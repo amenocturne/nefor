@@ -1,0 +1,6 @@
+window_size: 20
+
+messages:
+  duplicate: >
+    Result identical to your previous {tool}({args_summary}) call.
+    The data hasn't changed. Consider a different approach.

@@ -1,0 +1,132 @@
+@font-face {
+  font-family: 'JetBrainsMono NFM';
+  src: url('./fonts/JetBrainsMonoNerdFontMono-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+}
+
+@font-face {
+  font-family: 'JetBrainsMono NFM';
+  src: url('./fonts/JetBrainsMonoNerdFontMono-Bold.ttf') format('truetype');
+  font-weight: 700;
+  font-style: normal;
+}
+
+:root, [data-theme="dark"] {
+  color-scheme: dark;
+  --bg-primary: #0a0a0a;
+  --bg-secondary: #111111;
+  --bg-tertiary: #1a1a1a;
+  --bg-hover: #161616;
+  --border-primary: #222222;
+  --border-secondary: #1a1a1a;
+  --text-primary: #e0e0e0;
+  --text-secondary: #888888;
+  --text-dimmed: #777777;
+  --text-muted: #444444;
+  --accent: #4ade80;
+  --accent-bg: #1a2a1a;
+  --accent-border: #2a4a2a;
+  --danger: #ef4444;
+  --danger-bg: #2a1515;
+  --danger-border: #4a2020;
+  --btn-hover: #252525;
+  --accent-hover: #1f3a1f;
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+  --bg-primary: #ffffff;
+  --bg-secondary: #f5f5f5;
+  --bg-tertiary: #eeeeee;
+  --bg-hover: #e8e8e8;
+  --border-primary: #d0d0d0;
+  --border-secondary: #e0e0e0;
+  --text-primary: #1a1a1a;
+  --text-secondary: #555555;
+  --text-dimmed: #666666;
+  --text-muted: #999999;
+  --accent: #16a34a;
+  --accent-bg: #dcfce7;
+  --accent-border: #86efac;
+  --danger: #dc2626;
+  --danger-bg: #fef2f2;
+  --danger-border: #fecaca;
+  --btn-hover: #dddddd;
+  --accent-hover: #bbf7d0;
+}
+
+:root {
+  font-family:
+    Inter,
+    Avenir,
+    Helvetica,
+    Arial,
+    sans-serif;
+  font-size: 16px;
+  line-height: 24px;
+  font-weight: 400;
+
+  color: var(--text-primary);
+  background-color: var(--bg-primary);
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  -webkit-text-size-adjust: 100%;
+}
+
+.text-input {
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-primary);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: 'JetBrainsMono NFM', 'JetBrains Mono', monospace;
+  outline: none;
+  box-sizing: border-box;
+}
+
+.text-input:focus {
+  border-color: #333333;
+}
+
+select.text-input {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23777' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  padding-right: 28px;
+}
+
+select.text-input option {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+button, .toggle-btn, .tab-btn, .action-btn, .small-btn, .add-btn {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Remove focus ring on buttons — only inputs need tab focus */
+button:focus-visible {
+  outline: none;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}

@@ -1,0 +1,12 @@
+{
+  "name": "@agentic-kit/behavioral-reminders",
+  "version": "0.1.0",
+  "description": "Pi extension that sends mid-conversation nudges when the model drifts from instructions",
+  "type": "module",
+  "pi": {
+    "extensions": ["."]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}

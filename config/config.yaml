@@ -1,0 +1,8 @@
+provider: openrouter
+models:
+  orchestrator: openrouter/anthropic/claude-sonnet-4-6
+  worker: openrouter/anthropic/claude-sonnet-4-6
+  reviewer: openrouter/anthropic/claude-sonnet-4-6
+  explorer: openrouter/anthropic/claude-sonnet-4-6
+  tester: openrouter/anthropic/claude-sonnet-4-6
+  promptEngineer: openrouter/anthropic/claude-sonnet-4-6

@@ -1,0 +1,12 @@
+{
+  "name": "@agentic-kit/model-perf",
+  "version": "0.1.0",
+  "description": "Pi extension showing real-time model performance (tokens/sec) in the status bar",
+  "type": "module",
+  "pi": {
+    "extensions": ["."]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}

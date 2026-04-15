@@ -1,0 +1,12 @@
+{
+  "name": "@agentic-kit/agents-md-includes",
+  "version": "0.1.0",
+  "description": "Pi extension that expands @file references in AGENTS.md and parses validation_commands frontmatter",
+  "type": "module",
+  "pi": {
+    "extensions": ["."]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}

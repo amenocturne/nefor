@@ -1,0 +1,12 @@
+{
+  "name": "@agentic-kit/notification",
+  "version": "0.1.0",
+  "description": "Pi extension that fires system notifications when the agent needs attention or completes work",
+  "type": "module",
+  "pi": {
+    "extensions": ["."]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}

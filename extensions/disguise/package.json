@@ -1,0 +1,13 @@
+{
+  "name": "@agentic-kit/disguise",
+  "version": "0.1.0",
+  "description": "Pi extension for agent identity, context injection, and subagent dispatch",
+  "type": "module",
+  "pi": {
+    "extensions": ["."]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  }
+}

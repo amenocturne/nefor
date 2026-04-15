@@ -1,0 +1,13 @@
+{
+  "name": "@agentic-kit/background-tasks",
+  "version": "0.1.0",
+  "description": "Pi extension for background command execution and subagent orchestration with permission bubbling",
+  "type": "module",
+  "pi": {
+    "extensions": ["."]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  }
+}

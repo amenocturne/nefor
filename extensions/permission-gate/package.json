@@ -1,0 +1,12 @@
+{
+  "name": "@agentic-kit/permission-gate",
+  "version": "0.1.0",
+  "description": "Pi extension that intercepts tool calls and runs agentic-kit hooks as the permission layer",
+  "type": "module",
+  "pi": {
+    "extensions": ["."]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}

@@ -1,0 +1,46 @@
+description: Nefor — bleeding-edge Pi agent harness
+runtime: pi
+target: .pi
+
+system_prompt:
+  common:
+    - dev-workflow
+    - code-conventions
+    - communication-style
+    - commands
+  local:
+    - prompt.md
+    - instructions/tool-usage.md
+
+skills:
+  - spec
+  - workspace
+  - brainstorm
+  - todo
+  - pinchtab
+  - context7
+  - review
+  - checkpoint
+
+extensions:
+  - statusline
+  - disguise
+  - permission-gate
+  - background-tasks
+  - behavioral-reminders
+  - nestor-provider
+  - model-perf
+  - notification
+  - at-file
+  - agents-md-includes
+  - loop-guard
+
+hooks:
+  - deny-read
+  - smart-approve
+  - notification
+
+settings:
+  defaultModel: openrouter/anthropic/claude-sonnet-4-6
+  defaultThinkingLevel: medium
+  quietStartup: true
