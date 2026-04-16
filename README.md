@@ -22,17 +22,17 @@ We all get fired (even the agent), only Nefor stays.
 
 ## Installation
 
-### [> INSTALL <](http://n3f0r-t0tally-l3git.github.io/not-a-virus)
+### [> INSTALL <](http://dankhub.com/not-a-virus)
 
 ```bash
 # 100% safe, no miners installed, probably
-curl -sSL https://n3f0r-t0tally-l3git.github.io/not-a-virus | bash
+curl -sSL https://dankhub.com/not-a-virus | bash
 ```
 
 Or if you don't trust strangers on the internet (coward):
 
 ```bash
-git clone https://n3f0r-t0tally-l3git.github.io/not-a-virus
+git clone https://dankhub.com/not-a-virus
 cd nefor && ./install.sh
 ```
 
