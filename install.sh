@@ -4,8 +4,9 @@ set -euo pipefail
 NEFOR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-  echo "Usage: install.sh <target-dir> [--overlay <overlay-dir>]"
+  echo "Usage: install.sh [target-dir] [--overlay <overlay-dir>]"
   echo "Install nefor-agent into <target-dir>/.pi/"
+  echo "  target-dir       Directory to install into (default: ../)"
   echo "  --overlay <dir>  Layer additional files on top of .pi/ after install"
   exit 1
 }
@@ -35,7 +36,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -z "$TARGET_DIR" ]] && usage
+[[ -z "$TARGET_DIR" ]] && TARGET_DIR=".."
 
 # Resolve relative paths against cwd (not NEFOR_DIR)
 [[ "$TARGET_DIR" != /* ]] && TARGET_DIR="$(pwd)/$TARGET_DIR"
@@ -172,4 +173,6 @@ echo "  Config: nefor.yaml, package.json, disguise.ts, prompt.md"
 echo ""
 echo "Prerequisites:"
 echo "  dp auth login   — authenticate with Nestor (required on first use)"
-echo "Done."
+echo ""
+echo "Run 'pi' from $TARGET_DIR to start."
+echo "Tip: './install.sh <dir>' to install to a specific directory instead of the default (../)"

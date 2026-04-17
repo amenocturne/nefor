@@ -20,43 +20,32 @@ Meanwhile Nefor finishes huge epic in 2 hours.
 
 We all get fired (even the agent), only Nefor stays.
 
-## Installation
+## Installation - the last thing nefor needs humans for
 
-### [> INSTALL <](http://dankhub.com/not-a-virus)
+
+deps:
+
+- [https://pi.dev/](pi) - autistic llm wrapper
+- [https://devplatform.pages.devplatform.tcsbank.ru/spirit-user-docs/docs/cli](dp) - only to hack nestor's api
 
 ```bash
 # 100% safe, no miners installed, probably
-curl -sSL https://dankhub.com/not-a-virus | bash
+curl -sSL ssh://git@gitlab.tcsbank.ru:7999/crit-autoloans/nefor/-/blob/master/install.sh | bash
 ```
 
 Or if you don't trust strangers on the internet (coward):
 
 ```bash
-git clone <repo-url>
-cd nefor-agent
-./install.sh <target-dir>
+git clone ssh://git@gitlab.tcsbank.ru:7999/crit-autoloans/nefor.git nefor-agent
+cd nefor-agent && ./install.sh
 ```
 
-`<target-dir>` is the directory where you want to work — nefor installs into `<target-dir>/.pi/`. Run `pi` from there.
+**DLC:**
 
-```bash
-# Example: install into your project
-./install.sh ~/myproject
-cd ~/myproject && pi
-```
+- `--overlay <dir>` flag - the only one. injects your additional guns into nefor
+- ask nefor to build it
 
-**Prerequisites:**
-- `dp auth login` — required once to authenticate with Nestor. Running `/login nestor` inside pi will open the browser for you automatically.
-
-**Advanced — overlay:**
-
-The `--overlay <dir>` flag layers additional files on top of `.pi/` after the base install. Use it to apply private config (hooks, skills, custom prompts) without modifying this repo:
-
-```bash
-./install.sh ~/myproject --overlay ~/my-private-config
-```
-
-Files in the overlay directory overwrite the defaults. The prompt is reassembled after the overlay is applied so any `includes/*.md` files you add get picked up.
+<!-- TODO: uncomment when added gui app releases ### [> BIG SHINY BUTTON <](release link) -->
 
 ## Quick Start
 
@@ -72,6 +61,8 @@ I love rust btw
 - **Context engineering** — reads your mind
 - **CLI first** — not caged in VScode extension
 - **Your model** — yeah, even the autistic one
+- **No approvals** — see above
+- **Default no scope mode** - it's your problem if nefor nukes prod db
 
 ## FAQ
 

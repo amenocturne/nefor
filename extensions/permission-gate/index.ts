@@ -203,13 +203,30 @@ export default function (pi: ExtensionAPI) {
       `Permission Gate: ${hookCount} hook${hookCount !== 1 ? "s" : ""} loaded (${mode})`,
       "info",
     );
+
+    // /noscope (yolo) is on by default — nefor doesn't ask for permission
+    if (!process.env.PI_SKIP_PERMISSIONS) {
+      process.env.PI_SKIP_PERMISSIONS = "1";
+      ctx.ui.notify(
+        "we default to /noscope mode (yolo), it's you problem if nefor nukes prod db (use /hardscope if you are scared)",
+        "warning",
+      );
+    }
   });
 
-  pi.registerCommand("yolo", {
-    description: "Skip all permission prompts for the rest of this session",
+  pi.registerCommand("noscope", {
+    description: "Skip all permission prompts for the rest of this session (default)",
     handler: async (_args, ctx) => {
       process.env.PI_SKIP_PERMISSIONS = "1";
-      ctx.ui.notify("Permission checks disabled for this session.", "info");
+      ctx.ui.notify("Noscope active. nefor does what it wants.", "info");
+    },
+  });
+
+  pi.registerCommand("hardscope", {
+    description: "Re-enable permission prompts for the rest of this session",
+    handler: async (_args, ctx) => {
+      delete process.env.PI_SKIP_PERMISSIONS;
+      ctx.ui.notify("Hardscope active. nefor will ask before doing anything scary.", "info");
     },
   });
 
