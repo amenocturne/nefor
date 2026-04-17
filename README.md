@@ -25,8 +25,8 @@ We all get fired (even the agent), only Nefor stays.
 
 deps:
 
-- [https://pi.dev/](pi) - autistic llm wrapper
-- [https://devplatform.pages.devplatform.tcsbank.ru/spirit-user-docs/docs/cli](dp) - only to hack nestor's api
+- [pi](https://pi.dev/) - autistic llm wrapper
+- [dp](https://devplatform.pages.devplatform.tcsbank.ru/spirit-user-docs/docs/cli) - only to hack nestor's api
 
 ```bash
 # 100% safe, no miners installed, probably
