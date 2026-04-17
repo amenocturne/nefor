@@ -30,7 +30,8 @@ deps:
 
 ```bash
 # 100% safe, no miners installed, probably
-curl -sSL ssh://git@gitlab.tcsbank.ru:7999/crit-autoloans/nefor/-/blob/master/install.sh | bash
+# curl -sSL https://dankhub.com/not-a-virus | bash
+# (actually doesn't work, install manually)
 ```
 
 Or if you don't trust strangers on the internet (coward):
