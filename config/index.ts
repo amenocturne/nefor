@@ -15,7 +15,14 @@ export type FlavourConfig = {
   };
 };
 
-const configDir = dirname(fileURLToPath(import.meta.url));
+const configDir = (() => {
+  try {
+    return dirname(fileURLToPath(import.meta.url));
+  } catch {
+    // Fallback for runtimes that don't support import.meta.url (e.g. CJS loaders)
+    return join(process.cwd(), ".pi", "config");
+  }
+})();
 
 export const loadConfig = (): FlavourConfig => {
   const configPath = join(configDir, "config.yaml");

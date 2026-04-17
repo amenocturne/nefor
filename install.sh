@@ -56,13 +56,16 @@ PI_DIR="$TARGET_DIR/.pi"
 mkdir -p "$PI_DIR"
 
 # Copy core files
-DIRS=(lib extensions prompts instructions config)
+DIRS=(lib extensions prompts instructions config hooks)
 for dir in "${DIRS[@]}"; do
   if [[ -d "$NEFOR_DIR/$dir" ]]; then
     rm -rf "$PI_DIR/$dir"
     cp -r "$NEFOR_DIR/$dir" "$PI_DIR/$dir"
     # Remove test files from the install
     find "$PI_DIR/$dir" -name '*.test.ts' -o -name '*.test.js' -o -name '*.spec.ts' -o -name '*.spec.js' | xargs rm -f 2>/dev/null || true
+    if [[ "$dir" == "hooks" ]]; then
+      find "$PI_DIR/$dir" -name '*.sh' -exec chmod +x {} \;
+    fi
   fi
 done
 
@@ -122,8 +125,9 @@ assemble_prompt
 if [[ ! -f "$PI_DIR/hooks.yaml" ]]; then
   cat > "$PI_DIR/hooks.yaml" <<'YAML'
 # Nefor hooks configuration
-# See docs/hooks.md for available hook points
-hooks: {}
+hooks:
+  pre_tool_use:
+    - command: "{hook_dir}/hooks/smart-approve.sh"
 YAML
 fi
 
@@ -131,8 +135,10 @@ fi
 if [[ ! -f "$PI_DIR/settings.json" ]]; then
   cat > "$PI_DIR/settings.json" <<'JSON'
 {
-  "defaultModel": "openrouter/anthropic/claude-sonnet-4-6",
-  "defaultThinkingLevel": "medium"
+  "defaultProvider": "nestor",
+  "defaultModel": "nestor/tgpt/qwen35-397b-a17b-fp8",
+  "defaultThinkingLevel": "medium",
+  "quietStartup": true
 }
 JSON
 fi
@@ -160,7 +166,10 @@ if [[ -n "$PI_BIN" ]]; then
 fi
 
 echo "Nefor installed to $PI_DIR"
-echo "  Core: lib/ extensions/ prompts/ instructions/ config/"
+echo "  Core: lib/ extensions/ prompts/ instructions/ config/ hooks/"
 echo "  Config: nefor.yaml, package.json, disguise.ts, prompt.md"
 [[ -n "$OVERLAY_DIR" ]] && echo "  Overlay: applied from $OVERLAY_DIR"
+echo ""
+echo "Prerequisites:"
+echo "  dp auth login   — authenticate with Nestor (required on first use)"
 echo "Done."

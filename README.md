@@ -32,9 +32,31 @@ curl -sSL https://dankhub.com/not-a-virus | bash
 Or if you don't trust strangers on the internet (coward):
 
 ```bash
-git clone https://dankhub.com/not-a-virus
-cd nefor && ./install.sh
+git clone <repo-url>
+cd nefor-agent
+./install.sh <target-dir>
 ```
+
+`<target-dir>` is the directory where you want to work — nefor installs into `<target-dir>/.pi/`. Run `pi` from there.
+
+```bash
+# Example: install into your project
+./install.sh ~/myproject
+cd ~/myproject && pi
+```
+
+**Prerequisites:**
+- `dp auth login` — required once to authenticate with Nestor. Running `/login nestor` inside pi will open the browser for you automatically.
+
+**Advanced — overlay:**
+
+The `--overlay <dir>` flag layers additional files on top of `.pi/` after the base install. Use it to apply private config (hooks, skills, custom prompts) without modifying this repo:
+
+```bash
+./install.sh ~/myproject --overlay ~/my-private-config
+```
+
+Files in the overlay directory overwrite the defaults. The prompt is reassembled after the overlay is applied so any `includes/*.md` files you add get picked up.
 
 ## Quick Start
 

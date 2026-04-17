@@ -62,7 +62,7 @@ function findDpBinary(): string {
 	} catch {}
 
 	throw new Error(
-		"dp binary not found. Expected at /usr/local/bin/dp or ~/.nessy/dp_v13.4.2/dp",
+		"dp CLI not installed. Install it first: https://devplatform.pages.devplatform.tcsbank.ru/spirit-user-docs/docs/cli/ — then run /login nestor again.",
 	);
 }
 
@@ -229,13 +229,24 @@ function createOAuthHandlers(piRef: ExtensionAPI) {
 			}
 		}
 
-		// dp auth login needs a real TTY to open the browser, which conflicts
-		// with Pi's TUI. Ask the user to run it in another terminal.
+		// Launch dp auth login automatically — it opens the browser via the OS
+		// (no TTY needed for that part). Detach so it doesn't block pi's TUI.
+		let launched = false;
+		try {
+			const { spawn: _spawn } = await import("node:child_process");
+			const loginProc = _spawn(dpPath, ["auth", "login"], {
+				stdio: "ignore",
+				detached: true,
+				env: dpEnv(),
+			});
+			loginProc.unref();
+			launched = true;
+		} catch {}
+
 		await callbacks.onPrompt({
-			message:
-				"No active DP session. Run this in another terminal:\n\n" +
-				"    dp auth login\n\n" +
-				"Complete the browser login, then press Enter here.",
+			message: launched
+				? "Opening browser for DP authentication...\nComplete the login, then press Enter."
+				: "No active DP session. Run `dp auth login` in another terminal, then press Enter.",
 		});
 
 		// Retry after user says they've logged in

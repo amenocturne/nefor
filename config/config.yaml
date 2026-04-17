@@ -1,8 +1,8 @@
-provider: openrouter
+provider: nestor
 models:
-  orchestrator: openrouter/anthropic/claude-sonnet-4-6
-  worker: openrouter/anthropic/claude-sonnet-4-6
-  reviewer: openrouter/anthropic/claude-sonnet-4-6
-  explorer: openrouter/anthropic/claude-sonnet-4-6
-  tester: openrouter/anthropic/claude-sonnet-4-6
-  promptEngineer: openrouter/anthropic/claude-sonnet-4-6
+  orchestrator: nestor/tgpt/qwen35-397b-a17b-fp8
+  worker: nestor/tgpt/qwen35-397b-a17b-fp8
+  reviewer: nestor/tgpt/qwen35-397b-a17b-fp8
+  explorer: nestor/tgpt/qwen35-397b-a17b-fp8
+  tester: nestor/tgpt/qwen35-397b-a17b-fp8
+  promptEngineer: nestor/tgpt/qwen35-397b-a17b-fp8
