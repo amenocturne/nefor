@@ -57,18 +57,23 @@ PI_DIR="$TARGET_DIR/.pi"
 mkdir -p "$PI_DIR"
 
 # Copy core files
-DIRS=(lib extensions prompts instructions config hooks)
+DIRS=(lib extensions prompts instructions config)
 for dir in "${DIRS[@]}"; do
   if [[ -d "$NEFOR_DIR/$dir" ]]; then
     rm -rf "$PI_DIR/$dir"
     cp -r "$NEFOR_DIR/$dir" "$PI_DIR/$dir"
     # Remove test files from the install
     find "$PI_DIR/$dir" -name '*.test.ts' -o -name '*.test.js' -o -name '*.spec.ts' -o -name '*.spec.js' | xargs rm -f 2>/dev/null || true
-    if [[ "$dir" == "hooks" ]]; then
-      find "$PI_DIR/$dir" -name '*.sh' -exec chmod +x {} \;
-    fi
   fi
 done
+
+# Install permission hooks as perm-hooks/ (pi reserves .pi/hooks/ and warns on its
+# presence as a deprecated directory; we use a different name to avoid the collision)
+if [[ -d "$NEFOR_DIR/hooks" ]]; then
+  rm -rf "$PI_DIR/perm-hooks"
+  cp -r "$NEFOR_DIR/hooks" "$PI_DIR/perm-hooks"
+  find "$PI_DIR/perm-hooks" -name '*.sh' -exec chmod +x {} \;
+fi
 
 FILES=(disguise.ts prompt.md nefor.yaml package.json)
 for file in "${FILES[@]}"; do
@@ -128,7 +133,7 @@ if [[ ! -f "$PI_DIR/hooks.yaml" ]]; then
 # Nefor hooks configuration
 hooks:
   pre_tool_use:
-    - command: "{hook_dir}/hooks/smart-approve.sh"
+    - command: "{hook_dir}/perm-hooks/smart-approve.sh"
 YAML
 fi
 
@@ -167,7 +172,7 @@ if [[ -n "$PI_BIN" ]]; then
 fi
 
 echo "Nefor installed to $PI_DIR"
-echo "  Core: lib/ extensions/ prompts/ instructions/ config/ hooks/"
+echo "  Core: lib/ extensions/ prompts/ instructions/ config/ perm-hooks/"
 echo "  Config: nefor.yaml, package.json, disguise.ts, prompt.md"
 [[ -n "$OVERLAY_DIR" ]] && echo "  Overlay: applied from $OVERLAY_DIR"
 echo ""
