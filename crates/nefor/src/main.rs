@@ -13,14 +13,18 @@
 mod cli;
 mod config;
 mod error;
+mod events;
 mod ids;
 mod log;
 mod paths;
 mod ui;
 
+use std::sync::Arc;
+
 use anyhow::Context as _;
 
 use crate::error::NeforError;
+use crate::events::EventBus;
 use crate::ui::{InitLuaFoundWidget, NoConfigWidget, Region, WidgetRegistry};
 
 #[tokio::main]
@@ -54,7 +58,9 @@ async fn main() -> anyhow::Result<()> {
             .context("registering no-config placeholder widget")?;
     }
 
-    ui::app::run(registry)
+    let bus = Arc::new(EventBus::new());
+
+    ui::app::run(bus.clone(), registry)
         .await
         .map_err(NeforError::from)
         .context("running TUI event loop")?;

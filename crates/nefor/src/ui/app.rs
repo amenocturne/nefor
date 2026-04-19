@@ -2,15 +2,20 @@
 //!
 //! Enters raw mode + the alternate screen, drives a crossterm event stream
 //! and a tick timer inside a `tokio::select!`, and draws the registered
-//! widgets each tick. The loop is deliberately minimal: only `q` / Ctrl-C
-//! are handled. Arbitrary key dispatch, `subscribe_key`, `subscribe_resize`,
-//! and the Lua-visible event bus arrive in subsequent commits.
+//! widgets each tick. Every input event is also emitted onto the shared
+//! [`EventBus`] so other subscribers (logging probes, plugins once Lua is
+//! wired) can react — the renderer itself still owns the terminal and the
+//! crossterm event source.
+//!
+//! Only `q` / Ctrl-C are handled in-loop as quit keys. Arbitrary key dispatch
+//! at the Lua boundary lands with the Lua bindings.
 //!
 //! Panic safety is handled by a `Drop`-based [`TerminalGuard`]: the guard is
 //! constructed *immediately* after entering raw mode / alt-screen, so any
 //! panic inside the loop still restores the terminal as the guard unwinds.
 
 use std::io::stdout;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
@@ -22,6 +27,7 @@ use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
+use crate::events::{EventBus, EventName, EventPayload, KEY, RESIZE, SHUTDOWN, STARTUP, TICK};
 use crate::ui::error::UiError;
 use crate::ui::widget::WidgetRegistry;
 
@@ -49,16 +55,23 @@ impl Drop for TerminalGuard {
 
 /// Run the TUI event loop until the user presses `q` or Ctrl-C.
 ///
-/// Returns once the loop exits cleanly. Errors during terminal setup or
-/// event I/O bubble up as [`UiError`]; the [`TerminalGuard`] ensures the
-/// terminal is restored on both normal exit and panic.
-pub async fn run(registry: WidgetRegistry) -> Result<(), UiError> {
+/// On entry the loop emits [`STARTUP`] on `bus`; on clean exit it emits
+/// [`SHUTDOWN`]. Each crossterm event is forwarded as [`KEY`] or [`RESIZE`];
+/// each tick fires [`TICK`]. The renderer keeps ownership of the crossterm
+/// stream — the bus is broadcast-to-other-subscribers, not a reader.
+///
+/// Errors during terminal setup or event I/O bubble up as [`UiError`]; the
+/// [`TerminalGuard`] ensures the terminal is restored on both normal exit and
+/// panic.
+pub async fn run(bus: Arc<EventBus>, registry: WidgetRegistry) -> Result<(), UiError> {
     enable_raw_mode()?;
     execute!(stdout(), EnterAlternateScreen)?;
     let _guard = TerminalGuard;
 
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
+
+    bus.emit(&EventName::from(STARTUP), EventPayload::None);
 
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(TICK_INTERVAL);
@@ -69,11 +82,17 @@ pub async fn run(registry: WidgetRegistry) -> Result<(), UiError> {
     loop {
         tokio::select! {
             _ = ticker.tick() => {
+                bus.emit(&EventName::from(TICK), EventPayload::Tick);
                 terminal.draw(|frame| registry.render_all(frame))?;
             }
             maybe_event = events.next() => {
                 match maybe_event {
                     Some(Ok(event)) => {
+                        // Fan out to bus subscribers first, then handle quit
+                        // and redraw locally. Quit still exits even if a
+                        // subscriber panics — we rely on the bus being
+                        // reentrancy-safe (see events::bus doc).
+                        emit_crossterm(&bus, &event);
                         if should_quit(&event) {
                             break;
                         }
@@ -81,14 +100,35 @@ pub async fn run(registry: WidgetRegistry) -> Result<(), UiError> {
                         // next `terminal.draw`; we just need to redraw.
                         terminal.draw(|frame| registry.render_all(frame))?;
                     }
-                    Some(Err(e)) => return Err(UiError::Terminal(e)),
+                    Some(Err(e)) => {
+                        bus.emit(&EventName::from(SHUTDOWN), EventPayload::None);
+                        return Err(UiError::Terminal(e));
+                    }
                     None => break, // stream closed
                 }
             }
         }
     }
 
+    bus.emit(&EventName::from(SHUTDOWN), EventPayload::None);
     Ok(())
+}
+
+/// Translate a crossterm event into a bus emit. Events we don't yet have a
+/// typed payload for (focus, mouse, paste) are ignored at this layer — they
+/// land when a subscriber actually asks for them.
+fn emit_crossterm(bus: &EventBus, event: &Event) {
+    match event {
+        Event::Key(k) => bus.emit(&EventName::from(KEY), EventPayload::Key(*k)),
+        Event::Resize(cols, rows) => bus.emit(
+            &EventName::from(RESIZE),
+            EventPayload::Resize {
+                cols: *cols,
+                rows: *rows,
+            },
+        ),
+        _ => {}
+    }
 }
 
 /// `true` if `event` is `q` or Ctrl-C — the only exit keys MVP understands.
@@ -111,6 +151,7 @@ fn should_quit(event: &Event) -> bool {
 mod tests {
     use super::*;
     use crossterm::event::KeyEventKind;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
         Event::Key(KeyEvent {
@@ -144,5 +185,59 @@ mod tests {
     #[test]
     fn resize_does_not_quit() {
         assert!(!should_quit(&Event::Resize(80, 24)));
+    }
+
+    #[test]
+    fn emit_crossterm_forwards_key_events() {
+        let bus = EventBus::new();
+        let count = Arc::new(AtomicU64::new(0));
+        let c = Arc::clone(&count);
+        bus.on(
+            EventName::from(KEY),
+            Box::new(move |payload| {
+                if matches!(payload, EventPayload::Key(_)) {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
+            }),
+        );
+
+        emit_crossterm(&bus, &key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn emit_crossterm_forwards_resize() {
+        let bus = EventBus::new();
+        let seen = Arc::new(std::sync::Mutex::new(None::<(u16, u16)>));
+        let s = Arc::clone(&seen);
+        bus.on(
+            EventName::from(RESIZE),
+            Box::new(move |payload| {
+                if let EventPayload::Resize { cols, rows } = payload {
+                    *s.lock().unwrap() = Some((*cols, *rows));
+                }
+            }),
+        );
+
+        emit_crossterm(&bus, &Event::Resize(120, 40));
+        assert_eq!(*seen.lock().unwrap(), Some((120, 40)));
+    }
+
+    #[test]
+    fn emit_crossterm_ignores_other_events() {
+        let bus = EventBus::new();
+        let any = Arc::new(AtomicU64::new(0));
+        for name in [KEY, RESIZE, TICK, STARTUP, SHUTDOWN] {
+            let a = Arc::clone(&any);
+            bus.on(
+                EventName::from(name),
+                Box::new(move |_| {
+                    a.fetch_add(1, Ordering::Relaxed);
+                }),
+            );
+        }
+        // FocusGained is silently dropped — no emit, no panic.
+        emit_crossterm(&bus, &Event::FocusGained);
+        assert_eq!(any.load(Ordering::Relaxed), 0);
     }
 }
