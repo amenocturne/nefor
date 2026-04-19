@@ -15,7 +15,7 @@
 //! panic inside the loop still restores the terminal as the guard unwinds.
 
 use std::io::stdout;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
@@ -30,6 +30,15 @@ use ratatui::Terminal;
 use crate::events::{EventBus, EventName, EventPayload, KEY, RESIZE, SHUTDOWN, STARTUP, TICK};
 use crate::ui::error::UiError;
 use crate::ui::widget::WidgetRegistry;
+
+/// Shared handle on the widget registry.
+///
+/// Wrapped in an `Arc<Mutex<_>>` so Lua bindings (next commit) can register
+/// widgets *after* `run` has taken ownership of the render loop. Critical
+/// sections are tiny — push on register, iterate+render on draw — and
+/// Lua-side registration happens on whichever thread emitted the call, so a
+/// `std::sync::Mutex` suffices.
+pub type SharedRegistry = Arc<Mutex<WidgetRegistry>>;
 
 /// How often to redraw when no input event arrives. 100 ms is the usual TUI
 /// baseline — fast enough that future time-based widgets (clocks, spinners)
@@ -63,7 +72,7 @@ impl Drop for TerminalGuard {
 /// Errors during terminal setup or event I/O bubble up as [`UiError`]; the
 /// [`TerminalGuard`] ensures the terminal is restored on both normal exit and
 /// panic.
-pub async fn run(bus: Arc<EventBus>, registry: WidgetRegistry) -> Result<(), UiError> {
+pub async fn run(bus: Arc<EventBus>, registry: SharedRegistry) -> Result<(), UiError> {
     enable_raw_mode()?;
     execute!(stdout(), EnterAlternateScreen)?;
     let _guard = TerminalGuard;
@@ -83,7 +92,7 @@ pub async fn run(bus: Arc<EventBus>, registry: WidgetRegistry) -> Result<(), UiE
         tokio::select! {
             _ = ticker.tick() => {
                 bus.emit(&EventName::from(TICK), EventPayload::Tick);
-                terminal.draw(|frame| registry.render_all(frame))?;
+                draw_locked(&mut terminal, &registry)?;
             }
             maybe_event = events.next() => {
                 match maybe_event {
@@ -98,7 +107,7 @@ pub async fn run(bus: Arc<EventBus>, registry: WidgetRegistry) -> Result<(), UiE
                         }
                         // Resize events are picked up automatically on the
                         // next `terminal.draw`; we just need to redraw.
-                        terminal.draw(|frame| registry.render_all(frame))?;
+                        draw_locked(&mut terminal, &registry)?;
                     }
                     Some(Err(e)) => {
                         bus.emit(&EventName::from(SHUTDOWN), EventPayload::None);
@@ -111,6 +120,25 @@ pub async fn run(bus: Arc<EventBus>, registry: WidgetRegistry) -> Result<(), UiE
     }
 
     bus.emit(&EventName::from(SHUTDOWN), EventPayload::None);
+    Ok(())
+}
+
+/// Lock the shared registry briefly and render one frame.
+///
+/// The lock is held only for the duration of `terminal.draw`, which is
+/// itself bounded by how long the registered widgets take to produce their
+/// lines. Widgets that want to do heavy work should push the computation out
+/// of their renderer and read from a cached value — the usual ratatui
+/// discipline.
+fn draw_locked(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    registry: &SharedRegistry,
+) -> Result<(), UiError> {
+    let guard = match registry.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    terminal.draw(|frame| guard.render_all(frame))?;
     Ok(())
 }
 

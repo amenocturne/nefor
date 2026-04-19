@@ -14,6 +14,7 @@ use mlua::Lua;
 use crate::events::EventBus;
 use crate::lua::bindings;
 use crate::lua::error::LuaError;
+use crate::ui::SharedRegistry;
 
 /// Owns a Lua 5.4 VM with the `nefor.*` API installed.
 ///
@@ -25,22 +26,28 @@ use crate::lua::error::LuaError;
 pub struct LuaHost {
     lua: Lua,
     // Kept so future bindings can install themselves against the same bus
-    // `install_events` already wired up. Not consumed by this commit's code
-    // path beyond the initial install.
+    // `install_events` already wired up. Not consumed after construction.
     #[allow(dead_code)]
     bus: Arc<EventBus>,
+    // Same story for the widget registry — held so we can expose it later
+    // if a new API needs direct access. Widget registration already routes
+    // through it via `bindings::install_ui`.
+    #[allow(dead_code)]
+    registry: SharedRegistry,
 }
 
 impl LuaHost {
-    /// Construct a new VM and install the core `nefor.*` bindings.
+    /// Construct a new VM and install the full `nefor.*` binding surface.
     ///
-    /// Per this commit's scope, that's `nefor.events` and `nefor.log`. The
-    /// remaining tables (`nefor.ui`, `nefor.concurrency`, `nefor.process`) are
-    /// installed in a follow-up commit.
-    pub fn new(bus: Arc<EventBus>) -> Result<Self, LuaError> {
+    /// Installs `nefor.events`, `nefor.log`, `nefor.concurrency`,
+    /// `nefor.ui`, and `nefor.process`. The shared widget registry must be
+    /// the same one handed to [`crate::ui::app::run`] — `nefor.ui.register_widget`
+    /// and the renderer read from the same `Arc<Mutex<_>>`.
+    pub fn new(bus: Arc<EventBus>, registry: SharedRegistry) -> Result<Self, LuaError> {
         let lua = Lua::new();
-        install_nefor_surface(&lua, Arc::clone(&bus)).map_err(LuaError::VmInit)?;
-        Ok(Self { lua, bus })
+        install_nefor_surface(&lua, Arc::clone(&bus), Arc::clone(&registry))
+            .map_err(LuaError::VmInit)?;
+        Ok(Self { lua, bus, registry })
     }
 
     /// Borrow the inner Lua VM. Exposed for follow-up bindings and tests —
@@ -94,11 +101,18 @@ impl LuaHost {
     }
 }
 
-/// Install every `nefor.*` sub-table that this commit owns.
-fn install_nefor_surface(lua: &Lua, bus: Arc<EventBus>) -> mlua::Result<()> {
+/// Install every `nefor.*` sub-table.
+fn install_nefor_surface(
+    lua: &Lua,
+    bus: Arc<EventBus>,
+    registry: SharedRegistry,
+) -> mlua::Result<()> {
     let nefor = lua.create_table()?;
-    bindings::install_events(lua, &nefor, bus)?;
+    bindings::install_events(lua, &nefor, Arc::clone(&bus))?;
     bindings::install_log(lua, &nefor)?;
+    bindings::install_concurrency(lua, &nefor)?;
+    bindings::install_ui(lua, &nefor, Arc::clone(&bus), registry)?;
+    bindings::install_process(lua, &nefor)?;
     lua.globals().set("nefor", nefor)?;
     Ok(())
 }
@@ -106,10 +120,14 @@ fn install_nefor_surface(lua: &Lua, bus: Arc<EventBus>) -> mlua::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::WidgetRegistry;
     use std::path::PathBuf;
+    use std::sync::Mutex;
 
     fn host() -> LuaHost {
-        LuaHost::new(Arc::new(EventBus::new())).expect("host ok")
+        let bus = Arc::new(EventBus::new());
+        let registry: SharedRegistry = Arc::new(Mutex::new(WidgetRegistry::new()));
+        LuaHost::new(bus, registry).expect("host ok")
     }
 
     #[test]
@@ -117,7 +135,14 @@ mod tests {
         let h = host();
         let ok: bool = h
             .lua
-            .load("return type(nefor) == 'table' and type(nefor.events) == 'table' and type(nefor.log) == 'table'")
+            .load(
+                "return type(nefor) == 'table' \
+                 and type(nefor.events) == 'table' \
+                 and type(nefor.log) == 'table' \
+                 and type(nefor.concurrency) == 'table' \
+                 and type(nefor.ui) == 'table' \
+                 and type(nefor.process) == 'table'",
+            )
             .eval()
             .unwrap();
         assert!(ok);

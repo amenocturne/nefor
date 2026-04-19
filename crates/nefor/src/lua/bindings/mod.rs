@@ -9,6 +9,20 @@
 //! failure. The Lua-visible message is prefixed with the API path (e.g.,
 //! `nefor.events.on:`) so a `pcall` inside `init.lua` gets a readable
 //! diagnostic without the plugin author having to string-sniff.
+//!
+//! ## Sub-binding modules
+//!
+//! The `events` and `log` installers live in this file (they were the first
+//! commit's scope). The heavier surfaces — `concurrency`, `ui`, `process` —
+//! live in their own sibling modules so each can be read in isolation.
+
+pub mod concurrency;
+pub mod process;
+pub mod ui;
+
+pub use concurrency::install_concurrency;
+pub use process::install_process;
+pub use ui::install_ui;
 
 use std::sync::Arc;
 

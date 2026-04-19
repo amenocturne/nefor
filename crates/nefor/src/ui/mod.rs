@@ -15,7 +15,8 @@ pub mod placeholder;
 pub mod region;
 pub mod widget;
 
+pub use app::SharedRegistry;
 pub use error::UiError;
 pub use placeholder::NoConfigWidget;
 pub use region::Region;
-pub use widget::WidgetRegistry;
+pub use widget::{Widget, WidgetRegistry};
