@@ -9,4 +9,6 @@ description = "Pure Rust substrate for Transform<C> composition (Context, Transf
 
 [dependencies]
 thiserror = { workspace = true }
-futures = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
