@@ -8,6 +8,7 @@
 //! `UiError` / `PluginError` here yet.
 
 use crate::config::ConfigError;
+use crate::ui::UiError;
 
 /// Top-level error for the nefor binary.
 #[derive(Debug, thiserror::Error)]
@@ -19,6 +20,10 @@ pub enum NeforError {
     /// Config-directory resolution failed.
     #[error(transparent)]
     Config(#[from] ConfigError),
+
+    /// TUI / widget-registry failures.
+    #[error(transparent)]
+    Ui(#[from] UiError),
 
     /// Filesystem / IO error. Kept now so early FS callers wire through the
     /// same enum instead of inventing ad-hoc error types.
