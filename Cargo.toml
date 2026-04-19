@@ -1,0 +1,32 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+authors = ["amenocturne"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/amenocturne/nefor"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+mlua = { version = "0.10", features = ["lua54", "async", "send", "vendored"] }
+wasmtime = { version = "26", features = ["component-model", "async"] }
+wasmtime-wasi = "26"
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+rustls = "0.23"
+tokio-util = "0.7"
+dirs = "5"
+fs2 = "0.4"
+portable-pty = "0.9"
+notify = "7"
+futures = "0.3"
