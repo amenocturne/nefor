@@ -27,5 +27,13 @@ Rust rewrite of nefor. Monorepo: pure algebra library + TUI binary + Lua plugins
 
 ## Spec
 
-## MVP stop-line
-mock-plugin + starter `init.lua` running a minimal chat TUI. DAG, permission-gate, review-flow, roles, widgets are all post-MVP.
+## MVP status
+MVP complete (see git log for the landing commit).
+
+Shipped:
+- `nefor-combinators`: `Context`, `Transform<C>`, `chain`.
+- `nefor` binary: clap CLI, XDG config, tokio runtime, ratatui TUI with region layout, event bus, mlua 5.4 embedding, subprocess binding.
+- `mock-plugin` plugin: spawns `claude -p --output-format stream-json`; streams deltas, tool starts, final result; session resume via `--resume`.
+- `starter/init.lua`: chat TUI driving mock-plugin.
+
+Not shipped (post-MVP): DAG orchestrator, permission-gate, review-flow, role prompts, behavioral reminders, hook runner, MLG persona, Nestor harness, WASM runtime, Tauri GUI, bundled-config auto-install, plugin manager.
