@@ -20,9 +20,9 @@ dirs = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 futures = { workspace = true }
+mlua = { workspace = true }
 
 # Added as concrete callers need them:
-# mlua = { workspace = true }
 # wasmtime = { workspace = true }
 # wasmtime-wasi = { workspace = true }
 # reqwest = { workspace = true }

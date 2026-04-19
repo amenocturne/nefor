@@ -8,6 +8,7 @@
 //! `UiError` / `PluginError` here yet.
 
 use crate::config::ConfigError;
+use crate::lua::LuaError;
 use crate::ui::UiError;
 
 /// Top-level error for the nefor binary.
@@ -24,6 +25,14 @@ pub enum NeforError {
     /// TUI / widget-registry failures.
     #[error(transparent)]
     Ui(#[from] UiError),
+
+    /// Lua VM bootstrap / init.lua load failures. `init.lua` *execution*
+    /// errors are deliberately not elevated to this top-level type — the
+    /// main loop logs them and continues with partial state per spec
+    /// §Error handling. This variant is for "the VM couldn't even come up",
+    /// which is fatal.
+    #[error(transparent)]
+    Lua(#[from] LuaError),
 
     /// Filesystem / IO error. Kept now so early FS callers wire through the
     /// same enum instead of inventing ad-hoc error types.

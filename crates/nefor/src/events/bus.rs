@@ -162,6 +162,16 @@ impl SubscriptionId {
     pub fn as_u64(self) -> u64 {
         self.0
     }
+
+    /// Reconstruct a `SubscriptionId` from its raw `u64`. Paired with
+    /// [`SubscriptionId::as_u64`] for round-tripping through Lua, where ids
+    /// cross the Rust→Lua boundary as plain integers and come back through
+    /// `nefor.events.off`. Passing an id that was never issued (or one that
+    /// already unsubscribed) is a no-op at [`EventBus::off`], so no
+    /// correctness risk from this being public.
+    pub fn from_u64(id: u64) -> Self {
+        Self(id)
+    }
 }
 
 struct Subscription {
