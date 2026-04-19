@@ -17,13 +17,6 @@
 --     char, Enter, Backspace, etc. `nefor.ui.subscribe_key` uses a small
 --     pattern grammar that's great for named keys / chords but awkward for
 --     a free-form text input — the raw event fits better here.
---
--- Known limitation: the binary currently treats a plain `q` keypress as
--- "quit" at the event-loop level (see crates/nefor/src/ui/app.rs
--- should_quit). Typed messages that start with `q` will exit the TUI
--- before the handler below ever sees the keystroke. Workaround: type
--- any other character first, or use Ctrl-C to quit deliberately. A
--- proper chat-aware quit will land in v0.2.
 
 -------------------------------------------------------------------------
 -- 1. Plugin load path
@@ -97,7 +90,7 @@ end)
 nefor.ui.register_widget({ kind = "bottom", size = 2 }, function()
   return {
     "> " .. draft .. "|",
-    "Ctrl-C to quit - Enter to send - (heads up: bare `q` also quits, see README)",
+    "Ctrl-C to quit - Enter to send",
   }
 end)
 

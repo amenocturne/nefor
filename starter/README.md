@@ -19,7 +19,6 @@ Reference `init.lua` for a minimal Claude Code chat TUI.
 
 ## Known MVP limitations
 
-- **`q` is a hard quit.** The Rust binary's base event loop treats a plain `q` keypress as "quit" before user Lua handlers see it. Messages that start with a bare `q` will close the TUI. Workaround: lead with any other character, or use Ctrl-C deliberately. A chat-aware quit will land in v0.2.
 - Transcript is capped at 500 lines; older lines are dropped silently from the front.
 - No scrollback controls yet — the center widget shows whatever ratatui chooses to fit.
 - No prompt history (up-arrow recall). That's a plugin job.

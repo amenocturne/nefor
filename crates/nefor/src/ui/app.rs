@@ -159,13 +159,10 @@ fn emit_crossterm(bus: &EventBus, event: &Event) {
     }
 }
 
-/// `true` if `event` is `q` or Ctrl-C — the only exit keys MVP understands.
+/// `true` if `event` is Ctrl-C — the only exit key core handles. Plugins can
+/// emit additional quit events on the bus in the future.
 fn should_quit(event: &Event) -> bool {
     match event {
-        Event::Key(KeyEvent {
-            code: KeyCode::Char('q'),
-            ..
-        }) => true,
         Event::Key(KeyEvent {
             code: KeyCode::Char('c'),
             modifiers,
@@ -191,8 +188,8 @@ mod tests {
     }
 
     #[test]
-    fn q_quits() {
-        assert!(should_quit(&key(KeyCode::Char('q'), KeyModifiers::NONE)));
+    fn q_does_not_quit() {
+        assert!(!should_quit(&key(KeyCode::Char('q'), KeyModifiers::NONE)));
     }
 
     #[test]
