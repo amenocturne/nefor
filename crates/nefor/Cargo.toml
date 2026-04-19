@@ -11,18 +11,18 @@ default-run = "nefor"
 [dependencies]
 nefor-combinators = { path = "../nefor-combinators" }
 tokio = { workspace = true }
-mlua = { workspace = true }
-ratatui = { workspace = true }
-crossterm = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dirs = { workspace = true }
-futures = { workspace = true }
 
-# MVP: not used yet, add when needed
+# Added as concrete callers need them:
+# mlua = { workspace = true }
+# ratatui = { workspace = true }
+# crossterm = { workspace = true }
+# futures = { workspace = true }
 # wasmtime = { workspace = true }
 # wasmtime-wasi = { workspace = true }
 # reqwest = { workspace = true }
