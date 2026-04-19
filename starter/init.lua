@@ -1,63 +1,208 @@
--- Reference init.lua.
+-- starter/init.lua
 --
--- Not auto-installed. Copy to ~/.config/nefor/init.lua and adapt.
--- Proves the three binding families introduced in this commit work end
--- to end: a widget, a key handler, and a subprocess.
+-- Reference config for the nefor MVP. Copy to ~/.config/nefor/init.lua (or
+-- wherever NEFOR_APPNAME points) and adapt to taste. This file has no
+-- architectural privilege — it is a regular user config that composes the
+-- primitives the binary exposes (`nefor.events`, `nefor.ui`, `nefor.log`,
+-- `nefor.process`, `nefor.concurrency.sleep`) with the `mock-plugin` plugin.
 --
--- See CLAUDE.md for the MVP scope — mock-plugin and the rest of the
--- starter bundle arrive in follow-up commits.
+-- What it wires up:
+--   * Loads the mock-plugin plugin from the nefor monorepo's plugins/ dir.
+--   * Creates a single Claude Code session (general-purpose; no personas).
+--   * Renders a three-region chat TUI:
+--       top    — title bar (1 row)
+--       center — scrolling transcript
+--       bottom — "> <draft>" input line + hint (2 rows)
+--   * Handles keys via the raw `key` event bus so we get every printable
+--     char, Enter, Backspace, etc. `nefor.ui.subscribe_key` uses a small
+--     pattern grammar that's great for named keys / chords but awkward for
+--     a free-form text input — the raw event fits better here.
+--
+-- Known limitation: the binary currently treats a plain `q` keypress as
+-- "quit" at the event-loop level (see crates/nefor/src/ui/app.rs
+-- should_quit). Typed messages that start with `q` will exit the TUI
+-- before the handler below ever sees the keystroke. Workaround: type
+-- any other character first, or use Ctrl-C to quit deliberately. A
+-- proper chat-aware quit will land in v0.2.
 
--- A trivial status widget pinned to the bottom row. The renderer returns
--- the lines ratatui will draw; it's called once per frame, so it must be
--- cheap.
-local status_lines = { "nefor starter — press q or Ctrl-C to quit" }
+-------------------------------------------------------------------------
+-- 1. Plugin load path
+-------------------------------------------------------------------------
+-- We point Lua's require() at the monorepo's plugins/ directory. Adjust
+-- this if you cloned nefor elsewhere, or set NEFOR_PLUGINS in your shell
+-- env before launching nefor.
+--
+-- With PLUGINS_ROOT = ".../plugins":
+--   require("mock-plugin")            -> plugins/mock-plugin/init.lua
+--     via the "<root>/?/init.lua" entry below
+--   require("mock-plugin.lua.session") -> plugins/mock-plugin/lua/session.lua
+--     via the "<root>/?.lua" entry (Lua converts dots to path separators)
+local PLUGINS_ROOT = os.getenv("NEFOR_PLUGINS")
+  or (os.getenv("HOME") .. "/Vault/Projects/personal/nefor/plugins")
 
-nefor.ui.register_widget(
-  { kind = "bottom", size = 1 },
-  function()
-    return status_lines
+package.path = table.concat({
+  PLUGINS_ROOT .. "/?.lua",
+  PLUGINS_ROOT .. "/?/init.lua",
+  package.path,
+}, ";")
+
+local cc = require("mock-plugin")
+
+-------------------------------------------------------------------------
+-- 2. UI state
+-------------------------------------------------------------------------
+-- All UI state is just plain Lua locals. The widget renderers close over
+-- them and return fresh line arrays each frame. ratatui (via the LuaWidget
+-- wrapper in Rust) calls the renderer once per draw and treats the result
+-- as a Paragraph.
+local transcript = {}          -- list of strings, oldest first
+local draft = ""               -- current input buffer
+local session_id_display = "(new session)"
+
+-- Cap the transcript so long sessions don't balloon memory. Dropping from
+-- the front is O(n) but n is tiny by construction (500 lines max).
+local MAX_TRANSCRIPT_LINES = 500
+
+local function push(line)
+  transcript[#transcript + 1] = line
+  while #transcript > MAX_TRANSCRIPT_LINES do
+    table.remove(transcript, 1)
   end
-)
+end
 
--- A second widget occupies the center pane.
-local hint_lines = {
-  "nefor",
-  "",
-  "you are looking at starter/init.lua.",
-  "",
-  "try pressing '?' to toggle the hint.",
-  "the subprocess below will echo its pid once at startup.",
-}
+-------------------------------------------------------------------------
+-- 3. Widgets
+-------------------------------------------------------------------------
+-- Each renderer returns a list of strings that ratatui joins with \n and
+-- draws as a Paragraph. We don't know the frame dimensions here; for the
+-- MVP we let ratatui truncate. Scrollback controls are a post-MVP plugin.
 
-local show_hint = true
-nefor.ui.register_widget(
-  { kind = "center" },
-  function()
-    if show_hint then
-      return hint_lines
-    else
-      return { "(hint hidden — press ? again)" }
-    end
-  end
-)
-
--- '?' toggles the hint.
-nefor.ui.subscribe_key("?", function(ev)
-  show_hint = not show_hint
-  nefor.log.info("toggled hint", { shown = show_hint })
+-- Top: one-row title bar showing the session id once it's known.
+nefor.ui.register_widget({ kind = "top", size = 1 }, function()
+  return { "nefor - claude code chat - " .. session_id_display }
 end)
 
--- Spawn a subprocess at startup just to exercise the binding. Echoes its
--- own pid via the shell, captures the line, and shows it in the status
--- widget.
-nefor.process.spawn({
-  cmd = "sh",
-  args = { "-c", "echo pid:$$" },
-  on_stdout = function(line)
-    status_lines = { line .. " — starter init.lua ok" }
-    nefor.log.info("subprocess line", { line = line })
+-- Center: the whole transcript. ratatui shows what fits at the top of the
+-- area; the newest line is at the bottom of the list. When the list is
+-- taller than the area, older lines get clipped off the top (which is
+-- backwards — a proper ring-buffer view is post-MVP). For typical short
+-- sessions this is fine.
+nefor.ui.register_widget({ kind = "center" }, function()
+  return transcript
+end)
+
+-- Bottom: two rows. First row is the live input line with a `|` cursor
+-- marker (we can't position a real terminal cursor via the current
+-- binding, so we fake it with a character). Second row is a static hint.
+nefor.ui.register_widget({ kind = "bottom", size = 2 }, function()
+  return {
+    "> " .. draft .. "|",
+    "Ctrl-C to quit - Enter to send - (heads up: bare `q` also quits, see README)",
+  }
+end)
+
+push("[info] starter/init.lua loaded. type a prompt and press Enter.")
+
+-------------------------------------------------------------------------
+-- 4. Claude Code session
+-------------------------------------------------------------------------
+-- One general-purpose session for the whole TUI lifetime. Each callback
+-- mutates transcript state and relies on the once-per-frame redraw to
+-- surface changes. No explicit invalidation needed.
+local session              -- forward decl; referenced from callbacks below
+
+session = cc.session.new({
+  -- `bypassPermissions` lets Claude run tools without per-call approval
+  -- prompts — nefor has no permission-gate UI yet (that's post-MVP).
+  -- Tighten to "default" or "acceptEdits" once you trust your setup
+  -- less; "plan" is Claude's read-only planning mode.
+  permission_mode = "bypassPermissions",
+
+  -- Stream deltas arrive a few tokens at a time. We coalesce them into a
+  -- single "[assistant] ..." line so the transcript doesn't explode with
+  -- one line per token. The prefix check is cheap and unambiguous because
+  -- nothing else the UI emits starts with "[assistant] ".
+  on_message_delta = function(text)
+    local last = transcript[#transcript]
+    if last and last:sub(1, 12) == "[assistant] " then
+      transcript[#transcript] = last .. text
+    else
+      push("[assistant] " .. text)
+    end
   end,
-  on_exit = function(code)
-    nefor.log.info("subprocess exit", { code = code })
+
+  -- Claude is about to run a tool. We show the tool name + a short hint
+  -- drawn from the tool's input (Bash has `command`, most file tools have
+  -- `file_path`, etc.). Best-effort — unknown tools just show the name.
+  on_tool_start = function(tool_name, tool_input)
+    local hint = ""
+    if type(tool_input) == "table" then
+      hint = tool_input.command
+        or tool_input.file_path
+        or tool_input.description
+        or tool_input.pattern
+        or ""
+    end
+    push("[tool " .. tool_name .. "] " .. tostring(hint))
+  end,
+
+  -- Fires once per turn when Claude signals result:success. `info` carries
+  -- the billing/timing summary from the CC stream.
+  on_turn_done = function(_final_text, info)
+    push(string.format(
+      "[done] $%.4f - %dms - %d turn(s)",
+      info and info.cost_usd or 0,
+      info and info.duration_ms or 0,
+      info and info.num_turns or 0
+    ))
+    session_id_display = (session and session.id()) or session_id_display
+  end,
+
+  on_turn_error = function(message)
+    push("[error] " .. tostring(message))
   end,
 })
+
+-------------------------------------------------------------------------
+-- 5. Key handling
+-------------------------------------------------------------------------
+-- The `key` event payload shape (see crates/nefor/src/lua/bindings.rs,
+-- payload_to_lua + describe_key_code) is:
+--   {
+--     code = "Char" | "Enter" | "Backspace" | "Esc" | "Up" | ...,
+--     char = "a",            -- present iff code == "Char"
+--     f = 1..12,             -- present iff code == "F" (function keys)
+--     modifiers = { ctrl = bool, shift = bool, alt = bool },
+--   }
+-- We only care about Char / Enter / Backspace for the MVP chat loop.
+nefor.events.on("key", function(ev)
+  if type(ev) ~= "table" then return end
+  local mods = ev.modifiers or {}
+
+  if ev.code == "Enter" then
+    -- Submit. Empty drafts are a silent no-op so a stray Enter doesn't
+    -- emit a blank turn to Claude (CC rejects empty prompts anyway).
+    if draft == "" then return end
+    local prompt = draft
+    draft = ""
+    push("> " .. prompt)
+    session.run(prompt)
+
+  elseif ev.code == "Backspace" then
+    -- UTF-8-safe erase would need a codepoint walk; for ASCII input the
+    -- byte-level strip is correct, and multibyte input in a plain Lua
+    -- string will just leave a truncated sequence that ratatui renders
+    -- as a replacement char. Good enough for MVP.
+    draft = draft:sub(1, -2)
+
+  elseif ev.code == "Char" and ev.char then
+    -- Filter out control/alt chords so Ctrl-L or Alt-x don't get typed
+    -- literally. Shift is allowed so capital letters and shifted
+    -- punctuation work normally.
+    if not mods.ctrl and not mods.alt then
+      draft = draft .. ev.char
+    end
+  end
+  -- All other keys (Esc, arrows, F-keys, ...) are currently ignored.
+  -- Easy extension point: history recall on Up/Down, clear-line on Esc.
+end)
