@@ -14,44 +14,36 @@ use mlua::Lua;
 use crate::events::EventBus;
 use crate::lua::bindings;
 use crate::lua::error::LuaError;
-use crate::ui::SharedRegistry;
+use crate::ncp::SharedPluginRegistry;
 
 /// Owns a Lua 5.4 VM with the `nefor.*` API installed.
 ///
 /// `LuaHost` is intentionally not `Clone` — a process has one VM. The
 /// underlying [`mlua::Lua`] handle is `Send + Sync + Clone` (mlua's `send`
-/// feature), so pieces that need to call *into* the VM from other tasks
-/// (event handlers, process stdio dispatchers) capture a clone of `lua()`
-/// and call through it. The VM state is internally serialized.
+/// feature), so callers that need to invoke into the VM from other tasks
+/// clone the inner handle via [`LuaHost::lua`].
 pub struct LuaHost {
     lua: Lua,
-    // Kept so future bindings can install themselves against the same bus
-    // `install_events` already wired up. Not consumed after construction.
     #[allow(dead_code)]
     bus: Arc<EventBus>,
-    // Same story for the widget registry — held so we can expose it later
-    // if a new API needs direct access. Widget registration already routes
-    // through it via `bindings::install_ui`.
     #[allow(dead_code)]
-    registry: SharedRegistry,
+    plugins: SharedPluginRegistry,
 }
 
 impl LuaHost {
     /// Construct a new VM and install the full `nefor.*` binding surface.
     ///
-    /// Installs `nefor.events`, `nefor.log`, `nefor.concurrency`,
-    /// `nefor.ui`, and `nefor.process`. The shared widget registry must be
-    /// the same one handed to [`crate::ui::app::run`] — `nefor.ui.register_widget`
-    /// and the renderer read from the same `Arc<Mutex<_>>`.
-    pub fn new(bus: Arc<EventBus>, registry: SharedRegistry) -> Result<Self, LuaError> {
+    /// Installs `nefor.events`, `nefor.log`, `nefor.process`, `nefor.plugins`.
+    /// The shared plugin registry is written to by `nefor.plugins.spawn`
+    /// calls during `init.lua` and drained by the engine after load.
+    pub fn new(bus: Arc<EventBus>, plugins: SharedPluginRegistry) -> Result<Self, LuaError> {
         let lua = Lua::new();
-        install_nefor_surface(&lua, Arc::clone(&bus), Arc::clone(&registry))
+        install_nefor_surface(&lua, Arc::clone(&bus), Arc::clone(&plugins))
             .map_err(LuaError::VmInit)?;
-        Ok(Self { lua, bus, registry })
+        Ok(Self { lua, bus, plugins })
     }
 
-    /// Borrow the inner Lua VM. Exposed for follow-up bindings and tests —
-    /// callers inside the binary don't typically need raw access.
+    /// Borrow the inner Lua VM. Exposed for follow-up bindings and tests.
     #[allow(dead_code)]
     pub fn lua(&self) -> &Lua {
         &self.lua
@@ -64,15 +56,9 @@ impl LuaHost {
     /// - [`LuaError::InitLuaExec`] if Lua errored during execution; the
     ///   source location is attached when mlua's error carries one.
     /// - No error on a clean run.
-    ///
-    /// Per spec §Error handling: Lua errors that escape `init.lua` don't
-    /// crash the binary — the caller logs and continues with whatever partial
-    /// state Lua managed to set up before the error.
     pub fn load_init(&self, path: &Path) -> Result<(), LuaError> {
         let src = fs::read_to_string(path).map_err(LuaError::InitLuaRead)?;
         let path_buf = path.to_path_buf();
-        // `set_name` threads the path into mlua's error messages so our
-        // location parser has something to match against.
         let chunk_name = path.display().to_string();
         match self.lua.load(&src).set_name(chunk_name).exec() {
             Ok(()) => Ok(()),
@@ -84,10 +70,6 @@ impl LuaHost {
     }
 
     /// Load and execute an in-memory Lua source string under a synthetic name.
-    ///
-    /// Useful for integration tests and future REPL-style callers. Errors
-    /// propagate through [`LuaError::InitLuaExec`] so location extraction
-    /// works the same way as for a real `init.lua`.
     #[allow(dead_code)]
     pub fn exec_str(&self, name: &str, source: &str) -> Result<(), LuaError> {
         let name_buf = std::path::PathBuf::from(name);
@@ -105,14 +87,13 @@ impl LuaHost {
 fn install_nefor_surface(
     lua: &Lua,
     bus: Arc<EventBus>,
-    registry: SharedRegistry,
+    plugins: SharedPluginRegistry,
 ) -> mlua::Result<()> {
     let nefor = lua.create_table()?;
     bindings::install_events(lua, &nefor, Arc::clone(&bus))?;
     bindings::install_log(lua, &nefor)?;
-    bindings::install_concurrency(lua, &nefor)?;
-    bindings::install_ui(lua, &nefor, Arc::clone(&bus), registry)?;
     bindings::install_process(lua, &nefor)?;
+    bindings::install_plugins(lua, &nefor, plugins)?;
     lua.globals().set("nefor", nefor)?;
     Ok(())
 }
@@ -120,14 +101,14 @@ fn install_nefor_surface(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::WidgetRegistry;
+    use crate::ncp::PluginRegistry;
     use std::path::PathBuf;
     use std::sync::Mutex;
 
     fn host() -> LuaHost {
         let bus = Arc::new(EventBus::new());
-        let registry: SharedRegistry = Arc::new(Mutex::new(WidgetRegistry::new()));
-        LuaHost::new(bus, registry).expect("host ok")
+        let plugins: SharedPluginRegistry = Arc::new(Mutex::new(PluginRegistry::new()));
+        LuaHost::new(bus, plugins).expect("host ok")
     }
 
     #[test]
@@ -139,9 +120,8 @@ mod tests {
                 "return type(nefor) == 'table' \
                  and type(nefor.events) == 'table' \
                  and type(nefor.log) == 'table' \
-                 and type(nefor.concurrency) == 'table' \
-                 and type(nefor.ui) == 'table' \
-                 and type(nefor.process) == 'table'",
+                 and type(nefor.process) == 'table' \
+                 and type(nefor.plugins) == 'table'",
             )
             .eval()
             .unwrap();
@@ -158,7 +138,6 @@ mod tests {
     #[test]
     fn syntax_error_returns_init_lua_exec_with_location() {
         let h = host();
-        // Dangling `=` on line 2 — a clear syntax error.
         let src = "local x = 1\nx =\n";
         let err = h.exec_str("bad.lua", src).expect_err("must error");
         match err {
@@ -174,7 +153,6 @@ mod tests {
     #[test]
     fn runtime_error_returns_init_lua_exec_with_location() {
         let h = host();
-        // Call a nil value — a runtime error pointing at the offending line.
         let src = "local x = 1\nundefined_func()\n";
         let err = h.exec_str("bad.lua", src).expect_err("must error");
         match err {

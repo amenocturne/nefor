@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Pure Rust substrate for Transform<C> composition (Context, Transform, combinators)."
+description = "Pure Rust substrate for Reasoner<C> composition (Context, Reasoner, combinators)."
 
 [dependencies]
 thiserror = { workspace = true }

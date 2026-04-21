@@ -46,8 +46,14 @@ impl EnvReader for SystemEnv {
     fn get(&self, key: &str) -> Option<String> {
         std::env::var(key).ok()
     }
+    // Literal XDG on every platform — spec pins `~/.config/nefor/init.lua` as
+    // the default. `dirs::config_dir()` would give `~/Library/Application Support`
+    // on macOS, which diverges from the Neovim convention the spec references.
     fn xdg_config_home(&self) -> Option<PathBuf> {
-        dirs::config_dir()
+        std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
     }
 }
 
@@ -108,6 +114,7 @@ mod tests {
     fn cli_with_config(dir: Option<&str>) -> Cli {
         Cli {
             config: dir.map(PathBuf::from),
+            plugin_dir: None,
         }
     }
 

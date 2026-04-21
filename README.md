@@ -1,5 +1,7 @@
 # nefor
 
+> do whatever you want.
+
 Rust rewrite of the nefor agent harness. TUI agent runtime + context-combinators library.
 
 **Status: MVP complete.** A minimal Claude Code wrapper. Launch with `just run` and chat with Claude in a TUI. DAG orchestration, permission-gate, and review-flow are post-MVP.
@@ -15,7 +17,7 @@ just test
 
 ## Layout
 
-- `crates/nefor-combinators/` — pure Rust substrate (Context, Transform, combinators).
+- `crates/nefor-combinators/` — pure Rust substrate (Context, Reasoner, combinators).
 - `crates/nefor/` — binary: TUI + Lua plugin host.
 - `plugins/` — Lua plugins (mock-plugin, etc.).
 - `starter/` — reference `init.lua`; copy what you want.

@@ -1,0 +1,15 @@
+[package]
+name = "nefor-protocol"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Types and wire codec for the Nefor Composition Protocol (NCP) v0.1."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+semver = { workspace = true }

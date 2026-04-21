@@ -16,7 +16,7 @@ Rust rewrite of nefor. Monorepo: pure algebra library + TUI binary + Lua plugins
 - Enums (ADTs) for state; no boolean flags alongside sentinel variants.
 - Immutability by default; I/O only at boundaries.
 - No YAML/TOML/JSON config schema in core — config is `init.lua`.
-- Plugins are Lua-only (WASM post-MVP). No Rust plugin API.
+- Plugins are separate OS processes communicating via NCP (see `protocol/v0.1/spec.md`). Any language. Lua stays embedded for `init.lua` and lightweight in-engine composition.
 - Comments only for non-obvious *why*; code is self-documenting for *what*.
 
 ## Commands
@@ -31,7 +31,7 @@ Rust rewrite of nefor. Monorepo: pure algebra library + TUI binary + Lua plugins
 MVP complete (see git log for the landing commit).
 
 Shipped:
-- `nefor-combinators`: `Context`, `Transform<C>`, `chain`.
+- `nefor-combinators`: `Context`, `Reasoner<C>`, `chain`.
 - `nefor` binary: clap CLI, XDG config, tokio runtime, ratatui TUI with region layout, event bus, mlua 5.4 embedding, subprocess binding.
 - `mock-plugin` plugin: spawns `claude -p --output-format stream-json`; streams deltas, tool starts, final result; session resume via `--resume`.
 - `starter/init.lua`: chat TUI driving mock-plugin.

@@ -1,21 +1,17 @@
-//! `nefor` binary entry point.
+//! `nefor` engine entry point.
 //!
-//! Per spec §Startup sequence:
-//! 1. Resolve config dir (env + args).
-//! 2. Bring up the shared [`EventBus`], the shared [`WidgetRegistry`], and
-//!    the [`LuaHost`] that owns the `nefor.*` API.
-//! 3. If `<config_dir>/init.lua` exists, load it — plugins register widgets,
-//!    event handlers, process-spawned children, etc. during that call. Lua
-//!    errors that escape the loader are logged and skipped per spec §Error
-//!    handling; the binary keeps going with whatever partial state `init.lua`
-//!    managed to set up.
-//! 4. If no widgets got registered (no init.lua *or* init.lua failed before
-//!    touching `nefor.ui.register_widget`), install the no-config placeholder
-//!    so the user always sees *something* explaining the state.
-//! 5. Enter the TUI event loop.
+//! Startup sequence:
 //!
-//! `anyhow` is allowed here — this is the top boundary. Everywhere below is
-//! typed via [`NeforError`].
+//! 1. Parse CLI (`--config <DIR>`).
+//! 2. Resolve the config dir, initialize tracing to a file under it.
+//! 3. Boot the Lua VM and — if `init.lua` exists — run it. `init.lua` calls
+//!    `nefor.plugins.spawn { ... }` for every plugin the user wants to run.
+//! 4. Build a [`Broker`](crate::ncp::Broker), spawn every registered plugin
+//!    through it, install a `ctrl_c` shutdown hook, and run the broker until
+//!    it exits.
+//!
+//! Per D-02 the engine is pure glue: no plugins registered → log a message
+//! and exit cleanly. No UI, no bundled harness.
 
 mod cli;
 mod config;
@@ -24,8 +20,8 @@ mod events;
 mod ids;
 mod log;
 mod lua;
+mod ncp;
 mod paths;
-mod ui;
 
 use std::sync::{Arc, Mutex};
 
@@ -34,22 +30,29 @@ use anyhow::Context as _;
 use crate::error::NeforError;
 use crate::events::EventBus;
 use crate::lua::LuaHost;
-use crate::ui::{NoConfigWidget, Region, SharedRegistry, WidgetRegistry};
+use crate::ncp::{resolve_plugin_root, spawn_plugin, Broker, PluginRegistry, SharedPluginRegistry};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    log::init().ok();
-
     let args = cli::parse();
     let config_dir = config::resolve(&args)
         .map_err(NeforError::from)
         .context("resolving config directory")?;
 
-    tracing::info!(config_dir = %config_dir, "nefor starting");
+    let log_path = config_dir.as_path().join("nefor.log");
+    if let Err(e) = log::init(&log_path) {
+        eprintln!("nefor: failed to initialize logging at {log_path:?}: {e}");
+    }
+
+    tracing::info!(
+        config_dir = %config_dir,
+        log_path = %log_path.display(),
+        "nefor starting"
+    );
 
     let bus = Arc::new(EventBus::new());
-    let registry: SharedRegistry = Arc::new(Mutex::new(WidgetRegistry::new()));
-    let host = LuaHost::new(Arc::clone(&bus), Arc::clone(&registry))
+    let plugins: SharedPluginRegistry = Arc::new(Mutex::new(PluginRegistry::new()));
+    let host = LuaHost::new(Arc::clone(&bus), Arc::clone(&plugins))
         .map_err(NeforError::from)
         .context("initializing Lua VM")?;
 
@@ -59,23 +62,18 @@ async fn main() -> anyhow::Result<()> {
             Ok(()) => {
                 tracing::info!(path = %init_lua.display(), "init.lua loaded");
             }
-            Err(lua::LuaError::InitLuaExec { source, location }) => {
-                // Per spec: print + continue with partial state. We don't
-                // want a single typo in the user's init.lua to wedge the
-                // whole TUI before they can see anything.
-                match location {
-                    Some(loc) => tracing::error!(
-                        at = %loc,
-                        error = %source,
-                        "init.lua execution error (continuing with partial state)",
-                    ),
-                    None => tracing::error!(
-                        path = %init_lua.display(),
-                        error = %source,
-                        "init.lua execution error (continuing with partial state)",
-                    ),
-                }
-            }
+            Err(lua::LuaError::InitLuaExec { source, location }) => match location {
+                Some(loc) => tracing::error!(
+                    at = %loc,
+                    error = %source,
+                    "init.lua execution error (continuing with partial state)",
+                ),
+                None => tracing::error!(
+                    path = %init_lua.display(),
+                    error = %source,
+                    "init.lua execution error (continuing with partial state)",
+                ),
+            },
             Err(other) => {
                 tracing::error!(
                     path = %init_lua.display(),
@@ -88,33 +86,71 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(path = %init_lua.display(), "no init.lua at expected path");
     }
 
-    // If no widget claimed a region during init.lua, install the no-config
-    // placeholder. This is the "Lua had nothing to say" fallback — once
-    // Lua registers a widget we defer to it.
-    {
-        let mut guard = match registry.lock() {
+    let specs = {
+        let mut guard = match plugins.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if guard.is_empty() {
-            guard
-                .register(
-                    Region::Center,
-                    Box::new(NoConfigWidget::new(config_dir.clone())),
-                )
-                .map_err(NeforError::from)
-                .context("registering no-config placeholder widget")?;
+        guard.drain()
+    };
+
+    if specs.is_empty() {
+        tracing::info!(
+            config_dir = %config_dir,
+            "no plugins registered; exiting. See starter/init.lua for an example config."
+        );
+        drop(host);
+        return Ok(());
+    }
+
+    let plugin_root = match resolve_plugin_root(args.plugin_dir.clone()) {
+        Some(r) => r,
+        None => {
+            tracing::error!(
+                "could not resolve plugin root directory; set NEFOR_PLUGIN_DIR or pass --plugin-dir"
+            );
+            return Ok(());
+        }
+    };
+    tracing::info!(plugin_root = %plugin_root.as_path().display(), "plugin root resolved");
+
+    let mut broker = Broker::new(env!("CARGO_PKG_VERSION"));
+    for spec in &specs {
+        match spawn_plugin(spec, &plugin_root) {
+            Ok(transport) => {
+                let id = broker.attach_transport(transport, spec.name.clone());
+                tracing::info!(
+                    plugin = %spec.name,
+                    command = ?spec.command,
+                    conn = %id,
+                    "plugin spawned"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    plugin = %spec.name,
+                    command = ?spec.command,
+                    error = %e,
+                    "failed to spawn plugin"
+                );
+            }
         }
     }
 
-    ui::app::run(bus.clone(), Arc::clone(&registry))
-        .await
-        .map_err(NeforError::from)
-        .context("running TUI event loop")?;
+    let shutdown = broker.shutdown_handle();
+    let ctrl_c_task = tokio::spawn(async move {
+        if let Ok(()) = tokio::signal::ctrl_c().await {
+            tracing::info!("ctrl_c received; requesting broker shutdown");
+            shutdown
+                .shutdown(crate::ncp::broker::DEFAULT_SHUTDOWN_GRACE_MS)
+                .await;
+        }
+    });
 
-    // Host stays alive across the event loop so subscribers can keep calling
-    // back into Lua; drop it here as the process is about to exit anyway.
+    let stop_reason = broker.run().await;
+    tracing::info!(?stop_reason, "broker stopped");
+    ctrl_c_task.abort();
+
     drop(host);
-
     Ok(())
 }

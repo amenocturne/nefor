@@ -1,4 +1,4 @@
-//! Combinators over [`Transform<C>`](crate::Transform).
+//! Combinators over [`Reasoner<C>`](crate::Reasoner).
 //!
 //! MVP exposes exactly one: [`chain`]. Further combinators (`parallel`,
 //! `fanout`, `retry`, `timeout`, `race`, ...) land when a concrete
@@ -6,7 +6,7 @@
 //! surface area (§Architectural Rules #14, §Core enums closed sets).
 
 use crate::context::Context;
-use crate::transform::Transform;
+use crate::reasoner::Reasoner;
 
 /// Sequential composition: apply `f` then `g`.
 ///
@@ -16,25 +16,25 @@ use crate::transform::Transform;
 pub fn chain<C, F, G>(f: F, g: G) -> Chain<F, G>
 where
     C: Context,
-    F: Transform<C>,
-    G: Transform<C>,
+    F: Reasoner<C>,
+    G: Reasoner<C>,
 {
     Chain { f, g }
 }
 
-/// Transform produced by [`chain`]. Exposed so callers can name the type
-/// when storing chained transforms in structs or returning them from
+/// Reasoner produced by [`chain`]. Exposed so callers can name the type
+/// when storing chained reasoners in structs or returning them from
 /// functions.
 pub struct Chain<F, G> {
     f: F,
     g: G,
 }
 
-impl<C, F, G> Transform<C> for Chain<F, G>
+impl<C, F, G> Reasoner<C> for Chain<F, G>
 where
     C: Context,
-    F: Transform<C>,
-    G: Transform<C>,
+    F: Reasoner<C>,
+    G: Reasoner<C>,
 {
     type Err = ChainError<F::Err, G::Err>;
 
@@ -55,11 +55,11 @@ where
     E1: std::error::Error + Send + Sync + 'static,
     E2: std::error::Error + Send + Sync + 'static,
 {
-    /// The first transform in the chain failed.
-    #[error("first transform failed: {0}")]
+    /// The first reasoner in the chain failed.
+    #[error("first reasoner failed: {0}")]
     First(#[source] E1),
-    /// The second transform in the chain failed.
-    #[error("second transform failed: {0}")]
+    /// The second reasoner in the chain failed.
+    #[error("second reasoner failed: {0}")]
     Second(#[source] E2),
 }
 
@@ -67,7 +67,7 @@ where
 mod tests {
     use super::{chain, Chain, ChainError};
     use crate::context::Context;
-    use crate::transform::Transform;
+    use crate::reasoner::Reasoner;
     use std::convert::Infallible;
 
     #[derive(Clone, Debug, PartialEq)]
@@ -81,7 +81,7 @@ mod tests {
 
     struct Append(&'static str);
 
-    impl Transform<Ctx> for Append {
+    impl Reasoner<Ctx> for Append {
         type Err = Infallible;
 
         async fn apply(&self, c: Ctx) -> Result<Ctx, Self::Err> {
@@ -94,7 +94,7 @@ mod tests {
     struct Boom(&'static str);
 
     struct FailFirst;
-    impl Transform<Ctx> for FailFirst {
+    impl Reasoner<Ctx> for FailFirst {
         type Err = Boom;
         async fn apply(&self, _c: Ctx) -> Result<Ctx, Self::Err> {
             Err(Boom("first"))
@@ -102,7 +102,7 @@ mod tests {
     }
 
     struct FailSecond;
-    impl Transform<Ctx> for FailSecond {
+    impl Reasoner<Ctx> for FailSecond {
         type Err = Boom;
         async fn apply(&self, _c: Ctx) -> Result<Ctx, Self::Err> {
             Err(Boom("second"))
@@ -110,7 +110,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chain_composes_two_transforms() {
+    async fn chain_composes_two_reasoners() {
         let pipeline: Chain<Append, Append> = chain(Append("a"), Append("b"));
         let out = pipeline.apply(ctx("hello")).await.expect("both infallible");
         assert_eq!(out, ctx("helloab"));
