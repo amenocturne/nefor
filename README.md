@@ -15,7 +15,7 @@ just test
 
 ## Layout
 
-- `crates/nefor-combinators/` — pure Rust substrate (Context, Transform, combinators).
+- `crates/nefor-combinators/` — pure Rust substrate (Context, Reasoner, combinators).
 - `crates/nefor/` — binary: TUI + Lua plugin host.
 - `plugins/` — Lua plugins (mock-plugin, etc.).
 - `starter/` — reference `init.lua`; copy what you want.

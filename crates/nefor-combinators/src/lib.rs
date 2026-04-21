@@ -1,6 +1,6 @@
-//! nefor-combinators — pure Rust substrate for `Transform<C>` composition.
+//! nefor-combinators — pure Rust substrate for `Reasoner<C>` composition.
 //!
-//! MVP scope: [`Context`], [`Transform<C>`](Transform), and the [`chain`]
+//! MVP scope: [`Context`], [`Reasoner<C>`](Reasoner), and the [`chain`]
 //! combinator. Additional combinators (parallel, retry, timeout, ...) and
 //! refinement traits (`Mergeable`, `Journaled`, `Sequenced`) land when a
 //! concrete consumer requires them.
@@ -12,8 +12,8 @@
 
 mod combinators;
 mod context;
-mod transform;
+mod reasoner;
 
 pub use combinators::{chain, Chain, ChainError};
 pub use context::Context;
-pub use transform::Transform;
+pub use reasoner::Reasoner;
