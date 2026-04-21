@@ -66,6 +66,34 @@ Corollaries:
 
 This is why `nefor-protocol`'s `ParseError` has variants like `InvalidAttachBody(InvalidAttachReason)` and `InvalidSystemBody { kind, reason }` — the broker branches on variants, not message text. When you find yourself writing `msg.contains("...")` to decide what to do, stop: that's a missing enum arm.
 
+### Do we even need it?
+
+The meta-principle behind every other principle in this section. Every time a feature, field, abstraction, or dependency is proposed — before asking "how do we build it?", ask "do we actually need it?" Default to removing requirements, not accommodating them.
+
+> Junior engineers write beautiful code with premature abstractions and optimizations. Middles write code that gets the job done. Seniors ask if we even need it.
+
+Deleting a requirement is strictly better than implementing one: no surface area, no tests, no edge cases, no drift, no cognitive tax on future readers. Most "defensible" features are defensible in isolation and lose when weighed against the cost of carrying them.
+
+Track record in nefor — each of these was initially defensible, and each collapsed under the question:
+
+- Capabilities in NCP → dropped (can't enforce them; install-trust is honest)
+- WASM sandbox → dropped (same reason)
+- `plugin_joined` / `plugin_left` / `detach` / bootstrap roster → dropped (plugins advertise themselves; liveness is a plugin convention)
+- `args` / `env` / `cwd` / `build` fields on spawn → dropped (userspace composes via wrapper scripts or Lua)
+- `/bin/sh` dependency in the engine → dropped (direct exec; shell is a plugin's choice)
+- Plugin name in attach body → dropped (engine assigns from spawn config)
+- `InvalidSystemBody(String)` stringly-typed escape hatch → dropped (structured enum)
+- Plugin name override at runtime → dropped (name is a compile-time property of the plugin)
+
+How to apply it:
+
+1. When a feature is proposed, first ask "what breaks if we don't add this?"
+2. If the answer is "some users would need a wrapper" — decline the feature; users write wrappers.
+3. If the answer is "the system is unusable" — proceed, but pick the smallest thing that fixes it.
+4. Before merging any addition, check whether something adjacent can be deleted in the same commit. If yes, do it.
+
+YAGNI, no-v2, no-stringly-typed-state, contracts-over-implementations — they're all specific applications of this reflex. Default to "no" until the need is real and irreducible.
+
 ---
 
 ## Engine / protocol principles
