@@ -787,28 +787,25 @@ fn classify_parse_error(err: &ParseError) -> (ErrorCode, bool, String) {
         | ParseError::InvalidType(_)
         | ParseError::InvalidTimestamp(_)
         | ParseError::EmptyFrom
-        | ParseError::OutgoingHasStampedField(_) => {
+        | ParseError::OutgoingHasStampedField(_)
+        | ParseError::SystemBodyMissingKind
+        | ParseError::SystemBodyKindNotString => {
             (ErrorCode::MalformedEnvelope, false, err.to_string())
         }
         ParseError::BodyNotObject => (ErrorCode::BodyNotObject, false, err.to_string()),
         ParseError::UnknownKind(_) => (ErrorCode::UnknownKind, false, err.to_string()),
-        ParseError::InvalidSystemBody(msg) => {
-            // InvalidSystemBody covers attach-body semantic errors (empty
-            // name, reserved name, bad SemVer, bad protocol_version) AND
-            // structural errors on other system bodies. Attach-phase
-            // failures close (§8 invalid_attach, yes); generic structural
-            // failures don't (§8 malformed_envelope, no). We can't tell
-            // the two apart from the variant alone, but the message
-            // carries enough prose — attach errors all mention "attach".
-            let is_attach_phase = msg.contains("attach.")
-                || msg.contains("attach ")
-                || msg.starts_with("attach")
-                || msg.contains("SemVer");
-            if is_attach_phase {
-                (ErrorCode::InvalidAttach, true, err.to_string())
-            } else {
-                (ErrorCode::MalformedEnvelope, false, err.to_string())
-            }
+        // Attach-body faults (semantic or structural) → invalid_attach,
+        // close. The variant itself tells us the category, no string
+        // sniffing required.
+        ParseError::InvalidAttachBody(_) => (ErrorCode::InvalidAttach, true, err.to_string()),
+        // Structural faults on non-attach system bodies → malformed_envelope,
+        // keep the connection open. NOTE: plugins per §5/§7 only ever emit
+        // `attach` and `detach`, so in practice this path is triggered by
+        // structurally-broken `detach` bodies (wrong `reason` type, etc.);
+        // the other `SystemBodyKind` variants exist for defense in depth
+        // and for library consumers that also decode engine-sent messages.
+        ParseError::InvalidSystemBody { .. } => {
+            (ErrorCode::MalformedEnvelope, false, err.to_string())
         }
     }
 }
@@ -905,9 +902,9 @@ mod tests {
         tokio::spawn(broker.run());
 
         // `PluginName::new("engine")` fails, but the plugin-side attach
-        // payload is validated structurally during PARSE (parse.rs
-        // rejects attach.name = "engine" with InvalidSystemBody). That
-        // error comes back as InvalidAttach.
+        // payload is validated during PARSE (parse.rs rejects
+        // attach.name = "engine" with InvalidAttachBody(ReservedName)),
+        // which classify_parse_error maps to ErrorCode::InvalidAttach.
         send_outgoing(&mut p, attach_body("engine", "0.1.0", "0.1")).await;
 
         let env = recv_envelope(&mut p).await.expect("error");
@@ -1104,6 +1101,42 @@ mod tests {
         // No other peers — nothing to receive. Proof of alive-ness is
         // that the writer task hasn't closed our reader; we just confirm
         // no error within a brief window.
+        let next = tokio::time::timeout(Duration::from_millis(100), recv_envelope(&mut p)).await;
+        assert!(next.is_err() || next.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_error_invalid_system_body_does_not_close() {
+        // Structural errors on a non-attach system body (here: detach with
+        // a wrong-typed `reason`) classify as malformed_envelope and must
+        // keep the connection open.
+        let mut broker = Broker::new("0.1.0");
+        let (mut p, t) = make_transport();
+        broker.attach_transport(t, "p".into());
+        tokio::spawn(broker.run());
+
+        send_outgoing(&mut p, attach_body("p", "0.1.0", "0.1")).await;
+        recv_envelope(&mut p).await; // attach_ok
+
+        // Handcrafted so the type system doesn't reject it first.
+        p.writer
+            .write_all(b"{\"type\":\"system\",\"body\":{\"kind\":\"detach\",\"reason\":42}}\n")
+            .await
+            .unwrap();
+
+        let env = recv_envelope(&mut p).await.expect("error");
+        match env.body {
+            Body::System(SystemBody::Error { code, .. }) => {
+                assert_eq!(code, ErrorCode::MalformedEnvelope);
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
+
+        // Connection still open — prove by sending a valid event and
+        // confirming no further error within a brief window.
+        let mut body = serde_json::Map::new();
+        body.insert("k".into(), serde_json::Value::String("v".into()));
+        send_outgoing(&mut p, PluginOutgoing::event(body)).await;
         let next = tokio::time::timeout(Duration::from_millis(100), recv_envelope(&mut p)).await;
         assert!(next.is_err() || next.unwrap().is_none());
     }

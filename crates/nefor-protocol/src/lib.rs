@@ -35,5 +35,5 @@ mod system;
 
 pub use envelope::{Body, Envelope, MessageKind, PluginOutgoing};
 pub use newtypes::{PluginName, PluginNameError, Timestamp, TimestampParseError};
-pub use parse::ParseError;
+pub use parse::{InvalidAttachReason, InvalidBodyReason, ParseError, SystemBodyKind};
 pub use system::{ErrorCode, Offending, PluginLeftReason, SystemBody};
