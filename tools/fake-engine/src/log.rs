@@ -51,23 +51,11 @@ fn summarize_body(body: &Body) -> String {
 
 fn summarize_system(sys: &SystemBody) -> String {
     match sys {
-        SystemBody::Attach {
-            name,
-            version,
-            protocol_version,
-        } => format!("attach name={name} version={version} protocol={protocol_version}"),
-        SystemBody::AttachOk { engine_version } => {
-            format!("attach_ok engine_version={engine_version}")
+        SystemBody::Ready { protocol_version } => {
+            format!("ready protocol={protocol_version}")
         }
-        SystemBody::Detach { reason } => match reason {
-            Some(r) => format!("detach reason={r:?}"),
-            None => String::from("detach"),
-        },
-        SystemBody::PluginJoined { name, version } => {
-            format!("plugin_joined name={name} version={version}")
-        }
-        SystemBody::PluginLeft { name, reason } => {
-            format!("plugin_left name={name} reason={reason:?}")
+        SystemBody::ReadyOk { engine_version } => {
+            format!("ready_ok engine_version={engine_version}")
         }
         SystemBody::Shutdown { reason, grace_ms } => {
             let r = reason.as_deref().unwrap_or("");
@@ -98,19 +86,17 @@ mod tests {
     }
 
     #[test]
-    fn formats_system_attach() {
+    fn formats_system_ready() {
         let env = Envelope::system(
             PluginName::new("nefor-tui").expect("valid"),
             ts(),
-            SystemBody::Attach {
-                name: "nefor-tui".into(),
-                version: "0.1.0".into(),
+            SystemBody::Ready {
                 protocol_version: "0.1".into(),
             },
         );
         let line = format_envelope(&env);
         assert!(line.contains("nefor-tui"));
-        assert!(line.contains("attach"));
+        assert!(line.contains("ready"));
         assert!(line.contains("protocol=0.1"));
     }
 

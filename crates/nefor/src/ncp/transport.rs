@@ -49,14 +49,14 @@ pub type ExitWatcher = Pin<Box<dyn std::future::Future<Output = ExitOutcome> + S
 pub enum ExitOutcome {
     /// Clean exit with code 0.
     CleanExit,
-    /// Non-zero exit code or signal — broker reports `plugin_left` with
-    /// reason `crash`.
+    /// Non-zero exit code or signal. Broker logs the abnormal
+    /// termination.
     Crash,
     /// Engine-initiated close (we killed it because it didn't honour the
-    /// shutdown grace, etc.). Broker uses `evicted`.
+    /// shutdown grace, etc.).
     Evicted,
-    /// The broker couldn't observe the exit (wait failed). Treated as crash
-    /// for safety.
+    /// The broker couldn't observe the exit (wait failed). Treated as
+    /// crash for safety.
     Unknown,
 }
 

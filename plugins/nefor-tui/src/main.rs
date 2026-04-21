@@ -34,7 +34,10 @@ use tokio::sync::mpsc;
 use crate::errors::TuiError;
 use crate::grid::{DefaultColors, Grid, HlAttr, HlTable, LineCell};
 
-const PLUGIN_NAME: &str = "nefor-tui";
+/// Plugin version, advertised in the optional self-description event
+/// emitted after `ready_ok` (see `send_hello`). Not sent over the wire
+/// in the handshake itself — identity is assigned by the engine from
+/// spawn-config.
 const PLUGIN_VERSION: &str = "0.1.0";
 const PROTOCOL_VERSION: &str = "0.1";
 
@@ -61,24 +64,29 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run() -> anyhow::Result<()> {
-    // Stdout writer — single owner, so the initial attach and every later
+    // Stdout writer — single owner, so the initial ready and every later
     // event share one lane and never interleave mid-line.
     let (out_tx, _writer_handle) = transport::spawn_stdout_writer(128);
 
     // Stdin reader. Sender is owned by the spawned task; we consume the
-    // receiver in the main loop and in await_attach_ok.
+    // receiver in the main loop and in await_ready_ok.
     let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, TuiError>>(128);
     let _reader_handle = transport::spawn_stdin_reader(in_tx);
 
-    // 1) Send our attach before touching the terminal. If the engine
-    //    rejects the attach we want to exit cleanly *without* clobbering
-    //    the user's TTY.
-    send_attach(&out_tx).await?;
+    // 1) Send our ready before touching the terminal. If the engine
+    //    rejects the handshake we want to exit cleanly *without*
+    //    clobbering the user's TTY.
+    send_ready(&out_tx).await?;
 
-    let engine_version = transport::await_attach_ok(&mut in_rx)
+    let engine_version = transport::await_ready_ok(&mut in_rx)
         .await
-        .context("waiting for attach_ok")?;
-    tracing::info!(engine_version = %engine_version, "attached");
+        .context("waiting for ready_ok")?;
+    tracing::info!(engine_version = %engine_version, "ready");
+
+    // Optional self-advertisement. Demonstrates the hello-event
+    // convention in docs/plugin-authoring.md without ascribing it to the
+    // spec.
+    send_event(&out_tx, hello_body()).await?;
 
     // 2) Enter raw mode + alt screen + mouse + bracketed paste. Install
     //    TerminalGuard before any possible panic path.
@@ -153,13 +161,13 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
-    // Best-effort graceful detach before TerminalGuard tears down the
-    // alt screen.
-    let _ = out_tx
-        .send(PluginOutgoing::system(SystemBody::Detach {
-            reason: Some("stream closed".into()),
-        }))
-        .await;
+    // Best-effort farewell event before TerminalGuard tears down the
+    // alt screen. Peers that care about plugin liveness observe the
+    // goodbye event and stdout-close; the engine doesn't mediate.
+    let mut bye = Map::new();
+    bye.insert("kind".into(), Value::String("nefor-tui.goodbye".into()));
+    bye.insert("reason".into(), Value::String("stream closed".into()));
+    let _ = out_tx.send(PluginOutgoing::event(bye)).await;
 
     Ok(())
 }
@@ -325,15 +333,23 @@ fn translate_terminal_event(evt: &Event, state: &mut State) -> Option<Map<String
     }
 }
 
-async fn send_attach(out_tx: &mpsc::Sender<PluginOutgoing>) -> anyhow::Result<()> {
+async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> anyhow::Result<()> {
     out_tx
-        .send(PluginOutgoing::system(SystemBody::Attach {
-            name: PLUGIN_NAME.into(),
-            version: PLUGIN_VERSION.into(),
+        .send(PluginOutgoing::system(SystemBody::Ready {
             protocol_version: PROTOCOL_VERSION.into(),
         }))
         .await
-        .map_err(|_| anyhow::anyhow!("stdout writer closed before attach was sent"))
+        .map_err(|_| anyhow::anyhow!("stdout writer closed before ready was sent"))
+}
+
+/// Build the `nefor-tui.hello` self-description event. Purely
+/// informational — peers that want to know what plugins are on the bus
+/// and what versions they run can match on this kind.
+fn hello_body() -> Map<String, Value> {
+    let mut map = Map::new();
+    map.insert("kind".into(), Value::String("nefor-tui.hello".into()));
+    map.insert("version".into(), Value::String(PLUGIN_VERSION.into()));
+    map
 }
 
 async fn send_event(

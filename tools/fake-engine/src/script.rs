@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn parses_verbatim_envelope() {
-        let src = r#"{"type":"system","from":"engine","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"attach_ok","engine_version":"fake-0.1.0"}}"#;
+        let src = r#"{"type":"system","from":"engine","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"ready_ok","engine_version":"fake-0.1.0"}}"#;
         let steps = parse_script(src).expect("ok");
         assert!(matches!(&steps[0], ScriptStep::SendVerbatim(_)));
     }

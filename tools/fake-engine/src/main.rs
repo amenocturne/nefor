@@ -1,7 +1,7 @@
 //! fake-engine — developer harness that impersonates a nefor engine over
 //! NCP stdio.
 //!
-//! Spawns a plugin binary, performs the `attach` → `attach_ok` handshake,
+//! Spawns a plugin binary, performs the `ready` → `ready_ok` handshake,
 //! then either stays passive (logging every message the plugin emits) or
 //! plays back a `.jsonl` script of engine-to-plugin messages. See the
 //! top-level README for usage.
@@ -20,7 +20,7 @@ use crate::script::parse_script;
 
 /// Developer harness that impersonates a nefor engine over NCP stdio.
 ///
-/// Spawns the given plugin binary, performs the attach handshake, and
+/// Spawns the given plugin binary, performs the ready handshake, and
 /// either stays passive (logging every message the plugin emits) or plays
 /// back a .jsonl script of engine-to-plugin messages.
 #[derive(Debug, Parser)]

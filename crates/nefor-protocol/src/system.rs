@@ -1,7 +1,7 @@
 //! System message bodies (spec §5).
 //!
 //! Each variant of [`SystemBody`] maps one-to-one to a recognized system
-//! `kind` from §5.1–§5.7. Adding a variant is a spec change — the enum is
+//! `kind` from §5.1–§5.4. Adding a variant is a spec change — the enum is
 //! intentionally closed, not `#[non_exhaustive]`.
 
 use serde::{Deserialize, Serialize};
@@ -17,43 +17,21 @@ use crate::newtypes::{PluginName, Timestamp};
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SystemBody {
     /// §5.1 — plugin → engine. First message a plugin sends after
-    /// connecting; announces identity and protocol version.
-    Attach {
-        /// The plugin's identity claim (§5.1). Validated on parse:
-        /// non-empty and not `"engine"`.
-        name: String,
-        /// Plugin version (SemVer 2.0.0). Validated on parse.
-        version: String,
-        /// NCP protocol version the plugin implements (SemVer 2.0.0).
+    /// connecting; declares the NCP version the plugin speaks. Identity
+    /// (`from`) is assigned by the engine from spawn-config, not from the
+    /// plugin.
+    Ready {
+        /// NCP protocol version the plugin implements (SemVer 2.0.0 or
+        /// `MAJOR.MINOR` shorthand).
         protocol_version: String,
     },
-    /// §5.2 — engine → plugin. Accepts the attach.
-    AttachOk {
+    /// §5.2 — engine → plugin. Accepts the ready handshake.
+    ReadyOk {
         /// Engine implementation version (SemVer 2.0.0, not validated
         /// here — the plugin receiver decides what to do with it).
         engine_version: String,
     },
-    /// §5.3 — plugin → engine. Graceful shutdown signal.
-    Detach {
-        /// Free-form explanation; logged and forwarded in `plugin_left`.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-    },
-    /// §5.4 — engine → all. A new plugin has successfully attached.
-    PluginJoined {
-        /// The joining plugin's name.
-        name: String,
-        /// The joining plugin's declared version.
-        version: String,
-    },
-    /// §5.5 — engine → all. A plugin has disconnected.
-    PluginLeft {
-        /// The departed plugin's name.
-        name: String,
-        /// Categorical reason for departure.
-        reason: PluginLeftReason,
-    },
-    /// §5.6 — engine → all. The engine is shutting down.
+    /// §5.3 — engine → all. The engine is shutting down.
     Shutdown {
         /// Free-form explanation of why the engine is shutting down.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -62,7 +40,7 @@ pub enum SystemBody {
         #[serde(skip_serializing_if = "Option::is_none")]
         grace_ms: Option<u64>,
     },
-    /// §5.7 — engine → one plugin. Protocol-level error report.
+    /// §5.4 — engine → one plugin. Protocol-level error report.
     Error {
         /// Machine-readable error code drawn from §8.
         code: ErrorCode,
@@ -74,31 +52,15 @@ pub enum SystemBody {
     },
 }
 
-/// Categorical reason carried by `plugin_left` (§5.5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PluginLeftReason {
-    /// Plugin sent a graceful `detach` before closing.
-    Detach,
-    /// Connection closed without a `detach`.
-    Disconnect,
-    /// Plugin process terminated abnormally.
-    Crash,
-    /// Engine closed the connection for non-protocol reasons.
-    Evicted,
-}
-
 /// Error codes carried by `error.code` (§8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     /// Plugin's declared `protocol_version` is not supported (closes).
     ProtocolVersionMismatch,
-    /// Another plugin with the same name is currently attached (closes).
-    NameTaken,
-    /// Attach body missing fields, wrong types, or malformed version
-    /// strings (closes).
-    InvalidAttach,
+    /// Ready body missing required fields, wrong types, or malformed
+    /// version strings (closes).
+    InvalidReady,
     /// Received line is not valid JSON, or has missing/forbidden envelope
     /// fields.
     MalformedEnvelope,
@@ -130,22 +92,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn attach_serializes_as_snake_case_kind() {
-        let body = SystemBody::Attach {
-            name: "mock-plugin".into(),
-            version: "0.1.0".into(),
+    fn ready_serializes_as_snake_case_kind() {
+        let body = SystemBody::Ready {
             protocol_version: "0.1".into(),
         };
         let json = serde_json::to_value(&body).expect("serialize");
-        assert_eq!(json["kind"], "attach");
-        assert_eq!(json["name"], "mock-plugin");
+        assert_eq!(json["kind"], "ready");
+        assert_eq!(json["protocol_version"], "0.1");
     }
 
     #[test]
-    fn detach_omits_none_reason() {
-        let body = SystemBody::Detach { reason: None };
+    fn ready_ok_serializes() {
+        let body = SystemBody::ReadyOk {
+            engine_version: "0.1.0".into(),
+        };
         let json = serde_json::to_string(&body).expect("serialize");
-        assert_eq!(json, r#"{"kind":"detach"}"#);
+        assert_eq!(json, r#"{"kind":"ready_ok","engine_version":"0.1.0"}"#);
     }
 
     #[test]
@@ -159,23 +121,10 @@ mod tests {
     }
 
     #[test]
-    fn plugin_left_reason_round_trips() {
-        let body = SystemBody::PluginLeft {
-            name: "p".into(),
-            reason: PluginLeftReason::Crash,
-        };
-        let json = serde_json::to_string(&body).expect("serialize");
-        assert!(json.contains(r#""reason":"crash""#));
-        let back: SystemBody = serde_json::from_str(&json).expect("parse");
-        assert_eq!(back, body);
-    }
-
-    #[test]
     fn error_code_round_trips() {
         for code in [
             ErrorCode::ProtocolVersionMismatch,
-            ErrorCode::NameTaken,
-            ErrorCode::InvalidAttach,
+            ErrorCode::InvalidReady,
             ErrorCode::MalformedEnvelope,
             ErrorCode::BodyNotObject,
             ErrorCode::UnknownKind,
@@ -197,7 +146,7 @@ mod tests {
 
     #[test]
     fn system_body_rejects_unknown_fields() {
-        let raw = r#"{"kind":"detach","reason":"x","extra":1}"#;
+        let raw = r#"{"kind":"ready","protocol_version":"0.1","extra":1}"#;
         let err = serde_json::from_str::<SystemBody>(raw).unwrap_err();
         assert!(err.to_string().contains("extra"));
     }

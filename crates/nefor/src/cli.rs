@@ -25,6 +25,12 @@ pub struct Cli {
     /// Override the config directory (highest precedence; beats `NEFOR_APPNAME`).
     #[arg(long, value_name = "DIR")]
     pub config: Option<PathBuf>,
+
+    /// Override the plugin root directory (highest precedence; beats
+    /// `NEFOR_PLUGIN_DIR` and the XDG / dev fallbacks). Each registered
+    /// plugin gets `<this-dir>/<name>/` as its working directory.
+    #[arg(long, value_name = "DIR")]
+    pub plugin_dir: Option<PathBuf>,
 }
 
 /// Parse CLI arguments from the current process' `argv`.

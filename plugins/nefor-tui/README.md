@@ -18,8 +18,10 @@ useful only for wire smoke-testing with a fake engine.
 ## Protocol (sub-protocol, NCP v0.1)
 
 All kinds below live on `body.kind` inside `type: "event"` envelopes. The
-plugin attaches under the name `nefor-tui` and uses NCP `protocol_version`
-`"0.1"`.
+plugin connects, sends `ready { protocol_version: "0.1" }`, waits for
+`ready_ok`, and emits an optional `nefor-tui.hello` event with its
+version. Identity on the wire is assigned by the engine from spawn-config,
+not from the plugin.
 
 ### Events the plugin CONSUMES (engine → tui)
 
@@ -47,7 +49,7 @@ in `u32` (`0xRRGGBB`); absent highlight fields inherit from
 | `nefor-tui.input.paste`   | `{text: string}` — bulk paste (bracketed paste)                                                                     |
 | `nefor-tui.input.mouse`   | `{action: string, button?: string, row: u32, col: u32, modifiers: string[]}`                                        |
 | `nefor-tui.input.resize`  | `{cols: u32, rows: u32}` — emitted on SIGWINCH and once at startup                                                  |
-| `nefor-tui.ready`         | `{cols: u32, rows: u32}` — emitted once, immediately after `attach_ok`, to declare the plugin is rendering          |
+| `nefor-tui.ready`         | `{cols: u32, rows: u32}` — emitted once, immediately after `ready_ok`, to declare the plugin is rendering           |
 
 `key` is the main key symbol: single-character strings like `"a"` /
 `"A"` / `"!"`, or descriptive names like `"enter"`, `"backspace"`,
@@ -66,16 +68,19 @@ deterministically.
 
 ### Lifecycle
 
-1. Connect stdio; send NCP `attach { name: "nefor-tui", version: "0.1.0", protocol_version: "0.1" }`.
-2. Wait for `attach_ok` on stdin. On `error`, log (stderr) and exit 1.
-3. Enter raw mode + alt screen + mouse capture + bracketed paste. A
+1. Connect stdio; send NCP `ready { protocol_version: "0.1" }`.
+2. Wait for `ready_ok` on stdin. On `error`, log (stderr) and exit 1.
+3. Emit a `nefor-tui.hello` event with the plugin's version (optional
+   self-description — see `docs/plugin-authoring.md`).
+4. Enter raw mode + alt screen + mouse capture + bracketed paste. A
    `Drop`-based guard restores the terminal on normal exit, error, or
    panic.
-4. Emit `nefor-tui.input.resize` and then `nefor-tui.ready` with the
+5. Emit `nefor-tui.input.resize` and then `nefor-tui.ready` with the
    measured terminal dimensions.
-5. Main loop: multiplex (a) stdin NCP messages, (b) crossterm events,
+6. Main loop: multiplex (a) stdin NCP messages, (b) crossterm events,
    (c) SIGWINCH via crossterm's `Event::Resize`.
-6. On engine `shutdown`, send `detach` and exit.
+7. On engine `shutdown`, emit a `nefor-tui.goodbye` event and exit.
+   Closing stdout is the actual shutdown signal the engine sees.
 
 ### Not in scope
 

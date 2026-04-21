@@ -185,14 +185,14 @@ mod tests {
         let env = Envelope::system(
             PluginName::new("mock-plugin").expect("valid"),
             ts(),
-            SystemBody::Detach {
-                reason: Some("user quit".into()),
+            SystemBody::Ready {
+                protocol_version: "0.1".into(),
             },
         );
         let line = env.to_line();
         assert_eq!(
             line,
-            r#"{"type":"system","from":"mock-plugin","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"detach","reason":"user quit"}}"#
+            r#"{"type":"system","from":"mock-plugin","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"ready","protocol_version":"0.1"}}"#
         );
     }
 
@@ -216,7 +216,7 @@ mod tests {
         let env = Envelope::system(
             PluginName::engine(),
             ts(),
-            SystemBody::AttachOk {
+            SystemBody::ReadyOk {
                 engine_version: "0.1.0".into(),
             },
         );
@@ -226,15 +226,13 @@ mod tests {
 
     #[test]
     fn outgoing_encodes_only_type_and_body() {
-        let out = PluginOutgoing::system(SystemBody::Attach {
-            name: "p".into(),
-            version: "0.1.0".into(),
+        let out = PluginOutgoing::system(SystemBody::Ready {
             protocol_version: "0.1".into(),
         });
         let line = out.to_line();
         assert_eq!(
             line,
-            r#"{"type":"system","body":{"kind":"attach","name":"p","version":"0.1.0","protocol_version":"0.1"}}"#
+            r#"{"type":"system","body":{"kind":"ready","protocol_version":"0.1"}}"#
         );
     }
 }

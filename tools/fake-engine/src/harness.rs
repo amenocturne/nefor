@@ -1,4 +1,4 @@
-//! The harness itself: spawn the plugin, do the attach handshake, then
+//! The harness itself: spawn the plugin, do the ready handshake, then
 //! concurrently pump messages in both directions.
 
 use std::path::Path;
@@ -10,6 +10,10 @@ use anyhow::{anyhow, Context, Result};
 use nefor_protocol::{
     Body, Envelope, MessageKind, PluginName, PluginOutgoing, SystemBody, Timestamp,
 };
+
+// Plugin-outgoing parser is used on the handshake line (plugin sends
+// {type, body} — no from/ts); the full-envelope parser is used for the
+// logging reader (where the plugin might be sending replies).
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, Mutex};
@@ -17,7 +21,7 @@ use tokio::sync::{mpsc, Mutex};
 use crate::log;
 use crate::script::ScriptStep;
 
-/// Version string reported in `attach_ok.engine_version`.
+/// Version string reported in `ready_ok.engine_version`.
 pub const ENGINE_VERSION: &str = "fake-0.1.0";
 /// Grace window for the ctrl-c triggered shutdown.
 const CTRL_C_GRACE: Duration = Duration::from_millis(2000);
@@ -48,26 +52,35 @@ pub async fn run(plugin_path: &Path, script: Option<Vec<ScriptStep>>) -> Result<
 
     let mut reader = BufReader::new(stdout).lines();
 
-    // --- Handshake: read first line, expect attach, respond with attach_ok.
-    let attach_line = reader
+    // --- Handshake: read first line, expect ready, respond with ready_ok.
+    let ready_line = reader
         .next_line()
         .await
-        .context("reading attach line from plugin")?
-        .ok_or_else(|| anyhow!("plugin closed stdout before sending attach"))?;
+        .context("reading ready line from plugin")?
+        .ok_or_else(|| anyhow!("plugin closed stdout before sending ready"))?;
 
-    let plugin_identity = {
+    let plugin_label = plugin_name_from_command(plugin_path);
+    {
         let mut s = stdin.lock().await;
-        handle_attach(&attach_line, &mut s).await?
-    };
-    eprintln!("-- fake-engine: attached plugin {:?}", plugin_identity);
+        handle_ready(&ready_line, &mut s).await?;
+    }
+    eprintln!("-- fake-engine: ready plugin {plugin_label:?}");
 
     // --- Reader task: logs every line the plugin emits to our stderr.
+    // Plugins send `{type, body}` (PluginOutgoing), not fully-stamped
+    // envelopes. We stamp the plugin's label and a fresh timestamp so
+    // the log format stays uniform; this stamping is display-only, not
+    // a claim of authority (the real engine stamps from spawn-config).
     let (reader_done_tx, mut reader_done_rx) = mpsc::channel::<()>(1);
+    let label_for_reader = plugin_label.clone();
     let reader_task = tokio::spawn(async move {
         let mut lines = reader;
         while let Ok(Some(raw)) = lines.next_line().await {
-            match Envelope::parse_line(&raw) {
-                Ok(env) => eprintln!("{}", log::format_envelope(&env)),
+            match PluginOutgoing::parse_line(&raw) {
+                Ok(out) => {
+                    let env = stamp_for_display(&label_for_reader, out);
+                    eprintln!("{}", log::format_envelope(&env));
+                }
                 Err(e) => eprintln!(
                     "{}",
                     log::format_unparseable(&raw, &format!("parse error: {e}"))
@@ -166,31 +179,24 @@ fn spawn_plugin(plugin_path: &Path) -> Result<Child> {
         .with_context(|| format!("spawning plugin {plugin_path:?}"))
 }
 
-/// Parse the plugin's first line, validate it as an `attach`, and send
-/// `attach_ok` in return. Returns the plugin's declared name on success.
-async fn handle_attach(line: &str, stdin: &mut ChildStdin) -> Result<String> {
-    let env =
-        Envelope::parse_line(line).with_context(|| format!("parsing attach line: {line:?}"))?;
-    let name = match (&env.kind, &env.body) {
-        (
-            MessageKind::System,
-            Body::System(SystemBody::Attach {
-                name,
-                version: _,
-                protocol_version,
-            }),
-        ) => {
+/// Parse the plugin's first line, validate it as a `ready`, and send
+/// `ready_ok` in return. The plugin sends a `PluginOutgoing` shape
+/// ({type, body} — no `from`/`ts`), so we use the outgoing parser here.
+async fn handle_ready(line: &str, stdin: &mut ChildStdin) -> Result<()> {
+    let out = PluginOutgoing::parse_line(line)
+        .with_context(|| format!("parsing ready line: {line:?}"))?;
+    match (&out.kind, &out.body) {
+        (MessageKind::System, Body::System(SystemBody::Ready { protocol_version })) => {
             if protocol_version != "0.1" {
                 return Err(anyhow!(
                     "plugin reported protocol_version {protocol_version:?}, fake-engine speaks 0.1"
                 ));
             }
-            name.clone()
         }
         _ => {
             return Err(anyhow!(
-                "first message was not a system attach: got {:?}",
-                env
+                "first message was not a system ready: got {:?}",
+                out
             ));
         }
     };
@@ -198,12 +204,35 @@ async fn handle_attach(line: &str, stdin: &mut ChildStdin) -> Result<String> {
     let ok = Envelope::system(
         PluginName::engine(),
         Timestamp::now(),
-        SystemBody::AttachOk {
+        SystemBody::ReadyOk {
             engine_version: ENGINE_VERSION.into(),
         },
     );
     write_line(stdin, &ok.to_line()).await?;
-    Ok(name)
+    Ok(())
+}
+
+/// Derive a display name for the plugin from its binary path. The
+/// real engine assigns names from spawn-config; the fake-engine doesn't
+/// have that, so it falls back to the binary's file stem.
+fn plugin_name_from_command(plugin_path: &Path) -> String {
+    plugin_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("plugin")
+        .to_owned()
+}
+
+/// Stamp a plugin-outgoing message with a display-only identity + timestamp,
+/// so the log output shows the same shape the real engine would produce.
+fn stamp_for_display(label: &str, out: PluginOutgoing) -> Envelope {
+    let from = PluginName::new(label).unwrap_or_else(|_| PluginName::engine());
+    Envelope {
+        kind: out.kind,
+        from,
+        ts: Timestamp::now(),
+        body: out.body,
+    }
 }
 
 async fn send_shutdown(stdin: &mut ChildStdin, grace: Duration) -> Result<()> {

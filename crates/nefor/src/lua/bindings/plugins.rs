@@ -1,25 +1,25 @@
 //! `nefor.plugins.spawn` — register a plugin to be spawned.
 //!
 //! The engine knows which plugin binaries to launch from the shared
-//! [`PluginRegistry`]. `init.lua` fills that registry via this binding; the
-//! actual spawn happens after `init.lua` returns, when the engine enters its
-//! run phase (see [`crate::ncp::Broker::spawn`]).
+//! [`PluginRegistry`]. `init.lua` fills that registry via this binding;
+//! the actual spawn happens after `init.lua` returns, when the engine
+//! enters its run phase (see `crate::ncp::runner`).
 //!
-//! Only the minimum surface for wiring a plugin name to an OS command:
+//! Minimum surface: a plugin name and a command array.
 //!
 //! ```lua
 //! nefor.plugins.spawn {
-//!   name = "nefor-tui",
-//!   command = "nefor-tui",      -- required; from PATH or absolute
-//!   args = { "--foo", "bar" },  -- optional
-//!   env  = { KEY = "VAL" },     -- optional
-//!   cwd  = "/some/path",        -- optional
+//!   name    = "mock-plugin",
+//!   command = { "./target/release/mock-plugin", "--script", "scenarios/cc-like.lua" },
 //! }
 //! ```
-
-use std::collections::HashMap;
+//!
+//! Plugins that need shell features, env variables, or a custom working
+//! directory wrap themselves in a user-chosen wrapper script and expose
+//! that as their `command`. See `docs/plugin-authoring.md`.
 
 use mlua::{Lua, Table, Value};
+use nefor_protocol::PluginName;
 
 use crate::ncp::{PluginSpec, SharedPluginRegistry};
 
@@ -32,20 +32,31 @@ pub fn install_plugins(
     let tbl = lua.create_table()?;
 
     let spawn_fn = lua.create_function(move |_, opts: Table| {
-        let name: String = match opts.get::<Value>("name")? {
-            Value::String(s) => {
-                let s = s.to_str()?.to_owned();
-                if s.is_empty() {
-                    return Err(mlua::Error::runtime(
-                        "nefor.plugins.spawn: 'name' must be a non-empty string",
-                    ));
-                }
-                if s == "engine" {
-                    return Err(mlua::Error::runtime(
-                        "nefor.plugins.spawn: 'name' \"engine\" is reserved",
-                    ));
-                }
-                s
+        // Reject the fields that were removed in the runner-broker split
+        // with a specific, actionable error message. Better than a
+        // generic "unknown field" — we can tell users exactly what to do
+        // instead.
+        for removed in ["args", "env", "cwd"] {
+            let v: Value = opts.get(removed)?;
+            if !matches!(v, Value::Nil) {
+                let hint = match removed {
+                    "args" => "put args inside the command array, e.g. command = { binary, \"--flag\", \"value\" }",
+                    "env" => "set env vars in a wrapper script and invoke that script as the command",
+                    "cwd" => "the engine always uses <plugin-dir>/<name>/ as cwd; use a wrapper script if you need a different one",
+                    _ => unreachable!(),
+                };
+                return Err(mlua::Error::runtime(format!(
+                    "nefor.plugins.spawn: unknown field '{removed}'; {hint}"
+                )));
+            }
+        }
+
+        let name_raw: String = match opts.get::<Value>("name")? {
+            Value::String(s) => s.to_str()?.to_owned(),
+            Value::Nil => {
+                return Err(mlua::Error::runtime(
+                    "nefor.plugins.spawn: 'name' is required",
+                ));
             }
             other => {
                 return Err(mlua::Error::runtime(format!(
@@ -54,27 +65,11 @@ pub fn install_plugins(
                 )));
             }
         };
+        let name = PluginName::new(name_raw).map_err(|e| {
+            mlua::Error::runtime(format!("nefor.plugins.spawn: {e}"))
+        })?;
 
-        let command: String = match opts.get::<Value>("command")? {
-            Value::String(s) => {
-                let s = s.to_str()?.to_owned();
-                if s.is_empty() {
-                    return Err(mlua::Error::runtime(
-                        "nefor.plugins.spawn: 'command' must be a non-empty string",
-                    ));
-                }
-                s
-            }
-            other => {
-                return Err(mlua::Error::runtime(format!(
-                    "nefor.plugins.spawn: 'command' must be a string (got {})",
-                    other.type_name(),
-                )));
-            }
-        };
-
-        let args: Vec<String> = match opts.get::<Value>("args")? {
-            Value::Nil => Vec::new(),
+        let command: Vec<String> = match opts.get::<Value>("command")? {
             Value::Table(t) => {
                 let mut out = Vec::new();
                 for pair in t.pairs::<i64, Value>() {
@@ -83,64 +78,46 @@ pub fn install_plugins(
                         Value::String(s) => out.push(s.to_str()?.to_owned()),
                         other => {
                             return Err(mlua::Error::runtime(format!(
-                                "nefor.plugins.spawn: 'args' entries must be strings (got {})",
+                                "nefor.plugins.spawn: 'command' entries must be strings (got {})",
                                 other.type_name(),
                             )));
                         }
                     }
                 }
-                out
-            }
-            other => {
-                return Err(mlua::Error::runtime(format!(
-                    "nefor.plugins.spawn: 'args' must be a table of strings or nil (got {})",
-                    other.type_name(),
-                )));
-            }
-        };
-
-        let env: HashMap<String, String> = match opts.get::<Value>("env")? {
-            Value::Nil => HashMap::new(),
-            Value::Table(t) => {
-                let mut out = HashMap::new();
-                for pair in t.pairs::<String, String>() {
-                    let (k, v) = pair?;
-                    out.insert(k, v);
+                if out.is_empty() {
+                    return Err(mlua::Error::runtime(
+                        "nefor.plugins.spawn: 'command' must be a non-empty array of strings",
+                    ));
+                }
+                if out.iter().any(String::is_empty) {
+                    return Err(mlua::Error::runtime(
+                        "nefor.plugins.spawn: 'command' entries must be non-empty strings",
+                    ));
                 }
                 out
             }
+            Value::Nil => {
+                return Err(mlua::Error::runtime(
+                    "nefor.plugins.spawn: 'command' is required (an array of strings, first is the binary)",
+                ));
+            }
             other => {
                 return Err(mlua::Error::runtime(format!(
-                    "nefor.plugins.spawn: 'env' must be a table of string→string or nil (got {})",
+                    "nefor.plugins.spawn: 'command' must be an array of strings (got {})",
                     other.type_name(),
                 )));
             }
         };
 
-        let cwd: Option<String> = match opts.get::<Value>("cwd")? {
-            Value::Nil => None,
-            Value::String(s) => Some(s.to_str()?.to_owned()),
-            other => {
-                return Err(mlua::Error::runtime(format!(
-                    "nefor.plugins.spawn: 'cwd' must be a string or nil (got {})",
-                    other.type_name(),
-                )));
-            }
-        };
-
-        let spec = PluginSpec {
-            name,
-            command,
-            args,
-            env,
-            cwd,
-        };
+        let spec = PluginSpec { name, command };
 
         let mut guard = match plugins.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.register(spec).map_err(mlua::Error::runtime)?;
+        guard
+            .register(spec)
+            .map_err(|e| mlua::Error::runtime(e.to_string()))?;
         Ok(())
     })?;
     tbl.set("spawn", spawn_fn)?;
@@ -167,27 +144,23 @@ mod tests {
     #[test]
     fn spawn_registers_minimal_plugin() {
         let (lua, plugins) = setup();
-        lua.load(r#"nefor.plugins.spawn { name = "tui", command = "nefor-tui" }"#)
+        lua.load(r#"nefor.plugins.spawn { name = "tui", command = { "nefor-tui" } }"#)
             .exec()
             .expect("ok");
         let guard = plugins.lock().unwrap();
         let specs = guard.list();
         assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].name, "tui");
-        assert_eq!(specs[0].command, "nefor-tui");
-        assert!(specs[0].args.is_empty());
+        assert_eq!(specs[0].name.as_str(), "tui");
+        assert_eq!(specs[0].command, vec!["nefor-tui".to_string()]);
     }
 
     #[test]
-    fn spawn_registers_with_args_env_cwd() {
+    fn spawn_registers_with_multi_element_command() {
         let (lua, plugins) = setup();
         lua.load(
             r#"nefor.plugins.spawn {
                 name = "p",
-                command = "bin",
-                args = { "--flag", "x" },
-                env = { KEY = "VAL" },
-                cwd = "/tmp",
+                command = { "bin", "--flag", "x" },
             }"#,
         )
         .exec()
@@ -195,16 +168,17 @@ mod tests {
         let guard = plugins.lock().unwrap();
         let specs = guard.list();
         assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].args, vec!["--flag".to_string(), "x".to_string()]);
-        assert_eq!(specs[0].env.get("KEY").map(String::as_str), Some("VAL"));
-        assert_eq!(specs[0].cwd.as_deref(), Some("/tmp"));
+        assert_eq!(
+            specs[0].command,
+            vec!["bin".to_string(), "--flag".to_string(), "x".to_string()]
+        );
     }
 
     #[test]
     fn spawn_rejects_missing_name() {
         let (lua, _) = setup();
         let err = lua
-            .load(r#"nefor.plugins.spawn { command = "x" }"#)
+            .load(r#"nefor.plugins.spawn { command = { "x" } }"#)
             .exec()
             .expect_err("missing name");
         assert!(err.to_string().contains("name"));
@@ -221,25 +195,84 @@ mod tests {
     }
 
     #[test]
+    fn spawn_rejects_empty_command_array() {
+        let (lua, _) = setup();
+        let err = lua
+            .load(r#"nefor.plugins.spawn { name = "p", command = {} }"#)
+            .exec()
+            .expect_err("empty command");
+        assert!(err.to_string().contains("command"));
+    }
+
+    #[test]
     fn spawn_rejects_reserved_name() {
         let (lua, _) = setup();
         let err = lua
-            .load(r#"nefor.plugins.spawn { name = "engine", command = "x" }"#)
+            .load(r#"nefor.plugins.spawn { name = "engine", command = { "x" } }"#)
             .exec()
             .expect_err("reserved");
-        assert!(err.to_string().contains("reserved"));
+        assert!(err.to_string().contains("engine"));
     }
 
     #[test]
     fn spawn_rejects_duplicate_name() {
         let (lua, _) = setup();
-        lua.load(r#"nefor.plugins.spawn { name = "p", command = "a" }"#)
+        lua.load(r#"nefor.plugins.spawn { name = "p", command = { "a" } }"#)
             .exec()
             .expect("first ok");
         let err = lua
-            .load(r#"nefor.plugins.spawn { name = "p", command = "b" }"#)
+            .load(r#"nefor.plugins.spawn { name = "p", command = { "b" } }"#)
             .exec()
             .expect_err("dup");
         assert!(err.to_string().contains("already registered"));
+    }
+
+    #[test]
+    fn spawn_rejects_removed_args_field() {
+        let (lua, _) = setup();
+        let err = lua
+            .load(
+                r#"nefor.plugins.spawn {
+                    name = "p",
+                    command = { "bin" },
+                    args = { "--flag" },
+                }"#,
+            )
+            .exec()
+            .expect_err("args field removed");
+        let msg = err.to_string();
+        assert!(msg.contains("args"), "message should name the field: {msg}");
+    }
+
+    #[test]
+    fn spawn_rejects_removed_env_field() {
+        let (lua, _) = setup();
+        let err = lua
+            .load(
+                r#"nefor.plugins.spawn {
+                    name = "p",
+                    command = { "bin" },
+                    env = { K = "V" },
+                }"#,
+            )
+            .exec()
+            .expect_err("env field removed");
+        assert!(err.to_string().contains("env"));
+    }
+
+    #[test]
+    fn spawn_rejects_removed_cwd_field() {
+        let (lua, _) = setup();
+        let err = lua
+            .load(
+                r#"nefor.plugins.spawn {
+                    name = "p",
+                    command = { "bin" },
+                    cwd = "/tmp",
+                }"#,
+            )
+            .exec()
+            .expect_err("cwd field removed");
+        assert!(err.to_string().contains("cwd"));
     }
 }

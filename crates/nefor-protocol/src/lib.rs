@@ -1,6 +1,6 @@
 //! nefor-protocol — types and wire codec for the Nefor Composition Protocol.
 //!
-//! This crate models the envelope (§3) and the seven system message kinds
+//! This crate models the envelope (§3) and the four system message kinds
 //! (§5) of [NCP v0.1][spec], plus encode/decode helpers for the JSON Lines
 //! wire format. It is consumed by the engine broker and by plugin-side
 //! Rust implementations.
@@ -35,5 +35,5 @@ mod system;
 
 pub use envelope::{Body, Envelope, MessageKind, PluginOutgoing};
 pub use newtypes::{PluginName, PluginNameError, Timestamp, TimestampParseError};
-pub use parse::{InvalidAttachReason, InvalidBodyReason, ParseError, SystemBodyKind};
-pub use system::{ErrorCode, Offending, PluginLeftReason, SystemBody};
+pub use parse::{InvalidBodyReason, InvalidReadyReason, ParseError, SystemBodyKind};
+pub use system::{ErrorCode, Offending, SystemBody};

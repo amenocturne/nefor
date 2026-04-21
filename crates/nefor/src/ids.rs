@@ -9,10 +9,9 @@
 
 use std::fmt;
 
-/// Identifier for a configured plugin. Matches the plugin's NCP `attach.name`
-/// claim for spawned plugins, but is independent of NCP naming — this is the
-/// engine-side identity used by spawn config and log tagging before the
-/// plugin has attached.
+/// Identifier for a configured plugin. Set by spawn config (Lua
+/// `nefor.plugins.spawn { name = ... }`) and stamped as the `from`
+/// identity on every envelope the corresponding connection emits.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PluginId(pub String);
 

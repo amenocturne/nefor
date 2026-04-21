@@ -64,7 +64,18 @@ Corollaries:
 - **Pin message strings in tests** if the wire carries them (e.g., NCP `error.message`). An accidental reword must break a test, not silently change protocol-level behaviour.
 - **Parse errors carry structured context.** Not `Error(String)` with a freeform diagnostic; `Error { kind, field, reason }` with enum-typed slots that consumers can match on.
 
-This is why `nefor-protocol`'s `ParseError` has variants like `InvalidAttachBody(InvalidAttachReason)` and `InvalidSystemBody { kind, reason }` — the broker branches on variants, not message text. When you find yourself writing `msg.contains("...")` to decide what to do, stop: that's a missing enum arm.
+This is why `nefor-protocol`'s `ParseError` has variants like `InvalidReadyBody(InvalidReadyReason)` and `InvalidSystemBody { kind, reason }` — the broker branches on variants, not message text. When you find yourself writing `msg.contains("...")` to decide what to do, stop: that's a missing enum arm.
+
+### Runner / broker split
+
+The engine binary has exactly two subsystems:
+
+- **Runner** — spawns declared subprocesses with direct `Command::new(binary).args(...)`, bridges stdio, detects exit. Does not parse NCP; does not know what the bus is.
+- **Broker** — parses NCP envelopes, stamps `from` (from runner-assigned name) and `ts`, validates system messages, broadcasts event messages, enforces bounded per-peer queues.
+
+Runner does not invoke shell, does not manage env vars, does not handle cwd beyond the `<plugin-dir>/<name>/` convention. Plugins that need shell features, env, supervision, or daemon patterns wrap themselves in a user-chosen wrapper script and expose that as their `command`. A future community plugin can provide these as reusable services.
+
+This split is why nefor is cross-platform for free: the engine never assumes `/bin/sh` exists. It only assumes the declared binary is exec'able — which is how `std::process::Command` works on every supported platform.
 
 ### Do we even need it?
 
@@ -104,11 +115,11 @@ These principles shape NCP and the engine's runtime behaviour. They also appear 
 
 The engine understands only the system messages defined in the spec. Everything else — event bodies, sub-protocols, request/response patterns, addressing conventions — is opaque to the engine.
 
-When adding functionality: first ask "can a plugin do this?" If yes, it's a plugin. Only things that require engine-level privilege (managing attachments, stamping delivery facts, brokering the bus) belong in the engine.
+When adding functionality: first ask "can a plugin do this?" If yes, it's a plugin. Only things that require engine-level privilege (managing the connection lifecycle, stamping delivery facts, brokering the bus) belong in the engine.
 
 ### Broadcast
 
-The bus is a fan-out mechanism. Every event message reaches every attached plugin. Plugins filter by matching on body fields. No subscriptions, no routing tables, no addressing enforcement.
+The bus is a fan-out mechanism. Every event message reaches every connected plugin. Plugins filter by matching on body fields. No subscriptions, no routing tables, no addressing enforcement.
 
 This is load-bearing because it gives observability, replay, debug-tapping, and metrics plugins for free. Adding routing would cost more than it saves.
 
@@ -164,7 +175,7 @@ The first form asserts authority and tells the reader what to do next. The secon
 
 The spec describes what the engine does. It does not prescribe what plugins do internally. Any sentence of the form "the plugin makes/decides/uses/avoids X" where X is plugin-internal is a smell — rewrite as engine-speak.
 
-> ✅ "The engine rejects the attach with `protocol_version_mismatch` if the declared version does not match."
+> ✅ "The engine rejects the ready with `protocol_version_mismatch` if the declared version does not match."
 >
 > ❌ "The plugin must check that its protocol version matches the engine's."
 

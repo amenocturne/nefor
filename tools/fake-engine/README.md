@@ -7,9 +7,9 @@ real engine.
 ## What it does
 
 1. Spawns a plugin binary with stdin and stdout piped.
-2. Reads the plugin's first line and validates it as a [§5.1 `attach`][spec]
-   system message. Malformed attach → print parse error and exit 1.
-3. Sends an `attach_ok` (with `engine_version: "fake-0.1.0"`) back on the
+2. Reads the plugin's first line and validates it as a [§5.1 `ready`][spec]
+   system message. Malformed ready → print parse error and exit 1.
+3. Sends a `ready_ok` (with `engine_version: "fake-0.1.0"`) back on the
    plugin's stdin.
 4. Then either:
    - **Passive mode** (no `--script`): stays connected and logs every
@@ -30,6 +30,10 @@ plugin message is one line:
 <ts> <from> <type>: <body-summary>
 ```
 
+The fake-engine does not assign a plugin name from spawn-config (that's
+a real-engine concern); it derives a display label from the binary's
+file stem purely for its own logs.
+
 [spec]: ../../protocol/v0.1/spec.md
 
 ## Usage
@@ -41,7 +45,7 @@ fake-engine path/to/plugin-binary [--script path/to/script.jsonl]
 From the workspace root:
 
 ```
-# Passive mode: attach and listen.
+# Passive mode: ready and listen.
 cargo run -p fake-engine -- target/debug/nefor-tui
 
 # Script mode: drive the plugin through a render.
@@ -90,7 +94,6 @@ The fake engine is deliberately tiny. It does not:
 
 - Broadcast events between multiple plugins (it drives one plugin at a
   time).
-- Emit `plugin_joined` / `plugin_left` roster messages.
 - Enforce backpressure or queue overflow.
 - Validate plugin-emitted messages against any schema beyond the NCP
   envelope — unparseable lines are printed with an `<unparseable>` prefix

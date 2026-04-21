@@ -12,19 +12,21 @@ pub enum BrokerError {
     Spawn {
         /// Plugin name (from spawn config).
         name: String,
-        /// The OS command.
-        command: String,
+        /// The exec command (first element is the binary).
+        command: Vec<String>,
         /// Underlying IO error.
         #[source]
         source: std::io::Error,
     },
 
-    /// Misconfigured cwd that doesn't exist when we went to set it.
-    #[error("plugin {name:?} cwd {cwd:?} does not exist")]
-    InvalidCwd {
+    /// The plugin's working directory does not exist. The runner expects
+    /// `<plugin-root>/<name>/` to be present; directory creation is a
+    /// plugin-manager concern, not the engine's.
+    #[error("plugin {name:?} working directory {cwd:?} does not exist")]
+    MissingPluginDir {
         /// Plugin name.
         name: String,
-        /// The cwd path.
+        /// The resolved cwd path.
         cwd: PathBuf,
     },
 

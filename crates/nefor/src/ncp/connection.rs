@@ -1,4 +1,4 @@
-//! A single plugin connection: read loop, write queue, attach state.
+//! A single plugin connection: read loop, write queue, ready state.
 //!
 //! The connection is a value the broker owns in its central state. Each has
 //! a bounded MPSC receive queue (default 1024 per §6) the broker pushes
@@ -69,8 +69,9 @@ pub enum ConnectionInbound {
     Message(PluginOutgoing),
     /// Parse failure — broker maps to `error` code per §8.
     ParseError(ParseError),
-    /// Reader loop ended — EOF or fatal IO error. Broker reports
-    /// `plugin_left` with the appropriate reason.
+    /// Reader loop ended — EOF or fatal IO error. Broker logs the
+    /// departure; peers that care about peer liveness rely on plugin-
+    /// authored conventions (see `docs/plugin-authoring.md`).
     Closed {
         /// Whether the reader hit EOF cleanly or a transport error.
         reason: ReaderEnd,
@@ -331,10 +332,8 @@ mod tests {
         let id = ConnectionId::next();
         let handle = tokio::spawn(run_reader(id, Box::pin(server), tx));
 
-        // Send a valid attach outgoing envelope.
-        let out = PluginOutgoing::system(nefor_protocol::SystemBody::Attach {
-            name: "p".into(),
-            version: "0.1.0".into(),
+        // Send a valid ready outgoing envelope.
+        let out = PluginOutgoing::system(nefor_protocol::SystemBody::Ready {
             protocol_version: "0.1".into(),
         });
         let line = format!("{}\n", out.to_line());
@@ -396,7 +395,7 @@ mod tests {
         let env = Envelope::system(
             PluginName::engine(),
             Timestamp::now(),
-            SystemBody::AttachOk {
+            SystemBody::ReadyOk {
                 engine_version: "0.1.0".into(),
             },
         );
@@ -407,7 +406,7 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
         assert!(line.ends_with('\n'));
-        assert!(line.contains("attach_ok"));
+        assert!(line.contains("ready_ok"));
         handle.await.unwrap();
     }
 

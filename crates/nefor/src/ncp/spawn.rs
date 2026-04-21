@@ -1,28 +1,47 @@
 //! Plugin spawn configuration and registry.
 //!
 //! [`PluginSpec`] captures what `nefor.plugins.spawn { ... }` in `init.lua`
-//! declares: a plugin name, an OS command, optional args/env/cwd. The engine
-//! collects these specs during `init.lua` load and hands them to the broker
-//! when it enters the run phase.
+//! declares: a plugin name and the command array to exec. The engine
+//! collects these specs during `init.lua` load and hands them to the
+//! broker when it enters the run phase.
+//!
+//! The runner spawns subprocesses with direct `Command::new(binary)` —
+//! no shell, no env-map, no cwd override. Working directory is
+//! `<plugin-root>/<name>/` (resolved at spawn time by the engine). Plugins
+//! that need shell features wrap themselves in a user-chosen wrapper
+//! script and expose that as their `command`.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+use nefor_protocol::PluginName;
 
 /// A single plugin launch config.
 #[derive(Debug, Clone)]
 pub struct PluginSpec {
-    /// Plugin name claim. Must match the plugin's `attach.name` on the wire,
-    /// otherwise attach will be rejected with `name_taken` against the
-    /// plugin's self-declared name.
-    pub name: String,
-    /// Executable to invoke. Looked up via `PATH` if not absolute.
-    pub command: String,
-    /// Positional arguments.
-    pub args: Vec<String>,
-    /// Extra environment variables merged into the child's env.
-    pub env: HashMap<String, String>,
-    /// Working directory for the child; inherits the engine's cwd if `None`.
-    pub cwd: Option<String>,
+    /// Validated plugin name. The engine stamps `from = name` on every
+    /// envelope this connection emits.
+    pub name: PluginName,
+    /// The exec command: `[binary, ...args]`. First element is the binary
+    /// path (looked up via `PATH` if not absolute); remaining elements are
+    /// positional arguments. Must be non-empty.
+    pub command: Vec<String>,
+}
+
+/// Failure modes from [`PluginRegistry::register`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RegisterError {
+    /// Another spec with the same name was already registered. Catching
+    /// duplicates at config time gives a clearer error than a spawn-time
+    /// failure once two processes would share an identity on the wire.
+    #[error("plugin {0:?} is already registered")]
+    DuplicateName(String),
+    /// The command array was empty. The first element is the binary to
+    /// exec; without it there's nothing to spawn.
+    #[error("plugin {name:?} has an empty command array")]
+    EmptyCommand {
+        /// The offending plugin name.
+        name: String,
+    },
 }
 
 /// In-memory list of plugin specs.
@@ -42,12 +61,17 @@ impl PluginRegistry {
         Self::default()
     }
 
-    /// Register a plugin. Rejects duplicate names — the broker requires unique
-    /// names across the attach phase, and catching duplicates at config time
-    /// gives a clearer error than letting two connections race to attach.
-    pub fn register(&mut self, spec: PluginSpec) -> Result<(), String> {
+    /// Register a plugin. Rejects duplicate names and empty command arrays
+    /// at config time — both would otherwise surface as obscure runtime
+    /// failures once the broker tried to spawn.
+    pub fn register(&mut self, spec: PluginSpec) -> Result<(), RegisterError> {
+        if spec.command.is_empty() {
+            return Err(RegisterError::EmptyCommand {
+                name: spec.name.as_str().to_owned(),
+            });
+        }
         if self.specs.iter().any(|s| s.name == spec.name) {
-            return Err(format!("plugin {:?} is already registered", spec.name));
+            return Err(RegisterError::DuplicateName(spec.name.as_str().to_owned()));
         }
         self.specs.push(spec);
         Ok(())
@@ -71,11 +95,8 @@ mod tests {
 
     fn spec(name: &str) -> PluginSpec {
         PluginSpec {
-            name: name.to_string(),
-            command: "echo".to_string(),
-            args: vec![],
-            env: HashMap::new(),
-            cwd: None,
+            name: PluginName::new(name).expect("valid"),
+            command: vec!["echo".into()],
         }
     }
 
@@ -92,7 +113,18 @@ mod tests {
         let mut r = PluginRegistry::new();
         r.register(spec("a")).unwrap();
         let err = r.register(spec("a")).unwrap_err();
-        assert!(err.contains("already registered"));
+        assert_eq!(err, RegisterError::DuplicateName("a".into()));
+    }
+
+    #[test]
+    fn register_rejects_empty_command() {
+        let mut r = PluginRegistry::new();
+        let empty = PluginSpec {
+            name: PluginName::new("p").expect("valid"),
+            command: vec![],
+        };
+        let err = r.register(empty).unwrap_err();
+        assert_eq!(err, RegisterError::EmptyCommand { name: "p".into() });
     }
 
     #[test]

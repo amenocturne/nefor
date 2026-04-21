@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 
 use crate::envelope::{Body, Envelope, MessageKind, PluginOutgoing};
 use crate::newtypes::{PluginName, Timestamp};
-use crate::system::{ErrorCode, Offending, PluginLeftReason, SystemBody};
+use crate::system::{ErrorCode, Offending, SystemBody};
 
 /// Failure modes from parsing a wire line into an envelope.
 ///
@@ -70,12 +70,12 @@ pub enum ParseError {
     #[error("system body field `kind` has wrong JSON type (expected string)")]
     SystemBodyKindNotString,
 
-    /// Semantic or structural validation failure inside an `attach` body.
-    /// Per NCP §8 this maps to `invalid_attach` and closes the connection.
-    #[error("invalid attach: {0}")]
-    InvalidAttachBody(#[source] InvalidAttachReason),
+    /// Semantic or structural validation failure inside a `ready` body.
+    /// Per NCP §8 this maps to `invalid_ready` and closes the connection.
+    #[error("invalid ready: {0}")]
+    InvalidReadyBody(#[source] InvalidReadyReason),
 
-    /// Structural failure inside a non-attach system body. Per NCP §8 this
+    /// Structural failure inside a non-ready system body. Per NCP §8 this
     /// maps to `malformed_envelope` and keeps the connection open.
     #[error("invalid system body for kind `{kind}`: {reason}")]
     InvalidSystemBody {
@@ -101,61 +101,38 @@ pub enum ParseError {
     EmptyFrom,
 }
 
-/// Why an `attach` body was rejected.
+/// Why a `ready` body was rejected.
 ///
-/// Covers both §5.1's semantic invariants (empty name, reserved identity,
-/// malformed version strings) and structural faults (missing required
-/// fields, wrong types, extra fields). Per §8 every one of these produces
-/// `invalid_attach` and closes the connection.
+/// The ready body carries only `protocol_version`; every rejection — bad
+/// semver, missing field, wrong type, extra field — surfaces as this one
+/// variant. Per §8 the engine maps every ready-body fault to
+/// `invalid_ready` and closes the connection.
 #[derive(Debug, thiserror::Error)]
-pub enum InvalidAttachReason {
-    /// `name` was the empty string.
-    #[error("`name` must not be empty")]
-    EmptyName,
-    /// `name` was the reserved `"engine"` identity.
-    #[error("`name` must not be the reserved identity \"engine\"")]
-    ReservedName,
-    /// `version` did not parse as SemVer 2.0.0.
-    #[error("`version` is not a valid SemVer 2.0.0 string: {raw:?}")]
-    InvalidVersion {
-        /// The offending raw string.
-        raw: String,
-        /// The underlying semver parse error.
-        #[source]
-        source: semver::Error,
-    },
-    /// `protocol_version` did not parse as SemVer 2.0.0 or `MAJOR.MINOR`.
+pub enum InvalidReadyReason {
+    /// `protocol_version` was missing, not a string, the wrong shape, or
+    /// the body carried unexpected extra fields.
     #[error("`protocol_version` must be SemVer 2.0.0 or MAJOR.MINOR shorthand: {raw:?}")]
     InvalidProtocolVersion {
-        /// The offending raw string.
+        /// The offending raw string (or the name of the extra field, for
+        /// structural faults). Diagnostic only — consumers branch on the
+        /// variant, not on `raw`.
         raw: String,
     },
-    /// Attach body failed structural validation (missing/extra/wrong-type
-    /// field). Kept as a nested `InvalidBodyReason` so the vocabulary is
-    /// shared with non-attach bodies.
-    #[error("{0}")]
-    Structural(#[source] InvalidBodyReason),
 }
 
 /// Identifies which system message kind a body-level structural error was
 /// produced for. Printed verbatim in error messages and used for
 /// broker-side diagnostics.
 ///
-/// `Attach` is intentionally excluded — attach errors flow through
-/// [`ParseError::InvalidAttachBody`] / [`InvalidAttachReason`] instead.
+/// `Ready` is intentionally excluded — ready errors flow through
+/// [`ParseError::InvalidReadyBody`] / [`InvalidReadyReason`] instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemBodyKind {
-    /// `attach_ok` (§5.2).
-    AttachOk,
-    /// `detach` (§5.3).
-    Detach,
-    /// `plugin_joined` (§5.4).
-    PluginJoined,
-    /// `plugin_left` (§5.5).
-    PluginLeft,
-    /// `shutdown` (§5.6).
+    /// `ready_ok` (§5.2).
+    ReadyOk,
+    /// `shutdown` (§5.3).
     Shutdown,
-    /// `error` (§5.7).
+    /// `error` (§5.4).
     Error,
 }
 
@@ -163,10 +140,7 @@ impl SystemBodyKind {
     /// Wire-format name (snake_case, matches the `kind` discriminant).
     pub fn wire_name(self) -> &'static str {
         match self {
-            Self::AttachOk => "attach_ok",
-            Self::Detach => "detach",
-            Self::PluginJoined => "plugin_joined",
-            Self::PluginLeft => "plugin_left",
+            Self::ReadyOk => "ready_ok",
             Self::Shutdown => "shutdown",
             Self::Error => "error",
         }
@@ -199,7 +173,7 @@ pub enum InvalidBodyReason {
     #[error("unexpected field `{0}`")]
     ExtraField(String),
     /// An enum-valued field held a string outside its closed vocabulary
-    /// (e.g. `plugin_left.reason` or `error.code`).
+    /// (e.g. `error.code`).
     #[error("field `{field}` has invalid value {value:?} (expected one of {expected})")]
     InvalidEnumValue {
         /// Offending field name.
@@ -394,23 +368,9 @@ fn parse_system_body(mut obj: Map<String, Value>) -> Result<SystemBody, ParseErr
     };
 
     match kind.as_str() {
-        "attach" => parse_attach(obj).map_err(ParseError::InvalidAttachBody),
-        "attach_ok" => parse_attach_ok(obj).map_err(|reason| ParseError::InvalidSystemBody {
-            kind: SystemBodyKind::AttachOk,
-            reason,
-        }),
-        "detach" => parse_detach(obj).map_err(|reason| ParseError::InvalidSystemBody {
-            kind: SystemBodyKind::Detach,
-            reason,
-        }),
-        "plugin_joined" => {
-            parse_plugin_joined(obj).map_err(|reason| ParseError::InvalidSystemBody {
-                kind: SystemBodyKind::PluginJoined,
-                reason,
-            })
-        }
-        "plugin_left" => parse_plugin_left(obj).map_err(|reason| ParseError::InvalidSystemBody {
-            kind: SystemBodyKind::PluginLeft,
+        "ready" => parse_ready(obj).map_err(ParseError::InvalidReadyBody),
+        "ready_ok" => parse_ready_ok(obj).map_err(|reason| ParseError::InvalidSystemBody {
+            kind: SystemBodyKind::ReadyOk,
             reason,
         }),
         "shutdown" => parse_shutdown(obj).map_err(|reason| ParseError::InvalidSystemBody {
@@ -429,99 +389,41 @@ fn parse_system_body(mut obj: Map<String, Value>) -> Result<SystemBody, ParseErr
 //
 // Each of these takes the body map with `kind` already removed, validates
 // structure (no extras, required fields present, types correct), then
-// applies any per-kind semantic invariants. They return a reason type the
-// caller wraps into `ParseError` — that keeps the variant-mapping for
-// attach-vs-other co-located with the dispatch in `parse_system_body`.
+// applies any per-kind semantic invariants.
 
-fn parse_attach(mut obj: Map<String, Value>) -> Result<SystemBody, InvalidAttachReason> {
-    let name = take_string(&mut obj, "name")
-        .map_err(InvalidAttachReason::Structural)?
-        .ok_or(InvalidAttachReason::Structural(
-            InvalidBodyReason::MissingField("name"),
-        ))?;
-    let version = take_string(&mut obj, "version")
-        .map_err(InvalidAttachReason::Structural)?
-        .ok_or(InvalidAttachReason::Structural(
-            InvalidBodyReason::MissingField("version"),
-        ))?;
-    let protocol_version = take_string(&mut obj, "protocol_version")
-        .map_err(InvalidAttachReason::Structural)?
-        .ok_or(InvalidAttachReason::Structural(
-            InvalidBodyReason::MissingField("protocol_version"),
-        ))?;
-    reject_extras(obj).map_err(InvalidAttachReason::Structural)?;
-
-    if name.is_empty() {
-        return Err(InvalidAttachReason::EmptyName);
-    }
-    if name == "engine" {
-        return Err(InvalidAttachReason::ReservedName);
-    }
-    if let Err(source) = semver::Version::parse(&version) {
-        return Err(InvalidAttachReason::InvalidVersion {
-            raw: version,
-            source,
-        });
-    }
-    // Spec §5.1 says protocol_version is "SemVer 2.0.0 format", but both
-    // §5.1's own example (`"0.1"`) and §9's negotiation rule ("v0.1 engine
-    // rejects any protocol_version other than \"0.1\"") use a two-part
-    // form that strict SemVer would reject. Accept full SemVer OR the
-    // `MAJOR.MINOR` shorthand to cover both the spec's prose and its
-    // examples.
-    if !is_valid_protocol_version(&protocol_version) {
-        return Err(InvalidAttachReason::InvalidProtocolVersion {
-            raw: protocol_version,
-        });
-    }
-
-    Ok(SystemBody::Attach {
-        name,
-        version,
-        protocol_version,
-    })
-}
-
-fn parse_attach_ok(mut obj: Map<String, Value>) -> Result<SystemBody, InvalidBodyReason> {
-    let engine_version = take_string(&mut obj, "engine_version")?
-        .ok_or(InvalidBodyReason::MissingField("engine_version"))?;
-    reject_extras(obj)?;
-    Ok(SystemBody::AttachOk { engine_version })
-}
-
-fn parse_detach(mut obj: Map<String, Value>) -> Result<SystemBody, InvalidBodyReason> {
-    let reason = take_string(&mut obj, "reason")?;
-    reject_extras(obj)?;
-    Ok(SystemBody::Detach { reason })
-}
-
-fn parse_plugin_joined(mut obj: Map<String, Value>) -> Result<SystemBody, InvalidBodyReason> {
-    let name = take_string(&mut obj, "name")?.ok_or(InvalidBodyReason::MissingField("name"))?;
-    let version =
-        take_string(&mut obj, "version")?.ok_or(InvalidBodyReason::MissingField("version"))?;
-    reject_extras(obj)?;
-    Ok(SystemBody::PluginJoined { name, version })
-}
-
-fn parse_plugin_left(mut obj: Map<String, Value>) -> Result<SystemBody, InvalidBodyReason> {
-    let name = take_string(&mut obj, "name")?.ok_or(InvalidBodyReason::MissingField("name"))?;
-    let reason_raw =
-        take_string(&mut obj, "reason")?.ok_or(InvalidBodyReason::MissingField("reason"))?;
-    reject_extras(obj)?;
-    let reason = match reason_raw.as_str() {
-        "detach" => PluginLeftReason::Detach,
-        "disconnect" => PluginLeftReason::Disconnect,
-        "crash" => PluginLeftReason::Crash,
-        "evicted" => PluginLeftReason::Evicted,
-        _ => {
-            return Err(InvalidBodyReason::InvalidEnumValue {
-                field: "reason",
-                value: reason_raw,
-                expected: "\"detach\", \"disconnect\", \"crash\", or \"evicted\"",
+fn parse_ready(mut obj: Map<String, Value>) -> Result<SystemBody, InvalidReadyReason> {
+    // The ready body is tiny (just `protocol_version`). Every structural
+    // fault — missing field, wrong type, extra field — collapses to the
+    // single `invalid_ready` error code per §8, so we funnel them all
+    // through `InvalidProtocolVersion`. The `raw` payload is diagnostic
+    // only; callers should branch on the variant, not on `raw`.
+    let protocol_version = match obj.remove("protocol_version") {
+        Some(Value::String(s)) => s,
+        Some(Value::Null) | None => {
+            return Err(InvalidReadyReason::InvalidProtocolVersion { raw: String::new() })
+        }
+        Some(other) => {
+            return Err(InvalidReadyReason::InvalidProtocolVersion {
+                raw: other.to_string(),
             })
         }
     };
-    Ok(SystemBody::PluginLeft { name, reason })
+    if let Some((k, _)) = obj.into_iter().next() {
+        return Err(InvalidReadyReason::InvalidProtocolVersion { raw: k });
+    }
+    if !is_valid_protocol_version(&protocol_version) {
+        return Err(InvalidReadyReason::InvalidProtocolVersion {
+            raw: protocol_version,
+        });
+    }
+    Ok(SystemBody::Ready { protocol_version })
+}
+
+fn parse_ready_ok(mut obj: Map<String, Value>) -> Result<SystemBody, InvalidBodyReason> {
+    let engine_version = take_string(&mut obj, "engine_version")?
+        .ok_or(InvalidBodyReason::MissingField("engine_version"))?;
+    reject_extras(obj)?;
+    Ok(SystemBody::ReadyOk { engine_version })
 }
 
 fn parse_shutdown(mut obj: Map<String, Value>) -> Result<SystemBody, InvalidBodyReason> {
@@ -553,8 +455,7 @@ fn parse_error_body(mut obj: Map<String, Value>) -> Result<SystemBody, InvalidBo
     let code_raw = take_string(&mut obj, "code")?.ok_or(InvalidBodyReason::MissingField("code"))?;
     let code = match code_raw.as_str() {
         "protocol_version_mismatch" => ErrorCode::ProtocolVersionMismatch,
-        "name_taken" => ErrorCode::NameTaken,
-        "invalid_attach" => ErrorCode::InvalidAttach,
+        "invalid_ready" => ErrorCode::InvalidReady,
         "malformed_envelope" => ErrorCode::MalformedEnvelope,
         "body_not_object" => ErrorCode::BodyNotObject,
         "unknown_kind" => ErrorCode::UnknownKind,
@@ -564,7 +465,7 @@ fn parse_error_body(mut obj: Map<String, Value>) -> Result<SystemBody, InvalidBo
             return Err(InvalidBodyReason::InvalidEnumValue {
                 field: "code",
                 value: code_raw,
-                expected: "a §8 error code (e.g. \"malformed_envelope\", \"invalid_attach\")",
+                expected: "a §8 error code (e.g. \"malformed_envelope\", \"invalid_ready\")",
             })
         }
     };
@@ -658,7 +559,7 @@ mod tests {
     use super::*;
     use crate::envelope::Envelope;
     use crate::newtypes::PluginName;
-    use crate::system::{ErrorCode, Offending, PluginLeftReason};
+    use crate::system::{ErrorCode, Offending};
     use serde_json::json;
 
     fn ts() -> Timestamp {
@@ -679,63 +580,24 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_attach() {
-        roundtrip(SystemBody::Attach {
-            name: "p".into(),
-            version: "0.3.1".into(),
-            protocol_version: "0.1.0".into(),
+    fn round_trip_ready() {
+        roundtrip(SystemBody::Ready {
+            protocol_version: "0.1".into(),
         });
     }
 
     #[test]
-    fn round_trip_attach_ok() {
-        // attach_ok is engine-stamped so the `from` is synthetic here;
-        // on the wire the engine would use PluginName::engine().
+    fn round_trip_ready_ok() {
         let env = Envelope::system(
             PluginName::engine(),
             ts(),
-            SystemBody::AttachOk {
+            SystemBody::ReadyOk {
                 engine_version: "0.1.0".into(),
             },
         );
         let line = env.to_line();
         let parsed = Envelope::parse_line(&line).expect("round-trip");
         assert_eq!(parsed, env);
-    }
-
-    #[test]
-    fn round_trip_detach_with_reason() {
-        roundtrip(SystemBody::Detach {
-            reason: Some("user quit".into()),
-        });
-    }
-
-    #[test]
-    fn round_trip_detach_no_reason() {
-        roundtrip(SystemBody::Detach { reason: None });
-    }
-
-    #[test]
-    fn round_trip_plugin_joined() {
-        roundtrip(SystemBody::PluginJoined {
-            name: "peer".into(),
-            version: "0.2.0".into(),
-        });
-    }
-
-    #[test]
-    fn round_trip_plugin_left() {
-        for reason in [
-            PluginLeftReason::Detach,
-            PluginLeftReason::Disconnect,
-            PluginLeftReason::Crash,
-            PluginLeftReason::Evicted,
-        ] {
-            roundtrip(SystemBody::PluginLeft {
-                name: "peer".into(),
-                reason,
-            });
-        }
     }
 
     #[test]
@@ -910,56 +772,16 @@ mod tests {
         );
     }
 
-    // ---- attach body: semantic invariants ----------------------------------
+    // ---- ready body: invariants --------------------------------------------
 
     #[test]
-    fn rejects_attach_with_engine_name() {
-        let line = r#"{"type":"system","from":"p","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"attach","name":"engine","version":"0.1.0","protocol_version":"0.1.0"}}"#;
+    fn rejects_ready_with_invalid_protocol_version() {
+        let line = r#"{"type":"system","from":"p","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"ready","protocol_version":"not.a.version"}}"#;
         let err = Envelope::parse_line(line).unwrap_err();
         assert!(
             matches!(
                 err,
-                ParseError::InvalidAttachBody(InvalidAttachReason::ReservedName)
-            ),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn rejects_attach_with_empty_name() {
-        let line = r#"{"type":"system","from":"p","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"attach","name":"","version":"0.1.0","protocol_version":"0.1.0"}}"#;
-        let err = Envelope::parse_line(line).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ParseError::InvalidAttachBody(InvalidAttachReason::EmptyName)
-            ),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn rejects_attach_with_invalid_semver() {
-        let line = r#"{"type":"system","from":"p","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"attach","name":"p","version":"not.a.version","protocol_version":"0.1.0"}}"#;
-        let err = Envelope::parse_line(line).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ParseError::InvalidAttachBody(InvalidAttachReason::InvalidVersion { ref raw, .. })
-                    if raw == "not.a.version"
-            ),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn rejects_attach_with_invalid_protocol_version() {
-        let line = r#"{"type":"system","from":"p","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"attach","name":"p","version":"0.1.0","protocol_version":"not.a.version"}}"#;
-        let err = Envelope::parse_line(line).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ParseError::InvalidAttachBody(InvalidAttachReason::InvalidProtocolVersion {
+                ParseError::InvalidReadyBody(InvalidReadyReason::InvalidProtocolVersion {
                     ref raw
                 }) if raw == "not.a.version"
             ),
@@ -967,93 +789,52 @@ mod tests {
         );
     }
 
-    // ---- attach body: structural errors ------------------------------------
-
     #[test]
-    fn rejects_attach_missing_name() {
-        let line = r#"{"type":"system","from":"p","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"attach","version":"0.1.0","protocol_version":"0.1"}}"#;
+    fn rejects_ready_missing_protocol_version() {
+        let line = r#"{"type":"system","from":"p","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"ready"}}"#;
         let err = Envelope::parse_line(line).unwrap_err();
         assert!(
             matches!(
                 err,
-                ParseError::InvalidAttachBody(InvalidAttachReason::Structural(
-                    InvalidBodyReason::MissingField("name")
-                ))
+                ParseError::InvalidReadyBody(InvalidReadyReason::InvalidProtocolVersion { .. })
             ),
             "got {err:?}"
         );
     }
 
     #[test]
-    fn rejects_attach_wrong_type_version() {
-        let line = r#"{"type":"system","from":"p","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"attach","name":"p","version":42,"protocol_version":"0.1"}}"#;
+    fn rejects_ready_extra_field() {
+        let line = r#"{"type":"system","from":"p","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"ready","protocol_version":"0.1","bonus":"x"}}"#;
         let err = Envelope::parse_line(line).unwrap_err();
         assert!(
             matches!(
                 err,
-                ParseError::InvalidAttachBody(InvalidAttachReason::Structural(
-                    InvalidBodyReason::WrongFieldType {
-                        field: "version",
-                        expected: "string",
-                    }
-                ))
+                ParseError::InvalidReadyBody(InvalidReadyReason::InvalidProtocolVersion { .. })
             ),
             "got {err:?}"
         );
     }
 
     #[test]
-    fn rejects_attach_extra_field() {
-        let line = r#"{"type":"system","from":"p","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"attach","name":"p","version":"0.1.0","protocol_version":"0.1","bonus":"x"}}"#;
-        let err = Envelope::parse_line(line).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ParseError::InvalidAttachBody(InvalidAttachReason::Structural(
-                    InvalidBodyReason::ExtraField(ref f)
-                )) if f == "bonus"
-            ),
-            "got {err:?}"
-        );
-    }
-
-    // ---- non-attach body: structural errors --------------------------------
-
-    #[test]
-    fn rejects_plugin_left_missing_name() {
-        let line = r#"{"type":"system","from":"engine","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"plugin_left","reason":"detach"}}"#;
-        let err = Envelope::parse_line(line).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ParseError::InvalidSystemBody {
-                    kind: SystemBodyKind::PluginLeft,
-                    reason: InvalidBodyReason::MissingField("name"),
-                }
-            ),
-            "got {err:?}"
-        );
+    fn accepts_ready_with_major_minor_protocol_version() {
+        let line = r#"{"type":"system","from":"p","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"ready","protocol_version":"0.1"}}"#;
+        let env = Envelope::parse_line(line).expect("valid ready");
+        match env.body {
+            Body::System(SystemBody::Ready { protocol_version }) => {
+                assert_eq!(protocol_version, "0.1");
+            }
+            other => panic!("expected ready body, got {other:?}"),
+        }
     }
 
     #[test]
-    fn rejects_plugin_left_invalid_reason() {
-        let line = r#"{"type":"system","from":"engine","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"plugin_left","name":"p","reason":"retired"}}"#;
-        let err = Envelope::parse_line(line).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ParseError::InvalidSystemBody {
-                    kind: SystemBodyKind::PluginLeft,
-                    reason: InvalidBodyReason::InvalidEnumValue {
-                        field: "reason",
-                        ref value,
-                        ..
-                    },
-                } if value == "retired"
-            ),
-            "got {err:?}"
-        );
+    fn accepts_ready_with_full_semver_protocol_version() {
+        let line = r#"{"type":"system","from":"p","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"ready","protocol_version":"0.1.0"}}"#;
+        let env = Envelope::parse_line(line).expect("valid ready");
+        assert!(matches!(env.body, Body::System(SystemBody::Ready { .. })));
     }
+
+    // ---- non-ready body: structural errors --------------------------------
 
     #[test]
     fn rejects_shutdown_wrong_grace_type() {
@@ -1075,35 +856,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_attach_ok_extra_field() {
-        let line = r#"{"type":"system","from":"engine","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"attach_ok","engine_version":"0.1.0","bonus":1}}"#;
+    fn rejects_ready_ok_extra_field() {
+        let line = r#"{"type":"system","from":"engine","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"ready_ok","engine_version":"0.1.0","bonus":1}}"#;
         let err = Envelope::parse_line(line).unwrap_err();
         assert!(
             matches!(
                 err,
                 ParseError::InvalidSystemBody {
-                    kind: SystemBodyKind::AttachOk,
+                    kind: SystemBodyKind::ReadyOk,
                     reason: InvalidBodyReason::ExtraField(ref f),
                 } if f == "bonus"
-            ),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn rejects_detach_wrong_reason_type() {
-        let line = r#"{"type":"system","from":"p","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"detach","reason":42}}"#;
-        let err = Envelope::parse_line(line).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ParseError::InvalidSystemBody {
-                    kind: SystemBodyKind::Detach,
-                    reason: InvalidBodyReason::WrongFieldType {
-                        field: "reason",
-                        ..
-                    },
-                }
             ),
             "got {err:?}"
         );
@@ -1131,64 +893,25 @@ mod tests {
     // changes break the parser tests rather than downstream broker tests.
 
     #[test]
-    fn display_invalid_attach_empty_name() {
-        let err = ParseError::InvalidAttachBody(InvalidAttachReason::EmptyName);
-        assert_eq!(err.to_string(), "invalid attach: `name` must not be empty");
-    }
-
-    #[test]
-    fn display_invalid_attach_reserved_name() {
-        let err = ParseError::InvalidAttachBody(InvalidAttachReason::ReservedName);
-        assert_eq!(
-            err.to_string(),
-            "invalid attach: `name` must not be the reserved identity \"engine\""
-        );
-    }
-
-    #[test]
-    fn display_invalid_attach_invalid_version() {
-        let source = semver::Version::parse("not.a.version").unwrap_err();
-        let err = ParseError::InvalidAttachBody(InvalidAttachReason::InvalidVersion {
-            raw: "not.a.version".into(),
-            source,
-        });
-        assert_eq!(
-            err.to_string(),
-            "invalid attach: `version` is not a valid SemVer 2.0.0 string: \"not.a.version\""
-        );
-    }
-
-    #[test]
-    fn display_invalid_attach_invalid_protocol_version() {
-        let err = ParseError::InvalidAttachBody(InvalidAttachReason::InvalidProtocolVersion {
+    fn display_invalid_ready_invalid_protocol_version() {
+        let err = ParseError::InvalidReadyBody(InvalidReadyReason::InvalidProtocolVersion {
             raw: "not.a.version".into(),
         });
         assert_eq!(
             err.to_string(),
-            "invalid attach: `protocol_version` must be SemVer 2.0.0 or MAJOR.MINOR shorthand: \"not.a.version\""
-        );
-    }
-
-    #[test]
-    fn display_invalid_attach_structural_missing() {
-        let err = ParseError::InvalidAttachBody(InvalidAttachReason::Structural(
-            InvalidBodyReason::MissingField("name"),
-        ));
-        assert_eq!(
-            err.to_string(),
-            "invalid attach: missing required field `name`"
+            "invalid ready: `protocol_version` must be SemVer 2.0.0 or MAJOR.MINOR shorthand: \"not.a.version\""
         );
     }
 
     #[test]
     fn display_invalid_system_body_missing_field() {
         let err = ParseError::InvalidSystemBody {
-            kind: SystemBodyKind::PluginLeft,
-            reason: InvalidBodyReason::MissingField("name"),
+            kind: SystemBodyKind::ReadyOk,
+            reason: InvalidBodyReason::MissingField("engine_version"),
         };
         assert_eq!(
             err.to_string(),
-            "invalid system body for kind `plugin_left`: missing required field `name`"
+            "invalid system body for kind `ready_ok`: missing required field `engine_version`"
         );
     }
 
@@ -1210,28 +933,12 @@ mod tests {
     #[test]
     fn display_invalid_system_body_extra_field() {
         let err = ParseError::InvalidSystemBody {
-            kind: SystemBodyKind::AttachOk,
+            kind: SystemBodyKind::ReadyOk,
             reason: InvalidBodyReason::ExtraField("bonus".into()),
         };
         assert_eq!(
             err.to_string(),
-            "invalid system body for kind `attach_ok`: unexpected field `bonus`"
-        );
-    }
-
-    #[test]
-    fn display_invalid_system_body_enum_value() {
-        let err = ParseError::InvalidSystemBody {
-            kind: SystemBodyKind::PluginLeft,
-            reason: InvalidBodyReason::InvalidEnumValue {
-                field: "reason",
-                value: "retired".into(),
-                expected: "\"detach\", \"disconnect\", \"crash\", or \"evicted\"",
-            },
-        };
-        assert_eq!(
-            err.to_string(),
-            "invalid system body for kind `plugin_left`: field `reason` has invalid value \"retired\" (expected one of \"detach\", \"disconnect\", \"crash\", or \"evicted\")"
+            "invalid system body for kind `ready_ok`: unexpected field `bonus`"
         );
     }
 
@@ -1274,9 +981,7 @@ mod tests {
 
     #[test]
     fn outgoing_round_trip_system() {
-        let out = PluginOutgoing::system(SystemBody::Attach {
-            name: "p".into(),
-            version: "0.1.0".into(),
+        let out = PluginOutgoing::system(SystemBody::Ready {
             protocol_version: "0.1".into(),
         });
         let line = out.to_line();
@@ -1327,90 +1032,32 @@ mod tests {
     // ---- golden / canonical encoding ---------------------------------------
 
     #[test]
-    fn golden_attach() {
+    fn golden_ready() {
         let env = Envelope::system(
             pn("mock-plugin"),
             ts(),
-            SystemBody::Attach {
-                name: "mock-plugin".into(),
-                version: "0.3.1".into(),
+            SystemBody::Ready {
                 protocol_version: "0.1".into(),
             },
         );
         assert_eq!(
             env.to_line(),
-            r#"{"type":"system","from":"mock-plugin","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"attach","name":"mock-plugin","version":"0.3.1","protocol_version":"0.1"}}"#
+            r#"{"type":"system","from":"mock-plugin","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"ready","protocol_version":"0.1"}}"#
         );
     }
 
     #[test]
-    fn golden_attach_ok() {
+    fn golden_ready_ok() {
         let env = Envelope::system(
             PluginName::engine(),
             ts(),
-            SystemBody::AttachOk {
+            SystemBody::ReadyOk {
                 engine_version: "0.1.0".into(),
             },
         );
         assert_eq!(
             env.to_line(),
-            r#"{"type":"system","from":"engine","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"attach_ok","engine_version":"0.1.0"}}"#
-        );
-    }
-
-    #[test]
-    fn golden_detach_with_reason() {
-        let env = Envelope::system(
-            pn("p"),
-            ts(),
-            SystemBody::Detach {
-                reason: Some("user quit".into()),
-            },
-        );
-        assert_eq!(
-            env.to_line(),
-            r#"{"type":"system","from":"p","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"detach","reason":"user quit"}}"#
-        );
-    }
-
-    #[test]
-    fn golden_detach_no_reason() {
-        let env = Envelope::system(pn("p"), ts(), SystemBody::Detach { reason: None });
-        assert_eq!(
-            env.to_line(),
-            r#"{"type":"system","from":"p","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"detach"}}"#
-        );
-    }
-
-    #[test]
-    fn golden_plugin_joined() {
-        let env = Envelope::system(
-            PluginName::engine(),
-            ts(),
-            SystemBody::PluginJoined {
-                name: "peer".into(),
-                version: "0.2.0".into(),
-            },
-        );
-        assert_eq!(
-            env.to_line(),
-            r#"{"type":"system","from":"engine","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"plugin_joined","name":"peer","version":"0.2.0"}}"#
-        );
-    }
-
-    #[test]
-    fn golden_plugin_left() {
-        let env = Envelope::system(
-            PluginName::engine(),
-            ts(),
-            SystemBody::PluginLeft {
-                name: "peer".into(),
-                reason: PluginLeftReason::Crash,
-            },
-        );
-        assert_eq!(
-            env.to_line(),
-            r#"{"type":"system","from":"engine","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"plugin_left","name":"peer","reason":"crash"}}"#
+            r#"{"type":"system","from":"engine","ts":"2026-04-21T12:34:56.789Z","body":{"kind":"ready_ok","engine_version":"0.1.0"}}"#
         );
     }
 

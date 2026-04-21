@@ -2,7 +2,7 @@
 //!
 //! Splits stdin into complete `\n`-delimited envelopes (spec §2) and parses
 //! each into a [`nefor_protocol::Envelope`]. Writes are accepted via an mpsc
-//! channel so multiple producers (initial attach, stdin-reader-triggered
+//! channel so multiple producers (initial ready, stdin-reader-triggered
 //! replies, terminal input) can share a single owner of stdout without
 //! interleaving mid-line.
 //!
@@ -21,7 +21,10 @@ use crate::errors::TuiError;
 /// envelopes to `tx`. Returns when stdin closes.
 ///
 /// Lines that fail to parse are surfaced through `tx` as an `Err` so the
-/// main loop can log them uniformly.
+/// main loop can log them uniformly. Writes are accepted via an mpsc
+/// channel so multiple producers (initial ready, stdin-reader-triggered
+/// replies, terminal input) can share a single owner of stdout without
+/// interleaving mid-line.
 pub fn spawn_stdin_reader(
     tx: mpsc::Sender<Result<Envelope, TuiError>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -79,12 +82,12 @@ where
     w.flush().await
 }
 
-/// Block until stdin yields the engine's `attach_ok` or `error` reply.
+/// Block until stdin yields the engine's `ready_ok` or `error` reply.
 ///
-/// Called by main.rs between sending our own `attach` and entering the
+/// Called by main.rs between sending our own `ready` and entering the
 /// main loop. Returns the engine version on success, or an error on
 /// rejection / premature close.
-pub async fn await_attach_ok(
+pub async fn await_ready_ok(
     rx: &mut mpsc::Receiver<Result<Envelope, TuiError>>,
 ) -> Result<String, TuiError> {
     use nefor_protocol::{Body, SystemBody};
@@ -92,22 +95,20 @@ pub async fn await_attach_ok(
         let env = match rx.recv().await {
             Some(Ok(env)) => env,
             Some(Err(e)) => return Err(e),
-            None => return Err(TuiError::AttachClosed),
+            None => return Err(TuiError::ReadyClosed),
         };
         match env.body {
-            Body::System(SystemBody::AttachOk { engine_version }) => {
+            Body::System(SystemBody::ReadyOk { engine_version }) => {
                 return Ok(engine_version);
             }
             Body::System(SystemBody::Error { code, message, .. }) => {
-                return Err(TuiError::AttachFailed(format!("{code:?}: {message}")));
+                return Err(TuiError::ReadyFailed(format!("{code:?}: {message}")));
             }
-            // Pre-attach, the engine may already emit plugin_joined
-            // bootstrap frames right after attach_ok, but not before.
-            // Anything else we see first means a protocol violation or a
+            // Anything else before ready_ok is a protocol violation or a
             // stale stream; surface it as a best-effort diagnostic and
-            // keep waiting so we don't miss attach_ok riding behind it.
+            // keep waiting.
             other => {
-                tracing::warn!(?other, "unexpected pre-attach_ok envelope; ignoring");
+                tracing::warn!(?other, "unexpected pre-ready_ok envelope; ignoring");
                 continue;
             }
         }
@@ -120,23 +121,23 @@ mod tests {
     use nefor_protocol::{Envelope, PluginName, SystemBody, Timestamp};
 
     #[tokio::test]
-    async fn await_attach_ok_accepts_attach_ok() {
+    async fn await_ready_ok_accepts_ready_ok() {
         let (tx, mut rx) = mpsc::channel::<Result<Envelope, TuiError>>(4);
         let env = Envelope::system(
             PluginName::engine(),
             Timestamp::parse("2026-04-21T00:00:00.000Z").expect("valid"),
-            SystemBody::AttachOk {
+            SystemBody::ReadyOk {
                 engine_version: "0.1.0".into(),
             },
         );
         tx.send(Ok(env)).await.expect("send");
         drop(tx);
-        let v = await_attach_ok(&mut rx).await.expect("attach ok");
+        let v = await_ready_ok(&mut rx).await.expect("ready ok");
         assert_eq!(v, "0.1.0");
     }
 
     #[tokio::test]
-    async fn await_attach_ok_reports_error() {
+    async fn await_ready_ok_reports_error() {
         use nefor_protocol::ErrorCode;
         let (tx, mut rx) = mpsc::channel::<Result<Envelope, TuiError>>(4);
         let env = Envelope::system(
@@ -150,18 +151,18 @@ mod tests {
         );
         tx.send(Ok(env)).await.expect("send");
         drop(tx);
-        let err = await_attach_ok(&mut rx).await.unwrap_err();
+        let err = await_ready_ok(&mut rx).await.unwrap_err();
         match err {
-            TuiError::AttachFailed(m) => assert!(m.contains("ProtocolVersionMismatch")),
-            _ => panic!("expected AttachFailed, got {err:?}"),
+            TuiError::ReadyFailed(m) => assert!(m.contains("ProtocolVersionMismatch")),
+            _ => panic!("expected ReadyFailed, got {err:?}"),
         }
     }
 
     #[tokio::test]
-    async fn await_attach_ok_detects_closed_stream() {
+    async fn await_ready_ok_detects_closed_stream() {
         let (_tx, mut rx) = mpsc::channel::<Result<Envelope, TuiError>>(1);
         drop(_tx);
-        let err = await_attach_ok(&mut rx).await.unwrap_err();
-        assert!(matches!(err, TuiError::AttachClosed));
+        let err = await_ready_ok(&mut rx).await.unwrap_err();
+        assert!(matches!(err, TuiError::ReadyClosed));
     }
 }

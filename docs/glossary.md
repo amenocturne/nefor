@@ -1,16 +1,22 @@
 # Glossary
 
-Quick lookup for nefor and NCP terminology. All of these are defined in context in the [NCP spec](../protocol/v0.1/spec.md); this page is purely a convenience index.
+Quick lookup for nefor and NCP terminology. Spec-level terms are defined in the [NCP spec](../protocol/v0.1/spec.md); convention-level terms are defined in [`plugin-authoring.md`](plugin-authoring.md). This page is purely a convenience index.
 
-| Term               | Definition                                                                                                              | Defined in                                   |
-| ------------------ | ----------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
-| **Attach**         | The handshake a plugin performs to join the bus.                                                                        | NCP §5.1                                     |
-| **Body**           | The content field of an envelope. Spec-defined shapes for system messages, plugin-authored for events.                  | NCP §3                                       |
-| **Bus**            | The engine's broadcast mechanism. Every event message reaches every attached plugin.                                    | NCP §6                                       |
-| **Engine**         | A process implementing NCP's engine role: runs plugins, brokers messages. Reference implementation: the `nefor` binary. | NCP §1                                       |
-| **Envelope**       | The top-level JSON object with `type`, `from`, `ts`, `body`.                                                            | NCP §3                                       |
-| **Event**          | A message with `type: "event"`. Body is plugin-authored and opaque to the engine.                                       | NCP §4                                       |
-| **Kind**           | The discriminator inside `body` identifying the sub-shape.                                                              | NCP §5                                       |
-| **NCP**            | Nefor Composition Protocol. The communication protocol between the engine and its plugins.                              | [`protocol/v0.1/`](../protocol/v0.1/spec.md) |
-| **Plugin**         | Any process that speaks NCP and has attached to an engine.                                                              | NCP §1                                       |
-| **System message** | A message with `type: "system"`. Body follows a shape defined in NCP §5.                                                | NCP §4                                       |
+| Term               | Definition                                                                                                                                                                   | Defined in                                   |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
+| **Body**           | The content field of an envelope. Spec-defined shapes for system messages, plugin-authored for events.                                                                       | NCP §3                                       |
+| **Broker**         | The part of the engine that parses NCP envelopes, stamps `from`/`ts`, validates system messages, and broadcasts events. Counterpart to the runner.                           | `principles.md`                              |
+| **Bus**            | The engine's broadcast mechanism. Every event message reaches every connected plugin.                                                                                        | NCP §6                                       |
+| **Engine**         | A process implementing NCP's engine role: runs plugins, brokers messages. Reference implementation: the `nefor` binary.                                                      | NCP §1                                       |
+| **Envelope**       | The top-level JSON object with `type`, `from`, `ts`, `body`.                                                                                                                 | NCP §3                                       |
+| **Event**          | A message with `type: "event"`. Body is plugin-authored and opaque to the engine.                                                                                            | NCP §4                                       |
+| **Goodbye event**  | Convention: a plugin-namespaced event a plugin emits just before closing stdout to tell peers why it's leaving. Not spec-level.                                              | `plugin-authoring.md`                        |
+| **Hello event**    | Convention: a plugin-namespaced event a plugin emits immediately after `ready_ok` to advertise its version, capabilities, or other self-description. Not spec-level.         | `plugin-authoring.md`                        |
+| **Kind**           | The discriminator inside `body` identifying the sub-shape.                                                                                                                   | NCP §5                                       |
+| **Manifest**       | Convention: a plugin-namespaced event declaring what kinds the plugin consumes / emits and what version it advertises. Informs peer compatibility decisions. Not spec-level. | `plugin-authoring.md`                        |
+| **NCP**            | Nefor Composition Protocol. The communication protocol between the engine and its plugins.                                                                                   | [`protocol/v0.1/`](../protocol/v0.1/spec.md) |
+| **Plugin**         | Any process that speaks NCP and is connected to an engine.                                                                                                                   | NCP §1                                       |
+| **Ready**          | The first system message a plugin sends, declaring the NCP protocol version it speaks.                                                                                       | NCP §5.1                                     |
+| **Ready OK**       | The engine's reply accepting a `ready`.                                                                                                                                      | NCP §5.2                                     |
+| **Runner**         | The part of the engine that spawns declared subprocesses, assigns their identity from spawn-config, and bridges stdio. Counterpart to the broker.                            | `principles.md`                              |
+| **System message** | A message with `type: "system"`. Body follows a shape defined in NCP §5.                                                                                                     | NCP §4                                       |

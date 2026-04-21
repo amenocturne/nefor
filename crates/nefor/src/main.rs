@@ -30,7 +30,7 @@ use anyhow::Context as _;
 use crate::error::NeforError;
 use crate::events::EventBus;
 use crate::lua::LuaHost;
-use crate::ncp::{Broker, PluginRegistry, SharedPluginRegistry};
+use crate::ncp::{resolve_plugin_root, spawn_plugin, Broker, PluginRegistry, SharedPluginRegistry};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -103,13 +103,25 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let plugin_root = match resolve_plugin_root(args.plugin_dir.clone()) {
+        Some(r) => r,
+        None => {
+            tracing::error!(
+                "could not resolve plugin root directory; set NEFOR_PLUGIN_DIR or pass --plugin-dir"
+            );
+            return Ok(());
+        }
+    };
+    tracing::info!(plugin_root = %plugin_root.as_path().display(), "plugin root resolved");
+
     let mut broker = Broker::new(env!("CARGO_PKG_VERSION"));
     for spec in &specs {
-        match broker.spawn(spec) {
-            Ok(id) => {
+        match spawn_plugin(spec, &plugin_root) {
+            Ok(transport) => {
+                let id = broker.attach_transport(transport, spec.name.clone());
                 tracing::info!(
                     plugin = %spec.name,
-                    command = %spec.command,
+                    command = ?spec.command,
                     conn = %id,
                     "plugin spawned"
                 );
@@ -117,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
             Err(e) => {
                 tracing::error!(
                     plugin = %spec.name,
-                    command = %spec.command,
+                    command = ?spec.command,
                     error = %e,
                     "failed to spawn plugin"
                 );

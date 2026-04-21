@@ -43,7 +43,7 @@ impl PluginName {
     }
 
     /// Construct the reserved engine identity. Only the engine should ever
-    /// produce this; plugins MUST NOT attach under this name.
+    /// produce this; plugins MUST NOT be assigned this name.
     pub fn engine() -> Self {
         Self(String::from("engine"))
     }
@@ -77,8 +77,8 @@ impl<'de> Deserialize<'de> for PluginName {
         // Accept "engine" on the wire — the engine stamps its own messages
         // with from:"engine", and plugin receivers need to parse those.
         // Plugin-name construction via `PluginName::new` still rejects it
-        // for plugin-authored attach payloads (see SystemBody::Attach
-        // parsing in parse.rs).
+        // for any caller that's deciding whether to accept a spawn-time
+        // name (Lua bindings, spawn registry).
         if raw.is_empty() {
             return Err(serde::de::Error::custom(PluginNameError::Empty));
         }
@@ -204,7 +204,8 @@ mod tests {
     fn plugin_name_deserialize_accepts_engine() {
         // The wire-level deserializer accepts "engine" because that's what
         // the engine stamps on its own messages; plugin-level name
-        // validation happens in attach-body parsing.
+        // validation happens when we construct a `PluginName` from spawn
+        // config (via `PluginName::new`), before any wire traffic flows.
         let n: PluginName =
             serde_json::from_str(r#""engine""#).expect("engine is valid on the wire");
         assert!(n.is_engine());

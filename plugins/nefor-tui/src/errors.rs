@@ -8,14 +8,14 @@ use nefor_protocol::ParseError;
 /// Failure modes inside the plugin.
 #[derive(Debug, thiserror::Error)]
 pub enum TuiError {
-    /// The engine rejected our attach or disconnected before sending
-    /// `attach_ok`.
-    #[error("attach failed: {0}")]
-    AttachFailed(String),
+    /// The engine rejected our ready handshake or disconnected before
+    /// sending `ready_ok`.
+    #[error("ready failed: {0}")]
+    ReadyFailed(String),
 
-    /// Stdin closed before we got `attach_ok`.
-    #[error("engine closed the stream before attach_ok")]
-    AttachClosed,
+    /// Stdin closed before we got `ready_ok`.
+    #[error("engine closed the stream before ready_ok")]
+    ReadyClosed,
 
     /// I/O error talking to stdio or the terminal.
     #[error(transparent)]

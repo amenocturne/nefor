@@ -114,6 +114,7 @@ mod tests {
     fn cli_with_config(dir: Option<&str>) -> Cli {
         Cli {
             config: dir.map(PathBuf::from),
+            plugin_dir: None,
         }
     }
 

@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Developer harness that impersonates a nefor engine over NCP stdio. Spawns a plugin binary, performs the attach handshake, and either stays passive (logging everything) or plays back a .jsonl script."
+description = "Developer harness that impersonates a nefor engine over NCP stdio. Spawns a plugin binary, performs the ready handshake, and either stays passive (logging everything) or plays back a .jsonl script."
 
 [[bin]]
 name = "fake-engine"
