@@ -1,28 +1,19 @@
 //! Install `nefor.*` functions onto a Lua table.
 //!
 //! Each `install_*` function takes the shared `nefor` table and mutates it to
-//! add a sub-table. Kept separate from [`crate::lua::vm`] so that the VM
-//! module just orchestrates and the actual API surface lives here.
+//! add a sub-table.
 //!
-//! Per spec §Rust-caliber errors at the Lua boundary: every binding validates
-//! its arguments eagerly and raises a descriptive Lua runtime error on
-//! failure. The Lua-visible message is prefixed with the API path (e.g.,
-//! `nefor.events.on:`) so a `pcall` inside `init.lua` gets a readable
-//! diagnostic without the plugin author having to string-sniff.
-//!
-//! ## Sub-binding modules
-//!
-//! The `events` and `log` installers live in this file (they were the first
-//! commit's scope). The heavier surfaces — `concurrency`, `ui`, `process` —
-//! live in their own sibling modules so each can be read in isolation.
+//! Per D-02 the engine's Lua surface is intentionally small: logging, an
+//! internal event bus (engine-private, not the NCP bus), process spawning
+//! (for plugins that need to run OS commands from Lua), and a plugin
+//! registration table that `init.lua` writes to so the engine knows which
+//! plugin binaries to spawn.
 
-pub mod concurrency;
+pub mod plugins;
 pub mod process;
-pub mod ui;
 
-pub use concurrency::install_concurrency;
+pub use plugins::install_plugins;
 pub use process::install_process;
-pub use ui::install_ui;
 
 use std::sync::Arc;
 
@@ -30,45 +21,32 @@ use mlua::{Function, Lua, Table, Value};
 
 use crate::events::{EventBus, EventName, EventPayload, SubscriptionId};
 
-/// Max length of an event name we echo back in an error message. 64 is long
-/// enough for every reasonable name and short enough that a pathological
-/// megabyte-long string can't show up in logs.
-const MAX_ECHO_LEN: usize = 64;
-
 /// Install `nefor.events.{on, off, emit}` onto `nefor_tbl`.
 ///
-/// `bus` is shared with the rest of the binary — handlers registered from Lua
-/// go on the same bus the TUI emits lifecycle events to, so `nefor.events.on`
-/// sees `startup` / `key` / `tick` / `resize` / `shutdown` with zero extra
-/// wiring.
+/// The bus this wires into is engine-internal — lifecycle events like
+/// `startup` / `shutdown` / `tick`. Plugins observing the NCP bus never see
+/// these; they're for in-engine composition (e.g. a Lua snippet in init.lua
+/// that wants to react to engine shutdown).
 ///
 /// ## Payload conversion
 ///
-/// Event→Lua payload conversion is deliberately restricted:
+/// Event→Lua payload conversion is restricted:
 /// - [`EventPayload::None`] → `nil`
-/// - [`EventPayload::Tick`] → `nil` (the event name *is* the payload)
-/// - [`EventPayload::Key`] → `{ code = <string>, char = <string?>, f = <int?>, modifiers = { ctrl, shift, alt } }`
-/// - [`EventPayload::Resize`] → `{ cols = <int>, rows = <int> }`
+/// - [`EventPayload::Tick`] → `nil`
 /// - [`EventPayload::Custom`] — if the wrapped `Any` downcasts to `String`,
-///   we pass the string; otherwise `nil`. Typed cross-plugin payloads land
-///   when a plugin actually needs them.
+///   pass the string; otherwise `nil`.
 ///
 /// Lua→payload conversion for `nefor.events.emit` is likewise restricted to
-/// `nil` and `string` for MVP; anything else raises a typed error. This keeps
-/// the cross-thread contract simple (no parking `mlua::Value` on the bus).
+/// `nil` and `string`; anything else raises a typed error.
 pub fn install_events(lua: &Lua, nefor_tbl: &Table, bus: Arc<EventBus>) -> mlua::Result<()> {
     let events = lua.create_table()?;
 
-    // nefor.events.on(name, handler) -> sub_id (integer)
     let on_bus = Arc::clone(&bus);
     let on_lua = lua.clone();
     let on_fn = lua.create_function(move |_, (name, handler): (Value, Value)| {
         let name = validate_event_name(&name, "nefor.events.on")?;
         let handler = validate_handler(&handler, "nefor.events.on")?;
 
-        // Stash the Lua function in the registry so the handler closure can
-        // re-fetch it without keeping a live Lua reference alive across the
-        // closure boundary.
         let key = on_lua.create_registry_value(handler)?;
         let key = Arc::new(key);
 
@@ -91,8 +69,6 @@ pub fn install_events(lua: &Lua, nefor_tbl: &Table, bus: Arc<EventBus>) -> mlua:
                     }
                 };
                 if let Err(e) = func.call::<()>(arg) {
-                    // Spec: plugin errors during event callbacks — log + skip,
-                    // don't crash.
                     tracing::error!(error = %e, "Lua event handler raised");
                 }
             }),
@@ -102,7 +78,6 @@ pub fn install_events(lua: &Lua, nefor_tbl: &Table, bus: Arc<EventBus>) -> mlua:
     })?;
     events.set("on", on_fn)?;
 
-    // nefor.events.off(sub_id)
     let off_bus = Arc::clone(&bus);
     let off_fn = lua.create_function(move |_, sub_id: u64| {
         off_bus.off(SubscriptionId::from_u64(sub_id));
@@ -110,7 +85,6 @@ pub fn install_events(lua: &Lua, nefor_tbl: &Table, bus: Arc<EventBus>) -> mlua:
     })?;
     events.set("off", off_fn)?;
 
-    // nefor.events.emit(name, payload) — payload is nil or string only.
     let emit_bus = Arc::clone(&bus);
     let emit_fn = lua.create_function(move |_, (name, payload): (Value, Value)| {
         let name = validate_event_name(&name, "nefor.events.emit")?;
@@ -138,13 +112,6 @@ pub fn install_events(lua: &Lua, nefor_tbl: &Table, bus: Arc<EventBus>) -> mlua:
 }
 
 /// Install `nefor.log.{debug, info, warn, error}` onto `nefor_tbl`.
-///
-/// Each function takes `(msg: string, fields?: table)`. `fields` is optional;
-/// when present we render k=v pairs into the log line because `tracing`'s
-/// structured-fields macro is compile-time-dispatched and can't accept a
-/// dynamic table. Good enough for plugins — richer telemetry is a post-MVP
-/// concern once a concrete subscriber (file logger, plugin log pane) demands
-/// it.
 pub fn install_log(lua: &Lua, nefor_tbl: &Table) -> mlua::Result<()> {
     let log = lua.create_table()?;
     log.set(
@@ -179,14 +146,8 @@ pub fn install_log(lua: &Lua, nefor_tbl: &Table) -> mlua::Result<()> {
     Ok(())
 }
 
-/// Parsed form of `log.<level>(msg, fields?)` — a message plus a pre-formatted
-/// " k=v, k=v" suffix. Pre-formatting here keeps the `tracing::*!` call sites
-/// tiny.
 struct LogArgs {
     msg: String,
-    /// Already leading-space prefixed when non-empty: `" k=v, k=v"`. Empty
-    /// string when no fields were passed. Callers just concatenate — no
-    /// conditional formatting needed at the tracing call site.
     fields: String,
 }
 
@@ -261,7 +222,7 @@ fn value_to_display_str(v: &Value) -> String {
 }
 
 /// Validate `name` is a non-empty, reasonably short Lua string.
-fn validate_event_name(val: &Value, api: &'static str) -> mlua::Result<String> {
+pub(crate) fn validate_event_name(val: &Value, api: &'static str) -> mlua::Result<String> {
     match val {
         Value::String(s) => {
             let s = s.to_str()?.to_owned();
@@ -270,9 +231,6 @@ fn validate_event_name(val: &Value, api: &'static str) -> mlua::Result<String> {
                     "{api}: name must be a non-empty string (got \"\")"
                 )));
             }
-            // Bound the echoed-back value so a megabyte-long name doesn't end
-            // up in logs. The user's own value isn't truncated on the wire;
-            // only the diagnostic message trims it.
             if s.len() > 512 {
                 return Err(mlua::Error::runtime(format!(
                     "{api}: name too long ({} bytes); max is 512",
@@ -303,39 +261,6 @@ fn validate_handler(val: &Value, api: &'static str) -> mlua::Result<Function> {
 fn payload_to_lua(lua: &Lua, payload: &EventPayload) -> mlua::Result<Value> {
     match payload {
         EventPayload::None | EventPayload::Tick => Ok(Value::Nil),
-        EventPayload::Key(ke) => {
-            let t = lua.create_table()?;
-            let (code, maybe_char, maybe_f) = describe_key_code(ke.code);
-            t.set("code", code)?;
-            if let Some(c) = maybe_char {
-                t.set("char", c.to_string())?;
-            }
-            if let Some(f) = maybe_f {
-                t.set("f", f)?;
-            }
-            let mods = lua.create_table()?;
-            mods.set(
-                "ctrl",
-                ke.modifiers
-                    .contains(crossterm::event::KeyModifiers::CONTROL),
-            )?;
-            mods.set(
-                "shift",
-                ke.modifiers.contains(crossterm::event::KeyModifiers::SHIFT),
-            )?;
-            mods.set(
-                "alt",
-                ke.modifiers.contains(crossterm::event::KeyModifiers::ALT),
-            )?;
-            t.set("modifiers", mods)?;
-            Ok(Value::Table(t))
-        }
-        EventPayload::Resize { cols, rows } => {
-            let t = lua.create_table()?;
-            t.set("cols", *cols)?;
-            t.set("rows", *rows)?;
-            Ok(Value::Table(t))
-        }
         EventPayload::Custom(any) => {
             if let Some(s) = any.downcast_ref::<String>() {
                 let ls = lua.create_string(s)?;
@@ -347,58 +272,10 @@ fn payload_to_lua(lua: &Lua, payload: &EventPayload) -> mlua::Result<Value> {
     }
 }
 
-/// Map a [`crossterm::event::KeyCode`] into the `(code_name, maybe_char, maybe_f)`
-/// triple used by the Lua-visible event table. Keeping this centralized means
-/// the `nefor.ui.subscribe_key` pattern matcher (next commit) can reuse the
-/// same name strings.
-fn describe_key_code(code: crossterm::event::KeyCode) -> (&'static str, Option<char>, Option<u8>) {
-    use crossterm::event::KeyCode as K;
-    match code {
-        K::Backspace => ("Backspace", None, None),
-        K::Enter => ("Enter", None, None),
-        K::Left => ("Left", None, None),
-        K::Right => ("Right", None, None),
-        K::Up => ("Up", None, None),
-        K::Down => ("Down", None, None),
-        K::Home => ("Home", None, None),
-        K::End => ("End", None, None),
-        K::PageUp => ("PageUp", None, None),
-        K::PageDown => ("PageDown", None, None),
-        K::Tab => ("Tab", None, None),
-        K::BackTab => ("BackTab", None, None),
-        K::Delete => ("Delete", None, None),
-        K::Insert => ("Insert", None, None),
-        K::F(n) => ("F", None, Some(n)),
-        K::Char(c) => ("Char", Some(c), None),
-        K::Null => ("Null", None, None),
-        K::Esc => ("Esc", None, None),
-        K::CapsLock => ("CapsLock", None, None),
-        K::ScrollLock => ("ScrollLock", None, None),
-        K::NumLock => ("NumLock", None, None),
-        K::PrintScreen => ("PrintScreen", None, None),
-        K::Pause => ("Pause", None, None),
-        K::Menu => ("Menu", None, None),
-        K::KeypadBegin => ("KeypadBegin", None, None),
-        K::Media(_) => ("Media", None, None),
-        K::Modifier(_) => ("Modifier", None, None),
-    }
-}
-
-/// Truncate an event-name echo for log/error messages.
-#[allow(dead_code)]
-fn echo(name: &str) -> String {
-    if name.len() <= MAX_ECHO_LEN {
-        name.to_string()
-    } else {
-        format!("{}…", &name[..MAX_ECHO_LEN])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{EventBus, EventName, EventPayload, KEY, TICK};
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use crate::events::{EventBus, EventName, EventPayload, TICK};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn setup() -> (Lua, Arc<EventBus>) {
@@ -418,15 +295,12 @@ mod tests {
             .load(r#"return nefor.events.on("test", function() end)"#)
             .eval()
             .expect("eval ok");
-        // First subscription starts at 0; the exact value isn't the contract
-        // — that it's an integer is.
         assert_eq!(id, 0);
     }
 
     #[test]
     fn emit_from_rust_invokes_lua_handler() {
         let (lua, bus) = setup();
-        // Lua handler that pokes a Rust-side counter via a global function.
         let counter = Arc::new(AtomicU64::new(0));
         let c = Arc::clone(&counter);
         let observe = lua
@@ -536,45 +410,8 @@ mod tests {
     }
 
     #[test]
-    fn key_payload_table_has_expected_shape() {
-        let (lua, bus) = setup();
-        let got = Arc::new(std::sync::Mutex::new(None::<(String, bool, bool)>));
-        let g = Arc::clone(&got);
-        let observe = lua
-            .create_function(move |_, (code, ctrl, is_char): (String, bool, bool)| {
-                *g.lock().unwrap() = Some((code, ctrl, is_char));
-                Ok(())
-            })
-            .unwrap();
-        lua.globals().set("observe", observe).unwrap();
-
-        lua.load(
-            r#"
-            nefor.events.on("key", function(ev)
-                observe(ev.code, ev.modifiers.ctrl, ev.char ~= nil)
-            end)
-            "#,
-        )
-        .exec()
-        .unwrap();
-
-        let ke = KeyEvent {
-            code: KeyCode::Char('a'),
-            modifiers: KeyModifiers::CONTROL,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        };
-        bus.emit(&EventName::from(KEY), EventPayload::Key(ke));
-
-        let got = got.lock().unwrap().clone();
-        assert_eq!(got, Some(("Char".to_string(), true, true)));
-    }
-
-    #[test]
     fn log_info_with_fields_does_not_error() {
         let (lua, _bus) = setup();
-        // Happy path: a known level, a message, and a fields table with mixed
-        // value types. We verify no error/panic.
         lua.load(
             r#"
             nefor.log.debug("debug msg")

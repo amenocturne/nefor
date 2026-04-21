@@ -3,13 +3,10 @@
 //! Per spec §Code-Level Conventions: typed domain errors with `thiserror`;
 //! `anyhow` stays at the top boundary only. Each submodule defines its own
 //! `Error` enum; [`NeforError`] aggregates them for the binary's return type.
-//!
-//! Variants are only added as modules land — no pre-populated `LuaError` /
-//! `UiError` / `PluginError` here yet.
 
 use crate::config::ConfigError;
 use crate::lua::LuaError;
-use crate::ui::UiError;
+use crate::ncp::BrokerError;
 
 /// Top-level error for the nefor binary.
 #[derive(Debug, thiserror::Error)]
@@ -22,10 +19,6 @@ pub enum NeforError {
     #[error(transparent)]
     Config(#[from] ConfigError),
 
-    /// TUI / widget-registry failures.
-    #[error(transparent)]
-    Ui(#[from] UiError),
-
     /// Lua VM bootstrap / init.lua load failures. `init.lua` *execution*
     /// errors are deliberately not elevated to this top-level type — the
     /// main loop logs them and continues with partial state per spec
@@ -33,6 +26,10 @@ pub enum NeforError {
     /// which is fatal.
     #[error(transparent)]
     Lua(#[from] LuaError),
+
+    /// NCP broker failures (spawn, runtime).
+    #[error(transparent)]
+    Broker(#[from] BrokerError),
 
     /// Filesystem / IO error. Kept now so early FS callers wire through the
     /// same enum instead of inventing ad-hoc error types.
