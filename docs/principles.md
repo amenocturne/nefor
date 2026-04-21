@@ -41,6 +41,31 @@ When tempted to add "just one more thing" to the engine: write a plugin instead.
 
 Build only what the current problem requires. We have one reference implementation of each layer and the problem is tractable; don't design for hypothetical second users until they exist. When they arrive, the contracts are already honest and the refactor follows.
 
+### No v2 that carries v1's legacy
+
+We do not ship backwards-incompatible major versions that try to live alongside the old paradigm. If a rewrite is different enough to need "v2," it's a different project — a new binary, a new name, its own repo. The model is grep / ripgrep, ls / exa, make / just: similar functionality, distinct tools, each internally coherent. The anti-model is React's concurrent mode / hooks / class components coexisting indefinitely — a codebase whose cognitive surface is the sum of every era.
+
+Consequences for how we work:
+
+- **No tech-debt deferral.** We do not accept "fix it properly in v2." There is no v2. Do it right now, or acknowledge the limitation in the current contract.
+- **No compatibility shims.** Breaking changes are fine during development; once shipped, the contract is the contract. If the contract is wrong, it's a new project.
+- **No paradigm cohabitation.** When a better idea lands, we do not keep the old paradigm around "for users who haven't migrated." Migration is a fork-and-replace, not a flag.
+
+Corollary: take the time to get contracts right on the first pass. Short-term pain, long-term stability. Software like `grep(1)` or `ls(1)` has worked for decades without changing shape — that's the target.
+
+### No stringly-typed state
+
+Every piece of state that carries meaning — errors, kinds, reasons, codes, modes, phases — is a closed enum. Never a string, never an integer sentinel, never a free-form tag that downstream code pattern-matches on substrings. Strings exist at exactly two boundaries: serialization to the wire, and human-readable output for logs or UI. Everywhere else, variants.
+
+Corollaries:
+
+- **No string-sniffing to classify errors.** If two error conditions need different handling, they are different enum arms. Adding a `Custom(String)` escape hatch is a smell; stop and add a real variant instead.
+- **Display/Error mapping is explicit per arm.** `thiserror`'s per-variant `#[error("...")]` attributes, not a single catch-all format string that tries to describe every case.
+- **Pin message strings in tests** if the wire carries them (e.g., NCP `error.message`). An accidental reword must break a test, not silently change protocol-level behaviour.
+- **Parse errors carry structured context.** Not `Error(String)` with a freeform diagnostic; `Error { kind, field, reason }` with enum-typed slots that consumers can match on.
+
+This is why `nefor-protocol`'s `ParseError` has variants like `InvalidAttachBody(InvalidAttachReason)` and `InvalidSystemBody { kind, reason }` — the broker branches on variants, not message text. When you find yourself writing `msg.contains("...")` to decide what to do, stop: that's a missing enum arm.
+
 ---
 
 ## Engine / protocol principles
