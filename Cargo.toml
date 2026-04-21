@@ -19,7 +19,7 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
@@ -30,3 +30,5 @@ fs2 = "0.4"
 portable-pty = "0.9"
 notify = "7"
 futures = "0.3"
+time = { version = "0.3", features = ["formatting", "parsing", "serde", "serde-well-known", "macros"] }
+semver = "1"
