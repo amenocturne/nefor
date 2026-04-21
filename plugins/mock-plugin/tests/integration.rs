@@ -10,9 +10,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
-use nefor_protocol::{
-    Envelope, ParseError, PluginName, PluginOutgoing, SystemBody, Timestamp,
-};
+use nefor_protocol::{Envelope, ParseError, PluginName, PluginOutgoing, SystemBody, Timestamp};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
@@ -132,10 +130,7 @@ async fn minimal_script_sends_hello_and_exits_on_shutdown() {
         body.get("kind").and_then(|v| v.as_str()),
         Some("mock-plugin.hello")
     );
-    assert_eq!(
-        body.get("greeting").and_then(|v| v.as_str()),
-        Some("hi")
-    );
+    assert_eq!(body.get("greeting").and_then(|v| v.as_str()), Some("hi"));
 
     // 4) Tell it to shut down and wait for exit.
     send_shutdown(&mut stdin).await;
@@ -198,10 +193,7 @@ async fn echo_script_mirrors_events_back() {
         b.get("echoed_kind").and_then(|v| v.as_str()),
         Some("peer.ping")
     );
-    assert_eq!(
-        b.get("echoed_from").and_then(|v| v.as_str()),
-        Some("peer")
-    );
+    assert_eq!(b.get("echoed_from").and_then(|v| v.as_str()), Some("peer"));
 
     send_shutdown(&mut stdin).await;
     drop(stdin);

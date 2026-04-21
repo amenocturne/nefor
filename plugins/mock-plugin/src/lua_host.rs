@@ -167,10 +167,7 @@ impl LuaHost {
         }
         if let Some(key) = any {
             let f: Function = self.inner.lua.registry_value(&key)?;
-            if let Err(e) = f
-                .call_async::<()>((body_map, envelope_table))
-                .await
-            {
+            if let Err(e) = f.call_async::<()>((body_map, envelope_table)).await {
                 tracing::error!(error = %e, kind = ?kind_opt, "on_any handler raised");
             }
         }
@@ -301,8 +298,8 @@ impl LuaHost {
         let out_tx = self.inner.out_tx.clone();
         let state = Arc::clone(&self.inner.state);
         let name = self.inner.name.clone();
-        let f = lua.create_async_function(
-            move |_, (sub_kind, body): (String, Option<Table>)| {
+        let f =
+            lua.create_async_function(move |_, (sub_kind, body): (String, Option<Table>)| {
                 let out_tx = out_tx.clone();
                 let state = Arc::clone(&state);
                 let name = name.clone();
@@ -340,8 +337,7 @@ impl LuaHost {
                         .await
                         .map_err(|_| mlua::Error::runtime("nefor.emit: stdout writer closed"))
                 }
-            },
-        )?;
+            })?;
         nefor.set("emit", f)?;
         Ok(())
     }
@@ -350,8 +346,8 @@ impl LuaHost {
         let lua = &self.inner.lua;
         let out_tx = self.inner.out_tx.clone();
         let state = Arc::clone(&self.inner.state);
-        let f = lua.create_async_function(
-            move |_, (full_kind, body): (String, Option<Table>)| {
+        let f =
+            lua.create_async_function(move |_, (full_kind, body): (String, Option<Table>)| {
                 let out_tx = out_tx.clone();
                 let state = Arc::clone(&state);
                 async move {
@@ -377,8 +373,7 @@ impl LuaHost {
                         .await
                         .map_err(|_| mlua::Error::runtime("nefor.emit_raw: stdout writer closed"))
                 }
-            },
-        )?;
+            })?;
         nefor.set("emit_raw", f)?;
         Ok(())
     }
@@ -693,12 +688,9 @@ mod tests {
     #[tokio::test]
     async fn emit_raw_bypasses_prefix() {
         let (host, mut rx) = host_ready().await;
-        host.exec_script(
-            "t",
-            r#"nefor.emit_raw("some-peer.message", { a = 1 })"#,
-        )
-        .await
-        .expect("script");
+        host.exec_script("t", r#"nefor.emit_raw("some-peer.message", { a = 1 })"#)
+            .await
+            .expect("script");
         let out = rx.recv().await.expect("emitted");
         let body = match out.body {
             nefor_protocol::Body::Event(m) => m,
