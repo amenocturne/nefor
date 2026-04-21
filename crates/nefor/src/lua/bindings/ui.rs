@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use mlua::{Function, Lua, RegistryKey, Table, Value};
 use ratatui::layout::{Alignment, Rect};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::events::{EventBus, EventName, EventPayload, SubscriptionId, KEY, RESIZE};
@@ -49,24 +49,120 @@ struct LuaWidget {
 
 impl Widget for LuaWidget {
     fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let lines = match self.invoke_renderer() {
+            Some(v) => v,
+            None => return,
+        };
+        // Tail-clip: walk lines from the end, accumulate wrapped row counts,
+        // stop when adding the next line would exceed area.height. Renders
+        // only the tail slice — no Paragraph::scroll offset, no wrap/scroll
+        // math discrepancy. Newest content stays pinned to the bottom of the
+        // area; older content scrolls off the top. A line that partially
+        // overflows is excluded entirely (small blank gap at top), which the
+        // user tolerates more readily than newest content clipped at bottom.
+        let width = area.width as usize;
+        let height = area.height as usize;
+        let mut rows_used = 0usize;
+        let mut start = lines.len();
+        for (i, line) in lines.iter().enumerate().rev() {
+            let r = wrapped_row_count(line, width);
+            if rows_used + r > height {
+                break;
+            }
+            rows_used += r;
+            start = i;
+        }
+        let tail = &lines[start..];
+        let text = tail.join("\n");
+        let paragraph = Paragraph::new(text)
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, area);
+    }
+
+    fn measure(&self, width: u16) -> u16 {
+        let lines = match self.invoke_renderer() {
+            Some(v) => v,
+            None => return 1,
+        };
+        if lines.is_empty() {
+            return 1;
+        }
+        let w = width as usize;
+        let total: usize = lines.iter().map(|l| wrapped_row_count(l, w)).sum();
+        u16::try_from(total.max(1)).unwrap_or(u16::MAX)
+    }
+}
+
+impl LuaWidget {
+    fn invoke_renderer(&self) -> Option<Vec<String>> {
         let func: Function = match self.lua.registry_value(&self.renderer) {
             Ok(f) => f,
             Err(e) => {
                 tracing::error!(error = %e, "Lua widget renderer missing from registry");
-                return;
+                return None;
             }
         };
-        let lines: Vec<String> = match func.call::<Vec<String>>(()) {
-            Ok(v) => v,
+        match func.call::<Vec<String>>(()) {
+            Ok(v) => Some(v),
             Err(e) => {
                 tracing::error!(error = %e, "Lua widget renderer raised");
-                return;
+                None
             }
-        };
-        let text = lines.join("\n");
-        let paragraph = Paragraph::new(text).alignment(Alignment::Left);
-        frame.render_widget(paragraph, area);
+        }
     }
+}
+
+/// Approximate row count for a line rendered under ratatui's
+/// `Wrap { trim: false }` (word-wrap). For most ASCII input this matches
+/// ratatui's output; for very wide graphemes it under-counts. `width == 0`
+/// degrades to one row per input line — safe, non-panicking.
+fn wrapped_row_count(line: &str, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    if line.is_empty() {
+        return 1;
+    }
+    // Mirror ratatui's word-wrap: pack words into the current row, break when
+    // the next word wouldn't fit (counting one separator cell). A word wider
+    // than `width` spans ceil(len / width) rows on its own.
+    let mut rows = 1usize;
+    let mut col = 0usize;
+    for word in line.split_whitespace() {
+        let wlen = word.chars().count();
+        if col == 0 {
+            if wlen <= width {
+                col = wlen;
+            } else {
+                rows += (wlen - 1) / width;
+                col = wlen % width;
+                if col == 0 {
+                    col = width;
+                }
+            }
+        } else {
+            let needed = 1 + wlen;
+            if col + needed <= width {
+                col += needed;
+            } else {
+                rows += 1;
+                if wlen <= width {
+                    col = wlen;
+                } else {
+                    rows += (wlen - 1) / width;
+                    col = wlen % width;
+                    if col == 0 {
+                        col = width;
+                    }
+                }
+            }
+        }
+    }
+    rows
 }
 
 /// Install `nefor.ui.*` onto `nefor_tbl`.
@@ -400,9 +496,16 @@ fn parse_region(val: &Value) -> mlua::Result<Region> {
     })?;
     let size: Option<u16> = t.get::<Option<u16>>("size").unwrap_or(None);
     let size_or_one = size.unwrap_or(1);
+    // `bottom` without a size is auto-height: the widget reports its height
+    // each frame via Widget::measure. Other kinds keep the "no size → 1 row"
+    // default since they rarely grow dynamically (and we don't need a TopAuto
+    // yet; starter registrations don't want one).
     let region = match kind.as_str() {
         "top" => Region::Top(size_or_one),
-        "bottom" => Region::Bottom(size_or_one),
+        "bottom" => match size {
+            Some(h) => Region::Bottom(h),
+            None => Region::BottomAuto,
+        },
         "left" => Region::Left(size_or_one),
         "right" => Region::Right(size_or_one),
         "center" => Region::Center,
@@ -590,13 +693,23 @@ mod tests {
     }
 
     #[test]
-    fn parse_region_missing_size_defaults_to_one() {
+    fn parse_region_bottom_without_size_is_auto() {
         let lua = Lua::new();
         let t = lua.create_table().unwrap();
         t.set("kind", "bottom").unwrap();
         let v = Value::Table(t);
         let r = parse_region(&v).unwrap();
-        assert_eq!(r, Region::Bottom(1));
+        assert_eq!(r, Region::BottomAuto);
+    }
+
+    #[test]
+    fn parse_region_top_without_size_defaults_to_one() {
+        let lua = Lua::new();
+        let t = lua.create_table().unwrap();
+        t.set("kind", "top").unwrap();
+        let v = Value::Table(t);
+        let r = parse_region(&v).unwrap();
+        assert_eq!(r, Region::Top(1));
     }
 
     #[test]

@@ -1,20 +1,69 @@
 //! Tracing setup.
 //!
-//! `tracing_subscriber::fmt` writing to stderr (the TUI owns stdout once it
-//! comes online in a later commit), filtered by `RUST_LOG` via `EnvFilter`,
-//! defaulting to `info`.
+//! Writes to `<config_dir>/nefor.log` by default so log output doesn't paint
+//! over the TUI's alternate-screen frame. When `NEFOR_LOG_STDERR` is set (any
+//! non-empty value), logs go to stderr instead — useful for running without
+//! the TUI (e.g. `cargo test`, `--help` inspections, debugging with the
+//! terminal visible).
+//!
+//! Filter comes from `RUST_LOG` via `EnvFilter`, defaulting to `info`.
+
+use std::fs::OpenOptions;
+use std::path::{Path, PathBuf};
 
 use tracing_subscriber::util::{SubscriberInitExt, TryInitError};
 use tracing_subscriber::{fmt, EnvFilter};
 
-/// Initialize the global tracing subscriber. Returns a typed error so the
-/// caller (currently `main`) can decide whether to abort or continue.
-pub fn init() -> Result<(), TryInitError> {
+#[derive(Debug, thiserror::Error)]
+pub enum LogInitError {
+    #[error("failed to open log file {path:?}: {source}")]
+    OpenFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    Init(#[from] TryInitError),
+}
+
+/// Initialize the global tracing subscriber writing to `log_path`.
+///
+/// Creates parent directories if needed; appends if the file already exists.
+/// ANSI color codes are suppressed for file output (terminals don't interpret
+/// them mid-file and plain text is friendlier to `cat` / `less`).
+pub fn init(log_path: &Path) -> Result<(), LogInitError> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let use_stderr = std::env::var_os("NEFOR_LOG_STDERR").is_some_and(|v| !v.is_empty());
+
+    if use_stderr {
+        fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .finish()
+            .try_init()?;
+        return Ok(());
+    }
+
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| LogInitError::OpenFile {
+            path: log_path.to_path_buf(),
+            source,
+        })?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .map_err(|source| LogInitError::OpenFile {
+            path: log_path.to_path_buf(),
+            source,
+        })?;
 
     fmt()
         .with_env_filter(filter)
-        .with_writer(std::io::stderr)
+        .with_writer(std::sync::Mutex::new(file))
+        .with_ansi(false)
         .finish()
-        .try_init()
+        .try_init()?;
+    Ok(())
 }

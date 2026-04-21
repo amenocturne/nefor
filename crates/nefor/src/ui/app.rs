@@ -62,7 +62,7 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Run the TUI event loop until the user presses `q` or Ctrl-C.
+/// Run the TUI event loop until the user presses Ctrl-C.
 ///
 /// On entry the loop emits [`STARTUP`] on `bus`; on clean exit it emits
 /// [`SHUTDOWN`]. Each crossterm event is forwarded as [`KEY`] or [`RESIZE`];

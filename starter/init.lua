@@ -75,23 +75,28 @@ nefor.ui.register_widget({ kind = "top", size = 1 }, function()
   return { "nefor - claude code chat - " .. session_id_display }
 end)
 
--- Center: the whole transcript. ratatui shows what fits at the top of the
--- area; the newest line is at the bottom of the list. When the list is
--- taller than the area, older lines get clipped off the top (which is
--- backwards — a proper ring-buffer view is post-MVP). For typical short
--- sessions this is fine.
+-- Center: the whole transcript. The Lua widget renderer in nefor tail-aligns
+-- the list when it overflows the area — the newest line stays pinned to the
+-- bottom of the rect and older lines scroll off the top. Manual scrollback
+-- (PgUp/PgDn) is a future plugin; for MVP auto-scroll is all we need.
 nefor.ui.register_widget({ kind = "center" }, function()
   return transcript
 end)
 
--- Bottom: two rows. First row is the live input line with a `|` cursor
--- marker (we can't position a real terminal cursor via the current
--- binding, so we fake it with a character). Second row is a static hint.
-nefor.ui.register_widget({ kind = "bottom", size = 2 }, function()
-  return {
-    "> " .. draft .. "|",
-    "Ctrl-C to quit - Enter to send",
-  }
+-- Bottom: two stacked widgets.
+--   * Hint — pinned to the very last row (Bottom, size 1). Registered first
+--     so the `bottom` layout carves the outermost slot for it.
+--   * Input — the live `> <draft>|` line. Registered with `kind="bottom"`
+--     and no `size`, which nefor treats as auto-height: the widget's
+--     `measure(width)` reports `ceil_wrap(draft)` rows each frame, so the
+--     input grows from 1 row to 2/3/… as the draft wraps. The `|` fakes a
+--     terminal cursor because the current binding can't position one.
+nefor.ui.register_widget({ kind = "bottom", size = 1 }, function()
+  return { "Ctrl-C to quit - Enter to send" }
+end)
+
+nefor.ui.register_widget({ kind = "bottom" }, function()
+  return { "> " .. draft .. "|" }
 end)
 
 push("[info] starter/init.lua loaded. type a prompt and press Enter.")
@@ -140,11 +145,13 @@ session = cc.session.new({
   end,
 
   -- Fires once per turn when Claude signals result:success. `info` carries
-  -- the billing/timing summary from the CC stream.
+  -- the timing summary from the CC stream. We skip the cost field — on a
+  -- Claude Max subscription CC frequently reports $0 and the number is
+  -- meaningless; `/cost` in a CC session is the source of truth when you do
+  -- want the billing picture.
   on_turn_done = function(_final_text, info)
     push(string.format(
-      "[done] $%.4f - %dms - %d turn(s)",
-      info and info.cost_usd or 0,
+      "[done] %dms - %d turn(s)",
       info and info.duration_ms or 0,
       info and info.num_turns or 0
     ))

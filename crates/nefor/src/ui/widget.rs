@@ -29,6 +29,16 @@ use crate::ui::region::{layout, Region};
 pub trait Widget: Send + Sync {
     /// Render this widget into `area`.
     fn render(&self, frame: &mut Frame<'_>, area: Rect);
+
+    /// How many rows this widget wants when registered under
+    /// [`Region::BottomAuto`] (or a future `TopAuto`). Called each frame
+    /// *before* layout with the frame width so the widget can answer after
+    /// soft-wrap. Default `1` — fine for widgets that never claim auto rows.
+    ///
+    /// [`Region::BottomAuto`]: crate::ui::region::Region::BottomAuto
+    fn measure(&self, _width: u16) -> u16 {
+        1
+    }
 }
 
 /// Opaque handle returned by [`WidgetRegistry::register`].
@@ -117,11 +127,28 @@ impl WidgetRegistry {
     ///
     /// Layout is computed each frame from the widget regions — frame size can
     /// change between draws (terminal resize), and the layout computation is
-    /// cheap relative to the draw itself. Caching is a future optimization if
-    /// profiling shows it matters.
+    /// cheap relative to the draw itself.
+    ///
+    /// [`Region::BottomAuto`] is resolved *here* by asking each auto-sized
+    /// widget for its desired height via [`Widget::measure`]. The measure is
+    /// clamped to `[1, frame_height]` so one widget can't eat the whole screen
+    /// by accident. Layout then sees a concrete `Bottom(h)` and never
+    /// encounters `BottomAuto`.
     pub fn render_all(&self, frame: &mut Frame<'_>) {
-        let regions: Vec<Region> = self.entries.iter().map(|e| e.region).collect();
-        let rects = layout(frame.area(), &regions);
+        let frame_area = frame.area();
+        let regions: Vec<Region> = self
+            .entries
+            .iter()
+            .map(|e| match e.region {
+                Region::BottomAuto => {
+                    let want = e.widget.measure(frame_area.width);
+                    let clamped = want.clamp(1, frame_area.height.max(1));
+                    Region::Bottom(clamped)
+                }
+                other => other,
+            })
+            .collect();
+        let rects = layout(frame_area, &regions);
         for (entry, rect) in self.entries.iter().zip(rects) {
             entry.widget.render(frame, rect);
         }

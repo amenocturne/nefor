@@ -19,6 +19,15 @@
 //! `nefor.process.spawn(...)` returns a userdata with `kill()` /
 //! `wait()` / `write_stdin(bytes)` methods. The userdata holds the kill
 //! handle and a one-shot for the exit-wait future.
+//!
+//! ## Stdin policy
+//!
+//! Stdin defaults to `/dev/null`. A pipe is opened only when the caller
+//! explicitly asks for one — either by passing a `stdin = "<string>"`
+//! payload (pre-write + close) or `stdin_piped = true` (keep open for
+//! `proc:write_stdin(bytes)`). `claude -p <prompt>` and similar children
+//! that don't read stdin silently open it otherwise and print a spurious
+//! "no stdin data received" warning after a few seconds.
 
 use std::process::Stdio;
 use std::sync::Arc;
@@ -56,16 +65,33 @@ pub fn install_process(lua: &Lua, nefor_tbl: &Table) -> mlua::Result<()> {
         let cwd: Option<String> = opts.get::<Option<String>>("cwd").unwrap_or(None);
         let env_tbl: Option<Table> = opts.get::<Option<Table>>("env").unwrap_or(None);
         let stdin_string: Option<String> = opts.get::<Option<String>>("stdin").unwrap_or(None);
+        let stdin_piped: bool = opts
+            .get::<Option<bool>>("stdin_piped")
+            .unwrap_or(None)
+            .unwrap_or(false);
 
         let on_stdout = opts.get::<Option<Function>>("on_stdout").unwrap_or(None);
         let on_stderr = opts.get::<Option<Function>>("on_stderr").unwrap_or(None);
         let on_exit = opts.get::<Option<Function>>("on_exit").unwrap_or(None);
 
+        // stdin policy, least-surprise for non-interactive children:
+        //   - `stdin = "<string>"`      → piped, pre-write, close (signals EOF).
+        //   - `stdin_piped = true`      → piped, kept open; caller writes via
+        //                                  the returned handle's `write_stdin`.
+        //   - neither                   → `null`. Without this default, children
+        //     that don't read stdin (e.g. `claude -p "<prompt>"`) still see an
+        //     open pipe and may wait/warn. Null makes stdin a closed /dev/null.
+        let stdin_cfg = if stdin_string.is_some() || stdin_piped {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        };
+
         let mut cmd = Command::new(&cmd_name);
         cmd.args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .stdin(Stdio::piped());
+            .stdin(stdin_cfg);
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }

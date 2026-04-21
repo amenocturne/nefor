@@ -38,14 +38,20 @@ use crate::ui::{NoConfigWidget, Region, SharedRegistry, WidgetRegistry};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    log::init().ok();
-
+    // CLI + config-dir resolution run *before* logging so we know where to
+    // put the log file. Errors here go to stderr via clap / the anyhow chain;
+    // we don't have a log destination yet anyway.
     let args = cli::parse();
     let config_dir = config::resolve(&args)
         .map_err(NeforError::from)
         .context("resolving config directory")?;
 
-    tracing::info!(config_dir = %config_dir, "nefor starting");
+    let log_path = config_dir.as_path().join("nefor.log");
+    if let Err(e) = log::init(&log_path) {
+        eprintln!("nefor: failed to initialize logging at {log_path:?}: {e}");
+    }
+
+    tracing::info!(config_dir = %config_dir, log_path = %log_path.display(), "nefor starting");
 
     let bus = Arc::new(EventBus::new());
     let registry: SharedRegistry = Arc::new(Mutex::new(WidgetRegistry::new()));

@@ -13,8 +13,8 @@ use crate::paths::ConfigDir;
 use crate::ui::widget::Widget;
 
 /// Rendered when `<config_dir>/init.lua` is missing (or failed to load before
-/// registering any widget). Stays on screen until the user presses `q` /
-/// Ctrl-C; no other input is handled by this widget.
+/// registering any widget). Stays on screen until the user presses Ctrl-C;
+/// no other input is handled by this widget.
 pub struct NoConfigWidget {
     config_dir: ConfigDir,
 }
@@ -35,7 +35,7 @@ impl Widget for NoConfigWidget {
              \n\
              quick start: https://github.com/<placeholder>/nefor#quick-start\n\
              \n\
-             press q or Ctrl-C to quit",
+             press Ctrl-C to quit",
             self.config_dir,
         );
         let paragraph = Paragraph::new(text).alignment(Alignment::Center);

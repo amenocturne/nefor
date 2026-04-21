@@ -27,6 +27,15 @@ pub enum Region {
     Top(u16),
     /// Pinned to the bottom of the frame; `u16` is the height in rows.
     Bottom(u16),
+    /// Pinned to the bottom of the frame; height is whatever the widget asks
+    /// for via [`Widget::measure`] each frame. Typical use: a chat input line
+    /// that grows to 2/3/… rows as the draft wraps. Resolved into
+    /// [`Region::Bottom`] by [`WidgetRegistry::render_all`] *before* [`layout`]
+    /// runs, so [`layout`] itself never sees this variant.
+    ///
+    /// [`Widget::measure`]: crate::ui::widget::Widget::measure
+    /// [`WidgetRegistry::render_all`]: crate::ui::widget::WidgetRegistry::render_all
+    BottomAuto,
     /// Pinned to the left edge; `u16` is the width in columns.
     Left(u16),
     /// Pinned to the right edge; `u16` is the width in columns.
@@ -37,35 +46,50 @@ pub enum Region {
 
 /// Compute the rect each region occupies inside `frame_area`.
 ///
-/// The algorithm is a single pass in declaration order: each fixed region
-/// carves its slice off the current remainder (top from the top, bottom from
-/// the bottom, and so on). `Center` claims whatever's left.
+/// Two-pass, deliberately order-independent: pass 1 lets every fixed region
+/// (`Top` / `Bottom` / `Left` / `Right`) carve its slice in declaration order;
+/// pass 2 assigns the leftover rect to any `Center`. Registration order of
+/// `Center` relative to the fixed regions does *not* affect the layout — a
+/// plugin that registers `Center` before `Bottom` still leaves room for the
+/// bottom bar. Without this, a natural registration order (title / transcript
+/// / input) silently ate the input's region.
 ///
-/// The return vector matches `regions` one-for-one. If a region's claim
-/// exceeds the remaining area it yields [`Rect::ZERO`] — later regions stack
-/// up zero-rects behind it. This is the "fail soft, don't panic" posture the
-/// spec asks for at the UI layer; `WidgetRegistry::register` catches the real
-/// design errors (two widgets claiming the same region) at registration time.
+/// The return vector matches `regions` one-for-one. If a fixed region's claim
+/// exceeds the remaining area it gets clamped; later fixed regions may end up
+/// with [`Rect::ZERO`]. `Center` gets [`Rect::ZERO`] when nothing is left.
 pub fn layout(frame_area: Rect, regions: &[Region]) -> Vec<Rect> {
-    let mut out = Vec::with_capacity(regions.len());
+    let mut out = vec![Rect::ZERO; regions.len()];
     let mut remaining = frame_area;
+    let mut center_indices: Vec<usize> = Vec::new();
 
-    for region in regions {
-        let rect = match *region {
-            Region::Top(h) => carve_top(&mut remaining, h),
-            Region::Bottom(h) => carve_bottom(&mut remaining, h),
-            Region::Left(w) => carve_left(&mut remaining, w),
-            Region::Right(w) => carve_right(&mut remaining, w),
-            Region::Center => {
-                let taken = std::mem::replace(&mut remaining, Rect::ZERO);
-                if taken.width == 0 || taken.height == 0 {
-                    Rect::ZERO
-                } else {
-                    taken
-                }
+    for (i, region) in regions.iter().enumerate() {
+        match *region {
+            Region::Top(h) => out[i] = carve_top(&mut remaining, h),
+            Region::Bottom(h) => out[i] = carve_bottom(&mut remaining, h),
+            Region::Left(w) => out[i] = carve_left(&mut remaining, w),
+            Region::Right(w) => out[i] = carve_right(&mut remaining, w),
+            Region::Center => center_indices.push(i),
+            // Expected to be resolved to Bottom(h) by WidgetRegistry::render_all
+            // before layout is called. If we see one here a dev missed a
+            // resolution step — stay out of the way and log so it's findable.
+            Region::BottomAuto => {
+                tracing::error!("Region::BottomAuto reached layout() unresolved");
+                out[i] = Rect::ZERO;
             }
-        };
-        out.push(rect);
+        }
+    }
+
+    let center_rect = if remaining.width == 0 || remaining.height == 0 {
+        Rect::ZERO
+    } else {
+        remaining
+    };
+    // `WidgetRegistry::register` already treats a second `Center` as a conflict,
+    // so in practice this loop runs at most once. If it ever runs twice, both
+    // widgets get the same rect — defensible fallback, matches the "fail soft"
+    // posture the surrounding doc comment states.
+    for idx in center_indices {
+        out[idx] = center_rect;
     }
 
     out
@@ -183,19 +207,42 @@ mod tests {
     }
 
     #[test]
-    fn center_before_top_leaves_top_with_zero() {
-        let rects = layout(frame(80, 24), &[Region::Center, Region::Top(1)]);
-        assert_eq!(rects.len(), 2);
+    fn center_registered_before_fixed_regions_still_carves_correctly() {
+        // Declaration order: center, top, bottom. Under order-independent
+        // layout the fixed regions still claim their rows; center gets the
+        // 22-row remainder regardless of the registration order.
+        let rects = layout(
+            frame(80, 24),
+            &[Region::Center, Region::Top(1), Region::Bottom(2)],
+        );
+        assert_eq!(rects.len(), 3);
         assert_eq!(
             rects[0],
             Rect {
                 x: 0,
-                y: 0,
+                y: 1,
                 width: 80,
-                height: 24,
+                height: 21,
             }
         );
-        assert_eq!(rects[1], Rect::ZERO);
+        assert_eq!(
+            rects[1],
+            Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 1,
+            }
+        );
+        assert_eq!(
+            rects[2],
+            Rect {
+                x: 0,
+                y: 22,
+                width: 80,
+                height: 2,
+            }
+        );
     }
 
     #[test]
