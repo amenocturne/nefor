@@ -1,0 +1,11 @@
+# fake-engine script: draw "Hello, NCP!" to grid 1 then shut down.
+# Exercises the default_colors -> hl_attr_define -> grid resize/clear/line/cursor/flush path.
+{"type":"event","body":{"kind":"nefor-tui.default_colors","fg":16777215,"bg":0,"sp":16777215}}
+{"type":"event","body":{"kind":"nefor-tui.hl_attr_define","id":1,"rgb":{"fg":16711680,"bold":true}}}
+{"type":"event","body":{"kind":"nefor-tui.grid.resize","grid":1,"width":80,"height":24}}
+{"type":"event","body":{"kind":"nefor-tui.grid.clear","grid":1}}
+{"type":"event","body":{"kind":"nefor-tui.grid.line","grid":1,"row":0,"col_start":0,"cells":[["Hello, NCP!",1,null]]}}
+{"type":"event","body":{"kind":"nefor-tui.grid.cursor_goto","grid":1,"row":0,"col":11}}
+{"type":"event","body":{"kind":"nefor-tui.grid.flush"}}
+# sleep 2s
+{"type":"system","body":{"kind":"shutdown","grace_ms":1000}}

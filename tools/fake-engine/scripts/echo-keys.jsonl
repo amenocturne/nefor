@@ -1,0 +1,14 @@
+# fake-engine script: minimal resize + flush, then stay alive.
+# Use case: verify the plugin's input path. The harness logs every event
+# the plugin emits (keypresses, resize notifications, etc.) to its own
+# stderr. Pair this with running fake-engine without --script for the
+# passive-listener mode if you just want to watch; this script demonstrates
+# the same idea but establishes a minimal grid first so the TUI has
+# something to render against.
+{"type":"event","body":{"kind":"nefor-tui.default_colors","fg":16777215,"bg":0,"sp":16777215}}
+{"type":"event","body":{"kind":"nefor-tui.grid.resize","grid":1,"width":80,"height":24}}
+{"type":"event","body":{"kind":"nefor-tui.grid.clear","grid":1}}
+{"type":"event","body":{"kind":"nefor-tui.grid.flush"}}
+# From here on, no further engine-to-plugin traffic. The harness keeps the
+# connection open; use ctrl-c to end the session (which triggers a graceful
+# shutdown with a 2s grace window).

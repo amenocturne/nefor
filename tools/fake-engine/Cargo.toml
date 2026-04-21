@@ -1,0 +1,21 @@
+[package]
+name = "fake-engine"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Developer harness that impersonates a nefor engine over NCP stdio. Spawns a plugin binary, performs the attach handshake, and either stays passive (logging everything) or plays back a .jsonl script."
+
+[[bin]]
+name = "fake-engine"
+path = "src/main.rs"
+
+[dependencies]
+nefor-protocol = { path = "../../crates/nefor-protocol" }
+tokio = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
