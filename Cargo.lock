@@ -1029,6 +1029,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nefor-chat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nefor-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-width",
+]
+
+[[package]]
 name = "nefor-combinators"
 version = "0.1.0"
 dependencies = [
