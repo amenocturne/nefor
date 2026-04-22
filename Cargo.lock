@@ -1052,6 +1052,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nefor-combinators-plugin"
+version = "0.1.0"
+dependencies = [
+ "nefor-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "nefor-protocol"
 version = "0.1.0"
 dependencies = [

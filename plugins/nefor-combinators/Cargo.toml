@@ -1,0 +1,27 @@
+[package]
+name = "nefor-combinators-plugin"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NCP v0.1 plugin: combinator registry + executor. Plugins register type-aware trait implementations (Merge, Into); callers ask this plugin to run operations and it dispatches to the matching handler plugin."
+
+[[bin]]
+name = "nefor-combinators"
+path = "src/main.rs"
+
+[dependencies]
+nefor-protocol = { path = "../../crates/nefor-protocol" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+nefor-protocol = { path = "../../crates/nefor-protocol" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
