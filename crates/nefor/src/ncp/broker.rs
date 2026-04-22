@@ -425,6 +425,21 @@ impl Broker {
         if let Some(conn) = self.conns.remove(&id) {
             drop(conn.send);
         }
+
+        // Policy: the plugin set is a cooperating group. If one plugin
+        // exits and others are still alive, propagate shutdown so the
+        // session winds down as a whole instead of the remaining plugins
+        // hanging on an engine with nothing to drive. The shutdown select
+        // arm is already guarded against double-arming, and try_send
+        // failing (channel full / closed) means a shutdown is already
+        // in flight.
+        if !self.conns.is_empty() {
+            tracing::info!(
+                trigger_plugin = %name,
+                "peer exited; initiating engine shutdown"
+            );
+            let _ = self.shutdown_tx.try_send(DEFAULT_SHUTDOWN_GRACE_MS);
+        }
     }
 
     // ---- helpers ----------------------------------------------------------
