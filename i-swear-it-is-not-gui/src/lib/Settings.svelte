@@ -212,7 +212,7 @@
             activeConfig = name;
           }
         } catch {
-          // piDir may not have agentic-kit.json yet
+          // piDir may not have nefor.json yet
         }
       }
       const config = await invoke<ConfigData>('get_config', {

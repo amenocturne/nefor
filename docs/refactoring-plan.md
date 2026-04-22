@@ -124,7 +124,7 @@ Pi v0.60→v0.65 had breaking changes in 4 out of 6 minor versions. Need to veri
 1. **README.md** — correct extension count, add note about consolidation into disguise
 2. **architecture.md** — remove ghost references, describe actual architecture (disguise as composition layer)
 3. **extensions.md** — remove 4 consolidated extension sections, add section explaining the consolidation
-4. **model-routing.md** — describe actual mechanism (nefor/config/ + disguise.ts inline routing)
+4. **model-routing.md** — describe actual mechanism (`config/` + disguise.ts inline routing)
 5. **teams.md** — either describe how teams work via disguise.ts, or mark bg-dispatch/team as future work
 6. **workflow-plan.md** — convert to implementation summary or delete (workflow-spec.md already documents the implemented system)
 

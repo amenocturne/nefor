@@ -2,7 +2,7 @@
  * Notification — Pi extension for system notifications
  *
  * Reads Notification/Stop hook entries from .pi/hooks.json (written by
- * the agentic-kit installer) and fires them when:
+ * the installer) and fires them when:
  * - The agent is idle and waiting for user input (30s threshold)
  * - The session shuts down
  * - A background task completes (if background-tasks is loaded)

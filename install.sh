@@ -67,15 +67,7 @@ for dir in "${DIRS[@]}"; do
   fi
 done
 
-# Install permission hooks as perm-hooks/ (pi reserves .pi/hooks/ and warns on its
-# presence as a deprecated directory; we use a different name to avoid the collision)
-if [[ -d "$NEFOR_DIR/hooks" ]]; then
-  rm -rf "$PI_DIR/perm-hooks"
-  cp -r "$NEFOR_DIR/hooks" "$PI_DIR/perm-hooks"
-  find "$PI_DIR/perm-hooks" -name '*.sh' -exec chmod +x {} \;
-fi
-
-FILES=(disguise.ts prompt.md nefor.yaml package.json)
+FILES=(disguise.ts prompt.md package.json)
 for file in "${FILES[@]}"; do
   if [[ -f "$NEFOR_DIR/$file" ]]; then
     cp "$NEFOR_DIR/$file" "$PI_DIR/$file"
@@ -172,8 +164,8 @@ if [[ -n "$PI_BIN" ]]; then
 fi
 
 echo "Nefor installed to $PI_DIR"
-echo "  Core: lib/ extensions/ prompts/ instructions/ config/ perm-hooks/"
-echo "  Config: nefor.yaml, package.json, disguise.ts, prompt.md"
+echo "  Core: lib/ extensions/ prompts/ instructions/ config/ hooks/"
+echo "  Config: package.json, disguise.ts, prompt.md"
 [[ -n "$OVERLAY_DIR" ]] && echo "  Overlay: applied from $OVERLAY_DIR"
 echo ""
 echo "Prerequisites:"

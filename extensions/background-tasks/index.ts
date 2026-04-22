@@ -10,7 +10,7 @@
  * Widget: live task list below the editor
  * Command: /bg — show task summary
  *
- * Usage: pi -e agents/pi/extensions/background-tasks
+ * Usage: pi -e extensions/background-tasks
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";

@@ -1,5 +1,5 @@
 {
-  "name": "@agentic-kit/background-tasks",
+  "name": "@nefor/background-tasks",
   "version": "0.1.0",
   "description": "Pi extension for background command execution and subagent orchestration with permission bubbling",
   "type": "module",

@@ -1,5 +1,5 @@
 {
-  "name": "@agentic-kit/disguise",
+  "name": "@nefor/disguise",
   "version": "0.1.0",
   "description": "Pi extension for agent identity, context injection, and subagent dispatch",
   "type": "module",

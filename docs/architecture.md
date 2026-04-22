@@ -1,78 +1,53 @@
 # Architecture
 
-## Three-Layer Design
+## Repo Layout
 
 ```
-agents/pi/
-  lib/              LAYER 1: Shared primitives
-  extensions/       LAYER 2: Features (import only from lib/)
-  nefor/            LAYER 3: Flavour (manifest, disguise.ts, prompts, config)
+nefor/
+  install.sh         One-shot installer: copies everything into <target>/.pi/
+  disguise.ts        Workflow definition (lead tools, agent configs, effects)
+  prompt.md          System prompt (base + includes/*.md appended by installer)
+  config/            Model routing (config.yaml + loader)
+  prompts/           Per-agent prompts (builder, reviewer, explorer, …)
+  instructions/      Modular instruction files referenced from disguise context
+  includes/          Prompt fragments concatenated into prompt.md at install
+  extensions/        Self-contained Pi extensions (see below)
+  lib/               Shared primitives (no Pi API dep)
+  hooks/             Hook scripts (smart-approve.sh)
 ```
 
-**Layer 1 -- Library** (`lib/`): Pure utility modules with no Pi extension API dependency. Handles process spawning (`task-manager.ts`), file-based IPC (`permission-queue.ts`), unified prompt queuing (`queue-watcher.ts`), and the workflow framework (`workflow/` -- effect runtime, host adapter, skill runner, types).
+**`lib/`** — pure utility modules with no Pi extension API dependency. Process spawning (`task-manager.ts`), file-based IPC (`permission-queue.ts`), unified prompt queuing (`queue-watcher.ts`), and the workflow framework (`workflow/` — effect runtime, host adapter, skill runner, types).
 
-**Layer 2 -- Extensions** (`extensions/`): Each extension is a self-contained feature that registers tools, hooks, widgets, and commands via Pi's `ExtensionAPI`. Extensions import only from `lib/`, never from each other. This prevents coupling -- you can add or remove any extension without breaking others.
-
-**Layer 3 -- Flavour** (`nefor/`): The concrete agent configuration. Contains the manifest (`manifest.yaml`), system prompt (`prompt.md`), model configs (`config/`), agent prompt files (`prompts/`), instruction files (`instructions/`), and the workflow definition (`disguise.ts`).
+**`extensions/`** — each extension is a self-contained feature that registers tools, hooks, widgets, and commands via Pi's `ExtensionAPI`. Extensions import only from `lib/`, never from each other. You can add or remove any extension without breaking others.
 
 ## Disguise as Composition Layer
 
-Originally the agent had 9 extensions. Four of them -- workspace-context, context-loader, model-router, and agent-teams -- were too tightly coupled and were consolidated into the **disguise** extension. A fifth (provider-filter) was removed because Pi's auth-based filtering suffices.
+Originally the agent had 9 extensions. Four of them — workspace-context, context-loader, model-router, and agent-teams — were too tightly coupled and were consolidated into the **disguise** extension. A fifth (provider-filter) was removed because Pi's auth-based filtering suffices.
 
 The disguise extension (`extensions/disguise/index.ts`) now handles:
 - **Context loading**: reads instruction files and injects them via `appendSystemPrompt` or `sendMessage`
 - **Workspace context**: finds WORKSPACE.yaml, includes it in the system prompt
-- **Model routing**: `disguise.ts` imports from `nefor/config/index.ts` which loads role-to-model mappings from test.yaml or prod.yaml
+- **Model routing**: `disguise.ts` imports from `config/index.ts` which loads role-to-model mappings from `config.yaml`
 - **Team dispatch**: the workflow framework spawns subagents (explorer, builder, reviewer, tester) via `lib/task-manager.ts`
 - **Write-path enforcement**: intercepts write/edit tool calls and blocks those outside allowed paths
 - **Write hooks**: file writes matching patterns dispatch workflow effects (e.g., writing a plan triggers review)
 
 All of this is configured per-disguise in `disguise.ts`, not in separate extensions. See [workflow-spec.md](workflow-spec.md) for the framework design.
 
-## Profile x Agent Composition
-
-The main installer (`install.py`) merges a **profile** manifest with an **agent** manifest to produce the final configuration.
-
-```
-profiles/work/manifest.yaml    +    agents/pi/nefor/manifest.yaml
-       (org-specific)                     (runtime-specific)
-             |                                    |
-             v                                    v
-  hooks: [link-proxy]               extensions: [permission-gate, ...]
-  skills: [dp-jira]                 settings: {defaultModel: ...}
-  instructions: [sbt]               common: [dev-workflow, ...]
-  settings: {}                       skills: [spec, workspace, ...]
-             |                                    |
-             +-------- merge_manifests() ---------+
-                              |
-                              v
-                     InstallContext
-                    (union of both)
-```
-
-Lists are unioned (skills from both, hooks from both). Settings are merged with agent taking precedence. The merged context is passed to the runtime installer (`agents/pi/install.py`).
-
 ## Install Flow
 
-When you run `just install` (or `uv run install.py --all`):
+`./install.sh [target-dir] [--overlay <dir>]` sets up `<target-dir>/.pi/` from the repo:
 
-1. **Load registry** -- reads `installations.yaml` for all registered target/profile/agent combos
-2. **For each installation**:
-   a. Load profile manifest + agent manifest
-   b. Merge them into `InstallContext`
-   c. Resolve the runtime from the agent manifest (`runtime: pi`)
-   d. Load and call `agents/pi/install.py:install(ctx)`
-3. **Pi installer** (`agents/pi/install.py`):
-   a. Create `.pi/` directory
-   b. Validate all declared extensions exist in `agents/pi/extensions/`
-   c. Symlink extensions from `agents/pi/extensions/` into `.pi/extensions/`
-   d. Symlink skills from `skills/` into `.pi/skills/`
-   e. Generate `hooks.json` from declared hooks (absolute paths to hook scripts)
-   f. Copy `disguise.ts` and `prompts/` from the flavour directory to `.pi/`
-   g. Write `settings.json` from merged settings
-   h. Write `agentic-kit.json` with install metadata
+1. `mkdir -p <target>/.pi`
+2. Copy `lib/`, `extensions/`, `prompts/`, `instructions/`, `config/`, `hooks/` into `.pi/` (test files stripped; hook scripts chmod +x).
+3. Copy `disguise.ts`, `prompt.md`, `package.json` into `.pi/`.
+4. Copy `includes/` into `.pi/`, then assemble the final system prompt: `prompt.md` + each `includes/*.md` concatenated.
+5. `npm install --omit=dev` inside `.pi/` to pull runtime deps.
+6. Write default `hooks.yaml` (pre_tool_use → `smart-approve.sh`) and default `settings.json` (provider/model/thinking level) if absent.
+7. If `--overlay <dir>` given, `rsync` it over `.pi/` and re-assemble the prompt.
+8. Symlink `nefor → $(which pi)` in the same bin directory, so `nefor` runs Pi with nefor's `.pi/`.
 
-The prompt (`prompt.md`) lives in `agents/pi/nefor/prompt.md`, not in the installed config. Pi reads it directly from there -- the path is set during the manifest assembly process.
+No manifest merging, no symlinks into source, no generated `install metadata` files. Everything nefor ships is a plain copy.
 
 ## Data Flow
 

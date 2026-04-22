@@ -95,6 +95,13 @@ export function createPiHost(pi: any, piDirPath: string, extCtx?: any): PiHost {
       );
     },
 
+    notifyUser(message, type) {
+      // Toast via the extension UI — never enters the session/model context.
+      if (extCtx?.ui?.notify) {
+        extCtx.ui.notify(message, type ?? "info");
+      }
+    },
+
     appendSystemPrompt(content) {
       systemPromptAppendix += (systemPromptAppendix ? "\n\n" : "") + content;
     },

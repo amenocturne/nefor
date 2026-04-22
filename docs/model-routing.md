@@ -1,6 +1,6 @@
 # Model Routing
 
-Role-based model routing assigns different LLMs to different agent roles. Configured in flavour config files (`nefor/config/test.yaml` and `nefor/config/prod.yaml`), loaded by `nefor/config/index.ts`, and consumed by `disguise.ts` when defining agent configs.
+Role-based model routing assigns different LLMs to different agent roles. Configured in `config/config.yaml`, loaded by `config/index.ts`, and consumed by `disguise.ts` when defining agent configs.
 
 ## Role Definitions
 
@@ -14,31 +14,22 @@ Role-based model routing assigns different LLMs to different agent roles. Config
 
 ## Configuration
 
-Flavour config files in `agents/pi/nefor/config/`:
+`config/config.yaml`:
 
 ```yaml
-# config/test.yaml (OpenRouter models for development)
-provider: openrouter
-models:
-  orchestrator: openrouter/anthropic/claude-sonnet-4
-  worker: openrouter/anthropic/claude-sonnet-4
-  reviewer: openrouter/anthropic/claude-sonnet-4
-  explorer: openrouter/anthropic/claude-sonnet-4
-  tester: openrouter/anthropic/claude-sonnet-4
-
-# config/prod.yaml (Nestor/Tinkoff internal models)
 provider: nestor
 models:
-  orchestrator: tgpt/qwen35-397b-a17b-fp8
-  worker: tgpt/qwen35-397b-a17b-fp8
-  reviewer: tgpt/qwen35-397b-a17b-fp8
-  explorer: tgpt/qwen35-397b-a17b-fp8
-  tester: tgpt/qwen35-397b-a17b-fp8
+  orchestrator: nestor/tgpt/qwen35-397b-a17b-fp8
+  worker: nestor/tgpt/qwen35-397b-a17b-fp8
+  reviewer: nestor/tgpt/qwen35-397b-a17b-fp8
+  explorer: nestor/tgpt/qwen35-397b-a17b-fp8
+  tester: nestor/tgpt/qwen35-397b-a17b-fp8
+  promptEngineer: nestor/tgpt/qwen35-397b-a17b-fp8
 ```
 
-The active config is selected via `config` field in `.pi/agentic-kit.json` (written by the installer). If not set, defaults to `test`.
+`config/index.ts` reads `.pi/config/config.yaml` at module load — one file, no flavour/env selector. To point nefor at a different provider (e.g. OpenRouter for local testing), edit `config.yaml` directly.
 
-### Config Loading (`nefor/config/index.ts`)
+### Config Loading (`config/index.ts`)
 
 ```typescript
 import config from "./config/index.ts";
@@ -49,7 +40,7 @@ import config from "./config/index.ts";
 // etc.
 ```
 
-`loadConfig()` reads the config name from `.pi/agentic-kit.json`, loads the corresponding YAML file, and exports the parsed `FlavourConfig` as the default export.
+`loadConfig()` reads `.pi/config/config.yaml` and exports the parsed `FlavourConfig` as the default export.
 
 ## How Routing Works
 

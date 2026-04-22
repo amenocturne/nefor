@@ -12,6 +12,8 @@ export interface WorkflowContext {
   state: Record<string, unknown>;
   sendMessage(content: string, opts?: MessageOpts): void;
   log(message: string): void;
+  /** Toast notification visible to the user only — NOT added to the agent's context. */
+  notifyUser(message: string, type?: "info" | "warning" | "error"): void;
   spawn(agent: AgentConfig, prompt: string, opts?: SpawnOpts): Promise<AgentResult>;
   skill(name: string, args: string[]): Promise<SkillResult>;
   backgroundSkill(name: string, args: string[]): Promise<BackgroundSkillHandle>;
@@ -114,6 +116,7 @@ export interface RuntimeHost {
   setActiveTools(tools: string[]): void;
   getActiveTools(): string[];
   sendMessage(content: string, opts?: MessageOpts): void;
+  notifyUser(message: string, type?: "info" | "warning" | "error"): void;
   appendSystemPrompt(content: string): void;
   spawnAgent(config: AgentConfig, prompt: string, opts?: SpawnOpts): Promise<AgentResult>;
   discoverSkills(skillsDir: string): SkillRegistry;

@@ -337,11 +337,15 @@ const RunValidation = (): Effect => ({
     }
 
     const nodes = ctx.state.nodes as Map<string, DagNode>;
+    ctx.sendMessage(`All nodes complete.`, { display: true });
+    // User-only nudge — never enters the orchestrator's context, so it
+    // doesn't lecture itself about reflecting. Fires after substantive work.
     const hadEscalations = [...nodes.values()].some(n => n.status === "failed");
-    const hint = nodes.size >= 3 || hadEscalations
-      ? " Consider running `reflect` to capture learnings worth documenting."
-      : "";
-    ctx.sendMessage(`All nodes complete.${hint}`, { display: true });
+    if (nodes.size >= 3 || hadEscalations) {
+      ctx.notifyUser(
+        "/reflect to have nefor write down what we just learned — unsaved lessons get re-learned the hard way",
+      );
+    }
     return [];
   },
 });
@@ -601,6 +605,12 @@ export default defineDisguise({
               attempts: 0,
               maxAttempts: raw.maxAttempts ?? 3,
             });
+          }
+
+          // Approval is single-shot: consume it once the write-agents have
+          // been dispatched, so any subsequent batch needs a fresh review.
+          if (hasWriteAgents) {
+            (ctx.state as Record<string, unknown>).planApproved = false;
           }
 
           updateWidget(ctx);

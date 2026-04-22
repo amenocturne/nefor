@@ -84,6 +84,7 @@ export function createRuntime(): Runtime {
         state,
         sendMessage: (content, opts) => host.sendMessage(content, opts),
         log: (message) => host.sendMessage(`[workflow] ${message}`, { display: false }),
+        notifyUser: (message, type) => host.notifyUser(message, type),
         spawn: (agent, prompt, opts) => host.spawnAgent(agent, prompt, opts),
         skill: (name, args) => host.runSkill(name, args),
         backgroundSkill: async (name, args) => {

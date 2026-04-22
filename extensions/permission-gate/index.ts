@@ -194,7 +194,7 @@ export default function (pi: ExtensionAPI) {
     cwd = ctx.cwd;
     config = loadHooksConfig(cwd);
     interactive = ctx.hasUI;
-    taskId = process.env.AGENTIC_KIT_TASK_ID;
+    taskId = process.env.NEFOR_TASK_ID;
 
     const hookCount = countHooks(config);
     const mode = interactive ? "interactive" : taskId ? `subagent (task ${taskId})` : "subagent";
@@ -204,8 +204,11 @@ export default function (pi: ExtensionAPI) {
       "info",
     );
 
-    // /noscope (yolo) is on by default — nefor doesn't ask for permission
-    if (!process.env.PI_SKIP_PERMISSIONS) {
+    // /noscope (yolo) is on by default — nefor doesn't ask for permission.
+    // NEFOR_HARDSCOPE is the explicit opt-out: once set (by /hardscope), it
+    // inherits into subagent processes so they don't silently default back
+    // to noscope in their own session_start.
+    if (!process.env.PI_SKIP_PERMISSIONS && !process.env.NEFOR_HARDSCOPE) {
       process.env.PI_SKIP_PERMISSIONS = "1";
       ctx.ui.notify(
         "we default to /noscope mode (yolo), it's you problem if nefor nukes prod db (use /hardscope if you are scared)",
@@ -217,6 +220,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("noscope", {
     description: "Skip all permission prompts for the rest of this session (default)",
     handler: async (_args, ctx) => {
+      delete process.env.NEFOR_HARDSCOPE;
       process.env.PI_SKIP_PERMISSIONS = "1";
       ctx.ui.notify("Noscope active. nefor does what it wants.", "info");
     },
@@ -225,6 +229,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("hardscope", {
     description: "Re-enable permission prompts for the rest of this session",
     handler: async (_args, ctx) => {
+      process.env.NEFOR_HARDSCOPE = "1";
       delete process.env.PI_SKIP_PERMISSIONS;
       ctx.ui.notify("Hardscope active. nefor will ask before doing anything scary.", "info");
     },

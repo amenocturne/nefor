@@ -279,11 +279,12 @@ function createOAuthHandlers(piRef: ExtensionAPI) {
 		return credentials.access;
 	}
 
-	async function autoLogin(): Promise<void> {
+	async function autoLogin(): Promise<{ jwt: string; expiresAt: number }> {
 		dpPath = findDpBinary();
 		const dpToken = getDpToken(dpPath);
-		const { jwt } = await exchangeForJwt(dpToken);
+		const { jwt, expiresAt } = await exchangeForJwt(dpToken);
 		await updateModels(jwt);
+		return { jwt, expiresAt };
 	}
 
 	return { login, refreshToken, getApiKey, updateModels, autoLogin };
@@ -794,83 +795,21 @@ export default function (pi: ExtensionAPI) {
 		streamSimple: streamNestor,
 	});
 
-	// Auto-login on session start: try existing DP session first, and if that
-	// fails because the user isn't logged in, launch `dp auth login`, wait for
-	// the user to confirm, then retry. On final failure, show a debugging hint.
+	// Auto-login on session start: silently try existing DP session
+	// so real models are available without explicit /login.
+	// Persist credentials to authStorage — without this, Pi's first prompt
+	// can't resolve an API key for `nestor` and errors with "not authenticated".
 	pi.on("session_start", async (_event, ctx) => {
 		try {
-			await autoLogin();
-			return;
-		} catch (e) {
-			const msg = e instanceof Error ? e.message : String(e);
-
-			// Don't prompt in non-interactive sessions (subagents, pipes)
-			if (!ctx.hasUI) return;
-
-			if (msg.includes("dp CLI not installed")) {
-				ctx.ui.notify(
-					"Nestor: dp CLI not found. Install it: https://devplatform.pages.devplatform.tcsbank.ru/spirit-user-docs/docs/cli/",
-					"warning",
-				);
-				return;
-			}
-
-			// Only recover from the "not logged in" case — network/API errors
-			// shouldn't trigger an interactive flow at startup
-			if (msg !== "not-logged-in") {
-				ctx.ui.notify(`Nestor auto-login failed: ${msg}. Try /login nestor.`, "warning");
-				return;
-			}
-
-			let dpPath: string;
-			try {
-				dpPath = findDpBinary();
-			} catch {
-				return;
-			}
-
-			ctx.ui.notify("Nestor: not logged in. Launching `dp auth login` (opens browser)...", "info");
-
-			try {
-				const { spawn: _spawn } = await import("node:child_process");
-				const proc = _spawn(dpPath, ["auth", "login"], {
-					stdio: "ignore",
-					detached: true,
-					env: dpEnv(),
-				});
-				proc.unref();
-			} catch (spawnErr) {
-				ctx.ui.notify(
-					`Couldn't launch 'dp auth login': ${spawnErr}. Run it manually, then /login nestor.`,
-					"warning",
-				);
-				return;
-			}
-
-			const confirmed = await ctx.ui.confirm(
-				"DP Login",
-				"Complete the browser login, then confirm to continue.",
-				{ timeout: 300_000 },
-			);
-
-			if (!confirmed) {
-				ctx.ui.notify("Nestor auth skipped. Run /login nestor when ready.", "info");
-				return;
-			}
-
-			try {
-				await autoLogin();
-				ctx.ui.notify("Nestor: authenticated.", "info");
-			} catch (retryErr) {
-				const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
-				ctx.ui.notify(
-					"Nestor auth still failing after login.\n" +
-						`Details: ${retryMsg}\n` +
-						"Debug: run `dp auth print-token` in another terminal — it should return a long token after a successful login. " +
-						"If it returns 'no access token' or errors out, check: corporate VPN is on, your dp version is current, and that the browser login actually completed.",
-					"warning",
-				);
-			}
+			const { jwt, expiresAt } = await autoLogin();
+			ctx.modelRegistry.authStorage.set("nestor", {
+				type: "oauth",
+				refresh: "dp-session",
+				access: jwt,
+				expires: expiresAt,
+			});
+		} catch {
+			// No active DP session — user will need /login nestor
 		}
 	});
 }

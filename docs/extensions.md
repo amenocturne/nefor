@@ -1,6 +1,6 @@
 # Extensions
 
-Five composable extensions, each a self-contained feature. Extensions import only from `agents/pi/lib/`, never from each other.
+Five composable extensions, each a self-contained feature. Extensions import only from `lib/`, never from each other.
 
 Originally there were 9 extensions. Four (workspace-context, context-loader, model-router, agent-teams) were consolidated into the disguise extension after testing revealed tight coupling between them. The disguise extension serves as the composition layer -- handling context loading, model routing, team dispatch, and workspace context injection, all configured per-agent in `disguise.ts`. A fifth extension (provider-filter) was removed because Pi's auth-based filtering suffices.
 
@@ -17,7 +17,7 @@ Intercepts all tool calls, runs configured hooks, gates permissions, and repairs
 4. **Project auto-allow** -- file tools (read, write, edit, grep, find, ls) targeting paths within the project directory are auto-allowed.
 5. **User prompt** -- if all hooks abstain, enqueue into the unified permission queue for sequential user prompting.
 
-**Subagent mode:** When running in a non-interactive subagent (detected via `AGENTIC_KIT_TASK_ID` env var), permission requests are written to `~/.pi/agent/permission-queue/<taskId>/` as `.request.json` files. The subagent polls for `.response.json` until the main session responds (timeout: 120s).
+**Subagent mode:** When running in a non-interactive subagent (detected via `NEFOR_TASK_ID` env var), permission requests are written to `~/.pi/agent/permission-queue/<taskId>/` as `.request.json` files. The subagent polls for `.response.json` until the main session responds (timeout: 120s).
 
 **Tool name aliases:**
 
@@ -139,7 +139,7 @@ This extension consolidated the responsibilities of 4 former extensions: workspa
 
 - **Workspace context**: finds WORKSPACE.yaml (searching up to 5 parent directories), includes it in the system prompt
 - **Context loading**: reads context files listed in the disguise config, injects via `appendSystemPrompt`
-- **Model routing**: `disguise.ts` imports `nefor/config/index.ts` which loads role-to-model mappings from test.yaml or prod.yaml; subagents are spawned with the appropriate model
+- **Model routing**: `disguise.ts` imports `config/index.ts` which loads role-to-model mappings from `config.yaml`; subagents are spawned with the appropriate model
 - **Team dispatch**: the workflow framework in `lib/workflow/` handles subagent spawning via `lib/task-manager.ts`
 - **Tool restriction**: lead disguises replace standard tools with custom tools (explore, write-review, progress, bg-plan, read); solo disguises keep standard Pi tools
 

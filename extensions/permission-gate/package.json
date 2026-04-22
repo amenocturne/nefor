@@ -1,7 +1,7 @@
 {
-  "name": "@agentic-kit/permission-gate",
+  "name": "@nefor/permission-gate",
   "version": "0.1.0",
-  "description": "Pi extension that intercepts tool calls and runs agentic-kit hooks as the permission layer",
+  "description": "Pi extension that intercepts tool calls and runs configured hooks as the permission layer",
   "type": "module",
   "pi": {
     "extensions": ["."]

@@ -1,5 +1,5 @@
 {
-  "name": "@agentic-kit/nestor-provider",
+  "name": "@nefor/nestor-provider",
   "version": "0.1.0",
   "description": "Pi extension for Nestor DP Auth — connects Pi to Tinkoff's internal LLM API",
   "type": "module",

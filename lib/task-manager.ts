@@ -207,7 +207,7 @@ export async function spawnAgent(
       stdio: ["ignore", "pipe", "pipe"],
       env: {
         ...process.env,
-        AGENTIC_KIT_TASK_ID: id,
+        NEFOR_TASK_ID: id,
       },
     },
   );

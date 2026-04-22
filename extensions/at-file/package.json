@@ -1,5 +1,5 @@
 {
-  "name": "@agentic-kit/at-file",
+  "name": "@nefor/at-file",
   "version": "0.1.0",
   "description": "Pi extension for @file inclusion in interactive mode — reference files by path in your messages",
   "type": "module",

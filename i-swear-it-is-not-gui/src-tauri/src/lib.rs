@@ -601,7 +601,7 @@ fn save_config(config_path: String, config: ConfigData) -> Result<(), String> {
 
 #[tauri::command]
 fn get_active_config_name(pi_dir: String) -> Result<String, String> {
-    let path = std::path::Path::new(&pi_dir).join("agentic-kit.json");
+    let path = std::path::Path::new(&pi_dir).join("nefor.json");
     let contents =
         std::fs::read_to_string(&path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
     let json: serde_json::Value =
@@ -609,18 +609,18 @@ fn get_active_config_name(pi_dir: String) -> Result<String, String> {
     json.get("config")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| "No 'config' field in agentic-kit.json".to_string())
+        .ok_or_else(|| "No 'config' field in nefor.json".to_string())
 }
 
 #[tauri::command]
 fn set_active_config_name(pi_dir: String, name: String) -> Result<(), String> {
-    let path = std::path::Path::new(&pi_dir).join("agentic-kit.json");
+    let path = std::path::Path::new(&pi_dir).join("nefor.json");
     let contents =
         std::fs::read_to_string(&path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
     let mut json: serde_json::Value =
         serde_json::from_str(&contents).map_err(|e| format!("Failed to parse JSON: {e}"))?;
     json.as_object_mut()
-        .ok_or_else(|| "agentic-kit.json is not an object".to_string())?
+        .ok_or_else(|| "nefor.json is not an object".to_string())?
         .insert("config".to_string(), serde_json::Value::String(name));
     let out = serde_json::to_string_pretty(&json)
         .map_err(|e| format!("Failed to serialize JSON: {e}"))?;

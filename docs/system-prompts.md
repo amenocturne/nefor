@@ -1,6 +1,6 @@
 # System Prompts
 
-A single `prompt.md` in `agents/pi/` serves all modes. It's Qwen-specific: longer, more repetitive, and more explicit than prompts designed for Claude-class models. The prompt includes all sections (solo, delegation, teams) -- irrelevant sections are harmless when unused, and having one prompt avoids drift between variants.
+A single top-level `prompt.md` serves all modes. It's Qwen-specific: longer, more repetitive, and more explicit than prompts designed for Claude-class models. The prompt includes all sections (solo, delegation, teams) -- irrelevant sections are harmless when unused, and having one prompt avoids drift between variants.
 
 ## Prompt Structure
 

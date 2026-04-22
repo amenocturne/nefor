@@ -463,6 +463,22 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("unapprove", {
+    description: "Revoke plan approval — write-agents must be re-reviewed before dispatch",
+    handler: async (_args, ctx) => {
+      if (!workflowCtx) {
+        ctx.ui.notify("No active workflow.", "warning");
+        return;
+      }
+      (workflowCtx.state as Record<string, unknown>).planApproved = false;
+      pi.sendMessage(
+        { customType: "workflow", content: "Plan approval revoked by user. Submit a new plan via write-review before dispatching write-agents.", display: true },
+        { deliverAs: "steer" },
+      );
+      ctx.ui.notify("Plan approval revoked", "info");
+    },
+  });
+
   // ── /terminate command (kill all orchestrator agents) ───────────────
 
   pi.registerCommand("terminate", {

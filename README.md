@@ -27,6 +27,7 @@ deps:
 
 - [pi](https://pi.dev/) - autistic llm wrapper
 - [dp](https://devplatform.pages.devplatform.tcsbank.ru/spirit-user-docs/docs/cli) - only to hack nestor's api
+- `fd` + `ripgrep` - or nefor downloads them from github on first run, rude
 
 ```bash
 # 100% safe, no miners installed, probably
