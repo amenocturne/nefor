@@ -1,13 +1,18 @@
 # nefor — AI context
 
 ## What this is
-Rust rewrite of nefor. Monorepo: pure algebra library + TUI binary + Lua plugins.
+Rust rewrite of nefor. Monorepo: pure algebra library + NCP-speaking engine + separate-process plugins (Rust or Lua). Terminal frontend and Claude-Code wrapper both ship as plugins.
 
 ## Layout
 - `crates/nefor-combinators/` — library (pure Rust, minimal deps). Publishable standalone.
-- `crates/nefor/` — binary. Imports the library; wraps it in TUI + mlua + tokio.
-- `plugins/<name>/` — Lua plugin directories. First one: `mock-plugin` (spawns `claude`).
-- `starter/` — reference `init.lua`; not auto-installed.
+- `crates/nefor-protocol/` — NCP v0.1 envelope + system-body types and parsers.
+- `crates/nefor/` — engine binary. NCP broker + Lua host for `init.lua`. No UI, no harness.
+- `plugins/nefor-tui/` — Rust NCP plugin: ratatui/crossterm terminal frontend.
+- `plugins/nefor-chat/` — Rust NCP plugin: chat UI bridging `mock-plugin` ↔ `nefor-tui`.
+- `plugins/mock-plugin/` — Rust NCP plugin wrapping the `claude` CLI; emits `cc.*` events.
+- `plugins/mock-plugin/` — scriptable NCP actor for integration tests.
+- `tools/fake-engine/` — harness that impersonates the engine for plugin-side tests.
+- `starter/init.lua` — legacy MVP config (single-process Lua). Superseded by plugin composition; rewrite pending.
 
 ## Conventions (enforced)
 - Errors: `thiserror` for domain errors, `anyhow` only at the top boundary (`main.rs`).
@@ -16,24 +21,26 @@ Rust rewrite of nefor. Monorepo: pure algebra library + TUI binary + Lua plugins
 - Enums (ADTs) for state; no boolean flags alongside sentinel variants.
 - Immutability by default; I/O only at boundaries.
 - No YAML/TOML/JSON config schema in core — config is `init.lua`.
-- Plugins are separate OS processes communicating via NCP (see `protocol/v0.1/spec.md`). Any language. Lua stays embedded for `init.lua` and lightweight in-engine composition.
+- Plugins are separate OS processes communicating via NCP (see `protocol/v0.1/spec.md`). Any language. Lua stays embedded for `init.lua` composition.
 - Comments only for non-obvious *why*; code is self-documenting for *what*.
 
 ## Commands
-- `just run` — launch nefor TUI.
-- `just test` — workspace tests.
+- `just run` — launch engine with default config.
+- `just test` — workspace tests (all plugins + engine unit tests).
 - `just lint` — clippy with `-D warnings`.
 - `just fmt` — rustfmt.
+- Manual smoke: `NEFOR_PLUGIN_DIR=$PWD/plugins cargo run --bin nefor -- --config ./tmp/smoke-config-m2` → real TUI + Claude streaming.
 
 ## Spec
 
-## MVP status
-MVP complete (see git log for the landing commit).
+## Milestone status
+**M2 shipped** (Claude on screen). End-to-end: engine spawns `mock-plugin + nefor-chat + nefor-tui` as three processes, NCP brokers the events, prompts flow user → tui → chat → harness → Claude and responses stream back into a grid. `/resume` reloads prior session history from `~/.claude/projects/<escaped-cwd>/`. Clean exit via mouse wheel scroll, Ctrl+C, or terminal close.
 
-Shipped:
-- `nefor-combinators`: `Context`, `Reasoner<C>`, `chain`.
-- `nefor` binary: clap CLI, XDG config, tokio runtime, ratatui TUI with region layout, event bus, mlua 5.4 embedding, subprocess binding.
-- `mock-plugin` plugin: spawns `claude -p --output-format stream-json`; streams deltas, tool starts, final result; session resume via `--resume`.
-- `starter/init.lua`: chat TUI driving mock-plugin.
+Open work:
+- Full-process NCP integration test suite (task-7, unblocked by mock-plugin).
+- NCP throughput + backpressure benchmarks (task-8, deferred).
+- Tool input/output rendering in nefor-chat (`cc.tool.start` only shows names today).
+- Rewrite `starter/init.lua` to spawn the three-plugin graph — currently lives in `tmp/smoke-config-m2/`.
+- Plugin-root resolver polish (XDG → dev fallback).
 
-Not shipped (post-MVP): DAG orchestrator, permission-gate, review-flow, role prompts, behavioral reminders, hook runner, MLG persona, Nestor harness, WASM runtime, Tauri GUI, bundled-config auto-install, plugin manager.
+Deferred / not coming: DAG orchestrator, permission-gate UI, review-flow, persona system, hook runner, WASM runtime, bundled-config auto-install, plugin manager (Mason-style) — all post-MVP plugin-land.

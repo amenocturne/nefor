@@ -85,6 +85,13 @@ pub struct Broker {
     shutdown_tx: mpsc::Sender<u64>,
     /// Engine version string included in `ready_ok`.
     engine_version: String,
+    /// In-memory log of every event envelope routed through the broker,
+    /// in routing order with the original engine-stamped `ts`. Replayed
+    /// to each plugin immediately after its `ready_ok` so declarative
+    /// registrations emitted before a late attacher joined still reach
+    /// it. System envelopes are never logged — per NCP §6 the bus is
+    /// event-only. Sessions are short-lived; no retention policy in v1.
+    event_log: Vec<Envelope>,
 }
 
 /// Outcome of the broker's run loop.
@@ -113,6 +120,7 @@ impl Broker {
             shutdown_rx,
             shutdown_tx,
             engine_version: engine_version.into(),
+            event_log: Vec::new(),
         }
     }
 
@@ -313,6 +321,22 @@ impl Broker {
             },
         )
         .await;
+
+        // Replay the event log to this late attacher so plugin-level
+        // declarative events (e.g. `combinators.register`) emitted
+        // before it joined still reach it.
+        //
+        // Ordering invariant: this function runs inside the single
+        // `select!` arm in `run`, so no live inbound event can be
+        // routed between the snapshot we read here and the enqueues
+        // below. Because `push_envelope` uses an unbounded channel,
+        // each replay frame lands in the writer's FIFO queue ahead of
+        // any subsequent live traffic. The original engine-stamped
+        // `ts` on each envelope is preserved so causal order stays
+        // coherent across replay + live.
+        for env in self.event_log.clone() {
+            self.push_envelope(id, env).await;
+        }
     }
 
     async fn route_event(&mut self, sender_id: ConnectionId, out: PluginOutgoing) {
@@ -325,6 +349,11 @@ impl Broker {
         };
         let ts = Timestamp::now();
         let envelope = Envelope::event(sender_name, ts, event_body);
+
+        // Log every event envelope (bus is event-only per §6) for
+        // replay to future late attachers. Same envelope that peers
+        // receive, so `ts` and `from` match across live + replay.
+        self.event_log.push(envelope.clone());
 
         let targets: Vec<ConnectionId> = self
             .conns
@@ -424,6 +453,21 @@ impl Broker {
         // channel closes.
         if let Some(conn) = self.conns.remove(&id) {
             drop(conn.send);
+        }
+
+        // Policy: the plugin set is a cooperating group. If one plugin
+        // exits and others are still alive, propagate shutdown so the
+        // session winds down as a whole instead of the remaining plugins
+        // hanging on an engine with nothing to drive. The shutdown select
+        // arm is already guarded against double-arming, and try_send
+        // failing (channel full / closed) means a shutdown is already
+        // in flight.
+        if !self.conns.is_empty() {
+            tracing::info!(
+                trigger_plugin = %name,
+                "peer exited; initiating engine shutdown"
+            );
+            let _ = self.shutdown_tx.try_send(DEFAULT_SHUTDOWN_GRACE_MS);
         }
     }
 
@@ -827,6 +871,220 @@ mod tests {
             saw_overflow,
             "expected at least one QueueOverflow error on the saturated receiver",
         );
+    }
+
+    /// Drive a ready handshake on an attached plugin: send `ready`,
+    /// receive `ready_ok`, and return any envelopes that followed
+    /// the `ready_ok` within a short window. Those trailing envelopes
+    /// are the replayed event log (may be empty).
+    async fn ready_and_collect_replay(p: &mut MockPlugin) -> Vec<Envelope> {
+        send_outgoing(p, ready_body("0.1")).await;
+        let first = recv_envelope(p).await.expect("ready_ok");
+        assert!(
+            matches!(first.body, Body::System(SystemBody::ReadyOk { .. })),
+            "first envelope after ready must be ready_ok",
+        );
+        let mut replay = Vec::new();
+        while let Ok(Some(env)) =
+            tokio::time::timeout(Duration::from_millis(100), recv_envelope(p)).await
+        {
+            replay.push(env);
+        }
+        replay
+    }
+
+    fn event_with_key(key: &str, value: &str) -> PluginOutgoing {
+        let mut body = serde_json::Map::new();
+        body.insert(key.into(), serde_json::Value::String(value.into()));
+        PluginOutgoing::event(body)
+    }
+
+    #[tokio::test]
+    async fn late_attacher_receives_replay_of_earlier_events() {
+        let mut broker = Broker::new("0.1.0");
+        let (mut pa, ta) = make_transport();
+        let (mut pb, tb) = make_transport();
+        broker.attach_transport(ta, pn("a"));
+        broker.attach_transport(tb, pn("b"));
+        tokio::spawn(broker.run());
+
+        send_outgoing(&mut pa, ready_body("0.1")).await;
+        recv_envelope(&mut pa).await.expect("ready_ok a");
+
+        // A emits three events while B is still pre-ready.
+        send_outgoing(&mut pa, event_with_key("n", "1")).await;
+        send_outgoing(&mut pa, event_with_key("n", "2")).await;
+        send_outgoing(&mut pa, event_with_key("n", "3")).await;
+
+        // Give the broker a moment to route+log.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // B attaches later (already done above; still pre-ready) and rows through ready.
+        let replay = ready_and_collect_replay(&mut pb).await;
+        assert_eq!(
+            replay.len(),
+            3,
+            "expected 3 replayed events, got {replay:?}"
+        );
+        for (i, env) in replay.iter().enumerate() {
+            assert_eq!(env.kind, MessageKind::Event);
+            assert_eq!(env.from.as_str(), "a");
+            let want = (i + 1).to_string();
+            let Body::Event(ref map) = env.body else {
+                panic!("expected event body, got {:?}", env.body);
+            };
+            let got = map
+                .get("n")
+                .and_then(|v| v.as_str())
+                .expect("event body has string n");
+            assert_eq!(got, want.as_str(), "replay out of order");
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_preserves_original_ts() {
+        let mut broker = Broker::new("0.1.0");
+        let (mut pa, ta) = make_transport();
+        let (mut pc, tc) = make_transport();
+        let (mut pb, tb) = make_transport();
+        broker.attach_transport(ta, pn("a"));
+        broker.attach_transport(tc, pn("c"));
+        broker.attach_transport(tb, pn("b"));
+        tokio::spawn(broker.run());
+
+        // A and C ready first.
+        send_outgoing(&mut pa, ready_body("0.1")).await;
+        recv_envelope(&mut pa).await.expect("ready_ok a");
+        send_outgoing(&mut pc, ready_body("0.1")).await;
+        recv_envelope(&mut pc).await.expect("ready_ok c");
+
+        // A emits an event C sees live.
+        send_outgoing(&mut pa, event_with_key("tag", "x")).await;
+        let live = recv_envelope(&mut pc).await.expect("c got event live");
+        assert_eq!(live.kind, MessageKind::Event);
+
+        // B rows in late and gets the replayed copy.
+        let replay = ready_and_collect_replay(&mut pb).await;
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].ts, live.ts, "replay ts must match live ts");
+        assert_eq!(replay[0].from.as_str(), live.from.as_str());
+    }
+
+    #[tokio::test]
+    async fn replay_does_not_contain_system_messages() {
+        let mut broker = Broker::new("0.1.0");
+        let (mut pa, ta) = make_transport();
+        let (mut pb, tb) = make_transport();
+        broker.attach_transport(ta, pn("a"));
+        broker.attach_transport(tb, pn("b"));
+        tokio::spawn(broker.run());
+
+        send_outgoing(&mut pa, ready_body("0.1")).await;
+        recv_envelope(&mut pa).await.expect("ready_ok a");
+
+        // Provoke a system error back to A (engine-kind sent by plugin),
+        // then emit a valid event. The error envelope must NOT be
+        // replayed to B; only the event should.
+        p_send_raw(
+            &mut pa,
+            "{\"type\":\"system\",\"body\":{\"kind\":\"ready_ok\",\"engine_version\":\"x\"}}\n",
+        )
+        .await;
+        // Drain the error response so it doesn't pollute later reads.
+        let _ = recv_envelope(&mut pa).await;
+
+        send_outgoing(&mut pa, event_with_key("k", "v")).await;
+
+        // Let the broker catch up.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let replay = ready_and_collect_replay(&mut pb).await;
+        assert_eq!(
+            replay.len(),
+            1,
+            "expected exactly 1 replayed envelope, got {replay:?}",
+        );
+        assert_eq!(replay[0].kind, MessageKind::Event);
+        assert_eq!(replay[0].from.as_str(), "a");
+        for env in &replay {
+            assert!(
+                matches!(env.body, Body::Event(_)),
+                "replay must contain only event bodies, got {:?}",
+                env.body,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn self_does_not_see_own_replay() {
+        let mut broker = Broker::new("0.1.0");
+        let (mut pa, ta) = make_transport();
+        broker.attach_transport(ta, pn("a"));
+        tokio::spawn(broker.run());
+
+        send_outgoing(&mut pa, ready_body("0.1")).await;
+        recv_envelope(&mut pa).await.expect("ready_ok a");
+
+        send_outgoing(&mut pa, event_with_key("k", "v")).await;
+
+        // A must never see its own event — neither live (already
+        // covered elsewhere) nor as a replay (there's no second
+        // ready on this connection, but we still assert the stream
+        // stays quiet).
+        let next = tokio::time::timeout(Duration::from_millis(150), recv_envelope(&mut pa)).await;
+        assert!(
+            next.is_err() || next.unwrap().is_none(),
+            "A must not receive its own event",
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_then_live_preserves_order() {
+        let mut broker = Broker::new("0.1.0");
+        let (mut pa, ta) = make_transport();
+        let (mut pb, tb) = make_transport();
+        broker.attach_transport(ta, pn("a"));
+        broker.attach_transport(tb, pn("b"));
+        tokio::spawn(broker.run());
+
+        send_outgoing(&mut pa, ready_body("0.1")).await;
+        recv_envelope(&mut pa).await.expect("ready_ok a");
+
+        // E1 emitted before B is ready -> replayed.
+        send_outgoing(&mut pa, event_with_key("n", "1")).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // B completes the ready handshake; the replay of E1 is enqueued
+        // synchronously inside handle_ready, before any subsequent live
+        // traffic is routed.
+        send_outgoing(&mut pb, ready_body("0.1")).await;
+        let ready_ok = recv_envelope(&mut pb).await.expect("ready_ok b");
+        assert!(matches!(
+            ready_ok.body,
+            Body::System(SystemBody::ReadyOk { .. })
+        ));
+
+        // E2 emitted after B is ready -> delivered live.
+        send_outgoing(&mut pa, event_with_key("n", "2")).await;
+
+        let e1 = recv_envelope(&mut pb).await.expect("E1 (replay)");
+        let e2 = recv_envelope(&mut pb).await.expect("E2 (live)");
+        for env in [&e1, &e2] {
+            assert_eq!(env.kind, MessageKind::Event);
+            assert_eq!(env.from.as_str(), "a");
+        }
+        let extract = |env: &Envelope| -> String {
+            let Body::Event(ref map) = env.body else {
+                panic!("expected event");
+            };
+            map.get("n").and_then(|v| v.as_str()).expect("n").to_owned()
+        };
+        assert_eq!(extract(&e1), "1", "first envelope to B must be E1");
+        assert_eq!(extract(&e2), "2", "second envelope to B must be E2");
+    }
+
+    async fn p_send_raw(p: &mut MockPlugin, raw: &str) {
+        p.writer.write_all(raw.as_bytes()).await.unwrap();
     }
 
     #[tokio::test]

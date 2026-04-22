@@ -1,0 +1,29 @@
+[package]
+name = "nefor-chat"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Chat UI plugin for nefor. Bridges mock-plugin (Claude Code wrapper) and nefor-tui (cell-grid renderer) over NCP v0.1."
+
+[[bin]]
+name = "nefor-chat"
+path = "src/main.rs"
+
+[dependencies]
+nefor-protocol = { path = "../../crates/nefor-protocol" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Declared directly (not via workspace) — the same choice as nefor-tui, for
+# unicode-correct width calculation when wrapping transcript lines.
+unicode-width = "0.2"
+
+[dev-dependencies]
+serde_json = { workspace = true }

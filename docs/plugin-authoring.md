@@ -78,7 +78,7 @@ Before closing stdout, a plugin MAY emit a `<name>.goodbye` event with a reason:
   "body": { "kind": "nefor-tui.goodbye", "reason": "stream closed" } }
 ```
 
-The engine doesn't relay this or act on it. Peers that care see it before the connection goes silent.
+The engine doesn't relay `goodbye` events, but it does apply one policy when a connection drops: if the departed plugin was fully `ready` and other plugins are still alive, the broker broadcasts `shutdown` to them so the session winds down as a cooperating group. The rationale is that the reference compositions treat the plugin set as one unit — losing the terminal frontend, for example, shouldn't leave the Claude-harness hanging. Plugins that want to survive their peers (daemons, always-on helpers) should be spawned as a separate engine instance, not as part of the same graph.
 
 ### Heartbeat
 

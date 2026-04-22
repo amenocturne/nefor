@@ -88,24 +88,19 @@ impl HlTable {
 }
 
 /// Global default colors (engine-broadcast `default_colors`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Each field is optional: `None` means "use the terminal's native default
+/// for this channel". Publishers that want to theme the frame send concrete
+/// values; publishers that want to blend with the user's terminal can omit
+/// any combination of fields (or skip the `default_colors` event entirely).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DefaultColors {
-    /// Default foreground (packed `0x00RRGGBB`).
-    pub fg: u32,
-    /// Default background.
-    pub bg: u32,
-    /// Default special color.
-    pub sp: u32,
-}
-
-impl Default for DefaultColors {
-    fn default() -> Self {
-        Self {
-            fg: 0xCCCC_CCCC & 0x00FF_FFFF, // light gray
-            bg: 0x0000_0000,               // black
-            sp: 0x00FF_0000,               // red (underline default)
-        }
-    }
+    /// Default foreground (packed `0x00RRGGBB`). `None` → terminal default.
+    pub fg: Option<u32>,
+    /// Default background. `None` → terminal default (transparent).
+    pub bg: Option<u32>,
+    /// Default special color. `None` → terminal default.
+    pub sp: Option<u32>,
 }
 
 /// Grid-1 cell buffer.
