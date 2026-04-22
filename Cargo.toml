@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*", "plugins/mock-plugin", "plugins/nefor-chat", "plugins/nefor-tui", "tools/fake-engine"]
+members = ["crates/*", "plugins/mock-plugin", "plugins/nefor-chat", "plugins/nefor-combinators", "plugins/nefor-tui", "tools/fake-engine"]
 resolver = "2"
 
 [workspace.package]

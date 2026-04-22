@@ -1,22 +1,19 @@
-//! A single plugin connection: read loop, write queue, ready state.
+//! A single plugin connection: read loop, write queue.
 //!
-//! The connection is a value the broker owns in its central state. Each has
-//! a bounded MPSC receive queue (default 1024 per §6) the broker pushes
-//! messages into; a dedicated writer task drains that queue onto the wire.
+//! Post-Slice-2-I3 the broker is protocol-agnostic: it shuttles raw lines
+//! in both directions without parsing the NCP envelope. The reader task
+//! reads one newline-delimited UTF-8 string at a time (capped at
+//! [`MAX_LINE_BYTES`]) and hands the raw line to the broker. The writer
+//! task writes whatever bytes the broker queues onto the wire.
 //!
-//! A dedicated reader task parses one JSON line at a time from the transport
-//! reader and forwards a [`ConnectionInbound`] to the broker via the
-//! broker-wide inbound channel. Parse errors are converted to
-//! [`nefor_protocol::ParseError`] and let the broker decide whether to send
-//! back an `error` and whether to close.
+//! Framing-level errors (line exceeds the 16 MiB bound, non-UTF-8 bytes,
+//! or transport IO error) end the reader; the broker decides whether to
+//! tear the connection down via the exit watcher or reader-closed signal.
 
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use nefor_protocol::{
-    Envelope, ErrorCode, Offending, ParseError, PluginName, PluginOutgoing, SystemBody, Timestamp,
-};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
@@ -48,16 +45,17 @@ impl std::fmt::Display for ConnectionId {
     }
 }
 
-/// Outbound message destined for one connection's write queue.
+/// Outbound payload destined for one connection's write queue.
 ///
 /// `Close` is special: the writer task drains any preceding `Send`s,
 /// flushes the writer, then exits. It's how the broker sequences
-/// "send error, then close" atomically per §8.
+/// "send, then close" atomically.
 #[derive(Debug)]
 pub enum ConnectionOutbound {
-    /// Send this envelope (already stamped with `from = engine` or a peer's
-    /// name + `ts`).
-    Send(Envelope),
+    /// Send these bytes verbatim. Caller is responsible for including a
+    /// trailing `\n` (or whatever framing the wire expects) — the writer
+    /// does not add one.
+    Send(String),
     /// Close the connection after draining the preceding sends.
     Close,
 }
@@ -65,15 +63,14 @@ pub enum ConnectionOutbound {
 /// Inbound signal a connection's reader sends to the broker.
 #[derive(Debug)]
 pub enum ConnectionInbound {
-    /// Successfully-parsed line from the plugin.
-    Message(PluginOutgoing),
-    /// Parse failure — broker maps to `error` code per §8.
-    ParseError(ParseError),
-    /// Reader loop ended — EOF or fatal IO error. Broker logs the
-    /// departure; peers that care about peer liveness rely on plugin-
-    /// authored conventions (see `docs/plugin-authoring.md`).
+    /// A raw line read from the plugin, with the trailing newline stripped.
+    /// The broker does not parse; it timestamps and hands off to step.
+    Line(String),
+    /// Reader loop ended — EOF, framing cap exceeded, or a transport IO
+    /// error. Broker logs the departure; peers that care about peer
+    /// liveness rely on plugin-authored conventions.
     Closed {
-        /// Whether the reader hit EOF cleanly or a transport error.
+        /// Why the reader stopped.
         reason: ReaderEnd,
     },
 }
@@ -83,7 +80,7 @@ pub enum ConnectionInbound {
 pub enum ReaderEnd {
     /// Clean EOF.
     Eof,
-    /// Transport-level IO error.
+    /// Transport-level IO error (including invalid UTF-8 on the wire).
     IoError,
     /// Line exceeded the 16 MiB bound (§2). Treated as a framing error.
     LineTooLong,
@@ -95,9 +92,9 @@ pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 /// Default per-connection receive queue capacity (§6).
 pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 
-/// Spawn the reader task. Reads one line at a time, parses via
-/// [`PluginOutgoing::parse_line`], and forwards [`ConnectionInbound`] to
-/// `tx`. Returns when EOF or the broker closes `tx`.
+/// Spawn the reader task. Reads one line at a time, strips the trailing
+/// newline, and forwards [`ConnectionInbound::Line`] to `tx`. Returns when
+/// EOF, the broker closes `tx`, or a framing/IO error occurs.
 pub async fn run_reader(
     id: ConnectionId,
     reader: Pin<Box<dyn AsyncRead + Send + Unpin>>,
@@ -122,22 +119,14 @@ pub async fn run_reader(
                     if line.is_empty() {
                         continue;
                     }
-                    match PluginOutgoing::parse_line(&line) {
-                        Ok(msg) => {
-                            if tx
-                                .send((id, ConnectionInbound::Message(msg)))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                            continue;
-                        }
-                        Err(e) => {
-                            let _ = tx.send((id, ConnectionInbound::ParseError(e))).await;
-                            continue;
-                        }
+                    if tx
+                        .send((id, ConnectionInbound::Line(std::mem::take(&mut line))))
+                        .await
+                        .is_err()
+                    {
+                        return;
                     }
+                    continue;
                 }
             }
             Ok(ReadLine::TooLong) => ReaderEnd::LineTooLong,
@@ -200,19 +189,21 @@ async fn read_line_capped<R: AsyncRead + Unpin>(
 /// Spawn the writer task. Implements the bounded receive queue from §6: an
 /// internal [`VecDeque`] of capacity `cap` (default
 /// [`DEFAULT_QUEUE_CAPACITY`]). When a Send arrives and the queue is full,
-/// the oldest queued envelope is dropped and a `QueueOverflow` system error
-/// is enqueued in its place — the receiver MUST see the error per spec §6.
+/// the oldest queued line is dropped and a warning is logged — the broker no
+/// longer emits a protocol-level `QueueOverflow` system message (that was a
+/// starter/init.lua concern in the new model).
 ///
 /// `rx` itself is unbounded so the broker is never blocked; backpressure
 /// is enforced inside this task. Exits on [`ConnectionOutbound::Close`] or
 /// when `rx` closes.
 pub async fn run_writer(
+    id: ConnectionId,
     mut writer: Pin<Box<dyn AsyncWrite + Send + Unpin>>,
     rx: mpsc::UnboundedReceiver<ConnectionOutbound>,
     cap: usize,
 ) {
     let mut rx = rx;
-    let mut q: VecDeque<Envelope> = VecDeque::with_capacity(cap.min(1024));
+    let mut q: VecDeque<String> = VecDeque::with_capacity(cap.min(1024));
     let mut close_after_drain = false;
 
     loop {
@@ -220,13 +211,16 @@ pub async fn run_writer(
         // policy per §6.
         loop {
             match rx.try_recv() {
-                Ok(ConnectionOutbound::Send(env)) => {
+                Ok(ConnectionOutbound::Send(payload)) => {
                     if q.len() >= cap {
-                        let dropped = q.pop_front();
-                        let overflow = make_queue_overflow(dropped.as_ref());
-                        q.push_back(overflow);
+                        let _dropped = q.pop_front();
+                        tracing::warn!(
+                            conn = %id,
+                            cap,
+                            "write queue full; dropping oldest line",
+                        );
                     }
-                    q.push_back(env);
+                    q.push_back(payload);
                 }
                 Ok(ConnectionOutbound::Close) => {
                     close_after_drain = true;
@@ -241,12 +235,8 @@ pub async fn run_writer(
         }
 
         // Try to write the head of the queue.
-        if let Some(env) = q.pop_front() {
-            let line = env.to_line();
+        if let Some(line) = q.pop_front() {
             if writer.write_all(line.as_bytes()).await.is_err() {
-                return;
-            }
-            if writer.write_all(b"\n").await.is_err() {
                 return;
             }
             if writer.flush().await.is_err() {
@@ -263,26 +253,11 @@ pub async fn run_writer(
 
         // Nothing to do — wait for at least one new message.
         match rx.recv().await {
-            Some(ConnectionOutbound::Send(env)) => q.push_back(env),
+            Some(ConnectionOutbound::Send(payload)) => q.push_back(payload),
             Some(ConnectionOutbound::Close) => close_after_drain = true,
             None => close_after_drain = true,
         }
     }
-}
-
-fn make_queue_overflow(dropped: Option<&Envelope>) -> Envelope {
-    Envelope::system(
-        PluginName::engine(),
-        Timestamp::now(),
-        SystemBody::Error {
-            code: ErrorCode::QueueOverflow,
-            message: "per-connection receive queue full; oldest message dropped".into(),
-            offending: dropped.map(|e| Offending {
-                from: e.from.clone(),
-                ts: e.ts,
-            }),
-        },
-    )
 }
 
 /// Pipe a stderr byte stream to tracing, one line per log record, prefixed
@@ -326,23 +301,21 @@ mod tests {
     use tokio::io::duplex;
 
     #[tokio::test]
-    async fn reader_parses_one_valid_line() {
+    async fn reader_emits_lines_verbatim() {
         let (mut client, server) = duplex(1024);
         let (tx, mut rx) = mpsc::channel(8);
         let id = ConnectionId::next();
         let handle = tokio::spawn(run_reader(id, Box::pin(server), tx));
 
-        // Send a valid ready outgoing envelope.
-        let out = PluginOutgoing::system(nefor_protocol::SystemBody::Ready {
-            protocol_version: "0.1".into(),
-        });
-        let line = format!("{}\n", out.to_line());
-        client.write_all(line.as_bytes()).await.unwrap();
+        client.write_all(b"hello world\n").await.unwrap();
         drop(client);
 
         let (got_id, msg) = rx.recv().await.expect("message");
         assert_eq!(got_id, id);
-        assert!(matches!(msg, ConnectionInbound::Message(_)));
+        match msg {
+            ConnectionInbound::Line(s) => assert_eq!(s, "hello world"),
+            other => panic!("expected line, got {other:?}"),
+        }
 
         let (_, closed) = rx.recv().await.expect("close");
         assert!(
@@ -358,23 +331,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reader_reports_parse_error_on_invalid_json() {
+    async fn reader_skips_empty_lines() {
         let (mut client, server) = duplex(1024);
         let (tx, mut rx) = mpsc::channel(8);
         let id = ConnectionId::next();
         let handle = tokio::spawn(run_reader(id, Box::pin(server), tx));
 
-        client.write_all(b"this is not json\n").await.unwrap();
+        client.write_all(b"\n\nonly\n\n").await.unwrap();
         drop(client);
 
         let (_, msg) = rx.recv().await.expect("message");
-        assert!(
-            matches!(
-                msg,
-                ConnectionInbound::ParseError(ParseError::InvalidJson(_))
-            ),
-            "got {msg:?}"
-        );
+        match msg {
+            ConnectionInbound::Line(s) => assert_eq!(s, "only"),
+            other => panic!("expected line, got {other:?}"),
+        }
 
         let (_, closed) = rx.recv().await.expect("close");
         assert!(matches!(
@@ -387,71 +357,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writer_drains_envelopes_as_one_line_each() {
+    async fn writer_drains_lines_verbatim() {
         let (client, server) = duplex(1024);
         let (tx, rx) = mpsc::unbounded_channel();
-        let handle = tokio::spawn(run_writer(Box::pin(server), rx, DEFAULT_QUEUE_CAPACITY));
+        let id = ConnectionId::next();
+        let handle = tokio::spawn(run_writer(id, Box::pin(server), rx, DEFAULT_QUEUE_CAPACITY));
 
-        let env = Envelope::system(
-            PluginName::engine(),
-            Timestamp::now(),
-            SystemBody::ReadyOk {
-                engine_version: "0.1.0".into(),
-            },
-        );
-        tx.send(ConnectionOutbound::Send(env.clone())).unwrap();
+        tx.send(ConnectionOutbound::Send("first\n".into())).unwrap();
+        tx.send(ConnectionOutbound::Send("second\n".into()))
+            .unwrap();
         tx.send(ConnectionOutbound::Close).unwrap();
 
         let mut reader = BufReader::new(client);
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
-        assert!(line.ends_with('\n'));
-        assert!(line.contains("ready_ok"));
+        let mut line1 = String::new();
+        reader.read_line(&mut line1).await.unwrap();
+        assert_eq!(line1, "first\n");
+        let mut line2 = String::new();
+        reader.read_line(&mut line2).await.unwrap();
+        assert_eq!(line2, "second\n");
         handle.await.unwrap();
     }
 
     #[tokio::test]
-    async fn writer_overflow_drops_oldest_and_emits_queue_overflow() {
+    async fn writer_overflow_drops_oldest_silently() {
         // Tiny duplex: writer stalls after 1-2 lines. Tiny cap: queue
-        // saturates after a couple of pushes. Then we push a third —
-        // expect the oldest to be dropped and a QueueOverflow envelope
-        // to appear in the stream.
-        let (client, server) = duplex(64);
+        // saturates after a couple of pushes. The new string-level writer
+        // drops oldest on overflow and logs a warning — no protocol-level
+        // envelope is emitted any more.
+        let (client, server) = duplex(16);
         let (tx, rx) = mpsc::unbounded_channel();
         let cap = 2;
-        let handle = tokio::spawn(run_writer(Box::pin(server), rx, cap));
+        let id = ConnectionId::next();
+        let handle = tokio::spawn(run_writer(id, Box::pin(server), rx, cap));
 
-        // Three small events. Once the duplex fills the writer stalls;
-        // queue accumulates; on the third push the oldest is dropped.
-        for i in 0..6u32 {
-            let mut body = serde_json::Map::new();
-            body.insert("i".into(), serde_json::json!(i));
-            let env = Envelope::event(PluginName::new("p").unwrap(), Timestamp::now(), body);
-            tx.send(ConnectionOutbound::Send(env)).unwrap();
+        // Six lines into a queue of 2 — with a stalled writer, at least four
+        // should be dropped. We're not asserting the exact dropped count
+        // (that depends on scheduling) — just that the surviving output is a
+        // strict suffix of what we sent and that the task winds down cleanly.
+        let total = 6u32;
+        for i in 0..total {
+            tx.send(ConnectionOutbound::Send(format!("line{i}\n")))
+                .unwrap();
         }
         tx.send(ConnectionOutbound::Close).unwrap();
 
         let mut reader = BufReader::new(client);
-        let mut saw_overflow = false;
-        let mut total = 0;
+        let mut seen = Vec::new();
         loop {
             let mut line = String::new();
             match reader.read_line(&mut line).await {
                 Ok(0) => break,
-                Ok(_) => {
-                    total += 1;
-                    if line.contains("queue_overflow") {
-                        saw_overflow = true;
-                    }
-                }
+                Ok(_) => seen.push(line.trim_end_matches('\n').to_owned()),
                 Err(_) => break,
             }
         }
-        assert!(total > 0);
-        assert!(
-            saw_overflow,
-            "expected at least one queue_overflow line; got {total} lines total"
-        );
+        // Some lines must have been delivered — the exact set is scheduling-
+        // dependent but they all have the "line<N>" shape and are in order.
+        assert!(!seen.is_empty(), "writer delivered nothing");
+        for pair in seen.windows(2) {
+            let a: u32 = pair[0].trim_start_matches("line").parse().unwrap();
+            let b: u32 = pair[1].trim_start_matches("line").parse().unwrap();
+            assert!(a < b, "writer delivered lines out of order: {seen:?}");
+        }
         handle.await.unwrap();
     }
 }

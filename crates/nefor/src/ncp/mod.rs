@@ -1,24 +1,20 @@
 //! NCP — engine side of the Nefor Composition Protocol (spec v0.1).
 //!
-//! The engine has two subsystems (see `docs/principles.md`, "Runner /
-//! broker split"):
+//! Post-Slice-2-I3 the engine is protocol-agnostic string routing:
 //!
 //! - **Runner** (`runner`) — resolves the plugin root directory, spawns
 //!   the declared binary with `Command::new(binary).args(...)`, bridges
 //!   stdio. No shell, no env map. Exposes a [`Transport`](transport::Transport)
 //!   to the broker.
-//! - **Broker** (`broker`) — parses NCP envelopes, stamps `from` (from
-//!   the runner-assigned name) and `ts`, validates system messages,
-//!   broadcasts events, enforces bounded per-peer queues.
-//!
-//! Per D-10 the broker rejects malformed input loudly: every rejection is
-//! a `SystemBody::Error` back to the offending connection with a specific
-//! [`nefor_protocol::ErrorCode`], and close-triggering errors close the
-//! connection after the error is emitted.
+//! - **Broker** (`broker`) — stamps inbound lines, mirrors them to the
+//!   session log, invokes the Lua `step` function, and routes step's
+//!   outbound sends to connection writers. No envelope parsing, no
+//!   system-message dispatch, no replay-on-attach. All NCP protocol
+//!   handling lives in `starter/init.lua`.
 //!
 //! # Submodules
 //!
-//! - [`broker`] — broker state, stamp-and-broadcast loop, public API.
+//! - [`broker`] — broker state, step invocation loop, public API.
 //! - [`connection`] — a single plugin connection: send queue, read loop.
 //! - [`transport`] — `AsyncRead` / `AsyncWrite` traits and the stdio
 //!   implementation.
@@ -34,7 +30,7 @@ pub mod runner;
 pub mod spawn;
 pub mod transport;
 
-pub use broker::Broker;
+pub use broker::{Broker, BrokerOps, BrokerShared};
 pub use error::BrokerError;
 #[allow(unused_imports)]
 pub use runner::{resolve_plugin_root, spawn_plugin, PluginRoot};

@@ -1,0 +1,175 @@
+//! Unit tests for `starter/ncp.lua` driven from Rust.
+//!
+//! The Lua module under test (`starter/ncp.lua`) depends only on the
+//! `nefor.engine` surface — specifically `nefor.engine.send` and
+//! `nefor.engine.plugins`. This harness installs a mock `nefor.engine` that
+//! records calls + returns a caller-controlled plugin list, plus a `_test`
+//! helper global for the Lua tests to drive it. It then loads and runs
+//! `starter/ncp_test.lua`, which performs its own `assert`s and errors out
+//! on failure.
+//!
+//! Running the `ncp_test.lua` file from Rust (rather than a dedicated Lua
+//! CLI) keeps the tests inside `cargo test` and avoids a separate toolchain
+//! dependency.
+
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+use mlua::{Lua, Value};
+
+/// Resolve `<repo-root>/starter/`. `CARGO_MANIFEST_DIR` points at the
+/// engine crate (`crates/nefor`), so we walk up two levels.
+fn starter_dir() -> PathBuf {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("repo root is two levels above crates/nefor")
+        .join("starter")
+}
+
+#[test]
+fn starter_ncp_unit_tests() {
+    let lua = Lua::new();
+    install_mock_engine_and_test_helpers(&lua).expect("install mocks");
+    set_package_path(&lua).expect("set package.path");
+
+    let ncp_test = starter_dir().join("ncp_test.lua");
+    let src = std::fs::read_to_string(&ncp_test)
+        .unwrap_or_else(|e| panic!("read {}: {e}", ncp_test.display()));
+
+    if let Err(e) = lua
+        .load(&src)
+        .set_name(ncp_test.display().to_string())
+        .exec()
+    {
+        panic!("ncp_test.lua failed:\n{e}");
+    }
+}
+
+/// Install a fake `nefor.engine` that records `send` calls and reads its
+/// plugin list from a `_test`-owned slot. Also installs the `_test` global
+/// the Lua tests use to reset state and inspect recorded calls.
+fn install_mock_engine_and_test_helpers(lua: &Lua) -> mlua::Result<()> {
+    // Shared state between the two globals. Mutex is plenty here — there's
+    // no real concurrency; we're single-threaded inside a test.
+    struct Shared {
+        calls: Mutex<Vec<(Option<String>, String)>>,
+        plugins: Mutex<Vec<String>>,
+    }
+    let shared = std::sync::Arc::new(Shared {
+        calls: Mutex::new(Vec::new()),
+        plugins: Mutex::new(Vec::new()),
+    });
+
+    // nefor.engine.send(payload, target?) — record the call. Matches the
+    // real binding's signature modulo the fact we don't validate the target
+    // against PluginName (the tests pass well-formed names).
+    let nefor_tbl = lua.create_table()?;
+    let engine_tbl = lua.create_table()?;
+
+    let s1 = std::sync::Arc::clone(&shared);
+    let send_fn = lua.create_function(move |_, args: mlua::Variadic<Value>| {
+        let payload = match args.first() {
+            Some(Value::String(s)) => s.to_str()?.to_owned(),
+            other => {
+                return Err(mlua::Error::runtime(format!(
+                    "mock send: payload must be string; got {other:?}"
+                )));
+            }
+        };
+        let target = match args.get(1) {
+            None | Some(Value::Nil) => None,
+            Some(Value::String(s)) => Some(s.to_str()?.to_owned()),
+            other => {
+                return Err(mlua::Error::runtime(format!(
+                    "mock send: target must be string or nil; got {other:?}"
+                )));
+            }
+        };
+        s1.calls.lock().unwrap().push((target, payload));
+        Ok(())
+    })?;
+    engine_tbl.set("send", send_fn)?;
+
+    let s2 = std::sync::Arc::clone(&shared);
+    let plugins_fn = lua.create_function(move |lua, _: ()| {
+        let names = s2.plugins.lock().unwrap().clone();
+        let arr = lua.create_table()?;
+        for (i, n) in names.into_iter().enumerate() {
+            arr.set(i + 1, lua.create_string(&n)?)?;
+        }
+        Ok(arr)
+    })?;
+    engine_tbl.set("plugins", plugins_fn)?;
+
+    // nefor.engine.now() — return a fixed ISO-8601 string. Tests don't
+    // inspect timestamp values; a stable dummy is enough.
+    let now_fn = lua.create_function(|_, _: ()| Ok("2026-04-23T00:00:00.000Z".to_owned()))?;
+    engine_tbl.set("now", now_fn)?;
+
+    nefor_tbl.set("engine", engine_tbl)?;
+    lua.globals().set("nefor", nefor_tbl)?;
+
+    // _test — the Lua-side control surface.
+    let test_tbl = lua.create_table()?;
+
+    // _test.calls() -> array of { target = string|nil, payload = string }
+    let s3 = std::sync::Arc::clone(&shared);
+    let calls_fn = lua.create_function(move |lua, _: ()| {
+        let arr = lua.create_table()?;
+        let snap = s3.calls.lock().unwrap().clone();
+        for (i, (t, p)) in snap.into_iter().enumerate() {
+            let entry = lua.create_table()?;
+            match t {
+                Some(s) => entry.set("target", lua.create_string(&s)?)?,
+                None => entry.set("target", Value::Nil)?,
+            }
+            entry.set("payload", lua.create_string(&p)?)?;
+            arr.set(i + 1, entry)?;
+        }
+        Ok(arr)
+    })?;
+    test_tbl.set("calls", calls_fn)?;
+
+    // _test.calls_clear() — drop the recorded history.
+    let s4 = std::sync::Arc::clone(&shared);
+    let clear_fn = lua.create_function(move |_, _: ()| {
+        s4.calls.lock().unwrap().clear();
+        Ok(())
+    })?;
+    test_tbl.set("calls_clear", clear_fn)?;
+
+    // _test.set_plugins({ "a", "b" }) — override the plugin list that
+    // nefor.engine.plugins() returns.
+    let s5 = std::sync::Arc::clone(&shared);
+    let set_plugins_fn = lua.create_function(move |_, tbl: mlua::Table| {
+        let mut out = Vec::new();
+        for pair in tbl.pairs::<i64, String>() {
+            let (_i, v) = pair?;
+            out.push(v);
+        }
+        *s5.plugins.lock().unwrap() = out;
+        Ok(())
+    })?;
+    test_tbl.set("set_plugins", set_plugins_fn)?;
+
+    lua.globals().set("_test", test_tbl)?;
+    Ok(())
+}
+
+fn set_package_path(lua: &Lua) -> mlua::Result<()> {
+    let starter = starter_dir();
+    let starter_str = starter.display().to_string();
+    let script = format!(
+        r#"
+        package.path = table.concat({{
+          "{starter}/?.lua",
+          "{starter}/?/init.lua",
+          package.path,
+        }}, ";")
+        "#,
+        starter = starter_str
+    );
+    lua.load(&script).exec()
+}

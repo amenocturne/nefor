@@ -4,11 +4,12 @@
 //!
 //! 1. Parse CLI (`--config <DIR>`).
 //! 2. Resolve the config dir, initialize tracing to a file under it.
-//! 3. Boot the Lua VM and — if `init.lua` exists — run it. `init.lua` calls
-//!    `nefor.plugins.spawn { ... }` for every plugin the user wants to run.
-//! 4. Build a [`Broker`](crate::ncp::Broker), spawn every registered plugin
-//!    through it, install a `ctrl_c` shutdown hook, and run the broker until
-//!    it exits.
+//! 3. Open a fresh session log (optionally hydrating a parent session
+//!    referenced by `nefor.parent_session` after `init.lua` runs).
+//! 4. Boot the Lua VM with a [`BrokerOps`] routing sink and run
+//!    `init.lua`. Cache the global `step` function — fatal if missing.
+//! 5. Build a [`Broker`], spawn every registered plugin through it, install
+//!    a `ctrl_c` shutdown hook, and run the broker until it exits.
 //!
 //! Per D-02 the engine is pure glue: no plugins registered → log a message
 //! and exit cleanly. No UI, no bundled harness.
@@ -22,15 +23,22 @@ mod log;
 mod lua;
 mod ncp;
 mod paths;
+mod session;
 
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
+use nefor_protocol::Timestamp;
 
 use crate::error::NeforError;
 use crate::events::EventBus;
+use crate::lua::bindings::EngineOps;
 use crate::lua::LuaHost;
-use crate::ncp::{resolve_plugin_root, spawn_plugin, Broker, PluginRegistry, SharedPluginRegistry};
+use crate::ncp::{
+    resolve_plugin_root, spawn_plugin, Broker, BrokerOps, BrokerShared, PluginRegistry,
+    SharedPluginRegistry,
+};
+use crate::session::{load_session, SessionError, SessionHeader, SessionId, SessionWriter};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -50,9 +58,21 @@ async fn main() -> anyhow::Result<()> {
         "nefor starting"
     );
 
+    // Open the session file up-front so the broker's shared state can own it
+    // from the moment it exists. Parent-session hydration happens *after*
+    // init.lua runs, because init.lua is where `nefor.parent_session` is
+    // declared.
+    let session_id = SessionId::new();
+    let header = SessionHeader::new(session_id.clone(), None, Timestamp::now());
+    let session = SessionWriter::create(header).context("opening session log")?;
+    tracing::info!(session_id = %session_id, path = %session.path().display(), "session log opened");
+
+    let shared = Arc::new(Mutex::new(BrokerShared::new(session)));
+    let engine_ops: Arc<dyn EngineOps> = Arc::new(BrokerOps::new(Arc::clone(&shared)));
+
     let bus = Arc::new(EventBus::new());
     let plugins: SharedPluginRegistry = Arc::new(Mutex::new(PluginRegistry::new()));
-    let host = LuaHost::new(Arc::clone(&bus), Arc::clone(&plugins))
+    let mut host = LuaHost::new(Arc::clone(&bus), Arc::clone(&plugins), engine_ops)
         .map_err(NeforError::from)
         .context("initializing Lua VM")?;
 
@@ -86,6 +106,23 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(path = %init_lua.display(), "no init.lua at expected path");
     }
 
+    // Hydrate a parent session if init.lua set `nefor.parent_session`. Fatal
+    // if the id is present but malformed, or the session file is missing /
+    // malformed — the user explicitly asked to resume, so silent fallback
+    // would be worse than a loud exit.
+    let saved_log = match load_parent_session(&host) {
+        Ok(v) => v,
+        Err(e) => return Err(NeforError::Session(e).into()),
+    };
+    if !saved_log.is_empty() {
+        tracing::info!(entries = saved_log.len(), "parent session hydrated");
+    }
+
+    // Cache step now — fatal if init.lua didn't define one.
+    host.cache_step()
+        .map_err(NeforError::from)
+        .context("caching step function from init.lua")?;
+
     let specs = {
         let mut guard = match plugins.lock() {
             Ok(g) => g,
@@ -114,7 +151,7 @@ async fn main() -> anyhow::Result<()> {
     };
     tracing::info!(plugin_root = %plugin_root.as_path().display(), "plugin root resolved");
 
-    let mut broker = Broker::new(env!("CARGO_PKG_VERSION"));
+    let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, saved_log);
     for spec in &specs {
         match spawn_plugin(spec, &plugin_root) {
             Ok(transport) => {
@@ -151,6 +188,37 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(?stop_reason, "broker stopped");
     ctrl_c_task.abort();
 
-    drop(host);
     Ok(())
+}
+
+/// Read the global `nefor.parent_session` string (if any) and load the
+/// referenced session log. Returns an empty vec when no parent is declared.
+fn load_parent_session(host: &LuaHost) -> Result<Vec<session::LogEntry>, SessionError> {
+    let nefor: mlua::Table = match host.lua().globals().get("nefor") {
+        Ok(t) => t,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let parent: mlua::Value = match nefor.get("parent_session") {
+        Ok(v) => v,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let parent = match parent {
+        mlua::Value::Nil => return Ok(Vec::new()),
+        mlua::Value::String(s) => s
+            .to_str()
+            .map_err(|e| SessionError::InvalidSessionId {
+                raw: "<non-utf8>".to_string(),
+                reason: e.to_string(),
+            })?
+            .to_owned(),
+        other => {
+            return Err(SessionError::InvalidSessionId {
+                raw: format!("<{}>", other.type_name()),
+                reason: "nefor.parent_session must be a string".to_string(),
+            });
+        }
+    };
+    let id = SessionId::parse(&parent)?;
+    let loaded = load_session(&id)?;
+    Ok(loaded.entries)
 }

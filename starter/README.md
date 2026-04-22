@@ -1,33 +1,54 @@
 # starter/
 
-Reference `init.lua` for a minimal Claude Code chat TUI.
+Reference config for the nefor engine. This is also where NCP v0.1 protocol
+semantics live — Slice 2 I4 moved the handshake / broadcast / replay logic out
+of the Rust engine and into Lua. The engine is now a pure string-layer event
+bus; everything NCP-shaped happens here.
 
-**This is not auto-installed.** To use:
+## Layout
 
-1. Copy `init.lua` to `~/.config/nefor/init.lua` (or your `NEFOR_APPNAME` equivalent).
-3. Ensure `claude` is on `PATH` (the Claude Code CLI). Verify with `claude --version`.
-4. Run `just run` from the monorepo root (or `cargo run --bin nefor`).
-5. Type a prompt, press Enter. Ctrl-C quits.
+- `init.lua` — top-level composition. Sets `package.path`, defines the global
+  `step` hook (delegates to `ncp.step`), and registers plugins via
+  `nefor.plugins.spawn`. Edit this file to change which plugins run.
+- `ncp.lua` — NCP v0.1 protocol module. Handles `ready` / `ready_ok`,
+  broadcast-minus-sender, replay-on-attach, and `error` emission.
+- `lib/json.lua` — bundled rxi/json.lua (MIT). Do not edit; re-vendor from
+  upstream if a newer version is needed.
+- `ncp_test.lua` — Lua unit tests for `ncp.lua`. Driven by
+  `crates/nefor/tests/starter_ncp_test.rs`; not run directly.
 
-## What's here
+## Run
 
-- Three widgets: title bar (top, 1 row), scrolling transcript (center), input + hint (bottom, 2 rows).
-- A single `mock-plugin` session with `permission_mode = "bypassPermissions"` — adjust if you want CC to ask before running tools (see `cc.session.new` options).
-- Streaming: assistant text accumulates into one `[assistant] ...` line as deltas arrive.
-- Tool calls: shown inline as `[tool <name>] <short input hint>`.
-- Final per-turn cost + duration printed after the response.
+From the monorepo root:
 
-## Known MVP limitations
+```
+NEFOR_PLUGIN_DIR=$PWD/plugins cargo run --bin nefor -- --config ./starter
+```
 
-- Transcript is capped at 500 lines; older lines are dropped silently from the front.
-- No scrollback controls yet — the center widget shows whatever ratatui chooses to fit.
-- No prompt history (up-arrow recall). That's a plugin job.
-- One session per nefor launch; no multi-session switching.
-- Byte-level Backspace: ASCII is fine, multibyte input gets truncated bytes on erase. Post-MVP.
+The default composition spawns `mock-plugin`, `nefor-chat`, `nefor-tui`, and
+`nefor-combinators`. Build them first:
 
-## Extending
+```
+cargo build -p mock-plugin -p nefor-chat -p nefor-tui -p nefor-combinators-plugin
+```
 
-- Swap the `on_tool_start` / `on_turn_done` / `on_turn_error` callbacks in `init.lua` to route elsewhere — a logger, a status widget, etc.
-- Subscribe to `nefor.events.on("cc:tool_start", ...)` if you want cross-plugin observers; mock-plugin emits string-payload bus events alongside the structured callbacks (see `plugins/mock-plugin/lua/events.lua`).
-- Replace the input renderer with your own widget, or add new ones on `left` / `right` regions.
-- Hook `Up` / `Down` in the key handler for prompt history; `Esc` to clear the draft.
+## Customize
+
+- **Add/remove plugins**: edit the `nefor.plugins.spawn { ... }` block at the
+  end of `init.lua`.
+- **Resume a prior session**: uncomment `nefor.parent_session = "<uuid>"` at
+  the top of `init.lua` and fill in a prior session id from the engine log.
+  (Note: parent-session replay is deferred; `saved_log` is ignored by
+  `ncp.step` today.)
+- **Change protocol behavior**: `ncp.lua` is where handshake, broadcast,
+  replay, and error rules live. Swap it for your own module if you need a
+  non-standard dispatch policy.
+
+## Known gaps (next slice)
+
+- No graceful `shutdown` system-message emission. The engine still cascades
+  process shutdown when any plugin exits; plugins observe EOF on their stdin
+  and exit. Spec §5.3 `shutdown` message emission would require an
+  `nefor.engine.on_shutdown(fn)` binding and is deferred.
+- `saved_log` (parent-session hydration) is accepted by `ncp.step` and
+  ignored. Session-resumption semantics are tracked as D-21a-deferred.

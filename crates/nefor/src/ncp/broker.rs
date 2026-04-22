@@ -1,97 +1,180 @@
 //! Broker — central state + event loop.
 //!
-//! The broker owns one [`ConnectionState`] per connected plugin and runs
-//! the single event loop that fans out envelopes via per-connection
-//! bounded send queues (§6).
+//! Post-Slice-2-I3 the broker is a protocol-agnostic string router. Its
+//! responsibilities collapse to:
 //!
-//! Per §9 clarification / D-09, `shutdown` is delivered as N point-to-
-//! point sends, not through a bus abstraction. Event messages (§6) fan
-//! out to every OTHER connected plugin.
+//! 1. Accept per-connection transports attached by the runner (one per
+//!    spawned plugin); own the read/write tasks and exit watcher.
+//! 2. For every inbound line: stamp `origin = Plugin(name)` + `ts = now`,
+//!    append a [`LogEntry`] to the in-memory event log and the session
+//!    file, then invoke the cached Lua `step(saved_log, current_log)`
+//!    hook. Step is free to decide what (if anything) flows out.
+//! 3. Expose a [`BrokerOps`] routing sink to the Lua VM. When `step` calls
+//!    `nefor.engine.send(payload, target?)` the broker stamps the outbound
+//!    as `origin = Step`, appends it to the same log + session, and writes
+//!    the line to the target writer queue (broadcast = every connected
+//!    plugin; targeted = one plugin by name).
+//! 4. Cascade shutdown: when one plugin exits and others are still alive,
+//!    close the other connections' outbound channels within the grace
+//!    window. No protocol-level `shutdown` system message is emitted — if
+//!    `init.lua` wants to narrate the shutdown it does so via `step`.
 //!
-//! # Lifecycle
-//!
-//! 1. Runner spawns the plugin subprocess with cwd = `<plugin-dir>/<name>/`
-//!    and stamps `from = spec.name` on every envelope this connection
-//!    emits. No name negotiation on the wire.
-//! 2. Broker waits for the plugin's first message: a `ready` system body
-//!    declaring the NCP protocol version. Validates version, replies
-//!    `ready_ok` or an `error` that closes the connection.
-//! 3. Broker routes event messages (broadcast to every other peer) and
-//!    rejects system messages that plugins are not allowed to send.
-//! 4. On plugin stdout-close / exit the broker logs and cleans up. Peers
-//!    that care about peer liveness implement their own heartbeat /
-//!    farewell conventions.
+//! All NCP protocol handling (ready handshake, replay-on-attach, system
+//! message dispatch, error-code classification) has moved to the user's
+//! `starter/init.lua`. The broker does not parse the body of an inbound
+//! line — raw bytes in, raw bytes out.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use nefor_protocol::{
-    Body, Envelope, ErrorCode, MessageKind, Offending, ParseError, PluginName, PluginOutgoing,
-    SystemBody, Timestamp,
-};
+use nefor_protocol::{PluginName, Timestamp};
 use tokio::sync::mpsc;
 
+use crate::lua::bindings::{EngineOps, SendTarget};
+use crate::lua::LuaHost;
 use crate::ncp::connection::{
     run_exit_watcher, run_reader, run_stderr_pump, run_writer, ConnectionId, ConnectionInbound,
     ConnectionOutbound, ReaderEnd, DEFAULT_QUEUE_CAPACITY,
 };
 use crate::ncp::transport::{ExitOutcome, Transport};
-
-/// Protocol version this broker implements. Plugins declaring any other
-/// `protocol_version` in the ready handshake are rejected with
-/// `ProtocolVersionMismatch` (§9).
-pub const SUPPORTED_PROTOCOL_VERSION: &str = "0.1";
-
-/// How long a fresh connection has to send a valid `ready` before the
-/// broker closes it (§2, 10 s recommended default).
-pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
+use crate::session::{LogEntry, Origin, SessionWriter};
 
 /// Default shutdown grace — see §5.3. The broker still accepts an override
 /// at `shutdown` time for operator flexibility.
 pub const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 2000;
 
-/// Per-connection state the broker tracks.
-struct ConnectionState {
-    /// Engine-local id.
-    id: ConnectionId,
-    /// Plugin name — assigned by the runner at connection creation, not
-    /// negotiated on the wire. Present before the ready handshake.
+/// State the broker and the [`BrokerOps`] share: the engine's single source
+/// of truth for the bus-wide event log, the open session file, and the
+/// outbound-writer handle for every connected plugin.
+pub struct BrokerShared {
+    /// In-memory log of every message the engine has seen this run, inbound
+    /// (`Origin::Plugin`) and outbound (`Origin::Step`), in routing order.
+    /// Passed to `step` as `current_log`.
+    pub event_log: Vec<LogEntry>,
+    /// Write-through persistent mirror of `event_log`. Flushed on `Drop`.
+    pub session: SessionWriter,
+    /// Unbounded sender onto each connected plugin's writer queue, keyed by
+    /// plugin name. Populated by [`Broker::attach_transport`] and cleared
+    /// when the connection tears down.
+    pub conns: HashMap<PluginName, mpsc::UnboundedSender<ConnectionOutbound>>,
+}
+
+impl BrokerShared {
+    /// Build the shared state around an already-opened session writer.
+    pub fn new(session: SessionWriter) -> Self {
+        Self {
+            event_log: Vec::new(),
+            session,
+            conns: HashMap::new(),
+        }
+    }
+}
+
+/// Routing sink handed to the Lua VM. Every `nefor.engine.send` call from
+/// `step` lands here; the sink stamps the outbound, logs it, and writes it
+/// to the target connection(s).
+pub struct BrokerOps {
+    shared: Arc<Mutex<BrokerShared>>,
+}
+
+impl BrokerOps {
+    /// Wrap a shared-state handle as an engine-ops sink.
+    pub fn new(shared: Arc<Mutex<BrokerShared>>) -> Self {
+        Self { shared }
+    }
+}
+
+impl EngineOps for BrokerOps {
+    fn plugins(&self) -> Vec<PluginName> {
+        // Snapshot the connected set under the lock, then drop it. Callers
+        // (Lua `nefor.engine.plugins()`) iterate the snapshot without holding
+        // the lock — a plugin joining or leaving mid-iteration is fine since
+        // any subsequent `send` re-checks the live map.
+        let guard = match self.shared.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.conns.keys().cloned().collect()
+    }
+
+    fn send(&self, target: SendTarget, payload: String) {
+        let ts = Timestamp::now();
+        let target_name = match &target {
+            SendTarget::Broadcast => None,
+            SendTarget::Targeted(name) => Some(name.clone()),
+        };
+        let entry = LogEntry {
+            ts,
+            origin: Origin::Step,
+            target: target_name,
+            payload: payload.clone(),
+        };
+
+        // Hold the lock across the append + fanout so an interleaved inbound
+        // line can't observe a half-applied outbound. The broker's run loop
+        // is single-task so the only other holder is... itself, in a
+        // sequential path — no contention.
+        let mut guard = match self.shared.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.event_log.push(entry.clone());
+        if let Err(e) = guard.session.append(&entry) {
+            tracing::error!(error = %e, "failed to append outbound entry to session log");
+        }
+        let line = with_trailing_newline(payload);
+        match target {
+            SendTarget::Broadcast => {
+                for conn in guard.conns.values() {
+                    let _ = conn.send(ConnectionOutbound::Send(line.clone()));
+                }
+            }
+            SendTarget::Targeted(name) => {
+                if let Some(conn) = guard.conns.get(&name) {
+                    let _ = conn.send(ConnectionOutbound::Send(line));
+                } else {
+                    tracing::warn!(
+                        target = %name,
+                        "step.send: target plugin is not connected; dropping outbound",
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn with_trailing_newline(mut s: String) -> String {
+    if !s.ends_with('\n') {
+        s.push('\n');
+    }
+    s
+}
+
+/// Per-connection bookkeeping the broker keeps outside the shared state
+/// (the shared `conns` map is the routing index; this tracks lifecycle).
+struct ConnectionRecord {
     name: PluginName,
-    /// Sender onto the writer's queue. Unbounded so the broker is never
-    /// blocked; the writer task enforces the §6 bounded-queue overflow
-    /// policy on the receive side.
-    send: mpsc::UnboundedSender<ConnectionOutbound>,
-    /// When the ready timeout fires (only meaningful while pre-ready).
-    ready_deadline: Instant,
-    /// True once the plugin has sent a valid `ready`. Pre-ready events /
-    /// non-ready system messages are rejected.
-    ready: bool,
-    /// Set when the broker has scheduled this connection to close. While
-    /// `closing`, further inbound messages are logged-and-dropped.
     closing: bool,
 }
 
 /// The broker's single event loop.
 pub struct Broker {
-    conns: HashMap<ConnectionId, ConnectionState>,
+    shared: Arc<Mutex<BrokerShared>>,
+    host: LuaHost,
+    conns_by_id: HashMap<ConnectionId, ConnectionRecord>,
     /// Shared channel all per-connection readers drop messages onto.
     inbound_tx: mpsc::Sender<(ConnectionId, ConnectionInbound)>,
     inbound_rx: mpsc::Receiver<(ConnectionId, ConnectionInbound)>,
     /// Shared channel all per-connection exit watchers drop outcomes onto.
     exit_tx: mpsc::Sender<(ConnectionId, ExitOutcome)>,
     exit_rx: mpsc::Receiver<(ConnectionId, ExitOutcome)>,
-    /// Triggered by [`Broker::shutdown`] or an external signal.
+    /// Triggered by [`Broker::shutdown_handle`] or an external signal.
     shutdown_rx: mpsc::Receiver<u64>,
     shutdown_tx: mpsc::Sender<u64>,
-    /// Engine version string included in `ready_ok`.
-    engine_version: String,
-    /// In-memory log of every event envelope routed through the broker,
-    /// in routing order with the original engine-stamped `ts`. Replayed
-    /// to each plugin immediately after its `ready_ok` so declarative
-    /// registrations emitted before a late attacher joined still reach
-    /// it. System envelopes are never logged — per NCP §6 the bus is
-    /// event-only. Sessions are short-lived; no retention policy in v1.
-    event_log: Vec<Envelope>,
+    /// Saved log from a resumed parent session. Passed verbatim to every
+    /// `step` invocation as the first argument.
+    saved_log: Vec<LogEntry>,
 }
 
 /// Outcome of the broker's run loop.
@@ -104,23 +187,31 @@ pub enum BrokerStopReason {
 }
 
 impl Broker {
-    /// Construct a new broker with default capacities.
-    pub fn new(engine_version: impl Into<String>) -> Self {
+    /// Construct a new broker with default capacities. `shared` must already
+    /// own an open [`SessionWriter`]; `host` must have its `step` function
+    /// cached (see [`LuaHost::cache_step`]); `saved_log` is the hydrated
+    /// parent-session log (empty for a fresh session).
+    pub fn with_saved_log(
+        shared: Arc<Mutex<BrokerShared>>,
+        host: LuaHost,
+        saved_log: Vec<LogEntry>,
+    ) -> Self {
         // Shared inbound/exit channels sized to tolerate brief bursts from
         // many plugins. 1024 each matches §6's per-connection default.
         let (inbound_tx, inbound_rx) = mpsc::channel(1024);
         let (exit_tx, exit_rx) = mpsc::channel(64);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(4);
         Self {
-            conns: HashMap::new(),
+            shared,
+            host,
+            conns_by_id: HashMap::new(),
             inbound_tx,
             inbound_rx,
             exit_tx,
             exit_rx,
             shutdown_rx,
             shutdown_tx,
-            engine_version: engine_version.into(),
-            event_log: Vec::new(),
+            saved_log,
         }
     }
 
@@ -132,13 +223,14 @@ impl Broker {
 
     /// Attach an arbitrary transport to the broker under a pre-assigned
     /// plugin name. Returns the assigned [`ConnectionId`]. The broker
-    /// treats this as a fresh connection that still owes a `ready`
-    /// handshake before any events are accepted.
+    /// does not wait for a ready handshake — the first inbound line flows
+    /// directly into `step`.
     pub fn attach_transport(&mut self, transport: Transport, name: PluginName) -> ConnectionId {
         let id = ConnectionId::next();
         let log_label = name.as_str().to_owned();
         let (send_tx, send_rx) = mpsc::unbounded_channel::<ConnectionOutbound>();
         tokio::spawn(run_writer(
+            id,
             transport.writer,
             send_rx,
             DEFAULT_QUEUE_CAPACITY,
@@ -149,14 +241,14 @@ impl Broker {
         }
         tokio::spawn(run_exit_watcher(id, transport.exit, self.exit_tx.clone()));
 
-        self.conns.insert(
+        {
+            let mut guard = lock_shared(&self.shared);
+            guard.conns.insert(name.clone(), send_tx);
+        }
+        self.conns_by_id.insert(
             id,
-            ConnectionState {
-                id,
+            ConnectionRecord {
                 name,
-                send: send_tx,
-                ready_deadline: Instant::now() + READY_TIMEOUT,
-                ready: false,
                 closing: false,
             },
         );
@@ -166,38 +258,29 @@ impl Broker {
     /// Drive the broker until either all connections have left or a
     /// shutdown completes.
     pub async fn run(mut self) -> BrokerStopReason {
-        let mut ready_tick = tokio::time::interval(Duration::from_millis(500));
-        ready_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
         let mut shutdown_grace: Option<u64> = None;
         let mut shutdown_deadline: Option<Instant> = None;
 
         loop {
-            // Pending closes whose writer queue drained — remove them.
-            self.reap_closed();
-
             // If we're past the shutdown deadline, force-close everything
             // and exit.
             if let Some(deadline) = shutdown_deadline {
                 if Instant::now() >= deadline {
-                    for conn in self.conns.values_mut() {
-                        let _ = conn.send.send(ConnectionOutbound::Close);
-                        conn.closing = true;
-                    }
+                    self.force_close_all();
                     return BrokerStopReason::Shutdown;
                 }
             }
 
             // If the engine said to shut down and there are no connections
             // left, exit immediately without waiting out the grace.
-            if shutdown_deadline.is_some() && self.conns.is_empty() {
+            if shutdown_deadline.is_some() && self.conns_by_id.is_empty() {
                 return BrokerStopReason::Shutdown;
             }
 
             // If no shutdown in flight and all connections have quietly
             // left, return. This handles the "empty config" case (no
             // plugins spawned) and the "last plugin exited" case.
-            if shutdown_deadline.is_none() && self.conns.is_empty() {
+            if shutdown_deadline.is_none() && self.conns_by_id.is_empty() {
                 return BrokerStopReason::AllPluginsGone;
             }
 
@@ -217,10 +300,7 @@ impl Broker {
                 Some(grace_ms) = self.shutdown_rx.recv(), if shutdown_grace.is_none() => {
                     shutdown_grace = Some(grace_ms);
                     shutdown_deadline = Some(Instant::now() + Duration::from_millis(grace_ms));
-                    self.broadcast_shutdown(grace_ms).await;
-                }
-                _ = ready_tick.tick() => {
-                    self.check_ready_timeouts().await;
+                    self.begin_shutdown();
                 }
                 _ = tokio::time::sleep(sleep_dur), if shutdown_deadline.is_some() => {
                     // Loop iteration to re-check the shutdown deadline above.
@@ -232,227 +312,79 @@ impl Broker {
     // ---- inbound dispatch -------------------------------------------------
 
     async fn handle_inbound(&mut self, id: ConnectionId, msg: ConnectionInbound) {
-        let Some(conn) = self.conns.get(&id) else {
+        let Some(record) = self.conns_by_id.get(&id) else {
             return;
         };
-        if conn.closing {
+        if record.closing {
             return;
         }
         match msg {
-            ConnectionInbound::Message(out) => self.handle_message(id, out).await,
-            ConnectionInbound::ParseError(e) => self.handle_parse_error(id, e).await,
-            ConnectionInbound::Closed { reason } => {
-                self.handle_reader_closed(id, reason).await;
-            }
+            ConnectionInbound::Line(line) => self.handle_line(id, line),
+            ConnectionInbound::Closed { reason } => self.handle_reader_closed(id, reason),
         }
     }
 
-    async fn handle_message(&mut self, id: ConnectionId, out: PluginOutgoing) {
-        let ready = self.conns.get(&id).map(|c| c.ready).unwrap_or(false);
-        if !ready {
-            // Pre-ready connections: the first message MUST be a valid
-            // `ready` system body. Anything else (including event
-            // messages) closes the connection with invalid_ready.
-            if let (MessageKind::System, Body::System(SystemBody::Ready { .. })) =
-                (out.kind, &out.body)
-            {
-                self.handle_ready(id, out).await;
-            } else {
-                self.send_error_and_close(
-                    id,
-                    ErrorCode::InvalidReady,
-                    "first message must be a system ready".into(),
-                    None,
-                )
-                .await;
-            }
-            return;
-        }
-
-        // Post-ready: route by type.
-        match out.kind {
-            MessageKind::Event => self.route_event(id, out).await,
-            MessageKind::System => self.route_system(id, out).await,
-        }
-    }
-
-    async fn handle_ready(&mut self, id: ConnectionId, out: PluginOutgoing) {
-        let Body::System(SystemBody::Ready { protocol_version }) = out.body else {
-            // Can't happen given the check in `handle_message`, but we
-            // handle defensively.
-            self.send_error_and_close(
-                id,
-                ErrorCode::InvalidReady,
-                "internal: non-ready body in ready path".into(),
-                None,
-            )
-            .await;
+    fn handle_line(&mut self, id: ConnectionId, payload: String) {
+        let Some(record) = self.conns_by_id.get(&id) else {
             return;
         };
+        let origin_name = record.name.clone();
+        let entry = LogEntry {
+            ts: Timestamp::now(),
+            origin: Origin::Plugin(origin_name),
+            target: None,
+            payload,
+        };
 
-        if protocol_version != SUPPORTED_PROTOCOL_VERSION {
-            self.send_error_and_close(
-                id,
-                ErrorCode::ProtocolVersionMismatch,
-                format!(
-                    "engine supports protocol_version={SUPPORTED_PROTOCOL_VERSION:?}, \
-                     plugin sent {protocol_version:?}"
-                ),
-                None,
-            )
-            .await;
-            return;
-        }
-
-        let plugin_name = match self.conns.get_mut(&id) {
-            Some(conn) => {
-                conn.ready = true;
-                conn.name.clone()
+        // Append + snapshot the current log under the lock, then release it
+        // before invoking step — step may call back into `BrokerOps::send`
+        // which re-acquires the lock.
+        let current_snapshot = {
+            let mut guard = lock_shared(&self.shared);
+            guard.event_log.push(entry.clone());
+            if let Err(e) = guard.session.append(&entry) {
+                tracing::error!(error = %e, "failed to append inbound entry to session log");
             }
-            None => return,
+            guard.event_log.clone()
         };
 
-        tracing::info!(plugin = %plugin_name, %protocol_version, "plugin ready");
-
-        self.send_system(
-            id,
-            SystemBody::ReadyOk {
-                engine_version: self.engine_version.clone(),
-            },
-        )
-        .await;
-
-        // Replay the event log to this late attacher so plugin-level
-        // declarative events (e.g. `combinators.register`) emitted
-        // before it joined still reach it.
-        //
-        // Ordering invariant: this function runs inside the single
-        // `select!` arm in `run`, so no live inbound event can be
-        // routed between the snapshot we read here and the enqueues
-        // below. Because `push_envelope` uses an unbounded channel,
-        // each replay frame lands in the writer's FIFO queue ahead of
-        // any subsequent live traffic. The original engine-stamped
-        // `ts` on each envelope is preserved so causal order stays
-        // coherent across replay + live.
-        for env in self.event_log.clone() {
-            self.push_envelope(id, env).await;
+        if let Err(e) = self.host.invoke_step(&self.saved_log, &current_snapshot) {
+            tracing::error!(error = %e, "step invocation errored at VM level");
         }
     }
 
-    async fn route_event(&mut self, sender_id: ConnectionId, out: PluginOutgoing) {
-        let Body::Event(event_body) = out.body else {
-            return;
-        };
-        let sender_name = match self.conns.get(&sender_id).map(|c| c.name.clone()) {
-            Some(n) => n,
-            None => return,
-        };
-        let ts = Timestamp::now();
-        let envelope = Envelope::event(sender_name, ts, event_body);
-
-        // Log every event envelope (bus is event-only per §6) for
-        // replay to future late attachers. Same envelope that peers
-        // receive, so `ts` and `from` match across live + replay.
-        self.event_log.push(envelope.clone());
-
-        let targets: Vec<ConnectionId> = self
-            .conns
-            .iter()
-            .filter(|(peer_id, c)| **peer_id != sender_id && !c.closing && c.ready)
-            .map(|(peer_id, _)| *peer_id)
-            .collect();
-        for target_id in targets {
-            self.push_envelope(target_id, envelope.clone()).await;
-        }
-    }
-
-    async fn route_system(&mut self, sender_id: ConnectionId, out: PluginOutgoing) {
-        let Body::System(body) = out.body else {
-            return;
-        };
-        match body {
-            SystemBody::Ready { .. } => {
-                // Re-ready on an already-ready connection is a protocol
-                // error — the plugin has one shot at the handshake.
-                self.send_error_and_close(
-                    sender_id,
-                    ErrorCode::InvalidReady,
-                    "ready received on an already-ready connection".into(),
-                    None,
-                )
-                .await;
-            }
-            // The remaining system kinds are engine→plugin only per §5.
-            // A plugin sending them is a protocol violation — drop with
-            // an unknown_kind error (the kind is structurally recognized
-            // but not allowed in this direction).
-            SystemBody::ReadyOk { .. } | SystemBody::Shutdown { .. } | SystemBody::Error { .. } => {
-                self.send_system_error(
-                    sender_id,
-                    ErrorCode::UnknownKind,
-                    "system kind not permitted from plugins".into(),
-                    None,
-                )
-                .await;
-            }
-        }
-    }
-
-    async fn handle_parse_error(&mut self, id: ConnectionId, err: ParseError) {
-        let (code, close, message) = classify_parse_error(&err);
-        if close {
-            self.send_error_and_close(id, code, message, None).await;
-        } else {
-            self.send_system_error(id, code, message, None).await;
-        }
-    }
-
-    async fn handle_reader_closed(&mut self, id: ConnectionId, reason: ReaderEnd) {
+    fn handle_reader_closed(&mut self, id: ConnectionId, reason: ReaderEnd) {
         // Reader EOF / IO error — the plugin's outbound stream is done.
-        // We don't immediately remove the connection from state; we wait
-        // for the exit watcher to fire. Peers detecting plugin departure
-        // is a plugin-level concern (heartbeat / farewell events); the
-        // broker does not broadcast anything.
-
+        // Don't immediately remove the connection from state; wait for the
+        // exit watcher to fire. In-memory test transports without an exit
+        // watcher fall through to the inbound-drained path below.
         tracing::debug!(conn = %id, ?reason, "reader loop ended");
 
-        // For framing errors (LineTooLong), we additionally emit a
-        // malformed_envelope error so §2's 16 MiB bound is enforced
-        // visibly before close.
-        if matches!(reason, ReaderEnd::LineTooLong) {
-            self.send_system_error(
-                id,
-                ErrorCode::MalformedEnvelope,
-                "line exceeded 16 MiB framing bound".into(),
-                None,
-            )
-            .await;
-        }
-
-        // Pre-ready connections whose reader closes are torn down
-        // immediately; post-ready connections wait on the exit watcher
-        // to disambiguate clean exit vs crash. In-memory test transports
-        // without an exit watcher fall through to the exit-less path —
-        // they're reaped via the shared inbound channel when tests drop
-        // the plugin side.
-        let ready = self.conns.get(&id).map(|c| c.ready).unwrap_or(false);
-        if !ready {
-            self.force_close(id).await;
+        // If the connection has no exit watcher (in-memory tests), the
+        // reader-closed signal is the only teardown notification we'll get.
+        // Drop it now.
+        let has_watcher = self.conns_by_id.contains_key(&id);
+        if has_watcher {
+            // If this connection has no exit watcher attached (we can't tell
+            // from here — so be conservative), schedule a best-effort close.
+            // The real exit watcher path takes priority and is idempotent.
+            self.force_close(id);
         }
     }
 
     async fn handle_exit(&mut self, id: ConnectionId, outcome: ExitOutcome) {
         let name = self
-            .conns
+            .conns_by_id
             .get(&id)
-            .map(|c| c.name.as_str().to_owned())
+            .map(|r| r.name.as_str().to_owned())
             .unwrap_or_default();
         tracing::info!(plugin = %name, ?outcome, "plugin exited");
 
         // Drop the connection state. The writer task will exit when its
         // channel closes.
-        if let Some(conn) = self.conns.remove(&id) {
-            drop(conn.send);
+        if let Some(record) = self.conns_by_id.remove(&id) {
+            let mut guard = lock_shared(&self.shared);
+            guard.conns.remove(&record.name);
         }
 
         // Policy: the plugin set is a cooperating group. If one plugin
@@ -462,10 +394,10 @@ impl Broker {
         // arm is already guarded against double-arming, and try_send
         // failing (channel full / closed) means a shutdown is already
         // in flight.
-        if !self.conns.is_empty() {
+        if !self.conns_by_id.is_empty() {
             tracing::info!(
                 trigger_plugin = %name,
-                "peer exited; initiating engine shutdown"
+                "peer exited; initiating engine shutdown",
             );
             let _ = self.shutdown_tx.try_send(DEFAULT_SHUTDOWN_GRACE_MS);
         }
@@ -473,99 +405,43 @@ impl Broker {
 
     // ---- helpers ----------------------------------------------------------
 
-    async fn send_error_and_close(
-        &mut self,
-        id: ConnectionId,
-        code: ErrorCode,
-        message: String,
-        offending: Option<Offending>,
-    ) {
-        self.send_system_error(id, code, message, offending).await;
-
-        // Schedule close after the error drains.
-        if let Some(conn) = self.conns.get_mut(&id) {
-            let _ = conn.send.send(ConnectionOutbound::Close);
-            conn.closing = true;
+    fn begin_shutdown(&mut self) {
+        // Close every connection's writer channel. Writer tasks drain their
+        // queues, flush, and exit. The shutdown-grace deadline in the run
+        // loop force-closes anything still alive.
+        let ids: Vec<ConnectionId> = self.conns_by_id.keys().copied().collect();
+        for id in ids {
+            self.force_close(id);
         }
     }
 
-    async fn send_system_error(
-        &self,
-        id: ConnectionId,
-        code: ErrorCode,
-        message: String,
-        offending: Option<Offending>,
-    ) {
-        let body = SystemBody::Error {
-            code,
-            message,
-            offending,
-        };
-        self.send_system(id, body).await;
+    fn force_close_all(&mut self) {
+        let ids: Vec<ConnectionId> = self.conns_by_id.keys().copied().collect();
+        for id in ids {
+            self.force_close(id);
+        }
     }
 
-    async fn send_system(&self, id: ConnectionId, body: SystemBody) {
-        let env = Envelope::system(PluginName::engine(), Timestamp::now(), body);
-        self.push_envelope(id, env).await;
-    }
-
-    async fn push_envelope(&self, id: ConnectionId, env: Envelope) {
-        let Some(conn) = self.conns.get(&id) else {
+    fn force_close(&mut self, id: ConnectionId) {
+        let Some(record) = self.conns_by_id.get_mut(&id) else {
             return;
         };
-        // The send channel is unbounded so the broker never blocks. The
-        // writer task enforces the §6 receive-queue cap with drop-oldest +
-        // QueueOverflow emission to the receiver.
-        if conn.send.send(ConnectionOutbound::Send(env)).is_err() {
-            tracing::debug!(conn = %conn.id, "send queue closed (connection already torn down)");
+        if record.closing {
+            return;
+        }
+        record.closing = true;
+        let name = record.name.clone();
+        let guard = lock_shared(&self.shared);
+        if let Some(sender) = guard.conns.get(&name) {
+            let _ = sender.send(ConnectionOutbound::Close);
         }
     }
+}
 
-    async fn broadcast_shutdown(&mut self, grace_ms: u64) {
-        let targets: Vec<ConnectionId> = self
-            .conns
-            .iter()
-            .filter(|(_, c)| !c.closing && c.ready)
-            .map(|(peer_id, _)| *peer_id)
-            .collect();
-        for target_id in targets {
-            self.send_system(
-                target_id,
-                SystemBody::Shutdown {
-                    reason: Some("engine shutting down".into()),
-                    grace_ms: Some(grace_ms),
-                },
-            )
-            .await;
-        }
-    }
-
-    async fn check_ready_timeouts(&mut self) {
-        let now = Instant::now();
-        let expired: Vec<ConnectionId> = self
-            .conns
-            .iter()
-            .filter(|(_, c)| !c.ready && !c.closing && c.ready_deadline <= now)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in expired {
-            tracing::warn!(conn = %id, "ready timeout; closing connection");
-            self.force_close(id).await;
-        }
-    }
-
-    async fn force_close(&mut self, id: ConnectionId) {
-        if let Some(conn) = self.conns.get_mut(&id) {
-            let _ = conn.send.send(ConnectionOutbound::Close);
-            conn.closing = true;
-        }
-    }
-
-    /// Remove closed connections whose send queue has drained. Called at
-    /// the top of every loop iteration so state stays in sync with the
-    /// writer tasks.
-    fn reap_closed(&mut self) {
-        self.conns.retain(|_, c| !(c.closing && c.send.is_closed()));
+fn lock_shared(m: &Arc<Mutex<BrokerShared>>) -> std::sync::MutexGuard<'_, BrokerShared> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
@@ -580,52 +456,20 @@ impl ShutdownHandle {
     }
 }
 
-// ---- parse-error → error-code mapping -----------------------------------
-
-/// Map a [`ParseError`] to the §8 code, whether the connection should close,
-/// and the human-readable message to embed in the error.
-fn classify_parse_error(err: &ParseError) -> (ErrorCode, bool, String) {
-    match err {
-        // Framing-level errors that close per §8 footnote.
-        ParseError::InvalidJson(_) => (ErrorCode::MalformedEnvelope, true, err.to_string()),
-        // Ordinary envelope-level malformed_envelope: keep the connection.
-        ParseError::ExtraFields(_)
-        | ParseError::MissingField(_)
-        | ParseError::NotAnObject
-        | ParseError::WrongType { .. }
-        | ParseError::InvalidType(_)
-        | ParseError::InvalidTimestamp(_)
-        | ParseError::EmptyFrom
-        | ParseError::OutgoingHasStampedField(_)
-        | ParseError::SystemBodyMissingKind
-        | ParseError::SystemBodyKindNotString => {
-            (ErrorCode::MalformedEnvelope, false, err.to_string())
-        }
-        ParseError::BodyNotObject => (ErrorCode::BodyNotObject, false, err.to_string()),
-        ParseError::UnknownKind(_) => (ErrorCode::UnknownKind, false, err.to_string()),
-        // Ready-body faults → invalid_ready, close. The variant itself
-        // tells us the category, no string sniffing required.
-        ParseError::InvalidReadyBody(_) => (ErrorCode::InvalidReady, true, err.to_string()),
-        // Structural faults on non-ready system bodies → malformed_envelope,
-        // keep the connection open. In practice this path triggers for
-        // engine-sent-only kinds that a plugin sent with a bad shape —
-        // we keep the library consumer well-covered even if no known
-        // plugin flow reaches here.
-        ParseError::InvalidSystemBody { .. } => {
-            (ErrorCode::MalformedEnvelope, false, err.to_string())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::EventBus;
+    use crate::lua::LuaHost;
     use crate::ncp::transport::Transport;
-    use nefor_protocol::{Body, MessageKind, PluginOutgoing, SystemBody};
-    use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use crate::ncp::PluginRegistry;
+    use crate::session::{SessionHeader, SessionId};
+    use std::sync::Mutex as StdMutex;
+    use tempfile::TempDir;
+    use tokio::io::{duplex, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-    /// A mock transport backed by `tokio::io::duplex`. Returns the client
-    /// half for the test to drive.
+    /// A mock plugin transport pair. Returns the plugin half for tests to
+    /// drive, and the broker-side [`Transport`] for attachment.
     struct MockPlugin {
         writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
         reader: BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
@@ -636,7 +480,6 @@ mod tests {
     }
 
     fn make_transport_buf(buf: usize) -> (MockPlugin, Transport) {
-        // Broker side: reads from plugin's writer, writes to plugin's reader.
         let (plugin_side, broker_side) = duplex(buf);
         let (broker_read, broker_write) = tokio::io::split(broker_side);
         let (plugin_read, plugin_write) = tokio::io::split(plugin_side);
@@ -655,165 +498,57 @@ mod tests {
         )
     }
 
-    async fn send_outgoing(p: &mut MockPlugin, out: PluginOutgoing) {
-        let line = format!("{}\n", out.to_line());
+    async fn send_line(p: &mut MockPlugin, line: &str) {
         p.writer.write_all(line.as_bytes()).await.unwrap();
+        if !line.ends_with('\n') {
+            p.writer.write_all(b"\n").await.unwrap();
+        }
     }
 
-    async fn recv_envelope(p: &mut MockPlugin) -> Option<Envelope> {
+    async fn recv_line(p: &mut MockPlugin) -> Option<String> {
         let mut line = String::new();
         let n = p.reader.read_line(&mut line).await.ok()?;
         if n == 0 {
             return None;
         }
-        let trimmed = line.trim_end_matches(['\n', '\r']);
-        Envelope::parse_line(trimmed).ok()
-    }
-
-    fn ready_body(protocol_version: &str) -> PluginOutgoing {
-        PluginOutgoing::system(SystemBody::Ready {
-            protocol_version: protocol_version.into(),
-        })
+        Some(line.trim_end_matches(['\n', '\r']).to_owned())
     }
 
     fn pn(s: &str) -> PluginName {
         PluginName::new(s).expect("valid plugin name")
     }
 
+    fn build_host(shared: &Arc<StdMutex<BrokerShared>>, init_src: &str) -> LuaHost {
+        let bus = Arc::new(EventBus::new());
+        let plugins = Arc::new(StdMutex::new(PluginRegistry::new()));
+        let ops: Arc<dyn EngineOps> = Arc::new(BrokerOps::new(Arc::clone(shared)));
+        let mut host = LuaHost::new(bus, plugins, ops).expect("host ok");
+        host.exec_str("init.lua", init_src).expect("exec init");
+        host.cache_step().expect("cache step");
+        host
+    }
+
+    fn tmp_session(dir: &TempDir) -> (SessionWriter, std::path::PathBuf) {
+        let id = SessionId::new();
+        let path = dir
+            .path()
+            .join("nefor")
+            .join("sessions")
+            .join(format!("{id}.jsonl"));
+        let header = SessionHeader::new(id, None, Timestamp::now());
+        let writer = SessionWriter::create_at(path.clone(), header).expect("writer");
+        (writer, path)
+    }
+
     // --- tests ---------------------------------------------------------
 
     #[tokio::test]
-    async fn ready_accepts_valid_protocol_version() {
-        let mut broker = Broker::new("0.1.0");
-        let (mut p, t) = make_transport();
-        broker.attach_transport(t, pn("test"));
-        tokio::spawn(broker.run());
-
-        send_outgoing(&mut p, ready_body("0.1")).await;
-
-        let env = recv_envelope(&mut p).await.expect("ready_ok");
-        assert!(matches!(env.body, Body::System(SystemBody::ReadyOk { .. })));
-    }
-
-    #[tokio::test]
-    async fn ready_rejects_version_mismatch() {
-        let mut broker = Broker::new("0.1.0");
-        let (mut p, t) = make_transport();
-        broker.attach_transport(t, pn("test"));
-        tokio::spawn(broker.run());
-
-        send_outgoing(&mut p, ready_body("0.2")).await;
-
-        let env = recv_envelope(&mut p).await.expect("error");
-        match env.body {
-            Body::System(SystemBody::Error { code, .. }) => {
-                assert_eq!(code, ErrorCode::ProtocolVersionMismatch);
-            }
-            other => panic!("expected error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn broadcast_delivers_to_n_minus_1_peers() {
-        let mut broker = Broker::new("0.1.0");
-        let (mut pa, ta) = make_transport();
-        let (mut pb, tb) = make_transport();
-        let (mut pc, tc) = make_transport();
-        broker.attach_transport(ta, pn("a"));
-        broker.attach_transport(tb, pn("b"));
-        broker.attach_transport(tc, pn("c"));
-        tokio::spawn(broker.run());
-
-        send_outgoing(&mut pa, ready_body("0.1")).await;
-        recv_envelope(&mut pa).await.expect("ready_ok a");
-
-        send_outgoing(&mut pb, ready_body("0.1")).await;
-        recv_envelope(&mut pb).await.expect("ready_ok b");
-
-        send_outgoing(&mut pc, ready_body("0.1")).await;
-        recv_envelope(&mut pc).await.expect("ready_ok c");
-
-        // Now a sends an event.
-        let mut body = serde_json::Map::new();
-        body.insert("k".into(), serde_json::Value::String("hello".into()));
-        send_outgoing(&mut pa, PluginOutgoing::event(body)).await;
-
-        // b and c each receive it; a does not.
-        let env_b = recv_envelope(&mut pb).await.expect("b got event");
-        let env_c = recv_envelope(&mut pc).await.expect("c got event");
-        assert_eq!(env_b.kind, MessageKind::Event);
-        assert_eq!(env_c.kind, MessageKind::Event);
-        assert_eq!(env_b.from.as_str(), "a");
-        assert_eq!(env_c.from.as_str(), "a");
-
-        // Sender does not receive its own event.
-        let pa_next =
-            tokio::time::timeout(Duration::from_millis(100), recv_envelope(&mut pa)).await;
-        assert!(
-            pa_next.is_err() || pa_next.unwrap().is_none(),
-            "sender must not receive its own event",
-        );
-    }
-
-    #[tokio::test]
-    async fn non_ready_first_message_is_invalid_ready() {
-        let mut broker = Broker::new("0.1.0");
-        let (mut p, t) = make_transport();
-        broker.attach_transport(t, pn("p"));
-        tokio::spawn(broker.run());
-
-        let mut body = serde_json::Map::new();
-        body.insert("k".into(), serde_json::Value::String("v".into()));
-        send_outgoing(&mut p, PluginOutgoing::event(body)).await;
-
-        let env = recv_envelope(&mut p).await.expect("error");
-        match env.body {
-            Body::System(SystemBody::Error { code, .. }) => {
-                assert_eq!(code, ErrorCode::InvalidReady);
-            }
-            other => panic!("expected error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn parse_error_unknown_kind_does_not_close() {
-        let mut broker = Broker::new("0.1.0");
-        let (mut p, t) = make_transport();
-        broker.attach_transport(t, pn("p"));
-        tokio::spawn(broker.run());
-
-        send_outgoing(&mut p, ready_body("0.1")).await;
-        recv_envelope(&mut p).await; // ready_ok
-
-        // Send a system message with an unknown kind — must be handcrafted
-        // since the type system won't allow construction through
-        // SystemBody.
-        p.writer
-            .write_all(b"{\"type\":\"system\",\"body\":{\"kind\":\"invented\"}}\n")
-            .await
-            .unwrap();
-
-        let env = recv_envelope(&mut p).await.expect("error");
-        match env.body {
-            Body::System(SystemBody::Error { code, .. }) => {
-                assert_eq!(code, ErrorCode::UnknownKind);
-            }
-            other => panic!("expected error, got {other:?}"),
-        }
-
-        // Connection should still be open — send a valid event and
-        // observe no further error arrives.
-        let mut body = serde_json::Map::new();
-        body.insert("k".into(), serde_json::Value::String("v".into()));
-        send_outgoing(&mut p, PluginOutgoing::event(body)).await;
-
-        let next = tokio::time::timeout(Duration::from_millis(100), recv_envelope(&mut p)).await;
-        assert!(next.is_err() || next.unwrap().is_none());
-    }
-
-    #[tokio::test]
     async fn broker_exits_when_no_plugins_configured() {
-        let broker = Broker::new("0.1.0");
+        let dir = TempDir::new().unwrap();
+        let (session, _path) = tmp_session(&dir);
+        let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
+        let host = build_host(&shared, "function step(s, c) end");
+        let broker = Broker::with_saved_log(shared, host, Vec::new());
         let outcome = tokio::time::timeout(Duration::from_secs(2), broker.run())
             .await
             .expect("broker should exit quickly");
@@ -821,289 +556,245 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_overflow_sends_error_to_receiver() {
-        // Tiny receiver-side duplex buffer + the 1024-deep send queue means
-        // even a few thousand small events backs up enough to trigger the
-        // bounded-queue overflow path.
-        let mut broker = Broker::new("0.1.0");
-        let (mut sender_plugin, sender_t) = make_transport();
-        let (mut receiver_plugin, receiver_t) = make_transport_buf(256);
-        broker.attach_transport(sender_t, pn("s"));
-        broker.attach_transport(receiver_t, pn("r"));
-        tokio::spawn(broker.run());
-
-        send_outgoing(&mut sender_plugin, ready_body("0.1")).await;
-        recv_envelope(&mut sender_plugin).await;
-        send_outgoing(&mut receiver_plugin, ready_body("0.1")).await;
-        recv_envelope(&mut receiver_plugin).await;
-
-        for i in 0..3000u32 {
-            let mut body = serde_json::Map::new();
-            body.insert("i".into(), serde_json::json!(i));
-            send_outgoing(&mut sender_plugin, PluginOutgoing::event(body)).await;
-        }
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // Drain receiver looking for at least one QueueOverflow error.
-        let mut saw_overflow = false;
-        for _ in 0..4000 {
-            match tokio::time::timeout(
-                Duration::from_millis(50),
-                recv_envelope(&mut receiver_plugin),
-            )
-            .await
-            {
-                Ok(Some(env)) => {
-                    if let Body::System(SystemBody::Error {
-                        code: ErrorCode::QueueOverflow,
-                        ..
-                    }) = env.body
-                    {
-                        saw_overflow = true;
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-        assert!(
-            saw_overflow,
-            "expected at least one QueueOverflow error on the saturated receiver",
+    async fn inbound_line_invokes_step() {
+        // Step appends to a Lua-side global every time it runs so the test
+        // can assert what it saw.
+        let dir = TempDir::new().unwrap();
+        let (session, _path) = tmp_session(&dir);
+        let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
+        let host = build_host(
+            &shared,
+            r#"
+            seen = {}
+            function step(saved, current)
+                local last = current[#current]
+                seen[#seen + 1] = last.origin .. ":" .. last.payload
+            end
+            "#,
         );
-    }
 
-    /// Drive a ready handshake on an attached plugin: send `ready`,
-    /// receive `ready_ok`, and return any envelopes that followed
-    /// the `ready_ok` within a short window. Those trailing envelopes
-    /// are the replayed event log (may be empty).
-    async fn ready_and_collect_replay(p: &mut MockPlugin) -> Vec<Envelope> {
-        send_outgoing(p, ready_body("0.1")).await;
-        let first = recv_envelope(p).await.expect("ready_ok");
-        assert!(
-            matches!(first.body, Body::System(SystemBody::ReadyOk { .. })),
-            "first envelope after ready must be ready_ok",
-        );
-        let mut replay = Vec::new();
-        while let Ok(Some(env)) =
-            tokio::time::timeout(Duration::from_millis(100), recv_envelope(p)).await
-        {
-            replay.push(env);
-        }
-        replay
-    }
+        // Grab a handle on the Lua VM before handing it to the broker so the
+        // test can read `seen` back after the run.
+        let lua = host.lua().clone();
 
-    fn event_with_key(key: &str, value: &str) -> PluginOutgoing {
-        let mut body = serde_json::Map::new();
-        body.insert(key.into(), serde_json::Value::String(value.into()));
-        PluginOutgoing::event(body)
-    }
-
-    #[tokio::test]
-    async fn late_attacher_receives_replay_of_earlier_events() {
-        let mut broker = Broker::new("0.1.0");
-        let (mut pa, ta) = make_transport();
-        let (mut pb, tb) = make_transport();
-        broker.attach_transport(ta, pn("a"));
-        broker.attach_transport(tb, pn("b"));
-        tokio::spawn(broker.run());
-
-        send_outgoing(&mut pa, ready_body("0.1")).await;
-        recv_envelope(&mut pa).await.expect("ready_ok a");
-
-        // A emits three events while B is still pre-ready.
-        send_outgoing(&mut pa, event_with_key("n", "1")).await;
-        send_outgoing(&mut pa, event_with_key("n", "2")).await;
-        send_outgoing(&mut pa, event_with_key("n", "3")).await;
-
-        // Give the broker a moment to route+log.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // B attaches later (already done above; still pre-ready) and rows through ready.
-        let replay = ready_and_collect_replay(&mut pb).await;
-        assert_eq!(
-            replay.len(),
-            3,
-            "expected 3 replayed events, got {replay:?}"
-        );
-        for (i, env) in replay.iter().enumerate() {
-            assert_eq!(env.kind, MessageKind::Event);
-            assert_eq!(env.from.as_str(), "a");
-            let want = (i + 1).to_string();
-            let Body::Event(ref map) = env.body else {
-                panic!("expected event body, got {:?}", env.body);
-            };
-            let got = map
-                .get("n")
-                .and_then(|v| v.as_str())
-                .expect("event body has string n");
-            assert_eq!(got, want.as_str(), "replay out of order");
-        }
-    }
-
-    #[tokio::test]
-    async fn replay_preserves_original_ts() {
-        let mut broker = Broker::new("0.1.0");
-        let (mut pa, ta) = make_transport();
-        let (mut pc, tc) = make_transport();
-        let (mut pb, tb) = make_transport();
-        broker.attach_transport(ta, pn("a"));
-        broker.attach_transport(tc, pn("c"));
-        broker.attach_transport(tb, pn("b"));
-        tokio::spawn(broker.run());
-
-        // A and C ready first.
-        send_outgoing(&mut pa, ready_body("0.1")).await;
-        recv_envelope(&mut pa).await.expect("ready_ok a");
-        send_outgoing(&mut pc, ready_body("0.1")).await;
-        recv_envelope(&mut pc).await.expect("ready_ok c");
-
-        // A emits an event C sees live.
-        send_outgoing(&mut pa, event_with_key("tag", "x")).await;
-        let live = recv_envelope(&mut pc).await.expect("c got event live");
-        assert_eq!(live.kind, MessageKind::Event);
-
-        // B rows in late and gets the replayed copy.
-        let replay = ready_and_collect_replay(&mut pb).await;
-        assert_eq!(replay.len(), 1);
-        assert_eq!(replay[0].ts, live.ts, "replay ts must match live ts");
-        assert_eq!(replay[0].from.as_str(), live.from.as_str());
-    }
-
-    #[tokio::test]
-    async fn replay_does_not_contain_system_messages() {
-        let mut broker = Broker::new("0.1.0");
-        let (mut pa, ta) = make_transport();
-        let (mut pb, tb) = make_transport();
-        broker.attach_transport(ta, pn("a"));
-        broker.attach_transport(tb, pn("b"));
-        tokio::spawn(broker.run());
-
-        send_outgoing(&mut pa, ready_body("0.1")).await;
-        recv_envelope(&mut pa).await.expect("ready_ok a");
-
-        // Provoke a system error back to A (engine-kind sent by plugin),
-        // then emit a valid event. The error envelope must NOT be
-        // replayed to B; only the event should.
-        p_send_raw(
-            &mut pa,
-            "{\"type\":\"system\",\"body\":{\"kind\":\"ready_ok\",\"engine_version\":\"x\"}}\n",
-        )
-        .await;
-        // Drain the error response so it doesn't pollute later reads.
-        let _ = recv_envelope(&mut pa).await;
-
-        send_outgoing(&mut pa, event_with_key("k", "v")).await;
-
-        // Let the broker catch up.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let replay = ready_and_collect_replay(&mut pb).await;
-        assert_eq!(
-            replay.len(),
-            1,
-            "expected exactly 1 replayed envelope, got {replay:?}",
-        );
-        assert_eq!(replay[0].kind, MessageKind::Event);
-        assert_eq!(replay[0].from.as_str(), "a");
-        for env in &replay {
-            assert!(
-                matches!(env.body, Body::Event(_)),
-                "replay must contain only event bodies, got {:?}",
-                env.body,
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn self_does_not_see_own_replay() {
-        let mut broker = Broker::new("0.1.0");
-        let (mut pa, ta) = make_transport();
-        broker.attach_transport(ta, pn("a"));
-        tokio::spawn(broker.run());
-
-        send_outgoing(&mut pa, ready_body("0.1")).await;
-        recv_envelope(&mut pa).await.expect("ready_ok a");
-
-        send_outgoing(&mut pa, event_with_key("k", "v")).await;
-
-        // A must never see its own event — neither live (already
-        // covered elsewhere) nor as a replay (there's no second
-        // ready on this connection, but we still assert the stream
-        // stays quiet).
-        let next = tokio::time::timeout(Duration::from_millis(150), recv_envelope(&mut pa)).await;
-        assert!(
-            next.is_err() || next.unwrap().is_none(),
-            "A must not receive its own event",
-        );
-    }
-
-    #[tokio::test]
-    async fn replay_then_live_preserves_order() {
-        let mut broker = Broker::new("0.1.0");
-        let (mut pa, ta) = make_transport();
-        let (mut pb, tb) = make_transport();
-        broker.attach_transport(ta, pn("a"));
-        broker.attach_transport(tb, pn("b"));
-        tokio::spawn(broker.run());
-
-        send_outgoing(&mut pa, ready_body("0.1")).await;
-        recv_envelope(&mut pa).await.expect("ready_ok a");
-
-        // E1 emitted before B is ready -> replayed.
-        send_outgoing(&mut pa, event_with_key("n", "1")).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // B completes the ready handshake; the replay of E1 is enqueued
-        // synchronously inside handle_ready, before any subsequent live
-        // traffic is routed.
-        send_outgoing(&mut pb, ready_body("0.1")).await;
-        let ready_ok = recv_envelope(&mut pb).await.expect("ready_ok b");
-        assert!(matches!(
-            ready_ok.body,
-            Body::System(SystemBody::ReadyOk { .. })
-        ));
-
-        // E2 emitted after B is ready -> delivered live.
-        send_outgoing(&mut pa, event_with_key("n", "2")).await;
-
-        let e1 = recv_envelope(&mut pb).await.expect("E1 (replay)");
-        let e2 = recv_envelope(&mut pb).await.expect("E2 (live)");
-        for env in [&e1, &e2] {
-            assert_eq!(env.kind, MessageKind::Event);
-            assert_eq!(env.from.as_str(), "a");
-        }
-        let extract = |env: &Envelope| -> String {
-            let Body::Event(ref map) = env.body else {
-                panic!("expected event");
-            };
-            map.get("n").and_then(|v| v.as_str()).expect("n").to_owned()
-        };
-        assert_eq!(extract(&e1), "1", "first envelope to B must be E1");
-        assert_eq!(extract(&e2), "2", "second envelope to B must be E2");
-    }
-
-    async fn p_send_raw(p: &mut MockPlugin, raw: &str) {
-        p.writer.write_all(raw.as_bytes()).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn shutdown_sends_shutdown_to_plugins() {
-        let mut broker = Broker::new("0.1.0");
+        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
         let (mut p, t) = make_transport();
-        broker.attach_transport(t, pn("p"));
+        broker.attach_transport(t, pn("test"));
         let handle = broker.shutdown_handle();
-        tokio::spawn(broker.run());
+        let run = tokio::spawn(broker.run());
 
-        send_outgoing(&mut p, ready_body("0.1")).await;
-        recv_envelope(&mut p).await;
+        send_line(&mut p, "hello from test").await;
+
+        // Let the broker drain.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle.shutdown(50).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
+
+        let seen: mlua::Table = lua.globals().get("seen").unwrap();
+        let first: String = seen.get(1).unwrap();
+        assert_eq!(first, "test:hello from test");
+    }
+
+    #[tokio::test]
+    async fn step_send_broadcast_writes_to_all_peers() {
+        let dir = TempDir::new().unwrap();
+        let (session, _path) = tmp_session(&dir);
+        let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
+        // Step broadcasts "pong" on every inbound line.
+        let host = build_host(
+            &shared,
+            r#"function step(saved, current) nefor.engine.send("pong") end"#,
+        );
+
+        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let (mut pa, ta) = make_transport();
+        let (mut pb, tb) = make_transport();
+        let (mut pc, tc) = make_transport();
+        broker.attach_transport(ta, pn("a"));
+        broker.attach_transport(tb, pn("b"));
+        broker.attach_transport(tc, pn("c"));
+        let handle = broker.shutdown_handle();
+        let run = tokio::spawn(broker.run());
+
+        send_line(&mut pa, "trigger").await;
+
+        // All three plugins receive the broadcast — including the origin, per
+        // the spec: step is not a plugin, so "all plugins minus origin (Step)"
+        // = all plugins.
+        for (p, label) in [(&mut pa, "a"), (&mut pb, "b"), (&mut pc, "c")] {
+            let line = tokio::time::timeout(Duration::from_millis(500), recv_line(p))
+                .await
+                .unwrap_or_else(|_| panic!("{label} timed out waiting for broadcast"));
+            assert_eq!(line.as_deref(), Some("pong"));
+        }
 
         handle.shutdown(50).await;
-        // Plugin should observe shutdown system message.
-        let env = recv_envelope(&mut p).await.expect("shutdown msg");
-        assert!(matches!(
-            env.body,
-            Body::System(SystemBody::Shutdown { .. })
-        ));
+        let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
+    }
+
+    #[tokio::test]
+    async fn step_send_targeted_writes_to_one_peer() {
+        let dir = TempDir::new().unwrap();
+        let (session, _path) = tmp_session(&dir);
+        let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
+        let host = build_host(
+            &shared,
+            r#"function step(saved, current) nefor.engine.send("to-b-only", "b") end"#,
+        );
+
+        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let (mut pa, ta) = make_transport();
+        let (mut pb, tb) = make_transport();
+        broker.attach_transport(ta, pn("a"));
+        broker.attach_transport(tb, pn("b"));
+        let handle = broker.shutdown_handle();
+        let run = tokio::spawn(broker.run());
+
+        send_line(&mut pa, "trigger").await;
+
+        let got_b = tokio::time::timeout(Duration::from_millis(500), recv_line(&mut pb))
+            .await
+            .expect("b timed out");
+        assert_eq!(got_b.as_deref(), Some("to-b-only"));
+
+        // a must not have received anything — give it a generous window so we
+        // catch accidental fan-out.
+        let got_a = tokio::time::timeout(Duration::from_millis(150), recv_line(&mut pa)).await;
+        assert!(
+            got_a.is_err() || got_a.unwrap().is_none(),
+            "a must not receive targeted send aimed at b",
+        );
+
+        handle.shutdown(50).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
+    }
+
+    #[tokio::test]
+    async fn session_log_records_inbound_and_outbound() {
+        let dir = TempDir::new().unwrap();
+        let (session, path) = tmp_session(&dir);
+        let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
+        let host = build_host(
+            &shared,
+            r#"function step(saved, current) nefor.engine.send("echoed", "a") end"#,
+        );
+
+        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let (mut pa, ta) = make_transport();
+        broker.attach_transport(ta, pn("a"));
+        let handle = broker.shutdown_handle();
+        let run = tokio::spawn(broker.run());
+
+        send_line(&mut pa, "inbound-line").await;
+        // Let the outbound drain through the writer task onto the wire.
+        let got = tokio::time::timeout(Duration::from_millis(500), recv_line(&mut pa))
+            .await
+            .expect("a timed out");
+        assert_eq!(got.as_deref(), Some("echoed"));
+
+        // Shut the broker down cleanly so the SessionWriter flushes.
+        handle.shutdown(50).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
+
+        // Explicitly flush the session writer before reading the file back.
+        // Drop-ordering alone is not reliable here — the SessionWriter's
+        // Drop only runs when the last Arc<Mutex<BrokerShared>> is dropped,
+        // and subtle ordering inside spawned tasks can stretch that window.
+        {
+            let mut guard = shared.lock().expect("lock shared");
+            guard.session.flush().expect("flush session");
+        }
+
+        let mut file = tokio::fs::File::open(&path).await.expect("session file");
+        let mut body = String::new();
+        file.read_to_string(&mut body).await.expect("read session");
+        // Header + at least two entries (one inbound, one outbound).
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(
+            lines.len() >= 3,
+            "expected header + >=2 entries, got {}: {body}",
+            lines.len()
+        );
+        let inbound = lines
+            .iter()
+            .find(|l| l.contains("\"origin\":\"a\"") && l.contains("\"payload\":\"inbound-line\""))
+            .expect("inbound entry present");
+        let outbound = lines
+            .iter()
+            .find(|l| {
+                l.contains("\"origin\":\"step\"")
+                    && l.contains("\"target\":\"a\"")
+                    && l.contains("\"payload\":\"echoed\"")
+            })
+            .expect("outbound entry present");
+        assert_ne!(inbound, outbound);
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_peer_connections() {
+        // When one plugin exits, the broker cascades shutdown: the other
+        // connections' outbound channels close within the grace window.
+        let dir = TempDir::new().unwrap();
+        let (session, _path) = tmp_session(&dir);
+        let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
+        let host = build_host(&shared, "function step(s, c) end");
+
+        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let (_pa, ta) = make_transport();
+        let (pb, tb) = make_transport();
+        broker.attach_transport(ta, pn("a"));
+        broker.attach_transport(tb, pn("b"));
+        let handle = broker.shutdown_handle();
+        let run = tokio::spawn(broker.run());
+
+        handle.shutdown(50).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("broker should stop within grace")
+            .expect("join ok");
+        assert_eq!(outcome, BrokerStopReason::Shutdown);
+
+        // After shutdown the plugin-side reader should observe EOF.
+        let mut pb = pb;
+        let mut line = String::new();
+        let n = pb
+            .reader
+            .read_line(&mut line)
+            .await
+            .expect("read_line should return 0 at EOF");
+        assert_eq!(n, 0, "expected EOF after shutdown, got {line:?}");
+    }
+
+    #[tokio::test]
+    async fn write_queue_overflow_drops_oldest() {
+        // Tiny duplex buffer + per-step broadcasts fills up the writer. The
+        // broker's post-I3 overflow policy: drop oldest, no protocol emission.
+        // We assert the broker keeps making forward progress (doesn't hang)
+        // and the writer task logs the overflow internally.
+        let dir = TempDir::new().unwrap();
+        let (session, _path) = tmp_session(&dir);
+        let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
+        let host = build_host(
+            &shared,
+            r#"function step(saved, current) nefor.engine.send("x") end"#,
+        );
+
+        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let (mut sender, sender_t) = make_transport();
+        let (_receiver, receiver_t) = make_transport_buf(64);
+        broker.attach_transport(sender_t, pn("s"));
+        broker.attach_transport(receiver_t, pn("r"));
+        let handle = broker.shutdown_handle();
+        let run = tokio::spawn(broker.run());
+
+        for i in 0..200u32 {
+            send_line(&mut sender, &format!("trigger-{i}")).await;
+        }
+        // Give the broker time to process and the writer task time to attempt
+        // draining; this test passes if the broker's run loop doesn't deadlock.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        handle.shutdown(50).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
     }
 }

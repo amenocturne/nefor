@@ -6,6 +6,7 @@
 
 pub mod bindings;
 pub mod error;
+pub mod log;
 pub mod vm;
 
 pub use error::LuaError;
