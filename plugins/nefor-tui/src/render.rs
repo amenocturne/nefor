@@ -63,10 +63,15 @@ fn inside(area: Rect, x: u16, y: u16) -> bool {
 }
 
 fn attr_to_style(attr: HlAttr, defaults: &DefaultColors) -> Style {
-    let fg = attr.fg.unwrap_or(defaults.fg);
-    let bg = attr.bg.unwrap_or(defaults.bg);
+    // `None` at both the attr and defaults layer → terminal default
+    // (Color::Reset). That's how a publisher opts into the user's theme
+    // without hardcoding an RGB value.
+    let fg = attr.fg.or(defaults.fg);
+    let bg = attr.bg.or(defaults.bg);
     let (fg, bg) = if attr.reverse { (bg, fg) } else { (fg, bg) };
-    let mut style = Style::default().fg(rgb_to_color(fg)).bg(rgb_to_color(bg));
+    let mut style = Style::default()
+        .fg(fg.map_or(Color::Reset, rgb_to_color))
+        .bg(bg.map_or(Color::Reset, rgb_to_color));
     let mut modifier = Modifier::empty();
     if attr.bold {
         modifier |= Modifier::BOLD;
@@ -104,9 +109,9 @@ mod tests {
     #[test]
     fn attr_defaults_to_default_colors() {
         let d = DefaultColors {
-            fg: 0x00AAAAAA,
-            bg: 0x00111111,
-            sp: 0,
+            fg: Some(0x00AAAAAA),
+            bg: Some(0x00111111),
+            sp: None,
         };
         let s = attr_to_style(HlAttr::default(), &d);
         assert_eq!(s.fg, Some(Color::Rgb(0xAA, 0xAA, 0xAA)));
@@ -115,11 +120,21 @@ mod tests {
     }
 
     #[test]
+    fn empty_defaults_render_as_terminal_reset() {
+        // No default_colors event + no attr override → Color::Reset so the
+        // terminal's native theme shows through.
+        let d = DefaultColors::default();
+        let s = attr_to_style(HlAttr::default(), &d);
+        assert_eq!(s.fg, Some(Color::Reset));
+        assert_eq!(s.bg, Some(Color::Reset));
+    }
+
+    #[test]
     fn reverse_swaps_fg_and_bg() {
         let d = DefaultColors {
-            fg: 0x00AABBCC,
-            bg: 0x00112233,
-            sp: 0,
+            fg: Some(0x00AABBCC),
+            bg: Some(0x00112233),
+            sp: None,
         };
         let s = attr_to_style(
             HlAttr {
@@ -134,11 +149,7 @@ mod tests {
 
     #[test]
     fn bold_italic_underline_modifiers() {
-        let d = DefaultColors {
-            fg: 0,
-            bg: 0,
-            sp: 0,
-        };
+        let d = DefaultColors::default();
         let s = attr_to_style(
             HlAttr {
                 bold: true,

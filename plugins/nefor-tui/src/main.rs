@@ -283,11 +283,12 @@ fn handle_envelope(env: Envelope, state: &mut State) -> LoopAction {
                 LoopAction::Continue
             }
             Some("nefor-tui.default_colors") => {
-                if let (Some(fg), Some(bg), Some(sp)) =
-                    (as_u32(&map, "fg"), as_u32(&map, "bg"), as_u32(&map, "sp"))
-                {
-                    state.defaults = DefaultColors { fg, bg, sp };
-                }
+                // Each field is optional; missing → terminal default.
+                state.defaults = DefaultColors {
+                    fg: as_u32(&map, "fg"),
+                    bg: as_u32(&map, "bg"),
+                    sp: as_u32(&map, "sp"),
+                };
                 LoopAction::Continue
             }
             _ => LoopAction::Continue,
@@ -586,9 +587,9 @@ mod tests {
             "sp": 0x445566u32
         }));
         handle_envelope(env, &mut s);
-        assert_eq!(s.defaults.fg, 0xAABBCC);
-        assert_eq!(s.defaults.bg, 0x112233);
-        assert_eq!(s.defaults.sp, 0x445566);
+        assert_eq!(s.defaults.fg, Some(0xAABBCC));
+        assert_eq!(s.defaults.bg, Some(0x112233));
+        assert_eq!(s.defaults.sp, Some(0x445566));
     }
 
     #[test]
