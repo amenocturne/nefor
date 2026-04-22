@@ -13,7 +13,7 @@ mod input;
 mod render;
 mod transport;
 
-use std::io::stdout;
+use std::fs::{File, OpenOptions};
 
 use anyhow::Context as _;
 use crossterm::event::{
@@ -56,11 +56,15 @@ async fn main() -> anyhow::Result<()> {
         // TerminalGuard already ran by the time we get here (it's inside
         // `run`). Print once to stderr so the engine-spawned subprocess
         // surface shows the fault.
-        tracing::error!(error = %e, "nefor-tui exited with error");
-        eprintln!("nefor-tui: {e}");
+        tracing::error!(error = ?e, "nefor-tui exited with error");
+        eprintln!("nefor-tui: {e:#}");
         std::process::exit(1);
     }
-    Ok(())
+    // Force exit: `tokio::io::stdin()` parks a blocking read thread that
+    // can't be cancelled, so letting `main` return would make the runtime
+    // wait on that thread forever — the engine's `child.wait()` would
+    // then hang. TerminalGuard already ran inside `run()`.
+    std::process::exit(0);
 }
 
 async fn run() -> anyhow::Result<()> {
@@ -90,17 +94,26 @@ async fn run() -> anyhow::Result<()> {
 
     // 2) Enter raw mode + alt screen + mouse + bracketed paste. Install
     //    TerminalGuard before any possible panic path.
+    //
+    //    Terminal I/O goes to /dev/tty, NOT stdout — stdout is the NCP
+    //    channel back to the engine. Writing alt-screen / mouse-capture
+    //    escape codes to stdout would corrupt the JSONL stream.
+    let mut tty_for_execute = open_tty().context("open /dev/tty")?;
+    let tty_for_backend = open_tty().context("open /dev/tty for ratatui backend")?;
+    let tty_for_guard = open_tty().context("open /dev/tty for terminal guard")?;
     enable_raw_mode().context("enable_raw_mode")?;
     execute!(
-        stdout(),
+        &mut tty_for_execute,
         EnterAlternateScreen,
         EnableMouseCapture,
         EnableBracketedPaste
     )
     .context("enter alt screen / mouse / paste")?;
-    let _guard = TerminalGuard;
+    let _guard = TerminalGuard {
+        writer: tty_for_guard,
+    };
 
-    let backend = CrosstermBackend::new(stdout());
+    let backend = CrosstermBackend::new(tty_for_backend);
     let mut terminal = Terminal::new(backend).context("build ratatui terminal")?;
 
     // 3) Measure the terminal and emit ready + initial resize so the
@@ -121,6 +134,14 @@ async fn run() -> anyhow::Result<()> {
         .context("initial draw")?;
 
     // 4) Main loop: multiplex stdin NCP messages and crossterm events.
+    //
+    //    Pre-warm crossterm's event source via `poll(ZERO)` — this forces
+    //    the internal reader to initialize and surfaces any source-init
+    //    io::Error (SIGWINCH registration, /dev/tty open, etc.) instead
+    //    of letting `EventStream::new()` panic later with "reader source
+    //    not set" on its internal `waker()` call.
+    crossterm::event::poll(std::time::Duration::ZERO)
+        .context("initialize crossterm event source")?;
     let mut term_events = EventStream::new();
 
     loop {
@@ -148,6 +169,15 @@ async fn run() -> anyhow::Result<()> {
             maybe_event = term_events.next() => {
                 match maybe_event {
                     Some(Ok(event)) => {
+                        // Raw mode disables ISIG, so the terminal no longer
+                        // translates Ctrl+C into SIGINT. Without an escape
+                        // hatch the user would have no way to exit until a
+                        // composition plugin wires up quit semantics over
+                        // NCP. Treat Ctrl+C as a self-shutdown: closing our
+                        // stdout will let the engine's broker tear down.
+                        if is_quit_shortcut(&event) {
+                            break;
+                        }
                         if let Some(body) = translate_terminal_event(&event, &mut state) {
                             send_event(&out_tx, body).await?;
                         }
@@ -317,6 +347,24 @@ fn parse_hl_attr(rgb: Option<&Value>) -> HlAttr {
     }
 }
 
+/// True if the event is a Ctrl+C or Ctrl+D key press. The plugin treats
+/// these as a self-shutdown request because raw mode suppresses SIGINT
+/// and EOF at the terminal level.
+fn is_quit_shortcut(evt: &Event) -> bool {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    matches!(
+        evt,
+        Event::Key(k)
+            if k.kind == KeyEventKind::Press
+                && k.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(
+                    k.code,
+                    KeyCode::Char('c') | KeyCode::Char('C')
+                        | KeyCode::Char('d') | KeyCode::Char('D')
+                )
+    )
+}
+
 /// Translate a crossterm event into an NCP event body. Returns `None` for
 /// events we don't forward (focus, etc.). Side effect: updates `state.grid`
 /// on resize so the internal buffer matches the terminal.
@@ -364,12 +412,17 @@ async fn send_event(
 
 /// Restore cooked mode, main screen, mouse capture off, bracketed paste
 /// off. Runs on drop so panics unwind through a clean terminal.
-struct TerminalGuard;
+///
+/// Holds its own `/dev/tty` write handle — the TTY, not stdout, is where
+/// the teardown escape codes must land.
+struct TerminalGuard {
+    writer: File,
+}
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         if let Err(e) = execute!(
-            stdout(),
+            &mut self.writer,
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
@@ -380,6 +433,12 @@ impl Drop for TerminalGuard {
             tracing::error!(error = %e, "failed to disable raw mode on TUI exit");
         }
     }
+}
+
+/// Open the controlling terminal for read+write. Each caller gets its own
+/// file-descriptor so writers and the crossterm backend don't share state.
+fn open_tty() -> std::io::Result<File> {
+    OpenOptions::new().read(true).write(true).open("/dev/tty")
 }
 
 #[cfg(test)]

@@ -25,5 +25,5 @@ futures = { workspace = true }
 # Declared directly (not via workspace) so this plugin's ratatui/crossterm
 # choice is independent of any engine-side strip-down of workspace deps.
 ratatui = "0.30"
-crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
+crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste", "use-dev-tty", "libc"] }
 unicode-width = "0.2"
