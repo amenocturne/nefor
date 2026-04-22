@@ -14,8 +14,6 @@ mod render;
 mod state;
 mod wrap;
 
-use std::process::ExitCode;
-
 use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
@@ -29,16 +27,18 @@ pub const PLUGIN_VERSION: &str = "0.1.0";
 pub const PROTOCOL_VERSION: &str = "0.1";
 
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn main() {
     init_tracing();
-    match run().await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            tracing::error!(error = %e, "nefor-chat exited with error");
-            eprintln!("nefor-chat: {e}");
-            ExitCode::from(1)
-        }
+    if let Err(e) = run().await {
+        tracing::error!(error = %e, "nefor-chat exited with error");
+        eprintln!("nefor-chat: {e}");
+        std::process::exit(1);
     }
+    // Force exit: `tokio::io::stdin()` parks a non-cancellable blocking
+    // reader thread; letting the runtime drop naturally would hang the
+    // process after `run()` returns, keeping the engine's `child.wait()`
+    // pending. Same fix as nefor-tui.
+    std::process::exit(0);
 }
 
 fn init_tracing() {
@@ -102,11 +102,28 @@ async fn run() -> Result<(), ChatError> {
                 }
             }
             Action::SubmitPrompt(text) => {
-                // Register the user turn locally before shipping the
-                // `cc.prompt` — keeps the transcript and the outgoing
-                // event in the same logical beat.
-                state.push_entry(Role::User, text.clone());
-                send_event(&out_tx, cc_prompt_body(&text)).await?;
+                // Slash-commands are handled locally instead of being sent
+                // as a prompt. For `/resume` we don't push a confirmation
+                // entry here — mock-plugin responds with `cc.history.replay`
+                // which clears the transcript and populates it with the
+                // stored conversation. Regular text follows the normal
+                // cc.prompt path.
+                match parse_command(&text) {
+                    Some(Command::ResumeRecent) => {
+                        send_event(&out_tx, cc_resume_body(None)).await?;
+                    }
+                    Some(Command::ResumeSpecific(id)) => {
+                        send_event(&out_tx, cc_resume_body(Some(&id))).await?;
+                    }
+                    None => {
+                        // Register the user turn locally before shipping the
+                        // `cc.prompt` — keeps the transcript and the outgoing
+                        // event in the same logical beat.
+                        state.push_entry(Role::User, text.clone());
+                        state.begin_turn();
+                        send_event(&out_tx, cc_prompt_body(&text)).await?;
+                    }
+                }
                 if state.tui_ready {
                     if !palette_emitted {
                         emit_palette(&out_tx).await?;
@@ -176,6 +193,7 @@ fn handle_event(map: &Map<String, Value>, state: &mut ChatState) -> Action {
                 Action::Continue
             }
         }
+        "nefor-tui.input.mouse" => handle_mouse(map, state),
         // ---- mock-plugin output path ---------------------------------
         "cc.stream.delta" => {
             if let Some(t) = map.get("text").and_then(Value::as_str) {
@@ -191,6 +209,12 @@ fn handle_event(map: &Map<String, Value>, state: &mut ChatState) -> Action {
                 .and_then(Value::as_str)
                 .map(|s| s.to_owned());
             state.finalize_assistant(authoritative);
+            state.end_turn();
+            // Persistent "done" indicator in the transcript. Prefer the
+            // cost/timing info when mock-plugin supplies it; fall back to a
+            // bare marker otherwise.
+            let marker = done_marker(map);
+            state.push_entry(Role::System, marker);
             Action::Render
         }
         "cc.tool.start" => {
@@ -202,12 +226,45 @@ fn handle_event(map: &Map<String, Value>, state: &mut ChatState) -> Action {
             }
         }
         "cc.turn.error" => {
+            state.end_turn();
             if let Some(msg) = map.get("message").and_then(Value::as_str) {
                 state.push_entry(Role::System, format!("error: {msg}"));
                 Action::Render
             } else {
                 Action::Continue
             }
+        }
+        "cc.history.replay" => {
+            // Replace the transcript with stored-on-disk history from a
+            // previous session. mock-plugin guarantees `entries` is already
+            // in chronological order.
+            state.transcript.clear();
+            let mut count = 0usize;
+            if let Some(arr) = map.get("entries").and_then(Value::as_array) {
+                for e in arr {
+                    let Some(role_str) = e.get("role").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let role = match role_str {
+                        "user" => Role::User,
+                        "assistant" => Role::Assistant,
+                        _ => continue,
+                    };
+                    let text = e
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    state.push_entry(role, text);
+                    count += 1;
+                }
+            }
+            let session = map.get("session_id").and_then(Value::as_str).unwrap_or("?");
+            state.push_entry(
+                Role::System,
+                format!("resumed · {count} messages · session {session}"),
+            );
+            Action::Render
         }
         "cc.hello" | "cc.ready" | "cc.goodbye" => {
             tracing::debug!(kind, "mock-plugin lifecycle event (no-op on UI)");
@@ -301,6 +358,41 @@ fn page_size(state: &ChatState) -> u32 {
     (transcript / 2).max(1)
 }
 
+/// Rows the mouse wheel moves per scroll notch. Three is the usual
+/// terminal-convention tick — one wheel click feels like "a bit" but
+/// doesn't blow past the screen.
+const WHEEL_ROWS_PER_NOTCH: u32 = 3;
+
+/// Handle a `nefor-tui.input.mouse` envelope. For v1 we only react to
+/// wheel-scroll actions (up/down); clicks and drags are ignored.
+fn handle_mouse(map: &Map<String, Value>, state: &mut ChatState) -> Action {
+    match map.get("action").and_then(Value::as_str) {
+        Some("scroll_up") => {
+            state.scroll_up(WHEEL_ROWS_PER_NOTCH);
+            Action::Render
+        }
+        Some("scroll_down") => {
+            state.scroll_down(WHEEL_ROWS_PER_NOTCH);
+            Action::Render
+        }
+        _ => Action::Continue,
+    }
+}
+
+/// Build the persistent "done" line appended after a turn finishes. Picks
+/// the most informative subset from the `cc.stream.end` payload that is
+/// present — `duration_ms` is strongly preferred since it answers the
+/// "was that fast or slow?" question directly.
+fn done_marker(map: &Map<String, Value>) -> String {
+    let duration = map.get("duration_ms").and_then(Value::as_u64);
+    let num_turns = map.get("num_turns").and_then(Value::as_u64);
+    match (duration, num_turns) {
+        (Some(ms), Some(n)) if n > 1 => format!("done in {ms}ms / {n} turns"),
+        (Some(ms), _) => format!("done in {ms}ms"),
+        (None, _) => "done".into(),
+    }
+}
+
 fn as_u32(map: &Map<String, Value>, key: &str) -> Option<u32> {
     map.get(key)
         .and_then(Value::as_u64)
@@ -308,7 +400,6 @@ fn as_u32(map: &Map<String, Value>, key: &str) -> Option<u32> {
 }
 
 async fn emit_palette(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), ChatError> {
-    send_event(out_tx, render::default_colors_event()).await?;
     for def in render::palette_defines() {
         send_event(out_tx, def).await?;
     }
@@ -363,6 +454,42 @@ fn cc_prompt_body(text: &str) -> Map<String, Value> {
     m.insert("kind".into(), Value::String("cc.prompt".into()));
     m.insert("text".into(), Value::String(text.to_owned()));
     m
+}
+
+fn cc_resume_body(session_id: Option<&str>) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("kind".into(), Value::String("cc.resume".into()));
+    if let Some(id) = session_id {
+        m.insert("session_id".into(), Value::String(id.to_owned()));
+    }
+    m
+}
+
+/// Parse a slash-command submitted via the input line. Returns `None` if
+/// the text isn't a recognised command, so the caller falls through to the
+/// usual `cc.prompt` path.
+///
+/// Grammar is deliberately minimal: `/resume` and `/resume <session-id>`.
+/// Everything else is treated as a regular prompt — we don't surface an
+/// error on unknown slash commands because Claude prompts often start with
+/// a slash for role instruction (e.g. "/think step by step").
+fn parse_command(text: &str) -> Option<Command> {
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix("/resume")?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        Some(Command::ResumeRecent)
+    } else {
+        // Accept everything after /resume as the session-id; mock-plugin
+        // will validate and surface a turn_error if it's not a UUID.
+        Some(Command::ResumeSpecific(rest.to_owned()))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    ResumeRecent,
+    ResumeSpecific(String),
 }
 
 #[cfg(test)]
@@ -579,6 +706,41 @@ mod tests {
     }
 
     #[test]
+    fn mouse_scroll_up_moves_viewport_up() {
+        let mut s = ChatState::new();
+        for i in 0..20 {
+            s.push_entry(Role::User, format!("{i}"));
+        }
+        let env = event_env(json!({
+            "kind":"nefor-tui.input.mouse",
+            "action":"scroll_up",
+            "row": 0,
+            "col": 0,
+            "modifiers": [],
+        }));
+        handle_envelope(env, &mut s);
+        assert_eq!(s.scroll_offset, WHEEL_ROWS_PER_NOTCH);
+    }
+
+    #[test]
+    fn mouse_scroll_down_reduces_offset() {
+        let mut s = ChatState::new();
+        for i in 0..20 {
+            s.push_entry(Role::User, format!("{i}"));
+        }
+        s.scroll_up(10);
+        let env = event_env(json!({
+            "kind":"nefor-tui.input.mouse",
+            "action":"scroll_down",
+            "row": 0,
+            "col": 0,
+            "modifiers": [],
+        }));
+        handle_envelope(env, &mut s);
+        assert_eq!(s.scroll_offset, 10 - WHEEL_ROWS_PER_NOTCH);
+    }
+
+    #[test]
     fn shutdown_system_message_yields_shutdown_action() {
         let mut s = ChatState::new();
         let env = Envelope::system(
@@ -612,5 +774,41 @@ mod tests {
         let b = cc_prompt_body("go");
         assert_eq!(b["kind"], Value::String("cc.prompt".into()));
         assert_eq!(b["text"], Value::String("go".into()));
+    }
+
+    #[test]
+    fn cc_resume_body_without_id_omits_field() {
+        let b = cc_resume_body(None);
+        assert_eq!(b["kind"], Value::String("cc.resume".into()));
+        assert!(b.get("session_id").is_none());
+    }
+
+    #[test]
+    fn cc_resume_body_with_id_includes_field() {
+        let b = cc_resume_body(Some("abc"));
+        assert_eq!(b["session_id"], Value::String("abc".into()));
+    }
+
+    #[test]
+    fn parse_command_resume_alone() {
+        assert_eq!(parse_command("/resume"), Some(Command::ResumeRecent));
+        assert_eq!(parse_command("  /resume  "), Some(Command::ResumeRecent));
+    }
+
+    #[test]
+    fn parse_command_resume_with_uuid() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(
+            parse_command(&format!("/resume {id}")),
+            Some(Command::ResumeSpecific(id.to_owned()))
+        );
+    }
+
+    #[test]
+    fn parse_command_unknown_slash_stays_prompt() {
+        // "/think step by step" is a legitimate prompt — don't intercept it.
+        assert_eq!(parse_command("/think step by step"), None);
+        assert_eq!(parse_command("hello"), None);
+        assert_eq!(parse_command(""), None);
     }
 }

@@ -159,6 +159,10 @@ pub struct ChatState {
     /// `false` until we've seen `nefor-tui.ready`. No rendering happens
     /// before this flips.
     pub tui_ready: bool,
+    /// True between `cc.prompt` dispatch and `cc.stream.end`/`cc.turn.error`.
+    /// Renderer injects a "[claude is thinking...]" row while this is set
+    /// *and* no assistant entry has started streaming yet.
+    pub pending: bool,
 }
 
 impl Default for ChatState {
@@ -176,7 +180,26 @@ impl ChatState {
             scroll_offset: 0,
             dims: Dims::fallback(),
             tui_ready: false,
+            pending: false,
         }
+    }
+
+    // `#[allow(dead_code)]` here — as for `clear`/`clamp_scroll` below —
+    // is because the integration tests in `tests/render.rs` `#[path]`-
+    // include this module but never reach `main.rs`, which is where these
+    // helpers are actually called.
+
+    /// Mark a turn as in-flight. Called when the plugin ships `cc.prompt`.
+    #[allow(dead_code)]
+    pub fn begin_turn(&mut self) {
+        self.pending = true;
+    }
+
+    /// Mark the in-flight turn as finished. Called on `cc.stream.end` or
+    /// `cc.turn.error`.
+    #[allow(dead_code)]
+    pub fn end_turn(&mut self) {
+        self.pending = false;
     }
 
     /// Append a finished entry (user prompt, system line).
