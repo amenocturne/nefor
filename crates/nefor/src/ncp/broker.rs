@@ -86,6 +86,18 @@ impl BrokerOps {
 }
 
 impl EngineOps for BrokerOps {
+    fn plugins(&self) -> Vec<PluginName> {
+        // Snapshot the connected set under the lock, then drop it. Callers
+        // (Lua `nefor.engine.plugins()`) iterate the snapshot without holding
+        // the lock — a plugin joining or leaving mid-iteration is fine since
+        // any subsequent `send` re-checks the live map.
+        let guard = match self.shared.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.conns.keys().cloned().collect()
+    }
+
     fn send(&self, target: SendTarget, payload: String) {
         let ts = Timestamp::now();
         let target_name = match &target {

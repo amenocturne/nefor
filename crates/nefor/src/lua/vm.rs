@@ -189,6 +189,9 @@ mod tests {
     struct NullOps;
     impl EngineOps for NullOps {
         fn send(&self, _target: SendTarget, _payload: String) {}
+        fn plugins(&self) -> Vec<PluginName> {
+            Vec::new()
+        }
     }
 
     struct RecordOps {
@@ -207,6 +210,9 @@ mod tests {
     impl EngineOps for RecordOps {
         fn send(&self, target: SendTarget, payload: String) {
             self.calls.lock().unwrap().push((target, payload));
+        }
+        fn plugins(&self) -> Vec<PluginName> {
+            Vec::new()
         }
     }
 

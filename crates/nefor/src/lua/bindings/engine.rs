@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use mlua::{Lua, Table, Value};
-use nefor_protocol::PluginName;
+use nefor_protocol::{PluginName, Timestamp};
 
 /// Outbound routing decision produced by a step call.
 ///
@@ -43,6 +43,14 @@ pub trait EngineOps: Send + Sync {
     /// event log). Making `send` fallible here would force the step function
     /// to reason about transport-level errors, which is not its job.
     fn send(&self, target: SendTarget, payload: String);
+
+    /// Snapshot the names of plugins currently connected to the engine.
+    ///
+    /// Used by `starter/ncp.lua` to implement broadcast-minus-sender: NCP
+    /// broadcast excludes the sender, while `nefor.engine.send` broadcast
+    /// reaches every plugin. Lua enumerates the set and issues N-1 targeted
+    /// sends instead.
+    fn plugins(&self) -> Vec<PluginName>;
 }
 
 /// Install `nefor.engine.send` onto `nefor_tbl`.
@@ -84,6 +92,27 @@ pub fn install_engine(lua: &Lua, nefor_tbl: &Table, ops: Arc<dyn EngineOps>) -> 
     })?;
     engine.set("send", send_fn)?;
 
+    // nefor.engine.now() returns an ISO-8601 timestamp with millisecond
+    // precision — the wire format spec §3 requires for the `ts` field.
+    // Starter's NCP module uses this to stamp outbound envelopes with the
+    // engine's authoritative clock. Exposed from here rather than leaving
+    // Lua to build its own timestamp because Lua's stdlib has no millisecond
+    // precision and no UTC helper.
+    let now_fn = lua.create_function(|_, _: ()| Ok(Timestamp::now().to_iso8601()))?;
+    engine.set("now", now_fn)?;
+
+    let ops_for_plugins = Arc::clone(&ops);
+    let plugins_fn = lua.create_function(move |lua, _: ()| {
+        let names = ops_for_plugins.plugins();
+        let arr = lua.create_table()?;
+        for (i, name) in names.into_iter().enumerate() {
+            // Lua arrays are 1-indexed; the Lua caller iterates with ipairs.
+            arr.set(i + 1, lua.create_string(name.as_str())?)?;
+        }
+        Ok(arr)
+    })?;
+    engine.set("plugins", plugins_fn)?;
+
     nefor_tbl.set("engine", engine)?;
     Ok(())
 }
@@ -95,23 +124,32 @@ mod tests {
 
     struct RecordOps {
         calls: Mutex<Vec<(SendTarget, String)>>,
+        plugins: Mutex<Vec<PluginName>>,
     }
 
     impl RecordOps {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 calls: Mutex::new(Vec::new()),
+                plugins: Mutex::new(Vec::new()),
             })
         }
 
         fn snapshot(&self) -> Vec<(SendTarget, String)> {
             self.calls.lock().unwrap().clone()
         }
+
+        fn set_plugins(&self, names: Vec<PluginName>) {
+            *self.plugins.lock().unwrap() = names;
+        }
     }
 
     impl EngineOps for RecordOps {
         fn send(&self, target: SendTarget, payload: String) {
             self.calls.lock().unwrap().push((target, payload));
+        }
+        fn plugins(&self) -> Vec<PluginName> {
+            self.plugins.lock().unwrap().clone()
         }
     }
 
@@ -203,6 +241,37 @@ mod tests {
         let calls = ops.snapshot();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, SendTarget::Broadcast);
+    }
+
+    #[test]
+    fn engine_plugins_returns_empty_array_when_none() {
+        let (lua, _ops) = setup();
+        let n: i64 = lua
+            .load(r#"return #nefor.engine.plugins()"#)
+            .eval()
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn engine_plugins_returns_names_as_array() {
+        let (lua, ops) = setup();
+        ops.set_plugins(vec![
+            PluginName::new("a").unwrap(),
+            PluginName::new("b").unwrap(),
+            PluginName::new("c").unwrap(),
+        ]);
+        let concat: String = lua
+            .load(
+                r#"
+                local names = nefor.engine.plugins()
+                table.sort(names)
+                return table.concat(names, ",")
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert_eq!(concat, "a,b,c");
     }
 
     #[test]
