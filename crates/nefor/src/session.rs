@@ -298,6 +298,7 @@ impl SessionWriter {
 
     /// Flush the buffered writer to disk. Call this on clean shutdown; the
     /// `Drop` impl also flushes but cannot propagate errors.
+    #[allow(dead_code)]
     pub fn flush(&mut self) -> Result<(), SessionError> {
         self.file.flush().map_err(|source| SessionError::Io {
             path: self.path.clone(),
@@ -311,6 +312,7 @@ impl SessionWriter {
     }
 
     /// How many entries have been appended so far (header excluded).
+    #[allow(dead_code)]
     pub fn entries_written(&self) -> usize {
         self.entries_written
     }

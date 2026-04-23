@@ -14,8 +14,9 @@ use mlua::{Lua, RegistryKey};
 use crate::events::EventBus;
 use crate::lua::bindings::{self, EngineOps};
 use crate::lua::error::LuaError;
-use crate::lua::log::{log_to_lua_table, LogEntry};
+use crate::lua::log::log_to_lua_table;
 use crate::ncp::SharedPluginRegistry;
+use crate::session::LogEntry;
 
 /// Owns a Lua 5.4 VM with the `nefor.*` API installed.
 ///
@@ -33,7 +34,6 @@ pub struct LuaHost {
     /// [`LuaHost::cache_step`] after `init.lua` runs. `None` until then;
     /// [`LuaHost::invoke_step`] errors with [`LuaError::StepNotCached`] if
     /// called before caching.
-    #[allow(dead_code)]
     step: Option<RegistryKey>,
 }
 
@@ -112,7 +112,6 @@ impl LuaHost {
     /// global is not a function — both are fatal because the new engine
     /// model runs step on every inbound envelope and can't proceed without
     /// it.
-    #[allow(dead_code)]
     pub fn cache_step(&mut self) -> Result<(), LuaError> {
         let globals = self.lua.globals();
         let val: mlua::Value = globals.get("step").map_err(|_| LuaError::StepMissing)?;
@@ -131,7 +130,6 @@ impl LuaHost {
     /// step function are logged and swallowed — they must not take down the
     /// engine loop. VM-level errors (missing cache, registry corruption,
     /// conversion failure) bubble up as [`LuaError`].
-    #[allow(dead_code)]
     pub fn invoke_step(
         &self,
         saved_log: &[LogEntry],
@@ -175,8 +173,18 @@ mod tests {
     use super::*;
     use crate::lua::bindings::SendTarget;
     use crate::ncp::PluginRegistry;
+    use crate::session::Origin;
+    use nefor_protocol::{PluginName, Timestamp};
     use std::path::PathBuf;
     use std::sync::Mutex;
+
+    fn ts() -> Timestamp {
+        Timestamp::parse("2026-04-23T00:00:00.000Z").expect("valid ts")
+    }
+
+    fn plugin(name: &str) -> PluginName {
+        PluginName::new(name).expect("valid plugin name")
+    }
 
     struct NullOps;
     impl EngineOps for NullOps {
@@ -333,16 +341,16 @@ mod tests {
         h.cache_step().expect("cache ok");
         let saved: Vec<LogEntry> = (0..2)
             .map(|i| LogEntry {
-                ts: format!("s{i}"),
-                origin: "mock-plugin".into(),
+                ts: ts(),
+                origin: Origin::Plugin(plugin("mock-plugin")),
                 target: None,
                 payload: format!("sp{i}"),
             })
             .collect();
         let current: Vec<LogEntry> = (0..3)
             .map(|i| LogEntry {
-                ts: format!("c{i}"),
-                origin: "mock-plugin".into(),
+                ts: ts(),
+                origin: Origin::Plugin(plugin("mock-plugin")),
                 target: None,
                 payload: format!("cp{i}"),
             })
@@ -400,17 +408,17 @@ mod tests {
         .unwrap();
         h.cache_step().expect("cache ok");
         let entry = LogEntry {
-            ts: "2026-04-23T00:00:00Z".into(),
-            origin: "step".into(),
-            target: Some("mock-plugin".into()),
+            ts: ts(),
+            origin: Origin::Step,
+            target: Some(plugin("mock-plugin")),
             payload: "pl".into(),
         };
         h.invoke_step(&[], std::slice::from_ref(&entry)).unwrap();
-        let ts: String = h.lua.globals().get("captured_ts").unwrap();
+        let got_ts: String = h.lua.globals().get("captured_ts").unwrap();
         let origin: String = h.lua.globals().get("captured_origin").unwrap();
         let target: String = h.lua.globals().get("captured_target").unwrap();
         let payload: String = h.lua.globals().get("captured_payload").unwrap();
-        assert_eq!(ts, "2026-04-23T00:00:00Z");
+        assert_eq!(got_ts, "2026-04-23T00:00:00.000Z");
         assert_eq!(origin, "step");
         assert_eq!(target, "mock-plugin");
         assert_eq!(payload, "pl");

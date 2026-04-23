@@ -45,25 +45,6 @@ pub trait EngineOps: Send + Sync {
     fn send(&self, target: SendTarget, payload: String);
 }
 
-/// [`EngineOps`] that discards every send.
-///
-/// Used as a placeholder while broker wiring is in flight (I3): the engine
-/// binary constructs the Lua VM with this implementation until the real
-/// broker-backed ops are available. Any call on it is logged at `debug` so
-/// it's visible when a step is executing but the routing surface isn't
-/// connected yet.
-pub struct NoopEngineOps;
-
-impl EngineOps for NoopEngineOps {
-    fn send(&self, target: SendTarget, payload: String) {
-        tracing::debug!(
-            target = ?target,
-            bytes = payload.len(),
-            "nefor.engine.send dropped by NoopEngineOps (broker not yet wired)"
-        );
-    }
-}
-
 /// Install `nefor.engine.send` onto `nefor_tbl`.
 pub fn install_engine(lua: &Lua, nefor_tbl: &Table, ops: Arc<dyn EngineOps>) -> mlua::Result<()> {
     let engine = lua.create_table()?;

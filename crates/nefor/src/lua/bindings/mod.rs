@@ -13,10 +13,7 @@ pub mod engine;
 pub mod plugins;
 pub mod process;
 
-// `SendTarget` is re-exported for I3's broker wiring; unused in I2's binary
-// surface but needed by external consumers once integrated.
-#[allow(unused_imports)]
-pub use engine::{install_engine, EngineOps, NoopEngineOps, SendTarget};
+pub use engine::{install_engine, EngineOps, SendTarget};
 pub use plugins::install_plugins;
 pub use process::install_process;
 
