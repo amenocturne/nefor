@@ -8,3 +8,4 @@
 //! and `paths` submodules private.
 
 pub mod ncp;
+pub mod session;

@@ -11,9 +11,11 @@ use time::OffsetDateTime;
 
 /// A plugin's wire identity, as carried in `envelope.from`.
 ///
-/// Construction via [`PluginName::new`] rejects the empty string and the
-/// reserved literal `"engine"` (spec §3 "Reserved `from` identity").
-/// Deserialization applies the same rules.
+/// Construction via [`PluginName::new`] rejects the empty string and any
+/// reserved identity (spec §3 "Reserved `from` identity", plus engine-
+/// internal origins such as `"step"` used by the session log writer to
+/// distinguish Lua-originated messages from plugin-originated ones).
+/// Deserialization applies the empty-string rule only; see the impl note.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PluginName(String);
 
@@ -23,21 +25,30 @@ pub enum PluginNameError {
     /// The name was the empty string.
     #[error("plugin name must not be empty")]
     Empty,
-    /// The name was the reserved literal `"engine"`.
-    #[error("plugin name \"engine\" is reserved for the engine itself")]
-    Reserved,
+    /// The name collided with a reserved identity (e.g. `"engine"`, `"step"`).
+    #[error("plugin name \"{0}\" is reserved")]
+    Reserved(String),
 }
 
+/// Names that cannot be assigned to a plugin at spawn time.
+///
+/// - `"engine"`: reserved for the engine's own envelopes (spec §3).
+/// - `"step"`: reserved by the session log writer as the serialized form of
+///   [`Origin::Step`](../../nefor/session/enum.Origin.html); a plugin with
+///   that name would be indistinguishable from Lua-originated messages in
+///   the on-disk log.
+const RESERVED_PLUGIN_NAMES: &[&str] = &["engine", "step"];
+
 impl PluginName {
-    /// Construct a [`PluginName`], rejecting the empty string and the
-    /// reserved `"engine"` identity.
+    /// Construct a [`PluginName`], rejecting the empty string and any
+    /// reserved identity (see [`RESERVED_PLUGIN_NAMES`]).
     pub fn new(name: impl Into<String>) -> Result<Self, PluginNameError> {
         let name = name.into();
         if name.is_empty() {
             return Err(PluginNameError::Empty);
         }
-        if name == "engine" {
-            return Err(PluginNameError::Reserved);
+        if RESERVED_PLUGIN_NAMES.iter().any(|r| *r == name) {
+            return Err(PluginNameError::Reserved(name));
         }
         Ok(Self(name))
     }
@@ -183,7 +194,18 @@ mod tests {
 
     #[test]
     fn plugin_name_rejects_engine() {
-        assert_eq!(PluginName::new("engine"), Err(PluginNameError::Reserved));
+        assert_eq!(
+            PluginName::new("engine"),
+            Err(PluginNameError::Reserved("engine".into()))
+        );
+    }
+
+    #[test]
+    fn plugin_name_rejects_step() {
+        assert_eq!(
+            PluginName::new("step"),
+            Err(PluginNameError::Reserved("step".into()))
+        );
     }
 
     #[test]
