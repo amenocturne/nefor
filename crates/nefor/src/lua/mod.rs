@@ -6,7 +6,12 @@
 
 pub mod bindings;
 pub mod error;
+pub mod log;
 pub mod vm;
 
 pub use error::LuaError;
+// I3 will wire the step log types into main/broker; until then the re-exports
+// are consumed only by tests inside the `log` module.
+#[allow(unused_imports)]
+pub use log::{log_entry_to_lua_table, log_to_lua_table, LogEntry};
 pub use vm::LuaHost;

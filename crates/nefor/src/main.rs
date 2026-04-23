@@ -29,6 +29,7 @@ use anyhow::Context as _;
 
 use crate::error::NeforError;
 use crate::events::EventBus;
+use crate::lua::bindings::{EngineOps, NoopEngineOps};
 use crate::lua::LuaHost;
 use crate::ncp::{resolve_plugin_root, spawn_plugin, Broker, PluginRegistry, SharedPluginRegistry};
 
@@ -52,7 +53,11 @@ async fn main() -> anyhow::Result<()> {
 
     let bus = Arc::new(EventBus::new());
     let plugins: SharedPluginRegistry = Arc::new(Mutex::new(PluginRegistry::new()));
-    let host = LuaHost::new(Arc::clone(&bus), Arc::clone(&plugins))
+    // Slice 2 I2: step function + nefor.engine.send are installed, but the
+    // broker-backed routing sink lands in I3. Until then the VM holds a
+    // NoopEngineOps — calls from `step` are logged and dropped.
+    let engine_ops: Arc<dyn EngineOps> = Arc::new(NoopEngineOps);
+    let host = LuaHost::new(Arc::clone(&bus), Arc::clone(&plugins), engine_ops)
         .map_err(NeforError::from)
         .context("initializing Lua VM")?;
 
