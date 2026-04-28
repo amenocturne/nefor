@@ -9,12 +9,12 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use mlua::{Lua, RegistryKey};
+use mlua::{Lua, RegistryKey, Table};
 
 use crate::events::EventBus;
 use crate::lua::bindings::{self, EngineOps};
 use crate::lua::error::LuaError;
-use crate::lua::log::log_to_lua_table;
+use crate::lua::log::{log_entry_to_lua_table, log_to_lua_table};
 use crate::ncp::SharedPluginRegistry;
 use crate::session::LogEntry;
 
@@ -35,6 +35,19 @@ pub struct LuaHost {
     /// [`LuaHost::invoke_step`] errors with [`LuaError::StepNotCached`] if
     /// called before caching.
     step: Option<RegistryKey>,
+    /// Persistent Lua array mirroring the current session's log. Created
+    /// lazily on the first [`LuaHost::invoke_step`] call and reused — each
+    /// subsequent call appends only the new entries since the last call,
+    /// avoiding the O(n²) re-marshalling that an n-entry session would
+    /// otherwise incur. Reset by [`LuaHost::reset_logs`].
+    current_log_table: Option<RegistryKey>,
+    /// Number of entries already mirrored into `current_log_table`. Used
+    /// to compute the slice to append on each invocation.
+    current_log_mirrored: usize,
+    /// Persistent Lua array for the parent session's saved log. Populated
+    /// once on the first invoke (the saved log is immutable across the
+    /// run) and reused thereafter. `None` until first call.
+    saved_log_table: Option<RegistryKey>,
 }
 
 impl LuaHost {
@@ -63,6 +76,9 @@ impl LuaHost {
             bus,
             plugins,
             step: None,
+            current_log_table: None,
+            current_log_mirrored: 0,
+            saved_log_table: None,
         })
     }
 
@@ -142,13 +158,19 @@ impl LuaHost {
 
     /// Invoke `step(saved_log, current_log)`.
     ///
-    /// Each log slice is converted to a Lua array of entry tables (see
-    /// [`crate::lua::log::log_to_lua_table`]). Errors raised *inside* the
-    /// step function are logged and swallowed — they must not take down the
-    /// engine loop. VM-level errors (missing cache, registry corruption,
-    /// conversion failure) bubble up as [`LuaError`].
+    /// Both Lua tables are *persistent*: created on the first call, then
+    /// reused. Each subsequent invocation appends only the entries past
+    /// `current_log_mirrored` — converting the full log every time would
+    /// be O(n²) per session, which dominated typing latency on the
+    /// keystroke→render path. The saved log is built once (parent session
+    /// is immutable across the run).
+    ///
+    /// Errors raised *inside* the step function are logged and swallowed —
+    /// they must not take down the engine loop. VM-level errors (missing
+    /// cache, registry corruption, conversion failure) bubble up as
+    /// [`LuaError`].
     pub fn invoke_step(
-        &self,
+        &mut self,
         saved_log: &[LogEntry],
         current_log: &[LogEntry],
     ) -> Result<(), LuaError> {
@@ -156,8 +178,34 @@ impl LuaHost {
             return Err(LuaError::StepNotCached);
         };
         let func: mlua::Function = self.lua.registry_value(key)?;
-        let saved = log_to_lua_table(&self.lua, saved_log)?;
-        let current = log_to_lua_table(&self.lua, current_log)?;
+
+        // saved_log: build once, reuse forever.
+        let saved: Table = match self.saved_log_table.as_ref() {
+            Some(k) => self.lua.registry_value(k)?,
+            None => {
+                let t = log_to_lua_table(&self.lua, saved_log)?;
+                self.saved_log_table = Some(self.lua.create_registry_value(t.clone())?);
+                t
+            }
+        };
+
+        // current_log: persistent table, append-only on each call.
+        let current: Table = match self.current_log_table.as_ref() {
+            Some(k) => self.lua.registry_value(k)?,
+            None => {
+                let t = self.lua.create_table()?;
+                self.current_log_table = Some(self.lua.create_registry_value(t.clone())?);
+                t
+            }
+        };
+        if current_log.len() > self.current_log_mirrored {
+            for (offset, entry) in current_log[self.current_log_mirrored..].iter().enumerate() {
+                let lua_idx = self.current_log_mirrored + offset + 1; // 1-indexed
+                current.set(lua_idx, log_entry_to_lua_table(&self.lua, entry)?)?;
+            }
+            self.current_log_mirrored = current_log.len();
+        }
+
         match func.call::<()>((saved, current)) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -346,7 +394,7 @@ mod tests {
 
     #[test]
     fn invoke_step_before_cache_errors() {
-        let h = host();
+        let mut h = host();
         let err = h
             .invoke_step(&[], &[])
             .expect_err("uncached step must error");
