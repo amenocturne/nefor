@@ -170,6 +170,23 @@ async fn main() -> anyhow::Result<()> {
                     error = %e,
                     "failed to spawn plugin"
                 );
+                // Surface the spawn failure to the bus so step can translate
+                // it into a user-visible notification (e.g. a chat.popup).
+                // The first run-loop tick will drain this envelope before any
+                // other event flows. `code` distinguishes the typed failure
+                // shape so step can decide how to format it.
+                let code = match &e {
+                    crate::ncp::BrokerError::MissingPluginDir { .. } => "missing_dir",
+                    crate::ncp::BrokerError::Spawn { .. } => "spawn_failed",
+                    crate::ncp::BrokerError::Io(_) => "io_error",
+                };
+                broker.queue_engine_envelope(serde_json::json!({
+                    "kind":   "engine.plugin_failed",
+                    "plugin": spec.name.as_str(),
+                    "phase":  "spawn",
+                    "reason": e.to_string(),
+                    "code":   code,
+                }));
             }
         }
     }

@@ -1,0 +1,27 @@
+[package]
+name = "basic-tools-plugin"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NCP v0.1 plugin: file/bash/etc. tool primitives. v1 ships read_file only; write_file and bash land later behind permission gating."
+
+[[bin]]
+name = "basic-tools"
+path = "src/main.rs"
+
+[dependencies]
+nefor-protocol = { path = "../../crates/nefor-protocol" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"

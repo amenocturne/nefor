@@ -27,3 +27,7 @@ futures = { workspace = true }
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste", "use-dev-tty", "libc"] }
 unicode-width = "0.2"
+
+# OSC 52 clipboard handler base64-encodes the payload for the escape
+# sequence. Direct dep (not workspace) — same lane as ratatui/crossterm.
+base64 = "0.22"

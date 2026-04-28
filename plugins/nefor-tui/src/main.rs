@@ -7,18 +7,21 @@
 //! This binary contains no chat logic; see `plugins/nefor-chat` (separate
 //! crate) for the message-and-tool renderer built on top.
 
+mod clipboard;
 mod errors;
 mod grid;
 mod input;
 mod render;
+mod selection;
 mod transport;
 
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 
 use anyhow::Context as _;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream,
+    EventStream, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -33,6 +36,17 @@ use tokio::sync::mpsc;
 
 use crate::errors::TuiError;
 use crate::grid::{DefaultColors, Grid, HlAttr, HlTable, LineCell};
+use crate::selection::Selection;
+
+/// Highlight id used for cells inside the selection rect. Tui-internal
+/// palette ids start at 1000 to stay well clear of the chat plugin's
+/// `nefor-tui.hl_attr_define`-emitted ids (currently 0..21).
+pub const HL_SELECTION: u32 = 1000;
+
+/// Self-dismiss timeout for the "Copied N chars" toast emitted after a
+/// successful selection copy. Routed through the `chat.popup` contract with
+/// `ttl_ms`; nefor-chat translates that into a `Popup::Toast`.
+const COPY_TOAST_TTL_MS: u64 = 1500;
 
 /// Plugin version, advertised in the optional self-description event
 /// emitted after `ready_ok` (see `send_hello`). Not sent over the wire
@@ -92,6 +106,12 @@ async fn run() -> anyhow::Result<()> {
     // spec.
     send_event(&out_tx, hello_body()).await?;
 
+    // Plugin-readiness signal for downstream consumers (nefor-chat). The
+    // NCP `ready` system message is engine-↔-plugin handshake; peers see
+    // this `nefor-tui.ready` event-kind to know the grid is up and they
+    // can start emitting render commands.
+    send_event(&out_tx, ready_event_body()).await?;
+
     // 2) Enter raw mode + alt screen + mouse + bracketed paste. Install
     //    TerminalGuard before any possible panic path.
     //
@@ -124,13 +144,33 @@ async fn run() -> anyhow::Result<()> {
         grid: Grid::new(cols, rows),
         hl: HlTable::new(),
         defaults: DefaultColors::default(),
+        selection: None,
     };
+    // Define the tui-internal selection highlight up front. Chat-side
+    // `nefor-tui.hl_attr_define` events configure ids 0..21; HL_SELECTION
+    // sits at 1000 so the two namespaces don't collide.
+    state.hl.define(
+        HL_SELECTION,
+        HlAttr {
+            fg: Some(0x00000000),
+            bg: Some(0x007FB4FF),
+            ..HlAttr::default()
+        },
+    );
     send_event(&out_tx, input::resize_body(cols, rows)).await?;
     send_event(&out_tx, input::ready_body(cols, rows)).await?;
 
     // Draw an empty initial frame so the user sees a cleared alt screen.
     terminal
-        .draw(|frame| render::draw(frame, &state.grid, &state.hl, &state.defaults))
+        .draw(|frame| {
+            render::draw(
+                frame,
+                &state.grid,
+                &state.hl,
+                &state.defaults,
+                state.selection.as_ref(),
+            )
+        })
         .context("initial draw")?;
 
     // 4) Main loop: multiplex stdin NCP messages and crossterm events.
@@ -154,8 +194,17 @@ async fn run() -> anyhow::Result<()> {
                             LoopAction::Continue => {}
                             LoopAction::Flush => {
                                 terminal
-                                    .draw(|frame| render::draw(frame, &state.grid, &state.hl, &state.defaults))
+                                    .draw(|frame| render::draw(
+                                        frame,
+                                        &state.grid,
+                                        &state.hl,
+                                        &state.defaults,
+                                        state.selection.as_ref(),
+                                    ))
                                     .context("frame draw")?;
+                            }
+                            LoopAction::Clipboard(text) => {
+                                write_clipboard(&mut tty_for_execute, &text);
                             }
                             LoopAction::Shutdown => break,
                         }
@@ -177,6 +226,29 @@ async fn run() -> anyhow::Result<()> {
                         // stdout will let the engine's broker tear down.
                         if is_quit_shortcut(&event) {
                             break;
+                        }
+                        // Selection FSM runs *before* event forwarding so a
+                        // mouse-up triggers the copy + toast pipeline here,
+                        // and key/resize events clear any in-flight selection.
+                        let outcome = handle_terminal_event_for_selection(&event, &mut state);
+                        let needs_redraw = matches!(
+                            outcome,
+                            SelectionOutcome::Updated | SelectionOutcome::CopyAndToast { .. }
+                        );
+                        if let SelectionOutcome::CopyAndToast { text, char_count } = &outcome {
+                            write_clipboard(&mut tty_for_execute, text);
+                            send_event(&out_tx, copy_toast_body(*char_count)).await?;
+                        }
+                        if needs_redraw {
+                            terminal
+                                .draw(|frame| render::draw(
+                                    frame,
+                                    &state.grid,
+                                    &state.hl,
+                                    &state.defaults,
+                                    state.selection.as_ref(),
+                                ))
+                                .context("frame draw")?;
                         }
                         if let Some(body) = translate_terminal_event(&event, &mut state) {
                             send_event(&out_tx, body).await?;
@@ -207,11 +279,22 @@ struct State {
     grid: Grid,
     hl: HlTable,
     defaults: DefaultColors,
+    /// Active or just-completed mouse selection over the grid. `None` when
+    /// no drag is in progress and no completed selection is being shown.
+    /// Cleared on any keystroke and on resize.
+    selection: Option<Selection>,
 }
 
+#[derive(Debug)]
 enum LoopAction {
     Continue,
     Flush,
+    /// Write `text` to the system clipboard via OSC 52. Handled in the main
+    /// loop because the tty writer (`/dev/tty`) lives there — the
+    /// clipboard sequence must NOT go to stdout (which is the NCP channel
+    /// to the engine; mixing escape codes there would corrupt the JSONL
+    /// stream).
+    Clipboard(String),
     Shutdown,
 }
 
@@ -290,6 +373,17 @@ fn handle_envelope(env: Envelope, state: &mut State) -> LoopAction {
                     sp: as_u32(&map, "sp"),
                 };
                 LoopAction::Continue
+            }
+            Some("nefor-tui.clipboard.set") => {
+                // Best-effort write to the host clipboard via OSC 52. The
+                // sequence is fired off the tty in the main loop; here we
+                // just signal the intent. A missing/non-string `text` is
+                // silently ignored — the producer is malformed but we
+                // shouldn't crash the renderer.
+                match map.get("text").and_then(Value::as_str) {
+                    Some(text) => LoopAction::Clipboard(text.to_owned()),
+                    None => LoopAction::Continue,
+                }
             }
             _ => LoopAction::Continue,
         },
@@ -382,6 +476,133 @@ fn translate_terminal_event(evt: &Event, state: &mut State) -> Option<Map<String
     }
 }
 
+/// Outcome of running an inbound terminal event through the selection FSM.
+/// The caller decides whether to redraw and whether to fire the copy + toast
+/// pipeline based on this.
+#[derive(Debug)]
+enum SelectionOutcome {
+    /// Selection state didn't change. The event was either irrelevant (e.g.
+    /// scroll wheel, focus) or was an interaction we don't track here.
+    Unchanged,
+    /// Selection state changed in some way (down/drag/clear) but no copy
+    /// fires — caller should redraw to show the updated highlight.
+    Updated,
+    /// Mouse-up completed a non-zero-distance selection. Caller writes
+    /// `text` to the clipboard, emits a "Copied N chars" toast, and
+    /// redraws so the highlight clears.
+    CopyAndToast { text: String, char_count: usize },
+}
+
+/// Run the selection FSM against a crossterm event. Mouse Down/Drag/Up of
+/// the left button drive the FSM; key events and resize clear any active
+/// selection (the user has moved on or the cell coordinates invalidated).
+/// All other events leave selection state alone.
+fn handle_terminal_event_for_selection(evt: &Event, state: &mut State) -> SelectionOutcome {
+    match evt {
+        Event::Mouse(m) => handle_mouse_for_selection(m, state),
+        Event::Key(_) | Event::Resize(_, _) => {
+            if state.selection.take().is_some() {
+                SelectionOutcome::Updated
+            } else {
+                SelectionOutcome::Unchanged
+            }
+        }
+        _ => SelectionOutcome::Unchanged,
+    }
+}
+
+fn handle_mouse_for_selection(m: &MouseEvent, state: &mut State) -> SelectionOutcome {
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            // A new left-click always replaces any prior completed selection
+            // and starts a fresh drag.
+            state.selection = Some(Selection::new(m.row, m.column));
+            SelectionOutcome::Updated
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(sel) = state.selection.as_mut() {
+                if sel.active {
+                    sel.focus = (m.row, m.column);
+                    return SelectionOutcome::Updated;
+                }
+            }
+            SelectionOutcome::Unchanged
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let Some(mut sel) = state.selection else {
+                return SelectionOutcome::Unchanged;
+            };
+            if !sel.active {
+                return SelectionOutcome::Unchanged;
+            }
+            sel.focus = (m.row, m.column);
+            sel.active = false;
+            // Zero-distance click = silent deselect. No copy, no toast.
+            if sel.is_zero_distance() {
+                state.selection = None;
+                return SelectionOutcome::Updated;
+            }
+            let text = selection::extract_text(&state.grid, &sel);
+            if text.is_empty() {
+                state.selection = None;
+                return SelectionOutcome::Updated;
+            }
+            let char_count = text.chars().count();
+            // Drop the highlight as soon as the copy fires so the user sees
+            // the toast against a clean grid; matches the v1 chat behaviour.
+            state.selection = None;
+            SelectionOutcome::CopyAndToast { text, char_count }
+        }
+        // Wheel events and right/middle button presses don't participate in
+        // the selection FSM. They're forwarded to the bus by the caller so
+        // chat-side wheel scroll keeps working.
+        _ => SelectionOutcome::Unchanged,
+    }
+}
+
+/// Best-effort write of `text` to the system clipboard. Native helper
+/// (pbcopy on macOS) is preferred because OSC 52 silently no-ops on
+/// Terminal.app, iTerm2 without the opt-in pref, and tmux with
+/// `set-clipboard=off`. Falls through to OSC 52 when no native helper is
+/// available or the helper invocation failed.
+///
+/// Writes go to `/dev/tty`, not stdout — stdout is the NCP channel; mixing
+/// escape codes there would corrupt the JSONL stream.
+fn write_clipboard<W: Write>(tty: &mut W, text: &str) {
+    match clipboard::write_native(text) {
+        Ok(true) => {}
+        Ok(false) => {
+            if let Err(e) = clipboard::write_osc52(tty, text) {
+                tracing::warn!(error = %e, "OSC 52 clipboard write failed");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "native clipboard helper failed; falling back to OSC 52");
+            if let Err(e) = clipboard::write_osc52(tty, text) {
+                tracing::warn!(error = %e, "OSC 52 clipboard write failed");
+            }
+        }
+    }
+}
+
+/// Build a `chat.popup` event body for the "Copied N chars" toast. Sets
+/// `level=info` and `ttl_ms` so the chat-side handler routes it to a
+/// self-dismissing `Popup::Toast` rather than a modal info popup.
+fn copy_toast_body(char_count: usize) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("kind".into(), Value::String("chat.popup".into()));
+    m.insert("level".into(), Value::String("info".into()));
+    m.insert(
+        "message".into(),
+        Value::String(format!("Copied {char_count} chars")),
+    );
+    m.insert(
+        "ttl_ms".into(),
+        Value::Number(serde_json::Number::from(COPY_TOAST_TTL_MS)),
+    );
+    m
+}
+
 async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> anyhow::Result<()> {
     out_tx
         .send(PluginOutgoing::system(SystemBody::Ready {
@@ -397,6 +618,17 @@ async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> anyhow::Result<()>
 fn hello_body() -> Map<String, Value> {
     let mut map = Map::new();
     map.insert("kind".into(), Value::String("nefor-tui.hello".into()));
+    map.insert("version".into(), Value::String(PLUGIN_VERSION.into()));
+    map
+}
+
+/// Plugin-readiness signal: nefor-tui has completed NCP handshake and is
+/// about to enter raw mode. Downstream consumers (nefor-chat) wait on this
+/// event before emitting any grid commands; without it they'd race with
+/// terminal setup and the first frame would be lost.
+fn ready_event_body() -> Map<String, Value> {
+    let mut map = Map::new();
+    map.insert("kind".into(), Value::String("nefor-tui.ready".into()));
     map.insert("version".into(), Value::String(PLUGIN_VERSION.into()));
     map
 }
@@ -452,6 +684,7 @@ mod tests {
             grid: Grid::new(10, 4),
             hl: HlTable::new(),
             defaults: DefaultColors::default(),
+            selection: None,
         }
     }
 
@@ -600,6 +833,26 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_set_event_returns_clipboard_action() {
+        let mut s = state();
+        let env = event_env(json!({
+            "kind": "nefor-tui.clipboard.set",
+            "text": "hello clipboard"
+        }));
+        match handle_envelope(env, &mut s) {
+            LoopAction::Clipboard(text) => assert_eq!(text, "hello clipboard"),
+            other => panic!("expected Clipboard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clipboard_set_event_without_text_is_ignored() {
+        let mut s = state();
+        let env = event_env(json!({ "kind": "nefor-tui.clipboard.set" }));
+        assert!(matches!(handle_envelope(env, &mut s), LoopAction::Continue));
+    }
+
+    #[test]
     fn malformed_line_event_is_ignored() {
         let mut s = state();
         let env = event_env(json!({
@@ -625,5 +878,228 @@ mod tests {
         assert_eq!(out[1].repeat, None);
         assert_eq!(out[2].hl_id, Some(2));
         assert_eq!(out[2].repeat, None);
+    }
+
+    // ---- selection FSM ---------------------------------------------------
+
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    };
+
+    fn mouse_event(kind: MouseEventKind, row: u16, col: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    fn key_event(code: KeyCode) -> Event {
+        Event::Key(KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })
+    }
+
+    /// Prime a 10x4 grid with the row text "hello world" so the
+    /// extract_text path has content to harvest.
+    fn state_with_hello() -> State {
+        let mut s = state();
+        // Width 10, height 4. Write "hello worl" into row 0 (10 cols).
+        let cells: Vec<LineCell> = "hello worl"
+            .chars()
+            .map(|c| LineCell {
+                text: c.to_string(),
+                hl_id: Some(1),
+                repeat: Some(1),
+            })
+            .collect();
+        s.grid.apply_line(0, 0, &cells);
+        s
+    }
+
+    #[test]
+    fn left_down_arms_selection() {
+        let mut s = state_with_hello();
+        let evt = mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 2);
+        let outcome = handle_terminal_event_for_selection(&evt, &mut s);
+        assert!(matches!(outcome, SelectionOutcome::Updated));
+        let sel = s.selection.expect("selection armed");
+        assert_eq!(sel.anchor, (0, 2));
+        assert_eq!(sel.focus, (0, 2));
+        assert!(sel.active);
+    }
+
+    #[test]
+    fn drag_updates_focus_only_while_active() {
+        let mut s = state_with_hello();
+        handle_terminal_event_for_selection(
+            &mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 2),
+            &mut s,
+        );
+        let outcome = handle_terminal_event_for_selection(
+            &mouse_event(MouseEventKind::Drag(MouseButton::Left), 0, 6),
+            &mut s,
+        );
+        assert!(matches!(outcome, SelectionOutcome::Updated));
+        let sel = s.selection.expect("selection still armed");
+        assert_eq!(sel.anchor, (0, 2));
+        assert_eq!(sel.focus, (0, 6));
+        assert!(sel.active);
+    }
+
+    #[test]
+    fn drag_without_prior_down_is_noop() {
+        let mut s = state_with_hello();
+        let outcome = handle_terminal_event_for_selection(
+            &mouse_event(MouseEventKind::Drag(MouseButton::Left), 0, 4),
+            &mut s,
+        );
+        assert!(matches!(outcome, SelectionOutcome::Unchanged));
+        assert!(s.selection.is_none());
+    }
+
+    #[test]
+    fn up_zero_distance_clears_silently() {
+        let mut s = state_with_hello();
+        handle_terminal_event_for_selection(
+            &mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 4),
+            &mut s,
+        );
+        let outcome = handle_terminal_event_for_selection(
+            &mouse_event(MouseEventKind::Up(MouseButton::Left), 0, 4),
+            &mut s,
+        );
+        // Zero-distance: Updated (so the renderer can clear any visual
+        // state) but not CopyAndToast.
+        assert!(
+            matches!(outcome, SelectionOutcome::Updated),
+            "expected Updated, got {outcome:?}"
+        );
+        assert!(s.selection.is_none());
+    }
+
+    #[test]
+    fn up_nonzero_distance_emits_copy_and_clears_selection() {
+        let mut s = state_with_hello();
+        handle_terminal_event_for_selection(
+            &mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0),
+            &mut s,
+        );
+        handle_terminal_event_for_selection(
+            &mouse_event(MouseEventKind::Drag(MouseButton::Left), 0, 4),
+            &mut s,
+        );
+        let outcome = handle_terminal_event_for_selection(
+            &mouse_event(MouseEventKind::Up(MouseButton::Left), 0, 4),
+            &mut s,
+        );
+        match outcome {
+            SelectionOutcome::CopyAndToast { text, char_count } => {
+                assert_eq!(text, "hello");
+                assert_eq!(char_count, 5);
+            }
+            other => panic!("expected CopyAndToast, got {other:?}"),
+        }
+        // Highlight is cleared so the next render shows the toast over a
+        // clean grid.
+        assert!(s.selection.is_none());
+    }
+
+    #[test]
+    fn key_event_clears_selection() {
+        let mut s = state_with_hello();
+        handle_terminal_event_for_selection(
+            &mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0),
+            &mut s,
+        );
+        handle_terminal_event_for_selection(
+            &mouse_event(MouseEventKind::Drag(MouseButton::Left), 0, 4),
+            &mut s,
+        );
+        // Selection still armed (active drag). A keystroke clears it.
+        assert!(s.selection.is_some());
+        let outcome =
+            handle_terminal_event_for_selection(&key_event(KeyCode::Char('a')), &mut s);
+        assert!(matches!(outcome, SelectionOutcome::Updated));
+        assert!(s.selection.is_none());
+    }
+
+    #[test]
+    fn resize_event_clears_selection() {
+        let mut s = state_with_hello();
+        handle_terminal_event_for_selection(
+            &mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0),
+            &mut s,
+        );
+        handle_terminal_event_for_selection(
+            &mouse_event(MouseEventKind::Drag(MouseButton::Left), 0, 3),
+            &mut s,
+        );
+        let outcome = handle_terminal_event_for_selection(&Event::Resize(20, 10), &mut s);
+        assert!(matches!(outcome, SelectionOutcome::Updated));
+        assert!(s.selection.is_none());
+    }
+
+    #[test]
+    fn wheel_event_does_not_touch_selection() {
+        let mut s = state_with_hello();
+        handle_terminal_event_for_selection(
+            &mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0),
+            &mut s,
+        );
+        let before = s.selection;
+        let outcome = handle_terminal_event_for_selection(
+            &mouse_event(MouseEventKind::ScrollDown, 0, 0),
+            &mut s,
+        );
+        assert!(matches!(outcome, SelectionOutcome::Unchanged));
+        assert_eq!(s.selection, before);
+    }
+
+    #[test]
+    fn key_event_with_no_selection_is_unchanged() {
+        let mut s = state();
+        let outcome =
+            handle_terminal_event_for_selection(&key_event(KeyCode::Char('x')), &mut s);
+        assert!(matches!(outcome, SelectionOutcome::Unchanged));
+    }
+
+    #[test]
+    fn copy_toast_body_carries_ttl_ms_and_message() {
+        let body = copy_toast_body(7);
+        assert_eq!(body["kind"], Value::String("chat.popup".into()));
+        assert_eq!(body["level"], Value::String("info".into()));
+        assert_eq!(body["message"], Value::String("Copied 7 chars".into()));
+        assert_eq!(body["ttl_ms"], json!(COPY_TOAST_TTL_MS));
+    }
+
+    #[test]
+    fn reverse_direction_drag_extracts_left_to_right() {
+        // Drag from col 4 back to col 0 — extract_text should still pull
+        // characters in left→right reading order via Selection::normalized.
+        let mut s = state_with_hello();
+        handle_terminal_event_for_selection(
+            &mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 4),
+            &mut s,
+        );
+        handle_terminal_event_for_selection(
+            &mouse_event(MouseEventKind::Drag(MouseButton::Left), 0, 0),
+            &mut s,
+        );
+        let outcome = handle_terminal_event_for_selection(
+            &mouse_event(MouseEventKind::Up(MouseButton::Left), 0, 0),
+            &mut s,
+        );
+        match outcome {
+            SelectionOutcome::CopyAndToast { text, .. } => {
+                assert_eq!(text, "hello");
+            }
+            other => panic!("expected CopyAndToast, got {other:?}"),
+        }
     }
 }

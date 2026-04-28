@@ -1,20 +1,19 @@
-//! nefor-combinators — NCP v0.1 plugin: combinator registry + executor.
+//! nefor-combinators — NCP v0.1 plugin: unified combinator registry +
+//! signature query + runtime invoke (Stage 1 reshape per
+//! `nefor-combinators-spec`).
 //!
-//! Plugins on the bus register their type-aware combinator implementations
-//! (`Merge`, `Into`) via `combinators.register`. Callers ask this plugin to
-//! perform an op via `combinators.run`; the plugin looks up the registered
-//! handler, dispatches to it, and echoes the handler's reply back to the
-//! caller as `combinators.result` / `combinators.error`.
+//! Wire surface:
 //!
-//! Wire schema: see the plugin architecture doc
-//! (`nefor-reasoner-architecture.md`, section "The combinator library").
-//!
-//! Slice 1 scope:
-//! - `Merge` end-to-end.
-//! - `Into` parsed and stubbed (replies `no_handler_registered`).
-//! - Type-agnostic combinators (`Chain`, `Identity`, `Map<Option<T>>`, …)
-//!   are library-only and land when a consumer needs them — they are NOT
-//!   registered through this plugin.
+//! - `combinators.register` (extended) — plugins declare `Merge`, `Into`,
+//!   `Fanout`, and `Equivalent` (sugar) trait implementations.
+//! - `combinators.query` / `combinators.query.result` — scheduler asks
+//!   "do these signatures all resolve?" at submit time.
+//! - `combinators.invoke` / `combinators.invoke.result` — typed-multiset
+//!   invocation; replaces `combinators.run` over time.
+//! - `combinators.run` / `combinators.result` — Slice 1 legacy path, kept
+//!   so mock-plugin's existing `Merge<Message>` callers don't break during
+//!   migration (per spec §8 / D-15: short coexistence, then full cut).
+//! - `combinators.error` — every failure mode carries a closed [`ErrorCode`].
 
 mod dispatch;
 mod error;
@@ -31,10 +30,15 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::dispatch::{
     caller_error_body, caller_result_body, classify_reply_kind, handler_dispatch_body,
-    parse_run_body, HandlerReplyKind, InternalId, Op, PendingMap,
+    invoke_dispatch_body, invoke_result_body, parse_invoke_body, parse_query_body, parse_run_body,
+    parse_typed_outputs, query_result_body, validate_output_multiset, HandlerOutcome,
+    HandlerReplyKind, InternalId, InvokeRequest, Op, QueryResolution, RunRequest, TypedOutput,
 };
 use crate::error::{CombinatorsError, ErrorCode};
-use crate::registry::{parse_register_body, Registry};
+use crate::registry::{
+    parse_register_body, FullyQualifiedKind, FullyQualifiedType, Identity, Registry, TraitImpl,
+    PASS_THROUGH_HANDLER, PASS_THROUGH_OWNER,
+};
 
 /// NCP version this plugin speaks.
 const PROTOCOL_VERSION: &str = "0.1";
@@ -44,6 +48,10 @@ const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Handler timeout bound (v1: 30s, per spec).
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Pending-channel payload — covers single-output (legacy) and typed-multiset
+/// (new) reply shapes.
+type PendingOutcome = Result<HandlerOutcome, CombinatorsError>;
 
 #[tokio::main]
 async fn main() {
@@ -80,7 +88,11 @@ async fn run() -> Result<(), CombinatorsError> {
     send_event(&out_tx, ready_body()).await?;
 
     let registry: Arc<Mutex<Registry>> = Arc::new(Mutex::new(Registry::new()));
-    let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+    let pending: Arc<Mutex<HashMap<InternalId, PendingSlot>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    // Built-in registration: tool_split.
+    install_builtin_tool_split(&registry).await;
 
     run_dispatch_loop(&registry, &pending, &out_tx, &mut in_rx).await?;
 
@@ -88,9 +100,22 @@ async fn run() -> Result<(), CombinatorsError> {
     Ok(())
 }
 
+/// In-flight invocation entry. Both the Slice 1 legacy reader (which
+/// expects a single `output` field) and the new `invoke` reader (which
+/// expects an `outputs[]` multiset) feed back through the same oneshot
+/// after we re-shape the owner's reply into a [`HandlerOutcome`].
+struct PendingSlot {
+    /// Outcome receiver — fulfilled by the dispatch loop once the owner
+    /// replies (or by the timeout task on a no-reply).
+    tx: oneshot::Sender<PendingOutcome>,
+    /// Whether the owner's reply should be parsed as `output` (legacy) or
+    /// `outputs[]` (multiset).
+    expect_multi: bool,
+}
+
 async fn run_dispatch_loop(
     registry: &Arc<Mutex<Registry>>,
-    pending: &PendingMap,
+    pending: &Arc<Mutex<HashMap<InternalId, PendingSlot>>>,
     out_tx: &mpsc::Sender<PluginOutgoing>,
     in_rx: &mut mpsc::Receiver<Result<Envelope, CombinatorsError>>,
 ) -> Result<(), CombinatorsError> {
@@ -140,7 +165,7 @@ async fn run_dispatch_loop(
 /// sees every event, so filtering is this plugin's job.
 async fn dispatch_event(
     registry: &Arc<Mutex<Registry>>,
-    pending: &PendingMap,
+    pending: &Arc<Mutex<HashMap<InternalId, PendingSlot>>>,
     out_tx: &mpsc::Sender<PluginOutgoing>,
     sender: &str,
     body: &Map<String, Value>,
@@ -156,27 +181,36 @@ async fn dispatch_event(
     // it's ours.
     if let Some(shape) = classify_reply_kind(kind) {
         if let Some(internal_id) = body.get("id").and_then(Value::as_str) {
-            let maybe_tx = pending.lock().await.remove(internal_id);
-            if let Some(tx) = maybe_tx {
-                let outcome = match shape {
-                    HandlerReplyKind::Result => match body.get("output").cloned() {
-                        Some(v) => Ok(v),
-                        None => Err(CombinatorsError::Handler(
-                            "handler reply missing `output`".into(),
-                        )),
-                    },
+            let slot = pending.lock().await.remove(internal_id);
+            if let Some(slot) = slot {
+                let outcome: PendingOutcome = match shape {
+                    HandlerReplyKind::Result => {
+                        if slot.expect_multi {
+                            match parse_typed_outputs(body) {
+                                Some(outputs) => Ok(HandlerOutcome::Multi(outputs)),
+                                None => Err(CombinatorsError::Handler(
+                                    "handler reply missing or malformed `outputs[]`".into(),
+                                )),
+                            }
+                        } else {
+                            match body.get("output").cloned() {
+                                Some(v) => Ok(HandlerOutcome::Single(v)),
+                                None => Err(CombinatorsError::Handler(
+                                    "handler reply missing `output`".into(),
+                                )),
+                            }
+                        }
+                    }
                     HandlerReplyKind::Error => {
                         let msg = body
                             .get("message")
                             .and_then(Value::as_str)
                             .unwrap_or("<no message>")
                             .to_owned();
-                        Err(CombinatorsError::Handler(msg))
+                        Ok(HandlerOutcome::Error(msg))
                     }
                 };
-                // Receiver may be gone if the per-run task already timed
-                // out — that's fine, nothing to do.
-                let _ = tx.send(outcome);
+                let _ = slot.tx.send(outcome);
                 return Ok(());
             }
         }
@@ -188,6 +222,12 @@ async fn dispatch_event(
         }
         "combinators.run" => {
             handle_run(registry, pending, out_tx, sender, body).await?;
+        }
+        "combinators.query" => {
+            handle_query(registry, out_tx, sender, body).await?;
+        }
+        "combinators.invoke" => {
+            handle_invoke(registry, pending, out_tx, sender, body).await?;
         }
         _ => {
             // Not for us.
@@ -226,7 +266,7 @@ async fn handle_register(
 
 async fn handle_run(
     registry: &Arc<Mutex<Registry>>,
-    pending: &PendingMap,
+    pending: &Arc<Mutex<HashMap<InternalId, PendingSlot>>>,
     out_tx: &mpsc::Sender<PluginOutgoing>,
     caller: &str,
     body: &Map<String, Value>,
@@ -236,8 +276,6 @@ async fn handle_run(
         Err(e) => {
             let (code, message, caller_id) = match &e {
                 CombinatorsError::RunRejected { code, message } => {
-                    // Best-effort pull of `id` for the reply. Parse errors
-                    // may have failed BEFORE id, hence Option.
                     let id = body
                         .get("id")
                         .and_then(Value::as_str)
@@ -256,32 +294,16 @@ async fn handle_run(
         }
     };
 
-    // Slice 1: Into is stubbed — dispatch replies `no_handler_registered`.
-    // Full Into lands with the first consumer that needs it.
-    match req.op {
-        Op::Into => {
-            send_event(
-                out_tx,
-                caller_error_body(
-                    caller,
-                    Some(&req.caller_id),
-                    ErrorCode::NoHandlerRegistered,
-                    "Into is not implemented in Slice 1",
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
-        Op::Merge => {}
-    }
-
-    // Look up the Merge handler.
-    let handler = {
+    // Stage 1: both Merge and Into route through the unified registry. Into
+    // worked-stub from Slice 1 is gone — if a sender registered an Into,
+    // we now actually dispatch.
+    let identity = req.identity();
+    let owned = {
         let guard = registry.lock().await;
-        guard.merge_handler(&req.type_).cloned()
+        guard.lookup_or_pass_through(&identity)
     };
-    let handler = match handler {
-        Some(h) => h,
+    let owned = match owned {
+        Some(o) => o,
         None => {
             send_event(
                 out_tx,
@@ -289,7 +311,14 @@ async fn handle_run(
                     caller,
                     Some(&req.caller_id),
                     ErrorCode::NoHandlerRegistered,
-                    &format!("no Merge handler for type `{}`", req.type_.to_wire()),
+                    &format!(
+                        "no handler for op `{}` on `{}`",
+                        match req.op {
+                            Op::Merge => "Merge",
+                            Op::Into => "Into",
+                        },
+                        req.type_.to_wire()
+                    ),
                 ),
             )
             .await?;
@@ -297,44 +326,403 @@ async fn handle_run(
         }
     };
 
-    // Reserve a pending slot, emit the dispatch, then spawn a task that
-    // awaits the oneshot + timeout and forwards the outcome to the caller.
-    let internal_id: InternalId = uuid::Uuid::new_v4().to_string();
-    let (tx, rx) = oneshot::channel::<Result<Value, CombinatorsError>>();
-    pending.lock().await.insert(internal_id.clone(), tx);
+    dispatch_run_via(req, owned, pending, out_tx, caller).await
+}
 
-    let dispatch_body = handler_dispatch_body(&handler, &internal_id, &req.inputs);
+/// Dispatch a legacy `combinators.run` invocation. Single-output reply
+/// shape (`output` field) — kept for mock-plugin Slice 1.
+async fn dispatch_run_via(
+    req: RunRequest,
+    owned: registry::OwnedHandler,
+    pending: &Arc<Mutex<HashMap<InternalId, PendingSlot>>>,
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    caller: &str,
+) -> Result<(), CombinatorsError> {
+    // Synthesised handlers (pass_through, tool_split) are owned by us:
+    // resolve in-process instead of going through the bus. For the legacy
+    // path this only matters for pass_through; tool_split is arity-1 with
+    // a multiset output, which `combinators.run` cannot express.
+    if owned.owner == PASS_THROUGH_OWNER && owned.handler.bare == PASS_THROUGH_HANDLER {
+        // Echo input verbatim (arity 1 only).
+        let output = req.inputs.first().cloned().unwrap_or(Value::Null);
+        send_event(out_tx, caller_result_body(caller, &req.caller_id, output)).await?;
+        return Ok(());
+    }
+
+    let internal_id: InternalId = uuid::Uuid::new_v4().to_string();
+    let (tx, rx) = oneshot::channel::<PendingOutcome>();
+    pending.lock().await.insert(
+        internal_id.clone(),
+        PendingSlot {
+            tx,
+            expect_multi: false,
+        },
+    );
+
+    let dispatch_body = handler_dispatch_body(&owned.handler, &internal_id, &req.inputs);
     send_event(out_tx, dispatch_body).await?;
 
-    spawn_await_handler_reply(
+    spawn_await_legacy_reply(
         caller.to_owned(),
-        req.caller_id.clone(),
+        req.caller_id,
         internal_id,
         rx,
         pending.clone(),
         out_tx.clone(),
     );
-
-    // `req` still owned here — passing ownership to the spawned task would
-    // require cloning inputs we no longer use. Drop implicitly at fn end.
-    let _ = req;
     Ok(())
 }
 
-/// Spawn a task that waits for the handler's reply (or the timeout), then
-/// forwards a `combinators.result` / `combinators.error` to the caller.
-fn spawn_await_handler_reply(
+async fn handle_query(
+    registry: &Arc<Mutex<Registry>>,
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    caller: &str,
+    body: &Map<String, Value>,
+) -> Result<(), CombinatorsError> {
+    let req = match parse_query_body(body) {
+        Ok(r) => r,
+        Err(e) => {
+            let (code, message, caller_id) = match &e {
+                CombinatorsError::QueryRejected { code, message } => {
+                    let id = body
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                    (*code, message.clone(), id)
+                }
+                other => (ErrorCode::MalformedQuery, other.to_string(), None),
+            };
+            tracing::warn!(caller = caller, code = %code, message = %message, "query rejected");
+            send_event(
+                out_tx,
+                caller_error_body(caller, caller_id.as_deref(), code, &message),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let resolutions: Vec<QueryResolution> = {
+        let guard = registry.lock().await;
+        req.signatures
+            .iter()
+            .map(|sig| {
+                let id = Identity::new(sig.arity, sig.in_type.clone(), sig.out_multiset.clone());
+                match guard.lookup_or_pass_through(&id) {
+                    Some(owned) => QueryResolution::Resolved { owner: owned.owner },
+                    None => QueryResolution::Missing,
+                }
+            })
+            .collect()
+    };
+    let body_out = query_result_body(caller, &req.caller_id, &req.signatures, &resolutions);
+    send_event(out_tx, body_out).await
+}
+
+async fn handle_invoke(
+    registry: &Arc<Mutex<Registry>>,
+    pending: &Arc<Mutex<HashMap<InternalId, PendingSlot>>>,
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    caller: &str,
+    body: &Map<String, Value>,
+) -> Result<(), CombinatorsError> {
+    let req = match parse_invoke_body(body) {
+        Ok(r) => r,
+        Err(e) => {
+            let (code, message, caller_id) = match &e {
+                CombinatorsError::InvokeRejected { code, message } => {
+                    let id = body
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                    (*code, message.clone(), id)
+                }
+                other => (ErrorCode::MalformedEntry, other.to_string(), None),
+            };
+            tracing::warn!(caller = caller, code = %code, message = %message, "invoke rejected");
+            send_event(
+                out_tx,
+                caller_error_body(caller, caller_id.as_deref(), code, &message),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let owned = {
+        let guard = registry.lock().await;
+        guard.lookup_or_pass_through(&req.identity)
+    };
+    let owned = match owned {
+        Some(o) => o,
+        None => {
+            send_event(
+                out_tx,
+                caller_error_body(
+                    caller,
+                    Some(&req.caller_id),
+                    ErrorCode::NoHandlerRegistered,
+                    &format!(
+                        "no handler for signature in=`{}` out={:?}",
+                        req.identity.input_type.to_wire(),
+                        req.identity
+                            .output_multiset
+                            .iter()
+                            .map(|t| t.to_wire())
+                            .collect::<Vec<_>>()
+                    ),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    // In-process synthesis: pass_through and tool_split are owned by us.
+    if owned.owner == PASS_THROUGH_OWNER {
+        let outputs = match owned.handler.bare.as_str() {
+            PASS_THROUGH_HANDLER => synthesise_pass_through(&req),
+            TOOL_SPLIT_HANDLER => match synthesise_tool_split(&req) {
+                Ok(o) => o,
+                Err(msg) => {
+                    send_event(
+                        out_tx,
+                        caller_error_body(
+                            caller,
+                            Some(&req.caller_id),
+                            ErrorCode::HandlerError,
+                            &msg,
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            },
+            // Future built-ins land here; for now any other bare name owned
+            // by us is a bug.
+            other => {
+                send_event(
+                    out_tx,
+                    caller_error_body(
+                        caller,
+                        Some(&req.caller_id),
+                        ErrorCode::NoHandlerRegistered,
+                        &format!("internal: unknown built-in handler `{other}`"),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        // Validate built-in output multiset before forwarding.
+        if let Err(msg) = validate_output_multiset(&req.identity.output_multiset, &outputs) {
+            send_event(
+                out_tx,
+                caller_error_body(
+                    caller,
+                    Some(&req.caller_id),
+                    ErrorCode::HandlerOutputMismatch,
+                    &msg,
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        send_event(out_tx, invoke_result_body(caller, &req.caller_id, outputs)).await?;
+        return Ok(());
+    }
+
+    // External owner: dispatch via the bus.
+    let internal_id: InternalId = uuid::Uuid::new_v4().to_string();
+    let (tx, rx) = oneshot::channel::<PendingOutcome>();
+    pending.lock().await.insert(
+        internal_id.clone(),
+        PendingSlot {
+            tx,
+            expect_multi: true,
+        },
+    );
+
+    let dispatch_body =
+        invoke_dispatch_body(&owned.handler, &internal_id, &req.identity, &req.inputs);
+    send_event(out_tx, dispatch_body).await?;
+
+    spawn_await_invoke_reply(
+        caller.to_owned(),
+        req.caller_id,
+        req.identity,
+        internal_id,
+        rx,
+        pending.clone(),
+        out_tx.clone(),
+    );
+    Ok(())
+}
+
+/// `pass_through :: T -> {T}` — echo the single input as the single output.
+fn synthesise_pass_through(req: &InvokeRequest) -> Vec<TypedOutput> {
+    let value = req.inputs.first().cloned().unwrap_or(Value::Null);
+    let type_ = req.identity.input_type.clone();
+    vec![TypedOutput { type_, value }]
+}
+
+// ---- Built-in `tool_split` -------------------------------------------------
+
+/// Bare handler name for the `tool_split` built-in.
+const TOOL_SPLIT_HANDLER: &str = "tool_split";
+
+/// Plugin namespace owning `ProviderOut` and `FinalAnswer`.
+const GENERIC_PROVIDER_NS: &str = "generic-provider";
+/// Plugin namespace owning `ToolCalls`.
+const GENERIC_TOOL_NS: &str = "generic-tool";
+/// Bare type name: input to `tool_split`.
+const PROVIDER_OUT_NAME: &str = "ProviderOut";
+/// Bare type name: tool-execution branch output.
+const TOOL_CALLS_NAME: &str = "ToolCalls";
+/// Bare type name: terminal-text branch output.
+const FINAL_ANSWER_NAME: &str = "FinalAnswer";
+
+/// Install the built-in `tool_split` registration at startup.
+///
+/// Per parent spec §6.2: the signature is
+/// `generic-provider.ProviderOut -> { generic-tool.ToolCalls,
+/// generic-provider.FinalAnswer }`. None of these tags belong to the
+/// combinators-plugin namespace, so we use [`Registry::install_builtin`]
+/// which bypasses the wire-side namespace-ownership check. The handler
+/// itself stays in this plugin's namespace
+/// (`nefor-combinators.tool_split`) — that's where the implementation
+/// runs.
+async fn install_builtin_tool_split(registry: &Arc<Mutex<Registry>>) {
+    let provider_out = FullyQualifiedType {
+        plugin: GENERIC_PROVIDER_NS.to_owned(),
+        name: PROVIDER_OUT_NAME.to_owned(),
+    };
+    let tool_calls = FullyQualifiedType {
+        plugin: GENERIC_TOOL_NS.to_owned(),
+        name: TOOL_CALLS_NAME.to_owned(),
+    };
+    let final_answer = FullyQualifiedType {
+        plugin: GENERIC_PROVIDER_NS.to_owned(),
+        name: FINAL_ANSWER_NAME.to_owned(),
+    };
+    let handler = FullyQualifiedKind {
+        plugin: PASS_THROUGH_OWNER.to_owned(),
+        bare: TOOL_SPLIT_HANDLER.to_owned(),
+    };
+    let mut guard = registry.lock().await;
+    if let Err(e) = guard.install_builtin(
+        PASS_THROUGH_OWNER,
+        vec![TraitImpl::Fanout {
+            in_: provider_out,
+            outs: vec![tool_calls, final_answer],
+            handler,
+        }],
+    ) {
+        tracing::error!(error = %e, "failed to install built-in tool_split");
+    }
+}
+
+/// `tool_split` runtime logic. Inspects the input value's JSON shape:
+/// non-empty `tool_calls` array → emit ToolCalls slot; else → emit
+/// FinalAnswer slot. The unselected slot carries `null` (Maybe semantics).
+///
+/// Type matching is exact on the canonical tags: input is
+/// `generic-provider.ProviderOut`, outputs are `generic-tool.ToolCalls`
+/// and `generic-provider.FinalAnswer`. (Suffix-matching the previous
+/// placeholder-types code used was a smell flagged in T4's writeup; we
+/// now compare against the real tags directly.)
+fn synthesise_tool_split(req: &InvokeRequest) -> Result<Vec<TypedOutput>, String> {
+    let input = req.inputs.first().cloned().unwrap_or(Value::Null);
+    let mut tool_calls_type: Option<FullyQualifiedType> = None;
+    let mut final_answer_type: Option<FullyQualifiedType> = None;
+    for t in &req.identity.output_multiset {
+        if t.plugin == GENERIC_TOOL_NS && t.name == TOOL_CALLS_NAME {
+            tool_calls_type = Some(t.clone());
+        } else if t.plugin == GENERIC_PROVIDER_NS && t.name == FINAL_ANSWER_NAME {
+            final_answer_type = Some(t.clone());
+        }
+    }
+    let tool_calls_type = tool_calls_type.ok_or_else(|| {
+        format!("tool_split output multiset missing `{GENERIC_TOOL_NS}.{TOOL_CALLS_NAME}` slot")
+    })?;
+    let final_answer_type = final_answer_type.ok_or_else(|| {
+        format!(
+            "tool_split output multiset missing `{GENERIC_PROVIDER_NS}.{FINAL_ANSWER_NAME}` slot"
+        )
+    })?;
+
+    let has_tool_calls = input
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+
+    if has_tool_calls {
+        let calls = input.get("tool_calls").cloned().unwrap_or(Value::Null);
+        Ok(vec![
+            TypedOutput {
+                type_: tool_calls_type,
+                value: calls,
+            },
+            TypedOutput {
+                type_: final_answer_type,
+                value: Value::Null,
+            },
+        ])
+    } else {
+        let text = input.get("text").cloned().unwrap_or_else(|| input.clone());
+        let mut answer = Map::new();
+        answer.insert("text".into(), text);
+        Ok(vec![
+            TypedOutput {
+                type_: tool_calls_type,
+                value: Value::Null,
+            },
+            TypedOutput {
+                type_: final_answer_type,
+                value: Value::Object(answer),
+            },
+        ])
+    }
+}
+
+// ---- Reply forwarding -----------------------------------------------------
+
+/// Spawn a task that waits for a legacy `combinators.run` reply (single
+/// `output`) and forwards `combinators.result` / `combinators.error` to
+/// the caller.
+fn spawn_await_legacy_reply(
     caller: String,
     caller_id: String,
     internal_id: InternalId,
-    rx: oneshot::Receiver<Result<Value, CombinatorsError>>,
-    pending: PendingMap,
+    rx: oneshot::Receiver<PendingOutcome>,
+    pending: Arc<Mutex<HashMap<InternalId, PendingSlot>>>,
     out_tx: mpsc::Sender<PluginOutgoing>,
 ) {
     tokio::spawn(async move {
         let reply_body = match tokio::time::timeout(HANDLER_TIMEOUT, rx).await {
-            Ok(Ok(Ok(output))) => caller_result_body(&caller, &caller_id, output),
-            Ok(Ok(Err(CombinatorsError::Handler(msg)))) => {
+            Ok(Ok(Ok(HandlerOutcome::Single(output)))) => {
+                caller_result_body(&caller, &caller_id, output)
+            }
+            Ok(Ok(Ok(HandlerOutcome::Multi(outputs)))) => {
+                // Owner replied with multi-shape but caller used legacy run;
+                // collapse on a 1-output multiset, surface a mismatch otherwise.
+                if outputs.len() == 1 {
+                    caller_result_body(
+                        &caller,
+                        &caller_id,
+                        outputs.into_iter().next().expect("len 1").value,
+                    )
+                } else {
+                    caller_error_body(
+                        &caller,
+                        Some(&caller_id),
+                        ErrorCode::HandlerOutputMismatch,
+                        "legacy `combinators.run` caller cannot consume multiset reply",
+                    )
+                }
+            }
+            Ok(Ok(Ok(HandlerOutcome::Error(msg)))) => {
                 caller_error_body(&caller, Some(&caller_id), ErrorCode::HandlerError, &msg)
             }
             Ok(Ok(Err(other))) => caller_error_body(
@@ -343,7 +731,6 @@ fn spawn_await_handler_reply(
                 ErrorCode::HandlerError,
                 &other.to_string(),
             ),
-            // Oneshot dropped without sending — treat as handler error.
             Ok(Err(_)) => caller_error_body(
                 &caller,
                 Some(&caller_id),
@@ -351,8 +738,82 @@ fn spawn_await_handler_reply(
                 "handler reply channel closed",
             ),
             Err(_) => {
-                // Timeout: evict our pending entry so a late reply is
-                // ignored rather than silently dropped later.
+                let _ = pending.lock().await.remove(&internal_id);
+                caller_error_body(
+                    &caller,
+                    Some(&caller_id),
+                    ErrorCode::HandlerTimeout,
+                    &format!(
+                        "handler did not reply within {}ms",
+                        HANDLER_TIMEOUT.as_millis()
+                    ),
+                )
+            }
+        };
+        let _ = out_tx.send(PluginOutgoing::event(reply_body)).await;
+    });
+}
+
+/// Spawn a task that waits for a `combinators.invoke` reply (multiset
+/// `outputs[]`) and forwards `combinators.invoke.result` /
+/// `combinators.error` to the caller.
+fn spawn_await_invoke_reply(
+    caller: String,
+    caller_id: String,
+    identity: Identity,
+    internal_id: InternalId,
+    rx: oneshot::Receiver<PendingOutcome>,
+    pending: Arc<Mutex<HashMap<InternalId, PendingSlot>>>,
+    out_tx: mpsc::Sender<PluginOutgoing>,
+) {
+    tokio::spawn(async move {
+        let reply_body = match tokio::time::timeout(HANDLER_TIMEOUT, rx).await {
+            Ok(Ok(Ok(HandlerOutcome::Multi(outputs)))) => {
+                match validate_output_multiset(&identity.output_multiset, &outputs) {
+                    Ok(()) => invoke_result_body(&caller, &caller_id, outputs),
+                    Err(msg) => caller_error_body(
+                        &caller,
+                        Some(&caller_id),
+                        ErrorCode::HandlerOutputMismatch,
+                        &msg,
+                    ),
+                }
+            }
+            Ok(Ok(Ok(HandlerOutcome::Single(value)))) => {
+                // Owner replied legacy single-output to a new-shape invoke.
+                // Wrap into the registered single-element multiset when
+                // possible; otherwise mismatch.
+                if identity.output_multiset.len() == 1 {
+                    let outputs = vec![TypedOutput {
+                        type_: identity.output_multiset[0].clone(),
+                        value,
+                    }];
+                    invoke_result_body(&caller, &caller_id, outputs)
+                } else {
+                    caller_error_body(
+                        &caller,
+                        Some(&caller_id),
+                        ErrorCode::HandlerOutputMismatch,
+                        "owner replied with single `output` to a multi-output signature",
+                    )
+                }
+            }
+            Ok(Ok(Ok(HandlerOutcome::Error(msg)))) => {
+                caller_error_body(&caller, Some(&caller_id), ErrorCode::HandlerError, &msg)
+            }
+            Ok(Ok(Err(other))) => caller_error_body(
+                &caller,
+                Some(&caller_id),
+                ErrorCode::HandlerError,
+                &other.to_string(),
+            ),
+            Ok(Err(_)) => caller_error_body(
+                &caller,
+                Some(&caller_id),
+                ErrorCode::HandlerError,
+                "handler reply channel closed",
+            ),
+            Err(_) => {
                 let _ = pending.lock().await.remove(&internal_id);
                 caller_error_body(
                     &caller,
@@ -413,6 +874,22 @@ async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), Combina
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::TraitImpl;
+    use serde_json::json;
+
+    fn fqt(plugin: &str, name: &str) -> FullyQualifiedType {
+        FullyQualifiedType {
+            plugin: plugin.into(),
+            name: name.into(),
+        }
+    }
+
+    fn fqk(plugin: &str, bare: &str) -> FullyQualifiedKind {
+        FullyQualifiedKind {
+            plugin: plugin.into(),
+            bare: bare.into(),
+        }
+    }
 
     #[test]
     fn hello_body_advertises_plugin_version() {
@@ -445,5 +922,217 @@ mod tests {
             Some("combinators.goodbye")
         );
         assert!(b.get("reason").and_then(Value::as_str).is_some());
+    }
+
+    #[test]
+    fn synthesise_pass_through_echoes_input() {
+        let req = InvokeRequest {
+            caller_id: "c".into(),
+            identity: Identity::new(1, fqt("p", "T"), vec![fqt("p", "T")]),
+            inputs: vec![json!({"x": 7})],
+        };
+        let outs = synthesise_pass_through(&req);
+        assert_eq!(outs.len(), 1);
+        assert_eq!(outs[0].type_.to_wire(), "p.T");
+        assert_eq!(outs[0].value, json!({"x": 7}));
+    }
+
+    #[test]
+    fn tool_split_with_real_types_emits_correct_synthesis_for_tool_call_path() {
+        let req = InvokeRequest {
+            caller_id: "c".into(),
+            identity: Identity::new(
+                1,
+                fqt("generic-provider", "ProviderOut"),
+                vec![
+                    fqt("generic-provider", "FinalAnswer"),
+                    fqt("generic-tool", "ToolCalls"),
+                ],
+            ),
+            inputs: vec![json!({
+                "text": "I'll call a tool.",
+                "tool_calls": [{"name": "search", "args": {}}],
+            })],
+        };
+        let outs = synthesise_tool_split(&req).expect("ok");
+        assert_eq!(outs.len(), 2);
+        let tool = outs
+            .iter()
+            .find(|o| o.type_.to_wire() == "generic-tool.ToolCalls")
+            .expect("tool slot");
+        let answer = outs
+            .iter()
+            .find(|o| o.type_.to_wire() == "generic-provider.FinalAnswer")
+            .expect("answer slot");
+        assert!(tool.value.as_array().expect("array").len() == 1);
+        assert_eq!(answer.value, Value::Null);
+    }
+
+    #[test]
+    fn tool_split_with_real_types_emits_correct_synthesis_for_text_path() {
+        let req = InvokeRequest {
+            caller_id: "c".into(),
+            identity: Identity::new(
+                1,
+                fqt("generic-provider", "ProviderOut"),
+                vec![
+                    fqt("generic-provider", "FinalAnswer"),
+                    fqt("generic-tool", "ToolCalls"),
+                ],
+            ),
+            inputs: vec![json!({"text": "Hi there."})],
+        };
+        let outs = synthesise_tool_split(&req).expect("ok");
+        let tool = outs
+            .iter()
+            .find(|o| o.type_.to_wire() == "generic-tool.ToolCalls")
+            .expect("tool slot");
+        let answer = outs
+            .iter()
+            .find(|o| o.type_.to_wire() == "generic-provider.FinalAnswer")
+            .expect("answer slot");
+        assert_eq!(tool.value, Value::Null);
+        assert_eq!(
+            answer.value.get("text").and_then(Value::as_str),
+            Some("Hi there.")
+        );
+    }
+
+    #[tokio::test]
+    async fn install_tool_split_succeeds_at_startup() {
+        let r: Arc<Mutex<Registry>> = Arc::new(Mutex::new(Registry::new()));
+        install_builtin_tool_split(&r).await;
+        let id = Identity::new(
+            1,
+            fqt("generic-provider", "ProviderOut"),
+            vec![
+                fqt("generic-tool", "ToolCalls"),
+                fqt("generic-provider", "FinalAnswer"),
+            ],
+        );
+        let guard = r.lock().await;
+        let owned = guard.lookup(&id).expect("tool_split registered");
+        assert_eq!(owned.handler.to_wire(), "nefor-combinators.tool_split");
+    }
+
+    #[tokio::test]
+    async fn query_round_trip_resolves_pass_through_via_synthesis() {
+        // Drives the full query path: registry has only an Into entry; a
+        // query for one resolved + one missing + one pass-through-synthesised
+        // signature returns the right partition.
+        let mut registry = Registry::new();
+        registry
+            .install(
+                "p",
+                vec![fqt("p", "A")],
+                vec![TraitImpl::Into {
+                    in_: fqt("p", "A"),
+                    out: fqt("other", "B"),
+                    handler: fqk("p", "a_to_b"),
+                }],
+            )
+            .expect("install");
+
+        // Build the query body manually and walk the resolution code path.
+        let req = parse_query_body(
+            json!({
+                "id": "q-1",
+                "signatures": [
+                    { "in": "p.A", "out": ["other.B"] },
+                    { "in": "p.NotThere", "out": ["p.AlsoNot"] },
+                    { "in": "x.T", "out": ["x.T"] }    // pass_through synthesis
+                ]
+            })
+            .as_object()
+            .expect("obj"),
+        )
+        .expect("parse");
+
+        let resolutions: Vec<QueryResolution> = {
+            let r = registry;
+            req.signatures
+                .iter()
+                .map(|sig| {
+                    let id =
+                        Identity::new(sig.arity, sig.in_type.clone(), sig.out_multiset.clone());
+                    match r.lookup_or_pass_through(&id) {
+                        Some(owned) => QueryResolution::Resolved { owner: owned.owner },
+                        None => QueryResolution::Missing,
+                    }
+                })
+                .collect()
+        };
+        assert!(matches!(
+            resolutions[0],
+            QueryResolution::Resolved { ref owner } if owner == "p"
+        ));
+        assert!(matches!(resolutions[1], QueryResolution::Missing));
+        assert!(matches!(
+            resolutions[2],
+            QueryResolution::Resolved { ref owner } if owner == "nefor-combinators"
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_merge_dispatch_round_trip_via_pending() {
+        // Wires the dispatch loop's reader path: parse a Merge run, look up
+        // the registered handler, simulate an owner reply through the
+        // pending-map, and verify the fulfilled outcome.
+        let mut registry = Registry::new();
+        registry
+            .install(
+                "mock-plugin",
+                vec![fqt("mock-plugin", "Message")],
+                vec![TraitImpl::Merge {
+                    type_: fqt("mock-plugin", "Message"),
+                    handler: fqk("mock-plugin", "message.concat"),
+                }],
+            )
+            .expect("install");
+
+        let body = json!({
+            "id": "caller-1",
+            "op": "Merge",
+            "type": "mock-plugin.Message",
+            "inputs": [{"text": "hi "}, {"text": "there"}]
+        });
+        let req = parse_run_body(body.as_object().expect("obj")).expect("parse");
+        let identity = req.identity();
+        let owned = registry
+            .lookup_or_pass_through(&identity)
+            .expect("handler registered");
+        assert_eq!(owned.handler.to_wire(), "mock-plugin.message.concat");
+
+        let (tx, rx) = oneshot::channel::<PendingOutcome>();
+        let pending: Arc<Mutex<HashMap<InternalId, PendingSlot>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        pending.lock().await.insert(
+            "internal-1".into(),
+            PendingSlot {
+                tx,
+                expect_multi: false,
+            },
+        );
+
+        // Dispatch body shape check.
+        let dispatch = handler_dispatch_body(&owned.handler, "internal-1", &req.inputs);
+        assert_eq!(
+            dispatch.get("kind").and_then(Value::as_str),
+            Some("mock-plugin.message.concat")
+        );
+
+        // Owner "replies" — drive the oneshot.
+        let slot = pending.lock().await.remove("internal-1").expect("pending");
+        let _ = slot
+            .tx
+            .send(Ok(HandlerOutcome::Single(json!({"text": "hi there"}))));
+
+        let received = rx.await.expect("oneshot delivered").expect("ok");
+        match received {
+            HandlerOutcome::Single(v) => {
+                assert_eq!(v, json!({"text": "hi there"}));
+            }
+            other => panic!("unexpected outcome shape: {other:?}"),
+        }
     }
 }

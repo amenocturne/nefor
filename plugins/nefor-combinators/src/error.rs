@@ -22,7 +22,10 @@ pub enum ErrorCode {
     /// A registration entry was missing a required field or had the wrong
     /// shape.
     MalformedEntry,
-    /// `combinators.run` referenced an op/type with no registered handler.
+    /// A registration's output multiset was empty (e.g. `Fanout.out = []`).
+    EmptyOutputMultiset,
+    /// `combinators.run` / `combinators.invoke` referenced an op/signature
+    /// with no registered handler.
     NoHandlerRegistered,
     /// The handler returned an error (e.g. `*.error` reply).
     HandlerError,
@@ -32,6 +35,11 @@ pub enum ErrorCode {
     BadArity,
     /// `combinators.run` named an op outside the closed v1 set.
     UnknownOp,
+    /// `combinators.query` body shape wrong (missing fields, wrong types).
+    MalformedQuery,
+    /// Owner's reply `outputs[].type` multiset did not equal the registered
+    /// output multiset.
+    HandlerOutputMismatch,
 }
 
 impl ErrorCode {
@@ -41,11 +49,14 @@ impl ErrorCode {
             Self::UnknownTrait => "unknown_trait",
             Self::TypeNotDeclared => "type_not_declared",
             Self::MalformedEntry => "malformed_entry",
+            Self::EmptyOutputMultiset => "empty_output_multiset",
             Self::NoHandlerRegistered => "no_handler_registered",
             Self::HandlerError => "handler_error",
             Self::HandlerTimeout => "handler_timeout",
             Self::BadArity => "bad_arity",
             Self::UnknownOp => "unknown_op",
+            Self::MalformedQuery => "malformed_query",
+            Self::HandlerOutputMismatch => "handler_output_mismatch",
         }
     }
 }
@@ -98,6 +109,24 @@ pub enum CombinatorsError {
         message: String,
     },
 
+    /// A `combinators.query` payload was structurally invalid.
+    #[error("query rejected: {code}: {message}")]
+    QueryRejected {
+        /// Wire error code.
+        code: ErrorCode,
+        /// Human diagnostic.
+        message: String,
+    },
+
+    /// A `combinators.invoke` payload was structurally invalid.
+    #[error("invoke rejected: {code}: {message}")]
+    InvokeRejected {
+        /// Wire error code.
+        code: ErrorCode,
+        /// Human diagnostic.
+        message: String,
+    },
+
     /// Handler reported an error by wire (`*.error` reply).
     #[error("handler reported error: {0}")]
     Handler(String),
@@ -113,6 +142,10 @@ mod tests {
         assert_eq!(ErrorCode::TypeNotDeclared.as_wire(), "type_not_declared");
         assert_eq!(ErrorCode::MalformedEntry.as_wire(), "malformed_entry");
         assert_eq!(
+            ErrorCode::EmptyOutputMultiset.as_wire(),
+            "empty_output_multiset"
+        );
+        assert_eq!(
             ErrorCode::NoHandlerRegistered.as_wire(),
             "no_handler_registered"
         );
@@ -120,6 +153,11 @@ mod tests {
         assert_eq!(ErrorCode::HandlerTimeout.as_wire(), "handler_timeout");
         assert_eq!(ErrorCode::BadArity.as_wire(), "bad_arity");
         assert_eq!(ErrorCode::UnknownOp.as_wire(), "unknown_op");
+        assert_eq!(ErrorCode::MalformedQuery.as_wire(), "malformed_query");
+        assert_eq!(
+            ErrorCode::HandlerOutputMismatch.as_wire(),
+            "handler_output_mismatch"
+        );
     }
 
     #[test]

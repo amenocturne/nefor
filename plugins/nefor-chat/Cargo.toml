@@ -25,5 +25,14 @@ tracing-subscriber = { workspace = true }
 # unicode-correct width calculation when wrapping transcript lines.
 unicode-width = "0.2"
 
+# Markdown parser for assistant messages. CommonMark-compatible event-driven
+# parser; we walk events to emit (text, hl_id) spans rather than rendering to
+# HTML.
+pulldown-cmark = { version = "0.13", default-features = false }
+
+# UUID v4 generation for the `/dag-test` smoke command's `run_id`. dag-scheduler
+# already pulls v1 with the `v4` feature so resolution is a no-op.
+uuid = { version = "1", features = ["v4"] }
+
 [dev-dependencies]
 serde_json = { workspace = true }

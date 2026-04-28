@@ -11,17 +11,40 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::Frame;
 
 use crate::grid::{DefaultColors, Grid, HlAttr, HlTable};
+use crate::selection::{col_range_for_row, Selection};
+use crate::HL_SELECTION;
 
 /// Draw the grid and position the hardware cursor.
-pub fn draw(frame: &mut Frame<'_>, grid: &Grid, hl: &HlTable, defaults: &DefaultColors) {
+///
+/// `selection`, when present, overlays HL_SELECTION on the cells inside the
+/// selection rect — the canonical grid is left intact (a follow-up render
+/// without a selection should restore the original highlights), so the
+/// overlay is computed at draw time per cell.
+pub fn draw(
+    frame: &mut Frame<'_>,
+    grid: &Grid,
+    hl: &HlTable,
+    defaults: &DefaultColors,
+    selection: Option<&Selection>,
+) {
     let area = frame.area();
     let buf = frame.buffer_mut();
 
     let rows = grid.height().min(area.height);
     let cols = grid.width().min(area.width);
 
+    // Pre-compute the selection rect once so the per-cell overlay check is a
+    // simple range comparison rather than a function call per cell.
+    let sel_rect = selection.map(|s| s.normalized());
+
     for r in 0..rows {
         let row_cells = grid.row(r);
+        // For each visible row, work out the column band (if any) that falls
+        // inside the selection rect. Returned as `[start, end)`.
+        let row_sel_band = sel_rect
+            .and_then(|(top, left, bottom, right)| {
+                col_range_for_row(r, top, left, bottom, right, cols)
+            });
         let mut c: u16 = 0;
         while c < cols {
             let cell = &row_cells[usize::from(c)];
@@ -31,7 +54,18 @@ pub fn draw(frame: &mut Frame<'_>, grid: &Grid, hl: &HlTable, defaults: &Default
                 c += 1;
                 continue;
             }
-            let style = attr_to_style(hl.get(cell.hl_id), defaults);
+            // Pick the active hl: HL_SELECTION inside the selection band,
+            // the cell's own highlight otherwise. This is a draw-time
+            // overlay only — `cell.hl_id` is not mutated.
+            let in_selection = row_sel_band
+                .map(|(start, end)| c >= start && c < end)
+                .unwrap_or(false);
+            let attr = if in_selection {
+                hl.get(HL_SELECTION)
+            } else {
+                hl.get(cell.hl_id)
+            };
+            let style = attr_to_style(attr, defaults);
             let x = area.x + c;
             let y = area.y + r;
             if !inside(area, x, y) {

@@ -1,0 +1,24 @@
+[package]
+name = "generic-tool"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NCP v0.1 plugin: type-registry hub for the canonical tool protocol. Owns generic-tool.{ToolCalls, ToolResults}; concrete tool plugins (basic-tools, mock-plugin, ...) declare Into/From against these tags via nefor-combinators. Sibling to generic-provider — same passive-hub shape, different role."
+
+[[bin]]
+name = "generic-tool"
+path = "src/main.rs"
+
+[dependencies]
+nefor-protocol = { path = "../../crates/nefor-protocol" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }

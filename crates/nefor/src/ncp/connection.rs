@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::ncp::transport::{ExitOutcome, ExitWatcher};
@@ -149,30 +149,20 @@ async fn read_line_capped<R: AsyncRead + Unpin>(
     out: &mut String,
     max: usize,
 ) -> std::io::Result<ReadLine> {
+    use tokio::io::AsyncBufReadExt;
+
+    // `read_until` honors the BufReader's internal 64 KiB buffer — single
+    // syscall per buffer-fill, then byte scans in user space. The previous
+    // implementation called `read_exact` one byte at a time, which defeated
+    // the buffer (per-byte poll wake-up + tokio runtime crossings) and
+    // showed up as visible typing latency on the keystroke→render path.
     let mut buf = Vec::with_capacity(256);
-    loop {
-        let mut byte = [0u8; 1];
-        let n = reader.read_exact(&mut byte).await.map(|_| 1).or_else(|e| {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                Ok(0)
-            } else {
-                Err(e)
-            }
-        })?;
-        if n == 0 {
-            if buf.is_empty() {
-                return Ok(ReadLine::Ok(0));
-            }
-            break;
-        }
-        if byte[0] == b'\n' {
-            buf.push(byte[0]);
-            break;
-        }
-        if buf.len() + 1 > max {
-            return Ok(ReadLine::TooLong);
-        }
-        buf.push(byte[0]);
+    let n = reader.read_until(b'\n', &mut buf).await?;
+    if n == 0 {
+        return Ok(ReadLine::Ok(0));
+    }
+    if buf.len() > max {
+        return Ok(ReadLine::TooLong);
     }
     match String::from_utf8(buf) {
         Ok(s) => {
