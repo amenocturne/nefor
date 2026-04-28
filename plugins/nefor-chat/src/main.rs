@@ -261,6 +261,7 @@ fn handle_event(map: &Map<String, Value>, state: &mut ChatState) -> Action {
             // previous session. The producer guarantees `entries` is
             // already in chronological order.
             state.transcript.clear();
+            state.bump_transcript_version();
             let mut count = 0usize;
             if let Some(arr) = map.get("entries").and_then(Value::as_array) {
                 for e in arr {

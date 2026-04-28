@@ -229,6 +229,10 @@ pub struct ChatState {
     /// drives whether the statusline shows real values or `—` placeholders
     /// for absent fields.
     pub metadata: SessionMetadata,
+    /// Monotonic counter bumped whenever the transcript or `pending` flag
+    /// mutates. The renderer reads this to skip an expensive re-wrap +
+    /// markdown re-parse when only the input buffer has changed (typing).
+    pub transcript_version: u64,
 }
 
 impl Default for ChatState {
@@ -248,7 +252,16 @@ impl ChatState {
             tui_ready: false,
             pending: false,
             metadata: SessionMetadata::default(),
+            transcript_version: 0,
         }
+    }
+
+    /// Bump the transcript-version counter. Call after any direct mutation
+    /// to `transcript` that bypasses the helper methods (`push_entry`,
+    /// `append_assistant_delta`, `finalize_assistant`). Required for the
+    /// renderer's wrap+markdown cache to correctly invalidate.
+    pub fn bump_transcript_version(&mut self) {
+        self.transcript_version = self.transcript_version.wrapping_add(1);
     }
 
     // `#[allow(dead_code)]` here — as for `clear`/`clamp_scroll` below —
@@ -261,18 +274,21 @@ impl ChatState {
     #[allow(dead_code)]
     pub fn begin_turn(&mut self) {
         self.pending = true;
+        self.bump_transcript_version();
     }
 
     /// Mark the in-flight turn as finished. Called on `chat.stream.end`.
     #[allow(dead_code)]
     pub fn end_turn(&mut self) {
         self.pending = false;
+        self.bump_transcript_version();
     }
 
     /// Append a finished entry (user prompt, system line).
     pub fn push_entry(&mut self, role: Role, text: String) {
         self.transcript.push(TranscriptEntry::new(role, text));
         self.reset_scroll();
+        self.bump_transcript_version();
     }
 
     /// Append a chunk of streaming assistant text. Creates a new streaming
@@ -283,6 +299,7 @@ impl ChatState {
             if last.role == Role::Assistant && last.streaming {
                 last.text.push_str(chunk);
                 self.reset_scroll();
+                self.bump_transcript_version();
                 return;
             }
         }
@@ -292,6 +309,7 @@ impl ChatState {
             streaming: true,
         });
         self.reset_scroll();
+        self.bump_transcript_version();
     }
 
     /// Finalize the open streaming assistant entry.
@@ -310,6 +328,7 @@ impl ChatState {
                 }
                 last.streaming = false;
                 self.reset_scroll();
+                self.bump_transcript_version();
                 return;
             }
         }
@@ -320,6 +339,7 @@ impl ChatState {
                 streaming: false,
             });
             self.reset_scroll();
+            self.bump_transcript_version();
         }
     }
 

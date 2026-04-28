@@ -14,10 +14,66 @@
 //! a span sequence into one cell per grapheme so the renderer can pick up
 //! markdown bold/italic/code styling without a separate "rich-text" event.
 
+use std::cell::RefCell;
+
 use serde_json::{Map, Value};
 
 use crate::state::{ChatState, Role, SessionMetadata, TranscriptEntry};
 use crate::wrap::{char_width, str_width, wrap_to_width};
+
+// Thread-local cache for the wrapped+markdown-rendered transcript. Reused
+// across renders that don't change `transcript_version` (e.g. keystrokes
+// in the input buffer). Pulldown-cmark + per-line wrap is the dominant
+// per-frame cost; without this every keypress re-parses every assistant
+// message, producing visible typing latency on non-trivial transcripts.
+thread_local! {
+    static TRANSCRIPT_CACHE: RefCell<Option<TranscriptCache>> = const { RefCell::new(None) };
+}
+
+struct TranscriptCache {
+    version: u64,
+    cols: u32,
+    pending: bool,
+    lines: Vec<Line>,
+}
+
+/// Compute the wrapped + markdown-parsed transcript lines, consulting the
+/// thread-local cache. Cache key = `(transcript_version, cols, pending)`.
+/// Misses recompute and store; hits clone the cached `Vec<Line>` (cheap
+/// compared to a markdown re-parse of the entire transcript).
+fn wrapped_with_cache(state: &ChatState, cols: u32) -> Vec<Line> {
+    let pending = state.pending && !last_is_streaming_assistant(&state.transcript);
+
+    let hit = TRANSCRIPT_CACHE.with(|cell| {
+        let c = cell.borrow();
+        c.as_ref()
+            .filter(|c| {
+                c.version == state.transcript_version && c.cols == cols && c.pending == pending
+            })
+            .map(|c| c.lines.clone())
+    });
+    if let Some(lines) = hit {
+        return lines;
+    }
+
+    let mut wrapped = wrap_transcript(&state.transcript, cols as usize);
+    if pending {
+        for line in wrap_to_width("[claude is thinking...]", cols as usize) {
+            wrapped.push(vec![Span::new(line, HL_SYSTEM)]);
+        }
+    }
+
+    TRANSCRIPT_CACHE.with(|cell| {
+        *cell.borrow_mut() = Some(TranscriptCache {
+            version: state.transcript_version,
+            cols,
+            pending,
+            lines: wrapped.clone(),
+        });
+    });
+
+    wrapped
+}
 
 // ---- palette ---------------------------------------------------------------
 //
@@ -171,12 +227,7 @@ pub fn render_frame(state: &ChatState) -> Vec<Map<String, Value>> {
 
     out.push(grid_clear());
 
-    let mut wrapped = wrap_transcript(&state.transcript, cols as usize);
-    if state.pending && !last_is_streaming_assistant(&state.transcript) {
-        for line in wrap_to_width("[claude is thinking...]", cols as usize) {
-            wrapped.push(vec![Span::new(line, HL_SYSTEM)]);
-        }
-    }
+    let wrapped = wrapped_with_cache(state, cols);
     let total = wrapped.len() as u32;
 
     let max_offset = total.saturating_sub(transcript_rows);
