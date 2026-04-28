@@ -61,16 +61,16 @@ fn row_hl(row: &serde_json::Map<String, Value>) -> u64 {
 fn empty_transcript_empty_input_produces_clear_blanks_and_cursor() {
     let s = new_state(10, 3);
     let events = render_frame(&s);
-    // rows = 3 → 1 transcript row + 1 status + 1 input. Expected sequence:
-    // clear + 1 transcript blank + 1 status + 1 input + cursor + flush = 6.
+    // rows = 3 → row 0 transcript blank · row 1 input · row 2 status. Order
+    // emitted: clear · transcript · input · status · cursor · flush = 6.
     assert_eq!(events.len(), 6);
     assert_eq!(
         events[0]["kind"],
         Value::String("nefor-tui.grid.clear".into())
     );
-    assert_eq!(events[1]["row"], Value::Number(0u32.into()));
-    assert_eq!(events[2]["row"], Value::Number(1u32.into()));
-    assert_eq!(events[3]["row"], Value::Number(2u32.into()));
+    assert_eq!(events[1]["row"], Value::Number(0u32.into())); // transcript
+    assert_eq!(events[2]["row"], Value::Number(1u32.into())); // input
+    assert_eq!(events[3]["row"], Value::Number(2u32.into())); // status
     assert_eq!(
         events[4]["kind"],
         Value::String("nefor-tui.grid.cursor_goto".into())
@@ -101,13 +101,13 @@ fn user_then_assistant_pair_layout() {
     assert_eq!(row_hl(lines[1]), HL_ASSISTANT as u64);
     // Row 2: blank transcript tail (hl 0 / default).
     assert_eq!(row_text(lines[2]), " ");
-    // Row 3: status bar — no metadata wired yet, so it renders the dim "—".
-    let status_text = row_text(lines[3]);
+    // Row 3 (input): "> " + empty.
+    assert_eq!(row_text(lines[3]), "> ");
+    assert_eq!(row_hl(lines[3]), HL_INPUT as u64);
+    // Row 4 (status, bottom): no metadata wired yet → dim "—".
+    let status_text = row_text(lines[4]);
     assert!(status_text.contains("—"), "status_text: {status_text:?}");
-    assert_eq!(row_hl(lines[3]), HL_STATUS_DIM as u64);
-    // Row 4 (input): "> " + empty.
-    assert_eq!(row_text(lines[4]), "> ");
-    assert_eq!(row_hl(lines[4]), HL_INPUT as u64);
+    assert_eq!(row_hl(lines[4]), HL_STATUS_DIM as u64);
 }
 
 #[test]
@@ -136,11 +136,13 @@ fn input_longer_than_cols_wraps_to_multiple_rows() {
     }
     let events = render_frame(&s);
 
+    // Layout 5 rows, input wraps to 3 lines: row 0 transcript · rows 1-3
+    // input · row 4 status. First input row is row 1, last is row 3 (cursor).
     let row_first = events
         .iter()
         .find(|e| {
             e["kind"] == Value::String("nefor-tui.grid.line".into())
-                && e["row"] == Value::Number(2u32.into())
+                && e["row"] == Value::Number(1u32.into())
         })
         .expect("first input row");
     assert_eq!(row_text(row_first), "> abcdefgh");
@@ -149,7 +151,7 @@ fn input_longer_than_cols_wraps_to_multiple_rows() {
         .iter()
         .find(|e| e["kind"] == Value::String("nefor-tui.grid.cursor_goto".into()))
         .expect("cursor_goto");
-    assert_eq!(goto["row"], Value::Number(4u32.into()));
+    assert_eq!(goto["row"], Value::Number(3u32.into()));
     assert_eq!(goto["col"], Value::Number(2u32.into()));
 }
 
@@ -306,11 +308,11 @@ fn statusline_uses_status_hl_for_real_metadata() {
     s.metadata.model = Some("claude-opus-4-7".into());
     let events = render_frame(&s);
     let lines = find_line_events(&events);
-    // status row index = 4 (0..3 transcript, 4 status, 5 input).
+    // Layout 6 rows: rows 0-3 transcript · row 4 input · row 5 status (bottom).
     let status_row = lines
         .iter()
-        .find(|r| r["row"] == Value::Number(4u32.into()))
-        .expect("status row at row=4");
+        .find(|r| r["row"] == Value::Number(5u32.into()))
+        .expect("status row at row=5");
     // First cell carries the model name and `HL_STATUS` (not the dim dash).
     assert_eq!(row_hl(status_row), HL_STATUS as u64);
     assert!(row_text(status_row).starts_with("opus-4-7"));

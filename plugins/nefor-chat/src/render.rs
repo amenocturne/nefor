@@ -249,6 +249,16 @@ pub fn render_frame(state: &ChatState) -> Vec<Map<String, Value>> {
         }
     }
 
+    for i in 0..input_height {
+        let src_idx = (input_scroll + i) as usize;
+        let text = input_lines.get(src_idx).map(String::as_str).unwrap_or("");
+        out.push(grid_line(
+            input_start_row + i,
+            cols,
+            &[Span::new(text, HL_INPUT)],
+        ));
+    }
+
     if status_height > 0 {
         let spans = build_status_spans(
             &state.metadata,
@@ -260,15 +270,6 @@ pub fn render_frame(state: &ChatState) -> Vec<Map<String, Value>> {
         out.push(grid_line(status_row, cols, &spans));
     }
 
-    for i in 0..input_height {
-        let src_idx = (input_scroll + i) as usize;
-        let text = input_lines.get(src_idx).map(String::as_str).unwrap_or("");
-        out.push(grid_line(
-            input_start_row + i,
-            cols,
-            &[Span::new(text, HL_INPUT)],
-        ));
-    }
     out.push(grid_cursor_goto(
         input_start_row + cursor_line_visible,
         cursor_col,
