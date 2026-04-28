@@ -89,10 +89,10 @@ impl LuaHost {
         // for bundled Lua modules) without `debug.getinfo`. mlua's safe
         // stdlib subset omits `debug`.
         if let Some(parent) = path.parent() {
-            let _ = self.lua.globals().set(
-                "NEFOR_CONFIG_DIR",
-                parent.display().to_string(),
-            );
+            let _ = self
+                .lua
+                .globals()
+                .set("NEFOR_CONFIG_DIR", parent.display().to_string());
         }
 
         match self.lua.load(&src).set_name(chunk_name).exec() {
