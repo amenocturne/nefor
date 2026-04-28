@@ -1,12 +1,21 @@
 //! nefor-chat — chat UI plugin for nefor.
 //!
-//! Bridges [mock-plugin](../mock-plugin/) (Claude Code wrapper) and
+//! Bridges any [`chat-contract v0.1`] producer (e.g. mock-plugin) and
 //! [nefor-tui](../nefor-tui/) (cell-grid renderer) over NCP v0.1.
-//! Owns chat-layer state — transcript, input buffer, scroll offset — and
-//! translates both sides into grid mutations published on the bus.
+//! Owns chat-layer state — transcript, input buffer, scroll offset, session
+//! metadata — and translates both sides into grid mutations published on
+//! the bus.
 //!
 //! The plugin never touches the terminal directly; every rendering concern
-//! is expressed as a `nefor-tui.*` event.
+//! is expressed as a `nefor-tui.*` event. Inputs are consumed exclusively as
+//! `chat.*` events; the starter Lua config is responsible for renaming any
+//! producer-specific event names (e.g. `cc.*`) into the chat contract before
+//! they hit this plugin.
+//!
+//! [`chat-contract v0.1`]: required `chat.message.append`, `chat.stream.delta`,
+//! `chat.stream.end`; optional `chat.session.stats`, `chat.tool.start`,
+//! `chat.tool.end`, `chat.history.replay`. User → harness:
+//! `chat.input.submit`.
 
 mod error;
 mod ncp;
@@ -104,24 +113,24 @@ async fn run() -> Result<(), ChatError> {
             Action::SubmitPrompt(text) => {
                 // Slash-commands are handled locally instead of being sent
                 // as a prompt. For `/resume` we don't push a confirmation
-                // entry here — mock-plugin responds with `cc.history.replay`
+                // entry here — the harness responds with `chat.history.replay`
                 // which clears the transcript and populates it with the
                 // stored conversation. Regular text follows the normal
-                // cc.prompt path.
+                // `chat.input.submit` path.
                 match parse_command(&text) {
                     Some(Command::ResumeRecent) => {
-                        send_event(&out_tx, cc_resume_body(None)).await?;
+                        send_event(&out_tx, resume_body(None)).await?;
                     }
                     Some(Command::ResumeSpecific(id)) => {
-                        send_event(&out_tx, cc_resume_body(Some(&id))).await?;
+                        send_event(&out_tx, resume_body(Some(&id))).await?;
                     }
                     None => {
                         // Register the user turn locally before shipping the
-                        // `cc.prompt` — keeps the transcript and the outgoing
+                        // submit event — keeps the transcript and the outgoing
                         // event in the same logical beat.
                         state.push_entry(Role::User, text.clone());
                         state.begin_turn();
-                        send_event(&out_tx, cc_prompt_body(&text)).await?;
+                        send_event(&out_tx, input_submit_body(&text)).await?;
                     }
                 }
                 if state.tui_ready {
@@ -148,7 +157,7 @@ enum Action {
     Continue,
     /// State changed in a way that demands a redraw.
     Render,
-    /// The user hit Enter — flush the buffer as a `cc.prompt` and render.
+    /// The user hit Enter — flush the buffer as a `chat.input.submit` and render.
     SubmitPrompt(String),
     /// Engine signalled shutdown — exit cleanly.
     Shutdown,
@@ -194,8 +203,24 @@ fn handle_event(map: &Map<String, Value>, state: &mut ChatState) -> Action {
             }
         }
         "nefor-tui.input.mouse" => handle_mouse(map, state),
-        // ---- mock-plugin output path ---------------------------------
-        "cc.stream.delta" => {
+        // ---- chat-contract v0.1 input path --------------------------
+        "chat.message.append" => {
+            let Some(role_str) = map.get("role").and_then(Value::as_str) else {
+                return Action::Continue;
+            };
+            let Some(text) = map.get("text").and_then(Value::as_str) else {
+                return Action::Continue;
+            };
+            let role = match role_str {
+                "user" => Role::User,
+                "assistant" => Role::Assistant,
+                "system" => Role::System,
+                _ => return Action::Continue,
+            };
+            state.push_entry(role, text.to_owned());
+            Action::Render
+        }
+        "chat.stream.delta" => {
             if let Some(t) = map.get("text").and_then(Value::as_str) {
                 state.append_assistant_delta(t);
                 Action::Render
@@ -203,41 +228,38 @@ fn handle_event(map: &Map<String, Value>, state: &mut ChatState) -> Action {
                 Action::Continue
             }
         }
-        "cc.stream.end" => {
+        "chat.stream.end" => {
             let authoritative = map
                 .get("text")
                 .and_then(Value::as_str)
                 .map(|s| s.to_owned());
             state.finalize_assistant(authoritative);
             state.end_turn();
-            // Persistent "done" indicator in the transcript. Prefer the
-            // cost/timing info when mock-plugin supplies it; fall back to a
-            // bare marker otherwise.
-            let marker = done_marker(map);
-            state.push_entry(Role::System, marker);
             Action::Render
         }
-        "cc.tool.start" => {
-            if let Some(name) = map.get("name").and_then(Value::as_str) {
-                state.push_entry(Role::System, format!("tool: {name}"));
-                Action::Render
-            } else {
-                Action::Continue
-            }
+        "chat.session.stats" => {
+            state.metadata.update_from(map);
+            Action::Render
         }
-        "cc.turn.error" => {
-            state.end_turn();
-            if let Some(msg) = map.get("message").and_then(Value::as_str) {
-                state.push_entry(Role::System, format!("error: {msg}"));
-                Action::Render
-            } else {
-                Action::Continue
-            }
+        "chat.tool.start" => {
+            let Some(name) = map.get("name").and_then(Value::as_str) else {
+                return Action::Continue;
+            };
+            let input = map.get("input");
+            state.push_entry(Role::System, render::tool_start_line(name, input));
+            Action::Render
         }
-        "cc.history.replay" => {
+        "chat.tool.end" => {
+            // Tool output rendering is reserved; for v1 we don't surface
+            // results in the transcript. Acknowledge the event so callers
+            // know it was consumed.
+            tracing::debug!(?map, "chat.tool.end (no-op v1)");
+            Action::Continue
+        }
+        "chat.history.replay" => {
             // Replace the transcript with stored-on-disk history from a
-            // previous session. mock-plugin guarantees `entries` is already
-            // in chronological order.
+            // previous session. The producer guarantees `entries` is
+            // already in chronological order.
             state.transcript.clear();
             let mut count = 0usize;
             if let Some(arr) = map.get("entries").and_then(Value::as_array) {
@@ -265,10 +287,6 @@ fn handle_event(map: &Map<String, Value>, state: &mut ChatState) -> Action {
                 format!("resumed · {count} messages · session {session}"),
             );
             Action::Render
-        }
-        "cc.hello" | "cc.ready" | "cc.goodbye" => {
-            tracing::debug!(kind, "mock-plugin lifecycle event (no-op on UI)");
-            Action::Continue
         }
         _ => Action::Continue,
     }
@@ -327,7 +345,7 @@ fn handle_key(map: &Map<String, Value>, state: &mut ChatState) -> Action {
             Action::Render
         }
         "escape" => {
-            // v1: no-op on UI. Future: emit cc.interrupt.
+            // v1: no-op on UI. Future: emit a chat-layer interrupt event.
             Action::Continue
         }
         // Printable keys. nefor-tui forwards single-char key strings for
@@ -376,20 +394,6 @@ fn handle_mouse(map: &Map<String, Value>, state: &mut ChatState) -> Action {
             Action::Render
         }
         _ => Action::Continue,
-    }
-}
-
-/// Build the persistent "done" line appended after a turn finishes. Picks
-/// the most informative subset from the `cc.stream.end` payload that is
-/// present — `duration_ms` is strongly preferred since it answers the
-/// "was that fast or slow?" question directly.
-fn done_marker(map: &Map<String, Value>) -> String {
-    let duration = map.get("duration_ms").and_then(Value::as_u64);
-    let num_turns = map.get("num_turns").and_then(Value::as_u64);
-    match (duration, num_turns) {
-        (Some(ms), Some(n)) if n > 1 => format!("done in {ms}ms / {n} turns"),
-        (Some(ms), _) => format!("done in {ms}ms"),
-        (None, _) => "done".into(),
     }
 }
 
@@ -449,16 +453,16 @@ fn goodbye_body() -> Map<String, Value> {
     m
 }
 
-fn cc_prompt_body(text: &str) -> Map<String, Value> {
+fn input_submit_body(text: &str) -> Map<String, Value> {
     let mut m = Map::new();
-    m.insert("kind".into(), Value::String("cc.prompt".into()));
+    m.insert("kind".into(), Value::String("chat.input.submit".into()));
     m.insert("text".into(), Value::String(text.to_owned()));
     m
 }
 
-fn cc_resume_body(session_id: Option<&str>) -> Map<String, Value> {
+fn resume_body(session_id: Option<&str>) -> Map<String, Value> {
     let mut m = Map::new();
-    m.insert("kind".into(), Value::String("cc.resume".into()));
+    m.insert("kind".into(), Value::String("chat.resume".into()));
     if let Some(id) = session_id {
         m.insert("session_id".into(), Value::String(id.to_owned()));
     }
@@ -467,7 +471,7 @@ fn cc_resume_body(session_id: Option<&str>) -> Map<String, Value> {
 
 /// Parse a slash-command submitted via the input line. Returns `None` if
 /// the text isn't a recognised command, so the caller falls through to the
-/// usual `cc.prompt` path.
+/// usual `chat.input.submit` path.
 ///
 /// Grammar is deliberately minimal: `/resume` and `/resume <session-id>`.
 /// Everything else is treated as a regular prompt — we don't surface an
@@ -480,8 +484,8 @@ fn parse_command(text: &str) -> Option<Command> {
     if rest.is_empty() {
         Some(Command::ResumeRecent)
     } else {
-        // Accept everything after /resume as the session-id; mock-plugin
-        // will validate and surface a turn_error if it's not a UUID.
+        // Accept everything after /resume as the session-id; the harness
+        // validates it and surfaces an error if invalid.
         Some(Command::ResumeSpecific(rest.to_owned()))
     }
 }
@@ -617,10 +621,10 @@ mod tests {
     }
 
     #[test]
-    fn cc_stream_delta_appends_assistant() {
+    fn chat_stream_delta_appends_assistant() {
         let mut s = ChatState::new();
         let env = event_env(json!({
-            "kind": "cc.stream.delta",
+            "kind": "chat.stream.delta",
             "text": "hello",
         }));
         handle_envelope(env, &mut s);
@@ -631,14 +635,14 @@ mod tests {
     }
 
     #[test]
-    fn cc_stream_end_finalizes_assistant() {
+    fn chat_stream_end_finalizes_assistant() {
         let mut s = ChatState::new();
         handle_envelope(
-            event_env(json!({"kind":"cc.stream.delta","text":"partial"})),
+            event_env(json!({"kind":"chat.stream.delta","text":"partial"})),
             &mut s,
         );
         handle_envelope(
-            event_env(json!({"kind":"cc.stream.end","text":"FINAL"})),
+            event_env(json!({"kind":"chat.stream.end","text":"FINAL"})),
             &mut s,
         );
         assert_eq!(s.transcript[0].text, "FINAL");
@@ -646,47 +650,56 @@ mod tests {
     }
 
     #[test]
-    fn cc_stream_end_without_text_keeps_deltas() {
+    fn chat_stream_end_without_text_keeps_deltas() {
         let mut s = ChatState::new();
         handle_envelope(
-            event_env(json!({"kind":"cc.stream.delta","text":"keep"})),
+            event_env(json!({"kind":"chat.stream.delta","text":"keep"})),
             &mut s,
         );
-        handle_envelope(event_env(json!({"kind":"cc.stream.end"})), &mut s);
+        handle_envelope(event_env(json!({"kind":"chat.stream.end"})), &mut s);
         assert_eq!(s.transcript[0].text, "keep");
         assert!(!s.transcript[0].streaming);
     }
 
     #[test]
-    fn cc_tool_start_appends_system_entry() {
+    fn chat_tool_start_appends_system_entry() {
         let mut s = ChatState::new();
         handle_envelope(
-            event_env(json!({"kind":"cc.tool.start","name":"read"})),
+            event_env(json!({"kind":"chat.tool.start","name":"Read","input":{"file_path":"/a"}})),
             &mut s,
         );
         assert_eq!(s.transcript[0].role, Role::System);
-        assert_eq!(s.transcript[0].text, "tool: read");
+        assert!(s.transcript[0].text.contains("Read"));
+        assert!(s.transcript[0].text.contains("/a"));
     }
 
     #[test]
-    fn cc_turn_error_appends_system_entry() {
+    fn chat_message_append_pushes_entry() {
         let mut s = ChatState::new();
         handle_envelope(
-            event_env(json!({"kind":"cc.turn.error","message":"boom"})),
+            event_env(json!({"kind":"chat.message.append","role":"user","text":"hi"})),
             &mut s,
         );
-        assert_eq!(s.transcript[0].role, Role::System);
-        assert_eq!(s.transcript[0].text, "error: boom");
+        assert_eq!(s.transcript[0].role, Role::User);
+        assert_eq!(s.transcript[0].text, "hi");
     }
 
     #[test]
-    fn cc_hello_and_ready_are_noop_on_ui() {
+    fn chat_session_stats_updates_metadata() {
         let mut s = ChatState::new();
-        let a = handle_envelope(event_env(json!({"kind":"cc.hello"})), &mut s);
-        assert!(matches!(a, Action::Continue));
-        let a = handle_envelope(event_env(json!({"kind":"cc.ready"})), &mut s);
-        assert!(matches!(a, Action::Continue));
-        assert!(s.transcript.is_empty());
+        handle_envelope(
+            event_env(json!({
+                "kind":"chat.session.stats",
+                "model":"claude-opus-4-7",
+                "turns": 3,
+                "cumulative_cost_usd": 0.42,
+            })),
+            &mut s,
+        );
+        assert!(s.metadata.stats_seen);
+        assert_eq!(s.metadata.model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(s.metadata.turns, Some(3));
+        assert_eq!(s.metadata.cumulative_cost_usd, Some(0.42));
     }
 
     #[test]
@@ -770,22 +783,22 @@ mod tests {
     }
 
     #[test]
-    fn cc_prompt_body_carries_text() {
-        let b = cc_prompt_body("go");
-        assert_eq!(b["kind"], Value::String("cc.prompt".into()));
+    fn input_submit_body_carries_text() {
+        let b = input_submit_body("go");
+        assert_eq!(b["kind"], Value::String("chat.input.submit".into()));
         assert_eq!(b["text"], Value::String("go".into()));
     }
 
     #[test]
-    fn cc_resume_body_without_id_omits_field() {
-        let b = cc_resume_body(None);
-        assert_eq!(b["kind"], Value::String("cc.resume".into()));
+    fn resume_body_without_id_omits_field() {
+        let b = resume_body(None);
+        assert_eq!(b["kind"], Value::String("chat.resume".into()));
         assert!(b.get("session_id").is_none());
     }
 
     #[test]
-    fn cc_resume_body_with_id_includes_field() {
-        let b = cc_resume_body(Some("abc"));
+    fn resume_body_with_id_includes_field() {
+        let b = resume_body(Some("abc"));
         assert_eq!(b["session_id"], Value::String("abc".into()));
     }
 

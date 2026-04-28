@@ -11,7 +11,7 @@ pub enum Role {
     User,
     /// Claude's reply text, including streaming deltas.
     Assistant,
-    /// Diagnostic lines (tool starts, errors, mock-plugin meta).
+    /// Diagnostic lines (tool starts, errors, harness meta).
     System,
 }
 
@@ -25,7 +25,7 @@ pub struct TranscriptEntry {
     /// Raw body text. Plain (no markdown) per the v1 scope.
     pub text: String,
     /// If `true`, the assistant entry is still receiving deltas. Only ever
-    /// set for [`Role::Assistant`]. `cc.stream.end` flips this to `false`.
+    /// set for [`Role::Assistant`]. `chat.stream.end` flips this to `false`.
     pub streaming: bool,
 }
 
@@ -126,6 +126,67 @@ impl InputBuffer {
     }
 }
 
+/// Session-wide telemetry surfaced on the statusline.
+///
+/// All fields are optional — producers populate whichever subset they have.
+/// `stats_seen` flips to `true` the first time any `chat.session.stats`
+/// event arrives, even if every field is absent: it's the signal that "no
+/// stats provider is wired" (vs. "wired but values not yet known").
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionMetadata {
+    pub model: Option<String>,
+    pub turns: Option<u64>,
+    pub cumulative_cost_usd: Option<f64>,
+    pub cumulative_input_tokens: Option<u64>,
+    pub cumulative_output_tokens: Option<u64>,
+    pub cumulative_cache_read: Option<u64>,
+    pub cumulative_cache_creation: Option<u64>,
+    pub last_turn_duration_ms: Option<u64>,
+    pub stats_seen: bool,
+}
+
+impl SessionMetadata {
+    /// Merge a `chat.session.stats` body into this state.
+    ///
+    /// Each field present in `body` overwrites the current value; absent
+    /// fields are preserved. Always sets `stats_seen = true`.
+    //
+    // `#[allow(dead_code)]`: integration tests `#[path]`-include state.rs
+    // but never reach `main.rs`, where this is invoked.
+    #[allow(dead_code)]
+    pub fn update_from(&mut self, body: &serde_json::Map<String, serde_json::Value>) {
+        use serde_json::Value;
+        self.stats_seen = true;
+        if let Some(s) = body.get("model").and_then(Value::as_str) {
+            self.model = Some(s.to_owned());
+        }
+        if let Some(n) = body.get("turns").and_then(Value::as_u64) {
+            self.turns = Some(n);
+        }
+        if let Some(n) = body.get("cumulative_cost_usd").and_then(Value::as_f64) {
+            self.cumulative_cost_usd = Some(n);
+        }
+        if let Some(n) = body.get("cumulative_input_tokens").and_then(Value::as_u64) {
+            self.cumulative_input_tokens = Some(n);
+        }
+        if let Some(n) = body.get("cumulative_output_tokens").and_then(Value::as_u64) {
+            self.cumulative_output_tokens = Some(n);
+        }
+        if let Some(n) = body.get("cumulative_cache_read").and_then(Value::as_u64) {
+            self.cumulative_cache_read = Some(n);
+        }
+        if let Some(n) = body
+            .get("cumulative_cache_creation")
+            .and_then(Value::as_u64)
+        {
+            self.cumulative_cache_creation = Some(n);
+        }
+        if let Some(n) = body.get("last_turn_duration_ms").and_then(Value::as_u64) {
+            self.last_turn_duration_ms = Some(n);
+        }
+    }
+}
+
 /// Terminal dimensions the plugin has been told about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dims {
@@ -159,10 +220,15 @@ pub struct ChatState {
     /// `false` until we've seen `nefor-tui.ready`. No rendering happens
     /// before this flips.
     pub tui_ready: bool,
-    /// True between `cc.prompt` dispatch and `cc.stream.end`/`cc.turn.error`.
+    /// True between `chat.input.submit` dispatch and `chat.stream.end`.
     /// Renderer injects a "[claude is thinking...]" row while this is set
     /// *and* no assistant entry has started streaming yet.
     pub pending: bool,
+    /// Optional session telemetry — model, cost, token usage, last turn
+    /// duration. Populated from `chat.session.stats` events; `stats_seen`
+    /// drives whether the statusline shows real values or `—` placeholders
+    /// for absent fields.
+    pub metadata: SessionMetadata,
 }
 
 impl Default for ChatState {
@@ -181,6 +247,7 @@ impl ChatState {
             dims: Dims::fallback(),
             tui_ready: false,
             pending: false,
+            metadata: SessionMetadata::default(),
         }
     }
 
@@ -189,14 +256,14 @@ impl ChatState {
     // include this module but never reach `main.rs`, which is where these
     // helpers are actually called.
 
-    /// Mark a turn as in-flight. Called when the plugin ships `cc.prompt`.
+    /// Mark a turn as in-flight. Called when the plugin ships
+    /// `chat.input.submit`.
     #[allow(dead_code)]
     pub fn begin_turn(&mut self) {
         self.pending = true;
     }
 
-    /// Mark the in-flight turn as finished. Called on `cc.stream.end` or
-    /// `cc.turn.error`.
+    /// Mark the in-flight turn as finished. Called on `chat.stream.end`.
     #[allow(dead_code)]
     pub fn end_turn(&mut self) {
         self.pending = false;
@@ -230,10 +297,10 @@ impl ChatState {
     /// Finalize the open streaming assistant entry.
     ///
     /// If `final_text` is `Some`, replace the streaming entry's text with
-    /// the authoritative value (e.g. mock-plugin's `cc.stream.end.text`
+    /// the authoritative value (e.g. the harness's `chat.stream.end.text`
     /// after reconciliation). Otherwise keep whatever accumulated from
     /// deltas. If no streaming entry is open, `final_text` (if present)
-    /// is appended as a new assistant entry — so `cc.stream.end` never
+    /// is appended as a new assistant entry — so `chat.stream.end` never
     /// silently drops content.
     pub fn finalize_assistant(&mut self, final_text: Option<String>) {
         if let Some(last) = self.transcript.last_mut() {

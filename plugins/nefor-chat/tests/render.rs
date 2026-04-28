@@ -17,8 +17,11 @@ mod wrap;
 
 use serde_json::Value;
 
-use crate::render::{render_frame, HL_ASSISTANT, HL_INPUT, HL_SYSTEM, HL_USER};
-use crate::state::{ChatState, Dims, Role};
+use crate::render::{
+    build_status_spans, render_frame, tool_start_line, HL_ASSISTANT, HL_INPUT, HL_MD_BOLD,
+    HL_MD_CODE_INLINE, HL_MD_HEADING, HL_MD_ITALIC, HL_STATUS, HL_STATUS_DIM, HL_SYSTEM, HL_USER,
+};
+use crate::state::{ChatState, Dims, Role, SessionMetadata};
 
 fn new_state(cols: u32, rows: u32) -> ChatState {
     let mut s = ChatState::new();
@@ -36,9 +39,6 @@ fn find_line_events(
         .collect()
 }
 
-/// Reconstruct row text from per-character cells. Padding runs (3-element
-/// `[text, hl, repeat]` entries) are skipped so the result is the visible,
-/// unpadded content of the row.
 fn row_text(row: &serde_json::Map<String, Value>) -> String {
     let cells = row["cells"].as_array().expect("cells array");
     let mut out = String::new();
@@ -61,12 +61,8 @@ fn row_hl(row: &serde_json::Map<String, Value>) -> u64 {
 fn empty_transcript_empty_input_produces_clear_blanks_and_cursor() {
     let s = new_state(10, 3);
     let events = render_frame(&s);
-    // Expected sequence:
-    //   clear, line(row=0 blank), line(row=1 blank) [NOPE — row 0 only for
-    //   transcript; rows-1 is input], input line, cursor_goto, flush.
-    // rows = 3 → transcript_rows = 2, input_row = 2.
-    // We expect: clear + 2 transcript blank lines + 1 input line +
-    // cursor_goto + flush = 6 events.
+    // rows = 3 → 1 transcript row + 1 status + 1 input. Expected sequence:
+    // clear + 1 transcript blank + 1 status + 1 input + cursor + flush = 6.
     assert_eq!(events.len(), 6);
     assert_eq!(
         events[0]["kind"],
@@ -74,7 +70,6 @@ fn empty_transcript_empty_input_produces_clear_blanks_and_cursor() {
     );
     assert_eq!(events[1]["row"], Value::Number(0u32.into()));
     assert_eq!(events[2]["row"], Value::Number(1u32.into()));
-    // Input row.
     assert_eq!(events[3]["row"], Value::Number(2u32.into()));
     assert_eq!(
         events[4]["kind"],
@@ -100,33 +95,32 @@ fn user_then_assistant_pair_layout() {
     // Row 0: "you> hello"
     assert_eq!(row_text(lines[0]), "you> hello");
     assert_eq!(row_hl(lines[0]), HL_USER as u64);
-    // Row 1: "claude> hi there"
-    assert_eq!(row_text(lines[1]), "claude> hi there");
+    // Row 1: "claude> hi there" (markdown-rendered, prefix preserved)
+    assert!(row_text(lines[1]).starts_with("claude> "));
+    assert!(row_text(lines[1]).contains("hi there"));
     assert_eq!(row_hl(lines[1]), HL_ASSISTANT as u64);
-    // Row 2: blank transcript tail.
-    assert_eq!(row_text(lines[2]), "");
-    // Row 3: status bar — dim, contains the percentage.
-    assert!(row_text(lines[3]).contains("100%"));
-    assert_eq!(row_hl(lines[3]), 5u64); // HL_STATUS
-                                        // Row 4 (input): "> " + empty.
+    // Row 2: blank transcript tail (hl 0 / default).
+    assert_eq!(row_text(lines[2]), " ");
+    // Row 3: status bar — no metadata wired yet, so it renders the dim "—".
+    let status_text = row_text(lines[3]);
+    assert!(status_text.contains("—"), "status_text: {status_text:?}");
+    assert_eq!(row_hl(lines[3]), HL_STATUS_DIM as u64);
+    // Row 4 (input): "> " + empty.
     assert_eq!(row_text(lines[4]), "> ");
     assert_eq!(row_hl(lines[4]), HL_INPUT as u64);
 }
 
 #[test]
 fn scrolled_state_shows_older_rows() {
-    // rows=5 → transcript height = 3 (1 input + 1 status reserved).
     let mut s = new_state(20, 5);
     for i in 0..8 {
         s.push_entry(Role::User, format!("msg {i}"));
     }
-    // scroll_offset = 0 → last 3 rows (msg 5..7) visible.
     let events = render_frame(&s);
     let lines = find_line_events(&events);
     assert_eq!(row_text(lines[0]), "you> msg 5");
     assert_eq!(row_text(lines[2]), "you> msg 7");
 
-    // Scroll up by 3 → rows 2..4 visible (msg 2, 3, 4).
     s.scroll_up(3);
     let events = render_frame(&s);
     let lines = find_line_events(&events);
@@ -136,16 +130,12 @@ fn scrolled_state_shows_older_rows() {
 
 #[test]
 fn input_longer_than_cols_wraps_to_multiple_rows() {
-    // cols 10, buffer of 20 chars. Full input "> abcdefghijklmnopqrst"
-    // is 22 display cols → 3 wrapped rows of 10/10/2. With rows=5,
-    // max_input_rows = 4 so the whole thing fits.
     let mut s = new_state(10, 5);
     for c in "abcdefghijklmnopqrst".chars() {
         s.input.insert_char(c);
     }
     let events = render_frame(&s);
 
-    // First input row should carry "> " + first 8 buffer chars.
     let row_first = events
         .iter()
         .find(|e| {
@@ -155,9 +145,6 @@ fn input_longer_than_cols_wraps_to_multiple_rows() {
         .expect("first input row");
     assert_eq!(row_text(row_first), "> abcdefgh");
 
-    // Cursor at end: display col 22 → row 2 from top of input (3 rows
-    // into the wrapped sequence), col 2. Input starts at row 2
-    // (rows - input_height = 5 - 3 = 2), so cursor_row = 2 + 2 = 4.
     let goto = events
         .iter()
         .find(|e| e["kind"] == Value::String("nefor-tui.grid.cursor_goto".into()))
@@ -184,12 +171,10 @@ fn padding_run_fills_to_cols() {
     let lines = find_line_events(&events);
     let cells = lines[0]["cells"].as_array().expect("cells");
     // "you> hi" is 7 chars → 7 content cells + 1 padding run = 8 entries.
-    // The final entry is a repeat-form padding cell of 5 spaces.
     assert_eq!(cells.len(), 8);
     let last = cells.last().expect("padding cell");
     assert_eq!(last[0], Value::String(" ".into()));
     assert_eq!(last[2], Value::Number(5u32.into()));
-    // And the reconstructed content line matches.
     assert_eq!(row_text(lines[0]), "you> hi");
 }
 
@@ -212,4 +197,121 @@ fn every_line_event_targets_grid_1() {
             assert_eq!(g, &Value::Number(1u32.into()));
         }
     }
+}
+
+#[test]
+fn statusline_with_full_metadata_layout() {
+    let md = SessionMetadata {
+        stats_seen: true,
+        model: Some("claude-opus-4-7".into()),
+        turns: Some(3),
+        cumulative_cost_usd: Some(0.42),
+        cumulative_input_tokens: Some(40_000),
+        cumulative_cache_read: Some(7_000),
+        last_turn_duration_ms: Some(12_000),
+        ..Default::default()
+    };
+
+    let spans = build_status_spans(&md, 0, 10, 0, 100);
+    let joined: String = spans.iter().map(|s| s.text.as_str()).collect();
+    assert!(joined.starts_with("opus-4-7"), "{joined}");
+    assert!(joined.contains("ctx 47k/200k"), "{joined}");
+    assert!(joined.contains("$0.42"), "{joined}");
+    assert!(joined.contains("3 turns"), "{joined}");
+    assert!(joined.contains("12s"), "{joined}");
+}
+
+#[test]
+fn statusline_with_no_metadata_uses_dim_dash() {
+    let md = SessionMetadata::default();
+    let spans = build_status_spans(&md, 0, 10, 0, 80);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].text, "—");
+    assert_eq!(spans[0].hl, HL_STATUS_DIM);
+}
+
+#[test]
+fn markdown_bold_italic_inline_code_render_to_distinct_hls() {
+    let mut s = new_state(80, 6);
+    s.push_entry(
+        Role::Assistant,
+        "alpha **bold** and *italic* and `code()` end".into(),
+    );
+    let events = render_frame(&s);
+    let lines = find_line_events(&events);
+    let row = &lines[0];
+    let cells = row["cells"].as_array().expect("cells");
+
+    // Walk the cells, noting which hls appear at all.
+    let mut seen_hls: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for cell in cells {
+        let arr = cell.as_array().expect("cell array");
+        if arr.len() >= 3 {
+            continue; // padding run
+        }
+        if let Some(hl) = arr.get(1).and_then(Value::as_u64) {
+            seen_hls.insert(hl);
+        }
+    }
+    assert!(seen_hls.contains(&(HL_MD_BOLD as u64)), "bold hl missing");
+    assert!(
+        seen_hls.contains(&(HL_MD_ITALIC as u64)),
+        "italic hl missing"
+    );
+    assert!(
+        seen_hls.contains(&(HL_MD_CODE_INLINE as u64)),
+        "inline code hl missing"
+    );
+}
+
+#[test]
+fn markdown_heading_in_assistant_text_renders_with_heading_hl() {
+    let mut s = new_state(80, 6);
+    s.push_entry(Role::Assistant, "# big title".into());
+    let events = render_frame(&s);
+    let lines = find_line_events(&events);
+    // Find the row with "big title" content; walk for a heading-hl span.
+    let row = lines
+        .iter()
+        .find(|r| row_text(r).contains("big title"))
+        .expect("heading row");
+    let cells = row["cells"].as_array().expect("cells");
+    let any_heading = cells.iter().any(|c| {
+        let arr = c.as_array().expect("cell");
+        arr.len() < 3 && arr.get(1).and_then(Value::as_u64) == Some(HL_MD_HEADING as u64)
+    });
+    assert!(any_heading, "heading hl absent on heading row");
+}
+
+#[test]
+fn tool_start_for_bash_renders_one_liner_in_transcript() {
+    let mut s = new_state(80, 4);
+    let body = tool_start_line("Bash", Some(&serde_json::json!({"command":"ls -la"})));
+    s.push_entry(Role::System, body);
+    let events = render_frame(&s);
+    let lines = find_line_events(&events);
+    let text = row_text(lines[0]);
+    assert!(text.contains("Bash"), "{text}");
+    assert!(text.contains("ls -la"), "{text}");
+    assert!(
+        text.starts_with('['),
+        "system entries are bracketed: {text}"
+    );
+}
+
+#[test]
+fn statusline_uses_status_hl_for_real_metadata() {
+    let mut s = new_state(60, 6);
+    s.metadata.stats_seen = true;
+    s.metadata.model = Some("claude-opus-4-7".into());
+    let events = render_frame(&s);
+    let lines = find_line_events(&events);
+    // status row index = 4 (0..3 transcript, 4 status, 5 input).
+    let status_row = lines
+        .iter()
+        .find(|r| r["row"] == Value::Number(4u32.into()))
+        .expect("status row at row=4");
+    // First cell carries the model name and `HL_STATUS` (not the dim dash).
+    assert_eq!(row_hl(status_row), HL_STATUS as u64);
+    assert!(row_text(status_row).starts_with("opus-4-7"));
 }
