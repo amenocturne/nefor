@@ -67,23 +67,28 @@ end
 -- Paths match the default `--plugin-dir` layout: <plugin_root>/<name>/.
 -- Adjust per-plugin `command` entries if you've installed plugins
 -- elsewhere or want to run release builds.
+--
+-- `ncp.spawn` accepts everything `nefor.plugins.spawn` does plus optional
+-- `from_plugin` / `to_plugin` envelope transforms. See `ncp.lua` for the
+-- contract and `docs/plugin-authoring.md` for the worked example
+-- (mock-plugin's `cc.*` namespace adapted to nefor-chat's `chat.*`).
 
-nefor.plugins.spawn {
+ncp.spawn {
   name    = "mock-plugin",
   command = { "../target/debug/mock-plugin" },
 }
 
-nefor.plugins.spawn {
+ncp.spawn {
   name    = "nefor-chat",
   command = { "../target/debug/nefor-chat" },
 }
 
-nefor.plugins.spawn {
+ncp.spawn {
   name    = "nefor-tui",
   command = { "../target/debug/nefor-tui" },
 }
 
-nefor.plugins.spawn {
+ncp.spawn {
   name    = "nefor-combinators",
   command = { "../target/debug/nefor-combinators" },
 }

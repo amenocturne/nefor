@@ -281,6 +281,197 @@ local function test_late_attacher_receives_prior_events_in_order()
 end
 
 -- ------------------------------------------------------------------
+-- transforms: from_plugin rewrites event before broadcast
+-- ------------------------------------------------------------------
+-- Helper: ready each name in order, calling step after every append so
+-- ncp.step sees one new tail entry per call (the production pattern).
+local function ready_in_order(log, names)
+  for _, n in ipairs(names) do
+    log[#log + 1] = entry_plugin(n, make_ready("0.1"))
+    ncp.step({}, log)
+  end
+end
+
+local function test_from_plugin_transform_rewrites_event_kind()
+  reset()
+  _test.set_plugins({ "src", "dst" })
+
+  -- src has a from_plugin transform that rewrites cc.* → chat.*.
+  ncp._test_set_transforms("src", {
+    from_plugin = function(env)
+      if env.body and type(env.body.kind) == "string" then
+        local k = env.body.kind
+        if k:sub(1, 3) == "cc." then
+          env.body.kind = "chat." .. k:sub(4)
+        end
+      end
+      return env
+    end,
+  })
+
+  local log = {}
+  ready_in_order(log, { "src", "dst" })
+  _test.calls_clear()
+
+  log[#log + 1] = entry_plugin("src", make_event({ kind = "cc.stream.end", text = "hi" }))
+  ncp.step({}, log)
+
+  local calls = _test.calls()
+  assert_eq(#calls, 1, "exactly one peer (dst) received the event")
+  assert_eq(calls[1].target, "dst", "delivered to dst")
+  local decoded = json.decode(calls[1].payload)
+  assert_eq(decoded.body.kind, "chat.stream.end", "kind was rewritten by from_plugin")
+  assert_eq(decoded.body.text, "hi", "body fields preserved")
+  assert_eq(decoded.from, "src", "from preserved as origin plugin")
+end
+
+-- ------------------------------------------------------------------
+-- transforms: from_plugin returning nil drops the envelope entirely
+-- ------------------------------------------------------------------
+local function test_from_plugin_transform_returning_nil_drops_envelope()
+  reset()
+  _test.set_plugins({ "src", "dst" })
+
+  ncp._test_set_transforms("src", {
+    from_plugin = function(_env) return nil end,
+  })
+
+  local log = {}
+  ready_in_order(log, { "src", "dst" })
+  _test.calls_clear()
+
+  log[#log + 1] = entry_plugin("src", make_event({ kind = "any" }))
+  ncp.step({}, log)
+
+  assert_eq(#_test.calls(), 0, "no peers received the dropped event")
+end
+
+-- ------------------------------------------------------------------
+-- transforms: to_plugin rewrites only for that target
+-- ------------------------------------------------------------------
+local function test_to_plugin_transform_rewrites_per_target_only()
+  reset()
+  _test.set_plugins({ "src", "a", "b" })
+
+  -- Only 'a' has a to_plugin transform; 'b' should see the unrewritten event.
+  ncp._test_set_transforms("a", {
+    to_plugin = function(env)
+      env.body.kind = "rewritten"
+      return env
+    end,
+  })
+
+  local log = {}
+  ready_in_order(log, { "src", "a", "b" })
+  _test.calls_clear()
+
+  log[#log + 1] = entry_plugin("src", make_event({ kind = "original" }))
+  ncp.step({}, log)
+
+  local seen = {}
+  for _, c in ipairs(_test.calls()) do
+    local d = json.decode(c.payload)
+    seen[c.target] = d.body.kind
+  end
+  assert_eq(seen.a, "rewritten", "'a' saw rewritten event via to_plugin")
+  assert_eq(seen.b, "original",  "'b' saw original event (no transform)")
+end
+
+-- ------------------------------------------------------------------
+-- transforms: to_plugin returning nil drops for that target only
+-- ------------------------------------------------------------------
+local function test_to_plugin_transform_returning_nil_drops_for_target_only()
+  reset()
+  _test.set_plugins({ "src", "a", "b" })
+
+  ncp._test_set_transforms("a", {
+    to_plugin = function(_env) return nil end,
+  })
+
+  local log = {}
+  ready_in_order(log, { "src", "a", "b" })
+  _test.calls_clear()
+
+  log[#log + 1] = entry_plugin("src", make_event({ kind = "x" }))
+  ncp.step({}, log)
+
+  local targets = {}
+  for _, c in ipairs(_test.calls()) do
+    targets[c.target] = (targets[c.target] or 0) + 1
+  end
+  assert_eq(targets.a or 0, 0, "'a' was filtered by its to_plugin")
+  assert_eq(targets.b or 0, 1, "'b' still received the event")
+end
+
+-- ------------------------------------------------------------------
+-- transforms: errors in from_plugin emit transform_error and drop
+-- ------------------------------------------------------------------
+local function test_from_plugin_transform_error_emits_transform_error()
+  reset()
+  _test.set_plugins({ "src", "dst" })
+
+  ncp._test_set_transforms("src", {
+    from_plugin = function(_env) error("boom") end,
+  })
+
+  local log = {}
+  ready_in_order(log, { "src", "dst" })
+  _test.calls_clear()
+
+  log[#log + 1] = entry_plugin("src", make_event({ kind = "x" }))
+  ncp.step({}, log)
+
+  local calls = _test.calls()
+  assert_eq(#calls, 1, "one send: the error reply to source")
+  assert_eq(calls[1].target, "src", "error targeted at the source plugin")
+  local d = json.decode(calls[1].payload)
+  assert_eq(d.body.kind, "error", "error envelope")
+  assert_eq(d.body.code, "transform_error", "transform_error code")
+end
+
+-- ------------------------------------------------------------------
+-- transforms: replayed events also pass through transforms
+-- ------------------------------------------------------------------
+local function test_replayed_events_pass_through_from_plugin_transform()
+  reset()
+  _test.set_plugins({ "src" })
+
+  ncp._test_set_transforms("src", {
+    from_plugin = function(env)
+      env.body.kind = "rewritten"
+      return env
+    end,
+  })
+
+  -- src readies, then emits two events while alone on the bus.
+  local log = { entry_plugin("src", make_ready("0.1")) }
+  ncp.step({}, log)
+  for _, k in ipairs({ "e1", "e2" }) do
+    log[#log + 1] = entry_plugin("src", make_event({ kind = k }))
+    ncp.step({}, log)
+  end
+
+  -- 'late' joins. Replay should deliver both events with rewritten kind.
+  _test.set_plugins({ "src", "late" })
+  _test.calls_clear()
+  log[#log + 1] = entry_plugin("late", make_ready("0.1"))
+  ncp.step({}, log)
+
+  local replayed_kinds = {}
+  for _, c in ipairs(_test.calls()) do
+    if c.target == "late" then
+      local d = json.decode(c.payload)
+      if d.type == "event" then
+        replayed_kinds[#replayed_kinds + 1] = d.body.kind
+      end
+    end
+  end
+  assert_eq(#replayed_kinds, 2, "both prior events replayed")
+  assert_eq(replayed_kinds[1], "rewritten", "first replay used from_plugin")
+  assert_eq(replayed_kinds[2], "rewritten", "second replay used from_plugin")
+end
+
+-- ------------------------------------------------------------------
 -- 10. saved_log is not replayed in v1 (explicit documentation test)
 -- ------------------------------------------------------------------
 local function test_saved_log_is_not_replayed_in_v1()
@@ -316,6 +507,12 @@ local tests = {
   { name = "malformed_json_triggers_error", fn = test_malformed_json_triggers_error },
   { name = "second_ready_from_same_plugin_errors", fn = test_second_ready_from_same_plugin_errors },
   { name = "late_attacher_receives_prior_events_in_order", fn = test_late_attacher_receives_prior_events_in_order },
+  { name = "from_plugin_transform_rewrites_event_kind", fn = test_from_plugin_transform_rewrites_event_kind },
+  { name = "from_plugin_transform_returning_nil_drops_envelope", fn = test_from_plugin_transform_returning_nil_drops_envelope },
+  { name = "to_plugin_transform_rewrites_per_target_only", fn = test_to_plugin_transform_rewrites_per_target_only },
+  { name = "to_plugin_transform_returning_nil_drops_for_target_only", fn = test_to_plugin_transform_returning_nil_drops_for_target_only },
+  { name = "from_plugin_transform_error_emits_transform_error", fn = test_from_plugin_transform_error_emits_transform_error },
+  { name = "replayed_events_pass_through_from_plugin_transform", fn = test_replayed_events_pass_through_from_plugin_transform },
   { name = "saved_log_is_not_replayed_in_v1", fn = test_saved_log_is_not_replayed_in_v1 },
 }
 

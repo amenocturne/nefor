@@ -2,6 +2,7 @@
 --
 -- Public API:
 --   ncp.step(saved_log, current_log) -- called from the global step hook
+--   ncp.spawn(cfg)                   -- spawn a plugin with optional transforms
 --
 -- The engine is a pure string-layer event bus. Every inbound line gets
 -- appended to `current_log` and `ncp.step` is invoked. This module inspects
@@ -13,10 +14,15 @@
 --     plugins that were already connected.
 --   * `error` emission on malformed inbound (unparseable JSON, bad envelope,
 --     unknown kind, version mismatch, invalid ready).
+--   * Per-plugin envelope transforms: `from_plugin` runs at ingress (after
+--     a plugin emits, before broadcast); `to_plugin` runs at egress, per
+--     target. Both are optional, default identity, and may return `nil` to
+--     drop the envelope. Lets the user's init.lua adapt vendor namespaces
+--     (e.g. `cc.*` → `chat.*`) without modifying plugins.
 --
 -- State lives in module-level locals and is reset on module reload. Nothing
--- here is shared across step invocations except the `ready_plugins` set; the
--- engine holds the authoritative event log.
+-- here is shared across step invocations except the `ready_plugins` set and
+-- the `plugin_transforms` table; the engine holds the authoritative event log.
 --
 -- # Tradeoffs documented in code
 --
@@ -47,6 +53,14 @@ local ENGINE_VERSION = "0.1.0"
 -- ready (which the engine delivers via the normal broadcast path).
 local ready_plugins = {}
 
+-- Per-plugin envelope transforms, keyed by plugin name.
+-- Each entry: { from_plugin = function|nil, to_plugin = function|nil }.
+-- `from_plugin(env)` runs once per emission at ingress; `to_plugin(env)` runs
+-- per peer at egress. Both receive `{type, body, from}` (and `ts` on
+-- to_plugin) and return either a (possibly mutated) envelope table or nil
+-- to drop. Errors are caught — a faulty transform never crashes step.
+local plugin_transforms = {}
+
 -- ------------------------------------------------------------------
 -- helpers
 -- ------------------------------------------------------------------
@@ -62,6 +76,20 @@ end
 
 local function encode(v)
   return json.encode(v)
+end
+
+-- Recursively copy a value. Used at egress so each peer's `to_plugin`
+-- transform sees its own envelope — without this, mutating `env.body` in
+-- one peer's transform would leak to subsequent peers in the broadcast
+-- fan-out. JSON-shaped values are safe to deep-copy with this naive walk
+-- (no metatables, no cycles).
+local function deep_copy(v)
+  if type(v) ~= "table" then return v end
+  local out = {}
+  for k, vv in pairs(v) do
+    out[k] = deep_copy(vv)
+  end
+  return out
 end
 
 -- Build an engine-originated wire envelope. Per NCP §3 engine-broadcast
@@ -166,28 +194,71 @@ handle_ready = function(origin, body, current_log, tail_index)
   replay_prior_events(origin, current_log, tail_index)
 end
 
--- Re-wrap a plugin-authored event payload as a fully-stamped envelope
--- addressed at a peer. Plugins send `{type, body}`; receivers need
--- `{type, from, ts, body}` (§3). Starter's NCP layer is the only thing that
--- can stamp authoritative `from`/`ts` on the wire, so we do it here.
---
--- Returns the JSON line ready for `nefor.engine.send`, or nil if the
--- payload doesn't parse (caller has already logged/ignored).
-local function forward_envelope(sender, payload)
+-- Apply the source plugin's `from_plugin` transform (if any) to a decoded
+-- envelope. Returns the (possibly rewritten) envelope, or nil to drop.
+-- Errors in user code surface as `transform_error` to the source plugin
+-- and the envelope is dropped — better than crashing step.
+local function apply_from_plugin(origin, env)
+  local t = plugin_transforms[origin]
+  if not t or not t.from_plugin then return env end
+  local ok, result = pcall(t.from_plugin, env)
+  if not ok then
+    emit_error(origin, "transform_error",
+      "from_plugin transform raised: " .. tostring(result))
+    return nil
+  end
+  return result
+end
+
+-- Apply the target plugin's `to_plugin` transform (if any) to a wire
+-- envelope. Returns the (possibly rewritten) envelope, or nil to drop for
+-- this peer. Errors drop the envelope silently for the target — the target
+-- didn't cause them and shouldn't see a protocol error.
+local function apply_to_plugin(target, env)
+  local t = plugin_transforms[target]
+  if not t or not t.to_plugin then return env end
+  local ok, result = pcall(t.to_plugin, env)
+  if not ok then return nil end
+  return result
+end
+
+-- Decode a plugin-authored payload and run it through `from_plugin`.
+-- Returns the post-transform envelope `{type, body, from}`, or nil if the
+-- payload doesn't parse, isn't an object, or the transform dropped it.
+local function decode_and_apply_from(origin, payload)
   local decoded = select(1, try_decode(payload))
   if not decoded or type(decoded) ~= "table" then return nil end
-  return encode({
+  return apply_from_plugin(origin, {
     type = decoded.type,
-    from = sender,
-    ts   = nefor.engine.now(),
     body = decoded.body,
+    from = origin,
   })
 end
 
+-- Stamp + apply `to_plugin` + send. `env_in` is the post-from_plugin
+-- envelope `{type, body, from}`; we add an authoritative `ts` here per §3.
+-- Each peer gets its own `ts` to keep the broadcast loop simple; preserving
+-- a single shared `ts` across the fan-out is a v2 concern (see module doc).
+local function send_to_peer(target, env_in)
+  -- Body is deep-copied so peers can't see each other's `to_plugin`
+  -- mutations. type/from/ts are scalars and are reassigned per peer
+  -- anyway, so they don't need copying.
+  local env = apply_to_plugin(target, {
+    type = env_in.type,
+    from = env_in.from,
+    ts   = nefor.engine.now(),
+    body = deep_copy(env_in.body),
+  })
+  if env == nil then return end
+  nefor.engine.send(encode(env), target)
+end
+
 -- Replay every plugin-originated `type:"event"` entry seen before the
--- handshake. The engine stamps a fresh `ts` on each outbound send — see
--- module-level tradeoffs. Order is preserved by iterating current_log in
--- slice order.
+-- handshake. Replayed envelopes pass through `from_plugin` (at the source)
+-- and `to_plugin` (at the new attacher), so a late attacher sees the same
+-- transformed view as if it had been there all along. The engine stamps a
+-- fresh `ts` on each outbound send — see module-level tradeoffs. Order is
+-- preserved by iterating current_log in slice order.
 replay_prior_events = function(target, current_log, tail_index)
   for i = 1, tail_index - 1 do
     local entry = current_log[i]
@@ -195,10 +266,9 @@ replay_prior_events = function(target, current_log, tail_index)
     -- fan-out of prior events, not originals. Replaying them would
     -- double-deliver.
     if entry.origin ~= "step" then
-      local decoded = select(1, try_decode(entry.payload))
-      if decoded and decoded.type == "event" then
-        local wire = forward_envelope(entry.origin, entry.payload)
-        if wire then nefor.engine.send(wire, target) end
+      local env_in = decode_and_apply_from(entry.origin, entry.payload)
+      if env_in and env_in.type == "event" then
+        send_to_peer(target, env_in)
       end
     end
   end
@@ -220,11 +290,12 @@ local function handle_event(origin, payload)
     return
   end
 
-  local wire = forward_envelope(origin, payload)
-  if wire == nil then return end
+  local env_in = decode_and_apply_from(origin, payload)
+  if env_in == nil then return end
+
   for _, peer in ipairs(peers_minus(origin)) do
     if ready_plugins[peer] then
-      nefor.engine.send(wire, peer)
+      send_to_peer(peer, env_in)
     end
   end
 end
@@ -276,10 +347,70 @@ function M.step(_saved_log, current_log)
   end
 end
 
+-- ------------------------------------------------------------------
+-- public spawn API: nefor.plugins.spawn + transform registration
+-- ------------------------------------------------------------------
+
+-- ncp.spawn — wraps `nefor.plugins.spawn` to also accept optional
+-- `from_plugin` / `to_plugin` envelope transforms. The engine's spawn API
+-- rejects unknown fields (deliberately — it's part of the bus, not the
+-- protocol), so transforms live here in the protocol layer instead.
+--
+-- Example:
+--   ncp.spawn {
+--     name    = "mock-plugin",
+--     command = { "../target/debug/mock-plugin" },
+--     from_plugin = function(env)
+--       -- env = { type = "event"|"system", body = {...}, from = "mock-plugin" }
+--       if env.body and env.body.kind == "cc.stream.end" then
+--         env.body.kind = "chat.stream.end"
+--       end
+--       return env  -- or nil to drop the envelope
+--     end,
+--   }
+function M.spawn(cfg)
+  if type(cfg) ~= "table" then
+    error("ncp.spawn: expected table config, got " .. type(cfg), 2)
+  end
+  if type(cfg.name) ~= "string" or cfg.name == "" then
+    error("ncp.spawn: 'name' is required (non-empty string)", 2)
+  end
+
+  local from_plugin = cfg.from_plugin
+  local to_plugin   = cfg.to_plugin
+  if from_plugin ~= nil and type(from_plugin) ~= "function" then
+    error("ncp.spawn: 'from_plugin' must be a function or nil", 2)
+  end
+  if to_plugin ~= nil and type(to_plugin) ~= "function" then
+    error("ncp.spawn: 'to_plugin' must be a function or nil", 2)
+  end
+  if from_plugin or to_plugin then
+    plugin_transforms[cfg.name] = {
+      from_plugin = from_plugin,
+      to_plugin   = to_plugin,
+    }
+  end
+
+  -- Forward to the engine's spawn API with transforms stripped. The engine
+  -- rejects unknown fields, so we hand it only the fields it knows.
+  nefor.plugins.spawn({
+    name    = cfg.name,
+    command = cfg.command,
+  })
+end
+
 -- Exposed for tests only. Resets module state between scenarios so each
 -- test starts from a clean slate.
 function M._reset()
   ready_plugins = {}
+  plugin_transforms = {}
+end
+
+-- Exposed for tests only. Registers a transform for `name` without going
+-- through `M.spawn` (which calls into the real engine spawn API). Lets the
+-- ncp_test.lua suite exercise transforms without mocking `nefor.plugins`.
+function M._test_set_transforms(name, transforms)
+  plugin_transforms[name] = transforms
 end
 
 return M
