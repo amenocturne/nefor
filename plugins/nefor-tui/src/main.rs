@@ -92,6 +92,12 @@ async fn run() -> anyhow::Result<()> {
     // spec.
     send_event(&out_tx, hello_body()).await?;
 
+    // Plugin-readiness signal for downstream consumers (nefor-chat). The
+    // NCP `ready` system message is engine-↔-plugin handshake; peers see
+    // this `nefor-tui.ready` event-kind to know the grid is up and they
+    // can start emitting render commands.
+    send_event(&out_tx, ready_event_body()).await?;
+
     // 2) Enter raw mode + alt screen + mouse + bracketed paste. Install
     //    TerminalGuard before any possible panic path.
     //
@@ -397,6 +403,17 @@ async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> anyhow::Result<()>
 fn hello_body() -> Map<String, Value> {
     let mut map = Map::new();
     map.insert("kind".into(), Value::String("nefor-tui.hello".into()));
+    map.insert("version".into(), Value::String(PLUGIN_VERSION.into()));
+    map
+}
+
+/// Plugin-readiness signal: nefor-tui has completed NCP handshake and is
+/// about to enter raw mode. Downstream consumers (nefor-chat) wait on this
+/// event before emitting any grid commands; without it they'd race with
+/// terminal setup and the first frame would be lost.
+fn ready_event_body() -> Map<String, Value> {
+    let mut map = Map::new();
+    map.insert("kind".into(), Value::String("nefor-tui.ready".into()));
     map.insert("version".into(), Value::String(PLUGIN_VERSION.into()));
     map
 }
