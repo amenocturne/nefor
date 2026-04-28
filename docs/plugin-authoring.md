@@ -38,6 +38,60 @@ Concretely:
 
 The cost is a small amount of plumbing at the composition layer. The payoff is that plugins compose without knowing each other's names.
 
+## Per-plugin transforms
+
+Sometimes the cleanest plugin design is to keep the producer in its native vocabulary (`mock-plugin` emitting `cc.*`) while the consumer speaks a vendor-neutral contract (`nefor-chat` consuming [`chat-contract v0.1`](./chat-contract.md)). Per-plugin transforms are the glue: they live in `init.lua`, run inside the engine's Lua step hook, and rename / reshape / drop envelopes so each plugin keeps its own clean surface.
+
+This is composition layer work, not plugin layer work. The producer doesn't know who's listening; the consumer doesn't know who's producing. `init.lua` wires them together with a transform module per non-conforming peer.
+
+### Two hooks
+
+`ncp.spawn` (defined in [`starter/ncp.lua`](../starter/ncp.lua)) accepts two optional functions:
+
+- **`from_plugin(env)`** — runs once at ingress, after the named plugin emits and before the broker broadcasts. Rename or restructure events the plugin emits in its own namespace.
+- **`to_plugin(env)`** — runs at egress, per peer, before delivering to the named plugin. Rename or restructure events being delivered to it from elsewhere.
+
+Both receive `{type, body, from}` (and `ts` on `to_plugin`) and return either a (possibly mutated) envelope table or `nil` to drop. An error inside a transform is caught — `from_plugin` errors surface as `transform_error` to the source plugin and the envelope drops; `to_plugin` errors silently drop for that peer.
+
+### Per-peer isolation
+
+The broker deep-copies `body` before invoking each peer's `to_plugin`. Mutations one peer's transform makes do not leak to subsequent peers in the broadcast fan-out. Treat each transform invocation as owning its own envelope.
+
+### Worked example
+
+[`starter/mock_plugin_adapter.lua`](../starter/mock_plugin_adapter.lua) bridges `mock-plugin` (`cc.*`) to `chat-contract v0.1` (`chat.*`). Two representative rewrites:
+
+```lua
+-- from_plugin: mock-plugin emits, chat-contract surfaces.
+if k == "cc.stream.delta" then
+  env.body.kind = "chat.stream.delta"
+end
+
+-- to_plugin: chat plugin emits chat.input.submit, mock-plugin expects cc.prompt.
+if k == "chat.input.submit" then
+  env.body.kind = "cc.prompt"
+end
+```
+
+The full module also drops `cc.assistant.usage` (`return nil`) since the cumulative view in `chat.session.stats` covers the same statusline ground, and folds `cc.turn.error` into a system-role `chat.message.append` so harness errors land in the transcript.
+
+### Wiring it up
+
+Register the adapter in `init.lua` alongside the spawn:
+
+```lua
+local cc_adapter = require("mock_plugin_adapter")
+
+ncp.spawn {
+  name        = "mock-plugin",
+  command     = { "../target/debug/mock-plugin" },
+  from_plugin = cc_adapter.from_plugin,
+  to_plugin   = cc_adapter.to_plugin,
+}
+```
+
+A new harness gets a sibling adapter file and the same wiring. The chat plugin never has to learn another vendor namespace.
+
 ## Kind namespacing
 
 Event-message `kind` values SHOULD be prefixed with your plugin's name and a dot:
