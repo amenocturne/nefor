@@ -67,24 +67,30 @@ end
 
 local cc_adapter = require("mock_plugin_adapter")
 
+-- Plugin cwd is <plugin_root>/<name>/ (engine policy), so relative `../`
+-- paths walk into <plugin_root>, not the repo root. Build absolute paths
+-- from NEFOR_CONFIG_DIR (= <repo>/starter) → <repo>/target/debug/<bin>.
+local PROJECT_ROOT = STARTER_ROOT:match("^(.*)/[^/]+$") or "."
+local function bin(name) return PROJECT_ROOT .. "/target/debug/" .. name end
+
 ncp.spawn {
   name        = "mock-plugin",
-  command     = { "../target/debug/mock-plugin" },
+  command     = { bin("mock-plugin") },
   from_plugin = cc_adapter.from_plugin,
   to_plugin   = cc_adapter.to_plugin,
 }
 
 ncp.spawn {
   name    = "nefor-chat",
-  command = { "../target/debug/nefor-chat" },
+  command = { bin("nefor-chat") },
 }
 
 ncp.spawn {
   name    = "nefor-tui",
-  command = { "../target/debug/nefor-tui" },
+  command = { bin("nefor-tui") },
 }
 
 ncp.spawn {
   name    = "nefor-combinators",
-  command = { "../target/debug/nefor-combinators" },
+  command = { bin("nefor-combinators") },
 }
