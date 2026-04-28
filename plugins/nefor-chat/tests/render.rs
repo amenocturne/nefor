@@ -83,49 +83,57 @@ fn empty_transcript_empty_input_produces_clear_blanks_and_cursor() {
 
 #[test]
 fn user_then_assistant_pair_layout() {
-    let mut s = new_state(40, 5);
+    let mut s = new_state(40, 8);
     s.push_entry(Role::User, "hello".into());
     s.push_entry(Role::Assistant, "hi there".into());
     let events = render_frame(&s);
 
     let lines = find_line_events(&events);
-    // rows=5 → 3 transcript + 1 status + 1 input = 5 line events.
-    assert_eq!(lines.len(), 5);
-
-    // Row 0: "you> hello"
-    assert_eq!(row_text(lines[0]), "you> hello");
+    // 6 transcript rows: user block (top bar · "│ hello" · bottom bar) +
+    // assistant body "hi there" + 2 blank tails. Then input row + status.
+    // Row 0: top bar of user block.
+    assert_eq!(row_text(lines[0]), "│");
     assert_eq!(row_hl(lines[0]), HL_USER as u64);
-    // Row 1: "claude> hi there" (markdown-rendered, prefix preserved)
-    assert!(row_text(lines[1]).starts_with("claude> "));
-    assert!(row_text(lines[1]).contains("hi there"));
-    assert_eq!(row_hl(lines[1]), HL_ASSISTANT as u64);
-    // Row 2: blank transcript tail (hl 0 / default).
-    assert_eq!(row_text(lines[2]), " ");
-    // Row 3 (input): "> " + empty.
-    assert_eq!(row_text(lines[3]), "> ");
-    assert_eq!(row_hl(lines[3]), HL_INPUT as u64);
-    // Row 4 (status, bottom): no metadata wired yet → dim "—".
-    let status_text = row_text(lines[4]);
-    assert!(status_text.contains("—"), "status_text: {status_text:?}");
-    assert_eq!(row_hl(lines[4]), HL_STATUS_DIM as u64);
+    // Row 1: "│ hello" — bar carries HL_USER, text default fg.
+    assert_eq!(row_text(lines[1]), "│ hello");
+    assert_eq!(row_hl(lines[1]), HL_USER as u64);
+    // Row 2: bottom bar of user block.
+    assert_eq!(row_text(lines[2]), "│");
+    // Row 3: assistant body, plain markdown (no prefix).
+    assert!(row_text(lines[3]).contains("hi there"));
+    // Input row: the second-to-last line event, with just `│ ` (empty input).
+    let input_line = lines[lines.len() - 2];
+    assert_eq!(row_text(input_line), "│ ");
+    // Bottom row: status — no stats yet, hint shows.
+    let status = lines.last().expect("status");
+    assert!(
+        row_text(status).contains("Start chatting"),
+        "got: {:?}",
+        row_text(status)
+    );
+    assert_eq!(row_hl(status), HL_STATUS_DIM as u64);
 }
 
 #[test]
 fn scrolled_state_shows_older_rows() {
-    let mut s = new_state(20, 5);
+    let mut s = new_state(40, 12);
     for i in 0..8 {
         s.push_entry(Role::User, format!("msg {i}"));
     }
     let events = render_frame(&s);
     let lines = find_line_events(&events);
-    assert_eq!(row_text(lines[0]), "you> msg 5");
-    assert_eq!(row_text(lines[2]), "you> msg 7");
+    // Each user entry now occupies 3 rows (top bar · "│ msg N" · bottom bar).
+    // Most-recent visible content rows show the latest messages first.
+    let texts: Vec<String> = lines.iter().map(|l| row_text(l)).collect();
+    let joined = texts.join(" | ");
+    assert!(joined.contains("│ msg 7"), "joined: {joined}");
 
     s.scroll_up(3);
     let events = render_frame(&s);
     let lines = find_line_events(&events);
-    assert_eq!(row_text(lines[0]), "you> msg 2");
-    assert_eq!(row_text(lines[2]), "you> msg 4");
+    let texts: Vec<String> = lines.iter().map(|l| row_text(l)).collect();
+    let joined = texts.join(" | ");
+    assert!(joined.contains("│ msg 6"), "joined: {joined}");
 }
 
 #[test]
@@ -145,14 +153,15 @@ fn input_longer_than_cols_wraps_to_multiple_rows() {
                 && e["row"] == Value::Number(1u32.into())
         })
         .expect("first input row");
-    assert_eq!(row_text(row_first), "> abcdefgh");
+    // Bar prefix appears on every wrapped line; inner width is cols-2 = 8.
+    assert_eq!(row_text(row_first), "│ abcdefgh");
 
     let goto = events
         .iter()
         .find(|e| e["kind"] == Value::String("nefor-tui.grid.cursor_goto".into()))
         .expect("cursor_goto");
     assert_eq!(goto["row"], Value::Number(3u32.into()));
-    assert_eq!(goto["col"], Value::Number(2u32.into()));
+    assert_eq!(goto["col"], Value::Number(6u32.into()));
 }
 
 #[test]
@@ -167,17 +176,16 @@ fn system_entry_is_bracketed_with_system_hl() {
 
 #[test]
 fn padding_run_fills_to_cols() {
-    let mut s = new_state(12, 3);
+    let mut s = new_state(12, 5);
     s.push_entry(Role::User, "hi".into());
     let events = render_frame(&s);
     let lines = find_line_events(&events);
+    // Row 0 is the top bar of the user block — "│" + padding to cols.
     let cells = lines[0]["cells"].as_array().expect("cells");
-    // "you> hi" is 7 chars → 7 content cells + 1 padding run = 8 entries.
-    assert_eq!(cells.len(), 8);
+    assert_eq!(row_text(lines[0]), "│");
     let last = cells.last().expect("padding cell");
     assert_eq!(last[0], Value::String(" ".into()));
-    assert_eq!(last[2], Value::Number(5u32.into()));
-    assert_eq!(row_text(lines[0]), "you> hi");
+    assert_eq!(last[2], Value::Number(11u32.into()));
 }
 
 #[test]
@@ -224,11 +232,11 @@ fn statusline_with_full_metadata_layout() {
 }
 
 #[test]
-fn statusline_with_no_metadata_uses_dim_dash() {
+fn statusline_with_no_metadata_shows_invite_hint() {
     let md = SessionMetadata::default();
     let spans = build_status_spans(&md, 0, 10, 0, 80);
     assert_eq!(spans.len(), 1);
-    assert_eq!(spans[0].text, "—");
+    assert_eq!(spans[0].text, "Start chatting to see stats");
     assert_eq!(spans[0].hl, HL_STATUS_DIM);
 }
 

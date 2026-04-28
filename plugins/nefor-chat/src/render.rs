@@ -252,11 +252,14 @@ pub fn render_frame(state: &ChatState) -> Vec<Map<String, Value>> {
     for i in 0..input_height {
         let src_idx = (input_scroll + i) as usize;
         let text = input_lines.get(src_idx).map(String::as_str).unwrap_or("");
-        out.push(grid_line(
-            input_start_row + i,
-            cols,
-            &[Span::new(text, HL_INPUT)],
-        ));
+        // Split off the "│ " prefix so the bar carries HL_USER (matching
+        // the user-message block above) while the typed text stays in
+        // HL_INPUT (terminal-default).
+        let spans: Vec<Span> = match text.strip_prefix("│ ") {
+            Some(rest) => vec![Span::new("│ ", HL_USER), Span::new(rest, HL_INPUT)],
+            None => vec![Span::new(text, HL_INPUT)],
+        };
+        out.push(grid_line(input_start_row + i, cols, &spans));
     }
 
     if status_height > 0 {
@@ -290,11 +293,23 @@ fn wrap_transcript(entries: &[TranscriptEntry], cols: usize) -> Vec<Line> {
     for e in entries {
         match e.role {
             Role::User => {
-                let prefix = "you> ";
-                let full = format!("{prefix}{}", e.text);
-                for line in wrap_to_width(&full, cols) {
-                    out.push(vec![Span::new(line, HL_USER)]);
+                // Visual block: `│` top bar · `│ <text>` content · `│` bottom
+                // bar. The left bar in HL_USER (blue/bold) gives structural
+                // separation without forcing a background colour, so terminal
+                // transparency is preserved.
+                out.push(vec![Span::new("│", HL_USER)]);
+                let inner = cols.saturating_sub(2);
+                if inner == 0 {
+                    out.push(vec![Span::new("│ ", HL_USER)]);
+                } else {
+                    for line in wrap_to_width(&e.text, inner) {
+                        out.push(vec![
+                            Span::new("│ ", HL_USER),
+                            Span::new(line, HL_ASSISTANT),
+                        ]);
+                    }
                 }
+                out.push(vec![Span::new("│", HL_USER)]);
             }
             Role::System => {
                 let bracketed = format!("[{}]", e.text);
@@ -303,37 +318,13 @@ fn wrap_transcript(entries: &[TranscriptEntry], cols: usize) -> Vec<Line> {
                 }
             }
             Role::Assistant => {
-                // Assistant messages flow through the markdown pipeline.
-                // The "claude> " prefix lives on its own first line so
-                // bold/italic/code formatting only applies to body text,
-                // not the role label. This preserves the previous look while
-                // adding rich rendering.
+                // No prefix — assistant messages are the dominant content
+                // and stand on their own. Markdown rendering applies to the
+                // whole body. The visual cue that this is the assistant is
+                // the *absence* of a left bar (only user blocks carry one).
                 let md_lines = markdown::render(&e.text, cols);
-                for (i, line) in md_lines.iter().enumerate() {
-                    if i == 0 {
-                        let mut row: Line = vec![Span::new("claude> ", HL_ASSISTANT)];
-                        let prefix_w = "claude> ".len();
-                        // Re-wrap the first line under a tighter budget so
-                        // the prefix doesn't push the row past `cols`.
-                        let remaining = cols.saturating_sub(prefix_w);
-                        let (first, overflow) = split_spans_at_width(line, remaining);
-                        row.extend(first);
-                        out.push(row);
-                        if !overflow.is_empty() {
-                            // Continue the wrapped overflow on a fresh line
-                            // (no prefix). Also wrap that further if needed.
-                            for sub in wrap_spans(&overflow, cols) {
-                                out.push(sub);
-                            }
-                        }
-                    } else {
-                        out.push(line.clone());
-                    }
-                }
-                if md_lines.is_empty() {
-                    // Empty assistant entry — still surface the prefix so
-                    // streaming start is visible.
-                    out.push(vec![Span::new("claude> ", HL_ASSISTANT)]);
+                for line in md_lines {
+                    out.push(line);
                 }
             }
         }
@@ -836,6 +827,23 @@ pub fn build_status_spans(
 ) -> Vec<Span> {
     let cols = cols as usize;
 
+    // No turn has completed yet — render an inviting hint instead of a row
+    // of `—` placeholders. Scroll info still shows when the user has
+    // scrolled away from the bottom.
+    if !md.stats_seen {
+        let mut out: Vec<Span> = vec![Span::new("Start chatting to see stats", HL_STATUS_DIM)];
+        if let Some(scroll) = build_scroll_segment(total, transcript_rows, scroll_offset) {
+            out.push(Span::new(" │ ", HL_STATUS_DIM));
+            out.extend(scroll);
+        }
+        // Truncate if too narrow.
+        let width: usize = out.iter().map(|s| s.width()).sum();
+        if width > cols {
+            out = truncate_spans(&out, cols);
+        }
+        return out;
+    }
+
     // Build candidate segments in priority order (must-keep first). Each
     // segment carries its own spans and a width.
     let model_seg = build_model_segment(md);
@@ -1067,7 +1075,11 @@ pub fn render_input_wrapped(
     cursor_char_offset: usize,
     cols: u32,
 ) -> (Vec<String>, u32, u32) {
-    let prefix = "> ";
+    // Bar prefix appears on *every* wrapped input line, mirroring the
+    // user-message block. Wrapping happens against the inner width
+    // (`cols - prefix_w`); the prefix is then stitched on each line so the
+    // visual block stays continuous as the user types more.
+    let prefix = "│ ";
     let prefix_w = str_width(prefix);
     let cols_usize = cols as usize;
 
@@ -1078,31 +1090,35 @@ pub fn render_input_wrapped(
         let text: String = prefix.chars().take(cols_usize).collect();
         return (vec![text], 0, 0);
     }
+    let inner_w = cols_usize - prefix_w;
 
-    let full = format!("{prefix}{buffer}");
-    let mut lines: Vec<String> = Vec::new();
+    let mut inner_lines: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut current_w = 0usize;
-    for c in full.chars() {
+    for c in buffer.chars() {
         let cw = char_width(c);
-        if current_w + cw > cols_usize && !current.is_empty() {
-            lines.push(std::mem::take(&mut current));
+        if current_w + cw > inner_w && !current.is_empty() {
+            inner_lines.push(std::mem::take(&mut current));
             current_w = 0;
         }
         current.push(c);
         current_w += cw;
     }
-    lines.push(current);
+    inner_lines.push(current);
 
-    let cursor_display_col = prefix_w
-        + buffer
-            .chars()
-            .take(cursor_char_offset)
-            .map(char_width)
-            .sum::<usize>();
-    let cursor_line = (cursor_display_col / cols_usize) as u32;
-    let cursor_col = (cursor_display_col % cols_usize) as u32;
-    let cursor_col = cursor_col.min(cols.saturating_sub(1));
+    let lines: Vec<String> = inner_lines
+        .into_iter()
+        .map(|s| format!("{prefix}{s}"))
+        .collect();
+
+    let cursor_inner = buffer
+        .chars()
+        .take(cursor_char_offset)
+        .map(char_width)
+        .sum::<usize>();
+    let cursor_line = (cursor_inner / inner_w) as u32;
+    let cursor_col_inner = (cursor_inner % inner_w) as u32;
+    let cursor_col = (prefix_w as u32 + cursor_col_inner).min(cols.saturating_sub(1));
 
     (lines, cursor_line, cursor_col)
 }
@@ -1270,16 +1286,21 @@ mod tests {
         let s = state_with(
             vec![(Role::User, "hello"), (Role::Assistant, "hi there")],
             "",
-            Dims { cols: 40, rows: 6 },
+            Dims { cols: 40, rows: 8 },
         );
         let events = render_frame(&s);
+        // User block expands to 3 rows: top bar, "│ hello", bottom bar.
+        // Assistant body on row 3.
         let row0 = &events[1];
         let row1 = &events[2];
-        assert_eq!(row0["row"], Value::Number(0u32.into()));
-        assert_eq!(row_text(row0), "you> hello");
+        let row2 = &events[3];
+        let row3 = &events[4];
+        assert_eq!(row_text(row0), "│"); // top bar
         assert_eq!(row_hl(row0), HL_USER as u64);
-        assert!(row_text(row1).starts_with("claude> "));
-        assert!(row_text(row1).contains("hi there"));
+        assert_eq!(row_text(row1), "│ hello");
+        assert_eq!(row_hl(row1), HL_USER as u64); // bar carries HL_USER (first cell)
+        assert_eq!(row_text(row2), "│"); // bottom bar
+        assert!(row_text(row3).contains("hi there"));
     }
 
     #[test]
@@ -1323,7 +1344,7 @@ mod tests {
     #[test]
     fn render_input_wrapped_short_buffer_single_line() {
         let (lines, cline, col) = render_input_wrapped("abc", 3, 10);
-        assert_eq!(lines, vec!["> abc".to_string()]);
+        assert_eq!(lines, vec!["│ abc".to_string()]);
         assert_eq!(cline, 0);
         assert_eq!(col, 5);
     }
@@ -1331,17 +1352,17 @@ mod tests {
     #[test]
     fn render_input_wrapped_empty_buffer_cursor_at_prefix_end() {
         let (lines, cline, col) = render_input_wrapped("", 0, 10);
-        assert_eq!(lines, vec!["> ".to_string()]);
+        assert_eq!(lines, vec!["│ ".to_string()]);
         assert_eq!(cline, 0);
         assert_eq!(col, 2);
     }
 
     #[test]
-    fn status_with_no_metadata_shows_dim_dash_for_model() {
+    fn status_with_no_metadata_shows_invite_hint() {
         let md = SessionMetadata::default();
         let spans = build_status_spans(&md, 0, 10, 0, 80);
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].text, "—");
+        assert_eq!(spans[0].text, "Start chatting to see stats");
         assert_eq!(spans[0].hl, HL_STATUS_DIM);
     }
 
