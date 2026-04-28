@@ -214,11 +214,15 @@ pub fn render_frame(state: &ChatState) -> Vec<Map<String, Value>> {
 
     let status_height: u32 = if rows >= 3 { 1 } else { 0 };
 
+    // Layout, top → bottom: transcript · input · status. Status anchors to
+    // the very bottom row so it stays visible at startup (before any
+    // transcript content) and acts as a stable anchor for the eye when the
+    // input grows / shrinks.
     let max_input_rows = rows.saturating_sub(1 + status_height).max(1);
     let input_height = (input_lines.len() as u32).clamp(1, max_input_rows);
     let transcript_rows = rows - input_height - status_height;
-    let status_row = transcript_rows;
-    let input_start_row = transcript_rows + status_height;
+    let input_start_row = transcript_rows;
+    let status_row = transcript_rows + input_height;
 
     let input_scroll = (input_lines.len() as u32).saturating_sub(input_height);
     let cursor_line_visible = cursor_line_in_input
@@ -1298,8 +1302,11 @@ mod tests {
             .iter()
             .find(|e| e["kind"] == Value::String("nefor-tui.grid.cursor_goto".into()))
             .expect("cursor_goto emitted");
+        // Layout in 3 rows: row 0 transcript, row 1 input, row 2 status.
+        // Cursor goes on the input row, after the 5-char prompt + 2-char
+        // "> " prefix → col 7.
         assert_eq!(goto["col"], Value::Number(7u32.into()));
-        assert_eq!(goto["row"], Value::Number(2u32.into()));
+        assert_eq!(goto["row"], Value::Number(1u32.into()));
     }
 
     #[test]
