@@ -494,6 +494,93 @@ local function test_saved_log_is_not_replayed_in_v1()
 end
 
 -- ------------------------------------------------------------------
+-- mock_plugin_adapter: rewrites cc.* ↔ chat.*
+-- ------------------------------------------------------------------
+local cc = require("mock_plugin_adapter")
+
+local function test_cc_adapter_renames_stream_events_to_chat()
+  local out = cc.from_plugin({
+    type = "event",
+    from = "mock-plugin",
+    body = { kind = "cc.stream.delta", text = "hi" },
+  })
+  assert_eq(out.body.kind, "chat.stream.delta", "cc.stream.delta → chat.stream.delta")
+  assert_eq(out.body.text, "hi", "text preserved")
+
+  local end_out = cc.from_plugin({
+    type = "event",
+    from = "mock-plugin",
+    body = { kind = "cc.stream.end", text = "done", cost_usd = 0.001, duration_ms = 200, num_turns = 1 },
+  })
+  assert_eq(end_out.body.kind, "chat.stream.end", "cc.stream.end renamed")
+  assert_eq(end_out.body.text, "done", "text preserved")
+  assert_eq(end_out.body.cost_usd, nil, "per-turn meta stripped (lives on session.stats)")
+  assert_eq(end_out.body.num_turns, nil, "num_turns stripped")
+end
+
+local function test_cc_adapter_renames_session_stats_and_tool()
+  local s = cc.from_plugin({
+    type = "event", from = "mock-plugin",
+    body = { kind = "cc.session.stats", model = "claude-opus-4-7", turns = 3 },
+  })
+  assert_eq(s.body.kind, "chat.session.stats", "session.stats renamed")
+  assert_eq(s.body.model, "claude-opus-4-7", "model preserved")
+  assert_eq(s.body.turns, 3, "turns preserved")
+
+  local t = cc.from_plugin({
+    type = "event", from = "mock-plugin",
+    body = { kind = "cc.tool.start", name = "Bash", input = { command = "ls" } },
+  })
+  assert_eq(t.body.kind, "chat.tool.start", "tool.start renamed")
+  assert_eq(t.body.name, "Bash", "tool name preserved")
+end
+
+local function test_cc_adapter_drops_assistant_usage()
+  local out = cc.from_plugin({
+    type = "event", from = "mock-plugin",
+    body = { kind = "cc.assistant.usage", input_tokens = 10, output_tokens = 20 },
+  })
+  assert_eq(out, nil, "cc.assistant.usage is dropped (subsumed by session.stats)")
+end
+
+local function test_cc_adapter_surfaces_turn_error_as_system_message()
+  local out = cc.from_plugin({
+    type = "event", from = "mock-plugin",
+    body = { kind = "cc.turn.error", message = "rate limit" },
+  })
+  assert_eq(out.body.kind, "chat.message.append", "turn.error becomes message.append")
+  assert_eq(out.body.role, "system", "role=system")
+  assert_true(out.body.text:find("rate limit", 1, true) ~= nil,
+    "error message text included")
+end
+
+local function test_cc_adapter_passes_through_lifecycle_events()
+  for _, k in ipairs({ "cc.hello", "cc.ready", "cc.goodbye" }) do
+    local out = cc.from_plugin({
+      type = "event", from = "mock-plugin",
+      body = { kind = k },
+    })
+    assert_eq(out.body.kind, k, k .. " passes through unchanged")
+  end
+end
+
+local function test_cc_adapter_to_plugin_rewrites_input_submit()
+  local out = cc.to_plugin({
+    type = "event", from = "nefor-chat",
+    body = { kind = "chat.input.submit", text = "ping" },
+  })
+  assert_eq(out.body.kind, "cc.prompt", "chat.input.submit → cc.prompt")
+  assert_eq(out.body.text, "ping", "text preserved")
+
+  local r = cc.to_plugin({
+    type = "event", from = "nefor-chat",
+    body = { kind = "chat.resume", session_id = "abc" },
+  })
+  assert_eq(r.body.kind, "cc.resume", "chat.resume → cc.resume")
+  assert_eq(r.body.session_id, "abc", "session_id preserved")
+end
+
+-- ------------------------------------------------------------------
 -- driver
 -- ------------------------------------------------------------------
 
@@ -513,6 +600,12 @@ local tests = {
   { name = "to_plugin_transform_returning_nil_drops_for_target_only", fn = test_to_plugin_transform_returning_nil_drops_for_target_only },
   { name = "from_plugin_transform_error_emits_transform_error", fn = test_from_plugin_transform_error_emits_transform_error },
   { name = "replayed_events_pass_through_from_plugin_transform", fn = test_replayed_events_pass_through_from_plugin_transform },
+  { name = "cc_adapter_renames_stream_events_to_chat", fn = test_cc_adapter_renames_stream_events_to_chat },
+  { name = "cc_adapter_renames_session_stats_and_tool", fn = test_cc_adapter_renames_session_stats_and_tool },
+  { name = "cc_adapter_drops_assistant_usage", fn = test_cc_adapter_drops_assistant_usage },
+  { name = "cc_adapter_surfaces_turn_error_as_system_message", fn = test_cc_adapter_surfaces_turn_error_as_system_message },
+  { name = "cc_adapter_passes_through_lifecycle_events", fn = test_cc_adapter_passes_through_lifecycle_events },
+  { name = "cc_adapter_to_plugin_rewrites_input_submit", fn = test_cc_adapter_to_plugin_rewrites_input_submit },
   { name = "saved_log_is_not_replayed_in_v1", fn = test_saved_log_is_not_replayed_in_v1 },
 }
 

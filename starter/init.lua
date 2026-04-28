@@ -70,12 +70,16 @@ end
 --
 -- `ncp.spawn` accepts everything `nefor.plugins.spawn` does plus optional
 -- `from_plugin` / `to_plugin` envelope transforms. See `ncp.lua` for the
--- contract and `docs/plugin-authoring.md` for the worked example
--- (mock-plugin's `cc.*` namespace adapted to nefor-chat's `chat.*`).
+-- contract and `mock_plugin_adapter.lua` for the worked example: it adapts
+-- mock-plugin's `cc.*` namespace to nefor-chat's `chat-contract v0.1`.
+
+local cc_adapter = require("mock_plugin_adapter")
 
 ncp.spawn {
-  name    = "mock-plugin",
-  command = { "../target/debug/mock-plugin" },
+  name        = "mock-plugin",
+  command     = { "../target/debug/mock-plugin" },
+  from_plugin = cc_adapter.from_plugin,
+  to_plugin   = cc_adapter.to_plugin,
 }
 
 ncp.spawn {
