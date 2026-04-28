@@ -88,11 +88,16 @@ impl LuaHost {
         // user code can resolve sibling files (e.g. `package.path` extension
         // for bundled Lua modules) without `debug.getinfo`. mlua's safe
         // stdlib subset omits `debug`.
+        //
+        // Canonicalize so user code can build absolute paths (e.g. plugin
+        // commands that need to survive a cwd change in the spawned
+        // process). Fall back to the literal display string if canonicalize
+        // fails — better a relative path than no path.
         if let Some(parent) = path.parent() {
-            let _ = self
-                .lua
-                .globals()
-                .set("NEFOR_CONFIG_DIR", parent.display().to_string());
+            let resolved = fs::canonicalize(parent)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| parent.display().to_string());
+            let _ = self.lua.globals().set("NEFOR_CONFIG_DIR", resolved);
         }
 
         match self.lua.load(&src).set_name(chunk_name).exec() {
