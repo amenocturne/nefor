@@ -1075,10 +1075,11 @@ pub fn render_input_wrapped(
     cursor_char_offset: usize,
     cols: u32,
 ) -> (Vec<String>, u32, u32) {
-    // Bar prefix appears on *every* wrapped input line, mirroring the
-    // user-message block. Wrapping happens against the inner width
-    // (`cols - prefix_w`); the prefix is then stitched on each line so the
-    // visual block stays continuous as the user types more.
+    // Bar prefix appears on *every* wrapped input line. Wrapping is
+    // word-aware (best-effort): break at the last whitespace that fits;
+    // fall back to a hard column-break only when a single token is wider
+    // than the line. Cursor position is tracked in tandem with the wrap so
+    // it lands on the correct visual cell after any rebreak.
     let prefix = "│ ";
     let prefix_w = str_width(prefix);
     let cols_usize = cols as usize;
@@ -1095,30 +1096,80 @@ pub fn render_input_wrapped(
     let mut inner_lines: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut current_w = 0usize;
+    // Track the most recent whitespace within `current`: byte offset of the
+    // space char itself, so a wrap drops it cleanly.
+    let mut last_space_byte: Option<usize> = None;
+
+    let mut cursor_line: u32 = 0;
+    let mut cursor_byte: usize = 0;
+    let mut cursor_set = cursor_char_offset == 0;
+    let mut consumed = 0usize;
+
     for c in buffer.chars() {
         let cw = char_width(c);
-        if current_w + cw > inner_w && !current.is_empty() {
-            inner_lines.push(std::mem::take(&mut current));
-            current_w = 0;
+
+        if cw > 0 && current_w + cw > inner_w {
+            if let Some(sp_byte) = last_space_byte.take() {
+                // Word-break at the last space — drop the space, carry the
+                // tail to the next line.
+                let carry: String = current[(sp_byte + 1)..].to_owned();
+                let carry_w = str_width(&carry);
+                current.truncate(sp_byte);
+                // If cursor was placed on this line past the break, shift
+                // it onto the new line.
+                if cursor_set && cursor_line as usize == inner_lines.len() && cursor_byte > sp_byte
+                {
+                    cursor_line += 1;
+                    cursor_byte = cursor_byte.saturating_sub(sp_byte + 1);
+                }
+                inner_lines.push(std::mem::take(&mut current));
+                current = carry;
+                current_w = carry_w;
+            } else {
+                // Hard-break: no word boundary in this line.
+                inner_lines.push(std::mem::take(&mut current));
+                current_w = 0;
+            }
         }
+
+        if c == ' ' {
+            last_space_byte = Some(current.len());
+        }
+
         current.push(c);
         current_w += cw;
+        consumed += 1;
+
+        if consumed == cursor_char_offset {
+            cursor_set = true;
+            cursor_line = inner_lines.len() as u32;
+            cursor_byte = current.len();
+        }
     }
+
+    if !cursor_set {
+        // Cursor past end of buffer (shouldn't happen, but fall back).
+        cursor_line = inner_lines.len() as u32;
+        cursor_byte = current.len();
+    }
+
     inner_lines.push(current);
+
+    // Resolve cursor byte → display column on its line.
+    let cursor_line_str = inner_lines
+        .get(cursor_line as usize)
+        .map(String::as_str)
+        .unwrap_or("");
+    let cursor_col_inner: usize = cursor_line_str
+        .get(..cursor_byte.min(cursor_line_str.len()))
+        .map(|s| s.chars().map(char_width).sum())
+        .unwrap_or(0);
+    let cursor_col = (prefix_w as u32 + cursor_col_inner as u32).min(cols.saturating_sub(1));
 
     let lines: Vec<String> = inner_lines
         .into_iter()
         .map(|s| format!("{prefix}{s}"))
         .collect();
-
-    let cursor_inner = buffer
-        .chars()
-        .take(cursor_char_offset)
-        .map(char_width)
-        .sum::<usize>();
-    let cursor_line = (cursor_inner / inner_w) as u32;
-    let cursor_col_inner = (cursor_inner % inner_w) as u32;
-    let cursor_col = (prefix_w as u32 + cursor_col_inner).min(cols.saturating_sub(1));
 
     (lines, cursor_line, cursor_col)
 }
