@@ -240,14 +240,21 @@ end
 -- Each peer gets its own `ts` to keep the broadcast loop simple; preserving
 -- a single shared `ts` across the fan-out is a v2 concern (see module doc).
 local function send_to_peer(target, env_in)
-  -- Body is deep-copied so peers can't see each other's `to_plugin`
-  -- mutations. type/from/ts are scalars and are reassigned per peer
-  -- anyway, so they don't need copying.
+  -- Deep-copy body only when a `to_plugin` transform is actually registered
+  -- for `target` — otherwise the body is read-only on the way out and
+  -- copying is wasted work (per-keystroke, multiplied by N peers, this
+  -- adds up fast for fat bodies like `grid.line` cell arrays).
+  local has_transform = plugin_transforms[target]
+    and plugin_transforms[target].to_plugin
+  local body = env_in.body
+  if has_transform then
+    body = deep_copy(body)
+  end
   local env = apply_to_plugin(target, {
     type = env_in.type,
     from = env_in.from,
     ts   = nefor.engine.now(),
-    body = deep_copy(env_in.body),
+    body = body,
   })
   if env == nil then return end
   nefor.engine.send(encode(env), target)
@@ -292,6 +299,23 @@ local function handle_event(origin, payload)
 
   local env_in = decode_and_apply_from(origin, payload)
   if env_in == nil then return end
+
+  -- Targeted routing: events whose kind is "<peer>.<rest>" addressed at a
+  -- specific peer (other than the sender) deliver only to that peer. The
+  -- common case is render traffic from nefor-chat → nefor-tui ("nefor-tui.
+  -- grid.line", etc); broadcasting those to every plugin spends a Lua
+  -- step + JSON encode per peer for nothing. Events whose prefix is the
+  -- sender itself ("nefor-tui.input.key" from nefor-tui) are announcements
+  -- about the sender and stay broadcast. Events with a non-peer prefix
+  -- ("chat.*", "cc.*", custom kinds) also broadcast.
+  local k = env_in.body and env_in.body.kind
+  if type(k) == "string" then
+    local target = k:match("^([^.]+)%.")
+    if target and target ~= origin and ready_plugins[target] then
+      send_to_peer(target, env_in)
+      return
+    end
+  end
 
   for _, peer in ipairs(peers_minus(origin)) do
     if ready_plugins[peer] then

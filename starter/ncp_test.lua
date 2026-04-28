@@ -494,6 +494,54 @@ local function test_saved_log_is_not_replayed_in_v1()
 end
 
 -- ------------------------------------------------------------------
+-- targeted routing: kind "<peer>.<rest>" delivers only to <peer>
+-- ------------------------------------------------------------------
+local function test_kind_prefix_targets_named_peer_only()
+  reset()
+  _test.set_plugins({ "src", "nefor-tui", "other" })
+
+  local log = {}
+  ready_in_order(log, { "src", "nefor-tui", "other" })
+  _test.calls_clear()
+
+  -- src emits a "nefor-tui.grid.line" event. The kind prefix matches the
+  -- nefor-tui peer (and src is not nefor-tui), so it should deliver only
+  -- to nefor-tui — not "other".
+  log[#log + 1] = entry_plugin("src", make_event({ kind = "nefor-tui.grid.line", row = 0 }))
+  ncp.step({}, log)
+
+  local targets = {}
+  for _, c in ipairs(_test.calls()) do
+    targets[c.target] = (targets[c.target] or 0) + 1
+  end
+  assert_eq(targets["nefor-tui"] or 0, 1, "nefor-tui got the targeted event")
+  assert_eq(targets["other"] or 0, 0, "'other' did not receive targeted event")
+  assert_eq(targets["src"] or 0, 0, "sender did not receive its own event")
+end
+
+local function test_kind_prefix_self_announces_to_all_peers()
+  reset()
+  _test.set_plugins({ "nefor-tui", "a", "b" })
+
+  local log = {}
+  ready_in_order(log, { "nefor-tui", "a", "b" })
+  _test.calls_clear()
+
+  -- nefor-tui announces "nefor-tui.ready" — prefix matches the sender
+  -- itself, so this is a self-announcement and broadcasts to all peers.
+  log[#log + 1] = entry_plugin("nefor-tui", make_event({ kind = "nefor-tui.ready" }))
+  ncp.step({}, log)
+
+  local targets = {}
+  for _, c in ipairs(_test.calls()) do
+    targets[c.target] = (targets[c.target] or 0) + 1
+  end
+  assert_eq(targets["a"] or 0, 1, "'a' got the announcement")
+  assert_eq(targets["b"] or 0, 1, "'b' got the announcement")
+  assert_eq(targets["nefor-tui"] or 0, 0, "sender excluded from broadcast")
+end
+
+-- ------------------------------------------------------------------
 -- mock_plugin_adapter: rewrites cc.* ↔ chat.*
 -- ------------------------------------------------------------------
 local cc = require("mock_plugin_adapter")
@@ -600,6 +648,8 @@ local tests = {
   { name = "to_plugin_transform_returning_nil_drops_for_target_only", fn = test_to_plugin_transform_returning_nil_drops_for_target_only },
   { name = "from_plugin_transform_error_emits_transform_error", fn = test_from_plugin_transform_error_emits_transform_error },
   { name = "replayed_events_pass_through_from_plugin_transform", fn = test_replayed_events_pass_through_from_plugin_transform },
+  { name = "kind_prefix_targets_named_peer_only", fn = test_kind_prefix_targets_named_peer_only },
+  { name = "kind_prefix_self_announces_to_all_peers", fn = test_kind_prefix_self_announces_to_all_peers },
   { name = "cc_adapter_renames_stream_events_to_chat", fn = test_cc_adapter_renames_stream_events_to_chat },
   { name = "cc_adapter_renames_session_stats_and_tool", fn = test_cc_adapter_renames_session_stats_and_tool },
   { name = "cc_adapter_drops_assistant_usage", fn = test_cc_adapter_drops_assistant_usage },
