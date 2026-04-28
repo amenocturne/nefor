@@ -83,6 +83,18 @@ impl LuaHost {
         let src = fs::read_to_string(path).map_err(LuaError::InitLuaRead)?;
         let path_buf = path.to_path_buf();
         let chunk_name = path.display().to_string();
+
+        // Expose the directory containing init.lua as `NEFOR_CONFIG_DIR` so
+        // user code can resolve sibling files (e.g. `package.path` extension
+        // for bundled Lua modules) without `debug.getinfo`. mlua's safe
+        // stdlib subset omits `debug`.
+        if let Some(parent) = path.parent() {
+            let _ = self.lua.globals().set(
+                "NEFOR_CONFIG_DIR",
+                parent.display().to_string(),
+            );
+        }
+
         match self.lua.load(&src).set_name(chunk_name).exec() {
             Ok(()) => Ok(()),
             Err(source) => {

@@ -24,18 +24,10 @@
 -------------------------------------------------------------------------
 -- 1. Lua module path — bundled protocol + json alongside this file
 -------------------------------------------------------------------------
--- STARTER_ROOT points at the directory this init.lua lives in. We derive
--- it from the chunk name at load time so the user doesn't need to set an
--- env var. The engine loads init.lua with `set_name(<abs path>)`, and
--- `debug.getinfo(1).source` returns that path prefixed with "@".
-local function starter_root()
-  local src = debug.getinfo(1, "S").source
-  if src:sub(1, 1) == "@" then src = src:sub(2) end
-  -- Strip the trailing "/init.lua".
-  return src:match("^(.*)/[^/]+$") or "."
-end
-
-local STARTER_ROOT = starter_root()
+-- The engine sets `NEFOR_CONFIG_DIR` to the directory holding this
+-- init.lua before exec, so user code can resolve sibling Lua modules
+-- without poking at `debug.getinfo` (mlua's safe stdlib excludes `debug`).
+local STARTER_ROOT = NEFOR_CONFIG_DIR or "."
 
 package.path = table.concat({
   STARTER_ROOT .. "/?.lua",
