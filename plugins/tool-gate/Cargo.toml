@@ -1,0 +1,26 @@
+[package]
+name = "tool-gate-plugin"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NCP v0.1 plugin: tool-call permission gate. Sits between providers and tool-providing plugins; per-tool policy (auto/prompt/deny) with chat-rendered approval prompts."
+
+[[bin]]
+name = "tool-gate"
+path = "src/main.rs"
+
+[dependencies]
+nefor-protocol = { path = "../../crates/nefor-protocol" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
