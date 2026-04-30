@@ -1,0 +1,36 @@
+[package]
+name = "openai-provider"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NCP v0.1 plugin that talks to any OpenAI-compatible chat-completions endpoint (Ollama, Groq, OpenRouter, OpenAI, vLLM, …), streaming text deltas back as chat-contract events. Spawn N times with different env per instance to wire up multiple providers from one binary."
+
+[lib]
+name = "openai_provider"
+path = "src/lib.rs"
+
+[[bin]]
+name = "openai-provider"
+path = "src/main.rs"
+
+[dependencies]
+nefor-protocol = { path = "../../crates/nefor-protocol" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+tokio-util = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+clap = { workspace = true, features = ["env"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tokio-util = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
