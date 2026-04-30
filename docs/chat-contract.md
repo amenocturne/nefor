@@ -65,6 +65,26 @@ If no turn is in flight, `nefor-chat` does not emit; harnesses do not need to sp
 
 Producers populate whichever subset they have. Missing fields render as `—` in the statusline or skip rendering entirely; missing kinds simply do not surface.
 
+### `chat.stream.reasoning_delta`
+
+```json
+{ "kind": "chat.stream.reasoning_delta", "text": "…" }
+```
+
+Append `text` to the in-flight assistant entry's *reasoning* channel — separate from the content stream consumed by `chat.stream.delta`. Producers that surface a model's thinking trace (Ollama's `delta.reasoning` for Qwen 3 / Gemma 3) emit one of these per chunk. `nefor-chat` renders the accumulating trace as a dim live preview while the entry has no content yet, and collapses it to a single-row marker once content begins (or `reasoning_end` arrives reasoning-only). Reasoning is NOT included in the stored assistant text — it doesn't feed back into the next request's history.
+
+### `chat.stream.reasoning_end`
+
+```json
+{
+  "kind": "chat.stream.reasoning_end",
+  "text": "…",          // full accumulated reasoning trace
+  "duration_ms": 1840    // optional, u64
+}
+```
+
+Close the in-flight assistant entry's reasoning channel. Fires exactly once per turn at the boundary where the model transitions out of thinking — either the first content delta arrives, `finish_reason` lands without content (reasoning-only turn), or the body terminates. `text` is the authoritative full trace; `duration_ms` is the wall-clock from first reasoning chunk to this event. `nefor-chat` flips the live preview into the collapsed `▶ reasoning (Ns)` row and preserves the full trace for the Ctrl+O expanded view (same toggle that expands tool I/O details).
+
 ### `chat.session.stats`
 
 ```json

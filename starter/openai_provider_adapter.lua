@@ -65,6 +65,18 @@ function M.make(name, opts)
       -- doesn't, but the extra field is harmless to nefor-chat (extra
       -- keys are ignored).
       env.body.kind = "chat.stream.delta"
+    elseif k == prefix .. "stream.reasoning_delta" then
+      -- Live thinking-trace chunk (Ollama's `delta.reasoning` for
+      -- Qwen 3 / Gemma 3). Same field shape as stream.delta;
+      -- nefor-chat routes it to the reasoning channel of the in-flight
+      -- assistant entry.
+      env.body.kind = "chat.stream.reasoning_delta"
+    elseif k == prefix .. "stream.reasoning_end" then
+      -- Reasoning boundary: content has started, finish_reason landed
+      -- without content, or the body terminated. Carries the full
+      -- accumulated reasoning text and a duration_ms; nefor-chat uses
+      -- both for the collapsed-row label.
+      env.body.kind = "chat.stream.reasoning_end"
     elseif k == prefix .. "stream.end" then
       -- Keep model + duration_ms for the per-turn footer; drop the
       -- finish_reason since chat-contract doesn't render it.

@@ -25,6 +25,13 @@ use crate::openai::{
 /// either finalize the turn (`tool_calls` empty, `finish_reason ==
 /// "stop"`) or run the tool loop (`tool_calls` non-empty,
 /// `finish_reason == "tool_calls"`).
+///
+/// `reasoning_text` accumulates `delta.reasoning` chunks (Ollama's
+/// thinking trace for Gemma 3 / Qwen 3). It is intentionally NOT
+/// concatenated into `full_text`: the stored assistant message must
+/// stay clean (no reasoning) so it doesn't feed back into the next
+/// request's history. Callers that want to relay the trace use the
+/// dedicated reasoning callback or read this field at end-of-turn.
 #[derive(Debug, Clone, Default)]
 pub struct StreamOutcome {
     pub full_text: String,
@@ -32,6 +39,7 @@ pub struct StreamOutcome {
     pub usage: Option<Usage>,
     pub interrupted: bool,
     pub tool_calls: Vec<ToolCall>,
+    pub reasoning_text: String,
 }
 
 /// Errors that can come out of the HTTP/SSE pipeline. All of them lower
@@ -51,15 +59,40 @@ pub enum StreamError {
     Body(String),
 }
 
+/// Boundary signal passed to the reasoning callback. The dispatcher
+/// uses this to drive `<prefix>.stream.reasoning_delta` (per-chunk) and
+/// `<prefix>.stream.reasoning_end` (one-shot, synthesised at the moment
+/// reasoning stops streaming).
+///
+/// `End` fires exactly once per turn, at whichever of these comes first:
+///   * the first `delta.content` chunk (model transitioned thinking →
+///     output);
+///   * `finish_reason` arrives without any prior content (reasoning-only
+///     turn — typical for Gemma 3's reasoning-only edge case);
+///   * the body stream ends (defensive — providers we've seen always
+///     close with finish_reason, but don't rely on it).
+///
+/// `End` carries the full accumulated reasoning text so the chat plugin
+/// can render the collapsed row without holding its own buffer; the
+/// dispatcher can also stamp it onto `chat.complete.result` for
+/// non-streaming consumers.
+pub enum ReasoningEvent<'a> {
+    Delta(&'a str),
+    End { text: &'a str },
+}
+
 /// Drive a single chat-completions streaming call.
 ///
-/// `on_delta` is invoked synchronously for every text chunk; the caller
-/// emits `<prefix>.stream.delta` from inside that callback. Tool calls
-/// are accumulated silently and exposed via the returned
+/// `on_delta` is invoked synchronously for every content chunk; the
+/// caller emits `<prefix>.stream.delta` from inside that callback.
+/// `on_reasoning` is invoked for every reasoning chunk and once with
+/// `End` when reasoning is done — the chat plugin uses these to live-
+/// stream the thinking trace then collapse it. Tool calls are
+/// accumulated silently and exposed via the returned
 /// `StreamOutcome.tool_calls` — they don't fire a callback because the
 /// dispatcher's tool-loop logic needs the assembled list, not deltas.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_chat_stream<F>(
+pub async fn run_chat_stream<F, R>(
     client: &reqwest::Client,
     endpoint: &str,
     api_key: Option<&str>,
@@ -68,9 +101,11 @@ pub async fn run_chat_stream<F>(
     tools: Option<&[serde_json::Value]>,
     cancel: CancellationToken,
     mut on_delta: F,
+    mut on_reasoning: R,
 ) -> Result<StreamOutcome, StreamError>
 where
     F: FnMut(&str),
+    R: FnMut(ReasoningEvent<'_>),
 {
     let req = ChatRequest {
         model,
@@ -130,6 +165,10 @@ where
     let mut outcome = StreamOutcome::default();
     let mut buffer = String::new();
     let mut tc_acc = ToolCallAccumulator::new();
+    // Latch flipped once we've fired ReasoningEvent::End — at the
+    // boundary where reasoning stops and content/finish/usage takes
+    // over. Prevents duplicate end events if frames arrive interleaved.
+    let mut reasoning_ended = false;
     let mut byte_stream = response.bytes_stream();
 
     loop {
@@ -137,6 +176,7 @@ where
             _ = cancel.cancelled() => {
                 outcome.interrupted = true;
                 outcome.tool_calls = tc_acc.finalize();
+                maybe_end_reasoning(&outcome, &mut reasoning_ended, &mut on_reasoning);
                 return Ok(outcome);
             }
             next = byte_stream.next() => {
@@ -145,16 +185,51 @@ where
                     Some(Err(e)) => return Err(StreamError::Body(e.to_string())),
                     Some(Ok(bytes)) => {
                         buffer.push_str(&String::from_utf8_lossy(&bytes));
-                        drain_complete_frames(&mut buffer, &mut outcome, &mut tc_acc, &mut on_delta);
+                        drain_complete_frames(
+                            &mut buffer,
+                            &mut outcome,
+                            &mut tc_acc,
+                            &mut reasoning_ended,
+                            &mut on_delta,
+                            &mut on_reasoning,
+                        );
                     }
                 }
             }
         }
     }
     // Drain any leftover frame the server didn't terminate with `\n\n`.
-    drain_complete_frames(&mut buffer, &mut outcome, &mut tc_acc, &mut on_delta);
+    drain_complete_frames(
+        &mut buffer,
+        &mut outcome,
+        &mut tc_acc,
+        &mut reasoning_ended,
+        &mut on_delta,
+        &mut on_reasoning,
+    );
     outcome.tool_calls = tc_acc.finalize();
+    maybe_end_reasoning(&outcome, &mut reasoning_ended, &mut on_reasoning);
     Ok(outcome)
+}
+
+/// Fire `ReasoningEvent::End` once, idempotently. Called whenever the
+/// stream wraps up — either because content has started, the model
+/// emitted `finish_reason`, or the body terminated. Skips firing when
+/// no reasoning was observed at all (the common content-only path).
+fn maybe_end_reasoning<R>(outcome: &StreamOutcome, ended: &mut bool, on_reasoning: &mut R)
+where
+    R: FnMut(ReasoningEvent<'_>),
+{
+    if *ended {
+        return;
+    }
+    if outcome.reasoning_text.is_empty() {
+        return;
+    }
+    *ended = true;
+    on_reasoning(ReasoningEvent::End {
+        text: &outcome.reasoning_text,
+    });
 }
 
 /// Fetch the model catalog from `<base_url>/v1/models`. Returns an
@@ -194,15 +269,23 @@ pub async fn list_models(
 
 /// Pull every `\n\n`-delimited SSE frame out of `buffer`, parse the
 /// `data:` lines inside each, and apply them to `outcome` / `tc_acc` /
-/// `on_delta`. Trailing partial frames stay in the buffer for the next
-/// read.
-fn drain_complete_frames<F>(
+/// `on_delta` / `on_reasoning`. Trailing partial frames stay in the
+/// buffer for the next read.
+///
+/// `reasoning_ended` is the shared latch that gates the one-shot
+/// `ReasoningEvent::End`. We synthesise it here at the boundary where
+/// the model transitions out of thinking — either the first content
+/// delta arrives, or `finish_reason` lands. Subsequent calls are no-ops.
+fn drain_complete_frames<F, R>(
     buffer: &mut String,
     outcome: &mut StreamOutcome,
     tc_acc: &mut ToolCallAccumulator,
+    reasoning_ended: &mut bool,
     on_delta: &mut F,
+    on_reasoning: &mut R,
 ) where
     F: FnMut(&str),
+    R: FnMut(ReasoningEvent<'_>),
 {
     while let Some(end) = buffer.find("\n\n") {
         let frame: String = buffer.drain(..end + 2).collect();
@@ -214,17 +297,46 @@ fn drain_complete_frames<F>(
             let payload = payload.trim_start();
             match parse_sse_chunk(payload) {
                 SseEvent::Delta(text) => {
+                    // Boundary: first content chunk closes the reasoning
+                    // stream. The chat plugin uses this to flip the
+                    // live reasoning preview into its collapsed form.
+                    if !*reasoning_ended && !outcome.reasoning_text.is_empty() {
+                        *reasoning_ended = true;
+                        on_reasoning(ReasoningEvent::End {
+                            text: &outcome.reasoning_text,
+                        });
+                    }
                     on_delta(&text);
                     outcome.full_text.push_str(&text);
                 }
+                SseEvent::ReasoningDelta(text) => {
+                    outcome.reasoning_text.push_str(&text);
+                    on_reasoning(ReasoningEvent::Delta(&text));
+                }
                 SseEvent::Finish(reason) => {
                     outcome.finish_reason = Some(reason);
+                    // Reasoning-only turn (Gemma 3 edge case): finish
+                    // arrives without any content. Still close the
+                    // reasoning channel so the chat plugin renders the
+                    // collapsed/expanded row instead of leaving the
+                    // assistant entry stuck on "streaming".
+                    if !*reasoning_ended && !outcome.reasoning_text.is_empty() {
+                        *reasoning_ended = true;
+                        on_reasoning(ReasoningEvent::End {
+                            text: &outcome.reasoning_text,
+                        });
+                    }
                 }
                 SseEvent::Usage(u) => {
                     outcome.usage = Some(u);
                 }
-                SseEvent::ToolCallStart { index, id, name } => {
-                    tc_acc.start(index, id, name);
+                SseEvent::ToolCallStart {
+                    index,
+                    id,
+                    name,
+                    args,
+                } => {
+                    tc_acc.start(index, id, name, args);
                 }
                 SseEvent::ToolCallArgsDelta { index, delta } => {
                     tc_acc.append_args(index, &delta);
@@ -258,13 +370,13 @@ impl ToolCallAccumulator {
         Self::default()
     }
 
-    fn start(&mut self, index: usize, id: String, name: String) {
+    fn start(&mut self, index: usize, id: String, name: String, initial_args: String) {
         self.by_index.insert(
             index,
             ToolCallBuilder {
                 id,
                 name,
-                arguments: String::new(),
+                arguments: initial_args,
             },
         );
     }
@@ -322,9 +434,15 @@ mod tests {
         let mut deltas: Vec<String> = Vec::new();
         let mut outcome = StreamOutcome::default();
         let mut tc = ToolCallAccumulator::new();
-        drain_complete_frames(&mut buffer, &mut outcome, &mut tc, &mut |s| {
-            deltas.push(s.to_owned())
-        });
+        let mut ended = false;
+        drain_complete_frames(
+            &mut buffer,
+            &mut outcome,
+            &mut tc,
+            &mut ended,
+            &mut |s| deltas.push(s.to_owned()),
+            &mut |_| {},
+        );
         assert_eq!(deltas, vec!["Hi", " there"]);
         assert_eq!(outcome.full_text, "Hi there");
         assert_eq!(outcome.finish_reason.as_deref(), Some("stop"));
@@ -332,6 +450,7 @@ mod tests {
         assert_eq!(u.prompt_tokens, 3);
         assert_eq!(u.completion_tokens, 2);
         assert!(tc.finalize().is_empty(), "no tool calls");
+        assert!(outcome.reasoning_text.is_empty(), "no reasoning seen");
     }
 
     #[test]
@@ -342,9 +461,15 @@ mod tests {
         let mut outcome = StreamOutcome::default();
         let mut deltas: Vec<String> = Vec::new();
         let mut tc = ToolCallAccumulator::new();
-        drain_complete_frames(&mut buffer, &mut outcome, &mut tc, &mut |s| {
-            deltas.push(s.to_owned())
-        });
+        let mut ended = false;
+        drain_complete_frames(
+            &mut buffer,
+            &mut outcome,
+            &mut tc,
+            &mut ended,
+            &mut |s| deltas.push(s.to_owned()),
+            &mut |_| {},
+        );
         assert!(deltas.is_empty(), "no complete frames yet");
         assert!(buffer.contains("par"), "buffer retained the partial frame");
     }
@@ -355,16 +480,22 @@ mod tests {
         let mut outcome = StreamOutcome::default();
         let mut deltas: Vec<String> = Vec::new();
         let mut tc = ToolCallAccumulator::new();
-        drain_complete_frames(&mut buffer, &mut outcome, &mut tc, &mut |s| {
-            deltas.push(s.to_owned())
-        });
+        let mut ended = false;
+        drain_complete_frames(
+            &mut buffer,
+            &mut outcome,
+            &mut tc,
+            &mut ended,
+            &mut |s| deltas.push(s.to_owned()),
+            &mut |_| {},
+        );
         assert_eq!(deltas, vec!["x"]);
     }
 
     #[test]
     fn tool_call_accumulator_assembles_one_call() {
         let mut tc = ToolCallAccumulator::new();
-        tc.start(0, "call_a".into(), "read_file".into());
+        tc.start(0, "call_a".into(), "read_file".into(), String::new());
         tc.append_args(0, "{\"path\":");
         tc.append_args(0, "\"/tmp/foo.txt\"}");
         let calls = tc.finalize();
@@ -376,10 +507,25 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_accumulator_seeds_args_from_start_chunk() {
+        // Ollama-style: args delivered entirely in the start chunk.
+        let mut tc = ToolCallAccumulator::new();
+        tc.start(
+            0,
+            "call_a".into(),
+            "spawn_graph".into(),
+            r#"{"graph":{"nodes":[]}}"#.into(),
+        );
+        let calls = tc.finalize();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.arguments, r#"{"graph":{"nodes":[]}}"#);
+    }
+
+    #[test]
     fn tool_call_accumulator_assembles_parallel_calls_in_index_order() {
         let mut tc = ToolCallAccumulator::new();
-        tc.start(0, "call_a".into(), "read_file".into());
-        tc.start(1, "call_b".into(), "write_file".into());
+        tc.start(0, "call_a".into(), "read_file".into(), String::new());
+        tc.start(1, "call_b".into(), "write_file".into(), String::new());
         // Args arrive interleaved across indexes — the model emits them
         // in the order it's planning them.
         tc.append_args(1, "{\"path\":\"/x\",");
@@ -408,9 +554,15 @@ mod tests {
         let mut outcome = StreamOutcome::default();
         let mut deltas: Vec<String> = Vec::new();
         let mut tc = ToolCallAccumulator::new();
-        drain_complete_frames(&mut buffer, &mut outcome, &mut tc, &mut |s| {
-            deltas.push(s.to_owned())
-        });
+        let mut ended = false;
+        drain_complete_frames(
+            &mut buffer,
+            &mut outcome,
+            &mut tc,
+            &mut ended,
+            &mut |s| deltas.push(s.to_owned()),
+            &mut |_| {},
+        );
         assert!(deltas.is_empty(), "no text deltas in a tool-call turn");
         assert_eq!(outcome.finish_reason.as_deref(), Some("tool_calls"));
         let calls = tc.finalize();
@@ -418,5 +570,92 @@ mod tests {
         assert_eq!(calls[0].id, "call_x");
         assert_eq!(calls[0].function.name, "read_file");
         assert_eq!(calls[0].function.arguments, "{\"path\":\"/tmp/x\"}");
+    }
+
+    /// Reasoning-then-content interleave assembles correctly into
+    /// separate fields. The reasoning callback fires once per chunk
+    /// during the thinking phase, then `End` exactly once when the
+    /// first content delta arrives. `full_text` only sees content.
+    #[test]
+    fn drain_separates_reasoning_from_content_with_boundary_end() {
+        let mut buffer = String::new();
+        // Three reasoning chunks first (Ollama's typical Qwen3 shape).
+        buffer.push_str(
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"Let me \"}}]}\n\n",
+        );
+        buffer.push_str(
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"think \"}}]}\n\n",
+        );
+        buffer.push_str(
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"about it.\"}}]}\n\n",
+        );
+        // Then content. The first content chunk must trigger
+        // ReasoningEvent::End with the full accumulated trace.
+        buffer.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"The \"}}]}\n\n");
+        buffer.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"answer.\"}}]}\n\n");
+        buffer.push_str("data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n");
+        buffer.push_str("data: [DONE]\n\n");
+
+        let mut outcome = StreamOutcome::default();
+        let mut content_deltas: Vec<String> = Vec::new();
+        let mut reasoning_deltas: Vec<String> = Vec::new();
+        let mut reasoning_ends: Vec<String> = Vec::new();
+        let mut tc = ToolCallAccumulator::new();
+        let mut ended = false;
+        drain_complete_frames(
+            &mut buffer,
+            &mut outcome,
+            &mut tc,
+            &mut ended,
+            &mut |s| content_deltas.push(s.to_owned()),
+            &mut |ev| match ev {
+                ReasoningEvent::Delta(s) => reasoning_deltas.push(s.to_owned()),
+                ReasoningEvent::End { text } => reasoning_ends.push(text.to_owned()),
+            },
+        );
+
+        assert_eq!(content_deltas, vec!["The ", "answer."]);
+        assert_eq!(outcome.full_text, "The answer.");
+        assert_eq!(outcome.reasoning_text, "Let me think about it.");
+        assert_eq!(reasoning_deltas, vec!["Let me ", "think ", "about it."]);
+        // End fires exactly once at the content boundary, carrying the
+        // fully accumulated trace.
+        assert_eq!(reasoning_ends, vec!["Let me think about it."]);
+    }
+
+    /// Reasoning-only turn (Gemma 3 edge case): the model emits
+    /// reasoning then `finish_reason: "stop"` with NO content. End must
+    /// still fire exactly once so the chat plugin can finalise.
+    #[test]
+    fn drain_synthesises_reasoning_end_on_finish_when_no_content() {
+        let mut buffer = String::new();
+        buffer.push_str(
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"thinking only\"}}]}\n\n",
+        );
+        buffer.push_str(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        buffer.push_str("data: [DONE]\n\n");
+
+        let mut outcome = StreamOutcome::default();
+        let mut reasoning_ends: Vec<String> = Vec::new();
+        let mut tc = ToolCallAccumulator::new();
+        let mut ended = false;
+        drain_complete_frames(
+            &mut buffer,
+            &mut outcome,
+            &mut tc,
+            &mut ended,
+            &mut |_| {},
+            &mut |ev| {
+                if let ReasoningEvent::End { text } = ev {
+                    reasoning_ends.push(text.to_owned());
+                }
+            },
+        );
+
+        assert!(outcome.full_text.is_empty(), "no content emitted");
+        assert_eq!(outcome.reasoning_text, "thinking only");
+        assert_eq!(reasoning_ends, vec!["thinking only"]);
     }
 }

@@ -89,6 +89,36 @@ pub struct TranscriptEntry {
     pub duration_ms: Option<u64>,
     /// Optional tool-specific payload — present iff `role == Role::Tool`.
     pub tool: Option<ToolPayload>,
+    /// Optional reasoning trace attached to an assistant entry. Present
+    /// only on `Role::Assistant`; carries the model's thinking output
+    /// (Ollama's `delta.reasoning` for Qwen 3 / Gemma 3). Renders as a
+    /// dim live preview while `reasoning_streaming` is true; collapses
+    /// to a `▶ reasoning (Ns)` row once content begins (or the turn
+    /// ends with reasoning-only). Toggled to expanded view by Ctrl+O,
+    /// same binding used for tool I/O details. NEVER fed back into the
+    /// next request's history.
+    pub reasoning: Option<ReasoningPayload>,
+}
+
+/// Reasoning trace carried on an assistant entry. Mirrors the shape of
+/// `ToolPayload` (collapsed-by-default + expandable on Ctrl+O) so the
+/// renderer can reuse the same toggle convention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReasoningPayload {
+    /// Accumulated reasoning text. Grows during streaming and finalises
+    /// with the authoritative `reasoning_end.text`.
+    pub text: String,
+    /// `true` while `chat.stream.reasoning_delta` events are still
+    /// landing for this entry; flipped to `false` on
+    /// `chat.stream.reasoning_end` (or the entry's own `chat.stream.end`
+    /// as a defensive close). Drives the live preview vs. collapsed
+    /// row distinction in the renderer.
+    pub streaming: bool,
+    /// Wall-clock duration from the first reasoning chunk to the
+    /// `reasoning_end` boundary. Stamped from
+    /// `chat.stream.reasoning_end.duration_ms` (provider-side timer).
+    /// Used in the collapsed-row label `▶ reasoning (Ns)`.
+    pub duration_ms: Option<u64>,
 }
 
 /// Tool-call payload carried on a [`Role::Tool`] entry. Holds the harness's
@@ -121,6 +151,7 @@ impl TranscriptEntry {
             model: None,
             duration_ms: None,
             tool: None,
+            reasoning: None,
         }
     }
 }
@@ -846,6 +877,12 @@ pub struct ChatState {
     /// every tool entry to a one-line summary; `true` expands all of them
     /// to show full input + output.
     pub tools_expanded_global: bool,
+    /// Most recent ESC keypress timestamp. Two ESCs within
+    /// `DOUBLE_ESC_WINDOW` escalate from `Action::Interrupt` (cancel the
+    /// in-flight chat run) to `Action::InterruptAll` (cancel chat + all
+    /// sub-graph runs, drop deferred queue). `None` if no ESC has been
+    /// pressed yet, or if the previous ESC was outside the window.
+    pub last_escape_at: Option<Instant>,
     /// Submitted-prompt history, oldest first. Up/Down on an empty input
     /// buffer recall older/newer entries — same convention as a shell.
     pub prompt_history: Vec<String>,
@@ -931,6 +968,7 @@ impl ChatState {
             awaiting_response_since: None,
             awaiting_response_acknowledged: false,
             tools_expanded_global: false,
+            last_escape_at: None,
             prompt_history: Vec::new(),
             history_cursor: None,
             providers: Vec::new(),
@@ -1321,6 +1359,7 @@ impl ChatState {
                 output: None,
                 error: false,
             }),
+            reasoning: None,
         });
         self.bump_transcript_version();
     }
@@ -1358,6 +1397,81 @@ impl ChatState {
         self.bump_transcript_version();
     }
 
+    /// Append a chunk of streaming reasoning text to the in-flight
+    /// assistant entry. Creates a fresh streaming assistant entry (with
+    /// `text` empty) if none is open — reasoning often arrives BEFORE
+    /// the first content delta, so this is the typical first observation
+    /// of a turn for thinking-trace models. Subsequent
+    /// `append_assistant_delta` calls then attach content to the same
+    /// entry.
+    pub fn append_assistant_reasoning_delta(&mut self, chunk: &str) {
+        if let Some(last) = self.transcript.last_mut() {
+            if last.role == Role::Assistant && last.streaming {
+                let r = last
+                    .reasoning
+                    .get_or_insert_with(|| ReasoningPayload {
+                        text: String::new(),
+                        streaming: true,
+                        duration_ms: None,
+                    });
+                r.text.push_str(chunk);
+                r.streaming = true;
+                self.bump_transcript_version();
+                return;
+            }
+        }
+        self.transcript.push(TranscriptEntry {
+            role: Role::Assistant,
+            text: String::new(),
+            streaming: true,
+            model: None,
+            duration_ms: None,
+            tool: None,
+            reasoning: Some(ReasoningPayload {
+                text: chunk.to_owned(),
+                streaming: true,
+                duration_ms: None,
+            }),
+        });
+        self.bump_transcript_version();
+    }
+
+    /// Close the in-flight assistant entry's reasoning channel. Called
+    /// from `chat.stream.reasoning_end`. If `final_text` is non-empty
+    /// it overrides the accumulated streaming text (the provider's
+    /// authoritative full trace); empty replaces nothing. `duration_ms`
+    /// stamps the collapsed-row label. Triggers the visual transition
+    /// from live-preview to collapsed `▶ reasoning (Ns)` row.
+    ///
+    /// Idempotent: if there's no in-flight assistant entry or no
+    /// reasoning has been observed, this is a no-op (a stray
+    /// `reasoning_end` from a non-thinking model just gets dropped).
+    pub fn finalize_assistant_reasoning(
+        &mut self,
+        final_text: Option<String>,
+        duration_ms: Option<u64>,
+    ) {
+        let Some(last) = self.transcript.last_mut() else {
+            return;
+        };
+        if last.role != Role::Assistant {
+            return;
+        }
+        let Some(r) = last.reasoning.as_mut() else {
+            return;
+        };
+        if let Some(t) = final_text {
+            if !t.is_empty() {
+                r.text = t;
+            }
+        }
+        r.streaming = false;
+        if duration_ms.is_some() {
+            r.duration_ms = duration_ms;
+        }
+        self.bump_transcript_version();
+    }
+
     /// Append a chunk of streaming assistant text. Creates a new streaming
     /// entry if none is currently open; otherwise appends to the last
     /// streaming assistant entry.
@@ -1376,6 +1490,7 @@ impl ChatState {
             model: None,
             duration_ms: None,
             tool: None,
+            reasoning: None,
         });
         self.bump_transcript_version();
     }
@@ -1401,6 +1516,13 @@ impl ChatState {
                     }
                 }
                 last.streaming = false;
+                // Defensive close: if reasoning was still streaming
+                // (provider emitted stream.end without a paired
+                // reasoning_end), flip it to collapsed so the entry
+                // doesn't render as a frozen live-preview.
+                if let Some(r) = last.reasoning.as_mut() {
+                    r.streaming = false;
+                }
                 self.bump_transcript_version();
                 return;
             }
@@ -1416,6 +1538,7 @@ impl ChatState {
                 model: None,
                 duration_ms: None,
                 tool: None,
+                reasoning: None,
             });
             self.bump_transcript_version();
         }

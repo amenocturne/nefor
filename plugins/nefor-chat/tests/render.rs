@@ -574,12 +574,118 @@ fn tool_expanded_via_ctrl_o_shows_salient_header_and_output() {
         .map(|r| row_text(r))
         .collect::<Vec<_>>()
         .join("\n");
-    // Salient command is on the header; the standalone `input:` block was
-    // dropped in favour of the inline summary.
+    // Salient command rides on the header AND the full input block
+    // renders below. Simple-input tools accept the redundancy so
+    // structured-input tools (spawn_graph, write_file) stay viewable.
     assert!(joined.contains("▼ Bash(ls)"), "expanded header: {joined}");
-    assert!(!joined.contains("input:"), "input block must be gone: {joined}");
+    assert!(joined.contains("input:"), "input block missing: {joined}");
+    assert!(joined.contains("\"command\""), "input json missing: {joined}");
     assert!(joined.contains("output:"), "output label: {joined}");
     assert!(joined.contains("file1"), "output content: {joined}");
+}
+
+#[test]
+fn reasoning_only_in_flight_renders_live_preview() {
+    // Provider has emitted reasoning chunks but no content yet. The
+    // expected shape: a `▼ thinking…` header followed by the trace
+    // body in italic — the live preview that replaces the static
+    // "thinking..." spinner the user used to see.
+    let mut s = new_state(80, 24);
+    s.append_assistant_reasoning_delta("Reading the input.\n");
+    s.append_assistant_reasoning_delta("Picking the right relay.");
+    let events = render_frame(&mut s);
+    let lines = find_line_events(&events);
+    let joined: String = lines
+        .iter()
+        .map(|r| row_text(r))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("▼ thinking…"),
+        "live reasoning header missing: {joined}"
+    );
+    assert!(
+        joined.contains("Reading the input."),
+        "live reasoning body missing: {joined}"
+    );
+    assert!(
+        !joined.contains("▸ reasoning"),
+        "must not show collapsed marker while still streaming reasoning-only: {joined}"
+    );
+}
+
+#[test]
+fn reasoning_collapses_to_one_row_once_content_arrives() {
+    // The full path: reasoning streams first, then reasoning_end fires
+    // (provider's boundary signal), then content streams normally. The
+    // reasoning trace must collapse to `▸ reasoning (Ns)` and the
+    // content render below it.
+    let mut s = new_state(80, 24);
+    s.append_assistant_reasoning_delta("thinking about it");
+    s.finalize_assistant_reasoning(
+        Some("thinking about it".into()),
+        Some(1_500),
+    );
+    s.append_assistant_delta("Final answer.");
+    s.finalize_assistant(None);
+    let events = render_frame(&mut s);
+    let lines = find_line_events(&events);
+    let joined: String = lines
+        .iter()
+        .map(|r| row_text(r))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("▸ reasoning"),
+        "collapsed reasoning marker missing: {joined}"
+    );
+    assert!(
+        joined.contains("1.5s") || joined.contains("1s"),
+        "duration label missing: {joined}"
+    );
+    assert!(
+        joined.contains("Final answer"),
+        "content body missing: {joined}"
+    );
+    // The full trace text must NOT bleed into the rendered surface
+    // when collapsed — only the marker line.
+    assert!(
+        !joined.contains("thinking about it"),
+        "full trace must be hidden while collapsed: {joined}"
+    );
+}
+
+#[test]
+fn reasoning_only_finalized_collapses_to_marker() {
+    // Provider streamed reasoning, fired reasoning_end, but the turn
+    // continued with a tool call instead of content. The reasoning
+    // must still collapse to `▸ reasoning (Ns)` — the full trace is
+    // reachable via Ctrl+O like every other reasoning entry.
+    let mut s = new_state(80, 24);
+    s.append_assistant_reasoning_delta("planning the spawn_graph call");
+    s.finalize_assistant_reasoning(
+        Some("planning the spawn_graph call".into()),
+        Some(800),
+    );
+    let events = render_frame(&mut s);
+    let lines = find_line_events(&events);
+    let joined: String = lines
+        .iter()
+        .map(|r| row_text(r))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("▸ reasoning"),
+        "collapsed reasoning marker missing: {joined}"
+    );
+    assert!(
+        !joined.contains("planning the spawn_graph"),
+        "full trace must be hidden while collapsed: {joined}"
+    );
+    assert!(
+        !joined.contains("no content produced"),
+        "stale 'no content produced' branch still rendering: {joined}"
+    );
 }
 
 #[test]

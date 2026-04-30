@@ -21,8 +21,8 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 use crate::state::{
-    AuthStatus, ChatState, DagNodeStatus, DagRunUiState, Popup, Role, RowSnapshot, SessionMetadata,
-    TranscriptEntry,
+    AuthStatus, ChatState, DagNodeStatus, DagRunUiState, Popup, ReasoningPayload, Role,
+    RowSnapshot, SessionMetadata, TranscriptEntry,
 };
 use crate::wrap::{char_width, str_width, wrap_to_width};
 
@@ -128,6 +128,7 @@ pub const HL_MD_QUOTE_BAR: u32 = 17;
 pub const HL_FOOTER: u32 = 19;
 pub const HL_STATUS_INFO: u32 = 20;
 pub const HL_STATUS_OK: u32 = 21;
+pub const HL_REASONING: u32 = 22;
 
 /// Width of the vertical separator drawn between the chat pane and the
 /// sidebar. One column of `│` in `HL_FOOTER`. Subtracted from the sidebar's
@@ -177,6 +178,7 @@ pub fn palette_defines() -> Vec<Map<String, Value>> {
         hl_attr_define(HL_FOOTER, Some(0x707070), None, false, false, false),
         hl_attr_define(HL_STATUS_INFO, Some(0x7FB4FF), None, false, false, false),
         hl_attr_define(HL_STATUS_OK, Some(0x87D787), None, false, false, false),
+        hl_attr_define(HL_REASONING, Some(0x808080), None, false, true, false),
     ]
 }
 
@@ -1576,6 +1578,17 @@ fn wrap_transcript(entries: &[TranscriptEntry], cols: usize, tools_expanded: boo
                 }
             }
             Role::Assistant => {
+                // Reasoning rides above the content body when present.
+                // Two render shapes, driven off ReasoningPayload + Ctrl+O:
+                //   * streaming, no content yet → live italic preview.
+                //   * otherwise → collapsed `▸ reasoning (Ns)` row,
+                //     unless `tools_expanded` is on (full trace).
+                if let Some(r) = e.reasoning.as_ref() {
+                    for line in reasoning_lines(r, &e.text, cols, tools_expanded) {
+                        out.push(line);
+                    }
+                }
+
                 // No prefix — assistant messages are the dominant content
                 // and stand on their own. Markdown rendering applies to the
                 // whole body. The visual cue that this is the assistant is
@@ -3039,6 +3052,52 @@ const TOOL_EXPANDED_BODY_CAP: usize = 20;
 
 /// Render a one-line collapsed tool summary: `▸ <Name>(<truncated input>)`,
 /// or `▸ <Name>(<…>) … running` while still in flight.
+/// Render the reasoning rows for an assistant entry. Mirrors the tool
+/// collapsed/expanded convention so the user only has to remember one
+/// toggle (Ctrl+O). Live preview while streaming-with-no-content;
+/// otherwise collapsed `▸ reasoning (Ns)` (or expanded full trace if
+/// `expanded`). Reasoning-only turns (no content followed) collapse
+/// the same way — the trace is always reachable via Ctrl+O.
+fn reasoning_lines(
+    r: &ReasoningPayload,
+    content_text: &str,
+    cols: usize,
+    expanded: bool,
+) -> Vec<Line> {
+    if r.text.is_empty() {
+        return Vec::new();
+    }
+
+    let live = r.streaming && content_text.is_empty();
+    let show_full = live || expanded;
+
+    let mut out: Vec<Line> = Vec::new();
+    if show_full {
+        let header = if live { "▼ thinking…" } else { "▼ reasoning" };
+        out.push(vec![Span::new(header.to_string(), HL_FOOTER)]);
+        for line in wrap_to_width(&r.text, cols.saturating_sub(2).max(1)) {
+            out.push(vec![
+                Span::new("  ".to_string(), HL_FOOTER),
+                Span::new(line, HL_REASONING),
+            ]);
+        }
+    } else {
+        // Collapsed: one row, `▸ reasoning (Ns)`. Mirrors
+        // tool_collapsed_line's `▸ <Name>` head + parenthesised tail.
+        let label = match r.duration_ms.map(humanize_duration_ms) {
+            Some(d) => format!("▸ reasoning ({d})"),
+            None => "▸ reasoning".to_owned(),
+        };
+        let truncated = if str_width(&label) > cols {
+            truncate(&label, cols.max(1))
+        } else {
+            label
+        };
+        out.push(vec![Span::new(truncated, HL_FOOTER)]);
+    }
+    out
+}
+
 fn tool_collapsed_line(payload: &crate::state::ToolPayload, cols: usize) -> Line {
     let input_value: Option<Value> = if payload.input_json.is_empty() {
         None
@@ -3067,10 +3126,14 @@ fn tool_collapsed_line(payload: &crate::state::ToolPayload, cols: usize) -> Line
     };
 
     let mut spans = Vec::with_capacity(4);
-    // Errored tools are signalled by the dedicated `  error` sub-line below;
-    // the tool name itself stays in the neutral system color to avoid two
-    // redundant cues for one signal.
-    spans.push(Span::new(head, HL_SYSTEM));
+    // Tool name uses the same bright highlight as the expanded view's
+    // header — this is meaningful content (the model invoked a tool),
+    // not surrounding chrome, so it deserves to pop. Mirrors
+    // `tool_expanded_lines`'s header_hl rule: error → red, otherwise
+    // the heading orange. The parenthesised salient tail stays dim
+    // (HL_FOOTER) so the name reads as the primary anchor.
+    let head_hl = if payload.error { HL_STATUS_DANGER } else { HL_MD_HEADING };
+    spans.push(Span::new(head, head_hl));
     if !tail_text.is_empty() {
         spans.push(Span::new(tail_text, HL_FOOTER));
     }
@@ -3099,13 +3162,36 @@ fn tool_salient_summary(name: &str, input: Option<&Value>) -> Option<String> {
             input.and_then(|v| v.get("path")).and_then(Value::as_str)
         }
         "Grep" | "Glob" => input.and_then(|v| v.get("pattern")).and_then(Value::as_str),
+        // spawn_graph: report the node count rather than fishing a string
+        // field out of the input. The fallback below would otherwise grab
+        // `on_node_failure: "abort"` (a short policy enum) and render
+        // `spawn_graph(abort)` — looks like the tool aborted, very
+        // misleading. "(N nodes)" tells the user what they need to know
+        // at a glance; the full graph JSON is one Ctrl+O away.
+        "spawn_graph" => {
+            return input
+                .and_then(|v| v.get("graph"))
+                .and_then(|g| g.get("nodes"))
+                .and_then(Value::as_array)
+                .map(|nodes| match nodes.len() {
+                    1 => "1 node".to_owned(),
+                    n => format!("{n} nodes"),
+                });
+        }
         _ => None,
     };
     salient.map(str::to_owned).or_else(|| {
         // Fall back to the first short string field of the input map, so
-        // unknown tools still surface *something*.
+        // unknown tools still surface *something*. Skip well-known
+        // policy/enum fields (`on_node_failure`, `mode`, …) so they
+        // don't masquerade as the salient input — they describe HOW
+        // the tool runs, not WHAT it operates on.
+        const POLICY_FIELDS: &[&str] = &["on_node_failure", "mode", "policy", "strategy"];
         let obj = input.and_then(Value::as_object)?;
-        for (_k, v) in obj.iter() {
+        for (k, v) in obj.iter() {
+            if POLICY_FIELDS.contains(&k.as_str()) {
+                continue;
+            }
             if let Some(s) = v.as_str() {
                 if !s.is_empty() {
                     return Some(s.to_owned());
@@ -3155,6 +3241,30 @@ fn tool_expanded_lines(payload: &crate::state::ToolPayload, cols: usize) -> Vec<
     out.push(vec![Span::new(header_text, header_hl)]);
 
     let inner_w = cols.saturating_sub(2).max(1);
+
+    // Input block. Pretty-print the JSON for readability; fall back to
+    // the raw string when parse fails. We always show this when the
+    // model sent ANY input, including cases where the salient tail in
+    // the header already echoed the same field. For structured-input
+    // tools (`spawn_graph`, `write_file` with `content`, …) the salient
+    // tail truncates aggressively and the full payload is otherwise
+    // unreachable — losing input visibility is a worse failure than
+    // mild redundancy with the header tail.
+    if !payload.input_json.is_empty() {
+        out.push(vec![Span::new("  input:".to_string(), HL_FOOTER)]);
+        let pretty = match input_value.as_ref() {
+            Some(v) => serde_json::to_string_pretty(v)
+                .unwrap_or_else(|_| payload.input_json.clone()),
+            None => payload.input_json.clone(),
+        };
+        for line in body_lines(&pretty, inner_w, TOOL_EXPANDED_BODY_CAP) {
+            out.push(vec![
+                Span::new("  ".to_string(), HL_FOOTER),
+                Span::new(line, HL_MD_CODE_BLOCK),
+            ]);
+        }
+    }
+
     let (label, body_text) = match payload.output.as_deref() {
         None => ("  running...", None),
         Some(o) => ("  output:", Some(o)),
@@ -3512,7 +3622,7 @@ mod tests {
         // dropped when the misconfigured-harness banner was replaced by the
         // live "[thinking… Ns]" placeholder. HL_STATUS_OK added for the DAG
         // widget's "done" colour.
-        assert_eq!(defs.len(), 20);
+        assert_eq!(defs.len(), 21);
         for d in &defs {
             assert_eq!(d["kind"], Value::String("nefor-tui.hl_attr_define".into()));
             assert!(d.get("id").is_some());
@@ -4143,7 +4253,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_expanded_renders_salient_in_header_and_output_body() {
+    fn tool_expanded_renders_salient_in_header_and_input_and_output_body() {
         let payload = crate::state::ToolPayload {
             id: "toolu_1".into(),
             name: "Bash".into(),
@@ -4156,10 +4266,14 @@ mod tests {
             .iter()
             .flat_map(|l| l.iter().map(|s| s.text.as_str()))
             .collect();
-        // Salient command rides on the header — no separate `input:` block.
+        // Salient command rides on the header AND the full input block
+        // is shown below. Mild redundancy on simple tools is acceptable
+        // because for structured-input tools (spawn_graph, write_file)
+        // the salient tail truncates and the full payload would
+        // otherwise be unreachable.
         assert!(joined.contains("▼ Bash(ls)"), "header missing: {joined:?}");
-        assert!(!joined.contains("input:"), "input block must be dropped");
-        assert!(!joined.contains("\"command\""), "raw json must not appear");
+        assert!(joined.contains("input:"), "input block missing: {joined:?}");
+        assert!(joined.contains("\"command\""), "input json missing: {joined:?}");
         assert!(joined.contains("output:"), "output label missing");
         assert!(joined.contains("file1"), "output body missing");
         assert!(joined.contains("file2"), "output body missing");
