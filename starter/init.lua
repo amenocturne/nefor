@@ -202,10 +202,13 @@ ncp.spawn {
 chat_orchestrator.configure {
   provider = PROVIDER_NAME,
   model    = PROVIDER_MODEL,
-  -- system prompt intentionally omitted while we stabilise the chat
-  -- pipeline. Add a real system message back once continuous chat
-  -- works end-to-end and we want to test tool-graph driven behaviour.
-  system   = "",
+  -- Minimal system prompt: verifies the chat pipeline still honours
+  -- terse user instructions when a system message is present. Tools
+  -- are still advertised through the catalog (spawn_graph, basic
+  -- tools), so this also tests instruction-following with tools
+  -- attached. If gemma starts ignoring "respond X and nothing else"
+  -- prompts again, the tool catalog is the next variable to isolate.
+  system   = "You are a helpful assistant.",
 }
 rg_adapter.set_default_provider(PROVIDER_NAME, PROVIDER_MODEL)
 -- next_state capture rides on rg_adapter's in-process observer hook.
