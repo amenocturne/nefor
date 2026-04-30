@@ -43,6 +43,12 @@ use std::collections::HashSet;
 /// without the visible Ns changing.
 const PENDING_TICK: Duration = Duration::from_secs(1);
 
+/// Two ESCs within this window escalate to `Action::InterruptAll`. 600ms
+/// is comfortable for a deliberate double-tap and short enough that a
+/// stray ESC followed by an unrelated one half a second later won't
+/// nuke the user's runs by accident.
+const DOUBLE_ESC_WINDOW: Duration = Duration::from_millis(600);
+
 /// Plugin version for the `nefor-chat.hello` self-description event.
 pub const PLUGIN_VERSION: &str = "0.1.0";
 /// NCP version this plugin speaks.
@@ -176,6 +182,17 @@ async fn run() -> Result<(), ChatError> {
                     emit_render(&out_tx, &mut state).await?;
                 }
             }
+            Action::InterruptAll => {
+                state.acknowledge_response();
+                send_event(&out_tx, interrupt_all_body()).await?;
+                if state.tui_ready {
+                    if !palette_emitted {
+                        emit_palette(&out_tx).await?;
+                        palette_emitted = true;
+                    }
+                    emit_render(&out_tx, &mut state).await?;
+                }
+            }
             Action::SelectModel(sel) => {
                 send_event(
                     &out_tx,
@@ -249,6 +266,11 @@ enum Action {
     SubmitPrompt(String),
     /// The user hit ESC during a live turn — emit `chat.interrupt` and render.
     Interrupt,
+    /// The user hit ESC twice within DOUBLE_ESC_WINDOW — escalate: cancel
+    /// the in-flight chat run AND every sub-graph run AND drop any queued
+    /// deferred results. Emits `chat.interrupt_all`; the orchestrator
+    /// drives the actual cancellation fan-out.
+    InterruptAll,
     /// Model picker confirmed a row — emit `chat.model.set` and render.
     SelectModel(ModelSelection),
     /// User responded to a tool-permission popup — emit
@@ -357,6 +379,35 @@ fn handle_event(map: &Map<String, Value>, state: &mut ChatState) -> Action {
                 Action::Continue
             }
         }
+        "chat.stream.reasoning_delta" => {
+            // Live-stream the model's thinking trace into the in-flight
+            // assistant entry. The renderer shows it as a dim preview
+            // while content is empty; once content arrives the trace
+            // collapses to a one-row marker (see `chat.stream.reasoning_end`).
+            if let Some(t) = map.get("text").and_then(Value::as_str) {
+                if !t.is_empty() {
+                    state.acknowledge_response();
+                    state.append_assistant_reasoning_delta(t);
+                    return Action::Render;
+                }
+            }
+            Action::Continue
+        }
+        "chat.stream.reasoning_end" => {
+            // Reasoning channel closed — either content has started or
+            // the turn ended reasoning-only. Flip the in-flight entry's
+            // reasoning row from live-preview to collapsed and stamp
+            // the duration. The full trace is preserved on the entry
+            // for the Ctrl+O expanded view.
+            let final_text = map
+                .get("text")
+                .and_then(Value::as_str)
+                .map(|s| s.to_owned());
+            let duration_ms = map.get("duration_ms").and_then(Value::as_u64);
+            state.acknowledge_response();
+            state.finalize_assistant_reasoning(final_text, duration_ms);
+            Action::Render
+        }
         "chat.stream.end" => {
             let authoritative = map
                 .get("text")
@@ -426,10 +477,10 @@ fn handle_event(map: &Map<String, Value>, state: &mut ChatState) -> Action {
         "chat.popup" => handle_popup_event(map, state),
         "chat.tool.permission_request" => handle_tool_permission_request(map, state),
         "tool-gate.mode_changed" => handle_gate_mode_changed(map, state),
-        "dag.run_started" => handle_dag_run_started(map, state),
-        "dag.node_dispatched" => handle_dag_node_dispatched(map, state),
-        "dag.node_result" => handle_dag_node_result(map, state),
-        "dag.run_complete" => handle_dag_run_complete(map, state),
+        "graph.run_started" => handle_dag_run_started(map, state),
+        "graph.node_dispatched" => handle_dag_node_dispatched(map, state),
+        "graph.node_result" => handle_dag_node_result(map, state),
+        "graph.run_complete" => handle_dag_run_complete(map, state),
         "chat.history.replay" => {
             // Replace the transcript with stored-on-disk history from a
             // previous session. The producer guarantees `entries` is
@@ -959,10 +1010,21 @@ fn handle_key(map: &Map<String, Value>, state: &mut ChatState) -> Action {
             }
         }
         "escape" => {
-            // Mid-turn abort: only meaningful while we're awaiting a harness
-            // response. With nothing in flight, ESC stays a no-op so we don't
-            // spam the bus with interrupts the harness has nothing to do with.
-            if state.awaiting_response_since.is_some() {
+            // Two ESCs inside DOUBLE_ESC_WINDOW escalate to "kill
+            // everything" — chat run + every spawn_graph sub-graph + any
+            // queued deferred results. Useful when a model wandered into
+            // a thinking loop and a single chat.interrupt isn't enough
+            // (sub-graphs keep churning).
+            let now = std::time::Instant::now();
+            let escalate = state
+                .last_escape_at
+                .map(|prev| now.duration_since(prev) <= DOUBLE_ESC_WINDOW)
+                .unwrap_or(false);
+            state.last_escape_at = Some(now);
+            if escalate {
+                state.last_escape_at = None;
+                Action::InterruptAll
+            } else if state.awaiting_response_since.is_some() {
                 Action::Interrupt
             } else {
                 Action::Continue
@@ -1652,6 +1714,12 @@ fn input_submit_body(text: &str) -> Map<String, Value> {
 fn interrupt_body() -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("kind".into(), Value::String("chat.interrupt".into()));
+    m
+}
+
+fn interrupt_all_body() -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("kind".into(), Value::String("chat.interrupt_all".into()));
     m
 }
 
@@ -3578,7 +3646,7 @@ mod tests {
         let run_id = "11111111-2222-4333-8444-555555555555".to_owned();
         s.pending_dag_runs.insert(run_id.clone());
         let env = event_env(json!({
-            "kind": "dag.run_complete",
+            "kind": "graph.run_complete",
             "run_id": run_id,
             "status": "success",
             "results": {
@@ -3613,7 +3681,7 @@ mod tests {
         let v0 = s.transcript_version;
         let len0 = s.transcript.len();
         let env = event_env(json!({
-            "kind": "dag.run_complete",
+            "kind": "graph.run_complete",
             "run_id": "ffffffff-0000-4000-8000-000000000000",
             "status": "success",
             "results": { "n1": { "output": "x" } },
@@ -3639,7 +3707,7 @@ mod tests {
         let run_id = "abcdef01-2345-4678-89ab-cdef01234567".to_owned();
         s.pending_dag_runs.insert(run_id.clone());
         let env = event_env(json!({
-            "kind": "dag.run_complete",
+            "kind": "graph.run_complete",
             "run_id": run_id,
             "status": "failure",
             "results": {
@@ -3669,7 +3737,7 @@ mod tests {
         s.pending_dag_runs.insert(run_id.clone());
         let big = "x".repeat(1000);
         let env = event_env(json!({
-            "kind": "dag.run_complete",
+            "kind": "graph.run_complete",
             "run_id": run_id,
             "status": "success",
             "results": { "n1": { "output": big.clone() } },
@@ -3691,7 +3759,7 @@ mod tests {
     fn dag_run_started_inserts_run_into_dag_runs() {
         let mut s = ChatState::new();
         let env = event_env(json!({
-            "kind": "dag.run_started",
+            "kind": "graph.run_started",
             "run_id": "run-aaa",
             "total_nodes": 3,
         }));
@@ -3708,14 +3776,14 @@ mod tests {
         let mut s = ChatState::new();
         let _ = handle_envelope(
             event_env(json!({
-                "kind": "dag.run_started",
+                "kind": "graph.run_started",
                 "run_id": "run-bbb",
                 "total_nodes": 2,
             })),
             &mut s,
         );
         let env = event_env(json!({
-            "kind": "dag.node_dispatched",
+            "kind": "graph.node_dispatched",
             "run_id": "run-bbb",
             "node_id": "n1",
             "reasoner": "ollama",
@@ -3736,7 +3804,7 @@ mod tests {
         // something, with total_nodes=0 until run_started fills it in.
         let mut s = ChatState::new();
         let env = event_env(json!({
-            "kind": "dag.node_dispatched",
+            "kind": "graph.node_dispatched",
             "run_id": "run-orph",
             "node_id": "n7",
             "reasoner": "ollama",
@@ -3752,7 +3820,7 @@ mod tests {
         let mut s = ChatState::new();
         let _ = handle_envelope(
             event_env(json!({
-                "kind": "dag.run_started",
+                "kind": "graph.run_started",
                 "run_id": "run-ccc",
                 "total_nodes": 1,
             })),
@@ -3760,7 +3828,7 @@ mod tests {
         );
         let _ = handle_envelope(
             event_env(json!({
-                "kind": "dag.node_dispatched",
+                "kind": "graph.node_dispatched",
                 "run_id": "run-ccc",
                 "node_id": "n1",
                 "reasoner": "ollama",
@@ -3768,7 +3836,7 @@ mod tests {
             &mut s,
         );
         let env = event_env(json!({
-            "kind": "dag.node_result",
+            "kind": "graph.node_result",
             "run_id": "run-ccc",
             "node_id": "n1",
             "output": "ok",
@@ -3789,7 +3857,7 @@ mod tests {
         let mut s = ChatState::new();
         let _ = handle_envelope(
             event_env(json!({
-                "kind": "dag.run_started",
+                "kind": "graph.run_started",
                 "run_id": "run-ddd",
                 "total_nodes": 1,
             })),
@@ -3797,7 +3865,7 @@ mod tests {
         );
         let _ = handle_envelope(
             event_env(json!({
-                "kind": "dag.node_dispatched",
+                "kind": "graph.node_dispatched",
                 "run_id": "run-ddd",
                 "node_id": "n1",
                 "reasoner": "ollama",
@@ -3805,7 +3873,7 @@ mod tests {
             &mut s,
         );
         let env = event_env(json!({
-            "kind": "dag.node_result",
+            "kind": "graph.node_result",
             "run_id": "run-ddd",
             "node_id": "n1",
             "error": "timeout",
@@ -3829,7 +3897,7 @@ mod tests {
         s.pending_dag_runs.insert(run_id.clone());
         let _ = handle_envelope(
             event_env(json!({
-                "kind": "dag.run_started",
+                "kind": "graph.run_started",
                 "run_id": run_id.clone(),
                 "total_nodes": 1,
             })),
@@ -3837,7 +3905,7 @@ mod tests {
         );
         assert!(s.dag_runs.contains_key(&run_id));
         let env = event_env(json!({
-            "kind": "dag.run_complete",
+            "kind": "graph.run_complete",
             "run_id": run_id,
             "status": "success",
             "results": { "n1": { "output": "ok" } },
@@ -3868,14 +3936,14 @@ mod tests {
         let run_id = "panel-only".to_owned();
         let _ = handle_envelope(
             event_env(json!({
-                "kind": "dag.run_started",
+                "kind": "graph.run_started",
                 "run_id": run_id.clone(),
                 "total_nodes": 1,
             })),
             &mut s,
         );
         let env = event_env(json!({
-            "kind": "dag.run_complete",
+            "kind": "graph.run_complete",
             "run_id": run_id,
             "status": "success",
             "results": {},
@@ -3901,7 +3969,7 @@ mod tests {
         let mut s = ChatState::new();
         let _ = handle_envelope(
             event_env(json!({
-                "kind": "dag.run_started",
+                "kind": "graph.run_started",
                 "run_id": "run-h",
                 "total_nodes": 2,
             })),
@@ -3911,7 +3979,7 @@ mod tests {
         assert_eq!(s.dag_panel_rows(), 1);
         let _ = handle_envelope(
             event_env(json!({
-                "kind": "dag.node_dispatched",
+                "kind": "graph.node_dispatched",
                 "run_id": "run-h",
                 "node_id": "n1",
                 "reasoner": "ollama",
@@ -3920,7 +3988,7 @@ mod tests {
         );
         let _ = handle_envelope(
             event_env(json!({
-                "kind": "dag.node_dispatched",
+                "kind": "graph.node_dispatched",
                 "run_id": "run-h",
                 "node_id": "n2",
                 "reasoner": "ollama",
@@ -3938,7 +4006,7 @@ mod tests {
         s.pending_dag_runs.insert("run-pre".into());
         let _ = handle_envelope(
             event_env(json!({
-                "kind": "dag.run_started",
+                "kind": "graph.run_started",
                 "run_id": "run-pre",
                 "total_nodes": 1,
             })),

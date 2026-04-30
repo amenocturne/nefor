@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*", "plugins/mock-plugin", "plugins/nefor-chat", "plugins/nefor-combinators", "plugins/nefor-tui", "tools/fake-engine"]
+members = ["crates/*", "plugins/basic-tools", "plugins/reasoner-graph", "plugins/generic-provider", "plugins/generic-tool", "plugins/openai-provider", "plugins/mock-plugin", "plugins/nefor-chat", "plugins/nefor-combinators", "plugins/nefor-tui", "plugins/tool-gate", "tools/fake-engine"]
 resolver = "2"
 
 [workspace.package]
@@ -10,7 +10,7 @@ repository = "https://github.com/amenocturne/nefor"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
-mlua = { version = "0.10", features = ["lua54", "async", "send", "vendored"] }
+mlua = { version = "0.10", features = ["lua54", "async", "send", "vendored", "serialize"] }
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"

@@ -72,6 +72,7 @@ async fn streaming_emits_deltas_then_end() {
         None,
         CancellationToken::new(),
         |d| deltas.push(d.to_owned()),
+        |_| {},
     )
     .await
     .expect("ok");
@@ -116,6 +117,7 @@ async fn request_failure_emits_turn_error() {
         &messages,
         None,
         CancellationToken::new(),
+        |_| {},
         |_| {},
     )
     .await
@@ -193,6 +195,7 @@ async fn chat_completion_uses_passed_in_model_not_a_default() {
         &messages,
         None,
         CancellationToken::new(),
+        |_| {},
         |_| {},
     )
     .await
@@ -291,6 +294,7 @@ async fn unauthorized_response_yields_unauthorized_variant() {
         None,
         CancellationToken::new(),
         |_| {},
+        |_| {},
     )
     .await
     .expect_err("should fail");
@@ -342,6 +346,7 @@ async fn streaming_assembles_tool_call_from_fragmented_deltas() {
         &messages,
         None,
         CancellationToken::new(),
+        |_| {},
         |_| {},
     )
     .await
@@ -431,6 +436,7 @@ async fn request_body_carries_tools_array_when_present() {
         Some(&tools_array),
         CancellationToken::new(),
         |_| {},
+        |_| {},
     )
     .await
     .expect("ok");
@@ -514,6 +520,7 @@ async fn request_body_omits_tools_when_none_attached() {
         &messages,
         None,
         CancellationToken::new(),
+        |_| {},
         |_| {},
     )
     .await

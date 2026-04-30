@@ -96,7 +96,7 @@ pub(crate) fn build_sidebar(
 fn build_dag_widget(state: &ChatState, sidebar_cols: usize, now_ms: u64) -> SidebarWidget {
     // Title is shown in the widget header row by the assembler; its content
     // captures total in-flight runs at a glance.
-    let title = format!("DAG ({} run{})", state.dag_runs.len(), if state.dag_runs.len() == 1 { "" } else { "s" });
+    let title = format!("Graph ({} run{})", state.dag_runs.len(), if state.dag_runs.len() == 1 { "" } else { "s" });
 
     // Cap how many rows the DAG widget tries to fill so a runaway scheduler
     // doesn't crowd out other future widgets. Reuses `DAG_PANEL_MAX_ROWS`

@@ -55,7 +55,7 @@ use openai_provider::catalog::ToolCatalog;
 use openai_provider::config::Config;
 use openai_provider::openai::{Message, ToolCall};
 use openai_provider::state::{ChatId, ChatStats, Chats, ChatsError};
-use openai_provider::stream::{list_models, run_chat_stream, StreamError};
+use openai_provider::stream::{list_models, run_chat_stream, ReasoningEvent, StreamError};
 use nefor_protocol::{Body, Envelope, PluginName, PluginOutgoing, SystemBody};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
@@ -285,13 +285,15 @@ async fn dispatch_event(
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned);
+            let tools_enabled = body.get("tools").and_then(Value::as_bool);
             tracing::info!(
                 target: "openai_provider::chat",
                 chat_id = %chat_id,
                 model = ?model,
+                tools_enabled = ?tools_enabled,
                 "chat.create",
             );
-            match chats.create(chat_id.clone(), model).await {
+            match chats.create(chat_id.clone(), model, tools_enabled).await {
                 Ok(()) => {
                     send_event(out_tx, chat_created_body(config, &chat_id)).await?;
                 }
@@ -586,6 +588,11 @@ fn spawn_turn(
         #[allow(unused_assignments)]
         let mut final_finish_reason: Option<String> = None;
         let mut final_tool_calls: Vec<ToolCall> = Vec::new();
+        // Reasoning trace from the last firing only — reasoning is
+        // per-message, not accumulated across tool-loop iterations
+        // (each firing produces its own thinking trace; we surface the
+        // most recent one on `chat.complete.result`).
+        let mut final_reasoning = String::new();
         let mut interrupted = false;
         let mut errored = false;
 
@@ -611,7 +618,12 @@ fn spawn_turn(
                 roles = ?history.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
                 "history snapshot for turn iteration",
             );
-            let tools_array = catalog.to_openai_tools().await;
+            let chat_tools_on = chats.tools_enabled(&chat_id).await.unwrap_or(true);
+            let tools_array = if chat_tools_on {
+                catalog.to_openai_tools().await
+            } else {
+                Vec::new()
+            };
             let tools_slice: Option<&[serde_json::Value]> = if tools_array.is_empty() {
                 None
             } else {
@@ -623,7 +635,16 @@ fn spawn_turn(
             let chat_id_for_delta = chat_id.clone();
             let out_tx_for_delta = out_tx.clone();
             let prefix_for_delta = config.event_prefix();
+            let id_for_reason = turn_id.clone();
+            let chat_id_for_reason = chat_id.clone();
+            let out_tx_for_reason = out_tx.clone();
+            let prefix_for_reason = config.event_prefix();
             let token = auth.token().await;
+            // Stamp the reasoning duration from first reasoning chunk
+            // → ReasoningEvent::End. Captured in the closure so each
+            // firing in a tool loop gets its own timer (per-firing
+            // reasoning, never accumulated across firings).
+            let mut reasoning_started_at: Option<std::time::Instant> = None;
             let result = run_chat_stream(
                 &client,
                 &endpoint,
@@ -640,6 +661,35 @@ fn spawn_turn(
                         delta,
                     );
                     let _ = out_tx_for_delta.try_send(PluginOutgoing::event(body));
+                },
+                |ev| match ev {
+                    ReasoningEvent::Delta(text) => {
+                        if reasoning_started_at.is_none() {
+                            reasoning_started_at = Some(std::time::Instant::now());
+                        }
+                        let body = stream_reasoning_delta_body(
+                            &prefix_for_reason,
+                            &id_for_reason,
+                            &chat_id_for_reason,
+                            text,
+                        );
+                        let _ = out_tx_for_reason
+                            .try_send(PluginOutgoing::event(body));
+                    }
+                    ReasoningEvent::End { text } => {
+                        let duration_ms = reasoning_started_at
+                            .map(|s| s.elapsed().as_millis() as u64)
+                            .unwrap_or(0);
+                        let body = stream_reasoning_end_body(
+                            &prefix_for_reason,
+                            &id_for_reason,
+                            &chat_id_for_reason,
+                            text,
+                            duration_ms,
+                        );
+                        let _ = out_tx_for_reason
+                            .try_send(PluginOutgoing::event(body));
+                    }
                 },
             )
             .await;
@@ -662,6 +712,7 @@ fn spawn_turn(
                                 .await;
                         }
                         final_text = outcome.full_text;
+                        final_reasoning = outcome.reasoning_text;
                         final_finish_reason = Some("interrupted".to_string());
                         interrupted = true;
                         break;
@@ -679,11 +730,31 @@ fn spawn_turn(
                             )
                             .await;
 
-                        // Run each tool call (sequentially — the API
-                        // requires every call's tool message to be
-                        // present before the next chat-completions
-                        // request, so there's no win in parallelism for
-                        // a single round trip).
+                        // Stage 1+ (chat.complete API): defer the tool
+                        // loop to the caller. reasoner-graph dispatches
+                        // tools via tool-executor + tool-gate; the
+                        // adapter reasoner translates ToolResults back
+                        // into chat.append messages on the next firing.
+                        // Running our own tool loop here would race
+                        // those external dispatches and our internal
+                        // tool-id broker would wait
+                        // TOOL_RESULT_TIMEOUT (120s) for a tool.result
+                        // that never matches because the gate-side ids
+                        // are minted independently. Yield by returning
+                        // the tool_calls in chat.complete.result.
+                        if !legacy_default_chat {
+                            final_text = outcome.full_text;
+                            final_reasoning = outcome.reasoning_text;
+                            final_finish_reason = outcome.finish_reason;
+                            final_tool_calls = outcome.tool_calls;
+                            break;
+                        }
+
+                        // Legacy `<prefix>.prompt` API: run each tool
+                        // call (sequentially — the API requires every
+                        // call's tool message to be present before the
+                        // next chat-completions request, so there's no
+                        // win in parallelism for a single round trip).
                         let mut tool_loop_failed = false;
                         for tc in outcome.tool_calls {
                             let tool_step = run_one_tool_call(
@@ -746,6 +817,7 @@ fn spawn_turn(
                             .await;
                     }
                     final_text = outcome.full_text;
+                    final_reasoning = outcome.reasoning_text;
                     final_finish_reason = outcome.finish_reason;
                     final_tool_calls = outcome.tool_calls;
                     break;
@@ -832,6 +904,7 @@ fn spawn_turn(
                 total_prompt_tokens,
                 total_completion_tokens,
                 &active_model,
+                &final_reasoning,
             );
             let _ = out_tx.send(PluginOutgoing::event(body)).await;
         }
@@ -1046,6 +1119,51 @@ fn stream_delta_body(
     m
 }
 
+/// `<prefix>.stream.reasoning_delta { id, chat_id, text }` — one event
+/// per chunk of `delta.reasoning` (Ollama's thinking trace for Qwen 3 /
+/// Gemma 3). Mirrors `stream_delta_body`'s field shape so the chat-side
+/// adapter can translate it the same way.
+fn stream_reasoning_delta_body(
+    prefix: &str,
+    id: &str,
+    chat_id: &ChatId,
+    text: &str,
+) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert(
+        "kind".into(),
+        Value::String(format!("{prefix}stream.reasoning_delta")),
+    );
+    m.insert("id".into(), Value::String(id.to_owned()));
+    m.insert("chat_id".into(), Value::String(chat_id.to_string()));
+    m.insert("text".into(), Value::String(text.to_owned()));
+    m
+}
+
+/// `<prefix>.stream.reasoning_end { id, chat_id, text, duration_ms }`
+/// — one event per turn at the moment reasoning stops streaming
+/// (either content takes over, or `finish_reason` arrives without
+/// content). Carries the FULL accumulated reasoning text so the chat
+/// plugin can stamp the collapsed row without holding its own buffer.
+fn stream_reasoning_end_body(
+    prefix: &str,
+    id: &str,
+    chat_id: &ChatId,
+    text: &str,
+    duration_ms: u64,
+) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert(
+        "kind".into(),
+        Value::String(format!("{prefix}stream.reasoning_end")),
+    );
+    m.insert("id".into(), Value::String(id.to_owned()));
+    m.insert("chat_id".into(), Value::String(chat_id.to_string()));
+    m.insert("text".into(), Value::String(text.to_owned()));
+    m.insert("duration_ms".into(), Value::Number(duration_ms.into()));
+    m
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stream_end_body(
     config: &Config,
@@ -1212,7 +1330,15 @@ fn chat_error_body_msg(
 ///
 /// `output` follows the `generic-provider.ProviderOut` shape (per the
 /// Schelling-point docstring on generic-provider/main.rs):
-/// `{ text, tool_calls?, finish_reason?, usage? }`.
+/// `{ text, tool_calls?, finish_reason?, usage?, reasoning? }`.
+///
+/// The optional `reasoning` field carries the model's full thinking
+/// trace for the final firing. It rides on `chat.complete.result`
+/// (control-plane only) so non-streaming consumers (sub-graph node
+/// outputs, replay tooling, audit logs) can see it without subscribing
+/// to per-chunk `stream.reasoning_delta` events. It is NEVER fed back
+/// into the next request's history — `push_assistant` only stores the
+/// content text.
 #[allow(clippy::too_many_arguments)]
 fn chat_complete_result_body(
     config: &Config,
@@ -1223,9 +1349,13 @@ fn chat_complete_result_body(
     prompt_tokens: u64,
     completion_tokens: u64,
     model: &str,
+    reasoning: &str,
 ) -> Map<String, Value> {
     let mut output = Map::new();
     output.insert("text".into(), Value::String(text.to_owned()));
+    if !reasoning.is_empty() {
+        output.insert("reasoning".into(), Value::String(reasoning.to_owned()));
+    }
     if !tool_calls.is_empty() {
         let arr: Vec<Value> = tool_calls
             .iter()
@@ -2302,7 +2432,7 @@ mod tests {
         let config = cfg("ollama");
         let client = reqwest::Client::builder().build().expect("client");
 
-        chats.create(ChatId::new("c-1"), None).await.expect("seed");
+        chats.create(ChatId::new("c-1"), None, None).await.expect("seed");
 
         let body = make_event_body(
             "ollama.chat.create",
@@ -2336,7 +2466,7 @@ mod tests {
         let config = cfg("ollama");
         let client = reqwest::Client::builder().build().expect("client");
 
-        chats.create(ChatId::new("c-1"), None).await.expect("seed");
+        chats.create(ChatId::new("c-1"), None, None).await.expect("seed");
 
         let msg = serde_json::json!({"role": "user", "content": "hello"});
         let body = make_event_body(
@@ -2410,7 +2540,7 @@ mod tests {
         let config = cfg("ollama");
         let client = reqwest::Client::builder().build().expect("client");
 
-        chats.create(ChatId::new("c-1"), None).await.expect("seed");
+        chats.create(ChatId::new("c-1"), None, None).await.expect("seed");
 
         let body = make_event_body(
             "ollama.chat.delete",
@@ -2474,8 +2604,8 @@ mod tests {
     #[tokio::test]
     async fn two_concurrent_chats_have_independent_histories() {
         let chats = fresh_chats("m");
-        chats.create(ChatId::new("a"), None).await.expect("a");
-        chats.create(ChatId::new("b"), None).await.expect("b");
+        chats.create(ChatId::new("a"), None, None).await.expect("a");
+        chats.create(ChatId::new("b"), None, None).await.expect("b");
         chats.push_user(&ChatId::new("a"), "alpha".into()).await.unwrap();
         chats.push_user(&ChatId::new("b"), "beta".into()).await.unwrap();
         let ha = chats.history_snapshot(&ChatId::new("a")).await.unwrap();
@@ -2592,6 +2722,7 @@ mod tests {
             10,
             5,
             "qwen",
+            "",
         );
         assert_eq!(
             b.get("kind").and_then(Value::as_str),
@@ -2600,6 +2731,8 @@ mod tests {
         assert_eq!(b.get("chat_id").and_then(Value::as_str), Some("c-1"));
         let out = b.get("output").and_then(Value::as_object).expect("output");
         assert_eq!(out.get("text").and_then(Value::as_str), Some("Done."));
+        // Empty reasoning is dropped from the wire shape (back-compat).
+        assert!(out.get("reasoning").is_none());
         assert_eq!(
             out.get("finish_reason").and_then(Value::as_str),
             Some("tool_calls")

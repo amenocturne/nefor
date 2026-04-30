@@ -161,6 +161,13 @@ pub struct StreamOptions {
 pub enum SseEvent {
     /// Incremental token text from `choices[0].delta.content`.
     Delta(String),
+    /// Incremental reasoning text from `choices[0].delta.reasoning` —
+    /// emitted by Ollama for thinking-trace models (Qwen 3, Gemma 3, …).
+    /// Kept on its own variant so the dispatcher can route it to the
+    /// reasoning stream without polluting `delta.content` or the stored
+    /// assistant history. Precedence: when a chunk carries BOTH content
+    /// AND reasoning, content wins (see `parse_sse_chunk` doc).
+    ReasoningDelta(String),
     /// `choices[0].finish_reason` arrived; the assistant message is done.
     /// Some providers emit this on a chunk that also carries a final
     /// content delta — callers should treat both fields as independent.
@@ -171,11 +178,16 @@ pub enum SseEvent {
     Done,
     /// First chunk of a tool call — carries the `id` and function `name`.
     /// `index` distinguishes parallel calls within the same assistant
-    /// turn (the model can request several tools at once).
+    /// turn (the model can request several tools at once). `args` is the
+    /// initial arguments fragment carried in the same chunk: empty for
+    /// OpenAI's chunked streaming (subsequent chunks deliver the JSON
+    /// via `ToolCallArgsDelta`); the full JSON for Ollama, which packs
+    /// id+name+complete-arguments into a single chunk.
     ToolCallStart {
         index: usize,
         id: String,
         name: String,
+        args: String,
     },
     /// Subsequent chunk of a tool call — carries an incremental fragment
     /// of the JSON-encoded arguments string. The accumulator concatenates
@@ -256,6 +268,26 @@ pub fn parse_sse_chunk(payload: &str) -> SseEvent {
         }
     }
 
+    // `delta.reasoning` (Ollama for Gemma 3 / Qwen 3 thinking traces)
+    // routes to `SseEvent::ReasoningDelta` — a separate channel from
+    // `delta.content`. The dispatcher accumulates it independently and
+    // emits `<prefix>.stream.reasoning_delta` so the chat plugin can
+    // render the thinking trace live, then collapse it once content
+    // arrives. Critically, reasoning text never enters the stored
+    // assistant message (it would feed back into the next request as
+    // history and pollute the tool-flow inputs). Content takes
+    // precedence above; we only check reasoning when content is absent
+    // or empty.
+    if let Some(reasoning) = first_choice
+        .and_then(|c| c.get("delta"))
+        .and_then(|d| d.get("reasoning"))
+        .and_then(|t| t.as_str())
+    {
+        if !reasoning.is_empty() {
+            return SseEvent::ReasoningDelta(reasoning.to_owned());
+        }
+    }
+
     // Tool-call deltas live alongside the regular `delta.content` field.
     // We only look at the first entry in `tool_calls` per chunk: providers
     // we've seen emit one tool-call shape per chunk even when several
@@ -276,25 +308,30 @@ pub fn parse_sse_chunk(payload: &str) -> SseEvent {
                 .and_then(|f| f.get("name"))
                 .and_then(|n| n.as_str());
             let id = tc.get("id").and_then(|v| v.as_str());
+            let args = function
+                .and_then(|f| f.get("arguments"))
+                .and_then(|a| a.as_str())
+                .unwrap_or("")
+                .to_owned();
+            // Two valid shapes:
+            //   * Start chunk: id+name present (with args either empty —
+            //     OpenAI streaming style — or the complete JSON — Ollama
+            //     style, which packs the whole tool call in one chunk).
+            //   * Delta chunk: id+name absent, args carries a partial
+            //     fragment to concatenate.
             if let (Some(id), Some(name)) = (id, name) {
                 return SseEvent::ToolCallStart {
                     index,
                     id: id.to_owned(),
                     name: name.to_owned(),
+                    args,
                 };
             }
-            // Subsequent chunks carry only `function.arguments` as a
-            // partial string — accumulate.
-            if let Some(args) = function
-                .and_then(|f| f.get("arguments"))
-                .and_then(|a| a.as_str())
-            {
-                if !args.is_empty() {
-                    return SseEvent::ToolCallArgsDelta {
-                        index,
-                        delta: args.to_owned(),
-                    };
-                }
+            if !args.is_empty() {
+                return SseEvent::ToolCallArgsDelta {
+                    index,
+                    delta: args,
+                };
             }
         }
     }
@@ -321,6 +358,40 @@ mod tests {
     fn parse_sse_chunk_extracts_delta_content() {
         let payload = r#"{"choices":[{"delta":{"content":"Hello"},"index":0}]}"#;
         assert_eq!(parse_sse_chunk(payload), SseEvent::Delta("Hello".into()));
+    }
+
+    #[test]
+    fn parse_sse_chunk_routes_reasoning_to_its_own_variant() {
+        // Gemma 3 / Qwen 3 stream their thinking trace under
+        // `delta.reasoning`, separate from `delta.content`. The parser
+        // surfaces it as `ReasoningDelta` so the dispatcher can fan it
+        // out on a dedicated channel — never mixed into `delta.content`,
+        // which feeds the stored assistant history.
+        let payload = r#"{"choices":[{"delta":{"role":"assistant","content":"","reasoning":"Thinking..."}}]}"#;
+        assert_eq!(
+            parse_sse_chunk(payload),
+            SseEvent::ReasoningDelta("Thinking...".into())
+        );
+    }
+
+    #[test]
+    fn parse_sse_chunk_content_wins_over_reasoning_in_same_chunk() {
+        // If a chunk carries BOTH `delta.content` AND `delta.reasoning`
+        // (rare; we haven't seen it from Ollama, but the API doesn't
+        // forbid it), content wins. Reasoning will keep streaming in its
+        // own chunks; dropping a single reasoning fragment is cheaper
+        // than reordering content out of position.
+        let payload =
+            r#"{"choices":[{"delta":{"content":"hi","reasoning":"thinking..."}}]}"#;
+        assert_eq!(parse_sse_chunk(payload), SseEvent::Delta("hi".into()));
+    }
+
+    #[test]
+    fn parse_sse_chunk_empty_reasoning_string_is_empty_event() {
+        // Ollama sometimes flushes `reasoning:""` on the trailing frame;
+        // don't treat that as an event.
+        let payload = r#"{"choices":[{"delta":{"reasoning":""}}]}"#;
+        assert_eq!(parse_sse_chunk(payload), SseEvent::Empty);
     }
 
     #[test]
@@ -454,12 +525,40 @@ mod tests {
     fn parse_sse_chunk_tool_call_start_carries_id_name_index() {
         let payload = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"read_file","arguments":""}}]}}]}"#;
         match parse_sse_chunk(payload) {
-            SseEvent::ToolCallStart { index, id, name } => {
+            SseEvent::ToolCallStart {
+                index,
+                id,
+                name,
+                args,
+            } => {
                 assert_eq!(index, 0);
                 assert_eq!(id, "call_abc");
                 assert_eq!(name, "read_file");
+                assert!(args.is_empty(), "OpenAI start-chunk has empty args");
             }
             other => panic!("expected ToolCallStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sse_chunk_ollama_single_chunk_tool_call_keeps_args() {
+        // Ollama packs id + name + complete arguments into one chunk
+        // (verified against gemma4:latest at localhost:11434). The
+        // parser must NOT drop the arguments field on the start chunk.
+        let payload = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_xyz","type":"function","function":{"name":"spawn_graph","arguments":"{\"graph\":{\"nodes\":[]}}"}}]}}]}"#;
+        match parse_sse_chunk(payload) {
+            SseEvent::ToolCallStart {
+                index,
+                id,
+                name,
+                args,
+            } => {
+                assert_eq!(index, 0);
+                assert_eq!(id, "call_xyz");
+                assert_eq!(name, "spawn_graph");
+                assert_eq!(args, r#"{"graph":{"nodes":[]}}"#);
+            }
+            other => panic!("expected ToolCallStart with args, got {other:?}"),
         }
     }
 
@@ -489,7 +588,12 @@ mod tests {
         // Parallel tool calls — second call's index is 1.
         let payload = r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_2","type":"function","function":{"name":"write_file","arguments":""}}]}}]}"#;
         match parse_sse_chunk(payload) {
-            SseEvent::ToolCallStart { index, id, name } => {
+            SseEvent::ToolCallStart {
+                index,
+                id,
+                name,
+                args: _,
+            } => {
                 assert_eq!(index, 1);
                 assert_eq!(id, "call_2");
                 assert_eq!(name, "write_file");

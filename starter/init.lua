@@ -3,8 +3,8 @@
 -- Post Slice 2 I4 the engine is pure glue: no hardcoded NCP behavior, no
 -- bundled widgets. This file is the canonical reference config:
 --
---   1. Wire `package.path` so `require("ncp")` + `require("lib.json")`
---      resolve to the bundled Lua modules next to this file.
+--   1. Wire `package.path` so `require("ncp")` resolves to the bundled
+--      protocol module next to this file.
 --   2. Optionally declare a parent session id to resume from (commented out
 --      by default — uncomment and fill in a uuid to continue a prior run).
 --   3. Define the global `step` hook the engine calls on every inbound line.
@@ -14,9 +14,15 @@
 --      reference config (`tmp/smoke-config-m2/init.lua`) plus the
 --      combinators plugin; swap or remove entries to compose your own stack.
 --
--- This replaces the legacy MVP config (single-process Lua widgets) that
--- lived at this path pre-Slice-2. The widget model is now plugin-land
--- (`nefor-tui`, `nefor-chat`, ...); the starter's job is just composition.
+-- ### T7 — Stage 1 starter wiring (post-Phase-1B)
+--
+-- The chat plugin no longer talks to a provider directly. Instead a single
+-- `agentic_workflow` module owns the orchestration glue: it intercepts
+-- `chat.input.submit`, drives the reasoner-graph against the provider via
+-- a template orchestrator graph (provider-wrapper + tool-executor +
+-- adapter + terminal cycle), wires the spawn_graph tool, and surfaces
+-- run completions back to nefor-chat. See
+-- `starter/agentic_workflow.lua` for the full event flow.
 --
 -- Run:
 --   NEFOR_PLUGIN_DIR=$PWD/plugins cargo run --bin nefor -- --config ./starter
@@ -24,9 +30,6 @@
 -------------------------------------------------------------------------
 -- 1. Lua module path — bundled protocol + json alongside this file
 -------------------------------------------------------------------------
--- The engine sets `NEFOR_CONFIG_DIR` to the directory holding this
--- init.lua before exec, so user code can resolve sibling Lua modules
--- without poking at `debug.getinfo` (mlua's safe stdlib excludes `debug`).
 local STARTER_ROOT = NEFOR_CONFIG_DIR or "."
 
 package.path = table.concat({
@@ -38,10 +41,6 @@ package.path = table.concat({
 -------------------------------------------------------------------------
 -- 2. Optional parent session id (resume a prior run)
 -------------------------------------------------------------------------
--- Uncomment and set to a previous session's UUID (printed in the engine
--- log at startup) to hydrate `saved_log` on the next run. `saved_log` is
--- currently ignored by `ncp.step` — see `ncp.lua` for why.
---
 -- nefor.parent_session = "00000000-0000-0000-0000-000000000000"
 
 -------------------------------------------------------------------------
@@ -56,41 +55,181 @@ end
 -------------------------------------------------------------------------
 -- 4. Plugin composition
 -------------------------------------------------------------------------
--- Paths match the default `--plugin-dir` layout: <plugin_root>/<name>/.
--- Adjust per-plugin `command` entries if you've installed plugins
--- elsewhere or want to run release builds.
---
--- `ncp.spawn` accepts everything `nefor.plugins.spawn` does plus optional
--- `from_plugin` / `to_plugin` envelope transforms. See `ncp.lua` for the
--- contract and `mock_plugin_adapter.lua` for the worked example: it adapts
--- mock-plugin's `cc.*` namespace to nefor-chat's `chat-contract v0.1`.
 
-local cc_adapter = require("mock_plugin_adapter")
+local cc_adapter       = require("mock_plugin_adapter")
+local agentic_workflow = require("agentic_workflow")
 
--- Plugin cwd is <plugin_root>/<name>/ (engine policy), so relative `../`
--- paths walk into <plugin_root>, not the repo root. Build absolute paths
--- from NEFOR_CONFIG_DIR (= <repo>/starter) → <repo>/target/debug/<bin>.
+-- Plugin cwd is <plugin_root>/<name>/ (engine policy).
 local PROJECT_ROOT = STARTER_ROOT:match("^(.*)/[^/]+$") or "."
 local function bin(name) return PROJECT_ROOT .. "/target/debug/" .. name end
 
+local _ = cc_adapter  -- keep require warm; mock-plugin backend is opt-in
+
+-------------------------------------------------------------------------
+-- 4a. Spawn order
+-------------------------------------------------------------------------
+--
+-- Order matters because plugins register types/Into declarations
+-- against `nefor-combinators` at startup, and the scheduler queries
+-- combinators at submit time. The safe order:
+--
+--   1. nefor-combinators       (registry)
+--   2. generic-provider        (canonical type tags)
+--   3. generic-tool            (canonical type tags)
+--   4. openai-provider(s)      (declare Into against canonical types)
+--   5. reasoner-graph          (queries combinators on submit)
+--   6. tool-gate               (aggregates tool advertisements)
+--   7. basic-tools             (advertises tools to the gate)
+--   8. nefor-chat / nefor-tui  (UI; can come up any time)
+--
+-- ncp.lua's replay-on-attach means a late-attaching plugin still sees
+-- prior events, so this ordering is a robustness measure rather than a
+-- hard correctness requirement. It's still worth respecting because
+-- the combinators registry is queried synchronously during submit —
+-- if reasoner-graph submitted a graph before combinators readied, the
+-- query would block on a peer that doesn't exist yet.
+
 ncp.spawn {
-  name        = "mock-plugin",
-  command     = { bin("mock-plugin") },
-  from_plugin = cc_adapter.from_plugin,
-  to_plugin   = cc_adapter.to_plugin,
+  name    = "nefor-combinators",
+  command = { bin("nefor-combinators") },
 }
 
 ncp.spawn {
-  name    = "nefor-chat",
-  command = { bin("nefor-chat") },
+  name    = "generic-provider",
+  command = { bin("generic-provider") },
+}
+
+ncp.spawn {
+  name    = "generic-tool",
+  command = { bin("generic-tool") },
+}
+
+-------------------------------------------------------------------------
+-- 4b. Provider — real openai-provider against Ollama, OR mock-plugin
+-------------------------------------------------------------------------
+--
+-- USE_MOCK_PROVIDER=true swaps the live LLM for a deterministic mock.
+-- The mock-plugin binary loads `starter/mock_provider.lua` and emits
+-- the same `<name>.chat.{create,append,complete[.result]}` /
+-- `<name>.stream.delta`/`<name>.stream.end` shape openai-provider
+-- emits, with hardcoded canned responses for the smoke test prompt.
+-- See `starter/mock_provider.lua` for the response selection logic.
+--
+-- For the real provider: one chat session per orchestrator instance;
+-- agentic_workflow's reasoner-graph adapter calls
+-- `<name>.chat.create / chat.append / chat.complete` directly. The
+-- static_token=ollama-local trick unlocks openai-provider's auth gate
+-- without a real key (required for local Ollama). Real remote providers
+-- would supply an --api-key CLI arg.
+local USE_MOCK_PROVIDER = false
+
+local PROVIDER_NAME, PROVIDER_MODEL, provider_chain, provider_command
+
+if USE_MOCK_PROVIDER then
+  PROVIDER_NAME  = "mock-plugin"
+  PROVIDER_MODEL = "mock-model"
+  provider_chain = agentic_workflow.for_provider(PROVIDER_NAME)
+  provider_command = {
+    bin("mock-plugin"),
+    "--script", STARTER_ROOT .. "/mock_provider.lua",
+  }
+else
+  PROVIDER_NAME  = "ollama"
+  -- qwen3.6:35b-a3b-coding-mxfp8 — MoE (3B active params, 35B total) with
+  -- strong tool-calling. Verified one-shot to emit a clean spawn_graph
+  -- with proper terminal wiring; faster than the dense 27b model.
+  PROVIDER_MODEL = "qwen3.6:35b-a3b-coding-mxfp8"
+  provider_chain = agentic_workflow.for_provider(PROVIDER_NAME, { static_token = "ollama-local" })
+  provider_command = {
+    bin("openai-provider"),
+    "--name",     PROVIDER_NAME,
+    "--base-url", "http://localhost:11434",
+    "--model",    PROVIDER_MODEL,
+  }
+end
+
+-------------------------------------------------------------------------
+-- 4c. Orchestrator setup — single configuration call
+-------------------------------------------------------------------------
+--
+-- Stage-1 system prompt: teaches the orchestrator model when and how
+-- to use `spawn_graph`. Kept terse on purpose — Gemma 3 reasons itself
+-- into a "stop" finish without committing to the tool call when the
+-- prompt is dense. Schema-only worked-example was enough to make it
+-- emit a well-formed graph reliably; the verbose version was not.
+-- Two reasoner types are documented because those are the ones
+-- agentic_workflow handles for sub-graphs (`responder` = one-shot LLM,
+-- `terminal` = sink); other reasoner types are private to the
+-- orchestrator's chat loop and would just confuse the model.
+local ORCHESTRATOR_SYSTEM_PROMPT = [[
+You are a helpful assistant. Use the `spawn_graph` tool for parallel decomposition tasks (multiple independent sub-questions to combine).
+
+Graph schema:
+{ "nodes": [{ "id": str, "reasoner": str, "args": {...} }], "edges": [{ "from": str, "to": str }] }
+
+Reasoner types:
+- `responder` — one-shot LLM call. args: { "prompt": string }. Upstream nodes' outputs become user messages prepended to the prompt.
+- `terminal` — sink. args: {}. Exactly one per graph; its input becomes the run's result.
+
+To combine parallel branches into a single output, add a `responder` combine node downstream of the parallel branches and feed it into terminal. Do NOT wire parallel branches directly into terminal — terminal is a sink, not a combiner. Pattern:
+  branchA, branchB → combine (responder) → terminal
+
+Emit the tool call directly after deciding the structure. For simple chat turns (no decomposition benefit), just answer directly.
+]]
+
+agentic_workflow.setup {
+  provider = PROVIDER_NAME,
+  model    = PROVIDER_MODEL,
+  system   = ORCHESTRATOR_SYSTEM_PROMPT,
+}
+
+ncp.spawn {
+  name        = PROVIDER_NAME,
+  command     = provider_command,
+  from_plugin = provider_chain.from_plugin,
+  to_plugin   = provider_chain.to_plugin,
+}
+
+-------------------------------------------------------------------------
+-- 4d. Reasoner graph
+-------------------------------------------------------------------------
+
+ncp.spawn {
+  name        = "reasoner-graph",
+  command     = { bin("reasoner-graph") },
+  from_plugin = agentic_workflow.for_reasoner_graph().from_plugin,
+}
+
+-------------------------------------------------------------------------
+-- 4e. Tool gate + basic-tools + spawn_graph advertisement
+-------------------------------------------------------------------------
+
+ncp.spawn {
+  name        = "tool-gate",
+  command     = {
+    bin("tool-gate"),
+    "--prompt",  "read_file",
+    "--default", "prompt",
+  },
+  from_plugin = agentic_workflow.for_tool_gate("tool-gate").from_plugin,
+}
+
+ncp.spawn {
+  name    = "basic-tools",
+  command = { bin("basic-tools"), "--gate", "tool-gate" },
+}
+
+-------------------------------------------------------------------------
+-- 4f. Chat
+-------------------------------------------------------------------------
+
+ncp.spawn {
+  name        = "nefor-chat",
+  command     = { bin("nefor-chat") },
+  from_plugin = agentic_workflow.for_chat().from_plugin,
 }
 
 ncp.spawn {
   name    = "nefor-tui",
   command = { bin("nefor-tui") },
-}
-
-ncp.spawn {
-  name    = "nefor-combinators",
-  command = { bin("nefor-combinators") },
 }
