@@ -1,0 +1,24 @@
+[package]
+name = "generic-provider"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NCP v0.1 plugin: type-registry hub for the canonical provider protocol. Owns generic-provider.{ProviderIn, ProviderOut, ChatHistory, NoState, FinalAnswer}; concrete provider plugins (openai-provider, anthropic-provider, ...) declare Into/From against these tags via nefor-combinators. This plugin does not run models or hold sessions — it is a thin LSP-shaped registry whose job is to make the canonical type tags exist on the wire."
+
+[[bin]]
+name = "generic-provider"
+path = "src/main.rs"
+
+[dependencies]
+nefor-protocol = { path = "../../crates/nefor-protocol" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
