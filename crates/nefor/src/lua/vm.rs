@@ -159,10 +159,12 @@ impl LuaHost {
     /// Invoke `step(saved_log, current_log)`.
     ///
     /// Both Lua tables are *persistent*: created on the first call, then
-    /// reused. Each subsequent invocation appends only the entries past
-    /// `current_log_mirrored` — converting the full log every time would
+    /// reused. `new_current_entries` carries only the entries appended
+    /// since the previous call — converting the full log every time would
     /// be O(n²) per session, which dominated typing latency on the
-    /// keystroke→render path. The saved log is built once (parent session
+    /// keystroke→render path. The caller (broker) clones just the small
+    /// tail under its lock, avoiding an O(n) clone of the full event log
+    /// on every inbound line. The saved log is built once (parent session
     /// is immutable across the run).
     ///
     /// Errors raised *inside* the step function are logged and swallowed —
@@ -172,7 +174,7 @@ impl LuaHost {
     pub fn invoke_step(
         &mut self,
         saved_log: &[LogEntry],
-        current_log: &[LogEntry],
+        new_current_entries: &[LogEntry],
     ) -> Result<(), LuaError> {
         let Some(key) = self.step.as_ref() else {
             return Err(LuaError::StepNotCached);
@@ -198,12 +200,12 @@ impl LuaHost {
                 t
             }
         };
-        if current_log.len() > self.current_log_mirrored {
-            for (offset, entry) in current_log[self.current_log_mirrored..].iter().enumerate() {
+        if !new_current_entries.is_empty() {
+            for (offset, entry) in new_current_entries.iter().enumerate() {
                 let lua_idx = self.current_log_mirrored + offset + 1; // 1-indexed
                 current.set(lua_idx, log_entry_to_lua_table(&self.lua, entry)?)?;
             }
-            self.current_log_mirrored = current_log.len();
+            self.current_log_mirrored += new_current_entries.len();
         }
 
         match func.call::<()>((saved, current)) {
@@ -226,6 +228,7 @@ fn install_nefor_surface(
     let nefor = lua.create_table()?;
     bindings::install_engine(lua, &nefor, engine_ops)?;
     bindings::install_events(lua, &nefor, Arc::clone(&bus))?;
+    bindings::install_json(lua, &nefor)?;
     bindings::install_log(lua, &nefor)?;
     bindings::install_process(lua, &nefor)?;
     bindings::install_plugins(lua, &nefor, plugins)?;
@@ -301,6 +304,9 @@ mod tests {
                  and type(nefor.engine) == 'table' \
                  and type(nefor.engine.send) == 'function' \
                  and type(nefor.events) == 'table' \
+                 and type(nefor.json) == 'table' \
+                 and type(nefor.json.encode) == 'function' \
+                 and type(nefor.json.decode) == 'function' \
                  and type(nefor.log) == 'table' \
                  and type(nefor.process) == 'table' \
                  and type(nefor.plugins) == 'table'",

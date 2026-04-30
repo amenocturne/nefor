@@ -175,6 +175,17 @@ pub struct Broker {
     /// Saved log from a resumed parent session. Passed verbatim to every
     /// `step` invocation as the first argument.
     saved_log: Vec<LogEntry>,
+    /// Count of `event_log` entries already handed to `invoke_step`. The
+    /// broker clones just `event_log[mirrored_count..]` under its lock and
+    /// passes the small tail to step; the Lua VM appends those into the
+    /// persistent `current_log` table. Avoids the per-event O(n) clone of
+    /// the full log.
+    mirrored_count: usize,
+    /// Engine-originated synthetic envelopes (e.g. `engine.plugin_failed`)
+    /// queued by callers outside the inbound path. Drained into the event
+    /// log + step pipeline before the main `select!` on each tick so they
+    /// route alongside real plugin lines. See [`Broker::queue_engine_envelope`].
+    pending_engine_envelopes: Vec<LogEntry>,
 }
 
 /// Outcome of the broker's run loop.
@@ -212,6 +223,71 @@ impl Broker {
             shutdown_rx,
             shutdown_tx,
             saved_log,
+            mirrored_count: 0,
+            pending_engine_envelopes: Vec::new(),
+        }
+    }
+
+    /// Enqueue an engine-originated synthetic envelope for routing through
+    /// `step`. The envelope is built as
+    /// `{"type":"event","from":"engine","ts":<now>,"body":<body>}` and stamped
+    /// with `Origin::Plugin(PluginName::engine())` so step sees it as a normal
+    /// log entry. Drained on the next tick of [`Broker::run`] (or synchronously
+    /// by callers that need ordering with shutdown — see [`Broker::handle_exit`]).
+    ///
+    /// Used to surface engine-level events (spawn-time and runtime plugin
+    /// failures) to the Lua step layer, which translates them into plugin-
+    /// targeted notifications (e.g. `chat.popup` to nefor-chat).
+    pub fn queue_engine_envelope(&mut self, body: serde_json::Value) {
+        let ts = Timestamp::now();
+        let envelope = serde_json::json!({
+            "type": "event",
+            "from": "engine",
+            "ts": ts.to_iso8601(),
+            "body": body,
+        });
+        let payload = match serde_json::to_string(&envelope) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to serialize engine envelope; dropping");
+                return;
+            }
+        };
+        let entry = LogEntry {
+            ts,
+            origin: Origin::Plugin(PluginName::engine()),
+            target: None,
+            payload,
+        };
+        self.pending_engine_envelopes.push(entry);
+    }
+
+    /// Drain `pending_engine_envelopes` into the shared event log + session,
+    /// then invoke step on the appended tail. No-op when the queue is empty.
+    /// Called both from the main loop tick and synchronously from `handle_exit`
+    /// so an `engine.plugin_failed` envelope can reach `nefor-chat`'s writer
+    /// queue *before* the cooperative shutdown closes it.
+    fn drain_engine_envelopes(&mut self) {
+        if self.pending_engine_envelopes.is_empty() {
+            return;
+        }
+        let drained = std::mem::take(&mut self.pending_engine_envelopes);
+
+        let new_entries = {
+            let mut guard = lock_shared(&self.shared);
+            for entry in &drained {
+                guard.event_log.push(entry.clone());
+                if let Err(e) = guard.session.append(entry) {
+                    tracing::error!(error = %e, "failed to append engine envelope to session log");
+                }
+            }
+            let tail = guard.event_log[self.mirrored_count..].to_vec();
+            self.mirrored_count = guard.event_log.len();
+            tail
+        };
+
+        if let Err(e) = self.host.invoke_step(&self.saved_log, &new_entries) {
+            tracing::error!(error = %e, "step invocation errored at VM level");
         }
     }
 
@@ -262,6 +338,13 @@ impl Broker {
         let mut shutdown_deadline: Option<Instant> = None;
 
         loop {
+            // Synthetic engine envelopes (queued via `queue_engine_envelope`)
+            // are flushed at the top of every tick so they route alongside
+            // real inbound lines. Doing this before the `tokio::select!`
+            // guarantees they reach step before any pending shutdown arm
+            // fires this iteration.
+            self.drain_engine_envelopes();
+
             // If we're past the shutdown deadline, force-close everything
             // and exit.
             if let Some(deadline) = shutdown_deadline {
@@ -336,19 +419,22 @@ impl Broker {
             payload,
         };
 
-        // Append + snapshot the current log under the lock, then release it
-        // before invoking step — step may call back into `BrokerOps::send`
-        // which re-acquires the lock.
-        let current_snapshot = {
+        // Append + clone only the unmirrored tail under the lock, then
+        // release it before invoking step — step may call back into
+        // `BrokerOps::send` which re-acquires the lock. Cloning the whole
+        // `event_log` here was O(n) per inbound line, O(n²) per session.
+        let new_entries = {
             let mut guard = lock_shared(&self.shared);
             guard.event_log.push(entry.clone());
             if let Err(e) = guard.session.append(&entry) {
                 tracing::error!(error = %e, "failed to append inbound entry to session log");
             }
-            guard.event_log.clone()
+            let tail = guard.event_log[self.mirrored_count..].to_vec();
+            self.mirrored_count = guard.event_log.len();
+            tail
         };
 
-        if let Err(e) = self.host.invoke_step(&self.saved_log, &current_snapshot) {
+        if let Err(e) = self.host.invoke_step(&self.saved_log, &new_entries) {
             tracing::error!(error = %e, "step invocation errored at VM level");
         }
     }
@@ -395,6 +481,33 @@ impl Broker {
         // failing (channel full / closed) means a shutdown is already
         // in flight.
         if !self.conns_by_id.is_empty() {
+            // Surface abnormal exits as engine-originated `engine.plugin_failed`
+            // envelopes BEFORE triggering shutdown so step has a chance to
+            // translate them into peer-targeted notifications (e.g. a
+            // `chat.popup` to nefor-chat) while that peer's writer queue is
+            // still open. Clean exits don't get a synthetic event — they are
+            // normal lifecycle and shouldn't surface as failures.
+            let (code, should_emit) = match outcome {
+                ExitOutcome::CleanExit => ("clean_exit", false),
+                ExitOutcome::Crash => ("crash", true),
+                ExitOutcome::Evicted => ("evicted", false),
+                ExitOutcome::Unknown => ("unknown_exit", true),
+            };
+            if should_emit && !name.is_empty() {
+                self.queue_engine_envelope(serde_json::json!({
+                    "kind":   "engine.plugin_failed",
+                    "plugin": name,
+                    "phase":  "runtime",
+                    "reason": format!("plugin process exited abnormally ({code})"),
+                    "code":   code,
+                }));
+                // Drain synchronously so step's outbound `nefor.engine.send`
+                // lands on the target's writer queue before `begin_shutdown`
+                // (which runs on the next loop iteration) closes it. The
+                // writer task drains preceding `Send`s before honoring `Close`.
+                self.drain_engine_envelopes();
+            }
+
             tracing::info!(
                 trigger_plugin = %name,
                 "peer exited; initiating engine shutdown",
@@ -464,6 +577,7 @@ mod tests {
     use crate::ncp::transport::Transport;
     use crate::ncp::PluginRegistry;
     use crate::session::{SessionHeader, SessionId};
+    use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
     use tempfile::TempDir;
     use tokio::io::{duplex, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -763,6 +877,208 @@ mod tests {
             .await
             .expect("read_line should return 0 at EOF");
         assert_eq!(n, 0, "expected EOF after shutdown, got {line:?}");
+    }
+
+    /// Build a transport pair whose broker side has a caller-controllable
+    /// exit watcher. Returning the `oneshot::Sender` lets a test fire a
+    /// specific `ExitOutcome` to drive `handle_exit`.
+    fn make_transport_with_exit() -> (
+        MockPlugin,
+        Transport,
+        tokio::sync::oneshot::Sender<ExitOutcome>,
+    ) {
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<ExitOutcome>();
+        let watcher: Pin<Box<dyn std::future::Future<Output = ExitOutcome> + Send>> =
+            Box::pin(async move { exit_rx.await.unwrap_or(ExitOutcome::Unknown) });
+        let (plugin_side, broker_side) = duplex(64 * 1024);
+        let (broker_read, broker_write) = tokio::io::split(broker_side);
+        let (plugin_read, plugin_write) = tokio::io::split(plugin_side);
+        let transport = Transport {
+            reader: Box::pin(broker_read),
+            writer: Box::pin(broker_write),
+            stderr: None,
+            exit: Some(watcher),
+        };
+        (
+            MockPlugin {
+                writer: plugin_write,
+                reader: BufReader::new(plugin_read),
+            },
+            transport,
+            exit_tx,
+        )
+    }
+
+    #[tokio::test]
+    async fn queue_engine_envelope_drains_into_new_entries_on_next_tick() {
+        // Step records the kind of every entry it sees so we can assert the
+        // synthetic envelope reached the Lua layer with origin=engine.
+        let dir = TempDir::new().unwrap();
+        let (session, _path) = tmp_session(&dir);
+        let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
+        let host = build_host(
+            &shared,
+            r#"
+            seen = {}
+            function step(saved, current)
+                local last = current[#current]
+                seen[#seen + 1] = last.origin .. ":" .. last.payload
+            end
+            "#,
+        );
+        let lua = host.lua().clone();
+        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+
+        // Queue *before* run() — the first tick must drain it.
+        broker.queue_engine_envelope(serde_json::json!({
+            "kind": "engine.plugin_failed",
+            "plugin": "ghost",
+            "phase": "spawn",
+            "reason": "binary missing",
+            "code": "missing_dir",
+        }));
+        // Attach one transport so the run loop has a connection to wait on
+        // and doesn't exit AllPluginsGone before draining.
+        let (_p, t) = make_transport();
+        broker.attach_transport(t, pn("dummy"));
+
+        let handle = broker.shutdown_handle();
+        let run = tokio::spawn(broker.run());
+
+        // Give the broker a tick to drain.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        handle.shutdown(50).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
+
+        let seen: mlua::Table = lua.globals().get("seen").unwrap();
+        let first: String = seen.get(1).expect("step saw at least one entry");
+        assert!(
+            first.starts_with("engine:"),
+            "first entry should be from engine, got {first}"
+        );
+        assert!(
+            first.contains("\"kind\":\"engine.plugin_failed\""),
+            "payload should carry the kind, got {first}"
+        );
+        assert!(
+            first.contains("\"plugin\":\"ghost\""),
+            "payload should carry plugin name, got {first}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_exit_with_crash_emits_engine_plugin_failed_then_shuts_down() {
+        // Two plugins: 'a' is the victim, 'b' stays alive long enough for the
+        // synthetic envelope to flow through step. Step records what it saw
+        // so the test can assert the engine-originated entry shape.
+        let dir = TempDir::new().unwrap();
+        let (session, _path) = tmp_session(&dir);
+        let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
+        let host = build_host(
+            &shared,
+            r#"
+            engine_seen = {}
+            function step(saved, current)
+                local last = current[#current]
+                if last.origin == "engine" then
+                    engine_seen[#engine_seen + 1] = last.payload
+                end
+            end
+            "#,
+        );
+        let lua = host.lua().clone();
+        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+
+        let (_pa, ta, exit_tx_a) = make_transport_with_exit();
+        let (_pb, tb) = make_transport();
+        broker.attach_transport(ta, pn("a"));
+        broker.attach_transport(tb, pn("b"));
+
+        let run = tokio::spawn(broker.run());
+
+        // Fire the crash outcome for 'a'. The broker's exit watcher routes
+        // it to `handle_exit` which queues + drains synchronously.
+        let _ = exit_tx_a.send(ExitOutcome::Crash);
+
+        // The cooperative-shutdown grace is DEFAULT_SHUTDOWN_GRACE_MS. Wait
+        // long enough for: handle_exit → drain → step → shutdown → run exit.
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(DEFAULT_SHUTDOWN_GRACE_MS + 500),
+            run,
+        )
+        .await
+        .expect("broker should stop within grace + slack")
+        .expect("join ok");
+        assert_eq!(outcome, BrokerStopReason::Shutdown);
+
+        let engine_seen: mlua::Table = lua.globals().get("engine_seen").unwrap();
+        let len = engine_seen.len().unwrap();
+        assert!(len >= 1, "step should have observed >=1 engine entry, got {len}");
+        let payload: String = engine_seen.get(1).unwrap();
+        assert!(
+            payload.contains("\"kind\":\"engine.plugin_failed\""),
+            "expected engine.plugin_failed kind, got {payload}"
+        );
+        assert!(
+            payload.contains("\"plugin\":\"a\""),
+            "expected plugin name 'a', got {payload}"
+        );
+        assert!(
+            payload.contains("\"phase\":\"runtime\""),
+            "expected phase=runtime, got {payload}"
+        );
+        assert!(
+            payload.contains("\"code\":\"crash\""),
+            "expected code=crash, got {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_exit_with_clean_exit_does_not_emit_engine_plugin_failed() {
+        // CleanExit is normal lifecycle — no synthetic envelope, just the
+        // usual cooperative-shutdown cascade.
+        let dir = TempDir::new().unwrap();
+        let (session, _path) = tmp_session(&dir);
+        let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
+        let host = build_host(
+            &shared,
+            r#"
+            engine_seen = {}
+            function step(saved, current)
+                local last = current[#current]
+                if last.origin == "engine" then
+                    engine_seen[#engine_seen + 1] = last.payload
+                end
+            end
+            "#,
+        );
+        let lua = host.lua().clone();
+        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+
+        let (_pa, ta, exit_tx_a) = make_transport_with_exit();
+        let (_pb, tb) = make_transport();
+        broker.attach_transport(ta, pn("a"));
+        broker.attach_transport(tb, pn("b"));
+
+        let run = tokio::spawn(broker.run());
+
+        let _ = exit_tx_a.send(ExitOutcome::CleanExit);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(DEFAULT_SHUTDOWN_GRACE_MS + 500),
+            run,
+        )
+        .await
+        .expect("broker should stop within grace + slack")
+        .expect("join ok");
+        assert_eq!(outcome, BrokerStopReason::Shutdown);
+
+        let engine_seen: mlua::Table = lua.globals().get("engine_seen").unwrap();
+        let len = engine_seen.len().unwrap();
+        assert_eq!(
+            len, 0,
+            "clean exit must not produce an engine.plugin_failed envelope, saw {len}"
+        );
     }
 
     #[tokio::test]

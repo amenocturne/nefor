@@ -10,10 +10,12 @@
 //! plugin binaries to spawn.
 
 pub mod engine;
+pub mod json;
 pub mod plugins;
 pub mod process;
 
 pub use engine::{install_engine, EngineOps, SendTarget};
+pub use json::install_json;
 pub use plugins::install_plugins;
 pub use process::install_process;
 
