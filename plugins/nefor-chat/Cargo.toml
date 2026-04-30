@@ -30,5 +30,9 @@ unicode-width = "0.2"
 # HTML.
 pulldown-cmark = { version = "0.13", default-features = false }
 
+# UUID v4 generation for the `/dag-test` smoke command's `run_id`. dag-scheduler
+# already pulls v1 with the `v4` feature so resolution is a no-op.
+uuid = { version = "1", features = ["v4"] }
+
 [dev-dependencies]
 serde_json = { workspace = true }
