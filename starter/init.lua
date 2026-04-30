@@ -151,41 +151,69 @@ ncp.spawn {
 }
 
 -------------------------------------------------------------------------
--- 4b. Provider — openai-provider against local Ollama
+-- 4b. Provider — real openai-provider against Ollama, OR mock-plugin
 -------------------------------------------------------------------------
 --
--- One provider, one chat session per orchestrator instance. The
--- orchestrator's reasoner-graph adapter calls
--- `ollama.chat.create / chat.append / chat.complete` directly; the
--- legacy `chat.input.submit → ollama.prompt` adapter path is left
--- inert (we don't translate `chat.input.submit` here; the chat
--- orchestrator intercepts it on nefor-chat's egress before any
--- provider sees it).
+-- USE_MOCK_PROVIDER=true swaps the live LLM for a deterministic mock.
+-- The mock-plugin binary loads `starter/mock_provider.lua` and emits
+-- the same `<name>.chat.{create,append,complete[.result]}` /
+-- `<name>.stream.delta`/`<name>.stream.end` shape openai-provider
+-- emits, with hardcoded canned responses for the smoke test prompt.
+-- See `starter/mock_provider.lua` for the response selection logic.
 --
--- The static_token=ollama-anything trick unlocks the openai-provider's
--- auth gate without a real key — required for local Ollama. Real
--- providers should provide an --api-key CLI arg instead.
-local PROVIDER_NAME = "ollama"
-local PROVIDER_MODEL = "gemma4:latest"
+-- For the real provider: one chat session per orchestrator instance;
+-- the orchestrator's reasoner-graph adapter calls
+-- `<name>.chat.create / chat.append / chat.complete` directly; the
+-- legacy `chat.input.submit → <name>.prompt` adapter path is left
+-- inert. The static_token=ollama-local trick unlocks openai-provider's
+-- auth gate without a real key (required for local Ollama). Real
+-- remote providers would supply an --api-key CLI arg.
+local USE_MOCK_PROVIDER = false
 
-local provider_chat = mk_openai_provider(PROVIDER_NAME, { static_token = "ollama-local" })
+local PROVIDER_NAME, PROVIDER_MODEL, provider_chat, provider_spawn
 
-ncp.spawn {
-  name        = PROVIDER_NAME,
-  command     = {
-    bin("openai-provider"),
-    "--name",     PROVIDER_NAME,
-    "--base-url", "http://localhost:11434",
-    "--model",    PROVIDER_MODEL,
-  },
-  from_plugin = compose_chain({
-    -- Inner: type-adapter intercepts chat.complete.result for chats we own.
-    rg_adapter.for_provider(PROVIDER_NAME),
-    -- Outer: chat-contract translation (stream.delta → chat.stream.delta, …).
-    provider_chat,
-  }).from_plugin,
-  to_plugin   = provider_chat.to_plugin,
-}
+if USE_MOCK_PROVIDER then
+  PROVIDER_NAME  = "mock-plugin"
+  PROVIDER_MODEL = "mock-model"
+  -- mock-plugin's hardcoded plugin-name is "mock-plugin"; using anything
+  -- else would require a --name flag in mock-plugin's main.rs.
+  provider_chat = mk_openai_provider(PROVIDER_NAME)
+  provider_spawn = {
+    name        = PROVIDER_NAME,
+    command     = {
+      bin("mock-plugin"),
+      "--script", STARTER_ROOT .. "/mock_provider.lua",
+    },
+    from_plugin = compose_chain({
+      rg_adapter.for_provider(PROVIDER_NAME),
+      provider_chat,
+    }).from_plugin,
+    to_plugin   = provider_chat.to_plugin,
+  }
+else
+  PROVIDER_NAME  = "ollama"
+  -- qwen3.6:35b-a3b-coding-mxfp8 — MoE (3B active params, 35B total) with
+  -- strong tool-calling. Verified one-shot to emit a clean spawn_graph
+  -- with proper terminal wiring; faster than the dense 27b model.
+  PROVIDER_MODEL = "qwen3.6:35b-a3b-coding-mxfp8"
+  provider_chat = mk_openai_provider(PROVIDER_NAME, { static_token = "ollama-local" })
+  provider_spawn = {
+    name        = PROVIDER_NAME,
+    command     = {
+      bin("openai-provider"),
+      "--name",     PROVIDER_NAME,
+      "--base-url", "http://localhost:11434",
+      "--model",    PROVIDER_MODEL,
+    },
+    from_plugin = compose_chain({
+      rg_adapter.for_provider(PROVIDER_NAME),
+      provider_chat,
+    }).from_plugin,
+    to_plugin   = provider_chat.to_plugin,
+  }
+end
+
+ncp.spawn(provider_spawn)
 
 -------------------------------------------------------------------------
 -- 4c. Reasoner graph — three adapters co-attach
@@ -199,16 +227,35 @@ ncp.spawn {
 -- gate-forwarded `spawn-graph-tool.tool.invoke` is caught on
 -- tool-gate's egress chain (4d below), not here.
 
+-- Stage-1 system prompt: teaches the orchestrator model when and how
+-- to use `spawn_graph`. Kept terse on purpose — Gemma 3 reasons itself
+-- into a "stop" finish without committing to the tool call when the
+-- prompt is dense. Schema-only worked-example was enough to make it
+-- emit a well-formed graph reliably; the verbose version was not.
+-- Two reasoner types are documented because those are the ones
+-- rg_adapter handles for sub-graphs (`responder` = one-shot LLM,
+-- `terminal` = sink); other reasoner types are private to the
+-- orchestrator's chat loop and would just confuse the model.
+local ORCHESTRATOR_SYSTEM_PROMPT = [[
+You are a helpful assistant. Use the `spawn_graph` tool for parallel decomposition tasks (multiple independent sub-questions to combine).
+
+Graph schema:
+{ "nodes": [{ "id": str, "reasoner": str, "args": {...} }], "edges": [{ "from": str, "to": str }] }
+
+Reasoner types:
+- `responder` — one-shot LLM call. args: { "prompt": string }. Upstream nodes' outputs become user messages prepended to the prompt.
+- `terminal` — sink. args: {}. Exactly one per graph; its input becomes the run's result.
+
+To combine parallel branches into a single output, add a `responder` combine node downstream of the parallel branches and feed it into terminal. Do NOT wire parallel branches directly into terminal — terminal is a sink, not a combiner. Pattern:
+  branchA, branchB → combine (responder) → terminal
+
+Emit the tool call directly after deciding the structure. For simple chat turns (no decomposition benefit), just answer directly.
+]]
+
 chat_orchestrator.configure {
   provider = PROVIDER_NAME,
   model    = PROVIDER_MODEL,
-  -- Minimal system prompt: verifies the chat pipeline still honours
-  -- terse user instructions when a system message is present. Tools
-  -- are still advertised through the catalog (spawn_graph, basic
-  -- tools), so this also tests instruction-following with tools
-  -- attached. If gemma starts ignoring "respond X and nothing else"
-  -- prompts again, the tool catalog is the next variable to isolate.
-  system   = "You are a helpful assistant.",
+  system   = ORCHESTRATOR_SYSTEM_PROMPT,
 }
 rg_adapter.set_default_provider(PROVIDER_NAME, PROVIDER_MODEL)
 -- next_state capture rides on rg_adapter's in-process observer hook.
@@ -216,6 +263,17 @@ rg_adapter.set_default_provider(PROVIDER_NAME, PROVIDER_MODEL)
 -- `graph.node_result` envelopes — they're shipped via
 -- `nefor.engine.send` from Lua and bypass the bus's transform stack.
 chat_orchestrator.attach_state_capture()
+-- Async spawn_graph delivery: the chat orchestrator subscribes to
+-- spawn_graph's in-process `on_completed` hook so deferred sub-graph
+-- results can be injected as a fresh chat turn. Same rationale as
+-- attach_state_capture — engine.send-emitted events bypass the bus
+-- transform layer, so an in-process callback is the only viable path.
+chat_orchestrator.attach_spawn_graph_listener(spawn_graph)
+-- Hand rg_adapter a reference to spawn_graph so its for_provider
+-- stream.delta hook can release queued sub-graph dispatches the moment
+-- the orchestrator's wrap chat starts streaming. See the comment block
+-- inside spawn_graph's invoke handler for why we defer.
+rg_adapter.set_spawn_graph_module(spawn_graph)
 
 local rg_chain = compose_chain({
   -- `for_starter()` is the innermost transform in the rg chain: it

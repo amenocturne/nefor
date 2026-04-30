@@ -79,6 +79,14 @@ local M = {}
 
 local json = nefor.json
 
+-- spawn_graph module ref. Set by `M.set_spawn_graph_module(spawn_graph)`
+-- from init.lua. provider_run_node releases queued sub-graph dispatches
+-- right after emitting wrap's chat.complete so async-tool ack turns
+-- aren't queued behind the sub-graph nodes at the Ollama HTTP boundary.
+-- Module reference (rather than direct require) so tests that don't
+-- need spawn_graph can leave it nil.
+local spawn_graph_module = nil
+
 -- ------------------------------------------------------------------
 -- module state
 -- ------------------------------------------------------------------
@@ -98,6 +106,18 @@ local pending = {}
 -- Reverse maps for plugin-replies that don't carry firing_id.
 local chat_id_to_key = {}
 local tool_id_to_key = {}
+
+-- chat_ids whose `<prefix>.stream.{delta,end}` and `<prefix>.session.stats`
+-- should be visible to nefor-chat. True only for `provider-wrapper` (the
+-- orchestrator's user-facing wrap node); false for `responder`, `dummy`
+-- and any other reasoner type we drive through provider chats. Without
+-- this gate, sub-graph nodes' token streams leak into the chat as if
+-- they were the orchestrator's reply.
+local chat_id_stream_visible = {}
+
+-- Reasoner types whose streaming should reach nefor-chat. Anything else
+-- runs silently (sub-graph internals, scratch chats, etc.).
+local STREAM_VISIBLE_TYPES = { ["provider-wrapper"] = true }
 
 -- Stable-but-unique id counters for chat_ids and tool_ids minted here.
 local id_counter = 0
@@ -294,6 +314,7 @@ local function provider_run_node(reasoner_type, body)
     chat_id       = chat_id,
   }
   chat_id_to_key[chat_id] = key
+  chat_id_stream_visible[chat_id] = STREAM_VISIBLE_TYPES[reasoner_type] == true
 
   if need_create then
     local create_body = { kind = provider .. ".chat.create", chat_id = chat_id }
@@ -301,10 +322,19 @@ local function provider_run_node(reasoner_type, body)
     if type(model) == "string" and #model > 0 then
       create_body.model = model
     end
+    -- Sub-graph responder nodes must produce text, not tool calls. The
+    -- provider's tool catalog is process-global, so without this the
+    -- responder LLM sees the orchestrator's `spawn_graph` / `bash` / …
+    -- and tool-calls instead of writing the requested summary. Other
+    -- reasoner types (provider-wrapper) keep tools on.
+    if reasoner_type == "responder" then
+      create_body.tools = false
+    end
     nefor.log.info("rg_adapter -> provider: chat.create", {
       provider = provider,
       chat_id = chat_id,
       model = create_body.model,
+      tools = create_body.tools,
     })
     emit_to(provider, create_body)
   end
@@ -314,9 +344,13 @@ local function provider_run_node(reasoner_type, body)
   --   2. inputs.<id>.output is a ProviderIn-shaped table with
   --      `messages` list → append each (preferred path; what `adapter`
   --      emits on cycle re-fire).
-  --   3. inputs.<id>.output is a plain string → append as `user`.
-  --   4. else: args.prompt as `user` (first-firing convenience for
-  --      `dummy`).
+  --   3. inputs.<id>.output is a ProviderOut-shaped table with `text`
+  --      string → append text as `user` (what an upstream `responder`
+  --      / `provider-wrapper` node emits when fanned into a combiner).
+  --   4. inputs.<id>.output is a plain string → append as `user`.
+  --   5. First firing → append args.prompt as `user` AFTER any inputs.
+  --      Combiners (inputs + prompt) see upstream summaries first then
+  --      the combine instruction.
   if need_create then
     if type(args) == "table" and type(args.system) == "string" and #args.system > 0 then
       nefor.log.info("rg_adapter -> provider: chat.append (system)", {
@@ -333,7 +367,6 @@ local function provider_run_node(reasoner_type, body)
     end
   end
 
-  local appended_any = false
   for dep_id, dep_entry in pairs(inputs) do
     if type(dep_entry) == "table" and dep_entry.output ~= nil then
       local out = dep_entry.output
@@ -351,8 +384,20 @@ local function provider_run_node(reasoner_type, body)
             chat_id = chat_id,
             message = msg,
           })
-          appended_any = true
         end
+      elseif type(out) == "table" and type(out.text) == "string" then
+        nefor.log.info("rg_adapter -> provider: chat.append (ProviderOut text as user)", {
+          provider = provider,
+          chat_id = chat_id,
+          from_dep = tostring(dep_id),
+          content_len = #out.text,
+          content_preview = string.sub(out.text, 1, 80),
+        })
+        emit_to(provider, {
+          kind    = provider .. ".chat.append",
+          chat_id = chat_id,
+          message = { role = "user", content = out.text },
+        })
       elseif type(out) == "string" then
         nefor.log.info("rg_adapter -> provider: chat.append (string input as user)", {
           provider = provider,
@@ -365,20 +410,19 @@ local function provider_run_node(reasoner_type, body)
           chat_id = chat_id,
           message = { role = "user", content = out },
         })
-        appended_any = true
       end
     end
   end
 
-  -- First-firing convenience: append `args.prompt` as a user message
-  -- whenever no input-driven messages were appended. This covers BOTH
-  -- the fresh-chat case (need_create=true, system already added above)
-  -- AND the cross-run resume case (need_create=false, seed_chat_id
-  -- carries the existing chat — its system message survives, but the
-  -- new turn's user prompt still has to be appended). Without this,
-  -- a seeded chat gets `chat.complete` with no new user message and
-  -- the model either re-runs on stale history or the provider rejects
-  -- the call.
+  -- First-firing: append `args.prompt` as a user message AFTER any
+  -- input-driven messages. Three scenarios this covers:
+  --   * fresh single-shot (no inputs): prompt is the only user message.
+  --   * cross-run resume via seed_chat_id (no inputs but existing chat):
+  --     prompt is the new turn's user message; otherwise chat.complete
+  --     would run on stale history.
+  --   * combiner (inputs + prompt): upstream summaries land as user
+  --     messages first, then the combine instruction follows. Without
+  --     this, a fan-in combiner would silently drop its prompt.
   --
   -- prev_state on first firing arrives as serde_json `null`, which
   -- nefor.json decodes via mlua to a NULL sentinel (lightuserdata),
@@ -387,7 +431,7 @@ local function provider_run_node(reasoner_type, body)
   -- table (`{chat_id=...}`); anything else (NULL sentinel, missing,
   -- or non-table) means we're firing for the first time.
   local first_firing = (type(prev_state) ~= "table")
-  if not appended_any and first_firing then
+  if first_firing then
     local prompt = (type(args) == "table" and type(args.prompt) == "string") and args.prompt or ""
     if #prompt > 0 then
       nefor.log.info("rg_adapter -> provider: chat.append (prompt as user)", {
@@ -414,6 +458,11 @@ end
 
 handlers["dummy"] = function(body) return provider_run_node("dummy", body) end
 handlers["provider-wrapper"] = function(body) return provider_run_node("provider-wrapper", body) end
+-- `responder` is the spawn_graph-facing alias for `dummy`: a one-shot
+-- LLM completion node with no tools, no cycles, no fanout. The rename
+-- exists so the system prompt can advertise an intuitive type name to
+-- the model when it constructs sub-graphs.
+handlers["responder"] = function(body) return provider_run_node("responder", body) end
 
 -- ------------------------------------------------------------------
 -- handler: tool-executor
@@ -470,11 +519,27 @@ handlers["tool-executor"] = function(body)
     local tool_id = next_id("tool")
     pending[key].tool_ids[i] = tool_id
     tool_id_to_key[tool_id] = { key = key, idx = i }
+    local call_name = (type(call) == "table" and (call.name or call.tool)) or ""
+    local call_args = (type(call) == "table" and (call.arguments or call.args)) or {}
+    -- Surface the tool call to the chat UI as a collapsible row. Use
+    -- the model's `call.id` (e.g. "call_abc123") rather than the
+    -- gate-minted `tool_id` so the start/end pair correlates with the
+    -- assistant's tool_calls in the rendered transcript. The legacy
+    -- in-provider tool loop did this directly; the reasoner-graph
+    -- path now lives here so the orchestrator's tool calls render
+    -- the same way regardless of which loop drove them.
+    local model_call_id = (type(call) == "table" and call.id) or tool_id
+    emit_to("nefor-chat", {
+      kind  = "chat.tool.start",
+      id    = model_call_id,
+      name  = call_name,
+      input = call_args,
+    })
     emit_to("tool-gate", {
       kind = "tool-gate.tool.invoke",
       id   = tool_id,
-      name = (type(call) == "table" and (call.name or call.tool)) or "",
-      args = (type(call) == "table" and (call.arguments or call.args)) or {},
+      name = call_name,
+      args = call_args,
     })
   end
   return nil
@@ -484,28 +549,69 @@ end
 -- handler: adapter (pure Lua)
 -- ------------------------------------------------------------------
 --
--- Translates ToolResults → ProviderIn. The provider already accumulates
--- `tool.result` events into its chat history (see openai-provider's
--- main.rs `tool.result` arm). So the adapter node's job here is
--- minimal: produce a ProviderIn shape with no new messages, signaling
--- "continue the chat using whatever the provider already has". The
--- wrapper node sees this on its next firing and re-issues
--- chat.complete with no new appends.
+-- Translates ToolResults → ProviderIn messages. Inputs come from
+-- tool-executor as `{tool_results: [{id, name, output, error}, ...]}`
+-- where `id` is the original assistant-emitted tool_call.id (preserved
+-- through the gate hop by tool-executor). For each result we synthesise
+-- a `{role = "tool", content, tool_call_id}` message — the OpenAI-style
+-- tool-result shape. The wrapper node's next firing appends these via
+-- chat.append so the provider's chat history reflects the round trip.
 --
--- The `messages = {}` shape tells the wrapper "no extra append, just
--- complete again". ToolResults already landed in the provider's
--- chat history via the broadcast `tool.result` events.
+-- An earlier draft of this handler emitted `messages = {}` on the
+-- (false) assumption that the provider auto-accumulates broadcast
+-- `tool.result` events into its chat history. openai-provider's
+-- `tool.result` arm only routes to its legacy in-flight tool broker,
+-- not the chat-id-keyed history that the reasoner-graph flow uses —
+-- so leaving the messages empty meant the wrapper never saw the tool
+-- result and kept re-emitting the same tool call (infinite spawn
+-- loop). Translating here is the canonical place for it: the adapter
+-- node IS the protocol bridge between ToolResults and ProviderIn.
 
 handlers["adapter"] = function(body)
   local run_id = body.run_id
   local node_id = body.node_id
   local firing_id = body.firing_id
+  local inputs = body.inputs or {}
 
-  -- Synchronously reply — this handler does no I/O. We still emit ack
-  -- first to keep the lifecycle uniform. The result follows
-  -- immediately.
+  -- Locate the ToolResults payload. tool-executor emits its output as
+  -- `{tool_results: [...]}`; tolerate alternative shapes (string output,
+  -- bare list) defensively but the canonical path is the named list.
+  local results
+  for _, dep_entry in pairs(inputs) do
+    if type(dep_entry) == "table" and type(dep_entry.output) == "table" then
+      if type(dep_entry.output.tool_results) == "table" then
+        results = dep_entry.output.tool_results
+        break
+      end
+    end
+  end
+
+  local messages = {}
+  if type(results) == "table" then
+    for _, r in ipairs(results) do
+      local content
+      if type(r.output) == "string" then
+        content = r.output
+      elseif r.output ~= nil then
+        -- Non-string outputs (objects, arrays) get JSON-encoded so the
+        -- model still has something readable; rare in practice — most
+        -- tool plugins return strings.
+        content = json.encode(r.output)
+      elseif type(r.error) == "string" then
+        content = "[tool error] " .. r.error
+      else
+        content = ""
+      end
+      messages[#messages + 1] = {
+        role         = "tool",
+        content      = content,
+        tool_call_id = r.id,
+      }
+    end
+  end
+
   send_ack("adapter", run_id, firing_id)
-  send_node_result_ok(run_id, node_id, firing_id, { messages = {} }, nil)
+  send_node_result_ok(run_id, node_id, firing_id, { messages = messages }, nil)
   return "_already_replied"
 end
 
@@ -513,9 +619,12 @@ end
 -- handler: terminal (orchestrator escape edge consumer)
 -- ------------------------------------------------------------------
 --
--- Receives FinalAnswer-shaped input on the orchestrator's escape edge.
--- Echoes the input as output verbatim so `graph.run_complete.results`
--- can carry the terminal text. Pure Lua, single firing per run.
+-- Receives input(s) from upstream nodes. Single upstream → echo as-is
+-- so `graph.run_complete.results` carries the FinalAnswer verbatim.
+-- Multiple upstreams → concatenate each upstream's `output.text` with
+-- a `## <upstream_id>` header. Models routinely wire parallel branches
+-- straight into terminal expecting it to merge; without this, only one
+-- branch survived (Lua hash-table iteration order).
 
 handlers["terminal"] = function(body)
   local run_id = body.run_id
@@ -523,15 +632,30 @@ handlers["terminal"] = function(body)
   local firing_id = body.firing_id
   local inputs = body.inputs or {}
 
-  -- Find the FinalAnswer payload — first non-nil input.output wins.
-  local final
-  for _, dep_entry in pairs(inputs) do
+  -- Collect (upstream_id, output) pairs in stable (sorted) order so
+  -- repeated runs of the same graph produce identical terminal text.
+  local ordered_ids = {}
+  for upstream_id, dep_entry in pairs(inputs) do
     if type(dep_entry) == "table" and dep_entry.output ~= nil then
-      final = dep_entry.output
-      break
+      ordered_ids[#ordered_ids + 1] = upstream_id
     end
   end
-  if final == nil then final = { text = "" } end
+  table.sort(ordered_ids)
+
+  local final
+  if #ordered_ids == 0 then
+    final = { text = "" }
+  elseif #ordered_ids == 1 then
+    final = inputs[ordered_ids[1]].output
+  else
+    local parts = {}
+    for _, uid in ipairs(ordered_ids) do
+      local out = inputs[uid].output
+      local txt = (type(out) == "table" and out.text) or ""
+      parts[#parts + 1] = "## " .. tostring(uid) .. "\n" .. tostring(txt)
+    end
+    final = { text = table.concat(parts, "\n\n") }
+  end
 
   send_ack("terminal", run_id, firing_id)
   send_node_result_ok(run_id, node_id, firing_id, final, nil)
@@ -554,6 +678,17 @@ function M.register_type(name, handler_fn)
   assert(type(handler_fn) == "function",
          "register_type: handler must be a function")
   handlers[name] = handler_fn
+end
+
+-- Wire the spawn_graph module so for_provider's stream.delta hook can
+-- release queued sub-graph dispatches at the right moment. Optional —
+-- if unset, no flush happens and spawn_graph falls back to direct
+-- dispatch. See `spawn_graph_module` declaration up top for the why.
+function M.set_spawn_graph_module(spawn_graph)
+  assert(type(spawn_graph) == "table"
+           and type(spawn_graph.flush_pending_dispatches) == "function",
+         "set_spawn_graph_module: spawn_graph must expose flush_pending_dispatches")
+  spawn_graph_module = spawn_graph
 end
 
 -- List the reasoner-type names this adapter currently handles. Order is
@@ -705,10 +840,56 @@ function M.for_provider(name)
          "for_provider: name must be non-empty string")
   local prefix = name .. "."
   local result_kind = prefix .. "chat.complete.result"
+  -- Streaming-side kinds we suppress for sub-graph chats so their tokens
+  -- don't leak into nefor-chat as if the orchestrator were producing them.
+  -- Reasoning streams ride the same gate: a sub-graph responder's
+  -- thinking trace must not appear in the orchestrator's chat.
+  local stream_delta_kind = prefix .. "stream.delta"
+  local stream_end_kind   = prefix .. "stream.end"
+  local stream_reasoning_delta_kind = prefix .. "stream.reasoning_delta"
+  local stream_reasoning_end_kind   = prefix .. "stream.reasoning_end"
+  local session_stats_kind = prefix .. "session.stats"
 
   local function from_plugin(env)
     if env.type ~= "event" or type(env.body) ~= "table" then return env end
-    if env.body.kind ~= result_kind then return env end
+    local kind = env.body.kind
+
+    -- Sub-graph stream gating: stream.delta / stream.end / session.stats
+    -- AND the reasoning siblings carry chat_id; if it's one of our
+    -- internal (non-wrap) chats, drop. Pass through unconditionally for
+    -- chats we don't manage (someone else's chat) or for chats marked
+    -- stream-visible (the orchestrator's wrap node).
+    if kind == stream_delta_kind
+        or kind == stream_end_kind
+        or kind == stream_reasoning_delta_kind
+        or kind == stream_reasoning_end_kind
+        or kind == session_stats_kind then
+      local chat_id = env.body.chat_id
+      if type(chat_id) == "string" and chat_id_to_key[chat_id] ~= nil
+          and chat_id_stream_visible[chat_id] == false then
+        return nil
+      end
+      -- First sub-token from a stream-visible chat (the orchestrator's
+      -- wrap node) means Ollama has committed to processing this
+      -- request. THIS is the right moment to release any sub-graph
+      -- dispatches spawn_graph queued during the prior tool firing —
+      -- chat.complete just enqueues at the openai-provider boundary,
+      -- but a stream.delta means the HTTP request is in flight and
+      -- whatever comes next at Ollama queues behind it. Result: a
+      -- 50-token ack lands in ~3s instead of ~60s. Idempotent: when
+      -- the queue is empty (every delta after the first, all sub-
+      -- graph deltas, …) it's a no-op.
+      if (kind == stream_delta_kind or kind == stream_reasoning_delta_kind)
+          and type(chat_id) == "string"
+          and chat_id_stream_visible[chat_id] == true
+          and type(spawn_graph_module) == "table"
+          and type(spawn_graph_module.flush_pending_dispatches) == "function" then
+        spawn_graph_module.flush_pending_dispatches()
+      end
+      return env
+    end
+
+    if kind ~= result_kind then return env end
     local chat_id = env.body.chat_id
     if type(chat_id) ~= "string" then return env end
     local key = chat_id_to_key[chat_id]
@@ -722,6 +903,7 @@ function M.for_provider(name)
     local out = env.body.output
     pending[key] = nil
     chat_id_to_key[chat_id] = nil
+    chat_id_stream_visible[chat_id] = nil
 
     if type(out) == "table" then
       nefor.log.info("rg_adapter <- provider: chat.complete.result", {
@@ -778,12 +960,23 @@ function M.for_tool_gate()
     end
 
     -- Record this call's result.
+    local model_call_id = (entry.tool_calls[ref.idx] and entry.tool_calls[ref.idx].id) or tool_id
     entry.tool_results[ref.idx] = {
-      id     = (entry.tool_calls[ref.idx] and entry.tool_calls[ref.idx].id) or tool_id,
+      id     = model_call_id,
       name   = (entry.tool_calls[ref.idx] and entry.tool_calls[ref.idx].name) or "",
       output = env.body.output,
       error  = env.body.error,
     }
+    -- Close out the chat-UI row paired with the start emitted at
+    -- invoke time. `error` is a bool (chat-contract); coerce
+    -- truthy/non-nil values defensively in case the gate sends
+    -- something else.
+    emit_to("nefor-chat", {
+      kind   = "chat.tool.end",
+      id     = model_call_id,
+      output = type(env.body.output) == "string" and env.body.output or "",
+      error  = env.body.error == true,
+    })
     entry.pending_count = entry.pending_count - 1
     tool_id_to_key[tool_id] = nil
 
@@ -809,6 +1002,7 @@ end
 function M._reset()
   pending = {}
   chat_id_to_key = {}
+  chat_id_stream_visible = {}
   tool_id_to_key = {}
   id_counter = 0
   node_result_observers = {}

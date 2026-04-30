@@ -110,6 +110,18 @@ fn install_mock_engine_and_test_helpers(lua: &Lua) -> mlua::Result<()> {
 
     nefor_tbl.set("engine", engine_tbl)?;
     nefor::lua::bindings::install_json(lua, &nefor_tbl)?;
+
+    // Stub `nefor.log` so the starter modules' `nefor.log.info(...)`
+    // diagnostic calls don't blow up at test time. Tests don't inspect
+    // log output; a no-op accepting any arguments is enough.
+    let log_tbl = lua.create_table()?;
+    let no_op = lua.create_function(|_, _: mlua::Variadic<Value>| Ok(()))?;
+    log_tbl.set("info",  no_op.clone())?;
+    log_tbl.set("warn",  no_op.clone())?;
+    log_tbl.set("error", no_op.clone())?;
+    log_tbl.set("debug", no_op)?;
+    nefor_tbl.set("log", log_tbl)?;
+
     lua.globals().set("nefor", nefor_tbl)?;
 
     // _test — the Lua-side control surface.
