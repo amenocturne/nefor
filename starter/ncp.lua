@@ -39,7 +39,7 @@
 --   rewound history. Session resumption semantics are deferred (see
 --   nefor-reasoner-architecture.md: D-21a-deferred).
 
-local json = require("lib.json")
+local json = nefor.json
 
 local M = {}
 
@@ -60,6 +60,16 @@ local ready_plugins = {}
 -- to_plugin) and return either a (possibly mutated) envelope table or nil
 -- to drop. Errors are caught — a faulty transform never crashes step.
 local plugin_transforms = {}
+
+-- FIFO queue of `chat.popup` envelope tables awaiting nefor-chat's ready.
+-- Engine spawn-failures fire during boot, before nefor-chat completes its
+-- `ready` handshake — and nefor-chat's NCP layer drops every pre-ready_ok
+-- inbound envelope (per spec §5.1, the plugin must declare ready first).
+-- We buffer translated popups here and flush them inside `handle_ready`
+-- once nefor-chat enters `ready_plugins`. Bounded only by good sense: an
+-- engine that fails dozens of plugins at boot will accumulate dozens of
+-- popups; that's fine, a flood of popups is the right user-visible signal.
+local pending_chat_popups = {}
 
 -- ------------------------------------------------------------------
 -- helpers
@@ -192,6 +202,16 @@ handle_ready = function(origin, body, current_log, tail_index)
   ready_plugins[origin] = tail_index
   emit_ready_ok(origin)
   replay_prior_events(origin, current_log, tail_index)
+
+  -- Flush any popups buffered while nefor-chat was still booting. Each
+  -- popup needs a fresh `ts` per send; we already stamped at queue-time
+  -- but the engine restamps anyway, so we just re-encode and ship.
+  if origin == "nefor-chat" and #pending_chat_popups > 0 then
+    for _, popup in ipairs(pending_chat_popups) do
+      nefor.engine.send(encode(popup), "nefor-chat")
+    end
+    pending_chat_popups = {}
+  end
 end
 
 -- Apply the source plugin's `from_plugin` transform (if any) to a decoded
@@ -272,7 +292,12 @@ replay_prior_events = function(target, current_log, tail_index)
     -- Skip Step-originated entries: those are the engine's own forwarding
     -- fan-out of prior events, not originals. Replaying them would
     -- double-deliver.
-    if entry.origin ~= "step" then
+    --
+    -- Skip engine-originated entries too: `engine.*` kinds are private to
+    -- the translation layer in handle_engine_envelope and never belong on
+    -- the bus as broadcast events. Replaying them would leak the raw kind
+    -- (e.g. `engine.plugin_failed`) to every late attacher.
+    if entry.origin ~= "step" and entry.origin ~= "engine" then
       local env_in = decode_and_apply_from(entry.origin, entry.payload)
       if env_in and env_in.type == "event" then
         send_to_peer(target, env_in)
@@ -325,6 +350,67 @@ local function handle_event(origin, payload)
 end
 
 -- ------------------------------------------------------------------
+-- engine-originated envelopes (kind = "engine.*")
+-- ------------------------------------------------------------------
+--
+-- The engine emits synthetic envelopes onto the bus when something happens
+-- at the engine layer that plugins should know about — currently just
+-- `engine.plugin_failed` (spawn-time error or runtime crash). These arrive
+-- with `origin = "engine"` and carry a body shape like:
+--
+--   { kind = "engine.plugin_failed", plugin = "<name>",
+--     phase = "spawn"|"runtime", reason = "<text>", code = "<token>" }
+--
+-- We translate them into a `chat.popup` event targeted at nefor-chat so the
+-- user sees the failure instead of having it vanish into engine logs. If
+-- nefor-chat isn't connected (e.g. it's the plugin that died), we drop the
+-- event silently — there's no UI to render it on.
+local function handle_engine_envelope(decoded)
+  local body = decoded.body
+  if type(body) ~= "table" or type(body.kind) ~= "string" then return end
+
+  if body.kind == "engine.plugin_failed" then
+    -- Skip if nefor-chat isn't even on the spawn list right now (e.g. the
+    -- failed plugin *is* nefor-chat, or no chat is configured at all). The
+    -- popup contract only matters when there's something to render it.
+    local chat_present = false
+    for _, name in ipairs(nefor.engine.plugins()) do
+      if name == "nefor-chat" then chat_present = true; break end
+    end
+    if not chat_present then return end
+
+    local plugin = tostring(body.plugin or "<unknown>")
+    local phase  = tostring(body.phase  or "<unknown>")
+    local reason = tostring(body.reason or "<no reason>")
+    local popup = engine_envelope({
+      kind    = "chat.popup",
+      level   = "error",
+      title   = "plugin failed",
+      message = string.format("%s failed during %s: %s", plugin, phase, reason),
+      source  = "engine",
+    }, "event")
+
+    -- Engine spawn-failures fire during boot — before nefor-chat completes
+    -- its `ready` handshake. nefor-chat's NCP layer drops every pre-ready
+    -- inbound (per §5.1), so a direct send here would silently vanish. If
+    -- chat isn't ready yet, queue the popup; `handle_ready` flushes the
+    -- queue when chat readies.
+    if not ready_plugins["nefor-chat"] then
+      pending_chat_popups[#pending_chat_popups + 1] = popup
+      return
+    end
+    nefor.engine.send(encode(popup), "nefor-chat")
+    return
+  end
+
+  -- Future engine.* kinds: log and ignore. Better than silently dropping —
+  -- if a new engine envelope ships and starter isn't yet aware, the log
+  -- breadcrumb points at the version skew.
+  -- (Lua print would race with TUI rendering; rely on the engine's stderr
+  --  pump if we ever want this surfaced.)
+end
+
+-- ------------------------------------------------------------------
 -- public entry point
 -- ------------------------------------------------------------------
 
@@ -343,13 +429,26 @@ function M.step(_saved_log, current_log)
 
   local decoded, decode_err = try_decode(entry.payload)
   if decode_err ~= nil then
+    -- Engine-originated envelopes that fail to decode would loop forever
+    -- if we tried to error back at the engine — silently drop instead.
+    if entry.origin == "engine" then return end
     emit_error(entry.origin, "malformed_envelope",
       "payload is not valid JSON: " .. decode_err)
     return
   end
   if type(decoded) ~= "table" then
+    if entry.origin == "engine" then return end
     emit_error(entry.origin, "malformed_envelope",
       "payload is not a JSON object")
+    return
+  end
+
+  -- Engine-originated envelopes route through their own dispatcher. They
+  -- never go through the ready/event handshake — the engine is not a
+  -- plugin, doesn't ready, and its kinds (`engine.*`) are private to this
+  -- translation layer.
+  if entry.origin == "engine" then
+    handle_engine_envelope(decoded)
     return
   end
 
@@ -392,6 +491,18 @@ end
 --       return env  -- or nil to drop the envelope
 --     end,
 --   }
+-- Recognised keys on `ncp.spawn`'s config table. Anything outside this set
+-- is rejected at config-load time with a clear, actionable hint — same shape
+-- as the engine binding's own unknown-field errors. Surfacing here matters
+-- because `M.spawn` strips unknown fields before forwarding, so silent drops
+-- would leave users wondering why `env = { ... }` "did nothing".
+local SPAWN_VALID_KEYS = {
+  name        = true,
+  command     = true,
+  from_plugin = true,
+  to_plugin   = true,
+}
+
 function M.spawn(cfg)
   if type(cfg) ~= "table" then
     error("ncp.spawn: expected table config, got " .. type(cfg), 2)
@@ -408,6 +519,28 @@ function M.spawn(cfg)
   if to_plugin ~= nil and type(to_plugin) ~= "function" then
     error("ncp.spawn: 'to_plugin' must be a function or nil", 2)
   end
+
+  -- Reject every key outside the recognised set. Hints mirror the engine
+  -- binding's own messages so users see one consistent voice whether the
+  -- error came from Rust or Lua. `init.lua` runs before any plugin is
+  -- connected, so the bus isn't usable yet — popups are not the right
+  -- surface; a hard error at config load is.
+  for k, _ in pairs(cfg) do
+    if not SPAWN_VALID_KEYS[k] then
+      local hint
+      if k == "env" then
+        hint = "ncp.spawn: unknown field 'env'; pass values via CLI args inside the command array, e.g. `command = { binary, \"--name\", \"ollama\" }`"
+      elseif k == "args" then
+        hint = "ncp.spawn: unknown field 'args'; put args inside the command array, e.g. `command = { binary, \"--flag\", \"value\" }`"
+      elseif k == "cwd" then
+        hint = "ncp.spawn: unknown field 'cwd'; the engine always uses <plugin-dir>/<name>/ as cwd"
+      else
+        hint = "ncp.spawn: unknown field '" .. tostring(k) .. "'"
+      end
+      error(hint, 2)
+    end
+  end
+
   if from_plugin or to_plugin then
     plugin_transforms[cfg.name] = {
       from_plugin = from_plugin,
@@ -428,6 +561,7 @@ end
 function M._reset()
   ready_plugins = {}
   plugin_transforms = {}
+  pending_chat_popups = {}
 end
 
 -- Exposed for tests only. Registers a transform for `name` without going

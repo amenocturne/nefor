@@ -11,9 +11,9 @@ bus; everything NCP-shaped happens here.
   `step` hook (delegates to `ncp.step`), and registers plugins via
   `nefor.plugins.spawn`. Edit this file to change which plugins run.
 - `ncp.lua` — NCP v0.1 protocol module. Handles `ready` / `ready_ok`,
-  broadcast-minus-sender, replay-on-attach, and `error` emission.
-- `lib/json.lua` — bundled rxi/json.lua (MIT). Do not edit; re-vendor from
-  upstream if a newer version is needed.
+  broadcast-minus-sender, replay-on-attach, and `error` emission. JSON
+  encode/decode go through the engine-provided `nefor.json` (serde_json
+  bridged via mlua) — no pure-Lua JSON dependency.
 - `ncp_test.lua` — Lua unit tests for `ncp.lua`. Driven by
   `crates/nefor/tests/starter_ncp_test.rs`; not run directly.
 
