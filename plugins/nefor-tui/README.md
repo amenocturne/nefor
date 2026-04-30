@@ -35,6 +35,7 @@ not from the plugin.
 | `nefor-tui.grid.flush`         | `{}` — render accumulated events                                                                                          |
 | `nefor-tui.hl_attr_define`     | `{id: u32, rgb: {fg?: u32, bg?: u32, sp?: u32, bold?: bool, italic?: bool, underline?: bool, reverse?: bool}}`            |
 | `nefor-tui.default_colors`     | `{fg: u32, bg: u32, sp: u32}`                                                                                             |
+| `nefor-tui.clipboard.set`      | `{text: string}` — write `text` to the host clipboard via OSC 52 (best-effort; see "Clipboard" below)                     |
 
 `grid` is present for future-proofing; MVP renders only `grid=1`. Events
 targeting other grids are silently ignored. Colors are 24-bit RGB packed
@@ -81,6 +82,23 @@ deterministically.
    (c) SIGWINCH via crossterm's `Event::Resize`.
 7. On engine `shutdown`, emit a `nefor-tui.goodbye` event and exit.
    Closing stdout is the actual shutdown signal the engine sees.
+
+### Clipboard
+
+`nefor-tui.clipboard.set { text }` asks the host terminal to copy `text`
+to the system clipboard via [OSC 52]. The escape sequence
+(`\x1b]52;c;<base64-payload>\x07`) is fire-and-forget; we don't query the
+terminal to confirm it honored the request.
+
+Most modern terminals support OSC 52: kitty, wezterm, alacritty, foot,
+recent xterm, and iTerm2 (with the option enabled). macOS Terminal.app and
+tmux without `set -g set-clipboard on` ignore the sequence — `clipboard.set`
+silently no-ops there. Producers should treat clipboard as best-effort.
+
+The sequence is written to `/dev/tty`, not stdout (stdout is the NCP
+channel; mixing escape codes there would corrupt the JSONL stream).
+
+[OSC 52]: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Operating-System-Commands
 
 ### Not in scope
 
