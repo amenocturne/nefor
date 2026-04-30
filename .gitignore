@@ -6,3 +6,10 @@ tmp/
 .envrc
 .direnv/
 Cargo.lock.bak
+
+# Editor / agent state
+.claude/
+
+# Runtime logs
+starter/nefor.log
+nefor.log
