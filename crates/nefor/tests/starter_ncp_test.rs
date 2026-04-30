@@ -109,6 +109,7 @@ fn install_mock_engine_and_test_helpers(lua: &Lua) -> mlua::Result<()> {
     engine_tbl.set("now", now_fn)?;
 
     nefor_tbl.set("engine", engine_tbl)?;
+    nefor::lua::bindings::install_json(lua, &nefor_tbl)?;
     lua.globals().set("nefor", nefor_tbl)?;
 
     // _test — the Lua-side control surface.
