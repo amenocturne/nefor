@@ -14,8 +14,7 @@ Rust rewrite of nefor. Monorepo: pure algebra library + NCP-speaking engine + se
 - `plugins/mock-plugin/` — scriptable NCP actor for integration tests.
 - `tools/fake-engine/` — harness that impersonates the engine for plugin-side tests.
 - `starter/init.lua` — glue: `package.path`, plugin spawn, `step` delegator.
-- `starter/ncp.lua` — NCP v0.1 protocol implementation in Lua (handshake, broadcast, replay, errors).
-- `starter/lib/json.lua` — bundled rxi/json.lua v0.1.2 (MIT) used by `ncp.lua`.
+- `starter/ncp.lua` — NCP v0.1 protocol implementation in Lua (handshake, broadcast, replay, errors). JSON encode/decode go through `nefor.json` (serde_json bridged via mlua).
 
 ## Conventions (enforced)
 - Errors: `thiserror` for domain errors, `anyhow` only at the top boundary (`main.rs`).

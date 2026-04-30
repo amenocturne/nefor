@@ -1,9 +1,9 @@
 default:
     @just --list
 
-# Launch the nefor TUI (debug build; reads ~/.config/nefor/init.lua by default).
+# Launch the nefor TUI against the in-repo starter config and plugins (debug build).
 run:
-    cargo run --bin nefor
+    NEFOR_PLUGIN_DIR={{justfile_directory()}}/plugins cargo run --bin nefor -- --config ./starter
 
 # Fetch all workspace dependencies without compiling — warms the cache for offline builds.
 setup:
