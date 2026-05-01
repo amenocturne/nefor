@@ -7,14 +7,17 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use mlua::{Lua, RegistryKey, Table};
 
 use crate::events::EventBus;
-use crate::lua::bindings::{self, EngineOps};
+use crate::lua::bindings::{
+    self, EngineOps, EventSubscriptions, SharedStdinPump, SharedSubscriptions, StdinPump,
+};
 use crate::lua::error::LuaError;
 use crate::lua::log::{log_entry_to_lua_table, log_to_lua_table};
+use crate::lua::mode::EngineMode;
 use crate::ncp::SharedPluginRegistry;
 use crate::session::LogEntry;
 
@@ -48,27 +51,45 @@ pub struct LuaHost {
     /// once on the first invoke (the saved log is immutable across the
     /// run) and reused thereafter. `None` until first call.
     saved_log_table: Option<RegistryKey>,
+    /// `nefor.bus.on_event` registry. Populated by Lua at any time; read
+    /// by [`LuaHost::dispatch_subscriptions`] right after each step
+    /// invocation to fan out matching events.
+    subscriptions: SharedSubscriptions,
+    /// Stdin-pump receiver shared with `nefor.io.read_line`. Empty until
+    /// CLI dispatch mode installs a pump via [`LuaHost::attach_stdin_pump`].
+    #[allow(dead_code)]
+    stdin_pump: SharedStdinPump,
 }
 
 impl LuaHost {
     /// Construct a new VM and install the full `nefor.*` binding surface.
     ///
-    /// Installs `nefor.engine`, `nefor.events`, `nefor.log`, `nefor.process`,
-    /// `nefor.plugins`. The shared plugin registry is written to by
-    /// `nefor.plugins.spawn` calls during `init.lua` and drained by the
-    /// engine after load. `engine_ops` provides the routing sink used by
-    /// `nefor.engine.send`.
+    /// Installs `nefor.engine`, `nefor.events`, `nefor.bus`, `nefor.io`,
+    /// `nefor.log`, `nefor.process`, `nefor.plugins`. The shared plugin
+    /// registry is written to by `nefor.plugins.spawn` calls during
+    /// `init.lua` and drained by the engine after load. `engine_ops`
+    /// provides the routing sink used by `nefor.engine.send`.
+    ///
+    /// The host starts in [`EngineMode::Tui`]; CLI-dispatch callers must
+    /// invoke [`LuaHost::set_mode`] (and re-install bindings that depend
+    /// on the mode, namely `nefor.io`). For the common-case TUI path this
+    /// is a no-op.
     pub fn new(
         bus: Arc<EventBus>,
         plugins: SharedPluginRegistry,
         engine_ops: Arc<dyn EngineOps>,
     ) -> Result<Self, LuaError> {
         let lua = Lua::new();
+        let subscriptions: SharedSubscriptions = Arc::new(Mutex::new(EventSubscriptions::new()));
+        let stdin_pump: SharedStdinPump = Arc::new(Mutex::new(StdinPump::empty()));
         install_nefor_surface(
             &lua,
             Arc::clone(&bus),
             Arc::clone(&plugins),
             Arc::clone(&engine_ops),
+            Arc::clone(&subscriptions),
+            EngineMode::Tui,
+            Arc::clone(&stdin_pump),
         )
         .map_err(LuaError::VmInit)?;
         Ok(Self {
@@ -79,7 +100,37 @@ impl LuaHost {
             current_log_table: None,
             current_log_mirrored: 0,
             saved_log_table: None,
+            subscriptions,
+            stdin_pump,
         })
+    }
+
+    /// Switch the host to the given [`EngineMode`] and re-install
+    /// mode-dependent bindings (`nefor.io`). Idempotent. The bus, log,
+    /// plugin, and engine bindings are mode-independent and are not
+    /// reinstalled.
+    pub fn set_mode(&mut self, mode: EngineMode) {
+        let nefor: Table = match self.lua.globals().get("nefor") {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = %e, "set_mode: nefor table missing");
+                return;
+            }
+        };
+        if let Err(e) = bindings::install_io(&self.lua, &nefor, mode, Arc::clone(&self.stdin_pump))
+        {
+            tracing::error!(error = %e, "set_mode: failed to reinstall nefor.io");
+        }
+    }
+
+    /// Install the receiver end of the stdin pump. Used by the engine's
+    /// dispatch path to bridge the binary's stdin to `nefor.io.read_line`.
+    pub fn attach_stdin_pump(&self, rx: tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let mut guard = match self.stdin_pump.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard.set_rx(rx);
     }
 
     /// Borrow the inner Lua VM. Exposed for follow-up bindings and tests.
@@ -216,6 +267,101 @@ impl LuaHost {
             }
         }
     }
+
+    /// Dispatch `nefor.bus.on_event` subscribers for each entry in
+    /// `entries`. Each entry's `payload` is parsed as JSON to extract
+    /// `body.kind`; pattern-matching subscriptions are invoked with the
+    /// envelope as a Lua table.
+    ///
+    /// Errors raised inside a handler are logged and swallowed (D-21a-style
+    /// — same policy as `step`); subsequent handlers still run. Entries
+    /// whose payload is not parseable JSON, has no `body.kind`, etc., are
+    /// silently skipped — bus subscribers explicitly speak the kind layer
+    /// and don't see protocol-malformed traffic. (Step still saw it; the
+    /// distinction is: step is the protocol authority, on_event is a
+    /// convenience over kind-based routing.)
+    pub fn dispatch_subscriptions(&self, entries: &[LogEntry]) {
+        let snap = {
+            let guard = match self.subscriptions.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            guard.snapshot()
+        };
+        if snap.is_empty() {
+            return;
+        }
+        for entry in entries {
+            let Some(kind) = extract_body_kind(&entry.payload) else {
+                continue;
+            };
+            for (pattern, handler_key) in &snap {
+                if !pattern.matches(&kind) {
+                    continue;
+                }
+                let handler: mlua::Function = match self.lua.registry_value(handler_key.as_ref()) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::error!(error = %e, "bus.on_event handler missing from registry");
+                        continue;
+                    }
+                };
+                let env = match log_entry_to_lua_table(&self.lua, entry) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to convert entry for handler");
+                        continue;
+                    }
+                };
+                if let Err(e) = handler.call::<()>(env) {
+                    tracing::error!(error = %e, kind = %kind, "bus.on_event handler raised");
+                }
+            }
+        }
+    }
+
+    /// Invoke the cli function registered under `name` (via
+    /// `nefor.plugins.spawn { cli = ... }`) with `argv` as a 1-indexed
+    /// Lua table. Returns the integer the cli function returned, or 0 if
+    /// it returned nil / a non-integer. Errors raised inside the
+    /// function propagate as a Lua error and are mapped to a non-zero
+    /// exit (1) by the caller.
+    pub fn invoke_cli(&self, name: &str, argv: &[String]) -> Result<i32, LuaError> {
+        let registry: mlua::Table = self
+            .lua
+            .globals()
+            .get(crate::lua::bindings::plugins::CLI_REGISTRY_GLOBAL)
+            .map_err(LuaError::Other)?;
+        let func: mlua::Function = registry.get(name).map_err(LuaError::Other)?;
+
+        let args = self.lua.create_table().map_err(LuaError::Other)?;
+        for (i, a) in argv.iter().enumerate() {
+            args.set(i + 1, self.lua.create_string(a).map_err(LuaError::Other)?)
+                .map_err(LuaError::Other)?;
+        }
+
+        match func.call::<mlua::Value>(args) {
+            Ok(mlua::Value::Integer(n)) => Ok(i32::try_from(n).unwrap_or(0)),
+            Ok(mlua::Value::Number(n)) if n.fract() == 0.0 => {
+                Ok(i32::try_from(n as i64).unwrap_or(0))
+            }
+            Ok(_) => Ok(0),
+            Err(e) => {
+                tracing::error!(plugin = %name, error = %e, "cli function raised");
+                Err(LuaError::Other(e))
+            }
+        }
+    }
+}
+
+/// Extract `body.kind` from a JSON payload string. Returns `None` for
+/// any failure to parse, missing fields, or non-string `kind` — the
+/// dispatch path treats such entries as "no kind to match" and moves on.
+fn extract_body_kind(payload: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let body = v.get("body")?;
+    let kind = body.get("kind")?;
+    kind.as_str().map(|s| s.to_owned())
 }
 
 /// Install every `nefor.*` sub-table.
@@ -224,6 +370,9 @@ fn install_nefor_surface(
     bus: Arc<EventBus>,
     plugins: SharedPluginRegistry,
     engine_ops: Arc<dyn EngineOps>,
+    subscriptions: SharedSubscriptions,
+    mode: EngineMode,
+    stdin_pump: SharedStdinPump,
 ) -> mlua::Result<()> {
     let nefor = lua.create_table()?;
     bindings::install_engine(lua, &nefor, engine_ops)?;
@@ -232,6 +381,8 @@ fn install_nefor_surface(
     bindings::install_log(lua, &nefor)?;
     bindings::install_process(lua, &nefor)?;
     bindings::install_plugins(lua, &nefor, plugins)?;
+    bindings::install_bus(lua, &nefor, subscriptions)?;
+    bindings::install_io(lua, &nefor, mode, stdin_pump)?;
     lua.globals().set("nefor", nefor)?;
     Ok(())
 }
@@ -499,5 +650,95 @@ mod tests {
         assert_eq!(origin, "step");
         assert_eq!(target, "mock-plugin");
         assert_eq!(payload, "pl");
+    }
+
+    fn entry(payload: &str) -> LogEntry {
+        LogEntry {
+            ts: ts(),
+            origin: Origin::Plugin(plugin("p")),
+            target: None,
+            payload: payload.into(),
+        }
+    }
+
+    #[test]
+    fn extract_body_kind_returns_string() {
+        let p = r#"{"type":"event","from":"a","ts":"x","body":{"kind":"chat.input"}}"#;
+        assert_eq!(extract_body_kind(p), Some("chat.input".to_string()));
+    }
+
+    #[test]
+    fn extract_body_kind_missing_returns_none() {
+        let p = r#"{"type":"event","from":"a","ts":"x","body":{}}"#;
+        assert_eq!(extract_body_kind(p), None);
+    }
+
+    #[test]
+    fn extract_body_kind_garbage_returns_none() {
+        assert_eq!(extract_body_kind("not json"), None);
+    }
+
+    #[test]
+    fn on_event_exact_dispatch_fires_handler() {
+        let h = host();
+        h.exec_str(
+            "init.lua",
+            r#"
+            saw = {}
+            nefor.bus.on_event("chat.input", function(env)
+                saw[#saw + 1] = env.payload
+            end)
+            "#,
+        )
+        .unwrap();
+        let e1 = entry(r#"{"type":"event","from":"p","ts":"x","body":{"kind":"chat.input"}}"#);
+        let e2 = entry(r#"{"type":"event","from":"p","ts":"x","body":{"kind":"chat.other"}}"#);
+        h.dispatch_subscriptions(&[e1.clone(), e2]);
+        let saw: mlua::Table = h.lua.globals().get("saw").unwrap();
+        let len = saw.len().unwrap();
+        assert_eq!(len, 1);
+        let payload: String = saw.get(1).unwrap();
+        assert_eq!(payload, e1.payload);
+    }
+
+    #[test]
+    fn on_event_prefix_dispatch_fires_handler() {
+        let h = host();
+        h.exec_str(
+            "init.lua",
+            r#"
+            count = 0
+            nefor.bus.on_event("chat.*", function(env) count = count + 1 end)
+            "#,
+        )
+        .unwrap();
+        let entries = vec![
+            entry(r#"{"body":{"kind":"chat.input"}}"#),
+            entry(r#"{"body":{"kind":"chat.message.append"}}"#),
+            entry(r#"{"body":{"kind":"unrelated.kind"}}"#),
+        ];
+        h.dispatch_subscriptions(&entries);
+        let count: i64 = h.lua.globals().get("count").unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn on_event_handler_error_is_swallowed_and_subsequent_run() {
+        let h = host();
+        h.exec_str(
+            "init.lua",
+            r#"
+            tally = 0
+            -- First handler raises every time.
+            nefor.bus.on_event("k", function() error("boom") end)
+            -- Second handler must still fire.
+            nefor.bus.on_event("k", function() tally = tally + 1 end)
+            "#,
+        )
+        .unwrap();
+        let e = entry(r#"{"body":{"kind":"k"}}"#);
+        h.dispatch_subscriptions(&[e]);
+        let tally: i64 = h.lua.globals().get("tally").unwrap();
+        assert_eq!(tally, 1, "second handler must still run after first errors");
     }
 }

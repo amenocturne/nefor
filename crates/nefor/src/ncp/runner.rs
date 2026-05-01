@@ -100,8 +100,19 @@ fn dev_fallback() -> Option<PathBuf> {
 }
 
 /// Spawn a plugin declared by `spec`, rooted at `root`. Returns a
-/// [`Transport`] the broker can attach.
+/// [`Transport`] the broker can attach. The caller must filter out
+/// virtual specs (`spec.command.is_none()`) before calling — the runner
+/// errors loudly rather than guessing what to spawn.
 pub fn spawn_plugin(spec: &PluginSpec, root: &PluginRoot) -> Result<Transport, BrokerError> {
+    let command = spec.command.as_ref().ok_or_else(|| BrokerError::Spawn {
+        name: spec.name.as_str().to_owned(),
+        command: Vec::new(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "spec has no command (virtual plugin must not be subprocess-spawned)",
+        ),
+    })?;
+
     let cwd = root.as_path().join(spec.name.as_str());
     if !cwd.is_dir() {
         return Err(BrokerError::MissingPluginDir {
@@ -110,14 +121,11 @@ pub fn spawn_plugin(spec: &PluginSpec, root: &PluginRoot) -> Result<Transport, B
         });
     }
 
-    let (binary, args) = spec
-        .command
-        .split_first()
-        .ok_or_else(|| BrokerError::Spawn {
-            name: spec.name.as_str().to_owned(),
-            command: spec.command.clone(),
-            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command array"),
-        })?;
+    let (binary, args) = command.split_first().ok_or_else(|| BrokerError::Spawn {
+        name: spec.name.as_str().to_owned(),
+        command: command.clone(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command array"),
+    })?;
 
     let mut cmd = Command::new(binary);
     cmd.args(args)
@@ -128,7 +136,7 @@ pub fn spawn_plugin(spec: &PluginSpec, root: &PluginRoot) -> Result<Transport, B
 
     let mut child = cmd.spawn().map_err(|source| BrokerError::Spawn {
         name: spec.name.as_str().to_owned(),
-        command: spec.command.clone(),
+        command: command.clone(),
         source,
     })?;
 
@@ -183,13 +191,32 @@ mod tests {
     fn spawn_plugin_reports_missing_dir() {
         let spec = PluginSpec {
             name: PluginName::new("nonexistent-plugin").expect("valid"),
-            command: vec!["echo".into()],
+            command: Some(vec!["echo".into()]),
+            has_cli: false,
         };
         let root = PluginRoot::new(PathBuf::from("/tmp/definitely-not-a-plugin-root-xyz"));
         match spawn_plugin(&spec, &root) {
             Err(BrokerError::MissingPluginDir { .. }) => {}
             Err(other) => panic!("expected MissingPluginDir, got {other:?}"),
             Ok(_) => panic!("expected error for nonexistent plugin dir"),
+        }
+    }
+
+    #[test]
+    fn spawn_plugin_rejects_virtual_spec() {
+        let spec = PluginSpec {
+            name: PluginName::new("virtual").expect("valid"),
+            command: None,
+            has_cli: true,
+        };
+        let root = PluginRoot::new(PathBuf::from("/tmp"));
+        let res = spawn_plugin(&spec, &root);
+        match res {
+            Err(BrokerError::Spawn { source, .. }) => {
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+            }
+            Err(other) => panic!("expected Spawn err for virtual spec, got {other:?}"),
+            Ok(_) => panic!("expected error for virtual spec"),
         }
     }
 }

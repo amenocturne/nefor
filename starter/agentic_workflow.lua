@@ -53,6 +53,22 @@ local M = {}
 
 local json = nefor.json
 
+-- Seed math.random at module load so uuid_lite / mint_chat_run_id
+-- don't draw from the deterministic Lua-default sequence. os.time() is
+-- whole-seconds; mix in os.clock() (sub-second CPU time) and the
+-- address of a fresh table for additional entropy across processes
+-- spawned in the same wall-clock second. A monotonic counter
+-- (`id_seq` below) is folded into the minted ids for tighter collision
+-- resistance — two spawn_graph calls in the same second can't collide.
+do
+  local addr_byte = string.byte(tostring({}):sub(-2, -2)) or 0
+  math.randomseed((os.time() * 1000) + math.floor((os.clock() or 0) * 1e6) + addr_byte)
+end
+
+-- Monotonic counter used by uuid_lite + mint_chat_run_id to make ids
+-- unique even when two calls land in the same os.time() second.
+local id_seq = 0
+
 -- ------------------------------------------------------------------
 -- configuration & runtime state
 -- ------------------------------------------------------------------
@@ -134,13 +150,56 @@ end
 -- requires `from`+`ts` on every wire envelope; the engine forwards our
 -- payloads verbatim, so we stamp them ourselves. Target nil = broadcast
 -- (engine fans out); a string targets one peer.
+--
+-- json.encode is wrapped in pcall: a payload that contains non-UTF-8
+-- bytes (e.g. binary file content reaching the bus, or a UTF-8-truncated
+-- multibyte boundary from a buggy producer) would otherwise raise from
+-- the bus dispatcher with no path back to the run — engine logs the
+-- error but the broker keeps idling, hanging the user. On encode
+-- failure: emit a synthesised chat.popup so the user sees something
+-- failed, log loudly, and request engine exit so the run terminates
+-- cleanly instead of hanging.
 local function emit(target, body)
-  local payload = json.encode({
+  local ok, payload = pcall(json.encode, {
     type = "event",
     from = "engine",
     ts   = nefor.engine.now(),
     body = body,
   })
+  if not ok then
+    local kind = (type(body) == "table" and tostring(body.kind)) or "(unknown)"
+    nefor.log.error("agentic_workflow: json.encode failed — payload not emitted", {
+      kind  = kind,
+      error = tostring(payload),
+    })
+    -- Best-effort user-visible popup. Build the popup envelope from
+    -- string primitives only so the popup itself can't repeat the
+    -- failure. If even this re-encode fails, we've at least logged.
+    local popup_ok, popup_payload = pcall(json.encode, {
+      type = "event",
+      from = "engine",
+      ts   = nefor.engine.now(),
+      body = {
+        kind  = "chat.popup",
+        level = "error",
+        text  = "internal error: failed to encode bus event (kind="
+                .. kind .. "); see engine log",
+      },
+    })
+    if popup_ok and nefor.engine and nefor.engine.send then
+      for _, peer in ipairs(nefor.engine.plugins()) do
+        nefor.engine.send(popup_payload, peer)
+      end
+    end
+    -- Cleanly tear down the run. The CLI driver waits for engine.exit;
+    -- TUI driver treats this as a fatal — better to surface the bug
+    -- than silently hang. Guarded so a missing binding (test harness)
+    -- doesn't compound the failure.
+    if nefor.engine and type(nefor.engine.exit) == "function" then
+      nefor.engine.exit(1)
+    end
+    return
+  end
   if target ~= nil then
     nefor.engine.send(payload, target)
   else
@@ -236,9 +295,11 @@ local function advertise_body(gate_name)
 end
 
 local function uuid_lite()
+  id_seq = id_seq + 1
   return string.format(
-    "rg-%d-%d",
+    "rg-%d-%d-%d",
     os.time(),
+    id_seq,
     math.random(0, 2 ^ 31 - 1)
   )
 end
@@ -662,9 +723,11 @@ end
 -- ------------------------------------------------------------------
 
 local function mint_chat_run_id()
+  id_seq = id_seq + 1
   return string.format(
-    "chat-run-%d-%d",
+    "chat-run-%d-%d-%d",
     os.time(),
+    id_seq,
     math.random(0, 2 ^ 31 - 1)
   )
 end
@@ -1081,9 +1144,27 @@ function M.for_provider(name, opts)
     if not entry then return env end
 
     local out = env.body.output
+    local was_stream_visible = chat_id_stream_visible[chat_id] == true
     pending[key] = nil
     chat_id_to_key[chat_id] = nil
     chat_id_stream_visible[chat_id] = nil
+
+    -- D-31 backup flush: the primary trigger is the first stream.delta
+    -- or stream.reasoning_delta on a stream-visible chat (see ~line
+    -- 1095). That covers ~all real provider turns because qwen/ollama
+    -- always emit at least one intermediate text or reasoning delta.
+    -- The rare gap: a wrap firing that goes straight from chat.complete
+    -- to a tool-calls result with zero deltas — possible with some
+    -- providers' compact responses. Without this backup the queued
+    -- sub-graph dispatch leaks until cancel_all or the next user turn.
+    -- chat.complete.result arrives only AFTER the provider's response
+    -- is fully processed, so the dispatch-overtake race that ruled out
+    -- a chat.complete trigger doesn't apply here. flush is idempotent
+    -- (no-op when queue is empty) so the redundancy with the primary
+    -- trigger is harmless.
+    if was_stream_visible then
+      flush_pending_dispatches()
+    end
 
     if type(out) == "table" then
       nefor.log.info("agentic_workflow <- provider: chat.complete.result", {
@@ -1328,7 +1409,13 @@ function M.for_tool_gate(gate_name)
         output = env.body.output,
         error  = env.body.error,
       }
-      local err_bool = env.body.error == true
+      -- An error indicator is either `true` or a non-empty string error
+      -- message; either should drive the chat-tool-end `error` flag so
+      -- the UI can highlight the failed call. Tool implementations vary
+      -- between the two shapes.
+      local raw_err = env.body.error
+      local err_bool = raw_err == true
+          or (type(raw_err) == "string" and raw_err ~= "")
       local out_str = type(env.body.output) == "string" and env.body.output or ""
       fire_observers(tool_end_observers, model_call_id, out_str, err_bool)
       emit_to("nefor-chat", {
@@ -1366,14 +1453,19 @@ function M.for_chat()
     if env.type ~= "event" or type(env.body) ~= "table" then return env end
     local kind = env.body.kind
 
-    -- /new handler: clear current_state + drop deferred queue.
+    -- /new handler: clear current_state + drop deferred queue. Also
+    -- clear current_run_id so a `/new` mid-run doesn't wedge the next
+    -- submit into the [orchestrator busy] path; the in-flight run is
+    -- the one being discarded so blocking on it is the wrong move.
     if kind == "chat.reset" then
       nefor.log.info("agentic_workflow: chat.reset received, clearing current_state", {
         had_state = current_state ~= nil,
         prior_chat_id = type(current_state) == "table" and current_state.chat_id or nil,
         dropped_deferred = #deferred_queue,
+        had_run = current_run_id ~= nil,
       })
       current_state = nil
+      current_run_id = nil
       deferred_queue = {}
       return env
     end
@@ -1426,6 +1518,12 @@ end
 -- One-shot configuration. Wires the in-process observers (state capture
 -- + spawn_graph completion listener) before returning so the first
 -- possible event is already covered.
+--
+-- Idempotent: the observer registries are append-only, so a second
+-- setup() would double-fire the next_state capture and the
+-- spawn_graph completion handler. Config rebinds (provider/model/
+-- system) are still honoured on every call — only the observer
+-- wire-up is gated.
 function M.setup(opts)
   if type(opts) == "table" then
     if type(opts.provider) == "string" and #opts.provider > 0 then
@@ -1438,6 +1536,9 @@ function M.setup(opts)
       config.system = opts.system
     end
   end
+
+  if M._setup_done then return end
+  M._setup_done = true
 
   -- next_state capture: when the wrap node's firing completes, persist
   -- next_state so the next submit can seed_chat_id.
@@ -1525,6 +1626,16 @@ function M.cancel_all()
   local sub_n = cancel_all_pending_runs()
   local dropped = #deferred_queue
   deferred_queue = {}
+  -- Drop the in-flight provider/tool-gate bookkeeping too. A late
+  -- chat.complete.result for a chat we just cancelled would otherwise
+  -- emit a stale graph.node_result for a run_id reasoner-graph already
+  -- discarded. Reasoner-graph would silently drop it but the Lua-side
+  -- state bleed is a robustness wart. The registries get rebuilt as
+  -- new chats are created.
+  pending = {}
+  chat_id_to_key = {}
+  chat_id_stream_visible = {}
+  tool_id_to_key = {}
   nefor.log.info("agentic_workflow: cancel_all", {
     cancelled_chat_run = cancelled_chat,
     cancelled_sub_runs = sub_n,
@@ -1542,9 +1653,11 @@ end
 
 -- /new handler: broadcast chat.reset (openai-provider clears its chat
 -- histories, nefor-chat clears its transcript), and locally clear our
--- current_state + deferred queue.
+-- current_state + deferred queue. Also clear current_run_id — same
+-- reasoning as the chat.reset arm in for_chat.
 function M.new_chat()
   current_state = nil
+  current_run_id = nil
   deferred_queue = {}
   emit(nil, { kind = "chat.reset" })
 end
@@ -1647,6 +1760,7 @@ function M._reset()
   tool_end_observers = {}
   complete_observers = {}
   popup_observers = {}
+  M._setup_done = nil
 end
 
 -- Test-only inspection.

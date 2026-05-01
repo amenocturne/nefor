@@ -189,7 +189,10 @@ async fn handle_tool_invoke(
     // `args` is optional on the wire — a tool that takes no parameters
     // shouldn't require an empty `{}`. Default to an empty object so the
     // tool's parser sees a valid JSON object.
-    let args = body.get("args").cloned().unwrap_or(Value::Object(Map::new()));
+    let args = body
+        .get("args")
+        .cloned()
+        .unwrap_or(Value::Object(Map::new()));
 
     // Reject names this plugin doesn't own up front — keeps the error
     // surface small (BadArgs is the closest-fitting variant) and avoids
@@ -228,10 +231,7 @@ fn render_tool_error(e: &ToolError) -> String {
 
 fn hello_body() -> Map<String, Value> {
     let mut m = Map::new();
-    m.insert(
-        "kind".into(),
-        Value::String(format!("{PLUGIN_NAME}.hello")),
-    );
+    m.insert("kind".into(), Value::String(format!("{PLUGIN_NAME}.hello")));
     m.insert("version".into(), Value::String(PLUGIN_VERSION.into()));
     m
 }
@@ -345,17 +345,17 @@ mod tests {
     #[test]
     fn tool_register_body_lists_every_tool_with_schema() {
         let b = tool_register_body();
-        assert_eq!(
-            b.get("kind").and_then(Value::as_str),
-            Some("tool.register")
-        );
+        assert_eq!(b.get("kind").and_then(Value::as_str), Some("tool.register"));
         let arr = b.get("tools").and_then(Value::as_array).expect("tools");
         assert_eq!(arr.len(), TOOLS.len());
         let read_file = arr
             .iter()
             .find(|v| v.get("name").and_then(Value::as_str) == Some("read_file"))
             .expect("read_file in tools");
-        assert!(read_file.get("description").and_then(Value::as_str).is_some());
+        assert!(read_file
+            .get("description")
+            .and_then(Value::as_str)
+            .is_some());
         let params = read_file.get("parameters").expect("parameters");
         assert_eq!(params.get("type").and_then(Value::as_str), Some("object"));
     }
@@ -417,7 +417,10 @@ mod tests {
         let line = msg.to_line();
         let v: Value = serde_json::from_str(&line).expect("json");
         let body = v.get("body").expect("body");
-        assert_eq!(body.get("kind").and_then(Value::as_str), Some("tool.result"));
+        assert_eq!(
+            body.get("kind").and_then(Value::as_str),
+            Some("tool.result")
+        );
         assert_eq!(body.get("id").and_then(Value::as_str), Some("call-7"));
         assert_eq!(body.get("output").and_then(Value::as_str), Some("abc"));
     }
@@ -442,7 +445,10 @@ mod tests {
         let line = msg.to_line();
         let v: Value = serde_json::from_str(&line).expect("json");
         let body = v.get("body").expect("body");
-        assert_eq!(body.get("kind").and_then(Value::as_str), Some("tool.result"));
+        assert_eq!(
+            body.get("kind").and_then(Value::as_str),
+            Some("tool.result")
+        );
         assert_eq!(body.get("id").and_then(Value::as_str), Some("call-8"));
         let err = body.get("error").and_then(Value::as_str).expect("error");
         assert!(err.contains("file not found"), "got: {err}");

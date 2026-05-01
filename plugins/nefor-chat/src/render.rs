@@ -75,7 +75,11 @@ fn wrapped_with_cache(state: &ChatState, cols: u32) -> Vec<Line> {
         return lines;
     }
 
-    let mut wrapped = wrap_transcript(&state.transcript, cols as usize, state.tools_expanded_global);
+    let mut wrapped = wrap_transcript(
+        &state.transcript,
+        cols as usize,
+        state.tools_expanded_global,
+    );
     if pending {
         if !wrapped.is_empty() {
             wrapped.push(Vec::new());
@@ -284,8 +288,12 @@ pub fn render_frame(state: &mut ChatState) -> Vec<Map<String, Value>> {
         0
     };
 
-    let (input_lines, cursor_line_in_input, cursor_col) =
-        render_input_wrapped(&state.input.as_string(), state.input.cursor(), chat_cols, hpad);
+    let (input_lines, cursor_line_in_input, cursor_col) = render_input_wrapped(
+        &state.input.as_string(),
+        state.input.cursor(),
+        chat_cols,
+        hpad,
+    );
 
     // Layout, top → bottom: vpad_top · transcript · vpad_input_top ·
     // input_top_bar · input · input_bot_bar · status · vpad_bottom. Status
@@ -314,7 +322,13 @@ pub fn render_frame(state: &mut ChatState) -> Vec<Map<String, Value>> {
     let autocomplete_height: u32 = match &state.popup {
         Some(Popup::SlashAutocomplete { matches, .. }) => {
             let want = (matches.len() as u32).clamp(1, MAX_INLINE_AUTOCOMPLETE_ROWS);
-            let floor = vpad_top + vpad_input_top + input_bars + input_height + vpad_bottom + status_height + 1;
+            let floor = vpad_top
+                + vpad_input_top
+                + input_bars
+                + input_height
+                + vpad_bottom
+                + status_height
+                + 1;
             let avail = rows.saturating_sub(floor);
             want.min(avail)
         }
@@ -423,10 +437,7 @@ pub fn render_frame(state: &mut ChatState) -> Vec<Map<String, Value>> {
                 if (i as u32) >= autocomplete_height {
                     break;
                 }
-                frame.push((
-                    autocomplete_top_row + i as u32,
-                    pad_left(row_spans, hpad),
-                ));
+                frame.push((autocomplete_top_row + i as u32, pad_left(row_spans, hpad)));
             }
         }
     }
@@ -696,10 +707,7 @@ fn overlay_toast(frame: &mut Vec<(u32, Vec<Span>)>, message: &str, cols: u32, ro
     }
     text.push(' ');
 
-    let row_spans: Vec<Span> = vec![
-        Span::new(" ", 0),
-        Span::new(text, HL_STATUS_INFO),
-    ];
+    let row_spans: Vec<Span> = vec![Span::new(" ", 0), Span::new(text, HL_STATUS_INFO)];
     if let Some(slot) = frame.iter_mut().find(|(r, _)| *r == target_row) {
         slot.1 = row_spans;
     } else {
@@ -793,13 +801,7 @@ fn overlay_popup(frame: &mut Vec<(u32, Vec<Span>)>, popup: &Popup, cols: u32, ro
             args_preview,
             source,
             ..
-        } => render_popup_tool_permission(
-            tool,
-            args_preview,
-            source.as_deref(),
-            popup_w,
-            popup_h,
-        ),
+        } => render_popup_tool_permission(tool, args_preview, source.as_deref(), popup_w, popup_h),
     };
 
     for (i, line) in body.into_iter().enumerate() {
@@ -1018,7 +1020,11 @@ fn render_popup_message(
         ));
     }
     let footer_truncated = clip_to_width(footer, body_w);
-    rows.push(popup_text_row_with_border_hl(&footer_truncated, inner_w, hl));
+    rows.push(popup_text_row_with_border_hl(
+        &footer_truncated,
+        inner_w,
+        hl,
+    ));
     rows.push(popup_bottom_border_with_hl(width, hl));
     rows
 }
@@ -1086,7 +1092,11 @@ fn render_popup_tool_permission(
         ));
     }
     let footer_truncated = clip_to_width(footer, body_w);
-    rows.push(popup_text_row_with_border_hl(&footer_truncated, inner_w, hl));
+    rows.push(popup_text_row_with_border_hl(
+        &footer_truncated,
+        inner_w,
+        hl,
+    ));
     rows.push(popup_bottom_border_with_hl(width, hl));
     rows
 }
@@ -1520,12 +1530,8 @@ fn pad_left(mut spans: Vec<Span>, pad: u32) -> Vec<Span> {
 }
 
 fn snapshot_of(spans: &[Span]) -> RowSnapshot {
-    spans
-        .iter()
-        .map(|s| (s.text.clone(), s.hl))
-        .collect()
+    spans.iter().map(|s| (s.text.clone(), s.hl)).collect()
 }
-
 
 fn last_is_streaming_assistant(entries: &[TranscriptEntry]) -> bool {
     entries
@@ -1897,8 +1903,7 @@ mod markdown {
                     break;
                 }
                 Event::Start(Tag::TableCell) => {
-                    let (spans, next) =
-                        collect_inline_until(events, i + 1, &TagEnd::TableCell);
+                    let (spans, next) = collect_inline_until(events, i + 1, &TagEnd::TableCell);
                     cells.push(spans);
                     i = next;
                 }
@@ -2126,10 +2131,8 @@ mod markdown {
         // truncation. We keep the spans (with their highlights) for the
         // final emit, but width work happens on plain text.
         let header_cells = pad_or_truncate_row(header, ncols);
-        let body_cells: Vec<Vec<Vec<Span>>> = rows
-            .iter()
-            .map(|r| pad_or_truncate_row(r, ncols))
-            .collect();
+        let body_cells: Vec<Vec<Vec<Span>>> =
+            rows.iter().map(|r| pad_or_truncate_row(r, ncols)).collect();
 
         let mut widths: Vec<usize> = vec![0; ncols];
         for c in 0..ncols {
@@ -2531,9 +2534,11 @@ pub fn build_status_spans(
         segs.push(yolo);
     }
     segs.push(model_seg);
-    for seg in [ctx_seg, cost_seg, turns_seg, dur_seg, speed_seg, auth_seg, scroll_seg]
-        .into_iter()
-        .flatten()
+    for seg in [
+        ctx_seg, cost_seg, turns_seg, dur_seg, speed_seg, auth_seg, scroll_seg,
+    ]
+    .into_iter()
+    .flatten()
     {
         segs.push(seg);
     }
@@ -2846,9 +2851,7 @@ fn node_row_spans(
         None => String::new(),
     };
     // Two-space gutters between columns; padded with spaces for stable column widths.
-    let prefix = format!(
-        "{marker} {id_col:<6}  {reasoner_col:<12}  {status_word}{elapsed_str}",
-    );
+    let prefix = format!("{marker} {id_col:<6}  {reasoner_col:<12}  {status_word}{elapsed_str}",);
     let truncated = clip_to_width(&prefix, width);
     let used = str_width(&truncated);
     let pad = width.saturating_sub(used);
@@ -3073,7 +3076,11 @@ fn reasoning_lines(
 
     let mut out: Vec<Line> = Vec::new();
     if show_full {
-        let header = if live { "▼ thinking…" } else { "▼ reasoning" };
+        let header = if live {
+            "▼ thinking…"
+        } else {
+            "▼ reasoning"
+        };
         out.push(vec![Span::new(header.to_string(), HL_FOOTER)]);
         for line in wrap_to_width(&r.text, cols.saturating_sub(2).max(1)) {
             out.push(vec![
@@ -3132,7 +3139,11 @@ fn tool_collapsed_line(payload: &crate::state::ToolPayload, cols: usize) -> Line
     // `tool_expanded_lines`'s header_hl rule: error → red, otherwise
     // the heading orange. The parenthesised salient tail stays dim
     // (HL_FOOTER) so the name reads as the primary anchor.
-    let head_hl = if payload.error { HL_STATUS_DANGER } else { HL_MD_HEADING };
+    let head_hl = if payload.error {
+        HL_STATUS_DANGER
+    } else {
+        HL_MD_HEADING
+    };
     spans.push(Span::new(head, head_hl));
     if !tail_text.is_empty() {
         spans.push(Span::new(tail_text, HL_FOOTER));
@@ -3158,9 +3169,7 @@ fn tool_salient_summary(name: &str, input: Option<&Value>) -> Option<String> {
         "Read" | "Edit" | "Write" | "MultiEdit" => input
             .and_then(|v| v.get("file_path"))
             .and_then(Value::as_str),
-        "read_file" | "write_file" => {
-            input.and_then(|v| v.get("path")).and_then(Value::as_str)
-        }
+        "read_file" | "write_file" => input.and_then(|v| v.get("path")).and_then(Value::as_str),
         "Grep" | "Glob" => input.and_then(|v| v.get("pattern")).and_then(Value::as_str),
         // spawn_graph: report the node count rather than fishing a string
         // field out of the input. The fallback below would otherwise grab
@@ -3253,8 +3262,9 @@ fn tool_expanded_lines(payload: &crate::state::ToolPayload, cols: usize) -> Vec<
     if !payload.input_json.is_empty() {
         out.push(vec![Span::new("  input:".to_string(), HL_FOOTER)]);
         let pretty = match input_value.as_ref() {
-            Some(v) => serde_json::to_string_pretty(v)
-                .unwrap_or_else(|_| payload.input_json.clone()),
+            Some(v) => {
+                serde_json::to_string_pretty(v).unwrap_or_else(|_| payload.input_json.clone())
+            }
             None => payload.input_json.clone(),
         };
         for line in body_lines(&pretty, inner_w, TOOL_EXPANDED_BODY_CAP) {
@@ -3900,10 +3910,16 @@ mod tests {
         let spans = build_status_spans(&md, &providers, &auth, 0, 10, 0, 200, false);
         let joined: String = spans.iter().map(|s| s.text.as_str()).collect();
         assert!(joined.contains("ollama:"), "indicator missing: {joined:?}");
-        assert!(joined.contains("anthropic:"), "indicator missing: {joined:?}");
+        assert!(
+            joined.contains("anthropic:"),
+            "indicator missing: {joined:?}"
+        );
         // Connected → ✓, login_required → ?
         assert!(joined.contains('✓'), "connected marker missing: {joined:?}");
-        assert!(joined.contains('?'), "login-required marker missing: {joined:?}");
+        assert!(
+            joined.contains('?'),
+            "login-required marker missing: {joined:?}"
+        );
 
         // The login_required marker should be HL_STATUS_WARN; connected → HL_STATUS.
         let warn_marker = spans
@@ -4064,8 +4080,12 @@ mod tests {
         let src = "```\nfoo\nbar\n```";
         let lines = markdown::render(src, 80);
         assert!(lines.len() >= 2);
-        let line_a = lines.iter().find(|l| l.iter().any(|s| s.text.contains("foo")));
-        let line_b = lines.iter().find(|l| l.iter().any(|s| s.text.contains("bar")));
+        let line_a = lines
+            .iter()
+            .find(|l| l.iter().any(|s| s.text.contains("foo")));
+        let line_b = lines
+            .iter()
+            .find(|l| l.iter().any(|s| s.text.contains("bar")));
         assert!(line_a.is_some() && line_b.is_some(), "code lines missing");
         // Every span on a code-block row carries HL_MD_CODE_BLOCK so the
         // bg color extends as a uniform rectangle (left/right insets +
@@ -4087,7 +4107,12 @@ mod tests {
             .iter()
             .filter(|l| l.iter().any(|s| s.hl == HL_MD_CODE_BLOCK))
             .collect();
-        assert_eq!(code_rows.len(), 3, "expected 3 code rows, got {}", code_rows.len());
+        assert_eq!(
+            code_rows.len(),
+            3,
+            "expected 3 code rows, got {}",
+            code_rows.len()
+        );
         let widths: Vec<usize> = code_rows
             .iter()
             .map(|row| row.iter().map(|s| str_width(&s.text)).sum())
@@ -4109,7 +4134,10 @@ mod tests {
             .find(|l| l.iter().any(|s| s.text.contains("hello")))
             .expect("code row missing");
         // First non-empty span is the left inset: " ", HL_MD_CODE_BLOCK.
-        let first = row.iter().find(|s| !s.text.is_empty()).expect("non-empty span");
+        let first = row
+            .iter()
+            .find(|s| !s.text.is_empty())
+            .expect("non-empty span");
         assert_eq!(first.text, " ", "first span should be the 1-col left inset");
         assert_eq!(first.hl, HL_MD_CODE_BLOCK);
     }
@@ -4126,7 +4154,11 @@ mod tests {
             .iter()
             .filter(|l| l.iter().any(|s| s.hl == HL_MD_CODE_BLOCK))
             .collect();
-        assert!(code_rows.len() >= 3, "expected >=3 wrapped rows, got {}", code_rows.len());
+        assert!(
+            code_rows.len() >= 3,
+            "expected >=3 wrapped rows, got {}",
+            code_rows.len()
+        );
         // No code chunk on any row should exceed cols - 2 columns.
         for row in &code_rows {
             // The "code chunk" is the middle span — not the first (inset)
@@ -4273,7 +4305,10 @@ mod tests {
         // otherwise be unreachable.
         assert!(joined.contains("▼ Bash(ls)"), "header missing: {joined:?}");
         assert!(joined.contains("input:"), "input block missing: {joined:?}");
-        assert!(joined.contains("\"command\""), "input json missing: {joined:?}");
+        assert!(
+            joined.contains("\"command\""),
+            "input json missing: {joined:?}"
+        );
         assert!(joined.contains("output:"), "output label missing");
         assert!(joined.contains("file1"), "output body missing");
         assert!(joined.contains("file2"), "output body missing");
@@ -4328,7 +4363,10 @@ mod tests {
             .iter()
             .flat_map(|l| l.iter().map(|s| s.text.as_str()))
             .collect();
-        assert!(joined.contains("more lines"), "expected truncation hint: {joined:?}");
+        assert!(
+            joined.contains("more lines"),
+            "expected truncation hint: {joined:?}"
+        );
     }
 
     #[test]
@@ -4386,7 +4424,10 @@ mod tests {
             .iter()
             .flat_map(|l| l.iter().map(|s| s.text.as_str()))
             .collect();
-        assert!(!joined.contains('▣'), "no footer while streaming: {joined:?}");
+        assert!(
+            !joined.contains('▣'),
+            "no footer while streaming: {joined:?}"
+        );
     }
 
     #[test]
@@ -4399,7 +4440,10 @@ mod tests {
             .iter()
             .flat_map(|l| l.iter().map(|s| s.text.as_str()))
             .collect();
-        assert!(!joined.contains('▣'), "no footer absent metadata: {joined:?}");
+        assert!(
+            !joined.contains('▣'),
+            "no footer absent metadata: {joined:?}"
+        );
     }
 
     #[test]
@@ -4546,7 +4590,11 @@ mod tests {
             body.len()
         );
         // Line 1 contains the short cell text "x".
-        assert!(body[0].contains(" x "), "first body sub-line missing 'x': {:?}", body[0]);
+        assert!(
+            body[0].contains(" x "),
+            "first body sub-line missing 'x': {:?}",
+            body[0]
+        );
         // Lines 2 and 3 keep the right column blank (only spaces between │).
         for line in &body[1..] {
             // Strip the leading │, leading space, and look for content.
@@ -4573,7 +4621,9 @@ mod tests {
             .iter()
             .flat_map(|l| l.iter().map(|s| s.text.as_str()))
             .collect();
-        assert!(joined.contains("world"), "strikethrough text missing: {joined:?}");
+        assert!(
+            joined.contains("world"),
+            "strikethrough text missing: {joined:?}"
+        );
     }
-
 }

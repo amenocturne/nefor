@@ -51,6 +51,17 @@ pub trait EngineOps: Send + Sync {
     /// reaches every plugin. Lua enumerates the set and issues N-1 targeted
     /// sends instead.
     fn plugins(&self) -> Vec<PluginName>;
+
+    /// Request engine shutdown with the given exit code. The implementation
+    /// signals the broker to wind down (closing every plugin connection's
+    /// outbound channel within the cooperative-shutdown grace) and stashes
+    /// the requested exit code so the caller can read it back after the
+    /// broker's run loop returns. Idempotent — first call wins.
+    ///
+    /// Default impl is a no-op so test recorders that don't care about
+    /// shutdown signalling stay terse. Production wires this to the
+    /// broker's shutdown handle + an `AtomicI32` exit-code slot.
+    fn request_exit(&self, _code: i32) {}
 }
 
 /// Install `nefor.engine.send` onto `nefor_tbl`.
@@ -113,6 +124,40 @@ pub fn install_engine(lua: &Lua, nefor_tbl: &Table, ops: Arc<dyn EngineOps>) -> 
     })?;
     engine.set("plugins", plugins_fn)?;
 
+    // nefor.engine.exit(code?) — request a clean shutdown with the given
+    // exit code (defaults to 0). Broadcasts the cascade-close to every
+    // plugin's outbound queue, then the engine process terminates with
+    // the requested code once the broker's run loop unwinds.
+    let ops_for_exit = Arc::clone(&ops);
+    let exit_fn = lua.create_function(move |_, args: mlua::Variadic<Value>| {
+        let code: i32 = match args.first() {
+            None | Some(Value::Nil) => 0,
+            Some(Value::Integer(i)) => i32::try_from(*i).map_err(|_| {
+                mlua::Error::runtime(format!("nefor.engine.exit: code {i} does not fit in i32"))
+            })?,
+            Some(Value::Number(n)) => {
+                if n.fract() != 0.0 {
+                    return Err(mlua::Error::runtime(format!(
+                        "nefor.engine.exit: code must be an integer (got {n})"
+                    )));
+                }
+                let i = *n as i64;
+                i32::try_from(i).map_err(|_| {
+                    mlua::Error::runtime(format!("nefor.engine.exit: code {i} does not fit in i32"))
+                })?
+            }
+            Some(other) => {
+                return Err(mlua::Error::runtime(format!(
+                    "nefor.engine.exit: code must be an integer or nil (got {})",
+                    other.type_name(),
+                )));
+            }
+        };
+        ops_for_exit.request_exit(code);
+        Ok(())
+    })?;
+    engine.set("exit", exit_fn)?;
+
     nefor_tbl.set("engine", engine)?;
     Ok(())
 }
@@ -125,6 +170,7 @@ mod tests {
     struct RecordOps {
         calls: Mutex<Vec<(SendTarget, String)>>,
         plugins: Mutex<Vec<PluginName>>,
+        exit_code: Mutex<Option<i32>>,
     }
 
     impl RecordOps {
@@ -132,6 +178,7 @@ mod tests {
             Arc::new(Self {
                 calls: Mutex::new(Vec::new()),
                 plugins: Mutex::new(Vec::new()),
+                exit_code: Mutex::new(None),
             })
         }
 
@@ -142,6 +189,10 @@ mod tests {
         fn set_plugins(&self, names: Vec<PluginName>) {
             *self.plugins.lock().unwrap() = names;
         }
+
+        fn exit_code(&self) -> Option<i32> {
+            *self.exit_code.lock().unwrap()
+        }
     }
 
     impl EngineOps for RecordOps {
@@ -150,6 +201,9 @@ mod tests {
         }
         fn plugins(&self) -> Vec<PluginName> {
             self.plugins.lock().unwrap().clone()
+        }
+        fn request_exit(&self, code: i32) {
+            *self.exit_code.lock().unwrap() = Some(code);
         }
     }
 
@@ -285,5 +339,48 @@ mod tests {
             .expect_err("reserved name must be rejected");
         assert!(err.to_string().contains("nefor.engine.send"), "got: {err}");
         assert!(ops.snapshot().is_empty());
+    }
+
+    #[test]
+    fn engine_exit_default_code_is_zero() {
+        let (lua, ops) = setup();
+        lua.load(r#"nefor.engine.exit()"#).exec().unwrap();
+        assert_eq!(ops.exit_code(), Some(0));
+    }
+
+    #[test]
+    fn engine_exit_explicit_code_is_recorded() {
+        let (lua, ops) = setup();
+        lua.load(r#"nefor.engine.exit(42)"#).exec().unwrap();
+        assert_eq!(ops.exit_code(), Some(42));
+    }
+
+    #[test]
+    fn engine_exit_nil_code_is_zero() {
+        let (lua, ops) = setup();
+        lua.load(r#"nefor.engine.exit(nil)"#).exec().unwrap();
+        assert_eq!(ops.exit_code(), Some(0));
+    }
+
+    #[test]
+    fn engine_exit_rejects_non_integer() {
+        let (lua, ops) = setup();
+        let err = lua
+            .load(r#"nefor.engine.exit("oops")"#)
+            .exec()
+            .expect_err("string code must be rejected");
+        assert!(err.to_string().contains("must be an integer"));
+        assert_eq!(ops.exit_code(), None);
+    }
+
+    #[test]
+    fn engine_exit_rejects_fractional_number() {
+        let (lua, ops) = setup();
+        let err = lua
+            .load(r#"nefor.engine.exit(1.5)"#)
+            .exec()
+            .expect_err("fractional code must be rejected");
+        assert!(err.to_string().contains("must be an integer"));
+        assert_eq!(ops.exit_code(), None);
     }
 }

@@ -9,12 +9,16 @@
 //! registration table that `init.lua` writes to so the engine knows which
 //! plugin binaries to spawn.
 
+pub mod bus;
 pub mod engine;
+pub mod io;
 pub mod json;
 pub mod plugins;
 pub mod process;
 
+pub use bus::{install_bus, EventSubscriptions, SharedSubscriptions};
 pub use engine::{install_engine, EngineOps, SendTarget};
+pub use io::{install_io, spawn_stdin_pump, SharedStdinPump, StdinPump};
 pub use json::install_json;
 pub use plugins::install_plugins;
 pub use process::install_process;

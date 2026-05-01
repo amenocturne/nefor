@@ -101,10 +101,7 @@ impl Message {
     /// Assistant message that combined prose + tool calls. Used when the
     /// model interleaves text deltas with tool-call deltas in the same
     /// turn.
-    pub fn assistant_with_tool_calls<S: Into<String>>(
-        text: S,
-        tool_calls: Vec<ToolCall>,
-    ) -> Self {
+    pub fn assistant_with_tool_calls<S: Into<String>>(text: S, tool_calls: Vec<ToolCall>) -> Self {
         Self {
             role: "assistant".into(),
             content: Some(text.into()),
@@ -328,10 +325,7 @@ pub fn parse_sse_chunk(payload: &str) -> SseEvent {
                 };
             }
             if !args.is_empty() {
-                return SseEvent::ToolCallArgsDelta {
-                    index,
-                    delta: args,
-                };
+                return SseEvent::ToolCallArgsDelta { index, delta: args };
             }
         }
     }
@@ -381,8 +375,7 @@ mod tests {
         // forbid it), content wins. Reasoning will keep streaming in its
         // own chunks; dropping a single reasoning fragment is cheaper
         // than reordering content out of position.
-        let payload =
-            r#"{"choices":[{"delta":{"content":"hi","reasoning":"thinking..."}}]}"#;
+        let payload = r#"{"choices":[{"delta":{"content":"hi","reasoning":"thinking..."}}]}"#;
         assert_eq!(parse_sse_chunk(payload), SseEvent::Delta("hi".into()));
     }
 
@@ -465,7 +458,9 @@ mod tests {
         assert!(v.get("content").is_some(), "explicit null serialized");
         assert_eq!(v.get("content").unwrap(), &serde_json::Value::Null);
         assert_eq!(
-            v.get("tool_calls").and_then(|c| c.as_array()).map(|a| a.len()),
+            v.get("tool_calls")
+                .and_then(|c| c.as_array())
+                .map(|a| a.len()),
             Some(1)
         );
     }
@@ -480,7 +475,10 @@ mod tests {
             v.get("tool_call_id").and_then(|s| s.as_str()),
             Some("call_1")
         );
-        assert_eq!(v.get("content").and_then(|s| s.as_str()), Some("file contents"));
+        assert_eq!(
+            v.get("content").and_then(|s| s.as_str()),
+            Some("file contents")
+        );
     }
 
     #[test]
@@ -606,7 +604,8 @@ mod tests {
     fn parse_sse_chunk_tool_call_empty_args_is_empty() {
         // Some providers stream a no-op chunk with empty arguments —
         // treat as Empty so the accumulator doesn't see noise.
-        let payload = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":""}}]}}]}"#;
+        let payload =
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":""}}]}}]}"#;
         assert_eq!(parse_sse_chunk(payload), SseEvent::Empty);
     }
 }

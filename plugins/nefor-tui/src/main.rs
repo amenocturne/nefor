@@ -1023,8 +1023,7 @@ mod tests {
         );
         // Selection still armed (active drag). A keystroke clears it.
         assert!(s.selection.is_some());
-        let outcome =
-            handle_terminal_event_for_selection(&key_event(KeyCode::Char('a')), &mut s);
+        let outcome = handle_terminal_event_for_selection(&key_event(KeyCode::Char('a')), &mut s);
         assert!(matches!(outcome, SelectionOutcome::Updated));
         assert!(s.selection.is_none());
     }
@@ -1064,8 +1063,7 @@ mod tests {
     #[test]
     fn key_event_with_no_selection_is_unchanged() {
         let mut s = state();
-        let outcome =
-            handle_terminal_event_for_selection(&key_event(KeyCode::Char('x')), &mut s);
+        let outcome = handle_terminal_event_for_selection(&key_event(KeyCode::Char('x')), &mut s);
         assert!(matches!(outcome, SelectionOutcome::Unchanged));
     }
 

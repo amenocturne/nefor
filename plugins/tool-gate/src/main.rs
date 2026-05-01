@@ -397,7 +397,10 @@ async fn handle_tool_invoke(
             return Ok(());
         }
     };
-    let args = body.get("args").cloned().unwrap_or(Value::Object(Map::new()));
+    let args = body
+        .get("args")
+        .cloned()
+        .unwrap_or(Value::Object(Map::new()));
 
     let source = match state.tool_owner.get(&name).cloned() {
         Some(s) => s,
@@ -430,19 +433,12 @@ async fn handle_tool_invoke(
                     args: args.clone(),
                 },
             );
-            send_event(
-                out_tx,
-                permission_request_body(&outer_id, &name, &args),
-            )
-            .await?;
+            send_event(out_tx, permission_request_body(&outer_id, &name, &args)).await?;
         }
         Decision::Deny => {
             send_event(
                 out_tx,
-                tool_result_error_body(
-                    &outer_id,
-                    &format!("tool `{name}` denied by gate policy"),
-                ),
+                tool_result_error_body(&outer_id, &format!("tool `{name}` denied by gate policy")),
             )
             .await?;
         }
@@ -465,11 +461,7 @@ async fn forward_to_source(
             outer_id: outer_id.to_owned(),
         },
     );
-    send_event(
-        out_tx,
-        forward_invoke_body(source, &inner_id, name, args),
-    )
-    .await?;
+    send_event(out_tx, forward_invoke_body(source, &inner_id, name, args)).await?;
     Ok(())
 }
 
@@ -548,10 +540,7 @@ async fn handle_permission_response(
 
 fn hello_body() -> Map<String, Value> {
     let mut m = Map::new();
-    m.insert(
-        "kind".into(),
-        Value::String(format!("{PLUGIN_NAME}.hello")),
-    );
+    m.insert("kind".into(), Value::String(format!("{PLUGIN_NAME}.hello")));
     m.insert("version".into(), Value::String(PLUGIN_VERSION.into()));
     m
 }
@@ -683,8 +672,13 @@ mod tests {
                 {"name": "read_file", "description": "Read a file.", "parameters": {}}
             ]),
         );
-        handle_tools_advertise(&tx, &body, &mut state).await.unwrap();
-        assert_eq!(state.tool_owner.get("read_file"), Some(&"basic-tools".into()));
+        handle_tools_advertise(&tx, &body, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.tool_owner.get("read_file"),
+            Some(&"basic-tools".into())
+        );
 
         let msg = rx.recv().await.expect("got register");
         let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
@@ -706,7 +700,9 @@ mod tests {
             "basic-tools",
             json!([{"name": "read_file", "description": "", "parameters": {}}]),
         );
-        handle_tools_advertise(&tx, &body, &mut state).await.unwrap();
+        handle_tools_advertise(&tx, &body, &mut state)
+            .await
+            .unwrap();
         let _register = rx.recv().await.unwrap();
 
         let invoke = json!({
@@ -740,7 +736,9 @@ mod tests {
             "basic-tools",
             json!([{"name": "write_file", "description": "", "parameters": {}}]),
         );
-        handle_tools_advertise(&tx, &body, &mut state).await.unwrap();
+        handle_tools_advertise(&tx, &body, &mut state)
+            .await
+            .unwrap();
         let _register = rx.recv().await.unwrap();
 
         let invoke = json!({
@@ -764,7 +762,10 @@ mod tests {
         // inner id is freshly minted, not the outer id
         let inner_id = body.get("id").and_then(Value::as_str).unwrap();
         assert!(inner_id.starts_with("gate-"));
-        assert_eq!(state.pending.get(inner_id).map(|p| p.outer_id.as_str()), Some("prov-2"));
+        assert_eq!(
+            state.pending.get(inner_id).map(|p| p.outer_id.as_str()),
+            Some("prov-2")
+        );
     }
 
     #[tokio::test]
@@ -784,7 +785,10 @@ mod tests {
         let msg = rx.recv().await.unwrap();
         let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
         let body = v.get("body").unwrap();
-        assert_eq!(body.get("kind").and_then(Value::as_str), Some("tool.result"));
+        assert_eq!(
+            body.get("kind").and_then(Value::as_str),
+            Some("tool.result")
+        );
         assert_eq!(body.get("id").and_then(Value::as_str), Some("prov-3"));
         let err = body.get("error").and_then(Value::as_str).unwrap();
         assert!(err.contains("unknown tool"));
@@ -798,7 +802,9 @@ mod tests {
             "basic-tools",
             json!([{"name": "read_file", "description": "", "parameters": {}}]),
         );
-        handle_tools_advertise(&tx, &body, &mut state).await.unwrap();
+        handle_tools_advertise(&tx, &body, &mut state)
+            .await
+            .unwrap();
         let _ = rx.recv().await;
 
         let invoke = json!({
@@ -821,7 +827,9 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        handle_permission_response(&tx, &response, &mut state).await.unwrap();
+        handle_permission_response(&tx, &response, &mut state)
+            .await
+            .unwrap();
 
         let msg = rx.recv().await.unwrap();
         let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
@@ -841,7 +849,9 @@ mod tests {
             "basic-tools",
             json!([{"name": "read_file", "description": "", "parameters": {}}]),
         );
-        handle_tools_advertise(&tx, &body, &mut state).await.unwrap();
+        handle_tools_advertise(&tx, &body, &mut state)
+            .await
+            .unwrap();
         let _ = rx.recv().await;
 
         let invoke = json!({
@@ -864,12 +874,17 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        handle_permission_response(&tx, &response, &mut state).await.unwrap();
+        handle_permission_response(&tx, &response, &mut state)
+            .await
+            .unwrap();
 
         let msg = rx.recv().await.unwrap();
         let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
         let body = v.get("body").unwrap();
-        assert_eq!(body.get("kind").and_then(Value::as_str), Some("tool.result"));
+        assert_eq!(
+            body.get("kind").and_then(Value::as_str),
+            Some("tool.result")
+        );
         assert_eq!(body.get("id").and_then(Value::as_str), Some("prov-9"));
         let err = body.get("error").and_then(Value::as_str).unwrap();
         assert!(err.contains("denied by user"));
@@ -935,7 +950,9 @@ mod tests {
                 {"name": "bash", "description": "", "parameters": {}},
             ]),
         );
-        handle_tools_advertise(&tx, &advertise, &mut state).await.unwrap();
+        handle_tools_advertise(&tx, &advertise, &mut state)
+            .await
+            .unwrap();
         let _ = rx.recv().await; // tool.register
 
         for (id, name) in [("y-1", "read_file"), ("y-2", "bash")] {
@@ -1033,7 +1050,9 @@ mod tests {
             "basic-tools",
             json!([{"name": "bash", "description": "", "parameters": {}}]),
         );
-        handle_tools_advertise(&tx, &advertise, &mut state).await.unwrap();
+        handle_tools_advertise(&tx, &advertise, &mut state)
+            .await
+            .unwrap();
         let _ = rx.recv().await;
 
         let invoke = json!({
@@ -1049,7 +1068,10 @@ mod tests {
         let msg = rx.recv().await.unwrap();
         let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
         let body = v.get("body").unwrap();
-        assert_eq!(body.get("kind").and_then(Value::as_str), Some("tool.result"));
+        assert_eq!(
+            body.get("kind").and_then(Value::as_str),
+            Some("tool.result")
+        );
         let err = body.get("error").and_then(Value::as_str).unwrap();
         assert!(err.contains("denied by gate policy"));
         assert!(state.awaiting_approval.is_empty());

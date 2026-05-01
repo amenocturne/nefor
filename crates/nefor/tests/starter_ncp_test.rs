@@ -116,8 +116,8 @@ fn install_mock_engine_and_test_helpers(lua: &Lua) -> mlua::Result<()> {
     // log output; a no-op accepting any arguments is enough.
     let log_tbl = lua.create_table()?;
     let no_op = lua.create_function(|_, _: mlua::Variadic<Value>| Ok(()))?;
-    log_tbl.set("info",  no_op.clone())?;
-    log_tbl.set("warn",  no_op.clone())?;
+    log_tbl.set("info", no_op.clone())?;
+    log_tbl.set("warn", no_op.clone())?;
     log_tbl.set("error", no_op.clone())?;
     log_tbl.set("debug", no_op)?;
     nefor_tbl.set("log", log_tbl)?;

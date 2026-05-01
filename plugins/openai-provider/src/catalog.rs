@@ -157,7 +157,8 @@ mod tests {
     #[tokio::test]
     async fn register_from_one_plugin_lists_its_tools() {
         let cat = ToolCatalog::new();
-        cat.register_from("basic-tools", vec![read_file_spec()]).await;
+        cat.register_from("basic-tools", vec![read_file_spec()])
+            .await;
         let tools = cat.to_openai_tools().await;
         assert_eq!(tools.len(), 1);
         let t = &tools[0];
@@ -174,8 +175,10 @@ mod tests {
     #[tokio::test]
     async fn register_two_plugins_unions_catalogs() {
         let cat = ToolCatalog::new();
-        cat.register_from("basic-tools", vec![read_file_spec()]).await;
-        cat.register_from("web-tools", vec![write_file_spec()]).await;
+        cat.register_from("basic-tools", vec![read_file_spec()])
+            .await;
+        cat.register_from("web-tools", vec![write_file_spec()])
+            .await;
         let tools = cat.to_openai_tools().await;
         assert_eq!(tools.len(), 2);
         let names: Vec<&str> = tools
@@ -199,7 +202,8 @@ mod tests {
         cat.register_from("basic-tools", vec![read_file_spec(), write_file_spec()])
             .await;
         // Re-register with just one tool — the other should disappear.
-        cat.register_from("basic-tools", vec![read_file_spec()]).await;
+        cat.register_from("basic-tools", vec![read_file_spec()])
+            .await;
         let tools = cat.to_openai_tools().await;
         assert_eq!(tools.len(), 1);
         let f = tools[0].get("function").expect("fn");
@@ -209,17 +213,26 @@ mod tests {
     #[tokio::test]
     async fn owner_of_returns_registering_plugin() {
         let cat = ToolCatalog::new();
-        cat.register_from("basic-tools", vec![read_file_spec()]).await;
-        cat.register_from("web-tools", vec![write_file_spec()]).await;
-        assert_eq!(cat.owner_of("read_file").await.as_deref(), Some("basic-tools"));
-        assert_eq!(cat.owner_of("write_file").await.as_deref(), Some("web-tools"));
+        cat.register_from("basic-tools", vec![read_file_spec()])
+            .await;
+        cat.register_from("web-tools", vec![write_file_spec()])
+            .await;
+        assert_eq!(
+            cat.owner_of("read_file").await.as_deref(),
+            Some("basic-tools")
+        );
+        assert_eq!(
+            cat.owner_of("write_file").await.as_deref(),
+            Some("web-tools")
+        );
         assert_eq!(cat.owner_of("nonexistent").await, None);
     }
 
     #[tokio::test]
     async fn empty_register_clears_a_senders_entries() {
         let cat = ToolCatalog::new();
-        cat.register_from("basic-tools", vec![read_file_spec()]).await;
+        cat.register_from("basic-tools", vec![read_file_spec()])
+            .await;
         cat.register_from("basic-tools", vec![]).await;
         assert!(cat.to_openai_tools().await.is_empty());
         assert!(cat.owner_of("read_file").await.is_none());

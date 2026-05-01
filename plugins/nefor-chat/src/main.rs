@@ -194,11 +194,7 @@ async fn run() -> Result<(), ChatError> {
                 }
             }
             Action::SelectModel(sel) => {
-                send_event(
-                    &out_tx,
-                    model_set_body(Some(&sel.provider), &sel.model),
-                )
-                .await?;
+                send_event(&out_tx, model_set_body(Some(&sel.provider), &sel.model)).await?;
                 if state.tui_ready {
                     if !palette_emitted {
                         emit_palette(&out_tx).await?;
@@ -437,10 +433,7 @@ fn handle_event(map: &Map<String, Value>, state: &mut ChatState) -> Action {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .unwrap_or_default();
-            let input_json = map
-                .get("input")
-                .map(|v| v.to_string())
-                .unwrap_or_default();
+            let input_json = map.get("input").map(|v| v.to_string()).unwrap_or_default();
             state.acknowledge_response();
             state.push_tool_start(id, name.to_owned(), input_json);
             Action::Render
@@ -459,10 +452,7 @@ fn handle_event(map: &Map<String, Value>, state: &mut ChatState) -> Action {
                 Some(v) => serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()),
                 None => String::new(),
             };
-            let error = map
-                .get("error")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+            let error = map.get("error").and_then(Value::as_bool).unwrap_or(false);
             state.acknowledge_response();
             if state.attach_tool_end(&id, output, error) {
                 Action::Render
@@ -514,10 +504,8 @@ fn handle_event(map: &Map<String, Value>, state: &mut ChatState) -> Action {
                             // in claude's session log, so it stays None and
                             // the footer renders model-only.
                             if role == Role::Assistant {
-                                let model = e
-                                    .get("model")
-                                    .and_then(Value::as_str)
-                                    .map(str::to_owned);
+                                let model =
+                                    e.get("model").and_then(Value::as_str).map(str::to_owned);
                                 if model.is_some() {
                                     state.stamp_last_assistant(model, None);
                                 }
@@ -525,11 +513,7 @@ fn handle_event(map: &Map<String, Value>, state: &mut ChatState) -> Action {
                             count += 1;
                         }
                         "tool" => {
-                            let id = e
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_owned();
+                            let id = e.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
                             let name = e
                                 .get("name")
                                 .and_then(Value::as_str)
@@ -550,10 +534,8 @@ fn handle_event(map: &Map<String, Value>, state: &mut ChatState) -> Action {
                                         v => serde_json::to_string_pretty(v)
                                             .unwrap_or_else(|_| v.to_string()),
                                     };
-                                    let error = e
-                                        .get("error")
-                                        .and_then(Value::as_bool)
-                                        .unwrap_or(false);
+                                    let error =
+                                        e.get("error").and_then(Value::as_bool).unwrap_or(false);
                                     state.attach_tool_end(&id, output, error);
                                 }
                             }
@@ -604,7 +586,10 @@ fn handle_popup_event(map: &Map<String, Value>, state: &mut ChatState) -> Action
     let title = map.get("title").and_then(Value::as_str).unwrap_or("");
     let message = map.get("message").and_then(Value::as_str).unwrap_or("");
     if title.is_empty() && message.is_empty() {
-        tracing::warn!(level, "chat.popup dropped: both 'title' and 'message' are missing/empty");
+        tracing::warn!(
+            level,
+            "chat.popup dropped: both 'title' and 'message' are missing/empty"
+        );
         return Action::Continue;
     }
 
@@ -1077,12 +1062,7 @@ struct ModelSelection {
 /// handle the side effect inline in the caller, but `handle_key` is sync.
 /// We carry the selection back through a thread-local and let the main loop
 /// drain it before the render pass.
-fn handle_popup_key(
-    key: &str,
-    _has_ctrl: bool,
-    _has_alt: bool,
-    state: &mut ChatState,
-) -> Action {
+fn handle_popup_key(key: &str, _has_ctrl: bool, _has_alt: bool, state: &mut ChatState) -> Action {
     if key == "escape" {
         // ToolPermission needs to TELL the gate it was denied, not just
         // close the popup — otherwise the gate hangs on `awaiting_approval`
@@ -1173,10 +1153,7 @@ fn handle_popup_key(
                 }
                 "pageup" => {
                     let step = popup_page_step(state).max(1);
-                    let popup = state
-                        .popup
-                        .as_mut()
-                        .expect("popup is some (checked above)");
+                    let popup = state.popup.as_mut().expect("popup is some (checked above)");
                     if let Popup::ModelPicker { cursor, .. } = popup {
                         *cursor = cursor.saturating_sub(step);
                     }
@@ -1185,10 +1162,7 @@ fn handle_popup_key(
                 }
                 "pagedown" => {
                     let step = popup_page_step(state).max(1);
-                    let popup = state
-                        .popup
-                        .as_mut()
-                        .expect("popup is some (checked above)");
+                    let popup = state.popup.as_mut().expect("popup is some (checked above)");
                     if let Popup::ModelPicker {
                         all_models,
                         query,
@@ -1497,7 +1471,12 @@ fn handle_slash_autocomplete_key(key: &str, state: &mut ChatState) -> Action {
             Action::Render
         }
         "pageup" => {
-            if let Some(Popup::SlashAutocomplete { cursor, scroll, matches }) = state.popup.as_mut() {
+            if let Some(Popup::SlashAutocomplete {
+                cursor,
+                scroll,
+                matches,
+            }) = state.popup.as_mut()
+            {
                 let step = visible_rows.max(1);
                 *cursor = cursor.saturating_sub(step);
                 clamp_slash_scroll(matches.len(), *cursor, scroll, visible_rows);
@@ -1523,7 +1502,10 @@ fn handle_slash_autocomplete_key(key: &str, state: &mut ChatState) -> Action {
             // Tab: replace input with `/<name>` (+ trailing space if the
             // command takes args), but DO NOT submit. Keeps the popup open
             // while the registry is re-filtered against the new prefix.
-            if let Some(Popup::SlashAutocomplete { matches, cursor, .. }) = state.popup.as_ref() {
+            if let Some(Popup::SlashAutocomplete {
+                matches, cursor, ..
+            }) = state.popup.as_ref()
+            {
                 if let Some(cmd) = matches.get(*cursor).cloned() {
                     apply_slash_completion(state, &cmd, false);
                     return Action::Render;
@@ -1533,7 +1515,10 @@ fn handle_slash_autocomplete_key(key: &str, state: &mut ChatState) -> Action {
         }
         "enter" => {
             // Enter: replace input with the cursor's match and SUBMIT.
-            if let Some(Popup::SlashAutocomplete { matches, cursor, .. }) = state.popup.as_ref() {
+            if let Some(Popup::SlashAutocomplete {
+                matches, cursor, ..
+            }) = state.popup.as_ref()
+            {
                 if let Some(cmd) = matches.get(*cursor).cloned() {
                     apply_slash_completion(state, &cmd, true);
                     let text = state.input.as_string();
@@ -1743,10 +1728,7 @@ fn login_requested_body(provider: Option<&str>) -> Map<String, Value> {
 
 fn logout_requested_body(provider: Option<&str>) -> Map<String, Value> {
     let mut m = Map::new();
-    m.insert(
-        "kind".into(),
-        Value::String("chat.logout_requested".into()),
-    );
+    m.insert("kind".into(), Value::String("chat.logout_requested".into()));
     if let Some(p) = provider {
         m.insert("provider".into(), Value::String(p.to_owned()));
     }
@@ -1820,10 +1802,7 @@ fn gate_set_mode_body(mode: &str) -> Map<String, Value> {
 /// without the actual facts. See the implementation note in the task.
 fn dag_test_run_body(run_id: &str) -> Map<String, Value> {
     let mut m = Map::new();
-    m.insert(
-        "kind".into(),
-        Value::String("dag-scheduler.dag.run".into()),
-    );
+    m.insert("kind".into(), Value::String("dag-scheduler.dag.run".into()));
     m.insert("run_id".into(), Value::String(run_id.to_owned()));
     let nodes = serde_json::json!([
         {
@@ -1937,10 +1916,7 @@ fn handle_dag_run_started(map: &Map<String, Value>, state: &mut ChatState) -> Ac
     let Some(run_id) = map.get("run_id").and_then(Value::as_str) else {
         return Action::Continue;
     };
-    let total_nodes = map
-        .get("total_nodes")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize;
+    let total_nodes = map.get("total_nodes").and_then(Value::as_u64).unwrap_or(0) as usize;
     if state.dag_runs.contains_key(run_id) {
         return Action::Continue;
     }
@@ -2056,11 +2032,7 @@ fn format_dag_result_line(node_id: &str, entry: &Value) -> String {
             truncate_with_ellipsis(err, DAG_TEST_OUTPUT_CAP)
         );
     }
-    if obj
-        .get("skipped")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
+    if obj.get("skipped").and_then(Value::as_bool).unwrap_or(false) {
         return format!("{node_id}: [skipped]");
     }
     format!("{node_id}: (unknown result shape)")
@@ -2153,8 +2125,12 @@ fn parse_command(text: &str) -> Option<Command> {
 enum Command {
     ResumeRecent,
     ResumeSpecific(String),
-    Login { provider: Option<String> },
-    Logout { provider: Option<String> },
+    Login {
+        provider: Option<String>,
+    },
+    Logout {
+        provider: Option<String>,
+    },
     ModelList,
     ModelSet(String),
     Help,
@@ -2170,7 +2146,10 @@ enum Command {
     /// [`ChatState::pending_dag_runs`], and renders results when the matching
     /// `dag.run_complete` arrives.
     DagTest,
-    Generic { name: String, args: String },
+    Generic {
+        name: String,
+        args: String,
+    },
 }
 
 /// Dispatch a parsed slash-command. Side effects:
@@ -2732,10 +2711,7 @@ mod tests {
             &mut s,
         );
         assert_eq!(s.transcript[0].role, Role::Tool);
-        let payload = s.transcript[0]
-            .tool
-            .as_ref()
-            .expect("tool payload present");
+        let payload = s.transcript[0].tool.as_ref().expect("tool payload present");
         assert_eq!(payload.id, "toolu_1");
         assert_eq!(payload.name, "Read");
         assert!(payload.input_json.contains("/a"));
@@ -2762,10 +2738,7 @@ mod tests {
             })),
             &mut s,
         );
-        let payload = s.transcript[0]
-            .tool
-            .as_ref()
-            .expect("tool payload present");
+        let payload = s.transcript[0].tool.as_ref().expect("tool payload present");
         assert_eq!(payload.output.as_deref(), Some("file1\nfile2\n"));
         assert!(!payload.error);
     }
@@ -2797,10 +2770,7 @@ mod tests {
         assert_eq!(s.transcript[0].role, Role::User);
         assert_eq!(s.transcript[0].text, "do thing");
         assert_eq!(s.transcript[1].role, Role::Tool);
-        let payload = s.transcript[1]
-            .tool
-            .as_ref()
-            .expect("tool payload present");
+        let payload = s.transcript[1].tool.as_ref().expect("tool payload present");
         assert_eq!(payload.id, "toolu_1");
         assert_eq!(payload.name, "Bash");
         assert!(payload.input_json.contains("ls"));
@@ -2837,10 +2807,7 @@ mod tests {
         // Tool entry + system footer.
         assert_eq!(s.transcript.len(), 2);
         assert_eq!(s.transcript[0].role, Role::Tool);
-        let payload = s.transcript[0]
-            .tool
-            .as_ref()
-            .expect("tool payload present");
+        let payload = s.transcript[0].tool.as_ref().expect("tool payload present");
         assert_eq!(payload.id, "toolu_X");
         assert_eq!(payload.name, "Read");
         assert!(payload.input_json.contains("/etc/hosts"));
@@ -2866,10 +2833,7 @@ mod tests {
             ],
         }));
         handle_envelope(env, &mut s);
-        let payload = s.transcript[0]
-            .tool
-            .as_ref()
-            .expect("tool payload present");
+        let payload = s.transcript[0].tool.as_ref().expect("tool payload present");
         assert!(payload.output.is_none());
     }
 
@@ -3082,7 +3046,10 @@ mod tests {
         assert_eq!(s.scroll_offset, expected);
 
         s.append_assistant_delta("streaming response");
-        assert_eq!(s.scroll_offset, expected, "delta must not snap back to bottom");
+        assert_eq!(
+            s.scroll_offset, expected,
+            "delta must not snap back to bottom"
+        );
     }
 
     #[test]
@@ -3496,7 +3463,9 @@ mod tests {
             .build()
             .expect("runtime");
         rt.block_on(async {
-            handle_command(cmd, state, &tx).await.expect("handle_command");
+            handle_command(cmd, state, &tx)
+                .await
+                .expect("handle_command");
         });
         drop(tx);
         let mut out = Vec::new();
@@ -3558,7 +3527,10 @@ mod tests {
     fn parse_command_yolo_and_safe() {
         assert_eq!(parse_command("/yolo"), Some(Command::SetGateMode("yolo")));
         assert_eq!(parse_command("/safe"), Some(Command::SetGateMode("normal")));
-        assert_eq!(parse_command("  /yolo  "), Some(Command::SetGateMode("yolo")));
+        assert_eq!(
+            parse_command("  /yolo  "),
+            Some(Command::SetGateMode("yolo"))
+        );
     }
 
     #[test]
@@ -3599,7 +3571,11 @@ mod tests {
         assert_eq!(run_id.len(), 36, "run_id must be a uuid-shaped string");
         let graph = body["graph"].as_object().expect("graph object");
         let nodes = graph["nodes"].as_array().expect("nodes array");
-        assert_eq!(nodes.len(), 2, "v1 ships only the parallel pair (no fan-in)");
+        assert_eq!(
+            nodes.len(),
+            2,
+            "v1 ships only the parallel pair (no fan-in)"
+        );
         for n in nodes {
             assert_eq!(
                 n["reasoner"], "ollama",
@@ -4088,9 +4064,15 @@ mod tests {
         let before_version = s.transcript_version;
         let bodies = drive_command(Command::New, &mut s);
         // Local state cleared.
-        assert!(s.transcript.is_empty(), "transcript must be empty after /new");
+        assert!(
+            s.transcript.is_empty(),
+            "transcript must be empty after /new"
+        );
         assert!(!s.pending, "pending flag must be cleared");
-        assert!(s.awaiting_response_since.is_none(), "watchdog must be disarmed");
+        assert!(
+            s.awaiting_response_since.is_none(),
+            "watchdog must be disarmed"
+        );
         assert!(
             s.transcript_version > before_version,
             "transcript_version must be bumped so the renderer redraws"
@@ -4246,7 +4228,9 @@ mod tests {
         );
         let bodies = drive_command(Command::ModelList, &mut s);
         assert_eq!(bodies.len(), 2, "one list request per connected provider");
-        assert!(bodies.iter().all(|b| b["kind"] == "chat.model.list_requested"));
+        assert!(bodies
+            .iter()
+            .all(|b| b["kind"] == "chat.model.list_requested"));
         match &s.popup {
             Some(Popup::ModelPicker {
                 all_models,
@@ -4293,7 +4277,10 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(all_models.len(), 2);
-                assert!(awaiting.is_empty(), "ollama should be removed from awaiting");
+                assert!(
+                    awaiting.is_empty(),
+                    "ollama should be removed from awaiting"
+                );
             }
             other => panic!("expected ModelPicker, got {other:?}"),
         }
@@ -4332,7 +4319,9 @@ mod tests {
             );
         }
         match &s.popup {
-            Some(Popup::ModelPicker { query, all_models, .. }) => {
+            Some(Popup::ModelPicker {
+                query, all_models, ..
+            }) => {
                 assert_eq!(query, "qwen");
                 assert_eq!(all_models.len(), 3, "underlying list unchanged");
                 let visible = filter_models(all_models, query);
@@ -4374,7 +4363,9 @@ mod tests {
             &mut s,
         );
         match &s.popup {
-            Some(Popup::ModelPicker { query, all_models, .. }) => {
+            Some(Popup::ModelPicker {
+                query, all_models, ..
+            }) => {
                 assert_eq!(query, "x");
                 assert!(filter_models(all_models, query).is_empty());
             }
@@ -4389,7 +4380,9 @@ mod tests {
             &mut s,
         );
         match &s.popup {
-            Some(Popup::ModelPicker { query, all_models, .. }) => {
+            Some(Popup::ModelPicker {
+                query, all_models, ..
+            }) => {
                 assert!(query.is_empty());
                 assert_eq!(filter_models(all_models, query).len(), 2);
             }
@@ -4926,7 +4919,9 @@ mod tests {
             &mut s,
         );
         assert_eq!(
-            s.active_model_per_provider.get("ollama").map(String::as_str),
+            s.active_model_per_provider
+                .get("ollama")
+                .map(String::as_str),
             Some("first")
         );
         // A second ack on the same provider replaces the prior value.
@@ -4939,7 +4934,9 @@ mod tests {
             &mut s,
         );
         assert_eq!(
-            s.active_model_per_provider.get("ollama").map(String::as_str),
+            s.active_model_per_provider
+                .get("ollama")
+                .map(String::as_str),
             Some("second")
         );
         // Independent provider keeps its own slot.
@@ -4956,7 +4953,9 @@ mod tests {
             Some("groq-model")
         );
         assert_eq!(
-            s.active_model_per_provider.get("ollama").map(String::as_str),
+            s.active_model_per_provider
+                .get("ollama")
+                .map(String::as_str),
             Some("second")
         );
     }
@@ -5192,7 +5191,12 @@ mod tests {
         let a = handle_envelope(env, &mut s);
         assert!(matches!(a, Action::Render));
         match &s.popup {
-            Some(Popup::Info { title, message, source, .. }) => {
+            Some(Popup::Info {
+                title,
+                message,
+                source,
+                ..
+            }) => {
                 assert_eq!(title, "models updated");
                 assert_eq!(message, "phi4-mini is now the active model.");
                 assert_eq!(source.as_deref(), Some("ollama"));
@@ -5214,7 +5218,12 @@ mod tests {
         let a = handle_envelope(env, &mut s);
         assert!(matches!(a, Action::Render));
         match &s.popup {
-            Some(Popup::Warning { title, message, source, .. }) => {
+            Some(Popup::Warning {
+                title,
+                message,
+                source,
+                ..
+            }) => {
                 assert_eq!(title, "rate limit");
                 assert_eq!(message, "slow down");
                 assert_eq!(
@@ -5240,7 +5249,12 @@ mod tests {
         let a = handle_envelope(env, &mut s);
         assert!(matches!(a, Action::Render));
         match &s.popup {
-            Some(Popup::Error { title, message, source, .. }) => {
+            Some(Popup::Error {
+                title,
+                message,
+                source,
+                ..
+            }) => {
                 assert_eq!(title, "spawn failed");
                 assert_eq!(message, "binary not found");
                 assert_eq!(source.as_deref(), Some("nefor-combinators"));

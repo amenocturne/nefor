@@ -20,9 +20,9 @@ mod wrap;
 use serde_json::Value;
 
 use crate::render::{
-    build_status_spans, render_frame, HL_FOOTER, HL_MD_BOLD, HL_MD_CODE_INLINE,
-    HL_MD_HEADING, HL_MD_ITALIC, HL_STATUS, HL_STATUS_DANGER, HL_STATUS_DIM,
-    HL_STATUS_INFO, HL_STATUS_WARN, HL_SYSTEM,
+    build_status_spans, render_frame, HL_FOOTER, HL_MD_BOLD, HL_MD_CODE_INLINE, HL_MD_HEADING,
+    HL_MD_ITALIC, HL_STATUS, HL_STATUS_DANGER, HL_STATUS_DIM, HL_STATUS_INFO, HL_STATUS_WARN,
+    HL_SYSTEM,
 };
 use crate::state::{
     ChatState, DagNodeState, DagNodeStatus, DagRunUiState, Dims, Popup, Role, SessionMetadata,
@@ -579,7 +579,10 @@ fn tool_expanded_via_ctrl_o_shows_salient_header_and_output() {
     // structured-input tools (spawn_graph, write_file) stay viewable.
     assert!(joined.contains("▼ Bash(ls)"), "expanded header: {joined}");
     assert!(joined.contains("input:"), "input block missing: {joined}");
-    assert!(joined.contains("\"command\""), "input json missing: {joined}");
+    assert!(
+        joined.contains("\"command\""),
+        "input json missing: {joined}"
+    );
     assert!(joined.contains("output:"), "output label: {joined}");
     assert!(joined.contains("file1"), "output content: {joined}");
 }
@@ -622,10 +625,7 @@ fn reasoning_collapses_to_one_row_once_content_arrives() {
     // content render below it.
     let mut s = new_state(80, 24);
     s.append_assistant_reasoning_delta("thinking about it");
-    s.finalize_assistant_reasoning(
-        Some("thinking about it".into()),
-        Some(1_500),
-    );
+    s.finalize_assistant_reasoning(Some("thinking about it".into()), Some(1_500));
     s.append_assistant_delta("Final answer.");
     s.finalize_assistant(None);
     let events = render_frame(&mut s);
@@ -663,10 +663,7 @@ fn reasoning_only_finalized_collapses_to_marker() {
     // reachable via Ctrl+O like every other reasoning entry.
     let mut s = new_state(80, 24);
     s.append_assistant_reasoning_delta("planning the spawn_graph call");
-    s.finalize_assistant_reasoning(
-        Some("planning the spawn_graph call".into()),
-        Some(800),
-    );
+    s.finalize_assistant_reasoning(Some("planning the spawn_graph call".into()), Some(800));
     let events = render_frame(&mut s);
     let lines = find_line_events(&events);
     let joined: String = lines
@@ -703,7 +700,11 @@ fn assistant_body_survives_empty_authoritative_stream_end() {
 
     let events = render_frame(&mut s);
     let lines = find_line_events(&events);
-    let joined: String = lines.iter().map(|l| row_text(l)).collect::<Vec<_>>().join("\n");
+    let joined: String = lines
+        .iter()
+        .map(|l| row_text(l))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         joined.contains("here is a tiny table"),
         "assistant body must render after empty stream.end.text; got rows:\n{joined}"
@@ -752,9 +753,7 @@ fn popup_help_renders_centered_box() {
     assert!(txt.contains("┌"), "popup top border missing: {txt:?}");
     assert!(txt.contains("help"), "popup title missing: {txt:?}");
     // The body should mention at least one slash command.
-    let any_help_row = lines
-        .iter()
-        .any(|r| row_text(r).contains("/login"));
+    let any_help_row = lines.iter().any(|r| row_text(r).contains("/login"));
     assert!(any_help_row, "popup body should list /login");
 }
 
@@ -816,10 +815,11 @@ fn popup_model_picker_shows_count_indicator_in_title_for_long_lists() {
     s.popup_models_listed("groq", &many);
     let events = render_frame(&mut s);
     let lines = find_line_events(&events);
-    let has_indicator = lines
-        .iter()
-        .any(|r| row_text(r).contains("/200"));
-    assert!(has_indicator, "expected `<cursor>/200` count indicator in title");
+    let has_indicator = lines.iter().any(|r| row_text(r).contains("/200"));
+    assert!(
+        has_indicator,
+        "expected `<cursor>/200` count indicator in title"
+    );
 }
 
 #[test]
@@ -896,7 +896,9 @@ fn popup_warning_renders_with_warning_styling() {
         "title bar must carry HL_STATUS_WARN: hls={hls:?}"
     );
     assert!(
-        lines.iter().any(|r| row_text(r).contains("Unknown provider")),
+        lines
+            .iter()
+            .any(|r| row_text(r).contains("Unknown provider")),
         "warning message body missing"
     );
     assert!(
@@ -952,7 +954,9 @@ fn popup_info_renders_with_info_styling() {
         "title bar must carry HL_STATUS_INFO: hls={hls:?}"
     );
     assert!(
-        lines.iter().any(|r| row_text(r).contains("phi4-mini selected")),
+        lines
+            .iter()
+            .any(|r| row_text(r).contains("phi4-mini selected")),
         "info message body missing"
     );
     assert!(
@@ -1204,10 +1208,7 @@ fn slash_autocomplete_height_caps_at_eight() {
         .iter()
         .filter(|r| row_text(r).contains("/cmd"))
         .count();
-    assert!(
-        n <= 8,
-        "autocomplete band must cap at 8 rows, got {n}"
-    );
+    assert!(n <= 8, "autocomplete band must cap at 8 rows, got {n}");
     // And we expect the cap to actually bind here (registry has 20).
     assert_eq!(n, 8, "expected cap of 8 rows when 20 matches available");
 }
@@ -1303,16 +1304,22 @@ fn dag_panel_renders_run_header_and_node_lines() {
     let joined = texts.join("\n");
     // Header carries the 8-char run-id prefix and the (M/N nodes) counter.
     assert!(
-        texts.iter().any(|t| t.contains("ab8c0000") && t.contains("nodes")),
+        texts
+            .iter()
+            .any(|t| t.contains("ab8c0000") && t.contains("nodes")),
         "panel header missing run-id prefix or counter:\n{joined}"
     );
     // Node rows mention the node ids and the reasoner.
     assert!(
-        texts.iter().any(|t| t.contains("n1") && t.contains("ollama") && t.contains("running")),
+        texts
+            .iter()
+            .any(|t| t.contains("n1") && t.contains("ollama") && t.contains("running")),
         "n1 running row missing:\n{joined}"
     );
     assert!(
-        texts.iter().any(|t| t.contains("n2") && t.contains("ollama") && t.contains("done")),
+        texts
+            .iter()
+            .any(|t| t.contains("n2") && t.contains("ollama") && t.contains("done")),
         "n2 done row missing:\n{joined}"
     );
 }
@@ -1324,8 +1331,15 @@ fn dag_panel_absent_when_no_runs() {
     let mut s = new_state(40, 10);
     let events = render_frame(&mut s);
     let lines = find_line_events(&events);
-    let joined: String = lines.iter().map(|l| row_text(l)).collect::<Vec<_>>().join("\n");
-    assert!(!joined.contains("─ DAG "), "panel must not render: {joined}");
+    let joined: String = lines
+        .iter()
+        .map(|l| row_text(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !joined.contains("─ DAG "),
+        "panel must not render: {joined}"
+    );
 }
 
 // ---- right sidebar pane --------------------------------------------------
@@ -1500,7 +1514,11 @@ fn sidebar_auto_hides_on_narrow_terminal() {
     assert_eq!(s.sidebar_width(), 0);
     let events = render_frame(&mut s);
     let lines = find_line_events(&events);
-    let joined: String = lines.iter().map(|l| row_text(l)).collect::<Vec<_>>().join("\n");
+    let joined: String = lines
+        .iter()
+        .map(|l| row_text(l))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         !joined.contains("ab8c0000"),
         "sidebar must auto-hide on narrow terminal — DAG content leaked: {joined}"
@@ -1517,7 +1535,11 @@ fn sidebar_widget_rows_truncate_when_exceeding_rows() {
     let mut s = s;
     let events = render_frame(&mut s);
     let lines = find_line_events(&events);
-    let joined: String = lines.iter().map(|l| row_text(l)).collect::<Vec<_>>().join("\n");
+    let joined: String = lines
+        .iter()
+        .map(|l| row_text(l))
+        .collect::<Vec<_>>()
+        .join("\n");
     // The widget asks for max 8 rows; with 24 raw rows of content the
     // overflow marker `… +K more` lands on the last visible widget row.
     assert!(

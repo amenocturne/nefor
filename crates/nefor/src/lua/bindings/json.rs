@@ -22,16 +22,14 @@ pub fn install_json(lua: &Lua, nefor_tbl: &Table) -> mlua::Result<()> {
 
     let encode_fn = lua.create_function(|lua, value: Value| {
         let v: serde_json::Value = lua.from_value(value)?;
-        serde_json::to_string(&v).map_err(|e| {
-            mlua::Error::runtime(format!("nefor.json.encode: {e}"))
-        })
+        serde_json::to_string(&v)
+            .map_err(|e| mlua::Error::runtime(format!("nefor.json.encode: {e}")))
     })?;
     json.set("encode", encode_fn)?;
 
     let decode_fn = lua.create_function(|lua, s: String| {
-        let v: serde_json::Value = serde_json::from_str(&s).map_err(|e| {
-            mlua::Error::runtime(format!("nefor.json.decode: {e}"))
-        })?;
+        let v: serde_json::Value = serde_json::from_str(&s)
+            .map_err(|e| mlua::Error::runtime(format!("nefor.json.decode: {e}")))?;
         lua.to_value(&v)
     })?;
     json.set("decode", decode_fn)?;

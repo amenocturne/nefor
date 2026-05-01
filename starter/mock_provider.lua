@@ -81,17 +81,35 @@ local FINAL_RELAY_PREFIX = ""
 -- Async spawn_graph (post-2026-04-30): the immediate `tool.result` is
 -- just an ack ("Submitted sub-graph run_id=..."). The real result
 -- arrives later as a USER-role message starting with
--- "[Deferred result for spawn_graph". Pattern-match on that prefix in
+-- "[spawn_graph(run_id=...) result]". Pattern-match on that prefix in
 -- the latest user message to drive the relay turn — old behaviour
 -- (relaying last_tool when no deferred user message exists) still
 -- covers the synchronous case if anything reverts.
-local DEFERRED_RESULT_MARKER = "%[Deferred result for spawn_graph"
-local DEFERRED_FAILURE_MARKER = "%[Deferred FAILURE for spawn_graph"
+--
+-- The marker shape comes from agentic_workflow.format_deferred (see
+-- starter/agentic_workflow.lua); it changed during the Phase-1B
+-- consolidation. The legacy "[Deferred result for spawn_graph" prefix
+-- is also accepted so older fixtures keep working.
+local DEFERRED_RESULT_MARKER = "%[spawn_graph%(run_id="
+local DEFERRED_LEGACY_MARKER = "%[Deferred result for spawn_graph"
+local DEFERRED_FAILURE_MARKER = "%[spawn_graph%(run_id=[^)]*%) FAILED%]"
+local DEFERRED_FAILURE_LEGACY = "%[Deferred FAILURE for spawn_graph"
 local SUBMITTED_ACK_MARKER = "Submitted sub%-graph run_id="
 
 -- ------------------------------------------------------------------
 -- helpers
 -- ------------------------------------------------------------------
+
+-- UTF-8-safe truncate: returns `s` truncated to at most `n` codepoints.
+-- `string.sub` is byte-indexed; slicing inside a multibyte codepoint
+-- yields invalid UTF-8 that downstream `json.encode` chokes on. Use
+-- `utf8.offset` (Lua 5.3+) to find the byte offset of codepoint n+1.
+local function utf8_truncate(s, n)
+  if type(s) ~= "string" then return s end
+  local end_byte = utf8.offset(s, n + 1)
+  if end_byte == nil then return s end
+  return string.sub(s, 1, end_byte - 1)
+end
 
 local function pick_response_for(chat_id)
   local history = chats[chat_id] or {}
@@ -108,19 +126,29 @@ local function pick_response_for(chat_id)
 
   -- Deferred-result branch (async spawn_graph): the real result was
   -- injected as a user-role message starting with
-  -- "[Deferred result for spawn_graph". Relay the content (everything
-  -- after the marker line) as the final answer.
-  if type(last_user) == "string" and string.find(last_user, DEFERRED_RESULT_MARKER) then
+  -- "[spawn_graph(run_id=...) result]". Relay the content (everything
+  -- after the marker line) as the final answer. Two marker shapes
+  -- accepted: the current agentic_workflow form, and the legacy form
+  -- "[Deferred result for spawn_graph" for older fixtures.
+  if type(last_user) == "string"
+      and (string.find(last_user, DEFERRED_RESULT_MARKER)
+        or string.find(last_user, DEFERRED_LEGACY_MARKER)) then
     -- Strip the leading marker line; what remains is the actual
-    -- combined paragraph the model should relay.
-    local payload = string.match(last_user, "^%[Deferred result for spawn_graph%([^)]*%)%]\n(.*)$")
+    -- combined paragraph the model should relay. agentic_workflow
+    -- emits a long `--- output ---` framing block; pull just the body.
+    local body = string.match(last_user, "%-%-%- output %-%-%-\n(.*)$")
+    if body == nil then
+      body = string.match(last_user, "^%[Deferred result for spawn_graph%([^)]*%)%]\n(.*)$")
+    end
     return {
-      text = FINAL_RELAY_PREFIX .. tostring(payload or last_user),
+      text = FINAL_RELAY_PREFIX .. tostring(body or last_user),
       finish_reason = "stop",
       with_reasoning = true,
     }
   end
-  if type(last_user) == "string" and string.find(last_user, DEFERRED_FAILURE_MARKER) then
+  if type(last_user) == "string"
+      and (string.find(last_user, DEFERRED_FAILURE_MARKER)
+        or string.find(last_user, DEFERRED_FAILURE_LEGACY)) then
     return {
       text = "The spawned sub-graph failed: " .. tostring(last_user),
       finish_reason = "stop",
@@ -183,7 +211,7 @@ local function pick_response_for(chat_id)
   end
 
   return {
-    text = "[mock provider: no canned match for: " .. string.sub(last_user, 1, 60) .. "]",
+    text = "[mock provider: no canned match for: " .. utf8_truncate(last_user, 60) .. "]",
     finish_reason = "stop",
   }
 end
@@ -236,16 +264,24 @@ local function emit_stream(chat_id, text, opts)
   -- for the orchestrator's relay turn — but emitting them
   -- unconditionally keeps the mock simple and rg_adapter's gate
   -- handles the rest.
-  local n = math.max(1, math.floor(#text / 3))
-  local i = 1
-  while i <= #text do
-    local stop = math.min(i + n - 1, #text)
+  --
+  -- Chunk boundaries snap to UTF-8 codepoint edges. `string.sub` is
+  -- byte-indexed; slicing inside a multibyte codepoint produces
+  -- invalid UTF-8 that downstream `serde_json` can't deserialise.
+  local cp_count = utf8.len(text) or #text
+  local cp_per_chunk = math.max(1, math.floor(cp_count / 3))
+  local cp_i = 1
+  while cp_i <= cp_count do
+    local cp_stop = math.min(cp_i + cp_per_chunk - 1, cp_count)
+    local byte_start = utf8.offset(text, cp_i)
+    local byte_after_stop = utf8.offset(text, cp_stop + 1)
+    local byte_stop = byte_after_stop and (byte_after_stop - 1) or #text
     nefor.emit("stream.delta", {
       id      = id,
       chat_id = chat_id,
-      text    = string.sub(text, i, stop),
+      text    = string.sub(text, byte_start, byte_stop),
     })
-    i = stop + 1
+    cp_i = cp_stop + 1
   end
   nefor.emit("stream.end", {
     id            = id,
