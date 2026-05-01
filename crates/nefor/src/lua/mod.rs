@@ -7,7 +7,10 @@
 pub mod bindings;
 pub mod error;
 pub mod log;
+pub mod mode;
 pub mod vm;
 
 pub use error::LuaError;
+#[allow(unused_imports)]
+pub use mode::EngineMode;
 pub use vm::LuaHost;
