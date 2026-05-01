@@ -244,6 +244,14 @@ fn assert_success(out: &ProcessOutput) {
 const SPAWN_GRAPH_PROMPT: &str =
     "summarise octopuses and lighthouses in parallel and combine into one paragraph";
 
+/// Two short non-spawn-graph prompts. The mock has no canned match for
+/// either, so it returns the deterministic
+/// "[mock provider: no canned match for: <prompt>]" fallback per turn.
+/// That's enough for REPL multi-turn — we just need each turn to
+/// produce a distinct, recognisable line.
+const SIMPLE_PROMPT_1: &str = "hello";
+const SIMPLE_PROMPT_2: &str = "world";
+
 // --------------------------------------------------------------------
 // scenario 1 — single-shot text format
 // --------------------------------------------------------------------
@@ -390,5 +398,45 @@ fn scenario_3_single_shot_stream_json() {
         run_complete_count >= 1,
         "expected at least one graph.run_complete envelope; saw {run_complete_count} \
          across {total_lines} lines"
+    );
+}
+
+// --------------------------------------------------------------------
+// scenario 4 — REPL multi-turn (2 prompts + EOF)
+// --------------------------------------------------------------------
+
+#[test]
+fn scenario_4_repl_multi_turn() {
+    ensure_built();
+    let payload = format!("{SIMPLE_PROMPT_1}\n{SIMPLE_PROMPT_2}\n");
+    let out = run_scenario(&[], Some(payload.as_bytes()));
+    assert_success(&out);
+
+    // The mock returns "[mock provider: no canned match for: <prompt>]"
+    // for unknown prompts. Both should appear on stdout (text format),
+    // each on its own turn.
+    let stdout = &out.stdout;
+    let needle1 = format!("no canned match for: {SIMPLE_PROMPT_1}");
+    let needle2 = format!("no canned match for: {SIMPLE_PROMPT_2}");
+    assert!(
+        stdout.contains(&needle1),
+        "expected first turn's mock fallback for {SIMPLE_PROMPT_1:?}; \
+         stdout: {:?}",
+        truncate(stdout, 2048)
+    );
+    assert!(
+        stdout.contains(&needle2),
+        "expected second turn's mock fallback for {SIMPLE_PROMPT_2:?}; \
+         stdout: {:?}",
+        truncate(stdout, 2048)
+    );
+
+    // Sanity: the REPL emitted at least two prompts on stderr.
+    let prompt_count = out.stderr.matches("> ").count();
+    assert!(
+        prompt_count >= 2,
+        "expected at least two REPL prompts on stderr; saw {prompt_count}; \
+         stderr: {:?}",
+        truncate(&out.stderr, 1024)
     );
 }
