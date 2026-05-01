@@ -46,16 +46,17 @@
 --
 -- (`plugins/ollama/` ships in-tree as the worked example.)
 --
--- Recipe — paste into init.lua, after the existing `local cc_adapter = …`
--- block. Pick whichever provider you want; only un-comment ONE spawn.
+-- Recipe — paste into init.lua, after the existing
+-- `local agentic_workflow = require("agentic_workflow")` block. Pick
+-- whichever provider you want; only un-comment ONE spawn.
 --[[
 
-local mk_adapter = require("openai_provider_adapter").make
+local mk_adapter = require("agentic_workflow").for_provider
 
 ------------------------------------------------------------------
 -- Local Ollama (no API key, default base URL)
 ------------------------------------------------------------------
-local ollama = mk_adapter("ollama")
+local ollama = mk_adapter("ollama", { static_token = "ollama-local" })
 ncp.spawn {
   name        = "ollama",
   command     = {
