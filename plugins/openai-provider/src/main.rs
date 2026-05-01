@@ -49,6 +49,7 @@ mod ncp;
 use std::sync::Arc;
 use std::time::Duration;
 
+use nefor_protocol::{Body, Envelope, PluginName, PluginOutgoing, SystemBody};
 use openai_provider::auth::{AuthSnapshot, AuthState, AuthStore, LogoutOutcome};
 use openai_provider::broker::{ToolBroker, ToolResult};
 use openai_provider::catalog::ToolCatalog;
@@ -56,7 +57,6 @@ use openai_provider::config::Config;
 use openai_provider::openai::{Message, ToolCall};
 use openai_provider::state::{ChatId, ChatStats, Chats, ChatsError};
 use openai_provider::stream::{list_models, run_chat_stream, ReasoningEvent, StreamError};
-use nefor_protocol::{Body, Envelope, PluginName, PluginOutgoing, SystemBody};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
@@ -317,8 +317,7 @@ async fn dispatch_event(
             let message = match parse_provider_message(body.get("message")) {
                 Ok(m) => m,
                 Err(msg) => {
-                    send_event(out_tx, chat_error_body_msg(config, &chat_id, msg))
-                        .await?;
+                    send_event(out_tx, chat_error_body_msg(config, &chat_id, msg)).await?;
                     return Ok(());
                 }
             };
@@ -572,7 +571,9 @@ fn spawn_turn(
             Err(e) => {
                 tracing::warn!(chat_id = %chat_id, error = %e, "chat vanished before turn started");
                 let _ = out_tx
-                    .send(PluginOutgoing::event(chat_error_body(&config, &chat_id, &e)))
+                    .send(PluginOutgoing::event(chat_error_body(
+                        &config, &chat_id, &e,
+                    )))
                     .await;
                 return;
             }
@@ -605,7 +606,9 @@ fn spawn_turn(
                     errored = true;
                     final_finish_reason = Some("error".to_string());
                     let _ = out_tx
-                        .send(PluginOutgoing::event(chat_error_body(&config, &chat_id, &e)))
+                        .send(PluginOutgoing::event(chat_error_body(
+                            &config, &chat_id, &e,
+                        )))
                         .await;
                     break;
                 }
@@ -673,8 +676,7 @@ fn spawn_turn(
                             &chat_id_for_reason,
                             text,
                         );
-                        let _ = out_tx_for_reason
-                            .try_send(PluginOutgoing::event(body));
+                        let _ = out_tx_for_reason.try_send(PluginOutgoing::event(body));
                     }
                     ReasoningEvent::End { text } => {
                         let duration_ms = reasoning_started_at
@@ -687,8 +689,7 @@ fn spawn_turn(
                             text,
                             duration_ms,
                         );
-                        let _ = out_tx_for_reason
-                            .try_send(PluginOutgoing::event(body));
+                        let _ = out_tx_for_reason.try_send(PluginOutgoing::event(body));
                     }
                 },
             )
@@ -697,8 +698,7 @@ fn spawn_turn(
             match result {
                 Ok(outcome) => {
                     if let Some(u) = outcome.usage {
-                        total_prompt_tokens =
-                            total_prompt_tokens.saturating_add(u.prompt_tokens);
+                        total_prompt_tokens = total_prompt_tokens.saturating_add(u.prompt_tokens);
                         total_completion_tokens =
                             total_completion_tokens.saturating_add(u.completion_tokens);
                     }
@@ -757,19 +757,11 @@ fn spawn_turn(
                         // win in parallelism for a single round trip).
                         let mut tool_loop_failed = false;
                         for tc in outcome.tool_calls {
-                            let tool_step = run_one_tool_call(
-                                &catalog,
-                                &broker,
-                                &out_tx,
-                                &cancel,
-                                tc,
-                            )
-                            .await;
+                            let tool_step =
+                                run_one_tool_call(&catalog, &broker, &out_tx, &cancel, tc).await;
                             match tool_step {
                                 ToolStepOutcome::Result { id, content } => {
-                                    let _ = chats
-                                        .push_tool_result(&chat_id, id, content)
-                                        .await;
+                                    let _ = chats.push_tool_result(&chat_id, id, content).await;
                                 }
                                 ToolStepOutcome::Cancelled => {
                                     interrupted = true;
@@ -884,7 +876,10 @@ fn spawn_turn(
         }
         if interrupted && !errored {
             let _ = out_tx
-                .send(PluginOutgoing::event(turn_error_body(&config, "interrupted")))
+                .send(PluginOutgoing::event(turn_error_body(
+                    &config,
+                    "interrupted",
+                )))
                 .await;
         }
 
@@ -964,9 +959,7 @@ async fn run_one_tool_call(
         None => {
             let err = format!("no tool plugin registered tool `{}`", name);
             let _ = out_tx
-                .send(PluginOutgoing::event(chat_tool_end_body(
-                    &id, &err, true,
-                )))
+                .send(PluginOutgoing::event(chat_tool_end_body(&id, &err, true)))
                 .await;
             return ToolStepOutcome::Result {
                 id: id.clone(),
@@ -981,10 +974,7 @@ async fn run_one_tool_call(
     let rx = broker.register(id.clone()).await;
     let _ = out_tx
         .send(PluginOutgoing::event(tool_invoke_body(
-            &owner,
-            &id,
-            &name,
-            args_value,
+            &owner, &id, &name, args_value,
         )))
         .await;
 
@@ -1024,10 +1014,7 @@ async fn run_one_tool_call(
         Some(ToolResult {
             error: Some(err), ..
         }) => (err, true),
-        Some(_) => (
-            "tool replied without output or error".into(),
-            true,
-        ),
+        Some(_) => ("tool replied without output or error".into(), true),
         // Receiver dropped without a result — broker contract violation
         // OR the broker was cancelled. Treat as error.
         None => ("tool reply channel closed".into(), true),
@@ -1073,13 +1060,11 @@ fn parse_provider_message(value: Option<&Value>) -> Result<Message, String> {
         .and_then(Value::as_str)
         .ok_or_else(|| "chat.append message missing `role`".to_owned())?
         .to_owned();
-    let content = obj
-        .get("content")
-        .and_then(|v| match v {
-            Value::Null => None,
-            Value::String(s) => Some(s.clone()),
-            other => Some(other.to_string()),
-        });
+    let content = obj.get("content").and_then(|v| match v {
+        Value::Null => None,
+        Value::String(s) => Some(s.clone()),
+        other => Some(other.to_string()),
+    });
     let tool_calls = obj
         .get("tool_calls")
         .and_then(Value::as_array)
@@ -1102,12 +1087,7 @@ fn parse_provider_message(value: Option<&Value>) -> Result<Message, String> {
     })
 }
 
-fn stream_delta_body(
-    prefix: &str,
-    id: &str,
-    chat_id: &ChatId,
-    text: &str,
-) -> Map<String, Value> {
+fn stream_delta_body(prefix: &str, id: &str, chat_id: &ChatId, text: &str) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert(
         "kind".into(),
@@ -1190,11 +1170,7 @@ fn stream_end_body(
     m
 }
 
-fn session_stats_body(
-    config: &Config,
-    chat_id: &ChatId,
-    stats: &ChatStats,
-) -> Map<String, Value> {
+fn session_stats_body(config: &Config, chat_id: &ChatId, stats: &ChatStats) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert(
         "kind".into(),
@@ -1311,11 +1287,7 @@ fn chat_error_body(config: &Config, chat_id: &ChatId, e: &ChatsError) -> Map<Str
     chat_error_body_msg(config, chat_id, e.to_string())
 }
 
-fn chat_error_body_msg(
-    config: &Config,
-    chat_id: &ChatId,
-    message: String,
-) -> Map<String, Value> {
+fn chat_error_body_msg(config: &Config, chat_id: &ChatId, message: String) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert(
         "kind".into(),
@@ -1672,7 +1644,10 @@ mod tests {
         };
         let cid = ChatId::new("c1");
         let b = session_stats_body(&cfg("ollama"), &cid, &stats);
-        assert_eq!(b.get("kind").unwrap().as_str(), Some("ollama.session.stats"));
+        assert_eq!(
+            b.get("kind").unwrap().as_str(),
+            Some("ollama.session.stats")
+        );
         assert_eq!(b.get("chat_id").unwrap().as_str(), Some("c1"));
         assert_eq!(b.get("model").unwrap().as_str(), Some("qwen"));
         assert_eq!(b.get("turns").unwrap().as_u64(), Some(2));
@@ -1810,8 +1785,15 @@ mod tests {
             &[("token", Value::String("new-tok".into()))],
         );
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
-            &from_plugin("nefor-chat"), &body,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("nefor-chat"),
+            &body,
         )
         .await
         .expect("dispatch ok");
@@ -1837,8 +1819,15 @@ mod tests {
 
         let body = make_event_body("ollama.login_requested", &[]);
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
-            &from_plugin("nefor-chat"), &body,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("nefor-chat"),
+            &body,
         )
         .await
         .expect("dispatch ok");
@@ -1847,10 +1836,7 @@ mod tests {
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].get("state").unwrap().as_str(), Some("error"));
         let msg = emitted[0].get("message").unwrap().as_str().unwrap();
-        assert!(
-            msg.contains("no built-in login flow"),
-            "message was: {msg}"
-        );
+        assert!(msg.contains("no built-in login flow"), "message was: {msg}");
     }
 
     #[tokio::test]
@@ -1864,8 +1850,15 @@ mod tests {
 
         let body = make_event_body("ollama.logout_requested", &[]);
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
-            &from_plugin("nefor-chat"), &body,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("nefor-chat"),
+            &body,
         )
         .await
         .expect("dispatch ok");
@@ -1970,8 +1963,7 @@ mod tests {
                 }
                 acc.push_str(&String::from_utf8_lossy(&buf[..n]));
             }
-            let body =
-                r#"{"object":"list","data":[{"id":"qwen2.5-coder:7b"},{"id":"llama3:8b"}]}"#;
+            let body = r#"{"object":"list","data":[{"id":"qwen2.5-coder:7b"},{"id":"llama3:8b"}]}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -1991,8 +1983,15 @@ mod tests {
 
         let body = make_event_body("ollama.models.list_requested", &[]);
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
-            &from_plugin("nefor-chat"), &body,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("nefor-chat"),
+            &body,
         )
         .await
         .expect("dispatch ok");
@@ -2025,8 +2024,15 @@ mod tests {
             &[("model", Value::String("new-model".into()))],
         );
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
-            &from_plugin("nefor-chat"), &body,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("nefor-chat"),
+            &body,
         )
         .await
         .expect("dispatch ok");
@@ -2052,8 +2058,15 @@ mod tests {
 
         let body = make_event_body("ollama.model.set", &[("model", Value::String("".into()))]);
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
-            &from_plugin("nefor-chat"), &body,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("nefor-chat"),
+            &body,
         )
         .await
         .expect("dispatch ok");
@@ -2094,8 +2107,15 @@ mod tests {
 
         let body = make_event_body("ollama.auth.set", &[("token", Value::String("".into()))]);
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
-            &from_plugin("nefor-chat"), &body,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("nefor-chat"),
+            &body,
         )
         .await
         .expect("dispatch ok");
@@ -2111,7 +2131,10 @@ mod tests {
     fn chat_tool_start_body_uses_input_field_per_chat_contract() {
         let args = serde_json::json!({"path": "/tmp/x"});
         let b = chat_tool_start_body("call_1", "read_file", &args);
-        assert_eq!(b.get("kind").and_then(Value::as_str), Some("chat.tool.start"));
+        assert_eq!(
+            b.get("kind").and_then(Value::as_str),
+            Some("chat.tool.start")
+        );
         assert_eq!(b.get("id").and_then(Value::as_str), Some("call_1"));
         assert_eq!(b.get("name").and_then(Value::as_str), Some("read_file"));
         assert_eq!(b.get("input"), Some(&args));
@@ -2165,15 +2188,25 @@ mod tests {
             )],
         );
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
-            &from_plugin("basic-tools"), &body,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("basic-tools"),
+            &body,
         )
         .await
         .expect("dispatch ok");
 
         let tools = catalog.to_openai_tools().await;
         assert_eq!(tools.len(), 1);
-        assert_eq!(catalog.owner_of("read_file").await.as_deref(), Some("basic-tools"));
+        assert_eq!(
+            catalog.owner_of("read_file").await.as_deref(),
+            Some("basic-tools")
+        );
     }
 
     #[tokio::test]
@@ -2196,8 +2229,15 @@ mod tests {
             ],
         );
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
-            &from_plugin("basic-tools"), &body,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("basic-tools"),
+            &body,
         )
         .await
         .expect("dispatch ok");
@@ -2226,8 +2266,15 @@ mod tests {
             ],
         );
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
-            &from_plugin("basic-tools"), &body,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("basic-tools"),
+            &body,
         )
         .await
         .expect("dispatch ok");
@@ -2255,8 +2302,15 @@ mod tests {
         );
         // Just must not error. There's no caller to address.
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
-            &from_plugin("basic-tools"), &body,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("basic-tools"),
+            &body,
         )
         .await
         .expect("dispatch ok");
@@ -2407,8 +2461,15 @@ mod tests {
             &[("chat_id", Value::String("c-1".into()))],
         );
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
-            &from_plugin("reasoner-graph"), &body,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("reasoner-graph"),
+            &body,
         )
         .await
         .expect("dispatch ok");
@@ -2419,7 +2480,10 @@ mod tests {
             emitted[0].get("kind").and_then(Value::as_str),
             Some("ollama.chat.created")
         );
-        assert_eq!(emitted[0].get("chat_id").and_then(Value::as_str), Some("c-1"));
+        assert_eq!(
+            emitted[0].get("chat_id").and_then(Value::as_str),
+            Some("c-1")
+        );
         assert!(chats.exists(&ChatId::new("c-1")).await);
     }
 
@@ -2432,15 +2496,25 @@ mod tests {
         let config = cfg("ollama");
         let client = reqwest::Client::builder().build().expect("client");
 
-        chats.create(ChatId::new("c-1"), None, None).await.expect("seed");
+        chats
+            .create(ChatId::new("c-1"), None, None)
+            .await
+            .expect("seed");
 
         let body = make_event_body(
             "ollama.chat.create",
             &[("chat_id", Value::String("c-1".into()))],
         );
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
-            &from_plugin("reasoner-graph"), &body,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("reasoner-graph"),
+            &body,
         )
         .await
         .expect("dispatch ok");
@@ -2466,19 +2540,26 @@ mod tests {
         let config = cfg("ollama");
         let client = reqwest::Client::builder().build().expect("client");
 
-        chats.create(ChatId::new("c-1"), None, None).await.expect("seed");
+        chats
+            .create(ChatId::new("c-1"), None, None)
+            .await
+            .expect("seed");
 
         let msg = serde_json::json!({"role": "user", "content": "hello"});
         let body = make_event_body(
             "ollama.chat.append",
-            &[
-                ("chat_id", Value::String("c-1".into())),
-                ("message", msg),
-            ],
+            &[("chat_id", Value::String("c-1".into())), ("message", msg)],
         );
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
-            &from_plugin("reasoner-graph"), &body,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("reasoner-graph"),
+            &body,
         )
         .await
         .expect("dispatch ok");
@@ -2511,14 +2592,18 @@ mod tests {
         let msg = serde_json::json!({"role": "user", "content": "hello"});
         let body = make_event_body(
             "ollama.chat.append",
-            &[
-                ("chat_id", Value::String("ghost".into())),
-                ("message", msg),
-            ],
+            &[("chat_id", Value::String("ghost".into())), ("message", msg)],
         );
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
-            &from_plugin("reasoner-graph"), &body,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("reasoner-graph"),
+            &body,
         )
         .await
         .expect("dispatch ok");
@@ -2540,15 +2625,25 @@ mod tests {
         let config = cfg("ollama");
         let client = reqwest::Client::builder().build().expect("client");
 
-        chats.create(ChatId::new("c-1"), None, None).await.expect("seed");
+        chats
+            .create(ChatId::new("c-1"), None, None)
+            .await
+            .expect("seed");
 
         let body = make_event_body(
             "ollama.chat.delete",
             &[("chat_id", Value::String("c-1".into()))],
         );
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
-            &from_plugin("reasoner-graph"), &body,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("reasoner-graph"),
+            &body,
         )
         .await
         .expect("dispatch ok");
@@ -2582,13 +2677,17 @@ mod tests {
         // dispatcher itself still returns Ok, which is what we assert.
         let client = reqwest::Client::builder().build().expect("client");
 
-        let body = make_event_body(
-            "ollama.prompt",
-            &[("text", Value::String("hi".into()))],
-        );
+        let body = make_event_body("ollama.prompt", &[("text", Value::String("hi".into()))]);
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
-            &from_plugin("nefor-chat"), &body,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("nefor-chat"),
+            &body,
         )
         .await
         .expect("dispatch ok");
@@ -2606,8 +2705,14 @@ mod tests {
         let chats = fresh_chats("m");
         chats.create(ChatId::new("a"), None, None).await.expect("a");
         chats.create(ChatId::new("b"), None, None).await.expect("b");
-        chats.push_user(&ChatId::new("a"), "alpha".into()).await.unwrap();
-        chats.push_user(&ChatId::new("b"), "beta".into()).await.unwrap();
+        chats
+            .push_user(&ChatId::new("a"), "alpha".into())
+            .await
+            .unwrap();
+        chats
+            .push_user(&ChatId::new("b"), "beta".into())
+            .await
+            .unwrap();
         let ha = chats.history_snapshot(&ChatId::new("a")).await.unwrap();
         let hb = chats.history_snapshot(&ChatId::new("b")).await.unwrap();
         assert_eq!(ha.len(), 1);

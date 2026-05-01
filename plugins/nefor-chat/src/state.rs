@@ -485,10 +485,7 @@ impl SessionMetadata {
         {
             self.cumulative_cache_creation = Some(n);
         }
-        if let Some(n) = body
-            .get("last_turn_context_tokens")
-            .and_then(Value::as_u64)
-        {
+        if let Some(n) = body.get("last_turn_context_tokens").and_then(Value::as_u64) {
             self.last_turn_context_tokens = Some(n);
         }
         if let Some(n) = body.get("last_turn_duration_ms").and_then(Value::as_u64) {
@@ -882,7 +879,8 @@ pub struct ChatState {
     /// in-flight chat run) to `Action::InterruptAll` (cancel chat + all
     /// sub-graph runs, drop deferred queue). `None` if no ESC has been
     /// pressed yet, or if the previous ESC was outside the window.
-    #[allow(dead_code)] // read by main.rs; tests/render.rs #[path]-includes state.rs without main
+    #[allow(dead_code)]
+    // read by main.rs; tests/render.rs #[path]-includes state.rs without main
     pub last_escape_at: Option<Instant>,
     /// Submitted-prompt history, oldest first. Up/Down on an empty input
     /// buffer recall older/newer entries — same convention as a shell.
@@ -1408,13 +1406,11 @@ impl ChatState {
     pub fn append_assistant_reasoning_delta(&mut self, chunk: &str) {
         if let Some(last) = self.transcript.last_mut() {
             if last.role == Role::Assistant && last.streaming {
-                let r = last
-                    .reasoning
-                    .get_or_insert_with(|| ReasoningPayload {
-                        text: String::new(),
-                        streaming: true,
-                        duration_ms: None,
-                    });
+                let r = last.reasoning.get_or_insert_with(|| ReasoningPayload {
+                    text: String::new(),
+                    streaming: true,
+                    duration_ms: None,
+                });
                 r.text.push_str(chunk);
                 r.streaming = true;
                 self.bump_transcript_version();
@@ -1582,11 +1578,7 @@ impl ChatState {
             return 0;
         }
         // Sum of header + node rows across every tracked run.
-        let raw_rows: usize = self
-            .dag_runs
-            .values()
-            .map(|r| 1 + r.nodes.len())
-            .sum();
+        let raw_rows: usize = self.dag_runs.values().map(|r| 1 + r.nodes.len()).sum();
         let max = DAG_PANEL_MAX_ROWS as usize;
         let height = if raw_rows > max {
             // Reserve one row for the "… +K more" overflow line.
@@ -1621,7 +1613,9 @@ impl ChatState {
         let bar_floor = vpad_top + vpad_input_top + 2 + 1 + vpad_bottom + status_height + 1;
         let input_bars: u32 = if rows >= bar_floor { 2 } else { 0 };
         let max_input_rows = rows
-            .saturating_sub(vpad_top + vpad_input_top + input_bars + 1 + vpad_bottom + status_height)
+            .saturating_sub(
+                vpad_top + vpad_input_top + input_bars + 1 + vpad_bottom + status_height,
+            )
             .clamp(1, MAX_INPUT_ROWS);
         let input_logical_lines = self.input.lines().len() as u32;
         let input_height = input_logical_lines.clamp(1, max_input_rows);
@@ -2214,7 +2208,11 @@ mod tests {
     #[test]
     fn pending_seconds_at_returns_elapsed_while_unacknowledged() {
         let mut s = ChatState::new();
-        assert_eq!(s.pending_seconds_at(Instant::now()), None, "not armed: None");
+        assert_eq!(
+            s.pending_seconds_at(Instant::now()),
+            None,
+            "not armed: None"
+        );
 
         let t0 = Instant::now();
         s.awaiting_response_since = Some(t0 - Duration::from_secs(7));
@@ -2374,7 +2372,7 @@ mod tests {
         s.push_history("b".into());
         s.history_up(); // walk to "b"
         s.history_up(); // walk to "a"
-        // New submit lands.
+                        // New submit lands.
         s.push_history("c".into());
         assert_eq!(s.history_cursor, None);
         assert_eq!(s.history_up().as_deref(), Some("c"));
@@ -2397,5 +2395,4 @@ mod tests {
         s.input.insert_str("a\nb\nc"); // 3 logical lines
         assert_eq!(s.transcript_rows(), base - 2);
     }
-
 }

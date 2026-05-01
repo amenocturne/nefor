@@ -164,9 +164,7 @@ async fn dispatch_event(
             if let Some(name) = body.get("name").and_then(Value::as_str) {
                 track_peer(peers, name);
             } else {
-                tracing::warn!(
-                    "register_reasoner event missing required 'name' string field"
-                );
+                tracing::warn!("register_reasoner event missing required 'name' string field");
             }
         }
         "reasoner-graph.run" => {

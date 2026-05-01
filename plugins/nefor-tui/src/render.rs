@@ -41,10 +41,9 @@ pub fn draw(
         let row_cells = grid.row(r);
         // For each visible row, work out the column band (if any) that falls
         // inside the selection rect. Returned as `[start, end)`.
-        let row_sel_band = sel_rect
-            .and_then(|(top, left, bottom, right)| {
-                col_range_for_row(r, top, left, bottom, right, cols)
-            });
+        let row_sel_band = sel_rect.and_then(|(top, left, bottom, right)| {
+            col_range_for_row(r, top, left, bottom, right, cols)
+        });
         let mut c: u16 = 0;
         while c < cols {
             let cell = &row_cells[usize::from(c)];

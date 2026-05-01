@@ -141,9 +141,8 @@ async fn chat_completion_uses_passed_in_model_not_a_default() {
     // session.active_model -> arg in main.rs's spawn_turn really moves the
     // model through to the HTTP request).
     let (listener, addr) = bind_local().await;
-    let captured: std::sync::Arc<tokio::sync::Mutex<String>> = std::sync::Arc::new(
-        tokio::sync::Mutex::new(String::new()),
-    );
+    let captured: std::sync::Arc<tokio::sync::Mutex<String>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
     let captured_clone = captured.clone();
 
     let server = tokio::spawn(async move {
@@ -160,7 +159,10 @@ async fn chat_completion_uses_passed_in_model_not_a_default() {
             if let Some(headers_end) = acc.find("\r\n\r\n") {
                 let cl: usize = acc
                     .lines()
-                    .find_map(|l| l.strip_prefix("content-length:").or_else(|| l.strip_prefix("Content-Length:")))
+                    .find_map(|l| {
+                        l.strip_prefix("content-length:")
+                            .or_else(|| l.strip_prefix("Content-Length:"))
+                    })
                     .and_then(|v| v.trim().parse().ok())
                     .unwrap_or(0);
                 let body_so_far = acc.len() - (headers_end + 4);
@@ -361,7 +363,10 @@ async fn streaming_assembles_tool_call_from_fragmented_deltas() {
     assert_eq!(tc.kind, "function");
     assert_eq!(tc.function.name, "read_file");
     assert_eq!(tc.function.arguments, "{\"path\":\"/tmp/foo.txt\"}");
-    assert!(outcome.full_text.is_empty(), "no prose in a pure tool-call turn");
+    assert!(
+        outcome.full_text.is_empty(),
+        "no prose in a pure tool-call turn"
+    );
 }
 
 /// When tools are passed in, the request body must carry them in the
@@ -445,7 +450,10 @@ async fn request_body_carries_tools_array_when_present() {
 
     let body = captured.lock().await.clone();
     let v: serde_json::Value = serde_json::from_str(&body).expect("body json");
-    let tools = v.get("tools").and_then(|t| t.as_array()).expect("tools array");
+    let tools = v
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .expect("tools array");
     assert_eq!(tools.len(), 1);
     assert_eq!(
         tools[0].get("type").and_then(serde_json::Value::as_str),

@@ -213,13 +213,11 @@ impl Chats {
             .ok_or_else(|| ChatsError::NotFound(id.clone()))
     }
 
-    pub async fn set_chat_model(
-        &self,
-        id: &ChatId,
-        model: String,
-    ) -> Result<(), ChatsError> {
+    pub async fn set_chat_model(&self, id: &ChatId, model: String) -> Result<(), ChatsError> {
         let mut g = self.inner.lock().await;
-        let chat = g.get_mut(id).ok_or_else(|| ChatsError::NotFound(id.clone()))?;
+        let chat = g
+            .get_mut(id)
+            .ok_or_else(|| ChatsError::NotFound(id.clone()))?;
         chat.model = model;
         Ok(())
     }
@@ -233,7 +231,9 @@ impl Chats {
 
     pub async fn append(&self, id: &ChatId, message: Message) -> Result<(), ChatsError> {
         let mut g = self.inner.lock().await;
-        let chat = g.get_mut(id).ok_or_else(|| ChatsError::NotFound(id.clone()))?;
+        let chat = g
+            .get_mut(id)
+            .ok_or_else(|| ChatsError::NotFound(id.clone()))?;
         chat.history.push(message);
         Ok(())
     }
@@ -281,7 +281,9 @@ impl Chats {
     /// existing "/reset" command keeps working.
     pub async fn reset(&self, id: &ChatId) -> Result<(), ChatsError> {
         let mut g = self.inner.lock().await;
-        let chat = g.get_mut(id).ok_or_else(|| ChatsError::NotFound(id.clone()))?;
+        let chat = g
+            .get_mut(id)
+            .ok_or_else(|| ChatsError::NotFound(id.clone()))?;
         chat.history.clear();
         Ok(())
     }
@@ -302,7 +304,9 @@ impl Chats {
     /// a turn; `Err(NotFound)` if no such chat exists.
     pub async fn begin_turn(&self, id: &ChatId) -> Result<CancellationToken, ChatsError> {
         let mut g = self.inner.lock().await;
-        let chat = g.get_mut(id).ok_or_else(|| ChatsError::NotFound(id.clone()))?;
+        let chat = g
+            .get_mut(id)
+            .ok_or_else(|| ChatsError::NotFound(id.clone()))?;
         if chat.in_flight {
             return Err(ChatsError::Busy(id.clone()));
         }
@@ -356,7 +360,9 @@ impl Chats {
         duration_ms: u64,
     ) -> Result<(), ChatsError> {
         let mut g = self.inner.lock().await;
-        let chat = g.get_mut(id).ok_or_else(|| ChatsError::NotFound(id.clone()))?;
+        let chat = g
+            .get_mut(id)
+            .ok_or_else(|| ChatsError::NotFound(id.clone()))?;
         if let Some(m) = model {
             chat.stats.model = Some(m.to_owned());
         }
@@ -416,8 +422,13 @@ mod tests {
     async fn create_rejects_duplicate_id() {
         let c = Chats::with_default_model("m".into());
         let id = ChatId::new("dup");
-        c.create(id.clone(), None, None).await.expect("first create");
-        let err = c.create(id.clone(), None, None).await.expect_err("second create");
+        c.create(id.clone(), None, None)
+            .await
+            .expect("first create");
+        let err = c
+            .create(id.clone(), None, None)
+            .await
+            .expect_err("second create");
         assert!(matches!(err, ChatsError::AlreadyExists(x) if x == id));
     }
 
@@ -427,10 +438,7 @@ mod tests {
         let id = ChatId::new("x");
         c.create(id.clone(), None, None).await.expect("create");
         c.delete(&id).await.expect("delete");
-        let err = c
-            .push_user(&id, "y".into())
-            .await
-            .expect_err("post-delete");
+        let err = c.push_user(&id, "y".into()).await.expect_err("post-delete");
         assert!(matches!(err, ChatsError::NotFound(x) if x == id));
         assert!(!c.exists(&id).await);
     }
@@ -614,10 +622,7 @@ mod tests {
         c.create(ChatId::new("b"), None, None).await.expect("b");
         let mut ids = c.ids().await;
         ids.sort();
-        assert_eq!(
-            ids,
-            vec![ChatId::new("a"), ChatId::new("b")]
-        );
+        assert_eq!(ids, vec![ChatId::new("a"), ChatId::new("b")]);
     }
 
     #[tokio::test]

@@ -118,8 +118,8 @@ where
     };
 
     if tracing::enabled!(tracing::Level::INFO) {
-        let body_json = serde_json::to_string(&req)
-            .unwrap_or_else(|e| format!("<serialize-error: {e}>"));
+        let body_json =
+            serde_json::to_string(&req).unwrap_or_else(|e| format!("<serialize-error: {e}>"));
         tracing::info!(
             target: "openai_provider::http",
             endpoint = endpoint,
@@ -476,7 +476,9 @@ mod tests {
 
     #[test]
     fn drain_ignores_non_data_lines_and_blanks() {
-        let mut buffer = String::from(": keepalive\nevent: ping\ndata: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n");
+        let mut buffer = String::from(
+            ": keepalive\nevent: ping\ndata: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n",
+        );
         let mut outcome = StreamOutcome::default();
         let mut deltas: Vec<String> = Vec::new();
         let mut tc = ToolCallAccumulator::new();
@@ -536,7 +538,10 @@ mod tests {
         assert_eq!(calls[0].id, "call_a");
         assert_eq!(calls[0].function.arguments, "{\"path\":\"/y\"}");
         assert_eq!(calls[1].id, "call_b");
-        assert_eq!(calls[1].function.arguments, "{\"path\":\"/x\",\"content\":\"hi\"}");
+        assert_eq!(
+            calls[1].function.arguments,
+            "{\"path\":\"/x\",\"content\":\"hi\"}"
+        );
     }
 
     #[test]
@@ -548,7 +553,8 @@ mod tests {
         buffer.push_str("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n");
         buffer.push_str("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"/tmp/x\\\"}\"}}]}}]}\n\n");
         // Finish
-        buffer.push_str("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n");
+        buffer
+            .push_str("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n");
         buffer.push_str("data: [DONE]\n\n");
 
         let mut outcome = StreamOutcome::default();
@@ -580,15 +586,9 @@ mod tests {
     fn drain_separates_reasoning_from_content_with_boundary_end() {
         let mut buffer = String::new();
         // Three reasoning chunks first (Ollama's typical Qwen3 shape).
-        buffer.push_str(
-            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"Let me \"}}]}\n\n",
-        );
-        buffer.push_str(
-            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"think \"}}]}\n\n",
-        );
-        buffer.push_str(
-            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"about it.\"}}]}\n\n",
-        );
+        buffer.push_str("data: {\"choices\":[{\"delta\":{\"reasoning\":\"Let me \"}}]}\n\n");
+        buffer.push_str("data: {\"choices\":[{\"delta\":{\"reasoning\":\"think \"}}]}\n\n");
+        buffer.push_str("data: {\"choices\":[{\"delta\":{\"reasoning\":\"about it.\"}}]}\n\n");
         // Then content. The first content chunk must trigger
         // ReasoningEvent::End with the full accumulated trace.
         buffer.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"The \"}}]}\n\n");
@@ -629,12 +629,8 @@ mod tests {
     #[test]
     fn drain_synthesises_reasoning_end_on_finish_when_no_content() {
         let mut buffer = String::new();
-        buffer.push_str(
-            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"thinking only\"}}]}\n\n",
-        );
-        buffer.push_str(
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-        );
+        buffer.push_str("data: {\"choices\":[{\"delta\":{\"reasoning\":\"thinking only\"}}]}\n\n");
+        buffer.push_str("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
         buffer.push_str("data: [DONE]\n\n");
 
         let mut outcome = StreamOutcome::default();

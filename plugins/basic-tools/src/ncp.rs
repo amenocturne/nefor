@@ -93,9 +93,7 @@ pub async fn await_ready_ok(
                 return Ok(engine_version);
             }
             Body::System(SystemBody::Error { code, message, .. }) => {
-                return Err(BasicToolsError::ReadyFailed(format!(
-                    "{code:?}: {message}"
-                )));
+                return Err(BasicToolsError::ReadyFailed(format!("{code:?}: {message}")));
             }
             other => {
                 tracing::warn!(?other, "unexpected pre-ready_ok envelope; ignoring");

@@ -133,9 +133,7 @@ mod tests {
         assert_eq!(&bytes[..7], b"\x1b]52;c;");
         assert_eq!(*bytes.last().expect("non-empty"), 0x07);
         let payload = &bytes[7..bytes.len() - 1];
-        let decoded = STANDARD
-            .decode(payload)
-            .expect("payload is valid base64");
+        let decoded = STANDARD.decode(payload).expect("payload is valid base64");
         assert_eq!(decoded, text.as_bytes());
     }
 

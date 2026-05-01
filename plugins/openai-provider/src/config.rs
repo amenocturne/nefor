@@ -83,7 +83,12 @@ impl Config {
     /// trim a trailing slash from base_url if a custom value-parser was
     /// bypassed (e.g. `try_parse_from`).
     fn normalize(&mut self) {
-        if self.api_key.as_deref().map(|s| s.is_empty()).unwrap_or(false) {
+        if self
+            .api_key
+            .as_deref()
+            .map(|s| s.is_empty())
+            .unwrap_or(false)
+        {
             self.api_key = None;
         }
         self.base_url = self.base_url.trim_end_matches('/').to_string();
@@ -121,7 +126,10 @@ mod tests {
     #[test]
     fn chat_endpoint_appends_path() {
         let c = cfg("ollama");
-        assert_eq!(c.chat_endpoint(), "http://localhost:11434/v1/chat/completions");
+        assert_eq!(
+            c.chat_endpoint(),
+            "http://localhost:11434/v1/chat/completions"
+        );
     }
 
     #[test]
@@ -191,11 +199,7 @@ mod tests {
 
     #[test]
     fn model_flag_passes_through_verbatim() {
-        let (_g, c) = parse_clean(&[
-            "openai-provider",
-            "--model",
-            "llama-3.3-70b-versatile",
-        ]);
+        let (_g, c) = parse_clean(&["openai-provider", "--model", "llama-3.3-70b-versatile"]);
         assert_eq!(c.model, "llama-3.3-70b-versatile");
     }
 

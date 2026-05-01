@@ -992,7 +992,9 @@ fn apply_fanout_outputs(state: &mut RunState, node_id: &str, outputs: &[TypedFan
             }
         }
         if every_edge_suppressed && !deps_of_dep.is_empty() {
-            state.completed.insert(dep_id.clone(), NodeStatus::FanoutSuppressed);
+            state
+                .completed
+                .insert(dep_id.clone(), NodeStatus::FanoutSuppressed);
             newly_skipped.push(dep_id);
         }
     }

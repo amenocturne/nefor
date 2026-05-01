@@ -236,8 +236,7 @@ mod tests {
             .unwrap();
         // macOS prefixes /private/ to /tmp paths in `pwd`; allow either form.
         assert!(
-            out.contains(path_str)
-                || out.contains(&format!("/private{path_str}")),
+            out.contains(path_str) || out.contains(&format!("/private{path_str}")),
             "pwd output didn't match cwd: {out}"
         );
     }

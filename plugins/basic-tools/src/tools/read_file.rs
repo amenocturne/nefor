@@ -102,10 +102,12 @@ async fn read_text_file(path: &str) -> Result<String, ToolError> {
         });
     }
 
-    let mut file = tokio::fs::File::open(path).await.map_err(|e| ToolError::Io {
-        path: path.into(),
-        message: e.to_string(),
-    })?;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| ToolError::Io {
+            path: path.into(),
+            message: e.to_string(),
+        })?;
 
     // Probe the first BINARY_PROBE_BYTES for NUL bytes. If we find one,
     // bail early without slurping the whole file. This is the same
@@ -117,10 +119,13 @@ async fn read_text_file(path: &str) -> Result<String, ToolError> {
     let mut probe = vec![0u8; probe_cap];
     let mut probe_read = 0usize;
     while probe_read < probe_cap {
-        let n = file.read(&mut probe[probe_read..]).await.map_err(|e| ToolError::Io {
-            path: path.into(),
-            message: e.to_string(),
-        })?;
+        let n = file
+            .read(&mut probe[probe_read..])
+            .await
+            .map_err(|e| ToolError::Io {
+                path: path.into(),
+                message: e.to_string(),
+            })?;
         if n == 0 {
             break;
         }
@@ -137,10 +142,12 @@ async fn read_text_file(path: &str) -> Result<String, ToolError> {
     // and continue.
     let remaining_cap = (size as usize).saturating_sub(probe_read);
     let mut rest = Vec::with_capacity(remaining_cap);
-    file.read_to_end(&mut rest).await.map_err(|e| ToolError::Io {
-        path: path.into(),
-        message: e.to_string(),
-    })?;
+    file.read_to_end(&mut rest)
+        .await
+        .map_err(|e| ToolError::Io {
+            path: path.into(),
+            message: e.to_string(),
+        })?;
 
     let mut all = probe;
     all.extend_from_slice(&rest);
@@ -259,7 +266,10 @@ mod tests {
     fn schema_has_required_path() {
         let s = schema();
         assert_eq!(s.get("type").and_then(Value::as_str), Some("object"));
-        let required = s.get("required").and_then(Value::as_array).expect("required");
+        let required = s
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("required");
         assert!(required.iter().any(|v| v.as_str() == Some("path")));
     }
 }
