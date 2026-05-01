@@ -10,9 +10,11 @@
 //! `stage1_e2e.rs` left open: that test still requires live Ollama; this
 //! one validates the same wire end-to-end with the deterministic mock.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, Once};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -42,28 +44,30 @@ fn target_debug(bin: &str) -> PathBuf {
 }
 
 /// Build the engine + every plugin the cli-config spawns. No-op on a
-/// warm cache. We do this once per test invocation; cargo serialises
-/// individual #[test] runs via the test binary itself, so concurrent
-/// `cargo build` calls only race the first time and the overhead is
-/// minimal afterwards.
+/// warm cache. The `Once` guard ensures concurrent test runs (cargo
+/// runs #[test]s in parallel by default) don't all queue on the cargo
+/// artifact lock — only one build call goes out per process.
 fn ensure_built() {
-    let pkgs = [
-        "nefor",
-        "mock-plugin",
-        "reasoner-graph",
-        "tool-gate-plugin",
-        "nefor-combinators-plugin",
-        "generic-provider",
-        "generic-tool",
-        "basic-tools-plugin",
-    ];
-    let mut cmd = Command::new(env!("CARGO"));
-    cmd.arg("build").current_dir(repo_root());
-    for p in pkgs {
-        cmd.arg("-p").arg(p);
-    }
-    let status = cmd.status().expect("spawn cargo build");
-    assert!(status.success(), "cargo build failed for required packages");
+    static BUILT: Once = Once::new();
+    BUILT.call_once(|| {
+        let pkgs = [
+            "nefor",
+            "mock-plugin",
+            "reasoner-graph",
+            "tool-gate-plugin",
+            "nefor-combinators-plugin",
+            "generic-provider",
+            "generic-tool",
+            "basic-tools-plugin",
+        ];
+        let mut cmd = Command::new(env!("CARGO"));
+        cmd.arg("build").current_dir(repo_root());
+        for p in pkgs {
+            cmd.arg("-p").arg(p);
+        }
+        let status = cmd.status().expect("spawn cargo build");
+        assert!(status.success(), "cargo build failed for required packages");
+    });
 }
 
 // --------------------------------------------------------------------
@@ -76,12 +80,14 @@ fn ensure_built() {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputFormat {
     Json,
+    StreamJson,
 }
 
 impl OutputFormat {
     fn as_arg(self) -> &'static str {
         match self {
             OutputFormat::Json => "json",
+            OutputFormat::StreamJson => "stream-json",
         }
     }
 }
@@ -113,8 +119,11 @@ fn base_command(xdg: &Path) -> Command {
 }
 
 /// Spawn the engine, wait up to `SCENARIO_TIMEOUT`, return captured
-/// stdout/stderr + exit status. Kills the process on timeout (test
-/// fails the assertion afterwards).
+/// stdout/stderr + exit status. Drains both pipes on background threads
+/// to avoid the classic pipe-buffer deadlock — stream-json mode emits
+/// hundreds of envelope lines and would otherwise block the engine on
+/// write before we had a chance to call `wait_with_output`. Kills the
+/// process on timeout (test fails the assertion afterwards).
 fn run_scenario(extra_argv: &[&str], stdin_payload: StdinPayload) -> ProcessOutput {
     let xdg = TempDir::new().expect("xdg tempdir");
     let mut cmd = base_command(xdg.path());
@@ -136,6 +145,9 @@ fn run_scenario(extra_argv: &[&str], stdin_payload: StdinPayload) -> ProcessOutp
         drop(stdin);
     }
 
+    let stdout_buf = drain_pipe(child.stdout.take().expect("stdout piped"));
+    let stderr_buf = drain_pipe(child.stderr.take().expect("stderr piped"));
+
     let timed_out = match wait_with_deadline(&mut child, SCENARIO_TIMEOUT) {
         Some(_) => false,
         None => {
@@ -144,10 +156,10 @@ fn run_scenario(extra_argv: &[&str], stdin_payload: StdinPayload) -> ProcessOutp
             true
         }
     };
+    let status = child.wait().expect("wait child");
 
-    let output = child.wait_with_output().expect("wait_with_output");
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stdout = take_buf(&stdout_buf);
+    let stderr = take_buf(&stderr_buf);
 
     assert!(
         !timed_out,
@@ -158,10 +170,39 @@ fn run_scenario(extra_argv: &[&str], stdin_payload: StdinPayload) -> ProcessOutp
 
     drop(xdg);
     ProcessOutput {
-        status: output.status,
+        status,
         stdout,
         stderr,
     }
+}
+
+/// Spawn a thread that reads `pipe` to EOF into a shared `Vec<u8>`. The
+/// returned `Arc<Mutex<Vec<u8>>>` collects bytes as they arrive; reading
+/// it after the child exits gives the full output. Reading it earlier
+/// gives a partial snapshot (used in timeout-diagnostic paths).
+fn drain_pipe<R: Read + Send + 'static>(mut pipe: R) -> Arc<Mutex<Vec<u8>>> {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let buf_clone = Arc::clone(&buf);
+    thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => {
+                    if let Ok(mut g) = buf_clone.lock() {
+                        g.extend_from_slice(&chunk[..n]);
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    buf
+}
+
+fn take_buf(buf: &Arc<Mutex<Vec<u8>>>) -> String {
+    let bytes = buf.lock().map(|g| g.clone()).unwrap_or_default();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn wait_with_deadline(child: &mut Child, deadline: Duration) -> Option<std::process::ExitStatus> {
@@ -292,5 +333,62 @@ fn scenario_2_single_shot_json() {
     assert_eq!(
         status, "success",
         "expected status=success; full payload: {v:?}"
+    );
+}
+
+// --------------------------------------------------------------------
+// scenario 3 — single-shot stream-json format
+// --------------------------------------------------------------------
+
+#[test]
+fn scenario_3_single_shot_stream_json() {
+    ensure_built();
+    let out = run_scenario(
+        &[
+            "--format",
+            OutputFormat::StreamJson.as_arg(),
+            SPAWN_GRAPH_PROMPT,
+        ],
+        None,
+    );
+    assert_success(&out);
+
+    // Every non-empty stdout line must be a valid JSON envelope. Parse
+    // each and bucket by `body.kind`.
+    let mut run_complete_count = 0usize;
+    let mut total_lines = 0usize;
+    for (idx, line) in out.stdout.lines().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        total_lines += 1;
+        let v: Value = serde_json::from_str(line).unwrap_or_else(|e| {
+            panic!(
+                "stream-json line {idx} is not valid JSON: {e}; line: {:?}",
+                truncate(line, 512)
+            )
+        });
+        let kind = v
+            .get("body")
+            .and_then(|b| b.get("kind"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if kind == "graph.run_complete" {
+            run_complete_count += 1;
+        }
+    }
+
+    assert!(
+        total_lines > 0,
+        "expected at least one envelope on stdout in stream-json mode"
+    );
+    // Bus fan-out delivers one log entry per subscriber, so the wildcard
+    // handler in install_stream_json_format sees the same kind multiple
+    // times. Don't lock to an exact count — assert ≥1 to keep the test
+    // robust against bus-fan-out tuning.
+    assert!(
+        run_complete_count >= 1,
+        "expected at least one graph.run_complete envelope; saw {run_complete_count} \
+         across {total_lines} lines"
     );
 }
