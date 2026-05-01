@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
 use tempfile::TempDir;
 
 /// Hard wall-clock cap per scenario. Generous — the spawn pipeline is
@@ -68,6 +69,22 @@ fn ensure_built() {
 // --------------------------------------------------------------------
 // child helpers
 // --------------------------------------------------------------------
+
+/// `--format` values that scenarios assert on. `text` is the default and
+/// has its own scenario; non-default formats are passed via `--format`.
+/// Enum rather than stringly-typed to keep the call sites readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputFormat {
+    Json,
+}
+
+impl OutputFormat {
+    fn as_arg(self) -> &'static str {
+        match self {
+            OutputFormat::Json => "json",
+        }
+    }
+}
 
 /// Output of a finished engine subprocess.
 struct ProcessOutput {
@@ -221,5 +238,59 @@ fn scenario_1_single_shot_text_canonical() {
         out.stderr.contains("[tool: spawn_graph"),
         "expected spawn_graph tool one-liner on stderr; got: {:?}",
         truncate(&out.stderr, 2048)
+    );
+}
+
+// --------------------------------------------------------------------
+// scenario 2 — single-shot json format
+// --------------------------------------------------------------------
+
+#[test]
+fn scenario_2_single_shot_json() {
+    ensure_built();
+    let out = run_scenario(
+        &["--format", OutputFormat::Json.as_arg(), SPAWN_GRAPH_PROMPT],
+        None,
+    );
+    assert_success(&out);
+
+    // json mode prints exactly one JSON line on stdout.
+    let trimmed = out.stdout.trim_end_matches('\n');
+    assert!(
+        !trimmed.is_empty(),
+        "expected one JSON line on stdout; got empty"
+    );
+    assert!(
+        !trimmed.contains('\n'),
+        "expected exactly one JSON line on stdout; got multiple: {:?}",
+        truncate(&out.stdout, 2048)
+    );
+
+    let v: Value = serde_json::from_str(trimmed)
+        .unwrap_or_else(|e| panic!("stdout is not valid JSON: {e}; line: {trimmed:?}"));
+
+    let answer = v
+        .get("answer")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("missing `answer` field: {v:?}"));
+    assert!(
+        !answer.is_empty(),
+        "expected non-empty `answer` field; got: {v:?}"
+    );
+    let answer_lc = answer.to_lowercase();
+    for needle in ["octopus", "lighthouse"] {
+        assert!(
+            answer_lc.contains(needle),
+            "expected answer to contain {needle:?}; got: {answer:?}"
+        );
+    }
+
+    let status = v
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("missing `status` field: {v:?}"));
+    assert_eq!(
+        status, "success",
+        "expected status=success; full payload: {v:?}"
     );
 }
