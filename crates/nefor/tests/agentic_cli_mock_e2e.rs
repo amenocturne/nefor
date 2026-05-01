@@ -440,3 +440,28 @@ fn scenario_4_repl_multi_turn() {
         truncate(&out.stderr, 1024)
     );
 }
+
+// --------------------------------------------------------------------
+// scenario 5 — `-- --help` documented usage workaround
+// --------------------------------------------------------------------
+
+#[test]
+fn scenario_5_help_via_double_dash() {
+    ensure_built();
+    let out = run_scenario(&["--", "--help"], None);
+    assert_success(&out);
+
+    // The USAGE banner from agentic_cli.lua starts with "Usage:" and
+    // documents the format flag. Both substrings keep the assertion
+    // anchored without locking to the full text.
+    assert!(
+        out.stdout.starts_with("Usage:"),
+        "expected stdout to start with `Usage:`; got: {:?}",
+        truncate(&out.stdout, 512)
+    );
+    assert!(
+        out.stdout.contains("--format"),
+        "expected USAGE banner to mention --format; got: {:?}",
+        truncate(&out.stdout, 1024)
+    );
+}
