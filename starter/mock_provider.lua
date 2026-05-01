@@ -81,12 +81,19 @@ local FINAL_RELAY_PREFIX = ""
 -- Async spawn_graph (post-2026-04-30): the immediate `tool.result` is
 -- just an ack ("Submitted sub-graph run_id=..."). The real result
 -- arrives later as a USER-role message starting with
--- "[Deferred result for spawn_graph". Pattern-match on that prefix in
+-- "[spawn_graph(run_id=...) result]". Pattern-match on that prefix in
 -- the latest user message to drive the relay turn — old behaviour
 -- (relaying last_tool when no deferred user message exists) still
 -- covers the synchronous case if anything reverts.
-local DEFERRED_RESULT_MARKER = "%[Deferred result for spawn_graph"
-local DEFERRED_FAILURE_MARKER = "%[Deferred FAILURE for spawn_graph"
+--
+-- The marker shape comes from agentic_workflow.format_deferred (see
+-- starter/agentic_workflow.lua); it changed during the Phase-1B
+-- consolidation. The legacy "[Deferred result for spawn_graph" prefix
+-- is also accepted so older fixtures keep working.
+local DEFERRED_RESULT_MARKER = "%[spawn_graph%(run_id="
+local DEFERRED_LEGACY_MARKER = "%[Deferred result for spawn_graph"
+local DEFERRED_FAILURE_MARKER = "%[spawn_graph%(run_id=[^)]*%) FAILED%]"
+local DEFERRED_FAILURE_LEGACY = "%[Deferred FAILURE for spawn_graph"
 local SUBMITTED_ACK_MARKER = "Submitted sub%-graph run_id="
 
 -- ------------------------------------------------------------------
@@ -108,19 +115,29 @@ local function pick_response_for(chat_id)
 
   -- Deferred-result branch (async spawn_graph): the real result was
   -- injected as a user-role message starting with
-  -- "[Deferred result for spawn_graph". Relay the content (everything
-  -- after the marker line) as the final answer.
-  if type(last_user) == "string" and string.find(last_user, DEFERRED_RESULT_MARKER) then
+  -- "[spawn_graph(run_id=...) result]". Relay the content (everything
+  -- after the marker line) as the final answer. Two marker shapes
+  -- accepted: the current agentic_workflow form, and the legacy form
+  -- "[Deferred result for spawn_graph" for older fixtures.
+  if type(last_user) == "string"
+      and (string.find(last_user, DEFERRED_RESULT_MARKER)
+        or string.find(last_user, DEFERRED_LEGACY_MARKER)) then
     -- Strip the leading marker line; what remains is the actual
-    -- combined paragraph the model should relay.
-    local payload = string.match(last_user, "^%[Deferred result for spawn_graph%([^)]*%)%]\n(.*)$")
+    -- combined paragraph the model should relay. agentic_workflow
+    -- emits a long `--- output ---` framing block; pull just the body.
+    local body = string.match(last_user, "%-%-%- output %-%-%-\n(.*)$")
+    if body == nil then
+      body = string.match(last_user, "^%[Deferred result for spawn_graph%([^)]*%)%]\n(.*)$")
+    end
     return {
-      text = FINAL_RELAY_PREFIX .. tostring(payload or last_user),
+      text = FINAL_RELAY_PREFIX .. tostring(body or last_user),
       finish_reason = "stop",
       with_reasoning = true,
     }
   end
-  if type(last_user) == "string" and string.find(last_user, DEFERRED_FAILURE_MARKER) then
+  if type(last_user) == "string"
+      and (string.find(last_user, DEFERRED_FAILURE_MARKER)
+        or string.find(last_user, DEFERRED_FAILURE_LEGACY)) then
     return {
       text = "The spawned sub-graph failed: " .. tostring(last_user),
       finish_reason = "stop",
