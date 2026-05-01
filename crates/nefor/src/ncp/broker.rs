@@ -58,6 +58,43 @@ pub struct BrokerShared {
     /// plugin name. Populated by [`Broker::attach_transport`] and cleared
     /// when the connection tears down.
     pub conns: HashMap<PluginName, mpsc::UnboundedSender<ConnectionOutbound>>,
+    /// `nefor.engine.exit` sink. Set by the broker once it knows its
+    /// shutdown handle + exit-code slot. None before the broker starts (in
+    /// which case the binding still records a value for the next caller).
+    pub exit_request: Option<ExitRequestSink>,
+}
+
+/// Routing sink for `nefor.engine.exit`. Holds a clone of the shutdown
+/// handle and a shared exit-code slot. The broker installs one of these
+/// on its `BrokerShared` before entering the run loop; the binding fires
+/// it whenever Lua calls `nefor.engine.exit(code)`.
+#[derive(Clone)]
+pub struct ExitRequestSink {
+    pub shutdown: ShutdownHandle,
+    pub code: Arc<std::sync::atomic::AtomicI32>,
+    pub fired: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ExitRequestSink {
+    /// Idempotent: first call wins, subsequent calls log + ignore so a
+    /// faulty cli that calls exit twice with different codes doesn't
+    /// produce surprising behaviour.
+    pub fn request(&self, code: i32) {
+        use std::sync::atomic::Ordering;
+        if self
+            .fired
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.code.store(code, Ordering::SeqCst);
+            let shutdown = self.shutdown.clone();
+            tokio::spawn(async move {
+                shutdown.shutdown(DEFAULT_SHUTDOWN_GRACE_MS).await;
+            });
+        } else {
+            tracing::warn!(code, "nefor.engine.exit called more than once; ignoring");
+        }
+    }
 }
 
 impl BrokerShared {
@@ -67,6 +104,7 @@ impl BrokerShared {
             event_log: Vec::new(),
             session,
             conns: HashMap::new(),
+            exit_request: None,
         }
     }
 }
@@ -86,6 +124,25 @@ impl BrokerOps {
 }
 
 impl EngineOps for BrokerOps {
+    fn request_exit(&self, code: i32) {
+        let sink = {
+            let guard = match self.shared.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            guard.exit_request.clone()
+        };
+        match sink {
+            Some(s) => s.request(code),
+            None => {
+                tracing::warn!(
+                    code,
+                    "nefor.engine.exit called before broker installed an exit sink; ignoring"
+                );
+            }
+        }
+    }
+
     fn plugins(&self) -> Vec<PluginName> {
         // Snapshot the connected set under the lock, then drop it. Callers
         // (Lua `nefor.engine.plugins()`) iterate the snapshot without holding
@@ -186,6 +243,12 @@ pub struct Broker {
     /// log + step pipeline before the main `select!` on each tick so they
     /// route alongside real plugin lines. See [`Broker::queue_engine_envelope`].
     pending_engine_envelopes: Vec<LogEntry>,
+    /// Exit-code slot updated by `nefor.engine.exit(code)` via
+    /// [`ExitRequestSink`]. Read by [`Broker::requested_exit_code`] after
+    /// `run()` returns so the dispatch path can propagate the code.
+    exit_code_slot: Arc<std::sync::atomic::AtomicI32>,
+    /// Latch: true once `nefor.engine.exit` fired at least once.
+    exit_fired: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Outcome of the broker's run loop.
@@ -212,6 +275,21 @@ impl Broker {
         let (inbound_tx, inbound_rx) = mpsc::channel(1024);
         let (exit_tx, exit_rx) = mpsc::channel(64);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(4);
+
+        // Install the exit-request sink so `nefor.engine.exit(code)` can
+        // signal cooperative shutdown. The shutdown handle is the same
+        // mpsc the broker's run loop watches.
+        let exit_code_slot = Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let exit_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let mut guard = lock_shared(&shared);
+            guard.exit_request = Some(ExitRequestSink {
+                shutdown: ShutdownHandle(shutdown_tx.clone()),
+                code: Arc::clone(&exit_code_slot),
+                fired: Arc::clone(&exit_fired),
+            });
+        }
+
         Self {
             shared,
             host,
@@ -225,6 +303,22 @@ impl Broker {
             saved_log,
             mirrored_count: 0,
             pending_engine_envelopes: Vec::new(),
+            exit_code_slot,
+            exit_fired,
+        }
+    }
+
+    /// Read the exit code requested by `nefor.engine.exit`. Returns 0 if
+    /// no exit was requested (e.g. broker exited because all plugins
+    /// disconnected). Used by the CLI dispatch path to propagate the
+    /// requested code to `std::process::exit`.
+    #[allow(dead_code)]
+    pub fn requested_exit_code(&self) -> i32 {
+        if self.exit_fired.load(std::sync::atomic::Ordering::SeqCst) {
+            self.exit_code_slot
+                .load(std::sync::atomic::Ordering::SeqCst)
+        } else {
+            0
         }
     }
 
@@ -289,6 +383,7 @@ impl Broker {
         if let Err(e) = self.host.invoke_step(&self.saved_log, &new_entries) {
             tracing::error!(error = %e, "step invocation errored at VM level");
         }
+        self.host.dispatch_subscriptions(&new_entries);
     }
 
     /// Clone a handle the caller can hold to request shutdown from outside
@@ -329,6 +424,63 @@ impl Broker {
             },
         );
         id
+    }
+
+    /// CLI-dispatch entry point. Drives the broker as in [`Broker::run`],
+    /// but invokes the named plugin's `cli` function before entering the
+    /// loop. Returns the exit code requested via `nefor.engine.exit`
+    /// (defaults to 0 if the cli returns naturally without calling exit
+    /// and broker shutdown happens via plugin disconnect / ctrl_c).
+    ///
+    /// Invocation ordering:
+    /// 1. Attach was already done by the caller (subprocess plugins
+    ///    spawned + transports wired).
+    /// 2. Call `invoke_cli(name, args)`. Synchronous. The cli function
+    ///    may register handlers via `nefor.bus.on_event`, send
+    ///    envelopes via `nefor.engine.send`, block on
+    ///    `nefor.io.read_line`, and finally call `nefor.engine.exit`.
+    /// 3. Drive the run loop. Any handlers registered by the cli
+    ///    function fire as plugin lines arrive; an `engine.exit` call
+    ///    (made by the cli itself or any handler) triggers shutdown.
+    pub async fn run_with_cli_dispatch(self, name: &str, args: &[String]) -> i32 {
+        // The cli function runs on the main thread, holding the Lua VM
+        // mutex. This is fine because the broker hasn't entered its run
+        // loop yet — plugin lines queue in inbound_rx and are processed
+        // once we drop into `run`.
+        let cli_rc = self.host.invoke_cli(name, args);
+        let exit_fired_already = self.exit_fired.load(std::sync::atomic::Ordering::SeqCst);
+        match cli_rc {
+            Ok(rc) => {
+                // If the cli function returned a non-zero code without
+                // calling exit, treat that as the requested exit. The
+                // broker still runs to drain any handlers that need to
+                // observe in-flight traffic, until shutdown fires (via
+                // an exit call or peer disconnect).
+                if rc != 0 && !exit_fired_already {
+                    if let Some(sink) = lock_shared(&self.shared).exit_request.clone() {
+                        sink.request(rc);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(plugin = %name, error = %e, "cli function failed");
+                if !exit_fired_already {
+                    if let Some(sink) = lock_shared(&self.shared).exit_request.clone() {
+                        sink.request(1);
+                    }
+                }
+            }
+        }
+
+        // Snapshot the exit-code slot before consuming self in run().
+        let code_slot = Arc::clone(&self.exit_code_slot);
+        let fired_slot = Arc::clone(&self.exit_fired);
+        let _ = self.run().await;
+        if fired_slot.load(std::sync::atomic::Ordering::SeqCst) {
+            code_slot.load(std::sync::atomic::Ordering::SeqCst)
+        } else {
+            0
+        }
     }
 
     /// Drive the broker until either all connections have left or a
@@ -437,6 +589,13 @@ impl Broker {
         if let Err(e) = self.host.invoke_step(&self.saved_log, &new_entries) {
             tracing::error!(error = %e, "step invocation errored at VM level");
         }
+
+        // Fan out the same tail to `nefor.bus.on_event` subscribers. Done
+        // strictly after step so step's outbound `nefor.engine.send`
+        // entries (which were appended to the event log during the call)
+        // also reach handlers. Engine-side dispatch keeps it cheap when
+        // no subscriptions are registered.
+        self.host.dispatch_subscriptions(&new_entries);
     }
 
     fn handle_reader_closed(&mut self, id: ConnectionId, reason: ReaderEnd) {
@@ -1002,18 +1161,19 @@ mod tests {
 
         // The cooperative-shutdown grace is DEFAULT_SHUTDOWN_GRACE_MS. Wait
         // long enough for: handle_exit → drain → step → shutdown → run exit.
-        let outcome = tokio::time::timeout(
-            Duration::from_millis(DEFAULT_SHUTDOWN_GRACE_MS + 500),
-            run,
-        )
-        .await
-        .expect("broker should stop within grace + slack")
-        .expect("join ok");
+        let outcome =
+            tokio::time::timeout(Duration::from_millis(DEFAULT_SHUTDOWN_GRACE_MS + 500), run)
+                .await
+                .expect("broker should stop within grace + slack")
+                .expect("join ok");
         assert_eq!(outcome, BrokerStopReason::Shutdown);
 
         let engine_seen: mlua::Table = lua.globals().get("engine_seen").unwrap();
         let len = engine_seen.len().unwrap();
-        assert!(len >= 1, "step should have observed >=1 engine entry, got {len}");
+        assert!(
+            len >= 1,
+            "step should have observed >=1 engine entry, got {len}"
+        );
         let payload: String = engine_seen.get(1).unwrap();
         assert!(
             payload.contains("\"kind\":\"engine.plugin_failed\""),
@@ -1064,13 +1224,11 @@ mod tests {
 
         let _ = exit_tx_a.send(ExitOutcome::CleanExit);
 
-        let outcome = tokio::time::timeout(
-            Duration::from_millis(DEFAULT_SHUTDOWN_GRACE_MS + 500),
-            run,
-        )
-        .await
-        .expect("broker should stop within grace + slack")
-        .expect("join ok");
+        let outcome =
+            tokio::time::timeout(Duration::from_millis(DEFAULT_SHUTDOWN_GRACE_MS + 500), run)
+                .await
+                .expect("broker should stop within grace + slack")
+                .expect("join ok");
         assert_eq!(outcome, BrokerStopReason::Shutdown);
 
         let engine_seen: mlua::Table = lua.globals().get("engine_seen").unwrap();
