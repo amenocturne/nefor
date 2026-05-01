@@ -645,13 +645,20 @@ local function test_cc_adapter_to_plugin_rewrites_interrupt()
 end
 
 -- ------------------------------------------------------------------
--- openai_provider_adapter: static_token injects auth.set on ready
+-- agentic_workflow.for_provider: static_token injects auth.set on ready
 -- ------------------------------------------------------------------
-local openai = require("openai_provider_adapter")
+--
+-- Behaviour preserved from the prior openai_provider_adapter.make. The
+-- factory now composes inner (rg-style chat-completion correlation +
+-- stream gating) AND outer (chat-contract rename + static-token
+-- injection) into one transform pair; the static-token tests still
+-- exercise the outer-adapter behaviour through that composed pair.
+local rga = require("agentic_workflow")
 
 local function test_openai_adapter_static_token_injects_auth_set_on_ready()
   reset()
-  local ad = openai.make("ollama", { static_token = "local" })
+  rga._reset()
+  local ad = rga.for_provider("ollama", { static_token = "local" })
   -- Pre-ready and unrelated events shouldn't trigger an injection.
   ad.from_plugin({
     type = "event", from = "ollama",
@@ -682,7 +689,8 @@ end
 
 local function test_openai_adapter_no_static_token_skips_injection()
   reset()
-  local ad = openai.make("ollama")  -- no opts → no static_token
+  rga._reset()
+  local ad = rga.for_provider("ollama")  -- no opts → no static_token
   ad.from_plugin({
     type = "event", from = "ollama",
     body = { kind = "ollama.ready" },
@@ -691,11 +699,11 @@ local function test_openai_adapter_no_static_token_skips_injection()
 end
 
 -- ------------------------------------------------------------------
--- reasoner_graph_adapter: bridges reasoner-graph ↔ openai-provider /
--- tool-gate via per-firing pending state and the new wire shape.
+-- agentic_workflow reasoner-graph wiring: bridges reasoner-graph ↔
+-- openai-provider / tool-gate via per-firing pending state.
 -- ------------------------------------------------------------------
 --
--- The adapter intercepts three streams:
+-- The transforms intercept three streams:
 --   * `<type>.run_node` from reasoner-graph  → drives the worker plugin,
 --     emits `<type>.run_node.ack` and a future `graph.node_result`.
 --   * `<provider>.chat.complete.result`      → resolves a pending firing
@@ -704,9 +712,8 @@ end
 --     for a `tool-executor` node.
 --
 -- The Rust harness installs `nefor.engine.send` as the recording mock,
--- so envelopes the adapter emits via `nefor.engine.send` land in
--- `_test.calls()` exactly like ncp.lua's own broadcasts.
-local rga = require("reasoner_graph_adapter")
+-- so envelopes emitted via `nefor.engine.send` land in `_test.calls()`
+-- exactly like ncp.lua's own broadcasts.
 
 -- Helper: after `for_reasoner_graph().from_plugin(env)` runs, locate the
 -- first recorded send whose body.kind is `target_kind`. Returns the

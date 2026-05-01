@@ -14,24 +14,15 @@
 --      reference config (`tmp/smoke-config-m2/init.lua`) plus the
 --      combinators plugin; swap or remove entries to compose your own stack.
 --
--- ### T7 — Stage 1 starter wiring
+-- ### T7 — Stage 1 starter wiring (post-Phase-1B)
 --
--- The chat plugin no longer talks to a provider directly. Instead:
---
---   chat.input.submit        → chat_orchestrator.lua → reasoner-graph.run
---   reasoner-graph dispatches → reasoner_graph_adapter.lua → openai-provider
---                                                         → tool-gate
---   chat.complete.result     → reasoner_graph_adapter   → graph.node_result
---   tool.result              → reasoner_graph_adapter   → graph.node_result
---   graph.run_complete       → chat_orchestrator       → chat.message.append
---
--- Three Lua glue modules co-attach to the reasoner-graph spawn:
---   * type adapter         — drives provider/tool work for each
---                            reasoner type (`dummy`, `provider-wrapper`,
---                            `tool-executor`, `adapter`, `terminal`).
---   * spawn_graph binding  — exposes `spawn_graph` as a tool in the
---                            orchestrator's catalog.
---   * chat orchestrator    — translates chat.input.submit ↔ reasoner-graph.
+-- The chat plugin no longer talks to a provider directly. Instead a single
+-- `agentic_workflow` module owns the orchestration glue: it intercepts
+-- `chat.input.submit`, drives the reasoner-graph against the provider via
+-- a template orchestrator graph (provider-wrapper + tool-executor +
+-- adapter + terminal cycle), wires the spawn_graph tool, and surfaces
+-- run completions back to nefor-chat. See
+-- `starter/agentic_workflow.lua` for the full event flow.
 --
 -- Run:
 --   NEFOR_PLUGIN_DIR=$PWD/plugins cargo run --bin nefor -- --config ./starter
@@ -65,45 +56,8 @@ end
 -- 4. Plugin composition
 -------------------------------------------------------------------------
 
-local cc_adapter         = require("mock_plugin_adapter")
-local mk_openai_provider = require("openai_provider_adapter").make
-local rg_adapter         = require("reasoner_graph_adapter")
-local spawn_graph        = require("spawn_graph")
-local chat_orchestrator  = require("chat_orchestrator")
-
--- Compose two `{from_plugin, to_plugin}` transform pairs into one. The
--- inner adapter runs first; if it drops or rewrites the envelope the
--- outer adapter sees the result.
-local function compose_adapters(inner, outer)
-  local function chain_from(env)
-    local e = env
-    if inner.from_plugin then e = inner.from_plugin(e) end
-    if e == nil then return nil end
-    if outer.from_plugin then e = outer.from_plugin(e) end
-    return e
-  end
-  local function chain_to(env)
-    local e = env
-    if outer.to_plugin then e = outer.to_plugin(e) end
-    if e == nil then return nil end
-    if inner.to_plugin then e = inner.to_plugin(e) end
-    return e
-  end
-  return { from_plugin = chain_from, to_plugin = chain_to }
-end
-
--- Compose a list of adapters, left-to-right (first is innermost). Each
--- adapter is `{from_plugin, to_plugin}`; missing fields default to
--- identity. `from_plugin` runs in list order; `to_plugin` runs in
--- reverse.
-local function compose_chain(adapters)
-  if #adapters == 0 then return {} end
-  local result = adapters[1]
-  for i = 2, #adapters do
-    result = compose_adapters(result, adapters[i])
-  end
-  return result
-end
+local cc_adapter       = require("mock_plugin_adapter")
+local agentic_workflow = require("agentic_workflow")
 
 -- Plugin cwd is <plugin_root>/<name>/ (engine policy).
 local PROJECT_ROOT = STARTER_ROOT:match("^(.*)/[^/]+$") or "."
@@ -162,33 +116,22 @@ ncp.spawn {
 -- See `starter/mock_provider.lua` for the response selection logic.
 --
 -- For the real provider: one chat session per orchestrator instance;
--- the orchestrator's reasoner-graph adapter calls
--- `<name>.chat.create / chat.append / chat.complete` directly; the
--- legacy `chat.input.submit → <name>.prompt` adapter path is left
--- inert. The static_token=ollama-local trick unlocks openai-provider's
--- auth gate without a real key (required for local Ollama). Real
--- remote providers would supply an --api-key CLI arg.
+-- agentic_workflow's reasoner-graph adapter calls
+-- `<name>.chat.create / chat.append / chat.complete` directly. The
+-- static_token=ollama-local trick unlocks openai-provider's auth gate
+-- without a real key (required for local Ollama). Real remote providers
+-- would supply an --api-key CLI arg.
 local USE_MOCK_PROVIDER = false
 
-local PROVIDER_NAME, PROVIDER_MODEL, provider_chat, provider_spawn
+local PROVIDER_NAME, PROVIDER_MODEL, provider_chain, provider_command
 
 if USE_MOCK_PROVIDER then
   PROVIDER_NAME  = "mock-plugin"
   PROVIDER_MODEL = "mock-model"
-  -- mock-plugin's hardcoded plugin-name is "mock-plugin"; using anything
-  -- else would require a --name flag in mock-plugin's main.rs.
-  provider_chat = mk_openai_provider(PROVIDER_NAME)
-  provider_spawn = {
-    name        = PROVIDER_NAME,
-    command     = {
-      bin("mock-plugin"),
-      "--script", STARTER_ROOT .. "/mock_provider.lua",
-    },
-    from_plugin = compose_chain({
-      rg_adapter.for_provider(PROVIDER_NAME),
-      provider_chat,
-    }).from_plugin,
-    to_plugin   = provider_chat.to_plugin,
+  provider_chain = agentic_workflow.for_provider(PROVIDER_NAME)
+  provider_command = {
+    bin("mock-plugin"),
+    "--script", STARTER_ROOT .. "/mock_provider.lua",
   }
 else
   PROVIDER_NAME  = "ollama"
@@ -196,44 +139,26 @@ else
   -- strong tool-calling. Verified one-shot to emit a clean spawn_graph
   -- with proper terminal wiring; faster than the dense 27b model.
   PROVIDER_MODEL = "qwen3.6:35b-a3b-coding-mxfp8"
-  provider_chat = mk_openai_provider(PROVIDER_NAME, { static_token = "ollama-local" })
-  provider_spawn = {
-    name        = PROVIDER_NAME,
-    command     = {
-      bin("openai-provider"),
-      "--name",     PROVIDER_NAME,
-      "--base-url", "http://localhost:11434",
-      "--model",    PROVIDER_MODEL,
-    },
-    from_plugin = compose_chain({
-      rg_adapter.for_provider(PROVIDER_NAME),
-      provider_chat,
-    }).from_plugin,
-    to_plugin   = provider_chat.to_plugin,
+  provider_chain = agentic_workflow.for_provider(PROVIDER_NAME, { static_token = "ollama-local" })
+  provider_command = {
+    bin("openai-provider"),
+    "--name",     PROVIDER_NAME,
+    "--base-url", "http://localhost:11434",
+    "--model",    PROVIDER_MODEL,
   }
 end
 
-ncp.spawn(provider_spawn)
-
 -------------------------------------------------------------------------
--- 4c. Reasoner graph — three adapters co-attach
+-- 4c. Orchestrator setup — single configuration call
 -------------------------------------------------------------------------
 --
--- Order: type-adapter (innermost) → spawn_graph → chat orchestrator.
--- The type adapter handles `<reasoner>.run_node` egress (always); the
--- spawn_graph binding catches `graph.run_complete` for spawn_graph
--- sub-runs (matched by run_id) and emits `tool.result`; the chat
--- orchestrator catches `graph.run_complete` for chat-driven runs. The
--- gate-forwarded `spawn-graph-tool.tool.invoke` is caught on
--- tool-gate's egress chain (4d below), not here.
-
 -- Stage-1 system prompt: teaches the orchestrator model when and how
 -- to use `spawn_graph`. Kept terse on purpose — Gemma 3 reasons itself
 -- into a "stop" finish without committing to the tool call when the
 -- prompt is dense. Schema-only worked-example was enough to make it
 -- emit a well-formed graph reliably; the verbose version was not.
 -- Two reasoner types are documented because those are the ones
--- rg_adapter handles for sub-graphs (`responder` = one-shot LLM,
+-- agentic_workflow handles for sub-graphs (`responder` = one-shot LLM,
 -- `terminal` = sink); other reasoner types are private to the
 -- orchestrator's chat loop and would just confuse the model.
 local ORCHESTRATOR_SYSTEM_PROMPT = [[
@@ -252,57 +177,32 @@ To combine parallel branches into a single output, add a `responder` combine nod
 Emit the tool call directly after deciding the structure. For simple chat turns (no decomposition benefit), just answer directly.
 ]]
 
-chat_orchestrator.configure {
+agentic_workflow.setup {
   provider = PROVIDER_NAME,
   model    = PROVIDER_MODEL,
   system   = ORCHESTRATOR_SYSTEM_PROMPT,
 }
-rg_adapter.set_default_provider(PROVIDER_NAME, PROVIDER_MODEL)
--- next_state capture rides on rg_adapter's in-process observer hook.
--- A `to_plugin` transform on the reasoner-graph spawn would miss
--- `graph.node_result` envelopes — they're shipped via
--- `nefor.engine.send` from Lua and bypass the bus's transform stack.
-chat_orchestrator.attach_state_capture()
--- Async spawn_graph delivery: the chat orchestrator subscribes to
--- spawn_graph's in-process `on_completed` hook so deferred sub-graph
--- results can be injected as a fresh chat turn. Same rationale as
--- attach_state_capture — engine.send-emitted events bypass the bus
--- transform layer, so an in-process callback is the only viable path.
-chat_orchestrator.attach_spawn_graph_listener(spawn_graph)
--- Hand rg_adapter a reference to spawn_graph so its for_provider
--- stream.delta hook can release queued sub-graph dispatches the moment
--- the orchestrator's wrap chat starts streaming. See the comment block
--- inside spawn_graph's invoke handler for why we defer.
-rg_adapter.set_spawn_graph_module(spawn_graph)
 
-local rg_chain = compose_chain({
-  -- `for_starter()` is the innermost transform in the rg chain: it
-  -- watches reasoner-graph's own `ready` egress and emits
-  -- `reasoner-graph.register_reasoner { name }` for each Lua-resident
-  -- reasoner type (provider-wrapper, tool-executor, adapter, terminal,
-  -- dummy). Without this, the scheduler's connected-peer set never
-  -- learns those names and synthesises "reasoner '<name>' not
-  -- connected" on the first dispatch.
-  rg_adapter.for_starter(),
-  rg_adapter.for_reasoner_graph(),
-  spawn_graph.for_reasoner_graph(),
-  chat_orchestrator.for_reasoner_graph(),
-})
+ncp.spawn {
+  name        = PROVIDER_NAME,
+  command     = provider_command,
+  from_plugin = provider_chain.from_plugin,
+  to_plugin   = provider_chain.to_plugin,
+}
+
+-------------------------------------------------------------------------
+-- 4d. Reasoner graph
+-------------------------------------------------------------------------
 
 ncp.spawn {
   name        = "reasoner-graph",
   command     = { bin("reasoner-graph") },
-  from_plugin = rg_chain.from_plugin,
+  from_plugin = agentic_workflow.for_reasoner_graph().from_plugin,
 }
 
 -------------------------------------------------------------------------
--- 4d. Tool gate + basic-tools + spawn_graph advertisement
+-- 4e. Tool gate + basic-tools + spawn_graph advertisement
 -------------------------------------------------------------------------
-
-local gate_chain = compose_chain({
-  rg_adapter.for_tool_gate(),
-  spawn_graph.for_tool_gate("tool-gate"),
-})
 
 ncp.spawn {
   name        = "tool-gate",
@@ -311,7 +211,7 @@ ncp.spawn {
     "--prompt",  "read_file",
     "--default", "prompt",
   },
-  from_plugin = gate_chain.from_plugin,
+  from_plugin = agentic_workflow.for_tool_gate("tool-gate").from_plugin,
 }
 
 ncp.spawn {
@@ -320,18 +220,13 @@ ncp.spawn {
 }
 
 -------------------------------------------------------------------------
--- 4e. Chat (must come up before chat orchestrator works, but the chain
---     is set on its spawn so registration is just here)
+-- 4f. Chat
 -------------------------------------------------------------------------
-
-local chat_chain = compose_chain({
-  chat_orchestrator.for_chat(),
-})
 
 ncp.spawn {
   name        = "nefor-chat",
   command     = { bin("nefor-chat") },
-  from_plugin = chat_chain.from_plugin,
+  from_plugin = agentic_workflow.for_chat().from_plugin,
 }
 
 ncp.spawn {

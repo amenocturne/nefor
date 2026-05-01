@@ -5,24 +5,24 @@
 //! full Stage 1 wire (per parent spec §6.1):
 //!
 //! ```text
-//!   driver(chat.input.submit) → chat_orchestrator → reasoner-graph.run
+//!   driver(chat.input.submit) → agentic_workflow.for_chat → reasoner-graph.run
 //!     → combinators.query → nefor-combinators → combinators.query.result
 //!     → reasoner-graph dispatches provider-wrapper.run_node
-//!       → reasoner_graph_adapter → ollama.chat.{create,append,complete}
+//!       → agentic_workflow.for_reasoner_graph → ollama.chat.{create,append,complete}
 //!     → mock-plugin (impersonating openai-provider as "ollama") returns
 //!       chat.complete.result with tool_calls=[spawn_graph(...)]
-//!     → reasoner_graph_adapter → graph.node_result
+//!     → agentic_workflow.for_provider → graph.node_result
 //!     → reasoner-graph invokes tool_split → routes to tool-executor
 //!       → tool-gate.tool.invoke → tool-gate forwards as
 //!         spawn-graph-tool.tool.invoke (the virtual source name
-//!         spawn_graph.lua advertises under)
-//!       → spawn_graph binding (on tool-gate's egress chain) →
+//!         agentic_workflow registers spawn_graph under)
+//!       → agentic_workflow.for_tool_gate (on tool-gate's egress chain) →
 //!         reasoner-graph.run (sub-graph)
 //!     → sub-graph runs (also against mock-plugin)
 //!     → graph.run_complete (sub) → tool.result → loops back
 //!     → wrap re-fires → mock-plugin returns final text → tool_split routes
 //!       to terminal escape → graph.run_complete (outer)
-//!     → chat_orchestrator → chat.message.append → driver
+//!     → agentic_workflow.for_reasoner_graph → chat.message.append → driver
 //! ```
 //!
 //! mock-plugin stands in for openai-provider — its Lua script is
@@ -90,7 +90,6 @@ fn debug_dir() -> PathBuf {
 fn starter_dir() -> PathBuf {
     workspace_root().join("starter")
 }
-
 
 /// Build all plugin binaries we depend on. No-op on a warm cache.
 fn ensure_binaries_built() {
@@ -183,89 +182,37 @@ package.path = table.concat({
   package.path,
 }, ";")
 
-local ncp                = require("ncp")
-local rg_adapter         = require("reasoner_graph_adapter")
-local mk_openai_provider = require("openai_provider_adapter").make
-local spawn_graph        = require("spawn_graph")
-local chat_orchestrator  = require("chat_orchestrator")
+local ncp              = require("ncp")
+local agentic_workflow = require("agentic_workflow")
 
 function step(saved_log, current_log)
   ncp.step(saved_log, current_log)
 end
 
--- Compose two {from_plugin, to_plugin} pairs into one (as in the
--- shipping init.lua).
-local function compose_adapters(inner, outer)
-  local function chain_from(env)
-    local e = env
-    if inner.from_plugin then e = inner.from_plugin(e) end
-    if e == nil then return nil end
-    if outer.from_plugin then e = outer.from_plugin(e) end
-    return e
-  end
-  local function chain_to(env)
-    local e = env
-    if outer.to_plugin then e = outer.to_plugin(e) end
-    if e == nil then return nil end
-    if inner.to_plugin then e = inner.to_plugin(e) end
-    return e
-  end
-  return { from_plugin = chain_from, to_plugin = chain_to }
-end
-
-local function compose_chain(adapters)
-  if #adapters == 0 then return {} end
-  local result = adapters[1]
-  for i = 2, #adapters do
-    result = compose_adapters(result, adapters[i])
-  end
-  return result
-end
-
 local PROVIDER = "ollama"
 local MODEL    = "mock-model"
 
-chat_orchestrator.configure { provider = PROVIDER, model = MODEL }
-rg_adapter.set_default_provider(PROVIDER, MODEL)
+agentic_workflow.setup { provider = PROVIDER, model = MODEL }
 
--- Provider chain — type adapter (innermost) then chat-contract bridge.
-local provider_chat = mk_openai_provider(PROVIDER, { static_token = "ollama-local" })
-local provider_chain = compose_chain({
-  rg_adapter.for_provider(PROVIDER),
-  provider_chat,
-})
+-- Provider chain — agentic_workflow.for_provider already composes the
+-- rg-style + chat-contract transforms internally.
+local provider_chain = agentic_workflow.for_provider(PROVIDER, { static_token = "ollama-local" })
 ncp._test_set_transforms(PROVIDER, {
   from_plugin = provider_chain.from_plugin,
   to_plugin   = provider_chain.to_plugin,
 })
 
--- Reasoner-graph chain: starter (registers Lua-resident reasoner
--- types via reasoner-graph.register_reasoner) + type adapter +
--- spawn_graph + chat orchestrator.
-local rg_chain = compose_chain({
-  rg_adapter.for_starter(),
-  rg_adapter.for_reasoner_graph(),
-  spawn_graph.for_reasoner_graph(),
-  chat_orchestrator.for_reasoner_graph(),
-})
+local rg_chain = agentic_workflow.for_reasoner_graph()
 ncp._test_set_transforms("reasoner-graph", {
   from_plugin = rg_chain.from_plugin,
 })
 
--- Tool-gate chain: type adapter (intercepts tool.result) + spawn_graph
--- advertise hook (intercepts tool-gate.hello).
-local gate_chain = compose_chain({
-  rg_adapter.for_tool_gate(),
-  spawn_graph.for_tool_gate("tool-gate"),
-})
+local gate_chain = agentic_workflow.for_tool_gate("tool-gate")
 ncp._test_set_transforms("tool-gate", {
   from_plugin = gate_chain.from_plugin,
 })
 
--- Chat side — orchestrator intercepts chat.input.submit.
-local chat_chain = compose_chain({
-  chat_orchestrator.for_chat(),
-})
+local chat_chain = agentic_workflow.for_chat()
 ncp._test_set_transforms("nefor-chat", {
   from_plugin = chat_chain.from_plugin,
 })
@@ -448,6 +395,10 @@ async fn drain(driver: &mut Driver, window: Duration) -> Vec<Value> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
+// shared_guard holds the std::sync::Mutex briefly while we read the event
+// log; the awaits at the end of the test are after we drop it. Clippy
+// can't see through the explicit drop, so suppress at the function level.
+#[allow(clippy::await_holding_lock)]
 async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
     ensure_binaries_built();
 
@@ -495,23 +446,27 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
     // identical to the real openai-provider's `ollama.*` namespace.
     let combinators_spec = PluginSpec {
         name: PluginName::new("nefor-combinators").expect("valid name"),
-        command: vec![debug.join("nefor-combinators").display().to_string()],
+        command: Some(vec![debug.join("nefor-combinators").display().to_string()]),
+        has_cli: false,
     };
     let generic_provider_spec = PluginSpec {
         name: PluginName::new("generic-provider").expect("valid name"),
-        command: vec![debug.join("generic-provider").display().to_string()],
+        command: Some(vec![debug.join("generic-provider").display().to_string()]),
+        has_cli: false,
     };
     let generic_tool_spec = PluginSpec {
         name: PluginName::new("generic-tool").expect("valid name"),
-        command: vec![debug.join("generic-tool").display().to_string()],
+        command: Some(vec![debug.join("generic-tool").display().to_string()]),
+        has_cli: false,
     };
     let rg_spec = PluginSpec {
         name: PluginName::new("reasoner-graph").expect("valid name"),
-        command: vec![debug.join("reasoner-graph").display().to_string()],
+        command: Some(vec![debug.join("reasoner-graph").display().to_string()]),
+        has_cli: false,
     };
     let gate_spec = PluginSpec {
         name: PluginName::new("tool-gate").expect("valid name"),
-        command: vec![
+        command: Some(vec![
             debug.join("tool-gate").display().to_string(),
             // `auto` = "auto-allow unlisted tools" (the gate's no-prompt
             // mode). The starter's prod init.lua passes `prompt` instead
@@ -519,23 +474,26 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
             // no real chat to prompt, so auto-approve everything.
             "--default".into(),
             "auto".into(),
-        ],
+        ]),
+        has_cli: false,
     };
     let basic_tools_spec = PluginSpec {
         name: PluginName::new("basic-tools").expect("valid name"),
-        command: vec![
+        command: Some(vec![
             debug.join("basic-tools").display().to_string(),
             "--gate".into(),
             "tool-gate".into(),
-        ],
+        ]),
+        has_cli: false,
     };
     let ollama_spec = PluginSpec {
         name: PluginName::new("ollama").expect("valid name"),
-        command: vec![
+        command: Some(vec![
             debug.join("mock-plugin").display().to_string(),
             "--script".into(),
             mock_script.display().to_string(),
-        ],
+        ]),
+        has_cli: false,
     };
 
     // Spawn order matches §6.1's policy: registry → canonical → reasoner →
@@ -754,7 +712,9 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
          for spawn_graph; saw kinds: {log_kinds:?}"
     );
     assert!(
-        log_kinds.iter().any(|k| k == "spawn-graph-tool.tool.invoke"),
+        log_kinds
+            .iter()
+            .any(|k| k == "spawn-graph-tool.tool.invoke"),
         "expected tool-gate to forward the spawn_graph invoke as \
          spawn-graph-tool.tool.invoke (source: spawn-graph-tool, the \
          virtual source name spawn_graph.lua advertises under); saw \
@@ -797,7 +757,9 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
         .iter()
         .filter_map(|entry| serde_json::from_str::<Value>(&entry.payload).ok())
         .filter(|v| {
-            v.get("body").and_then(|b| b.get("kind")).and_then(Value::as_str)
+            v.get("body")
+                .and_then(|b| b.get("kind"))
+                .and_then(Value::as_str)
                 == Some("graph.run_complete")
         })
         .find(|v| {
@@ -820,7 +782,10 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
         .and_then(|b| b.get("status"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    assert_eq!(status, "success", "outer run did not succeed: {outer_complete:?}");
+    assert_eq!(
+        status, "success",
+        "outer run did not succeed: {outer_complete:?}"
+    );
     let text = outer_complete
         .get("body")
         .and_then(|b| b.get("results"))
@@ -828,9 +793,7 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
         .and_then(|t| t.get("output"))
         .and_then(|o| o.get("text"))
         .and_then(Value::as_str)
-        .unwrap_or_else(|| {
-            panic!("terminal output missing text: {outer_complete:?}")
-        });
+        .unwrap_or_else(|| panic!("terminal output missing text: {outer_complete:?}"));
     assert!(
         text.contains("FINAL"),
         "terminal text mismatch: {text:?}; full log kinds: {log_kinds:?}"
