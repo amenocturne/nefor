@@ -882,6 +882,7 @@ pub struct ChatState {
     /// in-flight chat run) to `Action::InterruptAll` (cancel chat + all
     /// sub-graph runs, drop deferred queue). `None` if no ESC has been
     /// pressed yet, or if the previous ESC was outside the window.
+    #[allow(dead_code)] // read by main.rs; tests/render.rs #[path]-includes state.rs without main
     pub last_escape_at: Option<Instant>,
     /// Submitted-prompt history, oldest first. Up/Down on an empty input
     /// buffer recall older/newer entries — same convention as a shell.
