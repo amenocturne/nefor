@@ -465,3 +465,28 @@ fn scenario_5_help_via_double_dash() {
         truncate(&out.stdout, 1024)
     );
 }
+
+// --------------------------------------------------------------------
+// scenario 6 — --yolo accepted (placeholder, no behavioural assertion)
+// --------------------------------------------------------------------
+
+#[test]
+fn scenario_6_yolo_flag_accepted() {
+    ensure_built();
+    let out = run_scenario(&["--yolo", SPAWN_GRAPH_PROMPT], None);
+    assert_success(&out);
+
+    // --yolo is a placeholder per agentic_workflow.set_yolo. Behaviour
+    // should be identical to the non-yolo run — assert the canonical
+    // answer still flows. We don't assert on tool-gate behaviour: the
+    // gate hookup is explicitly deferred (Phase 1B).
+    let lc = out.stdout.to_lowercase();
+    for needle in ["octopus", "lighthouse"] {
+        assert!(
+            lc.contains(needle),
+            "expected --yolo run to still produce canonical answer; \
+             missing {needle:?}; stdout: {:?}",
+            truncate(&out.stdout, 2048)
+        );
+    }
+}
