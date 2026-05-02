@@ -19,7 +19,7 @@
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::desc::{Alignment, Style, WidgetDescription, WrapMode};
+use crate::desc::{Alignment, Anchor, Dimension, Style, WidgetDescription, WrapMode};
 use crate::instance::{InstanceKind, WidgetInstance};
 use crate::render::{Cell, FrameBuffer};
 
@@ -106,6 +106,7 @@ pub fn layout(inst: &mut WidgetInstance, c: Constraints) -> Size {
         InstanceKind::Spacer => layout_spacer(inst, c),
         InstanceKind::Constrained => layout_constrained(inst, c),
         InstanceKind::Align => layout_align(inst, c),
+        InstanceKind::Anchored => layout_anchored(inst, c),
     };
     inst.layout.size = size;
     size
@@ -126,6 +127,7 @@ pub fn paint(inst: &WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
         InstanceKind::Expanded | InstanceKind::Constrained => paint_passthrough(inst, rect, out),
         InstanceKind::Spacer => { /* empty */ }
         InstanceKind::Align => paint_align(inst, rect, out),
+        InstanceKind::Anchored => paint_anchored(inst, rect, out),
     }
 }
 
@@ -624,6 +626,129 @@ fn paint_align(inst: &WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
     paint(child, child_rect, out);
 }
 
+// ── Anchored ─────────────────────────────────────────────────────────────
+
+fn layout_anchored(inst: &mut WidgetInstance, c: Constraints) -> Size {
+    let (width, height) = match &inst.last_desc {
+        WidgetDescription::Anchored { width, height, .. } => (*width, *height),
+        _ => unreachable!(),
+    };
+
+    // Resolve fixed/percent dimensions up-front against the parent's max.
+    // `Intrinsic` is left unresolved here; we ask the child to lay itself
+    // out under loose bounds and read its measured size.
+    let resolved_w = resolve_dimension(width, c.max_width);
+    let resolved_h = resolve_dimension(height, c.max_height);
+
+    let child_constraints = Constraints {
+        min_width: resolved_w.unwrap_or(0),
+        max_width: resolved_w.unwrap_or(c.max_width),
+        min_height: resolved_h.unwrap_or(0),
+        max_height: resolved_h.unwrap_or(c.max_height),
+    };
+
+    let child_size = match inst.children.first_mut() {
+        Some(child) => layout(child, child_constraints),
+        None => Size::default(),
+    };
+
+    // Final child size: explicit dim wins over measured size; clamp to parent.
+    let final_w = resolved_w.unwrap_or(child_size.width).min(c.max_width);
+    let final_h = resolved_h.unwrap_or(child_size.height).min(c.max_height);
+    inst.layout.anchored_child_size = Some(Size {
+        width: final_w,
+        height: final_h,
+    });
+
+    // Anchored claims all available space — paint the child within.
+    c.constrain(Size {
+        width: c.max_width,
+        height: c.max_height,
+    })
+}
+
+fn paint_anchored(inst: &WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
+    let (anchor, offset_x, offset_y) = match &inst.last_desc {
+        WidgetDescription::Anchored {
+            anchor,
+            offset_x,
+            offset_y,
+            ..
+        } => (*anchor, *offset_x, *offset_y),
+        _ => return,
+    };
+    let Some(child) = inst.children.first() else {
+        return;
+    };
+    let child_size = inst.layout.anchored_child_size.unwrap_or(child.layout.size);
+    let cw = child_size.width.min(rect.width);
+    let ch = child_size.height.min(rect.height);
+    if cw == 0 || ch == 0 {
+        return;
+    }
+    let (row, col) = anchor_position(anchor, rect.width, rect.height, cw, ch, offset_x, offset_y);
+    let max_col = rect.width.saturating_sub(cw);
+    let max_row = rect.height.saturating_sub(ch);
+    let row = row.min(max_row);
+    let col = col.min(max_col);
+    let child_rect = Rect {
+        row: rect.row.saturating_add(row),
+        col: rect.col.saturating_add(col),
+        width: cw,
+        height: ch,
+    };
+    paint(child, child_rect, out);
+}
+
+/// Resolve a [`Dimension`] against `axis_max`. Returns `None` for
+/// `Intrinsic`, which signals the caller to fall back to the child's
+/// measured size.
+fn resolve_dimension(d: Dimension, axis_max: u16) -> Option<u16> {
+    match d {
+        Dimension::Intrinsic => None,
+        Dimension::Cells(n) => Some(n.min(axis_max)),
+        Dimension::Percent(p) => Some(((axis_max as u32 * p as u32) / 100) as u16),
+    }
+}
+
+/// Compute the child's `(row, col)` inside the parent rect for the given
+/// anchor, then apply the cell offset. Negative offsets shift toward the
+/// origin and saturate at zero.
+fn anchor_position(
+    a: Anchor,
+    parent_w: u16,
+    parent_h: u16,
+    cw: u16,
+    ch: u16,
+    offset_x: i16,
+    offset_y: i16,
+) -> (u16, u16) {
+    let h_extra = parent_w.saturating_sub(cw);
+    let v_extra = parent_h.saturating_sub(ch);
+    let (base_row, base_col) = match a {
+        Anchor::TopLeft => (0u16, 0u16),
+        Anchor::Top => (0, h_extra / 2),
+        Anchor::TopRight => (0, h_extra),
+        Anchor::Left => (v_extra / 2, 0),
+        Anchor::Center => (v_extra / 2, h_extra / 2),
+        Anchor::Right => (v_extra / 2, h_extra),
+        Anchor::BottomLeft => (v_extra, 0),
+        Anchor::Bottom => (v_extra, h_extra / 2),
+        Anchor::BottomRight => (v_extra, h_extra),
+    };
+    let row = apply_offset(base_row, offset_y);
+    let col = apply_offset(base_col, offset_x);
+    (row, col)
+}
+
+fn apply_offset(base: u16, delta: i16) -> u16 {
+    if delta >= 0 {
+        base.saturating_add(delta as u16)
+    } else {
+        base.saturating_sub(delta.unsigned_abs())
+    }
+}
+
 /// Compute (row_offset, col_offset) of a `(child_w × child_h)` box inside
 /// a `(parent_w × parent_h)` rect, per [`Alignment`]. Saturates to zero
 /// when the child is bigger than the parent (paint then clips).
@@ -851,7 +976,7 @@ pub fn layout_and_paint(root: &mut WidgetInstance, width: u16, height: u16, out:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::desc::{Alignment, WidgetDescription, WrapMode};
+    use crate::desc::{Alignment, Anchor, Dimension, WidgetDescription, WrapMode};
     use crate::reconciler::Reconciler;
     use crate::render::FrameBuffer;
 
@@ -1276,5 +1401,259 @@ mod tests {
     fn explicit_newline_breaks_line() {
         let rows = wrap_text("a\nb", 10, WrapMode::Word);
         assert_eq!(rows, vec!["a", "b"]);
+    }
+
+    fn anchored(
+        child: WidgetDescription,
+        anchor: Anchor,
+        width: Dimension,
+        height: Dimension,
+        offset_x: i16,
+        offset_y: i16,
+    ) -> WidgetDescription {
+        WidgetDescription::Anchored {
+            anchor,
+            offset_x,
+            offset_y,
+            width,
+            height,
+            child: Box::new(child),
+            key: None,
+        }
+    }
+
+    #[test]
+    fn anchor_position_for_each_anchor_with_small_child() {
+        // Parent 12×6, child 2×2.
+        let cases = [
+            (Anchor::TopLeft, (0, 0)),
+            (Anchor::Top, (0, 5)),
+            (Anchor::TopRight, (0, 10)),
+            (Anchor::Left, (2, 0)),
+            (Anchor::Center, (2, 5)),
+            (Anchor::Right, (2, 10)),
+            (Anchor::BottomLeft, (4, 0)),
+            (Anchor::Bottom, (4, 5)),
+            (Anchor::BottomRight, (4, 10)),
+        ];
+        for (a, (row, col)) in cases {
+            assert_eq!(
+                anchor_position(a, 12, 6, 2, 2, 0, 0),
+                (row, col),
+                "anchor {a:?} mispositions"
+            );
+        }
+    }
+
+    #[test]
+    fn anchored_center_paints_at_middle() {
+        // 12×4 frame, child "AB" (2×1) → center at row 1, col (12-2)/2 = 5.
+        let desc = anchored(
+            text("AB"),
+            Anchor::Center,
+            Dimension::Intrinsic,
+            Dimension::Intrinsic,
+            0,
+            0,
+        );
+        let buf = paint_root(desc, 12, 4);
+        assert_eq!(cell_at(&buf, 1, 5), "A");
+        assert_eq!(cell_at(&buf, 1, 6), "B");
+        // Surrounding cells are blank — anchored doesn't paint outside the
+        // child rect, leaving the parent framebuffer untouched.
+        assert_eq!(cell_at(&buf, 0, 0), " ");
+        assert_eq!(cell_at(&buf, 3, 11), " ");
+    }
+
+    #[test]
+    fn anchored_top_left_paints_at_origin() {
+        let desc = anchored(
+            text("XY"),
+            Anchor::TopLeft,
+            Dimension::Intrinsic,
+            Dimension::Intrinsic,
+            0,
+            0,
+        );
+        let buf = paint_root(desc, 8, 3);
+        assert_eq!(cell_at(&buf, 0, 0), "X");
+        assert_eq!(cell_at(&buf, 0, 1), "Y");
+    }
+
+    #[test]
+    fn anchored_bottom_right_paints_at_far_corner() {
+        let desc = anchored(
+            text("MN"),
+            Anchor::BottomRight,
+            Dimension::Intrinsic,
+            Dimension::Intrinsic,
+            0,
+            0,
+        );
+        let buf = paint_root(desc, 10, 4);
+        // h_extra = 10-2 = 8, v_extra = 4-1 = 3 → starts at (3, 8)
+        assert_eq!(cell_at(&buf, 3, 8), "M");
+        assert_eq!(cell_at(&buf, 3, 9), "N");
+    }
+
+    #[test]
+    fn anchored_percent_width_resolves_against_parent() {
+        // 20-col parent, width = "50%" → child measured at 10 cols.
+        let desc = anchored(
+            text("hello world"),
+            Anchor::TopLeft,
+            Dimension::Percent(50),
+            Dimension::Intrinsic,
+            0,
+            0,
+        );
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let root = rec.root.as_mut().unwrap();
+        let _ = layout(root, Constraints::loose(20, 5));
+        let cs = root.layout.anchored_child_size.expect("anchored size");
+        assert_eq!(cs.width, 10);
+    }
+
+    #[test]
+    fn anchored_offset_shifts_position() {
+        // Center of a 10×4 with child 2×1 = (1, 4); +offset (1, 1) = (2, 5).
+        let desc = anchored(
+            text("AB"),
+            Anchor::Center,
+            Dimension::Intrinsic,
+            Dimension::Intrinsic,
+            1,
+            1,
+        );
+        let buf = paint_root(desc, 10, 4);
+        assert_eq!(cell_at(&buf, 2, 5), "A");
+        assert_eq!(cell_at(&buf, 2, 6), "B");
+    }
+
+    #[test]
+    fn anchored_negative_offset_shifts_toward_origin() {
+        // Center → (1, 4); -1, -1 → (0, 3).
+        let desc = anchored(
+            text("AB"),
+            Anchor::Center,
+            Dimension::Intrinsic,
+            Dimension::Intrinsic,
+            -1,
+            -1,
+        );
+        let buf = paint_root(desc, 10, 4);
+        assert_eq!(cell_at(&buf, 0, 3), "A");
+        assert_eq!(cell_at(&buf, 0, 4), "B");
+    }
+
+    #[test]
+    fn anchored_negative_offset_saturates_at_zero() {
+        // Top-left + negative offset clamps at origin (no underflow).
+        let desc = anchored(
+            text("AB"),
+            Anchor::TopLeft,
+            Dimension::Intrinsic,
+            Dimension::Intrinsic,
+            -10,
+            -10,
+        );
+        let buf = paint_root(desc, 8, 3);
+        assert_eq!(cell_at(&buf, 0, 0), "A");
+        assert_eq!(cell_at(&buf, 0, 1), "B");
+    }
+
+    #[test]
+    fn anchored_fixed_width_clamps_to_parent() {
+        // Requested width 100 in a 10-col parent → clamped to 10.
+        let desc = anchored(
+            text("hi"),
+            Anchor::TopLeft,
+            Dimension::Cells(100),
+            Dimension::Intrinsic,
+            0,
+            0,
+        );
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let root = rec.root.as_mut().unwrap();
+        let _ = layout(root, Constraints::loose(10, 3));
+        let cs = root.layout.anchored_child_size.expect("anchored size");
+        assert_eq!(cs.width, 10);
+    }
+
+    #[test]
+    fn anchored_size_fills_parent() {
+        // Anchored claims the full parent rect regardless of child size.
+        let desc = anchored(
+            text("a"),
+            Anchor::Center,
+            Dimension::Intrinsic,
+            Dimension::Intrinsic,
+            0,
+            0,
+        );
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let root = rec.root.as_mut().unwrap();
+        let s = layout(root, Constraints::loose(20, 5));
+        assert_eq!(
+            s,
+            Size {
+                width: 20,
+                height: 5
+            }
+        );
+    }
+
+    #[test]
+    fn anchored_child_larger_than_parent_clips_at_anchor_side() {
+        // Child 6×3 inside a 4×2 parent, anchored bottom-right.
+        // Resolved child size clamps to parent (4×2); anchor offsets clamp to 0.
+        let desc = anchored(
+            text("ABCDEF"),
+            Anchor::BottomRight,
+            Dimension::Intrinsic,
+            Dimension::Intrinsic,
+            0,
+            0,
+        );
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let root = rec.root.as_mut().unwrap();
+        let _ = layout(root, Constraints::loose(4, 2));
+        let cs = root.layout.anchored_child_size.expect("anchored size");
+        // child measured 6×1 inside loose bounds (text wraps to width 4 →
+        // multiple rows). Either way, clamped to parent width.
+        assert!(cs.width <= 4);
+        assert!(cs.height <= 2);
+    }
+
+    #[test]
+    fn anchored_inside_stack_overlays_centered() {
+        // stack { text("background"), anchored center { text("X") } }
+        // 11×3 → "X" lands at (1, 5).
+        let desc = WidgetDescription::Stack {
+            key: None,
+            children: vec![
+                text("aaaaaaaaaaa"),
+                anchored(
+                    text("X"),
+                    Anchor::Center,
+                    Dimension::Intrinsic,
+                    Dimension::Intrinsic,
+                    0,
+                    0,
+                ),
+            ],
+        };
+        let buf = paint_root(desc, 11, 3);
+        assert_eq!(cell_at(&buf, 1, 5), "X", "popup centered over background");
+        assert_eq!(cell_at(&buf, 0, 0), "a", "background preserved at top-left");
+        assert_eq!(
+            cell_at(&buf, 0, 10),
+            "a",
+            "background preserved at top-right"
+        );
     }
 }

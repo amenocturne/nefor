@@ -63,6 +63,15 @@ pub enum WidgetDescription {
         child: Box<WidgetDescription>,
         key: Option<String>,
     },
+    Anchored {
+        anchor: Anchor,
+        offset_x: i16,
+        offset_y: i16,
+        width: Dimension,
+        height: Dimension,
+        child: Box<WidgetDescription>,
+        key: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +87,33 @@ pub enum Alignment {
     BottomRight,
 }
 
+/// Anchor positions for `tui.anchored`. Mirrors [`Alignment`] but stays a
+/// distinct type so future divergence (e.g. anchor-only "follow-cursor"
+/// variants) doesn't leak into the alignment switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Anchor {
+    TopLeft,
+    Top,
+    TopRight,
+    Left,
+    Center,
+    Right,
+    BottomLeft,
+    Bottom,
+    BottomRight,
+}
+
+/// Width / height value for `tui.anchored`. `Intrinsic` lays the child out
+/// against the parent's loose bounds and uses its measured size; `Cells`
+/// pins to an absolute cell count; `Percent` resolves against the parent's
+/// max on that axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dimension {
+    Intrinsic,
+    Cells(u16),
+    Percent(u8),
+}
+
 impl WidgetDescription {
     /// Static type tag used as half of the reconciler's match key.
     pub fn type_tag(&self) -> &'static str {
@@ -91,6 +127,7 @@ impl WidgetDescription {
             WidgetDescription::Spacer { .. } => "spacer",
             WidgetDescription::Constrained { .. } => "constrained",
             WidgetDescription::Align { .. } => "align",
+            WidgetDescription::Anchored { .. } => "anchored",
         }
     }
 
@@ -105,7 +142,8 @@ impl WidgetDescription {
             | WidgetDescription::Expanded { key, .. }
             | WidgetDescription::Spacer { key, .. }
             | WidgetDescription::Constrained { key, .. }
-            | WidgetDescription::Align { key, .. } => key.as_deref(),
+            | WidgetDescription::Align { key, .. }
+            | WidgetDescription::Anchored { key, .. } => key.as_deref(),
         }
     }
 }
@@ -163,8 +201,9 @@ pub fn from_lua_table(t: &Table) -> Result<WidgetDescription, TuiError> {
         "spacer" => parse_spacer(t),
         "constrained" => parse_constrained(t),
         "align" => parse_align(t),
+        "anchored" => parse_anchored(t),
         other => Err(TuiError::InvalidDesc(format!(
-            "unknown widget kind `{other}`; expected one of: text, column, row, padding, stack, expanded, spacer, constrained, align"
+            "unknown widget kind `{other}`; expected one of: text, column, row, padding, stack, expanded, spacer, constrained, align, anchored"
         ))),
     }
 }
@@ -338,6 +377,133 @@ fn parse_align(t: &Table) -> Result<WidgetDescription, TuiError> {
         child,
         key,
     })
+}
+
+fn parse_anchored(t: &Table) -> Result<WidgetDescription, TuiError> {
+    let anchor = match t.get::<Value>("anchor")? {
+        Value::Nil => Anchor::Center,
+        Value::String(s) => parse_anchor_str(&s.to_str()?)?,
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.anchored: `anchor` must be a string (got {})",
+                other.type_name()
+            )));
+        }
+    };
+    let offset_x = parse_i16(t, "offset_x", 0, "tui.anchored")?;
+    let offset_y = parse_i16(t, "offset_y", 0, "tui.anchored")?;
+    let width = parse_dimension(t, "width")?;
+    let height = parse_dimension(t, "height")?;
+    let child_val: Value = t.get("child")?;
+    let child_tbl = match child_val {
+        Value::Table(t) => t,
+        Value::Nil => {
+            return Err(TuiError::InvalidDesc(
+                "tui.anchored: `child` is required".into(),
+            ));
+        }
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.anchored: `child` must be a widget table (got {})",
+                other.type_name()
+            )));
+        }
+    };
+    let child = Box::new(from_lua_table(&child_tbl)?);
+    let key = parse_key(t)?;
+    Ok(WidgetDescription::Anchored {
+        anchor,
+        offset_x,
+        offset_y,
+        width,
+        height,
+        child,
+        key,
+    })
+}
+
+fn parse_anchor_str(s: &str) -> Result<Anchor, TuiError> {
+    match s {
+        "top-left" => Ok(Anchor::TopLeft),
+        "top" => Ok(Anchor::Top),
+        "top-right" => Ok(Anchor::TopRight),
+        "left" => Ok(Anchor::Left),
+        "center" => Ok(Anchor::Center),
+        "right" => Ok(Anchor::Right),
+        "bottom-left" => Ok(Anchor::BottomLeft),
+        "bottom" => Ok(Anchor::Bottom),
+        "bottom-right" => Ok(Anchor::BottomRight),
+        other => Err(TuiError::InvalidDesc(format!(
+            "tui.anchored: `anchor` must be one of top-left|top|top-right|left|center|right|bottom-left|bottom|bottom-right (got `{other}`)"
+        ))),
+    }
+}
+
+fn parse_dimension(t: &Table, key: &str) -> Result<Dimension, TuiError> {
+    match t.get::<Value>(key)? {
+        Value::Nil => Ok(Dimension::Intrinsic),
+        Value::Integer(n) => clamp_u16(n, &format!("tui.anchored.{key}")).map(Dimension::Cells),
+        Value::Number(n) => clamp_u16_f(n, &format!("tui.anchored.{key}")).map(Dimension::Cells),
+        Value::String(s) => parse_percent(&s.to_str()?, key).map(Dimension::Percent),
+        other => Err(TuiError::InvalidDesc(format!(
+            "tui.anchored: `{key}` must be nil, an integer, or a percent string like \"50%\" (got {})",
+            other.type_name()
+        ))),
+    }
+}
+
+fn parse_percent(s: &str, key: &str) -> Result<u8, TuiError> {
+    let trimmed = s.trim();
+    let body = trimmed.strip_suffix('%').ok_or_else(|| {
+        TuiError::InvalidDesc(format!(
+            "tui.anchored: `{key}` string must end with `%` (got `{trimmed}`)"
+        ))
+    })?;
+    let n: u32 = body.trim().parse().map_err(|_| {
+        TuiError::InvalidDesc(format!(
+            "tui.anchored: `{key}` must be `N%` where N is an integer (got `{trimmed}`)"
+        ))
+    })?;
+    if n > 100 {
+        return Err(TuiError::InvalidDesc(format!(
+            "tui.anchored: `{key}` must be 0%..=100% (got `{trimmed}`)"
+        )));
+    }
+    Ok(n as u8)
+}
+
+fn parse_i16(t: &Table, key: &str, default: i16, ctx: &str) -> Result<i16, TuiError> {
+    match t.get::<Value>(key)? {
+        Value::Nil => Ok(default),
+        Value::Integer(n) => clamp_i16(n, &format!("{ctx}.{key}")),
+        Value::Number(n) => clamp_i16_f(n, &format!("{ctx}.{key}")),
+        other => Err(TuiError::InvalidDesc(format!(
+            "{ctx}: `{key}` must be a number (got {})",
+            other.type_name()
+        ))),
+    }
+}
+
+fn clamp_i16(n: i64, ctx: &str) -> Result<i16, TuiError> {
+    if !(i16::MIN as i64..=i16::MAX as i64).contains(&n) {
+        return Err(TuiError::InvalidDesc(format!(
+            "{ctx}: must be in {}..={} (got {n})",
+            i16::MIN,
+            i16::MAX
+        )));
+    }
+    Ok(n as i16)
+}
+
+fn clamp_i16_f(n: f64, ctx: &str) -> Result<i16, TuiError> {
+    if !n.is_finite() || !(i16::MIN as f64..=i16::MAX as f64).contains(&n) {
+        return Err(TuiError::InvalidDesc(format!(
+            "{ctx}: must be in {}..={} (got {n})",
+            i16::MIN,
+            i16::MAX
+        )));
+    }
+    Ok(n as i16)
 }
 
 fn parse_alignment_str(s: &str) -> Result<Alignment, TuiError> {
@@ -948,5 +1114,133 @@ mod tests {
         let t = eval_table(&l, r#"return { content = "x" }"#);
         let err = from_lua_table(&t).unwrap_err();
         assert!(format!("{err}").contains("missing `_tui_kind`"));
+    }
+
+    #[test]
+    fn anchored_table_parses_with_defaults() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"
+            return {
+              _tui_kind = "anchored",
+              child = { _tui_kind = "text", content = "x" },
+            }
+        "#,
+        );
+        let d = from_lua_table(&t).expect("parse");
+        match d {
+            WidgetDescription::Anchored {
+                anchor,
+                offset_x,
+                offset_y,
+                width,
+                height,
+                ..
+            } => {
+                assert_eq!(anchor, Anchor::Center);
+                assert_eq!(offset_x, 0);
+                assert_eq!(offset_y, 0);
+                assert_eq!(width, Dimension::Intrinsic);
+                assert_eq!(height, Dimension::Intrinsic);
+            }
+            _ => panic!("expected anchored"),
+        }
+    }
+
+    #[test]
+    fn anchored_table_parses_percent_and_offsets() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"
+            return {
+              _tui_kind = "anchored",
+              anchor = "top-right",
+              offset_x = -2,
+              offset_y = 3,
+              width = "60%",
+              height = 4,
+              child = { _tui_kind = "text", content = "x" },
+            }
+        "#,
+        );
+        let d = from_lua_table(&t).expect("parse");
+        match d {
+            WidgetDescription::Anchored {
+                anchor,
+                offset_x,
+                offset_y,
+                width,
+                height,
+                ..
+            } => {
+                assert_eq!(anchor, Anchor::TopRight);
+                assert_eq!(offset_x, -2);
+                assert_eq!(offset_y, 3);
+                assert_eq!(width, Dimension::Percent(60));
+                assert_eq!(height, Dimension::Cells(4));
+            }
+            _ => panic!("expected anchored"),
+        }
+    }
+
+    #[test]
+    fn anchored_unknown_anchor_errors() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"
+            return {
+              _tui_kind = "anchored",
+              anchor = "northwest",
+              child = { _tui_kind = "text", content = "x" },
+            }
+        "#,
+        );
+        let err = from_lua_table(&t).unwrap_err();
+        assert!(format!("{err}").contains("anchor"));
+    }
+
+    #[test]
+    fn anchored_invalid_percent_errors() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"
+            return {
+              _tui_kind = "anchored",
+              width = "fifty",
+              child = { _tui_kind = "text", content = "x" },
+            }
+        "#,
+        );
+        let err = from_lua_table(&t).unwrap_err();
+        assert!(format!("{err}").contains("`%`") || format!("{err}").contains("integer"));
+    }
+
+    #[test]
+    fn anchored_percent_over_100_errors() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"
+            return {
+              _tui_kind = "anchored",
+              width = "150%",
+              child = { _tui_kind = "text", content = "x" },
+            }
+        "#,
+        );
+        let err = from_lua_table(&t).unwrap_err();
+        assert!(format!("{err}").contains("0%..=100%"));
+    }
+
+    #[test]
+    fn anchored_requires_child() {
+        let l = lua();
+        let t = eval_table(&l, r#"return { _tui_kind = "anchored" }"#);
+        let err = from_lua_table(&t).unwrap_err();
+        assert!(format!("{err}").contains("`child` is required"));
     }
 }

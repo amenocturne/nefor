@@ -80,7 +80,8 @@ fn mount_subtree(
         WidgetDescription::Padding { child, .. }
         | WidgetDescription::Expanded { child, .. }
         | WidgetDescription::Constrained { child, .. }
-        | WidgetDescription::Align { child, .. } => {
+        | WidgetDescription::Align { child, .. }
+        | WidgetDescription::Anchored { child, .. } => {
             vec![mount_subtree((**child).clone(), 0, summary)]
         }
     };
@@ -110,7 +111,8 @@ fn update_instance(
         WidgetDescription::Padding { child, .. }
         | WidgetDescription::Expanded { child, .. }
         | WidgetDescription::Constrained { child, .. }
-        | WidgetDescription::Align { child, .. } => vec![(**child).clone()],
+        | WidgetDescription::Align { child, .. }
+        | WidgetDescription::Anchored { child, .. } => vec![(**child).clone()],
     };
 
     inst.children = reconcile_children(std::mem::take(&mut inst.children), new_children, summary);
