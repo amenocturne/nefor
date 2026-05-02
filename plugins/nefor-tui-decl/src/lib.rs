@@ -10,6 +10,7 @@ pub mod desc;
 pub mod engine;
 pub mod error;
 pub mod input;
+pub mod input_router;
 pub mod instance;
 pub mod layout;
 pub mod lua_host;

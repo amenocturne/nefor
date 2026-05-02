@@ -147,3 +147,22 @@ pub fn instance_key(desc: &WidgetDescription, position: usize) -> InstanceKey {
     };
     InstanceKey { type_tag, id }
 }
+
+/// Walk the instance tree and reconcile each `text_input`'s internal
+/// editing state with its description. Called once after every
+/// reconcile so the input router and the layout/paint pass observe a
+/// fresh `last_value` and `focused` flag.
+pub fn sync_text_inputs(inst: &mut WidgetInstance) {
+    if matches!(inst.kind(), InstanceKind::TextInput) {
+        if let WidgetDescription::TextInput { value, focused, .. } = &inst.last_desc {
+            let v = value.clone();
+            let f = *focused;
+            if let InstanceState::TextInput(s) = &mut inst.state {
+                s.sync_with_desc(&v, f);
+            }
+        }
+    }
+    for c in inst.children.iter_mut() {
+        sync_text_inputs(c);
+    }
+}

@@ -6,6 +6,8 @@
 
 use crate::error::TuiError;
 use crate::input::KeyMessage;
+use crate::input_router::{route_key, RouteDecision};
+use crate::instance::sync_text_inputs;
 use crate::lua_host::{LuaHost, SideEffect};
 use crate::reconciler::Reconciler;
 use crate::render::Renderer;
@@ -43,10 +45,48 @@ impl Engine {
         self.lua.lua()
     }
 
-    /// Dispatch a [`KeyMessage`]. Always sets the dirty flag in phase 1
-    /// (always-dirty after dispatch is acceptable per orchestrator
-    /// override Q2).
+    /// Dispatch a [`KeyMessage`]. The router first inspects the current
+    /// reconciled tree: if a focused `text_input` exists and the key is
+    /// an editing key, the router mutates the input's internal state in
+    /// place and dispatches the configured `on_change` / `on_submit`
+    /// callbacks to Lua. Otherwise the key bubbles to Lua as
+    /// `{ kind = "key.<name>", mods = [...] }`.
     pub fn handle_key(&mut self, key: KeyMessage) -> Result<(), TuiError> {
+        // Ensure we have a current reconciled tree so the router can
+        // inspect the latest description. The first key event would
+        // otherwise see an empty reconciler.
+        self.ensure_reconciled()?;
+
+        if let Some(root) = self.reconciler.root.as_mut() {
+            match route_key(root, &key) {
+                RouteDecision::HandledByTextInput {
+                    target_key,
+                    on_change,
+                    on_submit,
+                    value,
+                    value_changed,
+                    submitted,
+                } => {
+                    if value_changed {
+                        if let Some(kind) = on_change {
+                            self.dispatch_named(&kind, &target_key, Some(&value))?;
+                        }
+                    }
+                    if submitted {
+                        if let Some(kind) = on_submit {
+                            self.dispatch_named(&kind, &target_key, Some(&value))?;
+                        }
+                    }
+                    // Even with no Lua-visible callbacks (e.g. cursor
+                    // moves, copy with no clipboard), set dirty so the
+                    // next render repaints the cursor / selection.
+                    self.needs_render = true;
+                    return Ok(());
+                }
+                RouteDecision::BubbleToLua => {}
+            }
+        }
+
         let msg = self.lua().create_table()?;
         msg.set("kind", key.kind())?;
         let mods = self.lua().create_table()?;
@@ -55,6 +95,38 @@ impl Engine {
         }
         msg.set("mods", mods)?;
         self.dispatch_msg(msg)
+    }
+
+    /// Build `{ kind, target_key, value? }` and dispatch through Lua's
+    /// `update`. Used to relay text_input `on_change` / `on_submit`
+    /// callbacks.
+    fn dispatch_named(
+        &mut self,
+        kind: &str,
+        target_key: &str,
+        value: Option<&str>,
+    ) -> Result<(), TuiError> {
+        let msg = self.lua().create_table()?;
+        msg.set("kind", kind)?;
+        msg.set("target_key", target_key)?;
+        if let Some(v) = value {
+            msg.set("value", v)?;
+        }
+        self.dispatch_msg(msg)
+    }
+
+    /// Run a reconcile pass + sync text_input states without painting.
+    /// Used so the router observes the latest description tree before
+    /// the first render.
+    fn ensure_reconciled(&mut self) -> Result<(), TuiError> {
+        if self.reconciler.root.is_none() && self.lua.started() {
+            let desc = self.lua.render_view()?;
+            self.reconciler.reconcile(desc);
+            if let Some(root) = self.reconciler.root.as_mut() {
+                sync_text_inputs(root);
+            }
+        }
+        Ok(())
     }
 
     /// Dispatch an arbitrary Lua message table — used by the binary to
@@ -85,6 +157,7 @@ impl Engine {
         let desc = self.lua.render_view()?;
         self.reconciler.reconcile(desc);
         let root = self.reconciler.root.as_mut().ok_or(TuiError::NotStarted)?;
+        sync_text_inputs(root);
         let bytes = self.renderer.render(root);
         self.needs_render = false;
         Ok(Some(bytes))
