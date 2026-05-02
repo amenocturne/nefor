@@ -1042,6 +1042,130 @@ mod tests {
         );
     }
 
+    fn expanded(child: WidgetDescription, flex: u16) -> WidgetDescription {
+        WidgetDescription::Expanded {
+            flex,
+            child: Box::new(child),
+            key: None,
+        }
+    }
+
+    fn spacer(flex: u16) -> WidgetDescription {
+        WidgetDescription::Spacer { flex, key: None }
+    }
+
+    #[test]
+    fn row_with_one_expanded_takes_remaining_width() {
+        // Row of 20 cols; "abc" (3) + expanded(text "x") → expanded gets 17.
+        let desc = WidgetDescription::Row {
+            gap: 0,
+            key: None,
+            children: vec![text("abc"), expanded(text(""), 1)],
+        };
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let root = rec.root.as_mut().unwrap();
+        let _ = layout(root, Constraints::loose(20, 1));
+        // First child main = 3, expanded main = 17.
+        assert_eq!(root.layout.flex_main_sizes, vec![3, 17]);
+    }
+
+    #[test]
+    fn row_with_two_expanded_split_proportionally() {
+        // Both flex=1 → equal split of 10 cols.
+        let desc = WidgetDescription::Row {
+            gap: 0,
+            key: None,
+            children: vec![expanded(text(""), 1), expanded(text(""), 1)],
+        };
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let root = rec.root.as_mut().unwrap();
+        let _ = layout(root, Constraints::loose(10, 1));
+        // First gets 5; last (residual) gets the rest = 5.
+        assert_eq!(root.layout.flex_main_sizes, vec![5, 5]);
+    }
+
+    #[test]
+    fn row_with_weighted_flex_distributes_unevenly() {
+        // flex 1 + flex 3 → 25%/75% of 20 cols = 5 + 15.
+        let desc = WidgetDescription::Row {
+            gap: 0,
+            key: None,
+            children: vec![expanded(text(""), 1), expanded(text(""), 3)],
+        };
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let root = rec.root.as_mut().unwrap();
+        let _ = layout(root, Constraints::loose(20, 1));
+        assert_eq!(root.layout.flex_main_sizes, vec![5, 15]);
+    }
+
+    #[test]
+    fn flex_residual_handed_to_last_child() {
+        // 10 cols / 3 flex = 3 each, with 1 residual to last.
+        let desc = WidgetDescription::Row {
+            gap: 0,
+            key: None,
+            children: vec![
+                expanded(text(""), 1),
+                expanded(text(""), 1),
+                expanded(text(""), 1),
+            ],
+        };
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let root = rec.root.as_mut().unwrap();
+        let _ = layout(root, Constraints::loose(10, 1));
+        assert_eq!(root.layout.flex_main_sizes, vec![3, 3, 4]);
+    }
+
+    #[test]
+    fn spacer_pushes_following_text_to_end() {
+        // Row: "L" + spacer(1) + "R" inside 5 cols → "L   R".
+        let desc = WidgetDescription::Row {
+            gap: 0,
+            key: None,
+            children: vec![text("L"), spacer(1), text("R")],
+        };
+        let buf = paint_root(desc, 5, 1);
+        assert_eq!(cell_at(&buf, 0, 0), "L");
+        assert_eq!(cell_at(&buf, 0, 1), " ");
+        assert_eq!(cell_at(&buf, 0, 2), " ");
+        assert_eq!(cell_at(&buf, 0, 3), " ");
+        assert_eq!(cell_at(&buf, 0, 4), "R");
+    }
+
+    #[test]
+    fn column_with_expanded_grows_vertically() {
+        // Column of 10 rows: text(1 row) + expanded(text "") → expanded = 9.
+        let desc = WidgetDescription::Column {
+            gap: 0,
+            key: None,
+            children: vec![text("hi"), expanded(text(""), 1)],
+        };
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let root = rec.root.as_mut().unwrap();
+        let _ = layout(root, Constraints::loose(20, 10));
+        assert_eq!(root.layout.flex_main_sizes, vec![1, 9]);
+    }
+
+    #[test]
+    fn flex_with_zero_remaining_collapses() {
+        // Non-flex children eat all available main; expanded gets 0.
+        let desc = WidgetDescription::Row {
+            gap: 0,
+            key: None,
+            children: vec![text("xxxxx"), expanded(text(""), 1)],
+        };
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let root = rec.root.as_mut().unwrap();
+        let _ = layout(root, Constraints::loose(5, 1));
+        assert_eq!(root.layout.flex_main_sizes, vec![5, 0]);
+    }
+
     #[test]
     fn wrap_word_splits_on_word_boundary() {
         let rows = wrap_text("hello world", 6, WrapMode::Word);

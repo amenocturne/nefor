@@ -218,6 +218,20 @@ fn install_tui(lua: &Lua, started: Arc<Mutex<StartedState>>) -> Result<(), TuiEr
     })?;
     tui.set("stack", stack_fn)?;
 
+    // tui.expanded { flex?, child, key? }
+    let expanded_fn = lua.create_function(|_, args: Table| {
+        args.set(KIND_FIELD, "expanded")?;
+        Ok(args)
+    })?;
+    tui.set("expanded", expanded_fn)?;
+
+    // tui.spacer { flex?, key? }
+    let spacer_fn = lua.create_function(|_, args: Table| {
+        args.set(KIND_FIELD, "spacer")?;
+        Ok(args)
+    })?;
+    tui.set("spacer", spacer_fn)?;
+
     // tui.start { initial_state, view, update }
     let started_for_start = Arc::clone(&started);
     let start_fn = lua.create_function(move |lua, args: Table| {

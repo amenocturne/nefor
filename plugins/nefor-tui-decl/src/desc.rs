@@ -159,8 +159,10 @@ pub fn from_lua_table(t: &Table) -> Result<WidgetDescription, TuiError> {
         "row" => parse_row(t),
         "padding" => parse_padding(t),
         "stack" => parse_stack(t),
+        "expanded" => parse_expanded(t),
+        "spacer" => parse_spacer(t),
         other => Err(TuiError::InvalidDesc(format!(
-            "unknown widget kind `{other}`; expected one of: text, column, row, padding, stack"
+            "unknown widget kind `{other}`; expected one of: text, column, row, padding, stack, expanded, spacer"
         ))),
     }
 }
@@ -239,6 +241,34 @@ fn parse_stack(t: &Table) -> Result<WidgetDescription, TuiError> {
     };
     let key = parse_key(t)?;
     Ok(WidgetDescription::Stack { children, key })
+}
+
+fn parse_expanded(t: &Table) -> Result<WidgetDescription, TuiError> {
+    let flex = parse_u16(t, "flex", 1, "tui.expanded")?;
+    let child_val: Value = t.get("child")?;
+    let child_tbl = match child_val {
+        Value::Table(t) => t,
+        Value::Nil => {
+            return Err(TuiError::InvalidDesc(
+                "tui.expanded: `child` is required".into(),
+            ));
+        }
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.expanded: `child` must be a widget table (got {})",
+                other.type_name()
+            )));
+        }
+    };
+    let child = Box::new(from_lua_table(&child_tbl)?);
+    let key = parse_key(t)?;
+    Ok(WidgetDescription::Expanded { flex, child, key })
+}
+
+fn parse_spacer(t: &Table) -> Result<WidgetDescription, TuiError> {
+    let flex = parse_u16(t, "flex", 1, "tui.spacer")?;
+    let key = parse_key(t)?;
+    Ok(WidgetDescription::Spacer { flex, key })
 }
 
 fn parse_padding(t: &Table) -> Result<WidgetDescription, TuiError> {
@@ -637,6 +667,64 @@ mod tests {
                 assert_eq!(children.len(), 2);
             }
             _ => panic!("expected row"),
+        }
+    }
+
+    #[test]
+    fn expanded_table_parses_with_default_flex() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"
+            return {
+              _tui_kind = "expanded",
+              child = { _tui_kind = "text", content = "x" },
+            }
+        "#,
+        );
+        let d = from_lua_table(&t).expect("parse");
+        match d {
+            WidgetDescription::Expanded { flex, .. } => assert_eq!(flex, 1),
+            _ => panic!("expected expanded"),
+        }
+    }
+
+    #[test]
+    fn expanded_table_parses_explicit_flex() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"
+            return {
+              _tui_kind = "expanded",
+              flex = 3,
+              child = { _tui_kind = "text", content = "x" },
+            }
+        "#,
+        );
+        let d = from_lua_table(&t).expect("parse");
+        match d {
+            WidgetDescription::Expanded { flex, .. } => assert_eq!(flex, 3),
+            _ => panic!("expected expanded"),
+        }
+    }
+
+    #[test]
+    fn expanded_requires_child() {
+        let l = lua();
+        let t = eval_table(&l, r#"return { _tui_kind = "expanded" }"#);
+        let err = from_lua_table(&t).unwrap_err();
+        assert!(format!("{err}").contains("`child` is required"));
+    }
+
+    #[test]
+    fn spacer_table_parses() {
+        let l = lua();
+        let t = eval_table(&l, r#"return { _tui_kind = "spacer" }"#);
+        let d = from_lua_table(&t).expect("parse");
+        match d {
+            WidgetDescription::Spacer { flex, .. } => assert_eq!(flex, 1),
+            _ => panic!("expected spacer"),
         }
     }
 
