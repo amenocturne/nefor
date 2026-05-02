@@ -226,6 +226,10 @@ impl Engine {
     /// Apply one scroll command from Lua's queue against the live tree.
     /// Errors when the key doesn't resolve — silent no-op would mask
     /// config bugs (per spec § Lua scroll-control APIs).
+    ///
+    /// Fires `on_scroll` (if configured) on offset change so programmatic
+    /// scrolling and wheel-driven scrolling behave identically from
+    /// Lua's perspective.
     fn apply_scroll_command(&mut self, cmd: ScrollCommand) -> Result<(), TuiError> {
         let key = match &cmd {
             ScrollCommand::To { key, .. }
@@ -250,6 +254,10 @@ impl Engine {
                 "tui.scroll_*: failed to walk path to scrollable `{key}`"
             )));
         };
+        let on_scroll = match &target.last_desc {
+            WidgetDescription::Scrollable { on_scroll, .. } => on_scroll.clone(),
+            _ => None,
+        };
         let st = match &mut target.state {
             InstanceState::Scrollable(s) => s,
             _ => {
@@ -258,19 +266,47 @@ impl Engine {
                 )));
             }
         };
+        let prev = st.scroll_y;
         match cmd {
             ScrollCommand::To { offset, .. } => {
                 let max = st.scroll_y_max();
                 st.scroll_y = offset.min(max);
+                // Mirror was_at_* so stick_to handling stays consistent
+                // — a programmatic jump to the bottom should re-engage
+                // stick_to=end.
+                st.was_at_end = st.scroll_y == max;
+                st.was_at_start = st.scroll_y == 0;
             }
             ScrollCommand::By { delta, .. } => {
                 scroll_by_signed(st, delta);
+                let max = st.scroll_y_max();
+                st.was_at_end = st.scroll_y == max;
+                st.was_at_start = st.scroll_y == 0;
             }
             ScrollCommand::IntoView { .. } => {
                 // v1 minimal scope per spec: scroll to the bottom. Future
                 // iterations may resolve a focused-target's location
                 // within the scrollable.
                 st.scroll_y = st.scroll_y_max();
+                st.was_at_end = true;
+                st.was_at_start = st.scroll_y == 0;
+            }
+        }
+        let new_offset = st.scroll_y;
+        if new_offset != prev {
+            if let Some(kind) = on_scroll {
+                let msg = self.lua().create_table()?;
+                msg.set("kind", kind)?;
+                msg.set("target_key", key)?;
+                msg.set("offset", new_offset)?;
+                // Recursive dispatch — this could in turn queue more
+                // scroll commands, which `dispatch_msg` will drain. We
+                // limit recursion depth indirectly: if Lua keeps
+                // scrolling on every notification we'll grow the stack;
+                // a malicious config can't trip an infinite loop unless
+                // it keeps changing scroll_y, which terminates at the
+                // clamp boundary.
+                self.dispatch_msg(msg)?;
             }
         }
         Ok(())
