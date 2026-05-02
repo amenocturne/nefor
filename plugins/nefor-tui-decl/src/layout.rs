@@ -19,8 +19,10 @@
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::desc::{Alignment, Anchor, Dimension, Style, WidgetDescription, WrapMode};
-use crate::instance::{InstanceKind, WidgetInstance};
+use crate::desc::{
+    Alignment, Anchor, Dimension, Style, TextInputStyle, WidgetDescription, WrapMode,
+};
+use crate::instance::{InstanceKind, InstanceState, WidgetInstance};
 use crate::render::{Cell, FrameBuffer};
 
 /// Box constraints flowing down from parent to child during the measure
@@ -107,6 +109,7 @@ pub fn layout(inst: &mut WidgetInstance, c: Constraints) -> Size {
         InstanceKind::Constrained => layout_constrained(inst, c),
         InstanceKind::Align => layout_align(inst, c),
         InstanceKind::Anchored => layout_anchored(inst, c),
+        InstanceKind::TextInput => layout_text_input(inst, c),
     };
     inst.layout.size = size;
     size
@@ -128,6 +131,7 @@ pub fn paint(inst: &WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
         InstanceKind::Spacer => { /* empty */ }
         InstanceKind::Align => paint_align(inst, rect, out),
         InstanceKind::Anchored => paint_anchored(inst, rect, out),
+        InstanceKind::TextInput => paint_text_input(inst, rect, out),
     }
 }
 
@@ -767,6 +771,221 @@ fn align_offset(a: Alignment, parent_w: u16, parent_h: u16, cw: u16, ch: u16) ->
         Alignment::BottomRight => (v_extra, h_extra),
     };
     (row_frac, col_frac)
+}
+
+// ── TextInput ────────────────────────────────────────────────────────────
+
+fn layout_text_input(inst: &mut WidgetInstance, c: Constraints) -> Size {
+    let (value, min_lines, max_lines) = match &inst.last_desc {
+        WidgetDescription::TextInput {
+            value,
+            min_lines,
+            max_lines,
+            ..
+        } => (value.clone(), *min_lines, *max_lines),
+        _ => unreachable!("kind/desc mismatch"),
+    };
+    // Width: prefer parent's max so wrapping/scroll can use the full
+    // budget. Sync state's `last_value` here so the paint pass and the
+    // input router both see the latest.
+    if let InstanceState::TextInput(st) = &mut inst.state {
+        let focused = matches!(
+            &inst.last_desc,
+            WidgetDescription::TextInput { focused, .. } if *focused
+        );
+        st.sync_with_desc(&value, focused);
+    }
+
+    let visible_lines = visible_line_count(&value, min_lines, max_lines);
+    let raw = Size {
+        width: c.max_width,
+        height: visible_lines.min(c.max_height),
+    };
+    c.constrain(raw)
+}
+
+/// Number of rows the input wants to occupy. Bounded by `[min_lines,
+/// max_lines]`. Currently counts only hard newlines; soft-wrap lands
+/// in phase 5a alongside `scrollable` proper.
+fn visible_line_count(value: &str, min_lines: u16, max_lines: u16) -> u16 {
+    let actual = value.split('\n').count() as u32;
+    actual
+        .clamp(min_lines as u32, max_lines as u32)
+        .min(u16::MAX as u32) as u16
+}
+
+fn paint_text_input(inst: &WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
+    let (value, focused, placeholder, style) = match &inst.last_desc {
+        WidgetDescription::TextInput {
+            value,
+            focused,
+            placeholder,
+            style,
+            ..
+        } => (value.as_str(), *focused, placeholder.clone(), *style),
+        _ => return,
+    };
+    let st = match &inst.state {
+        InstanceState::TextInput(s) => s,
+        _ => return,
+    };
+    let style = style.unwrap_or_default();
+
+    let lines: Vec<&str> = if value.is_empty() && placeholder.is_some() {
+        // We render the placeholder run instead; cursor still draws
+        // at column 0 so a focused empty input shows where typing
+        // will land.
+        vec![placeholder.as_deref().unwrap_or_default()]
+    } else if value.is_empty() {
+        vec![""]
+    } else {
+        value.split('\n').collect()
+    };
+
+    let scroll_y = st.scroll_y as usize;
+    let scroll_x = st.scroll_x as usize;
+    let body_style = body_style_for(&style);
+    let placeholder_style = placeholder_style_for(&style);
+    let is_placeholder_run = value.is_empty() && placeholder.is_some();
+
+    for r in 0..rect.height as usize {
+        let row = rect.row.saturating_add(r as u16);
+        let line_idx = scroll_y + r;
+        let line = lines.get(line_idx).copied().unwrap_or("");
+        let visible: String = take_columns_from(line, scroll_x, rect.width as usize);
+        let safe = enforce_width_contract(&visible, rect.width);
+        let run_style = if is_placeholder_run {
+            placeholder_style
+        } else {
+            body_style
+        };
+        write_run(out, row, rect.col, &safe, &run_style);
+    }
+
+    // Cursor: only paint a visible cursor when focused. The painter draws
+    // a reverse-video cell at the cursor position. This is the engine's
+    // default; users can theme via `style.cursor`. Phase 4 ignores
+    // cursor_blink (no internal clock).
+    if focused {
+        paint_cursor(inst, rect, out, st, value, &style);
+    }
+}
+
+fn paint_cursor(
+    _inst: &WidgetInstance,
+    rect: Rect,
+    out: &mut FrameBuffer,
+    st: &crate::text_input::TextInputState,
+    value: &str,
+    style: &TextInputStyle,
+) {
+    // Find the (line_idx, col_within_line) of the cursor.
+    let (line_idx, col) = cursor_visual_position(value, st.cursor);
+    let scroll_y = st.scroll_y as usize;
+    let scroll_x = st.scroll_x as usize;
+    if line_idx < scroll_y {
+        return;
+    }
+    let row_within = line_idx - scroll_y;
+    if row_within >= rect.height as usize {
+        return;
+    }
+    if col < scroll_x {
+        return;
+    }
+    let col_within = col - scroll_x;
+    if col_within >= rect.width as usize {
+        return;
+    }
+    let row = rect.row.saturating_add(row_within as u16);
+    let col_abs = rect.col.saturating_add(col_within as u16);
+
+    // The cursor is rendered as reverse video over whichever cell lies
+    // there. If the user supplied `style.cursor`, treat that as the cell
+    // bg.
+    let row_idx = row as usize;
+    if row_idx >= out.lines.len() {
+        return;
+    }
+    let line = &mut out.lines[row_idx];
+    let col_idx = col_abs as usize;
+    if col_idx >= line.cells.len() {
+        return;
+    }
+    let mut cell = line.cells[col_idx].clone();
+    cell.style.reverse = true;
+    if let Some(c) = style.cursor {
+        cell.style.bg = Some(c);
+    }
+    line.cells[col_idx] = cell;
+}
+
+fn body_style_for(style: &TextInputStyle) -> Style {
+    Style {
+        fg: style.fg,
+        bg: style.bg,
+        bold: false,
+        italic: false,
+        underline: false,
+        reverse: false,
+    }
+}
+
+fn placeholder_style_for(style: &TextInputStyle) -> Style {
+    Style {
+        fg: style.placeholder,
+        bg: style.bg,
+        bold: false,
+        italic: false,
+        underline: false,
+        reverse: false,
+    }
+}
+
+/// Cursor visual position: `(line_index, column_within_line)` where
+/// `line_index` counts from 0 and column is the cell-width prefix sum
+/// from the line start to the cursor offset.
+fn cursor_visual_position(value: &str, cursor: usize) -> (usize, usize) {
+    let cursor = cursor.min(value.len());
+    let before = &value[..cursor];
+    let line_idx = before.bytes().filter(|b| *b == b'\n').count();
+    let last_nl = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_prefix = &before[last_nl..];
+    let col = string_width(line_prefix);
+    (line_idx, col)
+}
+
+/// Take up to `width` columns from `s` starting at column `start`.
+fn take_columns_from(s: &str, start: usize, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut col = 0usize;
+    let mut out = String::new();
+    for ch in s.chars() {
+        let w = char_width(ch);
+        if col + w <= start {
+            col += w;
+            continue;
+        }
+        if col >= start + width {
+            break;
+        }
+        // If the char straddles the start, emit a space to keep
+        // alignment.
+        if col < start {
+            for _ in 0..(start - col) {
+                out.push(' ');
+            }
+            col = start;
+        }
+        if col + w > start + width {
+            break;
+        }
+        out.push(ch);
+        col += w;
+    }
+    out
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────

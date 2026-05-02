@@ -6,6 +6,7 @@
 
 use crate::desc::WidgetDescription;
 use crate::layout::Size;
+use crate::text_input::TextInputState;
 
 /// Composite reconciler key. Two stages compose it:
 /// - `type_tag` — static string, never reused across primitive types
@@ -35,6 +36,7 @@ pub enum InstanceKind {
     Constrained,
     Align,
     Anchored,
+    TextInput,
 }
 
 /// Per-primitive internal state preserved across `view` rebuilds. Phase 1
@@ -54,6 +56,10 @@ pub enum InstanceState {
     Constrained,
     Align,
     Anchored,
+    /// Per-instance editing state for `text_input`. Survives across
+    /// re-renders via the reconciler key (per spec: cursor, selection,
+    /// scroll offset, IME composition, undo stack).
+    TextInput(TextInputState),
 }
 
 /// Layout side-effect storage on each instance — set by the measure pass,
@@ -111,6 +117,7 @@ pub fn default_state(kind: InstanceKind) -> InstanceState {
         InstanceKind::Constrained => InstanceState::Constrained,
         InstanceKind::Align => InstanceState::Align,
         InstanceKind::Anchored => InstanceState::Anchored,
+        InstanceKind::TextInput => InstanceState::TextInput(TextInputState::default()),
     }
 }
 
@@ -126,6 +133,7 @@ pub fn kind_of(desc: &WidgetDescription) -> InstanceKind {
         WidgetDescription::Constrained { .. } => InstanceKind::Constrained,
         WidgetDescription::Align { .. } => InstanceKind::Align,
         WidgetDescription::Anchored { .. } => InstanceKind::Anchored,
+        WidgetDescription::TextInput { .. } => InstanceKind::TextInput,
     }
 }
 

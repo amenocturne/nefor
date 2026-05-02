@@ -16,4 +16,5 @@ pub mod lua_host;
 pub mod ncp;
 pub mod reconciler;
 pub mod render;
+pub mod text_input;
 pub mod tty;

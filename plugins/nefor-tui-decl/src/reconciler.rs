@@ -69,7 +69,9 @@ fn mount_subtree(
     let kind = kind_of(&desc);
     let key = instance_key(&desc, position);
     let children = match &desc {
-        WidgetDescription::Text { .. } | WidgetDescription::Spacer { .. } => Vec::new(),
+        WidgetDescription::Text { .. }
+        | WidgetDescription::Spacer { .. }
+        | WidgetDescription::TextInput { .. } => Vec::new(),
         WidgetDescription::Column { children, .. }
         | WidgetDescription::Row { children, .. }
         | WidgetDescription::Stack { children, .. } => children
@@ -104,7 +106,9 @@ fn update_instance(
     summary.reused += 1;
 
     let new_children = match &new_desc {
-        WidgetDescription::Text { .. } | WidgetDescription::Spacer { .. } => Vec::new(),
+        WidgetDescription::Text { .. }
+        | WidgetDescription::Spacer { .. }
+        | WidgetDescription::TextInput { .. } => Vec::new(),
         WidgetDescription::Column { children, .. }
         | WidgetDescription::Row { children, .. }
         | WidgetDescription::Stack { children, .. } => children.clone(),

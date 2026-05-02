@@ -253,6 +253,15 @@ fn install_tui(lua: &Lua, started: Arc<Mutex<StartedState>>) -> Result<(), TuiEr
     })?;
     tui.set("anchored", anchored_fn)?;
 
+    // tui.text_input { key, value?, focused?, on_change?, on_submit?,
+    //                  min_lines?, max_lines?, placeholder?, cursor_blink?,
+    //                  style? }
+    let text_input_fn = lua.create_function(|_, args: Table| {
+        args.set(KIND_FIELD, "text_input")?;
+        Ok(args)
+    })?;
+    tui.set("text_input", text_input_fn)?;
+
     // tui.start { initial_state, view, update }
     let started_for_start = Arc::clone(&started);
     let start_fn = lua.create_function(move |lua, args: Table| {
