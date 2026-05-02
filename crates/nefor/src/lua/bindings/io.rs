@@ -94,6 +94,29 @@ pub fn spawn_stdin_pump() -> mpsc::UnboundedReceiver<String> {
 ///
 /// `mode` chooses the dispatch shape: TUI returns nil immediately.
 /// `pump` provides the stdin source in CLI dispatch mode.
+///
+/// # API contract — `read_line` blocks the broker run loop
+///
+/// `read_line` parks the broker's run task on the current worker thread
+/// via `tokio::task::block_in_place(handle.block_on(rx.recv()))`. While
+/// parked, no inbound plugin lines are processed and no exit watcher
+/// fires until either a stdin line arrives or stdin EOFs. Safe call
+/// sites:
+///
+/// 1. The cli-function entry point (before `Broker::run` enters its
+///    select loop) — the cli function is intended to drive the REPL
+///    here, blocking is the design.
+/// 2. Sequentially from `on_*` handlers in a strict
+///    read-then-submit-then-wait-for-complete-then-repeat pattern,
+///    where the handler knows no other bus events need concurrent
+///    dispatch while the read is outstanding.
+///
+/// NOT safe to call from a handler that expects other bus events to be
+/// dispatched concurrently with the read. The broker is single-tasked
+/// while `read_line` is blocked — a peer crash or shutdown signal
+/// won't progress until stdin produces a line. If a handler must wait
+/// for user input without monopolising the run loop, gate the wait on
+/// a separate task or restructure the flow into chained event handlers.
 pub fn install_io(
     lua: &Lua,
     nefor_tbl: &Table,
