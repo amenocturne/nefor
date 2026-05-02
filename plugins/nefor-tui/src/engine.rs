@@ -531,6 +531,120 @@ impl Engine {
     pub fn dimensions(&self) -> (u16, u16) {
         (self.renderer.width(), self.renderer.height())
     }
+
+    /// Plain-text snapshot of the most recently rendered frame.
+    ///
+    /// Each row's cells concatenated, rows joined by `\n`. Empty cells
+    /// render as a single space; trailing whitespace is preserved (so
+    /// rows are exactly `width` columns wide). Style information is
+    /// dropped — see [`Engine::snapshot_ansi`] for a styled variant.
+    ///
+    /// **Pre-condition:** at least one [`Engine::render_if_dirty`] call
+    /// must have produced a frame. Before any render, the buffer is
+    /// all-blank and you'll get a `width × height` rectangle of spaces.
+    ///
+    /// Used by integration tests to assert exact visual output against a
+    /// known terminal size — see `plugins/nefor-tui/tests/snapshot_test.rs`
+    /// for the canonical pattern.
+    pub fn snapshot(&self) -> String {
+        let frame = self.renderer.last_frame();
+        let mut out = String::new();
+        for (i, line) in frame.lines.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            for cell in &line.cells {
+                out.push_str(&cell.text);
+            }
+        }
+        out
+    }
+
+    /// Styled snapshot — text with inline ANSI SGR codes preserved.
+    /// Style transitions emit a fresh SGR sequence; each row ends with a
+    /// reset. Useful when a test wants to assert "this region is bold"
+    /// without parsing the framebuffer directly.
+    ///
+    /// Pre-conditions match [`Engine::snapshot`].
+    pub fn snapshot_ansi(&self) -> String {
+        use crate::ansi::{write_style, SGR_RESET};
+        let frame = self.renderer.last_frame();
+        let mut out = String::new();
+        for (i, line) in frame.lines.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            let mut cur: Option<crate::desc::Style> = None;
+            for cell in &line.cells {
+                if Some(cell.style) != cur {
+                    write_style(&mut out, &cell.style);
+                    cur = Some(cell.style);
+                }
+                out.push_str(&cell.text);
+            }
+            out.push_str(SGR_RESET);
+        }
+        out
+    }
+
+    /// Styled snapshot with human-readable markers — `[bold]...[/bold]`,
+    /// `[italic]...[/italic]`, `[underline]...[/underline]`. Colors are
+    /// not annotated. Designed for golden-file tests where the diff
+    /// stays readable across visual changes.
+    ///
+    /// Pre-conditions match [`Engine::snapshot`].
+    pub fn snapshot_styled(&self) -> String {
+        let frame = self.renderer.last_frame();
+        let mut out = String::new();
+        for (i, line) in frame.lines.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            let mut bold = false;
+            let mut italic = false;
+            let mut underline = false;
+            for cell in &line.cells {
+                let s = cell.style;
+                // Close in reverse order before opening new ones.
+                if underline && !s.underline {
+                    out.push_str("[/underline]");
+                    underline = false;
+                }
+                if italic && !s.italic {
+                    out.push_str("[/italic]");
+                    italic = false;
+                }
+                if bold && !s.bold {
+                    out.push_str("[/bold]");
+                    bold = false;
+                }
+                if !bold && s.bold {
+                    out.push_str("[bold]");
+                    bold = true;
+                }
+                if !italic && s.italic {
+                    out.push_str("[italic]");
+                    italic = true;
+                }
+                if !underline && s.underline {
+                    out.push_str("[underline]");
+                    underline = true;
+                }
+                out.push_str(&cell.text);
+            }
+            // Close any still-open markers at row end.
+            if underline {
+                out.push_str("[/underline]");
+            }
+            if italic {
+                out.push_str("[/italic]");
+            }
+            if bold {
+                out.push_str("[/bold]");
+            }
+        }
+        out
+    }
 }
 
 /// Locate a scrollable by user_key in the instance tree. Returns the

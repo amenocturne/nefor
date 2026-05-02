@@ -120,12 +120,20 @@ async fn main() -> ExitCode {
         }
     };
 
-    match run(script.as_ref()).await {
-        Ok(()) => ExitCode::SUCCESS,
+    let result = run(script.as_ref()).await;
+
+    // `tokio::io::stdin()` parks a blocking reader thread the runtime
+    // cannot cancel; letting `tokio::main` drop the runtime would hang
+    // forever waiting for that thread to finish a `next_line().await`
+    // that never returns. Bypass the runtime drop with `process::exit`
+    // — by this point the terminal has already been restored via
+    // `RawModeGuard`'s Drop in `run`, so this is a clean exit.
+    match result {
+        Ok(()) => std::process::exit(0),
         Err(e) => {
             tracing::error!(error = %e, "nefor-tui exited with error");
             eprintln!("nefor-tui: {e}");
-            ExitCode::from(1)
+            std::process::exit(1)
         }
     }
 }

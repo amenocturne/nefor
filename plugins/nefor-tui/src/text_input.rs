@@ -10,8 +10,23 @@
 //! All offsets are byte offsets into the UTF-8 value. Helpers below clamp
 //! to the nearest character boundary so external callers never have to
 //! reason about it.
+//!
+//! ## Soft-wrap (multi-line inputs)
+//!
+//! When `max_lines > 1` the layout pass word-wraps the value to the
+//! viewport width and counts each soft-wrapped row toward the visible
+//! line count. Cursor navigation (Up/Down arrows, Home/End) operates on
+//! visual rows, not logical rows. Each wrapped row carries the byte
+//! range `[start, end)` it covers in the original value so the cursor
+//! can translate between byte offset and `(visual_row, visual_col)`.
+//!
+//! Single-line inputs (`max_lines == 1`) keep horizontal-scroll
+//! behaviour: the value never wraps, but `scroll_x` is bumped so the
+//! cursor stays inside the viewport.
 
 use std::collections::VecDeque;
+
+use unicode_width::UnicodeWidthChar;
 
 /// Maximum entries kept in the undo / redo history. The cap exists so a
 /// runaway typing session doesn't grow unbounded; 128 covers normal
@@ -34,10 +49,17 @@ pub struct TextInputState {
     /// spans `[min(anchor, cursor), max(anchor, cursor))`.
     pub selection_anchor: Option<usize>,
     /// Horizontal scroll in cells. Increments when the cursor moves
-    /// past the rightmost visible column.
+    /// past the rightmost visible column. Used by single-line inputs;
+    /// multi-line inputs soft-wrap instead and never advance this.
     pub scroll_x: u16,
     /// Vertical scroll in lines. Increments past the bottom visible row.
     pub scroll_y: u16,
+    /// Most-recent viewport width observed during layout (in cells).
+    /// Cached so editing-key handlers (Up/Down, Home/End on a wrapped
+    /// row, scroll bookkeeping) can reason about the visual layout
+    /// without re-deriving it each call. Zero until the first paint —
+    /// fall back to whole-line semantics until the layout pass runs.
+    pub viewport_width: u16,
     /// Active IME composition, if any. While composing, the engine
     /// inserts a placeholder run at the cursor; `commit_ime` splices the
     /// committed text in and clears this slot.
@@ -214,6 +236,313 @@ pub fn allows_newline_insert(max_lines: u16) -> bool {
     max_lines > 1
 }
 
+/// Display width of a single char, in cells (zero for combiners).
+fn char_cell_width(c: char) -> usize {
+    UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// One soft-wrapped row inside [`wrap_value`]'s output. Carries enough
+/// context for cursor mapping in either direction:
+///
+/// - `start_byte` / `end_byte` — half-open byte range into the original
+///   value covered by this row.
+/// - `width` — visible cell width of the row (post-wrap).
+/// - `terminated_by_newline` — `true` when this row ends at a hard `\n`
+///   in the source value. Used so the cursor can sit on the empty row
+///   after a trailing newline without "jumping" onto the previous row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrappedRow {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub width: usize,
+    pub terminated_by_newline: bool,
+}
+
+/// Word-wrap `value` to the given viewport width, returning one
+/// [`WrappedRow`] per visible row. Hard newlines always start a new row;
+/// long logical lines are word-wrapped (with `wrap_char` fallback for
+/// individual words longer than the viewport, mirroring [`crate::layout::wrap_text`]).
+///
+/// Width is measured in unicode display columns. A `width = 0` viewport
+/// returns one empty row covering the whole value (the caller's clamp
+/// handles the visual no-op).
+pub fn wrap_value(value: &str, width: u16) -> Vec<WrappedRow> {
+    if width == 0 {
+        return vec![WrappedRow {
+            start_byte: 0,
+            end_byte: value.len(),
+            width: 0,
+            terminated_by_newline: false,
+        }];
+    }
+    let limit = width as usize;
+    let mut out: Vec<WrappedRow> = Vec::new();
+    let bytes = value.as_bytes();
+    let mut logical_start = 0usize;
+    let mut i = 0usize;
+    // Walk the value one logical line at a time (split by `\n`); after
+    // each split, soft-wrap the contained slice.
+    while i <= bytes.len() {
+        let at_eof = i == bytes.len();
+        let at_newline = !at_eof && bytes[i] == b'\n';
+        if at_eof || at_newline {
+            let line = &value[logical_start..i];
+            wrap_logical_line(line, logical_start, limit, at_newline, &mut out);
+            if at_newline {
+                logical_start = i + 1;
+                i += 1;
+                if logical_start == bytes.len() {
+                    // Trailing newline: emit an empty row anchored at the
+                    // very end so the cursor can sit there.
+                    out.push(WrappedRow {
+                        start_byte: bytes.len(),
+                        end_byte: bytes.len(),
+                        width: 0,
+                        terminated_by_newline: false,
+                    });
+                    break;
+                }
+            } else {
+                break;
+            }
+        } else {
+            // Skip multi-byte char lead bytes by stepping char-by-char
+            // when we would land mid-char. The slice operations above
+            // handle correctness; we just need to advance.
+            let ch_len = char_byte_len(value, i);
+            i += ch_len.max(1);
+        }
+    }
+    if out.is_empty() {
+        out.push(WrappedRow {
+            start_byte: 0,
+            end_byte: 0,
+            width: 0,
+            terminated_by_newline: false,
+        });
+    }
+    out
+}
+
+fn char_byte_len(s: &str, idx: usize) -> usize {
+    s[idx..].chars().next().map(|c| c.len_utf8()).unwrap_or(1)
+}
+
+/// Word-wrap a single `\n`-free slice to `limit` cells. Each emitted
+/// row's byte offsets are anchored at `slice_origin` (the slice's start
+/// in the parent value).
+fn wrap_logical_line(
+    line: &str,
+    slice_origin: usize,
+    limit: usize,
+    terminator_is_newline: bool,
+    out: &mut Vec<WrappedRow>,
+) {
+    if line.is_empty() {
+        out.push(WrappedRow {
+            start_byte: slice_origin,
+            end_byte: slice_origin,
+            width: 0,
+            terminated_by_newline: terminator_is_newline,
+        });
+        return;
+    }
+    let runs = split_keeping_spaces(line);
+    let mut row_start_in_line = 0usize;
+    let mut cursor = 0usize; // byte offset within `line`
+    let mut col = 0usize;
+    for run in runs {
+        let run_w: usize = run.chars().map(char_cell_width).sum();
+        let run_bytes = run.len();
+        if col == 0 && run_w > limit {
+            // Word longer than the viewport — emit any in-flight row,
+            // then char-wrap this run.
+            char_wrap_run(run, slice_origin + cursor, limit, out);
+            cursor += run_bytes;
+            row_start_in_line = cursor;
+            col = 0;
+            continue;
+        }
+        if col + run_w > limit {
+            // Close the current row at `cursor` and start a new one.
+            out.push(WrappedRow {
+                start_byte: slice_origin + row_start_in_line,
+                end_byte: slice_origin + cursor,
+                width: col,
+                terminated_by_newline: false,
+            });
+            // If this run is pure whitespace, swallow it at the line
+            // start (mirrors [`crate::layout::wrap_word`]).
+            if run.chars().all(char::is_whitespace) {
+                cursor += run_bytes;
+                row_start_in_line = cursor;
+                col = 0;
+                continue;
+            }
+            row_start_in_line = cursor;
+            col = 0;
+        }
+        cursor += run_bytes;
+        col += run_w;
+    }
+    // Trailing partial row.
+    out.push(WrappedRow {
+        start_byte: slice_origin + row_start_in_line,
+        end_byte: slice_origin + cursor,
+        width: col,
+        terminated_by_newline: terminator_is_newline,
+    });
+}
+
+/// Char-wrap a single run that's wider than `limit`. Emits as many rows
+/// as needed; each row's `terminated_by_newline` is `false` (the parent
+/// caller decides what comes after).
+fn char_wrap_run(run: &str, slice_origin: usize, limit: usize, out: &mut Vec<WrappedRow>) {
+    let mut start = 0usize;
+    let mut byte = 0usize;
+    let mut col = 0usize;
+    for ch in run.chars() {
+        let w = char_cell_width(ch);
+        if w > limit {
+            // Single grapheme wider than the line — emit prior, then this on its own.
+            if byte > start {
+                out.push(WrappedRow {
+                    start_byte: slice_origin + start,
+                    end_byte: slice_origin + byte,
+                    width: col,
+                    terminated_by_newline: false,
+                });
+            }
+            let next = byte + ch.len_utf8();
+            out.push(WrappedRow {
+                start_byte: slice_origin + byte,
+                end_byte: slice_origin + next,
+                width: w,
+                terminated_by_newline: false,
+            });
+            byte = next;
+            start = next;
+            col = 0;
+            continue;
+        }
+        if col + w > limit {
+            out.push(WrappedRow {
+                start_byte: slice_origin + start,
+                end_byte: slice_origin + byte,
+                width: col,
+                terminated_by_newline: false,
+            });
+            start = byte;
+            col = 0;
+        }
+        byte += ch.len_utf8();
+        col += w;
+    }
+    if byte > start {
+        out.push(WrappedRow {
+            start_byte: slice_origin + start,
+            end_byte: slice_origin + byte,
+            width: col,
+            terminated_by_newline: false,
+        });
+    }
+}
+
+/// Split `s` into runs that alternate whitespace and non-whitespace.
+/// Mirrors [`crate::layout::split_keeping_spaces`] but lives here so this
+/// module is self-contained.
+fn split_keeping_spaces(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    if s.is_empty() {
+        return out;
+    }
+    let mut start = 0usize;
+    let mut in_space = s.starts_with(char::is_whitespace);
+    let mut i = 0usize;
+    while i < s.len() {
+        let c = s[i..].chars().next().unwrap_or(' ');
+        let cw = c.is_whitespace();
+        if cw != in_space {
+            out.push(&s[start..i]);
+            start = i;
+            in_space = cw;
+        }
+        i += c.len_utf8();
+    }
+    if start < s.len() {
+        out.push(&s[start..]);
+    }
+    out
+}
+
+/// Soft-wrapped visible line count for a multi-line input — number of
+/// rows produced by [`wrap_value`] at the given viewport width.
+pub fn soft_wrapped_line_count(value: &str, width: u16) -> usize {
+    wrap_value(value, width).len()
+}
+
+/// Map a byte offset to `(visual_row, visual_col)` within the soft-
+/// wrapped layout. The cursor maps to the *first* row whose byte range
+/// covers it — when the cursor sits exactly on a wrap boundary (i.e.
+/// `cursor == row.end_byte` for some non-final row that didn't end on a
+/// hard `\n`), it visually belongs at the next row's start so typing
+/// flows on.
+pub fn cursor_in_wrap_for(value: &str, rows: &[WrappedRow], cursor: usize) -> (usize, usize) {
+    if rows.is_empty() {
+        return (0, 0);
+    }
+    for (i, row) in rows.iter().enumerate() {
+        let in_row = cursor >= row.start_byte && cursor <= row.end_byte;
+        if !in_row {
+            continue;
+        }
+        let next_starts_here = rows
+            .get(i + 1)
+            .is_some_and(|n| n.start_byte == cursor && cursor == row.end_byte);
+        if next_starts_here && !row.terminated_by_newline {
+            continue;
+        }
+        let local_end = cursor.min(value.len());
+        let local_start = row.start_byte.min(local_end);
+        let slice = &value[local_start..local_end];
+        let col: usize = slice.chars().map(char_cell_width).sum();
+        return (i, col);
+    }
+    let last = rows.last().expect("non-empty");
+    (rows.len() - 1, last.width)
+}
+
+/// Inverse of [`cursor_in_wrap_for`] — translate `(visual_row,
+/// target_col)` into a byte offset, clamped to the row's content. Used
+/// by Up/Down arrow when the cursor needs to land on a different visual
+/// row at approximately the same column.
+pub fn byte_offset_for_visual(
+    value: &str,
+    rows: &[WrappedRow],
+    visual_row: usize,
+    target_col: usize,
+) -> usize {
+    let row = match rows.get(visual_row) {
+        Some(r) => r,
+        None => return rows.last().map(|r| r.end_byte).unwrap_or(value.len()),
+    };
+    if target_col == 0 {
+        return row.start_byte;
+    }
+    let slice = &value[row.start_byte..row.end_byte];
+    let mut col = 0usize;
+    let mut last_byte = row.start_byte;
+    for ch in slice.chars() {
+        let w = char_cell_width(ch);
+        if col + w > target_col {
+            return last_byte;
+        }
+        col += w;
+        last_byte += ch.len_utf8();
+    }
+    row.end_byte
+}
+
 // ── Editing operations ────────────────────────────────────────────────────
 //
 // All ops act on the latest controlled-component value held in
@@ -352,20 +681,33 @@ impl TextInputState {
         EditOutcome::default()
     }
 
-    /// Move cursor to the previous line, preserving column when possible.
-    /// No-op on the first line.
+    /// Move cursor to the previous visual row, preserving column when
+    /// possible. No-op on the first row. Uses soft-wrap layout when the
+    /// viewport width is known (multi-line input post-layout); else
+    /// falls back to hard-newline rows.
     pub fn move_up(&mut self, extend_selection: bool) -> EditOutcome {
         self.update_selection_anchor(extend_selection);
-        let cur_line_start = line_start(&self.last_value, self.cursor);
-        if cur_line_start == 0 {
-            return EditOutcome::default();
+        if self.viewport_width > 0 {
+            let value = self.last_value.clone();
+            let rows = wrap_value(&value, self.viewport_width);
+            let (visual_row, col) = cursor_in_wrap_for(&value, &rows, self.cursor);
+            if visual_row == 0 {
+                return EditOutcome::default();
+            }
+            self.cursor = byte_offset_for_visual(&value, &rows, visual_row - 1, col);
+        } else {
+            // Hard-newline fallback (also handles single-line case
+            // gracefully — cursor sits at start of value, no-op).
+            let cur_line_start = line_start(&self.last_value, self.cursor);
+            if cur_line_start == 0 {
+                return EditOutcome::default();
+            }
+            let col = self.cursor - cur_line_start;
+            let prev_line_end = cur_line_start - 1;
+            let prev_line_start = line_start(&self.last_value, prev_line_end);
+            let prev_line_len = prev_line_end - prev_line_start;
+            self.cursor = prev_line_start + col.min(prev_line_len);
         }
-        let col = self.cursor - cur_line_start;
-        // Previous line ends at cur_line_start-1 (the `\n` itself).
-        let prev_line_end = cur_line_start - 1;
-        let prev_line_start = line_start(&self.last_value, prev_line_end);
-        let prev_line_len = prev_line_end - prev_line_start;
-        self.cursor = prev_line_start + col.min(prev_line_len);
         if !extend_selection {
             self.selection_anchor = None;
         }
@@ -374,17 +716,26 @@ impl TextInputState {
 
     pub fn move_down(&mut self, extend_selection: bool) -> EditOutcome {
         self.update_selection_anchor(extend_selection);
-        let cur_line_start = line_start(&self.last_value, self.cursor);
-        let cur_line_end = line_end(&self.last_value, self.cursor);
-        if cur_line_end == self.last_value.len() {
-            // No next line.
-            return EditOutcome::default();
+        if self.viewport_width > 0 {
+            let value = self.last_value.clone();
+            let rows = wrap_value(&value, self.viewport_width);
+            let (visual_row, col) = cursor_in_wrap_for(&value, &rows, self.cursor);
+            if visual_row + 1 >= rows.len() {
+                return EditOutcome::default();
+            }
+            self.cursor = byte_offset_for_visual(&value, &rows, visual_row + 1, col);
+        } else {
+            let cur_line_start = line_start(&self.last_value, self.cursor);
+            let cur_line_end = line_end(&self.last_value, self.cursor);
+            if cur_line_end == self.last_value.len() {
+                return EditOutcome::default();
+            }
+            let col = self.cursor - cur_line_start;
+            let next_line_start = cur_line_end + 1;
+            let next_line_end = line_end(&self.last_value, next_line_start);
+            let next_line_len = next_line_end - next_line_start;
+            self.cursor = next_line_start + col.min(next_line_len);
         }
-        let col = self.cursor - cur_line_start;
-        let next_line_start = cur_line_end + 1;
-        let next_line_end = line_end(&self.last_value, next_line_start);
-        let next_line_len = next_line_end - next_line_start;
-        self.cursor = next_line_start + col.min(next_line_len);
         if !extend_selection {
             self.selection_anchor = None;
         }
@@ -755,5 +1106,107 @@ mod tests {
         let out = s.insert_char('ö');
         assert_eq!(out.new_value.as_deref(), Some("aéö"));
         assert_eq!(s.cursor, 5, "byte cursor advances by 2 for ö");
+    }
+
+    // ── Soft-wrap (multi-line text_input) ────────────────────────────
+
+    #[test]
+    fn wrap_value_short_line_emits_one_row() {
+        let rows = wrap_value("hi", 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].start_byte, 0);
+        assert_eq!(rows[0].end_byte, 2);
+        assert_eq!(rows[0].width, 2);
+    }
+
+    #[test]
+    fn wrap_value_word_wraps_at_viewport_width() {
+        // "hello world foo bar" wrapped to 11 cells.
+        // Greedy word-wrap: "hello world" (11) | " foo bar" → "foo bar"
+        // (the leading whitespace at a line break is consumed).
+        let rows = wrap_value("hello world foo bar", 11);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(
+            &"hello world foo bar"[rows[0].start_byte..rows[0].end_byte],
+            "hello world"
+        );
+        assert!(rows[1].start_byte > 0);
+        assert!(!rows[1].terminated_by_newline);
+    }
+
+    #[test]
+    fn wrap_value_visible_count_grows_then_clamps() {
+        // Soft-wrap: line of "abcd efgh ijkl mnop qrst" at width=9 ought
+        // to produce more than one row.
+        let value = "abcd efgh ijkl mnop qrst";
+        let single = soft_wrapped_line_count(value, 100);
+        assert_eq!(single, 1, "wide viewport keeps one row");
+        let many = soft_wrapped_line_count(value, 9);
+        assert!(many >= 3, "narrow viewport produces multiple rows: {many}");
+    }
+
+    #[test]
+    fn wrap_value_respects_hard_newlines() {
+        let rows = wrap_value("a\nbc\n", 100);
+        // Three rows: "a", "bc", "" — the trailing newline emits an
+        // empty cursor-target row.
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(rows[0].terminated_by_newline);
+        assert!(rows[1].terminated_by_newline);
+        assert_eq!(rows[2].start_byte, 5);
+        assert_eq!(rows[2].end_byte, 5);
+    }
+
+    #[test]
+    fn wrap_value_long_word_char_wraps() {
+        // Single token wider than the viewport — must char-wrap.
+        let rows = wrap_value("abcdefghij", 4);
+        assert!(rows.len() >= 3, "{rows:?}");
+        // Total bytes covered equals input length.
+        let covered: usize = rows.iter().map(|r| r.end_byte - r.start_byte).sum();
+        // First row has no implicit gap; sum may equal len precisely
+        // because no whitespace is dropped.
+        assert!(covered >= 10);
+    }
+
+    #[test]
+    fn cursor_in_wrap_maps_byte_to_visual_position() {
+        let value = "hello world foo bar";
+        let rows = wrap_value(value, 11);
+        // Cursor right after "hello" → row 0, col 5.
+        let pos = cursor_in_wrap_for(value, &rows, 5);
+        assert_eq!(pos, (0, 5));
+        // Cursor at end → final row, end col.
+        let end = cursor_in_wrap_for(value, &rows, value.len());
+        assert_eq!(end.0, rows.len() - 1);
+    }
+
+    #[test]
+    fn cursor_in_wrap_with_hard_newline_lands_on_post_row() {
+        let value = "abc\ndef";
+        let rows = wrap_value(value, 100);
+        // Cursor at offset 4 (start of "def") → row 1, col 0.
+        let pos = cursor_in_wrap_for(value, &rows, 4);
+        assert_eq!(pos, (1, 0));
+    }
+
+    #[test]
+    fn byte_offset_for_visual_clamps_to_short_row() {
+        let value = "hello world foo bar";
+        let rows = wrap_value(value, 11);
+        // Try column 20 on row 1 — must clamp to row's end.
+        let off = byte_offset_for_visual(value, &rows, 1, 20);
+        assert_eq!(off, rows[1].end_byte);
+    }
+
+    #[test]
+    fn byte_offset_for_visual_round_trips_with_cursor_in_wrap() {
+        let value = "abcdef ghi jklmno pqrstu";
+        let rows = wrap_value(value, 8);
+        for cursor in [0, 3, 7, 11, value.len()] {
+            let (row, col) = cursor_in_wrap_for(value, &rows, cursor);
+            let back = byte_offset_for_visual(value, &rows, row, col);
+            assert_eq!(back, cursor, "round-trip failed @ cursor={cursor}");
+        }
     }
 }

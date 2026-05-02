@@ -82,6 +82,20 @@ pub enum WidgetDescription {
         flex: u16,
         key: Option<String>,
     },
+    /// Repeating-character fill primitive. Claims the parent's full
+    /// `(max_width, max_height)` constraints (same shape as `Spacer`)
+    /// and paints `char` repeated across every assigned cell. Composed
+    /// with `tui.text` + `tui.row` to form full-width rules and bordered
+    /// boxes — borders themselves are not a primitive (per the
+    /// no-opinions-in-core rule); the user picks the box-drawing glyphs.
+    Fill {
+        /// Single-cell glyph to repeat. The desc parser rejects empty
+        /// strings; multi-grapheme inputs paint the literal sequence
+        /// every column (engine paints whatever Lua hands it).
+        char: String,
+        style: Option<Style>,
+        key: Option<String>,
+    },
     Constrained {
         min_width: Option<u16>,
         max_width: Option<u16>,
@@ -231,6 +245,7 @@ impl WidgetDescription {
             WidgetDescription::Stack { .. } => "stack",
             WidgetDescription::Expanded { .. } => "expanded",
             WidgetDescription::Spacer { .. } => "spacer",
+            WidgetDescription::Fill { .. } => "fill",
             WidgetDescription::Constrained { .. } => "constrained",
             WidgetDescription::Align { .. } => "align",
             WidgetDescription::Anchored { .. } => "anchored",
@@ -252,6 +267,7 @@ impl WidgetDescription {
             | WidgetDescription::Stack { key, .. }
             | WidgetDescription::Expanded { key, .. }
             | WidgetDescription::Spacer { key, .. }
+            | WidgetDescription::Fill { key, .. }
             | WidgetDescription::Constrained { key, .. }
             | WidgetDescription::Align { key, .. }
             | WidgetDescription::Anchored { key, .. }
@@ -386,13 +402,14 @@ pub fn from_lua_table(t: &Table) -> Result<WidgetDescription, TuiError> {
         "stack" => parse_stack(t),
         "expanded" => parse_expanded(t),
         "spacer" => parse_spacer(t),
+        "fill" => parse_fill(t),
         "constrained" => parse_constrained(t),
         "align" => parse_align(t),
         "anchored" => parse_anchored(t),
         "text_input" => parse_text_input(t),
         "scrollable" => parse_scrollable(t),
         other => Err(TuiError::InvalidDesc(format!(
-            "unknown widget kind `{other}`; expected one of: text, spans, markdown, animation, column, row, padding, stack, expanded, spacer, constrained, align, anchored, text_input, scrollable"
+            "unknown widget kind `{other}`; expected one of: text, spans, markdown, animation, column, row, padding, stack, expanded, spacer, fill, constrained, align, anchored, text_input, scrollable"
         ))),
     }
 }
@@ -801,6 +818,35 @@ fn parse_spacer(t: &Table) -> Result<WidgetDescription, TuiError> {
     let flex = parse_u16(t, "flex", 1, "tui.spacer")?;
     let key = parse_key(t)?;
     Ok(WidgetDescription::Spacer { flex, key })
+}
+
+fn parse_fill(t: &Table) -> Result<WidgetDescription, TuiError> {
+    let ch: String = match t.get::<Value>("char")? {
+        Value::String(s) => s.to_str()?.to_string(),
+        Value::Nil => {
+            return Err(TuiError::InvalidDesc(
+                "tui.fill: `char` is required (got nil)".into(),
+            ));
+        }
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.fill: `char` must be a string (got {})",
+                other.type_name()
+            )));
+        }
+    };
+    if ch.is_empty() {
+        return Err(TuiError::InvalidDesc(
+            "tui.fill: `char` must not be an empty string".into(),
+        ));
+    }
+    let style = parse_style(t)?;
+    let key = parse_key(t)?;
+    Ok(WidgetDescription::Fill {
+        char: ch,
+        style,
+        key,
+    })
 }
 
 fn parse_constrained(t: &Table) -> Result<WidgetDescription, TuiError> {
@@ -1694,6 +1740,53 @@ mod tests {
             WidgetDescription::Spacer { flex, .. } => assert_eq!(flex, 1),
             _ => panic!("expected spacer"),
         }
+    }
+
+    #[test]
+    fn fill_table_parses_with_char_and_style() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r##"
+            return {
+              _tui_kind = "fill",
+              char = "─",
+              style = { fg = "#7FB4FF", bold = true },
+            }
+        "##,
+        );
+        let d = from_lua_table(&t).expect("parse");
+        match d {
+            WidgetDescription::Fill { char, style, .. } => {
+                assert_eq!(char, "─");
+                let style = style.expect("style");
+                assert_eq!(style.fg, Some(Color::Rgb(0x7F, 0xB4, 0xFF)));
+                assert!(style.bold);
+            }
+            _ => panic!("expected fill"),
+        }
+    }
+
+    #[test]
+    fn fill_requires_char() {
+        let l = lua();
+        let t = eval_table(&l, r#"return { _tui_kind = "fill" }"#);
+        let err = from_lua_table(&t).unwrap_err();
+        assert!(
+            format!("{err}").contains("`char` is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn fill_rejects_empty_char() {
+        let l = lua();
+        let t = eval_table(&l, r#"return { _tui_kind = "fill", char = "" }"#);
+        let err = from_lua_table(&t).unwrap_err();
+        assert!(
+            format!("{err}").contains("must not be an empty string"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

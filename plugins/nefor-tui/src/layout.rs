@@ -112,6 +112,7 @@ pub fn layout(inst: &mut WidgetInstance, c: Constraints) -> Size {
         InstanceKind::Stack => layout_stack(inst, c),
         InstanceKind::Expanded => layout_expanded(inst, c),
         InstanceKind::Spacer => layout_spacer(inst, c),
+        InstanceKind::Fill => layout_fill(inst, c),
         InstanceKind::Constrained => layout_constrained(inst, c),
         InstanceKind::Align => layout_align(inst, c),
         InstanceKind::Anchored => layout_anchored(inst, c),
@@ -146,6 +147,7 @@ pub fn paint(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
         InstanceKind::Stack => paint_stack(inst, rect, out),
         InstanceKind::Expanded | InstanceKind::Constrained => paint_passthrough(inst, rect, out),
         InstanceKind::Spacer => { /* empty */ }
+        InstanceKind::Fill => paint_fill(inst, rect, out),
         InstanceKind::Align => paint_align(inst, rect, out),
         InstanceKind::Anchored => paint_anchored(inst, rect, out),
         InstanceKind::TextInput => paint_text_input(inst, rect, out),
@@ -366,17 +368,35 @@ enum Axis {
     Vertical,
 }
 
-/// Two-pass flex distribution (shared between column + row).
+/// Three-phase flex distribution (shared between column + row).
 ///
-/// Pass 1 — measure non-flex children with the parent's cross-axis budget
-/// and natural main-axis space. The flex children get whatever main-axis
-/// space remains, distributed proportionally.
+/// Main-axis allocation (CSS `flex-grow` analogue):
+///   • Pass 1 — measure non-flex children with their natural main-axis
+///     size, capping at the remaining budget.
+///   • Pass 2 — distribute leftover main-axis space across flex children
+///     (`expanded` / `spacer`) proportional to `flex`. Residual goes to
+///     the last flex child so totals match exactly.
+///
+/// Cross-axis stretch (CSS `align-items: stretch` default):
+///   • Pass 3 — children that opt into cross-greedy (`tui.fill` and
+///     wrappers around it) are re-measured with the row's resolved
+///     cross size as a TIGHT constraint. The row's cross is
+///     `max(non-greedy children's cross sizes)`, clamped into the
+///     parent's `[min_cross, max_cross]` bounds. If every child is
+///     cross-greedy (no anchor), the row claims the parent's full
+///     cross — matching CSS flexbox.
+///
+/// The classification of a child as cross-greedy is intrinsic to the
+/// primitive (see [`child_cross_greedy_in_axis`]), not configurable per
+/// row/column. Users wanting natural-cross alignment for an otherwise
+/// greedy child can wrap it in `tui.align`, which absorbs the parent's
+/// cross and positions the child at its natural size.
 ///
 /// Edge cases worth keeping in mind:
 ///   • If `remaining` is 0 (or negative once gaps are subtracted), every
 ///     flex child gets `0` on the main axis and lays out tight on that
-///     axis — they may still measure non-zero on the cross axis, but
-///     their main-axis size collapses.
+///     axis. Cross-greedy reach is unaffected — they still stretch to
+///     match the resolved row cross.
 ///   • Integer division uses (`remaining * weight) / total_flex`. The
 ///     residual (so total flex sizes don't sum exactly to `remaining`) is
 ///     handed to the *last* flex child to keep totals consistent.
@@ -387,14 +407,29 @@ fn flex_layout(inst: &mut WidgetInstance, c: Constraints, axis: Axis, gap: u16) 
     }
 
     let main_max = main_of(axis, c.max_width, c.max_height);
+    let cross_min = cross_of(axis, c.min_width, c.min_height);
     let cross_max = cross_of(axis, c.max_width, c.max_height);
     let total_gap = (n as u16).saturating_sub(1).saturating_mul(gap);
 
-    // Inspect children to find flex factors (only `expanded`/`spacer`).
+    // Inspect children for main-axis flex factors and cross-axis greed.
+    // Both classifications are static functions of the child's
+    // descriptor — the layout engine never asks the child to opt in
+    // dynamically. Computed once up front so passes 1-3 share the
+    // results without re-walking the child tree.
     let flex_factors: Vec<u16> = inst.children.iter().map(child_flex_factor).collect();
+    let cross_greedy: Vec<bool> = inst
+        .children
+        .iter()
+        .map(|c| child_cross_greedy_in_axis(c, axis))
+        .collect();
     let total_flex: u32 = flex_factors.iter().map(|&f| f as u32).sum();
 
     let mut sizes: Vec<Size> = vec![Size::default(); n];
+    // Per-child main allotment captured during passes 1+2 so phase 3
+    // can re-measure cross-greedy children with the same main constraint
+    // they got the first time. Without this capture, the re-measure
+    // would lose the flex distribution result.
+    let mut main_allotments: Vec<u16> = vec![0; n];
     let mut non_flex_main: u32 = 0;
 
     // Pass 1: lay out non-flex children with their natural main-axis size.
@@ -402,20 +437,20 @@ fn flex_layout(inst: &mut WidgetInstance, c: Constraints, axis: Axis, gap: u16) 
         if flex_factors[i] > 0 {
             continue;
         }
+        let child_main_max = main_max
+            .saturating_sub(non_flex_main as u16)
+            .saturating_sub(total_gap);
+        main_allotments[i] = child_main_max;
         let child_constraints = match axis {
             Axis::Vertical => Constraints {
                 min_width: 0,
                 max_width: c.max_width,
                 min_height: 0,
-                max_height: main_max
-                    .saturating_sub(non_flex_main as u16)
-                    .saturating_sub(total_gap),
+                max_height: child_main_max,
             },
             Axis::Horizontal => Constraints {
                 min_width: 0,
-                max_width: main_max
-                    .saturating_sub(non_flex_main as u16)
-                    .saturating_sub(total_gap),
+                max_width: child_main_max,
                 min_height: 0,
                 max_height: c.max_height,
             },
@@ -449,6 +484,7 @@ fn flex_layout(inst: &mut WidgetInstance, c: Constraints, axis: Axis, gap: u16) 
             ((remaining_main * f as u32) / total_flex) as u16
         };
         handed_out_main = handed_out_main.saturating_add(allotment as u32);
+        main_allotments[i] = allotment;
 
         let child_constraints = match axis {
             Axis::Vertical => Constraints {
@@ -468,6 +504,52 @@ fn flex_layout(inst: &mut WidgetInstance, c: Constraints, axis: Axis, gap: u16) 
         sizes[i] = s;
     }
 
+    // Compute row's resolved cross size (CSS `align-items: stretch`):
+    // ignore cross-greedy children's first-pass sizes (they had no
+    // natural cross to contribute); take the max of the rest. If every
+    // child is cross-greedy, fall back to `cross_max` so the row spans
+    // its full available cross — matches flexbox default.
+    let any_non_greedy = cross_greedy.iter().any(|&g| !g);
+    let natural_cross: u16 = if any_non_greedy {
+        sizes
+            .iter()
+            .zip(cross_greedy.iter())
+            .filter_map(|(s, &greedy)| (!greedy).then_some(cross_of(axis, s.width, s.height)))
+            .max()
+            .unwrap_or(0)
+    } else {
+        cross_max
+    };
+    let row_cross = natural_cross.clamp(cross_min, cross_max);
+
+    // Pass 3: re-measure cross-greedy children with the row's cross
+    // size as a tight constraint. Their main-axis allotment is the same
+    // as in passes 1/2 — re-applying it via `main_allotments[i]` keeps
+    // flex distribution stable.
+    for i in 0..n {
+        if !cross_greedy[i] {
+            continue;
+        }
+        let allotment = main_allotments[i];
+        let is_flex = flex_factors[i] > 0;
+        let child_constraints = match axis {
+            Axis::Vertical => Constraints {
+                min_width: row_cross,
+                max_width: row_cross,
+                min_height: if is_flex { allotment } else { 0 },
+                max_height: allotment,
+            },
+            Axis::Horizontal => Constraints {
+                min_width: if is_flex { allotment } else { 0 },
+                max_width: allotment,
+                min_height: row_cross,
+                max_height: row_cross,
+            },
+        };
+        let s = layout(&mut inst.children[i], child_constraints);
+        sizes[i] = s;
+    }
+
     // Persist per-child main-axis size for the paint pass.
     inst.layout.flex_main_sizes = sizes
         .iter()
@@ -479,21 +561,15 @@ fn flex_layout(inst: &mut WidgetInstance, c: Constraints, axis: Axis, gap: u16) 
         .map(|s| main_of(axis, s.width, s.height) as u32)
         .sum::<u32>()
         + total_gap as u32;
-    let cross_used: u16 = sizes
-        .iter()
-        .map(|s| cross_of(axis, s.width, s.height))
-        .max()
-        .unwrap_or(0)
-        .min(cross_max);
 
     let raw = match axis {
         Axis::Vertical => Size {
-            width: cross_used,
+            width: row_cross,
             height: main_used.min(u16::MAX as u32) as u16,
         },
         Axis::Horizontal => Size {
             width: main_used.min(u16::MAX as u32) as u16,
-            height: cross_used,
+            height: row_cross,
         },
     };
     c.constrain(raw)
@@ -662,6 +738,56 @@ fn layout_spacer(_inst: &mut WidgetInstance, c: Constraints) -> Size {
         width: c.min_width,
         height: c.min_height,
     })
+}
+
+fn layout_fill(_inst: &mut WidgetInstance, c: Constraints) -> Size {
+    // Greedy: claim the parent's full max on both axes. The same shape
+    // as a Flutter `Container` with no child but a decoration, or HTML
+    // `width: 100%; height: 100%` inside a bounded parent.
+    //
+    // Inside a `row` / `column`, the parent's flex layout classifies
+    // `Fill` as cross-greedy and re-measures with a tight cross
+    // constraint after determining the row's cross from non-greedy
+    // siblings (CSS `align-items: stretch`). So the bare-`max_height`
+    // here is the unconstrained-parent path; inside a flex parent the
+    // tight constraint funnels through `c.constrain` and produces
+    // `row_cross × main_allotment`.
+    c.constrain(Size {
+        width: c.max_width,
+        height: c.max_height,
+    })
+}
+
+fn paint_fill(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
+    let (ch, style) = match &inst.last_desc {
+        WidgetDescription::Fill { char, style, .. } => (char.as_str(), style.unwrap_or_default()),
+        _ => return,
+    };
+    if ch.is_empty() || rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    // Pre-build one row's worth of repeats so `write_run` is called
+    // once per row instead of once per cell. The desc parser rejects
+    // empty strings; multi-grapheme inputs paint the literal sequence
+    // every column. Zero-width inputs (e.g. lone ZWJ) get clamped to a
+    // 1-cell stride so the loop terminates.
+    let unit_width = string_width(ch).max(1);
+    let total_width = rect.width as usize;
+    let repeats = total_width / unit_width;
+    let mut row_text = String::with_capacity(repeats * ch.len() + ch.len());
+    for _ in 0..repeats {
+        row_text.push_str(ch);
+    }
+    // Tail: emit one more unit if there are leftover columns; the
+    // per-cell width-clamp inside `write_run` drops any overhang so a
+    // 2-col char in a 1-col tail isn't half-painted.
+    if !total_width.is_multiple_of(unit_width) {
+        row_text.push_str(ch);
+    }
+    for row_off in 0..rect.height {
+        let row = rect.row.saturating_add(row_off);
+        write_run(out, row, rect.col, &row_text, &style);
+    }
 }
 
 fn paint_passthrough(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
@@ -915,15 +1041,26 @@ fn layout_text_input(inst: &mut WidgetInstance, c: Constraints) -> Size {
     // Width: prefer parent's max so wrapping/scroll can use the full
     // budget. Sync state's `last_value` here so the paint pass and the
     // input router both see the latest.
+    let viewport_w = c.max_width;
     if let InstanceState::TextInput(st) = &mut inst.state {
         let focused = matches!(
             &inst.last_desc,
             WidgetDescription::TextInput { focused, .. } if *focused
         );
         st.sync_with_desc(&value, focused);
+        st.viewport_width = viewport_w;
+        // For single-line inputs, keep `scroll_x` glued to the cursor.
+        // For multi-line inputs `scroll_x` is unused (soft-wrap covers
+        // overflow) — clear it so a value rewrite doesn't strand a
+        // stale offset.
+        if max_lines == 1 {
+            sync_single_line_scroll_x(st, viewport_w);
+        } else {
+            st.scroll_x = 0;
+        }
     }
 
-    let visible_lines = visible_line_count(&value, min_lines, max_lines);
+    let visible_lines = visible_line_count(&value, min_lines, max_lines, viewport_w);
     let raw = Size {
         width: c.max_width,
         height: visible_lines.min(c.max_height),
@@ -932,24 +1069,68 @@ fn layout_text_input(inst: &mut WidgetInstance, c: Constraints) -> Size {
 }
 
 /// Number of rows the input wants to occupy. Bounded by `[min_lines,
-/// max_lines]`. Currently counts only hard newlines; soft-wrap lands
-/// in phase 5a alongside `scrollable` proper.
-fn visible_line_count(value: &str, min_lines: u16, max_lines: u16) -> u16 {
-    let actual = value.split('\n').count() as u32;
+/// max_lines]`. Multi-line inputs (`max_lines > 1`) soft-wrap to the
+/// viewport so a long buffer grows vertically up to the cap;
+/// single-line inputs (`max_lines == 1`) always claim one row and rely
+/// on horizontal scrolling for overflow.
+fn visible_line_count(value: &str, min_lines: u16, max_lines: u16, viewport_w: u16) -> u16 {
+    if max_lines <= 1 {
+        return min_lines.max(1);
+    }
+    if viewport_w == 0 {
+        return min_lines;
+    }
+    let actual = crate::text_input::soft_wrapped_line_count(value, viewport_w) as u32;
     actual
         .clamp(min_lines as u32, max_lines as u32)
         .min(u16::MAX as u32) as u16
 }
 
+/// Single-line cursor-tracking scroll: bump `scroll_x` so the cursor
+/// stays inside `[scroll_x, scroll_x + viewport_w)`. Called once per
+/// layout — viewport width is known here, so this is the natural seam
+/// for the "input disappears off-screen" fix.
+fn sync_single_line_scroll_x(st: &mut crate::text_input::TextInputState, viewport_w: u16) {
+    if viewport_w == 0 {
+        return;
+    }
+    // Width of the value up to the cursor — that's the cursor's logical
+    // column on a single-line input.
+    let prefix = &st.last_value[..st.cursor.min(st.last_value.len())];
+    let cursor_col: usize = prefix.chars().map(unicode_col_width).sum();
+    let scroll_x = st.scroll_x as usize;
+    let viewport = viewport_w as usize;
+    let new_scroll = if cursor_col < scroll_x {
+        cursor_col as u16
+    } else if cursor_col >= scroll_x + viewport {
+        // Keep the cursor on the rightmost cell.
+        (cursor_col + 1).saturating_sub(viewport) as u16
+    } else {
+        st.scroll_x
+    };
+    st.scroll_x = new_scroll;
+}
+
+fn unicode_col_width(c: char) -> usize {
+    UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
 fn paint_text_input(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
-    let (value, focused, placeholder, style) = match &inst.last_desc {
+    let (value, focused, placeholder, style, max_lines) = match &inst.last_desc {
         WidgetDescription::TextInput {
             value,
             focused,
             placeholder,
             style,
+            max_lines,
             ..
-        } => (value.as_str(), *focused, placeholder.clone(), *style),
+        } => (
+            value.as_str(),
+            *focused,
+            placeholder.clone(),
+            *style,
+            *max_lines,
+        ),
         _ => return,
     };
     let st = match &inst.state {
@@ -958,10 +1139,47 @@ fn paint_text_input(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer
     };
     let style = style.unwrap_or_default();
 
-    let lines: Vec<&str> = if value.is_empty() && placeholder.is_some() {
-        // We render the placeholder run instead; cursor still draws
-        // at column 0 so a focused empty input shows where typing
-        // will land.
+    let body_style = body_style_for(&style);
+    let placeholder_style = placeholder_style_for(&style);
+    let is_placeholder_run = value.is_empty() && placeholder.is_some();
+
+    if max_lines > 1 {
+        // Soft-wrap: paint each wrapped row.
+        let display_value: &str = if is_placeholder_run {
+            placeholder.as_deref().unwrap_or_default()
+        } else {
+            value
+        };
+        let rows = crate::text_input::wrap_value(display_value, rect.width);
+        let scroll_y = st.scroll_y as usize;
+        for r in 0..rect.height as usize {
+            let row_y = rect.row.saturating_add(r as u16);
+            let row_idx = scroll_y + r;
+            let row = rows.get(row_idx);
+            let slice = match row {
+                Some(rw) => {
+                    let lo = rw.start_byte.min(display_value.len());
+                    let hi = rw.end_byte.min(display_value.len());
+                    &display_value[lo..hi]
+                }
+                None => "",
+            };
+            let safe = enforce_width_contract(slice, rect.width);
+            let run_style = if is_placeholder_run {
+                placeholder_style
+            } else {
+                body_style
+            };
+            write_run(out, row_y, rect.col, &safe, &run_style);
+        }
+        if focused && !is_placeholder_run {
+            paint_cursor_wrapped(rect, out, st, value, &rows, &style);
+        }
+        return;
+    }
+
+    // Single-line: horizontal scroll model unchanged.
+    let lines: Vec<&str> = if is_placeholder_run {
         vec![placeholder.as_deref().unwrap_or_default()]
     } else if value.is_empty() {
         vec![""]
@@ -971,9 +1189,6 @@ fn paint_text_input(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer
 
     let scroll_y = st.scroll_y as usize;
     let scroll_x = st.scroll_x as usize;
-    let body_style = body_style_for(&style);
-    let placeholder_style = placeholder_style_for(&style);
-    let is_placeholder_run = value.is_empty() && placeholder.is_some();
 
     for r in 0..rect.height as usize {
         let row = rect.row.saturating_add(r as u16);
@@ -996,6 +1211,47 @@ fn paint_text_input(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer
     if focused {
         paint_cursor(rect, out, st, value, &style);
     }
+}
+
+/// Cursor painter for soft-wrapped multi-line text_input. Maps the
+/// byte cursor through the wrapped layout to a `(visual_row, col)`
+/// pair, then draws a reverse-video cell at that position (clipped to
+/// the viewport).
+fn paint_cursor_wrapped(
+    rect: Rect,
+    out: &mut FrameBuffer,
+    st: &crate::text_input::TextInputState,
+    value: &str,
+    rows: &[crate::text_input::WrappedRow],
+    style: &TextInputStyle,
+) {
+    let (visual_row, col) = crate::text_input::cursor_in_wrap_for(value, rows, st.cursor);
+    let scroll_y = st.scroll_y as usize;
+    if visual_row < scroll_y {
+        return;
+    }
+    let row_within = visual_row - scroll_y;
+    if row_within >= rect.height as usize {
+        return;
+    }
+    if col >= rect.width as usize {
+        return;
+    }
+    let row_idx = (rect.row as usize).saturating_add(row_within);
+    let col_idx = (rect.col as usize).saturating_add(col);
+    if row_idx >= out.lines.len() {
+        return;
+    }
+    let line = &mut out.lines[row_idx];
+    if col_idx >= line.cells.len() {
+        return;
+    }
+    let mut cell = line.cells[col_idx].clone();
+    cell.style.reverse = true;
+    if let Some(c) = style.cursor {
+        cell.style.bg = Some(c);
+    }
+    line.cells[col_idx] = cell;
 }
 
 fn paint_cursor(
@@ -1370,6 +1626,56 @@ fn child_flex_factor(child: &WidgetInstance) -> u16 {
     match &child.last_desc {
         WidgetDescription::Expanded { flex, .. } | WidgetDescription::Spacer { flex, .. } => *flex,
         _ => 0,
+    }
+}
+
+/// Whether `child` opts into cross-axis stretch inside a flex parent
+/// (`row` or `column`) on `axis`. The flex layout treats cross-greedy
+/// children differently:
+///
+/// 1. their measured cross size does NOT participate in the row's
+///    natural-cross calculation (they have no natural cross), and
+/// 2. after the row's cross is determined from non-greedy siblings, they
+///    are re-measured with a tight cross constraint matching that row.
+///
+/// CSS-flexbox parallel: `align-items: stretch` is the default; greedy
+/// children are the ones that consume the resolved cross size. We make
+/// the call per-primitive instead of per-axis-flag because primitives
+/// like `tui.fill` are greedy on both axes by definition (paint requires
+/// a non-empty rect on both axes), and that property is intrinsic to the
+/// primitive's contract — not a layout option exposed at the row level.
+///
+/// Wrappers (`expanded`, `padding`, `constrained`) delegate to their
+/// child so the common composition `expanded { fill }` is correctly
+/// classified as cross-greedy without forcing every wrapper to know
+/// about the property.
+///
+/// `axis` is unused at the leaf today (every cross-greedy primitive is
+/// greedy on both axes), but it threads through wrappers so a future
+/// per-axis primitive (e.g. a hypothetical `tui.hfill` that's greedy
+/// only on horizontal) slots in without changing the call sites.
+#[allow(clippy::only_used_in_recursion)]
+fn child_cross_greedy_in_axis(child: &WidgetInstance, axis: Axis) -> bool {
+    match &child.last_desc {
+        // Greedy on both axes — claims whatever rect the parent assigns.
+        WidgetDescription::Fill { .. } => true,
+        // Spacer is empty filler on the main axis only; nothing to draw
+        // on the cross axis, so don't pull the row taller than its
+        // content.
+        WidgetDescription::Spacer { .. } => false,
+        // Single-child wrappers delegate. A constrained that bounds the
+        // cross axis will still be honored: phase 3 re-measures the
+        // child with `min == max == row_cross`, and `Constrained` clamps
+        // that into the user's bounds (`Constraints::constrain`). So the
+        // delegation is safe for the bounded case.
+        WidgetDescription::Expanded { .. }
+        | WidgetDescription::Padding { .. }
+        | WidgetDescription::Constrained { .. } => child
+            .children
+            .first()
+            .map(|c| child_cross_greedy_in_axis(c, axis))
+            .unwrap_or(false),
+        _ => false,
     }
 }
 
@@ -2062,6 +2368,219 @@ mod tests {
         assert_eq!(cell_at(&buf, 0, 2), " ");
         assert_eq!(cell_at(&buf, 0, 3), " ");
         assert_eq!(cell_at(&buf, 0, 4), "R");
+    }
+
+    fn fill(ch: &str, style: Option<Style>) -> WidgetDescription {
+        WidgetDescription::Fill {
+            char: ch.into(),
+            style,
+            key: None,
+        }
+    }
+
+    #[test]
+    fn fill_layout_claims_parent_max_constraints() {
+        // Bare fill: layout returns the parent's max bounds on both
+        // axes (greedy). Inside a row the user is expected to wrap the
+        // row in `tui.constrained { max_height = 1 }` to keep a single
+        // rule from bloating the row vertically.
+        let desc = fill("─", None);
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let root = rec.root.as_mut().unwrap();
+        let s = layout(root, Constraints::loose(12, 3));
+        assert_eq!(
+            s,
+            Size {
+                width: 12,
+                height: 3
+            }
+        );
+    }
+
+    #[test]
+    fn fill_paints_char_across_assigned_rect() {
+        // Bare fill — paint_root passes `loose(6, 1)` to the root,
+        // fill claims max → 6×1 rect filled with `─`.
+        let buf = paint_root(fill("─", None), 6, 1);
+        for col in 0..6 {
+            assert_eq!(cell_at(&buf, 0, col), "─", "col {col} should be filled");
+        }
+    }
+
+    #[test]
+    fn fill_repeats_across_multiple_rows() {
+        // Bare fill at the root claims the entire frame.
+        let buf = paint_root(fill("─", None), 4, 2);
+        for row in 0..2 {
+            for col in 0..4 {
+                assert_eq!(
+                    cell_at(&buf, row, col),
+                    "─",
+                    "({row},{col}) should be filled"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fill_propagates_style_to_painted_cells() {
+        use crate::desc::Color;
+        let red = Style {
+            fg: Some(Color::Rgb(255, 0, 0)),
+            ..Style::default()
+        };
+        let buf = paint_root(fill("─", Some(red)), 3, 1);
+        for col in 0..3 {
+            assert_eq!(buf.lines[0].cells[col].style, red);
+            assert_eq!(buf.lines[0].cells[col].text.as_str(), "─");
+        }
+    }
+
+    #[test]
+    fn fill_inside_bordered_box_composition() {
+        // The intended composition for a bordered input field:
+        //   ╭───╮
+        //   │ x │
+        //   ╰───╯
+        // Top/bot rows wrap in `constrained { max_height = 1 }` so
+        // fill (which greedily claims the parent's max_height) doesn't
+        // bloat the rule rows past 1 row tall.
+        let row_with = |corners: (&str, &str)| {
+            constrained(
+                WidgetDescription::Row {
+                    gap: 0,
+                    key: None,
+                    children: vec![
+                        text(corners.0),
+                        expanded(fill("─", None), 1),
+                        text(corners.1),
+                    ],
+                },
+                None,
+                None,
+                None,
+                Some(1),
+            )
+        };
+        let top = row_with(("╭", "╮"));
+        let bot = row_with(("╰", "╯"));
+        let mid = WidgetDescription::Row {
+            gap: 0,
+            key: None,
+            children: vec![text("│"), expanded(text("x"), 1), text("│")],
+        };
+        let desc = WidgetDescription::Column {
+            gap: 0,
+            key: None,
+            children: vec![top, mid, bot],
+        };
+        let buf = paint_root(desc, 5, 3);
+        assert_eq!(cell_at(&buf, 0, 0), "╭");
+        assert_eq!(cell_at(&buf, 0, 1), "─");
+        assert_eq!(cell_at(&buf, 0, 2), "─");
+        assert_eq!(cell_at(&buf, 0, 3), "─");
+        assert_eq!(cell_at(&buf, 0, 4), "╮");
+        assert_eq!(cell_at(&buf, 1, 0), "│");
+        assert_eq!(cell_at(&buf, 1, 4), "│");
+        assert_eq!(cell_at(&buf, 2, 0), "╰");
+        assert_eq!(cell_at(&buf, 2, 1), "─");
+        assert_eq!(cell_at(&buf, 2, 4), "╯");
+    }
+
+    #[test]
+    fn row_with_fill_side_and_multiline_content_stretches_fill() {
+        // Cross-axis stretch: side bar = `tui.fill { char = "│" }`,
+        // body = a 4-row text. Row's natural cross is 4 rows (from the
+        // body). The fill, classified as cross-greedy, is re-measured
+        // with `min_cross == max_cross == 4` and paints `│` on every
+        // row. Without cross-axis stretch the side bar would only paint
+        // at row 0, leaving rows 1..4 unbordered.
+        let body = text("aaa\nbbb\nccc\nddd");
+        let desc = WidgetDescription::Row {
+            gap: 0,
+            key: None,
+            children: vec![fill("│", None), expanded(body, 1), fill("│", None)],
+        };
+        let buf = paint_root(desc, 5, 4);
+        for row in 0..4 {
+            assert_eq!(
+                cell_at(&buf, row, 0),
+                "│",
+                "left side bar must paint row {row}",
+            );
+            assert_eq!(
+                cell_at(&buf, row, 4),
+                "│",
+                "right side bar must paint row {row}",
+            );
+        }
+    }
+
+    #[test]
+    fn column_with_fill_top_and_multiline_content_stretches_fill_horizontally() {
+        // Symmetric to the row case: a column with two `tui.fill` bars
+        // (one above, one below) and a 5-col body in the middle. Cross
+        // axis here is horizontal; bars must paint across the full
+        // column cross (5 cols), not collapse to 0.
+        let desc = WidgetDescription::Column {
+            gap: 0,
+            key: None,
+            children: vec![fill("─", None), expanded(text("hello"), 1), fill("─", None)],
+        };
+        let buf = paint_root(desc, 5, 3);
+        for col in 0..5 {
+            assert_eq!(cell_at(&buf, 0, col), "─", "top fill must paint col {col}",);
+            assert_eq!(
+                cell_at(&buf, 2, col),
+                "─",
+                "bottom fill must paint col {col}",
+            );
+        }
+    }
+
+    #[test]
+    fn row_with_only_greedy_children_uses_parent_max_cross() {
+        // Edge case: every child is cross-greedy, so there is no
+        // natural-cross signal. CSS-flexbox default: take the parent's
+        // full cross. Row of 6 cols × 4 rows, two fills, both must
+        // paint all 4 rows.
+        let desc = WidgetDescription::Row {
+            gap: 0,
+            key: None,
+            children: vec![expanded(fill("a", None), 1), expanded(fill("b", None), 1)],
+        };
+        let buf = paint_root(desc, 6, 4);
+        for row in 0..4 {
+            assert_eq!(cell_at(&buf, row, 0), "a", "row {row} col 0");
+            assert_eq!(cell_at(&buf, row, 5), "b", "row {row} col 5");
+        }
+    }
+
+    #[test]
+    fn row_with_no_greedy_children_unchanged_from_phase_2_behavior() {
+        // Regression guard: a row of plain text widgets must still
+        // collapse to the height of the tallest child, not the parent's
+        // max cross. This is the pre-cross-stretch behavior — the new
+        // pass 3 is a no-op when no child is cross-greedy.
+        let desc = WidgetDescription::Row {
+            gap: 0,
+            key: None,
+            children: vec![text("a"), text("bb"), text("ccc")],
+        };
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let root = rec.root.as_mut().unwrap();
+        let s = layout(root, Constraints::loose(20, 10));
+        // Sum of widths is 6; cross is 1 (all text is 1-tall). Loose
+        // bounds → row reports its content size, not the parent's max.
+        assert_eq!(
+            s,
+            Size {
+                width: 6,
+                height: 1
+            }
+        );
     }
 
     #[test]
