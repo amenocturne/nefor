@@ -24,7 +24,14 @@
 --   json             — single JSON line per turn on completion:
 --                      { answer, tool_calls, duration_ms }.
 --   stream-json      — passthrough: every chat.* / graph.* envelope as
---                      one JSON line on stdout (NCP wire format).
+--                      one JSON line on stdout (NCP wire format). The
+--                      user's prompt is NOT emitted as a chat.input.submit
+--                      envelope here because agentic_workflow.submit
+--                      dispatches directly to the orchestrator rather
+--                      than going through the bus (the chat-plugin path
+--                      that produces chat.input.submit isn't on the wire
+--                      in CLI mode). Reconstruct the prompt from the
+--                      process argv if a transcript replay needs it.
 --
 -- ### REPL design (event-driven via callbacks)
 --
