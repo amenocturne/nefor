@@ -23,6 +23,7 @@ use crate::mouse::{
 use crate::reconciler::Reconciler;
 use crate::render::Renderer;
 use crate::scrollable::{scroll_by_signed, WHEEL_STEP_ROWS};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 thread_local! {
     /// Wall-clock value installed by the engine for the duration of a
@@ -59,6 +60,12 @@ pub struct Engine {
     /// use [`Engine::advance_time`] to bump this; production code never
     /// touches it.
     clock_offset_ms: u64,
+    /// Buffered NCP egress accumulated from `update`'s side-effect list
+    /// plus the imperative `tui.emit`/`tui.send_to` queue. Drained by
+    /// the binary's main loop with [`Engine::take_emit_queue`] and
+    /// written to stdout as one JSON-line `PluginOutgoing::event(body)`
+    /// per entry.
+    pending_emits: Vec<(Option<String>, JsonMap<String, JsonValue>)>,
 }
 
 impl Engine {
@@ -74,6 +81,7 @@ impl Engine {
             exit_requested: false,
             clock_origin: Instant::now(),
             clock_offset_ms: 0,
+            pending_emits: Vec::new(),
         })
     }
 
@@ -210,6 +218,17 @@ impl Engine {
         for e in effects {
             match e {
                 SideEffect::Exit => self.exit_requested = true,
+                SideEffect::Emit { target_hint, body } => {
+                    self.pending_emits.push((target_hint, body));
+                }
+            }
+        }
+        // Drain the imperative emit queue too — `tui.emit / tui.send_to`
+        // pushed envelopes from inside Lua callbacks (e.g. on a deferred
+        // path) are not visible through the `update` return list.
+        for eff in self.lua.take_emit_queue() {
+            if let SideEffect::Emit { target_hint, body } = eff {
+                self.pending_emits.push((target_hint, body));
             }
         }
         // Apply any scroll commands the update issued via tui.scroll_*.
@@ -221,6 +240,30 @@ impl Engine {
         }
         self.needs_render = true;
         Ok(())
+    }
+
+    /// Dispatch an inbound NCP `event` body (the deserialized object
+    /// inside a `{ type: "event", body: { ... } }` envelope) into Lua's
+    /// `update` as a regular message. The body's `kind` becomes
+    /// `msg.kind`; other fields appear as siblings on the table.
+    ///
+    /// Used by the binary's main loop after the `ready_ok` handshake.
+    /// System messages (handshake, shutdown) are NOT routed here — the
+    /// main loop owns those.
+    pub fn dispatch_envelope_body(
+        &mut self,
+        body: &JsonMap<String, JsonValue>,
+    ) -> Result<(), TuiError> {
+        let msg = self.lua.body_to_msg_table(body)?;
+        self.dispatch_msg(msg)
+    }
+
+    /// Drain accumulated NCP egress for the binary's writer. Returns
+    /// `(target_hint, body)` pairs in submission order. The hint is for
+    /// observability only — the engine just emits a broadcast event;
+    /// per-peer routing is the bus's responsibility.
+    pub fn take_emit_queue(&mut self) -> Vec<(Option<String>, JsonMap<String, JsonValue>)> {
+        std::mem::take(&mut self.pending_emits)
     }
 
     /// Apply one scroll command from Lua's queue against the live tree.

@@ -12,7 +12,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use mlua::{Lua, RegistryKey, Table, Value};
+use mlua::{Lua, LuaSerdeExt, RegistryKey, Table, Value};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::desc::{from_lua_table, WidgetDescription, KIND_FIELD};
 use crate::error::TuiError;
@@ -55,12 +56,23 @@ struct StartedState {
     update_key: Option<RegistryKey>,
 }
 
-/// Side-effect record returned from `update`. Phase 1 honors only the
-/// `Exit` variant; unknown kinds are dropped at the boundary with a
-/// warning.
+/// Side-effect record returned from `update` (or queued via the
+/// imperative `tui.emit` helper). Phase 6 adds NCP egress (`Emit`); the
+/// engine drains the list after every `dispatch` and acts on each entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SideEffect {
+    /// Exit the run loop on the next `render_if_dirty` call.
     Exit,
+    /// Emit an NCP `event`-shaped envelope from this plugin. The body
+    /// MUST contain a `kind` string per the protocol; the engine wraps
+    /// it as a `PluginOutgoing::event(body)` and writes it to stdout.
+    /// `target_hint` is documentation-only at the plugin layer — actual
+    /// per-peer delivery is the engine's broker / Lua-side starter
+    /// transforms job (see `starter/ncp.lua`'s prefix-targeting).
+    Emit {
+        target_hint: Option<String>,
+        body: JsonMap<String, JsonValue>,
+    },
 }
 
 pub struct LuaHost {
@@ -73,6 +85,12 @@ pub struct LuaHost {
     /// Snapshot of every scrollable's current geometry. Engine writes;
     /// Lua reads via `tui.scroll_position(key)`.
     scroll_positions: Arc<Mutex<ScrollPositionMap>>,
+    /// Queue of NCP `event`-shaped envelopes that Lua produced via the
+    /// imperative `tui.emit` API. Drained by the engine after every
+    /// `dispatch` and written to stdout. Side-effects returned from
+    /// `update` are layered on top — the engine merges both before
+    /// flushing to the writer.
+    emit_queue: Arc<Mutex<Vec<SideEffect>>>,
 }
 
 impl LuaHost {
@@ -83,18 +101,28 @@ impl LuaHost {
         let scroll_queue: Arc<Mutex<Vec<ScrollCommand>>> = Arc::new(Mutex::new(Vec::new()));
         let scroll_positions: Arc<Mutex<ScrollPositionMap>> =
             Arc::new(Mutex::new(ScrollPositionMap::new()));
+        let emit_queue: Arc<Mutex<Vec<SideEffect>>> = Arc::new(Mutex::new(Vec::new()));
         install_tui(
             &lua,
             Arc::clone(&started),
             Arc::clone(&scroll_queue),
             Arc::clone(&scroll_positions),
+            Arc::clone(&emit_queue),
         )?;
         Ok(LuaHost {
             lua,
             started,
             scroll_queue,
             scroll_positions,
+            emit_queue,
         })
+    }
+
+    /// Drain queued NCP egress so the engine can flush them to stdout.
+    /// Returns the list in submission order.
+    pub fn take_emit_queue(&self) -> Vec<SideEffect> {
+        let mut q = lock(&self.emit_queue);
+        std::mem::take(&mut *q)
     }
 
     /// Drain any scroll commands that Lua queued during the most recent
@@ -160,9 +188,24 @@ impl LuaHost {
         from_lua_table(&table)
     }
 
+    /// Convert an NCP event body (`{ kind = "...", ... }`, JSON-shaped)
+    /// to a Lua table suitable for [`Self::dispatch`]. The conversion
+    /// goes through serde so nested objects/arrays / numbers / strings
+    /// land as native Lua types.
+    pub fn body_to_msg_table(&self, body: &JsonMap<String, JsonValue>) -> Result<Table, TuiError> {
+        let value = JsonValue::Object(body.clone());
+        let lua_val: Value = self.lua.to_value(&value)?;
+        let Value::Table(t) = lua_val else {
+            return Err(TuiError::InvalidDesc(
+                "internal: body_to_msg_table: top-level NCP body must be a JSON object".into(),
+            ));
+        };
+        Ok(t)
+    }
+
     /// Dispatch a message through `update(msg, state)`. Returns the side-
-    /// effect list as honored side-effects (phase 1: only `Exit`).
-    /// Other kinds are tracing-warned and dropped.
+    /// effect list (Exit / Emit). Unknown kinds are tracing-warned and
+    /// dropped.
     pub fn dispatch(&self, msg: Table) -> Result<Vec<SideEffect>, TuiError> {
         let (update, state) = {
             let started = lock(&self.started);
@@ -187,7 +230,7 @@ impl LuaHost {
             started.state_key = Some(new_state_key);
         }
 
-        Ok(parse_side_effects(effects_val))
+        Ok(parse_side_effects(&self.lua, effects_val))
     }
 }
 
@@ -198,7 +241,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     })
 }
 
-fn parse_side_effects(v: Value) -> Vec<SideEffect> {
+fn parse_side_effects(lua: &Lua, v: Value) -> Vec<SideEffect> {
     let table = match v {
         Value::Nil => return Vec::new(),
         Value::Table(t) => t,
@@ -236,6 +279,13 @@ fn parse_side_effects(v: Value) -> Vec<SideEffect> {
         };
         match kind.as_deref() {
             Some("exit") => out.push(SideEffect::Exit),
+            // `send_to` / `emit` — both shapes are accepted, both produce
+            // a `SideEffect::Emit`. The body is converted from Lua to
+            // serde_json::Value via mlua's serde bridge.
+            Some("send_to") | Some("emit") => match parse_emit_entry(lua, &entry_t) {
+                Ok(eff) => out.push(eff),
+                Err(e) => tracing::warn!(error = %e, "failed to parse emit/send_to side-effect"),
+            },
             Some(other) => {
                 tracing::warn!(kind = other, "unknown side-effect kind; ignoring");
             }
@@ -247,11 +297,37 @@ fn parse_side_effects(v: Value) -> Vec<SideEffect> {
     out
 }
 
+/// Convert a `{ kind = "send_to" | "emit", target?: string, body: table }`
+/// Lua table into a [`SideEffect::Emit`]. Errors propagate so the caller
+/// can log a precise reason.
+fn parse_emit_entry(lua: &Lua, entry: &Table) -> mlua::Result<SideEffect> {
+    let target_hint: Option<String> = match entry.get::<Value>("target") {
+        Ok(Value::String(s)) => s.to_str().ok().map(|c| c.to_string()),
+        // Backwards-compat: chat.lua may use `plugin = "..."`.
+        _ => match entry.get::<Value>("plugin") {
+            Ok(Value::String(s)) => s.to_str().ok().map(|c| c.to_string()),
+            _ => None,
+        },
+    };
+    let body_val: Value = entry.get("body")?;
+    let body_json: JsonValue = lua.from_value(body_val)?;
+    let JsonValue::Object(map) = body_json else {
+        return Err(mlua::Error::runtime(
+            "send_to/emit: `body` must be a JSON object (Lua table with string keys)",
+        ));
+    };
+    Ok(SideEffect::Emit {
+        target_hint,
+        body: map,
+    })
+}
+
 fn install_tui(
     lua: &Lua,
     started: Arc<Mutex<StartedState>>,
     scroll_queue: Arc<Mutex<Vec<ScrollCommand>>>,
     scroll_positions: Arc<Mutex<ScrollPositionMap>>,
+    emit_queue: Arc<Mutex<Vec<SideEffect>>>,
 ) -> Result<(), TuiError> {
     let tui = lua.create_table()?;
 
@@ -427,6 +503,71 @@ fn install_tui(
         })?;
     tui.set("scroll_position", scroll_position_fn)?;
 
+    // ── NCP egress ───────────────────────────────────────────────────
+    //
+    // Two equivalent surfaces:
+    //   tui.emit(body)
+    //   tui.send_to(target, body)
+    // Both push a `SideEffect::Emit` onto the shared queue; the engine
+    // drains the queue after every dispatch and writes one
+    // `PluginOutgoing::event(body)` per entry. `target` is a hint —
+    // actual per-peer routing is the engine's broker / starter NCP
+    // transforms job.
+
+    let queue_for_emit = Arc::clone(&emit_queue);
+    let emit_fn = lua.create_function(move |lua, body: Value| -> mlua::Result<()> {
+        let Value::Table(t) = body else {
+            return Err(mlua::Error::runtime(
+                "tui.emit: `body` must be a table with a `kind` field",
+            ));
+        };
+        let body_json: JsonValue = lua.from_value(Value::Table(t))?;
+        let JsonValue::Object(map) = body_json else {
+            return Err(mlua::Error::runtime(
+                "tui.emit: `body` must encode to a JSON object",
+            ));
+        };
+        if !map.get("kind").is_some_and(JsonValue::is_string) {
+            return Err(mlua::Error::runtime(
+                "tui.emit: `body` must contain a string `kind` field",
+            ));
+        }
+        lock(&queue_for_emit).push(SideEffect::Emit {
+            target_hint: None,
+            body: map,
+        });
+        Ok(())
+    })?;
+    tui.set("emit", emit_fn)?;
+
+    let queue_for_send_to = Arc::clone(&emit_queue);
+    let send_to_fn = lua.create_function(
+        move |lua, (target, body): (String, Value)| -> mlua::Result<()> {
+            let Value::Table(t) = body else {
+                return Err(mlua::Error::runtime(
+                    "tui.send_to: `body` must be a table with a `kind` field",
+                ));
+            };
+            let body_json: JsonValue = lua.from_value(Value::Table(t))?;
+            let JsonValue::Object(map) = body_json else {
+                return Err(mlua::Error::runtime(
+                    "tui.send_to: `body` must encode to a JSON object",
+                ));
+            };
+            if !map.get("kind").is_some_and(JsonValue::is_string) {
+                return Err(mlua::Error::runtime(
+                    "tui.send_to: `body` must contain a string `kind` field",
+                ));
+            }
+            lock(&queue_for_send_to).push(SideEffect::Emit {
+                target_hint: Some(target),
+                body: map,
+            });
+            Ok(())
+        },
+    )?;
+    tui.set("send_to", send_to_fn)?;
+
     // tui.start { initial_state, view, update }
     let started_for_start = Arc::clone(&started);
     let start_fn = lua.create_function(move |lua, args: Table| {
@@ -551,7 +692,7 @@ mod tests {
             tui.start {
                 initial_state = {},
                 view = function(_) return tui.text { content = "x" } end,
-                update = function(_, s) return s, { { kind = "send_to" } } end,
+                update = function(_, s) return s, { { kind = "totally-made-up-effect" } } end,
             }
         "#,
         );
@@ -559,6 +700,77 @@ mod tests {
         msg.set("kind", "key.x").expect("set");
         let effects = host.dispatch(msg).expect("dispatch");
         assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn send_to_side_effect_is_parsed_into_emit() {
+        let host = host_with(
+            r#"
+            tui.start {
+                initial_state = {},
+                view = function(_) return tui.text { content = "x" } end,
+                update = function(_, s)
+                    return s, {
+                        { kind = "send_to", target = "ollama",
+                          body  = { kind = "chat.input.submit", text = "hi" } },
+                    }
+                end,
+            }
+        "#,
+        );
+        let msg = host.lua().create_table().expect("tbl");
+        msg.set("kind", "noop").expect("set");
+        let effects = host.dispatch(msg).expect("dispatch");
+        assert_eq!(effects.len(), 1);
+        match &effects[0] {
+            SideEffect::Emit { target_hint, body } => {
+                assert_eq!(target_hint.as_deref(), Some("ollama"));
+                assert_eq!(
+                    body.get("kind").and_then(|v| v.as_str()),
+                    Some("chat.input.submit")
+                );
+                assert_eq!(body.get("text").and_then(|v| v.as_str()), Some("hi"));
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn imperative_tui_emit_queues_for_engine_drain() {
+        let host = LuaHost::new().expect("host");
+        host.lua()
+            .load(r#"tui.emit { kind = "x.test", n = 7 }"#)
+            .exec()
+            .expect("emit");
+        let drained = host.take_emit_queue();
+        assert_eq!(drained.len(), 1);
+        match &drained[0] {
+            SideEffect::Emit { target_hint, body } => {
+                assert_eq!(*target_hint, None);
+                assert_eq!(body.get("kind").and_then(|v| v.as_str()), Some("x.test"));
+                assert_eq!(body.get("n").and_then(|v| v.as_i64()), Some(7));
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+        // Drain leaves the queue empty.
+        assert!(host.take_emit_queue().is_empty());
+    }
+
+    #[test]
+    fn body_to_msg_table_round_trips_nested_object() {
+        let host = LuaHost::new().expect("host");
+        let mut body = JsonMap::new();
+        body.insert("kind".into(), JsonValue::String("chat.stream.delta".into()));
+        body.insert("text".into(), JsonValue::String("hi".into()));
+        let mut nested = JsonMap::new();
+        nested.insert("a".into(), JsonValue::from(1));
+        body.insert("nested".into(), JsonValue::Object(nested));
+        let t = host.body_to_msg_table(&body).expect("convert");
+        let kind: String = t.get("kind").expect("kind");
+        assert_eq!(kind, "chat.stream.delta");
+        let nested_t: Table = t.get("nested").expect("nested");
+        let a: i64 = nested_t.get("a").expect("a");
+        assert_eq!(a, 1);
     }
 
     #[test]

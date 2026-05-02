@@ -1,12 +1,15 @@
 //! nefor-tui binary entrypoint.
 //!
-//! Phase 1 wiring: NCP handshake on stdin/stdout, raw-mode + /dev/tty for
-//! terminal output, crossterm event stream into the engine. Receives no
-//! NCP events of its own use yet (chat lives on the legacy plugin until
-//! phase 6); the binary is here so the plugin can be smoke-tested end to
-//! end with a hand-supplied scenario before the migration ramps up.
+//! Phase 6 wiring: NCP handshake on stdin/stdout, raw-mode + /dev/tty for
+//! terminal output, crossterm event stream into the engine. Receives
+//! `event`-shaped envelopes from peers (e.g. `chat.stream.delta` from a
+//! provider via `agentic_workflow.for_provider`'s outer adapter) and
+//! routes them into the user-authored Lua composition via
+//! `Engine::dispatch_envelope_body`. Egress (`tui.emit` / `tui.send_to`
+//! from Lua) lands on stdout as `PluginOutgoing::event(body)`.
 
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -14,6 +17,7 @@ use crossterm::event::{Event, EventStream};
 use crossterm::terminal::size as term_size;
 use futures::StreamExt;
 use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
@@ -26,16 +30,17 @@ use nefor_tui::tty::{open_tty, RawModeGuard};
 
 const PROTOCOL_VERSION: &str = "0.1";
 
-/// Hard-coded scenario for phase-1 smoke runs. The real plugin entry
-/// point will load Lua from a CLI flag once the surface stabilises;
-/// hard-coding keeps the binary buildable and exercisable today.
+/// Default scenario when no `--script` flag is supplied. Useful for
+/// `cargo run -p nefor-tui` smoke runs and `cargo install` users who
+/// haven't picked a chat composition yet. The real chat surface lives
+/// at `starter/chat.lua` and gets loaded via `--script <path>`.
 const PLACEHOLDER_SCENARIO: &str = r#"
     tui.start {
       initial_state = { count = 0 },
       view = function(s)
         return tui.column { gap = 0, children = {
           tui.padding { value = 1, child = tui.text { content = "count: " .. tostring(s.count) } },
-          tui.text { content = "press space; q to quit" },
+          tui.text { content = "press space; q to quit; pass --script <path> to load a real composition" },
         }}
       end,
       update = function(msg, s)
@@ -45,6 +50,57 @@ const PLACEHOLDER_SCENARIO: &str = r#"
       end,
     }
 "#;
+
+/// Parse `--script <path>` (or `-s <path>`) out of `std::env::args`.
+/// Hand-rolled, no external dep — clap would just slow build times for
+/// what is structurally a single-flag CLI. Unrecognised flags abort the
+/// run with a usage hint so a typo doesn't silently load the placeholder.
+fn parse_script_flag() -> Result<Option<PathBuf>, String> {
+    let mut iter = std::env::args().skip(1);
+    let mut script: Option<PathBuf> = None;
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-s" | "--script" => {
+                let path = iter
+                    .next()
+                    .ok_or_else(|| "nefor-tui: --script requires a path argument".to_string())?;
+                script = Some(PathBuf::from(path));
+            }
+            "-h" | "--help" => {
+                return Err("Usage: nefor-tui [--script <path>]\n\n\
+                     --script <path>   Load a Lua composition that calls tui.start { ... }.\n\
+                     --help            Show this message.\n"
+                    .to_string());
+            }
+            other => {
+                return Err(format!(
+                    "nefor-tui: unknown argument `{other}` (use --help for usage)"
+                ));
+            }
+        }
+    }
+    Ok(script)
+}
+
+/// Read the `--script` file (UTF-8, no encoding sniffing) and feed it to
+/// the engine. Errors carry the path so a missing/wrong file is obvious.
+fn load_script_or_placeholder(
+    engine: &mut Engine,
+    script: Option<&PathBuf>,
+) -> Result<(), TuiError> {
+    match script {
+        Some(path) => {
+            let src = std::fs::read_to_string(path).map_err(|e| {
+                TuiError::Io(std::io::Error::other(format!(
+                    "nefor-tui: failed to read --script {}: {e}",
+                    path.display()
+                )))
+            })?;
+            engine.load_scenario(&src)
+        }
+        None => engine.load_scenario(PLACEHOLDER_SCENARIO),
+    }
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -56,7 +112,15 @@ async fn main() -> ExitCode {
         )
         .init();
 
-    match run().await {
+    let script = match parse_script_flag() {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::from(2);
+        }
+    };
+
+    match run(script.as_ref()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "nefor-tui exited with error");
@@ -66,7 +130,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> Result<(), TuiError> {
+async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
     // Stdout writer first so the handshake can land cleanly.
     let (out_tx, _writer_handle) = spawn_stdout_writer();
     let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, TuiError>>(CHANNEL_CAP);
@@ -90,7 +154,13 @@ async fn run() -> Result<(), TuiError> {
 
     let (cols, rows) = term_size().unwrap_or((80, 24));
     let mut engine = Engine::new(cols, rows)?;
-    engine.load_scenario(PLACEHOLDER_SCENARIO)?;
+    load_script_or_placeholder(&mut engine, script)?;
+
+    // Flush any emit-queue entries the script produced at load time
+    // (e.g. an initial `tui.emit { kind = "nefor-tui.hello" }` style
+    // self-advertisement). The placeholder produces nothing here; chat
+    // compositions may.
+    drain_emits_to_writer(&mut engine, &out_tx).await?;
 
     let mut term_events = EventStream::new();
     // ~60Hz tick for animation primitives. The arm is always armed —
@@ -102,11 +172,19 @@ async fn run() -> Result<(), TuiError> {
         tokio::select! {
             maybe_env = in_rx.recv() => match maybe_env {
                 Some(Ok(env)) => {
-                    if let Body::System(SystemBody::Shutdown { .. }) = env.body {
-                        break;
+                    match env.body {
+                        Body::System(SystemBody::Shutdown { .. }) => break,
+                        Body::System(_) => {
+                            // Other system messages (ready_ok again, errors)
+                            // are not actionable post-handshake; log + skip.
+                            tracing::debug!("post-handshake system message ignored");
+                        }
+                        Body::Event(map) => {
+                            if let Err(e) = engine.dispatch_envelope_body(&map) {
+                                tracing::warn!(error = %e, "engine.dispatch_envelope_body");
+                            }
+                        }
                     }
-                    // Phase 1 ignores all post-handshake NCP events; the
-                    // legacy plugin still owns chat until phase 6.
                 }
                 Some(Err(e)) => tracing::warn!(error = %e, "stdin parse error"),
                 None => break,
@@ -134,6 +212,11 @@ async fn run() -> Result<(), TuiError> {
             }
         }
 
+        // Drain Lua egress before painting — the user expects a single
+        // pass: handle event → emit messages → repaint reflecting the
+        // new state.
+        drain_emits_to_writer(&mut engine, &out_tx).await?;
+
         if let Some(bytes) = engine.render_if_dirty()? {
             tty_main.write_all(&bytes)?;
             tty_main.flush()?;
@@ -150,4 +233,34 @@ async fn run() -> Result<(), TuiError> {
     drop(tty_main);
     let _ = out_tx; // keep writer alive until end of run
     Ok(())
+}
+
+/// Drain accumulated Lua egress and forward each entry as a
+/// `PluginOutgoing::event(body)` line. `target_hint` is logged but not
+/// used for routing — the engine broadcasts; per-peer delivery happens
+/// via the bus (prefix-targeting in `starter/ncp.lua`).
+async fn drain_emits_to_writer(
+    engine: &mut Engine,
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+) -> Result<(), TuiError> {
+    let pending = engine.take_emit_queue();
+    for (target_hint, body) in pending {
+        if let Some(t) = &target_hint {
+            tracing::trace!(target = %t, kind = ?body.get("kind"), "emit (hint)");
+        }
+        let outgoing = PluginOutgoing::event(canonical_body(body));
+        out_tx
+            .send(outgoing)
+            .await
+            .map_err(|_| TuiError::WriterClosed)?;
+    }
+    Ok(())
+}
+
+/// `serde_json::Map` already has insertion-order semantics with the
+/// `preserve_order` feature on, so this is identity. Wrapped as a
+/// helper anyway so a future canonicalization pass (e.g. moving `kind`
+/// to the front) has one place to live.
+fn canonical_body(map: JsonMap<String, JsonValue>) -> JsonMap<String, JsonValue> {
+    map
 }
