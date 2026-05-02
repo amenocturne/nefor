@@ -16,7 +16,9 @@
 use std::collections::HashMap;
 
 use crate::desc::WidgetDescription;
-use crate::instance::{default_state, instance_key, kind_of, InstanceKey, WidgetInstance};
+use crate::instance::{
+    default_state, instance_key, kind_of, InstanceKey, LayoutResult, WidgetInstance,
+};
 
 #[derive(Debug, Default)]
 pub struct Reconciler {
@@ -67,13 +69,18 @@ fn mount_subtree(
     let kind = kind_of(&desc);
     let key = instance_key(&desc, position);
     let children = match &desc {
-        WidgetDescription::Text { .. } => Vec::new(),
-        WidgetDescription::Column { children, .. } => children
+        WidgetDescription::Text { .. } | WidgetDescription::Spacer { .. } => Vec::new(),
+        WidgetDescription::Column { children, .. }
+        | WidgetDescription::Row { children, .. }
+        | WidgetDescription::Stack { children, .. } => children
             .iter()
             .enumerate()
             .map(|(i, c)| mount_subtree(c.clone(), i, summary))
             .collect(),
-        WidgetDescription::Padding { child, .. } => {
+        WidgetDescription::Padding { child, .. }
+        | WidgetDescription::Expanded { child, .. }
+        | WidgetDescription::Constrained { child, .. }
+        | WidgetDescription::Align { child, .. } => {
             vec![mount_subtree((**child).clone(), 0, summary)]
         }
     };
@@ -82,6 +89,7 @@ fn mount_subtree(
         children,
         state: default_state(kind),
         last_desc: desc,
+        layout: LayoutResult::default(),
     }
 }
 
@@ -95,9 +103,14 @@ fn update_instance(
     summary.reused += 1;
 
     let new_children = match &new_desc {
-        WidgetDescription::Text { .. } => Vec::new(),
-        WidgetDescription::Column { children, .. } => children.clone(),
-        WidgetDescription::Padding { child, .. } => vec![(**child).clone()],
+        WidgetDescription::Text { .. } | WidgetDescription::Spacer { .. } => Vec::new(),
+        WidgetDescription::Column { children, .. }
+        | WidgetDescription::Row { children, .. }
+        | WidgetDescription::Stack { children, .. } => children.clone(),
+        WidgetDescription::Padding { child, .. }
+        | WidgetDescription::Expanded { child, .. }
+        | WidgetDescription::Constrained { child, .. }
+        | WidgetDescription::Align { child, .. } => vec![(**child).clone()],
     };
 
     inst.children = reconcile_children(std::mem::take(&mut inst.children), new_children, summary);

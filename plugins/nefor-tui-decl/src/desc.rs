@@ -24,6 +24,11 @@ pub enum WidgetDescription {
         gap: u16,
         key: Option<String>,
     },
+    Row {
+        children: Vec<WidgetDescription>,
+        gap: u16,
+        key: Option<String>,
+    },
     Padding {
         top: u16,
         right: u16,
@@ -32,6 +37,45 @@ pub enum WidgetDescription {
         child: Box<WidgetDescription>,
         key: Option<String>,
     },
+    Stack {
+        children: Vec<WidgetDescription>,
+        key: Option<String>,
+    },
+    Expanded {
+        flex: u16,
+        child: Box<WidgetDescription>,
+        key: Option<String>,
+    },
+    Spacer {
+        flex: u16,
+        key: Option<String>,
+    },
+    Constrained {
+        min_width: Option<u16>,
+        max_width: Option<u16>,
+        min_height: Option<u16>,
+        max_height: Option<u16>,
+        child: Box<WidgetDescription>,
+        key: Option<String>,
+    },
+    Align {
+        alignment: Alignment,
+        child: Box<WidgetDescription>,
+        key: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Alignment {
+    TopLeft,
+    Top,
+    TopRight,
+    Left,
+    Center,
+    Right,
+    BottomLeft,
+    Bottom,
+    BottomRight,
 }
 
 impl WidgetDescription {
@@ -40,7 +84,13 @@ impl WidgetDescription {
         match self {
             WidgetDescription::Text { .. } => "text",
             WidgetDescription::Column { .. } => "column",
+            WidgetDescription::Row { .. } => "row",
             WidgetDescription::Padding { .. } => "padding",
+            WidgetDescription::Stack { .. } => "stack",
+            WidgetDescription::Expanded { .. } => "expanded",
+            WidgetDescription::Spacer { .. } => "spacer",
+            WidgetDescription::Constrained { .. } => "constrained",
+            WidgetDescription::Align { .. } => "align",
         }
     }
 
@@ -49,7 +99,13 @@ impl WidgetDescription {
         match self {
             WidgetDescription::Text { key, .. }
             | WidgetDescription::Column { key, .. }
-            | WidgetDescription::Padding { key, .. } => key.as_deref(),
+            | WidgetDescription::Row { key, .. }
+            | WidgetDescription::Padding { key, .. }
+            | WidgetDescription::Stack { key, .. }
+            | WidgetDescription::Expanded { key, .. }
+            | WidgetDescription::Spacer { key, .. }
+            | WidgetDescription::Constrained { key, .. }
+            | WidgetDescription::Align { key, .. } => key.as_deref(),
         }
     }
 }

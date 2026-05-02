@@ -120,9 +120,10 @@ impl Renderer {
     /// Render `root` and return the ANSI byte stream that brings the
     /// terminal up to date. Subsequent calls diff against the prior
     /// frame's contents; force a full redraw with [`Renderer::mark_full`].
-    pub fn render(&mut self, root: &WidgetInstance) -> Vec<u8> {
+    pub fn render(&mut self, root: &mut WidgetInstance) -> Vec<u8> {
         self.next.reset(self.width, self.height);
-        layout::paint(root, self.width, self.height, (0, 0), &mut self.next);
+        reset_layout_state(root);
+        layout::layout_and_paint(root, self.width, self.height, &mut self.next);
         let bytes = if self.needs_full {
             self.emit_full()
         } else {
@@ -172,6 +173,17 @@ impl Renderer {
         out.push_str(HIDE_CURSOR);
         out.push_str(SYNC_END);
         out.into_bytes()
+    }
+}
+
+/// Walk `inst` and reset every instance's `layout` cache so a fresh
+/// measure pass starts clean. Layout state is not part of `InstanceState`
+/// (which the reconciler preserves verbatim across rebuilds), but it
+/// still lives on each instance and would otherwise leak per-frame data.
+fn reset_layout_state(inst: &mut WidgetInstance) {
+    inst.layout.reset();
+    for c in inst.children.iter_mut() {
+        reset_layout_state(c);
     }
 }
 
@@ -231,7 +243,7 @@ mod tests {
         let mut rec = Reconciler::new();
         rec.reconcile(desc);
         let mut renderer = Renderer::new(w, h);
-        let bytes = renderer.render(rec.root.as_ref().unwrap());
+        let bytes = renderer.render(rec.root.as_mut().unwrap());
         let s = String::from_utf8(bytes).expect("ansi is utf-8");
         (renderer, rec, s)
     }
@@ -258,11 +270,11 @@ mod tests {
         let mut rec = Reconciler::new();
         rec.reconcile(column(vec![text_root("aaa"), text_root("bbb")]));
         let mut renderer = Renderer::new(10, 3);
-        let _ = renderer.render(rec.root.as_ref().unwrap());
+        let _ = renderer.render(rec.root.as_mut().unwrap());
 
         // Change only the second child.
         rec.reconcile(column(vec![text_root("aaa"), text_root("BBB")]));
-        let bytes = renderer.render(rec.root.as_ref().unwrap());
+        let bytes = renderer.render(rec.root.as_mut().unwrap());
         let out = String::from_utf8(bytes).expect("utf-8");
 
         // No CLEAR_SCREEN on diff frame.
@@ -288,9 +300,9 @@ mod tests {
         let mut rec = Reconciler::new();
         rec.reconcile(text_root("hello"));
         let mut renderer = Renderer::new(10, 2);
-        let _ = renderer.render(rec.root.as_ref().unwrap());
+        let _ = renderer.render(rec.root.as_mut().unwrap());
         renderer.resize(20, 4);
-        let bytes = renderer.render(rec.root.as_ref().unwrap());
+        let bytes = renderer.render(rec.root.as_mut().unwrap());
         let out = String::from_utf8(bytes).expect("utf-8");
         assert!(out.contains(CLEAR_SCREEN), "post-resize must full-redraw");
     }

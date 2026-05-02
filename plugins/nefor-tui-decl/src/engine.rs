@@ -84,7 +84,7 @@ impl Engine {
         }
         let desc = self.lua.render_view()?;
         self.reconciler.reconcile(desc);
-        let root = self.reconciler.root.as_ref().ok_or(TuiError::NotStarted)?;
+        let root = self.reconciler.root.as_mut().ok_or(TuiError::NotStarted)?;
         let bytes = self.renderer.render(root);
         self.needs_render = false;
         Ok(Some(bytes))

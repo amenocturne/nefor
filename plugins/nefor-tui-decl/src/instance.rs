@@ -5,6 +5,7 @@
 //! rebuild.
 
 use crate::desc::WidgetDescription;
+use crate::layout::Size;
 
 /// Composite reconciler key. Two stages compose it:
 /// - `type_tag` — static string, never reused across primitive types
@@ -26,7 +27,13 @@ pub enum KeyId {
 pub enum InstanceKind {
     Text,
     Column,
+    Row,
     Padding,
+    Stack,
+    Expanded,
+    Spacer,
+    Constrained,
+    Align,
 }
 
 /// Per-primitive internal state preserved across `view` rebuilds. Phase 1
@@ -38,7 +45,33 @@ pub enum InstanceState {
     #[default]
     Text,
     Column,
+    Row,
     Padding,
+    Stack,
+    Expanded,
+    Spacer,
+    Constrained,
+    Align,
+}
+
+/// Layout side-effect storage on each instance — set by the measure pass,
+/// read by the paint pass. Reset before each measure to drop stale data
+/// from prior frames (the reconciler preserves state across rebuilds, so
+/// nothing else clears it).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LayoutResult {
+    /// Size returned by the most recent `layout` call.
+    pub size: Size,
+    /// For row/column: per-child main-axis size, ordered by child index.
+    /// Empty for non-flex parents.
+    pub flex_main_sizes: Vec<u16>,
+}
+
+impl LayoutResult {
+    pub fn reset(&mut self) {
+        self.size = Size::default();
+        self.flex_main_sizes.clear();
+    }
 }
 
 #[derive(Debug)]
@@ -47,6 +80,7 @@ pub struct WidgetInstance {
     pub children: Vec<WidgetInstance>,
     pub state: InstanceState,
     pub last_desc: WidgetDescription,
+    pub layout: LayoutResult,
 }
 
 impl WidgetInstance {
@@ -63,7 +97,13 @@ pub fn default_state(kind: InstanceKind) -> InstanceState {
     match kind {
         InstanceKind::Text => InstanceState::Text,
         InstanceKind::Column => InstanceState::Column,
+        InstanceKind::Row => InstanceState::Row,
         InstanceKind::Padding => InstanceState::Padding,
+        InstanceKind::Stack => InstanceState::Stack,
+        InstanceKind::Expanded => InstanceState::Expanded,
+        InstanceKind::Spacer => InstanceState::Spacer,
+        InstanceKind::Constrained => InstanceState::Constrained,
+        InstanceKind::Align => InstanceState::Align,
     }
 }
 
@@ -71,7 +111,13 @@ pub fn kind_of(desc: &WidgetDescription) -> InstanceKind {
     match desc {
         WidgetDescription::Text { .. } => InstanceKind::Text,
         WidgetDescription::Column { .. } => InstanceKind::Column,
+        WidgetDescription::Row { .. } => InstanceKind::Row,
         WidgetDescription::Padding { .. } => InstanceKind::Padding,
+        WidgetDescription::Stack { .. } => InstanceKind::Stack,
+        WidgetDescription::Expanded { .. } => InstanceKind::Expanded,
+        WidgetDescription::Spacer { .. } => InstanceKind::Spacer,
+        WidgetDescription::Constrained { .. } => InstanceKind::Constrained,
+        WidgetDescription::Align { .. } => InstanceKind::Align,
     }
 }
 
