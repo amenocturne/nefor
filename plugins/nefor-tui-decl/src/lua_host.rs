@@ -246,6 +246,13 @@ fn install_tui(lua: &Lua, started: Arc<Mutex<StartedState>>) -> Result<(), TuiEr
     })?;
     tui.set("align", align_fn)?;
 
+    // tui.anchored { anchor?, offset_x?, offset_y?, width?, height?, child, key? }
+    let anchored_fn = lua.create_function(|_, args: Table| {
+        args.set(KIND_FIELD, "anchored")?;
+        Ok(args)
+    })?;
+    tui.set("anchored", anchored_fn)?;
+
     // tui.start { initial_state, view, update }
     let started_for_start = Arc::clone(&started);
     let start_fn = lua.create_function(move |lua, args: Table| {

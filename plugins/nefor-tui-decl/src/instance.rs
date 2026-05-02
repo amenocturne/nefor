@@ -34,6 +34,7 @@ pub enum InstanceKind {
     Spacer,
     Constrained,
     Align,
+    Anchored,
 }
 
 /// Per-primitive internal state preserved across `view` rebuilds. Phase 1
@@ -52,6 +53,7 @@ pub enum InstanceState {
     Spacer,
     Constrained,
     Align,
+    Anchored,
 }
 
 /// Layout side-effect storage on each instance — set by the measure pass,
@@ -65,12 +67,16 @@ pub struct LayoutResult {
     /// For row/column: per-child main-axis size, ordered by child index.
     /// Empty for non-flex parents.
     pub flex_main_sizes: Vec<u16>,
+    /// For `anchored`: the resolved (width, height) the child should use.
+    /// `None` when the instance is not an anchored.
+    pub anchored_child_size: Option<Size>,
 }
 
 impl LayoutResult {
     pub fn reset(&mut self) {
         self.size = Size::default();
         self.flex_main_sizes.clear();
+        self.anchored_child_size = None;
     }
 }
 
@@ -104,6 +110,7 @@ pub fn default_state(kind: InstanceKind) -> InstanceState {
         InstanceKind::Spacer => InstanceState::Spacer,
         InstanceKind::Constrained => InstanceState::Constrained,
         InstanceKind::Align => InstanceState::Align,
+        InstanceKind::Anchored => InstanceState::Anchored,
     }
 }
 
@@ -118,6 +125,7 @@ pub fn kind_of(desc: &WidgetDescription) -> InstanceKind {
         WidgetDescription::Spacer { .. } => InstanceKind::Spacer,
         WidgetDescription::Constrained { .. } => InstanceKind::Constrained,
         WidgetDescription::Align { .. } => InstanceKind::Align,
+        WidgetDescription::Anchored { .. } => InstanceKind::Anchored,
     }
 }
 
