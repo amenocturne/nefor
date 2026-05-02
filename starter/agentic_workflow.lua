@@ -134,13 +134,56 @@ end
 -- requires `from`+`ts` on every wire envelope; the engine forwards our
 -- payloads verbatim, so we stamp them ourselves. Target nil = broadcast
 -- (engine fans out); a string targets one peer.
+--
+-- json.encode is wrapped in pcall: a payload that contains non-UTF-8
+-- bytes (e.g. binary file content reaching the bus, or a UTF-8-truncated
+-- multibyte boundary from a buggy producer) would otherwise raise from
+-- the bus dispatcher with no path back to the run — engine logs the
+-- error but the broker keeps idling, hanging the user. On encode
+-- failure: emit a synthesised chat.popup so the user sees something
+-- failed, log loudly, and request engine exit so the run terminates
+-- cleanly instead of hanging.
 local function emit(target, body)
-  local payload = json.encode({
+  local ok, payload = pcall(json.encode, {
     type = "event",
     from = "engine",
     ts   = nefor.engine.now(),
     body = body,
   })
+  if not ok then
+    local kind = (type(body) == "table" and tostring(body.kind)) or "(unknown)"
+    nefor.log.error("agentic_workflow: json.encode failed — payload not emitted", {
+      kind  = kind,
+      error = tostring(payload),
+    })
+    -- Best-effort user-visible popup. Build the popup envelope from
+    -- string primitives only so the popup itself can't repeat the
+    -- failure. If even this re-encode fails, we've at least logged.
+    local popup_ok, popup_payload = pcall(json.encode, {
+      type = "event",
+      from = "engine",
+      ts   = nefor.engine.now(),
+      body = {
+        kind  = "chat.popup",
+        level = "error",
+        text  = "internal error: failed to encode bus event (kind="
+                .. kind .. "); see engine log",
+      },
+    })
+    if popup_ok and nefor.engine and nefor.engine.send then
+      for _, peer in ipairs(nefor.engine.plugins()) do
+        nefor.engine.send(popup_payload, peer)
+      end
+    end
+    -- Cleanly tear down the run. The CLI driver waits for engine.exit;
+    -- TUI driver treats this as a fatal — better to surface the bug
+    -- than silently hang. Guarded so a missing binding (test harness)
+    -- doesn't compound the failure.
+    if nefor.engine and type(nefor.engine.exit) == "function" then
+      nefor.engine.exit(1)
+    end
+    return
+  end
   if target ~= nil then
     nefor.engine.send(payload, target)
   else

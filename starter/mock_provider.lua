@@ -100,6 +100,17 @@ local SUBMITTED_ACK_MARKER = "Submitted sub%-graph run_id="
 -- helpers
 -- ------------------------------------------------------------------
 
+-- UTF-8-safe truncate: returns `s` truncated to at most `n` codepoints.
+-- `string.sub` is byte-indexed; slicing inside a multibyte codepoint
+-- yields invalid UTF-8 that downstream `json.encode` chokes on. Use
+-- `utf8.offset` (Lua 5.3+) to find the byte offset of codepoint n+1.
+local function utf8_truncate(s, n)
+  if type(s) ~= "string" then return s end
+  local end_byte = utf8.offset(s, n + 1)
+  if end_byte == nil then return s end
+  return string.sub(s, 1, end_byte - 1)
+end
+
 local function pick_response_for(chat_id)
   local history = chats[chat_id] or {}
 
@@ -200,7 +211,7 @@ local function pick_response_for(chat_id)
   end
 
   return {
-    text = "[mock provider: no canned match for: " .. string.sub(last_user, 1, 60) .. "]",
+    text = "[mock provider: no canned match for: " .. utf8_truncate(last_user, 60) .. "]",
     finish_reason = "stop",
   }
 end
@@ -253,16 +264,24 @@ local function emit_stream(chat_id, text, opts)
   -- for the orchestrator's relay turn — but emitting them
   -- unconditionally keeps the mock simple and rg_adapter's gate
   -- handles the rest.
-  local n = math.max(1, math.floor(#text / 3))
-  local i = 1
-  while i <= #text do
-    local stop = math.min(i + n - 1, #text)
+  --
+  -- Chunk boundaries snap to UTF-8 codepoint edges. `string.sub` is
+  -- byte-indexed; slicing inside a multibyte codepoint produces
+  -- invalid UTF-8 that downstream `serde_json` can't deserialise.
+  local cp_count = utf8.len(text) or #text
+  local cp_per_chunk = math.max(1, math.floor(cp_count / 3))
+  local cp_i = 1
+  while cp_i <= cp_count do
+    local cp_stop = math.min(cp_i + cp_per_chunk - 1, cp_count)
+    local byte_start = utf8.offset(text, cp_i)
+    local byte_after_stop = utf8.offset(text, cp_stop + 1)
+    local byte_stop = byte_after_stop and (byte_after_stop - 1) or #text
     nefor.emit("stream.delta", {
       id      = id,
       chat_id = chat_id,
-      text    = string.sub(text, i, stop),
+      text    = string.sub(text, byte_start, byte_stop),
     })
-    i = stop + 1
+    cp_i = cp_stop + 1
   end
   nefor.emit("stream.end", {
     id            = id,
