@@ -958,6 +958,93 @@ mod tests {
         }
     }
 
+    const STICK_END_SCENARIO: &str = r#"
+        tui.start {
+          initial_state = { rows = 5, scroll_events = 0 },
+          view = function(s)
+            local kids = {}
+            for i = 1, s.rows do
+              kids[#kids + 1] = tui.text { content = "row " .. i }
+            end
+            return tui.column { gap = 0, children = {
+              tui.text { content = "events: " .. tostring(s.scroll_events) },
+              tui.expanded {
+                child = tui.scrollable {
+                  key       = "transcript",
+                  child     = tui.column { gap = 0, children = kids },
+                  stick_to  = "end",
+                  on_scroll = "log.scrolled",
+                },
+              },
+            }}
+          end,
+          update = function(msg, s)
+            if msg.kind == "grow" then
+              return { rows = s.rows + msg.delta, scroll_events = s.scroll_events }, {}
+            elseif msg.kind == "log.scrolled" then
+              return { rows = s.rows, scroll_events = s.scroll_events + 1 }, {}
+            end
+            return s, {}
+          end,
+        }
+    "#;
+
+    #[test]
+    fn stick_to_end_engine_pins_to_bottom_through_growth() {
+        let mut engine = Engine::new(20, 6).expect("engine");
+        engine.load_scenario(STICK_END_SCENARIO).expect("load");
+        let _ = engine.render_if_dirty().expect("render");
+        // Initial: 5 rows in a 5-row viewport — fits, scroll_y_max == 0.
+        // Grow content to 30 rows.
+        dispatch_kind_with(&mut engine, "grow", "delta", 25);
+        let _ = engine.render_if_dirty().expect("render");
+        let root = engine.reconciler.root.as_ref().expect("root");
+        let scroll_inst = &root.children[1].children[0];
+        match &scroll_inst.state {
+            InstanceState::Scrollable(s) => {
+                assert_eq!(
+                    s.scroll_y,
+                    s.scroll_y_max(),
+                    "stick_to = end pins after growth"
+                );
+                assert_eq!(s.scroll_y, 25);
+            }
+            _ => panic!("expected scrollable state"),
+        }
+    }
+
+    #[test]
+    fn wheel_fires_on_scroll_callback_when_configured() {
+        let mut engine = Engine::new(20, 6).expect("engine");
+        engine.load_scenario(STICK_END_SCENARIO).expect("load");
+        // Grow content first so wheel can move scroll_y.
+        dispatch_kind_with(&mut engine, "grow", "delta", 25);
+        let _ = engine.render_if_dirty().expect("render");
+
+        // Wheel up moves us off the bottom — on_scroll fires once.
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Wheel,
+                x: 1,
+                y: 2,
+                button: Some("up"),
+                mods: vec![],
+            })
+            .expect("wheel");
+        let _ = engine.render_if_dirty().expect("render");
+        let root = engine.reconciler.root.as_ref().expect("root");
+        let leading_text_desc = &root.children[0].last_desc;
+        match leading_text_desc {
+            WidgetDescription::Text { content, .. } => {
+                assert_eq!(
+                    content, "events: 1",
+                    "on_scroll should fire on wheel-induced scroll"
+                );
+            }
+            _ => panic!("expected leading text"),
+        }
+    }
+
     #[test]
     fn lua_scroll_to_unknown_key_errors() {
         const BAD_KEY: &str = r#"
