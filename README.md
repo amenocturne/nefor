@@ -15,25 +15,30 @@ just run     # launch engine + default config
 just test    # workspace tests (hermetic)
 ```
 
-Manual smoke against real Claude:
+Manual smoke against the local Ollama provider (default starter config):
 
 ```sh
-cargo build -p nefor -p mock-plugin -p nefor-chat -p nefor-tui
-NEFOR_PLUGIN_DIR=$PWD/plugins cargo run --bin nefor -- --config ./tmp/smoke-config-m2
+cargo build --workspace
+NEFOR_PLUGIN_DIR=$PWD/plugins cargo run --bin nefor -- --config ./starter
 ```
 
-Ctrl+C (or Ctrl+D) exits cleanly; `/resume` loads the most recent prior session for the current cwd, `/resume <uuid>` loads a specific one.
+Ctrl+C (or `/quit` in chat) exits cleanly; `/new` clears the transcript and starts a new chat.
 
 ## Layout
 
 - `crates/nefor-combinators/` — pure Rust substrate (Context, Reasoner, combinators).
 - `crates/nefor-protocol/` — NCP v0.1 types + parsers.
 - `crates/nefor/` — engine binary: NCP broker + mlua host.
-- `plugins/nefor-tui/` — terminal frontend (Rust, crossterm + ratatui).
-- `plugins/nefor-chat/` — chat UI (Rust) bridging mock-plugin ↔ nefor-tui.
-- `plugins/mock-plugin/` — Claude CLI wrapper (Rust) emitting `cc.*` events.
+- `plugins/nefor-tui/` — declarative TUI plugin (Rust): primitives + reconciler + line-diff renderer + Lua VM. The chat surface itself is Lua composition (`starter/chat.lua`).
+- `plugins/mock-plugin/` — Claude CLI wrapper (Rust) emitting `cc.*` events (opt-in).
+- `plugins/openai-provider/` — OpenAI-compatible HTTP provider (Ollama, real OpenAI, etc).
+- `plugins/reasoner-graph/` — orchestrator graph engine.
+- `plugins/tool-gate/` — tool advertisement + permission gate.
+- `plugins/basic-tools/` — bundled tools (read_file, etc).
 - `plugins/mock-plugin/` — scriptable peer for integration tests.
-- `starter/init.lua` — legacy reference config (awaiting rewrite for the three-plugin graph).
+- `starter/init.lua` — default engine composition. Spawns the orchestrator stack + nefor-tui with chat.lua.
+- `starter/chat.lua` — chat surface as a ~280-LOC Lua composition over `tui.*` primitives.
+- `cli-config/init.lua` — same engine, no UI: `nefor plugin agentic-cli "<prompt>"`.
 
 ## Testing
 

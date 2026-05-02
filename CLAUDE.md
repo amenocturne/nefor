@@ -7,8 +7,7 @@ Rust rewrite of nefor: orchestration substrate for AI agents. Monorepo: pure alg
 - `crates/nefor-combinators/` — in-process algebra library (pure Rust, minimal deps). Trait shapes for Rust-native plugins. The *canonical* combinator library at runtime is the plugin, not the crate.
 - `crates/nefor-protocol/` — NCP v0.1 envelope + system-body types. Used by plugins; engine stopped importing it in Slice 2.
 - `crates/nefor/` — engine binary. Pure string-layer event bus: reads plugin stdin, stamps `{origin, ts}`, persists to session log, invokes a required Lua `step` hook, routes step's `nefor.engine.send` calls. All NCP semantics live in Lua.
-- `plugins/nefor-tui/` — Rust NCP plugin: ratatui/crossterm terminal frontend with text selection + clipboard.
-- `plugins/nefor-chat/` — Rust NCP plugin: chat UI consuming `chat-contract v0.1` (statusline v2, markdown rendering, tool one-liners, DAG running-nodes sidebar pane behind Ctrl-B).
+- `plugins/nefor-tui/` — Rust NCP plugin: declarative TUI engine (reconciler + line-diff renderer + Lua VM + 15 primitives). Hosts the chat surface as a ~280-LOC Lua composition (`starter/chat.lua`). The pre-phase-6 split (`nefor-chat` chat-state owner + ratatui-based `nefor-tui` renderer over a grid protocol) collapsed into this single plugin.
 - `plugins/mock-plugin/` — Rust NCP plugin wrapping the `claude` CLI; emits `cc.*` events; declares `Context`/`Message` types + `Merge<Message>` handler. Adapter `starter/mock_plugin_adapter.lua` translates `cc.*` ↔ chat-contract.
 - `plugins/nefor-combinators/` — Rust NCP plugin: typed combinator registry keyed by `Identity (arity, input_type, output_multiset)`; per-trait constraint validation (Merge, Into, Fanout, Equivalent).
 - `plugins/generic-provider/`, `plugins/generic-tool/` — passive type-registry hubs owning canonical types (`ProviderIn`, `ProviderOut`, `ChatHistory`, `ToolCalls`, `ToolResults`, …). Concrete providers/tools declare `Into`/`From` against these so graphs are provider-agnostic.
@@ -21,10 +20,10 @@ Rust rewrite of nefor: orchestration substrate for AI agents. Monorepo: pure alg
 - `tools/fake-engine/` — harness that impersonates the engine for plugin-side tests.
 - `starter/init.lua` — glue: package.path, `step` delegator, plugin spawn order, per-edge `from_plugin`/`to_plugin` transforms.
 - `starter/ncp.lua` — NCP v0.1 in Lua (handshake, broadcast, replay, errors). JSON via `nefor.json` (serde_json bridged through mlua, ~10–40× faster than rxi/json.lua).
-- `starter/reasoner_graph_adapter.lua` — type-driven adapter for the scheduler. Handles `<reasoner>.run_node` for `dummy`, `responder`, `provider-wrapper`, `tool-executor`, `adapter`, `terminal`. Drives openai-provider + tool-gate; emits ack and `graph.node_result`.
-- `starter/spawn_graph.lua` — Lua tool binding exposing `spawn_graph` in the orchestrator's catalog. Translates tool-invoke → `reasoner-graph.run`, run-complete → `tool.result`.
-- `starter/chat_orchestrator.lua` — `chat.input.submit` ↔ orchestrator template graph. Persists `next_state` (chat_id) across submits via in-process `on_node_result` observer hook.
-- `starter/openai_provider_adapter.lua` — provider-side chat-contract bridge.
+- `starter/agentic_workflow.lua` — consolidated orchestration: per-edge transform factories (`for_provider`, `for_reasoner_graph`, `for_tool_gate`, `for_chat`), reasoner-type handlers (`dummy`, `responder`, `provider-wrapper`, `tool-executor`, `adapter`, `terminal`), spawn_graph tool binding, chat-input intake. Single source of truth for the orchestration graph wired by `init.lua`.
+- `starter/agentic_cli.lua` — virtual `agentic-cli` plugin: surfaces `agentic_workflow` over stdin/stdout for `nefor plugin agentic-cli "<prompt>"` invocations.
+- `starter/mock_plugin_adapter.lua` — opt-in `cc.*` ↔ chat-contract bridge.
+- `starter/chat.lua` — chat surface as a Lua composition over `tui.*` primitives (transcript, statusline, input, popup, slash commands).
 
 ## Conventions (enforced)
 - Errors: `thiserror` for domain errors, `anyhow` only at the top boundary (`main.rs`).
@@ -58,7 +57,8 @@ Source of truth lives in the vault, not here:
 
 **Slice 1 shipped** (combinator foundations). `nefor-combinators` plugin = type-aware registry + dispatch executor; mock-plugin declares `Context`/`Message` + `Merge<Message>` handler. Validated by `combinators_slice1.rs`.
 
-**M2 shipped** (Claude on screen). Engine spawns `mock-plugin + nefor-chat + nefor-tui` as three processes; prompts flow user → tui → chat → harness → Claude and responses stream back. `/resume` reloads prior session history.
+**M2 shipped** (Claude on screen). Engine spawns providers + reasoner-graph + tool-gate + nefor-tui (with `starter/chat.lua` as the chat composition); prompts flow user → tui → orchestrator → provider → tui and responses stream back. `/new` clears the transcript; `/quit` exits.
+
 
 **Recent UI polish.** DAG running-nodes panel above the statusline driven by `dag.run_started` / `dag.node_dispatched` lifecycle events; right sidebar pane (Ctrl-B toggle, persistent, vertical separator); `/dag-test` slash command for end-to-end DAG smoke testing; colored DAG widget rows; finished tasks linger 2s before pruning.
 
@@ -73,7 +73,7 @@ Source of truth lives in the vault, not here:
 
 ### 3. UX polish carry-overs from Session 3
 
-- **Sidebar count "1/4 most of the time"** — `handle_dag_node_dispatched` overwrites the entry on cycle re-dispatch, resetting Done→Running. Better display: "X done / Y dispatched" (no reset) or per-firing rows. `nefor-chat/render.rs#run_id_prefix_spans` + `nefor-chat/main.rs#handle_dag_node_dispatched`.
+- **Sidebar count "1/4 most of the time"** — DAG sidebar moved to phase 7 (deferred from the chat.lua cutover). The legacy issue (overwrite on cycle re-dispatch) carries forward to whoever rebuilds the panel as a Lua composition.
 - **No UI signal that a sub-graph spawn is in flight.** With async `spawn_graph` the chat unblocks fast; users have no badge telling them "background work running." Hook `spawn_graph.completed` events to a status-line indicator or a `chat.popup`.
 - **Permission-prompt fatigue.** `tool-gate --default prompt` prompts every spawn. `--allow spawn_graph` for trusted tools, or sticky-allow per session, would smooth iteration.
 - **Timeout / cancellation for deferred completions.** `chat_orchestrator.attach_spawn_graph_listener` queues forever; a runaway sub-graph never times out. Out-of-scope for v1; capture for Stage 2.
@@ -100,6 +100,6 @@ Source of truth lives in the vault, not here:
 - **Graceful shutdown** from starter via `nefor.engine.on_shutdown(fn)`.
 - **Leaf Reasoners** — `at-file`, `review-terminal`, `review-file-annotation`.
 - **Plugin-root resolver polish** — engine prefers XDG even when the dir doesn't exist.
-- **Syntax highlighting** inside markdown code blocks in nefor-chat.
+- **Syntax highlighting** inside markdown code blocks in nefor-tui's `tui.markdown` primitive.
 
 Deferred / not coming: WASM runtime, persona system, hook runner, plugin manager (Mason-style), capability model, multi-frontend (GUI/web/telegram beyond the NCP-first terminal) — all post-MVP plugin-land.
