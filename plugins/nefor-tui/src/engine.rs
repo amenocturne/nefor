@@ -214,6 +214,12 @@ impl Engine {
     /// Dispatch an arbitrary Lua message table — used by the binary to
     /// inject NCP-routed events alongside synthetic key messages.
     pub fn dispatch_msg(&mut self, msg: mlua::Table) -> Result<(), TuiError> {
+        // Publish the current frame-clock to Lua so `tui.now_ms()` reads
+        // the same value the animation sampler sees on the next render —
+        // critical for time-stamped composition (DAG-panel linger, "X
+        // seconds since" labels) where divergence between the two clocks
+        // would surface as flicker or off-by-one prune timing.
+        self.lua.set_now_ms(self.now_ms());
         let effects = self.lua.dispatch(msg)?;
         for e in effects {
             match e {
@@ -494,6 +500,11 @@ impl Engine {
         }
         let now = self.now_ms();
         install_render_time_ms(now);
+        // Mirror the time the animation sampler sees into Lua so
+        // `tui.now_ms()` calls inside `view` (e.g. "show this run only
+        // if completed_at_ms + linger > now") agree with what the
+        // animation primitive computes on the same frame.
+        self.lua.set_now_ms(now);
         let desc = self.lua.render_view()?;
         self.reconciler.reconcile(desc);
         let root = self.reconciler.root.as_mut().ok_or(TuiError::NotStarted)?;

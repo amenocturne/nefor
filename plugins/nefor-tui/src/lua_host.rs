@@ -10,6 +10,7 @@
 //! pulls the registry-stored values for each render and dispatch.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use mlua::{Lua, LuaSerdeExt, RegistryKey, Table, Value};
@@ -91,6 +92,13 @@ pub struct LuaHost {
     /// `update` are layered on top — the engine merges both before
     /// flushing to the writer.
     emit_queue: Arc<Mutex<Vec<SideEffect>>>,
+    /// Frame-clock value the engine installs before each dispatch /
+    /// render. Lua reads it via `tui.now_ms()` so timing-sensitive
+    /// composition (DAG-panel linger windows, cooldowns, time-since-X
+    /// labels) sees the same monotonic clock the animation sampler does
+    /// — including any synthetic `Engine::advance_time` offset tests
+    /// install. No Lua-side `os.time()` round-trip; one source of truth.
+    now_ms: Arc<AtomicU64>,
 }
 
 impl LuaHost {
@@ -102,12 +110,14 @@ impl LuaHost {
         let scroll_positions: Arc<Mutex<ScrollPositionMap>> =
             Arc::new(Mutex::new(ScrollPositionMap::new()));
         let emit_queue: Arc<Mutex<Vec<SideEffect>>> = Arc::new(Mutex::new(Vec::new()));
+        let now_ms: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         install_tui(
             &lua,
             Arc::clone(&started),
             Arc::clone(&scroll_queue),
             Arc::clone(&scroll_positions),
             Arc::clone(&emit_queue),
+            Arc::clone(&now_ms),
         )?;
         Ok(LuaHost {
             lua,
@@ -115,7 +125,16 @@ impl LuaHost {
             scroll_queue,
             scroll_positions,
             emit_queue,
+            now_ms,
         })
+    }
+
+    /// Publish the engine's current frame-clock to Lua. The engine calls
+    /// this before every `dispatch` and render so `tui.now_ms()` returns
+    /// the same value the animation sampler sees, including the
+    /// `Engine::advance_time` offset tests use.
+    pub fn set_now_ms(&self, now_ms: u64) {
+        self.now_ms.store(now_ms, Ordering::Relaxed);
     }
 
     /// Drain queued NCP egress so the engine can flush them to stdout.
@@ -328,6 +347,7 @@ fn install_tui(
     scroll_queue: Arc<Mutex<Vec<ScrollCommand>>>,
     scroll_positions: Arc<Mutex<ScrollPositionMap>>,
     emit_queue: Arc<Mutex<Vec<SideEffect>>>,
+    now_ms: Arc<AtomicU64>,
 ) -> Result<(), TuiError> {
     let tui = lua.create_table()?;
 
@@ -502,6 +522,23 @@ fn install_tui(
             Ok(t)
         })?;
     tui.set("scroll_position", scroll_position_fn)?;
+
+    // ── Clock query ──────────────────────────────────────────────────
+    //
+    // `tui.now_ms()` returns the engine's current frame-clock in
+    // milliseconds. The engine writes the value before every dispatch
+    // and render, so the number Lua reads is the same monotonic clock
+    // the animation sampler uses — including any synthetic offset tests
+    // install via `Engine::advance_time`. Composition that needs to
+    // stamp a "completed at" or check "is X still within its linger
+    // window" should use this rather than a Lua-side `os.time()` so
+    // timestamps remain comparable across the dispatch / view boundary
+    // and tests stay deterministic.
+    let now_for_lua = Arc::clone(&now_ms);
+    let now_ms_fn = lua.create_function(move |_, ()| -> mlua::Result<u64> {
+        Ok(now_for_lua.load(Ordering::Relaxed))
+    })?;
+    tui.set("now_ms", now_ms_fn)?;
 
     // ── NCP egress ───────────────────────────────────────────────────
     //
