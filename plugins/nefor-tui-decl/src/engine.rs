@@ -14,9 +14,13 @@ use crate::input::KeyMessage;
 use crate::input_router::{route_key, RouteDecision};
 use crate::instance::{sync_text_inputs, InstanceKind, InstanceState, WidgetInstance};
 use crate::lua_host::{LuaHost, SideEffect};
-use crate::mouse::{hit_test, kind_string, MouseMessage};
+use crate::mouse::{
+    find_scrollable_path, hit_test, instance_at_path as mouse_instance_at_path, kind_string,
+    MouseKind, MouseMessage,
+};
 use crate::reconciler::Reconciler;
 use crate::render::Renderer;
+use crate::scrollable::{scroll_by_signed, WHEEL_STEP_ROWS};
 
 thread_local! {
     /// Wall-clock value installed by the engine for the duration of a
@@ -217,12 +221,39 @@ impl Engine {
         Ok(())
     }
 
-    /// Dispatch a [`MouseMessage`]. Hit-tests against the most recently
-    /// painted tree (uses each instance's `painted_rect`); the result is
-    /// always bubbled to Lua as `{ kind, x, y, target_key, button, mods }`.
-    /// Wheel events bubble verbatim — auto-scroll on `scrollable` lands
-    /// in phase 5a.
+    /// Dispatch a [`MouseMessage`]. Browser-style routing:
+    ///
+    /// - **Wheel + scrollable under cursor** → engine auto-scrolls the
+    ///   deepest enclosing `scrollable` and does NOT bubble the event.
+    ///   The scroll is `WHEEL_STEP_ROWS` per notch, matching the legacy
+    ///   chat plugin's convention.
+    /// - **Wheel + no scrollable** → bubble `mouse.wheel` to Lua so the
+    ///   user can wire whatever fallback they want (e.g. carousel).
+    /// - **Clicks** → always bubble, with the deepest keyed instance's
+    ///   user_key as `target_key` (hit-test result).
     pub fn handle_mouse(&mut self, evt: MouseMessage) -> Result<(), TuiError> {
+        // Wheel auto-scroll: try to absorb the event by mutating a
+        // scrollable's state. If none is under the cursor, fall through
+        // to the bubble path so Lua sees the wheel event verbatim.
+        if matches!(evt.kind, MouseKind::Wheel) {
+            let absorbed = self.try_wheel_scroll(&evt)?;
+            if let Some(notify) = absorbed {
+                if let Some((kind, target_key, offset)) = notify {
+                    // The scrollable absorbed the wheel and configured
+                    // an `on_scroll` callback — emit it so Lua observes
+                    // the new offset. Same `dispatch_msg` path as any
+                    // other engine-originated message.
+                    let msg = self.lua().create_table()?;
+                    msg.set("kind", kind)?;
+                    msg.set("target_key", target_key)?;
+                    msg.set("offset", offset)?;
+                    self.dispatch_msg(msg)?;
+                }
+                self.needs_render = true;
+                return Ok(());
+            }
+        }
+
         let target_key = self
             .reconciler
             .root
@@ -246,6 +277,62 @@ impl Engine {
         }
         msg.set("mods", mods)?;
         self.dispatch_msg(msg)
+    }
+
+    /// Attempt to absorb a wheel event into a scrollable under the
+    /// cursor. Returns:
+    ///
+    /// - `Ok(None)` — no scrollable under cursor; caller should bubble.
+    /// - `Ok(Some(None))` — scrolled silently (no `on_scroll` configured
+    ///   or scroll_y didn't change).
+    /// - `Ok(Some(Some((kind, target_key, offset))))` — scrolled and
+    ///   `on_scroll` should be dispatched.
+    ///
+    /// Decoupled from `handle_mouse` so the borrow split (mutable
+    /// scrollable state vs. immutable Lua VM access) stays local — the
+    /// outer dispatch path can then use `self.lua()` after the mutation
+    /// scope closes.
+    #[allow(clippy::type_complexity)]
+    fn try_wheel_scroll(
+        &mut self,
+        evt: &MouseMessage,
+    ) -> Result<Option<Option<(String, String, u16)>>, TuiError> {
+        let delta_rows: i32 = match evt.button {
+            Some("up") => -(WHEEL_STEP_ROWS as i32),
+            Some("down") => WHEEL_STEP_ROWS as i32,
+            _ => return Ok(None),
+        };
+        let Some(root) = self.reconciler.root.as_mut() else {
+            return Ok(None);
+        };
+        let Some(path) = find_scrollable_path(root, evt.x, evt.y) else {
+            return Ok(None);
+        };
+        let Some(target) = mouse_instance_at_path(root, &path) else {
+            return Ok(None);
+        };
+        let target_key = target.last_desc.user_key().map(|s| s.to_string());
+        let on_scroll = match &target.last_desc {
+            WidgetDescription::Scrollable { on_scroll, .. } => on_scroll.clone(),
+            _ => None,
+        };
+        let new_offset = match &mut target.state {
+            InstanceState::Scrollable(s) => {
+                let prev = s.scroll_y;
+                scroll_by_signed(s, delta_rows);
+                if s.scroll_y == prev {
+                    None
+                } else {
+                    Some(s.scroll_y)
+                }
+            }
+            _ => None,
+        };
+        let notify = match (on_scroll, target_key, new_offset) {
+            (Some(kind), Some(key), Some(offset)) => Some((kind, key, offset)),
+            _ => None,
+        };
+        Ok(Some(notify))
     }
 
     /// Render if dirty. Returns the ANSI bytes; `None` means "no work".
@@ -493,5 +580,143 @@ mod tests {
             s.contains("clicked: label"),
             "expected label hit, got:\n{s}"
         );
+    }
+
+    const SCROLL_SCENARIO: &str = r#"
+        tui.start {
+          initial_state = { wheels = 0 },
+          view = function(s)
+            local kids = {}
+            for i = 1, 30 do
+              kids[#kids + 1] = tui.text { content = "row " .. i }
+            end
+            -- text first so the column gives it its natural 1-row height,
+            -- then `expanded` hands the rest of the rows to the scrollable.
+            return tui.column { gap = 0, children = {
+              tui.text { content = "wheels: " .. tostring(s.wheels) },
+              tui.expanded {
+                child = tui.scrollable {
+                  key       = "transcript",
+                  child     = tui.column { gap = 0, children = kids },
+                  scrollbar = "auto",
+                },
+              },
+            }}
+          end,
+          update = function(msg, s)
+            if msg.kind == "mouse.wheel" then
+              return { wheels = s.wheels + 1 }, {}
+            end
+            return s, {}
+          end,
+        }
+    "#;
+
+    #[test]
+    fn wheel_inside_scrollable_scrolls_and_does_not_bubble() {
+        use crate::mouse::{MouseKind, MouseMessage};
+        let mut engine = Engine::new(20, 6).expect("engine");
+        engine.load_scenario(SCROLL_SCENARIO).expect("load");
+        let _ = engine.render_if_dirty().expect("render");
+
+        // Cursor at y=2 lands inside the scrollable (rows 1..6).
+        // Wheel-down should scroll the scrollable, not bubble. So
+        // `wheels` stays at 0.
+        for _ in 0..3 {
+            engine
+                .handle_mouse(MouseMessage {
+                    kind: MouseKind::Wheel,
+                    x: 1,
+                    y: 2,
+                    button: Some("down"),
+                    mods: vec![],
+                })
+                .expect("wheel");
+        }
+        let _ = engine.render_if_dirty().expect("render");
+        // Verify the wheel events did NOT bubble: the Lua state's
+        // `wheels` counter would have to advance for that to happen,
+        // which would in turn change row 0's text. Re-render the tree
+        // by querying it directly for the current frame state.
+        let root = engine.reconciler.root.as_ref().expect("root");
+        // Tree: column { text, expanded { scrollable } }.
+        // Verify the leading text still says "wheels: 0".
+        let leading_text_desc = &root.children[0].last_desc;
+        match leading_text_desc {
+            WidgetDescription::Text { content, .. } => {
+                assert_eq!(
+                    content, "wheels: 0",
+                    "wheel inside scrollable must not bubble"
+                );
+            }
+            _ => panic!("expected leading text in column children[0]"),
+        }
+        // And the scroll position advanced. WHEEL_STEP_ROWS = 3, three
+        // notches → 9 rows.
+        let scroll_inst = &root.children[1].children[0];
+        match &scroll_inst.state {
+            InstanceState::Scrollable(s) => assert_eq!(s.scroll_y, 9),
+            _ => panic!("expected scrollable state"),
+        }
+    }
+
+    #[test]
+    fn wheel_outside_scrollable_bubbles_to_lua() {
+        use crate::mouse::{MouseKind, MouseMessage};
+        let mut engine = Engine::new(20, 6).expect("engine");
+        engine.load_scenario(SCROLL_SCENARIO).expect("load");
+        let _ = engine.render_if_dirty().expect("render");
+
+        // The leading text sits at row 0; the scrollable occupies rows
+        // 1..6. Wheel at y=0 lands on the text — outside the
+        // scrollable's painted rect — so the event bubbles.
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Wheel,
+                x: 1,
+                y: 0,
+                button: Some("up"),
+                mods: vec![],
+            })
+            .expect("wheel");
+        let _ = engine.render_if_dirty().expect("render");
+        // The wheel bubbled — Lua's `update` advanced `wheels` to 1, so
+        // a re-render of `view` produces a Text desc with the new content.
+        let root = engine.reconciler.root.as_ref().expect("root");
+        let leading_text_desc = &root.children[0].last_desc;
+        match leading_text_desc {
+            WidgetDescription::Text { content, .. } => {
+                assert_eq!(
+                    content, "wheels: 1",
+                    "wheel outside scrollable should bubble"
+                );
+            }
+            _ => panic!("expected leading text in column children[0]"),
+        }
+    }
+
+    #[test]
+    fn wheel_at_top_clamps_at_zero() {
+        use crate::mouse::{MouseKind, MouseMessage};
+        let mut engine = Engine::new(20, 6).expect("engine");
+        engine.load_scenario(SCROLL_SCENARIO).expect("load");
+        let _ = engine.render_if_dirty().expect("render");
+
+        // Already at top — wheel-up should clamp at 0 (no underflow).
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Wheel,
+                x: 1,
+                y: 2,
+                button: Some("up"),
+                mods: vec![],
+            })
+            .expect("wheel");
+        let root = engine.reconciler.root.as_ref().expect("root");
+        let scroll_inst = &root.children[1].children[0];
+        match &scroll_inst.state {
+            InstanceState::Scrollable(s) => assert_eq!(s.scroll_y, 0),
+            _ => panic!("expected scrollable state"),
+        }
     }
 }

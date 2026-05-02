@@ -17,7 +17,7 @@
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::desc::WidgetDescription;
-use crate::instance::WidgetInstance;
+use crate::instance::{InstanceKind, WidgetInstance};
 use crate::layout::Rect;
 
 /// Normalized mouse event the engine routes to Lua. Mirrors the spec's
@@ -120,6 +120,57 @@ fn rect_contains(rect: &Rect, x: u16, y: u16) -> bool {
     let x_in = x >= rect.col && x < rect.col.saturating_add(rect.width);
     let y_in = y >= rect.row && y < rect.row.saturating_add(rect.height);
     x_in && y_in
+}
+
+/// Walk the instance tree depth-first and return the **path** (sequence
+/// of child indices from the root) to the deepest `scrollable` whose
+/// painted rect contains `(x, y)`. `None` means no scrollable is under
+/// the cursor. The caller follows the path with `instance_at_path` to get
+/// a mutable handle (the borrow shape mirrors `input_router::route_key`).
+pub fn find_scrollable_path(root: &WidgetInstance, x: u16, y: u16) -> Option<Vec<usize>> {
+    let mut path: Vec<usize> = Vec::new();
+    let mut deepest: Option<Vec<usize>> = None;
+    walk_scrollable(root, x, y, &mut path, &mut deepest);
+    deepest
+}
+
+fn walk_scrollable(
+    inst: &WidgetInstance,
+    x: u16,
+    y: u16,
+    path: &mut Vec<usize>,
+    out: &mut Option<Vec<usize>>,
+) {
+    let Some(rect) = inst.layout.painted_rect else {
+        return;
+    };
+    if !rect_contains(&rect, x, y) {
+        return;
+    }
+    if matches!(inst.kind(), InstanceKind::Scrollable) {
+        *out = Some(path.clone());
+    }
+    for (i, child) in inst.children.iter().enumerate() {
+        path.push(i);
+        walk_scrollable(child, x, y, path, out);
+        path.pop();
+    }
+}
+
+/// Reach into the tree following `path` and return a mutable reference
+/// to the targeted instance. Mirrors `input_router::instance_at_path` so
+/// callers don't have to import a different helper for the wheel-scroll
+/// path. Returns `None` if any step is out of range.
+pub fn instance_at_path<'a>(
+    root: &'a mut WidgetInstance,
+    path: &[usize],
+) -> Option<&'a mut WidgetInstance> {
+    let mut cur: &mut WidgetInstance = root;
+    for &i in path {
+        let child = cur.children.get_mut(i)?;
+        cur = child;
+    }
+    Some(cur)
 }
 
 /// Convenience helper: build the kind string Lua sees for this event.
@@ -281,5 +332,56 @@ mod tests {
     fn kind_string_matches_spec() {
         assert_eq!(kind_string(MouseKind::Click), "mouse.click");
         assert_eq!(kind_string(MouseKind::Wheel), "mouse.wheel");
+    }
+
+    fn scrollable_desc(child: WidgetDescription, key: &str) -> WidgetDescription {
+        WidgetDescription::Scrollable {
+            key: Some(key.into()),
+            child: Box::new(child),
+            stick_to: None,
+            on_scroll: None,
+            scrollbar: crate::scrollable::ScrollbarMode::Auto,
+            style: None,
+        }
+    }
+
+    #[test]
+    fn find_scrollable_path_returns_path_when_cursor_inside() {
+        // column { scrollable { text("longish") }, text("trailer") }
+        let kids: Vec<_> = (0..15).map(|i| text(&format!("l{i}"), None)).collect();
+        let s = scrollable_desc(column(kids, None), "transcript");
+        let layout_tree = column(vec![s, text("trailer", None)], None);
+        let r = render_tree(layout_tree, 20, 6);
+        let root = r.root.as_ref().unwrap();
+        // (x=2, y=2) lands inside the scrollable's first 5 rows.
+        let path = find_scrollable_path(root, 2, 2).expect("scrollable under cursor");
+        // `instance_at_path` retrieves the scrollable instance.
+        let mut r2 = r;
+        let inst = instance_at_path(r2.root.as_mut().unwrap(), &path).expect("walk path");
+        assert_eq!(inst.last_desc.user_key(), Some("transcript"));
+    }
+
+    #[test]
+    fn find_scrollable_path_returns_none_when_cursor_outside() {
+        // Single text at the root: no scrollable in tree.
+        let r = render_tree(text("hello", Some("t")), 10, 3);
+        let root = r.root.as_ref().unwrap();
+        assert!(find_scrollable_path(root, 0, 0).is_none());
+    }
+
+    #[test]
+    fn find_scrollable_path_picks_deepest_when_nested() {
+        // Outer scrollable wraps an inner scrollable. The deepest hit
+        // wins so wheel events scroll the closest container under the
+        // cursor.
+        let inner_kids: Vec<_> = (0..30).map(|i| text(&format!("i{i}"), None)).collect();
+        let inner = scrollable_desc(column(inner_kids, None), "inner");
+        let outer = scrollable_desc(inner, "outer");
+        let r = render_tree(outer, 20, 6);
+        let root = r.root.as_ref().unwrap();
+        let path = find_scrollable_path(root, 1, 1).expect("path");
+        let mut r2 = r;
+        let inst = instance_at_path(r2.root.as_mut().unwrap(), &path).expect("walk");
+        assert_eq!(inst.last_desc.user_key(), Some("inner"));
     }
 }
