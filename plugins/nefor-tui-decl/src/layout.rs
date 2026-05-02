@@ -512,30 +512,23 @@ fn paint_stack(inst: &WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
 // ── Expanded / Spacer ────────────────────────────────────────────────────
 
 fn layout_expanded(inst: &mut WidgetInstance, c: Constraints) -> Size {
-    // Fill: tight to max on both axes (parent will have already shrunk
-    // max via flex distribution if this lives in a row/column).
-    let target = Size {
-        width: c.max_width,
-        height: c.max_height,
+    // Pass parent's constraints straight through. The flex parent
+    // (row/column) tightens the main axis via `min == max` before calling
+    // here; the cross axis stays loose so the child picks its natural
+    // size. Outside a flex parent, behaves like the bare child.
+    let child_size = match inst.children.first_mut() {
+        Some(child) => layout(child, c),
+        None => Size::default(),
     };
-    if let Some(child) = inst.children.first_mut() {
-        let _ = layout(
-            child,
-            Constraints {
-                min_width: 0,
-                max_width: c.max_width,
-                min_height: 0,
-                max_height: c.max_height,
-            },
-        );
-    }
-    c.constrain(target)
+    c.constrain(child_size)
 }
 
 fn layout_spacer(_inst: &mut WidgetInstance, c: Constraints) -> Size {
+    // Same logic as expanded but no child: fill the main axis (tight via
+    // parent), collapse on the loose axis.
     c.constrain(Size {
-        width: c.max_width,
-        height: c.max_height,
+        width: c.min_width,
+        height: c.min_height,
     })
 }
 
