@@ -5,7 +5,8 @@
 //! rebuild.
 
 use crate::desc::WidgetDescription;
-use crate::layout::Size;
+use crate::layout::{Rect, Size};
+use crate::text_input::TextInputState;
 
 /// Composite reconciler key. Two stages compose it:
 /// - `type_tag` — static string, never reused across primitive types
@@ -35,6 +36,7 @@ pub enum InstanceKind {
     Constrained,
     Align,
     Anchored,
+    TextInput,
 }
 
 /// Per-primitive internal state preserved across `view` rebuilds. Phase 1
@@ -54,6 +56,10 @@ pub enum InstanceState {
     Constrained,
     Align,
     Anchored,
+    /// Per-instance editing state for `text_input`. Survives across
+    /// re-renders via the reconciler key (per spec: cursor, selection,
+    /// scroll offset, IME composition, undo stack).
+    TextInput(TextInputState),
 }
 
 /// Layout side-effect storage on each instance — set by the measure pass,
@@ -70,6 +76,11 @@ pub struct LayoutResult {
     /// For `anchored`: the resolved (width, height) the child should use.
     /// `None` when the instance is not an anchored.
     pub anchored_child_size: Option<Size>,
+    /// Rect the instance occupied during the most recent paint pass.
+    /// `None` when the instance was clipped (zero-area rect) or never
+    /// painted. Populated by `layout::paint` so the mouse hit-test can
+    /// resolve a screen coord to the deepest enclosing instance.
+    pub painted_rect: Option<Rect>,
 }
 
 impl LayoutResult {
@@ -77,6 +88,7 @@ impl LayoutResult {
         self.size = Size::default();
         self.flex_main_sizes.clear();
         self.anchored_child_size = None;
+        self.painted_rect = None;
     }
 }
 
@@ -111,6 +123,7 @@ pub fn default_state(kind: InstanceKind) -> InstanceState {
         InstanceKind::Constrained => InstanceState::Constrained,
         InstanceKind::Align => InstanceState::Align,
         InstanceKind::Anchored => InstanceState::Anchored,
+        InstanceKind::TextInput => InstanceState::TextInput(TextInputState::default()),
     }
 }
 
@@ -126,6 +139,7 @@ pub fn kind_of(desc: &WidgetDescription) -> InstanceKind {
         WidgetDescription::Constrained { .. } => InstanceKind::Constrained,
         WidgetDescription::Align { .. } => InstanceKind::Align,
         WidgetDescription::Anchored { .. } => InstanceKind::Anchored,
+        WidgetDescription::TextInput { .. } => InstanceKind::TextInput,
     }
 }
 
@@ -138,4 +152,23 @@ pub fn instance_key(desc: &WidgetDescription, position: usize) -> InstanceKey {
         None => KeyId::Position(position),
     };
     InstanceKey { type_tag, id }
+}
+
+/// Walk the instance tree and reconcile each `text_input`'s internal
+/// editing state with its description. Called once after every
+/// reconcile so the input router and the layout/paint pass observe a
+/// fresh `last_value` and `focused` flag.
+pub fn sync_text_inputs(inst: &mut WidgetInstance) {
+    if matches!(inst.kind(), InstanceKind::TextInput) {
+        if let WidgetDescription::TextInput { value, focused, .. } = &inst.last_desc {
+            let v = value.clone();
+            let f = *focused;
+            if let InstanceState::TextInput(s) = &mut inst.state {
+                s.sync_with_desc(&v, f);
+            }
+        }
+    }
+    for c in inst.children.iter_mut() {
+        sync_text_inputs(c);
+    }
 }

@@ -6,7 +6,10 @@
 
 use crate::error::TuiError;
 use crate::input::KeyMessage;
+use crate::input_router::{route_key, RouteDecision};
+use crate::instance::sync_text_inputs;
 use crate::lua_host::{LuaHost, SideEffect};
+use crate::mouse::{hit_test, kind_string, MouseMessage};
 use crate::reconciler::Reconciler;
 use crate::render::Renderer;
 
@@ -43,10 +46,48 @@ impl Engine {
         self.lua.lua()
     }
 
-    /// Dispatch a [`KeyMessage`]. Always sets the dirty flag in phase 1
-    /// (always-dirty after dispatch is acceptable per orchestrator
-    /// override Q2).
+    /// Dispatch a [`KeyMessage`]. The router first inspects the current
+    /// reconciled tree: if a focused `text_input` exists and the key is
+    /// an editing key, the router mutates the input's internal state in
+    /// place and dispatches the configured `on_change` / `on_submit`
+    /// callbacks to Lua. Otherwise the key bubbles to Lua as
+    /// `{ kind = "key.<name>", mods = [...] }`.
     pub fn handle_key(&mut self, key: KeyMessage) -> Result<(), TuiError> {
+        // Ensure we have a current reconciled tree so the router can
+        // inspect the latest description. The first key event would
+        // otherwise see an empty reconciler.
+        self.ensure_reconciled()?;
+
+        if let Some(root) = self.reconciler.root.as_mut() {
+            match route_key(root, &key) {
+                RouteDecision::HandledByTextInput {
+                    target_key,
+                    on_change,
+                    on_submit,
+                    value,
+                    value_changed,
+                    submitted,
+                } => {
+                    if value_changed {
+                        if let Some(kind) = on_change {
+                            self.dispatch_named(&kind, &target_key, Some(&value))?;
+                        }
+                    }
+                    if submitted {
+                        if let Some(kind) = on_submit {
+                            self.dispatch_named(&kind, &target_key, Some(&value))?;
+                        }
+                    }
+                    // Even with no Lua-visible callbacks (e.g. cursor
+                    // moves, copy with no clipboard), set dirty so the
+                    // next render repaints the cursor / selection.
+                    self.needs_render = true;
+                    return Ok(());
+                }
+                RouteDecision::BubbleToLua => {}
+            }
+        }
+
         let msg = self.lua().create_table()?;
         msg.set("kind", key.kind())?;
         let mods = self.lua().create_table()?;
@@ -55,6 +96,38 @@ impl Engine {
         }
         msg.set("mods", mods)?;
         self.dispatch_msg(msg)
+    }
+
+    /// Build `{ kind, target_key, value? }` and dispatch through Lua's
+    /// `update`. Used to relay text_input `on_change` / `on_submit`
+    /// callbacks.
+    fn dispatch_named(
+        &mut self,
+        kind: &str,
+        target_key: &str,
+        value: Option<&str>,
+    ) -> Result<(), TuiError> {
+        let msg = self.lua().create_table()?;
+        msg.set("kind", kind)?;
+        msg.set("target_key", target_key)?;
+        if let Some(v) = value {
+            msg.set("value", v)?;
+        }
+        self.dispatch_msg(msg)
+    }
+
+    /// Run a reconcile pass + sync text_input states without painting.
+    /// Used so the router observes the latest description tree before
+    /// the first render.
+    fn ensure_reconciled(&mut self) -> Result<(), TuiError> {
+        if self.reconciler.root.is_none() && self.lua.started() {
+            let desc = self.lua.render_view()?;
+            self.reconciler.reconcile(desc);
+            if let Some(root) = self.reconciler.root.as_mut() {
+                sync_text_inputs(root);
+            }
+        }
+        Ok(())
     }
 
     /// Dispatch an arbitrary Lua message table — used by the binary to
@@ -77,6 +150,37 @@ impl Engine {
         Ok(())
     }
 
+    /// Dispatch a [`MouseMessage`]. Hit-tests against the most recently
+    /// painted tree (uses each instance's `painted_rect`); the result is
+    /// always bubbled to Lua as `{ kind, x, y, target_key, button, mods }`.
+    /// Wheel events bubble verbatim — auto-scroll on `scrollable` lands
+    /// in phase 5a.
+    pub fn handle_mouse(&mut self, evt: MouseMessage) -> Result<(), TuiError> {
+        let target_key = self
+            .reconciler
+            .root
+            .as_ref()
+            .and_then(|root| hit_test(root, evt.x, evt.y));
+
+        let msg = self.lua().create_table()?;
+        msg.set("kind", kind_string(evt.kind))?;
+        msg.set("x", evt.x)?;
+        msg.set("y", evt.y)?;
+        match target_key {
+            Some(k) => msg.set("target_key", k)?,
+            None => msg.set("target_key", mlua::Value::Nil)?,
+        }
+        if let Some(b) = evt.button {
+            msg.set("button", b)?;
+        }
+        let mods = self.lua().create_table()?;
+        for (i, m) in evt.mods.iter().enumerate() {
+            mods.set(i + 1, *m)?;
+        }
+        msg.set("mods", mods)?;
+        self.dispatch_msg(msg)
+    }
+
     /// Render if dirty. Returns the ANSI bytes; `None` means "no work".
     pub fn render_if_dirty(&mut self) -> Result<Option<Vec<u8>>, TuiError> {
         if !self.needs_render {
@@ -85,6 +189,7 @@ impl Engine {
         let desc = self.lua.render_view()?;
         self.reconciler.reconcile(desc);
         let root = self.reconciler.root.as_mut().ok_or(TuiError::NotStarted)?;
+        sync_text_inputs(root);
         let bytes = self.renderer.render(root);
         self.needs_render = false;
         Ok(Some(bytes))
@@ -178,5 +283,52 @@ mod tests {
         let bytes = engine.render_if_dirty().expect("second").expect("dirty");
         let s = String::from_utf8(bytes).expect("utf-8");
         assert!(s.contains("\x1b[2J"), "post-resize should full-redraw");
+    }
+
+    const MOUSE_SCENARIO: &str = r#"
+        tui.start {
+          initial_state = { last_click = nil },
+          view = function(s)
+            local label = s.last_click and ("clicked: " .. s.last_click) or "no click"
+            return tui.column { gap = 0, children = {
+              tui.padding {
+                value = 1,
+                key   = "wrapper",
+                child = tui.text { content = label, key = "label" },
+              },
+            }}
+          end,
+          update = function(msg, s)
+            if msg.kind == "mouse.click" then
+              return { last_click = msg.target_key or "<nil>" }, {}
+            end
+            return s, {}
+          end,
+        }
+    "#;
+
+    #[test]
+    fn mouse_click_dispatches_target_key_to_lua() {
+        use crate::mouse::{MouseKind, MouseMessage};
+        let mut engine = Engine::new(20, 5).expect("engine");
+        engine.load_scenario(MOUSE_SCENARIO).expect("load");
+        let _ = engine.render_if_dirty().expect("render");
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Click,
+                x: 2,
+                y: 1,
+                button: Some("left"),
+                mods: vec![],
+            })
+            .expect("mouse");
+        let bytes = engine.render_if_dirty().expect("render").expect("dirty");
+        let s = String::from_utf8(bytes).expect("utf-8");
+        // Hit-test reaches the deepest keyed instance under (2, 1) — the
+        // text labelled "label", inside the keyed padding.
+        assert!(
+            s.contains("clicked: label"),
+            "expected label hit, got:\n{s}"
+        );
     }
 }

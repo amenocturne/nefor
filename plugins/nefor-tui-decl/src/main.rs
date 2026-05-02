@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use nefor_tui_decl::engine::Engine;
 use nefor_tui_decl::error::TuiError;
 use nefor_tui_decl::input::from_key_event;
+use nefor_tui_decl::mouse::from_crossterm as from_mouse_event;
 use nefor_tui_decl::ncp::{await_ready_ok, spawn_stdin_reader, spawn_stdout_writer, CHANNEL_CAP};
 use nefor_tui_decl::tty::{open_tty, RawModeGuard};
 
@@ -110,7 +111,12 @@ async fn run() -> Result<(), TuiError> {
                     }
                 }
                 Some(Ok(Event::Resize(w, h))) => engine.handle_resize(w, h)?,
-                Some(Ok(_)) => {} // mouse / paste / focus — phase 1 ignores
+                Some(Ok(Event::Mouse(m))) => {
+                    if let Some(mm) = from_mouse_event(&m) {
+                        engine.handle_mouse(mm)?;
+                    }
+                }
+                Some(Ok(_)) => {} // paste / focus — phase 4 doesn't surface these
                 Some(Err(e)) => tracing::warn!(error = %e, "crossterm event error"),
                 None => break,
             }

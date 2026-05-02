@@ -72,6 +72,45 @@ pub enum WidgetDescription {
         child: Box<WidgetDescription>,
         key: Option<String>,
     },
+    TextInput {
+        /// User key — required for text_input so Lua can reference it
+        /// across re-renders. Stored as `Option<String>` to keep the
+        /// generic key-handling helpers untouched; semantically
+        /// `text_input` always has one.
+        key: Option<String>,
+        /// Controlled-component value. Lua holds the source of truth and
+        /// passes it back each render; the engine compares against the
+        /// instance's stored `last_value` to decide whether to reset
+        /// internal cursor state.
+        value: String,
+        /// Lua-controlled focus prop. When `true` the input router
+        /// absorbs editing keys. Multiple focused text_inputs in a tree
+        /// are user error: first-by-tree-order wins; the rest emit a
+        /// `tracing::warn!` once per render.
+        focused: bool,
+        /// Stable msg-kind identifier (constraint #1: callbacks are
+        /// strings, never function refs). Fired with `value = <new>`.
+        on_change: Option<String>,
+        /// Stable msg-kind identifier. Fired by Enter (no Shift) with
+        /// `value = <current>`. Does not modify the value itself.
+        on_submit: Option<String>,
+        /// Lower bound on visible rows. Width comes from parent
+        /// constraints.
+        min_lines: u16,
+        /// Upper bound on visible rows. When `min_lines == max_lines`
+        /// the input is fixed-size; else it grows up to `max_lines` and
+        /// then scrolls vertically.
+        max_lines: u16,
+        /// Optional placeholder text painted when `value` is empty.
+        /// `None` = no placeholder (and no opinion about fade colour).
+        placeholder: Option<String>,
+        /// Engine-level cursor blink hint. Phase 4 does not implement a
+        /// blinker (no internal clock); the field is parsed and stored
+        /// for forward compatibility with the animation primitive.
+        cursor_blink: bool,
+        /// Style record. `None` = neutral terminal fg/bg, no attrs.
+        style: Option<TextInputStyle>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +167,7 @@ impl WidgetDescription {
             WidgetDescription::Constrained { .. } => "constrained",
             WidgetDescription::Align { .. } => "align",
             WidgetDescription::Anchored { .. } => "anchored",
+            WidgetDescription::TextInput { .. } => "text_input",
         }
     }
 
@@ -143,9 +183,22 @@ impl WidgetDescription {
             | WidgetDescription::Spacer { key, .. }
             | WidgetDescription::Constrained { key, .. }
             | WidgetDescription::Align { key, .. }
-            | WidgetDescription::Anchored { key, .. } => key.as_deref(),
+            | WidgetDescription::Anchored { key, .. }
+            | WidgetDescription::TextInput { key, .. } => key.as_deref(),
         }
     }
+}
+
+/// Style record for `tui.text_input`. Mirrors the spec's
+/// `{ fg, bg, cursor, selection_bg, placeholder }` shape; each entry is
+/// optional so Lua can override piecemeal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TextInputStyle {
+    pub fg: Option<Color>,
+    pub bg: Option<Color>,
+    pub cursor: Option<Color>,
+    pub selection_bg: Option<Color>,
+    pub placeholder: Option<Color>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -202,8 +255,9 @@ pub fn from_lua_table(t: &Table) -> Result<WidgetDescription, TuiError> {
         "constrained" => parse_constrained(t),
         "align" => parse_align(t),
         "anchored" => parse_anchored(t),
+        "text_input" => parse_text_input(t),
         other => Err(TuiError::InvalidDesc(format!(
-            "unknown widget kind `{other}`; expected one of: text, column, row, padding, stack, expanded, spacer, constrained, align, anchored"
+            "unknown widget kind `{other}`; expected one of: text, column, row, padding, stack, expanded, spacer, constrained, align, anchored, text_input"
         ))),
     }
 }
@@ -420,6 +474,96 @@ fn parse_anchored(t: &Table) -> Result<WidgetDescription, TuiError> {
         child,
         key,
     })
+}
+
+fn parse_text_input(t: &Table) -> Result<WidgetDescription, TuiError> {
+    let key = parse_key(t)?;
+    let value: String = match t.get::<Value>("value")? {
+        Value::Nil => String::new(),
+        Value::String(s) => s.to_str()?.to_string(),
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.text_input: `value` must be a string or nil (got {})",
+                other.type_name()
+            )));
+        }
+    };
+    let focused = parse_optional_bool(t, "focused", "tui.text_input")?.unwrap_or(false);
+    let on_change = parse_optional_string(t, "on_change", "tui.text_input")?;
+    let on_submit = parse_optional_string(t, "on_submit", "tui.text_input")?;
+    let min_lines = parse_u16(t, "min_lines", 1, "tui.text_input")?;
+    let max_lines = parse_u16(t, "max_lines", min_lines.max(1), "tui.text_input")?;
+    if min_lines == 0 {
+        return Err(TuiError::InvalidDesc(
+            "tui.text_input: `min_lines` must be ≥ 1".into(),
+        ));
+    }
+    if max_lines < min_lines {
+        return Err(TuiError::InvalidDesc(format!(
+            "tui.text_input: `max_lines` ({max_lines}) must be ≥ `min_lines` ({min_lines})"
+        )));
+    }
+    let placeholder = parse_optional_string(t, "placeholder", "tui.text_input")?;
+    let cursor_blink = parse_optional_bool(t, "cursor_blink", "tui.text_input")?.unwrap_or(false);
+    let style = parse_text_input_style(t)?;
+    Ok(WidgetDescription::TextInput {
+        key,
+        value,
+        focused,
+        on_change,
+        on_submit,
+        min_lines,
+        max_lines,
+        placeholder,
+        cursor_blink,
+        style,
+    })
+}
+
+fn parse_optional_bool(t: &Table, key: &str, ctx: &str) -> Result<Option<bool>, TuiError> {
+    match t.get::<Value>(key)? {
+        Value::Nil => Ok(None),
+        Value::Boolean(b) => Ok(Some(b)),
+        other => Err(TuiError::InvalidDesc(format!(
+            "{ctx}: `{key}` must be a boolean (got {})",
+            other.type_name()
+        ))),
+    }
+}
+
+fn parse_optional_string(t: &Table, key: &str, ctx: &str) -> Result<Option<String>, TuiError> {
+    match t.get::<Value>(key)? {
+        Value::Nil => Ok(None),
+        Value::String(s) => Ok(Some(s.to_str()?.to_string())),
+        other => Err(TuiError::InvalidDesc(format!(
+            "{ctx}: `{key}` must be a string or nil (got {})",
+            other.type_name()
+        ))),
+    }
+}
+
+fn parse_text_input_style(t: &Table) -> Result<Option<TextInputStyle>, TuiError> {
+    match t.get::<Value>("style")? {
+        Value::Nil => Ok(None),
+        Value::Table(st) => {
+            let fg = parse_color(&st, "fg")?;
+            let bg = parse_color(&st, "bg")?;
+            let cursor = parse_color(&st, "cursor")?;
+            let selection_bg = parse_color(&st, "selection_bg")?;
+            let placeholder = parse_color(&st, "placeholder")?;
+            Ok(Some(TextInputStyle {
+                fg,
+                bg,
+                cursor,
+                selection_bg,
+                placeholder,
+            }))
+        }
+        other => Err(TuiError::InvalidDesc(format!(
+            "tui.text_input: `style` must be a table or nil (got {})",
+            other.type_name()
+        ))),
+    }
 }
 
 fn parse_anchor_str(s: &str) -> Result<Anchor, TuiError> {
@@ -1242,5 +1386,106 @@ mod tests {
         let t = eval_table(&l, r#"return { _tui_kind = "anchored" }"#);
         let err = from_lua_table(&t).unwrap_err();
         assert!(format!("{err}").contains("`child` is required"));
+    }
+
+    #[test]
+    fn text_input_table_parses_with_defaults() {
+        let l = lua();
+        let t = eval_table(&l, r#"return { _tui_kind = "text_input", key = "input" }"#);
+        let d = from_lua_table(&t).expect("parse");
+        match d {
+            WidgetDescription::TextInput {
+                key,
+                value,
+                focused,
+                on_change,
+                on_submit,
+                min_lines,
+                max_lines,
+                placeholder,
+                cursor_blink,
+                style,
+            } => {
+                assert_eq!(key.as_deref(), Some("input"));
+                assert!(value.is_empty());
+                assert!(!focused);
+                assert!(on_change.is_none());
+                assert!(on_submit.is_none());
+                assert_eq!(min_lines, 1);
+                assert_eq!(max_lines, 1);
+                assert!(placeholder.is_none());
+                assert!(!cursor_blink);
+                assert!(style.is_none());
+            }
+            _ => panic!("expected text_input"),
+        }
+    }
+
+    #[test]
+    fn text_input_parses_full_props() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"
+            return {
+              _tui_kind = "text_input",
+              key = "input",
+              value = "hello",
+              focused = true,
+              on_change = "input.changed",
+              on_submit = "input.submit",
+              min_lines = 2,
+              max_lines = 5,
+              placeholder = "type here",
+              cursor_blink = true,
+            }
+        "#,
+        );
+        let d = from_lua_table(&t).expect("parse");
+        match d {
+            WidgetDescription::TextInput {
+                value,
+                focused,
+                on_change,
+                on_submit,
+                min_lines,
+                max_lines,
+                placeholder,
+                cursor_blink,
+                ..
+            } => {
+                assert_eq!(value, "hello");
+                assert!(focused);
+                assert_eq!(on_change.as_deref(), Some("input.changed"));
+                assert_eq!(on_submit.as_deref(), Some("input.submit"));
+                assert_eq!(min_lines, 2);
+                assert_eq!(max_lines, 5);
+                assert_eq!(placeholder.as_deref(), Some("type here"));
+                assert!(cursor_blink);
+            }
+            _ => panic!("expected text_input"),
+        }
+    }
+
+    #[test]
+    fn text_input_rejects_max_lines_below_min() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"return { _tui_kind = "text_input", min_lines = 5, max_lines = 2 }"#,
+        );
+        let err = from_lua_table(&t).unwrap_err();
+        assert!(format!("{err}").contains("max_lines"));
+    }
+
+    #[test]
+    fn text_input_rejects_min_lines_zero() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"return { _tui_kind = "text_input", min_lines = 0, max_lines = 1 }"#,
+        );
+        let err = from_lua_table(&t).unwrap_err();
+        assert!(format!("{err}").contains("min_lines"));
     }
 }
