@@ -79,6 +79,15 @@ impl ExitRequestSink {
     /// Idempotent: first call wins, subsequent calls log + ignore so a
     /// faulty cli that calls exit twice with different codes doesn't
     /// produce surprising behaviour.
+    ///
+    /// Uses `try_send` directly on the shutdown channel rather than
+    /// `tokio::spawn(shutdown.shutdown(...).await)`. The async-spawn
+    /// path required a tokio runtime context (failing in unit tests
+    /// outside `#[tokio::main]`) and risked the spawned future never
+    /// running if the runtime was already winding down. The shutdown
+    /// channel has capacity 4 with a single sender, so `try_send`
+    /// always succeeds for the first call (the only one that matters
+    /// — subsequent calls are gated by the `fired` latch above).
     pub fn request(&self, code: i32) {
         use std::sync::atomic::Ordering;
         if self
@@ -87,10 +96,13 @@ impl ExitRequestSink {
             .is_ok()
         {
             self.code.store(code, Ordering::SeqCst);
-            let shutdown = self.shutdown.clone();
-            tokio::spawn(async move {
-                shutdown.shutdown(DEFAULT_SHUTDOWN_GRACE_MS).await;
-            });
+            if let Err(e) = self.shutdown.0.try_send(DEFAULT_SHUTDOWN_GRACE_MS) {
+                tracing::warn!(
+                    code,
+                    error = %e,
+                    "nefor.engine.exit: shutdown channel rejected signal"
+                );
+            }
         } else {
             tracing::warn!(code, "nefor.engine.exit called more than once; ignoring");
         }
