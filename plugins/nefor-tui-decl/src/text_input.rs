@@ -208,6 +208,276 @@ pub fn line_end(s: &str, idx: usize) -> usize {
     i
 }
 
+/// Whether the input should accept Shift+Enter newline insertion. Single-
+/// line inputs (`max_lines = 1`) ignore Shift+Enter and bubble it.
+pub fn allows_newline_insert(max_lines: u16) -> bool {
+    max_lines > 1
+}
+
+// ── Editing operations ────────────────────────────────────────────────────
+//
+// All ops act on the latest controlled-component value held in
+// `state.last_value`. Each op pushes an undo snapshot before mutating
+// (when the mutation actually changes the value), and returns an
+// [`EditOutcome`] so the input router can decide whether to fire
+// `on_change` / `on_submit`.
+
+impl TextInputState {
+    /// Insert a single char at the cursor. Replaces the active selection
+    /// if any.
+    pub fn insert_char(&mut self, ch: char) -> EditOutcome {
+        let mut buf = [0u8; 4];
+        let s = ch.encode_utf8(&mut buf);
+        self.insert_str(s)
+    }
+
+    /// Insert a UTF-8 string at the cursor (or in place of the active
+    /// selection).
+    pub fn insert_str(&mut self, s: &str) -> EditOutcome {
+        if s.is_empty() {
+            return EditOutcome::default();
+        }
+        self.push_undo();
+        let mut value = self.last_value.clone();
+        let (lo, hi) = match self.selection_range() {
+            Some(r) => r,
+            None => (self.cursor, self.cursor),
+        };
+        value.replace_range(lo..hi, s);
+        self.cursor = lo + s.len();
+        self.selection_anchor = None;
+        self.last_value = value.clone();
+        EditOutcome {
+            new_value: Some(value),
+            submitted: false,
+        }
+    }
+
+    /// Backspace: delete selection if any, else the char before cursor.
+    pub fn backspace(&mut self) -> EditOutcome {
+        if self.selection_range().is_some() {
+            return self.delete_selection();
+        }
+        if self.cursor == 0 {
+            return EditOutcome::default();
+        }
+        self.push_undo();
+        let prev = prev_char_boundary(&self.last_value, self.cursor);
+        let mut value = self.last_value.clone();
+        value.replace_range(prev..self.cursor, "");
+        self.cursor = prev;
+        self.last_value = value.clone();
+        EditOutcome {
+            new_value: Some(value),
+            submitted: false,
+        }
+    }
+
+    /// Delete: drop selection if any, else the char after cursor.
+    pub fn delete_forward(&mut self) -> EditOutcome {
+        if self.selection_range().is_some() {
+            return self.delete_selection();
+        }
+        if self.cursor >= self.last_value.len() {
+            return EditOutcome::default();
+        }
+        self.push_undo();
+        let next = next_char_boundary(&self.last_value, self.cursor);
+        let mut value = self.last_value.clone();
+        value.replace_range(self.cursor..next, "");
+        self.last_value = value.clone();
+        EditOutcome {
+            new_value: Some(value),
+            submitted: false,
+        }
+    }
+
+    /// Replace the selection with the empty string. No-op when there is
+    /// no selection.
+    pub fn delete_selection(&mut self) -> EditOutcome {
+        let Some((lo, hi)) = self.selection_range() else {
+            return EditOutcome::default();
+        };
+        if lo == hi {
+            self.selection_anchor = None;
+            return EditOutcome::default();
+        }
+        self.push_undo();
+        let mut value = self.last_value.clone();
+        value.replace_range(lo..hi, "");
+        self.cursor = lo;
+        self.selection_anchor = None;
+        self.last_value = value.clone();
+        EditOutcome {
+            new_value: Some(value),
+            submitted: false,
+        }
+    }
+
+    /// Move cursor one char left. With `extend_selection`, anchors the
+    /// selection on first call and grows it.
+    pub fn move_left(&mut self, extend_selection: bool) -> EditOutcome {
+        self.update_selection_anchor(extend_selection);
+        self.cursor = prev_char_boundary(&self.last_value, self.cursor);
+        if !extend_selection {
+            self.selection_anchor = None;
+        }
+        EditOutcome::default()
+    }
+
+    pub fn move_right(&mut self, extend_selection: bool) -> EditOutcome {
+        self.update_selection_anchor(extend_selection);
+        self.cursor = next_char_boundary(&self.last_value, self.cursor);
+        if !extend_selection {
+            self.selection_anchor = None;
+        }
+        EditOutcome::default()
+    }
+
+    pub fn move_to_line_start(&mut self, extend_selection: bool) -> EditOutcome {
+        self.update_selection_anchor(extend_selection);
+        self.cursor = line_start(&self.last_value, self.cursor);
+        if !extend_selection {
+            self.selection_anchor = None;
+        }
+        EditOutcome::default()
+    }
+
+    pub fn move_to_line_end(&mut self, extend_selection: bool) -> EditOutcome {
+        self.update_selection_anchor(extend_selection);
+        self.cursor = line_end(&self.last_value, self.cursor);
+        if !extend_selection {
+            self.selection_anchor = None;
+        }
+        EditOutcome::default()
+    }
+
+    /// Move cursor to the previous line, preserving column when possible.
+    /// No-op on the first line.
+    pub fn move_up(&mut self, extend_selection: bool) -> EditOutcome {
+        self.update_selection_anchor(extend_selection);
+        let cur_line_start = line_start(&self.last_value, self.cursor);
+        if cur_line_start == 0 {
+            return EditOutcome::default();
+        }
+        let col = self.cursor - cur_line_start;
+        // Previous line ends at cur_line_start-1 (the `\n` itself).
+        let prev_line_end = cur_line_start - 1;
+        let prev_line_start = line_start(&self.last_value, prev_line_end);
+        let prev_line_len = prev_line_end - prev_line_start;
+        self.cursor = prev_line_start + col.min(prev_line_len);
+        if !extend_selection {
+            self.selection_anchor = None;
+        }
+        EditOutcome::default()
+    }
+
+    pub fn move_down(&mut self, extend_selection: bool) -> EditOutcome {
+        self.update_selection_anchor(extend_selection);
+        let cur_line_start = line_start(&self.last_value, self.cursor);
+        let cur_line_end = line_end(&self.last_value, self.cursor);
+        if cur_line_end == self.last_value.len() {
+            // No next line.
+            return EditOutcome::default();
+        }
+        let col = self.cursor - cur_line_start;
+        let next_line_start = cur_line_end + 1;
+        let next_line_end = line_end(&self.last_value, next_line_start);
+        let next_line_len = next_line_end - next_line_start;
+        self.cursor = next_line_start + col.min(next_line_len);
+        if !extend_selection {
+            self.selection_anchor = None;
+        }
+        EditOutcome::default()
+    }
+
+    pub fn select_all(&mut self) -> EditOutcome {
+        if self.last_value.is_empty() {
+            return EditOutcome::default();
+        }
+        self.selection_anchor = Some(0);
+        self.cursor = self.last_value.len();
+        EditOutcome::default()
+    }
+
+    /// Pop the most recent undo snapshot and apply it, pushing the
+    /// current state onto the redo stack.
+    pub fn undo(&mut self) -> EditOutcome {
+        let Some(snap) = self.undo.pop_back() else {
+            return EditOutcome::default();
+        };
+        let cur = self.snapshot();
+        if self.redo.len() == HISTORY_CAP {
+            self.redo.pop_front();
+        }
+        self.redo.push_back(cur);
+        self.restore(snap);
+        EditOutcome {
+            new_value: Some(self.last_value.clone()),
+            submitted: false,
+        }
+    }
+
+    pub fn redo(&mut self) -> EditOutcome {
+        let Some(snap) = self.redo.pop_back() else {
+            return EditOutcome::default();
+        };
+        let cur = self.snapshot();
+        if self.undo.len() == HISTORY_CAP {
+            self.undo.pop_front();
+        }
+        self.undo.push_back(cur);
+        self.restore(snap);
+        EditOutcome {
+            new_value: Some(self.last_value.clone()),
+            submitted: false,
+        }
+    }
+
+    /// Begin or commit an IME composition. The composition string is
+    /// not yet part of `last_value`; the engine paints it as a hint at
+    /// the cursor. `commit_ime` splices the committed text in.
+    pub fn begin_ime(&mut self, text: &str) {
+        self.composing = Some(ImeComposition {
+            text: text.into(),
+            anchor: self.cursor,
+        });
+    }
+
+    pub fn update_ime(&mut self, text: &str) {
+        if let Some(c) = self.composing.as_mut() {
+            c.text = text.into();
+        } else {
+            self.begin_ime(text);
+        }
+    }
+
+    pub fn commit_ime(&mut self) -> EditOutcome {
+        let Some(c) = self.composing.take() else {
+            return EditOutcome::default();
+        };
+        if c.text.is_empty() {
+            return EditOutcome::default();
+        }
+        // Restore cursor to anchor before splicing so the inserted text
+        // lands at the original composition start.
+        self.cursor = c.anchor.min(self.last_value.len());
+        self.insert_str(&c.text)
+    }
+
+    pub fn cancel_ime(&mut self) {
+        self.composing = None;
+    }
+
+    /// Anchor the selection on the current cursor when `extend` is true
+    /// and there is no anchor yet.
+    fn update_selection_anchor(&mut self, extend: bool) {
+        if extend && self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.cursor);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,5 +563,197 @@ mod tests {
         st.cursor = 4;
         st.selection_anchor = Some(1);
         assert_eq!(st.selection_range(), Some((1, 4)));
+    }
+
+    fn st(value: &str, cursor: usize) -> TextInputState {
+        TextInputState {
+            last_value: value.into(),
+            cursor,
+            ..TextInputState::default()
+        }
+    }
+
+    #[test]
+    fn insert_char_appends_at_cursor() {
+        let mut s = st("hello", 5);
+        let out = s.insert_char('!');
+        assert_eq!(out.new_value.as_deref(), Some("hello!"));
+        assert_eq!(s.last_value, "hello!");
+        assert_eq!(s.cursor, 6);
+        assert!(!out.submitted);
+    }
+
+    #[test]
+    fn insert_str_replaces_selection() {
+        let mut s = st("hello", 1);
+        s.selection_anchor = Some(4);
+        let out = s.insert_str("XX");
+        assert_eq!(out.new_value.as_deref(), Some("hXXo"));
+        assert_eq!(s.cursor, 3);
+        assert!(s.selection_anchor.is_none());
+    }
+
+    #[test]
+    fn backspace_removes_previous_char() {
+        let mut s = st("hello", 5);
+        let out = s.backspace();
+        assert_eq!(out.new_value.as_deref(), Some("hell"));
+        assert_eq!(s.cursor, 4);
+    }
+
+    #[test]
+    fn backspace_at_start_is_noop() {
+        let mut s = st("hello", 0);
+        let out = s.backspace();
+        assert!(out.new_value.is_none());
+        assert_eq!(s.last_value, "hello");
+    }
+
+    #[test]
+    fn backspace_with_selection_deletes_selection() {
+        let mut s = st("hello", 4);
+        s.selection_anchor = Some(1);
+        let out = s.backspace();
+        assert_eq!(out.new_value.as_deref(), Some("ho"));
+        assert_eq!(s.cursor, 1);
+    }
+
+    #[test]
+    fn delete_forward_removes_next_char() {
+        let mut s = st("hello", 0);
+        let out = s.delete_forward();
+        assert_eq!(out.new_value.as_deref(), Some("ello"));
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn delete_forward_at_end_is_noop() {
+        let mut s = st("hello", 5);
+        let out = s.delete_forward();
+        assert!(out.new_value.is_none());
+    }
+
+    #[test]
+    fn move_left_decrements_cursor() {
+        let mut s = st("hello", 3);
+        s.move_left(false);
+        assert_eq!(s.cursor, 2);
+        assert!(s.selection_anchor.is_none());
+    }
+
+    #[test]
+    fn move_right_with_shift_extends_selection() {
+        let mut s = st("hello", 1);
+        s.move_right(true);
+        assert_eq!(s.cursor, 2);
+        assert_eq!(s.selection_anchor, Some(1));
+        s.move_right(true);
+        assert_eq!(s.cursor, 3);
+        assert_eq!(s.selection_anchor, Some(1));
+    }
+
+    #[test]
+    fn move_left_without_shift_clears_selection() {
+        let mut s = st("hello", 4);
+        s.selection_anchor = Some(1);
+        s.move_left(false);
+        assert_eq!(s.cursor, 3);
+        assert!(s.selection_anchor.is_none());
+    }
+
+    #[test]
+    fn home_end_jump_within_line() {
+        let mut s = st("abc\ndef", 5);
+        s.move_to_line_start(false);
+        assert_eq!(s.cursor, 4);
+        s.move_to_line_end(false);
+        assert_eq!(s.cursor, 7);
+    }
+
+    #[test]
+    fn select_all_anchors_at_zero() {
+        let mut s = st("abc", 1);
+        s.select_all();
+        assert_eq!(s.selection_range(), Some((0, 3)));
+    }
+
+    #[test]
+    fn move_up_down_preserves_column() {
+        let mut s = st("hello\nworld", 3);
+        s.move_down(false);
+        assert_eq!(s.cursor, 9, "column 3 on second line");
+        s.move_up(false);
+        assert_eq!(s.cursor, 3);
+    }
+
+    #[test]
+    fn move_up_clamps_to_short_line() {
+        let mut s = st("ab\nhello", 7); // cursor at 'l' (col 4)
+        s.move_up(false);
+        assert_eq!(s.cursor, 2, "clamped to end of short line");
+    }
+
+    #[test]
+    fn undo_after_insert_restores_value() {
+        let mut s = st("hello", 5);
+        s.insert_char('!');
+        let out = s.undo();
+        assert_eq!(out.new_value.as_deref(), Some("hello"));
+        assert_eq!(s.last_value, "hello");
+        assert_eq!(s.cursor, 5);
+    }
+
+    #[test]
+    fn redo_replays_undone_edit() {
+        let mut s = st("hello", 5);
+        s.insert_char('!');
+        s.undo();
+        let out = s.redo();
+        assert_eq!(out.new_value.as_deref(), Some("hello!"));
+        assert_eq!(s.last_value, "hello!");
+        assert_eq!(s.cursor, 6);
+    }
+
+    #[test]
+    fn undo_stack_caps_at_history_cap() {
+        let mut s = st("", 0);
+        for _ in 0..(HISTORY_CAP + 10) {
+            s.insert_char('x');
+        }
+        assert!(s.undo.len() <= HISTORY_CAP);
+    }
+
+    #[test]
+    fn ime_compose_then_commit_inserts_text() {
+        let mut s = st("ab", 1);
+        s.begin_ime("XYZ");
+        let out = s.commit_ime();
+        assert_eq!(out.new_value.as_deref(), Some("aXYZb"));
+        assert!(s.composing.is_none());
+        assert_eq!(s.cursor, 4);
+    }
+
+    #[test]
+    fn ime_cancel_drops_composition() {
+        let mut s = st("ab", 1);
+        s.begin_ime("X");
+        s.cancel_ime();
+        assert!(s.composing.is_none());
+        assert_eq!(s.last_value, "ab");
+    }
+
+    #[test]
+    fn allows_newline_insert_only_above_one() {
+        assert!(!allows_newline_insert(1));
+        assert!(allows_newline_insert(2));
+        assert!(allows_newline_insert(8));
+    }
+
+    #[test]
+    fn insert_str_handles_multibyte() {
+        let mut s = st("aé", 3);
+        let out = s.insert_char('ö');
+        assert_eq!(out.new_value.as_deref(), Some("aéö"));
+        assert_eq!(s.cursor, 5, "byte cursor advances by 2 for ö");
     }
 }
