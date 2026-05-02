@@ -4,8 +4,8 @@
 //! orchestrator override Q1 (option b). The scenario lives next to this
 //! test in `scenarios/counter.lua`.
 
-use nefor_tui_decl::engine::Engine;
-use nefor_tui_decl::input::KeyMessage;
+use nefor_tui::engine::Engine;
+use nefor_tui::input::KeyMessage;
 
 const COUNTER_SCENARIO: &str = include_str!("../scenarios/counter.lua");
 

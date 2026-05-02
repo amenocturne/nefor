@@ -8,8 +8,8 @@
 //! 3. Tab bubbles through to Lua as `key.tab` even with the input focused.
 //! 4. Backspace edits propagate through the controlled-component cycle.
 
-use nefor_tui_decl::engine::Engine;
-use nefor_tui_decl::input::KeyMessage;
+use nefor_tui::engine::Engine;
+use nefor_tui::input::KeyMessage;
 
 const TEXT_INPUT_SCENARIO: &str = include_str!("../scenarios/text_input.lua");
 

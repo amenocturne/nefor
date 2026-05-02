@@ -80,7 +80,7 @@ local _ = cc_adapter  -- keep require warm; mock-plugin backend is opt-in
 --   5. reasoner-graph          (queries combinators on submit)
 --   6. tool-gate               (aggregates tool advertisements)
 --   7. basic-tools             (advertises tools to the gate)
---   8. nefor-chat / nefor-tui  (UI; can come up any time)
+--   8. nefor-tui                (UI; can come up any time — chat is a Lua composition inside it)
 --
 -- ncp.lua's replay-on-attach means a late-attaching plugin still sees
 -- prior events, so this ordering is a robustness measure rather than a
@@ -222,14 +222,16 @@ ncp.spawn {
 -------------------------------------------------------------------------
 -- 4f. Chat
 -------------------------------------------------------------------------
+--
+-- Post-phase-6 cutover: the chat surface is a Lua composition (`chat.lua`)
+-- running inside the new declarative `nefor-tui` plugin. The plugin loads
+-- the script via `--script <path>` and exposes a `tui.*` primitive surface
+-- (text, column, row, scrollable, text_input, markdown, ...) that
+-- `chat.lua` composes into the transcript + statusline + input. The
+-- legacy split (`nefor-chat` + ratatui-based `nefor-tui`) is gone.
 
 ncp.spawn {
-  name        = "nefor-chat",
-  command     = { bin("nefor-chat") },
+  name        = "nefor-tui",
+  command     = { bin("nefor-tui"), "--script", STARTER_ROOT .. "/chat.lua" },
   from_plugin = agentic_workflow.for_chat().from_plugin,
-}
-
-ncp.spawn {
-  name    = "nefor-tui",
-  command = { bin("nefor-tui") },
 }

@@ -193,7 +193,7 @@ impl LuaHost {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| {
-        tracing::error!("nefor-tui-decl: mutex poisoned; recovering for best-effort progress");
+        tracing::error!("nefor-tui: mutex poisoned; recovering for best-effort progress");
         poisoned.into_inner()
     })
 }

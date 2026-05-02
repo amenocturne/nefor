@@ -10,10 +10,10 @@
 //! so future regressions surface as a specific row/col mismatch instead
 //! of a long opaque ANSI diff.
 
-use nefor_tui_decl::desc::{Alignment, Anchor, Dimension, WidgetDescription, WrapMode};
-use nefor_tui_decl::layout;
-use nefor_tui_decl::reconciler::Reconciler;
-use nefor_tui_decl::render::{FrameBuffer, Renderer};
+use nefor_tui::desc::{Alignment, Anchor, Dimension, WidgetDescription, WrapMode};
+use nefor_tui::layout;
+use nefor_tui::reconciler::Reconciler;
+use nefor_tui::render::{FrameBuffer, Renderer};
 
 fn text(s: &str) -> WidgetDescription {
     WidgetDescription::Text {

@@ -68,7 +68,7 @@ mod tests {
         let entry = LogEntry {
             ts: ts(),
             origin: Origin::Plugin(PluginName::new("mock-plugin").unwrap()),
-            target: Some(PluginName::new("nefor-chat").unwrap()),
+            target: Some(PluginName::new("nefor-tui").unwrap()),
             payload: "hello body".into(),
         };
         let tbl = log_entry_to_lua_table(&l, &entry).expect("convert ok");
@@ -78,7 +78,7 @@ mod tests {
         let payload: String = tbl.get("payload").unwrap();
         assert_eq!(ts_s, "2026-04-23T12:34:56.000Z");
         assert_eq!(origin, "mock-plugin");
-        assert_eq!(target, "nefor-chat");
+        assert_eq!(target, "nefor-tui");
         assert_eq!(payload, "hello body");
     }
 

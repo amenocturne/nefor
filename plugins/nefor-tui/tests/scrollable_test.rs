@@ -14,9 +14,9 @@
 //! 5. `tui.scroll_into_view(key)` jumps back to the bottom (v1 minimal
 //!    semantics).
 
-use nefor_tui_decl::engine::Engine;
-use nefor_tui_decl::input::KeyMessage;
-use nefor_tui_decl::mouse::{MouseKind, MouseMessage};
+use nefor_tui::engine::Engine;
+use nefor_tui::input::KeyMessage;
+use nefor_tui::mouse::{MouseKind, MouseMessage};
 
 const SCROLLABLE_SCENARIO: &str = include_str!("../scenarios/scrollable.lua");
 

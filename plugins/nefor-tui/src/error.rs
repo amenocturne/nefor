@@ -1,4 +1,4 @@
-//! Domain errors for nefor-tui-decl.
+//! Domain errors for nefor-tui.
 
 use nefor_protocol::ParseError;
 

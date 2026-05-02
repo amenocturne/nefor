@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use nefor_tui_decl::engine::Engine;
+use nefor_tui::engine::Engine;
 
 const SPINNER_SCENARIO: &str = include_str!("../scenarios/spinner.lua");
 
