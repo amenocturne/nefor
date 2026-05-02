@@ -10,7 +10,7 @@
 //! so future regressions surface as a specific row/col mismatch instead
 //! of a long opaque ANSI diff.
 
-use nefor_tui_decl::desc::{Alignment, WidgetDescription, WrapMode};
+use nefor_tui_decl::desc::{Alignment, Anchor, Dimension, WidgetDescription, WrapMode};
 use nefor_tui_decl::layout;
 use nefor_tui_decl::reconciler::Reconciler;
 use nefor_tui_decl::render::{FrameBuffer, Renderer};
@@ -69,6 +69,23 @@ fn stack(children: Vec<WidgetDescription>) -> WidgetDescription {
 fn align(child: WidgetDescription, a: Alignment) -> WidgetDescription {
     WidgetDescription::Align {
         alignment: a,
+        child: Box::new(child),
+        key: None,
+    }
+}
+
+fn anchored(
+    child: WidgetDescription,
+    anchor: Anchor,
+    width: Dimension,
+    height: Dimension,
+) -> WidgetDescription {
+    WidgetDescription::Anchored {
+        anchor,
+        offset_x: 0,
+        offset_y: 0,
+        width,
+        height,
         child: Box::new(child),
         key: None,
     }
@@ -178,5 +195,64 @@ fn nested_composition_renders_through_engine_with_synchronized_ansi() {
     assert!(
         ok_idx < z_idx - first_row_start || z_idx > first_row_start + ok_idx,
         "OK should appear before Z in the byte stream"
+    );
+}
+
+#[test]
+fn anchored_inside_stack_overlays_centered_popup() {
+    // Popup-pattern: a 3-row background fill + a centered popup on top.
+    //
+    //   stack [
+    //     text("aaaaaaaaaaa\nbbbbbbbbbbb\nccccccccccc"),  (3-row background)
+    //     anchored center "POP",                           (popup, intrinsic 3×1)
+    //   ]
+    //
+    // 11×3 frame. Anchored fills the full rect; child centers at
+    // ((11-3)/2, (3-1)/2) = (col 4, row 1). The popup only paints the 3-cell
+    // child rect — surrounding cells preserve the background underneath.
+    let bg = text("aaaaaaaaaaa\nbbbbbbbbbbb\nccccccccccc");
+    let popup = anchored(
+        text("POP"),
+        Anchor::Center,
+        Dimension::Intrinsic,
+        Dimension::Intrinsic,
+    );
+    let tree = stack(vec![bg, popup]);
+
+    let buf = render_to_buf(tree, 11, 3);
+    let dumped = dump(&buf);
+
+    let expected = "aaaaaaaaaaa\nbbbbPOPbbbb\nccccccccccc\n";
+    assert_eq!(dumped, expected, "frame mismatch:\nactual:\n{dumped}");
+}
+
+#[test]
+fn anchored_with_percent_width_inside_stack() {
+    // Anchored with explicit width="50%" of a 20-col parent → child rect
+    // is 10 cols wide. Child text wraps to that width.
+    let bg = text("--------------------"); // 20 dashes
+    let popup = anchored(
+        text("hello world!!"), // 13 chars; wraps to 10
+        Anchor::TopLeft,
+        Dimension::Percent(50),
+        Dimension::Intrinsic,
+    );
+    let tree = stack(vec![bg, popup]);
+
+    let buf = render_to_buf(tree, 20, 3);
+    let dumped = dump(&buf);
+
+    // Row 0: "hello "+"----" (popup paints 6 chars, then bg shows through?).
+    // Actually anchored at TopLeft with intrinsic h=2 lays the child over
+    // rows 0..2 cols 0..10. Background "----------" only appears at cols 10..20.
+    // Wrap at 10: "hello " (6) on row 0; "world!!" (7) on row 1.
+    let row0_chars: String = buf.lines[0].cells.iter().map(|c| c.text.clone()).collect();
+    assert!(
+        row0_chars.starts_with("hello"),
+        "row 0 starts with popup: {row0_chars:?}"
+    );
+    assert!(
+        row0_chars.ends_with("----------"),
+        "row 0 tail is background: {row0_chars:?} (full: {dumped})"
     );
 }
