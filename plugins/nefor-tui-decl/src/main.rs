@@ -8,12 +8,14 @@
 
 use std::io::Write as _;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use crossterm::event::{Event, EventStream};
 use crossterm::terminal::size as term_size;
 use futures::StreamExt;
 use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
 use tokio::sync::mpsc;
+use tokio::time::interval;
 
 use nefor_tui_decl::engine::Engine;
 use nefor_tui_decl::error::TuiError;
@@ -91,6 +93,11 @@ async fn run() -> Result<(), TuiError> {
     engine.load_scenario(PLACEHOLDER_SCENARIO)?;
 
     let mut term_events = EventStream::new();
+    // ~60Hz tick for animation primitives. The arm is always armed —
+    // when no animation is active, `mark_animation_tick` is skipped and
+    // `render_if_dirty` returns `None`, so the loop just goes back to
+    // sleep.
+    let mut anim_tick = interval(Duration::from_millis(16));
     loop {
         tokio::select! {
             maybe_env = in_rx.recv() => match maybe_env {
@@ -119,6 +126,11 @@ async fn run() -> Result<(), TuiError> {
                 Some(Ok(_)) => {} // paste / focus — phase 4 doesn't surface these
                 Some(Err(e)) => tracing::warn!(error = %e, "crossterm event error"),
                 None => break,
+            },
+            _ = anim_tick.tick() => {
+                if engine.has_active_animations() {
+                    engine.mark_animation_tick();
+                }
             }
         }
 

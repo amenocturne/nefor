@@ -4,6 +4,7 @@
 //! instance state inside `InstanceState` is moved verbatim across the
 //! rebuild.
 
+use crate::animation::AnimationState;
 use crate::desc::WidgetDescription;
 use crate::layout::{Rect, Size};
 use crate::text_input::TextInputState;
@@ -27,6 +28,9 @@ pub enum KeyId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstanceKind {
     Text,
+    Spans,
+    Markdown,
+    Animation,
     Column,
     Row,
     Padding,
@@ -47,6 +51,13 @@ pub enum InstanceState {
     /// Phase-1 placeholder. Reserved for cached wrap result.
     #[default]
     Text,
+    Spans,
+    Markdown,
+    /// Per-instance animation state — `mount_time_ms` is recorded on
+    /// first observation by the engine. Survives across re-renders via
+    /// the reconciler key, so a re-rendered animation does not jump
+    /// back to frame 0.
+    Animation(AnimationState),
     Column,
     Row,
     Padding,
@@ -114,6 +125,9 @@ impl WidgetInstance {
 pub fn default_state(kind: InstanceKind) -> InstanceState {
     match kind {
         InstanceKind::Text => InstanceState::Text,
+        InstanceKind::Spans => InstanceState::Spans,
+        InstanceKind::Markdown => InstanceState::Markdown,
+        InstanceKind::Animation => InstanceState::Animation(AnimationState::default()),
         InstanceKind::Column => InstanceState::Column,
         InstanceKind::Row => InstanceState::Row,
         InstanceKind::Padding => InstanceState::Padding,
@@ -130,6 +144,9 @@ pub fn default_state(kind: InstanceKind) -> InstanceState {
 pub fn kind_of(desc: &WidgetDescription) -> InstanceKind {
     match desc {
         WidgetDescription::Text { .. } => InstanceKind::Text,
+        WidgetDescription::Spans { .. } => InstanceKind::Spans,
+        WidgetDescription::Markdown { .. } => InstanceKind::Markdown,
+        WidgetDescription::Animation { .. } => InstanceKind::Animation,
         WidgetDescription::Column { .. } => InstanceKind::Column,
         WidgetDescription::Row { .. } => InstanceKind::Row,
         WidgetDescription::Padding { .. } => InstanceKind::Padding,

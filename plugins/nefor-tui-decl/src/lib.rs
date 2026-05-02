@@ -5,6 +5,7 @@
 //! binary wrapper (`main.rs`) for the NCP plugin role. Higher-level
 //! widgets land in phases 2–5.
 
+pub mod animation;
 pub mod ansi;
 pub mod desc;
 pub mod engine;
@@ -14,6 +15,7 @@ pub mod input_router;
 pub mod instance;
 pub mod layout;
 pub mod lua_host;
+pub mod markdown;
 pub mod mouse;
 pub mod ncp;
 pub mod reconciler;
