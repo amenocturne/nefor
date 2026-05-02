@@ -101,6 +101,7 @@ pub fn layout(inst: &mut WidgetInstance, c: Constraints) -> Size {
     let size = match inst.kind() {
         InstanceKind::Text => layout_text(inst, c),
         InstanceKind::Spans => layout_spans(inst, c),
+        InstanceKind::Markdown => layout_markdown(inst, c),
         InstanceKind::Column => layout_column(inst, c),
         InstanceKind::Row => layout_row(inst, c),
         InstanceKind::Padding => layout_padding(inst, c),
@@ -132,6 +133,7 @@ pub fn paint(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
     match inst.kind() {
         InstanceKind::Text => paint_text(inst, rect, out),
         InstanceKind::Spans => paint_spans(inst, rect, out),
+        InstanceKind::Markdown => paint_markdown(inst, rect, out),
         InstanceKind::Column => paint_column(inst, rect, out),
         InstanceKind::Row => paint_row(inst, rect, out),
         InstanceKind::Padding => paint_padding(inst, rect, out),
@@ -225,6 +227,37 @@ fn paint_spans(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
     };
     let rows = wrap_styled(&styled_chars_from_spans(&spans), rect.width, wrap);
     paint_styled_rows(&rows, rect, out);
+}
+
+// ── Markdown ─────────────────────────────────────────────────────────────
+
+fn layout_markdown(inst: &mut WidgetInstance, c: Constraints) -> Size {
+    let chars = render_markdown_chars(inst);
+    let wrap = match &inst.last_desc {
+        WidgetDescription::Markdown { wrap, .. } => *wrap,
+        _ => WrapMode::Word,
+    };
+    let rows = wrap_styled(&chars, c.max_width, wrap);
+    measure_styled_rows(&rows, c)
+}
+
+fn paint_markdown(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
+    let chars = render_markdown_chars(inst);
+    let wrap = match &inst.last_desc {
+        WidgetDescription::Markdown { wrap, .. } => *wrap,
+        _ => WrapMode::Word,
+    };
+    let rows = wrap_styled(&chars, rect.width, wrap);
+    paint_styled_rows(&rows, rect, out);
+}
+
+fn render_markdown_chars(inst: &WidgetInstance) -> Vec<StyledChar> {
+    match &inst.last_desc {
+        WidgetDescription::Markdown { source, theme, .. } => {
+            crate::markdown::render_to_styled_chars(source, theme.as_ref())
+        }
+        _ => Vec::new(),
+    }
 }
 
 // ── Column ───────────────────────────────────────────────────────────────
@@ -1438,7 +1471,7 @@ pub fn layout_and_paint(root: &mut WidgetInstance, width: u16, height: u16, out:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::desc::{Alignment, Anchor, Dimension, WidgetDescription, WrapMode};
+    use crate::desc::{Alignment, Anchor, Dimension, MarkdownTheme, WidgetDescription, WrapMode};
     use crate::reconciler::Reconciler;
     use crate::render::FrameBuffer;
 
@@ -2230,5 +2263,52 @@ mod tests {
         let buf = paint_root(desc, 10, 2);
         assert_eq!(cell_at(&buf, 0, 0), "a");
         assert_eq!(cell_at(&buf, 1, 0), "b");
+    }
+
+    // ── Markdown ─────────────────────────────────────────────────────
+
+    fn markdown_desc(source: &str, theme: Option<MarkdownTheme>) -> WidgetDescription {
+        WidgetDescription::Markdown {
+            source: source.into(),
+            theme,
+            wrap: WrapMode::Word,
+            key: None,
+        }
+    }
+
+    #[test]
+    fn markdown_renders_paragraph_through_engine() {
+        let desc = markdown_desc("hello", None);
+        let buf = paint_root(desc, 20, 2);
+        assert_eq!(cell_at(&buf, 0, 0), "h");
+        assert_eq!(cell_at(&buf, 0, 4), "o");
+    }
+
+    #[test]
+    fn markdown_with_theme_paints_styled_chars() {
+        use crate::desc::Color;
+        let h1 = Style {
+            bold: true,
+            fg: Some(Color::Rgb(0xff, 0, 0)),
+            ..Style::default()
+        };
+        let theme = MarkdownTheme {
+            h1: Some(h1),
+            ..MarkdownTheme::default()
+        };
+        let desc = markdown_desc("# Title", Some(theme));
+        let buf = paint_root(desc, 20, 2);
+        let cell_t = &buf.lines[0].cells[0];
+        assert_eq!(cell_t.text, "T");
+        assert_eq!(cell_t.style, h1);
+    }
+
+    #[test]
+    fn markdown_neutral_theme_keeps_default_style() {
+        let desc = markdown_desc("**bold**", None);
+        let buf = paint_root(desc, 20, 2);
+        let b = &buf.lines[0].cells[0];
+        assert_eq!(b.text, "b");
+        assert_eq!(b.style, Style::default());
     }
 }

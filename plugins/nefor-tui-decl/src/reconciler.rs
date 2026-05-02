@@ -71,6 +71,7 @@ fn mount_subtree(
     let children = match &desc {
         WidgetDescription::Text { .. }
         | WidgetDescription::Spans { .. }
+        | WidgetDescription::Markdown { .. }
         | WidgetDescription::Spacer { .. }
         | WidgetDescription::TextInput { .. } => Vec::new(),
         WidgetDescription::Column { children, .. }
@@ -109,6 +110,7 @@ fn update_instance(
     let new_children = match &new_desc {
         WidgetDescription::Text { .. }
         | WidgetDescription::Spans { .. }
+        | WidgetDescription::Markdown { .. }
         | WidgetDescription::Spacer { .. }
         | WidgetDescription::TextInput { .. } => Vec::new(),
         WidgetDescription::Column { children, .. }

@@ -197,6 +197,13 @@ fn install_tui(lua: &Lua, started: Arc<Mutex<StartedState>>) -> Result<(), TuiEr
     })?;
     tui.set("spans", spans_fn)?;
 
+    // tui.markdown { source, theme?, wrap?, key? }
+    let markdown_fn = lua.create_function(|_, args: Table| {
+        args.set(KIND_FIELD, "markdown")?;
+        Ok(args)
+    })?;
+    tui.set("markdown", markdown_fn)?;
+
     // tui.column { children, gap?, key? }
     let column_fn = lua.create_function(|_, args: Table| {
         args.set(KIND_FIELD, "column")?;

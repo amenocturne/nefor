@@ -28,6 +28,7 @@ pub enum KeyId {
 pub enum InstanceKind {
     Text,
     Spans,
+    Markdown,
     Column,
     Row,
     Padding,
@@ -49,6 +50,7 @@ pub enum InstanceState {
     #[default]
     Text,
     Spans,
+    Markdown,
     Column,
     Row,
     Padding,
@@ -117,6 +119,7 @@ pub fn default_state(kind: InstanceKind) -> InstanceState {
     match kind {
         InstanceKind::Text => InstanceState::Text,
         InstanceKind::Spans => InstanceState::Spans,
+        InstanceKind::Markdown => InstanceState::Markdown,
         InstanceKind::Column => InstanceState::Column,
         InstanceKind::Row => InstanceState::Row,
         InstanceKind::Padding => InstanceState::Padding,
@@ -134,6 +137,7 @@ pub fn kind_of(desc: &WidgetDescription) -> InstanceKind {
     match desc {
         WidgetDescription::Text { .. } => InstanceKind::Text,
         WidgetDescription::Spans { .. } => InstanceKind::Spans,
+        WidgetDescription::Markdown { .. } => InstanceKind::Markdown,
         WidgetDescription::Column { .. } => InstanceKind::Column,
         WidgetDescription::Row { .. } => InstanceKind::Row,
         WidgetDescription::Padding { .. } => InstanceKind::Padding,

@@ -14,6 +14,7 @@ pub mod input_router;
 pub mod instance;
 pub mod layout;
 pub mod lua_host;
+pub mod markdown;
 pub mod mouse;
 pub mod ncp;
 pub mod reconciler;

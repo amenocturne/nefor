@@ -27,6 +27,17 @@ pub enum WidgetDescription {
         wrap: WrapMode,
         key: Option<String>,
     },
+    /// Markdown source rendered through `pulldown-cmark`. The widget
+    /// walks the parser's events, emits a flat list of styled spans
+    /// (with internal newlines between blocks), and wraps the result.
+    /// `theme = None` (or any missing entry) renders that element as
+    /// neutral plain text. **No bundled defaults.**
+    Markdown {
+        source: String,
+        theme: Option<MarkdownTheme>,
+        wrap: WrapMode,
+        key: Option<String>,
+    },
     Column {
         children: Vec<WidgetDescription>,
         gap: u16,
@@ -167,6 +178,7 @@ impl WidgetDescription {
         match self {
             WidgetDescription::Text { .. } => "text",
             WidgetDescription::Spans { .. } => "spans",
+            WidgetDescription::Markdown { .. } => "markdown",
             WidgetDescription::Column { .. } => "column",
             WidgetDescription::Row { .. } => "row",
             WidgetDescription::Padding { .. } => "padding",
@@ -185,6 +197,7 @@ impl WidgetDescription {
         match self {
             WidgetDescription::Text { key, .. }
             | WidgetDescription::Spans { key, .. }
+            | WidgetDescription::Markdown { key, .. }
             | WidgetDescription::Column { key, .. }
             | WidgetDescription::Row { key, .. }
             | WidgetDescription::Padding { key, .. }
@@ -244,6 +257,27 @@ pub struct Span {
     pub style: Style,
 }
 
+/// Per-element style overrides for `tui.markdown`. Each entry is `None`
+/// when Lua omits it; the renderer falls back to neutral styling for
+/// any missing entry. **No bundled defaults** — `theme = nil` renders
+/// every element as plain text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MarkdownTheme {
+    pub bold: Option<Style>,
+    pub italic: Option<Style>,
+    pub code: Option<Style>,
+    pub code_block: Option<Style>,
+    pub h1: Option<Style>,
+    pub h2: Option<Style>,
+    pub h3: Option<Style>,
+    pub h4: Option<Style>,
+    pub h5: Option<Style>,
+    pub h6: Option<Style>,
+    pub link: Option<Style>,
+    pub blockquote: Option<Style>,
+    pub list_marker: Option<Style>,
+}
+
 /// Convert a Lua table (output of `tui.text/column/padding`) into a
 /// [`WidgetDescription`]. The conversion is recursive; each child of a
 /// column is also dispatched through here.
@@ -266,6 +300,7 @@ pub fn from_lua_table(t: &Table) -> Result<WidgetDescription, TuiError> {
     match kind.as_str() {
         "text" => parse_text(t),
         "spans" => parse_spans(t),
+        "markdown" => parse_markdown(t),
         "column" => parse_column(t),
         "row" => parse_row(t),
         "padding" => parse_padding(t),
@@ -277,7 +312,7 @@ pub fn from_lua_table(t: &Table) -> Result<WidgetDescription, TuiError> {
         "anchored" => parse_anchored(t),
         "text_input" => parse_text_input(t),
         other => Err(TuiError::InvalidDesc(format!(
-            "unknown widget kind `{other}`; expected one of: text, spans, column, row, padding, stack, expanded, spacer, constrained, align, anchored, text_input"
+            "unknown widget kind `{other}`; expected one of: text, spans, markdown, column, row, padding, stack, expanded, spacer, constrained, align, anchored, text_input"
         ))),
     }
 }
@@ -385,6 +420,99 @@ fn parse_one_span(t: &Table, ctx: &str, i: usize) -> Result<Span, TuiError> {
             reverse,
         },
     })
+}
+
+fn parse_markdown(t: &Table) -> Result<WidgetDescription, TuiError> {
+    let source: String = match t.get::<Value>("source")? {
+        Value::String(s) => s.to_str()?.to_string(),
+        Value::Nil => {
+            return Err(TuiError::InvalidDesc(
+                "tui.markdown: `source` is required (got nil)".into(),
+            ));
+        }
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.markdown: `source` must be a string (got {})",
+                other.type_name()
+            )));
+        }
+    };
+    let theme = parse_markdown_theme(t)?;
+    let wrap = parse_wrap(t)?;
+    let key = parse_key(t)?;
+    Ok(WidgetDescription::Markdown {
+        source,
+        theme,
+        wrap,
+        key,
+    })
+}
+
+fn parse_markdown_theme(t: &Table) -> Result<Option<MarkdownTheme>, TuiError> {
+    match t.get::<Value>("theme")? {
+        Value::Nil => Ok(None),
+        Value::Table(theme_t) => {
+            let bold = parse_theme_entry(&theme_t, "bold")?;
+            let italic = parse_theme_entry(&theme_t, "italic")?;
+            let code = parse_theme_entry(&theme_t, "code")?;
+            let code_block = parse_theme_entry(&theme_t, "code_block")?;
+            let h1 = parse_theme_entry(&theme_t, "h1")?;
+            let h2 = parse_theme_entry(&theme_t, "h2")?;
+            let h3 = parse_theme_entry(&theme_t, "h3")?;
+            let h4 = parse_theme_entry(&theme_t, "h4")?;
+            let h5 = parse_theme_entry(&theme_t, "h5")?;
+            let h6 = parse_theme_entry(&theme_t, "h6")?;
+            let link = parse_theme_entry(&theme_t, "link")?;
+            let blockquote = parse_theme_entry(&theme_t, "blockquote")?;
+            let list_marker = parse_theme_entry(&theme_t, "list_marker")?;
+            Ok(Some(MarkdownTheme {
+                bold,
+                italic,
+                code,
+                code_block,
+                h1,
+                h2,
+                h3,
+                h4,
+                h5,
+                h6,
+                link,
+                blockquote,
+                list_marker,
+            }))
+        }
+        other => Err(TuiError::InvalidDesc(format!(
+            "tui.markdown: `theme` must be a table or nil (got {})",
+            other.type_name()
+        ))),
+    }
+}
+
+/// One theme entry table → `Style`. Same shape as `tui.text`'s `style`.
+fn parse_theme_entry(t: &Table, key: &str) -> Result<Option<Style>, TuiError> {
+    match t.get::<Value>(key)? {
+        Value::Nil => Ok(None),
+        Value::Table(st) => {
+            let fg = parse_color(&st, "fg")?;
+            let bg = parse_color(&st, "bg")?;
+            let bold = parse_bool(&st, "bold")?;
+            let italic = parse_bool(&st, "italic")?;
+            let underline = parse_bool(&st, "underline")?;
+            let reverse = parse_bool(&st, "reverse")?;
+            Ok(Some(Style {
+                fg,
+                bg,
+                bold,
+                italic,
+                underline,
+                reverse,
+            }))
+        }
+        other => Err(TuiError::InvalidDesc(format!(
+            "tui.markdown.theme: `{key}` must be a table or nil (got {})",
+            other.type_name()
+        ))),
+    }
 }
 
 fn parse_column(t: &Table) -> Result<WidgetDescription, TuiError> {
@@ -1704,5 +1832,76 @@ mod tests {
         );
         let err = from_lua_table(&t).unwrap_err();
         assert!(format!("{err}").contains("rrggbb"));
+    }
+
+    #[test]
+    fn markdown_table_parses_minimal() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"return { _tui_kind = "markdown", source = "**hi** _world_" }"#,
+        );
+        let d = from_lua_table(&t).expect("parse");
+        match d {
+            WidgetDescription::Markdown {
+                source,
+                theme,
+                wrap,
+                ..
+            } => {
+                assert_eq!(source, "**hi** _world_");
+                assert!(theme.is_none());
+                assert!(matches!(wrap, WrapMode::Word));
+            }
+            _ => panic!("expected markdown"),
+        }
+    }
+
+    #[test]
+    fn markdown_requires_source() {
+        let l = lua();
+        let t = eval_table(&l, r#"return { _tui_kind = "markdown" }"#);
+        let err = from_lua_table(&t).unwrap_err();
+        assert!(format!("{err}").contains("source"));
+    }
+
+    #[test]
+    fn markdown_theme_table_parses() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r##"return {
+              _tui_kind = "markdown",
+              source = "x",
+              theme = {
+                bold = { bold = true },
+                italic = { italic = true },
+                code = { fg = "#ff8800" },
+                code_block = { fg = "#888888" },
+                h1 = { fg = "#ff00ff", bold = true },
+                h2 = { fg = "#00ffff" },
+                h3 = { fg = "#ffff00" },
+                h4 = { fg = "#00ff00" },
+                h5 = { fg = "#0000ff" },
+                h6 = { fg = "#888888" },
+                link = { underline = true },
+                blockquote = { italic = true },
+                list_marker = { fg = "#888888" },
+              },
+            }"##,
+        );
+        let d = from_lua_table(&t).expect("parse");
+        match d {
+            WidgetDescription::Markdown { theme, .. } => {
+                let t = theme.expect("theme set");
+                assert!(t.bold.unwrap().bold);
+                assert!(t.italic.unwrap().italic);
+                assert_eq!(t.code.unwrap().fg, Some(Color::Rgb(0xff, 0x88, 0x00)));
+                assert_eq!(t.h1.unwrap().fg, Some(Color::Rgb(0xff, 0x00, 0xff)));
+                assert!(t.h1.unwrap().bold);
+                assert!(t.link.unwrap().underline);
+            }
+            _ => panic!("expected markdown"),
+        }
     }
 }
