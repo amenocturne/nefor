@@ -1124,9 +1124,27 @@ function M.for_provider(name, opts)
     if not entry then return env end
 
     local out = env.body.output
+    local was_stream_visible = chat_id_stream_visible[chat_id] == true
     pending[key] = nil
     chat_id_to_key[chat_id] = nil
     chat_id_stream_visible[chat_id] = nil
+
+    -- D-31 backup flush: the primary trigger is the first stream.delta
+    -- or stream.reasoning_delta on a stream-visible chat (see ~line
+    -- 1095). That covers ~all real provider turns because qwen/ollama
+    -- always emit at least one intermediate text or reasoning delta.
+    -- The rare gap: a wrap firing that goes straight from chat.complete
+    -- to a tool-calls result with zero deltas — possible with some
+    -- providers' compact responses. Without this backup the queued
+    -- sub-graph dispatch leaks until cancel_all or the next user turn.
+    -- chat.complete.result arrives only AFTER the provider's response
+    -- is fully processed, so the dispatch-overtake race that ruled out
+    -- a chat.complete trigger doesn't apply here. flush is idempotent
+    -- (no-op when queue is empty) so the redundancy with the primary
+    -- trigger is harmless.
+    if was_stream_visible then
+      flush_pending_dispatches()
+    end
 
     if type(out) == "table" then
       nefor.log.info("agentic_workflow <- provider: chat.complete.result", {
