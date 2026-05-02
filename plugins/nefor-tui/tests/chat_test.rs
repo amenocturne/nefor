@@ -9,6 +9,7 @@
 //! subprocess, no /dev/tty — so the test stays fast and CI-portable.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use nefor_tui::engine::Engine;
 use nefor_tui::input::KeyMessage;
@@ -167,6 +168,179 @@ fn slash_new_clears_transcript_and_emits_chat_reset() {
     assert!(
         !out.contains("previous"),
         "transcript should be cleared after /new: {out:?}"
+    );
+}
+
+// ── DAG panel (phase 7) ───────────────────────────────────────────────
+//
+// These exercise the sidebar that subscribes to `reasoner-graph` plugin
+// lifecycle events (`graph.run_started`, `graph.node_dispatched`,
+// `graph.node_result`, `graph.run_complete`). The panel is hidden by
+// default; Ctrl+B toggles it on. Linger handling is pure-update, so a
+// completed run drops on the next event after `DAG_LINGER_MS` of engine
+// time has passed — `Engine::advance_time` plus a synthetic event drives
+// the prune deterministically without sleeping.
+
+fn toggle_sidebar(engine: &mut Engine) {
+    engine.handle_key(key("ctrl_b")).expect("ctrl_b");
+}
+
+#[test]
+fn graph_run_started_creates_a_dag_panel_row() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    toggle_sidebar(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.run_started",
+            "run_id": "run-aaaaaaaa",
+            "total_nodes": 3,
+        }),
+    );
+
+    let out = render_str(&mut engine);
+    // Header shows the abbreviated run id and (done/total) counter.
+    assert!(
+        out.contains("DAG run-aaaa"),
+        "dag header missing for run-aaaaaaaa: {out:?}"
+    );
+    assert!(
+        out.contains("(0/3)"),
+        "dag counter missing 0/3 for fresh run: {out:?}"
+    );
+}
+
+#[test]
+fn graph_node_dispatched_then_result_updates_status_glyph() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    toggle_sidebar(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.run_started",
+            "run_id": "run-bbbbbbbb",
+            "total_nodes": 2,
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.node_dispatched",
+            "run_id": "run-bbbbbbbb",
+            "node_id": "summarise",
+            "reasoner": "ollama",
+        }),
+    );
+
+    // After dispatch the node is "running" — the panel should render
+    // the running glyph (●) for it.
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("summarise"),
+        "node id missing from panel: {out:?}"
+    );
+    assert!(
+        out.contains('●'),
+        "running glyph (●) missing for dispatched node: {out:?}"
+    );
+
+    // Now flip the node to `done` via a node_result with `output`.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.node_result",
+            "run_id": "run-bbbbbbbb",
+            "node_id": "summarise",
+            "output": "summary text",
+        }),
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains('✓'),
+        "done glyph (✓) missing after node_result: {out:?}"
+    );
+    // The (done/total) counter should now read 1/2.
+    assert!(
+        out.contains("(1/2)"),
+        "counter should read 1/2 after one node done: {out:?}"
+    );
+}
+
+#[test]
+fn graph_run_complete_removes_run_after_linger_window() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    toggle_sidebar(&mut engine);
+
+    // Stand up a completed run: started, dispatched, result, complete.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.run_started",
+            "run_id": "run-cccccccc",
+            "total_nodes": 1,
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.node_dispatched",
+            "run_id": "run-cccccccc",
+            "node_id": "n1",
+            "reasoner": "ollama",
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.node_result",
+            "run_id": "run-cccccccc",
+            "node_id": "n1",
+            "output": "ok",
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.run_complete",
+            "run_id": "run-cccccccc",
+            "status": "success",
+            "results": { "n1": { "output": "ok" } },
+        }),
+    );
+
+    // The run is still within its linger window — header is visible.
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("DAG run-cccc"),
+        "completed run should linger initially: {out:?}"
+    );
+
+    // Advance past the 2s linger and dispatch a no-op event so update
+    // runs and prunes the stale entry. (The pure-update prune fires on
+    // every dispatch — we use any event with a kind chat.lua handles
+    // and that doesn't touch dag_runs; chat.session.stats fits.)
+    engine.advance_time(Duration::from_millis(3000));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.session.stats", "turns": 1 }),
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("DAG run-cccc"),
+        "completed run should be pruned past linger window: {out:?}"
+    );
+    // The empty-state hint should now show in the sidebar.
+    assert!(
+        out.contains("(no active runs)"),
+        "empty-state hint missing after prune: {out:?}"
     );
 }
 
