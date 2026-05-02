@@ -323,12 +323,13 @@ local function run_single_shot(prompt, format, json_state, turn_start_ms, gate)
       -- Re-open the stream gate so the relay turn's content reaches
       -- stdout.
       if gate then gate.suppress_stream = false end
-      -- Reset accumulated stream/tool state so the JSON payload only
-      -- carries the relay turn's content (matches user expectation:
-      -- "the answer" is the final user-facing text).
+      -- Reset accumulated answer text so the JSON payload only carries
+      -- the relay turn's content (matches user expectation: "the answer"
+      -- is the final user-facing text). Tool calls accumulate across both
+      -- firings — spawn_graph from the first turn belongs in the report
+      -- alongside any tool calls in the relay turn.
       if format == "json" then
         json_state.answer_acc = {}
-        json_state.tool_calls = {}
       end
       return
     end
@@ -407,7 +408,12 @@ local function run_repl(format, json_state, gate)
       spawn_graph_inflight = false
       if gate then gate.suppress_stream = false end
       -- Don't print or prompt yet — wait for the deferred relay turn.
-      reset_json_state()
+      -- Reset answer_acc so the JSON payload only carries the relay
+      -- turn's text; keep tool_calls so spawn_graph (from this firing)
+      -- stays in the final report.
+      if format == "json" then
+        json_state.answer_acc = {}
+      end
       return
     end
     emit_completion_output()
