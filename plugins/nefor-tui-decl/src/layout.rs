@@ -978,6 +978,71 @@ mod tests {
     }
 
     #[test]
+    fn row_lays_children_horizontally_with_gap() {
+        let desc = WidgetDescription::Row {
+            gap: 1,
+            key: None,
+            children: vec![text("ab"), text("cd")],
+        };
+        let buf = paint_root(desc, 8, 1);
+        assert_eq!(cell_at(&buf, 0, 0), "a");
+        assert_eq!(cell_at(&buf, 0, 1), "b");
+        assert_eq!(cell_at(&buf, 0, 2), " ", "gap column");
+        assert_eq!(cell_at(&buf, 0, 3), "c");
+        assert_eq!(cell_at(&buf, 0, 4), "d");
+    }
+
+    #[test]
+    fn row_layout_sums_children_widths_plus_gap() {
+        let desc = WidgetDescription::Row {
+            gap: 2,
+            key: None,
+            children: vec![text("xx"), text("yy"), text("zz")],
+        };
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let root = rec.root.as_mut().unwrap();
+        let s = layout(root, Constraints::loose(40, 5));
+        // 2 + 2 + 2 + 2 (gap) + 2 (gap) = 10 wide, max child height = 1.
+        assert_eq!(s.width, 10);
+        assert_eq!(s.height, 1);
+    }
+
+    #[test]
+    fn stack_overlays_children_with_later_on_top() {
+        let desc = WidgetDescription::Stack {
+            key: None,
+            children: vec![text("aaa"), text("b")],
+        };
+        let buf = paint_root(desc, 5, 1);
+        // First child paints "aaa" at col 0..3; second paints "b" at col 0,
+        // overwriting the first cell. The remainder of "aaa" stays.
+        assert_eq!(cell_at(&buf, 0, 0), "b", "later child wins position 0");
+        assert_eq!(cell_at(&buf, 0, 1), "a");
+        assert_eq!(cell_at(&buf, 0, 2), "a");
+    }
+
+    #[test]
+    fn stack_size_is_max_of_children() {
+        let desc = WidgetDescription::Stack {
+            key: None,
+            children: vec![text("hi"), text("hello")],
+        };
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let root = rec.root.as_mut().unwrap();
+        let s = layout(root, Constraints::loose(40, 5));
+        // max(2, 5) wide, max(1, 1) tall
+        assert_eq!(
+            s,
+            Size {
+                width: 5,
+                height: 1
+            }
+        );
+    }
+
+    #[test]
     fn wrap_word_splits_on_word_boundary() {
         let rows = wrap_text("hello world", 6, WrapMode::Word);
         assert_eq!(rows, vec!["hello ".to_string(), "world".to_string()]);

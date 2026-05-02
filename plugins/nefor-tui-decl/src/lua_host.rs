@@ -197,12 +197,26 @@ fn install_tui(lua: &Lua, started: Arc<Mutex<StartedState>>) -> Result<(), TuiEr
     })?;
     tui.set("column", column_fn)?;
 
+    // tui.row { children, gap?, key? }
+    let row_fn = lua.create_function(|_, args: Table| {
+        args.set(KIND_FIELD, "row")?;
+        Ok(args)
+    })?;
+    tui.set("row", row_fn)?;
+
     // tui.padding { value | {top,right,bottom,left}, child, key? }
     let padding_fn = lua.create_function(|_, args: Table| {
         args.set(KIND_FIELD, "padding")?;
         Ok(args)
     })?;
     tui.set("padding", padding_fn)?;
+
+    // tui.stack { children, key? }
+    let stack_fn = lua.create_function(|_, args: Table| {
+        args.set(KIND_FIELD, "stack")?;
+        Ok(args)
+    })?;
+    tui.set("stack", stack_fn)?;
 
     // tui.start { initial_state, view, update }
     let started_for_start = Arc::clone(&started);

@@ -156,9 +156,11 @@ pub fn from_lua_table(t: &Table) -> Result<WidgetDescription, TuiError> {
     match kind.as_str() {
         "text" => parse_text(t),
         "column" => parse_column(t),
+        "row" => parse_row(t),
         "padding" => parse_padding(t),
+        "stack" => parse_stack(t),
         other => Err(TuiError::InvalidDesc(format!(
-            "unknown widget kind `{other}`; expected one of: text, column, padding"
+            "unknown widget kind `{other}`; expected one of: text, column, row, padding, stack"
         ))),
     }
 }
@@ -204,6 +206,39 @@ fn parse_column(t: &Table) -> Result<WidgetDescription, TuiError> {
     let gap = parse_u16(t, "gap", 0, "tui.column")?;
     let key = parse_key(t)?;
     Ok(WidgetDescription::Column { children, gap, key })
+}
+
+fn parse_row(t: &Table) -> Result<WidgetDescription, TuiError> {
+    let children_val: Value = t.get("children")?;
+    let children = match children_val {
+        Value::Table(arr) => parse_children(&arr)?,
+        Value::Nil => Vec::new(),
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.row: `children` must be an array (got {})",
+                other.type_name()
+            )));
+        }
+    };
+    let gap = parse_u16(t, "gap", 0, "tui.row")?;
+    let key = parse_key(t)?;
+    Ok(WidgetDescription::Row { children, gap, key })
+}
+
+fn parse_stack(t: &Table) -> Result<WidgetDescription, TuiError> {
+    let children_val: Value = t.get("children")?;
+    let children = match children_val {
+        Value::Table(arr) => parse_children(&arr)?,
+        Value::Nil => Vec::new(),
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.stack: `children` must be an array (got {})",
+                other.type_name()
+            )));
+        }
+    };
+    let key = parse_key(t)?;
+    Ok(WidgetDescription::Stack { children, key })
 }
 
 fn parse_padding(t: &Table) -> Result<WidgetDescription, TuiError> {
@@ -574,9 +609,57 @@ mod tests {
     #[test]
     fn unknown_kind_errors() {
         let l = lua();
-        let t = eval_table(&l, r#"return { _tui_kind = "row" }"#);
+        let t = eval_table(&l, r#"return { _tui_kind = "marquee" }"#);
         let err = from_lua_table(&t).unwrap_err();
         assert!(format!("{err}").contains("unknown widget kind"));
+    }
+
+    #[test]
+    fn row_table_parses() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"
+            return {
+              _tui_kind = "row",
+              gap = 2,
+              children = {
+                { _tui_kind = "text", content = "a" },
+                { _tui_kind = "text", content = "b" },
+              },
+            }
+        "#,
+        );
+        let d = from_lua_table(&t).expect("parse");
+        match d {
+            WidgetDescription::Row { children, gap, .. } => {
+                assert_eq!(gap, 2);
+                assert_eq!(children.len(), 2);
+            }
+            _ => panic!("expected row"),
+        }
+    }
+
+    #[test]
+    fn stack_table_parses() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"
+            return {
+              _tui_kind = "stack",
+              children = {
+                { _tui_kind = "text", content = "bg" },
+                { _tui_kind = "text", content = "fg" },
+              },
+            }
+        "#,
+        );
+        let d = from_lua_table(&t).expect("parse");
+        match d {
+            WidgetDescription::Stack { children, .. } => assert_eq!(children.len(), 2),
+            _ => panic!("expected stack"),
+        }
     }
 
     #[test]
