@@ -1,199 +1,309 @@
-//! Ratatui frame rendering. Translates the cell model into buffer writes
-//! and positions the hardware cursor.
+//! Line-diff renderer.
 //!
-//! Kept deliberately dumb: the frontend doesn't decide what to draw, it
-//! only replays the engine's grid state. The only cleverness is
-//! highlight-attribute lookup and wide-glyph handling (continuation cells
-//! produced by [`crate::grid::Grid::apply_line`] are not redrawn).
+//! The renderer holds a rolling pair of frame buffers — `prev` (last
+//! flushed) and `next` (in-progress). Each frame:
+//! 1. Reset `next` to blank cells.
+//! 2. Walk the instance tree via `layout::paint`, which writes into
+//!    `next`.
+//! 3. Compare `next` against `prev` row-by-row; emit only the dirty rows.
+//! 4. Swap.
+//!
+//! Output is wrapped in DEC mode 2026 (synchronized output) so partial
+//! frames never make it to the screen.
 
-use ratatui::layout::{Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::Frame;
+use crate::ansi::{
+    write_move_to, write_style, CLEAR_LINE, CLEAR_SCREEN, HIDE_CURSOR, SGR_RESET, SYNC_BEGIN,
+    SYNC_END,
+};
+use crate::desc::Style;
+use crate::instance::WidgetInstance;
+use crate::layout;
 
-use crate::grid::{DefaultColors, Grid, HlAttr, HlTable};
-use crate::selection::{col_range_for_row, Selection};
-use crate::HL_SELECTION;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cell {
+    /// One grapheme cluster's text. `" "` for blanks.
+    pub text: String,
+    pub style: Style,
+}
 
-/// Draw the grid and position the hardware cursor.
-///
-/// `selection`, when present, overlays HL_SELECTION on the cells inside the
-/// selection rect — the canonical grid is left intact (a follow-up render
-/// without a selection should restore the original highlights), so the
-/// overlay is computed at draw time per cell.
-pub fn draw(
-    frame: &mut Frame<'_>,
-    grid: &Grid,
-    hl: &HlTable,
-    defaults: &DefaultColors,
-    selection: Option<&Selection>,
-) {
-    let area = frame.area();
-    let buf = frame.buffer_mut();
+impl Cell {
+    pub fn blank() -> Self {
+        Cell {
+            text: " ".into(),
+            style: Style::default(),
+        }
+    }
+}
 
-    let rows = grid.height().min(area.height);
-    let cols = grid.width().min(area.width);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Line {
+    pub cells: Vec<Cell>,
+}
 
-    // Pre-compute the selection rect once so the per-cell overlay check is a
-    // simple range comparison rather than a function call per cell.
-    let sel_rect = selection.map(|s| s.normalized());
-
-    for r in 0..rows {
-        let row_cells = grid.row(r);
-        // For each visible row, work out the column band (if any) that falls
-        // inside the selection rect. Returned as `[start, end)`.
-        let row_sel_band = sel_rect.and_then(|(top, left, bottom, right)| {
-            col_range_for_row(r, top, left, bottom, right, cols)
-        });
-        let mut c: u16 = 0;
-        while c < cols {
-            let cell = &row_cells[usize::from(c)];
-            if cell.text.is_empty() {
-                // Continuation column; previous iteration already drew
-                // the wide glyph that claims this cell.
-                c += 1;
-                continue;
-            }
-            // Pick the active hl: HL_SELECTION inside the selection band,
-            // the cell's own highlight otherwise. This is a draw-time
-            // overlay only — `cell.hl_id` is not mutated.
-            let in_selection = row_sel_band
-                .map(|(start, end)| c >= start && c < end)
-                .unwrap_or(false);
-            let attr = if in_selection {
-                hl.get(HL_SELECTION)
-            } else {
-                hl.get(cell.hl_id)
-            };
-            let style = attr_to_style(attr, defaults);
-            let x = area.x + c;
-            let y = area.y + r;
-            if !inside(area, x, y) {
-                break;
-            }
-            // Ratatui 0.30: cell mutation via `buf[(x, y)]`.
-            let bcell = &mut buf[(x, y)];
-            bcell.set_symbol(&cell.text);
-            bcell.set_style(style);
-
-            // Advance by glyph width. The continuation-cell convention
-            // from Grid means we can always step forward by 1; the next
-            // iteration will skip the empty continuation.
-            c += 1;
+impl Line {
+    fn blank(width: u16) -> Self {
+        Line {
+            cells: (0..width as usize).map(|_| Cell::blank()).collect(),
         }
     }
 
-    // Hardware cursor placement. Grid::cursor clamps to bounds.
-    let (cr, cc) = grid.cursor();
-    let cx = area.x.saturating_add(cc);
-    let cy = area.y.saturating_add(cr);
-    if inside(area, cx, cy) {
-        frame.set_cursor_position(Position::new(cx, cy));
+    fn reset(&mut self) {
+        for c in &mut self.cells {
+            *c = Cell::blank();
+        }
     }
 }
 
-fn inside(area: Rect, x: u16, y: u16) -> bool {
-    x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameBuffer {
+    pub lines: Vec<Line>,
 }
 
-fn attr_to_style(attr: HlAttr, defaults: &DefaultColors) -> Style {
-    // `None` at both the attr and defaults layer → terminal default
-    // (Color::Reset). That's how a publisher opts into the user's theme
-    // without hardcoding an RGB value.
-    let fg = attr.fg.or(defaults.fg);
-    let bg = attr.bg.or(defaults.bg);
-    let (fg, bg) = if attr.reverse { (bg, fg) } else { (fg, bg) };
-    let mut style = Style::default()
-        .fg(fg.map_or(Color::Reset, rgb_to_color))
-        .bg(bg.map_or(Color::Reset, rgb_to_color));
-    let mut modifier = Modifier::empty();
-    if attr.bold {
-        modifier |= Modifier::BOLD;
+impl FrameBuffer {
+    pub fn new(width: u16, height: u16) -> Self {
+        FrameBuffer {
+            lines: (0..height as usize).map(|_| Line::blank(width)).collect(),
+        }
     }
-    if attr.italic {
-        modifier |= Modifier::ITALIC;
+
+    fn reset(&mut self, width: u16, height: u16) {
+        if self.lines.len() != height as usize
+            || self.lines.first().map(|l| l.cells.len()).unwrap_or(0) != width as usize
+        {
+            *self = FrameBuffer::new(width, height);
+            return;
+        }
+        for line in &mut self.lines {
+            line.reset();
+        }
     }
-    if attr.underline {
-        modifier |= Modifier::UNDERLINED;
-    }
-    if !modifier.is_empty() {
-        style = style.add_modifier(modifier);
-    }
-    style
 }
 
-fn rgb_to_color(packed: u32) -> Color {
-    let r = ((packed >> 16) & 0xFF) as u8;
-    let g = ((packed >> 8) & 0xFF) as u8;
-    let b = (packed & 0xFF) as u8;
-    Color::Rgb(r, g, b)
+#[derive(Debug)]
+pub struct Renderer {
+    width: u16,
+    height: u16,
+    prev: FrameBuffer,
+    next: FrameBuffer,
+    needs_full: bool,
+}
+
+impl Renderer {
+    pub fn new(width: u16, height: u16) -> Self {
+        Renderer {
+            width,
+            height,
+            prev: FrameBuffer::new(width, height),
+            next: FrameBuffer::new(width, height),
+            needs_full: true,
+        }
+    }
+
+    pub fn resize(&mut self, width: u16, height: u16) {
+        if width == self.width && height == self.height {
+            return;
+        }
+        self.width = width;
+        self.height = height;
+        self.prev = FrameBuffer::new(width, height);
+        self.next = FrameBuffer::new(width, height);
+        self.needs_full = true;
+    }
+
+    pub fn width(&self) -> u16 {
+        self.width
+    }
+    pub fn height(&self) -> u16 {
+        self.height
+    }
+
+    /// Render `root` and return the ANSI byte stream that brings the
+    /// terminal up to date. Subsequent calls diff against the prior
+    /// frame's contents; force a full redraw with [`Renderer::mark_full`].
+    pub fn render(&mut self, root: &mut WidgetInstance) -> Vec<u8> {
+        self.next.reset(self.width, self.height);
+        reset_layout_state(root);
+        layout::layout_and_paint(root, self.width, self.height, &mut self.next);
+        let bytes = if self.needs_full {
+            self.emit_full()
+        } else {
+            self.emit_diff()
+        };
+        std::mem::swap(&mut self.prev, &mut self.next);
+        self.needs_full = false;
+        bytes
+    }
+
+    /// Force the next render to emit the full buffer.
+    pub fn mark_full(&mut self) {
+        self.needs_full = true;
+    }
+
+    fn emit_full(&self) -> Vec<u8> {
+        let mut out = String::new();
+        out.push_str(SYNC_BEGIN);
+        out.push_str(CLEAR_SCREEN);
+        for (i, line) in self.next.lines.iter().enumerate() {
+            write_move_to(&mut out, i as u16, 0);
+            out.push_str(CLEAR_LINE);
+            push_line(&mut out, line);
+        }
+        out.push_str(HIDE_CURSOR);
+        out.push_str(SYNC_END);
+        out.into_bytes()
+    }
+
+    fn emit_diff(&self) -> Vec<u8> {
+        let mut out = String::new();
+        out.push_str(SYNC_BEGIN);
+        for (i, (next_line, prev_line)) in self
+            .next
+            .lines
+            .iter()
+            .zip(self.prev.lines.iter())
+            .enumerate()
+        {
+            if next_line == prev_line {
+                continue;
+            }
+            write_move_to(&mut out, i as u16, 0);
+            out.push_str(CLEAR_LINE);
+            push_line(&mut out, next_line);
+        }
+        out.push_str(HIDE_CURSOR);
+        out.push_str(SYNC_END);
+        out.into_bytes()
+    }
+}
+
+/// Walk `inst` and reset every instance's `layout` cache so a fresh
+/// measure pass starts clean. Layout state is not part of `InstanceState`
+/// (which the reconciler preserves verbatim across rebuilds), but it
+/// still lives on each instance and would otherwise leak per-frame data.
+fn reset_layout_state(inst: &mut WidgetInstance) {
+    inst.layout.reset();
+    for c in inst.children.iter_mut() {
+        reset_layout_state(c);
+    }
+}
+
+fn push_line(out: &mut String, line: &Line) {
+    let mut current_style: Option<Style> = None;
+    for cell in &line.cells {
+        if Some(cell.style) != current_style {
+            write_style(out, &cell.style);
+            current_style = Some(cell.style);
+        }
+        out.push_str(&cell.text);
+    }
+    out.push_str(SGR_RESET);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::desc::{WidgetDescription, WrapMode};
+    use crate::reconciler::Reconciler;
 
-    #[test]
-    fn rgb_unpacks_to_components() {
-        assert_eq!(rgb_to_color(0x00FF8000), Color::Rgb(0xFF, 0x80, 0x00));
-        assert_eq!(rgb_to_color(0x00000000), Color::Rgb(0, 0, 0));
-        assert_eq!(rgb_to_color(0x00FFFFFF), Color::Rgb(0xFF, 0xFF, 0xFF));
+    fn text_root(content: &str) -> WidgetDescription {
+        WidgetDescription::Text {
+            content: content.into(),
+            style: None,
+            wrap: WrapMode::Word,
+            key: None,
+        }
+    }
+
+    fn column(children: Vec<WidgetDescription>) -> WidgetDescription {
+        WidgetDescription::Column {
+            children,
+            gap: 0,
+            key: None,
+        }
+    }
+
+    fn padding(
+        child: WidgetDescription,
+        top: u16,
+        right: u16,
+        bottom: u16,
+        left: u16,
+    ) -> WidgetDescription {
+        WidgetDescription::Padding {
+            top,
+            right,
+            bottom,
+            left,
+            child: Box::new(child),
+            key: None,
+        }
+    }
+
+    fn render_once(w: u16, h: u16, desc: WidgetDescription) -> (Renderer, Reconciler, String) {
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let mut renderer = Renderer::new(w, h);
+        let bytes = renderer.render(rec.root.as_mut().unwrap());
+        let s = String::from_utf8(bytes).expect("ansi is utf-8");
+        (renderer, rec, s)
     }
 
     #[test]
-    fn attr_defaults_to_default_colors() {
-        let d = DefaultColors {
-            fg: Some(0x00AAAAAA),
-            bg: Some(0x00111111),
-            sp: None,
-        };
-        let s = attr_to_style(HlAttr::default(), &d);
-        assert_eq!(s.fg, Some(Color::Rgb(0xAA, 0xAA, 0xAA)));
-        assert_eq!(s.bg, Some(Color::Rgb(0x11, 0x11, 0x11)));
-        assert!(s.add_modifier.is_empty());
+    fn full_frame_emits_clear_then_rows() {
+        let (_r, _rec, out) = render_once(10, 2, text_root("hi"));
+        assert!(out.starts_with(SYNC_BEGIN));
+        assert!(out.contains(CLEAR_SCREEN));
+        assert!(out.contains("hi"));
+        assert!(out.ends_with(SYNC_END));
     }
 
     #[test]
-    fn empty_defaults_render_as_terminal_reset() {
-        // No default_colors event + no attr override → Color::Reset so the
-        // terminal's native theme shows through.
-        let d = DefaultColors::default();
-        let s = attr_to_style(HlAttr::default(), &d);
-        assert_eq!(s.fg, Some(Color::Reset));
-        assert_eq!(s.bg, Some(Color::Reset));
+    fn synchronized_output_wraps_emission() {
+        let (_r, _rec, out) = render_once(5, 1, text_root("abc"));
+        let begin = out.find(SYNC_BEGIN).unwrap();
+        let end = out.rfind(SYNC_END).unwrap();
+        assert!(begin < end, "begin must precede end");
     }
 
     #[test]
-    fn reverse_swaps_fg_and_bg() {
-        let d = DefaultColors {
-            fg: Some(0x00AABBCC),
-            bg: Some(0x00112233),
-            sp: None,
-        };
-        let s = attr_to_style(
-            HlAttr {
-                reverse: true,
-                ..HlAttr::default()
-            },
-            &d,
+    fn diff_emits_only_changed_rows() {
+        let mut rec = Reconciler::new();
+        rec.reconcile(column(vec![text_root("aaa"), text_root("bbb")]));
+        let mut renderer = Renderer::new(10, 3);
+        let _ = renderer.render(rec.root.as_mut().unwrap());
+
+        // Change only the second child.
+        rec.reconcile(column(vec![text_root("aaa"), text_root("BBB")]));
+        let bytes = renderer.render(rec.root.as_mut().unwrap());
+        let out = String::from_utf8(bytes).expect("utf-8");
+
+        // No CLEAR_SCREEN on diff frame.
+        assert!(!out.contains(CLEAR_SCREEN));
+        // The changed row's text appears.
+        assert!(out.contains("BBB"));
+        // The unchanged row's text does NOT appear.
+        assert!(
+            !out.contains("aaa"),
+            "unchanged row should not be re-emitted"
         );
-        assert_eq!(s.fg, Some(Color::Rgb(0x11, 0x22, 0x33)));
-        assert_eq!(s.bg, Some(Color::Rgb(0xAA, 0xBB, 0xCC)));
     }
 
     #[test]
-    fn bold_italic_underline_modifiers() {
-        let d = DefaultColors::default();
-        let s = attr_to_style(
-            HlAttr {
-                bold: true,
-                italic: true,
-                underline: true,
-                ..HlAttr::default()
-            },
-            &d,
-        );
-        assert!(s.add_modifier.contains(Modifier::BOLD));
-        assert!(s.add_modifier.contains(Modifier::ITALIC));
-        assert!(s.add_modifier.contains(Modifier::UNDERLINED));
+    fn padding_offsets_text_into_inner_rect() {
+        let desc = padding(text_root("hi"), 1, 0, 0, 2);
+        let (_r, _rec, _out) = render_once(8, 3, desc);
+        // Verified more rigorously by layout::tests::column_padding_text_positions_correctly.
+    }
+
+    #[test]
+    fn resize_forces_full_redraw() {
+        let mut rec = Reconciler::new();
+        rec.reconcile(text_root("hello"));
+        let mut renderer = Renderer::new(10, 2);
+        let _ = renderer.render(rec.root.as_mut().unwrap());
+        renderer.resize(20, 4);
+        let bytes = renderer.render(rec.root.as_mut().unwrap());
+        let out = String::from_utf8(bytes).expect("utf-8");
+        assert!(out.contains(CLEAR_SCREEN), "post-resize must full-redraw");
     }
 }

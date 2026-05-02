@@ -613,7 +613,7 @@ handlers["tool-executor"] = function(body)
     local call_args = (type(call) == "table" and (call.arguments or call.args)) or {}
     local model_call_id = (type(call) == "table" and call.id) or tool_id
     fire_observers(tool_start_observers, model_call_id, call_name, call_args)
-    emit_to("nefor-chat", {
+    emit_to("nefor-tui", {
       kind  = "chat.tool.start",
       id    = model_call_id,
       name  = call_name,
@@ -1036,7 +1036,7 @@ function M.for_reasoner_graph()
           err_text = "[orchestrator finished with status: " .. tostring(status) .. "]"
         end
 
-        emit("nefor-chat", {
+        emit("nefor-tui", {
           kind = "chat.message.append",
           role = "system",
           text = err_text,
@@ -1418,7 +1418,7 @@ function M.for_tool_gate(gate_name)
           or (type(raw_err) == "string" and raw_err ~= "")
       local out_str = type(env.body.output) == "string" and env.body.output or ""
       fire_observers(tool_end_observers, model_call_id, out_str, err_bool)
-      emit_to("nefor-chat", {
+      emit_to("nefor-tui", {
         kind   = "chat.tool.end",
         id     = model_call_id,
         output = out_str,
@@ -1491,7 +1491,7 @@ function M.for_chat()
     })
 
     if current_run_id ~= nil then
-      emit("nefor-chat", {
+      emit("nefor-tui", {
         kind = "chat.message.append",
         role = "system",
         text = "[orchestrator busy — wait for the current turn to finish]",
@@ -1641,7 +1641,7 @@ function M.cancel_all()
     cancelled_sub_runs = sub_n,
     dropped_deferred = dropped,
   })
-  emit("nefor-chat", {
+  emit("nefor-tui", {
     kind = "chat.message.append",
     role = "system",
     text = string.format(

@@ -619,14 +619,14 @@ end
 
 local function test_cc_adapter_to_plugin_rewrites_input_submit()
   local out = cc.to_plugin({
-    type = "event", from = "nefor-chat",
+    type = "event", from = "nefor-tui",
     body = { kind = "chat.input.submit", text = "ping" },
   })
   assert_eq(out.body.kind, "cc.prompt", "chat.input.submit → cc.prompt")
   assert_eq(out.body.text, "ping", "text preserved")
 
   local r = cc.to_plugin({
-    type = "event", from = "nefor-chat",
+    type = "event", from = "nefor-tui",
     body = { kind = "chat.resume", session_id = "abc" },
   })
   assert_eq(r.body.kind, "cc.resume", "chat.resume → cc.resume")
@@ -634,11 +634,11 @@ local function test_cc_adapter_to_plugin_rewrites_input_submit()
 end
 
 local function test_cc_adapter_to_plugin_rewrites_interrupt()
-  -- Mid-turn abort path: nefor-chat ESC emits chat.interrupt, the adapter
+  -- Mid-turn abort path: nefor-tui ESC emits chat.interrupt, the adapter
   -- renames it to cc.interrupt before delivery so mock-plugin's
   -- dispatch-loop can find the running child and kill it.
   local out = cc.to_plugin({
-    type = "event", from = "nefor-chat",
+    type = "event", from = "nefor-tui",
     body = { kind = "chat.interrupt" },
   })
   assert_eq(out.body.kind, "cc.interrupt", "chat.interrupt → cc.interrupt")
@@ -748,7 +748,7 @@ local function test_rga_dummy_run_node_emits_ack_immediately()
   -- adapter must emit the ack synchronously inside from_plugin (before
   -- returning) so the watchdog stops well before any provider I/O.
   reset_rga()
-  _test.set_plugins({ "ollama", "nefor-chat" })
+  _test.set_plugins({ "ollama", "nefor-tui" })
   local hook = rga.for_reasoner_graph()
   local out = hook.from_plugin({
     type = "event", from = "reasoner-graph",
@@ -1203,7 +1203,7 @@ end
 --
 -- The engine emits synthetic `{type:"event", from:"engine", body:{kind="engine.plugin_failed", ...}}`
 -- envelopes when a plugin fails to spawn or crashes at runtime. Step
--- translates them into a `chat.popup{level="error"}` targeted at nefor-chat
+-- translates them into a `chat.popup{level="error"}` targeted at nefor-tui
 -- so the user sees the failure instead of it vanishing into engine logs.
 --
 -- Manual-test recipes (when you want to eyeball the rendered popup):
@@ -1234,12 +1234,12 @@ end
 
 local function test_engine_plugin_failed_routes_to_chat_popup()
   reset()
-  -- nefor-chat must be ready before it can receive popups — its NCP layer
+  -- nefor-tui must be ready before it can receive popups — its NCP layer
   -- drops every pre-ready_ok inbound (per spec §5.1). Drive the ready
   -- handshake first, then clear calls so the assertion below counts only
   -- the popup send.
-  _test.set_plugins({ "nefor-chat" })
-  local log = { entry_plugin("nefor-chat", make_ready("0.1")) }
+  _test.set_plugins({ "nefor-tui" })
+  local log = { entry_plugin("nefor-tui", make_ready("0.1")) }
   ncp.step({}, log)
   _test.calls_clear()
 
@@ -1251,7 +1251,7 @@ local function test_engine_plugin_failed_routes_to_chat_popup()
 
   local calls = _test.calls()
   assert_eq(#calls, 1, "exactly one send: the chat.popup")
-  assert_eq(calls[1].target, "nefor-chat", "popup targeted at nefor-chat")
+  assert_eq(calls[1].target, "nefor-tui", "popup targeted at nefor-tui")
   local decoded = json.decode(calls[1].payload)
   assert_eq(decoded.type, "event", "type=event")
   assert_eq(decoded.from, "engine", "from=engine")
@@ -1274,19 +1274,19 @@ end
 
 local function test_engine_plugin_failed_drops_when_chat_not_connected()
   reset()
-  -- nefor-chat absent from the bus — the failure has nowhere to render, so
+  -- nefor-tui absent from the bus — the failure has nowhere to render, so
   -- step silently drops the envelope. (The user can't see it; better than
   -- a `send` to a non-existent peer that the engine warns about.)
-  _test.set_plugins({ "ollama", "nefor-tui" })
+  _test.set_plugins({ "ollama" })
 
   local payload = make_engine_plugin_failed(
-    "nefor-chat", "runtime", "crashed", "crash"
+    "nefor-tui", "runtime", "crashed", "crash"
   )
   local log = { entry_engine(payload) }
   ncp.step({}, log)
 
   assert_eq(#_test.calls(), 0,
-    "no send when nefor-chat isn't on the bus")
+    "no send when nefor-tui isn't on the bus")
 end
 
 local function test_engine_origin_does_not_trigger_ready_handshake_error()
@@ -1297,14 +1297,14 @@ local function test_engine_origin_does_not_trigger_ready_handshake_error()
   -- After the fix, engine envelopes route through their own dispatcher
   -- and never reach the ready check.
   reset()
-  _test.set_plugins({ "nefor-chat" })
+  _test.set_plugins({ "nefor-tui" })
 
   local payload = make_engine_plugin_failed(
     "x", "spawn", "y", "missing_dir"
   )
   ncp.step({}, { entry_engine(payload) })
 
-  -- All sends must target nefor-chat (the popup), not "engine".
+  -- All sends must target nefor-tui (the popup), not "engine".
   for _, c in ipairs(_test.calls()) do
     assert_true(
       c.target ~= "engine",
@@ -1315,11 +1315,11 @@ end
 
 local function test_engine_plugin_failed_buffers_until_chat_readies()
   -- Real-world scenario: engine reports a spawn failure during boot, before
-  -- nefor-chat completes its handshake. Step must buffer the popup and
-  -- flush it once nefor-chat readies, otherwise the popup hits a pre-
+  -- nefor-tui completes its handshake. Step must buffer the popup and
+  -- flush it once nefor-tui readies, otherwise the popup hits a pre-
   -- ready_ok plugin and gets dropped (per §5.1).
   reset()
-  _test.set_plugins({ "nefor-chat" })
+  _test.set_plugins({ "nefor-tui" })
 
   -- Engine envelope arrives first — chat isn't ready yet.
   local payload = make_engine_plugin_failed(
@@ -1328,19 +1328,19 @@ local function test_engine_plugin_failed_buffers_until_chat_readies()
   local log = { entry_engine(payload) }
   ncp.step({}, log)
   assert_eq(#_test.calls(), 0,
-    "no send while nefor-chat is pre-ready (popup buffered)")
+    "no send while nefor-tui is pre-ready (popup buffered)")
 
   -- Now chat readies — handshake reply + buffered popup must both fire.
-  log[#log + 1] = entry_plugin("nefor-chat", make_ready("0.1"))
+  log[#log + 1] = entry_plugin("nefor-tui", make_ready("0.1"))
   ncp.step({}, log)
 
   local calls = _test.calls()
   assert_eq(#calls, 2,
     "two sends after ready: ready_ok + buffered popup")
-  assert_eq(calls[1].target, "nefor-chat", "ready_ok targets chat")
+  assert_eq(calls[1].target, "nefor-tui", "ready_ok targets chat")
   local ready_ok = json.decode(calls[1].payload)
   assert_eq(ready_ok.body.kind, "ready_ok", "first send is ready_ok")
-  assert_eq(calls[2].target, "nefor-chat", "popup targets chat")
+  assert_eq(calls[2].target, "nefor-tui", "popup targets chat")
   local popup = json.decode(calls[2].payload)
   assert_eq(popup.body.kind, "chat.popup", "second send is the buffered popup")
   assert_eq(popup.body.level, "error", "level=error")
@@ -1355,11 +1355,11 @@ local function test_engine_envelopes_skipped_in_replay_to_late_attachers()
   -- it: those are private to the translation layer. Pre-fix behavior leaked
   -- `engine.plugin_failed` to every late attacher.
   reset()
-  _test.set_plugins({ "nefor-chat", "late" })
+  _test.set_plugins({ "nefor-tui", "late" })
 
   -- Chat readies first; engine reports a failure; then a late plugin
   -- attaches. Replay should NOT carry the engine entry to it.
-  local log = { entry_plugin("nefor-chat", make_ready("0.1")) }
+  local log = { entry_plugin("nefor-tui", make_ready("0.1")) }
   ncp.step({}, log)
   log[#log + 1] = entry_engine(
     make_engine_plugin_failed("x", "spawn", "y", "missing_dir")

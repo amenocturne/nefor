@@ -1,110 +1,72 @@
 # nefor-tui
 
-Terminal frontend plugin for [nefor](../../README.md). Speaks
-[NCP v0.1](../../protocol/v0.1/spec.md) over stdio; renders an engine-driven
-cell grid with `ratatui` and forwards keyboard, paste, mouse, and resize
-input onto the bus.
+Declarative TUI plugin for nefor — Rust engine + reconciler + Lua-driven
+primitives. Chat is composed as a Lua module (`starter/chat.lua`) that
+runs inside this plugin's Lua VM. The legacy split (`nefor-chat` chat-
+state owner + ratatui-based `nefor-tui` renderer over a grid protocol)
+collapsed into this single plugin at phase 6 of the rewrite.
 
-The plugin has no chat-specific knowledge: it does not know about messages,
-tools, roles, or agents. It only renders cells and forwards input. The
-chat-layer composition lives in a separate plugin (`nefor-chat`) that
-publishes `nefor-tui.*` grid events.
+## What ships
 
-## Run
+- Tree reconciler with `(type_tag, key)` matching, depth-first
+  unmount/mount/update, instance-state preservation across rebuilds.
+- Line-diff renderer wrapped in DEC mode 2026 (synchronized output) with
+  full-frame on first render and after resize.
+- Primitives: `tui.text`, `tui.spans`, `tui.markdown`, `tui.animation`,
+  `tui.column`, `tui.row`, `tui.stack`, `tui.padding`, `tui.expanded`,
+  `tui.spacer`, `tui.constrained`, `tui.align`, `tui.anchored`,
+  `tui.text_input`, `tui.scrollable`.
+- Lua FFI: `tui.start { initial_state, view, update }` + primitive
+  constructors + `tui.scroll_to / scroll_by / scroll_into_view /
+  scroll_position` + NCP egress via the `send_to` side-effect and
+  `nefor.bus.on_event(pattern, msg_kind)` for ingress.
+- Raw key bubbling to Lua as `{ kind = "key.<name>", mods = {...} }`;
+  mouse wheel auto-scrolls the scrollable under the cursor.
 
-Spawned by the engine as a subprocess over stdio. Direct invocation is
-useful only for wire smoke-testing with a fake engine.
+## CLI flags
 
-## Protocol (sub-protocol, NCP v0.1)
+```
+nefor-tui --script <path-to-lua>
+```
 
-All kinds below live on `body.kind` inside `type: "event"` envelopes. The
-plugin connects, sends `ready { protocol_version: "0.1" }`, waits for
-`ready_ok`, and emits an optional `nefor-tui.hello` event with its
-version. Identity on the wire is assigned by the engine from spawn-config,
-not from the plugin.
+`--script` (or `-s`) loads a user-authored Lua module that calls
+`tui.start { ... }`. The shipped chat surface lives at
+`starter/chat.lua`. Without `--script`, a built-in counter scenario
+loads (useful for `cargo run -p nefor-tui` smoke runs).
 
-### Events the plugin CONSUMES (engine → tui)
+## Quick run
 
-| kind                           | body                                                                                                                      |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
-| `nefor-tui.grid.resize`        | `{grid: u32, width: u32, height: u32}`                                                                                    |
-| `nefor-tui.grid.clear`         | `{grid: u32}`                                                                                                             |
-| `nefor-tui.grid.line`          | `{grid: u32, row: u32, col_start: u32, cells: [[text: string, hl_id?: u32, repeat?: u32]]}`                               |
-| `nefor-tui.grid.cursor_goto`   | `{grid: u32, row: u32, col: u32}`                                                                                         |
-| `nefor-tui.grid.scroll`        | `{grid: u32, top: u32, bot: u32, rows: i32}` — positive rows move content up (matches nvim semantics)                     |
-| `nefor-tui.grid.flush`         | `{}` — render accumulated events                                                                                          |
-| `nefor-tui.hl_attr_define`     | `{id: u32, rgb: {fg?: u32, bg?: u32, sp?: u32, bold?: bool, italic?: bool, underline?: bool, reverse?: bool}}`            |
-| `nefor-tui.default_colors`     | `{fg: u32, bg: u32, sp: u32}`                                                                                             |
-| `nefor-tui.clipboard.set`      | `{text: string}` — write `text` to the host clipboard via OSC 52 (best-effort; see "Clipboard" below)                     |
+```sh
+cargo test -p nefor-tui
+```
 
-`grid` is present for future-proofing; MVP renders only `grid=1`. Events
-targeting other grids are silently ignored. Colors are 24-bit RGB packed
-in `u32` (`0xRRGGBB`); absent highlight fields inherit from
-`default_colors`.
+The full chat surface comes up via the engine launcher:
 
-### Events the plugin PRODUCES (tui → bus)
+```sh
+NEFOR_PLUGIN_DIR=$PWD/plugins cargo run --bin nefor -- --config ./starter
+```
 
-| kind                      | body                                                                                                                |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `nefor-tui.input.key`     | `{key: string, modifiers: string[]}`                                                                                |
-| `nefor-tui.input.paste`   | `{text: string}` — bulk paste (bracketed paste)                                                                     |
-| `nefor-tui.input.mouse`   | `{action: string, button?: string, row: u32, col: u32, modifiers: string[]}`                                        |
-| `nefor-tui.input.resize`  | `{cols: u32, rows: u32}` — emitted on SIGWINCH and once at startup                                                  |
-| `nefor-tui.ready`         | `{cols: u32, rows: u32}` — emitted once, immediately after `ready_ok`, to declare the plugin is rendering           |
+## Layout
 
-`key` is the main key symbol: single-character strings like `"a"` /
-`"A"` / `"!"`, or descriptive names like `"enter"`, `"backspace"`,
-`"escape"`, `"tab"`, `"backtab"`, `"left"`, `"right"`, `"up"`, `"down"`,
-`"pageup"`, `"pagedown"`, `"home"`, `"end"`, `"delete"`, `"insert"`,
-`"f1"`..`"f12"`. Shift + letter produces an uppercase `key` string **and**
-`"shift"` in modifiers. Pure modifier-only presses and key releases are not
-forwarded.
-
-`modifiers` is a subset of `["shift", "ctrl", "alt", "super"]`, ordered
-deterministically.
-
-`action` for mouse is `"down" | "up" | "drag" | "scroll_up" |
-"scroll_down" | "scroll_left" | "scroll_right"`. `button` is
-`"left" | "right" | "middle"` for button events; absent for scroll.
-
-### Lifecycle
-
-1. Connect stdio; send NCP `ready { protocol_version: "0.1" }`.
-2. Wait for `ready_ok` on stdin. On `error`, log (stderr) and exit 1.
-3. Emit a `nefor-tui.hello` event with the plugin's version (optional
-   self-description — see `docs/plugin-authoring.md`).
-4. Enter raw mode + alt screen + mouse capture + bracketed paste. A
-   `Drop`-based guard restores the terminal on normal exit, error, or
-   panic.
-5. Emit `nefor-tui.input.resize` and then `nefor-tui.ready` with the
-   measured terminal dimensions.
-6. Main loop: multiplex (a) stdin NCP messages, (b) crossterm events,
-   (c) SIGWINCH via crossterm's `Event::Resize`.
-7. On engine `shutdown`, emit a `nefor-tui.goodbye` event and exit.
-   Closing stdout is the actual shutdown signal the engine sees.
-
-### Clipboard
-
-`nefor-tui.clipboard.set { text }` asks the host terminal to copy `text`
-to the system clipboard via [OSC 52]. The escape sequence
-(`\x1b]52;c;<base64-payload>\x07`) is fire-and-forget; we don't query the
-terminal to confirm it honored the request.
-
-Most modern terminals support OSC 52: kitty, wezterm, alacritty, foot,
-recent xterm, and iTerm2 (with the option enabled). macOS Terminal.app and
-tmux without `set -g set-clipboard on` ignore the sequence — `clipboard.set`
-silently no-ops there. Producers should treat clipboard as best-effort.
-
-The sequence is written to `/dev/tty`, not stdout (stdout is the NCP
-channel; mixing escape codes there would corrupt the JSONL stream).
-
-[OSC 52]: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Operating-System-Commands
-
-### Not in scope
-
-- Chat, messages, tools, or agents. The engine's own `nefor-chat` plugin
-  (or any other composition plugin) owns those concerns and publishes
-  `nefor-tui.*` events at render time.
-- Scrollback. Scroll is a publisher-side operation via `grid.scroll`.
-- Modes or keymaps. Every forwardable key is emitted verbatim.
-- Theming. Colors come entirely from `hl_attr_define` / `default_colors`.
+| File | Role |
+|------|------|
+| `src/desc.rs` | Widget descriptions; Lua-table → `WidgetDescription` parser. |
+| `src/instance.rs` | Reconciler-owned instance tree types + key composition. |
+| `src/reconciler.rs` | `(type_tag, key)` match, mount / reuse / unmount. |
+| `src/layout.rs` | Constraints-down / sizes-up two-pass layout for every primitive. |
+| `src/render.rs` | Line-diff renderer + frame buffer. |
+| `src/ansi.rs` | CSI helpers (sync output, SGR, cursor moves). |
+| `src/lua_host.rs` | mlua VM, `tui.*` install, view/update dispatch, NCP bus bridge. |
+| `src/input.rs` | Crossterm `KeyEvent` → engine `KeyMessage`. |
+| `src/input_router.rs` | Editing-keys-to-focused-text_input vs bubble-to-Lua. |
+| `src/mouse.rs` | Hit-test + auto-wheel-scroll routing. |
+| `src/scrollable.rs` | Scroll state + wheel-step constants. |
+| `src/text_input.rs` | Single-line + multiline edit state, IME, paste. |
+| `src/markdown.rs` | pulldown-cmark adapter for `tui.markdown`. |
+| `src/animation.rs` | Time-based frame sampler. |
+| `src/engine.rs` | State machine — owns reconciler + renderer + lua + NCP queue. |
+| `src/ncp.rs` | NCP stdio transport. |
+| `src/tty.rs` | `/dev/tty` open + `RawModeGuard`. |
+| `src/main.rs` | Binary entrypoint: NCP handshake + crossterm event loop + `--script` flag. |
+| `tests/*_test.rs` | In-process integration tests for engine, layout, scrollable, text_input, animation. |
+| `scenarios/*.lua` | Standalone Lua apps for direct inspection. |

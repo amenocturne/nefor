@@ -61,12 +61,12 @@ local ready_plugins = {}
 -- to drop. Errors are caught — a faulty transform never crashes step.
 local plugin_transforms = {}
 
--- FIFO queue of `chat.popup` envelope tables awaiting nefor-chat's ready.
--- Engine spawn-failures fire during boot, before nefor-chat completes its
--- `ready` handshake — and nefor-chat's NCP layer drops every pre-ready_ok
+-- FIFO queue of `chat.popup` envelope tables awaiting nefor-tui's ready.
+-- Engine spawn-failures fire during boot, before nefor-tui completes its
+-- `ready` handshake — and nefor-tui's NCP layer drops every pre-ready_ok
 -- inbound envelope (per spec §5.1, the plugin must declare ready first).
 -- We buffer translated popups here and flush them inside `handle_ready`
--- once nefor-chat enters `ready_plugins`. Bounded only by good sense: an
+-- once nefor-tui enters `ready_plugins`. Bounded only by good sense: an
 -- engine that fails dozens of plugins at boot will accumulate dozens of
 -- popups; that's fine, a flood of popups is the right user-visible signal.
 local pending_chat_popups = {}
@@ -203,12 +203,12 @@ handle_ready = function(origin, body, current_log, tail_index)
   emit_ready_ok(origin)
   replay_prior_events(origin, current_log, tail_index)
 
-  -- Flush any popups buffered while nefor-chat was still booting. Each
+  -- Flush any popups buffered while nefor-tui was still booting. Each
   -- popup needs a fresh `ts` per send; we already stamped at queue-time
   -- but the engine restamps anyway, so we just re-encode and ship.
-  if origin == "nefor-chat" and #pending_chat_popups > 0 then
+  if origin == "nefor-tui" and #pending_chat_popups > 0 then
     for _, popup in ipairs(pending_chat_popups) do
-      nefor.engine.send(encode(popup), "nefor-chat")
+      nefor.engine.send(encode(popup), "nefor-tui")
     end
     pending_chat_popups = {}
   end
@@ -327,7 +327,7 @@ local function handle_event(origin, payload)
 
   -- Targeted routing: events whose kind is "<peer>.<rest>" addressed at a
   -- specific peer (other than the sender) deliver only to that peer. The
-  -- common case is render traffic from nefor-chat → nefor-tui ("nefor-tui.
+  -- common case is render traffic from nefor-tui → nefor-tui ("nefor-tui.
   -- grid.line", etc); broadcasting those to every plugin spends a Lua
   -- step + JSON encode per peer for nothing. Events whose prefix is the
   -- sender itself ("nefor-tui.input.key" from nefor-tui) are announcements
@@ -361,21 +361,21 @@ end
 --   { kind = "engine.plugin_failed", plugin = "<name>",
 --     phase = "spawn"|"runtime", reason = "<text>", code = "<token>" }
 --
--- We translate them into a `chat.popup` event targeted at nefor-chat so the
+-- We translate them into a `chat.popup` event targeted at nefor-tui so the
 -- user sees the failure instead of having it vanish into engine logs. If
--- nefor-chat isn't connected (e.g. it's the plugin that died), we drop the
+-- nefor-tui isn't connected (e.g. it's the plugin that died), we drop the
 -- event silently — there's no UI to render it on.
 local function handle_engine_envelope(decoded)
   local body = decoded.body
   if type(body) ~= "table" or type(body.kind) ~= "string" then return end
 
   if body.kind == "engine.plugin_failed" then
-    -- Skip if nefor-chat isn't even on the spawn list right now (e.g. the
-    -- failed plugin *is* nefor-chat, or no chat is configured at all). The
+    -- Skip if nefor-tui isn't even on the spawn list right now (e.g. the
+    -- failed plugin *is* nefor-tui, or no chat is configured at all). The
     -- popup contract only matters when there's something to render it.
     local chat_present = false
     for _, name in ipairs(nefor.engine.plugins()) do
-      if name == "nefor-chat" then chat_present = true; break end
+      if name == "nefor-tui" then chat_present = true; break end
     end
     if not chat_present then return end
 
@@ -390,16 +390,16 @@ local function handle_engine_envelope(decoded)
       source  = "engine",
     }, "event")
 
-    -- Engine spawn-failures fire during boot — before nefor-chat completes
-    -- its `ready` handshake. nefor-chat's NCP layer drops every pre-ready
+    -- Engine spawn-failures fire during boot — before nefor-tui completes
+    -- its `ready` handshake. nefor-tui's NCP layer drops every pre-ready
     -- inbound (per §5.1), so a direct send here would silently vanish. If
     -- chat isn't ready yet, queue the popup; `handle_ready` flushes the
     -- queue when chat readies.
-    if not ready_plugins["nefor-chat"] then
+    if not ready_plugins["nefor-tui"] then
       pending_chat_popups[#pending_chat_popups + 1] = popup
       return
     end
-    nefor.engine.send(encode(popup), "nefor-chat")
+    nefor.engine.send(encode(popup), "nefor-tui")
     return
   end
 

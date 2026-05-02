@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*", "plugins/basic-tools", "plugins/reasoner-graph", "plugins/generic-provider", "plugins/generic-tool", "plugins/openai-provider", "plugins/mock-plugin", "plugins/nefor-chat", "plugins/nefor-combinators", "plugins/nefor-tui", "plugins/tool-gate", "tools/fake-engine"]
+members = ["crates/*", "plugins/basic-tools", "plugins/reasoner-graph", "plugins/generic-provider", "plugins/generic-tool", "plugins/openai-provider", "plugins/mock-plugin", "plugins/nefor-combinators", "plugins/nefor-tui", "plugins/tool-gate", "tools/fake-engine"]
 resolver = "2"
 
 [workspace.package]

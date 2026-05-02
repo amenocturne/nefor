@@ -116,7 +116,7 @@ fn ensure_binaries_built() {
 }
 
 /// Driver side of the in-memory duplex. Used twice — once impersonating
-/// `nefor-chat`, once observing `mock-plugin` traffic in the assertions.
+/// `nefor-tui`, once observing `mock-plugin` traffic in the assertions.
 struct Driver {
     writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
     reader: BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
@@ -165,7 +165,7 @@ fn make_driver_transport() -> (Driver, Transport) {
 /// Write a test init.lua under `dir`. Wires:
 ///   * `package.path` so `require("ncp")` etc. resolve to `starter/`.
 ///   * `step` hook → `ncp.step`.
-///   * Transforms registered for "nefor-chat", "ollama", "reasoner-graph",
+///   * Transforms registered for "nefor-tui", "ollama", "reasoner-graph",
 ///     "tool-gate" via `ncp._test_set_transforms` — the test attaches the
 ///     plugins itself, so we skip `ncp.spawn` (it would try to fork a
 ///     binary that's already been spawned).
@@ -213,7 +213,7 @@ ncp._test_set_transforms("tool-gate", {
 })
 
 local chat_chain = agentic_workflow.for_chat()
-ncp._test_set_transforms("nefor-chat", {
+ncp._test_set_transforms("nefor-tui", {
   from_plugin = chat_chain.from_plugin,
 })
 "#;
@@ -416,7 +416,7 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
     // name (the runner uses `<root>/<name>/` as cwd). The repo's
     // `plugins/` has dirs for the real plugins; create empty dirs in a
     // tempdir-based root for the `ollama` mock and the driver-side
-    // `nefor-chat`.
+    // `nefor-tui`.
     //
     // No phantom plugins: Lua-resident reasoner types (provider-wrapper,
     // tool-executor, adapter, terminal) are declared via
@@ -433,7 +433,7 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
         "tool-gate",
         "basic-tools",
         "ollama",
-        "nefor-chat",
+        "nefor-tui",
     ] {
         std::fs::create_dir_all(plugin_root_dir.join(name)).expect("plugin cwd");
     }
@@ -470,7 +470,7 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
             debug.join("tool-gate").display().to_string(),
             // `auto` = "auto-allow unlisted tools" (the gate's no-prompt
             // mode). The starter's prod init.lua passes `prompt` instead
-            // and routes prompts to nefor-chat — but in the test we have
+            // and routes prompts to nefor-tui — but in the test we have
             // no real chat to prompt, so auto-approve everything.
             "--default".into(),
             "auto".into(),
@@ -521,7 +521,7 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
     broker.attach_transport(ollama_t, ollama_spec.name.clone());
     broker.attach_transport(
         driver_transport,
-        PluginName::new("nefor-chat").expect("valid name"),
+        PluginName::new("nefor-tui").expect("valid name"),
     );
 
     let shutdown = broker.shutdown_handle();
@@ -607,7 +607,7 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
     // Final quiet-window drain to absorb late chatter.
     let _startup = drain(&mut driver, QUIET_WINDOW).await;
 
-    // Submit the chat-style request that nefor-chat would have emitted.
+    // Submit the chat-style request that nefor-tui would have emitted.
     let submit = json!({
         "type": "event",
         "body": {
@@ -657,7 +657,7 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
 
     // ---- Read the session log for structural assertions --------------
     //
-    // The driver-side cuts only see traffic targeted at "nefor-chat" or
+    // The driver-side cuts only see traffic targeted at "nefor-tui" or
     // broadcast — that excludes targeted-only envelopes like
     // `tool-gate.tool.invoke` (delivered to tool-gate via the
     // prefix-targeting routing in ncp.lua). For those we read the
@@ -746,7 +746,7 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
     //
     // chat_orchestrator does NOT emit chat.message.append on success —
     // streaming via openai-provider's chat.stream.delta + stream.end
-    // already shows the assistant message in nefor-chat. Re-emitting
+    // already shows the assistant message in nefor-tui. Re-emitting
     // would duplicate the bubble. So we assert on the run's terminal
     // wire shape: an outer `graph.run_complete { status: "success" }`
     // whose results.terminal.output.text contains "FINAL".
