@@ -38,6 +38,19 @@ pub enum WidgetDescription {
         wrap: WrapMode,
         key: Option<String>,
     },
+    /// Time-as-source-of-truth animation. The engine samples the
+    /// current frame on each render from the elapsed wall-clock time
+    /// since the instance was first observed. No per-component clock,
+    /// no tick-driven reschedule — just elapsed-time math.
+    Animation {
+        frames: Vec<AnimationFrame>,
+        duration_ms: u64,
+        /// `None` = infinite playback; `Some(n)` = play `n` cycles
+        /// then hold the end frame for the active direction.
+        iterations: Option<u32>,
+        direction: AnimationDirection,
+        key: Option<String>,
+    },
     Column {
         children: Vec<WidgetDescription>,
         gap: u16,
@@ -179,6 +192,7 @@ impl WidgetDescription {
             WidgetDescription::Text { .. } => "text",
             WidgetDescription::Spans { .. } => "spans",
             WidgetDescription::Markdown { .. } => "markdown",
+            WidgetDescription::Animation { .. } => "animation",
             WidgetDescription::Column { .. } => "column",
             WidgetDescription::Row { .. } => "row",
             WidgetDescription::Padding { .. } => "padding",
@@ -198,6 +212,7 @@ impl WidgetDescription {
             WidgetDescription::Text { key, .. }
             | WidgetDescription::Spans { key, .. }
             | WidgetDescription::Markdown { key, .. }
+            | WidgetDescription::Animation { key, .. }
             | WidgetDescription::Column { key, .. }
             | WidgetDescription::Row { key, .. }
             | WidgetDescription::Padding { key, .. }
@@ -278,6 +293,25 @@ pub struct MarkdownTheme {
     pub list_marker: Option<Style>,
 }
 
+/// One frame entry in `tui.animation`. Either a plain string (rendered
+/// as neutral text) or a sequence of styled spans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnimationFrame {
+    Text(String),
+    Spans(Vec<Span>),
+}
+
+/// Direction of playback for `tui.animation`. Spec semantics:
+/// - `forward`: 0..N-1 then wrap.
+/// - `reverse`: N-1..0 then wrap.
+/// - `alternate`: 0..N-1 then N-1..0, period 2*duration_ms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnimationDirection {
+    Forward,
+    Reverse,
+    Alternate,
+}
+
 /// Convert a Lua table (output of `tui.text/column/padding`) into a
 /// [`WidgetDescription`]. The conversion is recursive; each child of a
 /// column is also dispatched through here.
@@ -301,6 +335,7 @@ pub fn from_lua_table(t: &Table) -> Result<WidgetDescription, TuiError> {
         "text" => parse_text(t),
         "spans" => parse_spans(t),
         "markdown" => parse_markdown(t),
+        "animation" => parse_animation(t),
         "column" => parse_column(t),
         "row" => parse_row(t),
         "padding" => parse_padding(t),
@@ -312,7 +347,7 @@ pub fn from_lua_table(t: &Table) -> Result<WidgetDescription, TuiError> {
         "anchored" => parse_anchored(t),
         "text_input" => parse_text_input(t),
         other => Err(TuiError::InvalidDesc(format!(
-            "unknown widget kind `{other}`; expected one of: text, spans, markdown, column, row, padding, stack, expanded, spacer, constrained, align, anchored, text_input"
+            "unknown widget kind `{other}`; expected one of: text, spans, markdown, animation, column, row, padding, stack, expanded, spacer, constrained, align, anchored, text_input"
         ))),
     }
 }
@@ -486,6 +521,136 @@ fn parse_markdown_theme(t: &Table) -> Result<Option<MarkdownTheme>, TuiError> {
             other.type_name()
         ))),
     }
+}
+
+fn parse_animation(t: &Table) -> Result<WidgetDescription, TuiError> {
+    let frames_val: Value = t.get("frames")?;
+    let frames_tbl = match frames_val {
+        Value::Table(arr) => arr,
+        Value::Nil => {
+            return Err(TuiError::InvalidDesc(
+                "tui.animation: `frames` is required (got nil)".into(),
+            ));
+        }
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.animation: `frames` must be an array (got {})",
+                other.type_name()
+            )));
+        }
+    };
+    let frames = parse_animation_frames(&frames_tbl)?;
+    if frames.is_empty() {
+        return Err(TuiError::InvalidDesc(
+            "tui.animation: `frames` must not be empty".into(),
+        ));
+    }
+    let duration_ms = match t.get::<Value>("duration_ms")? {
+        Value::Integer(n) => {
+            if n <= 0 {
+                return Err(TuiError::InvalidDesc(format!(
+                    "tui.animation: `duration_ms` must be > 0 (got {n})"
+                )));
+            }
+            n as u64
+        }
+        Value::Number(n) => {
+            if !n.is_finite() || n <= 0.0 {
+                return Err(TuiError::InvalidDesc(format!(
+                    "tui.animation: `duration_ms` must be > 0 (got {n})"
+                )));
+            }
+            n as u64
+        }
+        Value::Nil => {
+            return Err(TuiError::InvalidDesc(
+                "tui.animation: `duration_ms` is required".into(),
+            ));
+        }
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.animation: `duration_ms` must be a number (got {})",
+                other.type_name()
+            )));
+        }
+    };
+    let iterations = match t.get::<Value>("iterations")? {
+        Value::Nil => None,
+        Value::Integer(n) => {
+            if n <= 0 {
+                return Err(TuiError::InvalidDesc(format!(
+                    "tui.animation: `iterations` must be > 0 or nil (got {n})"
+                )));
+            }
+            if n > u32::MAX as i64 {
+                return Err(TuiError::InvalidDesc(format!(
+                    "tui.animation: `iterations` exceeds u32::MAX (got {n})"
+                )));
+            }
+            Some(n as u32)
+        }
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.animation: `iterations` must be a positive integer or nil (got {})",
+                other.type_name()
+            )));
+        }
+    };
+    let direction = match t.get::<Value>("direction")? {
+        Value::Nil => AnimationDirection::Forward,
+        Value::String(s) => match s.to_str()?.as_ref() {
+            "forward" => AnimationDirection::Forward,
+            "reverse" => AnimationDirection::Reverse,
+            "alternate" => AnimationDirection::Alternate,
+            other => {
+                return Err(TuiError::InvalidDesc(format!(
+                    "tui.animation: `direction` must be forward|reverse|alternate (got `{other}`)"
+                )));
+            }
+        },
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.animation: `direction` must be a string (got {})",
+                other.type_name()
+            )));
+        }
+    };
+    let key = parse_key(t)?;
+    Ok(WidgetDescription::Animation {
+        frames,
+        duration_ms,
+        iterations,
+        direction,
+        key,
+    })
+}
+
+fn parse_animation_frames(arr: &Table) -> Result<Vec<AnimationFrame>, TuiError> {
+    let mut out = Vec::new();
+    let len = arr.raw_len();
+    for i in 1..=len {
+        let v: Value = arr.get(i)?;
+        match v {
+            Value::Nil => continue,
+            Value::String(s) => out.push(AnimationFrame::Text(s.to_str()?.to_string())),
+            Value::Table(inner) => {
+                let spans = parse_span_array(&inner, "tui.animation.frame")?;
+                if spans.is_empty() {
+                    return Err(TuiError::InvalidDesc(format!(
+                        "tui.animation: frame #{i} table must contain at least one span"
+                    )));
+                }
+                out.push(AnimationFrame::Spans(spans));
+            }
+            other => {
+                return Err(TuiError::InvalidDesc(format!(
+                    "tui.animation: frame #{i} must be a string or span-array table (got {})",
+                    other.type_name()
+                )));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// One theme entry table → `Style`. Same shape as `tui.text`'s `style`.
@@ -1863,6 +2028,123 @@ mod tests {
         let t = eval_table(&l, r#"return { _tui_kind = "markdown" }"#);
         let err = from_lua_table(&t).unwrap_err();
         assert!(format!("{err}").contains("source"));
+    }
+
+    #[test]
+    fn animation_table_parses_minimal() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"return {
+              _tui_kind = "animation",
+              frames = { "a", "b", "c" },
+              duration_ms = 1000,
+            }"#,
+        );
+        let d = from_lua_table(&t).expect("parse");
+        match d {
+            WidgetDescription::Animation {
+                frames,
+                duration_ms,
+                iterations,
+                direction,
+                ..
+            } => {
+                assert_eq!(frames.len(), 3);
+                assert_eq!(duration_ms, 1000);
+                assert!(iterations.is_none());
+                assert!(matches!(direction, AnimationDirection::Forward));
+                assert!(matches!(&frames[0], AnimationFrame::Text(s) if s == "a"));
+            }
+            _ => panic!("expected animation"),
+        }
+    }
+
+    #[test]
+    fn animation_accepts_span_frames() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"return {
+              _tui_kind = "animation",
+              frames = {
+                { { text = "a", bold = true } },
+                { { text = "b" } },
+              },
+              duration_ms = 500,
+              iterations = 3,
+              direction = "alternate",
+            }"#,
+        );
+        let d = from_lua_table(&t).expect("parse");
+        match d {
+            WidgetDescription::Animation {
+                frames,
+                iterations,
+                direction,
+                ..
+            } => {
+                assert_eq!(iterations, Some(3));
+                assert!(matches!(direction, AnimationDirection::Alternate));
+                match &frames[0] {
+                    AnimationFrame::Spans(spans) => {
+                        assert_eq!(spans[0].text, "a");
+                        assert!(spans[0].style.bold);
+                    }
+                    _ => panic!("expected span-frame"),
+                }
+            }
+            _ => panic!("expected animation"),
+        }
+    }
+
+    #[test]
+    fn animation_requires_frames() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"return { _tui_kind = "animation", duration_ms = 100 }"#,
+        );
+        let err = from_lua_table(&t).unwrap_err();
+        assert!(format!("{err}").contains("frames"));
+    }
+
+    #[test]
+    fn animation_requires_duration() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"return { _tui_kind = "animation", frames = { "x" } }"#,
+        );
+        let err = from_lua_table(&t).unwrap_err();
+        assert!(format!("{err}").contains("duration_ms"));
+    }
+
+    #[test]
+    fn animation_rejects_zero_duration() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"return { _tui_kind = "animation", frames = { "x" }, duration_ms = 0 }"#,
+        );
+        let err = from_lua_table(&t).unwrap_err();
+        assert!(format!("{err}").contains("duration_ms"));
+    }
+
+    #[test]
+    fn animation_rejects_unknown_direction() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"return {
+              _tui_kind = "animation",
+              frames = { "x" },
+              duration_ms = 100,
+              direction = "diagonal",
+            }"#,
+        );
+        let err = from_lua_table(&t).unwrap_err();
+        assert!(format!("{err}").contains("direction"));
     }
 
     #[test]

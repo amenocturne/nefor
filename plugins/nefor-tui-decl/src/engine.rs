@@ -4,14 +4,38 @@
 //! `handle_resize`, and `render_if_dirty`. Integration tests drive the
 //! same surface in-process (no spawned subprocess, no /dev/tty).
 
+use std::cell::Cell;
+use std::time::{Duration, Instant};
+
+use crate::animation::sample as animation_sample;
+use crate::desc::WidgetDescription;
 use crate::error::TuiError;
 use crate::input::KeyMessage;
 use crate::input_router::{route_key, RouteDecision};
-use crate::instance::sync_text_inputs;
+use crate::instance::{sync_text_inputs, InstanceKind, InstanceState, WidgetInstance};
 use crate::lua_host::{LuaHost, SideEffect};
 use crate::mouse::{hit_test, kind_string, MouseMessage};
 use crate::reconciler::Reconciler;
 use crate::render::Renderer;
+
+thread_local! {
+    /// Wall-clock value installed by the engine for the duration of a
+    /// layout/paint pass. Used by the animation sampler to read "now"
+    /// without threading the value through every layout call.
+    static RENDER_TIME_MS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Read the current render-time-ms set by the engine. Returns `0`
+/// outside of a layout/paint pass — animation primitives seen at that
+/// point behave as if just mounted, which is harmless for unit tests
+/// that bypass the engine.
+pub fn current_render_time_ms() -> u64 {
+    RENDER_TIME_MS.with(|c| c.get())
+}
+
+fn install_render_time_ms(now_ms: u64) {
+    RENDER_TIME_MS.with(|c| c.set(now_ms));
+}
 
 pub struct Engine {
     lua: LuaHost,
@@ -19,6 +43,16 @@ pub struct Engine {
     renderer: Renderer,
     needs_render: bool,
     exit_requested: bool,
+    /// Origin of the engine's monotonic clock. Each frame the engine
+    /// computes `now_ms = (Instant::now() - clock_origin).as_millis()`
+    /// and installs that into the thread-local before drawing. Tests
+    /// can advance the clock with [`Engine::advance_time`] to step the
+    /// animation sampler deterministically.
+    clock_origin: Instant,
+    /// Synthetic offset added to the wall-clock-derived `now_ms`. Tests
+    /// use [`Engine::advance_time`] to bump this; production code never
+    /// touches it.
+    clock_offset_ms: u64,
 }
 
 impl Engine {
@@ -32,7 +66,40 @@ impl Engine {
             renderer: Renderer::new(width, height),
             needs_render: true,
             exit_requested: false,
+            clock_origin: Instant::now(),
+            clock_offset_ms: 0,
         })
+    }
+
+    /// Current frame-clock value in milliseconds. Combines the engine's
+    /// monotonic origin with the synthetic offset that tests can bump.
+    fn now_ms(&self) -> u64 {
+        let real = self.clock_origin.elapsed().as_millis() as u64;
+        real.saturating_add(self.clock_offset_ms)
+    }
+
+    /// Test-only API: advance the engine's frame clock by `delta`. The
+    /// animation sampler reads from this clock, so test scenarios can
+    /// step animations deterministically without sleeping.
+    pub fn advance_time(&mut self, delta: Duration) {
+        self.clock_offset_ms = self
+            .clock_offset_ms
+            .saturating_add(delta.as_millis() as u64);
+        // Time advancing is a render trigger — animations may need a
+        // fresh frame. The render loop is the actual cadence; here we
+        // just mark dirty so the next `render_if_dirty` runs.
+        self.needs_render = true;
+    }
+
+    /// `true` if any mounted animation has not yet completed. The main
+    /// loop should keep ticking the renderer at frame rate while this
+    /// returns `true` and stay idle otherwise.
+    pub fn has_active_animations(&self) -> bool {
+        let now = self.now_ms();
+        match self.reconciler.root.as_ref() {
+            Some(root) => any_active_animation(root, now),
+            None => false,
+        }
     }
 
     /// Load and execute a Lua source that calls `tui.start { ... }`.
@@ -186,6 +253,8 @@ impl Engine {
         if !self.needs_render {
             return Ok(None);
         }
+        let now = self.now_ms();
+        install_render_time_ms(now);
         let desc = self.lua.render_view()?;
         self.reconciler.reconcile(desc);
         let root = self.reconciler.root.as_mut().ok_or(TuiError::NotStarted)?;
@@ -195,6 +264,13 @@ impl Engine {
         Ok(Some(bytes))
     }
 
+    /// Force a render on the next call to `render_if_dirty`. Used by
+    /// the main loop's animation tick to redraw at frame rate without
+    /// any state change.
+    pub fn mark_animation_tick(&mut self) {
+        self.needs_render = true;
+    }
+
     pub fn exit_requested(&self) -> bool {
         self.exit_requested
     }
@@ -202,6 +278,43 @@ impl Engine {
     pub fn dimensions(&self) -> (u16, u16) {
         (self.renderer.width(), self.renderer.height())
     }
+}
+
+/// Walk the instance tree looking for at least one mounted animation
+/// that has not yet completed. Used by [`Engine::has_active_animations`].
+fn any_active_animation(inst: &WidgetInstance, now_ms: u64) -> bool {
+    if matches!(inst.kind(), InstanceKind::Animation) {
+        if let WidgetDescription::Animation {
+            frames,
+            duration_ms,
+            iterations,
+            direction,
+            ..
+        } = &inst.last_desc
+        {
+            if frames.is_empty() || *duration_ms == 0 {
+                return false;
+            }
+            let mount = match &inst.state {
+                InstanceState::Animation(s) => s.mount_time_ms.unwrap_or(now_ms),
+                _ => return false,
+            };
+            let s = animation_sample(
+                frames.len(),
+                *duration_ms,
+                *iterations,
+                *direction,
+                mount,
+                now_ms,
+            );
+            if !s.completed {
+                return true;
+            }
+        }
+    }
+    inst.children
+        .iter()
+        .any(|c| any_active_animation(c, now_ms))
 }
 
 #[cfg(test)]
@@ -306,6 +419,56 @@ mod tests {
           end,
         }
     "#;
+
+    const ANIMATION_SCENARIO: &str = r#"
+        tui.start {
+          initial_state = {},
+          view = function(_)
+            return tui.animation {
+              frames = { "a", "b", "c", "d" },
+              duration_ms = 100,
+            }
+          end,
+          update = function(_, s) return s, {} end,
+        }
+    "#;
+
+    const STATIC_SCENARIO: &str = r#"
+        tui.start {
+          initial_state = {},
+          view = function(_) return tui.text { content = "hello" } end,
+          update = function(_, s) return s, {} end,
+        }
+    "#;
+
+    #[test]
+    fn has_active_animations_false_when_no_animation_in_tree() {
+        let mut engine = Engine::new(20, 5).expect("engine");
+        engine.load_scenario(STATIC_SCENARIO).expect("load");
+        let _ = engine.render_if_dirty().expect("render");
+        assert!(!engine.has_active_animations());
+    }
+
+    #[test]
+    fn has_active_animations_true_when_infinite_animation_present() {
+        let mut engine = Engine::new(20, 5).expect("engine");
+        engine.load_scenario(ANIMATION_SCENARIO).expect("load");
+        let _ = engine.render_if_dirty().expect("render");
+        assert!(engine.has_active_animations());
+    }
+
+    #[test]
+    fn advance_time_marks_dirty() {
+        let mut engine = Engine::new(20, 5).expect("engine");
+        engine.load_scenario(ANIMATION_SCENARIO).expect("load");
+        let _ = engine.render_if_dirty().expect("first").expect("dirty");
+        // Without state change, second render returns None.
+        assert!(engine.render_if_dirty().expect("second").is_none());
+        // After advancing time, the engine should mark itself dirty.
+        engine.advance_time(Duration::from_millis(50));
+        let r = engine.render_if_dirty().expect("third");
+        assert!(r.is_some(), "advance_time should mark dirty");
+    }
 
     #[test]
     fn mouse_click_dispatches_target_key_to_lua() {

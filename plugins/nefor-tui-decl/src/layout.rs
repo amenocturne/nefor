@@ -19,8 +19,10 @@
 
 use unicode_width::UnicodeWidthChar;
 
+use crate::animation::{sample as animation_sample, AnimationState};
 use crate::desc::{
-    Alignment, Anchor, Dimension, Span, Style, TextInputStyle, WidgetDescription, WrapMode,
+    Alignment, Anchor, AnimationFrame, Dimension, Span, Style, TextInputStyle, WidgetDescription,
+    WrapMode,
 };
 use crate::instance::{InstanceKind, InstanceState, WidgetInstance};
 use crate::render::{Cell, FrameBuffer};
@@ -102,6 +104,7 @@ pub fn layout(inst: &mut WidgetInstance, c: Constraints) -> Size {
         InstanceKind::Text => layout_text(inst, c),
         InstanceKind::Spans => layout_spans(inst, c),
         InstanceKind::Markdown => layout_markdown(inst, c),
+        InstanceKind::Animation => layout_animation(inst, c),
         InstanceKind::Column => layout_column(inst, c),
         InstanceKind::Row => layout_row(inst, c),
         InstanceKind::Padding => layout_padding(inst, c),
@@ -134,6 +137,7 @@ pub fn paint(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
         InstanceKind::Text => paint_text(inst, rect, out),
         InstanceKind::Spans => paint_spans(inst, rect, out),
         InstanceKind::Markdown => paint_markdown(inst, rect, out),
+        InstanceKind::Animation => paint_animation(inst, rect, out),
         InstanceKind::Column => paint_column(inst, rect, out),
         InstanceKind::Row => paint_row(inst, rect, out),
         InstanceKind::Padding => paint_padding(inst, rect, out),
@@ -258,6 +262,63 @@ fn render_markdown_chars(inst: &WidgetInstance) -> Vec<StyledChar> {
         }
         _ => Vec::new(),
     }
+}
+
+// ── Animation ────────────────────────────────────────────────────────────
+
+fn layout_animation(inst: &mut WidgetInstance, c: Constraints) -> Size {
+    let chars = sampled_animation_chars(inst);
+    let rows = wrap_styled(&chars, c.max_width, WrapMode::None);
+    measure_styled_rows(&rows, c)
+}
+
+fn paint_animation(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
+    let chars = sampled_animation_chars(inst);
+    let rows = wrap_styled(&chars, rect.width, WrapMode::None);
+    paint_styled_rows(&rows, rect, out);
+}
+
+/// Sample the current animation frame and convert it to styled chars.
+/// Mounts (records `mount_time_ms`) on first observation. The clock
+/// value comes from [`crate::engine::current_render_time_ms`], which
+/// the engine sets before each measure/paint pass and resets after.
+fn sampled_animation_chars(inst: &mut WidgetInstance) -> Vec<StyledChar> {
+    let (frames, duration_ms, iterations, direction) = match &inst.last_desc {
+        WidgetDescription::Animation {
+            frames,
+            duration_ms,
+            iterations,
+            direction,
+            ..
+        } => (frames.clone(), *duration_ms, *iterations, *direction),
+        _ => return Vec::new(),
+    };
+    if frames.is_empty() || duration_ms == 0 {
+        return Vec::new();
+    }
+    let now = crate::engine::current_render_time_ms();
+    let state = match &mut inst.state {
+        InstanceState::Animation(s) => s,
+        _ => return Vec::new(),
+    };
+    let mount = match state.mount_time_ms {
+        Some(t) => t,
+        None => {
+            state.mount_time_ms = Some(now);
+            now
+        }
+    };
+    let _ = AnimationState::default; // keep AnimationState import warning-free
+    let s = animation_sample(frames.len(), duration_ms, iterations, direction, mount, now);
+    match &frames[s.frame_index] {
+        AnimationFrame::Text(t) => styled_chars_from_str(t, Style::default()),
+        AnimationFrame::Spans(spans) => styled_chars_from_spans(spans),
+    }
+}
+
+/// Convert a plain string + style into styled chars.
+pub(crate) fn styled_chars_from_str(s: &str, style: Style) -> Vec<StyledChar> {
+    s.chars().map(|ch| StyledChar { ch, style }).collect()
 }
 
 // ── Column ───────────────────────────────────────────────────────────────
