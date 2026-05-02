@@ -21,11 +21,12 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::animation::{sample as animation_sample, AnimationState};
 use crate::desc::{
-    Alignment, Anchor, AnimationFrame, Dimension, Span, Style, TextInputStyle, WidgetDescription,
-    WrapMode,
+    Alignment, Anchor, AnimationFrame, Dimension, ScrollableStyle, Span, Style, TextInputStyle,
+    WidgetDescription, WrapMode,
 };
 use crate::instance::{InstanceKind, InstanceState, WidgetInstance};
 use crate::render::{Cell, FrameBuffer};
+use crate::scrollable::{ScrollbarMode, StickTo};
 
 /// Box constraints flowing down from parent to child during the measure
 /// pass. A child must return a [`Size`] within these bounds.
@@ -115,6 +116,7 @@ pub fn layout(inst: &mut WidgetInstance, c: Constraints) -> Size {
         InstanceKind::Align => layout_align(inst, c),
         InstanceKind::Anchored => layout_anchored(inst, c),
         InstanceKind::TextInput => layout_text_input(inst, c),
+        InstanceKind::Scrollable => layout_scrollable(inst, c),
     };
     inst.layout.size = size;
     size
@@ -147,6 +149,7 @@ pub fn paint(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
         InstanceKind::Align => paint_align(inst, rect, out),
         InstanceKind::Anchored => paint_anchored(inst, rect, out),
         InstanceKind::TextInput => paint_text_input(inst, rect, out),
+        InstanceKind::Scrollable => paint_scrollable(inst, rect, out),
     }
 }
 
@@ -1111,6 +1114,256 @@ fn take_columns_from(s: &str, start: usize, width: usize) -> String {
     out
 }
 
+// ── Scrollable ───────────────────────────────────────────────────────────
+
+/// Whether this scrollable should reserve a column for the scrollbar
+/// gutter, given its visibility policy + cached geometry. The reserved
+/// column is consistent between layout and paint so the child sees the
+/// same constraints in both passes.
+fn scrollbar_visible(mode: ScrollbarMode, content_height: u16, viewport_height: u16) -> bool {
+    let overflows = content_height > viewport_height;
+    match mode {
+        ScrollbarMode::Always => true,
+        ScrollbarMode::Auto => overflows,
+        ScrollbarMode::Never => false,
+    }
+}
+
+fn layout_scrollable(inst: &mut WidgetInstance, c: Constraints) -> Size {
+    let (mode, _stick_to) = match &inst.last_desc {
+        WidgetDescription::Scrollable {
+            scrollbar,
+            stick_to,
+            ..
+        } => (*scrollbar, *stick_to),
+        _ => unreachable!("kind/desc mismatch"),
+    };
+
+    // The scrollable claims its parent's max bounds. Then we lay the
+    // child out under unbounded vertical extent so its returned size is
+    // the natural content height.
+    let viewport_w = c.max_width;
+    let viewport_h = c.max_height;
+    if viewport_w == 0 || viewport_h == 0 {
+        return c.constrain(Size::default());
+    }
+
+    // Pass 1 — measure child without reserving the gutter so we know if
+    // overflow is real (in `Auto` mode the gutter reservation depends on
+    // whether content actually overflows).
+    let prelim_w = viewport_w;
+    let prelim_constraints = Constraints {
+        min_width: 0,
+        max_width: prelim_w,
+        min_height: 0,
+        max_height: u16::MAX,
+    };
+    let prelim_size = match inst.children.first_mut() {
+        Some(child) => layout(child, prelim_constraints),
+        None => Size::default(),
+    };
+    let content_height = prelim_size.height;
+
+    let show_bar = scrollbar_visible(mode, content_height, viewport_h);
+
+    // Pass 2 — when the gutter is visible, re-measure the child with the
+    // reduced inner width so wrapping reflects the post-gutter geometry.
+    // (Skipping pass 2 when the gutter is hidden keeps measurement cheap.)
+    let inner_w = if show_bar {
+        viewport_w.saturating_sub(1)
+    } else {
+        viewport_w
+    };
+    let final_size = if show_bar && inner_w != prelim_w {
+        let final_constraints = Constraints {
+            min_width: 0,
+            max_width: inner_w,
+            min_height: 0,
+            max_height: u16::MAX,
+        };
+        match inst.children.first_mut() {
+            Some(child) => layout(child, final_constraints),
+            None => Size::default(),
+        }
+    } else {
+        prelim_size
+    };
+
+    // Stash the geometry for the paint pass + Lua-visible scroll APIs.
+    if let InstanceState::Scrollable(s) = &mut inst.state {
+        s.content_height = final_size.height;
+        s.viewport_height = viewport_h;
+    }
+
+    c.constrain(Size {
+        width: viewport_w,
+        height: viewport_h,
+    })
+}
+
+fn paint_scrollable(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
+    let (mode, stick_to, style) = match &inst.last_desc {
+        WidgetDescription::Scrollable {
+            scrollbar,
+            stick_to,
+            style,
+            ..
+        } => (*scrollbar, *stick_to, *style),
+        _ => return,
+    };
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+
+    // Read the geometry the layout pass cached, then settle the final
+    // scroll_y (apply stick_to, clamp to max). We mutate state through a
+    // small scope so the borrow doesn't fight the child paint below.
+    let (scroll_y, content_height, show_bar, inner_w) = {
+        let st = match &mut inst.state {
+            InstanceState::Scrollable(s) => s,
+            _ => return,
+        };
+        let viewport_h = rect.height;
+        st.viewport_height = viewport_h;
+        let content_height = st.content_height;
+        let show_bar = scrollbar_visible(mode, content_height, viewport_h);
+        let inner_w = if show_bar {
+            rect.width.saturating_sub(1)
+        } else {
+            rect.width
+        };
+        let max = content_height.saturating_sub(viewport_h);
+
+        // Stick-to handling: pin to the relevant edge before we render
+        // when the stickiness flag is still set. First-paint counts as
+        // sticky in both directions so transcripts mounted at-bottom
+        // stay there before any wheel/key events have moved them.
+        let scroll_y = match stick_to {
+            Some(StickTo::End) if !st.seeded || st.was_at_end => max,
+            Some(StickTo::Start) if !st.seeded || st.was_at_start => 0,
+            _ => st.scroll_y.min(max),
+        };
+        st.scroll_y = scroll_y;
+        // Update edge bookkeeping so the next paint pass observes a
+        // fresh `was_at_*` snapshot. Once content settles, content_height
+        // stays small enough to fit, max == 0 so both edges are true.
+        st.was_at_end = scroll_y == max;
+        st.was_at_start = scroll_y == 0;
+        st.seeded = true;
+        (scroll_y, content_height, show_bar, inner_w)
+    };
+
+    // Compute child's full content rect and paint it into a scratch
+    // buffer the height of `content_height`. The paint pass then copies
+    // a single viewport-height window of cells into `out`. This decouples
+    // wrapping (which the child does once at content_height) from
+    // viewport positioning, and keeps the child's invariants (ranges
+    // outside its allotted rect are not touched).
+    let content_w = inner_w;
+    let content_h = content_height;
+    let scratch_w = content_w.max(1);
+    let scratch_h = content_h.max(1);
+    let mut scratch = FrameBuffer::new(scratch_w, scratch_h);
+    if let Some(child) = inst.children.first_mut() {
+        let child_rect = Rect {
+            row: 0,
+            col: 0,
+            width: content_w,
+            height: content_h,
+        };
+        paint(child, child_rect, &mut scratch);
+    }
+
+    // Copy `[scroll_y, scroll_y + viewport_h)` of `scratch` into `out`.
+    let viewport_h = rect.height;
+    for r in 0..viewport_h as usize {
+        let src_row = scroll_y as usize + r;
+        let dst_row = rect.row as usize + r;
+        if dst_row >= out.lines.len() {
+            break;
+        }
+        if src_row >= scratch.lines.len() {
+            break;
+        }
+        let dst_line = &mut out.lines[dst_row];
+        let src_line = &scratch.lines[src_row];
+        for col in 0..content_w as usize {
+            let dst_col = rect.col as usize + col;
+            if dst_col >= dst_line.cells.len() {
+                break;
+            }
+            if col >= src_line.cells.len() {
+                break;
+            }
+            dst_line.cells[dst_col] = src_line.cells[col].clone();
+        }
+    }
+
+    if show_bar {
+        paint_scrollbar(rect, out, content_height, viewport_h, scroll_y, &style);
+    }
+}
+
+/// Paint the scrollbar gutter in the rect's last column — track + thumb.
+/// Thumb position is proportional to `scroll_y / scroll_y_max`; size is
+/// proportional to `viewport / content`, with a one-row floor so it stays
+/// visible on tiny viewports.
+fn paint_scrollbar(
+    rect: Rect,
+    out: &mut FrameBuffer,
+    content_height: u16,
+    viewport_height: u16,
+    scroll_y: u16,
+    style: &Option<ScrollableStyle>,
+) {
+    let col = rect.col + rect.width.saturating_sub(1);
+    let (track_style, thumb_style) = scrollbar_styles(style);
+
+    // Track first — fill every row in the gutter so the thumb overdraws.
+    for r in 0..rect.height as usize {
+        let row = rect.row.saturating_add(r as u16);
+        write_run(out, row, col, "│", &track_style);
+    }
+
+    if content_height == 0 || viewport_height == 0 {
+        return;
+    }
+    let viewport_h = viewport_height as u32;
+    let content_h = content_height as u32;
+    let scroll_y_u = scroll_y as u32;
+
+    let thumb_h = ((viewport_h * viewport_h) / content_h).max(1) as u16;
+    let thumb_h = thumb_h.min(viewport_height);
+    let track_room = viewport_height.saturating_sub(thumb_h) as u32;
+    let scroll_room = content_h.saturating_sub(viewport_h);
+    let thumb_top = (scroll_y_u * track_room)
+        .checked_div(scroll_room)
+        .unwrap_or(0) as u16;
+
+    for r in 0..thumb_h as usize {
+        let row = rect.row.saturating_add(thumb_top + r as u16);
+        write_run(out, row, col, "█", &thumb_style);
+    }
+}
+
+/// Resolve user style overrides into `(track_style, thumb_style)`. Both
+/// fall back to neutral `Style::default()` when nothing is set, per the
+/// no-default-styling rule.
+fn scrollbar_styles(style: &Option<ScrollableStyle>) -> (Style, Style) {
+    let s = style.unwrap_or_default();
+    let track = Style {
+        fg: s.scrollbar_fg,
+        bg: s.scrollbar_bg,
+        ..Style::default()
+    };
+    let thumb = Style {
+        fg: s.thumb.or(s.scrollbar_fg),
+        bg: s.scrollbar_bg,
+        ..Style::default()
+    };
+    (track, thumb)
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 fn child_flex_factor(child: &WidgetInstance) -> u16 {
@@ -1535,6 +1788,7 @@ mod tests {
     use crate::desc::{Alignment, Anchor, Dimension, MarkdownTheme, WidgetDescription, WrapMode};
     use crate::reconciler::Reconciler;
     use crate::render::FrameBuffer;
+    use crate::scrollable::ScrollableState;
 
     fn text(content: &str) -> WidgetDescription {
         WidgetDescription::Text {
@@ -2371,5 +2625,267 @@ mod tests {
         let b = &buf.lines[0].cells[0];
         assert_eq!(b.text, "b");
         assert_eq!(b.style, Style::default());
+    }
+
+    // ── Scrollable tests ────────────────────────────────────────────────
+
+    fn scrollable(child: WidgetDescription, key: &str) -> WidgetDescription {
+        WidgetDescription::Scrollable {
+            key: Some(key.into()),
+            child: Box::new(child),
+            stick_to: None,
+            on_scroll: None,
+            scrollbar: ScrollbarMode::Auto,
+            style: None,
+        }
+    }
+
+    fn scrollable_with(
+        child: WidgetDescription,
+        key: &str,
+        stick_to: Option<StickTo>,
+        scrollbar: ScrollbarMode,
+    ) -> WidgetDescription {
+        WidgetDescription::Scrollable {
+            key: Some(key.into()),
+            child: Box::new(child),
+            stick_to,
+            on_scroll: None,
+            scrollbar,
+            style: None,
+        }
+    }
+
+    fn column(children: Vec<WidgetDescription>, gap: u16) -> WidgetDescription {
+        WidgetDescription::Column {
+            children,
+            gap,
+            key: None,
+        }
+    }
+
+    fn long_column(n: u16) -> WidgetDescription {
+        let kids: Vec<_> = (0..n).map(|i| text(&format!("line-{i}"))).collect();
+        column(kids, 0)
+    }
+
+    fn scrollable_state(rec: &Reconciler) -> ScrollableState {
+        let root = rec.root.as_ref().expect("root");
+        match &root.state {
+            InstanceState::Scrollable(s) => *s,
+            _ => panic!("expected scrollable root"),
+        }
+    }
+
+    #[test]
+    fn scrollable_layout_stores_content_and_viewport_heights() {
+        // 12 rows of content into a 5-row viewport.
+        let mut rec = Reconciler::new();
+        rec.reconcile(scrollable(long_column(12), "transcript"));
+        let mut buf = FrameBuffer::new(20, 5);
+        layout_and_paint(rec.root.as_mut().unwrap(), 20, 5, &mut buf);
+        let st = scrollable_state(&rec);
+        assert_eq!(st.content_height, 12);
+        assert_eq!(st.viewport_height, 5);
+        assert_eq!(st.scroll_y_max(), 7);
+    }
+
+    #[test]
+    fn scrollable_no_overflow_does_not_show_scrollbar() {
+        // 3 rows of content into a 5-row viewport — no bar in `auto`.
+        let desc = scrollable_with(long_column(3), "k", None, ScrollbarMode::Auto);
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let mut buf = FrameBuffer::new(10, 5);
+        layout_and_paint(rec.root.as_mut().unwrap(), 10, 5, &mut buf);
+        // Last column should be blank (no track painted).
+        for r in 0..5 {
+            assert_eq!(cell_at(&buf, r, 9), " ", "row {r} last col is blank");
+        }
+    }
+
+    #[test]
+    fn scrollable_overflow_paints_track_and_thumb() {
+        let desc = scrollable_with(long_column(20), "k", None, ScrollbarMode::Auto);
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let mut buf = FrameBuffer::new(10, 5);
+        layout_and_paint(rec.root.as_mut().unwrap(), 10, 5, &mut buf);
+        // Last column at row 0 is the thumb (since scroll_y = 0). The
+        // remaining rows show the track glyph.
+        let bar_col = 9;
+        let r0 = cell_at(&buf, 0, bar_col);
+        assert_eq!(r0, "█", "thumb at top of track");
+        // Some row below has a track glyph.
+        let mut found_track = false;
+        for r in 1..5 {
+            if cell_at(&buf, r, bar_col) == "│" {
+                found_track = true;
+                break;
+            }
+        }
+        assert!(found_track, "track glyph should appear below thumb");
+    }
+
+    #[test]
+    fn scrollable_always_mode_paints_bar_even_without_overflow() {
+        let desc = scrollable_with(long_column(2), "k", None, ScrollbarMode::Always);
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let mut buf = FrameBuffer::new(10, 5);
+        layout_and_paint(rec.root.as_mut().unwrap(), 10, 5, &mut buf);
+        // Track must be present; with content_h <= viewport_h the
+        // thumb fills the gutter (max == 0, scroll_room == 0, thumb_h
+        // == viewport_h).
+        for r in 0..5 {
+            let g = cell_at(&buf, r, 9);
+            assert!(g == "█" || g == "│", "row {r} gutter glyph = {g:?}");
+        }
+    }
+
+    #[test]
+    fn scrollable_never_mode_suppresses_bar_even_with_overflow() {
+        let desc = scrollable_with(long_column(20), "k", None, ScrollbarMode::Never);
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let mut buf = FrameBuffer::new(10, 5);
+        layout_and_paint(rec.root.as_mut().unwrap(), 10, 5, &mut buf);
+        // No bar painted on the last column.
+        for r in 0..5 {
+            let g = cell_at(&buf, r, 9);
+            assert_ne!(g, "█", "row {r} should not show thumb");
+            assert_ne!(g, "│", "row {r} should not show track");
+        }
+    }
+
+    #[test]
+    fn scrollable_clamps_scroll_y_after_layout_when_content_shrinks() {
+        // Start with overflow: scroll_y = 5.
+        let mut rec = Reconciler::new();
+        rec.reconcile(scrollable(long_column(20), "k"));
+        let mut buf = FrameBuffer::new(10, 5);
+        layout_and_paint(rec.root.as_mut().unwrap(), 10, 5, &mut buf);
+        // Move the offset partway down.
+        if let Some(root) = rec.root.as_mut() {
+            if let InstanceState::Scrollable(s) = &mut root.state {
+                s.scroll_y = 12;
+                s.was_at_end = false;
+                s.was_at_start = false;
+            }
+        }
+        // Now shrink content to 4 rows — scroll_y should clamp to 0.
+        rec.reconcile(scrollable(long_column(4), "k"));
+        let mut buf = FrameBuffer::new(10, 5);
+        layout_and_paint(rec.root.as_mut().unwrap(), 10, 5, &mut buf);
+        let st = scrollable_state(&rec);
+        assert_eq!(st.scroll_y, 0, "scroll_y must clamp after content shrinks");
+    }
+
+    #[test]
+    fn stick_to_end_pins_to_bottom_on_first_paint() {
+        // 20 rows of content, viewport = 5. With stick_to = end, scroll_y
+        // should land at scroll_y_max (15) without any user input.
+        let desc = scrollable_with(
+            long_column(20),
+            "k",
+            Some(StickTo::End),
+            ScrollbarMode::Auto,
+        );
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let mut buf = FrameBuffer::new(10, 5);
+        layout_and_paint(rec.root.as_mut().unwrap(), 10, 5, &mut buf);
+        let st = scrollable_state(&rec);
+        assert_eq!(st.scroll_y, 15);
+        assert!(st.was_at_end);
+    }
+
+    #[test]
+    fn stick_to_end_follows_growing_content_when_at_bottom() {
+        let desc = scrollable_with(
+            long_column(10),
+            "k",
+            Some(StickTo::End),
+            ScrollbarMode::Auto,
+        );
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let mut buf = FrameBuffer::new(10, 5);
+        layout_and_paint(rec.root.as_mut().unwrap(), 10, 5, &mut buf);
+        let st0 = scrollable_state(&rec);
+        assert_eq!(st0.scroll_y, 5, "first paint pins at bottom");
+
+        // Content grows to 30 rows; user has not moved.
+        let desc2 = scrollable_with(
+            long_column(30),
+            "k",
+            Some(StickTo::End),
+            ScrollbarMode::Auto,
+        );
+        rec.reconcile(desc2);
+        let mut buf = FrameBuffer::new(10, 5);
+        layout_and_paint(rec.root.as_mut().unwrap(), 10, 5, &mut buf);
+        let st1 = scrollable_state(&rec);
+        assert_eq!(st1.scroll_y, 25, "follows the new bottom");
+    }
+
+    #[test]
+    fn stick_to_end_does_not_drag_user_who_scrolled_away_from_bottom() {
+        let desc = scrollable_with(
+            long_column(20),
+            "k",
+            Some(StickTo::End),
+            ScrollbarMode::Auto,
+        );
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let mut buf = FrameBuffer::new(10, 5);
+        layout_and_paint(rec.root.as_mut().unwrap(), 10, 5, &mut buf);
+        // User scrolled up away from the bottom.
+        if let Some(root) = rec.root.as_mut() {
+            if let InstanceState::Scrollable(s) = &mut root.state {
+                s.scroll_y = 5;
+                s.was_at_end = false;
+            }
+        }
+        // Content grows; scroll_y should stay where it was, not jump back.
+        let desc2 = scrollable_with(
+            long_column(30),
+            "k",
+            Some(StickTo::End),
+            ScrollbarMode::Auto,
+        );
+        rec.reconcile(desc2);
+        let mut buf = FrameBuffer::new(10, 5);
+        layout_and_paint(rec.root.as_mut().unwrap(), 10, 5, &mut buf);
+        let st = scrollable_state(&rec);
+        assert_eq!(st.scroll_y, 5, "user position preserved");
+        assert!(!st.was_at_end);
+    }
+
+    #[test]
+    fn scrollable_paints_window_at_scroll_y() {
+        // 20 rows: "line-0" .. "line-19". Viewport = 3. Scroll to row 5.
+        let desc = scrollable_with(long_column(20), "k", None, ScrollbarMode::Never);
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let mut buf = FrameBuffer::new(10, 3);
+        layout_and_paint(rec.root.as_mut().unwrap(), 10, 3, &mut buf);
+        // First paint at scroll_y = 0.
+        assert_eq!(cell_at(&buf, 0, 0), "l", "top of content shows line-0");
+
+        if let Some(root) = rec.root.as_mut() {
+            if let InstanceState::Scrollable(s) = &mut root.state {
+                s.scroll_y = 5;
+            }
+        }
+        let mut buf = FrameBuffer::new(10, 3);
+        layout_and_paint(rec.root.as_mut().unwrap(), 10, 3, &mut buf);
+        // Row 0 should now show line-5 ("line-5").
+        let row0: String = buf.lines[0].cells.iter().map(|c| c.text.clone()).collect();
+        assert!(
+            row0.starts_with("line-5"),
+            "expected line-5 at row 0, got {row0:?}"
+        );
     }
 }

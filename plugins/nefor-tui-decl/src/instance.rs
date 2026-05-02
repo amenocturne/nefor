@@ -7,6 +7,7 @@
 use crate::animation::AnimationState;
 use crate::desc::WidgetDescription;
 use crate::layout::{Rect, Size};
+use crate::scrollable::ScrollableState;
 use crate::text_input::TextInputState;
 
 /// Composite reconciler key. Two stages compose it:
@@ -41,6 +42,7 @@ pub enum InstanceKind {
     Align,
     Anchored,
     TextInput,
+    Scrollable,
 }
 
 /// Per-primitive internal state preserved across `view` rebuilds. Phase 1
@@ -71,6 +73,11 @@ pub enum InstanceState {
     /// re-renders via the reconciler key (per spec: cursor, selection,
     /// scroll offset, IME composition, undo stack).
     TextInput(TextInputState),
+    /// Per-instance scroll state for `scrollable`. Survives across
+    /// re-renders via the reconciler key — `scroll_y` and the
+    /// stick-to-end bookkeeping persist so wheel + auto-pin behave
+    /// consistently across `view` rebuilds.
+    Scrollable(ScrollableState),
 }
 
 /// Layout side-effect storage on each instance — set by the measure pass,
@@ -138,6 +145,17 @@ pub fn default_state(kind: InstanceKind) -> InstanceState {
         InstanceKind::Align => InstanceState::Align,
         InstanceKind::Anchored => InstanceState::Anchored,
         InstanceKind::TextInput => InstanceState::TextInput(TextInputState::default()),
+        InstanceKind::Scrollable => {
+            // Seed `was_at_end = true` so a `stick_to = "end"` transcript
+            // lands pinned to the bottom on first paint, before any
+            // wheel events have moved it. The paint pass clears the
+            // flag once the user scrolls away from the bottom.
+            InstanceState::Scrollable(ScrollableState {
+                was_at_end: true,
+                was_at_start: true,
+                ..ScrollableState::default()
+            })
+        }
     }
 }
 
@@ -157,6 +175,7 @@ pub fn kind_of(desc: &WidgetDescription) -> InstanceKind {
         WidgetDescription::Align { .. } => InstanceKind::Align,
         WidgetDescription::Anchored { .. } => InstanceKind::Anchored,
         WidgetDescription::TextInput { .. } => InstanceKind::TextInput,
+        WidgetDescription::Scrollable { .. } => InstanceKind::Scrollable,
     }
 }
 

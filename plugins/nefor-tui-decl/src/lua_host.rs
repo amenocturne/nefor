@@ -283,6 +283,13 @@ fn install_tui(lua: &Lua, started: Arc<Mutex<StartedState>>) -> Result<(), TuiEr
     })?;
     tui.set("text_input", text_input_fn)?;
 
+    // tui.scrollable { key, child, stick_to?, on_scroll?, scrollbar?, style? }
+    let scrollable_fn = lua.create_function(|_, args: Table| {
+        args.set(KIND_FIELD, "scrollable")?;
+        Ok(args)
+    })?;
+    tui.set("scrollable", scrollable_fn)?;
+
     // tui.start { initial_state, view, update }
     let started_for_start = Arc::clone(&started);
     let start_fn = lua.create_function(move |lua, args: Table| {

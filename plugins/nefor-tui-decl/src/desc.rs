@@ -104,6 +104,38 @@ pub enum WidgetDescription {
         child: Box<WidgetDescription>,
         key: Option<String>,
     },
+    /// `tui.scrollable` — viewport over a child of unbounded vertical
+    /// extent. Holds its own scroll offset (per-instance state, preserved
+    /// across `view` rebuilds via the reconciler key). Wheel events
+    /// auto-scroll the deepest scrollable under the cursor; keyboard
+    /// scrolling stays in Lua's domain (per spec — shortcuts are entirely
+    /// Lua-driven, unlike a browser default).
+    Scrollable {
+        /// User-supplied key. Required so Lua can drive scroll position
+        /// through `tui.scroll_to / scroll_by / scroll_into_view`. Kept
+        /// `Option<String>` for parity with the generic key-handling
+        /// helpers; semantically `scrollable` always has one (the desc
+        /// parser rejects scrollables without a key).
+        key: Option<String>,
+        /// The single child whose content is scrolled.
+        child: Box<WidgetDescription>,
+        /// Auto-pin behavior. `None` = no stickiness; `Some(End)` =
+        /// chat-transcript style auto-pin to bottom; `Some(Start)` = anchor
+        /// to top through content growth.
+        stick_to: Option<crate::scrollable::StickTo>,
+        /// Stable msg-kind dispatched to Lua's `update` whenever the
+        /// scroll position changes (wheel, programmatic, stick-to pin).
+        /// `None` to silence the callback entirely.
+        on_scroll: Option<String>,
+        /// Scrollbar visibility policy. `Auto` = show only when content
+        /// overflows; `Always` = always render the gutter; `Never` =
+        /// suppress (the gutter column is still reserved if `content >
+        /// viewport`, so painted geometry is consistent — see paint
+        /// implementation).
+        scrollbar: crate::scrollable::ScrollbarMode,
+        /// Per-element style overrides. `None` = neutral terminal output.
+        style: Option<ScrollableStyle>,
+    },
     TextInput {
         /// User key — required for text_input so Lua can reference it
         /// across re-renders. Stored as `Option<String>` to keep the
@@ -203,6 +235,7 @@ impl WidgetDescription {
             WidgetDescription::Align { .. } => "align",
             WidgetDescription::Anchored { .. } => "anchored",
             WidgetDescription::TextInput { .. } => "text_input",
+            WidgetDescription::Scrollable { .. } => "scrollable",
         }
     }
 
@@ -222,9 +255,20 @@ impl WidgetDescription {
             | WidgetDescription::Constrained { key, .. }
             | WidgetDescription::Align { key, .. }
             | WidgetDescription::Anchored { key, .. }
-            | WidgetDescription::TextInput { key, .. } => key.as_deref(),
+            | WidgetDescription::TextInput { key, .. }
+            | WidgetDescription::Scrollable { key, .. } => key.as_deref(),
         }
     }
+}
+
+/// Style record for `tui.scrollable`. Mirrors the spec's
+/// `{ scrollbar_fg, scrollbar_bg, thumb }` shape. `None` entries fall
+/// through to neutral cells (per the no-default-styling rule).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScrollableStyle {
+    pub scrollbar_fg: Option<Color>,
+    pub scrollbar_bg: Option<Color>,
+    pub thumb: Option<Color>,
 }
 
 /// Style record for `tui.text_input`. Mirrors the spec's
@@ -346,8 +390,9 @@ pub fn from_lua_table(t: &Table) -> Result<WidgetDescription, TuiError> {
         "align" => parse_align(t),
         "anchored" => parse_anchored(t),
         "text_input" => parse_text_input(t),
+        "scrollable" => parse_scrollable(t),
         other => Err(TuiError::InvalidDesc(format!(
-            "unknown widget kind `{other}`; expected one of: text, spans, markdown, animation, column, row, padding, stack, expanded, spacer, constrained, align, anchored, text_input"
+            "unknown widget kind `{other}`; expected one of: text, spans, markdown, animation, column, row, padding, stack, expanded, spacer, constrained, align, anchored, text_input, scrollable"
         ))),
     }
 }
@@ -910,6 +955,105 @@ fn parse_text_input(t: &Table) -> Result<WidgetDescription, TuiError> {
         cursor_blink,
         style,
     })
+}
+
+fn parse_scrollable(t: &Table) -> Result<WidgetDescription, TuiError> {
+    let key = parse_key(t)?;
+    if key.is_none() {
+        return Err(TuiError::InvalidDesc(
+            "tui.scrollable: `key` is required so the primitive can be referenced \
+             across re-renders and from `tui.scroll_to / scroll_by / scroll_position`"
+                .into(),
+        ));
+    }
+    let child_val: Value = t.get("child")?;
+    let child_tbl = match child_val {
+        Value::Table(t) => t,
+        Value::Nil => {
+            return Err(TuiError::InvalidDesc(
+                "tui.scrollable: `child` is required".into(),
+            ));
+        }
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.scrollable: `child` must be a widget table (got {})",
+                other.type_name()
+            )));
+        }
+    };
+    let child = Box::new(from_lua_table(&child_tbl)?);
+
+    let stick_to = match t.get::<Value>("stick_to")? {
+        Value::Nil => None,
+        Value::String(s) => match s.to_str()?.as_ref() {
+            "start" => Some(crate::scrollable::StickTo::Start),
+            "end" => Some(crate::scrollable::StickTo::End),
+            other => {
+                return Err(TuiError::InvalidDesc(format!(
+                    "tui.scrollable: `stick_to` must be \"start\", \"end\", or nil (got `{other}`)"
+                )));
+            }
+        },
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.scrollable: `stick_to` must be a string or nil (got {})",
+                other.type_name()
+            )));
+        }
+    };
+
+    let on_scroll = parse_optional_string(t, "on_scroll", "tui.scrollable")?;
+
+    let scrollbar = match t.get::<Value>("scrollbar")? {
+        Value::Nil => crate::scrollable::ScrollbarMode::Auto,
+        Value::String(s) => match s.to_str()?.as_ref() {
+            "auto" => crate::scrollable::ScrollbarMode::Auto,
+            "always" => crate::scrollable::ScrollbarMode::Always,
+            "never" => crate::scrollable::ScrollbarMode::Never,
+            other => {
+                return Err(TuiError::InvalidDesc(format!(
+                    "tui.scrollable: `scrollbar` must be \"auto\"|\"always\"|\"never\" (got `{other}`)"
+                )));
+            }
+        },
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.scrollable: `scrollbar` must be a string (got {})",
+                other.type_name()
+            )));
+        }
+    };
+
+    let style = parse_scrollable_style(t)?;
+
+    Ok(WidgetDescription::Scrollable {
+        key,
+        child,
+        stick_to,
+        on_scroll,
+        scrollbar,
+        style,
+    })
+}
+
+fn parse_scrollable_style(t: &Table) -> Result<Option<ScrollableStyle>, TuiError> {
+    match t.get::<Value>("style")? {
+        Value::Nil => Ok(None),
+        Value::Table(st) => {
+            let scrollbar_fg = parse_color(&st, "scrollbar_fg")?;
+            let scrollbar_bg = parse_color(&st, "scrollbar_bg")?;
+            let thumb = parse_color(&st, "thumb")?;
+            Ok(Some(ScrollableStyle {
+                scrollbar_fg,
+                scrollbar_bg,
+                thumb,
+            }))
+        }
+        other => Err(TuiError::InvalidDesc(format!(
+            "tui.scrollable: `style` must be a table or nil (got {})",
+            other.type_name()
+        ))),
+    }
 }
 
 fn parse_optional_bool(t: &Table, key: &str, ctx: &str) -> Result<Option<bool>, TuiError> {
