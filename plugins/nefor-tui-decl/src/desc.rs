@@ -19,6 +19,14 @@ pub enum WidgetDescription {
         wrap: WrapMode,
         key: Option<String>,
     },
+    /// Inline styled runs — a single logical text block with multiple
+    /// per-segment styles. Wrapping operates on the concatenated logical
+    /// text; span boundaries do not force line breaks.
+    Spans {
+        spans: Vec<Span>,
+        wrap: WrapMode,
+        key: Option<String>,
+    },
     Column {
         children: Vec<WidgetDescription>,
         gap: u16,
@@ -158,6 +166,7 @@ impl WidgetDescription {
     pub fn type_tag(&self) -> &'static str {
         match self {
             WidgetDescription::Text { .. } => "text",
+            WidgetDescription::Spans { .. } => "spans",
             WidgetDescription::Column { .. } => "column",
             WidgetDescription::Row { .. } => "row",
             WidgetDescription::Padding { .. } => "padding",
@@ -175,6 +184,7 @@ impl WidgetDescription {
     pub fn user_key(&self) -> Option<&str> {
         match self {
             WidgetDescription::Text { key, .. }
+            | WidgetDescription::Spans { key, .. }
             | WidgetDescription::Column { key, .. }
             | WidgetDescription::Row { key, .. }
             | WidgetDescription::Padding { key, .. }
@@ -225,6 +235,15 @@ pub enum WrapMode {
     None,
 }
 
+/// One styled run inside a `tui.spans`. The markdown walker (phase 5b)
+/// produces these too; future primitives that emit pre-styled inline
+/// content can reuse the type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Span {
+    pub text: String,
+    pub style: Style,
+}
+
 /// Convert a Lua table (output of `tui.text/column/padding`) into a
 /// [`WidgetDescription`]. The conversion is recursive; each child of a
 /// column is also dispatched through here.
@@ -246,6 +265,7 @@ pub fn from_lua_table(t: &Table) -> Result<WidgetDescription, TuiError> {
 
     match kind.as_str() {
         "text" => parse_text(t),
+        "spans" => parse_spans(t),
         "column" => parse_column(t),
         "row" => parse_row(t),
         "padding" => parse_padding(t),
@@ -257,7 +277,7 @@ pub fn from_lua_table(t: &Table) -> Result<WidgetDescription, TuiError> {
         "anchored" => parse_anchored(t),
         "text_input" => parse_text_input(t),
         other => Err(TuiError::InvalidDesc(format!(
-            "unknown widget kind `{other}`; expected one of: text, column, row, padding, stack, expanded, spacer, constrained, align, anchored, text_input"
+            "unknown widget kind `{other}`; expected one of: text, spans, column, row, padding, stack, expanded, spacer, constrained, align, anchored, text_input"
         ))),
     }
 }
@@ -285,6 +305,85 @@ fn parse_text(t: &Table) -> Result<WidgetDescription, TuiError> {
         style,
         wrap,
         key,
+    })
+}
+
+fn parse_spans(t: &Table) -> Result<WidgetDescription, TuiError> {
+    let spans_val: Value = t.get("spans")?;
+    let spans_tbl = match spans_val {
+        Value::Table(arr) => arr,
+        Value::Nil => {
+            return Err(TuiError::InvalidDesc(
+                "tui.spans: `spans` is required (got nil)".into(),
+            ));
+        }
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.spans: `spans` must be an array of span tables (got {})",
+                other.type_name()
+            )));
+        }
+    };
+    let spans = parse_span_array(&spans_tbl, "tui.spans")?;
+    let wrap = parse_wrap(t)?;
+    let key = parse_key(t)?;
+    Ok(WidgetDescription::Spans { spans, wrap, key })
+}
+
+/// Parse a Lua array of span tables `{ text=, fg=, bg=, bold=, italic=,
+/// underline=, reverse= }`. Used by `tui.spans` and (in later phases)
+/// `tui.animation` and the markdown walker.
+pub(crate) fn parse_span_array(arr: &Table, ctx: &str) -> Result<Vec<Span>, TuiError> {
+    let mut out = Vec::new();
+    let len = arr.raw_len();
+    for i in 1..=len {
+        let v: Value = arr.get(i)?;
+        let entry = match v {
+            Value::Nil => continue,
+            Value::Table(t) => t,
+            other => {
+                return Err(TuiError::InvalidDesc(format!(
+                    "{ctx}: span #{i} must be a table (got {})",
+                    other.type_name()
+                )));
+            }
+        };
+        out.push(parse_one_span(&entry, ctx, i)?);
+    }
+    Ok(out)
+}
+
+fn parse_one_span(t: &Table, ctx: &str, i: usize) -> Result<Span, TuiError> {
+    let text: String = match t.get::<Value>("text")? {
+        Value::String(s) => s.to_str()?.to_string(),
+        Value::Nil => {
+            return Err(TuiError::InvalidDesc(format!(
+                "{ctx}: span #{i} requires `text`"
+            )));
+        }
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "{ctx}: span #{i} `text` must be a string (got {})",
+                other.type_name()
+            )));
+        }
+    };
+    let fg = parse_color(t, "fg")?;
+    let bg = parse_color(t, "bg")?;
+    let bold = parse_bool(t, "bold")?;
+    let italic = parse_bool(t, "italic")?;
+    let underline = parse_bool(t, "underline")?;
+    let reverse = parse_bool(t, "reverse")?;
+    Ok(Span {
+        text,
+        style: Style {
+            fg,
+            bg,
+            bold,
+            italic,
+            underline,
+            reverse,
+        },
     })
 }
 
@@ -808,7 +907,19 @@ fn parse_style(t: &Table) -> Result<Option<Style>, TuiError> {
 fn parse_color(t: &Table, key: &str) -> Result<Option<Color>, TuiError> {
     match t.get::<Value>(key)? {
         Value::Nil => Ok(None),
-        Value::String(s) if s.to_str()?.as_ref() == "reset" => Ok(Some(Color::Reset)),
+        Value::String(s) => {
+            let raw = s.to_str()?;
+            let val: &str = raw.as_ref();
+            if val == "reset" {
+                Ok(Some(Color::Reset))
+            } else if let Some(hex) = val.strip_prefix('#') {
+                parse_hex_rgb(hex, key).map(Some)
+            } else {
+                Err(TuiError::InvalidDesc(format!(
+                    "color `{key}`: string must be \"reset\" or `#rrggbb` (got `{val}`)"
+                )))
+            }
+        }
         Value::Integer(n) => {
             if !(0..=255).contains(&n) {
                 return Err(TuiError::InvalidDesc(format!(
@@ -824,10 +935,22 @@ fn parse_color(t: &Table, key: &str) -> Result<Option<Color>, TuiError> {
             Ok(Some(Color::Rgb(r, g, b)))
         }
         other => Err(TuiError::InvalidDesc(format!(
-            "color `{key}` must be a string \"reset\", an integer 0..=255, or a table {{r,g,b}} (got {})",
+            "color `{key}` must be a string \"reset\" or `#rrggbb`, an integer 0..=255, or a table {{r,g,b}} (got {})",
             other.type_name()
         ))),
     }
+}
+
+fn parse_hex_rgb(hex: &str, key: &str) -> Result<Color, TuiError> {
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(TuiError::InvalidDesc(format!(
+            "color `{key}`: hex must be `#rrggbb` (got `#{hex}`)"
+        )));
+    }
+    let parse_pair = |i: usize| -> u8 {
+        u8::from_str_radix(&hex[i..i + 2], 16).expect("validated as ascii hex above")
+    };
+    Ok(Color::Rgb(parse_pair(0), parse_pair(2), parse_pair(4)))
 }
 
 fn parse_bool(t: &Table, key: &str) -> Result<bool, TuiError> {
@@ -1487,5 +1610,99 @@ mod tests {
         );
         let err = from_lua_table(&t).unwrap_err();
         assert!(format!("{err}").contains("min_lines"));
+    }
+
+    #[test]
+    fn spans_table_parses_minimal() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"return { _tui_kind = "spans", spans = { { text = "hi" } } }"#,
+        );
+        let d = from_lua_table(&t).expect("parse");
+        match d {
+            WidgetDescription::Spans { spans, wrap, key } => {
+                assert_eq!(spans.len(), 1);
+                assert_eq!(spans[0].text, "hi");
+                assert_eq!(spans[0].style, Style::default());
+                assert!(matches!(wrap, WrapMode::Word));
+                assert!(key.is_none());
+            }
+            _ => panic!("expected spans"),
+        }
+    }
+
+    #[test]
+    fn spans_table_parses_full_attributes() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r##"return {
+              _tui_kind = "spans",
+              spans = {
+                { text = "a", fg = "#ff0000", bold = true },
+                { text = "b", fg = 196, italic = true },
+                { text = "c", bg = { r = 1, g = 2, b = 3 }, underline = true, reverse = true },
+                { text = "d", fg = "reset" },
+              },
+              wrap = "char",
+            }"##,
+        );
+        let d = from_lua_table(&t).expect("parse");
+        match d {
+            WidgetDescription::Spans { spans, wrap, .. } => {
+                assert!(matches!(wrap, WrapMode::Char));
+                assert_eq!(spans[0].style.fg, Some(Color::Rgb(0xff, 0, 0)));
+                assert!(spans[0].style.bold);
+                assert_eq!(spans[1].style.fg, Some(Color::Indexed(196)));
+                assert!(spans[1].style.italic);
+                assert_eq!(spans[2].style.bg, Some(Color::Rgb(1, 2, 3)));
+                assert!(spans[2].style.underline);
+                assert!(spans[2].style.reverse);
+                assert_eq!(spans[3].style.fg, Some(Color::Reset));
+            }
+            _ => panic!("expected spans"),
+        }
+    }
+
+    #[test]
+    fn spans_requires_spans_field() {
+        let l = lua();
+        let t = eval_table(&l, r#"return { _tui_kind = "spans" }"#);
+        let err = from_lua_table(&t).unwrap_err();
+        assert!(format!("{err}").contains("spans"));
+    }
+
+    #[test]
+    fn spans_each_entry_requires_text() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r##"return { _tui_kind = "spans", spans = { { fg = "#ffffff" } } }"##,
+        );
+        let err = from_lua_table(&t).unwrap_err();
+        assert!(format!("{err}").contains("text"));
+    }
+
+    #[test]
+    fn spans_invalid_hex_color_errors() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r##"return { _tui_kind = "spans", spans = { { text = "x", fg = "#zzzzzz" } } }"##,
+        );
+        let err = from_lua_table(&t).unwrap_err();
+        assert!(format!("{err}").contains("hex"));
+    }
+
+    #[test]
+    fn spans_unknown_string_color_errors() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"return { _tui_kind = "spans", spans = { { text = "x", fg = "rebeccapurple" } } }"#,
+        );
+        let err = from_lua_table(&t).unwrap_err();
+        assert!(format!("{err}").contains("rrggbb"));
     }
 }

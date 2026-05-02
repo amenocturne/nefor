@@ -190,6 +190,13 @@ fn install_tui(lua: &Lua, started: Arc<Mutex<StartedState>>) -> Result<(), TuiEr
     })?;
     tui.set("text", text_fn)?;
 
+    // tui.spans { spans = { { text=, fg=, bg=, bold=, italic=, ... } }, wrap?, key? }
+    let spans_fn = lua.create_function(|_, args: Table| {
+        args.set(KIND_FIELD, "spans")?;
+        Ok(args)
+    })?;
+    tui.set("spans", spans_fn)?;
+
     // tui.column { children, gap?, key? }
     let column_fn = lua.create_function(|_, args: Table| {
         args.set(KIND_FIELD, "column")?;

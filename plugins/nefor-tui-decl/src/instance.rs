@@ -27,6 +27,7 @@ pub enum KeyId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstanceKind {
     Text,
+    Spans,
     Column,
     Row,
     Padding,
@@ -47,6 +48,7 @@ pub enum InstanceState {
     /// Phase-1 placeholder. Reserved for cached wrap result.
     #[default]
     Text,
+    Spans,
     Column,
     Row,
     Padding,
@@ -114,6 +116,7 @@ impl WidgetInstance {
 pub fn default_state(kind: InstanceKind) -> InstanceState {
     match kind {
         InstanceKind::Text => InstanceState::Text,
+        InstanceKind::Spans => InstanceState::Spans,
         InstanceKind::Column => InstanceState::Column,
         InstanceKind::Row => InstanceState::Row,
         InstanceKind::Padding => InstanceState::Padding,
@@ -130,6 +133,7 @@ pub fn default_state(kind: InstanceKind) -> InstanceState {
 pub fn kind_of(desc: &WidgetDescription) -> InstanceKind {
     match desc {
         WidgetDescription::Text { .. } => InstanceKind::Text,
+        WidgetDescription::Spans { .. } => InstanceKind::Spans,
         WidgetDescription::Column { .. } => InstanceKind::Column,
         WidgetDescription::Row { .. } => InstanceKind::Row,
         WidgetDescription::Padding { .. } => InstanceKind::Padding,

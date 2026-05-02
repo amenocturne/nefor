@@ -20,7 +20,7 @@
 use unicode_width::UnicodeWidthChar;
 
 use crate::desc::{
-    Alignment, Anchor, Dimension, Style, TextInputStyle, WidgetDescription, WrapMode,
+    Alignment, Anchor, Dimension, Span, Style, TextInputStyle, WidgetDescription, WrapMode,
 };
 use crate::instance::{InstanceKind, InstanceState, WidgetInstance};
 use crate::render::{Cell, FrameBuffer};
@@ -100,6 +100,7 @@ impl Rect {
 pub fn layout(inst: &mut WidgetInstance, c: Constraints) -> Size {
     let size = match inst.kind() {
         InstanceKind::Text => layout_text(inst, c),
+        InstanceKind::Spans => layout_spans(inst, c),
         InstanceKind::Column => layout_column(inst, c),
         InstanceKind::Row => layout_row(inst, c),
         InstanceKind::Padding => layout_padding(inst, c),
@@ -130,6 +131,7 @@ pub fn paint(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
     inst.layout.painted_rect = Some(rect);
     match inst.kind() {
         InstanceKind::Text => paint_text(inst, rect, out),
+        InstanceKind::Spans => paint_spans(inst, rect, out),
         InstanceKind::Column => paint_column(inst, rect, out),
         InstanceKind::Row => paint_row(inst, rect, out),
         InstanceKind::Padding => paint_padding(inst, rect, out),
@@ -203,6 +205,26 @@ fn enforce_width_contract(line: &str, max_width: u16) -> std::borrow::Cow<'_, st
     } else {
         std::borrow::Cow::Borrowed(line)
     }
+}
+
+// ── Spans ────────────────────────────────────────────────────────────────
+
+fn layout_spans(inst: &mut WidgetInstance, c: Constraints) -> Size {
+    let (spans, wrap) = match &inst.last_desc {
+        WidgetDescription::Spans { spans, wrap, .. } => (spans.clone(), *wrap),
+        _ => unreachable!("kind/desc mismatch"),
+    };
+    let rows = wrap_styled(&styled_chars_from_spans(&spans), c.max_width, wrap);
+    measure_styled_rows(&rows, c)
+}
+
+fn paint_spans(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
+    let (spans, wrap) = match &inst.last_desc {
+        WidgetDescription::Spans { spans, wrap, .. } => (spans.clone(), *wrap),
+        _ => return,
+    };
+    let rows = wrap_styled(&styled_chars_from_spans(&spans), rect.width, wrap);
+    paint_styled_rows(&rows, rect, out);
 }
 
 // ── Column ───────────────────────────────────────────────────────────────
@@ -1020,6 +1042,220 @@ fn cross_of(axis: Axis, width: u16, height: u16) -> u16 {
 
 /// Word-wrap `content` to fit in `width` columns. Newlines in source are
 /// hard breaks; returned vec elements never include a trailing newline.
+/// One char paired with its style. The styled-text path (spans, and in
+/// later 5b commits the markdown walker + animation frames) operates on
+/// `Vec<StyledChar>` so wrapping decisions are independent of span
+/// boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StyledChar {
+    pub ch: char,
+    pub style: Style,
+}
+
+/// Concatenate every span's chars into a single styled-char run.
+/// Embedded `\n` becomes an explicit line break in `wrap_styled`.
+pub fn styled_chars_from_spans(spans: &[Span]) -> Vec<StyledChar> {
+    let mut out: Vec<StyledChar> = Vec::new();
+    for span in spans {
+        for ch in span.text.chars() {
+            out.push(StyledChar {
+                ch,
+                style: span.style,
+            });
+        }
+    }
+    out
+}
+
+/// Wrap a styled-char run into rows of `width` cells. Honors `\n` as a
+/// hard line break; otherwise uses the same word/char/none algorithm as
+/// the unstyled path.
+pub fn wrap_styled(chars: &[StyledChar], width: u16, wrap: WrapMode) -> Vec<Vec<StyledChar>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let limit = width as usize;
+    // Split on `\n` first so wrapping operates on logical lines.
+    let mut logical: Vec<Vec<StyledChar>> = Vec::new();
+    let mut line: Vec<StyledChar> = Vec::new();
+    for c in chars {
+        if c.ch == '\n' {
+            logical.push(std::mem::take(&mut line));
+            continue;
+        }
+        line.push(c.clone());
+    }
+    if !line.is_empty() || !chars.is_empty() {
+        logical.push(line);
+    }
+
+    let mut wrapped: Vec<Vec<StyledChar>> = Vec::new();
+    for raw in logical {
+        match wrap {
+            WrapMode::None => wrapped.push(take_styled_columns(&raw, limit)),
+            WrapMode::Char => wrapped.extend(wrap_styled_char(&raw, limit)),
+            WrapMode::Word => wrapped.extend(wrap_styled_word(&raw, limit)),
+        }
+    }
+    wrapped
+}
+
+fn take_styled_columns(line: &[StyledChar], limit: usize) -> Vec<StyledChar> {
+    let mut taken = 0usize;
+    let mut out = Vec::new();
+    for c in line {
+        let w = char_width(c.ch);
+        if taken + w > limit {
+            break;
+        }
+        out.push(c.clone());
+        taken += w;
+    }
+    out
+}
+
+fn wrap_styled_char(line: &[StyledChar], limit: usize) -> Vec<Vec<StyledChar>> {
+    let mut out: Vec<Vec<StyledChar>> = Vec::new();
+    let mut current: Vec<StyledChar> = Vec::new();
+    let mut col = 0usize;
+    for c in line {
+        let w = char_width(c.ch);
+        if col + w > limit && !current.is_empty() {
+            out.push(std::mem::take(&mut current));
+            col = 0;
+        }
+        if w > limit {
+            if !current.is_empty() {
+                out.push(std::mem::take(&mut current));
+            }
+            current.push(c.clone());
+            out.push(std::mem::take(&mut current));
+            col = 0;
+            continue;
+        }
+        current.push(c.clone());
+        col += w;
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+fn wrap_styled_word(line: &[StyledChar], limit: usize) -> Vec<Vec<StyledChar>> {
+    let mut out: Vec<Vec<StyledChar>> = Vec::new();
+    let mut current: Vec<StyledChar> = Vec::new();
+    let mut col = 0usize;
+    for word in split_styled_words(line) {
+        let ww: usize = word.iter().map(|c| char_width(c.ch)).sum();
+        if col == 0 && ww > limit {
+            for sub in wrap_styled_char(word, limit) {
+                out.push(sub);
+            }
+            current.clear();
+            col = 0;
+            continue;
+        }
+        if col + ww > limit {
+            out.push(std::mem::take(&mut current));
+            col = 0;
+            if word.iter().all(|c| c.ch.is_whitespace()) {
+                continue;
+            }
+        }
+        current.extend_from_slice(word);
+        col += ww;
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+fn split_styled_words(line: &[StyledChar]) -> Vec<&[StyledChar]> {
+    let mut out: Vec<&[StyledChar]> = Vec::new();
+    if line.is_empty() {
+        return out;
+    }
+    let mut start = 0usize;
+    let mut in_space = line[0].ch.is_whitespace();
+    for (i, c) in line.iter().enumerate() {
+        let cw = c.ch.is_whitespace();
+        if cw != in_space {
+            out.push(&line[start..i]);
+            start = i;
+            in_space = cw;
+        }
+    }
+    if start < line.len() {
+        out.push(&line[start..]);
+    }
+    out
+}
+
+pub(crate) fn measure_styled_rows(rows: &[Vec<StyledChar>], c: Constraints) -> Size {
+    let height = rows.len() as u16;
+    let width = rows
+        .iter()
+        .map(|r| r.iter().map(|sc| char_width(sc.ch) as u16).sum::<u16>())
+        .max()
+        .unwrap_or(0);
+    c.constrain(Size { width, height })
+}
+
+pub(crate) fn paint_styled_rows(rows: &[Vec<StyledChar>], rect: Rect, out: &mut FrameBuffer) {
+    for (i, row) in rows.iter().enumerate() {
+        if i as u16 >= rect.height {
+            break;
+        }
+        let r = rect.row.saturating_add(i as u16);
+        write_styled_row(out, r, rect.col, rect.width, row);
+    }
+}
+
+fn write_styled_row(
+    buf: &mut FrameBuffer,
+    row: u16,
+    col_start: u16,
+    max_width: u16,
+    line: &[StyledChar],
+) {
+    let row_idx = row as usize;
+    if row_idx >= buf.lines.len() {
+        return;
+    }
+    let line_buf = &mut buf.lines[row_idx];
+    let limit = max_width as usize;
+    let mut col = col_start as usize;
+    let bound = (col_start as usize).saturating_add(limit);
+    for sc in line {
+        let w = char_width(sc.ch);
+        if w == 0 {
+            continue;
+        }
+        if col >= line_buf.cells.len() || col >= bound {
+            break;
+        }
+        if col + w > bound {
+            break;
+        }
+        let mut s = String::new();
+        s.push(sc.ch);
+        line_buf.cells[col] = Cell {
+            text: s,
+            style: sc.style,
+        };
+        col += w;
+        for _ in 1..w {
+            if col >= line_buf.cells.len() || col >= bound {
+                break;
+            }
+            line_buf.cells[col] = Cell::blank();
+            col += 1;
+        }
+    }
+}
+
 pub fn wrap_text(content: &str, width: u16, wrap: WrapMode) -> Vec<String> {
     if width == 0 {
         return vec![];
@@ -1881,5 +2117,118 @@ mod tests {
             "a",
             "background preserved at top-right"
         );
+    }
+
+    // ── Spans ────────────────────────────────────────────────────────
+
+    fn span(text: &str, style: Style) -> Span {
+        Span {
+            text: text.to_string(),
+            style,
+        }
+    }
+
+    fn spans_desc(spans: Vec<Span>, wrap: WrapMode) -> WidgetDescription {
+        WidgetDescription::Spans {
+            spans,
+            wrap,
+            key: None,
+        }
+    }
+
+    #[test]
+    fn spans_layout_concatenates_widths() {
+        let s = vec![
+            span("hello ", Style::default()),
+            span(
+                "world",
+                Style {
+                    bold: true,
+                    ..Style::default()
+                },
+            ),
+        ];
+        let desc = spans_desc(s, WrapMode::Word);
+        let buf = paint_root(desc, 20, 1);
+        assert_eq!(cell_at(&buf, 0, 0), "h");
+        assert_eq!(cell_at(&buf, 0, 6), "w");
+        assert_eq!(cell_at(&buf, 0, 10), "d");
+    }
+
+    #[test]
+    fn spans_per_segment_styles_land_on_cells() {
+        use crate::desc::Color;
+        let red = Style {
+            fg: Some(Color::Rgb(255, 0, 0)),
+            ..Style::default()
+        };
+        let bold = Style {
+            bold: true,
+            ..Style::default()
+        };
+        let s = vec![span("ab", red), span("cd", bold)];
+        let desc = spans_desc(s, WrapMode::None);
+        let buf = paint_root(desc, 10, 1);
+        assert_eq!(buf.lines[0].cells[0].style, red);
+        assert_eq!(buf.lines[0].cells[1].style, red);
+        assert_eq!(buf.lines[0].cells[2].style, bold);
+        assert_eq!(buf.lines[0].cells[3].style, bold);
+    }
+
+    #[test]
+    fn spans_wrap_word_splits_across_span_boundary() {
+        // Span boundary in the middle of a word should NOT force a break
+        // — wrapping operates on the concatenated logical text.
+        let s = vec![
+            span("hello", Style::default()),
+            span(
+                " world",
+                Style {
+                    bold: true,
+                    ..Style::default()
+                },
+            ),
+        ];
+        let desc = spans_desc(s, WrapMode::Word);
+        let buf = paint_root(desc, 6, 2);
+        // First row: "hello " (6 cells), second row: "world".
+        assert_eq!(cell_at(&buf, 0, 0), "h");
+        assert_eq!(cell_at(&buf, 0, 4), "o");
+        assert_eq!(cell_at(&buf, 1, 0), "w");
+        assert_eq!(cell_at(&buf, 1, 4), "d");
+    }
+
+    #[test]
+    fn spans_wrap_char_treats_styled_chars_uniformly() {
+        let s = vec![
+            span("abcd", Style::default()),
+            span("efgh", Style::default()),
+        ];
+        let desc = spans_desc(s, WrapMode::Char);
+        let buf = paint_root(desc, 3, 3);
+        assert_eq!(cell_at(&buf, 0, 0), "a");
+        assert_eq!(cell_at(&buf, 0, 2), "c");
+        assert_eq!(cell_at(&buf, 1, 0), "d");
+        assert_eq!(cell_at(&buf, 1, 2), "f");
+        assert_eq!(cell_at(&buf, 2, 0), "g");
+        assert_eq!(cell_at(&buf, 2, 1), "h");
+    }
+
+    #[test]
+    fn spans_wrap_none_truncates_to_width() {
+        let s = vec![span("abcdefghij", Style::default())];
+        let desc = spans_desc(s, WrapMode::None);
+        let buf = paint_root(desc, 4, 1);
+        assert_eq!(cell_at(&buf, 0, 0), "a");
+        assert_eq!(cell_at(&buf, 0, 3), "d");
+    }
+
+    #[test]
+    fn spans_explicit_newline_breaks_line() {
+        let s = vec![span("a\nb", Style::default())];
+        let desc = spans_desc(s, WrapMode::Word);
+        let buf = paint_root(desc, 10, 2);
+        assert_eq!(cell_at(&buf, 0, 0), "a");
+        assert_eq!(cell_at(&buf, 1, 0), "b");
     }
 }
