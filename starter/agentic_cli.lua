@@ -185,6 +185,19 @@ end
 local function write_stdout(s) io.stdout:write(s); io.stdout:flush() end
 local function write_stderr(s) io.stderr:write(s); io.stderr:flush() end
 
+-- Milliseconds-since-midnight (UTC) parsed from `nefor.engine.now()`'s
+-- ISO-8601 ms-precision string. Lua 5.4's `os.time()` is whole-seconds,
+-- so a sub-1s mock turn rounds to 0; this preserves precision.
+-- Wraps at midnight UTC — acceptable for sub-day CLI sessions; if a
+-- session genuinely spans midnight the duration_ms field reads negative.
+-- A real wall-clock binding (`nefor.engine.now_ms()`) would close that.
+local function now_ms()
+  local ts = nefor.engine.now()
+  local h, m, s, ms = ts:match("T(%d+):(%d+):(%d+)%.(%d+)Z")
+  if not h then return 0 end
+  return (((tonumber(h) * 60) + tonumber(m)) * 60 + tonumber(s)) * 1000 + tonumber(ms)
+end
+
 local function install_text_format(gate)
   agentic_workflow.on_stream(function(text)
     if gate and gate.suppress_stream then return end
@@ -298,7 +311,7 @@ local function run_single_shot(prompt, format, json_state, turn_start_ms, gate)
     already_exited = true
     if format == "json" then
       local answer = table.concat(json_state.answer_acc or {})
-      local duration_ms = (os.time() - turn_start_ms) * 1000
+      local duration_ms = now_ms() - turn_start_ms
       local payload = {
         answer = answer,
         tool_calls = json_state.tool_calls or {},
@@ -494,7 +507,7 @@ function M.run(argv)
 
   -- Branch on mode.
   if opts.prompt ~= nil then
-    run_single_shot(opts.prompt, opts.format, state, os.time(), gate)
+    run_single_shot(opts.prompt, opts.format, state, now_ms(), gate)
   else
     run_repl(opts.format, state, gate)
   end
