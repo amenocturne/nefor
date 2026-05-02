@@ -9,6 +9,7 @@ use crate::input::KeyMessage;
 use crate::input_router::{route_key, RouteDecision};
 use crate::instance::sync_text_inputs;
 use crate::lua_host::{LuaHost, SideEffect};
+use crate::mouse::{hit_test, kind_string, MouseMessage};
 use crate::reconciler::Reconciler;
 use crate::render::Renderer;
 
@@ -149,6 +150,37 @@ impl Engine {
         Ok(())
     }
 
+    /// Dispatch a [`MouseMessage`]. Hit-tests against the most recently
+    /// painted tree (uses each instance's `painted_rect`); the result is
+    /// always bubbled to Lua as `{ kind, x, y, target_key, button, mods }`.
+    /// Wheel events bubble verbatim — auto-scroll on `scrollable` lands
+    /// in phase 5a.
+    pub fn handle_mouse(&mut self, evt: MouseMessage) -> Result<(), TuiError> {
+        let target_key = self
+            .reconciler
+            .root
+            .as_ref()
+            .and_then(|root| hit_test(root, evt.x, evt.y));
+
+        let msg = self.lua().create_table()?;
+        msg.set("kind", kind_string(evt.kind))?;
+        msg.set("x", evt.x)?;
+        msg.set("y", evt.y)?;
+        match target_key {
+            Some(k) => msg.set("target_key", k)?,
+            None => msg.set("target_key", mlua::Value::Nil)?,
+        }
+        if let Some(b) = evt.button {
+            msg.set("button", b)?;
+        }
+        let mods = self.lua().create_table()?;
+        for (i, m) in evt.mods.iter().enumerate() {
+            mods.set(i + 1, *m)?;
+        }
+        msg.set("mods", mods)?;
+        self.dispatch_msg(msg)
+    }
+
     /// Render if dirty. Returns the ANSI bytes; `None` means "no work".
     pub fn render_if_dirty(&mut self) -> Result<Option<Vec<u8>>, TuiError> {
         if !self.needs_render {
@@ -251,5 +283,52 @@ mod tests {
         let bytes = engine.render_if_dirty().expect("second").expect("dirty");
         let s = String::from_utf8(bytes).expect("utf-8");
         assert!(s.contains("\x1b[2J"), "post-resize should full-redraw");
+    }
+
+    const MOUSE_SCENARIO: &str = r#"
+        tui.start {
+          initial_state = { last_click = nil },
+          view = function(s)
+            local label = s.last_click and ("clicked: " .. s.last_click) or "no click"
+            return tui.column { gap = 0, children = {
+              tui.padding {
+                value = 1,
+                key   = "wrapper",
+                child = tui.text { content = label, key = "label" },
+              },
+            }}
+          end,
+          update = function(msg, s)
+            if msg.kind == "mouse.click" then
+              return { last_click = msg.target_key or "<nil>" }, {}
+            end
+            return s, {}
+          end,
+        }
+    "#;
+
+    #[test]
+    fn mouse_click_dispatches_target_key_to_lua() {
+        use crate::mouse::{MouseKind, MouseMessage};
+        let mut engine = Engine::new(20, 5).expect("engine");
+        engine.load_scenario(MOUSE_SCENARIO).expect("load");
+        let _ = engine.render_if_dirty().expect("render");
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Click,
+                x: 2,
+                y: 1,
+                button: Some("left"),
+                mods: vec![],
+            })
+            .expect("mouse");
+        let bytes = engine.render_if_dirty().expect("render").expect("dirty");
+        let s = String::from_utf8(bytes).expect("utf-8");
+        // Hit-test reaches the deepest keyed instance under (2, 1) — the
+        // text labelled "label", inside the keyed padding.
+        assert!(
+            s.contains("clicked: label"),
+            "expected label hit, got:\n{s}"
+        );
     }
 }

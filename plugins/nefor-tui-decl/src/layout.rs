@@ -116,11 +116,18 @@ pub fn layout(inst: &mut WidgetInstance, c: Constraints) -> Size {
 }
 
 /// Paint pass — `inst` paints itself into `out` at the given `rect`.
-/// `inst.layout` must have been populated by a prior `layout` call.
-pub fn paint(inst: &WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
+/// `inst.layout` must have been populated by a prior `layout` call. As a
+/// side effect, the painted rect is recorded on the instance so the
+/// mouse hit-test (and any other post-paint walk) can map a screen
+/// coord to the deepest enclosing instance.
+pub fn paint(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
     if rect.width == 0 || rect.height == 0 {
+        // Clipped: clear any prior rect so the hit-test doesn't see
+        // stale geometry from a previous frame.
+        inst.layout.painted_rect = None;
         return;
     }
+    inst.layout.painted_rect = Some(rect);
     match inst.kind() {
         InstanceKind::Text => paint_text(inst, rect, out),
         InstanceKind::Column => paint_column(inst, rect, out),
@@ -153,7 +160,7 @@ fn layout_text(inst: &mut WidgetInstance, c: Constraints) -> Size {
     c.constrain(raw)
 }
 
-fn paint_text(inst: &WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
+fn paint_text(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
     let (content, style, wrap) = match &inst.last_desc {
         WidgetDescription::Text {
             content,
@@ -208,7 +215,7 @@ fn layout_column(inst: &mut WidgetInstance, c: Constraints) -> Size {
     flex_layout(inst, c, Axis::Vertical, gap)
 }
 
-fn paint_column(inst: &WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
+fn paint_column(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
     let gap = match &inst.last_desc {
         WidgetDescription::Column { gap, .. } => *gap,
         _ => 0,
@@ -226,7 +233,7 @@ fn layout_row(inst: &mut WidgetInstance, c: Constraints) -> Size {
     flex_layout(inst, c, Axis::Horizontal, gap)
 }
 
-fn paint_row(inst: &WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
+fn paint_row(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
     let gap = match &inst.last_desc {
         WidgetDescription::Row { gap, .. } => *gap,
         _ => 0,
@@ -373,15 +380,15 @@ fn flex_layout(inst: &mut WidgetInstance, c: Constraints, axis: Axis, gap: u16) 
     c.constrain(raw)
 }
 
-fn paint_flex(inst: &WidgetInstance, rect: Rect, out: &mut FrameBuffer, axis: Axis, gap: u16) {
+fn paint_flex(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer, axis: Axis, gap: u16) {
     let n = inst.children.len();
     if n == 0 {
         return;
     }
-    let main_sizes = &inst.layout.flex_main_sizes;
+    let main_sizes = inst.layout.flex_main_sizes.clone();
     let mut cursor: u16 = 0;
     let main_total = main_of(axis, rect.width, rect.height);
-    for (i, child) in inst.children.iter().enumerate() {
+    for (i, child) in inst.children.iter_mut().enumerate() {
         if cursor >= main_total {
             break;
         }
@@ -449,7 +456,7 @@ fn layout_padding(inst: &mut WidgetInstance, c: Constraints) -> Size {
     c.constrain(raw)
 }
 
-fn paint_padding(inst: &WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
+fn paint_padding(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
     let (top, _right, _bottom, left) = match &inst.last_desc {
         WidgetDescription::Padding {
             top,
@@ -467,7 +474,7 @@ fn paint_padding(inst: &WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
     if inner_w == 0 || inner_h == 0 {
         return;
     }
-    if let Some(child) = inst.children.first() {
+    if let Some(child) = inst.children.first_mut() {
         let inner = Rect {
             row: rect.row.saturating_add(top),
             col: rect.col.saturating_add(left),
@@ -500,8 +507,8 @@ fn layout_stack(inst: &mut WidgetInstance, c: Constraints) -> Size {
     })
 }
 
-fn paint_stack(inst: &WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
-    for child in inst.children.iter() {
+fn paint_stack(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
+    for child in inst.children.iter_mut() {
         // All children share the stack's full rect; later children paint
         // on top of earlier ones (no compositing — last writer wins).
         let s = child.layout.size;
@@ -538,8 +545,8 @@ fn layout_spacer(_inst: &mut WidgetInstance, c: Constraints) -> Size {
     })
 }
 
-fn paint_passthrough(inst: &WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
-    if let Some(child) = inst.children.first() {
+fn paint_passthrough(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
+    if let Some(child) = inst.children.first_mut() {
         let s = child.layout.size;
         let child_rect = Rect {
             row: rect.row,
@@ -609,12 +616,12 @@ fn layout_align(inst: &mut WidgetInstance, c: Constraints) -> Size {
     })
 }
 
-fn paint_align(inst: &WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
+fn paint_align(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
     let alignment = match &inst.last_desc {
         WidgetDescription::Align { alignment, .. } => *alignment,
         _ => return,
     };
-    let Some(child) = inst.children.first() else {
+    let Some(child) = inst.children.first_mut() else {
         return;
     };
     let cs = child.layout.size;
@@ -671,7 +678,7 @@ fn layout_anchored(inst: &mut WidgetInstance, c: Constraints) -> Size {
     })
 }
 
-fn paint_anchored(inst: &WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
+fn paint_anchored(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
     let (anchor, offset_x, offset_y) = match &inst.last_desc {
         WidgetDescription::Anchored {
             anchor,
@@ -681,10 +688,11 @@ fn paint_anchored(inst: &WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
         } => (*anchor, *offset_x, *offset_y),
         _ => return,
     };
-    let Some(child) = inst.children.first() else {
+    let anchored_child_size = inst.layout.anchored_child_size;
+    let Some(child) = inst.children.first_mut() else {
         return;
     };
-    let child_size = inst.layout.anchored_child_size.unwrap_or(child.layout.size);
+    let child_size = anchored_child_size.unwrap_or(child.layout.size);
     let cw = child_size.width.min(rect.width);
     let ch = child_size.height.min(rect.height);
     if cw == 0 || ch == 0 {
@@ -814,7 +822,7 @@ fn visible_line_count(value: &str, min_lines: u16, max_lines: u16) -> u16 {
         .min(u16::MAX as u32) as u16
 }
 
-fn paint_text_input(inst: &WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
+fn paint_text_input(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
     let (value, focused, placeholder, style) = match &inst.last_desc {
         WidgetDescription::TextInput {
             value,
@@ -867,12 +875,11 @@ fn paint_text_input(inst: &WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
     // default; users can theme via `style.cursor`. Phase 4 ignores
     // cursor_blink (no internal clock).
     if focused {
-        paint_cursor(inst, rect, out, st, value, &style);
+        paint_cursor(rect, out, st, value, &style);
     }
 }
 
 fn paint_cursor(
-    _inst: &WidgetInstance,
     rect: Rect,
     out: &mut FrameBuffer,
     st: &crate::text_input::TextInputState,

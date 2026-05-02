@@ -5,7 +5,7 @@
 //! rebuild.
 
 use crate::desc::WidgetDescription;
-use crate::layout::Size;
+use crate::layout::{Rect, Size};
 use crate::text_input::TextInputState;
 
 /// Composite reconciler key. Two stages compose it:
@@ -76,6 +76,11 @@ pub struct LayoutResult {
     /// For `anchored`: the resolved (width, height) the child should use.
     /// `None` when the instance is not an anchored.
     pub anchored_child_size: Option<Size>,
+    /// Rect the instance occupied during the most recent paint pass.
+    /// `None` when the instance was clipped (zero-area rect) or never
+    /// painted. Populated by `layout::paint` so the mouse hit-test can
+    /// resolve a screen coord to the deepest enclosing instance.
+    pub painted_rect: Option<Rect>,
 }
 
 impl LayoutResult {
@@ -83,6 +88,7 @@ impl LayoutResult {
         self.size = Size::default();
         self.flex_main_sizes.clear();
         self.anchored_child_size = None;
+        self.painted_rect = None;
     }
 }
 
