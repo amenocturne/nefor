@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 description = "Declarative TUI plugin for nefor — engine + reconciler + Lua-driven primitives. Phase 1 of the nefor-tui rewrite."
 
+[lib]
+name = "nefor_tui_decl"
+path = "src/lib.rs"
+
 [[bin]]
 name = "nefor-tui-decl"
 path = "src/main.rs"

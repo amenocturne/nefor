@@ -1,24 +1,10 @@
-//! nefor-tui-decl — declarative TUI plugin for nefor.
+//! nefor-tui-decl binary entrypoint.
 //!
-//! Phase-1 scaffold. Compiles, exits clean. Real entrypoint lands in
-//! commit 4 along with the lua host + event loop.
-
-mod ansi;
-mod desc;
-mod engine;
-mod error;
-mod input;
-mod instance;
-mod layout;
-mod lua_host;
-mod ncp;
-mod reconciler;
-mod render;
-mod tty;
+//! Phase-1 scaffold. Real NCP handshake + render loop lands in commit 4.
 
 use std::process::ExitCode;
 
-use crate::error::TuiError;
+use nefor_tui_decl::error::TuiError;
 
 #[tokio::main]
 async fn main() -> ExitCode {

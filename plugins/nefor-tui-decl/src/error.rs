@@ -7,4 +7,7 @@ pub enum TuiError {
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    #[error("invalid widget description: {0}")]
+    InvalidDesc(String),
 }
