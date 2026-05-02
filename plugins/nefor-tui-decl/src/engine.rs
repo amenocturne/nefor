@@ -13,7 +13,9 @@ use crate::error::TuiError;
 use crate::input::KeyMessage;
 use crate::input_router::{route_key, RouteDecision};
 use crate::instance::{sync_text_inputs, InstanceKind, InstanceState, WidgetInstance};
-use crate::lua_host::{LuaHost, SideEffect};
+use crate::lua_host::{
+    LuaHost, ScrollCommand, ScrollPositionMap, ScrollPositionSnapshot, SideEffect,
+};
 use crate::mouse::{
     find_scrollable_path, hit_test, instance_at_path as mouse_instance_at_path, kind_string,
     MouseKind, MouseMessage,
@@ -210,8 +212,79 @@ impl Engine {
                 SideEffect::Exit => self.exit_requested = true,
             }
         }
+        // Apply any scroll commands the update issued via tui.scroll_*.
+        // Errors here propagate so a missing-key reference surfaces
+        // immediately (per spec).
+        let cmds = self.lua.take_scroll_commands();
+        for cmd in cmds {
+            self.apply_scroll_command(cmd)?;
+        }
         self.needs_render = true;
         Ok(())
+    }
+
+    /// Apply one scroll command from Lua's queue against the live tree.
+    /// Errors when the key doesn't resolve — silent no-op would mask
+    /// config bugs (per spec § Lua scroll-control APIs).
+    fn apply_scroll_command(&mut self, cmd: ScrollCommand) -> Result<(), TuiError> {
+        let key = match &cmd {
+            ScrollCommand::To { key, .. }
+            | ScrollCommand::By { key, .. }
+            | ScrollCommand::IntoView { key } => key.clone(),
+        };
+        let Some(root) = self.reconciler.root.as_mut() else {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.scroll_*: no rendered tree yet (key `{key}`)"
+            )));
+        };
+        let path = match find_scrollable_by_key(root, &key) {
+            Some(p) => p,
+            None => {
+                return Err(TuiError::InvalidDesc(format!(
+                    "tui.scroll_*: no scrollable with key `{key}` in the current tree"
+                )));
+            }
+        };
+        let Some(target) = mouse_instance_at_path(root, &path) else {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.scroll_*: failed to walk path to scrollable `{key}`"
+            )));
+        };
+        let st = match &mut target.state {
+            InstanceState::Scrollable(s) => s,
+            _ => {
+                return Err(TuiError::InvalidDesc(format!(
+                    "tui.scroll_*: instance for key `{key}` is not a scrollable"
+                )));
+            }
+        };
+        match cmd {
+            ScrollCommand::To { offset, .. } => {
+                let max = st.scroll_y_max();
+                st.scroll_y = offset.min(max);
+            }
+            ScrollCommand::By { delta, .. } => {
+                scroll_by_signed(st, delta);
+            }
+            ScrollCommand::IntoView { .. } => {
+                // v1 minimal scope per spec: scroll to the bottom. Future
+                // iterations may resolve a focused-target's location
+                // within the scrollable.
+                st.scroll_y = st.scroll_y_max();
+            }
+        }
+        Ok(())
+    }
+
+    /// Walk the current tree and update the Lua-visible scroll-position
+    /// snapshot map. Called after every render so `tui.scroll_position`
+    /// returns the freshest geometry.
+    fn refresh_scroll_positions(&self) {
+        let mut snap = ScrollPositionMap::new();
+        if let Some(root) = self.reconciler.root.as_ref() {
+            collect_scroll_positions(root, &mut snap);
+        }
+        self.lua.write_scroll_positions(snap);
     }
 
     /// Apply a terminal resize. Forces a full redraw on the next render.
@@ -347,6 +420,9 @@ impl Engine {
         let root = self.reconciler.root.as_mut().ok_or(TuiError::NotStarted)?;
         sync_text_inputs(root);
         let bytes = self.renderer.render(root);
+        // Snapshot geometry post-paint so `tui.scroll_position` is up
+        // to date on the next Lua call.
+        self.refresh_scroll_positions();
         self.needs_render = false;
         Ok(Some(bytes))
     }
@@ -364,6 +440,62 @@ impl Engine {
 
     pub fn dimensions(&self) -> (u16, u16) {
         (self.renderer.width(), self.renderer.height())
+    }
+}
+
+/// Locate a scrollable by user_key in the instance tree. Returns the
+/// path (sequence of child indices from the root) or `None` if no
+/// matching scrollable exists. Used by `apply_scroll_command` so a
+/// Lua-side `tui.scroll_to(key, ...)` resolves the right instance.
+fn find_scrollable_by_key(root: &WidgetInstance, key: &str) -> Option<Vec<usize>> {
+    let mut path: Vec<usize> = Vec::new();
+    let mut found: Option<Vec<usize>> = None;
+    walk_scrollable_by_key(root, key, &mut path, &mut found);
+    found
+}
+
+fn walk_scrollable_by_key(
+    inst: &WidgetInstance,
+    key: &str,
+    path: &mut Vec<usize>,
+    out: &mut Option<Vec<usize>>,
+) {
+    if matches!(inst.kind(), InstanceKind::Scrollable) {
+        if let Some(k) = inst.last_desc.user_key() {
+            if k == key {
+                *out = Some(path.clone());
+                return;
+            }
+        }
+    }
+    for (i, child) in inst.children.iter().enumerate() {
+        if out.is_some() {
+            return;
+        }
+        path.push(i);
+        walk_scrollable_by_key(child, key, path, out);
+        path.pop();
+    }
+}
+
+/// Walk the tree and accumulate every scrollable's key + geometry into
+/// the snapshot map. Skips scrollables without a user_key (the desc
+/// parser already rejects keyless scrollables, but the walk stays defensive).
+fn collect_scroll_positions(inst: &WidgetInstance, out: &mut ScrollPositionMap) {
+    if matches!(inst.kind(), InstanceKind::Scrollable) {
+        if let (Some(k), InstanceState::Scrollable(s)) = (inst.last_desc.user_key(), &inst.state) {
+            out.insert(
+                k.to_string(),
+                ScrollPositionSnapshot {
+                    offset: s.scroll_y,
+                    max: s.scroll_y_max(),
+                    viewport_size: s.viewport_height,
+                },
+            );
+        }
+    }
+    for c in inst.children.iter() {
+        collect_scroll_positions(c, out);
     }
 }
 
@@ -693,6 +825,163 @@ mod tests {
             }
             _ => panic!("expected leading text in column children[0]"),
         }
+    }
+
+    const SCROLL_API_SCENARIO: &str = r#"
+        tui.start {
+          initial_state = { last_offset = 0 },
+          view = function(s)
+            local kids = {}
+            for i = 1, 30 do
+              kids[#kids + 1] = tui.text { content = "row " .. i }
+            end
+            return tui.column { gap = 0, children = {
+              tui.text { content = "offset: " .. tostring(s.last_offset) },
+              tui.expanded {
+                child = tui.scrollable {
+                  key   = "log",
+                  child = tui.column { gap = 0, children = kids },
+                },
+              },
+            }}
+          end,
+          update = function(msg, s)
+            if msg.kind == "scroll.to" then
+              tui.scroll_to("log", msg.offset)
+              return s, {}
+            elseif msg.kind == "scroll.by" then
+              tui.scroll_by("log", msg.delta)
+              return s, {}
+            elseif msg.kind == "scroll.into_view" then
+              tui.scroll_into_view("log")
+              return s, {}
+            elseif msg.kind == "scroll.read" then
+              local p = tui.scroll_position("log")
+              return { last_offset = p.offset }, {}
+            end
+            return s, {}
+          end,
+        }
+    "#;
+
+    fn dispatch_kind(engine: &mut Engine, kind: &str) {
+        let msg = engine.lua().create_table().unwrap();
+        msg.set("kind", kind).unwrap();
+        engine.dispatch_msg(msg).unwrap();
+    }
+
+    fn dispatch_kind_with(engine: &mut Engine, kind: &str, field: &str, val: i64) {
+        let msg = engine.lua().create_table().unwrap();
+        msg.set("kind", kind).unwrap();
+        msg.set(field, val).unwrap();
+        engine.dispatch_msg(msg).unwrap();
+    }
+
+    #[test]
+    fn lua_scroll_to_updates_scroll_state() {
+        let mut engine = Engine::new(20, 6).expect("engine");
+        engine.load_scenario(SCROLL_API_SCENARIO).expect("load");
+        let _ = engine.render_if_dirty().expect("render");
+
+        dispatch_kind_with(&mut engine, "scroll.to", "offset", 12);
+        // After dispatch_msg, the scroll command was processed.
+        let root = engine.reconciler.root.as_ref().expect("root");
+        let scroll_inst = &root.children[1].children[0];
+        match &scroll_inst.state {
+            InstanceState::Scrollable(s) => assert_eq!(s.scroll_y, 12),
+            _ => panic!("expected scrollable state"),
+        }
+    }
+
+    #[test]
+    fn lua_scroll_by_applies_relative_delta() {
+        let mut engine = Engine::new(20, 6).expect("engine");
+        engine.load_scenario(SCROLL_API_SCENARIO).expect("load");
+        let _ = engine.render_if_dirty().expect("render");
+
+        dispatch_kind_with(&mut engine, "scroll.by", "delta", 7);
+        let root = engine.reconciler.root.as_ref().expect("root");
+        let scroll_inst = &root.children[1].children[0];
+        match &scroll_inst.state {
+            InstanceState::Scrollable(s) => assert_eq!(s.scroll_y, 7),
+            _ => panic!("expected scrollable state"),
+        }
+
+        // Negative delta back toward top.
+        dispatch_kind_with(&mut engine, "scroll.by", "delta", -3);
+        let root = engine.reconciler.root.as_ref().expect("root");
+        let scroll_inst = &root.children[1].children[0];
+        match &scroll_inst.state {
+            InstanceState::Scrollable(s) => assert_eq!(s.scroll_y, 4),
+            _ => panic!("expected scrollable state"),
+        }
+    }
+
+    #[test]
+    fn lua_scroll_into_view_jumps_to_bottom() {
+        let mut engine = Engine::new(20, 6).expect("engine");
+        engine.load_scenario(SCROLL_API_SCENARIO).expect("load");
+        let _ = engine.render_if_dirty().expect("render");
+
+        dispatch_kind(&mut engine, "scroll.into_view");
+        let root = engine.reconciler.root.as_ref().expect("root");
+        let scroll_inst = &root.children[1].children[0];
+        match &scroll_inst.state {
+            InstanceState::Scrollable(s) => assert_eq!(s.scroll_y, s.scroll_y_max()),
+            _ => panic!("expected scrollable state"),
+        }
+    }
+
+    #[test]
+    fn lua_scroll_position_round_trips_offset_to_state() {
+        let mut engine = Engine::new(20, 6).expect("engine");
+        engine.load_scenario(SCROLL_API_SCENARIO).expect("load");
+        let _ = engine.render_if_dirty().expect("render");
+
+        // Scroll to 8, render to settle, then ask Lua for the position.
+        dispatch_kind_with(&mut engine, "scroll.to", "offset", 8);
+        let _ = engine.render_if_dirty().expect("render");
+        dispatch_kind(&mut engine, "scroll.read");
+        let _ = engine.render_if_dirty().expect("render");
+        // After scroll.read, Lua's update stored last_offset = 8.
+        let root = engine.reconciler.root.as_ref().expect("root");
+        // `column { text("offset: ..."), expanded { scrollable } }`
+        let leading_text = &root.children[0].last_desc;
+        match leading_text {
+            WidgetDescription::Text { content, .. } => {
+                assert_eq!(
+                    content, "offset: 8",
+                    "tui.scroll_position should return live offset"
+                );
+            }
+            _ => panic!("expected text in children[0]"),
+        }
+    }
+
+    #[test]
+    fn lua_scroll_to_unknown_key_errors() {
+        const BAD_KEY: &str = r#"
+            tui.start {
+              initial_state = {},
+              view = function(_) return tui.text { content = "x" } end,
+              update = function(msg, s)
+                if msg.kind == "go" then
+                  tui.scroll_to("nope", 1)
+                end
+                return s, {}
+              end,
+            }
+        "#;
+        let mut engine = Engine::new(20, 6).expect("engine");
+        engine.load_scenario(BAD_KEY).expect("load");
+        let _ = engine.render_if_dirty().expect("render");
+        let msg = engine.lua().create_table().unwrap();
+        msg.set("kind", "go").unwrap();
+        let err = engine.dispatch_msg(msg).unwrap_err();
+        assert!(
+            format!("{err}").contains("no scrollable with key `nope`"),
+            "expected missing-key error, got: {err}"
+        );
     }
 
     #[test]

@@ -9,12 +9,44 @@
 //! View / update / state are kept in the Lua registry. The Rust engine
 //! pulls the registry-stored values for each render and dispatch.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use mlua::{Lua, RegistryKey, Table, Value};
 
 use crate::desc::{from_lua_table, WidgetDescription, KIND_FIELD};
 use crate::error::TuiError;
+
+/// One queued scroll command produced by a Lua call to `tui.scroll_to /
+/// scroll_by / scroll_into_view`. The engine drains the queue after each
+/// `dispatch` call and applies the commands to the reconciled tree.
+///
+/// Decoupling this through a queue keeps Lua's `update` pure — the side
+/// effects of scroll changes are visible only after `dispatch` returns,
+/// matching the `side_effects` model used elsewhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScrollCommand {
+    /// Set absolute offset.
+    To { key: String, offset: u16 },
+    /// Apply a relative delta (positive = down).
+    By { key: String, delta: i32 },
+    /// Move the named scrollable's content so the focused/cursor target
+    /// is visible. v1 minimal scope: scroll to the bottom (matches the
+    /// chat-transcript "show me the latest" intent).
+    IntoView { key: String },
+}
+
+/// Snapshot of every scrollable's current geometry, keyed by user_key.
+/// The engine refreshes this map after every render so `tui.scroll_position`
+/// reads reflect the most recently painted frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScrollPositionSnapshot {
+    pub offset: u16,
+    pub max: u16,
+    pub viewport_size: u16,
+}
+
+pub type ScrollPositionMap = HashMap<String, ScrollPositionSnapshot>;
 
 #[derive(Default)]
 struct StartedState {
@@ -34,6 +66,13 @@ pub enum SideEffect {
 pub struct LuaHost {
     lua: Lua,
     started: Arc<Mutex<StartedState>>,
+    /// Queue of scroll commands produced by the Lua API surface. Drained
+    /// by the engine after every `dispatch` so the side effects show up
+    /// on the next render.
+    scroll_queue: Arc<Mutex<Vec<ScrollCommand>>>,
+    /// Snapshot of every scrollable's current geometry. Engine writes;
+    /// Lua reads via `tui.scroll_position(key)`.
+    scroll_positions: Arc<Mutex<ScrollPositionMap>>,
 }
 
 impl LuaHost {
@@ -41,8 +80,37 @@ impl LuaHost {
     pub fn new() -> Result<Self, TuiError> {
         let lua = Lua::new();
         let started = Arc::new(Mutex::new(StartedState::default()));
-        install_tui(&lua, Arc::clone(&started))?;
-        Ok(LuaHost { lua, started })
+        let scroll_queue: Arc<Mutex<Vec<ScrollCommand>>> = Arc::new(Mutex::new(Vec::new()));
+        let scroll_positions: Arc<Mutex<ScrollPositionMap>> =
+            Arc::new(Mutex::new(ScrollPositionMap::new()));
+        install_tui(
+            &lua,
+            Arc::clone(&started),
+            Arc::clone(&scroll_queue),
+            Arc::clone(&scroll_positions),
+        )?;
+        Ok(LuaHost {
+            lua,
+            started,
+            scroll_queue,
+            scroll_positions,
+        })
+    }
+
+    /// Drain any scroll commands that Lua queued during the most recent
+    /// `dispatch`. The engine processes the returned list against its
+    /// reconciled tree.
+    pub fn take_scroll_commands(&self) -> Vec<ScrollCommand> {
+        let mut q = lock(&self.scroll_queue);
+        std::mem::take(&mut *q)
+    }
+
+    /// Snapshot the engine's most recently observed scroll positions
+    /// into the shared map so `tui.scroll_position` returns up-to-date
+    /// data on the next Lua call.
+    pub fn write_scroll_positions(&self, snapshot: ScrollPositionMap) {
+        let mut p = lock(&self.scroll_positions);
+        *p = snapshot;
     }
 
     /// Borrow the underlying VM. Useful for integration tests that load
@@ -179,7 +247,12 @@ fn parse_side_effects(v: Value) -> Vec<SideEffect> {
     out
 }
 
-fn install_tui(lua: &Lua, started: Arc<Mutex<StartedState>>) -> Result<(), TuiError> {
+fn install_tui(
+    lua: &Lua,
+    started: Arc<Mutex<StartedState>>,
+    scroll_queue: Arc<Mutex<Vec<ScrollCommand>>>,
+    scroll_positions: Arc<Mutex<ScrollPositionMap>>,
+) -> Result<(), TuiError> {
     let tui = lua.create_table()?;
 
     // tui.text { content, key?, style?, wrap? }
@@ -289,6 +362,70 @@ fn install_tui(lua: &Lua, started: Arc<Mutex<StartedState>>) -> Result<(), TuiEr
         Ok(args)
     })?;
     tui.set("scrollable", scrollable_fn)?;
+
+    // ── Scroll-control APIs ──────────────────────────────────────────
+    //
+    // All four helpers funnel through the shared `scroll_queue` /
+    // `scroll_positions` channels — Lua never holds a widget instance.
+    // Missing keys raise a Lua error so config bugs surface immediately
+    // (per spec: "if the key doesn't resolve, error to Lua — surfaces
+    // config bugs early").
+
+    let queue_for_to = Arc::clone(&scroll_queue);
+    let scroll_to_fn =
+        lua.create_function(move |_, (key, offset): (String, i64)| -> mlua::Result<()> {
+            if !(0..=u16::MAX as i64).contains(&offset) {
+                return Err(mlua::Error::runtime(format!(
+                    "tui.scroll_to: `offset` must be in 0..=65535 (got {offset})"
+                )));
+            }
+            lock(&queue_for_to).push(ScrollCommand::To {
+                key,
+                offset: offset as u16,
+            });
+            Ok(())
+        })?;
+    tui.set("scroll_to", scroll_to_fn)?;
+
+    let queue_for_by = Arc::clone(&scroll_queue);
+    let scroll_by_fn =
+        lua.create_function(move |_, (key, delta): (String, i64)| -> mlua::Result<()> {
+            if !(i32::MIN as i64..=i32::MAX as i64).contains(&delta) {
+                return Err(mlua::Error::runtime(format!(
+                    "tui.scroll_by: `delta` must fit in i32 (got {delta})"
+                )));
+            }
+            lock(&queue_for_by).push(ScrollCommand::By {
+                key,
+                delta: delta as i32,
+            });
+            Ok(())
+        })?;
+    tui.set("scroll_by", scroll_by_fn)?;
+
+    let queue_for_into = Arc::clone(&scroll_queue);
+    let scroll_into_view_fn = lua.create_function(move |_, key: String| -> mlua::Result<()> {
+        lock(&queue_for_into).push(ScrollCommand::IntoView { key });
+        Ok(())
+    })?;
+    tui.set("scroll_into_view", scroll_into_view_fn)?;
+
+    let positions_for_read = Arc::clone(&scroll_positions);
+    let scroll_position_fn =
+        lua.create_function(move |lua, key: String| -> mlua::Result<Table> {
+            let map = lock(&positions_for_read);
+            let snap = map.get(&key).copied().ok_or_else(|| {
+                mlua::Error::runtime(format!(
+                    "tui.scroll_position: no scrollable with key `{key}` found in the current tree"
+                ))
+            })?;
+            let t = lua.create_table()?;
+            t.set("offset", snap.offset)?;
+            t.set("max", snap.max)?;
+            t.set("viewport_size", snap.viewport_size)?;
+            Ok(t)
+        })?;
+    tui.set("scroll_position", scroll_position_fn)?;
 
     // tui.start { initial_state, view, update }
     let started_for_start = Arc::clone(&started);
@@ -448,5 +585,101 @@ mod tests {
         let host = LuaHost::new().expect("host");
         let err = host.render_view().unwrap_err();
         assert!(matches!(err, TuiError::NotStarted));
+    }
+
+    #[test]
+    fn scroll_to_queues_command() {
+        let host = LuaHost::new().expect("host");
+        host.lua()
+            .load(r#"tui.scroll_to("transcript", 5)"#)
+            .exec()
+            .expect("eval");
+        let cmds = host.take_scroll_commands();
+        assert_eq!(
+            cmds,
+            vec![ScrollCommand::To {
+                key: "transcript".into(),
+                offset: 5,
+            }]
+        );
+        // Drain leaves the queue empty.
+        assert!(host.take_scroll_commands().is_empty());
+    }
+
+    #[test]
+    fn scroll_by_accepts_negative_delta() {
+        let host = LuaHost::new().expect("host");
+        host.lua()
+            .load(r#"tui.scroll_by("k", -10)"#)
+            .exec()
+            .expect("eval");
+        let cmds = host.take_scroll_commands();
+        assert_eq!(
+            cmds,
+            vec![ScrollCommand::By {
+                key: "k".into(),
+                delta: -10,
+            }]
+        );
+    }
+
+    #[test]
+    fn scroll_into_view_queues_command() {
+        let host = LuaHost::new().expect("host");
+        host.lua()
+            .load(r#"tui.scroll_into_view("transcript")"#)
+            .exec()
+            .expect("eval");
+        assert_eq!(
+            host.take_scroll_commands(),
+            vec![ScrollCommand::IntoView {
+                key: "transcript".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn scroll_position_returns_snapshot_when_present() {
+        let host = LuaHost::new().expect("host");
+        let mut map = ScrollPositionMap::new();
+        map.insert(
+            "transcript".into(),
+            ScrollPositionSnapshot {
+                offset: 7,
+                max: 30,
+                viewport_size: 5,
+            },
+        );
+        host.write_scroll_positions(map);
+        let table: Table = host
+            .lua()
+            .load(r#"return tui.scroll_position("transcript")"#)
+            .eval()
+            .expect("eval");
+        assert_eq!(table.get::<u16>("offset").unwrap(), 7);
+        assert_eq!(table.get::<u16>("max").unwrap(), 30);
+        assert_eq!(table.get::<u16>("viewport_size").unwrap(), 5);
+    }
+
+    #[test]
+    fn scroll_position_errors_on_unknown_key() {
+        let host = LuaHost::new().expect("host");
+        let err = host
+            .lua()
+            .load(r#"return tui.scroll_position("missing")"#)
+            .eval::<Table>()
+            .unwrap_err();
+        assert!(format!("{err}").contains("no scrollable with key `missing`"));
+    }
+
+    #[test]
+    fn scroll_to_rejects_out_of_range_offset() {
+        let host = LuaHost::new().expect("host");
+        let err = host
+            .lua()
+            .load(r#"tui.scroll_to("k", 100000)"#)
+            .exec()
+            .unwrap_err();
+        assert!(format!("{err}").contains("must be in 0..=65535"));
     }
 }
