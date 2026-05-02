@@ -161,8 +161,10 @@ pub fn from_lua_table(t: &Table) -> Result<WidgetDescription, TuiError> {
         "stack" => parse_stack(t),
         "expanded" => parse_expanded(t),
         "spacer" => parse_spacer(t),
+        "constrained" => parse_constrained(t),
+        "align" => parse_align(t),
         other => Err(TuiError::InvalidDesc(format!(
-            "unknown widget kind `{other}`; expected one of: text, column, row, padding, stack, expanded, spacer"
+            "unknown widget kind `{other}`; expected one of: text, column, row, padding, stack, expanded, spacer, constrained, align"
         ))),
     }
 }
@@ -269,6 +271,102 @@ fn parse_spacer(t: &Table) -> Result<WidgetDescription, TuiError> {
     let flex = parse_u16(t, "flex", 1, "tui.spacer")?;
     let key = parse_key(t)?;
     Ok(WidgetDescription::Spacer { flex, key })
+}
+
+fn parse_constrained(t: &Table) -> Result<WidgetDescription, TuiError> {
+    let min_width = parse_optional_u16(t, "min_width", "tui.constrained")?;
+    let max_width = parse_optional_u16(t, "max_width", "tui.constrained")?;
+    let min_height = parse_optional_u16(t, "min_height", "tui.constrained")?;
+    let max_height = parse_optional_u16(t, "max_height", "tui.constrained")?;
+    let child_val: Value = t.get("child")?;
+    let child_tbl = match child_val {
+        Value::Table(t) => t,
+        Value::Nil => {
+            return Err(TuiError::InvalidDesc(
+                "tui.constrained: `child` is required".into(),
+            ));
+        }
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.constrained: `child` must be a widget table (got {})",
+                other.type_name()
+            )));
+        }
+    };
+    let child = Box::new(from_lua_table(&child_tbl)?);
+    let key = parse_key(t)?;
+    Ok(WidgetDescription::Constrained {
+        min_width,
+        max_width,
+        min_height,
+        max_height,
+        child,
+        key,
+    })
+}
+
+fn parse_align(t: &Table) -> Result<WidgetDescription, TuiError> {
+    let alignment = match t.get::<Value>("alignment")? {
+        Value::Nil => Alignment::Center,
+        Value::String(s) => parse_alignment_str(&s.to_str()?)?,
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.align: `alignment` must be a string (got {})",
+                other.type_name()
+            )));
+        }
+    };
+    let child_val: Value = t.get("child")?;
+    let child_tbl = match child_val {
+        Value::Table(t) => t,
+        Value::Nil => {
+            return Err(TuiError::InvalidDesc(
+                "tui.align: `child` is required".into(),
+            ));
+        }
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.align: `child` must be a widget table (got {})",
+                other.type_name()
+            )));
+        }
+    };
+    let child = Box::new(from_lua_table(&child_tbl)?);
+    let key = parse_key(t)?;
+    Ok(WidgetDescription::Align {
+        alignment,
+        child,
+        key,
+    })
+}
+
+fn parse_alignment_str(s: &str) -> Result<Alignment, TuiError> {
+    match s {
+        "top-left" => Ok(Alignment::TopLeft),
+        "top" => Ok(Alignment::Top),
+        "top-right" => Ok(Alignment::TopRight),
+        "left" => Ok(Alignment::Left),
+        "center" => Ok(Alignment::Center),
+        "right" => Ok(Alignment::Right),
+        "bottom-left" => Ok(Alignment::BottomLeft),
+        "bottom" => Ok(Alignment::Bottom),
+        "bottom-right" => Ok(Alignment::BottomRight),
+        other => Err(TuiError::InvalidDesc(format!(
+            "tui.align: `alignment` must be one of top-left|top|top-right|left|center|right|bottom-left|bottom|bottom-right (got `{other}`)"
+        ))),
+    }
+}
+
+fn parse_optional_u16(t: &Table, key: &str, ctx: &str) -> Result<Option<u16>, TuiError> {
+    match t.get::<Value>(key)? {
+        Value::Nil => Ok(None),
+        Value::Integer(n) => clamp_u16(n, &format!("{ctx}.{key}")).map(Some),
+        Value::Number(n) => clamp_u16_f(n, &format!("{ctx}.{key}")).map(Some),
+        other => Err(TuiError::InvalidDesc(format!(
+            "{ctx}: `{key}` must be a number or nil (got {})",
+            other.type_name()
+        ))),
+    }
 }
 
 fn parse_padding(t: &Table) -> Result<WidgetDescription, TuiError> {
@@ -726,6 +824,100 @@ mod tests {
             WidgetDescription::Spacer { flex, .. } => assert_eq!(flex, 1),
             _ => panic!("expected spacer"),
         }
+    }
+
+    #[test]
+    fn constrained_table_parses() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"
+            return {
+              _tui_kind = "constrained",
+              max_width = 30,
+              min_height = 2,
+              child = { _tui_kind = "text", content = "x" },
+            }
+        "#,
+        );
+        let d = from_lua_table(&t).expect("parse");
+        match d {
+            WidgetDescription::Constrained {
+                min_width,
+                max_width,
+                min_height,
+                max_height,
+                ..
+            } => {
+                assert_eq!(min_width, None);
+                assert_eq!(max_width, Some(30));
+                assert_eq!(min_height, Some(2));
+                assert_eq!(max_height, None);
+            }
+            _ => panic!("expected constrained"),
+        }
+    }
+
+    #[test]
+    fn align_table_parses_each_alignment() {
+        let l = lua();
+        for (s, expected) in [
+            ("top-left", Alignment::TopLeft),
+            ("top", Alignment::Top),
+            ("top-right", Alignment::TopRight),
+            ("left", Alignment::Left),
+            ("center", Alignment::Center),
+            ("right", Alignment::Right),
+            ("bottom-left", Alignment::BottomLeft),
+            ("bottom", Alignment::Bottom),
+            ("bottom-right", Alignment::BottomRight),
+        ] {
+            let src = format!(
+                r#"return {{ _tui_kind = "align", alignment = "{s}", child = {{ _tui_kind = "text", content = "x" }} }}"#
+            );
+            let t = eval_table(&l, &src);
+            let d = from_lua_table(&t).expect("parse");
+            match d {
+                WidgetDescription::Align { alignment, .. } => assert_eq!(alignment, expected),
+                _ => panic!("expected align for {s}"),
+            }
+        }
+    }
+
+    #[test]
+    fn align_default_is_center() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"
+            return {
+              _tui_kind = "align",
+              child = { _tui_kind = "text", content = "x" },
+            }
+        "#,
+        );
+        let d = from_lua_table(&t).expect("parse");
+        match d {
+            WidgetDescription::Align { alignment, .. } => assert_eq!(alignment, Alignment::Center),
+            _ => panic!("expected align"),
+        }
+    }
+
+    #[test]
+    fn align_unknown_value_errors() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"
+            return {
+              _tui_kind = "align",
+              alignment = "diagonal",
+              child = { _tui_kind = "text", content = "x" },
+            }
+        "#,
+        );
+        let err = from_lua_table(&t).unwrap_err();
+        assert!(format!("{err}").contains("alignment"));
     }
 
     #[test]

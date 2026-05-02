@@ -1166,6 +1166,95 @@ mod tests {
         assert_eq!(root.layout.flex_main_sizes, vec![5, 0]);
     }
 
+    fn constrained(
+        child: WidgetDescription,
+        min_w: Option<u16>,
+        max_w: Option<u16>,
+        min_h: Option<u16>,
+        max_h: Option<u16>,
+    ) -> WidgetDescription {
+        WidgetDescription::Constrained {
+            min_width: min_w,
+            max_width: max_w,
+            min_height: min_h,
+            max_height: max_h,
+            child: Box::new(child),
+            key: None,
+        }
+    }
+
+    fn align(child: WidgetDescription, alignment: Alignment) -> WidgetDescription {
+        WidgetDescription::Align {
+            alignment,
+            child: Box::new(child),
+            key: None,
+        }
+    }
+
+    #[test]
+    fn constrained_tightens_max_width() {
+        // text "hello world" inside constrained max_width=4 → wraps at 4.
+        let desc = constrained(text("hello world"), None, Some(4), None, None);
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let root = rec.root.as_mut().unwrap();
+        let s = layout(root, Constraints::loose(40, 5));
+        assert!(s.width <= 4, "width {s:?} must be ≤ 4");
+        assert!(s.height >= 3, "wrapped to multiple lines");
+    }
+
+    #[test]
+    fn constrained_min_pads_to_minimum() {
+        // text "x" with min_width=10 → child renders at 10 wide.
+        let desc = constrained(text("x"), Some(10), None, None, None);
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let root = rec.root.as_mut().unwrap();
+        let s = layout(root, Constraints::loose(40, 5));
+        assert_eq!(s.width, 10);
+    }
+
+    #[test]
+    fn constrained_intersects_with_parent_max() {
+        // requested max_width=20 but parent only allows 5 → 5 wins.
+        let desc = constrained(text("hello world"), None, Some(20), None, None);
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let root = rec.root.as_mut().unwrap();
+        let s = layout(root, Constraints::loose(5, 5));
+        assert!(s.width <= 5);
+    }
+
+    #[test]
+    fn align_center_positions_text_in_middle() {
+        // 11×3 buffer, align center, text "hi" (2 cols × 1 row).
+        // h_extra = 9, /2 = 4 → "hi" lands at col 4.
+        // v_extra = 2, /2 = 1 → at row 1.
+        let desc = align(text("hi"), Alignment::Center);
+        let buf = paint_root(desc, 11, 3);
+        assert_eq!(cell_at(&buf, 1, 4), "h");
+        assert_eq!(cell_at(&buf, 1, 5), "i");
+        assert_eq!(cell_at(&buf, 0, 0), " ", "top-left blank");
+        assert_eq!(cell_at(&buf, 2, 10), " ", "bottom-right blank");
+    }
+
+    #[test]
+    fn align_top_left_paints_at_origin() {
+        let desc = align(text("AB"), Alignment::TopLeft);
+        let buf = paint_root(desc, 10, 3);
+        assert_eq!(cell_at(&buf, 0, 0), "A");
+        assert_eq!(cell_at(&buf, 0, 1), "B");
+    }
+
+    #[test]
+    fn align_bottom_right_paints_at_far_corner() {
+        let desc = align(text("XY"), Alignment::BottomRight);
+        let buf = paint_root(desc, 10, 3);
+        // h_extra = 8, v_extra = 2 → starts at (2, 8)
+        assert_eq!(cell_at(&buf, 2, 8), "X");
+        assert_eq!(cell_at(&buf, 2, 9), "Y");
+    }
+
     #[test]
     fn wrap_word_splits_on_word_boundary() {
         let rows = wrap_text("hello world", 6, WrapMode::Word);

@@ -232,6 +232,20 @@ fn install_tui(lua: &Lua, started: Arc<Mutex<StartedState>>) -> Result<(), TuiEr
     })?;
     tui.set("spacer", spacer_fn)?;
 
+    // tui.constrained { min_width?, max_width?, min_height?, max_height?, child, key? }
+    let constrained_fn = lua.create_function(|_, args: Table| {
+        args.set(KIND_FIELD, "constrained")?;
+        Ok(args)
+    })?;
+    tui.set("constrained", constrained_fn)?;
+
+    // tui.align { alignment?, child, key? }
+    let align_fn = lua.create_function(|_, args: Table| {
+        args.set(KIND_FIELD, "align")?;
+        Ok(args)
+    })?;
+    tui.set("align", align_fn)?;
+
     // tui.start { initial_state, view, update }
     let started_for_start = Arc::clone(&started);
     let start_fn = lua.create_function(move |lua, args: Table| {
