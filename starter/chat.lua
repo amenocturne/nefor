@@ -300,8 +300,14 @@ local function rule_row(left_corner, right_corner, style)
 end
 
 -- Bordered box around `child`. `border_style` colors the corners,
--- rules, and side bars.
-local function bordered_box(child, border_style)
+-- rules, and side bars. Optional `key` stamps the outer column with a
+-- stable user-key so the reconciler reuses the instance across renders
+-- where the parent column's child positions shift (e.g. the input
+-- field needs to keep text_input's per-instance cursor when the slash
+-- autocomplete dropdown opens above it and pushes the input down a
+-- slot — without a key, the column's `(type, position)` identity
+-- changes and the whole subtree re-mounts, dropping cursor state).
+local function bordered_box(child, border_style, key)
   local side_bar = tui.constrained {
     max_width = 1,
     child = tui.fill { char = "│", style = border_style },
@@ -322,6 +328,7 @@ local function bordered_box(child, border_style)
   }
   return tui.column {
     gap = 0,
+    key = key,
     children = {
       rule_row("╭", "╮", border_style),
       body_row,
@@ -1076,7 +1083,13 @@ local function view(state)
       max_lines = 6,
       placeholder = "type a message — Enter to send, /help for keys, /quit to exit",
     },
-    input_border_style
+    input_border_style,
+    -- Stable user-key on the bordered_box's outer column so the
+    -- reconciler reuses the text_input instance (preserving cursor +
+    -- selection + scroll) across renders that change main_column's
+    -- child count — notably when the slash autocomplete dropdown
+    -- appears or vanishes between the body row and the input.
+    "input-field"
   )
 
   local main_column = tui.column {

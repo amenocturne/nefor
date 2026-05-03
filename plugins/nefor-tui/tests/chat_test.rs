@@ -841,3 +841,39 @@ fn slash_quit_emits_exit_side_effect() {
         "/quit must emit `{{ kind = \"exit\" }}` side effect that the engine acts on"
     );
 }
+
+#[test]
+fn typing_slash_keeps_cursor_after_slash() {
+    // Regression: when the user typed `/` from an empty input, the
+    // appearance of the slash autocomplete dropdown shifted main_column's
+    // child positions by one slot, re-mounting the input field and
+    // dropping the text_input's per-instance cursor (clamping it back to
+    // 0). The fix gives bordered_box's outer column a stable user-key so
+    // the reconciler reuses the input subtree across the layout shift.
+    //
+    // We can't read text_input's cursor directly from the test surface,
+    // but the next character the user types lands at the cursor's
+    // current byte offset. So: type `/` then `quit\n`. If the cursor
+    // stayed at 1, the value submitted is "/quit" → exits. If the
+    // cursor regressed to 0, every subsequent char prepends → value
+    // becomes "tiuq/" (each char inserted at offset 0 in turn). That
+    // doesn't match `/quit` so no exit fires; we surface the bug via
+    // `exit_requested`.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    engine.handle_key(key("/")).expect("/");
+    let _ = render_str(&mut engine);
+    for ch in "quit".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    let _ = engine.take_emit_queue();
+    engine.handle_key(key("enter")).expect("enter");
+
+    assert!(
+        engine.exit_requested(),
+        "cursor regressed: typing `/` then `quit` then Enter must produce `/quit` and exit. \
+         If exit_requested is false, each char prepended at cursor 0 instead of appending."
+    );
+}
