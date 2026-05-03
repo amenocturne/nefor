@@ -62,6 +62,10 @@ struct Walker<'a> {
     /// duplicate newline emissions when blocks butt up against each
     /// other (e.g., end-of-paragraph then start-of-list).
     at_line_start: bool,
+    /// `true` after `Tag::Item` emits its marker but before the item's
+    /// content paragraph starts. Suppresses the paragraph-start newline
+    /// so `1. ` and the body sit on the same line.
+    suppress_next_paragraph_break: bool,
 }
 
 struct ListContext {
@@ -82,6 +86,7 @@ impl<'a> Walker<'a> {
             blockquote_depth: 0,
             started: false,
             at_line_start: true,
+            suppress_next_paragraph_break: false,
         }
     }
 
@@ -134,7 +139,14 @@ impl<'a> Walker<'a> {
 
     fn start_tag(&mut self, tag: Tag<'_>) {
         match tag {
-            Tag::Paragraph => self.ensure_block_separator(),
+            Tag::Paragraph => {
+                if self.suppress_next_paragraph_break {
+                    self.suppress_next_paragraph_break = false;
+                    self.started = true;
+                } else {
+                    self.ensure_block_separator();
+                }
+            }
             Tag::Heading { level, .. } => {
                 self.ensure_block_separator();
                 self.heading_level = Some(level);
@@ -175,6 +187,7 @@ impl<'a> Walker<'a> {
                         self.emit_str("- ", s);
                     }
                 }
+                self.suppress_next_paragraph_break = true;
             }
             Tag::Strong => self.inline.bold += 1,
             Tag::Emphasis => self.inline.italic += 1,

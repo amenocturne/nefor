@@ -1392,7 +1392,12 @@ local function transcript(state)
     key       = "transcript",
     stick_to  = "end",
     scrollbar = "auto",
-    child     = tui.column { gap = 1, children = widgets },
+    -- 1-cell right padding so wrapped lines don't visually clash into
+    -- the scrollbar's column.
+    child     = tui.padding {
+      value = { top = 0, right = 1, bottom = 0, left = 0 },
+      child = tui.column { gap = 1, children = widgets },
+    },
   }
 end
 
