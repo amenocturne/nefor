@@ -1401,6 +1401,32 @@ local function transcript(state)
   }
 end
 
+-- Keep the engine's render loop alive at ~1Hz while any per-second
+-- elapsed counter is on screen — `tui.now_ms()` only re-evaluates on a
+-- render, and the engine renders only on state changes / animation
+-- ticks. Without this, the DAG sidebar's "Ns" stalls between events
+-- (the user sees stale numbers until something else re-renders, like
+-- a scroll or keystroke). Mount only when something needs to refresh.
+local KEEPALIVE_FRAMES = { "", "" }
+
+local function any_dag_run_active(dag_runs)
+  if type(dag_runs) ~= "table" then return false end
+  for _, run in pairs(dag_runs) do
+    if run.completed_at_ms == nil then return true end
+  end
+  return false
+end
+
+local function render_keepalive(state)
+  if not (state.pending or any_dag_run_active(state.dag_runs)) then
+    return nil
+  end
+  return tui.animation {
+    frames      = KEEPALIVE_FRAMES,
+    duration_ms = 1000,
+  }
+end
+
 local function view(state)
   local body_row = tui.row {
     gap = 0,
@@ -1467,6 +1493,10 @@ local function view(state)
       slash_autocomplete_inline(state),
       input_field,
       statusline(state),
+      -- Invisible 1Hz keepalive: forces re-render while DAG runs or the
+      -- thinking ticker need the second-counter refreshed. Removed when
+      -- nothing needs to tick.
+      render_keepalive(state),
     },
   }
 
