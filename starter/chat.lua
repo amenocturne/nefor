@@ -317,12 +317,17 @@ local MARKDOWN_THEME = {
   italic        = { italic = true },
   code          = { fg = C.md_code_fg, bg = C.md_code_inline_bg },
   code_block    = { fg = C.md_code_fg, bg = C.md_code_block_bg },
-  h1            = { fg = C.md_heading, bold = true },
-  h2            = { fg = C.md_heading, bold = true },
-  h3            = { fg = C.md_heading, bold = true },
-  h4            = { fg = C.md_heading, bold = true },
-  h5            = { fg = C.md_heading, bold = true },
-  h6            = { fg = C.md_heading, bold = true },
+  -- Heading hierarchy: filled-to-hollow circle glyphs encode depth
+  -- (Emacs org-bullets-style) and a rotating color palette gives each
+  -- level a distinct hue. Bold for top three, italic decay for h4-h6
+  -- so visual weight tracks importance even though terminals can't
+  -- shrink fonts.
+  h1 = { prefix = "●", fg = "#ff66cc", bold = true, underline = true },
+  h2 = { prefix = "◉", fg = "#66ddff", bold = true },
+  h3 = { prefix = "◎", fg = "#88aaff", bold = true },
+  h4 = { prefix = "○", fg = "#88dd88", bold = true, italic = true },
+  h5 = { prefix = "◌", fg = "#ddcc66", italic = true },
+  h6 = { prefix = "·", fg = "#dd9966", italic = true },
   link          = { fg = C.user, underline = true },
   blockquote    = { fg = C.system, italic = true },
   list_marker   = { fg = C.user },

@@ -15,7 +15,7 @@
 
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
-use crate::desc::{MarkdownTheme, Style};
+use crate::desc::{HeadingStyle, MarkdownTheme, Style};
 use crate::layout::StyledChar;
 
 /// Render markdown `source` to a flat styled-char run, applying the
@@ -150,6 +150,14 @@ impl<'a> Walker<'a> {
             Tag::Heading { level, .. } => {
                 self.ensure_block_separator();
                 self.heading_level = Some(level);
+                if let Some(hs) = self.heading_at(level) {
+                    if let Some(p) = hs.prefix {
+                        let mut s = String::with_capacity(p.len_utf8() + 1);
+                        s.push(p);
+                        s.push(' ');
+                        self.emit_str(&s, hs.style);
+                    }
+                }
             }
             Tag::BlockQuote(_) => {
                 self.ensure_block_separator();
@@ -280,7 +288,7 @@ impl<'a> Walker<'a> {
         style
     }
 
-    fn heading_style(&self, level: HeadingLevel) -> Option<Style> {
+    fn heading_at(&self, level: HeadingLevel) -> Option<HeadingStyle> {
         let theme = self.theme?;
         match level {
             HeadingLevel::H1 => theme.h1,
@@ -290,6 +298,10 @@ impl<'a> Walker<'a> {
             HeadingLevel::H5 => theme.h5,
             HeadingLevel::H6 => theme.h6,
         }
+    }
+
+    fn heading_style(&self, level: HeadingLevel) -> Option<Style> {
+        self.heading_at(level).map(|hs| hs.style)
     }
 
     fn emit_str(&mut self, s: &str, style: Style) {
@@ -460,12 +472,12 @@ mod tests {
             ..Style::default()
         };
         let theme = MarkdownTheme {
-            h1: Some(h1),
-            h2: Some(h2),
-            h3: Some(h3),
-            h4: Some(h4),
-            h5: Some(h5),
-            h6: Some(h6),
+            h1: Some(HeadingStyle { style: h1, prefix: None }),
+            h2: Some(HeadingStyle { style: h2, prefix: None }),
+            h3: Some(HeadingStyle { style: h3, prefix: None }),
+            h4: Some(HeadingStyle { style: h4, prefix: None }),
+            h5: Some(HeadingStyle { style: h5, prefix: None }),
+            h6: Some(HeadingStyle { style: h6, prefix: None }),
             ..MarkdownTheme::default()
         };
         for (level, expected) in [

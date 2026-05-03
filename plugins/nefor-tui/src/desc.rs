@@ -343,16 +343,26 @@ pub struct MarkdownTheme {
     pub italic: Option<Style>,
     pub code: Option<Style>,
     pub code_block: Option<Style>,
-    pub h1: Option<Style>,
-    pub h2: Option<Style>,
-    pub h3: Option<Style>,
-    pub h4: Option<Style>,
-    pub h5: Option<Style>,
-    pub h6: Option<Style>,
+    pub h1: Option<HeadingStyle>,
+    pub h2: Option<HeadingStyle>,
+    pub h3: Option<HeadingStyle>,
+    pub h4: Option<HeadingStyle>,
+    pub h5: Option<HeadingStyle>,
+    pub h6: Option<HeadingStyle>,
     pub link: Option<Style>,
     pub blockquote: Option<Style>,
     pub list_marker: Option<Style>,
     pub strikethrough: Option<Style>,
+}
+
+/// Heading styling: text style plus an optional single-char prefix
+/// glyph. The walker emits `<prefix> ` before heading text using the
+/// same style, so Lua can compose Emacs-org-bullets-style level
+/// markers (●, ◉, ◎, ○, ◌, ·) without changing Style for everyone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HeadingStyle {
+    pub style: Style,
+    pub prefix: Option<char>,
 }
 
 /// One frame entry in `tui.animation`. Either a plain string (rendered
@@ -557,12 +567,12 @@ fn parse_markdown_theme(t: &Table) -> Result<Option<MarkdownTheme>, TuiError> {
             let italic = parse_theme_entry(&theme_t, "italic")?;
             let code = parse_theme_entry(&theme_t, "code")?;
             let code_block = parse_theme_entry(&theme_t, "code_block")?;
-            let h1 = parse_theme_entry(&theme_t, "h1")?;
-            let h2 = parse_theme_entry(&theme_t, "h2")?;
-            let h3 = parse_theme_entry(&theme_t, "h3")?;
-            let h4 = parse_theme_entry(&theme_t, "h4")?;
-            let h5 = parse_theme_entry(&theme_t, "h5")?;
-            let h6 = parse_theme_entry(&theme_t, "h6")?;
+            let h1 = parse_heading_entry(&theme_t, "h1")?;
+            let h2 = parse_heading_entry(&theme_t, "h2")?;
+            let h3 = parse_heading_entry(&theme_t, "h3")?;
+            let h4 = parse_heading_entry(&theme_t, "h4")?;
+            let h5 = parse_heading_entry(&theme_t, "h5")?;
+            let h6 = parse_heading_entry(&theme_t, "h6")?;
             let link = parse_theme_entry(&theme_t, "link")?;
             let blockquote = parse_theme_entry(&theme_t, "blockquote")?;
             let list_marker = parse_theme_entry(&theme_t, "list_marker")?;
@@ -722,6 +732,47 @@ fn parse_animation_frames(arr: &Table) -> Result<Vec<AnimationFrame>, TuiError> 
 }
 
 /// One theme entry table → `Style`. Same shape as `tui.text`'s `style`.
+fn parse_heading_entry(t: &Table, key: &str) -> Result<Option<HeadingStyle>, TuiError> {
+    match t.get::<Value>(key)? {
+        Value::Nil => Ok(None),
+        Value::Table(st) => {
+            let fg = parse_color(&st, "fg")?;
+            let bg = parse_color(&st, "bg")?;
+            let bold = parse_bool(&st, "bold")?;
+            let italic = parse_bool(&st, "italic")?;
+            let underline = parse_bool(&st, "underline")?;
+            let reverse = parse_bool(&st, "reverse")?;
+            let strikethrough = parse_bool(&st, "strikethrough")?;
+            let prefix = match st.get::<Value>("prefix")? {
+                Value::Nil => None,
+                Value::String(s) => s.to_str()?.chars().next(),
+                other => {
+                    return Err(TuiError::InvalidDesc(format!(
+                        "tui.markdown.theme: `{key}.prefix` must be a string (got {})",
+                        other.type_name()
+                    )))
+                }
+            };
+            Ok(Some(HeadingStyle {
+                style: Style {
+                    fg,
+                    bg,
+                    bold,
+                    italic,
+                    underline,
+                    reverse,
+                    strikethrough,
+                },
+                prefix,
+            }))
+        }
+        other => Err(TuiError::InvalidDesc(format!(
+            "tui.markdown.theme: `{key}` must be a table or nil (got {})",
+            other.type_name()
+        ))),
+    }
+}
+
 fn parse_theme_entry(t: &Table, key: &str) -> Result<Option<Style>, TuiError> {
     match t.get::<Value>(key)? {
         Value::Nil => Ok(None),
@@ -2426,8 +2477,8 @@ mod tests {
                 assert!(t.bold.unwrap().bold);
                 assert!(t.italic.unwrap().italic);
                 assert_eq!(t.code.unwrap().fg, Some(Color::Rgb(0xff, 0x88, 0x00)));
-                assert_eq!(t.h1.unwrap().fg, Some(Color::Rgb(0xff, 0x00, 0xff)));
-                assert!(t.h1.unwrap().bold);
+                assert_eq!(t.h1.unwrap().style.fg, Some(Color::Rgb(0xff, 0x00, 0xff)));
+                assert!(t.h1.unwrap().style.bold);
                 assert!(t.link.unwrap().underline);
             }
             _ => panic!("expected markdown"),
