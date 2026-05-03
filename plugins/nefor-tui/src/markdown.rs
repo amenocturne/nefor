@@ -169,6 +169,11 @@ impl<'a> Walker<'a> {
                 // we keep the walker simple.
                 let s = self.theme.and_then(|th| th.blockquote).unwrap_or_default();
                 self.emit_str("▎ ", s);
+                // Same trick as Tag::Item: pulldown wraps the quote body
+                // in a Tag::Paragraph that would otherwise insert its
+                // own blank-line separator and push the body to the next
+                // line, leaving `▎ ` orphaned on its own row.
+                self.suppress_next_paragraph_break = true;
             }
             Tag::CodeBlock(_) => {
                 self.ensure_block_separator();
