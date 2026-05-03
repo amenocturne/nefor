@@ -307,6 +307,7 @@ pub struct Style {
     pub italic: bool,
     pub underline: bool,
     pub reverse: bool,
+    pub strikethrough: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,6 +352,7 @@ pub struct MarkdownTheme {
     pub link: Option<Style>,
     pub blockquote: Option<Style>,
     pub list_marker: Option<Style>,
+    pub strikethrough: Option<Style>,
 }
 
 /// One frame entry in `tui.animation`. Either a plain string (rendered
@@ -506,6 +508,7 @@ fn parse_one_span(t: &Table, ctx: &str, i: usize) -> Result<Span, TuiError> {
     let italic = parse_bool(t, "italic")?;
     let underline = parse_bool(t, "underline")?;
     let reverse = parse_bool(t, "reverse")?;
+    let strikethrough = parse_bool(t, "strikethrough")?;
     Ok(Span {
         text,
         style: Style {
@@ -515,6 +518,7 @@ fn parse_one_span(t: &Table, ctx: &str, i: usize) -> Result<Span, TuiError> {
             italic,
             underline,
             reverse,
+            strikethrough,
         },
     })
 }
@@ -562,6 +566,7 @@ fn parse_markdown_theme(t: &Table) -> Result<Option<MarkdownTheme>, TuiError> {
             let link = parse_theme_entry(&theme_t, "link")?;
             let blockquote = parse_theme_entry(&theme_t, "blockquote")?;
             let list_marker = parse_theme_entry(&theme_t, "list_marker")?;
+            let strikethrough = parse_theme_entry(&theme_t, "strikethrough")?;
             Ok(Some(MarkdownTheme {
                 bold,
                 italic,
@@ -576,6 +581,7 @@ fn parse_markdown_theme(t: &Table) -> Result<Option<MarkdownTheme>, TuiError> {
                 link,
                 blockquote,
                 list_marker,
+                strikethrough,
             }))
         }
         other => Err(TuiError::InvalidDesc(format!(
@@ -726,6 +732,7 @@ fn parse_theme_entry(t: &Table, key: &str) -> Result<Option<Style>, TuiError> {
             let italic = parse_bool(&st, "italic")?;
             let underline = parse_bool(&st, "underline")?;
             let reverse = parse_bool(&st, "reverse")?;
+            let strikethrough = parse_bool(&st, "strikethrough")?;
             Ok(Some(Style {
                 fg,
                 bg,
@@ -733,6 +740,7 @@ fn parse_theme_entry(t: &Table, key: &str) -> Result<Option<Style>, TuiError> {
                 italic,
                 underline,
                 reverse,
+                strikethrough,
             }))
         }
         other => Err(TuiError::InvalidDesc(format!(
@@ -1371,6 +1379,7 @@ fn parse_style(t: &Table) -> Result<Option<Style>, TuiError> {
             let italic = parse_bool(&st, "italic")?;
             let underline = parse_bool(&st, "underline")?;
             let reverse = parse_bool(&st, "reverse")?;
+            let strikethrough = parse_bool(&st, "strikethrough")?;
             Ok(Some(Style {
                 fg,
                 bg,
@@ -1378,6 +1387,7 @@ fn parse_style(t: &Table) -> Result<Option<Style>, TuiError> {
                 italic,
                 underline,
                 reverse,
+                strikethrough,
             }))
         }
         other => Err(TuiError::InvalidDesc(format!(

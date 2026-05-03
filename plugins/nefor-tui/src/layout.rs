@@ -1310,6 +1310,7 @@ fn body_style_for(style: &TextInputStyle) -> Style {
         italic: false,
         underline: false,
         reverse: false,
+        strikethrough: false,
     }
 }
 
@@ -1321,6 +1322,7 @@ fn placeholder_style_for(style: &TextInputStyle) -> Style {
         italic: false,
         underline: false,
         reverse: false,
+        strikethrough: false,
     }
 }
 

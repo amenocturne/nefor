@@ -238,19 +238,20 @@ local STYLE = {
 
 -- Markdown theme — exact legacy hex codes (spec section 3).
 local MARKDOWN_THEME = {
-  bold        = { bold = true },
-  italic      = { italic = true },
-  code        = { fg = C.md_code_fg, bg = C.md_code_inline_bg },
-  code_block  = { fg = C.md_code_fg, bg = C.md_code_block_bg },
-  h1          = { fg = C.md_heading, bold = true },
-  h2          = { fg = C.md_heading, bold = true },
-  h3          = { fg = C.md_heading, bold = true },
-  h4          = { fg = C.md_heading, bold = true },
-  h5          = { fg = C.md_heading, bold = true },
-  h6          = { fg = C.md_heading, bold = true },
-  link        = { fg = C.user, underline = true },
-  blockquote  = { fg = C.system, italic = true },
-  list_marker = { fg = C.user },
+  bold          = { bold = true },
+  italic        = { italic = true },
+  code          = { fg = C.md_code_fg, bg = C.md_code_inline_bg },
+  code_block    = { fg = C.md_code_fg, bg = C.md_code_block_bg },
+  h1            = { fg = C.md_heading, bold = true },
+  h2            = { fg = C.md_heading, bold = true },
+  h3            = { fg = C.md_heading, bold = true },
+  h4            = { fg = C.md_heading, bold = true },
+  h5            = { fg = C.md_heading, bold = true },
+  h6            = { fg = C.md_heading, bold = true },
+  link          = { fg = C.user, underline = true },
+  blockquote    = { fg = C.system, italic = true },
+  list_marker   = { fg = C.user },
+  strikethrough = { strikethrough = true },
 }
 
 ------------------------------------------------------------------------

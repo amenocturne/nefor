@@ -37,6 +37,7 @@ struct InlineStyleStack {
     italic: u32,
     code: u32,
     link: u32,
+    strikethrough: u32,
 }
 
 /// Tracks block context so newlines / list markers / blockquote marks
@@ -177,7 +178,7 @@ impl<'a> Walker<'a> {
             }
             Tag::Strong => self.inline.bold += 1,
             Tag::Emphasis => self.inline.italic += 1,
-            Tag::Strikethrough => { /* not themed in v1 */ }
+            Tag::Strikethrough => self.inline.strikethrough += 1,
             Tag::Link { .. } => self.inline.link += 1,
             Tag::Image { .. } => { /* skip image alt; inline-text events still fire */ }
             // Tables / footnotes / metadata blocks fall through — text
@@ -219,6 +220,9 @@ impl<'a> Walker<'a> {
             TagEnd::Item => {}
             TagEnd::Strong => self.inline.bold = self.inline.bold.saturating_sub(1),
             TagEnd::Emphasis => self.inline.italic = self.inline.italic.saturating_sub(1),
+            TagEnd::Strikethrough => {
+                self.inline.strikethrough = self.inline.strikethrough.saturating_sub(1)
+            }
             TagEnd::Link => self.inline.link = self.inline.link.saturating_sub(1),
             _ => {}
         }
@@ -252,6 +256,11 @@ impl<'a> Walker<'a> {
         }
         if self.inline.code > 0 {
             if let Some(s) = self.theme.and_then(|t| t.code) {
+                style = merge_style(style, s);
+            }
+        }
+        if self.inline.strikethrough > 0 {
+            if let Some(s) = self.theme.and_then(|t| t.strikethrough) {
                 style = merge_style(style, s);
             }
         }
@@ -308,6 +317,7 @@ fn merge_style(base: Style, over: Style) -> Style {
         italic: base.italic || over.italic,
         underline: base.underline || over.underline,
         reverse: base.reverse || over.reverse,
+        strikethrough: base.strikethrough || over.strikethrough,
     }
 }
 
@@ -546,5 +556,38 @@ mod tests {
     #[test]
     fn empty_input_produces_empty_output() {
         assert!(render_to_styled_chars("", None).is_empty());
+    }
+
+    #[test]
+    fn strikethrough_body_picks_up_themed_style() {
+        // pulldown-cmark's Strikethrough extension is enabled via
+        // Options::all() — `~~deleted~~` becomes a Tag::Strikethrough
+        // inline. The walker maps the run to the theme's
+        // `strikethrough` entry; with a themed entry, the inner chars
+        // carry the strikethrough attribute.
+        let strike = Style {
+            strikethrough: true,
+            ..Style::default()
+        };
+        let theme = MarkdownTheme {
+            strikethrough: Some(strike),
+            ..MarkdownTheme::default()
+        };
+        let r = render_to_styled_chars("~~gone~~", Some(&theme));
+        let g = r.iter().find(|c| c.ch == 'g').expect("g present");
+        assert!(
+            g.style.strikethrough,
+            "themed strikethrough should mark the inner text",
+        );
+    }
+
+    #[test]
+    fn strikethrough_without_theme_entry_stays_neutral() {
+        // No theme → neutral output, exactly as bold/italic without
+        // theme entries. Confirms the no-default-theme contract.
+        let r = render_to_styled_chars("~~gone~~", None);
+        for c in &r {
+            assert_eq!(c.style, Style::default());
+        }
     }
 }
