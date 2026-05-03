@@ -112,6 +112,7 @@ pub fn layout(inst: &mut WidgetInstance, c: Constraints) -> Size {
         InstanceKind::Stack => layout_stack(inst, c),
         InstanceKind::Expanded => layout_expanded(inst, c),
         InstanceKind::Spacer => layout_spacer(inst, c),
+        InstanceKind::Fill => layout_fill(inst, c),
         InstanceKind::Constrained => layout_constrained(inst, c),
         InstanceKind::Align => layout_align(inst, c),
         InstanceKind::Anchored => layout_anchored(inst, c),
@@ -146,6 +147,7 @@ pub fn paint(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
         InstanceKind::Stack => paint_stack(inst, rect, out),
         InstanceKind::Expanded | InstanceKind::Constrained => paint_passthrough(inst, rect, out),
         InstanceKind::Spacer => { /* empty */ }
+        InstanceKind::Fill => paint_fill(inst, rect, out),
         InstanceKind::Align => paint_align(inst, rect, out),
         InstanceKind::Anchored => paint_anchored(inst, rect, out),
         InstanceKind::TextInput => paint_text_input(inst, rect, out),
@@ -662,6 +664,54 @@ fn layout_spacer(_inst: &mut WidgetInstance, c: Constraints) -> Size {
         width: c.min_width,
         height: c.min_height,
     })
+}
+
+fn layout_fill(_inst: &mut WidgetInstance, c: Constraints) -> Size {
+    // Greedy: claim the parent's full max on both axes. The same shape
+    // as a Flutter `Container` with no child but a decoration, or HTML
+    // `width: 100%; height: 100%` inside a bounded parent.
+    //
+    // Caveat: inside a row, fill's `max_height = parent.max_height`
+    // means an unconstrained row containing a fill bloats vertically.
+    // Wrap rows that should stay 1 row tall in
+    // `tui.constrained { max_height = 1, child = ... }` (or compose the
+    // fill row inside a column whose other rows pin the height).
+    c.constrain(Size {
+        width: c.max_width,
+        height: c.max_height,
+    })
+}
+
+fn paint_fill(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
+    let (ch, style) = match &inst.last_desc {
+        WidgetDescription::Fill { char, style, .. } => (char.as_str(), style.unwrap_or_default()),
+        _ => return,
+    };
+    if ch.is_empty() || rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    // Pre-build one row's worth of repeats so `write_run` is called
+    // once per row instead of once per cell. The desc parser rejects
+    // empty strings; multi-grapheme inputs paint the literal sequence
+    // every column. Zero-width inputs (e.g. lone ZWJ) get clamped to a
+    // 1-cell stride so the loop terminates.
+    let unit_width = string_width(ch).max(1);
+    let total_width = rect.width as usize;
+    let repeats = total_width / unit_width;
+    let mut row_text = String::with_capacity(repeats * ch.len() + ch.len());
+    for _ in 0..repeats {
+        row_text.push_str(ch);
+    }
+    // Tail: emit one more unit if there are leftover columns; the
+    // per-cell width-clamp inside `write_run` drops any overhang so a
+    // 2-col char in a 1-col tail isn't half-painted.
+    if !total_width.is_multiple_of(unit_width) {
+        row_text.push_str(ch);
+    }
+    for row_off in 0..rect.height {
+        let row = rect.row.saturating_add(row_off);
+        write_run(out, row, rect.col, &row_text, &style);
+    }
 }
 
 fn paint_passthrough(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
@@ -2192,6 +2242,124 @@ mod tests {
         assert_eq!(cell_at(&buf, 0, 2), " ");
         assert_eq!(cell_at(&buf, 0, 3), " ");
         assert_eq!(cell_at(&buf, 0, 4), "R");
+    }
+
+    fn fill(ch: &str, style: Option<Style>) -> WidgetDescription {
+        WidgetDescription::Fill {
+            char: ch.into(),
+            style,
+            key: None,
+        }
+    }
+
+    #[test]
+    fn fill_layout_claims_parent_max_constraints() {
+        // Bare fill: layout returns the parent's max bounds on both
+        // axes (greedy). Inside a row the user is expected to wrap the
+        // row in `tui.constrained { max_height = 1 }` to keep a single
+        // rule from bloating the row vertically.
+        let desc = fill("─", None);
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let root = rec.root.as_mut().unwrap();
+        let s = layout(root, Constraints::loose(12, 3));
+        assert_eq!(
+            s,
+            Size {
+                width: 12,
+                height: 3
+            }
+        );
+    }
+
+    #[test]
+    fn fill_paints_char_across_assigned_rect() {
+        // Bare fill — paint_root passes `loose(6, 1)` to the root,
+        // fill claims max → 6×1 rect filled with `─`.
+        let buf = paint_root(fill("─", None), 6, 1);
+        for col in 0..6 {
+            assert_eq!(cell_at(&buf, 0, col), "─", "col {col} should be filled");
+        }
+    }
+
+    #[test]
+    fn fill_repeats_across_multiple_rows() {
+        // Bare fill at the root claims the entire frame.
+        let buf = paint_root(fill("─", None), 4, 2);
+        for row in 0..2 {
+            for col in 0..4 {
+                assert_eq!(
+                    cell_at(&buf, row, col),
+                    "─",
+                    "({row},{col}) should be filled"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fill_propagates_style_to_painted_cells() {
+        use crate::desc::Color;
+        let red = Style {
+            fg: Some(Color::Rgb(255, 0, 0)),
+            ..Style::default()
+        };
+        let buf = paint_root(fill("─", Some(red)), 3, 1);
+        for col in 0..3 {
+            assert_eq!(buf.lines[0].cells[col].style, red);
+            assert_eq!(buf.lines[0].cells[col].text.as_str(), "─");
+        }
+    }
+
+    #[test]
+    fn fill_inside_bordered_box_composition() {
+        // The intended composition for a bordered input field:
+        //   ╭───╮
+        //   │ x │
+        //   ╰───╯
+        // Top/bot rows wrap in `constrained { max_height = 1 }` so
+        // fill (which greedily claims the parent's max_height) doesn't
+        // bloat the rule rows past 1 row tall.
+        let row_with = |corners: (&str, &str)| {
+            constrained(
+                WidgetDescription::Row {
+                    gap: 0,
+                    key: None,
+                    children: vec![
+                        text(corners.0),
+                        expanded(fill("─", None), 1),
+                        text(corners.1),
+                    ],
+                },
+                None,
+                None,
+                None,
+                Some(1),
+            )
+        };
+        let top = row_with(("╭", "╮"));
+        let bot = row_with(("╰", "╯"));
+        let mid = WidgetDescription::Row {
+            gap: 0,
+            key: None,
+            children: vec![text("│"), expanded(text("x"), 1), text("│")],
+        };
+        let desc = WidgetDescription::Column {
+            gap: 0,
+            key: None,
+            children: vec![top, mid, bot],
+        };
+        let buf = paint_root(desc, 5, 3);
+        assert_eq!(cell_at(&buf, 0, 0), "╭");
+        assert_eq!(cell_at(&buf, 0, 1), "─");
+        assert_eq!(cell_at(&buf, 0, 2), "─");
+        assert_eq!(cell_at(&buf, 0, 3), "─");
+        assert_eq!(cell_at(&buf, 0, 4), "╮");
+        assert_eq!(cell_at(&buf, 1, 0), "│");
+        assert_eq!(cell_at(&buf, 1, 4), "│");
+        assert_eq!(cell_at(&buf, 2, 0), "╰");
+        assert_eq!(cell_at(&buf, 2, 1), "─");
+        assert_eq!(cell_at(&buf, 2, 4), "╯");
     }
 
     #[test]

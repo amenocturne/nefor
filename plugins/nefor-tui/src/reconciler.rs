@@ -74,6 +74,7 @@ fn mount_subtree(
         | WidgetDescription::Markdown { .. }
         | WidgetDescription::Animation { .. }
         | WidgetDescription::Spacer { .. }
+        | WidgetDescription::Fill { .. }
         | WidgetDescription::TextInput { .. } => Vec::new(),
         WidgetDescription::Column { children, .. }
         | WidgetDescription::Row { children, .. }
@@ -115,6 +116,7 @@ fn update_instance(
         | WidgetDescription::Markdown { .. }
         | WidgetDescription::Animation { .. }
         | WidgetDescription::Spacer { .. }
+        | WidgetDescription::Fill { .. }
         | WidgetDescription::TextInput { .. } => Vec::new(),
         WidgetDescription::Column { children, .. }
         | WidgetDescription::Row { children, .. }

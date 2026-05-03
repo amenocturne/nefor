@@ -422,6 +422,15 @@ fn install_tui(
     })?;
     tui.set("spacer", spacer_fn)?;
 
+    // tui.fill { char, style?, key? } — repeating-character fill that
+    // claims the parent's full constraints. Composes with `tui.expanded`
+    // + `tui.text` to draw bordered boxes from box-drawing glyphs.
+    let fill_fn = lua.create_function(|_, args: Table| {
+        args.set(KIND_FIELD, "fill")?;
+        Ok(args)
+    })?;
+    tui.set("fill", fill_fn)?;
+
     // tui.constrained { min_width?, max_width?, min_height?, max_height?, child, key? }
     let constrained_fn = lua.create_function(|_, args: Table| {
         args.set(KIND_FIELD, "constrained")?;
