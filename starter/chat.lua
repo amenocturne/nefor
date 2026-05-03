@@ -1581,20 +1581,56 @@ local function update(msg, state)
     end
   end
 
+  -- Scroll keys: route to the active popup's scrollable when a popup is
+  -- open; otherwise to the transcript. The popup's body is wrapped in
+  -- `tui.scrollable { key = "popup_<variant>" }` (see `bordered_popup`),
+  -- so the same `tui.scroll_*` API drives both. Disabling transcript
+  -- scrolling while a popup is up matches the user-expected "modal
+  -- focus" gesture — the popup owns the keyboard while it's visible.
+  local function active_scroll_key()
+    if state.popup then
+      local v = state.popup.variant
+      if v == "help" then return "popup_help" end
+      if v == "info" or v == "warning" or v == "error" then return "popup_message" end
+      if v == "tool_permission" then return "popup_tool_permission" end
+    end
+    return nil
+  end
+
   if kind == "key.pageup" then
-    tui.scroll_by("transcript", -10)
+    local target = active_scroll_key()
+    if target then
+      tui.scroll_by(target, -10)
+    else
+      tui.scroll_by("transcript", -10)
+    end
     return state, {}
   end
   if kind == "key.pagedown" then
-    tui.scroll_by("transcript", 10)
+    local target = active_scroll_key()
+    if target then
+      tui.scroll_by(target, 10)
+    else
+      tui.scroll_by("transcript", 10)
+    end
     return state, {}
   end
   if kind == "key.home" then
-    tui.scroll_to("transcript", 0)
+    local target = active_scroll_key()
+    if target then
+      tui.scroll_to(target, 0)
+    else
+      tui.scroll_to("transcript", 0)
+    end
     return state, {}
   end
   if kind == "key.end" then
-    tui.scroll_into_view("transcript")
+    local target = active_scroll_key()
+    if target then
+      tui.scroll_into_view(target)
+    else
+      tui.scroll_into_view("transcript")
+    end
     return state, {}
   end
 

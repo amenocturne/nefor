@@ -877,3 +877,68 @@ fn typing_slash_keeps_cursor_after_slash() {
          If exit_requested is false, each char prepended at cursor 0 instead of appending."
     );
 }
+
+#[test]
+fn popup_open_routes_pgdn_to_popup_not_transcript() {
+    // With a popup open, scroll keys (PgUp/PgDn/Home/End) target the
+    // popup's scrollable. The transcript's scroll offset must not move.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Pump enough transcript content that PgDn would have something to
+    // scroll if it were routed to the transcript.
+    for _ in 0..40 {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "chat.message.append", "role": "user", "text": "x" }),
+        );
+    }
+    let _ = render_str(&mut engine);
+
+    // Open the help popup.
+    for ch in "/help".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = render_str(&mut engine);
+
+    // Read live offsets via the Lua-exposed `tui.scroll_position`. The
+    // engine refreshes this map after every render, so it reflects the
+    // current frame's geometry.
+    fn read_offset(engine: &mut Engine, key: &str) -> u16 {
+        let lua = engine.lua();
+        let chunk = format!(
+            r#"
+            local p = tui.scroll_position("{key}")
+            return p and p.offset or -1
+            "#
+        );
+        let v: i64 = lua
+            .load(chunk.as_str())
+            .eval()
+            .expect("scroll_position eval");
+        if v < 0 {
+            panic!("no scroll_position for `{key}`");
+        }
+        v as u16
+    }
+
+    let transcript_before = read_offset(&mut engine, "transcript");
+
+    // PgDn should scroll the popup's body, not the transcript.
+    engine.handle_key(key("pagedown")).expect("pagedown");
+    let _ = render_str(&mut engine);
+
+    let transcript_after = read_offset(&mut engine, "transcript");
+    assert_eq!(
+        transcript_before, transcript_after,
+        "transcript scroll moved while popup was open — popup should own scroll keys"
+    );
+
+    let popup_offset = read_offset(&mut engine, "popup_help");
+    assert!(
+        popup_offset > 0,
+        "popup_help scroll offset stayed at 0 after PgDn — scroll key didn't reach the popup"
+    );
+}
