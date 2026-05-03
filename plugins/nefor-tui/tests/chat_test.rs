@@ -570,6 +570,78 @@ fn slash_help_opens_help_popup() {
 }
 
 #[test]
+fn slash_help_popup_side_bars_paint_every_body_row() {
+    // Cross-axis-stretch regression test (the user-visible bug that
+    // motivated the cross-stretch implementation). The help popup is
+    // multi-line; before cross-axis stretch its `tui.text { content =
+    // "│" }` side bars only painted row 0, leaving the rest of the
+    // popup with corners + top/bottom rules but no vertical sides.
+    //
+    // After the fix the side bars are `tui.fill { char = "│" }` and
+    // CSS-flexbox-style cross stretch in the body row guarantees the
+    // fill spans the body's natural cross. Verify by walking every
+    // row of the popup's body span and asserting each carries the
+    // left + right `│` chrome at the expected columns.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    for ch in "/help".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+
+    // Locate the popup's top rule. The bottom rule is the LAST '╯' in
+    // the snapshot — the input field at the bottom of the screen also
+    // owns one and we want the popup's, which sits above it. Per the
+    // anchored 60% sizing the popup span is 14 rows tall starting at
+    // row 5 (centered in 24).
+    let rows: Vec<&str> = snap.lines().collect();
+    let popup_top_idx = rows
+        .iter()
+        .position(|r| r.contains('╭'))
+        .expect("popup top rule");
+    // Char-indexed columns — `str::find` returns byte offsets, but
+    // multi-byte UTF-8 box-drawing glyphs (each 3 bytes) make those
+    // offsets 3× the visible column. Walk chars to get the visible
+    // column index instead.
+    let popup_top_chars: Vec<char> = rows[popup_top_idx].chars().collect();
+    let popup_left_col = popup_top_chars
+        .iter()
+        .position(|&c| c == '╭')
+        .expect("popup top rule column");
+    let popup_right_col = popup_top_chars
+        .iter()
+        .rposition(|&c| c == '╮')
+        .expect("popup top right corner column");
+
+    // Every body row of the popup must carry side bars at the popup's
+    // left + right edges. We check rows that fall inside the popup
+    // span and contain non-space content (the inner body), proving
+    // the fill stretched as the row's cross changes with content.
+    let mut body_rows_seen = 0;
+    for (i, row) in rows.iter().enumerate().skip(popup_top_idx + 1) {
+        let chars: Vec<char> = row.chars().collect();
+        if popup_left_col >= chars.len() || chars[popup_left_col] != '│' {
+            // Past the popup's vertical extent.
+            break;
+        }
+        body_rows_seen += 1;
+        assert!(
+            popup_right_col < chars.len() && chars[popup_right_col] == '│',
+            "popup body row {i} missing right side bar at col {popup_right_col}: \
+             {row:?}\nfull snapshot:\n{snap}"
+        );
+    }
+    assert!(
+        body_rows_seen >= 5,
+        "expected ≥ 5 popup body rows with side bars (saw {body_rows_seen}); \
+         the help popup is multi-line by construction:\n{snap}"
+    );
+}
+
+#[test]
 fn slash_yolo_emits_tool_gate_set_mode() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
