@@ -944,6 +944,128 @@ fn popup_open_routes_pgdn_to_popup_not_transcript() {
 }
 
 #[test]
+fn arrow_up_scrolls_transcript_when_input_focused_at_top_line() {
+    // Mac keyboards lack PgUp/PgDn, so Up/Down arrow keys map to
+    // single-line scroll on the active surface. The chat input is
+    // single-line (max_lines = 1) by default, so the focused text_input
+    // bubbles Up unconditionally and Lua's update routes it to
+    // `tui.scroll_by("transcript", -1)`.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Pump enough transcript content that there's something to scroll up
+    // through. Auto-scroll keeps the transcript pinned to the bottom, so
+    // the offset is positive after the deltas land.
+    for _ in 0..40 {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "chat.message.append", "role": "user", "text": "x" }),
+        );
+    }
+    let _ = render_str(&mut engine);
+
+    fn read_offset(engine: &mut Engine, key: &str) -> u16 {
+        let lua = engine.lua();
+        let chunk = format!(
+            r#"
+            local p = tui.scroll_position("{key}")
+            return p and p.offset or -1
+            "#
+        );
+        let v: i64 = lua
+            .load(chunk.as_str())
+            .eval()
+            .expect("scroll_position eval");
+        if v < 0 {
+            panic!("no scroll_position for `{key}`");
+        }
+        v as u16
+    }
+
+    let before = read_offset(&mut engine, "transcript");
+    assert!(
+        before > 0,
+        "test prerequisite: transcript should be scrolled past the top after 40 messages"
+    );
+
+    engine.handle_key(key("up")).expect("up");
+    let _ = render_str(&mut engine);
+    let after = read_offset(&mut engine, "transcript");
+    assert!(
+        after < before,
+        "Up arrow with focused single-line input must scroll transcript up by 1 (before={before}, after={after})"
+    );
+    assert_eq!(
+        before - after,
+        1,
+        "Up arrow should scroll transcript by exactly 1 line (before={before}, after={after})"
+    );
+}
+
+#[test]
+fn arrow_up_scrolls_popup_when_popup_open() {
+    // With a popup open the active scroll target shifts to the popup's
+    // scrollable. Up/Down arrows must follow PgUp/PgDn's modal-focus
+    // routing — the transcript stays pinned, popup body scrolls.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Open the help popup (HELP_BODY is multi-line so it has content to
+    // scroll past).
+    for ch in "/help".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = render_str(&mut engine);
+
+    fn read_offset(engine: &mut Engine, key: &str) -> u16 {
+        let lua = engine.lua();
+        let chunk = format!(
+            r#"
+            local p = tui.scroll_position("{key}")
+            return p and p.offset or -1
+            "#
+        );
+        let v: i64 = lua
+            .load(chunk.as_str())
+            .eval()
+            .expect("scroll_position eval");
+        if v < 0 {
+            panic!("no scroll_position for `{key}`");
+        }
+        v as u16
+    }
+
+    let transcript_before = read_offset(&mut engine, "transcript");
+
+    // Down arrow first to give the popup a non-zero offset, then Up to
+    // verify Up routes to the popup (offset decreases).
+    engine.handle_key(key("down")).expect("down");
+    let _ = render_str(&mut engine);
+    let popup_after_down = read_offset(&mut engine, "popup_help");
+    assert!(
+        popup_after_down > 0,
+        "Down arrow must scroll the open popup, not the transcript: popup_help offset stayed at 0"
+    );
+
+    engine.handle_key(key("up")).expect("up");
+    let _ = render_str(&mut engine);
+    let popup_after_up = read_offset(&mut engine, "popup_help");
+    assert!(
+        popup_after_up < popup_after_down,
+        "Up arrow must scroll the open popup back up (after_down={popup_after_down}, after_up={popup_after_up})"
+    );
+
+    let transcript_after = read_offset(&mut engine, "transcript");
+    assert_eq!(
+        transcript_before, transcript_after,
+        "transcript scroll moved while popup was open — popup should own arrow keys"
+    );
+}
+
+#[test]
 fn statusline_renders_below_input_row() {
     // Per legacy spec, the statusline sits BELOW the input box. Verify
     // by rendering and walking rows: the input box's bottom-right

@@ -726,7 +726,8 @@ local HELP_BODY = [[Keys:
   Ctrl+B       toggle sidebar
   Ctrl+O       expand/collapse tool calls + reasoning
   ?            this help (when input empty)
-  PgUp / PgDn  scroll transcript
+  Up / Down    scroll transcript by one line
+  PgUp / PgDn  scroll transcript by one page
   Home / End   jump to top / bottom
   Ctrl+C       quit
   Ctrl+D       quit
@@ -1623,6 +1624,30 @@ local function update(msg, state)
       tui.scroll_by(target, 10)
     else
       tui.scroll_by("transcript", 10)
+    end
+    return state, {}
+  end
+  -- Up/Down arrows scroll the active surface by one line — Mac keyboards
+  -- don't have PgUp/PgDn, so arrows are the muscle-memory equivalent.
+  -- The text_input router only bubbles arrows when the cursor sits at
+  -- an edge of the input's content (single-line, or first/last visual
+  -- row of multi-line), so this only fires when the input has nowhere
+  -- to move the cursor.
+  if kind == "key.up" then
+    local target = active_scroll_key()
+    if target then
+      tui.scroll_by(target, -1)
+    else
+      tui.scroll_by("transcript", -1)
+    end
+    return state, {}
+  end
+  if kind == "key.down" then
+    local target = active_scroll_key()
+    if target then
+      tui.scroll_by(target, 1)
+    else
+      tui.scroll_by("transcript", 1)
     end
     return state, {}
   end
