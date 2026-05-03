@@ -40,6 +40,51 @@ loads (useful for `cargo run -p nefor-tui` smoke runs).
 cargo test -p nefor-tui
 ```
 
+## Snapshot tests
+
+Integration tests can assert exact visual output by driving the engine
+in-process and reading [`Engine::snapshot`]. Each row of the framebuffer
+is `width` cells wide (trailing whitespace preserved); rows are joined
+with `\n`.
+
+```rust
+use nefor_tui::engine::Engine;
+use nefor_tui::input::KeyMessage;
+
+const SCENARIO: &str = r#"
+    tui.start {
+      initial_state = { count = 0 },
+      view = function(s)
+        return tui.text { content = "count: " .. tostring(s.count) }
+      end,
+      update = function(msg, s)
+        if msg.kind == "key.space" then return { count = s.count + 1 }, {} end
+        return s, {}
+      end,
+    }
+"#;
+
+let mut engine = Engine::new(12, 1).unwrap();
+engine.load_scenario(SCENARIO).unwrap();
+let _ = engine.render_if_dirty().unwrap();
+assert_eq!(engine.snapshot(), "count: 0    ");
+
+engine.handle_key(KeyMessage { name: "space".into(), mods: vec![] }).unwrap();
+let _ = engine.render_if_dirty().unwrap();
+assert_eq!(engine.snapshot(), "count: 1    ");
+```
+
+Three snapshot variants are available on `Engine`:
+
+- `snapshot()` — plain text, no style info.
+- `snapshot_ansi()` — text with inline ANSI SGR escapes (each row ends
+  with a reset).
+- `snapshot_styled()` — text with human-readable `[bold]...[/bold]`,
+  `[italic]...[/italic]`, `[underline]...[/underline]` markers. Designed
+  for readable golden diffs.
+
+See `tests/snapshot_test.rs` for the canonical pattern.
+
 The full chat surface comes up via the engine launcher:
 
 ```sh

@@ -117,6 +117,17 @@ impl Renderer {
         self.height
     }
 
+    /// The last frame buffer painted via [`Renderer::render`]. After
+    /// `render()` swaps `prev` and `next`, the just-painted frame lives
+    /// in `prev`. Used by `Engine::snapshot()` for integration testing
+    /// against exact visual output.
+    ///
+    /// Before the first render, returns an all-blank buffer of the
+    /// configured size.
+    pub fn last_frame(&self) -> &FrameBuffer {
+        &self.prev
+    }
+
     /// Render `root` and return the ANSI byte stream that brings the
     /// terminal up to date. Subsequent calls diff against the prior
     /// frame's contents; force a full redraw with [`Renderer::mark_full`].
