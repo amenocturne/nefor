@@ -68,9 +68,18 @@ local function read_resume_target()
   -- macOS XDG-equivalent path. The engine session writer uses this same
   -- root via dirs::data_dir(). Linux/Windows users would need to adjust;
   -- v1 ships the macOS path because that's the developer's host.
-  local home = os.getenv("HOME") or ""
-  if home == "" then return nil end
-  local path = home .. "/Library/Application Support/nefor/resume_target"
+  -- `NEFOR_DATA_HOME` overrides for test harnesses that need to point
+  -- at a tempdir; chat.lua honours the same variable.
+  local override = os.getenv("NEFOR_DATA_HOME")
+  local root
+  if override ~= nil and override ~= "" then
+    root = override
+  else
+    local home = os.getenv("HOME") or ""
+    if home == "" then return nil end
+    root = home .. "/Library/Application Support/nefor"
+  end
+  local path = root .. "/resume_target"
   local fh = io.open(path, "r")
   if fh == nil then return nil, path end
   local content = fh:read("*a") or ""

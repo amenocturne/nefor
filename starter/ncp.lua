@@ -297,39 +297,50 @@ end
 -- Replay saved_log entries through `resume.lua`'s per-plugin transforms.
 -- Called from `handle_ready` when `resume.is_active()` — i.e. the engine
 -- booted with `nefor.parent_session = "<id>"`. Each plugin-originated
--- event entry passes through:
---   1. `from_plugin` at the source (rebuilds the same wire shape the
---      plugin emitted in the previous session — e.g. cc → chat rename),
---   2. `resume.transform_for_plugin(target, env)` — opt-in filter; default
---      is to drop. Plugins that didn't register a transform see nothing
---      from the parent session.
---   3. `to_plugin` for the target (per-peer rewrite).
--- Step (1)'s side effects (e.g. for_provider's static_token auth.set
--- injection on `<provider>.ready`) DO fire during this replay — that's
--- the point: a faithful replay of what a fresh-boot bus would observe
--- if the prior session never paused. Step (2) is the resume-specific
--- filter: drop sub-graph events, drop in-flight tool calls, keep
--- structural history (chat.create / chat.append / chat.message.append).
+-- event entry from the prior session passes through:
+--   1. `resume.transform_for_plugin(target, env)` — opt-in filter; default
+--      is to drop. Plugins that didn't register see nothing from the
+--      parent session. The transform receives the raw decoded envelope
+--      (post-JSON, pre-from_plugin) and decides whether the target
+--      should observe it.
+--   2. `to_plugin` for the target (per-peer rewrite, same as live path).
+--
+-- Why we DON'T run `from_plugin` during replay: the source plugin's
+-- `from_plugin` transform owns live-session orchestration (e.g.
+-- agentic_workflow.for_chat intercepts `chat.input.submit` and kicks off
+-- a fresh orchestrator run). Running it during replay would re-fire those
+-- side effects — every prior turn would launch a new graph, every
+-- pre-existing chat.create would mint a new chat. Replay must be inert
+-- to the policy layer; it's structural-history-only. Per-plugin resume
+-- transforms know exactly which kinds carry structure (chat.create,
+-- chat.append, chat.message.append, chat.stream.end) and which carry
+-- per-firing artefacts (deltas, tool calls, sub-graph ticks).
+--
+-- Self-origin entries skip: a plugin must not see its own past emissions
+-- replayed back at it (NCP broadcast-minus-sender invariant).
 replay_saved_log_for = function(target, saved_log)
   for i = 1, #saved_log do
     local entry = saved_log[i]
     -- Skip non-plugin origins. Step-originated entries are the prior run's
     -- broadcast fanout (already counted via the original); engine-origin
     -- entries are private translation-layer artefacts.
-    if entry.origin ~= "step" and entry.origin ~= "engine" then
-      local env_in = decode_and_apply_from(entry.origin, entry.payload)
-      if env_in and env_in.type == "event" then
+    if entry.origin ~= "step" and entry.origin ~= "engine"
+       and entry.origin ~= target then
+      local decoded = select(1, try_decode(entry.payload))
+      if decoded and type(decoded) == "table" and decoded.type == "event"
+         and type(decoded.body) == "table" then
+        local env_raw = {
+          type = decoded.type,
+          body = decoded.body,
+          from = entry.origin,
+        }
         -- Per-target resume filter. Default is drop (no registration).
-        local filtered = resume.transform_for_plugin(target, {
-          type = env_in.type,
-          body = env_in.body,
-          from = env_in.from,
-        })
+        local filtered = resume.transform_for_plugin(target, env_raw)
         if filtered ~= nil then
           send_to_peer(target, {
-            type = filtered.type or env_in.type,
+            type = filtered.type or env_raw.type,
             body = filtered.body,
-            from = filtered.from or env_in.from,
+            from = filtered.from or env_raw.from,
           })
         end
       end

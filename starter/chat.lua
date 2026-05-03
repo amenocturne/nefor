@@ -1103,7 +1103,14 @@ end
 
 -- Path to the macOS XDG-equivalent sessions directory. Linux/Windows
 -- users would adjust this — v1 ships the macOS path.
+--
+-- Test override: if `NEFOR_DATA_HOME` is set in the environment, its value
+-- is used as the data root. Lets the chat_test.rs harness point at a
+-- temp dir without touching the real `~/Library/Application Support`
+-- tree. Production envs leave this unset and fall back to $HOME.
 local function nefor_data_root()
+  local override = os.getenv("NEFOR_DATA_HOME")
+  if override ~= nil and override ~= "" then return override end
   local home = os.getenv("HOME") or ""
   if home == "" then return nil end
   return home .. "/Library/Application Support/nefor"
@@ -1121,19 +1128,88 @@ local function resume_target_path()
   return root .. "/resume_target"
 end
 
+-- Extract the value of `"text": "..."` from a session-log JSONL line
+-- carrying a chat.input.submit event. The wire shape is:
+--   {"ts":"...","origin":"...","payload":"{\"type\":\"event\",\"body\":{\"kind\":\"chat.input.submit\",\"text\":\"<actual>\"}}"}
+-- The `text` field lives inside the embedded JSON string of `payload`,
+-- so the literal JSONL bytes contain `\"text\":\"<value>\"` (each quote
+-- backslash-escaped once). After we pull out that escaped value we
+-- un-escape `\"`, `\\`, `\n`, `\t` to recover the human-readable string.
+--
+-- We avoid pulling in a full JSON parser because chat.lua's host VM
+-- (nefor-tui) doesn't expose `nefor.json`, and the picker is dev
+-- tooling — a regex-tier extraction is fine for a one-line preview.
+local function extract_submit_text(line)
+  -- Find the escaped `\"text\":\"` marker — note the literal backslashes.
+  local _, marker_end = line:find([[\"text\":\"]], 1, true)
+  if marker_end == nil then
+    -- Fall back to the un-escaped form for tests that synthesise the
+    -- inner envelope directly without double-encoding.
+    _, marker_end = line:find('"text":"', 1, true)
+    if marker_end == nil then return nil end
+  end
+  local i = marker_end + 1
+  local out = {}
+  local n = #line
+  while i <= n do
+    local c = line:sub(i, i)
+    if c == "\\" and i < n then
+      local nxt = line:sub(i + 1, i + 1)
+      if nxt == "\\" and i + 1 < n then
+        -- Escaped backslash inside the embedded JSON: `\\\"` is the
+        -- escaped form of an escaped quote inside the inner string.
+        local nnxt = line:sub(i + 2, i + 2)
+        if nnxt == '"' then
+          -- Inner closing quote of the string value — we're done.
+          return table.concat(out)
+        end
+        out[#out + 1] = "\\"
+        i = i + 2
+      elseif nxt == '"' then
+        out[#out + 1] = '"'
+        i = i + 2
+      elseif nxt == "n" then
+        out[#out + 1] = "\n"
+        i = i + 2
+      elseif nxt == "t" then
+        out[#out + 1] = "\t"
+        i = i + 2
+      else
+        out[#out + 1] = nxt
+        i = i + 2
+      end
+    elseif c == '"' then
+      -- Plain (non-escaped) quote means we matched the un-escaped form.
+      return table.concat(out)
+    else
+      out[#out + 1] = c
+      i = i + 1
+    end
+  end
+  return nil
+end
+
+-- Extract started_at from the JSONL header: a known-shape line
+--   {"_session":true,"session_id":"...","parent_session":...,"started_at":"<iso>"}
+-- Pattern-match the `"started_at":"<value>"` field; same rationale as
+-- extract_submit_text — we don't need a full JSON parser.
+local function extract_started_at(header_line)
+  local v = header_line:match('"started_at"%s*:%s*"([^"]+)"')
+  return v
+end
+
 -- List up to `limit` newest sessions on disk. Each row:
 --   { id = "<uuid>", path = "<full>", started_at = "<iso>", preview = "<first user prompt>" }
 -- The preview is best-effort: we scan the JSONL for the first
 -- `chat.input.submit` event and pull `text`. Sessions with no submits
--- (e.g. crashed boots) get a "(empty)" placeholder. `started_at` comes
--- from the header — falls back to "?" if the header is missing or
--- malformed (a real broken session would still show up in the picker
--- with the bad fields, which is the right diagnostic affordance).
+-- (e.g. crashed boots) get a "(no submits)" placeholder. `started_at`
+-- comes from the header — falls back to "?" if the header is missing
+-- or malformed.
 local function list_recent_sessions(limit)
   local dir = session_dir()
   if dir == nil then return {} end
   -- `ls -t` sorts newest mtime first. Pure-Lua dir iteration would need
-  -- LuaFileSystem; `io.popen` is available in mlua's safe stdlib.
+  -- LuaFileSystem; `io.popen` is enabled by mlua's safe stdlib.
   local cmd = string.format("ls -t %q 2>/dev/null", dir)
   local pipe = io.popen(cmd)
   if pipe == nil then return {} end
@@ -1146,35 +1222,20 @@ local function list_recent_sessions(limit)
     end
   end
   pipe:close()
-  -- Enrich each row with header timestamp + first prompt preview. We
-  -- read line-by-line and stop at the first chat.input.submit hit so
+  -- Enrich each row with header timestamp + first prompt preview. Read
+  -- line-by-line and stop at the first chat.input.submit hit so
   -- multi-megabyte sessions don't slurp the whole file.
   for _, s in ipairs(sessions) do
     local fh = io.open(s.path, "r")
     if fh ~= nil then
       local header_line = fh:read("*l") or ""
-      local header_ok, header = pcall(nefor.json.decode, header_line)
-      if header_ok and type(header) == "table" then
-        s.started_at = header.started_at or "?"
-      else
-        s.started_at = "?"
-      end
+      s.started_at = extract_started_at(header_line) or "?"
       local preview = nil
       for line in fh:lines() do
-        -- Cheap substring filter before the JSON decode hot path.
+        -- Cheap substring filter — most lines aren't chat.input.submit.
         if line:find("chat.input.submit", 1, true) ~= nil then
-          local ok, decoded = pcall(nefor.json.decode, line)
-          if ok and type(decoded) == "table"
-             and type(decoded.payload) == "string" then
-            local payload_ok, payload = pcall(nefor.json.decode, decoded.payload)
-            if payload_ok and type(payload) == "table"
-               and type(payload.body) == "table"
-               and payload.body.kind == "chat.input.submit"
-               and type(payload.body.text) == "string" then
-              preview = payload.body.text
-              break
-            end
-          end
+          preview = extract_submit_text(line)
+          if preview ~= nil then break end
         end
       end
       fh:close()
