@@ -13,7 +13,7 @@
 --   chat.stream.reasoning_delta, chat.stream.reasoning_end,
 --   chat.session.stats, chat.tool.start, chat.tool.end,
 --   chat.popup, chat.auth.status, chat.model.set_ack,
---   tool-gate.permission_request,
+--   chat.tool.permission_request, tool-gate.mode_changed,
 --   graph.run_started, graph.node_dispatched, graph.node_result,
 --   graph.run_complete.
 --
@@ -90,6 +90,44 @@ local function humanize_tokens(n)
   if n < 1000 then return tostring(n) end
   if n < 1000000 then return tostring(math.floor(n / 1000)) .. "k" end
   return string.format("%.1fM", n / 1000000)
+end
+
+-- Pretty-print an args table from a `chat.tool.permission_request` event
+-- so the popup body shows a human-legible summary of the call.
+-- Stringy values render verbatim; nested tables get a compact `{...}`
+-- placeholder rather than a recursive dump (most tools take flat args,
+-- and a long nested blob would blow up the popup anyway).
+local function format_args(args)
+  if args == nil then return "" end
+  if type(args) ~= "table" then return tostring(args) end
+  -- Collect string keys (NCP args are JSON objects) in insertion-ish
+  -- order. Lua tables don't preserve order; sort for a stable display.
+  local keys = {}
+  for k, _ in pairs(args) do
+    if type(k) == "string" then keys[#keys + 1] = k end
+  end
+  table.sort(keys)
+  if #keys == 0 then
+    -- Could be an empty object or an array. ipairs() handles arrays.
+    local arr = {}
+    for _, v in ipairs(args) do arr[#arr + 1] = tostring(v) end
+    if #arr == 0 then return "{}" end
+    return "[" .. table.concat(arr, ", ") .. "]"
+  end
+  local parts = {}
+  for _, k in ipairs(keys) do
+    local v = args[k]
+    local rendered
+    if type(v) == "table" then
+      rendered = "{...}"
+    elseif type(v) == "string" then
+      rendered = string.format("%q", v)
+    else
+      rendered = tostring(v)
+    end
+    parts[#parts + 1] = k .. " = " .. rendered
+  end
+  return table.concat(parts, "\n")
 end
 
 ------------------------------------------------------------------------
@@ -1546,9 +1584,12 @@ local function update(msg, state)
     return shallow_merge(state, { last_esc_ms = now }), {}
   end
 
-  -- Tool permission popup keys.
+  -- Tool permission popup keys. Routes to tool-gate via broadcast event
+  -- (target hint is documentation-only; tool-gate matches by `id`).
+  -- A / Enter → approve, D → deny. Esc handled in the popup-close branch
+  -- above — also denies. The footer chrome advertises the same.
   if state.popup and state.popup.variant == "tool_permission" then
-    if kind == "key.a" or kind == "key.A" then
+    if kind == "key.a" or kind == "key.A" or kind == "key.enter" then
       local id = state.popup.id
       return shallow_merge(state, { popup = NIL_SENTINEL }), {
         { kind = "send_to", target = "engine",
@@ -1773,20 +1814,33 @@ local function update(msg, state)
     return shallow_merge(state, { auth = auth }), {}
   end
 
-  if kind == "tool-gate.permission_request" then
-    -- args displayed pretty in the body.
+  if kind == "chat.tool.permission_request" then
+    -- Wire shape from tool-gate (plugins/tool-gate/src/main.rs):
+    --   { kind = "chat.tool.permission_request",
+    --     id   = "<provider outer id>",
+    --     tool = "<tool name>",
+    --     args = <JSON object> }
+    -- We render `args` into a small key/value summary. The response goes
+    -- back as `tool.permission_response { id, decision }` (handled in the
+    -- popup keymap below). `msg.input_pretty` and `msg.name` are kept as
+    -- forward-compatible fallbacks in case future emitters pre-format.
+    local args = msg.args
     local body
-    if type(msg.input) == "table" then
-      body = "(JSON args; provide via msg.input_pretty for rich format)"
+    if msg.input_pretty ~= nil then
+      body = tostring(msg.input_pretty)
+    elseif type(args) == "table" then
+      body = format_args(args)
+    elseif args ~= nil then
+      body = tostring(args)
     else
-      body = tostring(msg.input or "")
+      body = ""
     end
     return shallow_merge(state, {
       popup = {
         variant = "tool_permission",
         tool    = msg.tool or msg.name or "?",
         id      = msg.id,
-        body    = msg.input_pretty or body,
+        body    = body,
         source  = msg.source,
       },
     }), {}
