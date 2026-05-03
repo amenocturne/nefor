@@ -122,9 +122,16 @@ pub fn is_editing_key(key: &KeyMessage, max_lines: u16) -> bool {
     let solo_modifier = !has_ctrl && !has_alt && !has_super;
 
     match key.name.as_str() {
-        "backspace" | "delete" | "left" | "right" | "up" | "down" | "home" | "end" => {
-            !has_alt && !has_super
-        }
+        // Plain Backspace and Alt+Backspace (delete-word-back) both edit;
+        // Ctrl+Backspace stays free for Lua shortcuts.
+        "backspace" => !has_ctrl && !has_super,
+        // Plain Delete and Alt+Delete (delete-word-forward) both edit;
+        // Ctrl+Delete stays free.
+        "delete" => !has_ctrl && !has_super,
+        // Plain arrows + Alt+arrows (word-left/right). Ctrl+arrow and
+        // Super stay free.
+        "left" | "right" => !has_ctrl && !has_super,
+        "up" | "down" | "home" | "end" => !has_alt && !has_super,
         "enter" => {
             // Enter without modifiers → submit. Shift+Enter inserts a
             // newline only on multi-line inputs. Ctrl/Alt/Super+Enter
@@ -232,11 +239,16 @@ pub fn apply_editing_key(
 ) -> EditOutcome {
     let has_shift = key.mods.contains(&"shift");
     let has_ctrl = key.mods.contains(&"ctrl");
+    let has_alt = key.mods.contains(&"alt");
 
     match key.name.as_str() {
+        "backspace" if has_alt => state.delete_word_backward(),
         "backspace" => state.backspace(),
+        "delete" if has_alt => state.delete_word_forward(),
         "delete" => state.delete_forward(),
+        "left" if has_alt => state.move_word_left(has_shift),
         "left" => state.move_left(has_shift),
+        "right" if has_alt => state.move_word_right(has_shift),
         "right" => state.move_right(has_shift),
         "up" => state.move_up(has_shift),
         "down" => state.move_down(has_shift),
@@ -507,6 +519,75 @@ mod tests {
                 is_editing_key(&key(k, vec!["ctrl"]), 1),
                 "ctrl+{k} should be an editing key"
             );
+        }
+    }
+
+    #[test]
+    fn focused_input_absorbs_alt_word_motion_chords() {
+        // Alt+Backspace / Alt+Delete delete-word; Alt+Left/Right move
+        // by word. All absorb into the focused text_input.
+        for name in ["left", "right", "backspace", "delete"] {
+            assert!(
+                is_editing_key(&key(name, vec!["alt"]), 1),
+                "alt+{name} should be an editing key"
+            );
+        }
+    }
+
+    #[test]
+    fn alt_left_moves_cursor_word_back() {
+        // End-to-end via the router: Alt+Left should land the cursor
+        // at the start of the previous word.
+        let multi = WidgetDescription::TextInput {
+            key: Some("input".into()),
+            value: "foo bar baz".into(),
+            focused: true,
+            on_change: None,
+            on_submit: None,
+            min_lines: 1,
+            max_lines: 1,
+            placeholder: None,
+            cursor_blink: false,
+            style: None,
+        };
+        let mut r = build(multi);
+        let root = r.root.as_mut().unwrap();
+        // The first sync seeds cursor at end (=11). Alt+Left → start
+        // of "baz" (=8).
+        let _ = route_key(root, &key("left", vec!["alt"]));
+        match &root.state {
+            InstanceState::TextInput(s) => assert_eq!(s.cursor, 8),
+            _ => panic!("expected text_input state"),
+        }
+    }
+
+    #[test]
+    fn alt_backspace_deletes_word_back() {
+        let single = WidgetDescription::TextInput {
+            key: Some("input".into()),
+            value: "foo bar".into(),
+            focused: true,
+            on_change: Some("input.changed".into()),
+            on_submit: None,
+            min_lines: 1,
+            max_lines: 1,
+            placeholder: None,
+            cursor_blink: false,
+            style: None,
+        };
+        let mut r = build(single);
+        let root = r.root.as_mut().unwrap();
+        let decision = route_key(root, &key("backspace", vec!["alt"]));
+        match decision {
+            RouteDecision::HandledByTextInput {
+                value,
+                value_changed,
+                ..
+            } => {
+                assert_eq!(value, "foo ");
+                assert!(value_changed);
+            }
+            other => panic!("expected HandledByTextInput, got {other:?}"),
         }
     }
 
