@@ -1703,8 +1703,16 @@ local function update(msg, state)
       local cleared = shallow_merge(state, {
         entries = {}, in_flight = NIL_SENTINEL, input_value = "",
         pending = false, slash = NIL_SENTINEL,
+        dag_runs = {},
+        turn_started_at = NIL_SENTINEL,
+        last_turn_duration_ms = NIL_SENTINEL,
+        last_esc_ms = NIL_SENTINEL,
+        history_cursor = NIL_SENTINEL,
+        popup = NIL_SENTINEL,
       })
       return cleared, {
+        { kind = "send_to", target = "engine",
+          body = { kind = "chat.interrupt_all" } },
         { kind = "send_to", target = "engine",
           body = { kind = "chat.reset" } },
       }

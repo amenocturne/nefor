@@ -275,16 +275,65 @@ fn slash_new_clears_transcript_and_emits_chat_reset() {
     let _ = engine.take_emit_queue();
     engine.handle_key(key("enter")).expect("enter");
     let emits = engine.take_emit_queue();
-    assert_eq!(emits.len(), 1, "expected one chat.reset egress");
+    // /new must cancel any in-flight work AND clear the chat: emits both
+    // chat.interrupt_all (kills graphs/pending tool calls) and chat.reset.
     assert_eq!(
-        emits[0].1.get("kind").and_then(|v| v.as_str()),
-        Some("chat.reset")
+        emits.len(),
+        2,
+        "expected interrupt_all + reset egress, got {emits:?}"
+    );
+    let kinds: Vec<_> = emits
+        .iter()
+        .map(|(_, b)| b.get("kind").and_then(|v| v.as_str()).unwrap_or(""))
+        .collect();
+    assert!(
+        kinds.contains(&"chat.interrupt_all"),
+        "missing chat.interrupt_all in {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"chat.reset"),
+        "missing chat.reset in {kinds:?}"
     );
 
     let out = render_str(&mut engine);
     assert!(
         !out.contains("previous"),
         "transcript should be cleared after /new: {out:?}"
+    );
+}
+
+#[test]
+fn slash_new_clears_dag_runs() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Seed an active DAG run.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.run_started",
+            "run_id": "run-aaaaaaaa",
+            "total_nodes": 3,
+        }),
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("DAG run-aaaa"),
+        "dag header should appear pre-/new: {out:?}"
+    );
+
+    // /new + Enter.
+    for ch in "/new".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    let _ = engine.take_emit_queue();
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("DAG run-aaaa"),
+        "dag panel should be empty after /new: {out:?}"
     );
 }
 
