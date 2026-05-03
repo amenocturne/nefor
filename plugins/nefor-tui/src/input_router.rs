@@ -23,7 +23,9 @@
 use crate::desc::WidgetDescription;
 use crate::input::KeyMessage;
 use crate::instance::{InstanceKind, InstanceState, WidgetInstance};
-use crate::text_input::{allows_newline_insert, EditOutcome, TextInputState};
+use crate::text_input::{
+    allows_newline_insert, cursor_in_wrap_for, line_end, wrap_value, EditOutcome, TextInputState,
+};
 
 /// Outcome the engine acts on for a single key press.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +161,66 @@ pub fn is_editing_key(key: &KeyMessage, max_lines: u16) -> bool {
     }
 }
 
+/// Whether an Up/Down arrow should bubble to Lua instead of moving the
+/// cursor inside a focused text_input. Mac keyboards lack PgUp/PgDn, so
+/// the chat surface remaps Up/Down to scroll the active surface — but
+/// only when the input has nowhere to move the cursor. Rules:
+///
+/// - Single-line input (`max_lines == 1`): Up and Down always bubble.
+///   Cursor movement on a single visual row would be a no-op, and the
+///   user's intent is "scroll the transcript".
+/// - Multi-line input on Up: bubble when the cursor sits on the first
+///   visual row (soft-wrapped or hard-newline rows count). Else absorb
+///   so the cursor walks up.
+/// - Multi-line input on Down: bubble when the cursor sits on the last
+///   visual row. Else absorb.
+///
+/// Shift+Up / Shift+Down follow the same rule — cursor-extension
+/// selection at a row edge has nowhere to go, so bubbling lets the
+/// surface scroll instead. Documented at the call site.
+pub fn arrow_should_bubble(state: &TextInputState, key_name: &str, max_lines: u16) -> bool {
+    if max_lines <= 1 {
+        return true;
+    }
+    let value = state.last_value.as_str();
+    let cursor = state.cursor.min(value.len());
+    let (visual_row, last_row) = if state.viewport_width > 0 {
+        let rows = wrap_value(value, state.viewport_width);
+        if rows.is_empty() {
+            return true;
+        }
+        let (row, _) = cursor_in_wrap_for(value, &rows, cursor);
+        (row, rows.len().saturating_sub(1))
+    } else {
+        // Hard-newline fallback before the first layout pass: count
+        // logical rows by scanning `\n`s and locate the cursor's row.
+        let mut row = 0usize;
+        for &b in &value.as_bytes()[..cursor] {
+            if b == b'\n' {
+                row += 1;
+            }
+        }
+        let total = value.split('\n').count().saturating_sub(1);
+        (row, total)
+    };
+    match key_name {
+        "up" => visual_row == 0,
+        "down" => {
+            if state.viewport_width > 0 {
+                visual_row >= last_row
+            } else {
+                // Hard-newline fallback: cursor must be on the last
+                // logical line AND that line must have no trailing
+                // newline (else the cursor could land on the empty post-
+                // newline row).
+                let line_e = line_end(value, cursor);
+                visual_row >= last_row && line_e == value.len()
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Apply an editing key to `state`, given the description's bookkeeping.
 /// Returns the `EditOutcome` so the caller can fire `on_change`/`on_submit`.
 pub fn apply_editing_key(
@@ -234,6 +296,18 @@ pub fn route_key(root: &mut WidgetInstance, key: &KeyMessage) -> RouteDecision {
 
     if !is_editing_key(key, max_lines) {
         return RouteDecision::BubbleToLua;
+    }
+
+    // Up/Down at the edge of the input's content bubble to Lua so the
+    // chat surface can map them to scroll gestures (Mac keyboards lack
+    // PgUp/PgDn). Computed against the post-sync TextInputState the
+    // engine just refreshed.
+    if matches!(key.name.as_str(), "up" | "down") {
+        if let InstanceState::TextInput(s) = &inst.state {
+            if arrow_should_bubble(s, key.name.as_str(), max_lines) {
+                return RouteDecision::BubbleToLua;
+            }
+        }
     }
 
     let outcome = match &mut inst.state {
@@ -504,5 +578,131 @@ mod tests {
             InstanceState::TextInput(s) => assert_eq!(s.last_value, ""),
             _ => panic!("expected text_input state on unfocused child"),
         }
+    }
+
+    // ── Up/Down arrow bubbling at content edges (Mac PgUp/PgDn parity) ─
+
+    fn ti_state(value: &str, cursor: usize, viewport_width: u16) -> TextInputState {
+        TextInputState {
+            last_value: value.into(),
+            cursor,
+            viewport_width,
+            ..TextInputState::default()
+        }
+    }
+
+    #[test]
+    fn up_arrow_bubbles_when_cursor_on_first_line() {
+        // Multi-line input, cursor anywhere on visual row 0 → Up bubbles
+        // so the chat surface can scroll the transcript.
+        let s = ti_state("first\nsecond\nthird", 2, 80);
+        assert!(arrow_should_bubble(&s, "up", 8));
+    }
+
+    #[test]
+    fn up_arrow_moves_cursor_when_cursor_on_middle_line() {
+        // Cursor on the middle row → Up has somewhere to go, absorb.
+        let value = "first\nsecond\nthird";
+        let mid = "first\n".len() + 2; // inside "second"
+        let s = ti_state(value, mid, 80);
+        assert!(!arrow_should_bubble(&s, "up", 8));
+    }
+
+    #[test]
+    fn down_arrow_bubbles_when_cursor_on_last_line() {
+        // Cursor on the final visual row → Down bubbles.
+        let value = "first\nsecond\nthird";
+        let last = value.len() - 1; // inside "third"
+        let s = ti_state(value, last, 80);
+        assert!(arrow_should_bubble(&s, "down", 8));
+    }
+
+    #[test]
+    fn single_line_input_bubbles_both_up_and_down() {
+        // max_lines == 1 → arrows always bubble regardless of cursor.
+        let s = ti_state("hello", 3, 80);
+        assert!(arrow_should_bubble(&s, "up", 1));
+        assert!(arrow_should_bubble(&s, "down", 1));
+    }
+
+    #[test]
+    fn arrow_should_bubble_handles_zero_viewport_via_hard_newlines() {
+        // Pre-layout (viewport_width == 0): fall back to logical rows.
+        let s = ti_state("abc\ndef\nghi", 5, 0); // cursor in "def" (mid)
+        assert!(!arrow_should_bubble(&s, "up", 8));
+        assert!(!arrow_should_bubble(&s, "down", 8));
+        let s_top = ti_state("abc\ndef\nghi", 1, 0); // cursor in "abc"
+        assert!(arrow_should_bubble(&s_top, "up", 8));
+        let s_bot = ti_state("abc\ndef\nghi", 9, 0); // cursor in "ghi"
+        assert!(arrow_should_bubble(&s_bot, "down", 8));
+    }
+
+    #[test]
+    fn focused_multiline_bubbles_up_at_first_row() {
+        // route_key end-to-end: focused multi-line input with cursor at
+        // start of first row — Up must bubble, not absorb.
+        let multi = WidgetDescription::TextInput {
+            key: Some("input".into()),
+            value: "abc\ndef".into(),
+            focused: true,
+            on_change: None,
+            on_submit: None,
+            min_lines: 1,
+            max_lines: 4,
+            placeholder: None,
+            cursor_blink: false,
+            style: None,
+        };
+        let mut r = build(multi);
+        let root = r.root.as_mut().unwrap();
+        // Ensure cursor sits at position 0 (start of first row).
+        let decision = route_key(root, &key("up", vec![]));
+        assert_eq!(
+            decision,
+            RouteDecision::BubbleToLua,
+            "Up at first visual row must bubble to Lua"
+        );
+    }
+
+    #[test]
+    fn focused_multiline_absorbs_up_when_cursor_on_second_row() {
+        let multi = WidgetDescription::TextInput {
+            key: Some("input".into()),
+            value: "abc\ndef".into(),
+            focused: true,
+            on_change: None,
+            on_submit: None,
+            min_lines: 1,
+            max_lines: 4,
+            placeholder: None,
+            cursor_blink: false,
+            style: None,
+        };
+        let mut r = build(multi);
+        let root = r.root.as_mut().unwrap();
+        // Walk cursor to the second row first by pressing End then Down.
+        let _ = route_key(root, &key("end", vec![]));
+        let _ = route_key(root, &key("down", vec![]));
+        let decision = route_key(root, &key("up", vec![]));
+        match decision {
+            RouteDecision::HandledByTextInput { .. } => {}
+            other => panic!("Up on second row should be absorbed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn focused_singleline_bubbles_arrow_up_and_down() {
+        // Single-line input absorbs printables but bubbles Up/Down so
+        // they can drive transcript scrolling.
+        let mut r = build(ti("input", true, "hello"));
+        let root = r.root.as_mut().unwrap();
+        assert_eq!(
+            route_key(root, &key("up", vec![])),
+            RouteDecision::BubbleToLua
+        );
+        assert_eq!(
+            route_key(root, &key("down", vec![])),
+            RouteDecision::BubbleToLua
+        );
     }
 }
