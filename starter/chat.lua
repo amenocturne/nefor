@@ -331,7 +331,6 @@ local SLASH_COMMANDS = {
   { name = "resume",  aliases = {},          hint = "resume previous session",                takes_args = true },
   { name = "yolo",    aliases = {},          hint = "disable tool permission prompts (DANGEROUS)", takes_args = false },
   { name = "safe",    aliases = {},          hint = "re-enable tool permission prompts",      takes_args = false },
-  { name = "dag-test",aliases = {},          hint = "submit a 2-node parallel test DAG",      takes_args = false },
 }
 
 local function slash_filter(query)
@@ -873,8 +872,7 @@ Slash commands:
   /yolo /safe  toggle tool permission gate
   /login /logout  provider auth
   /model       list/switch model
-  /resume      resume a previous session
-  /dag-test    submit a test DAG]]
+  /resume      resume a previous session]]
 
 local function popup_help(state)
   if not state.popup or state.popup.variant ~= "help" then return nil end
@@ -1797,12 +1795,6 @@ local function update(msg, state)
       if args and #args > 0 then body.session_id = args end
       return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL }), {
         { kind = "send_to", target = "engine", body = body },
-      }
-    end
-    if cmd == "dag-test" then
-      return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL }), {
-        { kind = "send_to", target = "engine",
-          body = { kind = "chat.command", name = "dag-test" } },
       }
     end
     if cmd ~= nil then
