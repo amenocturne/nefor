@@ -368,17 +368,35 @@ enum Axis {
     Vertical,
 }
 
-/// Two-pass flex distribution (shared between column + row).
+/// Three-phase flex distribution (shared between column + row).
 ///
-/// Pass 1 — measure non-flex children with the parent's cross-axis budget
-/// and natural main-axis space. The flex children get whatever main-axis
-/// space remains, distributed proportionally.
+/// Main-axis allocation (CSS `flex-grow` analogue):
+///   • Pass 1 — measure non-flex children with their natural main-axis
+///     size, capping at the remaining budget.
+///   • Pass 2 — distribute leftover main-axis space across flex children
+///     (`expanded` / `spacer`) proportional to `flex`. Residual goes to
+///     the last flex child so totals match exactly.
+///
+/// Cross-axis stretch (CSS `align-items: stretch` default):
+///   • Pass 3 — children that opt into cross-greedy (`tui.fill` and
+///     wrappers around it) are re-measured with the row's resolved
+///     cross size as a TIGHT constraint. The row's cross is
+///     `max(non-greedy children's cross sizes)`, clamped into the
+///     parent's `[min_cross, max_cross]` bounds. If every child is
+///     cross-greedy (no anchor), the row claims the parent's full
+///     cross — matching CSS flexbox.
+///
+/// The classification of a child as cross-greedy is intrinsic to the
+/// primitive (see [`child_cross_greedy_in_axis`]), not configurable per
+/// row/column. Users wanting natural-cross alignment for an otherwise
+/// greedy child can wrap it in `tui.align`, which absorbs the parent's
+/// cross and positions the child at its natural size.
 ///
 /// Edge cases worth keeping in mind:
 ///   • If `remaining` is 0 (or negative once gaps are subtracted), every
 ///     flex child gets `0` on the main axis and lays out tight on that
-///     axis — they may still measure non-zero on the cross axis, but
-///     their main-axis size collapses.
+///     axis. Cross-greedy reach is unaffected — they still stretch to
+///     match the resolved row cross.
 ///   • Integer division uses (`remaining * weight) / total_flex`. The
 ///     residual (so total flex sizes don't sum exactly to `remaining`) is
 ///     handed to the *last* flex child to keep totals consistent.
@@ -389,14 +407,29 @@ fn flex_layout(inst: &mut WidgetInstance, c: Constraints, axis: Axis, gap: u16) 
     }
 
     let main_max = main_of(axis, c.max_width, c.max_height);
+    let cross_min = cross_of(axis, c.min_width, c.min_height);
     let cross_max = cross_of(axis, c.max_width, c.max_height);
     let total_gap = (n as u16).saturating_sub(1).saturating_mul(gap);
 
-    // Inspect children to find flex factors (only `expanded`/`spacer`).
+    // Inspect children for main-axis flex factors and cross-axis greed.
+    // Both classifications are static functions of the child's
+    // descriptor — the layout engine never asks the child to opt in
+    // dynamically. Computed once up front so passes 1-3 share the
+    // results without re-walking the child tree.
     let flex_factors: Vec<u16> = inst.children.iter().map(child_flex_factor).collect();
+    let cross_greedy: Vec<bool> = inst
+        .children
+        .iter()
+        .map(|c| child_cross_greedy_in_axis(c, axis))
+        .collect();
     let total_flex: u32 = flex_factors.iter().map(|&f| f as u32).sum();
 
     let mut sizes: Vec<Size> = vec![Size::default(); n];
+    // Per-child main allotment captured during passes 1+2 so phase 3
+    // can re-measure cross-greedy children with the same main constraint
+    // they got the first time. Without this capture, the re-measure
+    // would lose the flex distribution result.
+    let mut main_allotments: Vec<u16> = vec![0; n];
     let mut non_flex_main: u32 = 0;
 
     // Pass 1: lay out non-flex children with their natural main-axis size.
@@ -404,20 +437,20 @@ fn flex_layout(inst: &mut WidgetInstance, c: Constraints, axis: Axis, gap: u16) 
         if flex_factors[i] > 0 {
             continue;
         }
+        let child_main_max = main_max
+            .saturating_sub(non_flex_main as u16)
+            .saturating_sub(total_gap);
+        main_allotments[i] = child_main_max;
         let child_constraints = match axis {
             Axis::Vertical => Constraints {
                 min_width: 0,
                 max_width: c.max_width,
                 min_height: 0,
-                max_height: main_max
-                    .saturating_sub(non_flex_main as u16)
-                    .saturating_sub(total_gap),
+                max_height: child_main_max,
             },
             Axis::Horizontal => Constraints {
                 min_width: 0,
-                max_width: main_max
-                    .saturating_sub(non_flex_main as u16)
-                    .saturating_sub(total_gap),
+                max_width: child_main_max,
                 min_height: 0,
                 max_height: c.max_height,
             },
@@ -451,6 +484,7 @@ fn flex_layout(inst: &mut WidgetInstance, c: Constraints, axis: Axis, gap: u16) 
             ((remaining_main * f as u32) / total_flex) as u16
         };
         handed_out_main = handed_out_main.saturating_add(allotment as u32);
+        main_allotments[i] = allotment;
 
         let child_constraints = match axis {
             Axis::Vertical => Constraints {
@@ -470,6 +504,52 @@ fn flex_layout(inst: &mut WidgetInstance, c: Constraints, axis: Axis, gap: u16) 
         sizes[i] = s;
     }
 
+    // Compute row's resolved cross size (CSS `align-items: stretch`):
+    // ignore cross-greedy children's first-pass sizes (they had no
+    // natural cross to contribute); take the max of the rest. If every
+    // child is cross-greedy, fall back to `cross_max` so the row spans
+    // its full available cross — matches flexbox default.
+    let any_non_greedy = cross_greedy.iter().any(|&g| !g);
+    let natural_cross: u16 = if any_non_greedy {
+        sizes
+            .iter()
+            .zip(cross_greedy.iter())
+            .filter_map(|(s, &greedy)| (!greedy).then_some(cross_of(axis, s.width, s.height)))
+            .max()
+            .unwrap_or(0)
+    } else {
+        cross_max
+    };
+    let row_cross = natural_cross.clamp(cross_min, cross_max);
+
+    // Pass 3: re-measure cross-greedy children with the row's cross
+    // size as a tight constraint. Their main-axis allotment is the same
+    // as in passes 1/2 — re-applying it via `main_allotments[i]` keeps
+    // flex distribution stable.
+    for i in 0..n {
+        if !cross_greedy[i] {
+            continue;
+        }
+        let allotment = main_allotments[i];
+        let is_flex = flex_factors[i] > 0;
+        let child_constraints = match axis {
+            Axis::Vertical => Constraints {
+                min_width: row_cross,
+                max_width: row_cross,
+                min_height: if is_flex { allotment } else { 0 },
+                max_height: allotment,
+            },
+            Axis::Horizontal => Constraints {
+                min_width: if is_flex { allotment } else { 0 },
+                max_width: allotment,
+                min_height: row_cross,
+                max_height: row_cross,
+            },
+        };
+        let s = layout(&mut inst.children[i], child_constraints);
+        sizes[i] = s;
+    }
+
     // Persist per-child main-axis size for the paint pass.
     inst.layout.flex_main_sizes = sizes
         .iter()
@@ -481,21 +561,15 @@ fn flex_layout(inst: &mut WidgetInstance, c: Constraints, axis: Axis, gap: u16) 
         .map(|s| main_of(axis, s.width, s.height) as u32)
         .sum::<u32>()
         + total_gap as u32;
-    let cross_used: u16 = sizes
-        .iter()
-        .map(|s| cross_of(axis, s.width, s.height))
-        .max()
-        .unwrap_or(0)
-        .min(cross_max);
 
     let raw = match axis {
         Axis::Vertical => Size {
-            width: cross_used,
+            width: row_cross,
             height: main_used.min(u16::MAX as u32) as u16,
         },
         Axis::Horizontal => Size {
             width: main_used.min(u16::MAX as u32) as u16,
-            height: cross_used,
+            height: row_cross,
         },
     };
     c.constrain(raw)
@@ -671,11 +745,13 @@ fn layout_fill(_inst: &mut WidgetInstance, c: Constraints) -> Size {
     // as a Flutter `Container` with no child but a decoration, or HTML
     // `width: 100%; height: 100%` inside a bounded parent.
     //
-    // Caveat: inside a row, fill's `max_height = parent.max_height`
-    // means an unconstrained row containing a fill bloats vertically.
-    // Wrap rows that should stay 1 row tall in
-    // `tui.constrained { max_height = 1, child = ... }` (or compose the
-    // fill row inside a column whose other rows pin the height).
+    // Inside a `row` / `column`, the parent's flex layout classifies
+    // `Fill` as cross-greedy and re-measures with a tight cross
+    // constraint after determining the row's cross from non-greedy
+    // siblings (CSS `align-items: stretch`). So the bare-`max_height`
+    // here is the unconstrained-parent path; inside a flex parent the
+    // tight constraint funnels through `c.constrain` and produces
+    // `row_cross × main_allotment`.
     c.constrain(Size {
         width: c.max_width,
         height: c.max_height,
@@ -1553,6 +1629,56 @@ fn child_flex_factor(child: &WidgetInstance) -> u16 {
     }
 }
 
+/// Whether `child` opts into cross-axis stretch inside a flex parent
+/// (`row` or `column`) on `axis`. The flex layout treats cross-greedy
+/// children differently:
+///
+/// 1. their measured cross size does NOT participate in the row's
+///    natural-cross calculation (they have no natural cross), and
+/// 2. after the row's cross is determined from non-greedy siblings, they
+///    are re-measured with a tight cross constraint matching that row.
+///
+/// CSS-flexbox parallel: `align-items: stretch` is the default; greedy
+/// children are the ones that consume the resolved cross size. We make
+/// the call per-primitive instead of per-axis-flag because primitives
+/// like `tui.fill` are greedy on both axes by definition (paint requires
+/// a non-empty rect on both axes), and that property is intrinsic to the
+/// primitive's contract — not a layout option exposed at the row level.
+///
+/// Wrappers (`expanded`, `padding`, `constrained`) delegate to their
+/// child so the common composition `expanded { fill }` is correctly
+/// classified as cross-greedy without forcing every wrapper to know
+/// about the property.
+///
+/// `axis` is unused at the leaf today (every cross-greedy primitive is
+/// greedy on both axes), but it threads through wrappers so a future
+/// per-axis primitive (e.g. a hypothetical `tui.hfill` that's greedy
+/// only on horizontal) slots in without changing the call sites.
+#[allow(clippy::only_used_in_recursion)]
+fn child_cross_greedy_in_axis(child: &WidgetInstance, axis: Axis) -> bool {
+    match &child.last_desc {
+        // Greedy on both axes — claims whatever rect the parent assigns.
+        WidgetDescription::Fill { .. } => true,
+        // Spacer is empty filler on the main axis only; nothing to draw
+        // on the cross axis, so don't pull the row taller than its
+        // content.
+        WidgetDescription::Spacer { .. } => false,
+        // Single-child wrappers delegate. A constrained that bounds the
+        // cross axis will still be honored: phase 3 re-measures the
+        // child with `min == max == row_cross`, and `Constrained` clamps
+        // that into the user's bounds (`Constraints::constrain`). So the
+        // delegation is safe for the bounded case.
+        WidgetDescription::Expanded { .. }
+        | WidgetDescription::Padding { .. }
+        | WidgetDescription::Constrained { .. } => child
+            .children
+            .first()
+            .map(|c| child_cross_greedy_in_axis(c, axis))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
 fn main_of(axis: Axis, width: u16, height: u16) -> u16 {
     match axis {
         Axis::Horizontal => width,
@@ -2360,6 +2486,101 @@ mod tests {
         assert_eq!(cell_at(&buf, 2, 0), "╰");
         assert_eq!(cell_at(&buf, 2, 1), "─");
         assert_eq!(cell_at(&buf, 2, 4), "╯");
+    }
+
+    #[test]
+    fn row_with_fill_side_and_multiline_content_stretches_fill() {
+        // Cross-axis stretch: side bar = `tui.fill { char = "│" }`,
+        // body = a 4-row text. Row's natural cross is 4 rows (from the
+        // body). The fill, classified as cross-greedy, is re-measured
+        // with `min_cross == max_cross == 4` and paints `│` on every
+        // row. Without cross-axis stretch the side bar would only paint
+        // at row 0, leaving rows 1..4 unbordered.
+        let body = text("aaa\nbbb\nccc\nddd");
+        let desc = WidgetDescription::Row {
+            gap: 0,
+            key: None,
+            children: vec![fill("│", None), expanded(body, 1), fill("│", None)],
+        };
+        let buf = paint_root(desc, 5, 4);
+        for row in 0..4 {
+            assert_eq!(
+                cell_at(&buf, row, 0),
+                "│",
+                "left side bar must paint row {row}",
+            );
+            assert_eq!(
+                cell_at(&buf, row, 4),
+                "│",
+                "right side bar must paint row {row}",
+            );
+        }
+    }
+
+    #[test]
+    fn column_with_fill_top_and_multiline_content_stretches_fill_horizontally() {
+        // Symmetric to the row case: a column with two `tui.fill` bars
+        // (one above, one below) and a 5-col body in the middle. Cross
+        // axis here is horizontal; bars must paint across the full
+        // column cross (5 cols), not collapse to 0.
+        let desc = WidgetDescription::Column {
+            gap: 0,
+            key: None,
+            children: vec![fill("─", None), expanded(text("hello"), 1), fill("─", None)],
+        };
+        let buf = paint_root(desc, 5, 3);
+        for col in 0..5 {
+            assert_eq!(cell_at(&buf, 0, col), "─", "top fill must paint col {col}",);
+            assert_eq!(
+                cell_at(&buf, 2, col),
+                "─",
+                "bottom fill must paint col {col}",
+            );
+        }
+    }
+
+    #[test]
+    fn row_with_only_greedy_children_uses_parent_max_cross() {
+        // Edge case: every child is cross-greedy, so there is no
+        // natural-cross signal. CSS-flexbox default: take the parent's
+        // full cross. Row of 6 cols × 4 rows, two fills, both must
+        // paint all 4 rows.
+        let desc = WidgetDescription::Row {
+            gap: 0,
+            key: None,
+            children: vec![expanded(fill("a", None), 1), expanded(fill("b", None), 1)],
+        };
+        let buf = paint_root(desc, 6, 4);
+        for row in 0..4 {
+            assert_eq!(cell_at(&buf, row, 0), "a", "row {row} col 0");
+            assert_eq!(cell_at(&buf, row, 5), "b", "row {row} col 5");
+        }
+    }
+
+    #[test]
+    fn row_with_no_greedy_children_unchanged_from_phase_2_behavior() {
+        // Regression guard: a row of plain text widgets must still
+        // collapse to the height of the tallest child, not the parent's
+        // max cross. This is the pre-cross-stretch behavior — the new
+        // pass 3 is a no-op when no child is cross-greedy.
+        let desc = WidgetDescription::Row {
+            gap: 0,
+            key: None,
+            children: vec![text("a"), text("bb"), text("ccc")],
+        };
+        let mut rec = Reconciler::new();
+        rec.reconcile(desc);
+        let root = rec.root.as_mut().unwrap();
+        let s = layout(root, Constraints::loose(20, 10));
+        // Sum of widths is 6; cross is 1 (all text is 1-tall). Loose
+        // bounds → row reports its content size, not the parent's max.
+        assert_eq!(
+            s,
+            Size {
+                width: 6,
+                height: 1
+            }
+        );
     }
 
     #[test]
