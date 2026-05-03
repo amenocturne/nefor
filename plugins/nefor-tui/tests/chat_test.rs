@@ -291,22 +291,17 @@ fn slash_new_clears_transcript_and_emits_chat_reset() {
 //
 // These exercise the sidebar that subscribes to `reasoner-graph` plugin
 // lifecycle events (`graph.run_started`, `graph.node_dispatched`,
-// `graph.node_result`, `graph.run_complete`). The panel is hidden by
-// default; Ctrl+B toggles it on. Linger handling is pure-update, so a
+// `graph.node_result`, `graph.run_complete`). The panel is visible by
+// default; Ctrl+B toggles it off. Linger handling is pure-update, so a
 // completed run drops on the next event after `DAG_LINGER_MS` of engine
 // time has passed — `Engine::advance_time` plus a synthetic event drives
 // the prune deterministically without sleeping.
-
-fn toggle_sidebar(engine: &mut Engine) {
-    engine.handle_key(key("ctrl_b")).expect("ctrl_b");
-}
 
 #[test]
 fn graph_run_started_creates_a_dag_panel_row() {
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
-    toggle_sidebar(&mut engine);
 
     dispatch_event(
         &mut engine,
@@ -334,7 +329,6 @@ fn graph_node_dispatched_then_result_updates_status_glyph() {
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
-    toggle_sidebar(&mut engine);
 
     dispatch_event(
         &mut engine,
@@ -393,7 +387,6 @@ fn graph_run_complete_removes_run_after_linger_window() {
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
-    toggle_sidebar(&mut engine);
 
     // Stand up a completed run: started, dispatched, result, complete.
     dispatch_event(

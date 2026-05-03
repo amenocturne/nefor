@@ -201,7 +201,7 @@ local function initial_state()
     in_flight        = nil,
     input_value      = "",
     focused_id       = "input",
-    show_sidebar     = false,
+    show_sidebar     = true,
     popup            = nil,
     stats            = {},
     pending          = false,
@@ -1024,7 +1024,7 @@ local function vertical_separator()
   return tui.constrained {
     min_width = 1,
     max_width = 1,
-    child = tui.text { content = "│", style = STYLE.dag_separator, wrap = "none" },
+    child = tui.fill { char = "│", style = STYLE.dag_separator },
   }
 end
 
