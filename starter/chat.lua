@@ -1381,11 +1381,14 @@ local function view(state)
     },
   }
 
-  -- 1-cell outer padding so the UI doesn't sit flush against the
-  -- terminal edges — gives content breathing room on every side without
-  -- baking the layout decision into the engine.
+  -- 2-cell horizontal padding (legacy spec section 1, "HPAD = 2 columns
+  -- left/right inside the chat pane"). Top/bottom keep 1-cell so the
+  -- vertical breathing room stays modest — uniform 2 there would cost
+  -- two transcript rows on a 24-row terminal. Statusline is wrapped in
+  -- the same padded column for v1; pulling it flush-left needs a
+  -- restructure (separate padding container per child) and is deferred.
   return tui.padding {
-    value = 1,
+    value = { top = 1, right = 2, bottom = 1, left = 2 },
     child = tui.stack {
       children = compact {
         main_column,

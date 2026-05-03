@@ -1829,11 +1829,10 @@ fn statusline_shows_bottom_marker_when_transcript_overflows() {
 
 #[test]
 fn outer_padding_leaves_terminal_edges_blank() {
-    // 1-cell outer padding so the UI doesn't sit flush against terminal
-    // edges. Verify by snapshotting a fresh frame and asserting that
-    // the leftmost column, rightmost column, top row, and bottom row
-    // contain only blanks (spaces) — the padding pushes all painted
-    // content one cell inward.
+    // Outer padding so the UI doesn't sit flush against terminal edges
+    // (legacy spec section 1: HPAD=2 horizontal, 1-cell vertical). The
+    // first two columns and the last two columns are blank; the top and
+    // bottom rows are blank.
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -1844,30 +1843,39 @@ fn outer_padding_leaves_terminal_edges_blank() {
     let top = rows.first().expect("top row");
     assert!(
         top.chars().all(|c| c == ' '),
-        "top row must be blank (1-cell padding): {top:?}"
+        "top row must be blank (1-cell vpad): {top:?}"
     );
     // Bottom row: all spaces.
     let bot = rows.last().expect("bottom row");
     assert!(
         bot.chars().all(|c| c == ' '),
-        "bottom row must be blank (1-cell padding): {bot:?}"
+        "bottom row must be blank (1-cell vpad): {bot:?}"
     );
-    // Left column on every row: space.
+    // Left two columns on every row: spaces (HPAD=2).
     for (i, r) in rows.iter().enumerate() {
-        let first = r.chars().next().unwrap_or(' ');
-        assert_eq!(
-            first, ' ',
-            "left column of row {i} must be blank (1-cell padding): {r:?}"
-        );
+        let mut chars = r.chars();
+        let c0 = chars.next().unwrap_or(' ');
+        let c1 = chars.next().unwrap_or(' ');
+        assert_eq!(c0, ' ', "col 0 of row {i} must be blank: {r:?}");
+        assert_eq!(c1, ' ', "col 1 of row {i} must be blank (HPAD=2): {r:?}");
     }
-    // Right column on every row: space. Walk by chars so multi-byte
-    // glyphs don't confuse the byte-indexed view.
+    // Right two columns on every row: spaces (HPAD=2). Walk by chars so
+    // multi-byte glyphs don't confuse the byte-indexed view.
     for (i, r) in rows.iter().enumerate() {
-        let last = r.chars().last().unwrap_or(' ');
-        assert_eq!(
-            last, ' ',
-            "right column of row {i} must be blank (1-cell padding): {r:?}"
-        );
+        let chars: Vec<char> = r.chars().collect();
+        let n = chars.len();
+        if n >= 2 {
+            assert_eq!(
+                chars[n - 1],
+                ' ',
+                "rightmost col of row {i} must be blank: {r:?}"
+            );
+            assert_eq!(
+                chars[n - 2],
+                ' ',
+                "second-from-right col of row {i} must be blank (HPAD=2): {r:?}"
+            );
+        }
     }
 }
 
