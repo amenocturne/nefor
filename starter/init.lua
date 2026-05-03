@@ -201,6 +201,15 @@ else
   }
 end
 
+-- Resume transforms — registered before any plugin readies so the first
+-- handshake's saved_log replay (when resuming) finds them in place. The
+-- defaults cover nefor-tui (replay structural chat history) + the active
+-- provider (replay chat.create/append/complete to rebuild Chats map).
+-- Every other plugin defaults to drop, which is what the brief asks for.
+-- Project-private plugins can register their own transforms via
+-- `resume.register(name, fn)` after this line.
+resume.register_defaults(PROVIDER_NAME)
+
 -------------------------------------------------------------------------
 -- 4c. Orchestrator setup — single configuration call
 -------------------------------------------------------------------------

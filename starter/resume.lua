@@ -114,4 +114,87 @@ function M._registered_count()
   return n
 end
 
+-- ------------------------------------------------------------------
+-- shipped-plugin defaults
+-- ------------------------------------------------------------------
+--
+-- Per-plugin transforms for the stack `init.lua` ships by default. Kept
+-- in this module rather than scattered across init.lua because:
+--   (1) a Lua test harness can call `register_defaults` and then exercise
+--       each transform against fixtures of past saved-log entries,
+--   (2) init.lua's plugin spawn block stays scannable — one call vs
+--       a dozen inline closures.
+--
+-- Adding a new plugin: register a transform here (or call `register`
+-- directly from init.lua for project-private plugins). The default for
+-- unregistered plugins is to drop everything — that's the safe default
+-- for resume (no surprise replays of in-flight artefacts).
+
+-- nefor-tui transform: replay structural chat history. The chat surface
+-- (`starter/chat.lua`) handles `chat.message.append` and `chat.stream.end`
+-- by appending entries to `state.entries`; replaying those rebuilds the
+-- transcript verbatim. Drop everything else: `chat.stream.delta` (deltas
+-- already merged into the final stream.end text — replaying would
+-- duplicate), `graph.*` (sub-graph state is per-firing, doesn't carry
+-- over), key/mouse events (those came from the user, not the bus), and
+-- popup/toast events (transient UI).
+local TUI_KEPT = {
+  ["chat.message.append"] = true,
+  ["chat.stream.end"]     = true,
+  ["chat.session.stats"]  = true,
+  ["chat.tool.start"]     = true,
+  ["chat.tool.end"]       = true,
+  ["chat.model.set_ack"]  = true,
+  ["chat.auth.status"]    = true,
+}
+
+local function tui_transform(env)
+  if env.type ~= "event" or type(env.body) ~= "table" then return nil end
+  local kind = env.body.kind
+  if type(kind) ~= "string" then return nil end
+  if TUI_KEPT[kind] then return env end
+  return nil
+end
+
+-- openai-provider transform factory (per-instance because the plugin
+-- name is configurable: "ollama", "openai", etc., and the event prefix
+-- mirrors that name). Replay `<name>.chat.create`, `<name>.chat.append`,
+-- `<name>.chat.complete` so the provider rebuilds its `Chats` map. Drop
+-- stream deltas (per-turn artefacts), `<name>.chat.complete.result`
+-- (replaying would re-trigger graph.node_result emissions), errors, and
+-- auth/model events (those re-fire on a fresh boot via the live path).
+local function provider_transform_factory(provider_name)
+  -- Pre-build the kept-prefix lookup once so the per-event hot path is
+  -- a single string equality.
+  local prefix = provider_name .. "."
+  local kept = {
+    [prefix .. "chat.create"]   = true,
+    [prefix .. "chat.append"]   = true,
+    [prefix .. "chat.complete"] = true,
+  }
+  return function(env)
+    if env.type ~= "event" or type(env.body) ~= "table" then return nil end
+    local kind = env.body.kind
+    if type(kind) ~= "string" then return nil end
+    if kept[kind] then return env end
+    return nil
+  end
+end
+
+-- Convenience: register the default transforms for a stack composed of
+-- nefor-tui + an openai-style provider. Other plugins (reasoner-graph,
+-- tool-gate, basic-tools, mock-plugin, generic-*, nefor-combinators)
+-- get no registration → default-drop, which matches the brief.
+function M.register_defaults(provider_name)
+  M.register("nefor-tui", tui_transform)
+  if type(provider_name) == "string" and #provider_name > 0 then
+    M.register(provider_name, provider_transform_factory(provider_name))
+  end
+end
+
+-- Exposed for tests so they can verify factory output without going
+-- through register/transform_for_plugin.
+M._tui_transform = tui_transform
+M._provider_transform_factory = provider_transform_factory
+
 return M
