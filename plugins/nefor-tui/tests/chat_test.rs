@@ -1024,12 +1024,23 @@ fn autocomplete_open_enter_runs_highlighted_command() {
     // open and the user presses Enter, the highlighted match runs — not
     // the partial fragment they actually typed. Type `/mo`, the dropdown
     // shows `/model` (the only command starting with "mo") highlighted;
-    // Enter must dispatch the `/model` action, i.e. emit
-    // `chat.model.list_requested`, not bottom-fall-through to a generic
-    // `chat.command` named "mo".
+    // Enter must dispatch the `/model` action, which fans out one
+    // `chat.model.list_requested` per connected provider (legacy spec
+    // section 8/12) — not bottom-fall-through to a generic `chat.command`
+    // named "mo".
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
+
+    // Seed two connected providers so /model has someone to fan out to.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.auth.status", "provider": "ollama", "status": "connected" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.auth.status", "provider": "anthropic", "status": "connected" }),
+    );
 
     for ch in "/mo".chars() {
         engine.handle_key(key(&ch.to_string())).expect("type");
@@ -1045,15 +1056,22 @@ fn autocomplete_open_enter_runs_highlighted_command() {
     let emits = engine.take_emit_queue();
     assert_eq!(
         emits.len(),
-        1,
-        "Enter on open autocomplete should run highlighted command (one emit)"
+        2,
+        "Enter on open autocomplete with /model highlighted must fan out one list_requested per connected provider"
     );
-    assert_eq!(
-        emits[0].1.get("kind").and_then(|v| v.as_str()),
-        Some("chat.model.list_requested"),
-        "Enter on /mo with /model highlighted must run /model, not the partial: {:?}",
-        emits[0].1
-    );
+    for e in &emits {
+        assert_eq!(
+            e.1.get("kind").and_then(|v| v.as_str()),
+            Some("chat.model.list_requested"),
+            "expected chat.model.list_requested, got {:?}",
+            e.1
+        );
+        assert!(
+            e.1.get("provider").and_then(|v| v.as_str()).is_some(),
+            "fan-out must include `provider` field per legacy spec: {:?}",
+            e.1
+        );
+    }
 }
 
 #[test]
@@ -1065,6 +1083,12 @@ fn autocomplete_open_tab_completes_without_submitting() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
+
+    // Seed a connected provider so /model has fan-out targets.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.auth.status", "provider": "ollama", "status": "connected" }),
+    );
 
     for ch in "/mo".chars() {
         engine.handle_key(key(&ch.to_string())).expect("type");
@@ -1089,7 +1113,7 @@ fn autocomplete_open_tab_completes_without_submitting() {
     assert_eq!(
         emits.len(),
         1,
-        "Tab+backspace+Enter should submit /model: {out:?} -> emits={emits:?}"
+        "Tab+backspace+Enter should submit /model with one connected provider: {out:?} -> emits={emits:?}"
     );
     assert_eq!(
         emits[0].1.get("kind").and_then(|v| v.as_str()),
@@ -1531,4 +1555,207 @@ fn outer_padding_leaves_terminal_edges_blank() {
             "right column of row {i} must be blank (1-cell padding): {r:?}"
         );
     }
+}
+
+#[test]
+fn slash_model_no_args_fans_out_per_connected_provider_and_opens_popup() {
+    // Legacy spec section 8/12: `/model` with no args
+    //   1) emits one `chat.model.list_requested { provider }` per
+    //      connected provider, and
+    //   2) opens the ModelPicker popup with `awaiting` set to those
+    //      provider names.
+    // The transport adapter rejects requests that don't carry a
+    // `provider` field (see starter/agentic_workflow.lua:1301), so the
+    // fan-out shape is load-bearing — a single un-targeted request
+    // would be dropped on the floor.
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Two connected providers + one disconnected.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.auth.status", "provider": "ollama", "status": "connected" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.auth.status", "provider": "anthropic", "status": "connected" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.auth.status", "provider": "openai", "status": "login_required" }),
+    );
+
+    for ch in "/model".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    let _ = engine.take_emit_queue();
+    engine.handle_key(key("enter")).expect("enter");
+
+    let emits = engine.take_emit_queue();
+    assert_eq!(
+        emits.len(),
+        2,
+        "should emit exactly one list_requested per CONNECTED provider (not login_required): {emits:?}"
+    );
+    let mut providers: Vec<String> = emits
+        .iter()
+        .map(|(_, body)| {
+            body.get("provider")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+    providers.sort();
+    assert_eq!(providers, vec!["anthropic", "ollama"]);
+
+    // Popup is now visible.
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("pick a model"),
+        "ModelPicker popup title not visible: {out:?}"
+    );
+    assert!(
+        out.contains("loading from 2 provider"),
+        "ModelPicker should show loading footer for awaiting providers: {out:?}"
+    );
+}
+
+#[test]
+fn chat_models_listed_appends_into_open_picker_and_clears_awaiting() {
+    // After `/model` opens the picker, each provider responds with
+    // `chat.models.listed { provider, models }`. The picker appends the
+    // models, dedups, sorts, and removes the answering provider from
+    // the awaiting set.
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.auth.status", "provider": "ollama", "status": "connected" }),
+    );
+    for ch in "/model".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.models.listed",
+            "provider": "ollama",
+            "models": ["qwen2:7b", "llama3:8b"],
+        }),
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("qwen2:7b") && out.contains("llama3:8b"),
+        "models from ollama should appear in picker: {out:?}"
+    );
+    // Awaiting cleared → loading footer gone.
+    assert!(
+        !out.contains("loading from"),
+        "awaiting set should clear after the only provider responds: {out:?}"
+    );
+}
+
+#[test]
+fn model_picker_enter_emits_chat_model_set_with_provider() {
+    // Up/Down moves the cursor; Enter emits chat.model.set carrying the
+    // selected (provider, model) pair, then closes the popup.
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.auth.status", "provider": "ollama", "status": "connected" }),
+    );
+    for ch in "/model".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.models.listed",
+            "provider": "ollama",
+            "models": ["qwen2:7b", "llama3:8b"],
+        }),
+    );
+    let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+
+    // Enter on default cursor (row 1 = "llama3:8b" alphabetically before qwen2).
+    engine.handle_key(key("enter")).expect("enter");
+    let emits = engine.take_emit_queue();
+    assert_eq!(
+        emits.len(),
+        1,
+        "Enter on picker should emit one chat.model.set: {emits:?}"
+    );
+    assert_eq!(
+        emits[0].1.get("kind").and_then(|v| v.as_str()),
+        Some("chat.model.set")
+    );
+    assert_eq!(
+        emits[0].1.get("provider").and_then(|v| v.as_str()),
+        Some("ollama")
+    );
+    assert_eq!(
+        emits[0].1.get("model").and_then(|v| v.as_str()),
+        Some("llama3:8b"),
+        "default cursor should be on the alphabetically-first model"
+    );
+
+    // Popup closed.
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("pick a model"),
+        "popup should close after Enter: {out:?}"
+    );
+}
+
+#[test]
+fn model_picker_typing_filters_query() {
+    // Printable chars while the picker is open append to the filter
+    // query, narrowing the visible list.
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.auth.status", "provider": "ollama", "status": "connected" }),
+    );
+    for ch in "/model".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    // Render between popup-open and key.q so the text_input instance
+    // syncs to the cleared input_value before the q arrives. Without
+    // this render step the text_input still holds the pre-submit value
+    // and absorbs the q (router routes to it as a printable editing
+    // key) regardless of `focused=false`.
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.models.listed",
+            "provider": "ollama",
+            "models": ["qwen2:7b", "llama3:8b"],
+        }),
+    );
+    let _ = render_str(&mut engine);
+
+    engine.handle_key(key("q")).expect("q");
+    let out = render_str(&mut engine);
+    // Note: `llama3` is a substring of `ollama` (the provider name) too,
+    // so we look for `llama3` specifically as the model-row signature.
+    assert!(
+        out.contains("qwen") && !out.contains("llama3"),
+        "typing 'q' should filter to qwen-only: {out:?}"
+    );
 }

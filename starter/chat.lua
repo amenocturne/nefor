@@ -12,7 +12,7 @@
 --   chat.message.append, chat.stream.delta, chat.stream.end,
 --   chat.stream.reasoning_delta, chat.stream.reasoning_end,
 --   chat.session.stats, chat.tool.start, chat.tool.end,
---   chat.popup, chat.auth.status, chat.model.set_ack,
+--   chat.popup, chat.auth.status, chat.model.set_ack, chat.models.listed,
 --   chat.tool.permission_request, tool-gate.mode_changed,
 --   graph.run_started, graph.node_dispatched, graph.node_result,
 --   graph.run_complete.
@@ -937,6 +937,136 @@ local function popup_tool_permission(state)
   }
 end
 
+-- Filter the model picker's `models` list against the typed query.
+-- Substring match (case-insensitive) against `"<provider> <model>"`.
+-- Stable sort order is preserved by walking the source list in order.
+local function model_picker_filter(models, query)
+  if models == nil then return {} end
+  local q = (query or ""):lower()
+  if q == "" then return models end
+  local out = {}
+  for _, e in ipairs(models) do
+    local s = ((e.provider or "") .. " " .. (e.model or "")):lower()
+    if s:find(q, 1, true) ~= nil then out[#out + 1] = e end
+  end
+  return out
+end
+
+-- Count entries in the awaiting-set table.
+local function awaiting_count(awaiting)
+  if awaiting == nil then return 0 end
+  local n = 0
+  for _, _ in pairs(awaiting) do n = n + 1 end
+  return n
+end
+
+-- Model picker popup (spec section 12). Border is HL_USER. Layout:
+--   ╭── pick a model ──╮
+--   │ search: <query>  │
+--   │ ───────────────  │
+--   │ provider  model  │  ← row, cursor row inverted
+--   │ provider  model  │
+--   │ loading from N   │  ← footer (when awaiting providers)
+--   ╰──────────────────╯
+local function popup_model_picker(state)
+  if not state.popup or state.popup.variant ~= "model_picker" then return nil end
+  local p = state.popup
+  local matches = model_picker_filter(p.models, p.query)
+  local cursor = p.cursor or 1
+  if cursor < 1 then cursor = 1 end
+  if cursor > #matches and #matches > 0 then cursor = #matches end
+  -- Determine widest provider name for column alignment.
+  local prov_w = 0
+  for _, e in ipairs(matches) do
+    if e.provider and #e.provider > prov_w then prov_w = #e.provider end
+  end
+  if prov_w > 20 then prov_w = 20 end
+
+  local body_rows = {}
+  if #matches == 0 then
+    if awaiting_count(p.awaiting) == 0 and (p.models == nil or #p.models == 0) then
+      body_rows[#body_rows + 1] = tui.text {
+        content = "No providers connected.",
+        style   = STYLE.status_dim, wrap = "word",
+      }
+      body_rows[#body_rows + 1] = tui.text {
+        content = "Wire one up in init.lua (see docs/provider-plugins.md).",
+        style   = STYLE.status_dim, wrap = "word",
+      }
+    else
+      body_rows[#body_rows + 1] = tui.text {
+        content = "(no matches)",
+        style   = STYLE.status_dim, wrap = "none",
+      }
+    end
+  else
+    -- Window the visible rows around the cursor so a long list scrolls.
+    local cap = 12
+    local first = 1
+    if #matches > cap then
+      first = math.max(1, math.min(cursor - cap + 1, #matches - cap + 1))
+      if first < 1 then first = 1 end
+    end
+    local last = math.min(first + cap - 1, #matches)
+    for i = first, last do
+      local e = matches[i]
+      local row = string.format("%-" .. prov_w .. "s  %s", e.provider or "?", e.model or "?")
+      local style = (i == cursor)
+        and { fg = "#000000", bg = C.user }
+        or  STYLE.status
+      body_rows[#body_rows + 1] = tui.text {
+        content = row, style = style, wrap = "none",
+      }
+    end
+  end
+
+  local awaiting_n = awaiting_count(p.awaiting)
+  local children = {
+    tui.text {
+      content = "── pick a model ──",
+      style   = STYLE.popup_user,
+      wrap    = "none",
+    },
+    tui.text {
+      content = "search: " .. (p.query or ""),
+      style   = STYLE.status,
+      wrap    = "none",
+    },
+    tui.text {
+      content = string.rep("─", 40),
+      style   = STYLE.footer,
+      wrap    = "none",
+    },
+    tui.column { gap = 0, children = body_rows },
+  }
+  if awaiting_n > 0 then
+    children[#children + 1] = tui.text {
+      content = string.format("loading from %d provider(s)…", awaiting_n),
+      style   = STYLE.status_dim,
+      wrap    = "none",
+    }
+  end
+  children[#children + 1] = tui.text {
+    content = "↑/↓ select · Enter pick · Esc close · type to filter",
+    style   = STYLE.status_dim,
+    wrap    = "none",
+  }
+
+  return tui.anchored {
+    anchor = "center",
+    width  = "60%",
+    height = "60%",
+    child  = bordered_popup(
+      "popup_model_picker",
+      tui.padding {
+        value = 1,
+        child = tui.column { gap = 1, children = children },
+      },
+      STYLE.popup_user
+    ),
+  }
+end
+
 -- Toast: bottom-left, single-line, no border, in HL_STATUS_INFO. Auto-
 -- dismisses on `expires_at_ms` via the per-event prune cycle.
 local function popup_toast(state)
@@ -1163,8 +1293,15 @@ local function view(state)
   -- it in `╭─╮ │ ╰─╯` chrome so the input visually matches user
   -- message blocks. Border colour brightens (HL_USER) when the input
   -- is focused; dims to HL_STATUS_DIM when a popup steals focus.
-  local input_focused = state.focused_id == "input"
-    and not (state.popup and state.popup.variant == "tool_permission")
+  -- The input drops focus while certain popups own the keyboard.
+  -- Tool permission expects single-char A/D; model picker takes
+  -- printable chars as filter input — both paths require input to
+  -- stop swallowing keys.
+  local popup_owns_keys = state.popup and (
+    state.popup.variant == "tool_permission" or
+    state.popup.variant == "model_picker"
+  )
+  local input_focused = state.focused_id == "input" and not popup_owns_keys
   local input_border_style = input_focused
     and STYLE.input_border
     or STYLE.input_border_unfocused
@@ -1220,6 +1357,7 @@ local function view(state)
         main_column,
         popup_help(state),
         popup_message(state),
+        popup_model_picker(state),
         popup_tool_permission(state),
         popup_toast(state),
       },
@@ -1555,15 +1693,52 @@ local function update(msg, state)
       }
     end
     if cmd == "model" then
-      local body
       if args and #args > 0 then
-        body = { kind = "chat.model.set", model = args }
-      else
-        body = { kind = "chat.model.list_requested" }
+        -- `/model <name>` — direct switch on the active provider.
+        -- Active provider = first connected (alphabetical) when no
+        -- explicit selection has been made yet.
+        local provider = nil
+        local connected = {}
+        for n, st in pairs(state.auth or {}) do
+          if st == "connected" then connected[#connected + 1] = n end
+        end
+        table.sort(connected)
+        provider = connected[1]
+        local body = { kind = "chat.model.set", model = args }
+        if provider then body.provider = provider end
+        return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL }), {
+          { kind = "send_to", target = "engine", body = body },
+        }
       end
-      return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL }), {
-        { kind = "send_to", target = "engine", body = body },
-      }
+      -- `/model` (no args) — open the picker and fan out one
+      -- `chat.model.list_requested` per connected provider so the
+      -- popup can aggregate results as they land. Per legacy spec
+      -- section 8 / 12. The adapter rejects requests that don't
+      -- name a provider, so we MUST fan out per-provider here.
+      local connected = {}
+      for n, st in pairs(state.auth or {}) do
+        if st == "connected" then connected[#connected + 1] = n end
+      end
+      table.sort(connected)
+      local awaiting = {}
+      for _, n in ipairs(connected) do awaiting[n] = true end
+      local effects = {}
+      for _, n in ipairs(connected) do
+        effects[#effects + 1] = {
+          kind = "send_to", target = "engine",
+          body = { kind = "chat.model.list_requested", provider = n },
+        }
+      end
+      return shallow_merge(state, {
+        input_value = "", slash = NIL_SENTINEL,
+        popup = {
+          variant  = "model_picker",
+          models   = {},
+          query    = "",
+          cursor   = 1,
+          awaiting = awaiting,
+        },
+      }), effects
     end
     if cmd == "resume" then
       local body = { kind = "chat.resume" }
@@ -1679,6 +1854,70 @@ local function update(msg, state)
     end
   end
 
+  -- Model picker popup keys (legacy spec section 12). Up/Down move the
+  -- cursor through the filtered list; Enter emits chat.model.set for
+  -- the cursor row + closes; Backspace and printable chars edit the
+  -- filter query (re-clamping cursor against the new filtered count).
+  if state.popup and state.popup.variant == "model_picker" then
+    local p = state.popup
+    local filtered = model_picker_filter(p.models, p.query)
+    if kind == "key.up" or kind == "key.down" then
+      if #filtered == 0 then return state, {} end
+      local cur = p.cursor or 1
+      cur = (kind == "key.up") and (cur - 1) or (cur + 1)
+      if cur < 1 then cur = #filtered end
+      if cur > #filtered then cur = 1 end
+      return shallow_merge(state, {
+        popup = shallow_merge(p, { cursor = cur }),
+      }), {}
+    end
+    if kind == "key.enter" then
+      if #filtered == 0 then return state, {} end
+      local sel = filtered[p.cursor or 1] or filtered[1]
+      if not sel then return state, {} end
+      return shallow_merge(state, { popup = NIL_SENTINEL }), {
+        { kind = "send_to", target = "engine",
+          body = {
+            kind     = "chat.model.set",
+            provider = sel.provider,
+            model    = sel.model,
+          } },
+      }
+    end
+    if kind == "key.backspace" then
+      local q = p.query or ""
+      if #q > 0 then q = q:sub(1, #q - 1) end
+      return shallow_merge(state, {
+        popup = shallow_merge(p, { query = q, cursor = 1 }),
+      }), {}
+    end
+    -- Printable single-char filter input. The engine surfaces these as
+    -- `key.<ch>` events when the input field has dropped focus (which
+    -- it has — see `popup_owns_keys` above). `key.space` is a special
+    -- name we have to map back to a literal space.
+    if kind == "key.space" then
+      return shallow_merge(state, {
+        popup = shallow_merge(p, {
+          query  = (p.query or "") .. " ",
+          cursor = 1,
+        }),
+      }), {}
+    end
+    if kind:sub(1, 4) == "key." and #kind == 5 then
+      local ch = kind:sub(5, 5)
+      -- Filter pure printable ASCII characters into the query.
+      local b = string.byte(ch)
+      if b and b >= 33 and b <= 126 then
+        return shallow_merge(state, {
+          popup = shallow_merge(p, {
+            query  = (p.query or "") .. ch,
+            cursor = 1,
+          }),
+        }), {}
+      end
+    end
+  end
+
   -- Slash autocomplete keys (when slash popup open).
   if state.slash then
     if kind == "key.up" then
@@ -1722,6 +1961,7 @@ local function update(msg, state)
       if v == "help" then return "popup_help" end
       if v == "info" or v == "warning" or v == "error" then return "popup_message" end
       if v == "tool_permission" then return "popup_tool_permission" end
+      if v == "model_picker" then return "popup_model_picker" end
     end
     return nil
   end
@@ -1875,6 +2115,48 @@ local function update(msg, state)
     return shallow_merge(state, {
       model = msg.model or state.model,
       max_tokens = model_max_tokens(msg.model) or state.max_tokens,
+    }), {}
+  end
+
+  if kind == "chat.models.listed" then
+    -- A provider answered the list-request. Append into the open
+    -- model_picker popup if one is up; otherwise drop (legacy spec).
+    if not (state.popup and state.popup.variant == "model_picker") then
+      return state, {}
+    end
+    local provider = msg.provider or ""
+    local list = msg.models or {}
+    local prev = state.popup.models or {}
+    -- Append new (provider, model) pairs, dedup, then sort.
+    local seen = {}
+    for _, e in ipairs(prev) do
+      seen[(e.provider or "") .. "\0" .. (e.model or "")] = true
+    end
+    local merged = {}
+    for _, e in ipairs(prev) do merged[#merged + 1] = e end
+    if type(list) == "table" then
+      for _, m in ipairs(list) do
+        local key = provider .. "\0" .. tostring(m)
+        if not seen[key] then
+          merged[#merged + 1] = { provider = provider, model = tostring(m) }
+          seen[key] = true
+        end
+      end
+    end
+    table.sort(merged, function(a, b)
+      if a.provider == b.provider then return a.model < b.model end
+      return a.provider < b.provider
+    end)
+    -- Drop the answering provider from the awaiting set.
+    local prev_awaiting = state.popup.awaiting or {}
+    local new_awaiting = {}
+    for k, v in pairs(prev_awaiting) do new_awaiting[k] = v end
+    new_awaiting[provider] = nil
+    return shallow_merge(state, {
+      popup = shallow_merge(state.popup, {
+        models   = merged,
+        awaiting = new_awaiting,
+      }),
     }), {}
   end
 
