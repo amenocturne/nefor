@@ -18,9 +18,34 @@ pub struct KeyMessage {
 }
 
 impl KeyMessage {
-    /// Build the kind string Lua will see (`"key.<name>"`).
+    /// Build the kind string Lua will see. Modifier-prefixed keys fold
+    /// the modifier into the kind so user code can dispatch on a single
+    /// stable string:
+    ///
+    /// - `"a"`         → `"key.a"`
+    /// - `Ctrl+B`      → `"key.ctrl_b"`
+    /// - `Alt+Right`   → `"key.alt_right"`
+    /// - `Shift+Tab`   → `"key.shift_tab"`
+    ///
+    /// `mods` is also published on the table as a list, so handlers that
+    /// want to dispatch generically (`key.<name>` + inspect `msg.mods`)
+    /// can still do so. Plain printable + shift uppercases the name in
+    /// `key_code_name` already, so we drop the `shift_` prefix when the
+    /// only modifier is shift on a single printable to keep the existing
+    /// `key.A` shape for typed capitals.
     pub fn kind(&self) -> String {
-        format!("key.{}", self.name)
+        let only_shift_on_printable = self.mods == ["shift"]
+            && self.name.chars().count() == 1
+            && self.name.chars().next().is_some_and(|c| !c.is_control());
+        if only_shift_on_printable {
+            return format!("key.{}", self.name);
+        }
+        let mut prefix = String::new();
+        for m in &self.mods {
+            prefix.push_str(m);
+            prefix.push('_');
+        }
+        format!("key.{}{}", prefix, self.name)
     }
 }
 
@@ -185,5 +210,44 @@ mod tests {
             let m = from_key_event(&press(code, KeyModifiers::NONE)).expect("p");
             assert_eq!(m.name, expected, "{code:?}");
         }
+    }
+
+    #[test]
+    fn ctrl_prefixed_kind_folds_modifier_into_name() {
+        let m = from_key_event(&press(KeyCode::Char('b'), KeyModifiers::CONTROL)).expect("p");
+        assert_eq!(m.name, "b");
+        assert_eq!(m.mods, vec!["ctrl"]);
+        assert_eq!(m.kind(), "key.ctrl_b");
+    }
+
+    #[test]
+    fn alt_named_key_kind_folds_modifier() {
+        let m = from_key_event(&press(KeyCode::Right, KeyModifiers::ALT)).expect("p");
+        assert_eq!(m.kind(), "key.alt_right");
+    }
+
+    #[test]
+    fn shift_on_printable_keeps_uppercased_name_only() {
+        // Existing convention: key.A already encodes shift via the
+        // capital. Don't double-prefix.
+        let m = from_key_event(&press(KeyCode::Char('a'), KeyModifiers::SHIFT)).expect("p");
+        assert_eq!(m.kind(), "key.A");
+    }
+
+    #[test]
+    fn shift_on_named_key_does_fold() {
+        // Shift+Tab is a real distinct keypress (backtab); fold it.
+        let m = from_key_event(&press(KeyCode::Tab, KeyModifiers::SHIFT)).expect("p");
+        assert_eq!(m.kind(), "key.shift_tab");
+    }
+
+    #[test]
+    fn ctrl_alt_combo_orders_modifiers_stably() {
+        let m = from_key_event(&press(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ))
+        .expect("p");
+        assert_eq!(m.kind(), "key.ctrl_alt_x");
     }
 }
