@@ -266,14 +266,23 @@ end
 -- Full-width rounded-corner box around an arbitrary child:
 --   ╭──────────…──────╮
 --   │ <child>         │
+--   │ <child row 2>   │
 --   ╰──────────…──────╯
 --
 -- Built from primitives — corners are `tui.text`, the rules are
 -- `tui.expanded { child = tui.fill { char = "─" } }`, the side bars
--- frame the child via a `tui.row`. Each rule row is wrapped in
--- `constrained { max_height = 1 }` so the fill doesn't bloat past 1
--- row tall (greedy `tui.fill` claims the parent's full max_height by
--- default — see plugins/nefor-tui/src/layout.rs `layout_fill`).
+-- are `tui.fill { char = "│" }` constrained to 1 column wide. The
+-- side-bar fills inherit cross-axis stretch from the body row (CSS
+-- `align-items: stretch` default in the `row`/`column` layout): if the
+-- body is 4 rows tall, the side bars stretch to 4 rows automatically.
+-- Without that stretch, a `tui.text { content = "│" }` side bar would
+-- only paint row 0 and leave rows 1+ unbordered — the canonical
+-- "popup with a missing border" bug.
+--
+-- Each rule row is still wrapped in `constrained { max_height = 1 }`
+-- as defence-in-depth: the corner glyphs are 1-row tall so the row's
+-- natural cross resolves to 1 anyway, but the explicit cap makes the
+-- intent obvious in the source.
 ------------------------------------------------------------------------
 
 local function rule_row(left_corner, right_corner, style)
@@ -291,15 +300,24 @@ local function rule_row(left_corner, right_corner, style)
 end
 
 -- Bordered box around `child`. `border_style` colors the corners,
--- rules, and side bars. `body_style` colours the side-bar `│ ` /
--- ` │` chrome only — the child's own styling stands.
+-- rules, and side bars.
 local function bordered_box(child, border_style)
+  local side_bar = tui.constrained {
+    max_width = 1,
+    child = tui.fill { char = "│", style = border_style },
+  }
   local body_row = tui.row {
     gap = 0,
     children = {
-      tui.text { content = "│ ", style = border_style, wrap = "none" },
-      tui.expanded { child = child },
-      tui.text { content = " │", style = border_style, wrap = "none" },
+      side_bar,
+      -- Inset the body 1 col on each side so it doesn't touch the
+      -- side bars. `tui.padding` reports `(child + h_pad, child)` so
+      -- the body row's natural cross stays = the child's height; the
+      -- side-bar fills then stretch to that height.
+      tui.expanded {
+        child = tui.padding { left = 1, right = 1, top = 0, bottom = 0, child = child },
+      },
+      side_bar,
     },
   }
   return tui.column {
