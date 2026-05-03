@@ -1092,23 +1092,34 @@ local function view(state)
     "input-field"
   )
 
+  -- Layout (top → bottom): transcript | slash autocomplete (when open) |
+  -- input row | statusline. Statusline lives BELOW the input per legacy
+  -- spec — pushing it above the input visibly inverts the screen weight,
+  -- making the input feel like a status row rather than the primary
+  -- focus surface.
   local main_column = tui.column {
     gap = 0,
     children = compact {
       tui.expanded { child = body_row },
       slash_autocomplete_inline(state),
-      statusline(state),
       input_field,
+      statusline(state),
     },
   }
 
-  return tui.stack {
-    children = compact {
-      main_column,
-      popup_help(state),
-      popup_message(state),
-      popup_tool_permission(state),
-      popup_toast(state),
+  -- 1-cell outer padding so the UI doesn't sit flush against the
+  -- terminal edges — gives content breathing room on every side without
+  -- baking the layout decision into the engine.
+  return tui.padding {
+    value = 1,
+    child = tui.stack {
+      children = compact {
+        main_column,
+        popup_help(state),
+        popup_message(state),
+        popup_tool_permission(state),
+        popup_toast(state),
+      },
     },
   }
 end

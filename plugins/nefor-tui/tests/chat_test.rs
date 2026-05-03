@@ -942,3 +942,79 @@ fn popup_open_routes_pgdn_to_popup_not_transcript() {
         "popup_help scroll offset stayed at 0 after PgDn — scroll key didn't reach the popup"
     );
 }
+
+#[test]
+fn statusline_renders_below_input_row() {
+    // Per legacy spec, the statusline sits BELOW the input box. Verify
+    // by rendering and walking rows: the input box's bottom-right
+    // corner `╯` lies above the statusline, not below it.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    // Send a stats event so the statusline has identifiable text.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.session.stats", "model": "claude-test" }),
+    );
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    let rows: Vec<&str> = snap.lines().collect();
+
+    // Find the LAST `╯` (input box's bottom-right corner) and the
+    // statusline (row containing the model name `test`).
+    let last_corner_row = rows
+        .iter()
+        .rposition(|r| r.contains('╯'))
+        .expect("input bottom-right corner");
+    let statusline_row = rows
+        .iter()
+        .rposition(|r| r.contains("test"))
+        .expect("statusline with model name");
+    assert!(
+        statusline_row > last_corner_row,
+        "statusline (row {statusline_row}) must be BELOW input box bottom (row {last_corner_row}):\n{snap}"
+    );
+}
+
+#[test]
+fn outer_padding_leaves_terminal_edges_blank() {
+    // 1-cell outer padding so the UI doesn't sit flush against terminal
+    // edges. Verify by snapshotting a fresh frame and asserting that
+    // the leftmost column, rightmost column, top row, and bottom row
+    // contain only blanks (spaces) — the padding pushes all painted
+    // content one cell inward.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    let rows: Vec<&str> = snap.lines().collect();
+
+    // Top row: all spaces.
+    let top = rows.first().expect("top row");
+    assert!(
+        top.chars().all(|c| c == ' '),
+        "top row must be blank (1-cell padding): {top:?}"
+    );
+    // Bottom row: all spaces.
+    let bot = rows.last().expect("bottom row");
+    assert!(
+        bot.chars().all(|c| c == ' '),
+        "bottom row must be blank (1-cell padding): {bot:?}"
+    );
+    // Left column on every row: space.
+    for (i, r) in rows.iter().enumerate() {
+        let first = r.chars().next().unwrap_or(' ');
+        assert_eq!(
+            first, ' ',
+            "left column of row {i} must be blank (1-cell padding): {r:?}"
+        );
+    }
+    // Right column on every row: space. Walk by chars so multi-byte
+    // glyphs don't confuse the byte-indexed view.
+    for (i, r) in rows.iter().enumerate() {
+        let last = r.chars().last().unwrap_or(' ');
+        assert_eq!(
+            last, ' ',
+            "right column of row {i} must be blank (1-cell padding): {r:?}"
+        );
+    }
+}
