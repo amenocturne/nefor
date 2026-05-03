@@ -41,7 +41,63 @@ package.path = table.concat({
 -------------------------------------------------------------------------
 -- 2. Optional parent session id (resume a prior run)
 -------------------------------------------------------------------------
+--
+-- Manual resume: uncomment + fill a session UUID to force a one-shot
+-- resume of a specific past run. The engine reads
+-- `~/Library/Application Support/nefor/sessions/<id>.jsonl`, hydrates
+-- saved_log, and calls every step invocation with it.
+--
 -- nefor.parent_session = "00000000-0000-0000-0000-000000000000"
+--
+-- Auto-resume via sidechannel: when chat.lua's `/resume` picker selects
+-- a session, it writes the chosen id to the resume_target file below
+-- and calls `nefor.engine.exit(0)`. The user re-launches; this block
+-- reads the file, sets parent_session, deletes the file (so the *next*
+-- boot starts fresh), and flips `resume.is_active()` so ncp.lua routes
+-- saved_log entries through per-plugin transforms registered below.
+--
+-- Why a sidechannel + relaunch instead of in-place resume: rebuilding
+-- every plugin's state from saved_log requires shutting them down first
+-- (a provider mid-stream can't be told "you have a different chat now").
+-- Re-execve of the engine binary is the cleanest reset; sidechannel is
+-- the smallest surface that survives the process boundary.
+
+local resume = require("resume")
+
+local function read_resume_target()
+  -- macOS XDG-equivalent path. The engine session writer uses this same
+  -- root via dirs::data_dir(). Linux/Windows users would need to adjust;
+  -- v1 ships the macOS path because that's the developer's host.
+  local home = os.getenv("HOME") or ""
+  if home == "" then return nil end
+  local path = home .. "/Library/Application Support/nefor/resume_target"
+  local fh = io.open(path, "r")
+  if fh == nil then return nil, path end
+  local content = fh:read("*a") or ""
+  fh:close()
+  -- Trim whitespace including trailing newline.
+  content = content:gsub("^%s+", ""):gsub("%s+$", "")
+  if #content == 0 then return nil, path end
+  -- Defence-in-depth: refuse anything that doesn't look like a UUID. A
+  -- garbled file shouldn't blow up boot.
+  if not content:match("^[%w%-]+$") then return nil, path end
+  return content, path
+end
+
+do
+  local target_id, target_path = read_resume_target()
+  if target_id ~= nil then
+    nefor.parent_session = target_id
+    resume.set_active(true)
+    -- Best-effort delete so the next fresh boot doesn't auto-resume.
+    -- Failure here is non-fatal — the only consequence is the next boot
+    -- also resumes the same session, which is at worst confusing.
+    if target_path ~= nil then
+      os.remove(target_path)
+    end
+  end
+end
+
 
 -------------------------------------------------------------------------
 -- 3. Step function
@@ -56,14 +112,11 @@ end
 -- 4. Plugin composition
 -------------------------------------------------------------------------
 
-local cc_adapter       = require("mock_plugin_adapter")
 local agentic_workflow = require("agentic_workflow")
 
 -- Plugin cwd is <plugin_root>/<name>/ (engine policy).
 local PROJECT_ROOT = STARTER_ROOT:match("^(.*)/[^/]+$") or "."
 local function bin(name) return PROJECT_ROOT .. "/target/debug/" .. name end
-
-local _ = cc_adapter  -- keep require warm; mock-plugin backend is opt-in
 
 -------------------------------------------------------------------------
 -- 4a. Spawn order
