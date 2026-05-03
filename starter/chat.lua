@@ -915,8 +915,7 @@ end
 
 local function fmt_elapsed_ms(ms)
   if ms == nil then return "" end
-  if ms < 1000 then return tostring(ms) .. "ms" end
-  return string.format("%.1fs", ms / 1000)
+  return string.format("%ds", math.floor(ms / 1000))
 end
 
 local function prune_dag_runs(dag_runs, now_ms)
