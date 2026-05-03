@@ -774,7 +774,8 @@ local function popup_message(state)
     anchor = "center",
     width  = "60%",
     height = "50%",
-    child  = bordered_box(
+    child  = bordered_popup(
+      "popup_message",
       tui.padding {
         value = 1,
         child = tui.column {
@@ -803,7 +804,8 @@ local function popup_tool_permission(state)
     anchor = "center",
     width  = "60%",
     height = "50%",
-    child  = bordered_box(
+    child  = bordered_popup(
+      "popup_tool_permission",
       tui.padding {
         value = 1,
         child = tui.column {
