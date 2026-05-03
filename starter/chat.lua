@@ -722,6 +722,7 @@ local HELP_BODY = [[Keys:
   PgUp / PgDn  scroll transcript
   Home / End   jump to top / bottom
   Ctrl+C       quit
+  Ctrl+D       quit
 
 Slash commands:
   /new /clear  new chat (clears transcript)
@@ -1458,7 +1459,9 @@ local function update(msg, state)
   end
 
   -- ── keyboard shortcuts ──────────────────────────────────────────────
-  if kind == "key.ctrl_c" then
+  -- Ctrl+C and Ctrl+D both exit. Raw-mode terminals deliver these as
+  -- key events (not signals), so the app must terminate explicitly.
+  if kind == "key.ctrl_c" or kind == "key.ctrl_d" then
     return state, { { kind = "exit" } }
   end
 

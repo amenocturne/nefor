@@ -7,9 +7,14 @@
 //!   Subsequent focused inputs are user error: a `tracing::warn!` fires.
 //! - On each key event, the router asks: is this an editing key (printable
 //!   char, backspace, delete, arrows, home/end, enter w/o shift, ctrl+a,
-//!   ctrl+c, ctrl+v, ctrl+z, ctrl+y, shift+enter when multi-line)?
+//!   ctrl+v, ctrl+z, ctrl+y, shift+enter when multi-line)?
 //!   If yes AND a focused text_input exists → route to it; otherwise
 //!   bubble to Lua's `update` as a `key.<name>` message.
+//!
+//! Ctrl+C bubbles unconditionally — universally "exit/cancel" in raw-mode
+//! terminals. The desktop "Ctrl+C = copy" convention does not apply here
+//! (no system-clipboard integration in v1, and a text_input that swallows
+//! Ctrl+C strands the user with no way out of the app).
 //!
 //! Modifier-prefixed keys (Ctrl+B, Esc, Tab, F-keys, PgUp/PgDn) and
 //! release/repeat events ALWAYS bubble — even when a text_input is
@@ -130,7 +135,9 @@ pub fn is_editing_key(key: &KeyMessage, max_lines: u16) -> bool {
                 true
             }
         }
-        "a" | "c" | "v" | "z" | "y" if has_ctrl && !has_alt && !has_super => true,
+        // Ctrl+C bubbles to Lua as the universal "exit/cancel" gesture
+        // for terminal apps; absorbing it here would strand the user.
+        "a" | "v" | "z" | "y" if has_ctrl && !has_alt && !has_super => true,
         "space" => solo_modifier,
         // Single-char printable: route as text input. Names from
         // `from_key_event` are e.g. "a", "A", "1", "?". Excludes named
@@ -183,12 +190,6 @@ pub fn apply_editing_key(
             }
         }
         "a" if has_ctrl => state.select_all(),
-        "c" if has_ctrl => {
-            // Copy: no system clipboard in v1; treat as no-op. Bracketed
-            // paste lands in v1 via terminal sequences; the OS-level
-            // copy belongs in a later phase.
-            EditOutcome::default()
-        }
         "v" if has_ctrl => {
             // Paste: same shape — terminal-driven bracketed paste lives
             // outside the editing-key path. v1 no-op.
@@ -332,10 +333,29 @@ mod tests {
     #[test]
     fn editing_key_classifier_handles_ctrl_editing_subset() {
         assert!(is_editing_key(&key("a", vec!["ctrl"]), 1));
-        assert!(is_editing_key(&key("c", vec!["ctrl"]), 1));
         assert!(is_editing_key(&key("v", vec!["ctrl"]), 1));
         assert!(is_editing_key(&key("z", vec!["ctrl"]), 1));
         assert!(is_editing_key(&key("y", vec!["ctrl"]), 1));
+    }
+
+    #[test]
+    fn editing_key_classifier_lets_ctrl_c_bubble() {
+        // Ctrl+C is the universal "exit/cancel" in raw-mode terminals;
+        // text_input must not absorb it.
+        assert!(!is_editing_key(&key("c", vec!["ctrl"]), 1));
+        assert!(!is_editing_key(&key("c", vec!["ctrl"]), 6));
+    }
+
+    #[test]
+    fn focused_text_input_bubbles_ctrl_c_to_lua() {
+        let mut r = build(ti("input", true, "hi"));
+        let root = r.root.as_mut().unwrap();
+        let decision = route_key(root, &key("c", vec!["ctrl"]));
+        assert_eq!(
+            decision,
+            RouteDecision::BubbleToLua,
+            "Ctrl+C must bubble even when a text_input is focused"
+        );
     }
 
     #[test]

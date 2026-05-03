@@ -183,6 +183,49 @@ fn slash_quit_requests_exit() {
 }
 
 #[test]
+fn ctrl_c_exits_even_when_input_is_focused() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Type some text so the focused input is non-empty — the realistic
+    // case where the user is mid-message and wants out.
+    engine.handle_key(key("h")).expect("h");
+    engine.handle_key(key("i")).expect("hi");
+
+    // Send the realistic Ctrl+C shape (name="c", mods=["ctrl"]) — what
+    // crossterm produces. Pre-fix the router absorbed this as no-op
+    // copy; post-fix it bubbles to Lua as `key.ctrl_c`.
+    engine
+        .handle_key(KeyMessage {
+            name: "c".into(),
+            mods: vec!["ctrl"],
+        })
+        .expect("ctrl+c");
+    assert!(
+        engine.exit_requested(),
+        "Ctrl+C must exit even with a focused text_input",
+    );
+}
+
+#[test]
+fn ctrl_d_exits() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Ctrl+D bubbles unconditionally (the editing-key classifier never
+    // claimed it). Verify the chat surface wires it to exit.
+    engine
+        .handle_key(KeyMessage {
+            name: "d".into(),
+            mods: vec!["ctrl"],
+        })
+        .expect("ctrl+d");
+    assert!(engine.exit_requested(), "Ctrl+D must exit");
+}
+
+#[test]
 fn slash_new_clears_transcript_and_emits_chat_reset() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
