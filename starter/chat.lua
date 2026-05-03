@@ -1082,7 +1082,10 @@ local function view(state)
       on_submit = "input.submit",
       min_lines = 1,
       max_lines = 6,
-      placeholder = "type a message — Enter to send, /help for keys, /quit to exit",
+      -- No placeholder text: the bordered input below the transcript is
+      -- self-explanatory, and a default hint just adds visual noise the
+      -- user has to read past on every render. Slash-commands are
+      -- discoverable via `/` autocomplete; help via `/help`.
     },
     input_border_style,
     -- Stable user-key on the bordered_box's outer column so the

@@ -57,15 +57,44 @@ fn chat_lua_loads_and_renders_initial_frame() {
         out.contains("Start chatting to see stats"),
         "pre-stats placeholder missing: {out:?}"
     );
-    // Cursor inversion at row start splits the placeholder's first
-    // character from the rest, so match a substring that's contiguous
-    // after the cursor cell.
-    assert!(
-        out.contains("ype a message"),
-        "input placeholder missing: {out:?}"
-    );
+    // The input field should NOT carry a default hint — the bordered
+    // box below the transcript is self-explanatory. Substrings from the
+    // legacy hint must be absent.
+    for needle in ["type a message", "ype a message", "/help for keys"] {
+        assert!(
+            !out.contains(needle),
+            "input placeholder should be empty, found {needle:?} in: {out:?}"
+        );
+    }
     // Drain — the script doesn't emit anything at boot.
     assert!(engine.take_emit_queue().is_empty());
+}
+
+#[test]
+fn input_field_has_no_default_placeholder() {
+    // Belt-and-braces: even if the broader frame test above were edited
+    // for unrelated reasons, this one specifically pins the contract
+    // that `chat.lua` does not configure a `placeholder` on the input.
+    // The text_input renders the placeholder dimmed inside the bordered
+    // box; once removed, the box's first interior row is empty (modulo
+    // the cursor cell at column 0).
+    let src = chat_lua_source();
+    assert!(
+        !src.contains("placeholder ="),
+        "starter/chat.lua should not set a placeholder on the input"
+    );
+
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&src).expect("load");
+    let out = render_str(&mut engine);
+    // Sanity: the bordered box still renders (corners present), just
+    // without any hint text.
+    for corner in ['╭', '╮', '╰', '╯'] {
+        assert!(
+            out.contains(corner),
+            "input border missing corner {corner:?}: {out:?}"
+        );
+    }
 }
 
 #[test]
