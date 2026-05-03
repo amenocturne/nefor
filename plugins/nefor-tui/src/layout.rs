@@ -915,15 +915,26 @@ fn layout_text_input(inst: &mut WidgetInstance, c: Constraints) -> Size {
     // Width: prefer parent's max so wrapping/scroll can use the full
     // budget. Sync state's `last_value` here so the paint pass and the
     // input router both see the latest.
+    let viewport_w = c.max_width;
     if let InstanceState::TextInput(st) = &mut inst.state {
         let focused = matches!(
             &inst.last_desc,
             WidgetDescription::TextInput { focused, .. } if *focused
         );
         st.sync_with_desc(&value, focused);
+        st.viewport_width = viewport_w;
+        // For single-line inputs, keep `scroll_x` glued to the cursor.
+        // For multi-line inputs `scroll_x` is unused (soft-wrap covers
+        // overflow) — clear it so a value rewrite doesn't strand a
+        // stale offset.
+        if max_lines == 1 {
+            sync_single_line_scroll_x(st, viewport_w);
+        } else {
+            st.scroll_x = 0;
+        }
     }
 
-    let visible_lines = visible_line_count(&value, min_lines, max_lines);
+    let visible_lines = visible_line_count(&value, min_lines, max_lines, viewport_w);
     let raw = Size {
         width: c.max_width,
         height: visible_lines.min(c.max_height),
@@ -932,24 +943,68 @@ fn layout_text_input(inst: &mut WidgetInstance, c: Constraints) -> Size {
 }
 
 /// Number of rows the input wants to occupy. Bounded by `[min_lines,
-/// max_lines]`. Currently counts only hard newlines; soft-wrap lands
-/// in phase 5a alongside `scrollable` proper.
-fn visible_line_count(value: &str, min_lines: u16, max_lines: u16) -> u16 {
-    let actual = value.split('\n').count() as u32;
+/// max_lines]`. Multi-line inputs (`max_lines > 1`) soft-wrap to the
+/// viewport so a long buffer grows vertically up to the cap;
+/// single-line inputs (`max_lines == 1`) always claim one row and rely
+/// on horizontal scrolling for overflow.
+fn visible_line_count(value: &str, min_lines: u16, max_lines: u16, viewport_w: u16) -> u16 {
+    if max_lines <= 1 {
+        return min_lines.max(1);
+    }
+    if viewport_w == 0 {
+        return min_lines;
+    }
+    let actual = crate::text_input::soft_wrapped_line_count(value, viewport_w) as u32;
     actual
         .clamp(min_lines as u32, max_lines as u32)
         .min(u16::MAX as u32) as u16
 }
 
+/// Single-line cursor-tracking scroll: bump `scroll_x` so the cursor
+/// stays inside `[scroll_x, scroll_x + viewport_w)`. Called once per
+/// layout — viewport width is known here, so this is the natural seam
+/// for the "input disappears off-screen" fix.
+fn sync_single_line_scroll_x(st: &mut crate::text_input::TextInputState, viewport_w: u16) {
+    if viewport_w == 0 {
+        return;
+    }
+    // Width of the value up to the cursor — that's the cursor's logical
+    // column on a single-line input.
+    let prefix = &st.last_value[..st.cursor.min(st.last_value.len())];
+    let cursor_col: usize = prefix.chars().map(unicode_col_width).sum();
+    let scroll_x = st.scroll_x as usize;
+    let viewport = viewport_w as usize;
+    let new_scroll = if cursor_col < scroll_x {
+        cursor_col as u16
+    } else if cursor_col >= scroll_x + viewport {
+        // Keep the cursor on the rightmost cell.
+        (cursor_col + 1).saturating_sub(viewport) as u16
+    } else {
+        st.scroll_x
+    };
+    st.scroll_x = new_scroll;
+}
+
+fn unicode_col_width(c: char) -> usize {
+    UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
 fn paint_text_input(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
-    let (value, focused, placeholder, style) = match &inst.last_desc {
+    let (value, focused, placeholder, style, max_lines) = match &inst.last_desc {
         WidgetDescription::TextInput {
             value,
             focused,
             placeholder,
             style,
+            max_lines,
             ..
-        } => (value.as_str(), *focused, placeholder.clone(), *style),
+        } => (
+            value.as_str(),
+            *focused,
+            placeholder.clone(),
+            *style,
+            *max_lines,
+        ),
         _ => return,
     };
     let st = match &inst.state {
@@ -958,10 +1013,47 @@ fn paint_text_input(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer
     };
     let style = style.unwrap_or_default();
 
-    let lines: Vec<&str> = if value.is_empty() && placeholder.is_some() {
-        // We render the placeholder run instead; cursor still draws
-        // at column 0 so a focused empty input shows where typing
-        // will land.
+    let body_style = body_style_for(&style);
+    let placeholder_style = placeholder_style_for(&style);
+    let is_placeholder_run = value.is_empty() && placeholder.is_some();
+
+    if max_lines > 1 {
+        // Soft-wrap: paint each wrapped row.
+        let display_value: &str = if is_placeholder_run {
+            placeholder.as_deref().unwrap_or_default()
+        } else {
+            value
+        };
+        let rows = crate::text_input::wrap_value(display_value, rect.width);
+        let scroll_y = st.scroll_y as usize;
+        for r in 0..rect.height as usize {
+            let row_y = rect.row.saturating_add(r as u16);
+            let row_idx = scroll_y + r;
+            let row = rows.get(row_idx);
+            let slice = match row {
+                Some(rw) => {
+                    let lo = rw.start_byte.min(display_value.len());
+                    let hi = rw.end_byte.min(display_value.len());
+                    &display_value[lo..hi]
+                }
+                None => "",
+            };
+            let safe = enforce_width_contract(slice, rect.width);
+            let run_style = if is_placeholder_run {
+                placeholder_style
+            } else {
+                body_style
+            };
+            write_run(out, row_y, rect.col, &safe, &run_style);
+        }
+        if focused && !is_placeholder_run {
+            paint_cursor_wrapped(rect, out, st, value, &rows, &style);
+        }
+        return;
+    }
+
+    // Single-line: horizontal scroll model unchanged.
+    let lines: Vec<&str> = if is_placeholder_run {
         vec![placeholder.as_deref().unwrap_or_default()]
     } else if value.is_empty() {
         vec![""]
@@ -971,9 +1063,6 @@ fn paint_text_input(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer
 
     let scroll_y = st.scroll_y as usize;
     let scroll_x = st.scroll_x as usize;
-    let body_style = body_style_for(&style);
-    let placeholder_style = placeholder_style_for(&style);
-    let is_placeholder_run = value.is_empty() && placeholder.is_some();
 
     for r in 0..rect.height as usize {
         let row = rect.row.saturating_add(r as u16);
@@ -996,6 +1085,47 @@ fn paint_text_input(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer
     if focused {
         paint_cursor(rect, out, st, value, &style);
     }
+}
+
+/// Cursor painter for soft-wrapped multi-line text_input. Maps the
+/// byte cursor through the wrapped layout to a `(visual_row, col)`
+/// pair, then draws a reverse-video cell at that position (clipped to
+/// the viewport).
+fn paint_cursor_wrapped(
+    rect: Rect,
+    out: &mut FrameBuffer,
+    st: &crate::text_input::TextInputState,
+    value: &str,
+    rows: &[crate::text_input::WrappedRow],
+    style: &TextInputStyle,
+) {
+    let (visual_row, col) = crate::text_input::cursor_in_wrap_for(value, rows, st.cursor);
+    let scroll_y = st.scroll_y as usize;
+    if visual_row < scroll_y {
+        return;
+    }
+    let row_within = visual_row - scroll_y;
+    if row_within >= rect.height as usize {
+        return;
+    }
+    if col >= rect.width as usize {
+        return;
+    }
+    let row_idx = (rect.row as usize).saturating_add(row_within);
+    let col_idx = (rect.col as usize).saturating_add(col);
+    if row_idx >= out.lines.len() {
+        return;
+    }
+    let line = &mut out.lines[row_idx];
+    if col_idx >= line.cells.len() {
+        return;
+    }
+    let mut cell = line.cells[col_idx].clone();
+    cell.style.reverse = true;
+    if let Some(c) = style.cursor {
+        cell.style.bg = Some(c);
+    }
+    line.cells[col_idx] = cell;
 }
 
 fn paint_cursor(
