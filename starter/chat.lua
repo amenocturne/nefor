@@ -1,253 +1,458 @@
 -- starter/chat.lua — chat surface as a Lua composition over tui.* primitives.
 --
--- Phase 6 of the nefor-tui rewrite (see specs/nefor-tui-declarative-spec.md).
--- The previous architecture had two Rust plugins for the chat surface
--- (`nefor-chat` owning chat-state, `nefor-tui` owning grid rendering, talking
--- via a grid protocol). This file replaces both in ~one screenful of Lua —
--- demonstrating the opinionation ladder: the Rust plugin is opinion-free,
--- styling and layout decisions live here.
+-- Visual + behavioral parity with the legacy `nefor-chat` plugin. All hex
+-- codes, glyphs, segment ordering, and keymap are sourced from the
+-- reverse-engineered spec at
 --
--- Loaded by the new `nefor-tui` plugin via `--script chat.lua`. Inside the
--- plugin's Lua VM the only globals are `tui.*` (primitive constructors +
--- emit/send_to/scroll_* helpers); JSON conversion happens at the Rust↔Lua
--- bridge so Lua tables ARE the chat-contract bodies.
+-- Architecture (per nefor-tui-declarative-spec): the engine ships zero
+-- opinion. Every color, every layout, every glyph below is editable —
+-- this file IS the chat surface's identity.
 --
--- Wire shape (chat-contract v0.1, see docs/chat-contract.md):
+-- Inbound chat-contract events handled here:
+--   chat.message.append, chat.stream.delta, chat.stream.end,
+--   chat.stream.reasoning_delta, chat.stream.reasoning_end,
+--   chat.session.stats, chat.tool.start, chat.tool.end,
+--   chat.popup, chat.auth.status, chat.model.set_ack,
+--   tool-gate.permission_request,
+--   graph.run_started, graph.node_dispatched, graph.node_result,
+--   graph.run_complete.
 --
---   inbound  → chat.message.append, chat.stream.delta, chat.stream.end,
---              chat.session.stats, chat.tool.start, chat.tool.end,
---              chat.popup, chat.auth.status, chat.model.set_ack
---   outbound ← chat.input.submit, chat.interrupt, chat.interrupt_all,
---              chat.reset
---
--- v1 deferrals (deliberate, documented):
---   * No /resume / chat.history.replay restore — phase 7.
---   * No reasoning row collapse — Qwen-specific UX, deferred.
---   * No slash autocomplete dropdown — keep one screenful for v1.
---   * Cost color ramp deferred; statusline shows raw stats.
---
--- Phase 7 (DAG panel): the Ctrl+B sidebar now subscribes to graph.*
--- events from `reasoner-graph` and draws one row per tracked run header
--- + one row per node with status glyph + elapsed time. Linger handling
--- is pure-update pruning (no engine timer API): every update reads
--- `tui.now_ms()` and drops any run whose `completed_at_ms + 2s < now`.
--- That works because the engine pushes its frame-clock into Lua before
--- every dispatch, so subsequent events drive the prune cycle. A run
--- that completes during a dead-quiet moment still lingers a hair longer
--- than 2s — it's stamped on the next event, which is fine: the user has
--- already seen the green/red completion marker.
+-- Outbound:
+--   chat.input.submit, chat.interrupt, chat.interrupt_all, chat.reset,
+--   chat.command, tool.permission_response.
 
 ------------------------------------------------------------------------
 -- helpers
 ------------------------------------------------------------------------
 
--- Functional list helpers — chat.lua's view builders consume `state.entries`
--- as a list and produce a list of widgets, so map+filter close the loop
--- without a single explicit for-loop in the view layer.
 local function map(list, fn)
   local out = {}
   for i, v in ipairs(list) do out[i] = fn(v, i) end
   return out
 end
 
+-- Sentinel for `nil`-as-set-value in shallow_merge — Lua's `pairs`
+-- doesn't yield keys mapped to nil, so passing `{ x = nil }` to a merge
+-- can't distinguish "unset x" from "leave x alone". Wrap a nil as
+-- `NIL_SENTINEL` to force the merge to clear the key.
+local NIL_SENTINEL = {}
+
 local function shallow_merge(a, b)
   local out = {}
   for k, v in pairs(a) do out[k] = v end
-  for k, v in pairs(b) do out[k] = v end
+  for k, v in pairs(b) do
+    if v == NIL_SENTINEL then
+      out[k] = nil
+    else
+      out[k] = v
+    end
+  end
   return out
 end
 
--- Drop trailing nils from a list (so child arrays with conditional
--- entries don't break tui.column's #children iteration when an entry is
--- nil). Lua's table-as-list semantics make `{ a, nil, c }` == `{ a }`,
--- which is fine, but `{ a, nil_or_widget, c }` may surprise — explicit
--- compaction makes the intent obvious at the call site.
+-- Compact a list that may contain nils. We can't use `ipairs` because it
+-- stops at the first nil (a fundamental quirk of Lua's array semantics:
+-- `{ a, nil, c }` has length 1 from ipairs's perspective). Instead, walk
+-- a numeric range up to the table's "border" approximated by `#list`,
+-- but inspect every slot manually so trailing entries past a nil hole
+-- are visited.
 local function compact(list)
   local out = {}
-  for _, v in ipairs(list) do
+  -- Find the highest-set numeric key so we cover holes safely.
+  local maxn = 0
+  for k, _ in pairs(list) do
+    if type(k) == "number" and k > maxn then maxn = k end
+  end
+  for i = 1, maxn do
+    local v = list[i]
     if v ~= nil then out[#out + 1] = v end
   end
   return out
 end
 
-------------------------------------------------------------------------
--- styling (the only place opinion lives)
-------------------------------------------------------------------------
---
--- Themes here are Lua tables, neutral by default in primitives. Edit at
--- will. The Rust plugin ships zero defaults — the visual identity of the
--- chat surface is fully redefinable in this file.
+local function strip_claude_prefix(model)
+  if model == nil then return nil end
+  local stripped = model:gsub("^claude%-", "")
+  return stripped
+end
 
--- ANSI 256-color indices picked for legibility on dark + light terminals.
--- Index reference: https://en.wikipedia.org/wiki/ANSI_escape_code#8-bit
--- (2, 10 = green; 4, 12 = blue; 5, 13 = magenta; 3, 11 = yellow;
---  6, 14 = cyan; 1, 9 = red; 8 = bright black / "gray").
+local function humanize_duration_ms(ms)
+  if ms == nil then return nil end
+  if ms < 1000 then return tostring(math.floor(ms)) .. "ms" end
+  if ms < 60000 then return string.format("%ds", math.floor(ms / 1000)) end
+  local m = math.floor(ms / 60000)
+  local s = math.floor((ms % 60000) / 1000)
+  return string.format("%dm%02ds", m, s)
+end
+
+local function humanize_tokens(n)
+  if n == nil then return nil end
+  if n < 1000 then return tostring(n) end
+  if n < 1000000 then return tostring(math.floor(n / 1000)) .. "k" end
+  return string.format("%.1fM", n / 1000000)
+end
+
+------------------------------------------------------------------------
+-- styling — exact legacy hex codes
+------------------------------------------------------------------------
+
+-- Palette per legacy spec section 2.
 local C = {
-  green   = 10,
-  blue    = 12,
-  magenta = 13,
-  yellow  = 11,
-  cyan    = 14,
-  red     = 9,
-  gray    = 8,
+  user            = "#7FB4FF",  -- HL_USER, HL_STATUS_BAR_FILL, HL_MD_LIST_MARKER, HL_MD_LINK, HL_STATUS_INFO
+  system          = "#808080",  -- HL_SYSTEM, HL_STATUS, HL_REASONING, HL_MD_QUOTE_BAR
+  status_dim      = "#606060",  -- HL_STATUS_DIM
+  status_warn     = "#D7AF5F",  -- HL_STATUS_WARN
+  status_danger   = "#D75F5F",  -- HL_STATUS_DANGER
+  status_ok       = "#87D787",  -- HL_STATUS_OK
+  md_heading      = "#FFB86C",  -- HL_MD_HEADING (Dracula orange)
+  md_code_fg      = "#C0C0C0",  -- HL_MD_CODE_INLINE / HL_MD_CODE_BLOCK fg
+  md_code_inline_bg = "#303030",
+  md_code_block_bg  = "#202020",
+  footer          = "#707070",  -- HL_FOOTER
 }
 
--- Style records. Schema: { fg, bg, bold, italic, underline, reverse } —
--- all fields optional; missing fields fall through to neutral. The Rust
--- plugin ships zero defaults, so this table is the entire visual identity
--- of the chat surface.
 local STYLE = {
-  user_label      = { fg = C.blue,    bold = true },
-  assistant_label = { fg = C.magenta, bold = true },
-  system_label    = { fg = C.yellow,  italic = true },
-  tool_label      = { fg = C.cyan },
-  tool_error      = { fg = C.red, bold = true },
-  status_dim      = { fg = C.gray },
-  input_border    = { fg = C.gray },
-  popup_border    = { fg = C.yellow },
-  -- DAG panel — one style per node lifecycle bucket. The glyph and the
-  -- status word share the same fg so a row reads as green/amber/red
-  -- end-to-end at a glance.
-  dag_header      = { fg = C.gray },
-  dag_separator   = { fg = C.gray },
-  dag_pending     = { fg = C.gray },
-  dag_running     = { fg = C.yellow },
-  dag_done        = { fg = C.green },
-  dag_error       = { fg = C.red, bold = true },
-  dag_skipped     = { fg = C.gray, italic = true },
+  user_chrome     = { fg = C.user, bold = true },         -- ╭─╰│ borders
+  body_default    = nil,                                  -- HL_ASSISTANT = terminal default
+  system          = { fg = C.system, italic = true },
+  status          = { fg = C.system },
+  status_dim      = { fg = C.status_dim },
+  status_warn     = { fg = C.status_warn },
+  status_danger   = { fg = C.status_danger, bold = true },
+  status_ok       = { fg = C.status_ok },
+  status_info     = { fg = C.user },
+  status_bar_fill = { fg = C.user },
+  footer          = { fg = C.footer },
+  reasoning       = { fg = C.system, italic = true },
+  tool_name       = { fg = C.md_heading, bold = true },
+  tool_error      = { fg = C.status_danger, bold = true },
+  popup_user      = { fg = C.user, bold = true },
+  popup_warn      = { fg = C.status_warn, bold = true },
+  popup_danger    = { fg = C.status_danger, bold = true },
+  popup_info      = { fg = C.user, bold = true },
+  toast           = { fg = C.user },
+  -- DAG panel
+  dag_separator   = { fg = C.footer },
+  dag_pending     = { fg = C.status_dim },
+  dag_running     = { fg = C.status_warn },
+  dag_done        = { fg = C.status_ok },
+  dag_error       = { fg = C.status_danger, bold = true },
+  dag_skipped     = { fg = C.status_dim, italic = true },
 }
 
--- Markdown theme — passed as `theme` to `tui.markdown`. Neutral entries
--- (or missing keys) mean "fall through to plain text"; supplied entries
--- get highlighting.
+-- Markdown theme — exact legacy hex codes (spec section 3).
 local MARKDOWN_THEME = {
   bold        = { bold = true },
   italic      = { italic = true },
-  code        = { fg = C.yellow },
-  code_block  = { fg = C.yellow },
-  h1          = { fg = C.magenta, bold = true },
-  h2          = { fg = C.magenta, bold = true },
-  h3          = { fg = C.magenta },
-  link        = { fg = C.blue, underline = true },
-  blockquote  = { fg = C.gray, italic = true },
-  list_marker = { fg = C.cyan },
+  code        = { fg = C.md_code_fg, bg = C.md_code_inline_bg },
+  code_block  = { fg = C.md_code_fg, bg = C.md_code_block_bg },
+  h1          = { fg = C.md_heading, bold = true },
+  h2          = { fg = C.md_heading, bold = true },
+  h3          = { fg = C.md_heading, bold = true },
+  h4          = { fg = C.md_heading, bold = true },
+  h5          = { fg = C.md_heading, bold = true },
+  h6          = { fg = C.md_heading, bold = true },
+  link        = { fg = C.user, underline = true },
+  blockquote  = { fg = C.system, italic = true },
+  list_marker = { fg = C.user },
 }
 
 ------------------------------------------------------------------------
--- state shape
+-- state
 ------------------------------------------------------------------------
 --
---   entries           list of { role, text, model?, duration_ms?, kind }
---                     where role ∈ { "user", "assistant", "system", "tool" }
---                     and kind ∈ { "text", "stream", "tool_call" }
---   in_flight         index into entries of the in-flight assistant entry
---                     (or nil); reset on chat.stream.end
---   input_value       text_input current value (controlled component)
---   focused_id        which keyed widget claims keystrokes ("input")
---   show_sidebar      Ctrl+B toggle (DAG panel visibility)
---   popup             nil | { title, body } — Ctrl+O help, system errors
---   stats             { model?, prompt_tokens?, completion_tokens?, cost_usd?,
---                       turns?, duration_ms? } — populated from chat.session.stats
---   pending           true while awaiting first delta of a turn
---   model             active provider model string (chat.model.set_ack)
---   dag_runs          map keyed by run_id, each entry shape:
---                       { run_id, total_nodes, started_at_ms,
---                         completed_at_ms?, status?,
---                         nodes = { [node_id] = {
---                            reasoner, status, started_at_ms,
---                            finished_at_ms? } } }
---                     status ∈ { "pending","running","done","error","skipped" }
---                     for nodes; for runs the wire status is recorded as-is
---                     (`success` / `partial_failure` / `failure`).
---                     Updated by graph.* events; pruned in update once a run
---                     has been completed for >= DAG_LINGER_MS.
+--   entries           list. Per-entry shapes:
+--                       { role = "user",      kind = "text", text }
+--                       { role = "assistant", kind = "stream",
+--                         text, model?, duration_ms?, streaming?, reasoning? }
+--                       { role = "system",    kind = "text", text }
+--                       { role = "tool",      kind = "tool_call",
+--                         id, name, input, output?, error? }
+--   in_flight         index of streaming assistant entry, or nil
+--   input_value       text_input value
+--   focused_id        focus key (only "input" for now)
+--   show_sidebar      Ctrl+B toggle
+--   popup             nil | { variant, title, body, source?, ... }
+--                     variant ∈ "help" | "info" | "warning" | "error"
+--                       | "model_picker" | "tool_permission" | "toast"
+--   stats             chat.session.stats payload
+--   pending           true after submit, false after first delta or stream end
+--   turn_started_at   ms when the user submitted; cleared on stream end
+--   last_turn_duration_ms  ms recorded when the most recent turn ended
+--   model             active model
+--   max_tokens        per-model context window (200k for opus/sonnet/haiku)
+--   gate_yolo         whether the tool gate is in YOLO mode
+--   auth              per-provider state map
+--   expanded_details  Ctrl+O toggle: expand all tool I/O + reasoning rows
+--   slash             nil | { matches, cursor, query }
+--   last_esc_ms       ms of the most recent ESC press (for double-ESC)
+--   dag_runs          map keyed by run_id
 
--- How long a finished DAG run lingers in the panel after `graph.run_complete`
--- before pure-update pruning drops it. 2s is the same window the legacy
--- nefor-chat plugin used — short enough to avoid stale panels and long
--- enough that the user sees the final green/red marker as confirmation
--- the run actually finished.
-local DAG_LINGER_MS = 2000
+local DAG_LINGER_MS  = 2000
+local DOUBLE_ESC_MS  = 600
 
 local function initial_state()
   return {
-    entries      = {},
-    in_flight    = nil,
-    input_value  = "",
-    focused_id   = "input",
-    show_sidebar = false,
-    popup        = nil,
-    stats        = {},
-    pending      = false,
-    model        = nil,
-    dag_runs     = {},
+    entries          = {},
+    in_flight        = nil,
+    input_value      = "",
+    focused_id       = "input",
+    show_sidebar     = false,
+    popup            = nil,
+    stats            = {},
+    pending          = false,
+    turn_started_at  = nil,
+    last_turn_duration_ms = nil,
+    model            = nil,
+    max_tokens       = nil,
+    gate_yolo        = false,
+    auth             = {},
+    expanded_details = false,
+    slash            = nil,
+    last_esc_ms      = nil,
+    dag_runs         = {},
+    toast            = nil,  -- { text, expires_at_ms }
   }
 end
 
 ------------------------------------------------------------------------
--- entry rendering
+-- slash registry
 ------------------------------------------------------------------------
 
--- Role label widget — colored single-row prefix above each entry's body.
--- Pure function: same input → same output, no side effects, no state.
-local function role_label(role)
-  local m = {
-    user      = { text = "you",       style = STYLE.user_label },
-    assistant = { text = "assistant", style = STYLE.assistant_label },
-    system    = { text = "system",    style = STYLE.system_label },
-    tool      = { text = "tool",      style = STYLE.tool_label },
-  }
-  local cfg = m[role] or { text = role, style = nil }
-  return tui.text { content = cfg.text, style = cfg.style }
+local SLASH_COMMANDS = {
+  { name = "new",     aliases = { "clear" }, hint = "start a fresh chat (clears transcript)", takes_args = false },
+  { name = "help",    aliases = {},          hint = "show the help popup",                    takes_args = false },
+  { name = "quit",    aliases = { "exit" },  hint = "exit nefor",                             takes_args = false },
+  { name = "login",   aliases = {},          hint = "authenticate a provider",                takes_args = true },
+  { name = "logout",  aliases = {},          hint = "revoke a provider's auth",               takes_args = true },
+  { name = "model",   aliases = {},          hint = "list/switch active model",               takes_args = true },
+  { name = "resume",  aliases = {},          hint = "resume previous session",                takes_args = true },
+  { name = "yolo",    aliases = {},          hint = "disable tool permission prompts (DANGEROUS)", takes_args = false },
+  { name = "safe",    aliases = {},          hint = "re-enable tool permission prompts",      takes_args = false },
+  { name = "dag-test",aliases = {},          hint = "submit a 2-node parallel test DAG",      takes_args = false },
+}
+
+local function slash_filter(query)
+  -- Case-insensitive prefix match against name OR aliases.
+  local q = (query or ""):lower()
+  local out = {}
+  for _, cmd in ipairs(SLASH_COMMANDS) do
+    local match = cmd.name:lower():sub(1, #q) == q
+    if not match then
+      for _, a in ipairs(cmd.aliases) do
+        if a:lower():sub(1, #q) == q then match = true; break end
+      end
+    end
+    if match then out[#out + 1] = cmd end
+  end
+  return out
 end
 
--- Render one transcript entry. Branches by `entry.kind`:
---   text       — plain `tui.text` (user input, system messages).
---   stream     — `tui.markdown` (assistant content; reflows on every
---                stream.delta because state.entries[i].text changed).
---   tool_call  — `▸ name(args) → output` one-liner (collapsed). Phase 7
---                will add expand-on-Ctrl+O.
-local function render_entry(entry)
-  if entry.kind == "tool_call" then
-    local prefix = entry.error and "✗ " or "▸ "
-    local style = entry.error and STYLE.tool_error or STYLE.tool_label
-    local line = prefix .. (entry.name or "?")
-    if entry.input and #entry.input > 0 then
-      -- Truncate huge tool args so a giant JSON blob doesn't dominate
-      -- the transcript; the full payload lives in the unstyled `entry.input`
-      -- slot and a phase-7 expand toggle will surface it.
-      local trimmed = entry.input
-      if #trimmed > 80 then trimmed = trimmed:sub(1, 77) .. "..." end
-      line = line .. "(" .. trimmed .. ")"
-    end
-    if entry.output and #entry.output > 0 then
-      local trimmed = entry.output
-      if #trimmed > 60 then trimmed = trimmed:sub(1, 57) .. "..." end
-      line = line .. " → " .. trimmed
-    end
-    return tui.text { content = line, style = style, wrap = "word" }
-  end
+------------------------------------------------------------------------
+-- markdown rendering
+------------------------------------------------------------------------
 
-  if entry.kind == "stream" or entry.role == "assistant" then
-    return tui.column {
-      gap = 0,
-      children = {
-        role_label(entry.role),
-        tui.markdown {
-          source = entry.text or "",
-          theme  = MARKDOWN_THEME,
-          wrap   = "word",
-        },
-      },
-    }
-  end
+local function md(source)
+  return tui.markdown { source = source or "", theme = MARKDOWN_THEME, wrap = "word" }
+end
 
-  -- Default: plain text body (user, system, etc).
+------------------------------------------------------------------------
+-- entry rendering — per legacy spec section 5
+------------------------------------------------------------------------
+
+-- User entry: top + bottom rules in HL_USER, body in default fg.
+-- `╭────…` and `╰────…` borders sized to chat_cols. Since we don't know
+-- the column budget here exactly, we emit a long rule string and let
+-- `wrap = "none"` clip at the cell boundary — same effect as the
+-- legacy chat plugin's `top_rule = '╭' + '─'*(cols-1)` after layout.
+local function render_user_entry(entry)
+  local rule_top    = "╭" .. string.rep("─", 200)
+  local rule_bottom = "╰" .. string.rep("─", 200)
   return tui.column {
     gap = 0,
     children = {
-      role_label(entry.role),
-      tui.text { content = entry.text or "", wrap = "word" },
+      tui.text { content = rule_top,    style = STYLE.user_chrome, wrap = "none" },
+      tui.text { content = "│ " .. (entry.text or ""),             wrap = "word" },
+      tui.text { content = rule_bottom, style = STYLE.user_chrome, wrap = "none" },
+    },
+  }
+end
+
+-- Reasoning rows above the assistant body. Per legacy spec section 5:
+--   live  (streaming + body empty)  → "▼ thinking…"  + body
+--   expanded (Ctrl+O)               → "▼ reasoning"  + body
+--   collapsed                       → "▸ reasoning (Ns)"
+local function reasoning_rows(reasoning, body_empty, expanded)
+  if reasoning == nil or (reasoning.text or "") == "" then return nil end
+  local live = reasoning.streaming and body_empty
+  if live or expanded then
+    local header_text = live and "▼ thinking…" or "▼ reasoning"
+    return tui.column {
+      gap = 0,
+      children = {
+        tui.text { content = header_text, style = STYLE.footer, wrap = "none" },
+        tui.text { content = "  " .. (reasoning.text or ""), style = STYLE.reasoning, wrap = "word" },
+      },
+    }
+  end
+  local dur = humanize_duration_ms(reasoning.duration_ms)
+  local label = dur and ("▸ reasoning (" .. dur .. ")") or "▸ reasoning"
+  return tui.text { content = label, style = STYLE.footer, wrap = "none" }
+end
+
+-- Per-turn footer: "▣ <model> · <duration>" in HL_FOOTER.
+local function turn_footer(entry)
+  local model = strip_claude_prefix(entry.model)
+  local dur = humanize_duration_ms(entry.duration_ms)
+  if model and dur then
+    return tui.text { content = "▣ " .. model .. " · " .. dur, style = STYLE.footer, wrap = "none" }
+  elseif model then
+    return tui.text { content = "▣ " .. model, style = STYLE.footer, wrap = "none" }
+  elseif dur then
+    return tui.text { content = "▣ " .. dur, style = STYLE.footer, wrap = "none" }
+  end
+  return nil
+end
+
+local function render_assistant_entry(entry, expanded)
+  local body_empty = (entry.text or "") == ""
+  local rows = compact {
+    reasoning_rows(entry.reasoning, body_empty, expanded),
+    body_empty and nil or md(entry.text),
+    (not entry.streaming) and turn_footer(entry) or nil,
+  }
+  return tui.column { gap = 0, children = rows }
+end
+
+-- Salient input summary for tool collapsed-line.
+local function tool_salient(entry)
+  local name = entry.name or ""
+  local input = entry.input_table or {}
+  if name == "Bash" or name == "bash" then return input.command end
+  if name == "Read" or name == "Edit" or name == "Write" or name == "MultiEdit" then
+    return input.file_path
+  end
+  if name == "read_file" or name == "write_file" then return input.path end
+  if name == "Grep" or name == "Glob" then return input.pattern end
+  if name == "spawn_graph" then
+    local nodes = input.graph and input.graph.nodes or nil
+    if type(nodes) == "table" then
+      local n = #nodes
+      if n == 1 then return "1 node" end
+      return tostring(n) .. " nodes"
+    end
+  end
+  -- Fall back: first short string field, skipping policy-ish names.
+  for k, v in pairs(input) do
+    local skip = (k == "on_node_failure" or k == "mode" or k == "policy" or k == "strategy")
+    if (not skip) and type(v) == "string" then return v end
+  end
+  return nil
+end
+
+local function tool_collapsed(entry)
+  local glyph = "▸ "
+  local header_style = entry.error and STYLE.tool_error or STYLE.tool_name
+  local salient = tool_salient(entry)
+  local header = glyph .. (entry.name or "?")
+  if salient then
+    local trimmed = salient
+    if #trimmed > 80 then trimmed = trimmed:sub(1, 77) .. "..." end
+    header = header .. "(" .. trimmed .. ")"
+  end
+  if entry.output == nil and not entry.error then
+    header = header .. " …"  -- running indicator
+  end
+  local rows = { tui.text { content = header, style = header_style, wrap = "none" } }
+  if entry.error then
+    rows[#rows + 1] = tui.text { content = "  error", style = STYLE.status_danger, wrap = "none" }
+  end
+  return tui.column { gap = 0, children = rows }
+end
+
+local function tool_expanded(entry)
+  local glyph = "▼ "
+  local header_style = entry.error and STYLE.tool_error or STYLE.tool_name
+  local salient = tool_salient(entry)
+  local header = glyph .. (entry.name or "?")
+  if salient then
+    local trimmed = salient
+    if #trimmed > 80 then trimmed = trimmed:sub(1, 77) .. "..." end
+    header = header .. "(" .. trimmed .. ")"
+  end
+  local rows = { tui.text { content = header, style = header_style, wrap = "none" } }
+  rows[#rows + 1] = tui.text { content = "  input:",  style = STYLE.footer, wrap = "none" }
+  if entry.input and #entry.input > 0 then
+    rows[#rows + 1] = tui.text {
+      content = "  " .. entry.input,
+      style = { fg = C.md_code_fg, bg = C.md_code_block_bg },
+      wrap = "word",
+    }
+  end
+  if entry.output == nil and not entry.error then
+    rows[#rows + 1] = tui.text { content = "  running...", style = STYLE.footer, wrap = "none" }
+  else
+    rows[#rows + 1] = tui.text { content = "  output:", style = STYLE.footer, wrap = "none" }
+    if entry.output and #entry.output > 0 then
+      rows[#rows + 1] = tui.text {
+        content = "  " .. entry.output,
+        style = { fg = C.md_code_fg, bg = C.md_code_block_bg },
+        wrap = "word",
+      }
+    end
+  end
+  return tui.column { gap = 0, children = rows }
+end
+
+local function render_entry(entry, _i, expanded)
+  if entry.kind == "tool_call" then
+    if expanded then return tool_expanded(entry) end
+    return tool_collapsed(entry)
+  end
+  if entry.role == "assistant" or entry.kind == "stream" then
+    return render_assistant_entry(entry, expanded)
+  end
+  if entry.role == "user" then
+    return render_user_entry(entry)
+  end
+  if entry.role == "system" then
+    return tui.text {
+      content = "[" .. (entry.text or "") .. "]",
+      style   = STYLE.system,
+      wrap    = "word",
+    }
+  end
+  return tui.text { content = entry.text or "", wrap = "word" }
+end
+
+------------------------------------------------------------------------
+-- streaming indicator
+------------------------------------------------------------------------
+
+-- Spec section 6: pre-first-delta placeholder is `[thinking... Ns]`,
+-- static (no spinner) but with per-second elapsed counter. We use
+-- `tui.now_ms()` to compute the elapsed seconds on every render — same
+-- monotonic clock the engine ticks on dispatch, so the counter advances
+-- whenever a new event lands. Plus a `tui.animation` keeps the render
+-- loop alive at frame rate so the counter ticks even between events.
+local THINKING_FRAMES = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+
+local function thinking_widget(state)
+  if not state.pending then return nil end
+  if state.in_flight ~= nil then return nil end
+  local elapsed_ms = state.turn_started_at and (tui.now_ms() - state.turn_started_at) or 0
+  local secs = math.floor(elapsed_ms / 1000)
+  local body = secs > 0
+    and string.format("[thinking... %ds]", secs)
+    or  "[thinking...]"
+  return tui.row {
+    gap = 1,
+    children = {
+      tui.animation {
+        frames      = THINKING_FRAMES,
+        duration_ms = 800,
+      },
+      tui.text { content = body, style = STYLE.system, wrap = "none" },
     },
   }
 end
@@ -255,60 +460,171 @@ end
 ------------------------------------------------------------------------
 -- statusline
 ------------------------------------------------------------------------
---
--- A single row at the bottom of the chrome above the input. Shows:
---   model · in/out tokens · cost · turns · duration
--- Missing fields render as "—" — partial provider data is the common case.
 
-local function fmt_or_dash(v, fmt)
-  if v == nil then return "—" end
-  if fmt then return string.format(fmt, v) end
-  return tostring(v)
+local function ctx_bar(used, max)
+  if used == nil or max == nil or max == 0 then return nil end
+  local pct = math.floor(100 * used / max + 0.5)
+  if pct < 0 then pct = 0 end
+  if pct > 100 then pct = 100 end
+  local bar_w = 8
+  local filled = math.floor(bar_w * used / max + 0.5)
+  if filled < 0 then filled = 0 end
+  if filled > bar_w then filled = bar_w end
+  local empty = bar_w - filled
+  local bar_style
+  if pct >= 90 then
+    bar_style = STYLE.status_danger
+  elseif pct >= 70 then
+    bar_style = STYLE.status_warn
+  else
+    bar_style = STYLE.status_bar_fill
+  end
+  local label = string.format("ctx %s/%s ",
+    humanize_tokens(used) or tostring(used),
+    humanize_tokens(max)  or tostring(max))
+  return {
+    spans = {
+      { text = label, fg = C.system },
+      { text = string.rep("█", filled), fg = bar_style.fg },
+      { text = string.rep("░", empty),  fg = C.status_dim },
+      { text = " " .. tostring(pct) .. "%", fg = C.system },
+    },
+  }
+end
+
+local function auth_segment(auth)
+  if auth == nil then return nil end
+  local entries = {}
+  for name, status in pairs(auth) do
+    entries[#entries + 1] = { name = name, status = status }
+  end
+  if #entries == 0 then return nil end
+  table.sort(entries, function(a, b) return a.name < b.name end)
+  local spans = {}
+  local shown = 0
+  local extra = 0
+  for _, e in ipairs(entries) do
+    if shown >= 3 then
+      extra = extra + 1
+    else
+      if shown > 0 then
+        spans[#spans + 1] = { text = " ", fg = C.status_dim }
+      end
+      spans[#spans + 1] = { text = e.name .. ":", fg = C.status_dim }
+      local marker, color
+      if e.status == "connected" then
+        marker, color = "✓", C.system
+      elseif e.status == "login_required" then
+        marker, color = "?", C.status_warn
+      elseif e.status == nil then
+        marker, color = "·", C.status_dim
+      else
+        marker, color = "!", C.status_danger
+      end
+      spans[#spans + 1] = { text = marker, fg = color }
+      shown = shown + 1
+    end
+  end
+  if extra > 0 then
+    spans[#spans + 1] = { text = " +" .. tostring(extra), fg = C.status_dim }
+  end
+  return { spans = spans }
+end
+
+local function build_statusline_segments(state)
+  local segs = {}
+  if state.gate_yolo then
+    segs[#segs + 1] = { spans = { { text = "YOLO", fg = C.status_danger, bold = true } } }
+  end
+  local model = strip_claude_prefix(state.model or (state.stats and state.stats.model))
+  if model then
+    segs[#segs + 1] = { spans = { { text = model, fg = C.system } } }
+  else
+    segs[#segs + 1] = { spans = { { text = "Start chatting to see stats", fg = C.status_dim } } }
+  end
+
+  local s = state.stats or {}
+  local last_ctx = s.last_turn_context_tokens or s.context_tokens or s.prompt_tokens
+  if last_ctx and state.max_tokens then
+    local cb = ctx_bar(last_ctx, state.max_tokens)
+    if cb then segs[#segs + 1] = cb end
+  end
+
+  if s.cost_usd ~= nil then
+    segs[#segs + 1] = { spans = { { text = string.format("$%.2f", s.cost_usd), fg = C.system } } }
+  end
+  if s.turns ~= nil then
+    segs[#segs + 1] = { spans = { { text = tostring(s.turns) .. " turns", fg = C.system } } }
+  end
+  local last_dur = s.last_turn_duration_ms or state.last_turn_duration_ms or s.duration_ms
+  if last_dur ~= nil then
+    segs[#segs + 1] = { spans = { { text = humanize_duration_ms(last_dur), fg = C.system } } }
+  end
+  -- "[done in Xms]" indicator after the most recent stream end.
+  if state.last_turn_duration_ms ~= nil and not state.pending and state.in_flight == nil then
+    segs[#segs + 1] = {
+      spans = {
+        { text = "[done in " .. humanize_duration_ms(state.last_turn_duration_ms) .. "]",
+          fg = C.status_ok },
+      },
+    }
+  end
+
+  -- Speed: tok/s when both output_tokens and duration are known.
+  local ot = s.last_turn_output_tokens or s.completion_tokens
+  if ot and last_dur and last_dur > 0 then
+    local tps = math.floor((ot * 1000) / last_dur + 0.5)
+    segs[#segs + 1] = { spans = { { text = tostring(tps) .. " tok/s", fg = C.system } } }
+  end
+
+  local auth = auth_segment(state.auth)
+  if auth then segs[#segs + 1] = auth end
+
+  return segs
 end
 
 local function statusline(state)
-  local s = state.stats or {}
-  local segments = {
-    "model: " .. (state.model or s.model or "—"),
-    "in: "    .. fmt_or_dash(s.prompt_tokens),
-    "out: "   .. fmt_or_dash(s.completion_tokens),
-    "cost: $" .. fmt_or_dash(s.cost_usd, "%.4f"),
-    "turns: " .. fmt_or_dash(s.turns),
-    "Δt: "    .. (s.duration_ms and (tostring(math.floor(s.duration_ms / 1000)) .. "s") or "—"),
-  }
-  if state.pending then
-    segments[#segments + 1] = "[thinking…]"
+  local segs = build_statusline_segments(state)
+  local out_spans = {}
+  for i, seg in ipairs(segs) do
+    if i > 1 then
+      out_spans[#out_spans + 1] = { text = " │ ", fg = C.status_dim }
+    end
+    for _, sp in ipairs(seg.spans) do
+      out_spans[#out_spans + 1] = sp
+    end
   end
-  return tui.text {
-    content = table.concat(segments, "  ·  "),
-    style   = STYLE.status_dim,
-    wrap    = "none",
-  }
+  return tui.spans { spans = out_spans }
 end
 
 ------------------------------------------------------------------------
--- popup (help on Ctrl+O, error popups from chat.popup events)
+-- popups (help, info, warning, error, model_picker, tool_permission, toast)
 ------------------------------------------------------------------------
 
-local HELP_TEXT = [[Keys:
+local HELP_BODY = [[Keys:
   Enter        send message
+  Shift+Enter  insert newline
   Esc          cancel current turn
-  Esc Esc      cancel everything (double-tap)
+  Esc Esc      cancel everything (within 600ms)
   Ctrl+B       toggle sidebar
-  Ctrl+O       toggle this help
+  Ctrl+O       expand/collapse tool calls + reasoning
+  ?            this help (when input empty)
   PgUp / PgDn  scroll transcript
   Home / End   jump to top / bottom
   Ctrl+C       quit
 
 Slash commands:
-  /new         new chat (clears transcript)
-  /quit        exit nefor
+  /new /clear  new chat (clears transcript)
+  /help        this help
+  /quit /exit  exit nefor
+  /yolo /safe  toggle tool permission gate
+  /login /logout  provider auth
+  /model       list/switch model
+  /resume      resume a previous session
+  /dag-test    submit a test DAG]]
 
-Phase 6 cutover: the chat surface is a ~280-LOC Lua composition.
-Tweak starter/chat.lua to taste.]]
-
-local function popup_widget(state)
-  if not state.popup then return nil end
+local function popup_help(state)
+  if not state.popup or state.popup.variant ~= "help" then return nil end
   return tui.anchored {
     anchor = "center",
     width  = "60%",
@@ -318,34 +634,130 @@ local function popup_widget(state)
       child = tui.column {
         gap = 1,
         children = {
-          tui.text {
-            content = state.popup.title or "info",
-            style   = STYLE.popup_border,
-          },
-          tui.markdown {
-            source = state.popup.body or "",
-            theme  = MARKDOWN_THEME,
-            wrap   = "word",
-          },
-          tui.text { content = "(press Esc or Ctrl+O to close)", style = STYLE.status_dim },
+          tui.text { content = "── help ──", style = STYLE.popup_user },
+          tui.text { content = HELP_BODY, wrap = "word" },
+          tui.text { content = "(Esc / Q / Enter to close)", style = STYLE.status_dim },
         },
       },
     },
   }
 end
 
+local function popup_message(state)
+  if not state.popup then return nil end
+  local v = state.popup.variant
+  if v ~= "info" and v ~= "warning" and v ~= "error" then return nil end
+  local title_style, glyph
+  if v == "info" then
+    title_style, glyph = STYLE.popup_info, "ℹ"
+  elseif v == "warning" then
+    title_style, glyph = STYLE.popup_warn, "⚠"
+  else
+    title_style, glyph = STYLE.popup_danger, "✕"
+  end
+  local title = string.format(" %s %s %s ", v, glyph, state.popup.title or "")
+  return tui.anchored {
+    anchor = "center",
+    width  = "60%",
+    height = "50%",
+    child  = tui.padding {
+      value = 1,
+      child = tui.column {
+        gap = 1,
+        children = compact {
+          tui.text { content = title, style = title_style },
+          tui.markdown { source = state.popup.body or "", theme = MARKDOWN_THEME, wrap = "word" },
+          state.popup.source and tui.text {
+            content = "from: " .. state.popup.source,
+            style   = STYLE.footer,
+          } or nil,
+          tui.text { content = "Esc / Q to close", style = STYLE.status_dim },
+        },
+      },
+    },
+  }
+end
+
+-- Tool permission popup (spec section 12). Border is HL_STATUS_WARN;
+-- footer reads `[A]pprove [D]eny (ESC = deny)`. Keyhandlers in update.
+local function popup_tool_permission(state)
+  if not state.popup or state.popup.variant ~= "tool_permission" then return nil end
+  return tui.anchored {
+    anchor = "center",
+    width  = "60%",
+    height = "50%",
+    child  = tui.padding {
+      value = 1,
+      child = tui.column {
+        gap = 1,
+        children = {
+          tui.text {
+            content = " permission requested · " .. (state.popup.tool or "?"),
+            style   = STYLE.popup_warn,
+          },
+          tui.text { content = state.popup.body or "", wrap = "word" },
+          tui.text {
+            content = "[A]pprove   [D]eny   (Esc = deny)",
+            style   = STYLE.status_warn,
+          },
+        },
+      },
+    },
+  }
+end
+
+-- Toast: bottom-left, single-line, no border, in HL_STATUS_INFO. Auto-
+-- dismisses on `expires_at_ms` via the per-event prune cycle.
+local function popup_toast(state)
+  if not state.toast then return nil end
+  if state.toast.expires_at_ms and tui.now_ms() >= state.toast.expires_at_ms then
+    return nil
+  end
+  return tui.anchored {
+    anchor = "bottom-left",
+    offset_x = 1,
+    width  = 40,
+    child  = tui.text { content = state.toast.text or "", style = STYLE.toast, wrap = "none" },
+  }
+end
+
 ------------------------------------------------------------------------
--- DAG panel (sidebar widget — phase 7)
+-- slash autocomplete (inline above input, NOT centered overlay)
 ------------------------------------------------------------------------
---
--- Renders state.dag_runs as a stack of run sections. Each section has
--- a one-line header with the abbreviated run id and `<done>/<total>`
--- counter, then one row per node showing:
---
---     <glyph> <node_id>  <reasoner?>  <status_word> <elapsed>
---
--- The reasoner column is dropped on narrow sidebars so 28-col layouts
--- still fit `<glyph> <node> <elapsed>` without truncating into uselessness.
+
+local function slash_autocomplete_inline(state)
+  if not state.slash then return nil end
+  local matches = state.slash.matches or {}
+  if #matches == 0 then
+    return tui.text {
+      content = "no matching commands",
+      style   = STYLE.status_dim,
+      wrap    = "none",
+    }
+  end
+  -- Up to 8 rows.
+  local cap = 8
+  local cursor = state.slash.cursor or 1
+  local first = math.max(1, math.min(cursor - cap + 1, #matches - cap + 1))
+  if first < 1 then first = 1 end
+  local last = math.min(first + cap - 1, #matches)
+  local children = {}
+  for i = first, last do
+    local cmd = matches[i]
+    local is_cursor = (i == cursor)
+    local row = string.format("/%-12s  %s", cmd.name, cmd.hint or "")
+    children[#children + 1] = tui.text {
+      content = row,
+      style   = is_cursor and { fg = "#000000", bg = C.user } or nil,
+      wrap    = "none",
+    }
+  end
+  return tui.column { gap = 0, children = children }
+end
+
+------------------------------------------------------------------------
+-- DAG panel (sidebar widget)
+------------------------------------------------------------------------
 
 local DAG_GLYPHS = {
   pending = "○",
@@ -363,28 +775,19 @@ local DAG_NODE_STYLE = {
   skipped = STYLE.dag_skipped,
 }
 
--- Stable lexicographic order over a string-keyed table — Lua's pairs is
--- hash-iterated so rendering would jitter without an explicit sort.
-local function sorted_keys(map)
+local function sorted_keys(m)
   local out = {}
-  for k in pairs(map) do out[#out + 1] = k end
+  for k in pairs(m) do out[#out + 1] = k end
   table.sort(out)
   return out
 end
 
 local function fmt_elapsed_ms(ms)
   if ms == nil then return "" end
-  if ms < 1000 then
-    return tostring(ms) .. "ms"
-  end
+  if ms < 1000 then return tostring(ms) .. "ms" end
   return string.format("%.1fs", ms / 1000)
 end
 
--- Drop runs whose linger window has expired. Returns the same map ref
--- when nothing changes (so update can compare-and-skip), or a fresh map
--- with the stale entries removed. Pure-update pruning: no engine timer
--- needed — the next event drives this and the visible-but-stale row
--- disappears on the following frame.
 local function prune_dag_runs(dag_runs, now_ms)
   if dag_runs == nil then return {} end
   local pruned = nil
@@ -401,28 +804,23 @@ local function prune_dag_runs(dag_runs, now_ms)
   return pruned or dag_runs
 end
 
--- Header row: "DAG <prefix> (M/N)" rendered in dim chrome.
 local function dag_run_header(run)
   local short = run.run_id and run.run_id:sub(1, 8) or "?"
   local total = run.total_nodes or 0
   local nodes = run.nodes or {}
   local done = 0
+  local nodes_count = 0
   for _, n in pairs(nodes) do
+    nodes_count = nodes_count + 1
     if n.status == "done" or n.status == "error" or n.status == "skipped" then
       done = done + 1
     end
   end
-  -- Use the larger of total_nodes and observed-node count so a synthetic
-  -- run created from an out-of-order node_dispatched still shows a sane
-  -- counter rather than (1/0).
-  local nodes_count = 0
-  for _ in pairs(nodes) do nodes_count = nodes_count + 1 end
   if nodes_count > total then total = nodes_count end
   local title = string.format("DAG %s (%d/%d)", short, done, total)
-  return tui.text { content = title, style = STYLE.dag_header, wrap = "none" }
+  return tui.text { content = title, style = STYLE.footer, wrap = "none" }
 end
 
--- One node row inside a run section.
 local function dag_node_row(node_id, node, now_ms, narrow)
   local glyph = DAG_GLYPHS[node.status] or "·"
   local style = DAG_NODE_STYLE[node.status] or STYLE.status_dim
@@ -435,17 +833,10 @@ local function dag_node_row(node_id, node, now_ms, narrow)
     end
   end
   local elapsed_str = elapsed and (" " .. fmt_elapsed_ms(elapsed)) or ""
-
   local text
   if narrow then
-    -- `<glyph> <node_id> <elapsed>` — no reasoner column, no status word.
     text = glyph .. " " .. node_id .. elapsed_str
   else
-    -- `<glyph> <node_id>  <reasoner>  <status>[ <elapsed>]`. Two-space
-    -- gutters keep the columns readable; styling is uniform per row so
-    -- the green/amber/red signal carries even without per-segment colour
-    -- (text/spans split would force us to pre-pad each column to its
-    -- width here in Lua — not worth the complexity for v1).
     local reasoner = node.reasoner or ""
     local status_word = node.status or "?"
     text = string.format("%s %s  %s  %s%s",
@@ -454,22 +845,12 @@ local function dag_node_row(node_id, node, now_ms, narrow)
   return tui.text { content = text, style = style, wrap = "none" }
 end
 
--- Build one section per run: header + one row per node, separated by a
--- single blank line between runs. The whole stack is then capped to a
--- "+K more" overflow row in the sidebar's outer scroll budget — but for
--- v1 we just emit everything; the sidebar's `constrained` widget keeps
--- the column from blowing out and the chat's column gives whatever rows
--- the terminal has left.
 local function dag_panel_children(state, now_ms, narrow)
   local children = {}
   local run_ids = sorted_keys(state.dag_runs)
   for i, run_id in ipairs(run_ids) do
     if i > 1 then
-      children[#children + 1] = tui.text {
-        content = "",
-        style   = STYLE.dag_separator,
-        wrap    = "none",
-      }
+      children[#children + 1] = tui.text { content = "", wrap = "none" }
     end
     local run = state.dag_runs[run_id]
     children[#children + 1] = dag_run_header(run)
@@ -489,41 +870,30 @@ local function dag_panel_children(state, now_ms, narrow)
 end
 
 local function dag_panel(state)
-  -- Width budget mirrors the legacy plugin's heuristic: ~36 cols is
-  -- enough for the wide layout, narrower terminals fall back to compact.
-  -- The constrained widget below caps at 36, so we always render compact
-  -- when the sidebar is at its lower clamp.
-  local narrow = true   -- v1: always compact; phase-7+ can detect width
-                        -- via tui.scroll_position-style geometry hooks.
+  local narrow = true
   local now_ms = tui.now_ms()
+  local children = {
+    tui.text { content = "Graph", style = STYLE.footer, wrap = "none" },
+    tui.text { content = string.rep("─", 30), style = STYLE.footer, wrap = "none" },
+  }
+  for _, c in ipairs(dag_panel_children(state, now_ms, narrow)) do
+    children[#children + 1] = c
+  end
   return tui.constrained {
     min_width = 28,
     max_width = 36,
     child = tui.padding {
       value = 1,
-      child = tui.column {
-        gap      = 0,
-        children = dag_panel_children(state, now_ms, narrow),
-      },
+      child = tui.column { gap = 0, children = children },
     },
   }
 end
 
--- Vertical separator column between transcript and sidebar. The text
--- primitive renders a single glyph; layout repeats the column across
--- the full row height because constrained's `min_height` defaults open
--- and `expanded`'s `child` paints the glyph at the top — so we keep the
--- separator visually anchored to the top row, which reads as a clean
--- divider against the transcript's right edge for v1.
 local function vertical_separator()
   return tui.constrained {
     min_width = 1,
     max_width = 1,
-    child = tui.text {
-      content = "│",
-      style   = STYLE.dag_separator,
-      wrap    = "none",
-    },
+    child = tui.text { content = "│", style = STYLE.dag_separator, wrap = "none" },
   }
 end
 
@@ -532,12 +902,19 @@ end
 ------------------------------------------------------------------------
 
 local function transcript(state)
-  local children = map(state.entries, render_entry)
+  local entries = state.entries or {}
+  local widgets = {}
+  for i, e in ipairs(entries) do
+    widgets[#widgets + 1] = render_entry(e, i, state.expanded_details)
+  end
+  -- Append thinking indicator inline at the bottom when pending.
+  local think = thinking_widget(state)
+  if think then widgets[#widgets + 1] = think end
   return tui.scrollable {
     key       = "transcript",
     stick_to  = "end",
     scrollbar = "auto",
-    child     = tui.column { gap = 1, children = children },
+    child     = tui.column { gap = 1, children = widgets },
   }
 end
 
@@ -551,32 +928,43 @@ local function view(state)
     },
   }
 
+  local main_column = tui.column {
+    gap = 0,
+    children = compact {
+      tui.expanded { child = body_row },
+      slash_autocomplete_inline(state),
+      statusline(state),
+      tui.text_input {
+        key       = "input",
+        value     = state.input_value,
+        -- A popup that wants to absorb single-char keys (tool permission
+        -- with [A]/[D]) needs the input to drop focus while open; the
+        -- engine routes editing keys only to a `focused = true` input,
+        -- so single chars otherwise vanish into the buffer.
+        focused   = state.focused_id == "input"
+                     and not (state.popup and state.popup.variant == "tool_permission"),
+        on_change = "input.changed",
+        on_submit = "input.submit",
+        min_lines = 1,
+        max_lines = 8,
+        placeholder = "type a message — Enter to send, /help for keys, /quit to exit",
+      },
+    },
+  }
+
   return tui.stack {
     children = compact {
-      tui.column {
-        gap = 0,
-        children = {
-          tui.expanded { child = body_row },
-          statusline(state),
-          tui.text_input {
-            key       = "input",
-            value     = state.input_value,
-            focused   = state.focused_id == "input",
-            on_change = "input.changed",
-            on_submit = "input.submit",
-            min_lines = 1,
-            max_lines = 6,
-            placeholder = "type a message — Enter to send, /quit to exit",
-          },
-        },
-      },
-      popup_widget(state),
+      main_column,
+      popup_help(state),
+      popup_message(state),
+      popup_tool_permission(state),
+      popup_toast(state),
     },
   }
 end
 
 ------------------------------------------------------------------------
--- transcript helpers (state mutation, kept local to chat.lua)
+-- transcript helpers (state mutation)
 ------------------------------------------------------------------------
 
 local function push_entry(state, entry)
@@ -586,26 +974,20 @@ local function push_entry(state, entry)
   return shallow_merge(state, { entries = entries })
 end
 
--- Append delta text into the in-flight assistant entry. If no entry is
--- in flight, create one. Mirrors the legacy chat plugin's
--- `append_assistant_delta` semantics.
 local function append_assistant_delta(state, delta)
   if state.in_flight ~= nil and state.entries[state.in_flight] then
     local entries = {}
     for i, v in ipairs(state.entries) do
       entries[i] = (i == state.in_flight)
-        and shallow_merge(v, { text = (v.text or "") .. delta })
+        and shallow_merge(v, { text = (v.text or "") .. delta, streaming = true })
         or v
     end
     return shallow_merge(state, { entries = entries, pending = false })
   end
-  -- First delta of a new turn.
   local entries = {}
   for i, v in ipairs(state.entries) do entries[i] = v end
   entries[#entries + 1] = {
-    role = "assistant",
-    text = delta,
-    kind = "stream",
+    role = "assistant", text = delta, kind = "stream", streaming = true,
   }
   return shallow_merge(state, {
     entries   = entries,
@@ -614,25 +996,80 @@ local function append_assistant_delta(state, delta)
   })
 end
 
-local function finalize_assistant(state, final_text, model, duration_ms)
+local function append_reasoning_delta(state, delta)
+  -- Ensure we have an in-flight assistant entry; reasoning rides above it.
+  local idx = state.in_flight
+  local entries = {}
+  for i, v in ipairs(state.entries) do entries[i] = v end
+  if idx == nil then
+    entries[#entries + 1] = {
+      role = "assistant", text = "", kind = "stream", streaming = true,
+      reasoning = { text = delta, streaming = true },
+    }
+    return shallow_merge(state, {
+      entries = entries, in_flight = #entries, pending = false,
+    })
+  end
+  local cur = entries[idx]
+  local prev = cur.reasoning or { text = "", streaming = true }
+  entries[idx] = shallow_merge(cur, {
+    streaming = true,
+    reasoning = shallow_merge(prev, {
+      text      = (prev.text or "") .. delta,
+      streaming = true,
+    }),
+  })
+  return shallow_merge(state, { entries = entries, pending = false })
+end
+
+local function finalize_reasoning(state, duration_ms)
   if state.in_flight == nil then return state end
   local entries = {}
   for i, v in ipairs(state.entries) do
     if i == state.in_flight then
-      local merged = shallow_merge(v, {
+      local prev = v.reasoning or { text = "", streaming = true }
+      entries[i] = shallow_merge(v, {
+        reasoning = shallow_merge(prev, {
+          streaming   = false,
+          duration_ms = duration_ms or prev.duration_ms,
+        }),
+      })
+    else
+      entries[i] = v
+    end
+  end
+  return shallow_merge(state, { entries = entries })
+end
+
+local function finalize_assistant(state, final_text, model, duration_ms)
+  local now = tui.now_ms()
+  local turn_dur = duration_ms or (state.turn_started_at and (now - state.turn_started_at)) or nil
+  if state.in_flight == nil then
+    -- Empty turn (e.g. error) — still record durations.
+    return shallow_merge(state, {
+      pending = false, turn_started_at = NIL_SENTINEL,
+      last_turn_duration_ms = turn_dur,
+    })
+  end
+  local entries = {}
+  for i, v in ipairs(state.entries) do
+    if i == state.in_flight then
+      entries[i] = shallow_merge(v, {
         text        = final_text and #final_text > 0 and final_text or v.text,
         model       = model or v.model,
         duration_ms = duration_ms or v.duration_ms,
+        streaming   = false,
       })
-      entries[i] = merged
     else
       entries[i] = v
     end
   end
   return shallow_merge(state, {
-    entries   = entries,
-    in_flight = nil,
-    pending   = false,
+    entries          = entries,
+    in_flight        = NIL_SENTINEL,
+    pending          = false,
+    turn_started_at  = NIL_SENTINEL,
+    last_turn_duration_ms = turn_dur,
   })
 end
 
@@ -652,30 +1089,12 @@ local function attach_tool_end(state, id, output, error_flag)
 end
 
 ------------------------------------------------------------------------
--- update
+-- DAG panel state mutators
 ------------------------------------------------------------------------
---
--- The router for every event reaching the surface — keys, mouse,
--- text_input callbacks, NCP envelopes from peers (chat.* + others). All
--- state changes flow through here; side-effects are returned as a list
--- the engine drains.
-
-local function parse_slash(text)
-  if text:sub(1, 1) ~= "/" then return nil end
-  local cmd = text:match("^/(%S+)")
-  return cmd
-end
-
--- ── DAG-panel state mutators ──────────────────────────────────────────
---
--- Each handler returns a fresh state with state.dag_runs replaced by an
--- updated map. Treating dag_runs as immutable per dispatch matches the
--- shallow_merge convention the rest of the surface uses: no aliasing
--- across frames means the reconciler diffs cleanly.
 
 local function dag_apply(state, run_id, fn)
   local prev_runs = state.dag_runs or {}
-  local new_runs  = {}
+  local new_runs = {}
   for k, v in pairs(prev_runs) do new_runs[k] = v end
   new_runs[run_id] = fn(prev_runs[run_id])
   return shallow_merge(state, { dag_runs = new_runs })
@@ -685,12 +1104,9 @@ local function dag_run_started(state, run_id, total_nodes, now_ms)
   if state.dag_runs and state.dag_runs[run_id] then return state end
   return dag_apply(state, run_id, function(_)
     return {
-      run_id          = run_id,
-      total_nodes     = total_nodes or 0,
-      started_at_ms   = now_ms,
-      nodes           = {},
-      completed_at_ms = nil,
-      status          = nil,
+      run_id = run_id, total_nodes = total_nodes or 0,
+      started_at_ms = now_ms, nodes = {},
+      completed_at_ms = nil, status = nil,
     }
   end)
 end
@@ -698,18 +1114,15 @@ end
 local function dag_node_dispatched(state, run_id, node_id, reasoner, now_ms)
   return dag_apply(state, run_id, function(prev)
     local run = prev or {
-      run_id          = run_id,
-      total_nodes     = 0,
-      started_at_ms   = now_ms,
-      nodes           = {},
-      completed_at_ms = nil,
+      run_id = run_id, total_nodes = 0, started_at_ms = now_ms,
+      nodes = {}, completed_at_ms = nil,
     }
     local nodes = {}
     for k, v in pairs(run.nodes or {}) do nodes[k] = v end
     nodes[node_id] = {
-      reasoner       = reasoner or "",
-      status         = "running",
-      started_at_ms  = now_ms,
+      reasoner = reasoner or "",
+      status = "running",
+      started_at_ms = now_ms,
       finished_at_ms = nil,
     }
     return shallow_merge(run, { nodes = nodes })
@@ -727,13 +1140,11 @@ local function dag_node_result(state, run_id, node_id, has_output, has_error, no
     for k, v in pairs(prev.nodes or {}) do nodes[k] = v end
     local node = nodes[node_id]
     local status
-    if has_output    then status = "done"
+    if has_output then status = "done"
     elseif has_error then status = "error"
-    else                  status = "error" -- malformed; mark as error
-    end
+    else status = "error" end
     nodes[node_id] = shallow_merge(node, {
-      status         = status,
-      finished_at_ms = now_ms,
+      status = status, finished_at_ms = now_ms,
     })
     return shallow_merge(prev, { nodes = nodes })
   end)
@@ -742,80 +1153,167 @@ end
 local function dag_run_complete(state, run_id, status, results, now_ms)
   if not (state.dag_runs and state.dag_runs[run_id]) then return state end
   return dag_apply(state, run_id, function(prev)
-    -- Apply terminal status to nodes that didn't see a node_result —
-    -- skipped nodes appear as `{ skipped = true }` in `results`. Keeps
-    -- the panel honest about what actually ran.
     local nodes = {}
     for k, v in pairs(prev.nodes or {}) do nodes[k] = v end
     if type(results) == "table" then
       for node_id, entry in pairs(results) do
         if type(entry) == "table" and entry.skipped == true then
           nodes[node_id] = {
-            reasoner       = nodes[node_id] and nodes[node_id].reasoner or "",
-            status         = "skipped",
-            started_at_ms  = nodes[node_id] and nodes[node_id].started_at_ms or now_ms,
+            reasoner = nodes[node_id] and nodes[node_id].reasoner or "",
+            status = "skipped",
+            started_at_ms = nodes[node_id] and nodes[node_id].started_at_ms or now_ms,
             finished_at_ms = now_ms,
           }
         end
       end
     end
     return shallow_merge(prev, {
-      nodes           = nodes,
-      completed_at_ms = now_ms,
-      status          = status,
+      nodes = nodes, completed_at_ms = now_ms, status = status,
     })
   end)
+end
+
+------------------------------------------------------------------------
+-- max-tokens lookup (per-model context window)
+------------------------------------------------------------------------
+
+local function model_max_tokens(model)
+  if model == nil then return nil end
+  local m = model:lower()
+  if m:find("opus") or m:find("sonnet") or m:find("haiku") then return 200000 end
+  return nil
+end
+
+------------------------------------------------------------------------
+-- update
+------------------------------------------------------------------------
+
+local function parse_slash(text)
+  if text:sub(1, 1) ~= "/" then return nil, nil, false end
+  local cmd, rest = text:match("^/(%S+)%s*(.*)$")
+  local has_ws = text:find("^/%S+%s") ~= nil
+  return cmd, (rest ~= "" and rest or nil), has_ws
+end
+
+local function refresh_slash(state, text)
+  if text == nil or text:sub(1, 1) ~= "/" then
+    return shallow_merge(state, { slash = NIL_SENTINEL })
+  end
+  local cmd, _args, has_ws = parse_slash(text)
+  if has_ws then
+    -- User typed past the command name → close the popup.
+    return shallow_merge(state, { slash = NIL_SENTINEL })
+  end
+  local matches = slash_filter(cmd or "")
+  return shallow_merge(state, {
+    slash = { matches = matches, cursor = 1, query = cmd or "" },
+  })
 end
 
 local function update(msg, state)
   local kind = msg.kind or ""
 
-  -- Pure-update prune: every event drives a stale-run sweep so a
-  -- completed run drops within DAG_LINGER_MS of any subsequent dispatch
-  -- (key, mouse, peer event — anything). When the panel is visible and
-  -- a run just completed there's nearly always more traffic; in the
-  -- rare quiescent case the row sticks around until the next event,
-  -- which the user already saw transition green/red.
+  -- Pure-update prune for stale dag runs + expired toast.
   do
     local now = tui.now_ms()
     local pruned = prune_dag_runs(state.dag_runs or {}, now)
     if pruned ~= state.dag_runs then
       state = shallow_merge(state, { dag_runs = pruned })
     end
+    if state.toast and state.toast.expires_at_ms and now >= state.toast.expires_at_ms then
+      state = shallow_merge(state, { toast = NIL_SENTINEL })
+    end
   end
 
   -- ── text_input callbacks ────────────────────────────────────────────
   if kind == "input.changed" then
-    return shallow_merge(state, { input_value = msg.value or "" }), {}
+    local v = msg.value or ""
+    state = shallow_merge(state, { input_value = v })
+    state = refresh_slash(state, v)
+    return state, {}
   end
 
   if kind == "input.submit" then
     local text = msg.value or ""
     if #text == 0 then return state, {} end
-    -- Slash commands handled locally; everything else ships as
-    -- chat.input.submit on the bus.
-    local slash = parse_slash(text)
-    if slash == "quit" or slash == "exit" then
+    -- Slash dispatch.
+    local cmd, args, _has_ws = parse_slash(text)
+    if cmd == "quit" or cmd == "exit" then
       return state, { { kind = "exit" } }
     end
-    if slash == "new" then
-      local new_state = shallow_merge(state, {
-        entries     = {},
-        in_flight   = nil,
-        input_value = "",
-        pending     = false,
+    if cmd == "new" or cmd == "clear" then
+      local cleared = shallow_merge(state, {
+        entries = {}, in_flight = NIL_SENTINEL, input_value = "",
+        pending = false, slash = NIL_SENTINEL,
       })
-      return new_state, {
+      return cleared, {
         { kind = "send_to", target = "engine",
           body = { kind = "chat.reset" } },
       }
     end
-    -- Echo the user message into the transcript so the entry shows up
-    -- before the network round-trip; mirrors legacy chat plugin.
+    if cmd == "help" then
+      return shallow_merge(state, {
+        input_value = "", slash = NIL_SENTINEL,
+        popup = { variant = "help" },
+      }), {}
+    end
+    if cmd == "yolo" then
+      local s = shallow_merge(state, { input_value = "", slash = NIL_SENTINEL })
+      return s, {
+        { kind = "send_to", target = "engine",
+          body = { kind = "tool-gate.set_mode", mode = "yolo" } },
+      }
+    end
+    if cmd == "safe" then
+      local s = shallow_merge(state, { input_value = "", slash = NIL_SENTINEL })
+      return s, {
+        { kind = "send_to", target = "engine",
+          body = { kind = "tool-gate.set_mode", mode = "normal" } },
+      }
+    end
+    if cmd == "login" or cmd == "logout" then
+      local body = { kind = "chat." .. cmd .. "_requested" }
+      if args and #args > 0 then body.provider = args end
+      return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL }), {
+        { kind = "send_to", target = "engine", body = body },
+      }
+    end
+    if cmd == "model" then
+      local body
+      if args and #args > 0 then
+        body = { kind = "chat.model.set", model = args }
+      else
+        body = { kind = "chat.model.list_requested" }
+      end
+      return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL }), {
+        { kind = "send_to", target = "engine", body = body },
+      }
+    end
+    if cmd == "resume" then
+      local body = { kind = "chat.resume" }
+      if args and #args > 0 then body.session_id = args end
+      return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL }), {
+        { kind = "send_to", target = "engine", body = body },
+      }
+    end
+    if cmd == "dag-test" then
+      return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL }), {
+        { kind = "send_to", target = "engine",
+          body = { kind = "chat.command", name = "dag-test" } },
+      }
+    end
+    if cmd ~= nil then
+      -- Unknown slash → generic chat.command for user-defined Lua handlers.
+      return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL }), {
+        { kind = "send_to", target = "engine",
+          body = { kind = "chat.command", name = cmd, args = args or "" } },
+      }
+    end
+    -- Plain text submit.
     local with_user = push_entry(state, { role = "user", text = text, kind = "text" })
     local cleared = shallow_merge(with_user, {
-      input_value = "",
-      pending     = true,
+      input_value = "", pending = true,
+      turn_started_at = tui.now_ms(), slash = NIL_SENTINEL,
     })
     return cleared, {
       { kind = "send_to", target = "engine",
@@ -823,7 +1321,7 @@ local function update(msg, state)
     }
   end
 
-  -- ── keyboard shortcuts (all bubble unless a text_input swallowed) ──
+  -- ── keyboard shortcuts ──────────────────────────────────────────────
   if kind == "key.ctrl_c" then
     return state, { { kind = "exit" } }
   end
@@ -833,25 +1331,102 @@ local function update(msg, state)
   end
 
   if kind == "key.ctrl_o" then
-    if state.popup then
-      return shallow_merge(state, { popup = nil }), {}
+    -- Global toggle for tool I/O + reasoning expansion.
+    return shallow_merge(state, { expanded_details = not state.expanded_details }), {}
+  end
+
+  if kind == "key.?" or kind == "key.shift_?" then
+    -- ? opens help only when the input is empty (so users can type ? in
+    -- regular messages). Otherwise it bubbles into the input field.
+    if state.input_value == "" then
+      return shallow_merge(state, { popup = { variant = "help" } }), {}
     end
-    return shallow_merge(state, {
-      popup = { title = "help", body = HELP_TEXT },
-    }), {}
+    return state, {}
   end
 
   if kind == "key.escape" then
-    if state.popup then
-      return shallow_merge(state, { popup = nil }), {}
+    -- 1) close popup
+    if state.popup or state.toast then
+      -- Tool permission ESC = deny.
+      if state.popup and state.popup.variant == "tool_permission" then
+        local id = state.popup.id
+        return shallow_merge(state, { popup = NIL_SENTINEL }), {
+          { kind = "send_to", target = "engine",
+            body = { kind = "tool.permission_response", id = id, decision = "deny" } },
+        }
+      end
+      return shallow_merge(state, { popup = NIL_SENTINEL, toast = NIL_SENTINEL }), {}
     end
+    -- 2) close slash autocomplete
+    if state.slash then
+      return shallow_merge(state, { slash = NIL_SENTINEL }), {}
+    end
+    -- 3) double-ESC escalation
+    local now = tui.now_ms()
+    if state.last_esc_ms and (now - state.last_esc_ms) <= DOUBLE_ESC_MS then
+      return shallow_merge(state, { last_esc_ms = NIL_SENTINEL }), {
+        { kind = "send_to", target = "engine",
+          body = { kind = "chat.interrupt_all" } },
+      }
+    end
+    -- 4) single ESC interrupts the current turn
     if state.pending or state.in_flight ~= nil then
-      return state, {
+      return shallow_merge(state, { last_esc_ms = now }), {
         { kind = "send_to", target = "engine",
           body = { kind = "chat.interrupt" } },
       }
     end
-    return state, {}
+    -- Stamp anyway so a follow-up ESC within the window can escalate.
+    return shallow_merge(state, { last_esc_ms = now }), {}
+  end
+
+  -- Tool permission popup keys.
+  if state.popup and state.popup.variant == "tool_permission" then
+    if kind == "key.a" or kind == "key.A" then
+      local id = state.popup.id
+      return shallow_merge(state, { popup = NIL_SENTINEL }), {
+        { kind = "send_to", target = "engine",
+          body = { kind = "tool.permission_response", id = id, decision = "approve" } },
+      }
+    end
+    if kind == "key.d" or kind == "key.D" then
+      local id = state.popup.id
+      return shallow_merge(state, { popup = NIL_SENTINEL }), {
+        { kind = "send_to", target = "engine",
+          body = { kind = "tool.permission_response", id = id, decision = "deny" } },
+      }
+    end
+  end
+
+  -- Slash autocomplete keys (when slash popup open).
+  if state.slash then
+    if kind == "key.up" then
+      local n = #(state.slash.matches or {})
+      if n == 0 then return state, {} end
+      local cur = state.slash.cursor or 1
+      cur = cur - 1
+      if cur < 1 then cur = n end
+      return shallow_merge(state, {
+        slash = shallow_merge(state.slash, { cursor = cur }),
+      }), {}
+    end
+    if kind == "key.down" then
+      local n = #(state.slash.matches or {})
+      if n == 0 then return state, {} end
+      local cur = state.slash.cursor or 1
+      cur = cur + 1
+      if cur > n then cur = 1 end
+      return shallow_merge(state, {
+        slash = shallow_merge(state.slash, { cursor = cur }),
+      }), {}
+    end
+    if kind == "key.tab" then
+      local m = state.slash.matches and state.slash.matches[state.slash.cursor]
+      if m then
+        local v = "/" .. m.name .. (m.takes_args and " " or "")
+        return shallow_merge(state, { input_value = v, slash = NIL_SENTINEL }), {}
+      end
+    end
   end
 
   if kind == "key.pageup" then
@@ -876,9 +1451,7 @@ local function update(msg, state)
     local text = msg.text or ""
     if #text == 0 then return state, {} end
     return push_entry(state, {
-      role = msg.role or "system",
-      text = text,
-      kind = "text",
+      role = msg.role or "system", text = text, kind = "text",
     }), {}
   end
 
@@ -889,8 +1462,17 @@ local function update(msg, state)
   end
 
   if kind == "chat.stream.end" then
-    local final = msg.text
-    return finalize_assistant(state, final, msg.model, msg.duration_ms), {}
+    return finalize_assistant(state, msg.text, msg.model, msg.duration_ms), {}
+  end
+
+  if kind == "chat.stream.reasoning_delta" then
+    local t = msg.text or msg.delta or ""
+    if #t == 0 then return state, {} end
+    return append_reasoning_delta(state, t), {}
+  end
+
+  if kind == "chat.stream.reasoning_end" then
+    return finalize_reasoning(state, msg.duration_ms), {}
   end
 
   if kind == "chat.session.stats" then
@@ -898,18 +1480,29 @@ local function update(msg, state)
     for k, v in pairs(msg) do
       if k ~= "kind" then stats[k] = v end
     end
-    return shallow_merge(state, { stats = stats }), {}
+    local s = shallow_merge(state, { stats = stats })
+    if msg.model and not state.model then
+      s = shallow_merge(s, {
+        model = msg.model,
+        max_tokens = model_max_tokens(msg.model) or state.max_tokens,
+      })
+    end
+    return s, {}
   end
 
   if kind == "chat.tool.start" then
+    -- Preserve the raw input table for `tool_salient`.
+    local input_str
+    if type(msg.input) == "string" then input_str = msg.input
+    elseif type(msg.input) == "table" then input_str = "(object)"
+    else input_str = "" end
     return push_entry(state, {
       kind   = "tool_call",
       role   = "tool",
       id     = msg.id or "",
       name   = msg.name or "?",
-      input  = msg.input and (type(msg.input) == "string"
-                              and msg.input
-                              or "(object)") or "",
+      input  = input_str,
+      input_table = type(msg.input) == "table" and msg.input or nil,
     }), {}
   end
 
@@ -918,72 +1511,88 @@ local function update(msg, state)
   end
 
   if kind == "chat.popup" then
+    local v = msg.level or "info"
     return shallow_merge(state, {
       popup = {
-        title = msg.title or msg.level or "popup",
-        body  = msg.message or msg.text or "",
+        variant = v,
+        title   = msg.title or v,
+        body    = msg.message or msg.text or "",
+        source  = msg.source,
       },
     }), {}
   end
 
+  if kind == "chat.toast" then
+    local now = tui.now_ms()
+    local ttl = msg.ttl_ms or 2000
+    return shallow_merge(state, {
+      toast = { text = msg.text or "", expires_at_ms = now + ttl },
+    }), {}
+  end
+
   if kind == "chat.model.set_ack" then
-    return shallow_merge(state, { model = msg.model or state.model }), {}
+    return shallow_merge(state, {
+      model = msg.model or state.model,
+      max_tokens = model_max_tokens(msg.model) or state.max_tokens,
+    }), {}
   end
 
   if kind == "chat.auth.status" then
-    -- Phase 6 keeps auth handling minimal; surface a system entry so the
-    -- user sees something when an /login flow lands. Phase 7 can render
-    -- it in the statusline once the auth panel design firms up.
-    if msg.status and msg.status ~= "ok" then
-      return push_entry(state, {
-        role = "system",
-        text = "[auth " .. tostring(msg.status) .. "] " .. tostring(msg.message or ""),
-        kind = "text",
-      }), {}
-    end
-    return state, {}
+    local provider = msg.provider or ""
+    local status = msg.status or msg.state or "unknown"
+    if provider == "" then return state, {} end
+    local auth = {}
+    for k, v in pairs(state.auth or {}) do auth[k] = v end
+    auth[provider] = status
+    return shallow_merge(state, { auth = auth }), {}
   end
 
-  -- ── DAG observation (reasoner-graph plugin lifecycle events) ────────
-  --
-  -- The chat surface is a passive observer of every graph.* event on
-  -- the bus — it doesn't submit graphs itself; it just renders what's
-  -- in flight. The four lifecycle events form a state machine:
-  --
-  --   run_started → node_dispatched → node_result → run_complete
-  --
-  -- with run_complete optionally arriving without per-node results when
-  -- the run aborts before dispatch (typecheck failure, etc).
+  if kind == "tool-gate.permission_request" then
+    -- args displayed pretty in the body.
+    local body
+    if type(msg.input) == "table" then
+      body = "(JSON args; provide via msg.input_pretty for rich format)"
+    else
+      body = tostring(msg.input or "")
+    end
+    return shallow_merge(state, {
+      popup = {
+        variant = "tool_permission",
+        tool    = msg.tool or msg.name or "?",
+        id      = msg.id,
+        body    = msg.input_pretty or body,
+        source  = msg.source,
+      },
+    }), {}
+  end
+
+  if kind == "tool-gate.mode_changed" then
+    return shallow_merge(state, { gate_yolo = msg.mode == "yolo" }), {}
+  end
+
+  -- DAG observation
   if kind == "graph.run_started" then
     local now = tui.now_ms()
     return dag_run_started(state, msg.run_id or "", msg.total_nodes or 0, now), {}
   end
-
   if kind == "graph.node_dispatched" then
     if (msg.run_id or "") == "" or (msg.node_id or "") == "" then return state, {} end
     local now = tui.now_ms()
     return dag_node_dispatched(state, msg.run_id, msg.node_id, msg.reasoner or "", now), {}
   end
-
   if kind == "graph.node_result" then
     if (msg.run_id or "") == "" or (msg.node_id or "") == "" then return state, {} end
     local now = tui.now_ms()
-    -- The wire encodes terminal status as "output present" vs "error
-    -- present"; we don't try to parse the value — the panel just needs
-    -- to know which bucket to flip the glyph to.
     local has_output = msg.output ~= nil
     local has_error  = msg.error  ~= nil
     return dag_node_result(state, msg.run_id, msg.node_id, has_output, has_error, now), {}
   end
-
   if kind == "graph.run_complete" then
     if (msg.run_id or "") == "" then return state, {} end
     local now = tui.now_ms()
     return dag_run_complete(state, msg.run_id, msg.status, msg.results, now), {}
   end
 
-  -- Unrecognised event — log silently (the Rust plugin's tracing layer
-  -- catches these at trace level if needed).
   return state, {}
 end
 

@@ -51,10 +51,11 @@ fn chat_lua_loads_and_renders_initial_frame() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let out = render_str(&mut engine);
-    // Statusline placeholder when stats haven't arrived yet.
+    // Pre-stats statusline shows the dim "Start chatting" placeholder
+    // (legacy-spec parity, not the old MVP "model: —" format).
     assert!(
-        out.contains("model:"),
-        "statusline missing 'model:': {out:?}"
+        out.contains("Start chatting to see stats"),
+        "pre-stats placeholder missing: {out:?}"
     );
     // Cursor inversion at row start splits the placeholder's first
     // character from the rest, so match a substring that's contiguous
@@ -91,9 +92,12 @@ fn streaming_delta_appends_to_transcript() {
         out.contains("hello world"),
         "concatenated deltas missing from transcript: {out:?}"
     );
+    // Per legacy spec, assistant entries have NO role label — the visual
+    // cue is the absence of the user block's left bar. The per-turn
+    // footer marker `▣` + model name is the assistant signature.
     assert!(
-        out.contains("assistant"),
-        "assistant role label missing: {out:?}"
+        out.contains('▣') && out.contains("qwen-test"),
+        "per-turn footer (▣ <model>) missing after stream end: {out:?}"
     );
 }
 
@@ -364,11 +368,227 @@ fn chat_session_stats_updates_statusline() {
     );
 
     let out = render_str(&mut engine);
+    // Spec section 4 segment order: model · ctx · cost · turns · dur · speed.
+    // "qwen-test" doesn't carry a `claude-` prefix so the stripped form
+    // is identical.
     assert!(
         out.contains("qwen-test"),
         "statusline missing model: {out:?}"
     );
-    assert!(out.contains("in: 11"), "in tokens missing: {out:?}");
-    assert!(out.contains("out: 7"), "out tokens missing: {out:?}");
-    assert!(out.contains("turns: 1"), "turns missing: {out:?}");
+    assert!(out.contains("$0.00"), "cost segment missing: {out:?}");
+    assert!(out.contains("1 turns"), "turns segment missing: {out:?}");
+    assert!(out.contains("1s"), "duration segment missing: {out:?}");
+}
+
+#[test]
+fn ctrl_o_toggles_expanded_details() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Seed a tool call (running — no output yet) so we have a tool entry
+    // to compare collapsed/expanded against.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.tool.start",
+            "id": "t1",
+            "name": "Bash",
+            "input": "ls -la /tmp",
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.tool.end",
+            "id": "t1",
+            "output": "drwxr-xr-x 4 root  root  128 May  2 12:00 .",
+        }),
+    );
+
+    // Collapsed: header glyph is `▸`, no `input:` / `output:` blocks.
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains('▸') && out.contains("Bash"),
+        "collapsed tool header missing: {out:?}"
+    );
+    assert!(
+        !out.contains("output:"),
+        "collapsed view should not show 'output:' label: {out:?}"
+    );
+
+    // Toggle to expanded via Ctrl+O.
+    engine.handle_key(key("ctrl_o")).expect("ctrl_o");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains('▼'),
+        "expanded glyph (▼) missing after Ctrl+O: {out:?}"
+    );
+    assert!(
+        out.contains("output:"),
+        "expanded view missing 'output:' label: {out:?}"
+    );
+
+    // Toggle back: collapsed again.
+    engine.handle_key(key("ctrl_o")).expect("ctrl_o again");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains('▸') && !out.contains("output:"),
+        "second Ctrl+O should collapse: {out:?}"
+    );
+}
+
+#[test]
+fn thinking_indicator_shows_pending_then_clears_on_stream_end() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Submit a prompt → state.pending becomes true, turn_started_at set.
+    for ch in "hi".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("[thinking"),
+        "thinking placeholder missing while pending: {out:?}"
+    );
+
+    // Stream end clears pending, records last_turn_duration_ms.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "text": "hello" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 100 }),
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("[thinking"),
+        "thinking placeholder should clear after stream end: {out:?}"
+    );
+    assert!(
+        out.contains("[done in"),
+        "[done in Xms] indicator missing on statusline: {out:?}"
+    );
+}
+
+#[test]
+fn double_escape_within_window_emits_interrupt_all() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Mid-turn → first ESC interrupts.
+    for ch in "hi".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    engine.handle_key(key("escape")).expect("first esc");
+    let first = engine.take_emit_queue();
+    assert_eq!(
+        first[0].1.get("kind").and_then(|v| v.as_str()),
+        Some("chat.interrupt"),
+        "first ESC should emit chat.interrupt"
+    );
+
+    // Second ESC within 600ms → escalates to interrupt_all.
+    engine.handle_key(key("escape")).expect("second esc");
+    let second = engine.take_emit_queue();
+    assert_eq!(
+        second[0].1.get("kind").and_then(|v| v.as_str()),
+        Some("chat.interrupt_all"),
+        "second ESC within window should escalate"
+    );
+}
+
+#[test]
+fn slash_help_opens_help_popup() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    for ch in "/help".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let out = render_str(&mut engine);
+    assert!(out.contains("help"), "help popup not rendered: {out:?}");
+}
+
+#[test]
+fn slash_yolo_emits_tool_gate_set_mode() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    for ch in "/yolo".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "expected one egress");
+    assert_eq!(
+        emits[0].1.get("kind").and_then(|v| v.as_str()),
+        Some("tool-gate.set_mode")
+    );
+    assert_eq!(
+        emits[0].1.get("mode").and_then(|v| v.as_str()),
+        Some("yolo")
+    );
+}
+
+#[test]
+fn tool_permission_request_opens_popup_with_approve_deny() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "tool-gate.permission_request",
+            "id": "perm-1",
+            "tool": "Bash",
+            "input_pretty": "ls -la /tmp"
+        }),
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("permission requested"),
+        "permission popup title missing: {out:?}"
+    );
+    assert!(
+        out.contains("[A]pprove") && out.contains("[D]eny"),
+        "popup footer missing approve/deny chrome: {out:?}"
+    );
+
+    // Press 'a' → emits approve response.
+    let _ = engine.take_emit_queue();
+    engine.handle_key(key("a")).expect("a");
+    let emits = engine.take_emit_queue();
+    assert_eq!(
+        emits[0].1.get("kind").and_then(|v| v.as_str()),
+        Some("tool.permission_response")
+    );
+    assert_eq!(
+        emits[0].1.get("decision").and_then(|v| v.as_str()),
+        Some("approve")
+    );
+}
+
+#[test]
+fn slash_autocomplete_opens_when_typing_slash() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    engine.handle_key(key("/")).expect("/");
+    let out = render_str(&mut engine);
+    // Multiple commands begin with `/` so the popup should list them.
+    assert!(
+        out.contains("/new") || out.contains("/help"),
+        "slash autocomplete not visible: {out:?}"
+    );
 }
