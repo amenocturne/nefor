@@ -146,6 +146,19 @@ local function humanize_tokens(n)
   return string.format("%.1fM", n / 1000000)
 end
 
+-- The spawn_graph tool returns a verbose acknowledgment string:
+--   "Submitted sub-graph run_id=<id>. Acknowledge briefly to the user,
+--    or chain another tool call. The real result will arrive later as a
+--    user message tagged `[spawn_graph(run_id=<id>) result]`."
+-- That whole blob is LLM instruction noise. Surface just the run_id —
+-- progress is already visible in the DAG sidebar.
+local function format_spawn_graph_output(output)
+  if type(output) ~= "string" or #output == 0 then return output end
+  local run_id = output:match("run_id=([%w%-]+)")
+  if run_id then return "submitted as " .. run_id end
+  return output
+end
+
 -- Render a `spawn_graph` args.graph as a compact node list + edge list.
 -- Args of each node are deliberately omitted so the popup stays scannable;
 -- a future "focus a node" UI can surface them on demand.
@@ -660,8 +673,12 @@ local function tool_expanded(entry)
   else
     rows[#rows + 1] = tui.text { content = "  output:", style = STYLE.footer, wrap = "none" }
     if entry.output and #entry.output > 0 then
+      local out_text = entry.output
+      if entry.name == "spawn_graph" then
+        out_text = format_spawn_graph_output(out_text)
+      end
       rows[#rows + 1] = tui.text {
-        content = "  " .. entry.output,
+        content = "  " .. out_text,
         style = { fg = C.md_code_fg, bg = C.md_code_block_bg },
         wrap = "word",
       }
