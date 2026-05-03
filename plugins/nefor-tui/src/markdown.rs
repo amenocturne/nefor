@@ -162,11 +162,13 @@ impl<'a> Walker<'a> {
             Tag::BlockQuote(_) => {
                 self.ensure_block_separator();
                 self.blockquote_depth += 1;
-                // Emit a `> ` prefix at the start; for multiline quotes
-                // we don't try to prefix every wrapped line — that's a
-                // layout-pass concern and we keep the walker simple.
+                // Emit a `▎ ` left-rail prefix at the start; the heavier
+                // glyph reads more clearly as a quote indicator than a
+                // bare `>`. For multiline quotes we don't try to prefix
+                // every wrapped line — that's a layout-pass concern and
+                // we keep the walker simple.
                 let s = self.theme.and_then(|th| th.blockquote).unwrap_or_default();
-                self.emit_str("> ", s);
+                self.emit_str("▎ ", s);
             }
             Tag::CodeBlock(_) => {
                 self.ensure_block_separator();
@@ -316,10 +318,15 @@ impl<'a> Walker<'a> {
             self.started = true;
             return;
         }
+        // Block boundaries (paragraph, heading, list, code-block,
+        // blockquote, hr) get a blank line between them so prose stays
+        // readable. End the current line if we're not already at line
+        // start, then emit one more `\n` for the blank.
         if !self.at_line_start {
             self.emit_str("\n", Style::default());
-            self.at_line_start = true;
         }
+        self.emit_str("\n", Style::default());
+        self.at_line_start = true;
         self.started = true;
     }
 
@@ -540,9 +547,12 @@ mod tests {
         };
         let r = render_to_styled_chars("> quoted text", Some(&theme));
         let s: String = r.iter().map(|c| c.ch).collect();
-        assert!(s.contains("> "));
-        let gt = r.iter().find(|c| c.ch == '>').expect("> present");
-        assert!(gt.style.italic);
+        // Walker emits a `▎ ` left-rail glyph styled with the blockquote
+        // theme — heavier than `> ` and reads as a quote rail rather
+        // than email-style angle-quote.
+        assert!(s.contains("▎ "));
+        let rail = r.iter().find(|c| c.ch == '▎').expect("rail glyph present");
+        assert!(rail.style.italic);
     }
 
     #[test]

@@ -329,7 +329,9 @@ local MARKDOWN_THEME = {
   h5 = { prefix = "◌", fg = "#ddcc66", italic = true },
   h6 = { prefix = "·", fg = "#dd9966", italic = true },
   link          = { fg = C.user, underline = true },
-  blockquote    = { fg = C.system, italic = true },
+  -- Blockquote: the `▎ ` rail glyph + dim cyan italic clearly reads
+  -- as "this is a quote" without competing visually with regular prose.
+  blockquote    = { fg = "#7faaaa", italic = true },
   list_marker   = { fg = C.user },
   strikethrough = { strikethrough = true },
 }
