@@ -803,6 +803,34 @@ local function build_statusline_segments(state)
   local auth = auth_segment(state.auth)
   if auth then segs[#segs + 1] = auth end
 
+  -- Scroll percentage segment (legacy spec section 4). Hidden when the
+  -- transcript fits the viewport (no scrollback). At-bottom shows
+  -- `100% ↓ bottom`; at-top `0% ↑ top`; mid `{pct}% ↑`.
+  --
+  -- `pcall` because the snapshot map only carries an entry once the
+  -- scrollable has been laid out — pre-first-render the call would
+  -- raise `no scrollable with key 'transcript'`. We treat any failure
+  -- as "no segment yet" rather than letting the statusline blow up.
+  local ok, snap = pcall(tui.scroll_position, "transcript")
+  if ok and snap and snap.max and snap.max > 0 then
+    local offset = snap.offset or 0
+    local max = snap.max
+    if offset >= max then
+      segs[#segs + 1] = { spans = {
+        { text = "100% ↓ bottom", fg = C.status_dim },
+      } }
+    elseif offset <= 0 then
+      segs[#segs + 1] = { spans = {
+        { text = "0% ↑ top", fg = C.system },
+      } }
+    else
+      local pct = math.floor(100 * (max - offset) / max + 0.5)
+      segs[#segs + 1] = { spans = {
+        { text = tostring(pct) .. "% ↑", fg = C.system },
+      } }
+    end
+  end
+
   return segs
 end
 

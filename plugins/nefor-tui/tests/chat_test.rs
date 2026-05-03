@@ -1780,6 +1780,54 @@ fn statusline_renders_below_input_row() {
 }
 
 #[test]
+fn statusline_omits_scroll_segment_when_transcript_fits_viewport() {
+    // Empty / tiny transcript → no scrollback. The scroll segment is
+    // hidden entirely (legacy spec section 4: "Only rendered when total
+    // > transcript_rows").
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    assert!(
+        !snap.contains("100% ↓"),
+        "scroll segment should be absent on empty transcript: {snap}"
+    );
+    assert!(
+        !snap.contains("0% ↑"),
+        "scroll segment should be absent on empty transcript: {snap}"
+    );
+}
+
+#[test]
+fn statusline_shows_bottom_marker_when_transcript_overflows() {
+    // Push enough messages to overflow a 24-row terminal. The
+    // transcript stick_to=end keeps us at the bottom; the scroll
+    // segment should read `100% ↓ bottom`.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    for i in 0..30 {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "chat.message.append",
+                "role": "user",
+                "text": format!("line-{i}"),
+            }),
+        );
+    }
+    // First render lays out the transcript and populates the
+    // scroll-position snapshot. The second render's `view` call sees
+    // the populated snapshot and emits the scroll segment.
+    let _ = render_snapshot(&mut engine);
+    let snap = render_snapshot(&mut engine);
+    assert!(
+        snap.contains("100% ↓ bottom"),
+        "expected `100% ↓ bottom` segment for at-end overflow:\n{snap}"
+    );
+}
+
+#[test]
 fn outer_padding_leaves_terminal_edges_blank() {
     // 1-cell outer padding so the UI doesn't sit flush against terminal
     // edges. Verify by snapshotting a fresh frame and asserting that
