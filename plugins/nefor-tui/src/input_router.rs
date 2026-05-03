@@ -139,7 +139,9 @@ pub fn is_editing_key(key: &KeyMessage, max_lines: u16) -> bool {
         }
         // Ctrl+C bubbles to Lua as the universal "exit/cancel" gesture
         // for terminal apps; absorbing it here would strand the user.
-        "a" | "v" | "z" | "y" if has_ctrl && !has_alt && !has_super => true,
+        // The remaining readline shortcuts (Ctrl+A/E/U/K/W) absorb
+        // here so the editor handles them inline.
+        "a" | "e" | "u" | "k" | "w" | "v" | "z" | "y" if has_ctrl && !has_alt && !has_super => true,
         "space" => solo_modifier,
         // Single-char printable: route as text input. Names from
         // `from_key_event` are e.g. "a", "A", "1", "?". Excludes named
@@ -251,7 +253,11 @@ pub fn apply_editing_key(
                 }
             }
         }
-        "a" if has_ctrl => state.select_all(),
+        "a" if has_ctrl => state.move_to_line_start(false),
+        "e" if has_ctrl => state.move_to_line_end(false),
+        "u" if has_ctrl => state.delete_to_line_start(),
+        "k" if has_ctrl => state.delete_to_line_end(),
+        "w" if has_ctrl => state.delete_word_backward(),
         "v" if has_ctrl => {
             // Paste: same shape — terminal-driven bracketed paste lives
             // outside the editing-key path. v1 no-op.
@@ -477,7 +483,12 @@ mod tests {
     fn focused_input_bubbles_modifier_prefixed_keys() {
         let mut r = build(ti("input", true, "hi"));
         let root = r.root.as_mut().unwrap();
-        for k in ["b", "s", "k"] {
+        // Ctrl+B/S/G are NOT readline editing keys — they bubble so a
+        // composition above can use them as shortcuts (Ctrl+B = sidebar
+        // toggle, etc.). Ctrl+A/E/U/K/W now ABSORB into the editor as
+        // their readline equivalents (line start/end, kill-to-start,
+        // kill-to-end, delete-word-back) — covered separately below.
+        for k in ["b", "s", "g"] {
             let decision = route_key(root, &key(k, vec!["ctrl"]));
             assert_eq!(decision, RouteDecision::BubbleToLua, "ctrl+{k}");
         }
@@ -485,6 +496,18 @@ mod tests {
         assert_eq!(escape, RouteDecision::BubbleToLua);
         let tab = route_key(root, &key("tab", vec![]));
         assert_eq!(tab, RouteDecision::BubbleToLua);
+    }
+
+    #[test]
+    fn focused_input_absorbs_readline_editing_chords() {
+        // Ctrl+A/E/U/K/W are readline editing chords — absorb them
+        // into the focused text_input.
+        for k in ["a", "e", "u", "k", "w"] {
+            assert!(
+                is_editing_key(&key(k, vec!["ctrl"]), 1),
+                "ctrl+{k} should be an editing key"
+            );
+        }
     }
 
     #[test]

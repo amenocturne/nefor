@@ -235,6 +235,64 @@ pub fn line_end(s: &str, idx: usize) -> usize {
     i
 }
 
+/// Whether `c` belongs to a "word" run for cursor / delete word
+/// operations. Mirrors readline's default class: alphanumerics +
+/// underscore. Anything else (whitespace, punctuation, symbols) is a
+/// boundary.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Find the offset of the next word boundary to the LEFT of `idx`.
+/// Skips trailing whitespace/punctuation, then walks across one word
+/// run. Returns `0` when the cursor is at the start. Used by Ctrl+W /
+/// Alt+Backspace / Alt+Left.
+pub fn word_boundary_left(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    // Step 1: skip non-word chars on the left side of the cursor.
+    while i > 0 {
+        let prev = prev_char_boundary(s, i);
+        let c = s[prev..i].chars().next().unwrap_or(' ');
+        if is_word_char(c) {
+            break;
+        }
+        i = prev;
+    }
+    // Step 2: walk back across the contiguous word run.
+    while i > 0 {
+        let prev = prev_char_boundary(s, i);
+        let c = s[prev..i].chars().next().unwrap_or(' ');
+        if !is_word_char(c) {
+            break;
+        }
+        i = prev;
+    }
+    i
+}
+
+/// Find the offset of the next word boundary to the RIGHT of `idx`.
+/// Skips leading non-word chars, then walks across one word run.
+pub fn word_boundary_right(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    // Step 1: skip non-word chars at the cursor.
+    while i < s.len() {
+        let c = s[i..].chars().next().unwrap_or(' ');
+        if is_word_char(c) {
+            break;
+        }
+        i = next_char_boundary(s, i);
+    }
+    // Step 2: walk forward across the word run.
+    while i < s.len() {
+        let c = s[i..].chars().next().unwrap_or(' ');
+        if !is_word_char(c) {
+            break;
+        }
+        i = next_char_boundary(s, i);
+    }
+    i
+}
+
 /// Whether the input should accept Shift+Enter newline insertion. Single-
 /// line inputs (`max_lines = 1`) ignore Shift+Enter and bubble it.
 pub fn allows_newline_insert(max_lines: u16) -> bool {
@@ -756,6 +814,102 @@ impl TextInputState {
         EditOutcome::default()
     }
 
+    /// Ctrl+U: delete from cursor to start of current logical line.
+    /// No-op when cursor already at line start.
+    pub fn delete_to_line_start(&mut self) -> EditOutcome {
+        let start = line_start(&self.last_value, self.cursor);
+        if start == self.cursor {
+            return EditOutcome::default();
+        }
+        self.push_undo();
+        let mut value = self.last_value.clone();
+        value.replace_range(start..self.cursor, "");
+        self.cursor = start;
+        self.selection_anchor = None;
+        self.last_value = value.clone();
+        EditOutcome {
+            new_value: Some(value),
+            submitted: false,
+        }
+    }
+
+    /// Ctrl+K: delete from cursor to end of current logical line. The
+    /// trailing `\n` (if any) survives so the line break stays intact.
+    /// No-op when cursor already at line end.
+    pub fn delete_to_line_end(&mut self) -> EditOutcome {
+        let end = line_end(&self.last_value, self.cursor);
+        if end == self.cursor {
+            return EditOutcome::default();
+        }
+        self.push_undo();
+        let mut value = self.last_value.clone();
+        value.replace_range(self.cursor..end, "");
+        self.selection_anchor = None;
+        self.last_value = value.clone();
+        EditOutcome {
+            new_value: Some(value),
+            submitted: false,
+        }
+    }
+
+    /// Ctrl+W / Alt+Backspace: delete word backward — skip whitespace
+    /// then alphanumeric+underscore run before the cursor. Mirrors
+    /// readline semantics.
+    pub fn delete_word_backward(&mut self) -> EditOutcome {
+        let target = word_boundary_left(&self.last_value, self.cursor);
+        if target == self.cursor {
+            return EditOutcome::default();
+        }
+        self.push_undo();
+        let mut value = self.last_value.clone();
+        value.replace_range(target..self.cursor, "");
+        self.cursor = target;
+        self.selection_anchor = None;
+        self.last_value = value.clone();
+        EditOutcome {
+            new_value: Some(value),
+            submitted: false,
+        }
+    }
+
+    /// Alt+Delete: delete word forward — skip whitespace then word run
+    /// after the cursor.
+    pub fn delete_word_forward(&mut self) -> EditOutcome {
+        let target = word_boundary_right(&self.last_value, self.cursor);
+        if target == self.cursor {
+            return EditOutcome::default();
+        }
+        self.push_undo();
+        let mut value = self.last_value.clone();
+        value.replace_range(self.cursor..target, "");
+        self.selection_anchor = None;
+        self.last_value = value.clone();
+        EditOutcome {
+            new_value: Some(value),
+            submitted: false,
+        }
+    }
+
+    /// Alt+Left: move cursor one word backward. Selection-extend-aware.
+    pub fn move_word_left(&mut self, extend_selection: bool) -> EditOutcome {
+        self.update_selection_anchor(extend_selection);
+        self.cursor = word_boundary_left(&self.last_value, self.cursor);
+        if !extend_selection {
+            self.selection_anchor = None;
+        }
+        EditOutcome::default()
+    }
+
+    /// Alt+Right: move cursor one word forward.
+    pub fn move_word_right(&mut self, extend_selection: bool) -> EditOutcome {
+        self.update_selection_anchor(extend_selection);
+        self.cursor = word_boundary_right(&self.last_value, self.cursor);
+        if !extend_selection {
+            self.selection_anchor = None;
+        }
+        EditOutcome::default()
+    }
+
     /// Pop the most recent undo snapshot and apply it, pushing the
     /// current state onto the redo stack.
     pub fn undo(&mut self) -> EditOutcome {
@@ -1072,6 +1226,110 @@ mod tests {
         let mut s = st("abc", 1);
         s.select_all();
         assert_eq!(s.selection_range(), Some((0, 3)));
+    }
+
+    // ── Readline editing chords (Ctrl+U/K/W, Alt+Backspace/Delete/arrows) ─
+
+    #[test]
+    fn delete_to_line_start_kills_prefix() {
+        let mut s = st("hello world", 6); // cursor at 'w'
+        let outcome = s.delete_to_line_start();
+        assert_eq!(s.last_value, "world");
+        assert_eq!(s.cursor, 0);
+        assert_eq!(outcome.new_value.as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn delete_to_line_start_at_start_is_noop() {
+        let mut s = st("hello", 0);
+        let outcome = s.delete_to_line_start();
+        assert!(outcome.new_value.is_none());
+        assert_eq!(s.last_value, "hello");
+    }
+
+    #[test]
+    fn delete_to_line_end_kills_suffix() {
+        let mut s = st("hello world", 5); // cursor at space
+        let outcome = s.delete_to_line_end();
+        assert_eq!(s.last_value, "hello");
+        assert_eq!(s.cursor, 5);
+        assert_eq!(outcome.new_value.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn delete_to_line_end_preserves_trailing_newline() {
+        // Multi-line: cursor mid-line should kill to newline but keep it.
+        let mut s = st("hello\nworld", 3); // cursor in "hello"
+        let _ = s.delete_to_line_end();
+        assert_eq!(s.last_value, "hel\nworld");
+    }
+
+    #[test]
+    fn delete_word_backward_skips_whitespace_then_word() {
+        let mut s = st("foo bar baz", 11); // cursor at end
+        let _ = s.delete_word_backward();
+        assert_eq!(s.last_value, "foo bar ");
+        assert_eq!(s.cursor, 8);
+    }
+
+    #[test]
+    fn delete_word_backward_with_trailing_spaces_eats_them() {
+        let mut s = st("foo   ", 6);
+        let _ = s.delete_word_backward();
+        assert_eq!(s.last_value, "");
+    }
+
+    #[test]
+    fn delete_word_backward_at_zero_is_noop() {
+        let mut s = st("abc", 0);
+        let outcome = s.delete_word_backward();
+        assert!(outcome.new_value.is_none());
+        assert_eq!(s.last_value, "abc");
+    }
+
+    #[test]
+    fn delete_word_forward_drops_next_word() {
+        let mut s = st("foo bar baz", 0);
+        let _ = s.delete_word_forward();
+        assert_eq!(s.last_value, " bar baz");
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn move_word_left_jumps_to_previous_word_start() {
+        let mut s = st("foo bar baz", 11);
+        let _ = s.move_word_left(false);
+        assert_eq!(s.cursor, 8); // start of "baz"
+        let _ = s.move_word_left(false);
+        assert_eq!(s.cursor, 4); // start of "bar"
+    }
+
+    #[test]
+    fn move_word_right_jumps_past_next_word_end() {
+        let mut s = st("foo bar baz", 0);
+        let _ = s.move_word_right(false);
+        assert_eq!(s.cursor, 3); // end of "foo"
+        let _ = s.move_word_right(false);
+        assert_eq!(s.cursor, 7); // end of "bar"
+    }
+
+    #[test]
+    fn word_boundary_handles_punctuation_as_separator() {
+        // Punctuation is not a word char, so it acts as a boundary.
+        let mut s = st("a-b-c", 5);
+        let _ = s.delete_word_backward();
+        assert_eq!(s.last_value, "a-b-");
+    }
+
+    #[test]
+    fn word_boundary_handles_underscore_as_word_char() {
+        // Underscore counts as a word char (readline default class).
+        let mut s = st("foo_bar", 7);
+        let _ = s.delete_word_backward();
+        assert_eq!(
+            s.last_value, "",
+            "underscore-joined identifier deletes as one word"
+        );
     }
 
     #[test]
