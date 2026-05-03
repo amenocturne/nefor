@@ -442,9 +442,9 @@ mod tests {
     fn focused_text_input_absorbs_printable() {
         let mut r = build(ti("input", true, "hi"));
         let root = r.root.as_mut().unwrap();
-        // Default cursor is 0 (fresh state), so 'a' inserts at the
-        // start — the test asserts the absorption shape, not the
-        // cursor management Lua would normally drive.
+        // After the first sync the cursor sits at the end of the new
+        // value ("hi" → cursor=2, browser-input semantics for external
+        // value installs). 'a' therefore appends to the end.
         let decision = route_key(root, &key("a", vec![]));
         match decision {
             RouteDecision::HandledByTextInput {
@@ -456,7 +456,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(target_key, "input");
-                assert_eq!(value, "ahi");
+                assert_eq!(value, "hia");
                 assert!(value_changed);
                 assert!(!submitted);
                 assert_eq!(on_change.as_deref(), Some("input.changed"));
@@ -568,8 +568,10 @@ mod tests {
                 target_key, value, ..
             } => {
                 assert_eq!(target_key, "b");
-                // sync sets cursor=0 (default); inserting at 0 prepends.
-                assert_eq!(value, "yX");
+                // First sync lands cursor at end of installed value
+                // (browser-input semantics for an external value), so 'y'
+                // appends after "X".
+                assert_eq!(value, "Xy");
             }
             other => panic!("expected HandledByTextInput, got {other:?}"),
         }
@@ -639,8 +641,10 @@ mod tests {
 
     #[test]
     fn focused_multiline_bubbles_up_at_first_row() {
-        // route_key end-to-end: focused multi-line input with cursor at
-        // start of first row — Up must bubble, not absorb.
+        // route_key end-to-end: focused multi-line input with cursor on
+        // the first visual row — Up must bubble, not absorb. The first
+        // sync lands the cursor at the end of the value, so we manually
+        // park it on row 0 before exercising the router.
         let multi = WidgetDescription::TextInput {
             key: Some("input".into()),
             value: "abc\ndef".into(),
@@ -655,7 +659,10 @@ mod tests {
         };
         let mut r = build(multi);
         let root = r.root.as_mut().unwrap();
-        // Ensure cursor sits at position 0 (start of first row).
+        match &mut root.state {
+            InstanceState::TextInput(s) => s.cursor = 0,
+            _ => panic!("expected text_input state"),
+        }
         let decision = route_key(root, &key("up", vec![]));
         assert_eq!(
             decision,

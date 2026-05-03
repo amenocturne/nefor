@@ -107,15 +107,20 @@ impl TextInputState {
     /// - First sync ever: stash `value` as baseline; cursor stays at 0.
     /// - Value unchanged: keep cursor / selection / scroll verbatim.
     /// - Value changed externally (Lua rewrote it): adopt the new value
-    ///   and clamp cursor + selection + scroll to the new bounds.
+    ///   and move the cursor to the end. This matches browser semantics
+    ///   for `<input>.value = ...` — when application code replaces the
+    ///   value, the user expects the caret at the end of the new text
+    ///   (e.g. autocomplete: typing `/mo` then completing to `/model`
+    ///   should leave the cursor at offset 6, not stranded at 3). The
+    ///   selection clears since the prior anchor no longer maps onto the
+    ///   new content; scroll is similarly clamped on next paint.
     pub fn sync_with_desc(&mut self, value: &str, focused: bool) {
         self.focused = focused;
         if self.last_value != value {
             self.last_value = value.to_string();
-            self.cursor = clamp_to_char_boundary(value, self.cursor);
-            self.selection_anchor = self
-                .selection_anchor
-                .map(|a| clamp_to_char_boundary(value, a));
+            // External mutation → cursor jumps to end; drop selection.
+            self.cursor = value.len();
+            self.selection_anchor = None;
             // Scroll y can outlive a value rewrite (e.g. only one line
             // changed in a multi-line); keep it but clamp to line count.
             let lines = value.split('\n').count() as u16;
@@ -834,21 +839,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sync_seeds_baseline_and_keeps_cursor() {
+    fn sync_seeds_baseline_and_lands_cursor_at_end() {
+        // First sync ever — going from "" to "hello" counts as an
+        // external value install, so the cursor lands at the end. This
+        // matches browser semantics for `<input value="...">`: the
+        // caret starts past the prefilled text, ready to append.
         let mut st = TextInputState::default();
         st.sync_with_desc("hello", true);
         assert_eq!(st.last_value, "hello");
-        assert_eq!(st.cursor, 0);
+        assert_eq!(st.cursor, 5);
         assert!(st.focused);
     }
 
     #[test]
-    fn sync_clamps_cursor_when_value_shrinks() {
+    fn sync_moves_cursor_to_end_when_value_shrinks() {
+        // External value rewrite → cursor jumps to end of the new value.
+        // Browser-input semantics: replacing `.value` doesn't preserve
+        // the caret position from the old string.
         let mut st = TextInputState::default();
         st.sync_with_desc("hello", true);
         st.cursor = 5;
         st.sync_with_desc("hi", true);
-        assert_eq!(st.cursor, 2, "cursor clamped to new len");
+        assert_eq!(st.cursor, 2, "cursor at end of new value");
+    }
+
+    #[test]
+    fn external_value_change_moves_cursor_to_end() {
+        // Autocomplete scenario: user typed `/mo` (cursor=3), Lua rewrote
+        // value to `/model ` (length 7) on Tab. Cursor must follow to
+        // the end of the new value so the next keystroke appends.
+        let mut st = TextInputState::default();
+        st.sync_with_desc("/mo", true);
+        st.cursor = 3;
+        st.sync_with_desc("/model ", true);
+        assert_eq!(
+            st.cursor,
+            "/model ".len(),
+            "external rewrite (autocomplete) jumps cursor to end of new value"
+        );
+        assert!(
+            st.selection_anchor.is_none(),
+            "selection drops on external rewrite"
+        );
+    }
+
+    #[test]
+    fn sync_drops_selection_on_external_value_change() {
+        let mut st = TextInputState::default();
+        st.sync_with_desc("hello", true);
+        st.cursor = 4;
+        st.selection_anchor = Some(1);
+        st.sync_with_desc("world!", true);
+        assert!(
+            st.selection_anchor.is_none(),
+            "selection drops since old anchor doesn't map onto the new content"
+        );
+        assert_eq!(st.cursor, 6);
     }
 
     #[test]
