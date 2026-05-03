@@ -821,3 +821,23 @@ fn slash_autocomplete_opens_when_typing_slash() {
         "slash autocomplete not visible: {out:?}"
     );
 }
+
+#[test]
+fn slash_quit_emits_exit_side_effect() {
+    // Bug-1 regression coverage. Distinct from `slash_quit_requests_exit`
+    // above (which exercises the same code path under a different name)
+    // because the spec's bug-list explicitly names this scenario.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "/quit".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+
+    assert!(
+        engine.exit_requested(),
+        "/quit must emit `{{ kind = \"exit\" }}` side effect that the engine acts on"
+    );
+}
