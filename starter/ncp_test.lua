@@ -471,9 +471,13 @@ local function test_replayed_events_pass_through_from_plugin_transform()
 end
 
 -- ------------------------------------------------------------------
--- 10. saved_log is not replayed in v1 (explicit documentation test)
+-- 10. saved_log is not replayed when resume is inactive (default)
 -- ------------------------------------------------------------------
-local function test_saved_log_is_not_replayed_in_v1()
+--
+-- When `resume.is_active()` returns false (no parent_session at boot),
+-- saved_log is ignored — same behaviour as the v1 default before resume
+-- shipped. Replay-on-attach only covers current_log entries.
+local function test_saved_log_is_not_replayed_when_resume_inactive()
   reset()
   _test.set_plugins({ "p" })
 
@@ -490,6 +494,225 @@ local function test_saved_log_is_not_replayed_in_v1()
   assert_eq(#calls, 1, "no saved-log replay; only ready_ok")
   local decoded = json.decode(calls[1].payload)
   assert_eq(decoded.body.kind, "ready_ok", "ready_ok only")
+end
+
+-- ------------------------------------------------------------------
+-- resume.lua: per-plugin transform registry semantics
+-- ------------------------------------------------------------------
+local resume = require("resume")
+
+local function reset_resume()
+  reset()
+  resume._reset()
+end
+
+local function test_resume_unregistered_plugin_drops_by_default()
+  -- Default for plugins without a registered transform: drop. Replay is
+  -- opt-in, so a plugin that doesn't know about resume sees nothing
+  -- from the parent session — never re-fires events for sub-graphs,
+  -- in-flight tools, etc.
+  reset_resume()
+  local out = resume.transform_for_plugin("anybody", {
+    type = "event", body = { kind = "any.kind" }, from = "src",
+  })
+  assert_eq(out, nil, "unregistered plugin defaults to drop")
+end
+
+local function test_resume_registered_transform_runs()
+  reset_resume()
+  local seen
+  resume.register("dst", function(env)
+    seen = env
+    return env
+  end)
+  local in_env = {
+    type = "event", body = { kind = "carried" }, from = "src",
+  }
+  local out = resume.transform_for_plugin("dst", in_env)
+  assert_true(out ~= nil, "transform returned envelope")
+  assert_eq(out.body.kind, "carried", "body preserved")
+  assert_eq(seen.from, "src", "transform saw source plugin")
+end
+
+local function test_resume_transform_can_drop_by_returning_nil()
+  reset_resume()
+  resume.register("dst", function(_env) return nil end)
+  local out = resume.transform_for_plugin("dst", {
+    type = "event", body = { kind = "x" }, from = "src",
+  })
+  assert_eq(out, nil, "nil-return drops envelope")
+end
+
+local function test_resume_transform_error_drops_silently()
+  reset_resume()
+  resume.register("dst", function(_env) error("boom") end)
+  -- A faulty user transform during boot replay must not crash step.
+  local out = resume.transform_for_plugin("dst", {
+    type = "event", body = { kind = "x" }, from = "src",
+  })
+  assert_eq(out, nil, "error in transform drops silently")
+end
+
+local function test_resume_default_tui_transform_keeps_chat_history()
+  -- The shipped nefor-tui transform must preserve chat.message.append
+  -- and chat.stream.end (transcript-rebuild kinds) and drop everything
+  -- else (deltas, graphs, mouse/key events).
+  reset_resume()
+  local kept = resume._tui_transform({
+    type = "event", body = { kind = "chat.message.append", role = "user", text = "hi" },
+  })
+  assert_true(kept ~= nil, "chat.message.append kept")
+  local kept_end = resume._tui_transform({
+    type = "event", body = { kind = "chat.stream.end", text = "done" },
+  })
+  assert_true(kept_end ~= nil, "chat.stream.end kept")
+  -- Deltas: dropped (already merged into stream.end).
+  local dropped = resume._tui_transform({
+    type = "event", body = { kind = "chat.stream.delta", text = "x" },
+  })
+  assert_eq(dropped, nil, "chat.stream.delta dropped")
+  -- DAG events: dropped (per-firing artefacts).
+  local dag = resume._tui_transform({
+    type = "event", body = { kind = "graph.run_started", run_id = "r1" },
+  })
+  assert_eq(dag, nil, "graph.run_started dropped")
+end
+
+local function test_resume_default_provider_transform_keeps_structural_chats()
+  -- For a provider named "ollama", the transform must preserve
+  -- ollama.chat.{create,append,complete} and drop deltas/results/etc.
+  reset_resume()
+  local fac = resume._provider_transform_factory("ollama")
+  for _, k in ipairs({ "ollama.chat.create", "ollama.chat.append", "ollama.chat.complete" }) do
+    local kept = fac({ type = "event", body = { kind = k } })
+    assert_true(kept ~= nil, k .. " kept")
+  end
+  for _, k in ipairs({
+    "ollama.stream.delta", "ollama.stream.end",
+    "ollama.chat.complete.result", "ollama.auth.set",
+    "ollama.tool.advertise",
+  }) do
+    local dropped = fac({ type = "event", body = { kind = k } })
+    assert_eq(dropped, nil, k .. " dropped")
+  end
+end
+
+local function test_resume_register_defaults_wires_tui_and_provider()
+  reset_resume()
+  resume.register_defaults("ollama")
+  -- nefor-tui keeps chat.message.append.
+  local kept = resume.transform_for_plugin("nefor-tui", {
+    type = "event", body = { kind = "chat.message.append", role = "user", text = "hi" },
+  })
+  assert_true(kept ~= nil, "nefor-tui kept chat.message.append after register_defaults")
+  -- ollama keeps chat.create.
+  local kept_p = resume.transform_for_plugin("ollama", {
+    type = "event", body = { kind = "ollama.chat.create", chat_id = "c1" },
+  })
+  assert_true(kept_p ~= nil, "ollama kept chat.create after register_defaults")
+  -- Other plugins (e.g. reasoner-graph): drop everything.
+  local dropped = resume.transform_for_plugin("reasoner-graph", {
+    type = "event", body = { kind = "graph.run_started" },
+  })
+  assert_eq(dropped, nil, "reasoner-graph drops by default (unregistered)")
+end
+
+-- ------------------------------------------------------------------
+-- ncp.lua replays saved_log through resume transforms when active
+-- ------------------------------------------------------------------
+local function test_saved_log_replays_to_target_when_resume_active()
+  reset_resume()
+  resume.set_active(true)
+  -- nefor-tui keeps chat.message.append; everything else dropped.
+  resume.register("nefor-tui", function(env)
+    if env.body and env.body.kind == "chat.message.append" then return env end
+    return nil
+  end)
+  _test.set_plugins({ "nefor-tui" })
+
+  local saved = {
+    entry_plugin("nefor-tui-old", make_event({
+      kind = "chat.message.append", role = "user", text = "from-past",
+    })),
+    entry_plugin("nefor-tui-old", make_event({
+      kind = "graph.run_started", run_id = "r-old",
+    })),
+  }
+  local current = { entry_plugin("nefor-tui", make_ready("0.1")) }
+  ncp.step(saved, current)
+
+  local calls = _test.calls()
+  -- Expect ready_ok + 1 replayed event (the chat.message.append).
+  local replayed_kinds = {}
+  for _, c in ipairs(calls) do
+    if c.target == "nefor-tui" then
+      local d = json.decode(c.payload)
+      if d.type == "event" then
+        replayed_kinds[#replayed_kinds + 1] = d.body.kind
+      end
+    end
+  end
+  assert_eq(#replayed_kinds, 1, "exactly one replayed event delivered")
+  assert_eq(replayed_kinds[1], "chat.message.append",
+    "transform kept chat.message.append; dropped graph.run_started")
+end
+
+local function test_saved_log_replay_skips_self_origin()
+  -- A plugin must not see its own past emissions replayed back at it.
+  reset_resume()
+  resume.set_active(true)
+  resume.register("nefor-tui", function(env) return env end)  -- pass-through
+  _test.set_plugins({ "nefor-tui" })
+
+  local saved = {
+    entry_plugin("nefor-tui", make_event({ kind = "chat.input.submit", text = "old" })),
+    entry_plugin("other", make_event({ kind = "chat.message.append", role = "user", text = "ok" })),
+  }
+  local current = { entry_plugin("nefor-tui", make_ready("0.1")) }
+  ncp.step(saved, current)
+
+  local seen_self = false
+  local seen_other = false
+  for _, c in ipairs(_test.calls()) do
+    if c.target == "nefor-tui" then
+      local d = json.decode(c.payload)
+      if d.type == "event" and d.body and d.body.kind == "chat.input.submit" then
+        seen_self = true
+      end
+      if d.type == "event" and d.body and d.body.kind == "chat.message.append" then
+        seen_other = true
+      end
+    end
+  end
+  assert_eq(seen_self, false, "self-origin entries skipped on replay")
+  assert_eq(seen_other, true, "other-origin entries replayed")
+end
+
+local function test_saved_log_skipped_when_resume_inactive_explicit()
+  -- Even with transforms registered, saved_log replay does NOT fire if
+  -- resume is inactive. The lifecycle bit is the gate.
+  reset_resume()
+  -- Note: resume.set_active(true) NOT called.
+  resume.register("nefor-tui", function(env) return env end)
+  _test.set_plugins({ "nefor-tui" })
+
+  local saved = {
+    entry_plugin("other", make_event({
+      kind = "chat.message.append", role = "user", text = "stale",
+    })),
+  }
+  local current = { entry_plugin("nefor-tui", make_ready("0.1")) }
+  ncp.step(saved, current)
+
+  for _, c in ipairs(_test.calls()) do
+    if c.target == "nefor-tui" then
+      local d = json.decode(c.payload)
+      assert_true(
+        not (d.type == "event" and d.body and d.body.kind == "chat.message.append"),
+        "no chat.message.append replayed when resume inactive"
+      )
+    end
+  end
 end
 
 -- ------------------------------------------------------------------
@@ -1451,7 +1674,17 @@ local tests = {
   { name = "rga_register_type_dispatches_custom_handler", fn = test_rga_register_type_dispatches_custom_handler },
   { name = "rga_terminal_handler_emits_ack_and_node_result_synchronously", fn = test_rga_terminal_handler_emits_ack_and_node_result_synchronously },
   { name = "rga_for_reasoner_graph_passes_through_unrelated_kinds", fn = test_rga_for_reasoner_graph_passes_through_unrelated_kinds },
-  { name = "saved_log_is_not_replayed_in_v1", fn = test_saved_log_is_not_replayed_in_v1 },
+  { name = "saved_log_is_not_replayed_when_resume_inactive", fn = test_saved_log_is_not_replayed_when_resume_inactive },
+  { name = "resume_unregistered_plugin_drops_by_default", fn = test_resume_unregistered_plugin_drops_by_default },
+  { name = "resume_registered_transform_runs", fn = test_resume_registered_transform_runs },
+  { name = "resume_transform_can_drop_by_returning_nil", fn = test_resume_transform_can_drop_by_returning_nil },
+  { name = "resume_transform_error_drops_silently", fn = test_resume_transform_error_drops_silently },
+  { name = "resume_default_tui_transform_keeps_chat_history", fn = test_resume_default_tui_transform_keeps_chat_history },
+  { name = "resume_default_provider_transform_keeps_structural_chats", fn = test_resume_default_provider_transform_keeps_structural_chats },
+  { name = "resume_register_defaults_wires_tui_and_provider", fn = test_resume_register_defaults_wires_tui_and_provider },
+  { name = "saved_log_replays_to_target_when_resume_active", fn = test_saved_log_replays_to_target_when_resume_active },
+  { name = "saved_log_replay_skips_self_origin", fn = test_saved_log_replay_skips_self_origin },
+  { name = "saved_log_skipped_when_resume_inactive_explicit", fn = test_saved_log_skipped_when_resume_inactive_explicit },
   { name = "spawn_rejects_env_field_with_hint", fn = test_spawn_rejects_env_field_with_hint },
   { name = "spawn_rejects_args_field_with_hint", fn = test_spawn_rejects_args_field_with_hint },
   { name = "spawn_rejects_cwd_field_with_hint", fn = test_spawn_rejects_cwd_field_with_hint },
