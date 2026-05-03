@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use nefor_tui::engine::Engine;
 use nefor_tui::input::KeyMessage;
+use nefor_tui::mouse::{MouseKind, MouseMessage};
 use serde_json::{json, Map as JsonMap, Value as JsonValue};
 
 fn chat_lua_source() -> String {
@@ -1208,6 +1209,122 @@ fn arrow_up_scrolls_transcript_when_input_focused_at_top_line() {
         before - after,
         1,
         "Up arrow should scroll transcript by exactly 1 line (before={before}, after={after})"
+    );
+}
+
+#[test]
+fn arrow_up_scrolls_transcript_when_input_empty() {
+    // Spec coverage parity: when no popup is open and the input is
+    // empty, Up arrow must scroll the transcript. Companion to the
+    // top-line variant above; this one exercises the cursor-at-row-0
+    // path through the empty-buffer fast track and asserts the result
+    // by reading the live offset.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for _ in 0..40 {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "chat.message.append", "role": "user", "text": "x" }),
+        );
+    }
+    let _ = render_str(&mut engine);
+
+    fn read_offset(engine: &mut Engine, key: &str) -> u16 {
+        let lua = engine.lua();
+        let chunk = format!(
+            r#"
+            local p = tui.scroll_position("{key}")
+            return p and p.offset or -1
+            "#
+        );
+        let v: i64 = lua
+            .load(chunk.as_str())
+            .eval()
+            .expect("scroll_position eval");
+        if v < 0 {
+            panic!("no scroll_position for `{key}`");
+        }
+        v as u16
+    }
+
+    let before = read_offset(&mut engine, "transcript");
+    assert!(
+        before > 0,
+        "test prerequisite: transcript should overflow viewport"
+    );
+    engine.handle_key(key("up")).expect("up");
+    let _ = render_str(&mut engine);
+    let after = read_offset(&mut engine, "transcript");
+    assert!(
+        after < before,
+        "Up arrow on empty input + no popup must scroll transcript (before={before}, after={after})"
+    );
+}
+
+#[test]
+fn mouse_wheel_up_scrolls_transcript() {
+    // Wheel events under the transcript must scroll it. Pre-fix, the
+    // wheel path mutated `scroll_y` but left `was_at_end` sticky from
+    // the prior frame, so the next paint snapped scroll_y back to the
+    // bottom under `stick_to = end` — making the transcript appear
+    // "not scrollable". The fix updates `was_at_*` inside `scroll_by_signed`
+    // so wheel and `tui.scroll_by` stay symmetric.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for _ in 0..40 {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "chat.message.append", "role": "user", "text": "x" }),
+        );
+    }
+    let _ = render_str(&mut engine);
+
+    fn read_offset(engine: &mut Engine, key: &str) -> u16 {
+        let lua = engine.lua();
+        let chunk = format!(
+            r#"
+            local p = tui.scroll_position("{key}")
+            return p and p.offset or -1
+            "#
+        );
+        let v: i64 = lua
+            .load(chunk.as_str())
+            .eval()
+            .expect("scroll_position eval");
+        if v < 0 {
+            panic!("no scroll_position for `{key}`");
+        }
+        v as u16
+    }
+
+    let before = read_offset(&mut engine, "transcript");
+    assert!(
+        before > 0,
+        "test prerequisite: transcript should overflow viewport"
+    );
+
+    // Wheel up over the transcript area. (3, 3) sits inside the
+    // transcript's painted rect — top-left of the body row, past the
+    // 1-cell outer padding.
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Wheel,
+            x: 3,
+            y: 3,
+            button: Some("up"),
+            mods: vec![],
+        })
+        .expect("wheel up");
+    let _ = render_str(&mut engine);
+    let after = read_offset(&mut engine, "transcript");
+    assert!(
+        after < before,
+        "Wheel up must scroll transcript (before={before}, after={after}) — \
+         pre-fix the post-paint stick_to=end re-pinned scroll_y to the bottom"
     );
 }
 
