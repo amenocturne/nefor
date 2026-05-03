@@ -620,6 +620,35 @@ fn thinking_indicator_shows_pending_then_clears_on_stream_end() {
 }
 
 #[test]
+fn thinking_indicator_has_no_braille_spinner() {
+    // Legacy spec section 14 — the pre-first-delta placeholder is
+    // deliberately minimalist: static `[thinking... Ns]` text, no
+    // spinner. Earlier builds prepended a braille animation; this test
+    // pins the minimalist behavior so a future refactor can't sneak
+    // the spinner back in.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "hi".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("[thinking"),
+        "thinking placeholder missing while pending: {out:?}"
+    );
+    // None of the braille glyphs should appear anywhere in the frame.
+    for braille in ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] {
+        assert!(
+            !out.contains(braille),
+            "braille spinner glyph '{braille}' present (legacy spec: no spinner): {out:?}"
+        );
+    }
+}
+
+#[test]
 fn double_escape_within_window_emits_interrupt_all() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");

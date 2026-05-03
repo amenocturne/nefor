@@ -651,12 +651,15 @@ end
 ------------------------------------------------------------------------
 
 -- Spec section 6: pre-first-delta placeholder is `[thinking... Ns]`,
--- static (no spinner) but with per-second elapsed counter. We use
--- `tui.now_ms()` to compute the elapsed seconds on every render — same
--- monotonic clock the engine ticks on dispatch, so the counter advances
--- whenever a new event lands. Plus a `tui.animation` keeps the render
--- loop alive at frame rate so the counter ticks even between events.
-local THINKING_FRAMES = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+-- static (no spinner) but with per-second elapsed counter. Legacy
+-- chose deliberate minimalism here — no spinner, no frame cycle, just
+-- a tick that increments the integer second counter once per second.
+--
+-- We piggyback on `tui.animation` for its frame-rate side effect (it
+-- keeps the render loop alive at ~1Hz so the counter advances even
+-- without inbound events) but render zero-width frames, so visually
+-- there's no spinner — only the static `[thinking... Ns]` row.
+local THINKING_TICK_FRAMES = { "", "" }
 
 local function thinking_widget(state)
   if not state.pending then return nil end
@@ -667,11 +670,13 @@ local function thinking_widget(state)
     and string.format("[thinking... %ds]", secs)
     or  "[thinking...]"
   return tui.row {
-    gap = 1,
+    gap = 0,
     children = {
+      -- Empty 1-second-period animation drives the redraw loop so the
+      -- counter ticks; the rendered cells are blank.
       tui.animation {
-        frames      = THINKING_FRAMES,
-        duration_ms = 800,
+        frames      = THINKING_TICK_FRAMES,
+        duration_ms = 1000,
       },
       tui.text { content = body, style = STYLE.system, wrap = "none" },
     },
