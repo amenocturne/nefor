@@ -951,6 +951,86 @@ fn slash_autocomplete_opens_when_typing_slash() {
 }
 
 #[test]
+fn autocomplete_open_enter_runs_highlighted_command() {
+    // Browser-style combobox: when the slash autocomplete dropdown is
+    // open and the user presses Enter, the highlighted match runs — not
+    // the partial fragment they actually typed. Type `/mo`, the dropdown
+    // shows `/model` (the only command starting with "mo") highlighted;
+    // Enter must dispatch the `/model` action, i.e. emit
+    // `chat.model.list_requested`, not bottom-fall-through to a generic
+    // `chat.command` named "mo".
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "/mo".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("/model"),
+        "autocomplete should list /model after typing /mo: {out:?}"
+    );
+
+    let _ = engine.take_emit_queue();
+    engine.handle_key(key("enter")).expect("enter");
+    let emits = engine.take_emit_queue();
+    assert_eq!(
+        emits.len(),
+        1,
+        "Enter on open autocomplete should run highlighted command (one emit)"
+    );
+    assert_eq!(
+        emits[0].1.get("kind").and_then(|v| v.as_str()),
+        Some("chat.model.list_requested"),
+        "Enter on /mo with /model highlighted must run /model, not the partial: {:?}",
+        emits[0].1
+    );
+}
+
+#[test]
+fn autocomplete_open_tab_completes_without_submitting() {
+    // Tab while autocomplete is open replaces the input value with the
+    // highlighted match's command text — no submit fires. This test
+    // belt-and-braces the Tab path so the Enter path's new behaviour
+    // doesn't subsume Tab.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "/mo".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+
+    engine.handle_key(key("tab")).expect("tab");
+    let emits = engine.take_emit_queue();
+    assert!(
+        emits.is_empty(),
+        "Tab must not submit — it only replaces the input value: {emits:?}"
+    );
+    let out = render_str(&mut engine);
+    // The input now contains `/model ` (takes_args=true → trailing space).
+    // We verify by exit-shape via Backspace + Enter: backspace removes the
+    // trailing space, leaving `/model`, which submits to chat.model.list.
+    let _ = engine.take_emit_queue();
+    engine.handle_key(key("backspace")).expect("backspace");
+    engine.handle_key(key("enter")).expect("enter");
+    let emits = engine.take_emit_queue();
+    assert_eq!(
+        emits.len(),
+        1,
+        "Tab+backspace+Enter should submit /model: {out:?} -> emits={emits:?}"
+    );
+    assert_eq!(
+        emits[0].1.get("kind").and_then(|v| v.as_str()),
+        Some("chat.model.list_requested"),
+        "post-Tab value must be `/model `, with the cursor at end so backspace+Enter runs /model"
+    );
+}
+
+#[test]
 fn slash_quit_emits_exit_side_effect() {
     // Bug-1 regression coverage. Distinct from `slash_quit_requests_exit`
     // above (which exercises the same code path under a different name)

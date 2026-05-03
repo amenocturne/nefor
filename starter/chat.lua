@@ -1437,6 +1437,18 @@ local function update(msg, state)
 
   if kind == "input.submit" then
     local text = msg.value or ""
+    -- Slash autocomplete open + Enter → run the highlighted match,
+    -- regardless of what fragment the user actually typed. Browser-style
+    -- combobox semantics: pressing Enter while the dropdown is open
+    -- selects the focused option, it doesn't submit the partial query.
+    -- This lets `/mo` + Enter execute `/model` when the dropdown shows
+    -- `/model` highlighted (matching legacy nefor's behaviour).
+    if state.slash then
+      local m = state.slash.matches and state.slash.matches[state.slash.cursor]
+      if m then
+        text = "/" .. m.name
+      end
+    end
     if #text == 0 then return state, {} end
     -- Slash dispatch.
     local cmd, args, _has_ws = parse_slash(text)
