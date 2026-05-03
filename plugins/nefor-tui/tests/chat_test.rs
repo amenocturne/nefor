@@ -575,9 +575,16 @@ fn thinking_indicator_shows_pending_then_clears_on_stream_end() {
         !out.contains("[thinking"),
         "thinking placeholder should clear after stream end: {out:?}"
     );
+    // Legacy spec section 4 shows the turn duration as a bare segment
+    // (`100ms`, `2s`, etc.) — no `[done in ...]` brackets. The previous
+    // behavior added an extra status_ok segment that wasn't in legacy.
     assert!(
-        out.contains("[done in"),
-        "[done in Xms] indicator missing on statusline: {out:?}"
+        out.contains("100ms"),
+        "turn duration missing on statusline: {out:?}"
+    );
+    assert!(
+        !out.contains("[done in"),
+        "legacy spec: no [done in ...] segment, just bare duration: {out:?}"
     );
 }
 

@@ -715,15 +715,6 @@ local function build_statusline_segments(state)
   if last_dur ~= nil then
     segs[#segs + 1] = { spans = { { text = humanize_duration_ms(last_dur), fg = C.system } } }
   end
-  -- "[done in Xms]" indicator after the most recent stream end.
-  if state.last_turn_duration_ms ~= nil and not state.pending and state.in_flight == nil then
-    segs[#segs + 1] = {
-      spans = {
-        { text = "[done in " .. humanize_duration_ms(state.last_turn_duration_ms) .. "]",
-          fg = C.status_ok },
-      },
-    }
-  end
 
   -- Speed: tok/s when both output_tokens and duration are known.
   local ot = s.last_turn_output_tokens or s.completion_tokens
