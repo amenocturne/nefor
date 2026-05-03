@@ -10,7 +10,9 @@ use std::io::Write;
 
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 
 /// Open the controlling terminal for read+write. Each caller gets its
 /// own file descriptor.
@@ -34,19 +36,23 @@ pub struct RawModeGuard {
 }
 
 impl RawModeGuard {
-    /// Enable raw mode + mouse capture and emit any setup escapes
-    /// through the supplied writer. The writer is held until drop so
-    /// teardown escapes can use the same file descriptor.
+    /// Enable raw mode + alt-screen + mouse capture and emit any setup
+    /// escapes through the supplied writer. The writer is held until drop
+    /// so teardown escapes can use the same file descriptor.
     ///
-    /// Order on entry: enable raw mode, then enable mouse capture. The
-    /// mouse-capture sequence is a regular CSI escape; raw mode just
-    /// stops the terminal from interpreting it as input keystrokes
-    /// before crossterm gets to read them.
+    /// Order on entry: enable raw mode → enter alternate screen → enable
+    /// mouse capture. The alt-screen swap saves the user's existing
+    /// terminal contents and gives the TUI a clean canvas; on exit we
+    /// restore the original buffer so there are no leftover frame
+    /// fragments under the shell prompt.
     pub fn enter(mut writer: File) -> std::io::Result<Self> {
         enable_raw_mode()?;
+        if let Err(e) = execute!(&mut writer, EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(e);
+        }
         if let Err(e) = execute!(&mut writer, EnableMouseCapture) {
-            // Best-effort cleanup: undo raw mode before propagating so a
-            // mouse-capture failure doesn't strand the user's tty.
+            let _ = execute!(&mut writer, LeaveAlternateScreen);
             let _ = disable_raw_mode();
             return Err(e);
         }
@@ -57,12 +63,15 @@ impl RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         // Teardown order is the inverse of setup: disable mouse capture
-        // first (still inside raw mode so the disable sequence flushes
-        // cleanly), show the cursor, flush, then drop raw mode. Errors
-        // here are best-effort: by the time the guard runs there's
-        // nothing the caller can do.
+        // first, leave the alternate screen (restoring the user's
+        // original terminal contents), show the cursor, flush, then drop
+        // raw mode. Errors here are best-effort: by the time the guard
+        // runs there's nothing the caller can do.
         if let Err(e) = execute!(&mut self.writer, DisableMouseCapture) {
             tracing::error!(error = %e, "failed to disable mouse capture on tui exit");
+        }
+        if let Err(e) = execute!(&mut self.writer, LeaveAlternateScreen) {
+            tracing::error!(error = %e, "failed to leave alternate screen on tui exit");
         }
         if let Err(e) = execute!(&mut self.writer, crossterm::cursor::Show) {
             tracing::error!(error = %e, "failed to show cursor on tui exit");
