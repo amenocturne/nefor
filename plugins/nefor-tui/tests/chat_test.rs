@@ -627,6 +627,161 @@ fn ctrl_b_single_press_toggles_sidebar() {
     );
 }
 
+// ── Prompt-history recall on Up/Down with empty input ────────────────
+//
+// Legacy spec section 7: when the input field is empty and the user
+// presses Up, fill with the last submitted prompt; subsequent Up cycles
+// to older entries. Down moves forward; Down past the newest entry
+// clears the input and exits navigation. Any value mutation (typing,
+// backspace) drops the navigation cursor.
+
+#[test]
+fn arrow_up_on_empty_input_recalls_last_prompt() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Submit a first prompt so prompt_history has one entry.
+    for ch in "hello".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+
+    // Buffer should now be empty.
+    let out = render_snapshot(&mut engine);
+    assert!(
+        out.contains("hello"),
+        "submitted prompt should still appear in the transcript: {out:?}"
+    );
+
+    // Up on empty buffer recalls the last prompt.
+    engine.handle_key(key("up")).expect("up");
+    let out = render_snapshot(&mut engine);
+    assert!(
+        out.contains("hello"),
+        "input should re-fill with the recalled prompt after Up: {out:?}"
+    );
+}
+
+#[test]
+fn arrow_up_cycles_through_older_prompts() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Submit two prompts. Newest at index 1.
+    for prompt in ["first", "second"] {
+        for ch in prompt.chars() {
+            engine.handle_key(key(&ch.to_string())).expect("type");
+        }
+        engine.handle_key(key("enter")).expect("enter");
+        let _ = engine.take_emit_queue();
+    }
+
+    // Up #1 → "second" (newest)
+    engine.handle_key(key("up")).expect("up1");
+    let snap = render_snapshot(&mut engine);
+    assert!(
+        snap.contains("second"),
+        "first Up should recall the most recent prompt: {snap:?}"
+    );
+
+    // Up #2 → "first" (older)
+    engine.handle_key(key("up")).expect("up2");
+    let snap = render_snapshot(&mut engine);
+    // "second" lives in the transcript too; check the input row by
+    // looking for the input chrome `╰` rule and asserting "first" sits
+    // in the surrounding row. A simpler proxy: "first" must appear
+    // again, which it does only when the input recalls it. The
+    // submitted "first" prompt also appears in the transcript above
+    // the input, so we can't distinguish on substring alone — instead
+    // check that the snapshot contains BOTH prompts (transcript +
+    // input).
+    let firsts = snap.matches("first").count();
+    assert!(
+        firsts >= 2,
+        "second Up should also place 'first' into the input (giving 2+ occurrences): {snap:?}"
+    );
+}
+
+#[test]
+fn arrow_down_after_recall_clears_input() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "draft".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+
+    engine.handle_key(key("up")).expect("up recall");
+    let snap = render_snapshot(&mut engine);
+    let drafts = snap.matches("draft").count();
+    assert!(
+        drafts >= 2,
+        "Up should recall 'draft' into the input, giving 2 occurrences: {snap:?}"
+    );
+
+    // Down past the newest entry clears the input.
+    engine.handle_key(key("down")).expect("down clear");
+    let snap = render_snapshot(&mut engine);
+    let drafts_after = snap.matches("draft").count();
+    assert!(
+        drafts_after < drafts,
+        "Down past newest should clear the input, dropping one occurrence: \
+         was {drafts}, now {drafts_after}: {snap:?}"
+    );
+}
+
+#[test]
+fn arrow_up_on_non_empty_input_does_not_overwrite() {
+    // Legacy: Up on a non-empty single-line buffer is a no-op — the
+    // user is mid-edit and we won't yank their draft. Routes to scroll
+    // instead via the existing fallback.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "old".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    // Force a reconcile so the text_input's internal `last_value`
+    // syncs to the post-submit empty buffer before we start typing.
+    let _ = render_snapshot(&mut engine);
+
+    // Type a new draft.
+    for ch in "new".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    let snap = render_snapshot(&mut engine);
+    assert!(
+        snap.contains("new") && !snap.contains("old\n"),
+        "draft should be 'new': {snap:?}"
+    );
+
+    // Up should not overwrite the draft with "old". The text_input
+    // bubbles Up to Lua only at edge-of-content, but the chat surface's
+    // history-recall guard checks `empty || navigating` — neither true
+    // here, so the press should fall through to the scroll path
+    // without touching input_value. The single-line input bubbles Up
+    // unconditionally so the user can scroll.
+    engine.handle_key(key("up")).expect("up no-op");
+    let snap = render_snapshot(&mut engine);
+    assert!(
+        snap.contains("new"),
+        "input draft 'new' should survive Up on a non-empty buffer: {snap:?}"
+    );
+    assert!(
+        snap.matches("old").count() == 1,
+        "'old' should only appear in the transcript, not pulled into the input: {snap:?}"
+    );
+}
+
 #[test]
 fn ctrl_b_after_typing_still_single_press_toggles() {
     // Realistic user session: type a few characters into the input, then

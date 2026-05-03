@@ -283,9 +283,12 @@ local MARKDOWN_THEME = {
 --   slash             nil | { matches, cursor, query }
 --   last_esc_ms       ms of the most recent ESC press (for double-ESC)
 --   dag_runs          map keyed by run_id
+--   prompt_history    list of submitted prompts (newest at index 1, cap 200)
+--   history_cursor    nil = not navigating; integer = index into prompt_history
 
 local DAG_LINGER_MS  = 2000
 local DOUBLE_ESC_MS  = 600
+local HISTORY_CAP    = 200
 
 local function initial_state()
   return {
@@ -308,6 +311,8 @@ local function initial_state()
     last_esc_ms      = nil,
     dag_runs         = {},
     toast            = nil,  -- { text, expires_at_ms }
+    prompt_history   = {},
+    history_cursor   = nil,
   }
 end
 
@@ -1630,7 +1635,14 @@ local function update(msg, state)
   -- ── text_input callbacks ────────────────────────────────────────────
   if kind == "input.changed" then
     local v = msg.value or ""
-    state = shallow_merge(state, { input_value = v })
+    -- Any value mutation drops history navigation — once the user
+    -- starts editing the recalled prompt it stops being a history slot
+    -- and becomes the active draft. Clearing here keeps the next Up
+    -- from jumping back to the navigation cursor mid-edit.
+    state = shallow_merge(state, {
+      input_value    = v,
+      history_cursor = NIL_SENTINEL,
+    })
     state = refresh_slash(state, v)
     return state, {}
   end
@@ -1762,9 +1774,19 @@ local function update(msg, state)
     end
     -- Plain text submit.
     local with_user = push_entry(state, { role = "user", text = text, kind = "text" })
+    -- Prepend to prompt_history (newest at index 1) and cap. History
+    -- recall reads from index 1, so prepending keeps the cursor model
+    -- simple — Up = older = larger index, Down = newer = smaller.
+    local history = { text }
+    for i, v in ipairs(state.prompt_history or {}) do
+      if i >= HISTORY_CAP then break end
+      history[#history + 1] = v
+    end
     local cleared = shallow_merge(with_user, {
       input_value = "", pending = true,
       turn_started_at = tui.now_ms(), slash = NIL_SENTINEL,
+      prompt_history = history,
+      history_cursor = NIL_SENTINEL,
     })
     return cleared, {
       { kind = "send_to", target = "engine",
@@ -1814,7 +1836,14 @@ local function update(msg, state)
     if state.slash then
       return shallow_merge(state, { slash = NIL_SENTINEL }), {}
     end
-    -- 3) double-ESC escalation
+    -- 3) cancel prompt-history navigation (clear recalled value)
+    if state.history_cursor ~= nil then
+      return shallow_merge(state, {
+        input_value    = "",
+        history_cursor = NIL_SENTINEL,
+      }), {}
+    end
+    -- 4) double-ESC escalation
     local now = tui.now_ms()
     if state.last_esc_ms and (now - state.last_esc_ms) <= DOUBLE_ESC_MS then
       return shallow_merge(state, { last_esc_ms = NIL_SENTINEL }), {
@@ -1990,21 +2019,55 @@ local function update(msg, state)
   -- an edge of the input's content (single-line, or first/last visual
   -- row of multi-line), so this only fires when the input has nowhere
   -- to move the cursor.
+  --
+  -- When NO popup owns scroll AND the input is empty (or the user is
+  -- already navigating prompt history), Up/Down recall earlier prompts
+  -- per legacy spec section 7. Up walks to older prompts; Down walks
+  -- back to newer; reaching the latest+1 clears the buffer and ends
+  -- navigation. Any non-arrow key (handled below in input.changed) drops
+  -- history_cursor, so the next Up starts fresh.
   if kind == "key.up" then
     local target = active_scroll_key()
-    if target then
-      tui.scroll_by(target, -1)
-    else
+    if not target then
+      local navigating = state.history_cursor ~= nil
+      local empty = (state.input_value or "") == ""
+      if (navigating or empty) and #(state.prompt_history or {}) > 0 then
+        local cur = state.history_cursor or 0
+        local n = #state.prompt_history
+        local nxt = math.min(cur + 1, n)
+        return shallow_merge(state, {
+          input_value    = state.prompt_history[nxt],
+          history_cursor = nxt,
+        }), {}
+      end
       tui.scroll_by("transcript", -1)
+    else
+      tui.scroll_by(target, -1)
     end
     return state, {}
   end
   if kind == "key.down" then
     local target = active_scroll_key()
-    if target then
-      tui.scroll_by(target, 1)
-    else
+    if not target then
+      if state.history_cursor ~= nil then
+        local cur = state.history_cursor
+        if cur <= 1 then
+          -- Stepping past the newest entry clears the input and ends
+          -- history navigation.
+          return shallow_merge(state, {
+            input_value    = "",
+            history_cursor = NIL_SENTINEL,
+          }), {}
+        end
+        local nxt = cur - 1
+        return shallow_merge(state, {
+          input_value    = state.prompt_history[nxt],
+          history_cursor = nxt,
+        }), {}
+      end
       tui.scroll_by("transcript", 1)
+    else
+      tui.scroll_by(target, 1)
     end
     return state, {}
   end
