@@ -677,17 +677,20 @@ local function popup_help(state)
     anchor = "center",
     width  = "60%",
     height = "60%",
-    child  = tui.padding {
-      value = 1,
-      child = tui.column {
-        gap = 1,
-        children = {
-          tui.text { content = "── help ──", style = STYLE.popup_user },
-          tui.text { content = HELP_BODY, wrap = "word" },
-          tui.text { content = "(Esc / Q / Enter to close)", style = STYLE.status_dim },
+    child  = bordered_box(
+      tui.padding {
+        value = 1,
+        child = tui.column {
+          gap = 1,
+          children = {
+            tui.text { content = "── help ──", style = STYLE.popup_user },
+            tui.text { content = HELP_BODY, wrap = "word" },
+            tui.text { content = "(Esc / Q / Enter to close)", style = STYLE.status_dim },
+          },
         },
       },
-    },
+      STYLE.popup_user
+    ),
   }
 end
 
@@ -695,34 +698,37 @@ local function popup_message(state)
   if not state.popup then return nil end
   local v = state.popup.variant
   if v ~= "info" and v ~= "warning" and v ~= "error" then return nil end
-  local title_style, glyph
+  local title_style, glyph, border_style
   if v == "info" then
-    title_style, glyph = STYLE.popup_info, "ℹ"
+    title_style, glyph, border_style = STYLE.popup_info, "ℹ", STYLE.popup_info
   elseif v == "warning" then
-    title_style, glyph = STYLE.popup_warn, "⚠"
+    title_style, glyph, border_style = STYLE.popup_warn, "⚠", STYLE.popup_warn
   else
-    title_style, glyph = STYLE.popup_danger, "✕"
+    title_style, glyph, border_style = STYLE.popup_danger, "✕", STYLE.popup_danger
   end
   local title = string.format(" %s %s %s ", v, glyph, state.popup.title or "")
   return tui.anchored {
     anchor = "center",
     width  = "60%",
     height = "50%",
-    child  = tui.padding {
-      value = 1,
-      child = tui.column {
-        gap = 1,
-        children = compact {
-          tui.text { content = title, style = title_style },
-          tui.markdown { source = state.popup.body or "", theme = MARKDOWN_THEME, wrap = "word" },
-          state.popup.source and tui.text {
-            content = "from: " .. state.popup.source,
-            style   = STYLE.footer,
-          } or nil,
-          tui.text { content = "Esc / Q to close", style = STYLE.status_dim },
+    child  = bordered_box(
+      tui.padding {
+        value = 1,
+        child = tui.column {
+          gap = 1,
+          children = compact {
+            tui.text { content = title, style = title_style },
+            tui.markdown { source = state.popup.body or "", theme = MARKDOWN_THEME, wrap = "word" },
+            state.popup.source and tui.text {
+              content = "from: " .. state.popup.source,
+              style   = STYLE.footer,
+            } or nil,
+            tui.text { content = "Esc / Q to close", style = STYLE.status_dim },
+          },
         },
       },
-    },
+      border_style
+    ),
   }
 end
 
@@ -734,23 +740,26 @@ local function popup_tool_permission(state)
     anchor = "center",
     width  = "60%",
     height = "50%",
-    child  = tui.padding {
-      value = 1,
-      child = tui.column {
-        gap = 1,
-        children = {
-          tui.text {
-            content = " permission requested · " .. (state.popup.tool or "?"),
-            style   = STYLE.popup_warn,
-          },
-          tui.text { content = state.popup.body or "", wrap = "word" },
-          tui.text {
-            content = "[A]pprove   [D]eny   (Esc = deny)",
-            style   = STYLE.status_warn,
+    child  = bordered_box(
+      tui.padding {
+        value = 1,
+        child = tui.column {
+          gap = 1,
+          children = {
+            tui.text {
+              content = " permission requested · " .. (state.popup.tool or "?"),
+              style   = STYLE.popup_warn,
+            },
+            tui.text { content = state.popup.body or "", wrap = "word" },
+            tui.text {
+              content = "[A]pprove   [D]eny   (Esc = deny)",
+              style   = STYLE.status_warn,
+            },
           },
         },
       },
-    },
+      STYLE.popup_warn
+    ),
   }
 end
 

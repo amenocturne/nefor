@@ -554,8 +554,19 @@ fn slash_help_opens_help_popup() {
         engine.handle_key(key(&ch.to_string())).expect("type");
     }
     engine.handle_key(key("enter")).expect("enter");
-    let out = render_str(&mut engine);
-    assert!(out.contains("help"), "help popup not rendered: {out:?}");
+    let _ = render_str(&mut engine);
+    // Help popup is wrapped in `bordered_box`. Snapshot the framebuffer
+    // to assert the corners + side bars actually paint.
+    let snap = engine.snapshot();
+    assert!(snap.contains("help"), "help popup body missing: {snap}");
+    assert!(
+        snap.contains('╭') && snap.contains('╮'),
+        "help popup top corners missing: {snap}"
+    );
+    assert!(
+        snap.contains('╰') && snap.contains('╯'),
+        "help popup bottom corners missing: {snap}"
+    );
 }
 
 #[test]
@@ -603,6 +614,12 @@ fn tool_permission_request_opens_popup_with_approve_deny() {
         out.contains("[A]pprove") && out.contains("[D]eny"),
         "popup footer missing approve/deny chrome: {out:?}"
     );
+    // Permission popup wraps content in bordered_box — corners must paint.
+    let snap = engine.snapshot();
+    assert!(
+        snap.contains('╭') && snap.contains('╮') && snap.contains('╰') && snap.contains('╯'),
+        "permission popup borders missing: {snap}"
+    );
 
     // Press 'a' → emits approve response.
     let _ = engine.take_emit_queue();
@@ -616,6 +633,38 @@ fn tool_permission_request_opens_popup_with_approve_deny() {
         emits[0].1.get("decision").and_then(|v| v.as_str()),
         Some("approve")
     );
+}
+
+#[test]
+fn chat_popup_info_warning_error_all_render_with_borders() {
+    // All three message-popup variants share `bordered_box` chrome — only
+    // the border color and title glyph differ. Verifies each fires the
+    // box-drawing corners; color verification stays out of scope (the
+    // snapshot drops style by design).
+    for level in &["info", "warning", "error"] {
+        let mut engine = Engine::new(80, 24).expect("engine");
+        engine.load_scenario(&chat_lua_source()).expect("load");
+        let _ = render_str(&mut engine);
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "chat.popup",
+                "level": level,
+                "title": "test",
+                "message": "body text",
+            }),
+        );
+        let _ = render_str(&mut engine);
+        let snap = engine.snapshot();
+        assert!(
+            snap.contains('╭') && snap.contains('╮') && snap.contains('╰') && snap.contains('╯'),
+            "{level} popup borders missing: {snap}"
+        );
+        assert!(
+            snap.contains("body text"),
+            "{level} popup body missing: {snap}"
+        );
+    }
 }
 
 #[test]
