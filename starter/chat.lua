@@ -146,6 +146,33 @@ local function humanize_tokens(n)
   return string.format("%.1fM", n / 1000000)
 end
 
+-- Pad every line of `text` with trailing spaces to the longest line's
+-- width so a styled bg renders as a rectangle instead of ragging out
+-- to per-line content widths. Lines are rendered with `wrap = "none"`
+-- by callers when this matters; padding only fixes the natural-line
+-- raggedness, not post-wrap raggedness.
+local function pad_block(text)
+  if type(text) ~= "string" or #text == 0 then return text end
+  local lines = {}
+  for line in text:gmatch("([^\n]*)") do
+    lines[#lines + 1] = line
+  end
+  -- gmatch leaves a trailing empty match after the last newline; drop it.
+  if #lines > 0 and lines[#lines] == "" then
+    table.remove(lines, #lines)
+  end
+  local max_w = 0
+  for _, l in ipairs(lines) do
+    if #l > max_w then max_w = #l end
+  end
+  for i, l in ipairs(lines) do
+    if #l < max_w then
+      lines[i] = l .. string.rep(" ", max_w - #l)
+    end
+  end
+  return table.concat(lines, "\n")
+end
+
 -- The spawn_graph tool returns a verbose acknowledgment string:
 --   "Submitted sub-graph run_id=<id>. Acknowledge briefly to the user,
 --    or chain another tool call. The real result will arrive later as a
@@ -660,12 +687,13 @@ local function tool_expanded(entry)
   end
   if input_text and #input_text > 0 then
     -- 2-space indent each line so the body sits inset from the bullet
-    -- column and the dark background reads as a single block.
+    -- column and the dark background reads as a single block. Pad each
+    -- line to max width post-indent so the bg renders as a rectangle.
     local indented = "  " .. input_text:gsub("\n", "\n  ")
     rows[#rows + 1] = tui.text {
-      content = indented,
+      content = pad_block(indented),
       style = { fg = C.md_code_fg, bg = C.md_code_block_bg },
-      wrap = "word",
+      wrap = "none",
     }
   end
   if entry.output == nil and not entry.error then
@@ -677,10 +705,11 @@ local function tool_expanded(entry)
       if entry.name == "spawn_graph" then
         out_text = format_spawn_graph_output(out_text)
       end
+      local indented_out = "  " .. out_text:gsub("\n", "\n  ")
       rows[#rows + 1] = tui.text {
-        content = "  " .. out_text,
+        content = pad_block(indented_out),
         style = { fg = C.md_code_fg, bg = C.md_code_block_bg },
-        wrap = "word",
+        wrap = "none",
       }
     end
   end
