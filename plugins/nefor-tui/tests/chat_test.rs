@@ -2130,3 +2130,239 @@ fn model_picker_typing_filters_query() {
         "typing 'q' should filter to qwen-only: {out:?}"
     );
 }
+
+// ============================================================
+// /resume slash + session picker
+// ============================================================
+//
+// The picker reads from `$NEFOR_DATA_HOME/sessions/` (overridable via
+// env var, set per-test for isolation). Selecting a row writes the
+// chosen session id to `$NEFOR_DATA_HOME/resume_target` and emits
+// `{kind="exit"}`; init.lua reads that file at the next boot.
+//
+// Test isolation: each test creates a tempdir, sets NEFOR_DATA_HOME to
+// it, and tears it down on completion. Env var manipulation is
+// process-global so we serialize via a mutex.
+
+use std::io::Write;
+use std::sync::Mutex;
+
+// Process-global lock — env var mutation is unsafe across threads.
+// `cargo test` runs unit tests in parallel by default; this serializes
+// only the tests that touch NEFOR_DATA_HOME.
+static RESUME_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct ResumeEnv {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    _tempdir: tempfile::TempDir,
+    data_home: PathBuf,
+    prev: Option<String>,
+}
+
+impl ResumeEnv {
+    fn new() -> Self {
+        let guard = RESUME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let data_home = tempdir.path().to_path_buf();
+        std::fs::create_dir_all(data_home.join("sessions")).expect("mkdir sessions");
+        let prev = std::env::var("NEFOR_DATA_HOME").ok();
+        // Tests serialize via RESUME_ENV_LOCK so concurrent reads/writes
+        // don't race. set_var is safe under edition 2021.
+        std::env::set_var("NEFOR_DATA_HOME", &data_home);
+        ResumeEnv {
+            _guard: guard,
+            _tempdir: tempdir,
+            data_home,
+            prev,
+        }
+    }
+
+    fn sessions_dir(&self) -> PathBuf {
+        self.data_home.join("sessions")
+    }
+
+    fn resume_target(&self) -> PathBuf {
+        self.data_home.join("resume_target")
+    }
+
+    fn write_session(&self, id: &str, started_at: &str, prompt: Option<&str>) {
+        let mut path = self.sessions_dir();
+        path.push(format!("{id}.jsonl"));
+        let mut f = std::fs::File::create(&path).expect("create session jsonl");
+        let header = serde_json::json!({
+            "_session": true,
+            "session_id": id,
+            "parent_session": serde_json::Value::Null,
+            "started_at": started_at,
+        });
+        writeln!(f, "{}", serde_json::to_string(&header).unwrap()).unwrap();
+        if let Some(text) = prompt {
+            // One submit entry shaped like the engine writes them: the
+            // engine stamps {ts, origin, target?, payload} and payload
+            // is itself the JSON-encoded NCP envelope.
+            let payload = serde_json::json!({
+                "type": "event",
+                "body": { "kind": "chat.input.submit", "text": text },
+            });
+            let entry = serde_json::json!({
+                "ts": "2026-05-03T12:00:00.000Z",
+                "origin": "nefor-tui",
+                "target": serde_json::Value::Null,
+                "payload": serde_json::to_string(&payload).unwrap(),
+            });
+            writeln!(f, "{}", serde_json::to_string(&entry).unwrap()).unwrap();
+        }
+    }
+}
+
+impl Drop for ResumeEnv {
+    fn drop(&mut self) {
+        // Still under RESUME_ENV_LOCK.
+        match self.prev.as_deref() {
+            Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
+            None => std::env::remove_var("NEFOR_DATA_HOME"),
+        }
+    }
+}
+
+#[test]
+fn slash_resume_opens_session_picker_popup() {
+    let env = ResumeEnv::new();
+    env.write_session("aaaa1111-1111-1111-1111-111111111111", "2026-05-01T10:00:00.000Z", Some("first prompt"));
+    env.write_session("bbbb2222-2222-2222-2222-222222222222", "2026-05-02T11:00:00.000Z", Some("second prompt"));
+
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "/resume".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("resume a session"),
+        "picker popup should open: {out:?}"
+    );
+}
+
+#[test]
+fn session_picker_lists_recent_sessions_with_preview() {
+    let env = ResumeEnv::new();
+    env.write_session(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-05-01T10:00:00.000Z",
+        Some("the first message"),
+    );
+
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "/resume".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let out = render_str(&mut engine);
+
+    // The preview text from the first user message must surface.
+    assert!(
+        out.contains("the first message"),
+        "preview should include first user prompt: {out:?}"
+    );
+    // The formatted timestamp from the header (MM-DD HH:MM).
+    assert!(
+        out.contains("05-01 10:00"),
+        "formatted timestamp should appear: {out:?}"
+    );
+}
+
+#[test]
+fn session_picker_select_writes_sidechannel_and_exits() {
+    let env = ResumeEnv::new();
+    let session_id = "abcd1234-5678-9012-3456-7890abcdef00";
+    env.write_session(session_id, "2026-05-01T10:00:00.000Z", Some("anything"));
+
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "/resume".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = render_str(&mut engine);
+
+    // Cursor defaults to 1; with one session that's our row. Hit Enter.
+    engine.handle_key(key("enter")).expect("enter on row");
+
+    assert!(
+        engine.exit_requested(),
+        "selecting a session must request exit"
+    );
+    let target_file = env.resume_target();
+    assert!(
+        target_file.exists(),
+        "resume_target file should exist at {}",
+        target_file.display()
+    );
+    let written = std::fs::read_to_string(&target_file).expect("read sidechannel");
+    assert_eq!(
+        written.trim(),
+        session_id,
+        "sidechannel should contain the chosen session id"
+    );
+}
+
+#[test]
+fn session_picker_escape_cancels_without_writing() {
+    let env = ResumeEnv::new();
+    env.write_session(
+        "deadbeef-0000-0000-0000-000000000000",
+        "2026-05-01T10:00:00.000Z",
+        Some("scratch"),
+    );
+
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "/resume".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = render_str(&mut engine);
+
+    engine.handle_key(key("escape")).expect("escape");
+    assert!(!engine.exit_requested(), "escape must not exit");
+    assert!(
+        !env.resume_target().exists(),
+        "no sidechannel write on escape"
+    );
+}
+
+#[test]
+fn slash_resume_with_arg_writes_sidechannel_and_exits() {
+    // `/resume <id>` is the bypass-picker path. Useful for scripted
+    // testing and copy-paste recipes — no popup, write the file and
+    // exit.
+    let env = ResumeEnv::new();
+    let session_id = "feedface-0000-0000-0000-000000000000";
+
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    let cmd = format!("/resume {session_id}");
+    for ch in cmd.chars() {
+        // `key()` uses the raw character as the keypress name. For space,
+        // the engine's input router synthesizes "key.space" — match that.
+        let n = if ch == ' ' { "space".to_string() } else { ch.to_string() };
+        engine.handle_key(key(&n)).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+
+    assert!(engine.exit_requested(), "/resume <id> should exit");
+    let written = std::fs::read_to_string(env.resume_target()).expect("read sidechannel");
+    assert_eq!(written.trim(), session_id);
+}

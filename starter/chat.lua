@@ -1085,6 +1085,285 @@ local function awaiting_count(awaiting)
   return n
 end
 
+------------------------------------------------------------------------
+-- session resume — picker + sidechannel
+------------------------------------------------------------------------
+--
+-- `/resume` pops a session picker showing the last 10 sessions on disk
+-- (newest first) with a one-line preview of the first user prompt.
+-- Selecting a row writes the session id to a sidechannel file and emits
+-- `{kind="exit"}`; the user re-launches and `init.lua` reads the file at
+-- boot, sets `nefor.parent_session`, and ncp.lua replays saved_log
+-- through `resume.lua` transforms.
+--
+-- The picker is dev-tooling: in-place "warm" resume would require tearing
+-- every plugin's state down + back up, which is out of scope. Exit-and-
+-- relaunch is the cleanest contract — the OS gives us a fresh process
+-- tree and resume.lua's transforms handle the structural-history replay.
+
+-- Path to the macOS XDG-equivalent sessions directory. Linux/Windows
+-- users would adjust this — v1 ships the macOS path.
+--
+-- Test override: if `NEFOR_DATA_HOME` is set in the environment, its value
+-- is used as the data root. Lets the chat_test.rs harness point at a
+-- temp dir without touching the real `~/Library/Application Support`
+-- tree. Production envs leave this unset and fall back to $HOME.
+local function nefor_data_root()
+  local override = os.getenv("NEFOR_DATA_HOME")
+  if override ~= nil and override ~= "" then return override end
+  local home = os.getenv("HOME") or ""
+  if home == "" then return nil end
+  return home .. "/Library/Application Support/nefor"
+end
+
+local function session_dir()
+  local root = nefor_data_root()
+  if root == nil then return nil end
+  return root .. "/sessions"
+end
+
+local function resume_target_path()
+  local root = nefor_data_root()
+  if root == nil then return nil end
+  return root .. "/resume_target"
+end
+
+-- Extract the value of `"text": "..."` from a session-log JSONL line
+-- carrying a chat.input.submit event. The wire shape is:
+--   {"ts":"...","origin":"...","payload":"{\"type\":\"event\",\"body\":{\"kind\":\"chat.input.submit\",\"text\":\"<actual>\"}}"}
+-- The `text` field lives inside the embedded JSON string of `payload`,
+-- so the literal JSONL bytes contain `\"text\":\"<value>\"` (each quote
+-- backslash-escaped once). After we pull out that escaped value we
+-- un-escape `\"`, `\\`, `\n`, `\t` to recover the human-readable string.
+--
+-- We avoid pulling in a full JSON parser because chat.lua's host VM
+-- (nefor-tui) doesn't expose `nefor.json`, and the picker is dev
+-- tooling — a regex-tier extraction is fine for a one-line preview.
+local function extract_submit_text(line)
+  -- Find the escaped `\"text\":\"` marker — note the literal backslashes.
+  local _, marker_end = line:find([[\"text\":\"]], 1, true)
+  if marker_end == nil then
+    -- Fall back to the un-escaped form for tests that synthesise the
+    -- inner envelope directly without double-encoding.
+    _, marker_end = line:find('"text":"', 1, true)
+    if marker_end == nil then return nil end
+  end
+  local i = marker_end + 1
+  local out = {}
+  local n = #line
+  while i <= n do
+    local c = line:sub(i, i)
+    if c == "\\" and i < n then
+      local nxt = line:sub(i + 1, i + 1)
+      if nxt == "\\" and i + 1 < n then
+        -- Escaped backslash inside the embedded JSON: `\\\"` is the
+        -- escaped form of an escaped quote inside the inner string.
+        local nnxt = line:sub(i + 2, i + 2)
+        if nnxt == '"' then
+          -- Inner closing quote of the string value — we're done.
+          return table.concat(out)
+        end
+        out[#out + 1] = "\\"
+        i = i + 2
+      elseif nxt == '"' then
+        out[#out + 1] = '"'
+        i = i + 2
+      elseif nxt == "n" then
+        out[#out + 1] = "\n"
+        i = i + 2
+      elseif nxt == "t" then
+        out[#out + 1] = "\t"
+        i = i + 2
+      else
+        out[#out + 1] = nxt
+        i = i + 2
+      end
+    elseif c == '"' then
+      -- Plain (non-escaped) quote means we matched the un-escaped form.
+      return table.concat(out)
+    else
+      out[#out + 1] = c
+      i = i + 1
+    end
+  end
+  return nil
+end
+
+-- Extract started_at from the JSONL header: a known-shape line
+--   {"_session":true,"session_id":"...","parent_session":...,"started_at":"<iso>"}
+-- Pattern-match the `"started_at":"<value>"` field; same rationale as
+-- extract_submit_text — we don't need a full JSON parser.
+local function extract_started_at(header_line)
+  local v = header_line:match('"started_at"%s*:%s*"([^"]+)"')
+  return v
+end
+
+-- List up to `limit` newest sessions on disk. Each row:
+--   { id = "<uuid>", path = "<full>", started_at = "<iso>", preview = "<first user prompt>" }
+-- The preview is best-effort: we scan the JSONL for the first
+-- `chat.input.submit` event and pull `text`. Sessions with no submits
+-- (e.g. crashed boots) get a "(no submits)" placeholder. `started_at`
+-- comes from the header — falls back to "?" if the header is missing
+-- or malformed.
+local function list_recent_sessions(limit)
+  local dir = session_dir()
+  if dir == nil then return {} end
+  -- `ls -t` sorts newest mtime first. Pure-Lua dir iteration would need
+  -- LuaFileSystem; `io.popen` is enabled by mlua's safe stdlib.
+  local cmd = string.format("ls -t %q 2>/dev/null", dir)
+  local pipe = io.popen(cmd)
+  if pipe == nil then return {} end
+  local sessions = {}
+  for fname in pipe:lines() do
+    if #sessions >= limit then break end
+    local id = fname:match("^([%w%-]+)%.jsonl$")
+    if id ~= nil then
+      sessions[#sessions + 1] = { id = id, path = dir .. "/" .. fname }
+    end
+  end
+  pipe:close()
+  -- Enrich each row with header timestamp + first prompt preview. Read
+  -- line-by-line and stop at the first chat.input.submit hit so
+  -- multi-megabyte sessions don't slurp the whole file.
+  for _, s in ipairs(sessions) do
+    local fh = io.open(s.path, "r")
+    if fh ~= nil then
+      local header_line = fh:read("*l") or ""
+      s.started_at = extract_started_at(header_line) or "?"
+      local preview = nil
+      for line in fh:lines() do
+        -- Cheap substring filter — most lines aren't chat.input.submit.
+        if line:find("chat.input.submit", 1, true) ~= nil then
+          preview = extract_submit_text(line)
+          if preview ~= nil then break end
+        end
+      end
+      fh:close()
+      s.preview = preview or "(no submits)"
+    else
+      s.started_at = "?"
+      s.preview    = "(unreadable)"
+    end
+  end
+  return sessions
+end
+
+-- Truncate `text` to `n` columns (byte-count proxy; non-ASCII previews
+-- may render slightly off but the picker is dev-tooling). Newlines
+-- collapse to spaces so multi-line prompts render as a single row.
+local function clip_preview(text, n)
+  if text == nil then return "" end
+  text = tostring(text):gsub("\n", " "):gsub("\r", " ")
+  if #text <= n then return text end
+  return text:sub(1, math.max(0, n - 1)) .. "…"
+end
+
+-- Format the started_at timestamp for picker rows. ISO 8601 → "MM-DD HH:MM".
+-- Falls back to the raw string if it doesn't parse.
+local function format_started_at(s)
+  if type(s) ~= "string" then return "?" end
+  local mo, dy, hh, mm = s:match("^%d%d%d%d%-(%d%d)%-(%d%d)T(%d%d):(%d%d)")
+  if mo == nil then return s end
+  return string.format("%s-%s %s:%s", mo, dy, hh, mm)
+end
+
+-- Write `id` to the sidechannel resume_target file. Returns true on
+-- success. Failure is silent — the user will see the picker close + the
+-- app exit + nothing happen on relaunch, which is the diagnostic.
+local function write_resume_target(id)
+  local path = resume_target_path()
+  if path == nil then return false end
+  -- Ensure parent dir exists. The sessions dir already does (the engine
+  -- created it when writing the first session), so this is belt-and-
+  -- braces for fresh installs that have never written a session.
+  local root = nefor_data_root()
+  if root ~= nil then
+    -- mkdir -p; benign if it already exists.
+    os.execute(string.format("mkdir -p %q", root))
+  end
+  local fh = io.open(path, "w")
+  if fh == nil then return false end
+  fh:write(id)
+  fh:close()
+  return true
+end
+
+-- Session picker popup. Border is HL_USER. Layout:
+--   ╭── resume a session ──────╮
+--   │ MM-DD HH:MM  <preview>   │  ← cursor row inverted
+--   │ MM-DD HH:MM  <preview>   │
+--   │ ↑/↓ Enter pick · Esc     │
+--   ╰──────────────────────────╯
+local function popup_session_picker(state)
+  if not state.popup or state.popup.variant ~= "session_picker" then return nil end
+  local p = state.popup
+  local sessions = p.sessions or {}
+  local cursor = p.cursor or 1
+  if cursor < 1 then cursor = 1 end
+  if cursor > #sessions and #sessions > 0 then cursor = #sessions end
+
+  local body_rows = {}
+  if #sessions == 0 then
+    body_rows[#body_rows + 1] = tui.text {
+      content = "No saved sessions found.",
+      style   = STYLE.status_dim, wrap = "word",
+    }
+    body_rows[#body_rows + 1] = tui.text {
+      content = "Sessions live at " .. (session_dir() or "<unknown>"),
+      style   = STYLE.status_dim, wrap = "word",
+    }
+  else
+    -- Window the visible rows around the cursor.
+    local cap = 12
+    local first = 1
+    if #sessions > cap then
+      first = math.max(1, math.min(cursor - cap + 1, #sessions - cap + 1))
+      if first < 1 then first = 1 end
+    end
+    local last = math.min(first + cap - 1, #sessions)
+    for i = first, last do
+      local s = sessions[i]
+      local stamp = format_started_at(s.started_at)
+      local preview = clip_preview(s.preview, 50)
+      local row = string.format("%-12s  %s", stamp, preview)
+      local style = (i == cursor)
+        and { fg = "#000000", bg = C.user }
+        or  STYLE.status
+      body_rows[#body_rows + 1] = tui.text {
+        content = row, style = style, wrap = "none",
+      }
+    end
+  end
+
+  local children = {
+    tui.text {
+      content = "── resume a session ──",
+      style   = STYLE.popup_user,
+      wrap    = "none",
+    },
+    tui.column { gap = 0, children = body_rows },
+    tui.text {
+      content = "↑/↓ select · Enter resume · Esc cancel",
+      style   = STYLE.status_dim,
+      wrap    = "none",
+    },
+  }
+
+  return tui.anchored {
+    anchor = "center",
+    width  = "70%",
+    height = "60%",
+    child  = bordered_popup(
+      "popup_session_picker",
+      tui.padding {
+        value = 1,
+        child = tui.column { gap = 1, children = children },
+      },
+      STYLE.popup_user
+    ),
+  }
+end
+
 -- Model picker popup (spec section 12). Border is HL_USER. Layout:
 --   ╭── pick a model ──╮
 --   │ search: <query>  │
@@ -1455,7 +1734,8 @@ local function view(state)
   -- stop swallowing keys.
   local popup_owns_keys = state.popup and (
     state.popup.variant == "tool_permission" or
-    state.popup.variant == "model_picker"
+    state.popup.variant == "model_picker" or
+    state.popup.variant == "session_picker"
   )
   local input_focused = state.focused_id == "input" and not popup_owns_keys
   local input_border_style = input_focused
@@ -1521,6 +1801,7 @@ local function view(state)
         popup_help(state),
         popup_message(state),
         popup_model_picker(state),
+        popup_session_picker(state),
         popup_tool_permission(state),
         popup_toast(state),
       },
@@ -1919,11 +2200,35 @@ local function update(msg, state)
       }), effects
     end
     if cmd == "resume" then
-      local body = { kind = "chat.resume" }
-      if args and #args > 0 then body.session_id = args end
-      return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL }), {
-        { kind = "send_to", target = "engine", body = body },
-      }
+      -- `/resume <session-id>` — direct: write sidechannel + exit.
+      -- The `chat.input.submit` for the resume command itself doesn't
+      -- need to land on the bus; we synthesize the relaunch handoff
+      -- entirely client-side. Engine relaunches with parent_session set.
+      if args and #args > 0 then
+        local id = args:match("^([%w%-]+)") or args
+        if write_resume_target(id) then
+          return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL }), {
+            { kind = "exit" },
+          }
+        end
+        -- Sidechannel write failed — surface a toast so the user knows
+        -- something went wrong rather than the app silently no-op-ing.
+        local now = tui.now_ms()
+        return shallow_merge(state, {
+          input_value = "", slash = NIL_SENTINEL,
+          toast = { text = "resume: failed to write sidechannel", expires_at_ms = now + 3000 },
+        }), {}
+      end
+      -- `/resume` (no args) — open the picker.
+      local sessions = list_recent_sessions(10)
+      return shallow_merge(state, {
+        input_value = "", slash = NIL_SENTINEL,
+        popup = {
+          variant  = "session_picker",
+          sessions = sessions,
+          cursor   = 1,
+        },
+      }), {}
     end
     if cmd ~= nil then
       -- Unknown slash → generic chat.command for user-defined Lua handlers.
@@ -2107,6 +2412,44 @@ local function update(msg, state)
     end
   end
 
+  -- Session picker popup keys. Up/Down move cursor; Enter writes the
+  -- sidechannel resume_target file + emits exit (the user re-launches
+  -- and `init.lua` reads the file at boot — see `read_resume_target`
+  -- there). Esc handled in the popup-close branch above (closes without
+  -- writing). No filter input — the picker is small (≤10 sessions) and
+  -- the timestamps + previews are scannable as-is.
+  if state.popup and state.popup.variant == "session_picker" then
+    local p = state.popup
+    local sessions = p.sessions or {}
+    if kind == "key.up" or kind == "key.down" then
+      if #sessions == 0 then return state, {} end
+      local cur = p.cursor or 1
+      cur = (kind == "key.up") and (cur - 1) or (cur + 1)
+      if cur < 1 then cur = #sessions end
+      if cur > #sessions then cur = 1 end
+      return shallow_merge(state, {
+        popup = shallow_merge(p, { cursor = cur }),
+      }), {}
+    end
+    if kind == "key.enter" then
+      if #sessions == 0 then return state, {} end
+      local sel = sessions[p.cursor or 1] or sessions[1]
+      if not sel or not sel.id then return state, {} end
+      if write_resume_target(sel.id) then
+        return shallow_merge(state, { popup = NIL_SENTINEL }), {
+          { kind = "exit" },
+        }
+      end
+      -- Write failed — keep the popup open and surface a toast.
+      local now = tui.now_ms()
+      return shallow_merge(state, {
+        toast = { text = "resume: failed to write sidechannel", expires_at_ms = now + 3000 },
+      }), {}
+    end
+    -- All other keys swallow so they don't bubble into the input field.
+    return state, {}
+  end
+
   -- Slash autocomplete keys (when slash popup open).
   if state.slash then
     if kind == "key.up" then
@@ -2151,6 +2494,7 @@ local function update(msg, state)
       if v == "info" or v == "warning" or v == "error" then return "popup_message" end
       if v == "tool_permission" then return "popup_tool_permission" end
       if v == "model_picker" then return "popup_model_picker" end
+      if v == "session_picker" then return "popup_session_picker" end
     end
     return nil
   end
