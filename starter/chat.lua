@@ -70,6 +70,60 @@ local function compact(list)
   return out
 end
 
+-- Pretty-print a Lua table as 2-space-indented JSON-ish text. Used by
+-- `tool_expanded` to render `chat.tool.start` `input` payloads in the
+-- expanded view, matching legacy spec section 5: "{pretty-printed JSON}
+-- (2-space indent, HL_MD_CODE_BLOCK)". Strings are quoted, numbers and
+-- booleans render verbatim, nested tables nest one indent level. Arrays
+-- and objects are distinguished by whether the table has a numeric `[1]`
+-- key (no general way to tell in Lua, but the JSON-decoded shape from
+-- nefor-protocol is reliable).
+local function pretty_json(value, indent)
+  indent = indent or 0
+  local pad   = string.rep("  ", indent)
+  local pad_n = string.rep("  ", indent + 1)
+  local t = type(value)
+  if t == "string" then
+    return string.format("%q", value)
+  end
+  if t == "number" or t == "boolean" then
+    return tostring(value)
+  end
+  if t == "nil" then
+    return "null"
+  end
+  if t ~= "table" then
+    return string.format("%q", tostring(value))
+  end
+  -- Distinguish arrays from objects. An array has consecutive integer
+  -- keys 1..N and `#value == N`. An object has at least one string key.
+  local n = 0
+  for _ in pairs(value) do n = n + 1 end
+  if n == 0 then
+    return "{}"
+  end
+  local is_array = (#value == n)
+  if is_array then
+    local parts = {}
+    for i = 1, #value do
+      parts[i] = pad_n .. pretty_json(value[i], indent + 1)
+    end
+    return "[\n" .. table.concat(parts, ",\n") .. "\n" .. pad .. "]"
+  end
+  -- Object: sort keys for stable display.
+  local keys = {}
+  for k, _ in pairs(value) do
+    if type(k) == "string" then keys[#keys + 1] = k end
+  end
+  table.sort(keys)
+  local parts = {}
+  for _, k in ipairs(keys) do
+    parts[#parts + 1] = string.format("%s%q: %s",
+      pad_n, k, pretty_json(value[k], indent + 1))
+  end
+  return "{\n" .. table.concat(parts, ",\n") .. "\n" .. pad .. "}"
+end
+
 local function strip_claude_prefix(model)
   if model == nil then return nil end
   local stripped = model:gsub("^claude%-", "")
@@ -537,9 +591,21 @@ local function tool_expanded(entry)
   end
   local rows = { tui.text { content = header, style = header_style, wrap = "none" } }
   rows[#rows + 1] = tui.text { content = "  input:",  style = STYLE.footer, wrap = "none" }
-  if entry.input and #entry.input > 0 then
+  -- Prefer the structured `input_table` so we can pretty-print as JSON
+  -- per legacy spec section 5. Fall back to the raw string when only
+  -- a string was sent (legacy never did, but defensive).
+  local input_text
+  if entry.input_table ~= nil then
+    input_text = pretty_json(entry.input_table)
+  elseif entry.input and #entry.input > 0 and entry.input ~= "(object)" then
+    input_text = entry.input
+  end
+  if input_text and #input_text > 0 then
+    -- 2-space indent each line so the body sits inset from the bullet
+    -- column and the dark background reads as a single block.
+    local indented = "  " .. input_text:gsub("\n", "\n  ")
     rows[#rows + 1] = tui.text {
-      content = "  " .. entry.input,
+      content = indented,
       style = { fg = C.md_code_fg, bg = C.md_code_block_bg },
       wrap = "word",
     }

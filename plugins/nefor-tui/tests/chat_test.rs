@@ -545,6 +545,37 @@ fn ctrl_o_toggles_expanded_details() {
 }
 
 #[test]
+fn tool_expanded_pretty_prints_input_object() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Seed a tool call whose `input` is a JSON object (the wire shape
+    // for any non-Bash tool: Read, Edit, Write, etc). Legacy spec
+    // section 5 says expanded view shows pretty-printed JSON, not the
+    // `(object)` placeholder the previous build emitted.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.tool.start",
+            "id": "t1",
+            "name": "Read",
+            "input": { "file_path": "/tmp/example.txt" },
+        }),
+    );
+    engine.handle_key(key("ctrl_o")).expect("ctrl_o expand");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("file_path"),
+        "expanded tool view should pretty-print the input keys: {out:?}"
+    );
+    assert!(
+        !out.contains("(object)"),
+        "placeholder text leaked into expanded view: {out:?}"
+    );
+}
+
+#[test]
 fn thinking_indicator_shows_pending_then_clears_on_stream_end() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
