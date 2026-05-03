@@ -754,6 +754,11 @@ fn slash_yolo_emits_tool_gate_set_mode() {
 
 #[test]
 fn tool_permission_request_opens_popup_with_approve_deny() {
+    // Wire-shape contract: the event the popup listens for is the EXACT
+    // body tool-gate emits when policy=Prompt — `chat.tool.permission_request`
+    // with `id`, `tool`, `args` (see plugins/tool-gate/src/main.rs:
+    // permission_request_body). Test against the real shape so a future
+    // protocol drift breaks here, not silently in production.
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -761,10 +766,10 @@ fn tool_permission_request_opens_popup_with_approve_deny() {
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "tool-gate.permission_request",
+            "kind": "chat.tool.permission_request",
             "id": "perm-1",
             "tool": "Bash",
-            "input_pretty": "ls -la /tmp"
+            "args": { "command": "ls -la /tmp" }
         }),
     );
     let out = render_str(&mut engine);
@@ -776,6 +781,12 @@ fn tool_permission_request_opens_popup_with_approve_deny() {
         out.contains("[A]pprove") && out.contains("[D]eny"),
         "popup footer missing approve/deny chrome: {out:?}"
     );
+    // The args formatter renders `key = "value"` lines — confirm the
+    // command is visible so the user knows what they're approving.
+    assert!(
+        out.contains("command") && out.contains("ls -la /tmp"),
+        "args summary missing from popup body: {out:?}"
+    );
     // Permission popup wraps content in bordered_box — corners must paint.
     let snap = engine.snapshot();
     assert!(
@@ -783,17 +794,112 @@ fn tool_permission_request_opens_popup_with_approve_deny() {
         "permission popup borders missing: {snap}"
     );
 
-    // Press 'a' → emits approve response.
+    // Press 'a' → emits approve response back to tool-gate.
     let _ = engine.take_emit_queue();
     engine.handle_key(key("a")).expect("a");
     let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "expected exactly one egress on approve");
     assert_eq!(
         emits[0].1.get("kind").and_then(|v| v.as_str()),
         Some("tool.permission_response")
     );
     assert_eq!(
+        emits[0].1.get("id").and_then(|v| v.as_str()),
+        Some("perm-1"),
+        "response must carry the same id tool-gate sent"
+    );
+    assert_eq!(
         emits[0].1.get("decision").and_then(|v| v.as_str()),
         Some("approve")
+    );
+
+    // Re-open and exercise the deny path via 'd'.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.tool.permission_request",
+            "id": "perm-2",
+            "tool": "Bash",
+            "args": { "command": "rm -rf /" }
+        }),
+    );
+    let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+    engine.handle_key(key("d")).expect("d");
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "expected exactly one egress on deny");
+    assert_eq!(
+        emits[0].1.get("kind").and_then(|v| v.as_str()),
+        Some("tool.permission_response")
+    );
+    assert_eq!(
+        emits[0].1.get("id").and_then(|v| v.as_str()),
+        Some("perm-2")
+    );
+    assert_eq!(
+        emits[0].1.get("decision").and_then(|v| v.as_str()),
+        Some("deny")
+    );
+
+    // Re-open and exercise Esc → deny + close.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.tool.permission_request",
+            "id": "perm-3",
+            "tool": "Bash",
+            "args": {}
+        }),
+    );
+    let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+    engine.handle_key(key("escape")).expect("esc");
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "expected exactly one egress on esc");
+    assert_eq!(
+        emits[0].1.get("kind").and_then(|v| v.as_str()),
+        Some("tool.permission_response")
+    );
+    assert_eq!(
+        emits[0].1.get("id").and_then(|v| v.as_str()),
+        Some("perm-3")
+    );
+    assert_eq!(
+        emits[0].1.get("decision").and_then(|v| v.as_str()),
+        Some("deny")
+    );
+    // Popup must be closed after Esc — force a fresh frame so the
+    // snapshot reflects the post-update tree, not the prior render.
+    let snap_after = render_str(&mut engine);
+    assert!(
+        !snap_after.contains("permission requested"),
+        "popup should be closed after Esc: {snap_after}"
+    );
+
+    // Enter is also wired to approve as a quality-of-life shortcut (the
+    // input field is unfocused while the popup is open, so Enter bubbles
+    // up to Lua instead of submitting a chat message).
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.tool.permission_request",
+            "id": "perm-4",
+            "tool": "Bash",
+            "args": {}
+        }),
+    );
+    let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+    engine.handle_key(key("enter")).expect("enter");
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "expected exactly one egress on enter");
+    assert_eq!(
+        emits[0].1.get("decision").and_then(|v| v.as_str()),
+        Some("approve")
+    );
+    assert_eq!(
+        emits[0].1.get("id").and_then(|v| v.as_str()),
+        Some("perm-4")
     );
 }
 
