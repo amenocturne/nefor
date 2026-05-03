@@ -1476,6 +1476,32 @@ function M.for_chat()
       return nil
     end
 
+    -- Runtime model switch. Both `/model <name>` (direct) and the
+    -- model-picker popup (Enter on a row) emit the same envelope:
+    --   { kind = "chat.model.set", provider = "<name>"?, model = "<id>" }
+    -- The orchestrator owns `config.model` (used for fresh chat.create
+    -- calls inside `provider-wrapper` / `responder` / `tool-executor`
+    -- handlers), so it has to update local state here. Without this,
+    -- the picker only updated the provider's default-chat seed —
+    -- new chats minted by the orchestrator kept the original model
+    -- and per-turn footers stayed stamped with it. Pass the envelope
+    -- through (return env) so the egress transform on the provider
+    -- still translates it into `<prefix>.model.set` and the provider
+    -- emits its `model.set_ack`.
+    if kind == "chat.model.set" then
+      local model = env.body.model
+      local provider = env.body.provider
+      if type(model) == "string" and #model > 0 then
+        nefor.log.info("agentic_workflow: chat.model.set received", {
+          provider = provider,
+          model    = model,
+          previous = config.model,
+        })
+        M.set_model(provider, model)
+      end
+      return env
+    end
+
     if kind ~= "chat.input.submit" then return env end
 
     local text = env.body.text or ""
