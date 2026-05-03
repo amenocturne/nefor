@@ -330,6 +330,50 @@ local function bordered_box(child, border_style)
   }
 end
 
+-- `bordered_box` variant for popups anchored to a fixed height. The
+-- outer column distributes space top-down, non-flex first: when the
+-- body's natural height ≥ the popup's allocated height it consumes the
+-- full budget and the bottom rule is starved — the canonical "popup
+-- with no bottom rule" bug.
+--
+-- Fix: make the body row flex (`tui.expanded`). Flex children skip
+-- pass 1 and only get whatever's left after the two non-flex rule rows
+-- claim their 1-row budget each, so the bottom `╰────╯` always paints.
+-- Inside the flex body we wrap content in `tui.scrollable` so popup
+-- bodies of any length render — the user can scroll if content
+-- exceeds the visible area.
+local function bordered_popup(scroll_key, child, border_style)
+  local side_bar = tui.constrained {
+    max_width = 1,
+    child = tui.fill { char = "│", style = border_style },
+  }
+  local body_row = tui.row {
+    gap = 0,
+    children = {
+      side_bar,
+      tui.expanded {
+        child = tui.padding {
+          left = 1, right = 1, top = 0, bottom = 0,
+          child = tui.scrollable {
+            key       = scroll_key,
+            scrollbar = "auto",
+            child     = child,
+          },
+        },
+      },
+      side_bar,
+    },
+  }
+  return tui.column {
+    gap = 0,
+    children = {
+      rule_row("╭", "╮", border_style),
+      tui.expanded { child = body_row },
+      rule_row("╰", "╯", border_style),
+    },
+  }
+end
+
 ------------------------------------------------------------------------
 -- entry rendering — per legacy spec section 5
 ------------------------------------------------------------------------
@@ -695,7 +739,8 @@ local function popup_help(state)
     anchor = "center",
     width  = "60%",
     height = "60%",
-    child  = bordered_box(
+    child  = bordered_popup(
+      "popup_help",
       tui.padding {
         value = 1,
         child = tui.column {

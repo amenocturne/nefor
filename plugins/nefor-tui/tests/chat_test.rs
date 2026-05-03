@@ -571,17 +571,25 @@ fn slash_help_opens_help_popup() {
 
 #[test]
 fn slash_help_popup_side_bars_paint_every_body_row() {
-    // Cross-axis-stretch regression test (the user-visible bug that
-    // motivated the cross-stretch implementation). The help popup is
-    // multi-line; before cross-axis stretch its `tui.text { content =
-    // "│" }` side bars only painted row 0, leaving the rest of the
-    // popup with corners + top/bottom rules but no vertical sides.
+    // Two regressions guarded by this test:
     //
-    // After the fix the side bars are `tui.fill { char = "│" }` and
-    // CSS-flexbox-style cross stretch in the body row guarantees the
-    // fill spans the body's natural cross. Verify by walking every
-    // row of the popup's body span and asserting each carries the
-    // left + right `│` chrome at the expected columns.
+    // 1. Cross-axis-stretch: before that fix, `tui.text { content = "│" }`
+    //    side bars only painted row 0 of the popup body. After the fix
+    //    they're `tui.fill { char = "│" }` and CSS-flexbox-style cross
+    //    stretch in the body row guarantees the fill spans the body's
+    //    natural cross.
+    //
+    // 2. Body-overflow / missing bottom rule: the cross-stretch fix
+    //    exposed that `popup_help`'s content (~17 lines of HELP_BODY)
+    //    overflowed the 60%-of-24 anchored height, starving the bottom
+    //    `╰────╯` of its 1-row budget. The popup composition now wraps
+    //    the body in `tui.scrollable` inside a flex (`tui.expanded`) cell
+    //    so the bottom rule always paints at the popup's bottom edge.
+    //
+    // Verify by walking every row of the popup's body span and asserting
+    // each carries the left + right `│` chrome at the expected columns,
+    // PLUS that the popup is fully enclosed (top + bottom rules at the
+    // same column span).
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -617,14 +625,26 @@ fn slash_help_popup_side_bars_paint_every_body_row() {
         .expect("popup top right corner column");
 
     // Every body row of the popup must carry side bars at the popup's
-    // left + right edges. We check rows that fall inside the popup
-    // span and contain non-space content (the inner body), proving
-    // the fill stretched as the row's cross changes with content.
+    // left + right edges. Iterate until we hit the popup's bottom rule
+    // (`╰────╯`); every row in between must have `│` at both edges, and
+    // the bottom rule itself must be present (full enclosure — the
+    // overflow regression that motivated the scrollable wrap).
     let mut body_rows_seen = 0;
+    let mut popup_bottom_idx: Option<usize> = None;
     for (i, row) in rows.iter().enumerate().skip(popup_top_idx + 1) {
         let chars: Vec<char> = row.chars().collect();
+        if popup_left_col < chars.len() && chars[popup_left_col] == '╰' {
+            // Hit the popup's bottom rule — stop and verify bottom-right.
+            assert!(
+                popup_right_col < chars.len() && chars[popup_right_col] == '╯',
+                "popup bottom-right corner missing at col {popup_right_col} on row {i}: \
+                 {row:?}\nfull snapshot:\n{snap}"
+            );
+            popup_bottom_idx = Some(i);
+            break;
+        }
         if popup_left_col >= chars.len() || chars[popup_left_col] != '│' {
-            // Past the popup's vertical extent.
+            // Past the popup's vertical extent without seeing a bottom rule.
             break;
         }
         body_rows_seen += 1;
@@ -634,6 +654,11 @@ fn slash_help_popup_side_bars_paint_every_body_row() {
              {row:?}\nfull snapshot:\n{snap}"
         );
     }
+    assert!(
+        popup_bottom_idx.is_some(),
+        "popup bottom rule `╰────╯` not found below top rule at row {popup_top_idx} — \
+         the help popup must be fully enclosed (top + bottom rules):\n{snap}"
+    );
     assert!(
         body_rows_seen >= 5,
         "expected ≥ 5 popup body rows with side bars (saw {body_rows_seen}); \
