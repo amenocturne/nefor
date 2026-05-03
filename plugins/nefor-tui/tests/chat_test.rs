@@ -544,6 +544,117 @@ fn ctrl_o_toggles_expanded_details() {
     );
 }
 
+// Force the renderer to repaint and return the full framebuffer text.
+// Plain `render_if_dirty` only emits a *diff* against the prior frame,
+// so a check on its returned bytes misses cells that didn't change. The
+// engine snapshot returns every cell verbatim, which is what state-flip
+// tests actually want to inspect.
+fn render_snapshot(engine: &mut Engine) -> String {
+    engine.mark_animation_tick();
+    let _ = engine.render_if_dirty().expect("render");
+    engine.snapshot()
+}
+
+#[test]
+fn ctrl_b_uppercase_letter_still_toggles() {
+    // Some terminals (notably with Caps Lock or alternate keyboard
+    // layouts) deliver Ctrl+B as `KeyCode::Char('B')` + CONTROL — i.e.
+    // uppercase letter, no shift modifier. The Lua matcher must accept
+    // either casing or the press is silently dropped. The kind() builder
+    // in input.rs preserves the casing of the underlying char, so this
+    // test pins the chat surface against that asymmetry.
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("(no active runs)"),
+        "sidebar should be visible by default: {out:?}"
+    );
+
+    engine
+        .handle_key(KeyMessage {
+            name: "B".into(),
+            mods: vec!["ctrl"],
+        })
+        .expect("ctrl+B uppercase");
+    let out = render_snapshot(&mut engine);
+    assert!(
+        !out.contains("(no active runs)"),
+        "Ctrl+B (uppercase B) must still toggle sidebar: {out:?}"
+    );
+}
+
+#[test]
+fn ctrl_b_single_press_toggles_sidebar() {
+    // The chat surface boots with `show_sidebar = true` (legacy parity:
+    // sidebar visible by default in wide terminals). One Ctrl+B should
+    // hide it; a second should bring it back. A regression where the
+    // first press is consumed silently and only the second flips state
+    // would surface here. Test at 80 cols (typical default) to match
+    // the user's reported environment.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("(no active runs)"),
+        "sidebar should be visible by default: {out:?}"
+    );
+
+    // Send the realistic Ctrl+B shape (name="b", mods=["ctrl"]).
+    engine
+        .handle_key(KeyMessage {
+            name: "b".into(),
+            mods: vec!["ctrl"],
+        })
+        .expect("ctrl+b");
+    let out = render_snapshot(&mut engine);
+    assert!(
+        !out.contains("(no active runs)"),
+        "single Ctrl+B must hide the sidebar: {out:?}"
+    );
+
+    // A second press toggles back on.
+    engine
+        .handle_key(KeyMessage {
+            name: "b".into(),
+            mods: vec!["ctrl"],
+        })
+        .expect("ctrl+b again");
+    let out = render_snapshot(&mut engine);
+    assert!(
+        out.contains("(no active runs)"),
+        "second Ctrl+B must restore the sidebar: {out:?}"
+    );
+}
+
+#[test]
+fn ctrl_b_after_typing_still_single_press_toggles() {
+    // Realistic user session: type a few characters into the input, then
+    // press Ctrl+B. The text_input swallows the printables, but Ctrl+B
+    // (modifier-prefixed) must bubble to Lua and toggle on the first
+    // press — not require a second press.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "hello".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    let _ = render_snapshot(&mut engine);
+
+    engine
+        .handle_key(KeyMessage {
+            name: "b".into(),
+            mods: vec!["ctrl"],
+        })
+        .expect("ctrl+b");
+    let out = render_snapshot(&mut engine);
+    assert!(
+        !out.contains("(no active runs)"),
+        "single Ctrl+B after typing must hide the sidebar: {out:?}"
+    );
+}
+
 #[test]
 fn tool_expanded_pretty_prints_input_object() {
     let mut engine = Engine::new(120, 24).expect("engine");

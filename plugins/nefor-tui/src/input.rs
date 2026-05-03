@@ -33,6 +33,16 @@ impl KeyMessage {
     /// `key_code_name` already, so we drop the `shift_` prefix when the
     /// only modifier is shift on a single printable to keep the existing
     /// `key.A` shape for typed capitals.
+    ///
+    /// **Ctrl/Alt + letter casing**: when a non-shift modifier (Ctrl,
+    /// Alt, or Super) is held with a single ASCII letter, the casing is
+    /// folded to lowercase. Different terminals and keyboard states
+    /// (Caps Lock, Shift+Ctrl) report the same logical chord under
+    /// different casings — `Ctrl+B`, `Ctrl+Shift+B`, and `Ctrl+B with
+    /// Caps Lock on` would otherwise produce three distinct kinds and
+    /// silently break the binding when only one of them is matched.
+    /// Shift survives in `mods`, so handlers that genuinely need to
+    /// distinguish `Ctrl+B` from `Ctrl+Shift+B` can still inspect it.
     pub fn kind(&self) -> String {
         let only_shift_on_printable = self.mods == ["shift"]
             && self.name.chars().count() == 1
@@ -45,7 +55,17 @@ impl KeyMessage {
             prefix.push_str(m);
             prefix.push('_');
         }
-        format!("key.{}{}", prefix, self.name)
+        let name = if self
+            .mods
+            .iter()
+            .any(|m| matches!(*m, "ctrl" | "alt" | "super"))
+            && self.name.chars().count() == 1
+        {
+            self.name.to_ascii_lowercase()
+        } else {
+            self.name.clone()
+        };
+        format!("key.{}{}", prefix, name)
     }
 }
 
@@ -249,5 +269,51 @@ mod tests {
         ))
         .expect("p");
         assert_eq!(m.kind(), "key.ctrl_alt_x");
+    }
+
+    #[test]
+    fn ctrl_letter_kind_lowercased_regardless_of_terminal_casing() {
+        // Some terminals deliver `Ctrl+B` as `Char('B')` + CONTROL (no
+        // SHIFT modifier) — e.g. when the user has Caps Lock on, or
+        // certain alt-keymap combos. Ctrl+B and Ctrl+b are the same
+        // logical chord, so the kind() folding must yield a single
+        // stable string regardless of which casing the terminal sent.
+        let lower = from_key_event(&press(KeyCode::Char('b'), KeyModifiers::CONTROL)).expect("p");
+        assert_eq!(lower.kind(), "key.ctrl_b");
+        let upper = from_key_event(&press(KeyCode::Char('B'), KeyModifiers::CONTROL)).expect("p");
+        assert_eq!(
+            upper.kind(),
+            "key.ctrl_b",
+            "Ctrl+B with uppercase letter must fold to the same kind as Ctrl+b"
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_letter_kind_lowercased_too() {
+        // Ctrl+Shift+B should still register as `key.ctrl_b` (with shift
+        // surfaced via mods) so a binding for "ctrl_b" doesn't silently
+        // break when shift is also held — same logical chord.
+        let m = from_key_event(&press(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .expect("p");
+        assert_eq!(m.kind(), "key.shift_ctrl_b");
+        assert!(m.mods.contains(&"shift") && m.mods.contains(&"ctrl"));
+    }
+
+    #[test]
+    fn alt_letter_also_folds_casing() {
+        // Same rule for Alt — `Alt+F` and `Alt+f` are the same chord.
+        let upper = from_key_event(&press(KeyCode::Char('F'), KeyModifiers::ALT)).expect("p");
+        assert_eq!(upper.kind(), "key.alt_f");
+    }
+
+    #[test]
+    fn shift_only_printable_keeps_capital_name() {
+        // The `key.A` convention for typed capitals must survive — only
+        // ctrl/alt/super fold casing.
+        let m = from_key_event(&press(KeyCode::Char('a'), KeyModifiers::SHIFT)).expect("p");
+        assert_eq!(m.kind(), "key.A");
     }
 }
