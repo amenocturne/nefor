@@ -76,12 +76,23 @@ pub const WHEEL_STEP_ROWS: u16 = 3;
 
 /// Apply a wheel notch to `state`, clamping against the cached geometry.
 /// Positive `delta` scrolls down (toward end); negative scrolls up.
+///
+/// Also refreshes the `was_at_end` / `was_at_start` bookkeeping so the
+/// next paint pass observes the user's new position immediately. Without
+/// this, a wheel scroll from the bottom would clamp `scroll_y` correctly
+/// but leave `was_at_end = true` from the prior frame, and the next
+/// `paint_scrollable` would re-pin to the bottom under `stick_to = end`
+/// — making the transcript look "not scrollable" until content grew.
+/// The Lua API path (`apply_scroll_command`) used to mirror this update
+/// itself; sinking it here keeps wheel and `tui.scroll_by` symmetric.
 pub fn scroll_by_signed(state: &mut ScrollableState, delta: i32) {
     let max = state.scroll_y_max();
     let next = (state.scroll_y as i32)
         .saturating_add(delta)
         .clamp(0, max as i32);
     state.scroll_y = next as u16;
+    state.was_at_end = state.scroll_y == max;
+    state.was_at_start = state.scroll_y == 0;
 }
 
 #[cfg(test)]
@@ -142,5 +153,61 @@ mod tests {
         };
         scroll_by_signed(&mut s, 100);
         assert_eq!(s.scroll_y, 0);
+    }
+
+    #[test]
+    fn scroll_by_signed_clears_was_at_end_when_user_scrolls_up() {
+        // Bug-fix coverage: wheel-up from the bottom must drop the
+        // `was_at_end` flag so `paint_scrollable` doesn't re-pin to
+        // bottom under `stick_to = end`. Pre-fix this flag stayed sticky
+        // and the transcript appeared "not scrollable".
+        let mut s = ScrollableState {
+            scroll_y: 40,
+            content_height: 50,
+            viewport_height: 10,
+            was_at_end: true,
+            was_at_start: false,
+            seeded: true,
+            ..Default::default()
+        };
+        scroll_by_signed(&mut s, -3);
+        assert_eq!(s.scroll_y, 37);
+        assert!(
+            !s.was_at_end,
+            "scrolling up off the bottom must clear was_at_end"
+        );
+        assert!(!s.was_at_start);
+    }
+
+    #[test]
+    fn scroll_by_signed_sets_was_at_start_when_user_hits_top() {
+        let mut s = ScrollableState {
+            scroll_y: 2,
+            content_height: 50,
+            viewport_height: 10,
+            was_at_end: false,
+            was_at_start: false,
+            seeded: true,
+            ..Default::default()
+        };
+        scroll_by_signed(&mut s, -100);
+        assert_eq!(s.scroll_y, 0);
+        assert!(s.was_at_start, "landing at top must set was_at_start");
+    }
+
+    #[test]
+    fn scroll_by_signed_sets_was_at_end_when_user_scrolls_to_bottom() {
+        let mut s = ScrollableState {
+            scroll_y: 5,
+            content_height: 50,
+            viewport_height: 10,
+            was_at_end: false,
+            was_at_start: false,
+            seeded: true,
+            ..Default::default()
+        };
+        scroll_by_signed(&mut s, 100);
+        assert_eq!(s.scroll_y, 40);
+        assert!(s.was_at_end, "landing at bottom must set was_at_end");
     }
 }

@@ -12,8 +12,8 @@
 --   chat.message.append, chat.stream.delta, chat.stream.end,
 --   chat.stream.reasoning_delta, chat.stream.reasoning_end,
 --   chat.session.stats, chat.tool.start, chat.tool.end,
---   chat.popup, chat.auth.status, chat.model.set_ack,
---   tool-gate.permission_request,
+--   chat.popup, chat.auth.status, chat.model.set_ack, chat.models.listed,
+--   chat.tool.permission_request, tool-gate.mode_changed,
 --   graph.run_started, graph.node_dispatched, graph.node_result,
 --   graph.run_complete.
 --
@@ -70,6 +70,60 @@ local function compact(list)
   return out
 end
 
+-- Pretty-print a Lua table as 2-space-indented JSON-ish text. Used by
+-- `tool_expanded` to render `chat.tool.start` `input` payloads in the
+-- expanded view, matching legacy spec section 5: "{pretty-printed JSON}
+-- (2-space indent, HL_MD_CODE_BLOCK)". Strings are quoted, numbers and
+-- booleans render verbatim, nested tables nest one indent level. Arrays
+-- and objects are distinguished by whether the table has a numeric `[1]`
+-- key (no general way to tell in Lua, but the JSON-decoded shape from
+-- nefor-protocol is reliable).
+local function pretty_json(value, indent)
+  indent = indent or 0
+  local pad   = string.rep("  ", indent)
+  local pad_n = string.rep("  ", indent + 1)
+  local t = type(value)
+  if t == "string" then
+    return string.format("%q", value)
+  end
+  if t == "number" or t == "boolean" then
+    return tostring(value)
+  end
+  if t == "nil" then
+    return "null"
+  end
+  if t ~= "table" then
+    return string.format("%q", tostring(value))
+  end
+  -- Distinguish arrays from objects. An array has consecutive integer
+  -- keys 1..N and `#value == N`. An object has at least one string key.
+  local n = 0
+  for _ in pairs(value) do n = n + 1 end
+  if n == 0 then
+    return "{}"
+  end
+  local is_array = (#value == n)
+  if is_array then
+    local parts = {}
+    for i = 1, #value do
+      parts[i] = pad_n .. pretty_json(value[i], indent + 1)
+    end
+    return "[\n" .. table.concat(parts, ",\n") .. "\n" .. pad .. "]"
+  end
+  -- Object: sort keys for stable display.
+  local keys = {}
+  for k, _ in pairs(value) do
+    if type(k) == "string" then keys[#keys + 1] = k end
+  end
+  table.sort(keys)
+  local parts = {}
+  for _, k in ipairs(keys) do
+    parts[#parts + 1] = string.format("%s%q: %s",
+      pad_n, k, pretty_json(value[k], indent + 1))
+  end
+  return "{\n" .. table.concat(parts, ",\n") .. "\n" .. pad .. "}"
+end
+
 local function strip_claude_prefix(model)
   if model == nil then return nil end
   local stripped = model:gsub("^claude%-", "")
@@ -90,6 +144,119 @@ local function humanize_tokens(n)
   if n < 1000 then return tostring(n) end
   if n < 1000000 then return tostring(math.floor(n / 1000)) .. "k" end
   return string.format("%.1fM", n / 1000000)
+end
+
+-- Pad every line of `text` with trailing spaces to the longest line's
+-- width so a styled bg renders as a rectangle instead of ragging out
+-- to per-line content widths. Lines are rendered with `wrap = "none"`
+-- by callers when this matters; padding only fixes the natural-line
+-- raggedness, not post-wrap raggedness.
+local function pad_block(text)
+  if type(text) ~= "string" or #text == 0 then return text end
+  local lines = {}
+  for line in text:gmatch("([^\n]*)") do
+    lines[#lines + 1] = line
+  end
+  -- gmatch leaves a trailing empty match after the last newline; drop it.
+  if #lines > 0 and lines[#lines] == "" then
+    table.remove(lines, #lines)
+  end
+  local max_w = 0
+  for _, l in ipairs(lines) do
+    if #l > max_w then max_w = #l end
+  end
+  for i, l in ipairs(lines) do
+    if #l < max_w then
+      lines[i] = l .. string.rep(" ", max_w - #l)
+    end
+  end
+  return table.concat(lines, "\n")
+end
+
+-- The spawn_graph tool returns a verbose acknowledgment string:
+--   "Submitted sub-graph run_id=<id>. Acknowledge briefly to the user,
+--    or chain another tool call. The real result will arrive later as a
+--    user message tagged `[spawn_graph(run_id=<id>) result]`."
+-- That whole blob is LLM instruction noise. Surface just the run_id —
+-- progress is already visible in the DAG sidebar.
+local function format_spawn_graph_output(output)
+  if type(output) ~= "string" or #output == 0 then return output end
+  local run_id = output:match("run_id=([%w%-]+)")
+  if run_id then return "submitted as " .. run_id end
+  return output
+end
+
+-- Render a `spawn_graph` args.graph as a compact node list + edge list.
+-- Args of each node are deliberately omitted so the popup stays scannable;
+-- a future "focus a node" UI can surface them on demand.
+local function format_graph(graph)
+  if type(graph) ~= "table" then return tostring(graph) end
+  local lines = {}
+  local nodes = graph.nodes
+  if type(nodes) == "table" and #nodes > 0 then
+    lines[#lines + 1] = "nodes:"
+    for _, n in ipairs(nodes) do
+      local id = n.id or n.name or "?"
+      local reasoner = n.reasoner or n.kind or n.type or "?"
+      lines[#lines + 1] = "  " .. id .. " (" .. reasoner .. ")"
+    end
+  end
+  local edges = graph.edges
+  if type(edges) == "table" and #edges > 0 then
+    if #lines > 0 then lines[#lines + 1] = "" end
+    lines[#lines + 1] = "edges:"
+    for _, e in ipairs(edges) do
+      local from = e.from or e.src or e[1] or "?"
+      local to   = e.to   or e.dst or e[2] or "?"
+      lines[#lines + 1] = "  " .. from .. " -> " .. to
+    end
+  end
+  if #lines == 0 then return "(empty graph)" end
+  return table.concat(lines, "\n")
+end
+
+-- Pretty-print an args table from a `chat.tool.permission_request` event
+-- so the popup body shows a human-legible summary of the call.
+-- Stringy values render verbatim; nested tables get a compact `{...}`
+-- placeholder rather than a recursive dump (most tools take flat args,
+-- and a long nested blob would blow up the popup anyway). The
+-- `spawn_graph` tool gets a dedicated graph layout via `format_graph`.
+local function format_args(args)
+  if args == nil then return "" end
+  if type(args) ~= "table" then return tostring(args) end
+  -- spawn_graph: the only meaningful field is `graph`, and JSON of it is
+  -- noise. Render as a node + edge list per the user's spec.
+  if type(args.graph) == "table" then
+    return format_graph(args.graph)
+  end
+  -- Collect string keys (NCP args are JSON objects) in insertion-ish
+  -- order. Lua tables don't preserve order; sort for a stable display.
+  local keys = {}
+  for k, _ in pairs(args) do
+    if type(k) == "string" then keys[#keys + 1] = k end
+  end
+  table.sort(keys)
+  if #keys == 0 then
+    -- Could be an empty object or an array. ipairs() handles arrays.
+    local arr = {}
+    for _, v in ipairs(args) do arr[#arr + 1] = tostring(v) end
+    if #arr == 0 then return "{}" end
+    return "[" .. table.concat(arr, ", ") .. "]"
+  end
+  local parts = {}
+  for _, k in ipairs(keys) do
+    local v = args[k]
+    local rendered
+    if type(v) == "table" then
+      rendered = "{...}"
+    elseif type(v) == "string" then
+      rendered = string.format("%q", v)
+    else
+      rendered = tostring(v)
+    end
+    parts[#parts + 1] = k .. " = " .. rendered
+  end
+  return table.concat(parts, "\n")
 end
 
 ------------------------------------------------------------------------
@@ -146,19 +313,27 @@ local STYLE = {
 
 -- Markdown theme — exact legacy hex codes (spec section 3).
 local MARKDOWN_THEME = {
-  bold        = { bold = true },
-  italic      = { italic = true },
-  code        = { fg = C.md_code_fg, bg = C.md_code_inline_bg },
-  code_block  = { fg = C.md_code_fg, bg = C.md_code_block_bg },
-  h1          = { fg = C.md_heading, bold = true },
-  h2          = { fg = C.md_heading, bold = true },
-  h3          = { fg = C.md_heading, bold = true },
-  h4          = { fg = C.md_heading, bold = true },
-  h5          = { fg = C.md_heading, bold = true },
-  h6          = { fg = C.md_heading, bold = true },
-  link        = { fg = C.user, underline = true },
-  blockquote  = { fg = C.system, italic = true },
-  list_marker = { fg = C.user },
+  bold          = { bold = true },
+  italic        = { italic = true },
+  code          = { fg = C.md_code_fg, bg = C.md_code_inline_bg },
+  code_block    = { fg = C.md_code_fg, bg = C.md_code_block_bg },
+  -- Heading hierarchy: filled-to-hollow circle glyphs encode depth
+  -- (Emacs org-bullets-style) and a rotating color palette gives each
+  -- level a distinct hue. Bold for top three, italic decay for h4-h6
+  -- so visual weight tracks importance even though terminals can't
+  -- shrink fonts.
+  h1 = { prefix = "●", fg = "#ff66cc", bold = true, underline = true },
+  h2 = { prefix = "◉", fg = "#66ddff", bold = true },
+  h3 = { prefix = "◎", fg = "#88aaff", bold = true },
+  h4 = { prefix = "○", fg = "#88dd88", bold = true, italic = true },
+  h5 = { prefix = "◌", fg = "#ddcc66", italic = true },
+  h6 = { prefix = "·", fg = "#dd9966", italic = true },
+  link          = { fg = C.user, underline = true },
+  -- Blockquote: the `▎ ` rail glyph + dim cyan italic clearly reads
+  -- as "this is a quote" without competing visually with regular prose.
+  blockquote    = { fg = "#7faaaa", italic = true },
+  list_marker   = { fg = C.user },
+  strikethrough = { strikethrough = true },
 }
 
 ------------------------------------------------------------------------
@@ -191,9 +366,12 @@ local MARKDOWN_THEME = {
 --   slash             nil | { matches, cursor, query }
 --   last_esc_ms       ms of the most recent ESC press (for double-ESC)
 --   dag_runs          map keyed by run_id
+--   prompt_history    list of submitted prompts (newest at index 1, cap 200)
+--   history_cursor    nil = not navigating; integer = index into prompt_history
 
 local DAG_LINGER_MS  = 2000
 local DOUBLE_ESC_MS  = 600
+local HISTORY_CAP    = 200
 
 local function initial_state()
   return {
@@ -201,7 +379,7 @@ local function initial_state()
     in_flight        = nil,
     input_value      = "",
     focused_id       = "input",
-    show_sidebar     = false,
+    show_sidebar     = true,
     popup            = nil,
     stats            = {},
     pending          = false,
@@ -216,6 +394,8 @@ local function initial_state()
     last_esc_ms      = nil,
     dag_runs         = {},
     toast            = nil,  -- { text, expires_at_ms }
+    prompt_history   = {},
+    history_cursor   = nil,
   }
 end
 
@@ -233,7 +413,6 @@ local SLASH_COMMANDS = {
   { name = "resume",  aliases = {},          hint = "resume previous session",                takes_args = true },
   { name = "yolo",    aliases = {},          hint = "disable tool permission prompts (DANGEROUS)", takes_args = false },
   { name = "safe",    aliases = {},          hint = "re-enable tool permission prompts",      takes_args = false },
-  { name = "dag-test",aliases = {},          hint = "submit a 2-node parallel test DAG",      takes_args = false },
 }
 
 local function slash_filter(query)
@@ -499,11 +678,29 @@ local function tool_expanded(entry)
   end
   local rows = { tui.text { content = header, style = header_style, wrap = "none" } }
   rows[#rows + 1] = tui.text { content = "  input:",  style = STYLE.footer, wrap = "none" }
-  if entry.input and #entry.input > 0 then
+  -- spawn_graph: render as compact node-list + edge-list. Args of each
+  -- node are intentionally omitted (would clutter); future "focus a node"
+  -- UI surfaces them on demand. For everything else, prefer JSON pretty-
+  -- print of the structured input_table per legacy spec section 5; fall
+  -- back to the raw string when only a string was sent.
+  local input_text
+  if entry.name == "spawn_graph" and entry.input_table
+    and type(entry.input_table.graph) == "table" then
+    input_text = format_graph(entry.input_table.graph)
+  elseif entry.input_table ~= nil then
+    input_text = pretty_json(entry.input_table)
+  elseif entry.input and #entry.input > 0 and entry.input ~= "(object)" then
+    input_text = entry.input
+  end
+  if input_text and #input_text > 0 then
+    -- 2-space indent each line so the body sits inset from the bullet
+    -- column and the dark background reads as a single block. Pad each
+    -- line to max width post-indent so the bg renders as a rectangle.
+    local indented = "  " .. input_text:gsub("\n", "\n  ")
     rows[#rows + 1] = tui.text {
-      content = "  " .. entry.input,
+      content = pad_block(indented),
       style = { fg = C.md_code_fg, bg = C.md_code_block_bg },
-      wrap = "word",
+      wrap = "none",
     }
   end
   if entry.output == nil and not entry.error then
@@ -511,10 +708,15 @@ local function tool_expanded(entry)
   else
     rows[#rows + 1] = tui.text { content = "  output:", style = STYLE.footer, wrap = "none" }
     if entry.output and #entry.output > 0 then
+      local out_text = entry.output
+      if entry.name == "spawn_graph" then
+        out_text = format_spawn_graph_output(out_text)
+      end
+      local indented_out = "  " .. out_text:gsub("\n", "\n  ")
       rows[#rows + 1] = tui.text {
-        content = "  " .. entry.output,
+        content = pad_block(indented_out),
         style = { fg = C.md_code_fg, bg = C.md_code_block_bg },
-        wrap = "word",
+        wrap = "none",
       }
     end
   end
@@ -547,12 +749,15 @@ end
 ------------------------------------------------------------------------
 
 -- Spec section 6: pre-first-delta placeholder is `[thinking... Ns]`,
--- static (no spinner) but with per-second elapsed counter. We use
--- `tui.now_ms()` to compute the elapsed seconds on every render — same
--- monotonic clock the engine ticks on dispatch, so the counter advances
--- whenever a new event lands. Plus a `tui.animation` keeps the render
--- loop alive at frame rate so the counter ticks even between events.
-local THINKING_FRAMES = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+-- static (no spinner) but with per-second elapsed counter. Legacy
+-- chose deliberate minimalism here — no spinner, no frame cycle, just
+-- a tick that increments the integer second counter once per second.
+--
+-- We piggyback on `tui.animation` for its frame-rate side effect (it
+-- keeps the render loop alive at ~1Hz so the counter advances even
+-- without inbound events) but render zero-width frames, so visually
+-- there's no spinner — only the static `[thinking... Ns]` row.
+local THINKING_TICK_FRAMES = { "", "" }
 
 local function thinking_widget(state)
   if not state.pending then return nil end
@@ -563,11 +768,13 @@ local function thinking_widget(state)
     and string.format("[thinking... %ds]", secs)
     or  "[thinking...]"
   return tui.row {
-    gap = 1,
+    gap = 0,
     children = {
+      -- Empty 1-second-period animation drives the redraw loop so the
+      -- counter ticks; the rendered cells are blank.
       tui.animation {
-        frames      = THINKING_FRAMES,
-        duration_ms = 800,
+        frames      = THINKING_TICK_FRAMES,
+        duration_ms = 1000,
       },
       tui.text { content = body, style = STYLE.system, wrap = "none" },
     },
@@ -677,15 +884,6 @@ local function build_statusline_segments(state)
   if last_dur ~= nil then
     segs[#segs + 1] = { spans = { { text = humanize_duration_ms(last_dur), fg = C.system } } }
   end
-  -- "[done in Xms]" indicator after the most recent stream end.
-  if state.last_turn_duration_ms ~= nil and not state.pending and state.in_flight == nil then
-    segs[#segs + 1] = {
-      spans = {
-        { text = "[done in " .. humanize_duration_ms(state.last_turn_duration_ms) .. "]",
-          fg = C.status_ok },
-      },
-    }
-  end
 
   -- Speed: tok/s when both output_tokens and duration are known.
   local ot = s.last_turn_output_tokens or s.completion_tokens
@@ -696,6 +894,34 @@ local function build_statusline_segments(state)
 
   local auth = auth_segment(state.auth)
   if auth then segs[#segs + 1] = auth end
+
+  -- Scroll percentage segment (legacy spec section 4). Hidden when the
+  -- transcript fits the viewport (no scrollback). At-bottom shows
+  -- `100% ↓ bottom`; at-top `0% ↑ top`; mid `{pct}% ↑`.
+  --
+  -- `pcall` because the snapshot map only carries an entry once the
+  -- scrollable has been laid out — pre-first-render the call would
+  -- raise `no scrollable with key 'transcript'`. We treat any failure
+  -- as "no segment yet" rather than letting the statusline blow up.
+  local ok, snap = pcall(tui.scroll_position, "transcript")
+  if ok and snap and snap.max and snap.max > 0 then
+    local offset = snap.offset or 0
+    local max = snap.max
+    if offset >= max then
+      segs[#segs + 1] = { spans = {
+        { text = "100% ↓ bottom", fg = C.status_dim },
+      } }
+    elseif offset <= 0 then
+      segs[#segs + 1] = { spans = {
+        { text = "0% ↑ top", fg = C.system },
+      } }
+    else
+      local pct = math.floor(100 * (max - offset) / max + 0.5)
+      segs[#segs + 1] = { spans = {
+        { text = tostring(pct) .. "% ↑", fg = C.system },
+      } }
+    end
+  end
 
   return segs
 end
@@ -739,8 +965,7 @@ Slash commands:
   /yolo /safe  toggle tool permission gate
   /login /logout  provider auth
   /model       list/switch model
-  /resume      resume a previous session
-  /dag-test    submit a test DAG]]
+  /resume      resume a previous session]]
 
 local function popup_help(state)
   if not state.popup or state.popup.variant ~= "help" then return nil end
@@ -837,6 +1062,136 @@ local function popup_tool_permission(state)
   }
 end
 
+-- Filter the model picker's `models` list against the typed query.
+-- Substring match (case-insensitive) against `"<provider> <model>"`.
+-- Stable sort order is preserved by walking the source list in order.
+local function model_picker_filter(models, query)
+  if models == nil then return {} end
+  local q = (query or ""):lower()
+  if q == "" then return models end
+  local out = {}
+  for _, e in ipairs(models) do
+    local s = ((e.provider or "") .. " " .. (e.model or "")):lower()
+    if s:find(q, 1, true) ~= nil then out[#out + 1] = e end
+  end
+  return out
+end
+
+-- Count entries in the awaiting-set table.
+local function awaiting_count(awaiting)
+  if awaiting == nil then return 0 end
+  local n = 0
+  for _, _ in pairs(awaiting) do n = n + 1 end
+  return n
+end
+
+-- Model picker popup (spec section 12). Border is HL_USER. Layout:
+--   ╭── pick a model ──╮
+--   │ search: <query>  │
+--   │ ───────────────  │
+--   │ provider  model  │  ← row, cursor row inverted
+--   │ provider  model  │
+--   │ loading from N   │  ← footer (when awaiting providers)
+--   ╰──────────────────╯
+local function popup_model_picker(state)
+  if not state.popup or state.popup.variant ~= "model_picker" then return nil end
+  local p = state.popup
+  local matches = model_picker_filter(p.models, p.query)
+  local cursor = p.cursor or 1
+  if cursor < 1 then cursor = 1 end
+  if cursor > #matches and #matches > 0 then cursor = #matches end
+  -- Determine widest provider name for column alignment.
+  local prov_w = 0
+  for _, e in ipairs(matches) do
+    if e.provider and #e.provider > prov_w then prov_w = #e.provider end
+  end
+  if prov_w > 20 then prov_w = 20 end
+
+  local body_rows = {}
+  if #matches == 0 then
+    if awaiting_count(p.awaiting) == 0 and (p.models == nil or #p.models == 0) then
+      body_rows[#body_rows + 1] = tui.text {
+        content = "No providers connected.",
+        style   = STYLE.status_dim, wrap = "word",
+      }
+      body_rows[#body_rows + 1] = tui.text {
+        content = "Wire one up in init.lua (see docs/provider-plugins.md).",
+        style   = STYLE.status_dim, wrap = "word",
+      }
+    else
+      body_rows[#body_rows + 1] = tui.text {
+        content = "(no matches)",
+        style   = STYLE.status_dim, wrap = "none",
+      }
+    end
+  else
+    -- Window the visible rows around the cursor so a long list scrolls.
+    local cap = 12
+    local first = 1
+    if #matches > cap then
+      first = math.max(1, math.min(cursor - cap + 1, #matches - cap + 1))
+      if first < 1 then first = 1 end
+    end
+    local last = math.min(first + cap - 1, #matches)
+    for i = first, last do
+      local e = matches[i]
+      local row = string.format("%-" .. prov_w .. "s  %s", e.provider or "?", e.model or "?")
+      local style = (i == cursor)
+        and { fg = "#000000", bg = C.user }
+        or  STYLE.status
+      body_rows[#body_rows + 1] = tui.text {
+        content = row, style = style, wrap = "none",
+      }
+    end
+  end
+
+  local awaiting_n = awaiting_count(p.awaiting)
+  local children = {
+    tui.text {
+      content = "── pick a model ──",
+      style   = STYLE.popup_user,
+      wrap    = "none",
+    },
+    tui.text {
+      content = "search: " .. (p.query or ""),
+      style   = STYLE.status,
+      wrap    = "none",
+    },
+    tui.text {
+      content = string.rep("─", 40),
+      style   = STYLE.footer,
+      wrap    = "none",
+    },
+    tui.column { gap = 0, children = body_rows },
+  }
+  if awaiting_n > 0 then
+    children[#children + 1] = tui.text {
+      content = string.format("loading from %d provider(s)…", awaiting_n),
+      style   = STYLE.status_dim,
+      wrap    = "none",
+    }
+  end
+  children[#children + 1] = tui.text {
+    content = "↑/↓ select · Enter pick · Esc close · type to filter",
+    style   = STYLE.status_dim,
+    wrap    = "none",
+  }
+
+  return tui.anchored {
+    anchor = "center",
+    width  = "60%",
+    height = "60%",
+    child  = bordered_popup(
+      "popup_model_picker",
+      tui.padding {
+        value = 1,
+        child = tui.column { gap = 1, children = children },
+      },
+      STYLE.popup_user
+    ),
+  }
+end
+
 -- Toast: bottom-left, single-line, no border, in HL_STATUS_INFO. Auto-
 -- dismisses on `expires_at_ms` via the per-event prune cycle.
 local function popup_toast(state)
@@ -915,8 +1270,7 @@ end
 
 local function fmt_elapsed_ms(ms)
   if ms == nil then return "" end
-  if ms < 1000 then return tostring(ms) .. "ms" end
-  return string.format("%.1fs", ms / 1000)
+  return string.format("%ds", math.floor(ms / 1000))
 end
 
 local function prune_dag_runs(dag_runs, now_ms)
@@ -1024,7 +1378,7 @@ local function vertical_separator()
   return tui.constrained {
     min_width = 1,
     max_width = 1,
-    child = tui.text { content = "│", style = STYLE.dag_separator, wrap = "none" },
+    child = tui.fill { char = "│", style = STYLE.dag_separator },
   }
 end
 
@@ -1045,7 +1399,38 @@ local function transcript(state)
     key       = "transcript",
     stick_to  = "end",
     scrollbar = "auto",
-    child     = tui.column { gap = 1, children = widgets },
+    -- 1-cell right padding so wrapped lines don't visually clash into
+    -- the scrollbar's column.
+    child     = tui.padding {
+      value = { top = 0, right = 1, bottom = 0, left = 0 },
+      child = tui.column { gap = 1, children = widgets },
+    },
+  }
+end
+
+-- Keep the engine's render loop alive at ~1Hz while any per-second
+-- elapsed counter is on screen — `tui.now_ms()` only re-evaluates on a
+-- render, and the engine renders only on state changes / animation
+-- ticks. Without this, the DAG sidebar's "Ns" stalls between events
+-- (the user sees stale numbers until something else re-renders, like
+-- a scroll or keystroke). Mount only when something needs to refresh.
+local KEEPALIVE_FRAMES = { "", "" }
+
+local function any_dag_run_active(dag_runs)
+  if type(dag_runs) ~= "table" then return false end
+  for _, run in pairs(dag_runs) do
+    if run.completed_at_ms == nil then return true end
+  end
+  return false
+end
+
+local function render_keepalive(state)
+  if not (state.pending or any_dag_run_active(state.dag_runs)) then
+    return nil
+  end
+  return tui.animation {
+    frames      = KEEPALIVE_FRAMES,
+    duration_ms = 1000,
   }
 end
 
@@ -1064,8 +1449,15 @@ local function view(state)
   -- it in `╭─╮ │ ╰─╯` chrome so the input visually matches user
   -- message blocks. Border colour brightens (HL_USER) when the input
   -- is focused; dims to HL_STATUS_DIM when a popup steals focus.
-  local input_focused = state.focused_id == "input"
-    and not (state.popup and state.popup.variant == "tool_permission")
+  -- The input drops focus while certain popups own the keyboard.
+  -- Tool permission expects single-char A/D; model picker takes
+  -- printable chars as filter input — both paths require input to
+  -- stop swallowing keys.
+  local popup_owns_keys = state.popup and (
+    state.popup.variant == "tool_permission" or
+    state.popup.variant == "model_picker"
+  )
+  local input_focused = state.focused_id == "input" and not popup_owns_keys
   local input_border_style = input_focused
     and STYLE.input_border
     or STYLE.input_border_unfocused
@@ -1082,7 +1474,10 @@ local function view(state)
       on_submit = "input.submit",
       min_lines = 1,
       max_lines = 6,
-      placeholder = "type a message — Enter to send, /help for keys, /quit to exit",
+      -- No placeholder text: the bordered input below the transcript is
+      -- self-explanatory, and a default hint just adds visual noise the
+      -- user has to read past on every render. Slash-commands are
+      -- discoverable via `/` autocomplete; help via `/help`.
     },
     input_border_style,
     -- Stable user-key on the bordered_box's outer column so the
@@ -1105,19 +1500,27 @@ local function view(state)
       slash_autocomplete_inline(state),
       input_field,
       statusline(state),
+      -- Invisible 1Hz keepalive: forces re-render while DAG runs or the
+      -- thinking ticker need the second-counter refreshed. Removed when
+      -- nothing needs to tick.
+      render_keepalive(state),
     },
   }
 
-  -- 1-cell outer padding so the UI doesn't sit flush against the
-  -- terminal edges — gives content breathing room on every side without
-  -- baking the layout decision into the engine.
+  -- 2-cell horizontal padding (legacy spec section 1, "HPAD = 2 columns
+  -- left/right inside the chat pane"). Top/bottom keep 1-cell so the
+  -- vertical breathing room stays modest — uniform 2 there would cost
+  -- two transcript rows on a 24-row terminal. Statusline is wrapped in
+  -- the same padded column for v1; pulling it flush-left needs a
+  -- restructure (separate padding container per child) and is deferred.
   return tui.padding {
-    value = 1,
+    value = { top = 1, right = 2, bottom = 1, left = 2 },
     child = tui.stack {
       children = compact {
         main_column,
         popup_help(state),
         popup_message(state),
+        popup_model_picker(state),
         popup_tool_permission(state),
         popup_toast(state),
       },
@@ -1390,13 +1793,32 @@ local function update(msg, state)
   -- ── text_input callbacks ────────────────────────────────────────────
   if kind == "input.changed" then
     local v = msg.value or ""
-    state = shallow_merge(state, { input_value = v })
+    -- Any value mutation drops history navigation — once the user
+    -- starts editing the recalled prompt it stops being a history slot
+    -- and becomes the active draft. Clearing here keeps the next Up
+    -- from jumping back to the navigation cursor mid-edit.
+    state = shallow_merge(state, {
+      input_value    = v,
+      history_cursor = NIL_SENTINEL,
+    })
     state = refresh_slash(state, v)
     return state, {}
   end
 
   if kind == "input.submit" then
     local text = msg.value or ""
+    -- Slash autocomplete open + Enter → run the highlighted match,
+    -- regardless of what fragment the user actually typed. Browser-style
+    -- combobox semantics: pressing Enter while the dropdown is open
+    -- selects the focused option, it doesn't submit the partial query.
+    -- This lets `/mo` + Enter execute `/model` when the dropdown shows
+    -- `/model` highlighted (matching legacy nefor's behaviour).
+    if state.slash then
+      local m = state.slash.matches and state.slash.matches[state.slash.cursor]
+      if m then
+        text = "/" .. m.name
+      end
+    end
     if #text == 0 then return state, {} end
     -- Slash dispatch.
     local cmd, args, _has_ws = parse_slash(text)
@@ -1407,8 +1829,16 @@ local function update(msg, state)
       local cleared = shallow_merge(state, {
         entries = {}, in_flight = NIL_SENTINEL, input_value = "",
         pending = false, slash = NIL_SENTINEL,
+        dag_runs = {},
+        turn_started_at = NIL_SENTINEL,
+        last_turn_duration_ms = NIL_SENTINEL,
+        last_esc_ms = NIL_SENTINEL,
+        history_cursor = NIL_SENTINEL,
+        popup = NIL_SENTINEL,
       })
       return cleared, {
+        { kind = "send_to", target = "engine",
+          body = { kind = "chat.interrupt_all" } },
         { kind = "send_to", target = "engine",
           body = { kind = "chat.reset" } },
       }
@@ -1441,27 +1871,58 @@ local function update(msg, state)
       }
     end
     if cmd == "model" then
-      local body
       if args and #args > 0 then
-        body = { kind = "chat.model.set", model = args }
-      else
-        body = { kind = "chat.model.list_requested" }
+        -- `/model <name>` — direct switch on the active provider.
+        -- Active provider = first connected (alphabetical) when no
+        -- explicit selection has been made yet.
+        local provider = nil
+        local connected = {}
+        for n, st in pairs(state.auth or {}) do
+          if st == "connected" then connected[#connected + 1] = n end
+        end
+        table.sort(connected)
+        provider = connected[1]
+        local body = { kind = "chat.model.set", model = args }
+        if provider then body.provider = provider end
+        return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL }), {
+          { kind = "send_to", target = "engine", body = body },
+        }
       end
-      return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL }), {
-        { kind = "send_to", target = "engine", body = body },
-      }
+      -- `/model` (no args) — open the picker and fan out one
+      -- `chat.model.list_requested` per connected provider so the
+      -- popup can aggregate results as they land. Per legacy spec
+      -- section 8 / 12. The adapter rejects requests that don't
+      -- name a provider, so we MUST fan out per-provider here.
+      local connected = {}
+      for n, st in pairs(state.auth or {}) do
+        if st == "connected" then connected[#connected + 1] = n end
+      end
+      table.sort(connected)
+      local awaiting = {}
+      for _, n in ipairs(connected) do awaiting[n] = true end
+      local effects = {}
+      for _, n in ipairs(connected) do
+        effects[#effects + 1] = {
+          kind = "send_to", target = "engine",
+          body = { kind = "chat.model.list_requested", provider = n },
+        }
+      end
+      return shallow_merge(state, {
+        input_value = "", slash = NIL_SENTINEL,
+        popup = {
+          variant  = "model_picker",
+          models   = {},
+          query    = "",
+          cursor   = 1,
+          awaiting = awaiting,
+        },
+      }), effects
     end
     if cmd == "resume" then
       local body = { kind = "chat.resume" }
       if args and #args > 0 then body.session_id = args end
       return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL }), {
         { kind = "send_to", target = "engine", body = body },
-      }
-    end
-    if cmd == "dag-test" then
-      return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL }), {
-        { kind = "send_to", target = "engine",
-          body = { kind = "chat.command", name = "dag-test" } },
       }
     end
     if cmd ~= nil then
@@ -1473,9 +1934,19 @@ local function update(msg, state)
     end
     -- Plain text submit.
     local with_user = push_entry(state, { role = "user", text = text, kind = "text" })
+    -- Prepend to prompt_history (newest at index 1) and cap. History
+    -- recall reads from index 1, so prepending keeps the cursor model
+    -- simple — Up = older = larger index, Down = newer = smaller.
+    local history = { text }
+    for i, v in ipairs(state.prompt_history or {}) do
+      if i >= HISTORY_CAP then break end
+      history[#history + 1] = v
+    end
     local cleared = shallow_merge(with_user, {
       input_value = "", pending = true,
       turn_started_at = tui.now_ms(), slash = NIL_SENTINEL,
+      prompt_history = history,
+      history_cursor = NIL_SENTINEL,
     })
     return cleared, {
       { kind = "send_to", target = "engine",
@@ -1525,7 +1996,14 @@ local function update(msg, state)
     if state.slash then
       return shallow_merge(state, { slash = NIL_SENTINEL }), {}
     end
-    -- 3) double-ESC escalation
+    -- 3) cancel prompt-history navigation (clear recalled value)
+    if state.history_cursor ~= nil then
+      return shallow_merge(state, {
+        input_value    = "",
+        history_cursor = NIL_SENTINEL,
+      }), {}
+    end
+    -- 4) double-ESC escalation
     local now = tui.now_ms()
     if state.last_esc_ms and (now - state.last_esc_ms) <= DOUBLE_ESC_MS then
       return shallow_merge(state, { last_esc_ms = NIL_SENTINEL }), {
@@ -1544,9 +2022,12 @@ local function update(msg, state)
     return shallow_merge(state, { last_esc_ms = now }), {}
   end
 
-  -- Tool permission popup keys.
+  -- Tool permission popup keys. Routes to tool-gate via broadcast event
+  -- (target hint is documentation-only; tool-gate matches by `id`).
+  -- A / Enter → approve, D → deny. Esc handled in the popup-close branch
+  -- above — also denies. The footer chrome advertises the same.
   if state.popup and state.popup.variant == "tool_permission" then
-    if kind == "key.a" or kind == "key.A" then
+    if kind == "key.a" or kind == "key.A" or kind == "key.enter" then
       local id = state.popup.id
       return shallow_merge(state, { popup = NIL_SENTINEL }), {
         { kind = "send_to", target = "engine",
@@ -1559,6 +2040,70 @@ local function update(msg, state)
         { kind = "send_to", target = "engine",
           body = { kind = "tool.permission_response", id = id, decision = "deny" } },
       }
+    end
+  end
+
+  -- Model picker popup keys (legacy spec section 12). Up/Down move the
+  -- cursor through the filtered list; Enter emits chat.model.set for
+  -- the cursor row + closes; Backspace and printable chars edit the
+  -- filter query (re-clamping cursor against the new filtered count).
+  if state.popup and state.popup.variant == "model_picker" then
+    local p = state.popup
+    local filtered = model_picker_filter(p.models, p.query)
+    if kind == "key.up" or kind == "key.down" then
+      if #filtered == 0 then return state, {} end
+      local cur = p.cursor or 1
+      cur = (kind == "key.up") and (cur - 1) or (cur + 1)
+      if cur < 1 then cur = #filtered end
+      if cur > #filtered then cur = 1 end
+      return shallow_merge(state, {
+        popup = shallow_merge(p, { cursor = cur }),
+      }), {}
+    end
+    if kind == "key.enter" then
+      if #filtered == 0 then return state, {} end
+      local sel = filtered[p.cursor or 1] or filtered[1]
+      if not sel then return state, {} end
+      return shallow_merge(state, { popup = NIL_SENTINEL }), {
+        { kind = "send_to", target = "engine",
+          body = {
+            kind     = "chat.model.set",
+            provider = sel.provider,
+            model    = sel.model,
+          } },
+      }
+    end
+    if kind == "key.backspace" then
+      local q = p.query or ""
+      if #q > 0 then q = q:sub(1, #q - 1) end
+      return shallow_merge(state, {
+        popup = shallow_merge(p, { query = q, cursor = 1 }),
+      }), {}
+    end
+    -- Printable single-char filter input. The engine surfaces these as
+    -- `key.<ch>` events when the input field has dropped focus (which
+    -- it has — see `popup_owns_keys` above). `key.space` is a special
+    -- name we have to map back to a literal space.
+    if kind == "key.space" then
+      return shallow_merge(state, {
+        popup = shallow_merge(p, {
+          query  = (p.query or "") .. " ",
+          cursor = 1,
+        }),
+      }), {}
+    end
+    if kind:sub(1, 4) == "key." and #kind == 5 then
+      local ch = kind:sub(5, 5)
+      -- Filter pure printable ASCII characters into the query.
+      local b = string.byte(ch)
+      if b and b >= 33 and b <= 126 then
+        return shallow_merge(state, {
+          popup = shallow_merge(p, {
+            query  = (p.query or "") .. ch,
+            cursor = 1,
+          }),
+        }), {}
+      end
     end
   end
 
@@ -1605,6 +2150,7 @@ local function update(msg, state)
       if v == "help" then return "popup_help" end
       if v == "info" or v == "warning" or v == "error" then return "popup_message" end
       if v == "tool_permission" then return "popup_tool_permission" end
+      if v == "model_picker" then return "popup_model_picker" end
     end
     return nil
   end
@@ -1633,21 +2179,55 @@ local function update(msg, state)
   -- an edge of the input's content (single-line, or first/last visual
   -- row of multi-line), so this only fires when the input has nowhere
   -- to move the cursor.
+  --
+  -- When NO popup owns scroll AND the input is empty (or the user is
+  -- already navigating prompt history), Up/Down recall earlier prompts
+  -- per legacy spec section 7. Up walks to older prompts; Down walks
+  -- back to newer; reaching the latest+1 clears the buffer and ends
+  -- navigation. Any non-arrow key (handled below in input.changed) drops
+  -- history_cursor, so the next Up starts fresh.
   if kind == "key.up" then
     local target = active_scroll_key()
-    if target then
-      tui.scroll_by(target, -1)
-    else
+    if not target then
+      local navigating = state.history_cursor ~= nil
+      local empty = (state.input_value or "") == ""
+      if (navigating or empty) and #(state.prompt_history or {}) > 0 then
+        local cur = state.history_cursor or 0
+        local n = #state.prompt_history
+        local nxt = math.min(cur + 1, n)
+        return shallow_merge(state, {
+          input_value    = state.prompt_history[nxt],
+          history_cursor = nxt,
+        }), {}
+      end
       tui.scroll_by("transcript", -1)
+    else
+      tui.scroll_by(target, -1)
     end
     return state, {}
   end
   if kind == "key.down" then
     local target = active_scroll_key()
-    if target then
-      tui.scroll_by(target, 1)
-    else
+    if not target then
+      if state.history_cursor ~= nil then
+        local cur = state.history_cursor
+        if cur <= 1 then
+          -- Stepping past the newest entry clears the input and ends
+          -- history navigation.
+          return shallow_merge(state, {
+            input_value    = "",
+            history_cursor = NIL_SENTINEL,
+          }), {}
+        end
+        local nxt = cur - 1
+        return shallow_merge(state, {
+          input_value    = state.prompt_history[nxt],
+          history_cursor = nxt,
+        }), {}
+      end
       tui.scroll_by("transcript", 1)
+    else
+      tui.scroll_by(target, 1)
     end
     return state, {}
   end
@@ -1761,6 +2341,48 @@ local function update(msg, state)
     }), {}
   end
 
+  if kind == "chat.models.listed" then
+    -- A provider answered the list-request. Append into the open
+    -- model_picker popup if one is up; otherwise drop (legacy spec).
+    if not (state.popup and state.popup.variant == "model_picker") then
+      return state, {}
+    end
+    local provider = msg.provider or ""
+    local list = msg.models or {}
+    local prev = state.popup.models or {}
+    -- Append new (provider, model) pairs, dedup, then sort.
+    local seen = {}
+    for _, e in ipairs(prev) do
+      seen[(e.provider or "") .. "\0" .. (e.model or "")] = true
+    end
+    local merged = {}
+    for _, e in ipairs(prev) do merged[#merged + 1] = e end
+    if type(list) == "table" then
+      for _, m in ipairs(list) do
+        local key = provider .. "\0" .. tostring(m)
+        if not seen[key] then
+          merged[#merged + 1] = { provider = provider, model = tostring(m) }
+          seen[key] = true
+        end
+      end
+    end
+    table.sort(merged, function(a, b)
+      if a.provider == b.provider then return a.model < b.model end
+      return a.provider < b.provider
+    end)
+    -- Drop the answering provider from the awaiting set.
+    local prev_awaiting = state.popup.awaiting or {}
+    local new_awaiting = {}
+    for k, v in pairs(prev_awaiting) do new_awaiting[k] = v end
+    new_awaiting[provider] = nil
+    return shallow_merge(state, {
+      popup = shallow_merge(state.popup, {
+        models   = merged,
+        awaiting = new_awaiting,
+      }),
+    }), {}
+  end
+
   if kind == "chat.auth.status" then
     local provider = msg.provider or ""
     local status = msg.status or msg.state or "unknown"
@@ -1771,20 +2393,33 @@ local function update(msg, state)
     return shallow_merge(state, { auth = auth }), {}
   end
 
-  if kind == "tool-gate.permission_request" then
-    -- args displayed pretty in the body.
+  if kind == "chat.tool.permission_request" then
+    -- Wire shape from tool-gate (plugins/tool-gate/src/main.rs):
+    --   { kind = "chat.tool.permission_request",
+    --     id   = "<provider outer id>",
+    --     tool = "<tool name>",
+    --     args = <JSON object> }
+    -- We render `args` into a small key/value summary. The response goes
+    -- back as `tool.permission_response { id, decision }` (handled in the
+    -- popup keymap below). `msg.input_pretty` and `msg.name` are kept as
+    -- forward-compatible fallbacks in case future emitters pre-format.
+    local args = msg.args
     local body
-    if type(msg.input) == "table" then
-      body = "(JSON args; provide via msg.input_pretty for rich format)"
+    if msg.input_pretty ~= nil then
+      body = tostring(msg.input_pretty)
+    elseif type(args) == "table" then
+      body = format_args(args)
+    elseif args ~= nil then
+      body = tostring(args)
     else
-      body = tostring(msg.input or "")
+      body = ""
     end
     return shallow_merge(state, {
       popup = {
         variant = "tool_permission",
         tool    = msg.tool or msg.name or "?",
         id      = msg.id,
-        body    = msg.input_pretty or body,
+        body    = body,
         source  = msg.source,
       },
     }), {}

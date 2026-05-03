@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use nefor_tui::engine::Engine;
 use nefor_tui::input::KeyMessage;
+use nefor_tui::mouse::{MouseKind, MouseMessage};
 use serde_json::{json, Map as JsonMap, Value as JsonValue};
 
 fn chat_lua_source() -> String {
@@ -57,15 +58,44 @@ fn chat_lua_loads_and_renders_initial_frame() {
         out.contains("Start chatting to see stats"),
         "pre-stats placeholder missing: {out:?}"
     );
-    // Cursor inversion at row start splits the placeholder's first
-    // character from the rest, so match a substring that's contiguous
-    // after the cursor cell.
-    assert!(
-        out.contains("ype a message"),
-        "input placeholder missing: {out:?}"
-    );
+    // The input field should NOT carry a default hint — the bordered
+    // box below the transcript is self-explanatory. Substrings from the
+    // legacy hint must be absent.
+    for needle in ["type a message", "ype a message", "/help for keys"] {
+        assert!(
+            !out.contains(needle),
+            "input placeholder should be empty, found {needle:?} in: {out:?}"
+        );
+    }
     // Drain — the script doesn't emit anything at boot.
     assert!(engine.take_emit_queue().is_empty());
+}
+
+#[test]
+fn input_field_has_no_default_placeholder() {
+    // Belt-and-braces: even if the broader frame test above were edited
+    // for unrelated reasons, this one specifically pins the contract
+    // that `chat.lua` does not configure a `placeholder` on the input.
+    // The text_input renders the placeholder dimmed inside the bordered
+    // box; once removed, the box's first interior row is empty (modulo
+    // the cursor cell at column 0).
+    let src = chat_lua_source();
+    assert!(
+        !src.contains("placeholder ="),
+        "starter/chat.lua should not set a placeholder on the input"
+    );
+
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&src).expect("load");
+    let out = render_str(&mut engine);
+    // Sanity: the bordered box still renders (corners present), just
+    // without any hint text.
+    for corner in ['╭', '╮', '╰', '╯'] {
+        assert!(
+            out.contains(corner),
+            "input border missing corner {corner:?}: {out:?}"
+        );
+    }
 }
 
 #[test]
@@ -245,10 +275,24 @@ fn slash_new_clears_transcript_and_emits_chat_reset() {
     let _ = engine.take_emit_queue();
     engine.handle_key(key("enter")).expect("enter");
     let emits = engine.take_emit_queue();
-    assert_eq!(emits.len(), 1, "expected one chat.reset egress");
+    // /new must cancel any in-flight work AND clear the chat: emits both
+    // chat.interrupt_all (kills graphs/pending tool calls) and chat.reset.
     assert_eq!(
-        emits[0].1.get("kind").and_then(|v| v.as_str()),
-        Some("chat.reset")
+        emits.len(),
+        2,
+        "expected interrupt_all + reset egress, got {emits:?}"
+    );
+    let kinds: Vec<_> = emits
+        .iter()
+        .map(|(_, b)| b.get("kind").and_then(|v| v.as_str()).unwrap_or(""))
+        .collect();
+    assert!(
+        kinds.contains(&"chat.interrupt_all"),
+        "missing chat.interrupt_all in {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"chat.reset"),
+        "missing chat.reset in {kinds:?}"
     );
 
     let out = render_str(&mut engine);
@@ -258,26 +302,56 @@ fn slash_new_clears_transcript_and_emits_chat_reset() {
     );
 }
 
+#[test]
+fn slash_new_clears_dag_runs() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Seed an active DAG run.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.run_started",
+            "run_id": "run-aaaaaaaa",
+            "total_nodes": 3,
+        }),
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("DAG run-aaaa"),
+        "dag header should appear pre-/new: {out:?}"
+    );
+
+    // /new + Enter.
+    for ch in "/new".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    let _ = engine.take_emit_queue();
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("DAG run-aaaa"),
+        "dag panel should be empty after /new: {out:?}"
+    );
+}
+
 // ── DAG panel (phase 7) ───────────────────────────────────────────────
 //
 // These exercise the sidebar that subscribes to `reasoner-graph` plugin
 // lifecycle events (`graph.run_started`, `graph.node_dispatched`,
-// `graph.node_result`, `graph.run_complete`). The panel is hidden by
-// default; Ctrl+B toggles it on. Linger handling is pure-update, so a
+// `graph.node_result`, `graph.run_complete`). The panel is visible by
+// default; Ctrl+B toggles it off. Linger handling is pure-update, so a
 // completed run drops on the next event after `DAG_LINGER_MS` of engine
 // time has passed — `Engine::advance_time` plus a synthetic event drives
 // the prune deterministically without sleeping.
-
-fn toggle_sidebar(engine: &mut Engine) {
-    engine.handle_key(key("ctrl_b")).expect("ctrl_b");
-}
 
 #[test]
 fn graph_run_started_creates_a_dag_panel_row() {
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
-    toggle_sidebar(&mut engine);
 
     dispatch_event(
         &mut engine,
@@ -305,7 +379,6 @@ fn graph_node_dispatched_then_result_updates_status_glyph() {
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
-    toggle_sidebar(&mut engine);
 
     dispatch_event(
         &mut engine,
@@ -364,7 +437,6 @@ fn graph_run_complete_removes_run_after_linger_window() {
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
-    toggle_sidebar(&mut engine);
 
     // Stand up a completed run: started, dispatched, result, complete.
     dispatch_event(
@@ -521,6 +593,303 @@ fn ctrl_o_toggles_expanded_details() {
     );
 }
 
+// Force the renderer to repaint and return the full framebuffer text.
+// Plain `render_if_dirty` only emits a *diff* against the prior frame,
+// so a check on its returned bytes misses cells that didn't change. The
+// engine snapshot returns every cell verbatim, which is what state-flip
+// tests actually want to inspect.
+fn render_snapshot(engine: &mut Engine) -> String {
+    engine.mark_animation_tick();
+    let _ = engine.render_if_dirty().expect("render");
+    engine.snapshot()
+}
+
+#[test]
+fn ctrl_b_uppercase_letter_still_toggles() {
+    // Some terminals (notably with Caps Lock or alternate keyboard
+    // layouts) deliver Ctrl+B as `KeyCode::Char('B')` + CONTROL — i.e.
+    // uppercase letter, no shift modifier. The Lua matcher must accept
+    // either casing or the press is silently dropped. The kind() builder
+    // in input.rs preserves the casing of the underlying char, so this
+    // test pins the chat surface against that asymmetry.
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("(no active runs)"),
+        "sidebar should be visible by default: {out:?}"
+    );
+
+    engine
+        .handle_key(KeyMessage {
+            name: "B".into(),
+            mods: vec!["ctrl"],
+        })
+        .expect("ctrl+B uppercase");
+    let out = render_snapshot(&mut engine);
+    assert!(
+        !out.contains("(no active runs)"),
+        "Ctrl+B (uppercase B) must still toggle sidebar: {out:?}"
+    );
+}
+
+#[test]
+fn ctrl_b_single_press_toggles_sidebar() {
+    // The chat surface boots with `show_sidebar = true` (legacy parity:
+    // sidebar visible by default in wide terminals). One Ctrl+B should
+    // hide it; a second should bring it back. A regression where the
+    // first press is consumed silently and only the second flips state
+    // would surface here. Test at 80 cols (typical default) to match
+    // the user's reported environment.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("(no active runs)"),
+        "sidebar should be visible by default: {out:?}"
+    );
+
+    // Send the realistic Ctrl+B shape (name="b", mods=["ctrl"]).
+    engine
+        .handle_key(KeyMessage {
+            name: "b".into(),
+            mods: vec!["ctrl"],
+        })
+        .expect("ctrl+b");
+    let out = render_snapshot(&mut engine);
+    assert!(
+        !out.contains("(no active runs)"),
+        "single Ctrl+B must hide the sidebar: {out:?}"
+    );
+
+    // A second press toggles back on.
+    engine
+        .handle_key(KeyMessage {
+            name: "b".into(),
+            mods: vec!["ctrl"],
+        })
+        .expect("ctrl+b again");
+    let out = render_snapshot(&mut engine);
+    assert!(
+        out.contains("(no active runs)"),
+        "second Ctrl+B must restore the sidebar: {out:?}"
+    );
+}
+
+// ── Prompt-history recall on Up/Down with empty input ────────────────
+//
+// Legacy spec section 7: when the input field is empty and the user
+// presses Up, fill with the last submitted prompt; subsequent Up cycles
+// to older entries. Down moves forward; Down past the newest entry
+// clears the input and exits navigation. Any value mutation (typing,
+// backspace) drops the navigation cursor.
+
+#[test]
+fn arrow_up_on_empty_input_recalls_last_prompt() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Submit a first prompt so prompt_history has one entry.
+    for ch in "hello".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+
+    // Buffer should now be empty.
+    let out = render_snapshot(&mut engine);
+    assert!(
+        out.contains("hello"),
+        "submitted prompt should still appear in the transcript: {out:?}"
+    );
+
+    // Up on empty buffer recalls the last prompt.
+    engine.handle_key(key("up")).expect("up");
+    let out = render_snapshot(&mut engine);
+    assert!(
+        out.contains("hello"),
+        "input should re-fill with the recalled prompt after Up: {out:?}"
+    );
+}
+
+#[test]
+fn arrow_up_cycles_through_older_prompts() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Submit two prompts. Newest at index 1.
+    for prompt in ["first", "second"] {
+        for ch in prompt.chars() {
+            engine.handle_key(key(&ch.to_string())).expect("type");
+        }
+        engine.handle_key(key("enter")).expect("enter");
+        let _ = engine.take_emit_queue();
+    }
+
+    // Up #1 → "second" (newest)
+    engine.handle_key(key("up")).expect("up1");
+    let snap = render_snapshot(&mut engine);
+    assert!(
+        snap.contains("second"),
+        "first Up should recall the most recent prompt: {snap:?}"
+    );
+
+    // Up #2 → "first" (older)
+    engine.handle_key(key("up")).expect("up2");
+    let snap = render_snapshot(&mut engine);
+    // "second" lives in the transcript too; check the input row by
+    // looking for the input chrome `╰` rule and asserting "first" sits
+    // in the surrounding row. A simpler proxy: "first" must appear
+    // again, which it does only when the input recalls it. The
+    // submitted "first" prompt also appears in the transcript above
+    // the input, so we can't distinguish on substring alone — instead
+    // check that the snapshot contains BOTH prompts (transcript +
+    // input).
+    let firsts = snap.matches("first").count();
+    assert!(
+        firsts >= 2,
+        "second Up should also place 'first' into the input (giving 2+ occurrences): {snap:?}"
+    );
+}
+
+#[test]
+fn arrow_down_after_recall_clears_input() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "draft".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+
+    engine.handle_key(key("up")).expect("up recall");
+    let snap = render_snapshot(&mut engine);
+    let drafts = snap.matches("draft").count();
+    assert!(
+        drafts >= 2,
+        "Up should recall 'draft' into the input, giving 2 occurrences: {snap:?}"
+    );
+
+    // Down past the newest entry clears the input.
+    engine.handle_key(key("down")).expect("down clear");
+    let snap = render_snapshot(&mut engine);
+    let drafts_after = snap.matches("draft").count();
+    assert!(
+        drafts_after < drafts,
+        "Down past newest should clear the input, dropping one occurrence: \
+         was {drafts}, now {drafts_after}: {snap:?}"
+    );
+}
+
+#[test]
+fn arrow_up_on_non_empty_input_does_not_overwrite() {
+    // Legacy: Up on a non-empty single-line buffer is a no-op — the
+    // user is mid-edit and we won't yank their draft. Routes to scroll
+    // instead via the existing fallback.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "old".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    // Force a reconcile so the text_input's internal `last_value`
+    // syncs to the post-submit empty buffer before we start typing.
+    let _ = render_snapshot(&mut engine);
+
+    // Type a new draft.
+    for ch in "new".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    let snap = render_snapshot(&mut engine);
+    assert!(
+        snap.contains("new") && !snap.contains("old\n"),
+        "draft should be 'new': {snap:?}"
+    );
+
+    // Up should not overwrite the draft with "old". The text_input
+    // bubbles Up to Lua only at edge-of-content, but the chat surface's
+    // history-recall guard checks `empty || navigating` — neither true
+    // here, so the press should fall through to the scroll path
+    // without touching input_value. The single-line input bubbles Up
+    // unconditionally so the user can scroll.
+    engine.handle_key(key("up")).expect("up no-op");
+    let snap = render_snapshot(&mut engine);
+    assert!(
+        snap.contains("new"),
+        "input draft 'new' should survive Up on a non-empty buffer: {snap:?}"
+    );
+    assert!(
+        snap.matches("old").count() == 1,
+        "'old' should only appear in the transcript, not pulled into the input: {snap:?}"
+    );
+}
+
+#[test]
+fn ctrl_b_after_typing_still_single_press_toggles() {
+    // Realistic user session: type a few characters into the input, then
+    // press Ctrl+B. The text_input swallows the printables, but Ctrl+B
+    // (modifier-prefixed) must bubble to Lua and toggle on the first
+    // press — not require a second press.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "hello".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    let _ = render_snapshot(&mut engine);
+
+    engine
+        .handle_key(KeyMessage {
+            name: "b".into(),
+            mods: vec!["ctrl"],
+        })
+        .expect("ctrl+b");
+    let out = render_snapshot(&mut engine);
+    assert!(
+        !out.contains("(no active runs)"),
+        "single Ctrl+B after typing must hide the sidebar: {out:?}"
+    );
+}
+
+#[test]
+fn tool_expanded_pretty_prints_input_object() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Seed a tool call whose `input` is a JSON object (the wire shape
+    // for any non-Bash tool: Read, Edit, Write, etc). Legacy spec
+    // section 5 says expanded view shows pretty-printed JSON, not the
+    // `(object)` placeholder the previous build emitted.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.tool.start",
+            "id": "t1",
+            "name": "Read",
+            "input": { "file_path": "/tmp/example.txt" },
+        }),
+    );
+    engine.handle_key(key("ctrl_o")).expect("ctrl_o expand");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("file_path"),
+        "expanded tool view should pretty-print the input keys: {out:?}"
+    );
+    assert!(
+        !out.contains("(object)"),
+        "placeholder text leaked into expanded view: {out:?}"
+    );
+}
+
 #[test]
 fn thinking_indicator_shows_pending_then_clears_on_stream_end() {
     let mut engine = Engine::new(80, 24).expect("engine");
@@ -552,10 +921,46 @@ fn thinking_indicator_shows_pending_then_clears_on_stream_end() {
         !out.contains("[thinking"),
         "thinking placeholder should clear after stream end: {out:?}"
     );
+    // Legacy spec section 4 shows the turn duration as a bare segment
+    // (`100ms`, `2s`, etc.) — no `[done in ...]` brackets. The previous
+    // behavior added an extra status_ok segment that wasn't in legacy.
     assert!(
-        out.contains("[done in"),
-        "[done in Xms] indicator missing on statusline: {out:?}"
+        out.contains("100ms"),
+        "turn duration missing on statusline: {out:?}"
     );
+    assert!(
+        !out.contains("[done in"),
+        "legacy spec: no [done in ...] segment, just bare duration: {out:?}"
+    );
+}
+
+#[test]
+fn thinking_indicator_has_no_braille_spinner() {
+    // Legacy spec section 14 — the pre-first-delta placeholder is
+    // deliberately minimalist: static `[thinking... Ns]` text, no
+    // spinner. Earlier builds prepended a braille animation; this test
+    // pins the minimalist behavior so a future refactor can't sneak
+    // the spinner back in.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "hi".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("[thinking"),
+        "thinking placeholder missing while pending: {out:?}"
+    );
+    // None of the braille glyphs should appear anywhere in the frame.
+    for braille in ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] {
+        assert!(
+            !out.contains(braille),
+            "braille spinner glyph '{braille}' present (legacy spec: no spinner): {out:?}"
+        );
+    }
 }
 
 #[test]
@@ -732,6 +1137,11 @@ fn slash_yolo_emits_tool_gate_set_mode() {
 
 #[test]
 fn tool_permission_request_opens_popup_with_approve_deny() {
+    // Wire-shape contract: the event the popup listens for is the EXACT
+    // body tool-gate emits when policy=Prompt — `chat.tool.permission_request`
+    // with `id`, `tool`, `args` (see plugins/tool-gate/src/main.rs:
+    // permission_request_body). Test against the real shape so a future
+    // protocol drift breaks here, not silently in production.
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -739,10 +1149,10 @@ fn tool_permission_request_opens_popup_with_approve_deny() {
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "tool-gate.permission_request",
+            "kind": "chat.tool.permission_request",
             "id": "perm-1",
             "tool": "Bash",
-            "input_pretty": "ls -la /tmp"
+            "args": { "command": "ls -la /tmp" }
         }),
     );
     let out = render_str(&mut engine);
@@ -754,6 +1164,12 @@ fn tool_permission_request_opens_popup_with_approve_deny() {
         out.contains("[A]pprove") && out.contains("[D]eny"),
         "popup footer missing approve/deny chrome: {out:?}"
     );
+    // The args formatter renders `key = "value"` lines — confirm the
+    // command is visible so the user knows what they're approving.
+    assert!(
+        out.contains("command") && out.contains("ls -la /tmp"),
+        "args summary missing from popup body: {out:?}"
+    );
     // Permission popup wraps content in bordered_box — corners must paint.
     let snap = engine.snapshot();
     assert!(
@@ -761,17 +1177,112 @@ fn tool_permission_request_opens_popup_with_approve_deny() {
         "permission popup borders missing: {snap}"
     );
 
-    // Press 'a' → emits approve response.
+    // Press 'a' → emits approve response back to tool-gate.
     let _ = engine.take_emit_queue();
     engine.handle_key(key("a")).expect("a");
     let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "expected exactly one egress on approve");
     assert_eq!(
         emits[0].1.get("kind").and_then(|v| v.as_str()),
         Some("tool.permission_response")
     );
     assert_eq!(
+        emits[0].1.get("id").and_then(|v| v.as_str()),
+        Some("perm-1"),
+        "response must carry the same id tool-gate sent"
+    );
+    assert_eq!(
         emits[0].1.get("decision").and_then(|v| v.as_str()),
         Some("approve")
+    );
+
+    // Re-open and exercise the deny path via 'd'.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.tool.permission_request",
+            "id": "perm-2",
+            "tool": "Bash",
+            "args": { "command": "rm -rf /" }
+        }),
+    );
+    let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+    engine.handle_key(key("d")).expect("d");
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "expected exactly one egress on deny");
+    assert_eq!(
+        emits[0].1.get("kind").and_then(|v| v.as_str()),
+        Some("tool.permission_response")
+    );
+    assert_eq!(
+        emits[0].1.get("id").and_then(|v| v.as_str()),
+        Some("perm-2")
+    );
+    assert_eq!(
+        emits[0].1.get("decision").and_then(|v| v.as_str()),
+        Some("deny")
+    );
+
+    // Re-open and exercise Esc → deny + close.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.tool.permission_request",
+            "id": "perm-3",
+            "tool": "Bash",
+            "args": {}
+        }),
+    );
+    let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+    engine.handle_key(key("escape")).expect("esc");
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "expected exactly one egress on esc");
+    assert_eq!(
+        emits[0].1.get("kind").and_then(|v| v.as_str()),
+        Some("tool.permission_response")
+    );
+    assert_eq!(
+        emits[0].1.get("id").and_then(|v| v.as_str()),
+        Some("perm-3")
+    );
+    assert_eq!(
+        emits[0].1.get("decision").and_then(|v| v.as_str()),
+        Some("deny")
+    );
+    // Popup must be closed after Esc — force a fresh frame so the
+    // snapshot reflects the post-update tree, not the prior render.
+    let snap_after = render_str(&mut engine);
+    assert!(
+        !snap_after.contains("permission requested"),
+        "popup should be closed after Esc: {snap_after}"
+    );
+
+    // Enter is also wired to approve as a quality-of-life shortcut (the
+    // input field is unfocused while the popup is open, so Enter bubbles
+    // up to Lua instead of submitting a chat message).
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.tool.permission_request",
+            "id": "perm-4",
+            "tool": "Bash",
+            "args": {}
+        }),
+    );
+    let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+    engine.handle_key(key("enter")).expect("enter");
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "expected exactly one egress on enter");
+    assert_eq!(
+        emits[0].1.get("decision").and_then(|v| v.as_str()),
+        Some("approve")
+    );
+    assert_eq!(
+        emits[0].1.get("id").and_then(|v| v.as_str()),
+        Some("perm-4")
     );
 }
 
@@ -819,6 +1330,110 @@ fn slash_autocomplete_opens_when_typing_slash() {
     assert!(
         out.contains("/new") || out.contains("/help"),
         "slash autocomplete not visible: {out:?}"
+    );
+}
+
+#[test]
+fn autocomplete_open_enter_runs_highlighted_command() {
+    // Browser-style combobox: when the slash autocomplete dropdown is
+    // open and the user presses Enter, the highlighted match runs — not
+    // the partial fragment they actually typed. Type `/mo`, the dropdown
+    // shows `/model` (the only command starting with "mo") highlighted;
+    // Enter must dispatch the `/model` action, which fans out one
+    // `chat.model.list_requested` per connected provider (legacy spec
+    // section 8/12) — not bottom-fall-through to a generic `chat.command`
+    // named "mo".
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Seed two connected providers so /model has someone to fan out to.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.auth.status", "provider": "ollama", "status": "connected" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.auth.status", "provider": "anthropic", "status": "connected" }),
+    );
+
+    for ch in "/mo".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("/model"),
+        "autocomplete should list /model after typing /mo: {out:?}"
+    );
+
+    let _ = engine.take_emit_queue();
+    engine.handle_key(key("enter")).expect("enter");
+    let emits = engine.take_emit_queue();
+    assert_eq!(
+        emits.len(),
+        2,
+        "Enter on open autocomplete with /model highlighted must fan out one list_requested per connected provider"
+    );
+    for e in &emits {
+        assert_eq!(
+            e.1.get("kind").and_then(|v| v.as_str()),
+            Some("chat.model.list_requested"),
+            "expected chat.model.list_requested, got {:?}",
+            e.1
+        );
+        assert!(
+            e.1.get("provider").and_then(|v| v.as_str()).is_some(),
+            "fan-out must include `provider` field per legacy spec: {:?}",
+            e.1
+        );
+    }
+}
+
+#[test]
+fn autocomplete_open_tab_completes_without_submitting() {
+    // Tab while autocomplete is open replaces the input value with the
+    // highlighted match's command text — no submit fires. This test
+    // belt-and-braces the Tab path so the Enter path's new behaviour
+    // doesn't subsume Tab.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Seed a connected provider so /model has fan-out targets.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.auth.status", "provider": "ollama", "status": "connected" }),
+    );
+
+    for ch in "/mo".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+
+    engine.handle_key(key("tab")).expect("tab");
+    let emits = engine.take_emit_queue();
+    assert!(
+        emits.is_empty(),
+        "Tab must not submit — it only replaces the input value: {emits:?}"
+    );
+    let out = render_str(&mut engine);
+    // The input now contains `/model ` (takes_args=true → trailing space).
+    // We verify by exit-shape via Backspace + Enter: backspace removes the
+    // trailing space, leaving `/model`, which submits to chat.model.list.
+    let _ = engine.take_emit_queue();
+    engine.handle_key(key("backspace")).expect("backspace");
+    engine.handle_key(key("enter")).expect("enter");
+    let emits = engine.take_emit_queue();
+    assert_eq!(
+        emits.len(),
+        1,
+        "Tab+backspace+Enter should submit /model with one connected provider: {out:?} -> emits={emits:?}"
+    );
+    assert_eq!(
+        emits[0].1.get("kind").and_then(|v| v.as_str()),
+        Some("chat.model.list_requested"),
+        "post-Tab value must be `/model `, with the cursor at end so backspace+Enter runs /model"
     );
 }
 
@@ -1004,6 +1619,122 @@ fn arrow_up_scrolls_transcript_when_input_focused_at_top_line() {
 }
 
 #[test]
+fn arrow_up_scrolls_transcript_when_input_empty() {
+    // Spec coverage parity: when no popup is open and the input is
+    // empty, Up arrow must scroll the transcript. Companion to the
+    // top-line variant above; this one exercises the cursor-at-row-0
+    // path through the empty-buffer fast track and asserts the result
+    // by reading the live offset.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for _ in 0..40 {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "chat.message.append", "role": "user", "text": "x" }),
+        );
+    }
+    let _ = render_str(&mut engine);
+
+    fn read_offset(engine: &mut Engine, key: &str) -> u16 {
+        let lua = engine.lua();
+        let chunk = format!(
+            r#"
+            local p = tui.scroll_position("{key}")
+            return p and p.offset or -1
+            "#
+        );
+        let v: i64 = lua
+            .load(chunk.as_str())
+            .eval()
+            .expect("scroll_position eval");
+        if v < 0 {
+            panic!("no scroll_position for `{key}`");
+        }
+        v as u16
+    }
+
+    let before = read_offset(&mut engine, "transcript");
+    assert!(
+        before > 0,
+        "test prerequisite: transcript should overflow viewport"
+    );
+    engine.handle_key(key("up")).expect("up");
+    let _ = render_str(&mut engine);
+    let after = read_offset(&mut engine, "transcript");
+    assert!(
+        after < before,
+        "Up arrow on empty input + no popup must scroll transcript (before={before}, after={after})"
+    );
+}
+
+#[test]
+fn mouse_wheel_up_scrolls_transcript() {
+    // Wheel events under the transcript must scroll it. Pre-fix, the
+    // wheel path mutated `scroll_y` but left `was_at_end` sticky from
+    // the prior frame, so the next paint snapped scroll_y back to the
+    // bottom under `stick_to = end` — making the transcript appear
+    // "not scrollable". The fix updates `was_at_*` inside `scroll_by_signed`
+    // so wheel and `tui.scroll_by` stay symmetric.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for _ in 0..40 {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "chat.message.append", "role": "user", "text": "x" }),
+        );
+    }
+    let _ = render_str(&mut engine);
+
+    fn read_offset(engine: &mut Engine, key: &str) -> u16 {
+        let lua = engine.lua();
+        let chunk = format!(
+            r#"
+            local p = tui.scroll_position("{key}")
+            return p and p.offset or -1
+            "#
+        );
+        let v: i64 = lua
+            .load(chunk.as_str())
+            .eval()
+            .expect("scroll_position eval");
+        if v < 0 {
+            panic!("no scroll_position for `{key}`");
+        }
+        v as u16
+    }
+
+    let before = read_offset(&mut engine, "transcript");
+    assert!(
+        before > 0,
+        "test prerequisite: transcript should overflow viewport"
+    );
+
+    // Wheel up over the transcript area. (3, 3) sits inside the
+    // transcript's painted rect — top-left of the body row, past the
+    // 1-cell outer padding.
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Wheel,
+            x: 3,
+            y: 3,
+            button: Some("up"),
+            mods: vec![],
+        })
+        .expect("wheel up");
+    let _ = render_str(&mut engine);
+    let after = read_offset(&mut engine, "transcript");
+    assert!(
+        after < before,
+        "Wheel up must scroll transcript (before={before}, after={after}) — \
+         pre-fix the post-paint stick_to=end re-pinned scroll_y to the bottom"
+    );
+}
+
+#[test]
 fn arrow_up_scrolls_popup_when_popup_open() {
     // With a popup open the active scroll target shifts to the popup's
     // scrollable. Up/Down arrows must follow PgUp/PgDn's modal-focus
@@ -1098,12 +1829,59 @@ fn statusline_renders_below_input_row() {
 }
 
 #[test]
+fn statusline_omits_scroll_segment_when_transcript_fits_viewport() {
+    // Empty / tiny transcript → no scrollback. The scroll segment is
+    // hidden entirely (legacy spec section 4: "Only rendered when total
+    // > transcript_rows").
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    assert!(
+        !snap.contains("100% ↓"),
+        "scroll segment should be absent on empty transcript: {snap}"
+    );
+    assert!(
+        !snap.contains("0% ↑"),
+        "scroll segment should be absent on empty transcript: {snap}"
+    );
+}
+
+#[test]
+fn statusline_shows_bottom_marker_when_transcript_overflows() {
+    // Push enough messages to overflow a 24-row terminal. The
+    // transcript stick_to=end keeps us at the bottom; the scroll
+    // segment should read `100% ↓ bottom`.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    for i in 0..30 {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "chat.message.append",
+                "role": "user",
+                "text": format!("line-{i}"),
+            }),
+        );
+    }
+    // First render lays out the transcript and populates the
+    // scroll-position snapshot. The second render's `view` call sees
+    // the populated snapshot and emits the scroll segment.
+    let _ = render_snapshot(&mut engine);
+    let snap = render_snapshot(&mut engine);
+    assert!(
+        snap.contains("100% ↓ bottom"),
+        "expected `100% ↓ bottom` segment for at-end overflow:\n{snap}"
+    );
+}
+
+#[test]
 fn outer_padding_leaves_terminal_edges_blank() {
-    // 1-cell outer padding so the UI doesn't sit flush against terminal
-    // edges. Verify by snapshotting a fresh frame and asserting that
-    // the leftmost column, rightmost column, top row, and bottom row
-    // contain only blanks (spaces) — the padding pushes all painted
-    // content one cell inward.
+    // Outer padding so the UI doesn't sit flush against terminal edges
+    // (legacy spec section 1: HPAD=2 horizontal, 1-cell vertical). The
+    // first two columns and the last two columns are blank; the top and
+    // bottom rows are blank.
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -1114,29 +1892,241 @@ fn outer_padding_leaves_terminal_edges_blank() {
     let top = rows.first().expect("top row");
     assert!(
         top.chars().all(|c| c == ' '),
-        "top row must be blank (1-cell padding): {top:?}"
+        "top row must be blank (1-cell vpad): {top:?}"
     );
     // Bottom row: all spaces.
     let bot = rows.last().expect("bottom row");
     assert!(
         bot.chars().all(|c| c == ' '),
-        "bottom row must be blank (1-cell padding): {bot:?}"
+        "bottom row must be blank (1-cell vpad): {bot:?}"
     );
-    // Left column on every row: space.
+    // Left two columns on every row: spaces (HPAD=2).
     for (i, r) in rows.iter().enumerate() {
-        let first = r.chars().next().unwrap_or(' ');
-        assert_eq!(
-            first, ' ',
-            "left column of row {i} must be blank (1-cell padding): {r:?}"
-        );
+        let mut chars = r.chars();
+        let c0 = chars.next().unwrap_or(' ');
+        let c1 = chars.next().unwrap_or(' ');
+        assert_eq!(c0, ' ', "col 0 of row {i} must be blank: {r:?}");
+        assert_eq!(c1, ' ', "col 1 of row {i} must be blank (HPAD=2): {r:?}");
     }
-    // Right column on every row: space. Walk by chars so multi-byte
-    // glyphs don't confuse the byte-indexed view.
+    // Right two columns on every row: spaces (HPAD=2). Walk by chars so
+    // multi-byte glyphs don't confuse the byte-indexed view.
     for (i, r) in rows.iter().enumerate() {
-        let last = r.chars().last().unwrap_or(' ');
-        assert_eq!(
-            last, ' ',
-            "right column of row {i} must be blank (1-cell padding): {r:?}"
-        );
+        let chars: Vec<char> = r.chars().collect();
+        let n = chars.len();
+        if n >= 2 {
+            assert_eq!(
+                chars[n - 1],
+                ' ',
+                "rightmost col of row {i} must be blank: {r:?}"
+            );
+            assert_eq!(
+                chars[n - 2],
+                ' ',
+                "second-from-right col of row {i} must be blank (HPAD=2): {r:?}"
+            );
+        }
     }
+}
+
+#[test]
+fn slash_model_no_args_fans_out_per_connected_provider_and_opens_popup() {
+    // Legacy spec section 8/12: `/model` with no args
+    //   1) emits one `chat.model.list_requested { provider }` per
+    //      connected provider, and
+    //   2) opens the ModelPicker popup with `awaiting` set to those
+    //      provider names.
+    // The transport adapter rejects requests that don't carry a
+    // `provider` field (see starter/agentic_workflow.lua:1301), so the
+    // fan-out shape is load-bearing — a single un-targeted request
+    // would be dropped on the floor.
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Two connected providers + one disconnected.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.auth.status", "provider": "ollama", "status": "connected" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.auth.status", "provider": "anthropic", "status": "connected" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.auth.status", "provider": "openai", "status": "login_required" }),
+    );
+
+    for ch in "/model".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    let _ = engine.take_emit_queue();
+    engine.handle_key(key("enter")).expect("enter");
+
+    let emits = engine.take_emit_queue();
+    assert_eq!(
+        emits.len(),
+        2,
+        "should emit exactly one list_requested per CONNECTED provider (not login_required): {emits:?}"
+    );
+    let mut providers: Vec<String> = emits
+        .iter()
+        .map(|(_, body)| {
+            body.get("provider")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+    providers.sort();
+    assert_eq!(providers, vec!["anthropic", "ollama"]);
+
+    // Popup is now visible.
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("pick a model"),
+        "ModelPicker popup title not visible: {out:?}"
+    );
+    assert!(
+        out.contains("loading from 2 provider"),
+        "ModelPicker should show loading footer for awaiting providers: {out:?}"
+    );
+}
+
+#[test]
+fn chat_models_listed_appends_into_open_picker_and_clears_awaiting() {
+    // After `/model` opens the picker, each provider responds with
+    // `chat.models.listed { provider, models }`. The picker appends the
+    // models, dedups, sorts, and removes the answering provider from
+    // the awaiting set.
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.auth.status", "provider": "ollama", "status": "connected" }),
+    );
+    for ch in "/model".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.models.listed",
+            "provider": "ollama",
+            "models": ["qwen2:7b", "llama3:8b"],
+        }),
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("qwen2:7b") && out.contains("llama3:8b"),
+        "models from ollama should appear in picker: {out:?}"
+    );
+    // Awaiting cleared → loading footer gone.
+    assert!(
+        !out.contains("loading from"),
+        "awaiting set should clear after the only provider responds: {out:?}"
+    );
+}
+
+#[test]
+fn model_picker_enter_emits_chat_model_set_with_provider() {
+    // Up/Down moves the cursor; Enter emits chat.model.set carrying the
+    // selected (provider, model) pair, then closes the popup.
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.auth.status", "provider": "ollama", "status": "connected" }),
+    );
+    for ch in "/model".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.models.listed",
+            "provider": "ollama",
+            "models": ["qwen2:7b", "llama3:8b"],
+        }),
+    );
+    let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+
+    // Enter on default cursor (row 1 = "llama3:8b" alphabetically before qwen2).
+    engine.handle_key(key("enter")).expect("enter");
+    let emits = engine.take_emit_queue();
+    assert_eq!(
+        emits.len(),
+        1,
+        "Enter on picker should emit one chat.model.set: {emits:?}"
+    );
+    assert_eq!(
+        emits[0].1.get("kind").and_then(|v| v.as_str()),
+        Some("chat.model.set")
+    );
+    assert_eq!(
+        emits[0].1.get("provider").and_then(|v| v.as_str()),
+        Some("ollama")
+    );
+    assert_eq!(
+        emits[0].1.get("model").and_then(|v| v.as_str()),
+        Some("llama3:8b"),
+        "default cursor should be on the alphabetically-first model"
+    );
+
+    // Popup closed.
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("pick a model"),
+        "popup should close after Enter: {out:?}"
+    );
+}
+
+#[test]
+fn model_picker_typing_filters_query() {
+    // Printable chars while the picker is open append to the filter
+    // query, narrowing the visible list.
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.auth.status", "provider": "ollama", "status": "connected" }),
+    );
+    for ch in "/model".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    // Render between popup-open and key.q so the text_input instance
+    // syncs to the cleared input_value before the q arrives. Without
+    // this render step the text_input still holds the pre-submit value
+    // and absorbs the q (router routes to it as a printable editing
+    // key) regardless of `focused=false`.
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.models.listed",
+            "provider": "ollama",
+            "models": ["qwen2:7b", "llama3:8b"],
+        }),
+    );
+    let _ = render_str(&mut engine);
+
+    engine.handle_key(key("q")).expect("q");
+    let out = render_str(&mut engine);
+    // Note: `llama3` is a substring of `ollama` (the provider name) too,
+    // so we look for `llama3` specifically as the model-row signature.
+    assert!(
+        out.contains("qwen") && !out.contains("llama3"),
+        "typing 'q' should filter to qwen-only: {out:?}"
+    );
 }

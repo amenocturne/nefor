@@ -1310,6 +1310,7 @@ fn body_style_for(style: &TextInputStyle) -> Style {
         italic: false,
         underline: false,
         reverse: false,
+        strikethrough: false,
     }
 }
 
@@ -1321,6 +1322,7 @@ fn placeholder_style_for(style: &TextInputStyle) -> Style {
         italic: false,
         underline: false,
         reverse: false,
+        strikethrough: false,
     }
 }
 
@@ -3127,7 +3129,7 @@ mod tests {
             ..Style::default()
         };
         let theme = MarkdownTheme {
-            h1: Some(h1),
+            h1: Some(crate::desc::HeadingStyle { style: h1, prefix: None }),
             ..MarkdownTheme::default()
         };
         let desc = markdown_desc("# Title", Some(theme));

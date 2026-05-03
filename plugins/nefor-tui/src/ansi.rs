@@ -57,6 +57,9 @@ pub fn write_style(out: &mut String, s: &Style) {
     if s.reverse {
         out.push_str(";7");
     }
+    if s.strikethrough {
+        out.push_str(";9");
+    }
     if let Some(fg) = s.fg {
         write_fg(out, fg);
     }
@@ -121,6 +124,17 @@ mod tests {
         };
         write_style(&mut s, &style);
         assert_eq!(s, "\x1b[0;1;4m");
+    }
+
+    #[test]
+    fn strikethrough_emits_sgr_9() {
+        let mut s = String::new();
+        let style = Style {
+            strikethrough: true,
+            ..Style::default()
+        };
+        write_style(&mut s, &style);
+        assert_eq!(s, "\x1b[0;9m");
     }
 
     #[test]

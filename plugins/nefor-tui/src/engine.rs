@@ -603,9 +603,14 @@ impl Engine {
             let mut bold = false;
             let mut italic = false;
             let mut underline = false;
+            let mut strike = false;
             for cell in &line.cells {
                 let s = cell.style;
                 // Close in reverse order before opening new ones.
+                if strike && !s.strikethrough {
+                    out.push_str("[/strike]");
+                    strike = false;
+                }
                 if underline && !s.underline {
                     out.push_str("[/underline]");
                     underline = false;
@@ -630,9 +635,16 @@ impl Engine {
                     out.push_str("[underline]");
                     underline = true;
                 }
+                if !strike && s.strikethrough {
+                    out.push_str("[strike]");
+                    strike = true;
+                }
                 out.push_str(&cell.text);
             }
             // Close any still-open markers at row end.
+            if strike {
+                out.push_str("[/strike]");
+            }
             if underline {
                 out.push_str("[/underline]");
             }

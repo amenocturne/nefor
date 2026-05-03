@@ -122,9 +122,16 @@ pub fn is_editing_key(key: &KeyMessage, max_lines: u16) -> bool {
     let solo_modifier = !has_ctrl && !has_alt && !has_super;
 
     match key.name.as_str() {
-        "backspace" | "delete" | "left" | "right" | "up" | "down" | "home" | "end" => {
-            !has_alt && !has_super
-        }
+        // Plain Backspace and Alt+Backspace (delete-word-back) both edit;
+        // Ctrl+Backspace stays free for Lua shortcuts.
+        "backspace" => !has_ctrl && !has_super,
+        // Plain Delete and Alt+Delete (delete-word-forward) both edit;
+        // Ctrl+Delete stays free.
+        "delete" => !has_ctrl && !has_super,
+        // Plain arrows + Alt+arrows (word-left/right). Ctrl+arrow and
+        // Super stay free.
+        "left" | "right" => !has_ctrl && !has_super,
+        "up" | "down" | "home" | "end" => !has_alt && !has_super,
         "enter" => {
             // Enter without modifiers → submit. Shift+Enter inserts a
             // newline only on multi-line inputs. Ctrl/Alt/Super+Enter
@@ -139,7 +146,9 @@ pub fn is_editing_key(key: &KeyMessage, max_lines: u16) -> bool {
         }
         // Ctrl+C bubbles to Lua as the universal "exit/cancel" gesture
         // for terminal apps; absorbing it here would strand the user.
-        "a" | "v" | "z" | "y" if has_ctrl && !has_alt && !has_super => true,
+        // The remaining readline shortcuts (Ctrl+A/E/U/K/W) absorb
+        // here so the editor handles them inline.
+        "a" | "e" | "u" | "k" | "w" | "v" | "z" | "y" if has_ctrl && !has_alt && !has_super => true,
         "space" => solo_modifier,
         // Single-char printable: route as text input. Names from
         // `from_key_event` are e.g. "a", "A", "1", "?". Excludes named
@@ -230,11 +239,16 @@ pub fn apply_editing_key(
 ) -> EditOutcome {
     let has_shift = key.mods.contains(&"shift");
     let has_ctrl = key.mods.contains(&"ctrl");
+    let has_alt = key.mods.contains(&"alt");
 
     match key.name.as_str() {
+        "backspace" if has_alt => state.delete_word_backward(),
         "backspace" => state.backspace(),
+        "delete" if has_alt => state.delete_word_forward(),
         "delete" => state.delete_forward(),
+        "left" if has_alt => state.move_word_left(has_shift),
         "left" => state.move_left(has_shift),
+        "right" if has_alt => state.move_word_right(has_shift),
         "right" => state.move_right(has_shift),
         "up" => state.move_up(has_shift),
         "down" => state.move_down(has_shift),
@@ -251,7 +265,11 @@ pub fn apply_editing_key(
                 }
             }
         }
-        "a" if has_ctrl => state.select_all(),
+        "a" if has_ctrl => state.move_to_line_start(false),
+        "e" if has_ctrl => state.move_to_line_end(false),
+        "u" if has_ctrl => state.delete_to_line_start(),
+        "k" if has_ctrl => state.delete_to_line_end(),
+        "w" if has_ctrl => state.delete_word_backward(),
         "v" if has_ctrl => {
             // Paste: same shape — terminal-driven bracketed paste lives
             // outside the editing-key path. v1 no-op.
@@ -442,9 +460,9 @@ mod tests {
     fn focused_text_input_absorbs_printable() {
         let mut r = build(ti("input", true, "hi"));
         let root = r.root.as_mut().unwrap();
-        // Default cursor is 0 (fresh state), so 'a' inserts at the
-        // start — the test asserts the absorption shape, not the
-        // cursor management Lua would normally drive.
+        // After the first sync the cursor sits at the end of the new
+        // value ("hi" → cursor=2, browser-input semantics for external
+        // value installs). 'a' therefore appends to the end.
         let decision = route_key(root, &key("a", vec![]));
         match decision {
             RouteDecision::HandledByTextInput {
@@ -456,7 +474,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(target_key, "input");
-                assert_eq!(value, "ahi");
+                assert_eq!(value, "hia");
                 assert!(value_changed);
                 assert!(!submitted);
                 assert_eq!(on_change.as_deref(), Some("input.changed"));
@@ -477,7 +495,12 @@ mod tests {
     fn focused_input_bubbles_modifier_prefixed_keys() {
         let mut r = build(ti("input", true, "hi"));
         let root = r.root.as_mut().unwrap();
-        for k in ["b", "s", "k"] {
+        // Ctrl+B/S/G are NOT readline editing keys — they bubble so a
+        // composition above can use them as shortcuts (Ctrl+B = sidebar
+        // toggle, etc.). Ctrl+A/E/U/K/W now ABSORB into the editor as
+        // their readline equivalents (line start/end, kill-to-start,
+        // kill-to-end, delete-word-back) — covered separately below.
+        for k in ["b", "s", "g"] {
             let decision = route_key(root, &key(k, vec!["ctrl"]));
             assert_eq!(decision, RouteDecision::BubbleToLua, "ctrl+{k}");
         }
@@ -485,6 +508,87 @@ mod tests {
         assert_eq!(escape, RouteDecision::BubbleToLua);
         let tab = route_key(root, &key("tab", vec![]));
         assert_eq!(tab, RouteDecision::BubbleToLua);
+    }
+
+    #[test]
+    fn focused_input_absorbs_readline_editing_chords() {
+        // Ctrl+A/E/U/K/W are readline editing chords — absorb them
+        // into the focused text_input.
+        for k in ["a", "e", "u", "k", "w"] {
+            assert!(
+                is_editing_key(&key(k, vec!["ctrl"]), 1),
+                "ctrl+{k} should be an editing key"
+            );
+        }
+    }
+
+    #[test]
+    fn focused_input_absorbs_alt_word_motion_chords() {
+        // Alt+Backspace / Alt+Delete delete-word; Alt+Left/Right move
+        // by word. All absorb into the focused text_input.
+        for name in ["left", "right", "backspace", "delete"] {
+            assert!(
+                is_editing_key(&key(name, vec!["alt"]), 1),
+                "alt+{name} should be an editing key"
+            );
+        }
+    }
+
+    #[test]
+    fn alt_left_moves_cursor_word_back() {
+        // End-to-end via the router: Alt+Left should land the cursor
+        // at the start of the previous word.
+        let multi = WidgetDescription::TextInput {
+            key: Some("input".into()),
+            value: "foo bar baz".into(),
+            focused: true,
+            on_change: None,
+            on_submit: None,
+            min_lines: 1,
+            max_lines: 1,
+            placeholder: None,
+            cursor_blink: false,
+            style: None,
+        };
+        let mut r = build(multi);
+        let root = r.root.as_mut().unwrap();
+        // The first sync seeds cursor at end (=11). Alt+Left → start
+        // of "baz" (=8).
+        let _ = route_key(root, &key("left", vec!["alt"]));
+        match &root.state {
+            InstanceState::TextInput(s) => assert_eq!(s.cursor, 8),
+            _ => panic!("expected text_input state"),
+        }
+    }
+
+    #[test]
+    fn alt_backspace_deletes_word_back() {
+        let single = WidgetDescription::TextInput {
+            key: Some("input".into()),
+            value: "foo bar".into(),
+            focused: true,
+            on_change: Some("input.changed".into()),
+            on_submit: None,
+            min_lines: 1,
+            max_lines: 1,
+            placeholder: None,
+            cursor_blink: false,
+            style: None,
+        };
+        let mut r = build(single);
+        let root = r.root.as_mut().unwrap();
+        let decision = route_key(root, &key("backspace", vec!["alt"]));
+        match decision {
+            RouteDecision::HandledByTextInput {
+                value,
+                value_changed,
+                ..
+            } => {
+                assert_eq!(value, "foo ");
+                assert!(value_changed);
+            }
+            other => panic!("expected HandledByTextInput, got {other:?}"),
+        }
     }
 
     #[test]
@@ -568,8 +672,10 @@ mod tests {
                 target_key, value, ..
             } => {
                 assert_eq!(target_key, "b");
-                // sync sets cursor=0 (default); inserting at 0 prepends.
-                assert_eq!(value, "yX");
+                // First sync lands cursor at end of installed value
+                // (browser-input semantics for an external value), so 'y'
+                // appends after "X".
+                assert_eq!(value, "Xy");
             }
             other => panic!("expected HandledByTextInput, got {other:?}"),
         }
@@ -639,8 +745,10 @@ mod tests {
 
     #[test]
     fn focused_multiline_bubbles_up_at_first_row() {
-        // route_key end-to-end: focused multi-line input with cursor at
-        // start of first row — Up must bubble, not absorb.
+        // route_key end-to-end: focused multi-line input with cursor on
+        // the first visual row — Up must bubble, not absorb. The first
+        // sync lands the cursor at the end of the value, so we manually
+        // park it on row 0 before exercising the router.
         let multi = WidgetDescription::TextInput {
             key: Some("input".into()),
             value: "abc\ndef".into(),
@@ -655,7 +763,10 @@ mod tests {
         };
         let mut r = build(multi);
         let root = r.root.as_mut().unwrap();
-        // Ensure cursor sits at position 0 (start of first row).
+        match &mut root.state {
+            InstanceState::TextInput(s) => s.cursor = 0,
+            _ => panic!("expected text_input state"),
+        }
         let decision = route_key(root, &key("up", vec![]));
         assert_eq!(
             decision,

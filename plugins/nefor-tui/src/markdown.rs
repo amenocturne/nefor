@@ -15,7 +15,7 @@
 
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
-use crate::desc::{MarkdownTheme, Style};
+use crate::desc::{HeadingStyle, MarkdownTheme, Style};
 use crate::layout::StyledChar;
 
 /// Render markdown `source` to a flat styled-char run, applying the
@@ -37,6 +37,7 @@ struct InlineStyleStack {
     italic: u32,
     code: u32,
     link: u32,
+    strikethrough: u32,
 }
 
 /// Tracks block context so newlines / list markers / blockquote marks
@@ -61,6 +62,10 @@ struct Walker<'a> {
     /// duplicate newline emissions when blocks butt up against each
     /// other (e.g., end-of-paragraph then start-of-list).
     at_line_start: bool,
+    /// `true` after `Tag::Item` emits its marker but before the item's
+    /// content paragraph starts. Suppresses the paragraph-start newline
+    /// so `1. ` and the body sit on the same line.
+    suppress_next_paragraph_break: bool,
 }
 
 struct ListContext {
@@ -81,6 +86,7 @@ impl<'a> Walker<'a> {
             blockquote_depth: 0,
             started: false,
             at_line_start: true,
+            suppress_next_paragraph_break: false,
         }
     }
 
@@ -133,19 +139,41 @@ impl<'a> Walker<'a> {
 
     fn start_tag(&mut self, tag: Tag<'_>) {
         match tag {
-            Tag::Paragraph => self.ensure_block_separator(),
+            Tag::Paragraph => {
+                if self.suppress_next_paragraph_break {
+                    self.suppress_next_paragraph_break = false;
+                    self.started = true;
+                } else {
+                    self.ensure_block_separator();
+                }
+            }
             Tag::Heading { level, .. } => {
                 self.ensure_block_separator();
                 self.heading_level = Some(level);
+                if let Some(hs) = self.heading_at(level) {
+                    if let Some(p) = hs.prefix {
+                        let mut s = String::with_capacity(p.len_utf8() + 1);
+                        s.push(p);
+                        s.push(' ');
+                        self.emit_str(&s, hs.style);
+                    }
+                }
             }
             Tag::BlockQuote(_) => {
                 self.ensure_block_separator();
                 self.blockquote_depth += 1;
-                // Emit a `> ` prefix at the start; for multiline quotes
-                // we don't try to prefix every wrapped line — that's a
-                // layout-pass concern and we keep the walker simple.
+                // Emit a `▎ ` left-rail prefix at the start; the heavier
+                // glyph reads more clearly as a quote indicator than a
+                // bare `>`. For multiline quotes we don't try to prefix
+                // every wrapped line — that's a layout-pass concern and
+                // we keep the walker simple.
                 let s = self.theme.and_then(|th| th.blockquote).unwrap_or_default();
-                self.emit_str("> ", s);
+                self.emit_str("▎ ", s);
+                // Same trick as Tag::Item: pulldown wraps the quote body
+                // in a Tag::Paragraph that would otherwise insert its
+                // own blank-line separator and push the body to the next
+                // line, leaving `▎ ` orphaned on its own row.
+                self.suppress_next_paragraph_break = true;
             }
             Tag::CodeBlock(_) => {
                 self.ensure_block_separator();
@@ -174,10 +202,11 @@ impl<'a> Walker<'a> {
                         self.emit_str("- ", s);
                     }
                 }
+                self.suppress_next_paragraph_break = true;
             }
             Tag::Strong => self.inline.bold += 1,
             Tag::Emphasis => self.inline.italic += 1,
-            Tag::Strikethrough => { /* not themed in v1 */ }
+            Tag::Strikethrough => self.inline.strikethrough += 1,
             Tag::Link { .. } => self.inline.link += 1,
             Tag::Image { .. } => { /* skip image alt; inline-text events still fire */ }
             // Tables / footnotes / metadata blocks fall through — text
@@ -219,6 +248,9 @@ impl<'a> Walker<'a> {
             TagEnd::Item => {}
             TagEnd::Strong => self.inline.bold = self.inline.bold.saturating_sub(1),
             TagEnd::Emphasis => self.inline.italic = self.inline.italic.saturating_sub(1),
+            TagEnd::Strikethrough => {
+                self.inline.strikethrough = self.inline.strikethrough.saturating_sub(1)
+            }
             TagEnd::Link => self.inline.link = self.inline.link.saturating_sub(1),
             _ => {}
         }
@@ -255,10 +287,15 @@ impl<'a> Walker<'a> {
                 style = merge_style(style, s);
             }
         }
+        if self.inline.strikethrough > 0 {
+            if let Some(s) = self.theme.and_then(|t| t.strikethrough) {
+                style = merge_style(style, s);
+            }
+        }
         style
     }
 
-    fn heading_style(&self, level: HeadingLevel) -> Option<Style> {
+    fn heading_at(&self, level: HeadingLevel) -> Option<HeadingStyle> {
         let theme = self.theme?;
         match level {
             HeadingLevel::H1 => theme.h1,
@@ -268,6 +305,10 @@ impl<'a> Walker<'a> {
             HeadingLevel::H5 => theme.h5,
             HeadingLevel::H6 => theme.h6,
         }
+    }
+
+    fn heading_style(&self, level: HeadingLevel) -> Option<Style> {
+        self.heading_at(level).map(|hs| hs.style)
     }
 
     fn emit_str(&mut self, s: &str, style: Style) {
@@ -282,10 +323,15 @@ impl<'a> Walker<'a> {
             self.started = true;
             return;
         }
+        // Block boundaries (paragraph, heading, list, code-block,
+        // blockquote, hr) get a blank line between them so prose stays
+        // readable. End the current line if we're not already at line
+        // start, then emit one more `\n` for the blank.
         if !self.at_line_start {
             self.emit_str("\n", Style::default());
-            self.at_line_start = true;
         }
+        self.emit_str("\n", Style::default());
+        self.at_line_start = true;
         self.started = true;
     }
 
@@ -308,6 +354,7 @@ fn merge_style(base: Style, over: Style) -> Style {
         italic: base.italic || over.italic,
         underline: base.underline || over.underline,
         reverse: base.reverse || over.reverse,
+        strikethrough: base.strikethrough || over.strikethrough,
     }
 }
 
@@ -437,12 +484,12 @@ mod tests {
             ..Style::default()
         };
         let theme = MarkdownTheme {
-            h1: Some(h1),
-            h2: Some(h2),
-            h3: Some(h3),
-            h4: Some(h4),
-            h5: Some(h5),
-            h6: Some(h6),
+            h1: Some(HeadingStyle { style: h1, prefix: None }),
+            h2: Some(HeadingStyle { style: h2, prefix: None }),
+            h3: Some(HeadingStyle { style: h3, prefix: None }),
+            h4: Some(HeadingStyle { style: h4, prefix: None }),
+            h5: Some(HeadingStyle { style: h5, prefix: None }),
+            h6: Some(HeadingStyle { style: h6, prefix: None }),
             ..MarkdownTheme::default()
         };
         for (level, expected) in [
@@ -505,9 +552,12 @@ mod tests {
         };
         let r = render_to_styled_chars("> quoted text", Some(&theme));
         let s: String = r.iter().map(|c| c.ch).collect();
-        assert!(s.contains("> "));
-        let gt = r.iter().find(|c| c.ch == '>').expect("> present");
-        assert!(gt.style.italic);
+        // Walker emits a `▎ ` left-rail glyph styled with the blockquote
+        // theme — heavier than `> ` and reads as a quote rail rather
+        // than email-style angle-quote.
+        assert!(s.contains("▎ "));
+        let rail = r.iter().find(|c| c.ch == '▎').expect("rail glyph present");
+        assert!(rail.style.italic);
     }
 
     #[test]
@@ -546,5 +596,38 @@ mod tests {
     #[test]
     fn empty_input_produces_empty_output() {
         assert!(render_to_styled_chars("", None).is_empty());
+    }
+
+    #[test]
+    fn strikethrough_body_picks_up_themed_style() {
+        // pulldown-cmark's Strikethrough extension is enabled via
+        // Options::all() — `~~deleted~~` becomes a Tag::Strikethrough
+        // inline. The walker maps the run to the theme's
+        // `strikethrough` entry; with a themed entry, the inner chars
+        // carry the strikethrough attribute.
+        let strike = Style {
+            strikethrough: true,
+            ..Style::default()
+        };
+        let theme = MarkdownTheme {
+            strikethrough: Some(strike),
+            ..MarkdownTheme::default()
+        };
+        let r = render_to_styled_chars("~~gone~~", Some(&theme));
+        let g = r.iter().find(|c| c.ch == 'g').expect("g present");
+        assert!(
+            g.style.strikethrough,
+            "themed strikethrough should mark the inner text",
+        );
+    }
+
+    #[test]
+    fn strikethrough_without_theme_entry_stays_neutral() {
+        // No theme → neutral output, exactly as bold/italic without
+        // theme entries. Confirms the no-default-theme contract.
+        let r = render_to_styled_chars("~~gone~~", None);
+        for c in &r {
+            assert_eq!(c.style, Style::default());
+        }
     }
 }
