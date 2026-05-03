@@ -113,6 +113,10 @@ local C = {
 
 local STYLE = {
   user_chrome     = { fg = C.user, bold = true },         -- ╭─╰│ borders
+  -- Input-field border. Same blue as user blocks per legacy spec
+  -- section 1 (input top/bot bars in HL_USER).
+  input_border          = { fg = C.user, bold = true },
+  input_border_unfocused= { fg = C.status_dim },          -- dim when no focus
   body_default    = nil,                                  -- HL_ASSISTANT = terminal default
   system          = { fg = C.system, italic = true },
   status          = { fg = C.system },
@@ -257,25 +261,69 @@ local function md(source)
 end
 
 ------------------------------------------------------------------------
--- entry rendering — per legacy spec section 5
+-- bordered-box composition
+--
+-- Full-width rounded-corner box around an arbitrary child:
+--   ╭──────────…──────╮
+--   │ <child>         │
+--   ╰──────────…──────╯
+--
+-- Built from primitives — corners are `tui.text`, the rules are
+-- `tui.expanded { child = tui.fill { char = "─" } }`, the side bars
+-- frame the child via a `tui.row`. Each rule row is wrapped in
+-- `constrained { max_height = 1 }` so the fill doesn't bloat past 1
+-- row tall (greedy `tui.fill` claims the parent's full max_height by
+-- default — see plugins/nefor-tui/src/layout.rs `layout_fill`).
 ------------------------------------------------------------------------
 
--- User entry: top + bottom rules in HL_USER, body in default fg.
--- `╭────…` and `╰────…` borders sized to chat_cols. Since we don't know
--- the column budget here exactly, we emit a long rule string and let
--- `wrap = "none"` clip at the cell boundary — same effect as the
--- legacy chat plugin's `top_rule = '╭' + '─'*(cols-1)` after layout.
-local function render_user_entry(entry)
-  local rule_top    = "╭" .. string.rep("─", 200)
-  local rule_bottom = "╰" .. string.rep("─", 200)
+local function rule_row(left_corner, right_corner, style)
+  return tui.constrained {
+    max_height = 1,
+    child = tui.row {
+      gap = 0,
+      children = {
+        tui.text { content = left_corner,  style = style, wrap = "none" },
+        tui.expanded { child = tui.fill { char = "─", style = style } },
+        tui.text { content = right_corner, style = style, wrap = "none" },
+      },
+    },
+  }
+end
+
+-- Bordered box around `child`. `border_style` colors the corners,
+-- rules, and side bars. `body_style` colours the side-bar `│ ` /
+-- ` │` chrome only — the child's own styling stands.
+local function bordered_box(child, border_style)
+  local body_row = tui.row {
+    gap = 0,
+    children = {
+      tui.text { content = "│ ", style = border_style, wrap = "none" },
+      tui.expanded { child = child },
+      tui.text { content = " │", style = border_style, wrap = "none" },
+    },
+  }
   return tui.column {
     gap = 0,
     children = {
-      tui.text { content = rule_top,    style = STYLE.user_chrome, wrap = "none" },
-      tui.text { content = "│ " .. (entry.text or ""),             wrap = "word" },
-      tui.text { content = rule_bottom, style = STYLE.user_chrome, wrap = "none" },
+      rule_row("╭", "╮", border_style),
+      body_row,
+      rule_row("╰", "╯", border_style),
     },
   }
+end
+
+------------------------------------------------------------------------
+-- entry rendering — per legacy spec section 5
+------------------------------------------------------------------------
+
+-- User entry: full-width bordered block in HL_USER. Body stays in
+-- default fg per spec (`HL_ASSISTANT`-coloured text inside a HL_USER
+-- frame).
+local function render_user_entry(entry)
+  return bordered_box(
+    tui.text { content = entry.text or "", wrap = "word" },
+    STYLE.user_chrome
+  )
 end
 
 -- Reasoning rows above the assistant body. Per legacy spec section 5:
@@ -928,27 +976,41 @@ local function view(state)
     },
   }
 
+  -- Input field with full-width rounded border per legacy spec section
+  -- 7. The `tui.text_input` is the bare control; `bordered_box` wraps
+  -- it in `╭─╮ │ ╰─╯` chrome so the input visually matches user
+  -- message blocks. Border colour brightens (HL_USER) when the input
+  -- is focused; dims to HL_STATUS_DIM when a popup steals focus.
+  local input_focused = state.focused_id == "input"
+    and not (state.popup and state.popup.variant == "tool_permission")
+  local input_border_style = input_focused
+    and STYLE.input_border
+    or STYLE.input_border_unfocused
+  local input_field = bordered_box(
+    tui.text_input {
+      key       = "input",
+      value     = state.input_value,
+      -- A popup that wants to absorb single-char keys (tool permission
+      -- with [A]/[D]) needs the input to drop focus while open; the
+      -- engine routes editing keys only to a `focused = true` input,
+      -- so single chars otherwise vanish into the buffer.
+      focused   = input_focused,
+      on_change = "input.changed",
+      on_submit = "input.submit",
+      min_lines = 1,
+      max_lines = 6,
+      placeholder = "type a message — Enter to send, /help for keys, /quit to exit",
+    },
+    input_border_style
+  )
+
   local main_column = tui.column {
     gap = 0,
     children = compact {
       tui.expanded { child = body_row },
       slash_autocomplete_inline(state),
       statusline(state),
-      tui.text_input {
-        key       = "input",
-        value     = state.input_value,
-        -- A popup that wants to absorb single-char keys (tool permission
-        -- with [A]/[D]) needs the input to drop focus while open; the
-        -- engine routes editing keys only to a `focused = true` input,
-        -- so single chars otherwise vanish into the buffer.
-        focused   = state.focused_id == "input"
-                     and not (state.popup and state.popup.variant == "tool_permission"),
-        on_change = "input.changed",
-        on_submit = "input.submit",
-        min_lines = 1,
-        max_lines = 8,
-        placeholder = "type a message — Enter to send, /help for keys, /quit to exit",
-      },
+      input_field,
     },
   }
 
