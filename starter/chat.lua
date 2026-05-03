@@ -146,14 +146,49 @@ local function humanize_tokens(n)
   return string.format("%.1fM", n / 1000000)
 end
 
+-- Render a `spawn_graph` args.graph as a compact node list + edge list.
+-- Args of each node are deliberately omitted so the popup stays scannable;
+-- a future "focus a node" UI can surface them on demand.
+local function format_graph(graph)
+  if type(graph) ~= "table" then return tostring(graph) end
+  local lines = {}
+  local nodes = graph.nodes
+  if type(nodes) == "table" and #nodes > 0 then
+    lines[#lines + 1] = "nodes:"
+    for _, n in ipairs(nodes) do
+      local id = n.id or n.name or "?"
+      local reasoner = n.reasoner or n.kind or n.type or "?"
+      lines[#lines + 1] = "  " .. id .. " (" .. reasoner .. ")"
+    end
+  end
+  local edges = graph.edges
+  if type(edges) == "table" and #edges > 0 then
+    if #lines > 0 then lines[#lines + 1] = "" end
+    lines[#lines + 1] = "edges:"
+    for _, e in ipairs(edges) do
+      local from = e.from or e.src or e[1] or "?"
+      local to   = e.to   or e.dst or e[2] or "?"
+      lines[#lines + 1] = "  " .. from .. " -> " .. to
+    end
+  end
+  if #lines == 0 then return "(empty graph)" end
+  return table.concat(lines, "\n")
+end
+
 -- Pretty-print an args table from a `chat.tool.permission_request` event
 -- so the popup body shows a human-legible summary of the call.
 -- Stringy values render verbatim; nested tables get a compact `{...}`
 -- placeholder rather than a recursive dump (most tools take flat args,
--- and a long nested blob would blow up the popup anyway).
+-- and a long nested blob would blow up the popup anyway). The
+-- `spawn_graph` tool gets a dedicated graph layout via `format_graph`.
 local function format_args(args)
   if args == nil then return "" end
   if type(args) ~= "table" then return tostring(args) end
+  -- spawn_graph: the only meaningful field is `graph`, and JSON of it is
+  -- noise. Render as a node + edge list per the user's spec.
+  if type(args.graph) == "table" then
+    return format_graph(args.graph)
+  end
   -- Collect string keys (NCP args are JSON objects) in insertion-ish
   -- order. Lua tables don't preserve order; sort for a stable display.
   local keys = {}
@@ -596,11 +631,16 @@ local function tool_expanded(entry)
   end
   local rows = { tui.text { content = header, style = header_style, wrap = "none" } }
   rows[#rows + 1] = tui.text { content = "  input:",  style = STYLE.footer, wrap = "none" }
-  -- Prefer the structured `input_table` so we can pretty-print as JSON
-  -- per legacy spec section 5. Fall back to the raw string when only
-  -- a string was sent (legacy never did, but defensive).
+  -- spawn_graph: render as compact node-list + edge-list. Args of each
+  -- node are intentionally omitted (would clutter); future "focus a node"
+  -- UI surfaces them on demand. For everything else, prefer JSON pretty-
+  -- print of the structured input_table per legacy spec section 5; fall
+  -- back to the raw string when only a string was sent.
   local input_text
-  if entry.input_table ~= nil then
+  if entry.name == "spawn_graph" and entry.input_table
+    and type(entry.input_table.graph) == "table" then
+    input_text = format_graph(entry.input_table.graph)
+  elseif entry.input_table ~= nil then
     input_text = pretty_json(entry.input_table)
   elseif entry.input and #entry.input > 0 and entry.input ~= "(object)" then
     input_text = entry.input
