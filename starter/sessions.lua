@@ -171,6 +171,12 @@ local current_session_path = nil
 -- on session_end / shutdown.
 local current_session_file = nil
 
+-- Count of non-control envelopes persisted since the active file was
+-- opened. Used at close time to delete empty session files so the
+-- picker doesn't fill up with "started a chat, said nothing, quit"
+-- ghost entries. Reset on every open (init and resume swap).
+local entries_written = 0
+
 -- Subscription bookkeeping so tests can reset between scenarios.
 local persistence_installed = false
 local resume_listener_installed = false
@@ -324,6 +330,19 @@ local function close_session_file()
   end
 end
 
+-- Close the active session file and, if no real activity was recorded,
+-- delete the jsonl so it doesn't show up as an empty stub in the
+-- picker. "Real activity" means at least one non-control envelope was
+-- persisted — `sessions.*` events are filtered out before the counter
+-- ever increments. Resets the counter so the next open starts clean.
+local function close_and_prune_if_empty()
+  close_session_file()
+  if entries_written == 0 and current_session_path ~= nil then
+    pcall(os.remove, current_session_path)
+  end
+  entries_written = 0
+end
+
 -- ------------------------------------------------------------------
 -- bus emission helpers
 -- ------------------------------------------------------------------
@@ -407,11 +426,14 @@ local function persist_envelope(entry)
   if not encode_ok then return end
 
   -- Best-effort write — a transient I/O error shouldn't crash step.
-  pcall(function()
+  local write_ok = pcall(function()
     current_session_file:write(row_line)
     current_session_file:write("\n")
     current_session_file:flush()
   end)
+  if write_ok then
+    entries_written = entries_written + 1
+  end
 end
 
 -- Install the persistence subscription. Uses a wildcard pattern so
@@ -467,6 +489,36 @@ local REPLAY_TARGETS = { ["nefor-tui"] = true }
 -- are explicitly NOT replay targets: they already cleared state on
 -- `sessions.session_end` and re-receiving past commands would replay
 -- side effects (provider HTTP calls, graph dispatches, tool invokes).
+--
+-- Streaming deltas that are subsumed by their finalizers are dropped
+-- so resume is INSTANT, not "watch the whole conversation re-stream
+-- in real time". `chat.stream.end` carries the final assistant text,
+-- so dropping the per-token `chat.stream.delta` events is safe — the
+-- finalizer will build the entry from `text` directly. Reasoning
+-- deltas are KEPT because `chat.stream.reasoning_end` carries no
+-- payload (just `duration_ms`); the reasoning text only exists in
+-- the deltas and dropping them would erase the reasoning view.
+-- Reasoning deltas are typically short relative to assistant text,
+-- so this still gives a fast replay.
+local REPLAY_DROP_KINDS = {
+  ["chat.stream.delta"] = true,
+}
+
+-- Sniff the body kind out of a raw NCP wire payload. Substring search
+-- is good enough — replay is bulk and a full JSON decode per line on a
+-- 50k-event session is wasteful when the answer is one of two strings.
+-- False positives are bounded to envelopes whose body literally
+-- contains `"kind":"chat.stream.delta"` somewhere — which is the kind
+-- itself, the only legitimate match we care about.
+local function payload_has_drop_kind(payload)
+  for kind, _ in pairs(REPLAY_DROP_KINDS) do
+    if payload:find('"kind":"' .. kind .. '"', 1, true) then
+      return true
+    end
+  end
+  return false
+end
+
 local function replay_jsonl(path)
   if path == nil then return 0 end
   local fh = io.open(path, "r")
@@ -482,7 +534,8 @@ local function replay_jsonl(path)
       if ok and type(decoded) == "table" and type(decoded.payload) == "string" then
         if decoded.origin == "step"
            and type(decoded.target) == "string"
-           and REPLAY_TARGETS[decoded.target] then
+           and REPLAY_TARGETS[decoded.target]
+           and not payload_has_drop_kind(decoded.payload) then
           nefor.engine.send(decoded.payload, decoded.target)
           count = count + 1
         end
@@ -558,7 +611,7 @@ function M.resume(target_session_id)
   emit_control("sessions.session_end", { session_id = current_session_id })
 
   -- 2. Swap state.
-  close_session_file()
+  close_and_prune_if_empty()
   local new_path = session_path_for(target_session_id)
   if new_path ~= nil then
     ensure_dir(sessions_dir())
@@ -637,7 +690,7 @@ end
 -- the shape and underscore-prefix marks intentional non-use.
 local function on_engine_shutdown(_payload)
   emit_control("sessions.session_end", { session_id = current_session_id })
-  close_session_file()
+  close_and_prune_if_empty()
 end
 
 function M.handle_shutdown()
@@ -720,6 +773,7 @@ end
 -- doesn't matter.
 function M._reset()
   close_session_file()
+  entries_written      = 0
   current_session_id   = nil
   current_session_path = nil
   persistence_installed     = false

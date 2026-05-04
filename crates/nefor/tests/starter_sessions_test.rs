@@ -440,11 +440,14 @@ fn resume_replay_targets_only_tui_with_step_origin_entries() {
         chat_kind_sends.push((kind, target));
     }
 
-    // Replay should have produced exactly two sends — the two step-
-    // origin entries targeted at nefor-tui.
+    // Replay should have produced exactly one send — the
+    // chat.message.append. The chat.stream.delta is dropped by the
+    // replay's REPLAY_DROP_KINDS filter (resume is instant: deltas
+    // are subsumed by their stream.end finalizer, so re-streaming
+    // them would just re-render every token live).
     assert_eq!(
         chat_kind_sends.len(),
-        2,
+        1,
         "replay sent unexpected non-control envelopes: {chat_kind_sends:?}",
     );
     for (kind, target) in &chat_kind_sends {
@@ -453,13 +456,18 @@ fn resume_replay_targets_only_tui_with_step_origin_entries() {
             Some("nefor-tui"),
             "replay must target nefor-tui only; saw kind={kind} target={target:?}",
         );
-        assert!(
-            kind == "chat.message.append" || kind == "chat.stream.delta",
+        assert_eq!(
+            kind, "chat.message.append",
             "replay carried unexpected kind {kind}",
         );
     }
-    // Belt-and-braces: the raw provider-prefixed kind must NOT appear.
+    // Belt-and-braces: stream deltas are dropped, raw provider-prefix
+    // kinds must not appear, and reasoner-graph is never targeted.
     for (kind, _) in &chat_kind_sends {
+        assert_ne!(
+            kind, "chat.stream.delta",
+            "chat.stream.delta must be filtered out of replay (instant resume)",
+        );
         assert!(
             !kind.starts_with("ollama."),
             "raw provider-prefix kind leaked into replay: {kind}",

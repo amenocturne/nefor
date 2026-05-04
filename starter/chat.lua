@@ -2050,7 +2050,30 @@ local function finalize_assistant(state, final_text, model, duration_ms)
   local now = tui.now_ms()
   local turn_dur = duration_ms or (state.turn_started_at and (now - state.turn_started_at)) or nil
   if state.in_flight == nil then
-    -- Empty turn (e.g. error) — still record durations.
+    -- No in-flight entry. Two cases:
+    --   1. Resume replay dropped the per-token deltas; this finalizer
+    --      is the only event carrying the assistant text. Push a
+    --      fully-formed entry from `final_text` so the message lands.
+    --   2. Empty turn (e.g. error) — `final_text` is nil/empty;
+    --      record only the durations.
+    if final_text and #final_text > 0 then
+      local entries = {}
+      for i, v in ipairs(state.entries) do entries[i] = v end
+      entries[#entries + 1] = {
+        role        = "assistant",
+        text        = final_text,
+        kind        = "stream",
+        streaming   = false,
+        model       = model,
+        duration_ms = duration_ms,
+      }
+      return shallow_merge(state, {
+        entries          = entries,
+        pending          = false,
+        turn_started_at  = NIL_SENTINEL,
+        last_turn_duration_ms = turn_dur,
+      })
+    end
     return shallow_merge(state, {
       pending = false, turn_started_at = NIL_SENTINEL,
       last_turn_duration_ms = turn_dur,
