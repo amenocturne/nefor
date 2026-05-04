@@ -3063,6 +3063,66 @@ fn realistic_new_flow_with_prior_content_displays_first_message() {
     );
 }
 
+/// Boot-time race: ncp.lua's replay-on-attach delivers `sessions.session_start`
+/// (emitted during `sessions.init()`) AFTER nefor-tui finished its handshake.
+/// If the user types their first prompt before that envelope lands, the
+/// local push is in `entries`. The session_start handler used to wipe
+/// `entries = {}` "for cleanliness" — but at boot the transcript is
+/// already empty, so the clear only ever destroyed the user's locally-
+/// pushed message. The user then saw only the assistant's reply because
+/// the orchestrator's chat.message.append echo got deduped against
+/// pending_user_echo, so nothing repaints the user line.
+#[test]
+fn boot_session_start_after_local_submit_keeps_user_message_visible() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // User types FIRST, before the boot session_start arrives.
+    for ch in "first-prompt".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    // Now the boot session_start arrives (replay-on-attach).
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "boot" }),
+    );
+
+    // Then the orchestrator's echo arrives — it's deduped against the
+    // pending_user_echo marker the local submit set.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "first-prompt" }),
+    );
+
+    // Assistant streams a reply.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "text": "response-token" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
+    );
+
+    let _ = render_str(&mut engine);
+    let out = engine.snapshot();
+    assert!(
+        out.contains("first-prompt"),
+        "user's first message must remain visible after boot session_start \
+         lands; this is the production regression — only the assistant's \
+         reply was visible, never the user prompt. Transcript:\n{out}",
+    );
+    assert!(
+        out.contains("response-token"),
+        "assistant reply must also be visible:\n{out}"
+    );
+}
+
 /// `/clear` is an alias for `/new`. Same egress, same lifecycle expectations.
 #[test]
 fn slash_clear_is_alias_for_slash_new() {

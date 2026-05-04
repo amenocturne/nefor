@@ -2847,13 +2847,17 @@ local function update(msg, state)
   end
 
   if kind == "sessions.session_start" then
-    -- Idempotent fresh-state guarantee. session_end already cleared on
-    -- the resume path; for boot, state is already empty. Either way,
-    -- ensure transcript is empty so replay paints a clean view.
-    return shallow_merge(state, {
-      entries   = {},
-      in_flight = NIL_SENTINEL,
-    }), {}
+    -- No-op. The /resume + /new paths already clear via session_end's
+    -- handler above; at boot, state is already empty. The handler
+    -- USED to defensively wipe `entries = {}` here, but that turned
+    -- out to be the cause of a real bug: ncp.lua's replay-on-attach
+    -- can deliver the boot session_start AFTER the user has typed
+    -- their first prompt (the local-push went into entries first).
+    -- Wiping then nukes the user's message; the orchestrator's
+    -- chat.message.append echo arrives later and gets deduped against
+    -- the pending_user_echo marker, so nothing ever repaints the user
+    -- line — the transcript shows only the assistant's reply.
+    return state, {}
   end
 
   if kind == "sessions.resume_done" then
