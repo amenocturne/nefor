@@ -582,6 +582,79 @@ fn shutdown_prunes_session_with_no_user_submits() {
     }
 }
 
+#[test]
+fn new_mints_fresh_session_and_prunes_empty_outgoing() {
+    // `/new` regression: typing `/new` only cleared the transcript
+    // visually; the on-disk session id stayed put so every subsequent
+    // submit kept landing in the same jsonl. The picker therefore only
+    // ever showed one growing entry, no matter how many `/new`s the
+    // user typed. The fix is `sessions.new()` (driven by the
+    // `sessions.new_request` bus event) — mints a fresh id, runs the
+    // resume lifecycle (end → swap → start → resume_done), and prunes
+    // the outgoing file when it had no submits. We assert (a) the id
+    // changed, (b) the new file exists with a header, (c) the empty
+    // outgoing file is gone.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_HOME").ok();
+    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+
+    lua.load(
+        r#"
+        sessions = require("sessions")
+        sessions.init()
+        "#,
+    )
+    .exec()
+    .expect("sessions init");
+
+    let boot_id: String = lua
+        .load(r#"return sessions.current_id()"#)
+        .eval()
+        .expect("boot id");
+    let boot_path: String = lua
+        .load(r#"return sessions.current_path()"#)
+        .eval()
+        .expect("boot path");
+    assert!(
+        std::path::Path::new(&boot_path).exists(),
+        "boot session file should exist"
+    );
+
+    // Drive `/new` via the bus listener entry point so the test
+    // exercises the same path the chat surface hits.
+    lua.load(r#"sessions._on_new_request(nil)"#)
+        .exec()
+        .expect("drive new_request");
+
+    let new_id: String = lua
+        .load(r#"return sessions.current_id()"#)
+        .eval()
+        .expect("new id");
+    let new_path: String = lua
+        .load(r#"return sessions.current_path()"#)
+        .eval()
+        .expect("new path");
+    assert_ne!(boot_id, new_id, "/new must mint a fresh id");
+    assert!(
+        std::path::Path::new(&new_path).exists(),
+        "new session file should exist after /new"
+    );
+    assert!(
+        !std::path::Path::new(&boot_path).exists(),
+        "outgoing empty session file should be pruned by /new: {boot_path}"
+    );
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
+        None => std::env::remove_var("NEFOR_DATA_HOME"),
+    }
+}
+
 // Process-global lock to serialise tests that mutate NEFOR_DATA_HOME.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 

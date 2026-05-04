@@ -256,7 +256,7 @@ fn ctrl_d_exits() {
 }
 
 #[test]
-fn slash_new_clears_transcript_and_emits_chat_reset() {
+fn slash_new_clears_transcript_and_mints_new_session() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -275,12 +275,17 @@ fn slash_new_clears_transcript_and_emits_chat_reset() {
     let _ = engine.take_emit_queue();
     engine.handle_key(key("enter")).expect("enter");
     let emits = engine.take_emit_queue();
-    // /new must cancel any in-flight work AND clear the chat: emits both
-    // chat.interrupt_all (kills graphs/pending tool calls) and chat.reset.
+    // `/new` must cancel any in-flight work AND mint a brand-new
+    // on-disk session — without the latter, every submit kept landing
+    // in the same jsonl no matter how many times the user typed `/new`,
+    // so the picker only ever showed one growing entry. The egress is
+    // chat.interrupt_all (kills graphs/pending tool calls) +
+    // sessions.new_request (the starter's sessions module mints a
+    // fresh id and runs end → swap → start in-process).
     assert_eq!(
         emits.len(),
         2,
-        "expected interrupt_all + reset egress, got {emits:?}"
+        "expected interrupt_all + sessions.new_request egress, got {emits:?}"
     );
     let kinds: Vec<_> = emits
         .iter()
@@ -291,8 +296,8 @@ fn slash_new_clears_transcript_and_emits_chat_reset() {
         "missing chat.interrupt_all in {kinds:?}"
     );
     assert!(
-        kinds.contains(&"chat.reset"),
-        "missing chat.reset in {kinds:?}"
+        kinds.contains(&"sessions.new_request"),
+        "missing sessions.new_request in {kinds:?}"
     );
 
     let out = render_str(&mut engine);

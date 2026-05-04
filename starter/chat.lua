@@ -2313,6 +2313,18 @@ local function update(msg, state)
       return state, { { kind = "exit" } }
     end
     if cmd == "new" or cmd == "clear" then
+      -- `/new` mints a brand-new session on disk in addition to
+      -- clearing the visual transcript. Without `sessions.new_request`,
+      -- the on-disk session id stays put and every subsequent submit
+      -- lands in the file the picker previewed before — so the picker
+      -- only ever showed one growing entry no matter how many `/new`s
+      -- the user typed. The starter's sessions module subscribes to
+      -- this kind via `nefor.bus.on_event` and runs the in-process
+      -- mint + swap (session_end → close+prune → open fresh →
+      -- session_start → resume_done with replay=0). The
+      -- `chat.interrupt_all` envelope is still emitted so any in-flight
+      -- streaming aborts immediately rather than waiting for the
+      -- session_end teardown to fan out via the broker.
       local cleared = shallow_merge(state, {
         entries = {}, in_flight = NIL_SENTINEL, input_value = "",
         pending = false, slash = NIL_SENTINEL,
@@ -2327,7 +2339,7 @@ local function update(msg, state)
         { kind = "send_to", target = "engine",
           body = { kind = "chat.interrupt_all" } },
         { kind = "send_to", target = "engine",
-          body = { kind = "chat.reset" } },
+          body = { kind = "sessions.new_request" } },
       }
     end
     if cmd == "help" then

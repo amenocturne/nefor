@@ -45,6 +45,18 @@
 --     `sessions.resume(session_id)`. The request itself is a control
 --     event and is NOT persisted.
 --
+--   sessions.new_request { }
+--     Consumed (subscribed via `nefor.bus.on_event`). The chat surface
+--     emits this on `/new` (or `/clear`) to mint a brand-new session
+--     instead of continuing to write into the current jsonl. The
+--     library responds by minting a fresh UUID and running the same
+--     end → swap → start lifecycle as `resume` (replay is a no-op for
+--     a fresh file). Without this signal, `/new` only cleared the
+--     transcript visually — submits kept landing in whichever session
+--     was already active, so the picker only ever showed one growing
+--     entry. The request itself is a control event and is NOT
+--     persisted.
+--
 -- ## Public Lua API
 --
 --   sessions.init()
@@ -663,7 +675,7 @@ function M.resume(target_session_id)
 end
 
 -- ------------------------------------------------------------------
--- bus subscriptions: resume_request + shutdown
+-- bus subscriptions: resume_request + new_request + shutdown
 -- ------------------------------------------------------------------
 
 -- The dispatcher delivers a log-entry table `{ts, origin, target?, payload}`
@@ -678,12 +690,31 @@ local function on_resume_request(entry)
   M.resume(target)
 end
 
+-- `/new` from the chat surface. No payload — we mint the id here.
+-- Routes through `M.new()` which goes through the same end → swap →
+-- start lifecycle as resume (replay is trivially zero on a fresh file).
+local function on_new_request(_entry)
+  M.new()
+end
+
 local function install_resume_listener()
   if resume_listener_installed then return end
   if nefor.bus and nefor.bus.on_event then
     nefor.bus.on_event("sessions.resume_request", on_resume_request)
+    nefor.bus.on_event("sessions.new_request", on_new_request)
     resume_listener_installed = true
   end
+end
+
+-- Mint a brand-new session and switch to it. Mirrors the resume path
+-- exactly: the outgoing session gets `session_end` + a prune-if-empty
+-- close, the new file is opened, and `session_start` / `resume_done`
+-- fire so per-plugin handlers reset state. Replay reads the freshly
+-- created file (header only) and emits zero envelopes — the
+-- `replayed = 0` field on `resume_done` is the public signal.
+function M.new()
+  local id = uuid_v4()
+  M.resume(id)
 end
 
 -- Engine shutdown handler. Synchronous: we emit the session_end inside
@@ -797,6 +828,7 @@ end
 -- without having to pump the bus.
 M._persist_envelope = persist_envelope
 M._on_resume_request = on_resume_request
+M._on_new_request = on_new_request
 M._on_engine_shutdown = on_engine_shutdown
 M._uuid_v4 = uuid_v4
 M._data_root = data_root
