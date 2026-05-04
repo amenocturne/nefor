@@ -1849,21 +1849,6 @@ local function render_keepalive(state)
 end
 
 local function view(state)
-  local body_row = tui.row {
-    gap = 0,
-    children = compact {
-      tui.expanded { child = transcript(state) },
-      state.show_sidebar and vertical_separator() or nil,
-      state.show_sidebar and dag_panel(state)        or nil,
-    },
-  }
-
-  -- Toast moved to the outer stack so it can overlay the input and
-  -- statusline rows too — anchoring inside body_row's rect parked
-  -- the bottom rule under the input chrome. See outer `tui.stack`
-  -- below for the new placement (above all popups).
-  local body_with_toast = body_row
-
   -- Input field with full-width rounded border per legacy spec section
   -- 7. The `tui.text_input` is the bare control; `bordered_box` wraps
   -- it in `╭─╮ │ ╰─╯` chrome so the input visually matches user
@@ -1909,15 +1894,16 @@ local function view(state)
     "input-field"
   )
 
-  -- Layout (top → bottom): transcript | slash autocomplete (when open) |
-  -- input row | statusline. Statusline lives BELOW the input per legacy
-  -- spec — pushing it above the input visibly inverts the screen weight,
-  -- making the input feel like a status row rather than the primary
-  -- focus surface.
-  local main_column = tui.column {
+  -- Left column = chat surface. Top → bottom: transcript / slash
+  -- autocomplete (when open) / input / statusline / keepalive.
+  -- Statusline lives BELOW the input per legacy spec — pushing it
+  -- above the input visibly inverts the screen weight, making the
+  -- input feel like a status row rather than the primary focus
+  -- surface.
+  local left_column = tui.column {
     gap = 0,
     children = compact {
-      tui.expanded { child = body_with_toast },
+      tui.expanded { child = transcript(state) },
       slash_autocomplete_inline(state),
       input_field,
       statusline(state),
@@ -1928,17 +1914,27 @@ local function view(state)
     },
   }
 
-  -- 2-cell horizontal padding (legacy spec section 1, "HPAD = 2 columns
-  -- left/right inside the chat pane"). Top/bottom keep 1-cell so the
-  -- vertical breathing room stays modest — uniform 2 there would cost
-  -- two transcript rows on a 24-row terminal. Statusline is wrapped in
-  -- the same padded column for v1; pulling it flush-left needs a
-  -- restructure (separate padding container per child) and is deferred.
+  -- Outer row: left column (chat) | separator | sidebar. Sidebar
+  -- spans full window height — input and statusline stay confined
+  -- to the left column rather than running across underneath the
+  -- sidebar.
+  local main_row = tui.row {
+    gap = 0,
+    children = compact {
+      tui.expanded { child = left_column },
+      state.show_sidebar and vertical_separator() or nil,
+      state.show_sidebar and dag_panel(state)        or nil,
+    },
+  }
+
+  -- 1-cell vertical padding only — no horizontal padding. Side
+  -- padding ate into the toast's reach to the right edge and added
+  -- visual gutters that the user prefers without.
   return tui.padding {
-    value = { top = 1, right = 2, bottom = 1, left = 2 },
+    value = { top = 1, right = 0, bottom = 1, left = 0 },
     child = tui.stack {
       children = compact {
-        main_column,
+        main_row,
         popup_help(state),
         popup_message(state),
         popup_model_picker(state),

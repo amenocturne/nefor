@@ -1877,55 +1877,28 @@ fn statusline_shows_bottom_marker_when_transcript_overflows() {
 }
 
 #[test]
-fn outer_padding_leaves_terminal_edges_blank() {
-    // Outer padding so the UI doesn't sit flush against terminal edges
-    // (legacy spec section 1: HPAD=2 horizontal, 1-cell vertical). The
-    // first two columns and the last two columns are blank; the top and
-    // bottom rows are blank.
+fn outer_padding_leaves_top_and_bottom_rows_blank() {
+    // Outer vertical padding only — horizontal HPAD was dropped so the
+    // chat surface and the sidebar can run flush to the screen edges
+    // (toast slides off the right; sidebar sits flush left of the
+    // right edge). Top and bottom rows still get a 1-cell breathing
+    // gap so chrome doesn't slam against the terminal frame.
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
     let snap = engine.snapshot();
     let rows: Vec<&str> = snap.lines().collect();
 
-    // Top row: all spaces.
     let top = rows.first().expect("top row");
     assert!(
         top.chars().all(|c| c == ' '),
         "top row must be blank (1-cell vpad): {top:?}"
     );
-    // Bottom row: all spaces.
     let bot = rows.last().expect("bottom row");
     assert!(
         bot.chars().all(|c| c == ' '),
         "bottom row must be blank (1-cell vpad): {bot:?}"
     );
-    // Left two columns on every row: spaces (HPAD=2).
-    for (i, r) in rows.iter().enumerate() {
-        let mut chars = r.chars();
-        let c0 = chars.next().unwrap_or(' ');
-        let c1 = chars.next().unwrap_or(' ');
-        assert_eq!(c0, ' ', "col 0 of row {i} must be blank: {r:?}");
-        assert_eq!(c1, ' ', "col 1 of row {i} must be blank (HPAD=2): {r:?}");
-    }
-    // Right two columns on every row: spaces (HPAD=2). Walk by chars so
-    // multi-byte glyphs don't confuse the byte-indexed view.
-    for (i, r) in rows.iter().enumerate() {
-        let chars: Vec<char> = r.chars().collect();
-        let n = chars.len();
-        if n >= 2 {
-            assert_eq!(
-                chars[n - 1],
-                ' ',
-                "rightmost col of row {i} must be blank: {r:?}"
-            );
-            assert_eq!(
-                chars[n - 2],
-                ' ',
-                "second-from-right col of row {i} must be blank (HPAD=2): {r:?}"
-            );
-        }
-    }
 }
 
 #[test]
