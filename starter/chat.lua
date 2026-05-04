@@ -1471,18 +1471,30 @@ local function popup_model_picker(state)
   }
 end
 
--- Toast: bottom-left, single-line, no border, in HL_STATUS_INFO. Auto-
--- dismisses on `expires_at_ms` via the per-event prune cycle.
+-- Toast: bottom-left, single-line, no border, sits ON TOP of chat
+-- content. Auto-dismisses on `expires_at_ms`. Solid background via the
+-- text's own style so cells under the label are occluded rather than
+-- bleeding through. Two leading + two trailing spaces give visual
+-- breathing room while staying part of the same styled run, so the bg
+-- band reads as one block.
+local TOAST_BG = "#2a3340"
+local TOAST_FG = "#88ccff"
 local function popup_toast(state)
   if not state.toast then return nil end
   if state.toast.expires_at_ms and tui.now_ms() >= state.toast.expires_at_ms then
     return nil
   end
+  local label = "  " .. (state.toast.text or "") .. "  "
   return tui.anchored {
-    anchor = "bottom-left",
+    anchor   = "bottom-left",
     offset_x = 1,
-    width  = 40,
-    child  = tui.text { content = state.toast.text or "", style = STYLE.toast, wrap = "none" },
+    width    = #label,
+    height   = 1,
+    child = tui.text {
+      content = label,
+      style   = { fg = TOAST_FG, bg = TOAST_BG },
+      wrap    = "none",
+    },
   }
 end
 
