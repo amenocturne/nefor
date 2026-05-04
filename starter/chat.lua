@@ -1086,20 +1086,20 @@ local function awaiting_count(awaiting)
 end
 
 ------------------------------------------------------------------------
--- session resume — picker + sidechannel
+-- session resume — picker + bus event
 ------------------------------------------------------------------------
 --
 -- `/resume` pops a session picker showing the last 10 sessions on disk
 -- (newest first) with a one-line preview of the first user prompt.
--- Selecting a row writes the session id to a sidechannel file and emits
--- `{kind="exit"}`; the user re-launches and `init.lua` reads the file at
--- boot, sets `nefor.parent_session`, and ncp.lua replays saved_log
--- through `resume.lua` transforms.
---
--- The picker is dev-tooling: in-place "warm" resume would require tearing
--- every plugin's state down + back up, which is out of scope. Exit-and-
--- relaunch is the cleanest contract — the OS gives us a fresh process
--- tree and resume.lua's transforms handle the structural-history replay.
+-- Selecting a row emits a `sessions.resume_request { session_id }`
+-- envelope onto the NCP bus and dismisses the picker — no process exit,
+-- no sidechannel file. The starter's `sessions` Lua module subscribes to
+-- that kind via `nefor.bus.on_event` and runs the in-process resume
+-- sequence (emit `session_end` → swap state → emit `session_start` →
+-- replay jsonl → emit `resume_done`). Per-plugin handlers in the
+-- agentic_workflow transforms react to the lifecycle events to flush
+-- and rebuild their own state. The TUI process stays alive across the
+-- whole flip.
 
 -- Path to the macOS XDG-equivalent sessions directory. Linux/Windows
 -- users would adjust this — v1 ships the macOS path.
@@ -1120,12 +1120,6 @@ local function session_dir()
   local root = nefor_data_root()
   if root == nil then return nil end
   return root .. "/sessions"
-end
-
-local function resume_target_path()
-  local root = nefor_data_root()
-  if root == nil then return nil end
-  return root .. "/resume_target"
 end
 
 -- Extract the value of `"text": "..."` from a session-log JSONL line
@@ -1267,25 +1261,16 @@ local function format_started_at(s)
   return string.format("%s-%s %s:%s", mo, dy, hh, mm)
 end
 
--- Write `id` to the sidechannel resume_target file. Returns true on
--- success. Failure is silent — the user will see the picker close + the
--- app exit + nothing happen on relaunch, which is the diagnostic.
-local function write_resume_target(id)
-  local path = resume_target_path()
-  if path == nil then return false end
-  -- Ensure parent dir exists. The sessions dir already does (the engine
-  -- created it when writing the first session), so this is belt-and-
-  -- braces for fresh installs that have never written a session.
-  local root = nefor_data_root()
-  if root ~= nil then
-    -- mkdir -p; benign if it already exists.
-    os.execute(string.format("mkdir -p %q", root))
-  end
-  local fh = io.open(path, "w")
-  if fh == nil then return false end
-  fh:write(id)
-  fh:close()
-  return true
+-- Build a `sessions.resume_request` send_to effect for `id`. The starter's
+-- sessions module subscribes to this kind via `nefor.bus.on_event` and
+-- runs the swap sequence in-process. No process exit, no file write —
+-- the TUI stays alive across the resume.
+local function emit_resume_request(id)
+  return {
+    kind   = "send_to",
+    target = "engine",
+    body   = { kind = "sessions.resume_request", session_id = id },
+  }
 end
 
 -- Session picker popup. Border is HL_USER. Layout:
@@ -2343,24 +2328,14 @@ local function update(msg, state)
       }), effects
     end
     if cmd == "resume" then
-      -- `/resume <session-id>` — direct: write sidechannel + exit.
-      -- The `chat.input.submit` for the resume command itself doesn't
-      -- need to land on the bus; we synthesize the relaunch handoff
-      -- entirely client-side. Engine relaunches with parent_session set.
+      -- `/resume <session-id>` — direct: emit `sessions.resume_request`
+      -- onto the bus and clear the input. The starter's sessions module
+      -- runs the in-process swap (no exit, no sidechannel).
       if args and #args > 0 then
         local id = args:match("^([%w%-]+)") or args
-        if write_resume_target(id) then
-          return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL }), {
-            { kind = "exit" },
-          }
-        end
-        -- Sidechannel write failed — surface a toast so the user knows
-        -- something went wrong rather than the app silently no-op-ing.
-        local now = tui.now_ms()
-        return shallow_merge(state, {
-          input_value = "", slash = NIL_SENTINEL,
-          toast = { text = "resume: failed to write sidechannel", created_at_ms = now, expires_at_ms = now + 3000 },
-        }), {}
+        return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL }), {
+          emit_resume_request(id),
+        }
       end
       -- `/resume` (no args) — open the picker.
       local sessions = list_recent_sessions(10)
@@ -2555,12 +2530,13 @@ local function update(msg, state)
     end
   end
 
-  -- Session picker popup keys. Up/Down move cursor; Enter writes the
-  -- sidechannel resume_target file + emits exit (the user re-launches
-  -- and `init.lua` reads the file at boot — see `read_resume_target`
-  -- there). Esc handled in the popup-close branch above (closes without
-  -- writing). No filter input — the picker is small (≤10 sessions) and
-  -- the timestamps + previews are scannable as-is.
+  -- Session picker popup keys. Up/Down move cursor; Enter emits a
+  -- `sessions.resume_request` envelope onto the NCP bus and dismisses
+  -- the popup. The starter's sessions module subscribes via
+  -- `nefor.bus.on_event` and runs the in-process swap. Esc handled in
+  -- the popup-close branch above (closes without emitting). No filter
+  -- input — the picker is small (≤10 sessions) and the timestamps +
+  -- previews are scannable as-is.
   if state.popup and state.popup.variant == "session_picker" then
     local p = state.popup
     local sessions = p.sessions or {}
@@ -2578,16 +2554,9 @@ local function update(msg, state)
       if #sessions == 0 then return state, {} end
       local sel = sessions[p.cursor or 1] or sessions[1]
       if not sel or not sel.id then return state, {} end
-      if write_resume_target(sel.id) then
-        return shallow_merge(state, { popup = NIL_SENTINEL }), {
-          { kind = "exit" },
-        }
-      end
-      -- Write failed — keep the popup open and surface a toast.
-      local now = tui.now_ms()
-      return shallow_merge(state, {
-        toast = { text = "resume: failed to write sidechannel", created_at_ms = now, expires_at_ms = now + 3000 },
-      }), {}
+      return shallow_merge(state, { popup = NIL_SENTINEL }), {
+        emit_resume_request(sel.id),
+      }
     end
     -- All other keys swallow so they don't bubble into the input field.
     return state, {}
@@ -2734,6 +2703,50 @@ local function update(msg, state)
     else
       tui.scroll_into_view("transcript")
     end
+    return state, {}
+  end
+
+  -- ── session lifecycle ───────────────────────────────────────────────
+  -- The starter's `sessions` module emits four control events on the
+  -- bus. `session_end` and `session_start` bracket a resume swap;
+  -- `resume_done` is the "we're back, finalise rendering" signal.
+  -- During replay (between session_start and resume_done) we paint
+  -- envelopes normally — chat.message.append, chat.stream.* land in
+  -- transcript exactly the way they would on a live turn. The resume
+  -- envelopes ARE the past, so rendering them rebuilds the prior view.
+  if kind == "sessions.session_end" then
+    -- Tear down transcript + in-flight stream + popup. Keep the UI
+    -- shell (model id, stats, sidebar toggle, etc.) — those rebuild
+    -- from replayed events on resume_done. We also clear `pending`
+    -- and `turn_started_at` so the statusline doesn't show a phantom
+    -- in-flight turn from the outgoing session.
+    return shallow_merge(state, {
+      entries          = {},
+      in_flight        = NIL_SENTINEL,
+      pending          = false,
+      turn_started_at  = NIL_SENTINEL,
+      last_turn_duration_ms = NIL_SENTINEL,
+      popup            = NIL_SENTINEL,
+      toast            = NIL_SENTINEL,
+      slash            = NIL_SENTINEL,
+      dag_runs         = {},
+    }), {}
+  end
+
+  if kind == "sessions.session_start" then
+    -- Idempotent fresh-state guarantee. session_end already cleared on
+    -- the resume path; for boot, state is already empty. Either way,
+    -- ensure transcript is empty so replay paints a clean view.
+    return shallow_merge(state, {
+      entries   = {},
+      in_flight = NIL_SENTINEL,
+    }), {}
+  end
+
+  if kind == "sessions.resume_done" then
+    -- Live again. The transcript already reflects the replayed past;
+    -- nothing to do beyond letting the next render fire (which it
+    -- will from the surrounding update loop).
     return state, {}
   end
 

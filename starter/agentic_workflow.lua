@@ -120,6 +120,15 @@ local pending_dispatches = {}
 -- Sub-graph runs keyed by run_id. Each entry: { gate_inner_id }.
 local pending_runs = {}
 
+-- Session-replay flag. Flipped on by `sessions.session_start` (which fires
+-- for both fresh-boot and resume-target swaps) and back off by
+-- `sessions.resume_done`. While true, the reasoner-graph from_plugin
+-- transform short-circuits run_node dispatch — the graph already ran in
+-- the original session and re-running on replay would duplicate every
+-- side effect (provider chat.create, tool.invoke, etc.). The flag stays
+-- false during normal live operation; sessions module owns the lifecycle.
+local replay_mode = false
+
 -- In-process observer registries. These exist because the events they
 -- observe are emitted via `nefor.engine.send` (which bypasses ncp.lua's
 -- `from_plugin` / `to_plugin` chains), so a Lua-level consumer cannot
@@ -932,6 +941,15 @@ function M.for_reasoner_graph()
       return env
     end
 
+    -- During replay, the graph already ran in the original session — we
+    -- don't want to re-dispatch run_node handlers (which would emit
+    -- fresh chat.create / tool.invoke calls and double every side
+    -- effect). Drop graph emissions while replay_mode is true. The flag
+    -- is owned by the sessions handlers above and lifted on resume_done.
+    if replay_mode then
+      return nil
+    end
+
     -- (2) for_reasoner_graph: dispatch <token>.run_node.
     local token = kind:match("^([^.]+)%.run_node$")
     if token then
@@ -1597,6 +1615,88 @@ function M.setup(opts)
     })
     deferred_queue[#deferred_queue + 1] = { text = text }
     flush_deferred()
+  end
+
+  -- ------------------------------------------------------------------
+  -- session lifecycle handlers
+  -- ------------------------------------------------------------------
+  --
+  -- The starter's `sessions` module emits four control events on the
+  -- bus: session_start, session_end, resume_done, resume_request. We
+  -- subscribe via `nefor.bus.on_event` (which fires on every routed
+  -- envelope, regardless of origin — distinct from ncp.step which skips
+  -- engine-/step-origin entries) so per-plugin orchestration state can
+  -- track session boundaries.
+  --
+  --   session_end  → tear down in-flight orchestrator run, drop chat-id
+  --                   bookkeeping, broadcast `chat.reset` so the
+  --                   provider drops its `Chats` map and the TUI clears
+  --                   the transcript.
+  --   session_start → ensure state is empty (idempotent), set
+  --                   `replay_mode = true` so the reasoner-graph
+  --                   from_plugin transform stops dispatching run_node
+  --                   handlers (the graph already ran in the original
+  --                   session — re-running would duplicate every side
+  --                   effect).
+  --   resume_done  → flip `replay_mode = false`; the orchestrator is
+  --                   live again and ready to accept the next submit.
+  if nefor.bus and nefor.bus.on_event then
+    -- session_end fires only on a resume swap (and on shutdown — which
+    -- we ignore here, the process is going away). It's the signal that
+    -- the next session_start belongs to a different session id and any
+    -- subsequent envelopes through resume_done are replays. We use it
+    -- as the "expect replay" gate: the next session_start that follows
+    -- enables replay_mode.
+    local expecting_replay = false
+
+    nefor.bus.on_event("sessions.session_end", function(_entry)
+      -- Cancel any in-flight orchestrator run on the reasoner-graph side
+      -- and drop sub-graph bookkeeping. Mirrors cancel_all() but without
+      -- the user-visible "[interrupted: ...]" message — session swaps
+      -- are silent at the UX layer.
+      if current_run_id ~= nil then
+        emit("reasoner-graph", { kind = "reasoner-graph.graph.cancel", run_id = current_run_id })
+        current_run_id = nil
+      end
+      for run_id, _ in pairs(pending_runs) do
+        emit("reasoner-graph", { kind = "reasoner-graph.graph.cancel", run_id = run_id })
+      end
+      pending_runs       = {}
+      pending_dispatches = {}
+      pending            = {}
+      chat_id_to_key     = {}
+      chat_id_stream_visible = {}
+      tool_id_to_key     = {}
+      current_state      = nil
+      deferred_queue     = {}
+      -- Broadcast chat.reset so the provider's Chats map clears and the
+      -- TUI transcript empties. Provider's `<prefix>.reset` translation
+      -- already exists in for_provider's outer_to.
+      emit(nil, { kind = "chat.reset" })
+      expecting_replay = true
+      nefor.log.info("agentic_workflow: sessions.session_end → state cleared", {})
+    end)
+
+    nefor.bus.on_event("sessions.session_start", function(_entry)
+      -- session_start fires twice in a session's lifetime: once at boot
+      -- (fresh, no replay coming) and once after a resume swap (replay
+      -- about to begin). Boot has no preceding session_end, so
+      -- expecting_replay is false and we leave replay_mode off.
+      -- Resume's session_start follows session_end, so we enter replay
+      -- mode and wait for resume_done to lift it.
+      if expecting_replay then
+        replay_mode = true
+        expecting_replay = false
+        nefor.log.info("agentic_workflow: sessions.session_start (resume) → replay_mode=true", {})
+      else
+        nefor.log.info("agentic_workflow: sessions.session_start (boot) → live", {})
+      end
+    end)
+
+    nefor.bus.on_event("sessions.resume_done", function(_entry)
+      replay_mode = false
+      nefor.log.info("agentic_workflow: sessions.resume_done → replay_mode=false", {})
+    end)
   end
 end
 

@@ -120,4 +120,99 @@ do
   end
 end
 
+-- ------------------------------------------------------------------
+-- session lifecycle handlers (graph_skips_replay, provider_rebuilds_*,
+-- session_end clears state)
+-- ------------------------------------------------------------------
+--
+-- The bus subscriptions registered in agentic_workflow.setup() are
+-- driven via `_test.fire_bus(kind, body)`. After firing the handlers
+-- we can observe (a) the recorded engine.send calls (via `_test.calls()`),
+-- (b) for_reasoner_graph's behaviour while replay_mode is set.
+
+-- Session_end → emits chat.reset broadcast and graph.cancel for any
+-- in-flight runs. We seed plugin list so the broadcast fans out.
+do
+  _test.set_plugins({ "ollama", "reasoner-graph", "nefor-tui" })
+  _test.calls_clear()
+
+  _test.fire_bus("sessions.session_end", { session_id = "old-id" })
+
+  local saw_reset = false
+  for _, c in ipairs(_test.calls()) do
+    local ok, decoded = pcall(nefor.json.decode, c.payload)
+    if ok and type(decoded) == "table" and type(decoded.body) == "table"
+       and decoded.body.kind == "chat.reset" then
+      saw_reset = true
+    end
+  end
+  assert(saw_reset, "session_end must broadcast chat.reset to clear provider+TUI state")
+end
+
+-- graph_skips_replay: between session_end and resume_done, the
+-- for_reasoner_graph from_plugin transform drops every envelope so the
+-- graph plugin's replayed run_node emissions can't re-trigger handlers.
+-- Firing session_start (preceded by session_end) enters replay_mode;
+-- resume_done lifts it.
+do
+  local rg = agentic_workflow.for_reasoner_graph()
+  -- Sanity: a normal envelope passes through pre-replay (replay_mode is
+  -- still false from the boot session_start that didn't follow an end).
+  local pre_env = {
+    type = "event",
+    body = { kind = "irrelevant.kind" },
+    from = "reasoner-graph",
+  }
+  local pre_out = rg.from_plugin(pre_env)
+  assert(pre_out ~= nil, "pre-replay: pass-through")
+
+  -- Enter replay (session_end already fired above; now session_start).
+  _test.fire_bus("sessions.session_start", { session_id = "new-id" })
+
+  local replay_env = {
+    type = "event",
+    body = { kind = "responder.run_node", run_id = "r1", node_id = "n1", firing_id = "f1" },
+    from = "reasoner-graph",
+  }
+  local replay_out = rg.from_plugin(replay_env)
+  assert_eq(replay_out, nil,
+    "graph_skips_replay: in replay_mode, reasoner-graph from_plugin drops envelopes")
+
+  -- Lift replay_mode.
+  _test.fire_bus("sessions.resume_done", { session_id = "new-id" })
+
+  local post_env = {
+    type = "event",
+    body = { kind = "irrelevant.kind" },
+    from = "reasoner-graph",
+  }
+  local post_out = rg.from_plugin(post_env)
+  assert(post_out ~= nil, "after resume_done: pass-through restored")
+end
+
+-- provider_rebuilds_chat_history: replay paints provider chat.* events
+-- (e.g. ollama.chat.create) onto the wire — they reach the openai-provider
+-- process directly and are processed by its native state machine. The
+-- agentic_workflow per-provider transform's job is to NOT eat them
+-- during replay (the inner adapter only intercepts chat.complete.result
+-- envelopes for chats it owns). With no such ownership, replayed
+-- chat.create/append entries pass through to the outer adapter.
+do
+  local provider_chain = agentic_workflow.for_provider("ollama")
+  local create_env = {
+    type = "event",
+    body = { kind = "ollama.chat.create", chat_id = "old-chat-1" },
+    from = "ollama",
+  }
+  local out = provider_chain.from_plugin(create_env)
+  -- The outer adapter doesn't rewrite chat.create — it stays as-is and
+  -- passes through to broadcast. The inner adapter only intercepts
+  -- chat.complete.result for chats it owns; old-chat-1 isn't in
+  -- chat_id_to_key (cleared by session_end), so the replay flows through.
+  assert(out ~= nil,
+    "provider_rebuilds_chat_history: replayed chat.create passes through")
+  assert_eq(out.body.kind, "ollama.chat.create",
+    "provider replay preserves the provider-prefixed kind")
+end
+
 print("agentic_workflow_test: ok")

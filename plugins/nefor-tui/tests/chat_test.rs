@@ -2136,9 +2136,10 @@ fn model_picker_typing_filters_query() {
 // ============================================================
 //
 // The picker reads from `$NEFOR_DATA_HOME/sessions/` (overridable via
-// env var, set per-test for isolation). Selecting a row writes the
-// chosen session id to `$NEFOR_DATA_HOME/resume_target` and emits
-// `{kind="exit"}`; init.lua reads that file at the next boot.
+// env var, set per-test for isolation). Selecting a row emits a
+// `sessions.resume_request { session_id }` envelope onto the NCP bus —
+// no process exit, no sidechannel file. The starter's `sessions` Lua
+// module subscribes to that kind and runs the in-process swap.
 //
 // Test isolation: each test creates a tempdir, sets NEFOR_DATA_HOME to
 // it, and tears it down on completion. Env var manipulation is
@@ -2179,10 +2180,6 @@ impl ResumeEnv {
 
     fn sessions_dir(&self) -> PathBuf {
         self.data_home.join("sessions")
-    }
-
-    fn resume_target(&self) -> PathBuf {
-        self.data_home.join("resume_target")
     }
 
     fn write_session(&self, id: &str, started_at: &str, prompt: Option<&str>) {
@@ -2286,7 +2283,10 @@ fn session_picker_lists_recent_sessions_with_preview() {
 }
 
 #[test]
-fn session_picker_select_writes_sidechannel_and_exits() {
+fn resume_keeps_tui_alive() {
+    // Picker selection must NOT terminate the TUI process. Instead it
+    // emits a `sessions.resume_request { session_id }` envelope onto the
+    // bus; the starter's sessions module owns the in-process swap.
     let env = ResumeEnv::new();
     let session_id = "abcd1234-5678-9012-3456-7890abcdef00";
     env.write_session(session_id, "2026-05-01T10:00:00.000Z", Some("anything"));
@@ -2300,30 +2300,32 @@ fn session_picker_select_writes_sidechannel_and_exits() {
     }
     engine.handle_key(key("enter")).expect("enter");
     let _ = render_str(&mut engine);
+    // Drain emits from the picker open so the assertion below sees only
+    // the selection's egress.
+    let _ = engine.take_emit_queue();
 
     // Cursor defaults to 1; with one session that's our row. Hit Enter.
     engine.handle_key(key("enter")).expect("enter on row");
 
     assert!(
-        engine.exit_requested(),
-        "selecting a session must request exit"
+        !engine.exit_requested(),
+        "picker selection must NOT terminate the TUI process",
     );
-    let target_file = env.resume_target();
-    assert!(
-        target_file.exists(),
-        "resume_target file should exist at {}",
-        target_file.display()
-    );
-    let written = std::fs::read_to_string(&target_file).expect("read sidechannel");
+
+    let emits = engine.take_emit_queue();
+    let request = emits
+        .iter()
+        .find(|(_, b)| b.get("kind").and_then(|v| v.as_str()) == Some("sessions.resume_request"));
+    let (_, body) = request.expect("expected sessions.resume_request egress");
     assert_eq!(
-        written.trim(),
-        session_id,
-        "sidechannel should contain the chosen session id"
+        body.get("session_id").and_then(|v| v.as_str()),
+        Some(session_id),
+        "resume_request must carry the chosen session id",
     );
 }
 
 #[test]
-fn session_picker_escape_cancels_without_writing() {
+fn session_picker_escape_cancels_without_emitting() {
     let env = ResumeEnv::new();
     env.write_session(
         "deadbeef-0000-0000-0000-000000000000",
@@ -2340,21 +2342,25 @@ fn session_picker_escape_cancels_without_writing() {
     }
     engine.handle_key(key("enter")).expect("enter");
     let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
 
     engine.handle_key(key("escape")).expect("escape");
     assert!(!engine.exit_requested(), "escape must not exit");
+    let emits = engine.take_emit_queue();
     assert!(
-        !env.resume_target().exists(),
-        "no sidechannel write on escape"
+        !emits.iter().any(|(_, b)| {
+            b.get("kind").and_then(|v| v.as_str()) == Some("sessions.resume_request")
+        }),
+        "escape must not emit sessions.resume_request",
     );
 }
 
 #[test]
-fn slash_resume_with_arg_writes_sidechannel_and_exits() {
-    // `/resume <id>` is the bypass-picker path. Useful for scripted
-    // testing and copy-paste recipes — no popup, write the file and
-    // exit.
-    let env = ResumeEnv::new();
+fn slash_resume_with_arg_emits_resume_request() {
+    // `/resume <id>` is the bypass-picker path: emit the resume_request
+    // straight onto the bus, no popup. The TUI process stays alive —
+    // the starter's sessions module runs the swap in-process.
+    let _env = ResumeEnv::new();
     let session_id = "feedface-0000-0000-0000-000000000000";
 
     let mut engine = Engine::new(120, 30).expect("engine");
@@ -2372,11 +2378,22 @@ fn slash_resume_with_arg_writes_sidechannel_and_exits() {
         };
         engine.handle_key(key(&n)).expect("type");
     }
+    let _ = engine.take_emit_queue();
     engine.handle_key(key("enter")).expect("enter");
 
-    assert!(engine.exit_requested(), "/resume <id> should exit");
-    let written = std::fs::read_to_string(env.resume_target()).expect("read sidechannel");
-    assert_eq!(written.trim(), session_id);
+    assert!(
+        !engine.exit_requested(),
+        "/resume <id> must NOT terminate the TUI",
+    );
+    let emits = engine.take_emit_queue();
+    let req = emits
+        .iter()
+        .find(|(_, b)| b.get("kind").and_then(|v| v.as_str()) == Some("sessions.resume_request"));
+    let (_, body) = req.expect("expected sessions.resume_request egress");
+    assert_eq!(
+        body.get("session_id").and_then(|v| v.as_str()),
+        Some(session_id),
+    );
 }
 
 /// Mouse drag inside the transcript triggers the chat.lua mouse.selection
