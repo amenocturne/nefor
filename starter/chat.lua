@@ -1471,12 +1471,12 @@ local function popup_model_picker(state)
   }
 end
 
--- Toast: bottom-left, single-line, no border, sits ON TOP of chat
--- content. Auto-dismisses on `expires_at_ms`. Solid background via the
--- text's own style so cells under the label are occluded rather than
--- bleeding through. Two leading + two trailing spaces give visual
--- breathing room while staying part of the same styled run, so the bg
--- band reads as one block.
+-- Toast: full-width single-line banner anchored at the bottom row,
+-- replacing the statusline visually for the toast's lifetime. Auto-
+-- dismisses on `expires_at_ms`. The text leaf owns its full allocated
+-- rect (engine paints trailing cells with the text's own style), so
+-- the bg colour band reaches edge-to-edge — no per-row main_column
+-- chars peek through.
 local TOAST_BG = "#2a3340"
 local TOAST_FG = "#88ccff"
 local function popup_toast(state)
@@ -1484,11 +1484,11 @@ local function popup_toast(state)
   if state.toast.expires_at_ms and tui.now_ms() >= state.toast.expires_at_ms then
     return nil
   end
-  local label = "  " .. (state.toast.text or "") .. "  "
+  local label = "  " .. (state.toast.text or "")
   return tui.anchored {
     anchor   = "bottom-left",
-    offset_x = 1,
-    width    = #label,
+    offset_x = 0,
+    width    = "100%",
     height   = 1,
     child = tui.text {
       content = label,
