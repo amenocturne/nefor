@@ -3332,6 +3332,109 @@ fn first_submit_after_slash_new_renders_user_message_when_tool_call_follows() {
     );
 }
 
+/// Popups must paint an opaque background — transcript text behind the
+/// popup box must NOT bleed through the empty rows inside the box. The
+/// permission popup is the worst offender because its natural content
+/// is short relative to the 50%-height shell, leaving lots of empty
+/// dead-space cells that used to render whatever was on the layer
+/// below (the transcript). The fix puts a `tui.fill { char = " " }`
+/// stack-layer behind the content so every cell inside the box is
+/// painted.
+#[test]
+fn popup_paints_opaque_background_over_transcript() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Seed transcript with a known marker that sits in the area the
+    // popup will eventually overlay (centred, 60% × 50%).
+    for i in 0..20 {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "chat.message.append",
+                "role": "user",
+                "text": format!("MARKER-LEAK-LINE-{i}"),
+            }),
+        );
+    }
+    let _ = render_str(&mut engine);
+
+    // Open a tool-permission popup (short content; lots of dead space
+    // inside the box).
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.tool.permission_request",
+            "id": "t1",
+            "tool": "spawn_graph",
+            "args": {
+                "nodes": [
+                    {"id": "a", "reasoner": "responder"},
+                    {"id": "b", "reasoner": "responder"},
+                ],
+            },
+        }),
+    );
+    let _ = render_str(&mut engine);
+
+    // Locate the popup's row range. Title row contains
+    // "permission requested". Popup top border is one row above
+    // (a `╭───...───╮` row). Popup bottom border is the next
+    // `╰───...───╯` row after the title.
+    let snap = engine.snapshot();
+    let lines: Vec<&str> = snap.lines().collect();
+    let title_row = lines
+        .iter()
+        .position(|l| l.contains("permission requested"))
+        .expect("popup title row missing — popup didn't render");
+    let popup_top = lines[..title_row]
+        .iter()
+        .rposition(|l| l.contains('╭'))
+        .expect("popup top border row missing");
+    let popup_bottom = lines[title_row..]
+        .iter()
+        .position(|l| l.contains('╰'))
+        .map(|i| title_row + i)
+        .expect("popup bottom border row missing");
+
+    // Identify popup column range from the title row. The popup's
+    // outer borders are the LAST `│` to the left of the title text
+    // and the FIRST `│` to the right.
+    let title_line = lines[title_row];
+    let title_byte = title_line
+        .find("permission requested")
+        .expect("title text in row");
+    let left_border = title_line[..title_byte]
+        .rfind('│')
+        .expect("popup left border on title row");
+    let right_border = title_line[title_byte..]
+        .find('│')
+        .map(|i| title_byte + i)
+        .expect("popup right border on title row");
+
+    // Walk every popup INTERIOR row and slice out only the popup's
+    // columns. Anything OUTSIDE that slice (transcript bubbles to the
+    // left, sidebar to the right) is not a leak — it's other UI.
+    // Inside the slice, ANY transcript marker means the popup failed
+    // to paint an opaque background.
+    for (idx, row) in lines
+        .iter()
+        .enumerate()
+        .take(popup_bottom)
+        .skip(popup_top + 1)
+    {
+        if right_border > left_border + '│'.len_utf8() && row.len() > right_border {
+            let interior = &row[left_border + '│'.len_utf8()..right_border];
+            assert!(
+                !interior.contains("MARKER-LEAK-LINE"),
+                "transcript text leaked into popup interior at row {idx}: \
+                 {interior:?}\nfull snapshot:\n{snap}",
+            );
+        }
+    }
+}
+
 /// `/clear` is an alias for `/new`. Same egress, same lifecycle expectations.
 #[test]
 fn slash_clear_is_alias_for_slash_new() {

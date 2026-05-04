@@ -533,17 +533,30 @@ local function bordered_popup(scroll_key, child, border_style)
     max_width = 1,
     child = tui.fill { char = "│", style = border_style },
   }
+  -- Opaque background INSIDE the popup so transcript text behind the
+  -- box doesn't bleed through the empty rows below the natural content
+  -- height. Without this, a popup whose content is shorter than the
+  -- 50%-height shell shows transcript characters in the dead space
+  -- (e.g. transcript-text-on-top-of-permission-popup leaks). The fill
+  -- char is a normal space; ratatui's render path writes a glyph at
+  -- every cell, which paints over whatever the layer below put there.
+  local body_bg = tui.fill { char = " " }
   local body_row = tui.row {
     gap = 0,
     children = {
       side_bar,
       tui.expanded {
-        child = tui.padding {
-          left = 1, right = 1, top = 0, bottom = 0,
-          child = tui.scrollable {
-            key       = scroll_key,
-            scrollbar = "auto",
-            child     = child,
+        child = tui.stack {
+          children = {
+            body_bg,
+            tui.padding {
+              left = 1, right = 1, top = 0, bottom = 0,
+              child = tui.scrollable {
+                key       = scroll_key,
+                scrollbar = "auto",
+                child     = child,
+              },
+            },
           },
         },
       },
