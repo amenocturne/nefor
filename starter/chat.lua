@@ -2796,6 +2796,27 @@ local function update(msg, state)
     return dag_run_complete(state, msg.run_id, msg.status, msg.results, now), {}
   end
 
+  -- Mouse drag-to-select: the engine extracts the highlighted text from
+  -- the framebuffer and dispatches `mouse.selection` here. Policy lives
+  -- in this file (chat.lua), not the engine — we copy non-empty
+  -- selections to the clipboard and surface a short toast acknowledging
+  -- the action. The engine's role ends at "here is the text"; what
+  -- happens next is the surface's call.
+  if kind == "mouse.selection" then
+    local text = msg.text or ""
+    if #text > 0 then
+      tui.copy_to_clipboard(text)
+      local now = tui.now_ms()
+      return shallow_merge(state, {
+        toast = {
+          text = string.format("copied %d chars", #text),
+          expires_at_ms = now + 2000,
+        },
+      }), {}
+    end
+    return state, {}
+  end
+
   return state, {}
 end
 
