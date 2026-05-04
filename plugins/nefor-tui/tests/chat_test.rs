@@ -2495,7 +2495,7 @@ fn mouse_drag_copies_selection_and_shows_toast() {
 /// input field or statusline below it. Statusline placeholder remains
 /// visible after the toast appears.
 #[test]
-fn mouse_drag_toast_does_not_cover_input_or_statusline() {
+fn mouse_drag_toast_overlays_input_and_statusline() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     // Stream a known message into the transcript so the drag covers
@@ -2571,14 +2571,16 @@ fn mouse_drag_toast_does_not_cover_input_or_statusline() {
     let _ = engine.take_emit_queue();
     let post = engine.snapshot();
 
-    // Statusline placeholder must STILL be visible — the toast lives
-    // in the body area, not over the statusline.
+    // Toast is rendered last in the outer stack, so it overlays the
+    // statusline row. The placeholder text must NOT be visible while
+    // the toast band is up — that's the whole point of "show toast on
+    // top of everything".
     assert!(
-        post.lines()
+        !post
+            .lines()
             .any(|l| l.contains("Start chatting to see stats")),
-        "statusline placeholder should remain visible after toast: {post:?}"
+        "statusline placeholder must be occluded by toast: {post:?}"
     );
-    // Sanity: the toast label is still present somewhere.
     let label = format!("copied {} chars", "selectable-token".len());
     assert!(
         post.contains(&label),
@@ -2586,13 +2588,12 @@ fn mouse_drag_toast_does_not_cover_input_or_statusline() {
     );
 }
 
-/// Toast slide animation: the pill enters from the right edge and
-/// translates leftward to its rest position over the enter window.
-/// We sample a frame mid-enter (when the slide is still in progress)
-/// and another at rest, then assert the pill's left border `╭` glyph
-/// sits in different columns. This proves the animation is a real
-/// horizontal translation of the (full-size) pill, not a width clip
-/// or sudden snap into place.
+/// Toast slide animation: the text inside the banner translates
+/// leftward from flush-right into its rest position (TOAST_REST_INSET
+/// cells inset from the right edge) over the enter window. We sample
+/// a frame mid-enter and another at rest, then assert the text's
+/// rightmost column moves leftward. The bars span full width and
+/// never move; only the text's right-padding animates.
 ///
 /// Triggers via `chat.toast` (rather than mouse drag) so the TTL is
 /// long enough that real wall-clock drift between snapshots doesn't
@@ -2614,38 +2615,38 @@ fn chat_toast_slides_horizontally_during_enter() {
         }),
     );
 
-    // Helper: column of the toast pill's left border `╭` glyph in the
-    // current frame, or None if the toast isn't visible. The pill's
-    // top rule sits on a row above the input box; the input box's own
-    // `╭` lives further down. find_map iterates top-to-bottom so the
-    // first match is the toast's top-left corner.
-    fn pill_left_col(snap: &str) -> Option<usize> {
-        snap.lines().find_map(|l| l.find('╭'))
+    // Helper: column of the LAST char of the toast label on its row,
+    // or None if invisible. The label is `slide-test` followed by
+    // trailing pad (`inset + 1` spaces). As the slide proceeds, the
+    // label's rightmost column shifts leftward.
+    fn label_right_col(snap: &str) -> Option<usize> {
+        snap.lines().find_map(|l| {
+            let i = l.find("slide-test")?;
+            Some(i + "slide-test".len() - 1)
+        })
     }
 
-    // Sample mid-enter — past the very first frames where ease-out
-    // rounds inset to 0, but before the curve walks all the way to
-    // rest. ease_out_cubic(50/220) ≈ 0.59, so slide_offset ≈ 1.18 →
-    // inset = 1 (pill sits 1 column left of flush-right).
+    // Sample mid-enter — ease_out_cubic(50/220) ≈ 0.59, slide_offset
+    // ≈ 1.18 → inset = 1 → trailing pad = 2 cells. Label sits 2
+    // columns left of flush-right.
     engine.advance_time(Duration::from_millis(50));
     let _ = render_str(&mut engine);
     let early = engine.snapshot();
-    let early_col = pill_left_col(&early)
+    let early_col = label_right_col(&early)
         .unwrap_or_else(|| panic!("toast invisible mid-enter; snapshot:\n{early}"));
 
     // Sample at rest — past the enter window. inset = TOAST_REST_INSET
-    // (2 cells), so the pill sits 2 columns left of flush-right.
+    // (2) → trailing pad = 3 cells. Label sits 3 columns left of
+    // flush-right, i.e. one column further left than mid-enter.
     engine.advance_time(Duration::from_millis(250));
     let _ = render_str(&mut engine);
     let rest = engine.snapshot();
-    let rest_col = pill_left_col(&rest)
+    let rest_col = label_right_col(&rest)
         .unwrap_or_else(|| panic!("toast invisible at rest; snapshot:\n{rest}"));
 
-    // The visible translation: rest_col < early_col (pill moved left).
-    // Asserts a true horizontal offset — full-size pill, no clipping.
     assert!(
         rest_col < early_col,
-        "expected pill to slide leftward into rest position; \
+        "expected label to slide leftward into rest position; \
          early_col = {early_col}, rest_col = {rest_col}"
     );
 }

@@ -1490,7 +1490,7 @@ local TOAST_FG_WARN        = C.status_warn
 local TOAST_BORDER_WARN    = { fg = C.status_warn }
 local TOAST_FG_ERROR       = C.status_danger
 local TOAST_BORDER_ERROR   = { fg = C.status_danger }
-local TOAST_FULL_HEIGHT    = 5    -- ╭─╮ + blank + text + blank + ╰─╯
+local TOAST_FULL_HEIGHT    = 3    -- top rule + text + bottom rule (no inner padding)
 local TOAST_ENTER_MS       = 220
 local TOAST_EXIT_MS        = 220
 -- Cells of inset from the right edge at rest. The visible slide
@@ -1557,37 +1557,60 @@ local function inline_toast(state)
   local inset = math.floor(slide_offset + 0.5)
 
   local text = state.toast.text or ""
-  -- Pill width = text + 8 cells of internal padding (4 each side via
-  -- the inner column padding plus 1 each side from the box's `│ ` /
-  -- ` │` chrome). Cap at 60 so long messages don't span half the
-  -- screen.
-  local pill_w = math.min(60, #text + 8)
-
   local fg, border = toast_palette(state.toast.level)
 
-  local body = tui.column {
-    gap = 0,
-    children = {
-      tui.text { content = "", wrap = "none" },
-      tui.align {
-        alignment = "center",
-        child = tui.text { content = text, style = { fg = fg }, wrap = "none" },
+  -- Banner-style chrome: full-window-width top and bottom rules, no
+  -- left wall. The text rides the right edge with 2 cells of padding
+  -- and slides in horizontally; the rules stay parked across the full
+  -- width so the toast reads as a band rather than a pill.
+  local top_rule = tui.constrained {
+    max_height = 1,
+    child = tui.fill { char = "─", style = border },
+  }
+  local bottom_rule = tui.constrained {
+    max_height = 1,
+    child = tui.fill { char = "─", style = border },
+  }
+  -- The band itself spans full window width so the rules never move.
+  -- The slide is implemented by the text's right-padding: at rest it
+  -- sits TOAST_REST_INSET cells inset from the right edge; at enter
+  -- start it touches the edge; during exit it animates back to the
+  -- edge. `inset` is computed above from the easing curve.
+  local mid_row = tui.constrained {
+    max_height = 1,
+    child = tui.row {
+      gap = 0,
+      children = {
+        tui.expanded { child = tui.fill { char = " " } },
+        tui.text {
+          content = text,
+          style   = { fg = fg },
+          wrap    = "none",
+        },
+        tui.constrained {
+          max_width = inset + 1,
+          child = tui.fill { char = " " },
+        },
       },
-      tui.text { content = "", wrap = "none" },
     },
   }
+  local body = tui.column {
+    gap = 0,
+    key = "toast-box",
+    children = { top_rule, mid_row, bottom_rule },
+  }
 
-  -- BottomRight anchor: positive offset_x clamps at the right edge,
-  -- negative shifts leftward. Rest = -TOAST_REST_INSET (inset from
-  -- right). During enter, offset_x animates from 0 (flush right)
-  -- toward -TOAST_REST_INSET; during exit it animates back to 0.
+  -- Full-window-width band anchored to the bottom. Bars never move;
+  -- only the text inside `mid_row` translates via the trailing fill
+  -- whose width tracks `inset`. Width=100% pins the rules across the
+  -- entire window so they don't terminate inside the screen.
   return tui.anchored {
     anchor   = "bottom-right",
-    offset_x = -inset,
+    offset_x = 0,
     offset_y = 0,
-    width    = pill_w,
+    width    = "100%",
     height   = TOAST_FULL_HEIGHT,
-    child = bordered_box(body, border, "toast-box"),
+    child    = body,
   }
 end
 
@@ -1841,15 +1864,11 @@ local function view(state)
     },
   }
 
-  -- Toast overlays the bottom-right of the body area only (above the
-  -- input + statusline). Anchored bottom-right of this stack puts it
-  -- there without ever covering the input or statusline.
-  local body_with_toast = tui.stack {
-    children = compact {
-      body_row,
-      inline_toast(state),
-    },
-  }
+  -- Toast moved to the outer stack so it can overlay the input and
+  -- statusline rows too — anchoring inside body_row's rect parked
+  -- the bottom rule under the input chrome. See outer `tui.stack`
+  -- below for the new placement (above all popups).
+  local body_with_toast = body_row
 
   -- Input field with full-width rounded border per legacy spec section
   -- 7. The `tui.text_input` is the bare control; `bordered_box` wraps
@@ -1931,6 +1950,10 @@ local function view(state)
         popup_model_picker(state),
         popup_session_picker(state),
         popup_tool_permission(state),
+        -- Toast renders last so it sits above input, statusline, and
+        -- every popup — non-blocking notifications must never be
+        -- occluded by chrome below them.
+        inline_toast(state),
         popup_toast(state),
       },
     },
