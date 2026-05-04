@@ -18,6 +18,7 @@ use crate::ansi::{
 use crate::desc::Style;
 use crate::instance::WidgetInstance;
 use crate::layout;
+use crate::mouse::SelectionRange;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
@@ -132,9 +133,25 @@ impl Renderer {
     /// terminal up to date. Subsequent calls diff against the prior
     /// frame's contents; force a full redraw with [`Renderer::mark_full`].
     pub fn render(&mut self, root: &mut WidgetInstance) -> Vec<u8> {
+        self.render_with_selection(root, None)
+    }
+
+    /// Like [`Renderer::render`] but applies `selection`'s reverse-video
+    /// highlight to the cells covered by the range before emitting ANSI.
+    /// Selection is engine state, not layout state — we paint the tree
+    /// first, then post-process the framebuffer so existing widget paint
+    /// paths stay oblivious to the selection mechanism.
+    pub fn render_with_selection(
+        &mut self,
+        root: &mut WidgetInstance,
+        selection: Option<SelectionRange>,
+    ) -> Vec<u8> {
         self.next.reset(self.width, self.height);
         reset_layout_state(root);
         layout::layout_and_paint(root, self.width, self.height, &mut self.next);
+        if let Some(range) = selection {
+            apply_selection_highlight(&mut self.next, range);
+        }
         let bytes = if self.needs_full {
             self.emit_full()
         } else {
@@ -208,6 +225,69 @@ fn push_line(out: &mut String, line: &Line) {
         out.push_str(&cell.text);
     }
     out.push_str(SGR_RESET);
+}
+
+/// Walk the framebuffer cells covered by `range` and toggle their
+/// `reverse` SGR bit. We use the terminal's own reverse-video so the
+/// highlight stays neutral against any user theme — no engine-baked
+/// colors. Cells outside the buffer are silently skipped (the renderer
+/// never overdraws past `width × height`).
+fn apply_selection_highlight(buf: &mut FrameBuffer, range: SelectionRange) {
+    let height = buf.lines.len() as u16;
+    if height == 0 {
+        return;
+    }
+    let width = buf.lines.first().map(|l| l.cells.len() as u16).unwrap_or(0);
+    for row in range.start_row..=range.end_row {
+        if row >= height {
+            break;
+        }
+        let Some((c0, c1)) = range.row_span(row, width) else {
+            continue;
+        };
+        let line = &mut buf.lines[row as usize];
+        for col in c0..=c1 {
+            if let Some(cell) = line.cells.get_mut(col as usize) {
+                cell.style.reverse = !cell.style.reverse;
+            }
+        }
+    }
+}
+
+/// Extract plain-text from the framebuffer's cells covered by `range`.
+/// Each row's cells are joined into a string, trailing whitespace is
+/// trimmed per row, and rows are joined with `\n`. Empty selections
+/// (range entirely outside the buffer) yield `""`.
+pub fn extract_selection_text(buf: &FrameBuffer, range: SelectionRange) -> String {
+    let height = buf.lines.len() as u16;
+    if height == 0 {
+        return String::new();
+    }
+    let width = buf.lines.first().map(|l| l.cells.len() as u16).unwrap_or(0);
+    let mut rows: Vec<String> = Vec::new();
+    for row in range.start_row..=range.end_row {
+        if row >= height {
+            break;
+        }
+        let Some((c0, c1)) = range.row_span(row, width) else {
+            rows.push(String::new());
+            continue;
+        };
+        let mut piece = String::new();
+        let line = &buf.lines[row as usize];
+        for col in c0..=c1 {
+            if let Some(cell) = line.cells.get(col as usize) {
+                piece.push_str(&cell.text);
+            }
+        }
+        // Trim only trailing whitespace; leading spaces may be intentional
+        // (e.g. indentation inside a code block).
+        while piece.ends_with(' ') {
+            piece.pop();
+        }
+        rows.push(piece);
+    }
+    rows.join("\n")
 }
 
 #[cfg(test)]
@@ -316,5 +396,55 @@ mod tests {
         let bytes = renderer.render(rec.root.as_mut().unwrap());
         let out = String::from_utf8(bytes).expect("utf-8");
         assert!(out.contains(CLEAR_SCREEN), "post-resize must full-redraw");
+    }
+
+    fn make_buf(rows: &[&str], width: u16) -> FrameBuffer {
+        let mut buf = FrameBuffer::new(width, rows.len() as u16);
+        for (i, row) in rows.iter().enumerate() {
+            for (j, ch) in row.chars().enumerate() {
+                if j as u16 >= width {
+                    break;
+                }
+                buf.lines[i].cells[j].text = ch.to_string();
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn extract_selection_text_single_row() {
+        let buf = make_buf(&["hello world"], 11);
+        // Cells 6..=10 → "world"
+        let text = extract_selection_text(&buf, SelectionRange::normalised((6, 0), (10, 0)));
+        assert_eq!(text, "world");
+    }
+
+    #[test]
+    fn extract_selection_text_multi_row_line_flow() {
+        // Three rows of width 8.
+        let buf = make_buf(&["abcdefgh", "ijklmnop", "qrstuvwx"], 8);
+        // Drag from (5, 0) to (3, 2): row 0 from col 5 → end ("fgh"),
+        // row 1 full ("ijklmnop"), row 2 from start to col 3 ("qrst").
+        let text = extract_selection_text(&buf, SelectionRange::normalised((5, 0), (3, 2)));
+        assert_eq!(text, "fgh\nijklmnop\nqrst");
+    }
+
+    #[test]
+    fn extract_selection_text_trims_trailing_spaces_per_row() {
+        // Row 0 has trailing blanks past the visible chars.
+        let buf = make_buf(&["hi      "], 8);
+        let text = extract_selection_text(&buf, SelectionRange::normalised((0, 0), (7, 0)));
+        assert_eq!(text, "hi");
+    }
+
+    #[test]
+    fn apply_selection_highlight_toggles_reverse() {
+        let mut buf = make_buf(&["abcdef"], 6);
+        apply_selection_highlight(&mut buf, SelectionRange::normalised((1, 0), (3, 0)));
+        assert!(!buf.lines[0].cells[0].style.reverse);
+        assert!(buf.lines[0].cells[1].style.reverse);
+        assert!(buf.lines[0].cells[2].style.reverse);
+        assert!(buf.lines[0].cells[3].style.reverse);
+        assert!(!buf.lines[0].cells[4].style.reverse);
     }
 }
