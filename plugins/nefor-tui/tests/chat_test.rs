@@ -2440,7 +2440,10 @@ fn mouse_drag_copies_selection_and_shows_toast() {
         })
         .expect("up");
 
-    // Force a render so the toast lands in the framebuffer.
+    // Advance past the toast's slide-in animation window so the
+    // assertion sees the fully-sized toast (otherwise the first frame
+    // is height=1 and only the top border rule renders, no text yet).
+    engine.advance_time(Duration::from_millis(250));
     let _ = render_str(&mut engine);
     let _ = engine.take_emit_queue();
     let post = engine.snapshot();
@@ -2456,14 +2459,13 @@ fn mouse_drag_copies_selection_and_shows_toast() {
     );
 }
 
-/// Toast row asserts: the bottom-row banner must fully occlude the
-/// statusline cells underneath it. Concretely, after the drag → toast
-/// transition, the cells the toast covers carry no statusline glyphs
-/// ("Start chatting to see stats", "│", "1ms"). The `Engine::snapshot`
-/// stringifies cell `text` only, so we read the row, locate the toast
-/// label, and assert the rest of the row is blank — no leaked chars.
+/// Toast layout assertions: the bordered toast pill anchors to the
+/// bottom-left of the BODY area only — overlaying transcript content
+/// at the bottom rows of the body region, but never covering the
+/// input field or statusline below it. Statusline placeholder remains
+/// visible after the toast appears.
 #[test]
-fn mouse_drag_toast_fully_occludes_statusline_row() {
+fn mouse_drag_toast_does_not_cover_input_or_statusline() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     // Stream a known message into the transcript so the drag covers
@@ -2531,33 +2533,24 @@ fn mouse_drag_toast_fully_occludes_statusline_row() {
         })
         .expect("up");
 
-    // Force a render so the toast lands in the framebuffer.
+    // Advance past the toast's slide-in animation so the toast
+    // renders at full height in the snapshot.
+    engine.advance_time(Duration::from_millis(250));
     let _ = render_str(&mut engine);
     let _ = engine.take_emit_queue();
     let post = engine.snapshot();
 
-    // The toast banner replaces the statusline visually — none of the
-    // pre-toast statusline glyphs may remain on the toast's row.
-    let toast_row = post
-        .lines()
-        .find(|l| l.contains("copied"))
-        .expect("toast row in post-frame");
-    for needle in [
-        "Start chatting",
-        "to see stats",
-        "│", // statusline segment separator
-        "1ms",
-    ] {
-        assert!(
-            !toast_row.contains(needle),
-            "toast row leaked statusline content `{needle}`: {toast_row:?}"
-        );
-    }
-
-    // Sanity: the toast label is still present.
+    // Statusline placeholder must STILL be visible — the toast lives
+    // in the body area, not over the statusline.
+    assert!(
+        post.lines()
+            .any(|l| l.contains("Start chatting to see stats")),
+        "statusline placeholder should remain visible after toast: {post:?}"
+    );
+    // Sanity: the toast label is still present somewhere.
     let label = format!("copied {} chars", "selectable-token".len());
     assert!(
-        toast_row.contains(&label),
-        "expected toast label `{label}` on toast row: {toast_row:?}"
+        post.contains(&label),
+        "expected toast label `{label}` somewhere in frame: {post:?}"
     );
 }

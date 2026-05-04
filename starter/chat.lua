@@ -1477,25 +1477,78 @@ end
 -- rect (engine paints trailing cells with the text's own style), so
 -- the bg colour band reaches edge-to-edge — no per-row main_column
 -- chars peek through.
-local TOAST_BG = "#2a3340"
-local TOAST_FG = "#88ccff"
-local function popup_toast(state)
+local TOAST_FG          = "#88ccff"
+local TOAST_BORDER      = { fg = "#7faaaa" }   -- dim cyan rail to match blockquote palette
+local TOAST_FULL_HEIGHT = 5    -- ╭─╮ + blank + text + blank + ╰─╯
+local TOAST_ENTER_MS    = 180
+local TOAST_EXIT_MS     = 180
+
+-- Inline toast: bordered pill anchored bottom-left of the body area
+-- (overlaying the transcript only — never covers the input or
+-- statusline). Animates in/out by clipping its height from the bottom
+-- via `tui.constrained { max_height }` over the `TOAST_ENTER_MS` /
+-- `TOAST_EXIT_MS` windows. The render-loop keepalive (see
+-- `render_keepalive`) ensures `tui.now_ms()` re-evaluates each frame
+-- so the slide is smooth and the toast actually disappears at
+-- `expires_at_ms` rather than freezing on the last shown state.
+local function inline_toast(state)
   if not state.toast then return nil end
-  if state.toast.expires_at_ms and tui.now_ms() >= state.toast.expires_at_ms then
-    return nil
+  local now     = tui.now_ms()
+  local created = state.toast.created_at_ms or now
+  local expires = state.toast.expires_at_ms or (created + 2000)
+  if now >= expires then return nil end
+
+  local elapsed = now - created
+  local time_left = expires - now
+  local height
+  if elapsed < TOAST_ENTER_MS then
+    -- entering: 0 → TOAST_FULL_HEIGHT
+    local frac = elapsed / TOAST_ENTER_MS
+    height = math.max(1, math.floor(TOAST_FULL_HEIGHT * frac + 0.5))
+  elseif time_left < TOAST_EXIT_MS then
+    -- exiting: TOAST_FULL_HEIGHT → 0
+    local frac = time_left / TOAST_EXIT_MS
+    height = math.max(0, math.floor(TOAST_FULL_HEIGHT * frac + 0.5))
+  else
+    height = TOAST_FULL_HEIGHT
   end
-  local label = "  " .. (state.toast.text or "")
+  if height <= 0 then return nil end
+
+  local text = state.toast.text or ""
+  -- Pill width = text + 8 cells of internal padding (4 each side via
+  -- the inner column padding plus 1 each side from the box's `│ ` /
+  -- ` │` chrome). Cap at 60 so long messages don't span half the
+  -- screen.
+  local pill_w = math.min(60, #text + 8)
+
+  local body = tui.column {
+    gap = 0,
+    children = {
+      tui.text { content = "", wrap = "none" },
+      tui.align {
+        alignment = "center",
+        child = tui.text { content = text, style = { fg = TOAST_FG }, wrap = "none" },
+      },
+      tui.text { content = "", wrap = "none" },
+    },
+  }
+
   return tui.anchored {
     anchor   = "bottom-left",
     offset_x = 0,
-    width    = "100%",
-    height   = 1,
-    child = tui.text {
-      content = label,
-      style   = { fg = TOAST_FG, bg = TOAST_BG },
-      wrap    = "none",
-    },
+    offset_y = 0,
+    width    = pill_w,
+    height   = height,
+    child = bordered_box(body, TOAST_BORDER, "toast-box"),
   }
+end
+
+-- Old popup-style toast retained as a no-op shim so existing call
+-- sites (compact { ..., popup_toast(state), ... }) keep compiling
+-- while the inline_toast above takes over rendering. Anything left in
+-- the popup stack would just stack on top of the inline one.
+local function popup_toast(_state)
+  return nil
 end
 
 ------------------------------------------------------------------------
@@ -1716,12 +1769,17 @@ local function any_dag_run_active(dag_runs)
 end
 
 local function render_keepalive(state)
-  if not (state.pending or any_dag_run_active(state.dag_runs)) then
+  -- Toast inclusion is load-bearing: without it the engine renders only
+  -- on state changes, so the toast appears once and never re-renders to
+  -- run its slide-out / disappearance. duration_ms = 100 keeps the
+  -- toast slide animation smooth (~60fps engine tick when active);
+  -- DAG-elapsed counters only need 1Hz but the extra ticks are free.
+  if not (state.pending or any_dag_run_active(state.dag_runs) or state.toast) then
     return nil
   end
   return tui.animation {
     frames      = KEEPALIVE_FRAMES,
-    duration_ms = 1000,
+    duration_ms = 100,
   }
 end
 
@@ -1732,6 +1790,16 @@ local function view(state)
       tui.expanded { child = transcript(state) },
       state.show_sidebar and vertical_separator() or nil,
       state.show_sidebar and dag_panel(state)        or nil,
+    },
+  }
+
+  -- Toast overlays the bottom-left of the body area only (above the
+  -- input + statusline). Anchored bottom-left of this stack puts it
+  -- there without ever covering the input or statusline.
+  local body_with_toast = tui.stack {
+    children = compact {
+      body_row,
+      inline_toast(state),
     },
   }
 
@@ -1788,7 +1856,7 @@ local function view(state)
   local main_column = tui.column {
     gap = 0,
     children = compact {
-      tui.expanded { child = body_row },
+      tui.expanded { child = body_with_toast },
       slash_autocomplete_inline(state),
       input_field,
       statusline(state),
@@ -2228,7 +2296,7 @@ local function update(msg, state)
         local now = tui.now_ms()
         return shallow_merge(state, {
           input_value = "", slash = NIL_SENTINEL,
-          toast = { text = "resume: failed to write sidechannel", expires_at_ms = now + 3000 },
+          toast = { text = "resume: failed to write sidechannel", created_at_ms = now, expires_at_ms = now + 3000 },
         }), {}
       end
       -- `/resume` (no args) — open the picker.
@@ -2455,7 +2523,7 @@ local function update(msg, state)
       -- Write failed — keep the popup open and surface a toast.
       local now = tui.now_ms()
       return shallow_merge(state, {
-        toast = { text = "resume: failed to write sidechannel", expires_at_ms = now + 3000 },
+        toast = { text = "resume: failed to write sidechannel", created_at_ms = now, expires_at_ms = now + 3000 },
       }), {}
     end
     -- All other keys swallow so they don't bubble into the input field.
@@ -2686,7 +2754,7 @@ local function update(msg, state)
     local now = tui.now_ms()
     local ttl = msg.ttl_ms or 2000
     return shallow_merge(state, {
-      toast = { text = msg.text or "", expires_at_ms = now + ttl },
+      toast = { text = msg.text or "", created_at_ms = now, expires_at_ms = now + ttl },
     }), {}
   end
 
@@ -2822,6 +2890,7 @@ local function update(msg, state)
       return shallow_merge(state, {
         toast = {
           text = string.format("copied %d chars", #text),
+          created_at_ms = now,
           expires_at_ms = now + 2000,
         },
       }), {}
