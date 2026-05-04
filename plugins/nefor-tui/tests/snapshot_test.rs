@@ -152,6 +152,8 @@ fn snapshot_styled_marks_bold_regions() {
     let mut engine = Engine::new(6, 1).expect("engine");
     engine.load_scenario(SCENARIO).expect("scenario");
     paint(&mut engine);
-    // The 4-char bold word, then 2 trailing spaces (unstyled).
-    assert_eq!(engine.snapshot_styled(), "[bold]BOLD[/bold]  ");
+    // Per the leaf-occlusion contract (`paint_text` blanks the rest of
+    // its allocated rect with its own style), the 2 trailing cells are
+    // bold-styled blanks — same SGR run as the word itself.
+    assert_eq!(engine.snapshot_styled(), "[bold]BOLD  [/bold]");
 }
