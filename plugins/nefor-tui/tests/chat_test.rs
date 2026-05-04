@@ -1877,27 +1877,43 @@ fn statusline_shows_bottom_marker_when_transcript_overflows() {
 }
 
 #[test]
-fn outer_padding_leaves_top_and_bottom_rows_blank() {
-    // Outer vertical padding only — horizontal HPAD was dropped so the
-    // chat surface and the sidebar can run flush to the screen edges
-    // (toast slides off the right; sidebar sits flush left of the
-    // right edge). Top and bottom rows still get a 1-cell breathing
-    // gap so chrome doesn't slam against the terminal frame.
+fn left_column_lifts_input_and_statusline_off_terminal_edges() {
+    // No outer padding any more — the sidebar's vertical separator
+    // runs full window height edge-to-edge. Per-element spacing now
+    // lives inside `left_column`: a 1-row blank above the transcript
+    // and a 1-row blank below the statusline so the input + status
+    // sit one line off the top and bottom of the chat area without
+    // forcing a uniform gutter on the sidebar side too.
+    //
+    // We assert the chat-side columns (left of the sidebar separator)
+    // are blank on the very first and last rows; we do NOT assert the
+    // whole row is blank — the sidebar runs flush with the terminal
+    // top and bottom, which is the visual the user wants.
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
     let snap = engine.snapshot();
     let rows: Vec<&str> = snap.lines().collect();
 
+    // Find the sidebar separator column on a mid-screen row to bound
+    // the chat area on the left.
+    let sample_row = rows.get(rows.len() / 2).expect("mid row");
+    let sep_col = sample_row
+        .chars()
+        .position(|c| c == '│')
+        .expect("sidebar separator should be present in the default layout");
+
     let top = rows.first().expect("top row");
-    assert!(
-        top.chars().all(|c| c == ' '),
-        "top row must be blank (1-cell vpad): {top:?}"
-    );
     let bot = rows.last().expect("bottom row");
+    let chat_top: String = top.chars().take(sep_col).collect();
+    let chat_bot: String = bot.chars().take(sep_col).collect();
     assert!(
-        bot.chars().all(|c| c == ' '),
-        "bottom row must be blank (1-cell vpad): {bot:?}"
+        chat_top.chars().all(|c| c == ' '),
+        "top row chat-side must be blank: {chat_top:?}"
+    );
+    assert!(
+        chat_bot.chars().all(|c| c == ' '),
+        "bottom row chat-side must be blank: {chat_bot:?}"
     );
 }
 

@@ -1894,19 +1894,33 @@ local function view(state)
     "input-field"
   )
 
-  -- Left column = chat surface. Top → bottom: transcript / slash
-  -- autocomplete (when open) / input / statusline / keepalive.
-  -- Statusline lives BELOW the input per legacy spec — pushing it
-  -- above the input visibly inverts the screen weight, making the
-  -- input feel like a status row rather than the primary focus
-  -- surface.
+  -- One-row blank spacer reused at the top of the chat column and
+  -- the bottom (above the statusline). The sidebar gets no spacer:
+  -- its vertical separator now runs full window height edge-to-edge.
+  local function blank_row()
+    return tui.constrained {
+      max_height = 1,
+      child = tui.fill { char = " " },
+    }
+  end
+
+  -- Left column = chat surface. Top → bottom: 1-row top gap /
+  -- transcript / slash autocomplete (when open) / input / statusline /
+  -- 1-row bottom gap / keepalive. Statusline lives BELOW the input
+  -- per legacy spec — pushing it above the input visibly inverts the
+  -- screen weight, making the input feel like a status row rather
+  -- than the primary focus surface. The bottom gap lifts the
+  -- statusline off the very last row so it doesn't sit flush against
+  -- the terminal frame.
   local left_column = tui.column {
     gap = 0,
     children = compact {
+      blank_row(),
       tui.expanded { child = transcript(state) },
       slash_autocomplete_inline(state),
       input_field,
       statusline(state),
+      blank_row(),
       -- Invisible 1Hz keepalive: forces re-render while DAG runs or the
       -- thinking ticker need the second-counter refreshed. Removed when
       -- nothing needs to tick.
@@ -1914,10 +1928,10 @@ local function view(state)
     },
   }
 
-  -- Outer row: left column (chat) | separator | sidebar. Sidebar
-  -- spans full window height — input and statusline stay confined
-  -- to the left column rather than running across underneath the
-  -- sidebar.
+  -- Outer row: left column (chat) | separator | sidebar. No outer
+  -- padding — the sidebar's vertical separator reaches the full
+  -- window height (top and bottom edges flush), and per-element
+  -- spacing is handled inside `left_column` and `dag_panel`.
   local main_row = tui.row {
     gap = 0,
     children = compact {
@@ -1927,25 +1941,19 @@ local function view(state)
     },
   }
 
-  -- 1-cell vertical padding only — no horizontal padding. Side
-  -- padding ate into the toast's reach to the right edge and added
-  -- visual gutters that the user prefers without.
-  return tui.padding {
-    value = { top = 1, right = 0, bottom = 1, left = 0 },
-    child = tui.stack {
-      children = compact {
-        main_row,
-        popup_help(state),
-        popup_message(state),
-        popup_model_picker(state),
-        popup_session_picker(state),
-        popup_tool_permission(state),
-        -- Toast renders last so it sits above input, statusline, and
-        -- every popup — non-blocking notifications must never be
-        -- occluded by chrome below them.
-        inline_toast(state),
-        popup_toast(state),
-      },
+  return tui.stack {
+    children = compact {
+      main_row,
+      popup_help(state),
+      popup_message(state),
+      popup_model_picker(state),
+      popup_session_picker(state),
+      popup_tool_permission(state),
+      -- Toast renders last so it sits above input, statusline, and
+      -- every popup — non-blocking notifications must never be
+      -- occluded by chrome below them.
+      inline_toast(state),
+      popup_toast(state),
     },
   }
 end
