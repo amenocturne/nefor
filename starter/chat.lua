@@ -1571,14 +1571,12 @@ local function inline_toast(state)
   if visible_w <= 0 then return nil end
 
   -- At-rest content: 3 strings, each `pill_w_at_rest` cells wide.
-  -- Top and bottom are dashes terminating in `╮` / `╯`; mid is the
-  -- text + space + right-border `│`. There is no left chrome —
-  -- "no left order [border]" per spec. The right edge of these
-  -- strings always sits at the right edge of the window because the
-  -- enclosing anchored rect is bottom-right with width=visible_w.
-  local top_rule    = string.rep("─", pill_w_at_rest - 1) .. "╮"
-  local mid_text    = text .. " │"
-  local bottom_rule = string.rep("─", pill_w_at_rest - 1) .. "╯"
+  -- Chrome lives on the LEFT — `╭` / `│` / `╰` opens the pill on
+  -- the leading side; the dashes extend rightward and terminate
+  -- flush against the right edge of the window (no right corners).
+  local top_rule    = "╭" .. string.rep("─", pill_w_at_rest - 1)
+  local mid_text    = "│ " .. text
+  local bottom_rule = "╰" .. string.rep("─", pill_w_at_rest - 1)
 
   local body = tui.column {
     gap = 0,
