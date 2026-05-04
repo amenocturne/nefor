@@ -1,4 +1,4 @@
--- starter/ncp_test.lua — unit tests for ncp.step semantics.
+-- starter/ncp_test.lua — unit tests for ncp.dispatch semantics.
 --
 -- Loaded by `crates/nefor/tests/starter_ncp_test.rs`. The Rust test:
 --   * Installs a mock `nefor.engine` that records every `send` call and
@@ -61,10 +61,10 @@ local function make_event(body)
   return json.encode({ type = "event", body = body })
 end
 
--- Convenience: run step with a single inbound entry appended.
-local function step_with(origin, payload)
+-- Convenience: run dispatch with a single inbound entry appended.
+local function dispatch_with(origin, payload)
   local entry = entry_plugin(origin, payload)
-  ncp.step({ entry })
+  ncp.dispatch({ entry })
 end
 
 -- ------------------------------------------------------------------
@@ -73,7 +73,7 @@ end
 local function test_ready_triggers_ready_ok_reply()
   reset()
   _test.set_plugins({ "mock-plugin" })
-  step_with("mock-plugin", make_ready("0.1"))
+  dispatch_with("mock-plugin", make_ready("0.1"))
 
   local calls = _test.calls()
   assert_eq(#calls, 1, "exactly one send on ready")
@@ -91,7 +91,7 @@ end
 local function test_ready_with_wrong_version_triggers_error()
   reset()
   _test.set_plugins({ "p" })
-  step_with("p", make_ready("0.9"))
+  dispatch_with("p", make_ready("0.9"))
 
   local calls = _test.calls()
   assert_eq(#calls, 1, "one send for error")
@@ -109,7 +109,7 @@ local function test_malformed_ready_body_triggers_error()
   _test.set_plugins({ "p" })
   -- Missing protocol_version field.
   local bad = json.encode({ type = "system", body = { kind = "ready" } })
-  step_with("p", bad)
+  dispatch_with("p", bad)
 
   local calls = _test.calls()
   assert_eq(#calls, 1, "one error")
@@ -128,14 +128,14 @@ local function test_event_from_ready_plugin_broadcasts_to_others()
   local log = {}
   for _, name in ipairs({ "a", "b", "c" }) do
     log[#log + 1] = entry_plugin(name, make_ready("0.1"))
-    ncp.step(log)
+    ncp.dispatch(log)
   end
   _test.calls_clear()
 
   -- 'a' emits an event. Should reach b and c only.
   local ev = make_event({ kind = "test.ping" })
   log[#log + 1] = entry_plugin("a", ev)
-  ncp.step(log)
+  ncp.dispatch(log)
 
   local calls = _test.calls()
   local seen = { a = false, b = false, c = false }
@@ -157,14 +157,14 @@ local function test_event_from_ready_plugin_excludes_sender()
 
   local log = {}
   log[#log + 1] = entry_plugin("a", make_ready("0.1"))
-  ncp.step(log)
+  ncp.dispatch(log)
   log[#log + 1] = entry_plugin("b", make_ready("0.1"))
-  ncp.step(log)
+  ncp.dispatch(log)
   _test.calls_clear()
 
   local ev = make_event({ kind = "sub" })
   log[#log + 1] = entry_plugin("a", ev)
-  ncp.step(log)
+  ncp.dispatch(log)
 
   local calls = _test.calls()
   for _, c in ipairs(calls) do
@@ -181,7 +181,7 @@ local function test_event_from_non_ready_plugin_is_errored()
 
   -- 'a' emits an event without readying first.
   local log = { entry_plugin("a", make_event({ kind = "x" })) }
-  ncp.step(log)
+  ncp.dispatch(log)
 
   local calls = _test.calls()
   assert_eq(#calls, 1, "one send: the error reply")
@@ -197,7 +197,7 @@ end
 local function test_malformed_json_triggers_error()
   reset()
   _test.set_plugins({ "p" })
-  step_with("p", "{not valid json")
+  dispatch_with("p", "{not valid json")
 
   local calls = _test.calls()
   assert_eq(#calls, 1, "one send: error")
@@ -216,7 +216,7 @@ end
 local function test_second_ready_from_same_plugin_errors()
   reset()
   _test.set_plugins({ "p" })
-  step_with("p", make_ready("0.1"))
+  dispatch_with("p", make_ready("0.1"))
   _test.calls_clear()
 
   -- Second ready — still just one log entry from the test's point of
@@ -225,7 +225,7 @@ local function test_second_ready_from_same_plugin_errors()
     entry_plugin("p", make_ready("0.1")),
     entry_plugin("p", make_ready("0.1")),  -- the second ready
   }
-  ncp.step(log)
+  ncp.dispatch(log)
 
   local calls = _test.calls()
   assert_eq(#calls, 1, "one send: the error")
@@ -242,24 +242,24 @@ local function test_late_attacher_receives_prior_events_in_order()
 
   -- 'a' readies, then emits three events.
   local log = { entry_plugin("a", make_ready("0.1")) }
-  ncp.step(log)
+  ncp.dispatch(log)
 
   for _, k in ipairs({ "e1", "e2", "e3" }) do
     log[#log + 1] = entry_plugin("a", make_event({ kind = k }))
     -- Simulate step broadcasting: add one step entry per event for each
     -- connected-but-not-a peer. 'a' is the only ready plugin so no broadcasts
-    -- actually happen; the entry is appended by ncp.step's own broadcast
+    -- actually happen; the entry is appended by ncp.dispatch's own broadcast
     -- logic (via the mock `send`). We mirror that here to keep the log
     -- realistic: current_log in production contains both the inbound and
     -- step's outbound fanout.
-    ncp.step(log)
+    ncp.dispatch(log)
   end
 
   -- 'b' joins and readies. Expect three replayed events in order.
   _test.set_plugins({ "a", "b" })
   _test.calls_clear()
   log[#log + 1] = entry_plugin("b", make_ready("0.1"))
-  ncp.step(log)
+  ncp.dispatch(log)
 
   local calls = _test.calls()
   -- First call is the ready_ok reply; subsequent calls are the replayed
@@ -283,11 +283,11 @@ end
 -- transforms: from_plugin rewrites event before broadcast
 -- ------------------------------------------------------------------
 -- Helper: ready each name in order, calling step after every append so
--- ncp.step sees one new tail entry per call (the production pattern).
+-- ncp.dispatch sees one new tail entry per call (the production pattern).
 local function ready_in_order(log, names)
   for _, n in ipairs(names) do
     log[#log + 1] = entry_plugin(n, make_ready("0.1"))
-    ncp.step(log)
+    ncp.dispatch(log)
   end
 end
 
@@ -313,7 +313,7 @@ local function test_from_plugin_transform_rewrites_event_kind()
   _test.calls_clear()
 
   log[#log + 1] = entry_plugin("src", make_event({ kind = "cc.stream.end", text = "hi" }))
-  ncp.step(log)
+  ncp.dispatch(log)
 
   local calls = _test.calls()
   assert_eq(#calls, 1, "exactly one peer (dst) received the event")
@@ -340,7 +340,7 @@ local function test_from_plugin_transform_returning_nil_drops_envelope()
   _test.calls_clear()
 
   log[#log + 1] = entry_plugin("src", make_event({ kind = "any" }))
-  ncp.step(log)
+  ncp.dispatch(log)
 
   assert_eq(#_test.calls(), 0, "no peers received the dropped event")
 end
@@ -365,7 +365,7 @@ local function test_to_plugin_transform_rewrites_per_target_only()
   _test.calls_clear()
 
   log[#log + 1] = entry_plugin("src", make_event({ kind = "original" }))
-  ncp.step(log)
+  ncp.dispatch(log)
 
   local seen = {}
   for _, c in ipairs(_test.calls()) do
@@ -392,7 +392,7 @@ local function test_to_plugin_transform_returning_nil_drops_for_target_only()
   _test.calls_clear()
 
   log[#log + 1] = entry_plugin("src", make_event({ kind = "x" }))
-  ncp.step(log)
+  ncp.dispatch(log)
 
   local targets = {}
   for _, c in ipairs(_test.calls()) do
@@ -418,7 +418,7 @@ local function test_from_plugin_transform_error_emits_transform_error()
   _test.calls_clear()
 
   log[#log + 1] = entry_plugin("src", make_event({ kind = "x" }))
-  ncp.step(log)
+  ncp.dispatch(log)
 
   local calls = _test.calls()
   assert_eq(#calls, 1, "one send: the error reply to source")
@@ -444,17 +444,17 @@ local function test_replayed_events_pass_through_from_plugin_transform()
 
   -- src readies, then emits two events while alone on the bus.
   local log = { entry_plugin("src", make_ready("0.1")) }
-  ncp.step(log)
+  ncp.dispatch(log)
   for _, k in ipairs({ "e1", "e2" }) do
     log[#log + 1] = entry_plugin("src", make_event({ kind = k }))
-    ncp.step(log)
+    ncp.dispatch(log)
   end
 
   -- 'late' joins. Replay should deliver both events with rewritten kind.
   _test.set_plugins({ "src", "late" })
   _test.calls_clear()
   log[#log + 1] = entry_plugin("late", make_ready("0.1"))
-  ncp.step(log)
+  ncp.dispatch(log)
 
   local replayed_kinds = {}
   for _, c in ipairs(_test.calls()) do
@@ -486,7 +486,7 @@ local function test_kind_prefix_targets_named_peer_only()
   -- nefor-tui peer (and src is not nefor-tui), so it should deliver only
   -- to nefor-tui — not "other".
   log[#log + 1] = entry_plugin("src", make_event({ kind = "nefor-tui.grid.line", row = 0 }))
-  ncp.step(log)
+  ncp.dispatch(log)
 
   local targets = {}
   for _, c in ipairs(_test.calls()) do
@@ -508,7 +508,7 @@ local function test_kind_prefix_self_announces_to_all_peers()
   -- nefor-tui announces "nefor-tui.ready" — prefix matches the sender
   -- itself, so this is a self-announcement and broadcasts to all peers.
   log[#log + 1] = entry_plugin("nefor-tui", make_event({ kind = "nefor-tui.ready" }))
-  ncp.step(log)
+  ncp.dispatch(log)
 
   local targets = {}
   for _, c in ipairs(_test.calls()) do
@@ -1219,14 +1219,14 @@ local function test_engine_plugin_failed_routes_to_chat_popup()
   -- the popup send.
   _test.set_plugins({ "nefor-tui" })
   local log = { entry_plugin("nefor-tui", make_ready("0.1")) }
-  ncp.step(log)
+  ncp.dispatch(log)
   _test.calls_clear()
 
   local payload = make_engine_plugin_failed(
     "ollama", "spawn", "binary not found", "missing_dir"
   )
   log[#log + 1] = entry_engine(payload)
-  ncp.step(log)
+  ncp.dispatch(log)
 
   local calls = _test.calls()
   assert_eq(#calls, 1, "exactly one send: the chat.popup")
@@ -1262,7 +1262,7 @@ local function test_engine_plugin_failed_drops_when_chat_not_connected()
     "nefor-tui", "runtime", "crashed", "crash"
   )
   local log = { entry_engine(payload) }
-  ncp.step(log)
+  ncp.dispatch(log)
 
   assert_eq(#_test.calls(), 0,
     "no send when nefor-tui isn't on the bus")
@@ -1281,7 +1281,7 @@ local function test_engine_origin_does_not_trigger_ready_handshake_error()
   local payload = make_engine_plugin_failed(
     "x", "spawn", "y", "missing_dir"
   )
-  ncp.step({ entry_engine(payload) })
+  ncp.dispatch({ entry_engine(payload) })
 
   -- All sends must target nefor-tui (the popup), not "engine".
   for _, c in ipairs(_test.calls()) do
@@ -1305,13 +1305,13 @@ local function test_engine_plugin_failed_buffers_until_chat_readies()
     "ollama", "spawn", "binary not found", "missing_dir"
   )
   local log = { entry_engine(payload) }
-  ncp.step(log)
+  ncp.dispatch(log)
   assert_eq(#_test.calls(), 0,
     "no send while nefor-tui is pre-ready (popup buffered)")
 
   -- Now chat readies — handshake reply + buffered popup must both fire.
   log[#log + 1] = entry_plugin("nefor-tui", make_ready("0.1"))
-  ncp.step(log)
+  ncp.dispatch(log)
 
   local calls = _test.calls()
   assert_eq(#calls, 2,
@@ -1339,15 +1339,15 @@ local function test_engine_envelopes_skipped_in_replay_to_late_attachers()
   -- Chat readies first; engine reports a failure; then a late plugin
   -- attaches. Replay should NOT carry the engine entry to it.
   local log = { entry_plugin("nefor-tui", make_ready("0.1")) }
-  ncp.step(log)
+  ncp.dispatch(log)
   log[#log + 1] = entry_engine(
     make_engine_plugin_failed("x", "spawn", "y", "missing_dir")
   )
-  ncp.step(log)
+  ncp.dispatch(log)
   _test.calls_clear()
 
   log[#log + 1] = entry_plugin("late", make_ready("0.1"))
-  ncp.step(log)
+  ncp.dispatch(log)
 
   -- Late plugin gets ready_ok; nothing else (no engine.plugin_failed
   -- replay, no chat.popup replay since the chat.popup was a step-origin

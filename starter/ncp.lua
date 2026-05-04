@@ -1,12 +1,12 @@
 -- starter/ncp.lua — NCP v0.1 protocol implementation (Lua).
 --
 -- Public API:
---   ncp.step(current_log)            -- called from the global step hook
+--   ncp.dispatch(current_log)        -- called from the global dispatch hook
 --   ncp.spawn(cfg)                   -- spawn a plugin with optional transforms
 --
 -- The engine is a pure string-layer event bus. Every inbound line gets
--- appended to `current_log` and `ncp.step` is invoked. This module inspects
--- the new tail entry and implements:
+-- appended to `current_log` and `ncp.dispatch` is invoked. This module
+-- inspects the new tail entry and implements:
 --   * `ready` / `ready_ok` handshake (with `protocol_version` check).
 --   * Broadcast of `type:"event"` messages to every *other* ready plugin.
 --   * Replay-on-attach: when a plugin readies, resend the current session's
@@ -21,8 +21,9 @@
 --     (e.g. `cc.*` → `chat.*`) without modifying plugins.
 --
 -- State lives in module-level locals and is reset on module reload. Nothing
--- here is shared across step invocations except the `ready_plugins` set and
--- the `plugin_transforms` table; the engine holds the authoritative event log.
+-- here is shared across dispatch invocations except the `ready_plugins` set
+-- and the `plugin_transforms` table; the engine holds the authoritative
+-- event log.
 --
 -- # Tradeoffs documented in code
 --
@@ -41,9 +42,9 @@
 -- which runs the swap entirely in-process: emits `sessions.session_end`,
 -- swaps active jsonl + in-memory state, emits `sessions.session_start`,
 -- replays each saved entry via `nefor.engine.send`, then emits
--- `sessions.resume_done`. ncp.step itself sees no parent-session hook;
--- the legacy `saved_log` parameter (and `resume.lua` companion module)
--- have been removed.
+-- `sessions.resume_done`. ncp.dispatch itself sees no parent-session
+-- hook; the legacy `saved_log` parameter (and `resume.lua` companion
+-- module) have been removed.
 
 local json = nefor.json
 
@@ -64,7 +65,7 @@ local ready_plugins = {}
 -- `from_plugin(env)` runs once per emission at ingress; `to_plugin(env)` runs
 -- per peer at egress. Both receive `{type, body, from}` (and `ts` on
 -- to_plugin) and return either a (possibly mutated) envelope table or nil
--- to drop. Errors are caught — a faulty transform never crashes step.
+-- to drop. Errors are caught — a faulty transform never crashes dispatch.
 local plugin_transforms = {}
 
 -- FIFO queue of `chat.popup` envelope tables awaiting nefor-tui's ready.
@@ -83,7 +84,7 @@ local pending_chat_popups = {}
 
 -- Try to decode a JSON string. Returns (decoded, nil) on success or
 -- (nil, err_message) on failure. Wraps pcall so a bad line is a protocol
--- fault we report, not an uncaught error that takes down step.
+-- fault we report, not an uncaught error that takes down dispatch.
 local function try_decode(s)
   local ok, v = pcall(json.decode, s)
   if not ok then return nil, tostring(v) end
@@ -224,7 +225,7 @@ end
 -- Apply the source plugin's `from_plugin` transform (if any) to a decoded
 -- envelope. Returns the (possibly rewritten) envelope, or nil to drop.
 -- Errors in user code surface as `transform_error` to the source plugin
--- and the envelope is dropped — better than crashing step.
+-- and the envelope is dropped — better than crashing dispatch.
 local function apply_from_plugin(origin, env)
   local t = plugin_transforms[origin]
   if not t or not t.from_plugin then return env end
@@ -336,7 +337,7 @@ local function handle_event(origin, payload)
   -- specific peer (other than the sender) deliver only to that peer. The
   -- common case is render traffic from nefor-tui → nefor-tui ("nefor-tui.
   -- grid.line", etc); broadcasting those to every plugin spends a Lua
-  -- step + JSON encode per peer for nothing. Events whose prefix is the
+  -- dispatch + JSON encode per peer for nothing. Events whose prefix is the
   -- sender itself ("nefor-tui.input.key" from nefor-tui) are announcements
   -- about the sender and stay broadcast. Events with a non-peer prefix
   -- ("chat.*", "cc.*", custom kinds) also broadcast.
@@ -421,7 +422,7 @@ end
 -- public entry point
 -- ------------------------------------------------------------------
 
-function M.step(current_log)
+function M.dispatch(current_log)
   local tail_index = #current_log
   if tail_index == 0 then return end
 

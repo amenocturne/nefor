@@ -37,13 +37,13 @@ package.path = table.concat({
 }, ";")
 
 -------------------------------------------------------------------------
--- 2. Step function + session management
+-- 2. Dispatch hook + session management
 -------------------------------------------------------------------------
 --
 -- Session continuity (boot, shutdown, resume) is composed entirely in
 -- Lua via the sessions module. The Rust engine is session-blind: it
--- forwards inbound lines to step, broadcasts events, and exits on
--- request. Session id minting, on-disk jsonl persistence, and
+-- forwards inbound lines to the dispatch hook, broadcasts events, and
+-- exits on request. Session id minting, on-disk jsonl persistence, and
 -- in-process resume all live in `starter/sessions.lua`.
 --
 -- The legacy sidechannel-write + process-exit + engine-restart flow
@@ -55,12 +55,12 @@ package.path = table.concat({
 local ncp      = require("ncp")
 local sessions = require("sessions")
 
--- Forward the engine's `current_log` to ncp.step. The engine is
+-- Forward the engine's `current_log` to ncp.dispatch. The engine is
 -- session-blind: cross-run resume is owned by `starter/sessions.lua`,
 -- which subscribes to the bus directly via nefor.bus.on_event and
 -- replays jsonl onto it on `sessions.resume_request`.
-function step(current_log)
-  ncp.step(current_log)
+function dispatch(current_log)
+  ncp.dispatch(current_log)
 end
 
 -- Mint a fresh session, install persistence + resume_request listener,

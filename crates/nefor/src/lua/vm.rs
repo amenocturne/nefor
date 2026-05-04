@@ -33,16 +33,16 @@ pub struct LuaHost {
     bus: Arc<EventBus>,
     #[allow(dead_code)]
     plugins: SharedPluginRegistry,
-    /// Registry key for the global `step` function, populated by
-    /// [`LuaHost::cache_step`] after `init.lua` runs. `None` until then;
-    /// [`LuaHost::invoke_step`] errors with [`LuaError::StepNotCached`] if
-    /// called before caching.
-    step: Option<RegistryKey>,
+    /// Registry key for the global `dispatch` function, populated by
+    /// [`LuaHost::cache_dispatch`] after `init.lua` runs. `None` until
+    /// then; [`LuaHost::invoke_dispatch`] errors with
+    /// [`LuaError::DispatchNotCached`] if called before caching.
+    dispatch: Option<RegistryKey>,
     /// Persistent Lua array mirroring the current session's log. Created
-    /// lazily on the first [`LuaHost::invoke_step`] call and reused — each
-    /// subsequent call appends only the new entries since the last call,
-    /// avoiding the O(n²) re-marshalling that an n-entry session would
-    /// otherwise incur. Reset by [`LuaHost::reset_logs`].
+    /// lazily on the first [`LuaHost::invoke_dispatch`] call and reused —
+    /// each subsequent call appends only the new entries since the last
+    /// call, avoiding the O(n²) re-marshalling that an n-entry session
+    /// would otherwise incur.
     current_log_table: Option<RegistryKey>,
     /// Number of entries already mirrored into `current_log_table`. Used
     /// to compute the slice to append on each invocation.
@@ -92,7 +92,7 @@ impl LuaHost {
             lua,
             bus,
             plugins,
-            step: None,
+            dispatch: None,
             current_log_table: None,
             current_log_mirrored: 0,
             subscriptions,
@@ -192,25 +192,27 @@ impl LuaHost {
         }
     }
 
-    /// Look up the global `step` function defined by `init.lua` and stash
-    /// it in the Lua registry for repeat invocation.
+    /// Look up the global `dispatch` function defined by `init.lua` and
+    /// stash it in the Lua registry for repeat invocation.
     ///
-    /// Returns [`LuaError::StepMissing`] when no such global exists or the
-    /// global is not a function — both are fatal because the new engine
-    /// model runs step on every inbound envelope and can't proceed without
+    /// Returns [`LuaError::DispatchMissing`] when no such global exists or
+    /// the global is not a function — both are fatal because the engine
+    /// runs dispatch on every inbound envelope and can't proceed without
     /// it.
-    pub fn cache_step(&mut self) -> Result<(), LuaError> {
+    pub fn cache_dispatch(&mut self) -> Result<(), LuaError> {
         let globals = self.lua.globals();
-        let val: mlua::Value = globals.get("step").map_err(|_| LuaError::StepMissing)?;
+        let val: mlua::Value = globals
+            .get("dispatch")
+            .map_err(|_| LuaError::DispatchMissing)?;
         let func = match val {
             mlua::Value::Function(f) => f,
-            _ => return Err(LuaError::StepMissing),
+            _ => return Err(LuaError::DispatchMissing),
         };
-        self.step = Some(self.lua.create_registry_value(func)?);
+        self.dispatch = Some(self.lua.create_registry_value(func)?);
         Ok(())
     }
 
-    /// Invoke `step(current_log)`.
+    /// Invoke `dispatch(current_log)`.
     ///
     /// The Lua table is *persistent*: created on the first call, then
     /// reused. `new_current_entries` carries only the entries appended
@@ -220,13 +222,13 @@ impl LuaHost {
     /// tail under its lock, avoiding an O(n) clone of the full event log
     /// on every inbound line.
     ///
-    /// Errors raised *inside* the step function are logged and swallowed —
-    /// they must not take down the engine loop. VM-level errors (missing
-    /// cache, registry corruption, conversion failure) bubble up as
-    /// [`LuaError`].
-    pub fn invoke_step(&mut self, new_current_entries: &[LogEntry]) -> Result<(), LuaError> {
-        let Some(key) = self.step.as_ref() else {
-            return Err(LuaError::StepNotCached);
+    /// Errors raised *inside* the dispatch function are logged and
+    /// swallowed — they must not take down the engine loop. VM-level
+    /// errors (missing cache, registry corruption, conversion failure)
+    /// bubble up as [`LuaError`].
+    pub fn invoke_dispatch(&mut self, new_current_entries: &[LogEntry]) -> Result<(), LuaError> {
+        let Some(key) = self.dispatch.as_ref() else {
+            return Err(LuaError::DispatchNotCached);
         };
         let func: mlua::Function = self.lua.registry_value(key)?;
 
@@ -250,7 +252,7 @@ impl LuaHost {
         match func.call::<()>(current) {
             Ok(()) => Ok(()),
             Err(e) => {
-                tracing::error!(error = %e, "step invocation failed");
+                tracing::error!(error = %e, "dispatch invocation failed");
                 Ok(())
             }
         }
@@ -262,12 +264,12 @@ impl LuaHost {
     /// envelope as a Lua table.
     ///
     /// Errors raised inside a handler are logged and swallowed (D-21a-style
-    /// — same policy as `step`); subsequent handlers still run. Entries
+    /// — same policy as `dispatch`); subsequent handlers still run. Entries
     /// whose payload is not parseable JSON, has no `body.kind`, etc., are
     /// silently skipped — bus subscribers explicitly speak the kind layer
-    /// and don't see protocol-malformed traffic. (Step still saw it; the
-    /// distinction is: step is the protocol authority, on_event is a
-    /// convenience over kind-based routing.)
+    /// and don't see protocol-malformed traffic. (`dispatch` still saw it;
+    /// the distinction is: `dispatch` is the protocol authority, on_event
+    /// is a convenience over kind-based routing.)
     pub fn dispatch_subscriptions(&self, entries: &[LogEntry]) {
         let snap = {
             let guard = match self.subscriptions.lock() {
@@ -521,35 +523,39 @@ mod tests {
     }
 
     #[test]
-    fn step_missing_returns_error() {
+    fn dispatch_missing_returns_error() {
         let mut h = host();
-        // init.lua defines other globals but no `step`.
+        // init.lua defines other globals but no `dispatch`.
         h.exec_str("init.lua", "other_global = 1").unwrap();
-        let err = h.cache_step().expect_err("step missing must error");
-        assert!(matches!(err, LuaError::StepMissing));
+        let err = h.cache_dispatch().expect_err("dispatch missing must error");
+        assert!(matches!(err, LuaError::DispatchMissing));
     }
 
     #[test]
-    fn step_global_is_not_a_function() {
+    fn dispatch_global_is_not_a_function() {
         let mut h = host();
-        h.exec_str("init.lua", "step = 42").unwrap();
-        let err = h.cache_step().expect_err("non-function step must error");
-        assert!(matches!(err, LuaError::StepMissing));
+        h.exec_str("init.lua", "dispatch = 42").unwrap();
+        let err = h
+            .cache_dispatch()
+            .expect_err("non-function dispatch must error");
+        assert!(matches!(err, LuaError::DispatchMissing));
     }
 
     #[test]
-    fn invoke_step_before_cache_errors() {
+    fn invoke_dispatch_before_cache_errors() {
         let mut h = host();
-        let err = h.invoke_step(&[]).expect_err("uncached step must error");
-        assert!(matches!(err, LuaError::StepNotCached));
+        let err = h
+            .invoke_dispatch(&[])
+            .expect_err("uncached dispatch must error");
+        assert!(matches!(err, LuaError::DispatchNotCached));
     }
 
     #[test]
-    fn step_invocation_passes_log_table() {
+    fn dispatch_invocation_passes_log_table() {
         let mut h = host();
-        h.exec_str("init.lua", "function step(c) global_c_len = #c end")
+        h.exec_str("init.lua", "function dispatch(c) global_c_len = #c end")
             .unwrap();
-        h.cache_step().expect("cache ok");
+        h.cache_dispatch().expect("cache ok");
         let current: Vec<LogEntry> = (0..3)
             .map(|i| LogEntry {
                 ts: ts(),
@@ -558,47 +564,47 @@ mod tests {
                 payload: format!("cp{i}"),
             })
             .collect();
-        h.invoke_step(&current).expect("invoke ok");
+        h.invoke_dispatch(&current).expect("invoke ok");
         let c_len: i64 = h.lua.globals().get("global_c_len").unwrap();
         assert_eq!(c_len, 3);
     }
 
     #[test]
-    fn step_can_call_engine_send() {
+    fn dispatch_can_call_engine_send() {
         let ops = RecordOps::new();
         let mut h = host_with_ops(Arc::clone(&ops) as Arc<dyn EngineOps>);
         h.exec_str(
             "init.lua",
-            "function step(c) nefor.engine.send(\"from-step\") end",
+            "function dispatch(c) nefor.engine.send(\"from-dispatch\") end",
         )
         .unwrap();
-        h.cache_step().expect("cache ok");
-        h.invoke_step(&[]).expect("invoke ok");
+        h.cache_dispatch().expect("cache ok");
+        h.invoke_dispatch(&[]).expect("invoke ok");
         let calls = ops.snapshot();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, SendTarget::Broadcast);
-        assert_eq!(calls[0].1, "from-step");
+        assert_eq!(calls[0].1, "from-dispatch");
     }
 
     #[test]
-    fn step_error_is_logged_not_fatal() {
+    fn dispatch_error_is_logged_not_fatal() {
         let mut h = host();
-        h.exec_str("init.lua", "function step() error(\"boom\") end")
+        h.exec_str("init.lua", "function dispatch() error(\"boom\") end")
             .unwrap();
-        h.cache_step().expect("cache ok");
+        h.cache_dispatch().expect("cache ok");
         // Should return Ok despite the Lua error — the engine loop must
         // continue running on handler failure.
-        let res = h.invoke_step(&[]);
-        assert!(res.is_ok(), "step error must not be fatal; got {res:?}");
+        let res = h.invoke_dispatch(&[]);
+        assert!(res.is_ok(), "dispatch error must not be fatal; got {res:?}");
     }
 
     #[test]
-    fn step_reads_log_entry_fields() {
+    fn dispatch_reads_log_entry_fields() {
         let mut h = host();
         h.exec_str(
             "init.lua",
             r#"
-            function step(current)
+            function dispatch(current)
                 captured_ts = current[1].ts
                 captured_origin = current[1].origin
                 captured_target = current[1].target
@@ -607,14 +613,14 @@ mod tests {
             "#,
         )
         .unwrap();
-        h.cache_step().expect("cache ok");
+        h.cache_dispatch().expect("cache ok");
         let entry = LogEntry {
             ts: ts(),
             origin: Origin::Step,
             target: Some(plugin("mock-plugin")),
             payload: "pl".into(),
         };
-        h.invoke_step(std::slice::from_ref(&entry)).unwrap();
+        h.invoke_dispatch(std::slice::from_ref(&entry)).unwrap();
         let got_ts: String = h.lua.globals().get("captured_ts").unwrap();
         let origin: String = h.lua.globals().get("captured_origin").unwrap();
         let target: String = h.lua.globals().get("captured_target").unwrap();

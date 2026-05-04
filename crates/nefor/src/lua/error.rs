@@ -111,18 +111,18 @@ pub enum LuaError {
         got: String,
     },
 
-    /// `init.lua` loaded but did not define a global `step` function. The
-    /// step function is required in the redesigned engine — it is the user-
-    /// level NCP policy; without it the engine has nothing to run.
-    #[error("init.lua did not define a global `step` function (required)")]
-    StepMissing,
+    /// `init.lua` loaded but did not define a global `dispatch` function.
+    /// The dispatch hook is required in the redesigned engine — it is the
+    /// user-level NCP policy; without it the engine has nothing to run.
+    #[error("init.lua did not define a global `dispatch` function (required)")]
+    DispatchMissing,
 
-    /// [`crate::lua::LuaHost::invoke_step`] was called before
-    /// [`crate::lua::LuaHost::cache_step`] populated the registry key. This
-    /// is a programmer error in the engine — the orchestrator must call
-    /// `cache_step` once after `load_init`.
-    #[error("step function not cached (call cache_step after load_init)")]
-    StepNotCached,
+    /// [`crate::lua::LuaHost::invoke_dispatch`] was called before
+    /// [`crate::lua::LuaHost::cache_dispatch`] populated the registry key.
+    /// This is a programmer error in the engine — the orchestrator must
+    /// call `cache_dispatch` once after `load_init`.
+    #[error("dispatch function not cached (call cache_dispatch after load_init)")]
+    DispatchNotCached,
 
     /// Escape hatch for mlua errors we don't yet have a specific variant for.
     /// Use sparingly — adding a typed variant beats Other for everything a
