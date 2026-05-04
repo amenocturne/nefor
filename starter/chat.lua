@@ -2867,6 +2867,20 @@ local function update(msg, state)
     return state, {}
   end
 
+  if kind == "chat.reset" then
+    -- agentic_workflow's `teardown_for_session_end` broadcasts
+    -- chat.reset so the provider's chat-history map clears. The TUI
+    -- receives it too (broadcast doesn't filter peers), but the
+    -- transcript clear that USED to live here is redundant —
+    -- sessions.session_end fires alongside chat.reset and already
+    -- wipes entries. Pinning a no-op handler instead of letting the
+    -- envelope fall through is intentional: it documents that the
+    -- TUI deliberately ignores chat.reset, so a future contributor
+    -- who's tempted to "do something on reset" lands here first and
+    -- sees the comment explaining why session_end owns the clear.
+    return state, {}
+  end
+
   -- ── inbound chat-contract events ────────────────────────────────────
   if kind == "chat.message.append" then
     local text = msg.text or ""

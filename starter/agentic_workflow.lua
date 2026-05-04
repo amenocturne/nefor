@@ -1574,10 +1574,21 @@ function M.for_chat()
     -- Emit the user message to the TUI as a transcript-bound event.
     -- This is what makes the user's input visible across resume:
     -- chat.message.append targeted at nefor-tui is persisted as a
-    -- step-origin entry the replay path can re-deliver. (chat.lua's
-    -- key.submit handler intentionally does NOT push the user message
-    -- locally — the bus is the single source of truth so live and
-    -- replayed views match exactly.)
+    -- step-origin entry the replay path can re-deliver.
+    --
+    -- chat.lua ALSO pushes the user message locally on submit for
+    -- instant feedback (key.submit doesn't wait for the round-trip).
+    -- It sets a `pending_user_echo` marker so this echo is deduped
+    -- against the local push, rendering the user line exactly once
+    -- live. On replay the marker is absent so push_entry fires —
+    -- replayed views match the live view.
+    --
+    -- chat.lua's dedup is defensive: it only swallows the echo when
+    -- the local push actually landed in entries (a session-lifecycle
+    -- clear could have wiped it between submit and echo); otherwise
+    -- the echo falls through and re-paints the user line. So this
+    -- emission doubles as both the persistence path AND the recovery
+    -- path for the rare case where the local push was lost.
     emit("nefor-tui", {
       kind = "chat.message.append",
       role = "user",
