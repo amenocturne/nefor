@@ -215,4 +215,269 @@ do
     "provider replay preserves the provider-prefixed kind")
 end
 
+-- ------------------------------------------------------------------
+-- Issue 1 + Issue 3 — user message echo + busy-submit queue
+-- ------------------------------------------------------------------
+--
+-- Two intertwined behaviours share the chat.input.submit handler:
+--   * Issue 1: chat.input.submit must emit `chat.message.append`
+--     `{ role=user, text }` so the user message is persisted (and
+--     thus replayable) as a step-origin entry. Without this the
+--     resume replay path can't repaint user turns.
+--   * Issue 3: when busy, queue subsequent submits; flush on
+--     graph.run_complete; clear queue on chat.reset.
+
+-- Helpers ---------------------------------------------------------
+local function decode_calls()
+  local out = {}
+  for _, c in ipairs(_test.calls()) do
+    local ok, decoded = pcall(nefor.json.decode, c.payload)
+    if ok and type(decoded) == "table" and type(decoded.body) == "table" then
+      out[#out + 1] = { body = decoded.body, target = c.target }
+    end
+  end
+  return out
+end
+
+local function find_call(calls, kind, role, text_substr)
+  for _, c in ipairs(calls) do
+    if c.body.kind == kind
+       and (role == nil or c.body.role == role)
+       and (text_substr == nil
+            or (type(c.body.text) == "string"
+                and string.find(c.body.text, text_substr, 1, true) ~= nil)) then
+      return c
+    end
+  end
+  return nil
+end
+
+local function fresh_for_chat()
+  agentic_workflow._reset()
+  agentic_workflow.setup { provider = "ollama", model = "test-model" }
+  _test.set_plugins({ "ollama", "reasoner-graph", "nefor-tui" })
+  _test.calls_clear()
+  return agentic_workflow.for_chat()
+end
+
+-- (1.A) chat.input.submit emits chat.message.append role=user. -----
+do
+  local for_chat = fresh_for_chat()
+  for_chat.from_plugin {
+    type = "event",
+    from = "nefor-tui",
+    body = { kind = "chat.input.submit", text = "first prompt" },
+  }
+  local calls = decode_calls()
+  local user_echo = find_call(calls, "chat.message.append", "user", "first prompt")
+  assert(user_echo ~= nil,
+    "chat.input.submit must emit chat.message.append role=user (Issue 1 echo)")
+  assert_eq(user_echo.target, "nefor-tui",
+    "user echo must target nefor-tui specifically")
+end
+
+-- (3.A) Busy submit is queued, not rejected. --------------------------
+do
+  local for_chat = fresh_for_chat()
+  -- First submit — orchestrator becomes busy.
+  for_chat.from_plugin {
+    type = "event",
+    from = "nefor-tui",
+    body = { kind = "chat.input.submit", text = "first" },
+  }
+  _test.calls_clear()
+  -- Second submit while busy. With the old code this emitted
+  -- `[orchestrator busy — wait …]` and dropped the input. With the
+  -- new code the input should queue, AND the user message should
+  -- still echo (so the user sees they were heard).
+  for_chat.from_plugin {
+    type = "event",
+    from = "nefor-tui",
+    body = { kind = "chat.input.submit", text = "second" },
+  }
+  local calls = decode_calls()
+  local echo = find_call(calls, "chat.message.append", "user", "second")
+  assert(echo ~= nil,
+    "queued submit must still echo a chat.message.append role=user")
+  local queued_note = find_call(calls, "chat.message.append", "system", "queued")
+  assert(queued_note ~= nil,
+    "queued submit must surface a [queued ...] system message; got " ..
+    nefor.json.encode(calls))
+  -- Old-text rejection MUST be gone.
+  local busy_msg = find_call(calls, "chat.message.append", "system", "orchestrator busy")
+  assert_eq(busy_msg, nil,
+    "the rejected '[orchestrator busy ...]' must no longer appear")
+end
+
+-- (3.B) Two messages submitted back-to-back BOTH dispatch as the
+-- orchestrator frees up. We drive graph.run_complete to flush.
+do
+  local for_chat = fresh_for_chat()
+  local rg = agentic_workflow.for_reasoner_graph()
+  -- Submit twice in a row.
+  for_chat.from_plugin {
+    type = "event",
+    from = "nefor-tui",
+    body = { kind = "chat.input.submit", text = "alpha" },
+  }
+  for_chat.from_plugin {
+    type = "event",
+    from = "nefor-tui",
+    body = { kind = "chat.input.submit", text = "beta" },
+  }
+  -- Capture run_id by walking emitted reasoner-graph.run envelopes.
+  local function find_run_emit(calls)
+    for _, c in ipairs(calls) do
+      if c.body.kind == "reasoner-graph.run" then
+        return c.body.run_id
+      end
+    end
+    return nil
+  end
+  local first_run = find_run_emit(decode_calls())
+  assert(first_run ~= nil, "first submit dispatched a reasoner-graph.run")
+  -- Sanity: only ONE run dispatched so far (second is queued).
+  do
+    local count = 0
+    for _, c in ipairs(decode_calls()) do
+      if c.body.kind == "reasoner-graph.run" then count = count + 1 end
+    end
+    assert_eq(count, 1, "second submit must NOT dispatch while first is in flight")
+  end
+  _test.calls_clear()
+  -- Drive graph.run_complete success for the first run.
+  rg.from_plugin {
+    type = "event",
+    from = "reasoner-graph",
+    body = {
+      kind   = "graph.run_complete",
+      run_id = first_run,
+      status = "success",
+      results = {},
+    },
+  }
+  -- Now the queued "beta" should have dispatched.
+  local second_run = find_run_emit(decode_calls())
+  assert(second_run ~= nil,
+    "queued submit must dispatch on graph.run_complete; sends were " ..
+    nefor.json.encode(_test.calls()))
+  assert(second_run ~= first_run,
+    "second run must be a fresh run_id, got " .. tostring(second_run))
+end
+
+-- (3.C) chat.reset clears the pending-input queue (no surprise dispatch).
+do
+  local for_chat = fresh_for_chat()
+  for_chat.from_plugin {
+    type = "event",
+    from = "nefor-tui",
+    body = { kind = "chat.input.submit", text = "first" },
+  }
+  for_chat.from_plugin {
+    type = "event",
+    from = "nefor-tui",
+    body = { kind = "chat.input.submit", text = "queued-2" },
+  }
+  for_chat.from_plugin {
+    type = "event",
+    from = "nefor-tui",
+    body = { kind = "chat.input.submit", text = "queued-3" },
+  }
+  -- Reset clears queue + current_run_id.
+  for_chat.from_plugin {
+    type = "event",
+    from = "nefor-tui",
+    body = { kind = "chat.reset" },
+  }
+  _test.calls_clear()
+  -- Now drive graph.run_complete (orchestrator's old run_id was
+  -- cleared by chat.reset, so this matches nothing — but we want to
+  -- confirm the queue is empty independently of run_complete). Fire
+  -- a fresh submit and assert the dispatched run carries "fresh",
+  -- NOT "queued-2" (which would mean the queue leaked across reset).
+  for_chat.from_plugin {
+    type = "event",
+    from = "nefor-tui",
+    body = { kind = "chat.input.submit", text = "fresh" },
+  }
+  -- Inspect the reasoner-graph.run envelope's user_text. The graph
+  -- builder embeds the prompt inside the wrap node's args.
+  local function find_run_user_text(calls)
+    for _, c in ipairs(calls) do
+      if c.body.kind == "reasoner-graph.run" and type(c.body.graph) == "table" then
+        for _, node in ipairs(c.body.graph.nodes or {}) do
+          if node.id == "wrap" and type(node.args) == "table" then
+            return node.args.prompt
+          end
+        end
+      end
+    end
+    return nil
+  end
+  local user_text = find_run_user_text(decode_calls())
+  assert_eq(user_text, "fresh",
+    "after chat.reset, queue must be empty: dispatched user_text was '"
+    .. tostring(user_text) .. "', expected 'fresh'")
+end
+
+-- (3.D) session_end teardown clears the queue (resume implies discard).
+do
+  local for_chat = fresh_for_chat()
+  for_chat.from_plugin {
+    type = "event",
+    from = "nefor-tui",
+    body = { kind = "chat.input.submit", text = "first" },
+  }
+  for_chat.from_plugin {
+    type = "event",
+    from = "nefor-tui",
+    body = { kind = "chat.input.submit", text = "stranded" },
+  }
+  -- Session swap.
+  _test.fire_bus("sessions.session_end", { session_id = "old" })
+  _test.calls_clear()
+  -- Fresh submit after session swap. The queue should be empty —
+  -- the previously queued "stranded" must NOT dispatch.
+  for_chat.from_plugin {
+    type = "event",
+    from = "nefor-tui",
+    body = { kind = "chat.input.submit", text = "post-swap" },
+  }
+  -- Walk reasoner-graph.run envelopes; assert none carries "stranded".
+  for _, c in ipairs(decode_calls()) do
+    if c.body.kind == "reasoner-graph.run" and type(c.body.graph) == "table" then
+      for _, node in ipairs(c.body.graph.nodes or {}) do
+        if node.id == "wrap" and type(node.args) == "table" then
+          local txt = node.args.prompt
+          assert(txt ~= "stranded",
+            "session_end must clear pending_user_inputs; saw stranded dispatch")
+        end
+      end
+    end
+  end
+end
+
+-- ------------------------------------------------------------------
+-- Issue 2 — cancel_all no longer emits the [interrupted: chat=...] line
+-- ------------------------------------------------------------------
+do
+  agentic_workflow._reset()
+  agentic_workflow.setup { provider = "ollama", model = "test-model" }
+  _test.set_plugins({ "ollama", "reasoner-graph", "nefor-tui" })
+  _test.calls_clear()
+  -- Trigger cancel_all; ensure the developer-telemetry summary
+  -- (`[interrupted: chat=N sub-graphs=N deferred=N]`) does NOT appear
+  -- as a chat.message.append on the bus.
+  agentic_workflow.cancel_all()
+  for _, c in ipairs(decode_calls()) do
+    if c.body.kind == "chat.message.append" and type(c.body.text) == "string" then
+      assert(string.find(c.body.text, "interrupted: chat=", 1, true) == nil,
+        "cancel_all must not emit '[interrupted: chat=...]' to the user; saw "
+        .. c.body.text)
+      assert(string.find(c.body.text, "sub-graphs=", 1, true) == nil,
+        "cancel_all must not emit 'sub-graphs=' counter; saw " .. c.body.text)
+    end
+  end
+end
+
 print("agentic_workflow_test: ok")

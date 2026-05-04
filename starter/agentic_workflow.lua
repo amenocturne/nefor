@@ -90,6 +90,13 @@ local current_state = nil
 -- new chat run. Each entry: { text = "<formatted>" }.
 local deferred_queue = {}
 
+-- Queued user inputs submitted while the orchestrator was mid-turn.
+-- FIFO order; flushed in `flush_pending_user_inputs` after the current
+-- run completes. Cleared on chat.reset, session_end teardown, and
+-- cancel_all so a stuck run can't strand pending input forever.
+-- Each entry: a plain string (the user-typed text).
+local pending_user_inputs = {}
+
 -- pending firings keyed by run_id:firing_id (provider/tool-gate paths).
 local pending = {}
 
@@ -850,6 +857,31 @@ local function flush_deferred()
   submit_orchestrator_run(entry.text)
 end
 
+-- Drain one pending user-input from the queue and dispatch it as the
+-- next orchestrator run. Called after `current_run_id` clears (the
+-- only signal that the orchestrator is ready for fresh input).
+--
+-- Order vs. flush_deferred: callers run flush_deferred FIRST so a
+-- sub-graph completion that landed during the prior turn gets surfaced
+-- to the model before fresh user input. If flush_deferred submits a
+-- run, this is a no-op (current_run_id is set again); the next
+-- run_complete will retry.
+--
+-- Stuck-queue safety: every state-clear path (chat.reset, session_end,
+-- cancel_all) drops `pending_user_inputs` so a run that errors without
+-- emitting graph.run_complete can't strand the queue. The user can
+-- always re-submit; we'd rather drop than dispatch surprise turns.
+local function flush_pending_user_inputs()
+  if current_run_id ~= nil then return end
+  if #pending_user_inputs == 0 then return end
+  local text = table.remove(pending_user_inputs, 1)
+  nefor.log.info("agentic_workflow: flushing queued user input", {
+    text_preview = string.sub(text, 1, 80),
+    queue_remaining = #pending_user_inputs,
+  })
+  submit_orchestrator_run(text)
+end
+
 -- ------------------------------------------------------------------
 -- transform factories
 -- ------------------------------------------------------------------
@@ -1031,6 +1063,7 @@ function M.for_reasoner_graph()
 
         if status == "success" then
           flush_deferred()
+          flush_pending_user_inputs()
           return env
         end
 
@@ -1060,6 +1093,7 @@ function M.for_reasoner_graph()
           text = err_text,
         })
         flush_deferred()
+        flush_pending_user_inputs()
         return env
       end
 
@@ -1480,11 +1514,13 @@ function M.for_chat()
         had_state = current_state ~= nil,
         prior_chat_id = type(current_state) == "table" and current_state.chat_id or nil,
         dropped_deferred = #deferred_queue,
+        dropped_pending_inputs = #pending_user_inputs,
         had_run = current_run_id ~= nil,
       })
       current_state = nil
       current_run_id = nil
       deferred_queue = {}
+      pending_user_inputs = {}
       return env
     end
 
@@ -1532,13 +1568,34 @@ function M.for_chat()
       seed_chat_id = type(current_state) == "table" and current_state.chat_id or nil,
       busy = current_run_id ~= nil,
       deferred_queued = #deferred_queue,
+      user_queued = #pending_user_inputs,
+    })
+
+    -- Emit the user message to the TUI as a transcript-bound event.
+    -- This is what makes the user's input visible across resume:
+    -- chat.message.append targeted at nefor-tui is persisted as a
+    -- step-origin entry the replay path can re-deliver. (chat.lua's
+    -- key.submit handler intentionally does NOT push the user message
+    -- locally — the bus is the single source of truth so live and
+    -- replayed views match exactly.)
+    emit("nefor-tui", {
+      kind = "chat.message.append",
+      role = "user",
+      text = text,
     })
 
     if current_run_id ~= nil then
+      -- Orchestrator is mid-turn: queue the input and surface a
+      -- non-destructive note so the user knows the message was
+      -- accepted, not dropped. Old behavior rejected with a
+      -- "[orchestrator busy]" message; that lost the user's text.
+      pending_user_inputs[#pending_user_inputs + 1] = text
       emit("nefor-tui", {
         kind = "chat.message.append",
         role = "system",
-        text = "[orchestrator busy — wait for the current turn to finish]",
+        text = string.format(
+          "[queued — will dispatch when current turn finishes (%d in queue)]",
+          #pending_user_inputs),
       })
       return nil
     end
@@ -1686,6 +1743,7 @@ function M.setup(opts)
     tool_id_to_key     = {}
     current_state      = nil
     deferred_queue     = {}
+    pending_user_inputs = {}
     -- Broadcast chat.reset so the provider's Chats map clears and the
     -- TUI transcript empties. Provider's `<prefix>.reset` translation
     -- already exists in for_provider's outer_to.
@@ -1803,7 +1861,9 @@ function M.cancel_all()
   end
   local sub_n = cancel_all_pending_runs()
   local dropped = #deferred_queue
+  local dropped_inputs = #pending_user_inputs
   deferred_queue = {}
+  pending_user_inputs = {}
   -- Drop the in-flight provider/tool-gate bookkeeping too. A late
   -- chat.complete.result for a chat we just cancelled would otherwise
   -- emit a stale graph.node_result for a run_id reasoner-graph already
@@ -1814,19 +1874,26 @@ function M.cancel_all()
   chat_id_to_key = {}
   chat_id_stream_visible = {}
   tool_id_to_key = {}
+  -- This summary used to be emitted as a `chat.message.append` system
+  -- line ("[interrupted: chat=N sub-graphs=N deferred=N]"). It's
+  -- developer telemetry — counts of cancelled internal units, no
+  -- user-actionable signal — so it leaks into the transcript without
+  -- value (and is even surfaced verbatim through replay because it's
+  -- a normal append envelope). Demoted to log-only; user-visible
+  -- "interrupt" feedback comes from per-turn signals
+  -- (e.g. mock-plugin adapter's `[interrupted]` marker).
   nefor.log.info("agentic_workflow: cancel_all", {
     cancelled_chat_run = cancelled_chat,
     cancelled_sub_runs = sub_n,
     dropped_deferred = dropped,
+    dropped_pending_inputs = dropped_inputs,
   })
-  emit("nefor-tui", {
-    kind = "chat.message.append",
-    role = "system",
-    text = string.format(
-      "[interrupted: chat=%s sub-graphs=%d deferred=%d]",
-      cancelled_chat and "1" or "0", sub_n, dropped),
-  })
-  return { chat = cancelled_chat, sub_graphs = sub_n, deferred = dropped }
+  return {
+    chat = cancelled_chat,
+    sub_graphs = sub_n,
+    deferred = dropped,
+    pending_inputs = dropped_inputs,
+  }
 end
 
 -- /new handler: broadcast chat.reset (openai-provider clears its chat
@@ -1837,6 +1904,7 @@ function M.new_chat()
   current_state = nil
   current_run_id = nil
   deferred_queue = {}
+  pending_user_inputs = {}
   emit(nil, { kind = "chat.reset" })
 end
 
@@ -1923,6 +1991,7 @@ function M._reset()
   current_run_id = nil
   current_state = nil
   deferred_queue = {}
+  pending_user_inputs = {}
   pending = {}
   chat_id_to_key = {}
   tool_id_to_key = {}
