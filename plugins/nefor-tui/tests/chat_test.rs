@@ -2228,8 +2228,16 @@ impl Drop for ResumeEnv {
 #[test]
 fn slash_resume_opens_session_picker_popup() {
     let env = ResumeEnv::new();
-    env.write_session("aaaa1111-1111-1111-1111-111111111111", "2026-05-01T10:00:00.000Z", Some("first prompt"));
-    env.write_session("bbbb2222-2222-2222-2222-222222222222", "2026-05-02T11:00:00.000Z", Some("second prompt"));
+    env.write_session(
+        "aaaa1111-1111-1111-1111-111111111111",
+        "2026-05-01T10:00:00.000Z",
+        Some("first prompt"),
+    );
+    env.write_session(
+        "bbbb2222-2222-2222-2222-222222222222",
+        "2026-05-02T11:00:00.000Z",
+        Some("second prompt"),
+    );
 
     let mut engine = Engine::new(120, 30).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
@@ -2357,7 +2365,11 @@ fn slash_resume_with_arg_writes_sidechannel_and_exits() {
     for ch in cmd.chars() {
         // `key()` uses the raw character as the keypress name. For space,
         // the engine's input router synthesizes "key.space" — match that.
-        let n = if ch == ' ' { "space".to_string() } else { ch.to_string() };
+        let n = if ch == ' ' {
+            "space".to_string()
+        } else {
+            ch.to_string()
+        };
         engine.handle_key(key(&n)).expect("type");
     }
     engine.handle_key(key("enter")).expect("enter");
@@ -2440,10 +2452,11 @@ fn mouse_drag_copies_selection_and_shows_toast() {
         })
         .expect("up");
 
-    // Advance past the toast's slide-in animation window so the
-    // assertion sees the fully-sized toast (otherwise the first frame
-    // is height=1 and only the top border rule renders, no text yet).
-    engine.advance_time(Duration::from_millis(250));
+    // Render once — the slide animation translates horizontally rather
+    // than clipping height, so the toast text is on screen from frame
+    // one. Skipping the previous `advance_time(250)` keeps the gap
+    // between dispatch and assertion small enough that real wall-clock
+    // drift on a loaded CI box can't push past the 2 s default TTL.
     let _ = render_str(&mut engine);
     let _ = engine.take_emit_queue();
     let post = engine.snapshot();
@@ -2460,7 +2473,7 @@ fn mouse_drag_copies_selection_and_shows_toast() {
 }
 
 /// Toast layout assertions: the bordered toast pill anchors to the
-/// bottom-left of the BODY area only — overlaying transcript content
+/// bottom-right of the BODY area only — overlaying transcript content
 /// at the bottom rows of the body region, but never covering the
 /// input field or statusline below it. Statusline placeholder remains
 /// visible after the toast appears.
@@ -2533,9 +2546,10 @@ fn mouse_drag_toast_does_not_cover_input_or_statusline() {
         })
         .expect("up");
 
-    // Advance past the toast's slide-in animation so the toast
-    // renders at full height in the snapshot.
-    engine.advance_time(Duration::from_millis(250));
+    // Render once — the horizontal slide leaves the toast at full
+    // height/width from frame one, so we don't need to advance the
+    // synthetic clock past the enter window. Doing so unnecessarily
+    // narrows the wall-clock budget against the 2 s default TTL.
     let _ = render_str(&mut engine);
     let _ = engine.take_emit_queue();
     let post = engine.snapshot();
@@ -2552,5 +2566,69 @@ fn mouse_drag_toast_does_not_cover_input_or_statusline() {
     assert!(
         post.contains(&label),
         "expected toast label `{label}` somewhere in frame: {post:?}"
+    );
+}
+
+/// Toast slide animation: the pill enters from the right edge and
+/// translates leftward to its rest position over the enter window.
+/// We sample a frame mid-enter (when the slide is still in progress)
+/// and another at rest, then assert the pill's left border `╭` glyph
+/// sits in different columns. This proves the animation is a real
+/// horizontal translation of the (full-size) pill, not a width clip
+/// or sudden snap into place.
+///
+/// Triggers via `chat.toast` (rather than mouse drag) so the TTL is
+/// long enough that real wall-clock drift between snapshots doesn't
+/// race the toast's expiry — `tui.now_ms` adds wall-clock elapsed on
+/// top of the synthetic offset, and a slow CI run can push a 2000 ms
+/// default TTL toast out of view before the rest snapshot is taken.
+#[test]
+fn chat_toast_slides_horizontally_during_enter() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    // 60-second TTL — plenty of headroom for slow test runs.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.toast",
+            "text": "slide-test",
+            "ttl_ms": 60_000,
+        }),
+    );
+
+    // Helper: column of the toast pill's left border `╭` glyph in the
+    // current frame, or None if the toast isn't visible. The pill's
+    // top rule sits on a row above the input box; the input box's own
+    // `╭` lives further down. find_map iterates top-to-bottom so the
+    // first match is the toast's top-left corner.
+    fn pill_left_col(snap: &str) -> Option<usize> {
+        snap.lines().find_map(|l| l.find('╭'))
+    }
+
+    // Sample mid-enter — past the very first frames where ease-out
+    // rounds inset to 0, but before the curve walks all the way to
+    // rest. ease_out_cubic(50/220) ≈ 0.59, so slide_offset ≈ 1.18 →
+    // inset = 1 (pill sits 1 column left of flush-right).
+    engine.advance_time(Duration::from_millis(50));
+    let _ = render_str(&mut engine);
+    let early = engine.snapshot();
+    let early_col = pill_left_col(&early)
+        .unwrap_or_else(|| panic!("toast invisible mid-enter; snapshot:\n{early}"));
+
+    // Sample at rest — past the enter window. inset = TOAST_REST_INSET
+    // (2 cells), so the pill sits 2 columns left of flush-right.
+    engine.advance_time(Duration::from_millis(250));
+    let _ = render_str(&mut engine);
+    let rest = engine.snapshot();
+    let rest_col = pill_left_col(&rest)
+        .unwrap_or_else(|| panic!("toast invisible at rest; snapshot:\n{rest}"));
+
+    // The visible translation: rest_col < early_col (pill moved left).
+    // Asserts a true horizontal offset — full-size pill, no clipping.
+    assert!(
+        rest_col < early_col,
+        "expected pill to slide leftward into rest position; \
+         early_col = {early_col}, rest_col = {rest_col}"
     );
 }

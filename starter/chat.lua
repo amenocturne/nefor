@@ -1471,26 +1471,78 @@ local function popup_model_picker(state)
   }
 end
 
--- Toast: full-width single-line banner anchored at the bottom row,
--- replacing the statusline visually for the toast's lifetime. Auto-
--- dismisses on `expires_at_ms`. The text leaf owns its full allocated
--- rect (engine paints trailing cells with the text's own style), so
--- the bg colour band reaches edge-to-edge — no per-row main_column
--- chars peek through.
-local TOAST_FG          = "#88ccff"
-local TOAST_BORDER      = { fg = "#7faaaa" }   -- dim cyan rail to match blockquote palette
-local TOAST_FULL_HEIGHT = 5    -- ╭─╮ + blank + text + blank + ╰─╯
-local TOAST_ENTER_MS    = 180
-local TOAST_EXIT_MS     = 180
-
--- Inline toast: bordered pill anchored bottom-left of the body area
+-- Toast = ephemeral, non-blocking (e.g., "copied N chars").
+-- Popup = blocking, requires user input (esc) for dismissal.
+-- Don't blur this distinction.
+--
+-- Inline toast: bordered pill anchored bottom-RIGHT of the body area
 -- (overlaying the transcript only — never covers the input or
--- statusline). Animates in/out by clipping its height from the bottom
--- via `tui.constrained { max_height }` over the `TOAST_ENTER_MS` /
--- `TOAST_EXIT_MS` windows. The render-loop keepalive (see
+-- statusline). Auto-dismisses on `expires_at_ms`. The text leaf owns
+-- its full allocated rect (engine paints trailing cells with the
+-- text's own style), so the bg colour band reaches edge-to-edge — no
+-- per-row main_column chars peek through.
+--
+-- Animation: translate-only horizontal slide. The pill keeps full
+-- size throughout (no width clip, no height clip). On enter the pill
+-- slides leftward from the right edge to its rest position over
+-- `TOAST_ENTER_MS` with ease-out cubic; on exit it mirrors back over
+-- `TOAST_EXIT_MS` with ease-in cubic. The render-loop keepalive (see
 -- `render_keepalive`) ensures `tui.now_ms()` re-evaluates each frame
--- so the slide is smooth and the toast actually disappears at
--- `expires_at_ms` rather than freezing on the last shown state.
+-- so the slide is smooth and the toast disappears at `expires_at_ms`
+-- rather than freezing on the last shown state.
+--
+-- `tui.anchored`'s offset is clamped to keep the pill on-screen, so
+-- "off-screen right" is approximated by the rest position sitting
+-- `TOAST_REST_INSET` cells inward from the right edge — the slide is
+-- visible across that inset distance. The translation is real (no
+-- clipping), just bounded by the parent rect.
+local TOAST_FG_INFO        = "#88ccff"
+local TOAST_BORDER_INFO    = { fg = "#7faaaa" }   -- dim cyan rail to match blockquote palette
+-- warn/error variants reserved; only info wired by current call sites.
+-- Reference the popup warn/error palette so toast variants line up
+-- with the rest of the chrome when later call sites adopt them.
+local TOAST_FG_WARN        = C.status_warn
+local TOAST_BORDER_WARN    = { fg = C.status_warn }
+local TOAST_FG_ERROR       = C.status_danger
+local TOAST_BORDER_ERROR   = { fg = C.status_danger }
+local TOAST_FULL_HEIGHT    = 5    -- ╭─╮ + blank + text + blank + ╰─╯
+local TOAST_ENTER_MS       = 220
+local TOAST_EXIT_MS        = 220
+-- Cells of inset from the right edge at rest. The visible slide
+-- covers exactly this distance — pill enters by sliding leftward
+-- `TOAST_REST_INSET` cells from flush-right to its rest position.
+local TOAST_REST_INSET     = 2
+
+-- Easing helpers. Domain [0,1]; clamp before applying.
+local function clamp01(t)
+  if t < 0 then return 0 end
+  if t > 1 then return 1 end
+  return t
+end
+local function ease_out_cubic(t)
+  t = clamp01(t)
+  local u = 1 - t
+  return 1 - u * u * u
+end
+local function ease_in_cubic(t)
+  t = clamp01(t)
+  return t * t * t
+end
+
+-- Resolve the (fg, border) palette for a toast level. Unknown levels
+-- fall back to "info" so a malformed envelope doesn't crash render.
+local function toast_palette(level)
+  if level == "warn" then
+    return TOAST_FG_WARN, TOAST_BORDER_WARN
+  elseif level == "error" then
+    return TOAST_FG_ERROR, TOAST_BORDER_ERROR
+  else
+    -- "info" or anything else → info palette. Current call sites only
+    -- wire info; warn/error variants are reserved for future use.
+    return TOAST_FG_INFO, TOAST_BORDER_INFO
+  end
+end
+
 local function inline_toast(state)
   if not state.toast then return nil end
   local now     = tui.now_ms()
@@ -1498,21 +1550,26 @@ local function inline_toast(state)
   local expires = state.toast.expires_at_ms or (created + 2000)
   if now >= expires then return nil end
 
-  local elapsed = now - created
+  local elapsed   = now - created
   local time_left = expires - now
-  local height
+
+  -- Slide progress in cells. `slide_offset` ∈ [0, TOAST_REST_INSET]
+  -- where 0 = flush-right (entering / leaving the screen edge) and
+  -- TOAST_REST_INSET = at rest position. Pill is always full size.
+  local slide_offset
   if elapsed < TOAST_ENTER_MS then
-    -- entering: 0 → TOAST_FULL_HEIGHT
-    local frac = elapsed / TOAST_ENTER_MS
-    height = math.max(1, math.floor(TOAST_FULL_HEIGHT * frac + 0.5))
+    -- Enter: slide leftward from flush-right to rest, ease-out cubic.
+    local t = elapsed / TOAST_ENTER_MS
+    slide_offset = TOAST_REST_INSET * ease_out_cubic(t)
   elseif time_left < TOAST_EXIT_MS then
-    -- exiting: TOAST_FULL_HEIGHT → 0
-    local frac = time_left / TOAST_EXIT_MS
-    height = math.max(0, math.floor(TOAST_FULL_HEIGHT * frac + 0.5))
+    -- Exit: slide rightward from rest back to flush-right, ease-in cubic.
+    local t = 1 - (time_left / TOAST_EXIT_MS)
+    slide_offset = TOAST_REST_INSET * (1 - ease_in_cubic(t))
   else
-    height = TOAST_FULL_HEIGHT
+    slide_offset = TOAST_REST_INSET
   end
-  if height <= 0 then return nil end
+  -- Round to whole cells. `tui.anchored` offset is integer-typed.
+  local inset = math.floor(slide_offset + 0.5)
 
   local text = state.toast.text or ""
   -- Pill width = text + 8 cells of internal padding (4 each side via
@@ -1521,25 +1578,31 @@ local function inline_toast(state)
   -- screen.
   local pill_w = math.min(60, #text + 8)
 
+  local fg, border = toast_palette(state.toast.level)
+
   local body = tui.column {
     gap = 0,
     children = {
       tui.text { content = "", wrap = "none" },
       tui.align {
         alignment = "center",
-        child = tui.text { content = text, style = { fg = TOAST_FG }, wrap = "none" },
+        child = tui.text { content = text, style = { fg = fg }, wrap = "none" },
       },
       tui.text { content = "", wrap = "none" },
     },
   }
 
+  -- BottomRight anchor: positive offset_x clamps at the right edge,
+  -- negative shifts leftward. Rest = -TOAST_REST_INSET (inset from
+  -- right). During enter, offset_x animates from 0 (flush right)
+  -- toward -TOAST_REST_INSET; during exit it animates back to 0.
   return tui.anchored {
-    anchor   = "bottom-left",
-    offset_x = 0,
+    anchor   = "bottom-right",
+    offset_x = -inset,
     offset_y = 0,
     width    = pill_w,
-    height   = height,
-    child = bordered_box(body, TOAST_BORDER, "toast-box"),
+    height   = TOAST_FULL_HEIGHT,
+    child = bordered_box(body, border, "toast-box"),
   }
 end
 
@@ -1793,8 +1856,8 @@ local function view(state)
     },
   }
 
-  -- Toast overlays the bottom-left of the body area only (above the
-  -- input + statusline). Anchored bottom-left of this stack puts it
+  -- Toast overlays the bottom-right of the body area only (above the
+  -- input + statusline). Anchored bottom-right of this stack puts it
   -- there without ever covering the input or statusline.
   local body_with_toast = tui.stack {
     children = compact {
@@ -2753,8 +2816,17 @@ local function update(msg, state)
   if kind == "chat.toast" then
     local now = tui.now_ms()
     local ttl = msg.ttl_ms or 2000
+    -- `level` ∈ "info" | "warn" | "error". Defaults to "info" so the
+    -- existing call sites (which never set the field) keep their
+    -- current cyan styling. warn / error variants reserved for future
+    -- use; the render pipeline accepts them, no caller wires them yet.
     return shallow_merge(state, {
-      toast = { text = msg.text or "", created_at_ms = now, expires_at_ms = now + ttl },
+      toast = {
+        text = msg.text or "",
+        level = msg.level or "info",
+        created_at_ms = now,
+        expires_at_ms = now + ttl,
+      },
     }), {}
   end
 
@@ -2885,13 +2957,26 @@ local function update(msg, state)
   if kind == "mouse.selection" then
     local text = msg.text or ""
     if #text > 0 then
-      tui.copy_to_clipboard(text)
+      -- Read `now` BEFORE calling `tui.copy_to_clipboard`. The clipboard
+      -- binding hits a system-wide pasteboard (NSPasteboard on macOS,
+      -- X/Wayland selections on Linux), which can block tens to hundreds
+      -- of ms under contention. `tui.now_ms` is the cached frame clock
+      -- the engine installs at the start of each dispatch — same value
+      -- regardless of read order — but reading it up-front signals
+      -- intent and survives a future refactor where the binding
+      -- refreshes the clock mid-dispatch.
       local now = tui.now_ms()
+      tui.copy_to_clipboard(text)
       return shallow_merge(state, {
         toast = {
           text = string.format("copied %d chars", #text),
           created_at_ms = now,
-          expires_at_ms = now + 2000,
+          -- 4 s lifetime: covers the 2 s default plus headroom for the
+          -- clipboard call's wall-clock cost. Without this padding the
+          -- toast can wink out before the user's eye registers it on
+          -- slow / contended systems (and tests racing the same path
+          -- flake intermittently).
+          expires_at_ms = now + 4000,
         },
       }), {}
     end
