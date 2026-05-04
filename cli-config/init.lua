@@ -28,13 +28,21 @@ package.path = table.concat({
   package.path,
 }, ";")
 
-local ncp = require("ncp")
+local ncp      = require("ncp")
+local sessions = require("sessions")
 
--- Forward the engine's `current_log` to ncp.step. The engine is
--- session-blind; cross-run resume is owned by `starter/sessions.lua`.
-function step(current_log)
-  ncp.step(current_log)
+-- Forward the engine's `current_log` to ncp.dispatch. The engine is
+-- session-blind; cross-run resume + jsonl persistence are owned by
+-- `starter/sessions.lua` (loaded above and brought up below).
+function dispatch(current_log)
+  ncp.dispatch(current_log)
 end
+
+-- Mint a fresh session, install the persistence hook + resume listener,
+-- emit `sessions.session_start`. Done before any plugin spawn so the
+-- jsonl persistence is already wired when the first envelope routes.
+sessions.init()
+sessions.handle_shutdown()
 
 local agentic_workflow = require("agentic_workflow")
 local agentic_cli      = require("agentic_cli")

@@ -4,10 +4,9 @@
 //!
 //! 1. Parse CLI (`--config <DIR>`, optional `plugin` subcommand).
 //! 2. Resolve the config dir, initialize tracing to a file under it.
-//! 3. Open a fresh session log for engine-stamped persistence.
-//! 4. Boot the Lua VM with a [`BrokerOps`] routing sink and run
-//!    `init.lua`. Cache the global `step` function — fatal if missing.
-//! 5. Branch on [`cli::EngineMode`]:
+//! 3. Boot the Lua VM with a [`BrokerOps`] routing sink and run
+//!    `init.lua`. Cache the global `dispatch` function — fatal if missing.
+//! 4. Branch on [`cli::EngineMode`]:
 //!    - `Tui`: build a [`Broker`], spawn every registered plugin, install
 //!      a `ctrl_c` shutdown hook, and run the broker until it exits.
 //!    - `PluginList`: print the engine version + every plugin that
@@ -20,10 +19,10 @@
 //!      shut down.
 //!
 //! Per D-02 the engine is pure glue: no plugins registered → log a message
-//! and exit cleanly. No UI, no bundled harness. The engine is session-blind:
-//! it generates a fresh per-run id only to namespace its own log file. Any
-//! cross-session resumption / impersonation is the responsibility of Lua
-//! glue in `init.lua`.
+//! and exit cleanly. No UI, no bundled harness. The engine is fully
+//! session-blind: it owns no session id, writes no on-disk log, and does
+//! not parse envelope bodies. Cross-session persistence / resumption /
+//! impersonation are the responsibility of `starter/sessions.lua`.
 
 mod cli;
 mod config;
@@ -39,7 +38,6 @@ mod session;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
-use nefor_protocol::Timestamp;
 
 use crate::cli::{engine_mode_from_cli, EngineMode};
 use crate::error::NeforError;
@@ -50,7 +48,6 @@ use crate::ncp::{
     resolve_plugin_root, spawn_plugin, Broker, BrokerOps, BrokerShared, PluginRegistry, PluginSpec,
     SharedPluginRegistry,
 };
-use crate::session::{SessionHeader, SessionId, SessionWriter};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -72,15 +69,10 @@ async fn main() -> anyhow::Result<()> {
         "nefor starting"
     );
 
-    // Open the session file up-front so the broker's shared state can own it
-    // from the moment it exists. The id is purely a filename namespace — the
-    // engine itself is session-blind; any cross-run resumption is Lua's job.
-    let session_id = SessionId::new();
-    let header = SessionHeader::new(session_id.clone(), Timestamp::now());
-    let session = SessionWriter::create(header).context("opening session log")?;
-    tracing::info!(session_id = %session_id, path = %session.path().display(), "session log opened");
-
-    let shared = Arc::new(Mutex::new(BrokerShared::new(session)));
+    // The engine owns no session id and writes no jsonl — those concerns
+    // live in `starter/sessions.lua`. The broker's shared state is purely
+    // an in-memory event log + connection map.
+    let shared = Arc::new(Mutex::new(BrokerShared::new()));
     let engine_ops: Arc<dyn EngineOps> = Arc::new(BrokerOps::new(Arc::clone(&shared)));
 
     let bus = Arc::new(EventBus::new());
@@ -124,10 +116,10 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(path = %init_lua.display(), "no init.lua at expected path");
     }
 
-    // Cache step now — fatal if init.lua didn't define one.
-    host.cache_step()
+    // Cache dispatch now — fatal if init.lua didn't define one.
+    host.cache_dispatch()
         .map_err(NeforError::from)
-        .context("caching step function from init.lua")?;
+        .context("caching dispatch function from init.lua")?;
 
     match mode {
         EngineMode::Tui => run_tui(host, plugins, shared, args.plugin_dir.clone()).await,

@@ -126,6 +126,203 @@ fn jsonl_excludes_session_control_events() {
     }
 }
 
+#[test]
+fn inbound_outbound_cycle_lands_in_jsonl() {
+    // Engine-side persistence is gone: starter/sessions.lua is the sole
+    // writer. Drive a realistic inbound→broadcast cycle through the
+    // persistence hook and assert the jsonl mirrors what the broker
+    // would feed it. The shape is the same `{ts, origin, target?,
+    // payload}` row the engine used to write, so chat.lua's session
+    // picker keeps working unchanged.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_HOME").ok();
+    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+
+    lua.load(
+        r#"
+        sessions = require("sessions")
+        sessions.init()
+        "#,
+    )
+    .exec()
+    .expect("sessions init");
+    let session_path: String = lua
+        .load(r#"return sessions.current_path()"#)
+        .eval()
+        .expect("current_path");
+
+    // Three realistic envelopes the broker would have stamped + handed
+    // to dispatch_subscriptions: an inbound chat.input.submit, an
+    // outbound (Origin::Step) chat.input.echo, and another inbound
+    // chat.message.append. The persistence hook receives them as the
+    // same log-entry shape the engine used to clone into the session
+    // writer.
+    lua.load(
+        r#"
+        local json = nefor.json
+        local function entry(origin, target, body)
+            local payload = json.encode({ type = "event", body = body })
+            local e = { ts = "2026-05-04T00:00:00.000Z", origin = origin, payload = payload }
+            if target ~= nil then e.target = target end
+            return e
+        end
+        sessions._persist_envelope(entry("nefor-tui", nil,
+            { kind = "chat.input.submit", text = "hello" }))
+        sessions._persist_envelope(entry("step", "nefor-tui",
+            { kind = "chat.message.append", role = "user", text = "hello" }))
+        sessions._persist_envelope(entry("ollama", nil,
+            { kind = "chat.stream.end", chat_id = "c1" }))
+        "#,
+    )
+    .exec()
+    .expect("drive persistence");
+
+    let body = std::fs::read_to_string(&session_path).expect("read jsonl");
+    let lines: Vec<&str> = body.lines().collect();
+    // Header + 3 entries.
+    assert_eq!(
+        lines.len(),
+        4,
+        "expected header + 3 entries, got {}: {body}",
+        lines.len()
+    );
+    // Header carries the marker.
+    assert!(
+        lines[0].contains("\"_session\":true"),
+        "header missing: {}",
+        lines[0]
+    );
+    // Entries carry the engine-shape fields: ts, origin, optional
+    // target, payload.
+    assert!(
+        lines[1].contains("\"origin\":\"nefor-tui\"")
+            && lines[1].contains("chat.input.submit")
+            && !lines[1].contains("\"target\""),
+        "inbound entry shape wrong: {}",
+        lines[1]
+    );
+    assert!(
+        lines[2].contains("\"origin\":\"step\"")
+            && lines[2].contains("\"target\":\"nefor-tui\"")
+            && lines[2].contains("chat.message.append"),
+        "outbound entry shape wrong: {}",
+        lines[2]
+    );
+    assert!(
+        lines[3].contains("\"origin\":\"ollama\"") && lines[3].contains("chat.stream.end"),
+        "second inbound entry shape wrong: {}",
+        lines[3]
+    );
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
+        None => std::env::remove_var("NEFOR_DATA_HOME"),
+    }
+}
+
+#[test]
+fn resume_phase_hooks_fire_synchronously_before_emit() {
+    // The one-tick replay-leak fix: `sessions.on_resume_phase(phase, fn)`
+    // registers a synchronous callback that fires INSIDE
+    // `sessions.resume()` before the corresponding `emit_control`
+    // broadcast. Asserts the order:
+    //   1. session_end hook runs.
+    //   2. session_end emit.
+    //   3. session_start hook runs.
+    //   4. session_start emit.
+    //   5. (no replay file → no replayed entries here).
+    //   6. resume_done hook runs.
+    //   7. resume_done emit.
+    //
+    // We verify by recording timestamps in a Lua-side trace log: each
+    // hook records "phase:<name>", and we monkey-patch `nefor.engine.send`
+    // to also append "emit:<kind>". The final order tells us the sync
+    // hook ran before the broadcast.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_HOME").ok();
+    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+
+    // Replace engine.send with a recorder that decodes the payload and
+    // appends `emit:<kind>` to the trace.
+    lua.load(
+        r#"
+        _trace = {}
+        local json = nefor.json
+        nefor.engine.send = function(payload, _target)
+            local ok, decoded = pcall(json.decode, payload)
+            if ok and type(decoded) == "table"
+               and type(decoded.body) == "table"
+               and type(decoded.body.kind) == "string" then
+                _trace[#_trace + 1] = "emit:" .. decoded.body.kind
+            end
+        end
+        "#,
+    )
+    .exec()
+    .expect("install send recorder");
+
+    lua.load(
+        r#"
+        sessions = require("sessions")
+        sessions.init()
+
+        sessions.on_resume_phase("session_end", function(_id)
+            _trace[#_trace + 1] = "phase:session_end"
+        end)
+        sessions.on_resume_phase("session_start", function(_id)
+            _trace[#_trace + 1] = "phase:session_start"
+        end)
+        sessions.on_resume_phase("resume_done", function(_id)
+            _trace[#_trace + 1] = "phase:resume_done"
+        end)
+
+        -- Clear the trace so we only see what resume() does.
+        _trace = {}
+
+        -- Drive a resume to a fresh id (target file doesn't exist, so
+        -- replay_jsonl is a no-op — exactly what we want for the order
+        -- assertion).
+        sessions.resume("11111111-2222-4333-8444-555555555555")
+        "#,
+    )
+    .exec()
+    .expect("drive resume");
+
+    let trace: Table = lua.globals().get("_trace").expect("_trace");
+    let len = trace.len().expect("len") as usize;
+    let ordered: Vec<String> = (1..=len)
+        .map(|i| trace.get::<String>(i).expect("trace entry"))
+        .collect();
+    let expected = vec![
+        "phase:session_end",
+        "emit:sessions.session_end",
+        "phase:session_start",
+        "emit:sessions.session_start",
+        "phase:resume_done",
+        "emit:sessions.resume_done",
+    ];
+    assert_eq!(
+        ordered.iter().map(String::as_str).collect::<Vec<_>>(),
+        expected,
+        "phase hooks must fire BEFORE the corresponding emit; got {ordered:?}"
+    );
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
+        None => std::env::remove_var("NEFOR_DATA_HOME"),
+    }
+}
+
 // Process-global lock to serialise tests that mutate NEFOR_DATA_HOME.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
