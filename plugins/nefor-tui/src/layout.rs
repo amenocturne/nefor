@@ -184,6 +184,7 @@ fn paint_text(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
         _ => return,
     };
     let rows = wrap_text(content, rect.width, wrap);
+    let written_rows = rows.len().min(rect.height as usize);
     for (i, line) in rows.into_iter().enumerate() {
         if i as u16 >= rect.height {
             break;
@@ -195,7 +196,47 @@ fn paint_text(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
         // allotted column count.
         let safe = enforce_width_contract(&line, rect.width);
         let row = rect.row.saturating_add(i as u16);
+        let row_w = string_width(&safe) as u16;
         write_run(out, row, rect.col, &safe, &style);
+        // Occlusion contract: a leaf text widget owns the entire rect
+        // its parent allocated, not just the cells the glyphs fall on.
+        // When the painted line is narrower than `rect.width`, blank
+        // out the trailing cells with the same style — this is what
+        // makes `tui.text { style = { bg = ... }}` a reliable solid
+        // overlay in stack composition. Without it, anything painted
+        // earlier (lower z-order) bleeds through the gap.
+        if row_w < rect.width {
+            let blank_col = rect.col.saturating_add(row_w);
+            let blank_w = rect.width - row_w;
+            blank_run(out, row, blank_col, blank_w, &style);
+        }
+    }
+    // Same idea on the cross axis: rows the wrap didn't produce still
+    // belong to this widget, so styled blanks fill the remainder.
+    for i in written_rows..rect.height as usize {
+        let row = rect.row.saturating_add(i as u16);
+        blank_run(out, row, rect.col, rect.width, &style);
+    }
+}
+
+/// Fill `[col, col + width)` on `row` with blank cells carrying `style`.
+/// Used by leaf widgets (text, spans, markdown) to enforce the
+/// "widget owns its rect" occlusion contract — trailing/leading cells
+/// the glyphs don't touch still get the widget's style so a bg paints
+/// as a solid rectangle.
+fn blank_run(buf: &mut FrameBuffer, row: u16, col_start: u16, width: u16, style: &Style) {
+    let row_idx = row as usize;
+    if row_idx >= buf.lines.len() {
+        return;
+    }
+    let line = &mut buf.lines[row_idx];
+    let start = col_start as usize;
+    let end = start.saturating_add(width as usize).min(line.cells.len());
+    for col in start..end {
+        line.cells[col] = Cell {
+            text: " ".to_string(),
+            style: *style,
+        };
     }
 }
 
@@ -2986,6 +3027,77 @@ mod tests {
             "a",
             "background preserved at top-right"
         );
+    }
+
+    /// Stacking a styled `tui.text` over a wider painted background must
+    /// occlude the cells the overlay's rect covers — not just the cells
+    /// the overlay's glyphs touch. This is the toast-popup pattern: a
+    /// short label inside a fixed-width anchored rect should hide
+    /// whatever was painted underneath, both within the glyph run and
+    /// the trailing blank columns of its rect.
+    #[test]
+    fn styled_text_occludes_full_rect_in_stack_overlay() {
+        use crate::desc::Color;
+
+        let bg = Color::Rgb(0x2a, 0x33, 0x40);
+        let fg = Color::Rgb(0x88, 0xcc, 0xff);
+        let toast_style = Style {
+            fg: Some(fg),
+            bg: Some(bg),
+            ..Style::default()
+        };
+
+        // Background: 12 'X' chars across one row.
+        // Overlay: anchored top-left, 8 cells wide, with text "hi"
+        // (2 chars). Cells 2..8 within the overlay rect are trailing
+        // blanks the leaf must paint with the toast bg.
+        let overlay = WidgetDescription::Anchored {
+            anchor: Anchor::TopLeft,
+            offset_x: 0,
+            offset_y: 0,
+            width: Dimension::Cells(8),
+            height: Dimension::Cells(1),
+            child: Box::new(WidgetDescription::Text {
+                content: "hi".into(),
+                style: Some(toast_style),
+                wrap: WrapMode::None,
+                key: None,
+            }),
+            key: None,
+        };
+        let desc = WidgetDescription::Stack {
+            key: None,
+            children: vec![text("XXXXXXXXXXXX"), overlay],
+        };
+        let buf = paint_root(desc, 12, 1);
+
+        // The text glyphs land in cols 0-1.
+        assert_eq!(cell_at(&buf, 0, 0), "h");
+        assert_eq!(cell_at(&buf, 0, 1), "i");
+        // Cols 2..8 are the trailing blanks of the overlay rect — they
+        // must carry the toast style (bg occludes), and the underlying
+        // 'X' chars must be gone.
+        for col in 2..8 {
+            let cell = &buf.lines[0].cells[col];
+            assert_eq!(
+                cell.text, " ",
+                "col {col} should be a blank, not bg-text leak"
+            );
+            assert_eq!(
+                cell.style.bg,
+                Some(bg),
+                "col {col} must inherit toast bg so the overlay occludes underneath"
+            );
+        }
+        // Cols 8..12 are outside the overlay rect — the background
+        // 'XXXX' is preserved (the overlay only owns its own rect).
+        for col in 8..12 {
+            assert_eq!(
+                cell_at(&buf, 0, col),
+                "X",
+                "col {col} (outside overlay rect) keeps background"
+            );
+        }
     }
 
     // ── Spans ────────────────────────────────────────────────────────

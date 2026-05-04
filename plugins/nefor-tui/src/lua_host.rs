@@ -586,6 +586,31 @@ fn install_tui(
     })?;
     tui.set("emit", emit_fn)?;
 
+    // ── Clipboard ────────────────────────────────────────────────────
+    //
+    // `tui.copy_to_clipboard(text)` writes `text` to the system
+    // clipboard via `arboard`. The engine ships the mechanism (the cell
+    // → text extraction + the binding); the policy of *whether* to copy
+    // a given selection lives in user-space Lua. Errors are swallowed
+    // and logged because clipboard backends are best-effort at the OS
+    // level (Wayland surfaces, headless CI, focus-stealing rules) and
+    // we don't want a failed copy to propagate as a Lua exception that
+    // crashes the dispatch.
+    let copy_fn = lua.create_function(|_, text: String| -> mlua::Result<()> {
+        match arboard::Clipboard::new() {
+            Ok(mut cb) => {
+                if let Err(e) = cb.set_text(text) {
+                    tracing::warn!(error = %e, "tui.copy_to_clipboard: set_text failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "tui.copy_to_clipboard: clipboard init failed");
+            }
+        }
+        Ok(())
+    })?;
+    tui.set("copy_to_clipboard", copy_fn)?;
+
     let queue_for_send_to = Arc::clone(&emit_queue);
     let send_to_fn = lua.create_function(
         move |lua, (target, body): (String, Value)| -> mlua::Result<()> {

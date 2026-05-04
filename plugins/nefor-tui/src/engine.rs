@@ -18,10 +18,10 @@ use crate::lua_host::{
 };
 use crate::mouse::{
     find_scrollable_path, hit_test, instance_at_path as mouse_instance_at_path, kind_string,
-    MouseKind, MouseMessage,
+    MouseKind, MouseMessage, SelectionRange,
 };
 use crate::reconciler::Reconciler;
-use crate::render::Renderer;
+use crate::render::{extract_selection_text, Renderer};
 use crate::scrollable::{scroll_by_signed, WHEEL_STEP_ROWS};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
@@ -66,6 +66,17 @@ pub struct Engine {
     /// written to stdout as one JSON-line `PluginOutgoing::event(body)`
     /// per entry.
     pending_emits: Vec<(Option<String>, JsonMap<String, JsonValue>)>,
+    /// Cell coordinates where the user pressed left-mouse-button down,
+    /// initiating a selection drag. `None` when no drag is in progress.
+    selection_start: Option<(u16, u16)>,
+    /// Most recent cell the cursor passed over while the button is held.
+    /// Updated on every `Drag` event. Identical to `selection_start` on
+    /// the initial `Down` so a click without movement still produces a
+    /// (degenerate) one-cell selection range.
+    selection_end: Option<(u16, u16)>,
+    /// `true` between `Down(left)` and the matching `Up(left)`. Drives
+    /// the renderer's highlight pass and gates `Drag` updates.
+    selecting: bool,
 }
 
 impl Engine {
@@ -82,6 +93,9 @@ impl Engine {
             clock_origin: Instant::now(),
             clock_offset_ms: 0,
             pending_emits: Vec::new(),
+            selection_start: None,
+            selection_end: None,
+            selecting: false,
         })
     }
 
@@ -388,7 +402,14 @@ impl Engine {
     /// - **Wheel + no scrollable** → bubble `mouse.wheel` to Lua so the
     ///   user can wire whatever fallback they want (e.g. carousel).
     /// - **Clicks** → always bubble, with the deepest keyed instance's
-    ///   user_key as `target_key` (hit-test result).
+    ///   user_key as `target_key` (hit-test result). A left-button
+    ///   `Down` ALSO opens a selection range — the renderer paints the
+    ///   covered cells with reverse-video while the drag is in progress.
+    /// - **Drag (left)** → update the in-flight selection range; does
+    ///   not bubble to Lua. Wheel + click handlers stay live.
+    /// - **Up (left)** → finalise the selection: extract the covered
+    ///   plain-text from the framebuffer, dispatch `mouse.selection` to
+    ///   Lua, clear the range. Does not bubble as a separate click.
     pub fn handle_mouse(&mut self, evt: MouseMessage) -> Result<(), TuiError> {
         // Wheel auto-scroll: try to absorb the event by mutating a
         // scrollable's state. If none is under the cursor, fall through
@@ -410,6 +431,36 @@ impl Engine {
                 self.needs_render = true;
                 return Ok(());
             }
+        }
+
+        // Selection mechanism: left-button Down records a candidate
+        // origin; the selection only "opens" (becomes visible) on the
+        // first `Drag` so a pure click stays a click — no highlight
+        // flashes for tap-style interactions. `Up` finalises the drag
+        // (or drops a candidate origin if no drag ever happened).
+        match evt.kind {
+            MouseKind::Click if evt.button == Some("left") => {
+                self.selection_start = Some((evt.x, evt.y));
+                self.selection_end = None;
+                self.selecting = false;
+                // Fall through — the click still bubbles as `mouse.click`
+                // so Lua-side click handlers (e.g. button hit-test) keep
+                // working alongside the selection mechanism.
+            }
+            MouseKind::Drag => {
+                if self.selection_start.is_some() {
+                    self.selection_end = Some((evt.x, evt.y));
+                    self.selecting = true;
+                    self.needs_render = true;
+                }
+                // Drag is consumed by the selection mechanism; it does
+                // not bubble to Lua.
+                return Ok(());
+            }
+            MouseKind::Up => {
+                return self.finalise_selection(evt.x, evt.y);
+            }
+            _ => {}
         }
 
         let target_key = self
@@ -434,6 +485,61 @@ impl Engine {
             mods.set(i + 1, *m)?;
         }
         msg.set("mods", mods)?;
+        self.dispatch_msg(msg)
+    }
+
+    /// Currently-active selection range (if any). The renderer reads
+    /// this on every paint pass to apply the reverse-video highlight.
+    fn current_selection(&self) -> Option<SelectionRange> {
+        match (self.selection_start, self.selection_end, self.selecting) {
+            (Some(start), Some(end), true) => Some(SelectionRange::normalised(start, end)),
+            _ => None,
+        }
+    }
+
+    /// Finalise an in-flight selection on `Up(left)`. When the user
+    /// actually dragged (`selecting == true`), extracts the covered
+    /// plain-text from the most recently painted framebuffer and
+    /// dispatches `{ kind = "mouse.selection", text, start, end }` to
+    /// Lua. A bare click → release (no drag in between) clears the
+    /// candidate origin without dispatching anything — that path stays
+    /// owned by the `mouse.click` route. Up events outside a drag are
+    /// silent no-ops; selection-state tracking is the only signal that
+    /// distinguishes a stray release from an end-of-drag.
+    fn finalise_selection(&mut self, x: u16, y: u16) -> Result<(), TuiError> {
+        let was_selecting = self.selecting;
+        let start_opt = self.selection_start;
+        // Reset state up front. If we re-enter via dispatch_msg → update,
+        // the next render pass should already see the selection cleared.
+        self.selection_start = None;
+        self.selection_end = None;
+        self.selecting = false;
+        self.needs_render = true;
+
+        if !was_selecting {
+            return Ok(());
+        }
+        let Some(start) = start_opt else {
+            return Ok(());
+        };
+        let end = (x, y);
+        let range = SelectionRange::normalised(start, end);
+        // Pull text from the most recently rendered frame. Pre-render
+        // the buffer is all-blank and the extraction yields an empty
+        // string — Lua sees `text = ""` and decides what to do.
+        let text = extract_selection_text(self.renderer.last_frame(), range);
+
+        let msg = self.lua().create_table()?;
+        msg.set("kind", "mouse.selection")?;
+        msg.set("text", text.as_str())?;
+        let start_t = self.lua().create_table()?;
+        start_t.set("x", start.0)?;
+        start_t.set("y", start.1)?;
+        msg.set("start", start_t)?;
+        let end_t = self.lua().create_table()?;
+        end_t.set("x", end.0)?;
+        end_t.set("y", end.1)?;
+        msg.set("end", end_t)?;
         self.dispatch_msg(msg)
     }
 
@@ -507,9 +613,10 @@ impl Engine {
         self.lua.set_now_ms(now);
         let desc = self.lua.render_view()?;
         self.reconciler.reconcile(desc);
+        let selection = self.current_selection();
         let root = self.reconciler.root.as_mut().ok_or(TuiError::NotStarted)?;
         sync_text_inputs(root);
-        let bytes = self.renderer.render(root);
+        let bytes = self.renderer.render_with_selection(root, selection);
         // Snapshot geometry post-paint so `tui.scroll_position` is up
         // to date on the next Lua call.
         self.refresh_scroll_positions();
@@ -1310,5 +1417,216 @@ mod tests {
             InstanceState::Scrollable(s) => assert_eq!(s.scroll_y, 0),
             _ => panic!("expected scrollable state"),
         }
+    }
+
+    /// Drag-to-select scenario: a single line of static text. The state
+    /// remembers the most recent `mouse.selection` message (text +
+    /// endpoints) so tests can assert what Lua observed without poking
+    /// at the engine's internals.
+    const SELECTION_SCENARIO: &str = r#"
+        tui.start {
+          initial_state = { sel_text = nil, sel_start = nil, sel_end = nil },
+          view = function(s)
+            local label = s.sel_text and ("got: " .. s.sel_text) or "hello world"
+            return tui.text { content = label }
+          end,
+          update = function(msg, s)
+            if msg.kind == "mouse.selection" then
+              return {
+                sel_text  = msg.text or "",
+                sel_start = msg.start,
+                sel_end   = msg["end"],
+              }, {}
+            end
+            return s, {}
+          end,
+        }
+    "#;
+
+    #[test]
+    fn drag_then_release_dispatches_mouse_selection_with_text() {
+        use crate::mouse::{MouseKind, MouseMessage};
+        let mut engine = Engine::new(20, 3).expect("engine");
+        engine.load_scenario(SELECTION_SCENARIO).expect("load");
+        let _ = engine.render_if_dirty().expect("render");
+
+        // Down at (0, 0) — open selection candidate.
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Click,
+                x: 0,
+                y: 0,
+                button: Some("left"),
+                mods: vec![],
+            })
+            .expect("down");
+        // Drag to (4, 0) — covers "hello".
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Drag,
+                x: 4,
+                y: 0,
+                button: Some("left"),
+                mods: vec![],
+            })
+            .expect("drag");
+        // Up at (4, 0) — finalise.
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Up,
+                x: 4,
+                y: 0,
+                button: Some("left"),
+                mods: vec![],
+            })
+            .expect("up");
+        let bytes = engine.render_if_dirty().expect("render").expect("dirty");
+        let s = String::from_utf8(bytes).expect("utf-8");
+        // Lua's update absorbed `mouse.selection`, swapped state, and
+        // the next view emits "got: hello".
+        assert!(
+            s.contains("got: hello"),
+            "expected selection text in next frame, got: {s:?}"
+        );
+    }
+
+    #[test]
+    fn pure_click_does_not_dispatch_mouse_selection() {
+        // No drag in between — `mouse.click` bubbles, but no
+        // `mouse.selection` should fire on the trailing Up.
+        use crate::mouse::{MouseKind, MouseMessage};
+        let mut engine = Engine::new(20, 3).expect("engine");
+        engine.load_scenario(SELECTION_SCENARIO).expect("load");
+        let _ = engine.render_if_dirty().expect("render");
+
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Click,
+                x: 2,
+                y: 0,
+                button: Some("left"),
+                mods: vec![],
+            })
+            .expect("down");
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Up,
+                x: 2,
+                y: 0,
+                button: Some("left"),
+                mods: vec![],
+            })
+            .expect("up");
+        let _ = engine.render_if_dirty().expect("render");
+        // The framebuffer (read via snapshot, not the diff bytes) still
+        // reads "hello world", not "got: ...".
+        let snap = engine.snapshot();
+        assert!(
+            snap.contains("hello world"),
+            "expected unchanged label after pure click, got: {snap:?}"
+        );
+        assert!(!snap.contains("got:"));
+    }
+
+    #[test]
+    fn drag_paints_reverse_video_highlight_during_selection() {
+        // Halfway-through-drag frame should carry the reverse-SGR over
+        // the cells covered so far.
+        use crate::mouse::{MouseKind, MouseMessage};
+        let mut engine = Engine::new(20, 3).expect("engine");
+        engine.load_scenario(SELECTION_SCENARIO).expect("load");
+        let _ = engine.render_if_dirty().expect("render");
+
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Click,
+                x: 0,
+                y: 0,
+                button: Some("left"),
+                mods: vec![],
+            })
+            .expect("down");
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Drag,
+                x: 4,
+                y: 0,
+                button: Some("left"),
+                mods: vec![],
+            })
+            .expect("drag");
+        let _ = engine.render_if_dirty().expect("render");
+        let snap = engine.snapshot_ansi();
+        // SGR 7 = reverse video. The drag covers cells 0..=4 — the
+        // styled snapshot should contain the reverse parameter.
+        assert!(
+            snap.contains("\x1b[7m") || snap.contains(";7m"),
+            "expected reverse-video SGR during drag, got: {snap:?}"
+        );
+    }
+
+    #[test]
+    fn selection_extracts_multi_row_text_in_line_flow() {
+        const MULTI_ROW: &str = r#"
+            tui.start {
+              initial_state = { sel = nil },
+              view = function(s)
+                if s.sel then
+                  return tui.text { content = "got:" .. s.sel }
+                end
+                return tui.column { gap = 0, children = {
+                  tui.text { content = "alpha" },
+                  tui.text { content = "beta" },
+                }}
+              end,
+              update = function(msg, s)
+                if msg.kind == "mouse.selection" then
+                  return { sel = msg.text or "" }, {}
+                end
+                return s, {}
+              end,
+            }
+        "#;
+        use crate::mouse::{MouseKind, MouseMessage};
+        let mut engine = Engine::new(10, 3).expect("engine");
+        engine.load_scenario(MULTI_ROW).expect("load");
+        let _ = engine.render_if_dirty().expect("render");
+
+        // Drag from (2, 0) to (3, 1):
+        //   row 0: cols 2..=9 → "pha" + 5 trailing blanks → "pha"
+        //   row 1: cols 0..=3 → "beta"
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Click,
+                x: 2,
+                y: 0,
+                button: Some("left"),
+                mods: vec![],
+            })
+            .expect("down");
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Drag,
+                x: 3,
+                y: 1,
+                button: Some("left"),
+                mods: vec![],
+            })
+            .expect("drag");
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Up,
+                x: 3,
+                y: 1,
+                button: Some("left"),
+                mods: vec![],
+            })
+            .expect("up");
+        let bytes = engine.render_if_dirty().expect("render").expect("dirty");
+        let s = String::from_utf8(bytes).expect("utf-8");
+        assert!(
+            s.contains("got:pha\nbeta") || s.contains("got:pha"),
+            "expected multi-row line-flow text, got: {s:?}"
+        );
     }
 }

@@ -2366,3 +2366,191 @@ fn slash_resume_with_arg_writes_sidechannel_and_exits() {
     let written = std::fs::read_to_string(env.resume_target()).expect("read sidechannel");
     assert_eq!(written.trim(), session_id);
 }
+
+/// Mouse drag inside the transcript triggers the chat.lua mouse.selection
+/// handler. The handler calls `tui.copy_to_clipboard` and surfaces a
+/// `copied N chars` toast. The test asserts the toast appears — that
+/// transitively confirms the engine extracted the text and routed it to
+/// the Lua policy. Clipboard side-effects (the actual OS write) aren't
+/// asserted because the headless test runner has no clipboard backend
+/// to inspect; the binding swallows that failure by design (warn + drop).
+#[test]
+fn mouse_drag_copies_selection_and_shows_toast() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    // Stream a known message into the transcript so the drag covers
+    // identifiable text.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "text": "selectable-token" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
+    );
+    let frame = render_str(&mut engine);
+    assert!(
+        frame.contains("selectable-token"),
+        "expected token in pre-drag frame: {frame:?}"
+    );
+
+    // Locate the row carrying our token in the framebuffer snapshot so
+    // we drag over those cells.
+    let snap = engine.snapshot();
+    let row_idx = snap
+        .lines()
+        .position(|l| l.contains("selectable-token"))
+        .expect("token row in framebuffer");
+    let col_idx = snap
+        .lines()
+        .nth(row_idx)
+        .unwrap()
+        .find("selectable-token")
+        .unwrap();
+
+    // Down at the first cell of the token, drag to the last, release.
+    let y = row_idx as u16;
+    let x0 = col_idx as u16;
+    let x1 = (col_idx + "selectable-token".len() - 1) as u16;
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Click,
+            x: x0,
+            y,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("down");
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Drag,
+            x: x1,
+            y,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("drag");
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Up,
+            x: x1,
+            y,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("up");
+
+    // Advance past the toast's slide-in animation window so the
+    // assertion sees the fully-sized toast (otherwise the first frame
+    // is height=1 and only the top border rule renders, no text yet).
+    engine.advance_time(Duration::from_millis(250));
+    let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+    let post = engine.snapshot();
+    assert!(
+        post.contains("copied "),
+        "expected 'copied N chars' toast after drag, got: {post:?}"
+    );
+    // Char count in the toast should match the selection length.
+    let needle = format!("copied {} chars", "selectable-token".len());
+    assert!(
+        post.contains(&needle),
+        "expected exact toast `{needle}`, got: {post:?}"
+    );
+}
+
+/// Toast layout assertions: the bordered toast pill anchors to the
+/// bottom-left of the BODY area only — overlaying transcript content
+/// at the bottom rows of the body region, but never covering the
+/// input field or statusline below it. Statusline placeholder remains
+/// visible after the toast appears.
+#[test]
+fn mouse_drag_toast_does_not_cover_input_or_statusline() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    // Stream a known message into the transcript so the drag covers
+    // identifiable text.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "text": "selectable-token" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
+    );
+    let _ = render_str(&mut engine);
+
+    // Locate the row carrying our token in the framebuffer snapshot.
+    let snap = engine.snapshot();
+    let row_idx = snap
+        .lines()
+        .position(|l| l.contains("selectable-token"))
+        .expect("token row in framebuffer");
+    let col_idx = snap
+        .lines()
+        .nth(row_idx)
+        .unwrap()
+        .find("selectable-token")
+        .unwrap();
+
+    // Pre-toast: the bottom-row statusline carries the placeholder text.
+    let pre = engine.snapshot();
+    assert!(
+        pre.lines()
+            .any(|l| l.contains("Start chatting to see stats")),
+        "expected statusline placeholder before toast: {pre:?}"
+    );
+
+    // Drag to trigger the selection → clipboard copy → toast path.
+    let y = row_idx as u16;
+    let x0 = col_idx as u16;
+    let x1 = (col_idx + "selectable-token".len() - 1) as u16;
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Click,
+            x: x0,
+            y,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("down");
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Drag,
+            x: x1,
+            y,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("drag");
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Up,
+            x: x1,
+            y,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("up");
+
+    // Advance past the toast's slide-in animation so the toast
+    // renders at full height in the snapshot.
+    engine.advance_time(Duration::from_millis(250));
+    let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+    let post = engine.snapshot();
+
+    // Statusline placeholder must STILL be visible — the toast lives
+    // in the body area, not over the statusline.
+    assert!(
+        post.lines()
+            .any(|l| l.contains("Start chatting to see stats")),
+        "statusline placeholder should remain visible after toast: {post:?}"
+    );
+    // Sanity: the toast label is still present somewhere.
+    let label = format!("copied {} chars", "selectable-token".len());
+    assert!(
+        post.contains(&label),
+        "expected toast label `{label}` somewhere in frame: {post:?}"
+    );
+}
