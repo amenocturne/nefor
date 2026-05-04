@@ -480,6 +480,108 @@ fn resume_replay_targets_only_tui_with_step_origin_entries() {
     }
 }
 
+#[test]
+fn shutdown_prunes_session_with_no_user_submits() {
+    // Picker-clutter regression: sessions that boot, run handshake
+    // (combinators.hello, chat.model.set_ack, etc.), and quit without
+    // a single `chat.input.submit` used to stick around as `(no
+    // submits)` ghost rows in the picker. The fix is to count submits
+    // (matching the picker's preview filter) rather than every non-
+    // control envelope, then delete the file on shutdown when the
+    // count is zero.
+    //
+    // Two shapes here:
+    //   (a) handshake-only — must be pruned.
+    //   (b) one chat.input.submit — must be preserved.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_HOME").ok();
+    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+
+    // (a) handshake-only session.
+    {
+        let lua = Lua::new();
+        install_stub_nefor(&lua).expect("install nefor stub");
+        set_package_path(&lua).expect("set package.path");
+        lua.load(
+            r#"
+            sessions = require("sessions")
+            sessions.init()
+            local json = nefor.json
+            local function entry(origin, body)
+                return {
+                    ts      = "2026-05-04T00:00:00.000Z",
+                    origin  = origin,
+                    payload = json.encode({ type = "event", body = body }),
+                }
+            end
+            -- Realistic handshake traffic — no chat.input.submit.
+            sessions._persist_envelope(entry("nefor-combinators", { kind = "combinators.hello", version = "0.1.0" }))
+            sessions._persist_envelope(entry("nefor-combinators", { kind = "combinators.ready" }))
+            sessions._persist_envelope(entry("ollama", { kind = "chat.model.set_ack", model = "x", provider = "ollama" }))
+            "#,
+        )
+        .exec()
+        .expect("drive handshake");
+        let path: String = lua
+            .load(r#"return sessions.current_path()"#)
+            .eval()
+            .expect("current_path");
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "session file should exist before shutdown: {path}"
+        );
+        lua.load(r#"sessions._on_engine_shutdown(nil)"#)
+            .exec()
+            .expect("drive shutdown");
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "handshake-only session must be pruned on shutdown: {path}"
+        );
+    }
+
+    // (b) session with a real submit.
+    {
+        let lua = Lua::new();
+        install_stub_nefor(&lua).expect("install nefor stub");
+        set_package_path(&lua).expect("set package.path");
+        lua.load(
+            r#"
+            sessions = require("sessions")
+            sessions.init()
+            local json = nefor.json
+            local function entry(origin, body)
+                return {
+                    ts      = "2026-05-04T00:00:00.000Z",
+                    origin  = origin,
+                    payload = json.encode({ type = "event", body = body }),
+                }
+            end
+            sessions._persist_envelope(entry("nefor-combinators", { kind = "combinators.hello" }))
+            sessions._persist_envelope(entry("nefor-tui", { kind = "chat.input.submit", text = "hi" }))
+            "#,
+        )
+        .exec()
+        .expect("drive activity");
+        let path: String = lua
+            .load(r#"return sessions.current_path()"#)
+            .eval()
+            .expect("current_path");
+        lua.load(r#"sessions._on_engine_shutdown(nil)"#)
+            .exec()
+            .expect("drive shutdown");
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "session with chat.input.submit must be preserved on shutdown: {path}"
+        );
+    }
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
+        None => std::env::remove_var("NEFOR_DATA_HOME"),
+    }
+}
+
 // Process-global lock to serialise tests that mutate NEFOR_DATA_HOME.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 

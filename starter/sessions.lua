@@ -171,11 +171,18 @@ local current_session_path = nil
 -- on session_end / shutdown.
 local current_session_file = nil
 
--- Count of non-control envelopes persisted since the active file was
--- opened. Used at close time to delete empty session files so the
--- picker doesn't fill up with "started a chat, said nothing, quit"
--- ghost entries. Reset on every open (init and resume swap).
-local entries_written = 0
+-- Count of `chat.input.submit` envelopes persisted since the active file
+-- was opened. Used at close time to delete sessions that show as empty
+-- in the picker so it doesn't fill up with "started a chat, said
+-- nothing, quit" ghost entries. We count submits specifically (not all
+-- non-control envelopes) because boot handshake (`combinators.hello`,
+-- `chat.model.set_ack`, etc.) lands many envelopes before the user has
+-- typed anything — counting those would defeat the prune. The picker's
+-- own preview filter uses the same `chat.input.submit` signal, so this
+-- keeps the two in lockstep: a session the picker shows as `(no
+-- submits)` is exactly a session this counter calls empty. Reset on
+-- every open (init and resume swap).
+local submits_written = 0
 
 -- Subscription bookkeeping so tests can reset between scenarios.
 local persistence_installed = false
@@ -330,17 +337,17 @@ local function close_session_file()
   end
 end
 
--- Close the active session file and, if no real activity was recorded,
--- delete the jsonl so it doesn't show up as an empty stub in the
--- picker. "Real activity" means at least one non-control envelope was
--- persisted — `sessions.*` events are filtered out before the counter
--- ever increments. Resets the counter so the next open starts clean.
+-- Close the active session file and, if no real user activity was
+-- recorded, delete the jsonl so it doesn't show up as an empty stub in
+-- the picker. "Real activity" means at least one `chat.input.submit`
+-- envelope was persisted — see `submits_written` doc above. Resets the
+-- counter so the next open starts clean.
 local function close_and_prune_if_empty()
   close_session_file()
-  if entries_written == 0 and current_session_path ~= nil then
+  if submits_written == 0 and current_session_path ~= nil then
     pcall(os.remove, current_session_path)
   end
-  entries_written = 0
+  submits_written = 0
 end
 
 -- ------------------------------------------------------------------
@@ -431,8 +438,8 @@ local function persist_envelope(entry)
     current_session_file:write("\n")
     current_session_file:flush()
   end)
-  if write_ok then
-    entries_written = entries_written + 1
+  if write_ok and kind == "chat.input.submit" then
+    submits_written = submits_written + 1
   end
 end
 
@@ -773,7 +780,7 @@ end
 -- doesn't matter.
 function M._reset()
   close_session_file()
-  entries_written      = 0
+  submits_written      = 0
   current_session_id   = nil
   current_session_path = nil
   persistence_installed     = false
