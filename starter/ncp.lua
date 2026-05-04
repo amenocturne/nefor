@@ -1,12 +1,12 @@
 -- starter/ncp.lua — NCP v0.1 protocol implementation (Lua).
 --
 -- Public API:
---   ncp.step(saved_log, current_log) -- called from the global step hook
+--   ncp.dispatch(current_log)        -- called from the global dispatch hook
 --   ncp.spawn(cfg)                   -- spawn a plugin with optional transforms
 --
 -- The engine is a pure string-layer event bus. Every inbound line gets
--- appended to `current_log` and `ncp.step` is invoked. This module inspects
--- the new tail entry and implements:
+-- appended to `current_log` and `ncp.dispatch` is invoked. This module
+-- inspects the new tail entry and implements:
 --   * `ready` / `ready_ok` handshake (with `protocol_version` check).
 --   * Broadcast of `type:"event"` messages to every *other* ready plugin.
 --   * Replay-on-attach: when a plugin readies, resend the current session's
@@ -21,8 +21,9 @@
 --     (e.g. `cc.*` → `chat.*`) without modifying plugins.
 --
 -- State lives in module-level locals and is reset on module reload. Nothing
--- here is shared across step invocations except the `ready_plugins` set and
--- the `plugin_transforms` table; the engine holds the authoritative event log.
+-- here is shared across dispatch invocations except the `ready_plugins` set
+-- and the `plugin_transforms` table; the engine holds the authoritative
+-- event log.
 --
 -- # Tradeoffs documented in code
 --
@@ -33,16 +34,19 @@
 -- * Broadcast costs N-1 targeted sends. NCP broadcast excludes the sender;
 --   the engine's broadcast includes every connected plugin. Lua bridges the
 --   gap with `nefor.engine.plugins()` + per-peer `send`.
--- * `saved_log` (parent-session hydration) is opt-in via `resume.lua`.
---   When `resume.is_active()` is true, saved_log entries replay through
---   per-plugin transforms registered in `resume.lua` — by default, every
---   plugin drops every saved event (replay is opt-in per plugin), so
---   nothing carries over unless an init.lua transform explicitly allows
---   it through. This keeps the engine's "pure event bus" identity intact;
---   resumption is a starter-side composition.
+--
+-- # Cross-session resumption
+--
+-- The engine is session-blind. Cross-run resumption (replaying a prior
+-- session's jsonl onto the bus) is owned by `starter/sessions.lua`,
+-- which runs the swap entirely in-process: emits `sessions.session_end`,
+-- swaps active jsonl + in-memory state, emits `sessions.session_start`,
+-- replays each saved entry via `nefor.engine.send`, then emits
+-- `sessions.resume_done`. ncp.dispatch itself sees no parent-session
+-- hook; the legacy `saved_log` parameter (and `resume.lua` companion
+-- module) have been removed.
 
 local json = nefor.json
-local resume = require("resume")
 
 local M = {}
 
@@ -61,7 +65,7 @@ local ready_plugins = {}
 -- `from_plugin(env)` runs once per emission at ingress; `to_plugin(env)` runs
 -- per peer at egress. Both receive `{type, body, from}` (and `ts` on
 -- to_plugin) and return either a (possibly mutated) envelope table or nil
--- to drop. Errors are caught — a faulty transform never crashes step.
+-- to drop. Errors are caught — a faulty transform never crashes dispatch.
 local plugin_transforms = {}
 
 -- FIFO queue of `chat.popup` envelope tables awaiting nefor-tui's ready.
@@ -80,7 +84,7 @@ local pending_chat_popups = {}
 
 -- Try to decode a JSON string. Returns (decoded, nil) on success or
 -- (nil, err_message) on failure. Wraps pcall so a bad line is a protocol
--- fault we report, not an uncaught error that takes down step.
+-- fault we report, not an uncaught error that takes down dispatch.
 local function try_decode(s)
   local ok, v = pcall(json.decode, s)
   if not ok then return nil, tostring(v) end
@@ -149,25 +153,24 @@ end
 -- system message handling
 -- ------------------------------------------------------------------
 
--- Forward declarations: handle_system, handle_ready, replay_prior_events,
--- and replay_saved_log_for reference each other below; Lua resolves local
+-- Forward declarations: handle_system, handle_ready, and
+-- replay_prior_events reference each other below; Lua resolves local
 -- names lexically so we need the `local` declaration to precede every use
 -- site.
 local handle_system
 local handle_ready
 local replay_prior_events
-local replay_saved_log_for
 
 -- Handle a received `system` message from `origin`. `body` is the already-
 -- parsed body table (or may be nil/non-table on malformed input).
-handle_system = function(origin, body, saved_log, current_log, tail_index)
+handle_system = function(origin, body, current_log, tail_index)
   if type(body) ~= "table" or type(body.kind) ~= "string" then
     emit_error(origin, "malformed_envelope", "system body missing 'kind'")
     return
   end
 
   if body.kind == "ready" then
-    handle_ready(origin, body, saved_log, current_log, tail_index)
+    handle_ready(origin, body, current_log, tail_index)
     return
   end
 
@@ -178,7 +181,7 @@ handle_system = function(origin, body, saved_log, current_log, tail_index)
 end
 
 -- Dispatch for `ready` messages. Split out for clarity.
-handle_ready = function(origin, body, saved_log, current_log, tail_index)
+handle_ready = function(origin, body, current_log, tail_index)
   -- Structural check first (missing field, wrong type) — that's
   -- `invalid_ready`. Version-check next — that's `protocol_version_mismatch`.
   if type(body.protocol_version) ~= "string" then
@@ -206,15 +209,6 @@ handle_ready = function(origin, body, saved_log, current_log, tail_index)
 
   ready_plugins[origin] = tail_index
   emit_ready_ok(origin)
-  -- Saved-log replay first: when the user invoked `/resume <id>`, init.lua
-  -- set `nefor.parent_session = id` and the engine hydrated saved_log
-  -- with that session's history. Each plugin sees the parent's structural
-  -- history (filtered through its registered resume transform) BEFORE the
-  -- fresh session's own current_log entries — that ordering matches what
-  -- the plugin would have seen if the session had never paused.
-  if resume.is_active() and saved_log ~= nil then
-    replay_saved_log_for(origin, saved_log)
-  end
   replay_prior_events(origin, current_log, tail_index)
 
   -- Flush any popups buffered while nefor-tui was still booting. Each
@@ -231,7 +225,7 @@ end
 -- Apply the source plugin's `from_plugin` transform (if any) to a decoded
 -- envelope. Returns the (possibly rewritten) envelope, or nil to drop.
 -- Errors in user code surface as `transform_error` to the source plugin
--- and the envelope is dropped — better than crashing step.
+-- and the envelope is dropped — better than crashing dispatch.
 local function apply_from_plugin(origin, env)
   local t = plugin_transforms[origin]
   if not t or not t.from_plugin then return env end
@@ -294,60 +288,6 @@ local function send_to_peer(target, env_in)
   nefor.engine.send(encode(env), target)
 end
 
--- Replay saved_log entries through `resume.lua`'s per-plugin transforms.
--- Called from `handle_ready` when `resume.is_active()` — i.e. the engine
--- booted with `nefor.parent_session = "<id>"`. Each plugin-originated
--- event entry from the prior session passes through:
---   1. `resume.transform_for_plugin(target, env)` — opt-in filter; default
---      is to drop. Plugins that didn't register see nothing from the
---      parent session. The transform receives the raw decoded envelope
---      (post-JSON, pre-from_plugin) and decides whether the target
---      should observe it.
---   2. `to_plugin` for the target (per-peer rewrite, same as live path).
---
--- Why we DON'T run `from_plugin` during replay: the source plugin's
--- `from_plugin` transform owns live-session orchestration (e.g.
--- agentic_workflow.for_chat intercepts `chat.input.submit` and kicks off
--- a fresh orchestrator run). Running it during replay would re-fire those
--- side effects — every prior turn would launch a new graph, every
--- pre-existing chat.create would mint a new chat. Replay must be inert
--- to the policy layer; it's structural-history-only. Per-plugin resume
--- transforms know exactly which kinds carry structure (chat.create,
--- chat.append, chat.message.append, chat.stream.end) and which carry
--- per-firing artefacts (deltas, tool calls, sub-graph ticks).
---
--- Self-origin entries skip: a plugin must not see its own past emissions
--- replayed back at it (NCP broadcast-minus-sender invariant).
-replay_saved_log_for = function(target, saved_log)
-  for i = 1, #saved_log do
-    local entry = saved_log[i]
-    -- Skip non-plugin origins. Step-originated entries are the prior run's
-    -- broadcast fanout (already counted via the original); engine-origin
-    -- entries are private translation-layer artefacts.
-    if entry.origin ~= "step" and entry.origin ~= "engine"
-       and entry.origin ~= target then
-      local decoded = select(1, try_decode(entry.payload))
-      if decoded and type(decoded) == "table" and decoded.type == "event"
-         and type(decoded.body) == "table" then
-        local env_raw = {
-          type = decoded.type,
-          body = decoded.body,
-          from = entry.origin,
-        }
-        -- Per-target resume filter. Default is drop (no registration).
-        local filtered = resume.transform_for_plugin(target, env_raw)
-        if filtered ~= nil then
-          send_to_peer(target, {
-            type = filtered.type or env_raw.type,
-            body = filtered.body,
-            from = filtered.from or env_raw.from,
-          })
-        end
-      end
-    end
-  end
-end
-
 -- Replay every plugin-originated `type:"event"` entry seen before the
 -- handshake. Replayed envelopes pass through `from_plugin` (at the source)
 -- and `to_plugin` (at the new attacher), so a late attacher sees the same
@@ -397,7 +337,7 @@ local function handle_event(origin, payload)
   -- specific peer (other than the sender) deliver only to that peer. The
   -- common case is render traffic from nefor-tui → nefor-tui ("nefor-tui.
   -- grid.line", etc); broadcasting those to every plugin spends a Lua
-  -- step + JSON encode per peer for nothing. Events whose prefix is the
+  -- dispatch + JSON encode per peer for nothing. Events whose prefix is the
   -- sender itself ("nefor-tui.input.key" from nefor-tui) are announcements
   -- about the sender and stay broadcast. Events with a non-peer prefix
   -- ("chat.*", "cc.*", custom kinds) also broadcast.
@@ -482,12 +422,7 @@ end
 -- public entry point
 -- ------------------------------------------------------------------
 
-function M.step(saved_log, current_log)
-  -- saved_log carries the parent session's entries when the engine booted
-  -- with `nefor.parent_session = "<id>"`; otherwise it's an empty table.
-  -- We forward it into `handle_ready` so resume transforms can fire on
-  -- each plugin's first ready (see `replay_saved_log_for` above).
-
+function M.dispatch(current_log)
   local tail_index = #current_log
   if tail_index == 0 then return end
 
@@ -524,7 +459,7 @@ function M.step(saved_log, current_log)
 
   local t = decoded.type
   if t == "system" then
-    handle_system(entry.origin, decoded.body, saved_log, current_log, tail_index)
+    handle_system(entry.origin, decoded.body, current_log, tail_index)
   elseif t == "event" then
     -- §3: body must be a JSON object even for events. Enforce here rather
     -- than trust the plugin.
@@ -632,7 +567,6 @@ function M._reset()
   ready_plugins = {}
   plugin_transforms = {}
   pending_chat_popups = {}
-  resume._reset()
 end
 
 -- Exposed for tests only. Registers a transform for `name` without going

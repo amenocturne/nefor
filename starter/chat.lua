@@ -533,17 +533,30 @@ local function bordered_popup(scroll_key, child, border_style)
     max_width = 1,
     child = tui.fill { char = "│", style = border_style },
   }
+  -- Opaque background INSIDE the popup so transcript text behind the
+  -- box doesn't bleed through the empty rows below the natural content
+  -- height. Without this, a popup whose content is shorter than the
+  -- 50%-height shell shows transcript characters in the dead space
+  -- (e.g. transcript-text-on-top-of-permission-popup leaks). The fill
+  -- char is a normal space; ratatui's render path writes a glyph at
+  -- every cell, which paints over whatever the layer below put there.
+  local body_bg = tui.fill { char = " " }
   local body_row = tui.row {
     gap = 0,
     children = {
       side_bar,
       tui.expanded {
-        child = tui.padding {
-          left = 1, right = 1, top = 0, bottom = 0,
-          child = tui.scrollable {
-            key       = scroll_key,
-            scrollbar = "auto",
-            child     = child,
+        child = tui.stack {
+          children = {
+            body_bg,
+            tui.padding {
+              left = 1, right = 1, top = 0, bottom = 0,
+              child = tui.scrollable {
+                key       = scroll_key,
+                scrollbar = "auto",
+                child     = child,
+              },
+            },
           },
         },
       },
@@ -1086,46 +1099,45 @@ local function awaiting_count(awaiting)
 end
 
 ------------------------------------------------------------------------
--- session resume — picker + sidechannel
+-- session resume — picker + bus event
 ------------------------------------------------------------------------
 --
 -- `/resume` pops a session picker showing the last 10 sessions on disk
 -- (newest first) with a one-line preview of the first user prompt.
--- Selecting a row writes the session id to a sidechannel file and emits
--- `{kind="exit"}`; the user re-launches and `init.lua` reads the file at
--- boot, sets `nefor.parent_session`, and ncp.lua replays saved_log
--- through `resume.lua` transforms.
---
--- The picker is dev-tooling: in-place "warm" resume would require tearing
--- every plugin's state down + back up, which is out of scope. Exit-and-
--- relaunch is the cleanest contract — the OS gives us a fresh process
--- tree and resume.lua's transforms handle the structural-history replay.
+-- Selecting a row emits a `sessions.resume_request { session_id }`
+-- envelope onto the NCP bus and dismisses the picker — no process exit,
+-- no sidechannel file. The starter's `sessions` Lua module subscribes to
+-- that kind via `nefor.bus.on_event` and runs the in-process resume
+-- sequence (emit `session_end` → swap state → emit `session_start` →
+-- replay jsonl → emit `resume_done`). Per-plugin handlers in the
+-- agentic_workflow transforms react to the lifecycle events to flush
+-- and rebuild their own state. The TUI process stays alive across the
+-- whole flip.
 
--- Path to the macOS XDG-equivalent sessions directory. Linux/Windows
--- users would adjust this — v1 ships the macOS path.
---
--- Test override: if `NEFOR_DATA_HOME` is set in the environment, its value
--- is used as the data root. Lets the chat_test.rs harness point at a
--- temp dir without touching the real `~/Library/Application Support`
--- tree. Production envs leave this unset and fall back to $HOME.
+-- Resolve the sessions data root. Must match `starter/sessions.lua`'s
+-- `data_root()` exactly — picker reads from the same directory the
+-- writer writes to. Resolution order, first hit wins:
+--   1. `NEFOR_DATA_HOME` — test override + canonical setting.
+--   2. `XDG_DATA_HOME/nefor` — standard XDG.
+--   3. `$HOME/.local/share/nefor` — XDG default fallback.
+-- Earlier the picker resolved to `$HOME/Library/Application Support/nefor`
+-- on macOS while the writer used XDG, so the picker showed only stale
+-- legacy sessions and never saw new ones. Aligning the two resolvers
+-- is the fix.
 local function nefor_data_root()
   local override = os.getenv("NEFOR_DATA_HOME")
   if override ~= nil and override ~= "" then return override end
+  local xdg = os.getenv("XDG_DATA_HOME")
+  if xdg ~= nil and xdg ~= "" then return xdg .. "/nefor" end
   local home = os.getenv("HOME") or ""
   if home == "" then return nil end
-  return home .. "/Library/Application Support/nefor"
+  return home .. "/.local/share/nefor"
 end
 
 local function session_dir()
   local root = nefor_data_root()
   if root == nil then return nil end
   return root .. "/sessions"
-end
-
-local function resume_target_path()
-  local root = nefor_data_root()
-  if root == nil then return nil end
-  return root .. "/resume_target"
 end
 
 -- Extract the value of `"text": "..."` from a session-log JSONL line
@@ -1140,46 +1152,80 @@ end
 -- (nefor-tui) doesn't expose `nefor.json`, and the picker is dev
 -- tooling — a regex-tier extraction is fine for a one-line preview.
 local function extract_submit_text(line)
-  -- Find the escaped `\"text\":\"` marker — note the literal backslashes.
+  -- Two scan modes, picked by which marker matches:
+  --   * doubly-escaped:  `\"text\":\"` — payload is a JSON-encoded
+  --                      string inside a JSON row (the production
+  --                      shape; persist_envelope wraps the wire JSON
+  --                      via json.encode of the row table).
+  --   * singly-escaped:  `"text":"`    — the inner envelope written
+  --                      directly without the row-wrapper layer
+  --                      (test fixtures).
   local _, marker_end = line:find([[\"text\":\"]], 1, true)
+  local doubly_encoded = marker_end ~= nil
   if marker_end == nil then
-    -- Fall back to the un-escaped form for tests that synthesise the
-    -- inner envelope directly without double-encoding.
     _, marker_end = line:find('"text":"', 1, true)
     if marker_end == nil then return nil end
   end
+
   local i = marker_end + 1
   local out = {}
   local n = #line
   while i <= n do
     local c = line:sub(i, i)
-    if c == "\\" and i < n then
+    if c == "\\" and i + 1 <= n then
       local nxt = line:sub(i + 1, i + 1)
-      if nxt == "\\" and i + 1 < n then
-        -- Escaped backslash inside the embedded JSON: `\\\"` is the
-        -- escaped form of an escaped quote inside the inner string.
-        local nnxt = line:sub(i + 2, i + 2)
-        if nnxt == '"' then
-          -- Inner closing quote of the string value — we're done.
+      if doubly_encoded then
+        -- Doubly-encoded: every char of the inner JSON has each `"`
+        -- written as `\"` and each `\` as `\\` in the file. The
+        -- inner string's closing quote therefore appears as `\"`
+        -- (2 chars). An escaped quote inside the inner string —
+        -- which represents a literal `"` in the original text —
+        -- appears as `\\\"` (3 chars), and a literal backslash as
+        -- `\\\\` (4 chars).
+        if nxt == '"' then
           return table.concat(out)
+        elseif nxt == "\\" and i + 2 <= n then
+          local nnxt = line:sub(i + 2, i + 2)
+          if nnxt == '"' then
+            out[#out + 1] = '"'
+            i = i + 3
+          elseif nnxt == "\\" then
+            out[#out + 1] = "\\"
+            i = i + 4
+          elseif nnxt == "n" then
+            out[#out + 1] = "\n"
+            i = i + 3
+          elseif nnxt == "t" then
+            out[#out + 1] = "\t"
+            i = i + 3
+          else
+            out[#out + 1] = nnxt
+            i = i + 3
+          end
+        else
+          out[#out + 1] = nxt
+          i = i + 2
         end
-        out[#out + 1] = "\\"
-        i = i + 2
-      elseif nxt == '"' then
-        out[#out + 1] = '"'
-        i = i + 2
-      elseif nxt == "n" then
-        out[#out + 1] = "\n"
-        i = i + 2
-      elseif nxt == "t" then
-        out[#out + 1] = "\t"
-        i = i + 2
       else
-        out[#out + 1] = nxt
-        i = i + 2
+        -- Singly-encoded: standard JSON string escapes.
+        if nxt == '"' then
+          out[#out + 1] = '"'
+          i = i + 2
+        elseif nxt == "\\" then
+          out[#out + 1] = "\\"
+          i = i + 2
+        elseif nxt == "n" then
+          out[#out + 1] = "\n"
+          i = i + 2
+        elseif nxt == "t" then
+          out[#out + 1] = "\t"
+          i = i + 2
+        else
+          out[#out + 1] = nxt
+          i = i + 2
+        end
       end
-    elseif c == '"' then
-      -- Plain (non-escaped) quote means we matched the un-escaped form.
+    elseif c == '"' and not doubly_encoded then
       return table.concat(out)
     else
       out[#out + 1] = c
@@ -1267,25 +1313,16 @@ local function format_started_at(s)
   return string.format("%s-%s %s:%s", mo, dy, hh, mm)
 end
 
--- Write `id` to the sidechannel resume_target file. Returns true on
--- success. Failure is silent — the user will see the picker close + the
--- app exit + nothing happen on relaunch, which is the diagnostic.
-local function write_resume_target(id)
-  local path = resume_target_path()
-  if path == nil then return false end
-  -- Ensure parent dir exists. The sessions dir already does (the engine
-  -- created it when writing the first session), so this is belt-and-
-  -- braces for fresh installs that have never written a session.
-  local root = nefor_data_root()
-  if root ~= nil then
-    -- mkdir -p; benign if it already exists.
-    os.execute(string.format("mkdir -p %q", root))
-  end
-  local fh = io.open(path, "w")
-  if fh == nil then return false end
-  fh:write(id)
-  fh:close()
-  return true
+-- Build a `sessions.resume_request` send_to effect for `id`. The starter's
+-- sessions module subscribes to this kind via `nefor.bus.on_event` and
+-- runs the swap sequence in-process. No process exit, no file write —
+-- the TUI stays alive across the resume.
+local function emit_resume_request(id)
+  return {
+    kind   = "send_to",
+    target = "engine",
+    body   = { kind = "sessions.resume_request", session_id = id },
+  }
 end
 
 -- Session picker popup. Border is HL_USER. Layout:
@@ -1471,26 +1508,79 @@ local function popup_model_picker(state)
   }
 end
 
--- Toast: full-width single-line banner anchored at the bottom row,
--- replacing the statusline visually for the toast's lifetime. Auto-
--- dismisses on `expires_at_ms`. The text leaf owns its full allocated
--- rect (engine paints trailing cells with the text's own style), so
--- the bg colour band reaches edge-to-edge — no per-row main_column
--- chars peek through.
-local TOAST_FG          = "#88ccff"
-local TOAST_BORDER      = { fg = "#7faaaa" }   -- dim cyan rail to match blockquote palette
-local TOAST_FULL_HEIGHT = 5    -- ╭─╮ + blank + text + blank + ╰─╯
-local TOAST_ENTER_MS    = 180
-local TOAST_EXIT_MS     = 180
-
--- Inline toast: bordered pill anchored bottom-left of the body area
+-- Toast = ephemeral, non-blocking (e.g., "copied N chars").
+-- Popup = blocking, requires user input (esc) for dismissal.
+-- Don't blur this distinction.
+--
+-- Inline toast: bordered pill anchored bottom-RIGHT of the body area
 -- (overlaying the transcript only — never covers the input or
--- statusline). Animates in/out by clipping its height from the bottom
--- via `tui.constrained { max_height }` over the `TOAST_ENTER_MS` /
--- `TOAST_EXIT_MS` windows. The render-loop keepalive (see
+-- statusline). Auto-dismisses on `expires_at_ms`. The text leaf owns
+-- its full allocated rect (engine paints trailing cells with the
+-- text's own style), so the bg colour band reaches edge-to-edge — no
+-- per-row main_column chars peek through.
+--
+-- Animation: translate-only horizontal slide. The pill keeps full
+-- size throughout (no width clip, no height clip). On enter the pill
+-- slides leftward from the right edge to its rest position over
+-- `TOAST_ENTER_MS` with ease-out cubic; on exit it mirrors back over
+-- `TOAST_EXIT_MS` with ease-in cubic. The render-loop keepalive (see
 -- `render_keepalive`) ensures `tui.now_ms()` re-evaluates each frame
--- so the slide is smooth and the toast actually disappears at
--- `expires_at_ms` rather than freezing on the last shown state.
+-- so the slide is smooth and the toast disappears at `expires_at_ms`
+-- rather than freezing on the last shown state.
+--
+-- `tui.anchored`'s offset is clamped to keep the pill on-screen, so
+-- "off-screen right" is approximated by the rest position sitting
+-- `TOAST_REST_INSET` cells inward from the right edge — the slide is
+-- visible across that inset distance. The translation is real (no
+-- clipping), just bounded by the parent rect.
+local TOAST_FG_INFO        = "#88ccff"
+local TOAST_BORDER_INFO    = { fg = "#7faaaa" }   -- dim cyan rail to match blockquote palette
+-- warn/error variants reserved; only info wired by current call sites.
+-- Reference the popup warn/error palette so toast variants line up
+-- with the rest of the chrome when later call sites adopt them.
+local TOAST_FG_WARN        = C.status_warn
+local TOAST_BORDER_WARN    = { fg = C.status_warn }
+local TOAST_FG_ERROR       = C.status_danger
+local TOAST_BORDER_ERROR   = { fg = C.status_danger }
+local TOAST_FULL_HEIGHT    = 3    -- top rule + text + bottom rule (no inner padding)
+local TOAST_ENTER_MS       = 220
+local TOAST_EXIT_MS        = 220
+-- Extra cells of dashes past the right edge of the window. The
+-- anchored rect clamps to parent width, so these dashes get clipped
+-- on the right — visually the top/bottom rules look like they
+-- continue off-screen rather than terminating exactly at the edge.
+local TOAST_RIGHT_OVERFLOW = 6
+
+-- Easing helpers. Domain [0,1]; clamp before applying.
+local function clamp01(t)
+  if t < 0 then return 0 end
+  if t > 1 then return 1 end
+  return t
+end
+local function ease_out_cubic(t)
+  t = clamp01(t)
+  local u = 1 - t
+  return 1 - u * u * u
+end
+local function ease_in_cubic(t)
+  t = clamp01(t)
+  return t * t * t
+end
+
+-- Resolve the (fg, border) palette for a toast level. Unknown levels
+-- fall back to "info" so a malformed envelope doesn't crash render.
+local function toast_palette(level)
+  if level == "warn" then
+    return TOAST_FG_WARN, TOAST_BORDER_WARN
+  elseif level == "error" then
+    return TOAST_FG_ERROR, TOAST_BORDER_ERROR
+  else
+    -- "info" or anything else → info palette. Current call sites only
+    -- wire info; warn/error variants are reserved for future use.
+    return TOAST_FG_INFO, TOAST_BORDER_INFO
+  end
+end
+
 local function inline_toast(state)
   if not state.toast then return nil end
   local now     = tui.now_ms()
@@ -1498,48 +1588,75 @@ local function inline_toast(state)
   local expires = state.toast.expires_at_ms or (created + 2000)
   if now >= expires then return nil end
 
-  local elapsed = now - created
+  local elapsed   = now - created
   local time_left = expires - now
-  local height
-  if elapsed < TOAST_ENTER_MS then
-    -- entering: 0 → TOAST_FULL_HEIGHT
-    local frac = elapsed / TOAST_ENTER_MS
-    height = math.max(1, math.floor(TOAST_FULL_HEIGHT * frac + 0.5))
-  elseif time_left < TOAST_EXIT_MS then
-    -- exiting: TOAST_FULL_HEIGHT → 0
-    local frac = time_left / TOAST_EXIT_MS
-    height = math.max(0, math.floor(TOAST_FULL_HEIGHT * frac + 0.5))
-  else
-    height = TOAST_FULL_HEIGHT
-  end
-  if height <= 0 then return nil end
 
   local text = state.toast.text or ""
-  -- Pill width = text + 8 cells of internal padding (4 each side via
-  -- the inner column padding plus 1 each side from the box's `│ ` /
-  -- ` │` chrome). Cap at 60 so long messages don't span half the
-  -- screen.
-  local pill_w = math.min(60, #text + 8)
+  local fg, border = toast_palette(state.toast.level)
+
+  -- Small pill anchored bottom-right. Width at rest = `╭` corner +
+  -- space + text + extra dashes that overflow past the right edge.
+  -- The slide is implemented by varying the pill's WIDTH from 0
+  -- (off-screen) to pill_w_at_rest. Because the pill is anchored at
+  -- the right edge, the rect grows LEFTWARD as visible_w increases
+  -- and the text widgets' content gets truncated on the right by the
+  -- rect's width. The TOAST_RIGHT_OVERFLOW slack means the rules at
+  -- rest extend past the visible right edge of the window — they
+  -- look like they're going "off-screen" rather than stopping
+  -- exactly at the edge.
+  local pill_w_at_rest = 2 + #text + TOAST_RIGHT_OVERFLOW
+  local total_slide    = pill_w_at_rest
+  local distance_slid
+  if elapsed < TOAST_ENTER_MS then
+    local t = elapsed / TOAST_ENTER_MS
+    distance_slid = total_slide * ease_out_cubic(t)
+  elseif time_left < TOAST_EXIT_MS then
+    local t = 1 - (time_left / TOAST_EXIT_MS)
+    distance_slid = total_slide * (1 - ease_in_cubic(t))
+  else
+    distance_slid = total_slide
+  end
+  distance_slid = math.floor(distance_slid + 0.5)
+
+  local visible_w = math.min(distance_slid, pill_w_at_rest)
+  if visible_w <= 0 then return nil end
+
+  -- At-rest content: 3 strings, each `pill_w_at_rest` cells wide.
+  -- Chrome lives on the LEFT — `╭` / `│` / `╰` opens the pill on
+  -- the leading side; the dashes extend rightward past the right
+  -- edge of the window where the renderer clips them. The mid row
+  -- pads with trailing spaces so the area below the dashes doesn't
+  -- show the chrome from the layer underneath bleeding through.
+  local top_rule    = "╭" .. string.rep("─", pill_w_at_rest - 1)
+  local mid_text    = "│ " .. text .. string.rep(" ", TOAST_RIGHT_OVERFLOW)
+  local bottom_rule = "╰" .. string.rep("─", pill_w_at_rest - 1)
 
   local body = tui.column {
     gap = 0,
+    key = "toast-box",
     children = {
-      tui.text { content = "", wrap = "none" },
-      tui.align {
-        alignment = "center",
-        child = tui.text { content = text, style = { fg = TOAST_FG }, wrap = "none" },
+      tui.constrained {
+        max_height = 1,
+        child = tui.text { content = top_rule, style = border, wrap = "none" },
       },
-      tui.text { content = "", wrap = "none" },
+      tui.constrained {
+        max_height = 1,
+        child = tui.text { content = mid_text, style = { fg = fg }, wrap = "none" },
+      },
+      tui.constrained {
+        max_height = 1,
+        child = tui.text { content = bottom_rule, style = border, wrap = "none" },
+      },
     },
   }
 
   return tui.anchored {
-    anchor   = "bottom-left",
+    anchor   = "bottom-right",
     offset_x = 0,
     offset_y = 0,
-    width    = pill_w,
-    height   = height,
-    child = bordered_box(body, TOAST_BORDER, "toast-box"),
+    width    = visible_w,
+    height   = TOAST_FULL_HEIGHT,
+    child    = body,
   }
 end
 
@@ -1784,25 +1901,6 @@ local function render_keepalive(state)
 end
 
 local function view(state)
-  local body_row = tui.row {
-    gap = 0,
-    children = compact {
-      tui.expanded { child = transcript(state) },
-      state.show_sidebar and vertical_separator() or nil,
-      state.show_sidebar and dag_panel(state)        or nil,
-    },
-  }
-
-  -- Toast overlays the bottom-left of the body area only (above the
-  -- input + statusline). Anchored bottom-left of this stack puts it
-  -- there without ever covering the input or statusline.
-  local body_with_toast = tui.stack {
-    children = compact {
-      body_row,
-      inline_toast(state),
-    },
-  }
-
   -- Input field with full-width rounded border per legacy spec section
   -- 7. The `tui.text_input` is the bare control; `bordered_box` wraps
   -- it in `╭─╮ │ ╰─╯` chrome so the input visually matches user
@@ -1848,18 +1946,33 @@ local function view(state)
     "input-field"
   )
 
-  -- Layout (top → bottom): transcript | slash autocomplete (when open) |
-  -- input row | statusline. Statusline lives BELOW the input per legacy
-  -- spec — pushing it above the input visibly inverts the screen weight,
-  -- making the input feel like a status row rather than the primary
-  -- focus surface.
-  local main_column = tui.column {
+  -- One-row blank spacer reused at the top of the chat column and
+  -- the bottom (above the statusline). The sidebar gets no spacer:
+  -- its vertical separator now runs full window height edge-to-edge.
+  local function blank_row()
+    return tui.constrained {
+      max_height = 1,
+      child = tui.fill { char = " " },
+    }
+  end
+
+  -- Left column = chat surface. Top → bottom: 1-row top gap /
+  -- transcript / slash autocomplete (when open) / input / statusline /
+  -- 1-row bottom gap / keepalive. Statusline lives BELOW the input
+  -- per legacy spec — pushing it above the input visibly inverts the
+  -- screen weight, making the input feel like a status row rather
+  -- than the primary focus surface. The bottom gap lifts the
+  -- statusline off the very last row so it doesn't sit flush against
+  -- the terminal frame.
+  local left_column = tui.column {
     gap = 0,
     children = compact {
-      tui.expanded { child = body_with_toast },
+      blank_row(),
+      tui.expanded { child = transcript(state) },
       slash_autocomplete_inline(state),
       input_field,
       statusline(state),
+      blank_row(),
       -- Invisible 1Hz keepalive: forces re-render while DAG runs or the
       -- thinking ticker need the second-counter refreshed. Removed when
       -- nothing needs to tick.
@@ -1867,24 +1980,32 @@ local function view(state)
     },
   }
 
-  -- 2-cell horizontal padding (legacy spec section 1, "HPAD = 2 columns
-  -- left/right inside the chat pane"). Top/bottom keep 1-cell so the
-  -- vertical breathing room stays modest — uniform 2 there would cost
-  -- two transcript rows on a 24-row terminal. Statusline is wrapped in
-  -- the same padded column for v1; pulling it flush-left needs a
-  -- restructure (separate padding container per child) and is deferred.
-  return tui.padding {
-    value = { top = 1, right = 2, bottom = 1, left = 2 },
-    child = tui.stack {
-      children = compact {
-        main_column,
-        popup_help(state),
-        popup_message(state),
-        popup_model_picker(state),
-        popup_session_picker(state),
-        popup_tool_permission(state),
-        popup_toast(state),
-      },
+  -- Outer row: left column (chat) | separator | sidebar. No outer
+  -- padding — the sidebar's vertical separator reaches the full
+  -- window height (top and bottom edges flush), and per-element
+  -- spacing is handled inside `left_column` and `dag_panel`.
+  local main_row = tui.row {
+    gap = 0,
+    children = compact {
+      tui.expanded { child = left_column },
+      state.show_sidebar and vertical_separator() or nil,
+      state.show_sidebar and dag_panel(state)        or nil,
+    },
+  }
+
+  return tui.stack {
+    children = compact {
+      main_row,
+      popup_help(state),
+      popup_message(state),
+      popup_model_picker(state),
+      popup_session_picker(state),
+      popup_tool_permission(state),
+      -- Toast renders last so it sits above input, statusline, and
+      -- every popup — non-blocking notifications must never be
+      -- occluded by chrome below them.
+      inline_toast(state),
+      popup_toast(state),
     },
   }
 end
@@ -1971,7 +2092,30 @@ local function finalize_assistant(state, final_text, model, duration_ms)
   local now = tui.now_ms()
   local turn_dur = duration_ms or (state.turn_started_at and (now - state.turn_started_at)) or nil
   if state.in_flight == nil then
-    -- Empty turn (e.g. error) — still record durations.
+    -- No in-flight entry. Two cases:
+    --   1. Resume replay dropped the per-token deltas; this finalizer
+    --      is the only event carrying the assistant text. Push a
+    --      fully-formed entry from `final_text` so the message lands.
+    --   2. Empty turn (e.g. error) — `final_text` is nil/empty;
+    --      record only the durations.
+    if final_text and #final_text > 0 then
+      local entries = {}
+      for i, v in ipairs(state.entries) do entries[i] = v end
+      entries[#entries + 1] = {
+        role        = "assistant",
+        text        = final_text,
+        kind        = "stream",
+        streaming   = false,
+        model       = model,
+        duration_ms = duration_ms,
+      }
+      return shallow_merge(state, {
+        entries          = entries,
+        pending          = false,
+        turn_started_at  = NIL_SENTINEL,
+        last_turn_duration_ms = turn_dur,
+      })
+    end
     return shallow_merge(state, {
       pending = false, turn_started_at = NIL_SENTINEL,
       last_turn_duration_ms = turn_dur,
@@ -2187,6 +2331,18 @@ local function update(msg, state)
       return state, { { kind = "exit" } }
     end
     if cmd == "new" or cmd == "clear" then
+      -- `/new` mints a brand-new session on disk in addition to
+      -- clearing the visual transcript. Without `sessions.new_request`,
+      -- the on-disk session id stays put and every subsequent submit
+      -- lands in the file the picker previewed before — so the picker
+      -- only ever showed one growing entry no matter how many `/new`s
+      -- the user typed. The starter's sessions module subscribes to
+      -- this kind via `nefor.bus.on_event` and runs the in-process
+      -- mint + swap (session_end → close+prune → open fresh →
+      -- session_start → resume_done with replay=0). The
+      -- `chat.interrupt_all` envelope is still emitted so any in-flight
+      -- streaming aborts immediately rather than waiting for the
+      -- session_end teardown to fan out via the broker.
       local cleared = shallow_merge(state, {
         entries = {}, in_flight = NIL_SENTINEL, input_value = "",
         pending = false, slash = NIL_SENTINEL,
@@ -2201,7 +2357,7 @@ local function update(msg, state)
         { kind = "send_to", target = "engine",
           body = { kind = "chat.interrupt_all" } },
         { kind = "send_to", target = "engine",
-          body = { kind = "chat.reset" } },
+          body = { kind = "sessions.new_request" } },
       }
     end
     if cmd == "help" then
@@ -2280,24 +2436,28 @@ local function update(msg, state)
       }), effects
     end
     if cmd == "resume" then
-      -- `/resume <session-id>` — direct: write sidechannel + exit.
-      -- The `chat.input.submit` for the resume command itself doesn't
-      -- need to land on the bus; we synthesize the relaunch handoff
-      -- entirely client-side. Engine relaunches with parent_session set.
+      -- `/resume <session-id>` — direct: emit `sessions.resume_request`
+      -- onto the bus and clear the input. The starter's sessions module
+      -- runs the in-process swap (no exit, no sidechannel).
+      --
+      -- Locally clear the transcript here rather than waiting for the
+      -- session_end bus envelope to do it — the session_end handler
+      -- deliberately doesn't touch `entries` (see comment there) so
+      -- that user keystrokes between `/new` (or `/resume`) and the
+      -- broker's lifecycle round-trip aren't silently wiped. Replay
+      -- arrives via push_entry on each `chat.message.append` and
+      -- rebuilds the view from empty.
       if args and #args > 0 then
         local id = args:match("^([%w%-]+)") or args
-        if write_resume_target(id) then
-          return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL }), {
-            { kind = "exit" },
-          }
-        end
-        -- Sidechannel write failed — surface a toast so the user knows
-        -- something went wrong rather than the app silently no-op-ing.
-        local now = tui.now_ms()
         return shallow_merge(state, {
           input_value = "", slash = NIL_SENTINEL,
-          toast = { text = "resume: failed to write sidechannel", created_at_ms = now, expires_at_ms = now + 3000 },
-        }), {}
+          entries = {}, in_flight = NIL_SENTINEL,
+          pending = false, dag_runs = {},
+          turn_started_at = NIL_SENTINEL,
+          last_turn_duration_ms = NIL_SENTINEL,
+        }), {
+          emit_resume_request(id),
+        }
       end
       -- `/resume` (no args) — open the picker.
       local sessions = list_recent_sessions(10)
@@ -2318,6 +2478,14 @@ local function update(msg, state)
       }
     end
     -- Plain text submit.
+    --
+    -- We push the user message LOCALLY for instant feedback, then
+    -- emit `chat.input.submit`. The orchestrator's `for_chat` handler
+    -- echoes the message back via `chat.message.append { role=user }`
+    -- (so the message persists in the session log and replays on
+    -- resume); the corresponding handler below dedupes that round-trip
+    -- against `pending_user_echo` so we render once locally + once on
+    -- replay, never twice live.
     local with_user = push_entry(state, { role = "user", text = text, kind = "text" })
     -- Prepend to prompt_history (newest at index 1) and cap. History
     -- recall reads from index 1, so prepending keeps the cursor model
@@ -2332,6 +2500,12 @@ local function update(msg, state)
       turn_started_at = tui.now_ms(), slash = NIL_SENTINEL,
       prompt_history = history,
       history_cursor = NIL_SENTINEL,
+      -- Mark the next bus-delivered chat.message.append with this
+      -- exact text + role as the orchestrator's persist-echo and
+      -- swallow it. Cleared after one match — sequential identical
+      -- submits each set their own marker on submit, so the second
+      -- echo doesn't get eaten by the first marker.
+      pending_user_echo = text,
     })
     return cleared, {
       { kind = "send_to", target = "engine",
@@ -2492,12 +2666,13 @@ local function update(msg, state)
     end
   end
 
-  -- Session picker popup keys. Up/Down move cursor; Enter writes the
-  -- sidechannel resume_target file + emits exit (the user re-launches
-  -- and `init.lua` reads the file at boot — see `read_resume_target`
-  -- there). Esc handled in the popup-close branch above (closes without
-  -- writing). No filter input — the picker is small (≤10 sessions) and
-  -- the timestamps + previews are scannable as-is.
+  -- Session picker popup keys. Up/Down move cursor; Enter emits a
+  -- `sessions.resume_request` envelope onto the NCP bus and dismisses
+  -- the popup. The starter's sessions module subscribes via
+  -- `nefor.bus.on_event` and runs the in-process swap. Esc handled in
+  -- the popup-close branch above (closes without emitting). No filter
+  -- input — the picker is small (≤10 sessions) and the timestamps +
+  -- previews are scannable as-is.
   if state.popup and state.popup.variant == "session_picker" then
     local p = state.popup
     local sessions = p.sessions or {}
@@ -2515,16 +2690,20 @@ local function update(msg, state)
       if #sessions == 0 then return state, {} end
       local sel = sessions[p.cursor or 1] or sessions[1]
       if not sel or not sel.id then return state, {} end
-      if write_resume_target(sel.id) then
-        return shallow_merge(state, { popup = NIL_SENTINEL }), {
-          { kind = "exit" },
-        }
-      end
-      -- Write failed — keep the popup open and surface a toast.
-      local now = tui.now_ms()
+      -- Locally clear the transcript so the imminent replay paints
+      -- onto an empty surface. session_end no longer wipes entries
+      -- (see comment in its handler) — the picker owns the clear
+      -- here and the `/resume <id>` arm above owns it for the
+      -- direct path.
       return shallow_merge(state, {
-        toast = { text = "resume: failed to write sidechannel", created_at_ms = now, expires_at_ms = now + 3000 },
-      }), {}
+        popup = NIL_SENTINEL,
+        entries = {}, in_flight = NIL_SENTINEL,
+        pending = false, dag_runs = {},
+        turn_started_at = NIL_SENTINEL,
+        last_turn_duration_ms = NIL_SENTINEL,
+      }), {
+        emit_resume_request(sel.id),
+      }
     end
     -- All other keys swallow so they don't bubble into the input field.
     return state, {}
@@ -2674,12 +2853,130 @@ local function update(msg, state)
     return state, {}
   end
 
+  -- ── session lifecycle ───────────────────────────────────────────────
+  -- The starter's `sessions` module emits four control events on the
+  -- bus. `session_end` and `session_start` bracket a resume swap;
+  -- `resume_done` is the "we're back, finalise rendering" signal.
+  -- During replay (between session_start and resume_done) we paint
+  -- envelopes normally — chat.message.append, chat.stream.* land in
+  -- transcript exactly the way they would on a live turn. The resume
+  -- envelopes ARE the past, so rendering them rebuilds the prior view.
+  if kind == "sessions.session_end" then
+    -- Tear down ephemeral turn state — but DO NOT touch `entries`.
+    --
+    -- Rationale: session_end arrives via the bus, on a different
+    -- broker tick than the user's keystroke that triggered it (a
+    -- /new or /resume submit). If the user typed their first prompt
+    -- in the new session before this envelope landed, `entries`
+    -- already holds their locally-pushed message — and wiping it
+    -- here is exactly the race that made the user's prompt
+    -- invisible while the orchestrator's tool_call still painted.
+    -- The transcript clear is owned by the trigger paths instead:
+    -- /new clears locally in its slash-command handler; /resume
+    -- clears locally too (see the picker-Enter and `/resume <id>`
+    -- arms). For a /resume that lands replay envelopes, push_entry
+    -- on each replayed `chat.message.append` rebuilds the prior
+    -- view directly — no wipe needed here.
+    --
+    -- pending_user_echo is preserved for a similar reason: if the
+    -- user submitted text moments ago, the echo's defensive dedup
+    -- (chat.message.append handler) is what protects against
+    -- double-rendering. Clearing the marker here would mean the
+    -- echo arrives, finds no marker, and unconditionally pushes —
+    -- producing the OPPOSITE bug (user line rendered twice). The
+    -- marker self-clears the moment the echo lands or the next
+    -- /new fires.
+    return shallow_merge(state, {
+      in_flight        = NIL_SENTINEL,
+      pending          = false,
+      turn_started_at  = NIL_SENTINEL,
+      last_turn_duration_ms = NIL_SENTINEL,
+      popup            = NIL_SENTINEL,
+      toast            = NIL_SENTINEL,
+      slash            = NIL_SENTINEL,
+      dag_runs         = {},
+    }), {}
+  end
+
+  if kind == "sessions.session_start" then
+    -- No-op. The /resume + /new paths already clear via session_end's
+    -- handler above; at boot, state is already empty. The handler
+    -- USED to defensively wipe `entries = {}` here, but that turned
+    -- out to be the cause of a real bug: ncp.lua's replay-on-attach
+    -- can deliver the boot session_start AFTER the user has typed
+    -- their first prompt (the local-push went into entries first).
+    -- Wiping then nukes the user's message; the orchestrator's
+    -- chat.message.append echo arrives later and gets deduped against
+    -- the pending_user_echo marker, so nothing ever repaints the user
+    -- line — the transcript shows only the assistant's reply.
+    return state, {}
+  end
+
+  if kind == "sessions.resume_done" then
+    -- Live again. The transcript already reflects the replayed past;
+    -- nothing to do beyond letting the next render fire (which it
+    -- will from the surrounding update loop).
+    return state, {}
+  end
+
+  if kind == "chat.reset" then
+    -- agentic_workflow's `teardown_for_session_end` broadcasts
+    -- chat.reset so the provider's chat-history map clears. The TUI
+    -- receives it too (broadcast doesn't filter peers), but the
+    -- transcript clear that USED to live here is redundant —
+    -- sessions.session_end fires alongside chat.reset and already
+    -- wipes entries. Pinning a no-op handler instead of letting the
+    -- envelope fall through is intentional: it documents that the
+    -- TUI deliberately ignores chat.reset, so a future contributor
+    -- who's tempted to "do something on reset" lands here first and
+    -- sees the comment explaining why session_end owns the clear.
+    return state, {}
+  end
+
   -- ── inbound chat-contract events ────────────────────────────────────
   if kind == "chat.message.append" then
     local text = msg.text or ""
     if #text == 0 then return state, {} end
+    -- Round-trip echo from the orchestrator's `for_chat` handler:
+    -- when the user submits, we push locally for instant feedback
+    -- AND emit `chat.input.submit` to the bus. The orchestrator
+    -- replies with `chat.message.append { role=user, text=<same> }`
+    -- so the user message lands in the session log (and replays).
+    -- Live, that round-trip would render the same line twice; eat
+    -- it once when the marker matches.
+    --
+    -- BUT: only swallow the echo if the local push actually landed in
+    -- `state.entries`. The marker by itself isn't enough — if a
+    -- session-lifecycle event wiped entries between the local push
+    -- and this echo, eating the echo would leave the transcript with
+    -- NO user line (the user submitted, the orchestrator started
+    -- doing things, and the prompt visually disappeared). Only the
+    -- orchestrator's echo can re-paint the user line in that case,
+    -- so let it through. The check is "the tail of entries is a
+    -- user-role entry with matching text" — that's exactly the
+    -- shape the local push leaves.
+    local role = msg.role or "system"
+    if role == "user"
+       and state.pending_user_echo ~= nil
+       and state.pending_user_echo == text then
+      local entries = state.entries or {}
+      local tail = entries[#entries]
+      local local_push_landed = tail
+        and tail.role == "user"
+        and tail.text == text
+      if local_push_landed then
+        return shallow_merge(state, { pending_user_echo = NIL_SENTINEL }), {}
+      end
+      -- Marker stranded by an intervening clear — fall through and
+      -- push the echo so the user line is still visible. Clear the
+      -- marker so a future genuine duplicate can't ride this branch.
+      return push_entry(
+        shallow_merge(state, { pending_user_echo = NIL_SENTINEL }),
+        { role = role, text = text, kind = "text" }
+      ), {}
+    end
     return push_entry(state, {
-      role = msg.role or "system", text = text, kind = "text",
+      role = role, text = text, kind = "text",
     }), {}
   end
 
@@ -2753,8 +3050,17 @@ local function update(msg, state)
   if kind == "chat.toast" then
     local now = tui.now_ms()
     local ttl = msg.ttl_ms or 2000
+    -- `level` ∈ "info" | "warn" | "error". Defaults to "info" so the
+    -- existing call sites (which never set the field) keep their
+    -- current cyan styling. warn / error variants reserved for future
+    -- use; the render pipeline accepts them, no caller wires them yet.
     return shallow_merge(state, {
-      toast = { text = msg.text or "", created_at_ms = now, expires_at_ms = now + ttl },
+      toast = {
+        text = msg.text or "",
+        level = msg.level or "info",
+        created_at_ms = now,
+        expires_at_ms = now + ttl,
+      },
     }), {}
   end
 
@@ -2885,13 +3191,26 @@ local function update(msg, state)
   if kind == "mouse.selection" then
     local text = msg.text or ""
     if #text > 0 then
-      tui.copy_to_clipboard(text)
+      -- Read `now` BEFORE calling `tui.copy_to_clipboard`. The clipboard
+      -- binding hits a system-wide pasteboard (NSPasteboard on macOS,
+      -- X/Wayland selections on Linux), which can block tens to hundreds
+      -- of ms under contention. `tui.now_ms` is the cached frame clock
+      -- the engine installs at the start of each dispatch — same value
+      -- regardless of read order — but reading it up-front signals
+      -- intent and survives a future refactor where the binding
+      -- refreshes the clock mid-dispatch.
       local now = tui.now_ms()
+      tui.copy_to_clipboard(text)
       return shallow_merge(state, {
         toast = {
           text = string.format("copied %d chars", #text),
           created_at_ms = now,
-          expires_at_ms = now + 2000,
+          -- 4 s lifetime: covers the 2 s default plus headroom for the
+          -- clipboard call's wall-clock cost. Without this padding the
+          -- toast can wink out before the user's eye registers it on
+          -- slow / contended systems (and tests racing the same path
+          -- flake intermittently).
+          expires_at_ms = now + 4000,
         },
       }), {}
     end

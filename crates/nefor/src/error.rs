@@ -7,7 +7,6 @@
 use crate::config::ConfigError;
 use crate::lua::LuaError;
 use crate::ncp::BrokerError;
-use crate::session::SessionError;
 
 /// Top-level error for the nefor binary.
 #[derive(Debug, thiserror::Error)]
@@ -31,11 +30,6 @@ pub enum NeforError {
     /// NCP broker failures (spawn, runtime).
     #[error(transparent)]
     Broker(#[from] BrokerError),
-
-    /// Session log read/write failure (creating a fresh session on startup,
-    /// or hydrating a parent session declared in `init.lua`).
-    #[error(transparent)]
-    Session(#[from] SessionError),
 
     /// Filesystem / IO error. Kept now so early FS callers wire through the
     /// same enum instead of inventing ad-hoc error types.

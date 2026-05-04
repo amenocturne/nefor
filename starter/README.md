@@ -8,7 +8,7 @@ bus; everything NCP-shaped happens here.
 ## Layout
 
 - `init.lua` — top-level composition. Sets `package.path`, defines the global
-  `step` hook (delegates to `ncp.step`), and registers plugins via
+  `dispatch` hook (delegates to `ncp.dispatch`), and registers plugins via
   `nefor.plugins.spawn`. Edit this file to change which plugins run.
 - `ncp.lua` — NCP v0.1 protocol module. Handles `ready` / `ready_ok`,
   broadcast-minus-sender, replay-on-attach, and `error` emission. JSON
@@ -36,10 +36,10 @@ cargo build -p mock-plugin -p nefor-chat -p nefor-tui -p nefor-combinators-plugi
 
 - **Add/remove plugins**: edit the `nefor.plugins.spawn { ... }` block at the
   end of `init.lua`.
-- **Resume a prior session**: uncomment `nefor.parent_session = "<uuid>"` at
-  the top of `init.lua` and fill in a prior session id from the engine log.
-  (Note: parent-session replay is deferred; `saved_log` is ignored by
-  `ncp.step` today.)
+- **Resume a prior session**: emit `sessions.resume_request { session_id =
+  "<uuid>" }` on the bus (the chat slash-command surface does this for you).
+  `starter/sessions.lua` handles the rest in-process. The legacy
+  `nefor.parent_session` engine handoff has been removed.
 - **Change protocol behavior**: `ncp.lua` is where handshake, broadcast,
   replay, and error rules live. Swap it for your own module if you need a
   non-standard dispatch policy.
@@ -50,5 +50,7 @@ cargo build -p mock-plugin -p nefor-chat -p nefor-tui -p nefor-combinators-plugi
   process shutdown when any plugin exits; plugins observe EOF on their stdin
   and exit. Spec §5.3 `shutdown` message emission would require an
   `nefor.engine.on_shutdown(fn)` binding and is deferred.
-- `saved_log` (parent-session hydration) is accepted by `ncp.step` and
-  ignored. Session-resumption semantics are tracked as D-21a-deferred.
+- Per-plugin replay protocol — declarative replay annotation per plugin.
+  Currently every late-attaching plugin sees `replay-on-attach` of all prior
+  events; some plugins want a coalesced "we're back" signal instead. Tracked
+  as D-21a-deferred.

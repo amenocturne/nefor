@@ -1,7 +1,7 @@
-//! `nefor.engine.send` — emit a message from the step function.
+//! `nefor.engine.send` — emit a message from the dispatch hook.
 //!
-//! Step (`init.lua`'s `function step(saved_log, current_log) ... end`) is the
-//! policy engine. When it decides to forward something it calls
+//! Dispatch (`init.lua`'s `function dispatch(current_log) ... end`) is
+//! the policy engine. When it decides to forward something it calls
 //! `nefor.engine.send(payload, target?)`. Broadcasts omit the target;
 //! targeted sends pass a plugin name.
 //!
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use mlua::{Lua, Table, Value};
 use nefor_protocol::{PluginName, Timestamp};
 
-/// Outbound routing decision produced by a step call.
+/// Outbound routing decision produced by a dispatch call.
 ///
 /// Enum rather than `Option<PluginName>` so the intent (broadcast vs
 /// targeted) is self-documenting at use sites and new variants (e.g., a
@@ -40,8 +40,9 @@ pub trait EngineOps: Send + Sync {
     ///
     /// Infallible from the binding's perspective — the engine is responsible
     /// for surfacing any delivery failure asynchronously (e.g., through the
-    /// event log). Making `send` fallible here would force the step function
-    /// to reason about transport-level errors, which is not its job.
+    /// event log). Making `send` fallible here would force the dispatch
+    /// function to reason about transport-level errors, which is not its
+    /// job.
     fn send(&self, target: SendTarget, payload: String);
 
     /// Snapshot the names of plugins currently connected to the engine.

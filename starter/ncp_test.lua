@@ -1,4 +1,4 @@
--- starter/ncp_test.lua — unit tests for ncp.step semantics.
+-- starter/ncp_test.lua — unit tests for ncp.dispatch semantics.
 --
 -- Loaded by `crates/nefor/tests/starter_ncp_test.rs`. The Rust test:
 --   * Installs a mock `nefor.engine` that records every `send` call and
@@ -61,10 +61,10 @@ local function make_event(body)
   return json.encode({ type = "event", body = body })
 end
 
--- Convenience: run step with a single inbound entry appended.
-local function step_with(origin, payload)
+-- Convenience: run dispatch with a single inbound entry appended.
+local function dispatch_with(origin, payload)
   local entry = entry_plugin(origin, payload)
-  ncp.step({}, { entry })
+  ncp.dispatch({ entry })
 end
 
 -- ------------------------------------------------------------------
@@ -73,7 +73,7 @@ end
 local function test_ready_triggers_ready_ok_reply()
   reset()
   _test.set_plugins({ "mock-plugin" })
-  step_with("mock-plugin", make_ready("0.1"))
+  dispatch_with("mock-plugin", make_ready("0.1"))
 
   local calls = _test.calls()
   assert_eq(#calls, 1, "exactly one send on ready")
@@ -91,7 +91,7 @@ end
 local function test_ready_with_wrong_version_triggers_error()
   reset()
   _test.set_plugins({ "p" })
-  step_with("p", make_ready("0.9"))
+  dispatch_with("p", make_ready("0.9"))
 
   local calls = _test.calls()
   assert_eq(#calls, 1, "one send for error")
@@ -109,7 +109,7 @@ local function test_malformed_ready_body_triggers_error()
   _test.set_plugins({ "p" })
   -- Missing protocol_version field.
   local bad = json.encode({ type = "system", body = { kind = "ready" } })
-  step_with("p", bad)
+  dispatch_with("p", bad)
 
   local calls = _test.calls()
   assert_eq(#calls, 1, "one error")
@@ -128,14 +128,14 @@ local function test_event_from_ready_plugin_broadcasts_to_others()
   local log = {}
   for _, name in ipairs({ "a", "b", "c" }) do
     log[#log + 1] = entry_plugin(name, make_ready("0.1"))
-    ncp.step({}, log)
+    ncp.dispatch(log)
   end
   _test.calls_clear()
 
   -- 'a' emits an event. Should reach b and c only.
   local ev = make_event({ kind = "test.ping" })
   log[#log + 1] = entry_plugin("a", ev)
-  ncp.step({}, log)
+  ncp.dispatch(log)
 
   local calls = _test.calls()
   local seen = { a = false, b = false, c = false }
@@ -157,14 +157,14 @@ local function test_event_from_ready_plugin_excludes_sender()
 
   local log = {}
   log[#log + 1] = entry_plugin("a", make_ready("0.1"))
-  ncp.step({}, log)
+  ncp.dispatch(log)
   log[#log + 1] = entry_plugin("b", make_ready("0.1"))
-  ncp.step({}, log)
+  ncp.dispatch(log)
   _test.calls_clear()
 
   local ev = make_event({ kind = "sub" })
   log[#log + 1] = entry_plugin("a", ev)
-  ncp.step({}, log)
+  ncp.dispatch(log)
 
   local calls = _test.calls()
   for _, c in ipairs(calls) do
@@ -181,7 +181,7 @@ local function test_event_from_non_ready_plugin_is_errored()
 
   -- 'a' emits an event without readying first.
   local log = { entry_plugin("a", make_event({ kind = "x" })) }
-  ncp.step({}, log)
+  ncp.dispatch(log)
 
   local calls = _test.calls()
   assert_eq(#calls, 1, "one send: the error reply")
@@ -197,7 +197,7 @@ end
 local function test_malformed_json_triggers_error()
   reset()
   _test.set_plugins({ "p" })
-  step_with("p", "{not valid json")
+  dispatch_with("p", "{not valid json")
 
   local calls = _test.calls()
   assert_eq(#calls, 1, "one send: error")
@@ -216,7 +216,7 @@ end
 local function test_second_ready_from_same_plugin_errors()
   reset()
   _test.set_plugins({ "p" })
-  step_with("p", make_ready("0.1"))
+  dispatch_with("p", make_ready("0.1"))
   _test.calls_clear()
 
   -- Second ready — still just one log entry from the test's point of
@@ -225,7 +225,7 @@ local function test_second_ready_from_same_plugin_errors()
     entry_plugin("p", make_ready("0.1")),
     entry_plugin("p", make_ready("0.1")),  -- the second ready
   }
-  ncp.step({}, log)
+  ncp.dispatch(log)
 
   local calls = _test.calls()
   assert_eq(#calls, 1, "one send: the error")
@@ -242,24 +242,24 @@ local function test_late_attacher_receives_prior_events_in_order()
 
   -- 'a' readies, then emits three events.
   local log = { entry_plugin("a", make_ready("0.1")) }
-  ncp.step({}, log)
+  ncp.dispatch(log)
 
   for _, k in ipairs({ "e1", "e2", "e3" }) do
     log[#log + 1] = entry_plugin("a", make_event({ kind = k }))
     -- Simulate step broadcasting: add one step entry per event for each
     -- connected-but-not-a peer. 'a' is the only ready plugin so no broadcasts
-    -- actually happen; the entry is appended by ncp.step's own broadcast
+    -- actually happen; the entry is appended by ncp.dispatch's own broadcast
     -- logic (via the mock `send`). We mirror that here to keep the log
     -- realistic: current_log in production contains both the inbound and
     -- step's outbound fanout.
-    ncp.step({}, log)
+    ncp.dispatch(log)
   end
 
   -- 'b' joins and readies. Expect three replayed events in order.
   _test.set_plugins({ "a", "b" })
   _test.calls_clear()
   log[#log + 1] = entry_plugin("b", make_ready("0.1"))
-  ncp.step({}, log)
+  ncp.dispatch(log)
 
   local calls = _test.calls()
   -- First call is the ready_ok reply; subsequent calls are the replayed
@@ -283,11 +283,11 @@ end
 -- transforms: from_plugin rewrites event before broadcast
 -- ------------------------------------------------------------------
 -- Helper: ready each name in order, calling step after every append so
--- ncp.step sees one new tail entry per call (the production pattern).
+-- ncp.dispatch sees one new tail entry per call (the production pattern).
 local function ready_in_order(log, names)
   for _, n in ipairs(names) do
     log[#log + 1] = entry_plugin(n, make_ready("0.1"))
-    ncp.step({}, log)
+    ncp.dispatch(log)
   end
 end
 
@@ -313,7 +313,7 @@ local function test_from_plugin_transform_rewrites_event_kind()
   _test.calls_clear()
 
   log[#log + 1] = entry_plugin("src", make_event({ kind = "cc.stream.end", text = "hi" }))
-  ncp.step({}, log)
+  ncp.dispatch(log)
 
   local calls = _test.calls()
   assert_eq(#calls, 1, "exactly one peer (dst) received the event")
@@ -340,7 +340,7 @@ local function test_from_plugin_transform_returning_nil_drops_envelope()
   _test.calls_clear()
 
   log[#log + 1] = entry_plugin("src", make_event({ kind = "any" }))
-  ncp.step({}, log)
+  ncp.dispatch(log)
 
   assert_eq(#_test.calls(), 0, "no peers received the dropped event")
 end
@@ -365,7 +365,7 @@ local function test_to_plugin_transform_rewrites_per_target_only()
   _test.calls_clear()
 
   log[#log + 1] = entry_plugin("src", make_event({ kind = "original" }))
-  ncp.step({}, log)
+  ncp.dispatch(log)
 
   local seen = {}
   for _, c in ipairs(_test.calls()) do
@@ -392,7 +392,7 @@ local function test_to_plugin_transform_returning_nil_drops_for_target_only()
   _test.calls_clear()
 
   log[#log + 1] = entry_plugin("src", make_event({ kind = "x" }))
-  ncp.step({}, log)
+  ncp.dispatch(log)
 
   local targets = {}
   for _, c in ipairs(_test.calls()) do
@@ -418,7 +418,7 @@ local function test_from_plugin_transform_error_emits_transform_error()
   _test.calls_clear()
 
   log[#log + 1] = entry_plugin("src", make_event({ kind = "x" }))
-  ncp.step({}, log)
+  ncp.dispatch(log)
 
   local calls = _test.calls()
   assert_eq(#calls, 1, "one send: the error reply to source")
@@ -444,17 +444,17 @@ local function test_replayed_events_pass_through_from_plugin_transform()
 
   -- src readies, then emits two events while alone on the bus.
   local log = { entry_plugin("src", make_ready("0.1")) }
-  ncp.step({}, log)
+  ncp.dispatch(log)
   for _, k in ipairs({ "e1", "e2" }) do
     log[#log + 1] = entry_plugin("src", make_event({ kind = k }))
-    ncp.step({}, log)
+    ncp.dispatch(log)
   end
 
   -- 'late' joins. Replay should deliver both events with rewritten kind.
   _test.set_plugins({ "src", "late" })
   _test.calls_clear()
   log[#log + 1] = entry_plugin("late", make_ready("0.1"))
-  ncp.step({}, log)
+  ncp.dispatch(log)
 
   local replayed_kinds = {}
   for _, c in ipairs(_test.calls()) do
@@ -470,250 +470,6 @@ local function test_replayed_events_pass_through_from_plugin_transform()
   assert_eq(replayed_kinds[2], "rewritten", "second replay used from_plugin")
 end
 
--- ------------------------------------------------------------------
--- 10. saved_log is not replayed when resume is inactive (default)
--- ------------------------------------------------------------------
---
--- When `resume.is_active()` returns false (no parent_session at boot),
--- saved_log is ignored — same behaviour as the v1 default before resume
--- shipped. Replay-on-attach only covers current_log entries.
-local function test_saved_log_is_not_replayed_when_resume_inactive()
-  reset()
-  _test.set_plugins({ "p" })
-
-  -- Saved log from a parent session has prior events. We should not
-  -- resend them to 'p' on its ready — only current-session events count.
-  local saved = {
-    entry_plugin("prior", make_event({ kind = "from-past-life" })),
-  }
-  local current = { entry_plugin("p", make_ready("0.1")) }
-  ncp.step(saved, current)
-
-  local calls = _test.calls()
-  -- Exactly one send: the ready_ok. No replays from saved_log.
-  assert_eq(#calls, 1, "no saved-log replay; only ready_ok")
-  local decoded = json.decode(calls[1].payload)
-  assert_eq(decoded.body.kind, "ready_ok", "ready_ok only")
-end
-
--- ------------------------------------------------------------------
--- resume.lua: per-plugin transform registry semantics
--- ------------------------------------------------------------------
-local resume = require("resume")
-
-local function reset_resume()
-  reset()
-  resume._reset()
-end
-
-local function test_resume_unregistered_plugin_drops_by_default()
-  -- Default for plugins without a registered transform: drop. Replay is
-  -- opt-in, so a plugin that doesn't know about resume sees nothing
-  -- from the parent session — never re-fires events for sub-graphs,
-  -- in-flight tools, etc.
-  reset_resume()
-  local out = resume.transform_for_plugin("anybody", {
-    type = "event", body = { kind = "any.kind" }, from = "src",
-  })
-  assert_eq(out, nil, "unregistered plugin defaults to drop")
-end
-
-local function test_resume_registered_transform_runs()
-  reset_resume()
-  local seen
-  resume.register("dst", function(env)
-    seen = env
-    return env
-  end)
-  local in_env = {
-    type = "event", body = { kind = "carried" }, from = "src",
-  }
-  local out = resume.transform_for_plugin("dst", in_env)
-  assert_true(out ~= nil, "transform returned envelope")
-  assert_eq(out.body.kind, "carried", "body preserved")
-  assert_eq(seen.from, "src", "transform saw source plugin")
-end
-
-local function test_resume_transform_can_drop_by_returning_nil()
-  reset_resume()
-  resume.register("dst", function(_env) return nil end)
-  local out = resume.transform_for_plugin("dst", {
-    type = "event", body = { kind = "x" }, from = "src",
-  })
-  assert_eq(out, nil, "nil-return drops envelope")
-end
-
-local function test_resume_transform_error_drops_silently()
-  reset_resume()
-  resume.register("dst", function(_env) error("boom") end)
-  -- A faulty user transform during boot replay must not crash step.
-  local out = resume.transform_for_plugin("dst", {
-    type = "event", body = { kind = "x" }, from = "src",
-  })
-  assert_eq(out, nil, "error in transform drops silently")
-end
-
-local function test_resume_default_tui_transform_keeps_chat_history()
-  -- The shipped nefor-tui transform must preserve chat.message.append
-  -- and chat.stream.end (transcript-rebuild kinds) and drop everything
-  -- else (deltas, graphs, mouse/key events).
-  reset_resume()
-  local kept = resume._tui_transform({
-    type = "event", body = { kind = "chat.message.append", role = "user", text = "hi" },
-  })
-  assert_true(kept ~= nil, "chat.message.append kept")
-  local kept_end = resume._tui_transform({
-    type = "event", body = { kind = "chat.stream.end", text = "done" },
-  })
-  assert_true(kept_end ~= nil, "chat.stream.end kept")
-  -- Deltas: dropped (already merged into stream.end).
-  local dropped = resume._tui_transform({
-    type = "event", body = { kind = "chat.stream.delta", text = "x" },
-  })
-  assert_eq(dropped, nil, "chat.stream.delta dropped")
-  -- DAG events: dropped (per-firing artefacts).
-  local dag = resume._tui_transform({
-    type = "event", body = { kind = "graph.run_started", run_id = "r1" },
-  })
-  assert_eq(dag, nil, "graph.run_started dropped")
-end
-
-local function test_resume_default_provider_transform_keeps_structural_chats()
-  -- For a provider named "ollama", the transform must preserve
-  -- ollama.chat.{create,append,complete} and drop deltas/results/etc.
-  reset_resume()
-  local fac = resume._provider_transform_factory("ollama")
-  for _, k in ipairs({ "ollama.chat.create", "ollama.chat.append", "ollama.chat.complete" }) do
-    local kept = fac({ type = "event", body = { kind = k } })
-    assert_true(kept ~= nil, k .. " kept")
-  end
-  for _, k in ipairs({
-    "ollama.stream.delta", "ollama.stream.end",
-    "ollama.chat.complete.result", "ollama.auth.set",
-    "ollama.tool.advertise",
-  }) do
-    local dropped = fac({ type = "event", body = { kind = k } })
-    assert_eq(dropped, nil, k .. " dropped")
-  end
-end
-
-local function test_resume_register_defaults_wires_tui_and_provider()
-  reset_resume()
-  resume.register_defaults("ollama")
-  -- nefor-tui keeps chat.message.append.
-  local kept = resume.transform_for_plugin("nefor-tui", {
-    type = "event", body = { kind = "chat.message.append", role = "user", text = "hi" },
-  })
-  assert_true(kept ~= nil, "nefor-tui kept chat.message.append after register_defaults")
-  -- ollama keeps chat.create.
-  local kept_p = resume.transform_for_plugin("ollama", {
-    type = "event", body = { kind = "ollama.chat.create", chat_id = "c1" },
-  })
-  assert_true(kept_p ~= nil, "ollama kept chat.create after register_defaults")
-  -- Other plugins (e.g. reasoner-graph): drop everything.
-  local dropped = resume.transform_for_plugin("reasoner-graph", {
-    type = "event", body = { kind = "graph.run_started" },
-  })
-  assert_eq(dropped, nil, "reasoner-graph drops by default (unregistered)")
-end
-
--- ------------------------------------------------------------------
--- ncp.lua replays saved_log through resume transforms when active
--- ------------------------------------------------------------------
-local function test_saved_log_replays_to_target_when_resume_active()
-  reset_resume()
-  resume.set_active(true)
-  -- nefor-tui keeps chat.message.append; everything else dropped.
-  resume.register("nefor-tui", function(env)
-    if env.body and env.body.kind == "chat.message.append" then return env end
-    return nil
-  end)
-  _test.set_plugins({ "nefor-tui" })
-
-  local saved = {
-    entry_plugin("nefor-tui-old", make_event({
-      kind = "chat.message.append", role = "user", text = "from-past",
-    })),
-    entry_plugin("nefor-tui-old", make_event({
-      kind = "graph.run_started", run_id = "r-old",
-    })),
-  }
-  local current = { entry_plugin("nefor-tui", make_ready("0.1")) }
-  ncp.step(saved, current)
-
-  local calls = _test.calls()
-  -- Expect ready_ok + 1 replayed event (the chat.message.append).
-  local replayed_kinds = {}
-  for _, c in ipairs(calls) do
-    if c.target == "nefor-tui" then
-      local d = json.decode(c.payload)
-      if d.type == "event" then
-        replayed_kinds[#replayed_kinds + 1] = d.body.kind
-      end
-    end
-  end
-  assert_eq(#replayed_kinds, 1, "exactly one replayed event delivered")
-  assert_eq(replayed_kinds[1], "chat.message.append",
-    "transform kept chat.message.append; dropped graph.run_started")
-end
-
-local function test_saved_log_replay_skips_self_origin()
-  -- A plugin must not see its own past emissions replayed back at it.
-  reset_resume()
-  resume.set_active(true)
-  resume.register("nefor-tui", function(env) return env end)  -- pass-through
-  _test.set_plugins({ "nefor-tui" })
-
-  local saved = {
-    entry_plugin("nefor-tui", make_event({ kind = "chat.input.submit", text = "old" })),
-    entry_plugin("other", make_event({ kind = "chat.message.append", role = "user", text = "ok" })),
-  }
-  local current = { entry_plugin("nefor-tui", make_ready("0.1")) }
-  ncp.step(saved, current)
-
-  local seen_self = false
-  local seen_other = false
-  for _, c in ipairs(_test.calls()) do
-    if c.target == "nefor-tui" then
-      local d = json.decode(c.payload)
-      if d.type == "event" and d.body and d.body.kind == "chat.input.submit" then
-        seen_self = true
-      end
-      if d.type == "event" and d.body and d.body.kind == "chat.message.append" then
-        seen_other = true
-      end
-    end
-  end
-  assert_eq(seen_self, false, "self-origin entries skipped on replay")
-  assert_eq(seen_other, true, "other-origin entries replayed")
-end
-
-local function test_saved_log_skipped_when_resume_inactive_explicit()
-  -- Even with transforms registered, saved_log replay does NOT fire if
-  -- resume is inactive. The lifecycle bit is the gate.
-  reset_resume()
-  -- Note: resume.set_active(true) NOT called.
-  resume.register("nefor-tui", function(env) return env end)
-  _test.set_plugins({ "nefor-tui" })
-
-  local saved = {
-    entry_plugin("other", make_event({
-      kind = "chat.message.append", role = "user", text = "stale",
-    })),
-  }
-  local current = { entry_plugin("nefor-tui", make_ready("0.1")) }
-  ncp.step(saved, current)
-
-  for _, c in ipairs(_test.calls()) do
-    if c.target == "nefor-tui" then
-      local d = json.decode(c.payload)
-      assert_true(
-        not (d.type == "event" and d.body and d.body.kind == "chat.message.append"),
-        "no chat.message.append replayed when resume inactive"
-      )
-    end
-  end
-end
 
 -- ------------------------------------------------------------------
 -- targeted routing: kind "<peer>.<rest>" delivers only to <peer>
@@ -730,7 +486,7 @@ local function test_kind_prefix_targets_named_peer_only()
   -- nefor-tui peer (and src is not nefor-tui), so it should deliver only
   -- to nefor-tui — not "other".
   log[#log + 1] = entry_plugin("src", make_event({ kind = "nefor-tui.grid.line", row = 0 }))
-  ncp.step({}, log)
+  ncp.dispatch(log)
 
   local targets = {}
   for _, c in ipairs(_test.calls()) do
@@ -752,7 +508,7 @@ local function test_kind_prefix_self_announces_to_all_peers()
   -- nefor-tui announces "nefor-tui.ready" — prefix matches the sender
   -- itself, so this is a self-announcement and broadcasts to all peers.
   log[#log + 1] = entry_plugin("nefor-tui", make_event({ kind = "nefor-tui.ready" }))
-  ncp.step({}, log)
+  ncp.dispatch(log)
 
   local targets = {}
   for _, c in ipairs(_test.calls()) do
@@ -1463,14 +1219,14 @@ local function test_engine_plugin_failed_routes_to_chat_popup()
   -- the popup send.
   _test.set_plugins({ "nefor-tui" })
   local log = { entry_plugin("nefor-tui", make_ready("0.1")) }
-  ncp.step({}, log)
+  ncp.dispatch(log)
   _test.calls_clear()
 
   local payload = make_engine_plugin_failed(
     "ollama", "spawn", "binary not found", "missing_dir"
   )
   log[#log + 1] = entry_engine(payload)
-  ncp.step({}, log)
+  ncp.dispatch(log)
 
   local calls = _test.calls()
   assert_eq(#calls, 1, "exactly one send: the chat.popup")
@@ -1506,7 +1262,7 @@ local function test_engine_plugin_failed_drops_when_chat_not_connected()
     "nefor-tui", "runtime", "crashed", "crash"
   )
   local log = { entry_engine(payload) }
-  ncp.step({}, log)
+  ncp.dispatch(log)
 
   assert_eq(#_test.calls(), 0,
     "no send when nefor-tui isn't on the bus")
@@ -1525,7 +1281,7 @@ local function test_engine_origin_does_not_trigger_ready_handshake_error()
   local payload = make_engine_plugin_failed(
     "x", "spawn", "y", "missing_dir"
   )
-  ncp.step({}, { entry_engine(payload) })
+  ncp.dispatch({ entry_engine(payload) })
 
   -- All sends must target nefor-tui (the popup), not "engine".
   for _, c in ipairs(_test.calls()) do
@@ -1549,13 +1305,13 @@ local function test_engine_plugin_failed_buffers_until_chat_readies()
     "ollama", "spawn", "binary not found", "missing_dir"
   )
   local log = { entry_engine(payload) }
-  ncp.step({}, log)
+  ncp.dispatch(log)
   assert_eq(#_test.calls(), 0,
     "no send while nefor-tui is pre-ready (popup buffered)")
 
   -- Now chat readies — handshake reply + buffered popup must both fire.
   log[#log + 1] = entry_plugin("nefor-tui", make_ready("0.1"))
-  ncp.step({}, log)
+  ncp.dispatch(log)
 
   local calls = _test.calls()
   assert_eq(#calls, 2,
@@ -1583,15 +1339,15 @@ local function test_engine_envelopes_skipped_in_replay_to_late_attachers()
   -- Chat readies first; engine reports a failure; then a late plugin
   -- attaches. Replay should NOT carry the engine entry to it.
   local log = { entry_plugin("nefor-tui", make_ready("0.1")) }
-  ncp.step({}, log)
+  ncp.dispatch(log)
   log[#log + 1] = entry_engine(
     make_engine_plugin_failed("x", "spawn", "y", "missing_dir")
   )
-  ncp.step({}, log)
+  ncp.dispatch(log)
   _test.calls_clear()
 
   log[#log + 1] = entry_plugin("late", make_ready("0.1"))
-  ncp.step({}, log)
+  ncp.dispatch(log)
 
   -- Late plugin gets ready_ok; nothing else (no engine.plugin_failed
   -- replay, no chat.popup replay since the chat.popup was a step-origin
@@ -1674,17 +1430,6 @@ local tests = {
   { name = "rga_register_type_dispatches_custom_handler", fn = test_rga_register_type_dispatches_custom_handler },
   { name = "rga_terminal_handler_emits_ack_and_node_result_synchronously", fn = test_rga_terminal_handler_emits_ack_and_node_result_synchronously },
   { name = "rga_for_reasoner_graph_passes_through_unrelated_kinds", fn = test_rga_for_reasoner_graph_passes_through_unrelated_kinds },
-  { name = "saved_log_is_not_replayed_when_resume_inactive", fn = test_saved_log_is_not_replayed_when_resume_inactive },
-  { name = "resume_unregistered_plugin_drops_by_default", fn = test_resume_unregistered_plugin_drops_by_default },
-  { name = "resume_registered_transform_runs", fn = test_resume_registered_transform_runs },
-  { name = "resume_transform_can_drop_by_returning_nil", fn = test_resume_transform_can_drop_by_returning_nil },
-  { name = "resume_transform_error_drops_silently", fn = test_resume_transform_error_drops_silently },
-  { name = "resume_default_tui_transform_keeps_chat_history", fn = test_resume_default_tui_transform_keeps_chat_history },
-  { name = "resume_default_provider_transform_keeps_structural_chats", fn = test_resume_default_provider_transform_keeps_structural_chats },
-  { name = "resume_register_defaults_wires_tui_and_provider", fn = test_resume_register_defaults_wires_tui_and_provider },
-  { name = "saved_log_replays_to_target_when_resume_active", fn = test_saved_log_replays_to_target_when_resume_active },
-  { name = "saved_log_replay_skips_self_origin", fn = test_saved_log_replay_skips_self_origin },
-  { name = "saved_log_skipped_when_resume_inactive_explicit", fn = test_saved_log_skipped_when_resume_inactive_explicit },
   { name = "spawn_rejects_env_field_with_hint", fn = test_spawn_rejects_env_field_with_hint },
   { name = "spawn_rejects_args_field_with_hint", fn = test_spawn_rejects_args_field_with_hint },
   { name = "spawn_rejects_cwd_field_with_hint", fn = test_spawn_rejects_cwd_field_with_hint },

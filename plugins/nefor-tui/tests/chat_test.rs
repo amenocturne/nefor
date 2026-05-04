@@ -256,7 +256,7 @@ fn ctrl_d_exits() {
 }
 
 #[test]
-fn slash_new_clears_transcript_and_emits_chat_reset() {
+fn slash_new_clears_transcript_and_mints_new_session() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -275,12 +275,17 @@ fn slash_new_clears_transcript_and_emits_chat_reset() {
     let _ = engine.take_emit_queue();
     engine.handle_key(key("enter")).expect("enter");
     let emits = engine.take_emit_queue();
-    // /new must cancel any in-flight work AND clear the chat: emits both
-    // chat.interrupt_all (kills graphs/pending tool calls) and chat.reset.
+    // `/new` must cancel any in-flight work AND mint a brand-new
+    // on-disk session — without the latter, every submit kept landing
+    // in the same jsonl no matter how many times the user typed `/new`,
+    // so the picker only ever showed one growing entry. The egress is
+    // chat.interrupt_all (kills graphs/pending tool calls) +
+    // sessions.new_request (the starter's sessions module mints a
+    // fresh id and runs end → swap → start in-process).
     assert_eq!(
         emits.len(),
         2,
-        "expected interrupt_all + reset egress, got {emits:?}"
+        "expected interrupt_all + sessions.new_request egress, got {emits:?}"
     );
     let kinds: Vec<_> = emits
         .iter()
@@ -291,8 +296,8 @@ fn slash_new_clears_transcript_and_emits_chat_reset() {
         "missing chat.interrupt_all in {kinds:?}"
     );
     assert!(
-        kinds.contains(&"chat.reset"),
-        "missing chat.reset in {kinds:?}"
+        kinds.contains(&"sessions.new_request"),
+        "missing sessions.new_request in {kinds:?}"
     );
 
     let out = render_str(&mut engine);
@@ -1877,55 +1882,44 @@ fn statusline_shows_bottom_marker_when_transcript_overflows() {
 }
 
 #[test]
-fn outer_padding_leaves_terminal_edges_blank() {
-    // Outer padding so the UI doesn't sit flush against terminal edges
-    // (legacy spec section 1: HPAD=2 horizontal, 1-cell vertical). The
-    // first two columns and the last two columns are blank; the top and
-    // bottom rows are blank.
+fn left_column_lifts_input_and_statusline_off_terminal_edges() {
+    // No outer padding any more — the sidebar's vertical separator
+    // runs full window height edge-to-edge. Per-element spacing now
+    // lives inside `left_column`: a 1-row blank above the transcript
+    // and a 1-row blank below the statusline so the input + status
+    // sit one line off the top and bottom of the chat area without
+    // forcing a uniform gutter on the sidebar side too.
+    //
+    // We assert the chat-side columns (left of the sidebar separator)
+    // are blank on the very first and last rows; we do NOT assert the
+    // whole row is blank — the sidebar runs flush with the terminal
+    // top and bottom, which is the visual the user wants.
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
     let snap = engine.snapshot();
     let rows: Vec<&str> = snap.lines().collect();
 
-    // Top row: all spaces.
+    // Find the sidebar separator column on a mid-screen row to bound
+    // the chat area on the left.
+    let sample_row = rows.get(rows.len() / 2).expect("mid row");
+    let sep_col = sample_row
+        .chars()
+        .position(|c| c == '│')
+        .expect("sidebar separator should be present in the default layout");
+
     let top = rows.first().expect("top row");
-    assert!(
-        top.chars().all(|c| c == ' '),
-        "top row must be blank (1-cell vpad): {top:?}"
-    );
-    // Bottom row: all spaces.
     let bot = rows.last().expect("bottom row");
+    let chat_top: String = top.chars().take(sep_col).collect();
+    let chat_bot: String = bot.chars().take(sep_col).collect();
     assert!(
-        bot.chars().all(|c| c == ' '),
-        "bottom row must be blank (1-cell vpad): {bot:?}"
+        chat_top.chars().all(|c| c == ' '),
+        "top row chat-side must be blank: {chat_top:?}"
     );
-    // Left two columns on every row: spaces (HPAD=2).
-    for (i, r) in rows.iter().enumerate() {
-        let mut chars = r.chars();
-        let c0 = chars.next().unwrap_or(' ');
-        let c1 = chars.next().unwrap_or(' ');
-        assert_eq!(c0, ' ', "col 0 of row {i} must be blank: {r:?}");
-        assert_eq!(c1, ' ', "col 1 of row {i} must be blank (HPAD=2): {r:?}");
-    }
-    // Right two columns on every row: spaces (HPAD=2). Walk by chars so
-    // multi-byte glyphs don't confuse the byte-indexed view.
-    for (i, r) in rows.iter().enumerate() {
-        let chars: Vec<char> = r.chars().collect();
-        let n = chars.len();
-        if n >= 2 {
-            assert_eq!(
-                chars[n - 1],
-                ' ',
-                "rightmost col of row {i} must be blank: {r:?}"
-            );
-            assert_eq!(
-                chars[n - 2],
-                ' ',
-                "second-from-right col of row {i} must be blank (HPAD=2): {r:?}"
-            );
-        }
-    }
+    assert!(
+        chat_bot.chars().all(|c| c == ' '),
+        "bottom row chat-side must be blank: {chat_bot:?}"
+    );
 }
 
 #[test]
@@ -2136,9 +2130,10 @@ fn model_picker_typing_filters_query() {
 // ============================================================
 //
 // The picker reads from `$NEFOR_DATA_HOME/sessions/` (overridable via
-// env var, set per-test for isolation). Selecting a row writes the
-// chosen session id to `$NEFOR_DATA_HOME/resume_target` and emits
-// `{kind="exit"}`; init.lua reads that file at the next boot.
+// env var, set per-test for isolation). Selecting a row emits a
+// `sessions.resume_request { session_id }` envelope onto the NCP bus —
+// no process exit, no sidechannel file. The starter's `sessions` Lua
+// module subscribes to that kind and runs the in-process swap.
 //
 // Test isolation: each test creates a tempdir, sets NEFOR_DATA_HOME to
 // it, and tears it down on completion. Env var manipulation is
@@ -2179,10 +2174,6 @@ impl ResumeEnv {
 
     fn sessions_dir(&self) -> PathBuf {
         self.data_home.join("sessions")
-    }
-
-    fn resume_target(&self) -> PathBuf {
-        self.data_home.join("resume_target")
     }
 
     fn write_session(&self, id: &str, started_at: &str, prompt: Option<&str>) {
@@ -2228,8 +2219,16 @@ impl Drop for ResumeEnv {
 #[test]
 fn slash_resume_opens_session_picker_popup() {
     let env = ResumeEnv::new();
-    env.write_session("aaaa1111-1111-1111-1111-111111111111", "2026-05-01T10:00:00.000Z", Some("first prompt"));
-    env.write_session("bbbb2222-2222-2222-2222-222222222222", "2026-05-02T11:00:00.000Z", Some("second prompt"));
+    env.write_session(
+        "aaaa1111-1111-1111-1111-111111111111",
+        "2026-05-01T10:00:00.000Z",
+        Some("first prompt"),
+    );
+    env.write_session(
+        "bbbb2222-2222-2222-2222-222222222222",
+        "2026-05-02T11:00:00.000Z",
+        Some("second prompt"),
+    );
 
     let mut engine = Engine::new(120, 30).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
@@ -2278,7 +2277,10 @@ fn session_picker_lists_recent_sessions_with_preview() {
 }
 
 #[test]
-fn session_picker_select_writes_sidechannel_and_exits() {
+fn resume_keeps_tui_alive() {
+    // Picker selection must NOT terminate the TUI process. Instead it
+    // emits a `sessions.resume_request { session_id }` envelope onto the
+    // bus; the starter's sessions module owns the in-process swap.
     let env = ResumeEnv::new();
     let session_id = "abcd1234-5678-9012-3456-7890abcdef00";
     env.write_session(session_id, "2026-05-01T10:00:00.000Z", Some("anything"));
@@ -2292,30 +2294,32 @@ fn session_picker_select_writes_sidechannel_and_exits() {
     }
     engine.handle_key(key("enter")).expect("enter");
     let _ = render_str(&mut engine);
+    // Drain emits from the picker open so the assertion below sees only
+    // the selection's egress.
+    let _ = engine.take_emit_queue();
 
     // Cursor defaults to 1; with one session that's our row. Hit Enter.
     engine.handle_key(key("enter")).expect("enter on row");
 
     assert!(
-        engine.exit_requested(),
-        "selecting a session must request exit"
+        !engine.exit_requested(),
+        "picker selection must NOT terminate the TUI process",
     );
-    let target_file = env.resume_target();
-    assert!(
-        target_file.exists(),
-        "resume_target file should exist at {}",
-        target_file.display()
-    );
-    let written = std::fs::read_to_string(&target_file).expect("read sidechannel");
+
+    let emits = engine.take_emit_queue();
+    let request = emits
+        .iter()
+        .find(|(_, b)| b.get("kind").and_then(|v| v.as_str()) == Some("sessions.resume_request"));
+    let (_, body) = request.expect("expected sessions.resume_request egress");
     assert_eq!(
-        written.trim(),
-        session_id,
-        "sidechannel should contain the chosen session id"
+        body.get("session_id").and_then(|v| v.as_str()),
+        Some(session_id),
+        "resume_request must carry the chosen session id",
     );
 }
 
 #[test]
-fn session_picker_escape_cancels_without_writing() {
+fn session_picker_escape_cancels_without_emitting() {
     let env = ResumeEnv::new();
     env.write_session(
         "deadbeef-0000-0000-0000-000000000000",
@@ -2332,21 +2336,25 @@ fn session_picker_escape_cancels_without_writing() {
     }
     engine.handle_key(key("enter")).expect("enter");
     let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
 
     engine.handle_key(key("escape")).expect("escape");
     assert!(!engine.exit_requested(), "escape must not exit");
+    let emits = engine.take_emit_queue();
     assert!(
-        !env.resume_target().exists(),
-        "no sidechannel write on escape"
+        !emits.iter().any(|(_, b)| {
+            b.get("kind").and_then(|v| v.as_str()) == Some("sessions.resume_request")
+        }),
+        "escape must not emit sessions.resume_request",
     );
 }
 
 #[test]
-fn slash_resume_with_arg_writes_sidechannel_and_exits() {
-    // `/resume <id>` is the bypass-picker path. Useful for scripted
-    // testing and copy-paste recipes — no popup, write the file and
-    // exit.
-    let env = ResumeEnv::new();
+fn slash_resume_with_arg_emits_resume_request() {
+    // `/resume <id>` is the bypass-picker path: emit the resume_request
+    // straight onto the bus, no popup. The TUI process stays alive —
+    // the starter's sessions module runs the swap in-process.
+    let _env = ResumeEnv::new();
     let session_id = "feedface-0000-0000-0000-000000000000";
 
     let mut engine = Engine::new(120, 30).expect("engine");
@@ -2357,14 +2365,29 @@ fn slash_resume_with_arg_writes_sidechannel_and_exits() {
     for ch in cmd.chars() {
         // `key()` uses the raw character as the keypress name. For space,
         // the engine's input router synthesizes "key.space" — match that.
-        let n = if ch == ' ' { "space".to_string() } else { ch.to_string() };
+        let n = if ch == ' ' {
+            "space".to_string()
+        } else {
+            ch.to_string()
+        };
         engine.handle_key(key(&n)).expect("type");
     }
+    let _ = engine.take_emit_queue();
     engine.handle_key(key("enter")).expect("enter");
 
-    assert!(engine.exit_requested(), "/resume <id> should exit");
-    let written = std::fs::read_to_string(env.resume_target()).expect("read sidechannel");
-    assert_eq!(written.trim(), session_id);
+    assert!(
+        !engine.exit_requested(),
+        "/resume <id> must NOT terminate the TUI",
+    );
+    let emits = engine.take_emit_queue();
+    let req = emits
+        .iter()
+        .find(|(_, b)| b.get("kind").and_then(|v| v.as_str()) == Some("sessions.resume_request"));
+    let (_, body) = req.expect("expected sessions.resume_request egress");
+    assert_eq!(
+        body.get("session_id").and_then(|v| v.as_str()),
+        Some(session_id),
+    );
 }
 
 /// Mouse drag inside the transcript triggers the chat.lua mouse.selection
@@ -2440,10 +2463,11 @@ fn mouse_drag_copies_selection_and_shows_toast() {
         })
         .expect("up");
 
-    // Advance past the toast's slide-in animation window so the
-    // assertion sees the fully-sized toast (otherwise the first frame
-    // is height=1 and only the top border rule renders, no text yet).
-    engine.advance_time(Duration::from_millis(250));
+    // Render once — the slide animation translates horizontally rather
+    // than clipping height, so the toast text is on screen from frame
+    // one. Skipping the previous `advance_time(250)` keeps the gap
+    // between dispatch and assertion small enough that real wall-clock
+    // drift on a loaded CI box can't push past the 2 s default TTL.
     let _ = render_str(&mut engine);
     let _ = engine.take_emit_queue();
     let post = engine.snapshot();
@@ -2460,12 +2484,12 @@ fn mouse_drag_copies_selection_and_shows_toast() {
 }
 
 /// Toast layout assertions: the bordered toast pill anchors to the
-/// bottom-left of the BODY area only — overlaying transcript content
+/// bottom-right of the BODY area only — overlaying transcript content
 /// at the bottom rows of the body region, but never covering the
 /// input field or statusline below it. Statusline placeholder remains
 /// visible after the toast appears.
 #[test]
-fn mouse_drag_toast_does_not_cover_input_or_statusline() {
+fn mouse_drag_toast_overlays_input_and_statusline() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     // Stream a known message into the transcript so the drag covers
@@ -2533,24 +2557,903 @@ fn mouse_drag_toast_does_not_cover_input_or_statusline() {
         })
         .expect("up");
 
-    // Advance past the toast's slide-in animation so the toast
-    // renders at full height in the snapshot.
-    engine.advance_time(Duration::from_millis(250));
+    // Render once — the horizontal slide leaves the toast at full
+    // height/width from frame one, so we don't need to advance the
+    // synthetic clock past the enter window. Doing so unnecessarily
+    // narrows the wall-clock budget against the 2 s default TTL.
     let _ = render_str(&mut engine);
     let _ = engine.take_emit_queue();
     let post = engine.snapshot();
 
-    // Statusline placeholder must STILL be visible — the toast lives
-    // in the body area, not over the statusline.
-    assert!(
-        post.lines()
-            .any(|l| l.contains("Start chatting to see stats")),
-        "statusline placeholder should remain visible after toast: {post:?}"
-    );
-    // Sanity: the toast label is still present somewhere.
+    // Toast is a small pill anchored bottom-right. It overlays the
+    // input + statusline area on the right side; the left side of
+    // the statusline (where the placeholder text lives) is undisturbed.
+    // What matters is that the toast LABEL renders into the bottom
+    // few rows — proving it's painted above the input/statusline in
+    // z-order, not that it occludes the entire row.
     let label = format!("copied {} chars", "selectable-token".len());
+    let bottom_rows: String = post.lines().rev().take(5).collect::<Vec<_>>().join("\n");
     assert!(
-        post.contains(&label),
-        "expected toast label `{label}` somewhere in frame: {post:?}"
+        bottom_rows.contains(&label),
+        "expected toast label `{label}` in the bottom rows: {bottom_rows:?}"
+    );
+}
+
+/// Toast slide animation: the text inside the banner translates
+/// leftward from flush-right into its rest position (TOAST_REST_INSET
+/// cells inset from the right edge) over the enter window. We sample
+/// a frame mid-enter and another at rest, then assert the text's
+/// rightmost column moves leftward. The bars span full width and
+/// never move; only the text's right-padding animates.
+///
+/// Triggers via `chat.toast` (rather than mouse drag) so the TTL is
+/// long enough that real wall-clock drift between snapshots doesn't
+/// race the toast's expiry — `tui.now_ms` adds wall-clock elapsed on
+/// top of the synthetic offset, and a slow CI run can push a 2000 ms
+/// default TTL toast out of view before the rest snapshot is taken.
+#[test]
+fn chat_toast_slides_horizontally_during_enter() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    // 60-second TTL — plenty of headroom for slow test runs.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.toast",
+            "text": "slide-test",
+            "ttl_ms": 60_000,
+        }),
+    );
+
+    // Helper: longest leading prefix of "slide-test" found in `snap`.
+    // Mid-enter only the first few chars are rendered (the leading
+    // characters peek through at the right edge); at rest the full
+    // word is visible. So the prefix length grows monotonically as
+    // the slide progresses — that's what we assert.
+    fn longest_visible_prefix(snap: &str) -> usize {
+        let candidate = "slide-test";
+        let mut best = 0;
+        for prefix_len in 1..=candidate.len() {
+            if snap.contains(&candidate[..prefix_len]) {
+                best = prefix_len;
+            } else {
+                break;
+            }
+        }
+        best
+    }
+
+    // Sample mid-enter — ease_out_cubic(50/220) ≈ 0.59, total_slide
+    // = 12 (10 chars + TOAST_REST_INSET=2), distance_slid ≈ 7. So
+    // the first 7 chars of "slide-test" are rendered: "slide-t".
+    engine.advance_time(Duration::from_millis(50));
+    let _ = render_str(&mut engine);
+    let early = engine.snapshot();
+    let early_prefix = longest_visible_prefix(&early);
+    assert!(
+        early_prefix > 0 && early_prefix < "slide-test".len(),
+        "expected partial label mid-enter (got prefix len {early_prefix}); snapshot:\n{early}"
+    );
+
+    // Sample at rest — past the enter window. distance_slid =
+    // total_slide → full label visible.
+    engine.advance_time(Duration::from_millis(250));
+    let _ = render_str(&mut engine);
+    let rest = engine.snapshot();
+    let rest_prefix = longest_visible_prefix(&rest);
+    assert_eq!(
+        rest_prefix,
+        "slide-test".len(),
+        "expected full label visible at rest; snapshot:\n{rest}"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Resume / session lifecycle from the TUI's perspective
+// ──────────────────────────────────────────────────────────────────────────
+//
+// These tests pin the chat-side handling of the four control envelopes the
+// starter `sessions` module emits — `sessions.session_end`,
+// `sessions.session_start`, `sessions.resume_done` (broadcast events) — and
+// the orchestrator's `chat.message.append` round-trip echo. The earlier
+// tests in this file cover the egress side (`/resume <id>` → emits
+// `sessions.resume_request`); these cover the ingress side (the bus
+// envelopes flow back into chat.lua).
+//
+// Why the dedicated section: the resume path has had subtle bugs (transcript
+// stayed empty after pick, replayed deltas re-streamed in real time, first
+// post-`/new` submit invisible) that only surface when the lifecycle events
+// interleave with live keypresses. The chat surface has no Rust-side state
+// observable from the test other than (a) what it renders and (b) what it
+// emits — the assertions reflect that.
+
+/// `/new` immediately followed by a submit must show the user's text. The
+/// orchestrator echoes the submitted text back as `chat.message.append
+/// role=user` so it persists + replays; the chat side has a `pending_user_echo`
+/// dedup marker so the echo doesn't double-render the live message. The
+/// regression: the lifecycle events from `/new` (chat.reset, session_end,
+/// session_start, resume_done) used to land BEFORE the echo, and
+/// session_end's `entries = {}` clear wiped the locally-pushed user message.
+/// Then when the echo arrived, `pending_user_echo` was nil → `push_entry`
+/// fires → the message appears. So the order is what matters: this test
+/// drives the pessimistic order (lifecycle events arrive AFTER the local
+/// submit, then the echo arrives) and asserts the message is visible.
+#[test]
+fn slash_new_then_submit_shows_user_message_after_lifecycle_round_trip() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // `/new` + Enter — locally clears state, emits chat.interrupt_all +
+    // sessions.new_request.
+    for ch in "/new".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    // "hello" + Enter immediately — local push of user message,
+    // pending_user_echo set to "hello", emits chat.input.submit.
+    for ch in "hello".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    // Now the engine catches up: agentic_workflow's session_end teardown
+    // broadcasts chat.reset, sessions.lua emits the three lifecycle
+    // envelopes, and the chat.input.submit handler emits the echo.
+    dispatch_event(&mut engine, json!({ "kind": "chat.reset" }));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_end", "session_id": "old-id" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "new-id" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.resume_done", "session_id": "new-id", "replayed": 0 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "hello" }),
+    );
+
+    let _ = render_str(&mut engine);
+    let out = engine.snapshot();
+    assert!(
+        out.contains("hello"),
+        "user's first post-/new message must remain visible after the \
+         lifecycle round-trip; transcript was:\n{out}",
+    );
+}
+
+/// Live submit (no `/new` preceding) must dedup the echo. Local push +
+/// echo round-trip must produce ONE rendered user line, not two. The
+/// `pending_user_echo` marker is what enforces this.
+#[test]
+fn live_submit_dedups_orchestrator_echo() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "abc".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "abc" }),
+    );
+    let _ = render_str(&mut engine);
+    let out = engine.snapshot();
+
+    // "abc" must appear exactly once. Count the prefix occurrences with
+    // some forgiveness for the timestamp / icon column.
+    let occurrences = out.matches("abc").count();
+    assert_eq!(
+        occurrences, 1,
+        "expected exactly one rendered user line for 'abc' (dedup against \
+         the orchestrator's echo); got {occurrences} in: {out:?}",
+    );
+}
+
+/// Replay path: between session_start and resume_done, `chat.message.append`
+/// envelopes must paint the transcript. This is what makes a `/resume` show
+/// the prior conversation. The dedup marker is irrelevant on replay (the
+/// chat surface didn't emit anything live), so push_entry fires for every
+/// replayed envelope.
+#[test]
+fn replay_paints_transcript_between_session_start_and_resume_done() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Open the resume cycle.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_end", "session_id": "old" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "new" }),
+    );
+
+    // Replay envelopes — what the engine's replay loop sends to nefor-tui.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "first prompt" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "assistant", "text": "first reply" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "second prompt" }),
+    );
+
+    // Close the cycle.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.resume_done", "session_id": "new", "replayed": 3 }),
+    );
+
+    let _ = render_str(&mut engine);
+    let out = engine.snapshot();
+    for needle in ["first prompt", "first reply", "second prompt"] {
+        assert!(
+            out.contains(needle),
+            "replayed entry {needle:?} missing from transcript:\n{out}",
+        );
+    }
+}
+
+/// `sessions.session_end` deliberately does NOT touch `entries` —
+/// the trigger paths (`/new`, `/resume`) own the local transcript
+/// clear. Earlier the handler wiped entries here, but that was a
+/// race: when the user typed their first prompt in the new session
+/// before the bus envelope arrived, the wipe destroyed the
+/// locally-pushed message. This test pins the new contract.
+#[test]
+fn session_end_does_not_wipe_entries() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "user-typed-quickly" }),
+    );
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_end", "session_id": "old" }),
+    );
+    let _ = render_str(&mut engine);
+    let out = engine.snapshot();
+    assert!(
+        out.contains("user-typed-quickly"),
+        "session_end must NOT wipe entries — that was the production \
+         race that destroyed the user's first prompt after /new. \
+         Transcript:\n{out}",
+    );
+}
+
+/// Local entry-clear is owned by the trigger paths — `/new`, `/resume`,
+/// picker selection. The lifecycle envelopes are NOT responsible for
+/// wiping entries (see `session_end_does_not_wipe_entries`). This test
+/// pins the picker-selection clear: hitting Enter on a session row
+/// emits `sessions.resume_request` AND locally empties `entries` so
+/// the imminent replay paints onto a clean slate.
+#[test]
+fn picker_enter_locally_clears_transcript_before_resume() {
+    let env = ResumeEnv::new();
+    let target = "deadbeef-aaaa-4bbb-8ccc-000000000001";
+    env.write_session(target, "2026-05-04T12:00:00.000Z", Some("seed"));
+
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Old content from the current session.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "old-content" }),
+    );
+    let _ = render_str(&mut engine);
+
+    // Open the picker and press Enter on the (only) row.
+    for ch in "/resume".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter open");
+    let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+    engine.handle_key(key("enter")).expect("enter pick");
+    let _ = render_str(&mut engine);
+
+    let out = engine.snapshot();
+    assert!(
+        !out.contains("old-content"),
+        "picker Enter must locally clear the transcript so replay \
+         paints fresh:\n{out}",
+    );
+}
+
+/// `/new` must not strand a `pending_user_echo` from the prior turn. If
+/// the user submits "abc", presses `/new` before the echo arrives, then
+/// types "abc" again as their first post-`/new` submit, the second "abc"
+/// must NOT be deduped against the stranded marker — that would silently
+/// drop the user's first message in the new session.
+#[test]
+fn slash_new_clears_pending_user_echo_so_repeated_text_is_not_swallowed() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // First submit — sets pending_user_echo to "abc".
+    for ch in "abc".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    // `/new` BEFORE the orchestrator's echo arrives, so the marker is
+    // stranded. Then immediately submit the same text again.
+    for ch in "/new".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    // Second submit, identical text — different new session, NOT a
+    // duplicate. (No echo for the first "abc" was ever delivered.)
+    for ch in "abc".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    // Lifecycle catches up + echo arrives for the post-/new submit.
+    dispatch_event(&mut engine, json!({ "kind": "chat.reset" }));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_end", "session_id": "old" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "new" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.resume_done", "session_id": "new", "replayed": 0 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "abc" }),
+    );
+
+    let _ = render_str(&mut engine);
+    let out = engine.snapshot();
+    assert!(
+        out.contains("abc"),
+        "the post-/new 'abc' must remain visible — a stranded \
+         pending_user_echo from the pre-/new submit must not eat it. \
+         Transcript:\n{out}",
+    );
+}
+
+/// `/new` egress contract: cancels in-flight work AND mints a new on-disk
+/// session. Already covered by `slash_new_clears_transcript_and_mints_new_session`
+/// at the top of this file; this companion test pins the absence of stale
+/// emits — `/new` must NOT emit `sessions.resume_request` (that's the
+/// /resume path).
+#[test]
+fn slash_new_does_not_emit_resume_request() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "/new".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let emits = engine.take_emit_queue();
+
+    let kinds: Vec<_> = emits
+        .iter()
+        .map(|(_, b)| b.get("kind").and_then(|v| v.as_str()).unwrap_or(""))
+        .collect();
+    assert!(
+        !kinds.contains(&"sessions.resume_request"),
+        "/new must not emit sessions.resume_request; got {kinds:?}",
+    );
+    assert!(
+        kinds.contains(&"sessions.new_request"),
+        "/new must emit sessions.new_request; got {kinds:?}",
+    );
+}
+
+/// User flow with prior content, then `/new`, then immediate submit.
+/// Mimics the production scenario the user reported: had one session,
+/// switched to a new one, typed a prompt, first message didn't display.
+/// This drives the optimistic order (session lifecycle ARRIVES BEFORE
+/// the user's submit) — the realistic order under interactive typing.
+#[test]
+fn realistic_new_flow_with_prior_content_displays_first_message() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Prior session content.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "old-prompt" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "assistant", "text": "old-reply" }),
+    );
+    let _ = render_str(&mut engine);
+
+    // `/new` → emits chat.interrupt_all + sessions.new_request.
+    for ch in "/new".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    // Lifecycle catches up FIRST (engine is fast → events arrive before
+    // the user finishes typing the next prompt).
+    dispatch_event(&mut engine, json!({ "kind": "chat.reset" }));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_end", "session_id": "old" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "new" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.resume_done", "session_id": "new", "replayed": 0 }),
+    );
+    let _ = render_str(&mut engine);
+
+    // Old content is gone.
+    let mid = engine.snapshot();
+    assert!(
+        !mid.contains("old-prompt"),
+        "old content must be cleared by lifecycle: {mid}"
+    );
+
+    // User types first message in fresh session.
+    for ch in "fresh-prompt".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    // Orchestrator's echo for the fresh submit.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "fresh-prompt" }),
+    );
+    let _ = render_str(&mut engine);
+    let out = engine.snapshot();
+    assert!(
+        out.contains("fresh-prompt"),
+        "first post-/new submit must render — production bug repro. \
+         Transcript:\n{out}",
+    );
+}
+
+/// Boot-time race: ncp.lua's replay-on-attach delivers `sessions.session_start`
+/// (emitted during `sessions.init()`) AFTER nefor-tui finished its handshake.
+/// If the user types their first prompt before that envelope lands, the
+/// local push is in `entries`. The session_start handler used to wipe
+/// `entries = {}` "for cleanliness" — but at boot the transcript is
+/// already empty, so the clear only ever destroyed the user's locally-
+/// pushed message. The user then saw only the assistant's reply because
+/// the orchestrator's chat.message.append echo got deduped against
+/// pending_user_echo, so nothing repaints the user line.
+#[test]
+fn boot_session_start_after_local_submit_keeps_user_message_visible() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // User types FIRST, before the boot session_start arrives.
+    for ch in "first-prompt".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    // Now the boot session_start arrives (replay-on-attach).
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "boot" }),
+    );
+
+    // Then the orchestrator's echo arrives — it's deduped against the
+    // pending_user_echo marker the local submit set.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "first-prompt" }),
+    );
+
+    // Assistant streams a reply.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "text": "response-token" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
+    );
+
+    let _ = render_str(&mut engine);
+    let out = engine.snapshot();
+    assert!(
+        out.contains("first-prompt"),
+        "user's first message must remain visible after boot session_start \
+         lands; this is the production regression — only the assistant's \
+         reply was visible, never the user prompt. Transcript:\n{out}",
+    );
+    assert!(
+        out.contains("response-token"),
+        "assistant reply must also be visible:\n{out}"
+    );
+}
+
+/// Production bug: user submits, orchestrator emits a tool_call right away
+/// (no preceding text), the user sees the tool call but NOT their own
+/// prompt. Reproduces by: do the local submit (push_entry + set marker),
+/// then have a session-lifecycle event wipe `entries` (this is what
+/// `sessions.session_end` does — broadcast by `teardown_for_session_end`
+/// at the start of `/new` or `/resume`, but also reachable via other
+/// races). When the orchestrator's echo arrives, the dedup matches the
+/// stranded marker and silently swallows it. Then `chat.tool.start`
+/// pushes the tool block. The transcript ends up showing only the tool
+/// call.
+///
+/// Fix: dedup must verify the local push actually landed in entries
+/// (tail is a user-role entry with matching text) before suppressing
+/// the echo. Otherwise it lets the echo through so the user line is at
+/// least visible via the round-trip.
+#[test]
+fn echo_repaints_user_message_when_local_push_was_wiped_before_echo() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // User submits — local push goes into entries, pending_user_echo set.
+    for ch in "summarize-thing".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    // Some lifecycle event wipes entries (simulating a stranded clear —
+    // this could be session_end fired late, or any future code path
+    // that clears entries while the marker is still set).
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_end", "session_id": "old" }),
+    );
+    let _ = render_str(&mut engine);
+
+    // Orchestrator's echo arrives with the SAME text the marker
+    // tracks — naive dedup would swallow it.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "summarize-thing" }),
+    );
+    // Then the tool call paints (the visible artefact of the bug).
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.tool.start",
+            "id": "t1",
+            "name": "spawn_graph",
+            "input": "{}",
+        }),
+    );
+    let _ = render_str(&mut engine);
+
+    let out = engine.snapshot();
+    assert!(
+        out.contains("summarize-thing"),
+        "user prompt must remain visible even when entries was wiped \
+         between local push and echo (production bug repro). \
+         Transcript:\n{out}",
+    );
+    assert!(
+        out.contains("spawn_graph"),
+        "tool call must still render:\n{out}"
+    );
+}
+
+/// Direct production repro: at boot the first message renders fine, but
+/// after `/new` the very first submit's user message disappears while
+/// subsequent submits show. This drives the exact sequence the user sees:
+/// 1. Boot session, submit message #1, echo deduped, both visible.
+/// 2. `/new` → lifecycle cycle.
+/// 3. Submit message #2 in the new session.
+/// 4. Tool call arrives (no preceding text) — the orchestrator decided
+///    to spawn_graph immediately.
+/// 5. Assistant streams a final answer.
+///
+/// At step 5, the user must see message #2 above the tool call, not just
+/// the tool call. This pins it.
+#[test]
+fn first_submit_after_slash_new_renders_user_message_when_tool_call_follows() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Step 1: first session, first submit.
+    for ch in "old-prompt".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "old-prompt" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "text": "old-reply" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
+    );
+    let _ = render_str(&mut engine);
+    let first = engine.snapshot();
+    assert!(
+        first.contains("old-prompt"),
+        "boot session must show user message:\n{first}"
+    );
+
+    // Step 2: /new fires the lifecycle. Engine broadcasts chat.reset +
+    // session_end + session_start + resume_done back.
+    for ch in "/new".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    dispatch_event(&mut engine, json!({ "kind": "chat.reset" }));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_end", "session_id": "boot" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "new" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.resume_done", "session_id": "new", "replayed": 0 }),
+    );
+    let _ = render_str(&mut engine);
+    let mid = engine.snapshot();
+    assert!(
+        !mid.contains("old-prompt"),
+        "old session content must be cleared after /new:\n{mid}"
+    );
+
+    // Step 3: submit a tool-call-triggering prompt in the new session.
+    for ch in "summarize-things".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+
+    // Step 4: orchestrator's echo + immediate tool_call (no preceding
+    // text/reasoning — the orchestrator went straight to spawn_graph).
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "summarize-things" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.tool.start",
+            "id": "t1",
+            "name": "spawn_graph",
+            "input": "{}",
+        }),
+    );
+
+    // Step 5: graph events + final answer.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.run_started",
+            "run_id": "r1",
+            "total_nodes": 3,
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.run_complete",
+            "run_id": "r1",
+            "status": "ok",
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.tool.end",
+            "id": "t1",
+            "output": "ok",
+            "error": false,
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "text": "final-answer" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
+    );
+    let _ = render_str(&mut engine);
+
+    let out = engine.snapshot();
+    assert!(
+        out.contains("summarize-things"),
+        "user's first prompt in the post-/new session must be visible \
+         above the tool call. Production bug repro. Transcript:\n{out}",
+    );
+    assert!(
+        out.contains("spawn_graph") || out.contains("final-answer"),
+        "tool call or final answer must also be visible:\n{out}"
+    );
+}
+
+/// Popups must paint an opaque background — transcript text behind the
+/// popup box must NOT bleed through the empty rows inside the box. The
+/// permission popup is the worst offender because its natural content
+/// is short relative to the 50%-height shell, leaving lots of empty
+/// dead-space cells that used to render whatever was on the layer
+/// below (the transcript). The fix puts a `tui.fill { char = " " }`
+/// stack-layer behind the content so every cell inside the box is
+/// painted.
+#[test]
+fn popup_paints_opaque_background_over_transcript() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Seed transcript with a known marker that sits in the area the
+    // popup will eventually overlay (centred, 60% × 50%).
+    for i in 0..20 {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "chat.message.append",
+                "role": "user",
+                "text": format!("MARKER-LEAK-LINE-{i}"),
+            }),
+        );
+    }
+    let _ = render_str(&mut engine);
+
+    // Open a tool-permission popup (short content; lots of dead space
+    // inside the box).
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.tool.permission_request",
+            "id": "t1",
+            "tool": "spawn_graph",
+            "args": {
+                "nodes": [
+                    {"id": "a", "reasoner": "responder"},
+                    {"id": "b", "reasoner": "responder"},
+                ],
+            },
+        }),
+    );
+    let _ = render_str(&mut engine);
+
+    // Locate the popup's row range. Title row contains
+    // "permission requested". Popup top border is one row above
+    // (a `╭───...───╮` row). Popup bottom border is the next
+    // `╰───...───╯` row after the title.
+    let snap = engine.snapshot();
+    let lines: Vec<&str> = snap.lines().collect();
+    let title_row = lines
+        .iter()
+        .position(|l| l.contains("permission requested"))
+        .expect("popup title row missing — popup didn't render");
+    let popup_top = lines[..title_row]
+        .iter()
+        .rposition(|l| l.contains('╭'))
+        .expect("popup top border row missing");
+    let popup_bottom = lines[title_row..]
+        .iter()
+        .position(|l| l.contains('╰'))
+        .map(|i| title_row + i)
+        .expect("popup bottom border row missing");
+
+    // Identify popup column range from the title row. The popup's
+    // outer borders are the LAST `│` to the left of the title text
+    // and the FIRST `│` to the right.
+    let title_line = lines[title_row];
+    let title_byte = title_line
+        .find("permission requested")
+        .expect("title text in row");
+    let left_border = title_line[..title_byte]
+        .rfind('│')
+        .expect("popup left border on title row");
+    let right_border = title_line[title_byte..]
+        .find('│')
+        .map(|i| title_byte + i)
+        .expect("popup right border on title row");
+
+    // Walk every popup INTERIOR row and slice out only the popup's
+    // columns. Anything OUTSIDE that slice (transcript bubbles to the
+    // left, sidebar to the right) is not a leak — it's other UI.
+    // Inside the slice, ANY transcript marker means the popup failed
+    // to paint an opaque background.
+    for (idx, row) in lines
+        .iter()
+        .enumerate()
+        .take(popup_bottom)
+        .skip(popup_top + 1)
+    {
+        if right_border > left_border + '│'.len_utf8() && row.len() > right_border {
+            let interior = &row[left_border + '│'.len_utf8()..right_border];
+            assert!(
+                !interior.contains("MARKER-LEAK-LINE"),
+                "transcript text leaked into popup interior at row {idx}: \
+                 {interior:?}\nfull snapshot:\n{snap}",
+            );
+        }
+    }
+}
+
+/// `/clear` is an alias for `/new`. Same egress, same lifecycle expectations.
+#[test]
+fn slash_clear_is_alias_for_slash_new() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "/clear".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let emits = engine.take_emit_queue();
+
+    let kinds: Vec<_> = emits
+        .iter()
+        .map(|(_, b)| b.get("kind").and_then(|v| v.as_str()).unwrap_or(""))
+        .collect();
+    assert!(
+        kinds.contains(&"chat.interrupt_all") && kinds.contains(&"sessions.new_request"),
+        "/clear must emit interrupt_all + new_request like /new; got {kinds:?}",
     );
 }

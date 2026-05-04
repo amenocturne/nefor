@@ -484,12 +484,30 @@ mod tests {
             ..Style::default()
         };
         let theme = MarkdownTheme {
-            h1: Some(HeadingStyle { style: h1, prefix: None }),
-            h2: Some(HeadingStyle { style: h2, prefix: None }),
-            h3: Some(HeadingStyle { style: h3, prefix: None }),
-            h4: Some(HeadingStyle { style: h4, prefix: None }),
-            h5: Some(HeadingStyle { style: h5, prefix: None }),
-            h6: Some(HeadingStyle { style: h6, prefix: None }),
+            h1: Some(HeadingStyle {
+                style: h1,
+                prefix: None,
+            }),
+            h2: Some(HeadingStyle {
+                style: h2,
+                prefix: None,
+            }),
+            h3: Some(HeadingStyle {
+                style: h3,
+                prefix: None,
+            }),
+            h4: Some(HeadingStyle {
+                style: h4,
+                prefix: None,
+            }),
+            h5: Some(HeadingStyle {
+                style: h5,
+                prefix: None,
+            }),
+            h6: Some(HeadingStyle {
+                style: h6,
+                prefix: None,
+            }),
             ..MarkdownTheme::default()
         };
         for (level, expected) in [

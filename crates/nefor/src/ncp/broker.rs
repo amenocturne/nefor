@@ -1,28 +1,32 @@
 //! Broker — central state + event loop.
 //!
-//! Post-Slice-2-I3 the broker is a protocol-agnostic string router. Its
-//! responsibilities collapse to:
+//! Post-session-blind refactor the broker is a protocol-agnostic string
+//! router with no on-disk state. Its responsibilities collapse to:
 //!
 //! 1. Accept per-connection transports attached by the runner (one per
 //!    spawned plugin); own the read/write tasks and exit watcher.
 //! 2. For every inbound line: stamp `origin = Plugin(name)` + `ts = now`,
-//!    append a [`LogEntry`] to the in-memory event log and the session
-//!    file, then invoke the cached Lua `step(saved_log, current_log)`
-//!    hook. Step is free to decide what (if anything) flows out.
-//! 3. Expose a [`BrokerOps`] routing sink to the Lua VM. When `step` calls
-//!    `nefor.engine.send(payload, target?)` the broker stamps the outbound
-//!    as `origin = Step`, appends it to the same log + session, and writes
-//!    the line to the target writer queue (broadcast = every connected
-//!    plugin; targeted = one plugin by name).
+//!    append a [`LogEntry`] to the in-memory event log, then invoke the
+//!    cached Lua dispatch hook. The hook is free to decide what (if
+//!    anything) flows out.
+//! 3. Expose a [`BrokerOps`] routing sink to the Lua VM. When the dispatch
+//!    hook calls `nefor.engine.send(payload, target?)` the broker stamps
+//!    the outbound as `origin = Step`, appends it to the same log, and
+//!    writes the line to the target writer queue (broadcast = every
+//!    connected plugin; targeted = one plugin by name).
 //! 4. Cascade shutdown: when one plugin exits and others are still alive,
 //!    close the other connections' outbound channels within the grace
 //!    window. No protocol-level `shutdown` system message is emitted — if
-//!    `init.lua` wants to narrate the shutdown it does so via `step`.
+//!    `init.lua` wants to narrate the shutdown it does so via the
+//!    dispatch hook.
 //!
 //! All NCP protocol handling (ready handshake, replay-on-attach, system
 //! message dispatch, error-code classification) has moved to the user's
 //! `starter/init.lua`. The broker does not parse the body of an inbound
-//! line — raw bytes in, raw bytes out.
+//! line — raw bytes in, raw bytes out. The broker is session-blind: it
+//! does not own any session id, does not write any jsonl file, and does
+//! not know what a "session" is. Cross-run resumption / log persistence
+//! / replay are owned by `starter/sessions.lua`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -31,6 +35,7 @@ use std::time::{Duration, Instant};
 use nefor_protocol::{PluginName, Timestamp};
 use tokio::sync::mpsc;
 
+use crate::events::{EventBus, EventName, EventPayload, SHUTDOWN};
 use crate::lua::bindings::{EngineOps, SendTarget};
 use crate::lua::LuaHost;
 use crate::ncp::connection::{
@@ -38,22 +43,20 @@ use crate::ncp::connection::{
     ConnectionOutbound, ReaderEnd, DEFAULT_QUEUE_CAPACITY,
 };
 use crate::ncp::transport::{ExitOutcome, Transport};
-use crate::session::{LogEntry, Origin, SessionWriter};
+use crate::session::{LogEntry, Origin};
 
 /// Default shutdown grace — see §5.3. The broker still accepts an override
 /// at `shutdown` time for operator flexibility.
 pub const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 2000;
 
 /// State the broker and the [`BrokerOps`] share: the engine's single source
-/// of truth for the bus-wide event log, the open session file, and the
-/// outbound-writer handle for every connected plugin.
+/// of truth for the bus-wide event log and the outbound-writer handle for
+/// every connected plugin.
 pub struct BrokerShared {
     /// In-memory log of every message the engine has seen this run, inbound
     /// (`Origin::Plugin`) and outbound (`Origin::Step`), in routing order.
-    /// Passed to `step` as `current_log`.
+    /// Passed to the Lua dispatch hook as `current_log`.
     pub event_log: Vec<LogEntry>,
-    /// Write-through persistent mirror of `event_log`. Flushed on `Drop`.
-    pub session: SessionWriter,
     /// Unbounded sender onto each connected plugin's writer queue, keyed by
     /// plugin name. Populated by [`Broker::attach_transport`] and cleared
     /// when the connection tears down.
@@ -110,20 +113,27 @@ impl ExitRequestSink {
 }
 
 impl BrokerShared {
-    /// Build the shared state around an already-opened session writer.
-    pub fn new(session: SessionWriter) -> Self {
+    /// Build the shared state. The broker owns no on-disk persistence;
+    /// any session-log / replay concerns live in Lua.
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
         Self {
             event_log: Vec::new(),
-            session,
             conns: HashMap::new(),
             exit_request: None,
         }
     }
 }
 
+impl Default for BrokerShared {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Routing sink handed to the Lua VM. Every `nefor.engine.send` call from
-/// `step` lands here; the sink stamps the outbound, logs it, and writes it
-/// to the target connection(s).
+/// the `dispatch` hook lands here; the sink stamps the outbound, appends
+/// it to the in-memory log, and writes it to the target connection(s).
 pub struct BrokerOps {
     shared: Arc<Mutex<BrokerShared>>,
 }
@@ -188,10 +198,7 @@ impl EngineOps for BrokerOps {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.event_log.push(entry.clone());
-        if let Err(e) = guard.session.append(&entry) {
-            tracing::error!(error = %e, "failed to append outbound entry to session log");
-        }
+        guard.event_log.push(entry);
         let line = with_trailing_newline(payload);
         match target {
             SendTarget::Broadcast => {
@@ -205,7 +212,7 @@ impl EngineOps for BrokerOps {
                 } else {
                     tracing::warn!(
                         target = %name,
-                        "step.send: target plugin is not connected; dropping outbound",
+                        "dispatch.send: target plugin is not connected; dropping outbound",
                     );
                 }
             }
@@ -231,6 +238,11 @@ struct ConnectionRecord {
 pub struct Broker {
     shared: Arc<Mutex<BrokerShared>>,
     host: LuaHost,
+    /// Handle to the engine-internal lifecycle bus. The broker emits
+    /// [`SHUTDOWN`] on this bus inside [`Broker::begin_shutdown`] so Lua
+    /// subscribers (`sessions.handle_shutdown` in starter) fire
+    /// synchronously before plugin connections close.
+    events_bus: Arc<EventBus>,
     conns_by_id: HashMap<ConnectionId, ConnectionRecord>,
     /// Shared channel all per-connection readers drop messages onto.
     inbound_tx: mpsc::Sender<(ConnectionId, ConnectionInbound)>,
@@ -241,19 +253,17 @@ pub struct Broker {
     /// Triggered by [`Broker::shutdown_handle`] or an external signal.
     shutdown_rx: mpsc::Receiver<u64>,
     shutdown_tx: mpsc::Sender<u64>,
-    /// Saved log from a resumed parent session. Passed verbatim to every
-    /// `step` invocation as the first argument.
-    saved_log: Vec<LogEntry>,
-    /// Count of `event_log` entries already handed to `invoke_step`. The
-    /// broker clones just `event_log[mirrored_count..]` under its lock and
-    /// passes the small tail to step; the Lua VM appends those into the
-    /// persistent `current_log` table. Avoids the per-event O(n) clone of
-    /// the full log.
+    /// Count of `event_log` entries already handed to `invoke_dispatch`.
+    /// The broker clones just `event_log[mirrored_count..]` under its lock
+    /// and passes the small tail to the hook; the Lua VM appends those
+    /// into the persistent `current_log` table. Avoids the per-event O(n)
+    /// clone of the full log.
     mirrored_count: usize,
     /// Engine-originated synthetic envelopes (e.g. `engine.plugin_failed`)
     /// queued by callers outside the inbound path. Drained into the event
-    /// log + step pipeline before the main `select!` on each tick so they
-    /// route alongside real plugin lines. See [`Broker::queue_engine_envelope`].
+    /// log + dispatch pipeline before the main `select!` on each tick so
+    /// they route alongside real plugin lines. See
+    /// [`Broker::queue_engine_envelope`].
     pending_engine_envelopes: Vec<LogEntry>,
     /// Exit-code slot updated by `nefor.engine.exit(code)` via
     /// [`ExitRequestSink`]. Read by [`Broker::requested_exit_code`] after
@@ -273,15 +283,9 @@ pub enum BrokerStopReason {
 }
 
 impl Broker {
-    /// Construct a new broker with default capacities. `shared` must already
-    /// own an open [`SessionWriter`]; `host` must have its `step` function
-    /// cached (see [`LuaHost::cache_step`]); `saved_log` is the hydrated
-    /// parent-session log (empty for a fresh session).
-    pub fn with_saved_log(
-        shared: Arc<Mutex<BrokerShared>>,
-        host: LuaHost,
-        saved_log: Vec<LogEntry>,
-    ) -> Self {
+    /// Construct a new broker with default capacities. `host` must have its
+    /// dispatch function cached (see [`LuaHost::cache_dispatch`]).
+    pub fn new(shared: Arc<Mutex<BrokerShared>>, host: LuaHost) -> Self {
         // Shared inbound/exit channels sized to tolerate brief bursts from
         // many plugins. 1024 each matches §6's per-connection default.
         let (inbound_tx, inbound_rx) = mpsc::channel(1024);
@@ -302,9 +306,11 @@ impl Broker {
             });
         }
 
+        let events_bus = host.events_bus();
         Self {
             shared,
             host,
+            events_bus,
             conns_by_id: HashMap::new(),
             inbound_tx,
             inbound_rx,
@@ -312,7 +318,6 @@ impl Broker {
             exit_rx,
             shutdown_rx,
             shutdown_tx,
-            saved_log,
             mirrored_count: 0,
             pending_engine_envelopes: Vec::new(),
             exit_code_slot,
@@ -335,15 +340,16 @@ impl Broker {
     }
 
     /// Enqueue an engine-originated synthetic envelope for routing through
-    /// `step`. The envelope is built as
+    /// the `dispatch` hook. The envelope is built as
     /// `{"type":"event","from":"engine","ts":<now>,"body":<body>}` and stamped
-    /// with `Origin::Plugin(PluginName::engine())` so step sees it as a normal
-    /// log entry. Drained on the next tick of [`Broker::run`] (or synchronously
-    /// by callers that need ordering with shutdown — see [`Broker::handle_exit`]).
+    /// with `Origin::Plugin(PluginName::engine())` so the hook sees it as a
+    /// normal log entry. Drained on the next tick of [`Broker::run`] (or
+    /// synchronously by callers that need ordering with shutdown — see
+    /// [`Broker::handle_exit`]).
     ///
     /// Used to surface engine-level events (spawn-time and runtime plugin
-    /// failures) to the Lua step layer, which translates them into plugin-
-    /// targeted notifications (e.g. `chat.popup` to nefor-chat).
+    /// failures) to the Lua dispatch layer, which translates them into
+    /// plugin-targeted notifications (e.g. `chat.popup` to nefor-chat).
     pub fn queue_engine_envelope(&mut self, body: serde_json::Value) {
         let ts = Timestamp::now();
         let envelope = serde_json::json!({
@@ -368,11 +374,12 @@ impl Broker {
         self.pending_engine_envelopes.push(entry);
     }
 
-    /// Drain `pending_engine_envelopes` into the shared event log + session,
-    /// then invoke step on the appended tail. No-op when the queue is empty.
-    /// Called both from the main loop tick and synchronously from `handle_exit`
-    /// so an `engine.plugin_failed` envelope can reach `nefor-chat`'s writer
-    /// queue *before* the cooperative shutdown closes it.
+    /// Drain `pending_engine_envelopes` into the shared event log, then
+    /// invoke dispatch on the appended tail. No-op when the queue is
+    /// empty. Called both from the main loop tick and synchronously from
+    /// `handle_exit` so an `engine.plugin_failed` envelope can reach
+    /// `nefor-chat`'s writer queue *before* the cooperative shutdown
+    /// closes it.
     fn drain_engine_envelopes(&mut self) {
         if self.pending_engine_envelopes.is_empty() {
             return;
@@ -383,17 +390,14 @@ impl Broker {
             let mut guard = lock_shared(&self.shared);
             for entry in &drained {
                 guard.event_log.push(entry.clone());
-                if let Err(e) = guard.session.append(entry) {
-                    tracing::error!(error = %e, "failed to append engine envelope to session log");
-                }
             }
             let tail = guard.event_log[self.mirrored_count..].to_vec();
             self.mirrored_count = guard.event_log.len();
             tail
         };
 
-        if let Err(e) = self.host.invoke_step(&self.saved_log, &new_entries) {
-            tracing::error!(error = %e, "step invocation errored at VM level");
+        if let Err(e) = self.host.invoke_dispatch(&new_entries) {
+            tracing::error!(error = %e, "dispatch invocation errored at VM level");
         }
         self.host.dispatch_subscriptions(&new_entries);
     }
@@ -407,7 +411,7 @@ impl Broker {
     /// Attach an arbitrary transport to the broker under a pre-assigned
     /// plugin name. Returns the assigned [`ConnectionId`]. The broker
     /// does not wait for a ready handshake — the first inbound line flows
-    /// directly into `step`.
+    /// directly into the `dispatch` hook.
     pub fn attach_transport(&mut self, transport: Transport, name: PluginName) -> ConnectionId {
         let id = ConnectionId::next();
         let log_label = name.as_str().to_owned();
@@ -505,8 +509,8 @@ impl Broker {
             // Synthetic engine envelopes (queued via `queue_engine_envelope`)
             // are flushed at the top of every tick so they route alongside
             // real inbound lines. Doing this before the `tokio::select!`
-            // guarantees they reach step before any pending shutdown arm
-            // fires this iteration.
+            // guarantees they reach dispatch before any pending shutdown
+            // arm fires this iteration.
             self.drain_engine_envelopes();
 
             // If we're past the shutdown deadline, force-close everything
@@ -584,29 +588,27 @@ impl Broker {
         };
 
         // Append + clone only the unmirrored tail under the lock, then
-        // release it before invoking step — step may call back into
-        // `BrokerOps::send` which re-acquires the lock. Cloning the whole
-        // `event_log` here was O(n) per inbound line, O(n²) per session.
+        // release it before invoking dispatch — the hook may call back
+        // into `BrokerOps::send` which re-acquires the lock. Cloning the
+        // whole `event_log` here was O(n) per inbound line, O(n²) per
+        // session.
         let new_entries = {
             let mut guard = lock_shared(&self.shared);
-            guard.event_log.push(entry.clone());
-            if let Err(e) = guard.session.append(&entry) {
-                tracing::error!(error = %e, "failed to append inbound entry to session log");
-            }
+            guard.event_log.push(entry);
             let tail = guard.event_log[self.mirrored_count..].to_vec();
             self.mirrored_count = guard.event_log.len();
             tail
         };
 
-        if let Err(e) = self.host.invoke_step(&self.saved_log, &new_entries) {
-            tracing::error!(error = %e, "step invocation errored at VM level");
+        if let Err(e) = self.host.invoke_dispatch(&new_entries) {
+            tracing::error!(error = %e, "dispatch invocation errored at VM level");
         }
 
         // Fan out the same tail to `nefor.bus.on_event` subscribers. Done
-        // strictly after step so step's outbound `nefor.engine.send`
+        // strictly after dispatch so the hook's outbound `nefor.engine.send`
         // entries (which were appended to the event log during the call)
-        // also reach handlers. Engine-side dispatch keeps it cheap when
-        // no subscriptions are registered.
+        // also reach handlers. Engine-side dispatch keeps it cheap when no
+        // subscriptions are registered.
         self.host.dispatch_subscriptions(&new_entries);
     }
 
@@ -653,7 +655,7 @@ impl Broker {
         // in flight.
         if !self.conns_by_id.is_empty() {
             // Surface abnormal exits as engine-originated `engine.plugin_failed`
-            // envelopes BEFORE triggering shutdown so step has a chance to
+            // envelopes BEFORE triggering shutdown so dispatch has a chance to
             // translate them into peer-targeted notifications (e.g. a
             // `chat.popup` to nefor-chat) while that peer's writer queue is
             // still open. Clean exits don't get a synthetic event — they are
@@ -672,7 +674,7 @@ impl Broker {
                     "reason": format!("plugin process exited abnormally ({code})"),
                     "code":   code,
                 }));
-                // Drain synchronously so step's outbound `nefor.engine.send`
+                // Drain synchronously so dispatch's outbound `nefor.engine.send`
                 // lands on the target's writer queue before `begin_shutdown`
                 // (which runs on the next loop iteration) closes it. The
                 // writer task drains preceding `Send`s before honoring `Close`.
@@ -690,6 +692,16 @@ impl Broker {
     // ---- helpers ----------------------------------------------------------
 
     fn begin_shutdown(&mut self) {
+        // Emit `shutdown` on the engine-internal lifecycle bus BEFORE closing
+        // any connection. Lua subscribers (the starter's
+        // `sessions.handle_shutdown`) fire synchronously here, so they can
+        // emit `sessions.session_end` onto the NCP bus while every plugin's
+        // writer queue is still open. Order matters — once `force_close`
+        // runs the writer tasks drain + exit and any later sessions.* event
+        // would arrive after EOF.
+        self.events_bus
+            .emit(&EventName::from(SHUTDOWN), EventPayload::None);
+
         // Close every connection's writer channel. Writer tasks drain their
         // queues, flush, and exit. The shutdown-grace deadline in the run
         // loop force-closes anything still alive.
@@ -747,11 +759,9 @@ mod tests {
     use crate::lua::LuaHost;
     use crate::ncp::transport::Transport;
     use crate::ncp::PluginRegistry;
-    use crate::session::{SessionHeader, SessionId};
     use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
-    use tempfile::TempDir;
-    use tokio::io::{duplex, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     /// A mock plugin transport pair. Returns the plugin half for tests to
     /// drive, and the broker-side [`Transport`] for attachment.
@@ -809,31 +819,21 @@ mod tests {
         let ops: Arc<dyn EngineOps> = Arc::new(BrokerOps::new(Arc::clone(shared)));
         let mut host = LuaHost::new(bus, plugins, ops).expect("host ok");
         host.exec_str("init.lua", init_src).expect("exec init");
-        host.cache_step().expect("cache step");
+        host.cache_dispatch().expect("cache dispatch");
         host
     }
 
-    fn tmp_session(dir: &TempDir) -> (SessionWriter, std::path::PathBuf) {
-        let id = SessionId::new();
-        let path = dir
-            .path()
-            .join("nefor")
-            .join("sessions")
-            .join(format!("{id}.jsonl"));
-        let header = SessionHeader::new(id, None, Timestamp::now());
-        let writer = SessionWriter::create_at(path.clone(), header).expect("writer");
-        (writer, path)
+    fn shared_state() -> Arc<StdMutex<BrokerShared>> {
+        Arc::new(StdMutex::new(BrokerShared::new()))
     }
 
     // --- tests ---------------------------------------------------------
 
     #[tokio::test]
     async fn broker_exits_when_no_plugins_configured() {
-        let dir = TempDir::new().unwrap();
-        let (session, _path) = tmp_session(&dir);
-        let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
-        let host = build_host(&shared, "function step(s, c) end");
-        let broker = Broker::with_saved_log(shared, host, Vec::new());
+        let shared = shared_state();
+        let host = build_host(&shared, "function dispatch(c) end");
+        let broker = Broker::new(shared, host);
         let outcome = tokio::time::timeout(Duration::from_secs(2), broker.run())
             .await
             .expect("broker should exit quickly");
@@ -841,17 +841,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inbound_line_invokes_step() {
-        // Step appends to a Lua-side global every time it runs so the test
-        // can assert what it saw.
-        let dir = TempDir::new().unwrap();
-        let (session, _path) = tmp_session(&dir);
-        let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
+    async fn inbound_line_invokes_dispatch() {
+        // dispatch appends to a Lua-side global every time it runs so the
+        // test can assert what it saw.
+        let shared = shared_state();
         let host = build_host(
             &shared,
             r#"
             seen = {}
-            function step(saved, current)
+            function dispatch(current)
                 local last = current[#current]
                 seen[#seen + 1] = last.origin .. ":" .. last.payload
             end
@@ -862,7 +860,7 @@ mod tests {
         // test can read `seen` back after the run.
         let lua = host.lua().clone();
 
-        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let mut broker = Broker::new(Arc::clone(&shared), host);
         let (mut p, t) = make_transport();
         broker.attach_transport(t, pn("test"));
         let handle = broker.shutdown_handle();
@@ -881,17 +879,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn step_send_broadcast_writes_to_all_peers() {
-        let dir = TempDir::new().unwrap();
-        let (session, _path) = tmp_session(&dir);
-        let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
-        // Step broadcasts "pong" on every inbound line.
+    async fn dispatch_send_broadcast_writes_to_all_peers() {
+        let shared = shared_state();
+        // dispatch broadcasts "pong" on every inbound line.
         let host = build_host(
             &shared,
-            r#"function step(saved, current) nefor.engine.send("pong") end"#,
+            r#"function dispatch(current) nefor.engine.send("pong") end"#,
         );
 
-        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let mut broker = Broker::new(Arc::clone(&shared), host);
         let (mut pa, ta) = make_transport();
         let (mut pb, tb) = make_transport();
         let (mut pc, tc) = make_transport();
@@ -903,9 +899,9 @@ mod tests {
 
         send_line(&mut pa, "trigger").await;
 
-        // All three plugins receive the broadcast — including the origin, per
-        // the spec: step is not a plugin, so "all plugins minus origin (Step)"
-        // = all plugins.
+        // All three plugins receive the broadcast — including the origin,
+        // per the spec: the dispatch hook is not a plugin, so "all plugins
+        // minus origin (Step)" = all plugins.
         for (p, label) in [(&mut pa, "a"), (&mut pb, "b"), (&mut pc, "c")] {
             let line = tokio::time::timeout(Duration::from_millis(500), recv_line(p))
                 .await
@@ -918,16 +914,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn step_send_targeted_writes_to_one_peer() {
-        let dir = TempDir::new().unwrap();
-        let (session, _path) = tmp_session(&dir);
-        let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
+    async fn dispatch_send_targeted_writes_to_one_peer() {
+        let shared = shared_state();
         let host = build_host(
             &shared,
-            r#"function step(saved, current) nefor.engine.send("to-b-only", "b") end"#,
+            r#"function dispatch(current) nefor.engine.send("to-b-only", "b") end"#,
         );
 
-        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let mut broker = Broker::new(Arc::clone(&shared), host);
         let (mut pa, ta) = make_transport();
         let (mut pb, tb) = make_transport();
         broker.attach_transport(ta, pn("a"));
@@ -955,76 +949,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_log_records_inbound_and_outbound() {
-        let dir = TempDir::new().unwrap();
-        let (session, path) = tmp_session(&dir);
-        let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
+    async fn event_log_records_inbound_and_outbound() {
+        // Engine is session-blind — no on-disk file. The in-memory
+        // `event_log` is the only artefact and is what Lua subscribers see
+        // via `current_log`. The Lua-side `starter/sessions.lua` owns any
+        // jsonl persistence (covered by `starter_sessions_test.rs`).
+        let shared = shared_state();
         let host = build_host(
             &shared,
-            r#"function step(saved, current) nefor.engine.send("echoed", "a") end"#,
+            r#"function dispatch(current) nefor.engine.send("echoed", "a") end"#,
         );
 
-        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let mut broker = Broker::new(Arc::clone(&shared), host);
         let (mut pa, ta) = make_transport();
         broker.attach_transport(ta, pn("a"));
         let handle = broker.shutdown_handle();
         let run = tokio::spawn(broker.run());
 
         send_line(&mut pa, "inbound-line").await;
-        // Let the outbound drain through the writer task onto the wire.
         let got = tokio::time::timeout(Duration::from_millis(500), recv_line(&mut pa))
             .await
             .expect("a timed out");
         assert_eq!(got.as_deref(), Some("echoed"));
 
-        // Shut the broker down cleanly so the SessionWriter flushes.
         handle.shutdown(50).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
 
-        // Explicitly flush the session writer before reading the file back.
-        // Drop-ordering alone is not reliable here — the SessionWriter's
-        // Drop only runs when the last Arc<Mutex<BrokerShared>> is dropped,
-        // and subtle ordering inside spawned tasks can stretch that window.
-        {
-            let mut guard = shared.lock().expect("lock shared");
-            guard.session.flush().expect("flush session");
-        }
-
-        let mut file = tokio::fs::File::open(&path).await.expect("session file");
-        let mut body = String::new();
-        file.read_to_string(&mut body).await.expect("read session");
-        // Header + at least two entries (one inbound, one outbound).
-        let lines: Vec<&str> = body.lines().collect();
+        // Inspect the in-memory event log directly.
+        let entries: Vec<LogEntry> = {
+            let guard = shared.lock().expect("lock shared");
+            guard.event_log.clone()
+        };
         assert!(
-            lines.len() >= 3,
-            "expected header + >=2 entries, got {}: {body}",
-            lines.len()
+            entries.len() >= 2,
+            "expected at least 2 entries (1 inbound + 1 outbound), got {}: {:?}",
+            entries.len(),
+            entries
         );
-        let inbound = lines
+        let inbound = entries
             .iter()
-            .find(|l| l.contains("\"origin\":\"a\"") && l.contains("\"payload\":\"inbound-line\""))
+            .find(|e| {
+                matches!(&e.origin, Origin::Plugin(p) if p.as_str() == "a")
+                    && e.payload == "inbound-line"
+            })
             .expect("inbound entry present");
-        let outbound = lines
+        let outbound = entries
             .iter()
-            .find(|l| {
-                l.contains("\"origin\":\"step\"")
-                    && l.contains("\"target\":\"a\"")
-                    && l.contains("\"payload\":\"echoed\"")
+            .find(|e| {
+                matches!(e.origin, Origin::Step)
+                    && e.target.as_ref().is_some_and(|p| p.as_str() == "a")
+                    && e.payload == "echoed"
             })
             .expect("outbound entry present");
-        assert_ne!(inbound, outbound);
+        assert_ne!(inbound.payload, outbound.payload);
     }
 
     #[tokio::test]
     async fn shutdown_closes_peer_connections() {
         // When one plugin exits, the broker cascades shutdown: the other
         // connections' outbound channels close within the grace window.
-        let dir = TempDir::new().unwrap();
-        let (session, _path) = tmp_session(&dir);
-        let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
-        let host = build_host(&shared, "function step(s, c) end");
+        let shared = shared_state();
+        let host = build_host(&shared, "function dispatch(c) end");
 
-        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let mut broker = Broker::new(Arc::clone(&shared), host);
         let (_pa, ta) = make_transport();
         let (pb, tb) = make_transport();
         broker.attach_transport(ta, pn("a"));
@@ -1082,23 +1069,22 @@ mod tests {
 
     #[tokio::test]
     async fn queue_engine_envelope_drains_into_new_entries_on_next_tick() {
-        // Step records the kind of every entry it sees so we can assert the
-        // synthetic envelope reached the Lua layer with origin=engine.
-        let dir = TempDir::new().unwrap();
-        let (session, _path) = tmp_session(&dir);
-        let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
+        // dispatch records the kind of every entry it sees so we can
+        // assert the synthetic envelope reached the Lua layer with
+        // origin=engine.
+        let shared = shared_state();
         let host = build_host(
             &shared,
             r#"
             seen = {}
-            function step(saved, current)
+            function dispatch(current)
                 local last = current[#current]
                 seen[#seen + 1] = last.origin .. ":" .. last.payload
             end
             "#,
         );
         let lua = host.lua().clone();
-        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let mut broker = Broker::new(Arc::clone(&shared), host);
 
         // Queue *before* run() — the first tick must drain it.
         broker.queue_engine_envelope(serde_json::json!({
@@ -1122,7 +1108,7 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
 
         let seen: mlua::Table = lua.globals().get("seen").unwrap();
-        let first: String = seen.get(1).expect("step saw at least one entry");
+        let first: String = seen.get(1).expect("dispatch saw at least one entry");
         assert!(
             first.starts_with("engine:"),
             "first entry should be from engine, got {first}"
@@ -1139,17 +1125,16 @@ mod tests {
 
     #[tokio::test]
     async fn handle_exit_with_crash_emits_engine_plugin_failed_then_shuts_down() {
-        // Two plugins: 'a' is the victim, 'b' stays alive long enough for the
-        // synthetic envelope to flow through step. Step records what it saw
-        // so the test can assert the engine-originated entry shape.
-        let dir = TempDir::new().unwrap();
-        let (session, _path) = tmp_session(&dir);
-        let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
+        // Two plugins: 'a' is the victim, 'b' stays alive long enough for
+        // the synthetic envelope to flow through dispatch. The hook
+        // records what it saw so the test can assert the engine-originated
+        // entry shape.
+        let shared = shared_state();
         let host = build_host(
             &shared,
             r#"
             engine_seen = {}
-            function step(saved, current)
+            function dispatch(current)
                 local last = current[#current]
                 if last.origin == "engine" then
                     engine_seen[#engine_seen + 1] = last.payload
@@ -1158,7 +1143,7 @@ mod tests {
             "#,
         );
         let lua = host.lua().clone();
-        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let mut broker = Broker::new(Arc::clone(&shared), host);
 
         let (_pa, ta, exit_tx_a) = make_transport_with_exit();
         let (_pb, tb) = make_transport();
@@ -1167,12 +1152,13 @@ mod tests {
 
         let run = tokio::spawn(broker.run());
 
-        // Fire the crash outcome for 'a'. The broker's exit watcher routes
-        // it to `handle_exit` which queues + drains synchronously.
+        // Fire the crash outcome for 'a'. The broker's exit watcher
+        // routes it to `handle_exit` which queues + drains synchronously.
         let _ = exit_tx_a.send(ExitOutcome::Crash);
 
-        // The cooperative-shutdown grace is DEFAULT_SHUTDOWN_GRACE_MS. Wait
-        // long enough for: handle_exit → drain → step → shutdown → run exit.
+        // The cooperative-shutdown grace is DEFAULT_SHUTDOWN_GRACE_MS.
+        // Wait long enough for: handle_exit → drain → dispatch → shutdown
+        // → run exit.
         let outcome =
             tokio::time::timeout(Duration::from_millis(DEFAULT_SHUTDOWN_GRACE_MS + 500), run)
                 .await
@@ -1184,7 +1170,7 @@ mod tests {
         let len = engine_seen.len().unwrap();
         assert!(
             len >= 1,
-            "step should have observed >=1 engine entry, got {len}"
+            "dispatch should have observed >=1 engine entry, got {len}"
         );
         let payload: String = engine_seen.get(1).unwrap();
         assert!(
@@ -1209,14 +1195,12 @@ mod tests {
     async fn handle_exit_with_clean_exit_does_not_emit_engine_plugin_failed() {
         // CleanExit is normal lifecycle — no synthetic envelope, just the
         // usual cooperative-shutdown cascade.
-        let dir = TempDir::new().unwrap();
-        let (session, _path) = tmp_session(&dir);
-        let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
+        let shared = shared_state();
         let host = build_host(
             &shared,
             r#"
             engine_seen = {}
-            function step(saved, current)
+            function dispatch(current)
                 local last = current[#current]
                 if last.origin == "engine" then
                     engine_seen[#engine_seen + 1] = last.payload
@@ -1225,7 +1209,7 @@ mod tests {
             "#,
         );
         let lua = host.lua().clone();
-        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let mut broker = Broker::new(Arc::clone(&shared), host);
 
         let (_pa, ta, exit_tx_a) = make_transport_with_exit();
         let (_pb, tb) = make_transport();
@@ -1253,19 +1237,18 @@ mod tests {
 
     #[tokio::test]
     async fn write_queue_overflow_drops_oldest() {
-        // Tiny duplex buffer + per-step broadcasts fills up the writer. The
-        // broker's post-I3 overflow policy: drop oldest, no protocol emission.
-        // We assert the broker keeps making forward progress (doesn't hang)
-        // and the writer task logs the overflow internally.
-        let dir = TempDir::new().unwrap();
-        let (session, _path) = tmp_session(&dir);
-        let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
+        // Tiny duplex buffer + per-dispatch broadcasts fills up the
+        // writer. The broker's post-I3 overflow policy: drop oldest, no
+        // protocol emission. We assert the broker keeps making forward
+        // progress (doesn't hang) and the writer task logs the overflow
+        // internally.
+        let shared = shared_state();
         let host = build_host(
             &shared,
-            r#"function step(saved, current) nefor.engine.send("x") end"#,
+            r#"function dispatch(current) nefor.engine.send("x") end"#,
         );
 
-        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let mut broker = Broker::new(Arc::clone(&shared), host);
         let (mut sender, sender_t) = make_transport();
         let (_receiver, receiver_t) = make_transport_buf(64);
         broker.attach_transport(sender_t, pn("s"));

@@ -90,6 +90,13 @@ local current_state = nil
 -- new chat run. Each entry: { text = "<formatted>" }.
 local deferred_queue = {}
 
+-- Queued user inputs submitted while the orchestrator was mid-turn.
+-- FIFO order; flushed in `flush_pending_user_inputs` after the current
+-- run completes. Cleared on chat.reset, session_end teardown, and
+-- cancel_all so a stuck run can't strand pending input forever.
+-- Each entry: a plain string (the user-typed text).
+local pending_user_inputs = {}
+
 -- pending firings keyed by run_id:firing_id (provider/tool-gate paths).
 local pending = {}
 
@@ -119,6 +126,15 @@ local pending_dispatches = {}
 
 -- Sub-graph runs keyed by run_id. Each entry: { gate_inner_id }.
 local pending_runs = {}
+
+-- Session-replay flag. Flipped on by `sessions.session_start` (which fires
+-- for both fresh-boot and resume-target swaps) and back off by
+-- `sessions.resume_done`. While true, the reasoner-graph from_plugin
+-- transform short-circuits run_node dispatch — the graph already ran in
+-- the original session and re-running on replay would duplicate every
+-- side effect (provider chat.create, tool.invoke, etc.). The flag stays
+-- false during normal live operation; sessions module owns the lifecycle.
+local replay_mode = false
 
 -- In-process observer registries. These exist because the events they
 -- observe are emitted via `nefor.engine.send` (which bypasses ncp.lua's
@@ -841,6 +857,31 @@ local function flush_deferred()
   submit_orchestrator_run(entry.text)
 end
 
+-- Drain one pending user-input from the queue and dispatch it as the
+-- next orchestrator run. Called after `current_run_id` clears (the
+-- only signal that the orchestrator is ready for fresh input).
+--
+-- Order vs. flush_deferred: callers run flush_deferred FIRST so a
+-- sub-graph completion that landed during the prior turn gets surfaced
+-- to the model before fresh user input. If flush_deferred submits a
+-- run, this is a no-op (current_run_id is set again); the next
+-- run_complete will retry.
+--
+-- Stuck-queue safety: every state-clear path (chat.reset, session_end,
+-- cancel_all) drops `pending_user_inputs` so a run that errors without
+-- emitting graph.run_complete can't strand the queue. The user can
+-- always re-submit; we'd rather drop than dispatch surprise turns.
+local function flush_pending_user_inputs()
+  if current_run_id ~= nil then return end
+  if #pending_user_inputs == 0 then return end
+  local text = table.remove(pending_user_inputs, 1)
+  nefor.log.info("agentic_workflow: flushing queued user input", {
+    text_preview = string.sub(text, 1, 80),
+    queue_remaining = #pending_user_inputs,
+  })
+  submit_orchestrator_run(text)
+end
+
 -- ------------------------------------------------------------------
 -- transform factories
 -- ------------------------------------------------------------------
@@ -932,6 +973,15 @@ function M.for_reasoner_graph()
       return env
     end
 
+    -- During replay, the graph already ran in the original session — we
+    -- don't want to re-dispatch run_node handlers (which would emit
+    -- fresh chat.create / tool.invoke calls and double every side
+    -- effect). Drop graph emissions while replay_mode is true. The flag
+    -- is owned by the sessions handlers above and lifted on resume_done.
+    if replay_mode then
+      return nil
+    end
+
     -- (2) for_reasoner_graph: dispatch <token>.run_node.
     local token = kind:match("^([^.]+)%.run_node$")
     if token then
@@ -1013,6 +1063,7 @@ function M.for_reasoner_graph()
 
         if status == "success" then
           flush_deferred()
+          flush_pending_user_inputs()
           return env
         end
 
@@ -1042,6 +1093,7 @@ function M.for_reasoner_graph()
           text = err_text,
         })
         flush_deferred()
+        flush_pending_user_inputs()
         return env
       end
 
@@ -1462,11 +1514,13 @@ function M.for_chat()
         had_state = current_state ~= nil,
         prior_chat_id = type(current_state) == "table" and current_state.chat_id or nil,
         dropped_deferred = #deferred_queue,
+        dropped_pending_inputs = #pending_user_inputs,
         had_run = current_run_id ~= nil,
       })
       current_state = nil
       current_run_id = nil
       deferred_queue = {}
+      pending_user_inputs = {}
       return env
     end
 
@@ -1514,13 +1568,45 @@ function M.for_chat()
       seed_chat_id = type(current_state) == "table" and current_state.chat_id or nil,
       busy = current_run_id ~= nil,
       deferred_queued = #deferred_queue,
+      user_queued = #pending_user_inputs,
+    })
+
+    -- Emit the user message to the TUI as a transcript-bound event.
+    -- This is what makes the user's input visible across resume:
+    -- chat.message.append targeted at nefor-tui is persisted as a
+    -- step-origin entry the replay path can re-deliver.
+    --
+    -- chat.lua ALSO pushes the user message locally on submit for
+    -- instant feedback (key.submit doesn't wait for the round-trip).
+    -- It sets a `pending_user_echo` marker so this echo is deduped
+    -- against the local push, rendering the user line exactly once
+    -- live. On replay the marker is absent so push_entry fires —
+    -- replayed views match the live view.
+    --
+    -- chat.lua's dedup is defensive: it only swallows the echo when
+    -- the local push actually landed in entries (a session-lifecycle
+    -- clear could have wiped it between submit and echo); otherwise
+    -- the echo falls through and re-paints the user line. So this
+    -- emission doubles as both the persistence path AND the recovery
+    -- path for the rare case where the local push was lost.
+    emit("nefor-tui", {
+      kind = "chat.message.append",
+      role = "user",
+      text = text,
     })
 
     if current_run_id ~= nil then
+      -- Orchestrator is mid-turn: queue the input and surface a
+      -- non-destructive note so the user knows the message was
+      -- accepted, not dropped. Old behavior rejected with a
+      -- "[orchestrator busy]" message; that lost the user's text.
+      pending_user_inputs[#pending_user_inputs + 1] = text
       emit("nefor-tui", {
         kind = "chat.message.append",
         role = "system",
-        text = "[orchestrator busy — wait for the current turn to finish]",
+        text = string.format(
+          "[queued — will dispatch when current turn finishes (%d in queue)]",
+          #pending_user_inputs),
       })
       return nil
     end
@@ -1580,23 +1666,175 @@ function M.setup(opts)
   end
 
   -- Spawn_graph completion: queue + flush.
+  --
+  -- The completion is queued UNCONDITIONALLY. The earlier guard that
+  -- dropped the completion when `current_state.chat_id` was missing
+  -- was the cause of a real production hang: user submits a prompt
+  -- that triggers spawn_graph, all sub-graph nodes complete, the DAG
+  -- sidebar shows ✓✓✓ — but nothing surfaces in the chat. Reason:
+  -- the wrap-node observer that sets `current_state` only fires
+  -- after `send_node_result_ok` for `node_id == "wrap"` AND
+  -- `run_id == current_run_id`. If session-lifecycle teardown
+  -- cleared `current_run_id` before the wrap firing's
+  -- node_result envelope reached its observer (or the wrap node
+  -- emitted a node_result without a `next_state` slot for some
+  -- transient reason), `current_state` stayed nil and the
+  -- subscriber threw the deferred result on the floor.
+  --
+  -- The defensive shape: queue regardless. `flush_deferred` calls
+  -- `submit_orchestrator_run`, which already gracefully handles
+  -- missing `current_state` (it just doesn't pass `seed_chat_id` to
+  -- the wrap_args, so the new orchestrator run starts a fresh chat
+  -- with the deferred text as user input — quality is slightly
+  -- worse without the prior context, but the user gets the result
+  -- instead of permanent silence).
   completed_subscribers[#completed_subscribers + 1] = function(completion)
-    if type(current_state) ~= "table" or type(current_state.chat_id) ~= "string" then
-      nefor.log.info("agentic_workflow: dropping spawn_graph completion (no current chat)", {
-        run_id = completion.run_id,
-        status = completion.status,
-      })
-      return
-    end
     local text = format_deferred(completion)
     nefor.log.info("agentic_workflow: queueing deferred spawn_graph result", {
       sub_run_id = completion.run_id,
       status = completion.status,
       text_len = #text,
       busy = current_run_id ~= nil,
+      had_state = current_state ~= nil,
+      seed_chat_id = type(current_state) == "table" and current_state.chat_id or nil,
     })
     deferred_queue[#deferred_queue + 1] = { text = text }
     flush_deferred()
+  end
+
+  -- ------------------------------------------------------------------
+  -- session lifecycle handlers
+  -- ------------------------------------------------------------------
+  --
+  -- The starter's `sessions` module exposes two parallel notification
+  -- paths for resume lifecycle: bus events (`sessions.session_start` /
+  -- `session_end` / `resume_done`, fired one broker tick after they
+  -- broadcast) and synchronous resume-phase hooks (fired immediately,
+  -- INSIDE `sessions.resume()`, before the corresponding bus broadcast
+  -- ships).
+  --
+  -- We subscribe to BOTH:
+  --
+  --   * Synchronous phase hooks (`sessions.on_resume_phase`) — used for
+  --     work that must complete BEFORE replay traffic ships. Flipping
+  --     `replay_mode = true` is the canonical example: between the
+  --     session_start broadcast (which reaches reasoner-graph and may
+  --     cause it to react to replayed envelopes) and the bus subscriber
+  --     firing on the next tick, reasoner-graph could emit envelopes that
+  --     leak through `for_reasoner_graph.from_plugin` un-gated. Sync
+  --     hooks close that window.
+  --
+  --   * Bus subscribers (`nefor.bus.on_event`) — kept for the shutdown
+  --     path (sessions emits session_end on shutdown via the lifecycle
+  --     bus, NOT through resume()) and for test driveability.
+  --     Idempotent: the work is safe to run twice (state-clear of
+  --     already-empty tables, replay_mode set to its current value).
+  --
+  -- The lifecycle of `replay_mode` and per-session bookkeeping:
+  --
+  --   session_end  → cancel in-flight runs, drop chat-id bookkeeping,
+  --                   broadcast `chat.reset` so the provider drops its
+  --                   `Chats` map and the TUI clears the transcript.
+  --   session_start → set `replay_mode = true` so the reasoner-graph
+  --                   `from_plugin` transform drops envelopes that
+  --                   reasoner-graph emits in reaction to replayed
+  --                   bus traffic (the graph already ran in the
+  --                   original session — re-dispatching would duplicate
+  --                   every side effect).
+  --   resume_done  → flip `replay_mode = false`; the orchestrator is
+  --                   live again and ready to accept the next submit.
+  --
+  -- Boot session_start (fired by `sessions.init()`, not via resume())
+  -- only reaches the bus subscriber, never the sync hook. The bus
+  -- subscriber uses an `expecting_replay` flag — set by session_end —
+  -- to distinguish boot from resume. Sync hooks have no analog because
+  -- they only fire from `resume()` to begin with.
+  local expecting_replay = false
+
+  local function teardown_for_session_end(_session_id)
+    -- Cancel any in-flight orchestrator run on the reasoner-graph side
+    -- and drop sub-graph bookkeeping. Mirrors cancel_all() but without
+    -- the user-visible "[interrupted: ...]" message — session swaps are
+    -- silent at the UX layer. Idempotent on already-cleared state.
+    if current_run_id ~= nil then
+      emit("reasoner-graph", { kind = "reasoner-graph.graph.cancel", run_id = current_run_id })
+      current_run_id = nil
+    end
+    for run_id, _ in pairs(pending_runs) do
+      emit("reasoner-graph", { kind = "reasoner-graph.graph.cancel", run_id = run_id })
+    end
+    pending_runs       = {}
+    pending_dispatches = {}
+    pending            = {}
+    chat_id_to_key     = {}
+    chat_id_stream_visible = {}
+    tool_id_to_key     = {}
+    current_state      = nil
+    deferred_queue     = {}
+    pending_user_inputs = {}
+    -- Broadcast chat.reset so the provider's Chats map clears and the
+    -- TUI transcript empties. Provider's `<prefix>.reset` translation
+    -- already exists in for_provider's outer_to.
+    emit(nil, { kind = "chat.reset" })
+    expecting_replay = true
+    nefor.log.info("agentic_workflow: sessions.session_end → state cleared", {})
+  end
+
+  local function enter_replay_mode(_session_id)
+    -- Idempotent. Symmetric with the bus path's expecting_replay gate:
+    -- inside resume(), session_end's hook always fires first, so by the
+    -- time we get here on a resume swap the gate is set. Boot path
+    -- never hits this hook (boot doesn't go through resume()).
+    if not replay_mode then
+      replay_mode = true
+      nefor.log.info("agentic_workflow: sessions.session_start (resume) → replay_mode=true", {})
+    end
+  end
+
+  local function leave_replay_mode(_session_id)
+    if replay_mode then
+      replay_mode = false
+      nefor.log.info("agentic_workflow: sessions.resume_done → replay_mode=false", {})
+    end
+  end
+
+  -- Synchronous hooks: production resume path. These run BEFORE the
+  -- corresponding control-event broadcasts, closing the one-tick leak
+  -- window between session_start broadcast and the bus subscriber's
+  -- next-tick fire. `pcall(require)` so a unit-test harness without
+  -- starter/sessions.lua on the package path doesn't fail setup; the
+  -- bus subscribers below still cover those harnesses.
+  local sessions_ok, sessions_mod = pcall(require, "sessions")
+  if sessions_ok and type(sessions_mod) == "table"
+     and type(sessions_mod.on_resume_phase) == "function" then
+    sessions_mod.on_resume_phase("session_end",   teardown_for_session_end)
+    sessions_mod.on_resume_phase("session_start", enter_replay_mode)
+    sessions_mod.on_resume_phase("resume_done",   leave_replay_mode)
+  end
+
+  -- Bus subscribers: shutdown path + test compatibility. The work is
+  -- idempotent so double-firing (sync hook + bus subscriber) is safe.
+  if nefor.bus and nefor.bus.on_event then
+    nefor.bus.on_event("sessions.session_end", function(_entry)
+      teardown_for_session_end(nil)
+    end)
+
+    nefor.bus.on_event("sessions.session_start", function(_entry)
+      -- Boot session_start has no preceding session_end so
+      -- expecting_replay is false → leave replay_mode off. Resume's
+      -- session_start follows session_end (sync OR bus path) so the
+      -- gate is set.
+      if expecting_replay then
+        enter_replay_mode(nil)
+        expecting_replay = false
+      else
+        nefor.log.info("agentic_workflow: sessions.session_start (boot) → live", {})
+      end
+    end)
+
+    nefor.bus.on_event("sessions.resume_done", function(_entry)
+      leave_replay_mode(nil)
+    end)
   end
 end
 
@@ -1651,7 +1889,9 @@ function M.cancel_all()
   end
   local sub_n = cancel_all_pending_runs()
   local dropped = #deferred_queue
+  local dropped_inputs = #pending_user_inputs
   deferred_queue = {}
+  pending_user_inputs = {}
   -- Drop the in-flight provider/tool-gate bookkeeping too. A late
   -- chat.complete.result for a chat we just cancelled would otherwise
   -- emit a stale graph.node_result for a run_id reasoner-graph already
@@ -1662,19 +1902,26 @@ function M.cancel_all()
   chat_id_to_key = {}
   chat_id_stream_visible = {}
   tool_id_to_key = {}
+  -- This summary used to be emitted as a `chat.message.append` system
+  -- line ("[interrupted: chat=N sub-graphs=N deferred=N]"). It's
+  -- developer telemetry — counts of cancelled internal units, no
+  -- user-actionable signal — so it leaks into the transcript without
+  -- value (and is even surfaced verbatim through replay because it's
+  -- a normal append envelope). Demoted to log-only; user-visible
+  -- "interrupt" feedback comes from per-turn signals
+  -- (e.g. mock-plugin adapter's `[interrupted]` marker).
   nefor.log.info("agentic_workflow: cancel_all", {
     cancelled_chat_run = cancelled_chat,
     cancelled_sub_runs = sub_n,
     dropped_deferred = dropped,
+    dropped_pending_inputs = dropped_inputs,
   })
-  emit("nefor-tui", {
-    kind = "chat.message.append",
-    role = "system",
-    text = string.format(
-      "[interrupted: chat=%s sub-graphs=%d deferred=%d]",
-      cancelled_chat and "1" or "0", sub_n, dropped),
-  })
-  return { chat = cancelled_chat, sub_graphs = sub_n, deferred = dropped }
+  return {
+    chat = cancelled_chat,
+    sub_graphs = sub_n,
+    deferred = dropped,
+    pending_inputs = dropped_inputs,
+  }
 end
 
 -- /new handler: broadcast chat.reset (openai-provider clears its chat
@@ -1685,6 +1932,7 @@ function M.new_chat()
   current_state = nil
   current_run_id = nil
   deferred_queue = {}
+  pending_user_inputs = {}
   emit(nil, { kind = "chat.reset" })
 end
 
@@ -1771,6 +2019,7 @@ function M._reset()
   current_run_id = nil
   current_state = nil
   deferred_queue = {}
+  pending_user_inputs = {}
   pending = {}
   chat_id_to_key = {}
   tool_id_to_key = {}

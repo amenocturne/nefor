@@ -53,8 +53,7 @@ use nefor::ncp::runner::PluginRoot;
 use nefor::ncp::spawn::PluginSpec;
 use nefor::ncp::transport::Transport;
 use nefor::ncp::{spawn_plugin, Broker, BrokerOps, BrokerShared, PluginRegistry};
-use nefor::session::{SessionHeader, SessionId, SessionWriter};
-use nefor_protocol::{PluginName, Timestamp};
+use nefor_protocol::PluginName;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -164,7 +163,7 @@ fn make_driver_transport() -> (Driver, Transport) {
 
 /// Write a test init.lua under `dir`. Wires:
 ///   * `package.path` so `require("ncp")` etc. resolve to `starter/`.
-///   * `step` hook → `ncp.step`.
+///   * `dispatch` hook → `ncp.dispatch`.
 ///   * Transforms registered for "nefor-tui", "ollama", "reasoner-graph",
 ///     "tool-gate" via `ncp._test_set_transforms` — the test attaches the
 ///     plugins itself, so we skip `ncp.spawn` (it would try to fork a
@@ -185,8 +184,8 @@ package.path = table.concat({
 local ncp              = require("ncp")
 local agentic_workflow = require("agentic_workflow")
 
-function step(saved_log, current_log)
-  ncp.step(saved_log, current_log)
+function dispatch(current_log)
+  ncp.dispatch(current_log)
 end
 
 local PROVIDER = "ollama"
@@ -324,19 +323,8 @@ fn build_host(shared: Arc<Mutex<BrokerShared>>, config_dir: &Path) -> LuaHost {
     let mut host = LuaHost::new(bus, plugins, ops).expect("lua host");
     host.load_init(&config_dir.join("init.lua"))
         .expect("load init.lua");
-    host.cache_step().expect("cache step");
+    host.cache_dispatch().expect("cache dispatch");
     host
-}
-
-fn tmp_session_writer(tmp: &TempDir) -> SessionWriter {
-    let id = SessionId::new();
-    let path = tmp
-        .path()
-        .join("nefor")
-        .join("sessions")
-        .join(format!("{id}.jsonl"));
-    let header = SessionHeader::new(id, None, Timestamp::now());
-    SessionWriter::create_at(path, header).expect("session writer")
 }
 
 fn parse_json_line(line: &str) -> Option<Value> {
@@ -406,11 +394,8 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
     write_test_init_lua(tmp.path());
     let mock_script = write_mock_script(tmp.path());
 
-    let session = tmp_session_writer(&tmp);
-    let shared = Arc::new(Mutex::new(BrokerShared::new(session)));
+    let shared = Arc::new(Mutex::new(BrokerShared::new()));
     let host = build_host(Arc::clone(&shared), tmp.path());
-
-    let saved_log = Vec::new();
 
     // Plugin root must be a directory containing one subdir per plugin
     // name (the runner uses `<root>/<name>/` as cwd). The repo's
@@ -511,7 +496,7 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
 
     let (mut driver, driver_transport) = make_driver_transport();
 
-    let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, saved_log);
+    let mut broker = Broker::new(Arc::clone(&shared), host);
     broker.attach_transport(combinators_t, combinators_spec.name.clone());
     broker.attach_transport(generic_provider_t, generic_provider_spec.name.clone());
     broker.attach_transport(generic_tool_t, generic_tool_spec.name.clone());
@@ -529,7 +514,7 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
 
     handshake(&mut driver).await;
 
-    // Wait until every required peer is observable in the session log.
+    // Wait until every required peer is observable in the event log.
     // Two classes:
     //  * Real plugin processes — observable as a `from` field on any
     //    envelope they emit.
@@ -655,13 +640,13 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
         }
     }
 
-    // ---- Read the session log for structural assertions --------------
+    // ---- Read the in-memory event log for structural assertions -----
     //
     // The driver-side cuts only see traffic targeted at "nefor-tui" or
     // broadcast — that excludes targeted-only envelopes like
     // `tool-gate.tool.invoke` (delivered to tool-gate via the
     // prefix-targeting routing in ncp.lua). For those we read the
-    // session log via shared state.
+    // broker's in-memory `event_log` via shared state.
     let log_kinds: Vec<String> = {
         let guard = shared.lock().expect("shared lock");
         guard
