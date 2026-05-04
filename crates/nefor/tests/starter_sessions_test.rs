@@ -655,6 +655,453 @@ fn new_mints_fresh_session_and_prunes_empty_outgoing() {
     }
 }
 
+#[test]
+fn resume_to_existing_session_appends_in_order() {
+    // After `M.resume(target)` swaps to an existing file, subsequent
+    // persisted envelopes must APPEND — not overwrite the header, not
+    // duplicate the prior content. This test prepopulates a target file
+    // with one submit, resumes into it, drives a second submit through
+    // the persistence hook, and asserts the file ends with both
+    // submits in the original order.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_HOME").ok();
+    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+
+    let target_id = "44444444-2222-4333-8444-555555555555";
+    let sessions_dir = tempdir.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("mkdir");
+    let target_path = sessions_dir.join(format!("{target_id}.jsonl"));
+    let preexisting = format!(
+        concat!(
+            r#"{{"_session":true,"session_id":"{id}","started_at":"2026-05-04T00:00:00.000Z"}}"#,
+            "\n",
+            r#"{{"ts":"2026-05-04T00:00:00.001Z","origin":"nefor-tui","payload":"{{\"type\":\"event\",\"body\":{{\"kind\":\"chat.input.submit\",\"text\":\"first\"}}}}"}}"#,
+            "\n",
+        ),
+        id = target_id
+    );
+    std::fs::write(&target_path, &preexisting).expect("seed target file");
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+
+    lua.load(
+        r#"
+        sessions = require("sessions")
+        sessions.init()
+        "#,
+    )
+    .exec()
+    .expect("init");
+
+    // Resume into the seeded file.
+    let resume_call = format!(r#"sessions.resume("{target_id}")"#);
+    lua.load(&resume_call).exec().expect("resume");
+
+    // Drive a second submit through the persistence hook. The active
+    // file is now the target — write should append.
+    lua.load(
+        r#"
+        local json = nefor.json
+        sessions._persist_envelope({
+            ts      = "2026-05-04T00:00:01.000Z",
+            origin  = "nefor-tui",
+            payload = json.encode({ type = "event", body = { kind = "chat.input.submit", text = "second" } }),
+        })
+        "#,
+    )
+    .exec()
+    .expect("drive second submit");
+
+    let body = std::fs::read_to_string(&target_path).expect("read target");
+    let lines: Vec<&str> = body.lines().collect();
+    // header + first + second.
+    assert!(lines.len() >= 3, "expected ≥3 lines, got {body}");
+    let last = lines[lines.len() - 1];
+    let prior = lines[lines.len() - 2];
+    // Payload is a JSON-encoded string, so the inner `"text":"X"` is
+    // written as `\"text\":\"X\"` in the row's bytes. Match that.
+    assert!(
+        last.contains(r#"\"text\":\"second\""#),
+        "last line must be the second submit: {last}"
+    );
+    assert!(
+        prior.contains(r#"\"text\":\"first\""#),
+        "second-to-last line must be the preexisting first submit \
+         (resume must not corrupt the prior content): {prior}"
+    );
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
+        None => std::env::remove_var("NEFOR_DATA_HOME"),
+    }
+}
+
+#[test]
+fn resume_to_self_is_noop() {
+    // `M.resume(current_id)` should bail out instead of cycling
+    // session_end → session_start. Otherwise a duplicate resume_request
+    // (e.g., user clicks a row twice) would tear down state mid-turn
+    // for nothing.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_HOME").ok();
+    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+
+    // Set up a recorder so we can prove the resume short-circuits.
+    lua.load(
+        r#"
+        _emit_count = 0
+        local original_send = nefor.engine.send
+        nefor.engine.send = function(payload, target)
+            _emit_count = _emit_count + 1
+            return original_send(payload, target)
+        end
+        sessions = require("sessions")
+        sessions.init()
+        _emit_count = 0  -- reset after init's emit
+        "#,
+    )
+    .exec()
+    .expect("init + recorder");
+
+    let id: String = lua
+        .load(r#"return sessions.current_id()"#)
+        .eval()
+        .expect("current_id");
+    let resume_call = format!(r#"sessions.resume("{id}")"#);
+    lua.load(&resume_call).exec().expect("resume to self");
+
+    let after: i64 = lua
+        .load(r#"return _emit_count"#)
+        .eval()
+        .expect("emit_count");
+    assert_eq!(
+        after, 0,
+        "resume to current session must not emit any control events"
+    );
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
+        None => std::env::remove_var("NEFOR_DATA_HOME"),
+    }
+}
+
+#[test]
+fn resume_to_nonexistent_session_succeeds_with_zero_replayed() {
+    // Resume's contract: the swap always happens (we own the new id)
+    // even if the target file is missing. The bus broadcast carries
+    // `replayed = 0` and a fresh file is created. This is what makes a
+    // hand-typed `/resume <random-uuid>` recoverable rather than wedging
+    // the engine.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_HOME").ok();
+    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+
+    let target_id = "55555555-2222-4333-8444-555555555555";
+    let resume_call = format!(
+        r#"
+        _resume_done_payload = nil
+        local original_send = nefor.engine.send
+        local json = nefor.json
+        nefor.engine.send = function(payload, target)
+            local ok, decoded = pcall(json.decode, payload)
+            if ok and decoded and decoded.body
+               and decoded.body.kind == "sessions.resume_done" then
+                _resume_done_payload = payload
+            end
+            return original_send(payload, target)
+        end
+        sessions = require("sessions")
+        sessions.init()
+        sessions.resume("{target_id}")
+        "#
+    );
+    lua.load(&resume_call).exec().expect("resume to fresh");
+
+    let new_id: String = lua
+        .load(r#"return sessions.current_id()"#)
+        .eval()
+        .expect("current_id");
+    assert_eq!(new_id, target_id, "swap must complete to target id");
+
+    let new_path: String = lua
+        .load(r#"return sessions.current_path()"#)
+        .eval()
+        .expect("current_path");
+    assert!(
+        std::path::Path::new(&new_path).exists(),
+        "fresh file should exist with header at {new_path}"
+    );
+
+    let payload: Option<String> = lua
+        .load(r#"return _resume_done_payload"#)
+        .eval()
+        .expect("payload");
+    let payload = payload.expect("resume_done must broadcast");
+    assert!(
+        payload.contains("\"replayed\":0"),
+        "resume_done must report replayed=0 for missing target file: {payload}"
+    );
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
+        None => std::env::remove_var("NEFOR_DATA_HOME"),
+    }
+}
+
+#[test]
+fn data_root_resolves_xdg_then_home_fallback() {
+    // Picker reads from sessions.lua's data root; the resolver MUST
+    // walk: NEFOR_DATA_HOME → XDG_DATA_HOME/nefor → HOME/.local/share/nefor.
+    // chat.lua's picker resolver mirrors this — they have to agree or
+    // the picker shows nothing while writes go elsewhere (the bug from
+    // the rework session).
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev_data = std::env::var("NEFOR_DATA_HOME").ok();
+    let prev_xdg = std::env::var("XDG_DATA_HOME").ok();
+    let prev_home = std::env::var("HOME").ok();
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+    lua.load(r#"sessions = require("sessions")"#)
+        .exec()
+        .expect("require");
+
+    // Case 1: NEFOR_DATA_HOME wins.
+    std::env::remove_var("XDG_DATA_HOME");
+    std::env::set_var("HOME", "/tmp/test-home");
+    std::env::set_var("NEFOR_DATA_HOME", "/tmp/forced/root");
+    let r1: String = lua
+        .load(r#"return sessions._data_root()"#)
+        .eval()
+        .expect("r1");
+    assert_eq!(r1, "/tmp/forced/root");
+
+    // Case 2: NEFOR_DATA_HOME unset, XDG_DATA_HOME wins (with /nefor suffix).
+    std::env::remove_var("NEFOR_DATA_HOME");
+    std::env::set_var("XDG_DATA_HOME", "/tmp/xdg/root");
+    let r2: String = lua
+        .load(r#"return sessions._data_root()"#)
+        .eval()
+        .expect("r2");
+    assert_eq!(r2, "/tmp/xdg/root/nefor");
+
+    // Case 3: both unset, HOME fallback.
+    std::env::remove_var("XDG_DATA_HOME");
+    std::env::set_var("HOME", "/tmp/test-home");
+    let r3: String = lua
+        .load(r#"return sessions._data_root()"#)
+        .eval()
+        .expect("r3");
+    assert_eq!(r3, "/tmp/test-home/.local/share/nefor");
+
+    // Restore env.
+    match prev_data.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
+        None => std::env::remove_var("NEFOR_DATA_HOME"),
+    }
+    match prev_xdg.as_deref() {
+        Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+        None => std::env::remove_var("XDG_DATA_HOME"),
+    }
+    match prev_home.as_deref() {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
+}
+
+#[test]
+fn replay_drops_chat_stream_delta_keeps_reasoning_delta() {
+    // Replay must produce an INSTANT transcript, not a re-streaming of
+    // the original turn. Per-token `chat.stream.delta` envelopes are
+    // dropped because their finalizer (`chat.stream.end`) carries the
+    // full assistant text. Reasoning deltas are KEPT because their
+    // finalizer (`chat.stream.reasoning_end`) carries no text — the
+    // reasoning view is built from the deltas themselves.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_HOME").ok();
+    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+
+    let target_id = "66666666-2222-4333-8444-555555555555";
+    let sessions_dir = tempdir.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("mkdir");
+    let path = sessions_dir.join(format!("{target_id}.jsonl"));
+    let body = concat!(
+        r#"{"_session":true,"session_id":"66666666-2222-4333-8444-555555555555","started_at":"2026-05-04T00:00:00.000Z"}"#,
+        "\n",
+        // step-origin chat.stream.delta → MUST be dropped on replay
+        r#"{"ts":"2026-05-04T00:00:00.001Z","origin":"step","target":"nefor-tui","payload":"{\"type\":\"event\",\"from\":\"engine\",\"body\":{\"kind\":\"chat.stream.delta\",\"text\":\"tok\"}}"}"#,
+        "\n",
+        // step-origin chat.stream.reasoning_delta → MUST be kept
+        r#"{"ts":"2026-05-04T00:00:00.002Z","origin":"step","target":"nefor-tui","payload":"{\"type\":\"event\",\"from\":\"engine\",\"body\":{\"kind\":\"chat.stream.reasoning_delta\",\"text\":\"hmm\"}}"}"#,
+        "\n",
+        // step-origin chat.stream.end → kept (carries final text)
+        r#"{"ts":"2026-05-04T00:00:00.003Z","origin":"step","target":"nefor-tui","payload":"{\"type\":\"event\",\"from\":\"engine\",\"body\":{\"kind\":\"chat.stream.end\",\"text\":\"final\"}}"}"#,
+        "\n",
+    );
+    std::fs::write(&path, body).expect("seed");
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+    let resume_call = format!(
+        r#"
+        _replayed_kinds = {{}}
+        local original_send = nefor.engine.send
+        local json = nefor.json
+        nefor.engine.send = function(payload, target)
+            local ok, decoded = pcall(json.decode, payload)
+            if ok and decoded and decoded.body and decoded.body.kind then
+                _replayed_kinds[#_replayed_kinds + 1] = decoded.body.kind
+            end
+            return original_send(payload, target)
+        end
+        sessions = require("sessions")
+        sessions.init()
+        _replayed_kinds = {{}}  -- reset after init's session_start
+        sessions.resume("{target_id}")
+        "#
+    );
+    lua.load(&resume_call).exec().expect("resume");
+
+    let kinds: Table = lua.globals().get("_replayed_kinds").expect("kinds");
+    let len = kinds.len().expect("len") as usize;
+    let collected: Vec<String> = (1..=len)
+        .map(|i| kinds.get::<String>(i).expect("entry"))
+        .collect();
+    assert!(
+        !collected.iter().any(|k| k == "chat.stream.delta"),
+        "chat.stream.delta must be dropped on replay; got {collected:?}"
+    );
+    assert!(
+        collected.iter().any(|k| k == "chat.stream.reasoning_delta"),
+        "chat.stream.reasoning_delta must be kept on replay; got {collected:?}"
+    );
+    assert!(
+        collected.iter().any(|k| k == "chat.stream.end"),
+        "chat.stream.end must be kept on replay; got {collected:?}"
+    );
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
+        None => std::env::remove_var("NEFOR_DATA_HOME"),
+    }
+}
+
+#[test]
+fn new_then_new_prunes_each_empty_predecessor() {
+    // Repeated `/new` without typing must not leave a trail of empty
+    // stubs. Each cycle prunes the prior file; the picker stays clean.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_HOME").ok();
+    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+
+    lua.load(
+        r#"
+        sessions = require("sessions")
+        sessions.init()
+        sessions._on_new_request(nil)  -- /new #1
+        sessions._on_new_request(nil)  -- /new #2
+        sessions._on_new_request(nil)  -- /new #3
+        "#,
+    )
+    .exec()
+    .expect("triple-new");
+
+    let sessions_dir = tempdir.path().join("sessions");
+    let mut entries: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .expect("read sessions dir")
+        .filter_map(|r| r.ok())
+        .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
+        .collect();
+    entries.sort_by_key(|e| e.path());
+    // Only the latest active session file should remain — three
+    // predecessors must have been pruned.
+    assert_eq!(
+        entries.len(),
+        1,
+        "expected one active session file, got {}: {:?}",
+        entries.len(),
+        entries.iter().map(|e| e.path()).collect::<Vec<_>>(),
+    );
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
+        None => std::env::remove_var("NEFOR_DATA_HOME"),
+    }
+}
+
+#[test]
+fn new_after_submit_preserves_prior_session() {
+    // Asymmetric prune: a session with at least one user submit must
+    // SURVIVE `/new`. Otherwise the user's first session of the day
+    // would vanish the moment they typed `/new`.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_HOME").ok();
+    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+
+    lua.load(
+        r#"
+        sessions = require("sessions")
+        sessions.init()
+        local json = nefor.json
+        -- Real user submit in the boot session.
+        sessions._persist_envelope({
+            ts      = "2026-05-04T00:00:00.000Z",
+            origin  = "nefor-tui",
+            payload = json.encode({ type = "event", body = { kind = "chat.input.submit", text = "ship-it" } }),
+        })
+        _boot_path = sessions.current_path()
+        sessions._on_new_request(nil)
+        _new_path = sessions.current_path()
+        "#,
+    )
+    .exec()
+    .expect("submit + /new");
+
+    let boot_path: String = lua.load(r#"return _boot_path"#).eval().expect("boot path");
+    let new_path: String = lua.load(r#"return _new_path"#).eval().expect("new path");
+
+    assert!(
+        std::path::Path::new(&boot_path).exists(),
+        "session with prior submit must survive /new: {boot_path}"
+    );
+    assert!(
+        std::path::Path::new(&new_path).exists(),
+        "/new must open a fresh file: {new_path}"
+    );
+    assert_ne!(boot_path, new_path, "/new must mint a different id");
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
+        None => std::env::remove_var("NEFOR_DATA_HOME"),
+    }
+}
+
 // Process-global lock to serialise tests that mutate NEFOR_DATA_HOME.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 

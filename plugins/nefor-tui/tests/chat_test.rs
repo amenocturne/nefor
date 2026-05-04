@@ -2648,3 +2648,440 @@ fn chat_toast_slides_horizontally_during_enter() {
         "expected full label visible at rest; snapshot:\n{rest}"
     );
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Resume / session lifecycle from the TUI's perspective
+// ──────────────────────────────────────────────────────────────────────────
+//
+// These tests pin the chat-side handling of the four control envelopes the
+// starter `sessions` module emits — `sessions.session_end`,
+// `sessions.session_start`, `sessions.resume_done` (broadcast events) — and
+// the orchestrator's `chat.message.append` round-trip echo. The earlier
+// tests in this file cover the egress side (`/resume <id>` → emits
+// `sessions.resume_request`); these cover the ingress side (the bus
+// envelopes flow back into chat.lua).
+//
+// Why the dedicated section: the resume path has had subtle bugs (transcript
+// stayed empty after pick, replayed deltas re-streamed in real time, first
+// post-`/new` submit invisible) that only surface when the lifecycle events
+// interleave with live keypresses. The chat surface has no Rust-side state
+// observable from the test other than (a) what it renders and (b) what it
+// emits — the assertions reflect that.
+
+/// `/new` immediately followed by a submit must show the user's text. The
+/// orchestrator echoes the submitted text back as `chat.message.append
+/// role=user` so it persists + replays; the chat side has a `pending_user_echo`
+/// dedup marker so the echo doesn't double-render the live message. The
+/// regression: the lifecycle events from `/new` (chat.reset, session_end,
+/// session_start, resume_done) used to land BEFORE the echo, and
+/// session_end's `entries = {}` clear wiped the locally-pushed user message.
+/// Then when the echo arrived, `pending_user_echo` was nil → `push_entry`
+/// fires → the message appears. So the order is what matters: this test
+/// drives the pessimistic order (lifecycle events arrive AFTER the local
+/// submit, then the echo arrives) and asserts the message is visible.
+#[test]
+fn slash_new_then_submit_shows_user_message_after_lifecycle_round_trip() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // `/new` + Enter — locally clears state, emits chat.interrupt_all +
+    // sessions.new_request.
+    for ch in "/new".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    // "hello" + Enter immediately — local push of user message,
+    // pending_user_echo set to "hello", emits chat.input.submit.
+    for ch in "hello".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    // Now the engine catches up: agentic_workflow's session_end teardown
+    // broadcasts chat.reset, sessions.lua emits the three lifecycle
+    // envelopes, and the chat.input.submit handler emits the echo.
+    dispatch_event(&mut engine, json!({ "kind": "chat.reset" }));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_end", "session_id": "old-id" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "new-id" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.resume_done", "session_id": "new-id", "replayed": 0 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "hello" }),
+    );
+
+    let _ = render_str(&mut engine);
+    let out = engine.snapshot();
+    assert!(
+        out.contains("hello"),
+        "user's first post-/new message must remain visible after the \
+         lifecycle round-trip; transcript was:\n{out}",
+    );
+}
+
+/// Live submit (no `/new` preceding) must dedup the echo. Local push +
+/// echo round-trip must produce ONE rendered user line, not two. The
+/// `pending_user_echo` marker is what enforces this.
+#[test]
+fn live_submit_dedups_orchestrator_echo() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "abc".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "abc" }),
+    );
+    let _ = render_str(&mut engine);
+    let out = engine.snapshot();
+
+    // "abc" must appear exactly once. Count the prefix occurrences with
+    // some forgiveness for the timestamp / icon column.
+    let occurrences = out.matches("abc").count();
+    assert_eq!(
+        occurrences, 1,
+        "expected exactly one rendered user line for 'abc' (dedup against \
+         the orchestrator's echo); got {occurrences} in: {out:?}",
+    );
+}
+
+/// Replay path: between session_start and resume_done, `chat.message.append`
+/// envelopes must paint the transcript. This is what makes a `/resume` show
+/// the prior conversation. The dedup marker is irrelevant on replay (the
+/// chat surface didn't emit anything live), so push_entry fires for every
+/// replayed envelope.
+#[test]
+fn replay_paints_transcript_between_session_start_and_resume_done() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Open the resume cycle.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_end", "session_id": "old" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "new" }),
+    );
+
+    // Replay envelopes — what the engine's replay loop sends to nefor-tui.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "first prompt" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "assistant", "text": "first reply" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "second prompt" }),
+    );
+
+    // Close the cycle.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.resume_done", "session_id": "new", "replayed": 3 }),
+    );
+
+    let _ = render_str(&mut engine);
+    let out = engine.snapshot();
+    for needle in ["first prompt", "first reply", "second prompt"] {
+        assert!(
+            out.contains(needle),
+            "replayed entry {needle:?} missing from transcript:\n{out}",
+        );
+    }
+}
+
+/// `sessions.session_end` clears the transcript so the new session paints
+/// fresh. Without this, the previous session's content would be visible
+/// alongside the replayed new content during the swap.
+#[test]
+fn session_end_clears_transcript_before_replay() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "stale-from-old-session" }),
+    );
+    let _ = render_str(&mut engine);
+    let pre = engine.snapshot();
+    assert!(
+        pre.contains("stale-from-old-session"),
+        "seed entry should render before session_end:\n{pre}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_end", "session_id": "old" }),
+    );
+    let _ = render_str(&mut engine);
+    let post = engine.snapshot();
+    assert!(
+        !post.contains("stale-from-old-session"),
+        "transcript must be cleared by session_end so replay paints fresh; \
+         still contained stale entry:\n{post}",
+    );
+}
+
+/// Empty replay (`replayed = 0`) leaves the transcript empty. Tests the
+/// fresh-`/new` and fresh-resume-target paths where the new session has no
+/// prior content — chat.lua must accept `resume_done` without paintings
+/// stranded ghosts from the prior session.
+#[test]
+fn empty_replay_lifecycle_leaves_transcript_clean() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Old session had content.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "old-content" }),
+    );
+    let _ = render_str(&mut engine);
+
+    // Lifecycle for a swap to a brand-new (empty) session.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_end", "session_id": "old" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "new" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.resume_done", "session_id": "new", "replayed": 0 }),
+    );
+
+    let _ = render_str(&mut engine);
+    let out = engine.snapshot();
+    assert!(
+        !out.contains("old-content"),
+        "transcript must be empty after fresh-session lifecycle, but \
+         still contained old content:\n{out}",
+    );
+}
+
+/// `/new` must not strand a `pending_user_echo` from the prior turn. If
+/// the user submits "abc", presses `/new` before the echo arrives, then
+/// types "abc" again as their first post-`/new` submit, the second "abc"
+/// must NOT be deduped against the stranded marker — that would silently
+/// drop the user's first message in the new session.
+#[test]
+fn slash_new_clears_pending_user_echo_so_repeated_text_is_not_swallowed() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // First submit — sets pending_user_echo to "abc".
+    for ch in "abc".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    // `/new` BEFORE the orchestrator's echo arrives, so the marker is
+    // stranded. Then immediately submit the same text again.
+    for ch in "/new".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    // Second submit, identical text — different new session, NOT a
+    // duplicate. (No echo for the first "abc" was ever delivered.)
+    for ch in "abc".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    // Lifecycle catches up + echo arrives for the post-/new submit.
+    dispatch_event(&mut engine, json!({ "kind": "chat.reset" }));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_end", "session_id": "old" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "new" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.resume_done", "session_id": "new", "replayed": 0 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "abc" }),
+    );
+
+    let _ = render_str(&mut engine);
+    let out = engine.snapshot();
+    assert!(
+        out.contains("abc"),
+        "the post-/new 'abc' must remain visible — a stranded \
+         pending_user_echo from the pre-/new submit must not eat it. \
+         Transcript:\n{out}",
+    );
+}
+
+/// `/new` egress contract: cancels in-flight work AND mints a new on-disk
+/// session. Already covered by `slash_new_clears_transcript_and_mints_new_session`
+/// at the top of this file; this companion test pins the absence of stale
+/// emits — `/new` must NOT emit `sessions.resume_request` (that's the
+/// /resume path).
+#[test]
+fn slash_new_does_not_emit_resume_request() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "/new".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let emits = engine.take_emit_queue();
+
+    let kinds: Vec<_> = emits
+        .iter()
+        .map(|(_, b)| b.get("kind").and_then(|v| v.as_str()).unwrap_or(""))
+        .collect();
+    assert!(
+        !kinds.contains(&"sessions.resume_request"),
+        "/new must not emit sessions.resume_request; got {kinds:?}",
+    );
+    assert!(
+        kinds.contains(&"sessions.new_request"),
+        "/new must emit sessions.new_request; got {kinds:?}",
+    );
+}
+
+/// User flow with prior content, then `/new`, then immediate submit.
+/// Mimics the production scenario the user reported: had one session,
+/// switched to a new one, typed a prompt, first message didn't display.
+/// This drives the optimistic order (session lifecycle ARRIVES BEFORE
+/// the user's submit) — the realistic order under interactive typing.
+#[test]
+fn realistic_new_flow_with_prior_content_displays_first_message() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Prior session content.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "old-prompt" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "assistant", "text": "old-reply" }),
+    );
+    let _ = render_str(&mut engine);
+
+    // `/new` → emits chat.interrupt_all + sessions.new_request.
+    for ch in "/new".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    // Lifecycle catches up FIRST (engine is fast → events arrive before
+    // the user finishes typing the next prompt).
+    dispatch_event(&mut engine, json!({ "kind": "chat.reset" }));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_end", "session_id": "old" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "new" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.resume_done", "session_id": "new", "replayed": 0 }),
+    );
+    let _ = render_str(&mut engine);
+
+    // Old content is gone.
+    let mid = engine.snapshot();
+    assert!(
+        !mid.contains("old-prompt"),
+        "old content must be cleared by lifecycle: {mid}"
+    );
+
+    // User types first message in fresh session.
+    for ch in "fresh-prompt".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    // Orchestrator's echo for the fresh submit.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "fresh-prompt" }),
+    );
+    let _ = render_str(&mut engine);
+    let out = engine.snapshot();
+    assert!(
+        out.contains("fresh-prompt"),
+        "first post-/new submit must render — production bug repro. \
+         Transcript:\n{out}",
+    );
+}
+
+/// `/clear` is an alias for `/new`. Same egress, same lifecycle expectations.
+#[test]
+fn slash_clear_is_alias_for_slash_new() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "/clear".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let emits = engine.take_emit_queue();
+
+    let kinds: Vec<_> = emits
+        .iter()
+        .map(|(_, b)| b.get("kind").and_then(|v| v.as_str()).unwrap_or(""))
+        .collect();
+    assert!(
+        kinds.contains(&"chat.interrupt_all") && kinds.contains(&"sessions.new_request"),
+        "/clear must emit interrupt_all + new_request like /new; got {kinds:?}",
+    );
+}
