@@ -1538,26 +1538,36 @@ local function inline_toast(state)
   local elapsed   = now - created
   local time_left = expires - now
 
-  -- Slide progress in cells. `slide_offset` ∈ [0, TOAST_REST_INSET]
-  -- where 0 = flush-right (entering / leaving the screen edge) and
-  -- TOAST_REST_INSET = at rest position. Pill is always full size.
-  local slide_offset
-  if elapsed < TOAST_ENTER_MS then
-    -- Enter: slide leftward from flush-right to rest, ease-out cubic.
-    local t = elapsed / TOAST_ENTER_MS
-    slide_offset = TOAST_REST_INSET * ease_out_cubic(t)
-  elseif time_left < TOAST_EXIT_MS then
-    -- Exit: slide rightward from rest back to flush-right, ease-in cubic.
-    local t = 1 - (time_left / TOAST_EXIT_MS)
-    slide_offset = TOAST_REST_INSET * (1 - ease_in_cubic(t))
-  else
-    slide_offset = TOAST_REST_INSET
-  end
-  -- Round to whole cells. `tui.anchored` offset is integer-typed.
-  local inset = math.floor(slide_offset + 0.5)
-
   local text = state.toast.text or ""
   local fg, border = toast_palette(state.toast.level)
+
+  -- Marquee slide: the text translates leftward from off-screen-right.
+  -- `total_slide` is the full distance the leading character travels —
+  -- from the right edge of the window (off-screen) to its rest column
+  -- TOAST_REST_INSET cells inset from the edge. `distance_slid` ∈
+  -- [0, total_slide] tracks how far along we are. We render the
+  -- leftmost `visible_n` chars of `text` immediately followed by
+  -- `trailing_pad` blank cells, the whole strip right-aligned. The
+  -- result: at the start of enter, only the first character peeks at
+  -- the right edge; mid-enter the leading prefix grows leftward; at
+  -- rest the full text sits TOAST_REST_INSET cells from the edge.
+  -- Exit mirrors the enter in reverse.
+  local total_slide = #text + TOAST_REST_INSET
+  local distance_slid
+  if elapsed < TOAST_ENTER_MS then
+    local t = elapsed / TOAST_ENTER_MS
+    distance_slid = total_slide * ease_out_cubic(t)
+  elseif time_left < TOAST_EXIT_MS then
+    local t = 1 - (time_left / TOAST_EXIT_MS)
+    distance_slid = total_slide * (1 - ease_in_cubic(t))
+  else
+    distance_slid = total_slide
+  end
+  distance_slid = math.floor(distance_slid + 0.5)
+
+  local visible_n    = math.min(distance_slid, #text)
+  local visible_text = string.sub(text, 1, visible_n)
+  local trailing_pad = distance_slid - visible_n
 
   -- Banner-style chrome: full-window-width top and bottom rules, no
   -- left wall. The text rides the right edge with 2 cells of padding
@@ -1572,10 +1582,8 @@ local function inline_toast(state)
     child = tui.fill { char = "─", style = border },
   }
   -- The band itself spans full window width so the rules never move.
-  -- The slide is implemented by the text's right-padding: at rest it
-  -- sits TOAST_REST_INSET cells inset from the right edge; at enter
-  -- start it touches the edge; during exit it animates back to the
-  -- edge. `inset` is computed above from the easing curve.
+  -- The mid-row right-aligns the visible prefix of the text plus the
+  -- trailing pad. `tui.expanded` on the left absorbs the slack.
   local mid_row = tui.constrained {
     max_height = 1,
     child = tui.row {
@@ -1583,12 +1591,12 @@ local function inline_toast(state)
       children = {
         tui.expanded { child = tui.fill { char = " " } },
         tui.text {
-          content = text,
+          content = visible_text,
           style   = { fg = fg },
           wrap    = "none",
         },
         tui.constrained {
-          max_width = inset + 1,
+          max_width = trailing_pad,
           child = tui.fill { char = " " },
         },
       },

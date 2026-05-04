@@ -2615,38 +2615,45 @@ fn chat_toast_slides_horizontally_during_enter() {
         }),
     );
 
-    // Helper: column of the LAST char of the toast label on its row,
-    // or None if invisible. The label is `slide-test` followed by
-    // trailing pad (`inset + 1` spaces). As the slide proceeds, the
-    // label's rightmost column shifts leftward.
-    fn label_right_col(snap: &str) -> Option<usize> {
-        snap.lines().find_map(|l| {
-            let i = l.find("slide-test")?;
-            Some(i + "slide-test".len() - 1)
-        })
+    // Helper: longest leading prefix of "slide-test" found in `snap`.
+    // Mid-enter only the first few chars are rendered (the leading
+    // characters peek through at the right edge); at rest the full
+    // word is visible. So the prefix length grows monotonically as
+    // the slide progresses — that's what we assert.
+    fn longest_visible_prefix(snap: &str) -> usize {
+        let candidate = "slide-test";
+        let mut best = 0;
+        for prefix_len in 1..=candidate.len() {
+            if snap.contains(&candidate[..prefix_len]) {
+                best = prefix_len;
+            } else {
+                break;
+            }
+        }
+        best
     }
 
-    // Sample mid-enter — ease_out_cubic(50/220) ≈ 0.59, slide_offset
-    // ≈ 1.18 → inset = 1 → trailing pad = 2 cells. Label sits 2
-    // columns left of flush-right.
+    // Sample mid-enter — ease_out_cubic(50/220) ≈ 0.59, total_slide
+    // = 12 (10 chars + TOAST_REST_INSET=2), distance_slid ≈ 7. So
+    // the first 7 chars of "slide-test" are rendered: "slide-t".
     engine.advance_time(Duration::from_millis(50));
     let _ = render_str(&mut engine);
     let early = engine.snapshot();
-    let early_col = label_right_col(&early)
-        .unwrap_or_else(|| panic!("toast invisible mid-enter; snapshot:\n{early}"));
+    let early_prefix = longest_visible_prefix(&early);
+    assert!(
+        early_prefix > 0 && early_prefix < "slide-test".len(),
+        "expected partial label mid-enter (got prefix len {early_prefix}); snapshot:\n{early}"
+    );
 
-    // Sample at rest — past the enter window. inset = TOAST_REST_INSET
-    // (2) → trailing pad = 3 cells. Label sits 3 columns left of
-    // flush-right, i.e. one column further left than mid-enter.
+    // Sample at rest — past the enter window. distance_slid =
+    // total_slide → full label visible.
     engine.advance_time(Duration::from_millis(250));
     let _ = render_str(&mut engine);
     let rest = engine.snapshot();
-    let rest_col = label_right_col(&rest)
-        .unwrap_or_else(|| panic!("toast invisible at rest; snapshot:\n{rest}"));
-
-    assert!(
-        rest_col < early_col,
-        "expected label to slide leftward into rest position; \
-         early_col = {early_col}, rest_col = {rest_col}"
+    let rest_prefix = longest_visible_prefix(&rest);
+    assert_eq!(
+        rest_prefix,
+        "slide-test".len(),
+        "expected full label visible at rest; snapshot:\n{rest}"
     );
 }
