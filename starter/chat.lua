@@ -1493,10 +1493,11 @@ local TOAST_BORDER_ERROR   = { fg = C.status_danger }
 local TOAST_FULL_HEIGHT    = 3    -- top rule + text + bottom rule (no inner padding)
 local TOAST_ENTER_MS       = 220
 local TOAST_EXIT_MS        = 220
--- Cells of inset from the right edge at rest. The visible slide
--- covers exactly this distance — pill enters by sliding leftward
--- `TOAST_REST_INSET` cells from flush-right to its rest position.
-local TOAST_REST_INSET     = 2
+-- Extra cells of dashes past the right edge of the window. The
+-- anchored rect clamps to parent width, so these dashes get clipped
+-- on the right — visually the top/bottom rules look like they
+-- continue off-screen rather than terminating exactly at the edge.
+local TOAST_RIGHT_OVERFLOW = 6
 
 -- Easing helpers. Domain [0,1]; clamp before applying.
 local function clamp01(t)
@@ -1541,19 +1542,17 @@ local function inline_toast(state)
   local text = state.toast.text or ""
   local fg, border = toast_palette(state.toast.level)
 
-  -- Small rectangular pill anchored bottom-right. Pill width at rest =
-  -- text + 1 padding space + 1 right-border cell. The slide is
-  -- implemented by varying the pill's WIDTH from 0 (off-screen) to
-  -- pill_w_at_rest (full pill). Because the pill is anchored at the
-  -- right edge, the rect grows LEFTWARD as visible_w increases — the
-  -- text widgets render their full at-rest content into a too-narrow
-  -- rect, which truncates on the right. So the user sees the LEFTMOST
-  -- cells of the pill's content riding the right edge of the window:
-  -- leading dashes / leading chars of the text appear first, the
-  -- right corners / right border show only once the slide completes.
-  -- TOAST_REST_INSET is no longer used; replaced by this width-grows
-  -- model.
-  local pill_w_at_rest = #text + 2
+  -- Small pill anchored bottom-right. Width at rest = `╭` corner +
+  -- space + text + extra dashes that overflow past the right edge.
+  -- The slide is implemented by varying the pill's WIDTH from 0
+  -- (off-screen) to pill_w_at_rest. Because the pill is anchored at
+  -- the right edge, the rect grows LEFTWARD as visible_w increases
+  -- and the text widgets' content gets truncated on the right by the
+  -- rect's width. The TOAST_RIGHT_OVERFLOW slack means the rules at
+  -- rest extend past the visible right edge of the window — they
+  -- look like they're going "off-screen" rather than stopping
+  -- exactly at the edge.
+  local pill_w_at_rest = 2 + #text + TOAST_RIGHT_OVERFLOW
   local total_slide    = pill_w_at_rest
   local distance_slid
   if elapsed < TOAST_ENTER_MS then
@@ -1572,10 +1571,12 @@ local function inline_toast(state)
 
   -- At-rest content: 3 strings, each `pill_w_at_rest` cells wide.
   -- Chrome lives on the LEFT — `╭` / `│` / `╰` opens the pill on
-  -- the leading side; the dashes extend rightward and terminate
-  -- flush against the right edge of the window (no right corners).
+  -- the leading side; the dashes extend rightward past the right
+  -- edge of the window where the renderer clips them. The mid row
+  -- pads with trailing spaces so the area below the dashes doesn't
+  -- show the chrome from the layer underneath bleeding through.
   local top_rule    = "╭" .. string.rep("─", pill_w_at_rest - 1)
-  local mid_text    = "│ " .. text
+  local mid_text    = "│ " .. text .. string.rep(" ", TOAST_RIGHT_OVERFLOW)
   local bottom_rule = "╰" .. string.rep("─", pill_w_at_rest - 1)
 
   local body = tui.column {
