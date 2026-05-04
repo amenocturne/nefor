@@ -55,11 +55,12 @@ package.path = table.concat({
 local ncp      = require("ncp")
 local sessions = require("sessions")
 
--- Engine post-rewrite passes only `current_log` to step. ncp.step still
--- takes `(saved_log, current_log)` for the legacy resume.lua mechanism;
--- saved_log is permanently empty now, so we forward an empty table.
+-- Forward the engine's `current_log` to ncp.step. The engine is
+-- session-blind: cross-run resume is owned by `starter/sessions.lua`,
+-- which subscribes to the bus directly via nefor.bus.on_event and
+-- replays jsonl onto it on `sessions.resume_request`.
 function step(current_log)
-  ncp.step({}, current_log)
+  ncp.step(current_log)
 end
 
 -- Mint a fresh session, install persistence + resume_request listener,

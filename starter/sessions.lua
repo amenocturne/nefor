@@ -130,15 +130,15 @@
 -- `resume.lua` (the legacy module): a Lua module in the engine's VM is
 -- a function call, not an NCP round-trip.
 --
--- ## Relationship to resume.lua (legacy)
+-- ## Relationship to legacy resume.lua (removed)
 --
--- The legacy `starter/resume.lua` registers per-plugin transforms for
--- the engine's old `saved_log` replay path. That path is being torn down
--- by a parallel agent (engine becomes session-blind). This module
--- replaces it with a Lua-side replay. resume.lua is not removed in this
--- patch — `ncp.lua` still requires it for the saved_log code path,
--- which becomes inert once the engine stops sending saved_log. B3 will
--- finish removing both.
+-- This module replaces the legacy `starter/resume.lua` + `saved_log`
+-- code path. Per-plugin replay filtering is no longer in a separate
+-- registry — the live agentic_workflow transforms react to the
+-- `sessions.session_start` / `session_end` / `resume_done` lifecycle
+-- envelopes via `nefor.bus.on_event` and own their own state-flush /
+-- replay-mode flags. ncp.step and the engine no longer carry a
+-- saved_log argument.
 
 local M = {}
 
