@@ -134,6 +134,14 @@ impl LuaHost {
         &self.lua
     }
 
+    /// Borrow the engine-internal lifecycle bus. The broker uses this to
+    /// emit [`crate::events::SHUTDOWN`] inside its cooperative-shutdown
+    /// grace window so Lua subscribers (`nefor.events.on("shutdown",
+    /// ...)`) fire before plugin connections close.
+    pub fn events_bus(&self) -> Arc<EventBus> {
+        Arc::clone(&self.bus)
+    }
+
     /// Load and execute `path` as the user's `init.lua`.
     ///
     /// Reports typed errors in three shapes:

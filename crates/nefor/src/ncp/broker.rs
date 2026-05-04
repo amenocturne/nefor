@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 use nefor_protocol::{PluginName, Timestamp};
 use tokio::sync::mpsc;
 
+use crate::events::{EventBus, EventName, EventPayload, SHUTDOWN};
 use crate::lua::bindings::{EngineOps, SendTarget};
 use crate::lua::LuaHost;
 use crate::ncp::connection::{
@@ -232,6 +233,11 @@ struct ConnectionRecord {
 pub struct Broker {
     shared: Arc<Mutex<BrokerShared>>,
     host: LuaHost,
+    /// Handle to the engine-internal lifecycle bus. The broker emits
+    /// [`SHUTDOWN`] on this bus inside [`Broker::begin_shutdown`] so Lua
+    /// subscribers (`sessions.handle_shutdown` in starter) fire
+    /// synchronously before plugin connections close.
+    events_bus: Arc<EventBus>,
     conns_by_id: HashMap<ConnectionId, ConnectionRecord>,
     /// Shared channel all per-connection readers drop messages onto.
     inbound_tx: mpsc::Sender<(ConnectionId, ConnectionInbound)>,
@@ -295,9 +301,11 @@ impl Broker {
             });
         }
 
+        let events_bus = host.events_bus();
         Self {
             shared,
             host,
+            events_bus,
             conns_by_id: HashMap::new(),
             inbound_tx,
             inbound_rx,
@@ -682,6 +690,16 @@ impl Broker {
     // ---- helpers ----------------------------------------------------------
 
     fn begin_shutdown(&mut self) {
+        // Emit `shutdown` on the engine-internal lifecycle bus BEFORE closing
+        // any connection. Lua subscribers (the starter's
+        // `sessions.handle_shutdown`) fire synchronously here, so they can
+        // emit `sessions.session_end` onto the NCP bus while every plugin's
+        // writer queue is still open. Order matters — once `force_close`
+        // runs the writer tasks drain + exit and any later sessions.* event
+        // would arrive after EOF.
+        self.events_bus
+            .emit(&EventName::from(SHUTDOWN), EventPayload::None);
+
         // Close every connection's writer channel. Writer tasks drain their
         // queues, flush, and exit. The shutdown-grace deadline in the run
         // loop force-closes anything still alive.
