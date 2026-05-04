@@ -2878,11 +2878,36 @@ local function update(msg, state)
     -- so the user message lands in the session log (and replays).
     -- Live, that round-trip would render the same line twice; eat
     -- it once when the marker matches.
+    --
+    -- BUT: only swallow the echo if the local push actually landed in
+    -- `state.entries`. The marker by itself isn't enough — if a
+    -- session-lifecycle event wiped entries between the local push
+    -- and this echo, eating the echo would leave the transcript with
+    -- NO user line (the user submitted, the orchestrator started
+    -- doing things, and the prompt visually disappeared). Only the
+    -- orchestrator's echo can re-paint the user line in that case,
+    -- so let it through. The check is "the tail of entries is a
+    -- user-role entry with matching text" — that's exactly the
+    -- shape the local push leaves.
     local role = msg.role or "system"
     if role == "user"
        and state.pending_user_echo ~= nil
        and state.pending_user_echo == text then
-      return shallow_merge(state, { pending_user_echo = NIL_SENTINEL }), {}
+      local entries = state.entries or {}
+      local tail = entries[#entries]
+      local local_push_landed = tail
+        and tail.role == "user"
+        and tail.text == text
+      if local_push_landed then
+        return shallow_merge(state, { pending_user_echo = NIL_SENTINEL }), {}
+      end
+      -- Marker stranded by an intervening clear — fall through and
+      -- push the echo so the user line is still visible. Clear the
+      -- marker so a future genuine duplicate can't ride this branch.
+      return push_entry(
+        shallow_merge(state, { pending_user_echo = NIL_SENTINEL }),
+        { role = role, text = text, kind = "text" }
+      ), {}
     end
     return push_entry(state, {
       role = role, text = text, kind = "text",

@@ -3123,6 +3123,75 @@ fn boot_session_start_after_local_submit_keeps_user_message_visible() {
     );
 }
 
+/// Production bug: user submits, orchestrator emits a tool_call right away
+/// (no preceding text), the user sees the tool call but NOT their own
+/// prompt. Reproduces by: do the local submit (push_entry + set marker),
+/// then have a session-lifecycle event wipe `entries` (this is what
+/// `sessions.session_end` does — broadcast by `teardown_for_session_end`
+/// at the start of `/new` or `/resume`, but also reachable via other
+/// races). When the orchestrator's echo arrives, the dedup matches the
+/// stranded marker and silently swallows it. Then `chat.tool.start`
+/// pushes the tool block. The transcript ends up showing only the tool
+/// call.
+///
+/// Fix: dedup must verify the local push actually landed in entries
+/// (tail is a user-role entry with matching text) before suppressing
+/// the echo. Otherwise it lets the echo through so the user line is at
+/// least visible via the round-trip.
+#[test]
+fn echo_repaints_user_message_when_local_push_was_wiped_before_echo() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // User submits — local push goes into entries, pending_user_echo set.
+    for ch in "summarize-thing".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    // Some lifecycle event wipes entries (simulating a stranded clear —
+    // this could be session_end fired late, or any future code path
+    // that clears entries while the marker is still set).
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_end", "session_id": "old" }),
+    );
+    let _ = render_str(&mut engine);
+
+    // Orchestrator's echo arrives with the SAME text the marker
+    // tracks — naive dedup would swallow it.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "summarize-thing" }),
+    );
+    // Then the tool call paints (the visible artefact of the bug).
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.tool.start",
+            "id": "t1",
+            "name": "spawn_graph",
+            "input": "{}",
+        }),
+    );
+    let _ = render_str(&mut engine);
+
+    let out = engine.snapshot();
+    assert!(
+        out.contains("summarize-thing"),
+        "user prompt must remain visible even when entries was wiped \
+         between local push and echo (production bug repro). \
+         Transcript:\n{out}",
+    );
+    assert!(
+        out.contains("spawn_graph"),
+        "tool call must still render:\n{out}"
+    );
+}
+
 /// `/clear` is an alias for `/new`. Same egress, same lifecycle expectations.
 #[test]
 fn slash_clear_is_alias_for_slash_new() {
