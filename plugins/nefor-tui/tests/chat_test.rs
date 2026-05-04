@@ -2455,3 +2455,109 @@ fn mouse_drag_copies_selection_and_shows_toast() {
         "expected exact toast `{needle}`, got: {post:?}"
     );
 }
+
+/// Toast row asserts: the bottom-row banner must fully occlude the
+/// statusline cells underneath it. Concretely, after the drag → toast
+/// transition, the cells the toast covers carry no statusline glyphs
+/// ("Start chatting to see stats", "│", "1ms"). The `Engine::snapshot`
+/// stringifies cell `text` only, so we read the row, locate the toast
+/// label, and assert the rest of the row is blank — no leaked chars.
+#[test]
+fn mouse_drag_toast_fully_occludes_statusline_row() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    // Stream a known message into the transcript so the drag covers
+    // identifiable text.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "text": "selectable-token" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
+    );
+    let _ = render_str(&mut engine);
+
+    // Locate the row carrying our token in the framebuffer snapshot.
+    let snap = engine.snapshot();
+    let row_idx = snap
+        .lines()
+        .position(|l| l.contains("selectable-token"))
+        .expect("token row in framebuffer");
+    let col_idx = snap
+        .lines()
+        .nth(row_idx)
+        .unwrap()
+        .find("selectable-token")
+        .unwrap();
+
+    // Pre-toast: the bottom-row statusline carries the placeholder text.
+    let pre = engine.snapshot();
+    assert!(
+        pre.lines()
+            .any(|l| l.contains("Start chatting to see stats")),
+        "expected statusline placeholder before toast: {pre:?}"
+    );
+
+    // Drag to trigger the selection → clipboard copy → toast path.
+    let y = row_idx as u16;
+    let x0 = col_idx as u16;
+    let x1 = (col_idx + "selectable-token".len() - 1) as u16;
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Click,
+            x: x0,
+            y,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("down");
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Drag,
+            x: x1,
+            y,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("drag");
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Up,
+            x: x1,
+            y,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("up");
+
+    // Force a render so the toast lands in the framebuffer.
+    let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+    let post = engine.snapshot();
+
+    // The toast banner replaces the statusline visually — none of the
+    // pre-toast statusline glyphs may remain on the toast's row.
+    let toast_row = post
+        .lines()
+        .find(|l| l.contains("copied"))
+        .expect("toast row in post-frame");
+    for needle in [
+        "Start chatting",
+        "to see stats",
+        "│", // statusline segment separator
+        "1ms",
+    ] {
+        assert!(
+            !toast_row.contains(needle),
+            "toast row leaked statusline content `{needle}`: {toast_row:?}"
+        );
+    }
+
+    // Sanity: the toast label is still present.
+    let label = format!("copied {} chars", "selectable-token".len());
+    assert!(
+        toast_row.contains(&label),
+        "expected toast label `{label}` on toast row: {toast_row:?}"
+    );
+}
