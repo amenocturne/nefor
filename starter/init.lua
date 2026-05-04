@@ -5,12 +5,10 @@
 --
 --   1. Wire `package.path` so `require("ncp")` resolves to the bundled
 --      protocol module next to this file.
---   2. Optionally declare a parent session id to resume from (commented out
---      by default — uncomment and fill in a uuid to continue a prior run).
---   3. Define the global `step` hook the engine calls on every inbound line.
---      Delegates to `ncp.step` — the protocol module is where the NCP v0.1
---      semantics live.
---   4. Register plugins via `nefor.plugins.spawn`. Mirrors the pre-split
+--   2. Define the global `step` hook the engine calls on every inbound line
+--      and bring up the sessions module (boot + shutdown wiring). Session
+--      continuity is composed in Lua — see `starter/sessions.lua`.
+--   3. Register plugins via `nefor.plugins.spawn`. Mirrors the pre-split
 --      reference config (`tmp/smoke-config-m2/init.lua`) plus the
 --      combinators plugin; swap or remove entries to compose your own stack.
 --
@@ -39,83 +37,40 @@ package.path = table.concat({
 }, ";")
 
 -------------------------------------------------------------------------
--- 2. Optional parent session id (resume a prior run)
+-- 2. Step function + session management
 -------------------------------------------------------------------------
 --
--- Manual resume: uncomment + fill a session UUID to force a one-shot
--- resume of a specific past run. The engine reads
--- `~/Library/Application Support/nefor/sessions/<id>.jsonl`, hydrates
--- saved_log, and calls every step invocation with it.
+-- Session continuity (boot, shutdown, resume) is composed entirely in
+-- Lua via the sessions module. The Rust engine is session-blind: it
+-- forwards inbound lines to step, broadcasts events, and exits on
+-- request. Session id minting, on-disk jsonl persistence, and
+-- in-process resume all live in `starter/sessions.lua`.
 --
--- nefor.parent_session = "00000000-0000-0000-0000-000000000000"
---
--- Auto-resume via sidechannel: when chat.lua's `/resume` picker selects
--- a session, it writes the chosen id to the resume_target file below
--- and calls `nefor.engine.exit(0)`. The user re-launches; this block
--- reads the file, sets parent_session, deletes the file (so the *next*
--- boot starts fresh), and flips `resume.is_active()` so ncp.lua routes
--- saved_log entries through per-plugin transforms registered below.
---
--- Why a sidechannel + relaunch instead of in-place resume: rebuilding
--- every plugin's state from saved_log requires shutting them down first
--- (a provider mid-stream can't be told "you have a different chat now").
--- Re-execve of the engine binary is the cleanest reset; sidechannel is
--- the smallest surface that survives the process boundary.
+-- The legacy sidechannel-write + process-exit + engine-restart flow
+-- (and the `nefor.parent_session` engine handoff that drove it) are
+-- gone — they killed the TUI on every resume. The new flow is
+-- pure-Lua, in-process, message-bus juggling. See sessions.lua's
+-- docstring for the bus protocol.
 
-local resume = require("resume")
+local ncp      = require("ncp")
+local sessions = require("sessions")
 
-local function read_resume_target()
-  -- macOS XDG-equivalent path. The engine session writer uses this same
-  -- root via dirs::data_dir(). Linux/Windows users would need to adjust;
-  -- v1 ships the macOS path because that's the developer's host.
-  -- `NEFOR_DATA_HOME` overrides for test harnesses that need to point
-  -- at a tempdir; chat.lua honours the same variable.
-  local override = os.getenv("NEFOR_DATA_HOME")
-  local root
-  if override ~= nil and override ~= "" then
-    root = override
-  else
-    local home = os.getenv("HOME") or ""
-    if home == "" then return nil end
-    root = home .. "/Library/Application Support/nefor"
-  end
-  local path = root .. "/resume_target"
-  local fh = io.open(path, "r")
-  if fh == nil then return nil, path end
-  local content = fh:read("*a") or ""
-  fh:close()
-  -- Trim whitespace including trailing newline.
-  content = content:gsub("^%s+", ""):gsub("%s+$", "")
-  if #content == 0 then return nil, path end
-  -- Defence-in-depth: refuse anything that doesn't look like a UUID. A
-  -- garbled file shouldn't blow up boot.
-  if not content:match("^[%w%-]+$") then return nil, path end
-  return content, path
+-- Engine post-rewrite passes only `current_log` to step. ncp.step still
+-- takes `(saved_log, current_log)` for the legacy resume.lua mechanism;
+-- saved_log is permanently empty now, so we forward an empty table.
+function step(current_log)
+  ncp.step({}, current_log)
 end
 
-do
-  local target_id, target_path = read_resume_target()
-  if target_id ~= nil then
-    nefor.parent_session = target_id
-    resume.set_active(true)
-    -- Best-effort delete so the next fresh boot doesn't auto-resume.
-    -- Failure here is non-fatal — the only consequence is the next boot
-    -- also resumes the same session, which is at worst confusing.
-    if target_path ~= nil then
-      os.remove(target_path)
-    end
-  end
-end
+-- Mint a fresh session, install persistence + resume_request listener,
+-- emit `sessions.session_start`. Done before any plugin spawn so the
+-- persistence hook is in place when the first envelope routes.
+sessions.init()
 
-
--------------------------------------------------------------------------
--- 3. Step function
--------------------------------------------------------------------------
-local ncp = require("ncp")
-
-function step(saved_log, current_log)
-  ncp.step(saved_log, current_log)
-end
+-- Subscribe to engine shutdown so the library can emit
+-- `sessions.session_end` synchronously inside the cooperative-shutdown
+-- grace, before connections close.
+sessions.handle_shutdown()
 
 -------------------------------------------------------------------------
 -- 4. Plugin composition
@@ -209,15 +164,6 @@ else
     "--model",    PROVIDER_MODEL,
   }
 end
-
--- Resume transforms — registered before any plugin readies so the first
--- handshake's saved_log replay (when resuming) finds them in place. The
--- defaults cover nefor-tui (replay structural chat history) + the active
--- provider (replay chat.create/append/complete to rebuild Chats map).
--- Every other plugin defaults to drop, which is what the brief asks for.
--- Project-private plugins can register their own transforms via
--- `resume.register(name, fn)` after this line.
-resume.register_defaults(PROVIDER_NAME)
 
 -------------------------------------------------------------------------
 -- 4c. Orchestrator setup — single configuration call
