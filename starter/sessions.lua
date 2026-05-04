@@ -433,17 +433,40 @@ end
 -- resume
 -- ------------------------------------------------------------------
 
--- Replay each jsonl entry as a bus envelope. We emit via
--- nefor.engine.send (broadcast to every connected peer). Origin filters
--- mirror ncp.lua's replay-on-attach invariants:
---   * skip "step" entries — those were the broker's own forwarding
---     fan-out of prior events, not originals; replaying them would
---     double-deliver.
---   * skip "engine" entries — `engine.*` kinds are private to the
---     translation layer, never legitimate broadcast events.
--- That leaves only the original plugin emissions, which is exactly the
--- replay set per-plugin handlers want to see (B3 will register handlers
--- against `sessions.session_start` / specific kinds and react there).
+-- Plugins that accept replay traffic. Replay's job is to rebuild the
+-- UI surface's view of the past — not to re-drive provider HTTP calls,
+-- re-dispatch graphs, or re-fire tool gates. Listing the replay target
+-- explicitly keeps the side-effecting plugins blind to replay.
+--
+-- Adding more receivers (e.g. a future logging surface) is one entry.
+local REPLAY_TARGETS = { ["nefor-tui"] = true }
+
+-- Replay each jsonl entry to the UI surface(s) listed in REPLAY_TARGETS.
+--
+-- We replay STEP-ORIGIN entries that targeted a replay-receiver. Step
+-- entries are the broker's per-peer post-transform fan-out: each
+-- plugin's `from_plugin` ran on the inbound raw line, the result was
+-- egress-transformed via `to_plugin` per peer, and the broker enqueued
+-- one step entry per peer. Replaying step entries to their original
+-- target lands the EXACT envelope each peer received — no transform
+-- re-application needed.
+--
+-- Plugin-origin entries (the raw inbound lines) are NOT replayed:
+--   * they're the source of step entries above — replaying both would
+--     double-deliver to peers that read the post-transform shape.
+--   * the raw kind (e.g. `ollama.stream.delta`) is NOT what any peer
+--     received post-transform; routing it to nefor-tui without the
+--     `for_provider.from_plugin` translation leaves the TUI looking
+--     for `chat.stream.delta` — the transcript stays empty.
+--
+-- Engine-origin entries are skipped — `engine.*` kinds are private to
+-- the translation layer and never belong on the bus as broadcast
+-- events.
+--
+-- Side-effecting plugins (providers, reasoner-graph, tool-gate, etc.)
+-- are explicitly NOT replay targets: they already cleared state on
+-- `sessions.session_end` and re-receiving past commands would replay
+-- side effects (provider HTTP calls, graph dispatches, tool invokes).
 local function replay_jsonl(path)
   if path == nil then return 0 end
   local fh = io.open(path, "r")
@@ -457,12 +480,10 @@ local function replay_jsonl(path)
     else
       local ok, decoded = pcall(json.decode, line)
       if ok and type(decoded) == "table" and type(decoded.payload) == "string" then
-        local origin = decoded.origin
-        if origin ~= "step" and origin ~= "engine" then
-          -- Re-emit the inner payload exactly as the original plugin
-          -- emitted it. The broker writes the line verbatim to every
-          -- connected peer; the original `from` field survives.
-          nefor.engine.send(decoded.payload)
+        if decoded.origin == "step"
+           and type(decoded.target) == "string"
+           and REPLAY_TARGETS[decoded.target] then
+          nefor.engine.send(decoded.payload, decoded.target)
           count = count + 1
         end
       end

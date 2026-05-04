@@ -2379,6 +2379,14 @@ local function update(msg, state)
       }
     end
     -- Plain text submit.
+    --
+    -- We push the user message LOCALLY for instant feedback, then
+    -- emit `chat.input.submit`. The orchestrator's `for_chat` handler
+    -- echoes the message back via `chat.message.append { role=user }`
+    -- (so the message persists in the session log and replays on
+    -- resume); the corresponding handler below dedupes that round-trip
+    -- against `pending_user_echo` so we render once locally + once on
+    -- replay, never twice live.
     local with_user = push_entry(state, { role = "user", text = text, kind = "text" })
     -- Prepend to prompt_history (newest at index 1) and cap. History
     -- recall reads from index 1, so prepending keeps the cursor model
@@ -2393,6 +2401,12 @@ local function update(msg, state)
       turn_started_at = tui.now_ms(), slash = NIL_SENTINEL,
       prompt_history = history,
       history_cursor = NIL_SENTINEL,
+      -- Mark the next bus-delivered chat.message.append with this
+      -- exact text + role as the orchestrator's persist-echo and
+      -- swallow it. Cleared after one match — sequential identical
+      -- submits each set their own marker on submit, so the second
+      -- echo doesn't get eaten by the first marker.
+      pending_user_echo = text,
     })
     return cleared, {
       { kind = "send_to", target = "engine",
@@ -2742,7 +2756,10 @@ local function update(msg, state)
     -- shell (model id, stats, sidebar toggle, etc.) — those rebuild
     -- from replayed events on resume_done. We also clear `pending`
     -- and `turn_started_at` so the statusline doesn't show a phantom
-    -- in-flight turn from the outgoing session.
+    -- in-flight turn from the outgoing session. `pending_user_echo`
+    -- is dropped so a stranded marker (last submit's echo never
+    -- arrived before resume kicked in) can't swallow the first
+    -- replayed user message.
     return shallow_merge(state, {
       entries          = {},
       in_flight        = NIL_SENTINEL,
@@ -2753,6 +2770,7 @@ local function update(msg, state)
       toast            = NIL_SENTINEL,
       slash            = NIL_SENTINEL,
       dag_runs         = {},
+      pending_user_echo = NIL_SENTINEL,
     }), {}
   end
 
@@ -2777,8 +2795,21 @@ local function update(msg, state)
   if kind == "chat.message.append" then
     local text = msg.text or ""
     if #text == 0 then return state, {} end
+    -- Round-trip echo from the orchestrator's `for_chat` handler:
+    -- when the user submits, we push locally for instant feedback
+    -- AND emit `chat.input.submit` to the bus. The orchestrator
+    -- replies with `chat.message.append { role=user, text=<same> }`
+    -- so the user message lands in the session log (and replays).
+    -- Live, that round-trip would render the same line twice; eat
+    -- it once when the marker matches.
+    local role = msg.role or "system"
+    if role == "user"
+       and state.pending_user_echo ~= nil
+       and state.pending_user_echo == text then
+      return shallow_merge(state, { pending_user_echo = NIL_SENTINEL }), {}
+    end
     return push_entry(state, {
-      role = msg.role or "system", text = text, kind = "text",
+      role = role, text = text, kind = "text",
     }), {}
   end
 

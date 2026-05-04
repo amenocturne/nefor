@@ -323,6 +323,155 @@ fn resume_phase_hooks_fire_synchronously_before_emit() {
     }
 }
 
+#[test]
+fn resume_replay_targets_only_tui_with_step_origin_entries() {
+    // Issue 1 regression: the replay path used to broadcast plugin-
+    // origin entries (raw `<provider-prefix>.stream.delta` etc.)
+    // verbatim via `nefor.engine.send(payload)` — which bypasses the
+    // per-edge `for_provider.from_plugin` translation, so nefor-tui
+    // (which speaks `chat.*`) saw nothing match its handlers and the
+    // transcript stayed empty after `/resume`. The fix is to replay
+    // STEP-ORIGIN entries (post-transform per-peer fan-out the broker
+    // captured in the live session) targeted at `nefor-tui` only —
+    // side-effecting plugins (provider, reasoner-graph, tool-gate)
+    // should never see replay traffic.
+    //
+    // We synthesise a session log with one of each origin/target shape
+    // and a header, drive `sessions.resume()`, and assert (a) the
+    // engine.send calls that came out target only `nefor-tui`, (b) the
+    // payloads are the step-origin chat.* envelopes, never the raw
+    // `<prefix>.stream.delta`.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_HOME").ok();
+    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+
+    // Pre-seed a session jsonl on disk with a representative mix:
+    //   * header
+    //   * raw plugin-origin chat.input.submit (origin nefor-tui)
+    //   * step-origin chat.message.append targeted nefor-tui (a user echo)
+    //   * step-origin chat.stream.delta targeted nefor-tui
+    //   * step-origin chat.stream.delta targeted reasoner-graph (NOT replayed)
+    //   * raw plugin-origin ollama.stream.delta (NOT replayed)
+    let target_id = "11111111-2222-4333-8444-555555555555";
+    // sessions.lua's `data_root()` uses NEFOR_DATA_HOME as-is (no
+    // `/nefor` suffix — that's the XDG fallback path). Sessions live
+    // at `<root>/sessions/<id>.jsonl`.
+    let sessions_dir = tempdir.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
+    let session_path = sessions_dir.join(format!("{target_id}.jsonl"));
+    // Each line is a JSON document the engine's session writer (or
+    // `sessions._persist_envelope`) would have written.
+    let body = concat!(
+        // header
+        r#"{"_session":true,"session_id":"11111111-2222-4333-8444-555555555555","started_at":"2026-05-04T00:00:00.000Z"}"#,
+        "\n",
+        // plugin-origin raw inbound — must NOT be replayed
+        r#"{"ts":"2026-05-04T00:00:00.001Z","origin":"nefor-tui","payload":"{\"type\":\"event\",\"body\":{\"kind\":\"chat.input.submit\",\"text\":\"hi\"}}"}"#,
+        "\n",
+        // step-origin chat.message.append targeted nefor-tui — MUST be replayed
+        r#"{"ts":"2026-05-04T00:00:00.002Z","origin":"step","target":"nefor-tui","payload":"{\"ts\":\"2026-05-04T00:00:00.002Z\",\"type\":\"event\",\"from\":\"engine\",\"body\":{\"kind\":\"chat.message.append\",\"role\":\"user\",\"text\":\"hi\"}}"}"#,
+        "\n",
+        // step-origin chat.stream.delta targeted nefor-tui — MUST be replayed
+        r#"{"ts":"2026-05-04T00:00:00.003Z","origin":"step","target":"nefor-tui","payload":"{\"ts\":\"2026-05-04T00:00:00.003Z\",\"type\":\"event\",\"from\":\"ollama\",\"body\":{\"kind\":\"chat.stream.delta\",\"text\":\"Hello\"}}"}"#,
+        "\n",
+        // step-origin chat.stream.delta targeted reasoner-graph — MUST NOT be replayed
+        r#"{"ts":"2026-05-04T00:00:00.004Z","origin":"step","target":"reasoner-graph","payload":"{\"ts\":\"2026-05-04T00:00:00.004Z\",\"type\":\"event\",\"from\":\"ollama\",\"body\":{\"kind\":\"chat.stream.delta\",\"text\":\"Hello\"}}"}"#,
+        "\n",
+        // plugin-origin raw ollama.stream.delta — MUST NOT be replayed
+        r#"{"ts":"2026-05-04T00:00:00.005Z","origin":"ollama","payload":"{\"type\":\"event\",\"body\":{\"kind\":\"ollama.stream.delta\",\"chat_id\":\"c1\",\"text\":\"Hello\"}}"}"#,
+        "\n",
+    );
+    std::fs::write(&session_path, body).expect("write session");
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+
+    // Replace engine.send with a recorder. The control-event broadcasts
+    // (sessions.session_end / start / resume_done) come through too; we
+    // capture all of them and assert on the replay-specific subset.
+    lua.load(
+        r#"
+        _sends = {}
+        nefor.engine.send = function(payload, target)
+            _sends[#_sends + 1] = { payload = payload, target = target }
+        end
+        "#,
+    )
+    .exec()
+    .expect("install send recorder");
+
+    lua.load(format!(
+        r#"
+        sessions = require("sessions")
+        sessions.init()
+        sessions.resume("{target_id}")
+        "#,
+        target_id = target_id,
+    ))
+    .exec()
+    .expect("drive resume");
+
+    let sends_tbl: Table = lua.globals().get("_sends").expect("_sends");
+    let len = sends_tbl.len().expect("len") as usize;
+    let mut chat_kind_sends: Vec<(String, Option<String>)> = Vec::new();
+    for i in 1..=len {
+        let entry: Table = sends_tbl.get(i).expect("entry");
+        let payload: String = entry.get("payload").expect("payload");
+        let target: Option<String> = match entry.get::<Value>("target").expect("target") {
+            Value::String(s) => Some(s.to_str().expect("utf8").to_owned()),
+            _ => None,
+        };
+        // Look at the body.kind. Skip control events (sessions.*).
+        let v: serde_json::Value = match serde_json::from_str(&payload) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let kind = v
+            .get("body")
+            .and_then(|b| b.get("kind"))
+            .and_then(|k| k.as_str())
+            .unwrap_or("")
+            .to_owned();
+        if kind.starts_with("sessions.") {
+            continue;
+        }
+        chat_kind_sends.push((kind, target));
+    }
+
+    // Replay should have produced exactly two sends — the two step-
+    // origin entries targeted at nefor-tui.
+    assert_eq!(
+        chat_kind_sends.len(),
+        2,
+        "replay sent unexpected non-control envelopes: {chat_kind_sends:?}",
+    );
+    for (kind, target) in &chat_kind_sends {
+        assert_eq!(
+            target.as_deref(),
+            Some("nefor-tui"),
+            "replay must target nefor-tui only; saw kind={kind} target={target:?}",
+        );
+        assert!(
+            kind == "chat.message.append" || kind == "chat.stream.delta",
+            "replay carried unexpected kind {kind}",
+        );
+    }
+    // Belt-and-braces: the raw provider-prefixed kind must NOT appear.
+    for (kind, _) in &chat_kind_sends {
+        assert!(
+            !kind.starts_with("ollama."),
+            "raw provider-prefix kind leaked into replay: {kind}",
+        );
+    }
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
+        None => std::env::remove_var("NEFOR_DATA_HOME"),
+    }
+}
+
 // Process-global lock to serialise tests that mutate NEFOR_DATA_HOME.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
