@@ -2366,3 +2366,92 @@ fn slash_resume_with_arg_writes_sidechannel_and_exits() {
     let written = std::fs::read_to_string(env.resume_target()).expect("read sidechannel");
     assert_eq!(written.trim(), session_id);
 }
+
+/// Mouse drag inside the transcript triggers the chat.lua mouse.selection
+/// handler. The handler calls `tui.copy_to_clipboard` and surfaces a
+/// `copied N chars` toast. The test asserts the toast appears — that
+/// transitively confirms the engine extracted the text and routed it to
+/// the Lua policy. Clipboard side-effects (the actual OS write) aren't
+/// asserted because the headless test runner has no clipboard backend
+/// to inspect; the binding swallows that failure by design (warn + drop).
+#[test]
+fn mouse_drag_copies_selection_and_shows_toast() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    // Stream a known message into the transcript so the drag covers
+    // identifiable text.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "text": "selectable-token" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
+    );
+    let frame = render_str(&mut engine);
+    assert!(
+        frame.contains("selectable-token"),
+        "expected token in pre-drag frame: {frame:?}"
+    );
+
+    // Locate the row carrying our token in the framebuffer snapshot so
+    // we drag over those cells.
+    let snap = engine.snapshot();
+    let row_idx = snap
+        .lines()
+        .position(|l| l.contains("selectable-token"))
+        .expect("token row in framebuffer");
+    let col_idx = snap
+        .lines()
+        .nth(row_idx)
+        .unwrap()
+        .find("selectable-token")
+        .unwrap();
+
+    // Down at the first cell of the token, drag to the last, release.
+    let y = row_idx as u16;
+    let x0 = col_idx as u16;
+    let x1 = (col_idx + "selectable-token".len() - 1) as u16;
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Click,
+            x: x0,
+            y,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("down");
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Drag,
+            x: x1,
+            y,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("drag");
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Up,
+            x: x1,
+            y,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("up");
+
+    // Force a render so the toast lands in the framebuffer.
+    let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+    let post = engine.snapshot();
+    assert!(
+        post.contains("copied "),
+        "expected 'copied N chars' toast after drag, got: {post:?}"
+    );
+    // Char count in the toast should match the selection length.
+    let needle = format!("copied {} chars", "selectable-token".len());
+    assert!(
+        post.contains(&needle),
+        "expected exact toast `{needle}`, got: {post:?}"
+    );
+}
