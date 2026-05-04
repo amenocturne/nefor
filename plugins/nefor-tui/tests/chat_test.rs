@@ -2817,76 +2817,75 @@ fn replay_paints_transcript_between_session_start_and_resume_done() {
     }
 }
 
-/// `sessions.session_end` clears the transcript so the new session paints
-/// fresh. Without this, the previous session's content would be visible
-/// alongside the replayed new content during the swap.
+/// `sessions.session_end` deliberately does NOT touch `entries` —
+/// the trigger paths (`/new`, `/resume`) own the local transcript
+/// clear. Earlier the handler wiped entries here, but that was a
+/// race: when the user typed their first prompt in the new session
+/// before the bus envelope arrived, the wipe destroyed the
+/// locally-pushed message. This test pins the new contract.
 #[test]
-fn session_end_clears_transcript_before_replay() {
+fn session_end_does_not_wipe_entries() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
     dispatch_event(
         &mut engine,
-        json!({ "kind": "chat.message.append", "role": "user", "text": "stale-from-old-session" }),
+        json!({ "kind": "chat.message.append", "role": "user", "text": "user-typed-quickly" }),
     );
     let _ = render_str(&mut engine);
-    let pre = engine.snapshot();
-    assert!(
-        pre.contains("stale-from-old-session"),
-        "seed entry should render before session_end:\n{pre}"
-    );
-
     dispatch_event(
         &mut engine,
         json!({ "kind": "sessions.session_end", "session_id": "old" }),
     );
     let _ = render_str(&mut engine);
-    let post = engine.snapshot();
+    let out = engine.snapshot();
     assert!(
-        !post.contains("stale-from-old-session"),
-        "transcript must be cleared by session_end so replay paints fresh; \
-         still contained stale entry:\n{post}",
+        out.contains("user-typed-quickly"),
+        "session_end must NOT wipe entries — that was the production \
+         race that destroyed the user's first prompt after /new. \
+         Transcript:\n{out}",
     );
 }
 
-/// Empty replay (`replayed = 0`) leaves the transcript empty. Tests the
-/// fresh-`/new` and fresh-resume-target paths where the new session has no
-/// prior content — chat.lua must accept `resume_done` without paintings
-/// stranded ghosts from the prior session.
+/// Local entry-clear is owned by the trigger paths — `/new`, `/resume`,
+/// picker selection. The lifecycle envelopes are NOT responsible for
+/// wiping entries (see `session_end_does_not_wipe_entries`). This test
+/// pins the picker-selection clear: hitting Enter on a session row
+/// emits `sessions.resume_request` AND locally empties `entries` so
+/// the imminent replay paints onto a clean slate.
 #[test]
-fn empty_replay_lifecycle_leaves_transcript_clean() {
-    let mut engine = Engine::new(80, 24).expect("engine");
+fn picker_enter_locally_clears_transcript_before_resume() {
+    let env = ResumeEnv::new();
+    let target = "deadbeef-aaaa-4bbb-8ccc-000000000001";
+    env.write_session(target, "2026-05-04T12:00:00.000Z", Some("seed"));
+
+    let mut engine = Engine::new(120, 30).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
-    // Old session had content.
+    // Old content from the current session.
     dispatch_event(
         &mut engine,
         json!({ "kind": "chat.message.append", "role": "user", "text": "old-content" }),
     );
     let _ = render_str(&mut engine);
 
-    // Lifecycle for a swap to a brand-new (empty) session.
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "sessions.session_end", "session_id": "old" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "sessions.session_start", "session_id": "new" }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "sessions.resume_done", "session_id": "new", "replayed": 0 }),
-    );
-
+    // Open the picker and press Enter on the (only) row.
+    for ch in "/resume".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter open");
     let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+    engine.handle_key(key("enter")).expect("enter pick");
+    let _ = render_str(&mut engine);
+
     let out = engine.snapshot();
     assert!(
         !out.contains("old-content"),
-        "transcript must be empty after fresh-session lifecycle, but \
-         still contained old content:\n{out}",
+        "picker Enter must locally clear the transcript so replay \
+         paints fresh:\n{out}",
     );
 }
 
@@ -3189,6 +3188,147 @@ fn echo_repaints_user_message_when_local_push_was_wiped_before_echo() {
     assert!(
         out.contains("spawn_graph"),
         "tool call must still render:\n{out}"
+    );
+}
+
+/// Direct production repro: at boot the first message renders fine, but
+/// after `/new` the very first submit's user message disappears while
+/// subsequent submits show. This drives the exact sequence the user sees:
+/// 1. Boot session, submit message #1, echo deduped, both visible.
+/// 2. `/new` → lifecycle cycle.
+/// 3. Submit message #2 in the new session.
+/// 4. Tool call arrives (no preceding text) — the orchestrator decided
+///    to spawn_graph immediately.
+/// 5. Assistant streams a final answer.
+///
+/// At step 5, the user must see message #2 above the tool call, not just
+/// the tool call. This pins it.
+#[test]
+fn first_submit_after_slash_new_renders_user_message_when_tool_call_follows() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Step 1: first session, first submit.
+    for ch in "old-prompt".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "old-prompt" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "text": "old-reply" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
+    );
+    let _ = render_str(&mut engine);
+    let first = engine.snapshot();
+    assert!(
+        first.contains("old-prompt"),
+        "boot session must show user message:\n{first}"
+    );
+
+    // Step 2: /new fires the lifecycle. Engine broadcasts chat.reset +
+    // session_end + session_start + resume_done back.
+    for ch in "/new".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+    dispatch_event(&mut engine, json!({ "kind": "chat.reset" }));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_end", "session_id": "boot" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "new" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.resume_done", "session_id": "new", "replayed": 0 }),
+    );
+    let _ = render_str(&mut engine);
+    let mid = engine.snapshot();
+    assert!(
+        !mid.contains("old-prompt"),
+        "old session content must be cleared after /new:\n{mid}"
+    );
+
+    // Step 3: submit a tool-call-triggering prompt in the new session.
+    for ch in "summarize-things".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = engine.take_emit_queue();
+
+    // Step 4: orchestrator's echo + immediate tool_call (no preceding
+    // text/reasoning — the orchestrator went straight to spawn_graph).
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "summarize-things" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.tool.start",
+            "id": "t1",
+            "name": "spawn_graph",
+            "input": "{}",
+        }),
+    );
+
+    // Step 5: graph events + final answer.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.run_started",
+            "run_id": "r1",
+            "total_nodes": 3,
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.run_complete",
+            "run_id": "r1",
+            "status": "ok",
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.tool.end",
+            "id": "t1",
+            "output": "ok",
+            "error": false,
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "text": "final-answer" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
+    );
+    let _ = render_str(&mut engine);
+
+    let out = engine.snapshot();
+    assert!(
+        out.contains("summarize-things"),
+        "user's first prompt in the post-/new session must be visible \
+         above the tool call. Production bug repro. Transcript:\n{out}",
+    );
+    assert!(
+        out.contains("spawn_graph") || out.contains("final-answer"),
+        "tool call or final answer must also be visible:\n{out}"
     );
 }
 

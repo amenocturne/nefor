@@ -2426,9 +2426,23 @@ local function update(msg, state)
       -- `/resume <session-id>` — direct: emit `sessions.resume_request`
       -- onto the bus and clear the input. The starter's sessions module
       -- runs the in-process swap (no exit, no sidechannel).
+      --
+      -- Locally clear the transcript here rather than waiting for the
+      -- session_end bus envelope to do it — the session_end handler
+      -- deliberately doesn't touch `entries` (see comment there) so
+      -- that user keystrokes between `/new` (or `/resume`) and the
+      -- broker's lifecycle round-trip aren't silently wiped. Replay
+      -- arrives via push_entry on each `chat.message.append` and
+      -- rebuilds the view from empty.
       if args and #args > 0 then
         local id = args:match("^([%w%-]+)") or args
-        return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL }), {
+        return shallow_merge(state, {
+          input_value = "", slash = NIL_SENTINEL,
+          entries = {}, in_flight = NIL_SENTINEL,
+          pending = false, dag_runs = {},
+          turn_started_at = NIL_SENTINEL,
+          last_turn_duration_ms = NIL_SENTINEL,
+        }), {
           emit_resume_request(id),
         }
       end
@@ -2663,7 +2677,18 @@ local function update(msg, state)
       if #sessions == 0 then return state, {} end
       local sel = sessions[p.cursor or 1] or sessions[1]
       if not sel or not sel.id then return state, {} end
-      return shallow_merge(state, { popup = NIL_SENTINEL }), {
+      -- Locally clear the transcript so the imminent replay paints
+      -- onto an empty surface. session_end no longer wipes entries
+      -- (see comment in its handler) — the picker owns the clear
+      -- here and the `/resume <id>` arm above owns it for the
+      -- direct path.
+      return shallow_merge(state, {
+        popup = NIL_SENTINEL,
+        entries = {}, in_flight = NIL_SENTINEL,
+        pending = false, dag_runs = {},
+        turn_started_at = NIL_SENTINEL,
+        last_turn_duration_ms = NIL_SENTINEL,
+      }), {
         emit_resume_request(sel.id),
       }
     end
@@ -2824,16 +2849,31 @@ local function update(msg, state)
   -- transcript exactly the way they would on a live turn. The resume
   -- envelopes ARE the past, so rendering them rebuilds the prior view.
   if kind == "sessions.session_end" then
-    -- Tear down transcript + in-flight stream + popup. Keep the UI
-    -- shell (model id, stats, sidebar toggle, etc.) — those rebuild
-    -- from replayed events on resume_done. We also clear `pending`
-    -- and `turn_started_at` so the statusline doesn't show a phantom
-    -- in-flight turn from the outgoing session. `pending_user_echo`
-    -- is dropped so a stranded marker (last submit's echo never
-    -- arrived before resume kicked in) can't swallow the first
-    -- replayed user message.
+    -- Tear down ephemeral turn state — but DO NOT touch `entries`.
+    --
+    -- Rationale: session_end arrives via the bus, on a different
+    -- broker tick than the user's keystroke that triggered it (a
+    -- /new or /resume submit). If the user typed their first prompt
+    -- in the new session before this envelope landed, `entries`
+    -- already holds their locally-pushed message — and wiping it
+    -- here is exactly the race that made the user's prompt
+    -- invisible while the orchestrator's tool_call still painted.
+    -- The transcript clear is owned by the trigger paths instead:
+    -- /new clears locally in its slash-command handler; /resume
+    -- clears locally too (see the picker-Enter and `/resume <id>`
+    -- arms). For a /resume that lands replay envelopes, push_entry
+    -- on each replayed `chat.message.append` rebuilds the prior
+    -- view directly — no wipe needed here.
+    --
+    -- pending_user_echo is preserved for a similar reason: if the
+    -- user submitted text moments ago, the echo's defensive dedup
+    -- (chat.message.append handler) is what protects against
+    -- double-rendering. Clearing the marker here would mean the
+    -- echo arrives, finds no marker, and unconditionally pushes —
+    -- producing the OPPOSITE bug (user line rendered twice). The
+    -- marker self-clears the moment the echo lands or the next
+    -- /new fires.
     return shallow_merge(state, {
-      entries          = {},
       in_flight        = NIL_SENTINEL,
       pending          = false,
       turn_started_at  = NIL_SENTINEL,
@@ -2842,7 +2882,6 @@ local function update(msg, state)
       toast            = NIL_SENTINEL,
       slash            = NIL_SENTINEL,
       dag_runs         = {},
-      pending_user_echo = NIL_SENTINEL,
     }), {}
   end
 
