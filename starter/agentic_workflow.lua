@@ -1666,20 +1666,37 @@ function M.setup(opts)
   end
 
   -- Spawn_graph completion: queue + flush.
+  --
+  -- The completion is queued UNCONDITIONALLY. The earlier guard that
+  -- dropped the completion when `current_state.chat_id` was missing
+  -- was the cause of a real production hang: user submits a prompt
+  -- that triggers spawn_graph, all sub-graph nodes complete, the DAG
+  -- sidebar shows ✓✓✓ — but nothing surfaces in the chat. Reason:
+  -- the wrap-node observer that sets `current_state` only fires
+  -- after `send_node_result_ok` for `node_id == "wrap"` AND
+  -- `run_id == current_run_id`. If session-lifecycle teardown
+  -- cleared `current_run_id` before the wrap firing's
+  -- node_result envelope reached its observer (or the wrap node
+  -- emitted a node_result without a `next_state` slot for some
+  -- transient reason), `current_state` stayed nil and the
+  -- subscriber threw the deferred result on the floor.
+  --
+  -- The defensive shape: queue regardless. `flush_deferred` calls
+  -- `submit_orchestrator_run`, which already gracefully handles
+  -- missing `current_state` (it just doesn't pass `seed_chat_id` to
+  -- the wrap_args, so the new orchestrator run starts a fresh chat
+  -- with the deferred text as user input — quality is slightly
+  -- worse without the prior context, but the user gets the result
+  -- instead of permanent silence).
   completed_subscribers[#completed_subscribers + 1] = function(completion)
-    if type(current_state) ~= "table" or type(current_state.chat_id) ~= "string" then
-      nefor.log.info("agentic_workflow: dropping spawn_graph completion (no current chat)", {
-        run_id = completion.run_id,
-        status = completion.status,
-      })
-      return
-    end
     local text = format_deferred(completion)
     nefor.log.info("agentic_workflow: queueing deferred spawn_graph result", {
       sub_run_id = completion.run_id,
       status = completion.status,
       text_len = #text,
       busy = current_run_id ~= nil,
+      had_state = current_state ~= nil,
+      seed_chat_id = type(current_state) == "table" and current_state.chat_id or nil,
     })
     deferred_queue[#deferred_queue + 1] = { text = text }
     flush_deferred()
