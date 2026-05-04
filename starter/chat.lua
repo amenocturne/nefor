@@ -1101,19 +1101,24 @@ end
 -- and rebuild their own state. The TUI process stays alive across the
 -- whole flip.
 
--- Path to the macOS XDG-equivalent sessions directory. Linux/Windows
--- users would adjust this — v1 ships the macOS path.
---
--- Test override: if `NEFOR_DATA_HOME` is set in the environment, its value
--- is used as the data root. Lets the chat_test.rs harness point at a
--- temp dir without touching the real `~/Library/Application Support`
--- tree. Production envs leave this unset and fall back to $HOME.
+-- Resolve the sessions data root. Must match `starter/sessions.lua`'s
+-- `data_root()` exactly — picker reads from the same directory the
+-- writer writes to. Resolution order, first hit wins:
+--   1. `NEFOR_DATA_HOME` — test override + canonical setting.
+--   2. `XDG_DATA_HOME/nefor` — standard XDG.
+--   3. `$HOME/.local/share/nefor` — XDG default fallback.
+-- Earlier the picker resolved to `$HOME/Library/Application Support/nefor`
+-- on macOS while the writer used XDG, so the picker showed only stale
+-- legacy sessions and never saw new ones. Aligning the two resolvers
+-- is the fix.
 local function nefor_data_root()
   local override = os.getenv("NEFOR_DATA_HOME")
   if override ~= nil and override ~= "" then return override end
+  local xdg = os.getenv("XDG_DATA_HOME")
+  if xdg ~= nil and xdg ~= "" then return xdg .. "/nefor" end
   local home = os.getenv("HOME") or ""
   if home == "" then return nil end
-  return home .. "/Library/Application Support/nefor"
+  return home .. "/.local/share/nefor"
 end
 
 local function session_dir()
