@@ -1134,46 +1134,80 @@ end
 -- (nefor-tui) doesn't expose `nefor.json`, and the picker is dev
 -- tooling — a regex-tier extraction is fine for a one-line preview.
 local function extract_submit_text(line)
-  -- Find the escaped `\"text\":\"` marker — note the literal backslashes.
+  -- Two scan modes, picked by which marker matches:
+  --   * doubly-escaped:  `\"text\":\"` — payload is a JSON-encoded
+  --                      string inside a JSON row (the production
+  --                      shape; persist_envelope wraps the wire JSON
+  --                      via json.encode of the row table).
+  --   * singly-escaped:  `"text":"`    — the inner envelope written
+  --                      directly without the row-wrapper layer
+  --                      (test fixtures).
   local _, marker_end = line:find([[\"text\":\"]], 1, true)
+  local doubly_encoded = marker_end ~= nil
   if marker_end == nil then
-    -- Fall back to the un-escaped form for tests that synthesise the
-    -- inner envelope directly without double-encoding.
     _, marker_end = line:find('"text":"', 1, true)
     if marker_end == nil then return nil end
   end
+
   local i = marker_end + 1
   local out = {}
   local n = #line
   while i <= n do
     local c = line:sub(i, i)
-    if c == "\\" and i < n then
+    if c == "\\" and i + 1 <= n then
       local nxt = line:sub(i + 1, i + 1)
-      if nxt == "\\" and i + 1 < n then
-        -- Escaped backslash inside the embedded JSON: `\\\"` is the
-        -- escaped form of an escaped quote inside the inner string.
-        local nnxt = line:sub(i + 2, i + 2)
-        if nnxt == '"' then
-          -- Inner closing quote of the string value — we're done.
+      if doubly_encoded then
+        -- Doubly-encoded: every char of the inner JSON has each `"`
+        -- written as `\"` and each `\` as `\\` in the file. The
+        -- inner string's closing quote therefore appears as `\"`
+        -- (2 chars). An escaped quote inside the inner string —
+        -- which represents a literal `"` in the original text —
+        -- appears as `\\\"` (3 chars), and a literal backslash as
+        -- `\\\\` (4 chars).
+        if nxt == '"' then
           return table.concat(out)
+        elseif nxt == "\\" and i + 2 <= n then
+          local nnxt = line:sub(i + 2, i + 2)
+          if nnxt == '"' then
+            out[#out + 1] = '"'
+            i = i + 3
+          elseif nnxt == "\\" then
+            out[#out + 1] = "\\"
+            i = i + 4
+          elseif nnxt == "n" then
+            out[#out + 1] = "\n"
+            i = i + 3
+          elseif nnxt == "t" then
+            out[#out + 1] = "\t"
+            i = i + 3
+          else
+            out[#out + 1] = nnxt
+            i = i + 3
+          end
+        else
+          out[#out + 1] = nxt
+          i = i + 2
         end
-        out[#out + 1] = "\\"
-        i = i + 2
-      elseif nxt == '"' then
-        out[#out + 1] = '"'
-        i = i + 2
-      elseif nxt == "n" then
-        out[#out + 1] = "\n"
-        i = i + 2
-      elseif nxt == "t" then
-        out[#out + 1] = "\t"
-        i = i + 2
       else
-        out[#out + 1] = nxt
-        i = i + 2
+        -- Singly-encoded: standard JSON string escapes.
+        if nxt == '"' then
+          out[#out + 1] = '"'
+          i = i + 2
+        elseif nxt == "\\" then
+          out[#out + 1] = "\\"
+          i = i + 2
+        elseif nxt == "n" then
+          out[#out + 1] = "\n"
+          i = i + 2
+        elseif nxt == "t" then
+          out[#out + 1] = "\t"
+          i = i + 2
+        else
+          out[#out + 1] = nxt
+          i = i + 2
+        end
       end
-    elseif c == '"' then
-      -- Plain (non-escaped) quote means we matched the un-escaped form.
+    elseif c == '"' and not doubly_encoded then
       return table.concat(out)
     else
       out[#out + 1] = c
