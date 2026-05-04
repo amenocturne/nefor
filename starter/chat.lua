@@ -1541,18 +1541,20 @@ local function inline_toast(state)
   local text = state.toast.text or ""
   local fg, border = toast_palette(state.toast.level)
 
-  -- Marquee slide: the text translates leftward from off-screen-right.
-  -- `total_slide` is the full distance the leading character travels —
-  -- from the right edge of the window (off-screen) to its rest column
-  -- TOAST_REST_INSET cells inset from the edge. `distance_slid` ∈
-  -- [0, total_slide] tracks how far along we are. We render the
-  -- leftmost `visible_n` chars of `text` immediately followed by
-  -- `trailing_pad` blank cells, the whole strip right-aligned. The
-  -- result: at the start of enter, only the first character peeks at
-  -- the right edge; mid-enter the leading prefix grows leftward; at
-  -- rest the full text sits TOAST_REST_INSET cells from the edge.
-  -- Exit mirrors the enter in reverse.
-  local total_slide = #text + TOAST_REST_INSET
+  -- Small rectangular pill anchored bottom-right. Pill width at rest =
+  -- text + 1 padding space + 1 right-border cell. The slide is
+  -- implemented by varying the pill's WIDTH from 0 (off-screen) to
+  -- pill_w_at_rest (full pill). Because the pill is anchored at the
+  -- right edge, the rect grows LEFTWARD as visible_w increases — the
+  -- text widgets render their full at-rest content into a too-narrow
+  -- rect, which truncates on the right. So the user sees the LEFTMOST
+  -- cells of the pill's content riding the right edge of the window:
+  -- leading dashes / leading chars of the text appear first, the
+  -- right corners / right border show only once the slide completes.
+  -- TOAST_REST_INSET is no longer used; replaced by this width-grows
+  -- model.
+  local pill_w_at_rest = #text + 2
+  local total_slide    = pill_w_at_rest
   local distance_slid
   if elapsed < TOAST_ENTER_MS then
     local t = elapsed / TOAST_ENTER_MS
@@ -1565,58 +1567,43 @@ local function inline_toast(state)
   end
   distance_slid = math.floor(distance_slid + 0.5)
 
-  local visible_n    = math.min(distance_slid, #text)
-  local visible_text = string.sub(text, 1, visible_n)
-  local trailing_pad = distance_slid - visible_n
+  local visible_w = math.min(distance_slid, pill_w_at_rest)
+  if visible_w <= 0 then return nil end
 
-  -- Banner-style chrome: full-window-width top and bottom rules, no
-  -- left wall. The text rides the right edge with 2 cells of padding
-  -- and slides in horizontally; the rules stay parked across the full
-  -- width so the toast reads as a band rather than a pill.
-  local top_rule = tui.constrained {
-    max_height = 1,
-    child = tui.fill { char = "─", style = border },
-  }
-  local bottom_rule = tui.constrained {
-    max_height = 1,
-    child = tui.fill { char = "─", style = border },
-  }
-  -- The band itself spans full window width so the rules never move.
-  -- The mid-row right-aligns the visible prefix of the text plus the
-  -- trailing pad. `tui.expanded` on the left absorbs the slack.
-  local mid_row = tui.constrained {
-    max_height = 1,
-    child = tui.row {
-      gap = 0,
-      children = {
-        tui.expanded { child = tui.fill { char = " " } },
-        tui.text {
-          content = visible_text,
-          style   = { fg = fg },
-          wrap    = "none",
-        },
-        tui.constrained {
-          max_width = trailing_pad,
-          child = tui.fill { char = " " },
-        },
-      },
-    },
-  }
+  -- At-rest content: 3 strings, each `pill_w_at_rest` cells wide.
+  -- Top and bottom are dashes terminating in `╮` / `╯`; mid is the
+  -- text + space + right-border `│`. There is no left chrome —
+  -- "no left order [border]" per spec. The right edge of these
+  -- strings always sits at the right edge of the window because the
+  -- enclosing anchored rect is bottom-right with width=visible_w.
+  local top_rule    = string.rep("─", pill_w_at_rest - 1) .. "╮"
+  local mid_text    = text .. " │"
+  local bottom_rule = string.rep("─", pill_w_at_rest - 1) .. "╯"
+
   local body = tui.column {
     gap = 0,
     key = "toast-box",
-    children = { top_rule, mid_row, bottom_rule },
+    children = {
+      tui.constrained {
+        max_height = 1,
+        child = tui.text { content = top_rule, style = border, wrap = "none" },
+      },
+      tui.constrained {
+        max_height = 1,
+        child = tui.text { content = mid_text, style = { fg = fg }, wrap = "none" },
+      },
+      tui.constrained {
+        max_height = 1,
+        child = tui.text { content = bottom_rule, style = border, wrap = "none" },
+      },
+    },
   }
 
-  -- Full-window-width band anchored to the bottom. Bars never move;
-  -- only the text inside `mid_row` translates via the trailing fill
-  -- whose width tracks `inset`. Width=100% pins the rules across the
-  -- entire window so they don't terminate inside the screen.
   return tui.anchored {
     anchor   = "bottom-right",
     offset_x = 0,
     offset_y = 0,
-    width    = "100%",
+    width    = visible_w,
     height   = TOAST_FULL_HEIGHT,
     child    = body,
   }

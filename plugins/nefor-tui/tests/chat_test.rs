@@ -2571,20 +2571,17 @@ fn mouse_drag_toast_overlays_input_and_statusline() {
     let _ = engine.take_emit_queue();
     let post = engine.snapshot();
 
-    // Toast is rendered last in the outer stack, so it overlays the
-    // statusline row. The placeholder text must NOT be visible while
-    // the toast band is up — that's the whole point of "show toast on
-    // top of everything".
-    assert!(
-        !post
-            .lines()
-            .any(|l| l.contains("Start chatting to see stats")),
-        "statusline placeholder must be occluded by toast: {post:?}"
-    );
+    // Toast is a small pill anchored bottom-right. It overlays the
+    // input + statusline area on the right side; the left side of
+    // the statusline (where the placeholder text lives) is undisturbed.
+    // What matters is that the toast LABEL renders into the bottom
+    // few rows — proving it's painted above the input/statusline in
+    // z-order, not that it occludes the entire row.
     let label = format!("copied {} chars", "selectable-token".len());
+    let bottom_rows: String = post.lines().rev().take(5).collect::<Vec<_>>().join("\n");
     assert!(
-        post.contains(&label),
-        "expected toast label `{label}` somewhere in frame: {post:?}"
+        bottom_rows.contains(&label),
+        "expected toast label `{label}` in the bottom rows: {bottom_rows:?}"
     );
 }
 
