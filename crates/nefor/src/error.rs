@@ -32,8 +32,8 @@ pub enum NeforError {
     #[error(transparent)]
     Broker(#[from] BrokerError),
 
-    /// Session log read/write failure (creating a fresh session on startup,
-    /// or hydrating a parent session declared in `init.lua`).
+    /// Session log write failure when creating or appending to the engine's
+    /// own session file.
     #[error(transparent)]
     Session(#[from] SessionError),
 

@@ -16,7 +16,7 @@ use crate::lua::bindings::{
     self, EngineOps, EventSubscriptions, SharedStdinPump, SharedSubscriptions, StdinPump,
 };
 use crate::lua::error::LuaError;
-use crate::lua::log::{log_entry_to_lua_table, log_to_lua_table};
+use crate::lua::log::log_entry_to_lua_table;
 use crate::lua::mode::EngineMode;
 use crate::ncp::SharedPluginRegistry;
 use crate::session::LogEntry;
@@ -47,10 +47,6 @@ pub struct LuaHost {
     /// Number of entries already mirrored into `current_log_table`. Used
     /// to compute the slice to append on each invocation.
     current_log_mirrored: usize,
-    /// Persistent Lua array for the parent session's saved log. Populated
-    /// once on the first invoke (the saved log is immutable across the
-    /// run) and reused thereafter. `None` until first call.
-    saved_log_table: Option<RegistryKey>,
     /// `nefor.bus.on_event` registry. Populated by Lua at any time; read
     /// by [`LuaHost::dispatch_subscriptions`] right after each step
     /// invocation to fan out matching events.
@@ -99,7 +95,6 @@ impl LuaHost {
             step: None,
             current_log_table: None,
             current_log_mirrored: 0,
-            saved_log_table: None,
             subscriptions,
             stdin_pump,
         })
@@ -207,40 +202,25 @@ impl LuaHost {
         Ok(())
     }
 
-    /// Invoke `step(saved_log, current_log)`.
+    /// Invoke `step(current_log)`.
     ///
-    /// Both Lua tables are *persistent*: created on the first call, then
+    /// The Lua table is *persistent*: created on the first call, then
     /// reused. `new_current_entries` carries only the entries appended
     /// since the previous call — converting the full log every time would
     /// be O(n²) per session, which dominated typing latency on the
     /// keystroke→render path. The caller (broker) clones just the small
     /// tail under its lock, avoiding an O(n) clone of the full event log
-    /// on every inbound line. The saved log is built once (parent session
-    /// is immutable across the run).
+    /// on every inbound line.
     ///
     /// Errors raised *inside* the step function are logged and swallowed —
     /// they must not take down the engine loop. VM-level errors (missing
     /// cache, registry corruption, conversion failure) bubble up as
     /// [`LuaError`].
-    pub fn invoke_step(
-        &mut self,
-        saved_log: &[LogEntry],
-        new_current_entries: &[LogEntry],
-    ) -> Result<(), LuaError> {
+    pub fn invoke_step(&mut self, new_current_entries: &[LogEntry]) -> Result<(), LuaError> {
         let Some(key) = self.step.as_ref() else {
             return Err(LuaError::StepNotCached);
         };
         let func: mlua::Function = self.lua.registry_value(key)?;
-
-        // saved_log: build once, reuse forever.
-        let saved: Table = match self.saved_log_table.as_ref() {
-            Some(k) => self.lua.registry_value(k)?,
-            None => {
-                let t = log_to_lua_table(&self.lua, saved_log)?;
-                self.saved_log_table = Some(self.lua.create_registry_value(t.clone())?);
-                t
-            }
-        };
 
         // current_log: persistent table, append-only on each call.
         let current: Table = match self.current_log_table.as_ref() {
@@ -259,7 +239,7 @@ impl LuaHost {
             self.current_log_mirrored += new_current_entries.len();
         }
 
-        match func.call::<()>((saved, current)) {
+        match func.call::<()>(current) {
             Ok(()) => Ok(()),
             Err(e) => {
                 tracing::error!(error = %e, "step invocation failed");
@@ -552,29 +532,16 @@ mod tests {
     #[test]
     fn invoke_step_before_cache_errors() {
         let mut h = host();
-        let err = h
-            .invoke_step(&[], &[])
-            .expect_err("uncached step must error");
+        let err = h.invoke_step(&[]).expect_err("uncached step must error");
         assert!(matches!(err, LuaError::StepNotCached));
     }
 
     #[test]
-    fn step_invocation_passes_log_tables() {
+    fn step_invocation_passes_log_table() {
         let mut h = host();
-        h.exec_str(
-            "init.lua",
-            "function step(s, c) global_s_len = #s; global_c_len = #c end",
-        )
-        .unwrap();
+        h.exec_str("init.lua", "function step(c) global_c_len = #c end")
+            .unwrap();
         h.cache_step().expect("cache ok");
-        let saved: Vec<LogEntry> = (0..2)
-            .map(|i| LogEntry {
-                ts: ts(),
-                origin: Origin::Plugin(plugin("mock-plugin")),
-                target: None,
-                payload: format!("sp{i}"),
-            })
-            .collect();
         let current: Vec<LogEntry> = (0..3)
             .map(|i| LogEntry {
                 ts: ts(),
@@ -583,10 +550,8 @@ mod tests {
                 payload: format!("cp{i}"),
             })
             .collect();
-        h.invoke_step(&saved, &current).expect("invoke ok");
-        let s_len: i64 = h.lua.globals().get("global_s_len").unwrap();
+        h.invoke_step(&current).expect("invoke ok");
         let c_len: i64 = h.lua.globals().get("global_c_len").unwrap();
-        assert_eq!(s_len, 2);
         assert_eq!(c_len, 3);
     }
 
@@ -596,11 +561,11 @@ mod tests {
         let mut h = host_with_ops(Arc::clone(&ops) as Arc<dyn EngineOps>);
         h.exec_str(
             "init.lua",
-            "function step(s, c) nefor.engine.send(\"from-step\") end",
+            "function step(c) nefor.engine.send(\"from-step\") end",
         )
         .unwrap();
         h.cache_step().expect("cache ok");
-        h.invoke_step(&[], &[]).expect("invoke ok");
+        h.invoke_step(&[]).expect("invoke ok");
         let calls = ops.snapshot();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, SendTarget::Broadcast);
@@ -615,7 +580,7 @@ mod tests {
         h.cache_step().expect("cache ok");
         // Should return Ok despite the Lua error — the engine loop must
         // continue running on handler failure.
-        let res = h.invoke_step(&[], &[]);
+        let res = h.invoke_step(&[]);
         assert!(res.is_ok(), "step error must not be fatal; got {res:?}");
     }
 
@@ -625,7 +590,7 @@ mod tests {
         h.exec_str(
             "init.lua",
             r#"
-            function step(saved, current)
+            function step(current)
                 captured_ts = current[1].ts
                 captured_origin = current[1].origin
                 captured_target = current[1].target
@@ -641,7 +606,7 @@ mod tests {
             target: Some(plugin("mock-plugin")),
             payload: "pl".into(),
         };
-        h.invoke_step(&[], std::slice::from_ref(&entry)).unwrap();
+        h.invoke_step(std::slice::from_ref(&entry)).unwrap();
         let got_ts: String = h.lua.globals().get("captured_ts").unwrap();
         let origin: String = h.lua.globals().get("captured_origin").unwrap();
         let target: String = h.lua.globals().get("captured_target").unwrap();

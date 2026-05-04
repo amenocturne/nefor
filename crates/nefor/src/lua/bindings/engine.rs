@@ -1,7 +1,7 @@
 //! `nefor.engine.send` — emit a message from the step function.
 //!
-//! Step (`init.lua`'s `function step(saved_log, current_log) ... end`) is the
-//! policy engine. When it decides to forward something it calls
+//! Step (`init.lua`'s `function step(current_log) ... end`) is the policy
+//! engine. When it decides to forward something it calls
 //! `nefor.engine.send(payload, target?)`. Broadcasts omit the target;
 //! targeted sends pass a plugin name.
 //!

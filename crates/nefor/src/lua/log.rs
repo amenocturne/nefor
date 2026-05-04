@@ -1,8 +1,8 @@
 //! Lua-table conversion for `session::LogEntry`.
 //!
-//! The step function in `init.lua` takes two arrays of entries — the saved log
-//! (from a parent session, if any) and the current log (everything routed
-//! through the broker this run). Each entry arrives in Lua as:
+//! The step function in `init.lua` takes a single array of entries — the
+//! current log (everything routed through the broker this run). Each entry
+//! arrives in Lua as:
 //!
 //! ```lua
 //! { ts = "<iso>", origin = "<name-or-step>", target = "<name>" | nil, payload = "<raw-line>" }
@@ -36,17 +36,6 @@ pub fn log_entry_to_lua_table(lua: &Lua, e: &LogEntry) -> mlua::Result<Table> {
     }
     tbl.set("payload", lua.create_string(&e.payload)?)?;
     Ok(tbl)
-}
-
-/// Convert a slice of [`LogEntry`] to a Lua array table (integer keys
-/// `1..=n`), preserving slice order.
-pub fn log_to_lua_table(lua: &Lua, log: &[LogEntry]) -> mlua::Result<Table> {
-    let arr = lua.create_table()?;
-    for (i, entry) in log.iter().enumerate() {
-        // Lua arrays are 1-indexed.
-        arr.set(i + 1, log_entry_to_lua_table(lua, entry)?)?;
-    }
-    Ok(arr)
 }
 
 #[cfg(test)]
@@ -96,33 +85,5 @@ mod tests {
         assert_eq!(origin, "step");
         let target_val: Value = tbl.get("target").unwrap();
         assert!(matches!(target_val, Value::Nil));
-    }
-
-    #[test]
-    fn log_to_lua_table_preserves_order() {
-        let l = lua();
-        let entries: Vec<LogEntry> = (0..5)
-            .map(|i| LogEntry {
-                ts: ts(),
-                origin: Origin::Plugin(PluginName::new(format!("p{i}")).unwrap()),
-                target: None,
-                payload: format!("p{i}"),
-            })
-            .collect();
-        let arr = log_to_lua_table(&l, &entries).expect("convert ok");
-        let len = arr.len().expect("len ok");
-        assert_eq!(len, 5);
-        for i in 0..5 {
-            let entry: Table = arr.get(i + 1).expect("entry present");
-            let payload: String = entry.get("payload").unwrap();
-            assert_eq!(payload, format!("p{i}"));
-        }
-    }
-
-    #[test]
-    fn log_to_lua_table_empty_slice_is_length_zero() {
-        let l = lua();
-        let arr = log_to_lua_table(&l, &[]).expect("convert ok");
-        assert_eq!(arr.len().expect("len ok"), 0);
     }
 }

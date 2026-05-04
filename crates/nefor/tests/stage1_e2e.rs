@@ -185,8 +185,8 @@ package.path = table.concat({
 local ncp              = require("ncp")
 local agentic_workflow = require("agentic_workflow")
 
-function step(saved_log, current_log)
-  ncp.step(saved_log, current_log)
+function step(current_log)
+  ncp.step(current_log)
 end
 
 local PROVIDER = "ollama"
@@ -335,7 +335,7 @@ fn tmp_session_writer(tmp: &TempDir) -> SessionWriter {
         .join("nefor")
         .join("sessions")
         .join(format!("{id}.jsonl"));
-    let header = SessionHeader::new(id, None, Timestamp::now());
+    let header = SessionHeader::new(id, Timestamp::now());
     SessionWriter::create_at(path, header).expect("session writer")
 }
 
@@ -409,8 +409,6 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
     let session = tmp_session_writer(&tmp);
     let shared = Arc::new(Mutex::new(BrokerShared::new(session)));
     let host = build_host(Arc::clone(&shared), tmp.path());
-
-    let saved_log = Vec::new();
 
     // Plugin root must be a directory containing one subdir per plugin
     // name (the runner uses `<root>/<name>/` as cwd). The repo's
@@ -511,7 +509,7 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
 
     let (mut driver, driver_transport) = make_driver_transport();
 
-    let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, saved_log);
+    let mut broker = Broker::new(Arc::clone(&shared), host);
     broker.attach_transport(combinators_t, combinators_spec.name.clone());
     broker.attach_transport(generic_provider_t, generic_provider_spec.name.clone());
     broker.attach_transport(generic_tool_t, generic_tool_spec.name.clone());

@@ -6,13 +6,14 @@
 //! [`SessionHeader`] (marked with `_session: true`); subsequent lines are
 //! [`LogEntry`] records.
 //!
-//! This module provides the types, the [`SessionWriter`] that owns the open
-//! file, and the [`load_session`] reader used to hydrate a parent session on
-//! resume. Broker integration lives elsewhere; nothing here talks to the
-//! broker or to plugins directly.
+//! This module provides the types and the [`SessionWriter`] that owns the
+//! open file. The engine is otherwise session-blind — it does not read
+//! prior sessions back from disk; cross-run replay or resumption is the
+//! responsibility of Lua glue. Broker integration lives elsewhere; nothing
+//! here talks to the broker or to plugins directly.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -140,39 +141,22 @@ pub struct SessionHeader {
     pub marker: bool,
     /// Id of this session.
     pub session_id: SessionId,
-    /// Parent session whose log was replayed into this one, if any.
-    #[serde(default)]
-    pub parent_session: Option<SessionId>,
     /// When the session was opened.
     pub started_at: Timestamp,
 }
 
 impl SessionHeader {
     /// Build a header with the `_session: true` marker set.
-    pub fn new(
-        session_id: SessionId,
-        parent_session: Option<SessionId>,
-        started_at: Timestamp,
-    ) -> Self {
+    pub fn new(session_id: SessionId, started_at: Timestamp) -> Self {
         Self {
             marker: true,
             session_id,
-            parent_session,
             started_at,
         }
     }
 }
 
-/// A fully-loaded session read back from disk.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoadedSession {
-    /// First-line header.
-    pub header: SessionHeader,
-    /// All entries following the header, in file order.
-    pub entries: Vec<LogEntry>,
-}
-
-/// Failures that can arise writing or reading a session log.
+/// Failures that can arise writing a session log.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     /// The OS did not expose a usable XDG data directory (no `$HOME`, etc.).
@@ -186,19 +170,7 @@ pub enum SessionError {
         /// Lower-level parse reason.
         reason: String,
     },
-    /// Session file did not exist on disk.
-    #[error("session not found: {0}")]
-    NotFound(SessionId),
-    /// Session file existed but could not be parsed per the format invariant
-    /// (missing header, malformed JSON, entry before header, etc.).
-    #[error("malformed session file at {path}: {reason}")]
-    Malformed {
-        /// File we were reading.
-        path: PathBuf,
-        /// Human-readable parse reason.
-        reason: String,
-    },
-    /// Underlying I/O failure reading or writing the session file.
+    /// Underlying I/O failure writing the session file.
     #[error("I/O error on session log at {path}: {source}")]
     Io {
         /// File the I/O was directed at.
@@ -343,77 +315,6 @@ fn write_line(writer: &mut BufWriter<File>, line: &str, path: &Path) -> Result<(
         })
 }
 
-/// Load a full session log (header + all entries) by id.
-///
-/// Returns [`SessionError::NotFound`] if the file is absent, and
-/// [`SessionError::Malformed`] for structural problems (empty file, entry
-/// before header, invalid JSON, header marker not set).
-pub fn load_session(id: &SessionId) -> Result<LoadedSession, SessionError> {
-    let path = session_log_path(id)?;
-    load_session_at(path, id)
-}
-
-/// Reader variant rooted at an explicit path. Exposed to tests.
-#[doc(hidden)]
-pub fn load_session_at(path: PathBuf, id: &SessionId) -> Result<LoadedSession, SessionError> {
-    let file = match File::open(&path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(SessionError::NotFound(id.clone()));
-        }
-        Err(source) => {
-            return Err(SessionError::Io {
-                path: path.clone(),
-                source,
-            });
-        }
-    };
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-
-    let header_line = lines
-        .next()
-        .ok_or_else(|| SessionError::Malformed {
-            path: path.clone(),
-            reason: "empty file (no header line)".into(),
-        })?
-        .map_err(|source| SessionError::Io {
-            path: path.clone(),
-            source,
-        })?;
-
-    let header: SessionHeader =
-        serde_json::from_str(&header_line).map_err(|e| SessionError::Malformed {
-            path: path.clone(),
-            reason: format!("header line is not a valid SessionHeader: {e}"),
-        })?;
-    if !header.marker {
-        return Err(SessionError::Malformed {
-            path: path.clone(),
-            reason: "header line is missing the `_session: true` marker".into(),
-        });
-    }
-
-    let mut entries = Vec::new();
-    for (idx, line) in lines.enumerate() {
-        let line = line.map_err(|source| SessionError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        if line.is_empty() {
-            continue;
-        }
-        let entry: LogEntry = serde_json::from_str(&line).map_err(|e| SessionError::Malformed {
-            path: path.clone(),
-            // +2: human line numbering + one for the header.
-            reason: format!("line {} is not a valid LogEntry: {e}", idx + 2),
-        })?;
-        entries.push(entry);
-    }
-
-    Ok(LoadedSession { header, entries })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,7 +360,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let id = SessionId::new();
         let path = tmp_session_path(&dir, &id);
-        let header = SessionHeader::new(id.clone(), None, mk_ts("2026-04-23T12:00:00.000Z"));
+        let header = SessionHeader::new(id.clone(), mk_ts("2026-04-23T12:00:00.000Z"));
         {
             let _writer =
                 SessionWriter::create_at(path.clone(), header.clone()).expect("create writer");
@@ -475,7 +376,6 @@ mod tests {
         let parsed: SessionHeader = serde_json::from_str(first_line).expect("header parses");
         assert!(parsed.marker);
         assert_eq!(parsed.session_id, id);
-        assert_eq!(parsed.parent_session, None);
         // Explicit check that the wire form contains the marker.
         assert!(first_line.contains(r#""_session":true"#));
     }
@@ -485,7 +385,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let id = SessionId::new();
         let path = tmp_session_path(&dir, &id);
-        let header = SessionHeader::new(id.clone(), None, mk_ts("2026-04-23T12:00:00.000Z"));
+        let header = SessionHeader::new(id.clone(), mk_ts("2026-04-23T12:00:00.000Z"));
         let mut writer = SessionWriter::create_at(path.clone(), header).expect("create writer");
         let e1 = mk_entry(Origin::Plugin(mk_plugin("mock-plugin")), None, "hello");
         let e2 = mk_entry(Origin::Step, Some(mk_plugin("nefor-tui")), "render");
@@ -516,7 +416,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let id = SessionId::new();
         let path = tmp_session_path(&dir, &id);
-        let header = SessionHeader::new(id.clone(), None, mk_ts("2026-04-23T12:00:00.000Z"));
+        let header = SessionHeader::new(id.clone(), mk_ts("2026-04-23T12:00:00.000Z"));
         let mut writer = SessionWriter::create_at(path.clone(), header).expect("create");
         writer
             .append(&mk_entry(
@@ -553,7 +453,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let id = SessionId::new();
         let path = tmp_session_path(&dir, &id);
-        let header = SessionHeader::new(id.clone(), None, mk_ts("2026-04-23T12:00:00.000Z"));
+        let header = SessionHeader::new(id.clone(), mk_ts("2026-04-23T12:00:00.000Z"));
         {
             let mut writer = SessionWriter::create_at(path.clone(), header).expect("create");
             writer
@@ -562,70 +462,17 @@ mod tests {
             // No explicit flush — rely on Drop.
         }
 
-        let loaded = load_session_at(path.clone(), &id).expect("loaded");
-        assert_eq!(loaded.entries.len(), 1);
-        assert_eq!(loaded.entries[0].payload, "will-I-make-it");
-    }
-
-    #[test]
-    fn load_session_returns_not_found_for_missing_id() {
-        let dir = TempDir::new().expect("tempdir");
-        let id = SessionId::new();
-        let path = tmp_session_path(&dir, &id);
-        let err = load_session_at(path, &id).expect_err("should be missing");
-        assert!(matches!(err, SessionError::NotFound(_)));
-    }
-
-    #[test]
-    fn load_session_parses_header_and_entries() {
-        let dir = TempDir::new().expect("tempdir");
-        let id = SessionId::new();
-        let parent = SessionId::new();
-        let started_at = mk_ts("2026-04-23T12:00:00.000Z");
-        let path = tmp_session_path(&dir, &id);
-        let header = SessionHeader::new(id.clone(), Some(parent.clone()), started_at);
-        let entries = vec![
-            mk_entry(Origin::Plugin(mk_plugin("mock-plugin")), None, "first"),
-            mk_entry(Origin::Step, Some(mk_plugin("mock-plugin")), "second"),
-        ];
-        {
-            let mut writer =
-                SessionWriter::create_at(path.clone(), header.clone()).expect("create");
-            for e in &entries {
-                writer.append(e).expect("append");
-            }
-        }
-
-        let loaded = load_session_at(path, &id).expect("load");
-        assert_eq!(loaded.header, header);
-        assert_eq!(loaded.entries, entries);
-    }
-
-    #[test]
-    fn load_session_rejects_malformed() {
-        let dir = TempDir::new().expect("tempdir");
-        let id = SessionId::new();
-        let path = tmp_session_path(&dir, &id);
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-        std::fs::write(&path, "this is not JSON\n").expect("write garbage");
-        let err = load_session_at(path, &id).expect_err("should be malformed");
-        assert!(matches!(err, SessionError::Malformed { .. }));
-    }
-
-    #[test]
-    fn load_session_rejects_header_without_marker() {
-        let dir = TempDir::new().expect("tempdir");
-        let id = SessionId::new();
-        let path = tmp_session_path(&dir, &id);
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-        // Valid JSON shape but `_session` flipped to false.
-        let bogus = format!(
-            r#"{{"_session":false,"session_id":"{}","parent_session":null,"started_at":"2026-04-23T12:00:00.000Z"}}"#,
-            id.as_str()
-        );
-        std::fs::write(&path, format!("{bogus}\n")).expect("write");
-        let err = load_session_at(path, &id).expect_err("missing marker");
-        assert!(matches!(err, SessionError::Malformed { .. }));
+        // The engine never reads sessions back from disk, so the assertion
+        // here is purely "the bytes hit the file." Read the raw file and
+        // confirm the appended payload made it through Drop's flush.
+        let mut raw = String::new();
+        File::open(&path)
+            .expect("open")
+            .read_to_string(&mut raw)
+            .expect("read");
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 2, "1 header + 1 entry");
+        assert!(lines[1].contains("will-I-make-it"));
     }
 
     #[test]

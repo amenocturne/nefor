@@ -30,8 +30,11 @@ package.path = table.concat({
 
 local ncp = require("ncp")
 
-function step(saved_log, current_log)
-  ncp.step(saved_log, current_log)
+-- Engine post-rewrite passes only `current_log` to step. ncp.step still
+-- takes `(saved_log, current_log)` for the legacy resume.lua mechanism;
+-- saved_log is permanently empty now, so we forward an empty table.
+function step(current_log)
+  ncp.step({}, current_log)
 end
 
 local agentic_workflow = require("agentic_workflow")

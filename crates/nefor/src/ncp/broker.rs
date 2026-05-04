@@ -7,8 +7,8 @@
 //!    spawned plugin); own the read/write tasks and exit watcher.
 //! 2. For every inbound line: stamp `origin = Plugin(name)` + `ts = now`,
 //!    append a [`LogEntry`] to the in-memory event log and the session
-//!    file, then invoke the cached Lua `step(saved_log, current_log)`
-//!    hook. Step is free to decide what (if anything) flows out.
+//!    file, then invoke the cached Lua `step(current_log)` hook. Step is
+//!    free to decide what (if anything) flows out.
 //! 3. Expose a [`BrokerOps`] routing sink to the Lua VM. When `step` calls
 //!    `nefor.engine.send(payload, target?)` the broker stamps the outbound
 //!    as `origin = Step`, appends it to the same log + session, and writes
@@ -22,7 +22,8 @@
 //! All NCP protocol handling (ready handshake, replay-on-attach, system
 //! message dispatch, error-code classification) has moved to the user's
 //! `starter/init.lua`. The broker does not parse the body of an inbound
-//! line — raw bytes in, raw bytes out.
+//! line — raw bytes in, raw bytes out. The broker is also session-blind:
+//! cross-run resumption / saved-log replay is the responsibility of Lua.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -241,9 +242,6 @@ pub struct Broker {
     /// Triggered by [`Broker::shutdown_handle`] or an external signal.
     shutdown_rx: mpsc::Receiver<u64>,
     shutdown_tx: mpsc::Sender<u64>,
-    /// Saved log from a resumed parent session. Passed verbatim to every
-    /// `step` invocation as the first argument.
-    saved_log: Vec<LogEntry>,
     /// Count of `event_log` entries already handed to `invoke_step`. The
     /// broker clones just `event_log[mirrored_count..]` under its lock and
     /// passes the small tail to step; the Lua VM appends those into the
@@ -275,13 +273,8 @@ pub enum BrokerStopReason {
 impl Broker {
     /// Construct a new broker with default capacities. `shared` must already
     /// own an open [`SessionWriter`]; `host` must have its `step` function
-    /// cached (see [`LuaHost::cache_step`]); `saved_log` is the hydrated
-    /// parent-session log (empty for a fresh session).
-    pub fn with_saved_log(
-        shared: Arc<Mutex<BrokerShared>>,
-        host: LuaHost,
-        saved_log: Vec<LogEntry>,
-    ) -> Self {
+    /// cached (see [`LuaHost::cache_step`]).
+    pub fn new(shared: Arc<Mutex<BrokerShared>>, host: LuaHost) -> Self {
         // Shared inbound/exit channels sized to tolerate brief bursts from
         // many plugins. 1024 each matches §6's per-connection default.
         let (inbound_tx, inbound_rx) = mpsc::channel(1024);
@@ -312,7 +305,6 @@ impl Broker {
             exit_rx,
             shutdown_rx,
             shutdown_tx,
-            saved_log,
             mirrored_count: 0,
             pending_engine_envelopes: Vec::new(),
             exit_code_slot,
@@ -392,7 +384,7 @@ impl Broker {
             tail
         };
 
-        if let Err(e) = self.host.invoke_step(&self.saved_log, &new_entries) {
+        if let Err(e) = self.host.invoke_step(&new_entries) {
             tracing::error!(error = %e, "step invocation errored at VM level");
         }
         self.host.dispatch_subscriptions(&new_entries);
@@ -598,7 +590,7 @@ impl Broker {
             tail
         };
 
-        if let Err(e) = self.host.invoke_step(&self.saved_log, &new_entries) {
+        if let Err(e) = self.host.invoke_step(&new_entries) {
             tracing::error!(error = %e, "step invocation errored at VM level");
         }
 
@@ -820,7 +812,7 @@ mod tests {
             .join("nefor")
             .join("sessions")
             .join(format!("{id}.jsonl"));
-        let header = SessionHeader::new(id, None, Timestamp::now());
+        let header = SessionHeader::new(id, Timestamp::now());
         let writer = SessionWriter::create_at(path.clone(), header).expect("writer");
         (writer, path)
     }
@@ -832,8 +824,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (session, _path) = tmp_session(&dir);
         let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
-        let host = build_host(&shared, "function step(s, c) end");
-        let broker = Broker::with_saved_log(shared, host, Vec::new());
+        let host = build_host(&shared, "function step(c) end");
+        let broker = Broker::new(shared, host);
         let outcome = tokio::time::timeout(Duration::from_secs(2), broker.run())
             .await
             .expect("broker should exit quickly");
@@ -851,7 +843,7 @@ mod tests {
             &shared,
             r#"
             seen = {}
-            function step(saved, current)
+            function step(current)
                 local last = current[#current]
                 seen[#seen + 1] = last.origin .. ":" .. last.payload
             end
@@ -862,7 +854,7 @@ mod tests {
         // test can read `seen` back after the run.
         let lua = host.lua().clone();
 
-        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let mut broker = Broker::new(Arc::clone(&shared), host);
         let (mut p, t) = make_transport();
         broker.attach_transport(t, pn("test"));
         let handle = broker.shutdown_handle();
@@ -888,10 +880,10 @@ mod tests {
         // Step broadcasts "pong" on every inbound line.
         let host = build_host(
             &shared,
-            r#"function step(saved, current) nefor.engine.send("pong") end"#,
+            r#"function step(current) nefor.engine.send("pong") end"#,
         );
 
-        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let mut broker = Broker::new(Arc::clone(&shared), host);
         let (mut pa, ta) = make_transport();
         let (mut pb, tb) = make_transport();
         let (mut pc, tc) = make_transport();
@@ -924,10 +916,10 @@ mod tests {
         let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
         let host = build_host(
             &shared,
-            r#"function step(saved, current) nefor.engine.send("to-b-only", "b") end"#,
+            r#"function step(current) nefor.engine.send("to-b-only", "b") end"#,
         );
 
-        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let mut broker = Broker::new(Arc::clone(&shared), host);
         let (mut pa, ta) = make_transport();
         let (mut pb, tb) = make_transport();
         broker.attach_transport(ta, pn("a"));
@@ -961,10 +953,10 @@ mod tests {
         let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
         let host = build_host(
             &shared,
-            r#"function step(saved, current) nefor.engine.send("echoed", "a") end"#,
+            r#"function step(current) nefor.engine.send("echoed", "a") end"#,
         );
 
-        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let mut broker = Broker::new(Arc::clone(&shared), host);
         let (mut pa, ta) = make_transport();
         broker.attach_transport(ta, pn("a"));
         let handle = broker.shutdown_handle();
@@ -1022,9 +1014,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (session, _path) = tmp_session(&dir);
         let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
-        let host = build_host(&shared, "function step(s, c) end");
+        let host = build_host(&shared, "function step(c) end");
 
-        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let mut broker = Broker::new(Arc::clone(&shared), host);
         let (_pa, ta) = make_transport();
         let (pb, tb) = make_transport();
         broker.attach_transport(ta, pn("a"));
@@ -1091,14 +1083,14 @@ mod tests {
             &shared,
             r#"
             seen = {}
-            function step(saved, current)
+            function step(current)
                 local last = current[#current]
                 seen[#seen + 1] = last.origin .. ":" .. last.payload
             end
             "#,
         );
         let lua = host.lua().clone();
-        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let mut broker = Broker::new(Arc::clone(&shared), host);
 
         // Queue *before* run() — the first tick must drain it.
         broker.queue_engine_envelope(serde_json::json!({
@@ -1149,7 +1141,7 @@ mod tests {
             &shared,
             r#"
             engine_seen = {}
-            function step(saved, current)
+            function step(current)
                 local last = current[#current]
                 if last.origin == "engine" then
                     engine_seen[#engine_seen + 1] = last.payload
@@ -1158,7 +1150,7 @@ mod tests {
             "#,
         );
         let lua = host.lua().clone();
-        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let mut broker = Broker::new(Arc::clone(&shared), host);
 
         let (_pa, ta, exit_tx_a) = make_transport_with_exit();
         let (_pb, tb) = make_transport();
@@ -1216,7 +1208,7 @@ mod tests {
             &shared,
             r#"
             engine_seen = {}
-            function step(saved, current)
+            function step(current)
                 local last = current[#current]
                 if last.origin == "engine" then
                     engine_seen[#engine_seen + 1] = last.payload
@@ -1225,7 +1217,7 @@ mod tests {
             "#,
         );
         let lua = host.lua().clone();
-        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let mut broker = Broker::new(Arc::clone(&shared), host);
 
         let (_pa, ta, exit_tx_a) = make_transport_with_exit();
         let (_pb, tb) = make_transport();
@@ -1262,10 +1254,10 @@ mod tests {
         let shared = Arc::new(StdMutex::new(BrokerShared::new(session)));
         let host = build_host(
             &shared,
-            r#"function step(saved, current) nefor.engine.send("x") end"#,
+            r#"function step(current) nefor.engine.send("x") end"#,
         );
 
-        let mut broker = Broker::with_saved_log(Arc::clone(&shared), host, Vec::new());
+        let mut broker = Broker::new(Arc::clone(&shared), host);
         let (mut sender, sender_t) = make_transport();
         let (_receiver, receiver_t) = make_transport_buf(64);
         broker.attach_transport(sender_t, pn("s"));
