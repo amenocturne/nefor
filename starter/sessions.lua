@@ -75,6 +75,18 @@
 --     the user's expectation that picking a session always succeeds
 --     in some defined way rather than half-rolling-back.
 --
+--   sessions.on_resume_phase(phase, fn)
+--     Register a synchronous hook fired inside `M.resume()` immediately
+--     BEFORE the corresponding `emit_control` broadcast. Phases:
+--     "session_end" / "session_start" / "resume_done". Use this when a
+--     module's state must flip in lockstep with the resume sequence —
+--     specifically, when racing the bus subscriber's next-tick fire would
+--     leak stale traffic. The canonical caller is agentic_workflow.lua's
+--     `replay_mode = true` flag, which must be set before reasoner-graph
+--     replay envelopes ship.
+--     Errors raised inside a hook are caught + logged; subsequent hooks
+--     still fire.
+--
 --   sessions.handle_shutdown()
 --     Wire the shutdown handler. Subscribes to the engine-internal
 --     lifecycle event `"shutdown"` (`nefor.events.on("shutdown", ...)`)
@@ -136,9 +148,10 @@
 -- code path. Per-plugin replay filtering is no longer in a separate
 -- registry — the live agentic_workflow transforms react to the
 -- `sessions.session_start` / `session_end` / `resume_done` lifecycle
--- envelopes via `nefor.bus.on_event` and own their own state-flush /
--- replay-mode flags. ncp.step and the engine no longer carry a
--- saved_log argument.
+-- envelopes via `sessions.on_resume_phase` (synchronous, lockstep with
+-- the resume sequence) and `nefor.bus.on_event` (next-tick broadcast),
+-- and own their own state-flush / replay-mode flags. ncp.dispatch and
+-- the engine no longer carry a saved_log argument.
 
 local M = {}
 
@@ -162,6 +175,31 @@ local current_session_file = nil
 local persistence_installed = false
 local resume_listener_installed = false
 local shutdown_listener_installed = false
+
+-- Synchronous resume-phase hook registry. Modules whose state must flip
+-- IN LOCKSTEP with the resume sequence (rather than one broker-tick later
+-- via `nefor.bus.on_event`) register here. Each list fires once per
+-- resume, in registration order, INSIDE `M.resume()` immediately before
+-- the corresponding `emit_control` broadcast.
+--
+-- Why a Lua-local registry instead of the bus: bus subscribers fire on
+-- the broker's NEXT tick (the broker captures `new_entries` before step
+-- runs, so step's outbound `nefor.engine.send` sits unsubscribed-to until
+-- the next inbound line). Between the session_start broadcast and the
+-- agentic_workflow handler firing, the replay loop here can already have
+-- pushed reasoner-graph envelopes onto the wire — the handler that flips
+-- `replay_mode = true` runs too late to gate them. Synchronous hooks run
+-- BEFORE the broadcast, so any state these modules own is already in the
+-- replay-correct shape before the first replay envelope ships.
+--
+-- Keys: "session_end", "session_start", "resume_done". Values: array of
+-- `function(session_id) ... end` callbacks. Errors in a callback are
+-- caught + logged; subsequent callbacks still run.
+local resume_phase_hooks = {
+  session_end   = {},
+  session_start = {},
+  resume_done   = {},
+}
 
 -- ------------------------------------------------------------------
 -- helpers — uuid, paths, file io
@@ -434,6 +472,46 @@ local function replay_jsonl(path)
   return count
 end
 
+-- Fire every callback registered for `phase` synchronously, in
+-- registration order. `pcall` so a faulty hook doesn't break the resume
+-- sequence. Returns nothing — the side effects are what matters.
+local function fire_resume_phase(phase, session_id)
+  local list = resume_phase_hooks[phase]
+  if list == nil then return end
+  for _, fn in ipairs(list) do
+    local ok, err = pcall(fn, session_id)
+    if not ok and nefor.log and nefor.log.error then
+      nefor.log.error("sessions: resume-phase hook raised", {
+        phase = phase,
+        error = tostring(err),
+      })
+    end
+  end
+end
+
+-- Register a synchronous hook for one of the three resume phases.
+-- Called inside `M.resume()` BEFORE the corresponding `emit_control`
+-- broadcast, so module state owned outside sessions.lua can flip in
+-- lockstep with the resume sequence rather than racing the broker's
+-- next-tick bus dispatch. See `resume_phase_hooks` doc above for the
+-- "why" (one-tick-leak fix).
+--
+-- `phase` ∈ {"session_end", "session_start", "resume_done"}. Unknown
+-- phases raise — typo-resistant.
+function M.on_resume_phase(phase, fn)
+  if type(phase) ~= "string" or resume_phase_hooks[phase] == nil then
+    error(string.format(
+      "sessions.on_resume_phase: phase must be one of session_end / session_start / resume_done; got %s",
+      tostring(phase)
+    ), 2)
+  end
+  if type(fn) ~= "function" then
+    error("sessions.on_resume_phase: fn must be a function", 2)
+  end
+  local list = resume_phase_hooks[phase]
+  list[#list + 1] = fn
+end
+
 function M.resume(target_session_id)
   if type(target_session_id) ~= "string" or target_session_id == "" then
     if nefor.log and nefor.log.error then
@@ -452,6 +530,10 @@ function M.resume(target_session_id)
   end
 
   -- 1. Announce end of outgoing session.
+  --    Synchronous hooks fire FIRST so module state (e.g. in-flight
+  --    bookkeeping that needs to clear before the bus broadcast) is in
+  --    the correct shape by the time peers see session_end.
+  fire_resume_phase("session_end", current_session_id)
   emit_control("sessions.session_end", { session_id = current_session_id })
 
   -- 2. Swap state.
@@ -475,12 +557,24 @@ function M.resume(target_session_id)
 
   -- 3. Announce start of incoming session — BEFORE replay so handlers
   -- can teardown stale state and prepare to accept replayed envelopes.
+  --    Synchronous hooks fire BEFORE the broadcast: this is the
+  --    one-tick-leak fix. agentic_workflow's `replay_mode = true` flag
+  --    must be set before any envelope produced by replay_jsonl below
+  --    routes through reasoner-graph's `from_plugin`. The bus-event
+  --    subscriber for `sessions.session_start` only runs on the next
+  --    broker tick (see `resume_phase_hooks` doc), which is already too
+  --    late.
+  fire_resume_phase("session_start", target_session_id)
   emit_control("sessions.session_start", { session_id = target_session_id })
 
   -- 4. Replay. Errors here don't roll the swap back — see module doc.
   local replayed = replay_jsonl(new_path)
 
   -- 5. Coalesced "we're back" signal.
+  --    Synchronous hooks fire FIRST so listeners can lift any replay-
+  --    related gates before the broadcast goes out (symmetric with
+  --    session_start).
+  fire_resume_phase("resume_done", target_session_id)
   emit_control("sessions.resume_done", {
     session_id = target_session_id,
     replayed   = replayed,
@@ -610,6 +704,11 @@ function M._reset()
   persistence_installed     = false
   resume_listener_installed = false
   shutdown_listener_installed = false
+  resume_phase_hooks = {
+    session_end   = {},
+    session_start = {},
+    resume_done   = {},
+  }
 end
 
 -- Exposed for tests so they can drive the persistence hook directly

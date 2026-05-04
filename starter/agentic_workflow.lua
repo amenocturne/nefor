@@ -1621,81 +1621,133 @@ function M.setup(opts)
   -- session lifecycle handlers
   -- ------------------------------------------------------------------
   --
-  -- The starter's `sessions` module emits four control events on the
-  -- bus: session_start, session_end, resume_done, resume_request. We
-  -- subscribe via `nefor.bus.on_event` (which fires on every routed
-  -- envelope, regardless of origin — distinct from ncp.step which skips
-  -- engine-/step-origin entries) so per-plugin orchestration state can
-  -- track session boundaries.
+  -- The starter's `sessions` module exposes two parallel notification
+  -- paths for resume lifecycle: bus events (`sessions.session_start` /
+  -- `session_end` / `resume_done`, fired one broker tick after they
+  -- broadcast) and synchronous resume-phase hooks (fired immediately,
+  -- INSIDE `sessions.resume()`, before the corresponding bus broadcast
+  -- ships).
   --
-  --   session_end  → tear down in-flight orchestrator run, drop chat-id
-  --                   bookkeeping, broadcast `chat.reset` so the
-  --                   provider drops its `Chats` map and the TUI clears
-  --                   the transcript.
-  --   session_start → ensure state is empty (idempotent), set
-  --                   `replay_mode = true` so the reasoner-graph
-  --                   from_plugin transform stops dispatching run_node
-  --                   handlers (the graph already ran in the original
-  --                   session — re-running would duplicate every side
-  --                   effect).
+  -- We subscribe to BOTH:
+  --
+  --   * Synchronous phase hooks (`sessions.on_resume_phase`) — used for
+  --     work that must complete BEFORE replay traffic ships. Flipping
+  --     `replay_mode = true` is the canonical example: between the
+  --     session_start broadcast (which reaches reasoner-graph and may
+  --     cause it to react to replayed envelopes) and the bus subscriber
+  --     firing on the next tick, reasoner-graph could emit envelopes that
+  --     leak through `for_reasoner_graph.from_plugin` un-gated. Sync
+  --     hooks close that window.
+  --
+  --   * Bus subscribers (`nefor.bus.on_event`) — kept for the shutdown
+  --     path (sessions emits session_end on shutdown via the lifecycle
+  --     bus, NOT through resume()) and for test driveability.
+  --     Idempotent: the work is safe to run twice (state-clear of
+  --     already-empty tables, replay_mode set to its current value).
+  --
+  -- The lifecycle of `replay_mode` and per-session bookkeeping:
+  --
+  --   session_end  → cancel in-flight runs, drop chat-id bookkeeping,
+  --                   broadcast `chat.reset` so the provider drops its
+  --                   `Chats` map and the TUI clears the transcript.
+  --   session_start → set `replay_mode = true` so the reasoner-graph
+  --                   `from_plugin` transform drops envelopes that
+  --                   reasoner-graph emits in reaction to replayed
+  --                   bus traffic (the graph already ran in the
+  --                   original session — re-dispatching would duplicate
+  --                   every side effect).
   --   resume_done  → flip `replay_mode = false`; the orchestrator is
   --                   live again and ready to accept the next submit.
-  if nefor.bus and nefor.bus.on_event then
-    -- session_end fires only on a resume swap (and on shutdown — which
-    -- we ignore here, the process is going away). It's the signal that
-    -- the next session_start belongs to a different session id and any
-    -- subsequent envelopes through resume_done are replays. We use it
-    -- as the "expect replay" gate: the next session_start that follows
-    -- enables replay_mode.
-    local expecting_replay = false
+  --
+  -- Boot session_start (fired by `sessions.init()`, not via resume())
+  -- only reaches the bus subscriber, never the sync hook. The bus
+  -- subscriber uses an `expecting_replay` flag — set by session_end —
+  -- to distinguish boot from resume. Sync hooks have no analog because
+  -- they only fire from `resume()` to begin with.
+  local expecting_replay = false
 
+  local function teardown_for_session_end(_session_id)
+    -- Cancel any in-flight orchestrator run on the reasoner-graph side
+    -- and drop sub-graph bookkeeping. Mirrors cancel_all() but without
+    -- the user-visible "[interrupted: ...]" message — session swaps are
+    -- silent at the UX layer. Idempotent on already-cleared state.
+    if current_run_id ~= nil then
+      emit("reasoner-graph", { kind = "reasoner-graph.graph.cancel", run_id = current_run_id })
+      current_run_id = nil
+    end
+    for run_id, _ in pairs(pending_runs) do
+      emit("reasoner-graph", { kind = "reasoner-graph.graph.cancel", run_id = run_id })
+    end
+    pending_runs       = {}
+    pending_dispatches = {}
+    pending            = {}
+    chat_id_to_key     = {}
+    chat_id_stream_visible = {}
+    tool_id_to_key     = {}
+    current_state      = nil
+    deferred_queue     = {}
+    -- Broadcast chat.reset so the provider's Chats map clears and the
+    -- TUI transcript empties. Provider's `<prefix>.reset` translation
+    -- already exists in for_provider's outer_to.
+    emit(nil, { kind = "chat.reset" })
+    expecting_replay = true
+    nefor.log.info("agentic_workflow: sessions.session_end → state cleared", {})
+  end
+
+  local function enter_replay_mode(_session_id)
+    -- Idempotent. Symmetric with the bus path's expecting_replay gate:
+    -- inside resume(), session_end's hook always fires first, so by the
+    -- time we get here on a resume swap the gate is set. Boot path
+    -- never hits this hook (boot doesn't go through resume()).
+    if not replay_mode then
+      replay_mode = true
+      nefor.log.info("agentic_workflow: sessions.session_start (resume) → replay_mode=true", {})
+    end
+  end
+
+  local function leave_replay_mode(_session_id)
+    if replay_mode then
+      replay_mode = false
+      nefor.log.info("agentic_workflow: sessions.resume_done → replay_mode=false", {})
+    end
+  end
+
+  -- Synchronous hooks: production resume path. These run BEFORE the
+  -- corresponding control-event broadcasts, closing the one-tick leak
+  -- window between session_start broadcast and the bus subscriber's
+  -- next-tick fire. `pcall(require)` so a unit-test harness without
+  -- starter/sessions.lua on the package path doesn't fail setup; the
+  -- bus subscribers below still cover those harnesses.
+  local sessions_ok, sessions_mod = pcall(require, "sessions")
+  if sessions_ok and type(sessions_mod) == "table"
+     and type(sessions_mod.on_resume_phase) == "function" then
+    sessions_mod.on_resume_phase("session_end",   teardown_for_session_end)
+    sessions_mod.on_resume_phase("session_start", enter_replay_mode)
+    sessions_mod.on_resume_phase("resume_done",   leave_replay_mode)
+  end
+
+  -- Bus subscribers: shutdown path + test compatibility. The work is
+  -- idempotent so double-firing (sync hook + bus subscriber) is safe.
+  if nefor.bus and nefor.bus.on_event then
     nefor.bus.on_event("sessions.session_end", function(_entry)
-      -- Cancel any in-flight orchestrator run on the reasoner-graph side
-      -- and drop sub-graph bookkeeping. Mirrors cancel_all() but without
-      -- the user-visible "[interrupted: ...]" message — session swaps
-      -- are silent at the UX layer.
-      if current_run_id ~= nil then
-        emit("reasoner-graph", { kind = "reasoner-graph.graph.cancel", run_id = current_run_id })
-        current_run_id = nil
-      end
-      for run_id, _ in pairs(pending_runs) do
-        emit("reasoner-graph", { kind = "reasoner-graph.graph.cancel", run_id = run_id })
-      end
-      pending_runs       = {}
-      pending_dispatches = {}
-      pending            = {}
-      chat_id_to_key     = {}
-      chat_id_stream_visible = {}
-      tool_id_to_key     = {}
-      current_state      = nil
-      deferred_queue     = {}
-      -- Broadcast chat.reset so the provider's Chats map clears and the
-      -- TUI transcript empties. Provider's `<prefix>.reset` translation
-      -- already exists in for_provider's outer_to.
-      emit(nil, { kind = "chat.reset" })
-      expecting_replay = true
-      nefor.log.info("agentic_workflow: sessions.session_end → state cleared", {})
+      teardown_for_session_end(nil)
     end)
 
     nefor.bus.on_event("sessions.session_start", function(_entry)
-      -- session_start fires twice in a session's lifetime: once at boot
-      -- (fresh, no replay coming) and once after a resume swap (replay
-      -- about to begin). Boot has no preceding session_end, so
-      -- expecting_replay is false and we leave replay_mode off.
-      -- Resume's session_start follows session_end, so we enter replay
-      -- mode and wait for resume_done to lift it.
+      -- Boot session_start has no preceding session_end so
+      -- expecting_replay is false → leave replay_mode off. Resume's
+      -- session_start follows session_end (sync OR bus path) so the
+      -- gate is set.
       if expecting_replay then
-        replay_mode = true
+        enter_replay_mode(nil)
         expecting_replay = false
-        nefor.log.info("agentic_workflow: sessions.session_start (resume) → replay_mode=true", {})
       else
         nefor.log.info("agentic_workflow: sessions.session_start (boot) → live", {})
       end
     end)
 
     nefor.bus.on_event("sessions.resume_done", function(_entry)
-      replay_mode = false
-      nefor.log.info("agentic_workflow: sessions.resume_done → replay_mode=false", {})
+      leave_replay_mode(nil)
     end)
   end
 end
