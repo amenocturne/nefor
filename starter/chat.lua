@@ -2275,12 +2275,20 @@ local function dag_node_dispatched(state, run_id, node_id, reasoner, now_ms)
     }
     local nodes = {}
     for k, v in pairs(run.nodes or {}) do nodes[k] = v end
-    nodes[node_id] = {
-      reasoner = reasoner or "",
-      status = "running",
-      started_at_ms = now_ms,
-      finished_at_ms = nil,
-    }
+    -- Guard against out-of-order delivery: if `graph.node_result` arrived
+    -- BEFORE this dispatch envelope, the orphan-result path already
+    -- synthesized a `done`/`error` entry for this node. Overwriting it
+    -- with `running` here makes the node tick forever — no further
+    -- result will come to flip it back. Preserve the terminal state.
+    local existing = nodes[node_id]
+    if not (existing and (existing.status == "done" or existing.status == "error")) then
+      nodes[node_id] = {
+        reasoner = reasoner or "",
+        status = "running",
+        started_at_ms = now_ms,
+        finished_at_ms = nil,
+      }
+    end
     return shallow_merge(run, { nodes = nodes })
   end)
 end
