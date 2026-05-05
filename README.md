@@ -1,46 +1,73 @@
 # nefor
 
-> do whatever you want.
+> Agent harness substrate.
 
-Rust rewrite of the nefor agent harness. NCP-speaking engine + ratatui terminal frontend + Claude-Code wrapper, all as separate processes.
+A pure string-bus engine plus separate-process plugins (NCP v0.1 over JSON-line stdio), with Lua composition wiring it all together. Build chat surfaces, providers, schedulers, and tools as plugins in any language.
 
-**Status: M2 shipped.** End-to-end Claude chat in a TUI, composed from three plugins spoken over NCP v0.1. Plugin management, permission-gate, and DAG orchestration are post-MVP.
+**Status: Stage 1 — initial public release.** End-to-end chat works against any OpenAI-compatible provider (Ollama by default), with a declarative TUI, a typed reasoner-graph scheduler, tool-gate permissioning, and Lua-side session persistence.
 
+## Install
+
+```sh
+brew install amenocturne/tap/nefor
+```
+
+Then scaffold a config in your XDG config dir:
+
+```sh
+mkdir -p ~/.config/nefor
+cp $(brew --prefix)/share/nefor/starter/*.lua ~/.config/nefor/
+```
+
+The starter config talks to `localhost:11434` (Ollama default). Edit `~/.config/nefor/init.lua` to change provider / model.
 
 ## Quick start
 
 ```sh
-just setup   # cargo fetch
-just run     # launch engine + default config
-just test    # workspace tests (hermetic)
+nefor
 ```
 
-Manual smoke against the local Ollama provider (default starter config):
+Launches the chat TUI. `Ctrl+C` or `/quit` exits; `/new` clears the transcript.
+
+## Architecture
+
+The engine is a pure string-layer event bus: it reads plugin stdin, stamps `{origin, ts}`, persists to a session log, and invokes a required Lua `dispatch` hook. NCP v0.1 (handshake, broadcast, replay, errors) lives entirely in Lua under `starter/ncp.lua`. Plugins are independent OS processes communicating via JSON lines.
+
+### Layout
+
+- `crates/nefor/` — engine binary (NCP broker + mlua host).
+- `crates/nefor-protocol/` — NCP v0.1 envelope + system-body types.
+- `crates/nefor-combinators/` — in-process algebra library.
+- `plugins/nefor-tui/` — declarative TUI plugin: layout primitives + reconciler + line-diff renderer + Lua VM. Hosts the chat surface as a Lua composition.
+- `plugins/openai-provider/` — OpenAI-compatible HTTP provider.
+- `plugins/reasoner-graph/` — typed graph scheduler with cycles, per-firing lifecycle, fanout combinators.
+- `plugins/tool-gate/`, `plugins/basic-tools/` — tool advertisement and permission gate; bundled tools.
+- `plugins/generic-provider/`, `plugins/generic-tool/` — passive type-registry hubs.
+- `plugins/nefor-combinators/` — typed combinator registry plugin.
+- `plugins/mock-plugin/` — scriptable NCP actor for integration tests.
+- `starter/init.lua`, `starter/chat.lua`, `starter/ncp.lua` — default composition, chat surface, NCP-in-Lua.
+
+### Paths
+
+`nefor` resolves config and data via XDG-style env vars:
+
+| Env var            | Default                          | Holds       |
+|--------------------|----------------------------------|-------------|
+| `NEFOR_CONFIG_DIR` | `$XDG_CONFIG_HOME/nefor`         | `init.lua`  |
+| `NEFOR_DATA_DIR`   | `$XDG_DATA_HOME/nefor`           | sessions    |
+| `NEFOR_PLUGIN_DIR` | `$NEFOR_DATA_DIR/plugins`        | binaries    |
+
+CLI flags (`--config`, `--data-dir`, `--plugin-dir`) override env vars.
+
+## Build from source
 
 ```sh
-cargo build --workspace
-NEFOR_PLUGIN_DIR=$PWD/plugins cargo run --bin nefor -- --config ./starter
+just setup
+just run     # debug build, in-tree dev mode
+just test
+just lint
 ```
 
-Ctrl+C (or `/quit` in chat) exits cleanly; `/new` clears the transcript and starts a new chat.
+## License
 
-## Layout
-
-- `crates/nefor-combinators/` — pure Rust substrate (Context, Reasoner, combinators).
-- `crates/nefor-protocol/` — NCP v0.1 types + parsers.
-- `crates/nefor/` — engine binary: NCP broker + mlua host.
-- `plugins/nefor-tui/` — declarative TUI plugin (Rust): primitives + reconciler + line-diff renderer + Lua VM. The chat surface itself is Lua composition (`starter/chat.lua`).
-- `plugins/mock-plugin/` — Claude CLI wrapper (Rust) emitting `cc.*` events (opt-in).
-- `plugins/openai-provider/` — OpenAI-compatible HTTP provider (Ollama, real OpenAI, etc).
-- `plugins/reasoner-graph/` — orchestrator graph engine.
-- `plugins/tool-gate/` — tool advertisement + permission gate.
-- `plugins/basic-tools/` — bundled tools (read_file, etc).
-- `plugins/mock-plugin/` — scriptable peer for integration tests.
-- `starter/init.lua` — default engine composition. Spawns the orchestrator stack + nefor-tui with chat.lua.
-- `starter/chat.lua` — chat surface as a ~280-LOC Lua composition over `tui.*` primitives.
-- `cli-config/init.lua` — same engine, no UI: `nefor plugin agentic-cli "<prompt>"`.
-
-## Testing
-
-- `cargo test --workspace` — all unit + crate tests. Fast, hermetic: no network, no `claude`, no TTY.
-- Manual TTY smoke (above) drives the real `claude` CLI end-to-end; needs `claude` on `$PATH` and makes live API calls.
+MIT — see `LICENSE`.

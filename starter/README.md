@@ -1,56 +1,44 @@
 # starter/
 
-Reference config for the nefor engine. This is also where NCP v0.1 protocol
-semantics live — Slice 2 I4 moved the handshake / broadcast / replay logic out
-of the Rust engine and into Lua. The engine is now a pure string-layer event
-bus; everything NCP-shaped happens here.
+Reference config for the nefor engine. NCP v0.1 protocol semantics live here in Lua — the Rust engine is a pure string-bus.
 
 ## Layout
 
-- `init.lua` — top-level composition. Sets `package.path`, defines the global
-  `dispatch` hook (delegates to `ncp.dispatch`), and registers plugins via
-  `nefor.plugins.spawn`. Edit this file to change which plugins run.
-- `ncp.lua` — NCP v0.1 protocol module. Handles `ready` / `ready_ok`,
-  broadcast-minus-sender, replay-on-attach, and `error` emission. JSON
-  encode/decode go through the engine-provided `nefor.json` (serde_json
-  bridged via mlua) — no pure-Lua JSON dependency.
-- `ncp_test.lua` — Lua unit tests for `ncp.lua`. Driven by
-  `crates/nefor/tests/starter_ncp_test.rs`; not run directly.
+- `init.lua` — top-level composition. Sets `package.path`, defines the `dispatch` hook (delegates to `ncp.dispatch`), spawns plugins via `nefor.plugins.spawn`, and wires the orchestration graph.
+- `ncp.lua` — NCP v0.1 protocol module: handshake (`ready` / `ready_ok`), broadcast-minus-sender, replay-on-attach, error emission. JSON via `nefor.json` (serde_json through mlua).
+- `agentic_workflow.lua` — orchestration glue: per-edge transform factories, reasoner-type handlers, `spawn_graph` tool, chat-input intake.
+- `sessions.lua` — boot / shutdown / resume + jsonl persistence over the bus.
+- `chat.lua` — chat surface as a Lua composition over `tui.*` primitives.
+- `agentic_cli.lua` — virtual `agentic-cli` plugin for `nefor plugin agentic-cli "<prompt>"`.
+- `ncp_test.lua`, `agentic_workflow_test.lua` — Lua unit tests, driven by `crates/nefor/tests/starter_*_test.rs`.
 
 ## Run
 
-From the monorepo root:
+In-tree (debug build):
 
-```
-NEFOR_PLUGIN_DIR=$PWD/plugins cargo run --bin nefor -- --config ./starter
+```sh
+just run
 ```
 
-The default composition spawns `mock-plugin`, `nefor-chat`, `nefor-tui`, and
-`nefor-combinators`. Build them first:
+Equivalent to:
 
+```sh
+cargo build --workspace
+NEFOR_CONFIG_DIR=$PWD/starter NEFOR_PLUGIN_DIR=$PWD/target/debug \
+  RUST_LOG=debug cargo run --bin nefor
 ```
-cargo build -p mock-plugin -p nefor-chat -p nefor-tui -p nefor-combinators-plugin
+
+Installed (after `brew install amenocturne/tap/nefor`):
+
+```sh
+mkdir -p ~/.config/nefor
+cp $(brew --prefix)/share/nefor/starter/*.lua ~/.config/nefor/
+nefor
 ```
 
 ## Customize
 
-- **Add/remove plugins**: edit the `nefor.plugins.spawn { ... }` block at the
-  end of `init.lua`.
-- **Resume a prior session**: emit `sessions.resume_request { session_id =
-  "<uuid>" }` on the bus (the chat slash-command surface does this for you).
-  `starter/sessions.lua` handles the rest in-process. The legacy
-  `nefor.parent_session` engine handoff has been removed.
-- **Change protocol behavior**: `ncp.lua` is where handshake, broadcast,
-  replay, and error rules live. Swap it for your own module if you need a
-  non-standard dispatch policy.
-
-## Known gaps (next slice)
-
-- No graceful `shutdown` system-message emission. The engine still cascades
-  process shutdown when any plugin exits; plugins observe EOF on their stdin
-  and exit. Spec §5.3 `shutdown` message emission would require an
-  `nefor.engine.on_shutdown(fn)` binding and is deferred.
-- Per-plugin replay protocol — declarative replay annotation per plugin.
-  Currently every late-attaching plugin sees `replay-on-attach` of all prior
-  events; some plugins want a coalesced "we're back" signal instead. Tracked
-  as D-21a-deferred.
+- **Add/remove plugins**: edit the `ncp.spawn { ... }` blocks in `init.lua`.
+- **Resume a prior session**: emit `sessions.resume_request { session_id = "<uuid>" }` on the bus (the chat slash-command surface does this for you). `sessions.lua` handles the rest in-process.
+- **Change protocol behavior**: `ncp.lua` is where handshake, broadcast, replay, and error rules live.
+- **Switch provider/model**: edit the `PROVIDER_NAME` / `PROVIDER_MODEL` block in `init.lua`. `PROVIDER_MODEL = nil` works but the chat surface won't be useful until you set one.

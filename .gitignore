@@ -11,5 +11,4 @@ Cargo.lock.bak
 .claude/
 
 # Runtime logs
-starter/nefor.log
-nefor.log
+*.log
