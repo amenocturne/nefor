@@ -288,8 +288,16 @@ impl<'a> Walker<'a> {
             }
             TagEnd::BlockQuote(_) => {
                 self.blockquote_depth = self.blockquote_depth.saturating_sub(1);
-                self.emit_str("\n", Style::default());
-                self.at_line_start = true;
+                // The inner paragraph already emitted its terminating
+                // `\n`; emitting another here would push a blank line
+                // between this block and the next, fighting the
+                // "lead with separator, never follow" rule that
+                // `ensure_block_separator` enforces. Only finish the
+                // line if for some reason we're mid-line.
+                if !self.at_line_start {
+                    self.emit_str("\n", Style::default());
+                    self.at_line_start = true;
+                }
             }
             TagEnd::CodeBlock => {
                 self.in_code_block = false;
@@ -1142,6 +1150,63 @@ mod tests {
             s.contains("│ Tool      │ Purpose     │\n"),
             "unconstrained header should keep natural widths, got: {s:?}"
         );
+    }
+
+    #[test]
+    fn block_elements_have_consistent_leading_newline() {
+        // Every block boundary must carry exactly `\n\n` before it (the
+        // first block has no leading separator). Render a doc with one
+        // of every block kind in sequence and check each transition has
+        // exactly one blank line — no missing separators, no doubled
+        // trailing newlines from a previous block.
+        let src = "\
+# Header
+
+para text
+
+| a | b |
+| --- | --- |
+| 1 | 2 |
+
+```
+code
+```
+
+> quoted
+
+- list item
+
+---
+";
+        let r = super::render_to_styled_chars(src, None, None);
+        let s: String = r.iter().map(|c| c.ch).collect();
+        // Boundary phrase pairs: the prefix (last few chars of preceding
+        // block) and the start glyph of the next block. Each pair must
+        // appear with `\n\n` (not more) somewhere between them.
+        let boundaries = [
+            ("Header", "para text"),
+            ("para text", "│"),     // paragraph → table
+            ("─┤", "code"),          // table-divider → code (header divider just before code body)
+            ("code", "▎"),           // code block → blockquote
+            ("quoted", "-"),         // blockquote → list
+            ("list item", "---"),    // list → horizontal rule
+        ];
+        for (a, b) in boundaries {
+            let ai = s.find(a).unwrap_or_else(|| panic!("prefix {a:?} not found in {s:?}"));
+            let after_a = &s[ai + a.len()..];
+            let bi_rel = after_a
+                .find(b)
+                .unwrap_or_else(|| panic!("suffix {b:?} not found after {a:?} in {s:?}"));
+            let between = &after_a[..bi_rel];
+            assert!(
+                between.contains("\n\n"),
+                "expected `\\n\\n` between {a:?} and {b:?}, got between={between:?}"
+            );
+            assert!(
+                !between.contains("\n\n\n"),
+                "unexpected triple-newline between {a:?} and {b:?}, got between={between:?}"
+            );
+        }
     }
 
     #[test]
