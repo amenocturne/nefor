@@ -282,7 +282,7 @@ fn paint_spans(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
 // ── Markdown ─────────────────────────────────────────────────────────────
 
 fn layout_markdown(inst: &mut WidgetInstance, c: Constraints) -> Size {
-    let chars = render_markdown_chars(inst);
+    let chars = render_markdown_chars(inst, c.max_width);
     let wrap = match &inst.last_desc {
         WidgetDescription::Markdown { wrap, .. } => *wrap,
         _ => WrapMode::Word,
@@ -292,7 +292,7 @@ fn layout_markdown(inst: &mut WidgetInstance, c: Constraints) -> Size {
 }
 
 fn paint_markdown(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
-    let chars = render_markdown_chars(inst);
+    let chars = render_markdown_chars(inst, rect.width);
     let wrap = match &inst.last_desc {
         WidgetDescription::Markdown { wrap, .. } => *wrap,
         _ => WrapMode::Word,
@@ -301,10 +301,18 @@ fn paint_markdown(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) 
     paint_styled_rows(&rows, rect, out);
 }
 
-fn render_markdown_chars(inst: &WidgetInstance) -> Vec<StyledChar> {
+fn render_markdown_chars(inst: &WidgetInstance, available_width: u16) -> Vec<StyledChar> {
     match &inst.last_desc {
         WidgetDescription::Markdown { source, theme, .. } => {
-            crate::markdown::render_to_styled_chars(source, theme.as_ref())
+            // 0 = unconstrained (loose constraints with no parent budget);
+            // pass `None` so the table renderer falls back to natural widths
+            // rather than collapsing every column to the floor.
+            let aw = if available_width == 0 {
+                None
+            } else {
+                Some(available_width as usize)
+            };
+            crate::markdown::render_to_styled_chars(source, theme.as_ref(), aw)
         }
         _ => Vec::new(),
     }

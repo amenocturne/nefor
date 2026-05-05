@@ -23,8 +23,17 @@ use crate::layout::StyledChar;
 /// caller's `theme`. `theme = None` produces neutral output (no styles
 /// applied anywhere). The result includes embedded `\n` characters
 /// between blocks; the layout pass then wraps each line.
-pub fn render_to_styled_chars(source: &str, theme: Option<&MarkdownTheme>) -> Vec<StyledChar> {
-    let mut walker = Walker::new(theme);
+///
+/// `available_width` is the column budget the caller has for table
+/// rendering. When `Some(w)`, tables proportionally shrink columns so
+/// the assembled grid fits within `w` visual columns. When `None`, the
+/// table renderer falls back to its natural per-column widths (no cap).
+pub fn render_to_styled_chars(
+    source: &str,
+    theme: Option<&MarkdownTheme>,
+    available_width: Option<usize>,
+) -> Vec<StyledChar> {
+    let mut walker = Walker::new(theme, available_width);
     let parser = Parser::new_ext(source, Options::all());
     for ev in parser {
         walker.handle(ev);
@@ -45,6 +54,9 @@ struct InlineStyleStack {
 /// can be emitted at block boundaries.
 struct Walker<'a> {
     theme: Option<&'a MarkdownTheme>,
+    /// Column budget for tables. `None` = render at natural width;
+    /// `Some(w)` = proportionally shrink to fit `w` columns.
+    available_width: Option<usize>,
     out: Vec<StyledChar>,
     inline: InlineStyleStack,
     /// Current heading level if inside a heading start..end pair.
@@ -97,9 +109,10 @@ struct ListContext {
 }
 
 impl<'a> Walker<'a> {
-    fn new(theme: Option<&'a MarkdownTheme>) -> Self {
+    fn new(theme: Option<&'a MarkdownTheme>, available_width: Option<usize>) -> Self {
         Walker {
             theme,
+            available_width,
             out: Vec::new(),
             inline: InlineStyleStack::default(),
             heading_level: None,
@@ -433,13 +446,17 @@ impl<'a> Walker<'a> {
         }
     }
 
-    /// Per-column max width before we wrap. Generous enough that most
-    /// real-world cells (short labels, one-sentence descriptions) fit on
-    /// one line; tight enough that even a 4-column table stays under a
-    /// typical 80-column terminal once you add ` │ ` separators. If this
-    /// turns out to be wrong we'll plumb the actual layout width through
-    /// the walker.
-    const MAX_COL_WIDTH: usize = 40;
+    /// Per-column hard cap. Set high — the real fit-to-width discipline
+    /// is the proportional-shrink pass in `flush_table`, not this cap.
+    /// We keep a ceiling only so a single absurdly long cell (e.g., a
+    /// pasted URL) can't blow `col_widths` to thousands of columns and
+    /// force the shrink to operate on garbage scale.
+    const MAX_COL_WIDTH: usize = 200;
+
+    /// Floor for any single column under the proportional-shrink pass.
+    /// Below this, cells become unreadable (mid-word breaks every line);
+    /// matches what Glamour / Lipgloss use as a lower bound.
+    const MIN_COL_WIDTH: usize = 4;
 
     /// Render the accumulated table into `self.out` with padded columns,
     /// a header divider, and per-cell smart wrapping. Called once at
@@ -467,8 +484,8 @@ impl<'a> Walker<'a> {
         }
 
         // Natural width per column = the widest cell text in that column,
-        // capped by MAX_COL_WIDTH so a single huge cell can't blow up the
-        // table. Cells longer than the cap are wrapped below.
+        // capped by MAX_COL_WIDTH so one absurd cell can't blow scale.
+        // Cells wider than their final column wrap.
         let mut col_widths = vec![0usize; num_cols];
         for row in &state.rows {
             for (i, cell) in row.iter().enumerate() {
@@ -480,6 +497,20 @@ impl<'a> Walker<'a> {
         }
         for w in col_widths.iter_mut() {
             *w = (*w).clamp(1, Self::MAX_COL_WIDTH);
+        }
+
+        // Fit-to-width: when the caller advertised an `available_width`
+        // and the natural table is wider, shrink columns proportionally
+        // to their natural size (wider columns absorb more shrink). Each
+        // column is floored at MIN_COL_WIDTH so a tiny budget can't
+        // collapse columns to zero. Visual width =
+        //   1 (left │) + Σ(1 + col + 2) = 1 + 3·num_cols + Σ col_widths
+        let overhead = 1 + 3 * num_cols;
+        if let Some(budget) = self.available_width {
+            let natural_total: usize = col_widths.iter().sum::<usize>() + overhead;
+            if natural_total > budget {
+                shrink_columns_proportionally(&mut col_widths, budget, overhead);
+            }
         }
 
         // Pre-wrap every cell to its column width. `wrap_cell_lines`
@@ -556,6 +587,76 @@ impl<'a> Walker<'a> {
 
 fn cell_natural_width(cell: &[StyledChar]) -> usize {
     cell.iter().map(|c| char_display_width(c.ch)).sum()
+}
+
+/// Shrink `col_widths` in place so `Σ widths + overhead ≤ budget`,
+/// distributing the deficit proportionally to each column's current
+/// width (so wider columns absorb more shrink than narrow ones). Each
+/// column is floored at [`Walker::MIN_COL_WIDTH`].
+///
+/// Algorithm: when the unfrozen columns sum and budget allow it, scale
+/// every unfrozen column by `available / unfrozen_total`. Any column
+/// that would land below the floor is "frozen" at the floor and we
+/// repeat the pass until either everything fits or every column is
+/// frozen at the floor (in which case the table is wider than the
+/// budget can support — we accept the overflow rather than emit a
+/// degenerate zero-width grid).
+fn shrink_columns_proportionally(col_widths: &mut [usize], budget: usize, overhead: usize) {
+    let n = col_widths.len();
+    if n == 0 {
+        return;
+    }
+    let floor = Walker::MIN_COL_WIDTH;
+    let min_total = overhead + n * floor;
+    let target_content = budget.saturating_sub(overhead);
+    if budget <= min_total {
+        // Even all-floor doesn't fit — clamp to floor and accept overflow.
+        for w in col_widths.iter_mut() {
+            *w = floor;
+        }
+        return;
+    }
+
+    let mut frozen = vec![false; n];
+    loop {
+        let mut unfrozen_total = 0usize;
+        let mut frozen_total = 0usize;
+        for (i, &w) in col_widths.iter().enumerate() {
+            if frozen[i] {
+                frozen_total += w;
+            } else {
+                unfrozen_total += w;
+            }
+        }
+        // Budget left for the unfrozen columns to share.
+        let unfrozen_budget = target_content.saturating_sub(frozen_total);
+        if unfrozen_total == 0 || unfrozen_total <= unfrozen_budget {
+            // Nothing to shrink.
+            return;
+        }
+
+        let mut any_newly_frozen = false;
+        let mut new_widths = col_widths.to_vec();
+        for (i, &w) in col_widths.iter().enumerate() {
+            if frozen[i] {
+                continue;
+            }
+            // Proportional share, rounded down. The leftover slack is
+            // tolerated — a few columns of unused budget beats overflow.
+            let scaled = w.saturating_mul(unfrozen_budget) / unfrozen_total.max(1);
+            if scaled < floor {
+                new_widths[i] = floor;
+                frozen[i] = true;
+                any_newly_frozen = true;
+            } else {
+                new_widths[i] = scaled.max(1);
+            }
+        }
+        col_widths.copy_from_slice(&new_widths);
+        if !any_newly_frozen {
+            return;
+        }
+    }
 }
 
 fn char_display_width(c: char) -> usize {
@@ -668,6 +769,16 @@ fn merge_style(base: Style, over: Style) -> Style {
 mod tests {
     use super::*;
     use crate::desc::Color;
+
+    /// Test shim: keeps the historical 2-arg call shape working. Most
+    /// tests don't care about the table-fit budget — pass `None` so the
+    /// renderer falls back to natural widths.
+    fn render_to_styled_chars(
+        source: &str,
+        theme: Option<&MarkdownTheme>,
+    ) -> Vec<StyledChar> {
+        super::render_to_styled_chars(source, theme, None)
+    }
 
     fn neutral_text(s: &str) -> Vec<StyledChar> {
         s.chars()
@@ -949,33 +1060,88 @@ mod tests {
     }
 
     #[test]
-    fn gfm_table_wraps_cells_that_exceed_column_cap() {
-        // A cell whose content is wider than MAX_COL_WIDTH (40) should
-        // wrap to multiple visual lines. The other column on the same
-        // logical row pads out blank so the table stays aligned.
+    fn gfm_table_wraps_cells_when_constrained_to_available_width() {
+        // Caller advertises an 80-col budget. A cell wider than the
+        // proportional share for its column wraps to multiple visual
+        // lines; the other column on the same logical row pads blank so
+        // the table stays aligned. No row exceeds the 80-col budget.
         let long = "the quick brown fox jumps over the lazy dog and then keeps on running for several more lines worth of words";
         let src = format!("| short | long |\n| --- | --- |\n| a | {long} |\n");
-        let r = render_to_styled_chars(&src, None);
+        let r = super::render_to_styled_chars(&src, None, Some(80));
         let s: String = r.iter().map(|c| c.ch).collect();
-        // Body row spans more than one visual line: count lines that
-        // start with `│ a ` (the short cell only appears on the first
-        // wrap line — subsequent lines have an empty short cell).
-        let blank_short_cell_lines = s
-            .lines()
-            .filter(|l| l.starts_with("│       │ ") && l.ends_with(" │"))
-            .count();
+        // Body row spans more than one visual line: at least one row
+        // must have its short-cell column padded blank as a
+        // wrap-continuation. Find a `│ a` line and confirm at least one
+        // following row has the short-cell column entirely whitespace.
+        let lines: Vec<&str> = s.lines().collect();
+        let body_row = lines
+            .iter()
+            .position(|l| l.starts_with("│ a"))
+            .expect("body row with short cell `a` should exist");
+        let continuation = lines
+            .get(body_row + 1)
+            .copied()
+            .unwrap_or_default();
+        // Continuation: starts with `│`, then whitespace-only short
+        // column, then `│`, then more content.
+        let short_col_blank = continuation
+            .strip_prefix('│')
+            .and_then(|tail| tail.find('│').map(|idx| (tail, idx)))
+            .map(|(tail, idx)| tail[..idx].chars().all(char::is_whitespace))
+            .unwrap_or(false);
         assert!(
-            blank_short_cell_lines >= 1,
-            "expected at least one wrap-continuation line with the short cell padded blank, got: {s:?}"
+            short_col_blank,
+            "expected wrap-continuation row with blank short cell, got lines: {lines:?}"
         );
-        // No row ever exceeds: 1 (left │) + 1 (pad) + 5 (short col) + 1 (pad) + 1 (│)
-        // + 1 (pad) + 40 (long col cap) + 1 (pad) + 1 (right │) = 52 cols.
         for line in s.lines() {
-            if line.starts_with('│') {
+            if line.starts_with('│') || line.starts_with('├') {
                 let w: usize = line.chars().map(char_display_width).sum();
-                assert!(w <= 52, "row {line:?} exceeded expected width 52, was {w}");
+                assert!(w <= 80, "row {line:?} exceeded budget 80, was {w}");
             }
         }
+    }
+
+    #[test]
+    fn table_shrinks_proportionally_to_fit_available_width() {
+        // 5-column reference table modelled on the markdown screenshot
+        // bug: per-column natural widths sum well above 80 cols once you
+        // add separators. Caller advertises an 80-col budget — the
+        // renderer must shrink columns proportionally to fit.
+        let src = "\
+| Tool | Purpose | Notes | Owner | Status |
+| --- | --- | --- | --- | --- |
+| read_file | reads file contents from disk | safe and idempotent | platform | stable |
+| write_file | writes contents to disk path | mutating side effects | platform | stable |
+| run_shell | runs a shell command on host | dangerous, sandboxed only | infra | beta |
+";
+        let r = super::render_to_styled_chars(src, None, Some(80));
+        let s: String = r.iter().map(|c| c.ch).collect();
+        for line in s.lines() {
+            if line.starts_with('│') || line.starts_with('├') {
+                let w: usize = line.chars().map(char_display_width).sum();
+                assert!(
+                    w <= 80,
+                    "row exceeded available_width 80: width={w} line={line:?}"
+                );
+            }
+        }
+        // And the table must actually appear (not collapse to nothing).
+        assert!(s.contains("│"), "table renderer produced no border glyphs");
+        assert!(s.contains("├"), "table renderer produced no header divider");
+    }
+
+    #[test]
+    fn table_falls_back_to_natural_width_when_unconstrained() {
+        // No available_width → no proportional shrink; columns sit at
+        // their natural width. The header row should match the historical
+        // tight-padding output, confirming the no-cap behaviour.
+        let src = "| Tool | Purpose |\n| --- | --- |\n| read_file | reads files |\n";
+        let r = super::render_to_styled_chars(src, None, None);
+        let s: String = r.iter().map(|c| c.ch).collect();
+        assert!(
+            s.contains("│ Tool      │ Purpose     │\n"),
+            "unconstrained header should keep natural widths, got: {s:?}"
+        );
     }
 
     #[test]
