@@ -1867,6 +1867,53 @@ end
 -- view
 ------------------------------------------------------------------------
 
+-- Welcome-banner copy painted on a truly fresh chat surface (no entries,
+-- no in-flight turn). Disappears the instant the user submits — the
+-- entries-non-empty branch below skips it.
+--
+-- To disable: set WELCOME_BANNER_LINES to {} (empty list). To customize:
+-- edit the strings; each entry is one centered line. Style is shared
+-- with other dim chrome via STYLE.status_dim, so palette tweaks land
+-- here automatically.
+local WELCOME_BANNER_LINES = {
+  "Welcome to the starter config!",
+  "",
+  "This is your average agentic workflow, but nefor can do much more than that.",
+  "",
+  "Experiment and do whatever you want!",
+}
+
+local function welcome_banner()
+  if #WELCOME_BANNER_LINES == 0 then return nil end
+  local rows = {}
+  for i, line in ipairs(WELCOME_BANNER_LINES) do
+    -- Each line: a 1-row-tall `tui.align{center}` so the line centers
+    -- horizontally within the chat column. The height clamp is
+    -- load-bearing — without it `tui.align` greedily takes the
+    -- available height (it fills its slot at parent max), which would
+    -- collapse subsequent rows to zero height. With max_height=1 each
+    -- align resolves to exactly one row of centered content.
+    rows[i] = tui.constrained {
+      max_height = 1,
+      child = tui.align {
+        alignment = "center",
+        child = tui.text {
+          content = line,
+          style   = STYLE.status_dim,
+          wrap    = "none",
+        },
+      },
+    }
+  end
+  -- Outer wrapper centers the block vertically within the transcript
+  -- pane: the parent gives us the full available height and `tui.align`
+  -- parks the fixed-height row stack in the middle.
+  return tui.align {
+    alignment = "center",
+    child = tui.column { gap = 0, children = rows },
+  }
+end
+
 local function transcript(state)
   local entries = state.entries or {}
   local widgets = {}
@@ -1876,7 +1923,7 @@ local function transcript(state)
   -- Append thinking indicator inline at the bottom when pending.
   local think = thinking_widget(state)
   if think then widgets[#widgets + 1] = think end
-  return tui.scrollable {
+  local scroll = tui.scrollable {
     key       = "transcript",
     stick_to  = "end",
     scrollbar = "auto",
@@ -1887,6 +1934,25 @@ local function transcript(state)
       child = tui.column { gap = 1, children = widgets },
     },
   }
+  -- Fresh surface (no entries, not currently streaming a turn): paint
+  -- the welcome banner OVER the empty scrollable in a stack. We keep
+  -- the scrollable mounted so `tui.scroll_position("transcript")`
+  -- queries (and any tests / shortcuts that use them) keep resolving —
+  -- the banner is purely visual chrome on top of an empty viewport.
+  --
+  -- Replay-mode opt-out: between sessions.session_start (which clears
+  -- entries on resume) and the first replayed chat.message.append, the
+  -- transcript is briefly empty AND we're rebuilding. Painting the
+  -- banner here would flash the welcome copy in the middle of a
+  -- resume. The replay_mode gate suppresses it for that window.
+  if #entries == 0 and state.in_flight == nil
+     and not state.pending and not state.replay_mode then
+    local banner = welcome_banner()
+    if banner ~= nil then
+      return tui.stack { children = { scroll, banner } }
+    end
+  end
+  return scroll
 end
 
 -- Keep the engine's render loop alive at ~1Hz while any per-second
