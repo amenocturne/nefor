@@ -652,7 +652,19 @@ function M.resume(target_session_id)
   end
   current_session_id   = target_session_id
   current_session_path = new_path
-  current_session_was_resumed = true
+  -- Decide whether this is a true resume (file already exists with
+  -- prior content) or a fresh-mint via `M.new()` (file doesn't exist
+  -- yet — `open_session_file` will create it). Only true resumes
+  -- should be guarded against prune-on-swap.
+  local pre_existing = false
+  if new_path ~= nil then
+    local probe = io.open(new_path, "r")
+    if probe ~= nil then
+      probe:close()
+      pre_existing = true
+    end
+  end
+  current_session_was_resumed = pre_existing
   if new_path ~= nil then
     local fh, err = open_session_file(new_path, target_session_id)
     if fh == nil and nefor.log and nefor.log.error then
