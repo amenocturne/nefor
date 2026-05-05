@@ -54,6 +54,7 @@ package.path = table.concat({
 
 local ncp      = require("ncp")
 local sessions = require("sessions")
+local cfg      = require("config").active
 
 -- Forward the engine's `current_log` to ncp.dispatch. The engine is
 -- session-blind: cross-run resume is owned by `starter/sessions.lua`,
@@ -127,46 +128,44 @@ ncp.spawn {
 }
 
 -------------------------------------------------------------------------
--- 4b. Provider — real openai-provider against Ollama, OR mock-plugin
+-- 4b. Provider — selected by config.lua (prod = openai-provider, test = mock).
 -------------------------------------------------------------------------
 --
--- USE_MOCK_PROVIDER=true swaps the live LLM for a deterministic mock.
--- The mock-plugin binary loads `starter/mock_provider.lua` and emits
--- the same `<name>.chat.{create,append,complete[.result]}` /
--- `<name>.stream.delta`/`<name>.stream.end` shape openai-provider
--- emits, with hardcoded canned responses for the smoke test prompt.
--- See `starter/mock_provider.lua` for the response selection logic.
+-- The `prod` table runs openai-provider against the configured base_url
+-- (Ollama by default). The `test` table runs mock-plugin loading
+-- `mock_provider.lua` for deterministic smoke / e2e tests. Both emit
+-- the same `<name>.chat.*` / `<name>.stream.*` envelope shape so the
+-- rest of the composition is provider-agnostic.
 --
--- For the real provider: one chat session per orchestrator instance;
--- agentic_workflow's reasoner-graph adapter calls
--- `<name>.chat.create / chat.append / chat.complete` directly. The
--- static_token=ollama-local trick unlocks openai-provider's auth gate
--- without a real key (required for local Ollama). Real remote providers
--- would supply an --api-key CLI arg.
-local USE_MOCK_PROVIDER = false
+-- The `static_token=ollama-local` trick on prod unlocks openai-provider's
+-- auth gate without a real key (required for local Ollama). Real remote
+-- providers would supply an --api-key CLI arg via provider.extra_args.
 
-local PROVIDER_NAME, PROVIDER_MODEL, provider_chain, provider_command
+local PROVIDER_NAME  = cfg.provider.name
+local PROVIDER_MODEL = cfg.provider.model
+local provider_chain, provider_command
 
-if USE_MOCK_PROVIDER then
-  PROVIDER_NAME  = "mock-plugin"
-  PROVIDER_MODEL = "mock-model"
+if cfg.plugins.spawn_mock then
   provider_chain = agentic_workflow.for_provider(PROVIDER_NAME)
   provider_command = {
     bin("mock-plugin"),
-    "--script", STARTER_ROOT .. "/mock_provider.lua",
+    "--script", STARTER_ROOT .. "/" .. cfg.provider.mock_script,
   }
 else
-  PROVIDER_NAME  = "ollama"
-  PROVIDER_MODEL = nil  -- set this to e.g. "qwen2.5:7b" to enable chat
-  provider_chain = agentic_workflow.for_provider(PROVIDER_NAME, { static_token = "ollama-local" })
+  provider_chain = agentic_workflow.for_provider(PROVIDER_NAME, {
+    static_token = cfg.provider.static_token,
+  })
   provider_command = {
     bin("openai-provider"),
     "--name",     PROVIDER_NAME,
-    "--base-url", "http://localhost:11434",
+    "--base-url", cfg.provider.base_url,
   }
   if PROVIDER_MODEL then
     table.insert(provider_command, "--model")
     table.insert(provider_command, PROVIDER_MODEL)
+  end
+  for _, a in ipairs(cfg.provider.extra_args or {}) do
+    table.insert(provider_command, a)
   end
 end
 
@@ -226,13 +225,17 @@ ncp.spawn {
 -- 4e. Tool gate + basic-tools + spawn_graph advertisement
 -------------------------------------------------------------------------
 
+local tool_gate_argv = { bin("tool-gate") }
+for _, t in ipairs(cfg.tool_gate.prompt_tools or {}) do
+  tool_gate_argv[#tool_gate_argv + 1] = "--prompt"
+  tool_gate_argv[#tool_gate_argv + 1] = t
+end
+tool_gate_argv[#tool_gate_argv + 1] = "--default"
+tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
+
 ncp.spawn {
   name        = "tool-gate",
-  command     = {
-    bin("tool-gate"),
-    "--prompt",  "read_file",
-    "--default", "prompt",
-  },
+  command     = tool_gate_argv,
   from_plugin = agentic_workflow.for_tool_gate("tool-gate").from_plugin,
 }
 
