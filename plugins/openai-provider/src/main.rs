@@ -121,7 +121,7 @@ async fn run() -> Result<(), LlmError> {
     tracing::info!(
         engine_version = %engine_version,
         provider = %config.provider_name,
-        model = %config.model,
+        model = ?config.model,
         base_url = %config.base_url,
         "ready"
     );
@@ -402,7 +402,14 @@ async fn dispatch_event(
                 return Ok(());
             }
             let chat_id = ChatId::default_for_prefix(&prefix);
-            chats.ensure(chat_id.clone()).await;
+            if let Err(e) = chats.ensure(chat_id.clone()).await {
+                send_event(
+                    out_tx,
+                    turn_error_body(config, &format!("openai-provider: {e}")),
+                )
+                .await?;
+                return Ok(());
+            }
             chats.push_user(&chat_id, text).await?;
             start_completion_turn(
                 chats, auth, catalog, broker, config, client, out_tx, chat_id, true,
@@ -474,13 +481,27 @@ async fn dispatch_event(
             // pick it up. Also retarget the legacy default chat (the
             // one nefor-chat is talking to via `<prefix>.prompt`) so
             // the next turn uses the new model — matching the v1
-            // singleton's "set_active_model" behaviour. New chats
-            // created via `chat.create` with an explicit model are
-            // unaffected.
+            // singleton's "set_active_model" behaviour.
+            //
+            // If the request carries `chat_id`, retarget that chat too
+            // — the orchestrator passes its active conversation id so
+            // mid-session model switches actually flip the live chat
+            // (without this, /model only affects new chats and the
+            // active one keeps its original model).
             chats.set_default_model(model.clone()).await;
             let default_id = ChatId::default_for_prefix(&prefix);
             if chats.exists(&default_id).await {
                 let _ = chats.set_chat_model(&default_id, model.clone()).await;
+            }
+            if let Some(active_id) = body
+                .get("chat_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(ChatId::new)
+            {
+                if active_id != default_id && chats.exists(&active_id).await {
+                    let _ = chats.set_chat_model(&active_id, model.clone()).await;
+                }
             }
             send_event(out_tx, model_set_ack_body(config, &model)).await?;
         }
@@ -755,19 +776,52 @@ fn spawn_turn(
                         // call's tool message to be present before the
                         // next chat-completions request, so there's no
                         // win in parallelism for a single round trip).
+                        //
+                        // Capture the call ids upfront so an interrupt
+                        // partway through can synthesise tool_result
+                        // messages for the cancelled tool AND any
+                        // unstarted ones — the assistant turn pushed
+                        // earlier carried every tool_call, and the
+                        // OpenAI history shape requires a matching
+                        // tool message per call. Without this, the
+                        // next user submit would fail validation with
+                        // "tool_call has no tool message".
+                        let tool_call_ids: Vec<String> =
+                            outcome.tool_calls.iter().map(|tc| tc.id.clone()).collect();
                         let mut tool_loop_failed = false;
-                        for tc in outcome.tool_calls {
+                        let mut cancelled_idx: Option<usize> = None;
+                        for (idx, tc) in outcome.tool_calls.into_iter().enumerate() {
                             let tool_step =
                                 run_one_tool_call(&catalog, &broker, &out_tx, &cancel, tc).await;
                             match tool_step {
                                 ToolStepOutcome::Result { id, content } => {
                                     let _ = chats.push_tool_result(&chat_id, id, content).await;
                                 }
-                                ToolStepOutcome::Cancelled => {
+                                ToolStepOutcome::Cancelled { id } => {
+                                    let _ = chats
+                                        .push_tool_result(
+                                            &chat_id,
+                                            id,
+                                            "(tool was interrupted by the user)".to_owned(),
+                                        )
+                                        .await;
                                     interrupted = true;
                                     tool_loop_failed = true;
+                                    cancelled_idx = Some(idx);
                                     break;
                                 }
+                            }
+                        }
+                        if let Some(c_idx) = cancelled_idx {
+                            for unstarted_id in tool_call_ids.iter().skip(c_idx + 1) {
+                                let _ = chats
+                                    .push_tool_result(
+                                        &chat_id,
+                                        unstarted_id.clone(),
+                                        "(tool not run; previous tool call in this turn was interrupted)"
+                                            .to_owned(),
+                                    )
+                                    .await;
                             }
                         }
 
@@ -817,10 +871,10 @@ fn spawn_turn(
                 Err(e) => {
                     let msg = match &e {
                         StreamError::Unauthorized { body } => {
-                            format!("HTTP 401: {}", snippet(body))
+                            format!("HTTP 401: {}", extract_error_message(body))
                         }
                         StreamError::Http { status, body } => {
-                            format!("HTTP {status}: {}", snippet(body))
+                            format!("HTTP {status}: {}", extract_error_message(body))
                         }
                         StreamError::Request(s) => format!("request failed: {s}"),
                         StreamError::Body(s) => format!("stream read error: {s}"),
@@ -915,7 +969,7 @@ fn spawn_turn(
 /// of who labelled it an error.
 enum ToolStepOutcome {
     Result { id: String, content: String },
-    Cancelled,
+    Cancelled { id: String },
 }
 
 /// Run a single tool call: emit `chat.tool.start`, route the
@@ -985,7 +1039,7 @@ async fn run_one_tool_call(
         biased;
         _ = cancel.cancelled() => {
             broker.cancel(&id).await;
-            return ToolStepOutcome::Cancelled;
+            return ToolStepOutcome::Cancelled { id: id.clone() };
         }
         r = rx => r.ok(),
         _ = tokio::time::sleep(TOOL_RESULT_TIMEOUT) => {
@@ -1034,6 +1088,26 @@ fn snippet(s: &str) -> String {
     } else {
         format!("{}…", &s[..200])
     }
+}
+
+/// Extract a human-friendly message from an HTTP error body. The
+/// OpenAI / Ollama / Groq / OpenRouter shape is
+/// `{"error":{"message":"…", "type":"…", …}}`; surface just the
+/// `message` field when present so the chat.message.append the user
+/// eventually sees reads as a sentence rather than a wall of JSON.
+/// Falls back to the truncated raw body.
+fn extract_error_message(body: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<Value>(body) {
+        if let Some(msg) = v
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            return msg.to_owned();
+        }
+    }
+    snippet(body)
 }
 
 /// Read the `chat_id` field from a body. Returns `None` when missing or
@@ -1376,7 +1450,9 @@ fn hello_body(config: &Config) -> Map<String, Value> {
         "provider".into(),
         Value::String(config.provider_name.clone()),
     );
-    m.insert("model".into(), Value::String(config.model.clone()));
+    if let Some(model) = config.model.as_ref() {
+        m.insert("model".into(), Value::String(model.clone()));
+    }
     m.insert("base_url".into(), Value::String(config.base_url.clone()));
     m
 }
@@ -1539,7 +1615,7 @@ mod tests {
         Config {
             provider_name: name.into(),
             base_url: "http://localhost:11434".into(),
-            model: "qwen2.5-coder:7b".into(),
+            model: Some("qwen2.5-coder:7b".into()),
             api_key: None,
         }
     }
@@ -1768,7 +1844,7 @@ mod tests {
     }
 
     fn fresh_chats(default_model: &str) -> Arc<Chats> {
-        Arc::new(Chats::with_default_model(default_model.to_owned()))
+        Arc::new(Chats::with_default_model(Some(default_model.to_owned())))
     }
 
     #[tokio::test]
@@ -2044,7 +2120,7 @@ mod tests {
             Some("ollama.model.set_ack")
         );
         assert_eq!(emitted[0].get("model").unwrap().as_str(), Some("new-model"));
-        assert_eq!(chats.default_model().await, "new-model");
+        assert_eq!(chats.default_model().await.as_deref(), Some("new-model"));
     }
 
     #[tokio::test]
@@ -2073,7 +2149,7 @@ mod tests {
 
         let emitted = drain(&mut rx).await;
         assert!(emitted.is_empty());
-        assert_eq!(chats.default_model().await, "seed");
+        assert_eq!(chats.default_model().await.as_deref(), Some("seed"));
     }
 
     #[test]
@@ -2368,7 +2444,7 @@ mod tests {
                 assert_eq!(id, "call_1");
                 assert_eq!(content, "file body");
             }
-            ToolStepOutcome::Cancelled => panic!("unexpected cancel"),
+            ToolStepOutcome::Cancelled { .. } => panic!("unexpected cancel"),
         }
 
         // Inspect the event sequence.
@@ -2421,7 +2497,7 @@ mod tests {
                 assert_eq!(id, "call_1");
                 assert!(content.contains("nonexistent"));
             }
-            ToolStepOutcome::Cancelled => panic!("unexpected cancel"),
+            ToolStepOutcome::Cancelled { .. } => panic!("unexpected cancel"),
         }
         // chat.tool.start, then chat.tool.end with error=true. No
         // tool.invoke (no owner).

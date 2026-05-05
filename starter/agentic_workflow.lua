@@ -1187,6 +1187,46 @@ function M.for_provider(name, opts)
       return env
     end
 
+    -- Provider-side failure path: openai-provider emits
+    -- `<prefix>.chat.error { chat_id, message }` when chat.create /
+    -- chat.append / chat.complete cant land (e.g. NoModelConfigured).
+    -- agentic_workflow ships chat.create / chat.append (system) /
+    -- chat.append (user) / chat.complete in sequence per turn — when
+    -- the first one fails, all four emit chat.error. Pass the FIRST
+    -- through to outer_from so the user sees one error message;
+    -- silently drop the rest. Closing the in-flight reasoner-graph
+    -- node is also done on the first hit so the UI stops "thinking".
+    if kind == prefix .. "chat.error" then
+      local chat_id = env.body.chat_id
+      if type(chat_id) == "string" then
+        local key = chat_id_to_key[chat_id]
+        if key then
+          local entry = pending[key]
+          if entry then
+            pending[key] = nil
+            chat_id_to_key[chat_id] = nil
+            chat_id_stream_visible[chat_id] = nil
+            local emsg = tostring(env.body.message or "provider error")
+            nefor.log.warn("agentic_workflow <- provider: chat.error closing node", {
+              provider = name,
+              chat_id  = chat_id,
+              run_id   = entry.run_id,
+              node_id  = entry.node_id,
+              error    = emsg,
+            })
+            send_node_result_err(
+              entry.run_id, entry.node_id, entry.firing_id,
+              emsg
+            )
+            return env
+          end
+        end
+      end
+      -- No pending — duplicate from the cascade after chat.create
+      -- already failed, OR a stray late event. Drop it.
+      return nil
+    end
+
     if kind ~= result_kind then return env end
     local chat_id = env.body.chat_id
     if type(chat_id) ~= "string" then return env end
@@ -1292,6 +1332,17 @@ function M.for_provider(name, opts)
           text = "Error: " .. msg,
         }
       end
+    elseif k == prefix .. "chat.error" then
+      -- chat-state failures (chat.create / append / complete couldn't
+      -- land — e.g. NoModelConfigured). The matching node-result-err
+      -- already fired in inner_from; here we surface the message in
+      -- the transcript so the user sees what went wrong.
+      local msg = tostring(env.body.message or "provider error")
+      env.body = {
+        kind = "chat.message.append",
+        role = "system",
+        text = "Error: " .. msg,
+      }
     elseif k == prefix .. "hello" then
       local model = env.body.model
       if type(model) == "string" and #model > 0 then
@@ -1356,7 +1407,19 @@ function M.for_provider(name, opts)
     elseif k == "chat.model.set" then
       if env.body.provider ~= name then return nil end
       local model = env.body.model
-      env.body = { kind = prefix .. "model.set", model = model }
+      -- Propagate the active orchestrator chat_id so the provider can
+      -- retarget that chat too — without this, switching model
+      -- mid-conversation only affects newly-created chats and the
+      -- live conversation keeps using the model it was created with.
+      local active_chat_id =
+        type(current_state) == "table" and type(current_state.chat_id) == "string"
+          and current_state.chat_id
+          or nil
+      env.body = {
+        kind    = prefix .. "model.set",
+        model   = model,
+        chat_id = active_chat_id,
+      }
     end
     return env
   end

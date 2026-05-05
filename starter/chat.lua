@@ -2899,24 +2899,28 @@ local function update(msg, state)
   end
 
   if kind == "sessions.session_start" then
-    -- No-op. The /resume + /new paths already clear via session_end's
-    -- handler above; at boot, state is already empty. The handler
-    -- USED to defensively wipe `entries = {}` here, but that turned
-    -- out to be the cause of a real bug: ncp.lua's replay-on-attach
-    -- can deliver the boot session_start AFTER the user has typed
-    -- their first prompt (the local-push went into entries first).
-    -- Wiping then nukes the user's message; the orchestrator's
-    -- chat.message.append echo arrives later and gets deduped against
-    -- the pending_user_echo marker, so nothing ever repaints the user
-    -- line — the transcript shows only the assistant's reply.
+    -- Boot session_start carries no marker; resume's session_start
+    -- carries `from_resume = true` (sessions.lua sets it before
+    -- replay_jsonl). Flip into replay-mode for resume so the
+    -- replayed envelope stream can't re-trigger UI side effects —
+    -- notably the tool.permission_request popup, which the user
+    -- already approved in the original session (its decision is
+    -- recorded in the jsonl and a fresh popup would be a re-prompt).
+    if msg.from_resume then
+      return shallow_merge(state, { replay_mode = true }), {}
+    end
+    -- Boot path: state is already empty; the entries-wipe that
+    -- USED to live here turned out to break ncp.lua's replay-on-attach
+    -- (boot session_start delivered AFTER the user's first prompt
+    -- nuked the local-push), so we deliberately do nothing here.
     return state, {}
   end
 
   if kind == "sessions.resume_done" then
-    -- Live again. The transcript already reflects the replayed past;
-    -- nothing to do beyond letting the next render fire (which it
-    -- will from the surrounding update loop).
-    return state, {}
+    -- Replay finished — flip back to live so future envelopes drive
+    -- popups and other side effects normally again. The next render
+    -- fires from the surrounding update loop.
+    return shallow_merge(state, { replay_mode = NIL_SENTINEL }), {}
   end
 
   if kind == "chat.reset" then
@@ -2975,7 +2979,14 @@ local function update(msg, state)
         { role = role, text = text, kind = "text" }
       ), {}
     end
-    return push_entry(state, {
+    -- System messages always indicate the turn ended (interrupted,
+    -- error from the provider, etc.) — clear the thinking spinner
+    -- and turn-elapsed counter so the UI doesn't sit on
+    -- "[thinking... Ns]" forever after the orchestrator gives up.
+    local turn_state = role == "system"
+      and { pending = false, turn_started_at = NIL_SENTINEL }
+      or  {}
+    return push_entry(shallow_merge(state, turn_state), {
       role = role, text = text, kind = "text",
     }), {}
   end
@@ -3124,6 +3135,12 @@ local function update(msg, state)
   end
 
   if kind == "chat.tool.permission_request" then
+    -- Replay path: the user already approved in the original session
+    -- and the decision is in the jsonl — popping a fresh approval
+    -- popup would be a re-prompt for the same call. Drop the request
+    -- silently; the matching tool.permission_response is also in the
+    -- jsonl and will replay through tool-gate's normal handler.
+    if state.replay_mode then return state, {} end
     -- Wire shape from tool-gate (plugins/tool-gate/src/main.rs):
     --   { kind = "chat.tool.permission_request",
     --     id   = "<provider outer id>",

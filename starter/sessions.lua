@@ -658,7 +658,10 @@ function M.resume(target_session_id)
   --    broker tick (see `resume_phase_hooks` doc), which is already too
   --    late.
   fire_resume_phase("session_start", target_session_id)
-  emit_control("sessions.session_start", { session_id = target_session_id })
+  emit_control("sessions.session_start", {
+    session_id  = target_session_id,
+    from_resume = true,
+  })
 
   -- 4. Replay. Errors here don't roll the swap back — see module doc.
   local replayed = replay_jsonl(new_path)

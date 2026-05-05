@@ -112,6 +112,8 @@ pub enum ChatsError {
     NotFound(ChatId),
     #[error("chat `{0}` is busy")]
     Busy(ChatId),
+    #[error("no model configured: pass `--model` to openai-provider, set PROVIDER_MODEL in init.lua, or include `model` in the chat.create body")]
+    NoModelConfigured,
 }
 
 /// Concurrent-safe map of `ChatId → ChatState`. The full map is wrapped
@@ -122,8 +124,10 @@ pub enum ChatsError {
 #[derive(Default)]
 pub struct Chats {
     /// Default model used to seed new chats whose `chat.create` body
-    /// omitted a `model` field. Mirrors the v1 `--model` CLI flag.
-    default_model: Mutex<String>,
+    /// omitted a `model` field. None when the user hasn't set a model
+    /// (no `--model` arg, no per-chat override). The dispatcher errors
+    /// instead of guessing.
+    default_model: Mutex<Option<String>>,
     inner: Mutex<HashMap<ChatId, ChatState>>,
 }
 
@@ -132,16 +136,17 @@ impl Chats {
         Self::default()
     }
 
-    /// Build a Chats with the provided default model — production passes
-    /// the env-resolved `Config::model`; tests can pass any string.
-    pub fn with_default_model(model: String) -> Self {
+    /// Build a Chats with an optional default model. Production passes
+    /// the env-resolved `Config::model` (`Option<String>`); tests can
+    /// pass `Some("any-model")`.
+    pub fn with_default_model(model: Option<String>) -> Self {
         Self {
             default_model: Mutex::new(model),
             inner: Mutex::new(HashMap::new()),
         }
     }
 
-    pub async fn default_model(&self) -> String {
+    pub async fn default_model(&self) -> Option<String> {
         self.default_model.lock().await.clone()
     }
 
@@ -149,13 +154,14 @@ impl Chats {
     /// chats keep whatever model they were created with (per-chat
     /// model.set is via `set_chat_model`).
     pub async fn set_default_model(&self, model: String) {
-        *self.default_model.lock().await = model;
+        *self.default_model.lock().await = Some(model);
     }
 
-    /// Create a chat. Errors if a chat with this id already exists.
-    /// `model` defaults to `default_model` when omitted. `tools_enabled`
-    /// defaults to true; set false to omit the tools array on every
-    /// turn for this chat.
+    /// Create a chat. Errors if a chat with this id already exists, or
+    /// when neither a per-chat `model` nor the plugin-default is set
+    /// (`ChatsError::NoModelConfigured`). `tools_enabled` defaults to
+    /// true; set false to omit the tools array on every turn for this
+    /// chat.
     pub async fn create(
         &self,
         id: ChatId,
@@ -164,7 +170,12 @@ impl Chats {
     ) -> Result<(), ChatsError> {
         let resolved_model = match model {
             Some(m) => m,
-            None => self.default_model.lock().await.clone(),
+            None => self
+                .default_model
+                .lock()
+                .await
+                .clone()
+                .ok_or(ChatsError::NoModelConfigured)?,
         };
         let mut g = self.inner.lock().await;
         if g.contains_key(&id) {
@@ -186,12 +197,22 @@ impl Chats {
     }
 
     /// Idempotent variant for the default-chat compat path: creates the
-    /// chat if absent, no-op if present. Used by `<prefix>.prompt` so
-    /// the chat plugin doesn't have to learn the new chat.* shape yet.
-    pub async fn ensure(&self, id: ChatId) {
-        let model = self.default_model.lock().await.clone();
+    /// chat if absent, no-op if present. Used by `<prefix>.prompt`. Errors
+    /// `NoModelConfigured` if the chat has to be created and no default
+    /// is set — matches `create()` semantics.
+    pub async fn ensure(&self, id: ChatId) -> Result<(), ChatsError> {
         let mut g = self.inner.lock().await;
-        g.entry(id).or_insert_with(|| ChatState::new(model));
+        if g.contains_key(&id) {
+            return Ok(());
+        }
+        let model = self
+            .default_model
+            .lock()
+            .await
+            .clone()
+            .ok_or(ChatsError::NoModelConfigured)?;
+        g.insert(id, ChatState::new(model));
+        Ok(())
     }
 
     pub async fn delete(&self, id: &ChatId) -> Result<(), ChatsError> {
@@ -403,7 +424,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_then_append_and_snapshot_round_trips_through_history() {
-        let c = Chats::with_default_model("m".into());
+        let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("a");
         c.create(id.clone(), None, None).await.expect("create");
         c.push_user(&id, "hello".into()).await.expect("push user");
@@ -420,7 +441,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_rejects_duplicate_id() {
-        let c = Chats::with_default_model("m".into());
+        let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("dup");
         c.create(id.clone(), None, None)
             .await
@@ -434,7 +455,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_removes_chat_and_subsequent_ops_404() {
-        let c = Chats::with_default_model("m".into());
+        let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("x");
         c.create(id.clone(), None, None).await.expect("create");
         c.delete(&id).await.expect("delete");
@@ -445,7 +466,7 @@ mod tests {
 
     #[tokio::test]
     async fn append_to_unknown_chat_errors() {
-        let c = Chats::with_default_model("m".into());
+        let c = Chats::with_default_model(Some("m".into()));
         let err = c
             .push_user(&ChatId::new("ghost"), "hi".into())
             .await
@@ -455,7 +476,7 @@ mod tests {
 
     #[tokio::test]
     async fn reset_clears_only_target_chat_history() {
-        let c = Chats::with_default_model("m".into());
+        let c = Chats::with_default_model(Some("m".into()));
         let a = ChatId::new("a");
         let b = ChatId::new("b");
         c.create(a.clone(), None, None).await.expect("a");
@@ -469,7 +490,7 @@ mod tests {
 
     #[tokio::test]
     async fn reset_all_clears_every_chats_history() {
-        let c = Chats::with_default_model("m".into());
+        let c = Chats::with_default_model(Some("m".into()));
         let a = ChatId::new("a");
         let b = ChatId::new("b");
         c.create(a.clone(), None, None).await.expect("a");
@@ -483,7 +504,7 @@ mod tests {
 
     #[tokio::test]
     async fn begin_turn_is_per_chat_exclusive() {
-        let c = Chats::with_default_model("m".into());
+        let c = Chats::with_default_model(Some("m".into()));
         let a = ChatId::new("a");
         let b = ChatId::new("b");
         c.create(a.clone(), None, None).await.expect("a");
@@ -498,7 +519,7 @@ mod tests {
 
     #[tokio::test]
     async fn interrupt_only_cancels_named_chat() {
-        let c = Chats::with_default_model("m".into());
+        let c = Chats::with_default_model(Some("m".into()));
         let a = ChatId::new("a");
         let b = ChatId::new("b");
         c.create(a.clone(), None, None).await.expect("a");
@@ -512,7 +533,7 @@ mod tests {
 
     #[tokio::test]
     async fn interrupt_all_cancels_every_in_flight_turn() {
-        let c = Chats::with_default_model("m".into());
+        let c = Chats::with_default_model(Some("m".into()));
         let a = ChatId::new("a");
         let b = ChatId::new("b");
         c.create(a.clone(), None, None).await.expect("a");
@@ -526,7 +547,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_with_explicit_model_overrides_default() {
-        let c = Chats::with_default_model("default".into());
+        let c = Chats::with_default_model(Some("default".into()));
         let id = ChatId::new("a");
         c.create(id.clone(), Some("explicit".into()), None)
             .await
@@ -536,7 +557,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_chat_model_updates_per_chat_only() {
-        let c = Chats::with_default_model("default".into());
+        let c = Chats::with_default_model(Some("default".into()));
         let a = ChatId::new("a");
         let b = ChatId::new("b");
         c.create(a.clone(), None, None).await.expect("a");
@@ -548,10 +569,10 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_is_idempotent_for_legacy_default_chat_path() {
-        let c = Chats::with_default_model("m".into());
+        let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::default_for_prefix("ollama.");
-        c.ensure(id.clone()).await;
-        c.ensure(id.clone()).await;
+        c.ensure(id.clone()).await.expect("ensure ok");
+        c.ensure(id.clone()).await.expect("ensure ok");
         assert!(c.exists(&id).await);
     }
 
@@ -566,7 +587,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_turn_accumulates_per_chat() {
-        let c = Chats::with_default_model("m".into());
+        let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("a");
         c.create(id.clone(), None, None).await.expect("create");
         c.record_turn(&id, Some("qwen"), 100, 50, 1234)
@@ -587,7 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn push_assistant_tool_calls_and_tool_result_round_trip() {
-        let c = Chats::with_default_model("m".into());
+        let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("a");
         c.create(id.clone(), None, None).await.expect("create");
         c.push_user(&id, "hi".into()).await.expect("u");
@@ -617,7 +638,7 @@ mod tests {
 
     #[tokio::test]
     async fn ids_returns_every_live_chat() {
-        let c = Chats::with_default_model("m".into());
+        let c = Chats::with_default_model(Some("m".into()));
         c.create(ChatId::new("a"), None, None).await.expect("a");
         c.create(ChatId::new("b"), None, None).await.expect("b");
         let mut ids = c.ids().await;
@@ -627,7 +648,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_unknown_chat_errors() {
-        let c = Chats::with_default_model("m".into());
+        let c = Chats::with_default_model(Some("m".into()));
         let err = c
             .delete(&ChatId::new("ghost"))
             .await

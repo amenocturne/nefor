@@ -57,9 +57,12 @@ pub struct Config {
     #[arg(long = "base-url", default_value = "http://localhost:11434", value_parser = trim_trailing_slash)]
     pub base_url: String,
 
-    /// Model id to ask for on each request.
-    #[arg(long, default_value = "qwen2.5-coder:7b")]
-    pub model: String,
+    /// Default model id to ask for on each request. Optional: if unset,
+    /// each `chat.create` must carry its own `model` field, or the turn
+    /// errors with a clear message instead of dispatching against a
+    /// hard-coded fallback the user may not have pulled.
+    #[arg(long)]
+    pub model: Option<String>,
 
     /// Optional bearer token for hosted OpenAI-compatible providers.
     /// Ollama does not require one. Falls back to the
@@ -118,7 +121,7 @@ mod tests {
         Config {
             provider_name: name.into(),
             base_url: "http://localhost:11434".into(),
-            model: "qwen2.5-coder:7b".into(),
+            model: Some("qwen2.5-coder:7b".into()),
             api_key: None,
         }
     }
@@ -172,11 +175,11 @@ mod tests {
     }
 
     #[test]
-    fn defaults_match_local_ollama_layout() {
+    fn defaults_have_no_model() {
         let (_g, c) = parse_clean(&["openai-provider"]);
         assert_eq!(c.provider_name, "openai");
         assert_eq!(c.base_url, "http://localhost:11434");
-        assert_eq!(c.model, "qwen2.5-coder:7b");
+        assert!(c.model.is_none(), "model is opt-in; no compiled-in fallback");
         assert!(c.api_key.is_none());
     }
 
@@ -200,7 +203,7 @@ mod tests {
     #[test]
     fn model_flag_passes_through_verbatim() {
         let (_g, c) = parse_clean(&["openai-provider", "--model", "llama-3.3-70b-versatile"]);
-        assert_eq!(c.model, "llama-3.3-70b-versatile");
+        assert_eq!(c.model.as_deref(), Some("llama-3.3-70b-versatile"));
     }
 
     #[test]
@@ -222,7 +225,7 @@ mod tests {
         ]);
         assert_eq!(c.provider_name, "ollama");
         assert_eq!(c.base_url, "http://localhost:11434");
-        assert_eq!(c.model, "phi4-mini:latest");
+        assert_eq!(c.model.as_deref(), Some("phi4-mini:latest"));
         assert_eq!(c.event_prefix(), "ollama.");
         assert!(c.api_key.is_none());
     }
