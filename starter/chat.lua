@@ -1734,12 +1734,32 @@ local function fmt_elapsed_ms(ms)
   return string.format("%ds", math.floor(ms / 1000))
 end
 
+-- Hard ceiling on a never-completing run before we evict it anyway.
+-- 5× the linger window: long enough that a healthy long-running run
+-- doesn't get prematurely yanked, short enough that an orphan from a
+-- crash / dropped envelope can't accumulate indefinitely on a long-
+-- lived session. Tied to DAG_LINGER_MS so a future tweak there
+-- automatically scales this ceiling.
+local DAG_HARD_CEILING_MS = 5 * DAG_LINGER_MS
+
 local function prune_dag_runs(dag_runs, now_ms)
   if dag_runs == nil then return {} end
   local pruned = nil
   for run_id, run in pairs(dag_runs) do
+    local drop = false
     if run.completed_at_ms ~= nil
        and (now_ms - run.completed_at_ms) > DAG_LINGER_MS then
+      drop = true
+    elseif run.started_at_ms ~= nil
+           and (now_ms - run.started_at_ms) > DAG_HARD_CEILING_MS then
+      -- Hard-ceiling eviction: even still-running runs get pruned
+      -- once they're past the ceiling. Prevents indefinite-running
+      -- orphans (e.g. a graph.run_complete that never arrived
+      -- because the producer crashed) from piling up within a
+      -- single long-lived session.
+      drop = true
+    end
+    if drop then
       if pruned == nil then
         pruned = {}
         for k, v in pairs(dag_runs) do pruned[k] = v end
@@ -2200,21 +2220,47 @@ local function dag_node_dispatched(state, run_id, node_id, reasoner, now_ms)
 end
 
 local function dag_node_result(state, run_id, node_id, has_output, has_error, now_ms)
-  if not (state.dag_runs and state.dag_runs[run_id]
-          and state.dag_runs[run_id].nodes
-          and state.dag_runs[run_id].nodes[node_id]) then
-    return state
+  local terminal_status
+  if has_output then terminal_status = "done"
+  elseif has_error then terminal_status = "error"
+  else terminal_status = "error" end
+  -- Orphan path: a graph.node_result arrived for a node we never observed
+  -- via graph.node_dispatched (or for a run we never observed via
+  -- graph.run_started). Silently dropping it leaves the panel showing the
+  -- node as never-finished — the result is the *only* signal that node
+  -- terminated, so we synthesize a started==finished record so the panel
+  -- still reflects reality. Warn so we can spot how often this fires.
+  local known_run  = state.dag_runs and state.dag_runs[run_id]
+  local known_node = known_run and known_run.nodes and known_run.nodes[node_id]
+  if not known_node then
+    nefor.log.warn("chat: graph.node_result for unknown node", {
+      run_id  = run_id,
+      node_id = node_id,
+      status  = terminal_status,
+      run_seen = known_run ~= nil,
+    })
+    return dag_apply(state, run_id, function(prev)
+      local run = prev or {
+        run_id = run_id, total_nodes = 0, started_at_ms = now_ms,
+        nodes = {}, completed_at_ms = nil,
+      }
+      local nodes = {}
+      for k, v in pairs(run.nodes or {}) do nodes[k] = v end
+      nodes[node_id] = {
+        reasoner       = "",
+        status         = terminal_status,
+        started_at_ms  = now_ms,
+        finished_at_ms = now_ms,
+      }
+      return shallow_merge(run, { nodes = nodes })
+    end)
   end
   return dag_apply(state, run_id, function(prev)
     local nodes = {}
     for k, v in pairs(prev.nodes or {}) do nodes[k] = v end
     local node = nodes[node_id]
-    local status
-    if has_output then status = "done"
-    elseif has_error then status = "error"
-    else status = "error" end
     nodes[node_id] = shallow_merge(node, {
-      status = status, finished_at_ms = now_ms,
+      status = terminal_status, finished_at_ms = now_ms,
     })
     return shallow_merge(prev, { nodes = nodes })
   end)
@@ -2906,14 +2952,26 @@ local function update(msg, state)
     -- notably the tool.permission_request popup, which the user
     -- already approved in the original session (its decision is
     -- recorded in the jsonl and a fresh popup would be a re-prompt).
+    --
+    -- `dag_runs` always cleared: a fresh session is a fresh
+    -- DAG-context boundary regardless of which path we took to
+    -- get here. session_end's clear isn't enough on its own —
+    -- if a session swap doesn't go cleanly through session_end,
+    -- or if a run was mid-flight when the swap fired, stale runs
+    -- would otherwise stack on top of new ones in the panel.
     if msg.from_resume then
-      return shallow_merge(state, { replay_mode = true }), {}
+      return shallow_merge(state, {
+        replay_mode = true,
+        dag_runs    = {},
+      }), {}
     end
     -- Boot path: state is already empty; the entries-wipe that
     -- USED to live here turned out to break ncp.lua's replay-on-attach
     -- (boot session_start delivered AFTER the user's first prompt
-    -- nuked the local-push), so we deliberately do nothing here.
-    return state, {}
+    -- nuked the local-push), so we deliberately do nothing for
+    -- entries here. dag_runs is independent of that race (no
+    -- pre-boot dispatch path) so we still clear it.
+    return shallow_merge(state, { dag_runs = {} }), {}
   end
 
   if kind == "sessions.resume_done" then
@@ -3176,17 +3234,25 @@ local function update(msg, state)
     return shallow_merge(state, { gate_yolo = msg.mode == "yolo" }), {}
   end
 
-  -- DAG observation
+  -- DAG observation. Each handler short-circuits during replay: the
+  -- graph.* envelopes seeded into the resumed session's jsonl are
+  -- snapshots from the prior live run, not fresh dispatches, and
+  -- mutating dag_runs from them would re-light a panel that should
+  -- start clean (sessions.session_start clears it). Mirrors the
+  -- chat.tool.permission_request guard above.
   if kind == "graph.run_started" then
+    if state.replay_mode then return state, {} end
     local now = tui.now_ms()
     return dag_run_started(state, msg.run_id or "", msg.total_nodes or 0, now), {}
   end
   if kind == "graph.node_dispatched" then
+    if state.replay_mode then return state, {} end
     if (msg.run_id or "") == "" or (msg.node_id or "") == "" then return state, {} end
     local now = tui.now_ms()
     return dag_node_dispatched(state, msg.run_id, msg.node_id, msg.reasoner or "", now), {}
   end
   if kind == "graph.node_result" then
+    if state.replay_mode then return state, {} end
     if (msg.run_id or "") == "" or (msg.node_id or "") == "" then return state, {} end
     local now = tui.now_ms()
     local has_output = msg.output ~= nil
@@ -3194,6 +3260,7 @@ local function update(msg, state)
     return dag_node_result(state, msg.run_id, msg.node_id, has_output, has_error, now), {}
   end
   if kind == "graph.run_complete" then
+    if state.replay_mode then return state, {} end
     if (msg.run_id or "") == "" then return state, {} end
     local now = tui.now_ms()
     return dag_run_complete(state, msg.run_id, msg.status, msg.results, now), {}
