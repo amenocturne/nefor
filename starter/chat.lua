@@ -1734,12 +1734,32 @@ local function fmt_elapsed_ms(ms)
   return string.format("%ds", math.floor(ms / 1000))
 end
 
+-- Hard ceiling on a never-completing run before we evict it anyway.
+-- 5× the linger window: long enough that a healthy long-running run
+-- doesn't get prematurely yanked, short enough that an orphan from a
+-- crash / dropped envelope can't accumulate indefinitely on a long-
+-- lived session. Tied to DAG_LINGER_MS so a future tweak there
+-- automatically scales this ceiling.
+local DAG_HARD_CEILING_MS = 5 * DAG_LINGER_MS
+
 local function prune_dag_runs(dag_runs, now_ms)
   if dag_runs == nil then return {} end
   local pruned = nil
   for run_id, run in pairs(dag_runs) do
+    local drop = false
     if run.completed_at_ms ~= nil
        and (now_ms - run.completed_at_ms) > DAG_LINGER_MS then
+      drop = true
+    elseif run.started_at_ms ~= nil
+           and (now_ms - run.started_at_ms) > DAG_HARD_CEILING_MS then
+      -- Hard-ceiling eviction: even still-running runs get pruned
+      -- once they're past the ceiling. Prevents indefinite-running
+      -- orphans (e.g. a graph.run_complete that never arrived
+      -- because the producer crashed) from piling up within a
+      -- single long-lived session.
+      drop = true
+    end
+    if drop then
       if pruned == nil then
         pruned = {}
         for k, v in pairs(dag_runs) do pruned[k] = v end
@@ -2932,14 +2952,26 @@ local function update(msg, state)
     -- notably the tool.permission_request popup, which the user
     -- already approved in the original session (its decision is
     -- recorded in the jsonl and a fresh popup would be a re-prompt).
+    --
+    -- `dag_runs` always cleared: a fresh session is a fresh
+    -- DAG-context boundary regardless of which path we took to
+    -- get here. session_end's clear isn't enough on its own —
+    -- if a session swap doesn't go cleanly through session_end,
+    -- or if a run was mid-flight when the swap fired, stale runs
+    -- would otherwise stack on top of new ones in the panel.
     if msg.from_resume then
-      return shallow_merge(state, { replay_mode = true }), {}
+      return shallow_merge(state, {
+        replay_mode = true,
+        dag_runs    = {},
+      }), {}
     end
     -- Boot path: state is already empty; the entries-wipe that
     -- USED to live here turned out to break ncp.lua's replay-on-attach
     -- (boot session_start delivered AFTER the user's first prompt
-    -- nuked the local-push), so we deliberately do nothing here.
-    return state, {}
+    -- nuked the local-push), so we deliberately do nothing for
+    -- entries here. dag_runs is independent of that race (no
+    -- pre-boot dispatch path) so we still clear it.
+    return shallow_merge(state, { dag_runs = {} }), {}
   end
 
   if kind == "sessions.resume_done" then
