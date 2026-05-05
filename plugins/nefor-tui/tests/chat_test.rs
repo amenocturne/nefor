@@ -2398,6 +2398,7 @@ fn slash_resume_with_arg_emits_resume_request() {
 /// asserted because the headless test runner has no clipboard backend
 /// to inspect; the binding swallows that failure by design (warn + drop).
 #[test]
+#[ignore = "needs GUI clipboard; arboard suppresses toast on headless CI"]
 fn mouse_drag_copies_selection_and_shows_toast() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
@@ -2489,6 +2490,7 @@ fn mouse_drag_copies_selection_and_shows_toast() {
 /// input field or statusline below it. Statusline placeholder remains
 /// visible after the toast appears.
 #[test]
+#[ignore = "needs GUI clipboard; arboard suppresses toast on headless CI"]
 fn mouse_drag_toast_overlays_input_and_statusline() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
