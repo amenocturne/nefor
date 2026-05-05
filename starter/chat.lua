@@ -2275,13 +2275,17 @@ local function dag_node_dispatched(state, run_id, node_id, reasoner, now_ms)
     }
     local nodes = {}
     for k, v in pairs(run.nodes or {}) do nodes[k] = v end
-    -- Guard against out-of-order delivery: if `graph.node_result` arrived
-    -- BEFORE this dispatch envelope, the orphan-result path already
-    -- synthesized a `done`/`error` entry for this node. Overwriting it
-    -- with `running` here makes the node tick forever — no further
-    -- result will come to flip it back. Preserve the terminal state.
+    -- Guard ONLY against out-of-order orphan delivery: if a synthetic
+    -- entry was created because `graph.node_result` arrived before this
+    -- dispatch, preserve it (no further result will come). For the
+    -- normal multi-firing case (a node that legitimately fires again
+    -- after a previous firing's result), `was_orphan` is unset and the
+    -- dispatch resets the node to `running` for the new firing.
     local existing = nodes[node_id]
-    if not (existing and (existing.status == "done" or existing.status == "error")) then
+    local is_orphan_terminal = existing
+        and existing.was_orphan == true
+        and (existing.status == "done" or existing.status == "error")
+    if not is_orphan_terminal then
       nodes[node_id] = {
         reasoner = reasoner or "",
         status = "running",
@@ -2325,6 +2329,7 @@ local function dag_node_result(state, run_id, node_id, has_output, has_error, no
         status         = terminal_status,
         started_at_ms  = now_ms,
         finished_at_ms = now_ms,
+        was_orphan     = true,
       }
       return shallow_merge(run, { nodes = nodes })
     end)
@@ -2335,6 +2340,7 @@ local function dag_node_result(state, run_id, node_id, has_output, has_error, no
     local node = nodes[node_id]
     nodes[node_id] = shallow_merge(node, {
       status = terminal_status, finished_at_ms = now_ms,
+      was_orphan = NIL_SENTINEL,
     })
     return shallow_merge(prev, { nodes = nodes })
   end)
