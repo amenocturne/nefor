@@ -620,11 +620,29 @@ function M.on_resume_phase(phase, fn)
   list[#list + 1] = fn
 end
 
+local resume_in_progress = false
+
 function M.resume(target_session_id)
   if type(target_session_id) ~= "string" or target_session_id == "" then
     if nefor.log and nefor.log.error then
       nefor.log.error("sessions.resume: target_session_id must be a non-empty string", {
         got = type(target_session_id),
+      })
+    end
+    return
+  end
+  -- Re-entrance guard. A bus subscriber that emits during the swap can
+  -- circle back through `sessions.resume_request` / `sessions.new_request`
+  -- and re-call M.resume — without this guard the result is a runaway
+  -- cascade of session_end/session_start/resume_done cycles in
+  -- microseconds, clearing `current_state` repeatedly and stalling all
+  -- subsequent submits. Dropping the re-entrant call (and warning) gets
+  -- you to a state where the next log isolates the actual emitter.
+  if resume_in_progress then
+    if nefor.log and nefor.log.warn then
+      nefor.log.warn("sessions.resume: re-entrant call dropped", {
+        requested = target_session_id,
+        currently_active = current_session_id,
       })
     end
     return
@@ -636,6 +654,7 @@ function M.resume(target_session_id)
     end
     return
   end
+  resume_in_progress = true
 
   -- 1. Announce end of outgoing session.
   --    Synchronous hooks fire FIRST so module state (e.g. in-flight
@@ -703,6 +722,7 @@ function M.resume(target_session_id)
     session_id = target_session_id,
     replayed   = replayed,
   })
+  resume_in_progress = false
 end
 
 -- ------------------------------------------------------------------
