@@ -73,6 +73,24 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Resolve and propagate NEFOR_PLUGIN_DIR so init.lua's `bin()` helper
+    // can find the right path before any plugin gets spawned. The starter
+    // reads `os.getenv("NEFOR_PLUGIN_DIR")` directly; setting it here means
+    // `<exe>/../share/nefor/plugins` (Homebrew layout) and `<exe-dir>`
+    // (in-tree dev) both work without per-install configuration.
+    let plugin_root_unset = std::env::var("NEFOR_PLUGIN_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_none();
+    if plugin_root_unset {
+        if let Some(root) = resolve_plugin_root(args.plugin_dir.clone()) {
+            // SAFETY: single-threaded at this point, before any thread spawns.
+            unsafe {
+                std::env::set_var("NEFOR_PLUGIN_DIR", root.as_path());
+            }
+        }
+    }
+
     let log_path = config_dir.as_path().join("nefor.log");
     if let Err(e) = log::init(&log_path) {
         eprintln!("nefor: failed to initialize logging at {log_path:?}: {e}");

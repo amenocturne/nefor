@@ -47,8 +47,13 @@ impl PluginRoot {
 ///
 /// 1. `cli_override` — explicit `--plugin-dir` flag.
 /// 2. `NEFOR_PLUGIN_DIR` environment variable.
-/// 3. `$NEFOR_DATA_DIR/plugins/` if `NEFOR_DATA_DIR` is set.
-/// 4. `$XDG_DATA_HOME/nefor/plugins/` (falling back to
+/// 3. `$NEFOR_DATA_DIR/plugins/` if that path is a directory.
+/// 4. `<exe-dir>/../share/nefor/plugins` if that path is a directory
+///    (covers system installs like Homebrew where the binary lives at
+///    `<prefix>/bin/nefor` and plugins at `<prefix>/share/nefor/plugins`).
+/// 5. `<exe-dir>` if it contains the bundled `nefor-tui` binary
+///    (in-tree dev mode where `cargo build` puts everything in `target/debug/`).
+/// 6. `$XDG_DATA_HOME/nefor/plugins/` (falling back to
 ///    `~/.local/share/nefor/plugins/`).
 ///
 /// Returns `None` if none of the above produced a usable path. The engine
@@ -64,13 +69,34 @@ pub fn resolve_plugin_root(cli_override: Option<PathBuf>) -> Option<PluginRoot> 
     }
     if let Ok(raw) = std::env::var("NEFOR_DATA_DIR") {
         if !raw.is_empty() {
-            return Some(PluginRoot(PathBuf::from(raw).join("plugins")));
+            let p = PathBuf::from(raw).join("plugins");
+            if p.is_dir() {
+                return Some(PluginRoot(p));
+            }
         }
+    }
+    if let Some(p) = exe_relative_share_plugins() {
+        return Some(PluginRoot(p));
+    }
+    if let Some(p) = exe_dir_in_tree() {
+        return Some(PluginRoot(p));
     }
     if let Some(data_home) = xdg_data_home() {
         return Some(PluginRoot(data_home.join("nefor").join("plugins")));
     }
     None
+}
+
+fn exe_relative_share_plugins() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let candidate = exe.parent()?.parent()?.join("share/nefor/plugins");
+    candidate.is_dir().then_some(candidate)
+}
+
+fn exe_dir_in_tree() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let dir = exe.parent()?.to_path_buf();
+    dir.join("nefor-tui").is_file().then_some(dir)
 }
 
 fn xdg_data_home() -> Option<PathBuf> {

@@ -79,13 +79,12 @@ sessions.handle_shutdown()
 
 local agentic_workflow = require("agentic_workflow")
 
-local PROJECT_ROOT = STARTER_ROOT:match("^(.*)/[^/]+$") or "."
 local function bin(name)
   local plugin_dir = os.getenv("NEFOR_PLUGIN_DIR")
   if plugin_dir and plugin_dir ~= "" then
     return plugin_dir .. "/" .. name
   end
-  return PROJECT_ROOT .. "/target/debug/" .. name
+  error("NEFOR_PLUGIN_DIR is not set. The engine resolves this automatically; if you see this error, set it manually or pass --plugin-dir.")
 end
 
 -------------------------------------------------------------------------
@@ -158,14 +157,17 @@ if USE_MOCK_PROVIDER then
   }
 else
   PROVIDER_NAME  = "ollama"
-  PROVIDER_MODEL = nil
+  PROVIDER_MODEL = nil  -- set this to e.g. "qwen2.5:7b" to enable chat
   provider_chain = agentic_workflow.for_provider(PROVIDER_NAME, { static_token = "ollama-local" })
   provider_command = {
     bin("openai-provider"),
     "--name",     PROVIDER_NAME,
     "--base-url", "http://localhost:11434",
-    "--model",    PROVIDER_MODEL,
   }
+  if PROVIDER_MODEL then
+    table.insert(provider_command, "--model")
+    table.insert(provider_command, PROVIDER_MODEL)
+  end
 end
 
 -------------------------------------------------------------------------
