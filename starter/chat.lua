@@ -2275,24 +2275,12 @@ local function dag_node_dispatched(state, run_id, node_id, reasoner, now_ms)
     }
     local nodes = {}
     for k, v in pairs(run.nodes or {}) do nodes[k] = v end
-    -- Guard ONLY against out-of-order orphan delivery: if a synthetic
-    -- entry was created because `graph.node_result` arrived before this
-    -- dispatch, preserve it (no further result will come). For the
-    -- normal multi-firing case (a node that legitimately fires again
-    -- after a previous firing's result), `was_orphan` is unset and the
-    -- dispatch resets the node to `running` for the new firing.
-    local existing = nodes[node_id]
-    local is_orphan_terminal = existing
-        and existing.was_orphan == true
-        and (existing.status == "done" or existing.status == "error")
-    if not is_orphan_terminal then
-      nodes[node_id] = {
-        reasoner = reasoner or "",
-        status = "running",
-        started_at_ms = now_ms,
-        finished_at_ms = nil,
-      }
-    end
+    nodes[node_id] = {
+      reasoner = reasoner or "",
+      status = "running",
+      started_at_ms = now_ms,
+      finished_at_ms = nil,
+    }
     return shallow_merge(run, { nodes = nodes })
   end)
 end
@@ -2302,37 +2290,14 @@ local function dag_node_result(state, run_id, node_id, has_output, has_error, no
   if has_output then terminal_status = "done"
   elseif has_error then terminal_status = "error"
   else terminal_status = "error" end
-  -- Orphan path: a graph.node_result arrived for a node we never observed
-  -- via graph.node_dispatched (or for a run we never observed via
-  -- graph.run_started). Silently dropping it leaves the panel showing the
-  -- node as never-finished — the result is the *only* signal that node
-  -- terminated, so we synthesize a started==finished record so the panel
-  -- still reflects reality. Warn so we can spot how often this fires.
-  local known_run  = state.dag_runs and state.dag_runs[run_id]
-  local known_node = known_run and known_run.nodes and known_run.nodes[node_id]
-  if not known_node then
-    nefor.log.warn("chat: graph.node_result for unknown node", {
-      run_id  = run_id,
-      node_id = node_id,
-      status  = terminal_status,
-      run_seen = known_run ~= nil,
-    })
-    return dag_apply(state, run_id, function(prev)
-      local run = prev or {
-        run_id = run_id, total_nodes = 0, started_at_ms = now_ms,
-        nodes = {}, completed_at_ms = nil,
-      }
-      local nodes = {}
-      for k, v in pairs(run.nodes or {}) do nodes[k] = v end
-      nodes[node_id] = {
-        reasoner       = "",
-        status         = terminal_status,
-        started_at_ms  = now_ms,
-        finished_at_ms = now_ms,
-        was_orphan     = true,
-      }
-      return shallow_merge(run, { nodes = nodes })
-    end)
+  -- Drop results for nodes we haven't observed dispatch for. In live
+  -- mode this shouldn't happen; if it does, the result will be visible
+  -- in logs and that's the right place to investigate, not a synthetic
+  -- panel entry that papers over the gap.
+  if not (state.dag_runs and state.dag_runs[run_id]
+      and state.dag_runs[run_id].nodes
+      and state.dag_runs[run_id].nodes[node_id]) then
+    return state
   end
   return dag_apply(state, run_id, function(prev)
     local nodes = {}
@@ -2340,7 +2305,6 @@ local function dag_node_result(state, run_id, node_id, has_output, has_error, no
     local node = nodes[node_id]
     nodes[node_id] = shallow_merge(node, {
       status = terminal_status, finished_at_ms = now_ms,
-      was_orphan = NIL_SENTINEL,
     })
     return shallow_merge(prev, { nodes = nodes })
   end)
