@@ -11,7 +11,9 @@
 --
 -- Run:
 --   ./target/debug/nefor --config cli-config/ plugin agentic-cli "your prompt"
---   USE_MOCK_PROVIDER=true ./target/debug/nefor --config cli-config/ plugin agentic-cli "..."
+--   NEFOR_CONFIG=test ./target/debug/nefor --config cli-config/ plugin agentic-cli "..."
+-- (USE_MOCK_PROVIDER=true is still honored as a deprecated alias for
+--  NEFOR_CONFIG=test — see cli-config/config.lua.)
 
 local CONFIG_ROOT = NEFOR_CONFIG_DIR or "."
 
@@ -30,6 +32,7 @@ package.path = table.concat({
 
 local ncp      = require("ncp")
 local sessions = require("sessions")
+local cfg      = require("config").active
 
 -- Forward the engine's `current_log` to ncp.dispatch. The engine is
 -- session-blind; cross-run resume + jsonl persistence are owned by
@@ -50,32 +53,35 @@ local agentic_cli      = require("agentic_cli")
 local function bin(name) return PROJECT_ROOT .. "/target/debug/" .. name end
 
 -- ------------------------------------------------------------------
--- Provider selection (USE_MOCK_PROVIDER=true swaps in the deterministic
--- mock; same branching as starter/init.lua).
+-- Provider selection — driven by config.lua (cfg.provider + cfg.plugins).
 -- ------------------------------------------------------------------
 
-local USE_MOCK_PROVIDER = (os.getenv("USE_MOCK_PROVIDER") == "true")
+local PROVIDER_NAME  = cfg.provider.name
+local PROVIDER_MODEL = cfg.provider.model
+local provider_chain, provider_command
 
-local PROVIDER_NAME, PROVIDER_MODEL, provider_chain, provider_command
-
-if USE_MOCK_PROVIDER then
-  PROVIDER_NAME  = "mock-plugin"
-  PROVIDER_MODEL = "mock-model"
+if cfg.plugins.spawn_mock then
   provider_chain = agentic_workflow.for_provider(PROVIDER_NAME)
   provider_command = {
     bin("mock-plugin"),
-    "--script", STARTER_ROOT .. "/mock_provider.lua",
+    "--script", STARTER_ROOT .. "/" .. cfg.provider.mock_script,
   }
 else
-  PROVIDER_NAME  = "ollama"
-  PROVIDER_MODEL = "qwen3.6:35b-a3b-coding-mxfp8"
-  provider_chain = agentic_workflow.for_provider(PROVIDER_NAME, { static_token = "ollama-local" })
+  provider_chain = agentic_workflow.for_provider(PROVIDER_NAME, {
+    static_token = cfg.provider.static_token,
+  })
   provider_command = {
     bin("openai-provider"),
     "--name",     PROVIDER_NAME,
-    "--base-url", "http://localhost:11434",
-    "--model",    PROVIDER_MODEL,
+    "--base-url", cfg.provider.base_url,
   }
+  if PROVIDER_MODEL then
+    table.insert(provider_command, "--model")
+    table.insert(provider_command, PROVIDER_MODEL)
+  end
+  for _, a in ipairs(cfg.provider.extra_args or {}) do
+    table.insert(provider_command, a)
+  end
 end
 
 -- ------------------------------------------------------------------
@@ -125,17 +131,17 @@ ncp.spawn {
   from_plugin = agentic_workflow.for_reasoner_graph().from_plugin,
 }
 
+local tool_gate_argv = { bin("tool-gate") }
+for _, t in ipairs(cfg.tool_gate.prompt_tools or {}) do
+  tool_gate_argv[#tool_gate_argv + 1] = "--prompt"
+  tool_gate_argv[#tool_gate_argv + 1] = t
+end
+tool_gate_argv[#tool_gate_argv + 1] = "--default"
+tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
+
 ncp.spawn {
   name        = "tool-gate",
-  command     = {
-    bin("tool-gate"),
-    -- CLI surface has no permission-prompt UI in v1. Default `auto` keeps
-    -- the agent unblocked; --yolo on agentic-cli is the documented user
-    -- override (currently a placeholder, see agentic_workflow.set_yolo).
-    -- Phase 3 / Stage 2 should add a prompt-respecting CLI surface and
-    -- flip this back to `prompt`.
-    "--default", "auto",
-  },
+  command     = tool_gate_argv,
   from_plugin = agentic_workflow.for_tool_gate("tool-gate").from_plugin,
 }
 
