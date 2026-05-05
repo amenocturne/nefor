@@ -196,6 +196,14 @@ local current_session_file = nil
 -- every open (init and resume swap).
 local submits_written = 0
 
+-- True when the current session file was opened via `M.resume(...)` —
+-- i.e. it carries prior content from another run. Without this guard
+-- `close_and_prune_if_empty` would delete a resumed-but-not-modified
+-- session on the next swap (or quit), because no submit envelopes are
+-- written during replay-only viewing of an existing file. Reset along
+-- with `submits_written` on close.
+local current_session_was_resumed = false
+
 -- Subscription bookkeeping so tests can reset between scenarios.
 local persistence_installed = false
 local resume_listener_installed = false
@@ -356,10 +364,17 @@ end
 -- counter so the next open starts clean.
 local function close_and_prune_if_empty()
   close_session_file()
-  if submits_written == 0 and current_session_path ~= nil then
+  -- Never prune a session that was opened via resume — the file already
+  -- has prior content and `submits_written` only counts submits made
+  -- *this run*. Pruning here would silently delete the user's history
+  -- the moment they swap away from a resumed session.
+  if submits_written == 0
+      and not current_session_was_resumed
+      and current_session_path ~= nil then
     pcall(os.remove, current_session_path)
   end
   submits_written = 0
+  current_session_was_resumed = false
 end
 
 -- ------------------------------------------------------------------
@@ -637,6 +652,7 @@ function M.resume(target_session_id)
   end
   current_session_id   = target_session_id
   current_session_path = new_path
+  current_session_was_resumed = true
   if new_path ~= nil then
     local fh, err = open_session_file(new_path, target_session_id)
     if fh == nil and nefor.log and nefor.log.error then
