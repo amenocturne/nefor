@@ -1795,6 +1795,15 @@ pub fn wrap_styled(chars: &[StyledChar], width: u16, wrap: WrapMode) -> Vec<Vec<
 
     let mut wrapped: Vec<Vec<StyledChar>> = Vec::new();
     for raw in logical {
+        // Empty logical lines (consecutive `\n`s) carry the markdown
+        // walker's block separators. Preserve them as empty visual rows
+        // so blank lines actually render between blocks — without this
+        // passthrough, `wrap_styled_word`/`_char` produce zero rows for
+        // empty input and the spacing collapses.
+        if raw.is_empty() {
+            wrapped.push(Vec::new());
+            continue;
+        }
         match wrap {
             WrapMode::None => wrapped.push(take_styled_columns(&raw, limit)),
             WrapMode::Char => wrapped.extend(wrap_styled_char(&raw, limit)),

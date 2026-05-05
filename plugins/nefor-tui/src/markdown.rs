@@ -148,9 +148,14 @@ impl<'a> Walker<'a> {
                 self.emit_str(" ", Style::default());
             }
             Event::Rule => {
+                // Render `---` as a real horizontal rule across the pane
+                // using `─` (U+2500). Falls back to a 60-cell rule when
+                // available_width is unset (None or 0) so the rule still
+                // looks like a divider rather than three literal dashes.
                 self.ensure_block_separator();
-                let s = Style::default();
-                self.emit_str("---", s);
+                let width = self.available_width.filter(|w| *w > 0).unwrap_or(60);
+                let line: String = "─".repeat(width);
+                self.emit_str(&line, Style::default());
                 self.emit_str("\n", Style::default());
                 self.at_line_start = true;
                 self.started = true;
@@ -554,7 +559,7 @@ impl<'a> Walker<'a> {
                         for sc in line {
                             self.out.push(sc.clone());
                         }
-                        line.iter().map(|c| char_display_width(c.ch)).sum::<usize>()
+                        slice_visual_width(line)
                     } else {
                         0
                     };
@@ -594,7 +599,36 @@ impl<'a> Walker<'a> {
 }
 
 fn cell_natural_width(cell: &[StyledChar]) -> usize {
-    cell.iter().map(|c| char_display_width(c.ch)).sum()
+    slice_visual_width(cell)
+}
+
+/// Visual width of a styled-char run, measured the way a terminal will
+/// actually render it. Differs from a naive `Σ char_display_width` in
+/// one way that matters in practice: the emoji-presentation selector
+/// VS16 (U+FE0F) following a base char that `unicode-width` reports as
+/// 1 forces it to render as 2 cells. Without this adjustment, cells
+/// like `⚠️` (U+26A0 + U+FE0F) measure as 1 but render as 2, throwing
+/// off table column padding by one per emoji.
+///
+/// Other emoji edge cases (ZWJ sequences, regional-indicator flag
+/// pairs) aren't handled here yet — they're rarer in agent output and
+/// would need grapheme-cluster segmentation to do correctly.
+fn slice_visual_width(slice: &[StyledChar]) -> usize {
+    let mut total = 0usize;
+    let mut prev_w = 0usize;
+    for sc in slice {
+        if sc.ch == '\u{FE0F}' {
+            if prev_w == 1 {
+                total += 1;
+                prev_w = 2;
+            }
+            continue;
+        }
+        let w = char_display_width(sc.ch);
+        total += w;
+        prev_w = w;
+    }
+    total
 }
 
 /// Shrink `col_widths` in place so `Σ widths + overhead ≤ budget`,
@@ -686,7 +720,7 @@ fn wrap_cell_lines(cell: &[StyledChar], limit: usize) -> Vec<Vec<StyledChar>> {
     let mut col = 0usize;
 
     for word in split_styled_into_words(cell) {
-        let ww: usize = word.iter().map(|c| char_display_width(c.ch)).sum();
+        let ww: usize = slice_visual_width(word);
         let is_ws = word.iter().all(|c| c.ch.is_whitespace());
 
         if col > 0 && col + ww > limit {
@@ -1189,7 +1223,7 @@ code
             ("─┤", "code"),          // table-divider → code (header divider just before code body)
             ("code", "▎"),           // code block → blockquote
             ("quoted", "-"),         // blockquote → list
-            ("list item", "---"),    // list → horizontal rule
+            ("list item", "─"),      // list → horizontal rule (rendered as `─`-fill)
         ];
         for (a, b) in boundaries {
             let ai = s.find(a).unwrap_or_else(|| panic!("prefix {a:?} not found in {s:?}"));
