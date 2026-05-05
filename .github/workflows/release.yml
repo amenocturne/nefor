@@ -14,6 +14,8 @@ permissions:
 jobs:
   release:
     runs-on: macos-14
+    outputs:
+      sha256: ${{ steps.bundle.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -47,10 +49,12 @@ jobs:
           cp LICENSE README.md CHANGELOG.md "$DIST/share/nefor/"
 
           tar -czf "$DIST.tar.gz" "$DIST"
-          shasum -a 256 "$DIST.tar.gz" | tee "$DIST.tar.gz.sha256"
+          SHA256=$(shasum -a 256 "$DIST.tar.gz" | awk '{print $1}')
+          printf '%s  %s\n' "$SHA256" "$DIST.tar.gz" > "$DIST.tar.gz.sha256"
 
           echo "tarball=$DIST.tar.gz" >> "$GITHUB_OUTPUT"
           echo "sha256_file=$DIST.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
 
       - name: gh release
         uses: softprops/action-gh-release@v2
@@ -61,3 +65,36 @@ jobs:
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-tap:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tap
+        uses: actions/checkout@v4
+        with:
+          repository: amenocturne/homebrew-tap
+          token: ${{ secrets.TAP_PUSH_TOKEN }}
+
+      - name: Update Formula/nefor.rb
+        env:
+          SHA256: ${{ needs.release.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          URL="https://github.com/amenocturne/nefor/releases/download/${GITHUB_REF_NAME}/nefor-aarch64-apple-darwin.tar.gz"
+          sed -i "s|^  url \".*\"|  url \"$URL\"|"       Formula/nefor.rb
+          sed -i "s|^  sha256 \".*\"|  sha256 \"$SHA256\"|" Formula/nefor.rb
+          sed -i "s|^  version \".*\"|  version \"$VERSION\"|" Formula/nefor.rb
+
+      - name: Commit + push
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet Formula/nefor.rb; then
+            echo "No formula changes; skipping commit."
+            exit 0
+          fi
+          git commit -am "Bump nefor to ${GITHUB_REF_NAME}"
+          git push
