@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.3
+
+- **`openai-provider --auth-header NAME`**: send the API key under a non-standard header instead of `Authorization: Bearer …`. Useful for gateways that gate on a custom header (proxies, internal LLM routers). Defaults to `Authorization` so existing setups stay byte-identical.
+- **CI automation**: release workflow now auto-bumps `amenocturne/homebrew-tap`'s `Formula/nefor.rb` after each tag push, and supports manual triggers via Actions UI (`workflow_dispatch` with a `tag` input).
+
 ## v0.1.2
 
 UX fixes for the chat surface, surfaced during v0.1.1 bring-up.
