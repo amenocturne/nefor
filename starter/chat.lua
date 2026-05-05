@@ -2200,21 +2200,47 @@ local function dag_node_dispatched(state, run_id, node_id, reasoner, now_ms)
 end
 
 local function dag_node_result(state, run_id, node_id, has_output, has_error, now_ms)
-  if not (state.dag_runs and state.dag_runs[run_id]
-          and state.dag_runs[run_id].nodes
-          and state.dag_runs[run_id].nodes[node_id]) then
-    return state
+  local terminal_status
+  if has_output then terminal_status = "done"
+  elseif has_error then terminal_status = "error"
+  else terminal_status = "error" end
+  -- Orphan path: a graph.node_result arrived for a node we never observed
+  -- via graph.node_dispatched (or for a run we never observed via
+  -- graph.run_started). Silently dropping it leaves the panel showing the
+  -- node as never-finished — the result is the *only* signal that node
+  -- terminated, so we synthesize a started==finished record so the panel
+  -- still reflects reality. Warn so we can spot how often this fires.
+  local known_run  = state.dag_runs and state.dag_runs[run_id]
+  local known_node = known_run and known_run.nodes and known_run.nodes[node_id]
+  if not known_node then
+    nefor.log.warn("chat: graph.node_result for unknown node", {
+      run_id  = run_id,
+      node_id = node_id,
+      status  = terminal_status,
+      run_seen = known_run ~= nil,
+    })
+    return dag_apply(state, run_id, function(prev)
+      local run = prev or {
+        run_id = run_id, total_nodes = 0, started_at_ms = now_ms,
+        nodes = {}, completed_at_ms = nil,
+      }
+      local nodes = {}
+      for k, v in pairs(run.nodes or {}) do nodes[k] = v end
+      nodes[node_id] = {
+        reasoner       = "",
+        status         = terminal_status,
+        started_at_ms  = now_ms,
+        finished_at_ms = now_ms,
+      }
+      return shallow_merge(run, { nodes = nodes })
+    end)
   end
   return dag_apply(state, run_id, function(prev)
     local nodes = {}
     for k, v in pairs(prev.nodes or {}) do nodes[k] = v end
     local node = nodes[node_id]
-    local status
-    if has_output then status = "done"
-    elseif has_error then status = "error"
-    else status = "error" end
     nodes[node_id] = shallow_merge(node, {
-      status = status, finished_at_ms = now_ms,
+      status = terminal_status, finished_at_ms = now_ms,
     })
     return shallow_merge(prev, { nodes = nodes })
   end)
