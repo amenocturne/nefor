@@ -209,8 +209,19 @@ impl<'a> Walker<'a> {
             Tag::Strikethrough => self.inline.strikethrough += 1,
             Tag::Link { .. } => self.inline.link += 1,
             Tag::Image { .. } => { /* skip image alt; inline-text events still fire */ }
-            // Tables / footnotes / metadata blocks fall through — text
-            // events still fire and we surface them as plain spans.
+            // Tables: render as `| cell | cell |` rows. Without this the
+            // walker silently swallowed the wrapping tags and emitted the
+            // cell text events back-to-back, producing run-together output
+            // (`ToolPurposeread_fileRead...`). No alignment / no divider
+            // row — minimum viable rendering for terminal readability.
+            Tag::Table(_) => {
+                self.ensure_block_separator();
+            }
+            Tag::TableCell => {
+                self.emit_str("| ", Style::default());
+            }
+            // Footnotes / metadata blocks fall through — text events still
+            // fire and we surface them as plain spans.
             _ => {}
         }
     }
@@ -252,6 +263,19 @@ impl<'a> Walker<'a> {
                 self.inline.strikethrough = self.inline.strikethrough.saturating_sub(1)
             }
             TagEnd::Link => self.inline.link = self.inline.link.saturating_sub(1),
+            TagEnd::TableCell => {
+                self.emit_str(" ", Style::default());
+            }
+            TagEnd::TableHead | TagEnd::TableRow => {
+                self.emit_str("|\n", Style::default());
+                self.at_line_start = true;
+            }
+            TagEnd::Table => {
+                if !self.at_line_start {
+                    self.emit_str("\n", Style::default());
+                }
+                self.at_line_start = true;
+            }
             _ => {}
         }
     }
@@ -614,6 +638,26 @@ mod tests {
     #[test]
     fn empty_input_produces_empty_output() {
         assert!(render_to_styled_chars("", None).is_empty());
+    }
+
+    #[test]
+    fn gfm_table_renders_as_pipe_separated_rows() {
+        // Without table support the walker silently swallowed every
+        // wrapping tag and emitted Event::Text events back-to-back, so
+        // a GFM table came out as `ToolPurposeread_fileRead...`. Lock
+        // in the new behaviour: each cell ends up wrapped in `| ... |`,
+        // and rows end with newlines.
+        let src = "| Tool | Purpose |\n| --- | --- |\n| read_file | reads files |\n";
+        let r = render_to_styled_chars(src, None);
+        let s: String = r.iter().map(|c| c.ch).collect();
+        assert!(
+            s.contains("| Tool | Purpose |\n"),
+            "expected pipe-wrapped header row, got: {s:?}"
+        );
+        assert!(
+            s.contains("| read_file | reads files |\n"),
+            "expected pipe-wrapped data row, got: {s:?}"
+        );
     }
 
     #[test]
