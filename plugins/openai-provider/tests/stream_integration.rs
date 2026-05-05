@@ -67,6 +67,7 @@ async fn streaming_emits_deltas_then_end() {
         &client,
         &endpoint,
         None,
+        "Authorization",
         "test-model",
         &messages,
         None,
@@ -113,6 +114,7 @@ async fn request_failure_emits_turn_error() {
         &client,
         &endpoint,
         None,
+        "Authorization",
         "nonexistent",
         &messages,
         None,
@@ -193,6 +195,7 @@ async fn chat_completion_uses_passed_in_model_not_a_default() {
         &client,
         &endpoint,
         None,
+        "Authorization",
         "the-active-model",
         &messages,
         None,
@@ -231,7 +234,7 @@ async fn list_models_returns_sorted_ids() {
 
     let client = reqwest::Client::builder().build().expect("client");
     let base_url = format!("http://{}", addr);
-    let models = list_models(&client, &base_url, None).await.expect("ok");
+    let models = list_models(&client, &base_url, None, "Authorization").await.expect("ok");
 
     let _ = server.await;
 
@@ -257,7 +260,7 @@ async fn list_models_propagates_unauthorized() {
 
     let client = reqwest::Client::builder().build().expect("client");
     let base_url = format!("http://{}", addr);
-    let err = list_models(&client, &base_url, Some("badkey"))
+    let err = list_models(&client, &base_url, Some("badkey"), "Authorization")
         .await
         .expect_err("should fail");
 
@@ -291,6 +294,7 @@ async fn unauthorized_response_yields_unauthorized_variant() {
         &client,
         &endpoint,
         Some("badkey"),
+        "Authorization",
         "any-model",
         &messages,
         None,
@@ -344,6 +348,7 @@ async fn streaming_assembles_tool_call_from_fragmented_deltas() {
         &client,
         &endpoint,
         None,
+        "Authorization",
         "test-model",
         &messages,
         None,
@@ -436,6 +441,7 @@ async fn request_body_carries_tools_array_when_present() {
         &client,
         &endpoint,
         None,
+        "Authorization",
         "any-model",
         &messages,
         Some(&tools_array),
@@ -524,6 +530,7 @@ async fn request_body_omits_tools_when_none_attached() {
         &client,
         &endpoint,
         None,
+        "Authorization",
         "any-model",
         &messages,
         None,

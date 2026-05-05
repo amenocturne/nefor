@@ -70,6 +70,14 @@ pub struct Config {
     /// init.lua.
     #[arg(long = "api-key", env = "OPENAI_PROVIDER_API_KEY")]
     pub api_key: Option<String>,
+
+    /// HTTP header to carry the API key. Default `Authorization` uses
+    /// the standard `Authorization: Bearer <key>` form. A custom value
+    /// (e.g. `Nestor-Token`) sends the key raw under that header name —
+    /// no `Bearer` prefix. Required for OpenAI-compatible backends that
+    /// gate on a non-standard header name.
+    #[arg(long = "auth-header", default_value = "Authorization")]
+    pub auth_header: String,
 }
 
 /// Map `--name` to the public `provider_name` flag. Clap's derive uses
@@ -123,6 +131,7 @@ mod tests {
             base_url: "http://localhost:11434".into(),
             model: Some("qwen2.5-coder:7b".into()),
             api_key: None,
+            auth_header: "Authorization".into(),
         }
     }
 
@@ -181,6 +190,13 @@ mod tests {
         assert_eq!(c.base_url, "http://localhost:11434");
         assert!(c.model.is_none(), "model is opt-in; no compiled-in fallback");
         assert!(c.api_key.is_none());
+        assert_eq!(c.auth_header, "Authorization");
+    }
+
+    #[test]
+    fn auth_header_flag_overrides_default() {
+        let (_g, c) = parse_clean(&["openai-provider", "--auth-header", "Nestor-Token"]);
+        assert_eq!(c.auth_header, "Nestor-Token");
     }
 
     #[test]
