@@ -446,7 +446,7 @@ async fn dispatch_event(
         }
         "models.list_requested" => {
             let token = auth.token().await;
-            match list_models(client, &config.base_url, token.as_deref()).await {
+            match list_models(client, &config.base_url, token.as_deref(), &config.auth_header).await {
                 Ok(models) => {
                     send_event(out_tx, models_listed_body(config, &models)).await?;
                 }
@@ -673,6 +673,7 @@ fn spawn_turn(
                 &client,
                 &endpoint,
                 token.as_deref(),
+                &config.auth_header,
                 &active_model,
                 &history,
                 tools_slice,
@@ -1617,6 +1618,7 @@ mod tests {
             base_url: "http://localhost:11434".into(),
             model: Some("qwen2.5-coder:7b".into()),
             api_key: None,
+            auth_header: "Authorization".into(),
         }
     }
 

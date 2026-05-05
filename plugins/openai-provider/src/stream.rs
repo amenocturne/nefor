@@ -96,6 +96,7 @@ pub async fn run_chat_stream<F, R>(
     client: &reqwest::Client,
     endpoint: &str,
     api_key: Option<&str>,
+    auth_header: &str,
     model: &str,
     messages: &[Message],
     tools: Option<&[serde_json::Value]>,
@@ -133,7 +134,7 @@ where
 
     let mut builder = client.post(endpoint).json(&req);
     if let Some(k) = api_key {
-        builder = builder.bearer_auth(k);
+        builder = apply_auth(builder, auth_header, k);
     }
 
     let response = tokio::select! {
@@ -212,6 +213,26 @@ where
     Ok(outcome)
 }
 
+/// Apply the API key to the request builder under the configured
+/// header. `Authorization` (the default) takes the standard
+/// `Authorization: Bearer <key>` shape via reqwest's `bearer_auth`,
+/// preserving compatibility with Ollama / OpenAI / Groq / etc. Any
+/// other header name sends the key raw — `<header>: <key>` — for
+/// backends like the corp Nestor gateway that gate on a non-standard
+/// header. Comparison is case-insensitive so users can write
+/// `--auth-header authorization` without surprise.
+fn apply_auth(
+    builder: reqwest::RequestBuilder,
+    auth_header: &str,
+    key: &str,
+) -> reqwest::RequestBuilder {
+    if auth_header.eq_ignore_ascii_case("Authorization") {
+        builder.bearer_auth(key)
+    } else {
+        builder.header(auth_header, key)
+    }
+}
+
 /// Fire `ReasoningEvent::End` once, idempotently. Called whenever the
 /// stream wraps up — either because content has started, the model
 /// emitted `finish_reason`, or the body terminated. Skips firing when
@@ -238,11 +259,12 @@ pub async fn list_models(
     client: &reqwest::Client,
     base_url: &str,
     api_key: Option<&str>,
+    auth_header: &str,
 ) -> Result<Vec<String>, StreamError> {
     let endpoint = format!("{}/v1/models", base_url.trim_end_matches('/'));
     let mut builder = client.get(&endpoint);
     if let Some(k) = api_key {
-        builder = builder.bearer_auth(k);
+        builder = apply_auth(builder, auth_header, k);
     }
     let response = builder
         .send()
