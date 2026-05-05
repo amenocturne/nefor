@@ -156,20 +156,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mock-plugin"
-version = "0.1.0"
-dependencies = [
- "nefor-protocol",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

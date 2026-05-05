@@ -2,7 +2,7 @@
 //!
 //! Startup sequence:
 //!
-//! 1. Parse CLI (`--config <DIR>`, optional `plugin` subcommand).
+//! 1. Parse CLI (`--config`, `--data-dir`, `--plugin-dir`, optional `plugin` subcommand).
 //! 2. Resolve the config dir, initialize tracing to a file under it.
 //! 3. Boot the Lua VM with a [`BrokerOps`] routing sink and run
 //!    `init.lua`. Cache the global `dispatch` function — fatal if missing.
@@ -53,9 +53,25 @@ use crate::ncp::{
 async fn main() -> anyhow::Result<()> {
     let args = cli::parse();
     let mode = engine_mode_from_cli(&args);
-    let config_dir = config::resolve(&args)
+    let config_dir = config::resolve_config(&args)
         .map_err(NeforError::from)
         .context("resolving config directory")?;
+
+    // Resolve the data dir and propagate it to the environment so Lua can
+    // read it via os.getenv("NEFOR_DATA_DIR"). The CLI flag takes highest
+    // precedence; env var is already set if the user exported it; the XDG
+    // default is written only when neither is present.
+    let data_dir = config::resolve_data(&args)
+        .map_err(NeforError::from)
+        .context("resolving data directory")?;
+    // Only set when --data-dir was given (so the CLI flag wins over an
+    // existing NEFOR_DATA_DIR env var without silently overwriting it).
+    if args.data_dir.is_some() {
+        // SAFETY: single-threaded at this point, before any thread spawns.
+        unsafe {
+            std::env::set_var("NEFOR_DATA_DIR", data_dir.as_path());
+        }
+    }
 
     let log_path = config_dir.as_path().join("nefor.log");
     if let Err(e) = log::init(&log_path) {
@@ -64,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(
         config_dir = %config_dir,
+        data_dir = %data_dir,
         log_path = %log_path.display(),
         ?mode,
         "nefor starting"
@@ -113,7 +130,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     } else {
-        tracing::info!(path = %init_lua.display(), "no init.lua at expected path");
+        eprintln!(
+            "nefor: no init.lua found at {}. \
+             Set NEFOR_CONFIG_DIR or pass --config <DIR> pointing at a directory \
+             that contains init.lua. See README for install instructions.",
+            init_lua.display()
+        );
+        std::process::exit(1);
     }
 
     // Cache dispatch now — fatal if init.lua didn't define one.

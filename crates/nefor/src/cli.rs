@@ -9,7 +9,7 @@
 //!   plugins that registered a `cli` field or invokes the named plugin's
 //!   `cli` function with the leftover argv.
 //!
-//! `--config` / `--plugin-dir` are global flags applicable to both modes.
+//! `--config` / `--data-dir` / `--plugin-dir` are global flags applicable to both modes.
 
 use std::path::PathBuf;
 
@@ -24,19 +24,23 @@ use clap::{Parser, Subcommand};
     long_about = "nefor is a TUI/GUI agent runtime. The binary ships voiceless — \
                   providers, harnesses, DAG orchestration, personas, and statusline \
                   content all live in plugins loaded from the user's init.lua.\n\n\
-                  Config lives at $XDG_CONFIG_HOME/nefor/ by default; set \
-                  NEFOR_APPNAME=<name> for a parallel profile at \
-                  $XDG_CONFIG_HOME/nefor-<name>/, or pass --config <DIR> to \
-                  override for one invocation."
+                  Config: $NEFOR_CONFIG_DIR or $XDG_CONFIG_HOME/nefor/ (default ~/.config/nefor/).\n\
+                  Data:   $NEFOR_DATA_DIR or $XDG_DATA_HOME/nefor/ (default ~/.local/share/nefor/).\n\
+                  Plugins: $NEFOR_PLUGIN_DIR or $NEFOR_DATA_DIR/plugins/.\n\
+                  CLI flags --config/--data-dir/--plugin-dir override env vars."
 )]
 pub struct Cli {
-    /// Override the config directory (highest precedence; beats `NEFOR_APPNAME`).
+    /// Override the config directory (highest precedence; beats `NEFOR_CONFIG_DIR`).
     #[arg(long, value_name = "DIR", global = true)]
     pub config: Option<PathBuf>,
 
+    /// Override the data directory (highest precedence; beats `NEFOR_DATA_DIR`
+    /// and the XDG default `~/.local/share/nefor/`).
+    #[arg(long, value_name = "DIR", global = true)]
+    pub data_dir: Option<PathBuf>,
+
     /// Override the plugin root directory (highest precedence; beats
-    /// `NEFOR_PLUGIN_DIR` and the XDG / dev fallbacks). Each registered
-    /// plugin gets `<this-dir>/<name>/` as its working directory.
+    /// `NEFOR_PLUGIN_DIR` and the XDG / dev fallbacks).
     #[arg(long, value_name = "DIR", global = true)]
     pub plugin_dir: Option<PathBuf>,
 

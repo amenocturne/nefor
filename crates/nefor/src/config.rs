@@ -1,45 +1,42 @@
-//! Config directory resolution.
+//! Config and data directory resolution.
 //!
-//! Per spec §Configuration Model:
-//! - `--config <DIR>` wins over everything.
-//! - Else if `NEFOR_APPNAME=<name>` is set, use `$XDG_CONFIG_HOME/nefor-<name>/`.
-//! - Else use `$XDG_CONFIG_HOME/nefor/`.
+//! Precedence (highest → lowest):
+//! - `--config <DIR>` / `--data-dir <DIR>` CLI flags
+//! - `NEFOR_CONFIG_DIR` / `NEFOR_DATA_DIR` environment variables
+//! - XDG defaults (`~/.config/nefor/` and `~/.local/share/nefor/`)
 //!
-//! Resolution is pure: [`resolve_from`] takes the parsed CLI and an
-//! [`EnvReader`] and returns a [`ConfigDir`]. I/O (reading `init.lua`, creating
-//! the directory) is a later task.
+//! Resolution is pure: [`resolve_config_from`] / [`resolve_data_from`] take
+//! the parsed CLI and an [`EnvReader`]. I/O (reading `init.lua`, creating
+//! directories) happens later.
 
 use std::path::PathBuf;
 
 use crate::cli::Cli;
-use crate::paths::ConfigDir;
+use crate::paths::{ConfigDir, DataDir};
 
-/// Typed errors produced during config-dir resolution.
+/// Typed errors produced during directory resolution.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// `dirs::config_dir()` returned `None` — the platform couldn't locate a
-    /// home / XDG config root. Rare in practice (missing `$HOME` on Unix).
+    /// Neither a CLI flag, env var, nor a usable XDG root was found.
     #[error("could not determine XDG config directory (is $HOME set?)")]
     NoXdgConfigDir,
 
-    /// `NEFOR_APPNAME` was set but empty — almost certainly a user mistake
-    /// (a shell expansion of an unset variable); fail loud rather than
-    /// silently falling back to `$XDG_CONFIG_HOME/nefor-/`.
-    #[error("NEFOR_APPNAME is set but empty")]
-    EmptyAppName,
+    #[error("could not determine XDG data directory (is $HOME set?)")]
+    NoXdgDataDir,
 }
 
-/// Read-only view of the process environment used by [`resolve_from`]. A
+/// Read-only view of the process environment used by the resolve functions. A
 /// trait so unit tests can inject a deterministic env without mutating the
 /// real one (which would require `serial_test` for race-free concurrent tests).
 pub trait EnvReader {
-    /// Return the value of `key` if set, else `None`.
     fn get(&self, key: &str) -> Option<String>;
     /// Return the XDG config-home root (`$XDG_CONFIG_HOME` or `~/.config`).
     fn xdg_config_home(&self) -> Option<PathBuf>;
+    /// Return the XDG data-home root (`$XDG_DATA_HOME` or `~/.local/share`).
+    fn xdg_data_home(&self) -> Option<PathBuf>;
 }
 
-/// [`EnvReader`] backed by the real process environment + [`dirs`].
+/// [`EnvReader`] backed by the real process environment.
 pub struct SystemEnv;
 
 impl EnvReader for SystemEnv {
@@ -48,35 +45,55 @@ impl EnvReader for SystemEnv {
     }
     // Literal XDG on every platform — spec pins `~/.config/nefor/init.lua` as
     // the default. `dirs::config_dir()` would give `~/Library/Application Support`
-    // on macOS, which diverges from the Neovim convention the spec references.
+    // on macOS, which diverges from the Neovim convention.
     fn xdg_config_home(&self) -> Option<PathBuf> {
         std::env::var_os("XDG_CONFIG_HOME")
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
     }
+    fn xdg_data_home(&self) -> Option<PathBuf> {
+        std::env::var_os("XDG_DATA_HOME")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"))
+            })
+    }
 }
 
 /// Resolve the config directory from CLI args + environment. Pure.
-pub fn resolve_from(cli: &Cli, env: &impl EnvReader) -> Result<ConfigDir, ConfigError> {
+pub fn resolve_config_from(cli: &Cli, env: &impl EnvReader) -> Result<ConfigDir, ConfigError> {
     if let Some(dir) = &cli.config {
         return Ok(ConfigDir(dir.clone()));
     }
-
+    if let Some(raw) = env.get("NEFOR_CONFIG_DIR").filter(|s| !s.is_empty()) {
+        return Ok(ConfigDir(PathBuf::from(raw)));
+    }
     let xdg = env.xdg_config_home().ok_or(ConfigError::NoXdgConfigDir)?;
+    Ok(ConfigDir(xdg.join("nefor")))
+}
 
-    let leaf = match env.get("NEFOR_APPNAME") {
-        Some(name) if name.is_empty() => return Err(ConfigError::EmptyAppName),
-        Some(name) => format!("nefor-{name}"),
-        None => "nefor".to_string(),
-    };
-
-    Ok(ConfigDir(xdg.join(leaf)))
+/// Resolve the data directory from CLI args + environment. Pure.
+pub fn resolve_data_from(cli: &Cli, env: &impl EnvReader) -> Result<DataDir, ConfigError> {
+    if let Some(dir) = &cli.data_dir {
+        return Ok(DataDir(dir.clone()));
+    }
+    if let Some(raw) = env.get("NEFOR_DATA_DIR").filter(|s| !s.is_empty()) {
+        return Ok(DataDir(PathBuf::from(raw)));
+    }
+    let xdg = env.xdg_data_home().ok_or(ConfigError::NoXdgDataDir)?;
+    Ok(DataDir(xdg.join("nefor")))
 }
 
 /// Resolve the config directory using the real process environment.
-pub fn resolve(cli: &Cli) -> Result<ConfigDir, ConfigError> {
-    resolve_from(cli, &SystemEnv)
+pub fn resolve_config(cli: &Cli) -> Result<ConfigDir, ConfigError> {
+    resolve_config_from(cli, &SystemEnv)
+}
+
+/// Resolve the data directory using the real process environment.
+pub fn resolve_data(cli: &Cli) -> Result<DataDir, ConfigError> {
+    resolve_data_from(cli, &SystemEnv)
 }
 
 #[cfg(test)]
@@ -86,14 +103,16 @@ mod tests {
 
     struct FakeEnv {
         vars: HashMap<String, String>,
-        xdg: Option<PathBuf>,
+        xdg_config: Option<PathBuf>,
+        xdg_data: Option<PathBuf>,
     }
 
     impl FakeEnv {
-        fn new(xdg: Option<&str>) -> Self {
+        fn new(xdg_config: Option<&str>, xdg_data: Option<&str>) -> Self {
             Self {
                 vars: HashMap::new(),
-                xdg: xdg.map(PathBuf::from),
+                xdg_config: xdg_config.map(PathBuf::from),
+                xdg_data: xdg_data.map(PathBuf::from),
             }
         }
         fn with(mut self, key: &str, val: &str) -> Self {
@@ -107,66 +126,115 @@ mod tests {
             self.vars.get(key).cloned()
         }
         fn xdg_config_home(&self) -> Option<PathBuf> {
-            self.xdg.clone()
+            self.xdg_config.clone()
+        }
+        fn xdg_data_home(&self) -> Option<PathBuf> {
+            self.xdg_data.clone()
         }
     }
 
-    fn cli_with_config(dir: Option<&str>) -> Cli {
+    fn cli_bare() -> Cli {
         Cli {
-            config: dir.map(PathBuf::from),
+            config: None,
+            data_dir: None,
+            plugin_dir: None,
+            command: None,
+        }
+    }
+    fn cli_with_config(dir: &str) -> Cli {
+        Cli {
+            config: Some(PathBuf::from(dir)),
+            data_dir: None,
+            plugin_dir: None,
+            command: None,
+        }
+    }
+    fn cli_with_data(dir: &str) -> Cli {
+        Cli {
+            config: None,
+            data_dir: Some(PathBuf::from(dir)),
             plugin_dir: None,
             command: None,
         }
     }
 
+    // --- config dir ---
+
     #[test]
-    fn cli_flag_beats_env_and_default() {
-        let cli = cli_with_config(Some("/tmp/my-config"));
-        let env = FakeEnv::new(Some("/home/u/.config")).with("NEFOR_APPNAME", "analyst");
-        let got = resolve_from(&cli, &env).expect("resolve ok");
+    fn config_cli_flag_beats_env_and_default() {
+        let cli = cli_with_config("/tmp/my-config");
+        let env = FakeEnv::new(Some("/home/u/.config"), None)
+            .with("NEFOR_CONFIG_DIR", "/env/config");
+        let got = resolve_config_from(&cli, &env).expect("resolve ok");
         assert_eq!(got, ConfigDir(PathBuf::from("/tmp/my-config")));
     }
 
     #[test]
-    fn env_appname_beats_default() {
-        let cli = cli_with_config(None);
-        let env = FakeEnv::new(Some("/home/u/.config")).with("NEFOR_APPNAME", "analyst");
-        let got = resolve_from(&cli, &env).expect("resolve ok");
-        assert_eq!(
-            got,
-            ConfigDir(PathBuf::from("/home/u/.config/nefor-analyst"))
-        );
+    fn config_env_var_beats_xdg_default() {
+        let cli = cli_bare();
+        let env = FakeEnv::new(Some("/home/u/.config"), None)
+            .with("NEFOR_CONFIG_DIR", "/env/config");
+        let got = resolve_config_from(&cli, &env).expect("resolve ok");
+        assert_eq!(got, ConfigDir(PathBuf::from("/env/config")));
     }
 
     #[test]
-    fn default_when_neither_set() {
-        let cli = cli_with_config(None);
-        let env = FakeEnv::new(Some("/home/u/.config"));
-        let got = resolve_from(&cli, &env).expect("resolve ok");
+    fn config_xdg_default_when_no_flag_or_env() {
+        let cli = cli_bare();
+        let env = FakeEnv::new(Some("/home/u/.config"), None);
+        let got = resolve_config_from(&cli, &env).expect("resolve ok");
         assert_eq!(got, ConfigDir(PathBuf::from("/home/u/.config/nefor")));
     }
 
     #[test]
-    fn empty_appname_is_an_error() {
-        let cli = cli_with_config(None);
-        let env = FakeEnv::new(Some("/home/u/.config")).with("NEFOR_APPNAME", "");
-        let err = resolve_from(&cli, &env).expect_err("must error");
-        assert!(matches!(err, ConfigError::EmptyAppName));
-    }
-
-    #[test]
-    fn missing_xdg_is_an_error_when_no_flag() {
-        let cli = cli_with_config(None);
-        let env = FakeEnv::new(None);
-        let err = resolve_from(&cli, &env).expect_err("must error");
+    fn config_missing_xdg_errors_without_flag_or_env() {
+        let cli = cli_bare();
+        let env = FakeEnv::new(None, None);
+        let err = resolve_config_from(&cli, &env).expect_err("must error");
         assert!(matches!(err, ConfigError::NoXdgConfigDir));
     }
 
     #[test]
-    fn missing_xdg_is_fine_when_flag_is_given() {
-        let cli = cli_with_config(Some("/tmp/x"));
-        let env = FakeEnv::new(None);
-        let got = resolve_from(&cli, &env).expect("flag bypasses xdg lookup");
+    fn config_cli_flag_ok_without_xdg() {
+        let cli = cli_with_config("/tmp/x");
+        let env = FakeEnv::new(None, None);
+        let got = resolve_config_from(&cli, &env).expect("flag bypasses xdg");
         assert_eq!(got, ConfigDir(PathBuf::from("/tmp/x")));
+    }
+
+    // --- data dir ---
+
+    #[test]
+    fn data_cli_flag_beats_env_and_default() {
+        let cli = cli_with_data("/tmp/my-data");
+        let env = FakeEnv::new(None, Some("/home/u/.local/share"))
+            .with("NEFOR_DATA_DIR", "/env/data");
+        let got = resolve_data_from(&cli, &env).expect("resolve ok");
+        assert_eq!(got, DataDir(PathBuf::from("/tmp/my-data")));
+    }
+
+    #[test]
+    fn data_env_var_beats_xdg_default() {
+        let cli = cli_bare();
+        let env = FakeEnv::new(None, Some("/home/u/.local/share"))
+            .with("NEFOR_DATA_DIR", "/env/data");
+        let got = resolve_data_from(&cli, &env).expect("resolve ok");
+        assert_eq!(got, DataDir(PathBuf::from("/env/data")));
+    }
+
+    #[test]
+    fn data_xdg_default_when_no_flag_or_env() {
+        let cli = cli_bare();
+        let env = FakeEnv::new(None, Some("/home/u/.local/share"));
+        let got = resolve_data_from(&cli, &env).expect("resolve ok");
+        assert_eq!(got, DataDir(PathBuf::from("/home/u/.local/share/nefor")));
+    }
+
+    #[test]
+    fn data_missing_xdg_errors_without_flag_or_env() {
+        let cli = cli_bare();
+        let env = FakeEnv::new(None, None);
+        let err = resolve_data_from(&cli, &env).expect_err("must error");
+        assert!(matches!(err, ConfigError::NoXdgDataDir));
     }
 }

@@ -47,17 +47,12 @@ impl PluginRoot {
 ///
 /// 1. `cli_override` — explicit `--plugin-dir` flag.
 /// 2. `NEFOR_PLUGIN_DIR` environment variable.
-/// 3. `$XDG_DATA_HOME/nefor/plugins/` (falling back to
+/// 3. `$NEFOR_DATA_DIR/plugins/` if `NEFOR_DATA_DIR` is set.
+/// 4. `$XDG_DATA_HOME/nefor/plugins/` (falling back to
 ///    `~/.local/share/nefor/plugins/`).
-/// 4. Dev fallback — walk upward from the current executable looking for
-///    a `Cargo.toml` with a `plugins/` sibling. Returns that `plugins/`
-///    directory when found. This is the only branch that reaches into
-///    the repo layout; it exists so `cargo run` from the worktree Just
-///    Works during development.
 ///
-/// Returns `None` if none of the above produced a usable path (missing
-/// env vars and no dev layout). The engine treats this as a fatal
-/// configuration error at startup.
+/// Returns `None` if none of the above produced a usable path. The engine
+/// treats this as a fatal configuration error at startup.
 pub fn resolve_plugin_root(cli_override: Option<PathBuf>) -> Option<PluginRoot> {
     if let Some(p) = cli_override {
         return Some(PluginRoot(p));
@@ -67,10 +62,15 @@ pub fn resolve_plugin_root(cli_override: Option<PathBuf>) -> Option<PluginRoot> 
             return Some(PluginRoot(PathBuf::from(raw)));
         }
     }
+    if let Ok(raw) = std::env::var("NEFOR_DATA_DIR") {
+        if !raw.is_empty() {
+            return Some(PluginRoot(PathBuf::from(raw).join("plugins")));
+        }
+    }
     if let Some(data_home) = xdg_data_home() {
         return Some(PluginRoot(data_home.join("nefor").join("plugins")));
     }
-    dev_fallback().map(PluginRoot)
+    None
 }
 
 fn xdg_data_home() -> Option<PathBuf> {
@@ -80,23 +80,6 @@ fn xdg_data_home() -> Option<PathBuf> {
         }
     }
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"))
-}
-
-fn dev_fallback() -> Option<PathBuf> {
-    // Walk up from the current executable looking for a `Cargo.toml` next
-    // to a `plugins/` directory. This is purely a dev-time convenience so
-    // `cargo run` works without configuration.
-    let exe = std::env::current_exe().ok()?;
-    let mut cur = exe.as_path();
-    while let Some(parent) = cur.parent() {
-        let cargo_toml = parent.join("Cargo.toml");
-        let plugins_dir = parent.join("plugins");
-        if cargo_toml.is_file() && plugins_dir.is_dir() {
-            return Some(plugins_dir);
-        }
-        cur = parent;
-    }
-    None
 }
 
 /// Spawn a plugin declared by `spec`, rooted at `root`. Returns a
@@ -113,13 +96,15 @@ pub fn spawn_plugin(spec: &PluginSpec, root: &PluginRoot) -> Result<Transport, B
         ),
     })?;
 
-    let cwd = root.as_path().join(spec.name.as_str());
-    if !cwd.is_dir() {
-        return Err(BrokerError::MissingPluginDir {
-            name: spec.name.as_str().to_owned(),
-            cwd,
-        });
-    }
+    // In the nested layout (e.g. `plugins/<name>/`) the per-plugin subdirectory
+    // is the cwd. In the flat layout (e.g. `target/debug/<name>` is a binary,
+    // not a directory) fall back to the plugin root itself as the cwd.
+    let nested = root.as_path().join(spec.name.as_str());
+    let cwd = if nested.is_dir() {
+        nested
+    } else {
+        root.as_path().to_path_buf()
+    };
 
     let (binary, args) = command.split_first().ok_or_else(|| BrokerError::Spawn {
         name: spec.name.as_str().to_owned(),
@@ -188,7 +173,10 @@ mod tests {
     }
 
     #[test]
-    fn spawn_plugin_reports_missing_dir() {
+    fn spawn_plugin_errors_when_cwd_missing() {
+        // With flat layout the runner uses plugin_root as cwd when no
+        // per-plugin subdir exists. A root that doesn't exist at all
+        // means the spawn itself fails (OS rejects the cwd).
         let spec = PluginSpec {
             name: PluginName::new("nonexistent-plugin").expect("valid"),
             command: Some(vec!["echo".into()]),
@@ -196,9 +184,8 @@ mod tests {
         };
         let root = PluginRoot::new(PathBuf::from("/tmp/definitely-not-a-plugin-root-xyz"));
         match spawn_plugin(&spec, &root) {
-            Err(BrokerError::MissingPluginDir { .. }) => {}
-            Err(other) => panic!("expected MissingPluginDir, got {other:?}"),
-            Ok(_) => panic!("expected error for nonexistent plugin dir"),
+            Err(_) => {} // spawn error — OS rejects the non-existent cwd
+            Ok(_) => panic!("expected error for nonexistent cwd"),
         }
     }
 

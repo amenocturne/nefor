@@ -79,9 +79,14 @@ sessions.handle_shutdown()
 
 local agentic_workflow = require("agentic_workflow")
 
--- Plugin cwd is <plugin_root>/<name>/ (engine policy).
 local PROJECT_ROOT = STARTER_ROOT:match("^(.*)/[^/]+$") or "."
-local function bin(name) return PROJECT_ROOT .. "/target/debug/" .. name end
+local function bin(name)
+  local plugin_dir = os.getenv("NEFOR_PLUGIN_DIR")
+  if plugin_dir and plugin_dir ~= "" then
+    return plugin_dir .. "/" .. name
+  end
+  return PROJECT_ROOT .. "/target/debug/" .. name
+end
 
 -------------------------------------------------------------------------
 -- 4a. Spawn order
@@ -153,10 +158,7 @@ if USE_MOCK_PROVIDER then
   }
 else
   PROVIDER_NAME  = "ollama"
-  -- qwen3.6:35b-a3b-coding-mxfp8 — MoE (3B active params, 35B total) with
-  -- strong tool-calling. Verified one-shot to emit a clean spawn_graph
-  -- with proper terminal wiring; faster than the dense 27b model.
-  PROVIDER_MODEL = "qwen3.6:35b-a3b-coding-mxfp8"
+  PROVIDER_MODEL = nil
   provider_chain = agentic_workflow.for_provider(PROVIDER_NAME, { static_token = "ollama-local" })
   provider_command = {
     bin("openai-provider"),
