@@ -3234,17 +3234,25 @@ local function update(msg, state)
     return shallow_merge(state, { gate_yolo = msg.mode == "yolo" }), {}
   end
 
-  -- DAG observation
+  -- DAG observation. Each handler short-circuits during replay: the
+  -- graph.* envelopes seeded into the resumed session's jsonl are
+  -- snapshots from the prior live run, not fresh dispatches, and
+  -- mutating dag_runs from them would re-light a panel that should
+  -- start clean (sessions.session_start clears it). Mirrors the
+  -- chat.tool.permission_request guard above.
   if kind == "graph.run_started" then
+    if state.replay_mode then return state, {} end
     local now = tui.now_ms()
     return dag_run_started(state, msg.run_id or "", msg.total_nodes or 0, now), {}
   end
   if kind == "graph.node_dispatched" then
+    if state.replay_mode then return state, {} end
     if (msg.run_id or "") == "" or (msg.node_id or "") == "" then return state, {} end
     local now = tui.now_ms()
     return dag_node_dispatched(state, msg.run_id, msg.node_id, msg.reasoner or "", now), {}
   end
   if kind == "graph.node_result" then
+    if state.replay_mode then return state, {} end
     if (msg.run_id or "") == "" or (msg.node_id or "") == "" then return state, {} end
     local now = tui.now_ms()
     local has_output = msg.output ~= nil
@@ -3252,6 +3260,7 @@ local function update(msg, state)
     return dag_node_result(state, msg.run_id, msg.node_id, has_output, has_error, now), {}
   end
   if kind == "graph.run_complete" then
+    if state.replay_mode then return state, {} end
     if (msg.run_id or "") == "" then return state, {} end
     local now = tui.now_ms()
     return dag_run_complete(state, msg.run_id, msg.status, msg.results, now), {}
