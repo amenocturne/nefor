@@ -247,7 +247,7 @@ ncp.spawn {
   from_plugin = agentic_workflow.for_tool_gate("tool-gate").from_plugin,
 }
 
-actor.spawn(require("basic-tools")({ bin = bin("basic-tools") }))
+actor.spawn(require("basic-tools"))
 
 -------------------------------------------------------------------------
 -- 4f. Chat

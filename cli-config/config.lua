@@ -8,6 +8,16 @@
 
 local M = {}
 
+-- Binary path resolver. The CLI surface runs against in-tree builds, so
+-- we read directly from `<repo>/target/debug/`; the engine still sets
+-- NEFOR_PLUGIN_DIR but it points at the source-crate root in this layout
+-- (where the binaries don't live), so we don't use it.
+do
+  local CONFIG_ROOT = NEFOR_CONFIG_DIR or "."
+  local PROJECT_ROOT = CONFIG_ROOT:match("^(.*)/[^/]+$") or "."
+  M.bin = function(name) return PROJECT_ROOT .. "/target/debug/" .. name end
+end
+
 M.prod = {
   provider = {
     name         = "ollama",

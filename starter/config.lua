@@ -8,6 +8,20 @@
 
 local M = {}
 
+-- Binary path resolver. Plugins call `require("config").bin("<name>")` to
+-- get the absolute path of a sibling plugin binary; the engine sets
+-- NEFOR_PLUGIN_DIR before any Lua runs (resolved from the engine's
+-- install layout — see crates/nefor/src/main.rs).
+M.bin = function(name)
+  local plugin_dir = os.getenv("NEFOR_PLUGIN_DIR")
+  if not plugin_dir or plugin_dir == "" then
+    error("NEFOR_PLUGIN_DIR is not set; the engine resolves this "
+       .. "automatically when started via `nefor`. If you see this "
+       .. "from a custom harness, set it explicitly or pass --plugin-dir.")
+  end
+  return plugin_dir .. "/" .. name
+end
+
 -- Shared model fragment — the upstream starter has no Ollama model
 -- pinned (operator picks one in a fork or via PROVIDER_MODEL). Keeping
 -- this nil mirrors the prior behavior; openai-provider's spawn omits
