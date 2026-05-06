@@ -213,40 +213,44 @@ do
 end
 
 -- (3.B) Two messages submitted back-to-back BOTH dispatch as the
--- orchestrator frees up. We drive graph.run_complete to flush.
+-- orchestrator frees up. We drive the canonical run-close
+-- `tool.result { id=run_id, result: { status, results } }` to flush.
 do
   fresh_loop()
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "alpha" })
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "beta" })
 
+  -- Submission rides on the canonical tool contract:
+  -- `tool.invoke { id=run_id, name="spawn_graph", args: { graph, on_node_failure } }`.
   local function find_run_emit(calls)
     for _, c in ipairs(calls) do
-      if c.body.kind == "reasoner-graph.run" then
-        return c.body.run_id
+      if c.body.kind == "tool.invoke" and c.body.name == "spawn_graph" then
+        return c.body.id
       end
     end
     return nil
   end
   local first_run = find_run_emit(decode_calls())
-  assert(first_run ~= nil, "first submit dispatched a reasoner-graph.run")
+  assert(first_run ~= nil, "first submit dispatched a spawn_graph tool.invoke")
   do
     local count = 0
     for _, c in ipairs(decode_calls()) do
-      if c.body.kind == "reasoner-graph.run" then count = count + 1 end
+      if c.body.kind == "tool.invoke" and c.body.name == "spawn_graph" then
+        count = count + 1
+      end
     end
     assert_eq(count, 1, "second submit must NOT dispatch while first is in flight")
   end
   _test.calls_clear()
-  -- Drive graph.run_complete success for the first run.
+  -- Drive the canonical run-close for the first run.
   send_to_loop("reasoner-graph", {
-    kind   = "graph.run_complete",
-    run_id = first_run,
-    status = "success",
-    results = {},
+    kind   = "tool.result",
+    id     = first_run,
+    result = { status = "success", results = {} },
   })
   local second_run = find_run_emit(decode_calls())
   assert(second_run ~= nil,
-    "queued submit must dispatch on graph.run_complete; sends were " ..
+    "queued submit must dispatch on tool.result run-close; sends were " ..
     json.encode(_test.calls()))
   assert(second_run ~= first_run,
     "second run must be a fresh run_id, got " .. tostring(second_run))
@@ -263,8 +267,11 @@ do
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "fresh" })
   local function find_run_user_text(calls)
     for _, c in ipairs(calls) do
-      if c.body.kind == "reasoner-graph.run" and type(c.body.graph) == "table" then
-        for _, node in ipairs(c.body.graph.nodes or {}) do
+      if c.body.kind == "tool.invoke"
+          and c.body.name == "spawn_graph"
+          and type(c.body.args) == "table"
+          and type(c.body.args.graph) == "table" then
+        for _, node in ipairs(c.body.args.graph.nodes or {}) do
           if node.id == "wrap" and type(node.args) == "table" then
             return node.args.prompt
           end
@@ -288,8 +295,11 @@ do
   _test.calls_clear()
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "post-swap" })
   for _, c in ipairs(decode_calls()) do
-    if c.body.kind == "reasoner-graph.run" and type(c.body.graph) == "table" then
-      for _, node in ipairs(c.body.graph.nodes or {}) do
+    if c.body.kind == "tool.invoke"
+        and c.body.name == "spawn_graph"
+        and type(c.body.args) == "table"
+        and type(c.body.args.graph) == "table" then
+      for _, node in ipairs(c.body.args.graph.nodes or {}) do
         if node.id == "wrap" and type(node.args) == "table" then
           local txt = node.args.prompt
           assert(txt ~= "stranded",

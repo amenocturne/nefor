@@ -590,12 +590,14 @@ end
 -- openai-provider / tool-gate via per-firing pending state.
 -- ------------------------------------------------------------------
 --
--- The reasoners actor consumes `<type>.run_node` and runs the
--- handler; provider firings spawn `<provider>.chat.create / append /
--- complete` and the openai-provider wrapper's from_plugin correlates
--- the eventual `<provider>.chat.complete.result` back to a
--- graph.node_result. State (chat_id maps, pending entries) lives on
--- the agentic-loop actor and is exposed to wrappers via helpers.
+-- The reasoners actor consumes `tool.invoke { name=<reasoner-type> }`
+-- and runs the handler; provider firings spawn `<provider>.chat.create
+-- / append / complete` and the openai-provider wrapper's from_plugin
+-- correlates the eventual `<provider>.chat.complete.result` back to a
+-- `tool.result { id=firing_id, result }` (with next_state inside
+-- result for cycle re-fires). State (chat_id maps, pending entries)
+-- lives on the agentic-loop actor and is exposed to wrappers via
+-- helpers.
 --
 -- The Rust harness installs `nefor.engine.send` as the recording mock
 -- so envelopes emitted via `nefor.engine.send` land in `_test.calls()`
@@ -621,14 +623,31 @@ local function decode_all_calls()
   return out
 end
 
--- Drive a `<token>.run_node` envelope through the reasoners actor's
--- receive_msg. Mirrors the wire shape the actor.lua runtime hands it:
--- { ts, origin, payload } where payload is JSON-encoded { type, body }.
+-- Drive a `tool.invoke { name=<reasoner-type>, id=firing_id, args:
+-- { run_id, node_id, args, inputs, prev_state } }` envelope through
+-- the reasoners actor's receive_msg. Takes the legacy run-node body
+-- shape (`{ run_id, node_id, firing_id, args, inputs, prev_state, kind
+-- = "<type>.run_node" }`) and rewraps it into the canonical tool
+-- contract — keeps test call sites readable.
 local function dispatch_run_node(body)
+  local kind = body.kind or ""
+  local name = kind:match("^([^.]+)%.run_node$") or kind
+  local invoke_body = {
+    kind = "tool.invoke",
+    id   = body.firing_id,
+    name = name,
+    args = {
+      run_id     = body.run_id,
+      node_id    = body.node_id,
+      args       = body.args,
+      inputs     = body.inputs,
+      prev_state = body.prev_state,
+    },
+  }
   local entry = {
     ts      = "2026-04-23T00:00:00.000Z",
     origin  = "reasoner-graph",
-    payload = json.encode({ type = "event", from = "reasoner-graph", body = body }),
+    payload = json.encode({ type = "event", from = "reasoner-graph", body = invoke_body }),
   }
   reasoners.receive_msg(entry)
 end
@@ -646,10 +665,10 @@ local function pending_count()
   return n
 end
 
-local function test_rga_dummy_run_node_emits_ack_immediately()
-  -- The scheduler's ack_deadline applies to <type>.run_node.ack. The
-  -- handler must emit the ack synchronously inside receive_msg (before
-  -- returning) so the watchdog stops well before any provider I/O.
+local function test_rga_dummy_dispatch_drives_provider_chain()
+  -- Smoke: dispatching the dummy reasoner via tool.invoke fires
+  -- chat.create / chat.append / chat.complete on the underlying
+  -- provider. Acks are gone in the canonical contract.
   reset_rga()
   _test.set_plugins({ "ollama", "nefor-tui" })
   dispatch_run_node({
@@ -659,16 +678,17 @@ local function test_rga_dummy_run_node_emits_ack_immediately()
     inputs = {},
   })
 
-  local ack = find_call_with_kind("dummy.run_node.ack")
-  assert_true(ack ~= nil, "ack envelope was emitted")
-  assert_eq(ack.body.run_id, "r1", "ack carries run_id")
-  assert_eq(ack.body.firing_id, "f1", "ack carries firing_id")
+  local create = find_call_with_kind("ollama.chat.create")
+  assert_true(create ~= nil, "chat.create dispatched")
+  local complete = find_call_with_kind("ollama.chat.complete")
+  assert_true(complete ~= nil, "chat.complete dispatched")
 end
 
-local function test_rga_unknown_type_acks_then_errors_node_result()
-  -- An unknown reasoner type still gets an ack so the scheduler stops
-  -- the deadline watchdog; the failure surfaces as a graph.node_result
-  -- error rather than leaving the firing dangling.
+local function test_rga_unknown_type_is_ignored()
+  -- An unknown reasoner type is not for us — the reasoners actor must
+  -- not synthesize any reply (no acks in the canonical contract; the
+  -- Rust scheduler's peer-set check + ack-timeout watchdog handle
+  -- "reasoner not connected" upstream).
   reset_rga()
   _test.set_plugins({ "x" })
   dispatch_run_node({
@@ -677,15 +697,8 @@ local function test_rga_unknown_type_acks_then_errors_node_result()
     args = {}, inputs = {},
   })
 
-  local ack = find_call_with_kind("no-such-type.run_node.ack")
-  assert_true(ack ~= nil, "ack still fired for unknown type")
-  local result = find_call_with_kind("graph.node_result")
-  assert_true(result ~= nil, "graph.node_result emitted")
-  assert_true(result.body.error ~= nil, "result carries error message")
-  assert_true(
-    result.body.error:find("no-such-type", 1, true) ~= nil,
-    "error names the unknown reasoner type"
-  )
+  assert_eq(#_test.calls(), 0,
+    "unknown reasoner type emits nothing (Rust handles peer-set failure)")
 end
 
 local function test_rga_dispatch_drives_provider_chat_create_and_complete()
@@ -745,10 +758,12 @@ local function test_rga_prev_state_chat_id_skips_create()
     "complete reuses prev_state.chat_id verbatim")
 end
 
-local function test_rga_provider_result_emits_node_result_with_next_state()
+local function test_rga_provider_result_emits_tool_result_with_next_state()
   -- When openai-provider replies with chat.complete.result, the wrapper
-  -- must translate it into graph.node_result carrying next_state.chat_id
-  -- so the scheduler stores it on the node for the next firing.
+  -- must translate it into a `tool.result { id=firing_id, result }`
+  -- on the canonical contract — with `next_state.chat_id` packed
+  -- INSIDE result so the Rust scheduler picks it up on cycle re-fires
+  -- (wire-protocol spec coordination point 1).
   reset_rga()
   _test.set_plugins({ "ollama" })
   dispatch_run_node({
@@ -773,15 +788,15 @@ local function test_rga_provider_result_emits_node_result_with_next_state()
   })
   assert_eq(passed, nil, "owned chat.complete.result is dropped (consumed)")
 
-  local result = find_call_with_kind("graph.node_result")
-  assert_true(result ~= nil, "graph.node_result emitted")
-  assert_eq(result.body.run_id, "rR", "run_id propagated")
-  assert_eq(result.body.node_id, "nR", "node_id propagated")
-  assert_eq(result.body.firing_id, "fR", "firing_id propagated")
-  assert_true(type(result.body.output) == "table", "output forwarded as object")
-  assert_eq(result.body.output.text, "the answer", "output payload preserved")
-  assert_true(type(result.body.next_state) == "table", "next_state present")
-  assert_eq(result.body.next_state.chat_id, chat_id,
+  local result = find_call_with_kind("tool.result")
+  assert_true(result ~= nil, "tool.result emitted")
+  assert_eq(result.body.id, "fR", "tool.result keyed by firing_id")
+  assert_true(type(result.body.result) == "table", "result is an object")
+  assert_eq(result.body.result.text, "the answer",
+    "output fields preserved verbatim inside result")
+  assert_true(type(result.body.result.next_state) == "table",
+    "next_state present inside result")
+  assert_eq(result.body.result.next_state.chat_id, chat_id,
     "next_state.chat_id matches the chat we ran")
 end
 
@@ -806,7 +821,7 @@ local function test_rga_provider_result_for_unknown_chat_passes_through()
   assert_true(out ~= nil, "non-pending chat.complete.result passes through")
   assert_eq(out.body.kind, "ollama.chat.complete.result",
     "kind unchanged on pass-through")
-  assert_eq(#_test.calls(), 0, "no graph.node_result emitted")
+  assert_eq(#_test.calls(), 0, "no tool.result emitted")
 end
 
 local function test_rga_per_firing_keying_distinct_firings_resolve_independently()
@@ -845,9 +860,9 @@ local function test_rga_per_firing_keying_distinct_firings_resolve_independently
       output = { text = "B-ans" },
     },
   })
-  local resB = find_call_with_kind("graph.node_result")
+  local resB = find_call_with_kind("tool.result")
   assert_true(resB ~= nil, "result for B fired")
-  assert_eq(resB.body.firing_id, "fB", "result correlated to firing B")
+  assert_eq(resB.body.id, "fB", "result correlated to firing B")
   _test.calls_clear()
 
   prov.from_plugin({
@@ -858,16 +873,17 @@ local function test_rga_per_firing_keying_distinct_firings_resolve_independently
       output = { text = "A-ans" },
     },
   })
-  local resA = find_call_with_kind("graph.node_result")
+  local resA = find_call_with_kind("tool.result")
   assert_true(resA ~= nil, "result for A fired")
-  assert_eq(resA.body.firing_id, "fA", "result correlated to firing A")
+  assert_eq(resA.body.id, "fA", "result correlated to firing A")
   assert_eq(pending_count(), 0,
     "all pending firings resolved → pending_count == 0")
 end
 
 local function test_rga_register_type_dispatches_custom_handler()
   -- Type-driven dispatch is extensible: a custom reasoner type can be
-  -- registered and `<custom>.run_node` must invoke its handler.
+  -- registered and a `tool.invoke { name=<custom> }` must invoke its
+  -- handler with the unwrapped body shape.
   reset_rga()
   _test.set_plugins({ "x" })
   local seen = {}
@@ -891,17 +907,15 @@ local function test_rga_register_type_dispatches_custom_handler()
     "handler received prev_state table")
   assert_eq(seen.prev_state.hint, "preserved",
     "prev_state fields passed through verbatim")
-  local ack = find_call_with_kind("my-leaf.run_node.ack")
-  assert_true(ack ~= nil, "ack emitted for custom type")
 
   -- Cleanup: remove the custom handler so it doesn't bleed into other
   -- tests in the same suite.
   reasoners._internals.handlers["my-leaf"] = nil
 end
 
-local function test_rga_terminal_handler_emits_ack_and_node_result_synchronously()
-  -- The terminal handler is synchronous Lua: it must emit BOTH the ack
-  -- and the graph.node_result before receive_msg returns. This is the
+local function test_rga_terminal_handler_emits_tool_result_synchronously()
+  -- The terminal handler is synchronous Lua: it must emit `tool.result
+  -- { id=firing_id, result }` before receive_msg returns. The
   -- "_already_replied" code path.
   reset_rga()
   _test.set_plugins({ "x" })
@@ -911,14 +925,11 @@ local function test_rga_terminal_handler_emits_ack_and_node_result_synchronously
     args = {}, inputs = { up = { output = { text = "the final word" } } },
   })
 
-  local ack = find_call_with_kind("terminal.run_node.ack")
-  assert_true(ack ~= nil, "terminal ack emitted")
-  local result = find_call_with_kind("graph.node_result")
-  assert_true(result ~= nil, "terminal node_result emitted synchronously")
-  assert_eq(result.body.run_id, "rT", "run_id forwarded")
-  assert_eq(result.body.firing_id, "fT", "firing_id forwarded")
-  assert_eq(result.body.output.text, "the final word",
-    "FinalAnswer from inputs echoed as output")
+  local result = find_call_with_kind("tool.result")
+  assert_true(result ~= nil, "terminal tool.result emitted synchronously")
+  assert_eq(result.body.id, "fT", "id == firing_id forwarded")
+  assert_eq(result.body.result.text, "the final word",
+    "FinalAnswer from inputs echoed as result.text")
   assert_eq(pending_count(), 0, "no pending after synchronous handler")
 end
 
@@ -1282,15 +1293,15 @@ local tests = {
   { name = "kind_prefix_self_announces_to_all_peers", fn = test_kind_prefix_self_announces_to_all_peers },
   { name = "openai_adapter_static_token_injects_auth_set_on_ready", fn = test_openai_adapter_static_token_injects_auth_set_on_ready },
   { name = "openai_adapter_no_static_token_skips_injection", fn = test_openai_adapter_no_static_token_skips_injection },
-  { name = "rga_dummy_run_node_emits_ack_immediately", fn = test_rga_dummy_run_node_emits_ack_immediately },
-  { name = "rga_unknown_type_acks_then_errors_node_result", fn = test_rga_unknown_type_acks_then_errors_node_result },
+  { name = "rga_dummy_dispatch_drives_provider_chain", fn = test_rga_dummy_dispatch_drives_provider_chain },
+  { name = "rga_unknown_type_is_ignored", fn = test_rga_unknown_type_is_ignored },
   { name = "rga_dispatch_drives_provider_chat_create_and_complete", fn = test_rga_dispatch_drives_provider_chat_create_and_complete },
   { name = "rga_prev_state_chat_id_skips_create", fn = test_rga_prev_state_chat_id_skips_create },
-  { name = "rga_provider_result_emits_node_result_with_next_state", fn = test_rga_provider_result_emits_node_result_with_next_state },
+  { name = "rga_provider_result_emits_tool_result_with_next_state", fn = test_rga_provider_result_emits_tool_result_with_next_state },
   { name = "rga_provider_result_for_unknown_chat_passes_through", fn = test_rga_provider_result_for_unknown_chat_passes_through },
   { name = "rga_per_firing_keying_distinct_firings_resolve_independently", fn = test_rga_per_firing_keying_distinct_firings_resolve_independently },
   { name = "rga_register_type_dispatches_custom_handler", fn = test_rga_register_type_dispatches_custom_handler },
-  { name = "rga_terminal_handler_emits_ack_and_node_result_synchronously", fn = test_rga_terminal_handler_emits_ack_and_node_result_synchronously },
+  { name = "rga_terminal_handler_emits_tool_result_synchronously", fn = test_rga_terminal_handler_emits_tool_result_synchronously },
   { name = "rga_for_reasoner_graph_passes_through_unrelated_kinds", fn = test_rga_for_reasoner_graph_passes_through_unrelated_kinds },
   { name = "spawn_rejects_env_field_with_hint", fn = test_spawn_rejects_env_field_with_hint },
   { name = "spawn_rejects_args_field_with_hint", fn = test_spawn_rejects_args_field_with_hint },

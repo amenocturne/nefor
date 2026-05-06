@@ -15,8 +15,8 @@
 --     immediate ack, drop the gate-forwarded envelope before it
 --     tries to deliver to a nonexistent peer (D-22).
 --   * On `tool.result`: correlate by tool_id back to the
---     tool-executor pending entry, accumulate, emit graph.node_result
---     when all tool results land.
+--     tool-executor pending entry, accumulate, emit a closing
+--     tool.result { id=firing_id } when all tool results land.
 
 local envelope = require("lib.envelope")
 local graph_lib = require("lib.graph")
@@ -114,12 +114,10 @@ function M.spawn_spec(gate_name, command)
 
       if entry.pending_count == 0 then
         al().clear_pending_key(ref.key)
-        envelope.emit_broadcast({
-          kind      = "graph.node_result",
-          run_id    = entry.run_id,
-          node_id   = entry.node_id,
-          firing_id = entry.firing_id,
-          output    = { tool_results = entry.tool_results },
+        envelope.emit_as("tool-executor", nil, {
+          kind   = "tool.result",
+          id     = entry.firing_id,
+          result = { tool_results = entry.tool_results },
         })
       end
       return env

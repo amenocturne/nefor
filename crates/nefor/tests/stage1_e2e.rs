@@ -5,24 +5,24 @@
 //! full Stage 1 wire (per parent spec §6.1):
 //!
 //! ```text
-//!   driver(chat.input.submit) → agentic_workflow.for_chat → reasoner-graph.run
+//!   driver(chat.input.submit) → agentic-loop → tool.invoke{name=spawn_graph}
 //!     → combinators.query → nefor-combinators → combinators.query.result
-//!     → reasoner-graph dispatches provider-wrapper.run_node
-//!       → agentic_workflow.for_reasoner_graph → ollama.chat.{create,append,complete}
+//!     → reasoner-graph dispatches tool.invoke { name=provider-wrapper }
+//!       → reasoners actor → ollama.chat.{create,append,complete}
 //!     → mock-plugin (impersonating openai-provider as "ollama") returns
 //!       chat.complete.result with tool_calls=[spawn_graph(...)]
-//!     → agentic_workflow.for_provider → graph.node_result
+//!     → openai-provider wrapper → tool.result { id=firing_id, result }
 //!     → reasoner-graph invokes tool_split → routes to tool-executor
 //!       → tool-gate.tool.invoke → tool-gate forwards as
 //!         spawn-graph-tool.tool.invoke (the virtual source name
-//!         agentic_workflow registers spawn_graph under)
-//!       → agentic_workflow.for_tool_gate (on tool-gate's egress chain) →
-//!         reasoner-graph.run (sub-graph)
+//!         spawn_graph.lua registers under)
+//!       → tool-gate wrapper (on tool-gate's egress chain) →
+//!         tool.invoke{name=spawn_graph} (sub-graph)
 //!     → sub-graph runs (also against mock-plugin)
-//!     → graph.run_complete (sub) → tool.result → loops back
+//!     → tool.result { id=sub_run_id, result } → spawn_graph relay
 //!     → wrap re-fires → mock-plugin returns final text → tool_split routes
-//!       to terminal escape → graph.run_complete (outer)
-//!     → agentic_workflow.for_reasoner_graph → chat.message.append → driver
+//!       to terminal escape → tool.result { id=outer_run_id, result }
+//!     → agentic-loop notices our run is complete → chat.message.append → driver
 //! ```
 //!
 //! mock-plugin stands in for openai-provider — its Lua script is
@@ -36,7 +36,7 @@
 //!  * a `combinators.query` was emitted at submit time;
 //!  * a `tool-gate.tool.invoke` for `spawn_graph` was issued during the run;
 //!  * tool-gate forwarded it as `spawn-graph-tool.tool.invoke`;
-//!  * spawn_graph fired a sub-graph (>=2 reasoner-graph.run entries).
+//!  * spawn_graph fired a sub-graph (>=2 tool.invoke{name=spawn_graph} entries).
 //!
 //! Gated `#[ignore]`; run with
 //! `cargo test -p nefor --test stage1_e2e -- --ignored`.
@@ -404,10 +404,11 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
     // `nefor-tui`.
     //
     // No phantom plugins: Lua-resident reasoner types (provider-wrapper,
-    // tool-executor, adapter, terminal) are declared via
-    // `rg_adapter.for_starter()` which emits
-    // `reasoner-graph.register_reasoner` events. See plugins/reasoner-
-    // graph/src/main.rs for the new wire kind.
+    // tool-executor, adapter, terminal) seed the reasoner-graph binary's
+    // peer-set by emitting one `<name>.ready` envelope per type with
+    // `from = <name>` from the `reasoners` actor on first
+    // `reasoner-graph.ready`. See plugins/reasoner-graph/src/main.rs
+    // (`track_peer`) and starter/reasoners/init.lua (`seed_peer_set`).
     let plugin_root_dir = tmp.path().join("plugins");
     std::fs::create_dir_all(&plugin_root_dir).expect("plugin root dir");
     for name in [
@@ -515,13 +516,11 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
     handshake(&mut driver).await;
 
     // Wait until every required peer is observable in the event log.
-    // Two classes:
-    //  * Real plugin processes — observable as a `from` field on any
-    //    envelope they emit.
-    //  * Lua-resident reasoner types — declared via the
-    //    `reasoner-graph.register_reasoner { name }` event emitted by
-    //    `rg_adapter.for_starter()` once reasoner-graph readies. We
-    //    wait on those bodies appearing in the log.
+    // Both real plugins and Lua-resident reasoner types are observed via
+    // the `from` field on emitted envelopes. The reasoners actor seeds
+    // the peer-set with `<name>.ready { from=<name> }` envelopes per
+    // resident reasoner type on first `reasoner-graph.ready`, so the
+    // same scan covers both classes.
     let required_real_peers = [
         "ollama",
         "tool-gate",
@@ -530,58 +529,41 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
         "nefor-combinators",
         "generic-provider",
         "generic-tool",
+        // Lua-resident reasoner types — emitted as `<name>.ready` with
+        // `from = <name>`; checking the same `from` set as real peers
+        // is sufficient.
+        "provider-wrapper",
+        "tool-executor",
+        "adapter",
+        "terminal",
     ];
-    let required_lua_types = ["provider-wrapper", "tool-executor", "adapter", "terminal"];
     {
         let peers_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
-            let (seen_from, seen_registered): (
-                std::collections::HashSet<String>,
-                std::collections::HashSet<String>,
-            ) = {
+            let seen_from: std::collections::HashSet<String> = {
                 let guard = shared.lock().expect("shared lock");
                 let mut from = std::collections::HashSet::new();
-                let mut registered = std::collections::HashSet::new();
                 for entry in guard.event_log.iter() {
                     if let Ok(v) = serde_json::from_str::<Value>(&entry.payload) {
                         if let Some(f) = v.get("from").and_then(Value::as_str) {
                             from.insert(f.to_owned());
                         }
-                        let kind = v
-                            .get("body")
-                            .and_then(|b| b.get("kind"))
-                            .and_then(Value::as_str);
-                        if kind == Some("reasoner-graph.register_reasoner") {
-                            if let Some(name) = v
-                                .get("body")
-                                .and_then(|b| b.get("name"))
-                                .and_then(Value::as_str)
-                            {
-                                registered.insert(name.to_owned());
-                            }
-                        }
                     }
                 }
-                (from, registered)
+                from
             };
             let missing_real: Vec<&str> = required_real_peers
                 .iter()
                 .copied()
                 .filter(|p| !seen_from.contains(*p))
                 .collect();
-            let missing_lua: Vec<&str> = required_lua_types
-                .iter()
-                .copied()
-                .filter(|p| !seen_registered.contains(*p))
-                .collect();
-            if missing_real.is_empty() && missing_lua.is_empty() {
+            if missing_real.is_empty() {
                 break;
             }
             assert!(
                 tokio::time::Instant::now() < peers_deadline,
-                "timed out waiting for peers to ready: missing real={missing_real:?}, \
-                 missing lua-resident={missing_lua:?}; \
-                 saw from={seen_from:?}, saw registered={seen_registered:?}"
+                "timed out waiting for peers to ready: missing={missing_real:?}; \
+                 saw from={seen_from:?}"
             );
             // Keep draining the driver so the read buffer doesn't stall
             // the broker's writer queue.
@@ -687,9 +669,10 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
          node returned tool_calls; saw kinds: {log_kinds:?}"
     );
     assert!(
-        log_kinds.iter().any(|k| k == "tool-executor.run_node"),
-        "expected tool_split to route ToolCalls to the tool-executor \
-         node; saw kinds: {log_kinds:?}"
+        log_kinds.iter().any(|k| k == "tool.invoke"),
+        "expected at least one tool.invoke (canonical dispatch surface) \
+         to fire — including the tool-executor's invoke for the \
+         spawn_graph call; saw kinds: {log_kinds:?}"
     );
     assert!(
         log_kinds.iter().any(|k| k == "tool-gate.tool.invoke"),
@@ -706,35 +689,51 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
          kinds: {log_kinds:?}"
     );
     // spawn_graph.lua intercepts spawn-graph-tool.tool.invoke on
-    // tool-gate's egress and fires a nested reasoner-graph.run. We
-    // expect at least TWO reasoner-graph.run entries — the outer run
-    // started by chat_orchestrator and the sub-graph started by
-    // spawn_graph.
-    assert!(
-        log_kinds
+    // tool-gate's egress and fires a nested tool.invoke{name=spawn_graph}. We
+    // expect at least TWO `tool.invoke { name="spawn_graph" }` entries —
+    // the outer run started by chat_orchestrator and the sub-graph
+    // started by spawn_graph.
+    let spawn_graph_invoke_count: usize = {
+        let guard = shared.lock().expect("shared lock");
+        guard
+            .event_log
             .iter()
-            .filter(|k| *k == "reasoner-graph.run")
+            .filter(|entry| {
+                let Ok(v) = serde_json::from_str::<Value>(&entry.payload) else {
+                    return false;
+                };
+                let body = v.get("body");
+                body.and_then(|b| b.get("kind")).and_then(Value::as_str)
+                    == Some("tool.invoke")
+                    && body.and_then(|b| b.get("name")).and_then(Value::as_str)
+                        == Some("spawn_graph")
+            })
             .count()
-            >= 2,
-        "expected spawn_graph to fire a sub-graph reasoner-graph.run \
-         (so >=2 total reasoner-graph.run entries); saw kinds: \
-         {log_kinds:?}"
+    };
+    assert!(
+        spawn_graph_invoke_count >= 2,
+        "expected spawn_graph to fire a sub-graph tool.invoke{{name=spawn_graph}} \
+         (so >=2 total such entries); saw {spawn_graph_invoke_count}; \
+         log kinds: {log_kinds:?}"
     );
 
     // ---- Bookend assertion --------------------------------------------
     //
     // The full Stage 1 wire round-trips: chat.input.submit → outer
-    // reasoner-graph.run → wrap node → tool_split → tool-gate →
-    // spawn_graph → sub-graph → graph.run_complete → tool.result →
-    // wrap re-fires → final text → terminal escape →
-    // graph.run_complete (outer).
+    // tool.invoke{name=spawn_graph} → wrap node → tool_split → tool-gate →
+    // spawn_graph → sub-graph → tool.result (sub run-close) → loops back
+    // → wrap re-fires → final text → terminal escape →
+    // tool.result (outer run-close).
     //
     // chat_orchestrator does NOT emit chat.message.append on success —
     // streaming via openai-provider's chat.stream.delta + stream.end
     // already shows the assistant message in nefor-tui. Re-emitting
     // would duplicate the bubble. So we assert on the run's terminal
-    // wire shape: an outer `graph.run_complete { status: "success" }`
-    // whose results.terminal.output.text contains "FINAL".
+    // wire shape: an outer `tool.result { id=run_id, result: { status:
+    // "success", results } }` whose `results.terminal.output.text`
+    // contains "FINAL". Per Phase 3b's `synthesize_node_result`, the
+    // run-close packs the prior `graph.run_complete` shape verbatim
+    // into `result`.
     let _ = assistant_text; // Suppress unused warning if we keep the channel observation.
     let shared_guard = shared.lock().expect("shared lock");
     let outer_complete = shared_guard
@@ -745,26 +744,28 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
             v.get("body")
                 .and_then(|b| b.get("kind"))
                 .and_then(Value::as_str)
-                == Some("graph.run_complete")
+                == Some("tool.result")
         })
         .find(|v| {
-            // Outer run is the FIRST run_complete that has results.terminal
-            // (the orchestrator template); sub-graphs from spawn_graph
-            // don't have a "terminal" node id.
+            // Outer run is the FIRST tool.result whose result.results
+            // carries a `terminal` entry (the orchestrator template);
+            // sub-graphs from spawn_graph don't have a "terminal" node id.
             v.get("body")
-                .and_then(|b| b.get("results"))
+                .and_then(|b| b.get("result"))
+                .and_then(|r| r.get("results"))
                 .and_then(|r| r.get("terminal"))
                 .is_some()
         })
         .unwrap_or_else(|| {
             panic!(
-                "no outer graph.run_complete envelope with a terminal result; \
+                "no outer tool.result envelope with a terminal result; \
                  log kinds: {log_kinds:?}"
             )
         });
     let status = outer_complete
         .get("body")
-        .and_then(|b| b.get("status"))
+        .and_then(|b| b.get("result"))
+        .and_then(|r| r.get("status"))
         .and_then(Value::as_str)
         .unwrap_or("");
     assert_eq!(
@@ -773,7 +774,8 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
     );
     let text = outer_complete
         .get("body")
-        .and_then(|b| b.get("results"))
+        .and_then(|b| b.get("result"))
+        .and_then(|r| r.get("results"))
         .and_then(|r| r.get("terminal"))
         .and_then(|t| t.get("output"))
         .and_then(|o| o.get("text"))

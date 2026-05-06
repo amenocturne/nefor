@@ -13,10 +13,11 @@
 -- and the canonical bus shape the agentic-loop + TUI consume:
 --
 --   * `from_plugin` (binary → bus):
---       <prefix>.chat.complete.result  → graph.node_result via
---                                        agentic-loop pending lookup
---       <prefix>.chat.error            → graph.node_result.error
---                                        (closes the in-flight node)
+--       <prefix>.chat.complete.result  → tool.result { id=firing_id,
+--                                        result: { ...output,
+--                                                  next_state: { chat_id } } }
+--       <prefix>.chat.error            → tool.result { id=firing_id,
+--                                        error } (closes the in-flight node)
 --       <prefix>.stream.delta          → chat.stream.delta
 --       <prefix>.stream.end            → chat.stream.end
 --       <prefix>.stream.reasoning_*    → chat.stream.reasoning_*
@@ -142,19 +143,12 @@ function M.spawn_spec(name, command, opts)
             provider = name, chat_id = chat_id,
             run_id = entry.run_id, node_id = entry.node_id, error = emsg,
           })
-          local nefor_engine_send = nefor.engine.send
-          local payload = nefor.json.encode({
-            type = "event", from = "engine", ts = nefor.engine.now(),
-            body = {
-              kind = "graph.node_result",
-              run_id = entry.run_id, node_id = entry.node_id,
-              firing_id = entry.firing_id,
-              error = emsg,
-            },
+          local envelope = require("lib.envelope")
+          envelope.emit_as(entry.reasoner or "reasoners", nil, {
+            kind  = "tool.result",
+            id    = entry.firing_id,
+            error = emsg,
           })
-          for _, peer in ipairs(nefor.engine.plugins()) do
-            nefor_engine_send(payload, peer)
-          end
           return env
         end
       end
@@ -178,12 +172,13 @@ function M.spawn_spec(name, command, opts)
       al().flush_pending_dispatches()
     end
 
-    -- Emit graph.node_result via the engine binding. We can't reuse
-    -- envelope.emit_broadcast directly because that's loaded by
-    -- agentic-loop and the wrapper is supposed to stay light; but
-    -- envelope.emit/emit_broadcast IS available everywhere via the
-    -- lib path so let's use it.
+    -- Translate to canonical tool.result. The Rust scheduler resolves
+    -- `id` → (run_id, node_id, firing_id) via firing_by_request_id, so
+    -- we only need to send the firing_id here. `next_state` lives
+    -- INSIDE result (wire-protocol spec coordination point 1) so the
+    -- scheduler's synthesize_node_result extracts it for cycle re-fires.
     local envelope = require("lib.envelope")
+    local from_id = entry.reasoner or "reasoners"
     if type(out) == "table" then
       nefor.log.info("openai-provider <- chat.complete.result", {
         provider = name, chat_id = chat_id,
@@ -192,21 +187,21 @@ function M.spawn_spec(name, command, opts)
         text_preview = type(out.text) == "string" and string.sub(out.text, 1, 80) or nil,
         finish_reason = out.finish_reason,
       })
-      envelope.emit_broadcast({
-        kind = "graph.node_result",
-        run_id = entry.run_id, node_id = entry.node_id,
-        firing_id = entry.firing_id,
-        output = out,
-        next_state = { chat_id = chat_id },
+      local result = {}
+      for k, v in pairs(out) do result[k] = v end
+      result.next_state = { chat_id = chat_id }
+      envelope.emit_as(from_id, nil, {
+        kind   = "tool.result",
+        id     = entry.firing_id,
+        result = result,
       })
     else
       nefor.log.warn("openai-provider <- chat.complete.result with non-object output", {
         provider = name, chat_id = chat_id, out_type = type(out),
       })
-      envelope.emit_broadcast({
-        kind = "graph.node_result",
-        run_id = entry.run_id, node_id = entry.node_id,
-        firing_id = entry.firing_id,
+      envelope.emit_as(from_id, nil, {
+        kind  = "tool.result",
+        id    = entry.firing_id,
         error = "provider returned non-object output",
       })
     end

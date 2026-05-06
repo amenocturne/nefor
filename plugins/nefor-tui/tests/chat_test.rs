@@ -345,12 +345,16 @@ fn slash_new_clears_dag_runs() {
 // ── DAG panel (phase 7) ───────────────────────────────────────────────
 //
 // These exercise the sidebar that subscribes to `reasoner-graph` plugin
-// lifecycle events (`graph.run_started`, `graph.node_dispatched`,
-// `graph.node_result`, `graph.run_complete`). The panel is visible by
-// default; Ctrl+B toggles it off. Linger handling is pure-update, so a
-// completed run drops on the next event after `DAG_LINGER_MS` of engine
-// time has passed — `Engine::advance_time` plus a synthetic event drives
-// the prune deterministically without sleeping.
+// lifecycle events on the canonical tool contract:
+//   * `graph.run_started { run_id, total_nodes }`
+//   * `graph.node.fired   { run_id, node_id, firing_id, reasoner }`
+//   * `tool.result        { id, result | error }`
+//     — id == firing_id closes one node; id == run_id closes the run.
+// The panel is visible by default; Ctrl+B toggles it off. Linger
+// handling is pure-update, so a completed run drops on the next event
+// after `DAG_LINGER_MS` of engine time has passed — `Engine::advance_time`
+// plus a synthetic event drives the prune deterministically without
+// sleeping.
 
 #[test]
 fn graph_run_started_creates_a_dag_panel_row() {
@@ -396,9 +400,10 @@ fn graph_node_dispatched_then_result_updates_status_glyph() {
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "graph.node_dispatched",
+            "kind": "graph.node.fired",
             "run_id": "run-bbbbbbbb",
             "node_id": "summarise",
+            "firing_id": "f-summarise-1",
             "reasoner": "ollama",
         }),
     );
@@ -415,20 +420,21 @@ fn graph_node_dispatched_then_result_updates_status_glyph() {
         "running glyph (●) missing for dispatched node: {out:?}"
     );
 
-    // Now flip the node to `done` via a node_result with `output`.
+    // Now flip the node to `done` via a tool.result keyed on firing_id.
+    // chat.lua's firing→node map (populated by graph.node.fired)
+    // resolves the id back to (run_id, node_id).
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "graph.node_result",
-            "run_id": "run-bbbbbbbb",
-            "node_id": "summarise",
-            "output": "summary text",
+            "kind": "tool.result",
+            "id": "f-summarise-1",
+            "result": { "text": "summary text" },
         }),
     );
     let out = render_str(&mut engine);
     assert!(
         out.contains('✓'),
-        "done glyph (✓) missing after node_result: {out:?}"
+        "done glyph (✓) missing after tool.result: {out:?}"
     );
     // The (done/total) counter should now read 1/2.
     assert!(
@@ -455,28 +461,27 @@ fn graph_run_complete_removes_run_after_linger_window() {
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "graph.node_dispatched",
+            "kind": "graph.node.fired",
             "run_id": "run-cccccccc",
             "node_id": "n1",
+            "firing_id": "f-n1-1",
             "reasoner": "ollama",
         }),
     );
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "graph.node_result",
-            "run_id": "run-cccccccc",
-            "node_id": "n1",
-            "output": "ok",
+            "kind": "tool.result",
+            "id": "f-n1-1",
+            "result": { "text": "ok" },
         }),
     );
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "graph.run_complete",
-            "run_id": "run-cccccccc",
-            "status": "success",
-            "results": { "n1": { "output": "ok" } },
+            "kind": "tool.result",
+            "id": "run-cccccccc",
+            "result": { "status": "success", "results": { "n1": { "output": "ok" } } },
         }),
     );
 
@@ -3298,9 +3303,9 @@ fn first_submit_after_slash_new_renders_user_message_when_tool_call_follows() {
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "graph.run_complete",
-            "run_id": "r1",
-            "status": "ok",
+            "kind": "tool.result",
+            "id": "r1",
+            "result": { "status": "ok", "results": {} },
         }),
     );
     dispatch_event(

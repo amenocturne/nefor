@@ -20,7 +20,7 @@
 --
 --   text (default)   — stream chat.stream.delta to stdout in real time;
 --                      tool-call one-liners to stderr; trailing newline
---                      on graph.run_complete.
+--                      on the orchestrator-run tool.result close.
 --   json             — single JSON line per turn on completion:
 --                      { answer, tool_calls, duration_ms }.
 --   stream-json      — passthrough: every chat.* / graph.* envelope as
@@ -269,6 +269,10 @@ local function install_stream_json_format()
   end
   nefor.bus.on_event("chat.*", emit_env)
   nefor.bus.on_event("graph.*", emit_env)
+  -- Reasoner-graph close envelopes ride the canonical tool contract:
+  -- `tool.result { id=<run_id|firing_id>, result | error }`. Include
+  -- the family so stream-json transcripts retain run-close visibility.
+  nefor.bus.on_event("tool.*", emit_env)
 end
 
 -- ------------------------------------------------------------------
@@ -334,8 +338,8 @@ local function run_single_shot(prompt, format, json_state, turn_start_ms, gate)
     elseif format == "text" then
       write_stdout("\n")
     end
-    -- stream-json: nothing extra; graph.run_complete already passed
-    -- through the bus subscription.
+    -- stream-json: nothing extra; the run-close tool.result already
+    -- passed through the bus subscription.
     nefor.engine.exit(0)
   end
 

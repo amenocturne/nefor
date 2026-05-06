@@ -34,40 +34,49 @@
 --
 -- The wrapper folders (`openai-provider/`, `tool-gate/`, `reasoner-graph/`,
 -- `nefor-tui/`) own the wire-protocol translation between each plugin's
--- native envelope shape and the canonical shape the agentic-loop expects.
--- During Phase 3a the canonical shape is "today's chat.* / graph.node_result"
--- — Phase 3b will move the wire to `tool.invoke` / `tool.result`.
+-- native envelope shape and the canonical bus shape. Post Phase 3b the
+-- canonical wire is `tool.invoke` / `tool.result` — reasoner-graph
+-- (the Rust binary) dispatches nodes via `tool.invoke { id=firing_id,
+-- name=<reasoner>, args }`, expects `tool.result { id=firing_id, result }`
+-- back, and closes the run with `tool.result { id=run_id, result: { status,
+-- results } }`. `graph.node.fired` is the paired observer envelope
+-- broadcast alongside each `tool.invoke` so observers can map firing_id
+-- → (run_id, node_id, reasoner) without parsing dispatch traffic.
 --
--- The agentic-loop dispatches on these inbound kinds (sourced from
--- `agentic_workflow.lua`'s for_* adapters):
+-- The agentic-loop dispatches on these inbound kinds:
 --
 --   * `chat.input.submit { text }`        — user submit; build orchestrator
---                                           graph + emit reasoner-graph.run
+--                                           graph + emit canonical
+--                                           tool.invoke{name=spawn_graph}
 --   * `chat.interrupt_all`                — double-Esc; cancel everything
 --   * `chat.reset`                        — /new: clear state + broadcast
 --   * `chat.model.set`                    — runtime model switch
---   * `<token>.run_node`                  — reasoner-graph dispatching a
---                                           Lua-resident type (responder /
---                                           tool-executor / adapter / terminal /
---                                           provider-wrapper / dummy)
---                                           NOTE: handled by per-reasoner
---                                           actors in starter/reasoners/, not
---                                           here
---   * `graph.run_complete`                — orchestrator or sub-graph completed
---   * `graph.node_result`                 — observed for state capture (wrap
---                                           node's next_state → current_state)
+--   * `graph.run_started { run_id, total_nodes }` — observability only
+--   * `graph.node.fired { run_id, node_id, firing_id, reasoner }` —
+--                                           observer paired with each
+--                                           tool.invoke; agentic-loop uses
+--                                           it to map firing_id → node_id
+--                                           for the orchestrator run so
+--                                           `tool.result` for the wrap
+--                                           firing can capture next_state
+--   * `tool.result { id, result | error }` — three flavours, disambiguated
+--                                           by `id`:
+--                                              - `id == current_run_id`     → orchestrator complete
+--                                              - `id` in `pending_runs`     → sub-graph complete
+--                                              - `id` in firing→node map   → wrap-node next_state capture
+--                                           Other tool.result envelopes (real
+--                                           tool returns, spawn_graph acks)
+--                                           pass through to other consumers.
 --   * `<provider>.chat.complete.result`   — translated by provider wrapper into
---                                           graph.node_result; the wrapper
---                                           handles the heavy lifting here.
---                                           agentic-loop is the consumer of
---                                           graph.node_result.
+--                                           a `tool.result` keyed by
+--                                           firing_id. The wrapper does the
+--                                           chat_id → firing lookup +
+--                                           emission.
 --   * `<provider>.stream.delta` etc.      — observed via wrapper translations
 --                                           (fire stream/reasoning observers)
 --   * `tool-gate.tool.invoke` (spawn_graph) — gate-forwarded tool invocation;
 --                                            handled by per-plugin tool-gate
 --                                            wrapper for the spawn_graph case
---   * `tool.result`                       — tool-executor correlation; handled
---                                           by tool-gate wrapper today
 --   * `sessions.session_start/end/resume_done` — replay lifecycle
 --   * `engine.shutdown`                   — no-op (sessions handles)
 
@@ -100,6 +109,12 @@ local state = {
   chat_id_to_key       = {},    ---@type table
   tool_id_to_key       = {},    ---@type table
   chat_id_stream_visible = {},  ---@type table
+  -- firing_id → { run_id, node_id, reasoner } for tracked runs (the
+  -- orchestrator run + every sub-graph run we own). Populated by
+  -- graph.node.fired observer envelopes; consumed when a tool.result
+  -- arrives for a firing_id we care about (today: only wrap-node
+  -- next_state capture).
+  firing_to_node       = {},    ---@type table
 
   -- Session-replay flag. While true, graph emissions are dropped (the
   -- graph already ran in the prior session).
@@ -156,11 +171,18 @@ local function flush_pending_dispatches()
     nefor.log.info("agentic-loop: dispatching queued sub-graph", {
       run_id = entry.run_id,
     })
+    -- Canonical tool contract: submit a graph by issuing a
+    -- `tool.invoke { id=run_id, name="spawn_graph", args: { graph,
+    -- on_node_failure } }`. The reasoner-graph binary parses this in
+    -- its dispatch_event when name matches SPAWN_GRAPH_TOOL_NAME.
     emit("reasoner-graph", {
-      kind            = "reasoner-graph.run",
-      run_id          = entry.run_id,
-      graph           = entry.graph,
-      on_node_failure = entry.on_node_failure,
+      kind = "tool.invoke",
+      id   = entry.run_id,
+      name = "spawn_graph",
+      args = {
+        graph           = entry.graph,
+        on_node_failure = entry.on_node_failure,
+      },
     })
   end
   return n
@@ -169,7 +191,7 @@ end
 local function cancel_all_pending_runs()
   local n = 0
   for run_id, _ in pairs(state.pending_runs) do
-    emit("reasoner-graph", { kind = "reasoner-graph.graph.cancel", run_id = run_id })
+    emit("reasoner-graph", { kind = "graph.cancel", run_id = run_id })
     n = n + 1
   end
   state.pending_runs = {}
@@ -197,11 +219,17 @@ local function submit_orchestrator_run(user_text)
   end
 
   state.current_run_id = ids.mint_chat_run_id()
+  -- Canonical tool contract: graph submission is a `tool.invoke` with
+  -- name="spawn_graph". The reasoner-graph binary's dispatch_event
+  -- routes by name and parses graph + policy from inside `args`.
   emit("reasoner-graph", {
-    kind            = "reasoner-graph.run",
-    run_id          = state.current_run_id,
-    graph           = g,
-    on_node_failure = "abort",
+    kind = "tool.invoke",
+    id   = state.current_run_id,
+    name = "spawn_graph",
+    args = {
+      graph           = g,
+      on_node_failure = "abort",
+    },
   })
   return state.current_run_id
 end
@@ -237,7 +265,7 @@ local function cancel_all()
   local cancelled_chat = state.current_run_id ~= nil
   if cancelled_chat then
     emit("reasoner-graph", {
-      kind   = "reasoner-graph.graph.cancel",
+      kind   = "graph.cancel",
       run_id = state.current_run_id,
     })
     state.current_run_id = nil
@@ -251,6 +279,7 @@ local function cancel_all()
   state.chat_id_to_key = {}
   state.chat_id_stream_visible = {}
   state.tool_id_to_key = {}
+  state.firing_to_node = {}
   nefor.log.info("agentic-loop: cancel_all", {
     cancelled_chat_run = cancelled_chat,
     cancelled_sub_runs = sub_n,
@@ -368,59 +397,81 @@ local function handle_chat_model_set(body)
 end
 
 -- ------------------------------------------------------------------
--- envelope handler — graph.run_complete
+-- envelope handlers — graph.node.fired + tool.result
 -- ------------------------------------------------------------------
 
-local function handle_graph_run_complete(body)
+-- graph.node.fired observer: track firing_id → (run_id, node_id) for
+-- runs we care about (current orchestrator run + every sub-graph run
+-- we own). The Rust scheduler emits one of these per dispatch alongside
+-- the targeted tool.invoke; we use it to correlate the eventual
+-- tool.result back to a node so the wrap-node next_state capture works.
+local function handle_graph_node_fired(body)
   local run_id = body.run_id
+  local firing_id = body.firing_id
+  local node_id = body.node_id
+  if type(run_id) ~= "string" or type(firing_id) ~= "string" then return end
+  if run_id ~= state.current_run_id and state.pending_runs[run_id] == nil then
+    return
+  end
+  state.firing_to_node[firing_id] = {
+    run_id   = run_id,
+    node_id  = node_id,
+    reasoner = body.reasoner,
+  }
+end
 
-  -- Sub-graph completion: queue + flush deferred relay. The relay
-  -- is also flushed at the bottom of this function on the orchestrator-
-  -- match branch; we call flush_deferred here too because the
-  -- orchestrator typically completes BEFORE the sub-graph (the
-  -- orchestrator's wrap-firing-2 turn only emits a "Started the
-  -- sub-graph" ack and finishes; the sub-graph runs to completion
-  -- after that). By the time this branch fires, current_run_id is
-  -- already nil — so flushing here delivers the deferred text without
-  -- waiting for another graph.run_complete.
+-- A tool.result with id == one of our tracked run_ids closes that run.
+local function handle_tool_result_run_close(run_id, body)
+  -- tool.result { id=run_id, result: { status, results } } — Rust packs
+  -- the prior `graph.run_complete` shape verbatim into result.
+  local result = body.result
+  local status, results
+  if type(result) == "table" then
+    status  = result.status
+    results = result.results
+  end
+  results = results or {}
+
+  -- Sub-graph completion: queue + flush deferred relay.
   local sub_pending = state.pending_runs[run_id]
   if sub_pending ~= nil then
     state.pending_runs[run_id] = nil
-    local status = body.status or "unknown"
+    local effective_status = status or "unknown"
     local completion = {
       kind   = "spawn_graph.completed",
       run_id = run_id,
-      status = status,
+      status = effective_status,
     }
-    if status == "success" then
-      completion.output = serialise_results(body.results)
+    if effective_status == "success" then
+      completion.output = serialise_results(results)
     else
-      completion.error = "spawn_graph run completed with status `" .. status .. "`: " ..
-                         json.encode(body.results or {})
+      completion.error = "spawn_graph run completed with status `" .. effective_status ..
+                         "`: " .. json.encode(results)
     end
     nefor.log.info("agentic-loop: sub-graph completed", {
-      run_id = run_id, status = status,
+      run_id = run_id, status = effective_status,
     })
     local text = format_deferred(completion)
     state.deferred_queue[#state.deferred_queue + 1] = { text = text }
     flush_deferred()
     -- Note: do NOT return; the orchestrator-match branch below may
     -- also fire if (rare) the sub-graph completion races the
-    -- orchestrator's own graph.run_complete.
+    -- orchestrator's own run-close envelope.
   end
 
   -- Orchestrator completion: clear current_run_id, surface results.
   if run_id == state.current_run_id then
-    nefor.log.info("agentic-loop: graph.run_complete for our run", {
-      run_id = run_id, status = body.status,
+    nefor.log.info("agentic-loop: tool.result run-close for our run", {
+      run_id = run_id, status = status,
       had_state = state.current_state ~= nil,
       chat_id = type(state.current_state) == "table" and state.current_state.chat_id or nil,
       deferred_queued = #state.deferred_queue,
     })
     state.current_run_id = nil
-
-    local status = body.status
-    local results = body.results or {}
+    -- Drop firing→node mappings owned by this run.
+    for fid, ref in pairs(state.firing_to_node) do
+      if ref.run_id == run_id then state.firing_to_node[fid] = nil end
+    end
 
     fire_observers(state.complete_observers, run_id, tostring(status))
 
@@ -460,16 +511,45 @@ local function handle_graph_run_complete(body)
   end
 end
 
--- Capture wrap node's next_state → current_state for chat continuity.
-local function handle_graph_node_result(body)
-  if body.run_id ~= state.current_run_id then return end
-  if body.node_id ~= "wrap" then return end
-  if type(body.next_state) ~= "table" then return end
-  state.current_state = body.next_state
+-- Per-firing tool.result close: capture wrap node's next_state →
+-- current_state for chat continuity. Matches behaviour of the prior
+-- graph.node_result handler — only the wrap-firing's next_state matters
+-- to the orchestrator.
+local function handle_tool_result_firing_close(firing_id, body)
+  local ref = state.firing_to_node[firing_id]
+  if ref == nil then return end
+  -- Drop the mapping; firing is closed.
+  state.firing_to_node[firing_id] = nil
+  if ref.run_id ~= state.current_run_id then return end
+  if ref.node_id ~= "wrap" then return end
+  -- next_state lives inside `result` per the wire-protocol spec
+  -- (coordination point 1).
+  local result = body.result
+  if type(result) ~= "table" then return end
+  local next_state = result.next_state
+  if type(next_state) ~= "table" then return end
+  state.current_state = next_state
   nefor.log.info("agentic-loop: captured next_state from wrap", {
-    run_id = body.run_id,
-    chat_id = body.next_state.chat_id,
+    run_id  = ref.run_id,
+    chat_id = next_state.chat_id,
   })
+end
+
+-- Top-level dispatcher for tool.result. Disambiguates by `id`:
+--   - matches a tracked run_id           → run close
+--   - matches a tracked firing_id        → wrap-node next_state capture
+--   - neither (real tool, spawn_graph ack, etc.) → ignore
+local function handle_tool_result(body)
+  local id = body.id
+  if type(id) ~= "string" or id == "" then return end
+  if id == state.current_run_id or state.pending_runs[id] ~= nil then
+    handle_tool_result_run_close(id, body)
+    return
+  end
+  if state.firing_to_node[id] ~= nil then
+    handle_tool_result_firing_close(id, body)
+    return
+  end
 end
 
 -- ------------------------------------------------------------------
@@ -479,13 +559,13 @@ end
 local function teardown_for_session_end()
   if state.current_run_id ~= nil then
     emit("reasoner-graph", {
-      kind = "reasoner-graph.graph.cancel",
+      kind = "graph.cancel",
       run_id = state.current_run_id,
     })
     state.current_run_id = nil
   end
   for run_id, _ in pairs(state.pending_runs) do
-    emit("reasoner-graph", { kind = "reasoner-graph.graph.cancel", run_id = run_id })
+    emit("reasoner-graph", { kind = "graph.cancel", run_id = run_id })
   end
   state.pending_runs       = {}
   state.pending_dispatches = {}
@@ -493,6 +573,7 @@ local function teardown_for_session_end()
   state.chat_id_to_key     = {}
   state.chat_id_stream_visible = {}
   state.tool_id_to_key     = {}
+  state.firing_to_node     = {}
   state.current_state      = nil
   state.deferred_queue     = {}
   state.pending_user_inputs = {}
@@ -810,19 +891,36 @@ local function receive_msg(entry)
   if kind == "chat.interrupt_all" then cancel_all(); return end
   if kind == "chat.model.set" then handle_chat_model_set(body); return end
 
-  -- Reasoner-graph emissions: graph.run_complete + graph.node_result.
+  -- Reasoner-graph emissions on the canonical contract:
+  --   * graph.node.fired { run_id, node_id, firing_id, reasoner } —
+  --     observer paired with each tool.invoke dispatch.
+  --   * tool.result { id=<run_id|firing_id>, result | error } — both
+  --     run-close and per-firing close share the kind; we disambiguate
+  --     by id.
   if state.replay_mode then
-    if kind == "graph.run_complete" or kind == "graph.node_result" then
-      return
+    if kind == "graph.node.fired" then return end
+    if kind == "tool.result" then
+      -- Drop only tool.result envelopes that target one of our tracked
+      -- ids; pass the rest to other consumers (real tool returns,
+      -- spawn_graph synth replies). Matters because tool-gate's own
+      -- emission goes through this same bus.
+      local id = body.id
+      if type(id) == "string" then
+        if id == state.current_run_id
+            or state.pending_runs[id] ~= nil
+            or state.firing_to_node[id] ~= nil then
+          return
+        end
+      end
     end
   end
 
-  if kind == "graph.run_complete" then
-    handle_graph_run_complete(body)
+  if kind == "graph.node.fired" then
+    handle_graph_node_fired(body)
     return
   end
-  if kind == "graph.node_result" then
-    handle_graph_node_result(body)
+  if kind == "tool.result" then
+    handle_tool_result(body)
     return
   end
 end
@@ -866,6 +964,7 @@ M._internals  = {
     state.chat_id_to_key = {}
     state.tool_id_to_key = {}
     state.chat_id_stream_visible = {}
+    state.firing_to_node = {}
     state.replay_mode = false
     state.expecting_replay = false
     state.stream_observers = {}
