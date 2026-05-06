@@ -1245,6 +1245,73 @@ local function test_engine_envelopes_skipped_in_replay_to_late_attachers()
   end
 end
 
+-- ------------------------------------------------------------------
+-- Phase 4: replay-window gate suppresses per-peer fan-out
+-- ------------------------------------------------------------------
+--
+-- Sessions emits `sessions.replay.start` / `sessions.replay.end`
+-- around its replay loop. While the gate is open, ncp.lua's
+-- `send_to_peer` skips the underlying `nefor.engine.deliver` call so
+-- Rust plugins don't see envelopes that originate from (or get fanned
+-- out during) the replay. Pure-Lua actors are unaffected — they
+-- consume bus traffic via `nefor.bus.on_event`, which is independent
+-- of this fan-out path.
+--
+-- The unit test drives the gate via `ncp._set_in_replay(true)` (the
+-- production toggle path is a `nefor.bus.on_event` subscription;
+-- exercised in starter_sessions_test). Then it issues a plugin event
+-- and verifies no per-peer delivery happened.
+local function test_replay_gate_suppresses_send_to_peer()
+  reset()
+  _test.set_plugins({ "a", "b", "c" })
+
+  -- Ready all three peers so events would normally fan out.
+  local log = {}
+  for _, n in ipairs({ "a", "b", "c" }) do
+    log[#log + 1] = entry_plugin(n, make_ready("0.1"))
+    ncp.dispatch(log)
+  end
+  _test.calls_clear()
+
+  -- Open the replay window.
+  ncp._set_in_replay(true)
+
+  -- 'a' emits an event that would normally reach 'b' and 'c'.
+  log[#log + 1] = entry_plugin("a", make_event({ kind = "test.during.replay" }))
+  ncp.dispatch(log)
+
+  -- No fan-out delivery should have happened — the gate suppresses
+  -- send_to_peer inside the window.
+  local calls = _test.calls()
+  for _, c in ipairs(calls) do
+    if c.target == "b" or c.target == "c" then
+      local decoded = json.decode(c.payload)
+      assert_true(
+        decoded.body.kind ~= "test.during.replay",
+        "send_to_peer must not deliver during replay window; got "
+          .. tostring(decoded.body.kind) .. " to " .. tostring(c.target)
+      )
+    end
+  end
+
+  -- Close the window; subsequent events fan out normally again.
+  ncp._set_in_replay(false)
+  _test.calls_clear()
+  log[#log + 1] = entry_plugin("a", make_event({ kind = "test.after.replay" }))
+  ncp.dispatch(log)
+
+  local seen_b, seen_c = false, false
+  for _, c in ipairs(_test.calls()) do
+    local decoded = json.decode(c.payload)
+    if decoded.body.kind == "test.after.replay" then
+      if c.target == "b" then seen_b = true end
+      if c.target == "c" then seen_c = true end
+    end
+  end
+  assert_true(seen_b, "post-replay event must reach 'b'")
+  assert_true(seen_c, "post-replay event must reach 'c'")
+end
+
 local function test_spawn_accepts_the_four_valid_fields_without_error()
   reset()
   install_spawn_stub()
@@ -1313,6 +1380,7 @@ local tests = {
   { name = "engine_origin_does_not_trigger_ready_handshake_error", fn = test_engine_origin_does_not_trigger_ready_handshake_error },
   { name = "engine_plugin_failed_buffers_until_chat_readies", fn = test_engine_plugin_failed_buffers_until_chat_readies },
   { name = "engine_envelopes_skipped_in_replay_to_late_attachers", fn = test_engine_envelopes_skipped_in_replay_to_late_attachers },
+  { name = "replay_gate_suppresses_send_to_peer", fn = test_replay_gate_suppresses_send_to_peer },
 }
 
 for _, t in ipairs(tests) do

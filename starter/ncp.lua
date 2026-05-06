@@ -88,6 +88,16 @@ local ready_plugins = {}
 -- to drop. Errors are caught — a faulty transform never crashes dispatch.
 local plugin_transforms = {}
 
+-- Replay-window flag. Set true on `sessions.replay.start`, false on
+-- `sessions.replay.end` (toggled inline by the dispatch loop when it
+-- sees those markers — see `handle_event`). While true, `send_to_peer`
+-- short-circuits before calling `nefor.engine.deliver`: Rust plugins
+-- never see envelopes fanned out during a session replay. Pure-Lua
+-- actors are unaffected — they consume bus traffic via
+-- `nefor.bus.on_event` (the actor.lua runtime), which is independent
+-- of this fan-out path.
+local in_replay = false
+
 -- FIFO queue of `chat.popup` envelope tables awaiting nefor-tui's ready.
 -- Engine spawn-failures fire during boot, before nefor-tui completes its
 -- `ready` handshake — and nefor-tui's NCP layer drops every pre-ready_ok
@@ -310,6 +320,13 @@ end
 -- preserving a single shared `ts` across the fan-out is a v2 concern
 -- (see module doc).
 local function send_to_peer(target, env_in)
+  -- Replay-window gate. Inside `sessions.replay.start` /
+  -- `sessions.replay.end`, suppress per-peer fan-out so Rust plugins
+  -- don't see envelopes derived from the replay. Pure-Lua actors are
+  -- unaffected; they receive via the actor.lua bus subscription, which
+  -- runs independently of `nefor.engine.deliver`.
+  if in_replay then return end
+
   -- Deep-copy body only when a `to_plugin` transform is actually registered
   -- for `target` — otherwise the body is read-only on the way out and
   -- copying is wasted work (per-keystroke, multiplied by N peers, this
@@ -649,6 +666,15 @@ function M._reset()
   ready_plugins = {}
   plugin_transforms = {}
   pending_chat_popups = {}
+  in_replay = false
+end
+
+-- Exposed for tests only. Toggle the replay-window flag directly so a
+-- unit test can exercise `send_to_peer`'s gate without spinning up the
+-- full actor runtime + bus subscription. Production toggles via the
+-- `nefor.bus.on_event` subscription installed below.
+function M._set_in_replay(flag)
+  in_replay = flag and true or false
 end
 
 -- Exposed for tests only. Registers a transform for `name` without going
@@ -656,6 +682,29 @@ end
 -- ncp_test.lua suite exercise transforms without mocking `nefor.plugins`.
 function M._test_set_transforms(name, transforms)
   plugin_transforms[name] = transforms
+end
+
+-- ------------------------------------------------------------------
+-- replay-window subscription
+-- ------------------------------------------------------------------
+--
+-- Subscribe to the sessions replay framing so `in_replay` flips at the
+-- right moment. Sessions emits these as ordinary broadcast events (step
+-- entries on the bus), so the dispatch hook itself never sees them —
+-- step-origin entries are short-circuited in `M.dispatch`. The bus
+-- subscription path (driven by the broker's `dispatch_subscriptions`)
+-- IS the right place to react.
+--
+-- Guarded against environments where `nefor.bus` isn't installed (the
+-- ncp_test.lua harness) — the gate has a `_set_in_replay` test escape
+-- hatch for those.
+if nefor.bus and nefor.bus.on_event then
+  nefor.bus.on_event("sessions.replay.start", function(_entry)
+    in_replay = true
+  end)
+  nefor.bus.on_event("sessions.replay.end", function(_entry)
+    in_replay = false
+  end)
 end
 
 return M

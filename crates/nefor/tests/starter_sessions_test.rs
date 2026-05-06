@@ -237,9 +237,13 @@ fn resume_phase_hooks_fire_synchronously_before_emit() {
     //   2. session_end emit.
     //   3. session_start hook runs.
     //   4. session_start emit.
-    //   5. (no replay file → no replayed entries here).
-    //   6. resume_done hook runs.
-    //   7. resume_done emit.
+    //   5. replay.start emit (Phase 4 framing — pure-Lua actors only;
+    //      the resume_phase hook predates this and stays attached to
+    //      the live phases, not the replay window).
+    //   6. (no replay file → no replayed entries here).
+    //   7. replay.end emit.
+    //   8. resume_done hook runs.
+    //   9. resume_done emit.
     //
     // We verify by recording timestamps in a Lua-side trace log: each
     // hook records "phase:<name>", and we monkey-patch `nefor.engine.send`
@@ -311,6 +315,8 @@ fn resume_phase_hooks_fire_synchronously_before_emit() {
         "emit:sessions.session_end",
         "phase:session_start",
         "emit:sessions.session_start",
+        "emit:sessions.replay.start",
+        "emit:sessions.replay.end",
         "phase:resume_done",
         "emit:sessions.resume_done",
     ];
@@ -850,6 +856,161 @@ fn new_after_submit_preserves_prior_session() {
         "/new must open a fresh file: {new_path}"
     );
     assert_ne!(boot_path, new_path, "/new must mint a different id");
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
+        None => std::env::remove_var("NEFOR_DATA_HOME"),
+    }
+}
+
+#[test]
+fn replay_window_frames_resume_and_skips_persistence_inside() {
+    // Phase 4: sessions emits `sessions.replay.start` / `replay.end`
+    // around the replay loop, and persistence is suppressed inside the
+    // window. Together these let pure-Lua actors process replays via
+    // `nefor.bus.on_event` without re-recording derived emissions onto
+    // disk (which would duplicate state on the next resume). The
+    // markers themselves are NOT persisted (sessions.* filter).
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_HOME").ok();
+    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+
+    // Pre-seed a target session jsonl with one step-origin entry so
+    // replay_jsonl has something to do. The header line carries the
+    // `_session: true` marker the resolver expects.
+    let target_id = "66666666-2222-4333-8444-555555555555";
+    let sessions_dir = tempdir.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("mkdir");
+    let target_path = sessions_dir.join(format!("{target_id}.jsonl"));
+    let preseed = format!(
+        concat!(
+            r#"{{"_session":true,"session_id":"{id}","started_at":"2026-05-04T00:00:00.000Z"}}"#,
+            "\n",
+            r#"{{"ts":"2026-05-04T00:00:00.001Z","origin":"step","payload":"{{\"type\":\"event\",\"from\":\"agentic-loop\",\"body\":{{\"kind\":\"chat.message.append\",\"role\":\"user\",\"text\":\"hi\"}}}}"}}"#,
+            "\n",
+        ),
+        id = target_id
+    );
+    std::fs::write(&target_path, &preseed).expect("seed target");
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+
+    // Record every emission so we can assert ordering of the markers
+    // around the replayed envelope.
+    lua.load(
+        r#"
+        _emits = {}
+        local json = nefor.json
+        nefor.engine.send = function(payload, target)
+            local ok, decoded = pcall(json.decode, payload)
+            if ok and type(decoded) == "table"
+               and type(decoded.body) == "table"
+               and type(decoded.body.kind) == "string" then
+                _emits[#_emits + 1] = decoded.body.kind
+            end
+        end
+        sessions = require("sessions")
+        sessions_test = require("sessions.test")
+        sessions.init()
+        _emits = {}
+        "#,
+    )
+    .exec()
+    .expect("init");
+
+    let resume_call = format!(r#"sessions.resume("{target_id}")"#);
+    lua.load(&resume_call).exec().expect("resume");
+
+    let trace: Table = lua.globals().get("_emits").expect("_emits");
+    let len = trace.len().expect("len") as usize;
+    let ordered: Vec<String> = (1..=len)
+        .map(|i| trace.get::<String>(i).expect("entry"))
+        .collect();
+    let kinds: Vec<&str> = ordered.iter().map(String::as_str).collect();
+
+    // Markers frame the replayed envelope. The replayed envelope
+    // (chat.message.append) emerges between replay.start and replay.end.
+    let start_idx = kinds
+        .iter()
+        .position(|k| *k == "sessions.replay.start")
+        .expect("replay.start emitted");
+    let end_idx = kinds
+        .iter()
+        .position(|k| *k == "sessions.replay.end")
+        .expect("replay.end emitted");
+    let replayed_idx = kinds
+        .iter()
+        .position(|k| *k == "chat.message.append")
+        .expect("replayed envelope emerged");
+    assert!(
+        start_idx < replayed_idx && replayed_idx < end_idx,
+        "replayed envelope must fall inside the replay window: {kinds:?}"
+    );
+    let resume_done_idx = kinds
+        .iter()
+        .position(|k| *k == "sessions.resume_done")
+        .expect("resume_done emitted");
+    assert!(
+        end_idx < resume_done_idx,
+        "replay.end must precede resume_done: {kinds:?}"
+    );
+
+    // Persistence skip: drive a derived emission through the persist
+    // path while the in_replay_window flag is held true (simulating a
+    // pure-Lua actor reacting to a replayed envelope). The marker
+    // arrives via receive_msg; toggle it explicitly here so the test
+    // doesn't depend on the actor.lua runtime.
+    lua.load(
+        r#"
+        local json = nefor.json
+        local function entry(origin, body)
+            return {
+                ts      = "2026-05-04T00:00:00.000Z",
+                origin  = origin,
+                payload = json.encode({ type = "event", body = body }),
+            }
+        end
+        -- Open the window via the public bus protocol path.
+        sessions.receive_msg(entry("sessions",
+            { kind = "sessions.replay.start", session_id = "x", count = 0 }))
+        -- A pure-Lua actor's derived emission lands at the persist
+        -- handler — must be DROPPED.
+        sessions.receive_msg(entry("agentic-loop",
+            { kind = "chat.message.append", role = "system", text = "derived" }))
+        -- Close the window.
+        sessions.receive_msg(entry("sessions",
+            { kind = "sessions.replay.end", session_id = "x" }))
+        -- A live emission after the window must be PERSISTED.
+        sessions.receive_msg(entry("agentic-loop",
+            { kind = "chat.message.append", role = "user", text = "live" }))
+        "#,
+    )
+    .exec()
+    .expect("drive persistence around window");
+
+    let body = std::fs::read_to_string(&target_path).expect("read target");
+    // The persisted file must carry the seed entry + the live entry,
+    // but NOT the derived entry from inside the window. Markers are
+    // sessions.* — already filtered out by persist_envelope.
+    assert!(
+        body.contains(r#"\"text\":\"hi\""#),
+        "seed entry must remain: {body}"
+    );
+    assert!(
+        body.contains(r#"\"text\":\"live\""#),
+        "post-window live entry must be persisted: {body}"
+    );
+    assert!(
+        !body.contains(r#"\"text\":\"derived\""#),
+        "in-window derived entry must NOT be persisted: {body}"
+    );
+    assert!(
+        !body.contains("sessions.replay.start") && !body.contains("sessions.replay.end"),
+        "replay markers must not be persisted: {body}"
+    );
 
     match prev.as_deref() {
         Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),

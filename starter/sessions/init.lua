@@ -23,17 +23,30 @@
 --
 -- ## Public bus protocol
 --
--- Four control events. None are persisted (anything whose body.kind
+-- Six control events. None are persisted (anything whose body.kind
 -- starts with `sessions.` is dropped from disk).
 --
 --   sessions.session_start { session_id, from_resume? }
 --   sessions.session_end   { session_id }
+--   sessions.replay.start  { session_id, count }
+--   sessions.replay.end    { session_id }
 --   sessions.resume_done   { session_id, replayed }
 --     ↑ emitted
 --
 --   sessions.resume_request { session_id }
 --   sessions.new_request    { }
 --     ↑ consumed
+--
+-- ## Replay window
+--
+-- `replay.start` / `replay.end` frame the burst of replayed envelopes.
+-- The runtime gate (in `ncp.lua`) suppresses bus→Rust forwarding inside
+-- the window so Rust plugins never see replayed traffic; pure-Lua
+-- actors get the replay normally via `nefor.bus.on_event` and rebuild
+-- their state. Sessions itself ALSO drops persistence between the
+-- markers — pure-Lua actors may emit derived envelopes during state
+-- rebuild, and persisting those would duplicate state on next resume.
+-- The persist rule is "live traffic only."
 --
 -- ## On-disk path
 --
@@ -78,6 +91,14 @@ local state = {
     session_start = {},
     resume_done   = {},
   },
+
+  -- Replay-window flag — flipped by receive_msg when our own
+  -- `sessions.replay.start` / `sessions.replay.end` markers re-enter
+  -- through the bus. While true, `persist_envelope` drops everything:
+  -- pure-Lua actors may emit derived envelopes during replay-driven
+  -- state rebuild, and persisting those would duplicate state on the
+  -- next resume. The rule is "persist live traffic only."
+  in_replay_window = false,
 }
 
 -- ------------------------------------------------------------------
@@ -208,6 +229,14 @@ end
 local function persist_envelope(entry)
   if not state.current_session_file then return end
 
+  -- Drop everything inside the replay window. Pure-Lua actors process
+  -- replayed envelopes (via bus.on_event) and may emit derived ones —
+  -- persisting those would duplicate state on next resume. The window
+  -- is bounded by `sessions.replay.start` / `sessions.replay.end`,
+  -- which receive_msg uses to toggle `in_replay_window`. The markers
+  -- themselves fall through to the `sessions.*` filter below.
+  if state.in_replay_window then return end
+
   -- Drop sessions.* control events. They're starter-internal lifecycle
   -- signals, not session content.
   local ok, decoded = pcall(json.decode, entry.payload)
@@ -233,6 +262,28 @@ end
 -- ------------------------------------------------------------------
 -- resume — re-broadcast every step-origin entry to its original target
 -- ------------------------------------------------------------------
+
+-- Pre-pass: count the step-origin entries that would be replayed. Used
+-- to populate `sessions.replay.start { count }`. Cheaper than buffering
+-- the whole file: one extra read of the JSONL with a substring check
+-- before per-line decode (decode is unavoidable to filter step-origin).
+---@param path string
+---@return integer count
+local function count_replay_entries(path)
+  local fh = io.open(path, "r")
+  if not fh then return 0 end
+  local count = 0
+  for line in fh:lines() do
+    if line:sub(1, 12) ~= [[{"_session":]] then
+      local ok, decoded = pcall(json.decode, line)
+      if ok and decoded.origin == "step" then
+        count = count + 1
+      end
+    end
+  end
+  fh:close()
+  return count
+end
 
 ---@param path string
 ---@return integer count
@@ -327,8 +378,17 @@ local function do_resume(target_session_id)
   send_msg({ kind = "control", event = "sessions.session_start",
              extra = { session_id = target_session_id, from_resume = true } })
 
-  -- 4. Replay.
+  -- 4. Replay framed by start/end markers. The runtime gate
+  -- (ncp.lua) suppresses bus→Rust forwarding inside the window;
+  -- pure-Lua actors get the replay normally and rebuild state.
+  -- Sessions' own persistence path also drops envelopes inside the
+  -- window — see `in_replay_window` flag toggled in receive_msg.
+  local total = new_path and count_replay_entries(new_path) or 0
+  send_msg({ kind = "control", event = "sessions.replay.start",
+             extra = { session_id = target_session_id, count = total } })
   local replayed = new_path and replay_jsonl(new_path) or 0
+  send_msg({ kind = "control", event = "sessions.replay.end",
+             extra = { session_id = target_session_id } })
 
   -- 5. Coalesced "we're back" signal.
   fire_resume_phase("resume_done", target_session_id)
@@ -429,6 +489,22 @@ local function receive_msg(entry)
     return
   end
 
+  -- Replay-window markers — flip the persistence-skip flag. The
+  -- marker emissions are sessions's own (via send_msg in do_resume);
+  -- they round-trip through the bus and arrive here on a later tick,
+  -- which is exactly when the persistence handler needs the flag set
+  -- to drop derived emissions from pure-Lua actors processing the
+  -- replay. Markers themselves are not persisted (sessions.* filter
+  -- below).
+  if kind == "sessions.replay.start" then
+    state.in_replay_window = true
+    return
+  end
+  if kind == "sessions.replay.end" then
+    state.in_replay_window = false
+    return
+  end
+
   -- Drop sessions.* control events from persistence.
   if type(kind) == "string" and kind:sub(1, 9) == "sessions." then return end
 
@@ -486,6 +562,7 @@ return {
       state.should_prune_session  = true
       state.resume_in_progress    = false
       state.initialised           = false
+      state.in_replay_window      = false
       state.resume_phase_hooks    = {
         session_end   = {},
         session_start = {},
