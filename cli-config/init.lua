@@ -31,21 +31,24 @@ package.path = table.concat({
 }, ";")
 
 local ncp      = require("ncp")
+local actor    = require("actor")
 local sessions = require("sessions")
 local cfg      = require("config").active
 
 -- Forward the engine's `current_log` to ncp.dispatch. The engine is
 -- session-blind; cross-run resume + jsonl persistence are owned by
--- `starter/sessions.lua` (loaded above and brought up below).
+-- the sessions actor (registered with the actor runtime below).
 function dispatch(current_log)
   ncp.dispatch(current_log)
 end
 
--- Mint a fresh session, install the persistence hook + resume listener,
--- emit `sessions.session_start`. Done before any plugin spawn so the
--- jsonl persistence is already wired when the first envelope routes.
+-- Install the actor runtime, register the sessions actor, then mint a
+-- fresh session. Done before any plugin spawn so the persistence path
+-- is in place when the first envelope routes. Shutdown handling is
+-- wired implicitly via the runtime's engine.shutdown synthesis.
+actor.install()
+actor.spawn(sessions)
 sessions.init()
-sessions.handle_shutdown()
 
 local agentic_workflow = require("agentic_workflow")
 local agentic_cli      = require("agentic_cli")

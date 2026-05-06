@@ -53,26 +53,34 @@ package.path = table.concat({
 -- docstring for the bus protocol.
 
 local ncp      = require("ncp")
+local actor    = require("actor")
 local sessions = require("sessions")
 local cfg      = require("config").active
 
 -- Forward the engine's `current_log` to ncp.dispatch. The engine is
 -- session-blind: cross-run resume is owned by `starter/sessions.lua`,
--- which subscribes to the bus directly via nefor.bus.on_event and
--- replays jsonl onto it on `sessions.resume_request`.
+-- which is now an actor registered with `actor.lua`. The actor runtime
+-- subscribes to the bus once and routes every envelope to all spawned
+-- actors' `receive_msg`.
 function dispatch(current_log)
   ncp.dispatch(current_log)
 end
 
--- Mint a fresh session, install persistence + resume_request listener,
--- emit `sessions.session_start`. Done before any plugin spawn so the
--- persistence hook is in place when the first envelope routes.
-sessions.init()
+-- Install the actor runtime — subscribes to the bus and to engine
+-- shutdown lifecycle. Done BEFORE actor.spawn so the bus subscription
+-- is live when actors start running their boot code.
+actor.install()
 
--- Subscribe to engine shutdown so the library can emit
--- `sessions.session_end` synchronously inside the cooperative-shutdown
--- grace, before connections close.
-sessions.handle_shutdown()
+-- Register the sessions actor. The actor's `receive_msg` handles
+-- persistence, resume_request, new_request, and engine.shutdown via
+-- the bus — no separate bus or lifecycle subscriptions in the module.
+actor.spawn(sessions)
+
+-- Mint a fresh session and emit `sessions.session_start`. Done before
+-- any plugin spawn so the persistence path is in place when the first
+-- envelope routes. Shutdown handling is wired implicitly via the actor
+-- runtime — no `sessions.handle_shutdown()` call needed.
+sessions.init()
 
 -------------------------------------------------------------------------
 -- 4. Plugin composition
