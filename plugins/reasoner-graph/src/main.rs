@@ -154,20 +154,15 @@ async fn dispatch_event(
     };
 
     match kind {
-        "reasoner-graph.register_reasoner" => {
-            // Explicit declaration that a reasoner type is "connected"
-            // without owning a plugin process. Used by Lua-resident
-            // reasoner types (provider-wrapper, tool-executor, adapter,
-            // terminal, dummy) which never appear as a wire `from`.
-            // Idempotent — re-registering the same name is a no-op
-            // because `track_peer` is a HashSet insert.
-            if let Some(name) = body.get("name").and_then(Value::as_str) {
-                track_peer(peers, name);
-            } else {
-                tracing::warn!("register_reasoner event missing required 'name' string field");
+        "tool.invoke" => {
+            // Canonical tool contract: only `name="spawn_graph"` is ours.
+            // Anything else on the bus is targeted at a different tool
+            // and we ignore it. (Routing-by-name is the substitute for
+            // the old per-plugin envelope kinds.)
+            let name = body.get("name").and_then(Value::as_str).unwrap_or("");
+            if name != crate::graph::SPAWN_GRAPH_TOOL_NAME {
+                return Ok(());
             }
-        }
-        "reasoner-graph.run" => {
             let snapshot = peers.lock().expect("peers mutex poisoned").clone();
             let outcome = Scheduler::handle_submit(runs, &snapshot, body);
             let effects = match outcome {
@@ -175,9 +170,36 @@ async fn dispatch_event(
             };
             emit_effects(runs, peers, out_tx, effects.into_vec()).await?;
         }
-        "graph.node_result" => {
+        "tool.result" => {
+            // Inbound node-firing reply on the canonical contract.
+            // Resolve `id` → `(run_id, node_id, firing_id)` via the
+            // per-RunState `firing_by_request_id` table, then synthesize
+            // an in-process `graph.node_result`-shape body and feed it
+            // to the existing scheduler handler. The synthesized body
+            // never goes on the wire.
+            let id = match body.get("id").and_then(Value::as_str) {
+                Some(s) => s,
+                None => {
+                    tracing::warn!("tool.result missing `id`; dropping");
+                    return Ok(());
+                }
+            };
+            let resolved = Scheduler::resolve_request_id(runs, id);
+            let (run_id, node_id, firing_id) = match resolved {
+                Some(t) => t,
+                None => {
+                    // Either belongs to another tool (combinator
+                    // queries/invokes use `combinators.*.result`, not
+                    // `tool.result`) or the firing was already cancelled
+                    // / completed via the watchdog. Silent drop.
+                    tracing::debug!(id = %id, "tool.result for unknown request_id; dropping");
+                    return Ok(());
+                }
+            };
+            let synthesized =
+                synthesize_node_result(&run_id, &node_id, &firing_id, body);
             let snapshot = peers.lock().expect("peers mutex poisoned").clone();
-            let effects = Scheduler::handle_node_result(runs, &snapshot, body);
+            let effects = Scheduler::handle_node_result(runs, &snapshot, &synthesized);
             emit_effects(runs, peers, out_tx, effects.into_vec()).await?;
         }
         "graph.cancel" => {
@@ -201,17 +223,45 @@ async fn dispatch_event(
             let effects = Scheduler::handle_invoke_result(runs, &snapshot, body);
             emit_effects(runs, peers, out_tx, effects.into_vec()).await?;
         }
-        other if other.ends_with(".run_node.ack") => {
-            // `<reasoner>.run_node.ack` — pure bookkeeping, no
-            // outbound effects. The ack-timeout watchdog (spawned at
-            // dispatch) checks the firing's `acked` flag on expiry.
-            Scheduler::handle_node_ack(runs, body);
-        }
         _ => {
             // Not for us.
         }
     }
     Ok(())
+}
+
+/// Translate an inbound `tool.result { id, result | error }` body into
+/// the legacy `graph.node_result { run_id, node_id, firing_id, output |
+/// error, next_state? }` shape consumed by [`Scheduler::handle_node_result`].
+///
+/// The legacy shape is internal — never goes back on the bus — and
+/// keeps the scheduler's parsing untouched. Convention for the
+/// `result` payload: tools may include `next_state` inside it; we
+/// surface it at the synthesized body root because the scheduler
+/// threads it across cycle re-firings.
+fn synthesize_node_result(
+    run_id: &str,
+    node_id: &str,
+    firing_id: &str,
+    body: &Map<String, Value>,
+) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("kind".into(), Value::String("graph.node_result".into()));
+    m.insert("run_id".into(), Value::String(run_id.to_owned()));
+    m.insert("node_id".into(), Value::String(node_id.to_owned()));
+    m.insert("firing_id".into(), Value::String(firing_id.to_owned()));
+    if let Some(err) = body.get("error") {
+        m.insert("error".into(), err.clone());
+    } else if let Some(result) = body.get("result") {
+        m.insert("output".into(), result.clone());
+        // Tools that thread state across firings put `next_state`
+        // inside `result`. Surface it at the synthesized root so the
+        // scheduler picks it up as `current_state` for the next firing.
+        if let Some(ns) = result.as_object().and_then(|o| o.get("next_state")) {
+            m.insert("next_state".into(), ns.clone());
+        }
+    }
+    m
 }
 
 /// Drain a list of [`Effect`]s onto the outbound mpsc. Collects any
@@ -320,17 +370,22 @@ fn effect_to_body(effect: Effect) -> Map<String, Value> {
             inputs,
             prev_state,
         } => {
+            // Canonical tool contract: dispatch a node by issuing a
+            // `tool.invoke { id=firing_id, name=<reasoner>, args }`.
+            // `args` carries `{ run_id, node_id, args, inputs, prev_state }`
+            // per spec D2 — `firing_id` is implicit in the envelope `id`
+            // and not duplicated.
+            let mut tool_args = Map::new();
+            tool_args.insert("run_id".into(), Value::String(run_id));
+            tool_args.insert("node_id".into(), Value::String(node_id));
+            tool_args.insert("args".into(), args);
+            tool_args.insert("inputs".into(), Value::Object(inputs));
+            tool_args.insert("prev_state".into(), prev_state);
             let mut m = Map::new();
-            m.insert(
-                "kind".into(),
-                Value::String(format!("{}.run_node", reasoner)),
-            );
-            m.insert("run_id".into(), Value::String(run_id));
-            m.insert("node_id".into(), Value::String(node_id));
-            m.insert("firing_id".into(), Value::String(firing_id));
-            m.insert("args".into(), args);
-            m.insert("inputs".into(), Value::Object(inputs));
-            m.insert("prev_state".into(), prev_state);
+            m.insert("kind".into(), Value::String("tool.invoke".into()));
+            m.insert("id".into(), Value::String(firing_id));
+            m.insert("name".into(), Value::String(reasoner));
+            m.insert("args".into(), Value::Object(tool_args));
             m
         }
         Effect::NodeDispatched {
@@ -339,8 +394,12 @@ fn effect_to_body(effect: Effect) -> Map<String, Value> {
             firing_id,
             reasoner,
         } => {
+            // Paired observer envelope alongside each `tool.invoke` —
+            // pure observability for agentic-loop's per-node stream
+            // filtering (D-26 in agentic_workflow_map.md). No
+            // correctness depends on it. Spec D3.
             let mut m = Map::new();
-            m.insert("kind".into(), Value::String("graph.node_dispatched".into()));
+            m.insert("kind".into(), Value::String("graph.node.fired".into()));
             m.insert("run_id".into(), Value::String(run_id));
             m.insert("node_id".into(), Value::String(node_id));
             m.insert("firing_id".into(), Value::String(firing_id));
@@ -352,11 +411,17 @@ fn effect_to_body(effect: Effect) -> Map<String, Value> {
             status,
             results,
         } => {
+            // Canonical tool contract: close the spawn_graph invocation
+            // with `tool.result { id=run_id, result: { status, results } }`.
+            // The result body carries today's `graph.run_complete` shape
+            // verbatim per coordination point 4 in wire_protocol_spec.md.
+            let mut result_body = Map::new();
+            result_body.insert("status".into(), Value::String(status.as_wire().to_owned()));
+            result_body.insert("results".into(), Value::Object(results));
             let mut m = Map::new();
-            m.insert("kind".into(), Value::String("graph.run_complete".into()));
-            m.insert("run_id".into(), Value::String(run_id));
-            m.insert("status".into(), Value::String(status.as_wire().to_owned()));
-            m.insert("results".into(), Value::Object(results));
+            m.insert("kind".into(), Value::String("tool.result".into()));
+            m.insert("id".into(), Value::String(run_id));
+            m.insert("result".into(), Value::Object(result_body));
             m
         }
         Effect::CombinatorsQuery {
@@ -492,7 +557,10 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_node_effect_renders_targeted_kind_with_firing_and_state() {
+    fn dispatch_node_effect_renders_tool_invoke_with_args_payload() {
+        // Canonical tool contract: dispatch is a `tool.invoke { id=firing_id,
+        // name=<reasoner>, args: { run_id, node_id, args, inputs, prev_state } }`.
+        // firing_id is the envelope id, not duplicated inside args (spec D2).
         let mut inputs = Map::new();
         inputs.insert("n1".into(), json!({"output": "x"}));
         let body = effect_to_body(Effect::DispatchNode {
@@ -506,12 +574,21 @@ mod tests {
         });
         assert_eq!(
             body.get("kind").and_then(Value::as_str),
-            Some("openai-provider.run_node")
+            Some("tool.invoke")
         );
-        assert_eq!(body.get("run_id").and_then(Value::as_str), Some("run-1"));
-        assert_eq!(body.get("node_id").and_then(Value::as_str), Some("n2"));
-        assert_eq!(body.get("firing_id").and_then(Value::as_str), Some("f-abc"));
-        assert_eq!(body.get("prev_state"), Some(&json!({"history": [1]})));
+        assert_eq!(body.get("id").and_then(Value::as_str), Some("f-abc"));
+        assert_eq!(
+            body.get("name").and_then(Value::as_str),
+            Some("openai-provider")
+        );
+        let args = body.get("args").and_then(Value::as_object).expect("args");
+        assert_eq!(args.get("run_id").and_then(Value::as_str), Some("run-1"));
+        assert_eq!(args.get("node_id").and_then(Value::as_str), Some("n2"));
+        assert_eq!(args.get("args"), Some(&json!({"prompt": "hi"})));
+        assert_eq!(args.get("prev_state"), Some(&json!({"history": [1]})));
+        // firing_id MUST NOT be duplicated inside args — it lives only
+        // on the envelope id.
+        assert!(args.get("firing_id").is_none());
     }
 
     #[test]
@@ -529,7 +606,8 @@ mod tests {
     }
 
     #[test]
-    fn node_dispatched_effect_renders_kind_and_firing_id() {
+    fn node_dispatched_effect_renders_graph_node_fired_observer() {
+        // Paired observer alongside each tool.invoke (spec D3).
         let body = effect_to_body(Effect::NodeDispatched {
             run_id: "run-1".into(),
             node_id: "n1".into(),
@@ -538,14 +616,17 @@ mod tests {
         });
         assert_eq!(
             body.get("kind").and_then(Value::as_str),
-            Some("graph.node_dispatched")
+            Some("graph.node.fired")
         );
+        assert_eq!(body.get("run_id").and_then(Value::as_str), Some("run-1"));
+        assert_eq!(body.get("node_id").and_then(Value::as_str), Some("n1"));
         assert_eq!(body.get("firing_id").and_then(Value::as_str), Some("f-1"));
         assert_eq!(body.get("reasoner").and_then(Value::as_str), Some("r"));
     }
 
     #[test]
-    fn run_complete_effect_carries_status_string() {
+    fn run_complete_effect_renders_tool_result_with_status_in_result() {
+        // Canonical close: `tool.result { id=run_id, result: { status, results } }`.
         let body = effect_to_body(Effect::RunComplete {
             run_id: "run-1".into(),
             status: RunStatus::PartialFailure,
@@ -553,12 +634,15 @@ mod tests {
         });
         assert_eq!(
             body.get("kind").and_then(Value::as_str),
-            Some("graph.run_complete")
+            Some("tool.result")
         );
+        assert_eq!(body.get("id").and_then(Value::as_str), Some("run-1"));
+        let result = body.get("result").and_then(Value::as_object).expect("result");
         assert_eq!(
-            body.get("status").and_then(Value::as_str),
+            result.get("status").and_then(Value::as_str),
             Some("partial_failure")
         );
+        assert!(result.get("results").is_some());
     }
 
     #[tokio::test]
@@ -576,75 +660,162 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_reasoner_adds_name_to_peer_set() {
+    async fn dispatch_event_ignores_tool_invoke_for_other_names() {
+        // tool.invoke envelopes targeting other tools must be a no-op.
+        // Routing-by-name replaces the per-plugin envelope kinds.
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers: Arc<Mutex<PeerSet>> = Arc::new(Mutex::new(HashSet::new()));
         let (out_tx, _out_rx) = mpsc::channel::<PluginOutgoing>(8);
 
         let mut body = Map::new();
-        body.insert(
-            "kind".into(),
-            Value::String("reasoner-graph.register_reasoner".into()),
-        );
-        body.insert("name".into(), Value::String("provider-wrapper".into()));
+        body.insert("kind".into(), Value::String("tool.invoke".into()));
+        body.insert("id".into(), Value::String("call-1".into()));
+        body.insert("name".into(), Value::String("read_file".into()));
+        body.insert("args".into(), Value::Object(Map::new()));
 
-        dispatch_event(&runs, &peers, &out_tx, "engine", &body)
+        dispatch_event(&runs, &peers, &out_tx, "agentic-loop", &body)
             .await
             .expect("dispatch ok");
 
-        let snap = peers.lock().unwrap().clone();
-        assert!(
-            snap.contains("provider-wrapper"),
-            "register_reasoner should add 'provider-wrapper' to the peer set"
-        );
+        // No run should have been registered.
+        assert!(runs.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn register_reasoner_is_idempotent() {
+    async fn dispatch_event_routes_spawn_graph_invocation() {
+        // tool.invoke { name="spawn_graph" } should be parsed and the
+        // run accepted (single-source-node graph dispatches immediately).
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers: Arc<Mutex<PeerSet>> = Arc::new(Mutex::new(HashSet::new()));
-        let (out_tx, _out_rx) = mpsc::channel::<PluginOutgoing>(8);
+        // Pre-seed the reasoner as a peer so try_dispatch doesn't
+        // synthesize a "not connected" failure.
+        peers.lock().unwrap().insert("r".into());
+        let (out_tx, mut out_rx) = mpsc::channel::<PluginOutgoing>(16);
 
-        let mut body = Map::new();
-        body.insert(
-            "kind".into(),
-            Value::String("reasoner-graph.register_reasoner".into()),
+        let mut args = Map::new();
+        args.insert(
+            "graph".into(),
+            json!({
+                "nodes": [{"id": "n1", "reasoner": "r", "args": {}}],
+                "edges": []
+            }),
         );
-        body.insert("name".into(), Value::String("terminal".into()));
+        let mut body = Map::new();
+        body.insert("kind".into(), Value::String("tool.invoke".into()));
+        body.insert("id".into(), Value::String("run-1".into()));
+        body.insert("name".into(), Value::String("spawn_graph".into()));
+        body.insert("args".into(), Value::Object(args));
 
-        // Re-emit twice; HashSet should still contain only one entry for
-        // the name.
+        dispatch_event(&runs, &peers, &out_tx, "agentic-loop", &body)
+            .await
+            .expect("dispatch ok");
+
+        // Run is registered and the source node is in flight.
+        assert!(runs.lock().unwrap().contains_key("run-1"));
+
+        // Drain the writer channel and assert the canonical envelope
+        // shapes we expect: graph.run_started, tool.invoke (the node
+        // dispatch), graph.node.fired (the observer pair).
+        let mut kinds: Vec<String> = Vec::new();
         for _ in 0..3 {
-            dispatch_event(&runs, &peers, &out_tx, "engine", &body)
-                .await
-                .expect("dispatch ok");
+            let msg = out_rx.recv().await.expect("envelope");
+            if let Body::Event(map) = &msg.body {
+                if let Some(k) = map.get("kind").and_then(Value::as_str) {
+                    kinds.push(k.to_owned());
+                }
+            }
         }
+        assert!(kinds.iter().any(|k| k == "graph.run_started"));
+        assert!(kinds.iter().any(|k| k == "tool.invoke"));
+        assert!(kinds.iter().any(|k| k == "graph.node.fired"));
+    }
 
-        let snap = peers.lock().unwrap().clone();
-        assert_eq!(
-            snap.iter().filter(|n| *n == "terminal").count(),
-            1,
-            "register_reasoner must be idempotent on repeated emit"
+    #[tokio::test]
+    async fn dispatch_event_resolves_tool_result_into_node_result() {
+        // tool.result { id, result } for an in-flight firing must
+        // close the node and emit the run-completing tool.result.
+        let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
+        let peers: Arc<Mutex<PeerSet>> = Arc::new(Mutex::new(HashSet::new()));
+        peers.lock().unwrap().insert("r".into());
+        let (out_tx, mut out_rx) = mpsc::channel::<PluginOutgoing>(16);
+
+        // Submit a single-node spawn_graph.
+        let mut args = Map::new();
+        args.insert(
+            "graph".into(),
+            json!({
+                "nodes": [{"id": "n1", "reasoner": "r", "args": {}}],
+                "edges": []
+            }),
+        );
+        let mut submit = Map::new();
+        submit.insert("kind".into(), Value::String("tool.invoke".into()));
+        submit.insert("id".into(), Value::String("run-tr".into()));
+        submit.insert("name".into(), Value::String("spawn_graph".into()));
+        submit.insert("args".into(), Value::Object(args));
+        dispatch_event(&runs, &peers, &out_tx, "agentic-loop", &submit)
+            .await
+            .expect("dispatch ok");
+
+        // Pull the firing_id off the dispatched tool.invoke envelope.
+        let mut firing_id: Option<String> = None;
+        for _ in 0..3 {
+            let msg = out_rx.recv().await.expect("envelope");
+            if let Body::Event(map) = &msg.body {
+                if map.get("kind").and_then(Value::as_str) == Some("tool.invoke") {
+                    firing_id = map
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                    break;
+                }
+            }
+        }
+        let firing_id = firing_id.expect("dispatched tool.invoke carries id");
+
+        // Reply with a tool.result on that id.
+        let mut result_body = Map::new();
+        result_body.insert("kind".into(), Value::String("tool.result".into()));
+        result_body.insert("id".into(), Value::String(firing_id));
+        result_body.insert("result".into(), json!({"text": "hello"}));
+        dispatch_event(&runs, &peers, &out_tx, "r", &result_body)
+            .await
+            .expect("dispatch ok");
+
+        // Run should have completed and been removed from the registry.
+        assert!(runs.lock().unwrap().is_empty());
+
+        // Final outbound envelope should be tool.result for the run_id.
+        let mut found_run_complete = false;
+        while let Ok(msg) = out_rx.try_recv() {
+            if let Body::Event(map) = &msg.body {
+                if map.get("kind").and_then(Value::as_str) == Some("tool.result")
+                    && map.get("id").and_then(Value::as_str) == Some("run-tr")
+                {
+                    found_run_complete = true;
+                }
+            }
+        }
+        assert!(
+            found_run_complete,
+            "expected tool.result {{ id=run-tr }} closing the spawn_graph invocation"
         );
     }
 
     #[tokio::test]
-    async fn register_reasoner_without_name_is_ignored() {
+    async fn dispatch_event_drops_tool_result_for_unknown_id() {
+        // tool.result for an id we don't track is a silent drop —
+        // covers cancellation race + envelopes addressed to other tools.
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers: Arc<Mutex<PeerSet>> = Arc::new(Mutex::new(HashSet::new()));
         let (out_tx, _out_rx) = mpsc::channel::<PluginOutgoing>(8);
 
-        // Missing `name` field — should warn and drop, not panic.
         let mut body = Map::new();
-        body.insert(
-            "kind".into(),
-            Value::String("reasoner-graph.register_reasoner".into()),
-        );
-
-        dispatch_event(&runs, &peers, &out_tx, "engine", &body)
+        body.insert("kind".into(), Value::String("tool.result".into()));
+        body.insert("id".into(), Value::String("ghost".into()));
+        body.insert("result".into(), json!({}));
+        dispatch_event(&runs, &peers, &out_tx, "r", &body)
             .await
             .expect("dispatch ok");
-
-        assert!(peers.lock().unwrap().is_empty());
     }
 }
