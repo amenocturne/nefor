@@ -104,25 +104,33 @@ end
 -- against `nefor-combinators` at startup, and the scheduler queries
 -- combinators at submit time. The safe order:
 --
---   1. nefor-combinators       (registry)
---   2. generic-provider        (canonical type tags)
---   3. generic-tool            (canonical type tags)
---   4. openai-provider(s)      (declare Into against canonical types)
---   5. reasoner-graph          (queries combinators on submit)
---   6. tool-gate               (aggregates tool advertisements)
---   7. basic-tools             (advertises tools to the gate)
---   8. nefor-tui                (UI; can come up any time — chat is a Lua composition inside it)
+--   1. provider/tool contract declare()  (subscribe BEFORE combinators
+--      spawns so we don't miss its `combinators.ready` event — Lua-
+--      origin envelopes aren't replayed on attach, see
+--      lib/contracts/provider.lua)
+--   2. nefor-combinators       (registry)
+--   3. openai-provider(s)      (declare Into against canonical types)
+--   4. reasoner-graph          (queries combinators on submit)
+--   5. tool-gate               (aggregates tool advertisements)
+--   6. basic-tools             (advertises tools; declares tool contract)
+--   7. nefor-tui                (UI; can come up any time — chat is a Lua composition inside it)
+--
+-- Phase 2 of the agentic_workflow refactor moved the canonical type
+-- declarations (generic-provider/generic-tool) from passive Rust
+-- binaries into Lua contract libs (`lib/contracts/{provider,tool}.lua`).
+-- The libs emit the same `combinators.register` envelopes the binaries
+-- did, but namespaced via `envelope.emit_as("generic-provider", …)` so
+-- combinators stores the types under the canonical hub identity. The
+-- Rust binaries still build but are no longer spawned from this config.
 --
 -- ncp.lua's replay-on-attach means a late-attaching plugin still sees
--- prior events, so this ordering is a robustness measure rather than a
--- hard correctness requirement. It's still worth respecting because
--- the combinators registry is queried synchronously during submit —
--- if reasoner-graph submitted a graph before combinators readied, the
--- query would block on a peer that doesn't exist yet.
+-- prior plugin-origin events, so the combinators-spawn-then-Into-
+-- declarations chain works without strict ordering.
+
+require("lib.contracts.provider").declare()
+require("lib.contracts.tool").declare()
 
 actor.spawn(require("nefor-combinators"))
-actor.spawn(require("generic-provider"))
-actor.spawn(require("generic-tool"))
 
 -------------------------------------------------------------------------
 -- 4b. Provider — selected by config.lua (prod = openai-provider, test = mock).

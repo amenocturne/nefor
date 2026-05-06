@@ -117,9 +117,15 @@ agentic_workflow.setup {
 -- Plugin spawn order (mirrors starter/init.lua minus chat/tui).
 -- ------------------------------------------------------------------
 
+-- Canonical type-tag declarations: subscribe to combinators.ready
+-- BEFORE spawning combinators so the registration envelopes fire as
+-- soon as the registry is up. Replaces the (now-deleted) generic-
+-- provider / generic-tool Rust spawn dance — see
+-- lib/contracts/provider.lua and starter/init.lua's spawn-order block.
+require("lib.contracts.provider").declare()
+require("lib.contracts.tool").declare()
+
 actor.spawn(require("nefor-combinators"))
-actor.spawn(require("generic-provider"))
-actor.spawn(require("generic-tool"))
 
 ncp.spawn {
   name        = PROVIDER_NAME,

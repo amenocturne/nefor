@@ -3,6 +3,9 @@
 -- Pure helpers extracted from agentic_workflow.lua during the Phase 1
 -- refactor. No module-level mutable state.
 
+local provider_contract = require("lib.contracts.provider")
+local tool_contract     = require("lib.contracts.tool")
+
 local M = {}
 
 -- Virtual source name we register `spawn_graph` under. There is no
@@ -69,11 +72,10 @@ function M.build_orchestrator_graph(opts)
         reasoner = "provider-wrapper",
         args     = wrap_args,
         fanout   = {
-          -- Phase 2 will replace these once contracts are libs.
-          ["in"] = "generic-provider.ProviderOut",
+          ["in"] = provider_contract.PROVIDER_OUT,
           out    = {
-            "generic-tool.ToolCalls",
-            "generic-provider.FinalAnswer",
+            tool_contract.TOOL_CALLS,
+            provider_contract.FINAL_ANSWER,
           },
         },
       },
@@ -82,9 +84,8 @@ function M.build_orchestrator_graph(opts)
       { id = "terminal", reasoner = "terminal",      args = {} },
     },
     edges = {
-      -- Phase 2 will replace these type names once contracts are libs.
-      { from = "wrap",  to = "tools",    type = "generic-tool.ToolCalls" },
-      { from = "wrap",  to = "terminal", type = "generic-provider.FinalAnswer" },
+      { from = "wrap",  to = "tools",    type = tool_contract.TOOL_CALLS },
+      { from = "wrap",  to = "terminal", type = provider_contract.FINAL_ANSWER },
       { from = "tools", to = "adapt" },
       { from = "adapt", to = "wrap" },
     },

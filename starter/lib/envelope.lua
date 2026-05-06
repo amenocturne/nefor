@@ -63,9 +63,18 @@ end
 -- failed, log loudly, and request engine exit so the run terminates
 -- cleanly instead of hanging.
 function M.emit(target, body)
+  return M.emit_as("engine", target, body)
+end
+
+-- Emit with a custom `from` identity. Used by contract libs that emit
+-- on behalf of a canonical-type plugin (e.g. `generic-provider`,
+-- `generic-tool`) — combinators reads `envelope.from` to namespace
+-- declared types, so Lua-resident type registrations have to set the
+-- field to the canonical-plugin name, not the engine.
+function M.emit_as(from, target, body)
   local ok, payload = pcall(json.encode, {
     type = "event",
-    from = "engine",
+    from = from,
     ts   = nefor.engine.now(),
     body = body,
   })

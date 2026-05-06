@@ -9,8 +9,21 @@
 -- output speaks the canonical tool contract that tool-gate consumes
 -- directly. The Rust binary participates on the bus through the
 -- broker's stdin/stdout pipes.
+--
+-- ## Phase 2: tool-contract declaration
+--
+-- basic-tools is a tool consumer (advertises tools to the gate, emits
+-- tool results). It depends on the canonical `generic-tool.ToolCalls`/
+-- `generic-tool.ToolResults` type tags being declared against
+-- nefor-combinators. We declare them from Lua via the tool contract
+-- lib instead of relying on the (now-deleted) generic-tool Rust
+-- binary's startup envelope. `declare()` is idempotent and timing-safe
+-- (subscribes to combinators.ready, fires once).
 
-local config = require("config")
+local config        = require("config")
+local tool_contract = require("lib.contracts.tool")
+
+tool_contract.declare()
 
 return {
   name        = "basic-tools",
