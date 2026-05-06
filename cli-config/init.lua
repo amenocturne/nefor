@@ -117,9 +117,9 @@ agentic_workflow.setup {
 -- Plugin spawn order (mirrors starter/init.lua minus chat/tui).
 -- ------------------------------------------------------------------
 
-ncp.spawn { name = "nefor-combinators", command = { bin("nefor-combinators") } }
-ncp.spawn { name = "generic-provider",  command = { bin("generic-provider")  } }
-ncp.spawn { name = "generic-tool",      command = { bin("generic-tool")      } }
+actor.spawn(require("nefor-combinators"))
+actor.spawn(require("generic-provider"))
+actor.spawn(require("generic-tool"))
 
 ncp.spawn {
   name        = PROVIDER_NAME,

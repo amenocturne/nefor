@@ -120,20 +120,9 @@ end
 -- if reasoner-graph submitted a graph before combinators readied, the
 -- query would block on a peer that doesn't exist yet.
 
-ncp.spawn {
-  name    = "nefor-combinators",
-  command = { bin("nefor-combinators") },
-}
-
-ncp.spawn {
-  name    = "generic-provider",
-  command = { bin("generic-provider") },
-}
-
-ncp.spawn {
-  name    = "generic-tool",
-  command = { bin("generic-tool") },
-}
+actor.spawn(require("nefor-combinators"))
+actor.spawn(require("generic-provider"))
+actor.spawn(require("generic-tool"))
 
 -------------------------------------------------------------------------
 -- 4b. Provider — selected by config.lua (prod = openai-provider, test = mock).
