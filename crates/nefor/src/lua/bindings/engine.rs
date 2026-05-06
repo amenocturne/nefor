@@ -1,15 +1,31 @@
-//! `nefor.engine.send` — emit a message from the dispatch hook.
+//! `nefor.engine.send` / `nefor.engine.deliver` — outbound paths from Lua.
 //!
 //! Dispatch (`init.lua`'s `function dispatch(current_log) ... end`) is
-//! the policy engine. When it decides to forward something it calls
-//! `nefor.engine.send(payload, target?)`. Broadcasts omit the target;
-//! targeted sends pass a plugin name.
+//! the policy engine. Two structurally different operations live here:
 //!
-//! This module is intentionally narrow: it validates argument shape, wraps
-//! the target in a [`SendTarget`] enum (no stringly-typed "target or empty"
-//! state), and delegates the actual routing to an [`EngineOps`] trait. The
-//! production implementation wires to the broker + event log; the test
-//! implementation records calls for assertion.
+//! * [`send`](EngineOps::send) — **emission**. The Lua caller is publishing
+//!   a new envelope onto the bus. The broker stamps it as `Origin::Step`,
+//!   appends a [`LogEntry`](crate::session::LogEntry), and writes the line
+//!   to the target peer (broadcast = every connected peer). One emission,
+//!   one log entry. Lua exposes this as `nefor.engine.send(payload, target?)`.
+//! * [`deliver`](EngineOps::deliver) — **delivery**. The Lua caller is
+//!   forwarding an emission that's already been logged (e.g. ncp.lua's
+//!   per-peer fan-out of a plugin's broadcast event). The broker writes
+//!   to the named peer's stdin without appending a new log entry.
+//!   Targeted only — broadcast belongs to `send`. Lua exposes this as
+//!   `nefor.engine.deliver(peer, payload)`.
+//!
+//! This split keeps the bus log canonical: a "1 emission → 1 entry"
+//! invariant. Without it the dispatch hook's per-peer fan-out for a
+//! single broadcast emission would synthesize N step entries — meaning
+//! late attachers couldn't replay step-origin entries (the filter would
+//! re-deliver every fan-out copy).
+//!
+//! This module validates argument shape, wraps the target in a
+//! [`SendTarget`] enum (no stringly-typed "target or empty" state), and
+//! delegates the actual routing to an [`EngineOps`] trait. The production
+//! implementation wires to the broker + event log; the test implementation
+//! records calls for assertion.
 
 use std::sync::Arc;
 
@@ -36,7 +52,11 @@ pub enum SendTarget {
 /// implementation. Kept `Send + Sync` because the Lua VM is shared across
 /// tasks via mlua's `send` feature.
 pub trait EngineOps: Send + Sync {
-    /// Enqueue `payload` for delivery to `target`.
+    /// Emit `payload` onto the bus and route to `target`.
+    ///
+    /// The implementation appends a `LogEntry` (origin = Step) so the
+    /// emission is part of the canonical log, then writes the line to
+    /// every (broadcast) or one (targeted) connected plugin's stdin.
     ///
     /// Infallible from the binding's perspective — the engine is responsible
     /// for surfacing any delivery failure asynchronously (e.g., through the
@@ -44,6 +64,27 @@ pub trait EngineOps: Send + Sync {
     /// function to reason about transport-level errors, which is not its
     /// job.
     fn send(&self, target: SendTarget, payload: String);
+
+    /// Forward `payload` to one peer's stdin **without** appending a log
+    /// entry.
+    ///
+    /// Used by the dispatch hook's per-peer fan-out: when ncp.lua receives
+    /// a broadcast emission from one plugin and routes copies to every
+    /// other connected peer, each copy is a delivery, not a new emission.
+    /// The original emission already produced its single canonical log
+    /// entry at ingress (Origin::Plugin). Logging the fan-out copies as
+    /// well would muddy the log — replaying step-origin entries to late
+    /// attachers would double-deliver every event.
+    ///
+    /// Returns `Err` if `target` is not currently connected. Unlike
+    /// `send`'s infallible signature, the caller of `deliver` is the
+    /// in-VM Lua code that just enumerated `nefor.engine.plugins()` —
+    /// it has full agency to decide what to do on a TOCTOU disconnect
+    /// (typically: log + drop). Default impl returns `Ok(())` so test
+    /// recorders that don't care about transport semantics stay terse.
+    fn deliver(&self, _target: PluginName, _payload: String) -> Result<(), String> {
+        Ok(())
+    }
 
     /// Snapshot the names of plugins currently connected to the engine.
     ///
@@ -103,6 +144,56 @@ pub fn install_engine(lua: &Lua, nefor_tbl: &Table, ops: Arc<dyn EngineOps>) -> 
         Ok(())
     })?;
     engine.set("send", send_fn)?;
+
+    // nefor.engine.deliver(peer, payload) — write `payload` to one peer's
+    // stdin without appending a log entry. Used by the dispatch hook's
+    // per-peer fan-out (the original emission already produced its
+    // canonical Plugin entry at ingress). Targeted only — there is no
+    // broadcast variant because a fan-out call site always names one
+    // peer at a time. See module-level docstring for the send vs deliver
+    // split.
+    let ops_for_deliver = Arc::clone(&ops);
+    let deliver_fn = lua.create_function(move |_, args: mlua::Variadic<Value>| {
+        let peer = match args.first() {
+            Some(Value::String(s)) => {
+                let raw = s.to_str()?.to_owned();
+                PluginName::new(raw)
+                    .map_err(|e| mlua::Error::runtime(format!("nefor.engine.deliver: {e}")))?
+            }
+            Some(other) => {
+                return Err(mlua::Error::runtime(format!(
+                    "nefor.engine.deliver: peer must be a string (got {})",
+                    other.type_name(),
+                )));
+            }
+            None => {
+                return Err(mlua::Error::runtime(
+                    "nefor.engine.deliver: peer required (first argument must be a string)",
+                ));
+            }
+        };
+        let payload = match args.get(1) {
+            Some(Value::String(s)) => s.to_str()?.to_owned(),
+            Some(other) => {
+                return Err(mlua::Error::runtime(format!(
+                    "nefor.engine.deliver: payload must be a string (got {})",
+                    other.type_name(),
+                )));
+            }
+            None => {
+                return Err(mlua::Error::runtime(
+                    "nefor.engine.deliver: payload required (second argument must be a string)",
+                ));
+            }
+        };
+        if let Err(e) = ops_for_deliver.deliver(peer, payload) {
+            return Err(mlua::Error::runtime(format!(
+                "nefor.engine.deliver: {e}"
+            )));
+        }
+        Ok(())
+    })?;
+    engine.set("deliver", deliver_fn)?;
 
     // nefor.engine.now() returns an ISO-8601 timestamp with millisecond
     // precision — the wire format spec §3 requires for the `ts` field.
@@ -170,16 +261,22 @@ mod tests {
 
     struct RecordOps {
         calls: Mutex<Vec<(SendTarget, String)>>,
+        deliveries: Mutex<Vec<(PluginName, String)>>,
         plugins: Mutex<Vec<PluginName>>,
         exit_code: Mutex<Option<i32>>,
+        // When set, deliver() returns Err with this message — lets tests
+        // exercise the error surface without needing a real broker.
+        deliver_err: Mutex<Option<String>>,
     }
 
     impl RecordOps {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 calls: Mutex::new(Vec::new()),
+                deliveries: Mutex::new(Vec::new()),
                 plugins: Mutex::new(Vec::new()),
                 exit_code: Mutex::new(None),
+                deliver_err: Mutex::new(None),
             })
         }
 
@@ -187,8 +284,16 @@ mod tests {
             self.calls.lock().unwrap().clone()
         }
 
+        fn delivered(&self) -> Vec<(PluginName, String)> {
+            self.deliveries.lock().unwrap().clone()
+        }
+
         fn set_plugins(&self, names: Vec<PluginName>) {
             *self.plugins.lock().unwrap() = names;
+        }
+
+        fn set_deliver_err(&self, msg: &str) {
+            *self.deliver_err.lock().unwrap() = Some(msg.to_owned());
         }
 
         fn exit_code(&self) -> Option<i32> {
@@ -199,6 +304,13 @@ mod tests {
     impl EngineOps for RecordOps {
         fn send(&self, target: SendTarget, payload: String) {
             self.calls.lock().unwrap().push((target, payload));
+        }
+        fn deliver(&self, target: PluginName, payload: String) -> Result<(), String> {
+            if let Some(e) = self.deliver_err.lock().unwrap().clone() {
+                return Err(e);
+            }
+            self.deliveries.lock().unwrap().push((target, payload));
+            Ok(())
         }
         fn plugins(&self) -> Vec<PluginName> {
             self.plugins.lock().unwrap().clone()
@@ -340,6 +452,110 @@ mod tests {
             .expect_err("reserved name must be rejected");
         assert!(err.to_string().contains("nefor.engine.send"), "got: {err}");
         assert!(ops.snapshot().is_empty());
+    }
+
+    #[test]
+    fn engine_deliver_records_call_to_target() {
+        let (lua, ops) = setup();
+        lua.load(r#"nefor.engine.deliver("mock-plugin", "hello")"#)
+            .exec()
+            .unwrap();
+        let delivered = ops.delivered();
+        assert_eq!(delivered.len(), 1);
+        let expected = PluginName::new("mock-plugin").unwrap();
+        assert_eq!(delivered[0].0, expected);
+        assert_eq!(delivered[0].1, "hello");
+        // Critically, deliver must NOT trigger send (which logs as Step).
+        assert!(
+            ops.snapshot().is_empty(),
+            "deliver must not invoke EngineOps::send (no LogEntry)"
+        );
+    }
+
+    #[test]
+    fn engine_deliver_rejects_missing_peer() {
+        let (lua, ops) = setup();
+        let err = lua
+            .load(r#"nefor.engine.deliver()"#)
+            .exec()
+            .expect_err("missing peer must be rejected");
+        assert!(err.to_string().contains("peer required"), "got: {err}");
+        assert!(ops.delivered().is_empty());
+    }
+
+    #[test]
+    fn engine_deliver_rejects_missing_payload() {
+        let (lua, ops) = setup();
+        let err = lua
+            .load(r#"nefor.engine.deliver("p")"#)
+            .exec()
+            .expect_err("missing payload must be rejected");
+        assert!(err.to_string().contains("payload required"), "got: {err}");
+        assert!(ops.delivered().is_empty());
+    }
+
+    #[test]
+    fn engine_deliver_rejects_non_string_peer() {
+        let (lua, ops) = setup();
+        let err = lua
+            .load(r#"nefor.engine.deliver(42, "x")"#)
+            .exec()
+            .expect_err("integer peer must be rejected");
+        assert!(err.to_string().contains("peer must be a string"), "got: {err}");
+        assert!(ops.delivered().is_empty());
+    }
+
+    #[test]
+    fn engine_deliver_rejects_non_string_payload() {
+        let (lua, ops) = setup();
+        let err = lua
+            .load(r#"nefor.engine.deliver("p", {})"#)
+            .exec()
+            .expect_err("table payload must be rejected");
+        assert!(err.to_string().contains("payload must be a string"), "got: {err}");
+        assert!(ops.delivered().is_empty());
+    }
+
+    #[test]
+    fn engine_deliver_rejects_reserved_target_name() {
+        let (lua, ops) = setup();
+        let err = lua
+            .load(r#"nefor.engine.deliver("engine", "x")"#)
+            .exec()
+            .expect_err("reserved name must be rejected");
+        assert!(err.to_string().contains("nefor.engine.deliver"), "got: {err}");
+        assert!(ops.delivered().is_empty());
+    }
+
+    #[test]
+    fn engine_deliver_surfaces_unknown_peer_error() {
+        let (lua, ops) = setup();
+        ops.set_deliver_err("target plugin 'nope' is not connected");
+        let err = lua
+            .load(r#"nefor.engine.deliver("nope", "x")"#)
+            .exec()
+            .expect_err("unknown peer must surface as Lua error");
+        assert!(err.to_string().contains("not connected"), "got: {err}");
+    }
+
+    #[test]
+    fn engine_send_and_deliver_are_independent_paths() {
+        // A `send` records a call (logs Step entry); a `deliver` records
+        // a delivery (no log entry). Same VM, both surfaces, no
+        // cross-contamination.
+        let (lua, ops) = setup();
+        lua.load(
+            r#"
+            nefor.engine.send("emitted", "a")
+            nefor.engine.deliver("b", "delivered")
+            "#,
+        )
+        .exec()
+        .unwrap();
+        assert_eq!(ops.snapshot().len(), 1, "one send recorded");
+        assert_eq!(ops.delivered().len(), 1, "one delivery recorded");
+        assert_eq!(ops.snapshot()[0].1, "emitted");
+        assert_eq!(ops.delivered()[0].1, "delivered");
     }
 
     #[test]
