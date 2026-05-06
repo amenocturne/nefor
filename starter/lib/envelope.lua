@@ -105,13 +105,18 @@ function M.emit_as(from, target, body)
     end
     return
   end
-  if target ~= nil then
-    nefor.engine.send(payload, target)
-  else
-    for _, peer in ipairs(nefor.engine.plugins()) do
-      nefor.engine.send(payload, peer)
-    end
-  end
+  -- target ~= nil → engine sends to one peer (one log entry).
+  -- target == nil → engine broadcasts to every ready peer (still ONE
+  -- log entry, with target=None on the broker side). The previous
+  -- per-peer loop was a Phase-1 fallback dating from before the
+  -- engine binding accepted nil as a broadcast target; that loop
+  -- generated N log entries per broadcast, which the actor.lua bus
+  -- subscriber then dispatched N times — causing duplicate handling
+  -- of every emit_broadcast envelope (e.g. graph.node_result fired
+  -- once per peer through the resident reasoners' receive_msg).
+  -- Ship one entry; let the broker's targeted/broadcast distinction
+  -- handle peer fan-out without polluting the in-VM dispatch path.
+  nefor.engine.send(payload, target)
 end
 
 function M.emit_to(target, body) M.emit(target, body) end

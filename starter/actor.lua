@@ -93,6 +93,16 @@ local M = {
 --     broker's stdin/stdout pipes; the wrapper actor's receive_msg
 --     can additionally translate or react to that traffic. A wrapper
 --     with a no-op receive_msg is just "spawn this binary."
+--
+--     Optionally `from_plugin` and `to_plugin` envelope transforms
+--     translate between the plugin's native wire shape and the
+--     canonical bus shape. These are the same hooks `ncp.spawn`
+--     accepts (and use the same machinery): when a wrapper supplies
+--     them, `actor.spawn` routes the spawn through `ncp.spawn` so
+--     the protocol layer registers the transforms and applies them
+--     at ingress / per-target egress. Without transforms we use
+--     `nefor.plugins.spawn` directly to skip the ncp transform-table
+--     bookkeeping.
 function M.spawn(spec)
   if type(spec) ~= "table" then
     error("actor.spawn: spec must be a table", 2)
@@ -103,11 +113,31 @@ function M.spawn(spec)
   if type(spec.receive_msg) ~= "function" then
     error("actor.spawn: spec.receive_msg must be a function", 2)
   end
+  if spec.from_plugin ~= nil and type(spec.from_plugin) ~= "function" then
+    error("actor.spawn: spec.from_plugin must be a function or nil", 2)
+  end
+  if spec.to_plugin ~= nil and type(spec.to_plugin) ~= "function" then
+    error("actor.spawn: spec.to_plugin must be a function or nil", 2)
+  end
 
   M.actors[#M.actors + 1] = spec
 
   if spec.command then
-    nefor.plugins.spawn { name = spec.name, command = spec.command }
+    if spec.from_plugin or spec.to_plugin then
+      -- Route through ncp.spawn so plugin_transforms picks up the
+      -- ingress/egress hooks. Loaded lazily to avoid a require cycle
+      -- when actor.lua is loaded standalone (e.g. tests that don't
+      -- exercise transforms).
+      local ncp = require("ncp")
+      ncp.spawn {
+        name        = spec.name,
+        command     = spec.command,
+        from_plugin = spec.from_plugin,
+        to_plugin   = spec.to_plugin,
+      }
+    else
+      nefor.plugins.spawn { name = spec.name, command = spec.command }
+    end
   end
 end
 
