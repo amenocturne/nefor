@@ -520,20 +520,32 @@ local function test_kind_prefix_self_announces_to_all_peers()
 end
 
 -- ------------------------------------------------------------------
--- agentic_workflow.for_provider: static_token injects auth.set on ready
+-- openai-provider wrapper: static_token injects auth.set on ready
 -- ------------------------------------------------------------------
 --
--- Behaviour preserved from the prior openai_provider_adapter.make. The
--- factory now composes inner (rg-style chat-completion correlation +
--- stream gating) AND outer (chat-contract rename + static-token
--- injection) into one transform pair; the static-token tests still
--- exercise the outer-adapter behaviour through that composed pair.
-local rga = require("agentic_workflow")
+-- Post-Phase-3a the per-provider translation lives in the
+-- `openai-provider` actor folder rather than agentic_workflow's
+-- `for_provider()` factory. The behaviour is preserved verbatim — we
+-- exercise it through the new wrapper's `from_plugin` directly.
+
+local agentic_loop_mod = require("agentic-loop")
+local openai_provider  = require("openai-provider")
+
+local function build_provider_chain(name, opts)
+  -- spawn_spec returns an actor table with from_plugin / to_plugin
+  -- already wired. Tests just need the transform pair.
+  local spec = openai_provider.spawn_spec(name, { "/bin/true" }, opts)
+  return { from_plugin = spec.from_plugin, to_plugin = spec.to_plugin }
+end
+
+local function reset_loop()
+  agentic_loop_mod._internals.reset()
+end
 
 local function test_openai_adapter_static_token_injects_auth_set_on_ready()
   reset()
-  rga._reset()
-  local ad = rga.for_provider("ollama", { static_token = "local" })
+  reset_loop()
+  local ad = build_provider_chain("ollama", { static_token = "local" })
   -- Pre-ready and unrelated events shouldn't trigger an injection.
   ad.from_plugin({
     type = "event", from = "ollama",
@@ -564,8 +576,8 @@ end
 
 local function test_openai_adapter_no_static_token_skips_injection()
   reset()
-  rga._reset()
-  local ad = rga.for_provider("ollama")  -- no opts → no static_token
+  reset_loop()
+  local ad = build_provider_chain("ollama")  -- no opts → no static_token
   ad.from_plugin({
     type = "event", from = "ollama",
     body = { kind = "ollama.ready" },
@@ -574,25 +586,23 @@ local function test_openai_adapter_no_static_token_skips_injection()
 end
 
 -- ------------------------------------------------------------------
--- agentic_workflow reasoner-graph wiring: bridges reasoner-graph ↔
+-- reasoners actor + openai-provider wrapper: bridges reasoner-graph ↔
 -- openai-provider / tool-gate via per-firing pending state.
 -- ------------------------------------------------------------------
 --
--- The transforms intercept three streams:
---   * `<type>.run_node` from reasoner-graph  → drives the worker plugin,
---     emits `<type>.run_node.ack` and a future `graph.node_result`.
---   * `<provider>.chat.complete.result`      → resolves a pending firing
---     for a `dummy` / `provider-wrapper` node, emits `graph.node_result`.
---   * `tool.result`                          → resolves a pending firing
---     for a `tool-executor` node.
+-- The reasoners actor consumes `<type>.run_node` and runs the
+-- handler; provider firings spawn `<provider>.chat.create / append /
+-- complete` and the openai-provider wrapper's from_plugin correlates
+-- the eventual `<provider>.chat.complete.result` back to a
+-- graph.node_result. State (chat_id maps, pending entries) lives on
+-- the agentic-loop actor and is exposed to wrappers via helpers.
 --
--- The Rust harness installs `nefor.engine.send` as the recording mock,
+-- The Rust harness installs `nefor.engine.send` as the recording mock
 -- so envelopes emitted via `nefor.engine.send` land in `_test.calls()`
 -- exactly like ncp.lua's own broadcasts.
 
--- Helper: after `for_reasoner_graph().from_plugin(env)` runs, locate the
--- first recorded send whose body.kind is `target_kind`. Returns the
--- decoded envelope.
+local reasoners = require("reasoners")
+
 local function find_call_with_kind(target_kind)
   for _, c in ipairs(_test.calls()) do
     local d = json.decode(c.payload)
@@ -603,7 +613,6 @@ local function find_call_with_kind(target_kind)
   return nil
 end
 
--- Helper: filter all recorded calls into a list of decoded {body, target}.
 local function decode_all_calls()
   local out = {}
   for _, c in ipairs(_test.calls()) do
@@ -612,29 +621,43 @@ local function decode_all_calls()
   return out
 end
 
--- Reset both the adapter's pending state and the recorded send log.
+-- Drive a `<token>.run_node` envelope through the reasoners actor's
+-- receive_msg. Mirrors the wire shape the actor.lua runtime hands it:
+-- { ts, origin, payload } where payload is JSON-encoded { type, body }.
+local function dispatch_run_node(body)
+  local entry = {
+    ts      = "2026-04-23T00:00:00.000Z",
+    origin  = "reasoner-graph",
+    payload = json.encode({ type = "event", from = "reasoner-graph", body = body }),
+  }
+  reasoners.receive_msg(entry)
+end
+
 local function reset_rga()
   reset()
-  rga._reset()
+  reset_loop()
+  reasoners._internals.reset()
+end
+
+-- Pending-count introspection (used to be agentic_workflow._pending_count).
+local function pending_count()
+  local n = 0
+  for _ in pairs(agentic_loop_mod._internals.state.pending) do n = n + 1 end
+  return n
 end
 
 local function test_rga_dummy_run_node_emits_ack_immediately()
   -- The scheduler's ack_deadline applies to <type>.run_node.ack. The
-  -- adapter must emit the ack synchronously inside from_plugin (before
+  -- handler must emit the ack synchronously inside receive_msg (before
   -- returning) so the watchdog stops well before any provider I/O.
   reset_rga()
   _test.set_plugins({ "ollama", "nefor-tui" })
-  local hook = rga.for_reasoner_graph()
-  local out = hook.from_plugin({
-    type = "event", from = "reasoner-graph",
-    body = {
-      kind = "dummy.run_node",
-      run_id = "r1", node_id = "n1", firing_id = "f1",
-      args = { provider = "ollama", prompt = "hi" },
-      inputs = {},
-    },
+  dispatch_run_node({
+    kind = "dummy.run_node",
+    run_id = "r1", node_id = "n1", firing_id = "f1",
+    args = { provider = "ollama", prompt = "hi" },
+    inputs = {},
   })
-  assert_eq(out, nil, "run_node envelope is dropped after handling")
 
   local ack = find_call_with_kind("dummy.run_node.ack")
   assert_true(ack ~= nil, "ack envelope was emitted")
@@ -648,14 +671,10 @@ local function test_rga_unknown_type_acks_then_errors_node_result()
   -- error rather than leaving the firing dangling.
   reset_rga()
   _test.set_plugins({ "x" })
-  local hook = rga.for_reasoner_graph()
-  hook.from_plugin({
-    type = "event", from = "reasoner-graph",
-    body = {
-      kind = "no-such-type.run_node",
-      run_id = "r9", node_id = "nx", firing_id = "fx",
-      args = {}, inputs = {},
-    },
+  dispatch_run_node({
+    kind = "no-such-type.run_node",
+    run_id = "r9", node_id = "nx", firing_id = "fx",
+    args = {}, inputs = {},
   })
 
   local ack = find_call_with_kind("no-such-type.run_node.ack")
@@ -676,15 +695,11 @@ local function test_rga_dispatch_drives_provider_chat_create_and_complete()
   -- the openai-provider for `dummy`.
   reset_rga()
   _test.set_plugins({ "ollama" })
-  local hook = rga.for_reasoner_graph()
-  hook.from_plugin({
-    type = "event", from = "reasoner-graph",
-    body = {
-      kind = "dummy.run_node",
-      run_id = "r2", node_id = "wrap", firing_id = "f2",
-      args = { provider = "ollama", prompt = "hello", model = "qwen2.5-coder:7b" },
-      inputs = {},
-    },
+  dispatch_run_node({
+    kind = "dummy.run_node",
+    run_id = "r2", node_id = "wrap", firing_id = "f2",
+    args = { provider = "ollama", prompt = "hello", model = "qwen2.5-coder:7b" },
+    inputs = {},
   })
 
   local create = find_call_with_kind("ollama.chat.create")
@@ -705,21 +720,15 @@ end
 
 local function test_rga_prev_state_chat_id_skips_create()
   -- provider-wrapper second firing: prev_state carries a chat_id, so the
-  -- adapter must NOT mint chat.create — it reuses the prior chat. This
-  -- is the loop mechanism described in the parent spec §3 ("Reasoner
-  -- state across firings").
+  -- adapter must NOT mint chat.create — it reuses the prior chat.
   reset_rga()
   _test.set_plugins({ "ollama" })
-  local hook = rga.for_reasoner_graph()
-  hook.from_plugin({
-    type = "event", from = "reasoner-graph",
-    body = {
-      kind = "provider-wrapper.run_node",
-      run_id = "r3", node_id = "wrap", firing_id = "f-second",
-      args = { provider = "ollama" },
-      inputs = { up = { output = { messages = { { role = "user", content = "again" } } } } },
-      prev_state = { chat_id = "chat-existing" },
-    },
+  dispatch_run_node({
+    kind = "provider-wrapper.run_node",
+    run_id = "r3", node_id = "wrap", firing_id = "f-second",
+    args = { provider = "ollama" },
+    inputs = { up = { output = { messages = { { role = "user", content = "again" } } } } },
+    prev_state = { chat_id = "chat-existing" },
   })
 
   -- chat.create must not appear.
@@ -737,30 +746,23 @@ local function test_rga_prev_state_chat_id_skips_create()
 end
 
 local function test_rga_provider_result_emits_node_result_with_next_state()
-  -- When openai-provider replies with chat.complete.result, the adapter
-  -- must translate it into graph.node_result carrying next_state with
-  -- the chat_id so the scheduler stores it on the node for the next
-  -- firing.
+  -- When openai-provider replies with chat.complete.result, the wrapper
+  -- must translate it into graph.node_result carrying next_state.chat_id
+  -- so the scheduler stores it on the node for the next firing.
   reset_rga()
   _test.set_plugins({ "ollama" })
-  -- 1) Dispatch a firing so the adapter learns the chat_id.
-  rga.for_reasoner_graph().from_plugin({
-    type = "event", from = "reasoner-graph",
-    body = {
-      kind = "dummy.run_node",
-      run_id = "rR", node_id = "nR", firing_id = "fR",
-      args = { provider = "ollama", prompt = "p" },
-      inputs = {},
-    },
+  dispatch_run_node({
+    kind = "dummy.run_node",
+    run_id = "rR", node_id = "nR", firing_id = "fR",
+    args = { provider = "ollama", prompt = "p" },
+    inputs = {},
   })
-  -- Capture the chat_id from the create envelope.
   local create = find_call_with_kind("ollama.chat.create")
   assert_true(create ~= nil, "create envelope captured")
   local chat_id = create.body.chat_id
   _test.calls_clear()
 
-  -- 2) Provider replies. The provider-side hook must emit graph.node_result.
-  local prov_hook = rga.for_provider("ollama")
+  local prov_hook = build_provider_chain("ollama")
   local passed = prov_hook.from_plugin({
     type = "event", from = "ollama",
     body = {
@@ -785,10 +787,9 @@ end
 
 local function test_rga_provider_result_for_unknown_chat_passes_through()
   -- A chat.complete.result that doesn't belong to a pending firing must
-  -- pass through unchanged so any other consumer (the chat adapter) can
-  -- see it.
+  -- pass through unchanged so any other consumer can see it.
   reset_rga()
-  local prov_hook = rga.for_provider("ollama")
+  local prov_hook = build_provider_chain("ollama")
   local env = {
     type = "event", from = "ollama",
     body = {
@@ -798,49 +799,44 @@ local function test_rga_provider_result_for_unknown_chat_passes_through()
     },
   }
   local out = prov_hook.from_plugin(env)
-  assert_true(out == env, "non-pending chat.complete.result passes through")
+  -- The outer adapter passes ollama.chat.complete.result through
+  -- unchanged (the inner adapter only intercepts owned chats; outer
+  -- doesn't translate this kind). The envelope reference may be the
+  -- same table or a translated equivalent; verify by kind.
+  assert_true(out ~= nil, "non-pending chat.complete.result passes through")
+  assert_eq(out.body.kind, "ollama.chat.complete.result",
+    "kind unchanged on pass-through")
   assert_eq(#_test.calls(), 0, "no graph.node_result emitted")
 end
 
 local function test_rga_per_firing_keying_distinct_firings_resolve_independently()
-  -- The same node firing twice must get two distinct firing_ids; the
-  -- adapter must correlate each provider reply back to the right firing.
-  -- We dispatch firing A then firing B (different firing_ids, different
-  -- chats), then resolve B first and A second — both graph.node_results
-  -- must carry the correct firing_id.
+  -- Two firings for the same node must mint two chat_ids; the wrapper
+  -- correlates each provider reply back to the right firing.
   reset_rga()
   _test.set_plugins({ "ollama" })
-  local hook = rga.for_reasoner_graph()
 
-  hook.from_plugin({
-    type = "event", from = "reasoner-graph",
-    body = {
-      kind = "dummy.run_node",
-      run_id = "rP", node_id = "nP", firing_id = "fA",
-      args = { provider = "ollama", prompt = "a" },
-      inputs = {},
-    },
+  dispatch_run_node({
+    kind = "dummy.run_node",
+    run_id = "rP", node_id = "nP", firing_id = "fA",
+    args = { provider = "ollama", prompt = "a" },
+    inputs = {},
   })
   local create_a = find_call_with_kind("ollama.chat.create")
   local chat_a = create_a.body.chat_id
   _test.calls_clear()
 
-  hook.from_plugin({
-    type = "event", from = "reasoner-graph",
-    body = {
-      kind = "dummy.run_node",
-      run_id = "rP", node_id = "nP", firing_id = "fB",
-      args = { provider = "ollama", prompt = "b" },
-      inputs = {},
-    },
+  dispatch_run_node({
+    kind = "dummy.run_node",
+    run_id = "rP", node_id = "nP", firing_id = "fB",
+    args = { provider = "ollama", prompt = "b" },
+    inputs = {},
   })
   local create_b = find_call_with_kind("ollama.chat.create")
   local chat_b = create_b.body.chat_id
   assert_true(chat_a ~= chat_b, "two firings mint two distinct chat_ids")
   _test.calls_clear()
 
-  local prov = rga.for_provider("ollama")
-  -- Resolve B first.
+  local prov = build_provider_chain("ollama")
   prov.from_plugin({
     type = "event", from = "ollama",
     body = {
@@ -854,7 +850,6 @@ local function test_rga_per_firing_keying_distinct_firings_resolve_independently
   assert_eq(resB.body.firing_id, "fB", "result correlated to firing B")
   _test.calls_clear()
 
-  -- Resolve A second.
   prov.from_plugin({
     type = "event", from = "ollama",
     body = {
@@ -866,8 +861,7 @@ local function test_rga_per_firing_keying_distinct_firings_resolve_independently
   local resA = find_call_with_kind("graph.node_result")
   assert_true(resA ~= nil, "result for A fired")
   assert_eq(resA.body.firing_id, "fA", "result correlated to firing A")
-  -- And the adapter has cleared its pending map.
-  assert_eq(rga._pending_count(), 0,
+  assert_eq(pending_count(), 0,
     "all pending firings resolved → pending_count == 0")
 end
 
@@ -877,22 +871,18 @@ local function test_rga_register_type_dispatches_custom_handler()
   reset_rga()
   _test.set_plugins({ "x" })
   local seen = {}
-  rga.register_type("my-leaf", function(body)
+  reasoners._internals.handlers["my-leaf"] = function(body)
     seen.run_id    = body.run_id
     seen.firing_id = body.firing_id
     seen.prev_state = body.prev_state
-    return nil  -- async handler; ack will fire and we own the eventual result
-  end)
+    return nil
+  end
 
-  local hook = rga.for_reasoner_graph()
-  hook.from_plugin({
-    type = "event", from = "reasoner-graph",
-    body = {
-      kind = "my-leaf.run_node",
-      run_id = "rZ", node_id = "nZ", firing_id = "fZ",
-      args = {}, inputs = {},
-      prev_state = { hint = "preserved" },
-    },
+  dispatch_run_node({
+    kind = "my-leaf.run_node",
+    run_id = "rZ", node_id = "nZ", firing_id = "fZ",
+    args = {}, inputs = {},
+    prev_state = { hint = "preserved" },
   })
 
   assert_eq(seen.run_id, "rZ", "handler received run_id")
@@ -901,25 +891,24 @@ local function test_rga_register_type_dispatches_custom_handler()
     "handler received prev_state table")
   assert_eq(seen.prev_state.hint, "preserved",
     "prev_state fields passed through verbatim")
-  -- Ack still fires for the async handler.
   local ack = find_call_with_kind("my-leaf.run_node.ack")
   assert_true(ack ~= nil, "ack emitted for custom type")
+
+  -- Cleanup: remove the custom handler so it doesn't bleed into other
+  -- tests in the same suite.
+  reasoners._internals.handlers["my-leaf"] = nil
 end
 
 local function test_rga_terminal_handler_emits_ack_and_node_result_synchronously()
   -- The terminal handler is synchronous Lua: it must emit BOTH the ack
-  -- and the graph.node_result before from_plugin returns. This is the
+  -- and the graph.node_result before receive_msg returns. This is the
   -- "_already_replied" code path.
   reset_rga()
   _test.set_plugins({ "x" })
-  local hook = rga.for_reasoner_graph()
-  hook.from_plugin({
-    type = "event", from = "reasoner-graph",
-    body = {
-      kind = "terminal.run_node",
-      run_id = "rT", node_id = "term", firing_id = "fT",
-      args = {}, inputs = { up = { output = { text = "the final word" } } },
-    },
+  dispatch_run_node({
+    kind = "terminal.run_node",
+    run_id = "rT", node_id = "term", firing_id = "fT",
+    args = {}, inputs = { up = { output = { text = "the final word" } } },
   })
 
   local ack = find_call_with_kind("terminal.run_node.ack")
@@ -930,21 +919,19 @@ local function test_rga_terminal_handler_emits_ack_and_node_result_synchronously
   assert_eq(result.body.firing_id, "fT", "firing_id forwarded")
   assert_eq(result.body.output.text, "the final word",
     "FinalAnswer from inputs echoed as output")
-  -- No pending state should remain — terminal is synchronous.
-  assert_eq(rga._pending_count(), 0, "no pending after synchronous handler")
+  assert_eq(pending_count(), 0, "no pending after synchronous handler")
 end
 
 local function test_rga_for_reasoner_graph_passes_through_unrelated_kinds()
   -- Anything that isn't `<token>.run_node` must pass through unchanged
-  -- so other consumers on the bus continue to see it.
+  -- so other consumers on the bus continue to see it. We verify by
+  -- driving a non-run_node envelope through receive_msg and ensuring
+  -- no synthesised events fired.
   reset_rga()
-  local hook = rga.for_reasoner_graph()
-  local env = {
-    type = "event", from = "reasoner-graph",
-    body = { kind = "graph.run_started", run_id = "r" },
-  }
-  local out = hook.from_plugin(env)
-  assert_true(out == env, "non-run_node envelope passes through unchanged")
+  dispatch_run_node({
+    kind = "graph.run_started",
+    run_id = "r",
+  })
   assert_eq(#_test.calls(), 0, "no synthesised events for unrelated kinds")
 end
 
