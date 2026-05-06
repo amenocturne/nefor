@@ -54,8 +54,9 @@ sessions.init()
 -- against `nefor-combinators` at startup, and the scheduler queries
 -- combinators at submit time.
 --
---   1. provider/tool contract declare()  (subscribe BEFORE combinators
---      spawns so we don't miss its `combinators.ready` event)
+--   1. provider/tool contract declare()  (eagerly emit type-tag
+--      registrations onto the bus; combinators picks them up via
+--      ncp.lua's replay-on-attach when it readies)
 --   2. nefor-combinators       (registry)
 --   3. agentic-loop            (orchestrator state machine)
 --   4. reasoners               (Lua-resident reasoner handlers)

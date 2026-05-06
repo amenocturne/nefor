@@ -4,8 +4,9 @@
 -- Per the Phase 3a refactor plan: this wrapper is identity. The
 -- agentic-loop owns all run_complete handling + replay-mode gating
 -- (it short-circuits in `receive_msg` when replay_mode is true). The
--- resident-reasoner actor handles `<token>.run_node` dispatch and
--- registration on `reasoner-graph.ready`.
+-- resident-reasoner actor handles `<token>.run_node` dispatch; its
+-- peer-set seeds are emitted at module load and reach reasoner-graph
+-- via ncp.lua's replay-on-attach when this binary readies.
 --
 -- Phase 3b will switch reasoner-graph to speak the canonical tool
 -- contract (`tool.invoke` / `tool.result`); at that point the

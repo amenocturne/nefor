@@ -92,6 +92,37 @@ fn install_mock_engine_and_test_helpers(lua: &Lua) -> mlua::Result<()> {
     })?;
     engine_tbl.set("send", send_fn)?;
 
+    // nefor.engine.deliver(peer, payload) — mock surface for the
+    // per-peer fan-out path. From the Lua test's point of view a
+    // delivery looks identical to a targeted send (same recorded
+    // shape in `_test.calls()`); the broker-side distinction (no
+    // LogEntry append) is only visible in the production binding +
+    // the broker tests in src/ncp/broker.rs. Recording deliveries as
+    // ordinary calls keeps the existing assertions on `targets[<peer>]`
+    // unchanged after the send → deliver split.
+    let s_deliver = std::sync::Arc::clone(&shared);
+    let deliver_fn = lua.create_function(move |_, args: mlua::Variadic<Value>| {
+        let peer = match args.first() {
+            Some(Value::String(s)) => s.to_str()?.to_owned(),
+            other => {
+                return Err(mlua::Error::runtime(format!(
+                    "mock deliver: peer must be string; got {other:?}"
+                )));
+            }
+        };
+        let payload = match args.get(1) {
+            Some(Value::String(s)) => s.to_str()?.to_owned(),
+            other => {
+                return Err(mlua::Error::runtime(format!(
+                    "mock deliver: payload must be string; got {other:?}"
+                )));
+            }
+        };
+        s_deliver.calls.lock().unwrap().push((Some(peer), payload));
+        Ok(())
+    })?;
+    engine_tbl.set("deliver", deliver_fn)?;
+
     let s2 = std::sync::Arc::clone(&shared);
     let plugins_fn = lua.create_function(move |lua, _: ()| {
         let names = s2.plugins.lock().unwrap().clone();

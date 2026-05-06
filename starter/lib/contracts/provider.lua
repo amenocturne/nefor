@@ -26,12 +26,11 @@
 -- types under the canonical hub-namespace. (See lib/envelope.emit_as.)
 --
 -- Timing: combinators is a Rust binary that needs its own ready
--- handshake before it can receive events. `declare()` subscribes to
--- `combinators.ready` and emits the registration on receipt — guarantees
--- ordering even though Lua's `nefor.engine.send` calls are
--- engine-origin and not replayed by `ncp.lua`'s replay-on-attach.
--- Subscribe BEFORE spawning combinators (see starter/init.lua) so we
--- don't miss the ready event.
+-- handshake before it can receive events. `declare()` emits the
+-- registration eagerly at module load, before combinators is spawned;
+-- when combinators readies, ncp.lua's replay-on-attach delivers the
+-- prior step-origin emission to it. (Step entries log as bus events
+-- post-deliver/send split; replay carries them to late attachers.)
 
 local envelope = require("lib.envelope")
 
@@ -67,23 +66,16 @@ end
 
 local declared = false
 
--- Idempotent: subscribe once. Combinators handles re-registration
--- gracefully (atomic replace per sender), but no point spamming.
+-- Idempotent: emit once. Combinators handles re-registration gracefully
+-- (atomic replace per sender), but no point spamming.
 function M.declare()
   if declared then return end
   declared = true
-  local fired = false
-  if nefor.bus and nefor.bus.on_event then
-    nefor.bus.on_event("combinators.ready", function(_)
-      if fired then return end
-      fired = true
-      emit_register()
-    end)
-  end
+  emit_register()
 end
 
--- Test escape hatch: re-arm the subscription. Production code should
--- not call this.
+-- Test escape hatch: re-arm the emission. Production code should not
+-- call this.
 function M._reset()
   declared = false
 end

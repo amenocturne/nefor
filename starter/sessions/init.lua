@@ -245,11 +245,18 @@ local function replay_jsonl(path)
     -- Skip the header (cheap substring; full parse only on entries).
     if line:sub(1, 12) ~= [[{"_session":]] then
       local ok, decoded = pcall(json.decode, line)
-      if ok and decoded.origin == "step" and decoded.target then
+      -- Replay every step-origin entry — those are the dispatch hook's
+      -- outbound emissions. Both targeted (`target` set) and broadcast
+      -- (`target` nil) shapes round-trip via send_msg's
+      -- replay_envelope path: nefor.engine.send(payload, target?) with
+      -- target=nil broadcasts and a string targets one peer. Plugin-
+      -- origin entries are inputs — we don't re-emit them, peers re-
+      -- announce themselves on connect.
+      if ok and decoded.origin == "step" then
         send_msg({
           kind    = "replay_envelope",
           payload = decoded.payload,
-          target  = decoded.target,
+          target  = decoded.target,  -- may be nil (broadcast)
         })
         count = count + 1
       end

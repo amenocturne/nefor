@@ -18,7 +18,8 @@
 -- nefor-combinators. We declare them from Lua via the tool contract
 -- lib instead of relying on the (now-deleted) generic-tool Rust
 -- binary's startup envelope. `declare()` is idempotent and timing-safe
--- (subscribes to combinators.ready, fires once).
+-- (eagerly emits at load; combinators picks up the registration via
+-- ncp.lua's replay-on-attach when it readies).
 
 local config        = require("config")
 local tool_contract = require("lib.contracts.tool")

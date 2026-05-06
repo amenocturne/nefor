@@ -22,9 +22,18 @@
 -- synth-fails with `reasoner '<X>' not connected`. Lua-resident
 -- reasoners don't run as separate processes, so we make them visible to
 -- the peer-set by emitting one no-op `<name>.ready` envelope per
--- reasoner, with `from = <name>`, on the very first
--- `reasoner-graph.ready`. This is purely a peer-set seed — the kind
--- string itself is never consumed by anyone.
+-- reasoner, with `from = <name>`, eagerly at module load. Late-spawned
+-- reasoner-graph picks the seeds up via ncp.lua's replay-on-attach
+-- (step-origin broadcast emissions replay to late peers post the
+-- send/deliver split).
+--
+-- Targeting choice: the seeds are emitted as broadcasts (target = nil)
+-- because reasoner-graph is the only consumer that cares about them
+-- and replay-on-attach delivers them on its ready handshake. We could
+-- target reasoner-graph specifically with `emit_to`, but broadcast +
+-- replay keeps the path uniform with the contract libs and avoids
+-- depending on reasoner-graph's exact spawn name from inside the
+-- reasoners actor.
 
 local json = nefor.json
 
@@ -353,12 +362,19 @@ local function seed_peer_set()
   end
 end
 
--- ------------------------------------------------------------------
--- receive_msg — react to tool.invoke { name in handlers } +
--- reasoner-graph.ready
--- ------------------------------------------------------------------
+-- Fire the seeds at module-load time. Late-spawned reasoner-graph sees
+-- these via replay-on-attach. Idempotent guard prevents re-seeding when
+-- the test harness reloads the module.
+local seeded = false
+local function seed_once()
+  if seeded then return end
+  seeded = true
+  seed_peer_set()
+end
 
-local registered = false
+-- ------------------------------------------------------------------
+-- receive_msg — react to tool.invoke { name in handlers }
+-- ------------------------------------------------------------------
 
 -- Extract the dispatch body from a tool.invoke envelope. The Rust
 -- scheduler packs `{ run_id, node_id, args, inputs, prev_state }` into
@@ -405,14 +421,7 @@ local function receive_msg(entry)
   -- duplicate every side effect.
   if agentic_loop.is_replay_mode() then return end
 
-  -- (1) Seed peer-set on first reasoner-graph.ready.
-  if not registered and kind == "reasoner-graph.ready" then
-    seed_peer_set()
-    registered = true
-    return
-  end
-
-  -- (2) Dispatch tool.invoke { name in handlers }. Anything else on the
+  -- Dispatch tool.invoke { name in handlers }. Anything else on the
   -- bus is for someone else (real tools, spawn_graph routed to
   -- reasoner-graph itself, etc.) — ignore silently.
   if kind ~= "tool.invoke" then return end
@@ -432,14 +441,22 @@ local function receive_msg(entry)
   -- the provider wrapper's tool.result emission keyed off chat_id.
 end
 
+-- Seed the peer set at module-load time. Idempotent: a re-require
+-- (e.g. the test harness reloading) is a no-op until `_internals.reset`
+-- re-arms.
+seed_once()
+
 return {
   name        = "reasoners",
   receive_msg = receive_msg,
   send_msg    = function(_) end,
-  -- Test-only escape hatch: re-arm registration so test cases can
-  -- replay the boot dance.
+  -- Test-only escape hatch. `reset` re-arms the seed latch so a
+  -- subsequent `seed()` re-fires, but does NOT itself emit — tests
+  -- typically clear `_test.calls` between scenarios and don't expect
+  -- the reset to repopulate it.
   _internals = {
-    reset = function() registered = false end,
+    reset = function() seeded = false end,
+    seed  = seed_once,
     handlers = handlers,
   },
 }

@@ -28,12 +28,32 @@
 -- # Tradeoffs documented in code
 --
 -- * Replay re-stamps `ts`. The engine stamps `ts = now` on every outbound
---   `nefor.engine.send`, so replayed events arrive with a fresh timestamp
---   rather than the original. A future engine binding could accept a
---   `ts_override` and preserve wire-level ordering; out of scope for v1.
--- * Broadcast costs N-1 targeted sends. NCP broadcast excludes the sender;
---   the engine's broadcast includes every connected plugin. Lua bridges the
---   gap with `nefor.engine.plugins()` + per-peer `send`.
+--   `nefor.engine.deliver`, so replayed events arrive with a fresh
+--   timestamp rather than the original. A future engine binding could
+--   accept a `ts_override` and preserve wire-level ordering; out of scope
+--   for v1.
+-- * Broadcast costs N-1 targeted deliveries. NCP broadcast excludes the
+--   sender; the engine's `send` broadcasts to every connected plugin. Lua
+--   bridges the gap with `nefor.engine.plugins()` + per-peer `deliver`.
+--   The N-1 calls are routing decisions, not new emissions, so they
+--   don't inflate the bus log.
+--
+-- # Send vs deliver
+--
+-- This module uses two outbound paths into the broker, deliberately
+-- distinct:
+--
+-- * `nefor.engine.send(payload, target?)` — **emission**. Logs as a
+--   Step entry and writes to the bus. Used here for genuinely new
+--   envelopes the dispatch hook synthesizes: `ready_ok` replies, NCP
+--   `error` envelopes, the buffered `chat.popup` flush, and the engine
+--   → nefor-tui translation in `handle_engine_envelope`. Each call is
+--   one canonical bus event.
+-- * `nefor.engine.deliver(peer, payload)` — **delivery**. Writes to one
+--   peer's stdin without logging. Used by `send_to_peer` for the
+--   per-peer fan-out of an emission already on the bus. The original
+--   emission's log entry is the single source of truth; the fan-out
+--   copies are routing actions, not new events.
 --
 -- # Cross-session resumption
 --
@@ -253,20 +273,42 @@ end
 -- Decode a plugin-authored payload and run it through `from_plugin`.
 -- Returns the post-transform envelope `{type, body, from}`, or nil if the
 -- payload doesn't parse, isn't an object, or the transform dropped it.
+--
+-- `from` precedence: payload-declared `from` (if a string) wins over
+-- `origin`. This matters for step-origin entries during replay: those
+-- carry the original emitter's identity inside the payload (e.g. an
+-- `agentic-loop` broadcast retains `from = "agentic-loop"` even though
+-- its log entry's origin field is `"step"`). For plugin-origin entries
+-- the wire envelope's `from` typically matches `origin`, so this is a
+-- no-op — but a contract lib that emits with `from = "generic-provider"`
+-- via `envelope.emit_as(...)` while running inside basic-tools' load
+-- chain has its declared identity preserved.
 local function decode_and_apply_from(origin, payload)
   local decoded = select(1, try_decode(payload))
   if not decoded or type(decoded) ~= "table" then return nil end
+  local from = (type(decoded.from) == "string") and decoded.from or origin
   return apply_from_plugin(origin, {
     type = decoded.type,
     body = decoded.body,
-    from = origin,
+    from = from,
   })
 end
 
--- Stamp + apply `to_plugin` + send. `env_in` is the post-from_plugin
--- envelope `{type, body, from}`; we add an authoritative `ts` here per §3.
--- Each peer gets its own `ts` to keep the broadcast loop simple; preserving
--- a single shared `ts` across the fan-out is a v2 concern (see module doc).
+-- Stamp + apply `to_plugin` + write to the peer's stdin via the engine's
+-- `deliver` binding. `env_in` is the post-from_plugin envelope
+-- `{type, body, from}`; we add an authoritative `ts` here per §3.
+--
+-- This is **delivery, not emission**. The original envelope already
+-- produced its single canonical log entry at ingress (Origin::Plugin).
+-- Per-peer fan-out copies are routing decisions, not bus events — using
+-- `nefor.engine.send` here would synthesize a step entry per peer, which
+-- (a) inflates the log into 1 + N entries per emission and (b) breaks
+-- replay-on-attach: the dispatcher would re-enter and double-deliver
+-- every fan-out copy. `deliver` writes to one peer without logging.
+--
+-- Each peer gets its own `ts` to keep the broadcast loop simple;
+-- preserving a single shared `ts` across the fan-out is a v2 concern
+-- (see module doc).
 local function send_to_peer(target, env_in)
   -- Deep-copy body only when a `to_plugin` transform is actually registered
   -- for `target` — otherwise the body is read-only on the way out and
@@ -285,32 +327,72 @@ local function send_to_peer(target, env_in)
     body = body,
   })
   if env == nil then return end
-  nefor.engine.send(encode(env), target)
+  -- pcall: deliver raises if the target plugin disconnected between the
+  -- ready-set check and now. A TOCTOU disconnect on one peer must not
+  -- crash dispatch for the rest.
+  local ok, err = pcall(nefor.engine.deliver, target, encode(env))
+  if not ok then
+    nefor.log.warn("ncp.send_to_peer: deliver failed; dropping fan-out copy", {
+      target = target,
+      error  = tostring(err),
+    })
+  end
 end
 
--- Replay every plugin-originated `type:"event"` entry seen before the
--- handshake. Replayed envelopes pass through `from_plugin` (at the source)
--- and `to_plugin` (at the new attacher), so a late attacher sees the same
+-- Replay every prior `type:"event"` entry seen before the handshake.
+-- Replayed envelopes pass through `from_plugin` (at the source) and
+-- `to_plugin` (at the new attacher), so a late attacher sees the same
 -- transformed view as if it had been there all along. The engine stamps a
 -- fresh `ts` on each outbound send — see module-level tradeoffs. Order is
 -- preserved by iterating current_log in slice order.
+--
+-- ## What we replay
+--
+-- * Plugin-origin entries — verbatim, as before.
+-- * Step-origin entries with no target — Lua-direct **broadcast**
+--   emissions (e.g. `envelope.emit_broadcast` from agentic-loop or the
+--   contract libs). These are bus events that every connected peer
+--   would have seen had they been attached.
+--
+-- ## What we skip
+--
+-- * Step-origin entries with a target — those are emissions aimed at one
+--   specific peer (e.g. `ncp.emit_ready_ok`, `chat.popup` for nefor-tui,
+--   tool dispatch to a named provider). Replaying them to a *different*
+--   late attacher would deliver a message that wasn't meant for them.
+-- * Engine-origin entries — `engine.*` kinds are private to the
+--   translation layer (`handle_engine_envelope`) and would leak as raw
+--   kinds onto the bus.
+--
+-- ## Why dropping the old `origin ~= "step"` filter is now safe
+--
+-- Pre-refactor, every plugin emission produced one Plugin entry +
+-- N Step entries (one per peer the dispatch hook fanned out to). The
+-- old filter was correct then: skipping Step entries avoided re-routing
+-- those fan-out copies. Post-refactor, dispatch fan-out goes through
+-- `nefor.engine.deliver` which writes to a peer without logging — so
+-- step entries are now unambiguously bus emissions. The Plugin/Step
+-- distinction collapses to "who originated this": a connected plugin
+-- (Plugin) or the dispatch hook itself (Step). Both are bus events;
+-- both should replay.
 replay_prior_events = function(target, current_log, tail_index)
   for i = 1, tail_index - 1 do
     local entry = current_log[i]
-    -- Skip Step-originated entries: those are the engine's own forwarding
-    -- fan-out of prior events, not originals. Replaying them would
-    -- double-deliver.
-    --
-    -- Skip engine-originated entries too: `engine.*` kinds are private to
-    -- the translation layer in handle_engine_envelope and never belong on
-    -- the bus as broadcast events. Replaying them would leak the raw kind
-    -- (e.g. `engine.plugin_failed`) to every late attacher.
-    if entry.origin ~= "step" and entry.origin ~= "engine" then
+    -- Skip engine-originated entries: `engine.*` kinds are private to
+    -- the translation layer in handle_engine_envelope and never belong
+    -- on the bus as broadcast events. Replaying them would leak the
+    -- raw kind (e.g. `engine.plugin_failed`) to every late attacher.
+    if entry.origin == "engine" then goto continue end
+    -- Step entries with a specific target were targeted emissions aimed
+    -- at that peer only. Don't replay them to other late attachers.
+    if entry.origin == "step" and entry.target ~= nil then goto continue end
+    do
       local env_in = decode_and_apply_from(entry.origin, entry.payload)
       if env_in and env_in.type == "event" then
         send_to_peer(target, env_in)
       end
     end
+    ::continue::
   end
 end
 
