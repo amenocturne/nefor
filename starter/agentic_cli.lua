@@ -46,7 +46,11 @@
 
 local M = {}
 
-local agentic_workflow = require("agentic_workflow")
+-- The orchestrator is now exposed by the agentic-loop actor. Public
+-- API (on_stream / on_tool_start / on_tool_end / on_complete / submit
+-- / set_model / set_yolo) is preserved verbatim from the prior
+-- agentic_workflow module.
+local agentic_workflow = require("agentic-loop")
 local json = nefor.json
 
 -- ------------------------------------------------------------------

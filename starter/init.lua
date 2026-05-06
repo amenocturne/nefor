@@ -1,26 +1,19 @@
 -- starter/init.lua — default engine composition.
 --
--- Post Slice 2 I4 the engine is pure glue: no hardcoded NCP behavior, no
--- bundled widgets. This file is the canonical reference config:
+-- Post Phase 3a the orchestration glue lives in per-plugin actor
+-- folders rather than a single `agentic_workflow.lua` module:
 --
---   1. Wire `package.path` so `require("ncp")` resolves to the bundled
---      protocol module next to this file.
---   2. Define the global `step` hook the engine calls on every inbound line
---      and bring up the sessions module (boot + shutdown wiring). Session
---      continuity is composed in Lua — see `starter/sessions.lua`.
---   3. Register plugins via `nefor.plugins.spawn`. Mirrors the pre-split
---      reference config (`tmp/smoke-config-m2/init.lua`) plus the
---      combinators plugin; swap or remove entries to compose your own stack.
+--   * `agentic-loop/`     — orchestrator state machine
+--   * `reasoners/`        — Lua-resident reasoner type handlers
+--                           (responder, terminal, tool-executor,
+--                            adapter, provider-wrapper, dummy)
+--   * `<plugin>/`         — wrapper actor per Rust binary, owning
+--                           that plugin's wire-protocol translation
+--                           (openai-provider, mock-plugin, tool-gate,
+--                            nefor-tui, reasoner-graph,
+--                            nefor-combinators, basic-tools)
 --
--- ### T7 — Stage 1 starter wiring (post-Phase-1B)
---
--- The chat plugin no longer talks to a provider directly. Instead a single
--- `agentic_workflow` module owns the orchestration glue: it intercepts
--- `chat.input.submit`, drives the reasoner-graph against the provider via
--- a template orchestrator graph (provider-wrapper + tool-executor +
--- adapter + terminal cycle), wires the spawn_graph tool, and surfaces
--- run completions back to nefor-chat. See
--- `starter/agentic_workflow.lua` for the full event flow.
+-- This file just composes the actors in spawn order.
 --
 -- Run:
 --   NEFOR_PLUGIN_DIR=$PWD/plugins cargo run --bin nefor -- --config ./starter
@@ -39,155 +32,53 @@ package.path = table.concat({
 -------------------------------------------------------------------------
 -- 2. Dispatch hook + session management
 -------------------------------------------------------------------------
---
--- Session continuity (boot, shutdown, resume) is composed entirely in
--- Lua via the sessions module. The Rust engine is session-blind: it
--- forwards inbound lines to the dispatch hook, broadcasts events, and
--- exits on request. Session id minting, on-disk jsonl persistence, and
--- in-process resume all live in `starter/sessions.lua`.
---
--- The legacy sidechannel-write + process-exit + engine-restart flow
--- (and the `nefor.parent_session` engine handoff that drove it) are
--- gone — they killed the TUI on every resume. The new flow is
--- pure-Lua, in-process, message-bus juggling. See sessions.lua's
--- docstring for the bus protocol.
 
 local ncp      = require("ncp")
 local actor    = require("actor")
 local sessions = require("sessions")
 local cfg      = require("config").active
 
--- Forward the engine's `current_log` to ncp.dispatch. The engine is
--- session-blind: cross-run resume is owned by `starter/sessions.lua`,
--- which is now an actor registered with `actor.lua`. The actor runtime
--- subscribes to the bus once and routes every envelope to all spawned
--- actors' `receive_msg`.
 function dispatch(current_log)
   ncp.dispatch(current_log)
 end
 
--- Install the actor runtime — subscribes to the bus and to engine
--- shutdown lifecycle. Done BEFORE actor.spawn so the bus subscription
--- is live when actors start running their boot code.
 actor.install()
-
--- Register the sessions actor. The actor's `receive_msg` handles
--- persistence, resume_request, new_request, and engine.shutdown via
--- the bus — no separate bus or lifecycle subscriptions in the module.
 actor.spawn(sessions)
-
--- Mint a fresh session and emit `sessions.session_start`. Done before
--- any plugin spawn so the persistence path is in place when the first
--- envelope routes. Shutdown handling is wired implicitly via the actor
--- runtime — no `sessions.handle_shutdown()` call needed.
 sessions.init()
 
 -------------------------------------------------------------------------
--- 4. Plugin composition
--------------------------------------------------------------------------
-
-local agentic_workflow = require("agentic_workflow")
-
-local function bin(name)
-  local plugin_dir = os.getenv("NEFOR_PLUGIN_DIR")
-  if plugin_dir and plugin_dir ~= "" then
-    return plugin_dir .. "/" .. name
-  end
-  error("NEFOR_PLUGIN_DIR is not set. The engine resolves this automatically; if you see this error, set it manually or pass --plugin-dir.")
-end
-
--------------------------------------------------------------------------
--- 4a. Spawn order
+-- 3. Plugin composition
 -------------------------------------------------------------------------
 --
 -- Order matters because plugins register types/Into declarations
 -- against `nefor-combinators` at startup, and the scheduler queries
--- combinators at submit time. The safe order:
+-- combinators at submit time.
 --
 --   1. provider/tool contract declare()  (subscribe BEFORE combinators
---      spawns so we don't miss its `combinators.ready` event — Lua-
---      origin envelopes aren't replayed on attach, see
---      lib/contracts/provider.lua)
+--      spawns so we don't miss its `combinators.ready` event)
 --   2. nefor-combinators       (registry)
---   3. openai-provider(s)      (declare Into against canonical types)
---   4. reasoner-graph          (queries combinators on submit)
---   5. tool-gate               (aggregates tool advertisements)
---   6. basic-tools             (advertises tools; declares tool contract)
---   7. nefor-tui                (UI; can come up any time — chat is a Lua composition inside it)
---
--- Phase 2 of the agentic_workflow refactor moved the canonical type
--- declarations (generic-provider/generic-tool) from passive Rust
--- binaries into Lua contract libs (`lib/contracts/{provider,tool}.lua`).
--- The libs emit the same `combinators.register` envelopes the binaries
--- did, but namespaced via `envelope.emit_as("generic-provider", …)` so
--- combinators stores the types under the canonical hub identity. The
--- Rust binaries still build but are no longer spawned from this config.
---
--- ncp.lua's replay-on-attach means a late-attaching plugin still sees
--- prior plugin-origin events, so the combinators-spawn-then-Into-
--- declarations chain works without strict ordering.
+--   3. agentic-loop            (orchestrator state machine)
+--   4. reasoners               (Lua-resident reasoner handlers)
+--   5. provider                (openai-provider or mock-plugin)
+--   6. reasoner-graph          (queries combinators on submit)
+--   7. tool-gate               (aggregates tool advertisements)
+--   8. basic-tools             (advertises tools)
+--   9. nefor-tui               (UI)
 
 require("lib.contracts.provider").declare()
 require("lib.contracts.tool").declare()
 
 actor.spawn(require("nefor-combinators"))
 
--------------------------------------------------------------------------
--- 4b. Provider — selected by config.lua (prod = openai-provider, test = mock).
--------------------------------------------------------------------------
---
--- The `prod` table runs openai-provider against the configured base_url
--- (Ollama by default). The `test` table runs mock-plugin loading
--- `mock_provider.lua` for deterministic smoke / e2e tests. Both emit
--- the same `<name>.chat.*` / `<name>.stream.*` envelope shape so the
--- rest of the composition is provider-agnostic.
---
--- The `static_token=ollama-local` trick on prod unlocks openai-provider's
--- auth gate without a real key (required for local Ollama). Real remote
--- providers would supply an --api-key CLI arg via provider.extra_args.
-
-local PROVIDER_NAME  = cfg.provider.name
-local PROVIDER_MODEL = cfg.provider.model
-local provider_chain, provider_command
-
-if cfg.plugins.spawn_mock then
-  provider_chain = agentic_workflow.for_provider(PROVIDER_NAME)
-  provider_command = {
-    bin("mock-plugin"),
-    "--script", STARTER_ROOT .. "/" .. cfg.provider.mock_script,
-  }
-else
-  provider_chain = agentic_workflow.for_provider(PROVIDER_NAME, {
-    static_token = cfg.provider.static_token,
-  })
-  provider_command = {
-    bin("openai-provider"),
-    "--name",     PROVIDER_NAME,
-    "--base-url", cfg.provider.base_url,
-  }
-  if PROVIDER_MODEL then
-    table.insert(provider_command, "--model")
-    table.insert(provider_command, PROVIDER_MODEL)
-  end
-  for _, a in ipairs(cfg.provider.extra_args or {}) do
-    table.insert(provider_command, a)
-  end
-end
-
--------------------------------------------------------------------------
--- 4c. Orchestrator setup — single configuration call
--------------------------------------------------------------------------
---
--- Stage-1 system prompt: teaches the orchestrator model when and how
--- to use `spawn_graph`. Kept terse on purpose — Gemma 3 reasons itself
--- into a "stop" finish without committing to the tool call when the
--- prompt is dense. Schema-only worked-example was enough to make it
--- emit a well-formed graph reliably; the verbose version was not.
--- Two reasoner types are documented because those are the ones
--- agentic_workflow handles for sub-graphs (`responder` = one-shot LLM,
--- `terminal` = sink); other reasoner types are private to the
--- orchestrator's chat loop and would just confuse the model.
-local ORCHESTRATOR_SYSTEM_PROMPT = [[
+-- Boot the orchestrator actor + resident reasoner handlers BEFORE
+-- the plugins they coordinate. The actor runtime queues incoming
+-- envelopes during boot, so even if a plugin's `ready` arrives
+-- earlier than expected nothing is lost.
+local agentic_loop = require("agentic-loop")
+agentic_loop.configure {
+  provider = cfg.provider.name,
+  model    = cfg.provider.model,
+  system   = [[
 You are a helpful assistant. Use the `spawn_graph` tool for parallel decomposition tasks (multiple independent sub-questions to combine).
 
 Graph schema:
@@ -201,36 +92,57 @@ To combine parallel branches into a single output, add a `responder` combine nod
   branchA, branchB → combine (responder) → terminal
 
 Emit the tool call directly after deciding the structure. For simple chat turns (no decomposition benefit), just answer directly.
-]]
-
-agentic_workflow.setup {
-  provider = PROVIDER_NAME,
-  model    = PROVIDER_MODEL,
-  system   = ORCHESTRATOR_SYSTEM_PROMPT,
+]],
 }
-
-ncp.spawn {
-  name        = PROVIDER_NAME,
-  command     = provider_command,
-  from_plugin = provider_chain.from_plugin,
-  to_plugin   = provider_chain.to_plugin,
-}
+actor.spawn(agentic_loop)
+actor.spawn(require("reasoners"))
 
 -------------------------------------------------------------------------
--- 4d. Reasoner graph
+-- 3b. Provider — selected by config.lua (prod = openai-provider, test = mock).
 -------------------------------------------------------------------------
 
-ncp.spawn {
-  name        = "reasoner-graph",
-  command     = { bin("reasoner-graph") },
-  from_plugin = agentic_workflow.for_reasoner_graph().from_plugin,
-}
+local PROVIDER_NAME  = cfg.provider.name
+local PROVIDER_MODEL = cfg.provider.model
+
+if cfg.plugins.spawn_mock then
+  actor.spawn(require("mock-plugin").spawn_spec(
+    PROVIDER_NAME,
+    {
+      require("config").bin("mock-plugin"),
+      "--script", STARTER_ROOT .. "/" .. cfg.provider.mock_script,
+    }
+  ))
+else
+  local provider_command = {
+    require("config").bin("openai-provider"),
+    "--name",     PROVIDER_NAME,
+    "--base-url", cfg.provider.base_url,
+  }
+  if PROVIDER_MODEL then
+    table.insert(provider_command, "--model")
+    table.insert(provider_command, PROVIDER_MODEL)
+  end
+  for _, a in ipairs(cfg.provider.extra_args or {}) do
+    table.insert(provider_command, a)
+  end
+  actor.spawn(require("openai-provider").spawn_spec(
+    PROVIDER_NAME,
+    provider_command,
+    { static_token = cfg.provider.static_token }
+  ))
+end
 
 -------------------------------------------------------------------------
--- 4e. Tool gate + basic-tools + spawn_graph advertisement
+-- 3c. Reasoner graph
 -------------------------------------------------------------------------
 
-local tool_gate_argv = { bin("tool-gate") }
+actor.spawn(require("reasoner-graph").spawn_spec({ require("config").bin("reasoner-graph") }))
+
+-------------------------------------------------------------------------
+-- 3d. Tool gate + basic-tools
+-------------------------------------------------------------------------
+
+local tool_gate_argv = { require("config").bin("tool-gate") }
 for _, t in ipairs(cfg.tool_gate.prompt_tools or {}) do
   tool_gate_argv[#tool_gate_argv + 1] = "--prompt"
   tool_gate_argv[#tool_gate_argv + 1] = t
@@ -238,27 +150,15 @@ end
 tool_gate_argv[#tool_gate_argv + 1] = "--default"
 tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
 
-ncp.spawn {
-  name        = "tool-gate",
-  command     = tool_gate_argv,
-  from_plugin = agentic_workflow.for_tool_gate("tool-gate").from_plugin,
-}
+actor.spawn(require("tool-gate").spawn_spec("tool-gate", tool_gate_argv))
 
 actor.spawn(require("basic-tools"))
 
 -------------------------------------------------------------------------
--- 4f. Chat
+-- 3e. Chat (declarative TUI)
 -------------------------------------------------------------------------
---
--- Post-phase-6 cutover: the chat surface is a Lua composition (`chat.lua`)
--- running inside the new declarative `nefor-tui` plugin. The plugin loads
--- the script via `--script <path>` and exposes a `tui.*` primitive surface
--- (text, column, row, scrollable, text_input, markdown, ...) that
--- `chat.lua` composes into the transcript + statusline + input. The
--- legacy split (`nefor-chat` + ratatui-based `nefor-tui`) is gone.
 
-ncp.spawn {
-  name        = "nefor-tui",
-  command     = { bin("nefor-tui"), "--script", STARTER_ROOT .. "/chat.lua" },
-  from_plugin = agentic_workflow.for_chat().from_plugin,
-}
+actor.spawn(require("nefor-tui").spawn_spec({
+  require("config").bin("nefor-tui"),
+  "--script", STARTER_ROOT .. "/chat.lua",
+}))
