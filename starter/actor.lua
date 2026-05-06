@@ -81,9 +81,18 @@ local M = {
   installed = false,
 }
 
--- Register an actor. Validates the shape but doesn't call init —
--- modules that need boot-time work do it at module-load (top-level)
--- before returning the actor table, or in response to a wire envelope.
+-- Register an actor. Two shapes:
+--
+--   * Pure-Lua actor — no `command` field. Lives entirely in this VM;
+--     receive_msg sees every wire envelope, send_msg emits via
+--     nefor.engine.send.
+--
+--   * Rust-binary wrapper — `command` is a table the engine spawns as
+--     a subprocess (same shape as `nefor.plugins.spawn`'s `command`
+--     argument). The binary participates on the bus through the
+--     broker's stdin/stdout pipes; the wrapper actor's receive_msg
+--     can additionally translate or react to that traffic. A wrapper
+--     with a no-op receive_msg is just "spawn this binary."
 function M.spawn(spec)
   if type(spec) ~= "table" then
     error("actor.spawn: spec must be a table", 2)
@@ -94,7 +103,12 @@ function M.spawn(spec)
   if type(spec.receive_msg) ~= "function" then
     error("actor.spawn: spec.receive_msg must be a function", 2)
   end
+
   M.actors[#M.actors + 1] = spec
+
+  if spec.command then
+    nefor.plugins.spawn { name = spec.name, command = spec.command }
+  end
 end
 
 -- Internal: run one envelope through every actor.
