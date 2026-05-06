@@ -53,21 +53,10 @@ local M = {}
 
 local json = nefor.json
 
--- Seed math.random at module load so uuid_lite / mint_chat_run_id
--- don't draw from the deterministic Lua-default sequence. os.time() is
--- whole-seconds; mix in os.clock() (sub-second CPU time) and the
--- address of a fresh table for additional entropy across processes
--- spawned in the same wall-clock second. A monotonic counter
--- (`id_seq` below) is folded into the minted ids for tighter collision
--- resistance — two spawn_graph calls in the same second can't collide.
-do
-  local addr_byte = string.byte(tostring({}):sub(-2, -2)) or 0
-  math.randomseed((os.time() * 1000) + math.floor((os.clock() or 0) * 1e6) + addr_byte)
-end
-
--- Monotonic counter used by uuid_lite + mint_chat_run_id to make ids
--- unique even when two calls land in the same os.time() second.
-local id_seq = 0
+local envelope    = require("lib.envelope")
+local ids         = require("lib.ids")
+local results_lib = require("lib.results")
+local graph       = require("lib.graph")
 
 -- ------------------------------------------------------------------
 -- configuration & runtime state
@@ -113,9 +102,6 @@ local chat_id_stream_visible = {}
 -- Reasoner types whose streaming should reach nefor-chat.
 local STREAM_VISIBLE_TYPES = { ["provider-wrapper"] = true }
 
--- Monotonic counter for chat/tool ids minted here.
-local id_counter = 0
-
 -- Reasoner-type → handler-fn registry. Wired below.
 local handlers = {}
 
@@ -153,80 +139,12 @@ local popup_observers = {}           -- (popup_table)
 -- helpers
 -- ------------------------------------------------------------------
 
-local function next_id(prefix)
-  id_counter = id_counter + 1
-  return prefix .. "-" .. tostring(id_counter)
-end
-
-local function pending_key(run_id, firing_id)
-  return tostring(run_id) .. ":" .. tostring(firing_id)
-end
-
--- Build an envelope and ship it via the engine's send binding. NCP §3
--- requires `from`+`ts` on every wire envelope; the engine forwards our
--- payloads verbatim, so we stamp them ourselves. Target nil = broadcast
--- (engine fans out); a string targets one peer.
---
--- json.encode is wrapped in pcall: a payload that contains non-UTF-8
--- bytes (e.g. binary file content reaching the bus, or a UTF-8-truncated
--- multibyte boundary from a buggy producer) would otherwise raise from
--- the bus dispatcher with no path back to the run — engine logs the
--- error but the broker keeps idling, hanging the user. On encode
--- failure: emit a synthesised chat.popup so the user sees something
--- failed, log loudly, and request engine exit so the run terminates
--- cleanly instead of hanging.
-local function emit(target, body)
-  local ok, payload = pcall(json.encode, {
-    type = "event",
-    from = "engine",
-    ts   = nefor.engine.now(),
-    body = body,
-  })
-  if not ok then
-    local kind = (type(body) == "table" and tostring(body.kind)) or "(unknown)"
-    nefor.log.error("agentic_workflow: json.encode failed — payload not emitted", {
-      kind  = kind,
-      error = tostring(payload),
-    })
-    -- Best-effort user-visible popup. Build the popup envelope from
-    -- string primitives only so the popup itself can't repeat the
-    -- failure. If even this re-encode fails, we've at least logged.
-    local popup_ok, popup_payload = pcall(json.encode, {
-      type = "event",
-      from = "engine",
-      ts   = nefor.engine.now(),
-      body = {
-        kind  = "chat.popup",
-        level = "error",
-        text  = "internal error: failed to encode bus event (kind="
-                .. kind .. "); see engine log",
-      },
-    })
-    if popup_ok and nefor.engine and nefor.engine.send then
-      for _, peer in ipairs(nefor.engine.plugins()) do
-        nefor.engine.send(popup_payload, peer)
-      end
-    end
-    -- Cleanly tear down the run. The CLI driver waits for engine.exit;
-    -- TUI driver treats this as a fatal — better to surface the bug
-    -- than silently hang. Guarded so a missing binding (test harness)
-    -- doesn't compound the failure.
-    if nefor.engine and type(nefor.engine.exit) == "function" then
-      nefor.engine.exit(1)
-    end
-    return
-  end
-  if target ~= nil then
-    nefor.engine.send(payload, target)
-  else
-    for _, peer in ipairs(nefor.engine.plugins()) do
-      nefor.engine.send(payload, peer)
-    end
-  end
-end
-
-local function emit_to(target, body) emit(target, body) end
-local function emit_broadcast(body) emit(nil, body) end
+local emit           = envelope.emit
+local emit_to        = envelope.emit_to
+local emit_broadcast = envelope.emit_broadcast
+local next_id        = envelope.next_id
+local uuid_lite      = envelope.uuid_lite
+local pending_key    = ids.pending_key
 
 local function send_ack(reasoner, run_id, firing_id)
   emit_broadcast({
@@ -271,87 +189,10 @@ end
 -- spawn_graph internals (D-22: virtual source name)
 -- ------------------------------------------------------------------
 
--- Virtual source name we register `spawn_graph` under. There is no
--- plugin by this name on the bus — `for_tool_gate` intercepts the
--- gate-forwarded `spawn-graph-tool.tool.invoke` and drops it before
--- targeting tries to deliver to a non-existent peer.
-local SPAWN_GRAPH_SOURCE = "spawn-graph-tool"
+local SPAWN_GRAPH_SOURCE = graph.SPAWN_GRAPH_SOURCE
 
-local function spawn_graph_schema()
-  return {
-    type = "object",
-    description = "Submit a reasoner-graph run and return its results.",
-    properties = {
-      graph = {
-        type = "object",
-        description = "The graph topology: { nodes: [...], edges: [...] }.",
-      },
-      on_node_failure = {
-        type = "string",
-        enum = { "abort", "continue" },
-        description = "Failure policy. Defaults to abort.",
-      },
-    },
-    required = { "graph" },
-  }
-end
-
-local function advertise_body(gate_name)
-  return {
-    kind   = gate_name .. ".tools.advertise",
-    source = SPAWN_GRAPH_SOURCE,
-    tools  = {
-      {
-        name        = "spawn_graph",
-        description = "Submit a reasoner-graph run and return its terminal results.",
-        parameters  = spawn_graph_schema(),
-      },
-    },
-  }
-end
-
-local function uuid_lite()
-  id_seq = id_seq + 1
-  return string.format(
-    "rg-%d-%d-%d",
-    os.time(),
-    id_seq,
-    math.random(0, 2 ^ 31 - 1)
-  )
-end
-
--- Serialise sub-graph results into a tool-friendly string. Preference:
---   1. results.terminal.output.text — canonical agent-style exit.
---   2. Any node whose key contains "terminal", "out", or "final".
---   3. Any node's output.text (Lua pairs() order; last-resort).
---   4. JSON-encoded results map.
-local function extract_text(entry)
-  if type(entry) ~= "table" or type(entry.output) ~= "table" then return nil end
-  local out = entry.output
-  return out.text or (out.final_answer and out.final_answer.text) or nil
-end
-
-local function serialise_results(results)
-  if type(results) ~= "table" then return tostring(results) end
-
-  local terminal_text = extract_text(results.terminal)
-  if type(terminal_text) == "string" then return terminal_text end
-
-  for nid, entry in pairs(results) do
-    if type(nid) == "string"
-        and (string.find(nid, "terminal") or string.find(nid, "out") or string.find(nid, "final")) then
-      local txt = extract_text(entry)
-      if type(txt) == "string" then return txt end
-    end
-  end
-
-  for _, entry in pairs(results) do
-    local txt = extract_text(entry)
-    if type(txt) == "string" then return txt end
-  end
-
-  return json.encode(results)
-end
+local serialise_results = results_lib.serialise_results
+local format_deferred   = results_lib.format_deferred
 
 -- Release every queued sub-graph dispatch. Called from for_provider's
 -- stream.delta / stream.reasoning_delta handler on the orchestrator's
@@ -738,61 +579,6 @@ end
 -- orchestrator template + submit
 -- ------------------------------------------------------------------
 
-local function mint_chat_run_id()
-  id_seq = id_seq + 1
-  return string.format(
-    "chat-run-%d-%d-%d",
-    os.time(),
-    id_seq,
-    math.random(0, 2 ^ 31 - 1)
-  )
-end
-
-local function build_orchestrator_graph(opts)
-  opts = opts or {}
-  local provider = opts.provider or "ollama"
-  local model = opts.model
-  local system = opts.system or ""
-  local user_text = opts.user_text or ""
-
-  local wrap_args = {
-    provider = provider,
-    prompt   = user_text,
-  }
-  if type(system) == "string" and #system > 0 then
-    wrap_args.system = system
-  end
-  if type(model) == "string" and #model > 0 then
-    wrap_args.model = model
-  end
-
-  return {
-    nodes = {
-      {
-        id       = "wrap",
-        reasoner = "provider-wrapper",
-        args     = wrap_args,
-        fanout   = {
-          ["in"] = "generic-provider.ProviderOut",
-          out    = {
-            "generic-tool.ToolCalls",
-            "generic-provider.FinalAnswer",
-          },
-        },
-      },
-      { id = "tools",    reasoner = "tool-executor", args = {} },
-      { id = "adapt",    reasoner = "adapter",       args = {} },
-      { id = "terminal", reasoner = "terminal",      args = {} },
-    },
-    edges = {
-      { from = "wrap",  to = "tools",    type = "generic-tool.ToolCalls" },
-      { from = "wrap",  to = "terminal", type = "generic-provider.FinalAnswer" },
-      { from = "tools", to = "adapt" },
-      { from = "adapt", to = "wrap" },
-    },
-  }
-end
-
 -- Submit the orchestrator template graph as a fresh chat run. Used by
 -- both `chat.input.submit` (the user typed something) and the deferred
 -- spawn_graph delivery path.
@@ -802,7 +588,7 @@ end
 local function submit_orchestrator_run(user_text)
   if current_run_id ~= nil then return nil end
 
-  local graph = build_orchestrator_graph({
+  local g = graph.build_orchestrator_graph({
     provider  = config.provider,
     model     = config.model,
     system    = config.system,
@@ -810,40 +596,17 @@ local function submit_orchestrator_run(user_text)
   })
 
   if type(current_state) == "table" and type(current_state.chat_id) == "string" then
-    graph.nodes[1].args.seed_chat_id = current_state.chat_id
+    g.nodes[1].args.seed_chat_id = current_state.chat_id
   end
 
-  current_run_id = mint_chat_run_id()
+  current_run_id = ids.mint_chat_run_id()
   emit("reasoner-graph", {
     kind            = "reasoner-graph.run",
     run_id          = current_run_id,
-    graph           = graph,
+    graph           = g,
     on_node_failure = "abort",
   })
   return current_run_id
-end
-
--- Format a deferred spawn_graph completion into a user-role message.
-local function format_deferred(completion)
-  local run_id = completion.run_id or "?"
-  if completion.status == "success" then
-    return "[spawn_graph(run_id=" .. tostring(run_id) .. ") result]\n" ..
-           "The sub-graph you submitted earlier has finished. " ..
-           "Present the output below to the user as your reply to their " ..
-           "original prompt. You may lightly reformat for readability; " ..
-           "do not re-spawn the graph, do not fabricate missing content, " ..
-           "do not re-analyse whether the result is complete — the " ..
-           "sub-graph is the source of truth.\n\n" ..
-           "--- output ---\n" ..
-           tostring(completion.output or "")
-  else
-    return "[spawn_graph(run_id=" .. tostring(run_id) .. ") FAILED]\n" ..
-           "The sub-graph you submitted earlier failed. Tell the user " ..
-           "the sub-graph errored and offer to retry; do not silently " ..
-           "re-spawn or fabricate a result.\n\n" ..
-           "--- error ---\n" ..
-           tostring(completion.error or completion.status or "unknown error")
-  end
 end
 
 local function flush_deferred()
@@ -1451,7 +1214,7 @@ function M.for_tool_gate(gate_name)
     -- Spawn-graph: advertise on first hello.
     if not advertised and env.body.kind == hello_kind then
       advertised = true
-      emit(gate_name, advertise_body(gate_name))
+      emit(gate_name, graph.advertise_body(gate_name))
       return env
     end
 
@@ -2066,7 +1829,7 @@ end
 -- Test/dev only: build the orchestrator template graph for inspection.
 function M.build_template(user_text, opts)
   opts = opts or {}
-  return build_orchestrator_graph({
+  return graph.build_orchestrator_graph({
     provider  = opts.provider or config.provider,
     model     = opts.model    or config.model,
     system    = opts.system   or config.system,
@@ -2087,7 +1850,7 @@ function M._reset()
   chat_id_to_key = {}
   tool_id_to_key = {}
   chat_id_stream_visible = {}
-  id_counter = 0
+  envelope._reset()
   pending_dispatches = {}
   pending_runs = {}
   node_result_observers = {}
