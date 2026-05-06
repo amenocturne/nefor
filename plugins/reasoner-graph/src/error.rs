@@ -26,8 +26,9 @@ pub enum ErrorCode {
     MalformedGraph,
     /// A node became runnable but its named reasoner is not connected.
     ReasonerNotConnected,
-    /// The reasoner did not send `<reasoner>.run_node.ack` within
-    /// `ack_deadline_ms` of dispatch.
+    /// The reasoner did not reply with `tool.result` within
+    /// `ack_deadline_ms` of dispatch. (Tool contract has no acks; this
+    /// is the deadline-on-result watchdog per wire-spec D1.)
     AckTimeout,
     /// Submit-time type check failed (slot mismatches, duplicate output
     /// types in fanout multiset, etc.). Reported under synthetic

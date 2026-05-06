@@ -254,10 +254,10 @@ impl Graph {
     }
 }
 
-/// Parse a `graph` JSON value (the inner object under `reasoner-graph.run`'s
-/// `graph` key) into a [`Graph`]. Returns `Err(reason)` for malformed
-/// input — the scheduler turns that into a synthetic `_error` node in
-/// `graph.run_complete`.
+/// Parse a `graph` JSON value (the inner object under
+/// `tool.invoke.args.graph`) into a [`Graph`]. Returns `Err(reason)` for
+/// malformed input — the scheduler turns that into a synthetic `_error`
+/// node in `tool.result`'s `result.results`.
 pub fn parse_graph(graph_value: &Value) -> Result<Graph, String> {
     let obj = graph_value
         .as_object()
@@ -435,9 +435,12 @@ fn parse_fanout_signature(
     })
 }
 
-/// Parse the top-level `reasoner-graph.run` body into its pieces.
+/// Parse the top-level `tool.invoke { id, name="spawn_graph", args: { graph,
+/// on_node_failure?, ack_deadline_ms? } }` body into its pieces.
+#[derive(Debug)]
 pub struct RunSubmission {
-    /// Caller-supplied opaque correlation id.
+    /// Caller-supplied opaque correlation id (envelope `id` field —
+    /// becomes the run_id internally).
     pub run_id: String,
     /// Validated graph (cycles permitted).
     pub graph: Graph,
@@ -448,36 +451,77 @@ pub struct RunSubmission {
     pub ack_deadline_ms: u64,
 }
 
-/// Errors from parsing a `reasoner-graph.run` submission. The scheduler
-/// turns these into a synthetic `_error` node in `graph.run_complete`.
+/// The tool name this binary handles via the canonical contract.
+pub const SPAWN_GRAPH_TOOL_NAME: &str = "spawn_graph";
+
+/// Errors from parsing a `tool.invoke { name="spawn_graph" }` submission.
+/// The scheduler turns these into a synthetic `_error` node in the
+/// outbound `tool.result { id=run_id, result }`.
 #[derive(Debug, Clone)]
 pub struct SubmissionError {
     /// Human-readable reason carried into `_error.error`.
     pub message: String,
-    /// Caller-supplied run_id if we managed to parse it before failing.
-    /// `None` means the caller can't correlate the reply — we emit
-    /// `graph.run_complete` with an empty run_id, which is the best we
-    /// can do; callers should always include `run_id` first.
+    /// Caller-supplied run_id (envelope `id`) if we managed to parse it
+    /// before failing. `None` means the caller can't correlate the
+    /// reply — we emit a `tool.result` with an empty id, which is the
+    /// best we can do; callers should always include `id` first.
     pub run_id: Option<String>,
 }
 
-/// Parse the body of a `reasoner-graph.run` event.
+/// Parse the body of an inbound `tool.invoke { name="spawn_graph" }`
+/// event. The envelope `id` becomes the internal `run_id`; submission
+/// fields (`graph`, `on_node_failure`, `ack_deadline_ms`) are nested
+/// inside `args` per the canonical tool contract.
+///
+/// Unknown fields on the envelope and inside `args` are tolerated so
+/// future contract extensions (e.g. `graph_id` for nested-spawn agents,
+/// per spec Flow 2 / `nefor-recursive-agents`) don't break parsing.
 pub fn parse_submission(body: &Map<String, Value>) -> Result<RunSubmission, SubmissionError> {
+    // Envelope `id` is the caller-minted correlation key — internally
+    // it becomes the run_id. (Both names refer to the same string; the
+    // type system stays on `run_id` to minimize the in-crate diff.)
     let run_id = body
-        .get("run_id")
+        .get("id")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    // Pre-fetch run_id even if other parsing fails, so the caller can
+    // Pre-fetch id even if other parsing fails, so the caller can
     // correlate the reply.
     let run_id_for_error = run_id.clone();
 
     let run_id = run_id.ok_or_else(|| SubmissionError {
-        message: "missing `run_id` (string)".into(),
+        message: "missing `id` (string)".into(),
         run_id: None,
     })?;
 
-    let graph_value = body.get("graph").ok_or_else(|| SubmissionError {
-        message: "missing `graph` (object)".into(),
+    // The tool name MUST be "spawn_graph"; other names are routed by
+    // dispatch_event, but a defensive check here keeps the parser
+    // self-contained.
+    let name = body
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| SubmissionError {
+            message: "missing `name` (string)".into(),
+            run_id: run_id_for_error.clone(),
+        })?;
+    if name != SPAWN_GRAPH_TOOL_NAME {
+        return Err(SubmissionError {
+            message: format!(
+                "expected name=\"{SPAWN_GRAPH_TOOL_NAME}\"; got {name:?}"
+            ),
+            run_id: run_id_for_error,
+        });
+    }
+
+    let args = body
+        .get("args")
+        .and_then(Value::as_object)
+        .ok_or_else(|| SubmissionError {
+            message: "missing `args` (object)".into(),
+            run_id: run_id_for_error.clone(),
+        })?;
+
+    let graph_value = args.get("graph").ok_or_else(|| SubmissionError {
+        message: "missing `args.graph` (object)".into(),
         run_id: run_id_for_error.clone(),
     })?;
     let graph = parse_graph(graph_value).map_err(|e| SubmissionError {
@@ -485,7 +529,7 @@ pub fn parse_submission(body: &Map<String, Value>) -> Result<RunSubmission, Subm
         run_id: run_id_for_error.clone(),
     })?;
 
-    let on_failure = body
+    let on_failure = args
         .get("on_node_failure")
         .map(|v| v.as_str().unwrap_or(""))
         .map(Some)
@@ -495,15 +539,15 @@ pub fn parse_submission(body: &Map<String, Value>) -> Result<RunSubmission, Subm
         run_id: run_id_for_error.clone(),
     })?;
 
-    let ack_deadline_ms = match body.get("ack_deadline_ms") {
+    let ack_deadline_ms = match args.get("ack_deadline_ms") {
         None | Some(Value::Null) => DEFAULT_ACK_DEADLINE_MS,
         Some(Value::Number(n)) => n.as_u64().ok_or_else(|| SubmissionError {
-            message: "`ack_deadline_ms` must be a non-negative integer".into(),
+            message: "`args.ack_deadline_ms` must be a non-negative integer".into(),
             run_id: run_id_for_error.clone(),
         })?,
         Some(other) => {
             return Err(SubmissionError {
-                message: format!("`ack_deadline_ms` must be a number; got {other}"),
+                message: format!("`args.ack_deadline_ms` must be a number; got {other}"),
                 run_id: run_id_for_error,
             });
         }
@@ -745,23 +789,64 @@ mod tests {
     #[test]
     fn parse_submission_default_ack_deadline() {
         let body = json!({
-            "kind": "reasoner-graph.run",
-            "run_id": "r1",
-            "graph": {"nodes": [{"id": "n1", "reasoner": "r"}], "edges": []}
+            "kind": "tool.invoke",
+            "id": "r1",
+            "name": "spawn_graph",
+            "args": {
+                "graph": {"nodes": [{"id": "n1", "reasoner": "r"}], "edges": []}
+            }
         });
         let sub = parse_submission(body.as_object().unwrap()).unwrap();
+        assert_eq!(sub.run_id, "r1");
         assert_eq!(sub.ack_deadline_ms, DEFAULT_ACK_DEADLINE_MS);
     }
 
     #[test]
     fn parse_submission_custom_ack_deadline() {
         let body = json!({
-            "kind": "reasoner-graph.run",
-            "run_id": "r1",
-            "graph": {"nodes": [{"id": "n1", "reasoner": "r"}], "edges": []},
-            "ack_deadline_ms": 250
+            "kind": "tool.invoke",
+            "id": "r1",
+            "name": "spawn_graph",
+            "args": {
+                "graph": {"nodes": [{"id": "n1", "reasoner": "r"}], "edges": []},
+                "ack_deadline_ms": 250
+            }
         });
         let sub = parse_submission(body.as_object().unwrap()).unwrap();
         assert_eq!(sub.ack_deadline_ms, 250);
+    }
+
+    #[test]
+    fn parse_submission_rejects_wrong_tool_name() {
+        let body = json!({
+            "kind": "tool.invoke",
+            "id": "r1",
+            "name": "not_spawn_graph",
+            "args": {
+                "graph": {"nodes": [{"id": "n1", "reasoner": "r"}], "edges": []}
+            }
+        });
+        let err = parse_submission(body.as_object().unwrap()).unwrap_err();
+        assert!(err.message.contains("spawn_graph"));
+        assert_eq!(err.run_id.as_deref(), Some("r1"));
+    }
+
+    #[test]
+    fn parse_submission_tolerates_unknown_envelope_fields() {
+        // Phase 3b reserves `graph_id` for recursive sub-agents; the
+        // parser must accept (and ignore) it, plus any other future
+        // additions to the canonical tool contract.
+        let body = json!({
+            "kind": "tool.invoke",
+            "id": "r1",
+            "name": "spawn_graph",
+            "graph_id": "outer-run-xyz",
+            "args": {
+                "graph": {"nodes": [{"id": "n1", "reasoner": "r"}], "edges": []}
+            }
+        });
+        let sub = parse_submission(body.as_object().unwrap())
+            .expect("unknown envelope fields must be ignored");
+        assert_eq!(sub.run_id, "r1");
     }
 }
