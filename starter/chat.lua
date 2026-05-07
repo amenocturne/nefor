@@ -272,8 +272,15 @@ local C = {
   status_ok       = "#87D787",  -- HL_STATUS_OK
   md_heading      = "#FFB86C",  -- HL_MD_HEADING (Dracula orange)
   md_code_fg      = "#C0C0C0",  -- HL_MD_CODE_INLINE / HL_MD_CODE_BLOCK fg
-  md_code_inline_bg = "#303030",
-  md_code_block_bg  = "#202020",
+  -- Code-block bg: a clearly-grey rectangle, not the near-black
+  -- #202020 the legacy spec carried — at low display contrast / on
+  -- terminals with a warm color profile the old value rendered as a
+  -- muddy brownish patch behind the glyphs (Bug A3 colour half).
+  -- #3a3a3a is light enough to read as 'grey rectangle' on every
+  -- profile while still sitting behind the C0C0C0 fg with comfortable
+  -- legibility (~7:1 contrast).
+  md_code_inline_bg = "#3a3a3a",
+  md_code_block_bg  = "#3a3a3a",
   footer          = "#707070",  -- HL_FOOTER
 }
 

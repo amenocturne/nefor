@@ -136,7 +136,22 @@ impl<'a> Walker<'a> {
             Event::End(tag) => self.end_tag(tag),
             Event::Text(t) => {
                 let s = self.current_inline_style();
-                self.emit_str(&t, s);
+                // Code-block lines get the full-rectangle treatment: pad
+                // every line out to `available_width` with code_block-
+                // styled spaces so the dark-grey background fills the
+                // whole row of cells, not just the cells the source
+                // text happened to occupy. Without this the painted
+                // bg only shows behind the chars themselves and the
+                // trailing whitespace of every line carries default
+                // (terminal-bg) styling — visually a brownish patch
+                // (terminal default bg blended with the dim glyph fg)
+                // that ends mid-row, instead of a clean rectangle
+                // (Bug A3 code block background).
+                if self.in_code_block && self.available_width.is_some() {
+                    self.emit_code_block_text(&t, s);
+                } else {
+                    self.emit_str(&t, s);
+                }
             }
             Event::Code(t) => {
                 let s = self.theme.and_then(|th| th.code).unwrap_or_default();
@@ -421,6 +436,56 @@ impl<'a> Walker<'a> {
 
     fn heading_style(&self, level: HeadingLevel) -> Option<Style> {
         self.heading_at(level).map(|hs| hs.style)
+    }
+
+    /// Emit text inside a fenced/indented code block, padding each line
+    /// to the caller's column budget with code_block-styled spaces so
+    /// the bg fills the full rectangle (Bug A3). Splits `s` on `\n`,
+    /// emits each line's chars verbatim with `style`, then emits enough
+    /// trailing spaces with the same style to reach `available_width`,
+    /// then the `\n` (also with the code_block style so any cell-level
+    /// behaviour that depends on the newline's style stays consistent
+    /// with the surrounding row).
+    fn emit_code_block_text(&mut self, s: &str, style: Style) {
+        let budget = self.available_width.unwrap_or(0);
+        if budget == 0 {
+            // Fallback: no column budget known, behave like the
+            // non-code-block path.
+            self.emit_str(s, style);
+            return;
+        }
+        let lines: Vec<&str> = s.split('\n').collect();
+        let last_idx = lines.len().saturating_sub(1);
+        for (i, line) in lines.iter().enumerate() {
+            // Count visual width of the line so the padding hits the
+            // right column count for wide chars (CJK / emoji); using
+            // `chars().count()` would under-pad when the line carries
+            // any width-2 glyph.
+            let mut w = 0usize;
+            for ch in line.chars() {
+                self.out.push(StyledChar { ch, style });
+                w += UnicodeWidthChar::width(ch).unwrap_or(0);
+            }
+            if w < budget {
+                for _ in 0..(budget - w) {
+                    self.out.push(StyledChar { ch: ' ', style });
+                }
+            }
+            // Emit a `\n` between lines; pulldown_cmark closes the
+            // block with a trailing newline already, so the last
+            // segment is typically empty — don't add an extra `\n`.
+            if i < last_idx {
+                self.out.push(StyledChar {
+                    ch: '\n',
+                    style: Style::default(),
+                });
+                self.at_line_start = true;
+            } else {
+                // Track whether we landed at a line boundary so the
+                // surrounding block-separator logic keeps working.
+                self.at_line_start = line.is_empty();
+            }
+        }
     }
 
     fn emit_str(&mut self, s: &str, style: Style) {
@@ -922,6 +987,54 @@ mod tests {
         let r = render_to_styled_chars("```\nx = 1\n```", Some(&theme));
         let x = r.iter().find(|c| c.ch == 'x').expect("x present");
         assert_eq!(x.style.fg, Some(Color::Indexed(244)));
+    }
+
+    /// Bug A3: code-block lines must pad out to `available_width` with
+    /// code_block-styled spaces so the bg fills a full rectangle, not
+    /// just the cells the source occupies. Without the pad the dark
+    /// bg ends mid-row and the rest of every row carries the
+    /// terminal-default bg — visible as a brownish patch ending mid-
+    /// line on warm-profile terminals.
+    #[test]
+    fn code_block_pads_each_line_to_available_width_with_themed_bg() {
+        let cb = Style {
+            fg: Some(Color::Indexed(7)),
+            bg: Some(Color::Indexed(238)),
+            ..Style::default()
+        };
+        let theme = MarkdownTheme {
+            code_block: Some(cb),
+            ..MarkdownTheme::default()
+        };
+        // Width budget = 20; 'x = 1' is 5 cells, expect 15 trailing
+        // padding cells with the same code_block bg style.
+        let r = super::render_to_styled_chars("```\nx = 1\n```", Some(&theme), Some(20));
+        // Find the row of 'x = 1' chars; everything from `x` until the
+        // next `\n` should carry code_block bg, including the pad.
+        let mut started = false;
+        let mut bg_run = 0usize;
+        for sc in &r {
+            if sc.ch == 'x' {
+                started = true;
+            }
+            if !started {
+                continue;
+            }
+            if sc.ch == '\n' {
+                break;
+            }
+            assert_eq!(
+                sc.style.bg,
+                Some(Color::Indexed(238)),
+                "every cell on the code-block row must carry the bg, including padding"
+            );
+            bg_run += 1;
+        }
+        // 'x = 1' = 5 chars + 15 padding = 20 cells total.
+        assert_eq!(
+            bg_run, 20,
+            "code-block row should cover the full 20-column width budget"
+        );
     }
 
     #[test]
