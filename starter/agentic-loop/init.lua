@@ -474,9 +474,18 @@ local function handle_tool_result_run_close(run_id, body)
     -- chat transcript. We pick `chat.message.append` because it goes
     -- through the same persist+replay path as any other transcript
     -- entry; render shape is plain text with a system style.
+    -- Header line names the source so the user reads the system block
+    -- as "this is the result that came back from the sub-graph" rather
+    -- than ambiguous italicised text. Symmetric with the error path's
+    -- "[spawn_graph errored] ..." prefix.
     local visible_text
     if effective_status == "success" then
-      visible_text = tostring(completion.output or "")
+      local body = tostring(completion.output or "")
+      if #body == 0 then
+        visible_text = "[spawn_graph result] (empty)"
+      else
+        visible_text = "[spawn_graph result]\n" .. body
+      end
     else
       visible_text = "[spawn_graph errored] " ..
                      tostring(completion.error or "unknown error")
