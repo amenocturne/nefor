@@ -400,87 +400,144 @@ local function handle_engine_envelope(decoded)
 end
 
 -- ------------------------------------------------------------------
--- public entry point: invoke_from_plugin (broker → Lua, inbound lines)
+-- public entry points: invoke_from_plugin / invoke_from_plugin_batch
+-- (broker → Lua, inbound lines)
 -- ------------------------------------------------------------------
+--
+-- The broker's stdin reader hands inbound lines to Lua either one at a
+-- time (`invoke_from_plugin`) or as a per-peer per-tick batch
+-- (`invoke_from_plugin_batch`). The single-payload form is preserved for
+-- test harnesses that drive synthetic inbound traffic; the batched form
+-- is what production calls.
+--
+-- Batching matters when a peer bursts multiple lines into stdin between
+-- broker dispatch ticks (replay flush, streaming-delta storms, rapid
+-- tool-result fan-in). All event envelopes from the same peer in the
+-- same tick coalesce into a single `from_plugin(envs)` invocation,
+-- mirroring the outbound-side `to_plugin(envs)` shape from Phase A. The
+-- wrapper amortises translation work across the batch.
+--
+-- System messages still fire individually (they have framework
+-- semantics — handshake, replay-on-attach — that don't compose into a
+-- batch).
 
-function M.invoke_from_plugin(source, raw_payload)
-  if type(source) ~= "string" or source == "" then return end
-  if type(raw_payload) ~= "string" then return end
+-- Decode + classify a single payload. Returns one of:
+--   { kind = "drop" }                 -- malformed, error already delivered
+--   { kind = "system", body = ... }   -- caller forwards to handle_system
+--   { kind = "event",  env  = ... }   -- caller batches into envs
+local function classify_inbound_payload(source, raw_payload)
+  if type(raw_payload) ~= "string" then
+    return { kind = "drop" }
+  end
 
   local decoded, decode_err = try_decode(raw_payload)
   if decode_err ~= nil then
     deliver_error(source, "malformed_envelope",
       "payload is not valid JSON: " .. decode_err)
-    return
+    return { kind = "drop" }
   end
   if type(decoded) ~= "table" then
     deliver_error(source, "malformed_envelope",
       "payload is not a JSON object")
-    return
+    return { kind = "drop" }
   end
 
   local t = decoded.type
   if t == "system" then
-    -- For replay-on-attach, the framework needs the current bus log to
-    -- walk it. The Lua side reads it back via the dispatch hook's
-    -- argument; from this entry-point we only have the broker-supplied
-    -- payload. Use `_current_log_ref` (set by `M.dispatch` on the most
-    -- recent invocation) — it's a stable ref in the Lua VM.
-    local cl = M._current_log_ref or {}
-    handle_system(source, decoded.body, cl)
-    return
+    return { kind = "system", body = decoded.body }
   end
 
   if t == "event" then
     if type(decoded.body) ~= "table" then
       deliver_error(source, "body_not_object",
         "event body must be a JSON object")
-      return
+      return { kind = "drop" }
     end
     -- Drop events from non-ready plugins.
     if not ready_plugins[source] then
       deliver_error(source, "malformed_envelope",
         "received event before 'ready' handshake completed")
-      return
+      return { kind = "drop" }
     end
 
     local from = (type(decoded.from) == "string") and decoded.from or source
-    local env = {
-      type = decoded.type,
-      from = from,
-      body = decoded.body,
+    return {
+      kind = "event",
+      env = {
+        type = decoded.type,
+        from = from,
+        body = decoded.body,
+      },
     }
-
-    local hook = plugin_transforms[source] and plugin_transforms[source].from_plugin
-    if hook then
-      -- Batched contract: hook receives a list of envelopes per
-      -- invocation. The broker hands us one inbound line at a time, so
-      -- this list is single-element; wrappers iterate the list the same
-      -- way they would for a multi-element batch.
-      local ok, err = pcall(hook, { env })
-      if not ok then
-        deliver_error(source, "transform_error",
-          "from_plugin callback raised: " .. tostring(err))
-      end
-      return
-    end
-
-    -- Default callback: publish the envelope verbatim onto the bus via
-    -- `send` (broadcast). Wrappers without an explicit `from_plugin`
-    -- behave as identity passthrough — same effective behavior as the
-    -- pre-refactor "no from_plugin transform" path.
-    local payload = encode({
-      type = "event",
-      from = from,
-      ts   = nefor.engine.now(),
-      body = decoded.body,
-    })
-    nefor.engine.send(payload)
-    return
   end
 
   deliver_error(source, "malformed_envelope",
     "envelope 'type' must be 'system' or 'event'")
+  return { kind = "drop" }
+end
+
+-- Hand a per-peer batch of decoded event envelopes to the wrapper's
+-- `from_plugin(envs)` callback (single invocation), or the framework
+-- default (per-envelope `send`). Matches the outbound `to_plugin(envs)`
+-- shape from Phase A.
+local function deliver_event_batch_from(source, envs)
+  if #envs == 0 then return end
+
+  local hook = plugin_transforms[source] and plugin_transforms[source].from_plugin
+  if hook then
+    local ok, err = pcall(hook, envs)
+    if not ok then
+      deliver_error(source, "transform_error",
+        "from_plugin callback raised: " .. tostring(err))
+    end
+    return
+  end
+
+  -- Default callback: publish each envelope verbatim onto the bus via
+  -- `send` (broadcast). Wrappers without an explicit `from_plugin`
+  -- behave as identity passthrough.
+  for _, env in ipairs(envs) do
+    nefor.engine.send(encode({
+      type = "event",
+      from = env.from,
+      ts   = nefor.engine.now(),
+      body = env.body,
+    }))
+  end
+end
+
+function M.invoke_from_plugin(source, raw_payload)
+  if type(source) ~= "string" or source == "" then return end
+  M.invoke_from_plugin_batch(source, { raw_payload })
+end
+
+function M.invoke_from_plugin_batch(source, raw_payloads)
+  if type(source) ~= "string" or source == "" then return end
+  if type(raw_payloads) ~= "table" then return end
+  if #raw_payloads == 0 then return end
+
+  local cl = M._current_log_ref or {}
+  local envs = {}
+
+  for _, raw in ipairs(raw_payloads) do
+    local c = classify_inbound_payload(source, raw)
+    if c.kind == "system" then
+      -- System messages keep their per-envelope framework semantics
+      -- (handshake, replay-on-attach). Flush any accumulated events
+      -- before handling so cross-message ordering is preserved within
+      -- a single peer's batch.
+      if #envs > 0 then
+        deliver_event_batch_from(source, envs)
+        envs = {}
+      end
+      handle_system(source, c.body, cl)
+    elseif c.kind == "event" then
+      envs[#envs + 1] = c.env
+    end
+    -- "drop" classifications already emitted their error reply.
+  end
+
+  deliver_event_batch_from(source, envs)
 end
 
 -- ------------------------------------------------------------------
