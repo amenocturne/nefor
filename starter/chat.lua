@@ -2598,6 +2598,14 @@ local function update(msg, state)
       -- echo doesn't get eaten by the first marker.
       pending_user_echo = text,
     })
+    -- Re-pin the transcript to the bottom: stick_to = "end" only
+    -- auto-follows new content while `was_at_end` is true, so a user
+    -- who scrolled up to read older context and submits a new prompt
+    -- would otherwise stay parked mid-transcript watching their fresh
+    -- message + the incoming response render off-screen below the
+    -- viewport. scroll_into_view flips the flag on the next paint so
+    -- the auto-follow re-engages for the streaming response too.
+    tui.scroll_into_view("transcript")
     return cleared, {
       { kind = "send_to", target = "engine",
         body = { kind = "chat.input.submit", text = text } },

@@ -3547,6 +3547,111 @@ fn popup_paints_opaque_background_over_transcript() {
 }
 
 /// `/clear` is an alias for `/new`. Same egress, same lifecycle expectations.
+/// Submitting a chat message must re-pin the transcript to the bottom
+/// even when the user had scrolled up to read older context. Without
+/// this, `stick_to = "end"` only auto-follows new content while
+/// `was_at_end` is still true; once the user wheels up, the flag
+/// clears and a subsequent submit (Enter) leaves the viewport parked
+/// where it was — the user's fresh message + the streaming response
+/// render below the visible area until the user scrolls down manually.
+/// The submit reducer fires `tui.scroll_into_view("transcript")` so
+/// the next paint snaps to the new bottom and re-engages auto-follow
+/// for the streaming response that lands after.
+#[test]
+fn submit_re_pins_transcript_to_bottom_after_user_scrolled_up() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Pump enough content that the transcript has somewhere to scroll
+    // away from. Auto-scroll keeps it pinned to the bottom while
+    // entries arrive.
+    for _ in 0..40 {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "chat.message.append", "role": "user", "text": "x" }),
+        );
+    }
+    let _ = render_str(&mut engine);
+
+    fn read_offset(engine: &mut Engine, key: &str) -> u16 {
+        let lua = engine.lua();
+        let chunk = format!(
+            r#"
+            local p = tui.scroll_position("{key}")
+            return p and p.offset or -1
+            "#
+        );
+        let v: i64 = lua
+            .load(chunk.as_str())
+            .eval()
+            .expect("scroll_position eval");
+        if v < 0 {
+            panic!("no scroll_position for `{key}`");
+        }
+        v as u16
+    }
+    fn read_max(engine: &mut Engine, key: &str) -> u16 {
+        let lua = engine.lua();
+        let chunk = format!(
+            r#"
+            local p = tui.scroll_position("{key}")
+            return p and p.max or -1
+            "#
+        );
+        let v: i64 = lua
+            .load(chunk.as_str())
+            .eval()
+            .expect("scroll_position eval");
+        if v < 0 {
+            panic!("no scroll_position for `{key}`");
+        }
+        v as u16
+    }
+
+    let pinned = read_offset(&mut engine, "transcript");
+    let max_before = read_max(&mut engine, "transcript");
+    assert_eq!(
+        pinned, max_before,
+        "auto-scroll prereq: transcript should be at bottom after 40 entries"
+    );
+
+    // User scrolls up (Up arrow with focused single-line input bubbles
+    // to scroll_by("transcript", -1)).
+    for _ in 0..5 {
+        engine.handle_key(key("up")).expect("up");
+    }
+    let _ = render_str(&mut engine);
+    let after_scroll_up = read_offset(&mut engine, "transcript");
+    assert!(
+        after_scroll_up < pinned,
+        "test prereq: arrow-up should move the transcript away from the bottom"
+    );
+
+    // Type + submit. The stick_to = end auto-follow is dormant now
+    // because was_at_end is false; the submit reducer must explicitly
+    // re-pin via scroll_into_view.
+    for ch in "hi".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = render_str(&mut engine);
+
+    let after_submit = read_offset(&mut engine, "transcript");
+    let max_after = read_max(&mut engine, "transcript");
+    assert_eq!(
+        after_submit, max_after,
+        "submit must re-pin transcript to the bottom (offset={after_submit}, max={max_after})"
+    );
+    // And the new bottom must be past the prior bottom (the user's
+    // message added a new row), so we're not just lucking into the
+    // pre-submit offset.
+    assert!(
+        max_after > max_before,
+        "user message should have grown content height past max_before={max_before}, got max_after={max_after}"
+    );
+}
+
 #[test]
 fn slash_clear_is_alias_for_slash_new() {
     let mut engine = Engine::new(80, 24).expect("engine");
