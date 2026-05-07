@@ -175,12 +175,39 @@ local function pick_response_for(chat_id)
   -- Find the most recent user message and detect whether a tool message
   -- has landed (chat-orchestrator wrap node, second turn).
   local last_user
+  local last_user_idx
   local last_tool
+  local last_tool_idx
   for i = #history, 1, -1 do
     local m = history[i]
-    if m.role == "tool" and not last_tool then last_tool = m.content end
-    if m.role == "user" and not last_user then last_user = m.content end
+    if m.role == "tool" and not last_tool then
+      last_tool = m.content
+      last_tool_idx = i
+    end
+    if m.role == "user" and not last_user then
+      last_user = m.content
+      last_user_idx = i
+    end
   end
+
+  -- A tool message is "pending relay" only when it's MORE RECENT than
+  -- the latest user message — i.e. a tool result just landed and we
+  -- should respond to it. If the user has spoken since (next-turn
+  -- after a prior spawn_graph completed), last_tool is stale chat
+  -- history; pattern-match the new user input instead. Without this
+  -- gate, every turn in a chat that ever ran spawn_graph falls into
+  -- the SUBMITTED_ACK_MARKER branch because chat_id (and therefore
+  -- mock-side history) persists across orchestrator runs for
+  -- conversation continuity.
+  local tool_is_pending_relay
+  if last_tool_idx == nil then
+    tool_is_pending_relay = false
+  elseif last_user_idx == nil then
+    tool_is_pending_relay = true
+  else
+    tool_is_pending_relay = last_tool_idx > last_user_idx
+  end
+  if not tool_is_pending_relay then last_tool = nil end
 
   -- ----------------------------------------------------------------
   -- 1. Deferred-result branch (async spawn_graph). MUST stay first —
