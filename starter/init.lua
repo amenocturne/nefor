@@ -81,8 +81,8 @@ actor.spawn(require("nefor-combinators"))
 -- earlier than expected nothing is lost.
 local agentic_loop = require("agentic-loop")
 agentic_loop.configure {
-  provider = cfg.provider.name,
-  model    = cfg.provider.model,
+  provider = cfg.default_provider,
+  model    = cfg.default_model,
   system   = [[
 You are a helpful assistant. Use the `spawn_graph` tool for parallel decomposition tasks (multiple independent sub-questions to combine).
 
@@ -103,38 +103,41 @@ actor.spawn(agentic_loop)
 actor.spawn(require("reasoners"))
 
 -------------------------------------------------------------------------
--- 3b. Provider — selected by config.lua (prod = openai-provider, test = mock).
+-- 3b. Providers — every entry in cfg.providers is spawned. The picker
+--     aggregates connected providers via auth.status; no hard-coded
+--     test/prod switch.
 -------------------------------------------------------------------------
 
-local PROVIDER_NAME  = cfg.provider.name
-local PROVIDER_MODEL = cfg.provider.model
-
-if cfg.plugins.spawn_mock then
-  actor.spawn(require("mock-plugin").spawn_spec(
-    PROVIDER_NAME,
-    {
-      require("config").bin("mock-plugin"),
-      "--script", STARTER_ROOT .. "/" .. cfg.provider.mock_script,
+for _, p in ipairs(cfg.providers or {}) do
+  if p.kind == "mock" then
+    actor.spawn(require("mock-plugin").spawn_spec(
+      p.name,
+      {
+        require("config").bin("mock-plugin"),
+        "--script", STARTER_ROOT .. "/" .. p.mock_script,
+      }
+    ))
+  elseif p.kind == "openai" then
+    local provider_command = {
+      require("config").bin("openai-provider"),
+      "--name",     p.name,
+      "--base-url", p.base_url,
     }
-  ))
-else
-  local provider_command = {
-    require("config").bin("openai-provider"),
-    "--name",     PROVIDER_NAME,
-    "--base-url", cfg.provider.base_url,
-  }
-  if PROVIDER_MODEL then
-    table.insert(provider_command, "--model")
-    table.insert(provider_command, PROVIDER_MODEL)
+    if p.model then
+      table.insert(provider_command, "--model")
+      table.insert(provider_command, p.model)
+    end
+    for _, a in ipairs(p.extra_args or {}) do
+      table.insert(provider_command, a)
+    end
+    actor.spawn(require("openai-provider").spawn_spec(
+      p.name,
+      provider_command,
+      { static_token = p.static_token }
+    ))
+  else
+    error("starter/init.lua: unknown provider kind: " .. tostring(p.kind))
   end
-  for _, a in ipairs(cfg.provider.extra_args or {}) do
-    table.insert(provider_command, a)
-  end
-  actor.spawn(require("openai-provider").spawn_spec(
-    PROVIDER_NAME,
-    provider_command,
-    { static_token = cfg.provider.static_token }
-  ))
 end
 
 -------------------------------------------------------------------------

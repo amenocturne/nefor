@@ -1,8 +1,9 @@
 -- starter/mock_provider.lua — script for mock-plugin to impersonate an
 -- openai-provider for deterministic smoke testing of the spawn_graph
 -- pipeline AND a self-documenting interactive test machine for
--- developers who launch `nefor --config ./starter` (NEFOR_CONFIG=test
--- is the default — see config.lua).
+-- developers who launch `nefor --config ./starter`. Spawns alongside
+-- the openai-provider/ollama instance unconditionally; both register
+-- on the bus and show up in the /model picker (see config.lua).
 --
 -- Speaks the same wire shape as openai-provider:
 --   <name>.chat.create  { chat_id, model? }
@@ -508,12 +509,9 @@ local STREAM_PACE_SECONDS     = 0.05
 
 -- Skip pacing under tests — agentic_cli_mock_e2e fires several
 -- scenarios with a 10s wall-clock cap and the long-stream regression
--- already exercises a deliberate slow path. Activated by the same
--- NEFOR_CONFIG=test env the cli-config harness uses; interactive
--- launches with NEFOR_CONFIG=test still get pacing because the mock
--- runs as its own subprocess and inherits the parent's env (the cli
--- harness sets NEFOR_TEST_FAST_MOCK=1 explicitly to opt into instant
--- streaming).
+-- already exercises a deliberate slow path. The cli harness sets
+-- NEFOR_TEST_FAST_MOCK=1 explicitly to opt into instant streaming;
+-- interactive launches don't, so they see paced output.
 local function pacing_enabled()
   local v = os.getenv("NEFOR_TEST_FAST_MOCK")
   return not (v == "1" or v == "true")
@@ -594,6 +592,11 @@ nefor.on_ready_ok(function()
   -- Synthetic `<name>.hello { model = ... }` so chat_orchestrator's
   -- adapter learns the model name. Mirrors openai-provider's hello.
   nefor.emit("hello", { model = "mock-model" })
+  -- Announce auth state so the chat reducer marks this provider
+  -- "connected" — the /model picker fans out a list_requested per
+  -- connected provider, so without this the mock would be invisible
+  -- in the picker. Mock has no auth; "connected" is permanent.
+  nefor.emit("auth.status", { state = "connected" })
 end)
 
 nefor.on(NAME .. ".chat.create", function(body)
@@ -717,7 +720,27 @@ end)
 -- The auth dance — chat_orchestrator's openai_provider_adapter expects
 -- to inject a static_token via `<name>.auth.set` after seeing
 -- `<name>.ready`. Mock has no auth, but we acknowledge the set so the
--- adapter doesn't think auth failed.
+-- adapter doesn't think auth failed. Re-affirm "connected" because the
+-- ready-time emit is synchronous with handshake; the `auth.set` here
+-- arrives later from the wrapper's static-token injection.
 nefor.on(NAME .. ".auth.set", function(_body)
-  nefor.emit("auth.status", { state = "ready" })
+  nefor.emit("auth.status", { state = "connected" })
+end)
+
+-- /model picker discovery. The TUI fans out one
+-- `chat.model.list_requested { provider }` per connected provider when
+-- the user opens the picker; the wrapper translates that to
+-- `<NAME>.models.list_requested`. We answer with a single-model list.
+nefor.on(NAME .. ".models.list_requested", function(_body)
+  nefor.emit("models.listed", { models = { "mock-model" } })
+end)
+
+-- /model <name> selection. Mock has only one model; whatever model the
+-- user picks we ack back unchanged so chat.lua's reducer records the
+-- selection. The wrapper translates `<NAME>.model.set_ack` →
+-- `chat.model.set_ack { provider, model }`.
+nefor.on(NAME .. ".model.set", function(body)
+  local model = body and body.model
+  if type(model) ~= "string" or model == "" then return end
+  nefor.emit("model.set_ack", { model = model })
 end)
