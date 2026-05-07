@@ -23,7 +23,9 @@ use crate::mouse::{
 };
 use crate::reconciler::Reconciler;
 use crate::render::{extract_selection_text, Renderer};
-use crate::scrollable::{scroll_by_signed, WHEEL_STEP_ROWS};
+use crate::scrollable::{
+    scroll_by_signed, DRAG_AUTO_SCROLL_EDGE_ROWS, DRAG_AUTO_SCROLL_STEP, WHEEL_STEP_ROWS,
+};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 thread_local! {
@@ -78,6 +80,15 @@ pub struct Engine {
     /// `true` between `Down(left)` and the matching `Up(left)`. Drives
     /// the renderer's highlight pass and gates `Drag` updates.
     selecting: bool,
+    /// Key of the scrollable that was under the cursor on the initial
+    /// `Down(left)` of the in-flight selection. While the user drags
+    /// past the top or bottom edge of that scrollable's painted rect,
+    /// `handle_mouse` bumps its `scroll_y` so the selection can extend
+    /// beyond the viewport (browser-style auto-scroll). `None` when no
+    /// drag is in progress, when the click landed outside any scrollable,
+    /// or when the scrollable has no `key` for re-resolution on the next
+    /// reconcile.
+    selection_scroll_key: Option<String>,
 }
 
 impl Engine {
@@ -97,6 +108,7 @@ impl Engine {
             selection_start: None,
             selection_end: None,
             selecting: false,
+            selection_scroll_key: None,
         })
     }
 
@@ -493,6 +505,31 @@ impl Engine {
                 self.selection_start = Some((evt.x, evt.y));
                 self.selection_end = None;
                 self.selecting = false;
+                // Capture the keyed scrollable under the cursor (deepest
+                // wins, matching the wheel-routing path). On subsequent
+                // `Drag` events past the rect's edge we re-resolve by key
+                // and bump its `scroll_y` so the selection can extend
+                // past the viewport — see `auto_scroll_for_drag` below.
+                // No keyed scrollable under cursor → drag-auto-scroll
+                // stays inert (selection still works inside the visible
+                // rows, just no follow-the-cursor scroll).
+                self.selection_scroll_key = self
+                    .reconciler
+                    .root
+                    .as_ref()
+                    .and_then(|root| find_scrollable_path(root, evt.x, evt.y))
+                    .and_then(|path| {
+                        // Re-walk for the user_key — `find_scrollable_path`
+                        // returns the path regardless of whether the
+                        // scrollable is keyed; auto-scroll needs the key
+                        // to re-resolve under the next reconcile.
+                        let root = self.reconciler.root.as_ref()?;
+                        let mut cur = root;
+                        for &i in &path {
+                            cur = cur.children.get(i)?;
+                        }
+                        cur.last_desc.user_key().map(|s| s.to_string())
+                    });
                 // Fall through — the click still bubbles as `mouse.click`
                 // so Lua-side click handlers (e.g. button hit-test) keep
                 // working alongside the selection mechanism.
@@ -501,6 +538,7 @@ impl Engine {
                 if self.selection_start.is_some() {
                     self.selection_end = Some((evt.x, evt.y));
                     self.selecting = true;
+                    self.auto_scroll_for_drag(evt.x, evt.y);
                     self.needs_render = true;
                 }
                 // Drag is consumed by the selection mechanism; it does
@@ -564,6 +602,7 @@ impl Engine {
         self.selection_start = None;
         self.selection_end = None;
         self.selecting = false;
+        self.selection_scroll_key = None;
         self.needs_render = true;
 
         if !was_selecting {
@@ -591,6 +630,63 @@ impl Engine {
         end_t.set("y", end.1)?;
         msg.set("end", end_t)?;
         self.dispatch_msg(msg)
+    }
+
+    /// Auto-scroll the captured drag-origin scrollable when the cursor
+    /// hovers near (or past) the edge of its painted rect. Standard
+    /// editor / browser behaviour: dragging text past the viewport
+    /// extends the selection AND nudges the content along.
+    ///
+    /// Implementation: single-tick-per-`Drag`-event. Each fresh `Drag`
+    /// event past the edge advances `scroll_y` by `DRAG_AUTO_SCROLL_STEP`
+    /// rows, clamped against the scrollable's cached geometry. If the
+    /// user holds the cursor still past the edge without further mouse
+    /// movement the scroll halts — terminals deliver no `Drag` events
+    /// while the cursor sits motionless. A continuous-tick variant
+    /// would need to ride the existing 60Hz animation loop and hold a
+    /// "scroll_in_direction" latch; we deferred that to keep this v1
+    /// localised to `handle_mouse` (no engine-loop changes required).
+    /// The user-visible cost is needing to wiggle the cursor for very
+    /// long selections, which is the same fallback browsers expose
+    /// when their continuous-scroll timer ticks at a low rate.
+    ///
+    /// The selection range stays in absolute terminal cells (the existing
+    /// model), but as `scroll_y` changes the cells *under* the highlight
+    /// re-paint with new transcript content — so the highlighted region
+    /// grows naturally as the user drags past the edge, matching what a
+    /// human expects from "select past the bottom of the visible area".
+    fn auto_scroll_for_drag(&mut self, _x: u16, y: u16) {
+        let Some(key) = self.selection_scroll_key.clone() else {
+            return;
+        };
+        let Some(root) = self.reconciler.root.as_mut() else {
+            return;
+        };
+        let Some(path) = find_scrollable_by_key(root, &key) else {
+            return;
+        };
+        let Some(target) = mouse_instance_at_path(root, &path) else {
+            return;
+        };
+        // Read painted rect (immutable reflection of the last layout).
+        let Some(rect) = target.layout.painted_rect else {
+            return;
+        };
+        // Edge zones: rows within `DRAG_AUTO_SCROLL_EDGE_ROWS` of the top
+        // or bottom of the rect trigger a scroll. Past the rect entirely
+        // also triggers (the natural "drag way past the bottom" case).
+        let top = rect.row;
+        let bottom = rect.row.saturating_add(rect.height);
+        let delta: i32 = if y < top.saturating_add(DRAG_AUTO_SCROLL_EDGE_ROWS) {
+            -(DRAG_AUTO_SCROLL_STEP as i32)
+        } else if y >= bottom.saturating_sub(DRAG_AUTO_SCROLL_EDGE_ROWS) {
+            DRAG_AUTO_SCROLL_STEP as i32
+        } else {
+            return;
+        };
+        if let InstanceState::Scrollable(s) = &mut target.state {
+            scroll_by_signed(s, delta);
+        }
     }
 
     /// Attempt to absorb a wheel event into a scrollable under the

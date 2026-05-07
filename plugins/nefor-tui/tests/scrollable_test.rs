@@ -134,6 +134,209 @@ fn home_jumps_to_top_via_scroll_to() {
 }
 
 #[test]
+fn drag_past_bottom_edge_auto_scrolls_transcript_down() {
+    // Standard editor / browser behaviour: when the user drags a text
+    // selection past the bottom of the visible region, the transcript
+    // auto-scrolls so the selection can extend beyond the viewport. Each
+    // fresh `Drag` event whose y lies in (or past) the bottom edge zone
+    // advances `scroll_y` by `DRAG_AUTO_SCROLL_STEP` (1 row).
+    //
+    // Scrollable scenario: 30 rows of `row N` content in a 7-row viewport
+    // (40×8 frame, top row is the "offset:" label). Pinned-to-bottom on
+    // first paint → visible rows 24..30. After a wheel-up step (3 rows),
+    // scroll_y = 20 → visible rows 21..27. The mouse-down at (2, 4) lands
+    // inside the scrollable's painted rect (rows 1..7); the captured
+    // scrollable key is `log`. Each subsequent `Drag` past y=7 (the rect's
+    // last visible row, in the edge zone) advances scroll_y by 1.
+    let mut engine = Engine::new(40, 8).expect("engine");
+    engine.load_scenario(SCROLLABLE_SCENARIO).expect("scenario");
+    let _ = render_str(&mut engine);
+
+    // Wheel-up so we're not pinned at the bottom — gives us headroom in
+    // both directions for the assertion. Initial scroll_y_max = 30 - 7 =
+    // 23, wheel-up by 3 lands at scroll_y = 20.
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Wheel,
+            x: 1,
+            y: 4,
+            button: Some("up"),
+            mods: vec![],
+        })
+        .expect("wheel-up");
+    let pre = render_str(&mut engine);
+    assert!(
+        pre.contains("offset: 20"),
+        "expected wheel-up to put us at offset 20 before the drag; got:\n{pre}"
+    );
+    // Pre-drag visible window: rows 21..27. row 27 is the last visible
+    // line, row 28 is the next row that should come into view as we
+    // auto-scroll.
+    assert!(
+        pre.contains("row 27"),
+        "pre-drag frame should show row 27 as bottom of viewport:\n{pre}"
+    );
+    assert!(
+        !pre.contains("row 28"),
+        "pre-drag frame should NOT yet show row 28:\n{pre}"
+    );
+
+    // Click inside the scrollable rect (rows 1..7) — captures `log` as
+    // the drag-origin scrollable. Drag past the bottom of the rect (y
+    // beyond row 7) — past-the-edge triggers auto-scroll-down.
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Click,
+            x: 2,
+            y: 4,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("click");
+    // Five drag events past the bottom — each advances scroll_y by 1
+    // (DRAG_AUTO_SCROLL_STEP). After five: scroll_y = 25, visible
+    // rows 26..32, which is clamped against scroll_y_max = 23 → wait,
+    // actually 20 + 5 = 25 but max is 23, so two of those clamp. Net
+    // visible after clamp: scroll_y = 23, rows 24..30. row 30 is the
+    // very last; the assertion below uses row 28 which is well clear
+    // of the edge case.
+    for _ in 0..5 {
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Drag,
+                x: 2,
+                // y past the rect (rect bottom row is 7); 10 is comfortably
+                // past so we don't depend on the edge-zone constant.
+                y: 10,
+                button: Some("left"),
+                mods: vec![],
+            })
+            .expect("drag-down");
+    }
+    // No `Up` — we want to observe the in-flight scroll.
+    let mid = render_str(&mut engine);
+    // row 28 should now be visible — the transcript scrolled down to
+    // follow the drag.
+    assert!(
+        mid.contains("row 28"),
+        "drag past the bottom edge should auto-scroll the transcript down to bring row 28 into view; got:\n{mid}"
+    );
+    // Sanity: row 21 (which WAS visible pre-drag) should now be gone.
+    assert!(
+        !mid.contains("row 21"),
+        "drag-down should have scrolled past row 21:\n{mid}"
+    );
+
+    // Now drag back UP past the top edge (rect top is row 1) — each
+    // event retreats scroll_y by 1.
+    for _ in 0..10 {
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Drag,
+                x: 2,
+                // y above the rect entirely (rect top is row 1); y=0
+                // is past the top.
+                y: 0,
+                button: Some("left"),
+                mods: vec![],
+            })
+            .expect("drag-up");
+    }
+    let post = render_str(&mut engine);
+    // After drag-down clamp at scroll_y=23 then 10× drag-up: scroll_y =
+    // max(23 - 10, 0) = 13. Visible rows 14..20.
+    assert!(
+        post.contains("row 14"),
+        "drag past the top edge should auto-scroll the transcript up; row 14 expected in view, got:\n{post}"
+    );
+    // row 28 (visible mid-drag) should be gone again.
+    assert!(
+        !post.contains("row 28"),
+        "drag-up should have left row 28 behind:\n{post}"
+    );
+
+    // Release — clears the in-flight selection and the captured
+    // drag-origin scrollable key. Subsequent Drag events with no
+    // active selection are silent no-ops on the auto-scroll path.
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Up,
+            x: 2,
+            y: 0,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("up");
+}
+
+#[test]
+fn drag_inside_viewport_does_not_auto_scroll() {
+    // Sanity: while the drag-y stays inside the scrollable's painted
+    // rect AND outside the edge zone, scroll_y does not change. The
+    // selection still extends, but the transcript stays put.
+    let mut engine = Engine::new(40, 8).expect("engine");
+    engine.load_scenario(SCROLLABLE_SCENARIO).expect("scenario");
+    let _ = render_str(&mut engine);
+    // Wheel-up to leave the bottom-pin so a stray scroll would be
+    // observable through the offset text.
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Wheel,
+            x: 1,
+            y: 4,
+            button: Some("up"),
+            mods: vec![],
+        })
+        .expect("wheel-up");
+    let pre = render_str(&mut engine);
+    assert!(
+        pre.contains("offset: 20"),
+        "expected offset 20 pre-drag; got:\n{pre}"
+    );
+    let pre_snap = engine.snapshot();
+
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Click,
+            x: 2,
+            y: 4,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("click");
+    // y=3,4,5 — all comfortably inside the rect (rows 1..7) and outside
+    // both edge zones (top edge ≤ 1, bottom edge ≥ 6).
+    for y in [3, 4, 5] {
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Drag,
+                x: 2,
+                y,
+                button: Some("left"),
+                mods: vec![],
+            })
+            .expect("drag-mid");
+    }
+    let post = render_str(&mut engine);
+    let post_snap = engine.snapshot();
+    // No offset change — the offset text only updates via on_scroll
+    // (wheel path), but if the auto-scroll path bumped scroll_y the
+    // visible row range would shift. Compare snapshots: the row content
+    // must be identical pre vs post.
+    let extract_rows = |snap: &str| -> Vec<String> {
+        snap.lines()
+            .filter(|l| l.contains("row "))
+            .map(|s| s.to_string())
+            .collect()
+    };
+    assert_eq!(
+        extract_rows(&pre_snap),
+        extract_rows(&post_snap),
+        "drag inside viewport must not move scroll_y; pre:\n{pre}\npost:\n{post}"
+    );
+}
+
+#[test]
 fn end_jumps_to_bottom_via_scroll_into_view() {
     let mut engine = Engine::new(40, 8).expect("engine");
     engine.load_scenario(SCROLLABLE_SCENARIO).expect("scenario");

@@ -74,6 +74,21 @@ pub enum StickTo {
 /// Default rows-per-wheel-notch (matches the legacy chat plugin's choice).
 pub const WHEEL_STEP_ROWS: u16 = 3;
 
+/// Rows the auto-scroll-while-dragging path advances per fresh `Drag`
+/// event past (or near) the edge. One row keeps the scroll smooth
+/// relative to mouse movement: a 30-row drag past the bottom advances
+/// `scroll_y` by ~30, which in chat / transcript surfaces matches the
+/// natural "selection follows the cursor as content scrolls into view".
+pub const DRAG_AUTO_SCROLL_STEP: u16 = 1;
+
+/// Edge zone (in rows from the top / bottom of the painted rect) where
+/// a `Drag` event triggers an auto-scroll tick. `0` would only trigger
+/// past the rect entirely (a strict "past-the-edge" interpretation);
+/// `1` matches what browsers expose — drag onto the last visible row
+/// AND past it both kick the auto-scroll, so the user doesn't have to
+/// land the cursor exactly past the boundary to start scrolling.
+pub const DRAG_AUTO_SCROLL_EDGE_ROWS: u16 = 1;
+
 /// Apply a wheel notch to `state`, clamping against the cached geometry.
 /// Positive `delta` scrolls down (toward end); negative scrolls up.
 ///
