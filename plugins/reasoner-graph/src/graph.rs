@@ -112,10 +112,16 @@ impl OnNodeFailure {
     }
 }
 
-/// Default ack deadline if the submission omits `ack_deadline_ms`. Five
-/// seconds is generous for a local plugin that just needs to confirm
-/// receipt — actual work has no timeout per parent spec.
-pub const DEFAULT_ACK_DEADLINE_MS: u64 = 5_000;
+/// Default ack deadline if the submission omits `ack_deadline_ms`. Ten
+/// minutes covers real LLM streaming on local providers (qwen-7b ollama
+/// runs hit the multi-minute mark on first-token latency + long output).
+///
+/// The watchdog fires the firing as ack-timeout if no `tool.result`
+/// arrives in this window — i.e. the deadline is effectively a
+/// result-arrival deadline, not a "confirm receipt" ack. Parent spec
+/// reserves room for an explicit `tool.ack` envelope; until that lands
+/// the deadline must be sized to the slowest plausible streaming run.
+pub const DEFAULT_ACK_DEADLINE_MS: u64 = 600_000;
 
 /// Parsed and topology-validated graph (cycles allowed).
 #[derive(Debug, Clone)]
