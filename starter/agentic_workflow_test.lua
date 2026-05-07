@@ -641,11 +641,25 @@ do
     end
 
     local saw_create = false
-    for _, k in ipairs(kinds) do
-      if k == "another-provider.chat.create" then saw_create = true end
+    local create_model
+    for _, c in ipairs(decode_calls()) do
+      if c.body.kind == "another-provider.chat.create" then
+        saw_create = true
+        create_model = c.body.model
+      end
     end
     assert(saw_create,
       "set_model rebuild must emit <new>.chat.create on the bus; got kinds=" .. json.encode(kinds))
+    -- The new chat.create must carry the NEW model the user just selected,
+    -- NOT the model recorded on the source provider's chat.create. The
+    -- source log's model name lives in the OLD provider's namespace; using
+    -- it in the new provider is the exact bug a cross-provider switch is
+    -- trying to avoid (e.g., switching from mock to ollama would otherwise
+    -- ask ollama to spin up "mock-model", which it doesn't have, so the
+    -- next chat.complete returns an API error).
+    assert_eq(create_model, "qwen-other",
+      "<new>.chat.create must carry the NEW model from chat.model.set, not the source-log model; got "
+      .. tostring(create_model))
     assert_eq(#appends_for_new, 3,
       "set_model rebuild must re-feed 3 messages (system/user + synthesised assistant); got "
       .. tostring(#appends_for_new))

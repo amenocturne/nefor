@@ -115,11 +115,16 @@ function M.replay_chat_history(opts)
   local emitted   = 0
   local saw_create = false
 
-  -- Defer the chat.create emit until we know whether the source log
-  -- carries an explicit model on its own chat.create. If the source
-  -- log doesn't have it, we fall back to opts.model. The first emit on
-  -- the bus must be chat.create so the new provider's binary has a chat
-  -- to attach subsequent appends to.
+  -- The first emit on the bus must be chat.create so the new provider's
+  -- binary has a chat to attach subsequent appends to. The model on that
+  -- chat.create is whatever the caller passed — that name lives in the
+  -- TARGET provider's namespace. We deliberately do NOT carry the model
+  -- recorded on the source log's chat.create across the boundary: the
+  -- source-log model name is in the OLD provider's namespace and a
+  -- cross-provider switch implies the new provider doesn't share it
+  -- (e.g., "mock-model" → ollama, "qwen3" → groq). Asking the new
+  -- provider to spin up an old-namespace model name surfaces as an
+  -- API error on the next chat.complete.
   local create_model = model
   local pending_appends = {}
 
@@ -132,13 +137,6 @@ function M.replay_chat_history(opts)
           local k = body.kind
           if k == src_create_kind and body.chat_id == src_chat_id then
             saw_create = true
-            -- Source log pinned a specific model — prefer it over the
-            -- opts.model fallback so the rebuild faithfully reflects
-            -- the prior chat. The new provider may not honour the same
-            -- model name, but that's the caller's problem to pre-screen.
-            if type(body.model) == "string" and #body.model > 0 then
-              create_model = body.model
-            end
           elseif k == src_append_kind and body.chat_id == src_chat_id then
             pending_appends[#pending_appends + 1] = body.message
           elseif k == "tool.result" then
