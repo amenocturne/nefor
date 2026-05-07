@@ -457,4 +457,24 @@ do
     .. json.encode(_test.calls()))
 end
 
+-- ------------------------------------------------------------------
+-- Bug 5 regression — replay_window exposes a public synchronous
+-- setter that ncp.dispatch toggles inline as it walks the framing
+-- markers. The bus.on_event subscriber alone fires too late for the
+-- per-entry to_plugin loop in the same drain batch (vm.rs
+-- `drain_pending_dispatch` runs invoke_dispatch BEFORE
+-- dispatch_subscriptions across the entire batch). The integration
+-- coverage lives in ncp_test.lua's
+-- replay_window_suppresses_replayed_tool_invoke_in_same_batch /
+-- replay_window_does_not_starve_nefor_tui pair; here we just pin the
+-- public-API contract.
+-- ------------------------------------------------------------------
+do
+  local replay_window = require("lib.replay_window")
+  replay_window.set(true)
+  assert_eq(replay_window.active(), true, "replay_window.set(true) must take effect")
+  replay_window.set(false)
+  assert_eq(replay_window.active(), false, "replay_window.set(false) must take effect")
+end
+
 print("agentic_workflow_test: ok")

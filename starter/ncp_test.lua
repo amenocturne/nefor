@@ -1199,6 +1199,96 @@ local function test_tool_permission_response_dropped_during_replay()
   replay_window._set(false)
 end
 
+-- Bug 5 regression — the replay-window flag must be active for the
+-- per-entry to_plugin loop on every entry between sessions.replay.start
+-- and sessions.replay.end. The old setup deferred the flag flip to a
+-- nefor.bus.on_event subscriber that fires AFTER the entire batch's
+-- to_plugin pass (vm.rs `drain_pending_dispatch`); replayed envelopes
+-- riding in the same batch as the framing markers would all see
+-- replay_window.active() == false and reach the Rust peers as if
+-- fresh. ncp.dispatch now toggles the flag inline based on the framing
+-- marker entries.
+--
+-- The test simulates the production scenario: dispatch sees a batch
+-- containing [replay.start, tool-gate.tool.invoke, replay.end] in
+-- order. The replayed tool-invoke must NOT reach tool-gate's stdin —
+-- if it did, the binary would treat it as fresh, decide Prompt, and
+-- emit a duplicate chat.tool.permission_request after the window
+-- closes (the actual user-visible Bug 5 symptom on /resume).
+local function test_replay_window_suppresses_replayed_tool_invoke_in_same_batch()
+  reset()
+  _test.set_plugins({ "tool-gate", "nefor-tui", "ollama" })
+  ready_each({ "tool-gate", "nefor-tui", "ollama" })
+  spawn_tool_gate_wrapper()
+  -- Force the flag to a known starting state in case a prior test
+  -- left it set.
+  local replay_window = require("lib.replay_window")
+  replay_window.set(false)
+
+  -- Bypass invoke_from_plugin's "must be a ready peer" check by
+  -- pushing the entries directly onto the test bus log via
+  -- `nefor.engine.send`. Each entry rides as a step-origin emission
+  -- the way sessions's send_msg + replay_envelope path produces them.
+  local function send_step(from, body)
+    nefor.engine.send(json.encode({
+      type = "event",
+      from = from,
+      ts   = "2026-05-04T00:00:00.000Z",
+      body = body,
+    }))
+  end
+  send_step("sessions", { kind = "sessions.replay.start", session_id = "s", count = 1 })
+  send_step("ollama",   { kind = "tool-gate.tool.invoke",
+                          id   = "outer-replay",
+                          name = "spawn_graph",
+                          args = { graph = { nodes = {}, edges = {} } } })
+  send_step("sessions", { kind = "sessions.replay.end",   session_id = "s" })
+  _test.calls_clear()
+
+  ncp.dispatch(_test.bus_log())
+
+  local delivered = find_deliver_to("tool-gate", "tool-gate.tool.invoke")
+  assert_true(delivered == nil,
+    "replayed tool-gate.tool.invoke must NOT reach tool-gate's stdin during the replay window — Bug 5 regression")
+  -- And the flag must be released after the end-marker entry runs.
+  assert_eq(replay_window.active(), false,
+    "replay_window.active() must be false after the replay.end entry's to_plugin pass")
+end
+
+-- Pin the symmetric guarantee: nefor-tui DOES still receive replayed
+-- envelopes during the window, because the TUI surface needs them to
+-- repaint the transcript on resume. The chat.lua reducer gates side
+-- effects (popup, dag observation) with its own state.replay_mode
+-- flag — that's the level where "replay vs live" rendering policy
+-- lives, not the wrapper.
+local function test_replay_window_does_not_starve_nefor_tui()
+  reset()
+  _test.set_plugins({ "tool-gate", "nefor-tui", "ollama" })
+  ready_each({ "tool-gate", "nefor-tui", "ollama" })
+  spawn_tool_gate_wrapper()
+  local replay_window = require("lib.replay_window")
+  replay_window.set(false)
+
+  local function send_step(from, body)
+    nefor.engine.send(json.encode({
+      type = "event",
+      from = from,
+      ts   = "2026-05-04T00:00:00.000Z",
+      body = body,
+    }))
+  end
+  send_step("sessions", { kind = "sessions.replay.start", session_id = "s", count = 1 })
+  send_step("ollama",   { kind = "chat.message.append", role = "user", text = "hi" })
+  send_step("sessions", { kind = "sessions.replay.end",   session_id = "s" })
+  _test.calls_clear()
+
+  ncp.dispatch(_test.bus_log())
+
+  local delivered = find_deliver_to("nefor-tui", "chat.message.append")
+  assert_true(delivered ~= nil,
+    "replayed chat.message.append MUST reach nefor-tui's stdin so chat.lua repaints the transcript on resume")
+end
+
 local tests = {
   { name = "ready_triggers_ready_ok_reply", fn = test_ready_triggers_ready_ok_reply },
   { name = "ready_with_wrong_version_triggers_error", fn = test_ready_with_wrong_version_triggers_error },
@@ -1240,6 +1330,8 @@ local tests = {
   { name = "tool_permission_response_approve_round_trips_to_gate", fn = test_tool_permission_response_approve_round_trips_to_gate },
   { name = "tool_permission_response_deny_round_trips_to_gate", fn = test_tool_permission_response_deny_round_trips_to_gate },
   { name = "tool_permission_response_dropped_during_replay", fn = test_tool_permission_response_dropped_during_replay },
+  { name = "replay_window_suppresses_replayed_tool_invoke_in_same_batch", fn = test_replay_window_suppresses_replayed_tool_invoke_in_same_batch },
+  { name = "replay_window_does_not_starve_nefor_tui", fn = test_replay_window_does_not_starve_nefor_tui },
 }
 
 for _, t in ipairs(tests) do

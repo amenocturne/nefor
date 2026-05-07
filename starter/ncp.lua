@@ -81,6 +81,7 @@
 -- "wait, is this on the log or not?" ambiguity for replay/persistence.
 
 local json = nefor.json
+local replay_window = require("lib.replay_window")
 
 local M = {}
 
@@ -466,6 +467,29 @@ function M.dispatch(current_log)
           ts   = decoded.ts,
           body = decoded.body,
         }
+        -- Replay-window framing — toggle BEFORE the to_plugin fan-out
+        -- for this entry. The Rust drain loop runs the entire batch's
+        -- `to_plugin` calls before any `dispatch_subscriptions` handler
+        -- fires (vm.rs `drain_pending_dispatch`), so a bus.on_event
+        -- subscriber alone can't gate replayed envelopes that ride in
+        -- the same batch as the `replay.start` marker — by the time
+        -- the subscriber fires it's too late for THIS batch's
+        -- to_plugin pass. Toggling here means every entry between
+        -- start and end sees `replay_window.active() == true` from
+        -- the moment its `to_plugin` runs, so wrappers' replay-skip
+        -- gates (tool-gate, openai-provider, …) actually take effect
+        -- (Bug 5: tool-gate was processing replayed `tool-gate.tool.
+        -- invoke` envelopes as if fresh and emitting new
+        -- `chat.tool.permission_request` envelopes after the window
+        -- closed). nefor-tui's `to_plugin` deliberately does NOT skip
+        -- — the TUI surface NEEDS replayed envelopes to repaint the
+        -- transcript on resume.
+        local kind = env.body.kind
+        if kind == "sessions.replay.start" then
+          replay_window.set(true)
+        elseif kind == "sessions.replay.end" then
+          replay_window.set(false)
+        end
         for _, name in ipairs(nefor.engine.plugins()) do
           if ready_plugins[name] then
             call_to_plugin_for(name, env, entry.target)

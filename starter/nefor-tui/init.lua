@@ -14,12 +14,23 @@
 --
 -- ## to_plugin (bus → binary)
 --
--- Deliver verbatim, skipping replay-window envelopes and
--- self-emissions. No translation needed — chat.message.append /
--- chat.stream.delta / etc. flow through to the TUI as-is.
+-- Deliver verbatim, skipping self-emissions only. No translation —
+-- chat.message.append / chat.stream.delta / etc. flow through to the
+-- TUI as-is.
+--
+-- Unlike the other wrappers, this one DOES NOT short-circuit on
+-- `replay_window.active()`. The TUI surface needs every replayed
+-- envelope so chat.lua can rebuild its transcript on resume — that is
+-- the entire point of the resume UX. Replay-side suppression of fresh
+-- side effects (popups for previously-approved tools, fresh DAG-panel
+-- mutations from observation envelopes, etc.) lives INSIDE the chat.
+-- lua reducer, gated by `state.replay_mode` which the reducer flips
+-- on `sessions.replay.start` / `sessions.replay.end`. The other
+-- wrappers (tool-gate, openai-provider, …) do skip during replay
+-- because their peer plugins would treat the replayed envelopes as
+-- fresh invocations and produce duplicate side effects (Bug 5).
 
 local json = nefor.json
-local replay_window = require("lib.replay_window")
 
 local M = {}
 
@@ -37,7 +48,6 @@ function M.spawn_spec(command)
   end
 
   local function to_plugin(env)
-    if replay_window.active() then return end
     if env.from == "nefor-tui" then return end
     nefor.engine.deliver("nefor-tui", json.encode(env))
   end

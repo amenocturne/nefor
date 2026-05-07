@@ -343,6 +343,10 @@ local function do_resume(target_session_id)
   -- window; pure-Lua actors get the replay normally and rebuild
   -- state. Sessions' own persistence path also drops envelopes inside
   -- the window — see `in_replay_window` flag toggled in receive_msg.
+  -- The window flag's `to_plugin`-side toggle is owned by ncp.dispatch
+  -- (it sees the framing markers in entry order and flips the flag
+  -- inline before calling `to_plugin` for each entry — bus.on_event
+  -- subscribers fire too late for the same batch).
   local total = new_path and count_replay_entries(new_path) or 0
   send_msg({ kind = "control", event = "sessions.replay.start",
              extra = { session_id = target_session_id, count = total } })
