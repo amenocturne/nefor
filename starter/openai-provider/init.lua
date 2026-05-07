@@ -48,8 +48,21 @@
 --                                    current_state)
 --
 -- During a session replay (`sessions.replay.*` framing), `to_plugin`
--- short-circuits before calling deliver — Rust plugins must not see
--- envelopes derived from the replay.
+-- takes a separate cross-process-resume rebuild path (see the inline
+-- comment on `to_plugin` below). The provider binary is brand new on
+-- every nefor process restart, so its per-chat_id history table is
+-- empty; without rebuild on /resume the model replies with no memory
+-- of the prior conversation. We re-feed `<prefix>.chat.create` and
+-- `<prefix>.chat.append` envelopes into the binary verbatim, and
+-- synthesize a `<prefix>.chat.append { role=assistant }` from each
+-- replayed `tool.result` we own (the canonical close envelope carries
+-- the assistant text + tool_calls but the live `chat.complete` path
+-- pushes them inside the binary, so on replay — where chat.complete
+-- is intentionally NOT re-delivered — there's no other channel for
+-- the assistant turn to land in history). Other envelopes (chat.complete,
+-- streaming deltas, tool.invoke, …) drop on the floor — they would
+-- either re-trigger external side effects or close orchestrator nodes
+-- that don't exist in the fresh process.
 
 local json = nefor.json
 
@@ -315,11 +328,104 @@ function M.spawn_spec(name, command, opts)
   end
 
   -- ----------------------------------------------------------------
+  -- Cross-process resume: rebuild the binary's per-chat_id history
+  -- table from the recorded session log. Sessions replays the recorded
+  -- step-origin envelopes; we filter to the ones that carry chat
+  -- state for THIS provider and deliver them to the binary.
+  --
+  -- Owned chat_ids — populated when `<prefix>.chat.create` is
+  -- delivered (live or replay). Used to discriminate replayed
+  -- `tool.result` envelopes (which carry `result.next_state.chat_id`)
+  -- so only the matching wrapper synthesizes the assistant chat.append.
+  -- Mock-plugin chats vs openai-provider chats coexist on the same
+  -- bus; without ownership filtering both wrappers would react to
+  -- every replayed tool.result and corrupt each other's state.
+  -- ----------------------------------------------------------------
+  local owned_chat_ids = {}
+
+  local function deliver_body(body)
+    nefor.engine.deliver(name, json.encode({
+      type = "event",
+      from = "engine",
+      ts   = nefor.engine.now(),
+      body = body,
+    }))
+  end
+
+  local function handle_replay(env)
+    local body = env.body
+    local k = body.kind
+    if type(k) ~= "string" then return end
+
+    -- chat.create: skip if we already created this chat in-process —
+    -- the binary's `chats.create` errors on duplicate ids. Cross-
+    -- process resume after a fresh nefor start has an empty owned set
+    -- so first-seen chat.create gets through; in-process /resume of a
+    -- chat we already created is a no-op for the binary's state, so
+    -- dropping the duplicate is correct.
+    if k == prefix .. "chat.create" then
+      local cid = body.chat_id
+      if type(cid) == "string" and owned_chat_ids[cid] then return end
+      if type(cid) == "string" then owned_chat_ids[cid] = true end
+      deliver_body(body)
+      return
+    end
+    -- chat.append: re-feed verbatim only if we own the chat. Without
+    -- the ownership gate every wrapper (mock-plugin + openai-provider
+    -- + …) would deliver every replayed chat.append to its own binary,
+    -- and a chat.append for an unknown chat_id emits chat.error.
+    if k == prefix .. "chat.append" then
+      local cid = body.chat_id
+      if type(cid) ~= "string" or not owned_chat_ids[cid] then return end
+      deliver_body(body)
+      return
+    end
+
+    -- tool.result: synthesize an assistant `<prefix>.chat.append` so
+    -- the assistant turn lands in history. The wrapper's live
+    -- `inner_from` emits `tool.result` with
+    -- `result.next_state.chat_id` set; that's the discriminator. Skip
+    -- error-shaped results (no assistant content to record) and
+    -- chat_ids we don't own.
+    if k == "tool.result" then
+      if body.error ~= nil then return end
+      local result = body.result
+      if type(result) ~= "table" then return end
+      local ns = result.next_state
+      local cid = type(ns) == "table" and ns.chat_id or nil
+      if type(cid) ~= "string" or not owned_chat_ids[cid] then return end
+
+      local text = type(result.text) == "string" and result.text or ""
+      local tcs = result.tool_calls
+      local has_text = #text > 0
+      local has_tcs = type(tcs) == "table" and #tcs > 0
+      if not has_text and not has_tcs then return end
+
+      local message = { role = "assistant", content = text }
+      if has_tcs then message.tool_calls = tcs end
+      deliver_body({
+        kind    = prefix .. "chat.append",
+        chat_id = cid,
+        message = message,
+      })
+      return
+    end
+
+    -- Everything else drops. chat.complete would re-trigger streaming;
+    -- canonical chat.* (input.submit, model.set, …) would race the
+    -- live agentic-loop, which already has its own replay gate.
+  end
+
+  -- ----------------------------------------------------------------
   -- to_plugin callback: chat.* → <prefix>.* + deliver.
   -- ----------------------------------------------------------------
   local function to_plugin(env)
-    if replay_window.active() then return end
     if env.type ~= "event" or type(env.body) ~= "table" then return end
+
+    if replay_window.active() then
+      handle_replay(env)
+      return
+    end
 
     -- Don't deliver back to self.
     if env.from == name then return end
@@ -333,6 +439,16 @@ function M.spawn_spec(name, command, opts)
       -- Pass through — non-typed envelope, deliver as-is.
       nefor.engine.deliver(name, json.encode(env))
       return
+    end
+
+    -- Track live-path chat.create so a subsequent in-process /resume
+    -- (which replays the same chat.create through `handle_replay`) can
+    -- recognise the chat_id as already-created and skip the duplicate
+    -- delivery (the binary's `chats.create` errors on duplicate ids).
+    -- chat.create is prefix-namespaced so we filter by our prefix; the
+    -- envelope falls through to the default deliver below.
+    if k == prefix .. "chat.create" and type(body.chat_id) == "string" then
+      owned_chat_ids[body.chat_id] = true
     end
 
     if k == "chat.input.submit" or k == "chat.interrupt_all" then
