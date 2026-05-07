@@ -1040,6 +1040,85 @@ mod tests {
         assert!(rx.recv().await.is_none());
     }
 
+    /// Regression: two sequential `bash` invokes with different `args` must
+    /// EACH emit `chat.tool.permission_request`. The gate's policy is
+    /// per-tool-name only (no per-arg cache, no first-call-establishes-default
+    /// fast-path) — both calls under `Decision::Prompt` must prompt the user.
+    /// Pins the invariant against any future "approved this tool already"
+    /// short-circuit.
+    #[tokio::test]
+    async fn two_sequential_bash_invokes_with_different_args_both_prompt() {
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+        // Default `prompt` policy with bash unlisted — falls through to default.
+        let mut state = GateState::new(Policy::new(Decision::Prompt));
+        let advertise = advertise_body(
+            "basic-tools",
+            json!([{"name": "bash", "description": "", "parameters": {}}]),
+        );
+        handle_tools_advertise(&tx, &advertise, &mut state)
+            .await
+            .unwrap();
+        let _register = rx.recv().await.unwrap();
+
+        // First invoke: bash(pwd).
+        let first = json!({
+            "kind": "tool-gate.tool.invoke",
+            "id": "prov-pwd",
+            "name": "bash",
+            "args": { "command": "pwd" },
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        handle_tool_invoke(&tx, &first, &mut state).await.unwrap();
+        let msg = rx.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
+        let body = v.get("body").unwrap();
+        assert_eq!(
+            body.get("kind").and_then(Value::as_str),
+            Some("chat.tool.permission_request"),
+            "bash(pwd) must prompt under default Prompt policy"
+        );
+        assert_eq!(body.get("id").and_then(Value::as_str), Some("prov-pwd"));
+
+        // User approves bash(pwd).
+        let approve = json!({
+            "kind": "tool.permission_response",
+            "id": "prov-pwd",
+            "decision": "approve",
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        handle_permission_response(&tx, &approve, &mut state)
+            .await
+            .unwrap();
+        let _ = rx.recv().await.unwrap(); // basic-tools.tool.invoke forwarded
+
+        // Second invoke: bash(ls -la). Same tool, different args.
+        let second = json!({
+            "kind": "tool-gate.tool.invoke",
+            "id": "prov-ls",
+            "name": "bash",
+            "args": { "command": "ls -la" },
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        handle_tool_invoke(&tx, &second, &mut state).await.unwrap();
+        let msg = rx.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
+        let body = v.get("body").unwrap();
+        assert_eq!(
+            body.get("kind").and_then(Value::as_str),
+            Some("chat.tool.permission_request"),
+            "bash(ls -la) must ALSO prompt — prior approve of bash(pwd) \
+             must not establish a per-tool auto-allow cache"
+        );
+        assert_eq!(body.get("id").and_then(Value::as_str), Some("prov-ls"));
+        assert!(state.awaiting_approval.contains_key("prov-ls"));
+    }
+
     #[tokio::test]
     async fn deny_policy_replies_immediately_without_prompt() {
         let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
