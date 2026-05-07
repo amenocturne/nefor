@@ -458,6 +458,55 @@ do
 end
 
 -- ------------------------------------------------------------------
+-- Bug 6 regression — cancel_all interrupts the in-flight provider
+-- stream, not just the orchestrator graph. Without this, /new
+-- (chat.interrupt_all) lets the prior turn's `<provider>.stream.
+-- delta` envelopes keep arriving and paint into the freshly-cleared
+-- transcript. graph.cancel on the reasoner-graph side is
+-- accept-and-drop today, and the chat.reset that sessions emits
+-- later in the /new path only resets chat history — neither tears
+-- down the live provider turn.
+-- ------------------------------------------------------------------
+do
+  fresh_loop()
+  -- Prime an in-flight orchestrator run so cancel_all has something
+  -- to abort.
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "first" })
+  _test.calls_clear()
+  agentic_loop.cancel_all()
+  local saw_provider_interrupt = false
+  local saw_graph_cancel = false
+  for _, c in ipairs(decode_calls()) do
+    if c.body.kind == "ollama.interrupt" and c.target == "ollama" then
+      saw_provider_interrupt = true
+    end
+    if c.body.kind == "graph.cancel" and c.target == "reasoner-graph" then
+      saw_graph_cancel = true
+    end
+  end
+  assert(saw_provider_interrupt,
+    "cancel_all must emit `<provider>.interrupt` so the binary aborts the in-flight chat completion; got "
+    .. json.encode(_test.calls()))
+  assert(saw_graph_cancel,
+    "cancel_all must still emit graph.cancel for the orchestrator run; got "
+    .. json.encode(_test.calls()))
+end
+
+-- cancel_all with no in-flight run is a no-op — must NOT spuriously
+-- emit a provider interrupt. The symmetric single-Esc `cancel()`
+-- already gates on current_run_id; cancel_all matches that gate.
+do
+  fresh_loop()
+  agentic_loop.cancel_all()
+  for _, c in ipairs(decode_calls()) do
+    if c.body.kind == "ollama.interrupt" then
+      error("cancel_all with no in-flight run must NOT emit a provider interrupt; got "
+            .. json.encode(c.body))
+    end
+  end
+end
+
+-- ------------------------------------------------------------------
 -- Bug 5 regression — replay_window exposes a public synchronous
 -- setter that ncp.dispatch toggles inline as it walks the framing
 -- markers. The bus.on_event subscriber alone fires too late for the

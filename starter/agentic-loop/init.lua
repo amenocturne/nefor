@@ -249,16 +249,32 @@ local function flush_pending_user_inputs()
 end
 
 -- Cancel everything. D-32 fan-out order:
---   (1) cancel current orchestrator run
+--   (1) cancel current orchestrator run + interrupt the in-flight
+--       provider stream so deltas stop spilling
 --   (2) cancel sub-graph runs + clear queued dispatches
 --   (3) drop deferred queue + pending user inputs
 --   (4) clear pending bookkeeping
+--
+-- The single-Esc `cancel()` already fires `<provider>.interrupt` so
+-- the binary aborts the streaming chat completion; `cancel_all` now
+-- matches. Without it, `graph.cancel` on the reasoner-graph side is
+-- "accept-and-drop" (the in-flight provider chat is not torn down by
+-- the scheduler today), so an interrupt-all triggered by `/new`
+-- mid-stream would let the prior turn's provider deltas keep
+-- arriving and paint into the freshly-cleared transcript. The
+-- `chat.reset` that sessions emits later in the `/new` path
+-- translates to `<provider>.reset` which only clears chat history —
+-- it does NOT interrupt the live turn — so the provider-interrupt
+-- has to ride here.
 local function cancel_all()
   local cancelled_chat = state.current_run_id ~= nil
   if cancelled_chat then
     emit("reasoner-graph", {
       kind   = "graph.cancel",
       run_id = state.current_run_id,
+    })
+    emit(state.config.provider, {
+      kind = state.config.provider .. ".interrupt",
     })
     state.current_run_id = nil
   end
