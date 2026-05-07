@@ -8,6 +8,14 @@
 //! assert the binary saw the right re-fed `<prefix>.chat.create` /
 //! `<prefix>.chat.append` envelopes.
 //!
+//! Post batch-protocol refactor `to_plugin` takes a LIST of envelopes
+//! per invocation (`function to_plugin(envs) for _, env in ipairs(envs)
+//! do ... end end`). The Lua-side helpers below feed the wrapper a
+//! one-element list per "live" call to keep the per-envelope semantics
+//! these tests pin, and per-envelope the test sets `env.replay` to
+//! match what the framework would stamp inline as it walks
+//! `sessions.replay.*` framing.
+//!
 //! Why not e2e: the cross-process flow (kill nefor, start fresh, /resume)
 //! requires driving the engine binary across two process lifetimes plus
 //! a real provider binary. Pinning the contract at the wrapper boundary
@@ -65,11 +73,14 @@ fn replay_window_re_feeds_chat_history_into_provider_binary() {
 
     // Replay window open. Drive the recorded envelope sequence — these
     // are the shapes the bus log carries on disk after a normal turn.
+    // Batched signature: every call hands the wrapper a one-element list
+    // with `env.replay = true` (what the framework stamps when iterating
+    // a tail framed by sessions.replay.start/end).
     lua.load(
         r#"
         _replay.set(true)
         local function deliver_env(from, body)
-            _to_plugin({ type = "event", from = from, body = body })
+            _to_plugin({ { type = "event", from = from, body = body, replay = true } })
         end
 
         -- 1. Engine→provider chat.create (recorded with target=ollama).
@@ -192,35 +203,32 @@ fn cross_wrapper_isolation_unowned_chat_ids_drop() {
     lua.load(
         r#"
         _replay.set(true)
-        local function fire(env)
-            _mock_to_plugin(env)
-            _ollama_to_plugin(env)
+        local function fire(body, from)
+            local envs = { { type = "event", from = from, body = body, replay = true } }
+            _mock_to_plugin(envs)
+            _ollama_to_plugin(envs)
         end
 
         -- Mock chat is created via mock-plugin.chat.create.
-        fire({ type = "event", from = "engine", body = {
-            kind = "mock-plugin.chat.create", chat_id = "chat-mock-1",
-        }})
-        fire({ type = "event", from = "engine", body = {
+        fire({ kind = "mock-plugin.chat.create", chat_id = "chat-mock-1" }, "engine")
+        fire({
             kind    = "mock-plugin.chat.append",
             chat_id = "chat-mock-1",
             message = { role = "user", content = "hi mock" },
-        }})
+        }, "engine")
         -- Ollama chat is created via ollama.chat.create.
-        fire({ type = "event", from = "engine", body = {
-            kind = "ollama.chat.create", chat_id = "chat-ollama-1",
-        }})
-        fire({ type = "event", from = "engine", body = {
+        fire({ kind = "ollama.chat.create", chat_id = "chat-ollama-1" }, "engine")
+        fire({
             kind    = "ollama.chat.append",
             chat_id = "chat-ollama-1",
             message = { role = "user", content = "hi ollama" },
-        }})
+        }, "engine")
         -- tool.result for the ollama chat. Only the ollama wrapper owns
         -- it; mock-plugin must drop.
-        fire({ type = "event", from = "provider-wrapper", body = {
+        fire({
             kind = "tool.result", id = "f1",
             result = { text = "ollama reply", next_state = { chat_id = "chat-ollama-1" } },
-        }})
+        }, "provider-wrapper")
 
         _replay.set(false)
         _delivered = _test.delivered()
@@ -316,12 +324,16 @@ fn in_process_resume_skips_duplicate_chat_create() {
     .expect("spawn wrapper");
 
     // Live turn — wrapper sees chat.create through the live path.
+    // Batched signature: hand the wrapper a one-element envs list with
+    // `replay = false` (the framework's per-envelope stamp under live
+    // dispatch).
     lua.load(
         r#"
         _replay.set(false)
-        _to_plugin({ type = "event", from = "engine", body = {
-            kind = "ollama.chat.create", chat_id = "chat-1",
-        }})
+        _to_plugin({ {
+            type = "event", from = "engine", replay = false,
+            body = { kind = "ollama.chat.create", chat_id = "chat-1" },
+        } })
         _live_delivered_count = #_test.delivered()
         "#,
     )
@@ -339,9 +351,10 @@ fn in_process_resume_skips_duplicate_chat_create() {
     lua.load(
         r#"
         _replay.set(true)
-        _to_plugin({ type = "event", from = "engine", body = {
-            kind = "ollama.chat.create", chat_id = "chat-1",
-        }})
+        _to_plugin({ {
+            type = "event", from = "engine", replay = true,
+            body = { kind = "ollama.chat.create", chat_id = "chat-1" },
+        } })
         _replay.set(false)
         _replay_delivered = _test.delivered()
         "#,

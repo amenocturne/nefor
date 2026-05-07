@@ -13,7 +13,6 @@
 -- this binary so it doesn't re-run completed graph nodes.
 
 local json = nefor.json
-local replay_window = require("lib.replay_window")
 
 local NAME = "reasoner-graph"
 
@@ -22,20 +21,32 @@ local M = {}
 function M.spawn_spec(command)
   assert(type(command) == "table", "reasoner-graph.spawn_spec: command required")
 
-  local function from_plugin(env)
-    if type(env.body) ~= "table" then return end
-    nefor.engine.send(json.encode({
-      type = "event",
-      from = env.from or NAME,
-      ts   = nefor.engine.now(),
-      body = env.body,
-    }))
+  local function from_plugin(envs)
+    for _, env in ipairs(envs) do
+      if type(env.body) == "table" then
+        nefor.engine.send(json.encode({
+          type = "event",
+          from = env.from or NAME,
+          ts   = nefor.engine.now(),
+          body = env.body,
+        }))
+      end
+    end
   end
 
-  local function to_plugin(env)
-    if replay_window.active() then return end
-    if env.from == NAME then return end
-    nefor.engine.deliver(NAME, json.encode(env))
+  local function to_plugin(envs)
+    for _, env in ipairs(envs) do
+      if not env.replay and env.from ~= NAME then
+        -- Strip framework-only fields (`replay`, …) when encoding for
+        -- the wire — the protocol parser rejects unknown fields.
+        nefor.engine.deliver(NAME, json.encode({
+          type = env.type,
+          from = env.from,
+          ts   = env.ts,
+          body = env.body,
+        }))
+      end
+    end
   end
 
   return {

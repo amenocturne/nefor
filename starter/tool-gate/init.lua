@@ -30,7 +30,6 @@ local json = nefor.json
 
 local envelope = require("lib.envelope")
 local graph_lib = require("lib.graph")
-local replay_window = require("lib.replay_window")
 
 local SPAWN_GRAPH_SOURCE = graph_lib.SPAWN_GRAPH_SOURCE
 
@@ -62,7 +61,10 @@ function M.spawn_spec(gate_name, command)
     return agentic_loop
   end
 
-  local function from_plugin(env)
+  -- Per-envelope inbound logic — kept as a local so the batched
+  -- `from_plugin(envs)` callback can iterate without re-indenting the
+  -- decision tree.
+  local function handle_inbound(env)
     if env.type ~= "event" or type(env.body) ~= "table" then
       -- Republish verbatim non-event envelopes (defensive — events are
       -- the only shape we should see here per NCP).
@@ -173,11 +175,27 @@ function M.spawn_spec(gate_name, command)
     publish(env.from or gate_name, env.body)
   end
 
+  local function from_plugin(envs)
+    for _, env in ipairs(envs) do
+      handle_inbound(env)
+    end
+  end
+
   -- to_plugin: deliver verbatim, skip during replay + self-emissions.
-  local function to_plugin(env)
-    if replay_window.active() then return end
-    if env.from == gate_name then return end
-    nefor.engine.deliver(gate_name, json.encode(env))
+  local function to_plugin(envs)
+    for _, env in ipairs(envs) do
+      if not env.replay and env.from ~= gate_name then
+        -- Strip framework-only fields (`replay`, …) when encoding for
+        -- the wire; the protocol parser rejects unknown envelope
+        -- fields.
+        nefor.engine.deliver(gate_name, json.encode({
+          type = env.type,
+          from = env.from,
+          ts   = env.ts,
+          body = env.body,
+        }))
+      end
+    end
   end
 
   return {

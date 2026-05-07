@@ -259,19 +259,23 @@ local function test_from_plugin_callback_can_transform_kind()
 
   -- src has a from_plugin callback that rewrites cc.* → chat.* and
   -- republishes via send. We register the wrapper on both ends so the
-  -- dispatch can route to dst.
+  -- dispatch can route to dst. Batched signature: envs is a list per
+  -- invocation; the broker hands one inbound line at a time so this
+  -- usually iterates a single-element list.
   ncp._test_set_transforms("src", {
-    from_plugin = function(env)
-      if env.body and type(env.body.kind) == "string" then
-        local k = env.body.kind
-        if k:sub(1, 3) == "cc." then
-          env.body.kind = "chat." .. k:sub(4)
+    from_plugin = function(envs)
+      for _, env in ipairs(envs) do
+        if env.body and type(env.body.kind) == "string" then
+          local k = env.body.kind
+          if k:sub(1, 3) == "cc." then
+            env.body.kind = "chat." .. k:sub(4)
+          end
         end
+        nefor.engine.send(json.encode({
+          type = "event", from = "src",
+          ts = nefor.engine.now(), body = env.body,
+        }))
       end
-      nefor.engine.send(json.encode({
-        type = "event", from = "src",
-        ts = nefor.engine.now(), body = env.body,
-      }))
     end,
   })
 
@@ -299,9 +303,10 @@ local function test_from_plugin_callback_can_drop()
   _test.set_plugins({ "src", "dst" })
 
   -- A from_plugin that does nothing (no `send`) drops the envelope
-  -- entirely from the bus.
+  -- entirely from the bus. Batched signature still drops because it
+  -- iterates envs and emits nothing.
   ncp._test_set_transforms("src", {
-    from_plugin = function(_env) end,
+    from_plugin = function(_envs) end,
   })
 
   ready_each({ "src", "dst" })
@@ -326,10 +331,13 @@ local function test_to_plugin_callback_per_target_only()
 
   -- Only 'a' has a to_plugin callback that rewrites kind before
   -- delivering. 'b' uses the default callback (delivers verbatim).
+  -- Batched signature: iterate envs, mutate + deliver each.
   ncp._test_set_transforms("a", {
-    to_plugin = function(env)
-      env.body.kind = "rewritten"
-      nefor.engine.deliver("a", json.encode(env))
+    to_plugin = function(envs)
+      for _, env in ipairs(envs) do
+        env.body.kind = "rewritten"
+        nefor.engine.deliver("a", json.encode(env))
+      end
     end,
   })
 
@@ -356,9 +364,10 @@ local function test_to_plugin_callback_can_drop()
   _test.set_plugins({ "src", "a", "b" })
 
   -- 'a's to_plugin does nothing → no delivery to a. 'b' uses default →
-  -- delivery happens.
+  -- delivery happens. Batched signature: iterating an empty list is
+  -- the same as the no-op callback.
   ncp._test_set_transforms("a", {
-    to_plugin = function(_env) end,
+    to_plugin = function(_envs) end,
   })
 
   ready_each({ "src", "a", "b" })
@@ -384,7 +393,7 @@ local function test_from_plugin_callback_error_emits_transform_error()
   _test.set_plugins({ "src", "dst" })
 
   ncp._test_set_transforms("src", {
-    from_plugin = function(_env) error("boom") end,
+    from_plugin = function(_envs) error("boom") end,
   })
 
   ready_each({ "src", "dst" })
@@ -415,12 +424,14 @@ local function test_replayed_events_pass_through_from_plugin_callback()
   -- log holds the post-callback envelopes (what was published), the
   -- replayed events naturally carry the rewritten kind.
   ncp._test_set_transforms("src", {
-    from_plugin = function(env)
-      env.body.kind = "rewritten"
-      nefor.engine.send(json.encode({
-        type = "event", from = "src",
-        ts = nefor.engine.now(), body = env.body,
-      }))
+    from_plugin = function(envs)
+      for _, env in ipairs(envs) do
+        env.body.kind = "rewritten"
+        nefor.engine.send(json.encode({
+          type = "event", from = "src",
+          ts = nefor.engine.now(), body = env.body,
+        }))
+      end
     end,
   })
 
@@ -525,18 +536,18 @@ local function test_openai_adapter_static_token_injects_auth_set_on_ready()
   reset()
   reset_loop()
   local ad = build_provider_chain("ollama", { static_token = "local" })
-  ad.from_plugin({
+  ad.from_plugin({ {
     type = "event", from = "ollama",
     body = { kind = "ollama.hello" },
-  })
+  } })
   -- hello + default republish: 1 send (broadcast). Strip those for the
   -- injection assertion.
   _test.calls_clear()
 
-  ad.from_plugin({
+  ad.from_plugin({ {
     type = "event", from = "ollama",
     body = { kind = "ollama.ready" },
-  })
+  } })
 
   -- The wrapper synthesizes a targeted send (auth.set to ollama) and
   -- drops the ready (no republish). Assert the targeted send is there.
@@ -554,10 +565,10 @@ local function test_openai_adapter_static_token_injects_auth_set_on_ready()
 
   -- A second ready must not re-inject.
   _test.calls_clear()
-  ad.from_plugin({
+  ad.from_plugin({ {
     type = "event", from = "ollama",
     body = { kind = "ollama.ready" },
-  })
+  } })
   for _, c in ipairs(_test.calls()) do
     local d = json.decode(c.payload)
     assert_true(
@@ -571,10 +582,10 @@ local function test_openai_adapter_no_static_token_skips_injection()
   reset()
   reset_loop()
   local ad = build_provider_chain("ollama")
-  ad.from_plugin({
+  ad.from_plugin({ {
     type = "event", from = "ollama",
     body = { kind = "ollama.ready" },
-  })
+  } })
   for _, c in ipairs(_test.calls()) do
     local d = json.decode(c.payload)
     assert_true(
@@ -737,14 +748,14 @@ local function test_rga_provider_result_emits_tool_result_with_next_state()
   _test.calls_clear()
 
   local prov_hook = build_provider_chain("ollama")
-  prov_hook.from_plugin({
+  prov_hook.from_plugin({ {
     type = "event", from = "ollama",
     body = {
       kind = "ollama.chat.complete.result",
       chat_id = chat_id,
       output = { text = "the answer" },
     },
-  })
+  } })
 
   local result = find_call_with_kind("tool.result")
   assert_true(result ~= nil, "tool.result emitted")
@@ -761,14 +772,14 @@ end
 local function test_rga_provider_result_for_unknown_chat_passes_through()
   reset_rga()
   local prov_hook = build_provider_chain("ollama")
-  prov_hook.from_plugin({
+  prov_hook.from_plugin({ {
     type = "event", from = "ollama",
     body = {
       kind = "ollama.chat.complete.result",
       chat_id = "not-ours",
       output = { text = "..." },
     },
-  })
+  } })
   -- The wrapper's outer_from passes ollama.chat.complete.result through
   -- and republishes it (no firing matched). Bus should not see a
   -- tool.result.
@@ -807,27 +818,27 @@ local function test_rga_per_firing_keying_distinct_firings_resolve_independently
   _test.calls_clear()
 
   local prov = build_provider_chain("ollama")
-  prov.from_plugin({
+  prov.from_plugin({ {
     type = "event", from = "ollama",
     body = {
       kind = "ollama.chat.complete.result",
       chat_id = chat_b,
       output = { text = "B-ans" },
     },
-  })
+  } })
   local resB = find_call_with_kind("tool.result")
   assert_true(resB ~= nil, "result for B fired")
   assert_eq(resB.body.id, "fB", "result correlated to firing B")
   _test.calls_clear()
 
-  prov.from_plugin({
+  prov.from_plugin({ {
     type = "event", from = "ollama",
     body = {
       kind = "ollama.chat.complete.result",
       chat_id = chat_a,
       output = { text = "A-ans" },
     },
-  })
+  } })
   local resA = find_call_with_kind("tool.result")
   assert_true(resA ~= nil, "result for A fired")
   assert_eq(resA.body.id, "fA", "result correlated to firing A")
@@ -965,8 +976,8 @@ local function test_spawn_accepts_the_four_valid_fields_without_error()
   ncp.spawn({
     name        = "p",
     command     = { "/bin/echo", "hi" },
-    from_plugin = function(env) end,
-    to_plugin   = function(env) end,
+    from_plugin = function(envs) end,
+    to_plugin   = function(envs) end,
   })
   assert_eq(#spawn_calls, 1, "engine spawn invoked once")
   assert_eq(spawn_calls[1].name, "p", "name forwarded")
@@ -1333,6 +1344,52 @@ local function test_replay_window_does_not_starve_nefor_tui()
     "replayed chat.message.append MUST reach nefor-tui's stdin so chat.lua repaints the transcript on resume")
 end
 
+-- Batch-dispatch contract — `to_plugin(envs)` fires ONCE per dispatch
+-- tick with all envelopes destined for the peer in the new tail. The
+-- batch protocol refactor's headline guarantee: N envelopes pumped
+-- through the dispatch loop in a single tick reach the wrapper as a
+-- single invocation with N elements, not N invocations of one element
+-- each. This unblocks Phase B's resume-rendering optimisation
+-- (chat.lua coalesces N replayed deltas into one render pass) and
+-- amortises wrapper-side translation cost across live bursts.
+--
+-- Pre-refactor (per-envelope dispatch) the wrapper's to_plugin was
+-- called once per Step entry; converting that loop to send a list is
+-- the dispatch-loop change. This test pins the new contract: 5
+-- envelopes, 1 to_plugin call, 5 elements in `envs`.
+local function test_to_plugin_receives_full_batch_in_one_call()
+  reset()
+  _test.set_plugins({ "src", "peer" })
+
+  -- Record the size of `envs` for every to_plugin invocation.
+  local invocation_sizes = {}
+  ncp._test_set_transforms("peer", {
+    to_plugin = function(envs)
+      invocation_sizes[#invocation_sizes + 1] = #envs
+    end,
+  })
+
+  ready_each({ "src", "peer" })
+  _test.calls_clear()
+
+  -- Pump 5 envelopes through src's from_plugin (default callback
+  -- republishes via send → bus log gets 5 entries before the broker
+  -- drains to dispatch). We bypass `drive_inbound` here so the
+  -- accumulated bus log is dispatched as a single tick rather than one
+  -- entry per call.
+  for i = 1, 5 do
+    ncp.invoke_from_plugin("src", make_event({ kind = "test.batch", n = i }))
+  end
+  -- A single dispatch call walks the whole new tail and fans out per
+  -- peer in one to_plugin invocation.
+  ncp.dispatch(_test.bus_log())
+
+  assert_eq(#invocation_sizes, 1,
+    "to_plugin must fire ONCE for the whole batch — pre-refactor's per-envelope dispatch fired 5 times for 5 envelopes")
+  assert_eq(invocation_sizes[1], 5,
+    "the single invocation's envs list must contain all 5 envelopes")
+end
+
 local tests = {
   { name = "ready_triggers_ready_ok_reply", fn = test_ready_triggers_ready_ok_reply },
   { name = "ready_with_wrong_version_triggers_error", fn = test_ready_with_wrong_version_triggers_error },
@@ -1377,6 +1434,7 @@ local tests = {
   { name = "replay_window_suppresses_replayed_tool_invoke_in_same_batch", fn = test_replay_window_suppresses_replayed_tool_invoke_in_same_batch },
   { name = "replay_window_does_not_starve_nefor_tui", fn = test_replay_window_does_not_starve_nefor_tui },
   { name = "tool_gate_wrapper_forwards_error_message_to_chat_tool_end", fn = test_tool_gate_wrapper_forwards_error_message_to_chat_tool_end },
+  { name = "to_plugin_receives_full_batch_in_one_call", fn = test_to_plugin_receives_full_batch_in_one_call },
 }
 
 for _, t in ipairs(tests) do

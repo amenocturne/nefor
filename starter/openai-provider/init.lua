@@ -67,7 +67,6 @@
 local json = nefor.json
 
 local envelope = require("lib.envelope")
-local replay_window = require("lib.replay_window")
 
 local M = {}
 
@@ -300,10 +299,12 @@ function M.spawn_spec(name, command, opts)
   end
 
   -- ----------------------------------------------------------------
-  -- from_plugin callback: composed inner_from + outer_from + publish.
-  -- Side-effecting; framework ignores return value.
+  -- Per-envelope inbound logic — composed inner_from + outer_from +
+  -- publish. Side-effecting; result returned to the iterating caller
+  -- below for diagnostic clarity (it could be void), the iterator
+  -- ignores it.
   -- ----------------------------------------------------------------
-  local function from_plugin(env)
+  local function handle_inbound(env)
     -- Deep-copy body to avoid mutating the caller's table when
     -- outer_from rewrites kinds.
     local body_copy = {}
@@ -325,6 +326,16 @@ function M.spawn_spec(name, command, opts)
     if final_body == nil then return end
 
     publish(env.from or name, final_body)
+  end
+
+  -- ----------------------------------------------------------------
+  -- from_plugin callback: batched. Iterates envs, applies translation
+  -- per envelope. Framework ignores return value.
+  -- ----------------------------------------------------------------
+  local function from_plugin(envs)
+    for _, env in ipairs(envs) do
+      handle_inbound(env)
+    end
   end
 
   -- ----------------------------------------------------------------
@@ -417,12 +428,14 @@ function M.spawn_spec(name, command, opts)
   end
 
   -- ----------------------------------------------------------------
-  -- to_plugin callback: chat.* → <prefix>.* + deliver.
+  -- Per-envelope outbound logic — chat.* → <prefix>.* + deliver. Pulled
+  -- out of the to_plugin body so the batched callback below can iterate
+  -- without re-indenting.
   -- ----------------------------------------------------------------
-  local function to_plugin(env)
+  local function handle_outbound(env)
     if env.type ~= "event" or type(env.body) ~= "table" then return end
 
-    if replay_window.active() then
+    if env.replay then
       handle_replay(env)
       return
     end
@@ -436,8 +449,14 @@ function M.spawn_spec(name, command, opts)
 
     local k = body.kind
     if type(k) ~= "string" then
-      -- Pass through — non-typed envelope, deliver as-is.
-      nefor.engine.deliver(name, json.encode(env))
+      -- Pass through — non-typed envelope, deliver as-is. Strip
+      -- framework-only fields (`replay`, …) when encoding for the wire.
+      nefor.engine.deliver(name, json.encode({
+        type = env.type,
+        from = env.from,
+        ts   = env.ts,
+        body = env.body,
+      }))
       return
     end
 
@@ -498,6 +517,16 @@ function M.spawn_spec(name, command, opts)
       ts   = nefor.engine.now(),
       body = body,
     }))
+  end
+
+  -- ----------------------------------------------------------------
+  -- to_plugin callback: batched. Iterates envs, applies translation +
+  -- replay rebuild per envelope. Framework ignores return value.
+  -- ----------------------------------------------------------------
+  local function to_plugin(envs)
+    for _, env in ipairs(envs) do
+      handle_outbound(env)
+    end
   end
 
   return {

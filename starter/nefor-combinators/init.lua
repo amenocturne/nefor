@@ -14,25 +14,36 @@
 
 local json = nefor.json
 
-local config        = require("config")
-local replay_window = require("lib.replay_window")
+local config = require("config")
 
 local NAME = "nefor-combinators"
 
-local function from_plugin(env)
-  if type(env.body) ~= "table" then return end
-  nefor.engine.send(json.encode({
-    type = "event",
-    from = env.from or NAME,
-    ts   = nefor.engine.now(),
-    body = env.body,
-  }))
+local function from_plugin(envs)
+  for _, env in ipairs(envs) do
+    if type(env.body) == "table" then
+      nefor.engine.send(json.encode({
+        type = "event",
+        from = env.from or NAME,
+        ts   = nefor.engine.now(),
+        body = env.body,
+      }))
+    end
+  end
 end
 
-local function to_plugin(env)
-  if replay_window.active() then return end
-  if env.from == NAME then return end
-  nefor.engine.deliver(NAME, json.encode(env))
+local function to_plugin(envs)
+  for _, env in ipairs(envs) do
+    if not env.replay and env.from ~= NAME then
+      -- Encode a clean wire envelope without framework-only fields
+      -- (`replay`, …); the protocol parser rejects unknown fields.
+      nefor.engine.deliver(NAME, json.encode({
+        type = env.type,
+        from = env.from,
+        ts   = env.ts,
+        body = env.body,
+      }))
+    end
+  end
 end
 
 return {
