@@ -831,7 +831,21 @@ local function receive_msg(entry)
   -- Engine shutdown — sessions handles persistence; nothing for us.
   if kind == "engine.shutdown" then return end
 
-  -- Chat-input surface from the TUI.
+  -- Chat-input surface from the TUI. These envelopes drive new
+  -- orchestration (a `chat.input.submit` minted on resume would spawn
+  -- a fresh graph the user already saw the answer for); a session
+  -- replay rebuilds state via the bus markers, not by re-firing the
+  -- input handlers. The `tool.result` / `graph.node.fired` block
+  -- below handles the same concern for reasoner-graph emissions.
+  if replay_window.active() then
+    if kind == "chat.input.submit"
+        or kind == "chat.reset"
+        or kind == "chat.interrupt_all"
+        or kind == "chat.model.set" then
+      return
+    end
+  end
+
   if kind == "chat.input.submit" then handle_chat_input_submit(body); return end
   if kind == "chat.reset"        then handle_chat_reset(); return end
   if kind == "chat.interrupt_all" then cancel_all(); return end
