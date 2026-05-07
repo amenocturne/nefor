@@ -1733,14 +1733,6 @@ local function fmt_elapsed_ms(ms)
   return string.format("%ds", math.floor(ms / 1000))
 end
 
--- Hard ceiling on a never-completing run before we evict it anyway.
--- 5× the linger window: long enough that a healthy long-running run
--- doesn't get prematurely yanked, short enough that an orphan from a
--- crash / dropped envelope can't accumulate indefinitely on a long-
--- lived session. Tied to DAG_LINGER_MS so a future tweak there
--- automatically scales this ceiling.
-local DAG_HARD_CEILING_MS = 5 * DAG_LINGER_MS
-
 local function prune_dag_runs(dag_runs, now_ms)
   if dag_runs == nil then return {} end
   local pruned = nil
@@ -1748,14 +1740,6 @@ local function prune_dag_runs(dag_runs, now_ms)
     local drop = false
     if run.completed_at_ms ~= nil
        and (now_ms - run.completed_at_ms) > DAG_LINGER_MS then
-      drop = true
-    elseif run.started_at_ms ~= nil
-           and (now_ms - run.started_at_ms) > DAG_HARD_CEILING_MS then
-      -- Hard-ceiling eviction: even still-running runs get pruned
-      -- once they're past the ceiling. Prevents indefinite-running
-      -- orphans (e.g. a graph.run_complete that never arrived
-      -- because the producer crashed) from piling up within a
-      -- single long-lived session.
       drop = true
     end
     if drop then
