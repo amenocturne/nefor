@@ -1939,11 +1939,11 @@ local function transcript(state)
   -- queries (and any tests / shortcuts that use them) keep resolving —
   -- the banner is purely visual chrome on top of an empty viewport.
   --
-  -- Replay-mode opt-out: between sessions.session_start (which clears
-  -- entries on resume) and the first replayed chat.message.append, the
-  -- transcript is briefly empty AND we're rebuilding. Painting the
-  -- banner here would flash the welcome copy in the middle of a
-  -- resume. The replay_mode gate suppresses it for that window.
+  -- Replay-mode opt-out: between sessions.replay.start (window opens)
+  -- and the first replayed chat.message.append, the transcript is
+  -- briefly empty AND we're rebuilding. Painting the banner here would
+  -- flash the welcome copy in the middle of a resume. The replay_mode
+  -- gate suppresses it for that window.
   if #entries == 0 and state.in_flight == nil
      and not state.pending and not state.replay_mode then
     local banner = welcome_banner()
@@ -2988,36 +2988,36 @@ local function update(msg, state)
   end
 
   if kind == "sessions.session_start" then
-    -- Boot session_start carries no marker; resume's session_start
-    -- carries `from_resume = true` (sessions.lua sets it before
-    -- replay_jsonl). Flip into replay-mode for resume so the
-    -- replayed envelope stream can't re-trigger UI side effects —
-    -- notably the tool.permission_request popup, which the user
-    -- already approved in the original session (its decision is
-    -- recorded in the jsonl and a fresh popup would be a re-prompt).
-    --
     -- `dag_runs` always cleared: a fresh session is a fresh
     -- DAG-context boundary regardless of which path we took to
     -- get here. session_end's clear isn't enough on its own —
     -- if a session swap doesn't go cleanly through session_end,
     -- or if a run was mid-flight when the swap fired, stale runs
     -- would otherwise stack on top of new ones in the panel.
-    if msg.from_resume then
-      return shallow_merge(state, {
-        replay_mode = true,
-        dag_runs    = {},
-      }), {}
-    end
+    --
     -- Boot path: state is already empty; the entries-wipe that
     -- USED to live here turned out to break ncp.lua's replay-on-attach
     -- (boot session_start delivered AFTER the user's first prompt
     -- nuked the local-push), so we deliberately do nothing for
     -- entries here. dag_runs is independent of that race (no
     -- pre-boot dispatch path) so we still clear it.
+    --
+    -- Replay-mode flip is driven by `sessions.replay.start` /
+    -- `sessions.replay.end` markers below — the framing-marker
+    -- contract (Phase 4.5) is the canonical replay window now.
     return shallow_merge(state, { dag_runs = {}, firing_to_node = {} }), {}
   end
 
-  if kind == "sessions.resume_done" then
+  if kind == "sessions.replay.start" then
+    -- Replay started — suppress UI side effects that would re-trigger
+    -- against envelopes the user already saw the first time round.
+    -- Notable example: the tool.permission_request popup. The user
+    -- already approved in the original session (its decision is
+    -- recorded in the jsonl); a fresh popup would be a re-prompt.
+    return shallow_merge(state, { replay_mode = true }), {}
+  end
+
+  if kind == "sessions.replay.end" then
     -- Replay finished — flip back to live so future envelopes drive
     -- popups and other side effects normally again. The next render
     -- fires from the surrounding update loop.
