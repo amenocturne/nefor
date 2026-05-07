@@ -117,7 +117,36 @@ async fn run_dispatch_loop(
                                 tracing::warn!(?env, "unexpected system envelope after handshake");
                             }
                             Body::Event(_) => {
-                                host.dispatch_event(&env).await?;
+                                // Spawn each dispatch as its own task instead
+                                // of awaiting it inline. The reason: the
+                                // <prefix>.chat.complete handler runs an
+                                // async streaming loop that awaits
+                                // `nefor.sleep` between chunks. With inline
+                                // await the loop blocks the dispatch loop
+                                // for the full stream duration, so a follow
+                                // -up <prefix>.interrupt envelope sits in
+                                // `in_rx` until the stream finishes — at
+                                // which point cancelling is moot. Spawning
+                                // lets the runtime poll the in-flight
+                                // streaming task while we keep pulling
+                                // envelopes; mlua serialises real Lua work
+                                // internally (the `send` feature gates
+                                // concurrent VM access on a single mutex),
+                                // so two handlers can't truly race even if
+                                // the runtime polls them concurrently —
+                                // they'll just interleave at every `await`
+                                // suspension point. The interrupt handler
+                                // sets a Lua-side flag during one of the
+                                // streaming handler's `nefor.sleep` yields,
+                                // and the streaming loop notices the flag
+                                // on its next chunk-boundary check and
+                                // breaks early.
+                                let host_clone = host.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = host_clone.dispatch_event(&env).await {
+                                        tracing::error!(error = %e, "dispatch task failed");
+                                    }
+                                });
                             }
                         }
                     }

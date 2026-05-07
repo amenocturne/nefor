@@ -606,11 +606,8 @@ local CANNED_REASONING_CHUNKS = {
 -- at 20ms intervals. Slower than instant so streaming reads as live
 -- output instead of paste; faster than 80 tok/s so it doesn't become
 -- the dominant cost of an interactive turn.
--- `os.execute("sleep …")` spawns a sleep subprocess per chunk; cheap
--- enough at this rate (~20/sec) and the mock has no other concurrent
--- work to do while a stream is in flight.
 local STREAM_CHUNK_CODEPOINTS = 16
-local STREAM_PACE_SECONDS     = 0.02
+local STREAM_PACE_MS          = 20
 
 -- Skip pacing under tests — agentic_cli_mock_e2e fires several
 -- scenarios with a 10s wall-clock cap and the long-stream regression
@@ -622,11 +619,25 @@ local function pacing_enabled()
   return not (v == "1" or v == "true")
 end
 
+-- Yield-style pace: `nefor.sleep` is a tokio timer awaited from inside
+-- the host's async task, so the runtime can poll *other* dispatch tasks
+-- (notably the in-flight `<NAME>.interrupt` handler that sets the
+-- per-chat cancel flag) while we're paused between chunks. Earlier shape
+-- used `os.execute("sleep …")`, which spawns a blocking subprocess and
+-- holds the Lua coroutine; the dispatch loop still couldn't deliver an
+-- interrupt mid-stream, so /cancel only landed after the canned text
+-- finished — visible bug.
 local function pace()
   if pacing_enabled() then
-    os.execute("sleep " .. tostring(STREAM_PACE_SECONDS))
+    nefor.sleep(STREAM_PACE_MS)
   end
 end
+
+-- Per-chat interrupt flag. Set by the `<NAME>.interrupt` handler when an
+-- envelope lands during a stream; the streaming loops check it on every
+-- chunk boundary and break early. Keyed by chat_id so concurrent chats
+-- (one per active spawn_graph node) don't mistakenly cancel each other.
+local interrupted = {}
 
 local function emit_reasoning(chat_id, id)
   -- Emit reasoning chunks ahead of the content stream, then a
@@ -634,6 +645,7 @@ local function emit_reasoning(chat_id, id)
   -- openai-provider does on a real Qwen 3 turn.
   local full = ""
   for i, chunk in ipairs(CANNED_REASONING_CHUNKS) do
+    if interrupted[chat_id] then return false end
     full = full .. chunk
     nefor.emit("stream.reasoning_delta", {
       id      = id,
@@ -642,21 +654,27 @@ local function emit_reasoning(chat_id, id)
     })
     if i < #CANNED_REASONING_CHUNKS then pace() end
   end
+  if interrupted[chat_id] then return false end
   nefor.emit("stream.reasoning_end", {
     id          = id,
     chat_id     = chat_id,
     text        = full,
     duration_ms = 250,
   })
+  return true
 end
 
+-- Emit the full response stream. Returns true if it ran to completion,
+-- false if `interrupted[chat_id]` flipped mid-stream so the caller knows
+-- to skip the chat.complete.result and emit chat.error("interrupted")
+-- instead — mirrors openai-provider's turn.error("interrupted") path.
 local function emit_stream(chat_id, text, opts)
-  if type(text) ~= "string" or #text == 0 then return end
+  if type(text) ~= "string" or #text == 0 then return true end
   opts = opts or {}
   local id = "resp-" .. chat_id
 
   if opts.with_reasoning then
-    emit_reasoning(chat_id, id)
+    if not emit_reasoning(chat_id, id) then return false end
   end
 
   -- Stream the response in small fixed-size chunks paced to ~200 tok/s
@@ -668,6 +686,7 @@ local function emit_stream(chat_id, text, opts)
   local cp_per_chunk = STREAM_CHUNK_CODEPOINTS
   local cp_i = 1
   while cp_i <= cp_count do
+    if interrupted[chat_id] then return false end
     local cp_stop = math.min(cp_i + cp_per_chunk - 1, cp_count)
     local byte_start = utf8.offset(text, cp_i)
     local byte_after_stop = utf8.offset(text, cp_stop + 1)
@@ -680,6 +699,7 @@ local function emit_stream(chat_id, text, opts)
     cp_i = cp_stop + 1
     if cp_i <= cp_count then pace() end
   end
+  if interrupted[chat_id] then return false end
   nefor.emit("stream.end", {
     id            = id,
     chat_id       = chat_id,
@@ -687,6 +707,7 @@ local function emit_stream(chat_id, text, opts)
     model         = "mock-model",
     duration_ms   = 0,
   })
+  return true
 end
 
 -- ------------------------------------------------------------------
@@ -733,6 +754,12 @@ nefor.on(NAME .. ".chat.complete", function(body)
   local chat_id = body.chat_id
   if type(chat_id) ~= "string" then return end
 
+  -- Clear any leftover interrupt flag from a prior turn on this
+  -- chat_id; the flag is set by the `<NAME>.interrupt` handler when
+  -- /cancel fires mid-stream and is consumed by emit_stream's per-
+  -- chunk check below.
+  interrupted[chat_id] = nil
+
   local resp = pick_response_for(chat_id)
   nefor.log(string.format(
     "chat.complete chat_id=%s finish=%s text_len=%d tool_calls=%s",
@@ -765,8 +792,22 @@ nefor.on(NAME .. ".chat.complete", function(body)
   -- `with_reasoning` flag is set on the deferred-result relay turn so
   -- the orchestrator's wrap node demonstrates the live thinking →
   -- collapse rendering path.
+  local completed = true
   if type(resp.text) == "string" and #resp.text > 0 then
-    emit_stream(chat_id, resp.text, { with_reasoning = resp.with_reasoning })
+    completed = emit_stream(chat_id, resp.text, { with_reasoning = resp.with_reasoning })
+  end
+
+  -- Cancelled mid-stream: emit `<name>.chat.error` with msg "interrupted"
+  -- so the wrapper translates it into a `[interrupted]` system message
+  -- (mirrors openai-provider's turn.error("interrupted") path) and skip
+  -- the result wire — the agentic-loop's pending entry closes via
+  -- chat.error → tool.result{error="interrupted"}.
+  if not completed then
+    interrupted[chat_id] = nil
+    nefor.emit("chat.error", { chat_id = chat_id, message = "interrupted" })
+    if not chats[chat_id] then chats[chat_id] = {} end
+    table.insert(chats[chat_id], { role = "assistant", content = "" })
+    return
   end
 
   -- chat.complete.result with ProviderOut shape.
@@ -805,14 +846,36 @@ nefor.on(NAME .. ".chat.complete", function(body)
   })
 end)
 
+-- Cancellation hook. The chat-side `chat.interrupt` envelope is
+-- translated by the openai-provider wrapper to `<NAME>.interrupt`
+-- (carrying the chat_id, so concurrent chats don't clobber each other);
+-- when it lands during a stream we flip the per-chat flag and the
+-- emit_stream / emit_reasoning loops break at the next chunk boundary.
+-- Without this hook /cancel had to wait for the canned text to finish
+-- before taking effect.
+nefor.on(NAME .. ".interrupt", function(body)
+  local chat_id = body and body.chat_id
+  if type(chat_id) == "string" then
+    interrupted[chat_id] = true
+    nefor.log("interrupt chat_id=" .. chat_id)
+  else
+    -- Bare interrupt without chat_id: cancel every active chat. Rare
+    -- (the wrapper always carries the chat_id) but defensive.
+    for k, _ in pairs(chats) do interrupted[k] = true end
+    nefor.log("interrupt fanned out (no chat_id)")
+  end
+end)
+
 nefor.on(NAME .. ".chat.delete", function(body)
   local chat_id = body.chat_id
   if type(chat_id) ~= "string" then return end
   chats[chat_id] = nil
+  interrupted[chat_id] = nil
 end)
 
 nefor.on(NAME .. ".reset", function()
   chats = {}
+  interrupted = {}
 end)
 
 -- Tool-result accumulation is handled by rg_adapter's `adapter`

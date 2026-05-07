@@ -205,6 +205,117 @@ async fn echo_script_mirrors_events_back() {
     cleanup(&script);
 }
 
+/// Pinned regression for the cancel-mid-stream bug: while a Lua handler
+/// streams chunks via `nefor.sleep`-paced loops, an inbound `interrupt`
+/// envelope must land at the next sleep yield rather than waiting for
+/// the full stream to drain. The mock plugin's `chat.complete` handler
+/// can run for a long time (paced canned text); the wrapper translates
+/// `chat.interrupt` to `<NAME>.interrupt`, and the handler is expected
+/// to flip a per-chat flag the streaming loop checks. The fix has two
+/// halves: (a) `main::run_dispatch_loop` spawns each dispatch as its own
+/// tokio task so the loop itself never blocks on an in-flight handler;
+/// (b) the streaming script uses `nefor.sleep` (yields the runtime) and
+/// checks the flag between chunks. This test exercises both.
+#[tokio::test]
+async fn interrupt_envelope_breaks_streaming_loop_at_next_sleep_yield() {
+    let script = temp_script(
+        "interrupt-mid-stream",
+        r#"
+        local interrupted = false
+        nefor.on("peer.start", function()
+            for i = 1, 50 do
+                if interrupted then
+                    nefor.emit("stopped", { at = i })
+                    return
+                end
+                nefor.emit("tick", { i = i })
+                nefor.sleep(20)
+            end
+            nefor.emit("done", {})
+        end)
+        nefor.on("peer.stop", function()
+            interrupted = true
+        end)
+        "#,
+    );
+    let mut child = spawn_mock(&script).await;
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+
+    let _ready = read_line(&mut reader).await.expect("ready");
+    send_ready_ok(&mut stdin).await;
+
+    // Kick off the slow loop.
+    let mut start_body = serde_json::Map::new();
+    start_body.insert("kind".into(), serde_json::Value::String("peer.start".into()));
+    let start = Envelope::event(
+        PluginName::new("peer").expect("valid"),
+        Timestamp::now(),
+        start_body,
+    );
+    stdin.write_all(start.to_line().as_bytes()).await.expect("w");
+    stdin.write_all(b"\n").await.expect("nl");
+    stdin.flush().await.expect("flush");
+
+    // Read a few ticks so we know we're mid-stream — confirms the
+    // handler is yielding to the runtime instead of blocking.
+    let tick1 = read_line(&mut reader).await.expect("tick1");
+    let tick2 = read_line(&mut reader).await.expect("tick2");
+    assert!(tick1.contains("\"mock-plugin.tick\""), "first line should be a tick: {tick1}");
+    assert!(tick2.contains("\"mock-plugin.tick\""), "second line should be a tick: {tick2}");
+
+    // Send the interrupt while the loop is paused at `nefor.sleep`.
+    let mut stop_body = serde_json::Map::new();
+    stop_body.insert("kind".into(), serde_json::Value::String("peer.stop".into()));
+    let stop = Envelope::event(
+        PluginName::new("peer").expect("valid"),
+        Timestamp::now(),
+        stop_body,
+    );
+    stdin.write_all(stop.to_line().as_bytes()).await.expect("w");
+    stdin.write_all(b"\n").await.expect("nl");
+    stdin.flush().await.expect("flush");
+
+    // Drain remaining lines; expect a `stopped` envelope BEFORE we'd see
+    // 50 ticks. With the buggy shape (inline await, no sleep yield) the
+    // interrupt sits in the input queue and `stopped` never arrives —
+    // we'd see all 50 ticks then `done`.
+    let mut saw_stopped = false;
+    let mut saw_done = false;
+    let mut tick_count = 2; // already counted the first two
+    for _ in 0..60 {
+        let line = match timeout(Duration::from_secs(2), read_line(&mut reader)).await {
+            Ok(Some(l)) => l,
+            _ => break,
+        };
+        if line.contains("\"mock-plugin.tick\"") {
+            tick_count += 1;
+        } else if line.contains("\"mock-plugin.stopped\"") {
+            saw_stopped = true;
+            break;
+        } else if line.contains("\"mock-plugin.done\"") {
+            saw_done = true;
+            break;
+        }
+    }
+
+    send_shutdown(&mut stdin).await;
+    drop(stdin);
+    let _ = timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("exit in time")
+        .expect("wait");
+
+    assert!(saw_stopped, "stopped envelope must arrive after interrupt; tick_count={tick_count} done={saw_done}");
+    assert!(
+        tick_count < 50,
+        "interrupt should break the stream early; got {tick_count} ticks (full stream is 50)"
+    );
+
+    cleanup(&script);
+}
+
 #[tokio::test]
 async fn emit_before_ready_errors_in_script_load() {
     // Calling nefor.emit at top level runs before the handshake, so the
