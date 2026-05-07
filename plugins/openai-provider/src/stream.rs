@@ -53,10 +53,28 @@ pub enum StreamError {
     /// separately so the dispatcher can transition auth state.
     #[error("HTTP 401: {body}")]
     Unauthorized { body: String },
+    /// 400 specifically signalling the model doesn't support tool-calling
+    /// (Ollama: `<model> does not support tools`). Surfaced as its own
+    /// variant so the dispatcher can transparently retry the same turn
+    /// without the `tools` array — the user's mental model is "I sent a
+    /// message, the model should reply", not "raw HTTP error". The
+    /// dispatcher also caches the model as tools-incapable so subsequent
+    /// turns skip the round-trip cost.
+    #[error("model does not support tools: {body}")]
+    ToolsUnsupported { body: String },
     #[error("HTTP {status}: {body}")]
     Http { status: u16, body: String },
     #[error("read error mid-stream: {0}")]
     Body(String),
+}
+
+/// Heuristic: does this error body match the "model does not support
+/// tools" signature Ollama emits when the active model lacks the `tools`
+/// capability? Match the substring rather than parsing the JSON shape so
+/// future minor wording changes (model name, surrounding quotes) don't
+/// break the detection. Case-insensitive on the keyword phrase.
+pub(crate) fn body_signals_tools_unsupported(body: &str) -> bool {
+    body.to_ascii_lowercase().contains("does not support tools")
 }
 
 /// Boundary signal passed to the reasoning callback. The dispatcher
@@ -159,6 +177,12 @@ where
             .unwrap_or_else(|_| "<unreadable response body>".into());
         if status == 401 {
             return Err(StreamError::Unauthorized { body });
+        }
+        // Reactive fallback: only meaningful when the request actually
+        // carried tools. If we sent no tools and still got the signature,
+        // the server is telling us something else — fall through to Http.
+        if status == 400 && tools.is_some() && body_signals_tools_unsupported(&body) {
+            return Err(StreamError::ToolsUnsupported { body });
         }
         return Err(StreamError::Http { status, body });
     }
@@ -443,6 +467,28 @@ impl ToolCallAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_signals_tools_unsupported_matches_ollama_exact_phrase() {
+        // Ollama 0.x body shape, lifted from the user-reported bug.
+        let body = r#"{"error":{"message":"registry.ollama.ai/library/translategemma:latest does not support tools"}}"#;
+        assert!(body_signals_tools_unsupported(body));
+    }
+
+    #[test]
+    fn body_signals_tools_unsupported_is_case_insensitive() {
+        assert!(body_signals_tools_unsupported(
+            "Model Does Not Support Tools"
+        ));
+    }
+
+    #[test]
+    fn body_signals_tools_unsupported_rejects_unrelated_400() {
+        assert!(!body_signals_tools_unsupported(
+            r#"{"error":{"message":"model not found"}}"#
+        ));
+        assert!(!body_signals_tools_unsupported("invalid api key"));
+    }
 
     #[test]
     fn drain_yields_deltas_then_finish_and_usage() {

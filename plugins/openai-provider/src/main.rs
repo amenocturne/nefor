@@ -446,7 +446,14 @@ async fn dispatch_event(
         }
         "models.list_requested" => {
             let token = auth.token().await;
-            match list_models(client, &config.base_url, token.as_deref(), &config.auth_header).await {
+            match list_models(
+                client,
+                &config.base_url,
+                token.as_deref(),
+                &config.auth_header,
+            )
+            .await
+            {
                 Ok(models) => {
                     send_event(out_tx, models_listed_body(config, &models)).await?;
                 }
@@ -460,6 +467,11 @@ async fn dispatch_event(
                         }
                         StreamError::Request(s) => format!("request failed: {s}"),
                         StreamError::Body(s) => format!("read error: {s}"),
+                        // list_models doesn't send `tools`; the variant
+                        // can't fire here, but match exhaustively.
+                        StreamError::ToolsUnsupported { body } => {
+                            format!("HTTP 400: {}", snippet(body))
+                        }
                     };
                     if matches!(e, StreamError::Unauthorized { .. }) {
                         let snap = auth.mark_auth_error(HTTP_401_MESSAGE.to_owned()).await;
@@ -643,7 +655,15 @@ fn spawn_turn(
                 "history snapshot for turn iteration",
             );
             let chat_tools_on = chats.tools_enabled(&chat_id).await.unwrap_or(true);
-            let tools_array = if chat_tools_on {
+            // Per-model cache: a model the upstream previously rejected
+            // with the "does not support tools" signature stays disabled
+            // for the rest of this process — even on a fresh chat. The
+            // chat-level flag stays the discriminator for explicit opt-
+            // outs (sub-graph responder, etc); the model-level cache is
+            // a lazy capability cache populated reactively on the first
+            // 400 we see for each model.
+            let model_tools_supported = chats.model_supports_tools(&active_model).await;
+            let tools_array = if chat_tools_on && model_tools_supported {
                 catalog.to_openai_tools().await
             } else {
                 Vec::new()
@@ -869,6 +889,31 @@ fn spawn_turn(
                     final_tool_calls = outcome.tool_calls;
                     break;
                 }
+                Err(StreamError::ToolsUnsupported { body }) => {
+                    // Reactive fallback: the upstream rejected the request
+                    // because the active model lacks the `tools` capability
+                    // (e.g. ollama against `translategemma`). User's mental
+                    // model is "I sent a message, the model should reply" —
+                    // surfacing the raw 400 fails that. Mark the model as
+                    // tools-incapable for the rest of this process and the
+                    // chat as tools-off so subsequent iterations + future
+                    // turns skip the round-trip, then `continue` to retry
+                    // *this* iteration with no tools array. The retry can't
+                    // re-enter this arm because the next iteration's
+                    // `tools_array` is empty (chat flag flipped + model-
+                    // cache populated).
+                    tracing::info!(
+                        target: "openai_provider::tools",
+                        chat_id = %chat_id,
+                        model = %active_model,
+                        body = %body,
+                        "model rejected tools — falling back to chat-only mode for this model",
+                    );
+                    chats.mark_model_tools_unsupported(&active_model).await;
+                    let _ = chats.set_tools_enabled(&chat_id, false).await;
+                    iterations = iterations.saturating_sub(1);
+                    continue;
+                }
                 Err(e) => {
                     let msg = match &e {
                         StreamError::Unauthorized { body } => {
@@ -879,6 +924,11 @@ fn spawn_turn(
                         }
                         StreamError::Request(s) => format!("request failed: {s}"),
                         StreamError::Body(s) => format!("stream read error: {s}"),
+                        // Handled above in its own arm — unreachable here,
+                        // listed for exhaustiveness.
+                        StreamError::ToolsUnsupported { body } => {
+                            format!("HTTP 400: {}", extract_error_message(body))
+                        }
                     };
                     tracing::warn!(error = %e, "turn failed");
                     if matches!(e, StreamError::Unauthorized { .. }) {

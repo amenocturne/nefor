@@ -5,6 +5,7 @@
 //! pulling in axum/hyper-server for one test file.
 
 use openai_provider::openai::Message;
+use openai_provider::state::{ChatId, Chats};
 use openai_provider::stream::{list_models, run_chat_stream, StreamError};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -234,7 +235,9 @@ async fn list_models_returns_sorted_ids() {
 
     let client = reqwest::Client::builder().build().expect("client");
     let base_url = format!("http://{}", addr);
-    let models = list_models(&client, &base_url, None, "Authorization").await.expect("ok");
+    let models = list_models(&client, &base_url, None, "Authorization")
+        .await
+        .expect("ok");
 
     let _ = server.await;
 
@@ -546,4 +549,425 @@ async fn request_body_omits_tools_when_none_attached() {
     let body = captured.lock().await.clone();
     let v: serde_json::Value = serde_json::from_str(&body).expect("body json");
     assert!(v.get("tools").is_none(), "no tools field when None: {body}");
+}
+
+/// Reactive fallback contract: when the upstream returns 400 with the
+/// "model does not support tools" signature AND we sent tools in the
+/// request, `run_chat_stream` surfaces the dedicated
+/// `StreamError::ToolsUnsupported` variant. The turn loop in main.rs
+/// pattern-matches on this variant to mark the model + flip the chat's
+/// `tools_enabled` flag and retry the iteration.
+#[tokio::test]
+async fn http_400_with_tools_unsupported_signature_yields_dedicated_variant() {
+    let (listener, addr) = bind_local().await;
+
+    let server = tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.expect("accept");
+        let _ = read_request(&mut s).await;
+        // Verbatim body shape the user reported (translategemma).
+        let body = r#"{"error":{"message":"registry.ollama.ai/library/translategemma:latest does not support tools"}}"#;
+        let response = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = s.write_all(response.as_bytes()).await;
+        let _ = s.shutdown().await;
+    });
+
+    let client = reqwest::Client::builder().build().expect("client");
+    let endpoint = format!("http://{}/v1/chat/completions", addr);
+    let messages = vec![Message::user("hi")];
+    let tools_array = vec![serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read.",
+            "parameters": {"type": "object"}
+        }
+    })];
+
+    let err = run_chat_stream(
+        &client,
+        &endpoint,
+        None,
+        "Authorization",
+        "translategemma",
+        &messages,
+        Some(&tools_array),
+        CancellationToken::new(),
+        |_| {},
+        |_| {},
+    )
+    .await
+    .expect_err("400 should fail");
+
+    let _ = server.await;
+
+    match err {
+        StreamError::ToolsUnsupported { body } => {
+            assert!(
+                body.contains("does not support tools"),
+                "body carried: {body}"
+            );
+        }
+        other => panic!("expected ToolsUnsupported, got {other:?}"),
+    }
+}
+
+/// Disambiguator: same 400-with-signature body but the request did NOT
+/// carry tools. The dedicated variant must NOT fire — we only treat
+/// "tools" as the cause when we actually sent them. Falls through to the
+/// generic `Http` variant so the user sees the underlying error.
+#[tokio::test]
+async fn http_400_without_tools_in_request_falls_through_to_http_error() {
+    let (listener, addr) = bind_local().await;
+
+    let server = tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.expect("accept");
+        let _ = read_request(&mut s).await;
+        let body = r#"{"error":{"message":"some-model does not support tools"}}"#;
+        let response = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = s.write_all(response.as_bytes()).await;
+        let _ = s.shutdown().await;
+    });
+
+    let client = reqwest::Client::builder().build().expect("client");
+    let endpoint = format!("http://{}/v1/chat/completions", addr);
+    let messages = vec![Message::user("hi")];
+
+    let err = run_chat_stream(
+        &client,
+        &endpoint,
+        None,
+        "Authorization",
+        "some-model",
+        &messages,
+        None, // <-- the discriminator
+        CancellationToken::new(),
+        |_| {},
+        |_| {},
+    )
+    .await
+    .expect_err("400 should fail");
+
+    let _ = server.await;
+
+    match err {
+        StreamError::Http { status, .. } => assert_eq!(status, 400),
+        other => panic!("expected generic Http, got {other:?}"),
+    }
+}
+
+/// End-to-end retry contract: when the upstream rejects tools on the
+/// first call, the turn loop's reactive fallback (mark model + flip chat
+/// flag → omit tools on retry) succeeds on the second call. Mirrors the
+/// exact logic main.rs runs in the turn loop's `Err(ToolsUnsupported)`
+/// arm. Two server requests on a single endpoint:
+///   1) tools present → 400 with the signature.
+///   2) tools omitted → 200 streaming response.
+/// Asserts: both calls land on the same endpoint, the second omits the
+/// `tools` field, and the cache correctly suppresses tools on retry.
+#[tokio::test]
+async fn reactive_fallback_retries_without_tools_after_signature_400() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    // Captured request bodies from each connection so we can assert the
+    // wire shape changes between attempts.
+    let req1: std::sync::Arc<tokio::sync::Mutex<String>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+    let req2: std::sync::Arc<tokio::sync::Mutex<String>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+    let req1_c = req1.clone();
+    let req2_c = req2.clone();
+
+    let server = tokio::spawn(async move {
+        // First connection: respond with 400 + signature.
+        let (mut s, _) = listener.accept().await.expect("accept 1");
+        let mut buf = vec![0u8; 8192];
+        let mut acc = String::new();
+        loop {
+            let n = s.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+            if let Some(headers_end) = acc.find("\r\n\r\n") {
+                let cl: usize = acc
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("content-length:")
+                            .or_else(|| l.strip_prefix("Content-Length:"))
+                    })
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                let body_so_far = acc.len() - (headers_end + 4);
+                if body_so_far >= cl {
+                    break;
+                }
+            }
+        }
+        if let Some(idx) = acc.find("\r\n\r\n") {
+            *req1_c.lock().await = acc[idx + 4..].to_owned();
+        }
+        let body = r#"{"error":{"message":"translategemma:latest does not support tools"}}"#;
+        let response = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = s.write_all(response.as_bytes()).await;
+        let _ = s.shutdown().await;
+
+        // Second connection: respond with the streaming success body.
+        let (mut s, _) = listener.accept().await.expect("accept 2");
+        let mut buf = vec![0u8; 8192];
+        let mut acc = String::new();
+        loop {
+            let n = s.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+            if let Some(headers_end) = acc.find("\r\n\r\n") {
+                let cl: usize = acc
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("content-length:")
+                            .or_else(|| l.strip_prefix("Content-Length:"))
+                    })
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                let body_so_far = acc.len() - (headers_end + 4);
+                if body_so_far >= cl {
+                    break;
+                }
+            }
+        }
+        if let Some(idx) = acc.find("\r\n\r\n") {
+            *req2_c.lock().await = acc[idx + 4..].to_owned();
+        }
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                    data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n\
+                    data: [DONE]\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = s.write_all(response.as_bytes()).await;
+        let _ = s.shutdown().await;
+    });
+
+    let chats = Chats::with_default_model(Some("translategemma".into()));
+    let chat_id = ChatId::new("c1");
+    chats
+        .create(chat_id.clone(), Some("translategemma".into()), None)
+        .await
+        .expect("create");
+
+    let client = reqwest::Client::builder().build().expect("client");
+    let endpoint = format!("http://{}/v1/chat/completions", addr);
+    let messages = vec![Message::user("just chatting")];
+    let tools_array = vec![serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read.",
+            "parameters": {"type": "object"}
+        }
+    })];
+
+    // Mirror the turn-loop contract: build tools-array conditional on
+    // both per-chat flag AND per-model cache.
+    let chat_on = chats.tools_enabled(&chat_id).await.expect("tools_enabled");
+    let model_on = chats.model_supports_tools("translategemma").await;
+    let tools_for_first: Option<&[serde_json::Value]> = if chat_on && model_on {
+        Some(&tools_array)
+    } else {
+        None
+    };
+    assert!(tools_for_first.is_some(), "first call must include tools");
+
+    let first = run_chat_stream(
+        &client,
+        &endpoint,
+        None,
+        "Authorization",
+        "translategemma",
+        &messages,
+        tools_for_first,
+        CancellationToken::new(),
+        |_| {},
+        |_| {},
+    )
+    .await;
+
+    // Assert the dedicated variant — exactly what main.rs's turn-loop
+    // pattern-matches on.
+    match first {
+        Err(StreamError::ToolsUnsupported { body }) => {
+            assert!(body.contains("does not support tools"));
+        }
+        other => panic!("expected ToolsUnsupported on first call, got {other:?}"),
+    }
+
+    // Reactive fallback: mirror the turn-loop's response — mark model +
+    // flip chat-level flag.
+    chats.mark_model_tools_unsupported("translategemma").await;
+    chats
+        .set_tools_enabled(&chat_id, false)
+        .await
+        .expect("set tools off");
+
+    // Re-evaluate: the cache must now suppress tools.
+    let chat_on = chats.tools_enabled(&chat_id).await.expect("tools_enabled");
+    let model_on = chats.model_supports_tools("translategemma").await;
+    let tools_for_retry: Option<&[serde_json::Value]> = if chat_on && model_on {
+        Some(&tools_array)
+    } else {
+        None
+    };
+    assert!(
+        tools_for_retry.is_none(),
+        "retry must omit tools after marking model + chat as incapable"
+    );
+
+    let outcome = run_chat_stream(
+        &client,
+        &endpoint,
+        None,
+        "Authorization",
+        "translategemma",
+        &messages,
+        tools_for_retry,
+        CancellationToken::new(),
+        |_| {},
+        |_| {},
+    )
+    .await
+    .expect("retry succeeds");
+
+    let _ = server.await;
+
+    assert_eq!(outcome.full_text, "hi");
+    assert_eq!(outcome.finish_reason.as_deref(), Some("stop"));
+
+    // Pin the wire shape: first request carried tools, second omitted them.
+    let body1 = req1.lock().await.clone();
+    let v1: serde_json::Value = serde_json::from_str(&body1).expect("body1 json");
+    assert!(
+        v1.get("tools").is_some(),
+        "first request must carry tools field, body: {body1}"
+    );
+    let body2 = req2.lock().await.clone();
+    let v2: serde_json::Value = serde_json::from_str(&body2).expect("body2 json");
+    assert!(
+        v2.get("tools").is_none(),
+        "retry request must omit tools field, body: {body2}"
+    );
+}
+
+/// Cache test: a fresh chat against a model already marked
+/// tools-unsupported skips the round-trip — the very first request
+/// against this chat omits tools without paying the 400 cost. This is
+/// what makes the model-level cache valuable beyond the per-chat flag:
+/// every chat against the incapable model is fast on the first turn.
+#[tokio::test]
+async fn marked_model_skips_tools_on_first_turn_of_a_brand_new_chat() {
+    let chats = Chats::with_default_model(Some("translategemma".into()));
+    chats.mark_model_tools_unsupported("translategemma").await;
+
+    let chat_id = ChatId::new("fresh-chat");
+    chats
+        .create(chat_id.clone(), Some("translategemma".into()), None)
+        .await
+        .expect("create");
+
+    // Per-chat flag is still default-on (the chat never paid the round-
+    // trip), but the model cache vetoes tools.
+    assert!(
+        chats.tools_enabled(&chat_id).await.expect("tools_enabled"),
+        "per-chat flag stays on"
+    );
+    assert!(
+        !chats.model_supports_tools("translategemma").await,
+        "model cache says no"
+    );
+
+    // Combined gate (mirrors the turn-loop logic) → tools omitted.
+    let chat_on = chats.tools_enabled(&chat_id).await.expect("on");
+    let model_on = chats.model_supports_tools("translategemma").await;
+    assert!(
+        !(chat_on && model_on),
+        "combined gate should suppress tools on first turn for a known-incapable model"
+    );
+
+    // A different model is unaffected.
+    assert!(chats.model_supports_tools("qwen3").await);
+}
+
+/// Disambiguator: an unrelated 400 (not the "does not support tools"
+/// signature) must still surface as the generic `Http` variant even when
+/// tools were sent. The tools-fallback logic only fires on the exact
+/// signature, never on arbitrary 400s — otherwise a transient bad-request
+/// would silently disable tools for the rest of the process.
+#[tokio::test]
+async fn http_400_with_unrelated_message_falls_through_to_http_error() {
+    let (listener, addr) = bind_local().await;
+
+    let server = tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.expect("accept");
+        let _ = read_request(&mut s).await;
+        let body = r#"{"error":{"message":"context length exceeded"}}"#;
+        let response = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = s.write_all(response.as_bytes()).await;
+        let _ = s.shutdown().await;
+    });
+
+    let client = reqwest::Client::builder().build().expect("client");
+    let endpoint = format!("http://{}/v1/chat/completions", addr);
+    let messages = vec![Message::user("hi")];
+    let tools_array = vec![serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read.",
+            "parameters": {"type": "object"}
+        }
+    })];
+
+    let err = run_chat_stream(
+        &client,
+        &endpoint,
+        None,
+        "Authorization",
+        "any-model",
+        &messages,
+        Some(&tools_array),
+        CancellationToken::new(),
+        |_| {},
+        |_| {},
+    )
+    .await
+    .expect_err("400 should fail");
+
+    let _ = server.await;
+
+    match err {
+        StreamError::Http { status, body } => {
+            assert_eq!(status, 400);
+            assert!(body.contains("context length exceeded"));
+        }
+        other => panic!("expected generic Http, got {other:?}"),
+    }
 }

@@ -18,7 +18,7 @@
 //! `<prefix>.chat.create / chat.append / chat.complete` API is what
 //! reasoner-graph (T5) drives directly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use tokio::sync::Mutex;
@@ -129,6 +129,13 @@ pub struct Chats {
     /// instead of guessing.
     default_model: Mutex<Option<String>>,
     inner: Mutex<HashMap<ChatId, ChatState>>,
+    /// Models the upstream rejected with the "does not support tools"
+    /// signature. Process-wide (a model's tool capability is a property
+    /// of the model, not the chat), so a fresh chat against a known-
+    /// incapable model skips the round-trip cost of the first failed
+    /// turn. Cleared only by process restart — sufficient because the
+    /// model's capabilities don't change mid-process.
+    tools_unsupported_models: Mutex<HashSet<String>>,
 }
 
 impl Chats {
@@ -143,6 +150,7 @@ impl Chats {
         Self {
             default_model: Mutex::new(model),
             inner: Mutex::new(HashMap::new()),
+            tools_unsupported_models: Mutex::new(HashSet::new()),
         }
     }
 
@@ -194,6 +202,37 @@ impl Chats {
         g.get(id)
             .map(|c| c.tools_enabled)
             .ok_or_else(|| ChatsError::NotFound(id.clone()))
+    }
+
+    /// Flip a chat's tools-enabled flag — called after the reactive
+    /// "model doesn't support tools" 400 lands so the same chat's next
+    /// turn skips the round-trip. Idempotent; no-op if the chat vanished
+    /// mid-turn (the surrounding error path already logged that).
+    pub async fn set_tools_enabled(&self, id: &ChatId, enabled: bool) -> Result<(), ChatsError> {
+        let mut g = self.inner.lock().await;
+        let chat = g
+            .get_mut(id)
+            .ok_or_else(|| ChatsError::NotFound(id.clone()))?;
+        chat.tools_enabled = enabled;
+        Ok(())
+    }
+
+    /// Mark a model as known-tools-incapable. Subsequent
+    /// `model_supports_tools` checks return false for this exact name.
+    /// Comparison is exact: a per-spawn model.set with a slight rename
+    /// (e.g. tag suffix) is treated as a separate model and pays the
+    /// round-trip once.
+    pub async fn mark_model_tools_unsupported(&self, model: &str) {
+        self.tools_unsupported_models
+            .lock()
+            .await
+            .insert(model.to_owned());
+    }
+
+    /// True unless we've seen the upstream reject this exact model's
+    /// chat-completions call with the "does not support tools" signature.
+    pub async fn model_supports_tools(&self, model: &str) -> bool {
+        !self.tools_unsupported_models.lock().await.contains(model)
     }
 
     /// Idempotent variant for the default-chat compat path: creates the
@@ -653,6 +692,49 @@ mod tests {
             .delete(&ChatId::new("ghost"))
             .await
             .expect_err("delete missing");
+        assert!(matches!(err, ChatsError::NotFound(_)));
+    }
+
+    // --- tools-unsupported model cache ------------------------------
+
+    #[tokio::test]
+    async fn fresh_chats_supports_tools_for_any_model() {
+        let c = Chats::with_default_model(Some("m".into()));
+        assert!(c.model_supports_tools("translategemma").await);
+        assert!(c.model_supports_tools("anything-else").await);
+    }
+
+    #[tokio::test]
+    async fn marking_a_model_unsupported_persists_across_calls() {
+        let c = Chats::with_default_model(Some("m".into()));
+        c.mark_model_tools_unsupported("translategemma").await;
+        assert!(!c.model_supports_tools("translategemma").await);
+        // Other models unaffected.
+        assert!(c.model_supports_tools("qwen3").await);
+        // Idempotent re-mark.
+        c.mark_model_tools_unsupported("translategemma").await;
+        assert!(!c.model_supports_tools("translategemma").await);
+    }
+
+    #[tokio::test]
+    async fn set_tools_enabled_flips_per_chat_flag() {
+        let c = Chats::with_default_model(Some("m".into()));
+        let id = ChatId::new("a");
+        c.create(id.clone(), None, None).await.expect("create");
+        assert!(c.tools_enabled(&id).await.expect("on"));
+        c.set_tools_enabled(&id, false).await.expect("flip off");
+        assert!(!c.tools_enabled(&id).await.expect("off"));
+        c.set_tools_enabled(&id, true).await.expect("flip on");
+        assert!(c.tools_enabled(&id).await.expect("on again"));
+    }
+
+    #[tokio::test]
+    async fn set_tools_enabled_on_unknown_chat_errors() {
+        let c = Chats::with_default_model(Some("m".into()));
+        let err = c
+            .set_tools_enabled(&ChatId::new("ghost"), false)
+            .await
+            .expect_err("ghost");
         assert!(matches!(err, ChatsError::NotFound(_)));
     }
 }
