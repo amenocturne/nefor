@@ -176,6 +176,19 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
     // `render_if_dirty` returns `None`, so the loop just goes back to
     // sleep.
     let mut anim_tick = interval(Duration::from_millis(16));
+    // 1Hz wall-clock tick for live elapsed-ms labels — DAG node
+    // "running 18s" badges, the [thinking… 5s] turn-elapsed counter,
+    // etc. The Lua composition formats these labels against
+    // `tui.now_ms()` at paint time, so the *value* changes once per
+    // second even though no event fires; without a periodic mark-
+    // dirty the renderer stays clean and the label visibly freezes
+    // until the next user keystroke or bus envelope. Ticking at 1Hz
+    // matches the second-resolution of the labels themselves — going
+    // higher just burns CPU and battery for no visible difference
+    // (Bug A5 per-second rerender). The 60Hz animation tick is
+    // independent and continues to serve sub-second animation
+    // primitives (toast slide, spinner, …).
+    let mut wallclock_tick = interval(Duration::from_secs(1));
     loop {
         tokio::select! {
             maybe_env = in_rx.recv() => match maybe_env {
@@ -217,6 +230,14 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
                 if engine.has_active_animations() {
                     engine.mark_animation_tick();
                 }
+            }
+            _ = wallclock_tick.tick() => {
+                // Force a repaint so live elapsed-ms labels (DAG node
+                // 'running Ns', [thinking… Ns]) advance even when no
+                // bus envelope or keystroke arrives. The Lua composition
+                // re-reads tui.now_ms() at paint time, so flipping the
+                // dirty flag is enough — no state change required.
+                engine.mark_animation_tick();
             }
         }
 
