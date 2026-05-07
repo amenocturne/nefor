@@ -1,7 +1,7 @@
 //! End-to-end tests for the agentic-cli plugin against the mock provider.
 //!
 //! Spawns the real `nefor` engine binary as a subprocess against
-//! `cli-config/`, with `USE_MOCK_PROVIDER=true` so no live LLM is needed.
+//! `cli-config/`, with `NEFOR_CONFIG=test` so no live LLM is needed.
 //! Each scenario covers one path through the agentic_workflow + agentic_cli
 //! surface: single-shot text/json/stream-json formats, REPL multi-turn,
 //! `--help`, and the `--yolo` placeholder flag.
@@ -112,7 +112,7 @@ fn base_command(xdg: &Path) -> Command {
         .arg(repo_root().join("cli-config"))
         .arg("plugin")
         .arg("agentic-cli")
-        .env("USE_MOCK_PROVIDER", "true")
+        .env("NEFOR_CONFIG", "test")
         .env("NEFOR_PLUGIN_DIR", repo_root().join("plugins"))
         .env("XDG_DATA_HOME", xdg);
     cmd
