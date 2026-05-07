@@ -1,7 +1,11 @@
 -- starter/config.lua — settings table for this composition. Edit values, not call sites.
 --
--- Switch with NEFOR_CONFIG=test (or dev/staging — see aliases below).
--- Default is prod when the env var is unset.
+-- Switch with NEFOR_CONFIG=prod (or staging, which aliases to prod).
+-- Default is `test` when the env var is unset — `nefor --config ./starter`
+-- launches the deterministic mock provider out of the box so a developer
+-- testing interactively gets a self-documenting test machine without an
+-- external LLM. Set NEFOR_CONFIG=prod explicitly to switch to the real
+-- ollama-backed composition.
 --
 -- USE_MOCK_PROVIDER=true is deprecated; if set without NEFOR_CONFIG it
 -- maps to the `test` table and emits a one-line warning via nefor.log.
@@ -87,7 +91,10 @@ elseif legacy_mock then
     io.stderr:write("[nefor] " .. DEPRECATION_MSG .. "\n")
   end
 else
-  variant = "prod"
+  -- Default flip (qol-fixes): unset NEFOR_CONFIG now resolves to `test`
+  -- so the bundled starter is a deterministic mock by default. The
+  -- prod composition stays available via NEFOR_CONFIG=prod.
+  variant = "test"
 end
 
 M.active = M[variant] or error("unknown NEFOR_CONFIG: " .. tostring(variant))
