@@ -1973,7 +1973,14 @@ fn write_styled_row(
             text: s,
             style: sc.style,
         };
-        col += w;
+        col += 1;
+        // Wide-char spillover (East-Asian Wide / Fullwidth / most
+        // emoji): blank the (w - 1) trailing cells so prior-frame ink
+        // can't bleed through, AND so total advance equals the glyph's
+        // display width. Earlier shape did `col += w` then advanced
+        // again per blank, double-counting wide chars and visually
+        // gapping CJK runs (Bug 4 wide chars). Mirrors the same fix in
+        // `write_run` for plain-text painting.
         for _ in 1..w {
             if col >= line_buf.cells.len() || col >= bound {
                 break;
@@ -2143,10 +2150,17 @@ fn write_run(buf: &mut FrameBuffer, row: u16, col_start: u16, text: &str, style:
             text: s,
             style: *style,
         };
-        col += w;
-        // Wide chars: blank out the trailing cell(s) to avoid duplicating
-        // ink. Phase 1/2 are ASCII-only so this branch is dead; landed
-        // for forward compatibility.
+        col += 1;
+        // Wide chars (East-Asian Wide / Fullwidth / most emoji): the
+        // glyph itself painted into one cell above; blank out the
+        // remaining (w - 1) trailing cells so a previous frame's ink
+        // doesn't bleed through, and so total advance equals the
+        // glyph's display width. The earlier shape advanced `col += w`
+        // before this loop AND advanced again per iteration, double-
+        // counting wide chars: e.g. `你 好` rendered as `你  好` with
+        // an extra blank between glyphs and every subsequent char
+        // shifted right one cell per wide-char encountered (Bug 4 wide
+        // chars).
         for _ in 1..w {
             if col >= line.cells.len() {
                 break;
@@ -3578,6 +3592,57 @@ mod tests {
         let st = scrollable_state(&rec);
         assert_eq!(st.scroll_y, 5, "user position preserved");
         assert!(!st.was_at_end);
+    }
+
+    /// Bug 4 (wide chars) regression: a CJK / fullwidth / emoji glyph is
+    /// width-2 per `unicode-width`. Each such char should occupy
+    /// **exactly two cells** — one for the glyph, one blank for the
+    /// spillover — so total horizontal advance equals the glyph's
+    /// display width and `string_width` is honoured. The earlier shape
+    /// did `col += w` for the glyph cell AND advanced once more per
+    /// blank, double-counting the spillover and shifting every char
+    /// after a wide char one extra cell to the right per occurrence
+    /// (visible as e.g. `你 好 世 界` rendering with double-spaced
+    /// glyphs and trailing chars wrapping early).
+    #[test]
+    fn wide_char_writes_one_glyph_plus_one_blank_no_double_advance() {
+        // `你好` is two East-Asian Wide chars (width 2 each = 4 cells
+        // total). After the run, an ASCII `x` should land at col 4.
+        let buf = paint_root(text("你好x"), 8, 1);
+        assert_eq!(cell_at(&buf, 0, 0), "你", "glyph at col 0");
+        assert_eq!(cell_at(&buf, 0, 1), " ", "spillover blank for `你`");
+        assert_eq!(cell_at(&buf, 0, 2), "好", "next glyph at col 2");
+        assert_eq!(cell_at(&buf, 0, 3), " ", "spillover blank for `好`");
+        assert_eq!(cell_at(&buf, 0, 4), "x", "ASCII follows immediately, no extra gap");
+    }
+
+    /// Same contract for the styled-rows path (markdown, spans). The
+    /// Lua composition uses both `tui.text` (plain) and `tui.markdown`
+    /// (styled) for transcript prose, so both writers need the
+    /// invariant pinned.
+    #[test]
+    fn wide_char_writes_through_styled_painter_without_double_advance() {
+        // Drive paint_styled_rows directly via the spans primitive so
+        // we exercise write_styled_row, not write_run. `Spans` painter
+        // delegates to paint_styled_rows.
+        let desc = WidgetDescription::Spans {
+            spans: vec![Span {
+                text: "你好x".into(),
+                style: Style::default(),
+            }],
+            wrap: WrapMode::None,
+            key: None,
+        };
+        let buf = paint_root(desc, 8, 1);
+        assert_eq!(cell_at(&buf, 0, 0), "你");
+        assert_eq!(cell_at(&buf, 0, 1), " ", "spillover blank for `你`");
+        assert_eq!(cell_at(&buf, 0, 2), "好");
+        assert_eq!(cell_at(&buf, 0, 3), " ", "spillover blank for `好`");
+        assert_eq!(
+            cell_at(&buf, 0, 4),
+            "x",
+            "ASCII follows at col 4 with no extra cell gap"
+        );
     }
 
     #[test]
