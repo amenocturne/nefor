@@ -48,62 +48,68 @@ agentic_loop.configure {
   model    = "initial-model",
 }
 
--- Sanity: build_template reflects the seeded model.
+-- Sanity: configure() seeds the live config; build_template does NOT bake
+-- provider/model into wrap_args (the picker is the source of truth — every
+-- reasoner firing falls through to cfg.provider / cfg.model live).
 do
+  assert_eq(agentic_loop.config().provider, "ollama", "configure seeds provider")
+  assert_eq(agentic_loop.config().model,    "initial-model", "configure seeds model")
   local g = agentic_loop.build_template("hi")
   local saw = false
   for _, n in ipairs(g.nodes or {}) do
     if n.id == "wrap" and type(n.args) == "table" then
       saw = true
-      assert_eq(n.args.model, "initial-model", "wrap node carries seeded model")
+      assert_eq(n.args.provider, nil,
+        "wrap node must NOT bake provider into args (picker is source of truth)")
+      assert_eq(n.args.model, nil,
+        "wrap node must NOT bake model into args (picker is source of truth)")
     end
   end
   assert(saw, "wrap node found in template")
 end
 
--- chat.model.set with a non-empty model updates config.model.
+-- chat.model.set with a non-empty model updates the live config.model.
 do
   send_to_loop("nefor-tui", { kind = "chat.model.set", provider = "ollama", model = "new-model" })
-  local g = agentic_loop.build_template("hi")
-  local saw = false
-  for _, n in ipairs(g.nodes or {}) do
-    if n.id == "wrap" and type(n.args) == "table" then
-      saw = true
-      assert_eq(n.args.model, "new-model", "wrap node carries updated model")
-    end
-  end
-  assert(saw, "wrap node found in template after switch")
+  assert_eq(agentic_loop.config().model, "new-model", "config.model updated by chat.model.set")
 end
 
 -- chat.model.set with an empty model is a no-op (no crash, no update).
 do
   send_to_loop("nefor-tui", { kind = "chat.model.set", provider = "ollama", model = "" })
-  local g = agentic_loop.build_template("hi")
-  for _, n in ipairs(g.nodes or {}) do
-    if n.id == "wrap" and type(n.args) == "table" then
-      assert_eq(n.args.model, "new-model", "empty-model set did not clobber config.model")
-    end
-  end
+  assert_eq(agentic_loop.config().model, "new-model", "empty-model set did not clobber config.model")
 end
 
 -- chat.model.set with the model field absent is also a no-op.
 do
   send_to_loop("nefor-tui", { kind = "chat.model.set", provider = "ollama" })
-  local g = agentic_loop.build_template("hi")
-  for _, n in ipairs(g.nodes or {}) do
-    if n.id == "wrap" and type(n.args) == "table" then
-      assert_eq(n.args.model, "new-model", "missing-model set did not clobber config.model")
-    end
-  end
+  assert_eq(agentic_loop.config().model, "new-model", "missing-model set did not clobber config.model")
 end
 
 -- A second switch updates config.model again.
 do
   send_to_loop("nefor-tui", { kind = "chat.model.set", provider = "ollama", model = "another-model" })
+  assert_eq(agentic_loop.config().model, "another-model", "second switch sticks on live config")
+end
+
+-- Bug B1 regression — picker is the source of truth for ALL reasoner
+-- firings. The orchestrator graph builder must NOT bake provider/model
+-- into wrap_args, so wrap and sub-graph responder nodes alike fall
+-- through to the live cfg in `provider_run_node`. Per-node routing is
+-- still opt-in via explicit args.provider / args.model.
+do
+  send_to_loop("nefor-tui", { kind = "chat.model.set", provider = "qwen-provider", model = "qwen-model" })
+  assert_eq(agentic_loop.config().provider, "qwen-provider",
+    "chat.model.set with new provider updates config.provider")
+  assert_eq(agentic_loop.config().model, "qwen-model",
+    "chat.model.set with new model updates config.model")
   local g = agentic_loop.build_template("hi")
   for _, n in ipairs(g.nodes or {}) do
     if n.id == "wrap" and type(n.args) == "table" then
-      assert_eq(n.args.model, "another-model", "second switch sticks")
+      assert_eq(n.args.provider, nil,
+        "after picker switch, wrap_args.provider must remain nil — picker drives via cfg")
+      assert_eq(n.args.model, nil,
+        "after picker switch, wrap_args.model must remain nil — picker drives via cfg")
     end
   end
 end
@@ -387,14 +393,9 @@ do
 
   -- model.set was gated, so config.model must not have changed to the
   -- replay-injected value.
-  local g = agentic_loop.build_template("hi")
-  for _, n in ipairs(g.nodes or {}) do
-    if n.id == "wrap" and type(n.args) == "table" then
-      assert(n.args.model ~= "should-not-stick",
-        "chat.model.set during replay must not mutate config.model; saw "
-        .. tostring(n.args.model))
-    end
-  end
+  assert(agentic_loop.config().model ~= "should-not-stick",
+    "chat.model.set during replay must not mutate config.model; saw "
+    .. tostring(agentic_loop.config().model))
 end
 
 -- ------------------------------------------------------------------
