@@ -1073,6 +1073,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lua_broadcast_send_fires_every_dispatch_callback() {
+        // Post-callback-refactor invariant: a Lua-side broadcast
+        // (`nefor.engine.send` with no target) appends a Step entry +
+        // fires the dispatch hook so every wrapper's `to_plugin` runs.
+        // Pre-refactor the dispatch only fired on inbound plugin lines;
+        // Lua emissions bypassed it. We assert by counting how many
+        // dispatch invocations saw the synthesized broadcast and that
+        // the entry is on the bus log.
+        let shared = shared_state();
+        let host = build_host(
+            &shared,
+            r#"
+            saw = 0
+            function dispatch(current)
+                local last = current[#current]
+                if last and last.payload == "broadcast-from-lua" then
+                    saw = saw + 1
+                end
+            end
+            function invoke_from_plugin(source, payload)
+                -- Triggered by the inbound line; from here we publish a
+                -- broadcast back onto the bus.
+                nefor.engine.send("broadcast-from-lua")
+            end
+            "#,
+        );
+        let lua = host.lua().clone();
+
+        let mut broker = Broker::new(Arc::clone(&shared), host);
+        let (mut p, t) = make_transport();
+        broker.attach_transport(t, pn("a"));
+        let handle = broker.shutdown_handle();
+        let run = tokio::spawn(broker.run());
+
+        send_line(&mut p, "trigger").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle.shutdown(50).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
+
+        let saw: i64 = lua.globals().get("saw").unwrap();
+        assert!(
+            saw >= 1,
+            "Lua broadcast must fire the dispatch hook; saw={saw}"
+        );
+        let entries: Vec<LogEntry> = {
+            let guard = shared.lock().expect("lock shared");
+            guard.event_log.clone()
+        };
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e.origin, Origin::Step) && e.payload == "broadcast-from-lua"),
+            "broadcast must appear on the bus log; got {entries:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn engine_deliver_to_unknown_peer_surfaces_error_to_lua() {
         // deliver to a non-connected peer raises a typed Lua error so
         // the Lua caller (a wrapper's to_plugin or the dispatch hook)
