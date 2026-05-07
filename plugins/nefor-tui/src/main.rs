@@ -193,19 +193,34 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
         tokio::select! {
             maybe_env = in_rx.recv() => match maybe_env {
                 Some(Ok(env)) => {
-                    match env.body {
-                        Body::System(SystemBody::Shutdown { .. }) => break,
-                        Body::System(_) => {
-                            // Other system messages (ready_ok again, errors)
-                            // are not actionable post-handshake; log + skip.
-                            tracing::debug!("post-handshake system message ignored");
-                        }
-                        Body::Event(map) => {
-                            if let Err(e) = engine.dispatch_envelope_body(&map) {
-                                tracing::warn!(error = %e, "engine.dispatch_envelope_body");
+                    let mut shutdown = false;
+                    process_envelope(&mut engine, env, &mut shutdown);
+                    if shutdown { break; }
+                    // Drain any further pending envelopes in this tick
+                    // before we paint. Post batch-protocol refactor the
+                    // engine's per-peer dispatch hands the wrapper a
+                    // batch of envelopes (e.g. an entire replay burst on
+                    // /resume) and the wrapper's `to_plugin(envs)`
+                    // delivers them back-to-back to our stdin. Without
+                    // this drain each line iterates the outer loop
+                    // separately, triggering its own render — N replayed
+                    // chat.stream.delta envelopes meant N reconciler
+                    // passes and N terminal writes, which made /resume
+                    // visibly re-stream the prior session line by line.
+                    // try_recv-style drain absorbs the burst into a
+                    // single state-mutation pass, then the post-loop
+                    // `render_if_dirty` paints the final transcript
+                    // exactly once.
+                    while let Ok(env) = in_rx.try_recv() {
+                        match env {
+                            Ok(e) => {
+                                process_envelope(&mut engine, e, &mut shutdown);
+                                if shutdown { break; }
                             }
+                            Err(e) => tracing::warn!(error = %e, "stdin parse error"),
                         }
                     }
+                    if shutdown { break; }
                 }
                 Some(Err(e)) => tracing::warn!(error = %e, "stdin parse error"),
                 None => break,
@@ -263,6 +278,28 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
     drop(tty_main);
     let _ = out_tx; // keep writer alive until end of run
     Ok(())
+}
+
+/// Dispatch one inbound envelope to the engine. System messages are
+/// either a shutdown signal (sets `shutdown = true`) or post-handshake
+/// noise; `Body::Event` envelopes flow into the Lua reducer via
+/// `dispatch_envelope_body`. Extracted from the main loop so the
+/// in-tick drain that batches a burst of envelopes can apply identical
+/// handling per envelope.
+fn process_envelope(engine: &mut Engine, env: Envelope, shutdown: &mut bool) {
+    match env.body {
+        Body::System(SystemBody::Shutdown { .. }) => {
+            *shutdown = true;
+        }
+        Body::System(_) => {
+            tracing::debug!("post-handshake system message ignored");
+        }
+        Body::Event(map) => {
+            if let Err(e) = engine.dispatch_envelope_body(&map) {
+                tracing::warn!(error = %e, "engine.dispatch_envelope_body");
+            }
+        }
+    }
 }
 
 /// Drain accumulated Lua egress and forward each entry as a

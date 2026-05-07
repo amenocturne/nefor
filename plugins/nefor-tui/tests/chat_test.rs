@@ -131,6 +131,64 @@ fn input_field_has_no_default_placeholder() {
     }
 }
 
+// Batch-protocol Phase B regression — N replayed envelopes coalesce
+// into ONE render pass. Pre-refactor each chat.stream.delta envelope
+// rode the dispatch loop independently and triggered its own render
+// (visible re-streaming on /resume of a long chat). Post batch-protocol
+// refactor + main.rs drain-before-paint: a burst of envelopes lands as
+// dispatch_envelope_body calls back-to-back without an intervening
+// render, then a single render_if_dirty paints the full transcript.
+//
+// The test asserts the engine-level invariant the main.rs drain
+// depends on: state mutations from N envelopes accumulate into the
+// reconciler tree, and a single render captures all of them. Without
+// this guarantee, the main.rs optimization would silently swallow
+// deltas (or render incorrect intermediate state).
+#[test]
+fn batched_stream_deltas_render_in_a_single_pass() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Push 200 deltas back-to-back without rendering between them.
+    let n: usize = 200;
+    for i in 0..n {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "chat.stream.delta", "text": format!("d{i:03} ") }),
+        );
+    }
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "qwen-test", "duration_ms": 42 }),
+    );
+
+    // Single render — the final transcript must carry the latest
+    // deltas from the batch (the transcript scrolls so earlier deltas
+    // are off-screen, but the LAST deltas at the bottom are the
+    // visible signal that the batch was accumulated end-to-end). This
+    // pins the invariant that powers main.rs's drain-before-paint
+    // optimization on /resume.
+    let out = render_str(&mut engine);
+    for needle in ["d199", "d198", "d197"] {
+        assert!(
+            out.contains(needle),
+            "expected coalesced render to carry {needle:?}; got: {out:?}"
+        );
+    }
+
+    // A second render against the same state must be clean — no
+    // remaining dirty flag, no extra paint pass for the same content.
+    // This is the "render once, not N times" half of the invariant.
+    let none = engine
+        .render_if_dirty()
+        .expect("second render call must succeed");
+    assert!(
+        none.is_none(),
+        "render_if_dirty must return None after the batch was painted"
+    );
+}
+
 #[test]
 fn streaming_delta_appends_to_transcript() {
     let mut engine = Engine::new(80, 24).expect("engine");

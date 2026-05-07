@@ -50,11 +50,17 @@ function M.spawn_spec(command)
     end
   end
 
-  -- Phase A: mechanical loop wrap. Phase B will replace this with a
-  -- batched delivery shape that lets the chat.lua reducer (running
-  -- inside the TUI binary) coalesce N replayed envelopes into a single
-  -- render pass on /resume — the resume-staleness motivator from the
-  -- batch protocol design doc.
+  -- Mechanical loop — one stdin line per envelope, in order. The
+  -- resume-rendering optimization from the batch protocol design doc
+  -- doesn't live here: the wire shape stays one envelope per line
+  -- (each line is a self-contained NCP envelope that the binary
+  -- parses + dispatches independently). Coalescing happens INSIDE
+  -- the binary's main loop — after pulling the first line in a tick,
+  -- it drains every other line currently in its stdin channel before
+  -- calling render_if_dirty, so a burst of N envelopes produces one
+  -- render pass instead of N. See `plugins/nefor-tui/src/main.rs`'s
+  -- `process_envelope` + drain loop for the binary side; the wrapper
+  -- just delivers in order and lets the binary batch.
   local function to_plugin(envs)
     for _, env in ipairs(envs) do
       if env.from ~= "nefor-tui" then
