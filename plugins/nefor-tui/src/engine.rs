@@ -17,8 +17,9 @@ use crate::lua_host::{
     LuaHost, ScrollCommand, ScrollPositionMap, ScrollPositionSnapshot, SideEffect,
 };
 use crate::mouse::{
-    find_scrollable_path, hit_test, instance_at_path as mouse_instance_at_path, kind_string,
-    MouseKind, MouseMessage, SelectionRange,
+    find_focused_multiline_text_input_path, find_scrollable_path, hit_test,
+    instance_at_path as mouse_instance_at_path, kind_string, MouseKind, MouseMessage,
+    SelectionRange,
 };
 use crate::reconciler::Reconciler;
 use crate::render::{extract_selection_text, Renderer};
@@ -454,6 +455,16 @@ impl Engine {
         // scrollable's state. If none is under the cursor, fall through
         // to the bubble path so Lua sees the wheel event verbatim.
         if matches!(evt.kind, MouseKind::Wheel) {
+            // Focused multi-line text_input under the cursor wins
+            // first — the user's intent is "peek through this prompt's
+            // overflowed rows", and a scrollable transcript stacked
+            // around it (or a bubble to Lua) would otherwise steal the
+            // gesture. Single-line and unfocused text_inputs fall
+            // through to the existing path.
+            if self.try_wheel_text_input_scroll(&evt)? {
+                self.needs_render = true;
+                return Ok(());
+            }
             let absorbed = self.try_wheel_scroll(&evt)?;
             if let Some(notify) = absorbed {
                 if let Some((kind, target_key, offset)) = notify {
@@ -636,6 +647,71 @@ impl Engine {
             _ => None,
         };
         Ok(Some(notify))
+    }
+
+    /// Wheel-on-prompt: when a focused multi-line text_input lives under
+    /// the cursor, bump its `scroll_y` by ±`WHEEL_STEP_ROWS` so the user
+    /// can peek through the overflowed rows of a long buffer. Sets the
+    /// `manual_scroll` latch so the next layout pass's `sync_multi_line_
+    /// scroll_y` doesn't yank the viewport back to the cursor.
+    ///
+    /// Returns `true` when the event was consumed, `false` to fall
+    /// through to the scrollable / bubble path.
+    fn try_wheel_text_input_scroll(&mut self, evt: &MouseMessage) -> Result<bool, TuiError> {
+        let delta_rows: i32 = match evt.button {
+            Some("up") => -(WHEEL_STEP_ROWS as i32),
+            Some("down") => WHEEL_STEP_ROWS as i32,
+            _ => return Ok(false),
+        };
+        let Some(root) = self.reconciler.root.as_mut() else {
+            return Ok(false);
+        };
+        let Some(path) = find_focused_multiline_text_input_path(root, evt.x, evt.y) else {
+            return Ok(false);
+        };
+        let Some(target) = mouse_instance_at_path(root, &path) else {
+            return Ok(false);
+        };
+        let (value, min_lines, max_lines) = match &target.last_desc {
+            WidgetDescription::TextInput {
+                value,
+                min_lines,
+                max_lines,
+                ..
+            } => (value.clone(), *min_lines, *max_lines),
+            _ => return Ok(false),
+        };
+        let InstanceState::TextInput(state) = &mut target.state else {
+            return Ok(false);
+        };
+        let viewport_w = state.viewport_width;
+        if viewport_w == 0 {
+            // Pre-layout — no geometry to clamp against. Drop the
+            // event silently; the next layout pass will set viewport_w.
+            return Ok(false);
+        }
+        let total_rows = crate::text_input::soft_wrapped_line_count(&value, viewport_w) as u32;
+        let visible =
+            crate::layout::visible_line_count(&value, min_lines, max_lines, viewport_w) as u32;
+        let max_scroll = total_rows.saturating_sub(visible);
+        if max_scroll == 0 {
+            // Buffer fits entirely in the viewport — wheel has nothing
+            // to do. Consume the event so it doesn't bubble to a
+            // transcript scrollable below; the user's gesture was aimed
+            // at the prompt regardless.
+            return Ok(true);
+        }
+        let next = (state.scroll_y as i32)
+            .saturating_add(delta_rows)
+            .clamp(0, max_scroll as i32) as u16;
+        if next != state.scroll_y {
+            state.scroll_y = next;
+        }
+        // Latch even when the offset didn't change (already at edge):
+        // the user explicitly wheeled here, the auto-pin should stay
+        // suspended until the next editing key.
+        state.manual_scroll = true;
+        Ok(true)
     }
 
     /// Render if dirty. Returns the ANSI bytes; `None` means "no work".
@@ -1718,7 +1794,10 @@ mod tests {
         // First render after paste must produce one frame; after that
         // there's no further work for the engine until something else
         // changes — confirms no per-char redraw cascade happened.
-        let _ = engine.render_if_dirty().expect("post-paste").expect("dirty");
+        let _ = engine
+            .render_if_dirty()
+            .expect("post-paste")
+            .expect("dirty");
         let again = engine.render_if_dirty().expect("idle");
         assert!(
             again.is_none(),

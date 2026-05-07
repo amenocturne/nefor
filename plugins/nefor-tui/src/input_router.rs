@@ -232,6 +232,12 @@ pub fn arrow_should_bubble(state: &TextInputState, key_name: &str, max_lines: u1
 
 /// Apply an editing key to `state`, given the description's bookkeeping.
 /// Returns the `EditOutcome` so the caller can fire `on_change`/`on_submit`.
+///
+/// Clears `state.manual_scroll` up front: any editing key (cursor move
+/// or content mutation) is a "user wants to see the cursor again" signal,
+/// so the auto-pin re-engages on the next layout pass. Mirrors the
+/// scrollable container's `was_at_end` flip on user gesture — a one-bit
+/// latch that the auto-pin checks before stealing the viewport.
 pub fn apply_editing_key(
     state: &mut TextInputState,
     key: &KeyMessage,
@@ -240,6 +246,7 @@ pub fn apply_editing_key(
     let has_shift = key.mods.contains(&"shift");
     let has_ctrl = key.mods.contains(&"ctrl");
     let has_alt = key.mods.contains(&"alt");
+    state.manual_scroll = false;
 
     match key.name.as_str() {
         "backspace" if has_alt => state.delete_word_backward(),
@@ -358,7 +365,12 @@ pub fn route_paste(root: &mut WidgetInstance, text: &str) -> PasteDecision {
         text.to_string()
     };
     let outcome = match &mut inst.state {
-        InstanceState::TextInput(s) => s.insert_str(&normalised),
+        InstanceState::TextInput(s) => {
+            // Paste is a content mutation — clear the manual-scroll
+            // latch so the cursor-pin re-engages after the insert.
+            s.manual_scroll = false;
+            s.insert_str(&normalised)
+        }
         _ => return PasteDecision::Drop,
     };
     let value_changed = outcome.new_value.is_some();

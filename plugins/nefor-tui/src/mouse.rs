@@ -157,6 +157,62 @@ pub fn find_scrollable_path(root: &WidgetInstance, x: u16, y: u16) -> Option<Vec
     deepest
 }
 
+/// Walk the instance tree depth-first and return the **path** to a
+/// focused multi-line text_input whose painted rect contains `(x, y)`.
+/// Used by the wheel-on-prompt scroll path: the engine routes a wheel
+/// notch into the input's `scroll_y` instead of bubbling through to a
+/// scrollable below or to Lua.
+///
+/// Why "focused multi-line": single-line inputs have no row count to
+/// scroll through (horizontal scroll only); unfocused multi-line inputs
+/// belong to other surfaces (e.g. an inactive composer in a multi-pane
+/// future). Letting either case absorb the wheel would surprise the
+/// user — fall through to the existing scrollable / bubble path.
+pub fn find_focused_multiline_text_input_path(
+    root: &WidgetInstance,
+    x: u16,
+    y: u16,
+) -> Option<Vec<usize>> {
+    let mut path: Vec<usize> = Vec::new();
+    let mut found: Option<Vec<usize>> = None;
+    walk_focused_multiline_text_input(root, x, y, &mut path, &mut found);
+    found
+}
+
+fn walk_focused_multiline_text_input(
+    inst: &WidgetInstance,
+    x: u16,
+    y: u16,
+    path: &mut Vec<usize>,
+    out: &mut Option<Vec<usize>>,
+) {
+    let Some(rect) = inst.layout.painted_rect else {
+        return;
+    };
+    if !rect_contains(&rect, x, y) {
+        return;
+    }
+    if matches!(inst.kind(), InstanceKind::TextInput) {
+        if let WidgetDescription::TextInput {
+            focused, max_lines, ..
+        } = &inst.last_desc
+        {
+            if *focused && *max_lines > 1 {
+                *out = Some(path.clone());
+                // Don't recurse further — text_input is a leaf in
+                // practice, but a defensive early-return matches the
+                // single-text_input contract.
+                return;
+            }
+        }
+    }
+    for (i, child) in inst.children.iter().enumerate() {
+        path.push(i);
+        walk_focused_multiline_text_input(child, x, y, path, out);
+        path.pop();
+    }
+}
+
 fn walk_scrollable(
     inst: &WidgetInstance,
     x: u16,

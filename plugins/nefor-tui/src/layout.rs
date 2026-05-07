@@ -1133,7 +1133,12 @@ fn layout_text_input(inst: &mut WidgetInstance, c: Constraints) -> Size {
 /// viewport so a long buffer grows vertically up to the cap;
 /// single-line inputs (`max_lines == 1`) always claim one row and rely
 /// on horizontal scrolling for overflow.
-fn visible_line_count(value: &str, min_lines: u16, max_lines: u16, viewport_w: u16) -> u16 {
+pub(crate) fn visible_line_count(
+    value: &str,
+    min_lines: u16,
+    max_lines: u16,
+    viewport_w: u16,
+) -> u16 {
     if max_lines <= 1 {
         return min_lines.max(1);
     }
@@ -1184,6 +1189,13 @@ fn unicode_col_width(c: char) -> usize {
 /// arrow-up at the top of the window → past the top), we slide the
 /// window to put the cursor back in view. Above-cap content is hidden
 /// off the TOP, not the bottom — Claude-style.
+///
+/// Suspended while `state.manual_scroll == true` — the user is wheeling
+/// through the buffer and the cursor-pin would otherwise yank the
+/// viewport back as soon as the next layout pass ran. We still clamp
+/// against `max_scroll` so a value-shrink (submit clears buffer) drops
+/// scroll_y to 0; that path also resets the latch through
+/// `sync_with_desc`.
 fn sync_multi_line_scroll_y(
     st: &mut crate::text_input::TextInputState,
     value: &str,
@@ -1194,16 +1206,24 @@ fn sync_multi_line_scroll_y(
         return;
     }
     let rows = crate::text_input::wrap_value(value, viewport_w);
-    let (cursor_row, _) = crate::text_input::cursor_in_wrap_for(value, &rows, st.cursor);
     let total = rows.len() as u32;
     let visible = visible_lines as u32;
-    let cursor_row_u = cursor_row as u32;
     let scroll_y = st.scroll_y as u32;
     // Clamp first to handle a value rewrite that shrank the buffer
     // below the prior offset (e.g. submit clears value → buffer = 1
     // row, scroll_y was 5 → must reset to 0).
     let max_scroll = total.saturating_sub(visible);
-    let mut new_scroll = scroll_y.min(max_scroll);
+    let new_scroll = scroll_y.min(max_scroll);
+    if st.manual_scroll {
+        // Manual-scroll latch active: leave the user's offset alone
+        // (still post-clamp). Pin re-engages when an editing key or a
+        // value rewrite clears the latch.
+        st.scroll_y = new_scroll.min(u16::MAX as u32) as u16;
+        return;
+    }
+    let (cursor_row, _) = crate::text_input::cursor_in_wrap_for(value, &rows, st.cursor);
+    let cursor_row_u = cursor_row as u32;
+    let mut new_scroll = new_scroll;
     if cursor_row_u < new_scroll {
         new_scroll = cursor_row_u;
     } else if cursor_row_u >= new_scroll + visible {
@@ -2868,11 +2888,7 @@ mod tests {
         let rows = wrap_text("abcdefghij", 4, WrapMode::Word);
         assert_eq!(
             rows,
-            vec![
-                "abcd".to_string(),
-                "efgh".to_string(),
-                "ij".to_string(),
-            ]
+            vec!["abcd".to_string(), "efgh".to_string(), "ij".to_string(),]
         );
     }
 
@@ -3661,7 +3677,11 @@ mod tests {
         assert_eq!(cell_at(&buf, 0, 1), " ", "spillover blank for `你`");
         assert_eq!(cell_at(&buf, 0, 2), "好", "next glyph at col 2");
         assert_eq!(cell_at(&buf, 0, 3), " ", "spillover blank for `好`");
-        assert_eq!(cell_at(&buf, 0, 4), "x", "ASCII follows immediately, no extra gap");
+        assert_eq!(
+            cell_at(&buf, 0, 4),
+            "x",
+            "ASCII follows immediately, no extra gap"
+        );
     }
 
     /// Same contract for the styled-rows path (markdown, spans). The
