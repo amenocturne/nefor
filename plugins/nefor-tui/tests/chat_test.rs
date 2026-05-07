@@ -9,6 +9,7 @@
 //! subprocess, no /dev/tty — so the test stays fast and CI-portable.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use nefor_tui::engine::Engine;
@@ -16,7 +17,39 @@ use nefor_tui::input::KeyMessage;
 use nefor_tui::mouse::{MouseKind, MouseMessage};
 use serde_json::{json, Map as JsonMap, Value as JsonValue};
 
+/// Per-process tempdir kept alive for the lifetime of `cargo test` and
+/// pointed at by `NEFOR_DATA_HOME` on first access. Ensures chat.lua's
+/// `load_input_history` (issue #39) reads from / writes to a clean
+/// throwaway path instead of the developer's `$HOME/.local/share/
+/// nefor/input-history` — without this, parallel test runs would
+/// pollute (and read pre-existing entries from) the user's real
+/// shell-style history file.
+///
+/// Per-test ResumeEnv overrides this default for tests that need a
+/// per-test isolated data dir (e.g. session-picker, input-history
+/// regression tests); they restore back to whatever was set before
+/// (which is this process-wide tempdir) on Drop.
+static TEST_DATA_HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+
+fn ensure_test_data_home() {
+    let dir = TEST_DATA_HOME.get_or_init(|| {
+        tempfile::tempdir().expect("create per-process test data home")
+    });
+    // set_var is process-global; OnceLock guarantees the assignment
+    // runs only once. Subsequent ResumeEnv-style overrides save +
+    // restore around their scope, so this default is what they read
+    // at construction time and what they restore on Drop.
+    if std::env::var_os("NEFOR_DATA_HOME").is_none() {
+        std::env::set_var("NEFOR_DATA_HOME", dir.path());
+    }
+}
+
 fn chat_lua_source() -> String {
+    // Side-effect on first call: install a per-process data home so
+    // chat.lua's input-history loader doesn't reach into the user's
+    // real `$HOME/.local/share/nefor`. Centralised here because every
+    // chat-surface test reads this function — no per-test wiring.
+    ensure_test_data_home();
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -1679,6 +1712,13 @@ fn arrow_up_scrolls_transcript_when_input_focused_at_top_line() {
     // single-line (max_lines = 1) by default, so the focused text_input
     // bubbles Up unconditionally and Lua's update routes it to
     // `tui.scroll_by("transcript", -1)`.
+    //
+    // Hold a `ResumeEnv` so chat.lua's `load_input_history` reads from
+    // a clean tempdir — without it, the developer's $HOME/.local/share/
+    // nefor/input-history could prefill `prompt_history`, and the
+    // arrow-up handler would route to history-recall instead of
+    // scroll. Issue #39 added the disk-load on init.
+    let _env = ResumeEnv::new();
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -1739,6 +1779,12 @@ fn arrow_up_scrolls_transcript_when_input_empty() {
     // top-line variant above; this one exercises the cursor-at-row-0
     // path through the empty-buffer fast track and asserts the result
     // by reading the live offset.
+    //
+    // ResumeEnv pins an empty input-history (issue #39 hydrates
+    // chat.lua's prompt_history from disk on init); without it, a
+    // populated $HOME history would route arrow-up to recall instead
+    // of scroll.
+    let _env = ResumeEnv::new();
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -3809,5 +3855,186 @@ fn slash_clear_is_alias_for_slash_new() {
     assert!(
         kinds.contains(&"chat.interrupt_all") && kinds.contains(&"sessions.new_request"),
         "/clear must emit interrupt_all + new_request like /new; got {kinds:?}",
+    );
+}
+
+// ── persistent input history (issue #39) ────────────────────────────
+//
+// Like shell history: a submit on session A writes the prompt to
+// `<NEFOR_DATA_HOME>/input-history`; a fresh nefor process (session B)
+// reads it back at init so arrow-up recalls it. Cap is INPUT_HISTORY_MAX
+// (50) — pushing the 51st entry rolls the oldest off the disk file
+// the next time we trim.
+//
+// Reuses the `ResumeEnv` harness above for tempdir + NEFOR_DATA_HOME
+// isolation. Each test scopes its own env so the file lives in a
+// per-test tmp dir and tests don't race over the shared XDG path.
+
+fn read_history_file(path: &std::path::Path) -> Vec<String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    raw.lines().map(|l| l.to_string()).collect()
+}
+
+#[test]
+fn submit_persists_input_history_to_disk_for_next_session() {
+    let env = ResumeEnv::new();
+
+    // Session A: submit two prompts. Each Enter must mirror the text
+    // to `<data_home>/input-history`, newest at line 1.
+    {
+        let mut engine = Engine::new(80, 24).expect("engine A");
+        engine.load_scenario(&chat_lua_source()).expect("load");
+        let _ = render_str(&mut engine);
+
+        for ch in "hello".chars() {
+            engine.handle_key(key(&ch.to_string())).expect("type");
+        }
+        engine.handle_key(key("enter")).expect("submit hello");
+        let _ = render_str(&mut engine);
+
+        for ch in "world".chars() {
+            engine.handle_key(key(&ch.to_string())).expect("type");
+        }
+        engine.handle_key(key("enter")).expect("submit world");
+        let _ = render_str(&mut engine);
+    }
+
+    let path = env.data_home.join("input-history");
+    let lines = read_history_file(&path);
+    assert_eq!(
+        lines,
+        vec!["world".to_string(), "hello".to_string()],
+        "input-history must hold both submits, newest first"
+    );
+
+    // Session B: a fresh engine on the same NEFOR_DATA_HOME hydrates
+    // its `prompt_history` from disk. Arrow-up on the empty input
+    // recalls the most-recent ("world") on the first press.
+    let mut engine_b = Engine::new(80, 24).expect("engine B");
+    engine_b.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine_b);
+
+    engine_b.handle_key(key("up")).expect("arrow up");
+    let _ = render_str(&mut engine_b);
+
+    // Probe state.input_value via Lua. The state table is held inside
+    // the engine's frame closure; expose it indirectly by triggering
+    // a render and inspecting the rendered input field. But since the
+    // text_input desc carries the value verbatim, easier: pull it via
+    // the engine's snapshot — the input row contains the recalled
+    // text.
+    let snap = engine_b.snapshot();
+    assert!(
+        snap.contains("world"),
+        "expected last-session's prompt 'world' to recall via arrow-up, got snapshot:\n{snap}"
+    );
+
+    // Second arrow-up walks to the older entry.
+    engine_b.handle_key(key("up")).expect("arrow up 2");
+    let _ = render_str(&mut engine_b);
+    let snap = engine_b.snapshot();
+    assert!(
+        snap.contains("hello"),
+        "expected older prompt 'hello' on second arrow-up, got snapshot:\n{snap}"
+    );
+}
+
+#[test]
+fn submit_caps_input_history_at_max_and_rolls_oldest() {
+    // Pump 51 distinct prompts. The disk file must hold exactly 50
+    // entries (INPUT_HISTORY_MAX), with the OLDEST submission rolled
+    // off. Newest-first ordering means line 1 is the 51st prompt
+    // ("p51") and line 50 is the second-oldest ("p2"); "p1" is gone.
+    let env = ResumeEnv::new();
+
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for i in 1..=51 {
+        let prompt = format!("p{i}");
+        for ch in prompt.chars() {
+            engine.handle_key(key(&ch.to_string())).expect("type");
+        }
+        engine.handle_key(key("enter")).expect("submit");
+        let _ = render_str(&mut engine);
+    }
+
+    let path = env.data_home.join("input-history");
+    let lines = read_history_file(&path);
+    assert_eq!(
+        lines.len(),
+        50,
+        "input-history must trim to INPUT_HISTORY_MAX (50); got {} lines",
+        lines.len()
+    );
+    assert_eq!(
+        lines[0], "p51",
+        "newest submit must be at the top of the file"
+    );
+    assert_eq!(
+        lines[49], "p2",
+        "the 50th line must be the second-oldest — p1 rolled off"
+    );
+    assert!(
+        !lines.iter().any(|l| l == "p1"),
+        "oldest submit (p1) must have rolled off past the cap"
+    );
+}
+
+#[test]
+fn input_history_round_trips_multiline_payload_through_disk() {
+    // A multi-line paste landed via Shift+Enter / bracketed-paste +
+    // Enter must round-trip through the on-disk file: the file format
+    // escapes \n / \r so each entry stays on a single physical line,
+    // and the loader decodes back to the original verbatim. Without
+    // that escaping the second line of a multi-line paste would be
+    // read back as a separate history entry.
+    let env = ResumeEnv::new();
+
+    // Session A: paste a 3-line block, submit it. Use the engine's
+    // bracketed-paste path so the test exercises the same code path
+    // a real paste would.
+    {
+        let mut engine = Engine::new(80, 24).expect("engine A");
+        engine.load_scenario(&chat_lua_source()).expect("load");
+        let _ = render_str(&mut engine);
+
+        let payload = "line1\nline2\nline3";
+        engine.handle_paste(payload).expect("paste");
+        engine.handle_key(key("enter")).expect("submit");
+        let _ = render_str(&mut engine);
+    }
+
+    let path = env.data_home.join("input-history");
+    let lines = read_history_file(&path);
+    assert_eq!(
+        lines.len(),
+        1,
+        "multi-line submit must occupy exactly one physical line in the file (got {lines:?})"
+    );
+    assert!(
+        lines[0].contains(r"\n"),
+        "multi-line submit must have its real \\n escaped to the literal two-char `\\n` sequence \
+         on disk so the per-line frame survives — got: {:?}",
+        lines[0]
+    );
+
+    // Session B reloads. The first arrow-up recall puts the FULL
+    // multi-line text into the input — verify by a substring of each
+    // line in the snapshot.
+    let mut engine_b = Engine::new(80, 24).expect("engine B");
+    engine_b.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine_b);
+    engine_b.handle_key(key("up")).expect("arrow up");
+    let _ = render_str(&mut engine_b);
+    let snap = engine_b.snapshot();
+    assert!(
+        snap.contains("line1") && snap.contains("line2") && snap.contains("line3"),
+        "all three lines of the multi-line history entry must be visible \
+         in the recalled input — got snapshot:\n{snap}"
     );
 }

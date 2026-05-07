@@ -377,7 +377,156 @@ local MARKDOWN_THEME = {
 
 local DAG_LINGER_MS  = 2000
 local DOUBLE_ESC_MS  = 600
-local HISTORY_CAP    = 200
+
+-- Shell-style input-history cap. The submitted prompts (NOT every
+-- keystroke — the user-typed text at submit time) are kept in-memory
+-- under `state.prompt_history` AND mirrored to a single jsonl-ish file
+-- on disk so they survive nefor restarts; arrow-up in the chat input
+-- recalls them in reverse order. Past the cap the oldest entries roll
+-- off the disk file the next time we trim. One constant drives both
+-- the in-memory cap (issue #39) and the on-disk trim.
+local INPUT_HISTORY_MAX = 50
+
+------------------------------------------------------------------------
+-- shell-style input history (issue #39)
+------------------------------------------------------------------------
+-- Single shared file at `<data_root>/input-history` (NOT per-session —
+-- history is the user's, not the chat's). One submitted prompt per
+-- line, escaped so multi-line pastes round-trip without breaking the
+-- per-line frame. The chat-input arrow-up reducer already navigates an
+-- in-memory `state.prompt_history`; this layer just keeps that list
+-- mirrored to disk so it survives a nefor restart.
+--
+-- Defined up here, near the constant + initial_state, so both
+-- `initial_state` (which hydrates from disk on first run) and the
+-- submit reducer (which appends after every Enter) can call it as a
+-- file-level local. Forward-referencing a `local function` declared
+-- later in the chunk would resolve through globals at call time
+-- (Lua's lexical-scope rules), so the file order matters.
+
+-- Same env-var precedence as `sessions.lua`'s `compute_data_root` so
+-- input-history sits next to session jsonls under the same root.
+-- Inlined here rather than reusing `nefor_data_root` further down the
+-- file because that helper is declared after `initial_state`, and Lua
+-- closures bind locals at declaration time — `initial_state` would
+-- otherwise see `nefor_data_root` as a missing global.
+local function input_history_data_root()
+  local override = os.getenv("NEFOR_DATA_HOME")
+  if override ~= nil and override ~= "" then return override end
+  local xdg = os.getenv("XDG_DATA_HOME")
+  if xdg ~= nil and xdg ~= "" then return xdg .. "/nefor" end
+  local home = os.getenv("HOME") or ""
+  if home == "" then return nil end
+  return home .. "/.local/share/nefor"
+end
+
+local function input_history_path()
+  local root = input_history_data_root()
+  if root == nil then return nil end
+  return root .. "/input-history"
+end
+
+-- One-line escaping: `\` → `\\`, real `\n` → `\n` literal (two chars),
+-- real `\r` → `\r`. Decode reverses. Together this guarantees every
+-- entry fits on a single physical line in the file regardless of
+-- newlines / tabs / backslashes the user pasted in. Cheaper than
+-- pulling in a JSON parser (the TUI Lua VM doesn't expose
+-- `nefor.json`) and the format is self-describing — a developer
+-- reading the file sees the obvious shape.
+local function encode_history_line(text)
+  if text == nil then return "" end
+  local s = tostring(text)
+  s = s:gsub("\\", "\\\\")
+  s = s:gsub("\n", "\\n")
+  s = s:gsub("\r", "\\r")
+  return s
+end
+
+local function decode_history_line(line)
+  if line == nil then return nil end
+  local out = {}
+  local i = 1
+  local n = #line
+  while i <= n do
+    local c = line:sub(i, i)
+    if c == "\\" and i < n then
+      local nxt = line:sub(i + 1, i + 1)
+      if nxt == "n" then
+        out[#out + 1] = "\n"
+        i = i + 2
+      elseif nxt == "r" then
+        out[#out + 1] = "\r"
+        i = i + 2
+      elseif nxt == "\\" then
+        out[#out + 1] = "\\"
+        i = i + 2
+      else
+        -- Unknown escape — keep verbatim. Future-proof against new
+        -- escape kinds added by readers without breaking existing
+        -- files.
+        out[#out + 1] = c
+        i = i + 1
+      end
+    else
+      out[#out + 1] = c
+      i = i + 1
+    end
+  end
+  return table.concat(out)
+end
+
+-- Best-effort `mkdir -p` so the writer can drop the file even on a
+-- fresh data-root. Lua doesn't ship an in-process mkdir; shell out the
+-- same way `sessions.lua`'s `ensure_dir` does. Errors here mean the
+-- writer's `io.open` will fail next, which the writer logs and
+-- swallows — history just won't persist this session.
+local function ensure_history_dir()
+  local root = input_history_data_root()
+  if root == nil then return end
+  os.execute(string.format("mkdir -p %q 2>/dev/null", root))
+end
+
+-- Read the on-disk history into the in-memory list shape the rest of
+-- chat.lua uses: newest at index 1. The file is written newest-first
+-- on every append, so a forward read into a list keeps that order.
+-- Caps at INPUT_HISTORY_MAX defensively in case an older nefor wrote
+-- beyond the current cap.
+local function load_input_history()
+  local path = input_history_path()
+  if path == nil then return {} end
+  local f = io.open(path, "r")
+  if f == nil then return {} end
+  local out = {}
+  for line in f:lines() do
+    if #line > 0 then
+      out[#out + 1] = decode_history_line(line)
+      if #out >= INPUT_HISTORY_MAX then break end
+    end
+  end
+  f:close()
+  return out
+end
+
+-- Persist a `history` list to the input-history file. Called after
+-- every submit; rewrites the whole file rather than appending +
+-- truncating because the file is small (≤ INPUT_HISTORY_MAX lines)
+-- and the rewrite is atomic enough for our durability needs (last
+-- session crash loses at most the tail entry — `os.rename`-style
+-- atomic-replace via tmp file is overkill for shell-history-grade
+-- data). I/O failure is best-effort: log + continue so a read-only
+-- data dir doesn't poison submission.
+local function persist_input_history(history)
+  local path = input_history_path()
+  if path == nil then return end
+  ensure_history_dir()
+  local f = io.open(path, "w")
+  if f == nil then return end
+  for i = 1, math.min(#history, INPUT_HISTORY_MAX) do
+    f:write(encode_history_line(history[i]))
+    f:write("\n")
+  end
+  f:close()
+end
 
 local function initial_state()
   return {
@@ -400,7 +549,11 @@ local function initial_state()
     last_esc_ms      = nil,
     dag_runs         = {},
     toast            = nil,  -- { text, expires_at_ms }
-    prompt_history   = {},
+    -- Hydrate from <data_root>/input-history so arrow-up in the chat
+    -- input recalls submissions from prior nefor processes (issue #39
+    -- — shell-style persistent history). Empty on first run / read
+    -- failure.
+    prompt_history   = load_input_history(),
     history_cursor   = nil,
   }
 end
@@ -2581,11 +2734,13 @@ local function update(msg, state)
     -- Prepend to prompt_history (newest at index 1) and cap. History
     -- recall reads from index 1, so prepending keeps the cursor model
     -- simple — Up = older = larger index, Down = newer = smaller.
+    -- Mirror to disk so the entry survives a nefor restart (issue #39).
     local history = { text }
     for i, v in ipairs(state.prompt_history or {}) do
-      if i >= HISTORY_CAP then break end
+      if i >= INPUT_HISTORY_MAX then break end
       history[#history + 1] = v
     end
+    persist_input_history(history)
     local cleared = shallow_merge(with_user, {
       input_value = "", pending = true,
       turn_started_at = tui.now_ms(), slash = NIL_SENTINEL,
