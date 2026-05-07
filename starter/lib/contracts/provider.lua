@@ -57,10 +57,13 @@ local BARE_TYPES = {
 }
 
 local function emit_register()
+  -- `implementations` omitted: this hub-namespace owns no combinator
+  -- handlers, and `parse_register_body` treats a missing field as an
+  -- empty array. Sending `implementations = {}` from Lua serializes to
+  -- a JSON object (empty table → object) which the Rust side rejects.
   envelope.emit_as(FROM, nil, {
-    kind            = "combinators.register",
-    types           = BARE_TYPES,
-    implementations = {},
+    kind  = "combinators.register",
+    types = BARE_TYPES,
   })
 end
 
