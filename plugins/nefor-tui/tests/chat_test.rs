@@ -2095,6 +2095,62 @@ fn statusline_shows_bottom_marker_when_transcript_overflows() {
 }
 
 #[test]
+fn statusline_omits_loaded_providers_list() {
+    // Multiple providers' auth statuses must NOT clutter the statusline
+    // — the model picker (and `/model` slash command) shows providers
+    // alongside their models, so duplicating that information beside
+    // the active model just adds visual noise. The active model itself
+    // (from `chat.session.stats`) stays visible.
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    // Seed three auth statuses so the legacy `auth_segment` would have
+    // emitted `ollama:✓ anthropic:? openai:!` into the statusline.
+    for (provider, status) in [
+        ("ollama", "connected"),
+        ("anthropic", "login_required"),
+        ("openai", "error"),
+    ] {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "chat.auth.status", "provider": provider, "status": status }),
+        );
+    }
+    // Stats event so the statusline carries the active model name —
+    // anchors the assertion to a frame where the statusline is fully
+    // populated rather than the pre-stats placeholder branch.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.session.stats", "model": "claude-test" }),
+    );
+    let _ = render_snapshot(&mut engine);
+    let snap = render_snapshot(&mut engine);
+
+    // Statusline lives on the row(s) BELOW the input box. Take the rows
+    // after the last `╯` so we can assert against the statusline without
+    // false matches from popups or transcript content above.
+    let rows: Vec<&str> = snap.lines().collect();
+    let last_corner = rows
+        .iter()
+        .rposition(|r| r.contains('╯'))
+        .expect("input bottom-right corner");
+    let tail: String = rows[last_corner + 1..].join("\n");
+
+    // Active model still rendered (chat.lua strips the `claude-` prefix
+    // for display, so the surviving substring is `test`).
+    assert!(
+        tail.contains("test"),
+        "active model missing from statusline tail: {tail:?}"
+    );
+    // Provider names from the loaded-providers list must NOT appear.
+    for needle in ["ollama", "anthropic", "openai"] {
+        assert!(
+            !tail.contains(needle),
+            "loaded-provider name {needle:?} should not appear in statusline tail: {tail:?}"
+        );
+    }
+}
+
+#[test]
 fn left_column_lifts_input_and_statusline_off_terminal_edges() {
     // No outer padding any more — the sidebar's vertical separator
     // runs full window height edge-to-edge. Per-element spacing now

@@ -999,45 +999,6 @@ local function ctx_bar(used, max)
   }
 end
 
-local function auth_segment(auth)
-  if auth == nil then return nil end
-  local entries = {}
-  for name, status in pairs(auth) do
-    entries[#entries + 1] = { name = name, status = status }
-  end
-  if #entries == 0 then return nil end
-  table.sort(entries, function(a, b) return a.name < b.name end)
-  local spans = {}
-  local shown = 0
-  local extra = 0
-  for _, e in ipairs(entries) do
-    if shown >= 3 then
-      extra = extra + 1
-    else
-      if shown > 0 then
-        spans[#spans + 1] = { text = " ", fg = C.status_dim }
-      end
-      spans[#spans + 1] = { text = e.name .. ":", fg = C.status_dim }
-      local marker, color
-      if e.status == "connected" then
-        marker, color = "✓", C.system
-      elseif e.status == "login_required" then
-        marker, color = "?", C.status_warn
-      elseif e.status == nil then
-        marker, color = "·", C.status_dim
-      else
-        marker, color = "!", C.status_danger
-      end
-      spans[#spans + 1] = { text = marker, fg = color }
-      shown = shown + 1
-    end
-  end
-  if extra > 0 then
-    spans[#spans + 1] = { text = " +" .. tostring(extra), fg = C.status_dim }
-  end
-  return { spans = spans }
-end
-
 local function build_statusline_segments(state)
   local segs = {}
   if state.gate_yolo then
@@ -1074,9 +1035,6 @@ local function build_statusline_segments(state)
     local tps = math.floor((ot * 1000) / last_dur + 0.5)
     segs[#segs + 1] = { spans = { { text = tostring(tps) .. " tok/s", fg = C.system } } }
   end
-
-  local auth = auth_segment(state.auth)
-  if auth then segs[#segs + 1] = auth end
 
   -- Scroll percentage segment (legacy spec section 4). Hidden when the
   -- transcript fits the viewport (no scrollback). At-bottom shows
