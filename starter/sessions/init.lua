@@ -75,22 +75,7 @@ local state = {
   -- file, or (b) any envelope is persisted to it.
   should_prune_session = true,
 
-  -- Re-entrance guard for resume. A bus consumer that emits during a
-  -- resume can circle back through `sessions.resume_request` /
-  -- `sessions.new_request` and re-trigger; without this guard the
-  -- result is a runaway cascade. Phase 2 closes the cascade class
-  -- structurally (porting agentic_workflow); the guard goes away then.
-  resume_in_progress = false,
-
   initialised = false,
-
-  -- Synchronous resume-phase hook registry. Phase 1 compat for
-  -- agentic_workflow's `replay_mode` flip; goes away in Phase 2.
-  resume_phase_hooks = {
-    session_end   = {},
-    session_start = {},
-    resume_done   = {},
-  },
 
   -- Replay-window flag — flipped by receive_msg when our own
   -- `sessions.replay.start` / `sessions.replay.end` markers re-enter
@@ -317,41 +302,17 @@ local function replay_jsonl(path)
   return count
 end
 
----@param phase "session_end"|"session_start"|"resume_done"
----@param session_id string|nil
-local function fire_resume_phase(phase, session_id)
-  for _, fn in ipairs(state.resume_phase_hooks[phase]) do
-    local ok, err = pcall(fn, session_id)
-    if not ok and nefor.log then
-      nefor.log.error("sessions: resume-phase hook raised", {
-        phase = phase, error = tostring(err),
-      })
-    end
-  end
-end
-
 -- ------------------------------------------------------------------
 -- resume + new
 -- ------------------------------------------------------------------
 
 ---@param target_session_id string
 local function do_resume(target_session_id)
-  if state.resume_in_progress then
-    if nefor.log then
-      nefor.log.warn("sessions.resume: re-entrant call dropped", {
-        requested        = target_session_id,
-        currently_active = state.current_session_id,
-      })
-    end
-    return
-  end
   if state.current_session_id == target_session_id then
     return  -- no-op resume
   end
-  state.resume_in_progress = true
 
   -- 1. Announce end of outgoing session.
-  fire_resume_phase("session_end", state.current_session_id)
   send_msg({ kind = "control", event = "sessions.session_end",
              extra = { session_id = state.current_session_id } })
 
@@ -374,15 +335,14 @@ local function do_resume(target_session_id)
   end
 
   -- 3. Announce start of incoming session BEFORE replay.
-  fire_resume_phase("session_start", target_session_id)
   send_msg({ kind = "control", event = "sessions.session_start",
              extra = { session_id = target_session_id, from_resume = true } })
 
-  -- 4. Replay framed by start/end markers. The runtime gate
-  -- (ncp.lua) suppresses bus→Rust forwarding inside the window;
-  -- pure-Lua actors get the replay normally and rebuild state.
-  -- Sessions' own persistence path also drops envelopes inside the
-  -- window — see `in_replay_window` flag toggled in receive_msg.
+  -- 4. Replay framed by start/end markers. Per-wrapper replay-skip
+  -- (lib/replay_window) suppresses bus→peer side effects inside the
+  -- window; pure-Lua actors get the replay normally and rebuild
+  -- state. Sessions' own persistence path also drops envelopes inside
+  -- the window — see `in_replay_window` flag toggled in receive_msg.
   local total = new_path and count_replay_entries(new_path) or 0
   send_msg({ kind = "control", event = "sessions.replay.start",
              extra = { session_id = target_session_id, count = total } })
@@ -391,11 +351,8 @@ local function do_resume(target_session_id)
              extra = { session_id = target_session_id } })
 
   -- 5. Coalesced "we're back" signal.
-  fire_resume_phase("resume_done", target_session_id)
   send_msg({ kind = "control", event = "sessions.resume_done",
              extra = { session_id = target_session_id, replayed = replayed } })
-
-  state.resume_in_progress = false
 end
 
 local function do_new()
@@ -513,17 +470,6 @@ local function receive_msg(entry)
 end
 
 -- ------------------------------------------------------------------
--- on_resume_phase — synchronous hook registry (Phase 1 compat)
--- ------------------------------------------------------------------
-
----@param phase "session_end"|"session_start"|"resume_done"
----@param fn function
-local function on_resume_phase(phase, fn)
-  local list = state.resume_phase_hooks[phase]
-  list[#list + 1] = fn
-end
-
--- ------------------------------------------------------------------
 -- module table — actor contract + public Lua API
 -- ------------------------------------------------------------------
 
@@ -539,7 +485,6 @@ return {
   new              = do_new,
   current_id       = function() return state.current_session_id end,
   current_path     = function() return state.current_session_path end,
-  on_resume_phase  = on_resume_phase,
   -- handle_shutdown is a no-op now: the actor.lua runtime synthesizes
   -- an engine.shutdown wire envelope and our receive_msg handles it.
   handle_shutdown  = function() end,
@@ -560,14 +505,8 @@ return {
       state.current_session_id    = nil
       state.current_session_path  = nil
       state.should_prune_session  = true
-      state.resume_in_progress    = false
       state.initialised           = false
       state.in_replay_window      = false
-      state.resume_phase_hooks    = {
-        session_end   = {},
-        session_start = {},
-        resume_done   = {},
-      }
     end,
   },
 }

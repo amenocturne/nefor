@@ -228,27 +228,24 @@ fn inbound_outbound_cycle_lands_in_jsonl() {
 }
 
 #[test]
-fn resume_phase_hooks_fire_synchronously_before_emit() {
-    // The one-tick replay-leak fix: `sessions.on_resume_phase(phase, fn)`
-    // registers a synchronous callback that fires INSIDE
-    // `sessions.resume()` before the corresponding `emit_control`
-    // broadcast. Asserts the order:
-    //   1. session_end hook runs.
-    //   2. session_end emit.
-    //   3. session_start hook runs.
-    //   4. session_start emit.
-    //   5. replay.start emit (Phase 4 framing — pure-Lua actors only;
-    //      the resume_phase hook predates this and stays attached to
-    //      the live phases, not the replay window).
-    //   6. (no replay file → no replayed entries here).
-    //   7. replay.end emit.
-    //   8. resume_done hook runs.
-    //   9. resume_done emit.
+fn resume_emits_lifecycle_markers_in_order() {
+    // Phase 4.5 contract: `sessions.resume()` walks an explicit emit
+    // sequence — `session_end`, `session_start`, `replay.start`,
+    // (replayed entries), `replay.end`, `resume_done`. The synchronous
+    // `on_resume_phase` hook registry is gone; pure-Lua actors observe
+    // these phases by subscribing to the corresponding bus events
+    // (`nefor.bus.on_event`). This test asserts the emit order on the
+    // wire — that's the surface every consumer now reads against.
     //
-    // We verify by recording timestamps in a Lua-side trace log: each
-    // hook records "phase:<name>", and we monkey-patch `nefor.engine.send`
-    // to also append "emit:<kind>". The final order tells us the sync
-    // hook ran before the broadcast.
+    //   1. session_end emit.
+    //   2. session_start emit.
+    //   3. replay.start emit.
+    //   4. (no replay file → no replayed entries here).
+    //   5. replay.end emit.
+    //   6. resume_done emit.
+    //
+    // We monkey-patch `nefor.engine.send` to capture every emission's
+    // kind into a trace; the order assertion below is the contract.
     let tempdir = tempfile::tempdir().expect("tempdir");
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let prev = std::env::var("NEFOR_DATA_HOME").ok();
@@ -283,16 +280,6 @@ fn resume_phase_hooks_fire_synchronously_before_emit() {
         sessions_test = require("sessions.test")
         sessions.init()
 
-        sessions.on_resume_phase("session_end", function(_id)
-            _trace[#_trace + 1] = "phase:session_end"
-        end)
-        sessions.on_resume_phase("session_start", function(_id)
-            _trace[#_trace + 1] = "phase:session_start"
-        end)
-        sessions.on_resume_phase("resume_done", function(_id)
-            _trace[#_trace + 1] = "phase:resume_done"
-        end)
-
         -- Clear the trace so we only see what resume() does.
         _trace = {}
 
@@ -311,19 +298,16 @@ fn resume_phase_hooks_fire_synchronously_before_emit() {
         .map(|i| trace.get::<String>(i).expect("trace entry"))
         .collect();
     let expected = vec![
-        "phase:session_end",
         "emit:sessions.session_end",
-        "phase:session_start",
         "emit:sessions.session_start",
         "emit:sessions.replay.start",
         "emit:sessions.replay.end",
-        "phase:resume_done",
         "emit:sessions.resume_done",
     ];
     assert_eq!(
         ordered.iter().map(String::as_str).collect::<Vec<_>>(),
         expected,
-        "phase hooks must fire BEFORE the corresponding emit; got {ordered:?}"
+        "resume must emit lifecycle markers in this order; got {ordered:?}"
     );
 
     match prev.as_deref() {
