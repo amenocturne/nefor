@@ -17,7 +17,7 @@ use crate::lua_host::{
     LuaHost, ScrollCommand, ScrollPositionMap, ScrollPositionSnapshot, SideEffect,
 };
 use crate::mouse::{
-    find_focused_multiline_text_input_path, find_scrollable_path, hit_test,
+    find_focused_multiline_text_input_path, find_scrollable_path, find_selectable_path, hit_test,
     instance_at_path as mouse_instance_at_path, kind_string, MouseKind, MouseMessage,
     SelectionRange,
 };
@@ -519,39 +519,45 @@ impl Engine {
         }
 
         // Selection mechanism: left-button Down records a candidate
-        // origin; the selection only "opens" (becomes visible) on the
-        // first `Drag` so a pure click stays a click — no highlight
+        // origin only when a `selectable = true` widget sits under the
+        // cursor. Without that, the click bubbles as `mouse.click` and
+        // no selection state is opened — clicking on a non-selectable
+        // surface (status row, sidebar, modal chrome) doesn't begin a
+        // drag-select. The selection only "opens" (becomes visible) on
+        // the first `Drag` so a pure click stays a click — no highlight
         // flashes for tap-style interactions. `Up` finalises the drag
         // (or drops a candidate origin if no drag ever happened).
         match evt.kind {
             MouseKind::Click if evt.button == Some("left") => {
-                self.selection_start = Some((evt.x, evt.y));
+                // Always clear any prior selection state — even if this
+                // click doesn't open a new selection, the previous one's
+                // captured cell, rect, and content anchors must drop so
+                // the next render paints a clean frame.
+                self.selection_start = None;
                 self.selection_end = None;
                 self.selecting = false;
                 self.selection_scroll_key = None;
                 self.selection_scroll_rect = None;
                 self.selection_anchor_in_content = None;
                 self.selection_drag_in_content = None;
-                // Capture the keyed scrollable under the cursor (deepest
-                // wins, matching the wheel-routing path) along with its
-                // painted rect, content-width, and the anchor's content
-                // coords (transcript-line index + col-in-content). The
-                // content-coord anchor is the load-bearing piece of the
-                // copy-on-mouse-up fix: it names a *transcript line*
-                // rather than a screen row, so subsequent auto-scroll
-                // doesn't drift it. Without this, the selection's start
-                // would point at "screen row N" — and after auto-scroll
-                // bumped `scroll_y` by k, screen row N now shows a
-                // different transcript line, so the copy reads the wrong
-                // content. See `finalise_selection` for the consumer.
-                //
-                // No keyed scrollable under cursor → all three of
-                // `_key`, `_rect`, `_anchor_in_content` stay `None` and
-                // `auto_scroll_for_drag` + the copy path fall back to
-                // the legacy screen-coord behaviour.
+                self.needs_render = true;
+                // Capture the deepest `selectable = true` widget under
+                // the cursor along with its painted rect, content-width,
+                // and the anchor's content coords (transcript-line index
+                // + col-in-content). Selection scoping is per-widget:
+                // - Click outside any selectable → no selection opens.
+                //   The state stays cleared and no `mouse.selection`
+                //   ever fires for this gesture.
+                // - Click inside a selectable → record the anchor in
+                //   content coords. `row_in_content` names a transcript
+                //   line, so subsequent auto-scroll doesn't drift it
+                //   (the same property `141692f` introduced; widened
+                //   from "any keyed scrollable" to "any `selectable`
+                //   widget" in this revision).
                 if let Some((key, rect, anchor_content)) =
-                    self.resolve_scrollable_anchor_at_click(evt.x, evt.y)
+                    self.resolve_selectable_anchor_at_click(evt.x, evt.y)
                 {
+                    self.selection_start = Some((evt.x, evt.y));
                     self.selection_scroll_key = Some(key);
                     self.selection_scroll_rect = Some(rect);
                     self.selection_anchor_in_content = Some(anchor_content);
@@ -609,24 +615,45 @@ impl Engine {
         self.dispatch_msg(msg)
     }
 
-    /// Currently-active selection range (if any). The renderer reads
-    /// this on every paint pass to apply the reverse-video highlight.
-    fn current_selection(&self) -> Option<SelectionRange> {
-        match (self.selection_start, self.selection_end, self.selecting) {
-            (Some(start), Some(end), true) => Some(SelectionRange::normalised(start, end)),
+    /// Currently-active selection range (if any), paired with the
+    /// captured selectable widget's painted rect. The renderer reads
+    /// both on every paint pass: the range drives which cells get the
+    /// reverse-video highlight; the rect is the geometric clip — cells
+    /// outside it stay un-highlighted, even when the geometric range
+    /// extends past the widget's edge (drag past the right edge into
+    /// a neighbouring panel). Selection only opens for `selectable =
+    /// true` widgets, so the rect is always present when a selection
+    /// is active.
+    fn current_selection(&self) -> Option<(SelectionRange, crate::layout::Rect)> {
+        match (
+            self.selection_start,
+            self.selection_end,
+            self.selecting,
+            self.selection_scroll_rect,
+        ) {
+            (Some(start), Some(end), true, Some(rect)) => {
+                Some((SelectionRange::normalised(start, end), rect))
+            }
             _ => None,
         }
     }
 
     /// Finalise an in-flight selection on `Up(left)`. When the user
-    /// actually dragged (`selecting == true`), extracts the covered
-    /// plain-text from the most recently painted framebuffer and
-    /// dispatches `{ kind = "mouse.selection", text, start, end }` to
-    /// Lua. A bare click → release (no drag in between) clears the
-    /// candidate origin without dispatching anything — that path stays
-    /// owned by the `mouse.click` route. Up events outside a drag are
-    /// silent no-ops; selection-state tracking is the only signal that
-    /// distinguishes a stray release from an end-of-drag.
+    /// actually dragged (`selecting == true`) AND the click captured a
+    /// `selectable = true` widget, extracts the covered plain-text from
+    /// the captured widget's content and dispatches
+    /// `{ kind = "mouse.selection", text, start, end }` to Lua. A bare
+    /// click → release (no drag in between) clears the candidate origin
+    /// without dispatching anything — that path stays owned by the
+    /// `mouse.click` route. Up events outside a drag are silent no-ops.
+    ///
+    /// Without a captured selectable widget there is nothing to
+    /// extract: pre-fix the engine fell back to a screen-coord copy
+    /// from the framebuffer, which let drags on non-selectable surfaces
+    /// (status row, sidebar, modal chrome) surface a `mouse.selection`
+    /// envelope with whatever cells happened to lie under the drag.
+    /// That path is gone — selection only fires when the click landed
+    /// inside an explicit selectable region.
     fn finalise_selection(&mut self, x: u16, y: u16) -> Result<(), TuiError> {
         let was_selecting = self.selecting;
         let start_opt = self.selection_start;
@@ -659,31 +686,30 @@ impl Engine {
         };
         let end = (x, y);
 
-        // Prefer the content-coord copy path when the click landed
-        // inside a captured scrollable. Otherwise fall back to the
-        // legacy screen-coord extraction (selections outside any
-        // scrollable, or where the scrollable has no key).
+        // Selection extraction requires the captured selectable widget.
+        // The four `Some` requirements all populate together at click
+        // time — splitting them out keeps the extractor signature
+        // explicit, but in practice they're a single capture record.
         let text = match (
             scroll_key_opt.as_ref(),
             scroll_rect_opt,
             anchor_content_opt,
             drag_content_opt,
         ) {
-            (Some(key), Some(rect), Some(anchor), Some(drag)) => self
-                .extract_selection_from_scrollable_content(key, rect, anchor, drag)
-                .unwrap_or_else(|| {
-                    // Fallback if the scrollable disappeared from the
-                    // tree between Click and Up (extremely unlikely —
-                    // would require a Lua-side `view` to have removed
-                    // it mid-drag). Legacy screen-coord extraction
-                    // gives a "less wrong" answer than empty text.
-                    let range = SelectionRange::normalised(start, end);
-                    extract_selection_text(self.renderer.last_frame(), range)
-                }),
-            _ => {
-                let range = SelectionRange::normalised(start, end);
-                extract_selection_text(self.renderer.last_frame(), range)
+            (Some(key), Some(rect), Some(anchor), Some(drag)) => {
+                match self.extract_selection_from_scrollable_content(key, rect, anchor, drag) {
+                    Some(text) => text,
+                    None => {
+                        // Captured widget disappeared from the tree
+                        // between Click and Up (Lua-side `view` removed
+                        // it mid-drag — rare). Drop the dispatch
+                        // entirely rather than synthesising a copy from
+                        // the post-rebuild framebuffer.
+                        return Ok(());
+                    }
+                }
             }
+            _ => return Ok(()),
         };
 
         let msg = self.lua().create_table()?;
@@ -755,32 +781,36 @@ impl Engine {
         Some(extract_selection_text(&scratch, range))
     }
 
-    /// Walk the current tree for the deepest keyed scrollable under
-    /// `(x, y)` and return `(key, painted_rect, anchor_in_content)`.
+    /// Walk the current tree for the deepest `selectable = true` widget
+    /// under `(x, y)` and return `(key, painted_rect, anchor_in_content)`.
     /// `anchor_in_content` is `(col_in_content, row_in_content)` where
     /// `row_in_content = scroll_y_at_click + (y - rect.row)` (clamped
     /// to the rect's height) and `col_in_content = (x - rect.col)`
     /// clamped to the content width — i.e. the index into the
     /// scrollable's *content* scratch buffer that the click resolves
-    /// to. Returns `None` when no scrollable is under the cursor or
-    /// when the deepest one has no `user_key` (per the spec, only
-    /// keyed scrollables participate in the auto-scroll/copy paths).
-    fn resolve_scrollable_anchor_at_click(
+    /// to. Returns `None` when no selectable widget is under the cursor
+    /// or when the deepest one has no `user_key`. Per the spec only
+    /// keyed scrollables expose `selectable` (the desc parser rejects
+    /// keyless scrollables), so the missing-key branch is defensive.
+    fn resolve_selectable_anchor_at_click(
         &self,
         x: u16,
         y: u16,
     ) -> Option<(String, crate::layout::Rect, (u16, u16))> {
         let root = self.reconciler.root.as_ref()?;
-        let path = find_scrollable_path(root, x, y)?;
+        let path = find_selectable_path(root, x, y)?;
         let mut cur = root;
         for &i in &path {
             cur = cur.children.get(i)?;
         }
         let key = cur.last_desc.user_key()?.to_string();
         let rect = cur.layout.painted_rect?;
+        // `selectable = true` widget under the cursor; for v1 only
+        // scrollables expose the property, so the state-shape check
+        // is a guarded extraction rather than a kind dispatch.
         let scroll_y = match &cur.state {
             InstanceState::Scrollable(s) => s.scroll_y,
-            _ => return None,
+            _ => 0,
         };
         let content_w = scrollable_content_width(cur, rect);
         Some((
@@ -1880,16 +1910,22 @@ mod tests {
         }
     }
 
-    /// Drag-to-select scenario: a single line of static text. The state
-    /// remembers the most recent `mouse.selection` message (text +
-    /// endpoints) so tests can assert what Lua observed without poking
-    /// at the engine's internals.
+    /// Drag-to-select scenario: a single line of static text inside a
+    /// `selectable = true` scrollable. The selection mechanism only
+    /// captures inside selectable widgets, so the wrapping is required
+    /// post-fix. The state remembers the most recent `mouse.selection`
+    /// message (text + endpoints) so tests can assert what Lua observed
+    /// without poking at the engine's internals.
     const SELECTION_SCENARIO: &str = r#"
         tui.start {
           initial_state = { sel_text = nil, sel_start = nil, sel_end = nil },
           view = function(s)
             local label = s.sel_text and ("got: " .. s.sel_text) or "hello world"
-            return tui.text { content = label }
+            return tui.scrollable {
+              key        = "label",
+              selectable = true,
+              child      = tui.text { content = label },
+            }
           end,
           update = function(msg, s)
             if msg.kind == "mouse.selection" then
@@ -2035,10 +2071,14 @@ mod tests {
                 if s.sel then
                   return tui.text { content = "got:" .. s.sel }
                 end
-                return tui.column { gap = 0, children = {
-                  tui.text { content = "alpha" },
-                  tui.text { content = "beta" },
-                }}
+                return tui.scrollable {
+                  key        = "ab",
+                  selectable = true,
+                  child      = tui.column { gap = 0, children = {
+                    tui.text { content = "alpha" },
+                    tui.text { content = "beta" },
+                  }},
+                }
               end,
               update = function(msg, s)
                 if msg.kind == "mouse.selection" then

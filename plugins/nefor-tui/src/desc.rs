@@ -149,6 +149,14 @@ pub enum WidgetDescription {
         scrollbar: crate::scrollable::ScrollbarMode,
         /// Per-element style overrides. `None` = neutral terminal output.
         style: Option<ScrollableStyle>,
+        /// Opt-in for drag-to-select. When `true`, this scrollable defines
+        /// a selection region — clicks inside it open a selection,
+        /// drags clamp to its painted rect, and the highlight paints only
+        /// inside the rect. Default `false`: clicks bubble as
+        /// `mouse.click` without starting a selection. Selection is
+        /// always scoped to the captured widget; cross-panel highlight
+        /// bleed and cross-widget copy are both eliminated by clamping.
+        selectable: bool,
     },
     TextInput {
         /// User key — required for text_input so Lua can reference it
@@ -1131,6 +1139,17 @@ fn parse_scrollable(t: &Table) -> Result<WidgetDescription, TuiError> {
 
     let style = parse_scrollable_style(t)?;
 
+    let selectable = match t.get::<Value>("selectable")? {
+        Value::Nil => false,
+        Value::Boolean(b) => b,
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.scrollable: `selectable` must be a boolean (got {})",
+                other.type_name()
+            )));
+        }
+    };
+
     Ok(WidgetDescription::Scrollable {
         key,
         child,
@@ -1138,6 +1157,7 @@ fn parse_scrollable(t: &Table) -> Result<WidgetDescription, TuiError> {
         on_scroll,
         scrollbar,
         style,
+        selectable,
     })
 }
 

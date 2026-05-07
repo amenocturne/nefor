@@ -142,16 +142,24 @@ impl Renderer {
     /// Selection is engine state, not layout state — we paint the tree
     /// first, then post-process the framebuffer so existing widget paint
     /// paths stay oblivious to the selection mechanism.
+    ///
+    /// `selection` carries the geometric range AND the captured
+    /// selectable widget's painted rect. The highlight is intersected
+    /// with the rect: cells outside it stay un-highlighted even when
+    /// the user drags past the widget's edge into a neighbouring panel.
+    /// That's the closing half of the per-widget selection-scoping
+    /// model — the COPY clamp landed in `141692f`; the visual
+    /// highlight clamp lands here.
     pub fn render_with_selection(
         &mut self,
         root: &mut WidgetInstance,
-        selection: Option<SelectionRange>,
+        selection: Option<(SelectionRange, layout::Rect)>,
     ) -> Vec<u8> {
         self.next.reset(self.width, self.height);
         reset_layout_state(root);
         layout::layout_and_paint(root, self.width, self.height, &mut self.next);
-        if let Some(range) = selection {
-            apply_selection_highlight(&mut self.next, range);
+        if let Some((range, clip)) = selection {
+            apply_selection_highlight(&mut self.next, range, Some(clip));
         }
         let bytes = if self.needs_full {
             self.emit_full()
@@ -249,7 +257,20 @@ fn push_line(out: &mut String, line: &Line) {
 /// highlight stays neutral against any user theme — no engine-baked
 /// colors. Cells outside the buffer are silently skipped (the renderer
 /// never overdraws past `width × height`).
-fn apply_selection_highlight(buf: &mut FrameBuffer, range: SelectionRange) {
+///
+/// When `clip` is `Some(rect)`, cells outside the rect are also skipped
+/// — the highlight is the geometric intersection of the selection range
+/// with the captured selectable widget's painted rect. This stops a
+/// drag past the widget's edge from painting reverse-video onto cells
+/// that belong to a neighbouring panel (chat-into-sidebar, modal
+/// overlay-into-base). With `clip = None` the legacy unclipped path
+/// applies — kept available for tests of the highlight primitive in
+/// isolation.
+fn apply_selection_highlight(
+    buf: &mut FrameBuffer,
+    range: SelectionRange,
+    clip: Option<layout::Rect>,
+) {
     let height = buf.lines.len() as u16;
     if height == 0 {
         return;
@@ -261,6 +282,26 @@ fn apply_selection_highlight(buf: &mut FrameBuffer, range: SelectionRange) {
         }
         let Some((c0, c1)) = range.row_span(row, width) else {
             continue;
+        };
+        // Intersect the row's selection segment with the clip rect when
+        // present. `rect.row + rect.height` is exclusive; rows past it
+        // contribute nothing. Same shape on the column axis.
+        let (c0, c1) = match clip {
+            Some(rect) => {
+                let row_in = row >= rect.row && row < rect.row.saturating_add(rect.height);
+                if !row_in {
+                    continue;
+                }
+                let rect_c0 = rect.col;
+                let rect_c1 = rect.col.saturating_add(rect.width).saturating_sub(1);
+                let lo = c0.max(rect_c0);
+                let hi = c1.min(rect_c1);
+                if lo > hi {
+                    continue;
+                }
+                (lo, hi)
+            }
+            None => (c0, c1),
         };
         let line = &mut buf.lines[row as usize];
         for col in c0..=c1 {
@@ -483,11 +524,70 @@ mod tests {
     #[test]
     fn apply_selection_highlight_toggles_reverse() {
         let mut buf = make_buf(&["abcdef"], 6);
-        apply_selection_highlight(&mut buf, SelectionRange::normalised((1, 0), (3, 0)));
+        apply_selection_highlight(&mut buf, SelectionRange::normalised((1, 0), (3, 0)), None);
         assert!(!buf.lines[0].cells[0].style.reverse);
         assert!(buf.lines[0].cells[1].style.reverse);
         assert!(buf.lines[0].cells[2].style.reverse);
         assert!(buf.lines[0].cells[3].style.reverse);
         assert!(!buf.lines[0].cells[4].style.reverse);
+    }
+
+    #[test]
+    fn apply_selection_highlight_clips_to_rect_columns() {
+        // 6-cell row "abcdef" — geometric range covers cols 1..=5 but
+        // the clip rect is cols 0..=2 wide. Only cells 1..=2 should
+        // flip; cells 3..=5 stay un-reversed.
+        let mut buf = make_buf(&["abcdef"], 6);
+        let clip = layout::Rect {
+            row: 0,
+            col: 0,
+            width: 3, // cols 0..=2
+            height: 1,
+        };
+        apply_selection_highlight(
+            &mut buf,
+            SelectionRange::normalised((1, 0), (5, 0)),
+            Some(clip),
+        );
+        assert!(!buf.lines[0].cells[0].style.reverse);
+        assert!(buf.lines[0].cells[1].style.reverse);
+        assert!(buf.lines[0].cells[2].style.reverse);
+        assert!(
+            !buf.lines[0].cells[3].style.reverse,
+            "col 3 is past clip rect right edge — must stay unreversed"
+        );
+        assert!(!buf.lines[0].cells[4].style.reverse);
+        assert!(!buf.lines[0].cells[5].style.reverse);
+    }
+
+    #[test]
+    fn apply_selection_highlight_clips_to_rect_rows() {
+        // Two rows: row 0 inside clip, row 1 outside.
+        let mut buf = make_buf(&["abcdef", "ghijkl"], 6);
+        let clip = layout::Rect {
+            row: 0,
+            col: 0,
+            width: 6,
+            height: 1, // rows 0..=0
+        };
+        apply_selection_highlight(
+            &mut buf,
+            SelectionRange::normalised((0, 0), (5, 1)),
+            Some(clip),
+        );
+        // Row 0 cells should be reversed (range covers full row 0).
+        for col in 0..6 {
+            assert!(
+                buf.lines[0].cells[col].style.reverse,
+                "row 0 col {col} should be reversed"
+            );
+        }
+        // Row 1 outside clip — must stay un-reversed.
+        for col in 0..6 {
+            assert!(
+                !buf.lines[1].cells[col].style.reverse,
+                "row 1 col {col} is past clip rect — must stay unreversed"
+            );
+        }
     }
 }

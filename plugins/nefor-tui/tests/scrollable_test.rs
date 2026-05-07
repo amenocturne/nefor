@@ -376,11 +376,12 @@ const SCROLLABLE_SELECTION_SCENARIO: &str = r#"
           tui.text { content = "offset: " .. tostring(s.offset) },
           tui.expanded {
             child = tui.scrollable {
-              key       = "log",
-              child     = tui.column { gap = 0, children = kids },
-              stick_to  = "end",
-              on_scroll = "log.scrolled",
-              scrollbar = "auto",
+              key        = "log",
+              child      = tui.column { gap = 0, children = kids },
+              stick_to   = "end",
+              on_scroll  = "log.scrolled",
+              scrollbar  = "auto",
+              selectable = true,
             },
           },
         }}
@@ -628,5 +629,366 @@ fn drag_past_top_with_auto_scroll_copies_full_anchored_range() {
         captured.contains("row 24"),
         "copied selection must contain the anchor row (row 24) even after \
          auto-scroll moved it out of view; got:\n{captured:?}"
+    );
+}
+
+// ── selectable opt-in: per-widget scoping ─────────────────────────────
+//
+// A scrollable's `selectable = true` flag opts it into drag-to-select.
+// Clicks inside fire a selection; clicks elsewhere don't open one. The
+// scenario below paints a column where:
+// - Row 0 is a non-selectable status text (`status: ...`).
+// - Rows 1..7 hold a `tui.row { left | right }`. The left half is a
+//   `selectable = true` scrollable named "chat" (30 numbered rows). The
+//   right half is a `selectable = false` scrollable named "side" (20
+//   numbered rows). Both have keys so they participate in hit-testing.
+//
+// At a 40×8 frame: status is row 0; row body occupies rows 1..7 (7
+// rows). Each half-column is 20 cells wide (40 / 2). The chat scrollable
+// owns cells (col 0..=19, row 1..=7); the side scrollable owns cells
+// (col 20..=39, row 1..=7). The non-selectable status row is y=0.
+
+const SELECTABLE_LAYOUT_SCENARIO: &str = r#"
+    tui.start {
+      initial_state = {
+        chat_rows = 30,
+        side_rows = 20,
+      },
+      view = function(s)
+        local chat_kids = {}
+        for i = 1, s.chat_rows do
+          chat_kids[#chat_kids + 1] = tui.text { content = "chat " .. i }
+        end
+        local side_kids = {}
+        for i = 1, s.side_rows do
+          side_kids[#side_kids + 1] = tui.text { content = "side " .. i }
+        end
+        return tui.column { gap = 0, children = {
+          tui.text { content = "status: ready" },
+          tui.expanded {
+            child = tui.row { gap = 0, children = {
+              tui.expanded {
+                child = tui.scrollable {
+                  key        = "chat",
+                  child      = tui.column { gap = 0, children = chat_kids },
+                  stick_to   = "end",
+                  scrollbar  = "never",
+                  selectable = true,
+                },
+              },
+              tui.expanded {
+                child = tui.scrollable {
+                  key        = "side",
+                  child      = tui.column { gap = 0, children = side_kids },
+                  stick_to   = "end",
+                  scrollbar  = "never",
+                  -- selectable defaults to false: clicks/drags do not open selections.
+                },
+              },
+            }},
+          },
+        }}
+      end,
+      update = function(msg, s)
+        if msg.kind == "mouse.selection" then
+          tui.emit { kind = "selection.captured", text = msg.text or "" }
+        end
+        return s, {}
+      end,
+    }
+"#;
+
+/// Helper: click without releasing — drives the auto-scroll path's
+/// in-flight scenarios that don't end with mouse-up. Tests that need
+/// a finalised selection use `drag_select` instead.
+fn click_only(engine: &mut Engine, x: u16, y: u16) {
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Click,
+            x,
+            y,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("click");
+}
+
+fn release_only(engine: &mut Engine, x: u16, y: u16) {
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Up,
+            x,
+            y,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("up");
+}
+
+/// Wheel-up the named scrollable to take it off the bottom-pin, so the
+/// resulting visible window is deterministic for cell-coord assertions.
+fn wheel_up_n(engine: &mut Engine, x: u16, y: u16, n: usize) {
+    for _ in 0..n {
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Wheel,
+                x,
+                y,
+                button: Some("up"),
+                mods: vec![],
+            })
+            .expect("wheel-up");
+        let _ = engine.render_if_dirty();
+    }
+}
+
+/// Drag from the selectable chat scrollable out into the non-selectable
+/// sidebar. The drag should clamp to the chat's painted rect (col 0..=19);
+/// the copied text must NOT contain any "side N" rows from the sidebar.
+#[test]
+fn drag_from_selectable_into_nonselectable_clamps_to_origin() {
+    let mut engine = Engine::new(40, 8).expect("engine");
+    engine
+        .load_scenario(SELECTABLE_LAYOUT_SCENARIO)
+        .expect("scenario");
+    let _ = render_str(&mut engine);
+
+    // Move chat off bottom-pin so we have a stable visible window.
+    // chat scroll_y_max = 30 - 7 = 23. wheel-up 5×3 = 15 rows → offset 8,
+    // visible chat rows 9..=15 at row positions 1..=7.
+    wheel_up_n(&mut engine, 5, 4, 5);
+    // Same for sidebar: side scroll_y_max = 20 - 7 = 13. wheel-up 4×3
+    // → offset 1, visible side rows 2..=8.
+    wheel_up_n(&mut engine, 25, 4, 4);
+
+    // Click inside chat at (col=0, row=1) — anchor at the start of "chat 9"
+    // so the assertion below sees the full token even after row-trim.
+    // Drag into the sidebar (col=30, row=4) — geometrically inside side's
+    // rect, but the captured selection origin is chat. The drag should
+    // clamp to chat's rect (col cap at 19; rows stay valid).
+    drag_select(&mut engine, (0, 1), &[(15, 2), (25, 3), (30, 4)], (30, 4));
+    let captured =
+        last_captured_selection(&mut engine).expect("mouse.selection should fire on chat origin");
+    assert!(
+        captured.contains("chat 9"),
+        "drag from chat anchor must include the chat anchor row in copy; \
+         got:\n{captured:?}"
+    );
+    // The sidebar's content must NOT leak into the copy — the drag was
+    // clamped to the chat's painted rect (col <= 19), so cells past the
+    // boundary shouldn't appear regardless of where the cursor wandered.
+    assert!(
+        !captured.contains("side "),
+        "drag clamped to selectable chat rect must not include sidebar \
+         text; got:\n{captured:?}"
+    );
+}
+
+/// Click on a non-selectable area (the status row at y=0 / the sidebar)
+/// must NOT open a selection. Drag + release should produce no
+/// `mouse.selection` envelope.
+#[test]
+fn click_on_nonselectable_widget_does_not_capture_selection() {
+    let mut engine = Engine::new(40, 8).expect("engine");
+    engine
+        .load_scenario(SELECTABLE_LAYOUT_SCENARIO)
+        .expect("scenario");
+    let _ = render_str(&mut engine);
+    // Drain any startup emits — only the post-drag captures matter below.
+    let _ = engine.take_emit_queue();
+
+    // Drag entirely inside the sidebar (right half, col >= 20).
+    // Sidebar is `selectable = false` so this opens no selection.
+    drag_select(&mut engine, (25, 2), &[(28, 3), (30, 4)], (30, 5));
+    assert!(
+        last_captured_selection(&mut engine).is_none(),
+        "drag inside non-selectable sidebar should not fire mouse.selection"
+    );
+
+    // Drag on the status row (y=0) — a non-scrollable, no `selectable`
+    // widget. Same expectation: no selection.
+    drag_select(&mut engine, (1, 0), &[(5, 0), (10, 0)], (12, 0));
+    assert!(
+        last_captured_selection(&mut engine).is_none(),
+        "drag on the non-selectable status row should not fire mouse.selection"
+    );
+}
+
+/// Highlight paints only inside the captured selectable's rect. Drag
+/// from inside chat past the right edge of its painted rect — the
+/// drag's geometric range extends past col 19, but the post-render
+/// framebuffer must only carry the reverse-video SGR within the chat
+/// rect. The sidebar cells under the geometric range stay un-highlighted.
+#[test]
+fn selection_highlight_clips_to_captured_widget_rect() {
+    let mut engine = Engine::new(40, 8).expect("engine");
+    engine
+        .load_scenario(SELECTABLE_LAYOUT_SCENARIO)
+        .expect("scenario");
+    let _ = render_str(&mut engine);
+    // Take chat off bottom-pin so cells are stable for snapshot assertions.
+    wheel_up_n(&mut engine, 5, 4, 5);
+
+    // Click inside chat (col 2, row 1), drag past the right edge of
+    // the chat rect (col 19) into the sidebar (col 30, same row).
+    click_only(&mut engine, 2, 1);
+    let _ = engine.render_if_dirty();
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Drag,
+            x: 30,
+            y: 1,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("drag");
+    let _ = engine.render_if_dirty();
+
+    let snap = engine.snapshot_ansi();
+    // Split the snapshot into rows so we can inspect row 1 (the drag y)
+    // independently of the surrounding rows.
+    let row1 = snap.lines().nth(1).expect("row 1");
+    // The chat cells (cols 0..=19) should carry the reverse-video SGR.
+    // The sidebar half (cols 20..=39) sits geometrically under the drag's
+    // range but lives outside chat's rect — its cells must stay un-reversed.
+    //
+    // Strategy: row 1 must contain at least one "side " token (the sidebar's
+    // visible row on this y) AND that token must NOT be wrapped in a
+    // reverse-SGR. The simplest invariant: locate the "side " substring's
+    // start, then ensure no `;7m` or `\x1b[7m` opens between the last SGR
+    // boundary before "side " and the substring itself.
+    assert!(
+        row1.contains("side "),
+        "row 1 should still show sidebar content (snap):\n{snap:?}"
+    );
+
+    // The strict structural check: extract the styled text of the row,
+    // walk SGR-by-SGR, and verify no cell with a "side"-prefixed glyph
+    // is currently inside a reverse-video segment. Reverse video uses
+    // either bare `[7m` or `;7m` inside an SGR sequence.
+    let row1_string = row1.to_string();
+    let mut reverse_active = false;
+    let mut byte_idx = 0;
+    let mut found_unreversed_side = false;
+    while byte_idx < row1_string.len() {
+        let rest = &row1_string[byte_idx..];
+        if let Some(esc_at) = rest.find('\x1b') {
+            let visible_chunk = &rest[..esc_at];
+            // Did the sidebar text appear in this visible chunk while
+            // reverse_active was off? If yes, the highlight clipped.
+            if !reverse_active && visible_chunk.contains("side ") {
+                found_unreversed_side = true;
+            }
+            // Advance past the SGR sequence and update reverse_active.
+            let sgr_start = byte_idx + esc_at;
+            let sgr_tail = &row1_string[sgr_start..];
+            if let Some(end_idx) = sgr_tail.find('m') {
+                let sgr_body = &sgr_tail[..=end_idx];
+                if sgr_body.contains("[0m") || sgr_body == "\x1b[m" {
+                    reverse_active = false;
+                } else if sgr_body.contains(";7m") || sgr_body.contains("[7m") {
+                    reverse_active = true;
+                } else if sgr_body.contains(";27m") || sgr_body.contains("[27m") {
+                    reverse_active = false;
+                }
+                byte_idx = sgr_start + end_idx + 1;
+            } else {
+                break;
+            }
+        } else {
+            // Trailing visible chunk past the last SGR — same check.
+            if !reverse_active && rest.contains("side ") {
+                found_unreversed_side = true;
+            }
+            break;
+        }
+    }
+    assert!(
+        found_unreversed_side,
+        "sidebar cells outside chat's painted rect must NOT carry the \
+         reverse-video highlight; raw row:\n{row1_string:?}"
+    );
+
+    // Sanity check that the highlight DID paint inside chat's rect: at
+    // least one reverse-SGR must appear before the cells past col 19.
+    assert!(
+        row1_string.contains("\x1b[7m") || row1_string.contains(";7m"),
+        "highlight should still paint inside the chat rect; raw row:\n{row1_string:?}"
+    );
+
+    // Release to keep the engine in a clean state for any follow-up.
+    release_only(&mut engine, 30, 1);
+}
+
+/// Two adjacent selectable widgets, drag from A into B. The selection
+/// stays scoped to A (the captured origin) — B's content must not enter
+/// the copy. This pins the cross-widget no-selection rule under the
+/// scoping model.
+#[test]
+fn drag_across_two_adjacent_selectables_clamps_to_origin() {
+    const TWO_SELECTABLES: &str = r#"
+        tui.start {
+          initial_state = {},
+          view = function(_)
+            local left_kids = {}
+            for i = 1, 30 do
+              left_kids[#left_kids + 1] = tui.text { content = "left " .. i }
+            end
+            local right_kids = {}
+            for i = 1, 30 do
+              right_kids[#right_kids + 1] = tui.text { content = "right " .. i }
+            end
+            return tui.row { gap = 0, children = {
+              tui.expanded {
+                child = tui.scrollable {
+                  key        = "left",
+                  child      = tui.column { gap = 0, children = left_kids },
+                  stick_to   = "end",
+                  scrollbar  = "never",
+                  selectable = true,
+                },
+              },
+              tui.expanded {
+                child = tui.scrollable {
+                  key        = "right",
+                  child      = tui.column { gap = 0, children = right_kids },
+                  stick_to   = "end",
+                  scrollbar  = "never",
+                  selectable = true,
+                },
+              },
+            }}
+          end,
+          update = function(msg, s)
+            if msg.kind == "mouse.selection" then
+              tui.emit { kind = "selection.captured", text = msg.text or "" }
+            end
+            return s, {}
+          end,
+        }
+    "#;
+    let mut engine = Engine::new(40, 8).expect("engine");
+    engine.load_scenario(TWO_SELECTABLES).expect("scenario");
+    let _ = render_str(&mut engine);
+
+    // Wheel both off the bottom-pin so the visible windows are stable.
+    // 30 rows in 8-row viewport → max = 22. wheel-up 5×3 = 15 → offset 7,
+    // rows 8..=14 visible (rows 0..=6 of the rect's 8 rows hold those
+    // viewport rows; row 7 of the layout is row 14 of the transcript).
+    wheel_up_n(&mut engine, 5, 4, 5);
+    wheel_up_n(&mut engine, 25, 4, 5);
+
+    // Click in the LEFT scrollable, drag into the RIGHT scrollable, release.
+    drag_select(&mut engine, (2, 0), &[(15, 1), (25, 2), (30, 3)], (30, 3));
+    let captured =
+        last_captured_selection(&mut engine).expect("mouse.selection should fire on left origin");
+    assert!(
+        captured.contains("left "),
+        "drag from left origin must include left content in copy; got:\n{captured:?}"
+    );
+    assert!(
+        !captured.contains("right "),
+        "drag from left origin into right widget must NOT include right \
+         content (selection clamps to origin); got:\n{captured:?}"
     );
 }

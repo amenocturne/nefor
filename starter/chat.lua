@@ -2036,12 +2036,19 @@ local function transcript(state)
   local think = thinking_widget(state)
   if think then widgets[#widgets + 1] = think end
   local scroll = tui.scrollable {
-    key       = "transcript",
-    stick_to  = "end",
-    scrollbar = "auto",
+    key        = "transcript",
+    stick_to   = "end",
+    scrollbar  = "auto",
+    -- Drag-to-select scopes to this widget. Drags past the transcript's
+    -- edge clamp at the rect, so a selection that strays into the
+    -- sidebar / input / statusline doesn't paint highlight or copy text
+    -- from those panels. Other read-output surfaces (DAG sidebar, status
+    -- row) are deliberately not marked `selectable`: clicks there
+    -- bubble as `mouse.click` without opening a selection.
+    selectable = true,
     -- 1-cell right padding so wrapped lines don't visually clash into
     -- the scrollbar's column.
-    child     = tui.padding {
+    child      = tui.padding {
       value = { top = 0, right = 1, bottom = 0, left = 0 },
       child = tui.column { gap = 1, children = widgets },
     },

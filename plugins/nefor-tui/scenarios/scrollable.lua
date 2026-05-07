@@ -24,11 +24,12 @@ tui.start {
       tui.text { content = "offset: " .. tostring(s.scroll_offset) },
       tui.expanded {
         child = tui.scrollable {
-          key       = "log",
-          child     = tui.column { gap = 0, children = kids },
-          stick_to  = "end",
-          on_scroll = "log.scrolled",
-          scrollbar = "auto",
+          key        = "log",
+          child      = tui.column { gap = 0, children = kids },
+          stick_to   = "end",
+          on_scroll  = "log.scrolled",
+          scrollbar  = "auto",
+          selectable = true,
         },
       },
     }}

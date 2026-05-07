@@ -3432,6 +3432,7 @@ mod tests {
             on_scroll: None,
             scrollbar: ScrollbarMode::Auto,
             style: None,
+            selectable: false,
         }
     }
 
@@ -3448,6 +3449,7 @@ mod tests {
             on_scroll: None,
             scrollbar,
             style: None,
+            selectable: false,
         }
     }
 

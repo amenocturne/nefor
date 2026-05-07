@@ -236,6 +236,59 @@ fn walk_scrollable(
     }
 }
 
+/// Walk the tree depth-first and return the path to the deepest
+/// `selectable = true` widget whose painted rect contains `(x, y)`.
+/// Used by the engine's drag-to-select gate: only `selectable` widgets
+/// may originate a selection.
+///
+/// `selectable` is currently scoped to `tui.scrollable` (the only widget
+/// that exposes the property in v1). Adding it to other widget variants
+/// later means extending the matcher here; the engine path doesn't
+/// otherwise depend on the kind.
+pub fn find_selectable_path(root: &WidgetInstance, x: u16, y: u16) -> Option<Vec<usize>> {
+    let mut path: Vec<usize> = Vec::new();
+    let mut deepest: Option<Vec<usize>> = None;
+    walk_selectable(root, x, y, &mut path, &mut deepest);
+    deepest
+}
+
+fn walk_selectable(
+    inst: &WidgetInstance,
+    x: u16,
+    y: u16,
+    path: &mut Vec<usize>,
+    out: &mut Option<Vec<usize>>,
+) {
+    let Some(rect) = inst.layout.painted_rect else {
+        return;
+    };
+    if !rect_contains(&rect, x, y) {
+        return;
+    }
+    if is_selectable(&inst.last_desc) {
+        *out = Some(path.clone());
+    }
+    for (i, child) in inst.children.iter().enumerate() {
+        path.push(i);
+        walk_selectable(child, x, y, path, out);
+        path.pop();
+    }
+}
+
+/// Whether a widget description carries `selectable = true`. Currently
+/// only `Scrollable` exposes the property; non-scrollable widgets fall
+/// through to `false`. Adding the property to other variants is a
+/// matter of extending this matcher and the relevant `parse_*` path.
+pub fn is_selectable(desc: &WidgetDescription) -> bool {
+    matches!(
+        desc,
+        WidgetDescription::Scrollable {
+            selectable: true,
+            ..
+        }
+    )
+}
+
 /// Reach into the tree following `path` and return a mutable reference
 /// to the targeted instance. Mirrors `input_router::instance_at_path` so
 /// callers don't have to import a different helper for the wheel-scroll
@@ -571,6 +624,7 @@ mod tests {
             on_scroll: None,
             scrollbar: crate::scrollable::ScrollbarMode::Auto,
             style: None,
+            selectable: false,
         }
     }
 
