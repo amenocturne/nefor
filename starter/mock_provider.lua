@@ -1,6 +1,8 @@
 -- starter/mock_provider.lua — script for mock-plugin to impersonate an
 -- openai-provider for deterministic smoke testing of the spawn_graph
--- pipeline.
+-- pipeline AND a self-documenting interactive test machine for
+-- developers who launch `nefor --config ./starter` (NEFOR_CONFIG=test
+-- is the default — see config.lua).
 --
 -- Speaks the same wire shape as openai-provider:
 --   <name>.chat.create  { chat_id, model? }
@@ -10,31 +12,34 @@
 --   <name>.stream.delta { id, chat_id, text }   (one or more)
 --   <name>.stream.end   { id, chat_id, text, model, duration_ms, finish_reason? }
 --   <name>.chat.complete.result { chat_id, output: ProviderOut }
+--   <name>.chat.error   { chat_id, message }    (error-shaped close)
 --
 -- ProviderOut shape (matching openai-provider's chat_complete_result_body):
 --   { text, tool_calls?: [{id, name, arguments: object}], finish_reason?, usage }
 --
--- ### Response selection
+-- ### Response selection (state machine, applied in order)
 --
--- For each chat.complete, look at the chat's history and pick a canned
--- response by pattern. The pipeline should drive this sequence:
+-- For each chat.complete, look at the chat's history and pattern-match
+-- the latest user message against this priority list:
 --
--- 1. Orchestrator turn: user asks about octopuses + lighthouses + parallel.
---    No tool result yet → respond with a `spawn_graph` tool call carrying
---    a 4-node graph (sx, sy, combine, terminal).
--- 2. Sub-graph node `sx`: prompt about octopuses → text response.
--- 3. Sub-graph node `sy`: prompt about lighthouses → text response.
--- 4. Sub-graph node `combine`: history holds upstream summaries as user
---    messages plus the combine instruction → return combined paragraph.
--- 5. Orchestrator's wrap node fires again with the spawn_graph tool
---    result in history → relay text response.
+--   1. Deferred result / failure / submitted-ack from a prior
+--      spawn_graph (relay path — must run first to keep the original
+--      octopus+lighthouse workflow intact).
+--   2. Orchestrator-turn octopus + lighthouse + parallel/combine →
+--      emit spawn_graph tool call (must come before sub-graph canned
+--      text since the canonical prompt matches both).
+--   3. Sub-graph canned text (responder nodes inside the spawn_graph
+--      run — Summarise octopuses / lighthouses / Combine paragraph).
+--   4. SLOW_STREAM_REGRESSION_ marker — Bug 1 watchdog regression hook.
+--   5. Interactive triggers (read readme, cwd/pwd, secret key memory,
+--      list files, count to N, think out loud, fail).
+--   6. Help fallback — the banner-prefixed help block is also what
+--      shows up on the very first turn (no other trigger matched yet).
 --
 -- ### Why a Lua script and not a new Rust plugin
 --
 -- mock-plugin is already a scriptable NCP peer; reusing it costs a Lua
--- file instead of a fresh crate. The wire shape we need to emit is
--- mechanical (no real model in the loop), so all the work is pattern
--- matching + canned strings.
+-- file instead of a fresh crate.
 
 local NAME = nefor.name -- "mock-plugin"
 
@@ -96,6 +101,52 @@ local DEFERRED_FAILURE_MARKER = "%[spawn_graph%(run_id=[^)]*%) FAILED%]"
 local DEFERRED_FAILURE_LEGACY = "%[Deferred FAILURE for spawn_graph"
 local SUBMITTED_ACK_MARKER = "Submitted sub%-graph run_id="
 
+-- Banner prepended to first-turn output and to every help-fallback
+-- response. The marker (`MOCK_PROVIDER_BANNER`) is the substring tests
+-- can pin on to distinguish the help/banner path from canned-text
+-- replies without locking to the full banner string.
+local MOCK_PROVIDER_BANNER =
+  "**MOCK PROVIDER** -- this is a deterministic test machine, not a real model."
+
+local HELP_BODY = table.concat({
+  "",
+  "Try one of:",
+  "",
+  "  summarize octopuses and lighthouses",
+  "      -> spawns a 4-node sub-graph (parallel summaries -> combine -> terminal)",
+  "",
+  "  read readme",
+  "      -> uses the read_file tool to fetch README.md",
+  "      requires: read_file on the tool-gate allowlist (or auto)",
+  "",
+  "  what is my cwd",
+  "      -> uses the bash tool to run `pwd`",
+  "      requires: bash on the tool-gate allowlist (or auto)",
+  "",
+  "  list files",
+  "      -> uses the bash tool to run `ls -la`",
+  "      requires: bash on the tool-gate allowlist (or auto)",
+  "",
+  "  the secret key is <value>",
+  "      -> just a memory test; no special handling, the value enters chat history",
+  "",
+  "  what is the secret key?",
+  "      -> looks back through chat history for a prior \"secret key is X\"",
+  "",
+  "  count to <N>",
+  "      -> streams \"1, 2, 3, ..., N\" (capped at 50)",
+  "",
+  "  think out loud about <topic>",
+  "      -> emits reasoning_delta chunks before the final text",
+  "",
+  "  fail",
+  "      -> returns finish_reason=error to exercise the run-error rendering path",
+  "",
+  "(any other input prints this help)",
+}, "\n")
+
+local HELP_TEXT = MOCK_PROVIDER_BANNER .. "\n" .. HELP_BODY
+
 -- ------------------------------------------------------------------
 -- helpers
 -- ------------------------------------------------------------------
@@ -111,6 +162,12 @@ local function utf8_truncate(s, n)
   return string.sub(s, 1, end_byte - 1)
 end
 
+-- Lowercased copy used by the interactive trigger router.
+local function lc(s)
+  if type(s) ~= "string" then return "" end
+  return string.lower(s)
+end
+
 local function pick_response_for(chat_id)
   local history = chats[chat_id] or {}
 
@@ -124,18 +181,17 @@ local function pick_response_for(chat_id)
     if m.role == "user" and not last_user then last_user = m.content end
   end
 
-  -- Deferred-result branch (async spawn_graph): the real result was
-  -- injected as a user-role message starting with
-  -- "[spawn_graph(run_id=...) result]". Relay the content (everything
-  -- after the marker line) as the final answer. Two marker shapes
-  -- accepted: the current agentic_workflow form, and the legacy form
-  -- "[Deferred result for spawn_graph" for older fixtures.
+  -- ----------------------------------------------------------------
+  -- 1. Deferred-result branch (async spawn_graph). MUST stay first —
+  --    the orchestrator's wrap-node turn looks like an ordinary user
+  --    message but starts with the deferred marker, and routing it
+  --    through the help fallback would break the existing workflow.
+  -- ----------------------------------------------------------------
   if type(last_user) == "string"
       and (string.find(last_user, DEFERRED_RESULT_MARKER)
         or string.find(last_user, DEFERRED_LEGACY_MARKER)) then
     -- Strip the leading marker line; what remains is the actual
-    -- combined paragraph the model should relay. agentic_workflow
-    -- emits a long `--- output ---` framing block; pull just the body.
+    -- combined paragraph the model should relay.
     local body = string.match(last_user, "%-%-%- output %-%-%-\n(.*)$")
     if body == nil then
       body = string.match(last_user, "^%[Deferred result for spawn_graph%([^)]*%)%]\n(.*)$")
@@ -156,10 +212,9 @@ local function pick_response_for(chat_id)
   end
 
   -- Async ack branch: the only "tool" message in history is the
-  -- spawn_graph immediate ack ("Submitted sub-graph run_id=..."). We
-  -- can't relay that to the user as a final answer — the real result
-  -- hasn't arrived yet. Emit a short transitional acknowledgement so
-  -- the orchestrator graph terminates and the chat unblocks.
+  -- spawn_graph immediate ack. We can't relay that to the user as a
+  -- final answer — emit a short transitional ack so the orchestrator
+  -- terminates and the chat unblocks.
   if last_tool ~= nil and string.find(tostring(last_tool), SUBMITTED_ACK_MARKER) then
     return {
       text = "Started the sub-graph; I'll relay the results when they arrive.",
@@ -167,9 +222,50 @@ local function pick_response_for(chat_id)
     }
   end
 
-  -- Legacy / synchronous-style fallback: relay the tool result text as
-  -- the final answer. Kept for safety if anything reverts spawn_graph
-  -- to synchronous semantics.
+  -- ----------------------------------------------------------------
+  -- Tool-result relay for the new interactive triggers. When the wrap
+  -- node fires after a read_file / bash tool result, render a friendly
+  -- response that quotes the tool output. Keyed off the most recent
+  -- user-role trigger string already in history.
+  -- ----------------------------------------------------------------
+  if last_tool ~= nil and type(last_user) == "string" then
+    local low_user = lc(last_user)
+    if string.find(low_user, "read readme", 1, true) then
+      local content = tostring(last_tool)
+      local snippet = utf8_truncate(content, 200)
+      return {
+        text = string.format(
+          "Tool returned README.md (length: %d chars). Snippet: %s...",
+          #content, snippet),
+        finish_reason = "stop",
+      }
+    end
+    if string.find(low_user, "pwd", 1, true)
+        or string.find(low_user, "cwd")
+        or string.find(low_user, "where am i", 1, true) then
+      -- bash tool output may include a trailing newline / exit-code
+      -- footer; keep it terse for the common pwd case.
+      local trimmed = string.match(tostring(last_tool), "^%s*(.-)%s*$") or tostring(last_tool)
+      return {
+        text = "Working directory: " .. trimmed,
+        finish_reason = "stop",
+      }
+    end
+    if string.find(low_user, "list files", 1, true) then
+      return {
+        text = "Files in cwd:\n" .. tostring(last_tool),
+        finish_reason = "stop",
+      }
+    end
+    -- Legacy / synchronous-style fallback: relay the tool result text
+    -- as the final answer. Kept for safety if anything reverts
+    -- spawn_graph to synchronous semantics, or for unrecognised tool
+    -- calls in tests.
+    return {
+      text = FINAL_RELAY_PREFIX .. tostring(last_tool),
+      finish_reason = "stop",
+    }
+  end
   if last_tool ~= nil then
     return {
       text = FINAL_RELAY_PREFIX .. tostring(last_tool),
@@ -181,9 +277,18 @@ local function pick_response_for(chat_id)
     return { text = "[mock provider: no user message]", finish_reason = "stop" }
   end
 
-  -- Orchestrator first turn — emit spawn_graph tool call.
+  -- ----------------------------------------------------------------
+  -- 2. Orchestrator-turn spawn_graph: octopus + lighthouse + parallel
+  --    / combine / spawn_graph. MUST come before CANNED_TEXT — the
+  --    canonical user prompt
+  --    "summarise octopuses and lighthouses in parallel and combine
+  --     into one paragraph" matches the combine-paragraph canned text
+  --    too, but the spawn_graph turn is the one tests assert on.
+  -- ----------------------------------------------------------------
   if string.find(last_user, "octopus") and string.find(last_user, "lighthouse")
-      and (string.find(last_user, "parallel") or string.find(last_user, "[Cc]ombine") or string.find(last_user, "spawn_graph")) then
+      and (string.find(last_user, "parallel")
+        or string.find(last_user, "[Cc]ombine")
+        or string.find(last_user, "spawn_graph")) then
     return {
       text = "",
       finish_reason = "tool_calls",
@@ -192,36 +297,35 @@ local function pick_response_for(chat_id)
           id        = "call_mock_spawn_graph",
           name      = "spawn_graph",
           -- arguments is a JSON OBJECT in the openai-provider's
-          -- de-nested wire shape (see plugins/openai-provider/src/
-          -- main.rs:1233-1238 for the parse). rg_adapter forwards
-          -- this verbatim to tool_split which routes by tool_calls
-          -- presence; tool-executor reads `arguments` as the call's
-          -- parameter map.
+          -- de-nested wire shape; rg_adapter forwards verbatim and
+          -- tool-executor reads `arguments` as the call's parameter
+          -- map.
           arguments = { graph = CANNED_GRAPH },
         },
       },
     }
   end
 
-  -- Sub-graph nodes — match against canned text patterns in registration order.
+  -- ----------------------------------------------------------------
+  -- 3. Sub-graph canned text. Used by the responder nodes inside the
+  --    spawn_graph workflow — each fires its own chat with a prompt
+  --    like "Summarise octopuses..." or "Combine the two summaries
+  --    above into one paragraph."
+  -- ----------------------------------------------------------------
   for _, entry in ipairs(CANNED_TEXT) do
     if string.find(last_user, entry.pattern) then
       return { text = entry.text, finish_reason = "stop" }
     end
   end
 
-  -- Slow-stream regression hook (Bug 1 / commit 0941531). Triggered by
-  -- the literal substring "SLOW_STREAM_REGRESSION_". The mock blocks
-  -- inside chat.complete for ~1.2s before emitting — long enough that
-  -- the old `DEFAULT_ACK_DEADLINE_MS = 5s` watchdog window plus the
-  -- nominal-ack semantics would have started firing for a real model,
-  -- and definitely longer than any per-chunk pacing budget. Without
-  -- the watchdog the run completes cleanly. Kept short enough that
-  -- the test stays cheap; the regression is "no spurious timeout
-  -- error", not a specific wall-clock target.
+  -- ----------------------------------------------------------------
+  -- 4. SLOW_STREAM_REGRESSION_ — Bug 1 watchdog regression hook
+  --    (commit 0941531). Triggered by the literal substring; mock
+  --    blocks for ~1.2s before emitting.
+  -- ----------------------------------------------------------------
   if string.find(last_user, "SLOW_STREAM_REGRESSION_") then
-    -- Coarse sleep — `os.execute` is fine here because the mock
-    -- already runs in its own subprocess.
+    -- Coarse sleep — `os.execute` is fine because the mock already
+    -- runs in its own subprocess.
     os.execute("sleep 1.2")
     return {
       text = "slow regression payload acknowledged",
@@ -229,10 +333,156 @@ local function pick_response_for(chat_id)
     }
   end
 
-  return {
-    text = "[mock provider: no canned match for: " .. utf8_truncate(last_user, 60) .. "]",
-    finish_reason = "stop",
-  }
+  -- ----------------------------------------------------------------
+  -- 5. Interactive triggers — the developer-facing test machine.
+  -- ----------------------------------------------------------------
+  local low = lc(last_user)
+
+  -- 5a. read readme -> read_file tool call
+  if string.find(low, "read readme", 1, true) then
+    return {
+      text = "",
+      finish_reason = "tool_calls",
+      tool_calls = {
+        {
+          id        = "call_mock_read_readme",
+          name      = "read_file",
+          arguments = { path = "README.md" },
+        },
+      },
+    }
+  end
+
+  -- 5b. cwd / pwd / where am i -> bash tool call (pwd)
+  if string.find(low, "pwd", 1, true)
+      or string.find(low, "current cwd", 1, true)
+      or string.find(low, "where am i", 1, true)
+      or low == "cwd"
+      or string.find(low, "what is my cwd", 1, true)
+      or string.find(low, "my cwd", 1, true) then
+    return {
+      text = "",
+      finish_reason = "tool_calls",
+      tool_calls = {
+        {
+          id        = "call_mock_pwd",
+          name      = "bash",
+          arguments = { command = "pwd" },
+        },
+      },
+    }
+  end
+
+  -- 5c. list files -> bash tool call (ls -la)
+  if string.find(low, "list files", 1, true) then
+    return {
+      text = "",
+      finish_reason = "tool_calls",
+      tool_calls = {
+        {
+          id        = "call_mock_ls",
+          name      = "bash",
+          arguments = { command = "ls -la" },
+        },
+      },
+    }
+  end
+
+  -- 5d. fail / trigger error -> error-shaped close
+  if low == "fail" or string.find(low, "trigger error", 1, true) then
+    return {
+      text          = "",
+      finish_reason = "error",
+      error_message = "Mock provider triggered error on user request.",
+    }
+  end
+
+  -- 5e. secret-key memory (history-aware lookup)
+  if string.find(low, "what is the secret key") then
+    -- Look for any prior user message of the form "secret key is X".
+    -- Use a non-anchored case-insensitive scan.
+    local value
+    for i = #history - 1, 1, -1 do
+      local m = history[i]
+      if m.role == "user" and type(m.content) == "string" then
+        local lc_content = lc(m.content)
+        local capture = string.match(lc_content, "secret key is (.+)")
+        if capture then
+          -- Re-extract from the original (case-preserving) content
+          -- using the same offset so we keep the user's casing.
+          local start_idx = string.find(lc_content, "secret key is ", 1, true)
+          if start_idx then
+            value = string.sub(m.content, start_idx + #"secret key is ")
+            -- Strip a trailing `?` or `.` if user phrased as a sentence.
+            value = string.match(value, "^(.-)%s*[%?%.]*%s*$") or value
+          end
+          break
+        end
+      end
+    end
+    if value and value ~= "" then
+      return {
+        text = "The secret key is: " .. value,
+        finish_reason = "stop",
+      }
+    end
+    return {
+      text = "I don't know yet -- tell me with: \"the secret key is <value>\"",
+      finish_reason = "stop",
+    }
+  end
+
+  -- 5f. set the secret key (no special branch — value is now in
+  -- history and will be retrieved on the next "what is the secret
+  -- key?" turn). Acknowledge cleanly so the chat doesn't fall through
+  -- to help.
+  if string.find(low, "secret key is ") then
+    return {
+      text = "Got it. The secret key is now in this chat's history.",
+      finish_reason = "stop",
+    }
+  end
+
+  -- 5g. count to N (cap at 50)
+  do
+    local n_str = string.match(low, "count to (%d+)")
+    if n_str then
+      local n = tonumber(n_str) or 0
+      if n > 50 then n = 50 end
+      if n < 1 then n = 1 end
+      local parts = {}
+      for i = 1, n do parts[i] = tostring(i) end
+      return {
+        text = table.concat(parts, ", "),
+        finish_reason = "stop",
+      }
+    end
+  end
+
+  -- 5h. think out loud about / reason about <topic>
+  do
+    local topic = string.match(low, "think out loud about (.+)")
+                or string.match(low, "reason about (.+)")
+    if topic then
+      -- Strip a trailing punctuation block if user typed a sentence.
+      topic = string.match(topic, "^(.-)%s*[%?%.!]*%s*$") or topic
+      return {
+        text = "Reasoned about " .. topic
+            .. "; conclusion: deterministic mock has no opinion, but the reasoning channel works.",
+        finish_reason = "stop",
+        with_reasoning = true,
+      }
+    end
+  end
+
+  -- ----------------------------------------------------------------
+  -- 6. Help fallback. Same body whether this is the first turn (chat
+  --    history has only the just-arrived user message) or a later
+  --    unrecognised input — the banner-prefixed help block is the
+  --    deterministic "I don't know what you mean, here's what I do
+  --    know" answer.
+  -- ----------------------------------------------------------------
+  return { text = HELP_TEXT, finish_reason = "stop" }
 end
 
 -- Canned reasoning chunks emitted ahead of content for the orchestrator's
@@ -357,6 +607,25 @@ nefor.on(NAME .. ".chat.complete", function(body)
     tostring(resp.finish_reason),
     type(resp.text) == "string" and #resp.text or 0,
     resp.tool_calls and #resp.tool_calls or 0))
+
+  -- Error branch: emit `<name>.chat.error` and skip the result wire.
+  -- The wrapper actor (starter/openai-provider/init.lua) translates
+  -- chat.error into `tool.result { error }` for the agentic-loop's
+  -- run-error path, which is the rendering target the brief asks for.
+  if resp.finish_reason == "error" then
+    nefor.emit("chat.error", {
+      chat_id = chat_id,
+      message = resp.error_message or "mock provider error",
+    })
+    -- Echo the assistant turn into history so subsequent turns see
+    -- the failed attempt; content stays empty.
+    if not chats[chat_id] then chats[chat_id] = {} end
+    table.insert(chats[chat_id], {
+      role    = "assistant",
+      content = "",
+    })
+    return
+  end
 
   -- Stream phase (only when there's text — tool-call turns skip
   -- streaming, matching openai-provider's behaviour). The
