@@ -217,6 +217,19 @@ local function lc(s)
   return string.lower(s)
 end
 
+-- Per-chat tool-call id minter. The chat-side reducer correlates
+-- tool.result back to its tool block by exact id match (chat.lua's
+-- attach_tool_end matches the FIRST entry with the given id and stops),
+-- so a static id like "call_mock_pwd" repeated across turns means the
+-- second turn's deny / approve clobbers the first turn's already-done
+-- block and the second block never receives its own result. Mint a
+-- fresh id every call.
+local tool_id_counter = 0
+local function mint_tool_id(label)
+  tool_id_counter = tool_id_counter + 1
+  return "call_mock_" .. label .. "_" .. tostring(tool_id_counter)
+end
+
 local function pick_response_for(chat_id)
   local history = chats[chat_id] or {}
 
@@ -370,7 +383,7 @@ local function pick_response_for(chat_id)
       finish_reason = "tool_calls",
       tool_calls = {
         {
-          id        = "call_mock_spawn_graph",
+          id        = mint_tool_id("spawn_graph"),
           name      = "spawn_graph",
           -- arguments is a JSON OBJECT in the openai-provider's
           -- de-nested wire shape; rg_adapter forwards verbatim and
@@ -421,7 +434,7 @@ local function pick_response_for(chat_id)
       finish_reason = "tool_calls",
       tool_calls = {
         {
-          id        = "call_mock_read_readme",
+          id        = mint_tool_id("read_readme"),
           name      = "read_file",
           arguments = { path = "README.md" },
         },
@@ -441,7 +454,7 @@ local function pick_response_for(chat_id)
       finish_reason = "tool_calls",
       tool_calls = {
         {
-          id        = "call_mock_pwd",
+          id        = mint_tool_id("pwd"),
           name      = "bash",
           arguments = { command = "pwd" },
         },
@@ -456,7 +469,7 @@ local function pick_response_for(chat_id)
       finish_reason = "tool_calls",
       tool_calls = {
         {
-          id        = "call_mock_ls",
+          id        = mint_tool_id("ls"),
           name      = "bash",
           arguments = { command = "ls -la" },
         },
@@ -515,6 +528,21 @@ local function pick_response_for(chat_id)
   if string.find(low, "secret key is ") then
     return {
       text = "Got it. The secret key is now in this chat's history.",
+      finish_reason = "stop",
+    }
+  end
+
+  -- 5f-bilingual. translate hello to japanese -> canned reply, used by
+  -- the help text's "Bilingual example" and renders CJK in the
+  -- assistant text channel so the wide-char rendering is visible
+  -- outside the help block.
+  if string.find(low, "translate hello to japanese", 1, true)
+      or string.find(low, "translate hello to chinese", 1, true)
+      or string.find(low, "translate hello", 1, true) then
+    local greeting = "こんにちは"
+    if string.find(low, "chinese", 1, true) then greeting = "你好" end
+    return {
+      text = "**Hello** in that language is `" .. greeting .. "`.",
       finish_reason = "stop",
     }
   end
