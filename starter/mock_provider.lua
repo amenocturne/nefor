@@ -497,18 +497,47 @@ local CANNED_REASONING_CHUNKS = {
   "Producing the final answer now.",
 }
 
+-- Stream pacing — mimic ~80 tok/s typical of cloud LLM providers so
+-- the interactive feel matches a real model. ~4 chars/token English
+-- × 80 tok/s = ~320 chars/sec → 16-char chunks at 50ms intervals.
+-- `os.execute("sleep …")` spawns a sleep subprocess per chunk; cheap
+-- enough at this rate (~20/sec) and the mock has no other concurrent
+-- work to do while a stream is in flight.
+local STREAM_CHUNK_CODEPOINTS = 16
+local STREAM_PACE_SECONDS     = 0.05
+
+-- Skip pacing under tests — agentic_cli_mock_e2e fires several
+-- scenarios with a 10s wall-clock cap and the long-stream regression
+-- already exercises a deliberate slow path. Activated by the same
+-- NEFOR_CONFIG=test env the cli-config harness uses; interactive
+-- launches with NEFOR_CONFIG=test still get pacing because the mock
+-- runs as its own subprocess and inherits the parent's env (the cli
+-- harness sets NEFOR_TEST_FAST_MOCK=1 explicitly to opt into instant
+-- streaming).
+local function pacing_enabled()
+  local v = os.getenv("NEFOR_TEST_FAST_MOCK")
+  return not (v == "1" or v == "true")
+end
+
+local function pace()
+  if pacing_enabled() then
+    os.execute("sleep " .. tostring(STREAM_PACE_SECONDS))
+  end
+end
+
 local function emit_reasoning(chat_id, id)
   -- Emit reasoning chunks ahead of the content stream, then a
   -- reasoning_end carrying the full accumulated text. Mirrors what
   -- openai-provider does on a real Qwen 3 turn.
   local full = ""
-  for _, chunk in ipairs(CANNED_REASONING_CHUNKS) do
+  for i, chunk in ipairs(CANNED_REASONING_CHUNKS) do
     full = full .. chunk
     nefor.emit("stream.reasoning_delta", {
       id      = id,
       chat_id = chat_id,
       text    = chunk,
     })
+    if i < #CANNED_REASONING_CHUNKS then pace() end
   end
   nefor.emit("stream.reasoning_end", {
     id          = id,
@@ -527,18 +556,13 @@ local function emit_stream(chat_id, text, opts)
     emit_reasoning(chat_id, id)
   end
 
-  -- Three roughly-equal chunks for a more realistic streaming feel.
-  -- The wrap-node chat is the only one that surfaces these to the
-  -- user (rg_adapter gates non-wrap streams), so this only matters
-  -- for the orchestrator's relay turn — but emitting them
-  -- unconditionally keeps the mock simple and rg_adapter's gate
-  -- handles the rest.
-  --
-  -- Chunk boundaries snap to UTF-8 codepoint edges. `string.sub` is
-  -- byte-indexed; slicing inside a multibyte codepoint produces
-  -- invalid UTF-8 that downstream `serde_json` can't deserialise.
+  -- Stream the response in small fixed-size chunks paced to ~80 tok/s
+  -- to mimic a real cloud LLM. Chunk boundaries snap to UTF-8
+  -- codepoint edges (string.sub is byte-indexed; slicing inside a
+  -- multibyte codepoint produces invalid UTF-8 that downstream
+  -- serde_json can't deserialise).
   local cp_count = utf8.len(text) or #text
-  local cp_per_chunk = math.max(1, math.floor(cp_count / 3))
+  local cp_per_chunk = STREAM_CHUNK_CODEPOINTS
   local cp_i = 1
   while cp_i <= cp_count do
     local cp_stop = math.min(cp_i + cp_per_chunk - 1, cp_count)
@@ -551,6 +575,7 @@ local function emit_stream(chat_id, text, opts)
       text    = string.sub(text, byte_start, byte_stop),
     })
     cp_i = cp_stop + 1
+    if cp_i <= cp_count then pace() end
   end
   nefor.emit("stream.end", {
     id            = id,
