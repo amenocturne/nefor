@@ -3172,6 +3172,19 @@ local function update(msg, state)
   end
 
   if kind == "chat.model.set_ack" then
+    -- Replayed set_ack envelopes carry the model the OLD session was
+    -- bound to — replaying them onto the live state would clobber
+    -- whatever the user set via /model in the LIVE session before the
+    -- /resume (chat.model.set_ack is persisted, so the original
+    -- session's mock-provider hello → set_ack lives in the jsonl).
+    -- Bug A7 manifested as: pick mock → /new → /model qwen → /resume
+    -- prior mock chat → status bar reverts to mock-model even though
+    -- the orchestrator's live config (and the next reply's provider)
+    -- is qwen. The agentic-loop owns the live provider/model; it
+    -- doesn't replay chat.model.set on its own input gate, so its
+    -- state stays correct. chat.lua mirrors that posture by ignoring
+    -- replayed set_ack envelopes — only LIVE ones drive the badge.
+    if state.replay_mode then return state, {} end
     return shallow_merge(state, {
       model = msg.model or state.model,
       max_tokens = model_max_tokens(msg.model) or state.max_tokens,
