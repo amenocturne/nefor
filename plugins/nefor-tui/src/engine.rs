@@ -89,6 +89,26 @@ pub struct Engine {
     /// or when the scrollable has no `key` for re-resolution on the next
     /// reconcile.
     selection_scroll_key: Option<String>,
+    /// Painted rect of the captured scrollable at click time. Stable
+    /// across drag because the scrollable's screen position doesn't
+    /// shift while the user drags inside it. Used at copy time to map
+    /// screen-cursor coords back to content-buffer coords.
+    selection_scroll_rect: Option<crate::layout::Rect>,
+    /// Selection anchor in *content* coords of the captured scrollable —
+    /// `(col_in_content, row_in_content)` where `row_in_content =
+    /// scroll_y_at_click + (click_y - rect.row)` and `col_in_content =
+    /// click_x - rect.col`. Stable across auto-scroll: `row_in_content`
+    /// names a transcript line, not a screen row, so further scrolling
+    /// doesn't drift it. `None` when no scrollable was captured (click
+    /// landed outside) — the legacy screen-coord copy path then handles
+    /// extraction.
+    selection_anchor_in_content: Option<(u16, u16)>,
+    /// Selection drag end in *content* coords of the captured scrollable.
+    /// Re-derived on every `Drag` from the current `scroll_y` (which the
+    /// auto-scroll path may have mutated mid-drag) and the cursor's
+    /// screen y, clamped to the scrollable's painted rect. Pairs with
+    /// `selection_anchor_in_content` to drive the copy path.
+    selection_drag_in_content: Option<(u16, u16)>,
 }
 
 impl Engine {
@@ -109,6 +129,9 @@ impl Engine {
             selection_end: None,
             selecting: false,
             selection_scroll_key: None,
+            selection_scroll_rect: None,
+            selection_anchor_in_content: None,
+            selection_drag_in_content: None,
         })
     }
 
@@ -505,31 +528,35 @@ impl Engine {
                 self.selection_start = Some((evt.x, evt.y));
                 self.selection_end = None;
                 self.selecting = false;
+                self.selection_scroll_key = None;
+                self.selection_scroll_rect = None;
+                self.selection_anchor_in_content = None;
+                self.selection_drag_in_content = None;
                 // Capture the keyed scrollable under the cursor (deepest
-                // wins, matching the wheel-routing path). On subsequent
-                // `Drag` events past the rect's edge we re-resolve by key
-                // and bump its `scroll_y` so the selection can extend
-                // past the viewport — see `auto_scroll_for_drag` below.
-                // No keyed scrollable under cursor → drag-auto-scroll
-                // stays inert (selection still works inside the visible
-                // rows, just no follow-the-cursor scroll).
-                self.selection_scroll_key = self
-                    .reconciler
-                    .root
-                    .as_ref()
-                    .and_then(|root| find_scrollable_path(root, evt.x, evt.y))
-                    .and_then(|path| {
-                        // Re-walk for the user_key — `find_scrollable_path`
-                        // returns the path regardless of whether the
-                        // scrollable is keyed; auto-scroll needs the key
-                        // to re-resolve under the next reconcile.
-                        let root = self.reconciler.root.as_ref()?;
-                        let mut cur = root;
-                        for &i in &path {
-                            cur = cur.children.get(i)?;
-                        }
-                        cur.last_desc.user_key().map(|s| s.to_string())
-                    });
+                // wins, matching the wheel-routing path) along with its
+                // painted rect, content-width, and the anchor's content
+                // coords (transcript-line index + col-in-content). The
+                // content-coord anchor is the load-bearing piece of the
+                // copy-on-mouse-up fix: it names a *transcript line*
+                // rather than a screen row, so subsequent auto-scroll
+                // doesn't drift it. Without this, the selection's start
+                // would point at "screen row N" — and after auto-scroll
+                // bumped `scroll_y` by k, screen row N now shows a
+                // different transcript line, so the copy reads the wrong
+                // content. See `finalise_selection` for the consumer.
+                //
+                // No keyed scrollable under cursor → all three of
+                // `_key`, `_rect`, `_anchor_in_content` stay `None` and
+                // `auto_scroll_for_drag` + the copy path fall back to
+                // the legacy screen-coord behaviour.
+                if let Some((key, rect, anchor_content)) =
+                    self.resolve_scrollable_anchor_at_click(evt.x, evt.y)
+                {
+                    self.selection_scroll_key = Some(key);
+                    self.selection_scroll_rect = Some(rect);
+                    self.selection_anchor_in_content = Some(anchor_content);
+                    self.selection_drag_in_content = Some(anchor_content);
+                }
                 // Fall through — the click still bubbles as `mouse.click`
                 // so Lua-side click handlers (e.g. button hit-test) keep
                 // working alongside the selection mechanism.
@@ -539,6 +566,12 @@ impl Engine {
                     self.selection_end = Some((evt.x, evt.y));
                     self.selecting = true;
                     self.auto_scroll_for_drag(evt.x, evt.y);
+                    // Update the content-coord drag end *after*
+                    // auto_scroll_for_drag so the captured scrollable's
+                    // current `scroll_y` reflects this drag's tick.
+                    // Otherwise the cursor-at-edge case would lag a row
+                    // behind the visible content.
+                    self.update_drag_in_content(evt.x, evt.y);
                     self.needs_render = true;
                 }
                 // Drag is consumed by the selection mechanism; it does
@@ -597,12 +630,25 @@ impl Engine {
     fn finalise_selection(&mut self, x: u16, y: u16) -> Result<(), TuiError> {
         let was_selecting = self.selecting;
         let start_opt = self.selection_start;
+        let scroll_key_opt = self.selection_scroll_key.clone();
+        let scroll_rect_opt = self.selection_scroll_rect;
+        let anchor_content_opt = self.selection_anchor_in_content;
+        // Refresh the drag content coord one last time at the release
+        // position — the cursor may have moved between the most recent
+        // `Drag` and this `Up` (terminals don't always emit a final
+        // `Drag` immediately before `Up`).
+        self.update_drag_in_content(x, y);
+        let drag_content_opt = self.selection_drag_in_content;
+
         // Reset state up front. If we re-enter via dispatch_msg → update,
         // the next render pass should already see the selection cleared.
         self.selection_start = None;
         self.selection_end = None;
         self.selecting = false;
         self.selection_scroll_key = None;
+        self.selection_scroll_rect = None;
+        self.selection_anchor_in_content = None;
+        self.selection_drag_in_content = None;
         self.needs_render = true;
 
         if !was_selecting {
@@ -612,11 +658,33 @@ impl Engine {
             return Ok(());
         };
         let end = (x, y);
-        let range = SelectionRange::normalised(start, end);
-        // Pull text from the most recently rendered frame. Pre-render
-        // the buffer is all-blank and the extraction yields an empty
-        // string — Lua sees `text = ""` and decides what to do.
-        let text = extract_selection_text(self.renderer.last_frame(), range);
+
+        // Prefer the content-coord copy path when the click landed
+        // inside a captured scrollable. Otherwise fall back to the
+        // legacy screen-coord extraction (selections outside any
+        // scrollable, or where the scrollable has no key).
+        let text = match (
+            scroll_key_opt.as_ref(),
+            scroll_rect_opt,
+            anchor_content_opt,
+            drag_content_opt,
+        ) {
+            (Some(key), Some(rect), Some(anchor), Some(drag)) => self
+                .extract_selection_from_scrollable_content(key, rect, anchor, drag)
+                .unwrap_or_else(|| {
+                    // Fallback if the scrollable disappeared from the
+                    // tree between Click and Up (extremely unlikely —
+                    // would require a Lua-side `view` to have removed
+                    // it mid-drag). Legacy screen-coord extraction
+                    // gives a "less wrong" answer than empty text.
+                    let range = SelectionRange::normalised(start, end);
+                    extract_selection_text(self.renderer.last_frame(), range)
+                }),
+            _ => {
+                let range = SelectionRange::normalised(start, end);
+                extract_selection_text(self.renderer.last_frame(), range)
+            }
+        };
 
         let msg = self.lua().create_table()?;
         msg.set("kind", "mouse.selection")?;
@@ -630,6 +698,96 @@ impl Engine {
         end_t.set("y", end.1)?;
         msg.set("end", end_t)?;
         self.dispatch_msg(msg)
+    }
+
+    /// Paint the captured scrollable's child into a content-sized
+    /// scratch frame buffer and extract the selection text using
+    /// content-coords. Decoupling extraction from the live framebuffer
+    /// is the core of the auto-scroll copy fix: scroll position no
+    /// longer aliases the selection bounds.
+    ///
+    /// Returns `None` when the captured scrollable is no longer in the
+    /// tree, when its content geometry is unusable, or when the
+    /// instance shape changed unexpectedly. The caller falls back to
+    /// the legacy screen-coord extraction.
+    fn extract_selection_from_scrollable_content(
+        &mut self,
+        key: &str,
+        rect: crate::layout::Rect,
+        anchor: (u16, u16),
+        drag: (u16, u16),
+    ) -> Option<String> {
+        let root = self.reconciler.root.as_mut()?;
+        let path = find_scrollable_by_key(root, key)?;
+        let target = mouse_instance_at_path(root, &path)?;
+        // Read content geometry from the layout pass cache; bail if
+        // anything is unset (no render has fired yet).
+        let (content_h, content_w) = match &target.state {
+            InstanceState::Scrollable(s) => {
+                let content_w = scrollable_content_width(target, rect);
+                (s.content_height, content_w)
+            }
+            _ => return None,
+        };
+        if content_h == 0 || content_w == 0 {
+            return None;
+        }
+        // Repaint the child into a scratch buffer at content size.
+        // The child's measure-pass cache (line wraps, etc.) is keyed
+        // on the same `inner_w` the most recent layout used, so calling
+        // `paint` directly without a fresh measure is safe.
+        let mut scratch = crate::render::FrameBuffer::new(content_w, content_h);
+        if let Some(child) = target.children.first_mut() {
+            let child_rect = crate::layout::Rect {
+                row: 0,
+                col: 0,
+                width: content_w,
+                height: content_h,
+            };
+            crate::layout::paint(child, child_rect, &mut scratch);
+        }
+        // Build the selection range in content coords. `(col, row)` for
+        // anchor and drag are already content-relative, so handing the
+        // pair to `SelectionRange::normalised` produces the correct
+        // line-flow shape regardless of which direction the user
+        // dragged.
+        let range = SelectionRange::normalised(anchor, drag);
+        Some(extract_selection_text(&scratch, range))
+    }
+
+    /// Walk the current tree for the deepest keyed scrollable under
+    /// `(x, y)` and return `(key, painted_rect, anchor_in_content)`.
+    /// `anchor_in_content` is `(col_in_content, row_in_content)` where
+    /// `row_in_content = scroll_y_at_click + (y - rect.row)` (clamped
+    /// to the rect's height) and `col_in_content = (x - rect.col)`
+    /// clamped to the content width — i.e. the index into the
+    /// scrollable's *content* scratch buffer that the click resolves
+    /// to. Returns `None` when no scrollable is under the cursor or
+    /// when the deepest one has no `user_key` (per the spec, only
+    /// keyed scrollables participate in the auto-scroll/copy paths).
+    fn resolve_scrollable_anchor_at_click(
+        &self,
+        x: u16,
+        y: u16,
+    ) -> Option<(String, crate::layout::Rect, (u16, u16))> {
+        let root = self.reconciler.root.as_ref()?;
+        let path = find_scrollable_path(root, x, y)?;
+        let mut cur = root;
+        for &i in &path {
+            cur = cur.children.get(i)?;
+        }
+        let key = cur.last_desc.user_key()?.to_string();
+        let rect = cur.layout.painted_rect?;
+        let scroll_y = match &cur.state {
+            InstanceState::Scrollable(s) => s.scroll_y,
+            _ => return None,
+        };
+        let content_w = scrollable_content_width(cur, rect);
+        Some((
+            key,
+            rect,
+            screen_to_content(rect, content_w, scroll_y, x, y),
+        ))
     }
 
     /// Auto-scroll the captured drag-origin scrollable when the cursor
@@ -655,6 +813,42 @@ impl Engine {
     /// re-paint with new transcript content — so the highlighted region
     /// grows naturally as the user drags past the edge, matching what a
     /// human expects from "select past the bottom of the visible area".
+    /// Refresh `selection_drag_in_content` from the current cursor
+    /// position. Reads the captured scrollable's current `scroll_y`
+    /// (which `auto_scroll_for_drag` may have just bumped) so the
+    /// resolved content row tracks where the cursor *would* logically
+    /// be in the transcript — past the bottom of the viewport clamps
+    /// to the last visible content row, so the selection extends to
+    /// the bottom of what's currently scrolled into view rather than
+    /// off into nothing.
+    fn update_drag_in_content(&mut self, x: u16, y: u16) {
+        let Some(key) = self.selection_scroll_key.clone() else {
+            return;
+        };
+        let Some(rect) = self.selection_scroll_rect else {
+            return;
+        };
+        let Some(root) = self.reconciler.root.as_ref() else {
+            return;
+        };
+        let Some(path) = find_scrollable_by_key(root, &key) else {
+            return;
+        };
+        let mut cur = root;
+        for &i in &path {
+            let Some(c) = cur.children.get(i) else {
+                return;
+            };
+            cur = c;
+        }
+        let scroll_y = match &cur.state {
+            InstanceState::Scrollable(s) => s.scroll_y,
+            _ => return,
+        };
+        let content_w = scrollable_content_width(cur, rect);
+        self.selection_drag_in_content = Some(screen_to_content(rect, content_w, scroll_y, x, y));
+    }
+
     fn auto_scroll_for_drag(&mut self, _x: u16, y: u16) {
         let Some(key) = self.selection_scroll_key.clone() else {
             return;
@@ -981,6 +1175,62 @@ impl Engine {
 /// path (sequence of child indices from the root) or `None` if no
 /// matching scrollable exists. Used by `apply_scroll_command` so a
 /// Lua-side `tui.scroll_to(key, ...)` resolves the right instance.
+/// Width of the scrollable's content area — the painted rect width
+/// minus the scrollbar gutter when one is visible. Mirrors the
+/// `inner_w` calculation `paint_scrollable` uses each frame so the
+/// content-coord copy path reads the same cells the renderer painted.
+fn scrollable_content_width(inst: &WidgetInstance, rect: crate::layout::Rect) -> u16 {
+    let (mode, content_h, viewport_h) = match (&inst.last_desc, &inst.state) {
+        (WidgetDescription::Scrollable { scrollbar, .. }, InstanceState::Scrollable(s)) => {
+            (*scrollbar, s.content_height, s.viewport_height)
+        }
+        _ => return rect.width,
+    };
+    let bar = match mode {
+        crate::scrollable::ScrollbarMode::Always => true,
+        crate::scrollable::ScrollbarMode::Auto => content_h > viewport_h,
+        crate::scrollable::ScrollbarMode::Never => false,
+    };
+    if bar {
+        rect.width.saturating_sub(1)
+    } else {
+        rect.width
+    }
+}
+
+/// Map a screen `(x, y)` cursor coord to the scrollable's content-coord
+/// `(col_in_content, row_in_content)`. The y axis is anchored on the
+/// scrollable's *current* `scroll_y` so the resolved row names a
+/// transcript line: scrolling between Click and Up doesn't drift it.
+/// Both axes are clamped to the scrollable's content geometry — a
+/// cursor past the rect's bottom resolves to the last visible content
+/// row, mirroring browser behaviour where dragging past the viewport
+/// extends the selection to the bottom of what the user can see.
+fn screen_to_content(
+    rect: crate::layout::Rect,
+    content_w: u16,
+    scroll_y: u16,
+    x: u16,
+    y: u16,
+) -> (u16, u16) {
+    let dy_clamped = if y < rect.row {
+        0
+    } else {
+        let dy = y - rect.row;
+        let last_row = rect.height.saturating_sub(1);
+        dy.min(last_row)
+    };
+    let row_in_content = scroll_y.saturating_add(dy_clamped);
+    let dx_clamped = if x < rect.col {
+        0
+    } else {
+        let dx = x - rect.col;
+        let last_col = content_w.saturating_sub(1);
+        dx.min(last_col)
+    };
+    (dx_clamped, row_in_content)
+}
+
 fn find_scrollable_by_key(root: &WidgetInstance, key: &str) -> Option<Vec<usize>> {
     let mut path: Vec<usize> = Vec::new();
     let mut found: Option<Vec<usize>> = None;

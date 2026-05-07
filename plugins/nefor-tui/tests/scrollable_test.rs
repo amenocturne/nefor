@@ -352,3 +352,281 @@ fn end_jumps_to_bottom_via_scroll_into_view() {
         "end should restore bottom via tui.scroll_into_view; got:\n{out}"
     );
 }
+
+/// Scrollable scenario that mirrors the standard one but also captures
+/// the most recent `mouse.selection.text` into state. The captured text
+/// is mirrored into the global `LAST_SELECTION` cell via a custom
+/// `selection.notify` envelope dispatched from the Lua side — tests
+/// inspect that cell directly rather than re-parsing the rendered view
+/// (which fights `tui.text`'s wrapping). The scenario still keeps 30
+/// distinct `row N` lines so the assertions can pick identifying tokens
+/// out of the captured text.
+const SCROLLABLE_SELECTION_SCENARIO: &str = r#"
+    tui.start {
+      initial_state = {
+        rows   = 30,
+        offset = 0,
+      },
+      view = function(s)
+        local kids = {}
+        for i = 1, s.rows do
+          kids[#kids + 1] = tui.text { content = "row " .. i }
+        end
+        return tui.column { gap = 0, children = {
+          tui.text { content = "offset: " .. tostring(s.offset) },
+          tui.expanded {
+            child = tui.scrollable {
+              key       = "log",
+              child     = tui.column { gap = 0, children = kids },
+              stick_to  = "end",
+              on_scroll = "log.scrolled",
+              scrollbar = "auto",
+            },
+          },
+        }}
+      end,
+      update = function(msg, s)
+        if msg.kind == "log.scrolled" then
+          return { rows = s.rows, offset = msg.offset }, {}
+        elseif msg.kind == "mouse.selection" then
+          -- Echo the captured text out as an emit so the integration
+          -- test can read it directly off `take_emit_queue`. Avoids the
+          -- noise of word-wrapping a multi-line copy back into the
+          -- visible frame.
+          tui.emit { kind = "selection.captured", text = msg.text or "" }
+          return s, {}
+        elseif msg.kind == "key.pageup" then
+          tui.scroll_by("log", -10); return s, {}
+        elseif msg.kind == "key.pagedown" then
+          tui.scroll_by("log", 10); return s, {}
+        end
+        return s, {}
+      end,
+    }
+"#;
+
+/// Drain `take_emit_queue` and return the most recent `selection.captured`
+/// `text` field — the Lua-visible mirror of the engine's `mouse.selection`
+/// dispatch. Returns `None` when no selection has been captured since the
+/// last drain.
+fn last_captured_selection(engine: &mut Engine) -> Option<String> {
+    let queue = engine.take_emit_queue();
+    queue
+        .into_iter()
+        .filter_map(|(_, body)| {
+            let kind = body.get("kind")?.as_str()?;
+            if kind == "selection.captured" {
+                body.get("text")?.as_str().map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .next_back()
+}
+
+/// Helper: drive a click → drags → release sequence on the engine,
+/// rendering after each drag event so the framebuffer reflects
+/// auto-scroll mid-flight (matching production behaviour where the
+/// renderer ticks at frame rate while the user drags). Without this the
+/// framebuffer stays stuck on the pre-drag scroll position and the
+/// screen-coord copy path ironically "works" by reading stale cells.
+fn drag_select(engine: &mut Engine, click: (u16, u16), drags: &[(u16, u16)], release: (u16, u16)) {
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Click,
+            x: click.0,
+            y: click.1,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("click");
+    let _ = engine.render_if_dirty().expect("render after click");
+    for &(x, y) in drags {
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Drag,
+                x,
+                y,
+                button: Some("left"),
+                mods: vec![],
+            })
+            .expect("drag");
+        let _ = engine.render_if_dirty().expect("render after drag");
+    }
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Up,
+            x: release.0,
+            y: release.1,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("up");
+}
+
+/// The bug the user reported, distilled: drag-selection past the bottom
+/// of the scrollable's viewport auto-scrolls the content (good), but on
+/// release the copied selection only contains the cells that happen to
+/// be visible at release-time (bad — the original anchor row, having
+/// scrolled out of view, gets dropped).
+///
+/// Pre-fix the engine reads selection text from the framebuffer (screen
+/// cells) at mouse-up — which means the anchor's transcript content has
+/// long since scrolled past the top of the viewport and is gone from the
+/// frame. Post-fix the engine should resolve the anchor + drag endpoint
+/// in *content* coordinates (transcript line, column-in-content) so the
+/// auto-scroll between Click and Up doesn't drop content the user
+/// dragged across.
+///
+/// Repro: 30-row transcript, viewport 7 rows, scroll headroom 23. Wheel-up
+/// 5 notches (15 rows) so we sit at offset 8 with rows 9..15 visible.
+/// Click on row 9 (transcript anchor at top of viewport), then drag past
+/// the bottom edge enough times to scroll the anchor off-screen. On Up,
+/// the copied selection MUST include the row 9 marker — that's the
+/// content the user originally clicked on.
+#[test]
+fn drag_past_bottom_with_auto_scroll_copies_full_anchored_range() {
+    let mut engine = Engine::new(40, 8).expect("engine");
+    engine
+        .load_scenario(SCROLLABLE_SELECTION_SCENARIO)
+        .expect("scenario");
+    let _ = render_str(&mut engine);
+
+    // Wheel-up by 15 rows total (5 notches × 3) — leaves us at offset 8,
+    // visible rows 9..15. Pre-drag we have headroom both ways for the
+    // auto-scroll path to walk into.
+    for _ in 0..5 {
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Wheel,
+                x: 1,
+                y: 4,
+                button: Some("up"),
+                mods: vec![],
+            })
+            .expect("wheel-up");
+    }
+    let pre = render_str(&mut engine);
+    assert!(
+        pre.contains("offset: 8"),
+        "expected wheel-up to land at offset 8 pre-drag; got:\n{pre}"
+    );
+    assert!(
+        pre.contains("row 9"),
+        "pre-drag frame should show row 9 as top of viewport:\n{pre}"
+    );
+
+    // Click on the start of row 9 (y=1, x=0 — first row of the
+    // scrollable's painted rect), drag past the bottom edge 20 times so
+    // the anchor scrolls out of view, then release.
+    let drags: Vec<(u16, u16)> = (0..20).map(|_| (5, 10)).collect();
+    drag_select(&mut engine, (0, 1), &drags, (5, 10));
+    let captured = last_captured_selection(&mut engine).expect("mouse.selection should have fired");
+
+    // The originally-clicked anchor row (row 9) must be present in the
+    // captured text even though it scrolled out of view between Click
+    // and Up — the heart of the bug.
+    assert!(
+        captured.contains("row 9"),
+        "copied selection must contain the anchor row (row 9) even after \
+         auto-scroll moved it out of view; got:\n{captured:?}"
+    );
+}
+
+/// Static drag entirely inside the visible viewport — no auto-scroll
+/// kicks in, so the copy path's behavior must match the legacy
+/// screen-coord extraction. Regression guard: don't break the easy case
+/// while fixing the auto-scroll case.
+#[test]
+fn drag_inside_viewport_copies_visible_range_unchanged() {
+    let mut engine = Engine::new(40, 8).expect("engine");
+    engine
+        .load_scenario(SCROLLABLE_SELECTION_SCENARIO)
+        .expect("scenario");
+    let _ = render_str(&mut engine);
+    // Wheel-up by 6 rows so we sit at offset 17 — gives a stable visible
+    // window (rows 18..24) for the assertion.
+    for _ in 0..2 {
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Wheel,
+                x: 1,
+                y: 4,
+                button: Some("up"),
+                mods: vec![],
+            })
+            .expect("wheel-up");
+    }
+    let pre = render_str(&mut engine);
+    assert!(
+        pre.contains("offset: 17"),
+        "expected offset 17 pre-drag; got:\n{pre}"
+    );
+
+    // Click at (0, 2) — start of "row 19" — drag downward but stay
+    // inside the viewport AND outside the edge zone. The scrollable's
+    // painted rect is rows 1..=7; with `DRAG_AUTO_SCROLL_EDGE_ROWS = 1`
+    // the bottom edge zone is y >= 7, so y=6 (row 23) is the deepest
+    // non-triggering drag. No auto-scroll should fire across this drag.
+    drag_select(&mut engine, (0, 2), &[(3, 3), (3, 4), (3, 5)], (6, 6));
+    let captured = last_captured_selection(&mut engine).expect("mouse.selection should fire");
+    // Anchor row (19) and drag-end row (23) must both appear in the
+    // captured text — copy of an in-viewport drag must not regress.
+    assert!(
+        captured.contains("row 19"),
+        "in-viewport selection must include the anchor row (row 19); got:\n{captured:?}"
+    );
+    assert!(
+        captured.contains("row 23"),
+        "in-viewport selection must include the drag-end row (row 23); got:\n{captured:?}"
+    );
+}
+
+/// Drag past the TOP edge — symmetric to `drag_past_bottom...`. Click
+/// near the bottom of the viewport, drag past the top so the auto-scroll
+/// retreats and the original anchor is now below the visible region.
+/// The copied selection must still carry the anchor row.
+#[test]
+fn drag_past_top_with_auto_scroll_copies_full_anchored_range() {
+    let mut engine = Engine::new(40, 8).expect("engine");
+    engine
+        .load_scenario(SCROLLABLE_SELECTION_SCENARIO)
+        .expect("scenario");
+    let _ = render_str(&mut engine);
+    // Initial frame is pinned to bottom (offset 23, visible rows 24..30).
+    // Wheel-up two notches to land at offset 17 — gives headroom upward.
+    for _ in 0..2 {
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Wheel,
+                x: 1,
+                y: 4,
+                button: Some("up"),
+                mods: vec![],
+            })
+            .expect("wheel-up");
+    }
+    let pre = render_str(&mut engine);
+    assert!(
+        pre.contains("offset: 17"),
+        "expected offset 17 pre-drag; got:\n{pre}"
+    );
+    assert!(
+        pre.contains("row 24"),
+        "pre-drag frame should show row 24 as bottom of viewport:\n{pre}"
+    );
+
+    // Click at the bottom of the viewport (y=7 — last row of the
+    // scrollable's painted rect; row 24 of the transcript). Anchor at
+    // x=6 so the captured row carries "row 24" past the trailing trim.
+    // Drag past the top edge (y=0) 20 times to drive auto-scroll
+    // upward, then release.
+    let drags: Vec<(u16, u16)> = (0..20).map(|_| (0, 0)).collect();
+    drag_select(&mut engine, (6, 7), &drags, (0, 0));
+    let captured = last_captured_selection(&mut engine).expect("mouse.selection should fire");
+    assert!(
+        captured.contains("row 24"),
+        "copied selection must contain the anchor row (row 24) even after \
+         auto-scroll moved it out of view; got:\n{captured:?}"
+    );
+}
