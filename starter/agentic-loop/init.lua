@@ -88,6 +88,7 @@ local results_lib     = require("lib.results")
 local graph_lib       = require("lib.graph")
 local replay_window   = require("lib.replay_window")
 local history_replay  = require("lib.history_replay")
+local session_config  = require("lib.session_config")
 
 -- ------------------------------------------------------------------
 -- module-private state — held in `state` table; mutations are explicit
@@ -1074,6 +1075,68 @@ local function receive_msg(entry)
   end
 end
 
+-- Restore `state.config.{provider,model}` from the resumed session's
+-- on-disk log. Without this, /resume of a chat that was originally
+-- under provider A leaves state.config.provider pointing at whatever
+-- the LIVE session had switched to (e.g., the user did /model B before
+-- /resume-ing) — and the next live submit dispatches the resumed
+-- chat_id (restored separately by the replayed wrap-firing
+-- tool.result, per 91d49ef) against provider B, which doesn't own that
+-- chat. Symptom: "[Error: chat 'chat-1' not found]" on the first turn
+-- after /resume.
+--
+-- The walk reads the log fresh on every replay start; sessions's
+-- `current_path()` returns the path of the session being resumed
+-- (do_resume swaps state before emitting the replay markers). The
+-- helper picks the latest `chat.model.set` if the session ever saw
+-- /model, otherwise falls back to the prefix + model on the latest
+-- `<prefix>.chat.create`. Empty / unreadable logs leave config as-is.
+--
+-- The model picker UI tracks the model via `chat.model.set_ack` (gated
+-- against replayed acks per e647451 — replayed acks are stale relative
+-- to live state). After this restore, we emit a fresh LIVE
+-- `chat.model.set_ack` so chat.lua's status bar repaints with the
+-- resumed session's model. The ack must be live (not gated) because
+-- it carries the post-replay truth, not a replayed envelope.
+local function restore_active_model_from_session_log()
+  local sessions_mod = require("sessions")
+  local path = sessions_mod.current_path()
+  if type(path) ~= "string" or path == "" then return end
+  local active = session_config.read_active_model(path)
+  local provider = active.provider
+  local model    = active.model
+
+  local changed = false
+  if type(provider) == "string" and #provider > 0
+      and state.config.provider ~= provider then
+    state.config.provider = provider
+    changed = true
+  end
+  if type(model) == "string" and #model > 0
+      and state.config.model ~= model then
+    state.config.model = model
+    changed = true
+  end
+
+  if changed then
+    nefor.log.info("agentic-loop: /resume restored active provider/model from session log", {
+      provider = state.config.provider, model = state.config.model,
+    })
+    -- Surface the restored selection to chat.lua's status bar / model
+    -- picker. Live ack (not a replayed envelope) so chat.lua's
+    -- replay_mode gate doesn't drop it. We emit it broadcast so any
+    -- observer (statusline, picker, future surfaces) picks it up.
+    if type(state.config.provider) == "string" and #state.config.provider > 0
+        and type(state.config.model) == "string" and #state.config.model > 0 then
+      emit_broadcast({
+        kind     = "chat.model.set_ack",
+        provider = state.config.provider,
+        model    = state.config.model,
+      })
+    end
+  end
+end
+
 -- Drive `teardown_for_session_end` from the bus marker. Replay-mode
 -- gating is owned by `lib/replay_window`, which subscribes to
 -- `sessions.replay.start` / `sessions.replay.end` independently — the
@@ -1082,6 +1145,12 @@ end
 if nefor.bus and nefor.bus.on_event then
   nefor.bus.on_event("sessions.session_end", function(_entry)
     teardown_for_session_end()
+  end)
+  -- Restore active provider+model on every replay start. /resume drives
+  -- the replay markers; /new fires them too with an empty log, where
+  -- the helper is a no-op (no chat.create / chat.model.set to read).
+  nefor.bus.on_event("sessions.replay.start", function(_entry)
+    restore_active_model_from_session_log()
   end)
 end
 

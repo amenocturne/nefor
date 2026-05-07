@@ -833,4 +833,186 @@ do
     "run-close tool.result (no top-level next_state) must NOT clobber current_state during replay")
 end
 
+-- ------------------------------------------------------------------
+-- Cross-provider /resume — restores active provider+model from the
+-- session log so the next live submit dispatches against the chat_id's
+-- owning provider, not whatever provider the LIVE session happened to
+-- have selected at the moment of /resume.
+--
+-- User repro that motivates this:
+--   1. boot on default provider (mock-plugin) + send a turn → chat-1
+--      lives on mock-plugin
+--   2. /new (mints fresh session)
+--   3. /model qwen → state.config.provider = "ollama"
+--   4. /resume back to the chat-1 session
+--   5. send a new message → dispatches against state.config.provider
+--      (still "ollama") with state.current_state.chat_id = "chat-1"
+--      → ollama doesn't have chat-1 → "[Error: chat 'chat-1' not found]"
+--
+-- The fix: on `sessions.replay.start`, walk the resumed session's log
+-- and derive the active (provider, model) — latest `chat.model.set` if
+-- any, otherwise the prefix + model on the latest `<prefix>.chat.create`
+-- — and update state.config so the next live submit dispatches through
+-- the right provider.
+-- ------------------------------------------------------------------
+
+-- (a) Default-provider session (no /model switch): provider+model derived
+-- from the latest `<prefix>.chat.create`.
+do
+  fresh_loop()
+  -- Simulate the user's step-3 state: live config switched to ollama via
+  -- /model BEFORE the /resume.
+  agentic_loop.configure { provider = "ollama", model = "qwen-other" }
+
+  with_session_log({
+    -- Original session was created on mock-plugin and never saw /model.
+    step_entry("mock-plugin", {
+      kind = "mock-plugin.chat.create", chat_id = "chat-1", model = "mock-model",
+    }),
+    step_entry("mock-plugin", {
+      kind    = "mock-plugin.chat.append",
+      chat_id = "chat-1",
+      message = { role = "user", content = "hello" },
+    }),
+    step_entry_from("provider-wrapper", {
+      kind   = "tool.result",
+      id     = "firing-original",
+      result = {
+        text       = "hi there",
+        next_state = { chat_id = "chat-1" },
+      },
+    }),
+  }, function()
+    _test.fire_bus("sessions.replay.start", { session_id = "old", count = 0 })
+    -- The replayed wrap-firing tool.result restores chat_id (per 91d49ef).
+    send_to_loop("provider-wrapper", {
+      kind   = "tool.result",
+      id     = "firing-original",
+      result = {
+        text       = "hi there",
+        next_state = { chat_id = "chat-1" },
+      },
+    })
+    _test.fire_bus("sessions.replay.end", { session_id = "old" })
+
+    assert_eq(agentic_loop.config().provider, "mock-plugin",
+      "post-/resume, state.config.provider must be derived from the resumed session's "
+      .. "chat.create prefix, not the live-pre-resume value; got "
+      .. tostring(agentic_loop.config().provider))
+    assert_eq(agentic_loop.config().model, "mock-model",
+      "post-/resume, state.config.model must be derived from the resumed session's "
+      .. "chat.create model, not the live-pre-resume value; got "
+      .. tostring(agentic_loop.config().model))
+    assert_eq(agentic_loop._internals.state.current_state.chat_id, "chat-1",
+      "post-/resume, current_state.chat_id is restored from the replayed wrap-firing")
+
+    -- Step 5: live submit. The dispatched wrap node MUST seed_chat_id with
+    -- chat-1 AND the dispatch must ride state.config.provider = mock-plugin.
+    _test.calls_clear()
+    send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "follow up" })
+    local seeded_chat_id
+    local seeded_provider
+    for _, c in ipairs(decode_calls()) do
+      if c.body.kind == "tool.invoke"
+          and c.body.name == "spawn_graph"
+          and type(c.body.args) == "table"
+          and type(c.body.args.graph) == "table" then
+        for _, node in ipairs(c.body.args.graph.nodes or {}) do
+          if node.id == "wrap" and type(node.args) == "table" then
+            seeded_chat_id = node.args.seed_chat_id
+            seeded_provider = node.args.provider
+          end
+        end
+      end
+    end
+    assert_eq(seeded_chat_id, "chat-1",
+      "post-/resume submit must seed wrap with the resumed chat_id; got "
+      .. tostring(seeded_chat_id))
+    -- The wrap node intentionally doesn't bake provider into args; the live
+    -- cfg.provider drives dispatch (Bug B1). The cfg-level assertion above
+    -- already pins the user-visible bug — that's the dispatch path.
+    assert_eq(seeded_provider, nil,
+      "wrap node still doesn't bake provider into args (picker is source of truth)")
+  end)
+end
+
+-- (b) /model-switched session: latest `chat.model.set` wins over
+-- `chat.create` model.
+do
+  fresh_loop()
+  agentic_loop.configure { provider = "ollama", model = "qwen-other" }
+
+  with_session_log({
+    step_entry("mock-plugin", {
+      kind = "mock-plugin.chat.create", chat_id = "chat-1", model = "mock-model",
+    }),
+    -- Mid-session /model switch (canonical user-facing envelope).
+    step_entry(nil, { kind = "chat.model.set", provider = "anthropic", model = "claude-test" }),
+    step_entry_from("provider-wrapper", {
+      kind   = "tool.result",
+      id     = "firing-original",
+      result = {
+        text       = "hi",
+        next_state = { chat_id = "chat-1" },
+      },
+    }),
+  }, function()
+    _test.fire_bus("sessions.replay.start", { session_id = "old", count = 0 })
+    send_to_loop("provider-wrapper", {
+      kind   = "tool.result",
+      id     = "firing-original",
+      result = {
+        text       = "hi",
+        next_state = { chat_id = "chat-1" },
+      },
+    })
+    _test.fire_bus("sessions.replay.end", { session_id = "old" })
+
+    assert_eq(agentic_loop.config().provider, "anthropic",
+      "post-/resume, state.config.provider must be derived from the LATEST chat.model.set, not chat.create; got "
+      .. tostring(agentic_loop.config().provider))
+    assert_eq(agentic_loop.config().model, "claude-test",
+      "post-/resume, state.config.model must be derived from the LATEST chat.model.set, not chat.create; got "
+      .. tostring(agentic_loop.config().model))
+  end)
+end
+
+-- (c) Same-provider /resume: config stays at original values (no
+-- observable change, but the path still runs cleanly).
+do
+  fresh_loop()
+  -- Live config matches the resumed session's provider — no change expected.
+  agentic_loop.configure { provider = "mock-plugin", model = "mock-model" }
+
+  with_session_log({
+    step_entry("mock-plugin", {
+      kind = "mock-plugin.chat.create", chat_id = "chat-1", model = "mock-model",
+    }),
+  }, function()
+    _test.fire_bus("sessions.replay.start", { session_id = "old", count = 0 })
+    _test.fire_bus("sessions.replay.end", { session_id = "old" })
+    assert_eq(agentic_loop.config().provider, "mock-plugin",
+      "same-provider /resume keeps provider")
+    assert_eq(agentic_loop.config().model, "mock-model",
+      "same-provider /resume keeps model")
+  end)
+end
+
+-- (d) Empty session log (no chat.create yet): config stays at the live
+-- pre-resume values. There's nothing in the log to restore from, and
+-- there's no chat_id to dispatch against either, so this is a soft fail
+-- that doesn't clobber state.
+do
+  fresh_loop()
+  agentic_loop.configure { provider = "ollama", model = "qwen-other" }
+  with_session_log({}, function()
+    _test.fire_bus("sessions.replay.start", { session_id = "empty", count = 0 })
+    _test.fire_bus("sessions.replay.end", { session_id = "empty" })
+    assert_eq(agentic_loop.config().provider, "ollama",
+      "empty-log /resume: provider unchanged")
+    assert_eq(agentic_loop.config().model, "qwen-other",
+      "empty-log /resume: model unchanged")
+  end)
+end
+
 print("agentic_workflow_test: ok")
