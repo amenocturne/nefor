@@ -291,6 +291,89 @@ pub fn apply_editing_key(
     }
 }
 
+/// Outcome for a bracketed-paste event. Mirrors `RouteDecision` but
+/// carries no `submitted` slot — paste never submits, even when the
+/// pasted text contains an Enter (the terminal converts the LF inside
+/// bracketed-paste to the same `\n` that Shift+Enter would insert).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasteDecision {
+    /// No focused text_input — drop the paste. Bubbling raw bytes to
+    /// Lua would let arbitrary terminal chrome inject content into the
+    /// composition; the explicit decision is to ignore paste outside
+    /// editable surfaces (matches a focused `<input>` losing focus in
+    /// a browser — the paste goes nowhere).
+    Drop,
+    /// Routed into the focused text_input. The router has already
+    /// inserted the text in one buffer mutation; the engine should
+    /// fire `on_change` once with the post-insert value.
+    HandledByTextInput {
+        target_key: String,
+        on_change: Option<String>,
+        value: String,
+        value_changed: bool,
+    },
+}
+
+/// Top-level paste entry: insert `text` at the cursor of the focused
+/// text_input in a single buffer mutation, regardless of how many
+/// characters or newlines it contains. For single-line inputs
+/// (`max_lines == 1`), embedded newlines are flattened to spaces — a
+/// single-line input can't visually represent the extra rows, and
+/// silently dropping characters would corrupt the user's clipboard.
+///
+/// Decoupled from `route_key` so the engine can call it directly when
+/// crossterm delivers `Event::Paste(String)` with bracketed-paste
+/// enabled. Without this path, a 200-character paste would arrive as
+/// 200 separate `Event::Key(Char)` events, each driving its own
+/// dispatch + reconcile + render — the user sees the text materialise
+/// character-by-character with visible lag (issue #36).
+pub fn route_paste(root: &mut WidgetInstance, text: &str) -> PasteDecision {
+    let Some(path) = find_focused_path(root) else {
+        return PasteDecision::Drop;
+    };
+    let Some(inst) = instance_at_path(root, &path) else {
+        return PasteDecision::Drop;
+    };
+    let (target_key, on_change, max_lines) = match &inst.last_desc {
+        WidgetDescription::TextInput {
+            key: Some(k),
+            on_change,
+            max_lines,
+            ..
+        } => (k.clone(), on_change.clone(), *max_lines),
+        _ => return PasteDecision::Drop,
+    };
+    // Single-line inputs flatten embedded newlines to spaces; multi-
+    // line inputs accept newlines verbatim (same shape Shift+Enter
+    // would produce one keypress at a time).
+    let normalised: String = if max_lines <= 1 && text.contains(['\n', '\r']) {
+        text.chars()
+            .map(|c| if matches!(c, '\n' | '\r') { ' ' } else { c })
+            .collect()
+    } else if text.contains('\r') {
+        // Strip bare CR — terminals on Windows send CRLF; the LF alone
+        // is what `text_input` understands as a row break.
+        text.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        text.to_string()
+    };
+    let outcome = match &mut inst.state {
+        InstanceState::TextInput(s) => s.insert_str(&normalised),
+        _ => return PasteDecision::Drop,
+    };
+    let value_changed = outcome.new_value.is_some();
+    let value = outcome.new_value.unwrap_or_else(|| match &inst.state {
+        InstanceState::TextInput(s) => s.last_value.clone(),
+        _ => String::new(),
+    });
+    PasteDecision::HandledByTextInput {
+        target_key,
+        on_change,
+        value,
+        value_changed,
+    }
+}
+
 /// Top-level entry: given the current root and a key event, decide
 /// whether to bubble or absorb. Mutates the focused instance's state in
 /// place when absorbing.
@@ -815,5 +898,121 @@ mod tests {
             route_key(root, &key("down", vec![])),
             RouteDecision::BubbleToLua
         );
+    }
+
+    // ── bracketed-paste routing (issue #36) ─────────────────────────
+
+    fn ti_multiline(key: &str, focused: bool, value: &str, max_lines: u16) -> WidgetDescription {
+        WidgetDescription::TextInput {
+            key: Some(key.into()),
+            value: value.into(),
+            focused,
+            on_change: Some("input.changed".into()),
+            on_submit: Some("input.submit".into()),
+            min_lines: 1,
+            max_lines,
+            placeholder: None,
+            cursor_blink: false,
+            style: None,
+        }
+    }
+
+    #[test]
+    fn paste_inserts_entire_string_in_one_buffer_mutation() {
+        // Regression for issue #36: pasted text must land via insert_str
+        // (one mutation), not as N separate insert_char calls. The
+        // assertion is structural — the post-paste value contains the
+        // full 200-char paste, not a prefix that grew character-by-
+        // character through a per-key path.
+        let mut r = build(ti_multiline("input", true, "", 6));
+        let root = r.root.as_mut().unwrap();
+        let payload: String = "x".repeat(200);
+        let decision = route_paste(root, &payload);
+        match decision {
+            PasteDecision::HandledByTextInput {
+                target_key,
+                value,
+                value_changed,
+                on_change,
+            } => {
+                assert_eq!(target_key, "input");
+                assert!(value_changed);
+                assert_eq!(value.len(), 200);
+                assert_eq!(value, payload);
+                assert_eq!(on_change.as_deref(), Some("input.changed"));
+            }
+            other => panic!("expected HandledByTextInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paste_with_newlines_lands_verbatim_on_multiline_input() {
+        // A 5-line paste into a multi-line input keeps the embedded
+        // \n separators — they look the same as Shift+Enter.
+        let mut r = build(ti_multiline("input", true, "", 6));
+        let root = r.root.as_mut().unwrap();
+        let payload = "line1\nline2\nline3\nline4\nline5";
+        match route_paste(root, payload) {
+            PasteDecision::HandledByTextInput { value, .. } => {
+                assert_eq!(value, payload);
+                assert_eq!(value.matches('\n').count(), 4);
+            }
+            other => panic!("expected HandledByTextInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paste_with_newlines_into_single_line_input_flattens_to_spaces() {
+        // Single-line input can't represent multi-row content; flatten
+        // \n / \r to spaces rather than silently dropping characters
+        // (which would corrupt the user's clipboard payload).
+        let mut r = build(ti_multiline("input", true, "", 1));
+        let root = r.root.as_mut().unwrap();
+        let payload = "alpha\nbeta\rgamma";
+        match route_paste(root, payload) {
+            PasteDecision::HandledByTextInput { value, .. } => {
+                assert_eq!(value, "alpha beta gamma");
+            }
+            other => panic!("expected HandledByTextInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paste_strips_carriage_return_pairs_in_multiline() {
+        // Windows-style CRLF normalises to LF so wrap_value's hard-
+        // newline detection sees the row break.
+        let mut r = build(ti_multiline("input", true, "", 6));
+        let root = r.root.as_mut().unwrap();
+        let payload = "a\r\nb\r\nc";
+        match route_paste(root, payload) {
+            PasteDecision::HandledByTextInput { value, .. } => {
+                assert_eq!(value, "a\nb\nc");
+            }
+            other => panic!("expected HandledByTextInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paste_with_no_focused_input_drops_silently() {
+        let mut r = build(ti_multiline("input", false, "", 6));
+        let root = r.root.as_mut().unwrap();
+        let decision = route_paste(root, "anything");
+        assert_eq!(decision, PasteDecision::Drop);
+    }
+
+    #[test]
+    fn paste_inserts_at_cursor_replacing_selection_semantics() {
+        // insert_str is the same primitive Shift+Enter and printable
+        // chars use, so paste must inherit cursor-position semantics:
+        // insert at cursor, append after the existing value when the
+        // cursor sits at the end (browser-input default after sync).
+        let mut r = build(ti_multiline("input", true, "prefix-", 6));
+        let root = r.root.as_mut().unwrap();
+        match route_paste(root, "PASTE") {
+            PasteDecision::HandledByTextInput { value, .. } => {
+                assert_eq!(value, "prefix-PASTE");
+            }
+            other => panic!("expected HandledByTextInput, got {other:?}"),
+        }
     }
 }

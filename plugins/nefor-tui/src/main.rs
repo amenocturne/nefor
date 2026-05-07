@@ -222,7 +222,8 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
                         engine.handle_mouse(mm)?;
                     }
                 }
-                Some(Ok(_)) => {} // paste / focus — phase 4 doesn't surface these
+                Some(Ok(Event::Paste(text))) => engine.handle_paste(&text)?,
+                Some(Ok(_)) => {} // focus events — not surfaced to Lua
                 Some(Err(e)) => tracing::warn!(error = %e, "crossterm event error"),
                 None => break,
             },

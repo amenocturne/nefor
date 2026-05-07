@@ -11,7 +11,7 @@ use crate::animation::sample as animation_sample;
 use crate::desc::WidgetDescription;
 use crate::error::TuiError;
 use crate::input::KeyMessage;
-use crate::input_router::{route_key, RouteDecision};
+use crate::input_router::{route_key, route_paste, PasteDecision, RouteDecision};
 use crate::instance::{sync_text_inputs, InstanceKind, InstanceState, WidgetInstance};
 use crate::lua_host::{
     LuaHost, ScrollCommand, ScrollPositionMap, ScrollPositionSnapshot, SideEffect,
@@ -191,6 +191,45 @@ impl Engine {
         }
         msg.set("mods", mods)?;
         self.dispatch_msg(msg)
+    }
+
+    /// Insert a bracketed-paste payload at the cursor of the focused
+    /// text_input — one buffer mutation, one `on_change` dispatch, one
+    /// render-mark-dirty regardless of how many characters or
+    /// newlines the paste contains. Without this path, a multi-line
+    /// paste would arrive from crossterm as a stream of per-character
+    /// `Event::Key(Char)` events with bracketed-paste disabled — each
+    /// triggering its own dispatch + reconcile + render cycle, so a
+    /// 200-character paste rendered character-by-character with
+    /// visible lag (issue #36).
+    ///
+    /// No focused text_input → silently drop. Browser parity: a paste
+    /// outside any editable surface goes nowhere.
+    pub fn handle_paste(&mut self, text: &str) -> Result<(), TuiError> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.ensure_reconciled()?;
+        let Some(root) = self.reconciler.root.as_mut() else {
+            return Ok(());
+        };
+        match route_paste(root, text) {
+            PasteDecision::Drop => Ok(()),
+            PasteDecision::HandledByTextInput {
+                target_key,
+                on_change,
+                value,
+                value_changed,
+            } => {
+                if value_changed {
+                    if let Some(kind) = on_change {
+                        self.dispatch_named(&kind, &target_key, Some(&value))?;
+                    }
+                }
+                self.needs_render = true;
+                Ok(())
+            }
+        }
     }
 
     /// Build `{ kind, target_key, value? }` and dispatch through Lua's
@@ -1627,6 +1666,92 @@ mod tests {
         assert!(
             s.contains("got:pha\nbeta") || s.contains("got:pha"),
             "expected multi-row line-flow text, got: {s:?}"
+        );
+    }
+
+    // ── bracketed paste (issue #36) ─────────────────────────────────
+
+    /// Scenario with a focused multi-line input + an `on_change` counter
+    /// in state. Drives the engine-level paste path end-to-end so the
+    /// regression test asserts the full handle_paste contract: one
+    /// dispatch_named call (one `input.changed` message), one buffer
+    /// mutation, and one `render_if_dirty` flip — regardless of paste
+    /// length. Pre-fix the path was per-character, so a 200-char paste
+    /// would advance the counter to 200 and force 200 separate render
+    /// passes.
+    const PASTE_SCENARIO: &str = r#"
+        tui.start {
+          initial_state = { value = "", changes = 0 },
+          view = function(s)
+            return tui.column { gap = 0, children = {
+              tui.text { content = "v=" .. (s.value or "") },
+              tui.text { content = "c=" .. tostring(s.changes) },
+              tui.text_input {
+                key       = "input",
+                value     = s.value,
+                focused   = true,
+                on_change = "input.changed",
+                on_submit = "input.submit",
+                min_lines = 1,
+                max_lines = 6,
+              },
+            }}
+          end,
+          update = function(msg, s)
+            if msg.kind == "input.changed" then
+              return { value = msg.value or "", changes = (s.changes or 0) + 1 }, {}
+            end
+            return s, {}
+          end,
+        }
+    "#;
+
+    #[test]
+    fn paste_dispatches_single_on_change_for_full_payload() {
+        let mut engine = Engine::new(80, 12).expect("engine");
+        engine.load_scenario(PASTE_SCENARIO).expect("load");
+        let _ = engine.render_if_dirty().expect("first").expect("dirty");
+
+        let payload: String = "a".repeat(200);
+        engine.handle_paste(&payload).expect("paste");
+
+        // First render after paste must produce one frame; after that
+        // there's no further work for the engine until something else
+        // changes — confirms no per-char redraw cascade happened.
+        let _ = engine.render_if_dirty().expect("post-paste").expect("dirty");
+        let again = engine.render_if_dirty().expect("idle");
+        assert!(
+            again.is_none(),
+            "second render after paste should be a no-op — \
+             a per-char path would still have queued state changes"
+        );
+
+        // c=1 proves the on_change message fired exactly once for the
+        // whole paste (not 200 times). v=<full payload> proves the
+        // single insert_str carried the entire string.
+        let snap = engine.snapshot();
+        assert!(
+            snap.contains("c=1"),
+            "expected exactly one input.changed dispatch, got snapshot:\n{snap}"
+        );
+        assert!(
+            snap.contains(&format!("v={payload}").chars().take(80).collect::<String>()),
+            "expected pasted payload prefix in v=, got snapshot:\n{snap}"
+        );
+    }
+
+    #[test]
+    fn paste_with_no_focused_input_is_silent_noop() {
+        // No focused text_input → handle_paste must not error and must
+        // not mark dirty (no observable state change to draw).
+        let mut engine = Engine::new(40, 5).expect("engine");
+        engine.load_scenario(COUNTER_SCENARIO).expect("load");
+        let _ = engine.render_if_dirty().expect("first").expect("dirty");
+        engine.handle_paste("hello world").expect("paste");
+        let again = engine.render_if_dirty().expect("post");
+        assert!(
+            again.is_none(),
+            "paste with no focused input should not mark the engine dirty"
         );
     }
 }
