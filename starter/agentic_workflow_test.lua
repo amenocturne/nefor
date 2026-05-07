@@ -532,46 +532,160 @@ do
 end
 
 -- ------------------------------------------------------------------
--- Bug B2 regression — set_model with a NEW provider clears
--- state.current_state so the next submit mints a fresh chat under
--- the new provider plugin. Without this, seed_chat_id rides into
--- provider_run_node pointing at a chat the new provider has never
--- seen — its history sits in the prior provider's process memory,
--- not transferred — and the user's prior context (e.g. "the secret
--- key is nefor") is invisible to the new model.
+-- Bug B2 follow-up — set_model with a NEW provider walks the on-disk
+-- session log for the prior chat and re-emits its history into the
+-- new provider so conversation continuity holds across the switch.
+-- Prior contract (clear current_state, mint fresh chat) was a
+-- knowingly-lossy fallback; this is the eager rebuild path the brief
+-- prefers.
+--
+-- The fallback (clearing current_state) still applies when the
+-- session log is unreachable or has no chat.create entry for the
+-- prior chat_id.
 -- ------------------------------------------------------------------
 
--- Provider switch invalidates current_state.
+-- Helper: monkey-patch the sessions module to point at a tempfile we
+-- pre-populate with synthetic prior-session content.
+local function with_session_log(jsonl_lines, fn)
+  local tmp_path = os.tmpname()
+  local fh = assert(io.open(tmp_path, "w"))
+  fh:write(json.encode({ _session = true, session_id = "test", started_at = "2026-01-01T00:00:00Z" }))
+  fh:write("\n")
+  for _, line in ipairs(jsonl_lines) do
+    fh:write(line)
+    fh:write("\n")
+  end
+  fh:close()
+
+  local sessions = require("sessions")
+  local prior = sessions.current_path
+  sessions.current_path = function() return tmp_path end
+  local ok, err = pcall(fn, tmp_path)
+  sessions.current_path = prior
+  os.remove(tmp_path)
+  if not ok then error(err, 0) end
+end
+
+local function step_entry(target, body)
+  local row = {
+    ts      = "2026-01-01T00:00:00.000Z",
+    origin  = "step",
+    payload = json.encode({ type = "event", from = "engine", body = body }),
+  }
+  if target ~= nil then row.target = target end
+  return json.encode(row)
+end
+
+local function step_entry_from(from, body)
+  return json.encode({
+    ts      = "2026-01-01T00:00:00.000Z",
+    origin  = "step",
+    payload = json.encode({ type = "event", from = from, body = body }),
+  })
+end
+
+-- Provider switch with prior chat: history is rebuilt on the new
+-- provider, current_state holds the new chat_id, next submit seeds
+-- it.
 do
   fresh_loop()
-  -- Simulate a captured chat continuation — mock-side-equivalent of
-  -- what handle_tool_result_firing_close writes when a wrap firing
-  -- closes with next_state.chat_id.
-  agentic_loop._internals.state.current_state = { chat_id = "old-mock-chat-id" }
+  -- Use a chat_id that won't collide with the per-test next_id("chat")
+  -- counter (it starts at 0 in fresh_loop → first mint = "chat-1").
+  -- "chat-prior" picks a name outside that namespace so the assertion
+  -- can prove the new id is freshly-minted, not a coincidence.
+  agentic_loop._internals.state.current_state = { chat_id = "chat-prior" }
 
-  send_to_loop("nefor-tui", { kind = "chat.model.set", provider = "qwen-other-provider", model = "qwen-model" })
-  assert_eq(agentic_loop._internals.state.current_state, nil,
-    "set_model with a different provider must clear current_state so the next submit mints a fresh chat")
+  with_session_log({
+    step_entry("ollama", { kind = "ollama.chat.create", chat_id = "chat-prior", model = "qwen3" }),
+    step_entry("ollama", {
+      kind    = "ollama.chat.append",
+      chat_id = "chat-prior",
+      message = { role = "system", content = "you are helpful" },
+    }),
+    step_entry("ollama", {
+      kind    = "ollama.chat.append",
+      chat_id = "chat-prior",
+      message = { role = "user", content = "the secret word is sphinx; remember it" },
+    }),
+    step_entry_from("provider-wrapper", {
+      kind   = "tool.result",
+      id     = "firing-prior",
+      result = {
+        text       = "got it — the secret word is sphinx.",
+        next_state = { chat_id = "chat-prior" },
+      },
+    }),
+  }, function()
+    _test.calls_clear()
+    send_to_loop("nefor-tui", { kind = "chat.model.set", provider = "another-provider", model = "qwen-other" })
 
-  -- And the next submit's wrap_args carries no seed_chat_id — fresh
-  -- chat under the new provider.
-  _test.calls_clear()
-  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "what is the secret key?" })
-  local seen_seed
-  for _, c in ipairs(decode_calls()) do
-    if c.body.kind == "tool.invoke"
-        and c.body.name == "spawn_graph"
-        and type(c.body.args) == "table"
-        and type(c.body.args.graph) == "table" then
-      for _, node in ipairs(c.body.args.graph.nodes or {}) do
-        if node.id == "wrap" and type(node.args) == "table" then
-          seen_seed = node.args.seed_chat_id
+    -- current_state must now point at a fresh chat_id under the new
+    -- provider — NOT nil (legacy lossy fallback), NOT the prior id
+    -- (would collide with the old provider's binary on /resume).
+    local cs = agentic_loop._internals.state.current_state
+    assert(type(cs) == "table" and type(cs.chat_id) == "string" and cs.chat_id ~= "chat-prior",
+      "cross-provider /model switch must mint a fresh chat_id and store it in current_state; got "
+      .. json.encode(cs or {}))
+    local new_chat_id = cs.chat_id
+
+    -- Bus traffic must include <new>.chat.create + 3 chat.append
+    -- (system, user, assistant from synthesised tool.result).
+    local kinds = {}
+    local appends_for_new = {}
+    for _, c in ipairs(decode_calls()) do
+      kinds[#kinds + 1] = c.body.kind
+      if c.body.kind == "another-provider.chat.append"
+          and c.body.chat_id == new_chat_id then
+        appends_for_new[#appends_for_new + 1] = c.body.message
+      end
+    end
+
+    local saw_create = false
+    for _, k in ipairs(kinds) do
+      if k == "another-provider.chat.create" then saw_create = true end
+    end
+    assert(saw_create,
+      "set_model rebuild must emit <new>.chat.create on the bus; got kinds=" .. json.encode(kinds))
+    assert_eq(#appends_for_new, 3,
+      "set_model rebuild must re-feed 3 messages (system/user + synthesised assistant); got "
+      .. tostring(#appends_for_new))
+    assert_eq(appends_for_new[1].role,    "system",    "first re-fed message is system")
+    assert_eq(appends_for_new[2].role,    "user",      "second re-fed message is user")
+    assert_eq(appends_for_new[3].role,    "assistant", "third re-fed message is synthesised assistant turn")
+    assert_eq(appends_for_new[3].content, "got it — the secret word is sphinx.",
+      "synthesised assistant content comes from result.text")
+
+    -- Next submit's wrap node must seed_chat_id with the new chat_id —
+    -- so reasoners.lua takes the no-create branch and the rebuild
+    -- isn't undone by a fresh chat.create on a fresh id.
+    _test.calls_clear()
+    send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "what was the secret word?" })
+    local seen_seed
+    for _, c in ipairs(decode_calls()) do
+      if c.body.kind == "tool.invoke"
+          and c.body.name == "spawn_graph"
+          and type(c.body.args) == "table"
+          and type(c.body.args.graph) == "table" then
+        for _, node in ipairs(c.body.args.graph.nodes or {}) do
+          if node.id == "wrap" and type(node.args) == "table" then
+            seen_seed = node.args.seed_chat_id
+          end
         end
       end
     end
-  end
-  assert_eq(seen_seed, nil,
-    "after a provider switch, the next submit's wrap node must NOT carry seed_chat_id")
+    assert_eq(seen_seed, new_chat_id,
+      "post-switch submit's wrap node must seed_chat_id with the new chat_id; got " .. tostring(seen_seed))
+  end)
+end
+
+-- Provider switch with NO prior chat: the lossy-fallback path. We
+-- can't rebuild what we don't have.
+do
+  fresh_loop()
+  -- No current_state pre-set.
+  send_to_loop("nefor-tui", { kind = "chat.model.set", provider = "another-provider", model = "qwen-other" })
+  assert_eq(agentic_loop._internals.state.current_state, nil,
+    "cross-provider switch with no prior chat: current_state stays nil (no rebuild possible)")
 end
 
 -- Same-provider model-only switch keeps current_state intact.
@@ -589,6 +703,120 @@ do
     "model-only switch (same provider) must NOT clear current_state")
   assert_eq(agentic_loop._internals.state.current_state.chat_id, "ollama-chat-id",
     "model-only switch must preserve the active chat_id")
+end
+
+-- ------------------------------------------------------------------
+-- Cross-process /resume — agentic-loop restores state.current_state
+-- chat_id from replayed wrap-firing tool.result. Without this, the
+-- next live submit mints a fresh chat_id, and the openai-provider
+-- wrapper's painstakingly-rebuilt history (on the prior chat_id)
+-- is unused — the model replies with no memory of prior turns.
+--
+-- The replay window flips to active at sessions.replay.start; sessions
+-- replays each step-origin envelope through the bus; agentic-loop
+-- observes them. The wrap firing's tool.result carries
+-- result.next_state.chat_id — the canonical chat-continuity signal.
+-- ------------------------------------------------------------------
+do
+  fresh_loop()
+  -- Fresh process: state.current_state is nil at boot.
+  assert_eq(agentic_loop._internals.state.current_state, nil,
+    "post-reset, current_state is nil (fresh-process equivalent)")
+
+  -- Sessions replay opens.
+  _test.fire_bus("sessions.replay.start", { session_id = "old-session", count = 0 })
+  -- Replayed envelopes flow through the bus. The wrap firing's
+  -- tool.result is the canonical close envelope sessions persisted —
+  -- replay re-sends it. agentic-loop's firing_to_node table is empty
+  -- (fresh process boot), so the existing live firing-close handler
+  -- returns early. Replay path must capture chat_id independently.
+  send_to_loop("provider-wrapper", {
+    kind   = "tool.result",
+    id     = "firing-replayed-1",
+    result = {
+      text          = "Hello! How can I help?",
+      finish_reason = "stop",
+      next_state    = { chat_id = "chat-resumed-1" },
+    },
+  })
+  _test.fire_bus("sessions.replay.end", { session_id = "old-session" })
+
+  assert(agentic_loop._internals.state.current_state ~= nil,
+    "replayed wrap-firing tool.result must restore state.current_state on cross-process /resume")
+  assert_eq(agentic_loop._internals.state.current_state.chat_id, "chat-resumed-1",
+    "current_state.chat_id must come from result.next_state.chat_id of the replayed wrap firing")
+
+  -- Sanity: the next live submit seeds the wrap node with the
+  -- restored chat_id. Without that, reasoners.lua mints a fresh
+  -- chat-N and the wrapper's history rebuild on the OLD chat_id is
+  -- orphaned (the user-visible "no memory" symptom).
+  _test.calls_clear()
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "what was the secret word?" })
+  local seeded
+  for _, c in ipairs(decode_calls()) do
+    if c.body.kind == "tool.invoke"
+        and c.body.name == "spawn_graph"
+        and type(c.body.args) == "table"
+        and type(c.body.args.graph) == "table" then
+      for _, node in ipairs(c.body.args.graph.nodes or {}) do
+        if node.id == "wrap" and type(node.args) == "table" then
+          seeded = node.args.seed_chat_id
+        end
+      end
+    end
+  end
+  assert_eq(seeded, "chat-resumed-1",
+    "post-/resume submit must seed the wrap node with the recovered chat_id")
+end
+
+-- Multiple replayed tool.results in one window — latest chat_id wins.
+-- A session may carry several wrap-firings (one per turn) plus one
+-- /new mid-session that mints a fresh chat_id. The most recent
+-- recorded chat_id is the active one at /resume time.
+do
+  fresh_loop()
+  _test.fire_bus("sessions.replay.start", { session_id = "old-session", count = 0 })
+  send_to_loop("provider-wrapper", {
+    kind   = "tool.result",
+    id     = "firing-replayed-old",
+    result = {
+      text       = "first turn reply",
+      next_state = { chat_id = "chat-old-1" },
+    },
+  })
+  send_to_loop("provider-wrapper", {
+    kind   = "tool.result",
+    id     = "firing-replayed-newer",
+    result = {
+      text       = "second turn reply",
+      next_state = { chat_id = "chat-new-1" },
+    },
+  })
+  _test.fire_bus("sessions.replay.end", { session_id = "old-session" })
+  assert_eq(agentic_loop._internals.state.current_state.chat_id, "chat-new-1",
+    "the LATEST replayed wrap-firing chat_id wins (covers /new mid-session)")
+end
+
+-- tool.result envelopes WITHOUT result.next_state.chat_id (run-close,
+-- terminal close, sub-graph synth) must NOT clobber current_state.
+-- The orchestrator-run close shape carries result.results (a table of
+-- per-node outputs), not result.next_state.
+do
+  fresh_loop()
+  -- Pre-seed something so the negative assertion has a baseline.
+  agentic_loop._internals.state.current_state = { chat_id = "pre-existing" }
+  _test.fire_bus("sessions.replay.start", { session_id = "old-session", count = 0 })
+  send_to_loop("reasoner-graph", {
+    kind   = "tool.result",
+    id     = "run-close-id",
+    result = {
+      status  = "success",
+      results = { wrap = { output = { text = "x" } } },
+    },
+  })
+  _test.fire_bus("sessions.replay.end", { session_id = "old-session" })
+  assert_eq(agentic_loop._internals.state.current_state.chat_id, "pre-existing",
+    "run-close tool.result (no top-level next_state) must NOT clobber current_state during replay")
 end
 
 print("agentic_workflow_test: ok")

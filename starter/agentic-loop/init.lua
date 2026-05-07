@@ -82,11 +82,12 @@
 
 local json = nefor.json
 
-local envelope      = require("lib.envelope")
-local ids           = require("lib.ids")
-local results_lib   = require("lib.results")
-local graph_lib     = require("lib.graph")
-local replay_window = require("lib.replay_window")
+local envelope        = require("lib.envelope")
+local ids             = require("lib.ids")
+local results_lib     = require("lib.results")
+local graph_lib       = require("lib.graph")
+local replay_window   = require("lib.replay_window")
+local history_replay  = require("lib.history_replay")
 
 -- ------------------------------------------------------------------
 -- module-private state — held in `state` table; mutations are explicit
@@ -335,22 +336,30 @@ end
 -- <prefix>.model.set carries the active chat_id so the provider
 -- learns the new model for that chat, conversation continuity holds.
 --
--- A provider switch (different provider name) invalidates
--- state.current_state. The prior provider plugin holds the chat
--- history for the prior chat_id in its own process memory; the new
--- provider has never seen that chat_id, so a continuation with
--- seed_chat_id pointing at the prior chat would land at the new
--- provider with no history loaded — user asks "what is the secret
--- key?" and the new provider has no idea (Bug B2). Replaying chat
--- history into the new provider would require agentic-loop to track
--- per-chat_id message logs separately from the providers (option (a)
--- in the brief) — large architectural lift for the cross-provider
--- case. Instead: clear current_state so the next submit mints a
--- fresh chat under the new provider. User loses prior context but
--- the chat stays consistent. The user-facing semantics: switching
--- providers starts a clean chat, switching models within a provider
--- keeps context.
+-- A provider switch (different provider name) crosses a process
+-- boundary: the new provider's binary has no per-chat_id history
+-- table for the active chat. Without rebuild the model would reply
+-- with no memory of prior turns (Bug B2). We rebuild by walking the
+-- on-disk session log for the prior chat's `<old>.chat.{create,append}`
+-- + wrap-firing tool.result envelopes and re-emitting them as
+-- `<new>.chat.{create,append}` against a fresh chat_id under the new
+-- provider. The bus traffic flows through every wrapper's `to_plugin`
+-- the same way live envelopes do; the new provider's wrapper delivers
+-- to its binary, every other wrapper drops on prefix mismatch. The
+-- next submit seeds the wrap node with the new chat_id (via
+-- state.current_state) so reasoners.lua's no-create branch fires
+-- (prev_state.chat_id is set → no new chat.create, just chat.append +
+-- chat.complete on the already-rebuilt chat).
+--
+-- If the session log is unavailable (no path, open failure, no prior
+-- chat.create matching the chat_id), we fall back to clearing
+-- current_state — the legacy behaviour. User loses prior context but
+-- the chat stays consistent.
 local function set_model(provider, model)
+  local prior_provider = state.config.provider
+  local prior_chat_id  =
+    (type(state.current_state) == "table" and type(state.current_state.chat_id) == "string")
+      and state.current_state.chat_id or nil
   local provider_changed = false
   if type(provider) == "string" and #provider > 0 then
     if state.config.provider ~= provider then
@@ -361,13 +370,55 @@ local function set_model(provider, model)
   if type(model) == "string" and #model > 0 then
     state.config.model = model
   end
-  if provider_changed then
-    nefor.log.info("agentic-loop.set_model: provider changed, clearing current_state", {
-      new_provider = provider,
-      prior_chat_id = type(state.current_state) == "table" and state.current_state.chat_id or nil,
+  if not provider_changed then return end
+
+  if prior_chat_id == nil then
+    -- Cross-provider switch with no prior chat — nothing to rebuild.
+    nefor.log.info("agentic-loop.set_model: provider changed, no prior chat", {
+      prior_provider = prior_provider, new_provider = provider,
     })
     state.current_state = nil
+    return
   end
+
+  -- Rebuild prior chat under the new provider. The session log path is
+  -- resolved through the sessions module; we lazy-require it to avoid
+  -- a circular dep at module-load time (sessions doesn't depend on
+  -- agentic-loop, but lazy keeps the surface symmetric with the
+  -- agentic-loop ↔ openai-provider lazy-bind below).
+  local sessions = require("sessions")
+  local path = sessions.current_path()
+  if type(path) ~= "string" or path == "" then
+    nefor.log.warn("agentic-loop.set_model: no session log path available; clearing current_state", {
+      prior_provider = prior_provider, new_provider = provider,
+    })
+    state.current_state = nil
+    return
+  end
+
+  local target_chat_id = envelope.next_id("chat")
+  local n, err = history_replay.replay_chat_history {
+    path             = path,
+    src_prefix       = prior_provider,
+    src_chat_id      = prior_chat_id,
+    target_provider  = provider,
+    target_chat_id   = target_chat_id,
+    model            = state.config.model,
+  }
+  if err ~= nil then
+    nefor.log.warn("agentic-loop.set_model: history replay failed; clearing current_state", {
+      prior_provider = prior_provider, new_provider = provider,
+      prior_chat_id = prior_chat_id, error = err,
+    })
+    state.current_state = nil
+    return
+  end
+  state.current_state = { chat_id = target_chat_id }
+  nefor.log.info("agentic-loop.set_model: chat history fed to new provider", {
+    prior_provider  = prior_provider, new_provider = provider,
+    prior_chat_id   = prior_chat_id,  new_chat_id  = target_chat_id,
+    envelopes_emitted = n,
+  })
 end
 
 local function set_yolo(enabled)
@@ -966,6 +1017,28 @@ local function receive_msg(entry)
   if replay_window.active() then
     if kind == "graph.node.fired" then return end
     if kind == "tool.result" then
+      -- Cross-process /resume rebuild: capture the active chat_id from
+      -- replayed wrap-firing close envelopes. Live path keys this on
+      -- `firing_to_node[firing_id]` populated by `graph.node.fired`,
+      -- but on a fresh-process /resume firing_to_node is empty (the
+      -- run completed in the prior process). The wire signature of a
+      -- wrap firing close is `result.next_state.chat_id`; run-close /
+      -- terminal-close / sub-graph-synth tool.results carry
+      -- `result.results` / `result.text` / `result.status` instead, so
+      -- the next_state.chat_id check is the discriminator.
+      --
+      -- Without this, the next live submit reaches submit_orchestrator_run
+      -- with state.current_state==nil → no seed_chat_id → reasoners.lua
+      -- mints a fresh chat-N → openai-provider's painstakingly-rebuilt
+      -- history (on the OLD chat_id) is orphaned, model replies with no
+      -- memory of prior turns. (issue #38 follow-up to e831dd9.)
+      local result = body.result
+      if type(result) == "table" and type(result.next_state) == "table" then
+        local cid = result.next_state.chat_id
+        if type(cid) == "string" and cid ~= "" then
+          state.current_state = result.next_state
+        end
+      end
       -- Drop only tool.result envelopes that target one of our tracked
       -- ids; pass the rest to other consumers (real tool returns,
       -- spawn_graph synth replies). Matters because tool-gate's own
@@ -977,6 +1050,16 @@ local function receive_msg(entry)
             or state.firing_to_node[id] ~= nil then
           return
         end
+      end
+      -- Wrap-firing close — silently swallow during replay (state
+      -- already captured above). Without this short-circuit it falls
+      -- through to handle_tool_result below, which is a no-op anyway
+      -- (firing_to_node is empty), but the early return makes the
+      -- intent explicit.
+      if type(result) == "table" and type(result.next_state) == "table"
+          and type(result.next_state.chat_id) == "string"
+          and result.next_state.chat_id ~= "" then
+        return
       end
     end
   end
