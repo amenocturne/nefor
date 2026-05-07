@@ -311,12 +311,46 @@ local function new_chat()
   emit(nil, { kind = "chat.reset" })
 end
 
+-- Mid-chat /model picker.
+--
+-- A model-only switch (same provider, different model) keeps
+-- state.current_state intact — chat_id continues to live on the
+-- existing provider plugin, the wrapper's chat.model.set →
+-- <prefix>.model.set carries the active chat_id so the provider
+-- learns the new model for that chat, conversation continuity holds.
+--
+-- A provider switch (different provider name) invalidates
+-- state.current_state. The prior provider plugin holds the chat
+-- history for the prior chat_id in its own process memory; the new
+-- provider has never seen that chat_id, so a continuation with
+-- seed_chat_id pointing at the prior chat would land at the new
+-- provider with no history loaded — user asks "what is the secret
+-- key?" and the new provider has no idea (Bug B2). Replaying chat
+-- history into the new provider would require agentic-loop to track
+-- per-chat_id message logs separately from the providers (option (a)
+-- in the brief) — large architectural lift for the cross-provider
+-- case. Instead: clear current_state so the next submit mints a
+-- fresh chat under the new provider. User loses prior context but
+-- the chat stays consistent. The user-facing semantics: switching
+-- providers starts a clean chat, switching models within a provider
+-- keeps context.
 local function set_model(provider, model)
+  local provider_changed = false
   if type(provider) == "string" and #provider > 0 then
+    if state.config.provider ~= provider then
+      provider_changed = true
+    end
     state.config.provider = provider
   end
   if type(model) == "string" and #model > 0 then
     state.config.model = model
+  end
+  if provider_changed then
+    nefor.log.info("agentic-loop.set_model: provider changed, clearing current_state", {
+      new_provider = provider,
+      prior_chat_id = type(state.current_state) == "table" and state.current_state.chat_id or nil,
+    })
+    state.current_state = nil
   end
 end
 

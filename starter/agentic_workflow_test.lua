@@ -527,4 +527,64 @@ do
   assert_eq(replay_window.active(), false, "replay_window.set(false) must take effect")
 end
 
+-- ------------------------------------------------------------------
+-- Bug B2 regression — set_model with a NEW provider clears
+-- state.current_state so the next submit mints a fresh chat under
+-- the new provider plugin. Without this, seed_chat_id rides into
+-- provider_run_node pointing at a chat the new provider has never
+-- seen — its history sits in the prior provider's process memory,
+-- not transferred — and the user's prior context (e.g. "the secret
+-- key is nefor") is invisible to the new model.
+-- ------------------------------------------------------------------
+
+-- Provider switch invalidates current_state.
+do
+  fresh_loop()
+  -- Simulate a captured chat continuation — mock-side-equivalent of
+  -- what handle_tool_result_firing_close writes when a wrap firing
+  -- closes with next_state.chat_id.
+  agentic_loop._internals.state.current_state = { chat_id = "old-mock-chat-id" }
+
+  send_to_loop("nefor-tui", { kind = "chat.model.set", provider = "qwen-other-provider", model = "qwen-model" })
+  assert_eq(agentic_loop._internals.state.current_state, nil,
+    "set_model with a different provider must clear current_state so the next submit mints a fresh chat")
+
+  -- And the next submit's wrap_args carries no seed_chat_id — fresh
+  -- chat under the new provider.
+  _test.calls_clear()
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "what is the secret key?" })
+  local seen_seed
+  for _, c in ipairs(decode_calls()) do
+    if c.body.kind == "tool.invoke"
+        and c.body.name == "spawn_graph"
+        and type(c.body.args) == "table"
+        and type(c.body.args.graph) == "table" then
+      for _, node in ipairs(c.body.args.graph.nodes or {}) do
+        if node.id == "wrap" and type(node.args) == "table" then
+          seen_seed = node.args.seed_chat_id
+        end
+      end
+    end
+  end
+  assert_eq(seen_seed, nil,
+    "after a provider switch, the next submit's wrap node must NOT carry seed_chat_id")
+end
+
+-- Same-provider model-only switch keeps current_state intact.
+-- Conversation continuity holds because the chat_id still lives on
+-- the same provider; the wrapper's chat.model.set translation
+-- carries the active chat_id to the provider so it learns the new
+-- model for that chat.
+do
+  fresh_loop()
+  agentic_loop._internals.state.current_state = { chat_id = "ollama-chat-id" }
+  -- fresh_loop configures provider="ollama" — sending the SAME
+  -- provider with a different model is the model-only path.
+  send_to_loop("nefor-tui", { kind = "chat.model.set", provider = "ollama", model = "qwen2.5-coder:32b" })
+  assert(agentic_loop._internals.state.current_state ~= nil,
+    "model-only switch (same provider) must NOT clear current_state")
+  assert_eq(agentic_loop._internals.state.current_state.chat_id, "ollama-chat-id",
+    "model-only switch must preserve the active chat_id")
+end
+
 print("agentic_workflow_test: ok")
