@@ -44,8 +44,6 @@ sessions.init()
 
 local agentic_cli = require("agentic_cli")
 
-local function bin(name) return PROJECT_ROOT .. "/target/debug/" .. name end
-
 -- ------------------------------------------------------------------
 -- Plugin spawn order (mirrors starter/init.lua minus chat/tui).
 -- ------------------------------------------------------------------
@@ -85,13 +83,13 @@ if cfg.plugins.spawn_mock then
   actor.spawn(require("mock-plugin").spawn_spec(
     PROVIDER_NAME,
     {
-      bin("mock-plugin"),
+      require("config").bin("mock-plugin"),
       "--script", STARTER_ROOT .. "/" .. cfg.provider.mock_script,
     }
   ))
 else
   local provider_command = {
-    bin("openai-provider"),
+    require("config").bin("openai-provider"),
     "--name",     PROVIDER_NAME,
     "--base-url", cfg.provider.base_url,
   }
@@ -109,9 +107,9 @@ else
   ))
 end
 
-actor.spawn(require("reasoner-graph").spawn_spec({ bin("reasoner-graph") }))
+actor.spawn(require("reasoner-graph").spawn_spec({ require("config").bin("reasoner-graph") }))
 
-local tool_gate_argv = { bin("tool-gate") }
+local tool_gate_argv = { require("config").bin("tool-gate") }
 for _, t in ipairs(cfg.tool_gate.prompt_tools or {}) do
   tool_gate_argv[#tool_gate_argv + 1] = "--prompt"
   tool_gate_argv[#tool_gate_argv + 1] = t
