@@ -424,7 +424,18 @@ local function handle_tool_result_run_close(run_id, body)
   end
   results = results or {}
 
-  -- Sub-graph completion: queue + flush deferred relay.
+  -- Sub-graph completion: surface the literal sub-graph output to the
+  -- user, then queue the LLM-instruction-wrapped relay text + flush.
+  --
+  -- The deferred relay text built by `format_deferred` is shaped for the
+  -- LLM (it leads with "[spawn_graph(...) result]" + behavioural framing
+  -- + the actual output). It rides as the next orchestrator-turn user
+  -- message so the model can acknowledge / paraphrase. But the literal
+  -- sub-graph terminal output is the ground truth — the user wants to
+  -- see it directly, between the collapsed `▶ spawn_graph(...)` tool
+  -- view and the model's relay paragraph. Emit it as a transcript-bound
+  -- system message so it lands in the chat scrollback (and persists for
+  -- replay) at the moment the sub-graph closes.
   local sub_pending = state.pending_runs[run_id]
   if sub_pending ~= nil then
     state.pending_runs[run_id] = nil
@@ -443,6 +454,24 @@ local function handle_tool_result_run_close(run_id, body)
     nefor.log.info("agentic-loop: sub-graph completed", {
       run_id = run_id, status = effective_status,
     })
+    -- Surface the sub-graph terminal output (or error) literally in the
+    -- chat transcript. We pick `chat.message.append` because it goes
+    -- through the same persist+replay path as any other transcript
+    -- entry; render shape is plain text with a system style.
+    local visible_text
+    if effective_status == "success" then
+      visible_text = tostring(completion.output or "")
+    else
+      visible_text = "[spawn_graph errored] " ..
+                     tostring(completion.error or "unknown error")
+    end
+    if #visible_text > 0 then
+      emit("nefor-tui", {
+        kind = "chat.message.append",
+        role = "system",
+        text = visible_text,
+      })
+    end
     local text = format_deferred(completion)
     state.deferred_queue[#state.deferred_queue + 1] = { text = text }
     flush_deferred()

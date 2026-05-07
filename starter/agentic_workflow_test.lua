@@ -397,4 +397,64 @@ do
   end
 end
 
+-- ------------------------------------------------------------------
+-- Bug 4 regression — sub-graph completion emits the literal terminal
+-- output as a chat.message.append so the user can see what the
+-- sub-graph produced. The deferred relay text (verbose, model-facing)
+-- still rides as the next orchestrator-turn user message; the visible
+-- emit lands in the transcript before that.
+-- ------------------------------------------------------------------
+do
+  fresh_loop()
+  -- Drive the sub-graph dispatch path the way tool-gate's wrapper
+  -- does: queue_sub_graph + tool.result keyed by the minted run_id.
+  local terminal_text = "octopuses are eight-armed cephalopods; lighthouses are coastal sentinels."
+  local run_id = agentic_loop.queue_sub_graph(
+    { graph = { nodes = { { id = "terminal", reasoner = "terminal", args = {} } }, edges = {} } },
+    "gate-inner-1"
+  )
+  assert(type(run_id) == "string", "queue_sub_graph must return a run_id")
+  _test.calls_clear()
+
+  -- Drive the canonical sub-graph completion: a tool.result with id
+  -- == run_id and result.status == success carrying the terminal node
+  -- output table.
+  send_to_loop("reasoner-graph", {
+    kind   = "tool.result",
+    id     = run_id,
+    result = {
+      status  = "success",
+      results = { terminal = { output = { text = terminal_text } } },
+    },
+  })
+
+  local calls = decode_calls()
+  local visible = find_call(calls, "chat.message.append", "system", "octopuses are eight-armed")
+  assert(visible ~= nil,
+    "sub-graph completion must emit a chat.message.append carrying the literal terminal output; got "
+    .. json.encode(_test.calls()))
+  assert_eq(visible.target, "nefor-tui",
+    "visible sub-graph output must target nefor-tui")
+end
+
+-- Sub-graph failure surfaces an [spawn_graph errored] visible message.
+do
+  fresh_loop()
+  local run_id = agentic_loop.queue_sub_graph(
+    { graph = { nodes = { { id = "terminal", reasoner = "terminal", args = {} } }, edges = {} } },
+    "gate-inner-2"
+  )
+  _test.calls_clear()
+  send_to_loop("reasoner-graph", {
+    kind   = "tool.result",
+    id     = run_id,
+    result = { status = "error", results = { terminal = { error = "boom" } } },
+  })
+  local calls = decode_calls()
+  local err_msg = find_call(calls, "chat.message.append", "system", "spawn_graph errored")
+  assert(err_msg ~= nil,
+    "sub-graph failure must emit a [spawn_graph errored] system message; got "
+    .. json.encode(_test.calls()))
+end
+
 print("agentic_workflow_test: ok")
