@@ -1110,6 +1110,17 @@ fn layout_text_input(inst: &mut WidgetInstance, c: Constraints) -> Size {
     }
 
     let visible_lines = visible_line_count(&value, min_lines, max_lines, viewport_w);
+    // Multi-line: pin scroll_y so the cursor's wrapped row stays inside
+    // the visible window. Default behaviour matches Claude Code's input
+    // — the box grows up to `max_lines`, then internal-scrolls with the
+    // cursor anchored to the visible region. Without this, scroll_y
+    // stays at 0 forever and a paste / typing run past the cap shows
+    // the TOP of the buffer with the cursor scrolled off the bottom.
+    if max_lines > 1 && viewport_w > 0 {
+        if let InstanceState::TextInput(st) = &mut inst.state {
+            sync_multi_line_scroll_y(st, &value, viewport_w, visible_lines);
+        }
+    }
     let raw = Size {
         width: c.max_width,
         height: visible_lines.min(c.max_height),
@@ -1162,6 +1173,43 @@ fn sync_single_line_scroll_x(st: &mut crate::text_input::TextInputState, viewpor
 
 fn unicode_col_width(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// Multi-line cursor-tracking vertical scroll. Bumps `scroll_y` so the
+/// cursor's wrapped row stays inside `[scroll_y, scroll_y + visible)`.
+/// Mirrors [`sync_single_line_scroll_x`] on the y-axis.
+///
+/// Default-anchor-to-cursor: any time the cursor moves past either edge
+/// of the visible window (typing / pasting at end → past the bottom;
+/// arrow-up at the top of the window → past the top), we slide the
+/// window to put the cursor back in view. Above-cap content is hidden
+/// off the TOP, not the bottom — Claude-style.
+fn sync_multi_line_scroll_y(
+    st: &mut crate::text_input::TextInputState,
+    value: &str,
+    viewport_w: u16,
+    visible_lines: u16,
+) {
+    if visible_lines == 0 {
+        return;
+    }
+    let rows = crate::text_input::wrap_value(value, viewport_w);
+    let (cursor_row, _) = crate::text_input::cursor_in_wrap_for(value, &rows, st.cursor);
+    let total = rows.len() as u32;
+    let visible = visible_lines as u32;
+    let cursor_row_u = cursor_row as u32;
+    let scroll_y = st.scroll_y as u32;
+    // Clamp first to handle a value rewrite that shrank the buffer
+    // below the prior offset (e.g. submit clears value → buffer = 1
+    // row, scroll_y was 5 → must reset to 0).
+    let max_scroll = total.saturating_sub(visible);
+    let mut new_scroll = scroll_y.min(max_scroll);
+    if cursor_row_u < new_scroll {
+        new_scroll = cursor_row_u;
+    } else if cursor_row_u >= new_scroll + visible {
+        new_scroll = cursor_row_u + 1 - visible;
+    }
+    st.scroll_y = new_scroll.min(u16::MAX as u32) as u16;
 }
 
 fn paint_text_input(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
