@@ -143,9 +143,19 @@ impl<'a> Walker<'a> {
                 self.emit_str(&t, s);
             }
             Event::SoftBreak | Event::HardBreak => {
-                // Inline break inside a paragraph / heading: emit a
-                // space — wrap-time decisions handle layout.
-                self.emit_str(" ", Style::default());
+                // Terminal markdown convention (mdcat/glow/bat): a
+                // newline in the source becomes a real line break, not
+                // a space. CommonMark's HTML rendering folds soft
+                // breaks because CSS reflows the paragraph; in a TTY
+                // the wrap pass already handles word/char wrapping at
+                // the column budget, so collapsing soft breaks to
+                // spaces erases the source's row structure (e.g. a
+                // bash tool output relayed verbatim into assistant
+                // text — `total 16\nfile1\nfile2\n…` would render as
+                // one wrapped paragraph). Emit `\n`; the layout pass
+                // splits on it before applying the wrap mode.
+                self.emit_str("\n", Style::default());
+                self.at_line_start = true;
             }
             Event::Rule => {
                 // Render `---` as a real horizontal rule across the pane
@@ -1058,6 +1068,28 @@ mod tests {
         let s: String = r.iter().map(|c| c.ch).collect();
         assert!(s.contains("first\n"));
         assert!(s.contains("second"));
+    }
+
+    /// Single newlines inside a paragraph land as real `\n` rows, not
+    /// spaces. Bug-A regression: when a tool's multi-line output is
+    /// relayed verbatim into assistant text (`"Files in cwd:\n<bash
+    /// output with embedded \n>"`), the previous CommonMark-spec soft-
+    /// break-as-space behaviour collapsed every line into one wrapped
+    /// paragraph. Terminal markdown (mdcat / glow / bat) renders soft
+    /// breaks as line breaks and lets the wrap pass do its own
+    /// word/char wrapping; that's the convention this asserts.
+    #[test]
+    fn soft_break_in_paragraph_emits_newline_not_space() {
+        let r = render_to_styled_chars("line one\nline two", None);
+        let s: String = r.iter().map(|c| c.ch).collect();
+        assert!(
+            s.contains("line one\nline two"),
+            "single-newline paragraph should keep the row break, got {s:?}"
+        );
+        assert!(
+            !s.contains("line one line two"),
+            "soft break collapsed to space — bug-A regression: {s:?}"
+        );
     }
 
     #[test]
