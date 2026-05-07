@@ -126,12 +126,29 @@ function M.spawn_spec(gate_name, command)
           local raw_err = env.body.error
           local err_bool = raw_err == true
               or (type(raw_err) == "string" and raw_err ~= "")
-          local out_str = type(env.body.output) == "string" and env.body.output or ""
-          al().fire_tool_end_observers(model_call_id, out_str, err_bool)
+          -- Mirror openai-provider's `chat_tool_end_body` contract
+          -- (run_one_tool_call): when the result carries an error
+          -- string, the chat-side `output` field carries that error
+          -- message so the tool block can render WHY it errored
+          -- ("tool `bash` denied by user", "denied by gate policy",
+          -- "unknown tool `…`"). Earlier the wrapper dropped the
+          -- error string and emitted output="" — the chat.lua
+          -- reducer then rendered an empty "output:" line under the
+          -- bash block on deny (Bug B). Fall back to "" only when
+          -- there's truly nothing to surface.
+          local payload_output
+          if type(env.body.output) == "string" then
+            payload_output = env.body.output
+          elseif type(raw_err) == "string" then
+            payload_output = raw_err
+          else
+            payload_output = ""
+          end
+          al().fire_tool_end_observers(model_call_id, payload_output, err_bool)
           envelope.emit_to("nefor-tui", {
             kind   = "chat.tool.end",
             id     = model_call_id,
-            output = out_str,
+            output = payload_output,
             error  = err_bool,
           })
           entry.pending_count = entry.pending_count - 1

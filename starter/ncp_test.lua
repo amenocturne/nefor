@@ -1255,6 +1255,50 @@ local function test_replay_window_suppresses_replayed_tool_invoke_in_same_batch(
     "replay_window.active() must be false after the replay.end entry's to_plugin pass")
 end
 
+-- Bug B regression — when tool-gate emits `tool.result { id, error }`
+-- (deny / policy / unknown-tool path) the wrapper's `from_plugin`
+-- correlates the tool_id back to the executor pending entry and emits
+-- a `chat.tool.end` to nefor-tui. The earlier shape dropped the error
+-- string and emitted `output = ""`, leaving the chat surface to
+-- render an empty `output:` row under the tool block — visually
+-- indistinguishable from "still running" for the user. Mirror the
+-- openai-provider `chat_tool_end_body` contract: when the result
+-- carries an error, the chat-side `output` field carries the error
+-- message so the tool block can label it `error:` and surface what
+-- happened.
+local function test_tool_gate_wrapper_forwards_error_message_to_chat_tool_end()
+  reset()
+  reset_loop()
+  _test.set_plugins({ "tool-gate", "nefor-tui" })
+  ready_each({ "tool-gate", "nefor-tui" })
+  spawn_tool_gate_wrapper()
+
+  -- Register a pending tool-executor entry the wrapper can correlate
+  -- back to. Mirrors the reasoner's `tool-executor` dispatch shape.
+  agentic_loop_mod.track_tool_executor(
+    "run-1", "node-1", "firing-1",
+    { { id = "call_mock_ls", name = "bash", arguments = { command = "ls -la" } } },
+    { "tool-1" }
+  )
+  _test.calls_clear()
+
+  drive_inbound("tool-gate", make_event({
+    kind  = "tool.result",
+    id    = "tool-1",
+    error = "tool `bash` denied by user",
+  }))
+
+  local delivered = find_deliver_to("nefor-tui", "chat.tool.end")
+  assert_true(delivered ~= nil,
+    "tool-gate wrapper must emit chat.tool.end on tool.result correlation")
+  assert_eq(delivered.body.id, "call_mock_ls",
+    "chat.tool.end carries the model_call_id from the executor entry")
+  assert_eq(delivered.body.error, true,
+    "error flag must be true when the result carries an error string")
+  assert_eq(delivered.body.output, "tool `bash` denied by user",
+    "Bug B: error message must land in the `output` field so the chat tool block can render it under `error:` instead of an empty `output:` line")
+end
+
 -- Pin the symmetric guarantee: nefor-tui DOES still receive replayed
 -- envelopes during the window, because the TUI surface needs them to
 -- repaint the transcript on resume. The chat.lua reducer gates side
@@ -1332,6 +1376,7 @@ local tests = {
   { name = "tool_permission_response_dropped_during_replay", fn = test_tool_permission_response_dropped_during_replay },
   { name = "replay_window_suppresses_replayed_tool_invoke_in_same_batch", fn = test_replay_window_suppresses_replayed_tool_invoke_in_same_batch },
   { name = "replay_window_does_not_starve_nefor_tui", fn = test_replay_window_does_not_starve_nefor_tui },
+  { name = "tool_gate_wrapper_forwards_error_message_to_chat_tool_end", fn = test_tool_gate_wrapper_forwards_error_message_to_chat_tool_end },
 }
 
 for _, t in ipairs(tests) do

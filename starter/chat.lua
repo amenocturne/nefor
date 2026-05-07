@@ -718,7 +718,18 @@ local function tool_expanded(entry)
   if entry.output == nil and not entry.error then
     rows[#rows + 1] = tui.text { content = "  running...", style = STYLE.footer, wrap = "none" }
   else
-    rows[#rows + 1] = tui.text { content = "  output:", style = STYLE.footer, wrap = "none" }
+    -- Label the trailing block by terminal status. `error:` (red) for
+    -- the deny / policy / unknown-tool / timeout paths so the block
+    -- reads as a denial rather than an empty `output:` (Bug B); the
+    -- tool-gate wrapper now puts the error message into the `output`
+    -- field so it lands here instead of being dropped on the floor.
+    local label, label_style
+    if entry.error then
+      label, label_style = "  error:", STYLE.status_danger
+    else
+      label, label_style = "  output:", STYLE.footer
+    end
+    rows[#rows + 1] = tui.text { content = label, style = label_style, wrap = "none" }
     if entry.output and #entry.output > 0 then
       local out_text = entry.output
       if entry.name == "spawn_graph" then

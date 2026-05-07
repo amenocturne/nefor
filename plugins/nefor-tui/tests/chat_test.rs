@@ -603,7 +603,60 @@ fn ctrl_o_toggles_expanded_details() {
     );
 }
 
-// Force the renderer to repaint and return the full framebuffer text.
+/// Bug-B regression: a denied tool call (`chat.tool.end` with
+/// `error = true`) flips the expanded tool block to a clearly denied
+/// state — `error:` label in red, then the error message — instead
+/// of leaving an empty `output:` line that reads as "running...
+/// finished but produced nothing". The error message comes through in
+/// the `output` field on the chat-side wire (mirroring openai-
+/// provider's `chat_tool_end_body` contract); the tool-gate Lua
+/// wrapper now preserves it instead of zeroing it on the way through.
+#[test]
+fn denied_tool_call_renders_error_state_not_empty_output() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.tool.start",
+            "id": "call_mock_ls",
+            "name": "bash",
+            "input": { "command": "ls -la" },
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.tool.end",
+            "id": "call_mock_ls",
+            "output": "tool `bash` denied by user",
+            "error": true,
+        }),
+    );
+
+    // Expanded view: clearly labelled as `error:` with the message.
+    engine.handle_key(key("ctrl_o")).expect("ctrl_o");
+    let _ = render_str(&mut engine);
+    let out = engine.snapshot();
+    assert!(
+        !out.contains("running..."),
+        "denied tool block should not show 'running...' (Bug B regression): {out:?}"
+    );
+    assert!(
+        out.contains("error:"),
+        "expanded view should label trailing block as `error:` on deny: {out:?}"
+    );
+    assert!(
+        out.contains("denied by user"),
+        "expanded view should surface the error message: {out:?}"
+    );
+    assert!(
+        !out.contains("output:"),
+        "expanded view should NOT show `output:` label when error is set: {out:?}"
+    );
+}
 // Plain `render_if_dirty` only emits a *diff* against the prior frame,
 // so a check on its returned bytes misses cells that didn't change. The
 // engine snapshot returns every cell verbatim, which is what state-flip
