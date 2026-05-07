@@ -210,6 +210,25 @@ local function pick_response_for(chat_id)
     end
   end
 
+  -- Slow-stream regression hook (Bug 1 / commit 0941531). Triggered by
+  -- the literal substring "SLOW_STREAM_REGRESSION_". The mock blocks
+  -- inside chat.complete for ~1.2s before emitting — long enough that
+  -- the old `DEFAULT_ACK_DEADLINE_MS = 5s` watchdog window plus the
+  -- nominal-ack semantics would have started firing for a real model,
+  -- and definitely longer than any per-chunk pacing budget. Without
+  -- the watchdog the run completes cleanly. Kept short enough that
+  -- the test stays cheap; the regression is "no spurious timeout
+  -- error", not a specific wall-clock target.
+  if string.find(last_user, "SLOW_STREAM_REGRESSION_") then
+    -- Coarse sleep — `os.execute` is fine here because the mock
+    -- already runs in its own subprocess.
+    os.execute("sleep 1.2")
+    return {
+      text = "slow regression payload acknowledged",
+      finish_reason = "stop",
+    }
+  end
+
   return {
     text = "[mock provider: no canned match for: " .. utf8_truncate(last_user, 60) .. "]",
     finish_reason = "stop",

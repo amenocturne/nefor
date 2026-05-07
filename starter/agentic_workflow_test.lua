@@ -335,4 +335,66 @@ do
   end
 end
 
+-- ------------------------------------------------------------------
+-- Bug 3 regression — chat.input.submit during replay must not
+-- re-spawn an orchestrator graph. Sessions replays the user's
+-- original submit envelope when a session resumes; agentic-loop
+-- already saw the answer in the prior run, so re-firing the
+-- handler would spawn a fresh graph and re-invoke the model on
+-- exactly the same prompt. State is rebuilt by pure-Lua actors
+-- watching the bus markers; replayed wire envelopes are observation
+-- only, not new orchestration triggers.
+-- ------------------------------------------------------------------
+do
+  fresh_loop()
+  _test.fire_bus("sessions.replay.start", { session_id = "resumed", count = 0 })
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "first prompt" })
+  for _, c in ipairs(decode_calls()) do
+    assert(not (c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"),
+      "chat.input.submit during replay must NOT dispatch a fresh spawn_graph; got "
+      .. json.encode(c.body))
+    assert(not (c.body.kind == "chat.message.append" and c.body.role == "user"),
+      "chat.input.submit during replay must NOT echo a user message; got "
+      .. json.encode(c.body))
+  end
+  _test.fire_bus("sessions.replay.end", { session_id = "resumed" })
+
+  -- After replay ends, the actor returns to live behaviour: a fresh
+  -- submit dispatches normally. Locks in that the gate is window-
+  -- scoped, not a hard mute.
+  _test.calls_clear()
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "post-replay" })
+  local saw_dispatch = false
+  for _, c in ipairs(decode_calls()) do
+    if c.body.kind == "tool.invoke" and c.body.name == "spawn_graph" then
+      saw_dispatch = true
+    end
+  end
+  assert(saw_dispatch,
+    "after replay.end, live chat.input.submit must dispatch a spawn_graph again")
+end
+
+-- chat.reset / chat.interrupt_all / chat.model.set during replay are
+-- also gated. Same reasoning: they would mutate state that's already
+-- being rebuilt from the recorded log.
+do
+  fresh_loop()
+  _test.fire_bus("sessions.replay.start", { session_id = "resumed", count = 0 })
+  send_to_loop("nefor-tui", { kind = "chat.reset" })
+  send_to_loop("nefor-tui", { kind = "chat.interrupt_all" })
+  send_to_loop("nefor-tui", { kind = "chat.model.set", provider = "ollama", model = "should-not-stick" })
+  _test.fire_bus("sessions.replay.end", { session_id = "resumed" })
+
+  -- model.set was gated, so config.model must not have changed to the
+  -- replay-injected value.
+  local g = agentic_loop.build_template("hi")
+  for _, n in ipairs(g.nodes or {}) do
+    if n.id == "wrap" and type(n.args) == "table" then
+      assert(n.args.model ~= "should-not-stick",
+        "chat.model.set during replay must not mutate config.model; saw "
+        .. tostring(n.args.model))
+    end
+  end
+end
+
 print("agentic_workflow_test: ok")

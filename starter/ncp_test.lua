@@ -1085,8 +1085,119 @@ local function test_engine_plugin_failed_buffers_until_chat_readies()
 end
 
 -- ------------------------------------------------------------------
--- driver
+-- Bug 2 regression — tool.permission_response wire-side delivery
 -- ------------------------------------------------------------------
+--
+-- The chat unit-test (nefor-tui chat_test.rs) verifies that pressing
+-- the approve key emits `{kind=tool.permission_response, decision="approve"}`
+-- on the egress queue. The Rust unit-test in plugins/tool-gate/src/main.rs
+-- verifies that the binary's `handle_permission_response` calls
+-- forward_to_source when decision="approve". The wire between them —
+-- ncp.lua's dispatch + tool-gate's wrapper to_plugin — has no
+-- intermediate transform: the response must round-trip from the chat's
+-- bus emission to tool-gate's stdin verbatim, with the `decision` field
+-- intact. This test locks that contract.
+--
+-- Two paths matter independently:
+--   * the chat's approve emission lands at tool-gate's stdin with
+--     `decision = "approve"`.
+--   * the chat's deny emission lands with `decision = "deny"`. (Pinning
+--     both stops a future "swap approve/deny somewhere" regression
+--     from passing this test by accident.)
+
+local tool_gate_mod = require("tool-gate")
+
+local function spawn_tool_gate_wrapper()
+  local spec = tool_gate_mod.spawn_spec("tool-gate", { "/bin/true" })
+  -- Skip the engine-spawn round-trip — register the transforms
+  -- directly so we don't try to fork a real binary.
+  ncp._test_set_transforms("tool-gate", {
+    from_plugin = spec.from_plugin,
+    to_plugin   = spec.to_plugin,
+  })
+end
+
+local function find_deliver_to(target, kind)
+  for _, c in ipairs(_test.calls()) do
+    if c.target == target then
+      local d = json.decode(c.payload)
+      if d and d.body and d.body.kind == kind then
+        return d
+      end
+    end
+  end
+  return nil
+end
+
+local function test_tool_permission_response_approve_round_trips_to_gate()
+  reset()
+  _test.set_plugins({ "tool-gate", "nefor-tui" })
+  ready_each({ "tool-gate", "nefor-tui" })
+  spawn_tool_gate_wrapper()
+  _test.calls_clear()
+
+  drive_inbound("nefor-tui", make_event({
+    kind     = "tool.permission_response",
+    id       = "outer-id-7",
+    decision = "approve",
+  }))
+
+  local delivered = find_deliver_to("tool-gate", "tool.permission_response")
+  assert_true(delivered ~= nil,
+    "tool.permission_response must reach tool-gate's stdin")
+  assert_eq(delivered.body.decision, "approve",
+    "decision must round-trip as `approve` — bug 2 regression")
+  assert_eq(delivered.body.id, "outer-id-7",
+    "id must round-trip unchanged so tool-gate matches awaiting_approval")
+end
+
+local function test_tool_permission_response_deny_round_trips_to_gate()
+  reset()
+  _test.set_plugins({ "tool-gate", "nefor-tui" })
+  ready_each({ "tool-gate", "nefor-tui" })
+  spawn_tool_gate_wrapper()
+  _test.calls_clear()
+
+  drive_inbound("nefor-tui", make_event({
+    kind     = "tool.permission_response",
+    id       = "outer-id-9",
+    decision = "deny",
+  }))
+
+  local delivered = find_deliver_to("tool-gate", "tool.permission_response")
+  assert_true(delivered ~= nil,
+    "tool.permission_response (deny) must reach tool-gate's stdin")
+  assert_eq(delivered.body.decision, "deny",
+    "deny must round-trip as `deny`, not silently flipped to approve")
+end
+
+-- Pin that the wrapper's replay-window guard suppresses delivery while
+-- a session is replaying — a stale approve from the recorded log must
+-- not double-fire the Rust gate's awaiting_approval lookup. Captures
+-- the per-wrapper replay-skip contract introduced by the Phase-4.5
+-- callback refactor.
+local function test_tool_permission_response_dropped_during_replay()
+  reset()
+  _test.set_plugins({ "tool-gate", "nefor-tui" })
+  ready_each({ "tool-gate", "nefor-tui" })
+  spawn_tool_gate_wrapper()
+
+  -- Open the replay window on the bus the way sessions does.
+  local replay_window = require("lib.replay_window")
+  replay_window._set(true)
+  _test.calls_clear()
+
+  drive_inbound("nefor-tui", make_event({
+    kind     = "tool.permission_response",
+    id       = "outer-id-replay",
+    decision = "approve",
+  }))
+
+  local delivered = find_deliver_to("tool-gate", "tool.permission_response")
+  assert_true(delivered == nil,
+    "replay window must suppress permission_response delivery to the gate")
+  replay_window._set(false)
+end
 
 local tests = {
   { name = "ready_triggers_ready_ok_reply", fn = test_ready_triggers_ready_ok_reply },
@@ -1126,6 +1237,9 @@ local tests = {
   { name = "engine_plugin_failed_routes_to_chat_popup", fn = test_engine_plugin_failed_routes_to_chat_popup },
   { name = "engine_plugin_failed_drops_when_chat_not_connected", fn = test_engine_plugin_failed_drops_when_chat_not_connected },
   { name = "engine_plugin_failed_buffers_until_chat_readies", fn = test_engine_plugin_failed_buffers_until_chat_readies },
+  { name = "tool_permission_response_approve_round_trips_to_gate", fn = test_tool_permission_response_approve_round_trips_to_gate },
+  { name = "tool_permission_response_deny_round_trips_to_gate", fn = test_tool_permission_response_deny_round_trips_to_gate },
+  { name = "tool_permission_response_dropped_during_replay", fn = test_tool_permission_response_dropped_during_replay },
 }
 
 for _, t in ipairs(tests) do
