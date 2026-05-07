@@ -4,7 +4,7 @@
 //! - the parsed [`Graph`]
 //! - per-firing [`NodeFiring`] records: a node may fire multiple times
 //!   (cyclic case) and each firing carries its own `firing_id`,
-//!   `prev_state`, ack flag, and result.
+//!   `prev_state`, completion flag, and result.
 //! - per-node [`NodeStatus`]: the *latest* firing's terminal status —
 //!   used by `is_runnable` and run-completion bookkeeping.
 //! - per-node `current_state`: the latest completed firing's `next_state`,
@@ -15,9 +15,12 @@
 //!
 //! This module is pure: it does not touch the bus. The main loop owns the
 //! mpsc sender and calls into [`Scheduler::handle_submit`] /
-//! [`Scheduler::handle_node_result`] / [`Scheduler::handle_node_ack`] /
-//! [`Scheduler::handle_ack_timeout`], collecting bus events to emit from
+//! [`Scheduler::handle_node_result`], collecting bus events to emit from
 //! the returned [`Effects`].
+//!
+//! Dispatch is fire-and-forget: a firing closes on `tool.result` arrival
+//! or on `graph.cancel` — there is no result-arrival deadline. If a
+//! reasoner never replies, the firing stays open indefinitely.
 //!
 //! ## Lifecycle keying
 //!
@@ -32,8 +35,8 @@
 //! The run completes when:
 //! 1. Every node has at least one completed firing (output / error /
 //!    skipped), AND
-//! 2. There are no in-flight firings (every dispatched firing has either
-//!    ack-failed or completed), AND
+//! 2. There are no in-flight firings (every dispatched firing has
+//!    completed), AND
 //! 3. No node is currently runnable (the dataflow has reached its
 //!    fixpoint).
 //!
@@ -74,7 +77,7 @@ pub enum NodeStatus {
     /// Reasoner returned `output` successfully.
     Output(Value),
     /// Reasoner returned `error` (or scheduler synthesized a failure,
-    /// e.g. ack timeout, reasoner not connected).
+    /// e.g. reasoner not connected).
     Error(String),
     /// Skipped due to abort-mode short-circuit (never dispatched).
     /// Counts as failure for the run's final status.
@@ -122,8 +125,10 @@ pub struct NodeFiring {
     #[cfg_attr(not(test), allow(dead_code))]
     pub prev_state: Value,
     /// True once a `tool.result` arrived for this firing OR the
-    /// scheduler synthesized a failure (ack timeout, reasoner not
-    /// connected).
+    /// scheduler synthesized a failure (e.g. reasoner not connected at
+    /// dispatch time). Drives the post-completion duplicate-result
+    /// drop guard in `handle_node_result` and the run-completion
+    /// fixpoint check.
     pub completed: bool,
 }
 
@@ -167,8 +172,6 @@ pub struct RunState {
     pub current_state: HashMap<NodeId, Value>,
     /// Failure policy from submit.
     pub on_failure: OnNodeFailure,
-    /// Per-dispatch ack deadline (ms).
-    pub ack_deadline_ms: u64,
     /// True once a node errored under abort mode. Suppresses further
     /// dispatch; not-yet-dispatched nodes are marked skipped immediately.
     pub aborted: bool,
@@ -212,8 +215,7 @@ pub struct RunState {
     /// Mirrors the pattern used by `pending_fanouts` (combinator
     /// invocations) and `RunPhase::PendingTypecheck { query_id }`
     /// (combinator queries). Entries are inserted at dispatch time and
-    /// removed when the matching `tool.result` (or synthesized
-    /// ack-timeout failure) lands.
+    /// removed when the matching `tool.result` lands.
     pub firing_by_request_id: HashMap<String, (NodeId, FiringId)>,
 }
 
@@ -1230,7 +1232,6 @@ impl Scheduler {
                 firings: HashMap::new(),
                 current_state: HashMap::new(),
                 on_failure: submission.on_failure,
-                ack_deadline_ms: submission.ack_deadline_ms,
                 aborted: false,
                 pending_fanouts: HashMap::new(),
                 fanout_seeded: HashMap::new(),
@@ -1270,7 +1271,6 @@ impl Scheduler {
             firings: HashMap::new(),
             current_state: HashMap::new(),
             on_failure: submission.on_failure,
-            ack_deadline_ms: submission.ack_deadline_ms,
             aborted: false,
             pending_fanouts: HashMap::new(),
             fanout_seeded: HashMap::new(),
@@ -1424,71 +1424,6 @@ impl Scheduler {
             dispatch_all_runnable(state, peers, &mut effects);
             if run_is_done(state) {
                 if let Some(taken) = guard.remove(&run_id) {
-                    completed_run = Some(taken);
-                }
-            }
-        }
-        if let Some(state) = completed_run {
-            let status = final_status(&state);
-            let results = build_results(&state);
-            effects.push(Effect::RunComplete {
-                run_id: state.run_id.clone(),
-                status,
-                results,
-            });
-        }
-        effects
-    }
-
-    /// Handle an ack-deadline expiry. The main loop arms a timer per
-    /// dispatch and calls this on expiry; if the firing has been acked
-    /// in the meantime this is a no-op, otherwise we synthesize a
-    /// failure on that firing and apply the policy.
-    pub fn handle_ack_timeout(
-        runs: &Runs,
-        peers: &PeerSet,
-        run_id: &str,
-        firing_id: &str,
-    ) -> Effects {
-        let mut effects = Effects::new();
-        let mut completed_run: Option<RunState> = None;
-        {
-            let mut guard = runs.lock().expect("runs mutex poisoned");
-            let state = match guard.get_mut(run_id) {
-                Some(s) => s,
-                None => return effects, // run was cancelled or already completed
-            };
-            // Find the firing.
-            let mut owner_node: Option<String> = None;
-            for (nid, firings) in state.firings.iter_mut() {
-                if let Some(f) = firings.iter_mut().find(|f| f.firing_id == firing_id) {
-                    if f.completed {
-                        return effects; // late timer; ignore
-                    }
-                    f.completed = true;
-                    owner_node = Some(nid.clone());
-                    break;
-                }
-            }
-            let node_id = match owner_node {
-                Some(n) => n,
-                None => return effects, // unknown firing; ignore
-            };
-            // Synthesized `tool.result { id=firing_id, error: "ack_timeout" }`
-            // path (per wire-spec D1): the watchdog manufactures a failure
-            // for this firing without an envelope ever hitting the bus.
-            // Drop the request-id correlation entry — a real
-            // `tool.result` arriving later for this id is a duplicate
-            // and gets dropped by the post-completion guard.
-            state.firing_by_request_id.remove(firing_id);
-            state.completed.insert(
-                node_id.clone(),
-                NodeStatus::Error("reasoner ack timeout".to_owned()),
-            );
-            propagate_after_completion(state, &node_id, peers, &mut effects);
-
-            if run_is_done(state) {
-                if let Some(taken) = guard.remove(run_id) {
                     completed_run = Some(taken);
                 }
             }
@@ -2414,47 +2349,6 @@ mod tests {
         // resolve_request_id can no longer find it — same effect as
         // "entry cleared," verified one level up.
         assert!(Scheduler::resolve_request_id(&runs, &firing_id).is_none());
-    }
-
-    #[test]
-    fn ack_timeout_fails_dispatch_and_applies_policy() {
-        let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
-        let peers = peers_with(&["r"]);
-        // Two-node abort chain: ack timeout on n1 should skip n2.
-        let g = json!({
-            "nodes": [
-                {"id": "n1", "reasoner": "r", "args": {}},
-                {"id": "n2", "reasoner": "r", "args": {}}
-            ],
-            "edges": [{"from": "n1", "to": "n2"}]
-        });
-        let outcome = Scheduler::handle_submit(&runs, &peers, &submit_body("run-to", g, None));
-        let e = match outcome {
-            SubmitOutcome::Accepted(e) => e.into_vec(),
-            _ => panic!("accepted"),
-        };
-        let f1 = first_dispatch_firing_id(&e);
-
-        let r = Scheduler::handle_ack_timeout(&runs, &peers, "run-to", &f1).into_vec();
-        let complete = r
-            .iter()
-            .find(|e| matches!(e, Effect::RunComplete { .. }))
-            .expect("run_complete on timeout");
-        match complete {
-            Effect::RunComplete {
-                status, results, ..
-            } => {
-                assert_eq!(*status, RunStatus::Failure);
-                let n1_err = results
-                    .get("n1")
-                    .and_then(|v| v.get("error"))
-                    .and_then(Value::as_str)
-                    .unwrap();
-                assert!(n1_err.contains("ack timeout"));
-                assert_eq!(results.get("n2"), Some(&json!({"skipped": true})));
-            }
-            _ => unreachable!(),
-        }
     }
 
     #[test]

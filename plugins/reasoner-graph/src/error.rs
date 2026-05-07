@@ -11,7 +11,7 @@ use nefor_protocol::ParseError;
 /// results in `graph.run_complete` (under `_error`, `_typecheck`,
 /// `_missing_combinators`, etc.) and as node-level errors when the
 /// scheduler manufactures a failure (e.g. reasoner not connected at
-/// dispatch, ack timeout).
+/// dispatch).
 ///
 /// Closed set by design: extending it is a protocol change. Currently the
 /// state machine emits free-form `error` strings; this enum is the
@@ -26,10 +26,6 @@ pub enum ErrorCode {
     MalformedGraph,
     /// A node became runnable but its named reasoner is not connected.
     ReasonerNotConnected,
-    /// The reasoner did not reply with `tool.result` within
-    /// `ack_deadline_ms` of dispatch. (Tool contract has no acks; this
-    /// is the deadline-on-result watchdog per wire-spec D1.)
-    AckTimeout,
     /// Submit-time type check failed (slot mismatches, duplicate output
     /// types in fanout multiset, etc.). Reported under synthetic
     /// `_typecheck` node. Reserved — full implementation lands with T6.
@@ -48,7 +44,6 @@ impl ErrorCode {
         match self {
             Self::MalformedGraph => "malformed_graph",
             Self::ReasonerNotConnected => "reasoner_not_connected",
-            Self::AckTimeout => "ack_timeout",
             Self::TypecheckFailed => "typecheck_failed",
             Self::MissingCombinators => "missing_combinators",
         }
@@ -96,7 +91,6 @@ mod tests {
             ErrorCode::ReasonerNotConnected.as_wire(),
             "reasoner_not_connected"
         );
-        assert_eq!(ErrorCode::AckTimeout.as_wire(), "ack_timeout");
         assert_eq!(ErrorCode::TypecheckFailed.as_wire(), "typecheck_failed");
         assert_eq!(
             ErrorCode::MissingCombinators.as_wire(),

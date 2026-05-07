@@ -1,15 +1,14 @@
 //! reasoner-graph — NCP v0.1 plugin: dumb scheduler for graphs of reasoners.
 //!
 //! Renamed from `dag-scheduler`. Cycles are now allowed (it's a graph, not
-//! a DAG); per-firing lifecycle bookkeeping; ack-deadline + indefinite
-//! result wait; reasoner state carry via `prev_state` / `next_state`. See
-//! the parent spec at
+//! a DAG); per-firing lifecycle bookkeeping; fire-and-forget dispatch
+//! (cancellation via `graph.cancel`); reasoner state carry via
+//! `prev_state` / `next_state`. See the parent spec at
 //! `projects/software/active/nefor/specs/nefor-agent-and-reasoner-types-spec.md`
 //! §3 for the full contract.
 //!
 //! Layering mirrors `nefor-combinators`:
-//! - `main.rs` — entry, ready handshake, dispatch loop, bus encoding,
-//!   per-firing ack-timeout watchdogs.
+//! - `main.rs` — entry, ready handshake, dispatch loop, bus encoding.
 //! - `ncp.rs`  — stdio transport + handshake helpers.
 //! - `error.rs` — typed errors and wire `ErrorCode`.
 //! - `graph.rs` — graph parsing (cycles allowed; `fanout` is parsed but
@@ -24,14 +23,13 @@ mod state;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
 use crate::error::ReasonerGraphError;
-use crate::state::{Effect, FiringId, PeerSet, Runs, Scheduler, SubmitOutcome};
+use crate::state::{Effect, PeerSet, Runs, Scheduler, SubmitOutcome};
 
 /// NCP version this plugin speaks.
 const PROTOCOL_VERSION: &str = "0.1";
@@ -168,7 +166,7 @@ async fn dispatch_event(
             let effects = match outcome {
                 SubmitOutcome::Accepted(e) | SubmitOutcome::Rejected(e) => e,
             };
-            emit_effects(runs, peers, out_tx, effects.into_vec()).await?;
+            emit_effects(out_tx, effects.into_vec()).await?;
         }
         "tool.result" => {
             // Inbound node-firing reply on the canonical contract.
@@ -191,7 +189,7 @@ async fn dispatch_event(
                     // Either belongs to another tool (combinator
                     // queries/invokes use `combinators.*.result`, not
                     // `tool.result`) or the firing was already cancelled
-                    // / completed via the watchdog. Silent drop.
+                    // (via `graph.cancel`) or completed. Silent drop.
                     tracing::debug!(id = %id, "tool.result for unknown request_id; dropping");
                     return Ok(());
                 }
@@ -200,7 +198,7 @@ async fn dispatch_event(
                 synthesize_node_result(&run_id, &node_id, &firing_id, body);
             let snapshot = peers.lock().expect("peers mutex poisoned").clone();
             let effects = Scheduler::handle_node_result(runs, &snapshot, &synthesized);
-            emit_effects(runs, peers, out_tx, effects.into_vec()).await?;
+            emit_effects(out_tx, effects.into_vec()).await?;
         }
         "graph.cancel" => {
             // Stage 1: accept-and-drop. The reserved kind is honored;
@@ -214,14 +212,14 @@ async fn dispatch_event(
             // `_missing_combinators` failure.
             let snapshot = peers.lock().expect("peers mutex poisoned").clone();
             let effects = Scheduler::handle_query_result(runs, &snapshot, body);
-            emit_effects(runs, peers, out_tx, effects.into_vec()).await?;
+            emit_effects(out_tx, effects.into_vec()).await?;
         }
         "combinators.invoke.result" => {
             // Reply to a runtime fanout dispatch. Routes typed outputs
             // to outgoing edges by `edge.type` matching.
             let snapshot = peers.lock().expect("peers mutex poisoned").clone();
             let effects = Scheduler::handle_invoke_result(runs, &snapshot, body);
-            emit_effects(runs, peers, out_tx, effects.into_vec()).await?;
+            emit_effects(out_tx, effects.into_vec()).await?;
         }
         _ => {
             // Not for us.
@@ -264,89 +262,20 @@ fn synthesize_node_result(
     m
 }
 
-/// Drain a list of [`Effect`]s onto the outbound mpsc. Collects any
-/// dispatched `(run_id, firing_id, ack_deadline_ms)` triples so the
-/// caller can spawn ack-timeout watchdogs.
+/// Drain a list of [`Effect`]s onto the outbound mpsc.
+///
+/// Pure fire-and-forget: dispatches are emitted and that's it. If a
+/// reasoner never replies with `tool.result`, the firing stays open
+/// indefinitely; cancellation goes through `graph.cancel`.
 async fn emit_effects(
-    runs: &Runs,
-    peers: &Arc<Mutex<PeerSet>>,
     out_tx: &mpsc::Sender<PluginOutgoing>,
     effects: Vec<Effect>,
 ) -> Result<(), ReasonerGraphError> {
     for e in effects {
-        // Snapshot the (run_id, firing_id, deadline_ms) BEFORE consuming
-        // the effect so we can arm a watchdog after the dispatch is on
-        // the wire.
-        let dispatched_meta = if let Effect::DispatchNode {
-            run_id, firing_id, ..
-        } = &e
-        {
-            let deadline = runs
-                .lock()
-                .expect("runs mutex poisoned")
-                .get(run_id)
-                .map(|s| s.ack_deadline_ms);
-            deadline.map(|d| (run_id.clone(), firing_id.clone(), d))
-        } else {
-            None
-        };
-
         let body = effect_to_body(e);
         send_event(out_tx, body).await?;
-
-        if let Some((run_id, firing_id, deadline_ms)) = dispatched_meta {
-            spawn_ack_watchdog(
-                runs.clone(),
-                peers.clone(),
-                out_tx.clone(),
-                run_id,
-                firing_id,
-                deadline_ms,
-            );
-        }
     }
     Ok(())
-}
-
-/// Spawn a watchdog that fires after `deadline_ms` and asks the
-/// scheduler to handle an ack-timeout. If the firing has been acked or
-/// already completed, the scheduler call is a no-op.
-fn spawn_ack_watchdog(
-    runs: Runs,
-    peers: Arc<Mutex<PeerSet>>,
-    out_tx: mpsc::Sender<PluginOutgoing>,
-    run_id: String,
-    firing_id: FiringId,
-    deadline_ms: u64,
-) {
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(deadline_ms)).await;
-        let snapshot = peers.lock().expect("peers mutex poisoned").clone();
-        let effects =
-            Scheduler::handle_ack_timeout(&runs, &snapshot, &run_id, &firing_id).into_vec();
-        // Manual drain (we don't have access to `emit_effects` here
-        // without recursion; effects from a timeout are necessarily
-        // propagation + run-completion events, which don't trigger
-        // further dispatches that need watchdogs in this code path —
-        // any propagation re-dispatches would themselves be Dispatch
-        // effects, which means we'd need to arm new watchdogs. Handle
-        // that by recursing into the scheduler-driven dispatch path
-        // for completeness.
-        for e in effects {
-            // Ack-timeout effects are typically RunComplete (when
-            // the timeout collapses the run) or further Dispatches
-            // (when on_node_failure=continue propagates). For
-            // simplicity emit straight without re-arming watchdogs;
-            // a continue-policy follow-up dispatch will be re-armed
-            // by the next propagating handler call. (Revisit if
-            // needed when end-to-end tests prove the gap matters.)
-            let body = effect_to_body(e);
-            if out_tx.send(PluginOutgoing::event(body)).await.is_err() {
-                tracing::warn!(run_id = %run_id, "writer closed during ack-timeout drain");
-                return;
-            }
-        }
-    });
 }
 
 fn effect_to_body(effect: Effect) -> Map<String, Value> {
