@@ -47,18 +47,36 @@ fn starter_ncp_unit_tests() {
     }
 }
 
-/// Install a fake `nefor.engine` that records `send` calls and reads its
-/// plugin list from a `_test`-owned slot. Also installs the `_test` global
-/// the Lua tests use to reset state and inspect recorded calls.
+/// Install a fake `nefor.engine` that records `send` and `deliver` calls
+/// and reads its plugin list from a `_test`-owned slot. Also installs the
+/// `_test` global the Lua tests use to reset state and inspect recorded
+/// calls.
+///
+/// Post-refactor the mock distinguishes between calls (send + deliver)
+/// for assertion convenience but also tracks **bus-log entries** —
+/// `nefor.engine.send` appends a Step entry to a synthesized log so tests
+/// can pass that log to `M.dispatch(log)` and exercise the wrapper
+/// `to_plugin` fan-out. `_test.bus_log()` returns the accumulated log.
 fn install_mock_engine_and_test_helpers(lua: &Lua) -> mlua::Result<()> {
-    // Shared state between the two globals. Mutex is plenty here — there's
-    // no real concurrency; we're single-threaded inside a test.
     struct Shared {
+        // Recorded calls (both send and deliver). Same list shape as the
+        // pre-refactor harness so existing assertions keep working.
         calls: Mutex<Vec<(Option<String>, String)>>,
+        // Synthesized bus log — append-only, mirrors what the production
+        // broker would build. Each `send` adds an entry; `deliver` does
+        // not.
+        bus_log: Mutex<Vec<BusEntry>>,
         plugins: Mutex<Vec<String>>,
+    }
+    #[derive(Clone)]
+    struct BusEntry {
+        origin: String,
+        target: Option<String>,
+        payload: String,
     }
     let shared = std::sync::Arc::new(Shared {
         calls: Mutex::new(Vec::new()),
+        bus_log: Mutex::new(Vec::new()),
         plugins: Mutex::new(Vec::new()),
     });
 
@@ -87,7 +105,15 @@ fn install_mock_engine_and_test_helpers(lua: &Lua) -> mlua::Result<()> {
                 )));
             }
         };
-        s1.calls.lock().unwrap().push((target, payload));
+        s1.calls
+            .lock()
+            .unwrap()
+            .push((target.clone(), payload.clone()));
+        s1.bus_log.lock().unwrap().push(BusEntry {
+            origin: "step".into(),
+            target,
+            payload,
+        });
         Ok(())
     })?;
     engine_tbl.set("send", send_fn)?;
@@ -176,13 +202,44 @@ fn install_mock_engine_and_test_helpers(lua: &Lua) -> mlua::Result<()> {
     })?;
     test_tbl.set("calls", calls_fn)?;
 
-    // _test.calls_clear() — drop the recorded history.
+    // _test.calls_clear() — drop the recorded history (calls only;
+    // bus_log is preserved so dispatch tests can drive accumulated log).
     let s4 = std::sync::Arc::clone(&shared);
     let clear_fn = lua.create_function(move |_, _: ()| {
         s4.calls.lock().unwrap().clear();
         Ok(())
     })?;
     test_tbl.set("calls_clear", clear_fn)?;
+
+    // _test.bus_log() — return the synthesized bus log as an array of
+    // log-entry tables matching the shape the broker passes to dispatch:
+    //   { ts, origin, target, payload }
+    let s_log = std::sync::Arc::clone(&shared);
+    let bus_log_fn = lua.create_function(move |lua, _: ()| {
+        let arr = lua.create_table()?;
+        let snap = s_log.bus_log.lock().unwrap().clone();
+        for (i, entry) in snap.into_iter().enumerate() {
+            let row = lua.create_table()?;
+            row.set("ts", lua.create_string("2026-04-23T00:00:00.000Z")?)?;
+            row.set("origin", lua.create_string(&entry.origin)?)?;
+            match entry.target {
+                Some(t) => row.set("target", lua.create_string(&t)?)?,
+                None => row.set("target", Value::Nil)?,
+            }
+            row.set("payload", lua.create_string(&entry.payload)?)?;
+            arr.set(i + 1, row)?;
+        }
+        Ok(arr)
+    })?;
+    test_tbl.set("bus_log", bus_log_fn)?;
+
+    // _test.bus_log_clear() — wipe the synthesized bus log.
+    let s_log_clear = std::sync::Arc::clone(&shared);
+    let bus_log_clear_fn = lua.create_function(move |_, _: ()| {
+        s_log_clear.bus_log.lock().unwrap().clear();
+        Ok(())
+    })?;
+    test_tbl.set("bus_log_clear", bus_log_clear_fn)?;
 
     // _test.set_plugins({ "a", "b" }) — override the plugin list that
     // nefor.engine.plugins() returns.

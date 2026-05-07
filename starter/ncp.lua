@@ -1,120 +1,118 @@
 -- starter/ncp.lua — NCP v0.1 protocol implementation (Lua).
 --
--- Public API:
---   ncp.dispatch(current_log)        -- called from the global dispatch hook
---   ncp.spawn(cfg)                   -- spawn a plugin with optional transforms
+-- ## Public API
 --
--- The engine is a pure string-layer event bus. Every inbound line gets
--- appended to `current_log` and `ncp.dispatch` is invoked. This module
--- inspects the new tail entry and implements:
---   * `ready` / `ready_ok` handshake (with `protocol_version` check).
---   * Broadcast of `type:"event"` messages to every *other* ready plugin.
---   * Replay-on-attach: when a plugin readies, resend the current session's
---     prior event messages to it so it observes the same bus history as
---     plugins that were already connected.
---   * `error` emission on malformed inbound (unparseable JSON, bad envelope,
---     unknown kind, version mismatch, invalid ready).
---   * Per-plugin envelope transforms: `from_plugin` runs at ingress (after
---     a plugin emits, before broadcast); `to_plugin` runs at egress, per
---     target. Both are optional, default identity, and may return `nil` to
---     drop the envelope. Lets the user's init.lua adapt vendor namespaces
---     (e.g. `cc.*` → `chat.*`) without modifying plugins.
+--   ncp.invoke_from_plugin(source, payload)  -- broker hook for inbound lines
+--   ncp.dispatch(current_log)                -- broker hook after each emission
+--   ncp.spawn(cfg)                           -- register a wrapper (transforms)
 --
--- State lives in module-level locals and is reset on module reload. Nothing
--- here is shared across dispatch invocations except the `ready_plugins` set
--- and the `plugin_transforms` table; the engine holds the authoritative
--- event log.
+-- ## Architecture (post wrapper-callback refactor)
 --
--- # Tradeoffs documented in code
+-- Wrappers' `from_plugin` and `to_plugin` are **side-effecting callbacks**,
+-- not transforms. The framework hands the parsed envelope to the wrapper;
+-- the wrapper decides what (if anything) flows onto the bus or down to a
+-- peer's stdin. The framework never inspects the return value.
 --
--- * Replay re-stamps `ts`. The engine stamps `ts = now` on every outbound
---   `nefor.engine.deliver`, so replayed events arrive with a fresh
---   timestamp rather than the original. A future engine binding could
---   accept a `ts_override` and preserve wire-level ordering; out of scope
---   for v1.
--- * Broadcast costs N-1 targeted deliveries. NCP broadcast excludes the
---   sender; the engine's `send` broadcasts to every connected plugin. Lua
---   bridges the gap with `nefor.engine.plugins()` + per-peer `deliver`.
---   The N-1 calls are routing decisions, not new emissions, so they
---   don't inflate the bus log.
+-- Two outbound paths into the broker, deliberately distinct:
 --
--- # Send vs deliver
+-- * `nefor.engine.send(payload, target?)` — **emission**. Appends a Step
+--   entry to the bus log; the broker's drain fires `dispatch` for the new
+--   tail, which iterates wrappers and calls each `to_plugin(env)`.
+--   `target` is informational on the log entry (the default `to_plugin`
+--   uses it to deliver only to that peer).
+-- * `nefor.engine.deliver(peer, payload)` — **delivery**. Writes one line
+--   to one peer's stdin without logging. Used inside `to_plugin` to push
+--   the event to the wrapped Rust binary (or by any callback that needs a
+--   targeted side-effect that should NOT show up on the bus).
 --
--- This module uses two outbound paths into the broker, deliberately
--- distinct:
+-- The bus log holds **only what was explicitly published via `send`** —
+-- symmetric for plugin emissions and Lua emissions. Plugin-emitted lines
+-- the wrapper doesn't republish never appear on the bus.
 --
--- * `nefor.engine.send(payload, target?)` — **emission**. Logs as a
---   Step entry and writes to the bus. Used here for genuinely new
---   envelopes the dispatch hook synthesizes: `ready_ok` replies, NCP
---   `error` envelopes, the buffered `chat.popup` flush, and the engine
---   → nefor-tui translation in `handle_engine_envelope`. Each call is
---   one canonical bus event.
--- * `nefor.engine.deliver(peer, payload)` — **delivery**. Writes to one
---   peer's stdin without logging. Used by `send_to_peer` for the
---   per-peer fan-out of an emission already on the bus. The original
---   emission's log entry is the single source of truth; the fan-out
---   copies are routing actions, not new events.
+-- ## Plugin-line flow (inbound)
 --
--- # Cross-session resumption
+-- Broker receives `payload` from plugin P:
+--   1. Broker calls `M.invoke_from_plugin(P, payload)`.
+--   2. We decode payload as JSON. Bad JSON → `error` reply via deliver
+--      (targeted at P; doesn't pollute bus log).
+--   3. `type:"system"` envelopes (ready handshake) are handled
+--      framework-level here: they synthesize ready_ok / replay etc. and
+--      do NOT reach the wrapper's `from_plugin`. NCP framework owns the
+--      handshake.
+--   4. `type:"event"` envelopes go to `plugin_transforms[P].from_plugin`,
+--      called as a side-effecting callback. Default (no `from_plugin`
+--      registered) publishes the envelope verbatim via `engine.send` so
+--      the bus sees the plugin's emission.
 --
--- The engine is session-blind. Cross-run resumption (replaying a prior
--- session's jsonl onto the bus) is owned by `starter/sessions.lua`,
--- which runs the swap entirely in-process: emits `sessions.session_end`,
--- swaps active jsonl + in-memory state, emits `sessions.session_start`,
--- replays each saved entry via `nefor.engine.send`, then emits
--- `sessions.resume_done`. ncp.dispatch itself sees no parent-session
--- hook; the legacy `saved_log` parameter (and `resume.lua` companion
--- module) have been removed.
+-- ## Bus-event flow (outbound, every wrapper)
+--
+-- Broker drains new tail entries through `M.dispatch(current_log)`:
+--   1. Skip Plugin entries — those are engine-injected synthetics
+--      (`engine.plugin_failed`); they go through their own translation
+--      below.
+--   2. Step entries are bus emissions. We decode the payload and call
+--      every registered wrapper's `to_plugin(env)`. Default callback
+--      delivers the envelope verbatim to the wrapper's peer (skipping
+--      self-emissions and respecting log-entry `target` if set).
+--   3. Engine entries (synthetic `engine.*`) go through the engine
+--      translator (`handle_engine_envelope`) which decides whether to
+--      publish chat-popup events.
+--
+-- Wrappers that want bespoke routing override `to_plugin`. Wrappers that
+-- speak the canonical bus shape can omit it entirely and let the default
+-- pass through.
+--
+-- ## Replay window
+--
+-- The legacy `in_replay` gate lived here as a framework-level skip.
+-- Post-refactor it's a per-wrapper concern: each wrapper that wants to
+-- skip envelopes during a replay-window adds the check inside its own
+-- `to_plugin` callback (typically via `lib.replay_window`). The framework
+-- no longer suppresses anything globally.
+--
+-- ## Why `from_plugin` is no longer a transform
+--
+-- Pre-refactor, `from_plugin` returned the envelope and dispatch owned
+-- the broadcast fan-out + the auto-log of plugin emissions. That coupled
+-- two responsibilities to one callback signature: "translate the shape"
+-- AND "decide whether to publish". The split — wrapper owns *publishing*,
+-- framework owns nothing more than the system handshake — makes
+-- per-wrapper decisions explicit (call send or don't) and removes the
+-- "wait, is this on the log or not?" ambiguity for replay/persistence.
 
 local json = nefor.json
 
 local M = {}
 
 -- Protocol constants.
-local NCP_VERSION = "0.1"
+local NCP_VERSION    = "0.1"
 local ENGINE_VERSION = "0.1.0"
 
--- Ready plugins, keyed by plugin name. Value = index into current_log at
--- the moment the handshake was accepted, so replay-on-attach can slice
--- strictly-prior entries without counting messages that arrived after the
--- ready (which the engine delivers via the normal broadcast path).
+-- Ready plugins, keyed by plugin name. Value = monotonic id; structurally
+-- a presence set, but the previous tail-index gate is gone (the bus log
+-- now only carries what was published, so replay-on-attach uses the log
+-- itself rather than a "strictly prior" filter).
 local ready_plugins = {}
 
--- Per-plugin envelope transforms, keyed by plugin name.
--- Each entry: { from_plugin = function|nil, to_plugin = function|nil }.
--- `from_plugin(env)` runs once per emission at ingress; `to_plugin(env)` runs
--- per peer at egress. Both receive `{type, body, from}` (and `ts` on
--- to_plugin) and return either a (possibly mutated) envelope table or nil
--- to drop. Errors are caught — a faulty transform never crashes dispatch.
+-- Per-plugin envelope callbacks, keyed by plugin name.
+--   { from_plugin = function|nil, to_plugin = function|nil }
 local plugin_transforms = {}
 
--- Replay-window flag. Set true on `sessions.replay.start`, false on
--- `sessions.replay.end` (toggled inline by the dispatch loop when it
--- sees those markers — see `handle_event`). While true, `send_to_peer`
--- short-circuits before calling `nefor.engine.deliver`: Rust plugins
--- never see envelopes fanned out during a session replay. Pure-Lua
--- actors are unaffected — they consume bus traffic via
--- `nefor.bus.on_event` (the actor.lua runtime), which is independent
--- of this fan-out path.
-local in_replay = false
-
 -- FIFO queue of `chat.popup` envelope tables awaiting nefor-tui's ready.
--- Engine spawn-failures fire during boot, before nefor-tui completes its
--- `ready` handshake — and nefor-tui's NCP layer drops every pre-ready_ok
--- inbound envelope (per spec §5.1, the plugin must declare ready first).
--- We buffer translated popups here and flush them inside `handle_ready`
--- once nefor-tui enters `ready_plugins`. Bounded only by good sense: an
--- engine that fails dozens of plugins at boot will accumulate dozens of
--- popups; that's fine, a flood of popups is the right user-visible signal.
 local pending_chat_popups = {}
+
+-- High-water mark for `M.dispatch`: the highest index of `current_log`
+-- already processed. The broker grows the same persistent log table on
+-- each invocation; without this, `dispatch` would re-fire to_plugin for
+-- entries it already handled when called multiple times in a single
+-- session (e.g. once per inbound line, repeatedly cascading through
+-- `drain_pending_dispatch`).
+local dispatch_hwm = 0
 
 -- ------------------------------------------------------------------
 -- helpers
 -- ------------------------------------------------------------------
 
--- Try to decode a JSON string. Returns (decoded, nil) on success or
--- (nil, err_message) on failure. Wraps pcall so a bad line is a protocol
--- fault we report, not an uncaught error that takes down dispatch.
 local function try_decode(s)
   local ok, v = pcall(json.decode, s)
   if not ok then return nil, tostring(v) end
@@ -125,11 +123,12 @@ local function encode(v)
   return json.encode(v)
 end
 
--- Recursively copy a value. Used at egress so each peer's `to_plugin`
--- transform sees its own envelope — without this, mutating `env.body` in
--- one peer's transform would leak to subsequent peers in the broadcast
--- fan-out. JSON-shaped values are safe to deep-copy with this naive walk
--- (no metatables, no cycles).
+-- Recursive deep-copy for envelopes shared across multiple wrappers'
+-- to_plugin callbacks. Without this a wrapper that mutates `env.body`
+-- in place leaks the mutation into every subsequent wrapper's view —
+-- the dispatch loop calls each wrapper with the same envelope table.
+-- JSON-shaped values are safe to deep-copy with this naive walk (no
+-- metatables, no cycles).
 local function deep_copy(v)
   if type(v) ~= "table" then return v end
   local out = {}
@@ -139,10 +138,6 @@ local function deep_copy(v)
   return out
 end
 
--- Build an engine-originated wire envelope. Per NCP §3 engine-broadcast
--- envelopes carry `from:"engine"` + engine-stamped `ts` in addition to the
--- plugin-authored `type` + `body`. `nefor.engine.now()` returns the
--- authoritative ISO-8601 timestamp.
 local function engine_envelope(body_tbl, kind)
   return {
     type = kind,
@@ -152,334 +147,177 @@ local function engine_envelope(body_tbl, kind)
   }
 end
 
-local function emit_ready_ok(target)
-  nefor.engine.send(encode(engine_envelope({
-    kind = "ready_ok",
-    engine_version = ENGINE_VERSION,
-  }, "system")), target)
-end
-
-local function emit_error(target, code, message)
-  nefor.engine.send(encode(engine_envelope({
-    kind = "error",
-    code = code,
+-- Targeted error reply via `deliver` — no log entry, no bus traffic for
+-- a peer's protocol fault. The peer sees the error on its stdin; the
+-- rest of the bus is unaffected.
+local function deliver_error(target, code, message)
+  local payload = encode(engine_envelope({
+    kind    = "error",
+    code    = code,
     message = message,
-  }, "system")), target)
+  }, "system"))
+  pcall(nefor.engine.deliver, target, payload)
 end
 
--- List of currently connected plugin names, minus `exclude`. Used for
--- broadcast-minus-sender.
-local function peers_minus(exclude)
-  local out = {}
-  for _, name in ipairs(nefor.engine.plugins()) do
-    if name ~= exclude then
-      out[#out + 1] = name
-    end
-  end
-  return out
+local function deliver_ready_ok(target)
+  local payload = encode(engine_envelope({
+    kind           = "ready_ok",
+    engine_version = ENGINE_VERSION,
+  }, "system"))
+  pcall(nefor.engine.deliver, target, payload)
 end
 
 -- ------------------------------------------------------------------
--- system message handling
+-- system message handling (NCP handshake — framework-level)
 -- ------------------------------------------------------------------
 
--- Forward declarations: handle_system, handle_ready, and
--- replay_prior_events reference each other below; Lua resolves local
--- names lexically so we need the `local` declaration to precede every use
--- site.
-local handle_system
-local handle_ready
-local replay_prior_events
+local replay_prior_events  -- forward decl
 
--- Handle a received `system` message from `origin`. `body` is the already-
--- parsed body table (or may be nil/non-table on malformed input).
-handle_system = function(origin, body, current_log, tail_index)
-  if type(body) ~= "table" or type(body.kind) ~= "string" then
-    emit_error(origin, "malformed_envelope", "system body missing 'kind'")
-    return
-  end
-
-  if body.kind == "ready" then
-    handle_ready(origin, body, current_log, tail_index)
-    return
-  end
-
-  -- Plugins only legitimately send `ready` as a system kind (per §5).
-  -- Anything else is a protocol fault on their side.
-  emit_error(origin, "unknown_kind",
-    "plugins may only send 'ready' as a system kind; got '" .. body.kind .. "'")
-end
-
--- Dispatch for `ready` messages. Split out for clarity.
-handle_ready = function(origin, body, current_log, tail_index)
-  -- Structural check first (missing field, wrong type) — that's
-  -- `invalid_ready`. Version-check next — that's `protocol_version_mismatch`.
+local function handle_ready(origin, body, current_log)
   if type(body.protocol_version) ~= "string" then
-    emit_error(origin, "invalid_ready",
+    deliver_error(origin, "invalid_ready",
       "ready body missing required string field 'protocol_version'")
     return
   end
   if body.protocol_version ~= NCP_VERSION then
-    emit_error(origin, "protocol_version_mismatch",
+    deliver_error(origin, "protocol_version_mismatch",
       "engine speaks NCP " .. NCP_VERSION ..
       "; plugin declared '" .. body.protocol_version .. "'")
     return
   end
-
-  -- Policy: re-ready from an already-ready plugin is a protocol fault. The
-  -- spec doesn't explicitly name the case, but `ready` is defined as "first
-  -- message a plugin sends after connecting" (§5.1) — a second ready is not
-  -- a first. We surface `invalid_ready` and ignore the repeat rather than
-  -- duplicate the replay burst.
   if ready_plugins[origin] then
-    emit_error(origin, "invalid_ready",
+    deliver_error(origin, "invalid_ready",
       "plugin already ready; 'ready' is only valid as the first message")
     return
   end
 
-  ready_plugins[origin] = tail_index
-  emit_ready_ok(origin)
-  replay_prior_events(origin, current_log, tail_index)
+  ready_plugins[origin] = true
+  deliver_ready_ok(origin)
+  replay_prior_events(origin, current_log)
 
-  -- Flush any popups buffered while nefor-tui was still booting. Each
-  -- popup needs a fresh `ts` per send; we already stamped at queue-time
-  -- but the engine restamps anyway, so we just re-encode and ship.
+  -- Flush any popups buffered while nefor-tui was still booting.
   if origin == "nefor-tui" and #pending_chat_popups > 0 then
     for _, popup in ipairs(pending_chat_popups) do
-      nefor.engine.send(encode(popup), "nefor-tui")
+      pcall(nefor.engine.deliver, "nefor-tui", encode(popup))
     end
     pending_chat_popups = {}
   end
 end
 
--- Apply the source plugin's `from_plugin` transform (if any) to a decoded
--- envelope. Returns the (possibly rewritten) envelope, or nil to drop.
--- Errors in user code surface as `transform_error` to the source plugin
--- and the envelope is dropped — better than crashing dispatch.
-local function apply_from_plugin(origin, env)
-  local t = plugin_transforms[origin]
-  if not t or not t.from_plugin then return env end
-  local ok, result = pcall(t.from_plugin, env)
-  if not ok then
-    emit_error(origin, "transform_error",
-      "from_plugin transform raised: " .. tostring(result))
-    return nil
+local function handle_system(origin, body, current_log)
+  if type(body) ~= "table" or type(body.kind) ~= "string" then
+    deliver_error(origin, "malformed_envelope", "system body missing 'kind'")
+    return
   end
-  return result
+  if body.kind == "ready" then
+    handle_ready(origin, body, current_log)
+    return
+  end
+  deliver_error(origin, "unknown_kind",
+    "plugins may only send 'ready' as a system kind; got '" .. body.kind .. "'")
 end
 
--- Apply the target plugin's `to_plugin` transform (if any) to a wire
--- envelope. Returns the (possibly rewritten) envelope, or nil to drop for
--- this peer. Errors drop the envelope silently for the target — the target
--- didn't cause them and shouldn't see a protocol error.
-local function apply_to_plugin(target, env)
+-- ------------------------------------------------------------------
+-- replay-on-attach
+-- ------------------------------------------------------------------
+--
+-- When a plugin readies after others have already been emitting, it
+-- needs to see the bus events it missed. We re-deliver the prior bus
+-- log to the new attacher by walking it and calling its wrapper's
+-- to_plugin (if any) on each entry, exactly as if the entry were just
+-- being dispatched.
+--
+-- We DON'T republish via `send` (that would re-fire every wrapper's
+-- to_plugin again, doubling traffic). We invoke the new attacher's
+-- to_plugin directly with the parsed envelope.
+
+local function call_to_plugin_for(target, env, entry_target)
+  -- Skip nothing here; the wrapper or default decides. Caller already
+  -- filtered sane shapes.
   local t = plugin_transforms[target]
-  if not t or not t.to_plugin then return env end
-  local ok, result = pcall(t.to_plugin, env)
-  if not ok then return nil end
-  return result
-end
-
--- Decode a plugin-authored payload and run it through `from_plugin`.
--- Returns the post-transform envelope `{type, body, from}`, or nil if the
--- payload doesn't parse, isn't an object, or the transform dropped it.
---
--- `from` precedence: payload-declared `from` (if a string) wins over
--- `origin`. This matters for step-origin entries during replay: those
--- carry the original emitter's identity inside the payload (e.g. an
--- `agentic-loop` broadcast retains `from = "agentic-loop"` even though
--- its log entry's origin field is `"step"`). For plugin-origin entries
--- the wire envelope's `from` typically matches `origin`, so this is a
--- no-op — but a contract lib that emits with `from = "generic-provider"`
--- via `envelope.emit_as(...)` while running inside basic-tools' load
--- chain has its declared identity preserved.
-local function decode_and_apply_from(origin, payload)
-  local decoded = select(1, try_decode(payload))
-  if not decoded or type(decoded) ~= "table" then return nil end
-  local from = (type(decoded.from) == "string") and decoded.from or origin
-  return apply_from_plugin(origin, {
-    type = decoded.type,
-    body = decoded.body,
-    from = from,
-  })
-end
-
--- Stamp + apply `to_plugin` + write to the peer's stdin via the engine's
--- `deliver` binding. `env_in` is the post-from_plugin envelope
--- `{type, body, from}`; we add an authoritative `ts` here per §3.
---
--- This is **delivery, not emission**. The original envelope already
--- produced its single canonical log entry at ingress (Origin::Plugin).
--- Per-peer fan-out copies are routing decisions, not bus events — using
--- `nefor.engine.send` here would synthesize a step entry per peer, which
--- (a) inflates the log into 1 + N entries per emission and (b) breaks
--- replay-on-attach: the dispatcher would re-enter and double-deliver
--- every fan-out copy. `deliver` writes to one peer without logging.
---
--- Each peer gets its own `ts` to keep the broadcast loop simple;
--- preserving a single shared `ts` across the fan-out is a v2 concern
--- (see module doc).
-local function send_to_peer(target, env_in)
-  -- Replay-window gate. Inside `sessions.replay.start` /
-  -- `sessions.replay.end`, suppress per-peer fan-out so Rust plugins
-  -- don't see envelopes derived from the replay. Pure-Lua actors are
-  -- unaffected; they receive via the actor.lua bus subscription, which
-  -- runs independently of `nefor.engine.deliver`.
-  if in_replay then return end
-
-  -- Deep-copy body only when a `to_plugin` transform is actually registered
-  -- for `target` — otherwise the body is read-only on the way out and
-  -- copying is wasted work (per-keystroke, multiplied by N peers, this
-  -- adds up fast for fat bodies like `grid.line` cell arrays).
-  local has_transform = plugin_transforms[target]
-    and plugin_transforms[target].to_plugin
-  local body = env_in.body
-  if has_transform then
-    body = deep_copy(body)
-  end
-  local env = apply_to_plugin(target, {
-    type = env_in.type,
-    from = env_in.from,
-    ts   = nefor.engine.now(),
-    body = body,
-  })
-  if env == nil then return end
-  -- pcall: deliver raises if the target plugin disconnected between the
-  -- ready-set check and now. A TOCTOU disconnect on one peer must not
-  -- crash dispatch for the rest.
-  local ok, err = pcall(nefor.engine.deliver, target, encode(env))
-  if not ok then
-    nefor.log.warn("ncp.send_to_peer: deliver failed; dropping fan-out copy", {
-      target = target,
-      error  = tostring(err),
-    })
-  end
-end
-
--- Replay every prior `type:"event"` entry seen before the handshake.
--- Replayed envelopes pass through `from_plugin` (at the source) and
--- `to_plugin` (at the new attacher), so a late attacher sees the same
--- transformed view as if it had been there all along. The engine stamps a
--- fresh `ts` on each outbound send — see module-level tradeoffs. Order is
--- preserved by iterating current_log in slice order.
---
--- ## What we replay
---
--- * Plugin-origin entries — verbatim, as before.
--- * Step-origin entries with no target — Lua-direct **broadcast**
---   emissions (e.g. `envelope.emit_broadcast` from agentic-loop or the
---   contract libs). These are bus events that every connected peer
---   would have seen had they been attached.
---
--- ## What we skip
---
--- * Step-origin entries with a target — those are emissions aimed at one
---   specific peer (e.g. `ncp.emit_ready_ok`, `chat.popup` for nefor-tui,
---   tool dispatch to a named provider). Replaying them to a *different*
---   late attacher would deliver a message that wasn't meant for them.
--- * Engine-origin entries — `engine.*` kinds are private to the
---   translation layer (`handle_engine_envelope`) and would leak as raw
---   kinds onto the bus.
---
--- ## Why dropping the old `origin ~= "step"` filter is now safe
---
--- Pre-refactor, every plugin emission produced one Plugin entry +
--- N Step entries (one per peer the dispatch hook fanned out to). The
--- old filter was correct then: skipping Step entries avoided re-routing
--- those fan-out copies. Post-refactor, dispatch fan-out goes through
--- `nefor.engine.deliver` which writes to a peer without logging — so
--- step entries are now unambiguously bus emissions. The Plugin/Step
--- distinction collapses to "who originated this": a connected plugin
--- (Plugin) or the dispatch hook itself (Step). Both are bus events;
--- both should replay.
-replay_prior_events = function(target, current_log, tail_index)
-  for i = 1, tail_index - 1 do
-    local entry = current_log[i]
-    -- Skip engine-originated entries: `engine.*` kinds are private to
-    -- the translation layer in handle_engine_envelope and never belong
-    -- on the bus as broadcast events. Replaying them would leak the
-    -- raw kind (e.g. `engine.plugin_failed`) to every late attacher.
-    if entry.origin == "engine" then goto continue end
-    -- Step entries with a specific target were targeted emissions aimed
-    -- at that peer only. Don't replay them to other late attachers.
-    if entry.origin == "step" and entry.target ~= nil then goto continue end
-    do
-      local env_in = decode_and_apply_from(entry.origin, entry.payload)
-      if env_in and env_in.type == "event" then
-        send_to_peer(target, env_in)
-      end
+  local cb = t and t.to_plugin
+  if cb then
+    -- Deep-copy so the wrapper can mutate `env.body` without leaking
+    -- mutations into the next peer's view.
+    local copied = {
+      type = env.type,
+      from = env.from,
+      ts   = env.ts,
+      body = deep_copy(env.body),
+    }
+    local ok, err = pcall(cb, copied)
+    if not ok then
+      nefor.log.warn("ncp: to_plugin raised; dropping for peer", {
+        peer  = target,
+        error = tostring(err),
+      })
     end
-    ::continue::
-  end
-end
-
--- ------------------------------------------------------------------
--- event broadcast
--- ------------------------------------------------------------------
-
-local function handle_event(origin, payload)
-  -- Drop events from plugins that haven't readied yet — the spec's ready
-  -- timeout (§2) combined with "ready is the first message" (§5.1) means a
-  -- well-behaved plugin sends nothing else first. We emit a malformed-
-  -- envelope error to nudge the implementer; the connection stays open so
-  -- the plugin can still ready up.
-  if not ready_plugins[origin] then
-    emit_error(origin, "malformed_envelope",
-      "received event before 'ready' handshake completed")
     return
   end
 
-  local env_in = decode_and_apply_from(origin, payload)
-  if env_in == nil then return end
+  -- Default to_plugin: deliver the envelope verbatim to `target`,
+  -- subject to:
+  --   * skip if env.from == target (don't echo a peer's emission back
+  --     to itself)
+  --   * skip if entry_target is set and != target (a `send(payload, X)`
+  --     was addressed at X; other peers shouldn't see it)
+  --   * skip if kind starts with "<peer>." and <peer> != target —
+  --     legacy peer-prefixed routing convention
+  if env.from == target then return end
+  if entry_target ~= nil and entry_target ~= target then return end
 
-  -- Targeted routing: events whose kind is "<peer>.<rest>" addressed at a
-  -- specific peer (other than the sender) deliver only to that peer. The
-  -- common case is render traffic from nefor-tui → nefor-tui ("nefor-tui.
-  -- grid.line", etc); broadcasting those to every plugin spends a Lua
-  -- dispatch + JSON encode per peer for nothing. Events whose prefix is the
-  -- sender itself ("nefor-tui.input.key" from nefor-tui) are announcements
-  -- about the sender and stay broadcast. Events with a non-peer prefix
-  -- ("chat.*", "cc.*", custom kinds) also broadcast.
-  local k = env_in.body and env_in.body.kind
+  -- Legacy peer-prefix routing: kinds shaped "<peer>.<rest>" addressed
+  -- at one specific peer (other than the sender) deliver only to that
+  -- peer. We only apply this when the prefix actually matches a ready
+  -- peer (avoids false positives on generic kinds like "test.ping" or
+  -- "graph.node.fired" whose first component is not a peer name).
+  local k = env.body and env.body.kind
   if type(k) == "string" then
-    local target = k:match("^([^.]+)%.")
-    if target and target ~= origin and ready_plugins[target] then
-      send_to_peer(target, env_in)
-      return
+    local prefix = k:match("^([^.]+)%.")
+    if prefix and prefix ~= env.from and ready_plugins[prefix] then
+      if prefix ~= target then return end
     end
   end
 
-  for _, peer in ipairs(peers_minus(origin)) do
-    if ready_plugins[peer] then
-      send_to_peer(peer, env_in)
+  pcall(nefor.engine.deliver, target, encode(env))
+end
+
+-- Replay prior bus events to a freshly-readied peer. Walks the current
+-- log up to the entry that triggered this ready (exclusive), filters to
+-- bus emissions (Step entries), decodes each, and calls `to_plugin` for
+-- the new attacher.
+replay_prior_events = function(target, current_log)
+  for _, entry in ipairs(current_log) do
+    if entry.origin == "step" then
+      -- Only re-deliver to this peer if the original emission was a
+      -- broadcast (target nil) or addressed at this peer. Targeted
+      -- emissions for other peers are not for this attacher.
+      if entry.target == nil or entry.target == target then
+        local decoded = select(1, try_decode(entry.payload))
+        if type(decoded) == "table" and decoded.type == "event"
+            and type(decoded.body) == "table" then
+          local from = (type(decoded.from) == "string") and decoded.from or "engine"
+          call_to_plugin_for(target, {
+            type = decoded.type,
+            from = from,
+            ts   = decoded.ts,
+            body = decoded.body,
+          }, entry.target)
+        end
+      end
     end
   end
 end
 
 -- ------------------------------------------------------------------
--- engine-originated envelopes (kind = "engine.*")
+-- engine envelopes (synthetic engine.*)
 -- ------------------------------------------------------------------
---
--- The engine emits synthetic envelopes onto the bus when something happens
--- at the engine layer that plugins should know about — currently just
--- `engine.plugin_failed` (spawn-time error or runtime crash). These arrive
--- with `origin = "engine"` and carry a body shape like:
---
---   { kind = "engine.plugin_failed", plugin = "<name>",
---     phase = "spawn"|"runtime", reason = "<text>", code = "<token>" }
---
--- We translate them into a `chat.popup` event targeted at nefor-tui so the
--- user sees the failure instead of having it vanish into engine logs. If
--- nefor-tui isn't connected (e.g. it's the plugin that died), we drop the
--- event silently — there's no UI to render it on.
+
 local function handle_engine_envelope(decoded)
   local body = decoded.body
   if type(body) ~= "table" or type(body.kind) ~= "string" then return end
 
   if body.kind == "engine.plugin_failed" then
-    -- Skip if nefor-tui isn't even on the spawn list right now (e.g. the
-    -- failed plugin *is* nefor-tui, or no chat is configured at all). The
-    -- popup contract only matters when there's something to render it.
     local chat_present = false
     for _, name in ipairs(nefor.engine.plugins()) do
       if name == "nefor-tui" then chat_present = true; break end
@@ -497,109 +335,154 @@ local function handle_engine_envelope(decoded)
       source  = "engine",
     }, "event")
 
-    -- Engine spawn-failures fire during boot — before nefor-tui completes
-    -- its `ready` handshake. nefor-tui's NCP layer drops every pre-ready
-    -- inbound (per §5.1), so a direct send here would silently vanish. If
-    -- chat isn't ready yet, queue the popup; `handle_ready` flushes the
-    -- queue when chat readies.
     if not ready_plugins["nefor-tui"] then
       pending_chat_popups[#pending_chat_popups + 1] = popup
       return
     end
-    nefor.engine.send(encode(popup), "nefor-tui")
-    return
+    -- Use deliver: the popup is targeted (only nefor-tui needs to see
+    -- it) and going through send would inflate the bus log with one
+    -- step entry per engine.plugin_failed.
+    pcall(nefor.engine.deliver, "nefor-tui", encode(popup))
   end
-
-  -- Future engine.* kinds: log and ignore. Better than silently dropping —
-  -- if a new engine envelope ships and starter isn't yet aware, the log
-  -- breadcrumb points at the version skew.
-  -- (Lua print would race with TUI rendering; rely on the engine's stderr
-  --  pump if we ever want this surfaced.)
 end
 
 -- ------------------------------------------------------------------
--- public entry point
+-- public entry point: invoke_from_plugin (broker → Lua, inbound lines)
 -- ------------------------------------------------------------------
 
-function M.dispatch(current_log)
-  local tail_index = #current_log
-  if tail_index == 0 then return end
+function M.invoke_from_plugin(source, raw_payload)
+  if type(source) ~= "string" or source == "" then return end
+  if type(raw_payload) ~= "string" then return end
 
-  local entry = current_log[tail_index]
-  -- Only react to lines the engine received from a plugin. Entries with
-  -- origin == "step" are this module's own outbound sends — reprocessing
-  -- them would infinite-loop on a malformed reply.
-  if entry.origin == "step" then return end
-
-  local decoded, decode_err = try_decode(entry.payload)
+  local decoded, decode_err = try_decode(raw_payload)
   if decode_err ~= nil then
-    -- Engine-originated envelopes that fail to decode would loop forever
-    -- if we tried to error back at the engine — silently drop instead.
-    if entry.origin == "engine" then return end
-    emit_error(entry.origin, "malformed_envelope",
+    deliver_error(source, "malformed_envelope",
       "payload is not valid JSON: " .. decode_err)
     return
   end
   if type(decoded) ~= "table" then
-    if entry.origin == "engine" then return end
-    emit_error(entry.origin, "malformed_envelope",
+    deliver_error(source, "malformed_envelope",
       "payload is not a JSON object")
-    return
-  end
-
-  -- Engine-originated envelopes route through their own dispatcher. They
-  -- never go through the ready/event handshake — the engine is not a
-  -- plugin, doesn't ready, and its kinds (`engine.*`) are private to this
-  -- translation layer.
-  if entry.origin == "engine" then
-    handle_engine_envelope(decoded)
     return
   end
 
   local t = decoded.type
   if t == "system" then
-    handle_system(entry.origin, decoded.body, current_log, tail_index)
-  elseif t == "event" then
-    -- §3: body must be a JSON object even for events. Enforce here rather
-    -- than trust the plugin.
+    -- For replay-on-attach, the framework needs the current bus log to
+    -- walk it. The Lua side reads it back via the dispatch hook's
+    -- argument; from this entry-point we only have the broker-supplied
+    -- payload. Use `_current_log_ref` (set by `M.dispatch` on the most
+    -- recent invocation) — it's a stable ref in the Lua VM.
+    local cl = M._current_log_ref or {}
+    handle_system(source, decoded.body, cl)
+    return
+  end
+
+  if t == "event" then
     if type(decoded.body) ~= "table" then
-      emit_error(entry.origin, "body_not_object",
+      deliver_error(source, "body_not_object",
         "event body must be a JSON object")
       return
     end
-    handle_event(entry.origin, entry.payload)
-  else
-    emit_error(entry.origin, "malformed_envelope",
-      "envelope 'type' must be 'system' or 'event'")
+    -- Drop events from non-ready plugins.
+    if not ready_plugins[source] then
+      deliver_error(source, "malformed_envelope",
+        "received event before 'ready' handshake completed")
+      return
+    end
+
+    local from = (type(decoded.from) == "string") and decoded.from or source
+    local env = {
+      type = decoded.type,
+      from = from,
+      body = decoded.body,
+    }
+
+    local hook = plugin_transforms[source] and plugin_transforms[source].from_plugin
+    if hook then
+      local ok, err = pcall(hook, env)
+      if not ok then
+        deliver_error(source, "transform_error",
+          "from_plugin callback raised: " .. tostring(err))
+      end
+      return
+    end
+
+    -- Default callback: publish the envelope verbatim onto the bus via
+    -- `send` (broadcast). Wrappers without an explicit `from_plugin`
+    -- behave as identity passthrough — same effective behavior as the
+    -- pre-refactor "no from_plugin transform" path.
+    local payload = encode({
+      type = "event",
+      from = from,
+      ts   = nefor.engine.now(),
+      body = decoded.body,
+    })
+    nefor.engine.send(payload)
+    return
   end
+
+  deliver_error(source, "malformed_envelope",
+    "envelope 'type' must be 'system' or 'event'")
 end
 
 -- ------------------------------------------------------------------
--- public spawn API: nefor.plugins.spawn + transform registration
+-- public entry point: dispatch (broker → Lua, every new bus entry)
 -- ------------------------------------------------------------------
 
--- ncp.spawn — wraps `nefor.plugins.spawn` to also accept optional
--- `from_plugin` / `to_plugin` envelope transforms. The engine's spawn API
--- rejects unknown fields (deliberately — it's part of the bus, not the
--- protocol), so transforms live here in the protocol layer instead.
---
--- Example:
---   ncp.spawn {
---     name    = "mock-plugin",
---     command = { "../target/debug/mock-plugin" },
---     from_plugin = function(env)
---       -- env = { type = "event"|"system", body = {...}, from = "mock-plugin" }
---       if env.body and env.body.kind == "cc.stream.end" then
---         env.body.kind = "chat.stream.end"
---       end
---       return env  -- or nil to drop the envelope
---     end,
---   }
--- Recognised keys on `ncp.spawn`'s config table. Anything outside this set
--- is rejected at config-load time with a clear, actionable hint — same shape
--- as the engine binding's own unknown-field errors. Surfacing here matters
--- because `M.spawn` strips unknown fields before forwarding, so silent drops
--- would leave users wondering why `env = { ... }` "did nothing".
+-- Dispatch processes new entries only. The broker passes the same
+-- current_log table on every call (it grows in place); re-calls without
+-- growth shouldn't re-fire to_plugin for entries already handled. We
+-- track a high-water mark per-log via a hidden field.
+function M.dispatch(current_log)
+  -- Stash the current_log ref so `invoke_from_plugin` (which the broker
+  -- calls in a different code path) can use it for replay-on-attach.
+  M._current_log_ref = current_log
+
+  local tail_index = #current_log
+  if tail_index == 0 then return end
+
+  if tail_index <= dispatch_hwm then return end
+
+  -- Process every new entry from dispatch_hwm+1 .. tail_index. Multiple
+  -- entries can land in a single dispatch tick when a `to_plugin`
+  -- callback in turn calls `nefor.engine.send` (cascade) — the broker
+  -- drains them under one dispatch call, and we have to fire to_plugin
+  -- for each.
+  for i = dispatch_hwm + 1, tail_index do
+    local entry = current_log[i]
+    if entry.origin == "engine" then
+      local decoded, decode_err = try_decode(entry.payload)
+      if decode_err == nil and type(decoded) == "table" then
+        handle_engine_envelope(decoded)
+      end
+    elseif entry.origin == "step" then
+      local decoded = select(1, try_decode(entry.payload))
+      if type(decoded) == "table" and decoded.type == "event"
+          and type(decoded.body) == "table" then
+        local env = {
+          type = decoded.type,
+          from = (type(decoded.from) == "string") and decoded.from or "engine",
+          ts   = decoded.ts,
+          body = decoded.body,
+        }
+        for _, name in ipairs(nefor.engine.plugins()) do
+          if ready_plugins[name] then
+            call_to_plugin_for(name, env, entry.target)
+          end
+        end
+      end
+    end
+    -- Plugin-origin entries don't appear in the post-refactor flow
+    -- (handle_line no longer auto-logs); ignore them defensively.
+  end
+  dispatch_hwm = tail_index
+end
+
+-- ------------------------------------------------------------------
+-- public spawn API
+-- ------------------------------------------------------------------
+
 local SPAWN_VALID_KEYS = {
   name        = true,
   command     = true,
@@ -624,11 +507,6 @@ function M.spawn(cfg)
     error("ncp.spawn: 'to_plugin' must be a function or nil", 2)
   end
 
-  -- Reject every key outside the recognised set. Hints mirror the engine
-  -- binding's own messages so users see one consistent voice whether the
-  -- error came from Rust or Lua. `init.lua` runs before any plugin is
-  -- connected, so the bus isn't usable yet — popups are not the right
-  -- surface; a hard error at config load is.
   for k, _ in pairs(cfg) do
     if not SPAWN_VALID_KEYS[k] then
       local hint
@@ -645,66 +523,44 @@ function M.spawn(cfg)
     end
   end
 
-  if from_plugin or to_plugin then
-    plugin_transforms[cfg.name] = {
-      from_plugin = from_plugin,
-      to_plugin   = to_plugin,
-    }
-  end
+  -- Always register the wrapper (even with nil callbacks) so dispatch
+  -- knows the peer is "owned" by a wrapper. A nil callback = framework
+  -- default applies.
+  plugin_transforms[cfg.name] = {
+    from_plugin = from_plugin,
+    to_plugin   = to_plugin,
+  }
 
-  -- Forward to the engine's spawn API with transforms stripped. The engine
-  -- rejects unknown fields, so we hand it only the fields it knows.
   nefor.plugins.spawn({
     name    = cfg.name,
     command = cfg.command,
   })
 end
 
--- Exposed for tests only. Resets module state between scenarios so each
--- test starts from a clean slate.
+-- ------------------------------------------------------------------
+-- test escape hatches
+-- ------------------------------------------------------------------
+
 function M._reset()
-  ready_plugins = {}
-  plugin_transforms = {}
+  ready_plugins      = {}
+  plugin_transforms  = {}
   pending_chat_popups = {}
-  in_replay = false
+  dispatch_hwm       = 0
+  M._current_log_ref = nil
 end
 
--- Exposed for tests only. Toggle the replay-window flag directly so a
--- unit test can exercise `send_to_peer`'s gate without spinning up the
--- full actor runtime + bus subscription. Production toggles via the
--- `nefor.bus.on_event` subscription installed below.
-function M._set_in_replay(flag)
-  in_replay = flag and true or false
-end
-
--- Exposed for tests only. Registers a transform for `name` without going
--- through `M.spawn` (which calls into the real engine spawn API). Lets the
--- ncp_test.lua suite exercise transforms without mocking `nefor.plugins`.
 function M._test_set_transforms(name, transforms)
   plugin_transforms[name] = transforms
 end
 
--- ------------------------------------------------------------------
--- replay-window subscription
--- ------------------------------------------------------------------
---
--- Subscribe to the sessions replay framing so `in_replay` flips at the
--- right moment. Sessions emits these as ordinary broadcast events (step
--- entries on the bus), so the dispatch hook itself never sees them —
--- step-origin entries are short-circuited in `M.dispatch`. The bus
--- subscription path (driven by the broker's `dispatch_subscriptions`)
--- IS the right place to react.
---
--- Guarded against environments where `nefor.bus` isn't installed (the
--- ncp_test.lua harness) — the gate has a `_set_in_replay` test escape
--- hatch for those.
-if nefor.bus and nefor.bus.on_event then
-  nefor.bus.on_event("sessions.replay.start", function(_entry)
-    in_replay = true
-  end)
-  nefor.bus.on_event("sessions.replay.end", function(_entry)
-    in_replay = false
-  end)
+-- Tests sometimes need to mark a peer as ready without going through
+-- the JSON handshake. Production code shouldn't need this.
+function M._test_set_ready(name, flag)
+  if flag then
+    ready_plugins[name] = true
+  else
+    ready_plugins[name] = nil
+  end
 end
 
 return M

@@ -178,6 +178,17 @@ impl EngineOps for BrokerOps {
     }
 
     fn send(&self, target: SendTarget, payload: String) {
+        // Post-callback-refactor: `send` is pure emission. It appends a
+        // canonical Step entry to the bus log; routing is owned entirely by
+        // Lua wrappers (their `to_plugin` callbacks call
+        // `nefor.engine.deliver` to write the line to a peer's stdin).
+        //
+        // The wrapper-driven dispatch is fired by the broker on the next
+        // run-loop tick via `drain_pending_dispatch` (which calls
+        // `invoke_dispatch` + `dispatch_subscriptions` for the appended
+        // tail). Doing the dispatch synchronously inside `send` would
+        // deadlock if a dispatch handler in turn called `send` — it would
+        // re-enter the lock the broker holds while iterating.
         let ts = Timestamp::now();
         let target_name = match &target {
             SendTarget::Broadcast => None,
@@ -187,36 +198,13 @@ impl EngineOps for BrokerOps {
             ts,
             origin: Origin::Step,
             target: target_name,
-            payload: payload.clone(),
+            payload,
         };
-
-        // Hold the lock across the append + fanout so an interleaved inbound
-        // line can't observe a half-applied outbound. The broker's run loop
-        // is single-task so the only other holder is... itself, in a
-        // sequential path — no contention.
         let mut guard = match self.shared.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
         guard.event_log.push(entry);
-        let line = with_trailing_newline(payload);
-        match target {
-            SendTarget::Broadcast => {
-                for conn in guard.conns.values() {
-                    let _ = conn.send(ConnectionOutbound::Send(line.clone()));
-                }
-            }
-            SendTarget::Targeted(name) => {
-                if let Some(conn) = guard.conns.get(&name) {
-                    let _ = conn.send(ConnectionOutbound::Send(line));
-                } else {
-                    tracing::warn!(
-                        target = %name,
-                        "dispatch.send: target plugin is not connected; dropping outbound",
-                    );
-                }
-            }
-        }
     }
 
     fn deliver(&self, target: PluginName, payload: String) -> Result<(), String> {
@@ -416,20 +404,17 @@ impl Broker {
         }
         let drained = std::mem::take(&mut self.pending_engine_envelopes);
 
-        let new_entries = {
+        {
             let mut guard = lock_shared(&self.shared);
             for entry in &drained {
                 guard.event_log.push(entry.clone());
             }
-            let tail = guard.event_log[self.mirrored_count..].to_vec();
-            self.mirrored_count = guard.event_log.len();
-            tail
-        };
-
-        if let Err(e) = self.host.invoke_dispatch(&new_entries) {
-            tracing::error!(error = %e, "dispatch invocation errored at VM level");
         }
-        self.host.dispatch_subscriptions(&new_entries);
+
+        // Use the shared drain so wrapper `to_plugin` callbacks fire on the
+        // synthetic engine envelope (and any envelopes they publish in
+        // turn).
+        self.drain_pending_dispatch();
     }
 
     /// Clone a handle the caller can hold to request shutdown from outside
@@ -606,40 +591,75 @@ impl Broker {
     }
 
     fn handle_line(&mut self, id: ConnectionId, payload: String) {
+        // Post-callback-refactor: inbound plugin lines are NOT auto-logged.
+        // Instead the broker invokes Lua's `invoke_from_plugin(source,
+        // payload)` hook; the corresponding wrapper's `from_plugin` callback
+        // (or the framework default) decides whether to publish onto the
+        // bus via `nefor.engine.send`. Only published emissions land in the
+        // event log — symmetric for plugin-emitted and Lua-emitted bus
+        // events.
+        //
+        // After the hook runs, we drain any new tail entries through
+        // dispatch + subscriptions so wrapper `to_plugin` callbacks (and
+        // any `nefor.bus.on_event` listeners) fire on the wrapper's own
+        // emissions.
         let Some(record) = self.conns_by_id.get(&id) else {
             return;
         };
         let origin_name = record.name.clone();
-        let entry = LogEntry {
-            ts: Timestamp::now(),
-            origin: Origin::Plugin(origin_name),
-            target: None,
-            payload,
-        };
-
-        // Append + clone only the unmirrored tail under the lock, then
-        // release it before invoking dispatch — the hook may call back
-        // into `BrokerOps::send` which re-acquires the lock. Cloning the
-        // whole `event_log` here was O(n) per inbound line, O(n²) per
-        // session.
-        let new_entries = {
-            let mut guard = lock_shared(&self.shared);
-            guard.event_log.push(entry);
-            let tail = guard.event_log[self.mirrored_count..].to_vec();
-            self.mirrored_count = guard.event_log.len();
-            tail
-        };
-
-        if let Err(e) = self.host.invoke_dispatch(&new_entries) {
-            tracing::error!(error = %e, "dispatch invocation errored at VM level");
+        if let Err(e) = self
+            .host
+            .invoke_from_plugin(origin_name.as_str(), &payload)
+        {
+            tracing::error!(error = %e, "invoke_from_plugin errored at VM level");
         }
+        self.drain_pending_dispatch();
+    }
 
-        // Fan out the same tail to `nefor.bus.on_event` subscribers. Done
-        // strictly after dispatch so the hook's outbound `nefor.engine.send`
-        // entries (which were appended to the event log during the call)
-        // also reach handlers. Engine-side dispatch keeps it cheap when no
-        // subscriptions are registered.
-        self.host.dispatch_subscriptions(&new_entries);
+    /// Drain new tail entries into Lua's dispatch + subscription handlers.
+    /// Idempotent: a no-op when no entries have been appended since the
+    /// last drain. Called after every inbound line, every drain of the
+    /// engine-envelope queue, and every cli-driven hook so wrapper
+    /// `to_plugin` callbacks (and `nefor.bus.on_event` subscribers) see
+    /// what was published.
+    ///
+    /// Loops until the bus log stops growing — a `to_plugin` handler may
+    /// call `nefor.engine.send` to publish a derived envelope, and that
+    /// derived envelope must itself fire dispatch on the next iteration so
+    /// its own `to_plugin` reactions run. The fixed iteration cap (8)
+    /// guards against pathological cascades; in practice 1-2 iterations is
+    /// the steady state.
+    fn drain_pending_dispatch(&mut self) {
+        for _ in 0..8 {
+            let new_entries = {
+                let guard = lock_shared(&self.shared);
+                let total = guard.event_log.len();
+                if total <= self.mirrored_count {
+                    return;
+                }
+                let tail = guard.event_log[self.mirrored_count..].to_vec();
+                self.mirrored_count = total;
+                tail
+            };
+
+            if let Err(e) = self.host.invoke_dispatch(&new_entries) {
+                tracing::error!(error = %e, "dispatch invocation errored at VM level");
+            }
+            self.host.dispatch_subscriptions(&new_entries);
+        }
+        // Drop a breadcrumb if we hit the cascade cap so the operator
+        // notices a runaway dispatch rather than silently masking it.
+        let pending = {
+            let guard = lock_shared(&self.shared);
+            guard.event_log.len().saturating_sub(self.mirrored_count)
+        };
+        if pending > 0 {
+            tracing::warn!(
+                pending,
+                "drain_pending_dispatch: cascade cap reached; \
+                 remaining entries will be drained on next tick"
+            );
+        }
     }
 
     fn handle_reader_closed(&mut self, id: ConnectionId, reason: ReaderEnd) {
@@ -871,23 +891,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inbound_line_invokes_dispatch() {
-        // dispatch appends to a Lua-side global every time it runs so the
-        // test can assert what it saw.
+    async fn inbound_line_invokes_from_plugin_hook() {
+        // Post-callback-refactor: inbound plugin lines fire the Lua
+        // `invoke_from_plugin(source, payload)` hook — NOT `dispatch`.
+        // The hook is responsible for deciding whether to publish onto
+        // the bus.
         let shared = shared_state();
         let host = build_host(
             &shared,
             r#"
             seen = {}
-            function dispatch(current)
-                local last = current[#current]
-                seen[#seen + 1] = last.origin .. ":" .. last.payload
+            function dispatch(current) end
+            function invoke_from_plugin(source, payload)
+                seen[#seen + 1] = source .. ":" .. payload
             end
             "#,
         );
 
-        // Grab a handle on the Lua VM before handing it to the broker so the
-        // test can read `seen` back after the run.
         let lua = host.lua().clone();
 
         let mut broker = Broker::new(Arc::clone(&shared), host);
@@ -898,7 +918,6 @@ mod tests {
 
         send_line(&mut p, "hello from test").await;
 
-        // Let the broker drain.
         tokio::time::sleep(Duration::from_millis(100)).await;
         handle.shutdown(50).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
@@ -909,87 +928,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_send_broadcast_writes_to_all_peers() {
+    async fn inbound_line_does_not_auto_log() {
+        // Inbound plugin lines no longer auto-append to the event log —
+        // the `invoke_from_plugin` hook (or the wrapper's `from_plugin`
+        // callback it dispatches to) decides whether to publish via
+        // `nefor.engine.send`. A no-op hook means zero entries land on
+        // the bus log even though the plugin emitted bytes.
         let shared = shared_state();
-        // dispatch broadcasts "pong" on every inbound line.
         let host = build_host(
             &shared,
-            r#"function dispatch(current) nefor.engine.send("pong") end"#,
+            r#"
+            function dispatch(current) end
+            function invoke_from_plugin(source, payload) end
+            "#,
         );
 
         let mut broker = Broker::new(Arc::clone(&shared), host);
-        let (mut pa, ta) = make_transport();
-        let (mut pb, tb) = make_transport();
-        let (mut pc, tc) = make_transport();
-        broker.attach_transport(ta, pn("a"));
-        broker.attach_transport(tb, pn("b"));
-        broker.attach_transport(tc, pn("c"));
+        let (mut p, t) = make_transport();
+        broker.attach_transport(t, pn("test"));
         let handle = broker.shutdown_handle();
         let run = tokio::spawn(broker.run());
 
-        send_line(&mut pa, "trigger").await;
-
-        // All three plugins receive the broadcast — including the origin,
-        // per the spec: the dispatch hook is not a plugin, so "all plugins
-        // minus origin (Step)" = all plugins.
-        for (p, label) in [(&mut pa, "a"), (&mut pb, "b"), (&mut pc, "c")] {
-            let line = tokio::time::timeout(Duration::from_millis(500), recv_line(p))
-                .await
-                .unwrap_or_else(|_| panic!("{label} timed out waiting for broadcast"));
-            assert_eq!(line.as_deref(), Some("pong"));
-        }
-
+        send_line(&mut p, "ignored line").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         handle.shutdown(50).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
-    }
 
-    #[tokio::test]
-    async fn dispatch_send_targeted_writes_to_one_peer() {
-        let shared = shared_state();
-        let host = build_host(
-            &shared,
-            r#"function dispatch(current) nefor.engine.send("to-b-only", "b") end"#,
-        );
-
-        let mut broker = Broker::new(Arc::clone(&shared), host);
-        let (mut pa, ta) = make_transport();
-        let (mut pb, tb) = make_transport();
-        broker.attach_transport(ta, pn("a"));
-        broker.attach_transport(tb, pn("b"));
-        let handle = broker.shutdown_handle();
-        let run = tokio::spawn(broker.run());
-
-        send_line(&mut pa, "trigger").await;
-
-        let got_b = tokio::time::timeout(Duration::from_millis(500), recv_line(&mut pb))
-            .await
-            .expect("b timed out");
-        assert_eq!(got_b.as_deref(), Some("to-b-only"));
-
-        // a must not have received anything — give it a generous window so we
-        // catch accidental fan-out.
-        let got_a = tokio::time::timeout(Duration::from_millis(150), recv_line(&mut pa)).await;
+        let entries: Vec<LogEntry> = {
+            let guard = shared.lock().expect("lock shared");
+            guard.event_log.clone()
+        };
         assert!(
-            got_a.is_err() || got_a.unwrap().is_none(),
-            "a must not receive targeted send aimed at b",
+            entries.is_empty(),
+            "no auto-log of plugin lines; hook discarded the line. got {entries:?}"
         );
-
-        handle.shutdown(50).await;
-        let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
     }
 
     #[tokio::test]
-    async fn dispatch_deliver_writes_to_one_peer_without_log_entry() {
-        // `nefor.engine.deliver(peer, payload)` writes to the named peer's
-        // stdin like a targeted `send` — but without appending a LogEntry.
-        // This is the bus's "delivery without emission" path used by
-        // ncp.lua's per-peer fan-out. We assert (a) only the named peer
-        // sees the line, (b) the in-memory event log carries one entry
-        // for the inbound trigger and zero step entries for the deliver.
+    async fn engine_send_appends_log_and_fires_dispatch() {
+        // `nefor.engine.send` is pure emission. After the refactor the
+        // broker's drain wakes up dispatch on the appended tail; the
+        // Lua side never writes to peers from `send` (that's `deliver`'s
+        // job). We verify by triggering a send from invoke_from_plugin
+        // and asserting both the log entry and the dispatch hook saw the
+        // tail.
         let shared = shared_state();
         let host = build_host(
             &shared,
-            r#"function dispatch(current) nefor.engine.deliver("b", "to-b") end"#,
+            r#"
+            seen_dispatch = {}
+            function dispatch(current)
+                local last = current[#current]
+                seen_dispatch[#seen_dispatch + 1] = last.origin .. ":" .. last.payload
+            end
+            function invoke_from_plugin(source, payload)
+                nefor.engine.send("emitted-from-hook")
+            end
+            "#,
+        );
+        let lua = host.lua().clone();
+
+        let mut broker = Broker::new(Arc::clone(&shared), host);
+        let (mut p, t) = make_transport();
+        broker.attach_transport(t, pn("a"));
+        let handle = broker.shutdown_handle();
+        let run = tokio::spawn(broker.run());
+
+        send_line(&mut p, "trigger").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle.shutdown(50).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
+
+        let entries: Vec<LogEntry> = {
+            let guard = shared.lock().expect("lock shared");
+            guard.event_log.clone()
+        };
+        let step_count = entries
+            .iter()
+            .filter(|e| matches!(e.origin, Origin::Step))
+            .count();
+        assert_eq!(step_count, 1, "exactly one step entry from the send");
+        assert!(
+            !entries.iter().any(|e| matches!(&e.origin, Origin::Plugin(_))),
+            "no auto-logged plugin entries; got {entries:?}"
+        );
+
+        let seen: mlua::Table = lua.globals().get("seen_dispatch").unwrap();
+        let len = seen.len().unwrap();
+        assert!(
+            len >= 1,
+            "dispatch fired on the appended tail; got len {len}"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_deliver_writes_to_peer_without_log_entry() {
+        // `nefor.engine.deliver` writes to one peer's stdin without
+        // appending a LogEntry. Verify by triggering a deliver from the
+        // invoke_from_plugin hook (the inbound trigger itself is not
+        // logged after the refactor — only `send` adds bus entries).
+        let shared = shared_state();
+        let host = build_host(
+            &shared,
+            r#"
+            function dispatch(current) end
+            function invoke_from_plugin(source, payload)
+                nefor.engine.deliver("b", "to-b")
+            end
+            "#,
         );
 
         let mut broker = Broker::new(Arc::clone(&shared), host);
@@ -1007,7 +1053,6 @@ mod tests {
             .expect("b timed out");
         assert_eq!(got_b.as_deref(), Some("to-b"));
 
-        // 'a' must not see anything routed back.
         let got_a = tokio::time::timeout(Duration::from_millis(150), recv_line(&mut pa)).await;
         assert!(
             got_a.is_err() || got_a.unwrap().is_none(),
@@ -1021,36 +1066,24 @@ mod tests {
             let guard = shared.lock().expect("lock shared");
             guard.event_log.clone()
         };
-        // Exactly one entry: the inbound trigger from 'a'. The deliver
-        // produced no Step entry — that's the whole point.
-        let step_count = entries
-            .iter()
-            .filter(|e| matches!(e.origin, Origin::Step))
-            .count();
-        assert_eq!(
-            step_count, 0,
-            "deliver must not append a Step entry; got {entries:?}"
+        assert!(
+            entries.is_empty(),
+            "deliver must not append; inbound is no longer auto-logged. got {entries:?}"
         );
-        let plugin_count = entries
-            .iter()
-            .filter(|e| matches!(&e.origin, Origin::Plugin(p) if p.as_str() == "a"))
-            .count();
-        assert_eq!(plugin_count, 1, "one inbound entry for the trigger");
     }
 
     #[tokio::test]
-    async fn dispatch_deliver_to_unknown_peer_surfaces_error_to_lua() {
-        // The deliver binding is fallible: when the target isn't connected,
-        // the broker returns Err, the Lua binding raises, and dispatch's
-        // pcall (or any other error path) sees the failure rather than
-        // silently dropping. We exercise it by writing a dispatch hook
-        // that catches the error in pcall and stashes the message.
+    async fn engine_deliver_to_unknown_peer_surfaces_error_to_lua() {
+        // deliver to a non-connected peer raises a typed Lua error so
+        // the Lua caller (a wrapper's to_plugin or the dispatch hook)
+        // can pcall + log + drop.
         let shared = shared_state();
         let host = build_host(
             &shared,
             r#"
             last_err = nil
-            function dispatch(current)
+            function dispatch(current) end
+            function invoke_from_plugin(source, payload)
                 local ok, err = pcall(function()
                     nefor.engine.deliver("nope", "x")
                 end)
@@ -1080,15 +1113,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn event_log_records_inbound_and_outbound() {
-        // Engine is session-blind — no on-disk file. The in-memory
-        // `event_log` is the only artefact and is what Lua subscribers see
-        // via `current_log`. The Lua-side `starter/sessions.lua` owns any
-        // jsonl persistence (covered by `starter_sessions_test.rs`).
+    async fn event_log_records_outbound_only() {
+        // After the refactor the bus log carries only what was published
+        // via `send`. Inbound plugin lines don't auto-log; they fire
+        // `invoke_from_plugin` and the hook decides whether to publish.
         let shared = shared_state();
         let host = build_host(
             &shared,
-            r#"function dispatch(current) nefor.engine.send("echoed", "a") end"#,
+            r#"
+            function dispatch(current) end
+            function invoke_from_plugin(source, payload)
+                -- republish verbatim onto the bus; no peer write here —
+                -- send is pure emission post-refactor.
+                nefor.engine.send(payload)
+            end
+            "#,
         );
 
         let mut broker = Broker::new(Arc::clone(&shared), host);
@@ -1098,41 +1137,25 @@ mod tests {
         let run = tokio::spawn(broker.run());
 
         send_line(&mut pa, "inbound-line").await;
-        let got = tokio::time::timeout(Duration::from_millis(500), recv_line(&mut pa))
-            .await
-            .expect("a timed out");
-        assert_eq!(got.as_deref(), Some("echoed"));
-
+        tokio::time::sleep(Duration::from_millis(100)).await;
         handle.shutdown(50).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
 
-        // Inspect the in-memory event log directly.
         let entries: Vec<LogEntry> = {
             let guard = shared.lock().expect("lock shared");
             guard.event_log.clone()
         };
+        // Exactly one Step entry (the republish). No Plugin entries
+        // (nothing auto-logged the inbound).
+        let step_count = entries
+            .iter()
+            .filter(|e| matches!(e.origin, Origin::Step))
+            .count();
+        assert_eq!(step_count, 1, "one step entry from the republish");
         assert!(
-            entries.len() >= 2,
-            "expected at least 2 entries (1 inbound + 1 outbound), got {}: {:?}",
-            entries.len(),
-            entries
+            !entries.iter().any(|e| matches!(&e.origin, Origin::Plugin(_))),
+            "no auto-logged plugin entries; got {entries:?}"
         );
-        let inbound = entries
-            .iter()
-            .find(|e| {
-                matches!(&e.origin, Origin::Plugin(p) if p.as_str() == "a")
-                    && e.payload == "inbound-line"
-            })
-            .expect("inbound entry present");
-        let outbound = entries
-            .iter()
-            .find(|e| {
-                matches!(e.origin, Origin::Step)
-                    && e.target.as_ref().is_some_and(|p| p.as_str() == "a")
-                    && e.payload == "echoed"
-            })
-            .expect("outbound entry present");
-        assert_ne!(inbound.payload, outbound.payload);
     }
 
     #[tokio::test]

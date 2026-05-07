@@ -38,6 +38,11 @@ pub struct LuaHost {
     /// then; [`LuaHost::invoke_dispatch`] errors with
     /// [`LuaError::DispatchNotCached`] if called before caching.
     dispatch: Option<RegistryKey>,
+    /// Registry key for the global `invoke_from_plugin` function.
+    /// Populated alongside `dispatch` by [`LuaHost::cache_dispatch`].
+    /// Optional in the registry sense (not all test harnesses install it),
+    /// but production `init.lua` always exposes it.
+    invoke_from_plugin: Option<RegistryKey>,
     /// Persistent Lua array mirroring the current session's log. Created
     /// lazily on the first [`LuaHost::invoke_dispatch`] call and reused —
     /// each subsequent call appends only the new entries since the last
@@ -93,6 +98,7 @@ impl LuaHost {
             bus,
             plugins,
             dispatch: None,
+            invoke_from_plugin: None,
             current_log_table: None,
             current_log_mirrored: 0,
             subscriptions,
@@ -209,6 +215,14 @@ impl LuaHost {
             _ => return Err(LuaError::DispatchMissing),
         };
         self.dispatch = Some(self.lua.create_registry_value(func)?);
+
+        // Optional: cache `invoke_from_plugin` if `init.lua` defines one.
+        // Production starter wires this to `ncp.invoke_from_plugin`; test
+        // harnesses that drive dispatch directly (not through inbound
+        // lines) may omit it.
+        if let Ok(mlua::Value::Function(f)) = globals.get::<mlua::Value>("invoke_from_plugin") {
+            self.invoke_from_plugin = Some(self.lua.create_registry_value(f)?);
+        }
         Ok(())
     }
 
@@ -253,6 +267,33 @@ impl LuaHost {
             Ok(()) => Ok(()),
             Err(e) => {
                 tracing::error!(error = %e, "dispatch invocation failed");
+                Ok(())
+            }
+        }
+    }
+
+    /// Invoke the global `invoke_from_plugin(source, payload)` Lua hook.
+    ///
+    /// Called by the broker for each inbound plugin line (post-callback
+    /// refactor). The Lua side is responsible for:
+    /// - decoding the payload + handling NCP-level system messages (ready
+    ///   handshake, etc.) — these don't go through wrapper callbacks;
+    /// - dispatching the parsed envelope to the corresponding wrapper's
+    ///   `from_plugin(env)` callback (or the framework default which
+    ///   publishes it verbatim onto the bus via `nefor.engine.send`).
+    ///
+    /// Errors raised inside the hook are logged and swallowed — same
+    /// policy as `invoke_dispatch`. A missing global is silently a no-op
+    /// so test harnesses that don't install one keep working.
+    pub fn invoke_from_plugin(&self, source: &str, payload: &str) -> Result<(), LuaError> {
+        let Some(key) = self.invoke_from_plugin.as_ref() else {
+            return Ok(());
+        };
+        let func: mlua::Function = self.lua.registry_value(key)?;
+        match func.call::<()>((source.to_owned(), payload.to_owned())) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::error!(error = %e, "invoke_from_plugin handler raised");
                 Ok(())
             }
         }
