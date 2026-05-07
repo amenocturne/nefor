@@ -278,17 +278,17 @@ local function pick_response_for(chat_id)
   end
 
   -- ----------------------------------------------------------------
-  -- 2. Orchestrator-turn spawn_graph: octopus + lighthouse + parallel
-  --    / combine / spawn_graph. MUST come before CANNED_TEXT — the
-  --    canonical user prompt
-  --    "summarise octopuses and lighthouses in parallel and combine
-  --     into one paragraph" matches the combine-paragraph canned text
-  --    too, but the spawn_graph turn is the one tests assert on.
+  -- 2. Orchestrator-turn spawn_graph: octopus + lighthouse anywhere in
+  --    the latest user message. MUST come before CANNED_TEXT (which
+  --    matches "Combine ... paragraph" for the inner combine node).
+  --    Inner sub-graph nodes don't have both words in their latest
+  --    user message — `sx` sees "Summarise octopuses…", `sy` sees
+  --    "Summarise lighthouses…", `combine` sees "Combine the two
+  --    summaries…" — so the broad two-word match is safe. The
+  --    relay turn's last_user matches the deferred-result branch
+  --    first and returns before reaching here.
   -- ----------------------------------------------------------------
-  if string.find(last_user, "octopus") and string.find(last_user, "lighthouse")
-      and (string.find(last_user, "parallel")
-        or string.find(last_user, "[Cc]ombine")
-        or string.find(last_user, "spawn_graph")) then
+  if string.find(last_user, "octopus") and string.find(last_user, "lighthouse") then
     return {
       text = "",
       finish_reason = "tool_calls",
