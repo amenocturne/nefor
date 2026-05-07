@@ -115,28 +115,32 @@ do
 end
 
 -- ------------------------------------------------------------------
--- session lifecycle (graph_skips_replay → broadcast chat.reset)
+-- session lifecycle (session_end is local-state teardown only)
 -- ------------------------------------------------------------------
 
--- sessions.session_end (delivered via the bus) → emits chat.reset
--- broadcast and graph.cancel for any in-flight runs. Phase 4.5 moved
--- the trigger from receive_msg to a `nefor.bus.on_event` subscriber;
--- the test drives it through `_test.fire_bus` accordingly.
+-- sessions.session_end (delivered via the bus) is internal teardown
+-- bookkeeping for the agentic-loop actor: clears current_state, the
+-- pending-input queue, and any in-flight run id. It does NOT broadcast
+-- chat.reset — chat.reset translates to <provider>.reset on the wire,
+-- which providers handle as reset_all() (every chat history wiped, not
+-- just the active one). With reset_all in this path, any later
+-- /resume of a chat under the same provider lands on a chat_id whose
+-- history the provider no longer holds — model replies with no
+-- context. See commit 5042a06 for the full rationale. The test below
+-- pins the new contract: session_end produces no chat.reset egress.
 do
   _test.set_plugins({ "ollama", "reasoner-graph", "nefor-tui" })
   _test.calls_clear()
 
   _test.fire_bus("sessions.session_end", { session_id = "old-id" })
 
-  local saw_reset = false
   for _, c in ipairs(_test.calls()) do
     local ok, decoded = pcall(json.decode, c.payload)
-    if ok and type(decoded) == "table" and type(decoded.body) == "table"
-       and decoded.body.kind == "chat.reset" then
-      saw_reset = true
+    if ok and type(decoded) == "table" and type(decoded.body) == "table" then
+      assert(decoded.body.kind ~= "chat.reset",
+        "session_end must NOT broadcast chat.reset — would wipe sibling chat histories on the provider, breaking later /resume")
     end
   end
-  assert(saw_reset, "session_end must broadcast chat.reset to clear provider+TUI state")
 end
 
 -- Replay-window gating now lives in `lib/replay_window`, driven by
