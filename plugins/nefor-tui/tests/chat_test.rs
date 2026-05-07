@@ -3652,6 +3652,144 @@ fn submit_re_pins_transcript_to_bottom_after_user_scrolled_up() {
     );
 }
 
+/// Streaming output must NOT yank the user back to the bottom when
+/// they've manually scrolled up to read older context (issue #37).
+/// `stick_to = "end"` only auto-follows new content while
+/// `was_at_end == true`; once the user wheels up the flag clears, and
+/// the streaming-delta append path must respect it — content keeps
+/// growing in the model, but the viewport stays parked at the user's
+/// chosen offset until they explicitly press End / Ctrl+End to re-pin.
+#[test]
+fn streaming_deltas_do_not_yank_user_back_to_bottom_when_scrolled_up() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Pre-fill enough content that there's somewhere to scroll up.
+    for _ in 0..40 {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "chat.message.append", "role": "user", "text": "x" }),
+        );
+    }
+    let _ = render_str(&mut engine);
+
+    fn read_offset(engine: &mut Engine, key: &str) -> u16 {
+        let lua = engine.lua();
+        let chunk = format!(
+            r#"
+            local p = tui.scroll_position("{key}")
+            return p and p.offset or -1
+            "#
+        );
+        let v: i64 = lua
+            .load(chunk.as_str())
+            .eval()
+            .expect("scroll_position eval");
+        if v < 0 {
+            panic!("no scroll_position for `{key}`");
+        }
+        v as u16
+    }
+    fn read_max(engine: &mut Engine, key: &str) -> u16 {
+        let lua = engine.lua();
+        let chunk = format!(
+            r#"
+            local p = tui.scroll_position("{key}")
+            return p and p.max or -1
+            "#
+        );
+        let v: i64 = lua
+            .load(chunk.as_str())
+            .eval()
+            .expect("scroll_position eval");
+        if v < 0 {
+            panic!("no scroll_position for `{key}`");
+        }
+        v as u16
+    }
+
+    // Prereq: auto-scroll has us pinned to the bottom.
+    let pinned = read_offset(&mut engine, "transcript");
+    let max_before_scroll = read_max(&mut engine, "transcript");
+    assert_eq!(
+        pinned, max_before_scroll,
+        "auto-scroll prereq: transcript should be pinned to bottom"
+    );
+
+    // User scrolls up off the bottom via arrow-up. The chat input is
+    // empty at this point, so chat.lua's key.up handler fires
+    // `tui.scroll_by("transcript", -1)` per its arrow-on-empty branch
+    // (the engine-level wheel path is exercised separately in
+    // `mouse_wheel_up_scrolls_transcript`). Walk a few rows so we have
+    // measurable headroom against the streaming content's growth.
+    for _ in 0..6 {
+        engine.handle_key(key("up")).expect("arrow up");
+    }
+    let _ = render_str(&mut engine);
+    let after_scroll = read_offset(&mut engine, "transcript");
+    assert!(
+        after_scroll < pinned,
+        "test prereq: arrow-up must move the viewport off the bottom \
+         (was {pinned}, now {after_scroll})"
+    );
+
+    // Now pump 20 streaming deltas — the LLM's response is arriving
+    // while the user is scrolled up. The deltas grow content_height
+    // (so scroll_y_max grows), but scroll_y must stay parked at
+    // after_scroll because was_at_end is false. Without that
+    // invariant, `stick_to = "end"`'s auto-follow would yank the
+    // user back to the bottom on every delta and they'd never get to
+    // read the older context they scrolled up to see (issue #37).
+    for _ in 0..20 {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "chat.stream.delta", "text": "lorem ipsum dolor sit amet " }),
+        );
+    }
+    let _ = render_str(&mut engine);
+
+    let mid_stream = read_offset(&mut engine, "transcript");
+    let max_mid = read_max(&mut engine, "transcript");
+    assert!(
+        max_mid > max_before_scroll,
+        "streaming deltas must grow content_height past the pre-scroll max \
+         (was {max_before_scroll}, now {max_mid})"
+    );
+    assert_eq!(
+        mid_stream, after_scroll,
+        "streaming deltas must NOT yank the viewport back to the bottom — \
+         scroll_y was {after_scroll} when user scrolled up, expected to stay \
+         there but is now {mid_stream} (max grew to {max_mid})"
+    );
+
+    // Scroll back to bottom via the explicit programmatic path the
+    // chat-side `/end` slash command + key.end (when keyboard isn't
+    // captured by the input) both use. After this, was_at_end flips
+    // back to true and a subsequent delta would auto-follow as before.
+    engine
+        .lua()
+        .load(r#"tui.scroll_into_view("transcript")"#)
+        .exec()
+        .expect("scroll_into_view");
+    // The Lua call only QUEUES the scroll command on the host's
+    // pending list — it doesn't dispatch through the engine. Drive a
+    // dispatch_msg with a no-op kind so engine.dispatch_msg drains the
+    // queue via take_scroll_commands, the same way a real Lua-side
+    // tui.scroll_into_view() inside an `update` reducer would.
+    let drain = engine.lua().create_table().expect("table");
+    drain.set("kind", "noop").expect("kind");
+    engine.dispatch_msg(drain).expect("drain");
+    let _ = render_str(&mut engine);
+    let after_repin = read_offset(&mut engine, "transcript");
+    let max_after_repin = read_max(&mut engine, "transcript");
+    assert_eq!(
+        after_repin, max_after_repin,
+        "tui.scroll_into_view must snap viewport back to bottom \
+         (offset={after_repin}, max={max_after_repin})"
+    );
+}
+
 #[test]
 fn slash_clear_is_alias_for_slash_new() {
     let mut engine = Engine::new(80, 24).expect("engine");
