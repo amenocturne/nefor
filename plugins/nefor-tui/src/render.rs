@@ -19,6 +19,7 @@ use crate::desc::Style;
 use crate::instance::WidgetInstance;
 use crate::layout;
 use crate::mouse::SelectionRange;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
@@ -217,12 +218,28 @@ fn reset_layout_state(inst: &mut WidgetInstance) {
 
 fn push_line(out: &mut String, line: &Line) {
     let mut current_style: Option<Style> = None;
-    for cell in &line.cells {
+    let mut i = 0;
+    while i < line.cells.len() {
+        let cell = &line.cells[i];
         if Some(cell.style) != current_style {
             write_style(out, &cell.style);
             current_style = Some(cell.style);
         }
         out.push_str(&cell.text);
+        // Wide chars (East-Asian Wide / Fullwidth / most emoji) advance
+        // the terminal cursor by their display width, not by 1. The
+        // painter records a wide char as one model cell with the glyph
+        // plus (w - 1) trailing "spillover" blank cells (so prior-frame
+        // ink doesn't bleed and neighbouring writes know the cell is
+        // taken). The terminal already moves the cursor past those
+        // spillover cells when it renders the wide glyph, so emitting
+        // them as ASCII spaces here would push every subsequent cell on
+        // the row right by (w - 1) per wide char — visible as the panel
+        // divider shifting right one cell per emoji on the rows that
+        // contain emoji. Skip the spillover cells in the byte stream;
+        // their model state is purely a paint-side bookkeeping device.
+        let w = UnicodeWidthStr::width(cell.text.as_str()).max(1);
+        i += w;
     }
     out.push_str(SGR_RESET);
 }
@@ -435,6 +452,32 @@ mod tests {
         let buf = make_buf(&["hi      "], 8);
         let text = extract_selection_text(&buf, SelectionRange::normalised((0, 0), (7, 0)));
         assert_eq!(text, "hi");
+    }
+
+    /// Wide chars (East-Asian Wide / Fullwidth / most emoji) advance the
+    /// terminal's cursor by their display width — so a row of model
+    /// width N that contains a wide char must NOT emit a trailing
+    /// "spillover" cell as a literal space, or the terminal runs the
+    /// cursor one column past the row's intended right edge per wide
+    /// char. Visible failure mode: the panel divider (next column over)
+    /// looked one cell to the right on every emoji-bearing row, jagging
+    /// the otherwise-flush vertical line. Fix is in `push_line`: walk
+    /// cells stepping by display width instead of by 1.
+    #[test]
+    fn wide_char_does_not_emit_extra_space_into_byte_stream() {
+        let (_r, _rec, out) = render_once(10, 1, text_root("ab📄cd"));
+        // The cell payload run is `ab📄cd    ` — emoji counts as one
+        // visible char that the terminal expands to 2 cells. The earlier
+        // shape emitted `ab📄 cd    ` (extra space after the emoji),
+        // which terminals render as 11 visible cells in a 10-wide row.
+        assert!(
+            out.contains("ab📄cd    "),
+            "expected emoji + 4 trailing pads, got: {out:?}"
+        );
+        assert!(
+            !out.contains("ab📄 cd"),
+            "spillover blank must not be emitted as a literal space"
+        );
     }
 
     #[test]
