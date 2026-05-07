@@ -82,10 +82,11 @@
 
 local json = nefor.json
 
-local envelope    = require("lib.envelope")
-local ids         = require("lib.ids")
-local results_lib = require("lib.results")
-local graph_lib   = require("lib.graph")
+local envelope      = require("lib.envelope")
+local ids           = require("lib.ids")
+local results_lib   = require("lib.results")
+local graph_lib     = require("lib.graph")
+local replay_window = require("lib.replay_window")
 
 -- ------------------------------------------------------------------
 -- module-private state — held in `state` table; mutations are explicit
@@ -115,15 +116,6 @@ local state = {
   -- arrives for a firing_id we care about (today: only wrap-node
   -- next_state capture).
   firing_to_node       = {},    ---@type table
-
-  -- Session-replay flag. While true, graph emissions are dropped (the
-  -- graph already ran in the prior session).
-  replay_mode = false,
-
-  -- Internal resume-mode bookkeeping: bus-subscriber path for boot vs
-  -- resume disambiguation. Set true by session_end teardown so the
-  -- following session_start enters replay; cleared once consumed.
-  expecting_replay = false,
 
   -- Observer registries. Public on_* setters append; producers fire via
   -- pcall so a bad observer doesn't break the chain.
@@ -578,33 +570,7 @@ local function teardown_for_session_end()
   state.deferred_queue     = {}
   state.pending_user_inputs = {}
   emit(nil, { kind = "chat.reset" })
-  state.expecting_replay = true
   nefor.log.info("agentic-loop: sessions.session_end → state cleared", {})
-end
-
-local function enter_replay_mode()
-  if not state.replay_mode then
-    state.replay_mode = true
-    nefor.log.info("agentic-loop: sessions.session_start (resume) → replay_mode=true", {})
-  end
-end
-
-local function leave_replay_mode()
-  if state.replay_mode then
-    state.replay_mode = false
-    nefor.log.info("agentic-loop: sessions.resume_done → replay_mode=false", {})
-  end
-end
-
--- ------------------------------------------------------------------
--- replay_mode getter — exposed to other actors (resident reasoners,
--- sibling wrappers) so they can short-circuit graph dispatch while a
--- session is replaying. The flag itself moves to a sessions slot in a
--- later phase; the getter is the integration point.
--- ------------------------------------------------------------------
-
-local function is_replay_mode()
-  return state.replay_mode
 end
 
 -- ------------------------------------------------------------------
@@ -823,7 +789,6 @@ function M.fire_reasoning_observers(text) fire_reasoning_observers(text) end
 function M.fire_tool_start_observers(id, name, input) fire_tool_start_observers(id, name, input) end
 function M.fire_tool_end_observers(id, output, err) fire_tool_end_observers(id, output, err) end
 
-function M.is_replay_mode() return is_replay_mode() end
 function M.config() return state.config end
 
 -- Back-compat with agentic_workflow.build_template (used by tests).
@@ -863,25 +828,6 @@ local function receive_msg(entry)
   local kind = body.kind
   if type(kind) ~= "string" then return end
 
-  -- Sessions lifecycle. Drives replay_mode + state teardown.
-  if kind == "sessions.session_end" then
-    teardown_for_session_end()
-    return
-  end
-  if kind == "sessions.session_start" then
-    if state.expecting_replay then
-      enter_replay_mode()
-      state.expecting_replay = false
-    else
-      nefor.log.info("agentic-loop: sessions.session_start (boot) → live", {})
-    end
-    return
-  end
-  if kind == "sessions.resume_done" then
-    leave_replay_mode()
-    return
-  end
-
   -- Engine shutdown — sessions handles persistence; nothing for us.
   if kind == "engine.shutdown" then return end
 
@@ -897,7 +843,7 @@ local function receive_msg(entry)
   --   * tool.result { id=<run_id|firing_id>, result | error } — both
   --     run-close and per-firing close share the kind; we disambiguate
   --     by id.
-  if state.replay_mode then
+  if replay_window.active() then
     if kind == "graph.node.fired" then return end
     if kind == "tool.result" then
       -- Drop only tool.result envelopes that target one of our tracked
@@ -925,23 +871,16 @@ local function receive_msg(entry)
   end
 end
 
--- Synchronous resume-phase hook registration. Phase 1 compat — these
--- close the one-tick window between sessions.resume()'s broadcast and
--- the bus subscriber's next-tick fire. agentic_workflow.lua's setup()
--- subscribed via sessions.on_resume_phase + nefor.bus.on_event; we
--- still need both because sessions.on_resume_phase only fires inside
--- resume(), and shutdown teardown comes via the bus.
-local function install_session_hooks()
-  local sessions_ok, sessions_mod = pcall(require, "sessions")
-  if sessions_ok and type(sessions_mod) == "table"
-      and type(sessions_mod.on_resume_phase) == "function" then
-    sessions_mod.on_resume_phase("session_end",   teardown_for_session_end)
-    sessions_mod.on_resume_phase("session_start", enter_replay_mode)
-    sessions_mod.on_resume_phase("resume_done",   leave_replay_mode)
-  end
+-- Drive `teardown_for_session_end` from the bus marker. Replay-mode
+-- gating is owned by `lib/replay_window`, which subscribes to
+-- `sessions.replay.start` / `sessions.replay.end` independently — the
+-- old `session_start` / `resume_done` lifecycle hooks are dead weight
+-- now that the gate flips on the framing markers instead.
+if nefor.bus and nefor.bus.on_event then
+  nefor.bus.on_event("sessions.session_end", function(_entry)
+    teardown_for_session_end()
+  end)
 end
-
-install_session_hooks()
 
 -- ------------------------------------------------------------------
 -- module table — actor contract + public API
@@ -965,8 +904,6 @@ M._internals  = {
     state.tool_id_to_key = {}
     state.chat_id_stream_visible = {}
     state.firing_to_node = {}
-    state.replay_mode = false
-    state.expecting_replay = false
     state.stream_observers = {}
     state.reasoning_observers = {}
     state.tool_start_observers = {}

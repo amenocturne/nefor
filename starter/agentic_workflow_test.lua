@@ -112,13 +112,15 @@ end
 -- session lifecycle (graph_skips_replay → broadcast chat.reset)
 -- ------------------------------------------------------------------
 
--- session_end → emits chat.reset broadcast and graph.cancel for any
--- in-flight runs.
+-- sessions.session_end (delivered via the bus) → emits chat.reset
+-- broadcast and graph.cancel for any in-flight runs. Phase 4.5 moved
+-- the trigger from receive_msg to a `nefor.bus.on_event` subscriber;
+-- the test drives it through `_test.fire_bus` accordingly.
 do
   _test.set_plugins({ "ollama", "reasoner-graph", "nefor-tui" })
   _test.calls_clear()
 
-  send_to_loop("sessions", { kind = "sessions.session_end", session_id = "old-id" })
+  _test.fire_bus("sessions.session_end", { session_id = "old-id" })
 
   local saw_reset = false
   for _, c in ipairs(_test.calls()) do
@@ -131,19 +133,22 @@ do
   assert(saw_reset, "session_end must broadcast chat.reset to clear provider+TUI state")
 end
 
--- replay_mode flag flips during session_end → session_start window.
--- After resume_done the flag clears.
+-- Replay-window gating now lives in `lib/replay_window`, driven by
+-- `sessions.replay.start` / `sessions.replay.end` framing markers.
+-- agentic-loop short-circuits inside `receive_msg` based on the
+-- module's `active()` getter; the test asserts the flip end-to-end by
+-- firing the markers and probing the gate.
 do
+  local replay_window = require("lib.replay_window")
   _test.set_plugins({ "ollama", "reasoner-graph", "nefor-tui" })
 
-  -- session_end (already entered replay-expectation gate above)
-  send_to_loop("sessions", { kind = "sessions.session_start", session_id = "new-id" })
-  assert_eq(agentic_loop.is_replay_mode(), true,
-    "after session_end → session_start, replay_mode is true")
+  _test.fire_bus("sessions.replay.start", { session_id = "new-id", count = 0 })
+  assert_eq(replay_window.active(), true,
+    "after replay.start, replay_window is active")
 
-  send_to_loop("sessions", { kind = "sessions.resume_done", session_id = "new-id" })
-  assert_eq(agentic_loop.is_replay_mode(), false,
-    "after resume_done, replay_mode lifts")
+  _test.fire_bus("sessions.replay.end", { session_id = "new-id" })
+  assert_eq(replay_window.active(), false,
+    "after replay.end, replay_window lifts")
 end
 
 -- ------------------------------------------------------------------
@@ -291,7 +296,7 @@ do
   fresh_loop()
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "first" })
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "stranded" })
-  send_to_loop("sessions", { kind = "sessions.session_end", session_id = "old" })
+  _test.fire_bus("sessions.session_end", { session_id = "old" })
   _test.calls_clear()
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "post-swap" })
   for _, c in ipairs(decode_calls()) do

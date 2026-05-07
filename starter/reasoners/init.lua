@@ -37,8 +37,9 @@
 
 local json = nefor.json
 
-local envelope    = require("lib.envelope")
-local ids         = require("lib.ids")
+local envelope      = require("lib.envelope")
+local ids           = require("lib.ids")
+local replay_window = require("lib.replay_window")
 
 local emit_as        = envelope.emit_as
 local emit_to        = envelope.emit_to
@@ -419,7 +420,7 @@ local function receive_msg(entry)
 
   -- Skip during replay — graph already ran; re-dispatch would
   -- duplicate every side effect.
-  if agentic_loop.is_replay_mode() then return end
+  if replay_window.active() then return end
 
   -- Dispatch tool.invoke { name in handlers }. Anything else on the
   -- bus is for someone else (real tools, spawn_graph routed to
