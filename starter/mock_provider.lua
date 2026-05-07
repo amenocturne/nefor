@@ -573,14 +573,16 @@ local CANNED_REASONING_CHUNKS = {
   "Producing the final answer now.",
 }
 
--- Stream pacing — mimic ~80 tok/s typical of cloud LLM providers so
--- the interactive feel matches a real model. ~4 chars/token English
--- × 80 tok/s = ~320 chars/sec → 16-char chunks at 50ms intervals.
+-- Stream pacing — mimic ~200 tok/s, fast cloud LLM territory. ~4
+-- chars/token English × 200 tok/s = ~800 chars/sec → 16-char chunks
+-- at 20ms intervals. Slower than instant so streaming reads as live
+-- output instead of paste; faster than 80 tok/s so it doesn't become
+-- the dominant cost of an interactive turn.
 -- `os.execute("sleep …")` spawns a sleep subprocess per chunk; cheap
 -- enough at this rate (~20/sec) and the mock has no other concurrent
 -- work to do while a stream is in flight.
 local STREAM_CHUNK_CODEPOINTS = 16
-local STREAM_PACE_SECONDS     = 0.05
+local STREAM_PACE_SECONDS     = 0.02
 
 -- Skip pacing under tests — agentic_cli_mock_e2e fires several
 -- scenarios with a 10s wall-clock cap and the long-stream regression
@@ -629,7 +631,7 @@ local function emit_stream(chat_id, text, opts)
     emit_reasoning(chat_id, id)
   end
 
-  -- Stream the response in small fixed-size chunks paced to ~80 tok/s
+  -- Stream the response in small fixed-size chunks paced to ~200 tok/s
   -- to mimic a real cloud LLM. Chunk boundaries snap to UTF-8
   -- codepoint edges (string.sub is byte-indexed; slicing inside a
   -- multibyte codepoint produces invalid UTF-8 that downstream
