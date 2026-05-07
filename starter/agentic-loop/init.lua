@@ -303,12 +303,28 @@ local function cancel_all()
 end
 
 -- /new handler.
+--
+-- Clears orchestrator-side state so the next submit mints a fresh
+-- chat_id under the active provider. Does NOT broadcast `chat.reset`
+-- — that envelope translates to `<provider>.reset` on the wire which
+-- providers handle as `reset_all()`, wiping every chat history they
+-- hold (not just the active chat). With reset_all in the /new path,
+-- a later /resume of any prior chat under the same provider lands on
+-- a chat_id whose history the provider no longer has — the model
+-- replies with no context.
+--
+-- The clean semantics: each chat_id is an independent conversation
+-- that lives on the provider for the lifetime of the provider
+-- process. /new starts a NEW chat_id (fresh state from the model's
+-- perspective by virtue of no prior messages) without touching
+-- siblings. /resume restores any chat_id and the provider still has
+-- its history. Cross-process resume (after restarting nefor) still
+-- needs an explicit replay-from-session-log — tracked separately.
 local function new_chat()
   state.current_state = nil
   state.current_run_id = nil
   state.deferred_queue = {}
   state.pending_user_inputs = {}
-  emit(nil, { kind = "chat.reset" })
 end
 
 -- Mid-chat /model picker.
@@ -657,7 +673,9 @@ local function teardown_for_session_end()
   state.current_state      = nil
   state.deferred_queue     = {}
   state.pending_user_inputs = {}
-  emit(nil, { kind = "chat.reset" })
+  -- Don't broadcast `chat.reset` here either — same reason as new_chat
+  -- above. Provider-side chat histories stay so /resume of any prior
+  -- chat under the same provider gets its history back.
   nefor.log.info("agentic-loop: sessions.session_end → state cleared", {})
 end
 
