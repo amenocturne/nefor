@@ -308,10 +308,17 @@ end
 
 ---@param target_session_id string
 local function do_resume(target_session_id)
-  if state.current_session_id == target_session_id then
-    return  -- no-op resume
-  end
-
+  -- Same-id resume is a re-load, not a no-op. Chat.lua's `/resume`
+  -- and picker handlers locally clear the transcript BEFORE emitting
+  -- `sessions.resume_request` (the imminent replay is expected to
+  -- repaint), so an early-return here would leave the user staring
+  -- at an empty chat. Cycling the full lifecycle replays the on-disk
+  -- log against the (already-cleared) chat surface and rebuilds the
+  -- transcript exactly the way a cross-session resume does. close +
+  -- reopen of the same path is safe in append mode; the file's prior
+  -- traffic is what `replay_jsonl` reads, and `should_prune_session`
+  -- stays false when the file has content (so no prune happens).
+  --
   -- 1. Announce end of outgoing session.
   send_msg({ kind = "control", event = "sessions.session_end",
              extra = { session_id = state.current_session_id } })

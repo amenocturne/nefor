@@ -560,11 +560,29 @@ fn resume_to_existing_session_appends_in_order() {
 }
 
 #[test]
-fn resume_to_self_is_noop() {
-    // `M.resume(current_id)` should bail out instead of cycling
-    // session_end → session_start. Otherwise a duplicate resume_request
-    // (e.g., user clicks a row twice) would tear down state mid-turn
-    // for nothing.
+fn resume_to_self_replays_log_so_chat_repaints() {
+    // Regression for: "/resume the active session leaves the chat blank."
+    //
+    // chat.lua's `/resume <id>` and picker handlers locally clear
+    // `entries` BEFORE emitting `sessions.resume_request`, expecting the
+    // imminent replay to repaint the transcript. The old contract had
+    // `do_resume(current_id)` early-return as a no-op (protecting against
+    // a duplicate resume_request tearing down state mid-turn). Result:
+    // chat cleared, sessions did nothing, transcript stayed empty.
+    //
+    // The new contract: same-id resume cycles the full lifecycle —
+    // session_end, session_start, replay.start, replay envelopes from
+    // disk, replay.end, resume_done — so the chat's pre-cleared
+    // transcript is rebuilt from the on-disk log. The "duplicate click"
+    // case is covered by chat.lua already: each click clears entries and
+    // each subsequent resume re-fills them; the final state matches the
+    // log. Re-replay is idempotent at the chat-state level (entries are
+    // rebuilt from `chat.message.append` envelopes either way).
+    //
+    // This test pins:
+    //   1. the lifecycle markers fire in the standard order
+    //   2. the on-disk persisted entry (a chat.input.submit) is replayed
+    //      to its original target (broadcast, target=nil here).
     let tempdir = tempfile::tempdir().expect("tempdir");
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let prev = std::env::var("NEFOR_DATA_HOME").ok();
@@ -574,23 +592,43 @@ fn resume_to_self_is_noop() {
     install_stub_nefor(&lua).expect("install nefor stub");
     set_package_path(&lua).expect("set package.path");
 
-    // Set up a recorder so we can prove the resume short-circuits.
+    // Recorder captures every emission's body.kind so we can assert the
+    // lifecycle order AND the replayed-content kind.
     lua.load(
         r#"
-        _emit_count = 0
-        local original_send = nefor.engine.send
-        nefor.engine.send = function(payload, target)
-            _emit_count = _emit_count + 1
-            return original_send(payload, target)
+        _trace = {}
+        local json = nefor.json
+        nefor.engine.send = function(payload, _target)
+            local ok, decoded = pcall(json.decode, payload)
+            if ok and type(decoded) == "table"
+               and type(decoded.body) == "table"
+               and type(decoded.body.kind) == "string" then
+                _trace[#_trace + 1] = "emit:" .. decoded.body.kind
+            end
         end
         sessions = require("sessions")
         sessions_test = require("sessions.test")
         sessions.init()
-        _emit_count = 0  -- reset after init's emit
+
+        -- Persist one chat.input.submit so replay has something to
+        -- re-emit. Use the test handle that drives persist_envelope
+        -- directly with a step-origin entry.
+        sessions_test._persist_envelope({
+            ts      = "2026-05-04T00:00:01.000Z",
+            origin  = "step",
+            payload = json.encode({
+                type = "event",
+                from = "nefor-tui",
+                body = { kind = "chat.input.submit", text = "hello" },
+            }),
+        })
+
+        -- Clear the trace so we only see what resume() does.
+        _trace = {}
         "#,
     )
     .exec()
-    .expect("init + recorder");
+    .expect("init + recorder + seed");
 
     let id: String = lua
         .load(r#"return sessions.current_id()"#)
@@ -599,13 +637,26 @@ fn resume_to_self_is_noop() {
     let resume_call = format!(r#"sessions.resume("{id}")"#);
     lua.load(&resume_call).exec().expect("resume to self");
 
-    let after: i64 = lua
-        .load(r#"return _emit_count"#)
-        .eval()
-        .expect("emit_count");
+    let trace: Table = lua.globals().get("_trace").expect("_trace");
+    let len = trace.len().expect("len") as usize;
+    let ordered: Vec<String> = (1..=len)
+        .map(|i| trace.get::<String>(i).expect("trace entry"))
+        .collect();
+    let expected = vec![
+        "emit:sessions.session_end",
+        "emit:sessions.session_start",
+        "emit:sessions.replay.start",
+        // The replayed entry — chat.input.submit was the seeded payload.
+        "emit:chat.input.submit",
+        "emit:sessions.replay.end",
+        "emit:sessions.resume_done",
+    ];
     assert_eq!(
-        after, 0,
-        "resume to current session must not emit any control events"
+        ordered.iter().map(String::as_str).collect::<Vec<_>>(),
+        expected,
+        "same-session resume must cycle the full lifecycle and replay \
+         persisted entries so chat.lua's pre-cleared transcript repaints; \
+         got {ordered:?}"
     );
 
     match prev.as_deref() {
