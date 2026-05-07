@@ -741,23 +741,46 @@ fn try_dispatch(state: &mut RunState, node_id: &str, peers: &PeerSet, effects: &
         firing_id.clone(),
         (node.id.clone(), firing_id.clone()),
     );
+    // Lifecycle marker FIRST, then the targeted dispatch. Order matters:
+    // an in-process synchronous reasoner (Lua-resident `terminal`,
+    // `adapter`, `tool-executor`, …) replies on its own `tool.invoke`
+    // inside the same dispatch tick, emitting `tool.result` before
+    // control returns here for the next effect. If `NodeDispatched`
+    // (`graph.node.fired`) is pushed AFTER `DispatchNode`
+    // (`tool.invoke`), the bus order ends up:
+    //
+    //   1. tool.invoke              (consumed by the reasoner)
+    //   2. tool.result              (reasoner's reply, broadcast)
+    //   3. graph.node.fired         (lifecycle marker)
+    //
+    // Observers that build a `firing_id → (run_id, node_id)` map from
+    // `graph.node.fired` (chat.lua's DAG panel; agentic-loop's wrap
+    // next_state capture) then see (2) BEFORE (3) and silently drop
+    // the close — the firing stays "running" forever in their view.
+    // Visible symptom: the `terminal` node in the orchestrator graph
+    // ticks elapsed-ms in the chat DAG sidebar after the agent's full
+    // response is delivered, because terminal's tool.result landed
+    // before its graph.node.fired (Bug A6 terminal node keeps
+    // ticking).
+    //
+    // Pushing `NodeDispatched` first puts `graph.node.fired` on the
+    // bus before `tool.invoke`, so the lifecycle marker observed by
+    // every consumer arrives before any reasoner can synchronously
+    // close the firing.
+    effects.push(Effect::NodeDispatched {
+        run_id: state.run_id.clone(),
+        node_id: node.id.clone(),
+        firing_id: firing_id.clone(),
+        reasoner: node.reasoner.clone(),
+    });
     effects.push(Effect::DispatchNode {
         reasoner: node.reasoner.clone(),
         run_id: state.run_id.clone(),
         node_id: node.id.clone(),
-        firing_id: firing_id.clone(),
+        firing_id,
         args: node.args.clone(),
         inputs,
         prev_state,
-    });
-    // Broadcast lifecycle marker alongside the targeted dispatch so
-    // observers can light up a "running" badge without listening on the
-    // reasoner-prefixed channel. Paired one-to-one with DispatchNode.
-    effects.push(Effect::NodeDispatched {
-        run_id: state.run_id.clone(),
-        node_id: node.id.clone(),
-        firing_id,
-        reasoner: node.reasoner.clone(),
     });
     // Per-node fanout dispatch happens at result time inside
     // `propagate_after_completion`. No work required at dispatch.
@@ -1690,12 +1713,31 @@ mod tests {
             SubmitOutcome::Accepted(e) => e.into_vec(),
             SubmitOutcome::Rejected(_) => panic!("expected accepted"),
         };
-        // RunStarted, DispatchNode, NodeDispatched.
+        // RunStarted, NodeDispatched, DispatchNode. NodeDispatched fires
+        // BEFORE DispatchNode so the lifecycle marker (graph.node.fired)
+        // lands on the bus before the targeted tool.invoke; an in-process
+        // synchronous reasoner that replies immediately on tool.invoke
+        // would otherwise emit tool.result before any observer saw the
+        // firing's graph.node.fired (Bug A6 root cause).
         assert_eq!(effects.len(), 3);
         assert!(
             matches!(&effects[0], Effect::RunStarted { run_id, total_nodes } if run_id == "run-1" && *total_nodes == 1)
         );
         match &effects[1] {
+            Effect::NodeDispatched {
+                run_id,
+                node_id,
+                firing_id,
+                reasoner,
+            } => {
+                assert_eq!(run_id, "run-1");
+                assert_eq!(node_id, "n1");
+                assert_eq!(reasoner, "r");
+                assert!(!firing_id.is_empty());
+            }
+            other => panic!("unexpected effect: {other:?}"),
+        }
+        match &effects[2] {
             Effect::DispatchNode {
                 reasoner,
                 run_id,
@@ -1711,20 +1753,6 @@ mod tests {
                 assert_eq!(args, &json!({"x": 1}));
                 assert_eq!(prev_state, &Value::Null);
                 assert!(!firing_id.is_empty(), "firing_id must be minted");
-            }
-            other => panic!("unexpected effect: {other:?}"),
-        }
-        match &effects[2] {
-            Effect::NodeDispatched {
-                run_id,
-                node_id,
-                firing_id,
-                reasoner,
-            } => {
-                assert_eq!(run_id, "run-1");
-                assert_eq!(node_id, "n1");
-                assert_eq!(reasoner, "r");
-                assert!(!firing_id.is_empty());
             }
             other => panic!("unexpected effect: {other:?}"),
         }
@@ -1852,8 +1880,17 @@ mod tests {
         )
         .into_vec();
         let f2 = first_dispatch_firing_id(&e2);
+        // NodeDispatched comes first now (lifecycle marker before
+        // targeted dispatch — see `try_dispatch` for rationale); the
+        // DispatchNode follows. We assert on the DispatchNode by
+        // searching rather than indexing so the test is robust to
+        // either ordering.
+        let dn = e2
+            .iter()
+            .find(|e| matches!(e, Effect::DispatchNode { .. }))
+            .expect("DispatchNode in e2");
         assert!(
-            matches!(&e2[0], Effect::DispatchNode { node_id, inputs, .. } if {
+            matches!(dn, Effect::DispatchNode { node_id, inputs, .. } if {
                 node_id == "n2" && inputs.get("n1") == Some(&json!({"output": "ok1"}))
             })
         );
@@ -1865,7 +1902,11 @@ mod tests {
         )
         .into_vec();
         let f3 = first_dispatch_firing_id(&e3);
-        assert!(matches!(&e3[0], Effect::DispatchNode { node_id, .. } if node_id == "n3"));
+        let dn3 = e3
+            .iter()
+            .find(|e| matches!(e, Effect::DispatchNode { .. }))
+            .expect("DispatchNode in e3");
+        assert!(matches!(dn3, Effect::DispatchNode { node_id, .. } if node_id == "n3"));
 
         let e4 = Scheduler::handle_node_result(
             &runs,
@@ -1962,7 +2003,14 @@ mod tests {
             &result_body("run-d", "n3", Some(&f3), Ok(json!("c")), None),
         )
         .into_vec();
-        match &r3[0] {
+        // NodeDispatched (lifecycle) precedes DispatchNode (targeted
+        // tool.invoke) per try_dispatch ordering; find the
+        // DispatchNode rather than indexing positionally.
+        let dn = r3
+            .iter()
+            .find(|e| matches!(e, Effect::DispatchNode { .. }))
+            .expect("DispatchNode in r3");
+        match dn {
             Effect::DispatchNode {
                 node_id, inputs, ..
             } => {
@@ -2369,7 +2417,14 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_emits_node_dispatched_alongside_dispatch_node() {
+    fn dispatch_emits_node_dispatched_before_dispatch_node() {
+        // Inverted from the prior shape: NodeDispatched (lifecycle marker
+        // → graph.node.fired) MUST land on the bus BEFORE DispatchNode
+        // (targeted tool.invoke). An in-process synchronous reasoner
+        // would otherwise emit tool.result before any observer saw the
+        // firing's graph.node.fired, breaking the
+        // firing_id → (run_id, node_id) map every consumer builds from
+        // graph.node.fired (Bug A6 root cause).
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
@@ -2386,28 +2441,28 @@ mod tests {
             _ => panic!("accepted"),
         };
         for (i, e) in effects.iter().enumerate() {
-            if let Effect::DispatchNode {
-                node_id,
+            if let Effect::NodeDispatched {
                 run_id,
-                reasoner,
+                node_id,
                 firing_id,
-                ..
+                reasoner,
             } = e
             {
-                let nd = effects.get(i + 1).expect("trailing NodeDispatched");
-                match nd {
-                    Effect::NodeDispatched {
-                        run_id: nd_rid,
-                        node_id: nd_nid,
-                        firing_id: nd_fid,
-                        reasoner: nd_r,
+                let dn = effects.get(i + 1).expect("trailing DispatchNode");
+                match dn {
+                    Effect::DispatchNode {
+                        run_id: dn_rid,
+                        node_id: dn_nid,
+                        firing_id: dn_fid,
+                        reasoner: dn_r,
+                        ..
                     } => {
-                        assert_eq!(nd_rid, run_id);
-                        assert_eq!(nd_nid, node_id);
-                        assert_eq!(nd_fid, firing_id);
-                        assert_eq!(nd_r, reasoner);
+                        assert_eq!(dn_rid, run_id);
+                        assert_eq!(dn_nid, node_id);
+                        assert_eq!(dn_fid, firing_id);
+                        assert_eq!(dn_r, reasoner);
                     }
-                    other => panic!("expected NodeDispatched after DispatchNode, got: {other:?}"),
+                    other => panic!("expected DispatchNode after NodeDispatched, got: {other:?}"),
                 }
             }
         }
