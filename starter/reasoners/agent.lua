@@ -27,11 +27,34 @@
 --     id     = <firing_id>,
 --     result = {
 --       text       = <final assistant answer>,
---       structured = <opaque>?,    -- reserved for the `finalize` tool;
---                                  -- absent in v0.1
+--       structured = <opaque>?,    -- populated when the agent terminates
+--                                  -- via the `finalize` tool (see below);
+--                                  -- absent on text-only termination.
 --       next_state = { chat_id = <string> },
 --     }
 --   }
+--
+-- ## `finalize` tool
+--
+-- A synthetic tool the agent reasoner injects into every firing's
+-- advertised set. Sub-agents call `finalize(answer, ...arbitrary
+-- fields...)` to terminate the run with structured output. The
+-- reasoner intercepts the call BEFORE allowlist enforcement /
+-- tool-gate dispatch:
+--
+--   * `result.structured` = the full args object (so downstream
+--     reasoner combinators can read typed fields like `findings`,
+--     `risks`, `confidence` to compose the next agent's prompt).
+--   * `result.text`       = `args.answer` (a human-readable summary
+--     for non-structured-aware consumers).
+--
+-- `finalize` is auto-included regardless of the caller's
+-- `args.tool_allowlist` — it's an agent-internal terminator, not a
+-- routed tool. If the model returns `finalize` alongside other
+-- tool_calls in the same response, `finalize` wins (the others are
+-- dropped). Empty / missing `args.answer` synthesizes a placeholder
+-- text rather than erroring — the structured payload is still
+-- captured.
 --
 -- ## Internal turn-cycle
 --
@@ -79,6 +102,38 @@ local emit_to = envelope.emit_to
 local next_id = envelope.next_id
 
 local M = {}
+
+-- The `finalize` tool's reserved name. Calls under this name are
+-- intercepted as terminators, not dispatched to tool-gate.
+local FINALIZE_NAME = "finalize"
+
+-- JSON schema for the `finalize` tool. Only `answer` is required;
+-- additional fields pass through into `result.structured` verbatim
+-- (`additionalProperties = true`). Role-specific finalize-tool
+-- schemas (per spec §2 "Structured finalization") layer on top of
+-- this base by adding fields like `findings` / `risks` /
+-- `context_for_next_agent` to the role's system prompt.
+local FINALIZE_SCHEMA = {
+  type = "function",
+  ["function"] = {
+    name = FINALIZE_NAME,
+    description = "Terminate this agent's run with a final answer and any structured fields needed by downstream nodes.",
+    parameters = {
+      type       = "object",
+      properties = {
+        answer = {
+          type        = "string",
+          description = "Human-readable final answer.",
+        },
+      },
+      required             = { "answer" },
+      additionalProperties = true,
+    },
+  },
+}
+
+M.FINALIZE_NAME   = FINALIZE_NAME
+M.FINALIZE_SCHEMA = FINALIZE_SCHEMA
 
 -- Forward-declared; bound on first dispatch (require cycle: agent.lua
 -- is loaded by reasoners/init.lua, which is loaded by agentic-loop's
@@ -147,16 +202,20 @@ local function clear_firing(firing_id)
   agents[firing_id] = nil
 end
 
-local function send_terminal_ok(firing_id, text)
+local function send_terminal_ok(firing_id, text, structured)
   local entry = agents[firing_id]
   local chat_id = entry and entry.chat_id or nil
+  local result = {
+    text       = text or "",
+    next_state = { chat_id = chat_id },
+  }
+  if structured ~= nil then
+    result.structured = structured
+  end
   emit_as("agent", nil, {
     kind   = "tool.result",
     id     = firing_id,
-    result = {
-      text       = text or "",
-      next_state = { chat_id = chat_id },
-    },
+    result = result,
   })
   clear_firing(firing_id)
 end
@@ -249,8 +308,15 @@ local function handle(body)
   if type(model) == "string" and #model > 0 then
     create_body.model = model
   end
+  -- Advertise the role's allowlist + the synthetic `finalize`
+  -- terminator. `finalize` rides on every agent firing regardless of
+  -- the caller's allowlist (spec §2 "Structured finalization"); it's
+  -- intercepted here, not routed through tool-gate.
   if type(args.tool_allowlist) == "table" then
-    create_body.tools = args.tool_allowlist
+    local advertised = {}
+    for _, n in ipairs(args.tool_allowlist) do advertised[#advertised + 1] = n end
+    advertised[#advertised + 1] = FINALIZE_NAME
+    create_body.tools = advertised
   end
   emit_to(provider, create_body)
 
@@ -325,6 +391,55 @@ end
 -- definition lives below.
 local finish_turn
 
+-- Pull the `finalize` call out of a tool_calls list, if present.
+-- Returns the matching call or nil. When multiple finalize calls
+-- arrive in the same response (degenerate case), the first wins.
+local function find_finalize_call(tool_calls)
+  if type(tool_calls) ~= "table" then return nil end
+  for _, call in ipairs(tool_calls) do
+    if type(call) == "table" then
+      local name = call.name or call.tool
+      if name == FINALIZE_NAME then return call end
+    end
+  end
+  return nil
+end
+
+-- Build the terminal payload from a finalize tool_call.
+--   text       = args.answer  (or a placeholder if missing/empty)
+--   structured = the full args object verbatim
+--
+-- A non-table args slot (some providers stream "{}" as a string;
+-- normally already JSON-decoded by the provider — see openai-provider
+-- main.rs:1460) is treated as empty. We never error on a malformed
+-- finalize: the contract is "terminate", and synthesising a
+-- placeholder is strictly more useful than re-firing chat.complete.
+local function payload_from_finalize(call)
+  local raw = call.arguments or call.args
+  local args
+  if type(raw) == "table" then
+    args = raw
+  elseif type(raw) == "string" then
+    local ok, decoded = pcall(json.decode, raw)
+    if ok and type(decoded) == "table" then
+      args = decoded
+    else
+      args = {}
+    end
+  else
+    args = {}
+  end
+
+  local answer = args.answer
+  local text
+  if type(answer) == "string" and #answer > 0 then
+    text = answer
+  else
+    text = "[finalize: no answer provided]"
+  end
+  return text, args
+end
+
 -- Provider-reply handler. The wire shape is the same as
 -- `chat_complete_result_body` in openai-provider:
 --   { chat_id, output: { text, tool_calls?, finish_reason?, ... } }
@@ -344,6 +459,20 @@ local function on_chat_complete_result(body)
 
   local tool_calls = out.tool_calls
   local has_calls = type(tool_calls) == "table" and #tool_calls > 0
+
+  -- Finalize wins over any other tool_call in the same response. The
+  -- terminator runs BEFORE allowlist enforcement / tool-gate dispatch
+  -- so it's never blocked, never reaches a real tool plugin, and any
+  -- sibling tool_calls in the same turn (e.g. the model emitted
+  -- bash + finalize together) are dropped.
+  if has_calls then
+    local fin = find_finalize_call(tool_calls)
+    if fin ~= nil then
+      local text, structured = payload_from_finalize(fin)
+      send_terminal_ok(firing_id, text, structured)
+      return
+    end
+  end
 
   if not has_calls then
     -- Terminal: text-only reply ends the agent loop.

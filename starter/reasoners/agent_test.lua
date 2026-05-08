@@ -479,4 +479,261 @@ do
     "error string includes the provider message")
 end
 
+-- ------------------------------------------------------------------
+-- Scenario 6: finalize tool — answer-only terminates with structured
+-- ------------------------------------------------------------------
+--
+-- The agent reasoner intercepts `finalize` BEFORE allowlist
+-- enforcement / tool-gate dispatch. A `finalize` call MUST:
+--   * never reach tool-gate (no tool-gate.tool.invoke envelope)
+--   * close the firing with result.text = args.answer and
+--     result.structured = the args object verbatim
+do
+  fresh()
+  dispatch_agent("firing-fin-1", {
+    system_prompt  = "You are an explorer.",
+    model          = "test-model",
+    tool_allowlist = { "read_file" },   -- finalize NOT listed here
+    prompt         = "Investigate.",
+  })
+
+  local create = find_call(decode_calls(), function(c)
+    return c.body.kind == "mock-prov.chat.create"
+  end)
+  local chat_id = create.body.chat_id
+
+  _test.calls_clear()
+  feed("mock-prov", {
+    kind    = "mock-prov.chat.complete.result",
+    chat_id = chat_id,
+    output  = {
+      text          = "",
+      finish_reason = "tool_calls",
+      tool_calls    = {
+        { id = "tc-fin-1", name = "finalize", arguments = { answer = "done" } },
+      },
+    },
+  })
+
+  local calls = decode_calls()
+
+  -- finalize must NEVER reach tool-gate.
+  local leaked = find_call(calls, function(c)
+    return c.body.kind == "tool-gate.tool.invoke" and c.body.name == "finalize"
+  end)
+  assert(leaked == nil,
+    "finalize MUST NOT reach tool-gate; saw " .. json.encode(_test.calls()))
+
+  -- The terminal envelope carries text + structured.
+  local terminal = find_call(calls, function(c)
+    return c.body.kind == "tool.result" and c.body.id == "firing-fin-1"
+  end)
+  assert(terminal ~= nil,
+    "agent must emit terminal tool.result on finalize; got " .. json.encode(_test.calls()))
+  assert(terminal.body.error == nil, "terminal tool.result must NOT carry error")
+  assert_eq(terminal.body.result.text, "done", "result.text = args.answer")
+  assert(type(terminal.body.result.structured) == "table",
+    "result.structured present")
+  assert_eq(terminal.body.result.structured.answer, "done",
+    "result.structured carries the answer field verbatim")
+  assert_eq(terminal.body.result.next_state.chat_id, chat_id,
+    "terminal next_state.chat_id matches the firing's chat_id")
+
+  -- Per-firing state cleared.
+  assert(agent._internals.agents["firing-fin-1"] == nil,
+    "agent state must clear on finalize-terminal")
+end
+
+-- ------------------------------------------------------------------
+-- Scenario 7: finalize with extra structured fields
+-- ------------------------------------------------------------------
+--
+-- Arbitrary fields on `finalize`'s args land verbatim in
+-- result.structured. These are what downstream reasoner combinators
+-- read to compose the next agent's prompt (spec §2 hand-off
+-- mechanics).
+do
+  fresh()
+  dispatch_agent("firing-fin-2", {
+    system_prompt  = "You are an explorer.",
+    model          = "test-model",
+    tool_allowlist = { "read_file" },
+    prompt         = "Investigate.",
+  })
+  local create = find_call(decode_calls(), function(c)
+    return c.body.kind == "mock-prov.chat.create"
+  end)
+  local chat_id = create.body.chat_id
+
+  _test.calls_clear()
+  feed("mock-prov", {
+    kind    = "mock-prov.chat.complete.result",
+    chat_id = chat_id,
+    output  = {
+      text          = "",
+      finish_reason = "tool_calls",
+      tool_calls    = {
+        { id = "tc-fin-2", name = "finalize", arguments = {
+            answer     = "done",
+            findings   = { "x", "y" },
+            confidence = 0.8,
+          },
+        },
+      },
+    },
+  })
+
+  local terminal = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result" and c.body.id == "firing-fin-2"
+  end)
+  assert(terminal ~= nil, "finalize emits terminal tool.result")
+  assert_eq(terminal.body.result.text, "done", "result.text = args.answer")
+  local s = terminal.body.result.structured
+  assert(type(s) == "table", "result.structured present")
+  assert_eq(s.answer, "done", "structured.answer = args.answer")
+  assert(type(s.findings) == "table", "structured.findings present (list)")
+  assert_eq(#s.findings, 2, "structured.findings preserves length")
+  assert_eq(s.findings[1], "x", "structured.findings[1] preserved")
+  assert_eq(s.findings[2], "y", "structured.findings[2] preserved")
+  assert_eq(s.confidence, 0.8, "structured.confidence preserved verbatim")
+end
+
+-- ------------------------------------------------------------------
+-- Scenario 8: finalize alongside other tool calls — finalize wins
+-- ------------------------------------------------------------------
+--
+-- When the provider returns multiple tool_calls in a single response
+-- and one of them is `finalize`, the agent terminates immediately on
+-- the finalize. Sibling calls (here: bash) are dropped — they MUST
+-- NOT reach tool-gate. This pins the simpler semantic over running
+-- siblings before terminating.
+do
+  fresh()
+  dispatch_agent("firing-fin-3", {
+    system_prompt  = "You are a builder.",
+    model          = "test-model",
+    tool_allowlist = { "bash" },   -- bash is allowed, but finalize wins
+    prompt         = "Build.",
+  })
+  local create = find_call(decode_calls(), function(c)
+    return c.body.kind == "mock-prov.chat.create"
+  end)
+  local chat_id = create.body.chat_id
+
+  _test.calls_clear()
+  feed("mock-prov", {
+    kind    = "mock-prov.chat.complete.result",
+    chat_id = chat_id,
+    output  = {
+      text          = "",
+      finish_reason = "tool_calls",
+      tool_calls    = {
+        { id = "tc-bash", name = "bash", arguments = { command = "ls" } },
+        { id = "tc-fin",  name = "finalize", arguments = { answer = "built" } },
+      },
+    },
+  })
+
+  local calls = decode_calls()
+
+  -- The sibling bash call MUST NOT have been dispatched.
+  local bash_leak = find_call(calls, function(c)
+    return c.body.kind == "tool-gate.tool.invoke" and c.body.name == "bash"
+  end)
+  assert(bash_leak == nil,
+    "sibling tool_calls dropped when finalize is in the same response; saw "
+    .. json.encode(_test.calls()))
+
+  -- Terminal lands.
+  local terminal = find_call(calls, function(c)
+    return c.body.kind == "tool.result" and c.body.id == "firing-fin-3"
+  end)
+  assert(terminal ~= nil, "finalize-among-siblings emits terminal tool.result")
+  assert_eq(terminal.body.result.text, "built", "result.text from finalize")
+  assert_eq(terminal.body.result.structured.answer, "built",
+    "result.structured.answer from finalize")
+end
+
+-- ------------------------------------------------------------------
+-- Scenario 9: chat.create advertises finalize regardless of allowlist
+-- ------------------------------------------------------------------
+--
+-- The agent reasoner injects `finalize` into the advertised tool set
+-- on every firing — the caller's `tool_allowlist` doesn't need to
+-- mention it. This ensures sub-agents can always terminate
+-- structurally even with a minimal allowlist.
+do
+  fresh()
+  dispatch_agent("firing-fin-4", {
+    system_prompt  = "You are an explorer.",
+    model          = "test-model",
+    tool_allowlist = { "read_file" },   -- finalize NOT mentioned
+    prompt         = "Investigate.",
+  })
+
+  local create = find_call(decode_calls(), function(c)
+    return c.body.kind == "mock-prov.chat.create"
+  end)
+  assert(create ~= nil, "chat.create emitted")
+  assert(type(create.body.tools) == "table",
+    "chat.create.tools present (list of advertised tool names)")
+
+  local saw_finalize, saw_read = false, false
+  for _, n in ipairs(create.body.tools) do
+    if n == "finalize"  then saw_finalize = true end
+    if n == "read_file" then saw_read     = true end
+  end
+  assert(saw_read,
+    "user-supplied allowlist entries still advertised (read_file)")
+  assert(saw_finalize,
+    "finalize MUST be auto-included in chat.create.tools regardless of allowlist")
+end
+
+-- ------------------------------------------------------------------
+-- Scenario 10: finalize with empty/missing answer synthesises text
+-- ------------------------------------------------------------------
+--
+-- A degenerate finalize call (no answer / empty answer) terminates
+-- with a placeholder text rather than erroring. structured still
+-- carries whatever the model passed.
+do
+  fresh()
+  dispatch_agent("firing-fin-5", {
+    system_prompt  = "You are an explorer.",
+    model          = "test-model",
+    tool_allowlist = { "read_file" },
+    prompt         = "Investigate.",
+  })
+  local create = find_call(decode_calls(), function(c)
+    return c.body.kind == "mock-prov.chat.create"
+  end)
+  local chat_id = create.body.chat_id
+
+  _test.calls_clear()
+  feed("mock-prov", {
+    kind    = "mock-prov.chat.complete.result",
+    chat_id = chat_id,
+    output  = {
+      text          = "",
+      finish_reason = "tool_calls",
+      tool_calls    = {
+        { id = "tc-fin-empty", name = "finalize", arguments = {} },
+      },
+    },
+  })
+
+  local terminal = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result" and c.body.id == "firing-fin-5"
+  end)
+  assert(terminal ~= nil, "empty finalize still emits terminal tool.result")
+  assert(terminal.body.error == nil,
+    "missing answer must NOT surface as a terminal error")
+  assert(type(terminal.body.result.text) == "string"
+       and #terminal.body.result.text > 0,
+    "result.text is a non-empty placeholder when answer is missing; got: "
+    .. tostring(terminal.body.result.text))
+  assert(string.find(terminal.body.result.text, "finalize", 1, true) ~= nil,
+    "placeholder text mentions finalize for diagnostics")
+end
+
 print("agent_test: ok")
