@@ -4152,3 +4152,224 @@ fn input_history_round_trips_multiline_payload_through_disk() {
          in the recalled input — got snapshot:\n{snap}"
     );
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// @path preprocessor (#47)
+// ──────────────────────────────────────────────────────────────────────
+// chat.lua's submit reducer scans plain-text submits for `@<path>`
+// tokens and inlines the file contents as a `<file path="…">` block
+// before emitting `chat.input.submit`. The lead workflow spec
+// (lead-workflow-spec §1, §6, §8) treats this as a starter-config
+// prerequisite: the orchestrator's first turn sees `@`-files already
+// resolved, with the existing `read_file` tool as the fallback for
+// truncated or larger files.
+
+fn type_text(engine: &mut Engine, s: &str) {
+    for ch in s.chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+}
+
+fn submit_text(engine: &mut Engine, s: &str) {
+    type_text(engine, s);
+    engine.handle_key(key("enter")).expect("enter");
+}
+
+#[test]
+fn at_path_inlines_existing_file_into_wire_envelope() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("hello.lua");
+    std::fs::write(&path, "print('hi from fixture')\n").expect("write fixture");
+
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Absolute paths sidestep CWD assumptions — the io.open fallback
+    // for absolute tokens is the codepath this test pins.
+    let prompt = format!("summarize @{}", path.display());
+    submit_text(&mut engine, &prompt);
+
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "submit should produce exactly one emit");
+    let (target_hint, body) = &emits[0];
+    assert_eq!(target_hint.as_deref(), Some("engine"));
+    assert_eq!(
+        body.get("kind").and_then(|v| v.as_str()),
+        Some("chat.input.submit")
+    );
+    let wire = body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .expect("text on the envelope");
+
+    assert!(
+        wire.contains("print('hi from fixture')"),
+        "file contents missing from wire text: {wire:?}"
+    );
+    assert!(
+        wire.contains(&format!("<file path=\"{}\">", path.display())),
+        "expected `<file path=\"…\">` wrapper in wire text: {wire:?}"
+    );
+    assert!(
+        wire.contains("```lua"),
+        "expected lua fence inferred from .lua extension: {wire:?}"
+    );
+    assert!(
+        wire.contains("</file>"),
+        "expected closing `</file>` in wire text: {wire:?}"
+    );
+    // The raw `@<path>` token must NOT survive into the wire envelope —
+    // the inlined block replaced it. (`@` may still appear inside the
+    // file path attribute, but the standalone `@<path>` token gone.)
+    let needle = format!("@{}", path.display());
+    assert!(
+        !wire.contains(&needle),
+        "@-token should be replaced, not present verbatim: {wire:?}"
+    );
+}
+
+#[test]
+fn at_path_missing_file_leaves_token_untouched_no_error() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Absolute path that does not exist — chat.lua MUST leave the
+    // token verbatim and emit a normal `chat.input.submit` envelope.
+    // The orchestrator + model can ask the user about it; chat.lua's
+    // job is just to not error.
+    let prompt = "look at @/this/does/not/exist/anywhere.lua please";
+    submit_text(&mut engine, prompt);
+
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "submit should produce exactly one emit");
+    let body = &emits[0].1;
+    assert_eq!(
+        body.get("kind").and_then(|v| v.as_str()),
+        Some("chat.input.submit")
+    );
+    let wire = body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .expect("text on the envelope");
+    assert!(
+        wire.contains("@/this/does/not/exist/anywhere.lua"),
+        "missing-file token should pass through unchanged: {wire:?}"
+    );
+    assert!(
+        !wire.contains("<file path"),
+        "no <file> wrapper should appear when the file is missing: {wire:?}"
+    );
+}
+
+#[test]
+fn at_path_truncates_files_over_inline_budget() {
+    // Budget in chat.lua is 16 KiB — write 32 KiB so the truncation
+    // marker fires regardless of any +1 boundary off-by-one.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("big.txt");
+    let payload = "x".repeat(32 * 1024);
+    std::fs::write(&path, &payload).expect("write big fixture");
+
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    let prompt = format!("summarize @{}", path.display());
+    submit_text(&mut engine, &prompt);
+
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "submit should produce exactly one emit");
+    let body = &emits[0].1;
+    let wire = body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .expect("text on the envelope");
+    assert!(
+        wire.contains("[truncated; use read_file tool for full contents]"),
+        "expected truncation marker in wire text: {wire:?}"
+    );
+    // Total size of the inlined content + wrapper should be far below
+    // the original 32 KiB — pin a soft upper bound so a regression
+    // that emits the full file slips the assertion. 24 KiB is well
+    // above the 16 KiB budget + wrapper text but well below 32 KiB.
+    assert!(
+        wire.len() < 24 * 1024,
+        "wire text should be truncated near 16 KiB budget; got {} bytes",
+        wire.len()
+    );
+}
+
+#[test]
+fn at_path_expands_multiple_references_in_one_message() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let a = dir.path().join("alpha.lua");
+    let b = dir.path().join("beta.md");
+    std::fs::write(&a, "ALPHA_CONTENTS\n").expect("write alpha");
+    std::fs::write(&b, "BETA_CONTENTS\n").expect("write beta");
+
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    let prompt = format!("compare @{} and @{}", a.display(), b.display());
+    submit_text(&mut engine, &prompt);
+
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "submit should produce exactly one emit");
+    let body = &emits[0].1;
+    let wire = body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .expect("text on the envelope");
+    assert!(
+        wire.contains("ALPHA_CONTENTS"),
+        "alpha file contents missing: {wire:?}"
+    );
+    assert!(
+        wire.contains("BETA_CONTENTS"),
+        "beta file contents missing: {wire:?}"
+    );
+    // Two `<file path="…">` wrappers — one per resolved reference.
+    let opens = wire.matches("<file path=\"").count();
+    assert_eq!(
+        opens, 2,
+        "expected exactly two <file> blocks for two refs: {wire:?}"
+    );
+}
+
+#[test]
+fn at_path_strips_trailing_punctuation_when_resolving() {
+    // User types `@<path>.` at end of sentence — the trailing period
+    // is prompt punctuation, not part of the filename. chat.lua peels
+    // common trailing punctuation off the captured token before
+    // resolution and re-attaches it verbatim after the inlined block.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ref.md");
+    std::fs::write(&path, "PUNCT_FIXTURE\n").expect("write ref");
+
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Period after the path; the model still gets the file inlined.
+    let prompt = format!("see @{}.", path.display());
+    submit_text(&mut engine, &prompt);
+
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1);
+    let wire = emits[0]
+        .1
+        .get("text")
+        .and_then(|v| v.as_str())
+        .expect("text");
+    assert!(
+        wire.contains("PUNCT_FIXTURE"),
+        "expected file contents inlined despite trailing period: {wire:?}"
+    );
+    assert!(
+        wire.contains(&format!("<file path=\"{}\">", path.display())),
+        "wrapper should carry the trimmed (no-trailing-period) path: {wire:?}"
+    );
+}

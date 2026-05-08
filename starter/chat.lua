@@ -2481,6 +2481,89 @@ local function model_max_tokens(model)
 end
 
 ------------------------------------------------------------------------
+-- @path preprocessor (#47)
+------------------------------------------------------------------------
+-- Inline file references like `@starter/chat.lua` into the user's
+-- submitted text BEFORE it reaches the provider. The lead workflow
+-- spec (lead-workflow-spec §1, §6, §8) treats this as a starter-config
+-- prerequisite: the orchestrator's first turn sees the file contents
+-- already inlined; large files truncate with a marker pointing at the
+-- existing `read_file` tool for the full contents.
+--
+-- Scope (intentionally small):
+--   * pattern is `@<non-whitespace>`; trailing common punctuation
+--     (`.,;:!?)`) is shaved off the captured token because it almost
+--     never belongs to the path and the user's prompt-tail punctuation
+--     would otherwise turn `@a.lua.` into a missing-file silent no-op.
+--   * resolution: cwd-relative first, then treat the token as already
+--     absolute. Paths that don't resolve / can't be opened leave the
+--     `@<token>` as-is — no error surfaces, the user sees the raw text
+--     in their bubble and the model can ask.
+--   * inlined block is a fenced HTML-ish `<file path="…">` … `</file>`
+--     wrapper. Code-fence language is inferred from extension; unknown
+--     extensions render with a plain ``` fence.
+
+local AT_PATH_INLINE_BUDGET = 16 * 1024
+local AT_PATH_TRUNCATION_MARKER =
+  "\n... [truncated; use read_file tool for full contents] ..."
+
+local AT_PATH_FENCE_LANG = {
+  lua = "lua", rs = "rust", md = "md", json = "json", toml = "toml",
+  py = "python", js = "javascript", ts = "typescript", tsx = "tsx",
+  sh = "bash", bash = "bash", yaml = "yaml", yml = "yaml",
+  html = "html", css = "css", go = "go", rb = "ruby", java = "java",
+}
+
+local function at_path_fence_lang(path)
+  local ext = path:match("%.([%w]+)$")
+  if ext == nil then return "" end
+  return AT_PATH_FENCE_LANG[ext:lower()] or ""
+end
+
+local function at_path_read(path)
+  local f = io.open(path, "r")
+  if f == nil then return nil end
+  local data = f:read(AT_PATH_INLINE_BUDGET + 1)
+  f:close()
+  if data == nil then return "" end
+  if #data > AT_PATH_INLINE_BUDGET then
+    return data:sub(1, AT_PATH_INLINE_BUDGET) .. AT_PATH_TRUNCATION_MARKER
+  end
+  return data
+end
+
+-- Try cwd-relative first, then treat the path as already absolute.
+-- Both branches can resolve the same string when cwd happens to be `/`,
+-- but io.open is idempotent so the duplication is harmless.
+local function at_path_resolve(token)
+  local data = at_path_read(token)
+  if data ~= nil then return data, token end
+  if token:sub(1, 1) == "/" then return nil, nil end
+  return nil, nil
+end
+
+local function expand_at_path_refs(text)
+  if text == nil or text == "" or text:find("@", 1, true) == nil then
+    return text
+  end
+  return (text:gsub("@([^%s]+)", function(token)
+    -- Strip trailing prompt punctuation that almost never belongs to a
+    -- path (`.`, `,`, `;`, `:`, `!`, `?`, `)`). One pass — multiple
+    -- trailing punctuation chars (e.g. `@file.lua?!`) all peel off.
+    local trimmed, _trail_n = token:gsub("[%.%,;:!%?%)]+$", "")
+    if trimmed == "" then return nil end
+    local data, resolved = at_path_resolve(trimmed)
+    if data == nil then return nil end
+    local trail = token:sub(#trimmed + 1)
+    local lang = at_path_fence_lang(resolved)
+    return string.format(
+      "<file path=\"%s\">\n```%s\n%s\n```\n</file>%s",
+      resolved, lang, data, trail
+    )
+  end))
+end
+
+------------------------------------------------------------------------
 -- update
 ------------------------------------------------------------------------
 
@@ -2712,7 +2795,18 @@ local function update(msg, state)
     -- resume); the corresponding handler below dedupes that round-trip
     -- against `pending_user_echo` so we render once locally + once on
     -- replay, never twice live.
-    local with_user = push_entry(state, { role = "user", text = text, kind = "text" })
+    --
+    -- `@path` preprocessor (#47): the wire envelope, the local user
+    -- bubble, and the dedup marker all carry the EXPANDED text. The
+    -- user sees exactly what the model receives (transparency); the
+    -- orchestrator's echo round-trips through the same dedup gate.
+    -- Prompt-history (recall via arrow-up) keeps the ORIGINAL `@`-form
+    -- so a recalled prompt edits like a fresh one and re-expands at
+    -- next submit (file contents may have changed in the meantime —
+    -- the user re-submitting expects the current state, not a
+    -- snapshot from the original turn).
+    local wire_text = expand_at_path_refs(text)
+    local with_user = push_entry(state, { role = "user", text = wire_text, kind = "text" })
     -- Prepend to prompt_history (newest at index 1) and cap. History
     -- recall reads from index 1, so prepending keeps the cursor model
     -- simple — Up = older = larger index, Down = newer = smaller.
@@ -2733,7 +2827,7 @@ local function update(msg, state)
       -- swallow it. Cleared after one match — sequential identical
       -- submits each set their own marker on submit, so the second
       -- echo doesn't get eaten by the first marker.
-      pending_user_echo = text,
+      pending_user_echo = wire_text,
     })
     -- Re-pin the transcript to the bottom: stick_to = "end" only
     -- auto-follows new content while `was_at_end` is true, so a user
@@ -2745,7 +2839,7 @@ local function update(msg, state)
     tui.scroll_into_view("transcript")
     return cleared, {
       { kind = "send_to", target = "engine",
-        body = { kind = "chat.input.submit", text = text } },
+        body = { kind = "chat.input.submit", text = wire_text } },
     }
   end
 
