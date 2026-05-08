@@ -350,6 +350,10 @@ local function agent_handle(body)
   return agent_reasoner.handle(body)
 end
 
+local run_reasoner          = require("reasoners.run")
+local run_wrappers_reasoner = require("reasoners.run-wrappers")
+local loop_counter_reasoner = require("reasoners.loop_counter")
+
 local handlers = {
   ["dummy"]            = function(body) return provider_run_node("dummy", body) end,
   ["provider-wrapper"] = function(body) return provider_run_node("provider-wrapper", body) end,
@@ -359,6 +363,9 @@ local handlers = {
   ["terminal"]         = terminal_run_node,
   -- agent reasoner (lead workflow keystone)
   ["agent"]            = agent_handle,
+  ["run"]              = run_reasoner.handle,
+  ["runCommand"]       = run_wrappers_reasoner.handle,
+  ["loop-counter"]     = loop_counter_reasoner.handle,
 }
 
 local function lua_resident_types()
@@ -446,6 +453,12 @@ local function receive_msg(entry)
     agent_reasoner = require("reasoners.agent")
   end
   agent_reasoner.receive_msg(entry)
+
+  -- The `run` reasoner correlates tool-gate's `tool.result` envelopes
+  -- by tool_id back to its waiting firing_id. Forward every envelope
+  -- so its receive_msg can pick the ones it owns; non-matching
+  -- tool_ids are silently skipped inside the module.
+  run_reasoner.receive_msg(entry)
 
   -- Dispatch tool.invoke { name in handlers }. Anything else on the
   -- bus is for someone else (real tools, spawn_graph routed to
