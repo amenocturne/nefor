@@ -2300,6 +2300,7 @@ mod tests {
         let desc = WidgetDescription::Column {
             gap: 0,
             key: None,
+            selectable: false,
             children: vec![WidgetDescription::Padding {
                 top: 1,
                 right: 0,
@@ -2323,6 +2324,7 @@ mod tests {
         let desc = WidgetDescription::Column {
             gap: 1,
             key: None,
+            selectable: false,
             children: vec![text("a"), text("b")],
         };
         let buf = paint_root(desc, 4, 4);
@@ -2640,6 +2642,7 @@ mod tests {
         let desc = WidgetDescription::Column {
             gap: 0,
             key: None,
+            selectable: false,
             children: vec![top, mid, bot],
         };
         let buf = paint_root(desc, 5, 3);
@@ -2693,6 +2696,7 @@ mod tests {
         let desc = WidgetDescription::Column {
             gap: 0,
             key: None,
+            selectable: false,
             children: vec![fill("─", None), expanded(text("hello"), 1), fill("─", None)],
         };
         let buf = paint_root(desc, 5, 3);
@@ -2756,6 +2760,7 @@ mod tests {
         let desc = WidgetDescription::Column {
             gap: 0,
             key: None,
+            selectable: false,
             children: vec![text("hi"), expanded(text(""), 1)],
         };
         let mut rec = Reconciler::new();
@@ -3458,6 +3463,7 @@ mod tests {
             children,
             gap,
             key: None,
+            selectable: false,
         }
     }
 

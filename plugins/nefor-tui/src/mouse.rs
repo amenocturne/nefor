@@ -275,14 +275,27 @@ fn walk_selectable(
     }
 }
 
-/// Whether a widget description carries `selectable = true`. Currently
-/// only `Scrollable` exposes the property; non-scrollable widgets fall
-/// through to `false`. Adding the property to other variants is a
-/// matter of extending this matcher and the relevant `parse_*` path.
+/// Whether a widget description carries `selectable = true`. Single
+/// extension point: adding the property to a new widget variant means
+/// touching this matcher plus the relevant `parse_*` path.
+///
+/// Currently:
+/// - `Scrollable { selectable: true }` — chat transcripts and the like.
+/// - `Column { selectable: true }` — non-scrolling read-output panels
+///   (sidebar, status block).
+/// - `TextInput { selectable: true }` — the prompt input; selection
+///   here is the transcript-style mouse copy mechanism, distinct from
+///   the input's internal editing-cursor state.
 pub fn is_selectable(desc: &WidgetDescription) -> bool {
     matches!(
         desc,
         WidgetDescription::Scrollable {
+            selectable: true,
+            ..
+        } | WidgetDescription::Column {
+            selectable: true,
+            ..
+        } | WidgetDescription::TextInput {
             selectable: true,
             ..
         }
@@ -414,6 +427,7 @@ mod tests {
             children,
             gap: 0,
             key: key.map(|s| s.into()),
+            selectable: false,
         }
     }
 

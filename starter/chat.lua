@@ -1962,7 +1962,18 @@ local function dag_panel(state)
     max_width = 36,
     child = tui.padding {
       value = 1,
-      child = tui.column { gap = 0, children = children },
+      -- Drag-to-select scopes to this column. The sidebar doesn't
+      -- scroll, so the selection's content geometry equals the
+      -- column's painted rect — the engine paints the column into
+      -- a rect-sized scratch buffer and extracts plain text from
+      -- the cells the drag covered. Keyed so the engine can
+      -- re-resolve the captured widget across `view` rebuilds.
+      child = tui.column {
+        gap        = 0,
+        key        = "sidebar",
+        selectable = true,
+        children   = children,
+      },
     },
   }
 end
@@ -2137,6 +2148,12 @@ local function view(state)
       on_submit = "input.submit",
       min_lines = 1,
       max_lines = 6,
+      -- Drag-to-select the displayed text — the same transcript-style
+      -- copy mechanism the chat scrollable uses. Click without drag
+      -- still bubbles as a `mouse.click` (no cursor positioning today;
+      -- typing into the focused input continues to work as before).
+      -- The input's internal editing-cursor state is unchanged.
+      selectable = true,
       -- No placeholder text: the bordered input below the transcript is
       -- self-explanatory, and a default hint just adds visual noise the
       -- user has to read past on every render. Slash-commands are

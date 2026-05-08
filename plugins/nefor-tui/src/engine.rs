@@ -773,7 +773,7 @@ impl Engine {
             drag_content_opt,
         ) {
             (Some(key), Some(rect), Some(anchor), Some(drag)) => {
-                match self.extract_selection_from_scrollable_content(key, rect, anchor, drag) {
+                match self.extract_selection_from_selectable(key, rect, anchor, drag) {
                     Some(text) => text,
                     None => {
                         // Captured widget disappeared from the tree
@@ -802,17 +802,27 @@ impl Engine {
         self.dispatch_msg(msg)
     }
 
-    /// Paint the captured scrollable's child into a content-sized
+    /// Paint the captured selectable's content into a content-sized
     /// scratch frame buffer and extract the selection text using
     /// content-coords. Decoupling extraction from the live framebuffer
     /// is the core of the auto-scroll copy fix: scroll position no
     /// longer aliases the selection bounds.
     ///
-    /// Returns `None` when the captured scrollable is no longer in the
-    /// tree, when its content geometry is unusable, or when the
-    /// instance shape changed unexpectedly. The caller falls back to
-    /// the legacy screen-coord extraction.
-    fn extract_selection_from_scrollable_content(
+    /// Two shapes:
+    /// - **Scrollable** — paint the *child* into a scratch buffer at
+    ///   `(content_w, content_h)` (the unbounded content size from the
+    ///   last layout pass). Anchor + drag content coords already index
+    ///   into that buffer.
+    /// - **Non-scrollable** (sidebar Column, prompt TextInput) — paint
+    ///   the captured widget itself into a scratch at `rect.width ×
+    ///   rect.height`. Content-coord = screen-coord relative to the
+    ///   rect's top-left, since there's no scrolled virtual content.
+    ///
+    /// Returns `None` when the captured widget is no longer in the
+    /// tree or when its geometry is unusable (no render has fired
+    /// yet). The caller drops the dispatch silently rather than
+    /// synthesising a copy from a stale framebuffer.
+    fn extract_selection_from_selectable(
         &mut self,
         key: &str,
         rect: crate::layout::Rect,
@@ -820,41 +830,52 @@ impl Engine {
         drag: (u16, u16),
     ) -> Option<String> {
         let root = self.reconciler.root.as_mut()?;
-        let path = find_scrollable_by_key(root, key)?;
+        let path = find_widget_by_key(root, key)?;
         let target = mouse_instance_at_path(root, &path)?;
-        // Read content geometry from the layout pass cache; bail if
-        // anything is unset (no render has fired yet).
-        let (content_h, content_w) = match &target.state {
+
+        match &target.state {
             InstanceState::Scrollable(s) => {
+                // Scrollable: paint the child into a content-sized scratch.
                 let content_w = scrollable_content_width(target, rect);
-                (s.content_height, content_w)
+                let content_h = s.content_height;
+                if content_h == 0 || content_w == 0 {
+                    return None;
+                }
+                let mut scratch = crate::render::FrameBuffer::new(content_w, content_h);
+                if let Some(child) = target.children.first_mut() {
+                    let child_rect = crate::layout::Rect {
+                        row: 0,
+                        col: 0,
+                        width: content_w,
+                        height: content_h,
+                    };
+                    crate::layout::paint(child, child_rect, &mut scratch);
+                }
+                let range = SelectionRange::normalised(anchor, drag);
+                Some(extract_selection_text(&scratch, range))
             }
-            _ => return None,
-        };
-        if content_h == 0 || content_w == 0 {
-            return None;
+            _ => {
+                // Non-scrollable selectable (Column, TextInput, ...): paint
+                // the widget itself into a scratch at the captured rect's
+                // size. No virtual content extent — content-coord directly
+                // mirrors screen-coord relative to the rect's top-left.
+                let content_w = rect.width;
+                let content_h = rect.height;
+                if content_w == 0 || content_h == 0 {
+                    return None;
+                }
+                let mut scratch = crate::render::FrameBuffer::new(content_w, content_h);
+                let local_rect = crate::layout::Rect {
+                    row: 0,
+                    col: 0,
+                    width: content_w,
+                    height: content_h,
+                };
+                crate::layout::paint(target, local_rect, &mut scratch);
+                let range = SelectionRange::normalised(anchor, drag);
+                Some(extract_selection_text(&scratch, range))
+            }
         }
-        // Repaint the child into a scratch buffer at content size.
-        // The child's measure-pass cache (line wraps, etc.) is keyed
-        // on the same `inner_w` the most recent layout used, so calling
-        // `paint` directly without a fresh measure is safe.
-        let mut scratch = crate::render::FrameBuffer::new(content_w, content_h);
-        if let Some(child) = target.children.first_mut() {
-            let child_rect = crate::layout::Rect {
-                row: 0,
-                col: 0,
-                width: content_w,
-                height: content_h,
-            };
-            crate::layout::paint(child, child_rect, &mut scratch);
-        }
-        // Build the selection range in content coords. `(col, row)` for
-        // anchor and drag are already content-relative, so handing the
-        // pair to `SelectionRange::normalised` produces the correct
-        // line-flow shape regardless of which direction the user
-        // dragged.
-        let range = SelectionRange::normalised(anchor, drag);
-        Some(extract_selection_text(&scratch, range))
     }
 
     /// Walk the current tree for the deepest `selectable = true` widget
@@ -937,7 +958,10 @@ impl Engine {
         let Some(root) = self.reconciler.root.as_ref() else {
             return;
         };
-        let Some(path) = find_scrollable_by_key(root, &key) else {
+        // General key lookup — captured selectable may be a Scrollable
+        // (chat transcript), Column (sidebar), TextInput (prompt), or
+        // any future variant `is_selectable` accepts.
+        let Some(path) = find_widget_by_key(root, &key) else {
             return;
         };
         let mut cur = root;
@@ -947,9 +971,12 @@ impl Engine {
             };
             cur = c;
         }
+        // scroll_y is only meaningful for Scrollable; non-scrollable
+        // selectables anchor at content row 0 with screen row offsets
+        // mapping directly to content rows.
         let scroll_y = match &cur.state {
             InstanceState::Scrollable(s) => s.scroll_y,
-            _ => return,
+            _ => 0,
         };
         let content_w = scrollable_content_width(cur, rect);
         self.selection_drag_in_content = Some(screen_to_content(rect, content_w, scroll_y, x, y));

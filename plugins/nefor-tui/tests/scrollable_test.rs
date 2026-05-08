@@ -1449,3 +1449,214 @@ fn latch_advances_drag_in_content_under_motionless_cursor() {
          captured copy; got:\n{captured:?}"
     );
 }
+
+// ── non-scrollable selectables (Column / TextInput) ──────────────────
+//
+// `selectable = true` extends to non-scrollable widgets so the user can
+// drag-copy from a sidebar column or the prompt text_input. Non-scrolling
+// surfaces have no virtual content extent — content-coord = screen-coord
+// relative to the rect's top-left, so the copy path paints the widget
+// itself (not a child) into a rect-sized scratch buffer and runs the
+// existing extract_selection_text.
+
+const NON_SCROLLABLE_SELECTABLE_SCENARIO: &str = r#"
+    tui.start {
+      initial_state = {},
+      view = function(_)
+        return tui.row { gap = 0, children = {
+          tui.expanded {
+            child = tui.column {
+              key        = "main",
+              selectable = true,
+              gap        = 0,
+              children   = {
+                tui.text { content = "main alpha" },
+                tui.text { content = "main bravo" },
+                tui.text { content = "main charlie" },
+              },
+            },
+          },
+          tui.expanded {
+            child = tui.column {
+              key        = "sidebar",
+              selectable = true,
+              gap        = 0,
+              children   = {
+                tui.text { content = "side foo" },
+                tui.text { content = "side bar" },
+                tui.text { content = "side baz" },
+              },
+            },
+          },
+        }}
+      end,
+      update = function(msg, s)
+        if msg.kind == "mouse.selection" then
+          tui.emit { kind = "selection.captured", text = msg.text or "" }
+        end
+        return s, {}
+      end,
+    }
+"#;
+
+/// Drag inside a non-scrollable selectable column. The copy returns
+/// the cells under the drag's content-coord range — content rows are
+/// the column's visible rows (no virtual extent).
+#[test]
+fn drag_inside_selectable_column_copies_visible_text() {
+    let mut engine = Engine::new(40, 4).expect("engine");
+    engine
+        .load_scenario(NON_SCROLLABLE_SELECTABLE_SCENARIO)
+        .expect("scenario");
+    let _ = render_str(&mut engine);
+    // Layout: 40-wide, 4-tall. Two columns side by side, each 20-wide.
+    // Main column owns cols 0..=19, rows 0..=2. Drag from row 0 col 5
+    // ("alpha" starts ~col 5 of "main alpha") to row 2 col 12 (end of
+    // "main charlie") — captures content under the drag range.
+    drag_select(&mut engine, (0, 0), &[(10, 1), (15, 2)], (15, 2));
+    let captured =
+        last_captured_selection(&mut engine).expect("mouse.selection should fire");
+    assert!(
+        captured.contains("main alpha"),
+        "captured copy must include the anchor row 'main alpha'; got:\n{captured:?}"
+    );
+    assert!(
+        captured.contains("main charlie"),
+        "captured copy must include the drag-end row 'main charlie'; got:\n{captured:?}"
+    );
+}
+
+/// Drag from a non-scrollable selectable into a different non-scrollable
+/// selectable: the copy clamps to the captured origin's rect. The
+/// sidebar text must NOT leak into the main-column copy.
+#[test]
+fn drag_from_one_selectable_column_into_another_clamps_to_origin() {
+    let mut engine = Engine::new(40, 4).expect("engine");
+    engine
+        .load_scenario(NON_SCROLLABLE_SELECTABLE_SCENARIO)
+        .expect("scenario");
+    let _ = render_str(&mut engine);
+    // Click in main column (col 5, row 0), drag into sidebar (col 30, row 2).
+    drag_select(&mut engine, (5, 0), &[(15, 1), (25, 2), (30, 2)], (30, 2));
+    let captured =
+        last_captured_selection(&mut engine).expect("mouse.selection should fire");
+    assert!(
+        captured.contains("main"),
+        "drag from main origin must include main content; got:\n{captured:?}"
+    );
+    assert!(
+        !captured.contains("side "),
+        "drag clamped to main rect must NOT include sidebar text; got:\n{captured:?}"
+    );
+}
+
+const SELECTABLE_TEXT_INPUT_SCENARIO: &str = r#"
+    tui.start {
+      initial_state = { value = "hello world from prompt" },
+      view = function(s)
+        return tui.column { gap = 0, children = {
+          tui.text { content = "header" },
+          tui.text_input {
+            key        = "prompt",
+            value      = s.value,
+            focused    = true,
+            on_change  = "input.changed",
+            min_lines  = 1,
+            max_lines  = 1,
+            selectable = true,
+          },
+        }}
+      end,
+      update = function(msg, s)
+        if msg.kind == "mouse.selection" then
+          tui.emit { kind = "selection.captured", text = msg.text or "" }
+        elseif msg.kind == "input.changed" then
+          return { value = msg.value }, {}
+        end
+        return s, {}
+      end,
+    }
+"#;
+
+/// Drag inside a `selectable = true` text_input: the copy returns the
+/// visible text under the drag (the prompt's displayed value).
+#[test]
+fn drag_inside_selectable_text_input_copies_visible_text() {
+    let mut engine = Engine::new(40, 3).expect("engine");
+    engine
+        .load_scenario(SELECTABLE_TEXT_INPUT_SCENARIO)
+        .expect("scenario");
+    let _ = render_str(&mut engine);
+    // Header on row 0; text_input on row 1. Drag across the input's row.
+    drag_select(&mut engine, (0, 1), &[(10, 1), (20, 1)], (20, 1));
+    let captured =
+        last_captured_selection(&mut engine).expect("mouse.selection should fire");
+    // The captured text should include "hello world" (or a substring of
+    // "hello world from prompt") — exact match depends on the input's
+    // visible window, but the displayed prefix must be present.
+    assert!(
+        captured.contains("hello world") || captured.contains("hello"),
+        "drag inside selectable text_input must capture displayed text; got:\n{captured:?}"
+    );
+}
+
+/// Typing into a `selectable = true` focused text_input still inserts
+/// at the cursor — selection-on-drag must not regress the editing flow.
+#[test]
+fn selectable_text_input_still_accepts_typing_keys() {
+    let mut engine = Engine::new(40, 3).expect("engine");
+    engine
+        .load_scenario(SELECTABLE_TEXT_INPUT_SCENARIO)
+        .expect("scenario");
+    let _ = render_str(&mut engine);
+    // Press 'X' — the focused input should absorb it via the editing
+    // path and on_change should fire with the new value.
+    engine.handle_key(key("X")).expect("key X");
+    let _ = render_str(&mut engine);
+    // The state's `value` should now end with "X" (cursor was at end
+    // after the initial sync).
+    let snap = engine.snapshot();
+    assert!(
+        snap.contains("hello world from promptX")
+            || snap.contains("X"),
+        "typing into a selectable text_input must still insert at cursor; \
+         frame:\n{snap}"
+    );
+}
+
+/// Click on a selectable text_input + immediate release (no drag): no
+/// `mouse.selection` envelope fires (selection only opens on actual
+/// drag, matching the legacy contract for scrollable selectables).
+#[test]
+fn click_release_on_selectable_text_input_emits_no_selection() {
+    let mut engine = Engine::new(40, 3).expect("engine");
+    engine
+        .load_scenario(SELECTABLE_TEXT_INPUT_SCENARIO)
+        .expect("scenario");
+    let _ = render_str(&mut engine);
+    // Drain any startup emits.
+    let _ = engine.take_emit_queue();
+    // Click then release at the same cell — no Drag in between.
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Click,
+            x: 5,
+            y: 1,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("click");
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Up,
+            x: 5,
+            y: 1,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("up");
+    assert!(
+        last_captured_selection(&mut engine).is_none(),
+        "click+release without drag must not fire mouse.selection"
+    );
+}

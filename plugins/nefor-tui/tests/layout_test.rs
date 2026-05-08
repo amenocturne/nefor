@@ -29,6 +29,7 @@ fn column(children: Vec<WidgetDescription>, gap: u16) -> WidgetDescription {
         children,
         gap,
         key: None,
+        selectable: false,
     }
 }
 

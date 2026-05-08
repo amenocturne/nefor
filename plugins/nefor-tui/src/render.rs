@@ -489,6 +489,7 @@ mod tests {
             children,
             gap: 0,
             key: None,
+            selectable: false,
         }
     }
 
