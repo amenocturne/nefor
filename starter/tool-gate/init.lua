@@ -30,6 +30,7 @@ local json = nefor.json
 
 local envelope = require("lib.envelope")
 local graph_lib = require("lib.graph")
+local tool_output_dump = require("lib.tool_output_dump")
 
 local SPAWN_GRAPH_SOURCE = graph_lib.SPAWN_GRAPH_SOURCE
 
@@ -115,6 +116,40 @@ function M.spawn_spec(gate_name, command)
     -- tool.result correlation for tool-executor firings.
     if env.body.kind == "tool.result" then
       local tool_id = env.body.id
+      -- Dump-to-file swap: when a tool's output exceeds the inline
+      -- budget (32 KiB by default), write the full payload to a
+      -- persistent file under <NEFOR_DATA_HOME>/tool-results/ and
+      -- replace `env.body.output` with a summary that names the path
+      -- and inlines a 4 KiB preview. The model then sees the summary
+      -- in its context (small, navigable) while the full result lives
+      -- on disk for it to grep via the bash tool on subsequent turns.
+      -- Per the lead-workflow spec §5: huge tool outputs (10k-line
+      -- file reads, recursive grep across a monorepo, deep find) are
+      -- the only place where truncation of model-visible payload is
+      -- acceptable, and it's done via this dump-and-summarise layer
+      -- rather than fixed-byte slicing.
+      if type(tool_id) == "string"
+          and tool_output_dump.should_dump(env.body.output) then
+        -- chat_id is best-effort surface for v1; the tool-executor
+        -- pending entry doesn't carry it directly. The dump lib
+        -- safely defaults to `_unscoped/` when nil. Adding a real
+        -- chat_id surface is a follow-up (per-tool-type thresholds,
+        -- cleanup policy, et al — see PR description).
+        local summary, path, dump_err = tool_output_dump.dump(
+          nil, tool_id, env.body.output,
+          { tool = env.body.name }
+        )
+        if summary then
+          nefor.log.info("tool-gate: dumped huge tool output to file", {
+            tool_id = tool_id, path = path, bytes = #summary,
+          })
+          env.body.output = summary
+        else
+          nefor.log.warn("tool-gate: dump failed; forwarding original output", {
+            tool_id = tool_id, error = dump_err,
+          })
+        end
+      end
       if type(tool_id) == "string" then
         local ref, entry = al().take_pending_for_tool(tool_id)
         if ref then
