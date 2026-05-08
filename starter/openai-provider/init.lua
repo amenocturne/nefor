@@ -123,9 +123,15 @@ function M.spawn_spec(name, command, opts)
         or kind == stream_reasoning_end_kind
         or kind == session_stats_kind then
       local chat_id = env.body.chat_id
-      if type(chat_id) == "string"
-          and al().peek_pending_for_chat(chat_id) ~= nil
-          and not al().stream_visible(chat_id) then
+      -- D-26 + agent-reasoner sub-firing gate. `stream_suppressed`
+      -- collapses both:
+      --   (a) tracked pending entry whose reasoner type isn't in
+      --       STREAM_VISIBLE_TYPES (sub-graph responder, etc.)
+      --   (b) explicit stream-hidden registration the agent reasoner
+      --       installs for each sub-firing's chat_id (so the user
+      --       doesn't see the sub-agent's internal-turn streams
+      --       interleaved with the lead's response).
+      if type(chat_id) == "string" and al().stream_suppressed(chat_id) then
         return nil
       end
 

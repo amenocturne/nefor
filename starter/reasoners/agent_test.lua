@@ -969,4 +969,308 @@ do
     "post-close graph.cancel must NOT emit a second terminal tool.result")
 end
 
+-- ------------------------------------------------------------------
+-- Scenario 15 (Fix #1): chat.complete carries finalize schema in
+-- extra_tools so the provider binary appends it to the upstream
+-- tools array
+-- ------------------------------------------------------------------
+--
+-- Pre-fix the agent reasoner emitted `<provider>.chat.complete {
+-- chat_id }` only — the binary built its tools array purely from the
+-- global ToolCatalog and the model never saw `finalize` as an option.
+-- Fix #1 adds `extra_tools = [FINALIZE_SCHEMA]` to the chat.complete
+-- envelope; the binary appends them to the catalog tools before
+-- assembling the upstream HTTP request.
+--
+-- Verified-fail-pre-fix: removing the `extra_tools = { FINALIZE_SCHEMA }`
+-- line in agent.lua's emit_chat_complete trips the schema-shape
+-- assertion below.
+do
+  fresh()
+  dispatch_agent("firing-extra-1", {
+    system_prompt  = "You are a builder.",
+    model          = "test-model",
+    tool_allowlist = { "read_file" },
+    prompt         = "Build.",
+  })
+
+  local complete = find_call(decode_calls(), function(c)
+    return c.body.kind == "mock-prov.chat.complete"
+  end)
+  assert(complete ~= nil, "chat.complete emitted on dispatch")
+  assert(type(complete.body.extra_tools) == "table",
+    "chat.complete must carry extra_tools as a list")
+  assert_eq(#complete.body.extra_tools, 1,
+    "extra_tools holds exactly one entry (finalize)")
+
+  local entry = complete.body.extra_tools[1]
+  assert(type(entry) == "table",
+    "extra_tools[1] is a tool-spec object")
+  assert_eq(entry.type, "function",
+    "extra_tools[1].type is 'function' (OpenAI tool wire shape)")
+  assert(type(entry["function"]) == "table",
+    "extra_tools[1].function is a table")
+  assert_eq(entry["function"].name, "finalize",
+    "extra_tools[1].function.name is 'finalize'")
+
+  -- Also assert subsequent turns (tool-call → result → next chat.complete)
+  -- still carry extra_tools so the model can call finalize on iteration 2.
+  local create = find_call(decode_calls(), function(c)
+    return c.body.kind == "mock-prov.chat.create"
+  end)
+  local chat_id = create.body.chat_id
+
+  _test.calls_clear()
+  feed("mock-prov", {
+    kind    = "mock-prov.chat.complete.result",
+    chat_id = chat_id,
+    output  = {
+      text          = "",
+      finish_reason = "tool_calls",
+      tool_calls    = {
+        { id = "tc-extra", name = "read_file", arguments = { path = "x.txt" } },
+      },
+    },
+  })
+  local invoke = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool-gate.tool.invoke"
+  end)
+  _test.calls_clear()
+  feed("tool-gate", {
+    kind   = "tool.result",
+    id     = invoke.body.id,
+    output = "x contents",
+  })
+
+  local complete2 = find_call(decode_calls(), function(c)
+    return c.body.kind == "mock-prov.chat.complete"
+  end)
+  assert(complete2 ~= nil, "chat.complete fires on next turn")
+  assert(type(complete2.body.extra_tools) == "table",
+    "next-turn chat.complete also carries extra_tools (finalize available every iteration)")
+  assert_eq(complete2.body.extra_tools[1]["function"].name, "finalize",
+    "next-turn extra_tools[1] is finalize")
+end
+
+-- ------------------------------------------------------------------
+-- Scenario 16 (Fix #2): chat.message.append { role=system } folds
+-- into <provider>.chat.append for active firings
+-- ------------------------------------------------------------------
+--
+-- tool-gate's smart AGENTS.md loader (b600850) emits
+-- chat.message.append { role=system, text=<marker>+<body> } envelopes
+-- onto the bus when an inner tool call touches a path. Pre-fix the
+-- envelope was TUI/persistence-only; the model never saw the AGENTS.md
+-- content because nothing folded it into provider chat history.
+-- Fix #2 has the agent reasoner watch its bus subscription for
+-- chat.message.append envelopes with role=system and translate them
+-- into <provider>.chat.append for each active firing.
+--
+-- Verified-fail-pre-fix: removing the chat.message.append branch in
+-- agent.lua's receive_msg trips the "agent must fold system message
+-- into <provider>.chat.append" assertion.
+do
+  fresh()
+  dispatch_agent("firing-fold-1", {
+    system_prompt  = "You are a builder.",
+    model          = "test-model",
+    tool_allowlist = { "read_file" },
+    prompt         = "Read README.",
+  })
+
+  -- Drain dispatch envelopes; we only care about envelopes after the
+  -- system-message fold is triggered.
+  _test.calls_clear()
+
+  -- tool-gate's smart loader emits this envelope onto the bus. The
+  -- text shape mirrors the actual marker tool-gate uses (the prefix
+  -- is load-bearing per spec §5).
+  local agents_md_text =
+    "[Loaded /home/skril/code/foo/AGENTS.md because tool call touched a file in /home/skril/code/foo/. " ..
+    "This is project guidance for that directory, not a user request.]\n\n" ..
+    "Project rule: prefer functional style. Avoid global state."
+  feed("tool-gate", {
+    kind = "chat.message.append",
+    role = "system",
+    text = agents_md_text,
+  })
+
+  local calls = decode_calls()
+  local fold = find_call(calls, function(c)
+    return c.body.kind == "mock-prov.chat.append"
+       and type(c.body.message) == "table"
+       and c.body.message.role == "system"
+       and c.body.message.content == agents_md_text
+  end)
+  assert(fold ~= nil,
+    "agent must fold system chat.message.append into <provider>.chat.append for the active firing; got "
+    .. json.encode(_test.calls()))
+  assert_eq(fold.target, "mock-prov",
+    "folded chat.append targets the firing's provider")
+
+  -- The chat_id MUST match the firing's chat_id (so the provider
+  -- binary appends to the same chat history the agent reasoner is
+  -- driving).
+  local entry
+  for _, e in pairs(agent._internals.agents) do entry = e; break end
+  assert(entry ~= nil, "active firing entry exists")
+  assert_eq(fold.body.chat_id, entry.chat_id,
+    "folded chat.append rides the firing's chat_id")
+end
+
+-- ------------------------------------------------------------------
+-- Scenario 17 (Fix #2 negative): role=user does NOT translate
+-- ------------------------------------------------------------------
+--
+-- The user-message path is owned by the chat-runner / agentic-loop —
+-- folding role=user from chat.message.append would double-emit user
+-- turns into provider chat history. Only role=system folds.
+do
+  fresh()
+  dispatch_agent("firing-fold-2", {
+    system_prompt  = "You are a builder.",
+    model          = "test-model",
+    tool_allowlist = { "read_file" },
+    prompt         = "Build.",
+  })
+
+  _test.calls_clear()
+  feed("nefor-tui", {
+    kind = "chat.message.append",
+    role = "user",
+    text = "extra user input",
+  })
+
+  local calls = decode_calls()
+  local leak = find_call(calls, function(c)
+    return c.body.kind == "mock-prov.chat.append"
+       and type(c.body.message) == "table"
+       and c.body.message.role == "user"
+  end)
+  assert(leak == nil,
+    "role=user chat.message.append MUST NOT fold into <provider>.chat.append; got "
+    .. json.encode(_test.calls()))
+
+  -- Also assert: an assistant role doesn't fold either.
+  _test.calls_clear()
+  feed("nefor-tui", {
+    kind = "chat.message.append",
+    role = "assistant",
+    text = "extra assistant text",
+  })
+  local leak2 = find_call(decode_calls(), function(c)
+    return c.body.kind == "mock-prov.chat.append"
+       and type(c.body.message) == "table"
+       and c.body.message.role == "assistant"
+  end)
+  assert(leak2 == nil,
+    "role=assistant chat.message.append MUST NOT fold either")
+end
+
+-- ------------------------------------------------------------------
+-- Scenario 18 (Fix #2 negative): no fold when no firing is active
+-- ------------------------------------------------------------------
+--
+-- AGENTS.md envelopes flowing on the bus when no agent firing is
+-- active (e.g. the user's lead-workflow chat hits a tool itself)
+-- MUST NOT produce spurious <provider>.chat.append envelopes — there's
+-- no agent to fold them into.
+do
+  fresh()
+  -- No dispatch_agent call — agents table is empty.
+  _test.calls_clear()
+  feed("tool-gate", {
+    kind = "chat.message.append",
+    role = "system",
+    text = "[Loaded /tmp/AGENTS.md ...]\n\nfoo",
+  })
+
+  local calls = decode_calls()
+  local leak = find_call(calls, function(c)
+    return string.sub(c.body.kind or "", -#"chat.append") == "chat.append"
+  end)
+  assert(leak == nil,
+    "system chat.message.append with no active firing MUST NOT fold; got "
+    .. json.encode(_test.calls()))
+end
+
+-- ------------------------------------------------------------------
+-- Scenario 19 (Fix #3): agent firing's chat_id is registered as
+-- stream-hidden in agentic-loop's stream-suppression map
+-- ------------------------------------------------------------------
+--
+-- Pre-fix sub-agent firings emitted `<provider>.stream.delta` envelopes
+-- that the openai-provider wrapper translated into `chat.stream.delta`
+-- and the chat surface rendered. The user saw a noisy stream of
+-- sub-agent reasoning interleaved with the lead's response. Fix #3
+-- registers each agent firing's chat_id as stream-hidden in the
+-- agentic-loop's chat_id_stream_explicitly_hidden table so the
+-- wrapper's `stream_suppressed` gate drops the sub-agent's stream
+-- events.
+--
+-- Verified-fail-pre-fix: removing the `register_chat_stream_hidden`
+-- call in agent.lua's handle() trips this assertion.
+do
+  fresh()
+  dispatch_agent("firing-hide-1", {
+    system_prompt  = "You are a builder.",
+    model          = "test-model",
+    tool_allowlist = { "read_file" },
+    prompt         = "Build.",
+  })
+
+  -- The agent's chat_id must be registered as stream-hidden in
+  -- agentic-loop's state.
+  local entry
+  for _, e in pairs(agent._internals.agents) do entry = e; break end
+  assert(entry ~= nil, "active firing entry exists")
+  assert(agentic_loop.stream_suppressed(entry.chat_id) == true,
+    "agent firing's chat_id MUST be stream-suppressed (so the wrapper drops sub-agent stream events)")
+
+  -- A chat_id we never minted MUST NOT be suppressed (default false).
+  assert(agentic_loop.stream_suppressed("never-seen-chat-id") == false,
+    "unknown chat_id is not suppressed (lead's chat_id, etc., still streams)")
+end
+
+-- ------------------------------------------------------------------
+-- Scenario 20 (Fix #3): stream-hidden registration is unwound when
+-- the firing terminates
+-- ------------------------------------------------------------------
+--
+-- Without unregister-on-close the chat_id_stream_explicitly_hidden
+-- table grows monotonically across firings, leaking memory and
+-- (worse) suppressing future chat.stream.delta envelopes for any
+-- chat that happens to reuse a recycled chat_id.
+do
+  fresh()
+  dispatch_agent("firing-hide-2", {
+    system_prompt  = "You are a builder.",
+    model          = "test-model",
+    tool_allowlist = { "read_file" },
+    prompt         = "Build.",
+  })
+
+  local entry
+  for _, e in pairs(agent._internals.agents) do entry = e; break end
+  assert(entry ~= nil, "active firing entry exists")
+  local chat_id = entry.chat_id
+  assert(agentic_loop.stream_suppressed(chat_id) == true,
+    "registered as stream-hidden during firing")
+
+  -- Terminate the firing via a text-only provider reply.
+  _test.calls_clear()
+  feed("mock-prov", {
+    kind    = "mock-prov.chat.complete.result",
+    chat_id = chat_id,
+    output  = { text = "done.", finish_reason = "stop" },
+  })
+
+  -- Firing closed.
+  assert(agent._internals.agents["firing-hide-2"] == nil,
+    "agent state cleared on terminal")
+  -- And the stream-hidden registration is gone.
+  assert(agentic_loop.stream_suppressed(chat_id) == false,
+    "stream-hidden registration MUST be released when the firing closes")
+end
+
 print("agent_test: ok")

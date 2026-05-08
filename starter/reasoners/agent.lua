@@ -197,6 +197,11 @@ local function clear_firing(firing_id)
   if entry == nil then return end
   if type(entry.chat_id) == "string" then
     chat_to_firing[entry.chat_id] = nil
+    -- Drop the stream-hidden registration so the chat_id doesn't leak
+    -- across firings. Cheap (single map delete); skipping it would
+    -- mean the agentic-loop's chat_id_stream_explicitly_hidden table
+    -- grows monotonically across firings.
+    al().unregister_chat_stream_hidden(entry.chat_id)
   end
   if type(entry.pending_tools) == "table" then
     for tool_id, _ in pairs(entry.pending_tools) do
@@ -233,11 +238,20 @@ local function send_terminal_err(firing_id, err)
   clear_firing(firing_id)
 end
 
--- Emit `<provider>.chat.complete` to start the next turn.
+-- Emit `<provider>.chat.complete` to start the next turn. The
+-- `extra_tools` field carries the synthetic `finalize` schema so the
+-- model sees `finalize` in its advertised tool list — the
+-- openai-provider binary appends `extra_tools` to the catalog-derived
+-- tools array before assembling the upstream HTTP request. Without
+-- this the chat.create.tools list (the per-firing advertised set on
+-- the wire) is parsed as a bool by the binary and the catalog is the
+-- only tool source; the model would never learn `finalize` is an
+-- option.
 local function emit_chat_complete(entry)
   emit_to(entry.provider, {
-    kind    = entry.provider .. ".chat.complete",
-    chat_id = entry.chat_id,
+    kind        = entry.provider .. ".chat.complete",
+    chat_id     = entry.chat_id,
+    extra_tools = { FINALIZE_SCHEMA },
   })
 end
 
@@ -300,6 +314,16 @@ local function handle(body)
   }
   agents[firing_id] = entry
   chat_to_firing[chat_id] = firing_id
+
+  -- Register the agent's chat_id as stream-hidden so the
+  -- openai-provider wrapper's gate suppresses the sub-agent's
+  -- `<provider>.stream.delta` events from translating into
+  -- `chat.stream.delta` (which the chat surface renders). Without
+  -- this the user sees a noisy stream of every sub-agent's reasoning
+  -- interleaved with the lead's response. The lead's own chat_id is
+  -- NOT registered here — it goes through `track_provider_firing` as
+  -- "provider-wrapper" which is in the STREAM_VISIBLE_TYPES set.
+  al().register_chat_stream_hidden(chat_id)
 
   -- chat.create. The provider binary's tool-advertisement set rides on
   -- `tools` here (per provider-wrapper's existing seed). The agent
@@ -671,6 +695,37 @@ local function receive_msg(entry)
   -- no entry in `agents` and are skipped by on_graph_cancel.
   if kind == "graph.cancel" then
     on_graph_cancel(body)
+    return
+  end
+
+  -- chat.message.append { role = "system" } fold (lead-workflow-spec
+  -- §5 follow-up): tool-gate's smart AGENTS.md loader emits these
+  -- envelopes when an inner tool call touches a path under an
+  -- AGENTS.md-bearing dir. The envelope is TUI/persistence-shaped —
+  -- nothing translates it into provider chat history by default, so
+  -- the model never sees the AGENTS.md content. The agent reasoner
+  -- folds every system-role chat.message.append into a
+  -- <provider>.chat.append for each of OUR active firings so the
+  -- model picks up the context on its next turn. role=user / role=
+  -- assistant are NOT folded — user input rides through the chat-
+  -- runner / agentic-loop's normal path and assistant content comes
+  -- from the provider itself; double-folding either would corrupt
+  -- history. Skipped when no firing is active so the AGENTS.md emit
+  -- doesn't leak when the agent reasoner isn't the one using
+  -- tool-gate.
+  if kind == "chat.message.append" and body.role == "system" then
+    local text = body.text or body.content
+    if type(text) ~= "string" or #text == 0 then return end
+    -- Fold into every active firing. v0.1: no chat_id correlation on
+    -- the source envelope, so we fan out — this matches the
+    -- per-chat-deduped semantics tool-gate enforces (a single
+    -- AGENTS.md emission triggers one fold per agent, all targeting
+    -- their own provider chat). If finer correlation is ever needed,
+    -- threading a chat_id through tool-gate's smart loader is the
+    -- natural extension.
+    for _, fentry in pairs(agents) do
+      emit_chat_append(fentry, { role = "system", content = text })
+    end
     return
   end
 

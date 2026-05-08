@@ -351,13 +351,27 @@ async fn dispatch_event(
                     return Ok(());
                 }
             };
+            // Per-firing schemas appended to the global ToolCatalog tools
+            // for this turn only. The agent reasoner uses this to inject
+            // its synthetic `finalize` terminator without polluting the
+            // catalog. Each entry must already be in the OpenAI tool
+            // wire shape: `{type:"function", function:{name,description,parameters}}`.
+            // Non-array / malformed payloads are silently dropped so a
+            // misshaped emit can't crash the dispatch.
+            let extra_tools: Vec<Value> = body
+                .get("extra_tools")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             tracing::info!(
                 target: "openai_provider::chat",
                 chat_id = %chat_id,
+                extra_tools_count = extra_tools.len(),
                 "chat.complete",
             );
             start_completion_turn(
                 chats, auth, catalog, broker, config, client, out_tx, chat_id, false,
+                extra_tools,
             )
             .await?;
         }
@@ -413,6 +427,7 @@ async fn dispatch_event(
             chats.push_user(&chat_id, text).await?;
             start_completion_turn(
                 chats, auth, catalog, broker, config, client, out_tx, chat_id, true,
+                Vec::new(),
             )
             .await?;
         }
@@ -557,6 +572,7 @@ async fn start_completion_turn(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     chat_id: ChatId,
     legacy_default_chat: bool,
+    extra_tools: Vec<Value>,
 ) -> Result<(), LlmError> {
     let cancel = match chats.begin_turn(&chat_id).await {
         Ok(t) => t,
@@ -580,6 +596,7 @@ async fn start_completion_turn(
         chat_id,
         cancel,
         legacy_default_chat,
+        extra_tools,
     );
     Ok(())
 }
@@ -596,6 +613,7 @@ fn spawn_turn(
     chat_id: ChatId,
     cancel: tokio_util::sync::CancellationToken,
     legacy_default_chat: bool,
+    extra_tools: Vec<Value>,
 ) {
     tokio::spawn(async move {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -663,11 +681,22 @@ fn spawn_turn(
             // a lazy capability cache populated reactively on the first
             // 400 we see for each model.
             let model_tools_supported = chats.model_supports_tools(&active_model).await;
-            let tools_array = if chat_tools_on && model_tools_supported {
+            let mut tools_array = if chat_tools_on && model_tools_supported {
                 catalog.to_openai_tools().await
             } else {
                 Vec::new()
             };
+            // Per-firing extra_tools (e.g. agent reasoner's `finalize`
+            // synthetic terminator). Appended AFTER the catalog so a
+            // catalog entry of the same name still wins on iteration
+            // (the agent reasoner intercepts `finalize` Lua-side before
+            // any catalog routing, so collisions are not a concern in
+            // practice). Skipped when the chat is in tools-off mode
+            // (matches catalog suppression — the model can't use tools
+            // at all in that case).
+            if chat_tools_on && model_tools_supported && !extra_tools.is_empty() {
+                tools_array.extend(extra_tools.iter().cloned());
+            }
             let tools_slice: Option<&[serde_json::Value]> = if tools_array.is_empty() {
                 None
             } else {
@@ -2981,6 +3010,200 @@ mod tests {
                 || wire_partial.starts_with(assistant_content),
             "stored partial and wire-observed partial must share a prefix; \
              stored={assistant_content:?} wire={wire_partial:?}",
+        );
+    }
+
+    /// Fix #1 regression: when `<prefix>.chat.complete` carries an
+    /// `extra_tools` array, every iteration's upstream HTTP request body
+    /// MUST include those tools alongside whatever the global
+    /// ToolCatalog provided. The agent reasoner relies on this to inject
+    /// its synthetic `finalize` schema per-firing without polluting the
+    /// catalog. Pre-fix the chat.complete dispatcher ignored
+    /// `extra_tools` and the tools array was catalog-only — the model
+    /// never saw `finalize` in its advertised set.
+    ///
+    /// Drive: bind an SSE server that captures the first request body
+    /// it receives and replies with a single delta + finish + DONE.
+    /// Fire chat.create → chat.append (user) → chat.complete (with
+    /// extra_tools = [finalize_schema]). Wait for
+    /// chat.complete.result. Assert the captured request body's
+    /// `tools` array contains an entry with name == "finalize".
+    #[tokio::test]
+    async fn chat_complete_extra_tools_lands_in_upstream_request_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let captured: std::sync::Arc<tokio::sync::Mutex<String>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let captured_clone = captured.clone();
+
+        let _server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 8192];
+            let mut acc = String::new();
+            loop {
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if let Some(headers_end) = acc.find("\r\n\r\n") {
+                    let cl: usize = acc
+                        .lines()
+                        .find_map(|l| {
+                            l.strip_prefix("content-length:")
+                                .or_else(|| l.strip_prefix("Content-Length:"))
+                        })
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    let body_so_far = acc.len() - (headers_end + 4);
+                    if body_so_far >= cl {
+                        break;
+                    }
+                }
+            }
+            if let Some(idx) = acc.find("\r\n\r\n") {
+                *captured_clone.lock().await = acc[idx + 4..].to_owned();
+            }
+            // One delta + finish + DONE — terminates the loop cleanly so
+            // the test doesn't hang waiting for chat.complete.result.
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n\
+                        data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n\
+                        data: [DONE]\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = s.write_all(response.as_bytes()).await;
+            let _ = s.shutdown().await;
+        });
+
+        let (auth, tx, mut rx) = auth_test_rig(Some("envkey"));
+        let chats = fresh_chats("test-model");
+        let catalog = Arc::new(ToolCatalog::new());
+        let broker = Arc::new(ToolBroker::new());
+        let mut config = cfg("ollama");
+        config.base_url = format!("http://{}", addr);
+        let client = reqwest::Client::builder().build().expect("client");
+
+        // 1. chat.create.
+        let create_body = make_event_body(
+            "ollama.chat.create",
+            &[("chat_id", Value::String("c-extra".into()))],
+        );
+        dispatch_event(
+            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &from_plugin("reasoner-graph"),
+            &create_body,
+        )
+        .await
+        .expect("create");
+
+        // 2. chat.append { role=user }.
+        let append_body = make_event_body(
+            "ollama.chat.append",
+            &[
+                ("chat_id", Value::String("c-extra".into())),
+                (
+                    "message",
+                    serde_json::json!({"role": "user", "content": "go"}),
+                ),
+            ],
+        );
+        dispatch_event(
+            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &from_plugin("reasoner-graph"),
+            &append_body,
+        )
+        .await
+        .expect("append");
+
+        // 3. chat.complete with extra_tools carrying the finalize
+        // schema. Mirrors the agent reasoner's emit shape:
+        // `extra_tools = [FINALIZE_SCHEMA]`.
+        let finalize_schema = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "finalize",
+                "description": "Terminate this agent's run.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "answer": {"type": "string"}
+                    },
+                    "required": ["answer"],
+                    "additionalProperties": true,
+                },
+            },
+        });
+        let complete_body = make_event_body(
+            "ollama.chat.complete",
+            &[
+                ("chat_id", Value::String("c-extra".into())),
+                ("extra_tools", Value::Array(vec![finalize_schema])),
+            ],
+        );
+        dispatch_event(
+            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &from_plugin("reasoner-graph"),
+            &complete_body,
+        )
+        .await
+        .expect("complete");
+
+        // 4. Wait for chat.complete.result on the writer channel —
+        //    that's the marker the spawned turn finished its HTTP call.
+        let mut saw_complete_result = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Ok(msg) = rx.try_recv() {
+                let line = msg.to_line();
+                let v: Value = serde_json::from_str(&line).expect("json");
+                if let Some(body) = v.get("body").and_then(Value::as_object) {
+                    if body.get("kind").and_then(Value::as_str)
+                        == Some("ollama.chat.complete.result")
+                    {
+                        saw_complete_result = true;
+                        break;
+                    }
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        assert!(
+            saw_complete_result,
+            "chat.complete.result must arrive after the SSE server closes",
+        );
+
+        // 5. Assert the captured upstream request body included the
+        //    finalize tool in its `tools` array.
+        let body = captured.lock().await.clone();
+        assert!(
+            !body.is_empty(),
+            "server must have captured a request body",
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&body).expect("upstream request body json");
+        let tools = v
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .expect("upstream request body must include `tools` when extra_tools provided");
+        let saw_finalize = tools.iter().any(|t| {
+            t.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                == Some("finalize")
+        });
+        assert!(
+            saw_finalize,
+            "tools array MUST include an entry whose function.name == \"finalize\"; \
+             body was {body}",
         );
     }
 
