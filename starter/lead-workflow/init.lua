@@ -457,7 +457,12 @@ local function terminate_active_graph()
   local run_id = state.active_run_id
   state.active_run_id = nil
 
-  emit_to("reasoner-graph", { kind = "graph.cancel", run_id = run_id })
+  -- Broadcast (target = nil) rather than target reasoner-graph: every
+  -- in-flight agent reasoner under this run also needs to see the
+  -- envelope so it can interrupt its provider stream + close its
+  -- firing (sub-graph cancel propagation, #53). The reasoner-graph
+  -- binary still receives the broadcast and processes it the same way.
+  emit_as(SOURCE_NAME, nil, { kind = "graph.cancel", run_id = run_id })
   emit_to("nefor-tui", {
     kind = "chat.message.append",
     role = "system",

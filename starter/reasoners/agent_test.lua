@@ -736,4 +736,237 @@ do
     "placeholder text mentions finalize for diagnostics")
 end
 
+-- ------------------------------------------------------------------
+-- Scenario 11: graph.cancel propagates to in-flight sub-agent firing
+-- ------------------------------------------------------------------
+--
+-- Mirrors the chat-side cancel_all → <provider>.interrupt fix from
+-- ef260cd, applied to sub-graph firings (#53). When lead-workflow
+-- broadcasts `graph.cancel { run_id }` (session_end / user /quit
+-- mid-run), every agent reasoner with a firing under that run_id MUST:
+--   * emit `<provider>.interrupt { chat_id }` so the provider binary
+--     tears down the streaming HTTP call,
+--   * emit a terminal `tool.result { error }` so reasoner-graph
+--     de-registers the firing.
+--
+-- Verified-fail-pre-fix: with the on_graph_cancel handler removed (or
+-- the receive_msg branch elided), neither envelope fires.
+do
+  fresh()
+  dispatch_agent("firing-cancel-1", {
+    system_prompt  = "You are an explorer.",
+    model          = "test-model",
+    tool_allowlist = { "read_file" },
+    prompt         = "Investigate.",
+  })
+
+  local create = find_call(decode_calls(), function(c)
+    return c.body.kind == "mock-prov.chat.create"
+  end)
+  local chat_id = create.body.chat_id
+
+  -- Mid-firing: lead-workflow broadcasts graph.cancel for our run_id.
+  -- The dispatch_agent helper sets run_id = "run-test".
+  _test.calls_clear()
+  feed("lead-workflow", { kind = "graph.cancel", run_id = "run-test" })
+
+  local calls = decode_calls()
+
+  -- Provider interrupt MUST fire, carrying our chat_id.
+  local interrupt = find_call(calls, function(c)
+    return c.body.kind == "mock-prov.interrupt"
+       and c.body.chat_id == chat_id
+       and c.target == "mock-prov"
+  end)
+  assert(interrupt ~= nil,
+    "graph.cancel for the firing's run_id must emit <provider>.interrupt { chat_id }; got "
+    .. json.encode(_test.calls()))
+
+  -- Terminal tool.result MUST close the firing with an error.
+  local terminal = find_call(calls, function(c)
+    return c.body.kind == "tool.result" and c.body.id == "firing-cancel-1"
+  end)
+  assert(terminal ~= nil,
+    "graph.cancel must close the firing with a terminal tool.result; got "
+    .. json.encode(_test.calls()))
+  assert(terminal.body.error ~= nil,
+    "terminal tool.result on graph.cancel must carry an error (not a normal result)")
+  assert(string.find(tostring(terminal.body.error), "cancelled", 1, true) ~= nil
+      or string.find(tostring(terminal.body.error), "Cancel", 1, true) ~= nil,
+    "terminal error mentions cancellation; got: " .. tostring(terminal.body.error))
+
+  -- Per-firing state cleared.
+  assert(agent._internals.agents["firing-cancel-1"] == nil,
+    "agent state cleared after graph.cancel teardown")
+end
+
+-- ------------------------------------------------------------------
+-- Scenario 12: graph.cancel fans out to every firing under the run
+-- ------------------------------------------------------------------
+--
+-- Two sub-agent firings under the same run_id (e.g. an explore →
+-- explore parallel pair). One graph.cancel must interrupt BOTH chat_ids
+-- and close BOTH firings. Verifies the fanout walks the agents map and
+-- doesn't stop at the first match.
+do
+  fresh()
+  dispatch_agent("firing-multi-A", {
+    system_prompt  = "You are an explorer.",
+    model          = "test-model",
+    tool_allowlist = { "read_file" },
+    prompt         = "Investigate A.",
+  })
+  dispatch_agent("firing-multi-B", {
+    system_prompt  = "You are an explorer.",
+    model          = "test-model",
+    tool_allowlist = { "read_file" },
+    prompt         = "Investigate B.",
+  })
+
+  -- Capture each firing's chat_id from its chat.create.
+  local creates = find_calls(decode_calls(), function(c)
+    return c.body.kind == "mock-prov.chat.create"
+  end)
+  assert_eq(#creates, 2, "two firings → two chat.create envelopes")
+  local chat_ids = {}
+  for _, c in ipairs(creates) do chat_ids[#chat_ids + 1] = c.body.chat_id end
+  assert(chat_ids[1] ~= chat_ids[2], "each firing mints a distinct chat_id")
+
+  _test.calls_clear()
+  feed("lead-workflow", { kind = "graph.cancel", run_id = "run-test" })
+
+  local calls = decode_calls()
+
+  -- Both chat_ids interrupted.
+  local interrupts = find_calls(calls, function(c)
+    return c.body.kind == "mock-prov.interrupt"
+  end)
+  assert_eq(#interrupts, 2,
+    "graph.cancel must interrupt every firing under the run; got "
+    .. json.encode(_test.calls()))
+  local hit = { [chat_ids[1]] = false, [chat_ids[2]] = false }
+  for _, c in ipairs(interrupts) do
+    if hit[c.body.chat_id] ~= nil then hit[c.body.chat_id] = true end
+  end
+  assert(hit[chat_ids[1]] and hit[chat_ids[2]],
+    "every firing's chat_id appears on an interrupt envelope")
+
+  -- Both firings closed.
+  for _, fid in ipairs({ "firing-multi-A", "firing-multi-B" }) do
+    local terminal = find_call(calls, function(c)
+      return c.body.kind == "tool.result" and c.body.id == fid
+    end)
+    assert(terminal ~= nil,
+      "graph.cancel closes firing " .. fid .. "; got " .. json.encode(_test.calls()))
+    assert(terminal.body.error ~= nil,
+      "firing " .. fid .. " closed with an error on cancel")
+    assert(agent._internals.agents[fid] == nil,
+      "firing " .. fid .. " state cleared after cancel")
+  end
+end
+
+-- ------------------------------------------------------------------
+-- Scenario 13: graph.cancel for an unrelated run_id is a no-op
+-- ------------------------------------------------------------------
+--
+-- A firing under run_id A must NOT be interrupted when graph.cancel
+-- carries run_id B. Guards against accidental cancel-fanout to siblings
+-- (e.g. lead's own chat firing under a different run, or a parallel
+-- graph the user didn't /quit).
+do
+  fresh()
+  dispatch_agent("firing-unrelated", {
+    system_prompt  = "You are an explorer.",
+    model          = "test-model",
+    tool_allowlist = { "read_file" },
+    prompt         = "Investigate.",
+  })
+
+  -- The firing is under run_id "run-test" (dispatch_agent default).
+  -- Cancel a DIFFERENT run.
+  _test.calls_clear()
+  feed("lead-workflow", { kind = "graph.cancel", run_id = "run-some-other" })
+
+  local calls = decode_calls()
+
+  -- No interrupt envelope.
+  local interrupt = find_call(calls, function(c)
+    return c.body.kind == "mock-prov.interrupt"
+  end)
+  assert(interrupt == nil,
+    "graph.cancel for a non-matching run_id must NOT emit interrupt; got "
+    .. json.encode(_test.calls()))
+
+  -- No terminal tool.result for our firing.
+  local terminal = find_call(calls, function(c)
+    return c.body.kind == "tool.result" and c.body.id == "firing-unrelated"
+  end)
+  assert(terminal == nil,
+    "graph.cancel for an unrelated run must NOT close our firing")
+
+  -- State still alive.
+  assert(agent._internals.agents["firing-unrelated"] ~= nil,
+    "agent state for the unrelated firing must still be live")
+end
+
+-- ------------------------------------------------------------------
+-- Scenario 14: graph.cancel is idempotent against an already-closed firing
+-- ------------------------------------------------------------------
+--
+-- Race: the firing terminates normally (text-only reply lands) and
+-- THEN graph.cancel arrives for the same run_id. The cancel handler
+-- must no-op (no double interrupt, no double terminal tool.result) —
+-- otherwise we'd emit a stale interrupt against a chat_id whose stream
+-- is already gone, and reasoner-graph would see a phantom tool.result
+-- it can't correlate.
+do
+  fresh()
+  dispatch_agent("firing-closed", {
+    system_prompt  = "You are an explorer.",
+    model          = "test-model",
+    tool_allowlist = { "read_file" },
+    prompt         = "Investigate.",
+  })
+
+  local create = find_call(decode_calls(), function(c)
+    return c.body.kind == "mock-prov.chat.create"
+  end)
+  local chat_id = create.body.chat_id
+
+  -- Close normally with a text-only reply.
+  _test.calls_clear()
+  feed("mock-prov", {
+    kind    = "mock-prov.chat.complete.result",
+    chat_id = chat_id,
+    output  = { text = "Done.", finish_reason = "stop" },
+  })
+  local terminal = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result" and c.body.id == "firing-closed"
+  end)
+  assert(terminal ~= nil, "firing closed normally")
+  assert(agent._internals.agents["firing-closed"] == nil,
+    "state cleared after normal close")
+
+  -- Now graph.cancel arrives for the same run_id. Should be a no-op.
+  _test.calls_clear()
+  feed("lead-workflow", { kind = "graph.cancel", run_id = "run-test" })
+
+  local calls = decode_calls()
+
+  -- No spurious interrupt.
+  local late_interrupt = find_call(calls, function(c)
+    return c.body.kind == "mock-prov.interrupt"
+  end)
+  assert(late_interrupt == nil,
+    "post-close graph.cancel must NOT emit a late interrupt; got "
+    .. json.encode(_test.calls()))
+
+  -- No spurious terminal tool.result.
+  local late_terminal = find_call(calls, function(c)
+    return c.body.kind == "tool.result" and c.body.id == "firing-closed"
+  end)
+  assert(late_terminal == nil,
+    "post-close graph.cancel must NOT emit a second terminal tool.result")
+end
+
 print("agent_test: ok")

@@ -153,6 +153,10 @@ end
 --
 -- agents[firing_id] = {
 --   firing_id      = string,
+--   run_id         = string,         -- enclosing graph run_id; used to
+--                                    -- match `graph.cancel { run_id }` so
+--                                    -- in-flight provider streams under a
+--                                    -- cancelled run are interrupted (#53).
 --   chat_id        = string,
 --   provider       = string,         -- e.g. "ollama" / "mock-plugin"
 --   tool_allowlist = { string -> true } | nil,
@@ -286,6 +290,7 @@ local function handle(body)
 
   local entry = {
     firing_id      = firing_id,
+    run_id         = body.run_id,
     chat_id        = chat_id,
     provider       = provider,
     tool_allowlist = build_allowlist_set(args.tool_allowlist),
@@ -582,6 +587,54 @@ local function on_chat_error(body)
   send_terminal_err(firing_id, body.message or "provider error")
 end
 
+-- Sub-graph cancel propagation (#53). Companion to ef260cd's chat-side
+-- cancel_all → <provider>.interrupt fix: when lead-workflow cancels the
+-- enclosing graph (session_end / user /quit mid-run), in-flight
+-- `<provider>.chat.complete` streams under our firing keep producing
+-- tokens unless we tear them down explicitly. Walk every firing under
+-- the cancelled run_id and:
+--   1. emit `<provider>.interrupt { chat_id }` so the provider binary
+--      closes the streaming HTTP call (mock honours chat_id; openai's
+--      legacy bare `interrupt` is chat-agnostic — that's a separate gap
+--      tracked against the openai binary, NOT this fix).
+--   2. emit a terminal `tool.result { error }` for the firing so
+--      reasoner-graph's `firing_by_request_id` gets cleaned up the same
+--      way a provider error close would. Idempotent: a firing that's
+--      already terminated has no entry, so the cancel is a no-op for it.
+--
+-- Wire shape: graph.cancel { run_id }. Lead-workflow emits this as a
+-- BROADCAST (not targeted at reasoner-graph) so the in-VM bus surfaces
+-- it to every actor including us — see lead-workflow/init.lua's
+-- terminate_active_graph.
+local function on_graph_cancel(body)
+  local run_id = body.run_id
+  if type(run_id) ~= "string" or #run_id == 0 then return end
+
+  -- Snapshot the matching firings before we mutate. clear_firing inside
+  -- send_terminal_err deletes from `agents`; iterating it directly under
+  -- mutation is undefined in Lua.
+  local victims = {}
+  for firing_id, entry in pairs(agents) do
+    if entry.run_id == run_id then
+      victims[#victims + 1] = { firing_id = firing_id, entry = entry }
+    end
+  end
+
+  for _, v in ipairs(victims) do
+    local entry = v.entry
+    -- 1. interrupt the provider stream (per-chat). Mock honours chat_id;
+    -- openai-provider currently fanouts to all chats — that's the open
+    -- follow-up captured in the binary's TODO at main.rs:419-425.
+    emit_to(entry.provider, {
+      kind    = entry.provider .. ".interrupt",
+      chat_id = entry.chat_id,
+    })
+    -- 2. close the firing with a terminal error so the scheduler
+    -- de-registers it. Matches the close-on-provider-error shape.
+    send_terminal_err(v.firing_id, "[Graph cancelled by user]")
+  end
+end
+
 -- ------------------------------------------------------------------
 -- receive_msg — bus subscriber for provider replies + tool results
 -- ------------------------------------------------------------------
@@ -609,6 +662,17 @@ local function receive_msg(entry)
   local body = decoded.body
   local kind = body.kind
   if type(kind) ~= "string" then return end
+
+  -- graph.cancel handler — sub-graph cancel propagation (#53). The
+  -- lead-workflow actor broadcasts `graph.cancel { run_id }` on
+  -- session_end / user-quit; we tear down any of OUR firings under the
+  -- cancelled run by interrupting the provider stream + emitting a
+  -- terminal tool.result. Idempotent: firings already terminated have
+  -- no entry in `agents` and are skipped by on_graph_cancel.
+  if kind == "graph.cancel" then
+    on_graph_cancel(body)
+    return
+  end
 
   -- tool.result envelopes targeting one of our tool_ids advance the
   -- per-turn loop. Everything else (run-close tool.results owned by
@@ -659,6 +723,7 @@ M._internals = {
   on_chat_complete_result = on_chat_complete_result,
   on_tool_result          = on_tool_result,
   on_chat_error           = on_chat_error,
+  on_graph_cancel         = on_graph_cancel,
 }
 
 return M

@@ -418,11 +418,14 @@ do
   lw._internals.terminate_active_graph()
 
   local calls = decode_calls()
+  -- Broadcast (target == nil) per #53: the cancel envelope must reach
+  -- every in-flight agent reasoner so it can interrupt its provider
+  -- stream. reasoner-graph still receives the broadcast.
   local cancel = find_call(calls, function(c)
-    return c.body.kind == "graph.cancel" and c.target == "reasoner-graph"
+    return c.body.kind == "graph.cancel" and c.target == nil
   end)
   assert_true(cancel ~= nil,
-    "session_end with active graph must emit graph.cancel; got "
+    "session_end with active graph must emit graph.cancel as a broadcast; got "
     .. json.encode(_test.calls()))
   assert_eq(cancel.body.run_id, run_id, "graph.cancel carries the active run_id")
 
