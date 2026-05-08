@@ -31,6 +31,7 @@ local json = nefor.json
 local envelope = require("lib.envelope")
 local graph_lib = require("lib.graph")
 local tool_output_dump = require("lib.tool_output_dump")
+local agents_md = require("lib.agents_md")
 
 local SPAWN_GRAPH_SOURCE = graph_lib.SPAWN_GRAPH_SOURCE
 
@@ -217,9 +218,44 @@ function M.spawn_spec(gate_name, command)
   end
 
   -- to_plugin: deliver verbatim, skip during replay + self-emissions.
+  --
+  -- Smart AGENTS.md loader hook (lead-workflow-spec §5): on each
+  -- outbound `tool-gate.tool.invoke` for a path-touching tool, walk
+  -- up from the touched file's dir and append any AGENTS.md not yet
+  -- loaded for this chat to the chat history with an explicit marker.
+  -- The marker is load-bearing — without it the model sees AGENTS.md
+  -- content turning up out of context and tries to interpret why,
+  -- which steers it in the wrong direction.
+  --
+  -- chat_id is best-effort surface for v0.1; the tool.invoke envelope
+  -- doesn't carry one and the agentic-loop's pending-tool chain
+  -- doesn't expose chat_id for tool-executor entries either. The
+  -- agents_md lib falls back to a `_global` scope when chat_id is
+  -- nil. Threading a real chat_id through is a follow-up (the
+  -- dedup-set then becomes per-chat which prevents an outer
+  -- AGENTS.md from being silently shared between two unrelated
+  -- chats; without it /new still gets fresh emissions because the
+  -- inner `_global` set survives, so an /reset-aware override would
+  -- improve the experience but isn't load-bearing for correctness).
+  --
+  -- Emission lands BEFORE the tool.invoke is forwarded to the binary
+  -- so the chat-history ordering is "[system: AGENTS.md loaded …]"
+  -- → tool.invoke → tool.result. The model sees AGENTS.md context
+  -- on its NEXT provider turn, after the tool.result lands.
   local function to_plugin(envs)
     for _, env in ipairs(envs) do
       if not env.replay and env.from ~= gate_name then
+        if env.type == "event" and type(env.body) == "table"
+            and env.body.kind == "tool-gate.tool.invoke" then
+          local ok, err = pcall(agents_md.emit_for_tool_call,
+            nil, env.body.name, env.body.args,
+            function(body) envelope.emit(nil, body) end)
+          if not ok then
+            nefor.log.warn("tool-gate: agents_md.emit_for_tool_call errored", {
+              tool = env.body.name, error = tostring(err),
+            })
+          end
+        end
         -- Strip framework-only fields (`replay`, …) when encoding for
         -- the wire; the protocol parser rejects unknown envelope
         -- fields.
