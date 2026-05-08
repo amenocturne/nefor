@@ -89,6 +89,17 @@ pub const DRAG_AUTO_SCROLL_STEP: u16 = 1;
 /// land the cursor exactly past the boundary to start scrolling.
 pub const DRAG_AUTO_SCROLL_EDGE_ROWS: u16 = 1;
 
+/// Minimum gap between continuous-tick auto-scroll advances while the
+/// user holds the cursor motionless past the edge of a captured
+/// scrollable. Drives the latch's tick gate: every animation frame
+/// that's at least this many ms past the previous tick advances
+/// `scroll_y` by `DRAG_AUTO_SCROLL_STEP`. 60ms ≈ 16 rows/sec, matching
+/// typical text-editor auto-scroll speed — fast enough that long
+/// selections feel responsive, slow enough to stay controllable. The
+/// 60Hz animation tick (~16ms) is too fast on its own; this gate
+/// throttles it down to something the human eye can track.
+pub const DRAG_AUTO_SCROLL_LATCH_INTERVAL_MS: u64 = 60;
+
 /// Apply a wheel notch to `state`, clamping against the cached geometry.
 /// Positive `delta` scrolls down (toward end); negative scrolls up.
 ///

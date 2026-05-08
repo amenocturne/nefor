@@ -24,7 +24,8 @@ use crate::mouse::{
 use crate::reconciler::Reconciler;
 use crate::render::{extract_selection_text, Renderer};
 use crate::scrollable::{
-    scroll_by_signed, DRAG_AUTO_SCROLL_EDGE_ROWS, DRAG_AUTO_SCROLL_STEP, WHEEL_STEP_ROWS,
+    scroll_by_signed, DRAG_AUTO_SCROLL_EDGE_ROWS, DRAG_AUTO_SCROLL_LATCH_INTERVAL_MS,
+    DRAG_AUTO_SCROLL_STEP, WHEEL_STEP_ROWS,
 };
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
@@ -109,6 +110,36 @@ pub struct Engine {
     /// screen y, clamped to the scrollable's painted rect. Pairs with
     /// `selection_anchor_in_content` to drive the copy path.
     selection_drag_in_content: Option<(u16, u16)>,
+    /// Continuous-tick auto-scroll direction. Set when a `Drag` event
+    /// lands inside the captured scrollable's edge zone (or past it),
+    /// cleared when a subsequent `Drag` lands inside the viewport away
+    /// from the edge or when the selection ends. While set, every
+    /// animation tick that's at least `DRAG_AUTO_SCROLL_LATCH_INTERVAL_MS`
+    /// past the previous tick advances `scroll_y` by one row in this
+    /// direction — so a motionless cursor sitting past the edge keeps
+    /// scrolling instead of stalling on the first `Drag` event (terminals
+    /// emit `Drag` only on cursor motion).
+    selection_auto_scroll_latch: Option<AutoScrollDirection>,
+    /// Last `(x, y)` cell the cursor passed over while dragging. Read by
+    /// the latched-tick path to re-resolve the drag's content-coord
+    /// against the freshly-bumped `scroll_y` — content under a fixed
+    /// cursor advances naturally as scroll continues.
+    last_drag_screen_pos: Option<(u16, u16)>,
+    /// Wall-clock ms of the last latched auto-scroll tick (per
+    /// [`Engine::now_ms`]). Sub-tick gate: the animation tick fires at
+    /// 60Hz but we advance scroll only every
+    /// `DRAG_AUTO_SCROLL_LATCH_INTERVAL_MS` ms so the speed feels
+    /// controllable.
+    last_auto_scroll_tick_ms: u64,
+}
+
+/// Direction of the continuous auto-scroll latch. `Up` scrolls toward
+/// the start of the content (decreases `scroll_y`); `Down` scrolls toward
+/// the end (increases `scroll_y`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoScrollDirection {
+    Up,
+    Down,
 }
 
 impl Engine {
@@ -132,6 +163,9 @@ impl Engine {
             selection_scroll_rect: None,
             selection_anchor_in_content: None,
             selection_drag_in_content: None,
+            selection_auto_scroll_latch: None,
+            last_drag_screen_pos: None,
+            last_auto_scroll_tick_ms: 0,
         })
     }
 
@@ -540,6 +574,8 @@ impl Engine {
                 self.selection_scroll_rect = None;
                 self.selection_anchor_in_content = None;
                 self.selection_drag_in_content = None;
+                self.selection_auto_scroll_latch = None;
+                self.last_drag_screen_pos = None;
                 self.needs_render = true;
                 // Capture the deepest `selectable = true` widget under
                 // the cursor along with its painted rect, content-width,
@@ -571,6 +607,11 @@ impl Engine {
                 if self.selection_start.is_some() {
                     self.selection_end = Some((evt.x, evt.y));
                     self.selecting = true;
+                    // Memorise the cursor's screen position so the
+                    // continuous-tick latch can re-resolve content-coord
+                    // against future `scroll_y` bumps while the cursor
+                    // sits motionless past the edge.
+                    self.last_drag_screen_pos = Some((evt.x, evt.y));
                     self.auto_scroll_for_drag(evt.x, evt.y);
                     // Update the content-coord drag end *after*
                     // auto_scroll_for_drag so the captured scrollable's
@@ -676,6 +717,8 @@ impl Engine {
         self.selection_scroll_rect = None;
         self.selection_anchor_in_content = None;
         self.selection_drag_in_content = None;
+        self.selection_auto_scroll_latch = None;
+        self.last_drag_screen_pos = None;
         self.needs_render = true;
 
         if !was_selecting {
@@ -883,6 +926,11 @@ impl Engine {
         let Some(key) = self.selection_scroll_key.clone() else {
             return;
         };
+        // Cache the frame-clock before reaching into the reconciler tree:
+        // the latch update below needs `now_ms` AND the mutable target
+        // borrow runs through the same scope. Hoisting the read avoids
+        // an `&self` / `&mut self` overlap.
+        let now = self.now_ms();
         let Some(root) = self.reconciler.root.as_mut() else {
             return;
         };
@@ -901,16 +949,115 @@ impl Engine {
         // also triggers (the natural "drag way past the bottom" case).
         let top = rect.row;
         let bottom = rect.row.saturating_add(rect.height);
-        let delta: i32 = if y < top.saturating_add(DRAG_AUTO_SCROLL_EDGE_ROWS) {
-            -(DRAG_AUTO_SCROLL_STEP as i32)
-        } else if y >= bottom.saturating_sub(DRAG_AUTO_SCROLL_EDGE_ROWS) {
-            DRAG_AUTO_SCROLL_STEP as i32
-        } else {
-            return;
+        let direction: Option<AutoScrollDirection> =
+            if y < top.saturating_add(DRAG_AUTO_SCROLL_EDGE_ROWS) {
+                Some(AutoScrollDirection::Up)
+            } else if y >= bottom.saturating_sub(DRAG_AUTO_SCROLL_EDGE_ROWS) {
+                Some(AutoScrollDirection::Down)
+            } else {
+                None
+            };
+        // Update the latch: setting it on a fresh edge crossing arms the
+        // continuous-tick path; a `Drag` back into the viewport clears it
+        // so motionless cursors only scroll when actually past the edge.
+        match direction {
+            Some(dir) => {
+                self.selection_auto_scroll_latch = Some(dir);
+                // Reset the tick gate to the current frame-clock so the
+                // first latched advance fires only after a full interval —
+                // avoids a double-bump when the user crosses into the edge
+                // zone (the `Drag` itself bumps once below; the latch's
+                // first tick should be one interval later, not immediately).
+                self.last_auto_scroll_tick_ms = now;
+            }
+            None => {
+                self.selection_auto_scroll_latch = None;
+            }
+        }
+        let delta: i32 = match direction {
+            Some(AutoScrollDirection::Up) => -(DRAG_AUTO_SCROLL_STEP as i32),
+            Some(AutoScrollDirection::Down) => DRAG_AUTO_SCROLL_STEP as i32,
+            None => return,
         };
         if let InstanceState::Scrollable(s) = &mut target.state {
             scroll_by_signed(s, delta);
         }
+    }
+
+    /// Advance the captured scrollable's `scroll_y` by one row in the
+    /// latched direction when at least `DRAG_AUTO_SCROLL_LATCH_INTERVAL_MS`
+    /// have passed since the previous tick. Re-resolves the drag's
+    /// content-coord against the new `scroll_y` so the selection range
+    /// keeps following the (motionless) cursor.
+    ///
+    /// Called from the binary's animation tick on every frame. No-op
+    /// when the latch is clear, when no scrollable is captured, or when
+    /// the cached tree has already gone away mid-drag (rare). Returns
+    /// `true` when state mutated so the caller can mark dirty.
+    fn tick_drag_auto_scroll(&mut self) -> bool {
+        let Some(direction) = self.selection_auto_scroll_latch else {
+            return false;
+        };
+        let now = self.now_ms();
+        if now.saturating_sub(self.last_auto_scroll_tick_ms) < DRAG_AUTO_SCROLL_LATCH_INTERVAL_MS {
+            return false;
+        }
+        let Some(key) = self.selection_scroll_key.clone() else {
+            return false;
+        };
+        let Some(root) = self.reconciler.root.as_mut() else {
+            return false;
+        };
+        let Some(path) = find_scrollable_by_key(root, &key) else {
+            return false;
+        };
+        let Some(target) = mouse_instance_at_path(root, &path) else {
+            return false;
+        };
+        let prev_scroll_y = match &target.state {
+            InstanceState::Scrollable(s) => s.scroll_y,
+            _ => return false,
+        };
+        let delta: i32 = match direction {
+            AutoScrollDirection::Up => -(DRAG_AUTO_SCROLL_STEP as i32),
+            AutoScrollDirection::Down => DRAG_AUTO_SCROLL_STEP as i32,
+        };
+        if let InstanceState::Scrollable(s) = &mut target.state {
+            scroll_by_signed(s, delta);
+            // Already-clamped: scroll_y didn't move. Latch stays armed —
+            // the user is still pressing past the edge — but we don't
+            // pay the re-resolve / dirty cost on a no-op tick.
+            if s.scroll_y == prev_scroll_y {
+                self.last_auto_scroll_tick_ms = now;
+                return false;
+            }
+        }
+        self.last_auto_scroll_tick_ms = now;
+        // Re-resolve the drag's content-coord against the new `scroll_y`.
+        // Cursor's screen position hasn't changed (motionless drag), but
+        // the content under it has — the new content row is what the
+        // selection should extend to.
+        if let Some((x, y)) = self.last_drag_screen_pos {
+            self.update_drag_in_content(x, y);
+        }
+        self.needs_render = true;
+        true
+    }
+
+    /// `true` while the continuous-tick auto-scroll latch is armed. The
+    /// binary's animation tick reads this to decide whether to call
+    /// [`Engine::tick_drag_auto_scroll`]; tests inspect it as a
+    /// black-box assertion that a `Drag` past the edge armed the latch.
+    pub fn has_drag_auto_scroll_latch(&self) -> bool {
+        self.selection_auto_scroll_latch.is_some()
+    }
+
+    /// Advance one frame of latched auto-scroll if the gate has elapsed
+    /// since the previous tick. Called by the binary on every animation
+    /// tick (no-op when the latch is clear). Returns `true` when state
+    /// mutated.
+    pub fn drive_drag_auto_scroll_tick(&mut self) -> bool {
+        self.tick_drag_auto_scroll()
     }
 
     /// Attempt to absorb a wheel event into a scrollable under the

@@ -14,6 +14,8 @@
 //! 5. `tui.scroll_into_view(key)` jumps back to the bottom (v1 minimal
 //!    semantics).
 
+use std::time::Duration;
+
 use nefor_tui::engine::Engine;
 use nefor_tui::input::KeyMessage;
 use nefor_tui::mouse::{MouseKind, MouseMessage};
@@ -990,5 +992,318 @@ fn drag_across_two_adjacent_selectables_clamps_to_origin() {
         !captured.contains("right "),
         "drag from left origin into right widget must NOT include right \
          content (selection clamps to origin); got:\n{captured:?}"
+    );
+}
+
+// ── continuous-tick auto-scroll latch ─────────────────────────────────
+//
+// crossterm only emits `Drag` events on cursor MOTION. The per-Drag
+// auto-scroll path from `28071ab` advances `scroll_y` exactly once per
+// drag event past the edge — so a motionless cursor sitting past the
+// edge produced no further scrolls. The latch path arms when a drag
+// lands in the edge zone, then advances `scroll_y` on every animation
+// tick (gated by an interval so the speed feels controllable). Tests
+// drive the engine clock with `advance_time` to step the gate
+// deterministically.
+
+/// Drag past the bottom edge then advance the engine clock several
+/// latch-intervals. Each interval should advance `scroll_y` by one row,
+/// pulling new transcript rows into view even though no further `Drag`
+/// events fire. The selection's content-end advances naturally as the
+/// content under the (motionless) cursor scrolls.
+#[test]
+fn motionless_cursor_past_bottom_keeps_scrolling_via_latch() {
+    let mut engine = Engine::new(40, 8).expect("engine");
+    engine
+        .load_scenario(SCROLLABLE_SELECTION_SCENARIO)
+        .expect("scenario");
+    let _ = render_str(&mut engine);
+    // Wheel-up to land at offset 8 (visible rows 9..15) — gives plenty
+    // of headroom for the latch to walk into without hitting scroll_y_max.
+    for _ in 0..5 {
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Wheel,
+                x: 1,
+                y: 4,
+                button: Some("up"),
+                mods: vec![],
+            })
+            .expect("wheel-up");
+    }
+    let pre = render_str(&mut engine);
+    assert!(
+        pre.contains("offset: 8"),
+        "expected offset 8 pre-drag; got:\n{pre}"
+    );
+
+    // Click inside the rect, then ONE `Drag` past the bottom edge — that
+    // arms the latch and advances scroll_y by 1 (the existing per-drag
+    // path). After the drag, the cursor doesn't move further: no
+    // additional `Drag` events fire, only animation ticks.
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Click,
+            x: 0,
+            y: 1,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("click");
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Drag,
+            x: 5,
+            y: 10,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("drag-down");
+    let _ = render_str(&mut engine);
+    let post_drag = engine.snapshot();
+    // The `offset:` label only updates via the wheel path's `on_scroll`
+    // event; auto-scroll mutates `scroll_y` directly, so visible rows
+    // are the load-bearing signal. Drag in the edge zone advances
+    // scroll_y by 1: visible window 9..15 → 10..16.
+    assert!(
+        post_drag.contains("row 16"),
+        "first Drag past bottom should bring row 16 into view (scroll_y 8 → 9); got:\n{post_drag}"
+    );
+    assert!(
+        engine.has_drag_auto_scroll_latch(),
+        "Drag in the bottom edge zone must arm the auto-scroll latch"
+    );
+
+    // Now advance the clock by N latch-intervals and call the latched
+    // tick on each — production wires this through the binary's 60Hz
+    // animation tick. We expect scroll_y to advance by N rows.
+    let interval_ms = 60u64;
+    for _ in 0..5 {
+        engine.advance_time(Duration::from_millis(interval_ms));
+        engine.drive_drag_auto_scroll_tick();
+        let _ = engine.render_if_dirty();
+    }
+    let post = engine.snapshot();
+    // Five latched ticks → scroll_y 9 + 5 = 14, visible rows 15..21.
+    assert!(
+        post.contains("row 21"),
+        "five latched ticks should pull row 21 into view (scroll_y 9 + 5 = 14); got:\n{post}"
+    );
+    assert!(
+        !post.contains("row 9 ") && !post.contains("row 9\n") && !post.ends_with("row 9"),
+        "five latched ticks should have scrolled row 9 out of view; got:\n{post}"
+    );
+}
+
+/// A `Drag` back into the viewport (off the edge) clears the latch, so
+/// subsequent ticks do NOT advance `scroll_y`.
+#[test]
+fn drag_back_into_viewport_clears_latch() {
+    let mut engine = Engine::new(40, 8).expect("engine");
+    engine
+        .load_scenario(SCROLLABLE_SELECTION_SCENARIO)
+        .expect("scenario");
+    let _ = render_str(&mut engine);
+    // Take off the bottom-pin.
+    for _ in 0..5 {
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Wheel,
+                x: 1,
+                y: 4,
+                button: Some("up"),
+                mods: vec![],
+            })
+            .expect("wheel-up");
+    }
+    let _ = render_str(&mut engine);
+    // Click + drag past bottom edge → latch armed.
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Click,
+            x: 0,
+            y: 1,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("click");
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Drag,
+            x: 5,
+            y: 10,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("drag-edge");
+    assert!(engine.has_drag_auto_scroll_latch());
+    // Drag back inside the viewport, comfortably away from edge zones.
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Drag,
+            x: 5,
+            y: 4,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("drag-mid");
+    assert!(
+        !engine.has_drag_auto_scroll_latch(),
+        "Drag back into the viewport (away from the edge zone) must clear the latch"
+    );
+    // Snapshot offset, advance the clock, confirm no further scroll.
+    let pre = render_str(&mut engine);
+    for _ in 0..5 {
+        engine.advance_time(Duration::from_millis(60));
+        engine.drive_drag_auto_scroll_tick();
+    }
+    let post = render_str(&mut engine);
+    let extract_offset = |s: &str| -> Option<String> {
+        s.lines().find(|l| l.contains("offset:")).map(String::from)
+    };
+    assert_eq!(
+        extract_offset(&pre),
+        extract_offset(&post),
+        "no latch → ticks must not move scroll_y; pre:\n{pre}\npost:\n{post}"
+    );
+}
+
+/// Mouse-up while the latch is armed must clear it — no scroll on the
+/// next tick.
+#[test]
+fn mouse_up_clears_latch() {
+    let mut engine = Engine::new(40, 8).expect("engine");
+    engine
+        .load_scenario(SCROLLABLE_SELECTION_SCENARIO)
+        .expect("scenario");
+    let _ = render_str(&mut engine);
+    for _ in 0..5 {
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Wheel,
+                x: 1,
+                y: 4,
+                button: Some("up"),
+                mods: vec![],
+            })
+            .expect("wheel-up");
+    }
+    let _ = render_str(&mut engine);
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Click,
+            x: 0,
+            y: 1,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("click");
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Drag,
+            x: 5,
+            y: 10,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("drag-edge");
+    assert!(engine.has_drag_auto_scroll_latch());
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Up,
+            x: 5,
+            y: 10,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("up");
+    assert!(
+        !engine.has_drag_auto_scroll_latch(),
+        "mouse-up must clear the auto-scroll latch"
+    );
+}
+
+/// The latch's content-coord drag end advances as content scrolls under
+/// a motionless cursor — when the latch ticks pull row N into view past
+/// the cursor's screen position, the selection's drag end resolves to
+/// row N (not the original click row + zero).
+///
+/// Verifies that when the user releases AFTER the latch has scrolled the
+/// content but BEFORE the cursor moves further, the captured selection
+/// covers the full anchored range (anchor + scrolled-into-view rows).
+#[test]
+fn latch_advances_drag_in_content_under_motionless_cursor() {
+    let mut engine = Engine::new(40, 8).expect("engine");
+    engine
+        .load_scenario(SCROLLABLE_SELECTION_SCENARIO)
+        .expect("scenario");
+    let _ = render_str(&mut engine);
+    for _ in 0..5 {
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Wheel,
+                x: 1,
+                y: 4,
+                button: Some("up"),
+                mods: vec![],
+            })
+            .expect("wheel-up");
+    }
+    let _ = render_str(&mut engine);
+    // Click on row 9 (top of viewport) → anchor at content row 8.
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Click,
+            x: 0,
+            y: 1,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("click");
+    // One Drag past the bottom edge, then sit motionless — latch advances
+    // scroll_y on subsequent ticks.
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Drag,
+            x: 5,
+            y: 10,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("drag-edge");
+    let _ = engine.render_if_dirty();
+    // Tick the latch enough times to pull rows 16..20 into view past
+    // the cursor — drag's content row should track them.
+    for _ in 0..15 {
+        engine.advance_time(Duration::from_millis(60));
+        engine.drive_drag_auto_scroll_tick();
+        let _ = engine.render_if_dirty();
+    }
+    // Release without further mouse motion — copy must include rows the
+    // latch scrolled past.
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Up,
+            x: 5,
+            y: 10,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("up");
+    let captured =
+        last_captured_selection(&mut engine).expect("mouse.selection should fire on release");
+    assert!(
+        captured.contains("row 9"),
+        "captured copy must contain anchor row 9; got:\n{captured:?}"
+    );
+    // After 1 (drag) + 15 (latch) = 16 row scrolls past offset 8 = scroll_y 23
+    // (clamped at scroll_y_max = 30 - 7 = 23). Visible rows 24..30. The
+    // cursor at y=10 (past rect bottom row 7) clamps to last visible row =
+    // row 30. So the selection covers rows 9..30 — assert a row well past
+    // the original viewport is included.
+    assert!(
+        captured.contains("row 20"),
+        "latch should pull content past the original viewport into the \
+         captured copy; got:\n{captured:?}"
     );
 }
