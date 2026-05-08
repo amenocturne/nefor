@@ -163,6 +163,16 @@ actor.spawn(require("tool-gate").spawn_spec("tool-gate", tool_gate_argv))
 actor.spawn(require("basic-tools"))
 
 -------------------------------------------------------------------------
+-- 3d2. Lead-workflow actor — owns plan/approval state + active graph
+--      run_id; advertises `dispatch-graph` / `write-review` /
+--      `await-approval` tools to tool-gate. Lives alongside
+--      `agentic-loop`, not inside it (separate bus subscriptions,
+--      separate state).
+-------------------------------------------------------------------------
+
+actor.spawn(require("lead-workflow"))
+
+-------------------------------------------------------------------------
 -- 3e. Chat (declarative TUI)
 -------------------------------------------------------------------------
 
