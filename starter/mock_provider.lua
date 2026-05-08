@@ -664,17 +664,25 @@ local function emit_reasoning(chat_id, id)
   return true
 end
 
--- Emit the full response stream. Returns true if it ran to completion,
--- false if `interrupted[chat_id]` flipped mid-stream so the caller knows
--- to skip the chat.complete.result and emit chat.error("interrupted")
--- instead — mirrors openai-provider's turn.error("interrupted") path.
+-- Emit the full response stream. Returns `(completed, partial)` where
+-- `completed` is true if the stream ran to completion, false if
+-- `interrupted[chat_id]` flipped mid-stream; `partial` is the substring
+-- actually emitted as `stream.delta` chunks so far (the full text on
+-- completion, the prefix-up-to-the-cancel-boundary on interrupt). The
+-- caller persists `partial` into the chat history so the next turn's
+-- context shows what the model said before being cut off — mirrors
+-- openai-provider's `outcome.full_text` push on `outcome.interrupted`
+-- (plugins/openai-provider/src/main.rs:751-755). Without this, the
+-- model on the next turn has no record of its own interrupted attempt,
+-- so the user's "you started thinking wrongly" follow-up has nothing
+-- to anchor against.
 local function emit_stream(chat_id, text, opts)
-  if type(text) ~= "string" or #text == 0 then return true end
+  if type(text) ~= "string" or #text == 0 then return true, "" end
   opts = opts or {}
   local id = "resp-" .. chat_id
 
   if opts.with_reasoning then
-    if not emit_reasoning(chat_id, id) then return false end
+    if not emit_reasoning(chat_id, id) then return false, "" end
   end
 
   -- Stream the response in small fixed-size chunks paced to ~200 tok/s
@@ -685,21 +693,24 @@ local function emit_stream(chat_id, text, opts)
   local cp_count = utf8.len(text) or #text
   local cp_per_chunk = STREAM_CHUNK_CODEPOINTS
   local cp_i = 1
+  local emitted = ""
   while cp_i <= cp_count do
-    if interrupted[chat_id] then return false end
+    if interrupted[chat_id] then return false, emitted end
     local cp_stop = math.min(cp_i + cp_per_chunk - 1, cp_count)
     local byte_start = utf8.offset(text, cp_i)
     local byte_after_stop = utf8.offset(text, cp_stop + 1)
     local byte_stop = byte_after_stop and (byte_after_stop - 1) or #text
+    local chunk = string.sub(text, byte_start, byte_stop)
     nefor.emit("stream.delta", {
       id      = id,
       chat_id = chat_id,
-      text    = string.sub(text, byte_start, byte_stop),
+      text    = chunk,
     })
+    emitted = emitted .. chunk
     cp_i = cp_stop + 1
     if cp_i <= cp_count then pace() end
   end
-  if interrupted[chat_id] then return false end
+  if interrupted[chat_id] then return false, emitted end
   nefor.emit("stream.end", {
     id            = id,
     chat_id       = chat_id,
@@ -707,7 +718,7 @@ local function emit_stream(chat_id, text, opts)
     model         = "mock-model",
     duration_ms   = 0,
   })
-  return true
+  return true, text
 end
 
 -- ------------------------------------------------------------------
@@ -791,10 +802,13 @@ nefor.on(NAME .. ".chat.complete", function(body)
   -- streaming, matching openai-provider's behaviour). The
   -- `with_reasoning` flag is set on the deferred-result relay turn so
   -- the orchestrator's wrap node demonstrates the live thinking →
-  -- collapse rendering path.
+  -- collapse rendering path. `partial` is the prefix actually emitted
+  -- before the loop ran out (full text on completion, cancel-boundary
+  -- prefix on interrupt — used to seed history below).
   local completed = true
+  local partial = ""
   if type(resp.text) == "string" and #resp.text > 0 then
-    completed = emit_stream(chat_id, resp.text, { with_reasoning = resp.with_reasoning })
+    completed, partial = emit_stream(chat_id, resp.text, { with_reasoning = resp.with_reasoning })
   end
 
   -- Cancelled mid-stream: emit `<name>.chat.error` with msg "interrupted"
@@ -802,11 +816,24 @@ nefor.on(NAME .. ".chat.complete", function(body)
   -- (mirrors openai-provider's turn.error("interrupted") path) and skip
   -- the result wire — the agentic-loop's pending entry closes via
   -- chat.error → tool.result{error="interrupted"}.
+  --
+  -- Persist `partial` (the prefix actually streamed before the cancel
+  -- flag flipped) into chat history so the NEXT turn's `pick_response_for`
+  -- — and any real-LLM equivalent — sees what the model said before
+  -- being cut off. Without this, a "/cancel + 'you were thinking
+  -- wrong'" follow-up has no anchor in context. Mirrors openai-
+  -- provider's push_assistant on outcome.interrupted
+  -- (plugins/openai-provider/src/main.rs around line 751). Skip the
+  -- push entirely when the cancel landed before any chunks (partial
+  -- empty) — an empty assistant message confuses both the OpenAI wire
+  -- shape (content: null vs "") and any history-walking heuristic.
   if not completed then
     interrupted[chat_id] = nil
     nefor.emit("chat.error", { chat_id = chat_id, message = "interrupted" })
     if not chats[chat_id] then chats[chat_id] = {} end
-    table.insert(chats[chat_id], { role = "assistant", content = "" })
+    if type(partial) == "string" and #partial > 0 then
+      table.insert(chats[chat_id], { role = "assistant", content = partial })
+    end
     return
   end
 
@@ -901,6 +928,30 @@ end)
 -- `<NAME>.models.list_requested`. We answer with a single-model list.
 nefor.on(NAME .. ".models.list_requested", function(_body)
   nefor.emit("models.listed", { models = { "mock-model" } })
+end)
+
+-- Debug-only history snapshot. Used by integration tests (and ad-hoc
+-- diagnostics) to peek at the per-chat messages table without
+-- re-driving a full chat.complete cycle. The production chat path
+-- doesn't depend on it; nothing on the bus emits or subscribes to
+-- `<NAME>.debug.history.*` outside of test harnesses.
+nefor.on(NAME .. ".debug.history.dump", function(body)
+  local chat_id = body and body.chat_id
+  if type(chat_id) ~= "string" then return end
+  local history = chats[chat_id] or {}
+  local snapshot = {}
+  for i, m in ipairs(history) do
+    snapshot[i] = {
+      role         = m.role,
+      content      = m.content,
+      tool_call_id = m.tool_call_id,
+      tool_calls   = m.tool_calls,
+    }
+  end
+  nefor.emit("debug.history.result", {
+    chat_id  = chat_id,
+    messages = snapshot,
+  })
 end)
 
 -- /model <name> selection. Mock has only one model; whatever model the
