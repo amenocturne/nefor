@@ -437,6 +437,19 @@ local function reduce_plan_submitted(body)
     submitted_at = body.submitted_at,
     approved     = nil,
   }
+
+  -- Re-emit the chat-surface envelope on every plan.submitted handling,
+  -- live and replay both. chat.lua's reducer keys plan entries by
+  -- plan_id and is idempotent, so a duplicate (live persistence + replay
+  -- re-emit on the next /resume) is a no-op visually. Without this the
+  -- yellow plan box never reappears after /resume even though the
+  -- actor's active_plan state is restored.
+  emit_as(SOURCE_NAME, nil, {
+    kind         = "chat.plan.append",
+    plan_id      = plan_id,
+    text         = body.plan,
+    submitted_at = body.submitted_at,
+  })
 end
 
 local function reduce_plan_approved(body)

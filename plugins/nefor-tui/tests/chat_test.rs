@@ -4722,3 +4722,83 @@ fn user_submit_after_plan_does_not_carry_plan_body_in_wire_text() {
         );
     }
 }
+
+#[test]
+fn chat_plan_append_is_idempotent_on_plan_id() {
+    // The lead-workflow actor's plan.submitted reducer fires
+    // chat.plan.append on every handling — once on live (via bus
+    // feedback) and again on /resume (sessions replays both the
+    // persisted chat.plan.append and re-fires the reducer for the
+    // replayed plan.submitted). chat.lua's reducer must dedupe by
+    // plan_id so the same plan doesn't paint two yellow boxes after
+    // every resume.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    let envelope = json!({
+        "kind": "chat.plan.append",
+        "plan_id": "dup-plan",
+        "text": "DUP_PLAN_BODY",
+        "submitted_at": "2026-05-08T12:00:00Z",
+    });
+    dispatch_event(&mut engine, envelope.clone());
+    dispatch_event(&mut engine, envelope);
+    let out = render_str(&mut engine);
+
+    let body_count = out.matches("DUP_PLAN_BODY").count();
+    assert_eq!(
+        body_count, 1,
+        "duplicate chat.plan.append for same plan_id must render only one yellow box; out: {out:?}"
+    );
+}
+
+#[test]
+fn chat_plan_append_dedup_preserves_approved_status() {
+    // After a plan is approved, a duplicate chat.plan.append for the
+    // same plan_id (e.g. from /resume's replay path) must NOT regress
+    // the entry's status back to "pending". The dedup branch returns
+    // the existing entry untouched.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.plan.append",
+            "plan_id": "dup-approve",
+            "text": "PLAN_TO_APPROVE",
+            "submitted_at": "2026-05-08T12:00:00Z",
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "lead-workflow.plan.approved",
+            "plan_id": "dup-approve",
+            "approved": true,
+        }),
+    );
+    // Duplicate append for the already-approved plan_id.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.plan.append",
+            "plan_id": "dup-approve",
+            "text": "PLAN_TO_APPROVE",
+            "submitted_at": "2026-05-08T12:00:00Z",
+        }),
+    );
+
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("✓ approved"),
+        "approved status must survive a duplicate chat.plan.append: {out:?}"
+    );
+    let body_count = out.matches("PLAN_TO_APPROVE").count();
+    assert_eq!(
+        body_count, 1,
+        "duplicate append must not paint a second entry: {out:?}"
+    );
+}

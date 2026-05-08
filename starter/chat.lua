@@ -3501,9 +3501,25 @@ local function update(msg, state)
   if kind == "chat.plan.append" then
     local text = msg.text or ""
     if #text == 0 then return state, {} end
+    -- Idempotent on plan_id: the lead-workflow actor's plan.submitted
+    -- reducer fires chat.plan.append on every handling — live (via bus
+    -- feedback) AND replay. Sessions persists the live emission, then
+    -- /resume replays both the persisted chat.plan.append and the
+    -- re-emit from the actor's reducer. Without this guard the same
+    -- plan_id would produce two yellow boxes after every /resume. Drop
+    -- the duplicate; status stays untouched (already-approved entries
+    -- don't regress to pending).
+    local plan_id = msg.plan_id or ""
+    if plan_id ~= "" then
+      for _, v in ipairs(state.entries) do
+        if v.kind == "plan" and v.plan_id == plan_id then
+          return state, {}
+        end
+      end
+    end
     return push_entry(state, {
       kind         = "plan",
-      plan_id      = msg.plan_id or "",
+      plan_id      = plan_id,
       text         = text,
       submitted_at = msg.submitted_at,
       status       = "pending",

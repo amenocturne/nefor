@@ -392,6 +392,120 @@ do
 end
 
 -- ------------------------------------------------------------------
+-- chat.plan.append re-emit: replaying lead-workflow.plan.submitted on
+-- /resume must produce a chat.plan.append envelope so the chat surface
+-- can re-render the yellow plan box. Without this, the actor's plan
+-- state restores correctly but the visual entry is lost.
+-- ------------------------------------------------------------------
+
+do
+  fresh()
+  local replay_window = require("lib.replay_window")
+  replay_window.set(true)
+  feed("step", {
+    kind         = "lead-workflow.plan.submitted",
+    plan_id      = "plan-replay-1",
+    plan         = "Replayed plan body",
+    submitted_at = "2026-05-08T00:00:00.000Z",
+  })
+  replay_window.set(false)
+
+  local calls = decode_calls()
+  local appended = find_call(calls, function(c)
+    return c.body.kind == "chat.plan.append"
+        and c.body.plan_id == "plan-replay-1"
+  end)
+  assert_true(appended ~= nil,
+    "replayed plan.submitted must re-emit chat.plan.append for the chat surface; got "
+    .. json.encode(_test.calls()))
+  assert_eq(appended.body.text, "Replayed plan body",
+    "replayed chat.plan.append carries the plan text")
+  assert_eq(appended.body.submitted_at, "2026-05-08T00:00:00.000Z",
+    "replayed chat.plan.append carries the original submitted_at")
+end
+
+-- Multi-plan replay: plan A submitted+approved, plan B submitted only.
+-- chat.plan.append fires for both, plan A gets approved status via
+-- chat.lua's direct subscription to lead-workflow.plan.approved (replay
+-- already covers that path; we only need to assert chat.plan.append
+-- re-emission here).
+do
+  fresh()
+  local replay_window = require("lib.replay_window")
+  replay_window.set(true)
+  feed("step", {
+    kind         = "lead-workflow.plan.submitted",
+    plan_id      = "plan-A",
+    plan         = "Plan A body",
+    submitted_at = "2026-05-08T00:00:00.000Z",
+  })
+  feed("step", {
+    kind     = "lead-workflow.plan.approved",
+    plan_id  = "plan-A",
+    approved = true,
+  })
+  feed("step", {
+    kind         = "lead-workflow.plan.submitted",
+    plan_id      = "plan-B",
+    plan         = "Plan B body",
+    submitted_at = "2026-05-08T00:01:00.000Z",
+  })
+  replay_window.set(false)
+
+  local calls = decode_calls()
+  local append_calls = find_calls(calls, function(c)
+    return c.body.kind == "chat.plan.append"
+  end)
+  assert_eq(#append_calls, 2,
+    "expected chat.plan.append for both plan A and plan B on replay; got "
+    .. tostring(#append_calls))
+  local saw_a, saw_b = false, false
+  for _, c in ipairs(append_calls) do
+    if c.body.plan_id == "plan-A" then saw_a = true end
+    if c.body.plan_id == "plan-B" then saw_b = true end
+  end
+  assert_true(saw_a, "plan A's chat.plan.append fires on replay")
+  assert_true(saw_b, "plan B's chat.plan.append fires on replay")
+end
+
+-- Live path: the actor emits lead-workflow.plan.submitted from
+-- write-review; the bus feeds that envelope back through receive_msg,
+-- and the reducer re-emits chat.plan.append for the chat surface. The
+-- test simulates the bus feedback explicitly because the test driver
+-- doesn't wire actor.lua's bus subscription. Regression pin against
+-- gating chat.plan.append emission on replay only.
+do
+  fresh()
+  feed("tool-gate", {
+    kind = "lead-workflow.tool.invoke",
+    id   = "firing-plan-live",
+    name = "write-review",
+    args = { plan = "Live plan body" },
+  })
+  local plan_id = lw._internals.state.active_plan.plan_id
+
+  -- Simulate the bus feedback (in production, actor.lua's bus.on_event
+  -- subscriber re-dispatches the actor's own emitted envelope through
+  -- receive_msg).
+  feed("step", {
+    kind         = "lead-workflow.plan.submitted",
+    plan_id      = plan_id,
+    plan         = "Live plan body",
+    submitted_at = "2026-05-08T00:00:00.000Z",
+  })
+
+  local calls = decode_calls()
+  local appended = find_call(calls, function(c)
+    return c.body.kind == "chat.plan.append" and c.body.plan_id == plan_id
+  end)
+  assert_true(appended ~= nil,
+    "write-review on live path (with bus feedback) must emit chat.plan.append; got "
+    .. json.encode(_test.calls()))
+  assert_eq(appended.body.text, "Live plan body",
+    "live chat.plan.append carries the plan text")
+end
+
+-- ------------------------------------------------------------------
 -- session_end terminates active graph
 -- ------------------------------------------------------------------
 
