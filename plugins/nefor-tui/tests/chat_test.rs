@@ -4373,3 +4373,352 @@ fn at_path_strips_trailing_punctuation_when_resolving() {
         "wrapper should carry the trimmed (no-trailing-period) path: {wire:?}"
     );
 }
+
+// ───────────────────────────────────────────────────────────────────
+// plan-message contract — yellow-bordered render-only entry kind
+// emitted by the lead-workflow actor's `write-review` tool. The plan
+// body is shown to the user and reviewed via /approve | /reject; it
+// does NOT enter model context (the model already saw it via the
+// tool call's args).
+// ───────────────────────────────────────────────────────────────────
+
+/// SGR fragment for the plan border colour `#FFD75F`. The 24-bit
+/// colour gets written as `38;2;255;215;95` per ansi.rs's `write_fg`.
+/// Asserting the literal SGR substring is the cheapest way to confirm
+/// the renderer painted the yellow chrome — the plan border is the
+/// only thing in chat.lua that uses this RGB triple, so a hit on this
+/// substring uniquely identifies the plan box.
+const PLAN_YELLOW_SGR: &str = "38;2;255;215;95";
+
+#[test]
+fn chat_plan_append_renders_yellow_bordered_plan_entry() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.plan.append",
+            "plan_id": "p1",
+            "text": "Step one\nStep two",
+            "submitted_at": "2026-05-08T14:30:00Z",
+        }),
+    );
+
+    let out = render_str(&mut engine);
+
+    // Body lines from the markdown plan land in the transcript.
+    assert!(out.contains("Step one"), "plan body line 1 missing: {out:?}");
+    assert!(out.contains("Step two"), "plan body line 2 missing: {out:?}");
+
+    // The bordered_box helper paints all four rounded corners, same as
+    // the user block — confirms render_plan_entry routed through
+    // bordered_box rather than dropping to the plain-text fallback.
+    for corner in ['╭', '╮', '╰', '╯'] {
+        assert!(
+            out.contains(corner),
+            "plan block missing corner {corner:?}: {out:?}"
+        );
+    }
+
+    // Yellow border colour (#FFD75F → SGR 38;2;255;215;95). This is the
+    // load-bearing assertion: a non-yellow border (e.g. blue user_chrome)
+    // would emit `38;2;127;180;255` instead, and this substring would
+    // NOT appear.
+    assert!(
+        out.contains(PLAN_YELLOW_SGR),
+        "yellow plan border SGR `{PLAN_YELLOW_SGR}` missing in: {out:?}",
+    );
+
+    // Subtitle carries the timestamp the actor stamped.
+    assert!(
+        out.contains("submitted at 14:30"),
+        "plan subtitle missing timestamp: {out:?}"
+    );
+
+    // Pending plans show the action hint so the user knows the
+    // /approve | /reject convention without leaving the chat surface.
+    assert!(
+        out.contains("/approve"),
+        "pending plan should show /approve hint: {out:?}"
+    );
+    assert!(
+        out.contains("/reject"),
+        "pending plan should show /reject hint: {out:?}"
+    );
+}
+
+#[test]
+fn lead_workflow_plan_approved_updates_status() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.plan.append",
+            "plan_id": "abc-123",
+            "text": "Refactor the bus reducer",
+            "submitted_at": "2026-05-08T09:15:00Z",
+        }),
+    );
+    let pre = render_str(&mut engine);
+    assert!(
+        pre.contains("/approve"),
+        "pre-approval should show pending hint: {pre:?}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "lead-workflow.plan.approved",
+            "plan_id": "abc-123",
+            "approved": true,
+        }),
+    );
+    let out = render_str(&mut engine);
+
+    // After approval the hint disappears and a check-mark status row
+    // takes its place.
+    assert!(
+        !out.contains("/approve"),
+        "approved plan should NOT carry the pending hint: {out:?}"
+    );
+    assert!(
+        out.contains("✓ approved"),
+        "approved plan should show the check-mark status: {out:?}"
+    );
+    // Plan body still in the transcript — approval doesn't hide it.
+    assert!(
+        out.contains("Refactor the bus reducer"),
+        "approved plan body missing: {out:?}"
+    );
+}
+
+#[test]
+fn lead_workflow_plan_rejected_marks_entry() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.plan.append",
+            "plan_id": "rej-1",
+            "text": "Drop the index",
+            "submitted_at": "2026-05-08T10:00:00Z",
+        }),
+    );
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "lead-workflow.plan.approved",
+            "plan_id": "rej-1",
+            "approved": false,
+        }),
+    );
+    let out = render_str(&mut engine);
+
+    assert!(
+        out.contains("✗ rejected"),
+        "rejected plan should show the cross status: {out:?}"
+    );
+    assert!(
+        !out.contains("/approve"),
+        "rejected plan should NOT carry the pending hint: {out:?}"
+    );
+}
+
+#[test]
+fn multiple_plans_track_status_independently() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.plan.append",
+            "plan_id": "first",
+            "text": "FIRST_PLAN_BODY",
+            "submitted_at": "2026-05-08T08:00:00Z",
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.plan.append",
+            "plan_id": "second",
+            "text": "SECOND_PLAN_BODY",
+            "submitted_at": "2026-05-08T08:05:00Z",
+        }),
+    );
+    let _ = render_str(&mut engine);
+
+    // Approve only the FIRST one — second must stay pending.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "lead-workflow.plan.approved",
+            "plan_id": "first",
+            "approved": true,
+        }),
+    );
+    let out = render_str(&mut engine);
+
+    assert!(
+        out.contains("FIRST_PLAN_BODY"),
+        "first plan body missing: {out:?}"
+    );
+    assert!(
+        out.contains("SECOND_PLAN_BODY"),
+        "second plan body missing: {out:?}"
+    );
+    // Exactly one approved row — the FIRST plan's status changed; the
+    // second is still pending and shouldn't carry the check-mark.
+    let approved_count = out.matches("✓ approved").count();
+    assert_eq!(
+        approved_count, 1,
+        "expected exactly one approved row after approving plan_id=first; out: {out:?}"
+    );
+    // The second plan's pending hint must still be visible — its
+    // status didn't change. (Note: the first plan's hint also went
+    // away; both contribute to the count, so we just assert the hint
+    // string is present at least once.)
+    assert!(
+        out.contains("/approve"),
+        "second (still-pending) plan should still show the action hint: {out:?}"
+    );
+}
+
+#[test]
+fn approval_for_unknown_plan_id_is_dropped() {
+    // Defence: an approval envelope for a plan_id we never appended is
+    // a no-op — chat.lua's reducer leaves state untouched rather than
+    // creating a synthetic entry. Pre-fix a sloppy reducer that pushed
+    // an entry on approval would surface a phantom row here.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "lead-workflow.plan.approved",
+            "plan_id": "ghost",
+            "approved": true,
+        }),
+    );
+    let out = render_str(&mut engine);
+
+    // No plan body → no approval check should appear.
+    assert!(
+        !out.contains("✓ approved"),
+        "approval for unknown plan_id should NOT paint a status row: {out:?}"
+    );
+}
+
+#[test]
+fn chat_plan_append_does_not_emit_chat_message_append_or_input_submit() {
+    // Render-only contract: the plan envelope drops into the chat
+    // surface as a yellow-bordered entry but MUST NOT cause chat.lua
+    // to re-emit a `chat.message.append` (which would feed the
+    // assistant/orchestrator history) or a `chat.input.submit` (which
+    // would re-trigger model inference). The model already saw the
+    // plan via the write-review tool's args; chat.lua's job is purely
+    // visual review-and-approve.
+    //
+    // This is the "plan content is NOT included in model context"
+    // assertion: model context is built from `chat.message.append`
+    // envelopes the orchestrator/agentic-loop replays into providers.
+    // If chat.lua doesn't echo the plan back as a message, the
+    // provider's history never sees it — preventing the duplication
+    // the user flagged on the spec.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.plan.append",
+            "plan_id": "p1",
+            "text": "PLAN_TEXT_THAT_MUST_NOT_LEAK",
+            "submitted_at": "2026-05-08T12:00:00Z",
+        }),
+    );
+
+    let emits = engine.take_emit_queue();
+    for (_target, body) in &emits {
+        let kind = body
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert_ne!(
+            kind, "chat.message.append",
+            "chat.plan.append must NOT echo as chat.message.append (would land in model context): {body:?}"
+        );
+        assert_ne!(
+            kind, "chat.input.submit",
+            "chat.plan.append must NOT trigger a chat.input.submit: {body:?}"
+        );
+        // The plan body is the load-bearing thing to NOT leak. Even if
+        // some other envelope did get emitted, the plan text itself
+        // must not be a payload field of it.
+        let serialized = serde_json::to_string(body).unwrap_or_default();
+        assert!(
+            !serialized.contains("PLAN_TEXT_THAT_MUST_NOT_LEAK"),
+            "plan body leaked into emitted envelope {kind:?}: {body:?}"
+        );
+    }
+
+    // And the plan body still rendered visibly — proving the entry
+    // landed locally without going through any wire echo.
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("PLAN_TEXT_THAT_MUST_NOT_LEAK"),
+        "plan body missing from local render: {out:?}"
+    );
+}
+
+#[test]
+fn user_submit_after_plan_does_not_carry_plan_body_in_wire_text() {
+    // Tighter version of the previous test: even after the plan lands
+    // and the user types their next prompt, the `chat.input.submit`
+    // wire envelope must carry ONLY the user's typed text — the plan
+    // body must never be appended (e.g. as context glue) into that
+    // text field. Pre-fix a naive reducer that built `text` by
+    // concatenating recent entries would leak the plan here.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.plan.append",
+            "plan_id": "p1",
+            "text": "PLAN_BODY_PRIVATE_TO_RENDER",
+            "submitted_at": "2026-05-08T12:00:00Z",
+        }),
+    );
+    let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+
+    submit_text(&mut engine, "/approve");
+
+    let emits = engine.take_emit_queue();
+    for (_target, body) in &emits {
+        let serialized = serde_json::to_string(body).unwrap_or_default();
+        assert!(
+            !serialized.contains("PLAN_BODY_PRIVATE_TO_RENDER"),
+            "plan body leaked into post-plan emit {body:?}"
+        );
+    }
+}

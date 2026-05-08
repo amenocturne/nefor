@@ -282,6 +282,12 @@ local C = {
   md_code_inline_bg = "#3a3a3a",
   md_code_block_bg  = "#3a3a3a",
   footer          = "#707070",  -- HL_FOOTER
+  -- Plan-message border. Yellow distinguishes a write-review plan from
+  -- the user's blue block and the system's grey-italic line. Bright
+  -- gold reads on every terminal profile and doesn't collide with the
+  -- existing `status_warn` (#D7AF5F) which carries semantic "warning"
+  -- weight; plans aren't warnings, they're a third entry kind.
+  plan            = "#FFD75F",
 }
 
 local STYLE = {
@@ -315,6 +321,19 @@ local STYLE = {
   dag_done        = { fg = C.status_ok },
   dag_error       = { fg = C.status_danger, bold = true },
   dag_skipped     = { fg = C.status_dim, italic = true },
+  -- Plan-entry chrome (yellow border). Same `bold = true` weight the
+  -- user_chrome carries so the two read as parallel "input/output of a
+  -- decision" frames at equal visual weight.
+  plan_chrome           = { fg = C.plan, bold = true },
+  -- Approved plans dim the border so the chat scroll de-emphasises
+  -- already-resolved plans without actually hiding them. Rejected
+  -- plans go danger-red so they stand out as "do NOT proceed on this".
+  plan_chrome_approved  = { fg = C.plan, italic = true },
+  plan_chrome_rejected  = { fg = C.status_danger, strikethrough = true },
+  plan_subtitle         = { fg = C.footer },
+  plan_hint             = { fg = C.footer, italic = true },
+  plan_status_approved  = { fg = C.status_ok, bold = true },
+  plan_status_rejected  = { fg = C.status_danger, bold = true },
 }
 
 -- Markdown theme — exact legacy hex codes (spec section 3).
@@ -353,6 +372,8 @@ local MARKDOWN_THEME = {
 --                       { role = "system",    kind = "text", text }
 --                       { role = "tool",      kind = "tool_call",
 --                         id, name, input, output?, error? }
+--                       { kind = "plan", plan_id, text, submitted_at,
+--                         status = "pending" | "approved" | "rejected" }
 --   in_flight         index of streaming assistant entry, or nil
 --   input_value       text_input value
 --   focused_id        focus key (only "input" for now)
@@ -906,10 +927,91 @@ local function tool_expanded(entry)
   return tui.column { gap = 0, children = rows }
 end
 
+-- Plan entries carry a `submitted_at` timestamp the lead-workflow
+-- actor stamps when the write-review tool fires. Render as "HH:MM"
+-- for the plan-box subtitle. Accepts ISO 8601 strings (e.g.
+-- "2026-05-08T14:30:21Z") and epoch-ms numbers; anything else
+-- stringifies as-is so a malformed value doesn't crash the surface.
+local function format_submitted_at(s)
+  if type(s) == "number" then
+    return os.date("!%H:%M", math.floor(s / 1000))
+  end
+  if type(s) ~= "string" then return tostring(s) end
+  local hh, mm = s:match("T(%d%d):(%d%d)")
+  if hh ~= nil then return hh .. ":" .. mm end
+  return s
+end
+
+-- Plan entry: full-width yellow-bordered block carrying a write-review
+-- plan the lead-workflow actor submitted. Render-only — the model
+-- already saw the plan via the tool call's args, so chat.lua does NOT
+-- forward the body into model context (the submit reducer's
+-- `chat.input.submit` path doesn't carry plan content; the plan
+-- envelope is consumed here without echoing as a `chat.message.append`).
+-- Layout:
+--   ╭── plan · submitted at HH:MM ──╮
+--   │ <markdown body>               │
+--   │                               │
+--   │ [/approve to proceed | /reject <reason>]
+--   ╰───────────────────────────────╯
+-- Status drives the border style: pending = yellow active, approved =
+-- yellow italic with green check subtitle, rejected = red strikethrough
+-- with red status subtitle. The hint row only renders for `pending`.
+local function render_plan_entry(entry)
+  local status = entry.status or "pending"
+  local border_style
+  if status == "approved" then
+    border_style = STYLE.plan_chrome_approved
+  elseif status == "rejected" then
+    border_style = STYLE.plan_chrome_rejected
+  else
+    border_style = STYLE.plan_chrome
+  end
+
+  local subtitle_text = "plan"
+  local stamped = format_submitted_at(entry.submitted_at)
+  if stamped and stamped ~= "" then
+    subtitle_text = subtitle_text .. " · submitted at " .. stamped
+  end
+
+  local rows = {
+    tui.text { content = subtitle_text, style = STYLE.plan_subtitle, wrap = "none" },
+    md(entry.text or ""),
+  }
+
+  if status == "pending" then
+    rows[#rows + 1] = tui.text {
+      content = "[/approve to proceed | /reject <reason> to send back]",
+      style   = STYLE.plan_hint,
+      wrap    = "word",
+    }
+  elseif status == "approved" then
+    rows[#rows + 1] = tui.text {
+      content = "✓ approved",
+      style   = STYLE.plan_status_approved,
+      wrap    = "none",
+    }
+  elseif status == "rejected" then
+    rows[#rows + 1] = tui.text {
+      content = "✗ rejected",
+      style   = STYLE.plan_status_rejected,
+      wrap    = "none",
+    }
+  end
+
+  return bordered_box(
+    tui.column { gap = 0, children = rows },
+    border_style
+  )
+end
+
 local function render_entry(entry, _i, expanded)
   if entry.kind == "tool_call" then
     if expanded then return tool_expanded(entry) end
     return tool_collapsed(entry)
+  end
+  if entry.kind == "plan" then
+    return render_plan_entry(entry)
   end
   if entry.role == "assistant" or entry.kind == "stream" then
     return render_assistant_entry(entry, expanded)
@@ -3386,6 +3488,51 @@ local function update(msg, state)
 
   if kind == "chat.tool.end" then
     return attach_tool_end(state, msg.id or "", msg.output or "", msg.error == true), {}
+  end
+
+  -- ── plan-message contract (lead-workflow `write-review` tool) ──────
+  -- The lead-workflow actor's `write-review` tool fires a plan envelope
+  -- the chat surface renders as a yellow-bordered "plan" entry. This
+  -- block is render-only on chat.lua's side — the plan body is NOT
+  -- added to model context by anything in this file (the submit
+  -- reducer's `chat.input.submit` emit carries only the user's typed
+  -- text). The model already saw the plan as the tool call's args, so
+  -- re-forwarding it via `chat.message.append` would be a duplication.
+  if kind == "chat.plan.append" then
+    local text = msg.text or ""
+    if #text == 0 then return state, {} end
+    return push_entry(state, {
+      kind         = "plan",
+      plan_id      = msg.plan_id or "",
+      text         = text,
+      submitted_at = msg.submitted_at,
+      status       = "pending",
+    }), {}
+  end
+
+  -- Approval/rejection arrives from the lead-workflow actor after the
+  -- user types `/approve` or `/reject`. We update the matching plan
+  -- entry's status in place — visual state changes (border colour,
+  -- check/cross subtitle) but the plan stays in the transcript so the
+  -- user can scroll back to see what was decided.
+  if kind == "lead-workflow.plan.approved" then
+    local plan_id = msg.plan_id or ""
+    if plan_id == "" then return state, {} end
+    local approved = (msg.approved == true)
+    local entries = {}
+    local matched = false
+    for i, v in ipairs(state.entries) do
+      if not matched and v.kind == "plan" and v.plan_id == plan_id then
+        entries[i] = shallow_merge(v, {
+          status = approved and "approved" or "rejected",
+        })
+        matched = true
+      else
+        entries[i] = v
+      end
+    end
+    if not matched then return state, {} end
+    return shallow_merge(state, { entries = entries }), {}
   end
 
   if kind == "chat.popup" then
