@@ -21,6 +21,33 @@ use crate::layout;
 use crate::mouse::SelectionRange;
 use unicode_width::UnicodeWidthStr;
 
+/// Highlight payload the engine hands the renderer per frame. Built
+/// from the captured selectable widget's content-coord anchor + drag
+/// pair plus its painted rect and current `scroll_y`. The renderer
+/// walks each visible cell of `clip`, maps it to the content-coord row
+/// it currently shows, and flips the reverse-video bit when the
+/// resolved content-coord is inside `[anchor, drag]` in line-flow
+/// order. Decoupled from screen-coord selection bounds so a drag that
+/// crosses an auto-scroll boundary keeps the originally-anchored row
+/// fully highlighted even after that row scrolls past the viewport
+/// edge — pre-fix the screen-coord path painted "anchor (clamped to
+/// row 0), drag-col" instead of "row 0 from col 0 to drag-col" once
+/// the anchor scrolled out of frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionHighlight {
+    /// Anchor in content coords: `(col, row_in_content)`.
+    pub anchor: (u16, u16),
+    /// Drag end in content coords: `(col, row_in_content)`.
+    pub drag: (u16, u16),
+    /// Clip rect (screen cells). Highlights paint only inside this
+    /// rect — cells in neighbouring panels stay un-reversed.
+    pub clip: layout::Rect,
+    /// Content-row offset of `clip.row`'s first visible row. For
+    /// non-scrollable selectables this is `0` (content-coord = screen
+    /// coord relative to the rect's top-left).
+    pub scroll_y: u16,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cell {
     /// One grapheme cluster's text. `" "` for blanks.
@@ -137,29 +164,30 @@ impl Renderer {
         self.render_with_selection(root, None)
     }
 
-    /// Like [`Renderer::render`] but applies `selection`'s reverse-video
-    /// highlight to the cells covered by the range before emitting ANSI.
-    /// Selection is engine state, not layout state — we paint the tree
-    /// first, then post-process the framebuffer so existing widget paint
-    /// paths stay oblivious to the selection mechanism.
+    /// Like [`Renderer::render`] but applies `highlight`'s reverse-video
+    /// highlight to the cells covered by the captured selectable's
+    /// anchor + drag pair before emitting ANSI. Selection is engine
+    /// state, not layout state — we paint the tree first, then
+    /// post-process the framebuffer so existing widget paint paths stay
+    /// oblivious to the selection mechanism.
     ///
-    /// `selection` carries the geometric range AND the captured
-    /// selectable widget's painted rect. The highlight is intersected
-    /// with the rect: cells outside it stay un-highlighted even when
-    /// the user drags past the widget's edge into a neighbouring panel.
-    /// That's the closing half of the per-widget selection-scoping
-    /// model — the COPY clamp landed in `141692f`; the visual
-    /// highlight clamp lands here.
+    /// `highlight` carries the content-coord range, the captured
+    /// selectable widget's painted rect, and the widget's current
+    /// `scroll_y`. The highlight resolves each visible cell of the rect
+    /// to its content-coord row and paints reverse-video only when that
+    /// content-coord lies inside `[anchor, drag]` in line-flow order.
+    /// Cells outside the rect stay un-highlighted even when the user
+    /// drags past the widget's edge into a neighbouring panel.
     pub fn render_with_selection(
         &mut self,
         root: &mut WidgetInstance,
-        selection: Option<(SelectionRange, layout::Rect)>,
+        highlight: Option<SelectionHighlight>,
     ) -> Vec<u8> {
         self.next.reset(self.width, self.height);
         reset_layout_state(root);
         layout::layout_and_paint(root, self.width, self.height, &mut self.next);
-        if let Some((range, clip)) = selection {
-            apply_selection_highlight(&mut self.next, range, Some(clip));
+        if let Some(h) = highlight {
+            apply_selection_highlight_in_content_coords(&mut self.next, h);
         }
         let bytes = if self.needs_full {
             self.emit_full()
@@ -252,20 +280,116 @@ fn push_line(out: &mut String, line: &Line) {
     out.push_str(SGR_RESET);
 }
 
-/// Walk the framebuffer cells covered by `range` and toggle their
-/// `reverse` SGR bit. We use the terminal's own reverse-video so the
-/// highlight stays neutral against any user theme — no engine-baked
-/// colors. Cells outside the buffer are silently skipped (the renderer
-/// never overdraws past `width × height`).
+/// Walk every cell inside `highlight.clip` and toggle its `reverse` SGR
+/// bit when the cell's content-coord position falls inside the
+/// `[anchor, drag]` content range in line-flow order. We use the
+/// terminal's own reverse-video so the highlight stays neutral against
+/// any user theme — no engine-baked colors.
 ///
-/// When `clip` is `Some(rect)`, cells outside the rect are also skipped
-/// — the highlight is the geometric intersection of the selection range
-/// with the captured selectable widget's painted rect. This stops a
-/// drag past the widget's edge from painting reverse-video onto cells
-/// that belong to a neighbouring panel (chat-into-sidebar, modal
-/// overlay-into-base). With `clip = None` the legacy unclipped path
-/// applies — kept available for tests of the highlight primitive in
-/// isolation.
+/// Resolves each screen-cell `(col, row)` to a content-coord
+/// `(col_in_content, row_in_content)` via the rect + scroll_y: cells
+/// outside the rect stay un-flipped, and cells inside the rect with a
+/// content-coord row past the captured widget's content extent stay
+/// un-flipped (line-flow order doesn't include cells that don't exist
+/// in the content). The "in range" predicate is the standard line-flow
+/// shape — first row from anchor.col to end-of-row, middle rows full
+/// width, last row from start-of-row to drag.col — applied in content
+/// coords so a row that scrolled past the viewport edge produces a
+/// fully-highlighted top visible row, matching the user's expectation
+/// of "the rows above the cursor are fully selected".
+fn apply_selection_highlight_in_content_coords(buf: &mut FrameBuffer, highlight: SelectionHighlight) {
+    let height = buf.lines.len() as u16;
+    if height == 0 {
+        return;
+    }
+    let width = buf.lines.first().map(|l| l.cells.len() as u16).unwrap_or(0);
+    if width == 0 {
+        return;
+    }
+    let SelectionHighlight {
+        anchor,
+        drag,
+        clip,
+        scroll_y,
+    } = highlight;
+    // Normalise anchor + drag into line-flow order (start <= end).
+    let (start, end) = if (anchor.1, anchor.0) <= (drag.1, drag.0) {
+        (anchor, drag)
+    } else {
+        (drag, anchor)
+    };
+    let (start_col, start_row) = start;
+    let (end_col, end_row) = end;
+    // Walk each cell inside the clip rect on the screen; map to content
+    // coords via scroll_y; check inclusion against the content range.
+    let row_lo = clip.row;
+    let row_hi = clip
+        .row
+        .saturating_add(clip.height)
+        .min(height)
+        .saturating_sub(1);
+    let col_lo = clip.col;
+    let col_hi = clip
+        .col
+        .saturating_add(clip.width)
+        .min(width)
+        .saturating_sub(1);
+    if row_lo > row_hi || col_lo > col_hi {
+        return;
+    }
+    for screen_row in row_lo..=row_hi {
+        // Content row currently shown at this screen row.
+        let content_row = scroll_y.saturating_add(screen_row.saturating_sub(clip.row));
+        if content_row < start_row || content_row > end_row {
+            continue;
+        }
+        // Per-row column span in content coords (line-flow shape on
+        // the content row axis), then offset back into screen-cell
+        // columns relative to clip.col.
+        let (content_c0, content_c1) = if start_row == end_row {
+            // Single content-row selection — bounded both sides.
+            let (a, b) = if start_col <= end_col {
+                (start_col, end_col)
+            } else {
+                (end_col, start_col)
+            };
+            (a, b)
+        } else if content_row == start_row {
+            // First row: anchor column to end-of-content-row.
+            (start_col, u16::MAX)
+        } else if content_row == end_row {
+            // Last row: 0 to drag column.
+            (0, end_col)
+        } else {
+            // Middle row: full width.
+            (0, u16::MAX)
+        };
+        // Map content cols → screen cols inside the clip rect. A
+        // non-scrollable selectable shares col origin with the rect
+        // (col_in_content = screen_col - clip.col); the same mapping
+        // applies for scrollables since the col axis isn't scrolled.
+        let screen_lo = clip.col.saturating_add(content_c0).max(col_lo);
+        let screen_hi = clip
+            .col
+            .saturating_add(content_c1.min(clip.width.saturating_sub(1)))
+            .min(col_hi);
+        if screen_lo > screen_hi {
+            continue;
+        }
+        let line = &mut buf.lines[screen_row as usize];
+        for col in screen_lo..=screen_hi {
+            if let Some(cell) = line.cells.get_mut(col as usize) {
+                cell.style.reverse = !cell.style.reverse;
+            }
+        }
+    }
+}
+
+/// Legacy screen-coord highlight kept for the existing render.rs unit
+/// tests of the highlight primitive in isolation. Production code uses
+/// [`apply_selection_highlight_in_content_coords`] via
+/// [`Renderer::render_with_selection`].
+#[cfg(test)]
 fn apply_selection_highlight(
     buf: &mut FrameBuffer,
     range: SelectionRange,
@@ -283,9 +407,6 @@ fn apply_selection_highlight(
         let Some((c0, c1)) = range.row_span(row, width) else {
             continue;
         };
-        // Intersect the row's selection segment with the clip rect when
-        // present. `rect.row + rect.height` is exclusive; rows past it
-        // contribute nothing. Same shape on the column axis.
         let (c0, c1) = match clip {
             Some(rect) => {
                 let row_in = row >= rect.row && row < rect.row.saturating_add(rect.height);

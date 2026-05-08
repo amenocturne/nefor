@@ -22,7 +22,7 @@ use crate::mouse::{
     SelectionRange,
 };
 use crate::reconciler::Reconciler;
-use crate::render::{extract_selection_text, Renderer};
+use crate::render::{extract_selection_text, Renderer, SelectionHighlight};
 use crate::scrollable::{
     scroll_by_signed, DRAG_AUTO_SCROLL_EDGE_ROWS, DRAG_AUTO_SCROLL_LATCH_INTERVAL_MS,
     DRAG_AUTO_SCROLL_STEP, WHEEL_STEP_ROWS,
@@ -656,26 +656,59 @@ impl Engine {
         self.dispatch_msg(msg)
     }
 
-    /// Currently-active selection range (if any), paired with the
-    /// captured selectable widget's painted rect. The renderer reads
-    /// both on every paint pass: the range drives which cells get the
-    /// reverse-video highlight; the rect is the geometric clip — cells
-    /// outside it stay un-highlighted, even when the geometric range
-    /// extends past the widget's edge (drag past the right edge into
-    /// a neighbouring panel). Selection only opens for `selectable =
-    /// true` widgets, so the rect is always present when a selection
-    /// is active.
-    fn current_selection(&self) -> Option<(SelectionRange, crate::layout::Rect)> {
+    /// Currently-active selection highlight (if any). The renderer
+    /// reads this on every paint pass: it walks the captured selectable
+    /// widget's painted rect (the highlight's `clip`) and flips the
+    /// reverse-video bit on cells whose content-coord position falls
+    /// inside `[anchor, drag]` in line-flow order.
+    ///
+    /// Highlight bounds live in **content coords** of the captured
+    /// widget, paired with the widget's current `scroll_y` so the
+    /// renderer can resolve each visible screen cell back to its
+    /// content-coord row. A row that scrolled past the viewport edge
+    /// produces a fully-highlighted top visible row (matching the
+    /// user's expectation of "rows above the cursor are fully
+    /// selected") instead of the screen-coord shape that painted
+    /// "anchor at row 0 (clamped), col preserved" — the half-selected
+    /// look the user reported.
+    fn current_selection(&self) -> Option<SelectionHighlight> {
         match (
-            self.selection_start,
-            self.selection_end,
             self.selecting,
             self.selection_scroll_rect,
+            self.selection_anchor_in_content,
+            self.selection_drag_in_content,
         ) {
-            (Some(start), Some(end), true, Some(rect)) => {
-                Some((SelectionRange::normalised(start, end), rect))
+            (true, Some(rect), Some(anchor), Some(drag)) => {
+                let scroll_y = self.captured_widget_scroll_y().unwrap_or(0);
+                Some(SelectionHighlight {
+                    anchor,
+                    drag,
+                    clip: rect,
+                    scroll_y,
+                })
             }
             _ => None,
+        }
+    }
+
+    /// Read the captured selectable widget's current `scroll_y` from the
+    /// instance tree. `Some(0)` for non-scrollable selectables (which
+    /// live by convention with content_row == screen_row relative to
+    /// the rect's top-left); `None` only when the captured widget
+    /// disappeared from the tree mid-drag. Resolves freshly on every
+    /// frame so an auto-scroll bump between Drag and the next render
+    /// shows up immediately.
+    fn captured_widget_scroll_y(&self) -> Option<u16> {
+        let key = self.selection_scroll_key.as_ref()?;
+        let root = self.reconciler.root.as_ref()?;
+        let path = find_widget_by_key(root, key)?;
+        let mut cur = root;
+        for &i in &path {
+            cur = cur.children.get(i)?;
+        }
+        match &cur.state {
+            InstanceState::Scrollable(s) => Some(s.scroll_y),
+            _ => Some(0),
         }
     }
 
@@ -1435,6 +1468,40 @@ fn walk_scrollable_by_key(
         }
         path.push(i);
         walk_scrollable_by_key(child, key, path, out);
+        path.pop();
+    }
+}
+
+/// Walk the tree for any widget instance whose `user_key` matches
+/// `key` and return the path. Used by the selection mechanism to look
+/// up the captured selectable widget regardless of its kind (the
+/// initial v1 only captured Scrollables; non-scrollable selectables —
+/// sidebar columns, prompt text_inputs — share the same lookup).
+fn find_widget_by_key(root: &WidgetInstance, key: &str) -> Option<Vec<usize>> {
+    let mut path: Vec<usize> = Vec::new();
+    let mut found: Option<Vec<usize>> = None;
+    walk_widget_by_key(root, key, &mut path, &mut found);
+    found
+}
+
+fn walk_widget_by_key(
+    inst: &WidgetInstance,
+    key: &str,
+    path: &mut Vec<usize>,
+    out: &mut Option<Vec<usize>>,
+) {
+    if let Some(k) = inst.last_desc.user_key() {
+        if k == key {
+            *out = Some(path.clone());
+            return;
+        }
+    }
+    for (i, child) in inst.children.iter().enumerate() {
+        if out.is_some() {
+            return;
+        }
+        path.push(i);
+        walk_widget_by_key(child, key, path, out);
         path.pop();
     }
 }

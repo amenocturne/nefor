@@ -244,9 +244,14 @@ fn drag_past_bottom_edge_auto_scrolls_transcript_down() {
             })
             .expect("drag-up");
     }
-    let post = render_str(&mut engine);
+    let _ = render_str(&mut engine);
+    let post = engine.snapshot();
     // After drag-down clamp at scroll_y=23 then 10× drag-up: scroll_y =
-    // max(23 - 10, 0) = 13. Visible rows 14..20.
+    // max(23 - 10, 0) = 13. Visible rows 14..20. Read from
+    // `engine.snapshot()` (plain-text framebuffer) rather than the
+    // ANSI-byte render: the in-flight selection highlight may inject
+    // mid-token SGR escapes ("row 14" → "ro\x1b[7mw 14") that would
+    // defeat a literal `contains` check on the byte stream.
     assert!(
         post.contains("row 14"),
         "drag past the top edge should auto-scroll the transcript up; row 14 expected in view, got:\n{post}"
@@ -992,6 +997,143 @@ fn drag_across_two_adjacent_selectables_clamps_to_origin() {
         !captured.contains("right "),
         "drag from left origin into right widget must NOT include right \
          content (selection clamps to origin); got:\n{captured:?}"
+    );
+}
+
+// ── highlight in content coords ───────────────────────────────────────
+//
+// Pre-fix the highlight painted screen-coord cells: anchor's screen y
+// got clamped to row 0 when it scrolled out of frame, but anchor's col
+// stayed, producing the "half-selected top line" the user reported. Fix
+// renders the highlight in content coords: each visible cell of the
+// captured widget's rect resolves to its content-coord row, and the
+// in-range predicate runs in content order. Once the anchor's content
+// row scrolls out of view, the new top visible row's content row sits
+// strictly between anchor and drag in line-flow order, so it's painted
+// fully reverse-video — the user's expectation of "rows above the
+// cursor are fully selected".
+
+/// Walk a row of the styled snapshot and return the count of cells the
+/// renderer painted with the reverse-video SGR active. Used by the
+/// content-coord highlight tests below as an aggregate witness — a
+/// fully-highlighted row should report ~`width` reversed cells, a
+/// half-highlighted row reports a smaller count. The snapshot's per-row
+/// SGR shape is "RESET ... [styled-segment] ... RESET", so we walk the
+/// byte stream tracking whether the current style carries reverse.
+fn count_reverse_cells_on_row(engine: &mut Engine, screen_row: u16) -> u16 {
+    use unicode_width::UnicodeWidthStr;
+    let bytes = engine.render_if_dirty().expect("render-if-dirty").unwrap_or_default();
+    if bytes.is_empty() {
+        // Nothing dirty — the snapshot is still the prev frame.
+    }
+    let snap = engine.snapshot_ansi();
+    let row = match snap.lines().nth(screen_row as usize) {
+        Some(r) => r.to_string(),
+        None => return 0,
+    };
+    let mut reverse_active = false;
+    let mut count: u16 = 0;
+    let mut i = 0;
+    while i < row.len() {
+        let rest = &row[i..];
+        if let Some(esc_at) = rest.find('\x1b') {
+            // Visible chunk before the next SGR.
+            let visible = &rest[..esc_at];
+            if reverse_active {
+                count = count.saturating_add(visible.width() as u16);
+            }
+            let sgr_start = i + esc_at;
+            let sgr_tail = &row[sgr_start..];
+            if let Some(end_idx) = sgr_tail.find('m') {
+                let body = &sgr_tail[..=end_idx];
+                if body.contains("[0m") || body == "\x1b[m" {
+                    reverse_active = false;
+                } else if body.contains(";7m") || body.contains("[7m") {
+                    reverse_active = true;
+                } else if body.contains(";27m") || body.contains("[27m") {
+                    reverse_active = false;
+                }
+                i = sgr_start + end_idx + 1;
+            } else {
+                break;
+            }
+        } else {
+            if reverse_active {
+                count = count.saturating_add(rest.width() as u16);
+            }
+            break;
+        }
+    }
+    count
+}
+
+/// Anchor mid-line, drag past the bottom past the anchor row's screen
+/// position. Pre-fix the screen-coord highlight clamped the anchor's
+/// row to 0 (its row scrolled past the top edge) but kept its col, so
+/// the top visible row painted reverse "from anchor.col onwards" —
+/// the half-selected look. Post-fix the new top-visible row's
+/// content-coord sits strictly between anchor's content row and drag's
+/// content row, so it's a middle row → fully reversed.
+#[test]
+fn anchor_scrolls_out_of_view_top_row_paints_fully_reversed() {
+    let mut engine = Engine::new(40, 8).expect("engine");
+    engine
+        .load_scenario(SCROLLABLE_SELECTION_SCENARIO)
+        .expect("scenario");
+    let _ = render_str(&mut engine);
+    // Wheel-up to land at offset 8 (visible rows 9..15).
+    for _ in 0..5 {
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Wheel,
+                x: 1,
+                y: 4,
+                button: Some("up"),
+                mods: vec![],
+            })
+            .expect("wheel-up");
+    }
+    let _ = render_str(&mut engine);
+    // Click mid-line at (col=5, screen_row=2 → content_row 10), then drag
+    // past the bottom edge enough times that scroll_y advances past
+    // content_row 10 — anchor scrolls past the top of the viewport.
+    // Don't release — we want to inspect mid-drag highlight.
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Click,
+            x: 5,
+            y: 2,
+            button: Some("left"),
+            mods: vec![],
+        })
+        .expect("click");
+    let _ = engine.render_if_dirty();
+    // Many drags past bottom so the anchor's content row scrolls off-screen.
+    for _ in 0..20 {
+        engine
+            .handle_mouse(MouseMessage {
+                kind: MouseKind::Drag,
+                x: 5,
+                y: 10,
+                button: Some("left"),
+                mods: vec![],
+            })
+            .expect("drag");
+        let _ = engine.render_if_dirty();
+    }
+    // Top visible row (screen row 1) should be fully reverse-video — its
+    // content-coord row is strictly between anchor (which scrolled past
+    // the top) and drag (past the visible region), so the line-flow shape
+    // marks it a middle row → full width. Width is 40 cells; the
+    // scrollbar gutter on the rightmost cell stays un-reversed (paint
+    // happens before the highlight runs and the gutter renders the bar
+    // glyph; but the predicate will still flip it), so the count is the
+    // rect's content width (~39 cells).
+    let reversed = count_reverse_cells_on_row(&mut engine, 1);
+    assert!(
+        reversed >= 30,
+        "top visible row should paint ~full-width reverse-video once \
+         the anchor scrolls out of view (got {reversed} reversed cells)"
     );
 }
 
