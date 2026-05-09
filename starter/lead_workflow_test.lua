@@ -666,6 +666,123 @@ do
     "missing plan_id returns error")
 end
 
+-- ------------------------------------------------------------------
+-- dispatch-graph terminal-node (sink) structural validation
+--
+-- A reasoner-graph sub-graph must have exactly one terminal node — one
+-- node that no other node depends on, whose result becomes the graph's
+-- return value. dispatch-graph is the role-aware contract layer that
+-- enforces this lead-facing shape; reasoner-graph itself stays a
+-- primitive that accepts any DAG.
+-- ------------------------------------------------------------------
+
+-- 0 sinks: cyclic dependency means every node has a successor. Common
+-- failure mode when the lead tries to encode a loop in the graph
+-- structure rather than at the agent level.
+do
+  fresh()
+  feed("tool-gate", {
+    kind = "lead-workflow.tool.invoke",
+    id   = "dispatch_graph_rejects_zero_terminal_nodes",
+    name = "dispatch-graph",
+    args = {
+      nodes = {
+        { id = "a", role = "explorer", agent_args = { prompt = "x" },
+          dependencies = { "b" } },
+        { id = "b", role = "explorer", agent_args = { prompt = "y" },
+          dependencies = { "a" } },
+      },
+    },
+  })
+  local err = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result"
+        and c.body.id == "dispatch_graph_rejects_zero_terminal_nodes"
+  end)
+  assert_true(err ~= nil and type(err.body.error) == "string",
+    "0-sink graph returns a tool.result error")
+  assert_true(string.find(err.body.error, "0 terminal nodes", 1, true) ~= nil,
+    "0-sink error message names the problem ('0 terminal nodes'); got: "
+    .. tostring(err.body.error))
+  -- The error should point the lead at how to fix it (cycle / loop-guard).
+  assert_true(string.find(err.body.error, "dispatch-graph", 1, true) ~= nil,
+    "0-sink error message identifies the validator ('dispatch-graph'); got: "
+    .. tostring(err.body.error))
+end
+
+-- N>1 sinks: two independent components, each ending in its own sink.
+-- Lead needs to add an aggregator or split into separate graphs.
+do
+  fresh()
+  feed("tool-gate", {
+    kind = "lead-workflow.tool.invoke",
+    id   = "dispatch_graph_rejects_multiple_terminal_nodes",
+    name = "dispatch-graph",
+    args = {
+      nodes = {
+        { id = "a", role = "explorer", agent_args = { prompt = "x" } },
+        { id = "b", role = "explorer", agent_args = { prompt = "y" },
+          dependencies = { "a" } },
+        { id = "c", role = "explorer", agent_args = { prompt = "z" } },
+        { id = "d", role = "explorer", agent_args = { prompt = "w" },
+          dependencies = { "c" } },
+      },
+    },
+  })
+  local err = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result"
+        and c.body.id == "dispatch_graph_rejects_multiple_terminal_nodes"
+  end)
+  assert_true(err ~= nil and type(err.body.error) == "string",
+    "multi-sink graph returns a tool.result error")
+  assert_true(string.find(err.body.error, "2 terminal nodes", 1, true) ~= nil,
+    "multi-sink error names the count ('2 terminal nodes'); got: "
+    .. tostring(err.body.error))
+  assert_true(string.find(err.body.error, "b", 1, true) ~= nil
+              and string.find(err.body.error, "d", 1, true) ~= nil,
+    "multi-sink error lists both sink ids ('b' and 'd'); got: "
+    .. tostring(err.body.error))
+  -- A spawn_graph invoke must NOT have been emitted — the validator
+  -- gates dispatch.
+  local invoke = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
+  end)
+  assert_eq(invoke, nil,
+    "rejected graph must not produce a spawn_graph tool.invoke")
+end
+
+-- Happy path: single-sink graph (chain) translates and dispatches as
+-- before. Regression guard against the validator over-rejecting.
+do
+  fresh()
+  feed("tool-gate", {
+    kind = "lead-workflow.tool.invoke",
+    id   = "dispatch_graph_accepts_single_terminal_node",
+    name = "dispatch-graph",
+    args = {
+      nodes = {
+        { id = "a", role = "explorer", agent_args = { prompt = "x" } },
+        { id = "b", role = "explorer", agent_args = { prompt = "y" },
+          dependencies = { "a" } },
+        { id = "c", role = "explorer", agent_args = { prompt = "z" },
+          dependencies = { "b" } },
+      },
+    },
+  })
+  local calls = decode_calls()
+  local invoke = find_call(calls, function(c)
+    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
+        and c.target == "reasoner-graph"
+  end)
+  assert_true(invoke ~= nil,
+    "single-sink graph dispatches a spawn_graph tool.invoke")
+  local reply = find_call(calls, function(c)
+    return c.body.kind == "tool.result"
+        and c.body.id == "dispatch_graph_accepts_single_terminal_node"
+  end)
+  assert_true(reply ~= nil and reply.body.error == nil,
+    "single-sink graph replies success (no error field)")
+end
+
 -- Unknown tool name returns an error.
 do
   fresh()

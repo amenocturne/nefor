@@ -171,6 +171,52 @@ end
 -- tool: dispatch-graph
 -- ------------------------------------------------------------------
 
+-- Validate that the role-keyed node spec has exactly one terminal
+-- (sink) node — one node id that no other node lists in its
+-- `dependencies`. Reasoner-graph treats the sole terminal node's result
+-- as the graph's return value; without exactly one, that contract is
+-- ambiguous (zero = cycle, more than one = no canonical result), so
+-- dispatch-graph rejects at the lead-facing layer rather than letting
+-- reasoner-graph receive an ill-shaped DAG. Reasoner-graph itself stays
+-- a primitive — the role-aware shape is enforced here.
+--
+-- Returns nil on success, an error string on failure.
+local function validate_terminal_count(node_specs)
+  local has_successor = {}
+  for _, spec in ipairs(node_specs) do
+    if type(spec.dependencies) == "table" then
+      for _, dep_id in ipairs(spec.dependencies) do
+        has_successor[dep_id] = true
+      end
+    end
+  end
+
+  local sinks = {}
+  for _, spec in ipairs(node_specs) do
+    if not has_successor[spec.id] then
+      sinks[#sinks + 1] = spec.id
+    end
+  end
+
+  if #sinks == 1 then return nil end
+
+  if #sinks == 0 then
+    return "dispatch-graph: graph has 0 terminal nodes — every node is "
+        .. "depended on by another. Sub-graphs must have exactly one "
+        .. "terminal node whose result becomes the graph's return value. "
+        .. "Likely cause: a cycle in dependencies. Break the cycle, or "
+        .. "move loop-guard logic into a single counter-node graph."
+  end
+
+  return string.format(
+    "dispatch-graph: graph has %d terminal nodes: [%s]. Sub-graphs must "
+    .. "have exactly one terminal node whose result becomes the graph's "
+    .. "return value. Add a final node (commonly a 'reviewer' or "
+    .. "aggregator) that depends on all of these, or dispatch them as "
+    .. "separate graphs.",
+    #sinks, table.concat(sinks, ", "))
+end
+
 -- Build a reasoner-graph spec from the lead's role-keyed node list.
 -- Each input node:
 --   { id, role, agent_args = { prompt, ... }, dependencies? = { upstream_ids } }
@@ -186,15 +232,24 @@ local function build_graph_spec(node_specs)
     return nil, "dispatch-graph: nodes list must be a non-empty array"
   end
 
-  local nodes = {}
-  local edges = {}
+  -- First pass: per-spec well-formedness (id + role present).
   for _, spec in ipairs(node_specs) do
     if type(spec) ~= "table" or type(spec.id) ~= "string"
         or type(spec.role) ~= "string" then
       return nil,
         "dispatch-graph: each node must carry { id: string, role: string }"
     end
+  end
 
+  -- Structural: exactly one terminal node. Validated before translation
+  -- so the error names role-level node ids the lead recognises, not
+  -- post-translation reasoner-graph internals.
+  local terminal_err = validate_terminal_count(node_specs)
+  if terminal_err then return nil, terminal_err end
+
+  local nodes = {}
+  local edges = {}
+  for _, spec in ipairs(node_specs) do
     local agent_args = {}
     if type(spec.agent_args) == "table" then
       for k, v in pairs(spec.agent_args) do agent_args[k] = v end
