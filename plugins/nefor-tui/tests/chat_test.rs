@@ -1698,6 +1698,324 @@ fn typing_slash_keeps_cursor_after_slash() {
     );
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// @-path autocomplete — mirrors the slash autocomplete machinery but
+// the completion source is the filesystem under CWD. Trigger fires on
+// the trailing `@<token>` (last whitespace-separated word starts
+// with `@`); selection inserts the path back into the input.
+// ──────────────────────────────────────────────────────────────────────
+
+/// CWD is process-global, so tests that mutate it must serialise.
+/// Each `CwdSwitch` instance changes CWD to the provided path on
+/// construction and restores it (to a stable repo path, not whatever
+/// `current_dir` returned, since concurrent tests may have left CWD
+/// pointing at a since-deleted tempdir) on Drop. The Drop also
+/// releases the inner Mutex guard, freeing the next test.
+static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct CwdSwitch {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl CwdSwitch {
+    fn to(path: &std::path::Path) -> Self {
+        let guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_current_dir(path).expect("chdir into fixture");
+        Self { _guard: guard }
+    }
+}
+
+impl Drop for CwdSwitch {
+    fn drop(&mut self) {
+        // CARGO_MANIFEST_DIR is stable for the test binary's lifetime
+        // so it's the safe restore target — even if the original cwd
+        // was deleted by a sibling test, the next test starts from a
+        // real directory.
+        let safe = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let _ = std::env::set_current_dir(&safe);
+    }
+}
+
+/// Set the chat-test process CWD to a tempdir populated with a known
+/// fixture tree, returning the dir handle (callers must keep it alive
+/// for the test's duration so the directory survives until ls runs).
+fn at_complete_fixture() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("src")).expect("mkdir src");
+    std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").expect("write main.rs");
+    std::fs::write(dir.path().join("src/macro.rs"), "// mac").expect("write macro.rs");
+    std::fs::write(dir.path().join("src/lib.rs"), "// lib").expect("write lib.rs");
+    std::fs::create_dir_all(dir.path().join("docs")).expect("mkdir docs");
+    std::fs::write(dir.path().join("docs/spec.md"), "# spec").expect("write spec.md");
+    std::fs::write(dir.path().join("README.md"), "# readme").expect("write readme");
+    std::fs::create_dir_all(dir.path().join(".git")).expect("mkdir .git");
+    std::fs::write(dir.path().join(".git/HEAD"), "ref:").expect("write head");
+    dir
+}
+
+#[test]
+fn at_path_autocomplete_opens_when_typing_at_sign() {
+    let fixture = at_complete_fixture();
+    let _cwd = CwdSwitch::to(fixture.path());
+
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    engine.handle_key(key("@")).expect("@");
+    let out = render_str(&mut engine);
+
+    // CWD-level entries should appear: README.md and src/ at minimum.
+    // .git is on the ignore allowlist; it must not surface.
+    assert!(
+        out.contains("README.md"),
+        "@ autocomplete should list README.md at CWD: {out:?}"
+    );
+    assert!(
+        out.contains("src/"),
+        "@ autocomplete should list src/ as a directory: {out:?}"
+    );
+    assert!(
+        !out.contains(".git"),
+        "@ autocomplete must not list .git directory: {out:?}"
+    );
+
+}
+
+#[test]
+fn at_path_autocomplete_does_not_break_slash_popup() {
+    // Belt-and-braces: typing `/` from empty input still opens the
+    // slash popup; the @-popup wiring must not interfere.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    engine.handle_key(key("/")).expect("/");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("/new") || out.contains("/help"),
+        "slash autocomplete should still open after @-completion wiring: {out:?}"
+    );
+    // No `@`-popup artefacts.
+    assert!(
+        !out.contains("no matching paths"),
+        "slash popup must not double-render with @-popup empty state: {out:?}"
+    );
+}
+
+#[test]
+fn at_path_autocomplete_filters_by_leaf_prefix_in_subdir() {
+    // Typing `@src/m` should list only `src/` entries whose name
+    // starts with `m` (case-insensitive). The fixture has
+    // `src/main.rs`, `src/macro.rs`, `src/lib.rs` — `m` matches the
+    // first two, NOT lib.rs.
+    let fixture = at_complete_fixture();
+    let _cwd = CwdSwitch::to(fixture.path());
+
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "@src/m".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    let out = render_str(&mut engine);
+
+    assert!(
+        out.contains("main.rs"),
+        "@src/m should list main.rs: {out:?}"
+    );
+    assert!(
+        out.contains("macro.rs"),
+        "@src/m should list macro.rs: {out:?}"
+    );
+    assert!(
+        !out.contains("lib.rs"),
+        "@src/m should NOT list lib.rs (no `m` prefix): {out:?}"
+    );
+
+}
+
+#[test]
+fn at_path_autocomplete_navigation_into_subdir_shows_subdir_contents() {
+    // `@src/` (trailing slash, no leaf) should show the contents of
+    // src/, not CWD. Mirrors bash tab-completion intuition.
+    let fixture = at_complete_fixture();
+    let _cwd = CwdSwitch::to(fixture.path());
+
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "@src/".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    let out = render_str(&mut engine);
+
+    assert!(
+        out.contains("main.rs"),
+        "@src/ should show src contents (main.rs missing): {out:?}"
+    );
+    assert!(
+        out.contains("lib.rs"),
+        "@src/ should show src contents (lib.rs missing): {out:?}"
+    );
+    // README.md is at CWD, not under src/, so it MUST NOT appear in
+    // the subdir listing.
+    assert!(
+        !out.contains("README.md"),
+        "@src/ should NOT show CWD entries (README.md leaked): {out:?}"
+    );
+
+}
+
+#[test]
+fn at_path_autocomplete_tab_inserts_selected_match_into_input() {
+    // Tab on the @-popup replaces the trailing @<token> with the
+    // resolved path. We verify by submitting after Tab and inspecting
+    // the wire envelope's text — the @-path preprocessor inlines the
+    // file contents, so post-Tab + Enter must produce a wire payload
+    // carrying the resolved file's body.
+    //
+    // ResumeEnv isolates the on-disk input-history so this test's
+    // submit doesn't pollute siblings (the failing-prereq surface in
+    // serial test runs).
+    let _env = ResumeEnv::new();
+    let fixture = at_complete_fixture();
+    let _cwd = CwdSwitch::to(fixture.path());
+
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Type `@READ`, popup highlights README.md (the only match).
+    for ch in "@READ".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    let _ = render_str(&mut engine);
+
+    // Tab inserts the path → input value becomes `@README.md`.
+    engine.handle_key(key("tab")).expect("tab");
+    // Tab on its own does NOT submit.
+    let emits_after_tab = engine.take_emit_queue();
+    assert!(
+        emits_after_tab.is_empty(),
+        "Tab on @-popup must not submit: {emits_after_tab:?}"
+    );
+
+    // Render to give the text_input widget a chance to sync from
+    // the Lua-side input_value the Tab handler wrote — handle_key
+    // doesn't reconcile, so the widget's internal value is one
+    // sync-cycle behind without an interleaving render.
+    let _ = render_str(&mut engine);
+
+    // Enter now submits with the @-token expanded by the existing
+    // @path preprocessor → wire text contains the file contents.
+    engine.handle_key(key("enter")).expect("enter");
+    let emits = engine.take_emit_queue();
+    assert_eq!(
+        emits.len(),
+        1,
+        "Tab+Enter should produce exactly one chat.input.submit: {emits:?}"
+    );
+    let body = &emits[0].1;
+    let wire = body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .expect("text on envelope");
+    assert!(
+        wire.contains("# readme"),
+        "wire text should contain README.md contents after Tab inserted the path: {wire:?}"
+    );
+
+}
+
+#[test]
+fn at_path_autocomplete_escape_closes_popup() {
+    let fixture = at_complete_fixture();
+    let _cwd = CwdSwitch::to(fixture.path());
+
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    engine.handle_key(key("@")).expect("@");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("README.md"),
+        "@ should open popup: {out:?}"
+    );
+
+    engine.handle_key(key("escape")).expect("esc");
+    let out2 = render_str(&mut engine);
+    assert!(
+        !out2.contains("README.md") || !out2.contains("src/"),
+        "Escape should close @-popup: {out2:?}"
+    );
+
+}
+
+#[test]
+fn at_path_autocomplete_triggers_mid_message_not_only_at_start() {
+    // Per spec: trigger fires on the *trailing* `@<token>`, not just at
+    // column 0. Type a sentence, then `@` — the popup must open.
+    let fixture = at_complete_fixture();
+    let _cwd = CwdSwitch::to(fixture.path());
+
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "summarize @".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("README.md"),
+        "@-popup should open when @ appears mid-message: {out:?}"
+    );
+
+}
+
+#[test]
+fn at_path_autocomplete_arrow_keys_move_cursor() {
+    // Down then Tab inserts the second match, not the first.
+    let _env = ResumeEnv::new();
+    let fixture = at_complete_fixture();
+    let _cwd = CwdSwitch::to(fixture.path());
+
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // `@src/` lists src/ contents alphabetically with dirs-first.
+    // Fixture: lib.rs, macro.rs, main.rs (no subdirs under src) →
+    // cursor at lib.rs. Down → macro.rs.
+    for ch in "@src/".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("down")).expect("down");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("tab")).expect("tab");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("enter")).expect("enter");
+
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "submit emit");
+    let wire = emits[0]
+        .1
+        .get("text")
+        .and_then(|v| v.as_str())
+        .expect("text");
+    assert!(
+        wire.contains("// mac"),
+        "Down+Tab on @src/ should select macro.rs (2nd alphabetical), \
+         wire contents should be `// mac`: {wire:?}"
+    );
+
+}
+
 #[test]
 fn popup_open_routes_pgdn_to_popup_not_transcript() {
     // With a popup open, scroll keys (PgUp/PgDn/Home/End) target the
