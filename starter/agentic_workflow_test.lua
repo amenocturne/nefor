@@ -115,6 +115,64 @@ do
 end
 
 -- ------------------------------------------------------------------
+-- tool_allowlist plumbing: configure -> state.config -> wrap_args.
+--
+-- Pre-fix the lead's chat saw the entire wire-advertised tool catalog
+-- including reasoner-graph internals like `spawn_graph`, so the model
+-- could call `spawn_graph` directly and bottom out in `reasoner '<role>'
+-- not connected`. The fix wires lead_role.ORCHESTRATION_TOOLS through
+-- agentic_loop.configure { tool_allowlist = ... } → state.config →
+-- build_orchestrator_graph → wrap_args.tool_allowlist → provider-wrapper
+-- emits as chat.create.tools. These tests pin the Lua-side plumbing.
+-- The Rust openai-provider has its own per-turn-filtering test
+-- (chat_create_tools_string_array_filters_per_turn_tools_array).
+-- ------------------------------------------------------------------
+do
+  -- Orchestrator wrap_args.tool_allowlist absent by default (no filter).
+  agentic_loop._internals.reset()
+  agentic_loop.configure { provider = "ollama", model = "m" }
+  local g = agentic_loop.build_template("hi")
+  for _, n in ipairs(g.nodes or {}) do
+    if n.id == "wrap" and type(n.args) == "table" then
+      assert_eq(n.args.tool_allowlist, nil,
+        "without configure { tool_allowlist }, wrap_args.tool_allowlist stays nil (no filter)")
+    end
+  end
+
+  -- Configure with an allowlist; wrap_args.tool_allowlist now carries it.
+  local allowlist = { "read_file", "dispatch-graph", "write-review", "await-approval" }
+  agentic_loop.configure { tool_allowlist = allowlist }
+  assert(type(agentic_loop.config().tool_allowlist) == "table",
+    "configure { tool_allowlist } stores the list on state.config")
+  assert_eq(#agentic_loop.config().tool_allowlist, #allowlist,
+    "configure-stored allowlist preserves length")
+
+  local g2 = agentic_loop.build_template("hi")
+  local saw_wrap = false
+  for _, n in ipairs(g2.nodes or {}) do
+    if n.id == "wrap" and type(n.args) == "table" then
+      saw_wrap = true
+      assert(type(n.args.tool_allowlist) == "table",
+        "configure-set tool_allowlist surfaces on wrap_args")
+      -- Spot-check contents: every input name landed.
+      local seen = {}
+      for _, name in ipairs(n.args.tool_allowlist) do seen[name] = true end
+      for _, expected in ipairs(allowlist) do
+        assert(seen[expected],
+          "wrap_args.tool_allowlist must contain `" .. expected .. "`")
+      end
+      -- Most important: spawn_graph (a reasoner-graph internal not in
+      -- ORCHESTRATION_TOOLS) is NOT on the lead's allowlist. Without
+      -- this filter the lead can call spawn_graph directly and produces
+      -- the runtime error this fix is designed to prevent.
+      assert(seen["spawn_graph"] == nil,
+        "wrap_args.tool_allowlist must NOT include `spawn_graph` — that's a reasoner-graph internal the lead reaches via dispatch-graph, not directly")
+    end
+  end
+  assert(saw_wrap, "wrap node found in template")
+end
+
+-- ------------------------------------------------------------------
 -- session lifecycle (session_end is local-state teardown only)
 -- ------------------------------------------------------------------
 

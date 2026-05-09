@@ -33,10 +33,11 @@ package.path = table.concat({
 -- 2. Dispatch hook + session management
 -------------------------------------------------------------------------
 
-local ncp      = require("ncp")
-local actor    = require("actor")
-local sessions = require("sessions")
-local cfg      = require("config").active
+local ncp       = require("ncp")
+local actor     = require("actor")
+local sessions  = require("sessions")
+local cfg       = require("config").active
+local lead_role = require("lead_role")
 
 function dispatch(current_log)
   ncp.dispatch(current_log)
@@ -83,21 +84,17 @@ local agentic_loop = require("agentic-loop")
 agentic_loop.configure {
   provider = cfg.default_provider,
   model    = cfg.default_model,
-  system   = [[
-You are a helpful assistant. Use the `spawn_graph` tool for parallel decomposition tasks (multiple independent sub-questions to combine).
-
-Graph schema:
-{ "nodes": [{ "id": str, "reasoner": str, "args": {...} }], "edges": [{ "from": str, "to": str }] }
-
-Reasoner types:
-- `responder` — one-shot LLM call. args: { "prompt": string }. Upstream nodes' outputs become user messages prepended to the prompt.
-- `terminal` — sink. args: {}. Exactly one per graph; its input becomes the run's result.
-
-To combine parallel branches into a single output, add a `responder` combine node downstream of the parallel branches and feed it into terminal. Do NOT wire parallel branches directly into terminal — terminal is a sink, not a combiner. Pattern:
-  branchA, branchB → combine (responder) → terminal
-
-Emit the tool call directly after deciding the structure. For simple chat turns (no decomposition benefit), just answer directly.
-]],
+  system   = lead_role.LEAD_SYSTEM_PROMPT,
+  -- Restrict the lead's chat catalog to the orchestration-tool surface.
+  -- Without this filter the lead sees every wire-advertised tool — most
+  -- problematically `spawn_graph` (the reasoner-graph internal that
+  -- `dispatch-graph` translates into) — and can call them directly,
+  -- bypassing the role-keyed sub-agent contract and bottoming out in
+  -- `reasoner '<role>' not connected` runtime errors. The agent
+  -- reasoner already enforces a per-role allowlist on its sub-firings
+  -- via the same `chat.create.tools` plumbing; this extends the same
+  -- discipline to the lead's chat at the orchestrator layer.
+  tool_allowlist = lead_role.ORCHESTRATION_TOOLS,
 }
 actor.spawn(agentic_loop)
 actor.spawn(require("reasoners"))

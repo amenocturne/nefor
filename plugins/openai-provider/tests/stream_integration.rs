@@ -767,7 +767,7 @@ async fn reactive_fallback_retries_without_tools_after_signature_400() {
     let chats = Chats::with_default_model(Some("translategemma".into()));
     let chat_id = ChatId::new("c1");
     chats
-        .create(chat_id.clone(), Some("translategemma".into()), None)
+        .create(chat_id.clone(), Some("translategemma".into()), None, None)
         .await
         .expect("create");
 
@@ -885,7 +885,7 @@ async fn marked_model_skips_tools_on_first_turn_of_a_brand_new_chat() {
 
     let chat_id = ChatId::new("fresh-chat");
     chats
-        .create(chat_id.clone(), Some("translategemma".into()), None)
+        .create(chat_id.clone(), Some("translategemma".into()), None, None)
         .await
         .expect("create");
 

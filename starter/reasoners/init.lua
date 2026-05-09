@@ -137,6 +137,20 @@ local function provider_run_node(reasoner_type, body)
     -- D-29: sub-graph responder nodes must produce text, not tool calls.
     if reasoner_type == "responder" then
       create_body.tools = false
+    elseif type(args) == "table" and type(args.tool_allowlist) == "table" then
+      -- Provider-side tool-name allowlist for this chat (matches the
+      -- agent reasoner's pattern for sub-agent firings). Carries a list
+      -- of allowed tool names on `chat.create.tools`; the openai-provider
+      -- binary filters its per-turn `tools` array down to entries whose
+      -- function.name is in this list. Used by the lead orchestrator
+      -- (wired via agentic-loop.configure { tool_allowlist }) so the
+      -- lead's chat can't see reasoner-graph internals like
+      -- `spawn_graph` even though the global catalog advertises them.
+      local advertised = {}
+      for _, n in ipairs(args.tool_allowlist) do
+        advertised[#advertised + 1] = n
+      end
+      create_body.tools = advertised
     end
     emit_to(provider, create_body)
   end
