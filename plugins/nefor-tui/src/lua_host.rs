@@ -16,8 +16,9 @@ use std::sync::{Arc, Mutex};
 use mlua::{Lua, LuaSerdeExt, RegistryKey, Table, Value};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::desc::{from_lua_table, WidgetDescription, KIND_FIELD};
+use crate::desc::{KIND_FIELD, WidgetDescription, from_lua_table};
 use crate::error::TuiError;
+use crate::fs::install_fs;
 
 /// One queued scroll command produced by a Lua call to `tui.scroll_to /
 /// scroll_by / scroll_into_view`. The engine drains the queue after each
@@ -119,6 +120,17 @@ impl LuaHost {
             Arc::clone(&emit_queue),
             Arc::clone(&now_ms),
         )?;
+        // `nefor.fs.list_dir` — a Rust-backed readdir, used by chat.lua's
+        // @-path autocomplete. Stays separate from the `tui` table so the
+        // namespace stays meaningful: `tui.*` is TUI primitives, `nefor.*`
+        // is engine / runtime services that happen to be available in
+        // this plugin's VM too. The chat.lua composition was the trigger
+        // (parallel-test fork contention on `io.popen("ls …")`) but a
+        // generic readdir is broad enough to live under the runtime
+        // namespace rather than `tui.fs`.
+        let nefor = lua.create_table()?;
+        install_fs(&lua, &nefor)?;
+        lua.globals().set("nefor", nefor)?;
         Ok(LuaHost {
             lua,
             started,

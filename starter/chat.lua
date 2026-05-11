@@ -693,37 +693,37 @@ end
 -- half-typed dir name silently produces "no matches" rather than a
 -- Lua error.
 --
--- `ls -1Ap` is a single shell-out that returns one entry per line
--- with a trailing `/` on directories (BSD ls's `-p` flag does the
--- per-entry lstat for us). `head -n N` upstream of the pipe caps
--- output so typing into a deeply-nested directory doesn't fan out
--- syscalls beyond what fits in the popup. macOS tempdir parents
--- (~3-4k entries) cap at <30ms in benchmark — well inside the
--- per-keystroke budget. The cache in `build_at_complete` reuses
+-- Backed by `nefor.fs.list_dir`, a Rust readdir bridged into Lua
+-- (plugins/nefor-tui/src/fs.rs). The previous implementation shelled
+-- out via `io.popen("ls -1Ap …")`, which produced `shell-init: cwd
+-- not found` warnings when parallel tests inherited a since-deleted
+-- tempdir cwd and inflated parallel-mode wall-time from ~90ms to
+-- >60s due to fork contention. The Rust path is a single readdir
+-- with no subprocess.
+--
+-- Filtering: skip dotfiles (leading `.`) and the
+-- AT_COMPLETION_IGNORE allowlist; cap at AT_COMPLETION_CAP entries.
+-- Sort dirs-first then case-insensitive alphabetical so drill-down
+-- candidates lead the popup. The cache in `build_at_complete` reuses
 -- the listing across keystrokes within the same dir.
 local function ls_entries(dir)
-  -- No `head -n` upstream — that's an extra fork in the pipeline,
-  -- and the Lua-side cap below sends SIGPIPE to ls anyway when the
-  -- pipe closes. Halves the fork cost in tight typing loops.
-  local cmd = string.format("ls -1Ap %q 2>/dev/null", dir)
-  local pipe = io.popen(cmd)
-  if pipe == nil then return {} end
-  local out = {}
-  for line in pipe:lines() do
-    local is_dir = false
-    local name = line
-    if name:sub(-1) == "/" then
-      is_dir = true
-      name = name:sub(1, -2)
-    end
-    if name ~= ""
-       and name:sub(1, 1) ~= "."
-       and not AT_COMPLETION_IGNORE[name] then
-      out[#out + 1] = { name = name, is_dir = is_dir }
-    end
-    if #out >= AT_COMPLETION_CAP then break end
+  local entries, err = nefor.fs.list_dir(dir)
+  if entries == nil then
+    -- Half-typed dir, permission denied, etc. Silently return empty
+    -- so the popup shows "no matches" rather than raising. The error
+    -- string is intentionally not surfaced — the user's signal is the
+    -- empty popup, not a Lua-level error message.
+    local _ = err
+    return {}
   end
-  pipe:close()
+  local out = {}
+  for _, e in ipairs(entries) do
+    local name = e.name
+    if name:sub(1, 1) ~= "." and not AT_COMPLETION_IGNORE[name] then
+      out[#out + 1] = { name = name, is_dir = e.is_dir }
+      if #out >= AT_COMPLETION_CAP then break end
+    end
+  end
   table.sort(out, function(a, b)
     -- Directories first, then alphabetical case-insensitive — drives
     -- the user toward drill-down candidates over peer-level files.

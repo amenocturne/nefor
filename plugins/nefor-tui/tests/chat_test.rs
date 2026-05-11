@@ -15,7 +15,7 @@ use std::time::Duration;
 use nefor_tui::engine::Engine;
 use nefor_tui::input::KeyMessage;
 use nefor_tui::mouse::{MouseKind, MouseMessage};
-use serde_json::{json, Map as JsonMap, Value as JsonValue};
+use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 /// Per-process tempdir kept alive for the lifetime of `cargo test` and
 /// pointed at by `NEFOR_DATA_HOME` on first access. Ensures chat.lua's
@@ -32,9 +32,8 @@ use serde_json::{json, Map as JsonMap, Value as JsonValue};
 static TEST_DATA_HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
 
 fn ensure_test_data_home() {
-    let dir = TEST_DATA_HOME.get_or_init(|| {
-        tempfile::tempdir().expect("create per-process test data home")
-    });
+    let dir = TEST_DATA_HOME
+        .get_or_init(|| tempfile::tempdir().expect("create per-process test data home"));
     // set_var is process-global; OnceLock guarantees the assignment
     // runs only once. Subsequent ResumeEnv-style overrides save +
     // restore around their scope, so this default is what they read
@@ -661,7 +660,10 @@ fn replayed_chat_model_set_ack_does_not_clobber_live_model() {
         }),
     );
     let out = render_snapshot(&mut engine);
-    assert!(out.contains("qwen-test"), "live model missing pre-replay: {out:?}");
+    assert!(
+        out.contains("qwen-test"),
+        "live model missing pre-replay: {out:?}"
+    );
 
     // /resume picker fires: replay window opens, replayed envelopes
     // include the OLD session's mock-provider set_ack.
@@ -1779,7 +1781,6 @@ fn at_path_autocomplete_opens_when_typing_at_sign() {
         !out.contains(".git"),
         "@ autocomplete must not list .git directory: {out:?}"
     );
-
 }
 
 #[test]
@@ -1833,7 +1834,6 @@ fn at_path_autocomplete_filters_by_leaf_prefix_in_subdir() {
         !out.contains("lib.rs"),
         "@src/m should NOT list lib.rs (no `m` prefix): {out:?}"
     );
-
 }
 
 #[test]
@@ -1866,7 +1866,6 @@ fn at_path_autocomplete_navigation_into_subdir_shows_subdir_contents() {
         !out.contains("README.md"),
         "@src/ should NOT show CWD entries (README.md leaked): {out:?}"
     );
-
 }
 
 #[test]
@@ -1927,7 +1926,6 @@ fn at_path_autocomplete_tab_inserts_selected_match_into_input() {
         wire.contains("# readme"),
         "wire text should contain README.md contents after Tab inserted the path: {wire:?}"
     );
-
 }
 
 #[test]
@@ -1941,10 +1939,7 @@ fn at_path_autocomplete_escape_closes_popup() {
 
     engine.handle_key(key("@")).expect("@");
     let out = render_str(&mut engine);
-    assert!(
-        out.contains("README.md"),
-        "@ should open popup: {out:?}"
-    );
+    assert!(out.contains("README.md"), "@ should open popup: {out:?}");
 
     engine.handle_key(key("escape")).expect("esc");
     let out2 = render_str(&mut engine);
@@ -1952,7 +1947,6 @@ fn at_path_autocomplete_escape_closes_popup() {
         !out2.contains("README.md") || !out2.contains("src/"),
         "Escape should close @-popup: {out2:?}"
     );
-
 }
 
 #[test]
@@ -1974,7 +1968,6 @@ fn at_path_autocomplete_triggers_mid_message_not_only_at_start() {
         out.contains("README.md"),
         "@-popup should open when @ appears mid-message: {out:?}"
     );
-
 }
 
 #[test]
@@ -2013,7 +2006,51 @@ fn at_path_autocomplete_arrow_keys_move_cursor() {
         "Down+Tab on @src/ should select macro.rs (2nd alphabetical), \
          wire contents should be `// mac`: {wire:?}"
     );
+}
 
+/// Lua-level smoke that `nefor.fs.list_dir` is wired into the same VM
+/// that hosts chat.lua. Targets the chat.lua-facing contract: a string
+/// path in, a `{ { name, is_dir }, ... }` table out (or `(nil, err)`
+/// on failure). Guards against a future reinstall regression where
+/// `install_fs` gets dropped from `LuaHost::new` and chat.lua's
+/// `ls_entries` silently falls back to empty-with-no-error.
+#[test]
+fn nefor_fs_list_dir_binding_is_available_in_chat_lua_vm() {
+    let fixture = at_complete_fixture();
+    let _cwd = CwdSwitch::to(fixture.path());
+
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+
+    let lua = engine.lua();
+    let (has_readme, has_src_dir, missing_path_is_nil): (bool, bool, bool) = lua
+        .load(
+            r#"
+            assert(nefor and type(nefor) == "table", "nefor global missing")
+            assert(nefor.fs and type(nefor.fs) == "table", "nefor.fs missing")
+            assert(type(nefor.fs.list_dir) == "function", "nefor.fs.list_dir missing")
+            local entries = nefor.fs.list_dir(".")
+            local has_readme, has_src_dir = false, false
+            for _, e in ipairs(entries) do
+              if e.name == "README.md" and e.is_dir == false then has_readme = true end
+              if e.name == "src" and e.is_dir == true then has_src_dir = true end
+            end
+            local missing, err = nefor.fs.list_dir("/this/path/does/not/exist")
+            return has_readme, has_src_dir, missing == nil and type(err) == "string"
+            "#,
+        )
+        .eval()
+        .expect("eval nefor.fs.list_dir checks");
+
+    assert!(
+        has_readme,
+        "fixture's README.md should appear as is_dir=false"
+    );
+    assert!(has_src_dir, "fixture's src/ should appear as is_dir=true");
+    assert!(
+        missing_path_is_nil,
+        "missing path should yield (nil, err_string)"
+    );
 }
 
 #[test]
@@ -4727,8 +4764,14 @@ fn chat_plan_append_renders_yellow_bordered_plan_entry() {
     let out = render_str(&mut engine);
 
     // Body lines from the markdown plan land in the transcript.
-    assert!(out.contains("Step one"), "plan body line 1 missing: {out:?}");
-    assert!(out.contains("Step two"), "plan body line 2 missing: {out:?}");
+    assert!(
+        out.contains("Step one"),
+        "plan body line 1 missing: {out:?}"
+    );
+    assert!(
+        out.contains("Step two"),
+        "plan body line 2 missing: {out:?}"
+    );
 
     // The bordered_box helper paints all four rounded corners, same as
     // the user block — confirms render_plan_entry routed through

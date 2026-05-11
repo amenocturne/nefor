@@ -10,6 +10,7 @@ pub mod ansi;
 pub mod desc;
 pub mod engine;
 pub mod error;
+pub mod fs;
 pub mod input;
 pub mod input_router;
 pub mod instance;
