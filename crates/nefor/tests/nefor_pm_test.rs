@@ -35,7 +35,15 @@ fn install_nefor(lua: &Lua) -> mlua::Result<()> {
     let nefor = lua.create_table()?;
     nefor::lua::bindings::install_json(lua, &nefor)?;
     nefor::lua::bindings::install_process(lua, &nefor)?;
-    nefor::lua::bindings::install_fs(lua, &nefor)?;
+    // pm's data_root() now delegates to `nefor.fs.data_root()` — capture
+    // the resolved value from NEFOR_DATA_DIR (the DataDirGuard sets it
+    // before constructing this VM). When unset, the resolver falls back
+    // to XDG/HOME, but pm tests always pin the env so the unset branch
+    // is moot here.
+    let data_dir_path = std::env::var("NEFOR_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/var/empty/nefor-pm-test-data"));
+    nefor::lua::bindings::install_fs(lua, &nefor, nefor::paths::DataDir(data_dir_path))?;
     lua.globals().set("nefor", nefor)?;
     Ok(())
 }
@@ -62,11 +70,12 @@ fn lua_with_pm() -> Lua {
 /// Process-global lock to serialise tests that mutate NEFOR_DATA_DIR.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// Scoped data-dir override. Sets NEFOR_DATA_DIR + unsets the other path
-/// resolvers so the resolver lands on the tempdir deterministically.
+/// Scoped data-dir override. Sets NEFOR_DATA_DIR + unsets XDG_DATA_HOME
+/// so the resolver lands on the tempdir deterministically. nefor-pm's
+/// data_root() now delegates to `nefor.fs.data_root()` which is also
+/// captured from this same env var at install time (see `install_nefor`).
 struct DataDirGuard {
     prev_data_dir: Option<String>,
-    prev_data_home: Option<String>,
     prev_xdg: Option<String>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
@@ -75,14 +84,11 @@ impl DataDirGuard {
     fn new(path: &std::path::Path) -> Self {
         let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_data_dir = std::env::var("NEFOR_DATA_DIR").ok();
-        let prev_data_home = std::env::var("NEFOR_DATA_HOME").ok();
         let prev_xdg = std::env::var("XDG_DATA_HOME").ok();
         std::env::set_var("NEFOR_DATA_DIR", path);
-        std::env::remove_var("NEFOR_DATA_HOME");
         std::env::remove_var("XDG_DATA_HOME");
         Self {
             prev_data_dir,
-            prev_data_home,
             prev_xdg,
             _lock: lock,
         }
@@ -94,10 +100,6 @@ impl Drop for DataDirGuard {
         match self.prev_data_dir.as_deref() {
             Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
             None => std::env::remove_var("NEFOR_DATA_DIR"),
-        }
-        match self.prev_data_home.as_deref() {
-            Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
-            None => std::env::remove_var("NEFOR_DATA_HOME"),
         }
         match self.prev_xdg.as_deref() {
             Some(v) => std::env::set_var("XDG_DATA_HOME", v),

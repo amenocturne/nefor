@@ -336,7 +336,8 @@ async fn build_host(shared: Arc<Mutex<BrokerShared>>, config_dir: &Path) -> LuaH
     let bus = Arc::new(EventBus::new());
     let plugins = Arc::new(Mutex::new(PluginRegistry::new()));
     let ops: Arc<dyn EngineOps> = Arc::new(BrokerOps::new(Arc::clone(&shared)));
-    let mut host = LuaHost::new(bus, plugins, ops).expect("lua host");
+    let data_dir = nefor::paths::DataDir(PathBuf::from("/var/empty/stage1-e2e-data"));
+    let mut host = LuaHost::new(bus, plugins, ops, data_dir).expect("lua host");
     host.load_init(&config_dir.join("init.lua"))
         .await
         .expect("load init.lua");

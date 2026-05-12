@@ -1,9 +1,9 @@
 -- Dump-to-file layer for huge tool results. When a tool.result's
 -- output exceeds the inline budget, the full payload lands on disk
--- under `<NEFOR_DATA_HOME>/tool-results/<chat_id>/<call_id>.txt` and
--- only a summary + path reference flows into the model's chat
--- history. The model greps the file from a later turn (via bash) to
--- extract specifics it didn't get in the inlined preview.
+-- under `<data_root>/tool-results/<chat_id>/<call_id>.txt` and only
+-- a summary + path reference flows into the model's chat history.
+-- The model greps the file from a later turn (via bash) to extract
+-- specifics it didn't get in the inlined preview.
 
 local json = nefor.json
 
@@ -19,28 +19,22 @@ M.INLINE_BUDGET = 32 * 1024
 -- pattern, without replicating the whole thing back into context.
 M.PREVIEW_BYTES = 4 * 1024
 
--- Same precedence as starter/sessions/init.lua so NEFOR_DATA_HOME
--- controls both:
---   1. $NEFOR_DATA_HOME    (test override + canonical)
---   2. $XDG_DATA_HOME/nefor
---   3. $HOME/.local/share/nefor
+-- Delegates to `nefor.fs.data_root()` — the engine's canonical resolved
+-- data directory (CLI flag > NEFOR_DATA_DIR env var > XDG default).
+-- This module runs in the engine Lua VM (tool-gate's wrapper actor),
+-- so the binding is always available.
 ---@return string|nil
 local function data_root()
-  local override = os.getenv("NEFOR_DATA_HOME")
-  if override and override ~= "" then return override end
-  local xdg = os.getenv("XDG_DATA_HOME")
-  if xdg and xdg ~= "" then return xdg .. "/nefor" end
-  local home = os.getenv("HOME")
-  if not home or home == "" then return nil end
-  return home .. "/.local/share/nefor"
+  return nefor.fs.data_root()
 end
 
 ---@param path string
 local function ensure_dir(path)
-  -- Best-effort recursive mkdir. `2>/dev/null` swallows EEXIST and
-  -- permission errors — they surface on the subsequent io.open with
-  -- a real error string.
-  os.execute(string.format("mkdir -p %q 2>/dev/null", path))
+  -- Best-effort recursive mkdir via the Rust binding. Idempotent on
+  -- EEXIST and surfaces permission errors on the subsequent io.open
+  -- with a real error string (the return value here is intentionally
+  -- ignored — the next write_file is the source of truth on success).
+  nefor.fs.mkdir_p(path)
 end
 
 -- Realistic chat_ids are already filesystem-safe (UUIDs, `chat-1`);
@@ -144,7 +138,7 @@ function M.dump(chat_id, call_id, output, args)
 
   local root = data_root()
   if not root then
-    return nil, nil, "no data root (NEFOR_DATA_HOME / XDG_DATA_HOME / HOME unset)"
+    return nil, nil, "no data root (nefor.fs.data_root unavailable)"
   end
 
   local cid = safe_call_id(call_id)

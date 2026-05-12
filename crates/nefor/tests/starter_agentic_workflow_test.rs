@@ -55,6 +55,15 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
 
     nefor::lua::bindings::install_json(lua, &nefor)?;
 
+    // nefor.fs — sessions module (transitively required) calls
+    // nefor.fs.data_root() at load time. Capture NEFOR_DATA_DIR from
+    // the env if the test set it, otherwise a /var/empty default keeps
+    // disk writes failing harmlessly.
+    let data_dir = std::env::var("NEFOR_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/var/empty/agentic-workflow-test"));
+    nefor::lua::bindings::install_fs(lua, &nefor, nefor::paths::DataDir(data_dir))?;
+
     let log_tbl = lua.create_table()?;
     let no_op: Function = lua.create_function(|_, _: mlua::Variadic<Value>| Ok(()))?;
     log_tbl.set("info", no_op.clone())?;

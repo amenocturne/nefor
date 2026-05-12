@@ -57,20 +57,19 @@ async fn main() -> anyhow::Result<()> {
         .map_err(NeforError::from)
         .context("resolving config directory")?;
 
-    // Resolve the data dir and propagate it to the environment so Lua can
-    // read it via os.getenv("NEFOR_DATA_DIR"). The CLI flag takes highest
-    // precedence; env var is already set if the user exported it; the XDG
-    // default is written only when neither is present.
+    // Resolve the data dir and propagate it to the environment so every
+    // spawned plugin subprocess inherits the canonical value. The CLI flag
+    // takes highest precedence; if neither flag nor env var is set, the
+    // XDG default lands in the env var so plugin processes see the same
+    // path the engine resolved (otherwise a plugin reading
+    // `os.getenv("NEFOR_DATA_DIR")` on a default-layout install would get
+    // nil and silently fall back to its own resolver).
     let data_dir = config::resolve_data(&args)
         .map_err(NeforError::from)
         .context("resolving data directory")?;
-    // Only set when --data-dir was given (so the CLI flag wins over an
-    // existing NEFOR_DATA_DIR env var without silently overwriting it).
-    if args.data_dir.is_some() {
-        // SAFETY: single-threaded at this point, before any thread spawns.
-        unsafe {
-            std::env::set_var("NEFOR_DATA_DIR", data_dir.as_path());
-        }
+    // SAFETY: single-threaded at this point, before any thread spawns.
+    unsafe {
+        std::env::set_var("NEFOR_DATA_DIR", data_dir.as_path());
     }
 
     // Resolve and propagate NEFOR_PLUGIN_DIR so init.lua's `bin()` helper
@@ -112,9 +111,14 @@ async fn main() -> anyhow::Result<()> {
 
     let bus = Arc::new(EventBus::new());
     let plugins: SharedPluginRegistry = Arc::new(Mutex::new(PluginRegistry::new()));
-    let mut host = LuaHost::new(Arc::clone(&bus), Arc::clone(&plugins), engine_ops)
-        .map_err(NeforError::from)
-        .context("initializing Lua VM")?;
+    let mut host = LuaHost::new(
+        Arc::clone(&bus),
+        Arc::clone(&plugins),
+        engine_ops,
+        data_dir.clone(),
+    )
+    .map_err(NeforError::from)
+    .context("initializing Lua VM")?;
 
     // CLI dispatch vs TUI: the bindings need to know the active mode so
     // `nefor.io.read_line` short-circuits to nil in TUI (where stdin is

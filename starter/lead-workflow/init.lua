@@ -105,14 +105,10 @@ local SOURCE_NAME = "lead-workflow"
 -- on-disk plan path resolution
 -- ------------------------------------------------------------------
 
+-- Delegates to `nefor.fs.data_root()` — the engine's canonical resolved
+-- data directory (CLI flag > `NEFOR_DATA_DIR` env var > XDG default).
 local function compute_data_root()
-  local override = os.getenv("NEFOR_DATA_HOME")
-  if override and override ~= "" then return override end
-  local xdg = os.getenv("XDG_DATA_HOME")
-  if xdg and xdg ~= "" then return xdg .. "/nefor" end
-  local home = os.getenv("HOME")
-  if not home or home == "" then return nil end
-  return home .. "/.local/share/nefor"
+  return nefor.fs.data_root()
 end
 
 local function plans_dir()
@@ -122,7 +118,7 @@ local function plans_dir()
 end
 
 local function ensure_dir(path)
-  os.execute(string.format("mkdir -p %q 2>/dev/null", path))
+  nefor.fs.mkdir_p(path)
 end
 
 local function plan_path_for(plan_id)

@@ -87,6 +87,7 @@ impl LuaHost {
         bus: Arc<EventBus>,
         plugins: SharedPluginRegistry,
         engine_ops: Arc<dyn EngineOps>,
+        data_dir: crate::paths::DataDir,
     ) -> Result<Self, LuaError> {
         let lua = Lua::new();
         let subscriptions: SharedSubscriptions = Arc::new(Mutex::new(EventSubscriptions::new()));
@@ -99,6 +100,7 @@ impl LuaHost {
             Arc::clone(&subscriptions),
             EngineMode::Tui,
             Arc::clone(&stdin_pump),
+            data_dir,
         )
         .map_err(LuaError::VmInit)?;
         Ok(Self {
@@ -469,11 +471,12 @@ fn install_nefor_surface(
     subscriptions: SharedSubscriptions,
     mode: EngineMode,
     stdin_pump: SharedStdinPump,
+    data_dir: crate::paths::DataDir,
 ) -> mlua::Result<()> {
     let nefor = lua.create_table()?;
     bindings::install_engine(lua, &nefor, engine_ops)?;
     bindings::install_events(lua, &nefor, Arc::clone(&bus))?;
-    bindings::install_fs(lua, &nefor)?;
+    bindings::install_fs(lua, &nefor, data_dir)?;
     bindings::install_json(lua, &nefor)?;
     bindings::install_log(lua, &nefor)?;
     bindings::install_process(lua, &nefor)?;
@@ -539,7 +542,8 @@ mod tests {
     fn host_with_ops(ops: Arc<dyn EngineOps>) -> LuaHost {
         let bus = Arc::new(EventBus::new());
         let plugins: SharedPluginRegistry = Arc::new(Mutex::new(PluginRegistry::new()));
-        LuaHost::new(bus, plugins, ops).expect("host ok")
+        let data_dir = crate::paths::DataDir(PathBuf::from("/var/empty/nefor-test"));
+        LuaHost::new(bus, plugins, ops, data_dir).expect("host ok")
     }
 
     #[test]

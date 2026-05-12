@@ -68,6 +68,13 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
     let nefor = lua.create_table()?;
     nefor::lua::bindings::install_json(lua, &nefor)?;
 
+    // nefor.fs — real binding, snapshotting NEFOR_DATA_DIR from the env
+    // (test sets it before calling install_stub_nefor).
+    let data_dir = std::env::var("NEFOR_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/var/empty/nefor-test-data"));
+    nefor::lua::bindings::install_fs(lua, &nefor, nefor::paths::DataDir(data_dir))?;
+
     let log_tbl = lua.create_table()?;
     let no_op: Function = lua.create_function(|_, _: mlua::Variadic<Value>| Ok(()))?;
     log_tbl.set("info", no_op.clone())?;
@@ -544,8 +551,8 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 fn maybe_dump_output_passes_through_small_output_unchanged() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = std::env::var("NEFOR_DATA_HOME").ok();
-    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
 
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("nefor stub");
@@ -572,8 +579,8 @@ fn maybe_dump_output_passes_through_small_output_unchanged() {
     assert!(path.is_none());
 
     match prev.as_deref() {
-        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
-        None => std::env::remove_var("NEFOR_DATA_HOME"),
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
     }
 }
 
@@ -581,8 +588,8 @@ fn maybe_dump_output_passes_through_small_output_unchanged() {
 fn maybe_dump_output_rewrites_huge_output_into_summary_and_writes_disk() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = std::env::var("NEFOR_DATA_HOME").ok();
-    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
 
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("nefor stub");
@@ -638,8 +645,8 @@ fn maybe_dump_output_rewrites_huge_output_into_summary_and_writes_disk() {
     assert_eq!(on_disk, "PAYLOAD\n".repeat(5000));
 
     match prev.as_deref() {
-        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
-        None => std::env::remove_var("NEFOR_DATA_HOME"),
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
     }
 }
 
@@ -647,8 +654,8 @@ fn maybe_dump_output_rewrites_huge_output_into_summary_and_writes_disk() {
 fn maybe_dump_output_ignores_bodies_without_string_id() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = std::env::var("NEFOR_DATA_HOME").ok();
-    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
 
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("nefor stub");
@@ -675,8 +682,8 @@ fn maybe_dump_output_ignores_bodies_without_string_id() {
     assert!(path.is_none());
 
     match prev.as_deref() {
-        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
-        None => std::env::remove_var("NEFOR_DATA_HOME"),
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
     }
 }
 

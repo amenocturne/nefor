@@ -29,7 +29,7 @@ return {
 
   -- Helpers exposed for direct unit-testing.
   _uuid_v4   = i.uuid_v4,
-  -- The data-root resolver re-reads env vars on every call; tests can
-  -- exercise its precedence by toggling NEFOR_DATA_HOME / XDG_DATA_HOME.
+  -- The data-root resolver delegates to nefor.fs.data_root(); tests
+  -- override the binding to drive different roots.
   _data_root = i.compute_data_root,
 }

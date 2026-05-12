@@ -18,7 +18,7 @@ use nefor_tui::mouse::{MouseKind, MouseMessage};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 /// Per-process tempdir kept alive for the lifetime of `cargo test` and
-/// pointed at by `NEFOR_DATA_HOME` on first access. Ensures chat.lua's
+/// pointed at by `NEFOR_DATA_DIR` on first access. Ensures chat.lua's
 /// `load_input_history` (issue #39) reads from / writes to a clean
 /// throwaway path instead of the developer's `$HOME/.local/share/
 /// nefor/input-history` — without this, parallel test runs would
@@ -38,8 +38,8 @@ fn ensure_test_data_home() {
     // runs only once. Subsequent ResumeEnv-style overrides save +
     // restore around their scope, so this default is what they read
     // at construction time and what they restore on Drop.
-    if std::env::var_os("NEFOR_DATA_HOME").is_none() {
-        std::env::set_var("NEFOR_DATA_HOME", dir.path());
+    if std::env::var_os("NEFOR_DATA_DIR").is_none() {
+        std::env::set_var("NEFOR_DATA_DIR", dir.path());
     }
 }
 
@@ -2765,13 +2765,13 @@ fn model_picker_typing_filters_query() {
 // /resume slash + session picker
 // ============================================================
 //
-// The picker reads from `$NEFOR_DATA_HOME/sessions/` (overridable via
+// The picker reads from `$NEFOR_DATA_DIR/sessions/` (overridable via
 // env var, set per-test for isolation). Selecting a row emits a
 // `sessions.resume_request { session_id }` envelope onto the NCP bus —
 // no process exit, no sidechannel file. The starter's `sessions` Lua
 // module subscribes to that kind and runs the in-process swap.
 //
-// Test isolation: each test creates a tempdir, sets NEFOR_DATA_HOME to
+// Test isolation: each test creates a tempdir, sets NEFOR_DATA_DIR to
 // it, and tears it down on completion. Env var manipulation is
 // process-global so we serialize via a mutex.
 
@@ -2780,7 +2780,7 @@ use std::sync::Mutex;
 
 // Process-global lock — env var mutation is unsafe across threads.
 // `cargo test` runs unit tests in parallel by default; this serializes
-// only the tests that touch NEFOR_DATA_HOME.
+// only the tests that touch NEFOR_DATA_DIR.
 static RESUME_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct ResumeEnv {
@@ -2796,10 +2796,10 @@ impl ResumeEnv {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let data_home = tempdir.path().to_path_buf();
         std::fs::create_dir_all(data_home.join("sessions")).expect("mkdir sessions");
-        let prev = std::env::var("NEFOR_DATA_HOME").ok();
+        let prev = std::env::var("NEFOR_DATA_DIR").ok();
         // Tests serialize via RESUME_ENV_LOCK so concurrent reads/writes
         // don't race. set_var is safe under edition 2021.
-        std::env::set_var("NEFOR_DATA_HOME", &data_home);
+        std::env::set_var("NEFOR_DATA_DIR", &data_home);
         ResumeEnv {
             _guard: guard,
             _tempdir: tempdir,
@@ -2846,8 +2846,8 @@ impl Drop for ResumeEnv {
     fn drop(&mut self) {
         // Still under RESUME_ENV_LOCK.
         match self.prev.as_deref() {
-            Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
-            None => std::env::remove_var("NEFOR_DATA_HOME"),
+            Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+            None => std::env::remove_var("NEFOR_DATA_DIR"),
         }
     }
 }
@@ -4342,12 +4342,12 @@ fn slash_clear_is_alias_for_slash_new() {
 // ── persistent input history (issue #39) ────────────────────────────
 //
 // Like shell history: a submit on session A writes the prompt to
-// `<NEFOR_DATA_HOME>/input-history`; a fresh nefor process (session B)
+// `<NEFOR_DATA_DIR>/input-history`; a fresh nefor process (session B)
 // reads it back at init so arrow-up recalls it. Cap is INPUT_HISTORY_MAX
 // (50) — pushing the 51st entry rolls the oldest off the disk file
 // the next time we trim.
 //
-// Reuses the `ResumeEnv` harness above for tempdir + NEFOR_DATA_HOME
+// Reuses the `ResumeEnv` harness above for tempdir + NEFOR_DATA_DIR
 // isolation. Each test scopes its own env so the file lives in a
 // per-test tmp dir and tests don't race over the shared XDG path.
 
@@ -4391,7 +4391,7 @@ fn submit_persists_input_history_to_disk_for_next_session() {
         "input-history must hold both submits, newest first"
     );
 
-    // Session B: a fresh engine on the same NEFOR_DATA_HOME hydrates
+    // Session B: a fresh engine on the same NEFOR_DATA_DIR hydrates
     // its `prompt_history` from disk. Arrow-up on the empty input
     // recalls the most-recent ("world") on the first press.
     let mut engine_b = Engine::new(80, 24).expect("engine B");

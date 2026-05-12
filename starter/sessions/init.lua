@@ -50,10 +50,9 @@
 --
 -- ## On-disk path
 --
--- Resolved once at module load:
---   1. `$NEFOR_DATA_HOME` — test override.
---   2. `$XDG_DATA_HOME/nefor` — standard XDG.
---   3. `$HOME/.local/share/nefor` — XDG default fallback.
+-- Resolved once at module load from `nefor.fs.data_root()` — the
+-- engine's canonical resolved data directory (CLI flag >
+-- `NEFOR_DATA_DIR` env var > `XDG_DATA_HOME/nefor`).
 -- Path: `<root>/sessions/<id>.jsonl`. Parent dir is created on init.
 
 local json = nefor.json
@@ -92,13 +91,7 @@ local state = {
 
 ---@return string|nil
 local function compute_data_root()
-  local override = os.getenv("NEFOR_DATA_HOME")
-  if override and override ~= "" then return override end
-  local xdg = os.getenv("XDG_DATA_HOME")
-  if xdg and xdg ~= "" then return xdg .. "/nefor" end
-  local home = os.getenv("HOME")
-  if not home or home == "" then return nil end
-  return home .. "/.local/share/nefor"
+  return nefor.fs.data_root()
 end
 
 local DATA_ROOT    = compute_data_root()

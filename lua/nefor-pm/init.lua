@@ -83,18 +83,13 @@ local function ensure_on_path(dir)
   end
 end
 
--- Mirror sessions.lua's resolver: NEFOR_DATA_HOME → XDG_DATA_HOME/nefor →
--- HOME/.local/share/nefor. NEFOR_DATA_DIR (used by the engine binary) is
--- treated as the highest-priority override.
+-- Delegates to `nefor.fs.data_root()` — the engine's canonical resolved
+-- data directory (CLI flag > NEFOR_DATA_DIR env var > XDG_DATA_HOME/nefor).
+-- Avoids the historical Lua-side re-resolver that invented a
+-- `NEFOR_DATA_HOME` the Rust resolver doesn't know about, which silently
+-- diverged when both were set to different values.
 local function data_root()
-  local d = os.getenv("NEFOR_DATA_DIR")
-  if is_string(d) then return d end
-  d = os.getenv("NEFOR_DATA_HOME")
-  if is_string(d) then return d end
-  d = os.getenv("XDG_DATA_HOME")
-  if is_string(d) then return pjoin(d, "nefor") end
-  local home = os.getenv("HOME") or ""
-  return pjoin(home, ".local/share/nefor")
+  return nefor.fs.data_root()
 end
 
 local function plugins_root()

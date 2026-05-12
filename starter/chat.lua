@@ -463,14 +463,15 @@ local INPUT_HISTORY_MAX = 50
 -- later in the chunk would resolve through globals at call time
 -- (Lua's lexical-scope rules), so the file order matters.
 
--- Same env-var precedence as `sessions.lua`'s `compute_data_root` so
--- input-history sits next to session jsonls under the same root.
+-- Same env-var precedence as the engine's `nefor.fs.data_root()`
+-- (NEFOR_DATA_DIR → XDG_DATA_HOME/nefor → HOME/.local/share/nefor)
+-- so input-history sits next to session jsonls under the same root.
 -- Inlined here rather than reusing `nefor_data_root` further down the
 -- file because that helper is declared after `initial_state`, and Lua
 -- closures bind locals at declaration time — `initial_state` would
 -- otherwise see `nefor_data_root` as a missing global.
 local function input_history_data_root()
-  local override = os.getenv("NEFOR_DATA_HOME")
+  local override = os.getenv("NEFOR_DATA_DIR")
   if override ~= nil and override ~= "" then return override end
   local xdg = os.getenv("XDG_DATA_HOME")
   if xdg ~= nil and xdg ~= "" then return xdg .. "/nefor" end
@@ -1355,18 +1356,19 @@ end
 -- and rebuild their own state. The TUI process stays alive across the
 -- whole flip.
 
--- Resolve the sessions data root. Must match `starter/sessions.lua`'s
--- `data_root()` exactly — picker reads from the same directory the
--- writer writes to. Resolution order, first hit wins:
---   1. `NEFOR_DATA_HOME` — test override + canonical setting.
+-- Resolve the sessions data root. Must match the engine's
+-- `nefor.fs.data_root()` exactly — picker reads from the same directory
+-- the writer writes to. Resolution order, first hit wins:
+--   1. `NEFOR_DATA_DIR` — canonical setting (engine always propagates
+--      its resolved value into this env var when spawning plugins).
 --   2. `XDG_DATA_HOME/nefor` — standard XDG.
 --   3. `$HOME/.local/share/nefor` — XDG default fallback.
--- Earlier the picker resolved to `$HOME/Library/Application Support/nefor`
--- on macOS while the writer used XDG, so the picker showed only stale
--- legacy sessions and never saw new ones. Aligning the two resolvers
--- is the fix.
+--
+-- This module runs in the TUI plugin's subprocess VM where the engine
+-- `nefor.fs.*` bindings aren't installed; that's why the resolver here
+-- is a (matching) reimplementation rather than a delegation.
 local function nefor_data_root()
-  local override = os.getenv("NEFOR_DATA_HOME")
+  local override = os.getenv("NEFOR_DATA_DIR")
   if override ~= nil and override ~= "" then return override end
   local xdg = os.getenv("XDG_DATA_HOME")
   if xdg ~= nil and xdg ~= "" then return xdg .. "/nefor" end

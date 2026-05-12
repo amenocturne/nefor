@@ -182,8 +182,7 @@ do
     "plan text in envelope")
 
   -- File on disk at the expected location (best-effort: only if
-  -- NEFOR_DATA_HOME / XDG_DATA_HOME / HOME resolve to something
-  -- writable).
+  -- nefor.fs.data_root() returns a writable path).
   local path = lw._internals.plan_path_for(sub.body.plan_id)
   if type(path) == "string" then
     local fh = io.open(path, "r")

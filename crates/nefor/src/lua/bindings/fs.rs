@@ -11,13 +11,29 @@
 
 use std::fs;
 use std::os::unix::fs as unix_fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use mlua::{Lua, Table};
 
+use crate::paths::DataDir;
+
 /// Install `nefor.fs.*` onto `nefor_tbl`.
-pub fn install_fs(lua: &Lua, nefor_tbl: &Table) -> mlua::Result<()> {
+///
+/// `data_dir` is the engine's canonical resolved data directory (CLI flag
+/// > `NEFOR_DATA_DIR` > `XDG_DATA_HOME/nefor`). It's captured into
+/// `nefor.fs.data_root()` so Lua reads the same value the engine resolved
+/// at startup — without re-evaluating env vars on the Lua side (which
+/// historically drifted: Lua-side helpers invented a `NEFOR_DATA_HOME`
+/// the Rust resolver doesn't know about).
+pub fn install_fs(lua: &Lua, nefor_tbl: &Table, data_dir: DataDir) -> mlua::Result<()> {
     let fs_tbl = lua.create_table()?;
+
+    let data_root: PathBuf = data_dir.as_path().to_path_buf();
+    let data_root_string = data_root.to_string_lossy().into_owned();
+    fs_tbl.set(
+        "data_root",
+        lua.create_function(move |_, _: ()| Ok(data_root_string.clone()))?,
+    )?;
 
     fs_tbl.set(
         "mkdir_p",
@@ -119,11 +135,25 @@ mod tests {
     use super::*;
 
     fn setup() -> Lua {
+        setup_with_data_dir(PathBuf::from("/var/empty/nefor-test-data-dir"))
+    }
+
+    fn setup_with_data_dir(data_dir: PathBuf) -> Lua {
         let lua = Lua::new();
         let nefor = lua.create_table().unwrap();
-        install_fs(&lua, &nefor).unwrap();
+        install_fs(&lua, &nefor, DataDir(data_dir)).unwrap();
         lua.globals().set("nefor", nefor).unwrap();
         lua
+    }
+
+    #[test]
+    fn data_root_returns_engine_resolved_path() {
+        let lua = setup_with_data_dir(PathBuf::from("/some/explicit/data"));
+        let got: String = lua
+            .load("return nefor.fs.data_root()")
+            .eval()
+            .unwrap();
+        assert_eq!(got, "/some/explicit/data");
     }
 
     #[test]
