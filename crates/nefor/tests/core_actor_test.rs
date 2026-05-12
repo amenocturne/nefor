@@ -5,7 +5,9 @@
 //!
 //! Drives the helper against a mock `nefor.engine` surface that
 //! records every `send` / `deliver` call into a shared `_test.calls()`
-//! buffer, then runs `lua/core/actor_test.lua` for the assertions.
+//! buffer, then runs `tests/lua/core/actor_test.lua` for the assertions.
+//! Test scripts live under repo-root `tests/lua/` rather than inside
+//! the lib directories so the shipped libs are pure source.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -135,7 +137,11 @@ fn core_actor_identity_spec_tests() {
     install_mocks(&lua, shared).expect("install mocks");
     set_package_path(&lua).expect("set package.path");
 
-    let test_file = lua_dir().join("core").join("actor_test.lua");
+    let test_file = repo_root()
+        .join("tests")
+        .join("lua")
+        .join("core")
+        .join("actor_test.lua");
     let src = std::fs::read_to_string(&test_file)
         .unwrap_or_else(|e| panic!("read {}: {e}", test_file.display()));
     if let Err(e) = lua

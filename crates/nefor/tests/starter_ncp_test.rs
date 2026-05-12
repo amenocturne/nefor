@@ -5,8 +5,10 @@
 //! `nefor.engine.plugins`. This harness installs a mock `nefor.engine` that
 //! records calls + returns a caller-controlled plugin list, plus a `_test`
 //! helper global for the Lua tests to drive it. It then loads and runs
-//! `starter/ncp_test.lua`, which performs its own `assert`s and errors out
-//! on failure.
+//! `tests/lua/core/ncp_test.lua`, which performs its own `assert`s and
+//! errors out on failure. The Lua test script lives under repo-root
+//! `tests/lua/` rather than inside `lua/core/` so the shipped lib is
+//! pure source.
 //!
 //! Running the `ncp_test.lua` file from Rust (rather than a dedicated Lua
 //! CLI) keeps the tests inside `cargo test` and avoids a separate toolchain
@@ -42,7 +44,11 @@ fn starter_ncp_unit_tests() {
     install_mock_engine_and_test_helpers(&lua).expect("install mocks");
     set_package_path(&lua).expect("set package.path");
 
-    let ncp_test = lua_dir().join("core").join("ncp_test.lua");
+    let ncp_test = repo_root()
+        .join("tests")
+        .join("lua")
+        .join("core")
+        .join("ncp_test.lua");
     let src = std::fs::read_to_string(&ncp_test)
         .unwrap_or_else(|e| panic!("read {}: {e}", ncp_test.display()));
 

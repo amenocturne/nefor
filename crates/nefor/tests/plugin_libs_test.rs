@@ -3,7 +3,7 @@
 //! Post Phase-2 shape consolidation:
 //!   * `basic-tools`, `nefor-combinators` no longer ship Lua libs —
 //!     their actor-spec wiring is the generic identity passthrough in
-//!     `core.actor.identity_spec`, exercised by `core/actor_test.lua`.
+//!     `core.actor.identity_spec`, exercised by `tests/lua/core/actor_test.lua`.
 //!   * `reasoner-graph` ships only `spawn_graph.lua` (protocol
 //!     primitives); the actor spec is built inline in starter via the
 //!     identity helper.
@@ -185,10 +185,11 @@ fn set_package_path(lua: &Lua, plugin: &str) -> mlua::Result<()> {
 /// Build a Lua VM, install mocks + paths, optionally run a per-test
 /// setup snippet, then load and run the plugin's test file.
 ///
-/// `test_file` is resolved against `<plugin_lua_dir>/<plugin>/` first
-/// (legacy nested layout) then `<plugin_lua_dir>/` (flat layout post
-/// dir-override-by-symlink fix). Plugins still on the nested layout
-/// keep working; nefor-tui uses the flat shape.
+/// The Lua test script lives at repo-root `tests/lua/<plugin>/<file>`.
+/// Test fixtures live outside the shipped lib dirs so the libs are pure
+/// source. The mock-engine + package.path setup still routes
+/// `require("<plugin>...")` into `plugins/<plugin>/lua/`, so the require
+/// resolves from the test-file's new location without further wiring.
 fn run_lua_test(plugin: &str, test_file: &str, setup_script: &str) {
     let lua = Lua::new();
     let shared = std::sync::Arc::new(Shared {
@@ -204,9 +205,11 @@ fn run_lua_test(plugin: &str, test_file: &str, setup_script: &str) {
             .expect("setup script");
     }
 
-    let nested = plugin_lua_dir(plugin).join(plugin).join(test_file);
-    let flat = plugin_lua_dir(plugin).join(test_file);
-    let path = if nested.exists() { nested } else { flat };
+    let path = repo_root()
+        .join("tests")
+        .join("lua")
+        .join(plugin)
+        .join(test_file);
     let src = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     if let Err(e) = lua.load(&src).set_name(path.display().to_string()).exec() {
