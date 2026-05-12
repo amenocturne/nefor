@@ -87,8 +87,8 @@ local ids             = require("core.ids")
 local results_lib     = require("agentic-loop.results")
 local topology        = require("agentic-loop.topology")
 local spawn_graph     = require("reasoner-graph.spawn_graph")
-local replay_window   = require("core.replay_window")
 local history_replay  = require("core.history_replay")
+local replay_window   = history_replay
 local session_config  = require("agentic-loop.session_config")
 local generic_provider = require("libs.generic-provider")
 local generic_tool     = require("libs.generic-tool")
@@ -1222,7 +1222,7 @@ local function restore_active_model_from_session_log()
 end
 
 -- Drive `teardown_for_session_end` from the bus marker. Replay-mode
--- gating is owned by `lib/replay_window`, which subscribes to
+-- gating is owned by `core.history_replay`, which subscribes to
 -- `sessions.replay.start` / `sessions.replay.end` independently — the
 -- old `session_start` / `resume_done` lifecycle hooks are dead weight
 -- now that the gate flips on the framing markers instead.

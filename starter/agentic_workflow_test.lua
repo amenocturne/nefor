@@ -201,13 +201,19 @@ do
   end
 end
 
--- Replay-window gating now lives in `lib/replay_window`, driven by
+-- Replay-window gating now lives in `core.history_replay`, driven by
 -- `sessions.replay.start` / `sessions.replay.end` framing markers.
 -- agentic-loop short-circuits inside `receive_msg` based on the
 -- module's `active()` getter; the test asserts the flip end-to-end by
 -- firing the markers and probing the gate.
+--
+-- The bus subscription is no longer wired at require-time — call sites
+-- (starter/init.lua at runtime, the test driver here) opt in via
+-- `install()`. We invoke it explicitly so `fire_bus` reaches a registered
+-- handler.
 do
-  local replay_window = require("core.replay_window")
+  local replay_window = require("core.history_replay")
+  replay_window.install()
   _test.set_plugins({ "ollama", "reasoner-graph", "nefor-tui" })
 
   _test.fire_bus("sessions.replay.start", { session_id = "new-id", count = 0 })
@@ -582,7 +588,7 @@ end
 -- public-API contract.
 -- ------------------------------------------------------------------
 do
-  local replay_window = require("core.replay_window")
+  local replay_window = require("core.history_replay")
   replay_window.set(true)
   assert_eq(replay_window.active(), true, "replay_window.set(true) must take effect")
   replay_window.set(false)

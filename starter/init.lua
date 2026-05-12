@@ -105,11 +105,12 @@ pm.install({
 -- 2. Dispatch hook + session management
 -------------------------------------------------------------------------
 
-local ncp       = require("core.ncp")
-local actor     = require("core.actor")
-local sessions  = require("sessions")
-local cfg       = require("config").active
-local lead_role = require("lead_role")
+local ncp            = require("core.ncp")
+local actor          = require("core.actor")
+local history_replay = require("core.history_replay")
+local sessions       = require("sessions")
+local cfg            = require("config").active
+local lead_role      = require("lead_role")
 
 function dispatch(current_log)
   ncp.dispatch(current_log)
@@ -120,6 +121,12 @@ function invoke_from_plugin(source, payload)
 end
 
 actor.install()
+-- Install the replay-window bus subscription (defense-in-depth fallback
+-- for the synchronous `history_replay.set` path that sessions drives
+-- around its replay burst). Used to live as a require-time side effect
+-- of the merged-away `core.replay_window` module; now wired explicitly
+-- here so module load stays free of bus dependencies.
+history_replay.install()
 actor.spawn(sessions)
 sessions.init()
 

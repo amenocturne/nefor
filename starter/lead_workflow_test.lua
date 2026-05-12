@@ -337,7 +337,7 @@ do
 
   -- Now simulate /resume: clear actor state, fire replay markers, replay envelopes.
   fresh()
-  local replay_window = require("core.replay_window")
+  local replay_window = require("core.history_replay")
   replay_window.set(true)
 
   -- Replayed envelopes from the on-disk session log: plan A submitted
@@ -371,7 +371,7 @@ end
 -- planApproved survives a replay in the simpler single-plan case too.
 do
   fresh()
-  local replay_window = require("core.replay_window")
+  local replay_window = require("core.history_replay")
   replay_window.set(true)
   feed("step", {
     kind    = "lead-workflow.plan.submitted",
@@ -400,7 +400,7 @@ end
 
 do
   fresh()
-  local replay_window = require("core.replay_window")
+  local replay_window = require("core.history_replay")
   replay_window.set(true)
   feed("step", {
     kind         = "lead-workflow.plan.submitted",
@@ -431,7 +431,7 @@ end
 -- re-emission here).
 do
   fresh()
-  local replay_window = require("core.replay_window")
+  local replay_window = require("core.history_replay")
   replay_window.set(true)
   feed("step", {
     kind         = "lead-workflow.plan.submitted",

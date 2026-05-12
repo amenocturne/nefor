@@ -346,7 +346,7 @@ local function do_resume(target_session_id)
              extra = { session_id = target_session_id, from_resume = true } })
 
   -- 4. Replay framed by start/end markers. Per-wrapper replay-skip
-  -- (lib/replay_window) suppresses bus→peer side effects inside the
+  -- (core.history_replay) suppresses bus→peer side effects inside the
   -- window; pure-Lua actors get the replay normally and rebuild
   -- state. Sessions' own persistence path also drops envelopes inside
   -- the window — see `in_replay_window` flag toggled in receive_msg.

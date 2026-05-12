@@ -73,7 +73,7 @@ fn replay_window_re_feeds_chat_history_into_provider_binary() {
         local op = require("provider")
         local spec = op.spawn_spec("ollama", { "/bin/true" }, {})
         _to_plugin = spec.to_plugin
-        _replay = require("core.replay_window")
+        _replay = require("core.history_replay")
         "#,
     )
     .exec()
@@ -202,7 +202,7 @@ fn cross_wrapper_isolation_unowned_chat_ids_drop() {
         -- instances; the two actor instances don't share state.
         _mock_to_plugin   = op.spawn_spec("mock-plugin", { "/bin/true" }, {}).to_plugin
         _ollama_to_plugin = op.spawn_spec("ollama",      { "/bin/true" }, {}).to_plugin
-        _replay = require("core.replay_window")
+        _replay = require("core.history_replay")
         "#,
     )
     .exec()
@@ -325,7 +325,7 @@ fn in_process_resume_skips_duplicate_chat_create() {
         r#"
         local op = require("provider")
         _to_plugin = op.spawn_spec("ollama", { "/bin/true" }, {}).to_plugin
-        _replay = require("core.replay_window")
+        _replay = require("core.history_replay")
         "#,
     )
     .exec()
@@ -439,10 +439,11 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
     log_tbl.set("debug", no_op.clone())?;
     nefor.set("log", log_tbl)?;
 
-    // bus.on_event — record handlers in a Lua-side registry. The
-    // replay_window module's library load registers a handler here
-    // (defense-in-depth fallback); it's no-op for these tests because
-    // we drive replay_window via its public set() helper.
+    // bus.on_event — accept handler registrations as a no-op. The
+    // history_replay module no longer self-subscribes at require-time
+    // (now wired explicitly by starter/init.lua via
+    // history_replay.install()); these tests drive the replay-window
+    // flag via the module's public set() helper instead.
     let bus_tbl = lua.create_table()?;
     let on_event = lua.create_function(|_, _: mlua::Variadic<Value>| Ok(()))?;
     bus_tbl.set("on_event", on_event)?;
