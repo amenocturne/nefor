@@ -49,13 +49,25 @@ fn chat_lua_source() -> String {
     // real `$HOME/.local/share/nefor`. Centralised here because every
     // chat-surface test reads this function — no per-test wiring.
     ensure_test_data_home();
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
         .expect("repo root")
-        .join("starter")
-        .join("chat.lua");
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {:?}: {e}", path))
+        .to_path_buf();
+    // Tell chat.lua's package.path bootstrap where the nefor-tui plugin
+    // lib lives. In a normal `nefor` run, the engine sets NEFOR_CONFIG_DIR
+    // and chat.lua derives the plugin-lib dir relative to that; tests
+    // load chat.lua directly into the engine's Lua VM (no env from the
+    // engine entry point) so we set the explicit override here.
+    let plugin_lua = repo_root
+        .join("plugins")
+        .join("nefor-tui")
+        .join("lua");
+    if std::env::var_os("NEFOR_TUI_LUA_DIR").is_none() {
+        std::env::set_var("NEFOR_TUI_LUA_DIR", &plugin_lua);
+    }
+    let chat_path = repo_root.join("starter").join("chat.lua");
+    std::fs::read_to_string(&chat_path).unwrap_or_else(|e| panic!("read {:?}: {e}", chat_path))
 }
 
 fn render_str(engine: &mut Engine) -> String {

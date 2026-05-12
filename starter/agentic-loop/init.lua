@@ -82,13 +82,16 @@
 
 local json = nefor.json
 
-local envelope        = require("lib.envelope")
-local ids             = require("lib.ids")
-local results_lib     = require("lib.results")
-local graph_lib       = require("lib.graph")
-local replay_window   = require("lib.replay_window")
-local history_replay  = require("lib.history_replay")
-local session_config  = require("lib.session_config")
+local envelope        = require("core.envelope")
+local ids             = require("core.ids")
+local results_lib     = require("agentic-loop.results")
+local topology        = require("agentic-loop.topology")
+local spawn_graph     = require("reasoner-graph.spawn_graph")
+local replay_window   = require("core.replay_window")
+local history_replay  = require("core.history_replay")
+local session_config  = require("agentic-loop.session_config")
+local generic_provider = require("libs.generic-provider")
+local generic_tool     = require("libs.generic-tool")
 
 -- ------------------------------------------------------------------
 -- module-private state — held in `state` table; mutations are explicit
@@ -138,7 +141,7 @@ local state = {
 -- Reasoner types whose streaming should reach nefor-tui.
 local STREAM_VISIBLE_TYPES = { ["provider-wrapper"] = true }
 
-local SPAWN_GRAPH_SOURCE = graph_lib.SPAWN_GRAPH_SOURCE
+local SPAWN_GRAPH_SOURCE = spawn_graph.SPAWN_GRAPH_SOURCE
 
 local emit           = envelope.emit
 local emit_to        = envelope.emit_to
@@ -206,12 +209,15 @@ end
 local function submit_orchestrator_run(user_text)
   if state.current_run_id ~= nil then return nil end
 
-  local g = graph_lib.build_orchestrator_graph({
+  local g = topology.build_orchestrator_graph({
     provider       = state.config.provider,
     model          = state.config.model,
     system         = state.config.system,
     user_text      = user_text or "",
     tool_allowlist = state.config.tool_allowlist,
+    provider_out   = generic_provider.PROVIDER_OUT,
+    final_answer   = generic_provider.FINAL_ANSWER,
+    tool_calls     = generic_tool.TOOL_CALLS,
   })
 
   if type(state.current_state) == "table"
@@ -1015,15 +1021,26 @@ function M.fire_tool_end_observers(id, output, err) fire_tool_end_observers(id, 
 
 function M.config() return state.config end
 
+-- Public read-only accessor for the orchestrator's current state
+-- (last-seen chat_id, anything else carried forward across firings).
+-- Returns the underlying table or nil — callers must treat the result
+-- as read-only; mutations leak into orchestrator state. Provider
+-- compositors use this to thread the active chat_id into
+-- `chat.model.set` bodies; tests use it to assert state transitions.
+function M.current_state() return state.current_state end
+
 -- Back-compat with agentic_workflow.build_template (used by tests).
 function M.build_template(user_text, opts)
   opts = opts or {}
-  return graph_lib.build_orchestrator_graph({
+  return topology.build_orchestrator_graph({
     provider       = opts.provider       or state.config.provider,
     model          = opts.model          or state.config.model,
     system         = opts.system         or state.config.system,
     user_text      = user_text or "",
     tool_allowlist = opts.tool_allowlist or state.config.tool_allowlist,
+    provider_out   = generic_provider.PROVIDER_OUT,
+    final_answer   = generic_provider.FINAL_ANSWER,
+    tool_calls     = generic_tool.TOOL_CALLS,
   })
 end
 

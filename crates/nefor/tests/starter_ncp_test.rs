@@ -20,12 +20,20 @@ use mlua::{Lua, Value};
 /// Resolve `<repo-root>/starter/`. `CARGO_MANIFEST_DIR` points at the
 /// engine crate (`crates/nefor`), so we walk up two levels.
 fn starter_dir() -> PathBuf {
+    repo_root().join("starter")
+}
+
+fn lua_dir() -> PathBuf {
+    repo_root().join("lua")
+}
+
+fn repo_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest
         .parent()
         .and_then(|p| p.parent())
         .expect("repo root is two levels above crates/nefor")
-        .join("starter")
+        .to_path_buf()
 }
 
 #[test]
@@ -34,7 +42,7 @@ fn starter_ncp_unit_tests() {
     install_mock_engine_and_test_helpers(&lua).expect("install mocks");
     set_package_path(&lua).expect("set package.path");
 
-    let ncp_test = starter_dir().join("ncp_test.lua");
+    let ncp_test = lua_dir().join("core").join("ncp_test.lua");
     let src = std::fs::read_to_string(&ncp_test)
         .unwrap_or_else(|e| panic!("read {}: {e}", ncp_test.display()));
 
@@ -262,15 +270,42 @@ fn install_mock_engine_and_test_helpers(lua: &Lua) -> mlua::Result<()> {
 fn set_package_path(lua: &Lua) -> mlua::Result<()> {
     let starter = starter_dir();
     let starter_str = starter.display().to_string();
+    let lua_root = lua_dir();
+    let lua_root_str = lua_root.display().to_string();
+    let op_plugin_lua = repo_root()
+        .join("plugins")
+        .join("openai-provider")
+        .join("lua");
+    let op_plugin_lua_str = op_plugin_lua.display().to_string();
+    let tg_plugin_lua = repo_root().join("plugins").join("tool-gate").join("lua");
+    let tg_plugin_lua_str = tg_plugin_lua.display().to_string();
+    let rg_plugin_lua = repo_root().join("plugins").join("reasoner-graph").join("lua");
+    let rg_plugin_lua_str = rg_plugin_lua.display().to_string();
     let script = format!(
         r#"
         package.path = table.concat({{
           "{starter}/?.lua",
           "{starter}/?/init.lua",
+          "{op_plugin_lua}/?.lua",
+          "{op_plugin_lua}/?/init.lua",
+          "{tg_plugin_lua}/?.lua",
+          "{tg_plugin_lua}/?/init.lua",
+          "{rg_plugin_lua}/?.lua",
+          "{rg_plugin_lua}/?/init.lua",
+          "{lua_root}/?.lua",
+          "{lua_root}/?/init.lua",
           package.path,
         }}, ";")
+        -- starter Lua code resolves sibling files relative to
+        -- NEFOR_CONFIG_DIR; tests must set it for parity with engine
+        -- startup.
+        NEFOR_CONFIG_DIR = "{starter}"
         "#,
-        starter = starter_str
+        starter = starter_str,
+        lua_root = lua_root_str,
+        op_plugin_lua = op_plugin_lua_str,
+        tg_plugin_lua = tg_plugin_lua_str,
+        rg_plugin_lua = rg_plugin_lua_str,
     );
     lua.load(&script).exec()
 }

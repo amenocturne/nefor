@@ -19,12 +19,20 @@ use std::sync::Mutex;
 use mlua::{Function, Lua, Table, Value};
 
 fn starter_dir() -> PathBuf {
+    repo_root().join("starter")
+}
+
+fn lua_dir() -> PathBuf {
+    repo_root().join("lua")
+}
+
+fn repo_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest
         .parent()
         .and_then(|p| p.parent())
         .expect("repo root is two levels above crates/nefor")
-        .join("starter")
+        .to_path_buf()
 }
 
 // ----------------------------------------------------------------
@@ -48,7 +56,7 @@ fn small_string_output_does_not_dump() {
     let should_dump: bool = lua
         .load(
             r#"
-            local d = require("lib.tool_output_dump")
+            local d = require("tool-gate.tool_output_dump")
             return d.should_dump("small string")
             "#,
         )
@@ -58,7 +66,7 @@ fn small_string_output_does_not_dump() {
 
     // Empty / nil also never dumps.
     let nil_dump: bool = lua
-        .load(r#"return require("lib.tool_output_dump").should_dump(nil)"#)
+        .load(r#"return require("tool-gate.tool_output_dump").should_dump(nil)"#)
         .eval()
         .expect("nil should_dump");
     assert!(!nil_dump, "nil output must not trigger dump");
@@ -91,7 +99,7 @@ fn large_output_writes_full_contents_to_file_and_returns_summary() {
     let setup: Table = lua
         .load(
             r#"
-            local d = require("lib.tool_output_dump")
+            local d = require("tool-gate.tool_output_dump")
             local payload = string.rep("ABCDE\n", 10240)
             local summary, path, err = d.dump("chat-1", "call-42", payload, { tool = "read_file" })
             return { summary = summary, path = path, err = err, payload_len = #payload }
@@ -201,7 +209,7 @@ fn missing_chat_id_falls_back_to_unscoped_directory() {
     let path: String = lua
         .load(
             r#"
-            local d = require("lib.tool_output_dump")
+            local d = require("tool-gate.tool_output_dump")
             local big = string.rep("X", 64 * 1024)
             local _, path, _ = d.dump(nil, "call-99", big, nil)
             return path
@@ -241,7 +249,7 @@ fn table_output_is_json_encoded_for_disk_write() {
     let setup: Table = lua
         .load(
             r#"
-            local d = require("lib.tool_output_dump")
+            local d = require("tool-gate.tool_output_dump")
             -- Build a table whose JSON encoding exceeds the budget.
             local entries = {}
             for i = 1, 4000 do
@@ -301,8 +309,8 @@ fn tool_gate_wrapper_swaps_huge_tool_result_output_to_summary() {
     // small tool.result (must pass through verbatim).
     lua.load(
         r#"
-        local tool_gate = require("tool-gate")
-        local spec = tool_gate.spawn_spec("tool-gate", { "fake-binary" })
+        local tools = require("tools")
+        local spec = tools.gate_spec("tool-gate", { "fake-binary" })
         _from_plugin = spec.from_plugin
 
         local big = string.rep("PAYLOAD-LINE\n", 5000)  -- ~65 KiB
@@ -413,7 +421,7 @@ fn paths_to_check_walks_outermost_first_to_root() {
     let dirs: Table = lua
         .load(
             r#"
-            local d = require("lib.agents_md")
+            local d = require("tool-gate.agents_md")
             return d.paths_to_check("/a/b/c/d.txt")
             "#,
         )
@@ -448,7 +456,7 @@ fn paths_to_check_skips_existing_directory_arg_starting_at_self() {
     let collected: Vec<String> = lua
         .load(&format!(
             r#"
-            local d = require("lib.agents_md")
+            local d = require("tool-gate.agents_md")
             local dirs = d.paths_to_check("{dir}")
             return dirs
             "#,
@@ -499,7 +507,7 @@ fn find_unloaded_skips_already_loaded_paths() {
     let counts: Table = lua
         .load(&format!(
             r#"
-            local d = require("lib.agents_md")
+            local d = require("tool-gate.agents_md")
             d._reset()
             local dirs = {{ "{outer}", "{inner}" }}
             local first = d.find_unloaded_agents_md("chat-1", dirs)
@@ -570,7 +578,7 @@ fn emit_for_tool_call_emits_outer_first_then_inner_with_marker() {
     let result: Table = lua
         .load(&format!(
             r#"
-            local d = require("lib.agents_md")
+            local d = require("tool-gate.agents_md")
             d._reset()
             local emitted = {{}}
             local count = d.emit_for_tool_call("chat-1", "read_file",
@@ -657,7 +665,7 @@ fn emit_for_tool_call_deduplicates_across_calls_in_same_chat() {
     let result: Table = lua
         .load(&format!(
             r#"
-            local d = require("lib.agents_md")
+            local d = require("tool-gate.agents_md")
             d._reset()
             local emitted = {{}}
             local emit = function(body) emitted[#emitted + 1] = body end
@@ -710,7 +718,7 @@ fn emit_for_tool_call_noops_for_non_path_touching_tools() {
     let count: i64 = lua
         .load(
             r#"
-            local d = require("lib.agents_md")
+            local d = require("tool-gate.agents_md")
             d._reset()
             local emitted = {}
             local n = d.emit_for_tool_call("chat-1", "bash",
@@ -742,7 +750,7 @@ fn emit_for_tool_call_skips_empty_agents_md() {
     let count: i64 = lua
         .load(&format!(
             r#"
-            local d = require("lib.agents_md")
+            local d = require("tool-gate.agents_md")
             d._reset()
             local emitted = {{}}
             local n = d.emit_for_tool_call("chat-2", "read_file",
@@ -796,9 +804,9 @@ fn tool_gate_wrapper_emits_agents_md_on_outbound_path_touching_invoke() {
     let touched_str = touched.display().to_string();
     lua.load(&format!(
         r#"
-        require("lib.agents_md")._reset()
-        local tool_gate = require("tool-gate")
-        local spec = tool_gate.spawn_spec("tool-gate", {{ "fake-binary" }})
+        require("tool-gate.agents_md")._reset()
+        local tools = require("tools")
+        local spec = tools.gate_spec("tool-gate", {{ "fake-binary" }})
         spec.to_plugin({{
             -- Path-touching: must trigger AGENTS.md emission.
             {{ type = "event", from = "agentic-loop",
@@ -981,15 +989,35 @@ fn install_agentic_loop_stub(lua: &Lua) -> mlua::Result<()> {
 fn set_package_path(lua: &Lua) -> mlua::Result<()> {
     let starter = starter_dir();
     let starter_str = starter.display().to_string();
+    let lua_root = lua_dir();
+    let lua_root_str = lua_root.display().to_string();
+    let plugin_lua = repo_root().join("plugins").join("tool-gate").join("lua");
+    let plugin_lua_str = plugin_lua.display().to_string();
+    let rg_plugin_lua = repo_root().join("plugins").join("reasoner-graph").join("lua");
+    let rg_plugin_lua_str = rg_plugin_lua.display().to_string();
     let script = format!(
         r#"
         package.path = table.concat({{
           "{starter}/?.lua",
           "{starter}/?/init.lua",
+          "{plugin_lua}/?.lua",
+          "{plugin_lua}/?/init.lua",
+          "{rg_plugin_lua}/?.lua",
+          "{rg_plugin_lua}/?/init.lua",
+          "{lua_root}/?.lua",
+          "{lua_root}/?/init.lua",
           package.path,
         }}, ";")
+        -- starter/tools.lua reaches the plugin lib via
+        -- `require("tool-gate")`. The plugin's `lua/` parent is on
+        -- package.path above so that resolves to
+        -- plugins/tool-gate/lua/tool-gate/init.lua.
+        NEFOR_CONFIG_DIR = "{starter}"
         "#,
-        starter = starter_str
+        starter = starter_str,
+        lua_root = lua_root_str,
+        plugin_lua = plugin_lua_str,
+        rg_plugin_lua = rg_plugin_lua_str,
     );
     lua.load(&script).exec()
 }

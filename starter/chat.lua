@@ -20,44 +20,81 @@
 --   chat.input.submit, chat.interrupt, chat.interrupt_all, chat.reset,
 --   chat.command, tool.permission_response.
 
-------------------------------------------------------------------------
--- helpers
-------------------------------------------------------------------------
+-- The nefor-tui binary loads this file via `--script chat.lua`. Its
+-- embedded Lua VM starts with a vanilla package.path; locate the plugin
+-- lib's `lua/` dir and install a searcher that resolves `nefor-tui`
+-- and `nefor-tui.<sub>` requires against it. A custom searcher avoids
+-- the filesystem mutation a path graft would need (the lib's init.lua
+-- sits directly at `<lua-dir>/init.lua` rather than `<lua-dir>/<name>/`).
+do
+  local function path_exists(p)
+    local f = io.open(p, "r")
+    if f == nil then return false end
+    f:close()
+    return true
+  end
+  local candidates = {}
+  local explicit = os.getenv("NEFOR_TUI_LUA_DIR")
+  if explicit and explicit ~= "" then
+    candidates[#candidates + 1] = explicit
+  end
+  local config_dir = os.getenv("NEFOR_CONFIG_DIR")
+  if config_dir and config_dir ~= "" then
+    candidates[#candidates + 1] = config_dir .. "/../plugins/nefor-tui/lua"
+  end
+  candidates[#candidates + 1] = "./plugins/nefor-tui/lua"
+  candidates[#candidates + 1] = "../plugins/nefor-tui/lua"
 
-local function map(list, fn)
-  local out = {}
-  for i, v in ipairs(list) do out[i] = fn(v, i) end
-  return out
-end
-
--- Sentinel for `nil`-as-set-value in shallow_merge — Lua's `pairs`
--- doesn't yield keys mapped to nil, so passing `{ x = nil }` to a merge
--- can't distinguish "unset x" from "leave x alone". Wrap a nil as
--- `NIL_SENTINEL` to force the merge to clear the key.
-local NIL_SENTINEL = {}
-
-local function shallow_merge(a, b)
-  local out = {}
-  for k, v in pairs(a) do out[k] = v end
-  for k, v in pairs(b) do
-    if v == NIL_SENTINEL then
-      out[k] = nil
-    else
-      out[k] = v
+  local lua_dir
+  for _, c in ipairs(candidates) do
+    if path_exists(c .. "/init.lua") then
+      lua_dir = c
+      break
     end
   end
-  return out
+  if lua_dir == nil then
+    error("starter/chat.lua: could not locate plugins/nefor-tui/lua/init.lua")
+  end
+
+  local PREFIX = "nefor-tui"
+  local searchers = package.searchers or package.loaders
+  table.insert(searchers, 1, function(name)
+    if name ~= PREFIX and name:sub(1, #PREFIX + 1) ~= PREFIX .. "." then
+      return nil
+    end
+    local rel
+    if name == PREFIX then
+      rel = "/init.lua"
+    else
+      -- nefor-tui.widget.popup -> /widget/popup.lua (with init.lua fallback)
+      local sub = name:sub(#PREFIX + 2):gsub("%.", "/")
+      rel = "/" .. sub .. ".lua"
+    end
+    local file_path = lua_dir .. rel
+    if not path_exists(file_path) then
+      local init_path = lua_dir .. rel:gsub("%.lua$", "/init.lua")
+      if path_exists(init_path) then file_path = init_path
+      else return "\n\tno file " .. file_path end
+    end
+    local chunk, err = loadfile(file_path)
+    if chunk == nil then return "\n\t" .. tostring(err) end
+    return chunk, file_path
+  end)
 end
 
--- Compact a list that may contain nils. We can't use `ipairs` because it
--- stops at the first nil (a fundamental quirk of Lua's array semantics:
--- `{ a, nil, c }` has length 1 from ipairs's perspective). Instead, walk
--- a numeric range up to the table's "border" approximated by `#list`,
--- but inspect every slot manually so trailing entries past a nil hole
--- are visited.
+local tui_lib       = require("nefor-tui")
+local W             = tui_lib.widget
+local _util         = tui_lib.util
+local bordered_box  = _util.bordered_box
+local shallow_merge = _util.shallow_merge
+local NIL_SENTINEL  = _util.NIL
+
+-- Drop nil holes from an array so reducer-built children lists stay
+-- dense. Lua's table constructor with conditionally-nil entries leaves
+-- gaps that break `ipairs`; the renderer relies on contiguous indices.
 local function compact(list)
   local out = {}
-  -- Find the highest-set numeric key so we cover holes safely.
+  if list == nil then return out end
   local maxn = 0
   for k, _ in pairs(list) do
     if type(k) == "number" and k > maxn then maxn = k end
@@ -752,140 +789,6 @@ local function md(source)
 end
 
 ------------------------------------------------------------------------
--- bordered-box composition
---
--- Full-width rounded-corner box around an arbitrary child:
---   ╭──────────…──────╮
---   │ <child>         │
---   │ <child row 2>   │
---   ╰──────────…──────╯
---
--- Built from primitives — corners are `tui.text`, the rules are
--- `tui.expanded { child = tui.fill { char = "─" } }`, the side bars
--- are `tui.fill { char = "│" }` constrained to 1 column wide. The
--- side-bar fills inherit cross-axis stretch from the body row (CSS
--- `align-items: stretch` default in the `row`/`column` layout): if the
--- body is 4 rows tall, the side bars stretch to 4 rows automatically.
--- Without that stretch, a `tui.text { content = "│" }` side bar would
--- only paint row 0 and leave rows 1+ unbordered — the canonical
--- "popup with a missing border" bug.
---
--- Each rule row is still wrapped in `constrained { max_height = 1 }`
--- as defence-in-depth: the corner glyphs are 1-row tall so the row's
--- natural cross resolves to 1 anyway, but the explicit cap makes the
--- intent obvious in the source.
-------------------------------------------------------------------------
-
-local function rule_row(left_corner, right_corner, style)
-  return tui.constrained {
-    max_height = 1,
-    child = tui.row {
-      gap = 0,
-      children = {
-        tui.text { content = left_corner,  style = style, wrap = "none" },
-        tui.expanded { child = tui.fill { char = "─", style = style } },
-        tui.text { content = right_corner, style = style, wrap = "none" },
-      },
-    },
-  }
-end
-
--- Bordered box around `child`. `border_style` colors the corners,
--- rules, and side bars. Optional `key` stamps the outer column with a
--- stable user-key so the reconciler reuses the instance across renders
--- where the parent column's child positions shift (e.g. the input
--- field needs to keep text_input's per-instance cursor when the slash
--- autocomplete dropdown opens above it and pushes the input down a
--- slot — without a key, the column's `(type, position)` identity
--- changes and the whole subtree re-mounts, dropping cursor state).
-local function bordered_box(child, border_style, key)
-  local side_bar = tui.constrained {
-    max_width = 1,
-    child = tui.fill { char = "│", style = border_style },
-  }
-  local body_row = tui.row {
-    gap = 0,
-    children = {
-      side_bar,
-      -- Inset the body 1 col on each side so it doesn't touch the
-      -- side bars. `tui.padding` reports `(child + h_pad, child)` so
-      -- the body row's natural cross stays = the child's height; the
-      -- side-bar fills then stretch to that height.
-      tui.expanded {
-        child = tui.padding { left = 1, right = 1, top = 0, bottom = 0, child = child },
-      },
-      side_bar,
-    },
-  }
-  return tui.column {
-    gap = 0,
-    key = key,
-    children = {
-      rule_row("╭", "╮", border_style),
-      body_row,
-      rule_row("╰", "╯", border_style),
-    },
-  }
-end
-
--- `bordered_box` variant for popups anchored to a fixed height. The
--- outer column distributes space top-down, non-flex first: when the
--- body's natural height ≥ the popup's allocated height it consumes the
--- full budget and the bottom rule is starved — the canonical "popup
--- with no bottom rule" bug.
---
--- Fix: make the body row flex (`tui.expanded`). Flex children skip
--- pass 1 and only get whatever's left after the two non-flex rule rows
--- claim their 1-row budget each, so the bottom `╰────╯` always paints.
--- Inside the flex body we wrap content in `tui.scrollable` so popup
--- bodies of any length render — the user can scroll if content
--- exceeds the visible area.
-local function bordered_popup(scroll_key, child, border_style)
-  local side_bar = tui.constrained {
-    max_width = 1,
-    child = tui.fill { char = "│", style = border_style },
-  }
-  -- Opaque background INSIDE the popup so transcript text behind the
-  -- box doesn't bleed through the empty rows below the natural content
-  -- height. Without this, a popup whose content is shorter than the
-  -- 50%-height shell shows transcript characters in the dead space
-  -- (e.g. transcript-text-on-top-of-permission-popup leaks). The fill
-  -- char is a normal space; ratatui's render path writes a glyph at
-  -- every cell, which paints over whatever the layer below put there.
-  local body_bg = tui.fill { char = " " }
-  local body_row = tui.row {
-    gap = 0,
-    children = {
-      side_bar,
-      tui.expanded {
-        child = tui.stack {
-          children = {
-            body_bg,
-            tui.padding {
-              left = 1, right = 1, top = 0, bottom = 0,
-              child = tui.scrollable {
-                key       = scroll_key,
-                scrollbar = "auto",
-                child     = child,
-              },
-            },
-          },
-        },
-      },
-      side_bar,
-    },
-  }
-  return tui.column {
-    gap = 0,
-    children = {
-      rule_row("╭", "╮", border_style),
-      tui.expanded { child = body_row },
-      rule_row("╰", "╯", border_style),
-    },
-  }
-end
-
-------------------------------------------------------------------------
 -- entry rendering — per legacy spec section 5
 ------------------------------------------------------------------------
 
@@ -1344,26 +1247,19 @@ Slash commands:
 
 local function popup_help(state)
   if not state.popup or state.popup.variant ~= "help" then return nil end
-  return tui.anchored {
-    anchor = "center",
-    width  = "60%",
-    height = "60%",
-    child  = bordered_popup(
-      "popup_help",
-      tui.padding {
-        value = 1,
-        child = tui.column {
-          gap = 1,
-          children = {
-            tui.text { content = "── help ──", style = STYLE.popup_user },
-            tui.text { content = HELP_BODY, wrap = "word" },
-            tui.text { content = "(Esc / Q / Enter to close)", style = STYLE.status_dim },
-          },
-        },
-      },
-      STYLE.popup_user
-    ),
-  }
+  return W.popup.view({
+    open         = true,
+    border_style = STYLE.popup_user,
+    width        = "60%",
+    height       = "60%",
+    scroll_key   = "popup_help",
+    title        = "── help ──",
+    title_style  = STYLE.popup_user,
+    child        = tui.column { gap = 1, children = {
+      tui.text { content = HELP_BODY, wrap = "word" },
+      tui.text { content = "(Esc / Q / Enter to close)", style = STYLE.status_dim },
+    }},
+  })
 end
 
 local function popup_message(state)
@@ -1379,62 +1275,45 @@ local function popup_message(state)
     title_style, glyph, border_style = STYLE.popup_danger, "✕", STYLE.popup_danger
   end
   local title = string.format(" %s %s %s ", v, glyph, state.popup.title or "")
-  return tui.anchored {
-    anchor = "center",
-    width  = "60%",
-    height = "50%",
-    child  = bordered_popup(
-      "popup_message",
-      tui.padding {
-        value = 1,
-        child = tui.column {
-          gap = 1,
-          children = compact {
-            tui.text { content = title, style = title_style },
-            tui.markdown { source = state.popup.body or "", theme = MARKDOWN_THEME, wrap = "word" },
-            state.popup.source and tui.text {
-              content = "from: " .. state.popup.source,
-              style   = STYLE.footer,
-            } or nil,
-            tui.text { content = "Esc / Q to close", style = STYLE.status_dim },
-          },
-        },
-      },
-      border_style
-    ),
-  }
+  return W.popup.view({
+    open         = true,
+    border_style = border_style,
+    width        = "60%",
+    height       = "50%",
+    scroll_key   = "popup_message",
+    title        = title,
+    title_style  = title_style,
+    child        = tui.column { gap = 1, children = compact {
+      tui.markdown { source = state.popup.body or "", theme = MARKDOWN_THEME, wrap = "word" },
+      state.popup.source and tui.text {
+        content = "from: " .. state.popup.source,
+        style   = STYLE.footer,
+      } or nil,
+      tui.text { content = "Esc / Q to close", style = STYLE.status_dim },
+    }},
+  })
 end
 
 -- Tool permission popup (spec section 12). Border is HL_STATUS_WARN;
 -- footer reads `[A]pprove [D]eny (ESC = deny)`. Keyhandlers in update.
 local function popup_tool_permission(state)
   if not state.popup or state.popup.variant ~= "tool_permission" then return nil end
-  return tui.anchored {
-    anchor = "center",
-    width  = "60%",
-    height = "50%",
-    child  = bordered_popup(
-      "popup_tool_permission",
-      tui.padding {
-        value = 1,
-        child = tui.column {
-          gap = 1,
-          children = {
-            tui.text {
-              content = " permission requested · " .. (state.popup.tool or "?"),
-              style   = STYLE.popup_warn,
-            },
-            tui.text { content = state.popup.body or "", wrap = "word" },
-            tui.text {
-              content = "[A]pprove   [D]eny   (Esc = deny)",
-              style   = STYLE.status_warn,
-            },
-          },
-        },
+  return W.popup.view({
+    open         = true,
+    border_style = STYLE.popup_warn,
+    width        = "60%",
+    height       = "50%",
+    scroll_key   = "popup_tool_permission",
+    title        = " permission requested · " .. (state.popup.tool or "?"),
+    title_style  = STYLE.popup_warn,
+    child        = tui.column { gap = 1, children = {
+      tui.text { content = state.popup.body or "", wrap = "word" },
+      tui.text {
+        content = "[A]pprove   [D]eny   (Esc = deny)",
+        style   = STYLE.status_warn,
       },
-      STYLE.popup_warn
-    ),
-  }
+    }},
+  })
 end
 
 -- Filter the model picker's `models` list against the typed query.
@@ -1693,74 +1572,57 @@ end
 --   │ MM-DD HH:MM  <preview>   │
 --   │ ↑/↓ Enter pick · Esc     │
 --   ╰──────────────────────────╯
+local CURSOR_ROW_STYLE = { fg = "#000000", bg = C.user }
+
 local function popup_session_picker(state)
   if not state.popup or state.popup.variant ~= "session_picker" then return nil end
   local p = state.popup
   local sessions = p.sessions or {}
-  local cursor = p.cursor or 1
-  if cursor < 1 then cursor = 1 end
-  if cursor > #sessions and #sessions > 0 then cursor = #sessions end
-
-  local body_rows = {}
-  if #sessions == 0 then
-    body_rows[#body_rows + 1] = tui.text {
+  local empty_child = tui.column { gap = 0, children = {
+    tui.text {
       content = "No saved sessions found.",
       style   = STYLE.status_dim, wrap = "word",
-    }
-    body_rows[#body_rows + 1] = tui.text {
+    },
+    tui.text {
       content = "Sessions live at " .. (session_dir() or "<unknown>"),
       style   = STYLE.status_dim, wrap = "word",
-    }
+    },
+  }}
+  local picker_body
+  if #sessions == 0 then
+    picker_body = empty_child
   else
-    -- Window the visible rows around the cursor.
-    local cap = 12
-    local first = 1
-    if #sessions > cap then
-      first = math.max(1, math.min(cursor - cap + 1, #sessions - cap + 1))
-      if first < 1 then first = 1 end
-    end
-    local last = math.min(first + cap - 1, #sessions)
-    for i = first, last do
-      local s = sessions[i]
-      local stamp = format_started_at(s.started_at)
-      local preview = clip_preview(s.preview, 50)
-      local row = string.format("%-12s  %s", stamp, preview)
-      local style = (i == cursor)
-        and { fg = "#000000", bg = C.user }
-        or  STYLE.status
-      body_rows[#body_rows + 1] = tui.text {
-        content = row, style = style, wrap = "none",
-      }
-    end
+    picker_body = W.picker.view({
+      state        = { cursor = p.cursor or 1 },
+      entries      = function() return sessions end,
+      format_entry = function(s)
+        local stamp = format_started_at(s.started_at)
+        local preview = clip_preview(s.preview, 50)
+        return string.format("%-12s  %s", stamp, preview)
+      end,
+      cursor_style = CURSOR_ROW_STYLE,
+      row_style    = STYLE.status,
+      show_search  = false,
+      cap          = 12,
+    })
   end
-
-  local children = {
-    tui.text {
-      content = "── resume a session ──",
-      style   = STYLE.popup_user,
-      wrap    = "none",
-    },
-    tui.column { gap = 0, children = body_rows },
-    tui.text {
-      content = "↑/↓ select · Enter resume · Esc cancel",
-      style   = STYLE.status_dim,
-      wrap    = "none",
-    },
-  }
-
-  return tui.anchored {
-    anchor = "center",
-    width  = "70%",
-    height = "60%",
-    child  = bordered_popup(
-      "popup_session_picker",
-      tui.padding {
-        value = 1,
-        child = tui.column { gap = 1, children = children },
+  return W.popup.view({
+    open         = true,
+    border_style = STYLE.popup_user,
+    width        = "70%",
+    height       = "60%",
+    scroll_key   = "popup_session_picker",
+    title        = "── resume a session ──",
+    title_style  = STYLE.popup_user,
+    child        = tui.column { gap = 1, children = {
+      picker_body,
+      tui.text {
+        content = "↑/↓ select · Enter resume · Esc cancel",
+        style   = STYLE.status_dim,
+        wrap    = "none",
       },
-      STYLE.popup_user
-    ),
-  }
+    }},
+  })
 end
 
 -- Model picker popup (spec section 12). Border is HL_USER. Layout:
@@ -1775,99 +1637,59 @@ local function popup_model_picker(state)
   if not state.popup or state.popup.variant ~= "model_picker" then return nil end
   local p = state.popup
   local matches = model_picker_filter(p.models, p.query)
-  local cursor = p.cursor or 1
-  if cursor < 1 then cursor = 1 end
-  if cursor > #matches and #matches > 0 then cursor = #matches end
-  -- Determine widest provider name for column alignment.
   local prov_w = 0
   for _, e in ipairs(matches) do
     if e.provider and #e.provider > prov_w then prov_w = #e.provider end
   end
   if prov_w > 20 then prov_w = 20 end
 
-  local body_rows = {}
-  if #matches == 0 then
-    if awaiting_count(p.awaiting) == 0 and (p.models == nil or #p.models == 0) then
-      body_rows[#body_rows + 1] = tui.text {
-        content = "No providers connected.",
-        style   = STYLE.status_dim, wrap = "word",
-      }
-      body_rows[#body_rows + 1] = tui.text {
-        content = "Wire one up in init.lua (see docs/provider-plugins.md).",
-        style   = STYLE.status_dim, wrap = "word",
-      }
-    else
-      body_rows[#body_rows + 1] = tui.text {
-        content = "(no matches)",
-        style   = STYLE.status_dim, wrap = "none",
-      }
-    end
-  else
-    -- Window the visible rows around the cursor so a long list scrolls.
-    local cap = 12
-    local first = 1
-    if #matches > cap then
-      first = math.max(1, math.min(cursor - cap + 1, #matches - cap + 1))
-      if first < 1 then first = 1 end
-    end
-    local last = math.min(first + cap - 1, #matches)
-    for i = first, last do
-      local e = matches[i]
-      local row = string.format("%-" .. prov_w .. "s  %s", e.provider or "?", e.model or "?")
-      local style = (i == cursor)
-        and { fg = "#000000", bg = C.user }
-        or  STYLE.status
-      body_rows[#body_rows + 1] = tui.text {
-        content = row, style = style, wrap = "none",
-      }
-    end
+  local empty_text
+  if awaiting_count(p.awaiting) == 0 and (p.models == nil or #p.models == 0) then
+    empty_text = "No providers connected.\nWire one up in init.lua (see docs/provider-plugins.md)."
   end
 
+  local picker_body = W.picker.view({
+    state          = { cursor = p.cursor or 1, query = p.query or "" },
+    entries        = function() return p.models or {} end,
+    filter         = function(_, q) return model_picker_filter(p.models, q) end,
+    format_entry   = function(e)
+      return string.format("%-" .. prov_w .. "s  %s", e.provider or "?", e.model or "?")
+    end,
+    cursor_style   = CURSOR_ROW_STYLE,
+    row_style      = STYLE.status,
+    search_style   = STYLE.status,
+    divider_style  = STYLE.footer,
+    empty_style    = STYLE.status_dim,
+    empty_text     = empty_text,
+    cap            = 12,
+    gap            = 0,
+  })
+
   local awaiting_n = awaiting_count(p.awaiting)
-  local children = {
-    tui.text {
-      content = "── pick a model ──",
-      style   = STYLE.popup_user,
-      wrap    = "none",
-    },
-    tui.text {
-      content = "search: " .. (p.query or ""),
-      style   = STYLE.status,
-      wrap    = "none",
-    },
-    tui.text {
-      content = string.rep("─", 40),
-      style   = STYLE.footer,
-      wrap    = "none",
-    },
-    tui.column { gap = 0, children = body_rows },
-  }
-  if awaiting_n > 0 then
-    children[#children + 1] = tui.text {
+  local children = compact {
+    picker_body,
+    (awaiting_n > 0) and tui.text {
       content = string.format("loading from %d provider(s)…", awaiting_n),
       style   = STYLE.status_dim,
       wrap    = "none",
-    }
-  end
-  children[#children + 1] = tui.text {
-    content = "↑/↓ select · Enter pick · Esc close · type to filter",
-    style   = STYLE.status_dim,
-    wrap    = "none",
+    } or nil,
+    tui.text {
+      content = "↑/↓ select · Enter pick · Esc close · type to filter",
+      style   = STYLE.status_dim,
+      wrap    = "none",
+    },
   }
 
-  return tui.anchored {
-    anchor = "center",
-    width  = "60%",
-    height = "60%",
-    child  = bordered_popup(
-      "popup_model_picker",
-      tui.padding {
-        value = 1,
-        child = tui.column { gap = 1, children = children },
-      },
-      STYLE.popup_user
-    ),
-  }
+  return W.popup.view({
+    open         = true,
+    border_style = STYLE.popup_user,
+    width        = "60%",
+    height       = "60%",
+    scroll_key   = "popup_model_picker",
+    title        = "── pick a model ──",
+    title_style  = STYLE.popup_user,
+    child        = tui.column { gap = 1, children = children },
+  })
 end
 
 -- Toast = ephemeral, non-blocking (e.g., "copied N chars").
@@ -2031,59 +1853,55 @@ local function popup_toast(_state)
 end
 
 ------------------------------------------------------------------------
--- slash autocomplete (inline above input, NOT centered overlay)
+-- slash + @-path autocomplete (inline above input)
 ------------------------------------------------------------------------
+--
+-- Both dropdowns reuse `W.picker.view` — the picker widget renders a
+-- windowed list with cursor-row inversion (same shape as the legacy
+-- inline popup). Slash filtering and @-path entry resolution are
+-- driven by the reducer's `state.slash.matches` / `state.at_complete.
+-- matches` (computed by `refresh_slash` / `refresh_at_complete`),
+-- which keeps this view-time call purely cosmetic.
 
--- Shared row-list popup. Both slash and @-path autocomplete use this:
--- a vertically-stacked list of rows, the cursor row inverted on
--- C.user, the visible window scrolled to keep the cursor in view.
--- `rows` is a list of strings; `cursor` is the 1-based selection
--- index; `empty_text` renders alone when rows is empty.
-local function autocomplete_popup(rows, cursor, empty_text)
-  if #rows == 0 then
+local function inline_picker_list(matches, cursor, format_entry, empty_text)
+  if #matches == 0 then
     return tui.text {
       content = empty_text or "no matches",
       style   = STYLE.status_dim,
       wrap    = "none",
     }
   end
-  local cap = 8
-  cursor = cursor or 1
-  local first = math.max(1, math.min(cursor - cap + 1, #rows - cap + 1))
-  if first < 1 then first = 1 end
-  local last = math.min(first + cap - 1, #rows)
-  local children = {}
-  for i = first, last do
-    local is_cursor = (i == cursor)
-    children[#children + 1] = tui.text {
-      content = rows[i],
-      style   = is_cursor and { fg = "#000000", bg = C.user } or nil,
-      wrap    = "none",
-    }
-  end
-  return tui.column { gap = 0, children = children }
+  return W.picker.view({
+    state        = { cursor = cursor or 1 },
+    entries      = function() return matches end,
+    format_entry = format_entry,
+    cursor_style = CURSOR_ROW_STYLE,
+    show_search  = false,
+    cap          = 8,
+    gap          = 0,
+  })
 end
 
 local function slash_autocomplete_inline(state)
   if not state.slash then return nil end
-  local matches = state.slash.matches or {}
-  local rows = {}
-  for i, cmd in ipairs(matches) do
-    rows[i] = string.format("/%-12s  %s", cmd.name, cmd.hint or "")
-  end
-  return autocomplete_popup(rows, state.slash.cursor, "no matching commands")
+  return inline_picker_list(
+    state.slash.matches or {}, state.slash.cursor,
+    function(cmd) return string.format("/%-12s  %s", cmd.name, cmd.hint or "") end,
+    "no matching commands"
+  )
 end
 
 local function at_autocomplete_inline(state)
   if not state.at_complete then return nil end
-  local matches = state.at_complete.matches or {}
-  local rows = {}
-  for i, e in ipairs(matches) do
-    -- Trailing `/` on directories so the user can see at a glance
-    -- which entries are drillable.
-    rows[i] = e.is_dir and (e.name .. "/") or e.name
-  end
-  return autocomplete_popup(rows, state.at_complete.cursor, "no matching paths")
+  return inline_picker_list(
+    state.at_complete.matches or {}, state.at_complete.cursor,
+    function(e)
+      -- Trailing `/` on directories so the user can see at a glance
+      -- which entries are drillable.
+      return e.is_dir and (e.name .. "/") or e.name
+    end,
+    "no matching paths"
+  )
 end
 
 ------------------------------------------------------------------------
@@ -2294,51 +2112,26 @@ local function welcome_banner()
 end
 
 local function transcript(state)
-  local entries = state.entries or {}
-  local widgets = {}
-  for i, e in ipairs(entries) do
-    widgets[#widgets + 1] = render_entry(e, i, state.expanded_details)
+  -- Welcome banner shows on a fresh surface only; the chat widget's
+  -- `empty_view` slot accepts a fn returning the banner tree, which it
+  -- stacks over an empty scrollable so scroll_position keeps resolving.
+  -- Replay-mode opt-out: between sessions.replay.start and the first
+  -- replayed chat.message.append, the transcript is briefly empty AND
+  -- we're rebuilding. Painting the banner here would flash the welcome
+  -- copy in the middle of a resume.
+  local empty_view
+  if state.in_flight == nil and not state.pending and not state.replay_mode then
+    empty_view = welcome_banner
   end
-  -- Append thinking indicator inline at the bottom when pending.
-  local think = thinking_widget(state)
-  if think then widgets[#widgets + 1] = think end
-  local scroll = tui.scrollable {
-    key        = "transcript",
-    stick_to   = "end",
-    scrollbar  = "auto",
-    -- Drag-to-select scopes to this widget. Drags past the transcript's
-    -- edge clamp at the rect, so a selection that strays into the
-    -- sidebar / input / statusline doesn't paint highlight or copy text
-    -- from those panels. Other read-output surfaces (DAG sidebar, status
-    -- row) are deliberately not marked `selectable`: clicks there
-    -- bubble as `mouse.click` without opening a selection.
-    selectable = true,
-    -- 1-cell right padding so wrapped lines don't visually clash into
-    -- the scrollbar's column.
-    child      = tui.padding {
-      value = { top = 0, right = 1, bottom = 0, left = 0 },
-      child = tui.column { gap = 1, children = widgets },
-    },
-  }
-  -- Fresh surface (no entries, not currently streaming a turn): paint
-  -- the welcome banner OVER the empty scrollable in a stack. We keep
-  -- the scrollable mounted so `tui.scroll_position("transcript")`
-  -- queries (and any tests / shortcuts that use them) keep resolving —
-  -- the banner is purely visual chrome on top of an empty viewport.
-  --
-  -- Replay-mode opt-out: between sessions.replay.start (window opens)
-  -- and the first replayed chat.message.append, the transcript is
-  -- briefly empty AND we're rebuilding. Painting the banner here would
-  -- flash the welcome copy in the middle of a resume. The replay_mode
-  -- gate suppresses it for that window.
-  if #entries == 0 and state.in_flight == nil
-     and not state.pending and not state.replay_mode then
-    local banner = welcome_banner()
-    if banner ~= nil then
-      return tui.stack { children = { scroll, banner } }
-    end
-  end
-  return scroll
+  return W.chat.view({
+    key          = "transcript",
+    entries      = function() return state.entries or {} end,
+    render_entry = function(e, i)
+      return render_entry(e, i, state.expanded_details)
+    end,
+    append       = thinking_widget(state),
+    empty_view   = empty_view,
+  })
 end
 
 -- Keep the engine's render loop alive at ~1Hz while any per-second
@@ -2391,38 +2184,25 @@ local function view(state)
   local input_border_style = input_focused
     and STYLE.input_border
     or STYLE.input_border_unfocused
-  local input_field = bordered_box(
-    tui.text_input {
-      key       = "input",
-      value     = state.input_value,
-      -- A popup that wants to absorb single-char keys (tool permission
-      -- with [A]/[D]) needs the input to drop focus while open; the
-      -- engine routes editing keys only to a `focused = true` input,
-      -- so single chars otherwise vanish into the buffer.
-      focused   = input_focused,
-      on_change = "input.changed",
-      on_submit = "input.submit",
-      min_lines = 1,
-      max_lines = 6,
-      -- Drag-to-select the displayed text — the same transcript-style
-      -- copy mechanism the chat scrollable uses. Click without drag
-      -- still bubbles as a `mouse.click` (no cursor positioning today;
-      -- typing into the focused input continues to work as before).
-      -- The input's internal editing-cursor state is unchanged.
-      selectable = true,
-      -- No placeholder text: the bordered input below the transcript is
-      -- self-explanatory, and a default hint just adds visual noise the
-      -- user has to read past on every render. Slash-commands are
-      -- discoverable via `/` autocomplete; help via `/help`.
-    },
-    input_border_style,
-    -- Stable user-key on the bordered_box's outer column so the
-    -- reconciler reuses the text_input instance (preserving cursor +
-    -- selection + scroll) across renders that change main_column's
-    -- child count — notably when the slash autocomplete dropdown
-    -- appears or vanishes between the body row and the input.
-    "input-field"
-  )
+  -- Input renders as a bordered text input. The prompt widget's
+  -- completion plumbing isn't used here — chat.lua maintains its own
+  -- slash / at-path completion state in the reducer with bespoke
+  -- behaviour (filesystem source for @, command registry for /, custom
+  -- apply semantics). The autocomplete dropdowns are rendered inline
+  -- above the input via slash_autocomplete_inline / at_autocomplete_inline
+  -- and produce the same column layout the prompt widget would.
+  local input_field = W.prompt.view({
+    state          = { value = state.input_value },
+    key            = "input",
+    focused        = input_focused,
+    on_change      = "input.changed",
+    on_submit      = "input.submit",
+    border_style   = input_border_style,
+    border_key     = "input-field",
+    min_lines      = 1,
+    max_lines      = 6,
+    selectable     = true,
+  })
 
   -- One-row blank spacer reused at the top of the chat column and
   -- the bottom (above the statusline). The sidebar gets no spacer:
@@ -3253,104 +3033,65 @@ local function update(msg, state)
   -- cursor through the filtered list; Enter emits chat.model.set for
   -- the cursor row + closes; Backspace and printable chars edit the
   -- filter query (re-clamping cursor against the new filtered count).
-  if state.popup and state.popup.variant == "model_picker" then
+  -- Model + session picker popups: delegate cursor/filter handling to
+  -- W.picker.handle. Each popup's state lives under `state.popup`;
+  -- when a handler returns, we fold its state patch into the popup
+  -- slot and emit effects through the caller-side on_select callback.
+  -- We gate the picker delegation on key.* events so non-key messages
+  -- (chat.models.listed, chat.model.set_ack, etc.) keep flowing to
+  -- their dedicated handlers below.
+  if state.popup and state.popup.variant == "model_picker"
+     and kind:sub(1, 4) == "key." then
     local p = state.popup
-    local filtered = model_picker_filter(p.models, p.query)
-    if kind == "key.up" or kind == "key.down" then
-      if #filtered == 0 then return state, {} end
-      local cur = p.cursor or 1
-      cur = (kind == "key.up") and (cur - 1) or (cur + 1)
-      if cur < 1 then cur = #filtered end
-      if cur > #filtered then cur = 1 end
-      return shallow_merge(state, {
-        popup = shallow_merge(p, { cursor = cur }),
-      }), {}
-    end
-    if kind == "key.enter" then
-      if #filtered == 0 then return state, {} end
-      local sel = filtered[p.cursor or 1] or filtered[1]
-      if not sel then return state, {} end
-      return shallow_merge(state, { popup = NIL_SENTINEL }), {
-        { kind = "send_to", target = "engine",
-          body = {
-            kind     = "chat.model.set",
-            provider = sel.provider,
-            model    = sel.model,
-          } },
-      }
-    end
-    if kind == "key.backspace" then
-      local q = p.query or ""
-      if #q > 0 then q = q:sub(1, #q - 1) end
-      return shallow_merge(state, {
-        popup = shallow_merge(p, { query = q, cursor = 1 }),
-      }), {}
-    end
-    -- Printable single-char filter input. The engine surfaces these as
-    -- `key.<ch>` events when the input field has dropped focus (which
-    -- it has — see `popup_owns_keys` above). `key.space` is a special
-    -- name we have to map back to a literal space.
-    if kind == "key.space" then
-      return shallow_merge(state, {
-        popup = shallow_merge(p, {
-          query  = (p.query or "") .. " ",
-          cursor = 1,
-        }),
-      }), {}
-    end
-    if kind:sub(1, 4) == "key." and #kind == 5 then
-      local ch = kind:sub(5, 5)
-      -- Filter pure printable ASCII characters into the query.
-      local b = string.byte(ch)
-      if b and b >= 33 and b <= 126 then
-        return shallow_merge(state, {
-          popup = shallow_merge(p, {
-            query  = (p.query or "") .. ch,
-            cursor = 1,
-          }),
-        }), {}
+    local result = W.picker.handle({
+      state   = { cursor = p.cursor or 1, query = p.query or "" },
+      entries = function() return p.models or {} end,
+      filter  = function(_, q) return model_picker_filter(p.models, q) end,
+    }, msg)
+    if result ~= nil then
+      if result.selected ~= nil then
+        return shallow_merge(state, { popup = NIL_SENTINEL }), {
+          { kind = "send_to", target = "engine",
+            body = {
+              kind     = "chat.model.set",
+              provider = result.selected.provider,
+              model    = result.selected.model,
+            } },
+        }
       end
+      return shallow_merge(state, {
+        popup = shallow_merge(p, result.state),
+      }), {}
     end
   end
 
-  -- Session picker popup keys. Up/Down move cursor; Enter emits a
-  -- `sessions.resume_request` envelope onto the NCP bus and dismisses
-  -- the popup. The starter's sessions module subscribes via
-  -- `nefor.bus.on_event` and runs the in-process swap. Esc handled in
-  -- the popup-close branch above (closes without emitting). No filter
-  -- input — the picker is small (≤10 sessions) and the timestamps +
-  -- previews are scannable as-is.
-  if state.popup and state.popup.variant == "session_picker" then
+  -- Session picker: same shape as model picker, no filter input.
+  -- Esc handled in the popup-close branch above (closes without
+  -- emitting). All other keys swallow so they don't bubble.
+  if state.popup and state.popup.variant == "session_picker"
+     and kind:sub(1, 4) == "key." then
     local p = state.popup
     local sessions = p.sessions or {}
-    if kind == "key.up" or kind == "key.down" then
-      if #sessions == 0 then return state, {} end
-      local cur = p.cursor or 1
-      cur = (kind == "key.up") and (cur - 1) or (cur + 1)
-      if cur < 1 then cur = #sessions end
-      if cur > #sessions then cur = 1 end
+    local result = W.picker.handle({
+      state       = { cursor = p.cursor or 1 },
+      entries     = function() return sessions end,
+      show_search = false,
+    }, msg)
+    if result ~= nil then
+      if result.selected ~= nil and result.selected.id then
+        return shallow_merge(state, {
+          popup = NIL_SENTINEL,
+          entries = {}, in_flight = NIL_SENTINEL,
+          pending = false, dag_runs = {}, firing_to_node = {},
+          turn_started_at = NIL_SENTINEL,
+          last_turn_duration_ms = NIL_SENTINEL,
+        }), {
+          emit_resume_request(result.selected.id),
+        }
+      end
       return shallow_merge(state, {
-        popup = shallow_merge(p, { cursor = cur }),
+        popup = shallow_merge(p, result.state),
       }), {}
-    end
-    if kind == "key.enter" then
-      if #sessions == 0 then return state, {} end
-      local sel = sessions[p.cursor or 1] or sessions[1]
-      if not sel or not sel.id then return state, {} end
-      -- Locally clear the transcript so the imminent replay paints
-      -- onto an empty surface. session_end no longer wipes entries
-      -- (see comment in its handler) — the picker owns the clear
-      -- here and the `/resume <id>` arm above owns it for the
-      -- direct path.
-      return shallow_merge(state, {
-        popup = NIL_SENTINEL,
-        entries = {}, in_flight = NIL_SENTINEL,
-        pending = false, dag_runs = {}, firing_to_node = {},
-        turn_started_at = NIL_SENTINEL,
-        last_turn_duration_ms = NIL_SENTINEL,
-      }), {
-        emit_resume_request(sel.id),
-      }
     end
     -- All other keys swallow so they don't bubble into the input field.
     return state, {}
@@ -3428,6 +3169,12 @@ local function update(msg, state)
   -- so the same `tui.scroll_*` API drives both. Disabling transcript
   -- scrolling while a popup is up matches the user-expected "modal
   -- focus" gesture — the popup owns the keyboard while it's visible.
+  -- Scroll-key routing: when a popup is open, route scroll keys to its
+  -- inner scrollable; otherwise to the transcript. Popups are wrapped
+  -- by W.popup.view with `scroll_key = "popup_<variant>"`, so the same
+  -- `tui.scroll_*` API drives both. Up/Down on the transcript surface
+  -- ALSO drive prompt-history recall when no popup is active and the
+  -- input is empty / already navigating — handled separately below.
   local function active_scroll_key()
     if state.popup then
       local v = state.popup.variant
@@ -3440,98 +3187,59 @@ local function update(msg, state)
     return nil
   end
 
+  local function route_scroll(delta_or_fn)
+    local target = active_scroll_key() or "transcript"
+    delta_or_fn(target)
+  end
+
   if kind == "key.pageup" then
-    local target = active_scroll_key()
-    if target then
-      tui.scroll_by(target, -10)
-    else
-      tui.scroll_by("transcript", -10)
-    end
+    route_scroll(function(k) tui.scroll_by(k, -10) end)
     return state, {}
   end
   if kind == "key.pagedown" then
-    local target = active_scroll_key()
-    if target then
-      tui.scroll_by(target, 10)
-    else
-      tui.scroll_by("transcript", 10)
-    end
+    route_scroll(function(k) tui.scroll_by(k, 10) end)
     return state, {}
   end
-  -- Up/Down arrows scroll the active surface by one line — Mac keyboards
-  -- don't have PgUp/PgDn, so arrows are the muscle-memory equivalent.
-  -- The text_input router only bubbles arrows when the cursor sits at
-  -- an edge of the input's content (single-line, or first/last visual
-  -- row of multi-line), so this only fires when the input has nowhere
-  -- to move the cursor.
-  --
-  -- When NO popup owns scroll AND the input is empty (or the user is
-  -- already navigating prompt history), Up/Down recall earlier prompts
-  -- per legacy spec section 7. Up walks to older prompts; Down walks
-  -- back to newer; reaching the latest+1 clears the buffer and ends
-  -- navigation. Any non-arrow key (handled below in input.changed) drops
-  -- history_cursor, so the next Up starts fresh.
   if kind == "key.up" then
-    local target = active_scroll_key()
-    if not target then
+    if active_scroll_key() == nil then
       local navigating = state.history_cursor ~= nil
       local empty = (state.input_value or "") == ""
       if (navigating or empty) and #(state.prompt_history or {}) > 0 then
         local cur = state.history_cursor or 0
-        local n = #state.prompt_history
-        local nxt = math.min(cur + 1, n)
+        local nxt = math.min(cur + 1, #state.prompt_history)
         return shallow_merge(state, {
           input_value    = state.prompt_history[nxt],
           history_cursor = nxt,
         }), {}
       end
-      tui.scroll_by("transcript", -1)
-    else
-      tui.scroll_by(target, -1)
     end
+    route_scroll(function(k) tui.scroll_by(k, -1) end)
     return state, {}
   end
   if kind == "key.down" then
-    local target = active_scroll_key()
-    if not target then
-      if state.history_cursor ~= nil then
-        local cur = state.history_cursor
-        if cur <= 1 then
-          -- Stepping past the newest entry clears the input and ends
-          -- history navigation.
-          return shallow_merge(state, {
-            input_value    = "",
-            history_cursor = NIL_SENTINEL,
-          }), {}
-        end
-        local nxt = cur - 1
+    if active_scroll_key() == nil and state.history_cursor ~= nil then
+      local cur = state.history_cursor
+      if cur <= 1 then
         return shallow_merge(state, {
-          input_value    = state.prompt_history[nxt],
-          history_cursor = nxt,
+          input_value    = "",
+          history_cursor = NIL_SENTINEL,
         }), {}
       end
-      tui.scroll_by("transcript", 1)
-    else
-      tui.scroll_by(target, 1)
+      local nxt = cur - 1
+      return shallow_merge(state, {
+        input_value    = state.prompt_history[nxt],
+        history_cursor = nxt,
+      }), {}
     end
+    route_scroll(function(k) tui.scroll_by(k, 1) end)
     return state, {}
   end
   if kind == "key.home" then
-    local target = active_scroll_key()
-    if target then
-      tui.scroll_to(target, 0)
-    else
-      tui.scroll_to("transcript", 0)
-    end
+    route_scroll(function(k) tui.scroll_to(k, 0) end)
     return state, {}
   end
   if kind == "key.end" then
-    local target = active_scroll_key()
-    if target then
-      tui.scroll_into_view(target)
-    else
-      tui.scroll_into_view("transcript")
-    end
+    route_scroll(function(k) tui.scroll_into_view(k) end)
     return state, {}
   end
 

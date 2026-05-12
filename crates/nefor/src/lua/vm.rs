@@ -164,7 +164,12 @@ impl LuaHost {
     /// - [`LuaError::InitLuaExec`] if Lua errored during execution; the
     ///   source location is attached when mlua's error carries one.
     /// - No error on a clean run.
-    pub fn load_init(&self, path: &Path) -> Result<(), LuaError> {
+    ///
+    /// `async` only because callers slot this into a tokio task; the
+    /// chunk itself runs via sync `exec`. `pm.install` ran on a real
+    /// fresh-boot path uses the sync `nefor.process.run` / `nefor.fs.*`
+    /// bindings so no async-Lua surface is exposed.
+    pub async fn load_init(&self, path: &Path) -> Result<(), LuaError> {
         let src = fs::read_to_string(path).map_err(LuaError::InitLuaRead)?;
         let path_buf = path.to_path_buf();
         let chunk_name = path.display().to_string();
@@ -468,6 +473,7 @@ fn install_nefor_surface(
     let nefor = lua.create_table()?;
     bindings::install_engine(lua, &nefor, engine_ops)?;
     bindings::install_events(lua, &nefor, Arc::clone(&bus))?;
+    bindings::install_fs(lua, &nefor)?;
     bindings::install_json(lua, &nefor)?;
     bindings::install_log(lua, &nefor)?;
     bindings::install_process(lua, &nefor)?;
@@ -551,6 +557,10 @@ mod tests {
                  and type(nefor.json.decode) == 'function' \
                  and type(nefor.log) == 'table' \
                  and type(nefor.process) == 'table' \
+                 and type(nefor.process.run) == 'function' \
+                 and type(nefor.fs) == 'table' \
+                 and type(nefor.fs.mkdir_p) == 'function' \
+                 and type(nefor.fs.read_file) == 'function' \
                  and type(nefor.plugins) == 'table'",
             )
             .eval()
@@ -595,8 +605,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn load_init_reads_file() {
+    #[tokio::test]
+    async fn load_init_reads_file() {
         let h = host();
         let tmp = std::env::temp_dir().join(format!(
             "nefor-test-init-{}-{}.lua",
@@ -607,18 +617,19 @@ mod tests {
                 .unwrap_or(0),
         ));
         std::fs::write(&tmp, "nefor.log.info('loaded from disk')").expect("write ok");
-        let res = h.load_init(&tmp);
+        let res = h.load_init(&tmp).await;
         let _ = std::fs::remove_file(&tmp);
         res.expect("load_init should succeed");
     }
 
-    #[test]
-    fn load_init_missing_file_returns_read_error() {
+    #[tokio::test]
+    async fn load_init_missing_file_returns_read_error() {
         let h = host();
         let missing = std::env::temp_dir().join("nefor-definitely-not-here-xyz.lua");
         let _ = std::fs::remove_file(&missing);
         let err = h
             .load_init(&missing)
+            .await
             .expect_err("missing file should error");
         assert!(matches!(err, LuaError::InitLuaRead(_)));
     }

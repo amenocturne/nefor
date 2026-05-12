@@ -16,17 +16,75 @@ local CONFIG_ROOT = NEFOR_CONFIG_DIR or "."
 -- package path so require() resolves there.
 local PROJECT_ROOT = CONFIG_ROOT:match("^(.*)/[^/]+$") or "."
 local STARTER_ROOT = PROJECT_ROOT .. "/starter"
+local LUA_ROOT = PROJECT_ROOT .. "/lua"
 
 package.path = table.concat({
   CONFIG_ROOT .. "/?.lua",
   CONFIG_ROOT .. "/?/init.lua",
   STARTER_ROOT .. "/?.lua",
   STARTER_ROOT .. "/?/init.lua",
+  LUA_ROOT .. "/?.lua",
+  LUA_ROOT .. "/?/init.lua",
   package.path,
 }, ";")
 
-local ncp      = require("ncp")
-local actor    = require("actor")
+-- nefor-pm wires the core primitives, generic libs, and every plugin
+-- lib. The `dir` overrides skip the clone path; pm registers each dir
+-- and puts it on package.path so `require("<name>")` resolves to the
+-- plugin lib. Starter composers live as per-domain files (provider,
+-- tools, graph, combinators) at the starter root and are reached via
+-- plain `require("<name>")`.
+local pm = require("nefor-pm")
+pm.install({
+  -- Multi-consumer protocol primitives.
+  {
+    "amenocturne/nefor",
+    name = "core",
+    tag  = "v0.1.5",
+    path = "lua/core/",
+    dir  = LUA_ROOT .. "/core",
+  },
+
+  -- Independent generic libs (no plugin binary, no cross-deps beyond core).
+  {
+    "amenocturne/nefor",
+    name = "libs",
+    tag  = "v0.1.5",
+    path = "lua/libs/",
+    dir  = LUA_ROOT .. "/libs",
+  },
+
+  {
+    "amenocturne/nefor",
+    name = "openai-provider",
+    tag  = "v0.1.5",
+    path = "plugins/openai-provider/lua/openai-provider/",
+    dir  = PROJECT_ROOT .. "/plugins/openai-provider/lua/openai-provider",
+  },
+
+  {
+    "amenocturne/nefor",
+    name = "tool-gate",
+    tag  = "v0.1.5",
+    path = "plugins/tool-gate/lua/tool-gate/",
+    dir  = PROJECT_ROOT .. "/plugins/tool-gate/lua/tool-gate",
+  },
+
+  -- reasoner-graph ships the `spawn_graph` protocol primitive only —
+  -- the actor-spec wiring is identity passthrough and lives in
+  -- starter/graph.lua via `core.actor.identity_spec`. `require(
+  -- "reasoner-graph.spawn_graph")` resolves the sub-module.
+  {
+    "amenocturne/nefor",
+    name = "reasoner-graph",
+    tag  = "v0.1.5",
+    path = "plugins/reasoner-graph/lua/reasoner-graph/",
+    dir  = PROJECT_ROOT .. "/plugins/reasoner-graph/lua/reasoner-graph",
+  },
+})
+
+local ncp      = require("core.ncp")
+local actor    = require("core.actor")
 local sessions = require("sessions")
 local cfg      = require("config").active
 
@@ -48,10 +106,10 @@ local agentic_cli = require("agentic_cli")
 -- Plugin spawn order (mirrors starter/init.lua minus chat/tui).
 -- ------------------------------------------------------------------
 
-require("lib.contracts.provider").declare()
-require("lib.contracts.tool").declare()
+require("libs.generic-provider").declare()
+require("libs.generic-tool").declare()
 
-actor.spawn(require("nefor-combinators"))
+actor.spawn(require("combinators"))
 
 local agentic_loop = require("agentic-loop")
 agentic_loop.configure {
@@ -79,8 +137,11 @@ actor.spawn(require("reasoners"))
 local PROVIDER_NAME  = cfg.provider.name
 local PROVIDER_MODEL = cfg.provider.model
 
+local provider = require("provider")
 if cfg.plugins.spawn_mock then
-  actor.spawn(require("mock-plugin").spawn_spec(
+  -- mock-plugin uses the same wire protocol as the openai-provider
+  -- binary, so the provider actor spec works as-is.
+  actor.spawn(provider.spawn_spec(
     PROVIDER_NAME,
     {
       require("config").bin("mock-plugin"),
@@ -100,15 +161,16 @@ else
   for _, a in ipairs(cfg.provider.extra_args or {}) do
     table.insert(provider_command, a)
   end
-  actor.spawn(require("openai-provider").spawn_spec(
+  actor.spawn(provider.spawn_spec(
     PROVIDER_NAME,
     provider_command,
     { static_token = cfg.provider.static_token }
   ))
 end
 
-actor.spawn(require("reasoner-graph").spawn_spec({ require("config").bin("reasoner-graph") }))
+actor.spawn(require("graph").spawn_spec({ require("config").bin("reasoner-graph") }))
 
+local tools = require("tools")
 local tool_gate_argv = { require("config").bin("tool-gate") }
 for _, t in ipairs(cfg.tool_gate.prompt_tools or {}) do
   tool_gate_argv[#tool_gate_argv + 1] = "--prompt"
@@ -117,9 +179,9 @@ end
 tool_gate_argv[#tool_gate_argv + 1] = "--default"
 tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
 
-actor.spawn(require("tool-gate").spawn_spec("tool-gate", tool_gate_argv))
+actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
 
-actor.spawn(require("basic-tools"))
+actor.spawn(tools.basic_actor_spec())
 
 -- ------------------------------------------------------------------
 -- Virtual agentic-cli plugin — calls nefor.plugins.spawn directly to

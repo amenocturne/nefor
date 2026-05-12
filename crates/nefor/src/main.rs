@@ -123,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
 
     let init_lua = config_dir.as_path().join("init.lua");
     if init_lua.exists() {
-        match host.load_init(&init_lua) {
+        match host.load_init(&init_lua).await {
             Ok(()) => {
                 tracing::info!(path = %init_lua.display(), "init.lua loaded");
             }

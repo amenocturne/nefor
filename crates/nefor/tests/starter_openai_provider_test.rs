@@ -28,12 +28,20 @@ use std::path::PathBuf;
 use mlua::{Function, Lua, Table, Value};
 
 fn starter_dir() -> PathBuf {
+    repo_root().join("starter")
+}
+
+fn lua_dir() -> PathBuf {
+    repo_root().join("lua")
+}
+
+fn repo_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest
         .parent()
         .and_then(|p| p.parent())
         .expect("repo root is two levels above crates/nefor")
-        .join("starter")
+        .to_path_buf()
 }
 
 /// Drive the wrapper's `to_plugin` callback for a sequence of replayed
@@ -62,10 +70,10 @@ fn replay_window_re_feeds_chat_history_into_provider_binary() {
     // just returns the spec table; we drive `to_plugin` directly.
     lua.load(
         r#"
-        local op = require("openai-provider")
+        local op = require("provider")
         local spec = op.spawn_spec("ollama", { "/bin/true" }, {})
         _to_plugin = spec.to_plugin
-        _replay = require("lib.replay_window")
+        _replay = require("core.replay_window")
         "#,
     )
     .exec()
@@ -189,16 +197,16 @@ fn cross_wrapper_isolation_unowned_chat_ids_drop() {
 
     lua.load(
         r#"
-        local op = require("openai-provider")
-        -- mock_provider chats live on this wrapper; ollama chats on the
-        -- other. The two wrappers don't share state.
+        local op = require("provider")
+        -- mock_provider chats and ollama chats use independent spawn_spec
+        -- instances; the two actor instances don't share state.
         _mock_to_plugin   = op.spawn_spec("mock-plugin", { "/bin/true" }, {}).to_plugin
         _ollama_to_plugin = op.spawn_spec("ollama",      { "/bin/true" }, {}).to_plugin
-        _replay = require("lib.replay_window")
+        _replay = require("core.replay_window")
         "#,
     )
     .exec()
-    .expect("spawn both wrappers");
+    .expect("spawn both provider instances");
 
     lua.load(
         r#"
@@ -315,9 +323,9 @@ fn in_process_resume_skips_duplicate_chat_create() {
 
     lua.load(
         r#"
-        local op = require("openai-provider")
+        local op = require("provider")
         _to_plugin = op.spawn_spec("ollama", { "/bin/true" }, {}).to_plugin
-        _replay = require("lib.replay_window")
+        _replay = require("core.replay_window")
         "#,
     )
     .exec()
@@ -538,15 +546,38 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
 fn set_package_path(lua: &Lua) -> mlua::Result<()> {
     let starter = starter_dir();
     let starter_str = starter.display().to_string();
+    let lua_root = lua_dir();
+    let lua_root_str = lua_root.display().to_string();
+    let plugin_lua = repo_root()
+        .join("plugins")
+        .join("openai-provider")
+        .join("lua");
+    let plugin_lua_str = plugin_lua.display().to_string();
+    let rg_plugin_lua = repo_root().join("plugins").join("reasoner-graph").join("lua");
+    let rg_plugin_lua_str = rg_plugin_lua.display().to_string();
     let script = format!(
         r#"
         package.path = table.concat({{
           "{starter}/?.lua",
           "{starter}/?/init.lua",
+          "{plugin_lua}/?.lua",
+          "{plugin_lua}/?/init.lua",
+          "{rg_plugin_lua}/?.lua",
+          "{rg_plugin_lua}/?/init.lua",
+          "{lua_root}/?.lua",
+          "{lua_root}/?/init.lua",
           package.path,
         }}, ";")
+        -- starter/provider.lua reaches the plugin lib via
+        -- `require("openai-provider")`. The plugin's `lua/` parent is on
+        -- package.path above so that resolves to
+        -- plugins/openai-provider/lua/openai-provider/init.lua.
+        NEFOR_CONFIG_DIR = "{starter}"
         "#,
-        starter = starter_str
+        starter = starter_str,
+        lua_root = lua_root_str,
+        plugin_lua = plugin_lua_str,
+        rg_plugin_lua = rg_plugin_lua_str,
     );
     lua.load(&script).exec()
 }

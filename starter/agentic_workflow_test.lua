@@ -207,7 +207,7 @@ end
 -- module's `active()` getter; the test asserts the flip end-to-end by
 -- firing the markers and probing the gate.
 do
-  local replay_window = require("lib.replay_window")
+  local replay_window = require("core.replay_window")
   _test.set_plugins({ "ollama", "reasoner-graph", "nefor-tui" })
 
   _test.fire_bus("sessions.replay.start", { session_id = "new-id", count = 0 })
@@ -582,7 +582,7 @@ end
 -- public-API contract.
 -- ------------------------------------------------------------------
 do
-  local replay_window = require("lib.replay_window")
+  local replay_window = require("core.replay_window")
   replay_window.set(true)
   assert_eq(replay_window.active(), true, "replay_window.set(true) must take effect")
   replay_window.set(false)

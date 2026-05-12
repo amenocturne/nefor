@@ -1,0 +1,178 @@
+-- Dump-to-file layer for huge tool results. When a tool.result's
+-- output exceeds the inline budget, the full payload lands on disk
+-- under `<NEFOR_DATA_HOME>/tool-results/<chat_id>/<call_id>.txt` and
+-- only a summary + path reference flows into the model's chat
+-- history. The model greps the file from a later turn (via bash) to
+-- extract specifics it didn't get in the inlined preview.
+
+local json = nefor.json
+
+local M = {}
+
+-- 32 KiB comfortably fits typical read_file / ls / short grep while
+-- catching the cases that genuinely blow up model context (10k-line
+-- files, recursive grep across a monorepo).
+M.INLINE_BUDGET = 32 * 1024
+
+-- 4 KiB head-preview alongside the "written to <path>" notice — enough
+-- for the model to recognise what it's looking at and decide on a grep
+-- pattern, without replicating the whole thing back into context.
+M.PREVIEW_BYTES = 4 * 1024
+
+-- Same precedence as starter/sessions/init.lua so NEFOR_DATA_HOME
+-- controls both:
+--   1. $NEFOR_DATA_HOME    (test override + canonical)
+--   2. $XDG_DATA_HOME/nefor
+--   3. $HOME/.local/share/nefor
+---@return string|nil
+local function data_root()
+  local override = os.getenv("NEFOR_DATA_HOME")
+  if override and override ~= "" then return override end
+  local xdg = os.getenv("XDG_DATA_HOME")
+  if xdg and xdg ~= "" then return xdg .. "/nefor" end
+  local home = os.getenv("HOME")
+  if not home or home == "" then return nil end
+  return home .. "/.local/share/nefor"
+end
+
+---@param path string
+local function ensure_dir(path)
+  -- Best-effort recursive mkdir. `2>/dev/null` swallows EEXIST and
+  -- permission errors — they surface on the subsequent io.open with
+  -- a real error string.
+  os.execute(string.format("mkdir -p %q 2>/dev/null", path))
+end
+
+-- Realistic chat_ids are already filesystem-safe (UUIDs, `chat-1`);
+-- this rules out path traversal from a malformed value escaping the
+-- tool-results root.
+---@param scope string|nil
+---@return string
+local function safe_scope(scope)
+  if type(scope) ~= "string" or scope == "" then return "_unscoped" end
+  local cleaned = scope:gsub("[^%w%-_]", "_")
+  if cleaned == "" then return "_unscoped" end
+  return cleaned
+end
+
+---@param call_id string|nil
+---@return string|nil
+local function safe_call_id(call_id)
+  if type(call_id) ~= "string" or call_id == "" then return nil end
+  local cleaned = call_id:gsub("[^%w%-_]", "_")
+  if cleaned == "" then return nil end
+  return cleaned
+end
+
+-- Strings pass through; anything else is JSON-encoded so a
+-- table-shaped output gets a deterministic textual form for both the
+-- size check and the on-disk write (the model greps the textual form).
+---@param output any
+---@return string|nil, string|nil
+local function stringify(output)
+  if type(output) == "string" then return output, nil end
+  if output == nil then return "", nil end
+  local ok, encoded = pcall(json.encode, output)
+  if not ok then
+    return nil, "json.encode: " .. tostring(encoded)
+  end
+  return encoded, nil
+end
+
+-- Cheap short-circuit for the common case (small output → no work).
+---@param output any
+---@return boolean
+function M.should_dump(output)
+  local s = stringify(output)
+  if not s then return false end
+  return #s > M.INLINE_BUDGET
+end
+
+---@param payload string  -- already stringified
+---@param path string
+---@return string
+local function summarise(payload, path)
+  local total = #payload
+  local preview_len = math.min(M.PREVIEW_BYTES, total)
+  local preview = payload:sub(1, preview_len)
+  return table.concat({
+    "[Output written to " .. path .. "; " .. tostring(total)
+      .. " bytes; truncated preview below]",
+    "",
+    preview,
+    "",
+    "... [output continues; full content at " .. path
+      .. "; use `grep <pattern> " .. path .. "` or `head -n <N> "
+      .. path .. "` to extract more] ...",
+  }, "\n")
+end
+
+---@param path string
+---@param contents string
+---@return boolean, string|nil
+local function write_file(path, contents)
+  local fh, err = io.open(path, "w")
+  if not fh then return false, tostring(err) end
+  local ok, write_err = pcall(function() fh:write(contents) end)
+  fh:close()
+  if not ok then return false, tostring(write_err) end
+  return true, nil
+end
+
+-- Best-effort: meta is debugging surface, not load-bearing.
+---@param meta_path string
+---@param meta table
+local function write_meta(meta_path, meta)
+  local ok, encoded = pcall(json.encode, meta)
+  if not ok then return end
+  pcall(function() write_file(meta_path, encoded) end)
+end
+
+-- Write the full output to disk and return summary + path. On disk
+-- error returns `nil, nil, err` so the caller can degrade to the
+-- un-replaced output.
+---@param chat_id string|nil
+---@param call_id string
+---@param output any
+---@param args table|nil  -- { tool?, args? } — optional metadata for the meta companion
+---@return string|nil summary
+---@return string|nil path
+---@return string|nil err
+function M.dump(chat_id, call_id, output, args)
+  local payload, encode_err = stringify(output)
+  if not payload then return nil, nil, encode_err end
+
+  local root = data_root()
+  if not root then
+    return nil, nil, "no data root (NEFOR_DATA_HOME / XDG_DATA_HOME / HOME unset)"
+  end
+
+  local cid = safe_call_id(call_id)
+  if not cid then return nil, nil, "missing call_id" end
+
+  local scope_dir = root .. "/tool-results/" .. safe_scope(chat_id)
+  ensure_dir(scope_dir)
+
+  local path = scope_dir .. "/" .. cid .. ".txt"
+  local ok, err = write_file(path, payload)
+  if not ok then return nil, nil, err end
+
+  if type(args) == "table" then
+    write_meta(scope_dir .. "/" .. cid .. ".meta.json", {
+      tool        = args.tool,
+      args        = args.args,
+      total_bytes = #payload,
+      timestamp   = nefor.engine.now(),
+    })
+  end
+
+  return summarise(payload, path), path, nil
+end
+
+-- Test-only: expose internals.
+M._stringify  = stringify
+M._summarise  = summarise
+M._safe_scope = safe_scope
+M._data_root  = data_root
+
+return M

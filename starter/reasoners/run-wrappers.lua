@@ -49,7 +49,7 @@
 -- carries `id = firing_id`, which closes the firing without further
 -- bookkeeping in this layer — no correlation map needed.
 
-local envelope = require("lib.envelope")
+local envelope = require("core.envelope")
 
 local emit_as = envelope.emit_as
 

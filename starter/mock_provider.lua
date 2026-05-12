@@ -780,7 +780,7 @@ nefor.on(NAME .. ".chat.complete", function(body)
     resp.tool_calls and #resp.tool_calls or 0))
 
   -- Error branch: emit `<name>.chat.error` and skip the result wire.
-  -- The wrapper actor (starter/openai-provider/init.lua) translates
+  -- The wrapper actor (starter/wrappers/openai-provider.lua) translates
   -- chat.error into `tool.result { error }` for the agentic-loop's
   -- run-error path, which is the rendering target the brief asks for.
   if resp.finish_reason == "error" then

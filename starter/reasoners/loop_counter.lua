@@ -56,7 +56,7 @@
 -- mechanically. `key` is preserved for the downstream error-emit node
 -- to format a meaningful diagnostic.
 
-local envelope = require("lib.envelope")
+local envelope = require("core.envelope")
 
 local emit_as = envelope.emit_as
 

@@ -37,9 +37,9 @@
 
 local json = nefor.json
 
-local envelope      = require("lib.envelope")
-local ids           = require("lib.ids")
-local replay_window = require("lib.replay_window")
+local envelope      = require("core.envelope")
+local ids           = require("core.ids")
+local replay_window = require("core.replay_window")
 
 local emit_as        = envelope.emit_as
 local emit_to        = envelope.emit_to
