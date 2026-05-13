@@ -50,18 +50,22 @@ impl PluginRoot {
 ///
 /// 1. `cli_override` — explicit `--plugin-dir` flag.
 /// 2. `NEFOR_PLUGIN_DIR` environment variable.
-/// 3. `<exe-dir>/../share/nefor/plugins` if that path is a directory
+/// 3. `<exe-dir>` if it contains the bundled `nefor-tui` binary
+///    (covers `just install` to `~/.local/bin/` and in-tree
+///    `cargo build` to `target/debug/`). Strong positive signal:
+///    a real plugin binary is sitting next to the engine.
+/// 4. `<exe-dir>/../share/nefor/plugins` if that path is a directory
 ///    (covers system installs like Homebrew where the binary lives at
 ///    `<prefix>/bin/nefor` and plugins at `<prefix>/share/nefor/plugins`).
-/// 4. `<exe-dir>` if it contains the bundled `nefor-tui` binary
-///    (covers `just install` to `~/.local/bin/` and in-tree
-///    `cargo build` to `target/debug/`).
-/// 5. `$NEFOR_DATA_DIR/plugins/` if that path is a directory. Last
-///    among the binary-resolution paths because nefor-pm uses
-///    `$NEFOR_DATA_DIR/plugins/` as its **source** overlay (Lua
-///    require() resolution): the directory is full of source-dir
-///    symlinks, not executables. Putting it ahead of `<exe-dir>`
-///    would shadow real binaries with non-executable source dirs.
+///    Checked **after** `<exe-dir>` because for `just install` the
+///    relative-share path resolves to `~/.local/share/nefor/plugins`,
+///    which collides with nefor-pm's source-overlay directory: the
+///    directory exists but holds source-dir symlinks, not executables.
+///    The exe-dir check has a positive signal (`nefor-tui` is a file)
+///    that this purely path-shape check lacks, so it wins.
+/// 5. `$NEFOR_DATA_DIR/plugins/` if that path is a directory. Late
+///    fallback for the same reason: nefor-pm uses it as a Lua
+///    require() overlay, not an executables directory.
 /// 6. `$XDG_DATA_HOME/nefor/plugins/` (falling back to
 ///    `~/.local/share/nefor/plugins/`).
 ///
@@ -76,10 +80,10 @@ pub fn resolve_plugin_root(cli_override: Option<PathBuf>) -> Option<PluginRoot> 
             return Some(PluginRoot(PathBuf::from(raw)));
         }
     }
-    if let Some(p) = exe_relative_share_plugins() {
+    if let Some(p) = exe_dir_in_tree() {
         return Some(PluginRoot(p));
     }
-    if let Some(p) = exe_dir_in_tree() {
+    if let Some(p) = exe_relative_share_plugins() {
         return Some(PluginRoot(p));
     }
     if let Ok(raw) = std::env::var("NEFOR_DATA_DIR") {
@@ -195,27 +199,29 @@ mod tests {
     }
 
     #[test]
-    fn resolve_plugin_root_data_dir_does_not_shadow_exe_dir() {
-        // Regression: nefor-pm uses $NEFOR_DATA_DIR/plugins as its source
-        // overlay (Lua require() resolution), so even when that path is
-        // a directory it contains source-dir symlinks, NOT executables.
-        // Prior ordering picked the data-dir first; that shadowed the
-        // real binary directory next to the engine and made spawn fail
-        // with "permission denied" / "no such file" for every plugin.
-        // The fix puts NEFOR_PLUGIN_DIR + exe-relative paths ahead of
-        // the data-dir overlay; the data-dir branch is only reached
-        // when nothing else resolved.
+    fn resolve_plugin_root_exe_dir_beats_xdg_share_overlay() {
+        // Regression: when the engine is `just install`-ed to
+        // ~/.local/bin/, the exe-relative-share path
+        // (`<exe-dir>/../share/nefor/plugins`) resolves to
+        // ~/.local/share/nefor/plugins, which is exactly the path
+        // nefor-pm uses for its Lua require() source overlay (full of
+        // source-dir symlinks, no executables). The first attempt at a
+        // fix put exe_dir_in_tree AFTER exe_relative_share_plugins,
+        // so the path-shape check still won and every plugin spawn
+        // failed with "permission denied" / "no such file".
         //
-        // We pin the contract by setting NEFOR_DATA_DIR to a real dir
-        // (with a `plugins/` subdir) AND clearing NEFOR_PLUGIN_DIR.
-        // resolve_plugin_root should still NOT return the data-dir
-        // path: exe_dir_in_tree (or share_plugins) wins.
+        // The corrected priority puts exe_dir_in_tree FIRST: it has a
+        // positive signal (`nefor-tui` is present as a file in the
+        // exe dir) that the relative-share path-shape check lacks.
+        // Homebrew layout is unaffected because nefor-tui is NOT in
+        // /opt/homebrew/bin/ — it lives under share/nefor/plugins/,
+        // so exe_dir_in_tree fails and exe_relative_share_plugins
+        // catches it.
         //
-        // We can't safely mutate process env from a test (other tests
-        // race), so this is a doc-pin via the function's documented
-        // priority list. The behavioural assert lives in
-        // resolve_plugin_root's doc-comment which the type system
-        // can't enforce.
+        // Process env is racy across tests, so this stays a doc-pin
+        // anchored to the priority list in resolve_plugin_root's
+        // doc-comment. The cli-override and round-trip tests cover
+        // the structural contract.
     }
 
     #[test]
