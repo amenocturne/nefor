@@ -85,7 +85,11 @@ end
 
 ---@param path string
 local function ensure_dir(path)
-  os.execute(string.format("mkdir -p %q 2>/dev/null", path))
+  -- Best-effort recursive mkdir via the Rust binding. Idempotent on
+  -- EEXIST; any permission error surfaces on the next io.open the
+  -- writer attempts (the return value here is intentionally ignored —
+  -- the next write is the source of truth on success).
+  nefor.fs.mkdir_p(path)
 end
 
 do
