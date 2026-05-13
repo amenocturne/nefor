@@ -54,6 +54,21 @@ install:
       cargo install --locked dabin
       echo "  da -> $(command -v da || echo '?')"
     fi
+    # Copy this checkout's starter/ into ~/.config/nefor so a bare
+    # `nefor` (no flags) from any cwd picks up a baseline config. We
+    # COPY (not symlink) so user edits to ~/.config/nefor don't bleed
+    # back into the repo. If the directory already exists we leave it
+    # alone — the user owns their config; re-copying would clobber any
+    # local tweaks. To refresh from a fresh checkout, move the existing
+    # one aside and re-run.
+    if [ -e ~/.config/nefor ]; then
+      echo "  ~/.config/nefor already exists; leaving it alone."
+      echo "  (To refresh from this checkout: move it aside and re-run \`just install\`.)"
+    else
+      mkdir -p ~/.config/nefor
+      cp -R "{{justfile_directory()}}/starter/." ~/.config/nefor/
+      echo "  ~/.config/nefor (copied from {{justfile_directory()}}/starter)"
+    fi
     echo
     echo "Installed -> $PREFIX/bin"
     echo "Make sure your shell has:"
