@@ -8,7 +8,7 @@
 //! 2. Lets the spawned plugin inherit the engine's current working
 //!    directory. This matches what users expect when they `cd
 //!    ~/projects/foo && nefor` — a `bash` tool running inside
-//!    `basic-tools` should see `/Users/me/projects/foo`, not the
+//!    `basic-tools` should see the user's `cd`'d directory, not the
 //!    formula's plugin install dir. Plugins that need a different
 //!    working directory wrap themselves in a `cd ... && exec ...`
 //!    shell script and expose that as their `command`.

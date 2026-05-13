@@ -1086,7 +1086,7 @@ do
   -- text shape mirrors the actual marker tool-gate uses (the prefix
   -- is load-bearing per spec §5).
   local agents_md_text =
-    "[Loaded /home/skril/code/foo/AGENTS.md because tool call touched a file in /home/skril/code/foo/. " ..
+    "[Loaded /tmp/foo/AGENTS.md because tool call touched a file in /tmp/foo/. " ..
     "This is project guidance for that directory, not a user request.]\n\n" ..
     "Project rule: prefer functional style. Avoid global state."
   feed("tool-gate", {
