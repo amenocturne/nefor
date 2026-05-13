@@ -685,13 +685,10 @@ end
 local function receive_msg(entry)
   if entry.origin == "step" and entry.target ~= nil then return end
 
-  local payload = entry.payload
-  if type(payload) ~= "string" or payload == "" then return end
-  local ok, decoded = pcall(json.decode, payload)
-  if not ok or type(decoded) ~= "table" or type(decoded.body) ~= "table" then return end
+  local ok, decoded = pcall(json.decode, entry.payload)
+  if not ok then return end
   local body = decoded.body
   local kind = body.kind
-  if type(kind) ~= "string" then return end
 
   -- Tool invocations from the gate. Live path only — during replay the
   -- gate doesn't re-issue invokes (replay_window suppresses to_plugin

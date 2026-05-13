@@ -422,13 +422,10 @@ local function receive_msg(entry)
     agentic_loop = require("agentic-loop")
   end
 
-  local payload = entry.payload
-  if type(payload) ~= "string" or payload == "" then return end
-  local ok, decoded = pcall(json.decode, payload)
-  if not ok or type(decoded) ~= "table" or type(decoded.body) ~= "table" then return end
+  local ok, decoded = pcall(json.decode, entry.payload)
+  if not ok then return end
   local body = decoded.body
   local kind = body.kind
-  if type(kind) ~= "string" then return end
 
   -- Skip during replay — graph already ran; re-dispatch would
   -- duplicate every side effect.

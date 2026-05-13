@@ -672,10 +672,8 @@ local function receive_msg(entry)
   -- reasoners/init.lua and agentic-loop/init.lua).
   if entry.origin == "step" and entry.target ~= nil then return end
 
-  local payload = entry.payload
-  if type(payload) ~= "string" or payload == "" then return end
-  local ok, decoded = pcall(json.decode, payload)
-  if not ok or type(decoded) ~= "table" or type(decoded.body) ~= "table" then return end
+  local ok, decoded = pcall(json.decode, entry.payload)
+  if not ok then return end
 
   -- Skip during replay — the agent reasoner's per-firing state lives
   -- in module-level tables that don't survive a process restart, so
@@ -684,7 +682,6 @@ local function receive_msg(entry)
 
   local body = decoded.body
   local kind = body.kind
-  if type(kind) ~= "string" then return end
 
   -- graph.cancel handler — sub-graph cancel propagation. The
   -- lead-workflow actor broadcasts `graph.cancel { run_id }` on
