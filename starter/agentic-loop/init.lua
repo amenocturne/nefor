@@ -588,9 +588,8 @@ local function handle_tool_result_run_close(run_id, body)
 end
 
 -- Per-firing tool.result close: capture wrap node's next_state →
--- current_state for chat continuity. Matches behaviour of the prior
--- graph.node_result handler — only the wrap-firing's next_state matters
--- to the orchestrator.
+-- current_state for chat continuity. Only the wrap-firing's next_state
+-- matters to the orchestrator.
 local function handle_tool_result_firing_close(firing_id, body)
   local ref = state.firing_to_node[firing_id]
   if ref == nil then return end

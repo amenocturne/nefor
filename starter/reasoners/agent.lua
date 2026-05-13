@@ -649,14 +649,13 @@ local function on_graph_cancel(body)
   for _, v in ipairs(victims) do
     local entry = v.entry
     -- 1. interrupt the provider stream (per-chat). Mock honours chat_id;
-    -- openai-provider currently fanouts to all chats — that's the open
-    -- follow-up captured in the binary's TODO at main.rs:419-425.
+    -- openai-provider currently fanouts to all chats.
     emit(entry.provider, {
       kind    = entry.provider .. ".interrupt",
       chat_id = entry.chat_id,
     })
     -- 2. close the firing with a terminal error so the scheduler
-    -- de-registers it. Matches the close-on-provider-error shape.
+    -- de-registers it.
     send_terminal_err(v.firing_id, "[Graph cancelled by user]")
   end
 end

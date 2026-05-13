@@ -1,11 +1,9 @@
--- starter/lib/envelope.lua — envelope construction + id helpers.
+-- Envelope construction + id helpers.
 --
--- Pure helpers extracted from agentic_workflow.lua during the Phase 1
--- refactor. The behaviour is unchanged: envelopes are stamped with
--- from="engine" + ts via nefor.engine.now() and shipped via
--- nefor.engine.send. A pcall around json.encode catches non-UTF-8
--- payloads, surfaces a chat.popup, and exits the engine cleanly so a
--- broker hang doesn't strand the user.
+-- Envelopes are stamped with from="engine" + ts via nefor.engine.now() and
+-- shipped via nefor.engine.send. A pcall around json.encode catches
+-- non-UTF-8 payloads, surfaces a chat.popup, and exits the engine cleanly
+-- so a broker hang doesn't strand the user.
 --
 -- `id_seq` lives here because both `uuid_lite()` (this module) and
 -- `ids.mint_chat_run_id()` fold the same monotonic counter into their
@@ -106,16 +104,10 @@ function M.emit_as(from, target, body)
     return
   end
   -- target ~= nil → engine sends to one peer (one log entry).
-  -- target == nil → engine broadcasts to every ready peer (still ONE
-  -- log entry, with target=None on the broker side). The previous
-  -- per-peer loop was a Phase-1 fallback dating from before the
-  -- engine binding accepted nil as a broadcast target; that loop
-  -- generated N log entries per broadcast, which the actor.lua bus
-  -- subscriber then dispatched N times — causing duplicate handling
-  -- of every emit_broadcast envelope (e.g. graph.node_result fired
-  -- once per peer through the resident reasoners' receive_msg).
-  -- Ship one entry; let the broker's targeted/broadcast distinction
-  -- handle peer fan-out without polluting the in-VM dispatch path.
+  -- target == nil → engine broadcasts to every ready peer (still ONE log
+  -- entry, with target=None on the broker side). Ship one entry; the
+  -- broker's targeted/broadcast distinction handles peer fan-out without
+  -- the actor.lua bus subscriber dispatching the same envelope N times.
   nefor.engine.send(payload, target)
 end
 
