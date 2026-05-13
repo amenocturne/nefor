@@ -30,7 +30,7 @@ fn starter_lead_workflow_full() {
     install_stub_nefor(&lua).expect("install nefor stub");
     set_package_path(&lua).expect("set package.path");
 
-    let test_path = starter_dir().join("lead_workflow_test.lua");
+    let test_path = repo_root().join("tests/lua/lead-workflow/workflow_test.lua");
     let src = std::fs::read_to_string(&test_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", test_path.display()));
 

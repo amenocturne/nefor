@@ -1068,6 +1068,11 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
     let lua_root_str = lua_root.display().to_string();
     let rg_plugin_lua = repo_root().join("plugins").join("reasoner-graph").join("lua");
     let rg_plugin_lua_str = rg_plugin_lua.display().to_string();
+    // `tests/lua/?.lua` so `require("sessions.test")` resolves to the
+    // test-only escape hatch at `tests/lua/sessions/test.lua` — the file
+    // is not shipped under starter/ to keep the installed config pure.
+    let tests_lua = repo_root().join("tests").join("lua");
+    let tests_lua_str = tests_lua.display().to_string();
     let script = format!(
         r#"
         package.path = table.concat({{
@@ -1077,12 +1082,15 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
           "{rg_plugin_lua}/?/init.lua",
           "{lua_root}/?.lua",
           "{lua_root}/?/init.lua",
+          "{tests_lua}/?.lua",
+          "{tests_lua}/?/init.lua",
           package.path,
         }}, ";")
         "#,
         starter = starter_str,
         lua_root = lua_root_str,
         rg_plugin_lua = rg_plugin_lua_str,
+        tests_lua = tests_lua_str,
     );
     lua.load(&script).exec()
 }

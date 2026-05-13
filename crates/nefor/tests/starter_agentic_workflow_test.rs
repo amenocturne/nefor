@@ -8,7 +8,7 @@
 //! config — but the surface still has to be present so module load and
 //! the for_chat closure don't blow up on first invocation.
 //!
-//! The Lua test file itself is `starter/agentic_workflow_test.lua`.
+//! The Lua test file itself is `tests/lua/agentic-loop/workflow_test.lua`.
 
 use std::path::PathBuf;
 
@@ -37,7 +37,7 @@ fn starter_agentic_workflow_for_chat_model_switch() {
     install_stub_nefor(&lua).expect("install nefor stub");
     set_package_path(&lua).expect("set package.path");
 
-    let test_path = starter_dir().join("agentic_workflow_test.lua");
+    let test_path = repo_root().join("tests/lua/agentic-loop/workflow_test.lua");
     let src = std::fs::read_to_string(&test_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", test_path.display()));
 

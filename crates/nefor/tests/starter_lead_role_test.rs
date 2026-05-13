@@ -57,7 +57,7 @@ fn starter_lead_role_smoke() {
     let lua = Lua::new();
     set_package_path(&lua).expect("set package.path");
 
-    let test_path = starter_dir().join("lead_role_test.lua");
+    let test_path = repo_root().join("tests/lua/lead-workflow/role_test.lua");
     let src = std::fs::read_to_string(&test_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", test_path.display()));
 

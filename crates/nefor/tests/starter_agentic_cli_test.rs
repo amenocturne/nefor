@@ -45,7 +45,7 @@ fn starter_agentic_cli_parser_tests() {
     install_stub_nefor(&lua).expect("install nefor stub");
     set_package_path(&lua).expect("set package.path");
 
-    let test_path = starter_dir().join("agentic_cli_test.lua");
+    let test_path = repo_root().join("tests/lua/cli/agentic_cli_test.lua");
     let src = std::fs::read_to_string(&test_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", test_path.display()));
 
