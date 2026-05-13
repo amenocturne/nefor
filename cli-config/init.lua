@@ -70,10 +70,9 @@ pm.install({
     dir  = PROJECT_ROOT .. "/plugins/tool-gate/lua/tool-gate",
   },
 
-  -- reasoner-graph ships the `spawn_graph` protocol primitive only —
-  -- the actor-spec wiring is identity passthrough and lives in
-  -- starter/graph.lua via `core.actor.identity_spec`. `require(
-  -- "reasoner-graph.spawn_graph")` resolves the sub-module.
+  -- reasoner-graph's actor-spec wiring is identity passthrough and
+  -- lives in starter/graph.lua via `core.actor.identity_spec`. The
+  -- `spawn_graph` protocol contract lives at `libs.spawn-graph`.
   {
     "amenocturne/nefor",
     name = "reasoner-graph",
