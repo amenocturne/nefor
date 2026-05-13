@@ -1,12 +1,7 @@
 -- starter/chat.lua — chat surface as a Lua composition over tui.* primitives.
 --
--- Visual + behavioral parity with the legacy `nefor-chat` plugin. All hex
--- codes, glyphs, segment ordering, and keymap are sourced from the
--- reverse-engineered spec at
---
--- Architecture (per nefor-tui-declarative-spec): the engine ships zero
--- opinion. Every color, every layout, every glyph below is editable —
--- this file IS the chat surface's identity.
+-- The engine ships zero opinion. Every color, every layout, every
+-- glyph below is editable — this file IS the chat surface's identity.
 --
 -- Inbound chat-contract events handled here:
 --   chat.message.append, chat.stream.delta, chat.stream.end,
@@ -108,11 +103,10 @@ end
 
 -- Pretty-print a Lua table as 2-space-indented JSON-ish text. Used by
 -- `tool_expanded` to render `chat.tool.start` `input` payloads in the
--- expanded view, matching legacy spec section 5: "{pretty-printed JSON}
--- (2-space indent, HL_MD_CODE_BLOCK)". Strings are quoted, numbers and
--- booleans render verbatim, nested tables nest one indent level. Arrays
--- and objects are distinguished by whether the table has a numeric `[1]`
--- key (no general way to tell in Lua, but the JSON-decoded shape from
+-- expanded view. Strings are quoted, numbers and booleans render
+-- verbatim, nested tables nest one indent level. Arrays and objects
+-- are distinguished by whether the table has a numeric `[1]` key (no
+-- general way to tell in Lua, but the JSON-decoded shape from
 -- nefor-protocol is reliable).
 local function pretty_json(value, indent)
   indent = indent or 0
@@ -158,12 +152,6 @@ local function pretty_json(value, indent)
       pad_n, k, pretty_json(value[k], indent + 1))
   end
   return "{\n" .. table.concat(parts, ",\n") .. "\n" .. pad .. "}"
-end
-
-local function strip_claude_prefix(model)
-  if model == nil then return nil end
-  local stripped = model:gsub("^claude%-", "")
-  return stripped
 end
 
 local function humanize_duration_ms(ms)
@@ -299,26 +287,22 @@ end
 -- styling — exact legacy hex codes
 ------------------------------------------------------------------------
 
--- Palette per legacy spec section 2.
+-- Palette. Single source of truth for the chat surface's colour names.
 local C = {
-  user            = "#7FB4FF",  -- HL_USER, HL_STATUS_BAR_FILL, HL_MD_LIST_MARKER, HL_MD_LINK, HL_STATUS_INFO
-  system          = "#808080",  -- HL_SYSTEM, HL_STATUS, HL_REASONING, HL_MD_QUOTE_BAR
-  status_dim      = "#606060",  -- HL_STATUS_DIM
-  status_warn     = "#D7AF5F",  -- HL_STATUS_WARN
-  status_danger   = "#D75F5F",  -- HL_STATUS_DANGER
-  status_ok       = "#87D787",  -- HL_STATUS_OK
-  md_heading      = "#FFB86C",  -- HL_MD_HEADING (Dracula orange)
-  md_code_fg      = "#C0C0C0",  -- HL_MD_CODE_INLINE / HL_MD_CODE_BLOCK fg
-  -- Code-block bg: a clearly-grey rectangle, not the near-black
-  -- #202020 the legacy spec carried — at low display contrast / on
-  -- terminals with a warm color profile the old value rendered as a
-  -- muddy brownish patch behind the glyphs (Bug A3 colour half).
-  -- #3a3a3a is light enough to read as 'grey rectangle' on every
-  -- profile while still sitting behind the C0C0C0 fg with comfortable
-  -- legibility (~7:1 contrast).
+  user            = "#7FB4FF",
+  system          = "#808080",
+  status_dim      = "#606060",
+  status_warn     = "#D7AF5F",
+  status_danger   = "#D75F5F",
+  status_ok       = "#87D787",
+  md_heading      = "#FFB86C",
+  md_code_fg      = "#C0C0C0",
+  -- Code-block bg: a clearly-grey rectangle that stays readable
+  -- against `md_code_fg` on every terminal profile (~7:1 contrast).
+  -- Darker values muddy out on warm-colour profiles.
   md_code_inline_bg = "#3a3a3a",
   md_code_block_bg  = "#3a3a3a",
-  footer          = "#707070",  -- HL_FOOTER
+  footer          = "#707070",
   -- Plan-message border. Yellow distinguishes a write-review plan from
   -- the user's blue block and the system's grey-italic line. Bright
   -- gold reads on every terminal profile and doesn't collide with the
@@ -329,8 +313,8 @@ local C = {
 
 local STYLE = {
   user_chrome     = { fg = C.user, bold = true },         -- ╭─╰│ borders
-  -- Input-field border. Same blue as user blocks per legacy spec
-  -- section 1 (input top/bot bars in HL_USER).
+  -- Input-field border. Same blue as user blocks so the input reads as
+  -- a peer to user message blocks rather than a separate widget kind.
   input_border          = { fg = C.user, bold = true },
   input_border_unfocused= { fg = C.status_dim },          -- dim when no focus
   body_default    = nil,                                  -- HL_ASSISTANT = terminal default
@@ -413,7 +397,6 @@ local MARKDOWN_THEME = {
 --                         status = "pending" | "approved" | "rejected" }
 --   in_flight         index of streaming assistant entry, or nil
 --   input_value       text_input value
---   focused_id        focus key (only "input" for now)
 --   show_sidebar      Ctrl+B toggle
 --   popup             nil | { variant, title, body, source?, ... }
 --                     variant ∈ "help" | "info" | "warning" | "error"
@@ -437,24 +420,21 @@ local MARKDOWN_THEME = {
 local DAG_LINGER_MS  = 2000
 local DOUBLE_ESC_MS  = 600
 
--- Shell-style input-history cap. The submitted prompts (NOT every
--- keystroke — the user-typed text at submit time) are kept in-memory
--- under `state.prompt_history` AND mirrored to a single jsonl-ish file
--- on disk so they survive nefor restarts; arrow-up in the chat input
--- recalls them in reverse order. Past the cap the oldest entries roll
--- off the disk file the next time we trim. One constant drives both
--- the in-memory cap (issue #39) and the on-disk trim.
+-- Shell-style input-history cap. Submitted prompts (NOT every
+-- keystroke — only the user-typed text at submit time) are kept
+-- in-memory under `state.prompt_history` AND mirrored to a single
+-- file on disk so they survive nefor restarts. Past the cap the
+-- oldest entries roll off the disk file the next time we trim. One
+-- constant drives both the in-memory cap and the on-disk trim.
 local INPUT_HISTORY_MAX = 50
 
 ------------------------------------------------------------------------
--- shell-style input history (issue #39)
+-- shell-style input history (persistent across nefor restarts)
 ------------------------------------------------------------------------
 -- Single shared file at `<data_root>/input-history` (NOT per-session —
 -- history is the user's, not the chat's). One submitted prompt per
 -- line, escaped so multi-line pastes round-trip without breaking the
--- per-line frame. The chat-input arrow-up reducer already navigates an
--- in-memory `state.prompt_history`; this layer just keeps that list
--- mirrored to disk so it survives a nefor restart.
+-- per-line frame.
 --
 -- Defined up here, near the constant + initial_state, so both
 -- `initial_state` (which hydrates from disk on first run) and the
@@ -593,7 +573,6 @@ local function initial_state()
     entries          = {},
     in_flight        = nil,
     input_value      = "",
-    focused_id       = "input",
     show_sidebar     = true,
     popup            = nil,
     stats            = {},
@@ -610,9 +589,8 @@ local function initial_state()
     dag_runs         = {},
     toasts           = {},
     -- Hydrate from <data_root>/input-history so arrow-up in the chat
-    -- input recalls submissions from prior nefor processes (issue #39
-    -- — shell-style persistent history). Empty on first run / read
-    -- failure.
+    -- input recalls submissions from prior nefor processes. Empty on
+    -- first run / read failure.
     prompt_history   = load_input_history(),
     history_cursor   = nil,
   }
@@ -820,7 +798,7 @@ local function md(source)
 end
 
 ------------------------------------------------------------------------
--- entry rendering — per legacy spec section 5
+-- entry rendering
 ------------------------------------------------------------------------
 
 -- User entry: full-width bordered block in HL_USER. Body stays in
@@ -833,7 +811,7 @@ local function render_user_entry(entry)
   )
 end
 
--- Reasoning rows above the assistant body. Per legacy spec section 5:
+-- Reasoning rows above the assistant body. Three visual states:
 --   live  (streaming + body empty)  → "▼ thinking…"  + body
 --   expanded (Ctrl+O)               → "▼ reasoning"  + body
 --   collapsed                       → "▸ reasoning (Ns)"
@@ -857,7 +835,7 @@ end
 
 -- Per-turn footer: "▣ <model> · <duration>" in HL_FOOTER.
 local function turn_footer(entry)
-  local model = strip_claude_prefix(entry.model)
+  local model = entry.model
   local dur = humanize_duration_ms(entry.duration_ms)
   if model and dur then
     return tui.text { content = "▣ " .. model .. " · " .. dur, style = STYLE.footer, wrap = "none" }
@@ -938,10 +916,10 @@ local function tool_expanded(entry)
   local rows = { tui.text { content = header, style = header_style, wrap = "none" } }
   rows[#rows + 1] = tui.text { content = "  input:",  style = STYLE.footer, wrap = "none" }
   -- spawn_graph: render as compact node-list + edge-list. Args of each
-  -- node are intentionally omitted (would clutter); future "focus a node"
-  -- UI surfaces them on demand. For everything else, prefer JSON pretty-
-  -- print of the structured input_table per legacy spec section 5; fall
-  -- back to the raw string when only a string was sent.
+  -- node are intentionally omitted (would clutter); future "focus a
+  -- node" UI surfaces them on demand. For everything else, prefer JSON
+  -- pretty-print of the structured input_table; fall back to the raw
+  -- string when only a string was sent.
   local input_text
   if entry.name == "spawn_graph" and entry.input_table
     and type(entry.input_table.graph) == "table" then
@@ -967,9 +945,9 @@ local function tool_expanded(entry)
   else
     -- Label the trailing block by terminal status. `error:` (red) for
     -- the deny / policy / unknown-tool / timeout paths so the block
-    -- reads as a denial rather than an empty `output:` (Bug B); the
-    -- tool-gate wrapper now puts the error message into the `output`
-    -- field so it lands here instead of being dropped on the floor.
+    -- reads as a denial rather than an empty `output:`. The tool-gate
+    -- wrapper puts the error message into the `output` field so it
+    -- lands here instead of being dropped on the floor.
     local label, label_style
     if entry.error then
       label, label_style = "  error:", STYLE.status_danger
@@ -1172,7 +1150,7 @@ local function build_statusline_segments(state)
   if state.gate_yolo then
     segs[#segs + 1] = { spans = { { text = "YOLO", fg = C.status_danger, bold = true } } }
   end
-  local model = strip_claude_prefix(state.model or (state.stats and state.stats.model))
+  local model = state.model or (state.stats and state.stats.model)
   if model then
     segs[#segs + 1] = { spans = { { text = model, fg = C.system } } }
   else
@@ -1204,8 +1182,8 @@ local function build_statusline_segments(state)
     segs[#segs + 1] = { spans = { { text = tostring(tps) .. " tok/s", fg = C.system } } }
   end
 
-  -- Scroll percentage segment (legacy spec section 4). Hidden when the
-  -- transcript fits the viewport (no scrollback). At-bottom shows
+  -- Scroll percentage segment. Hidden when the transcript fits the
+  -- viewport (no scrollback). At-bottom shows
   -- `100% ↓ bottom`; at-top `0% ↑ top`; mid `{pct}% ↑`.
   --
   -- `pcall` because the snapshot map only carries an entry once the
@@ -1993,11 +1971,11 @@ local function render_keepalive(state)
 end
 
 local function view(state)
-  -- Input field with full-width rounded border per legacy spec section
-  -- 7. The `tui.text_input` is the bare control; `bordered_box` wraps
-  -- it in `╭─╮ │ ╰─╯` chrome so the input visually matches user
-  -- message blocks. Border colour brightens (HL_USER) when the input
-  -- is focused; dims to HL_STATUS_DIM when a popup steals focus.
+  -- Input field with full-width rounded border. The text_input is the
+  -- bare control; the prompt widget wraps it in `╭─╮ │ ╰─╯` chrome so
+  -- it visually matches user message blocks. Border colour brightens
+  -- (user blue) when the input is focused; dims when a popup steals
+  -- focus.
   -- The input drops focus while certain popups own the keyboard.
   -- Tool permission expects single-char A/D; model picker takes
   -- printable chars as filter input — both paths require input to
@@ -2007,7 +1985,7 @@ local function view(state)
     state.popup.variant == "model_picker" or
     state.popup.variant == "session_picker"
   )
-  local input_focused = state.focused_id == "input" and not popup_owns_keys
+  local input_focused = not popup_owns_keys
   local input_border_style = input_focused
     and STYLE.input_border
     or STYLE.input_border_unfocused
@@ -2048,13 +2026,12 @@ local function view(state)
   end
 
   -- Left column = chat surface. Top → bottom: 1-row top gap /
-  -- transcript / slash autocomplete (when open) / input / statusline /
-  -- 1-row bottom gap / keepalive. Statusline lives BELOW the input
-  -- per legacy spec — pushing it above the input visibly inverts the
-  -- screen weight, making the input feel like a status row rather
-  -- than the primary focus surface. The bottom gap lifts the
-  -- statusline off the very last row so it doesn't sit flush against
-  -- the terminal frame.
+  -- transcript / input (carries its own autocomplete) / statusline /
+  -- 1-row bottom gap / keepalive. Statusline lives BELOW the input —
+  -- pushing it above the input visibly inverts the screen weight,
+  -- making the input feel like a status row rather than the primary
+  -- focus surface. The bottom gap lifts the statusline off the very
+  -- last row so it doesn't sit flush against the terminal frame.
   local left_column = tui.column {
     gap = 0,
     children = compact {
@@ -2348,14 +2325,13 @@ local function model_max_tokens(model)
 end
 
 ------------------------------------------------------------------------
--- @path preprocessor (#47)
+-- @path preprocessor
 ------------------------------------------------------------------------
 -- Inline file references like `@starter/chat.lua` into the user's
--- submitted text BEFORE it reaches the provider. The lead workflow
--- spec (lead-workflow-spec §1, §6, §8) treats this as a starter-config
--- prerequisite: the orchestrator's first turn sees the file contents
--- already inlined; large files truncate with a marker pointing at the
--- existing `read_file` tool for the full contents.
+-- submitted text BEFORE it reaches the provider. The orchestrator's
+-- first turn sees the file contents already inlined; large files
+-- truncate with a marker pointing at the existing `read_file` tool
+-- for the full contents.
 --
 -- Scope (intentionally small):
 --   * pattern is `@<non-whitespace>`; trailing common punctuation
@@ -2399,13 +2375,15 @@ local function at_path_read(path)
   return data
 end
 
--- Try cwd-relative first, then treat the path as already absolute.
--- Both branches can resolve the same string when cwd happens to be `/`,
--- but io.open is idempotent so the duplication is harmless.
+-- Resolve `@token` against the current cwd via `io.open`. Returns
+-- (data, resolved_path) on success, (nil, nil) when the token doesn't
+-- resolve. Absolute paths are handled implicitly by io.open — the
+-- cwd-relative attempt above already covers `/abs/path` because Lua
+-- treats the leading `/` as absolute. No separate absolute branch is
+-- needed.
 local function at_path_resolve(token)
   local data = at_path_read(token)
   if data ~= nil then return data, token end
-  if token:sub(1, 1) == "/" then return nil, nil end
   return nil, nil
 end
 
@@ -2606,9 +2584,9 @@ local function update(msg, state)
       end
       -- `/model` (no args) — open the picker and fan out one
       -- `chat.model.list_requested` per connected provider so the
-      -- popup can aggregate results as they land. Per legacy spec
-      -- section 8 / 12. The adapter rejects requests that don't
-      -- name a provider, so we MUST fan out per-provider here.
+      -- popup can aggregate results as they land. The adapter rejects
+      -- requests that don't name a provider, so we MUST fan out
+      -- per-provider here.
       local connected = {}
       for n, st in pairs(state.auth or {}) do
         if st == "connected" then connected[#connected + 1] = n end
@@ -2686,7 +2664,7 @@ local function update(msg, state)
     -- against `pending_user_echo` so we render once locally + once on
     -- replay, never twice live.
     --
-    -- `@path` preprocessor (#47): the wire envelope, the local user
+    -- `@path` preprocessor: the wire envelope, the local user
     -- bubble, and the dedup marker all carry the EXPANDED text. The
     -- user sees exactly what the model receives (transparency); the
     -- orchestrator's echo round-trips through the same dedup gate.
@@ -2700,7 +2678,7 @@ local function update(msg, state)
     -- Prepend to prompt_history (newest at index 1) and cap. History
     -- recall reads from index 1, so prepending keeps the cursor model
     -- simple — Up = older = larger index, Down = newer = smaller.
-    -- Mirror to disk so the entry survives a nefor restart (issue #39).
+    -- Mirror to disk so the entry survives a nefor restart.
     local history = { text }
     for i, v in ipairs(state.prompt_history or {}) do
       if i >= INPUT_HISTORY_MAX then break end
@@ -2823,8 +2801,8 @@ local function update(msg, state)
     end
   end
 
-  -- Model picker popup keys (legacy spec section 12). Up/Down move the
-  -- cursor through the filtered list; Enter emits chat.model.set for
+  -- Model picker popup keys. Up/Down move the cursor through the
+  -- filtered list; Enter emits chat.model.set for
   -- the cursor row + closes; Backspace and printable chars edit the
   -- filter query (re-clamping cursor against the new filtered count).
   -- Model + session picker popups: delegate cursor/filter handling to
@@ -3025,7 +3003,7 @@ local function update(msg, state)
     --
     -- Replay-mode flip is driven by `sessions.replay.start` /
     -- `sessions.replay.end` markers below — the framing-marker
-    -- contract (Phase 4.5) is the canonical replay window now.
+    -- contract is the canonical replay window.
     return shallow_merge(state, { dag_runs = {}, firing_to_node = {} }), {}
   end
 
@@ -3262,13 +3240,10 @@ local function update(msg, state)
     -- whatever the user set via /model in the LIVE session before the
     -- /resume (chat.model.set_ack is persisted, so the original
     -- session's mock-provider hello → set_ack lives in the jsonl).
-    -- Bug A7 manifested as: pick mock → /new → /model qwen → /resume
-    -- prior mock chat → status bar reverts to mock-model even though
-    -- the orchestrator's live config (and the next reply's provider)
-    -- is qwen. The agentic-loop owns the live provider/model; it
-    -- doesn't replay chat.model.set on its own input gate, so its
-    -- state stays correct. chat.lua mirrors that posture by ignoring
-    -- replayed set_ack envelopes — only LIVE ones drive the badge.
+    -- The agentic-loop owns the live provider/model and doesn't
+    -- replay chat.model.set on its own input gate, so its state stays
+    -- correct; chat.lua mirrors that posture by ignoring replayed
+    -- set_ack envelopes — only LIVE ones drive the badge.
     if state.replay_mode then return state, {} end
     return shallow_merge(state, {
       model = msg.model or state.model,
@@ -3278,7 +3253,7 @@ local function update(msg, state)
 
   if kind == "chat.models.listed" then
     -- A provider answered the list-request. Append into the open
-    -- model_picker popup if one is up; otherwise drop (legacy spec).
+    -- model_picker popup if one is up; otherwise drop.
     if not (state.popup and state.popup.variant == "model_picker") then
       return state, {}
     end
@@ -3377,15 +3352,15 @@ local function update(msg, state)
   -- start clean (sessions.session_start clears it). Mirrors the
   -- chat.tool.permission_request guard above.
   --
-  -- Wire shape post Phase 3b: reasoner-graph emits
+  -- Wire shape from reasoner-graph:
   --   * graph.run_started  { run_id, total_nodes }
   --   * graph.node.fired   { run_id, node_id, firing_id, reasoner }
   --     — paired observer for each tool.invoke dispatch.
   --   * tool.result        { id, result | error }
   --     — id == firing_id closes one node; id == run_id closes the run.
-  --   We also keep a firing_id → (run_id, node_id) map per state so
-  --   tool.result events can be routed back to the right node without
-  --   parsing dispatch traffic.
+  -- We also keep a firing_id → (run_id, node_id) map per state so
+  -- tool.result events can be routed back to the right node without
+  -- parsing dispatch traffic.
   if kind == "graph.run_started" then
     if state.replay_mode then return state, {} end
     local now = tui.now_ms()
