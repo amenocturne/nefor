@@ -15,6 +15,8 @@ M.COMMANDS = {
   { name = "resume",  aliases = {},          hint = "resume previous session",                takes_args = true },
   { name = "yolo",    aliases = {},          hint = "disable tool permission prompts (DANGEROUS)", takes_args = false },
   { name = "safe",    aliases = {},          hint = "re-enable tool permission prompts",      takes_args = false },
+  { name = "approve", aliases = {},          hint = "approve the pending plan (optional reason)", takes_args = true },
+  { name = "reject",  aliases = {},          hint = "reject the pending plan with a reason", takes_args = true },
 }
 
 local function slash_filter(query)
