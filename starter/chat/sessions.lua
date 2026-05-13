@@ -7,27 +7,12 @@
 -- replay jsonl → resume_done). No process exit, no sidechannel file —
 -- the TUI stays alive across the whole flip.
 
+local common = require("chat.common")
+
 local M = {}
 
--- Resolve the sessions data root. Must match the engine's
--- nefor.fs.data_root() exactly — the picker reads from the same
--- directory the writer writes to. Resolution order, first hit wins:
---   1. NEFOR_DATA_DIR — canonical setting (engine always propagates
---      its resolved value into this env var when spawning plugins).
---   2. XDG_DATA_HOME/nefor — standard XDG.
---   3. $HOME/.local/share/nefor — XDG default fallback.
-local function data_root()
-  local override = os.getenv("NEFOR_DATA_DIR")
-  if override ~= nil and override ~= "" then return override end
-  local xdg = os.getenv("XDG_DATA_HOME")
-  if xdg ~= nil and xdg ~= "" then return xdg .. "/nefor" end
-  local home = os.getenv("HOME") or ""
-  if home == "" then return nil end
-  return home .. "/.local/share/nefor"
-end
-
 function M.session_dir()
-  local root = data_root()
+  local root = common.data_root()
   if root == nil then return nil end
   return root .. "/sessions"
 end

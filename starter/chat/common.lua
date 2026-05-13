@@ -14,6 +14,30 @@ M.shallow_merge   = util.shallow_merge
 M.NIL_SENTINEL    = util.NIL
 M.bordered_box    = util.bordered_box
 
+-- Resolve the engine's data root from env vars. Must match
+-- `nefor.fs.data_root()` exactly so readers and writers agree on the
+-- on-disk location. Cascade, first hit wins:
+--   1. NEFOR_DATA_DIR — canonical setting (engine always propagates
+--      its resolved value into this env var when spawning plugins).
+--   2. XDG_DATA_HOME/nefor — standard XDG.
+--   3. $HOME/.local/share/nefor — XDG default fallback.
+-- Returns nil only when NEFOR_DATA_DIR and XDG_DATA_HOME and HOME are
+-- all unset (no sane default available).
+--
+-- The chat surface runs inside the nefor-tui plugin's Lua VM where the
+-- engine `nefor.fs.*` bindings aren't installed; this resolver is a
+-- matching reimplementation rather than a delegation. Centralised here
+-- so the session picker and the input-history file stay in sync.
+function M.data_root()
+  local override = os.getenv("NEFOR_DATA_DIR")
+  if override ~= nil and override ~= "" then return override end
+  local xdg = os.getenv("XDG_DATA_HOME")
+  if xdg ~= nil and xdg ~= "" then return xdg .. "/nefor" end
+  local home = os.getenv("HOME") or ""
+  if home == "" then return nil end
+  return home .. "/.local/share/nefor"
+end
+
 -- Drop nil holes from an array so reducer-built children lists stay
 -- dense. Lua's table constructor with conditionally-nil entries leaves
 -- gaps that break `ipairs`; the renderer relies on contiguous indices.
