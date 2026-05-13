@@ -110,7 +110,7 @@ local actor          = require("core.actor")
 local history_replay = require("core.history_replay")
 local sessions       = require("sessions")
 local cfg            = require("config").active
-local lead_role      = require("lead_role")
+local lead_role      = require("lead-workflow.role")
 
 function dispatch(current_log)
   ncp.dispatch(current_log)
@@ -153,7 +153,7 @@ sessions.init()
 require("libs.generic-provider").declare()
 require("libs.generic-tool").declare()
 
-actor.spawn(require("combinators"))
+actor.spawn(require("compositors.combinators"))
 
 -- Boot the orchestrator actor + resident reasoner handlers BEFORE
 -- the plugins they coordinate. The actor runtime queues incoming
@@ -184,7 +184,7 @@ actor.spawn(require("reasoners"))
 --     test/prod switch.
 -------------------------------------------------------------------------
 
-local provider = require("provider")
+local provider = require("compositors.provider")
 for _, p in ipairs(cfg.providers or {}) do
   if p.kind == "mock" then
     -- mock-plugin speaks the same wire protocol as the openai-provider
@@ -224,13 +224,13 @@ end
 -- 3c. Reasoner graph
 -------------------------------------------------------------------------
 
-actor.spawn(require("graph").spawn_spec({ require("config").bin("reasoner-graph") }))
+actor.spawn(require("compositors.graph").spawn_spec({ require("config").bin("reasoner-graph") }))
 
 -------------------------------------------------------------------------
 -- 3d. Tool gate + basic-tools
 -------------------------------------------------------------------------
 
-local tools = require("tools")
+local tools = require("compositors.tools")
 local tool_gate_argv = { require("config").bin("tool-gate") }
 for _, t in ipairs(cfg.tool_gate.prompt_tools or {}) do
   tool_gate_argv[#tool_gate_argv + 1] = "--prompt"
@@ -257,7 +257,7 @@ actor.spawn(require("lead-workflow"))
 -- 3e. Chat (declarative TUI)
 -------------------------------------------------------------------------
 
-actor.spawn(require("chat_bridge").spawn_spec({
+actor.spawn(require("compositors.chat_bridge").spawn_spec({
   require("config").bin("nefor-tui"),
-  "--script", STARTER_ROOT .. "/chat.lua",
+  "--script", STARTER_ROOT .. "/chat/init.lua",
 }))

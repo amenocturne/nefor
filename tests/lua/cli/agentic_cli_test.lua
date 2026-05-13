@@ -2,14 +2,14 @@
 --
 -- Loaded by `crates/nefor/tests/starter_agentic_cli_test.rs`. The Rust
 -- harness installs a stub `nefor` surface (json + bus.on_event +
--- engine.exit + io.read_line + log) so `require("agentic_cli")`
+-- engine.exit + io.read_line + log) so `require("cli")`
 -- succeeds; this file then drives the parser directly without
 -- spawning anything on the bus.
 --
 -- We test only the parser because the full run flow needs the broker;
 -- those scenarios live in the smoke-test path (Phase 3 e2e suite).
 
-local agentic_cli = require("agentic_cli")
+local agentic_cli = require("cli")
 
 local function assert_eq(actual, expected, msg)
   if actual ~= expected then

@@ -521,7 +521,7 @@ end
 -- pre-decoded envelope; assertion is on what `_test.calls()` recorded.
 
 local agentic_loop_mod = require("agentic-loop")
-local openai_provider  = require("provider")
+local openai_provider  = require("compositors.provider")
 
 local function build_provider_chain(name, opts)
   local spec = openai_provider.spawn_spec(name, { "/bin/true" }, opts)
@@ -1116,7 +1116,7 @@ end
 --     both stops a future "swap approve/deny somewhere" regression
 --     from passing this test by accident.)
 
-local tools_mod = require("tools")
+local tools_mod = require("compositors.tools")
 
 local function spawn_tool_gate_wrapper()
   local spec = tools_mod.gate_spec("tool-gate", { "/bin/true" })

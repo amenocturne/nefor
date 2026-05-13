@@ -9,7 +9,7 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 - `crates/nefor-combinators/` — in-process algebra library (pure Rust, minimal deps). Trait shapes for Rust-native plugins. The canonical combinator library at runtime is the plugin, not the crate.
 - `crates/nefor-protocol/` — NCP v0.1 envelope + system-body types. Used by plugins; engine no longer imports it (engine is pure string-bus).
 - `crates/nefor/` — engine binary. Reads plugin stdin, stamps `{origin, ts}`, persists to session log, invokes a required Lua `dispatch` hook, routes the hook's `nefor.engine.send` calls. All NCP semantics live in Lua.
-- `plugins/nefor-tui/` — declarative TUI plugin (Rust): reconciler + line-diff renderer + Lua VM + 15 layout primitives. Hosts the chat surface as a Lua composition (`starter/chat.lua`).
+- `plugins/nefor-tui/` — declarative TUI plugin (Rust): reconciler + line-diff renderer + Lua VM + 15 layout primitives. Hosts the chat surface as a Lua composition (`starter/chat/init.lua`).
 - `plugins/nefor-combinators/` — typed combinator registry keyed by `Identity (arity, input_type, output_multiset)`; per-trait constraint validation (Merge, Into, Fanout, Equivalent).
 - `plugins/generic-provider/`, `plugins/generic-tool/` — passive type-registry hubs owning canonical types (`ProviderIn`, `ProviderOut`, `ChatHistory`, `ToolCalls`, `ToolResults`, …). Concrete providers/tools declare `Into`/`From` against these so graphs are provider-agnostic.
 - `plugins/openai-provider/` — generic OpenAI-compatible provider with chat-id-keyed `Chats` map (`<prefix>.chat.{create, append, complete, delete}`). Configurable base URL + model. Declares `Into` against `generic-provider` types.
@@ -18,12 +18,17 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 - `plugins/basic-tools/` — `read_file` / `write_file` / `bash` built-ins.
 - `plugins/mock-plugin/` — scriptable NCP actor for integration tests. Local Ollama works through `openai-provider` directly with `static_token = "ollama-local"`.
 - `tools/fake-engine/` — harness that impersonates the engine for plugin-side tests.
-- `starter/init.lua` — default composition. Sets `package.path`, defines the global `dispatch` hook (delegates to `ncp.dispatch`), spawns plugins via `nefor.plugins.spawn`, wires per-edge `from_plugin`/`to_plugin` transforms.
-- `starter/ncp.lua` — NCP v0.1 in Lua (handshake, broadcast-minus-sender, replay-on-attach, errors). JSON via the engine-provided `nefor.json` (serde_json bridged through mlua).
-- `starter/agentic_workflow.lua` — orchestration glue: per-edge transform factories (`for_provider`, `for_reasoner_graph`, `for_tool_gate`, `for_chat`), reasoner-type handlers (`responder`, `provider-wrapper`, `tool-executor`, `adapter`, `terminal`), `spawn_graph` tool binding, chat-input intake.
-- `starter/sessions.lua` — Lua-side session library: boot/shutdown/resume + jsonl persistence over the bus.
-- `starter/chat.lua` — chat surface as a Lua composition over `tui.*` primitives (transcript, statusline, input, popups, slash commands).
-- `starter/agentic_cli.lua` — virtual `agentic-cli` plugin: surfaces `agentic_workflow` over stdin/stdout for `nefor plugin agentic-cli "<prompt>"`.
+- `starter/init.lua` — default composition. Sets `package.path`, defines the global `dispatch` hook (delegates to `core.ncp.dispatch`), spawns plugins via `nefor.plugins.spawn`, wires per-edge `from_plugin`/`to_plugin` transforms.
+- `lua/core/` — shipped library: NCP v0.1 (handshake, broadcast-minus-sender, replay-on-attach, errors), actor runtime, history replay. JSON via the engine-provided `nefor.json`.
+- `starter/agentic-loop/` — orchestrator state machine.
+- `starter/reasoners/` — Lua-resident reasoner type handlers (`responder`, `provider-wrapper`, `tool-executor`, `adapter`, `terminal`, `agent`, `run`, `loop_counter`).
+- `starter/sessions/` — sessions actor: boot/shutdown/resume + jsonl persistence over the bus.
+- `starter/chat/` — chat surface composed over `tui.*` primitives (entry `chat/init.lua`; transcript, statusline, input, popups, slash commands as submodules).
+- `starter/cli/` — virtual `agentic-cli` plugin: surfaces the loop over stdin/stdout for `nefor plugin agentic-cli "<prompt>"`.
+- `starter/lead-workflow/` — lead role plus the dispatch-graph / write-review / await-approval tool surface.
+- `starter/compositors/` — actor-spec builders per plugin binary (provider, tools, graph, combinators, chat_bridge).
+- `starter/mock-provider/` — script loaded by `mock-plugin` to impersonate an openai-compatible provider with deterministic responses.
+- `starter/config/` — settings table consumed by `starter/init.lua`.
 
 ## Path resolution
 

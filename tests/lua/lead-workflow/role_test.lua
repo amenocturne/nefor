@@ -26,7 +26,7 @@ local function contains(list, target)
 end
 
 -- Module loads without error.
-local lead_role = require("lead_role")
+local lead_role = require("lead-workflow.role")
 
 -- LEAD_SYSTEM_PROMPT is a non-empty string with the expected role-cue.
 assert_true(type(lead_role.LEAD_SYSTEM_PROMPT) == "string", "LEAD_SYSTEM_PROMPT is a string")

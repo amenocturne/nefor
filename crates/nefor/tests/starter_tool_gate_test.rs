@@ -309,7 +309,7 @@ fn tool_gate_wrapper_swaps_huge_tool_result_output_to_summary() {
     // small tool.result (must pass through verbatim).
     lua.load(
         r#"
-        local tools = require("tools")
+        local tools = require("compositors.tools")
         local spec = tools.gate_spec("tool-gate", { "fake-binary" })
         _from_plugin = spec.from_plugin
 
@@ -805,7 +805,7 @@ fn tool_gate_wrapper_emits_agents_md_on_outbound_path_touching_invoke() {
     lua.load(&format!(
         r#"
         require("tool-gate.agents_md")._reset()
-        local tools = require("tools")
+        local tools = require("compositors.tools")
         local spec = tools.gate_spec("tool-gate", {{ "fake-binary" }})
         spec.to_plugin({{
             -- Path-touching: must trigger AGENTS.md emission.

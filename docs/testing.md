@@ -65,7 +65,7 @@ export NEFOR_PLUGIN_DIR=$PWD/plugins
 export USE_MOCK_PROVIDER=true
 ```
 
-`USE_MOCK_PROVIDER=true` switches `cli-config/init.lua` to spawn `mock-plugin` running `starter/mock_provider.lua` instead of `openai-provider`. Drop the env var to use a real provider.
+`USE_MOCK_PROVIDER=true` switches `cli-config/init.lua` to spawn `mock-plugin` running `starter/mock-provider/init.lua` instead of `openai-provider`. Drop the env var to use a real provider.
 
 ### Single-shot mode
 
@@ -232,14 +232,14 @@ fn my_new_scenario() {
 - Thread-per-pipe drain (avoids the ~64KB stdout pipe-buffer deadlock that otherwise stalls `wait_with_output` in stream-json mode)
 - One-time `cargo build` via `Once` guard (cargo's artifact lock serializes parallel builds)
 
-If the prompt doesn't have a canned response in `starter/mock_provider.lua`, the mock falls through to `[mock provider: no canned match for: <prompt>]`. Use this for scenarios that don't care about response content (e.g. testing flag plumbing or REPL multi-turn). Add a new scripted prompt to `mock_provider.lua` only if a deterministic content match is required.
+If the prompt doesn't have a canned response in `starter/mock-provider/init.lua`, the mock falls through to `[mock provider: no canned match for: <prompt>]`. Use this for scenarios that don't care about response content (e.g. testing flag plumbing or REPL multi-turn). Add a new scripted prompt to `mock-provider/init.lua` only if a deterministic content match is required.
 
-## Adding scenarios to mock_provider.lua
+## Adding scenarios to mock-provider/init.lua
 
 The mock has a scripted-table pattern: prompt-substring match → response shape.
 
 ```lua
--- starter/mock_provider.lua
+-- starter/mock-provider/init.lua
 
 local SCRIPTS = {
   -- Existing canonical
@@ -253,7 +253,7 @@ local SCRIPTS = {
 }
 ```
 
-Document at the top of `mock_provider.lua` what prompts trigger what responses. Don't change existing scripted responses (other tests depend on them); only add new ones.
+Document at the top of `mock-provider/init.lua` what prompts trigger what responses. Don't change existing scripted responses (other tests depend on them); only add new ones.
 
 ## Troubleshooting
 

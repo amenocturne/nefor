@@ -33,7 +33,7 @@ const PROTOCOL_VERSION: &str = "0.1";
 /// Default scenario when no `--script` flag is supplied. Useful for
 /// `cargo run -p nefor-tui` smoke runs and `cargo install` users who
 /// haven't picked a chat composition yet. The real chat surface lives
-/// at `starter/chat.lua` and gets loaded via `--script <path>`.
+/// at `starter/chat/init.lua` and gets loaded via `--script <path>`.
 const PLACEHOLDER_SCENARIO: &str = r#"
     tui.start {
       initial_state = { count = 0 },

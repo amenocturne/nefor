@@ -100,7 +100,7 @@ actor.install()
 actor.spawn(sessions)
 sessions.init()
 
-local agentic_cli = require("agentic_cli")
+local agentic_cli = require("cli")
 
 -- ------------------------------------------------------------------
 -- Plugin spawn order (mirrors starter/init.lua minus chat/tui).
@@ -109,7 +109,7 @@ local agentic_cli = require("agentic_cli")
 require("libs.generic-provider").declare()
 require("libs.generic-tool").declare()
 
-actor.spawn(require("combinators"))
+actor.spawn(require("compositors.combinators"))
 
 local agentic_loop = require("agentic-loop")
 agentic_loop.configure {
@@ -137,7 +137,7 @@ actor.spawn(require("reasoners"))
 local PROVIDER_NAME  = cfg.provider.name
 local PROVIDER_MODEL = cfg.provider.model
 
-local provider = require("provider")
+local provider = require("compositors.provider")
 if cfg.plugins.spawn_mock then
   -- mock-plugin uses the same wire protocol as the openai-provider
   -- binary, so the provider actor spec works as-is.
@@ -168,9 +168,9 @@ else
   ))
 end
 
-actor.spawn(require("graph").spawn_spec({ require("config").bin("reasoner-graph") }))
+actor.spawn(require("compositors.graph").spawn_spec({ require("config").bin("reasoner-graph") }))
 
-local tools = require("tools")
+local tools = require("compositors.tools")
 local tool_gate_argv = { require("config").bin("tool-gate") }
 for _, t in ipairs(cfg.tool_gate.prompt_tools or {}) do
   tool_gate_argv[#tool_gate_argv + 1] = "--prompt"

@@ -1,6 +1,6 @@
 # chat-contract v0.1
 
-The event vocabulary the chat surface (composed in `starter/chat.lua`, hosted by the `nefor-tui` plugin) consumes and emits. It is producer-agnostic: any LLM harness — `mock-plugin`, `openai-provider` against Ollama, a future `example-harness` — can drive the chat surface by hitting these event kinds. Harnesses that already speak a different namespace adapt via per-plugin transforms in `init.lua` (see [Adapting a non-conforming harness](#adapting-a-non-conforming-harness)).
+The event vocabulary the chat surface (composed in `starter/chat/`, hosted by the `nefor-tui` plugin) consumes and emits. It is producer-agnostic: any LLM harness — `mock-plugin`, `openai-provider` against Ollama, a future `example-harness` — can drive the chat surface by hitting these event kinds. Harnesses that already speak a different namespace adapt via per-plugin transforms in `init.lua` (see [Adapting a non-conforming harness](#adapting-a-non-conforming-harness)).
 
 This document is plugin-layer convention, not part of NCP. The protocol spec lives at [`protocol/v0.1/spec.md`](../protocol/v0.1/spec.md); ecosystem conventions for emitting and consuming events generally live in [`plugin-authoring.md`](./plugin-authoring.md).
 

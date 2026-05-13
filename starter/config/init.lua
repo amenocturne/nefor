@@ -40,7 +40,7 @@ M.active = {
       kind        = "mock",
       name        = "mock-plugin",
       -- Resolved against STARTER_ROOT in init.lua at load time.
-      mock_script = "mock_provider.lua",
+      mock_script = "mock-provider/init.lua",
     },
     {
       kind         = "openai",
