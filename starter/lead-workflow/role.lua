@@ -93,7 +93,6 @@ M.ORCHESTRATION_TOOLS = {
   "read_file",
   "dispatch-graph",
   "write-review",
-  "await-approval",
 }
 
 return M

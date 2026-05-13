@@ -1,21 +1,46 @@
 -- starter/lead-workflow/init.lua — lead-workflow actor.
 --
--- Owns three pieces of state on top of the lead's existing chat-side
--- agentic-loop (see `agentic-loop/init.lua`):
+-- Owns two pieces of state on top of the lead's chat-side agentic-loop
+-- (see `agentic-loop/init.lua`):
 --
 --   1. The currently-executing graph (if any) — its run_id, so a
 --      session-end can cancel it cleanly.
---   2. The active plan + planApproved flag — persisted to the session
---      log via two custom envelopes (`lead-workflow.plan.submitted`,
---      `lead-workflow.plan.approved`) and replayed on /resume.
---   3. Per-firing await-approval state — which firing is blocked on
---      which plan_id, so a `/approve` / `/reject ...` user submit can
---      be routed back to the right tool.invoke.
+--   2. The currently-in-flight plan slot — one plan at a time.
+--      Ephemeral: lives in process memory, never replayed across
+--      session boundaries. Flushed when the user types anything
+--      non-verdict, or at session-end.
+--
+-- ## Plan approval contract (blocking write-review)
+--
+-- `write-review` is a BLOCKING tool. The lead calls it; this actor
+-- records the plan and the firing_id in `state.active_plan` but does
+-- NOT emit `tool.result`. The agentic-loop is now waiting for the tool
+-- to complete — the lead's turn is effectively paused.
+--
+-- One of three user actions resolves the deferred ack:
+--
+--   * `/approve [reason]`      — emit tool.result = "approved, proceed
+--                                with implementation". status="approved".
+--   * `/reject [reason]`       — emit tool.result = "rejected: <reason>,
+--                                revise". status="rejected".
+--   * any other user message   — emit tool.result = "user replied with
+--                                a comment, plan discarded — address
+--                                their reply: <text>". active_plan is
+--                                cleared. The same chat.input.submit
+--                                ALSO lands as a regular user.message
+--                                via agentic-loop's normal path, so the
+--                                lead's next inference has both.
+--
+-- After the verdict resolves, the approval is single-use per turn: the
+-- next genuine user message clears `state.active_plan`. Combined with
+-- the no-replay rule (state.active_plan does not survive session
+-- restart), this means writer dispatches always need a fresh approval
+-- across session boundaries.
 --
 -- ## Tools the lead invokes
 --
 -- Advertised to tool-gate as a virtual source `lead-workflow`. The
--- gate forwards `tool-gate.tool.invoke` → `lead-workflow.tool.invoke`,
+-- gate forwards `tool-gate.tool.invoke` → `lead-workflow.tool.invoke`;
 -- this actor handles the forwarded envelopes and emits `tool.result`
 -- back. The gate's id-rewriting machinery handles the round-trip.
 --
@@ -27,38 +52,24 @@
 --     when the role module is not yet loaded), submits it via the same
 --     `tool.invoke{name=spawn_graph}` shape `agentic-loop`'s
 --     `submit_orchestrator_run` uses. Returns the minted run_id.
+--     Writer roles (read_only=false) require `state.active_plan.status
+--     == "approved"`; read-only roles dispatch freely.
 --
 --   * `write-review` (alias `submit-plan`) — args:
 --       { plan = <string> }
---     Persists the plan to `<DATA>/plans/<plan_id>.md`, broadcasts
---     `lead-workflow.plan.submitted { plan_id, plan, submitted_at }`,
---     returns `{ plan_id }`.
---
---   * `await-approval` — args:
---       { plan_id = <string> }
---     Stores the firing as the pending approval-callback. When a later
---     `chat.input.submit { text }` matches `/approve` or `/reject ...`
---     for the currently-active plan, this actor:
---       (a) emits `lead-workflow.plan.approved { plan_id, approved,
---           approval_reason? }`,
---       (b) replies `tool.result { id=firing_id, output={...} }` so
---           the lead's tool call returns.
---
--- ## Persistence + replay
---
--- Both `lead-workflow.plan.submitted` and `lead-workflow.plan.approved`
--- envelopes ride the regular bus, so sessions persists them
--- automatically. On /resume the replay window re-fires them; this
--- actor's reducer handles them identically in live and replay paths
--- (multi-plan: the latest plan_id wins; an `approved` updates the
--- matching plan).
+--     Stores the plan in `state.active_plan`, broadcasts
+--     `lead-workflow.plan.submitted { plan, submitted_at }` for the
+--     chat surface to render the yellow review block. Does NOT emit
+--     tool.result — the agentic-loop blocks until the user verdict
+--     resolves the deferred ack.
 --
 -- ## Termination on session exit
 --
 -- Subscribes to `sessions.session_end`. If `state.active_run_id ~= nil`,
 -- emits `<reasoner-graph>.cancel { run_id }` and appends a system
 -- message `[Graph terminated by user — session exit]` to chat history
--- so the model sees it on the next turn.
+-- so the model sees it on the next turn. Also clears `state.active_plan`
+-- so a resumed/new session starts with no carry-over approval.
 
 local json = nefor.json
 
@@ -67,54 +78,32 @@ local replay_window = require("core.history_replay")
 
 local emit_as = envelope.emit_as
 local emit    = envelope.emit
-local next_id = envelope.next_id
 
 local state = {
   -- The in-flight graph's run_id; nil when no graph is running.
   ---@type string|nil
   active_run_id = nil,
 
-  -- Most-recently-submitted plan + its approval state. Latest plan_id
-  -- wins; a `lead-workflow.plan.approved { plan_id }` only updates if
-  -- the plan_id matches active_plan.plan_id. (Older plans are
-  -- considered superseded.)
+  -- The single in-flight plan slot. Lifetime is one verdict turn:
+  -- created by write-review, decided by /approve or /reject, flushed
+  -- on the next user message after the verdict (or immediately when
+  -- the user comments instead of voting). Not replayed across session
+  -- boundaries — each session starts with no approval.
+  --
+  -- Shape when non-nil:
+  --   {
+  --     content           = string,  -- the plan text
+  --     submitted_at      = number,  -- engine.now() at submit time
+  --     pending_firing_id = string|nil, -- write-review firing waiting
+  --                                       for verdict; nil after resolved
+  --     status            = "pending"|"approved"|"rejected",
+  --     reason            = string|nil, -- /reject reason, if given
+  --   }
   ---@type table|nil
   active_plan = nil,
-
-  -- await-approval bookkeeping. firing_id -> { plan_id }. When a user
-  -- input matches `/approve` or `/reject ...`, the matching firing is
-  -- resolved + cleared.
-  pending_approvals = {},
-
-  -- Track which plan_ids we've already persisted so the replay path
-  -- doesn't re-write the file (the in-process file write is best-effort
-  -- and lossless to skip on replay).
-  persisted_plans = {},
 }
 
 local SOURCE_NAME = "lead-workflow"
-
--- Delegates to `nefor.fs.data_root()` — the engine's canonical resolved
--- data directory (CLI flag > `NEFOR_DATA_DIR` env var > XDG default).
-local function compute_data_root()
-  return nefor.fs.data_root()
-end
-
-local function plans_dir()
-  local root = compute_data_root()
-  if not root then return nil end
-  return root .. "/plans"
-end
-
-local function ensure_dir(path)
-  nefor.fs.mkdir_p(path)
-end
-
-local function plan_path_for(plan_id)
-  local dir = plans_dir()
-  if not dir then return nil end
-  return dir .. "/" .. plan_id .. ".md"
-end
 
 -- Look up `lead-workflow.role.AGENT_CONFIGS[role]`. Tolerates the role
 -- module not being loaded: returns nil instead of erroring at module
@@ -315,7 +304,7 @@ end
 -- Returns nil on pass, an error string on rejection.
 local function gate_against_unapproved_plan(node_specs)
   local approved = type(state.active_plan) == "table"
-                   and state.active_plan.approved == true
+                   and state.active_plan.status == "approved"
   if approved then return nil end
   local writers = {}
   for _, spec in ipairs(node_specs) do
@@ -328,20 +317,19 @@ local function gate_against_unapproved_plan(node_specs)
   local plan_state
   if type(state.active_plan) ~= "table" then
     plan_state = "no plan submitted yet"
-  elseif state.active_plan.approved == nil then
-    plan_state = "plan `" .. tostring(state.active_plan.plan_id)
-                 .. "` is awaiting user approval"
-  elseif state.active_plan.approved == false then
-    plan_state = "plan `" .. tostring(state.active_plan.plan_id)
-                 .. "` was rejected by the user"
+  elseif state.active_plan.status == "pending" then
+    plan_state = "the active plan is awaiting user approval"
+  elseif state.active_plan.status == "rejected" then
+    plan_state = "the active plan was rejected by the user"
   else
-    plan_state = "unknown plan state"
+    plan_state = "no approved plan in this turn"
   end
   return string.format(
     "dispatch-graph: write-capable roles require an approved plan, but %s. "
-    .. "Offending node(s): %s. Either restrict this dispatch to read-only roles "
-    .. "(explorer/reviewer/critic/reflector — investigation), or call write-review "
-    .. "+ await-approval first, then dispatch the implementation graph.",
+    .. "Offending node(s): %s. Either restrict this dispatch to read-only "
+    .. "roles (explorer/reviewer/critic/reflector — investigation), or "
+    .. "submit a plan with write-review and wait for the user's /approve "
+    .. "before dispatching the implementation graph.",
     plan_state, table.concat(writers, ", "))
 end
 
@@ -407,25 +395,12 @@ local function dispatch_graph(firing_id, args)
 end
 
 -- Tool: write-review (alias submit-plan).
-local function persist_plan(plan_id, plan_text)
-  if state.persisted_plans[plan_id] then return end
-  state.persisted_plans[plan_id] = true
-  local dir = plans_dir()
-  if not dir then return end
-  ensure_dir(dir)
-  local path = plan_path_for(plan_id)
-  if not path then return end
-  local fh, oerr = io.open(path, "w")
-  if not fh then
-    nefor.log.warn("lead-workflow: failed to open plan file", {
-      plan_id = plan_id, path = path, error = tostring(oerr),
-    })
-    return
-  end
-  fh:write(plan_text)
-  fh:close()
-end
-
+--
+-- Blocking semantics: stores the plan + the firing_id, emits the chat-
+-- surface envelope, then returns WITHOUT calling emit_tool_result_ok.
+-- The agentic-loop now sits idle waiting for the deferred tool.result.
+-- handle_chat_input resolves the ack when the user types /approve,
+-- /reject, or any other text.
 local function submit_plan(firing_id, args)
   local plan = args and args.plan
   if type(plan) ~= "string" or #plan == 0 then
@@ -433,82 +408,78 @@ local function submit_plan(firing_id, args)
     return
   end
 
-  local plan_id = next_id("plan")
-  local submitted_at = nefor.engine.now()
-
-  -- Best-effort file write (live path only — replayed envelopes are
-  -- already on disk somewhere, no need to overwrite). We treat the
-  -- envelope as the source of truth on resume; the file is a
-  -- user-facing artefact.
-  if not replay_window.active() then
-    persist_plan(plan_id, plan)
+  -- Calling write-review while another plan is in-flight discards the
+  -- earlier one. The earlier firing_id is dead-acked so the agentic-
+  -- loop doesn't leak the deferred entry (this happens when an agent
+  -- mis-orders calls or the test driver fires a second submit before
+  -- a verdict; not a normal happy-path).
+  if type(state.active_plan) == "table"
+      and state.active_plan.pending_firing_id ~= nil
+      and state.active_plan.pending_firing_id ~= firing_id then
+    emit_tool_result_err(state.active_plan.pending_firing_id,
+      "write-review: superseded by a newer plan submitted in the same turn")
   end
 
-  -- Update local state. The bus envelope below carries the same data;
-  -- our reducer (handle_plan_submitted) is what records it on replay.
-  -- Direct local mutation here mirrors what the reducer would do, so
-  -- the live path doesn't double-process.
+  local submitted_at = nefor.engine.now()
+
   state.active_plan = {
-    plan_id      = plan_id,
-    text         = plan,
-    submitted_at = submitted_at,
-    approved     = nil,
+    content           = plan,
+    submitted_at      = submitted_at,
+    pending_firing_id = firing_id,
+    status            = "pending",
+    reason            = nil,
   }
 
-  -- Broadcast the plan-submission envelope. Sessions persists it; on
-  -- /resume replay re-fires it through this actor's bus subscription
-  -- and the reducer rebuilds active_plan.
+  -- Broadcast the plan-submission envelope so the chat surface can
+  -- render the yellow review block. This is for UI only — the actor
+  -- state above is the source of truth; the envelope is not consumed
+  -- back into actor state and does not survive across sessions.
   emit_as(SOURCE_NAME, nil, {
     kind         = "lead-workflow.plan.submitted",
-    plan_id      = plan_id,
     plan         = plan,
     submitted_at = submitted_at,
   })
 
-  emit_tool_result_ok(firing_id, { plan_id = plan_id })
+  -- No tool.result here — the call is blocking. handle_chat_input emits
+  -- the deferred ack when the verdict arrives.
 end
 
--- Tool: await-approval.
-local function await_approval(firing_id, args)
-  local plan_id = args and args.plan_id
-  if type(plan_id) ~= "string" or #plan_id == 0 then
-    emit_tool_result_err(firing_id, "await-approval: args.plan_id must be a non-empty string")
-    return
-  end
-
-  -- Edge cases: if the plan is already approved/rejected (e.g. user
-  -- approved while the lead was still processing), resolve immediately.
-  if type(state.active_plan) == "table"
-      and state.active_plan.plan_id == plan_id
-      and state.active_plan.approved ~= nil then
-    emit_tool_result_ok(firing_id, {
-      plan_id  = plan_id,
-      approved = state.active_plan.approved,
-      reason   = state.active_plan.approval_reason,
-    })
-    return
-  end
-
-  state.pending_approvals[firing_id] = { plan_id = plan_id }
+-- Resolve the deferred write-review ack with an approval payload.
+-- Tool.result text is structured for the model: a directive, not just
+-- a status code. /approve carries no reason field by spec; if the user
+-- typed `/approve <text>`, the trailing text rides along as a `note`.
+local function emit_verdict_approved(firing_id, note)
+  local notice = "Plan approved by user. Proceed with the implementation " ..
+                 "now — call dispatch-graph for the implementation graph " ..
+                 "as the next tool call. The approval is valid for this " ..
+                 "turn only."
+  local out = { status = "approved", notice = notice }
+  if type(note) == "string" and #note > 0 then out.note = note end
+  emit_tool_result_ok(firing_id, out)
 end
 
--- Resolve any pending await-approval firings that match the given
--- plan_id with the given approval verdict.
-local function resolve_pending_approvals(plan_id, approved, reason)
-  local resolved = {}
-  for fid, pending in pairs(state.pending_approvals) do
-    if pending.plan_id == plan_id then
-      resolved[#resolved + 1] = fid
-    end
-  end
-  for _, fid in ipairs(resolved) do
-    state.pending_approvals[fid] = nil
-    emit_tool_result_ok(fid, {
-      plan_id  = plan_id,
-      approved = approved,
-      reason   = reason,
-    })
-  end
+local function emit_verdict_rejected(firing_id, reason)
+  local why = (type(reason) == "string" and #reason > 0)
+    and ("\n\n--- reason ---\n" .. reason) or ""
+  local notice = "Plan rejected by user." .. why .. "\n\n" ..
+    "Revise the plan to address the feedback, then call write-review " ..
+    "again. If the rejection reason is unclear, ask the user a " ..
+    "clarifying question instead of re-submitting blindly. Do NOT " ..
+    "dispatch the rejected plan."
+  local out = { status = "rejected", notice = notice }
+  if type(reason) == "string" and #reason > 0 then out.reason = reason end
+  emit_tool_result_ok(firing_id, out)
+end
+
+local function emit_verdict_discarded(firing_id, comment)
+  local notice = "User replied with a comment instead of a verdict; the " ..
+    "submitted plan is discarded. Treat the user's reply as the next " ..
+    "turn's input — answer questions, incorporate feedback, and submit " ..
+    "a fresh plan via write-review when ready. Do NOT dispatch the " ..
+    "discarded plan."
+  local out = { status = "discarded", notice = notice }
+  if type(comment) == "string" and #comment > 0 then out.comment = comment end
+  emit_tool_result_ok(firing_id, out)
 end
 
 -- chat.input.submit watcher — /approve and /reject patterns.
@@ -532,68 +503,87 @@ local function parse_approval_command(text)
 end
 
 local function handle_chat_input(body)
-  if type(state.active_plan) ~= "table" then return end
-  if state.active_plan.approved ~= nil then return end
   local verdict, reason = parse_approval_command(body.text)
-  if verdict == nil then return end
+  local plan = state.active_plan
 
-  local plan_id = state.active_plan.plan_id
+  -- /approve or /reject
+  if verdict ~= nil then
+    -- No-op when no pending plan to vote on. The user's message stays
+    -- a plain chat input (it'll be handled by agentic-loop as a regular
+    -- user.message); we just don't bind a verdict to it.
+    if type(plan) ~= "table" or plan.status ~= "pending" then return end
 
-  -- Update local state inline (the live path mirrors what the reducer
-  -- does on replay).
-  state.active_plan.approved = verdict
-  state.active_plan.approval_reason = reason
+    local firing_id = plan.pending_firing_id
+    plan.pending_firing_id = nil
+    plan.status = verdict and "approved" or "rejected"
+    plan.reason = reason
 
-  -- Broadcast the approval envelope so sessions persists it for replay.
-  local body_out = {
-    kind     = "lead-workflow.plan.approved",
-    plan_id  = plan_id,
-    approved = verdict,
-  }
-  if reason ~= nil then body_out.approval_reason = reason end
-  emit_as(SOURCE_NAME, nil, body_out)
+    emit_as(SOURCE_NAME, nil, {
+      kind             = "lead-workflow.plan.approved",
+      approved         = verdict,
+      approval_reason  = reason,
+    })
 
-  resolve_pending_approvals(plan_id, verdict, reason)
+    if verdict then
+      emit_verdict_approved(firing_id, reason)
+    else
+      emit_verdict_rejected(firing_id, reason)
+    end
+    return
+  end
+
+  -- Non-verdict text.
+  if type(plan) ~= "table" then return end
+
+  if plan.status == "pending" then
+    -- Comment arrived while the plan was awaiting a verdict. Discard
+    -- the plan, ack the deferred firing with the comment text inlined,
+    -- and clear active_plan. The same chat.input.submit also rides
+    -- through agentic-loop as a normal user.message, so the lead's
+    -- next inference sees the user's text on both channels — the
+    -- redundancy is harmless and the tool.result keeps the agent from
+    -- assuming the plan still applies.
+    local firing_id = plan.pending_firing_id
+    state.active_plan = nil
+    emit_verdict_discarded(firing_id, body.text)
+    return
+  end
+
+  -- Plan was already decided (approved / rejected). The next user
+  -- message ends the verdict's validity window; flush so any further
+  -- writer dispatch needs a fresh plan + approval cycle.
+  state.active_plan = nil
 end
 
--- Replay reducers — same shape as live but no side effects (no file
--- write, no resolution callbacks since pending_approvals didn't
--- survive the process exit).
+-- Replay reducers — UI re-emission only. Plan state is ephemeral
+-- per session (see header doc): we do NOT rebuild state.active_plan
+-- from the bus log, since carrying an approval into a new session
+-- would let a writer dispatch run without a fresh user verdict.
 
 local function reduce_plan_submitted(body)
-  local plan_id = body.plan_id
-  if type(plan_id) ~= "string" then return end
-  state.active_plan = {
-    plan_id      = plan_id,
-    text         = body.plan,
-    submitted_at = body.submitted_at,
-    approved     = nil,
-  }
-
-  -- Re-emit the chat-surface envelope on every plan.submitted handling,
-  -- live and replay both. chat.lua's reducer keys plan entries by
-  -- plan_id and is idempotent, so a duplicate (live persistence + replay
-  -- re-emit on the next /resume) is a no-op visually. Without this the
-  -- yellow plan box never reappears after /resume even though the
-  -- actor's active_plan state is restored.
+  -- Re-emit the chat-surface envelope so the yellow review block
+  -- reappears after /resume. chat.lua keys plan entries by submission
+  -- order; no plan_id is needed.
   emit_as(SOURCE_NAME, nil, {
     kind         = "chat.plan.append",
-    plan_id      = plan_id,
     text         = body.plan,
     submitted_at = body.submitted_at,
   })
 end
 
-local function reduce_plan_approved(body)
-  local plan_id = body.plan_id
-  if type(plan_id) ~= "string" then return end
-  if type(state.active_plan) ~= "table" then return end
-  if state.active_plan.plan_id ~= plan_id then return end
-  state.active_plan.approved = body.approved
-  state.active_plan.approval_reason = body.approval_reason
+local function reduce_plan_approved(_body)
+  -- No-op. The chat surface tracks plan status from chat.plan.append +
+  -- its own verdict envelopes; the actor's state.active_plan is not
+  -- rebuilt from replay.
 end
 
 local function terminate_active_graph()
+  -- Session boundary flushes the plan slot unconditionally — no
+  -- approval survives across sessions. If a write-review was in-flight
+  -- at session-end, the deferred firing is abandoned; the agentic-loop
+  -- state is torn down with the session so there's nothing to ack into.
+  state.active_plan = nil
+
   if state.active_run_id == nil then return end
   local run_id = state.active_run_id
   state.active_run_id = nil
@@ -609,10 +599,6 @@ local function terminate_active_graph()
     role = "system",
     text = "[Graph terminated by user — session exit]",
   })
-  -- Also clear pending approvals; the lead's await-approval tool calls
-  -- shouldn't survive the session boundary (they're per-firing, and the
-  -- firings are gone).
-  state.pending_approvals = {}
 end
 
 -- Run-close watcher — clear active_run_id when the in-flight graph
@@ -658,20 +644,19 @@ local function lead_workflow_tool_schemas()
     },
     {
       name        = "write-review",
-      description = "Submit a plan for user review. Persists the plan and surfaces it to the chat.",
+      description =
+        "Submit a plan for user review. BLOCKING — the call does not " ..
+        "return until the user responds. /approve resolves it with " ..
+        "an approval directive (then dispatch the implementation). " ..
+        "/reject resolves it with a rejection + reason (revise and " ..
+        "call write-review again). Any other user reply resolves it " ..
+        "as 'discarded' (treat the reply as fresh input). The approval " ..
+        "is valid for one turn only — flushed by the next non-verdict " ..
+        "user message and across session boundaries.",
       parameters  = {
         type = "object",
         properties = { plan = { type = "string" } },
         required = { "plan" },
-      },
-    },
-    {
-      name        = "await-approval",
-      description = "Block until the user approves or rejects the plan with the given plan_id.",
-      parameters  = {
-        type = "object",
-        properties = { plan_id = { type = "string" } },
-        required = { "plan_id" },
       },
     },
   }
@@ -691,7 +676,6 @@ local TOOL_HANDLERS = {
   ["dispatch-graph"]  = dispatch_graph,
   ["write-review"]    = submit_plan,
   ["submit-plan"]     = submit_plan,
-  ["await-approval"]  = await_approval,
 }
 
 local function handle_tool_invoke(body)
@@ -811,14 +795,10 @@ return {
     reduce_plan_submitted = reduce_plan_submitted,
     reduce_plan_approved  = reduce_plan_approved,
     parse_approval_command = parse_approval_command,
-    plan_path_for         = plan_path_for,
-    plans_dir             = plans_dir,
     terminate_active_graph = terminate_active_graph,
     reset = function()
       state.active_run_id = nil
       state.active_plan = nil
-      state.pending_approvals = {}
-      state.persisted_plans = {}
       advertised = false
     end,
   },

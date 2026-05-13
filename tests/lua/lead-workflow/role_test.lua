@@ -92,12 +92,19 @@ assert_eq(lead_role.AGENT_CONFIGS.builder.read_only,  false, "builder is not rea
 -- Lead's orchestration tools are minimal and don't include the
 -- investigation/edit tools sub-agents have.
 assert_true(type(lead_role.ORCHESTRATION_TOOLS) == "table", "ORCHESTRATION_TOOLS is a table")
-for _, tool in ipairs({ "read_file", "dispatch-graph", "write-review", "await-approval" }) do
+for _, tool in ipairs({ "read_file", "dispatch-graph", "write-review" }) do
   assert_true(
     contains(lead_role.ORCHESTRATION_TOOLS, tool),
     "ORCHESTRATION_TOOLS contains " .. tool
   )
 end
+-- await-approval was removed; the verdict now arrives as a tagged user
+-- message instead of via a blocking tool. The lead must NOT advertise
+-- a no-op stub of the old name.
+assert_true(
+  not contains(lead_role.ORCHESTRATION_TOOLS, "await-approval"),
+  "ORCHESTRATION_TOOLS must NOT contain await-approval (replaced by tagged user-message verdict feedback)"
+)
 for _, tool in ipairs({ "write_file", "bash", "list_dir", "search_text" }) do
   assert_true(
     not contains(lead_role.ORCHESTRATION_TOOLS, tool),

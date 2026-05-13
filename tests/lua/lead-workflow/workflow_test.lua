@@ -193,15 +193,16 @@ end
 -- After /approve, the same writer dispatch is accepted.
 do
   fresh()
-  -- Synthesise an approved plan via the reducer (skips the file write).
-  lw._internals.reduce_plan_submitted({
-    plan_id = "plan-test-approval", plan = "test plan",
-    submitted_at = "2026-05-08T00:00:00.000Z",
+  -- Submit a plan + approve it via the live path.
+  feed("tool-gate", {
+    kind = "lead-workflow.tool.invoke",
+    id   = "firing-plan-pre",
+    name = "write-review",
+    args = { plan = "test plan" },
   })
-  lw._internals.reduce_plan_approved({
-    plan_id = "plan-test-approval", approved = true,
-  })
+  feed("nefor-tui", { kind = "chat.input.submit", text = "/approve" })
   _test.calls_clear()
+
   feed("tool-gate", {
     kind = "lead-workflow.tool.invoke",
     id   = "firing-builder-with-plan",
@@ -223,7 +224,8 @@ do
 end
 
 -- ------------------------------------------------------------------
--- write-review persists plan + emits envelope
+-- write-review is BLOCKING — no tool.result yet, plan slot records
+-- the pending firing_id.
 -- ------------------------------------------------------------------
 
 do
@@ -237,81 +239,50 @@ do
 
   local calls = decode_calls()
 
-  -- Envelope on the bus.
+  -- Plan envelope on the bus (for the chat surface).
   local sub = find_call(calls, function(c)
     return c.body.kind == "lead-workflow.plan.submitted"
   end)
   assert_true(sub ~= nil,
     "write-review must emit lead-workflow.plan.submitted; got "
     .. json.encode(_test.calls()))
-  assert_true(type(sub.body.plan_id) == "string" and #sub.body.plan_id > 0,
-    "plan_id minted")
   assert_eq(sub.body.plan, "1. Read auth.lua\n2. Add login flow\n3. Test it",
     "plan text in envelope")
+  assert_true(sub.body.plan_id == nil,
+    "plan_id has been removed from the envelope (one plan in flight, no id needed)")
 
-  -- File on disk at the expected location (best-effort: only if
-  -- nefor.fs.data_root() returns a writable path).
-  local path = lw._internals.plan_path_for(sub.body.plan_id)
-  if type(path) == "string" then
-    local fh = io.open(path, "r")
-    if fh then
-      local contents = fh:read("*a")
-      fh:close()
-      assert_true(string.find(contents, "Add login flow", 1, true) ~= nil,
-        "plan file contains the plan text; got: " .. tostring(contents))
-      os.remove(path)
-    end
-    -- (we don't fail if the path isn't writable — the actor logs warn
-    -- and proceeds; the envelope is the source of truth)
-  end
-
-  -- Tool reply with plan_id.
-  local reply = find_call(calls, function(c)
+  -- BLOCKING: no tool.result yet for write-review.
+  local pre = find_call(calls, function(c)
     return c.body.kind == "tool.result" and c.body.id == "firing-plan-1"
   end)
-  assert_true(reply ~= nil, "write-review replies with tool.result")
-  assert_eq(reply.body.output.plan_id, sub.body.plan_id,
-    "reply carries the plan_id")
+  assert_eq(pre, nil,
+    "write-review is blocking — no tool.result until user verdict; got "
+    .. json.encode(_test.calls()))
 
-  -- Active plan state.
+  -- Active plan state records the pending firing.
   local ap = lw._internals.state.active_plan
-  assert_true(type(ap) == "table",         "active_plan recorded")
-  assert_eq(ap.plan_id, sub.body.plan_id,  "active_plan.plan_id matches submit")
-  assert_eq(ap.approved, nil,              "active_plan.approved starts nil (pending)")
+  assert_true(type(ap) == "table",               "active_plan recorded")
+  assert_eq(ap.status, "pending",                "status starts pending")
+  assert_eq(ap.pending_firing_id, "firing-plan-1",
+    "pending_firing_id captures the write-review firing for later ack")
+  assert_eq(ap.content, "1. Read auth.lua\n2. Add login flow\n3. Test it",
+    "plan content stored verbatim")
 end
 
 -- ------------------------------------------------------------------
--- await-approval resolves on /approve
+-- /approve resolves the deferred write-review ack with approval.
 -- ------------------------------------------------------------------
 
 do
   fresh()
-  -- Submit a plan first.
   feed("tool-gate", {
     kind = "lead-workflow.tool.invoke",
     id   = "firing-plan-2",
     name = "write-review",
     args = { plan = "Plan A" },
   })
-  local plan_id = lw._internals.state.active_plan.plan_id
   _test.calls_clear()
 
-  -- Lead asks to await approval.
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "firing-await-1",
-    name = "await-approval",
-    args = { plan_id = plan_id },
-  })
-
-  -- Should not have replied yet.
-  local pre = find_call(decode_calls(), function(c)
-    return c.body.kind == "tool.result" and c.body.id == "firing-await-1"
-  end)
-  assert_eq(pre, nil, "await-approval is blocking — no reply yet")
-
-  -- User types /approve.
-  _test.calls_clear()
   feed("nefor-tui", { kind = "chat.input.submit", text = "/approve" })
 
   local calls = decode_calls()
@@ -323,17 +294,29 @@ do
     "user /approve must emit lead-workflow.plan.approved; got "
     .. json.encode(_test.calls()))
   assert_eq(approved_env.body.approved, true, "approved=true on /approve")
-  assert_eq(approved_env.body.plan_id, plan_id, "plan_id matches")
 
+  -- The deferred write-review ack resolves.
   local reply = find_call(calls, function(c)
-    return c.body.kind == "tool.result" and c.body.id == "firing-await-1"
+    return c.body.kind == "tool.result" and c.body.id == "firing-plan-2"
   end)
-  assert_true(reply ~= nil, "await-approval resolves with tool.result on approve")
-  assert_eq(reply.body.output.approved, true, "reply carries approved=true")
+  assert_true(reply ~= nil,
+    "/approve resolves the deferred write-review tool.result")
+  assert_eq(reply.body.output.status, "approved",
+    "tool.result.output.status == 'approved'")
+  assert_true(type(reply.body.output.notice) == "string"
+              and #reply.body.output.notice > 0,
+    "tool.result carries a notice directive for the model")
+
+  -- State: approved, pending_firing_id cleared.
+  local ap = lw._internals.state.active_plan
+  assert_true(type(ap) == "table", "active_plan still present after verdict")
+  assert_eq(ap.status, "approved", "status flipped to approved")
+  assert_eq(ap.pending_firing_id, nil,
+    "pending_firing_id cleared once the deferred ack fires")
 end
 
 -- ------------------------------------------------------------------
--- await-approval resolves on /reject with reason
+-- /reject resolves the deferred ack with rejection + reason.
 -- ------------------------------------------------------------------
 
 do
@@ -344,17 +327,8 @@ do
     name = "write-review",
     args = { plan = "Plan B" },
   })
-  local plan_id = lw._internals.state.active_plan.plan_id
   _test.calls_clear()
 
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "firing-await-2",
-    name = "await-approval",
-    args = { plan_id = plan_id },
-  })
-
-  _test.calls_clear()
   feed("nefor-tui", { kind = "chat.input.submit",
                       text = "/reject too aggressive timeline" })
 
@@ -368,101 +342,97 @@ do
     "rejection reason captured")
 
   local reply = find_call(calls, function(c)
-    return c.body.kind == "tool.result" and c.body.id == "firing-await-2"
+    return c.body.kind == "tool.result" and c.body.id == "firing-plan-3"
   end)
-  assert_true(reply ~= nil, "await-approval resolves on reject")
-  assert_eq(reply.body.output.approved, false, "reply carries approved=false")
+  assert_true(reply ~= nil, "/reject resolves the deferred write-review ack")
+  assert_eq(reply.body.output.status, "rejected",
+    "tool.result.output.status == 'rejected'")
   assert_eq(reply.body.output.reason, "too aggressive timeline",
-    "reply carries rejection reason")
+    "tool.result carries the rejection reason for the model")
 end
 
 -- ------------------------------------------------------------------
--- planApproved persists via replay — multi-plan edge case
+-- Non-verdict user message while plan pending — discards the plan and
+-- resolves the deferred ack with status: "discarded".
 -- ------------------------------------------------------------------
 
 do
   fresh()
-  -- Live: submit + approve plan A, then submit plan B (unapproved).
   feed("tool-gate", {
     kind = "lead-workflow.tool.invoke",
-    id   = "firing-A",
+    id   = "firing-plan-discard",
     name = "write-review",
-    args = { plan = "Plan A" },
+    args = { plan = "Plan C" },
   })
-  local plan_a_id = lw._internals.state.active_plan.plan_id
+  _test.calls_clear()
+
+  feed("nefor-tui", { kind = "chat.input.submit",
+                      text = "actually can you also add step 4" })
+
+  local calls = decode_calls()
+  local reply = find_call(calls, function(c)
+    return c.body.kind == "tool.result" and c.body.id == "firing-plan-discard"
+  end)
+  assert_true(reply ~= nil,
+    "comment while plan pending must resolve the deferred ack")
+  assert_eq(reply.body.output.status, "discarded",
+    "comment resolves with status: 'discarded'")
+  assert_eq(reply.body.output.comment, "actually can you also add step 4",
+    "comment text rides along in the tool.result for the model")
+
+  -- active_plan is flushed.
+  assert_eq(lw._internals.state.active_plan, nil,
+    "non-verdict comment discards the plan slot entirely")
+end
+
+-- ------------------------------------------------------------------
+-- Single-use approval: a non-verdict user message AFTER /approve
+-- flushes the approval so the next writer dispatch is gated again.
+-- ------------------------------------------------------------------
+
+do
+  fresh()
+  feed("tool-gate", {
+    kind = "lead-workflow.tool.invoke",
+    id   = "firing-plan-single-use",
+    name = "write-review",
+    args = { plan = "Plan D" },
+  })
   feed("nefor-tui", { kind = "chat.input.submit", text = "/approve" })
+  assert_eq(lw._internals.state.active_plan.status, "approved",
+    "verdict applied")
+
+  -- Next user message expires the approval.
+  feed("nefor-tui", { kind = "chat.input.submit", text = "do this please" })
+  assert_eq(lw._internals.state.active_plan, nil,
+    "next user message after verdict flushes the approval")
+
+  _test.calls_clear()
   feed("tool-gate", {
     kind = "lead-workflow.tool.invoke",
-    id   = "firing-B",
-    name = "write-review",
-    args = { plan = "Plan B" },
+    id   = "firing-builder-expired",
+    name = "dispatch-graph",
+    args = {
+      nodes = {
+        { id = "b", role = "builder", agent_args = { prompt = "x" } },
+      },
+    },
   })
-  local plan_b_id = lw._internals.state.active_plan.plan_id
-  assert_true(plan_b_id ~= plan_a_id, "plan_id is fresh per submit")
-  assert_eq(lw._internals.state.active_plan.approved, nil,
-    "fresh-plan-B has nil (pending) approval")
-
-  -- Now simulate /resume: clear actor state, fire replay markers, replay envelopes.
-  fresh()
-  local replay_window = require("core.history_replay")
-  replay_window.set(true)
-
-  -- Replayed envelopes from the on-disk session log: plan A submitted
-  -- + approved, plan B submitted (no approval).
-  feed("step", {
-    kind         = "lead-workflow.plan.submitted",
-    plan_id      = plan_a_id,
-    plan         = "Plan A",
-    submitted_at = "2026-05-08T00:00:00.000Z",
-  })
-  feed("step", {
-    kind     = "lead-workflow.plan.approved",
-    plan_id  = plan_a_id,
-    approved = true,
-  })
-  feed("step", {
-    kind         = "lead-workflow.plan.submitted",
-    plan_id      = plan_b_id,
-    plan         = "Plan B",
-    submitted_at = "2026-05-08T00:01:00.000Z",
-  })
-  replay_window.set(false)
-
-  -- Latest plan wins; its approval state is pending.
-  local ap = lw._internals.state.active_plan
-  assert_true(type(ap) == "table",      "active_plan restored after replay")
-  assert_eq(ap.plan_id, plan_b_id,      "latest plan (B) wins after multi-plan replay")
-  assert_eq(ap.approved, nil,           "plan B remains unapproved on replay")
-end
-
--- planApproved survives a replay in the simpler single-plan case too.
-do
-  fresh()
-  local replay_window = require("core.history_replay")
-  replay_window.set(true)
-  feed("step", {
-    kind    = "lead-workflow.plan.submitted",
-    plan_id = "plan-x",
-    plan    = "Single plan",
-    submitted_at = "2026-05-08T00:00:00.000Z",
-  })
-  feed("step", {
-    kind     = "lead-workflow.plan.approved",
-    plan_id  = "plan-x",
-    approved = true,
-  })
-  replay_window.set(false)
-  assert_eq(lw._internals.state.active_plan.plan_id, "plan-x",
-    "single-plan replay restores plan_id")
-  assert_eq(lw._internals.state.active_plan.approved, true,
-    "single-plan replay restores approved=true")
+  local err = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result"
+       and c.body.id == "firing-builder-expired"
+       and type(c.body.error) == "string"
+  end)
+  assert_true(err ~= nil,
+    "after approval expires, the writer dispatch is gated again")
 end
 
 -- ------------------------------------------------------------------
 -- chat.plan.append re-emit: replaying lead-workflow.plan.submitted on
 -- /resume must produce a chat.plan.append envelope so the chat surface
--- can re-render the yellow plan box. Without this, the actor's plan
--- state restores correctly but the visual entry is lost.
+-- can re-render the yellow plan box. Without this, the visual entry
+-- is lost on resume (the actor state is intentionally NOT rebuilt
+-- — verdicts don't carry across sessions — but the chat history does).
 -- ------------------------------------------------------------------
 
 do
@@ -471,7 +441,6 @@ do
   replay_window.set(true)
   feed("step", {
     kind         = "lead-workflow.plan.submitted",
-    plan_id      = "plan-replay-1",
     plan         = "Replayed plan body",
     submitted_at = "2026-05-08T00:00:00.000Z",
   })
@@ -480,67 +449,40 @@ do
   local calls = decode_calls()
   local appended = find_call(calls, function(c)
     return c.body.kind == "chat.plan.append"
-        and c.body.plan_id == "plan-replay-1"
+       and c.body.submitted_at == "2026-05-08T00:00:00.000Z"
   end)
   assert_true(appended ~= nil,
     "replayed plan.submitted must re-emit chat.plan.append for the chat surface; got "
     .. json.encode(_test.calls()))
   assert_eq(appended.body.text, "Replayed plan body",
     "replayed chat.plan.append carries the plan text")
-  assert_eq(appended.body.submitted_at, "2026-05-08T00:00:00.000Z",
-    "replayed chat.plan.append carries the original submitted_at")
 end
 
--- Multi-plan replay: plan A submitted+approved, plan B submitted only.
--- chat.plan.append fires for both, plan A gets approved status via
--- chat.lua's direct subscription to lead-workflow.plan.approved (replay
--- already covers that path; we only need to assert chat.plan.append
--- re-emission here).
+-- Replay does NOT rebuild state.active_plan. Approval/verdict state is
+-- per-session — flushing on session boundary is the contract.
 do
   fresh()
   local replay_window = require("core.history_replay")
   replay_window.set(true)
   feed("step", {
     kind         = "lead-workflow.plan.submitted",
-    plan_id      = "plan-A",
-    plan         = "Plan A body",
+    plan         = "Old session plan",
     submitted_at = "2026-05-08T00:00:00.000Z",
   })
   feed("step", {
     kind     = "lead-workflow.plan.approved",
-    plan_id  = "plan-A",
     approved = true,
   })
-  feed("step", {
-    kind         = "lead-workflow.plan.submitted",
-    plan_id      = "plan-B",
-    plan         = "Plan B body",
-    submitted_at = "2026-05-08T00:01:00.000Z",
-  })
   replay_window.set(false)
-
-  local calls = decode_calls()
-  local append_calls = find_calls(calls, function(c)
-    return c.body.kind == "chat.plan.append"
-  end)
-  assert_eq(#append_calls, 2,
-    "expected chat.plan.append for both plan A and plan B on replay; got "
-    .. tostring(#append_calls))
-  local saw_a, saw_b = false, false
-  for _, c in ipairs(append_calls) do
-    if c.body.plan_id == "plan-A" then saw_a = true end
-    if c.body.plan_id == "plan-B" then saw_b = true end
-  end
-  assert_true(saw_a, "plan A's chat.plan.append fires on replay")
-  assert_true(saw_b, "plan B's chat.plan.append fires on replay")
+  assert_eq(lw._internals.state.active_plan, nil,
+    "replay does NOT rebuild active_plan — each session starts with no carry-over approval")
 end
 
 -- Live path: the actor emits lead-workflow.plan.submitted from
 -- write-review; the bus feeds that envelope back through receive_msg,
 -- and the reducer re-emits chat.plan.append for the chat surface. The
 -- test simulates the bus feedback explicitly because the test driver
--- doesn't wire actor.lua's bus subscription. Regression pin against
--- gating chat.plan.append emission on replay only.
+-- doesn't wire actor.lua's bus subscription.
 do
   fresh()
   feed("tool-gate", {
@@ -549,21 +491,20 @@ do
     name = "write-review",
     args = { plan = "Live plan body" },
   })
-  local plan_id = lw._internals.state.active_plan.plan_id
 
   -- Simulate the bus feedback (in production, actor.lua's bus.on_event
   -- subscriber re-dispatches the actor's own emitted envelope through
   -- receive_msg).
   feed("step", {
     kind         = "lead-workflow.plan.submitted",
-    plan_id      = plan_id,
     plan         = "Live plan body",
     submitted_at = "2026-05-08T00:00:00.000Z",
   })
 
   local calls = decode_calls()
   local appended = find_call(calls, function(c)
-    return c.body.kind == "chat.plan.append" and c.body.plan_id == plan_id
+    return c.body.kind == "chat.plan.append"
+       and c.body.submitted_at == "2026-05-08T00:00:00.000Z"
   end)
   assert_true(appended ~= nil,
     "write-review on live path (with bus feedback) must emit chat.plan.append; got "
@@ -573,7 +514,7 @@ do
 end
 
 -- ------------------------------------------------------------------
--- session_end terminates active graph
+-- session_end terminates active graph AND flushes the plan slot
 -- ------------------------------------------------------------------
 
 do
@@ -592,6 +533,16 @@ do
   })
   local run_id = lw._internals.state.active_run_id
   assert_true(type(run_id) == "string", "active_run_id set after dispatch")
+
+  -- Also submit a plan that's awaiting approval at session-end.
+  feed("tool-gate", {
+    kind = "lead-workflow.tool.invoke",
+    id   = "firing-plan-at-end",
+    name = "write-review",
+    args = { plan = "in-flight plan" },
+  })
+  assert_eq(lw._internals.state.active_plan.status, "pending",
+    "plan slot is pending before session_end")
   _test.calls_clear()
 
   -- Direct invocation matches the bus.on_event subscriber the actor
@@ -599,359 +550,13 @@ do
   lw._internals.terminate_active_graph()
 
   local calls = decode_calls()
-  -- Broadcast (target == nil) per #53: the cancel envelope must reach
-  -- every in-flight agent reasoner so it can interrupt its provider
-  -- stream. reasoner-graph still receives the broadcast.
   local cancel = find_call(calls, function(c)
-    return c.body.kind == "graph.cancel" and c.target == nil
+    return c.body.kind == "graph.cancel" and c.body.run_id == run_id
   end)
-  assert_true(cancel ~= nil,
-    "session_end with active graph must emit graph.cancel as a broadcast; got "
-    .. json.encode(_test.calls()))
-  assert_eq(cancel.body.run_id, run_id, "graph.cancel carries the active run_id")
+  assert_true(cancel ~= nil, "session_end emits graph.cancel for the active run")
 
-  local sysmsg = find_call(calls, function(c)
-    return c.body.kind == "chat.message.append"
-       and c.body.role == "system"
-       and type(c.body.text) == "string"
-       and string.find(c.body.text, "Graph terminated by user", 1, true) ~= nil
-  end)
-  assert_true(sysmsg ~= nil,
-    "session_end must append a 'Graph terminated by user' system message; got "
-    .. json.encode(_test.calls()))
-  assert_eq(sysmsg.target, "nefor-tui", "system message targets nefor-tui")
-
-  -- active_run_id cleared.
   assert_eq(lw._internals.state.active_run_id, nil,
     "active_run_id cleared after termination")
+  assert_eq(lw._internals.state.active_plan, nil,
+    "active_plan flushed at session_end — no carry-over approval")
 end
-
--- session_end with no active graph is a no-op (no spurious envelopes).
-do
-  fresh()
-  lw._internals.terminate_active_graph()
-  for _, c in ipairs(decode_calls()) do
-    assert_true(c.body.kind ~= "graph.cancel",
-      "session_end with no active graph must not emit graph.cancel")
-    assert_true(not (c.body.kind == "chat.message.append"
-                     and type(c.body.text) == "string"
-                     and string.find(c.body.text, "Graph terminated", 1, true) ~= nil),
-      "session_end with no active graph must not emit terminated system message")
-  end
-end
-
--- ------------------------------------------------------------------
--- run-close envelope clears active_run_id
--- ------------------------------------------------------------------
-
-do
-  fresh()
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "firing-dispatch-close",
-    name = "dispatch-graph",
-    args = {
-      nodes = { { id = "x", role = "explorer", agent_args = { prompt = "x" } } },
-    },
-  })
-  local run_id = lw._internals.state.active_run_id
-  assert_true(type(run_id) == "string", "active_run_id set")
-
-  feed("reasoner-graph", {
-    kind   = "tool.result",
-    id     = run_id,
-    result = { status = "success", results = {} },
-  })
-  assert_eq(lw._internals.state.active_run_id, nil,
-    "run-close tool.result for active run_id clears active_run_id")
-end
-
--- A run-close for a different run_id must NOT clear active_run_id.
-do
-  fresh()
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "firing-dispatch-other",
-    name = "dispatch-graph",
-    args = {
-      nodes = { { id = "x", role = "explorer", agent_args = { prompt = "x" } } },
-    },
-  })
-  local run_id = lw._internals.state.active_run_id
-
-  feed("reasoner-graph", {
-    kind   = "tool.result",
-    id     = "some-other-run-id",
-    result = { status = "success", results = {} },
-  })
-  assert_eq(lw._internals.state.active_run_id, run_id,
-    "tool.result for unrelated run_id must not clear our active_run_id")
-end
-
--- ------------------------------------------------------------------
--- bad-args branches on dispatch-graph / write-review / await-approval
--- ------------------------------------------------------------------
-
-do
-  fresh()
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "bad-1",
-    name = "dispatch-graph",
-    args = { nodes = {} },
-  })
-  local err = find_call(decode_calls(), function(c)
-    return c.body.kind == "tool.result" and c.body.id == "bad-1"
-  end)
-  assert_true(err ~= nil and type(err.body.error) == "string",
-    "empty nodes list returns error")
-
-  fresh()
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "bad-2",
-    name = "write-review",
-    args = { plan = "" },
-  })
-  local err2 = find_call(decode_calls(), function(c)
-    return c.body.kind == "tool.result" and c.body.id == "bad-2"
-  end)
-  assert_true(err2 ~= nil and type(err2.body.error) == "string",
-    "empty plan returns error")
-
-  fresh()
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "bad-3",
-    name = "await-approval",
-    args = {},
-  })
-  local err3 = find_call(decode_calls(), function(c)
-    return c.body.kind == "tool.result" and c.body.id == "bad-3"
-  end)
-  assert_true(err3 ~= nil and type(err3.body.error) == "string",
-    "missing plan_id returns error")
-end
-
--- ------------------------------------------------------------------
--- dispatch-graph terminal-node (sink) structural validation
---
--- A reasoner-graph sub-graph must have exactly one terminal node — one
--- node that no other node depends on, whose result becomes the graph's
--- return value. dispatch-graph is the role-aware contract layer that
--- enforces this lead-facing shape; reasoner-graph itself stays a
--- primitive that accepts any DAG.
--- ------------------------------------------------------------------
-
--- 0 sinks: cyclic dependency means every node has a successor. Common
--- failure mode when the lead tries to encode a loop in the graph
--- structure rather than at the agent level.
-do
-  fresh()
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "dispatch_graph_rejects_zero_terminal_nodes",
-    name = "dispatch-graph",
-    args = {
-      nodes = {
-        { id = "a", role = "explorer", agent_args = { prompt = "x" },
-          dependencies = { "b" } },
-        { id = "b", role = "explorer", agent_args = { prompt = "y" },
-          dependencies = { "a" } },
-      },
-    },
-  })
-  local err = find_call(decode_calls(), function(c)
-    return c.body.kind == "tool.result"
-        and c.body.id == "dispatch_graph_rejects_zero_terminal_nodes"
-  end)
-  assert_true(err ~= nil and type(err.body.error) == "string",
-    "0-sink graph returns a tool.result error")
-  assert_true(string.find(err.body.error, "0 terminal nodes", 1, true) ~= nil,
-    "0-sink error message names the problem ('0 terminal nodes'); got: "
-    .. tostring(err.body.error))
-  -- The error should point the lead at how to fix it (cycle / loop-guard).
-  assert_true(string.find(err.body.error, "dispatch-graph", 1, true) ~= nil,
-    "0-sink error message identifies the validator ('dispatch-graph'); got: "
-    .. tostring(err.body.error))
-end
-
--- Disconnected components: two independent chains a→b and c→d.
--- Rejected so the lead splits them into two dispatch-graph calls.
-do
-  fresh()
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "dispatch_graph_rejects_disconnected_components",
-    name = "dispatch-graph",
-    args = {
-      nodes = {
-        { id = "a", role = "explorer", agent_args = { prompt = "x" } },
-        { id = "b", role = "explorer", agent_args = { prompt = "y" },
-          dependencies = { "a" } },
-        { id = "c", role = "explorer", agent_args = { prompt = "z" } },
-        { id = "d", role = "explorer", agent_args = { prompt = "w" },
-          dependencies = { "c" } },
-      },
-    },
-  })
-  local err = find_call(decode_calls(), function(c)
-    return c.body.kind == "tool.result"
-        and c.body.id == "dispatch_graph_rejects_disconnected_components"
-  end)
-  assert_true(err ~= nil and type(err.body.error) == "string",
-    "disconnected graph returns a tool.result error")
-  assert_true(string.find(err.body.error, "2 disconnected components", 1, true) ~= nil,
-    "error names the component count; got: " .. tostring(err.body.error))
-  local invoke = find_call(decode_calls(), function(c)
-    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
-  end)
-  assert_eq(invoke, nil,
-    "rejected disconnected graph must not produce a spawn_graph tool.invoke")
-end
-
--- Connected multi-sink: explorer fans out to two siblings that share
--- the root but don't depend on each other. Accepted — reasoner-graph
--- returns result.results keyed by both sinks.
-do
-  fresh()
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "dispatch_graph_accepts_connected_multi_sink",
-    name = "dispatch-graph",
-    args = {
-      nodes = {
-        { id = "root", role = "explorer", agent_args = { prompt = "x" } },
-        { id = "a",    role = "explorer", agent_args = { prompt = "y" },
-          dependencies = { "root" } },
-        { id = "b",    role = "reviewer", agent_args = { prompt = "z" },
-          dependencies = { "root" } },
-      },
-    },
-  })
-  local err = find_call(decode_calls(), function(c)
-    return c.body.kind == "tool.result"
-        and c.body.id == "dispatch_graph_accepts_connected_multi_sink"
-        and type(c.body.error) == "string"
-  end)
-  assert_eq(err, nil, "connected multi-sink graph must NOT error")
-  local invoke = find_call(decode_calls(), function(c)
-    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
-  end)
-  assert_true(invoke ~= nil,
-    "connected multi-sink graph must dispatch a spawn_graph tool.invoke")
-end
-
--- Happy path: single-sink graph (chain) translates and dispatches as
--- before. Regression guard against the validator over-rejecting.
-do
-  fresh()
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "dispatch_graph_accepts_single_terminal_node",
-    name = "dispatch-graph",
-    args = {
-      nodes = {
-        { id = "a", role = "explorer", agent_args = { prompt = "x" } },
-        { id = "b", role = "explorer", agent_args = { prompt = "y" },
-          dependencies = { "a" } },
-        { id = "c", role = "explorer", agent_args = { prompt = "z" },
-          dependencies = { "b" } },
-      },
-    },
-  })
-  local calls = decode_calls()
-  local invoke = find_call(calls, function(c)
-    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
-        and c.target == "reasoner-graph"
-  end)
-  assert_true(invoke ~= nil,
-    "single-sink graph dispatches a spawn_graph tool.invoke")
-  local reply = find_call(calls, function(c)
-    return c.body.kind == "tool.result"
-        and c.body.id == "dispatch_graph_accepts_single_terminal_node"
-  end)
-  assert_true(reply ~= nil and reply.body.error == nil,
-    "single-sink graph replies success (no error field)")
-end
-
--- Single node, no dependencies: build_graph_spec must NOT include an
--- empty `edges` field. reasoner-graph rejects `edges: {}` (which Lua
--- empty tables serialise to in JSON) with "`graph.edges` must be an
--- array"; omitting the key entirely is treated as no-edges. Regression
--- pin: without the omission the dispatched sub-graph fails immediately
--- and never shows up in the DAG sidebar.
-do
-  fresh()
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "dispatch_graph_no_edges_omits_field",
-    name = "dispatch-graph",
-    args = {
-      nodes = {
-        { id = "solo", role = "explorer", agent_args = { prompt = "x" } },
-      },
-    },
-  })
-  local invoke = find_call(decode_calls(), function(c)
-    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
-  end)
-  assert_true(invoke ~= nil, "single-node graph emits spawn_graph")
-  local graph = invoke.body.args and invoke.body.args.graph
-  assert_true(type(graph) == "table", "spawn_graph args.graph is a table")
-  assert_eq(graph.edges, nil,
-    "single-node graph omits `edges` (would serialise to JSON `{}` and reasoner-graph would reject)")
-end
-
--- Unknown tool name returns an error.
-do
-  fresh()
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "bad-4",
-    name = "no-such-tool",
-    args = {},
-  })
-  local err = find_call(decode_calls(), function(c)
-    return c.body.kind == "tool.result" and c.body.id == "bad-4"
-  end)
-  assert_true(err ~= nil and type(err.body.error) == "string"
-                          and string.find(err.body.error, "unknown tool", 1, true) ~= nil,
-    "unknown tool name surfaces a clear error")
-end
-
--- ------------------------------------------------------------------
--- await-approval resolves immediately if plan already has a verdict
--- (covers the race where the user approves before the lead asks)
--- ------------------------------------------------------------------
-
-do
-  fresh()
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "firing-plan-race",
-    name = "write-review",
-    args = { plan = "Plan race" },
-  })
-  local plan_id = lw._internals.state.active_plan.plan_id
-  feed("nefor-tui", { kind = "chat.input.submit", text = "/approve" })
-  _test.calls_clear()
-
-  -- await-approval AFTER the user approved.
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "firing-await-race",
-    name = "await-approval",
-    args = { plan_id = plan_id },
-  })
-
-  local reply = find_call(decode_calls(), function(c)
-    return c.body.kind == "tool.result" and c.body.id == "firing-await-race"
-  end)
-  assert_true(reply ~= nil,
-    "await-approval against already-approved plan resolves immediately")
-  assert_eq(reply.body.output.approved, true,
-    "immediate resolution carries the approved verdict")
-end
-
-print("lead_workflow_test: ok")
