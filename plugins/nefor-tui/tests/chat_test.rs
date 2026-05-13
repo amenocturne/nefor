@@ -66,6 +66,14 @@ fn chat_lua_source() -> String {
     if std::env::var_os("NEFOR_TUI_LUA_DIR").is_none() {
         std::env::set_var("NEFOR_TUI_LUA_DIR", &plugin_lua);
     }
+    // Tell chat.lua's package.path bootstrap where the chat/ submodule
+    // dir lives. Same rationale as NEFOR_TUI_LUA_DIR above — tests
+    // load chat.lua directly into the engine VM with no NEFOR_CONFIG_DIR
+    // (which is how the binary normally seeds this path).
+    let chat_subdir = repo_root.join("starter").join("chat");
+    if std::env::var_os("NEFOR_STARTER_CHAT_DIR").is_none() {
+        std::env::set_var("NEFOR_STARTER_CHAT_DIR", &chat_subdir);
+    }
     let chat_path = repo_root.join("starter").join("chat.lua");
     std::fs::read_to_string(&chat_path).unwrap_or_else(|e| panic!("read {:?}: {e}", chat_path))
 }
