@@ -709,12 +709,14 @@ do
 end
 
 -- N>1 sinks: two independent components, each ending in its own sink.
--- Lead needs to add an aggregator or split into separate graphs.
+-- Multi-sink graphs are accepted — reasoner-graph returns the result
+-- as a per-sink dict, and the lead can present each leaf's output
+-- without an aggregator.
 do
   fresh()
   feed("tool-gate", {
     kind = "lead-workflow.tool.invoke",
-    id   = "dispatch_graph_rejects_multiple_terminal_nodes",
+    id   = "dispatch_graph_accepts_multiple_terminal_nodes",
     name = "dispatch-graph",
     args = {
       nodes = {
@@ -729,24 +731,15 @@ do
   })
   local err = find_call(decode_calls(), function(c)
     return c.body.kind == "tool.result"
-        and c.body.id == "dispatch_graph_rejects_multiple_terminal_nodes"
+        and c.body.id == "dispatch_graph_accepts_multiple_terminal_nodes"
+        and type(c.body.error) == "string"
   end)
-  assert_true(err ~= nil and type(err.body.error) == "string",
-    "multi-sink graph returns a tool.result error")
-  assert_true(string.find(err.body.error, "2 terminal nodes", 1, true) ~= nil,
-    "multi-sink error names the count ('2 terminal nodes'); got: "
-    .. tostring(err.body.error))
-  assert_true(string.find(err.body.error, "b", 1, true) ~= nil
-              and string.find(err.body.error, "d", 1, true) ~= nil,
-    "multi-sink error lists both sink ids ('b' and 'd'); got: "
-    .. tostring(err.body.error))
-  -- A spawn_graph invoke must NOT have been emitted — the validator
-  -- gates dispatch.
+  assert_eq(err, nil, "multi-sink graph must NOT return a tool.result error")
   local invoke = find_call(decode_calls(), function(c)
     return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
   end)
-  assert_eq(invoke, nil,
-    "rejected graph must not produce a spawn_graph tool.invoke")
+  assert_true(invoke ~= nil,
+    "multi-sink graph must dispatch a spawn_graph tool.invoke")
 end
 
 -- Happy path: single-sink graph (chain) translates and dispatches as

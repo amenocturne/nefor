@@ -28,16 +28,15 @@ These are reasoner-graph internals that `dispatch-graph` translates into. Callin
 
 Even if a future build advertises one of these names, treat it as not yours to call. The tool surface above is the complete list.
 
-## Graph shape — exactly one terminal node
+## Graph shape
 
-Every graph you submit must converge to **exactly one terminal node** (a node nothing else depends on). The terminal node's structured-finalize output is what the graph returns to you.
+You compose any DAG. The return shape is `results: { <sink_id>: <finalize_output>, ... }` — a dict keyed by every terminal node (a node nothing else depends on). Both single-sink and multi-sink graphs are supported; only cycles (0 sinks) are rejected.
 
-- ✅ Single node, no dependencies.
-- ✅ Linear chain: `explorer → builder → reviewer`. `reviewer` is the sink.
-- ✅ Parallel fan-out + fan-in: two explorers in parallel, then one builder that depends on both. `builder` is the sink.
-- ❌ Two unrelated parallel nodes with no aggregator. `dispatch-graph` rejects this with `graph has N terminal nodes`. To fix: add a final node (reviewer / synthesiser) whose `dependencies` list includes every parallel branch's leaf.
+- **Single sink** when one node should synthesise the others. E.g. `explorer → builder → reviewer`; you receive `results: { reviewer: {...} }`.
+- **Multi-sink** when independent reports should come back unmerged. E.g. three parallel `explorer` nodes with no dependencies linking them; you receive `results: { exp1: {...}, exp2: {...}, exp3: {...} }` and present them yourself in chat.
+- **Fan-out + fan-in** when parallel branches feed a single conclusion. E.g. two explorers in parallel, then one builder that lists both as dependencies; you receive `results: { builder: {...} }` (builder saw both findings in its prompt context).
 
-When you want broad parallel exploration on a complex task, end the graph with a reviewer or builder that depends on every explorer — that aggregator receives all findings via its dependency context and produces the unified output.
+Pick the shape that fits the task — don't add an aggregator node just to satisfy a constraint.
 
 ## Sub-agent roles available
 

@@ -171,23 +171,16 @@ local function validate_terminal_count(node_specs)
     end
   end
 
-  if #sinks == 1 then return nil end
+  -- Multi-sink is allowed: reasoner-graph returns `result.results` as a
+  -- dict keyed by node id, so each sink's structured-finalize is
+  -- delivered to the caller. Only 0 sinks (every node has a successor)
+  -- is invalid — that's a cycle.
+  if #sinks >= 1 then return nil end
 
-  if #sinks == 0 then
-    return "dispatch-graph: graph has 0 terminal nodes — every node is "
-        .. "depended on by another. Sub-graphs must have exactly one "
-        .. "terminal node whose result becomes the graph's return value. "
-        .. "Likely cause: a cycle in dependencies. Break the cycle, or "
-        .. "move loop-guard logic into a single counter-node graph."
-  end
-
-  return string.format(
-    "dispatch-graph: graph has %d terminal nodes: [%s]. Sub-graphs must "
-    .. "have exactly one terminal node whose result becomes the graph's "
-    .. "return value. Add a final node (commonly a 'reviewer' or "
-    .. "aggregator) that depends on all of these, or dispatch them as "
-    .. "separate graphs.",
-    #sinks, table.concat(sinks, ", "))
+  return "dispatch-graph: graph has 0 terminal nodes — every node is "
+      .. "depended on by another. Likely cause: a cycle in dependencies. "
+      .. "Break the cycle, or move loop-guard logic into a single "
+      .. "counter-node graph."
 end
 
 -- Build a reasoner-graph spec from the lead's role-keyed node list.
@@ -519,13 +512,12 @@ local function lead_workflow_tool_schemas()
       name        = "dispatch-graph",
       description =
         "Dispatch a reasoner-graph of role-keyed sub-agents and return the run_id. " ..
-        "The graph MUST converge to exactly one terminal (sink) node — a node " ..
-        "that no other node depends on. The terminal node's structured-finalize " ..
-        "output becomes the graph's return value. If you want parallel work " ..
-        "(e.g. several explorers), add a final aggregator node that depends on " ..
-        "all of them (a reviewer that synthesises findings, a tester that runs " ..
-        "after all builders, etc.). Submitting N independent parallel nodes with " ..
-        "no aggregator is rejected with `dispatch-graph: graph has N terminal nodes`.",
+        "The graph's `result.results` is a dict keyed by each terminal (sink) node " ..
+        "id, carrying that node's structured-finalize output. Multi-sink graphs are " ..
+        "supported — e.g. N parallel explorers with no aggregator returns " ..
+        "{ exp1: {...}, exp2: {...}, ... }. Use a single sink when one node should " ..
+        "synthesise the others' output; use multi-sink when independent reports " ..
+        "should come back unmerged. Cycles (0 sinks) are rejected.",
       parameters  = {
         type = "object",
         properties = {
@@ -533,9 +525,9 @@ local function lead_workflow_tool_schemas()
             type = "array",
             description =
               "Role-keyed node specs: { id, role, agent_args, dependencies? }. " ..
-              "Use the `dependencies` field (array of node ids) to wire up the " ..
-              "DAG so it converges to a single sink. Sub-agent finalize output " ..
-              "is auto-composed into dependent nodes' prompts.",
+              "Use `dependencies` (array of node ids) to wire up the DAG. " ..
+              "Each dependency's structured-finalize output is auto-composed " ..
+              "into the dependent node's prompt as context.",
           },
         },
         required = { "nodes" },
