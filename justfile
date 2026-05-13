@@ -26,6 +26,26 @@ fmt:
 build:
     cargo build --workspace --release
 
+# Build release and symlink every shipped binary into $PREFIX/bin
+# (default: ~/.local/bin). Symlinks point back into target/release/
+# so a subsequent `just build` is picked up without re-running install.
+# Override the destination: PREFIX=/usr/local just install.
+install:
+    #!/usr/bin/env bash
+    set -eu
+    PREFIX="${PREFIX:-$HOME/.local}"
+    cargo build --workspace --release
+    mkdir -p "$PREFIX/bin"
+    cd "{{justfile_directory()}}"
+    for bin in nefor openai-provider tool-gate basic-tools reasoner-graph nefor-tui mock-plugin generic-provider generic-tool nefor-combinators; do
+      ln -sfv "$(pwd)/target/release/$bin" "$PREFIX/bin/$bin"
+    done
+    echo
+    echo "Installed -> $PREFIX/bin"
+    echo "Make sure your shell has:"
+    echo "  export PATH=\"$PREFIX/bin:\$PATH\""
+    echo "  export NEFOR_PLUGIN_DIR=\"$PREFIX/bin\""
+
 # Remove the entire target/ directory. Next build is a full cold compile.
 clean:
     cargo clean
