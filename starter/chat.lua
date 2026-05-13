@@ -609,7 +609,7 @@ local function initial_state()
     at_complete      = nil,
     last_esc_ms      = nil,
     dag_runs         = {},
-    toast            = nil,  -- { text, expires_at_ms }
+    toasts           = {},
     -- Hydrate from <data_root>/input-history so arrow-up in the chat
     -- input recalls submissions from prior nefor processes (issue #39
     -- — shell-style persistent history). Empty on first run / read
@@ -1696,163 +1696,9 @@ end
 
 -- Toast = ephemeral, non-blocking (e.g., "copied N chars").
 -- Popup = blocking, requires user input (esc) for dismissal.
--- Don't blur this distinction.
---
--- Inline toast: bordered pill anchored bottom-RIGHT of the body area
--- (overlaying the transcript only — never covers the input or
--- statusline). Auto-dismisses on `expires_at_ms`. The text leaf owns
--- its full allocated rect (engine paints trailing cells with the
--- text's own style), so the bg colour band reaches edge-to-edge — no
--- per-row main_column chars peek through.
---
--- Animation: translate-only horizontal slide. The pill keeps full
--- size throughout (no width clip, no height clip). On enter the pill
--- slides leftward from the right edge to its rest position over
--- `TOAST_ENTER_MS` with ease-out cubic; on exit it mirrors back over
--- `TOAST_EXIT_MS` with ease-in cubic. The render-loop keepalive (see
--- `render_keepalive`) ensures `tui.now_ms()` re-evaluates each frame
--- so the slide is smooth and the toast disappears at `expires_at_ms`
--- rather than freezing on the last shown state.
---
--- `tui.anchored`'s offset is clamped to keep the pill on-screen, so
--- "off-screen right" is approximated by the rest position sitting
--- `TOAST_REST_INSET` cells inward from the right edge — the slide is
--- visible across that inset distance. The translation is real (no
--- clipping), just bounded by the parent rect.
-local TOAST_FG_INFO        = "#88ccff"
-local TOAST_BORDER_INFO    = { fg = "#7faaaa" }   -- dim cyan rail to match blockquote palette
--- warn/error variants reserved; only info wired by current call sites.
--- Reference the popup warn/error palette so toast variants line up
--- with the rest of the chrome when later call sites adopt them.
-local TOAST_FG_WARN        = C.status_warn
-local TOAST_BORDER_WARN    = { fg = C.status_warn }
-local TOAST_FG_ERROR       = C.status_danger
-local TOAST_BORDER_ERROR   = { fg = C.status_danger }
-local TOAST_FULL_HEIGHT    = 3    -- top rule + text + bottom rule (no inner padding)
-local TOAST_ENTER_MS       = 220
-local TOAST_EXIT_MS        = 220
--- Extra cells of dashes past the right edge of the window. The
--- anchored rect clamps to parent width, so these dashes get clipped
--- on the right — visually the top/bottom rules look like they
--- continue off-screen rather than terminating exactly at the edge.
-local TOAST_RIGHT_OVERFLOW = 6
-
--- Easing helpers. Domain [0,1]; clamp before applying.
-local function clamp01(t)
-  if t < 0 then return 0 end
-  if t > 1 then return 1 end
-  return t
-end
-local function ease_out_cubic(t)
-  t = clamp01(t)
-  local u = 1 - t
-  return 1 - u * u * u
-end
-local function ease_in_cubic(t)
-  t = clamp01(t)
-  return t * t * t
-end
-
--- Resolve the (fg, border) palette for a toast level. Unknown levels
--- fall back to "info" so a malformed envelope doesn't crash render.
-local function toast_palette(level)
-  if level == "warn" then
-    return TOAST_FG_WARN, TOAST_BORDER_WARN
-  elseif level == "error" then
-    return TOAST_FG_ERROR, TOAST_BORDER_ERROR
-  else
-    -- "info" or anything else → info palette. Current call sites only
-    -- wire info; warn/error variants are reserved for future use.
-    return TOAST_FG_INFO, TOAST_BORDER_INFO
-  end
-end
-
-local function inline_toast(state)
-  if not state.toast then return nil end
-  local now     = tui.now_ms()
-  local created = state.toast.created_at_ms or now
-  local expires = state.toast.expires_at_ms or (created + 2000)
-  if now >= expires then return nil end
-
-  local elapsed   = now - created
-  local time_left = expires - now
-
-  local text = state.toast.text or ""
-  local fg, border = toast_palette(state.toast.level)
-
-  -- Small pill anchored bottom-right. Width at rest = `╭` corner +
-  -- space + text + extra dashes that overflow past the right edge.
-  -- The slide is implemented by varying the pill's WIDTH from 0
-  -- (off-screen) to pill_w_at_rest. Because the pill is anchored at
-  -- the right edge, the rect grows LEFTWARD as visible_w increases
-  -- and the text widgets' content gets truncated on the right by the
-  -- rect's width. The TOAST_RIGHT_OVERFLOW slack means the rules at
-  -- rest extend past the visible right edge of the window — they
-  -- look like they're going "off-screen" rather than stopping
-  -- exactly at the edge.
-  local pill_w_at_rest = 2 + #text + TOAST_RIGHT_OVERFLOW
-  local total_slide    = pill_w_at_rest
-  local distance_slid
-  if elapsed < TOAST_ENTER_MS then
-    local t = elapsed / TOAST_ENTER_MS
-    distance_slid = total_slide * ease_out_cubic(t)
-  elseif time_left < TOAST_EXIT_MS then
-    local t = 1 - (time_left / TOAST_EXIT_MS)
-    distance_slid = total_slide * (1 - ease_in_cubic(t))
-  else
-    distance_slid = total_slide
-  end
-  distance_slid = math.floor(distance_slid + 0.5)
-
-  local visible_w = math.min(distance_slid, pill_w_at_rest)
-  if visible_w <= 0 then return nil end
-
-  -- At-rest content: 3 strings, each `pill_w_at_rest` cells wide.
-  -- Chrome lives on the LEFT — `╭` / `│` / `╰` opens the pill on
-  -- the leading side; the dashes extend rightward past the right
-  -- edge of the window where the renderer clips them. The mid row
-  -- pads with trailing spaces so the area below the dashes doesn't
-  -- show the chrome from the layer underneath bleeding through.
-  local top_rule    = "╭" .. string.rep("─", pill_w_at_rest - 1)
-  local mid_text    = "│ " .. text .. string.rep(" ", TOAST_RIGHT_OVERFLOW)
-  local bottom_rule = "╰" .. string.rep("─", pill_w_at_rest - 1)
-
-  local body = tui.column {
-    gap = 0,
-    key = "toast-box",
-    children = {
-      tui.constrained {
-        max_height = 1,
-        child = tui.text { content = top_rule, style = border, wrap = "none" },
-      },
-      tui.constrained {
-        max_height = 1,
-        child = tui.text { content = mid_text, style = { fg = fg }, wrap = "none" },
-      },
-      tui.constrained {
-        max_height = 1,
-        child = tui.text { content = bottom_rule, style = border, wrap = "none" },
-      },
-    },
-  }
-
-  return tui.anchored {
-    anchor   = "bottom-right",
-    offset_x = 0,
-    offset_y = 0,
-    width    = visible_w,
-    height   = TOAST_FULL_HEIGHT,
-    child    = body,
-  }
-end
-
--- Old popup-style toast retained as a no-op shim so existing call
--- sites (compact { ..., popup_toast(state), ... }) keep compiling
--- while the inline_toast above takes over rendering. Anything left in
--- the popup stack would just stack on top of the inline one.
-local function popup_toast(_state)
-  return nil
-end
+-- Don't blur this distinction. Renderer lives in `W.toast.view`; this
+-- file's role is to manage `state.toasts` (push on event, prune on
+-- expiry) and place the rendered node in the stack.
 
 ------------------------------------------------------------------------
 -- slash + @-path autocomplete (inline above input)
@@ -2158,7 +2004,8 @@ local function render_keepalive(state)
   -- run its slide-out / disappearance. duration_ms = 100 keeps the
   -- toast slide animation smooth (~60fps engine tick when active);
   -- DAG-elapsed counters only need 1Hz but the extra ticks are free.
-  if not (state.pending or any_dag_run_active(state.dag_runs) or state.toast) then
+  local has_toast = state.toasts and #state.toasts > 0
+  if not (state.pending or any_dag_run_active(state.dag_runs) or has_toast) then
     return nil
   end
   return tui.animation {
@@ -2265,8 +2112,7 @@ local function view(state)
       -- Toast renders last so it sits above input, statusline, and
       -- every popup — non-blocking notifications must never be
       -- occluded by chrome below them.
-      inline_toast(state),
-      popup_toast(state),
+      W.toast.view({ toasts = state.toasts }),
     },
   }
 end
@@ -2681,15 +2527,22 @@ end
 local function update(msg, state)
   local kind = msg.kind or ""
 
-  -- Pure-update prune for stale dag runs + expired toast.
+  -- Pure-update prune for stale dag runs + expired toasts.
   do
     local now = tui.now_ms()
     local pruned = prune_dag_runs(state.dag_runs or {}, now)
     if pruned ~= state.dag_runs then
       state = shallow_merge(state, { dag_runs = pruned })
     end
-    if state.toast and state.toast.expires_at_ms and now >= state.toast.expires_at_ms then
-      state = shallow_merge(state, { toast = NIL_SENTINEL })
+    local toasts = state.toasts
+    if toasts ~= nil and #toasts > 0 then
+      local kept = {}
+      for _, t in ipairs(toasts) do
+        if not W.toast.is_expired(t, now) then kept[#kept + 1] = t end
+      end
+      if #kept ~= #toasts then
+        state = shallow_merge(state, { toasts = kept })
+      end
     end
   end
 
@@ -2965,7 +2818,8 @@ local function update(msg, state)
 
   if kind == "key.escape" then
     -- 1) close popup
-    if state.popup or state.toast then
+    local has_toast = state.toasts and #state.toasts > 0
+    if state.popup or has_toast then
       -- Tool permission ESC = deny.
       if state.popup and state.popup.variant == "tool_permission" then
         local id = state.popup.id
@@ -2974,7 +2828,7 @@ local function update(msg, state)
             body = { kind = "tool.permission_response", id = id, decision = "deny" } },
         }
       end
-      return shallow_merge(state, { popup = NIL_SENTINEL, toast = NIL_SENTINEL }), {}
+      return shallow_merge(state, { popup = NIL_SENTINEL, toasts = {} }), {}
     end
     -- 2) close slash autocomplete
     if state.slash then
@@ -3284,7 +3138,7 @@ local function update(msg, state)
       turn_started_at  = NIL_SENTINEL,
       last_turn_duration_ms = NIL_SENTINEL,
       popup            = NIL_SENTINEL,
-      toast            = NIL_SENTINEL,
+      toasts           = {},
       slash            = NIL_SENTINEL,
       dag_runs         = {},
     }), {}
@@ -3526,18 +3380,16 @@ local function update(msg, state)
   if kind == "chat.toast" then
     local now = tui.now_ms()
     local ttl = msg.ttl_ms or 2000
-    -- `level` ∈ "info" | "warn" | "error". Defaults to "info" so the
-    -- existing call sites (which never set the field) keep their
-    -- current cyan styling. warn / error variants reserved for future
-    -- use; the render pipeline accepts them, no caller wires them yet.
-    return shallow_merge(state, {
-      toast = {
-        text = msg.text or "",
-        level = msg.level or "info",
-        created_at_ms = now,
-        expires_at_ms = now + ttl,
-      },
-    }), {}
+    local toasts = {}
+    for _, t in ipairs(state.toasts or {}) do toasts[#toasts + 1] = t end
+    toasts[#toasts + 1] = {
+      id            = msg.id or tostring(now) .. "-" .. tostring(#toasts + 1),
+      text          = msg.text or "",
+      level         = msg.level or "info",
+      started_at_ms = now,
+      ttl_ms        = ttl,
+    }
+    return shallow_merge(state, { toasts = toasts }), {}
   end
 
   if kind == "chat.model.set_ack" then
@@ -3737,18 +3589,21 @@ local function update(msg, state)
       -- refreshes the clock mid-dispatch.
       local now = tui.now_ms()
       tui.copy_to_clipboard(text)
-      return shallow_merge(state, {
-        toast = {
-          text = string.format("copied %d chars", #text),
-          created_at_ms = now,
-          -- 4 s lifetime: covers the 2 s default plus headroom for the
-          -- clipboard call's wall-clock cost. Without this padding the
-          -- toast can wink out before the user's eye registers it on
-          -- slow / contended systems (and tests racing the same path
-          -- flake intermittently).
-          expires_at_ms = now + 4000,
-        },
-      }), {}
+      local toasts = {}
+      for _, t in ipairs(state.toasts or {}) do toasts[#toasts + 1] = t end
+      toasts[#toasts + 1] = {
+        id            = "clipboard-" .. tostring(now),
+        text          = string.format("copied %d chars", #text),
+        level         = "info",
+        started_at_ms = now,
+        -- 4 s lifetime: covers the 2 s default plus headroom for the
+        -- clipboard call's wall-clock cost. Without this padding the
+        -- toast can wink out before the user's eye registers it on
+        -- slow / contended systems (and tests racing the same path
+        -- flake intermittently).
+        ttl_ms        = 4000,
+      }
+      return shallow_merge(state, { toasts = toasts }), {}
     end
     return state, {}
   end

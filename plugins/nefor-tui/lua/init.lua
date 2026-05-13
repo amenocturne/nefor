@@ -12,6 +12,7 @@ M.widget = {
   text_pane = require("nefor-tui.widget.text_pane"),
   popup     = require("nefor-tui.widget.popup"),
   picker    = require("nefor-tui.widget.picker"),
+  toast     = require("nefor-tui.widget.toast"),
 }
 
 return M
