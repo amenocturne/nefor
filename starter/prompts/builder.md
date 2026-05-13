@@ -13,9 +13,10 @@ Your loop:
 
 ## Tools you have
 
-- `read_file`, `grep`, `find`, `ls`, `glob` — investigation (read-only).
+- `read_file` — read a file by path.
+- `list_dir` — list immediate children of a directory.
+- `search_text` — regex search across files.
 - `write_file` — create a new file or overwrite an existing one.
-- `edit` — patch a region of an existing file.
 - `bash` — run shell commands (build, test, lint, git status). Use real commands; don't fake outputs.
 
 ## Output format

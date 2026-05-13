@@ -52,30 +52,28 @@ for _, role in ipairs({ "explorer", "builder", "reviewer" }) do
   assert_true(#cfg.tool_allowlist > 0, role .. ".tool_allowlist is non-empty")
 end
 
--- Builder gets write_file. Explorer and reviewer don't.
+-- Builder gets write_file + bash. Explorer and reviewer don't.
 assert_true(
   contains(lead_role.AGENT_CONFIGS.builder.tool_allowlist, "write_file"),
   "builder allowlist contains write_file"
 )
 assert_true(
-  contains(lead_role.AGENT_CONFIGS.builder.tool_allowlist, "edit"),
-  "builder allowlist contains edit"
+  contains(lead_role.AGENT_CONFIGS.builder.tool_allowlist, "bash"),
+  "builder allowlist contains bash"
 )
-assert_true(
-  not contains(lead_role.AGENT_CONFIGS.explorer.tool_allowlist, "write_file"),
-  "explorer allowlist does NOT contain write_file"
-)
-assert_true(
-  not contains(lead_role.AGENT_CONFIGS.reviewer.tool_allowlist, "write_file"),
-  "reviewer allowlist does NOT contain write_file"
-)
-assert_true(
-  not contains(lead_role.AGENT_CONFIGS.reviewer.tool_allowlist, "edit"),
-  "reviewer allowlist does NOT contain edit"
-)
+for _, tool in ipairs({ "write_file", "bash" }) do
+  assert_true(
+    not contains(lead_role.AGENT_CONFIGS.explorer.tool_allowlist, tool),
+    "explorer allowlist does NOT contain " .. tool
+  )
+  assert_true(
+    not contains(lead_role.AGENT_CONFIGS.reviewer.tool_allowlist, tool),
+    "reviewer allowlist does NOT contain " .. tool
+  )
+end
 
 -- Explorer and reviewer share the read-only tool set.
-for _, tool in ipairs({ "read_file", "grep", "find", "ls", "glob", "bash" }) do
+for _, tool in ipairs({ "read_file", "list_dir", "search_text" }) do
   assert_true(
     contains(lead_role.AGENT_CONFIGS.explorer.tool_allowlist, tool),
     "explorer allowlist contains " .. tool
@@ -86,6 +84,11 @@ for _, tool in ipairs({ "read_file", "grep", "find", "ls", "glob", "bash" }) do
   )
 end
 
+-- read_only flag mirrors the tool set: true for read-only roles.
+assert_eq(lead_role.AGENT_CONFIGS.explorer.read_only, true, "explorer is read_only")
+assert_eq(lead_role.AGENT_CONFIGS.reviewer.read_only, true, "reviewer is read_only")
+assert_eq(lead_role.AGENT_CONFIGS.builder.read_only,  false, "builder is not read_only")
+
 -- Lead's orchestration tools are minimal and don't include the
 -- investigation/edit tools sub-agents have.
 assert_true(type(lead_role.ORCHESTRATION_TOOLS) == "table", "ORCHESTRATION_TOOLS is a table")
@@ -95,7 +98,7 @@ for _, tool in ipairs({ "read_file", "dispatch-graph", "write-review", "await-ap
     "ORCHESTRATION_TOOLS contains " .. tool
   )
 end
-for _, tool in ipairs({ "grep", "find", "ls", "glob", "write_file", "edit", "bash" }) do
+for _, tool in ipairs({ "write_file", "bash", "list_dir", "search_text" }) do
   assert_true(
     not contains(lead_role.ORCHESTRATION_TOOLS, tool),
     "ORCHESTRATION_TOOLS does NOT contain " .. tool
