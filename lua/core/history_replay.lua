@@ -115,9 +115,6 @@ function M.active() return in_replay end
 ---@param flag boolean
 function M.set(flag) in_replay = flag and true or false end
 
--- Backwards-compat alias for the prior test escape hatch name.
-M._set = M.set
-
 ---Subscribe to `sessions.replay.start` / `sessions.replay.end` as a
 ---defense-in-depth fallback for the synchronous `M.set` path. Idempotent:
 ---safe to call from contexts that don't actually have the bus wired
@@ -232,11 +229,11 @@ function M.replay_chat_history(opts)
   if type(create_model) == "string" and #create_model > 0 then
     create_body.model = create_model
   end
-  envelope.emit_to(target_provider, create_body)
+  envelope.emit(target_provider, create_body)
   emitted = emitted + 1
 
   for _, message in ipairs(pending_appends) do
-    envelope.emit_to(target_provider, {
+    envelope.emit(target_provider, {
       kind    = target_append_kind,
       chat_id = target_chat_id,
       message = message,

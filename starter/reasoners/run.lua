@@ -65,7 +65,7 @@ local envelope      = require("core.envelope")
 local replay_window = require("core.history_replay")
 
 local emit_as = envelope.emit_as
-local emit_to = envelope.emit_to
+local emit    = envelope.emit
 local next_id = envelope.next_id
 
 local M = {}
@@ -125,7 +125,7 @@ local function handle(body)
   local tool_id = next_id("tool")
   tool_to_firing[tool_id] = firing_id
 
-  emit_to("tool-gate", {
+  emit("tool-gate", {
     kind = "tool-gate.tool.invoke",
     id   = tool_id,
     name = "bash",
@@ -186,10 +186,8 @@ local function receive_msg(entry)
   -- Matches the broadcast-fan-out filter in reasoners/init.lua.
   if entry.origin == "step" and entry.target ~= nil then return end
 
-  local payload = entry.payload
-  if type(payload) ~= "string" or payload == "" then return end
-  local ok, decoded = pcall(json.decode, payload)
-  if not ok or type(decoded) ~= "table" or type(decoded.body) ~= "table" then return end
+  local ok, decoded = pcall(json.decode, entry.payload)
+  if not ok then return end
 
   -- Replayed envelopes from a past run-id can't advance the in-memory
   -- tool_to_firing map; skip during replay (parity with agent.lua).

@@ -30,7 +30,6 @@ local results_lib     = require("agentic-loop.results")
 local topology        = require("agentic-loop.topology")
 local spawn_graph     = require("reasoner-graph.spawn_graph")
 local history_replay  = require("core.history_replay")
-local replay_window   = history_replay
 local session_config  = require("agentic-loop.session_config")
 local generic_provider = require("libs.generic-provider")
 local generic_tool     = require("libs.generic-tool")
@@ -73,7 +72,6 @@ local state = {
   tool_start_observers   = {},  ---@type table
   tool_end_observers     = {},  ---@type table
   complete_observers     = {},  ---@type table
-  popup_observers        = {},  ---@type table
 }
 
 -- Reasoner types whose streaming should reach nefor-tui.
@@ -82,8 +80,6 @@ local STREAM_VISIBLE_TYPES = { ["provider-wrapper"] = true }
 local SPAWN_GRAPH_SOURCE = spawn_graph.SPAWN_GRAPH_SOURCE
 
 local emit           = envelope.emit
-local emit_to        = envelope.emit_to
-local emit_broadcast = envelope.emit_broadcast
 local pending_key    = ids.pending_key
 local uuid_lite      = envelope.uuid_lite
 
@@ -592,9 +588,8 @@ local function handle_tool_result_run_close(run_id, body)
 end
 
 -- Per-firing tool.result close: capture wrap node's next_state →
--- current_state for chat continuity. Matches behaviour of the prior
--- graph.node_result handler — only the wrap-firing's next_state matters
--- to the orchestrator.
+-- current_state for chat continuity. Only the wrap-firing's next_state
+-- matters to the orchestrator.
 local function handle_tool_result_firing_close(firing_id, body)
   local ref = state.firing_to_node[firing_id]
   if ref == nil then return end
@@ -712,7 +707,7 @@ local function track_tool_executor(run_id, node_id, firing_id, calls, tool_ids)
 end
 
 -- Provider-node pending entry constructor — same idea for the provider/
--- responder/wrapper/dummy reasoners.
+-- responder/wrapper reasoners.
 local function track_provider_firing(reasoner_type, run_id, node_id, firing_id,
                                      provider_name, chat_id)
   local key = pending_key(run_id, firing_id)
@@ -873,10 +868,6 @@ function M.on_complete(fn)
   assert(type(fn) == "function", "on_complete: callback must be a function")
   state.complete_observers[#state.complete_observers + 1] = fn
 end
-function M.on_popup(fn)
-  assert(type(fn) == "function", "on_popup: callback must be a function")
-  state.popup_observers[#state.popup_observers + 1] = fn
-end
 
 -- Configuration. Called once at boot from init.lua to set provider /
 -- model / system. Idempotent for config rebinds.
@@ -965,13 +956,10 @@ local function receive_msg(entry)
   -- the actor.lua runtime.
   if entry.origin == "step" and entry.target ~= nil then return end
 
-  local payload = entry.payload
-  if type(payload) ~= "string" or payload == "" then return end
-  local ok, decoded = pcall(json.decode, payload)
-  if not ok or type(decoded) ~= "table" or type(decoded.body) ~= "table" then return end
+  local ok, decoded = pcall(json.decode, entry.payload)
+  if not ok then return end
   local body = decoded.body
   local kind = body.kind
-  if type(kind) ~= "string" then return end
 
   -- Engine shutdown — sessions handles persistence; nothing for us.
   if kind == "engine.shutdown" then return end
@@ -982,7 +970,7 @@ local function receive_msg(entry)
   -- replay rebuilds state via the bus markers, not by re-firing the
   -- input handlers. The `tool.result` / `graph.node.fired` block
   -- below handles the same concern for reasoner-graph emissions.
-  if replay_window.active() then
+  if history_replay.active() then
     if kind == "chat.input.submit"
         or kind == "chat.reset"
         or kind == "chat.interrupt_all"
@@ -1002,7 +990,7 @@ local function receive_msg(entry)
   --   * tool.result { id=<run_id|firing_id>, result | error } — both
   --     run-close and per-firing close share the kind; we disambiguate
   --     by id.
-  if replay_window.active() then
+  if history_replay.active() then
     if kind == "graph.node.fired" then return end
     if kind == "tool.result" then
       -- Cross-process /resume rebuild: capture the active chat_id from
@@ -1115,7 +1103,7 @@ local function restore_active_model_from_session_log()
     -- observer (statusline, picker, future surfaces) picks it up.
     if type(state.config.provider) == "string" and #state.config.provider > 0
         and type(state.config.model) == "string" and #state.config.model > 0 then
-      emit_broadcast({
+      emit(nil, {
         kind     = "chat.model.set_ack",
         provider = state.config.provider,
         model    = state.config.model,
@@ -1165,7 +1153,6 @@ M._internals  = {
     state.tool_start_observers = {}
     state.tool_end_observers = {}
     state.complete_observers = {}
-    state.popup_observers = {}
     envelope._reset()
   end,
 }
