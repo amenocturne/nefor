@@ -236,19 +236,19 @@ do
 end
 
 do
-  local source_called_args = nil
+  local source_called_with = nil
   local opts = {
     state = { value = "/new", completion = nil },
     on_change = "prompt.changed",
     completions = {
       { trigger = "/", anchor = "start",
-        source = function(...) source_called_args = select("#", ...); return { { name = "new" }, { name = "next" } } end,
+        source = function(body) source_called_with = body; return { { name = "new" }, { name = "next" } } end,
       },
     },
   }
   local r = prompt.handle(opts, { kind = "prompt.changed", value = "/ne" })
   assert_true(r ~= nil, "input.changed consumed")
-  assert_eq(source_called_args, 0, "completion source called with 0 args")
+  assert_eq(source_called_with, "ne", "completion source receives trigger body")
   assert_true(r.state.completion ~= nil, "completion opened")
 end
 

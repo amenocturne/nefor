@@ -427,8 +427,8 @@ local MARKDOWN_THEME = {
 --   gate_yolo         whether the tool gate is in YOLO mode
 --   auth              per-provider state map
 --   expanded_details  Ctrl+O toggle: expand all tool I/O + reasoning rows
---   slash             nil | { matches, cursor, query }
---   at_complete       nil | { matches, cursor, token, base_dir, leaf }
+--   completion        nil | prompt-widget completion blob
+--                       (see plugins/nefor-tui/lua/widget/prompt.lua)
 --   last_esc_ms       ms of the most recent ESC press (for double-ESC)
 --   dag_runs          map keyed by run_id
 --   prompt_history    list of submitted prompts (newest at index 1, cap 200)
@@ -605,8 +605,7 @@ local function initial_state()
     gate_yolo        = false,
     auth             = {},
     expanded_details = false,
-    slash            = nil,
-    at_complete      = nil,
+    completion       = nil,
     last_esc_ms      = nil,
     dag_runs         = {},
     toasts           = {},
@@ -652,22 +651,26 @@ local function slash_filter(query)
 end
 
 ------------------------------------------------------------------------
--- @path autocomplete (#XX)
+-- @path autocomplete
 ------------------------------------------------------------------------
--- Mirrors slash autocomplete shape (matches/cursor/render) but the
--- completion source is the filesystem under CWD, walked one directory
--- level at a time to match bash-tab-completion intuition: `@src/m`
--- shows files in `src/` whose name starts with `m`, NOT a recursive
--- walk from CWD.
+-- Filesystem source for the @-path completion. The user types `@<path>`
+-- mid-message; the prompt widget's completion plumbing routes
+-- per-keystroke trigger detection + Tab application, this file owns
+-- the directory listing + filter behaviour:
 --
--- Trigger: the input's *last whitespace-separated word* starts with
--- `@`. This matches expand_at_path_refs's tokenisation (`@<non-ws>`)
--- and lets the user type an `@`-ref anywhere in a sentence, not just
--- as the first character (`/` is fixed at column 0; `@` floats).
+--   * walked one directory level at a time, bash-style — `@src/m`
+--     lists `src/` entries whose name starts with `m`, NOT a recursive
+--     walk from CWD;
+--   * excludes hidden files (leading `.`) and the AT_COMPLETION_IGNORE
+--     allowlist; not a full gitignore parser;
+--   * dirs-first then case-insensitive alphabetical so drill-down
+--     candidates lead the popup;
+--   * cached per base_dir under a file-level closure so repeated
+--     keystrokes within the same dir (or back-stepping over previously
+--     visited dirs) reuse one readdir.
 --
--- Excluded entries: hidden files (leading `.`), `.git`, `node_modules`,
--- `target`, `__pycache__`. Conservative allowlist; not a full
--- gitignore parser per spec.
+-- Resolves through `nefor.fs.list_dir`, the Rust readdir bridged into
+-- Lua (plugins/nefor-tui/src/fs.rs).
 
 local AT_COMPLETION_CAP = 200
 
@@ -676,41 +679,11 @@ local AT_COMPLETION_IGNORE = {
   ["target"] = true, ["__pycache__"] = true,
 }
 
--- Find the active `@token` in `text`. Returns `nil` if there isn't
--- one. The active token is the trailing `@<non-ws>*` substring at end
--- of input — completion only fires while the cursor is conceptually
--- on the token being typed. We approximate "cursor at end" with
--- "value ends with the token" because text_input doesn't surface its
--- per-instance cursor through the `input.changed` payload (the value
--- is what we have; for the QoL win this is enough — same fidelity as
--- expand_at_path_refs which also only sees the submitted value).
-local function active_at_token(text)
-  if text == nil or text == "" then return nil end
-  -- Find last `@` that's at start-of-string or preceded by whitespace.
-  local at_pos = nil
-  for i = #text, 1, -1 do
-    local c = text:sub(i, i)
-    if c == "@" then
-      if i == 1 or text:sub(i - 1, i - 1):match("%s") then
-        at_pos = i
-      end
-      break
-    end
-    if c:match("%s") then break end
-  end
-  if at_pos == nil then return nil end
-  local token_body = text:sub(at_pos + 1)
-  -- Token must contain no whitespace — completion stops once the user
-  -- types past the token (a space after `@foo`).
-  if token_body:find("%s") ~= nil then return nil end
-  return text:sub(at_pos), at_pos, token_body
-end
-
--- Split `body` (the part after `@`) into (base_dir, leaf). `base_dir`
--- is everything up to and including the last `/`; `leaf` is the
--- (case-insensitive prefix-matched) filter against directory entries.
--- Trailing `/` means base_dir = body, leaf = "".
+-- Split `body` (the part after `@`) into (base_dir, leaf). base_dir
+-- is everything up to and including the last `/`; leaf is the prefix
+-- filter against directory entries. Trailing `/` means leaf = "".
 local function split_at_body(body)
+  if body == nil then return "", "" end
   local last_slash = body:find("/[^/]*$")
   if last_slash == nil then
     return "", body
@@ -719,38 +692,18 @@ local function split_at_body(body)
 end
 
 -- Resolve `base_dir` against CWD. Empty → CWD. Paths starting with
--- `/` are treated as absolute. Trailing slash kept (ls handles it).
+-- `/` are treated as absolute.
 local function resolve_base_dir(base_dir)
   if base_dir == nil or base_dir == "" then return "." end
   if base_dir:sub(1, 1) == "/" then return base_dir end
   return "./" .. base_dir
 end
 
--- List entries under `dir`. Returns list of `{ name, is_dir }`.
--- Errors (missing dir, permission denied) yield empty list so a
--- half-typed dir name silently produces "no matches" rather than a
--- Lua error.
---
--- Backed by `nefor.fs.list_dir`, a Rust readdir bridged into Lua
--- (plugins/nefor-tui/src/fs.rs). The previous implementation shelled
--- out via `io.popen("ls -1Ap …")`, which produced `shell-init: cwd
--- not found` warnings when parallel tests inherited a since-deleted
--- tempdir cwd and inflated parallel-mode wall-time from ~90ms to
--- >60s due to fork contention. The Rust path is a single readdir
--- with no subprocess.
---
--- Filtering: skip dotfiles (leading `.`) and the
--- AT_COMPLETION_IGNORE allowlist; cap at AT_COMPLETION_CAP entries.
--- Sort dirs-first then case-insensitive alphabetical so drill-down
--- candidates lead the popup. The cache in `build_at_complete` reuses
--- the listing across keystrokes within the same dir.
 local function ls_entries(dir)
   local entries, err = nefor.fs.list_dir(dir)
   if entries == nil then
     -- Half-typed dir, permission denied, etc. Silently return empty
-    -- so the popup shows "no matches" rather than raising. The error
-    -- string is intentionally not surfaced — the user's signal is the
-    -- empty popup, not a Lua-level error message.
+    -- so the popup shows "no matches" rather than raising.
     local _ = err
     return {}
   end
@@ -763,15 +716,30 @@ local function ls_entries(dir)
     end
   end
   table.sort(out, function(a, b)
-    -- Directories first, then alphabetical case-insensitive — drives
-    -- the user toward drill-down candidates over peer-level files.
     if a.is_dir ~= b.is_dir then return a.is_dir end
     return a.name:lower() < b.name:lower()
   end)
   return out
 end
 
-local function at_filter(entries, leaf)
+local at_dir_cache = {}
+
+-- Returns entries under the base_dir derived from the trigger body.
+-- Filter (leaf prefix match) lives in `at_completion_filter` below so
+-- the cache key is the base_dir alone — typing forward into a leaf
+-- doesn't blow the cache.
+local function at_completion_source(body)
+  local base_dir = split_at_body(body)
+  local cached = at_dir_cache[base_dir]
+  if cached == nil then
+    cached = ls_entries(resolve_base_dir(base_dir))
+    at_dir_cache[base_dir] = cached
+  end
+  return cached
+end
+
+local function at_completion_filter(entries, body)
+  local _, leaf = split_at_body(body)
   local q = (leaf or ""):lower()
   if q == "" then return entries end
   local out = {}
@@ -779,6 +747,68 @@ local function at_filter(entries, leaf)
     if e.name:lower():sub(1, #q) == q then out[#out + 1] = e end
   end
   return out
+end
+
+local function at_completion_format(entry)
+  -- Trailing `/` on directories so the user sees at a glance which
+  -- entries are drillable.
+  return entry.is_dir and (entry.name .. "/") or entry.name
+end
+
+-- Replace the trailing `@<token>` with `@<base_dir><name>(/ if dir)`.
+-- The prompt widget calls this with the apply contract
+-- `(entry, body, value, token)`; we walk back from the value's end to
+-- find the token position rather than re-scanning, since the widget
+-- already validated the token shape.
+local function at_completion_apply(entry, body, value, token)
+  if value == nil or token == nil then return value end
+  local pos = #value - #token + 1
+  if pos < 1 then return value end
+  local base_dir = split_at_body(body or "")
+  local replacement = "@" .. base_dir .. entry.name
+  if entry.is_dir then replacement = replacement .. "/" end
+  return value:sub(1, pos - 1) .. replacement
+end
+
+local function slash_completion_format(cmd)
+  return string.format("/%-12s  %s", cmd.name, cmd.hint or "")
+end
+
+local function slash_completion_apply(entry)
+  return "/" .. entry.name .. (entry.takes_args and " " or "")
+end
+
+-- Completion sources declared by chat.lua, consumed by the prompt
+-- widget. Each entry carries:
+--   trigger      — first char (`/` or `@`).
+--   anchor       — "start" fires only at column 0 (slash command);
+--                  "word" fires at end-of-word (path ref mid-message).
+--   source       — entry list. Called with the current trigger body
+--                  so @-path can pick a base_dir per keystroke.
+--   filter       — fn(entries, body) → filtered list. Default is
+--                  leaf-prefix; slash filter also matches aliases,
+--                  @-path filter compares against the leaf segment.
+--   format_entry — fn(entry) → display string (no styling).
+--   apply        — fn(entry, body, value, token) → new input value.
+local function prompt_completions()
+  return {
+    {
+      trigger      = "/",
+      anchor       = "start",
+      source       = function() return SLASH_COMMANDS end,
+      filter       = function(_, body) return slash_filter(body or "") end,
+      format_entry = slash_completion_format,
+      apply        = slash_completion_apply,
+    },
+    {
+      trigger      = "@",
+      anchor       = "word",
+      source       = at_completion_source,
+      filter       = at_completion_filter,
+      format_entry = at_completion_format,
+      apply        = at_completion_apply,
+    },
+  }
 end
 
 ------------------------------------------------------------------------
@@ -1701,58 +1731,6 @@ end
 -- expiry) and place the rendered node in the stack.
 
 ------------------------------------------------------------------------
--- slash + @-path autocomplete (inline above input)
-------------------------------------------------------------------------
---
--- Both dropdowns reuse `W.picker.view` — the picker widget renders a
--- windowed list with cursor-row inversion (same shape as the legacy
--- inline popup). Slash filtering and @-path entry resolution are
--- driven by the reducer's `state.slash.matches` / `state.at_complete.
--- matches` (computed by `refresh_slash` / `refresh_at_complete`),
--- which keeps this view-time call purely cosmetic.
-
-local function inline_picker_list(matches, cursor, format_entry, empty_text)
-  if #matches == 0 then
-    return tui.text {
-      content = empty_text or "no matches",
-      style   = STYLE.status_dim,
-      wrap    = "none",
-    }
-  end
-  return W.picker.view({
-    state        = { cursor = cursor or 1 },
-    entries      = function() return matches end,
-    format_entry = format_entry,
-    cursor_style = CURSOR_ROW_STYLE,
-    show_search  = false,
-    cap          = 8,
-    gap          = 0,
-  })
-end
-
-local function slash_autocomplete_inline(state)
-  if not state.slash then return nil end
-  return inline_picker_list(
-    state.slash.matches or {}, state.slash.cursor,
-    function(cmd) return string.format("/%-12s  %s", cmd.name, cmd.hint or "") end,
-    "no matching commands"
-  )
-end
-
-local function at_autocomplete_inline(state)
-  if not state.at_complete then return nil end
-  return inline_picker_list(
-    state.at_complete.matches or {}, state.at_complete.cursor,
-    function(e)
-      -- Trailing `/` on directories so the user can see at a glance
-      -- which entries are drillable.
-      return e.is_dir and (e.name .. "/") or e.name
-    end,
-    "no matching paths"
-  )
-end
-
-------------------------------------------------------------------------
 -- DAG panel (sidebar widget)
 ------------------------------------------------------------------------
 
@@ -2033,24 +2011,30 @@ local function view(state)
   local input_border_style = input_focused
     and STYLE.input_border
     or STYLE.input_border_unfocused
-  -- Input renders as a bordered text input. The prompt widget's
-  -- completion plumbing isn't used here — chat.lua maintains its own
-  -- slash / at-path completion state in the reducer with bespoke
-  -- behaviour (filesystem source for @, command registry for /, custom
-  -- apply semantics). The autocomplete dropdowns are rendered inline
-  -- above the input via slash_autocomplete_inline / at_autocomplete_inline
-  -- and produce the same column layout the prompt widget would.
+  -- The prompt widget owns trigger detection + popup rendering + Tab
+  -- routing for both slash and @-path completion. Chat.lua declares
+  -- the completion sources via `prompt_completions()` and reads the
+  -- selected match back from `state.completion` on submit (Enter
+  -- promotes the highlighted slash match to its command text).
   local input_field = W.prompt.view({
-    state          = { value = state.input_value },
-    key            = "input",
-    focused        = input_focused,
-    on_change      = "input.changed",
-    on_submit      = "input.submit",
-    border_style   = input_border_style,
-    border_key     = "input-field",
-    min_lines      = 1,
-    max_lines      = 6,
-    selectable     = true,
+    state          = {
+      value      = state.input_value,
+      completion = state.completion,
+    },
+    key             = "input",
+    focused         = input_focused,
+    on_change       = "input.changed",
+    on_submit       = "input.submit",
+    border_style    = input_border_style,
+    border_key      = "input-field",
+    min_lines       = 1,
+    max_lines       = 6,
+    selectable      = true,
+    completions     = prompt_completions(),
+    completions_view = {
+      cursor_style = CURSOR_ROW_STYLE,
+      empty_style  = STYLE.status_dim,
+    },
   })
 
   -- One-row blank spacer reused at the top of the chat column and
@@ -2076,8 +2060,6 @@ local function view(state)
     children = compact {
       blank_row(),
       tui.expanded { child = transcript(state) },
-      slash_autocomplete_inline(state),
-      at_autocomplete_inline(state),
       input_field,
       statusline(state),
       blank_row(),
@@ -2452,6 +2434,8 @@ end
 -- update
 ------------------------------------------------------------------------
 
+-- Parse `/cmd args` out of an input value. Returns
+-- (cmd, args, has_ws). `cmd` nil when text isn't a slash command.
 local function parse_slash(text)
   if text:sub(1, 1) ~= "/" then return nil, nil, false end
   local cmd, rest = text:match("^/(%S+)%s*(.*)$")
@@ -2459,69 +2443,33 @@ local function parse_slash(text)
   return cmd, (rest ~= "" and rest or nil), has_ws
 end
 
-local function refresh_slash(state, text)
-  if text == nil or text:sub(1, 1) ~= "/" then
-    return shallow_merge(state, { slash = NIL_SENTINEL })
-  end
-  local cmd, _args, has_ws = parse_slash(text)
-  if has_ws then
-    -- User typed past the command name → close the popup.
-    return shallow_merge(state, { slash = NIL_SENTINEL })
-  end
-  local matches = slash_filter(cmd or "")
-  return shallow_merge(state, {
-    slash = { matches = matches, cursor = 1, query = cmd or "" },
-  })
-end
-
-local function refresh_at_complete(state, text)
-  local token, _at_pos, body = active_at_token(text)
-  if token == nil then
-    return shallow_merge(state, { at_complete = NIL_SENTINEL })
-  end
-  local base_dir, leaf = split_at_body(body or "")
-  local prev = state.at_complete
-  if prev and prev.token == token then return state end
-  -- Reuse the cached entry list per base_dir. The dir cache hangs
-  -- off `at_complete.dir_cache` so when the user backs up out of a
-  -- subdir (e.g. types past `@/private/var/` then deletes back to
-  -- `@/private/`) we don't re-shell out to `ls` for a directory we
-  -- already enumerated. Saves an io.popen per leaf-only keystroke
-  -- AND per back-step over previously visited base_dirs.
-  local dir_cache = (prev and prev.dir_cache) or {}
-  local entries = dir_cache[base_dir]
-  if entries == nil then
-    entries = ls_entries(resolve_base_dir(base_dir))
-    dir_cache[base_dir] = entries
-  end
-  local matches = at_filter(entries, leaf)
-  local at = {
-    matches   = matches,
-    cursor    = 1,
-    token     = token,
-    base_dir  = base_dir,
-    leaf      = leaf,
-    entries   = entries,
-    dir_cache = dir_cache,
+-- The prompt widget's `handle()` consumes a fixed set of kinds when a
+-- completion is active (key.up/down/tab/escape) and on every value
+-- change. Wrap it so the reducer can fold the state patch back into
+-- chat.lua's flat state shape.
+local function prompt_widget_opts(state)
+  return {
+    state       = {
+      value          = state.input_value,
+      completion     = state.completion,
+      history_cursor = state.history_cursor,
+    },
+    on_change   = "input.changed",
+    on_submit   = "input.submit",
+    completions = prompt_completions(),
+    history     = function() return state.prompt_history or {} end,
   }
-  return shallow_merge(state, { at_complete = at })
 end
 
--- Apply the cursor-selected entry: replace the trailing `@<token>`
--- with `@<base_dir><name>` (plus a trailing `/` for directories so
--- the user can keep drilling). Returns the new input value, or
--- `nil` if there's nothing to apply (no entries / no active token).
-local function apply_at_completion(state)
-  local at = state.at_complete
-  if at == nil then return nil end
-  local entry = at.matches and at.matches[at.cursor or 1]
-  if entry == nil then return nil end
-  local text = state.input_value or ""
-  local token, at_pos = active_at_token(text)
-  if token == nil or at_pos == nil then return nil end
-  local replacement = "@" .. (at.base_dir or "") .. entry.name
-  if entry.is_dir then replacement = replacement .. "/" end
-  return text:sub(1, at_pos - 1) .. replacement
+local function fold_prompt_patch(state, patch)
+  -- The widget's patch keys are { value, completion, history_cursor }
+  -- inside `state.<patch>`; translate them into chat.lua's flat fields.
+  -- util.NIL is the sentinel chat.lua already uses, so just remap names.
+  local out = {}
+  if patch.value          ~= nil then out.input_value    = patch.value          end
+  if patch.completion     ~= nil then out.completion     = patch.completion     end
+  if patch.history_cursor ~= nil then out.history_cursor = patch.history_cursor end
+  return shallow_merge(state, out)
 end
 
 local function update(msg, state)
@@ -2548,17 +2496,10 @@ local function update(msg, state)
 
   -- ── text_input callbacks ────────────────────────────────────────────
   if kind == "input.changed" then
-    local v = msg.value or ""
-    -- Any value mutation drops history navigation — once the user
-    -- starts editing the recalled prompt it stops being a history slot
-    -- and becomes the active draft. Clearing here keeps the next Up
-    -- from jumping back to the navigation cursor mid-edit.
-    state = shallow_merge(state, {
-      input_value    = v,
-      history_cursor = NIL_SENTINEL,
-    })
-    state = refresh_slash(state, v)
-    state = refresh_at_complete(state, v)
+    local result = W.prompt.handle(prompt_widget_opts(state), msg)
+    if result and result.state then
+      return fold_prompt_patch(state, result.state), {}
+    end
     return state, {}
   end
 
@@ -2575,8 +2516,9 @@ local function update(msg, state)
     -- selects the focused option, it doesn't submit the partial query.
     -- This lets `/mo` + Enter execute `/model` when the dropdown shows
     -- `/model` highlighted (matching legacy nefor's behaviour).
-    if state.slash then
-      local m = state.slash.matches and state.slash.matches[state.slash.cursor]
+    if state.completion and state.completion.trigger == "/" then
+      local c = state.completion
+      local m = c.matches and c.matches[c.cursor or 1]
       if m then
         text = "/" .. m.name
       end
@@ -2602,7 +2544,7 @@ local function update(msg, state)
       -- session_end teardown to fan out via the broker.
       local cleared = shallow_merge(state, {
         entries = {}, in_flight = NIL_SENTINEL, input_value = "",
-        pending = false, slash = NIL_SENTINEL, at_complete = NIL_SENTINEL,
+        pending = false, completion = NIL_SENTINEL,
         dag_runs = {}, firing_to_node = {},
         turn_started_at = NIL_SENTINEL,
         last_turn_duration_ms = NIL_SENTINEL,
@@ -2619,19 +2561,19 @@ local function update(msg, state)
     end
     if cmd == "help" then
       return shallow_merge(state, {
-        input_value = "", slash = NIL_SENTINEL, at_complete = NIL_SENTINEL,
+        input_value = "", completion = NIL_SENTINEL,
         popup = { variant = "help" },
       }), {}
     end
     if cmd == "yolo" then
-      local s = shallow_merge(state, { input_value = "", slash = NIL_SENTINEL, at_complete = NIL_SENTINEL })
+      local s = shallow_merge(state, { input_value = "", completion = NIL_SENTINEL })
       return s, {
         { kind = "send_to", target = "engine",
           body = { kind = "tool-gate.set_mode", mode = "yolo" } },
       }
     end
     if cmd == "safe" then
-      local s = shallow_merge(state, { input_value = "", slash = NIL_SENTINEL, at_complete = NIL_SENTINEL })
+      local s = shallow_merge(state, { input_value = "", completion = NIL_SENTINEL })
       return s, {
         { kind = "send_to", target = "engine",
           body = { kind = "tool-gate.set_mode", mode = "normal" } },
@@ -2640,7 +2582,7 @@ local function update(msg, state)
     if cmd == "login" or cmd == "logout" then
       local body = { kind = "chat." .. cmd .. "_requested" }
       if args and #args > 0 then body.provider = args end
-      return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL, at_complete = NIL_SENTINEL }), {
+      return shallow_merge(state, { input_value = "", completion = NIL_SENTINEL }), {
         { kind = "send_to", target = "engine", body = body },
       }
     end
@@ -2658,7 +2600,7 @@ local function update(msg, state)
         provider = connected[1]
         local body = { kind = "chat.model.set", model = args }
         if provider then body.provider = provider end
-        return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL, at_complete = NIL_SENTINEL }), {
+        return shallow_merge(state, { input_value = "", completion = NIL_SENTINEL }), {
           { kind = "send_to", target = "engine", body = body },
         }
       end
@@ -2682,7 +2624,7 @@ local function update(msg, state)
         }
       end
       return shallow_merge(state, {
-        input_value = "", slash = NIL_SENTINEL, at_complete = NIL_SENTINEL,
+        input_value = "", completion = NIL_SENTINEL,
         popup = {
           variant  = "model_picker",
           models   = {},
@@ -2707,7 +2649,7 @@ local function update(msg, state)
       if args and #args > 0 then
         local id = args:match("^([%w%-]+)") or args
         return shallow_merge(state, {
-          input_value = "", slash = NIL_SENTINEL, at_complete = NIL_SENTINEL,
+          input_value = "", completion = NIL_SENTINEL,
           entries = {}, in_flight = NIL_SENTINEL,
           pending = false, dag_runs = {}, firing_to_node = {},
           turn_started_at = NIL_SENTINEL,
@@ -2719,7 +2661,7 @@ local function update(msg, state)
       -- `/resume` (no args) — open the picker.
       local sessions = list_recent_sessions(10)
       return shallow_merge(state, {
-        input_value = "", slash = NIL_SENTINEL, at_complete = NIL_SENTINEL,
+        input_value = "", completion = NIL_SENTINEL,
         popup = {
           variant  = "session_picker",
           sessions = sessions,
@@ -2729,7 +2671,7 @@ local function update(msg, state)
     end
     if cmd ~= nil then
       -- Unknown slash → generic chat.command for user-defined Lua handlers.
-      return shallow_merge(state, { input_value = "", slash = NIL_SENTINEL, at_complete = NIL_SENTINEL }), {
+      return shallow_merge(state, { input_value = "", completion = NIL_SENTINEL }), {
         { kind = "send_to", target = "engine",
           body = { kind = "chat.command", name = cmd, args = args or "" } },
       }
@@ -2767,7 +2709,7 @@ local function update(msg, state)
     persist_input_history(history)
     local cleared = shallow_merge(with_user, {
       input_value = "", pending = true,
-      turn_started_at = tui.now_ms(), slash = NIL_SENTINEL, at_complete = NIL_SENTINEL,
+      turn_started_at = tui.now_ms(), completion = NIL_SENTINEL,
       prompt_history = history,
       history_cursor = NIL_SENTINEL,
       -- Mark the next bus-delivered chat.message.append with this
@@ -2830,13 +2772,9 @@ local function update(msg, state)
       end
       return shallow_merge(state, { popup = NIL_SENTINEL, toasts = {} }), {}
     end
-    -- 2) close slash autocomplete
-    if state.slash then
-      return shallow_merge(state, { slash = NIL_SENTINEL }), {}
-    end
-    -- 2b) close @-path autocomplete
-    if state.at_complete then
-      return shallow_merge(state, { at_complete = NIL_SENTINEL }), {}
+    -- 2) close completion dropdown (slash or @-path)
+    if state.completion ~= nil then
+      return shallow_merge(state, { completion = NIL_SENTINEL }), {}
     end
     -- 3) cancel prompt-history navigation (clear recalled value)
     if state.history_cursor ~= nil then
@@ -2953,69 +2891,14 @@ local function update(msg, state)
     return state, {}
   end
 
-  -- Slash autocomplete keys (when slash popup open).
-  if state.slash then
-    if kind == "key.up" then
-      local n = #(state.slash.matches or {})
-      if n == 0 then return state, {} end
-      local cur = state.slash.cursor or 1
-      cur = cur - 1
-      if cur < 1 then cur = n end
-      return shallow_merge(state, {
-        slash = shallow_merge(state.slash, { cursor = cur }),
-      }), {}
-    end
-    if kind == "key.down" then
-      local n = #(state.slash.matches or {})
-      if n == 0 then return state, {} end
-      local cur = state.slash.cursor or 1
-      cur = cur + 1
-      if cur > n then cur = 1 end
-      return shallow_merge(state, {
-        slash = shallow_merge(state.slash, { cursor = cur }),
-      }), {}
-    end
-    if kind == "key.tab" then
-      local m = state.slash.matches and state.slash.matches[state.slash.cursor]
-      if m then
-        local v = "/" .. m.name .. (m.takes_args and " " or "")
-        return shallow_merge(state, { input_value = v, slash = NIL_SENTINEL }), {}
-      end
-    end
-  end
-
-  -- @-path autocomplete keys (when popup open). Up/Down move the
-  -- cursor; Tab inserts the highlighted entry into the input,
-  -- replacing the trailing `@<token>`. Enter is handled in the
-  -- input.submit branch above (it inserts, not submits, when the
-  -- popup is open).
-  if state.at_complete then
-    if kind == "key.up" then
-      local n = #(state.at_complete.matches or {})
-      if n == 0 then return state, {} end
-      local cur = state.at_complete.cursor or 1
-      cur = cur - 1
-      if cur < 1 then cur = n end
-      return shallow_merge(state, {
-        at_complete = shallow_merge(state.at_complete, { cursor = cur }),
-      }), {}
-    end
-    if kind == "key.down" then
-      local n = #(state.at_complete.matches or {})
-      if n == 0 then return state, {} end
-      local cur = state.at_complete.cursor or 1
-      cur = cur + 1
-      if cur > n then cur = 1 end
-      return shallow_merge(state, {
-        at_complete = shallow_merge(state.at_complete, { cursor = cur }),
-      }), {}
-    end
-    if kind == "key.tab" then
-      local new_text = apply_at_completion(state)
-      if new_text == nil then return state, {} end
-      local s = shallow_merge(state, { input_value = new_text })
-      s = refresh_at_complete(s, new_text)
-      return s, {}
+  -- Slash and @-path autocomplete keys (when completion popup open).
+  -- The prompt widget consumes key.up/down/tab/escape against the
+  -- active completion; chat.lua folds its state patch back into the
+  -- flat reducer shape.
+  if state.completion ~= nil then
+    local result = W.prompt.handle(prompt_widget_opts(state), msg)
+    if result ~= nil then
+      return fold_prompt_patch(state, result.state or {}), {}
     end
   end
 
@@ -3056,38 +2939,19 @@ local function update(msg, state)
     route_scroll(function(k) tui.scroll_by(k, 10) end)
     return state, {}
   end
-  if kind == "key.up" then
+  if kind == "key.up" or kind == "key.down" then
+    -- Up/Down on the chat surface: when no popup owns scroll routing,
+    -- the prompt widget gets first dibs (history nav when the input
+    -- is empty or already navigating). If the widget didn't consume,
+    -- the key routes to scroll.
     if active_scroll_key() == nil then
-      local navigating = state.history_cursor ~= nil
-      local empty = (state.input_value or "") == ""
-      if (navigating or empty) and #(state.prompt_history or {}) > 0 then
-        local cur = state.history_cursor or 0
-        local nxt = math.min(cur + 1, #state.prompt_history)
-        return shallow_merge(state, {
-          input_value    = state.prompt_history[nxt],
-          history_cursor = nxt,
-        }), {}
+      local result = W.prompt.handle(prompt_widget_opts(state), msg)
+      if result ~= nil then
+        return fold_prompt_patch(state, result.state or {}), {}
       end
     end
-    route_scroll(function(k) tui.scroll_by(k, -1) end)
-    return state, {}
-  end
-  if kind == "key.down" then
-    if active_scroll_key() == nil and state.history_cursor ~= nil then
-      local cur = state.history_cursor
-      if cur <= 1 then
-        return shallow_merge(state, {
-          input_value    = "",
-          history_cursor = NIL_SENTINEL,
-        }), {}
-      end
-      local nxt = cur - 1
-      return shallow_merge(state, {
-        input_value    = state.prompt_history[nxt],
-        history_cursor = nxt,
-      }), {}
-    end
-    route_scroll(function(k) tui.scroll_by(k, 1) end)
+    local delta = (kind == "key.up") and -1 or 1
+    route_scroll(function(k) tui.scroll_by(k, delta) end)
     return state, {}
   end
   if kind == "key.home" then
@@ -3139,7 +3003,7 @@ local function update(msg, state)
       last_turn_duration_ms = NIL_SENTINEL,
       popup            = NIL_SENTINEL,
       toasts           = {},
-      slash            = NIL_SENTINEL,
+      completion       = NIL_SENTINEL,
       dag_runs         = {},
     }), {}
   end

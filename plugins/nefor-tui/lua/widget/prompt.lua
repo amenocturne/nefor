@@ -74,7 +74,10 @@ local function compute_completion(opts, text, prev)
   if prev and prev.token == token then
     return {}
   end
-  local entries = cfg.source and cfg.source() or {}
+  -- `source(body)` lets the caller derive a per-keystroke listing from
+  -- the trigger body — @-path autocomplete uses it to scope the
+  -- directory listing to the prefix in body.
+  local entries = cfg.source and cfg.source(body or "") or {}
   local matches
   if cfg.filter ~= nil then
     matches = cfg.filter(entries, body or "")
