@@ -56,6 +56,26 @@ local provider_lib = require("openai-provider")
 
 local M = {}
 
+-- opts.hooks lets downstream callers splice per-envelope logic into the
+-- two translation seams without forking this file. Both hooks are
+-- optional; absent hooks leave the pipeline byte-for-byte identical to
+-- the no-hook path.
+--
+--   intercept_inbound(env, helpers) — runs in from_plugin between
+--     translator.maybe_inject_static_token and translator.outbound.
+--     May mutate env.body in place (e.g. rewriting body.text or
+--     body.kind) and may emit synthetic envelopes via
+--     helpers.emit_synthetic(from, body). Return false to drop the env;
+--     any other return value continues normal processing.
+--
+--   intercept_to_plugin(env) — runs in to_plugin inside the
+--     non-replay branch, before translator.inbound. Same drop / continue
+--     semantics. Replay envelopes always take the lib path.
+--
+-- helpers = { kinds = translator.kinds, name = <provider name>,
+--             emit_synthetic = <function(from, body)> }. emit_synthetic
+-- writes a wire-shape event envelope to the bus so callers don't need
+-- to know the framing.
 function M.spawn_spec(name, command, opts)
   if type(name) ~= "string" or #name == 0 then
     error("provider.spawn_spec: name required, got " .. type(name))
@@ -64,9 +84,25 @@ function M.spawn_spec(name, command, opts)
     error("provider.spawn_spec: command must be a table, got " .. type(command))
   end
   opts = opts or {}
+  local hooks = opts.hooks or {}
 
   local translator = provider_lib.translator(name)
   local kinds = translator.kinds
+
+  local function emit_synthetic(from, body)
+    nefor.engine.send(nefor.json.encode({
+      type = "event",
+      from = from,
+      ts   = nefor.engine.now(),
+      body = body,
+    }))
+  end
+
+  local hook_helpers = {
+    kinds          = kinds,
+    name           = name,
+    emit_synthetic = emit_synthetic,
+  }
 
   -- Lazy-bind to agentic-loop — module load order can require this
   -- file before agentic-loop's spawn line in init.lua.
@@ -206,6 +242,12 @@ function M.spawn_spec(name, command, opts)
       -- (ready/goodbye both return nil from outbound).
       translator.maybe_inject_static_token(env, opts)
 
+      if hooks.intercept_inbound then
+        if hooks.intercept_inbound(env, hook_helpers) == false then
+          goto continue
+        end
+      end
+
       local body = translator.outbound(env)
       if body ~= nil then
         body = handle_orchestrator_outbound(body)
@@ -213,6 +255,7 @@ function M.spawn_spec(name, command, opts)
           translator.publish(env.from or name, body)
         end
       end
+      ::continue::
     end
   end
 
@@ -229,6 +272,12 @@ function M.spawn_spec(name, command, opts)
       if env.replay then
         provider_lib.replay_rebuild(env, name)
       else
+        if hooks.intercept_to_plugin then
+          if hooks.intercept_to_plugin(env) == false then
+            goto continue
+          end
+        end
+
         local body = translator.inbound(env)
         if body ~= nil then
           if body.kind == kinds.model_set then
@@ -243,6 +292,7 @@ function M.spawn_spec(name, command, opts)
           translator.deliver(body)
         end
       end
+      ::continue::
     end
   end
 
