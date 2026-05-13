@@ -49,8 +49,25 @@ do
   end
 
   local config_dir = os.getenv("NEFOR_CONFIG_DIR")
+  local dev_dir    = os.getenv("NEFOR_DEV_DIR")
+  local data_dir   = os.getenv("NEFOR_DATA_DIR")
+  -- Bootstrap clone path (team consumers); mirrors how
+  -- nefor.fs.data_root resolves $XDG_DATA_HOME/nefor or
+  -- $HOME/.local/share/nefor on a fresh machine.
+  local xdg_data   = os.getenv("XDG_DATA_HOME")
+  local home       = os.getenv("HOME")
+  local pm_root
+  if data_dir and data_dir ~= "" then
+    pm_root = data_dir .. "/nefor"
+  elseif xdg_data and xdg_data ~= "" then
+    pm_root = xdg_data .. "/nefor/nefor"
+  elseif home and home ~= "" then
+    pm_root = home .. "/.local/share/nefor/nefor"
+  end
 
   local tui_lua_dir = pick_dir("NEFOR_TUI_LUA_DIR", "/init.lua", {
+    dev_dir    and (dev_dir    .. "/plugins/nefor-tui/lua") or nil,
+    pm_root    and (pm_root    .. "/plugins/nefor-tui/lua") or nil,
     config_dir and (config_dir .. "/../plugins/nefor-tui/lua") or nil,
     "./plugins/nefor-tui/lua",
     "../plugins/nefor-tui/lua",
@@ -63,6 +80,8 @@ do
   -- `<NEFOR_CONFIG_DIR>/chat` (the user installs starter/ as their
   -- config dir; chat/ is a sibling of init.lua).
   local chat_dir = pick_dir("NEFOR_STARTER_CHAT_DIR", "/common.lua", {
+    dev_dir    and (dev_dir    .. "/starter/chat") or nil,
+    pm_root    and (pm_root    .. "/starter/chat") or nil,
     config_dir and (config_dir .. "/chat") or nil,
     "./starter/chat",
     "../starter/chat",
