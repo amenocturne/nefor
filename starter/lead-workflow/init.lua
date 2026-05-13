@@ -12,21 +12,19 @@
 --      which plan_id, so a `/approve` / `/reject ...` user submit can
 --      be routed back to the right tool.invoke.
 --
--- Per lead-workflow-spec §2 / §6 / §7-c.
---
 -- ## Tools the lead invokes
 --
--- These are advertised to tool-gate as a virtual source `lead-workflow`.
--- The gate forwards `tool-gate.tool.invoke` → `lead-workflow.tool.invoke`,
+-- Advertised to tool-gate as a virtual source `lead-workflow`. The
+-- gate forwards `tool-gate.tool.invoke` → `lead-workflow.tool.invoke`,
 -- this actor handles the forwarded envelopes and emits `tool.result`
 -- back. The gate's id-rewriting machinery handles the round-trip.
 --
 --   * `dispatch-graph` — args:
 --       { nodes = [{ id, role, agent_args, dependencies? }, ...] }
 --     Builds a reasoner-graph spec from the role-keyed nodes (looking
---     up `role -> reasoner config` from `lead_role.AGENT_CONFIGS` when
---     available; falling back to a default `agent`-reasoner shape so
---     the actor stays usable before C3 lands), submits it via the same
+--     up `role -> reasoner config` from `lead-workflow.role.AGENT_CONFIGS`
+--     when available; falling back to a default `agent`-reasoner shape
+--     when the role module is not yet loaded), submits it via the same
 --     `tool.invoke{name=spawn_graph}` shape `agentic-loop`'s
 --     `submit_orchestrator_run` uses. Returns the minted run_id.
 --
@@ -34,8 +32,7 @@
 --       { plan = <string> }
 --     Persists the plan to `<DATA>/plans/<plan_id>.md`, broadcasts
 --     `lead-workflow.plan.submitted { plan_id, plan, submitted_at }`,
---     returns `{ plan_id }`. The chat-surface render (C4) picks up the
---     envelope.
+--     returns `{ plan_id }`.
 --
 --   * `await-approval` — args:
 --       { plan_id = <string> }
@@ -72,10 +69,6 @@ local emit_as = envelope.emit_as
 local emit_to = envelope.emit_to
 local next_id = envelope.next_id
 
--- ------------------------------------------------------------------
--- module-private state
--- ------------------------------------------------------------------
-
 local state = {
   -- The in-flight graph's run_id; nil when no graph is running.
   ---@type string|nil
@@ -101,10 +94,6 @@ local state = {
 
 local SOURCE_NAME = "lead-workflow"
 
--- ------------------------------------------------------------------
--- on-disk plan path resolution
--- ------------------------------------------------------------------
-
 -- Delegates to `nefor.fs.data_root()` — the engine's canonical resolved
 -- data directory (CLI flag > `NEFOR_DATA_DIR` env var > XDG default).
 local function compute_data_root()
@@ -127,25 +116,16 @@ local function plan_path_for(plan_id)
   return dir .. "/" .. plan_id .. ".md"
 end
 
--- ------------------------------------------------------------------
--- lazy lead_role lookup (C3 subagent)
--- ------------------------------------------------------------------
-
--- Look up `lead_role.AGENT_CONFIGS[role]`. Tolerates the C3 subagent's
--- output not being available: returns nil + diagnostic instead of
--- erroring at module load. Each call retries the require so that once
--- C3 lands the next dispatch picks it up.
+-- Look up `lead-workflow.role.AGENT_CONFIGS[role]`. Tolerates the role
+-- module not being loaded: returns nil instead of erroring at module
+-- load. Each call retries the require so a later install picks up.
 local function role_config(role)
-  local ok, mod = pcall(require, "lead_role")
+  local ok, mod = pcall(require, "lead-workflow.role")
   if not ok or type(mod) ~= "table" then return nil end
   local configs = mod.AGENT_CONFIGS
   if type(configs) ~= "table" then return nil end
   return configs[role]
 end
-
--- ------------------------------------------------------------------
--- envelope emit helpers
--- ------------------------------------------------------------------
 
 local function emit_tool_result_ok(firing_id, output)
   emit_as(SOURCE_NAME, nil, {
@@ -163,10 +143,7 @@ local function emit_tool_result_err(firing_id, err)
   })
 end
 
--- ------------------------------------------------------------------
--- tool: dispatch-graph
--- ------------------------------------------------------------------
-
+-- Tool: dispatch-graph.
 -- Validate that the role-keyed node spec has exactly one terminal
 -- (sink) node — one node id that no other node lists in its
 -- `dependencies`. Reasoner-graph treats the sole terminal node's result
@@ -218,11 +195,10 @@ end
 --   { id, role, agent_args = { prompt, ... }, dependencies? = { upstream_ids } }
 --
 -- For each node we resolve `role -> { system_prompt, tool_allowlist,
--- model? }` from lead_role.AGENT_CONFIGS. If unavailable (C3 not yet
--- landed), we fall back to passing the role straight through as an
--- `agent` reasoner with the caller's `agent_args` only — the agent
--- reasoner will fail the firing if `prompt` is missing, which is fine
--- (the lead retries).
+-- model? }` from `lead-workflow.role.AGENT_CONFIGS`. If unavailable
+-- we fall back to passing the role straight through as an `agent`
+-- reasoner with the caller's `agent_args` only — the agent reasoner
+-- will fail the firing if `prompt` is missing.
 local function build_graph_spec(node_specs)
   if type(node_specs) ~= "table" or #node_specs == 0 then
     return nil, "dispatch-graph: nodes list must be a non-empty array"
@@ -314,10 +290,7 @@ local function dispatch_graph(firing_id, args)
   })
 end
 
--- ------------------------------------------------------------------
--- tool: write-review (submit-plan)
--- ------------------------------------------------------------------
-
+-- Tool: write-review (alias submit-plan).
 local function persist_plan(plan_id, plan_text)
   if state.persisted_plans[plan_id] then return end
   state.persisted_plans[plan_id] = true
@@ -379,10 +352,7 @@ local function submit_plan(firing_id, args)
   emit_tool_result_ok(firing_id, { plan_id = plan_id })
 end
 
--- ------------------------------------------------------------------
--- tool: await-approval
--- ------------------------------------------------------------------
-
+-- Tool: await-approval.
 local function await_approval(firing_id, args)
   local plan_id = args and args.plan_id
   if type(plan_id) ~= "string" or #plan_id == 0 then
@@ -425,10 +395,7 @@ local function resolve_pending_approvals(plan_id, approved, reason)
   end
 end
 
--- ------------------------------------------------------------------
--- chat.input.submit watcher — /approve and /reject patterns
--- ------------------------------------------------------------------
-
+-- chat.input.submit watcher — /approve and /reject patterns.
 -- Match `/approve` or `/approve <reason>` and `/reject <reason>`. The
 -- patterns are lenient: surrounding whitespace is stripped. Returns
 -- (verdict, reason) or nil if the text doesn't match.
@@ -473,11 +440,9 @@ local function handle_chat_input(body)
   resolve_pending_approvals(plan_id, verdict, reason)
 end
 
--- ------------------------------------------------------------------
--- replay reducers — same shape as live but no side effects (no file
--- write, no resolution callbacks since pending_approvals didn't survive
--- the process exit)
--- ------------------------------------------------------------------
+-- Replay reducers — same shape as live but no side effects (no file
+-- write, no resolution callbacks since pending_approvals didn't
+-- survive the process exit).
 
 local function reduce_plan_submitted(body)
   local plan_id = body.plan_id
@@ -512,10 +477,6 @@ local function reduce_plan_approved(body)
   state.active_plan.approval_reason = body.approval_reason
 end
 
--- ------------------------------------------------------------------
--- session_end → terminate active graph
--- ------------------------------------------------------------------
-
 local function terminate_active_graph()
   if state.active_run_id == nil then return end
   local run_id = state.active_run_id
@@ -524,7 +485,7 @@ local function terminate_active_graph()
   -- Broadcast (target = nil) rather than target reasoner-graph: every
   -- in-flight agent reasoner under this run also needs to see the
   -- envelope so it can interrupt its provider stream + close its
-  -- firing (sub-graph cancel propagation, #53). The reasoner-graph
+  -- firing (sub-graph cancel propagation). The reasoner-graph
   -- binary still receives the broadcast and processes it the same way.
   emit_as(SOURCE_NAME, nil, { kind = "graph.cancel", run_id = run_id })
   emit_to("nefor-tui", {
@@ -538,22 +499,17 @@ local function terminate_active_graph()
   state.pending_approvals = {}
 end
 
--- ------------------------------------------------------------------
--- run-close watcher — clear active_run_id when the in-flight graph
--- finishes on its own
--- ------------------------------------------------------------------
-
+-- Run-close watcher — clear active_run_id when the in-flight graph
+-- finishes on its own.
 local function maybe_clear_active_run(run_id)
   if state.active_run_id ~= nil and state.active_run_id == run_id then
     state.active_run_id = nil
   end
 end
 
--- ------------------------------------------------------------------
 -- tools.advertise on first <gate>.hello (best-effort; the actor still
 -- works without the gate being up — tests drive tool.invoke envelopes
--- synthetically)
--- ------------------------------------------------------------------
+-- synthetically).
 
 local advertised = false
 
@@ -604,10 +560,6 @@ local function advertise_tools(gate_name)
   })
 end
 
--- ------------------------------------------------------------------
--- bus dispatcher — invoked from receive_msg
--- ------------------------------------------------------------------
-
 local TOOL_HANDLERS = {
   ["dispatch-graph"]  = dispatch_graph,
   ["write-review"]    = submit_plan,
@@ -626,10 +578,6 @@ local function handle_tool_invoke(body)
   end
   handler(firing_id, body.args or {})
 end
-
--- ------------------------------------------------------------------
--- receive_msg
--- ------------------------------------------------------------------
 
 local function receive_msg(entry)
   if entry.origin == "step" and entry.target ~= nil then return end
@@ -694,19 +642,12 @@ local function receive_msg(entry)
   end
 end
 
--- ------------------------------------------------------------------
--- bus subscriptions — session_end + replay markers
--- ------------------------------------------------------------------
-
+-- Bus subscriptions — session_end + replay markers.
 if nefor.bus and nefor.bus.on_event then
   nefor.bus.on_event("sessions.session_end", function(_entry)
     terminate_active_graph()
   end)
 end
-
--- ------------------------------------------------------------------
--- module table
--- ------------------------------------------------------------------
 
 return {
   name        = "lead-workflow",

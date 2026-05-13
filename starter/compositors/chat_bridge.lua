@@ -1,14 +1,14 @@
--- starter/chat_bridge.lua — engine-side actor that bridges the bus to
--- the nefor-tui plugin binary's stdio. Identity passthrough on both
--- directions: the binary's outbound envelopes go on the bus verbatim;
--- inbound envelopes are re-encoded without the framework-only `replay`
--- flag (the protocol parser at the binary rejects unknown fields) but
--- with `env.replay` envelopes preserved so chat.lua can rebuild its
--- transcript on resume.
+-- starter/compositors/chat_bridge.lua — engine-side actor that bridges
+-- the bus to the nefor-tui plugin binary's stdio. Identity passthrough
+-- on both directions: the binary's outbound envelopes go on the bus
+-- verbatim; inbound envelopes are re-encoded without the framework-only
+-- `replay` flag (the protocol parser at the binary rejects unknown
+-- fields) but with `env.replay` envelopes preserved so chat/init.lua
+-- can rebuild its transcript on resume.
 --
--- The companion UI script lives at `starter/chat.lua` and is loaded by
--- the nefor-tui binary itself; the two run in different processes and
--- share no Lua state.
+-- The companion UI script lives at `starter/chat/init.lua` and is
+-- loaded by the nefor-tui binary itself; the two run in different
+-- processes and share no Lua state.
 
 local json = nefor.json
 

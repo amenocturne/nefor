@@ -1,8 +1,7 @@
 -- starter/reasoners/agent.lua — `agent` reasoner type.
 --
--- Lead-workflow keystone (lead-workflow-spec §2 / §7-a). Composes the
--- existing `provider-wrapper` + `tool-executor` patterns inline into a
--- single self-contained reasoner that runs its own per-firing
+-- Composes the `provider-wrapper` + `tool-executor` patterns inline
+-- into a single self-contained reasoner that runs its own per-firing
 -- agentic-loop: provider call → optional tool calls → results →
 -- provider → … → terminal.
 --
@@ -109,9 +108,8 @@ local FINALIZE_NAME = "finalize"
 
 -- JSON schema for the `finalize` tool. Only `answer` is required;
 -- additional fields pass through into `result.structured` verbatim
--- (`additionalProperties = true`). Role-specific finalize-tool
--- schemas (per spec §2 "Structured finalization") layer on top of
--- this base by adding fields like `findings` / `risks` /
+-- (`additionalProperties = true`). Role-specific schemas layer on top
+-- of this base by adding fields like `findings` / `risks` /
 -- `context_for_next_agent` to the role's system prompt.
 local FINALIZE_SCHEMA = {
   type = "function",
@@ -147,16 +145,14 @@ local function al()
   return agentic_loop
 end
 
--- ------------------------------------------------------------------
--- per-firing state
--- ------------------------------------------------------------------
+-- Per-firing state.
 --
 -- agents[firing_id] = {
 --   firing_id      = string,
 --   run_id         = string,         -- enclosing graph run_id; used to
 --                                    -- match `graph.cancel { run_id }` so
 --                                    -- in-flight provider streams under a
---                                    -- cancelled run are interrupted (#53).
+--                                    -- cancelled run are interrupted.
 --   chat_id        = string,
 --   provider       = string,         -- e.g. "ollama" / "mock-plugin"
 --   tool_allowlist = { string -> true } | nil,
@@ -178,10 +174,6 @@ end
 local agents          = {}
 local chat_to_firing  = {}
 local tool_to_firing  = {}
-
--- ------------------------------------------------------------------
--- helpers
--- ------------------------------------------------------------------
 
 local function build_allowlist_set(list)
   if type(list) ~= "table" then return nil end
@@ -264,9 +256,7 @@ local function emit_chat_append(entry, message)
   })
 end
 
--- ------------------------------------------------------------------
--- dispatch handler — entry from reasoners/init.lua
--- ------------------------------------------------------------------
+-- Dispatch handler — entry from reasoners/init.lua.
 --
 -- body shape (post unwrap_invoke_body):
 --   { run_id, node_id, firing_id, args, inputs, prev_state }
@@ -339,8 +329,8 @@ local function handle(body)
   end
   -- Advertise the role's allowlist + the synthetic `finalize`
   -- terminator. `finalize` rides on every agent firing regardless of
-  -- the caller's allowlist (spec §2 "Structured finalization"); it's
-  -- intercepted here, not routed through tool-gate.
+  -- the caller's allowlist; it's intercepted here, not routed through
+  -- tool-gate.
   if type(args.tool_allowlist) == "table" then
     local advertised = {}
     for _, n in ipairs(args.tool_allowlist) do advertised[#advertised + 1] = n end
@@ -370,10 +360,6 @@ local function handle(body)
 end
 
 M.handle = handle
-
--- ------------------------------------------------------------------
--- bus event handlers
--- ------------------------------------------------------------------
 
 -- Dispatch a single provider tool_call. Returns:
 --   true  — dispatched (or synthesised local result for disallowed)
@@ -611,16 +597,16 @@ local function on_chat_error(body)
   send_terminal_err(firing_id, body.message or "provider error")
 end
 
--- Sub-graph cancel propagation (#53). Companion to ef260cd's chat-side
--- cancel_all → <provider>.interrupt fix: when lead-workflow cancels the
+-- Sub-graph cancel propagation. Companion to the chat-side cancel_all
+-- → <provider>.interrupt path: when lead-workflow cancels the
 -- enclosing graph (session_end / user /quit mid-run), in-flight
 -- `<provider>.chat.complete` streams under our firing keep producing
 -- tokens unless we tear them down explicitly. Walk every firing under
 -- the cancelled run_id and:
 --   1. emit `<provider>.interrupt { chat_id }` so the provider binary
 --      closes the streaming HTTP call (mock honours chat_id; openai's
---      legacy bare `interrupt` is chat-agnostic — that's a separate gap
---      tracked against the openai binary, NOT this fix).
+--      bare `interrupt` is chat-agnostic — a separate gap tracked
+--      against the openai binary, NOT this fix).
 --   2. emit a terminal `tool.result { error }` for the firing so
 --      reasoner-graph's `firing_by_request_id` gets cleaned up the same
 --      way a provider error close would. Idempotent: a firing that's
@@ -659,10 +645,8 @@ local function on_graph_cancel(body)
   end
 end
 
--- ------------------------------------------------------------------
--- receive_msg — bus subscriber for provider replies + tool results
--- ------------------------------------------------------------------
-
+-- receive_msg — bus subscriber for provider replies + tool results.
+--
 -- Called from reasoners/init.lua's receive_msg before its tool.invoke
 -- dispatch path. We watch for the bus envelopes that carry per-turn
 -- progress (provider replies, tool results, provider errors) targeting
@@ -687,7 +671,7 @@ local function receive_msg(entry)
   local kind = body.kind
   if type(kind) ~= "string" then return end
 
-  -- graph.cancel handler — sub-graph cancel propagation (#53). The
+  -- graph.cancel handler — sub-graph cancel propagation. The
   -- lead-workflow actor broadcasts `graph.cancel { run_id }` on
   -- session_end / user-quit; we tear down any of OUR firings under the
   -- cancelled run by interrupting the provider stream + emitting a
@@ -760,10 +744,6 @@ local function receive_msg(entry)
 end
 
 M.receive_msg = receive_msg
-
--- ------------------------------------------------------------------
--- test escape hatch
--- ------------------------------------------------------------------
 
 M._internals = {
   agents          = agents,

@@ -1,25 +1,13 @@
 -- starter/sessions/init.lua — session-management actor.
 --
--- ## Layout
---
--- This plugin is a folder. `init.lua` (this file) is the production
--- actor — `require("sessions")` returns it. `test.lua` is a sibling
--- module exporting test escape hatches; `require("sessions.test")` is
--- imported only by tests, never by production code.
---
--- ## Shape
---
--- Returns the actor table — `{ name, receive_msg, send_msg, ... }` —
--- which the starter registers via `actor.spawn(require("sessions"))`.
--- The actor runtime calls `receive_msg(entry)` for every wire envelope;
--- the module's own code calls `send_msg(...)` to emit.
---
--- ## What this module owns
---
--- All session knowledge — id, on-disk jsonl path, persistence of bus
+-- Owns session knowledge: id, on-disk jsonl path, persistence of bus
 -- traffic, in-process resume. Filtering replay traffic is the consumer
 -- plugin's concern; sessions broadcasts every recorded step-origin
 -- entry to its original target on resume.
+--
+-- The test escape-hatch surface (`require("sessions.test")`) lives
+-- under `tests/lua/sessions/test.lua` and is on the package.path only
+-- in the Rust test harness.
 --
 -- ## Public bus protocol
 --
@@ -57,10 +45,6 @@
 
 local json = nefor.json
 
--- ------------------------------------------------------------------
--- module state — single table; mutations are explicit (state.x = ...)
--- ------------------------------------------------------------------
-
 local state = {
   ---@type string|nil
   current_session_id   = nil,
@@ -85,10 +69,6 @@ local state = {
   in_replay_window = false,
 }
 
--- ------------------------------------------------------------------
--- on-disk paths — computed once at module load
--- ------------------------------------------------------------------
-
 ---@return string|nil
 local function compute_data_root()
   return nefor.fs.data_root()
@@ -107,10 +87,6 @@ end
 local function ensure_dir(path)
   os.execute(string.format("mkdir -p %q 2>/dev/null", path))
 end
-
--- ------------------------------------------------------------------
--- helpers — uuid, file io
--- ------------------------------------------------------------------
 
 do
   local addr_byte = string.byte(tostring({}):sub(-2, -2)) or 0
@@ -177,10 +153,7 @@ local function close_and_prune_if_empty()
   state.should_prune_session = true
 end
 
--- ------------------------------------------------------------------
--- send_msg — translate plugin-internal output to wire envelope, emit
--- ------------------------------------------------------------------
-
+-- send_msg — translate plugin-internal output to wire envelope, emit.
 ---@param internal table
 local function send_msg(internal)
   if internal.kind == "control" then
@@ -199,10 +172,7 @@ local function send_msg(internal)
   end
 end
 
--- ------------------------------------------------------------------
--- persistence — write each non-control envelope verbatim to jsonl
--- ------------------------------------------------------------------
-
+-- Persistence — write each non-control envelope verbatim to jsonl.
 ---@param entry { ts: string?, origin: string?, target: string?, payload: string }
 local function persist_envelope(entry)
   if not state.current_session_file then return end
@@ -237,10 +207,8 @@ local function persist_envelope(entry)
   state.should_prune_session = false
 end
 
--- ------------------------------------------------------------------
--- resume — re-broadcast every step-origin entry to its original target
--- ------------------------------------------------------------------
-
+-- Resume — re-broadcast every step-origin entry to its original target.
+--
 -- Pre-pass: count the step-origin entries that would be replayed. Used
 -- to populate `sessions.replay.start { count }`. Cheaper than buffering
 -- the whole file: one extra read of the JSONL with a substring check
@@ -294,10 +262,6 @@ local function replay_jsonl(path)
   fh:close()
   return count
 end
-
--- ------------------------------------------------------------------
--- resume + new
--- ------------------------------------------------------------------
 
 ---@param target_session_id string
 local function do_resume(target_session_id)
@@ -363,19 +327,11 @@ local function do_new()
   do_resume(uuid_v4())
 end
 
--- ------------------------------------------------------------------
--- shutdown
--- ------------------------------------------------------------------
-
 local function do_shutdown()
   send_msg({ kind = "control", event = "sessions.session_end",
              extra = { session_id = state.current_session_id } })
   close_and_prune_if_empty()
 end
-
--- ------------------------------------------------------------------
--- init (boot path)
--- ------------------------------------------------------------------
 
 local function do_init()
   if state.initialised then
@@ -416,10 +372,7 @@ local function do_init()
   return id
 end
 
--- ------------------------------------------------------------------
--- receive_msg — runtime-driven inbound handler
--- ------------------------------------------------------------------
-
+-- receive_msg — runtime-driven inbound handler.
 ---@param entry { ts: string?, origin: string?, target: string?, payload: string }
 local function receive_msg(entry)
   local payload = entry.payload
@@ -473,10 +426,6 @@ local function receive_msg(entry)
   persist_envelope(entry)
 end
 
--- ------------------------------------------------------------------
--- module table — actor contract + public Lua API
--- ------------------------------------------------------------------
-
 return {
   -- actor contract
   name        = "sessions",
@@ -493,9 +442,9 @@ return {
   -- an engine.shutdown wire envelope and our receive_msg handles it.
   handle_shutdown  = function() end,
 
-  -- Internal handle for `sessions/test.lua` only. Production code must
-  -- not reach for this; it exists so the test surface can live in a
-  -- separate module without duplicating private helpers.
+  -- Internal handle for the test escape-hatch module only. Production
+  -- code must not reach for this; it exists so the test surface can
+  -- live in a separate module without duplicating private helpers.
   _internals = {
     state              = state,
     persist_envelope   = persist_envelope,

@@ -1,10 +1,9 @@
--- starter/agentic_cli.lua — agentic-cli plugin (pure-Lua, virtual).
+-- starter/cli/init.lua — agentic-cli plugin (pure-Lua, virtual).
 --
--- Surfaces agentic_workflow as a stdin/stdout CLI: single-shot prompt or
+-- Surfaces `agentic-loop` as a stdin/stdout CLI: single-shot prompt or
 -- interactive REPL. Behaviour parity with the TUI is by construction —
--- agentic_workflow is the single source of truth and this module only
--- changes the surface (stdin/stdout vs. chat-contract → nefor-chat →
--- nefor-tui).
+-- `agentic-loop` is the single source of truth and this module only
+-- changes the surface (stdin/stdout vs. chat-contract → nefor-tui).
 --
 -- ### Lifecycle
 --
@@ -46,18 +45,10 @@
 
 local M = {}
 
--- The orchestrator is now exposed by the agentic-loop actor. Public
--- API (on_stream / on_tool_start / on_tool_end / on_complete / submit
--- / set_model / set_yolo) is preserved verbatim from the prior
--- agentic_workflow module.
 local agentic_workflow = require("agentic-loop")
 local json = nefor.json
 
--- ------------------------------------------------------------------
--- argv parser
--- ------------------------------------------------------------------
---
--- Hand-rolled, no external dep. Recognises:
+-- Argv parser. Hand-rolled, no external dep. Recognises:
 --
 --   <prompt>                       single positional → single-shot mode
 --   -m / --model <model>           switch model on the active provider
@@ -163,10 +154,6 @@ local function parse_argv(argv)
   return opts, nil
 end
 
--- ------------------------------------------------------------------
--- file prepend
--- ------------------------------------------------------------------
-
 local function read_file(path)
   local fh, err = io.open(path, "r")
   if not fh then
@@ -184,9 +171,7 @@ local function build_prompt_with_file(prompt, file_path)
   return header .. (prompt or ""), nil
 end
 
--- ------------------------------------------------------------------
--- output handlers
--- ------------------------------------------------------------------
+-- Output handlers.
 --
 -- `text` format streams via on_stream / on_tool_*. `json` accumulates
 -- final state and prints once on on_complete. `stream-json` registers
@@ -275,9 +260,7 @@ local function install_stream_json_format()
   nefor.bus.on_event("tool.*", emit_env)
 end
 
--- ------------------------------------------------------------------
--- run modes
--- ------------------------------------------------------------------
+-- Run modes.
 --
 -- Both modes defer the first action until all plugins are ready. The
 -- cli function itself runs synchronously on the main thread BEFORE the
@@ -457,10 +440,6 @@ local function run_repl(format, json_state, gate)
   end)
 end
 
--- ------------------------------------------------------------------
--- entry point
--- ------------------------------------------------------------------
-
 function M.run(argv)
   argv = argv or {}
   local opts, parse_err = parse_argv(argv)
@@ -528,10 +507,6 @@ function M.run(argv)
   end
   return 0
 end
-
--- ------------------------------------------------------------------
--- test-only exports
--- ------------------------------------------------------------------
 
 function M._parse_argv(argv) return parse_argv(argv) end
 function M._usage() return USAGE end

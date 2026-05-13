@@ -1,6 +1,7 @@
--- starter/provider.lua — engine-side actor for OpenAI-compatible
--- providers. Threads the openai-provider plugin lib's translation
--- primitives with starter-owned `agentic-loop` orchestrator state.
+-- starter/compositors/provider.lua — engine-side actor for
+-- OpenAI-compatible providers. Threads the openai-provider plugin
+-- lib's translation primitives with starter-owned `agentic-loop`
+-- orchestrator state.
 --
 -- The mock-plugin Rust binary speaks the same provider wire-protocol
 -- (`<prefix>.chat.create`, `<prefix>.stream.delta`, …), so it uses the
@@ -87,7 +88,7 @@ function M.spawn_spec(name, command, opts)
         or k == "chat.stream.reasoning_end"
         or k == "chat.session.stats" then
       local chat_id = body.chat_id
-      -- D-26 + agent-reasoner sub-firing gate. `stream_suppressed`
+      -- Stream-suppression gate. `stream_suppressed`
       -- collapses tracked pending entries whose reasoner type isn't in
       -- STREAM_VISIBLE_TYPES (sub-graph responder, etc.) with the
       -- explicit stream-hidden registration the agent reasoner installs

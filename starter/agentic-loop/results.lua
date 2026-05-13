@@ -1,7 +1,6 @@
--- starter/lib/results.lua — result-payload formatting helpers.
+-- starter/agentic-loop/results.lua — result-payload formatting helpers.
 --
--- Pure helpers extracted from agentic_workflow.lua during the Phase 1
--- refactor. No module-level state; safe to require from anywhere.
+-- Pure helpers; no module-level state. Safe to require from anywhere.
 
 local M = {}
 

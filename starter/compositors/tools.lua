@@ -1,4 +1,4 @@
--- starter/tools.lua — engine-side actors for the tools domain.
+-- starter/compositors/tools.lua — engine-side actors for the tools domain.
 -- Exposes two spawn specs:
 --
 --   tools.gate_spec(gate_name, command)
@@ -26,7 +26,7 @@ local M = {}
 --   * On `spawn-graph-tool.tool.invoke`: parse the invoke, queue the
 --     sub-graph through agentic-loop, emit the synthesised ack
 --     `tool.result`, and DROP the gate-forwarded envelope before
---     targeting tries to deliver to a non-existent peer (D-22).
+--     targeting tries to deliver to a non-existent peer.
 --   * On `tool.result`: when the output exceeds the inline budget,
 --     dump-to-file via the plugin lib's `maybe_dump_output` (full
 --     payload to disk, summary in `body.output`). Then correlate the

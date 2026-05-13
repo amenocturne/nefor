@@ -1,9 +1,9 @@
--- starter/mock_provider.lua — script for mock-plugin to impersonate an
--- openai-provider for deterministic smoke testing of the spawn_graph
--- pipeline AND a self-documenting interactive test machine for
--- developers who launch `nefor --config ./starter`. Spawns alongside
--- the openai-provider/ollama instance unconditionally; both register
--- on the bus and show up in the /model picker (see config.lua).
+-- starter/mock-provider/init.lua — script for mock-plugin to
+-- impersonate an openai-provider for deterministic smoke testing of
+-- the spawn_graph pipeline AND a self-documenting interactive test
+-- machine for developers who launch `nefor --config ./starter`. Spawns
+-- alongside the openai-provider/ollama instance unconditionally; both
+-- register on the bus and show up in the /model picker.
 --
 -- Speaks the same wire shape as openai-provider:
 --   <name>.chat.create  { chat_id, model? }
@@ -31,7 +31,7 @@
 --      text since the canonical prompt matches both).
 --   3. Sub-graph canned text (responder nodes inside the spawn_graph
 --      run — Summarise octopuses / lighthouses / Combine paragraph).
---   4. SLOW_STREAM_REGRESSION_ marker — Bug 1 watchdog regression hook.
+--   4. SLOW_STREAM_REGRESSION_ marker — long-stream watchdog regression hook.
 --   5. Interactive triggers (read readme, cwd/pwd, secret key memory,
 --      list files, count to N, think out loud, fail).
 --   6. Help fallback — the banner-prefixed help block is also what
@@ -84,18 +84,13 @@ local CANNED_TEXT = {
 -- relay it as the assistant's final answer.
 local FINAL_RELAY_PREFIX = ""
 
--- Async spawn_graph (post-2026-04-30): the immediate `tool.result` is
--- just an ack ("Submitted sub-graph run_id=..."). The real result
--- arrives later as a USER-role message starting with
--- "[spawn_graph(run_id=...) result]". Pattern-match on that prefix in
--- the latest user message to drive the relay turn — old behaviour
--- (relaying last_tool when no deferred user message exists) still
--- covers the synchronous case if anything reverts.
+-- Async spawn_graph: the immediate `tool.result` is just an ack
+-- ("Submitted sub-graph run_id=..."). The real result arrives later
+-- as a USER-role message starting with "[spawn_graph(run_id=...)
+-- result]". Pattern-match on that prefix in the latest user message
+-- to drive the relay turn.
 --
--- The marker shape comes from agentic_workflow.format_deferred (see
--- starter/agentic_workflow.lua); it changed during the Phase-1B
--- consolidation. The legacy "[Deferred result for spawn_graph" prefix
--- is also accepted so older fixtures keep working.
+-- The marker shape comes from `agentic-loop.results.format_deferred`.
 local DEFERRED_RESULT_MARKER = "%[spawn_graph%(run_id="
 local DEFERRED_LEGACY_MARKER = "%[Deferred result for spawn_graph"
 local DEFERRED_FAILURE_MARKER = "%[spawn_graph%(run_id=[^)]*%) FAILED%]"
@@ -195,10 +190,6 @@ local HELP_BODY = table.concat({
 }, "\n")
 
 local HELP_TEXT = MOCK_PROVIDER_BANNER .. "\n" .. HELP_BODY
-
--- ------------------------------------------------------------------
--- helpers
--- ------------------------------------------------------------------
 
 -- UTF-8-safe truncate: returns `s` truncated to at most `n` codepoints.
 -- `string.sub` is byte-indexed; slicing inside a multibyte codepoint
@@ -407,11 +398,9 @@ local function pick_response_for(chat_id)
     end
   end
 
-  -- ----------------------------------------------------------------
-  -- 4. SLOW_STREAM_REGRESSION_ — Bug 1 watchdog regression hook
-  --    (commit 0941531). Triggered by the literal substring; mock
-  --    blocks for ~1.2s before emitting.
-  -- ----------------------------------------------------------------
+  -- SLOW_STREAM_REGRESSION_ marker: triggered by the literal
+  -- substring; mock blocks for ~1.2s before emitting. Long-stream
+  -- watchdog regression hook for the agentic-cli timeout path.
   if string.find(last_user, "SLOW_STREAM_REGRESSION_") then
     -- Coarse sleep — `os.execute` is fine because the mock already
     -- runs in its own subprocess.
@@ -720,10 +709,6 @@ local function emit_stream(chat_id, text, opts)
   })
   return true, text
 end
-
--- ------------------------------------------------------------------
--- handlers
--- ------------------------------------------------------------------
 
 nefor.on_ready_ok(function()
   -- Synthetic `<name>.hello { model = ... }` so chat_orchestrator's

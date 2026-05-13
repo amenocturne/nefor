@@ -1,26 +1,8 @@
 -- starter/init.lua — default engine composition.
 --
--- Post Phase 3a the orchestration glue lives in per-plugin actor
--- folders rather than a single `agentic_workflow.lua` module:
---
---   * `agentic-loop/`     — orchestrator state machine
---   * `reasoners/`        — Lua-resident reasoner type handlers
---                           (responder, terminal, tool-executor,
---                            adapter, provider-wrapper, dummy)
---   * `<plugin>/`         — wrapper actor per Rust binary, owning
---                           that plugin's wire-protocol translation
---                           (openai-provider, mock-plugin, tool-gate,
---                            nefor-tui, reasoner-graph,
---                            nefor-combinators, basic-tools)
---
--- This file just composes the actors in spawn order.
---
 -- Run:
 --   NEFOR_PLUGIN_DIR=$PWD/plugins cargo run --bin nefor -- --config ./starter
 
--------------------------------------------------------------------------
--- 1. Lua module path — bundled protocol + json alongside this file
--------------------------------------------------------------------------
 local STARTER_ROOT = NEFOR_CONFIG_DIR or "."
 local LUA_ROOT = STARTER_ROOT .. "/../lua"
 
@@ -33,17 +15,11 @@ package.path = table.concat({
 }, ";")
 
 -- nefor-pm wires the core primitives, generic libs, and every plugin
--- lib. For in-tree development the `dir` override skips the clone
--- path; pm registers the dir and (idempotently) ensures package.path
--- covers each plugin lib's parent so bare `require("<name>")`
--- resolves to the plugin lib at `plugins/<name>/lua/<name>/init.lua`.
--- The starter-side composers live as per-domain files (chat_bridge,
--- provider, tools, graph, combinators) at the starter root.
+-- lib. The `dir` override skips the clone path for in-tree builds; pm
+-- registers each dir and ensures package.path covers it so bare
+-- `require("<name>")` resolves to the plugin lib.
 local pm = require("nefor-pm")
 pm.install({
-  -- Multi-consumer protocol primitives. Sub-modules accessed as
-  -- `require("core.envelope")`, `require("core.ncp")`, etc. The
-  -- aggregator `require("core")` returns a table of all sub-modules.
   {
     "amenocturne/nefor",
     name = "core",
@@ -52,10 +28,6 @@ pm.install({
     dir  = LUA_ROOT .. "/core",
   },
 
-  -- Independent generic libs (no plugin binary, no cross-deps beyond
-  -- core). Each lib lives at `libs/<name>/init.lua`; the umbrella
-  -- entry grafts the parent dir so `require("libs.generic-provider")`
-  -- / `require("libs.generic-tool")` resolve.
   {
     "amenocturne/nefor",
     name = "libs",
@@ -88,10 +60,6 @@ pm.install({
     dir  = STARTER_ROOT .. "/../plugins/nefor-tui/lua",
   },
 
-  -- reasoner-graph ships the `spawn_graph` protocol primitive only —
-  -- the actor-spec wiring is identity passthrough and lives in
-  -- starter/graph.lua via `core.actor.identity_spec`. `require(
-  -- "reasoner-graph.spawn_graph")` resolves the sub-module.
   {
     "amenocturne/nefor",
     name = "reasoner-graph",
@@ -100,10 +68,6 @@ pm.install({
     dir  = STARTER_ROOT .. "/../plugins/reasoner-graph/lua/reasoner-graph",
   },
 })
-
--------------------------------------------------------------------------
--- 2. Dispatch hook + session management
--------------------------------------------------------------------------
 
 local ncp            = require("core.ncp")
 local actor          = require("core.actor")
@@ -121,44 +85,31 @@ function invoke_from_plugin(source, payload)
 end
 
 actor.install()
--- Install the replay-window bus subscription (defense-in-depth fallback
--- for the synchronous `history_replay.set` path that sessions drives
--- around its replay burst). Used to live as a require-time side effect
--- of the merged-away `core.replay_window` module; now wired explicitly
+-- Defense-in-depth fallback for the synchronous `history_replay.set`
+-- path that sessions drives around its replay burst. Wired explicitly
 -- here so module load stays free of bus dependencies.
 history_replay.install()
 actor.spawn(sessions)
 sessions.init()
 
--------------------------------------------------------------------------
--- 3. Plugin composition
--------------------------------------------------------------------------
---
--- Order matters because plugins register types/Into declarations
--- against `nefor-combinators` at startup, and the scheduler queries
--- combinators at submit time.
---
---   1. provider/tool contract declare()  (eagerly emit type-tag
---      registrations onto the bus; combinators picks them up via
---      ncp.lua's replay-on-attach when it readies)
---   2. nefor-combinators       (registry)
---   3. agentic-loop            (orchestrator state machine)
---   4. reasoners               (Lua-resident reasoner handlers)
---   5. provider                (openai-provider or mock-plugin)
---   6. reasoner-graph          (queries combinators on submit)
---   7. tool-gate               (aggregates tool advertisements)
---   8. basic-tools             (advertises tools)
---   9. nefor-tui               (UI)
+-- Spawn order matters: provider/tool type-tag registrations must reach
+-- nefor-combinators before the scheduler queries it on submit. Order:
+--   1. libs.generic-{provider,tool}.declare()
+--   2. compositors.combinators
+--   3. agentic-loop + reasoners
+--   4. providers
+--   5. reasoner-graph + tool-gate + basic-tools
+--   6. lead-workflow
+--   7. chat (declarative TUI)
 
 require("libs.generic-provider").declare()
 require("libs.generic-tool").declare()
 
 actor.spawn(require("compositors.combinators"))
 
--- Boot the orchestrator actor + resident reasoner handlers BEFORE
--- the plugins they coordinate. The actor runtime queues incoming
--- envelopes during boot, so even if a plugin's `ready` arrives
--- earlier than expected nothing is lost.
+-- The actor runtime queues incoming envelopes during boot, so spawning
+-- the orchestrator and its resident reasoners before the plugins they
+-- coordinate is safe even if a plugin's `ready` arrives early.
 local agentic_loop = require("agentic-loop")
 agentic_loop.configure {
   provider = cfg.default_provider,
@@ -167,7 +118,7 @@ agentic_loop.configure {
   -- Restrict the lead's chat catalog to the orchestration-tool surface.
   -- Without this filter the lead sees every wire-advertised tool — most
   -- problematically `spawn_graph` (the reasoner-graph internal that
-  -- `dispatch-graph` translates into) — and can call them directly,
+  -- `dispatch-graph` translates into) — and could call them directly,
   -- bypassing the role-keyed sub-agent contract and bottoming out in
   -- `reasoner '<role>' not connected` runtime errors. The agent
   -- reasoner already enforces a per-role allowlist on its sub-firings
@@ -178,18 +129,11 @@ agentic_loop.configure {
 actor.spawn(agentic_loop)
 actor.spawn(require("reasoners"))
 
--------------------------------------------------------------------------
--- 3b. Providers — every entry in cfg.providers is spawned. The picker
---     aggregates connected providers via auth.status; no hard-coded
---     test/prod switch.
--------------------------------------------------------------------------
-
 local provider = require("compositors.provider")
 for _, p in ipairs(cfg.providers or {}) do
   if p.kind == "mock" then
     -- mock-plugin speaks the same wire protocol as the openai-provider
-    -- binary, so the same actor spec works — only the binary command
-    -- differs.
+    -- binary, so the same actor spec works — only the binary differs.
     actor.spawn(provider.spawn_spec(
       p.name,
       {
@@ -220,15 +164,7 @@ for _, p in ipairs(cfg.providers or {}) do
   end
 end
 
--------------------------------------------------------------------------
--- 3c. Reasoner graph
--------------------------------------------------------------------------
-
 actor.spawn(require("compositors.graph").spawn_spec({ require("config").bin("reasoner-graph") }))
-
--------------------------------------------------------------------------
--- 3d. Tool gate + basic-tools
--------------------------------------------------------------------------
 
 local tools = require("compositors.tools")
 local tool_gate_argv = { require("config").bin("tool-gate") }
@@ -240,22 +176,13 @@ tool_gate_argv[#tool_gate_argv + 1] = "--default"
 tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
 
 actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
-
 actor.spawn(tools.basic_actor_spec())
 
--------------------------------------------------------------------------
--- 3d2. Lead-workflow actor — owns plan/approval state + active graph
---      run_id; advertises `dispatch-graph` / `write-review` /
---      `await-approval` tools to tool-gate. Lives alongside
---      `agentic-loop`, not inside it (separate bus subscriptions,
---      separate state).
--------------------------------------------------------------------------
-
+-- lead-workflow lives alongside agentic-loop, not inside it: separate
+-- bus subscriptions, separate state. Owns plan/approval state and the
+-- active graph run id; advertises dispatch-graph / write-review /
+-- await-approval to tool-gate.
 actor.spawn(require("lead-workflow"))
-
--------------------------------------------------------------------------
--- 3e. Chat (declarative TUI)
--------------------------------------------------------------------------
 
 actor.spawn(require("compositors.chat_bridge").spawn_spec({
   require("config").bin("nefor-tui"),

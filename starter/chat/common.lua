@@ -203,10 +203,6 @@ function M.format_args(args)
   return table.concat(parts, "\n")
 end
 
-------------------------------------------------------------------------
--- styling — palette + named styles
-------------------------------------------------------------------------
-
 M.C = {
   user            = "#7FB4FF",
   system          = "#808080",

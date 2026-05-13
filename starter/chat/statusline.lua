@@ -124,9 +124,7 @@ function M.view(state)
   return tui.spans { spans = out_spans }
 end
 
-------------------------------------------------------------------------
--- welcome banner
-------------------------------------------------------------------------
+-- Welcome banner.
 -- Painted on a truly fresh chat surface (no entries, no in-flight
 -- turn). Disappears the instant the user submits.
 --
