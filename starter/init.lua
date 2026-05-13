@@ -1,10 +1,76 @@
 -- starter/init.lua — default engine composition.
 --
--- Run:
---   NEFOR_PLUGIN_DIR=$PWD/plugins cargo run --bin nefor -- --config ./starter
+-- The starter is designed to be COPIED to ~/.config/nefor (`just
+-- install` does this) without taking the rest of the repo with it.
+-- That means relative paths into `../lua/` and `../plugins/` aren't
+-- a usable source for nefor-pm: when the user runs from
+-- ~/.config/nefor/, those paths resolve to ~/.config/lua/ etc., which
+-- don't exist.
+--
+-- Bootstrap order:
+--   1. NEFOR_DEV_DIR set     → in-checkout dev mode; resolve from there.
+--   2. STARTER_ROOT/../lua/nefor-pm exists → in-checkout (running via
+--                                            `just run`); use ../lua etc.
+--   3. otherwise             → sparse-clone amenocturne/nefor at the
+--                              pinned ref into <DATA>/nefor/, use that.
+--
+-- Once the bootstrap picks NEFOR_ROOT, every pm.install entry resolves
+-- its `dir` from that single root — no more "../" walks from the
+-- starter location.
 
 local STARTER_ROOT = NEFOR_CONFIG_DIR or "."
-local LUA_ROOT = STARTER_ROOT .. "/../lua"
+local NEFOR_DEV_DIR = os.getenv("NEFOR_DEV_DIR")
+
+-- Pinned upstream ref for the bootstrap clone. Bumping this is a
+-- single-source change: the clone path AND every pm.install entry
+-- below pick it up. Currently tracks the qol-fixes branch — bump to
+-- a stable tag (v0.1.6+) once qol-fixes merges and the starter's
+-- runtime contract is locked in.
+local UPSTREAM_REF = "qol-fixes"
+local SPARSE_CONE  = "lua starter plugins"
+
+local function path_exists(p)
+  if nefor and nefor.fs and nefor.fs.exists then
+    return nefor.fs.exists(p)
+  end
+  local f = io.open(p, "r")
+  if f then f:close(); return true end
+  return false
+end
+
+local function run(cmd)
+  local ok = os.execute(cmd)
+  return ok == true or ok == 0
+end
+
+-- Resolve NEFOR_ROOT — the directory whose `lua/` and `plugins/`
+-- mirror the github repo layout.
+local NEFOR_ROOT
+if NEFOR_DEV_DIR and #NEFOR_DEV_DIR > 0 then
+  NEFOR_ROOT = NEFOR_DEV_DIR
+elseif path_exists(STARTER_ROOT .. "/../lua/nefor-pm/init.lua") then
+  NEFOR_ROOT = STARTER_ROOT .. "/.."
+else
+  local data_dir = nefor.fs.data_root()
+  local pm_root  = data_dir .. "/nefor"
+  if not path_exists(pm_root) then
+    nefor.fs.mkdir_p(data_dir)
+    local clone_cmd = "git clone --depth 1 --filter=blob:none --sparse "
+                   .. "--branch '" .. UPSTREAM_REF .. "' "
+                   .. "https://github.com/amenocturne/nefor.git '" .. pm_root .. "'"
+    if not run(clone_cmd) then
+      error("nefor bootstrap: git clone failed for ref " .. UPSTREAM_REF
+            .. ". Check git is on PATH, the network is reachable, and the "
+            .. "ref exists on origin.")
+    end
+  end
+  if not run("git -C '" .. pm_root .. "' sparse-checkout set " .. SPARSE_CONE) then
+    error("nefor bootstrap: git sparse-checkout failed for " .. pm_root)
+  end
+  NEFOR_ROOT = pm_root
+end
+
+local LUA_ROOT = NEFOR_ROOT .. "/lua"
 
 package.path = table.concat({
   STARTER_ROOT .. "/?.lua",
@@ -15,57 +81,57 @@ package.path = table.concat({
 }, ";")
 
 -- nefor-pm wires the core primitives, generic libs, and every plugin
--- lib. The `dir` override skips the clone path for in-tree builds; pm
--- registers each dir and ensures package.path covers it so bare
--- `require("<name>")` resolves to the plugin lib.
+-- lib. Every entry's `dir` resolves from NEFOR_ROOT (whichever way
+-- the bootstrap above picked it). `tag` matches UPSTREAM_REF so a
+-- future pm consistency check or refresh path uses one source of truth.
 local pm = require("nefor-pm")
 pm.install({
   {
     "amenocturne/nefor",
     name = "core",
-    tag  = "v0.1.5",
+    tag  = UPSTREAM_REF,
     path = "lua/core/",
-    dir  = LUA_ROOT .. "/core",
+    dir  = NEFOR_ROOT .. "/lua/core",
   },
 
   {
     "amenocturne/nefor",
     name = "libs",
-    tag  = "v0.1.5",
+    tag  = UPSTREAM_REF,
     path = "lua/libs/",
-    dir  = LUA_ROOT .. "/libs",
+    dir  = NEFOR_ROOT .. "/lua/libs",
   },
 
   {
     "amenocturne/nefor",
     name = "openai-provider",
-    tag  = "v0.1.5",
+    tag  = UPSTREAM_REF,
     path = "plugins/openai-provider/lua/openai-provider/",
-    dir  = STARTER_ROOT .. "/../plugins/openai-provider/lua/openai-provider",
+    dir  = NEFOR_ROOT .. "/plugins/openai-provider/lua/openai-provider",
   },
 
   {
     "amenocturne/nefor",
     name = "tool-gate",
-    tag  = "v0.1.5",
+    tag  = UPSTREAM_REF,
     path = "plugins/tool-gate/lua/tool-gate/",
-    dir  = STARTER_ROOT .. "/../plugins/tool-gate/lua/tool-gate",
+    dir  = NEFOR_ROOT .. "/plugins/tool-gate/lua/tool-gate",
   },
 
   {
     "amenocturne/nefor",
     name = "nefor-tui",
-    tag  = "v0.1.5",
+    tag  = UPSTREAM_REF,
     path = "plugins/nefor-tui/lua/",
-    dir  = STARTER_ROOT .. "/../plugins/nefor-tui/lua",
+    dir  = NEFOR_ROOT .. "/plugins/nefor-tui/lua",
   },
 
   {
     "amenocturne/nefor",
     name = "reasoner-graph",
-    tag  = "v0.1.5",
+    tag  = UPSTREAM_REF,
     path = "plugins/reasoner-graph/lua/reasoner-graph/",
-    dir  = STARTER_ROOT .. "/../plugins/reasoner-graph/lua/reasoner-graph",
+    dir  = NEFOR_ROOT .. "/plugins/reasoner-graph/lua/reasoner-graph",
   },
 })
 
