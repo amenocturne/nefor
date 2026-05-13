@@ -164,23 +164,62 @@ local function validate_terminal_count(node_specs)
     end
   end
 
-  local sinks = {}
+  local sink_count = 0
   for _, spec in ipairs(node_specs) do
-    if not has_successor[spec.id] then
-      sinks[#sinks + 1] = spec.id
-    end
+    if not has_successor[spec.id] then sink_count = sink_count + 1 end
+  end
+  if sink_count == 0 then
+    return "dispatch-graph: graph has 0 terminal nodes — every node is "
+        .. "depended on by another. Likely cause: a cycle in dependencies. "
+        .. "Break the cycle, or move loop-guard logic into a single "
+        .. "counter-node graph."
   end
 
-  -- Multi-sink is allowed: reasoner-graph returns `result.results` as a
-  -- dict keyed by node id, so each sink's structured-finalize is
-  -- delivered to the caller. Only 0 sinks (every node has a successor)
-  -- is invalid — that's a cycle.
-  if #sinks >= 1 then return nil end
+  -- Connectedness: each `dispatch-graph` call must be ONE connected DAG.
+  -- Disconnected components = N independent tasks bundled into one run,
+  -- which loses the UX wins of parallel sidebar rows + independent
+  -- tool.result returns. Lead should call dispatch-graph N times instead.
+  -- Union-find over dependency edges; count distinct roots.
+  local parent = {}
+  for _, spec in ipairs(node_specs) do parent[spec.id] = spec.id end
+  local function find(x)
+    while parent[x] ~= x do
+      parent[x] = parent[parent[x]]
+      x = parent[x]
+    end
+    return x
+  end
+  for _, spec in ipairs(node_specs) do
+    if type(spec.dependencies) == "table" then
+      for _, dep_id in ipairs(spec.dependencies) do
+        if parent[dep_id] ~= nil then
+          local a, b = find(spec.id), find(dep_id)
+          if a ~= b then parent[a] = b end
+        end
+      end
+    end
+  end
+  local components = {}
+  for _, spec in ipairs(node_specs) do
+    local r = find(spec.id)
+    components[r] = components[r] or {}
+    components[r][#components[r] + 1] = spec.id
+  end
+  local component_strs = {}
+  for _, ids in pairs(components) do
+    component_strs[#component_strs + 1] = "[" .. table.concat(ids, ", ") .. "]"
+  end
+  if #component_strs > 1 then
+    return string.format(
+      "dispatch-graph: graph has %d disconnected components: %s. Each "
+      .. "independent task must be dispatched as its own dispatch-graph "
+      .. "call so it gets its own run_id, appears as a separate row in "
+      .. "the UI, and its result comes back independently. Combine "
+      .. "nodes into one graph only when they share data dependencies.",
+      #component_strs, table.concat(component_strs, " "))
+  end
 
-  return "dispatch-graph: graph has 0 terminal nodes — every node is "
-      .. "depended on by another. Likely cause: a cycle in dependencies. "
-      .. "Break the cycle, or move loop-guard logic into a single "
-      .. "counter-node graph."
+  return nil
 end
 
 -- Build a reasoner-graph spec from the lead's role-keyed node list.
@@ -511,13 +550,13 @@ local function lead_workflow_tool_schemas()
     {
       name        = "dispatch-graph",
       description =
-        "Dispatch a reasoner-graph of role-keyed sub-agents and return the run_id. " ..
-        "The graph's `result.results` is a dict keyed by each terminal (sink) node " ..
-        "id, carrying that node's structured-finalize output. Multi-sink graphs are " ..
-        "supported — e.g. N parallel explorers with no aggregator returns " ..
-        "{ exp1: {...}, exp2: {...}, ... }. Use a single sink when one node should " ..
-        "synthesise the others' output; use multi-sink when independent reports " ..
-        "should come back unmerged. Cycles (0 sinks) are rejected.",
+        "Dispatch ONE connected sub-graph of role-keyed sub-agents and return its " ..
+        "run_id. For N independent tasks call dispatch-graph N times — each call " ..
+        "gets its own run_id, appears as a separate row in the UI, and returns its " ..
+        "result independently when finished. The graph's result.results is a dict " ..
+        "keyed by terminal (sink) node id; multi-sink within ONE connected DAG is " ..
+        "fine (e.g. explore → build, explore → test = two sinks sharing a root). " ..
+        "Disconnected components and cycles are rejected.",
       parameters  = {
         type = "object",
         properties = {

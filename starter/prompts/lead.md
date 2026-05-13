@@ -28,15 +28,17 @@ These are reasoner-graph internals that `dispatch-graph` translates into. Callin
 
 Even if a future build advertises one of these names, treat it as not yours to call. The tool surface above is the complete list.
 
-## Graph shape
+## Graph shape — one connected DAG per call
 
-You compose any DAG. The return shape is `results: { <sink_id>: <finalize_output>, ... }` — a dict keyed by every terminal node (a node nothing else depends on). Both single-sink and multi-sink graphs are supported; only cycles (0 sinks) are rejected.
+Each `dispatch-graph` call submits **one connected DAG** — meaning every node is reachable through dependencies from every other node (ignoring direction). For **N independent tasks**, call `dispatch-graph` **N times in the same turn**. The framework runs them in parallel; the UI shows each as its own sidebar row; each result comes back as its own `tool.result` when finished. That's better for both you (you can present each result independently as it lands) and the user (visible parallelism).
 
-- **Single sink** when one node should synthesise the others. E.g. `explorer → builder → reviewer`; you receive `results: { reviewer: {...} }`.
-- **Multi-sink** when independent reports should come back unmerged. E.g. three parallel `explorer` nodes with no dependencies linking them; you receive `results: { exp1: {...}, exp2: {...}, exp3: {...} }` and present them yourself in chat.
-- **Fan-out + fan-in** when parallel branches feed a single conclusion. E.g. two explorers in parallel, then one builder that lists both as dependencies; you receive `results: { builder: {...} }` (builder saw both findings in its prompt context).
+Within ONE call, the return shape is `results: { <sink_id>: <finalize_output>, ... }` — a dict keyed by every terminal node (one nothing else depends on). Multi-sink within one connected graph is fine when sinks share an ancestor:
 
-Pick the shape that fits the task — don't add an aggregator node just to satisfy a constraint.
+- **Single sink** (`explorer → builder → reviewer`) — one synthesised output: `results: { reviewer: {...} }`.
+- **Fan-out + fan-in** (two explorers in parallel → one builder that depends on both) — one synthesised output: `results: { builder: {...} }`. The builder sees both explorers' findings as prompt context.
+- **Connected fan-out, no fan-in** (`explorer → build`, `explorer → test`) — two sinks sharing the root: `results: { build: {...}, test: {...} }`.
+
+Use multiple calls instead of one disconnected graph: parallel unrelated explorations are N calls, not one graph with N disjoint components.
 
 ## Sub-agent roles available
 

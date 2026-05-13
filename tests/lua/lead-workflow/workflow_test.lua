@@ -708,15 +708,13 @@ do
     .. tostring(err.body.error))
 end
 
--- N>1 sinks: two independent components, each ending in its own sink.
--- Multi-sink graphs are accepted — reasoner-graph returns the result
--- as a per-sink dict, and the lead can present each leaf's output
--- without an aggregator.
+-- Disconnected components: two independent chains a→b and c→d.
+-- Rejected so the lead splits them into two dispatch-graph calls.
 do
   fresh()
   feed("tool-gate", {
     kind = "lead-workflow.tool.invoke",
-    id   = "dispatch_graph_accepts_multiple_terminal_nodes",
+    id   = "dispatch_graph_rejects_disconnected_components",
     name = "dispatch-graph",
     args = {
       nodes = {
@@ -731,15 +729,49 @@ do
   })
   local err = find_call(decode_calls(), function(c)
     return c.body.kind == "tool.result"
-        and c.body.id == "dispatch_graph_accepts_multiple_terminal_nodes"
+        and c.body.id == "dispatch_graph_rejects_disconnected_components"
+  end)
+  assert_true(err ~= nil and type(err.body.error) == "string",
+    "disconnected graph returns a tool.result error")
+  assert_true(string.find(err.body.error, "2 disconnected components", 1, true) ~= nil,
+    "error names the component count; got: " .. tostring(err.body.error))
+  local invoke = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
+  end)
+  assert_eq(invoke, nil,
+    "rejected disconnected graph must not produce a spawn_graph tool.invoke")
+end
+
+-- Connected multi-sink: explorer fans out to two siblings that share
+-- the root but don't depend on each other. Accepted — reasoner-graph
+-- returns result.results keyed by both sinks.
+do
+  fresh()
+  feed("tool-gate", {
+    kind = "lead-workflow.tool.invoke",
+    id   = "dispatch_graph_accepts_connected_multi_sink",
+    name = "dispatch-graph",
+    args = {
+      nodes = {
+        { id = "root", role = "explorer", agent_args = { prompt = "x" } },
+        { id = "a",    role = "builder",  agent_args = { prompt = "y" },
+          dependencies = { "root" } },
+        { id = "b",    role = "reviewer", agent_args = { prompt = "z" },
+          dependencies = { "root" } },
+      },
+    },
+  })
+  local err = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result"
+        and c.body.id == "dispatch_graph_accepts_connected_multi_sink"
         and type(c.body.error) == "string"
   end)
-  assert_eq(err, nil, "multi-sink graph must NOT return a tool.result error")
+  assert_eq(err, nil, "connected multi-sink graph must NOT error")
   local invoke = find_call(decode_calls(), function(c)
     return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
   end)
   assert_true(invoke ~= nil,
-    "multi-sink graph must dispatch a spawn_graph tool.invoke")
+    "connected multi-sink graph must dispatch a spawn_graph tool.invoke")
 end
 
 -- Happy path: single-sink graph (chain) translates and dispatches as
