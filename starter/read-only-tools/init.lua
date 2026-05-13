@@ -144,7 +144,14 @@ local function handle_tool_invoke(body)
       tostring(body.name) .. "'")
     return
   end
-  handler(firing_id, body.args or {})
+  -- We advertised the tool; the caller is owed a tool.result. A handler
+  -- crash without this wrapper produces no envelope on the bus, which
+  -- the agent reasoner reads as "still running" and hangs forever.
+  local ok, err = pcall(handler, firing_id, body.args or {})
+  if not ok then
+    emit_err(firing_id, "read-only-tools." .. tostring(body.name) ..
+      ": handler raised: " .. tostring(err))
+  end
 end
 
 local function tool_schemas()
