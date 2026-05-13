@@ -119,11 +119,7 @@ function M.emit_as(from, target, body)
   nefor.engine.send(payload, target)
 end
 
-function M.emit_to(target, body) M.emit(target, body) end
-function M.emit_broadcast(body) M.emit(nil, body) end
-
--- Test-only: reset module-level counters. agentic_workflow.M._reset()
--- delegates here so the test escape hatch keeps working after extraction.
+-- Test-only: reset module-level counters.
 function M._reset()
   id_seq = 0
   id_counter = 0

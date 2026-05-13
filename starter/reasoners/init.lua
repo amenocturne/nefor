@@ -30,7 +30,7 @@
 -- Targeting choice: the seeds are emitted as broadcasts (target = nil)
 -- because reasoner-graph is the only consumer that cares about them
 -- and replay-on-attach delivers them on its ready handshake. We could
--- target reasoner-graph specifically with `emit_to`, but broadcast +
+-- target reasoner-graph specifically with `emit`, but broadcast +
 -- replay keeps the path uniform with the contract libs and avoids
 -- depending on reasoner-graph's exact spawn name from inside the
 -- reasoners actor.
@@ -42,7 +42,7 @@ local ids           = require("core.ids")
 local replay_window = require("core.history_replay")
 
 local emit_as        = envelope.emit_as
-local emit_to        = envelope.emit_to
+local emit           = envelope.emit
 local next_id        = envelope.next_id
 
 -- Forward-declare; populated after agentic_loop module is required.
@@ -146,12 +146,12 @@ local function provider_run_node(reasoner_type, body)
       end
       create_body.tools = advertised
     end
-    emit_to(provider, create_body)
+    emit(provider, create_body)
   end
 
   if need_create then
     if type(args) == "table" and type(args.system) == "string" and #args.system > 0 then
-      emit_to(provider, {
+      emit(provider, {
         kind    = provider .. ".chat.append",
         chat_id = chat_id,
         message = { role = "system", content = args.system },
@@ -164,20 +164,20 @@ local function provider_run_node(reasoner_type, body)
       local out = dep_entry.output
       if type(out) == "table" and type(out.messages) == "table" then
         for _, msg in ipairs(out.messages) do
-          emit_to(provider, {
+          emit(provider, {
             kind    = provider .. ".chat.append",
             chat_id = chat_id,
             message = msg,
           })
         end
       elseif type(out) == "table" and type(out.text) == "string" then
-        emit_to(provider, {
+        emit(provider, {
           kind    = provider .. ".chat.append",
           chat_id = chat_id,
           message = { role = "user", content = out.text },
         })
       elseif type(out) == "string" then
-        emit_to(provider, {
+        emit(provider, {
           kind    = provider .. ".chat.append",
           chat_id = chat_id,
           message = { role = "user", content = out },
@@ -194,7 +194,7 @@ local function provider_run_node(reasoner_type, body)
   if first_firing then
     local prompt = (type(args) == "table" and type(args.prompt) == "string") and args.prompt or ""
     if #prompt > 0 then
-      emit_to(provider, {
+      emit(provider, {
         kind    = provider .. ".chat.append",
         chat_id = chat_id,
         message = { role = "user", content = prompt },
@@ -202,7 +202,7 @@ local function provider_run_node(reasoner_type, body)
     end
   end
 
-  emit_to(provider, { kind = provider .. ".chat.complete", chat_id = chat_id })
+  emit(provider, { kind = provider .. ".chat.complete", chat_id = chat_id })
   return nil
 end
 
@@ -246,13 +246,13 @@ local function tool_executor_run_node(body)
     local call_args = (type(call) == "table" and (call.arguments or call.args)) or {}
     local model_call_id = (type(call) == "table" and call.id) or tool_id
     agentic_loop.fire_tool_start_observers(model_call_id, call_name, call_args)
-    emit_to("nefor-tui", {
+    emit("nefor-tui", {
       kind  = "chat.tool.start",
       id    = model_call_id,
       name  = call_name,
       input = call_args,
     })
-    emit_to("tool-gate", {
+    emit("tool-gate", {
       kind = "tool-gate.tool.invoke",
       id   = tool_id,
       name = call_name,

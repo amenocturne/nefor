@@ -1195,7 +1195,7 @@ local function test_tool_permission_response_dropped_during_replay()
 
   -- Open the replay window on the bus the way sessions does.
   local replay_window = require("core.history_replay")
-  replay_window._set(true)
+  replay_window.set(true)
   _test.calls_clear()
 
   drive_inbound("nefor-tui", make_event({
@@ -1207,7 +1207,7 @@ local function test_tool_permission_response_dropped_during_replay()
   local delivered = find_deliver_to("tool-gate", "tool.permission_response")
   assert_true(delivered == nil,
     "replay window must suppress permission_response delivery to the gate")
-  replay_window._set(false)
+  replay_window.set(false)
 end
 
 -- Bug 5 regression — the replay-window flag must be active for the

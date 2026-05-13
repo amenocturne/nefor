@@ -65,7 +65,7 @@ local envelope      = require("core.envelope")
 local replay_window = require("core.history_replay")
 
 local emit_as = envelope.emit_as
-local emit_to = envelope.emit_to
+local emit    = envelope.emit
 local next_id = envelope.next_id
 
 local M = {}
@@ -125,7 +125,7 @@ local function handle(body)
   local tool_id = next_id("tool")
   tool_to_firing[tool_id] = firing_id
 
-  emit_to("tool-gate", {
+  emit("tool-gate", {
     kind = "tool-gate.tool.invoke",
     id   = tool_id,
     name = "bash",

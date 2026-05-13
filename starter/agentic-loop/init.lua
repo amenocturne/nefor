@@ -30,7 +30,6 @@ local results_lib     = require("agentic-loop.results")
 local topology        = require("agentic-loop.topology")
 local spawn_graph     = require("reasoner-graph.spawn_graph")
 local history_replay  = require("core.history_replay")
-local replay_window   = history_replay
 local session_config  = require("agentic-loop.session_config")
 local generic_provider = require("libs.generic-provider")
 local generic_tool     = require("libs.generic-tool")
@@ -82,8 +81,6 @@ local STREAM_VISIBLE_TYPES = { ["provider-wrapper"] = true }
 local SPAWN_GRAPH_SOURCE = spawn_graph.SPAWN_GRAPH_SOURCE
 
 local emit           = envelope.emit
-local emit_to        = envelope.emit_to
-local emit_broadcast = envelope.emit_broadcast
 local pending_key    = ids.pending_key
 local uuid_lite      = envelope.uuid_lite
 
@@ -982,7 +979,7 @@ local function receive_msg(entry)
   -- replay rebuilds state via the bus markers, not by re-firing the
   -- input handlers. The `tool.result` / `graph.node.fired` block
   -- below handles the same concern for reasoner-graph emissions.
-  if replay_window.active() then
+  if history_replay.active() then
     if kind == "chat.input.submit"
         or kind == "chat.reset"
         or kind == "chat.interrupt_all"
@@ -1002,7 +999,7 @@ local function receive_msg(entry)
   --   * tool.result { id=<run_id|firing_id>, result | error } — both
   --     run-close and per-firing close share the kind; we disambiguate
   --     by id.
-  if replay_window.active() then
+  if history_replay.active() then
     if kind == "graph.node.fired" then return end
     if kind == "tool.result" then
       -- Cross-process /resume rebuild: capture the active chat_id from
@@ -1115,7 +1112,7 @@ local function restore_active_model_from_session_log()
     -- observer (statusline, picker, future surfaces) picks it up.
     if type(state.config.provider) == "string" and #state.config.provider > 0
         and type(state.config.model) == "string" and #state.config.model > 0 then
-      emit_broadcast({
+      emit(nil, {
         kind     = "chat.model.set_ack",
         provider = state.config.provider,
         model    = state.config.model,

@@ -97,7 +97,7 @@ local envelope      = require("core.envelope")
 local replay_window = require("core.history_replay")
 
 local emit_as = envelope.emit_as
-local emit_to = envelope.emit_to
+local emit    = envelope.emit
 local next_id = envelope.next_id
 
 local M = {}
@@ -240,7 +240,7 @@ end
 -- only tool source; the model would never learn `finalize` is an
 -- option.
 local function emit_chat_complete(entry)
-  emit_to(entry.provider, {
+  emit(entry.provider, {
     kind        = entry.provider .. ".chat.complete",
     chat_id     = entry.chat_id,
     extra_tools = { FINALIZE_SCHEMA },
@@ -249,7 +249,7 @@ end
 
 -- Append a single message to the chat.
 local function emit_chat_append(entry, message)
-  emit_to(entry.provider, {
+  emit(entry.provider, {
     kind    = entry.provider .. ".chat.append",
     chat_id = entry.chat_id,
     message = message,
@@ -338,7 +338,7 @@ local function handle(body)
     advertised[#advertised + 1] = FINALIZE_NAME
     create_body.tools = advertised
   end
-  emit_to(provider, create_body)
+  emit(provider, create_body)
 
   -- system message: system_prompt + optional additional_context
   if type(system_prompt) == "string" and #system_prompt > 0 then
@@ -394,7 +394,7 @@ local function dispatch_tool_call(entry, call)
     return true
   end
 
-  emit_to("tool-gate", {
+  emit("tool-gate", {
     kind = "tool-gate.tool.invoke",
     id   = tool_id,
     name = name,
@@ -651,7 +651,7 @@ local function on_graph_cancel(body)
     -- 1. interrupt the provider stream (per-chat). Mock honours chat_id;
     -- openai-provider currently fanouts to all chats — that's the open
     -- follow-up captured in the binary's TODO at main.rs:419-425.
-    emit_to(entry.provider, {
+    emit(entry.provider, {
       kind    = entry.provider .. ".interrupt",
       chat_id = entry.chat_id,
     })

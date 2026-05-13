@@ -66,7 +66,7 @@ local envelope      = require("core.envelope")
 local replay_window = require("core.history_replay")
 
 local emit_as = envelope.emit_as
-local emit_to = envelope.emit_to
+local emit    = envelope.emit
 local next_id = envelope.next_id
 
 local state = {
@@ -580,7 +580,7 @@ local function terminate_active_graph()
   -- firing (sub-graph cancel propagation). The reasoner-graph
   -- binary still receives the broadcast and processes it the same way.
   emit_as(SOURCE_NAME, nil, { kind = "graph.cancel", run_id = run_id })
-  emit_to("nefor-tui", {
+  emit("nefor-tui", {
     kind = "chat.message.append",
     role = "system",
     text = "[Graph terminated by user — session exit]",
