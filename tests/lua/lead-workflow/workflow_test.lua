@@ -807,6 +807,34 @@ do
     "single-sink graph replies success (no error field)")
 end
 
+-- Single node, no dependencies: build_graph_spec must NOT include an
+-- empty `edges` field. reasoner-graph rejects `edges: {}` (which Lua
+-- empty tables serialise to in JSON) with "`graph.edges` must be an
+-- array"; omitting the key entirely is treated as no-edges. Regression
+-- pin: without the omission the dispatched sub-graph fails immediately
+-- and never shows up in the DAG sidebar.
+do
+  fresh()
+  feed("tool-gate", {
+    kind = "lead-workflow.tool.invoke",
+    id   = "dispatch_graph_no_edges_omits_field",
+    name = "dispatch-graph",
+    args = {
+      nodes = {
+        { id = "solo", role = "explorer", agent_args = { prompt = "x" } },
+      },
+    },
+  })
+  local invoke = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
+  end)
+  assert_true(invoke ~= nil, "single-node graph emits spawn_graph")
+  local graph = invoke.body.args and invoke.body.args.graph
+  assert_true(type(graph) == "table", "spawn_graph args.graph is a table")
+  assert_eq(graph.edges, nil,
+    "single-node graph omits `edges` (would serialise to JSON `{}` and reasoner-graph would reject)")
+end
+
 -- Unknown tool name returns an error.
 do
   fresh()

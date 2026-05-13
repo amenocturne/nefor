@@ -948,10 +948,6 @@ function M.update(msg, state)
   -- tool.result events can be routed back to the right node without
   -- parsing dispatch traffic.
   if kind == "graph.run_started" then
-    io.stderr:write(string.format(
-      "[chat.update] graph.run_started run_id=%s total_nodes=%s replay_mode=%s\n",
-      tostring(msg.run_id), tostring(msg.total_nodes), tostring(state.replay_mode)))
-    io.stderr:flush()
     if state.replay_mode then return state, {} end
     local now = tui.now_ms()
     return dag.run_started(state, msg.run_id or "", msg.total_nodes or 0, now), {}

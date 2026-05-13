@@ -288,29 +288,28 @@ local function build_graph_spec(node_specs)
     end
   end
 
+  -- Lua's empty `{}` serialises to JSON `{}` (object), not `[]` (array).
+  -- reasoner-graph requires `edges` to be an array when present, so omit
+  -- the key entirely when there are no edges — reasoner-graph defaults
+  -- missing `edges` to no-edges, which is what we want for single-node
+  -- graphs and any chain-shape where deps are encoded purely in
+  -- `dependencies`.
+  if #edges == 0 then
+    return { nodes = nodes }
+  end
   return { nodes = nodes, edges = edges }
 end
 
 local function dispatch_graph(firing_id, args)
-  nefor.log.info("lead-workflow: dispatch_graph called", {
-    firing_id  = firing_id,
-    node_count = args and args.nodes and #args.nodes or nil,
-  })
   local nodes = args and args.nodes
   local graph, err = build_graph_spec(nodes)
   if err then
-    nefor.log.info("lead-workflow: dispatch_graph rejected", { error = err })
     emit_tool_result_err(firing_id, err)
     return
   end
 
   local run_id = envelope.uuid_lite()
   state.active_run_id = run_id
-
-  nefor.log.info("lead-workflow: emitting tool.invoke{spawn_graph}", {
-    run_id    = run_id,
-    node_count = #graph.nodes,
-  })
 
   -- Submit via the same canonical contract agentic-loop uses for
   -- orchestrator runs: tool.invoke{name=spawn_graph} targeting the
