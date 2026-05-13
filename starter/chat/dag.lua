@@ -39,16 +39,20 @@ local function fmt_elapsed_ms(ms)
   return string.format("%ds", math.floor(ms / 1000))
 end
 
+-- A completed run lingers in the panel for `LINGER_MS` after its
+-- `completed_at_ms` so the user can see the final state. Past that
+-- window the run is dropped — visually by the view (this helper),
+-- structurally by `prune` on the next reducer dispatch.
+local function is_expired(run, now_ms)
+  return run.completed_at_ms ~= nil
+     and (now_ms - run.completed_at_ms) > M.LINGER_MS
+end
+
 function M.prune(dag_runs, now_ms)
   if dag_runs == nil then return {} end
   local pruned = nil
   for run_id, run in pairs(dag_runs) do
-    local drop = false
-    if run.completed_at_ms ~= nil
-       and (now_ms - run.completed_at_ms) > M.LINGER_MS then
-      drop = true
-    end
-    if drop then
+    if is_expired(run, now_ms) then
       if pruned == nil then
         pruned = {}
         for k, v in pairs(dag_runs) do pruned[k] = v end
@@ -59,10 +63,21 @@ function M.prune(dag_runs, now_ms)
   return pruned or dag_runs
 end
 
-function M.any_active(dag_runs)
+-- `any_active` drives the render-keepalive animation in view.lua, so
+-- the engine keeps ticking until the panel is empty. Once every run
+-- has completed AND its linger window has closed, the panel is
+-- effectively empty (the view filter drops them) — returning false
+-- here lets the engine settle. Until then we stay active.
+--
+-- The wallclock_tick in plugins/nefor-tui/src/main.rs marks the
+-- engine dirty every 1s independent of `has_active_animations`, so
+-- the linger-window countdown advances even after `any_active` flips
+-- false; the next reducer dispatch (or the view-side `is_expired`
+-- filter on the next paint) finalises the removal.
+function M.any_active(dag_runs, now_ms)
   if type(dag_runs) ~= "table" then return false end
   for _, run in pairs(dag_runs) do
-    if run.completed_at_ms == nil then return true end
+    if not is_expired(run, now_ms or 0) then return true end
   end
   return false
 end
@@ -111,15 +126,26 @@ end
 local function panel_children(state, now_ms, narrow)
   local children = {}
   local run_ids = sorted_keys(state.dag_runs)
-  for i, run_id in ipairs(run_ids) do
-    if i > 1 then
-      children[#children + 1] = tui.text { content = "", wrap = "none" }
-    end
+  local first = true
+  for _, run_id in ipairs(run_ids) do
     local run = state.dag_runs[run_id]
-    children[#children + 1] = run_header(run)
-    local node_ids = sorted_keys(run.nodes or {})
-    for _, node_id in ipairs(node_ids) do
-      children[#children + 1] = node_row(node_id, run.nodes[node_id], now_ms, narrow)
+    -- View-side filter: a completed run past its linger window is
+    -- dropped at paint time so the panel updates on the
+    -- wallclock_tick re-render even though the reducer-side `prune`
+    -- only runs on a fresh dispatch. Without this, the completed
+    -- run stayed visible (all nodes green) until the next user
+    -- keystroke flushed prune through the reducer. Mirrors the
+    -- toast widget's defence-in-depth filter at view-time.
+    if not is_expired(run, now_ms) then
+      if not first then
+        children[#children + 1] = tui.text { content = "", wrap = "none" }
+      end
+      first = false
+      children[#children + 1] = run_header(run)
+      local node_ids = sorted_keys(run.nodes or {})
+      for _, node_id in ipairs(node_ids) do
+        children[#children + 1] = node_row(node_id, run.nodes[node_id], now_ms, narrow)
+      end
     end
   end
   if #children == 0 then

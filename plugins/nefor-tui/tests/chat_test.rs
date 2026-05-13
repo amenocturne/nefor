@@ -554,6 +554,78 @@ fn graph_node_dispatched_then_result_updates_status_glyph() {
 }
 
 #[test]
+fn graph_run_complete_hides_run_after_linger_without_dispatch() {
+    // Regression for the "fully green sidebar until I interact" bug:
+    // the wallclock_tick in plugins/nefor-tui/src/main.rs paints
+    // every second so live elapsed labels advance, but the reducer
+    // only runs on dispatched messages — so the prune in `update`
+    // never ran between user keystrokes and the completed run lingered
+    // on screen as a fully-done DAG. The view-side `is_expired`
+    // filter in `dag.panel_children` drops the run at paint time so
+    // wallclock_tick re-renders surface the empty panel without
+    // needing a synthetic event.
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.run_started",
+            "run_id": "run-dddddddd",
+            "total_nodes": 1,
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.node.fired",
+            "run_id": "run-dddddddd",
+            "node_id": "n1",
+            "firing_id": "f-n1-1",
+            "reasoner": "ollama",
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "tool.result",
+            "id": "f-n1-1",
+            "result": { "text": "ok" },
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "tool.result",
+            "id": "run-dddddddd",
+            "result": { "status": "success", "results": { "n1": { "output": "ok" } } },
+        }),
+    );
+
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("DAG run-dddd"),
+        "completed run should linger initially: {out:?}"
+    );
+
+    // Advance past the 2s linger and render again — `advance_time`
+    // marks dirty (the same effect wallclock_tick has in production)
+    // but does NOT dispatch any message. The view-side filter must
+    // hide the run on this paint alone.
+    engine.advance_time(Duration::from_millis(3000));
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("DAG run-dddd"),
+        "completed run should be hidden past linger window without a dispatch: {out:?}"
+    );
+    assert!(
+        out.contains("(no active runs)"),
+        "empty-state hint missing after linger window: {out:?}"
+    );
+}
+
+#[test]
 fn graph_run_complete_removes_run_after_linger_window() {
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
