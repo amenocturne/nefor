@@ -635,9 +635,13 @@ local function receive_msg(entry)
     return
   end
 
-  -- Tool-gate hello — advertise our tools on first sight.
-  if string.sub(kind, -#".hello") == ".hello" then
-    advertise_tools(decoded.from)
+  -- Tool-gate hello — advertise our tools on first sight. Narrowed
+  -- to `tool-gate.hello` specifically: matching any `*.hello` would
+  -- mean the first non-gate plugin to say hello (e.g. nefor-combinators)
+  -- silently locks the advertised flag and tool-gate never sees the
+  -- ad. The advertise_tools target must always be tool-gate.
+  if kind == "tool-gate.hello" then
+    advertise_tools("tool-gate")
     return
   end
 end

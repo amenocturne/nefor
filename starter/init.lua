@@ -175,14 +175,17 @@ end
 tool_gate_argv[#tool_gate_argv + 1] = "--default"
 tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
 
-actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
-actor.spawn(tools.basic_actor_spec())
-
 -- lead-workflow lives alongside agentic-loop, not inside it: separate
 -- bus subscriptions, separate state. Owns plan/approval state and the
 -- active graph run id; advertises dispatch-graph / write-review /
--- await-approval to tool-gate.
+-- await-approval to tool-gate. Registered BEFORE tool-gate's spawn so
+-- its bus subscription is live when tool-gate.hello arrives —
+-- otherwise the advertise is missed and the lead model gets "no such
+-- tool" at runtime.
 actor.spawn(require("lead-workflow"))
+
+actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
+actor.spawn(tools.basic_actor_spec())
 
 actor.spawn(require("compositors.chat_bridge").spawn_spec({
   require("config").bin("nefor-tui"),
