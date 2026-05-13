@@ -295,6 +295,7 @@ local function handle(body)
   local entry = {
     firing_id      = firing_id,
     run_id         = body.run_id,
+    node_id        = body.node_id,
     chat_id        = chat_id,
     provider       = provider,
     tool_allowlist = build_allowlist_set(args.tool_allowlist),
@@ -399,6 +400,21 @@ local function dispatch_tool_call(entry, call)
     name = name,
     args = call_args,
   })
+
+  -- Paired observer envelope so the chat surface can show "agent in
+  -- node X is currently calling tool Y" in the DAG sidebar. Only emit
+  -- when the agent is running inside a graph node (run_id + node_id
+  -- both present); standalone agent firings have no node to attach to.
+  if type(entry.run_id) == "string" and type(entry.node_id) == "string"
+      and #entry.run_id > 0 and #entry.node_id > 0 then
+    emit_as("agent", nil, {
+      kind      = "graph.node.tool.invoke",
+      run_id    = entry.run_id,
+      node_id   = entry.node_id,
+      tool_id   = tool_id,
+      tool_name = name,
+    })
+  end
   return true
 end
 

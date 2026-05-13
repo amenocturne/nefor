@@ -964,6 +964,17 @@ function M.update(msg, state)
     next_map[msg.firing_id] = { run_id = msg.run_id, node_id = msg.node_id }
     return shallow_merge(with_dispatch, { firing_to_node = next_map }), {}
   end
+  -- Agent-reasoner progress: the agent inside (run_id, node_id) just
+  -- dispatched a sub-tool to tool-gate. Surface the tool name as a
+  -- second indented line on the node row so the user can tell what
+  -- each parallel agent is actually doing.
+  if kind == "graph.node.tool.invoke" then
+    if state.replay_mode then return state, {} end
+    if (msg.run_id or "") == "" or (msg.node_id or "") == "" then return state, {} end
+    if type(msg.tool_name) ~= "string" or #msg.tool_name == 0 then return state, {} end
+    local now = tui.now_ms()
+    return dag.node_tool_invoked(state, msg.run_id, msg.node_id, msg.tool_name, now), {}
+  end
   if kind == "tool.result" then
     if state.replay_mode then return state, {} end
     local id = msg.id

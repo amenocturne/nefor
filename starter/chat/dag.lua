@@ -99,7 +99,7 @@ local function run_header(run)
   return tui.text { content = title, style = STYLE.footer, wrap = "none" }
 end
 
-local function node_row(node_id, node, now_ms, narrow)
+local function node_rows(node_id, node, now_ms, narrow)
   local glyph = GLYPHS[node.status] or "·"
   local style = NODE_STYLE[node.status] or STYLE.status_dim
   local elapsed
@@ -120,7 +120,20 @@ local function node_row(node_id, node, now_ms, narrow)
     text = string.format("%s %s  %s  %s%s",
       glyph, node_id, reasoner, status_word, elapsed_str)
   end
-  return tui.text { content = text, style = style, wrap = "none" }
+  local rows = { tui.text { content = text, style = style, wrap = "none" } }
+  -- Indented sub-line: "what the agent inside this node is doing
+  -- right now" (last tool dispatched to tool-gate). Only shown while
+  -- the node is running — once it terminates, the status glyph + the
+  -- transcript carry the signal and the leftover tool name is noise.
+  if node.status == "running" and type(node.last_tool) == "string"
+      and #node.last_tool > 0 then
+    rows[#rows + 1] = tui.text {
+      content = "  → " .. node.last_tool,
+      style   = STYLE.status_dim,
+      wrap    = "none",
+    }
+  end
+  return rows
 end
 
 local function panel_children(state, now_ms, narrow)
@@ -144,7 +157,9 @@ local function panel_children(state, now_ms, narrow)
       children[#children + 1] = run_header(run)
       local node_ids = sorted_keys(run.nodes or {})
       for _, node_id in ipairs(node_ids) do
-        children[#children + 1] = node_row(node_id, run.nodes[node_id], now_ms, narrow)
+        for _, row in ipairs(node_rows(node_id, run.nodes[node_id], now_ms, narrow)) do
+          children[#children + 1] = row
+        end
       end
     end
   end
@@ -230,6 +245,27 @@ function M.node_dispatched(state, run_id, node_id, reasoner, now_ms)
       finished_at_ms = nil,
     }
     return shallow_merge(run, { nodes = nodes })
+  end)
+end
+
+function M.node_tool_invoked(state, run_id, node_id, tool_name, now_ms)
+  -- Only stamp progress for nodes we've observed dispatch for. If we
+  -- haven't seen `graph.node.fired` for this (run, node) yet — out-of-
+  -- order delivery, replay tail, whatever — drop quietly rather than
+  -- synthesise a partial node row that misses `reasoner` / start time.
+  if not (state.dag_runs and state.dag_runs[run_id]
+      and state.dag_runs[run_id].nodes
+      and state.dag_runs[run_id].nodes[node_id]) then
+    return state
+  end
+  return apply(state, run_id, function(prev)
+    local nodes = {}
+    for k, v in pairs(prev.nodes or {}) do nodes[k] = v end
+    nodes[node_id] = shallow_merge(nodes[node_id], {
+      last_tool       = tool_name,
+      last_tool_at_ms = now_ms,
+    })
+    return shallow_merge(prev, { nodes = nodes })
   end)
 end
 
