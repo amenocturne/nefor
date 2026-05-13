@@ -35,6 +35,15 @@ local function bootstrap_pm()
   local pm_root  = data_dir .. "/nefor"
   local pm_init  = pm_root .. "/lua/nefor-pm/init.lua"
 
+  -- Lua 5.2+ returns (true|nil, "exit"|"signal", code); 5.1 returns
+  -- the raw exit code. Capture once — re-checking by re-calling
+  -- os.execute would re-run the command and `git clone` would then
+  -- blow up on "already exists" right after a successful first run.
+  local function run(cmd)
+    local ok = os.execute(cmd)
+    return ok == true or ok == 0
+  end
+
   local f = io.open(pm_init, "r")
   if f then
     f:close()
@@ -45,11 +54,10 @@ local function bootstrap_pm()
     os.execute("mkdir -p '" .. data_dir .. "'")
     local clone_cmd = "git clone --depth 1 --filter=blob:none --sparse "
                    .. "https://github.com/amenocturne/nefor.git '" .. pm_root .. "'"
-    if os.execute(clone_cmd) ~= 0 and os.execute(clone_cmd) ~= true then
+    if not run(clone_cmd) then
       error("nefor bootstrap: git clone failed; check network + git availability")
     end
-    if os.execute("git -C '" .. pm_root .. "' sparse-checkout set lua/nefor-pm") ~= 0
-        and os.execute("git -C '" .. pm_root .. "' sparse-checkout set lua/nefor-pm") ~= true then
+    if not run("git -C '" .. pm_root .. "' sparse-checkout set lua/nefor-pm") then
       error("nefor bootstrap: git sparse-checkout set failed")
     end
   end
