@@ -4,28 +4,14 @@
 -- so they survive nefor restarts. Past INPUT_HISTORY_MAX entries the
 -- oldest roll off the disk file the next time we trim.
 
+local common = require("chat.common")
+
 local M = {}
 
 M.INPUT_HISTORY_MAX = 50
 
--- Same env-var precedence as the engine's nefor.fs.data_root()
--- (NEFOR_DATA_DIR → XDG_DATA_HOME/nefor → HOME/.local/share/nefor) so
--- input-history sits next to session jsonls under the same root.
--- This module runs in the TUI plugin's subprocess VM where the engine
--- `nefor.fs.*` bindings aren't installed; the resolver here is a
--- matching reimplementation rather than a delegation.
-local function data_root()
-  local override = os.getenv("NEFOR_DATA_DIR")
-  if override ~= nil and override ~= "" then return override end
-  local xdg = os.getenv("XDG_DATA_HOME")
-  if xdg ~= nil and xdg ~= "" then return xdg .. "/nefor" end
-  local home = os.getenv("HOME") or ""
-  if home == "" then return nil end
-  return home .. "/.local/share/nefor"
-end
-
 local function history_path()
-  local root = data_root()
+  local root = common.data_root()
   if root == nil then return nil end
   return root .. "/input-history"
 end
@@ -75,11 +61,13 @@ local function decode_line(line)
 end
 
 -- Best-effort `mkdir -p` so the writer can drop the file even on a
--- fresh data-root. Lua doesn't ship an in-process mkdir; shell out.
--- Errors here mean the writer's io.open will fail next, which the
--- writer logs and swallows — history just won't persist this session.
+-- fresh data-root. The TUI plugin's Lua VM only exposes
+-- `nefor.fs.list_dir` (see plugins/nefor-tui/src/fs.rs) — `mkdir_p` is
+-- not bridged, so we shell out here. Errors here mean the writer's
+-- io.open will fail next, which the writer logs and swallows —
+-- history just won't persist this session.
 local function ensure_dir()
-  local root = data_root()
+  local root = common.data_root()
   if root == nil then return end
   os.execute(string.format("mkdir -p %q 2>/dev/null", root))
 end

@@ -2,7 +2,7 @@
 -- side-effect bridges (huge-output dump-to-file, AGENTS.md emission).
 
 local envelope         = require("core.envelope")
-local spawn_graph      = require("reasoner-graph.spawn_graph")
+local spawn_graph      = require("libs.spawn-graph")
 local tool_output_dump = require("tool-gate.tool_output_dump")
 local agents_md        = require("tool-gate.agents_md")
 
