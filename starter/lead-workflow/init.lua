@@ -308,22 +308,29 @@ local function dispatch_graph(firing_id, args)
     return
   end
 
-  local run_id = envelope.uuid_lite()
+  -- Route through agentic-loop's sub-graph queue rather than emitting
+  -- the tool.invoke directly. queue_sub_graph mints the run_id AND
+  -- registers it in pending_runs — without that registration the
+  -- run-close handler in agentic-loop has nothing to match against,
+  -- the `[spawn_graph result]` system message is never appended, the
+  -- deferred-relay text is never queued, and the lead's next chat
+  -- turn never sees the sub-graph's findings (so the lead has to
+  -- guess and chats / redispatches instead of acting on results).
+  --
+  -- flush_pending_dispatches pushes the dispatch out NOW. The
+  -- agentic-loop side flushes on wrap-stream delta / chat.complete
+  -- normally, but the dispatch-graph tool runs entirely Lua-side
+  -- without going through that path.
+  local al = require("agentic-loop")
+  local run_id = al.queue_sub_graph(
+    { graph = graph, on_node_failure = "abort" }, firing_id)
+  if type(run_id) ~= "string" then
+    emit_tool_result_err(firing_id,
+      "dispatch-graph: agentic-loop refused the graph (queue_sub_graph returned nil)")
+    return
+  end
+  al.flush_pending_dispatches()
   state.active_run_id = run_id
-
-  -- Submit via the same canonical contract agentic-loop uses for
-  -- orchestrator runs: tool.invoke{name=spawn_graph} targeting the
-  -- reasoner-graph plugin. The plugin's dispatch_event routes by name
-  -- and parses graph + on_node_failure from inside args.
-  emit_to("reasoner-graph", {
-    kind = "tool.invoke",
-    id   = run_id,
-    name = "spawn_graph",
-    args = {
-      graph           = graph,
-      on_node_failure = "abort",
-    },
-  })
 
   emit_tool_result_ok(firing_id, {
     run_id = run_id,
