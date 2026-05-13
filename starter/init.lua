@@ -189,6 +189,15 @@ actor.spawn(require("lead-workflow"))
 -- tool-gate spawn so the gate's first hello triggers our advertise.
 actor.spawn(require("read-only-tools"))
 
+-- Tool-validator owns the chat.tool.permission_request → chat.tool.
+-- popup_request translation: classifies bash commands through `da`
+-- (approve/deny/defer), routes only the deferred ones to a user popup.
+-- Must be spawned BEFORE tool-gate so its subscription is live when
+-- the first gated invocation lands. The chat surface listens to
+-- popup_request, not permission_request — without the validator
+-- running, gated invocations never reach the popup.
+actor.spawn(require("tool-validator"))
+
 actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
 actor.spawn(tools.basic_actor_spec())
 

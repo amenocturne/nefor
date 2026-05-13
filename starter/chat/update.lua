@@ -928,23 +928,26 @@ function M.update(msg, state)
     return shallow_merge(state, { auth = auth }), {}
   end
 
-  if kind == "chat.tool.permission_request" then
+  if kind == "chat.tool.popup_request" then
     -- Replay path: the user already approved in the original session
     -- and the decision is in the jsonl — popping a fresh approval
     -- popup would be a re-prompt for the same call. Drop the request
     -- silently; the matching tool.permission_response is also in the
     -- jsonl and will replay through tool-gate's normal handler.
     if state.replay_mode then return state, {} end
-    -- Wire shape from tool-gate (plugins/tool-gate/src/main.rs):
-    --   { kind = "chat.tool.permission_request",
+    -- Wire shape from the tool-validator actor:
+    --   { kind = "chat.tool.popup_request",
     --     id   = "<provider outer id>",
     --     tool = "<tool name>",
     --     args = <JSON object> }
-    -- We render `args` into a small key/value summary. The response goes
-    -- back as `tool.permission_response { id, decision }` (handled in
-    -- the popup keymap below). `msg.input_pretty` and `msg.name` are
-    -- kept as forward-compatible fallbacks in case future emitters
-    -- pre-format.
+    -- The validator is the only emitter — it owns the decision split
+    -- between auto-approve, auto-deny, and "ask the human". tool-gate
+    -- still emits `chat.tool.permission_request`; the validator
+    -- forwards as popup_request when it defers. We render `args` into
+    -- a small key/value summary; the response goes back as
+    -- `tool.permission_response { id, decision }` (handled in the
+    -- popup keymap below). `msg.input_pretty` and `msg.name` are kept
+    -- as forward-compatible fallbacks in case future emitters pre-format.
     local args = msg.args
     local body
     if msg.input_pretty ~= nil then

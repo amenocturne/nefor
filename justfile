@@ -42,6 +42,18 @@ install:
       install -m 0755 "target/release/$bin" "$PREFIX/bin/$bin"
       echo "  $PREFIX/bin/$bin"
     done
+    # The starter ships a tool-validator that classifies bash commands
+    # via `da` (https://github.com/amenocturne/da) before any popup
+    # fires. Install it on PATH if the user doesn't already have it —
+    # the validator falls back to "always defer to user" without it,
+    # but auto-approval of safe read-only commands needs the binary.
+    if command -v da >/dev/null 2>&1; then
+      echo "  da (already installed) -> $(command -v da)"
+    else
+      echo "Installing da (bash-command classifier)..."
+      cargo install --locked dabin
+      echo "  da -> $(command -v da || echo '?')"
+    fi
     echo
     echo "Installed -> $PREFIX/bin"
     echo "Make sure your shell has:"

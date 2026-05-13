@@ -12,7 +12,7 @@
 --   chat.stream.reasoning_delta, chat.stream.reasoning_end,
 --   chat.session.stats, chat.tool.start, chat.tool.end,
 --   chat.popup, chat.auth.status, chat.model.set_ack, chat.models.listed,
---   chat.tool.permission_request, tool-gate.mode_changed,
+--   chat.tool.popup_request, tool-gate.mode_changed,
 --   graph.run_started, graph.node.fired, tool.result.
 --
 -- Outbound:

@@ -188,8 +188,8 @@ function M.format_graph(graph)
   return table.concat(lines, "\n")
 end
 
--- Pretty-print an args table from a `chat.tool.permission_request`
--- event so the popup body shows a human-legible summary of the call.
+-- Pretty-print an args table from a `chat.tool.popup_request` event
+-- so the popup body shows a human-legible summary of the call.
 -- Stringy values render verbatim; nested tables get a compact `{...}`
 -- placeholder rather than a recursive dump (most tools take flat args,
 -- and a long nested blob would blow up the popup anyway). The
