@@ -28,6 +28,17 @@ These are reasoner-graph internals that `dispatch-graph` translates into. Callin
 
 Even if a future build advertises one of these names, treat it as not yours to call. The tool surface above is the complete list.
 
+## Graph shape — exactly one terminal node
+
+Every graph you submit must converge to **exactly one terminal node** (a node nothing else depends on). The terminal node's structured-finalize output is what the graph returns to you.
+
+- ✅ Single node, no dependencies.
+- ✅ Linear chain: `explorer → builder → reviewer`. `reviewer` is the sink.
+- ✅ Parallel fan-out + fan-in: two explorers in parallel, then one builder that depends on both. `builder` is the sink.
+- ❌ Two unrelated parallel nodes with no aggregator. `dispatch-graph` rejects this with `graph has N terminal nodes`. To fix: add a final node (reviewer / synthesiser) whose `dependencies` list includes every parallel branch's leaf.
+
+When you want broad parallel exploration on a complex task, end the graph with a reviewer or builder that depends on every explorer — that aggregator receives all findings via its dependency context and produces the unified output.
+
 ## Sub-agent roles available
 
 - `explorer` — read-only investigation. Returns structured `findings` with `file:line` references.

@@ -517,13 +517,25 @@ local function lead_workflow_tool_schemas()
   return {
     {
       name        = "dispatch-graph",
-      description = "Dispatch a reasoner-graph of role-keyed sub-agents and return the run_id.",
+      description =
+        "Dispatch a reasoner-graph of role-keyed sub-agents and return the run_id. " ..
+        "The graph MUST converge to exactly one terminal (sink) node — a node " ..
+        "that no other node depends on. The terminal node's structured-finalize " ..
+        "output becomes the graph's return value. If you want parallel work " ..
+        "(e.g. several explorers), add a final aggregator node that depends on " ..
+        "all of them (a reviewer that synthesises findings, a tester that runs " ..
+        "after all builders, etc.). Submitting N independent parallel nodes with " ..
+        "no aggregator is rejected with `dispatch-graph: graph has N terminal nodes`.",
       parameters  = {
         type = "object",
         properties = {
           nodes = {
             type = "array",
-            description = "Role-keyed node specs: { id, role, agent_args, dependencies? }.",
+            description =
+              "Role-keyed node specs: { id, role, agent_args, dependencies? }. " ..
+              "Use the `dependencies` field (array of node ids) to wire up the " ..
+              "DAG so it converges to a single sink. Sub-agent finalize output " ..
+              "is auto-composed into dependent nodes' prompts.",
           },
         },
         required = { "nodes" },
