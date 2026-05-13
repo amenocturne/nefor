@@ -253,6 +253,25 @@ local function find_call(calls, kind, role, text_substr)
   return nil
 end
 
+-- chat.graph_result.append carries the sub-graph output in `output`
+-- (success) or `error` (failure), not `text`, so the text-keyed
+-- find_call doesn't fit. Match by status + substring in the
+-- status-appropriate field.
+local function find_graph_result(calls, status, body_substr)
+  for _, c in ipairs(calls) do
+    if c.body.kind == "chat.graph_result.append"
+       and c.body.status == status then
+      local field = (status == "failed") and c.body.error or c.body.output
+      if body_substr == nil
+         or (type(field) == "string"
+             and string.find(field, body_substr, 1, true) ~= nil) then
+        return c
+      end
+    end
+  end
+  return nil
+end
+
 local function fresh_loop()
   agentic_loop._internals.reset()
   agentic_loop.configure { provider = "ollama", model = "test-model" }
@@ -498,15 +517,15 @@ do
   })
 
   local calls = decode_calls()
-  local visible = find_call(calls, "chat.message.append", "system", "octopuses are eight-armed")
+  local visible = find_graph_result(calls, "success", "octopuses are eight-armed")
   assert(visible ~= nil,
-    "sub-graph completion must emit a chat.message.append carrying the literal terminal output; got "
+    "sub-graph completion must emit a chat.graph_result.append carrying the terminal output; got "
     .. json.encode(_test.calls()))
   assert_eq(visible.target, "nefor-tui",
     "visible sub-graph output must target nefor-tui")
 end
 
--- Sub-graph failure surfaces an [spawn_graph errored] visible message.
+-- Sub-graph failure surfaces a chat.graph_result.append with status=failed.
 do
   fresh_loop()
   local run_id = agentic_loop.queue_sub_graph(
@@ -520,9 +539,9 @@ do
     result = { status = "error", results = { terminal = { error = "boom" } } },
   })
   local calls = decode_calls()
-  local err_msg = find_call(calls, "chat.message.append", "system", "spawn_graph errored")
+  local err_msg = find_graph_result(calls, "failed", "boom")
   assert(err_msg ~= nil,
-    "sub-graph failure must emit a [spawn_graph errored] system message; got "
+    "sub-graph failure must emit a chat.graph_result.append with status=failed; got "
     .. json.encode(_test.calls()))
 end
 

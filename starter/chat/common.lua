@@ -248,6 +248,13 @@ M.C = {
   -- existing status_warn (#D7AF5F) which carries semantic "warning"
   -- weight; plans aren't warnings, they're a third entry kind.
   plan            = "#FFD75F",
+  -- graph_result header colour. Cyan picks up the orchestration /
+  -- sub-graph register — distinct from tool_name (md_heading orange,
+  -- request side) and plan (yellow, write-review). The blockquote
+  -- accent (#7faaaa) is the closest existing neighbour but reads as
+  -- "quoted text"; a brighter saturated cyan separates the graph-result
+  -- block from prose without colliding with status_warn / plan yellow.
+  graph_result    = "#5FD7D7",
 }
 
 local C = M.C
@@ -271,6 +278,8 @@ M.STYLE = {
   reasoning       = { fg = C.system, italic = true },
   tool_name       = { fg = C.md_heading, bold = true },
   tool_error      = { fg = C.status_danger, bold = true },
+  graph_result_name   = { fg = C.graph_result, bold = true },
+  graph_result_error  = { fg = C.status_danger, bold = true },
   popup_user      = { fg = C.user, bold = true },
   popup_warn      = { fg = C.status_warn, bold = true },
   popup_danger    = { fg = C.status_danger, bold = true },

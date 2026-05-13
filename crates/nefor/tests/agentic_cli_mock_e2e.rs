@@ -456,13 +456,14 @@ fn scenario_3_single_shot_stream_json() {
          {total_lines} lines"
     );
 
-    // Bug 4 regression — sub-graph completion surfaces the literal
-    // terminal output as a `chat.message.append role=system` so the
-    // user actually sees what the sub-graph produced. The deferred
-    // relay text is a model-facing wrapper; this is the visible one.
-    // The mock's combine-step canned text contains "sentinels", which
-    // is the distinguishing keyword from the orchestrator turn's other
-    // emissions. Look for a chat.message.append carrying it.
+    // Sub-graph completion surfaces the terminal output as a
+    // `chat.graph_result.append` envelope so the TUI renders it as a
+    // distinguishable block. The deferred relay text is a separate
+    // model-facing wrapper; this is the human-visible one. The mock's
+    // combine-step canned text contains "sentinels", which is the
+    // distinguishing keyword from the orchestrator turn's other
+    // emissions. Look for a graph_result envelope carrying it in
+    // `output`.
     let mut visible_subgraph_count = 0usize;
     for line in out.stdout.lines() {
         if line.is_empty() {
@@ -477,19 +478,19 @@ fn scenario_3_single_shot_stream_json() {
             None => continue,
         };
         let kind = body.get("kind").and_then(Value::as_str).unwrap_or("");
-        if kind != "chat.message.append" {
+        if kind != "chat.graph_result.append" {
             continue;
         }
-        let role = body.get("role").and_then(Value::as_str).unwrap_or("");
-        let text = body.get("text").and_then(Value::as_str).unwrap_or("");
-        if role == "system" && text.contains("sentinels") {
+        let status = body.get("status").and_then(Value::as_str).unwrap_or("");
+        let output = body.get("output").and_then(Value::as_str).unwrap_or("");
+        if status == "success" && output.contains("sentinels") {
             visible_subgraph_count += 1;
         }
     }
     assert!(
         visible_subgraph_count >= 1,
         "expected the sub-graph terminal text to land as a \
-         chat.message.append role=system on the bus (Bug 4); \
+         chat.graph_result.append envelope on the bus; \
          saw {visible_subgraph_count} matching envelopes across \
          {total_lines} lines"
     );

@@ -279,6 +279,13 @@ local function build_graph_spec(node_specs)
       id       = spec.id,
       reasoner = "agent",
       args     = agent_args,
+      -- Carries the lead's role label (explorer / builder / reviewer /
+      -- …) through to the chat surface so the graph_result block can
+      -- show role per node rather than the generic `agent` reasoner.
+      -- reasoner-graph parses by `id` + `reasoner` only and silently
+      -- ignores unknown fields; the field round-trips through
+      -- agentic-loop's pending_runs without touching the wire.
+      role     = spec.role,
     }
 
     if type(spec.dependencies) == "table" then
