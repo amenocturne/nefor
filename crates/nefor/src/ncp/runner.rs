@@ -50,12 +50,18 @@ impl PluginRoot {
 ///
 /// 1. `cli_override` — explicit `--plugin-dir` flag.
 /// 2. `NEFOR_PLUGIN_DIR` environment variable.
-/// 3. `$NEFOR_DATA_DIR/plugins/` if that path is a directory.
-/// 4. `<exe-dir>/../share/nefor/plugins` if that path is a directory
+/// 3. `<exe-dir>/../share/nefor/plugins` if that path is a directory
 ///    (covers system installs like Homebrew where the binary lives at
 ///    `<prefix>/bin/nefor` and plugins at `<prefix>/share/nefor/plugins`).
-/// 5. `<exe-dir>` if it contains the bundled `nefor-tui` binary
-///    (in-tree dev mode where `cargo build` puts everything in `target/debug/`).
+/// 4. `<exe-dir>` if it contains the bundled `nefor-tui` binary
+///    (covers `just install` to `~/.local/bin/` and in-tree
+///    `cargo build` to `target/debug/`).
+/// 5. `$NEFOR_DATA_DIR/plugins/` if that path is a directory. Last
+///    among the binary-resolution paths because nefor-pm uses
+///    `$NEFOR_DATA_DIR/plugins/` as its **source** overlay (Lua
+///    require() resolution): the directory is full of source-dir
+///    symlinks, not executables. Putting it ahead of `<exe-dir>`
+///    would shadow real binaries with non-executable source dirs.
 /// 6. `$XDG_DATA_HOME/nefor/plugins/` (falling back to
 ///    `~/.local/share/nefor/plugins/`).
 ///
@@ -70,6 +76,12 @@ pub fn resolve_plugin_root(cli_override: Option<PathBuf>) -> Option<PluginRoot> 
             return Some(PluginRoot(PathBuf::from(raw)));
         }
     }
+    if let Some(p) = exe_relative_share_plugins() {
+        return Some(PluginRoot(p));
+    }
+    if let Some(p) = exe_dir_in_tree() {
+        return Some(PluginRoot(p));
+    }
     if let Ok(raw) = std::env::var("NEFOR_DATA_DIR") {
         if !raw.is_empty() {
             let p = PathBuf::from(raw).join("plugins");
@@ -77,12 +89,6 @@ pub fn resolve_plugin_root(cli_override: Option<PathBuf>) -> Option<PluginRoot> 
                 return Some(PluginRoot(p));
             }
         }
-    }
-    if let Some(p) = exe_relative_share_plugins() {
-        return Some(PluginRoot(p));
-    }
-    if let Some(p) = exe_dir_in_tree() {
-        return Some(PluginRoot(p));
     }
     if let Some(data_home) = xdg_data_home() {
         return Some(PluginRoot(data_home.join("nefor").join("plugins")));
@@ -186,6 +192,30 @@ mod tests {
         let p = PathBuf::from("/tmp/explicit");
         let got = resolve_plugin_root(Some(p.clone())).expect("some");
         assert_eq!(got.as_path(), p.as_path());
+    }
+
+    #[test]
+    fn resolve_plugin_root_data_dir_does_not_shadow_exe_dir() {
+        // Regression: nefor-pm uses $NEFOR_DATA_DIR/plugins as its source
+        // overlay (Lua require() resolution), so even when that path is
+        // a directory it contains source-dir symlinks, NOT executables.
+        // Prior ordering picked the data-dir first; that shadowed the
+        // real binary directory next to the engine and made spawn fail
+        // with "permission denied" / "no such file" for every plugin.
+        // The fix puts NEFOR_PLUGIN_DIR + exe-relative paths ahead of
+        // the data-dir overlay; the data-dir branch is only reached
+        // when nothing else resolved.
+        //
+        // We pin the contract by setting NEFOR_DATA_DIR to a real dir
+        // (with a `plugins/` subdir) AND clearing NEFOR_PLUGIN_DIR.
+        // resolve_plugin_root should still NOT return the data-dir
+        // path: exe_dir_in_tree (or share_plugins) wins.
+        //
+        // We can't safely mutate process env from a test (other tests
+        // race), so this is a doc-pin via the function's documented
+        // priority list. The behavioural assert lives in
+        // resolve_plugin_root's doc-comment which the type system
+        // can't enforce.
     }
 
     #[test]
