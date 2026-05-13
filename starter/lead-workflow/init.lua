@@ -383,9 +383,26 @@ local function dispatch_graph(firing_id, args)
   al.flush_pending_dispatches()
   state.active_run_id = run_id
 
+  -- The ack body carries an explicit async-contract instruction. Without
+  -- it, smaller models (qwen2.5:7b observed in practice) read the bare
+  -- {run_id, nodes} response as "tool returned nothing useful" and
+  -- re-call dispatch-graph for the same task, producing duplicate
+  -- sub-graph runs. The wording deliberately avoids "or chain another
+  -- tool call" — that phrase nudges the model toward immediate
+  -- redispatch — and reserves "you may dispatch a different task" as
+  -- the only sanctioned chained-call path.
+  local n = #graph.nodes
   emit_tool_result_ok(firing_id, {
     run_id = run_id,
-    nodes  = #graph.nodes,
+    nodes  = n,
+    notice = string.format(
+      "Submitted (async, %d node%s). Acknowledge briefly to the user " ..
+      "in one short sentence, then WAIT for the result. Do NOT call " ..
+      "dispatch-graph again for this same task — the result will arrive " ..
+      "later as a user message tagged `[spawn_graph(run_id=%s) result]`. " ..
+      "You may dispatch a DIFFERENT task in parallel if the user asked " ..
+      "for one.",
+      n, n == 1 and "" or "s", run_id),
   })
 end
 
