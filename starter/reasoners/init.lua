@@ -1,7 +1,7 @@
 -- starter/reasoners/init.lua — bundle entry for Lua-resident reasoners.
 --
 -- Each Lua-resident reasoner type (responder, terminal, tool-executor,
--- adapter, provider-wrapper, dummy) lives behind a single dispatcher
+-- adapter, provider-wrapper) lives behind a single dispatcher
 -- actor. Inbound dispatch comes in as the canonical tool contract:
 -- `tool.invoke { id=firing_id, name=<reasoner>, args: { run_id, node_id,
 -- args, inputs, prev_state } }`. The handler chain is the same as the
@@ -71,7 +71,7 @@ local function send_tool_result_err(reasoner_type, firing_id, err)
   })
 end
 
--- Handler for dummy / provider-wrapper / responder.
+-- Handler for provider-wrapper / responder.
 --
 -- Owns invariants:
 --   * Sub-graph stream gating — chat_id_stream_visible flag set
@@ -351,7 +351,6 @@ local run_wrappers_reasoner = require("reasoners.run-wrappers")
 local loop_counter_reasoner = require("reasoners.loop_counter")
 
 local handlers = {
-  ["dummy"]            = function(body) return provider_run_node("dummy", body) end,
   ["provider-wrapper"] = function(body) return provider_run_node("provider-wrapper", body) end,
   ["responder"]        = function(body) return provider_run_node("responder", body) end,
   ["tool-executor"]    = tool_executor_run_node,

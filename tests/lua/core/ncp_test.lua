@@ -654,11 +654,11 @@ local function pending_count()
   return n
 end
 
-local function test_rga_dummy_dispatch_drives_provider_chain()
+local function test_rga_provider_wrapper_dispatch_drives_provider_chain()
   reset_rga()
   _test.set_plugins({ "ollama", "nefor-tui" })
   dispatch_run_node({
-    kind = "dummy.run_node",
+    kind = "provider-wrapper.run_node",
     run_id = "r1", node_id = "n1", firing_id = "f1",
     args = { provider = "ollama", prompt = "hi" },
     inputs = {},
@@ -687,7 +687,7 @@ local function test_rga_dispatch_drives_provider_chat_create_and_complete()
   reset_rga()
   _test.set_plugins({ "ollama" })
   dispatch_run_node({
-    kind = "dummy.run_node",
+    kind = "provider-wrapper.run_node",
     run_id = "r2", node_id = "wrap", firing_id = "f2",
     args = { provider = "ollama", prompt = "hello", model = "qwen2.5-coder:7b" },
     inputs = {},
@@ -737,7 +737,7 @@ local function test_rga_provider_result_emits_tool_result_with_next_state()
   reset_rga()
   _test.set_plugins({ "ollama" })
   dispatch_run_node({
-    kind = "dummy.run_node",
+    kind = "provider-wrapper.run_node",
     run_id = "rR", node_id = "nR", firing_id = "fR",
     args = { provider = "ollama", prompt = "p" },
     inputs = {},
@@ -797,7 +797,7 @@ local function test_rga_per_firing_keying_distinct_firings_resolve_independently
   _test.set_plugins({ "ollama" })
 
   dispatch_run_node({
-    kind = "dummy.run_node",
+    kind = "provider-wrapper.run_node",
     run_id = "rP", node_id = "nP", firing_id = "fA",
     args = { provider = "ollama", prompt = "a" },
     inputs = {},
@@ -807,7 +807,7 @@ local function test_rga_per_firing_keying_distinct_firings_resolve_independently
   _test.calls_clear()
 
   dispatch_run_node({
-    kind = "dummy.run_node",
+    kind = "provider-wrapper.run_node",
     run_id = "rP", node_id = "nP", firing_id = "fB",
     args = { provider = "ollama", prompt = "b" },
     inputs = {},
@@ -1410,7 +1410,7 @@ local tests = {
   { name = "kind_prefix_self_announces_to_all_peers", fn = test_kind_prefix_self_announces_to_all_peers },
   { name = "openai_adapter_static_token_injects_auth_set_on_ready", fn = test_openai_adapter_static_token_injects_auth_set_on_ready },
   { name = "openai_adapter_no_static_token_skips_injection", fn = test_openai_adapter_no_static_token_skips_injection },
-  { name = "rga_dummy_dispatch_drives_provider_chain", fn = test_rga_dummy_dispatch_drives_provider_chain },
+  { name = "rga_provider_wrapper_dispatch_drives_provider_chain", fn = test_rga_provider_wrapper_dispatch_drives_provider_chain },
   { name = "rga_unknown_type_is_ignored", fn = test_rga_unknown_type_is_ignored },
   { name = "rga_dispatch_drives_provider_chat_create_and_complete", fn = test_rga_dispatch_drives_provider_chat_create_and_complete },
   { name = "rga_prev_state_chat_id_skips_create", fn = test_rga_prev_state_chat_id_skips_create },

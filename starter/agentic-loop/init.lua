@@ -72,7 +72,6 @@ local state = {
   tool_start_observers   = {},  ---@type table
   tool_end_observers     = {},  ---@type table
   complete_observers     = {},  ---@type table
-  popup_observers        = {},  ---@type table
 }
 
 -- Reasoner types whose streaming should reach nefor-tui.
@@ -709,7 +708,7 @@ local function track_tool_executor(run_id, node_id, firing_id, calls, tool_ids)
 end
 
 -- Provider-node pending entry constructor — same idea for the provider/
--- responder/wrapper/dummy reasoners.
+-- responder/wrapper reasoners.
 local function track_provider_firing(reasoner_type, run_id, node_id, firing_id,
                                      provider_name, chat_id)
   local key = pending_key(run_id, firing_id)
@@ -869,10 +868,6 @@ end
 function M.on_complete(fn)
   assert(type(fn) == "function", "on_complete: callback must be a function")
   state.complete_observers[#state.complete_observers + 1] = fn
-end
-function M.on_popup(fn)
-  assert(type(fn) == "function", "on_popup: callback must be a function")
-  state.popup_observers[#state.popup_observers + 1] = fn
 end
 
 -- Configuration. Called once at boot from init.lua to set provider /
@@ -1162,7 +1157,6 @@ M._internals  = {
     state.tool_start_observers = {}
     state.tool_end_observers = {}
     state.complete_observers = {}
-    state.popup_observers = {}
     envelope._reset()
   end,
 }
