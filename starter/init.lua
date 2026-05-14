@@ -112,6 +112,14 @@ pm.install({
 
   {
     "amenocturne/nefor",
+    name = "chatgpt-provider",
+    tag  = UPSTREAM_REF,
+    path = "plugins/chatgpt-provider/lua/chatgpt-provider/",
+    dir  = NEFOR_ROOT .. "/plugins/chatgpt-provider/lua/chatgpt-provider",
+  },
+
+  {
+    "amenocturne/nefor",
     name = "tool-gate",
     tag  = UPSTREAM_REF,
     path = "plugins/tool-gate/lua/tool-gate/",
@@ -224,6 +232,25 @@ for _, p in ipairs(cfg.providers or {}) do
       p.name,
       provider_command,
       { static_token = p.static_token }
+    ))
+  elseif p.kind == "chatgpt" then
+    local provider_command = {
+      require("config").bin("chatgpt-provider"),
+      "--name", p.name,
+    }
+    if p.base_url then
+      table.insert(provider_command, "--base-url")
+      table.insert(provider_command, p.base_url)
+    end
+    -- No `--model` flag: chatgpt-provider fetches its model list from
+    -- the backend at runtime; the user picks via `/model` in chat.
+    for _, a in ipairs(p.extra_args or {}) do
+      table.insert(provider_command, a)
+    end
+    actor.spawn(provider.spawn_spec(
+      p.name,
+      provider_command,
+      { translator_lib = "chatgpt-provider" }
     ))
   else
     error("starter/init.lua: unknown provider kind: " .. tostring(p.kind))

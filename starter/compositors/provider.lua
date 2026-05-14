@@ -52,7 +52,6 @@
 -- synthesis). This file just delegates.
 
 local envelope = require("core.envelope")
-local provider_lib = require("openai-provider")
 
 local M = {}
 
@@ -76,6 +75,11 @@ local M = {}
 --             emit_synthetic = <function(from, body)> }. emit_synthetic
 -- writes a wire-shape event envelope to the bus so callers don't need
 -- to know the framing.
+--
+--   translator_lib (optional) — Lua module name to require for the
+--     translator. Defaults to "openai-provider". Set to your provider's
+--     lua dir name when the binary emits the same wire kinds but lives
+--     under a different require path (e.g. "chatgpt-provider").
 function M.spawn_spec(name, command, opts)
   if type(name) ~= "string" or #name == 0 then
     error("provider.spawn_spec: name required, got " .. type(name))
@@ -86,6 +90,7 @@ function M.spawn_spec(name, command, opts)
   opts = opts or {}
   local hooks = opts.hooks or {}
 
+  local provider_lib = require(opts.translator_lib or "openai-provider")
   local translator = provider_lib.translator(name)
   local kinds = translator.kinds
 

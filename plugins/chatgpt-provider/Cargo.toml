@@ -1,0 +1,48 @@
+[package]
+name = "chatgpt-provider"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NCP v0.1 plugin that talks to OpenAI's Responses API using ChatGPT-subscription OAuth credentials. Phase 2: standalone OAuth PKCE login that persists tokens for downstream phases."
+
+[lib]
+name = "chatgpt_provider"
+path = "src/lib.rs"
+
+[[bin]]
+name = "chatgpt-provider"
+path = "src/main.rs"
+
+[dependencies]
+nefor-protocol = { path = "../../crates/nefor-protocol" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+dirs = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+futures = { workspace = true }
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
+
+# OAuth flow specifics — declared here rather than via workspace because
+# no other crate in the workspace consumes them yet.
+tiny_http = "0.12"
+webbrowser = "1"
+urlencoding = "2"
+base64 = "0.22"
+sha2 = "0.10"
+rand = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"

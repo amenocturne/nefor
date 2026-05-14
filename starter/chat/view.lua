@@ -102,7 +102,11 @@ function M.render(state)
   local popup_owns_keys = state.popup and (
     state.popup.variant == "tool_permission" or
     state.popup.variant == "model_picker" or
-    state.popup.variant == "session_picker"
+    state.popup.variant == "session_picker" or
+    state.popup.variant == "login_picker" or
+    state.popup.variant == "info" or
+    state.popup.variant == "warning" or
+    state.popup.variant == "error"
   )
   local input_focused = not popup_owns_keys
   local input_border_style = input_focused
@@ -183,6 +187,7 @@ function M.render(state)
       popups.message(state),
       popups.model_picker(state),
       popups.session_picker(state),
+      popups.login_picker(state),
       popups.tool_permission(state),
       -- Toast renders last so it sits above input, statusline, and
       -- every popup — non-blocking notifications must never be

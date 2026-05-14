@@ -167,11 +167,54 @@ function M.update(msg, state)
       }
     end
     if cmd == "login" or cmd == "logout" then
-      local body = { kind = "chat." .. cmd .. "_requested" }
-      if args and #args > 0 then body.provider = args end
-      return shallow_merge(state, { input_value = "", completion = NIL_SENTINEL }), {
-        { kind = "send_to", target = "engine", body = body },
-      }
+      if args and #args > 0 then
+        -- Direct path: refuse if the named provider doesn't advertise
+        -- a login flow. Avoids `/logout ollama` succeeding-silently the
+        -- same way the picker would have prevented.
+        local supports = (state.supports_login or {})[args]
+        if not supports then
+          return shallow_merge(state, {
+            input_value = "", completion = NIL_SENTINEL,
+            popup = {
+              variant = "warning",
+              title   = "/" .. cmd,
+              body    = "Provider `" .. args .. "` doesn't support " .. cmd .. ".",
+            },
+          }), {}
+        end
+        local body = { kind = "chat." .. cmd .. "_requested", provider = args }
+        return shallow_merge(state, { input_value = "", completion = NIL_SENTINEL }), {
+          { kind = "send_to", target = "engine", body = body },
+        }
+      end
+      -- No args — open the provider picker. Filter to providers that
+      -- advertise `supports_login` via chat.auth.status (so mock + ollama
+      -- with a static token aren't offered for a no-op login/logout).
+      -- For /login include any state; for /logout require state ==
+      -- connected (you can't log out from one you're not logged into).
+      local supports = state.supports_login or {}
+      local providers = {}
+      for n, st in pairs(state.auth or {}) do
+        if supports[n] then
+          if cmd == "logout" then
+            if st == "connected" then
+              providers[#providers + 1] = { name = n, state = st }
+            end
+          else
+            providers[#providers + 1] = { name = n, state = st }
+          end
+        end
+      end
+      table.sort(providers, function(a, b) return a.name < b.name end)
+      return shallow_merge(state, {
+        input_value = "", completion = NIL_SENTINEL,
+        popup = {
+          variant   = "login_picker",
+          mode      = cmd,                -- "login" | "logout"
+          providers = providers,
+          cursor    = 1,
+        },
+      }), {}
     end
     if cmd == "model" then
       if args and #args > 0 then
@@ -192,32 +235,32 @@ function M.update(msg, state)
         }
       end
       -- `/model` (no args) — open the picker and fan out one
-      -- chat.model.list_requested per connected provider so the popup
-      -- can aggregate results as they land. The adapter rejects
-      -- requests that don't name a provider, so we MUST fan out
-      -- per-provider here.
-      local connected = {}
+      -- chat.model.list_requested per *known* provider, connected or
+      -- not. Disconnected providers will respond with an empty list,
+      -- but their section still renders so the user sees what's
+      -- available behind a login.
+      local providers = {}
       for n, st in pairs(state.auth or {}) do
-        if st == "connected" then connected[#connected + 1] = n end
+        providers[#providers + 1] = { name = n, state = st, models = {} }
       end
-      table.sort(connected)
+      table.sort(providers, function(a, b) return a.name < b.name end)
       local awaiting = {}
-      for _, n in ipairs(connected) do awaiting[n] = true end
+      for _, prov in ipairs(providers) do awaiting[prov.name] = true end
       local effects = {}
-      for _, n in ipairs(connected) do
+      for _, prov in ipairs(providers) do
         effects[#effects + 1] = {
           kind = "send_to", target = "engine",
-          body = { kind = "chat.model.list_requested", provider = n },
+          body = { kind = "chat.model.list_requested", provider = prov.name },
         }
       end
       return shallow_merge(state, {
         input_value = "", completion = NIL_SENTINEL,
         popup = {
-          variant  = "model_picker",
-          models   = {},
-          query    = "",
-          cursor   = 1,
-          awaiting = awaiting,
+          variant   = "model_picker",
+          providers = providers,
+          query     = "",
+          cursor    = 1,
+          awaiting  = awaiting,
         },
       }), effects
     end
@@ -344,6 +387,19 @@ function M.update(msg, state)
     return state, {}
   end
 
+  -- Info / warning / error popups are dismiss-only and accept Esc,
+  -- Enter, or Q. Earlier the popup said "Esc / Q to close" but only
+  -- Esc was wired; Enter is the natural confirm key when the popup is
+  -- a notification.
+  if state.popup
+     and (state.popup.variant == "info"
+       or state.popup.variant == "warning"
+       or state.popup.variant == "error")
+     and (kind == "key.escape" or kind == "key.enter"
+       or kind == "key.q" or kind == "key.Q") then
+    return shallow_merge(state, { popup = NIL_SENTINEL }), {}
+  end
+
   if kind == "key.escape" then
     -- 1) close popup
     local has_toast = state.toasts and #state.toasts > 0
@@ -421,10 +477,27 @@ function M.update(msg, state)
   if state.popup and state.popup.variant == "model_picker"
      and kind:sub(1, 4) == "key." then
     local p = state.popup
+    -- Flatten provider sections into a list of selectable rows for
+    -- the picker widget. Filter each provider's models by the typed
+    -- query so cursor navigation only lands on visible models.
+    local q_lc = (p.query or ""):lower()
+    local flat_rows = {}
+    for _, prov in ipairs(p.providers or {}) do
+      for _, m in ipairs(prov.models or {}) do
+        local s = tostring(m):lower()
+        if q_lc == "" or s:find(q_lc, 1, true) ~= nil then
+          flat_rows[#flat_rows + 1] = { provider = prov.name, model = m }
+        end
+      end
+    end
     local result = W.picker.handle({
       state   = { cursor = p.cursor or 1, query = p.query or "" },
-      entries = function() return p.models or {} end,
-      filter  = function(_, q) return popups.model_picker_filter(p.models, q) end,
+      entries = function() return flat_rows end,
+      -- flat_rows is already query-filtered (matches the section view).
+      -- The widget's default_filter would re-filter via tostring(entry)
+      -- on each {provider, model} table → "table: 0x…" → zero matches
+      -- → arrow keys silently do nothing. Pass identity instead.
+      filter  = function(entries, _q) return entries end,
     }, msg)
     if result ~= nil then
       if result.selected ~= nil then
@@ -441,6 +514,37 @@ function M.update(msg, state)
         popup = shallow_merge(p, result.state),
       }), {}
     end
+  end
+
+  -- Login/logout picker: pick a provider to authenticate or revoke.
+  -- Emission kind switches on popup.mode ("login" → chat.login_requested,
+  -- "logout" → chat.logout_requested). No filter input — provider lists
+  -- stay short.
+  if state.popup and state.popup.variant == "login_picker"
+     and kind:sub(1, 4) == "key." then
+    local p = state.popup
+    local rows = p.providers or {}
+    local result = W.picker.handle({
+      state       = { cursor = p.cursor or 1 },
+      entries     = function() return rows end,
+      show_search = false,
+    }, msg)
+    if result ~= nil then
+      if result.selected ~= nil and result.selected.name then
+        local mode = p.mode or "login"
+        return shallow_merge(state, { popup = NIL_SENTINEL }), {
+          { kind = "send_to", target = "engine",
+            body = {
+              kind     = "chat." .. mode .. "_requested",
+              provider = result.selected.name,
+            } },
+        }
+      end
+      return shallow_merge(state, {
+        popup = shallow_merge(p, result.state),
+      }), {}
+    end
+    return state, {}
   end
 
   -- Session picker: same shape as model picker, no filter input. Esc
@@ -904,43 +1008,45 @@ function M.update(msg, state)
   end
 
   if kind == "chat.models.listed" then
-    -- A provider answered the list-request. Append into the open
-    -- model_picker popup if one is up; otherwise drop.
+    -- A provider answered the list-request. Update its section in
+    -- the open model_picker popup if one is up; otherwise drop.
     if not (state.popup and state.popup.variant == "model_picker") then
       return state, {}
     end
     local provider = msg.provider or ""
     local list = msg.models or {}
-    local prev = state.popup.models or {}
-    -- Append new (provider, model) pairs, dedup, then sort.
-    local seen = {}
-    for _, e in ipairs(prev) do
-      seen[(e.provider or "") .. "\0" .. (e.model or "")] = true
-    end
-    local merged = {}
-    for _, e in ipairs(prev) do merged[#merged + 1] = e end
+    local models = {}
     if type(list) == "table" then
-      for _, m in ipairs(list) do
-        local key = provider .. "\0" .. tostring(m)
-        if not seen[key] then
-          merged[#merged + 1] = { provider = provider, model = tostring(m) }
-          seen[key] = true
-        end
+      for _, m in ipairs(list) do models[#models + 1] = tostring(m) end
+    end
+    table.sort(models)
+    local new_providers = {}
+    local found = false
+    for _, prov in ipairs(state.popup.providers or {}) do
+      if prov.name == provider then
+        new_providers[#new_providers + 1] = shallow_merge(prov, { models = models })
+        found = true
+      else
+        new_providers[#new_providers + 1] = prov
       end
     end
-    table.sort(merged, function(a, b)
-      if a.provider == b.provider then return a.model < b.model end
-      return a.provider < b.provider
-    end)
-    -- Drop the answering provider from the awaiting set.
+    -- If the picker opened before this provider was known, append it.
+    -- State from chat.auth.status will fill in on the next status.
+    if not found then
+      new_providers[#new_providers + 1] = {
+        name = provider, state = state.auth and state.auth[provider] or "unknown",
+        models = models,
+      }
+      table.sort(new_providers, function(a, b) return a.name < b.name end)
+    end
     local prev_awaiting = state.popup.awaiting or {}
     local new_awaiting = {}
     for k, v in pairs(prev_awaiting) do new_awaiting[k] = v end
     new_awaiting[provider] = nil
     return shallow_merge(state, {
       popup = shallow_merge(state.popup, {
-        models   = merged,
-        awaiting = new_awaiting,
+        providers = new_providers,
+        awaiting  = new_awaiting,
       }),
     }), {}
   end
@@ -952,7 +1058,41 @@ function M.update(msg, state)
     local auth = {}
     for k, v in pairs(state.auth or {}) do auth[k] = v end
     auth[provider] = status
-    return shallow_merge(state, { auth = auth }), {}
+    -- Carry forward the provider's `supports_login` capability flag.
+    -- Default false: providers that don't set it on their auth.status
+    -- are hidden from the /login and /logout pickers.
+    local supports = {}
+    for k, v in pairs(state.supports_login or {}) do supports[k] = v end
+    if msg.supports_login ~= nil then
+      supports[provider] = msg.supports_login and true or false
+    end
+    -- If an open model picker has a section for this provider, update
+    -- its state so [connected]/[disconnected] tag re-colours live.
+    local new_popup = state.popup
+    if state.popup and state.popup.variant == "model_picker"
+       and state.popup.providers then
+      local found_section = false
+      local new_providers = {}
+      for _, prov in ipairs(state.popup.providers) do
+        if prov.name == provider then
+          found_section = true
+          new_providers[#new_providers + 1] = shallow_merge(prov, { state = status })
+        else
+          new_providers[#new_providers + 1] = prov
+        end
+      end
+      -- New provider not in the picker yet: insert (alphabetical).
+      if not found_section then
+        new_providers[#new_providers + 1] = {
+          name = provider, state = status, models = {},
+        }
+        table.sort(new_providers, function(a, b) return a.name < b.name end)
+      end
+      new_popup = shallow_merge(state.popup, { providers = new_providers })
+    end
+    return shallow_merge(state, {
+      auth = auth, supports_login = supports, popup = new_popup,
+    }), {}
   end
 
   if kind == "chat.tool.popup_request" then

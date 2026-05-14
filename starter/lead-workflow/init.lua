@@ -639,6 +639,23 @@ local function lead_workflow_tool_schemas()
               "Use `dependencies` (array of node ids) to wire up the DAG. " ..
               "Each dependency's structured-finalize output is auto-composed " ..
               "into the dependent node's prompt as context.",
+            -- OpenAI's Responses API server-side validates tool
+            -- schemas and rejects arrays without `items`. Lenient
+            -- providers (ollama) tolerate the omission; strict ones
+            -- 400 with "array schema missing items".
+            items = {
+              type = "object",
+              properties = {
+                id           = { type = "string" },
+                role         = { type = "string" },
+                agent_args   = { type = "object" },
+                dependencies = {
+                  type = "array",
+                  items = { type = "string" },
+                },
+              },
+              required = { "id", "role" },
+            },
           },
         },
         required = { "nodes" },

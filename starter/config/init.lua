@@ -49,6 +49,12 @@ M.active = {
       base_url     = "http://localhost:11434",
       extra_args   = {},
     },
+    {
+      kind = "chatgpt",
+      name = "chatgpt",
+      -- No `model` field: chatgpt-provider fetches the available list
+      -- from /models at runtime so the user picks via `/model`.
+    },
   },
 
   tool_gate = {

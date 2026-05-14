@@ -181,51 +181,127 @@ function M.session_picker(state)
   })
 end
 
+-- Model picker rendered as per-provider sections. Each provider gets:
+--
+--   <provider>  [connected]      ← green header for connected
+--     model-a
+--     model-b
+--
+--   <provider>  [disconnected]   ← red header for login_required/error
+--     (log in to load models)
+--
+-- Cursor navigates over the flat list of selectable model rows;
+-- section headers and placeholder text are visual-only and skipped.
+-- The text tag complements the colour so the picker stays readable in
+-- terminals without colour.
 function M.model_picker(state)
   if not state.popup or state.popup.variant ~= "model_picker" then return nil end
   local p = state.popup
-  local matches = M.model_picker_filter(p.models, p.query)
-  local prov_w = 0
-  for _, e in ipairs(matches) do
-    if e.provider and #e.provider > prov_w then prov_w = #e.provider end
-  end
-  if prov_w > 20 then prov_w = 20 end
+  local providers = p.providers or {}
+  local query_lc = (p.query or ""):lower()
 
-  local empty_text
-  if awaiting_count(p.awaiting) == 0 and (p.models == nil or #p.models == 0) then
-    empty_text = "No providers connected.\nWire one up in init.lua (see docs/provider-plugins.md)."
+  local function matches_query(model_name)
+    if query_lc == "" then return true end
+    return tostring(model_name):lower():find(query_lc, 1, true) ~= nil
   end
 
-  local picker_body = W.picker.view({
-    state          = { cursor = p.cursor or 1, query = p.query or "" },
-    entries        = function() return p.models or {} end,
-    filter         = function(_, q) return M.model_picker_filter(p.models, q) end,
-    format_entry   = function(e)
-      return string.format("%-" .. prov_w .. "s  %s", e.provider or "?", e.model or "?")
-    end,
-    cursor_style   = CURSOR_ROW_STYLE,
-    row_style      = STYLE.status,
-    search_style   = STYLE.status,
-    divider_style  = STYLE.footer,
-    empty_style    = STYLE.status_dim,
-    empty_text     = empty_text,
-    cap            = 12,
-    gap            = 0,
-  })
+  -- First pass: build the flat list of selectable rows so we can
+  -- clamp the cursor and map cursor→provider/model on Enter.
+  local flat_rows = {}
+  local section_models = {}  -- per-provider filtered model lists, parallel to providers[]
+  for pi, prov in ipairs(providers) do
+    local filtered = {}
+    for _, m in ipairs(prov.models or {}) do
+      if matches_query(m) then
+        filtered[#filtered + 1] = m
+        flat_rows[#flat_rows + 1] = { provider = prov.name, model = m }
+      end
+    end
+    section_models[pi] = filtered
+  end
 
-  local awaiting_n = awaiting_count(p.awaiting)
-  local children = compact {
-    picker_body,
-    (awaiting_n > 0) and tui.text {
-      content = string.format("loading from %d provider(s)…", awaiting_n),
-      style   = STYLE.status_dim,
+  local cursor = p.cursor or 1
+  if cursor < 1 then cursor = 1 end
+  if #flat_rows > 0 and cursor > #flat_rows then cursor = #flat_rows end
+
+  local function state_tag(s)
+    if s == "connected"      then return "[connected]"    end
+    if s == "login_required" then return "[disconnected]" end
+    if s == "error"          then return "[disconnected]" end
+    return "[" .. tostring(s or "unknown") .. "]"
+  end
+
+  local function header_style(s)
+    if s == "connected" then return STYLE.status_ok end
+    return STYLE.status_danger
+  end
+
+  local children = {}
+  children[#children + 1] = tui.text {
+    content = "search: " .. (p.query or ""),
+    style   = STYLE.status, wrap = "none",
+  }
+  children[#children + 1] = tui.text {
+    content = string.rep("─", 40),
+    style   = STYLE.footer, wrap = "none",
+  }
+
+  if #providers == 0 then
+    children[#children + 1] = tui.text {
+      content = "No providers registered.",
+      style   = STYLE.status_dim, wrap = "word",
+    }
+  end
+
+  -- Tracks the cursor's position in flat_rows so we can highlight the
+  -- right model row during the per-section render pass.
+  local flat_idx = 0
+
+  for pi, prov in ipairs(providers) do
+    if pi > 1 then
+      children[#children + 1] = tui.text {
+        content = "", style = STYLE.status, wrap = "none",
+      }
+    end
+    children[#children + 1] = tui.text {
+      content = prov.name .. "  " .. state_tag(prov.state),
+      style   = header_style(prov.state),
       wrap    = "none",
-    } or nil,
-    tui.text {
-      content = "↑/↓ select · Enter pick · Esc close · type to filter",
-      style   = STYLE.status_dim,
-      wrap    = "none",
-    },
+    }
+    local filtered = section_models[pi]
+    if #filtered == 0 then
+      local hint
+      if prov.state == "connected" then
+        if p.awaiting and p.awaiting[prov.name] then
+          hint = "  (loading…)"
+        elseif query_lc ~= "" then
+          hint = "  (no matches)"
+        else
+          hint = "  (no models)"
+        end
+      else
+        hint = "  (log in to load models)"
+      end
+      children[#children + 1] = tui.text {
+        content = hint, style = STYLE.status_dim, wrap = "none",
+      }
+    else
+      for _, m in ipairs(filtered) do
+        flat_idx = flat_idx + 1
+        local style = (flat_idx == cursor) and CURSOR_ROW_STYLE or STYLE.status
+        children[#children + 1] = tui.text {
+          content = "  " .. m, style = style, wrap = "none",
+        }
+      end
+    end
+  end
+
+  children[#children + 1] = tui.text {
+    content = "", style = STYLE.status, wrap = "none",
+  }
+  children[#children + 1] = tui.text {
+    content = "↑/↓ select · Enter pick · Esc close · type to filter",
+    style   = STYLE.status_dim, wrap = "none",
   }
 
   return W.popup.view({
@@ -236,7 +312,77 @@ function M.model_picker(state)
     scroll_key   = "popup_model_picker",
     title        = "── pick a model ──",
     title_style  = STYLE.popup_user,
-    child        = tui.column { gap = 1, children = children },
+    child        = tui.column { gap = 0, children = children },
+  })
+end
+
+-- Provider login picker. Lists every provider the engine knows about
+-- with its current auth state as a right-aligned tag so the user can
+-- pick which one to authenticate. Selection emits
+-- `chat.login_requested` or `chat.logout_requested` depending on
+-- `popup.mode` ("login" or "logout"; defaults to "login").
+function M.login_picker(state)
+  if not state.popup or state.popup.variant ~= "login_picker" then return nil end
+  local p = state.popup
+  local mode = p.mode or "login"
+  local rows = p.providers or {}
+  local prov_w = 0
+  for _, r in ipairs(rows) do
+    if #r.name > prov_w then prov_w = #r.name end
+  end
+  if prov_w > 20 then prov_w = 20 end
+
+  local function state_tag(s)
+    if s == "connected"      then return "[connected]" end
+    if s == "login_required" then return "[log in]"    end
+    if s == "error"          then return "[error]"     end
+    return "[" .. tostring(s or "unknown") .. "]"
+  end
+
+  local empty_text
+  if #rows == 0 then
+    if mode == "logout" then
+      empty_text = "No connected providers to log out from."
+    else
+      empty_text = "No providers registered yet."
+    end
+  end
+
+  local title  = (mode == "logout") and "── log out from provider ──" or "── log in to provider ──"
+  local footer = (mode == "logout")
+    and "↑/↓ select · Enter logout · Esc cancel"
+    or  "↑/↓ select · Enter login · Esc cancel"
+
+  local picker_body = W.picker.view({
+    state          = { cursor = p.cursor or 1 },
+    entries        = function() return rows end,
+    format_entry   = function(r)
+      return string.format("%-" .. prov_w .. "s  %s", r.name, state_tag(r.state))
+    end,
+    cursor_style   = CURSOR_ROW_STYLE,
+    row_style      = STYLE.status,
+    show_search    = false,
+    empty_style    = STYLE.status_dim,
+    empty_text     = empty_text,
+    cap            = 12,
+    gap            = 0,
+  })
+
+  return W.popup.view({
+    open         = true,
+    border_style = STYLE.popup_user,
+    width        = "50%",
+    height       = "40%",
+    scroll_key   = "popup_login_picker",
+    title        = title,
+    title_style  = STYLE.popup_user,
+    child        = tui.column { gap = 1, children = {
+      picker_body,
+      tui.text {
+        content = footer,
+        style   = STYLE.status_dim, wrap = "none",
+      },
+    }},
   })
 end
 
@@ -251,6 +397,7 @@ function M.scroll_key(variant)
   if variant == "tool_permission" then return "popup_tool_permission" end
   if variant == "model_picker"    then return "popup_model_picker" end
   if variant == "session_picker"  then return "popup_session_picker" end
+  if variant == "login_picker"    then return "popup_login_picker" end
   return nil
 end
 

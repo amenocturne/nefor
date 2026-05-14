@@ -1,0 +1,98 @@
+//! Domain errors for chatgpt-provider.
+
+#[derive(Debug, thiserror::Error)]
+pub enum ChatgptError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error("HTTP transport error: {0}")]
+    Http(#[from] reqwest::Error),
+
+    #[error("JSON parse error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    /// JWT claim payload could not be base64url-decoded.
+    #[error("invalid base64 in JWT: {0}")]
+    Base64(#[from] base64::DecodeError),
+
+    /// JWT did not have three dot-separated segments, or the payload
+    /// segment was missing.
+    #[error("malformed JWT: {0}")]
+    MalformedJwt(&'static str),
+
+    /// Loopback callback server bind failed on both the preferred and
+    /// fallback ports.
+    #[error("could not bind loopback OAuth callback server: {0}")]
+    BindFailed(String),
+
+    /// The OAuth `state` parameter on the callback did not match the
+    /// value we sent in the authorize URL — treat as a possible CSRF
+    /// attempt and abort.
+    #[error("OAuth state parameter mismatch on /auth/callback")]
+    StateMismatch,
+
+    /// Server returned the `error` query param on the callback (e.g.
+    /// `access_denied`).
+    #[error("OAuth callback returned error: {0}")]
+    CallbackError(String),
+
+    /// Token endpoint returned a non-2xx response.
+    #[error("token endpoint returned {status}: {body}")]
+    TokenEndpoint { status: u16, body: String },
+
+    /// `data_dir` could not be resolved — neither `$NEFOR_DATA_DIR` is
+    /// set nor does the platform expose a user data directory.
+    #[error("could not resolve $NEFOR_DATA_DIR or platform data dir")]
+    DataDirUnavailable,
+
+    /// `current_access_token()` was called but the store is in
+    /// `LoginRequired` — caller must drive the OAuth flow first.
+    #[error("no tokens on disk; run `chatgpt-provider login` first")]
+    NoTokens,
+
+    /// Refresh-token exchange failed (likely refresh token expired or
+    /// revoked).
+    #[error("refresh failed: {0}")]
+    RefreshFailed(String),
+
+    /// The Responses endpoint returned a non-2xx status with the body
+    /// captured for diagnostics. Surfaced before any SSE frame is
+    /// yielded.
+    #[error("responses endpoint returned {status}: {body}")]
+    ResponsesEndpoint { status: u16, body: String },
+
+    /// Mid-stream transport failure (TCP reset, idle timeout, decoder
+    /// error). The string carries a one-line summary suitable for the
+    /// caller's error frame.
+    #[error("responses SSE stream error: {0}")]
+    ResponsesStream(String),
+
+    /// `Authorization: Bearer ...` could not be constructed because the
+    /// access token contained bytes that aren't valid in an HTTP header
+    /// value. Shouldn't happen with real OAuth tokens — defensive.
+    #[error("could not build Authorization header: {0}")]
+    InvalidHeader(String),
+
+    /// Engine rejected our ready handshake, or closed before replying.
+    #[error("ready failed: {0}")]
+    ReadyFailed(String),
+
+    /// Stdin closed before we saw `ready_ok`.
+    #[error("engine closed stdio before ready_ok")]
+    ReadyClosed,
+
+    /// Wire-format decode failure we could not recover from.
+    #[error("protocol parse error: {0}")]
+    Parse(#[from] nefor_protocol::ParseError),
+
+    /// The writer task exited before the outgoing channel drained.
+    #[error("stdout writer closed before outgoing message was delivered")]
+    WriterClosed,
+
+    /// Bubbled out of a chats-map operation. The dispatcher catches and
+    /// translates these into wire-level error events; surfacing it as a
+    /// top-level error variant means production code paths don't have
+    /// to `unwrap` a Result<_, ChatsError>.
+    #[error("chat operation failed: {0}")]
+    Chats(#[from] crate::state::ChatsError),
+}
