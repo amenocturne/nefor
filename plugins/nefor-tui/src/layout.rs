@@ -282,7 +282,7 @@ fn paint_spans(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
 // ── Markdown ─────────────────────────────────────────────────────────────
 
 fn layout_markdown(inst: &mut WidgetInstance, c: Constraints) -> Size {
-    let chars = render_markdown_chars(inst);
+    let chars = render_markdown_chars(inst, c.max_width);
     let wrap = match &inst.last_desc {
         WidgetDescription::Markdown { wrap, .. } => *wrap,
         _ => WrapMode::Word,
@@ -292,7 +292,7 @@ fn layout_markdown(inst: &mut WidgetInstance, c: Constraints) -> Size {
 }
 
 fn paint_markdown(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
-    let chars = render_markdown_chars(inst);
+    let chars = render_markdown_chars(inst, rect.width);
     let wrap = match &inst.last_desc {
         WidgetDescription::Markdown { wrap, .. } => *wrap,
         _ => WrapMode::Word,
@@ -301,10 +301,18 @@ fn paint_markdown(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) 
     paint_styled_rows(&rows, rect, out);
 }
 
-fn render_markdown_chars(inst: &WidgetInstance) -> Vec<StyledChar> {
+fn render_markdown_chars(inst: &WidgetInstance, available_width: u16) -> Vec<StyledChar> {
     match &inst.last_desc {
         WidgetDescription::Markdown { source, theme, .. } => {
-            crate::markdown::render_to_styled_chars(source, theme.as_ref())
+            // 0 = unconstrained (loose constraints with no parent budget);
+            // pass `None` so the table renderer falls back to natural widths
+            // rather than collapsing every column to the floor.
+            let aw = if available_width == 0 {
+                None
+            } else {
+                Some(available_width as usize)
+            };
+            crate::markdown::render_to_styled_chars(source, theme.as_ref(), aw)
         }
         _ => Vec::new(),
     }
@@ -1855,6 +1863,15 @@ pub fn wrap_styled(chars: &[StyledChar], width: u16, wrap: WrapMode) -> Vec<Vec<
 
     let mut wrapped: Vec<Vec<StyledChar>> = Vec::new();
     for raw in logical {
+        // Empty logical lines (consecutive `\n`s) carry the markdown
+        // walker's block separators. Preserve them as empty visual rows
+        // so blank lines actually render between blocks — without this
+        // passthrough, `wrap_styled_word`/`_char` produce zero rows for
+        // empty input and the spacing collapses.
+        if raw.is_empty() {
+            wrapped.push(Vec::new());
+            continue;
+        }
         match wrap {
             WrapMode::None => wrapped.push(take_styled_columns(&raw, limit)),
             WrapMode::Char => wrapped.extend(wrap_styled_char(&raw, limit)),
@@ -1912,6 +1929,27 @@ fn wrap_styled_word(line: &[StyledChar], limit: usize) -> Vec<Vec<StyledChar>> {
     let mut col = 0usize;
     for word in split_styled_words(line) {
         let ww: usize = word.iter().map(|c| char_width(c.ch)).sum();
+        let is_ws = word.iter().all(|c| c.ch.is_whitespace());
+
+        // Word doesn't fit on the current line — flush before we decide
+        // what to do with it.
+        if col > 0 && col + ww > limit {
+            out.push(std::mem::take(&mut current));
+            col = 0;
+            if is_ws {
+                // Skip pure-whitespace words at line starts so we don't
+                // leave a trailing-space artefact at the start of the
+                // next line.
+                continue;
+            }
+        }
+
+        // Word is wider than the line itself — fall back to char wrap so
+        // it doesn't overflow. Order matters: this check runs AFTER the
+        // flush above so a long word arriving mid-line first gets pushed
+        // to its own line, then char-wrapped from there. The previous
+        // version only caught oversized words that started at col == 0
+        // by coincidence, leaving mid-line oversized words to overflow.
         if col == 0 && ww > limit {
             for sub in wrap_styled_char(word, limit) {
                 out.push(sub);
@@ -1920,13 +1958,7 @@ fn wrap_styled_word(line: &[StyledChar], limit: usize) -> Vec<Vec<StyledChar>> {
             col = 0;
             continue;
         }
-        if col + ww > limit {
-            out.push(std::mem::take(&mut current));
-            col = 0;
-            if word.iter().all(|c| c.ch.is_whitespace()) {
-                continue;
-            }
-        }
+
         current.extend_from_slice(word);
         col += ww;
     }
@@ -2097,8 +2129,26 @@ fn wrap_word(line: &str, width: u16) -> Vec<String> {
     let mut col = 0usize;
     for word in split_keeping_spaces(line) {
         let ww = string_width(word);
+        let is_ws = word.chars().all(char::is_whitespace);
+
+        // Word doesn't fit on the current line — flush before deciding
+        // what to do with it.
+        if col > 0 && col + ww > limit {
+            out.push(std::mem::take(&mut current));
+            col = 0;
+            if is_ws {
+                // Skip pure-whitespace words at line starts so we don't
+                // leave a trailing-space artefact.
+                continue;
+            }
+        }
+
+        // Word is wider than the line itself — char-wrap it. Runs AFTER
+        // the flush so mid-line oversized words first get pushed to their
+        // own line, then char-wrapped. The previous version only caught
+        // oversized words that arrived with col == 0 by coincidence,
+        // leaving mid-line oversized words to overflow.
         if col == 0 && ww > limit {
-            // Word longer than the line — char-wrap it on its own row(s).
             for sub in wrap_char(word, width) {
                 out.push(sub);
             }
@@ -2106,15 +2156,7 @@ fn wrap_word(line: &str, width: u16) -> Vec<String> {
             col = 0;
             continue;
         }
-        if col + ww > limit {
-            out.push(std::mem::take(&mut current));
-            col = 0;
-            // Skip pure-whitespace words at line starts to avoid leaving
-            // a trailing-space artefact at the start of the new line.
-            if word.chars().all(char::is_whitespace) {
-                continue;
-            }
-        }
+
         current.push_str(word);
         col += ww;
     }
@@ -2851,7 +2893,11 @@ mod tests {
         let rows = wrap_text("abcdefghij", 4, WrapMode::Word);
         assert_eq!(
             rows,
-            vec!["abcd".to_string(), "efgh".to_string(), "ij".to_string(),]
+            vec![
+                "abcd".to_string(),
+                "efgh".to_string(),
+                "ij".to_string(),
+            ]
         );
     }
 
