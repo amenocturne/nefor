@@ -784,6 +784,16 @@ return {
   receive_msg = receive_msg,
   send_msg    = function(_) end,
 
+  -- Public: pre-execution gate check for `dispatch-graph` args. Returns
+  -- nil if the call would be allowed, or a rejection-reason string if
+  -- it would be auto-rejected by `dispatch_graph` (writer roles without
+  -- an approved plan). The tool-validator uses this to suppress the
+  -- approval popup for invocations that are guaranteed to fail —
+  -- otherwise the UX is "agent calls tool → user clicks approve →
+  -- chat shows rejection", which feels broken. Same semantics as the
+  -- internal check; safe to call multiple times per invocation.
+  gate_against_unapproved_plan = gate_against_unapproved_plan,
+
   _internals = {
     state = state,
     SOURCE_NAME = SOURCE_NAME,

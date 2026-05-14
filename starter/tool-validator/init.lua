@@ -22,6 +22,15 @@
 --   --git read,add,commit,restore-staged,tag,fetch,pull,push
 --   --cargo local
 --
+-- `dispatch-graph`: asks lead-workflow whether the args would be
+-- auto-rejected (writer roles without an approved plan). On a sure
+-- rejection we deny here so the user never sees a popup for an
+-- invocation that's about to be turned down — without this the UX
+-- would be "agent calls tool → popup → user approves → chat shows
+-- rejection". The rejection reason rides through tool-gate's
+-- permission_response.reason → tool.result.error so the agent learns
+-- exactly what to do next.
+--
 -- Other tools: always defer to the user (no per-tool policy yet). They
 -- still get popped up; the validator is just the routing seam.
 --
@@ -73,12 +82,16 @@ local function probe_da()
   return da_available
 end
 
-local function emit_response(id, decision)
-  emit(nil, {
+local function emit_response(id, decision, reason)
+  local body = {
     kind     = "tool.permission_response",
     id       = id,
     decision = decision,
-  })
+  }
+  if type(reason) == "string" and #reason > 0 then
+    body.reason = reason
+  end
+  emit(nil, body)
 end
 
 local function emit_popup(body)
@@ -89,6 +102,26 @@ local function emit_popup(body)
     tool = body.tool or body.name,
     args = body.args,
   })
+end
+
+-- Pre-execution gate check for `dispatch-graph`. Asks lead-workflow
+-- whether the args would be auto-rejected; if so, returns the rich
+-- rejection reason so the popup can be skipped. Returns:
+--   nil          — args look fine, fall through to popup
+--   string reason — auto-deny with this message
+-- Tolerates lead-workflow not being loaded (returns nil) so the
+-- validator stays useful even when the lead-workflow actor isn't
+-- spawned (e.g. minimal test setups).
+local function classify_dispatch_graph(args)
+  local ok, lw = pcall(require, "lead-workflow")
+  if not ok or type(lw) ~= "table" then return nil end
+  local check = lw.gate_against_unapproved_plan
+  if type(check) ~= "function" then return nil end
+  local nodes = args and args.nodes
+  if type(nodes) ~= "table" then return nil end
+  local rejection = check(nodes)
+  if type(rejection) == "string" and #rejection > 0 then return rejection end
+  return nil
 end
 
 -- Classify a bash command through da. Returns one of:
@@ -126,6 +159,13 @@ local function handle_permission_request(body)
       return
     end
     -- defer: fall through to popup.
+  elseif tool == "dispatch-graph" then
+    local rejection = classify_dispatch_graph(args)
+    if rejection ~= nil then
+      emit_response(id, "deny", rejection)
+      return
+    end
+    -- pass: fall through to popup so the user still confirms execution.
   end
 
   emit_popup(body)
@@ -155,6 +195,7 @@ return {
 
   _internals = {
     classify_bash             = classify_bash,
+    classify_dispatch_graph   = classify_dispatch_graph,
     handle_permission_request = handle_permission_request,
     reset = function() da_available = nil end,
   },
