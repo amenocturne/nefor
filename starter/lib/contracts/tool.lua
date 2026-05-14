@@ -49,18 +49,13 @@ end
 
 local declared = false
 
--- Idempotent: subscribe once.
+-- Idempotent: emit once. See lib/contracts/provider.lua's docstring —
+-- the emission lands as a step-origin LogEntry; combinators sees it via
+-- ncp.lua's replay-on-attach when it readies.
 function M.declare()
   if declared then return end
   declared = true
-  local fired = false
-  if nefor.bus and nefor.bus.on_event then
-    nefor.bus.on_event("combinators.ready", function(_)
-      if fired then return end
-      fired = true
-      emit_register()
-    end)
-  end
+  emit_register()
 end
 
 -- Test escape hatch.

@@ -1,62 +1,62 @@
 -- starter/nefor-tui/init.lua — wrapper actor for the nefor-tui Rust
 -- binary.
 --
--- Constructor returns the actor spec for the declarative TUI plugin
--- (`bin/nefor-tui --script chat.lua`). The wrapper's only job is
--- envelope filtering at ingress: certain `chat.*` envelopes the TUI
--- emits are consumed entirely by the agentic-loop and shouldn't fan
--- out to other plugins. Without filtering, the openai-provider
--- wrapper's `to_plugin` translates `chat.input.submit` → `<prefix>.
--- prompt` and ships it to the provider — duplicating the user prompt
--- on every turn.
+-- ## from_plugin (binary → bus)
 --
--- The agentic-loop subscribes to the same envelopes via its actor
--- `receive_msg` (broadcast-bus dispatch), so dropping at ingress is
--- safe: the loop already saw the envelope by the time we return nil.
+-- Republish every TUI emission verbatim onto the bus. The agentic-loop
+-- subscribes via `nefor.bus.on_event` and reacts; other wrappers
+-- (provider, tool-gate) see the same envelopes and decide whether to
+-- forward them to their peer. The Phase-3 architecture means the
+-- provider wrapper's `to_plugin` no longer translates
+-- `chat.input.submit` → `<prefix>.prompt` (the orchestration goes
+-- through `tool.invoke` instead), so the previous "drop these kinds at
+-- ingress" guard isn't needed.
 --
--- This wrapper has no `to_plugin` — outbound envelopes targeted at
--- nefor-tui (chat.message.append, chat.stream.delta, …) flow through
--- as-is.
+-- ## to_plugin (bus → binary)
+--
+-- Deliver verbatim, skipping self-emissions only. No translation —
+-- chat.message.append / chat.stream.delta / etc. flow through to the
+-- TUI as-is.
+--
+-- Unlike the other wrappers, this one DOES NOT short-circuit on
+-- `replay_window.active()`. The TUI surface needs every replayed
+-- envelope so chat.lua can rebuild its transcript on resume — that is
+-- the entire point of the resume UX. Replay-side suppression of fresh
+-- side effects (popups for previously-approved tools, fresh DAG-panel
+-- mutations from observation envelopes, etc.) lives INSIDE the chat.
+-- lua reducer, gated by `state.replay_mode` which the reducer flips
+-- on `sessions.replay.start` / `sessions.replay.end`. The other
+-- wrappers (tool-gate, openai-provider, …) do skip during replay
+-- because their peer plugins would treat the replayed envelopes as
+-- fresh invocations and produce duplicate side effects (Bug 5).
+
+local json = nefor.json
 
 local M = {}
-
--- Envelopes the TUI emits that the agentic-loop fully owns. Returning
--- nil from from_plugin drops them from the broadcast fan-out, so
--- sibling plugins (provider, tool-gate, reasoner-graph) don't see
--- them. The agentic-loop already received them via its own bus
--- subscription before this filter runs.
---
--- Why each one:
---   * chat.input.submit  — the loop emits the right downstream traffic
---                          (reasoner-graph.run + user echo). Letting
---                          it broadcast also triggers openai-provider's
---                          outer_to, which would send a stray
---                          <prefix>.prompt to the provider.
---   * chat.interrupt_all — the loop owns cancel_all() fan-out. The
---                          wrapper used to call it directly via
---                          for_chat; same coupling lifted into the
---                          loop's receive_msg.
-local TUI_DROP_KINDS = {
-  ["chat.input.submit"]  = true,
-  ["chat.interrupt_all"] = true,
-}
 
 function M.spawn_spec(command)
   assert(type(command) == "table", "nefor-tui.spawn_spec: command required")
 
   local function from_plugin(env)
-    if env.type ~= "event" or type(env.body) ~= "table" then return env end
-    local kind = env.body.kind
-    if type(kind) == "string" and TUI_DROP_KINDS[kind] then
-      return nil
-    end
-    return env
+    if type(env.body) ~= "table" then return end
+    nefor.engine.send(json.encode({
+      type = "event",
+      from = env.from or "nefor-tui",
+      ts   = nefor.engine.now(),
+      body = env.body,
+    }))
+  end
+
+  local function to_plugin(env)
+    if env.from == "nefor-tui" then return end
+    nefor.engine.deliver("nefor-tui", json.encode(env))
   end
 
   return {
     name        = "nefor-tui",
     command     = command,
     from_plugin = from_plugin,
+    to_plugin   = to_plugin,
     receive_msg = function(_) end,
   }
 end

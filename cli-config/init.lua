@@ -33,6 +33,10 @@ function dispatch(current_log)
   ncp.dispatch(current_log)
 end
 
+function invoke_from_plugin(source, payload)
+  ncp.invoke_from_plugin(source, payload)
+end
+
 actor.install()
 actor.spawn(sessions)
 sessions.init()

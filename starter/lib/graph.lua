@@ -49,20 +49,21 @@ end
 
 function M.build_orchestrator_graph(opts)
   opts = opts or {}
-  local provider = opts.provider or "ollama"
-  local model = opts.model
   local system = opts.system or ""
   local user_text = opts.user_text or ""
 
+  -- Provider + model are NOT baked into wrap_args. The picker (state.config
+  -- on agentic-loop) is the single source of truth: every reasoner firing
+  -- — orchestrator wrap + every responder/dummy/etc. node spawned via
+  -- spawn_graph — falls through `provider_run_node`'s `args.provider or
+  -- cfg.provider` precedence to the live config. Per-node routing is still
+  -- opt-in: a caller that wants a specific provider/model on a specific
+  -- node sets args.provider / args.model on that node explicitly.
   local wrap_args = {
-    provider = provider,
-    prompt   = user_text,
+    prompt = user_text,
   }
   if type(system) == "string" and #system > 0 then
     wrap_args.system = system
-  end
-  if type(model) == "string" and #model > 0 then
-    wrap_args.model = model
   end
 
   return {

@@ -23,17 +23,30 @@
 --
 -- ## Public bus protocol
 --
--- Four control events. None are persisted (anything whose body.kind
+-- Six control events. None are persisted (anything whose body.kind
 -- starts with `sessions.` is dropped from disk).
 --
 --   sessions.session_start { session_id, from_resume? }
 --   sessions.session_end   { session_id }
+--   sessions.replay.start  { session_id, count }
+--   sessions.replay.end    { session_id }
 --   sessions.resume_done   { session_id, replayed }
 --     ↑ emitted
 --
 --   sessions.resume_request { session_id }
 --   sessions.new_request    { }
 --     ↑ consumed
+--
+-- ## Replay window
+--
+-- `replay.start` / `replay.end` frame the burst of replayed envelopes.
+-- The runtime gate (in `ncp.lua`) suppresses bus→Rust forwarding inside
+-- the window so Rust plugins never see replayed traffic; pure-Lua
+-- actors get the replay normally via `nefor.bus.on_event` and rebuild
+-- their state. Sessions itself ALSO drops persistence between the
+-- markers — pure-Lua actors may emit derived envelopes during state
+-- rebuild, and persisting those would duplicate state on next resume.
+-- The persist rule is "live traffic only."
 --
 -- ## On-disk path
 --
@@ -62,22 +75,15 @@ local state = {
   -- file, or (b) any envelope is persisted to it.
   should_prune_session = true,
 
-  -- Re-entrance guard for resume. A bus consumer that emits during a
-  -- resume can circle back through `sessions.resume_request` /
-  -- `sessions.new_request` and re-trigger; without this guard the
-  -- result is a runaway cascade. Phase 2 closes the cascade class
-  -- structurally (porting agentic_workflow); the guard goes away then.
-  resume_in_progress = false,
-
   initialised = false,
 
-  -- Synchronous resume-phase hook registry. Phase 1 compat for
-  -- agentic_workflow's `replay_mode` flip; goes away in Phase 2.
-  resume_phase_hooks = {
-    session_end   = {},
-    session_start = {},
-    resume_done   = {},
-  },
+  -- Replay-window flag — flipped by receive_msg when our own
+  -- `sessions.replay.start` / `sessions.replay.end` markers re-enter
+  -- through the bus. While true, `persist_envelope` drops everything:
+  -- pure-Lua actors may emit derived envelopes during replay-driven
+  -- state rebuild, and persisting those would duplicate state on the
+  -- next resume. The rule is "persist live traffic only."
+  in_replay_window = false,
 }
 
 -- ------------------------------------------------------------------
@@ -208,6 +214,14 @@ end
 local function persist_envelope(entry)
   if not state.current_session_file then return end
 
+  -- Drop everything inside the replay window. Pure-Lua actors process
+  -- replayed envelopes (via bus.on_event) and may emit derived ones —
+  -- persisting those would duplicate state on next resume. The window
+  -- is bounded by `sessions.replay.start` / `sessions.replay.end`,
+  -- which receive_msg uses to toggle `in_replay_window`. The markers
+  -- themselves fall through to the `sessions.*` filter below.
+  if state.in_replay_window then return end
+
   -- Drop sessions.* control events. They're starter-internal lifecycle
   -- signals, not session content.
   local ok, decoded = pcall(json.decode, entry.payload)
@@ -234,6 +248,28 @@ end
 -- resume — re-broadcast every step-origin entry to its original target
 -- ------------------------------------------------------------------
 
+-- Pre-pass: count the step-origin entries that would be replayed. Used
+-- to populate `sessions.replay.start { count }`. Cheaper than buffering
+-- the whole file: one extra read of the JSONL with a substring check
+-- before per-line decode (decode is unavoidable to filter step-origin).
+---@param path string
+---@return integer count
+local function count_replay_entries(path)
+  local fh = io.open(path, "r")
+  if not fh then return 0 end
+  local count = 0
+  for line in fh:lines() do
+    if line:sub(1, 12) ~= [[{"_session":]] then
+      local ok, decoded = pcall(json.decode, line)
+      if ok and decoded.origin == "step" then
+        count = count + 1
+      end
+    end
+  end
+  fh:close()
+  return count
+end
+
 ---@param path string
 ---@return integer count
 local function replay_jsonl(path)
@@ -245,11 +281,18 @@ local function replay_jsonl(path)
     -- Skip the header (cheap substring; full parse only on entries).
     if line:sub(1, 12) ~= [[{"_session":]] then
       local ok, decoded = pcall(json.decode, line)
-      if ok and decoded.origin == "step" and decoded.target then
+      -- Replay every step-origin entry — those are the dispatch hook's
+      -- outbound emissions. Both targeted (`target` set) and broadcast
+      -- (`target` nil) shapes round-trip via send_msg's
+      -- replay_envelope path: nefor.engine.send(payload, target?) with
+      -- target=nil broadcasts and a string targets one peer. Plugin-
+      -- origin entries are inputs — we don't re-emit them, peers re-
+      -- announce themselves on connect.
+      if ok and decoded.origin == "step" then
         send_msg({
           kind    = "replay_envelope",
           payload = decoded.payload,
-          target  = decoded.target,
+          target  = decoded.target,  -- may be nil (broadcast)
         })
         count = count + 1
       end
@@ -259,41 +302,17 @@ local function replay_jsonl(path)
   return count
 end
 
----@param phase "session_end"|"session_start"|"resume_done"
----@param session_id string|nil
-local function fire_resume_phase(phase, session_id)
-  for _, fn in ipairs(state.resume_phase_hooks[phase]) do
-    local ok, err = pcall(fn, session_id)
-    if not ok and nefor.log then
-      nefor.log.error("sessions: resume-phase hook raised", {
-        phase = phase, error = tostring(err),
-      })
-    end
-  end
-end
-
 -- ------------------------------------------------------------------
 -- resume + new
 -- ------------------------------------------------------------------
 
 ---@param target_session_id string
 local function do_resume(target_session_id)
-  if state.resume_in_progress then
-    if nefor.log then
-      nefor.log.warn("sessions.resume: re-entrant call dropped", {
-        requested        = target_session_id,
-        currently_active = state.current_session_id,
-      })
-    end
-    return
-  end
   if state.current_session_id == target_session_id then
     return  -- no-op resume
   end
-  state.resume_in_progress = true
 
   -- 1. Announce end of outgoing session.
-  fire_resume_phase("session_end", state.current_session_id)
   send_msg({ kind = "control", event = "sessions.session_end",
              extra = { session_id = state.current_session_id } })
 
@@ -316,19 +335,28 @@ local function do_resume(target_session_id)
   end
 
   -- 3. Announce start of incoming session BEFORE replay.
-  fire_resume_phase("session_start", target_session_id)
   send_msg({ kind = "control", event = "sessions.session_start",
              extra = { session_id = target_session_id, from_resume = true } })
 
-  -- 4. Replay.
+  -- 4. Replay framed by start/end markers. Per-wrapper replay-skip
+  -- (lib/replay_window) suppresses bus→peer side effects inside the
+  -- window; pure-Lua actors get the replay normally and rebuild
+  -- state. Sessions' own persistence path also drops envelopes inside
+  -- the window — see `in_replay_window` flag toggled in receive_msg.
+  -- The window flag's `to_plugin`-side toggle is owned by ncp.dispatch
+  -- (it sees the framing markers in entry order and flips the flag
+  -- inline before calling `to_plugin` for each entry — bus.on_event
+  -- subscribers fire too late for the same batch).
+  local total = new_path and count_replay_entries(new_path) or 0
+  send_msg({ kind = "control", event = "sessions.replay.start",
+             extra = { session_id = target_session_id, count = total } })
   local replayed = new_path and replay_jsonl(new_path) or 0
+  send_msg({ kind = "control", event = "sessions.replay.end",
+             extra = { session_id = target_session_id } })
 
   -- 5. Coalesced "we're back" signal.
-  fire_resume_phase("resume_done", target_session_id)
   send_msg({ kind = "control", event = "sessions.resume_done",
              extra = { session_id = target_session_id, replayed = replayed } })
-
-  state.resume_in_progress = false
 end
 
 local function do_new()
@@ -422,22 +450,27 @@ local function receive_msg(entry)
     return
   end
 
+  -- Replay-window markers — flip the persistence-skip flag. The
+  -- marker emissions are sessions's own (via send_msg in do_resume);
+  -- they round-trip through the bus and arrive here on a later tick,
+  -- which is exactly when the persistence handler needs the flag set
+  -- to drop derived emissions from pure-Lua actors processing the
+  -- replay. Markers themselves are not persisted (sessions.* filter
+  -- below).
+  if kind == "sessions.replay.start" then
+    state.in_replay_window = true
+    return
+  end
+  if kind == "sessions.replay.end" then
+    state.in_replay_window = false
+    return
+  end
+
   -- Drop sessions.* control events from persistence.
   if type(kind) == "string" and kind:sub(1, 9) == "sessions." then return end
 
   -- Everything else: persist.
   persist_envelope(entry)
-end
-
--- ------------------------------------------------------------------
--- on_resume_phase — synchronous hook registry (Phase 1 compat)
--- ------------------------------------------------------------------
-
----@param phase "session_end"|"session_start"|"resume_done"
----@param fn function
-local function on_resume_phase(phase, fn)
-  local list = state.resume_phase_hooks[phase]
-  list[#list + 1] = fn
 end
 
 -- ------------------------------------------------------------------
@@ -456,7 +489,6 @@ return {
   new              = do_new,
   current_id       = function() return state.current_session_id end,
   current_path     = function() return state.current_session_path end,
-  on_resume_phase  = on_resume_phase,
   -- handle_shutdown is a no-op now: the actor.lua runtime synthesizes
   -- an engine.shutdown wire envelope and our receive_msg handles it.
   handle_shutdown  = function() end,
@@ -477,13 +509,8 @@ return {
       state.current_session_id    = nil
       state.current_session_path  = nil
       state.should_prune_session  = true
-      state.resume_in_progress    = false
       state.initialised           = false
-      state.resume_phase_hooks    = {
-        session_end   = {},
-        session_start = {},
-        resume_done   = {},
-      }
+      state.in_replay_window      = false
     end,
   },
 }

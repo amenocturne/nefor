@@ -48,102 +48,117 @@ agentic_loop.configure {
   model    = "initial-model",
 }
 
--- Sanity: build_template reflects the seeded model.
+-- Sanity: configure() seeds the live config; build_template does NOT bake
+-- provider/model into wrap_args (the picker is the source of truth — every
+-- reasoner firing falls through to cfg.provider / cfg.model live).
 do
+  assert_eq(agentic_loop.config().provider, "ollama", "configure seeds provider")
+  assert_eq(agentic_loop.config().model,    "initial-model", "configure seeds model")
   local g = agentic_loop.build_template("hi")
   local saw = false
   for _, n in ipairs(g.nodes or {}) do
     if n.id == "wrap" and type(n.args) == "table" then
       saw = true
-      assert_eq(n.args.model, "initial-model", "wrap node carries seeded model")
+      assert_eq(n.args.provider, nil,
+        "wrap node must NOT bake provider into args (picker is source of truth)")
+      assert_eq(n.args.model, nil,
+        "wrap node must NOT bake model into args (picker is source of truth)")
     end
   end
   assert(saw, "wrap node found in template")
 end
 
--- chat.model.set with a non-empty model updates config.model.
+-- chat.model.set with a non-empty model updates the live config.model.
 do
   send_to_loop("nefor-tui", { kind = "chat.model.set", provider = "ollama", model = "new-model" })
-  local g = agentic_loop.build_template("hi")
-  local saw = false
-  for _, n in ipairs(g.nodes or {}) do
-    if n.id == "wrap" and type(n.args) == "table" then
-      saw = true
-      assert_eq(n.args.model, "new-model", "wrap node carries updated model")
-    end
-  end
-  assert(saw, "wrap node found in template after switch")
+  assert_eq(agentic_loop.config().model, "new-model", "config.model updated by chat.model.set")
 end
 
 -- chat.model.set with an empty model is a no-op (no crash, no update).
 do
   send_to_loop("nefor-tui", { kind = "chat.model.set", provider = "ollama", model = "" })
-  local g = agentic_loop.build_template("hi")
-  for _, n in ipairs(g.nodes or {}) do
-    if n.id == "wrap" and type(n.args) == "table" then
-      assert_eq(n.args.model, "new-model", "empty-model set did not clobber config.model")
-    end
-  end
+  assert_eq(agentic_loop.config().model, "new-model", "empty-model set did not clobber config.model")
 end
 
 -- chat.model.set with the model field absent is also a no-op.
 do
   send_to_loop("nefor-tui", { kind = "chat.model.set", provider = "ollama" })
-  local g = agentic_loop.build_template("hi")
-  for _, n in ipairs(g.nodes or {}) do
-    if n.id == "wrap" and type(n.args) == "table" then
-      assert_eq(n.args.model, "new-model", "missing-model set did not clobber config.model")
-    end
-  end
+  assert_eq(agentic_loop.config().model, "new-model", "missing-model set did not clobber config.model")
 end
 
 -- A second switch updates config.model again.
 do
   send_to_loop("nefor-tui", { kind = "chat.model.set", provider = "ollama", model = "another-model" })
+  assert_eq(agentic_loop.config().model, "another-model", "second switch sticks on live config")
+end
+
+-- Bug B1 regression — picker is the source of truth for ALL reasoner
+-- firings. The orchestrator graph builder must NOT bake provider/model
+-- into wrap_args, so wrap and sub-graph responder nodes alike fall
+-- through to the live cfg in `provider_run_node`. Per-node routing is
+-- still opt-in via explicit args.provider / args.model.
+do
+  send_to_loop("nefor-tui", { kind = "chat.model.set", provider = "qwen-provider", model = "qwen-model" })
+  assert_eq(agentic_loop.config().provider, "qwen-provider",
+    "chat.model.set with new provider updates config.provider")
+  assert_eq(agentic_loop.config().model, "qwen-model",
+    "chat.model.set with new model updates config.model")
   local g = agentic_loop.build_template("hi")
   for _, n in ipairs(g.nodes or {}) do
     if n.id == "wrap" and type(n.args) == "table" then
-      assert_eq(n.args.model, "another-model", "second switch sticks")
+      assert_eq(n.args.provider, nil,
+        "after picker switch, wrap_args.provider must remain nil — picker drives via cfg")
+      assert_eq(n.args.model, nil,
+        "after picker switch, wrap_args.model must remain nil — picker drives via cfg")
     end
   end
 end
 
 -- ------------------------------------------------------------------
--- session lifecycle (graph_skips_replay → broadcast chat.reset)
+-- session lifecycle (session_end is local-state teardown only)
 -- ------------------------------------------------------------------
 
--- session_end → emits chat.reset broadcast and graph.cancel for any
--- in-flight runs.
+-- sessions.session_end (delivered via the bus) is internal teardown
+-- bookkeeping for the agentic-loop actor: clears current_state, the
+-- pending-input queue, and any in-flight run id. It does NOT broadcast
+-- chat.reset — chat.reset translates to <provider>.reset on the wire,
+-- which providers handle as reset_all() (every chat history wiped, not
+-- just the active one). With reset_all in this path, any later
+-- /resume of a chat under the same provider lands on a chat_id whose
+-- history the provider no longer holds — model replies with no
+-- context. See commit 5042a06 for the full rationale. The test below
+-- pins the new contract: session_end produces no chat.reset egress.
 do
   _test.set_plugins({ "ollama", "reasoner-graph", "nefor-tui" })
   _test.calls_clear()
 
-  send_to_loop("sessions", { kind = "sessions.session_end", session_id = "old-id" })
+  _test.fire_bus("sessions.session_end", { session_id = "old-id" })
 
-  local saw_reset = false
   for _, c in ipairs(_test.calls()) do
     local ok, decoded = pcall(json.decode, c.payload)
-    if ok and type(decoded) == "table" and type(decoded.body) == "table"
-       and decoded.body.kind == "chat.reset" then
-      saw_reset = true
+    if ok and type(decoded) == "table" and type(decoded.body) == "table" then
+      assert(decoded.body.kind ~= "chat.reset",
+        "session_end must NOT broadcast chat.reset — would wipe sibling chat histories on the provider, breaking later /resume")
     end
   end
-  assert(saw_reset, "session_end must broadcast chat.reset to clear provider+TUI state")
 end
 
--- replay_mode flag flips during session_end → session_start window.
--- After resume_done the flag clears.
+-- Replay-window gating now lives in `lib/replay_window`, driven by
+-- `sessions.replay.start` / `sessions.replay.end` framing markers.
+-- agentic-loop short-circuits inside `receive_msg` based on the
+-- module's `active()` getter; the test asserts the flip end-to-end by
+-- firing the markers and probing the gate.
 do
+  local replay_window = require("lib.replay_window")
   _test.set_plugins({ "ollama", "reasoner-graph", "nefor-tui" })
 
-  -- session_end (already entered replay-expectation gate above)
-  send_to_loop("sessions", { kind = "sessions.session_start", session_id = "new-id" })
-  assert_eq(agentic_loop.is_replay_mode(), true,
-    "after session_end → session_start, replay_mode is true")
+  _test.fire_bus("sessions.replay.start", { session_id = "new-id", count = 0 })
+  assert_eq(replay_window.active(), true,
+    "after replay.start, replay_window is active")
 
-  send_to_loop("sessions", { kind = "sessions.resume_done", session_id = "new-id" })
-  assert_eq(agentic_loop.is_replay_mode(), false,
-    "after resume_done, replay_mode lifts")
+  _test.fire_bus("sessions.replay.end", { session_id = "new-id" })
+  assert_eq(replay_window.active(), false,
+    "after replay.end, replay_window lifts")
 end
 
 -- ------------------------------------------------------------------
@@ -291,7 +306,7 @@ do
   fresh_loop()
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "first" })
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "stranded" })
-  send_to_loop("sessions", { kind = "sessions.session_end", session_id = "old" })
+  _test.fire_bus("sessions.session_end", { session_id = "old" })
   _test.calls_clear()
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "post-swap" })
   for _, c in ipairs(decode_calls()) do
@@ -328,6 +343,143 @@ do
         "cancel_all must not emit 'sub-graphs=' counter; saw " .. c.body.text)
     end
   end
+end
+
+-- ------------------------------------------------------------------
+-- Bug 3 regression — chat.input.submit during replay must not
+-- re-spawn an orchestrator graph. Sessions replays the user's
+-- original submit envelope when a session resumes; agentic-loop
+-- already saw the answer in the prior run, so re-firing the
+-- handler would spawn a fresh graph and re-invoke the model on
+-- exactly the same prompt. State is rebuilt by pure-Lua actors
+-- watching the bus markers; replayed wire envelopes are observation
+-- only, not new orchestration triggers.
+-- ------------------------------------------------------------------
+do
+  fresh_loop()
+  _test.fire_bus("sessions.replay.start", { session_id = "resumed", count = 0 })
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "first prompt" })
+  for _, c in ipairs(decode_calls()) do
+    assert(not (c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"),
+      "chat.input.submit during replay must NOT dispatch a fresh spawn_graph; got "
+      .. json.encode(c.body))
+    assert(not (c.body.kind == "chat.message.append" and c.body.role == "user"),
+      "chat.input.submit during replay must NOT echo a user message; got "
+      .. json.encode(c.body))
+  end
+  _test.fire_bus("sessions.replay.end", { session_id = "resumed" })
+
+  -- After replay ends, the actor returns to live behaviour: a fresh
+  -- submit dispatches normally. Locks in that the gate is window-
+  -- scoped, not a hard mute.
+  _test.calls_clear()
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "post-replay" })
+  local saw_dispatch = false
+  for _, c in ipairs(decode_calls()) do
+    if c.body.kind == "tool.invoke" and c.body.name == "spawn_graph" then
+      saw_dispatch = true
+    end
+  end
+  assert(saw_dispatch,
+    "after replay.end, live chat.input.submit must dispatch a spawn_graph again")
+end
+
+-- chat.reset / chat.interrupt_all / chat.model.set during replay are
+-- also gated. Same reasoning: they would mutate state that's already
+-- being rebuilt from the recorded log.
+do
+  fresh_loop()
+  _test.fire_bus("sessions.replay.start", { session_id = "resumed", count = 0 })
+  send_to_loop("nefor-tui", { kind = "chat.reset" })
+  send_to_loop("nefor-tui", { kind = "chat.interrupt_all" })
+  send_to_loop("nefor-tui", { kind = "chat.model.set", provider = "ollama", model = "should-not-stick" })
+  _test.fire_bus("sessions.replay.end", { session_id = "resumed" })
+
+  -- model.set was gated, so config.model must not have changed to the
+  -- replay-injected value.
+  assert(agentic_loop.config().model ~= "should-not-stick",
+    "chat.model.set during replay must not mutate config.model; saw "
+    .. tostring(agentic_loop.config().model))
+end
+
+-- ------------------------------------------------------------------
+-- Bug 4 regression — sub-graph completion emits the literal terminal
+-- output as a chat.message.append so the user can see what the
+-- sub-graph produced. The deferred relay text (verbose, model-facing)
+-- still rides as the next orchestrator-turn user message; the visible
+-- emit lands in the transcript before that.
+-- ------------------------------------------------------------------
+do
+  fresh_loop()
+  -- Drive the sub-graph dispatch path the way tool-gate's wrapper
+  -- does: queue_sub_graph + tool.result keyed by the minted run_id.
+  local terminal_text = "octopuses are eight-armed cephalopods; lighthouses are coastal sentinels."
+  local run_id = agentic_loop.queue_sub_graph(
+    { graph = { nodes = { { id = "terminal", reasoner = "terminal", args = {} } }, edges = {} } },
+    "gate-inner-1"
+  )
+  assert(type(run_id) == "string", "queue_sub_graph must return a run_id")
+  _test.calls_clear()
+
+  -- Drive the canonical sub-graph completion: a tool.result with id
+  -- == run_id and result.status == success carrying the terminal node
+  -- output table.
+  send_to_loop("reasoner-graph", {
+    kind   = "tool.result",
+    id     = run_id,
+    result = {
+      status  = "success",
+      results = { terminal = { output = { text = terminal_text } } },
+    },
+  })
+
+  local calls = decode_calls()
+  local visible = find_call(calls, "chat.message.append", "system", "octopuses are eight-armed")
+  assert(visible ~= nil,
+    "sub-graph completion must emit a chat.message.append carrying the literal terminal output; got "
+    .. json.encode(_test.calls()))
+  assert_eq(visible.target, "nefor-tui",
+    "visible sub-graph output must target nefor-tui")
+end
+
+-- Sub-graph failure surfaces an [spawn_graph errored] visible message.
+do
+  fresh_loop()
+  local run_id = agentic_loop.queue_sub_graph(
+    { graph = { nodes = { { id = "terminal", reasoner = "terminal", args = {} } }, edges = {} } },
+    "gate-inner-2"
+  )
+  _test.calls_clear()
+  send_to_loop("reasoner-graph", {
+    kind   = "tool.result",
+    id     = run_id,
+    result = { status = "error", results = { terminal = { error = "boom" } } },
+  })
+  local calls = decode_calls()
+  local err_msg = find_call(calls, "chat.message.append", "system", "spawn_graph errored")
+  assert(err_msg ~= nil,
+    "sub-graph failure must emit a [spawn_graph errored] system message; got "
+    .. json.encode(_test.calls()))
+end
+
+-- ------------------------------------------------------------------
+-- Bug 5 regression — replay_window exposes a public synchronous
+-- setter that ncp.dispatch toggles inline as it walks the framing
+-- markers. The bus.on_event subscriber alone fires too late for the
+-- per-entry to_plugin loop in the same drain batch (vm.rs
+-- `drain_pending_dispatch` runs invoke_dispatch BEFORE
+-- dispatch_subscriptions across the entire batch). The integration
+-- coverage lives in ncp_test.lua's
+-- replay_window_suppresses_replayed_tool_invoke_in_same_batch /
+-- replay_window_does_not_starve_nefor_tui pair; here we just pin the
+-- public-API contract.
+-- ------------------------------------------------------------------
+do
+  local replay_window = require("lib.replay_window")
+  replay_window.set(true)
+  assert_eq(replay_window.active(), true, "replay_window.set(true) must take effect")
+  replay_window.set(false)
+  assert_eq(replay_window.active(), false, "replay_window.set(false) must take effect")
 end
 
 print("agentic_workflow_test: ok")

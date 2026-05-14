@@ -4,7 +4,7 @@
 //! - the parsed [`Graph`]
 //! - per-firing [`NodeFiring`] records: a node may fire multiple times
 //!   (cyclic case) and each firing carries its own `firing_id`,
-//!   `prev_state`, ack flag, and result.
+//!   `prev_state`, completion flag, and result.
 //! - per-node [`NodeStatus`]: the *latest* firing's terminal status —
 //!   used by `is_runnable` and run-completion bookkeeping.
 //! - per-node `current_state`: the latest completed firing's `next_state`,
@@ -15,9 +15,12 @@
 //!
 //! This module is pure: it does not touch the bus. The main loop owns the
 //! mpsc sender and calls into [`Scheduler::handle_submit`] /
-//! [`Scheduler::handle_node_result`] / [`Scheduler::handle_node_ack`] /
-//! [`Scheduler::handle_ack_timeout`], collecting bus events to emit from
+//! [`Scheduler::handle_node_result`], collecting bus events to emit from
 //! the returned [`Effects`].
+//!
+//! Dispatch is fire-and-forget: a firing closes on `tool.result` arrival
+//! or on `graph.cancel` — there is no result-arrival deadline. If a
+//! reasoner never replies, the firing stays open indefinitely.
 //!
 //! ## Lifecycle keying
 //!
@@ -32,8 +35,8 @@
 //! The run completes when:
 //! 1. Every node has at least one completed firing (output / error /
 //!    skipped), AND
-//! 2. There are no in-flight firings (every dispatched firing has either
-//!    ack-failed or completed), AND
+//! 2. There are no in-flight firings (every dispatched firing has
+//!    completed), AND
 //! 3. No node is currently runnable (the dataflow has reached its
 //!    fixpoint).
 //!
@@ -74,7 +77,7 @@ pub enum NodeStatus {
     /// Reasoner returned `output` successfully.
     Output(Value),
     /// Reasoner returned `error` (or scheduler synthesized a failure,
-    /// e.g. ack timeout, reasoner not connected).
+    /// e.g. reasoner not connected).
     Error(String),
     /// Skipped due to abort-mode short-circuit (never dispatched).
     /// Counts as failure for the run's final status.
@@ -122,8 +125,10 @@ pub struct NodeFiring {
     #[cfg_attr(not(test), allow(dead_code))]
     pub prev_state: Value,
     /// True once a `tool.result` arrived for this firing OR the
-    /// scheduler synthesized a failure (ack timeout, reasoner not
-    /// connected).
+    /// scheduler synthesized a failure (e.g. reasoner not connected at
+    /// dispatch time). Drives the post-completion duplicate-result
+    /// drop guard in `handle_node_result` and the run-completion
+    /// fixpoint check.
     pub completed: bool,
 }
 
@@ -167,8 +172,6 @@ pub struct RunState {
     pub current_state: HashMap<NodeId, Value>,
     /// Failure policy from submit.
     pub on_failure: OnNodeFailure,
-    /// Per-dispatch ack deadline (ms).
-    pub ack_deadline_ms: u64,
     /// True once a node errored under abort mode. Suppresses further
     /// dispatch; not-yet-dispatched nodes are marked skipped immediately.
     pub aborted: bool,
@@ -212,8 +215,7 @@ pub struct RunState {
     /// Mirrors the pattern used by `pending_fanouts` (combinator
     /// invocations) and `RunPhase::PendingTypecheck { query_id }`
     /// (combinator queries). Entries are inserted at dispatch time and
-    /// removed when the matching `tool.result` (or synthesized
-    /// ack-timeout failure) lands.
+    /// removed when the matching `tool.result` lands.
     pub firing_by_request_id: HashMap<String, (NodeId, FiringId)>,
 }
 
@@ -739,23 +741,46 @@ fn try_dispatch(state: &mut RunState, node_id: &str, peers: &PeerSet, effects: &
         firing_id.clone(),
         (node.id.clone(), firing_id.clone()),
     );
+    // Lifecycle marker FIRST, then the targeted dispatch. Order matters:
+    // an in-process synchronous reasoner (Lua-resident `terminal`,
+    // `adapter`, `tool-executor`, …) replies on its own `tool.invoke`
+    // inside the same dispatch tick, emitting `tool.result` before
+    // control returns here for the next effect. If `NodeDispatched`
+    // (`graph.node.fired`) is pushed AFTER `DispatchNode`
+    // (`tool.invoke`), the bus order ends up:
+    //
+    //   1. tool.invoke              (consumed by the reasoner)
+    //   2. tool.result              (reasoner's reply, broadcast)
+    //   3. graph.node.fired         (lifecycle marker)
+    //
+    // Observers that build a `firing_id → (run_id, node_id)` map from
+    // `graph.node.fired` (chat.lua's DAG panel; agentic-loop's wrap
+    // next_state capture) then see (2) BEFORE (3) and silently drop
+    // the close — the firing stays "running" forever in their view.
+    // Visible symptom: the `terminal` node in the orchestrator graph
+    // ticks elapsed-ms in the chat DAG sidebar after the agent's full
+    // response is delivered, because terminal's tool.result landed
+    // before its graph.node.fired (Bug A6 terminal node keeps
+    // ticking).
+    //
+    // Pushing `NodeDispatched` first puts `graph.node.fired` on the
+    // bus before `tool.invoke`, so the lifecycle marker observed by
+    // every consumer arrives before any reasoner can synchronously
+    // close the firing.
+    effects.push(Effect::NodeDispatched {
+        run_id: state.run_id.clone(),
+        node_id: node.id.clone(),
+        firing_id: firing_id.clone(),
+        reasoner: node.reasoner.clone(),
+    });
     effects.push(Effect::DispatchNode {
         reasoner: node.reasoner.clone(),
         run_id: state.run_id.clone(),
         node_id: node.id.clone(),
-        firing_id: firing_id.clone(),
+        firing_id,
         args: node.args.clone(),
         inputs,
         prev_state,
-    });
-    // Broadcast lifecycle marker alongside the targeted dispatch so
-    // observers can light up a "running" badge without listening on the
-    // reasoner-prefixed channel. Paired one-to-one with DispatchNode.
-    effects.push(Effect::NodeDispatched {
-        run_id: state.run_id.clone(),
-        node_id: node.id.clone(),
-        firing_id,
-        reasoner: node.reasoner.clone(),
     });
     // Per-node fanout dispatch happens at result time inside
     // `propagate_after_completion`. No work required at dispatch.
@@ -1230,7 +1255,6 @@ impl Scheduler {
                 firings: HashMap::new(),
                 current_state: HashMap::new(),
                 on_failure: submission.on_failure,
-                ack_deadline_ms: submission.ack_deadline_ms,
                 aborted: false,
                 pending_fanouts: HashMap::new(),
                 fanout_seeded: HashMap::new(),
@@ -1270,7 +1294,6 @@ impl Scheduler {
             firings: HashMap::new(),
             current_state: HashMap::new(),
             on_failure: submission.on_failure,
-            ack_deadline_ms: submission.ack_deadline_ms,
             aborted: false,
             pending_fanouts: HashMap::new(),
             fanout_seeded: HashMap::new(),
@@ -1424,71 +1447,6 @@ impl Scheduler {
             dispatch_all_runnable(state, peers, &mut effects);
             if run_is_done(state) {
                 if let Some(taken) = guard.remove(&run_id) {
-                    completed_run = Some(taken);
-                }
-            }
-        }
-        if let Some(state) = completed_run {
-            let status = final_status(&state);
-            let results = build_results(&state);
-            effects.push(Effect::RunComplete {
-                run_id: state.run_id.clone(),
-                status,
-                results,
-            });
-        }
-        effects
-    }
-
-    /// Handle an ack-deadline expiry. The main loop arms a timer per
-    /// dispatch and calls this on expiry; if the firing has been acked
-    /// in the meantime this is a no-op, otherwise we synthesize a
-    /// failure on that firing and apply the policy.
-    pub fn handle_ack_timeout(
-        runs: &Runs,
-        peers: &PeerSet,
-        run_id: &str,
-        firing_id: &str,
-    ) -> Effects {
-        let mut effects = Effects::new();
-        let mut completed_run: Option<RunState> = None;
-        {
-            let mut guard = runs.lock().expect("runs mutex poisoned");
-            let state = match guard.get_mut(run_id) {
-                Some(s) => s,
-                None => return effects, // run was cancelled or already completed
-            };
-            // Find the firing.
-            let mut owner_node: Option<String> = None;
-            for (nid, firings) in state.firings.iter_mut() {
-                if let Some(f) = firings.iter_mut().find(|f| f.firing_id == firing_id) {
-                    if f.completed {
-                        return effects; // late timer; ignore
-                    }
-                    f.completed = true;
-                    owner_node = Some(nid.clone());
-                    break;
-                }
-            }
-            let node_id = match owner_node {
-                Some(n) => n,
-                None => return effects, // unknown firing; ignore
-            };
-            // Synthesized `tool.result { id=firing_id, error: "ack_timeout" }`
-            // path (per wire-spec D1): the watchdog manufactures a failure
-            // for this firing without an envelope ever hitting the bus.
-            // Drop the request-id correlation entry — a real
-            // `tool.result` arriving later for this id is a duplicate
-            // and gets dropped by the post-completion guard.
-            state.firing_by_request_id.remove(firing_id);
-            state.completed.insert(
-                node_id.clone(),
-                NodeStatus::Error("reasoner ack timeout".to_owned()),
-            );
-            propagate_after_completion(state, &node_id, peers, &mut effects);
-
-            if run_is_done(state) {
-                if let Some(taken) = guard.remove(run_id) {
                     completed_run = Some(taken);
                 }
             }
@@ -1755,12 +1713,31 @@ mod tests {
             SubmitOutcome::Accepted(e) => e.into_vec(),
             SubmitOutcome::Rejected(_) => panic!("expected accepted"),
         };
-        // RunStarted, DispatchNode, NodeDispatched.
+        // RunStarted, NodeDispatched, DispatchNode. NodeDispatched fires
+        // BEFORE DispatchNode so the lifecycle marker (graph.node.fired)
+        // lands on the bus before the targeted tool.invoke; an in-process
+        // synchronous reasoner that replies immediately on tool.invoke
+        // would otherwise emit tool.result before any observer saw the
+        // firing's graph.node.fired (Bug A6 root cause).
         assert_eq!(effects.len(), 3);
         assert!(
             matches!(&effects[0], Effect::RunStarted { run_id, total_nodes } if run_id == "run-1" && *total_nodes == 1)
         );
         match &effects[1] {
+            Effect::NodeDispatched {
+                run_id,
+                node_id,
+                firing_id,
+                reasoner,
+            } => {
+                assert_eq!(run_id, "run-1");
+                assert_eq!(node_id, "n1");
+                assert_eq!(reasoner, "r");
+                assert!(!firing_id.is_empty());
+            }
+            other => panic!("unexpected effect: {other:?}"),
+        }
+        match &effects[2] {
             Effect::DispatchNode {
                 reasoner,
                 run_id,
@@ -1776,20 +1753,6 @@ mod tests {
                 assert_eq!(args, &json!({"x": 1}));
                 assert_eq!(prev_state, &Value::Null);
                 assert!(!firing_id.is_empty(), "firing_id must be minted");
-            }
-            other => panic!("unexpected effect: {other:?}"),
-        }
-        match &effects[2] {
-            Effect::NodeDispatched {
-                run_id,
-                node_id,
-                firing_id,
-                reasoner,
-            } => {
-                assert_eq!(run_id, "run-1");
-                assert_eq!(node_id, "n1");
-                assert_eq!(reasoner, "r");
-                assert!(!firing_id.is_empty());
             }
             other => panic!("unexpected effect: {other:?}"),
         }
@@ -1917,8 +1880,17 @@ mod tests {
         )
         .into_vec();
         let f2 = first_dispatch_firing_id(&e2);
+        // NodeDispatched comes first now (lifecycle marker before
+        // targeted dispatch — see `try_dispatch` for rationale); the
+        // DispatchNode follows. We assert on the DispatchNode by
+        // searching rather than indexing so the test is robust to
+        // either ordering.
+        let dn = e2
+            .iter()
+            .find(|e| matches!(e, Effect::DispatchNode { .. }))
+            .expect("DispatchNode in e2");
         assert!(
-            matches!(&e2[0], Effect::DispatchNode { node_id, inputs, .. } if {
+            matches!(dn, Effect::DispatchNode { node_id, inputs, .. } if {
                 node_id == "n2" && inputs.get("n1") == Some(&json!({"output": "ok1"}))
             })
         );
@@ -1930,7 +1902,11 @@ mod tests {
         )
         .into_vec();
         let f3 = first_dispatch_firing_id(&e3);
-        assert!(matches!(&e3[0], Effect::DispatchNode { node_id, .. } if node_id == "n3"));
+        let dn3 = e3
+            .iter()
+            .find(|e| matches!(e, Effect::DispatchNode { .. }))
+            .expect("DispatchNode in e3");
+        assert!(matches!(dn3, Effect::DispatchNode { node_id, .. } if node_id == "n3"));
 
         let e4 = Scheduler::handle_node_result(
             &runs,
@@ -2027,7 +2003,14 @@ mod tests {
             &result_body("run-d", "n3", Some(&f3), Ok(json!("c")), None),
         )
         .into_vec();
-        match &r3[0] {
+        // NodeDispatched (lifecycle) precedes DispatchNode (targeted
+        // tool.invoke) per try_dispatch ordering; find the
+        // DispatchNode rather than indexing positionally.
+        let dn = r3
+            .iter()
+            .find(|e| matches!(e, Effect::DispatchNode { .. }))
+            .expect("DispatchNode in r3");
+        match dn {
             Effect::DispatchNode {
                 node_id, inputs, ..
             } => {
@@ -2417,47 +2400,6 @@ mod tests {
     }
 
     #[test]
-    fn ack_timeout_fails_dispatch_and_applies_policy() {
-        let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
-        let peers = peers_with(&["r"]);
-        // Two-node abort chain: ack timeout on n1 should skip n2.
-        let g = json!({
-            "nodes": [
-                {"id": "n1", "reasoner": "r", "args": {}},
-                {"id": "n2", "reasoner": "r", "args": {}}
-            ],
-            "edges": [{"from": "n1", "to": "n2"}]
-        });
-        let outcome = Scheduler::handle_submit(&runs, &peers, &submit_body("run-to", g, None));
-        let e = match outcome {
-            SubmitOutcome::Accepted(e) => e.into_vec(),
-            _ => panic!("accepted"),
-        };
-        let f1 = first_dispatch_firing_id(&e);
-
-        let r = Scheduler::handle_ack_timeout(&runs, &peers, "run-to", &f1).into_vec();
-        let complete = r
-            .iter()
-            .find(|e| matches!(e, Effect::RunComplete { .. }))
-            .expect("run_complete on timeout");
-        match complete {
-            Effect::RunComplete {
-                status, results, ..
-            } => {
-                assert_eq!(*status, RunStatus::Failure);
-                let n1_err = results
-                    .get("n1")
-                    .and_then(|v| v.get("error"))
-                    .and_then(Value::as_str)
-                    .unwrap();
-                assert!(n1_err.contains("ack timeout"));
-                assert_eq!(results.get("n2"), Some(&json!({"skipped": true})));
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    #[test]
     fn cancel_drops_run_from_registry() {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
@@ -2475,7 +2417,14 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_emits_node_dispatched_alongside_dispatch_node() {
+    fn dispatch_emits_node_dispatched_before_dispatch_node() {
+        // Inverted from the prior shape: NodeDispatched (lifecycle marker
+        // → graph.node.fired) MUST land on the bus BEFORE DispatchNode
+        // (targeted tool.invoke). An in-process synchronous reasoner
+        // would otherwise emit tool.result before any observer saw the
+        // firing's graph.node.fired, breaking the
+        // firing_id → (run_id, node_id) map every consumer builds from
+        // graph.node.fired (Bug A6 root cause).
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
@@ -2492,28 +2441,28 @@ mod tests {
             _ => panic!("accepted"),
         };
         for (i, e) in effects.iter().enumerate() {
-            if let Effect::DispatchNode {
-                node_id,
+            if let Effect::NodeDispatched {
                 run_id,
-                reasoner,
+                node_id,
                 firing_id,
-                ..
+                reasoner,
             } = e
             {
-                let nd = effects.get(i + 1).expect("trailing NodeDispatched");
-                match nd {
-                    Effect::NodeDispatched {
-                        run_id: nd_rid,
-                        node_id: nd_nid,
-                        firing_id: nd_fid,
-                        reasoner: nd_r,
+                let dn = effects.get(i + 1).expect("trailing DispatchNode");
+                match dn {
+                    Effect::DispatchNode {
+                        run_id: dn_rid,
+                        node_id: dn_nid,
+                        firing_id: dn_fid,
+                        reasoner: dn_r,
+                        ..
                     } => {
-                        assert_eq!(nd_rid, run_id);
-                        assert_eq!(nd_nid, node_id);
-                        assert_eq!(nd_fid, firing_id);
-                        assert_eq!(nd_r, reasoner);
+                        assert_eq!(dn_rid, run_id);
+                        assert_eq!(dn_nid, node_id);
+                        assert_eq!(dn_fid, firing_id);
+                        assert_eq!(dn_r, reasoner);
                     }
-                    other => panic!("expected NodeDispatched after DispatchNode, got: {other:?}"),
+                    other => panic!("expected DispatchNode after NodeDispatched, got: {other:?}"),
                 }
             }
         }

@@ -545,6 +545,57 @@ fn chat_session_stats_updates_statusline() {
     assert!(out.contains("1s"), "duration segment missing: {out:?}");
 }
 
+/// Bug A7 regression: a replayed `chat.model.set_ack` (the original
+/// session's provider hello → set_ack, persisted in the jsonl) must
+/// NOT clobber the live `state.model` the user set via /model after
+/// /new + before /resume. The agentic-loop's live config is the
+/// source of truth for which provider serves the next turn; chat.lua
+/// mirrors that posture by ignoring set_ack envelopes that arrive
+/// inside the replay window. Visible bug: pick mock → /new → /model
+/// qwen → /resume an old mock chat → status bar reverts to
+/// mock-model even though the next reply still routes through qwen.
+#[test]
+fn replayed_chat_model_set_ack_does_not_clobber_live_model() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Live: user is on `qwen-test`.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.model.set_ack",
+            "provider": "qwen",
+            "model": "qwen-test",
+        }),
+    );
+    let out = render_snapshot(&mut engine);
+    assert!(out.contains("qwen-test"), "live model missing pre-replay: {out:?}");
+
+    // /resume picker fires: replay window opens, replayed envelopes
+    // include the OLD session's mock-provider set_ack.
+    dispatch_event(&mut engine, json!({ "kind": "sessions.replay.start" }));
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.model.set_ack",
+            "provider": "mock",
+            "model": "mock-model",
+        }),
+    );
+    dispatch_event(&mut engine, json!({ "kind": "sessions.replay.end" }));
+
+    let out = render_snapshot(&mut engine);
+    assert!(
+        out.contains("qwen-test"),
+        "live model must survive replayed set_ack (Bug A7): {out:?}"
+    );
+    assert!(
+        !out.contains("mock-model"),
+        "replayed set_ack must not clobber live model: {out:?}"
+    );
+}
+
 #[test]
 fn ctrl_o_toggles_expanded_details() {
     let mut engine = Engine::new(120, 24).expect("engine");

@@ -112,11 +112,6 @@ impl OnNodeFailure {
     }
 }
 
-/// Default ack deadline if the submission omits `ack_deadline_ms`. Five
-/// seconds is generous for a local plugin that just needs to confirm
-/// receipt — actual work has no timeout per parent spec.
-pub const DEFAULT_ACK_DEADLINE_MS: u64 = 5_000;
-
 /// Parsed and topology-validated graph (cycles allowed).
 #[derive(Debug, Clone)]
 pub struct Graph {
@@ -436,7 +431,7 @@ fn parse_fanout_signature(
 }
 
 /// Parse the top-level `tool.invoke { id, name="spawn_graph", args: { graph,
-/// on_node_failure?, ack_deadline_ms? } }` body into its pieces.
+/// on_node_failure? } }` body into its pieces.
 #[derive(Debug)]
 pub struct RunSubmission {
     /// Caller-supplied opaque correlation id (envelope `id` field —
@@ -446,9 +441,6 @@ pub struct RunSubmission {
     pub graph: Graph,
     /// Failure policy (default abort).
     pub on_failure: OnNodeFailure,
-    /// Per-dispatch ack deadline. Defaults to
-    /// [`DEFAULT_ACK_DEADLINE_MS`] when unset on the submission.
-    pub ack_deadline_ms: u64,
 }
 
 /// The tool name this binary handles via the canonical contract.
@@ -470,8 +462,8 @@ pub struct SubmissionError {
 
 /// Parse the body of an inbound `tool.invoke { name="spawn_graph" }`
 /// event. The envelope `id` becomes the internal `run_id`; submission
-/// fields (`graph`, `on_node_failure`, `ack_deadline_ms`) are nested
-/// inside `args` per the canonical tool contract.
+/// fields (`graph`, `on_node_failure`) are nested inside `args` per the
+/// canonical tool contract.
 ///
 /// Unknown fields on the envelope and inside `args` are tolerated so
 /// future contract extensions (e.g. `graph_id` for nested-spawn agents,
@@ -536,28 +528,13 @@ pub fn parse_submission(body: &Map<String, Value>) -> Result<RunSubmission, Subm
         .unwrap_or(None);
     let on_failure = OnNodeFailure::parse(on_failure).map_err(|e| SubmissionError {
         message: e,
-        run_id: run_id_for_error.clone(),
+        run_id: run_id_for_error,
     })?;
-
-    let ack_deadline_ms = match args.get("ack_deadline_ms") {
-        None | Some(Value::Null) => DEFAULT_ACK_DEADLINE_MS,
-        Some(Value::Number(n)) => n.as_u64().ok_or_else(|| SubmissionError {
-            message: "`args.ack_deadline_ms` must be a non-negative integer".into(),
-            run_id: run_id_for_error.clone(),
-        })?,
-        Some(other) => {
-            return Err(SubmissionError {
-                message: format!("`args.ack_deadline_ms` must be a number; got {other}"),
-                run_id: run_id_for_error,
-            });
-        }
-    };
 
     Ok(RunSubmission {
         run_id,
         graph,
         on_failure,
-        ack_deadline_ms,
     })
 }
 
@@ -784,36 +761,6 @@ mod tests {
     #[test]
     fn on_node_failure_rejects_unknown() {
         assert!(OnNodeFailure::parse(Some("retry")).is_err());
-    }
-
-    #[test]
-    fn parse_submission_default_ack_deadline() {
-        let body = json!({
-            "kind": "tool.invoke",
-            "id": "r1",
-            "name": "spawn_graph",
-            "args": {
-                "graph": {"nodes": [{"id": "n1", "reasoner": "r"}], "edges": []}
-            }
-        });
-        let sub = parse_submission(body.as_object().unwrap()).unwrap();
-        assert_eq!(sub.run_id, "r1");
-        assert_eq!(sub.ack_deadline_ms, DEFAULT_ACK_DEADLINE_MS);
-    }
-
-    #[test]
-    fn parse_submission_custom_ack_deadline() {
-        let body = json!({
-            "kind": "tool.invoke",
-            "id": "r1",
-            "name": "spawn_graph",
-            "args": {
-                "graph": {"nodes": [{"id": "n1", "reasoner": "r"}], "edges": []},
-                "ack_deadline_ms": 250
-            }
-        });
-        let sub = parse_submission(body.as_object().unwrap()).unwrap();
-        assert_eq!(sub.ack_deadline_ms, 250);
     }
 
     #[test]
