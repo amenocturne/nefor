@@ -352,8 +352,35 @@ fn drain_complete_frames<F, R>(
                             text: &outcome.reasoning_text,
                         });
                     }
-                    on_delta(&text);
-                    outcome.full_text.push_str(&text);
+                    // Defensive strip: when Qwen-style chat templates close
+                    // reasoning on a literal `</think>` written inside the
+                    // model's monologue, the literal close-tag character
+                    // sequence frequently leads the first content chunk
+                    // (Ollama emits the matched tag itself onto the content
+                    // channel after the reasoning split). The user shouldn't
+                    // see `</think>` rendered as the start of an answer.
+                    // Strip a single leading `</think>` (with optional
+                    // surrounding whitespace) from the content stream.
+                    // Only fires when reasoning was non-empty AND we have
+                    // not yet emitted any content — covers the leak shape
+                    // without disturbing legitimate uses of the literal
+                    // string later in the answer.
+                    let emit_text: &str = if outcome.full_text.is_empty()
+                        && !outcome.reasoning_text.is_empty()
+                    {
+                        let trimmed = text.trim_start();
+                        if let Some(rest) = trimmed.strip_prefix("</think>") {
+                            rest.trim_start_matches(|c: char| c == '>' || c.is_whitespace())
+                        } else {
+                            text.as_str()
+                        }
+                    } else {
+                        text.as_str()
+                    };
+                    if !emit_text.is_empty() {
+                        on_delta(emit_text);
+                        outcome.full_text.push_str(emit_text);
+                    }
                 }
                 SseEvent::ReasoningDelta(text) => {
                     outcome.reasoning_text.push_str(&text);

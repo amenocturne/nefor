@@ -234,6 +234,10 @@ actor.spawn(require("compositors.graph").spawn_spec({ require("config").bin("rea
 
 local tools = require("compositors.tools")
 local tool_gate_argv = { require("config").bin("tool-gate") }
+for _, t in ipairs(cfg.tool_gate.auto_tools or {}) do
+  tool_gate_argv[#tool_gate_argv + 1] = "--auto"
+  tool_gate_argv[#tool_gate_argv + 1] = t
+end
 for _, t in ipairs(cfg.tool_gate.prompt_tools or {}) do
   tool_gate_argv[#tool_gate_argv + 1] = "--prompt"
   tool_gate_argv[#tool_gate_argv + 1] = t

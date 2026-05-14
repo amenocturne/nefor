@@ -188,17 +188,53 @@ function M.format_graph(graph)
   return table.concat(lines, "\n")
 end
 
+-- Render a `dispatch-graph` args table (`{ nodes = [{ id, role,
+-- dependencies }] }`) as a yaml-like two-section block: `nodes:` lists
+-- ids with arrow-notated dependencies, `agents:` maps each id to its
+-- assigned role. Two sections instead of one merged line so the user
+-- can scan topology and role assignment independently — same shape the
+-- approve popup used before the args-passthrough refactor.
+function M.format_dispatch_graph(nodes)
+  if type(nodes) ~= "table" or #nodes == 0 then return "(empty graph)" end
+  local lines = { "nodes:" }
+  for _, n in ipairs(nodes) do
+    local id = n.id or "?"
+    local deps = n.dependencies
+    if type(deps) == "table" and #deps > 0 then
+      lines[#lines + 1] = "  " .. id .. " -> " .. table.concat(deps, ", ")
+    else
+      lines[#lines + 1] = "  " .. id
+    end
+  end
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "agents:"
+  for _, n in ipairs(nodes) do
+    local id = n.id or "?"
+    local role = n.role or "?"
+    lines[#lines + 1] = "  " .. id .. ": " .. role
+  end
+  return table.concat(lines, "\n")
+end
+
 -- Pretty-print an args table from a `chat.tool.popup_request` event
 -- so the popup body shows a human-legible summary of the call.
 -- Stringy values render verbatim; nested tables get a compact `{...}`
 -- placeholder rather than a recursive dump (most tools take flat args,
 -- and a long nested blob would blow up the popup anyway). The
--- `spawn_graph` tool gets a dedicated graph layout via format_graph.
+-- `spawn_graph` and `dispatch-graph` tools get dedicated layouts.
 function M.format_args(args)
   if args == nil then return "" end
   if type(args) ~= "table" then return tostring(args) end
   if type(args.graph) == "table" then
     return M.format_graph(args.graph)
+  end
+  -- dispatch-graph shape: top-level `nodes` array whose entries carry
+  -- `role` (lead-workflow's role-aware spec). Detect via the role field
+  -- on the first entry to avoid colliding with any future tool that
+  -- also names its arg `nodes` but with a different shape.
+  if type(args.nodes) == "table" and type(args.nodes[1]) == "table"
+      and args.nodes[1].role ~= nil then
+    return M.format_dispatch_graph(args.nodes)
   end
   local keys = {}
   for k, _ in pairs(args) do

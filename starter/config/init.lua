@@ -52,11 +52,23 @@ M.active = {
   },
 
   tool_gate = {
-    -- Prompt for tool calls in the TUI. Lead allowlist auto-approves
-    -- the canonical reads/writes; everything else gets the popup so a
-    -- developer testing the gate path sees the approval flow.
+    -- Default policy for unlisted tools. `prompt` = popup; user
+    -- approves before the call lands.
     default_action = "prompt",
-    prompt_tools   = { "read_file" },
+    -- Tools that bypass the popup entirely. Read-only investigation
+    -- (read_file / list_dir / search_text) is safe to auto-allow —
+    -- nothing on disk changes. write-review (alias submit-plan) is
+    -- the lead's plan-submission tool: it doesn't perform side
+    -- effects, it just parks a plan for the user's /approve, so
+    -- gating it behind an approval popup is a redundant click. The
+    -- plan still appears in chat as a chat.plan.append entry where
+    -- the user accepts/rejects with /approve / /reject.
+    auto_tools     = {
+      "read_file", "list_dir", "search_text",
+      "write-review", "submit-plan",
+    },
+    -- Tools that always go through the popup, regardless of default.
+    prompt_tools   = {},
   },
 
   log_level = "info",

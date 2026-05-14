@@ -127,8 +127,12 @@ local function node_rows(node_id, node, now_ms, narrow)
   -- transcript carry the signal and the leftover tool name is noise.
   if node.status == "running" and type(node.last_tool) == "string"
       and #node.last_tool > 0 then
+    local label = node.last_tool
+    if type(node.last_tool_args) == "string" and #node.last_tool_args > 0 then
+      label = label .. "(" .. node.last_tool_args .. ")"
+    end
     rows[#rows + 1] = tui.text {
-      content = "  → " .. node.last_tool,
+      content = "  → " .. label,
       style   = STYLE.status_dim,
       wrap    = "none",
     }
@@ -248,7 +252,54 @@ function M.node_dispatched(state, run_id, node_id, reasoner, now_ms)
   end)
 end
 
-function M.node_tool_invoked(state, run_id, node_id, tool_name, now_ms)
+-- Format a tool's args into a short single-line string for the DAG
+-- sidebar's "currently calling X" sub-row. The goal is to make
+-- parallel agents distinguishable when they happen to use the same
+-- tool name (e.g. three explorers all running `bash` with different
+-- commands). Per-tool extractors for the common cases; generic first-
+-- string-arg fallback for everything else.
+local TOOL_ARG_KEYS = {
+  bash         = { "command" },
+  read_file    = { "path", "file_path" },
+  write_file   = { "path", "file_path" },
+  edit_file    = { "path", "file_path", "target_path" },
+  list_dir     = { "path" },
+  search_text  = { "pattern", "query", "text" },
+}
+
+local function format_tool_args_short(tool_name, args)
+  if type(args) ~= "table" then return "" end
+  local keys = TOOL_ARG_KEYS[tool_name]
+  local picked
+  if keys then
+    for _, k in ipairs(keys) do
+      local v = args[k]
+      if type(v) == "string" and #v > 0 then picked = v; break end
+    end
+  end
+  if picked == nil then
+    -- Generic: first string-valued arg (sorted-key order for
+    -- determinism so the same args render the same way each turn).
+    local sorted = {}
+    for k, _ in pairs(args) do
+      if type(k) == "string" then sorted[#sorted + 1] = k end
+    end
+    table.sort(sorted)
+    for _, k in ipairs(sorted) do
+      local v = args[k]
+      if type(v) == "string" and #v > 0 then picked = v; break end
+    end
+  end
+  if picked == nil then return "" end
+  -- Compact whitespace + truncate. Newlines turn the row multi-line
+  -- and break sidebar layout; replace them.
+  picked = picked:gsub("[\r\n]+", " ")
+  local MAX = 40
+  if #picked > MAX then picked = picked:sub(1, MAX - 1) .. "…" end
+  return picked
+end
+
+function M.node_tool_invoked(state, run_id, node_id, tool_name, tool_args, now_ms)
   -- Only stamp progress for nodes we've observed dispatch for. If we
   -- haven't seen `graph.node.fired` for this (run, node) yet — out-of-
   -- order delivery, replay tail, whatever — drop quietly rather than
@@ -258,11 +309,13 @@ function M.node_tool_invoked(state, run_id, node_id, tool_name, now_ms)
       and state.dag_runs[run_id].nodes[node_id]) then
     return state
   end
+  local short_args = format_tool_args_short(tool_name, tool_args)
   return apply(state, run_id, function(prev)
     local nodes = {}
     for k, v in pairs(prev.nodes or {}) do nodes[k] = v end
     nodes[node_id] = shallow_merge(nodes[node_id], {
       last_tool       = tool_name,
+      last_tool_args  = short_args,
       last_tool_at_ms = now_ms,
     })
     return shallow_merge(prev, { nodes = nodes })
@@ -292,6 +345,37 @@ function M.node_result(state, run_id, node_id, has_output, has_error, now_ms)
     })
     return shallow_merge(prev, { nodes = nodes })
   end)
+end
+
+-- User-initiated interrupt (double-ESC). Flip every still-running
+-- node to `error` so it renders red — "interrupted" is a failure
+-- from the run's POV, same as a backend crash. Stamp completed_at_ms
+-- so the linger window starts running and the run fades out via the
+-- existing prune path; otherwise the sidebar would freeze with stale
+-- "Ns" timers because cancel_all on the engine side never emits the
+-- run.completed envelope a clean termination would.
+function M.interrupt_all(state, now_ms)
+  if type(state.dag_runs) ~= "table" then return state end
+  local new_runs = {}
+  for run_id, run in pairs(state.dag_runs) do
+    local nodes = {}
+    for node_id, node in pairs(run.nodes or {}) do
+      if node.status == "running" or node.status == "pending" then
+        nodes[node_id] = shallow_merge(node, {
+          status         = "error",
+          finished_at_ms = now_ms,
+        })
+      else
+        nodes[node_id] = node
+      end
+    end
+    new_runs[run_id] = shallow_merge(run, {
+      nodes           = nodes,
+      completed_at_ms = run.completed_at_ms or now_ms,
+      status          = run.status or "interrupted",
+    })
+  end
+  return shallow_merge(state, { dag_runs = new_runs })
 end
 
 function M.run_complete(state, run_id, status, results, now_ms)

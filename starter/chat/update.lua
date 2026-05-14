@@ -372,14 +372,16 @@ function M.update(msg, state)
     -- 4) double-ESC escalation
     local now = tui.now_ms()
     if state.last_esc_ms and (now - state.last_esc_ms) <= DOUBLE_ESC_MS then
-      return shallow_merge(state, { last_esc_ms = NIL_SENTINEL }), {
+      local interrupted = dag.interrupt_all(state, now)
+      return shallow_merge(interrupted, { last_esc_ms = NIL_SENTINEL }), {
         { kind = "send_to", target = "engine",
           body = { kind = "chat.interrupt_all" } },
       }
     end
     -- 4) single ESC interrupts the current turn
     if state.pending or state.in_flight ~= nil then
-      return shallow_merge(state, { last_esc_ms = now }), {
+      local interrupted = dag.interrupt_all(state, now)
+      return shallow_merge(interrupted, { last_esc_ms = now }), {
         { kind = "send_to", target = "engine",
           body = { kind = "chat.interrupt" } },
       }
@@ -685,6 +687,31 @@ function M.update(msg, state)
       local path, dir = text:match(
         "^%[Loaded (.-) because tool call touched a file in (.-)%. This is project guidance for that directory, not a user request%.%]")
       if path and dir then
+        -- Sub-graph routing: tool-gate stamps `chat_id` on agents_md
+        -- emissions. If that chat_id maps to a known sub-graph node
+        -- (registered via `graph.node.chat.bound` when the agent
+        -- reasoner spun up), route to the DAG sidebar's "last tool"
+        -- slot for that node and DO NOT add to the main transcript.
+        -- The lead's chat history is independent — only the visible
+        -- transcript needs to suppress it. If chat_id is set but we
+        -- have no binding for it, treat as a sub-graph emission for a
+        -- node we haven't seen yet (still drop from main chat —
+        -- rendering it would be the bug we're fixing).
+        local mc = msg.chat_id
+        if type(mc) == "string" and #mc > 0 then
+          local binding = state.chat_id_to_node and state.chat_id_to_node[mc]
+          if binding then
+            local now = tui.now_ms()
+            local synth = "AGENTS.md(" .. path .. ")"
+            return shallow_merge(
+              dag.node_tool_invoked(state, binding.run_id, binding.node_id, synth, nil, now),
+              turn_state
+            ), {}
+          end
+          -- Sub-chat we don't have a binding for — drop silently
+          -- rather than leak into the main transcript.
+          return shallow_merge(state, turn_state), {}
+        end
         local body = text:match("\n\n(.*)$") or ""
         return transcript.push_entry(shallow_merge(state, turn_state), {
           kind = "agents_md",
@@ -1015,7 +1042,23 @@ function M.update(msg, state)
     if (msg.run_id or "") == "" or (msg.node_id or "") == "" then return state, {} end
     if type(msg.tool_name) ~= "string" or #msg.tool_name == 0 then return state, {} end
     local now = tui.now_ms()
-    return dag.node_tool_invoked(state, msg.run_id, msg.node_id, msg.tool_name, now), {}
+    return dag.node_tool_invoked(state, msg.run_id, msg.node_id, msg.tool_name, msg.tool_args, now), {}
+  end
+  -- Sub-agent chat-id binding. The agent reasoner emits this once per
+  -- firing right after minting its chat_id; the chat surface stores
+  -- chat_id → (run_id, node_id) so emissions tagged with that chat_id
+  -- (notably tool-gate's AGENTS.md auto-load system message) can be
+  -- routed to the DAG sidebar instead of leaking into the main
+  -- transcript. See the agents_md branch in the chat.message.append
+  -- handler for the consumer side.
+  if kind == "graph.node.chat.bound" then
+    if (msg.run_id or "") == "" or (msg.node_id or "") == "" then return state, {} end
+    if type(msg.chat_id) ~= "string" or #msg.chat_id == 0 then return state, {} end
+    local prev = state.chat_id_to_node or {}
+    local next_map = {}
+    for k, v in pairs(prev) do next_map[k] = v end
+    next_map[msg.chat_id] = { run_id = msg.run_id, node_id = msg.node_id }
+    return shallow_merge(state, { chat_id_to_node = next_map }), {}
   end
   if kind == "tool.result" then
     if state.replay_mode then return state, {} end

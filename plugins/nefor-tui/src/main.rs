@@ -211,13 +211,33 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
                     // single state-mutation pass, then the post-loop
                     // `render_if_dirty` paints the final transcript
                     // exactly once.
-                    while let Ok(env) = in_rx.try_recv() {
-                        match env {
-                            Ok(e) => {
+                    //
+                    // Cap the drain at MAX_DRAIN_PER_TICK so a sustained
+                    // high-rate stream (a runaway provider streaming
+                    // ~25 deltas/sec) can't starve the `term_events`
+                    // branch of the outer select. Without this cap, the
+                    // user's ESC / Ctrl+C / Ctrl+D presses queue at
+                    // crossterm's level but never get polled — the inner
+                    // drain only exits when the channel goes momentarily
+                    // empty, and a back-to-back delta burst rarely
+                    // affords that gap. Bounded drain gives terminal
+                    // events a deterministic upper bound on input
+                    // latency (~one tick per 32 envelopes); the next
+                    // outer-loop iteration resumes the drain.
+                    const MAX_DRAIN_PER_TICK: usize = 32;
+                    let mut drained = 0;
+                    while drained < MAX_DRAIN_PER_TICK {
+                        match in_rx.try_recv() {
+                            Ok(Ok(e)) => {
                                 process_envelope(&mut engine, e, &mut shutdown);
                                 if shutdown { break; }
+                                drained += 1;
                             }
-                            Err(e) => tracing::warn!(error = %e, "stdin parse error"),
+                            Ok(Err(e)) => {
+                                tracing::warn!(error = %e, "stdin parse error");
+                                drained += 1;
+                            }
+                            Err(_) => break, // channel empty for this tick
                         }
                     }
                     if shutdown { break; }

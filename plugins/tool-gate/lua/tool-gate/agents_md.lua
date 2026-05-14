@@ -226,9 +226,18 @@ function M.emit_for_tool_call(chat_id, tool_name, args, emitter)
   for _, e in ipairs(found) do
     local text = format_message(e.path, e.dir, e.contents)
     emitter({
-      kind = "chat.message.append",
-      role = "system",
-      text = text,
+      kind    = "chat.message.append",
+      role    = "system",
+      text    = text,
+      -- Stamp the chat_id so the chat surface can route sub-agent
+      -- AGENTS.md emissions to the DAG sidebar instead of the main
+      -- transcript. The chat reducer maps chat_id → (run_id, node_id)
+      -- via `graph.node.chat.bound`; emissions whose chat_id is a
+      -- known sub-chat surface as a node-row "last tool" line, not
+      -- as a free-standing entry in the main chat.
+      chat_id = chat_id,
+      path    = e.path,
+      dir     = e.dir,
     })
     marked[#marked + 1] = e.path
   end

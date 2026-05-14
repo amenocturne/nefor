@@ -306,6 +306,23 @@ local function handle(body)
   agents[firing_id] = entry
   chat_to_firing[chat_id] = firing_id
 
+  -- Bind chat_id ↔ (run_id, node_id) for the chat surface. Sub-agent
+  -- emissions that ride on chat_id (notably the AGENTS.md auto-load
+  -- system message from tool-gate) are routed by the chat reducer to
+  -- the matching DAG node's "last tool" slot rather than the main
+  -- transcript. Without this binding the chat surface has no way to
+  -- know whether a chat_id refers to the lead's chat (render) or a
+  -- sub-agent's chat (route to sidebar).
+  if type(body.run_id) == "string" and type(body.node_id) == "string"
+      and #body.run_id > 0 and #body.node_id > 0 then
+    emit_as("agent", nil, {
+      kind    = "graph.node.chat.bound",
+      run_id  = body.run_id,
+      node_id = body.node_id,
+      chat_id = chat_id,
+    })
+  end
+
   -- Register the agent's chat_id as stream-hidden so the
   -- openai-provider wrapper's gate suppresses the sub-agent's
   -- `<provider>.stream.delta` events from translating into
@@ -413,6 +430,10 @@ local function dispatch_tool_call(entry, call)
       node_id   = entry.node_id,
       tool_id   = tool_id,
       tool_name = name,
+      -- Args ride alongside so the DAG sidebar can render
+      -- `bash(grep …)` instead of bare `bash` — distinguishes
+      -- parallel agents that all happen to use the same tool.
+      tool_args = call_args,
     })
   end
   return true
