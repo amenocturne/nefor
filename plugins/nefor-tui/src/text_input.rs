@@ -71,6 +71,16 @@ pub struct TextInputState {
     /// Whether the focused-prop changed since the last `sync_with_desc`.
     /// Used by the input router to gate engine-internal cursor updates.
     pub focused: bool,
+    /// User is mouse-wheeling through the buffer; suspends the
+    /// cursor-pin in [`crate::layout::sync_multi_line_scroll_y`] so the
+    /// wheel can peek at parts of the buffer outside the cursor's row.
+    /// Cleared by any cursor-moving key, any content mutation, and the
+    /// natural value-shrink path (`sync_with_desc` rewriting `last_value`
+    /// — submit clears the buffer, so scroll_y collapses to 0 and the
+    /// flag must clear too). Mirrors `ScrollableState::was_at_end` in
+    /// purpose: a one-bit user-intent latch that the auto-pin checks
+    /// before stealing the viewport back.
+    pub manual_scroll: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +131,11 @@ impl TextInputState {
             // External mutation → cursor jumps to end; drop selection.
             self.cursor = value.len();
             self.selection_anchor = None;
+            // External rewrite invalidates the manual-scroll latch — the
+            // user's old viewport offset doesn't map onto the new
+            // content, so the auto-pin should re-engage. Submit clears
+            // the buffer this way; autocomplete rewrites also flow here.
+            self.manual_scroll = false;
             // Scroll y can outlive a value rewrite (e.g. only one line
             // changed in a multi-line); keep it but clamp to line count.
             let lines = value.split('\n').count() as u16;

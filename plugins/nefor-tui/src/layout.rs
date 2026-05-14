@@ -1102,6 +1102,17 @@ fn layout_text_input(inst: &mut WidgetInstance, c: Constraints) -> Size {
     }
 
     let visible_lines = visible_line_count(&value, min_lines, max_lines, viewport_w);
+    // Multi-line: pin scroll_y so the cursor's wrapped row stays inside
+    // the visible window. Default behaviour matches Claude Code's input
+    // — the box grows up to `max_lines`, then internal-scrolls with the
+    // cursor anchored to the visible region. Without this, scroll_y
+    // stays at 0 forever and a paste / typing run past the cap shows
+    // the TOP of the buffer with the cursor scrolled off the bottom.
+    if max_lines > 1 && viewport_w > 0 {
+        if let InstanceState::TextInput(st) = &mut inst.state {
+            sync_multi_line_scroll_y(st, &value, viewport_w, visible_lines);
+        }
+    }
     let raw = Size {
         width: c.max_width,
         height: visible_lines.min(c.max_height),
@@ -1114,7 +1125,12 @@ fn layout_text_input(inst: &mut WidgetInstance, c: Constraints) -> Size {
 /// viewport so a long buffer grows vertically up to the cap;
 /// single-line inputs (`max_lines == 1`) always claim one row and rely
 /// on horizontal scrolling for overflow.
-fn visible_line_count(value: &str, min_lines: u16, max_lines: u16, viewport_w: u16) -> u16 {
+pub(crate) fn visible_line_count(
+    value: &str,
+    min_lines: u16,
+    max_lines: u16,
+    viewport_w: u16,
+) -> u16 {
     if max_lines <= 1 {
         return min_lines.max(1);
     }
@@ -1154,6 +1170,58 @@ fn sync_single_line_scroll_x(st: &mut crate::text_input::TextInputState, viewpor
 
 fn unicode_col_width(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// Multi-line cursor-tracking vertical scroll. Bumps `scroll_y` so the
+/// cursor's wrapped row stays inside `[scroll_y, scroll_y + visible)`.
+/// Mirrors [`sync_single_line_scroll_x`] on the y-axis.
+///
+/// Default-anchor-to-cursor: any time the cursor moves past either edge
+/// of the visible window (typing / pasting at end → past the bottom;
+/// arrow-up at the top of the window → past the top), we slide the
+/// window to put the cursor back in view. Above-cap content is hidden
+/// off the TOP, not the bottom — Claude-style.
+///
+/// Suspended while `state.manual_scroll == true` — the user is wheeling
+/// through the buffer and the cursor-pin would otherwise yank the
+/// viewport back as soon as the next layout pass ran. We still clamp
+/// against `max_scroll` so a value-shrink (submit clears buffer) drops
+/// scroll_y to 0; that path also resets the latch through
+/// `sync_with_desc`.
+fn sync_multi_line_scroll_y(
+    st: &mut crate::text_input::TextInputState,
+    value: &str,
+    viewport_w: u16,
+    visible_lines: u16,
+) {
+    if visible_lines == 0 {
+        return;
+    }
+    let rows = crate::text_input::wrap_value(value, viewport_w);
+    let total = rows.len() as u32;
+    let visible = visible_lines as u32;
+    let scroll_y = st.scroll_y as u32;
+    // Clamp first to handle a value rewrite that shrank the buffer
+    // below the prior offset (e.g. submit clears value → buffer = 1
+    // row, scroll_y was 5 → must reset to 0).
+    let max_scroll = total.saturating_sub(visible);
+    let new_scroll = scroll_y.min(max_scroll);
+    if st.manual_scroll {
+        // Manual-scroll latch active: leave the user's offset alone
+        // (still post-clamp). Pin re-engages when an editing key or a
+        // value rewrite clears the latch.
+        st.scroll_y = new_scroll.min(u16::MAX as u32) as u16;
+        return;
+    }
+    let (cursor_row, _) = crate::text_input::cursor_in_wrap_for(value, &rows, st.cursor);
+    let cursor_row_u = cursor_row as u32;
+    let mut new_scroll = new_scroll;
+    if cursor_row_u < new_scroll {
+        new_scroll = cursor_row_u;
+    } else if cursor_row_u >= new_scroll + visible {
+        new_scroll = cursor_row_u + 1 - visible;
+    }
+    st.scroll_y = new_scroll.min(u16::MAX as u32) as u16;
 }
 
 fn paint_text_input(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
@@ -1941,7 +2009,14 @@ fn write_styled_row(
             text: s,
             style: sc.style,
         };
-        col += w;
+        col += 1;
+        // Wide-char spillover (East-Asian Wide / Fullwidth / most
+        // emoji): blank the (w - 1) trailing cells so prior-frame ink
+        // can't bleed through, AND so total advance equals the glyph's
+        // display width. Earlier shape did `col += w` then advanced
+        // again per blank, double-counting wide chars and visually
+        // gapping CJK runs (Bug 4 wide chars). Mirrors the same fix in
+        // `write_run` for plain-text painting.
         for _ in 1..w {
             if col >= line_buf.cells.len() || col >= bound {
                 break;
@@ -2101,10 +2176,17 @@ fn write_run(buf: &mut FrameBuffer, row: u16, col_start: u16, text: &str, style:
             text: s,
             style: *style,
         };
-        col += w;
-        // Wide chars: blank out the trailing cell(s) to avoid duplicating
-        // ink. Phase 1/2 are ASCII-only so this branch is dead; landed
-        // for forward compatibility.
+        col += 1;
+        // Wide chars (East-Asian Wide / Fullwidth / most emoji): the
+        // glyph itself painted into one cell above; blank out the
+        // remaining (w - 1) trailing cells so a previous frame's ink
+        // doesn't bleed through, and so total advance equals the
+        // glyph's display width. The earlier shape advanced `col += w`
+        // before this loop AND advanced again per iteration, double-
+        // counting wide chars: e.g. `你 好` rendered as `你  好` with
+        // an extra blank between glyphs and every subsequent char
+        // shifted right one cell per wide-char encountered (Bug 4 wide
+        // chars).
         for _ in 1..w {
             if col >= line.cells.len() {
                 break;
@@ -2755,6 +2837,41 @@ mod tests {
     fn wrap_word_keeps_intact_when_fits() {
         let rows = wrap_text("hello", 10, WrapMode::Word);
         assert_eq!(rows, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn wrap_word_falls_back_to_char_wrap_for_oversized_word_at_line_start() {
+        // A single word longer than the line should char-wrap instead of
+        // overflowing — this case the old implementation already handled.
+        let rows = wrap_text("abcdefghij", 4, WrapMode::Word);
+        assert_eq!(
+            rows,
+            vec!["abcd".to_string(), "efgh".to_string(), "ij".to_string(),]
+        );
+    }
+
+    #[test]
+    fn wrap_word_char_wraps_oversized_word_after_mid_line_flush() {
+        // Regression: a normal-sized word fills part of the line, then a
+        // word longer than the limit follows. The previous implementation
+        // flushed the line, then extended `current` with the long word
+        // unchanged — producing a row that overflowed `limit`. The fix
+        // reorders the checks so the flushed-to-empty state goes through
+        // the char-wrap fallback.
+        let rows = wrap_text("hi superlongword", 6, WrapMode::Word);
+        assert_eq!(
+            rows,
+            vec![
+                "hi ".to_string(),
+                "superl".to_string(),
+                "ongwor".to_string(),
+                "d".to_string(),
+            ]
+        );
+        // No row exceeds the 6-char limit.
+        for row in &rows {
+            assert!(row.chars().count() <= 6, "row {row:?} exceeded limit");
+        }
     }
 
     #[test]
@@ -3497,6 +3614,61 @@ mod tests {
         let st = scrollable_state(&rec);
         assert_eq!(st.scroll_y, 5, "user position preserved");
         assert!(!st.was_at_end);
+    }
+
+    /// Bug 4 (wide chars) regression: a CJK / fullwidth / emoji glyph is
+    /// width-2 per `unicode-width`. Each such char should occupy
+    /// **exactly two cells** — one for the glyph, one blank for the
+    /// spillover — so total horizontal advance equals the glyph's
+    /// display width and `string_width` is honoured. The earlier shape
+    /// did `col += w` for the glyph cell AND advanced once more per
+    /// blank, double-counting the spillover and shifting every char
+    /// after a wide char one extra cell to the right per occurrence
+    /// (visible as e.g. `你 好 世 界` rendering with double-spaced
+    /// glyphs and trailing chars wrapping early).
+    #[test]
+    fn wide_char_writes_one_glyph_plus_one_blank_no_double_advance() {
+        // `你好` is two East-Asian Wide chars (width 2 each = 4 cells
+        // total). After the run, an ASCII `x` should land at col 4.
+        let buf = paint_root(text("你好x"), 8, 1);
+        assert_eq!(cell_at(&buf, 0, 0), "你", "glyph at col 0");
+        assert_eq!(cell_at(&buf, 0, 1), " ", "spillover blank for `你`");
+        assert_eq!(cell_at(&buf, 0, 2), "好", "next glyph at col 2");
+        assert_eq!(cell_at(&buf, 0, 3), " ", "spillover blank for `好`");
+        assert_eq!(
+            cell_at(&buf, 0, 4),
+            "x",
+            "ASCII follows immediately, no extra gap"
+        );
+    }
+
+    /// Same contract for the styled-rows path (markdown, spans). The
+    /// Lua composition uses both `tui.text` (plain) and `tui.markdown`
+    /// (styled) for transcript prose, so both writers need the
+    /// invariant pinned.
+    #[test]
+    fn wide_char_writes_through_styled_painter_without_double_advance() {
+        // Drive paint_styled_rows directly via the spans primitive so
+        // we exercise write_styled_row, not write_run. `Spans` painter
+        // delegates to paint_styled_rows.
+        let desc = WidgetDescription::Spans {
+            spans: vec![Span {
+                text: "你好x".into(),
+                style: Style::default(),
+            }],
+            wrap: WrapMode::None,
+            key: None,
+        };
+        let buf = paint_root(desc, 8, 1);
+        assert_eq!(cell_at(&buf, 0, 0), "你");
+        assert_eq!(cell_at(&buf, 0, 1), " ", "spillover blank for `你`");
+        assert_eq!(cell_at(&buf, 0, 2), "好");
+        assert_eq!(cell_at(&buf, 0, 3), " ", "spillover blank for `好`");
+        assert_eq!(
+            cell_at(&buf, 0, 4),
+            "x",
+            "ASCII follows at col 4 with no extra cell gap"
+        );
     }
 
     #[test]

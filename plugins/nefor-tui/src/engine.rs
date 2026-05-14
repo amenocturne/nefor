@@ -11,14 +11,15 @@ use crate::animation::sample as animation_sample;
 use crate::desc::WidgetDescription;
 use crate::error::TuiError;
 use crate::input::KeyMessage;
-use crate::input_router::{route_key, RouteDecision};
+use crate::input_router::{route_key, route_paste, PasteDecision, RouteDecision};
 use crate::instance::{sync_text_inputs, InstanceKind, InstanceState, WidgetInstance};
 use crate::lua_host::{
     LuaHost, ScrollCommand, ScrollPositionMap, ScrollPositionSnapshot, SideEffect,
 };
 use crate::mouse::{
-    find_scrollable_path, hit_test, instance_at_path as mouse_instance_at_path, kind_string,
-    MouseKind, MouseMessage, SelectionRange,
+    find_focused_multiline_text_input_path, find_scrollable_path, hit_test,
+    instance_at_path as mouse_instance_at_path, kind_string, MouseKind, MouseMessage,
+    SelectionRange,
 };
 use crate::reconciler::Reconciler;
 use crate::render::{extract_selection_text, Renderer};
@@ -191,6 +192,45 @@ impl Engine {
         }
         msg.set("mods", mods)?;
         self.dispatch_msg(msg)
+    }
+
+    /// Insert a bracketed-paste payload at the cursor of the focused
+    /// text_input — one buffer mutation, one `on_change` dispatch, one
+    /// render-mark-dirty regardless of how many characters or
+    /// newlines the paste contains. Without this path, a multi-line
+    /// paste would arrive from crossterm as a stream of per-character
+    /// `Event::Key(Char)` events with bracketed-paste disabled — each
+    /// triggering its own dispatch + reconcile + render cycle, so a
+    /// 200-character paste rendered character-by-character with
+    /// visible lag (issue #36).
+    ///
+    /// No focused text_input → silently drop. Browser parity: a paste
+    /// outside any editable surface goes nowhere.
+    pub fn handle_paste(&mut self, text: &str) -> Result<(), TuiError> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.ensure_reconciled()?;
+        let Some(root) = self.reconciler.root.as_mut() else {
+            return Ok(());
+        };
+        match route_paste(root, text) {
+            PasteDecision::Drop => Ok(()),
+            PasteDecision::HandledByTextInput {
+                target_key,
+                on_change,
+                value,
+                value_changed,
+            } => {
+                if value_changed {
+                    if let Some(kind) = on_change {
+                        self.dispatch_named(&kind, &target_key, Some(&value))?;
+                    }
+                }
+                self.needs_render = true;
+                Ok(())
+            }
+        }
     }
 
     /// Build `{ kind, target_key, value? }` and dispatch through Lua's
@@ -415,6 +455,16 @@ impl Engine {
         // scrollable's state. If none is under the cursor, fall through
         // to the bubble path so Lua sees the wheel event verbatim.
         if matches!(evt.kind, MouseKind::Wheel) {
+            // Focused multi-line text_input under the cursor wins
+            // first — the user's intent is "peek through this prompt's
+            // overflowed rows", and a scrollable transcript stacked
+            // around it (or a bubble to Lua) would otherwise steal the
+            // gesture. Single-line and unfocused text_inputs fall
+            // through to the existing path.
+            if self.try_wheel_text_input_scroll(&evt)? {
+                self.needs_render = true;
+                return Ok(());
+            }
             let absorbed = self.try_wheel_scroll(&evt)?;
             if let Some(notify) = absorbed {
                 if let Some((kind, target_key, offset)) = notify {
@@ -597,6 +647,71 @@ impl Engine {
             _ => None,
         };
         Ok(Some(notify))
+    }
+
+    /// Wheel-on-prompt: when a focused multi-line text_input lives under
+    /// the cursor, bump its `scroll_y` by ±`WHEEL_STEP_ROWS` so the user
+    /// can peek through the overflowed rows of a long buffer. Sets the
+    /// `manual_scroll` latch so the next layout pass's `sync_multi_line_
+    /// scroll_y` doesn't yank the viewport back to the cursor.
+    ///
+    /// Returns `true` when the event was consumed, `false` to fall
+    /// through to the scrollable / bubble path.
+    fn try_wheel_text_input_scroll(&mut self, evt: &MouseMessage) -> Result<bool, TuiError> {
+        let delta_rows: i32 = match evt.button {
+            Some("up") => -(WHEEL_STEP_ROWS as i32),
+            Some("down") => WHEEL_STEP_ROWS as i32,
+            _ => return Ok(false),
+        };
+        let Some(root) = self.reconciler.root.as_mut() else {
+            return Ok(false);
+        };
+        let Some(path) = find_focused_multiline_text_input_path(root, evt.x, evt.y) else {
+            return Ok(false);
+        };
+        let Some(target) = mouse_instance_at_path(root, &path) else {
+            return Ok(false);
+        };
+        let (value, min_lines, max_lines) = match &target.last_desc {
+            WidgetDescription::TextInput {
+                value,
+                min_lines,
+                max_lines,
+                ..
+            } => (value.clone(), *min_lines, *max_lines),
+            _ => return Ok(false),
+        };
+        let InstanceState::TextInput(state) = &mut target.state else {
+            return Ok(false);
+        };
+        let viewport_w = state.viewport_width;
+        if viewport_w == 0 {
+            // Pre-layout — no geometry to clamp against. Drop the
+            // event silently; the next layout pass will set viewport_w.
+            return Ok(false);
+        }
+        let total_rows = crate::text_input::soft_wrapped_line_count(&value, viewport_w) as u32;
+        let visible =
+            crate::layout::visible_line_count(&value, min_lines, max_lines, viewport_w) as u32;
+        let max_scroll = total_rows.saturating_sub(visible);
+        if max_scroll == 0 {
+            // Buffer fits entirely in the viewport — wheel has nothing
+            // to do. Consume the event so it doesn't bubble to a
+            // transcript scrollable below; the user's gesture was aimed
+            // at the prompt regardless.
+            return Ok(true);
+        }
+        let next = (state.scroll_y as i32)
+            .saturating_add(delta_rows)
+            .clamp(0, max_scroll as i32) as u16;
+        if next != state.scroll_y {
+            state.scroll_y = next;
+        }
+        // Latch even when the offset didn't change (already at edge):
+        // the user explicitly wheeled here, the auto-pin should stay
+        // suspended until the next editing key.
+        state.manual_scroll = true;
+        Ok(true)
     }
 
     /// Render if dirty. Returns the ANSI bytes; `None` means "no work".
@@ -1627,6 +1742,95 @@ mod tests {
         assert!(
             s.contains("got:pha\nbeta") || s.contains("got:pha"),
             "expected multi-row line-flow text, got: {s:?}"
+        );
+    }
+
+    // ── bracketed paste (issue #36) ─────────────────────────────────
+
+    /// Scenario with a focused multi-line input + an `on_change` counter
+    /// in state. Drives the engine-level paste path end-to-end so the
+    /// regression test asserts the full handle_paste contract: one
+    /// dispatch_named call (one `input.changed` message), one buffer
+    /// mutation, and one `render_if_dirty` flip — regardless of paste
+    /// length. Pre-fix the path was per-character, so a 200-char paste
+    /// would advance the counter to 200 and force 200 separate render
+    /// passes.
+    const PASTE_SCENARIO: &str = r#"
+        tui.start {
+          initial_state = { value = "", changes = 0 },
+          view = function(s)
+            return tui.column { gap = 0, children = {
+              tui.text { content = "v=" .. (s.value or "") },
+              tui.text { content = "c=" .. tostring(s.changes) },
+              tui.text_input {
+                key       = "input",
+                value     = s.value,
+                focused   = true,
+                on_change = "input.changed",
+                on_submit = "input.submit",
+                min_lines = 1,
+                max_lines = 6,
+              },
+            }}
+          end,
+          update = function(msg, s)
+            if msg.kind == "input.changed" then
+              return { value = msg.value or "", changes = (s.changes or 0) + 1 }, {}
+            end
+            return s, {}
+          end,
+        }
+    "#;
+
+    #[test]
+    fn paste_dispatches_single_on_change_for_full_payload() {
+        let mut engine = Engine::new(80, 12).expect("engine");
+        engine.load_scenario(PASTE_SCENARIO).expect("load");
+        let _ = engine.render_if_dirty().expect("first").expect("dirty");
+
+        let payload: String = "a".repeat(200);
+        engine.handle_paste(&payload).expect("paste");
+
+        // First render after paste must produce one frame; after that
+        // there's no further work for the engine until something else
+        // changes — confirms no per-char redraw cascade happened.
+        let _ = engine
+            .render_if_dirty()
+            .expect("post-paste")
+            .expect("dirty");
+        let again = engine.render_if_dirty().expect("idle");
+        assert!(
+            again.is_none(),
+            "second render after paste should be a no-op — \
+             a per-char path would still have queued state changes"
+        );
+
+        // c=1 proves the on_change message fired exactly once for the
+        // whole paste (not 200 times). v=<full payload> proves the
+        // single insert_str carried the entire string.
+        let snap = engine.snapshot();
+        assert!(
+            snap.contains("c=1"),
+            "expected exactly one input.changed dispatch, got snapshot:\n{snap}"
+        );
+        assert!(
+            snap.contains(&format!("v={payload}").chars().take(80).collect::<String>()),
+            "expected pasted payload prefix in v=, got snapshot:\n{snap}"
+        );
+    }
+
+    #[test]
+    fn paste_with_no_focused_input_is_silent_noop() {
+        // No focused text_input → handle_paste must not error and must
+        // not mark dirty (no observable state change to draw).
+        let mut engine = Engine::new(40, 5).expect("engine");
+        engine.load_scenario(COUNTER_SCENARIO).expect("load");
+        let _ = engine.render_if_dirty().expect("first").expect("dirty");
+        engine.handle_paste("hello world").expect("paste");
+        let again = engine.render_if_dirty().expect("post");
+        assert!(
+            again.is_none(),
+            "paste with no focused input should not mark the engine dirty"
         );
     }
 }

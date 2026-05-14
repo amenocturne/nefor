@@ -176,23 +176,51 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
     // `render_if_dirty` returns `None`, so the loop just goes back to
     // sleep.
     let mut anim_tick = interval(Duration::from_millis(16));
+    // 1Hz wall-clock tick for live elapsed-ms labels — DAG node
+    // "running 18s" badges, the [thinking… 5s] turn-elapsed counter,
+    // etc. The Lua composition formats these labels against
+    // `tui.now_ms()` at paint time, so the *value* changes once per
+    // second even though no event fires; without a periodic mark-
+    // dirty the renderer stays clean and the label visibly freezes
+    // until the next user keystroke or bus envelope. Ticking at 1Hz
+    // matches the second-resolution of the labels themselves — going
+    // higher just burns CPU and battery for no visible difference
+    // (Bug A5 per-second rerender). The 60Hz animation tick is
+    // independent and continues to serve sub-second animation
+    // primitives (toast slide, spinner, …).
+    let mut wallclock_tick = interval(Duration::from_secs(1));
     loop {
         tokio::select! {
             maybe_env = in_rx.recv() => match maybe_env {
                 Some(Ok(env)) => {
-                    match env.body {
-                        Body::System(SystemBody::Shutdown { .. }) => break,
-                        Body::System(_) => {
-                            // Other system messages (ready_ok again, errors)
-                            // are not actionable post-handshake; log + skip.
-                            tracing::debug!("post-handshake system message ignored");
-                        }
-                        Body::Event(map) => {
-                            if let Err(e) = engine.dispatch_envelope_body(&map) {
-                                tracing::warn!(error = %e, "engine.dispatch_envelope_body");
+                    let mut shutdown = false;
+                    process_envelope(&mut engine, env, &mut shutdown);
+                    if shutdown { break; }
+                    // Drain any further pending envelopes in this tick
+                    // before we paint. Post batch-protocol refactor the
+                    // engine's per-peer dispatch hands the wrapper a
+                    // batch of envelopes (e.g. an entire replay burst on
+                    // /resume) and the wrapper's `to_plugin(envs)`
+                    // delivers them back-to-back to our stdin. Without
+                    // this drain each line iterates the outer loop
+                    // separately, triggering its own render — N replayed
+                    // chat.stream.delta envelopes meant N reconciler
+                    // passes and N terminal writes, which made /resume
+                    // visibly re-stream the prior session line by line.
+                    // try_recv-style drain absorbs the burst into a
+                    // single state-mutation pass, then the post-loop
+                    // `render_if_dirty` paints the final transcript
+                    // exactly once.
+                    while let Ok(env) = in_rx.try_recv() {
+                        match env {
+                            Ok(e) => {
+                                process_envelope(&mut engine, e, &mut shutdown);
+                                if shutdown { break; }
                             }
+                            Err(e) => tracing::warn!(error = %e, "stdin parse error"),
                         }
                     }
+                    if shutdown { break; }
                 }
                 Some(Err(e)) => tracing::warn!(error = %e, "stdin parse error"),
                 None => break,
@@ -209,7 +237,8 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
                         engine.handle_mouse(mm)?;
                     }
                 }
-                Some(Ok(_)) => {} // paste / focus — phase 4 doesn't surface these
+                Some(Ok(Event::Paste(text))) => engine.handle_paste(&text)?,
+                Some(Ok(_)) => {} // focus events — not surfaced to Lua
                 Some(Err(e)) => tracing::warn!(error = %e, "crossterm event error"),
                 None => break,
             },
@@ -217,6 +246,14 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
                 if engine.has_active_animations() {
                     engine.mark_animation_tick();
                 }
+            }
+            _ = wallclock_tick.tick() => {
+                // Force a repaint so live elapsed-ms labels (DAG node
+                // 'running Ns', [thinking… Ns]) advance even when no
+                // bus envelope or keystroke arrives. The Lua composition
+                // re-reads tui.now_ms() at paint time, so flipping the
+                // dirty flag is enough — no state change required.
+                engine.mark_animation_tick();
             }
         }
 
@@ -241,6 +278,28 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
     drop(tty_main);
     let _ = out_tx; // keep writer alive until end of run
     Ok(())
+}
+
+/// Dispatch one inbound envelope to the engine. System messages are
+/// either a shutdown signal (sets `shutdown = true`) or post-handshake
+/// noise; `Body::Event` envelopes flow into the Lua reducer via
+/// `dispatch_envelope_body`. Extracted from the main loop so the
+/// in-tick drain that batches a burst of envelopes can apply identical
+/// handling per envelope.
+fn process_envelope(engine: &mut Engine, env: Envelope, shutdown: &mut bool) {
+    match env.body {
+        Body::System(SystemBody::Shutdown { .. }) => {
+            *shutdown = true;
+        }
+        Body::System(_) => {
+            tracing::debug!("post-handshake system message ignored");
+        }
+        Body::Event(map) => {
+            if let Err(e) = engine.dispatch_envelope_body(&map) {
+                tracing::warn!(error = %e, "engine.dispatch_envelope_body");
+            }
+        }
+    }
 }
 
 /// Drain accumulated Lua egress and forward each entry as a

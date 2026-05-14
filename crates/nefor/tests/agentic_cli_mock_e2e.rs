@@ -221,7 +221,12 @@ fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
         s.to_owned()
     } else {
-        format!("{}...<truncated {} bytes>", &s[..n], s.len() - n)
+        // Floor to the nearest char boundary at-or-before `n`; raw
+        // `&s[..n]` panics when `n` lands inside a multi-byte UTF-8
+        // char (scenario_4 flake under heavy parallel load — help
+        // banners with CJK / cyrillic byte runs cross the cap).
+        let cut = s.floor_char_boundary(n);
+        format!("{}...<truncated {} bytes>", &s[..cut], s.len() - cut)
     }
 }
 
@@ -232,6 +237,31 @@ fn assert_success(out: &ProcessOutput) {
         out.status,
         truncate(&out.stderr, 4096)
     );
+}
+
+#[test]
+fn truncate_does_not_panic_on_multibyte_boundary() {
+    // Pre-fix `truncate` did `&s[..n]` which panics whenever `n` lands
+    // inside a multi-byte UTF-8 char — the scenario_4 flake under heavy
+    // parallel load when a help-banner CJK / cyrillic byte run crossed
+    // the 2048-byte cap. Each n in 0..=s.len() must produce valid UTF-8.
+    let s = "привет world hello мир — еще немного текста";
+    for n in 0..=s.len() {
+        let out = truncate(s, n);
+        // String already enforces UTF-8 validity, so reaching this line
+        // is the no-panic assertion. Belt-and-braces: the prefix must
+        // be a prefix of `s` up to some char boundary at-or-before n.
+        let head_end = out.find("...<truncated ").unwrap_or(out.len());
+        let head = &out[..head_end];
+        assert!(s.starts_with(head), "head must be a prefix of input");
+        assert!(
+            head.len() <= n,
+            "head bytes ({}) must not exceed cap ({}) for n={}",
+            head.len(),
+            n,
+            n
+        );
+    }
 }
 
 // --------------------------------------------------------------------
