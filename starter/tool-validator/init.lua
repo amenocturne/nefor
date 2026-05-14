@@ -65,21 +65,45 @@ local DA_ARGS = {
   "--cargo", "local",
 }
 
--- Resolved on first use. nil => not probed; true => available;
--- false => probe failed (no da on PATH). The probe is one fork+exec
--- with --version; cheap to defer to first call.
-local da_available = nil
+-- Resolved on first use. The cache holds the resolved cmd path
+-- (e.g. /Users/x/.local/share/nefor/bin/da) when da is reachable, or
+-- false when the probe failed. nil => not probed yet.
+local da_cmd = nil
 
+-- Find da via two paths, in priority order:
+--   1. <data_root>/bin/da — the private install `just install-nefor`
+--      drops into ~/.local/share/nefor/bin/. Keeps da off the user's
+--      PATH but reachable from the engine.
+--   2. PATH lookup of bare `da` — fallback for users who installed it
+--      themselves (e.g. `cargo install dabin`).
+-- Either path is probed via `da --version`; whichever succeeds wins.
 local function probe_da()
-  if da_available ~= nil then return da_available end
-  local r = nefor.process.run { cmd = "da", args = { "--version" } }
-  da_available = (type(r) == "table" and r.code == 0) or false
-  if not da_available then
-    nefor.log.warn("tool-validator: `da` not on PATH; bash invocations " ..
-                   "will defer to the user popup. Install via `cargo " ..
-                   "install dabin` (or upstream's `just install`).")
+  if da_cmd ~= nil then return da_cmd end
+
+  local function try(cmd)
+    local r = nefor.process.run { cmd = cmd, args = { "--version" } }
+    if type(r) == "table" and r.code == 0 then return cmd end
+    return nil
   end
-  return da_available
+
+  local data_root = (nefor.fs and nefor.fs.data_root and nefor.fs.data_root()) or nil
+  local private = data_root and (data_root .. "/bin/da") or nil
+  if private and try(private) then
+    da_cmd = private
+    return da_cmd
+  end
+
+  if try("da") then
+    da_cmd = "da"
+    return da_cmd
+  end
+
+  da_cmd = false
+  nefor.log.warn("tool-validator: `da` not found at " ..
+                 (private or "<data_root>/bin/da") .. " or on PATH; bash " ..
+                 "invocations will defer to the user popup. Re-run " ..
+                 "`just install-nefor` to install it under the libexec dir.")
+  return da_cmd
 end
 
 local function emit_response(id, decision, reason)
@@ -129,9 +153,10 @@ end
 -- Spawn / unavailability is treated as defer.
 local function classify_bash(command)
   if type(command) ~= "string" or #command == 0 then return "defer" end
-  if not probe_da() then return "defer" end
+  local cmd = probe_da()
+  if not cmd then return "defer" end
   local r = nefor.process.run {
-    cmd   = "da",
+    cmd   = cmd,
     args  = DA_ARGS,
     stdin = command,
   }
@@ -197,6 +222,6 @@ return {
     classify_bash             = classify_bash,
     classify_dispatch_graph   = classify_dispatch_graph,
     handle_permission_request = handle_permission_request,
-    reset = function() da_available = nil end,
+    reset = function() da_cmd = nil end,
   },
 }

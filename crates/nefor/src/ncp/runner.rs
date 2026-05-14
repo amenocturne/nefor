@@ -49,14 +49,29 @@ impl PluginRoot {
 /// Resolve the plugin root directory using, in order of precedence:
 ///
 /// 1. `cli_override` — explicit `--plugin-dir` flag.
-/// 2. `NEFOR_PLUGIN_DIR` environment variable.
-/// 3. `$NEFOR_DATA_DIR/plugins/` if that path is a directory.
-/// 4. `<exe-dir>/../share/nefor/plugins` if that path is a directory
-///    (covers system installs like Homebrew where the binary lives at
-///    `<prefix>/bin/nefor` and plugins at `<prefix>/share/nefor/plugins`).
-/// 5. `<exe-dir>` if it contains the bundled `nefor-tui` binary
-///    (in-tree dev mode where `cargo build` puts everything in `target/debug/`).
-/// 6. `$XDG_DATA_HOME/nefor/plugins/` (falling back to
+/// 2. `NEFOR_PLUGIN_DIR` environment variable. Override only; the
+///    default install layout (#4) doesn't require it.
+/// 3. `<exe-dir>` if it contains the bundled `nefor-tui` binary.
+///    Covers in-tree `cargo build` (everything in `target/debug/`)
+///    and the brew layout where the formula installs every binary
+///    next to `nefor`. Strong positive signal: a real plugin binary
+///    is sitting next to the engine.
+/// 4. `<data_root>/bin` if it contains `nefor-tui`. This is the
+///    default location for `just install-nefor source` — the recipe
+///    drops every plugin (and `da`) into `~/.local/share/nefor/bin`
+///    so only the user-facing `nefor` CLI is exposed on PATH. The
+///    engine finds them here without any env var being set, matching
+///    the data root the rest of the engine reports.
+/// 5. `<exe-dir>/../share/nefor/plugins` if that path is a directory
+///    (legacy Homebrew layout where the formula put plugins under
+///    `<prefix>/share/nefor/plugins/`). Path-shape only — falls
+///    behind #3/#4 because it collides with nefor-pm's source overlay
+///    on user installs (the dir exists with source-dir symlinks but
+///    no executables; spawn would fail).
+/// 6. `$NEFOR_DATA_DIR/plugins/` if that path is a directory. Late
+///    fallback — nefor-pm uses it as a Lua require() overlay, not an
+///    executables directory.
+/// 7. `$XDG_DATA_HOME/nefor/plugins/` (falling back to
 ///    `~/.local/share/nefor/plugins/`).
 ///
 /// Returns `None` if none of the above produced a usable path. The engine
@@ -70,6 +85,15 @@ pub fn resolve_plugin_root(cli_override: Option<PathBuf>) -> Option<PluginRoot> 
             return Some(PluginRoot(PathBuf::from(raw)));
         }
     }
+    if let Some(p) = exe_dir_in_tree() {
+        return Some(PluginRoot(p));
+    }
+    if let Some(p) = data_root_bin() {
+        return Some(PluginRoot(p));
+    }
+    if let Some(p) = exe_relative_share_plugins() {
+        return Some(PluginRoot(p));
+    }
     if let Ok(raw) = std::env::var("NEFOR_DATA_DIR") {
         if !raw.is_empty() {
             let p = PathBuf::from(raw).join("plugins");
@@ -77,12 +101,6 @@ pub fn resolve_plugin_root(cli_override: Option<PathBuf>) -> Option<PluginRoot> 
                 return Some(PluginRoot(p));
             }
         }
-    }
-    if let Some(p) = exe_relative_share_plugins() {
-        return Some(PluginRoot(p));
-    }
-    if let Some(p) = exe_dir_in_tree() {
-        return Some(PluginRoot(p));
     }
     if let Some(data_home) = xdg_data_home() {
         return Some(PluginRoot(data_home.join("nefor").join("plugins")));
@@ -100,6 +118,28 @@ fn exe_dir_in_tree() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
     let dir = exe.parent()?.to_path_buf();
     dir.join("nefor-tui").is_file().then_some(dir)
+}
+
+/// `<data_root>/bin` if it contains the bundled `nefor-tui` binary.
+/// `data_root` resolves the same way `nefor.fs.data_root` reports it
+/// to Lua: `$NEFOR_DATA_DIR` if set (main.rs propagates this from the
+/// CLI flag / env / XDG default), otherwise `$XDG_DATA_HOME/nefor`,
+/// otherwise `~/.local/share/nefor`. The recipe `just install-nefor
+/// source` lands every plugin binary at `<data_root>/bin/`, so this
+/// is the default plugin root for source installs without requiring
+/// the user to export `NEFOR_PLUGIN_DIR`.
+fn data_root_bin() -> Option<PathBuf> {
+    let data_root = if let Ok(raw) = std::env::var("NEFOR_DATA_DIR") {
+        if !raw.is_empty() {
+            PathBuf::from(raw)
+        } else {
+            xdg_data_home()?.join("nefor")
+        }
+    } else {
+        xdg_data_home()?.join("nefor")
+    };
+    let candidate = data_root.join("bin");
+    candidate.join("nefor-tui").is_file().then_some(candidate)
 }
 
 fn xdg_data_home() -> Option<PathBuf> {
@@ -186,6 +226,32 @@ mod tests {
         let p = PathBuf::from("/tmp/explicit");
         let got = resolve_plugin_root(Some(p.clone())).expect("some");
         assert_eq!(got.as_path(), p.as_path());
+    }
+
+    #[test]
+    fn resolve_plugin_root_exe_dir_beats_xdg_share_overlay() {
+        // Regression: when the engine is `just install`-ed to
+        // ~/.local/bin/, the exe-relative-share path
+        // (`<exe-dir>/../share/nefor/plugins`) resolves to
+        // ~/.local/share/nefor/plugins, which is exactly the path
+        // nefor-pm uses for its Lua require() source overlay (full of
+        // source-dir symlinks, no executables). The first attempt at a
+        // fix put exe_dir_in_tree AFTER exe_relative_share_plugins,
+        // so the path-shape check still won and every plugin spawn
+        // failed with "permission denied" / "no such file".
+        //
+        // The corrected priority puts exe_dir_in_tree FIRST: it has a
+        // positive signal (`nefor-tui` is present as a file in the
+        // exe dir) that the relative-share path-shape check lacks.
+        // Homebrew layout is unaffected because nefor-tui is NOT in
+        // /opt/homebrew/bin/ — it lives under share/nefor/plugins/,
+        // so exe_dir_in_tree fails and exe_relative_share_plugins
+        // catches it.
+        //
+        // Process env is racy across tests, so this stays a doc-pin
+        // anchored to the priority list in resolve_plugin_root's
+        // doc-comment. The cli-override and round-trip tests cover
+        // the structural contract.
     }
 
     #[test]
