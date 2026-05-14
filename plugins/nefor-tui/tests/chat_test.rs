@@ -73,7 +73,7 @@ fn chat_lua_source() -> String {
     if std::env::var_os("NEFOR_STARTER_CHAT_DIR").is_none() {
         std::env::set_var("NEFOR_STARTER_CHAT_DIR", &chat_subdir);
     }
-    let chat_path = repo_root.join("starter").join("chat").join("init.lua");
+    let chat_path = repo_root.join("starter").join("chat.lua");
     std::fs::read_to_string(&chat_path).unwrap_or_else(|e| panic!("read {:?}: {e}", chat_path))
 }
 
