@@ -336,6 +336,21 @@ local run_reasoner          = require("reasoners.run")
 local run_wrappers_reasoner = require("reasoners.run-wrappers")
 local loop_counter_reasoner = require("reasoners.loop_counter")
 
+-- agent reasoner (lead workflow keystone) — self-contained module.
+-- Lazy-required on first dispatch to avoid circular import at module load.
+local agent_reasoner
+
+local function agent_handle(body)
+  if agent_reasoner == nil then
+    agent_reasoner = require("reasoners.agent")
+  end
+  return agent_reasoner.handle(body)
+end
+
+local run_reasoner          = require("reasoners.run")
+local run_wrappers_reasoner = require("reasoners.run-wrappers")
+local loop_counter_reasoner = require("reasoners.loop_counter")
+
 local handlers = {
   ["dummy"]            = function(body) return provider_run_node("dummy", body) end,
   ["provider-wrapper"] = function(body) return provider_run_node("provider-wrapper", body) end,
@@ -343,6 +358,11 @@ local handlers = {
   ["tool-executor"]    = tool_executor_run_node,
   ["adapter"]          = adapter_run_node,
   ["terminal"]         = terminal_run_node,
+  -- agent reasoner (lead workflow keystone)
+  ["agent"]            = agent_handle,
+  ["run"]              = run_reasoner.handle,
+  ["runCommand"]       = run_wrappers_reasoner.handle,
+  ["loop-counter"]     = loop_counter_reasoner.handle,
 }
 
 local function lua_resident_types()
@@ -415,6 +435,24 @@ local function receive_msg(entry)
   -- Skip during replay — graph already ran; re-dispatch would
   -- duplicate every side effect.
   if replay_window.active() then return end
+
+  -- Forward bus events to the agent reasoner so it can advance its
+  -- per-firing turn-cycle when provider replies / tool results land.
+  -- The agent reasoner is module-local-stateful (per §7-a of the spec)
+  -- because reasoner-graph re-fires only on cyclic graphs; an agent
+  -- node has no cycle, so the loop runs inline within one firing while
+  -- the firing waits on bus envelopes targeting our chat_ids /
+  -- tool_ids.
+  if agent_reasoner == nil then
+    agent_reasoner = require("reasoners.agent")
+  end
+  agent_reasoner.receive_msg(entry)
+
+  -- The `run` reasoner correlates tool-gate's `tool.result` envelopes
+  -- by tool_id back to its waiting firing_id. Forward every envelope
+  -- so its receive_msg can pick the ones it owns; non-matching
+  -- tool_ids are silently skipped inside the module.
+  run_reasoner.receive_msg(entry)
 
   -- Dispatch tool.invoke { name in handlers }. Anything else on the
   -- bus is for someone else (real tools, spawn_graph routed to

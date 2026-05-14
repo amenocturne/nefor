@@ -54,6 +54,7 @@ local state = {
   chat_id_to_key       = {},    ---@type table
   tool_id_to_key       = {},    ---@type table
   chat_id_stream_visible = {},  ---@type table
+  chat_id_stream_explicitly_hidden = {},  ---@type table  -- chats explicitly registered hidden by agent reasoners; gates streams without a pending entry
   -- firing_id → { run_id, node_id, reasoner } for tracked runs (the
   -- orchestrator run + every sub-graph run we own). Populated by
   -- graph.node.fired observer envelopes; consumed when a tool.result
@@ -222,6 +223,7 @@ local function cancel_all()
   state.pending = {}
   state.chat_id_to_key = {}
   state.chat_id_stream_visible = {}
+  state.chat_id_stream_explicitly_hidden = {}
   state.tool_id_to_key = {}
   state.firing_to_node = {}
   nefor.log.info("agentic-loop: cancel_all", {
@@ -647,6 +649,7 @@ local function teardown_for_session_end()
   state.pending            = {}
   state.chat_id_to_key     = {}
   state.chat_id_stream_visible = {}
+  state.chat_id_stream_explicitly_hidden = {}
   state.tool_id_to_key     = {}
   state.firing_to_node     = {}
   state.current_state      = nil
@@ -757,6 +760,7 @@ local function stream_visible(chat_id)
   return state.chat_id_stream_visible[chat_id] == true
 end
 
+-- ------------------------------------------------------------------
 -- Per-chat stream-visibility registration for chats the agentic-loop
 -- doesn't itself own (e.g. agent-reasoner sub-firings). The provider
 -- wrapper's gate normally requires both a pending entry AND
@@ -787,7 +791,7 @@ end
 
 -- Single-call gate the provider wrappers use on inbound stream events.
 -- True when EITHER (a) the chat has a tracked pending entry whose
--- reasoner type is not stream-visible, OR (b)
+-- reasoner type is not stream-visible (existing D-26 path), OR (b)
 -- the chat was explicitly registered hidden by an agent reasoner.
 local function stream_suppressed(chat_id)
   if type(chat_id) ~= "string" or chat_id == "" then return false end
@@ -909,6 +913,9 @@ end
 function M.take_pending_for_chat(chat_id) return take_pending_for_chat(chat_id) end
 function M.peek_pending_for_chat(chat_id) return peek_pending_for_chat(chat_id) end
 function M.stream_visible(chat_id) return stream_visible(chat_id) end
+function M.register_chat_stream_hidden(chat_id) register_chat_stream_hidden(chat_id) end
+function M.unregister_chat_stream_hidden(chat_id) unregister_chat_stream_hidden(chat_id) end
+function M.stream_suppressed(chat_id) return stream_suppressed(chat_id) end
 function M.flush_pending_dispatches() return flush_pending_dispatches() end
 function M.take_pending_for_tool(tool_id) return take_pending_for_tool(tool_id) end
 function M.clear_pending_key(key) clear_pending_key(key) end
@@ -1150,6 +1157,7 @@ M._internals  = {
     state.chat_id_to_key = {}
     state.tool_id_to_key = {}
     state.chat_id_stream_visible = {}
+    state.chat_id_stream_explicitly_hidden = {}
     state.firing_to_node = {}
     state.stream_observers = {}
     state.reasoning_observers = {}
