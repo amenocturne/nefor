@@ -43,6 +43,14 @@ pub struct LuaHost {
     /// Optional in the registry sense (not all test harnesses install it),
     /// but production `init.lua` always exposes it.
     invoke_from_plugin: Option<RegistryKey>,
+    /// Registry key for the global `invoke_from_plugin_batch` function —
+    /// the per-peer per-tick batched form of `invoke_from_plugin`. The
+    /// broker prefers this when present so a multi-line stdin burst from
+    /// one peer reaches the wrapper as one `from_plugin(envs)` call (the
+    /// inbound mirror of Phase A's outbound `to_plugin(envs)` shape).
+    /// Falls back to a per-payload loop on `invoke_from_plugin` when
+    /// absent so older `init.lua` files keep working.
+    invoke_from_plugin_batch: Option<RegistryKey>,
     /// Persistent Lua array mirroring the current session's log. Created
     /// lazily on the first [`LuaHost::invoke_dispatch`] call and reused —
     /// each subsequent call appends only the new entries since the last
@@ -99,6 +107,7 @@ impl LuaHost {
             plugins,
             dispatch: None,
             invoke_from_plugin: None,
+            invoke_from_plugin_batch: None,
             current_log_table: None,
             current_log_mirrored: 0,
             subscriptions,
@@ -223,6 +232,15 @@ impl LuaHost {
         if let Ok(mlua::Value::Function(f)) = globals.get::<mlua::Value>("invoke_from_plugin") {
             self.invoke_from_plugin = Some(self.lua.create_registry_value(f)?);
         }
+        // Optional: cache `invoke_from_plugin_batch` for the broker's
+        // batched dispatch path. Production `starter/ncp.lua` exposes it;
+        // if missing, the broker falls back to N per-payload calls on
+        // `invoke_from_plugin`.
+        if let Ok(mlua::Value::Function(f)) =
+            globals.get::<mlua::Value>("invoke_from_plugin_batch")
+        {
+            self.invoke_from_plugin_batch = Some(self.lua.create_registry_value(f)?);
+        }
         Ok(())
     }
 
@@ -297,6 +315,48 @@ impl LuaHost {
                 Ok(())
             }
         }
+    }
+
+    /// Invoke the global `invoke_from_plugin_batch(source, payloads)` Lua
+    /// hook. `payloads` is a list of raw inbound lines from one peer
+    /// already drained from the broker's inbound channel within a single
+    /// dispatch tick; the Lua side decodes each, classifies system vs
+    /// event, and fires the wrapper's `from_plugin(envs)` callback ONCE
+    /// with all event envelopes.
+    ///
+    /// Falls back to a per-payload loop on `invoke_from_plugin` when the
+    /// Lua side hasn't installed a batched entry point — preserves
+    /// behaviour for older `init.lua` files.
+    ///
+    /// Errors raised inside the hook are logged and swallowed (same
+    /// policy as `invoke_from_plugin`).
+    pub fn invoke_from_plugin_batch(
+        &self,
+        source: &str,
+        payloads: &[String],
+    ) -> Result<(), LuaError> {
+        if payloads.is_empty() {
+            return Ok(());
+        }
+        if let Some(key) = self.invoke_from_plugin_batch.as_ref() {
+            let func: mlua::Function = self.lua.registry_value(key)?;
+            let table = self.lua.create_table()?;
+            for (i, p) in payloads.iter().enumerate() {
+                table.set(i + 1, p.as_str())?; // 1-indexed
+            }
+            match func.call::<()>((source.to_owned(), table)) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::error!(error = %e, "invoke_from_plugin_batch handler raised");
+                    return Ok(());
+                }
+            }
+        }
+        // Fallback: per-payload loop on the unbatched hook.
+        for p in payloads {
+            self.invoke_from_plugin(source, p)?;
+        }
+        Ok(())
     }
 
     /// Dispatch `nefor.bus.on_event` subscribers for each entry in

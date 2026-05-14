@@ -116,8 +116,63 @@ async fn run_dispatch_loop(
                                 // log and keep going.
                                 tracing::warn!(?env, "unexpected system envelope after handshake");
                             }
-                            Body::Event(_) => {
-                                host.dispatch_event(&env).await?;
+                            Body::Event(map) => {
+                                // Streaming dispatch (`<prefix>.chat.complete`)
+                                // gets its own tokio task because the
+                                // handler awaits `nefor.sleep` between
+                                // chunks; awaiting inline would block the
+                                // dispatch loop for the full stream and
+                                // prevent a follow-up `<prefix>.interrupt`
+                                // from landing in time. Spawning lets the
+                                // runtime poll other dispatch tasks during
+                                // the streaming handler's yields; mlua's
+                                // `send` feature serialises real Lua work
+                                // on a single VM mutex so the interrupt
+                                // handler interleaves cleanly at the
+                                // streaming handler's `await` suspension
+                                // points (sets a Lua-side cancel flag the
+                                // streaming loop checks on each chunk
+                                // boundary).
+                                //
+                                // Non-streaming envelopes (`chat.create`,
+                                // `chat.append`, every other event with no
+                                // internal `await`) dispatch inline. Prior
+                                // shape spawned every event uniformly, but
+                                // tokio::spawn doesn't guarantee tasks
+                                // start in spawn order, and the order in
+                                // which spawned tasks acquire mlua's VM
+                                // mutex isn't guaranteed either — under
+                                // post batch-protocol refactor's batched
+                                // delivery the engine hands the binary
+                                // [chat.create, chat.append, chat.complete]
+                                // back-to-back and a later `chat.complete`
+                                // task could win the VM mutex ahead of an
+                                // earlier `chat.append`, leaving the
+                                // complete handler with no user message in
+                                // history. Awaiting non-streaming events
+                                // inline removes the race for everything
+                                // that doesn't yield.
+                                //
+                                // Custom scripts whose handlers do yield
+                                // (e.g. tests that emit `nefor.sleep` from
+                                // a non-chat.complete kind) need to opt in
+                                // by using a `*.chat.complete` kind for the
+                                // streaming handler — same shape the real
+                                // provider uses.
+                                let kind_is_complete = map
+                                    .get("kind")
+                                    .and_then(|v| v.as_str())
+                                    .is_some_and(|k| k.ends_with(".chat.complete"));
+                                if kind_is_complete {
+                                    let host_clone = host.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = host_clone.dispatch_event(&env).await {
+                                            tracing::error!(error = %e, "dispatch task failed");
+                                        }
+                                    });
+                                } else if let Err(e) = host.dispatch_event(&env).await {
+                                    tracing::error!(error = %e, "dispatch task failed");
+                                }
                             }
                         }
                     }

@@ -37,19 +37,38 @@ local M = {}
 function M.spawn_spec(command)
   assert(type(command) == "table", "nefor-tui.spawn_spec: command required")
 
-  local function from_plugin(env)
-    if type(env.body) ~= "table" then return end
-    nefor.engine.send(json.encode({
-      type = "event",
-      from = env.from or "nefor-tui",
-      ts   = nefor.engine.now(),
-      body = env.body,
-    }))
+  local function from_plugin(envs)
+    for _, env in ipairs(envs) do
+      if type(env.body) == "table" then
+        nefor.engine.send(json.encode({
+          type = "event",
+          from = env.from or "nefor-tui",
+          ts   = nefor.engine.now(),
+          body = env.body,
+        }))
+      end
+    end
   end
 
-  local function to_plugin(env)
-    if env.from == "nefor-tui" then return end
-    nefor.engine.deliver("nefor-tui", json.encode(env))
+  -- Phase A: mechanical loop wrap. Phase B will replace this with a
+  -- batched delivery shape that lets the chat.lua reducer (running
+  -- inside the TUI binary) coalesce N replayed envelopes into a single
+  -- render pass on /resume — the resume-staleness motivator from the
+  -- batch protocol design doc.
+  local function to_plugin(envs)
+    for _, env in ipairs(envs) do
+      if env.from ~= "nefor-tui" then
+        -- Strip framework-only fields (`replay`, …) when encoding for
+        -- the wire; the protocol parser rejects unknown envelope
+        -- fields.
+        nefor.engine.deliver("nefor-tui", json.encode({
+          type = env.type,
+          from = env.from,
+          ts   = env.ts,
+          body = env.body,
+        }))
+      end
+    end
   end
 
   return {

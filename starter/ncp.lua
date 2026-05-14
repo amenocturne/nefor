@@ -8,10 +8,17 @@
 --
 -- ## Architecture (post wrapper-callback refactor)
 --
--- Wrappers' `from_plugin` and `to_plugin` are **side-effecting callbacks**,
--- not transforms. The framework hands the parsed envelope to the wrapper;
--- the wrapper decides what (if anything) flows onto the bus or down to a
+-- Wrappers' `from_plugin` and `to_plugin` are **batched side-effecting
+-- callbacks**, not transforms. The framework hands a LIST of parsed
+-- envelopes (`envs`) to the wrapper per dispatch tick; the wrapper iterates
+-- the list and decides what (if anything) flows onto the bus or down to a
 -- peer's stdin. The framework never inspects the return value.
+--
+-- Single-envelope is just a one-element list — wrappers that don't care
+-- about batching write `for _, env in ipairs(envs) do ... end` and the
+-- semantics match the per-envelope contract that came before. Wrappers
+-- that benefit from batching (TUI re-rendering on resume, provider
+-- history rebuild) read across the batch and amortise work.
 --
 -- Two outbound paths into the broker, deliberately distinct:
 --
@@ -40,9 +47,10 @@
 --      do NOT reach the wrapper's `from_plugin`. NCP framework owns the
 --      handshake.
 --   4. `type:"event"` envelopes go to `plugin_transforms[P].from_plugin`,
---      called as a side-effecting callback. Default (no `from_plugin`
---      registered) publishes the envelope verbatim via `engine.send` so
---      the bus sees the plugin's emission.
+--      called as a batched side-effecting callback with a one-element
+--      `envs` list (the broker hands us one line per call). Default (no
+--      `from_plugin` registered) publishes the envelope verbatim via
+--      `engine.send` so the bus sees the plugin's emission.
 --
 -- ## Bus-event flow (outbound, every wrapper)
 --
@@ -50,10 +58,13 @@
 --   1. Skip Plugin entries — those are engine-injected synthetics
 --      (`engine.plugin_failed`); they go through their own translation
 --      below.
---   2. Step entries are bus emissions. We decode the payload and call
---      every registered wrapper's `to_plugin(env)`. Default callback
---      delivers the envelope verbatim to the wrapper's peer (skipping
---      self-emissions and respecting log-entry `target` if set).
+--   2. Step entries are bus emissions. We decode the payload and
+--      accumulate per-peer batches; once the entire new-tail slice has
+--      been walked, each registered wrapper's `to_plugin(envs)` fires
+--      ONCE per dispatch tick with all envelopes destined for that peer
+--      this tick. Default callback iterates `envs` and delivers each
+--      envelope verbatim to the wrapper's peer (skipping self-emissions
+--      and respecting log-entry `target` if set).
 --   3. Engine entries (synthetic `engine.*`) go through the engine
 --      translator (`handle_engine_envelope`) which decides whether to
 --      publish chat-popup events.
@@ -66,9 +77,17 @@
 --
 -- The legacy `in_replay` gate lived here as a framework-level skip.
 -- Post-refactor it's a per-wrapper concern: each wrapper that wants to
--- skip envelopes during a replay-window adds the check inside its own
--- `to_plugin` callback (typically via `lib.replay_window`). The framework
--- no longer suppresses anything globally.
+-- skip envelopes during a replay-window reads `env.replay` on each
+-- envelope inside its `to_plugin(envs)` loop. The framework walks the
+-- new tail in order and stamps each Step envelope with the current
+-- replay-window state (toggled inline as it hits
+-- `sessions.replay.start` / `sessions.replay.end` framing markers), so
+-- every envelope inside a replay window carries `env.replay = true` and
+-- every live envelope carries `env.replay = false`. The global
+-- `lib.replay_window.active()` flag stays in sync as a back-compat
+-- channel for `nefor.bus.on_event` subscribers; wrappers should prefer
+-- `env.replay` because batched dispatch removes the per-envelope
+-- temporal coupling that the global flag implicitly relied on.
 --
 -- ## Why `from_plugin` is no longer a transform
 --
@@ -224,38 +243,20 @@ end
 --
 -- When a plugin readies after others have already been emitting, it
 -- needs to see the bus events it missed. We re-deliver the prior bus
--- log to the new attacher by walking it and calling its wrapper's
--- to_plugin (if any) on each entry, exactly as if the entry were just
--- being dispatched.
+-- log to the new attacher by walking it and accumulating a single envs
+-- list, then calling its wrapper's to_plugin (if any) ONCE with the
+-- whole list, exactly as if the entries were dispatched together in a
+-- single tick.
 --
 -- We DON'T republish via `send` (that would re-fire every wrapper's
 -- to_plugin again, doubling traffic). We invoke the new attacher's
--- to_plugin directly with the parsed envelope.
+-- to_plugin directly with the parsed envelopes.
 
-local function call_to_plugin_for(target, env, entry_target)
-  -- Skip nothing here; the wrapper or default decides. Caller already
-  -- filtered sane shapes.
-  local t = plugin_transforms[target]
-  local cb = t and t.to_plugin
-  if cb then
-    -- Deep-copy so the wrapper can mutate `env.body` without leaking
-    -- mutations into the next peer's view.
-    local copied = {
-      type = env.type,
-      from = env.from,
-      ts   = env.ts,
-      body = deep_copy(env.body),
-    }
-    local ok, err = pcall(cb, copied)
-    if not ok then
-      nefor.log.warn("ncp: to_plugin raised; dropping for peer", {
-        peer  = target,
-        error = tostring(err),
-      })
-    end
-    return
-  end
-
+-- Default to_plugin path for a single envelope. Used both as the
+-- per-envelope inner step of the framework default (when a wrapper has
+-- no `to_plugin` override) and by no-override peers iterating their own
+-- batches via the framework default.
+local function default_deliver_for(target, env, entry_target)
   -- Default to_plugin: deliver the envelope verbatim to `target`,
   -- subject to:
   --   * skip if env.from == target (don't echo a peer's emission back
@@ -280,14 +281,62 @@ local function call_to_plugin_for(target, env, entry_target)
     end
   end
 
-  pcall(nefor.engine.deliver, target, encode(env))
+  -- Strip framework-only fields (`replay`, …) when encoding for the
+  -- wire; the protocol parser rejects unknown envelope fields.
+  pcall(nefor.engine.deliver, target, encode({
+    type = env.type,
+    from = env.from,
+    ts   = env.ts,
+    body = env.body,
+  }))
+end
+
+-- Fan a per-peer batch of envelopes (already deep-copied for this
+-- peer's view) into the wrapper's `to_plugin(envs)` callback, or
+-- default-deliver each envelope when no override is registered.
+--
+-- `entry_targets` is a parallel list of the source log entry's `target`
+-- field (nil for broadcast, plugin name for targeted) — the default
+-- delivery path consults it to filter peers other than the addressee.
+-- Wrapper overrides don't see entry_target directly; if a wrapper needs
+-- targeting, it inspects env.body.kind / env.from and delivers itself.
+local function call_to_plugin_for_batch(target, envs, entry_targets)
+  if #envs == 0 then return end
+  local t = plugin_transforms[target]
+  local cb = t and t.to_plugin
+  if cb then
+    local ok, err = pcall(cb, envs)
+    if not ok then
+      nefor.log.warn("ncp: to_plugin raised; dropping batch for peer", {
+        peer  = target,
+        count = #envs,
+        error = tostring(err),
+      })
+    end
+    return
+  end
+
+  for i, env in ipairs(envs) do
+    default_deliver_for(target, env, entry_targets[i])
+  end
 end
 
 -- Replay prior bus events to a freshly-readied peer. Walks the current
 -- log up to the entry that triggered this ready (exclusive), filters to
--- bus emissions (Step entries), decodes each, and calls `to_plugin` for
--- the new attacher.
+-- bus emissions (Step entries), decodes each, accumulates a single envs
+-- list (one entry per replayed envelope), and fires the new attacher's
+-- to_plugin once with the whole batch.
+--
+-- Replay-on-attach happens outside the live `sessions.replay.*` framing
+-- (the new attacher is just catching up to "what's already on the bus";
+-- it isn't a session-replay event), so every envelope's `replay` flag
+-- is whatever the global replay_window state says at this moment —
+-- normally false, but if a session replay is in progress the new peer
+-- sees the same view as everyone else.
 replay_prior_events = function(target, current_log)
+  local current_replay = replay_window.active()
+  local envs = {}
+  local entry_targets = {}
   for _, entry in ipairs(current_log) do
     if entry.origin == "step" then
       -- Only re-deliver to this peer if the original emission was a
@@ -298,16 +347,19 @@ replay_prior_events = function(target, current_log)
         if type(decoded) == "table" and decoded.type == "event"
             and type(decoded.body) == "table" then
           local from = (type(decoded.from) == "string") and decoded.from or "engine"
-          call_to_plugin_for(target, {
-            type = decoded.type,
-            from = from,
-            ts   = decoded.ts,
-            body = decoded.body,
-          }, entry.target)
+          envs[#envs + 1] = {
+            type   = decoded.type,
+            from   = from,
+            ts     = decoded.ts,
+            body   = deep_copy(decoded.body),
+            replay = current_replay,
+          }
+          entry_targets[#entry_targets + 1] = entry.target
         end
       end
     end
   end
+  call_to_plugin_for_batch(target, envs, entry_targets)
 end
 
 -- ------------------------------------------------------------------
@@ -348,83 +400,144 @@ local function handle_engine_envelope(decoded)
 end
 
 -- ------------------------------------------------------------------
--- public entry point: invoke_from_plugin (broker → Lua, inbound lines)
+-- public entry points: invoke_from_plugin / invoke_from_plugin_batch
+-- (broker → Lua, inbound lines)
 -- ------------------------------------------------------------------
+--
+-- The broker's stdin reader hands inbound lines to Lua either one at a
+-- time (`invoke_from_plugin`) or as a per-peer per-tick batch
+-- (`invoke_from_plugin_batch`). The single-payload form is preserved for
+-- test harnesses that drive synthetic inbound traffic; the batched form
+-- is what production calls.
+--
+-- Batching matters when a peer bursts multiple lines into stdin between
+-- broker dispatch ticks (replay flush, streaming-delta storms, rapid
+-- tool-result fan-in). All event envelopes from the same peer in the
+-- same tick coalesce into a single `from_plugin(envs)` invocation,
+-- mirroring the outbound-side `to_plugin(envs)` shape from Phase A. The
+-- wrapper amortises translation work across the batch.
+--
+-- System messages still fire individually (they have framework
+-- semantics — handshake, replay-on-attach — that don't compose into a
+-- batch).
 
-function M.invoke_from_plugin(source, raw_payload)
-  if type(source) ~= "string" or source == "" then return end
-  if type(raw_payload) ~= "string" then return end
+-- Decode + classify a single payload. Returns one of:
+--   { kind = "drop" }                 -- malformed, error already delivered
+--   { kind = "system", body = ... }   -- caller forwards to handle_system
+--   { kind = "event",  env  = ... }   -- caller batches into envs
+local function classify_inbound_payload(source, raw_payload)
+  if type(raw_payload) ~= "string" then
+    return { kind = "drop" }
+  end
 
   local decoded, decode_err = try_decode(raw_payload)
   if decode_err ~= nil then
     deliver_error(source, "malformed_envelope",
       "payload is not valid JSON: " .. decode_err)
-    return
+    return { kind = "drop" }
   end
   if type(decoded) ~= "table" then
     deliver_error(source, "malformed_envelope",
       "payload is not a JSON object")
-    return
+    return { kind = "drop" }
   end
 
   local t = decoded.type
   if t == "system" then
-    -- For replay-on-attach, the framework needs the current bus log to
-    -- walk it. The Lua side reads it back via the dispatch hook's
-    -- argument; from this entry-point we only have the broker-supplied
-    -- payload. Use `_current_log_ref` (set by `M.dispatch` on the most
-    -- recent invocation) — it's a stable ref in the Lua VM.
-    local cl = M._current_log_ref or {}
-    handle_system(source, decoded.body, cl)
-    return
+    return { kind = "system", body = decoded.body }
   end
 
   if t == "event" then
     if type(decoded.body) ~= "table" then
       deliver_error(source, "body_not_object",
         "event body must be a JSON object")
-      return
+      return { kind = "drop" }
     end
     -- Drop events from non-ready plugins.
     if not ready_plugins[source] then
       deliver_error(source, "malformed_envelope",
         "received event before 'ready' handshake completed")
-      return
+      return { kind = "drop" }
     end
 
     local from = (type(decoded.from) == "string") and decoded.from or source
-    local env = {
-      type = decoded.type,
-      from = from,
-      body = decoded.body,
+    return {
+      kind = "event",
+      env = {
+        type = decoded.type,
+        from = from,
+        body = decoded.body,
+      },
     }
-
-    local hook = plugin_transforms[source] and plugin_transforms[source].from_plugin
-    if hook then
-      local ok, err = pcall(hook, env)
-      if not ok then
-        deliver_error(source, "transform_error",
-          "from_plugin callback raised: " .. tostring(err))
-      end
-      return
-    end
-
-    -- Default callback: publish the envelope verbatim onto the bus via
-    -- `send` (broadcast). Wrappers without an explicit `from_plugin`
-    -- behave as identity passthrough — same effective behavior as the
-    -- pre-refactor "no from_plugin transform" path.
-    local payload = encode({
-      type = "event",
-      from = from,
-      ts   = nefor.engine.now(),
-      body = decoded.body,
-    })
-    nefor.engine.send(payload)
-    return
   end
 
   deliver_error(source, "malformed_envelope",
     "envelope 'type' must be 'system' or 'event'")
+  return { kind = "drop" }
+end
+
+-- Hand a per-peer batch of decoded event envelopes to the wrapper's
+-- `from_plugin(envs)` callback (single invocation), or the framework
+-- default (per-envelope `send`). Matches the outbound `to_plugin(envs)`
+-- shape from Phase A.
+local function deliver_event_batch_from(source, envs)
+  if #envs == 0 then return end
+
+  local hook = plugin_transforms[source] and plugin_transforms[source].from_plugin
+  if hook then
+    local ok, err = pcall(hook, envs)
+    if not ok then
+      deliver_error(source, "transform_error",
+        "from_plugin callback raised: " .. tostring(err))
+    end
+    return
+  end
+
+  -- Default callback: publish each envelope verbatim onto the bus via
+  -- `send` (broadcast). Wrappers without an explicit `from_plugin`
+  -- behave as identity passthrough.
+  for _, env in ipairs(envs) do
+    nefor.engine.send(encode({
+      type = "event",
+      from = env.from,
+      ts   = nefor.engine.now(),
+      body = env.body,
+    }))
+  end
+end
+
+function M.invoke_from_plugin(source, raw_payload)
+  if type(source) ~= "string" or source == "" then return end
+  M.invoke_from_plugin_batch(source, { raw_payload })
+end
+
+function M.invoke_from_plugin_batch(source, raw_payloads)
+  if type(source) ~= "string" or source == "" then return end
+  if type(raw_payloads) ~= "table" then return end
+  if #raw_payloads == 0 then return end
+
+  local cl = M._current_log_ref or {}
+  local envs = {}
+
+  for _, raw in ipairs(raw_payloads) do
+    local c = classify_inbound_payload(source, raw)
+    if c.kind == "system" then
+      -- System messages keep their per-envelope framework semantics
+      -- (handshake, replay-on-attach). Flush any accumulated events
+      -- before handling so cross-message ordering is preserved within
+      -- a single peer's batch.
+      if #envs > 0 then
+        deliver_event_batch_from(source, envs)
+        envs = {}
+      end
+      handle_system(source, c.body, cl)
+    elseif c.kind == "event" then
+      envs[#envs + 1] = c.env
+    end
+    -- "drop" classifications already emitted their error reply.
+  end
+
+  deliver_event_batch_from(source, envs)
 end
 
 -- ------------------------------------------------------------------
@@ -435,6 +548,16 @@ end
 -- current_log table on every call (it grows in place); re-calls without
 -- growth shouldn't re-fire to_plugin for entries already handled. We
 -- track a high-water mark per-log via a hidden field.
+--
+-- Batched fan-out: the new tail can hold N step entries in one drain
+-- tick (cascade from a wrapper's own `engine.send`, replay burst from
+-- sessions, etc.). We accumulate per-peer envs lists across the whole
+-- tail, then fire each ready wrapper's `to_plugin(envs)` ONCE with its
+-- batch. Engine-origin entries (synthetic engine.*) interleave; they
+-- run through `handle_engine_envelope` in their original position,
+-- which is fine because the engine translator only mutates pending
+-- popups / queues new bus emissions and doesn't itself drive
+-- `to_plugin` for the same entry.
 function M.dispatch(current_log)
   -- Stash the current_log ref so `invoke_from_plugin` (which the broker
   -- calls in a different code path) can use it for replay-on-attach.
@@ -445,11 +568,42 @@ function M.dispatch(current_log)
 
   if tail_index <= dispatch_hwm then return end
 
-  -- Process every new entry from dispatch_hwm+1 .. tail_index. Multiple
-  -- entries can land in a single dispatch tick when a `to_plugin`
-  -- callback in turn calls `nefor.engine.send` (cascade) — the broker
-  -- drains them under one dispatch call, and we have to fire to_plugin
-  -- for each.
+  -- Snapshot the ready peer list once per dispatch tick. The result
+  -- shape is:
+  --   per_peer_envs[name]    = { env1, env2, ... }   (deep-copied bodies)
+  --   per_peer_targets[name] = { entry.target1, ... }  (parallel array)
+  local plugins_snapshot = nefor.engine.plugins()
+  local per_peer_envs = {}
+  local per_peer_targets = {}
+  for _, name in ipairs(plugins_snapshot) do
+    if ready_plugins[name] then
+      per_peer_envs[name] = {}
+      per_peer_targets[name] = {}
+    end
+  end
+
+  -- Replay-window framing — toggle the global flag inline as we walk
+  -- the tail and stamp each Step env with the window state at the
+  -- moment of its position in the batch. The Rust drain loop runs the
+  -- entire batch's `to_plugin` calls before any `dispatch_subscriptions`
+  -- handler fires (vm.rs `drain_pending_dispatch`), so a bus.on_event
+  -- subscriber alone can't gate replayed envelopes riding in the same
+  -- batch as the `replay.start` marker (Bug 5). Stamping per-envelope
+  -- means a wrapper iterating its envs list reads `env.replay` directly
+  -- and the per-envelope state is preserved across the batch boundary,
+  -- which the global `replay_window.active()` flag CANNOT do at
+  -- end-of-tick when called from inside a wrapper's loop — by then the
+  -- flag is whatever the LAST framing marker set it to.
+  --
+  -- The global flag is still kept in sync because back-compat
+  -- subscribers (sessions's persistence guard, defense-in-depth bus
+  -- handlers) read it. Wrappers should prefer `env.replay`.
+  --
+  -- nefor-tui deliberately does NOT consult `env.replay` — the TUI
+  -- surface NEEDS replayed envelopes to repaint the transcript on
+  -- resume. Other wrappers (tool-gate, openai-provider, …) skip on
+  -- `env.replay` because their peer plugins would treat replayed
+  -- envelopes as fresh invocations and produce duplicate side effects.
   for i = dispatch_hwm + 1, tail_index do
     local entry = current_log[i]
     if entry.origin == "engine" then
@@ -461,38 +615,29 @@ function M.dispatch(current_log)
       local decoded = select(1, try_decode(entry.payload))
       if type(decoded) == "table" and decoded.type == "event"
           and type(decoded.body) == "table" then
-        local env = {
-          type = decoded.type,
-          from = (type(decoded.from) == "string") and decoded.from or "engine",
-          ts   = decoded.ts,
-          body = decoded.body,
-        }
-        -- Replay-window framing — toggle BEFORE the to_plugin fan-out
-        -- for this entry. The Rust drain loop runs the entire batch's
-        -- `to_plugin` calls before any `dispatch_subscriptions` handler
-        -- fires (vm.rs `drain_pending_dispatch`), so a bus.on_event
-        -- subscriber alone can't gate replayed envelopes that ride in
-        -- the same batch as the `replay.start` marker — by the time
-        -- the subscriber fires it's too late for THIS batch's
-        -- to_plugin pass. Toggling here means every entry between
-        -- start and end sees `replay_window.active() == true` from
-        -- the moment its `to_plugin` runs, so wrappers' replay-skip
-        -- gates (tool-gate, openai-provider, …) actually take effect
-        -- (Bug 5: tool-gate was processing replayed `tool-gate.tool.
-        -- invoke` envelopes as if fresh and emitting new
-        -- `chat.tool.permission_request` envelopes after the window
-        -- closed). nefor-tui's `to_plugin` deliberately does NOT skip
-        -- — the TUI surface NEEDS replayed envelopes to repaint the
-        -- transcript on resume.
-        local kind = env.body.kind
+        local kind = decoded.body.kind
         if kind == "sessions.replay.start" then
           replay_window.set(true)
         elseif kind == "sessions.replay.end" then
           replay_window.set(false)
         end
-        for _, name in ipairs(nefor.engine.plugins()) do
+        local current_replay = replay_window.active()
+        local from = (type(decoded.from) == "string") and decoded.from or "engine"
+        for _, name in ipairs(plugins_snapshot) do
           if ready_plugins[name] then
-            call_to_plugin_for(name, env, entry.target)
+            -- Deep-copy the body per peer so a wrapper that mutates
+            -- env.body inside its loop doesn't leak into another peer's
+            -- view of the same envelope.
+            local envs = per_peer_envs[name]
+            envs[#envs + 1] = {
+              type   = decoded.type,
+              from   = from,
+              ts     = decoded.ts,
+              body   = deep_copy(decoded.body),
+              replay = current_replay,
+            }
+            local tgts = per_peer_targets[name]
+            tgts[#tgts + 1] = entry.target
           end
         end
       end
@@ -500,6 +645,16 @@ function M.dispatch(current_log)
     -- Plugin-origin entries don't appear in the post-refactor flow
     -- (handle_line no longer auto-logs); ignore them defensively.
   end
+
+  -- Fire each peer's batched to_plugin once. Order across peers
+  -- mirrors `plugins_snapshot` (registration order), the same order
+  -- the per-entry loop used pre-refactor.
+  for _, name in ipairs(plugins_snapshot) do
+    if ready_plugins[name] then
+      call_to_plugin_for_batch(name, per_peer_envs[name], per_peer_targets[name])
+    end
+  end
+
   dispatch_hwm = tail_index
 end
 

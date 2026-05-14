@@ -558,7 +558,7 @@ impl Broker {
 
             tokio::select! {
                 Some((conn_id, msg)) = self.inbound_rx.recv() => {
-                    self.handle_inbound(conn_id, msg).await;
+                    self.handle_inbound_tick(conn_id, msg).await;
                 }
                 Some((conn_id, outcome)) = self.exit_rx.recv() => {
                     self.handle_exit(conn_id, outcome).await;
@@ -577,43 +577,128 @@ impl Broker {
 
     // ---- inbound dispatch -------------------------------------------------
 
-    async fn handle_inbound(&mut self, id: ConnectionId, msg: ConnectionInbound) {
-        let Some(record) = self.conns_by_id.get(&id) else {
-            return;
-        };
-        if record.closing {
-            return;
-        }
-        match msg {
-            ConnectionInbound::Line(line) => self.handle_line(id, line),
-            ConnectionInbound::Closed { reason } => self.handle_reader_closed(id, reason),
-        }
-    }
+    /// Drive one inbound dispatch tick. The first message comes in via the
+    /// `select!` arm; we drain any further immediately-available inbound
+    /// messages (across all peers) before flushing, group lines by peer,
+    /// and call `invoke_from_plugin_batch(peer, lines)` once per peer.
+    /// Empty batches skip the wrapper call entirely.
+    ///
+    /// The "tick" boundary mirrors Phase A's outbound `to_plugin(envs)`
+    /// shape: a single-line burst is a 1-element batch (identical to the
+    /// pre-batching behaviour); a multi-line burst from one peer reaches
+    /// the wrapper as one `from_plugin(envs)` invocation so wrappers can
+    /// amortise translation work the same way `to_plugin` already does.
+    ///
+    /// Closed-connection messages still fire one-by-one — at most one per
+    /// connection id, and the teardown path is order-sensitive so it stays
+    /// outside the batched line group.
+    ///
+    /// Bus-tail dispatch (`drain_pending_dispatch`) runs ONCE at the end
+    /// of the tick after every wrapper has had its `from_plugin(envs)`
+    /// invocation. Pre-refactor it ran per-line, so an N-line burst paid
+    /// N drains; now N lines burst → 1 drain → 1 dispatch tick walks
+    /// whatever was published across the whole batch.
+    async fn handle_inbound_tick(&mut self, first_id: ConnectionId, first_msg: ConnectionInbound) {
+        // Per-peer accumulators for this tick. Lines stay in stdin order
+        // within a peer (we push in arrival order); cross-peer ordering
+        // does not affect correctness because each peer's wrapper fires
+        // independently.
+        let mut batched_lines: Vec<(PluginName, Vec<String>)> = Vec::new();
+        // Closed messages dispatched after line batches flush. Each
+        // connection id appears at most once — it's a teardown notice.
+        let mut closed_msgs: Vec<(ConnectionId, ReaderEnd)> = Vec::new();
 
-    fn handle_line(&mut self, id: ConnectionId, payload: String) {
-        // Post-callback-refactor: inbound plugin lines are NOT auto-logged.
-        // Instead the broker invokes Lua's `invoke_from_plugin(source,
-        // payload)` hook; the corresponding wrapper's `from_plugin` callback
-        // (or the framework default) decides whether to publish onto the
-        // bus via `nefor.engine.send`. Only published emissions land in the
+        // Sort one (id, msg) into the per-peer line batch or closed list,
+        // dropping messages from connections we've already torn down or
+        // marked closing. Hoisted to a free fn-style block so we can call
+        // it once for the `select!`-supplied first message and again for
+        // each `try_recv` drain step without a borrow-checker fight over
+        // capturing `&mut self`.
+        let sort = |conns: &HashMap<ConnectionId, ConnectionRecord>,
+                    batched: &mut Vec<(PluginName, Vec<String>)>,
+                    closed: &mut Vec<(ConnectionId, ReaderEnd)>,
+                    id: ConnectionId,
+                    msg: ConnectionInbound| {
+            let Some(record) = conns.get(&id) else {
+                return;
+            };
+            if record.closing {
+                return;
+            }
+            match msg {
+                ConnectionInbound::Line(line) => {
+                    let name = record.name.clone();
+                    if let Some((_, lines)) = batched.iter_mut().find(|(n, _)| n == &name) {
+                        lines.push(line);
+                    } else {
+                        batched.push((name, vec![line]));
+                    }
+                }
+                ConnectionInbound::Closed { reason } => {
+                    closed.push((id, reason));
+                }
+            }
+        };
+
+        sort(
+            &self.conns_by_id,
+            &mut batched_lines,
+            &mut closed_msgs,
+            first_id,
+            first_msg,
+        );
+
+        // Drain any other messages that have already arrived. `try_recv`
+        // is non-blocking; we stop as soon as the channel is empty so the
+        // tick boundary stays bounded by what's actually pending. New
+        // messages that arrive after this point ride the next tick.
+        loop {
+            match self.inbound_rx.try_recv() {
+                Ok((id, msg)) => sort(
+                    &self.conns_by_id,
+                    &mut batched_lines,
+                    &mut closed_msgs,
+                    id,
+                    msg,
+                ),
+                Err(_) => break,
+            }
+        }
+
+        // Inbound plugin lines are NOT auto-logged: the broker invokes
+        // Lua's `invoke_from_plugin_batch(source, lines)` hook; the
+        // wrapper's `from_plugin(envs)` callback (or the framework
+        // default) decides whether to publish onto the bus via
+        // `nefor.engine.send`. Only published emissions land in the
         // event log — symmetric for plugin-emitted and Lua-emitted bus
         // events.
-        //
-        // After the hook runs, we drain any new tail entries through
-        // dispatch + subscriptions so wrapper `to_plugin` callbacks (and
-        // any `nefor.bus.on_event` listeners) fire on the wrapper's own
-        // emissions.
-        let Some(record) = self.conns_by_id.get(&id) else {
-            return;
-        };
-        let origin_name = record.name.clone();
-        if let Err(e) = self
-            .host
-            .invoke_from_plugin(origin_name.as_str(), &payload)
-        {
-            tracing::error!(error = %e, "invoke_from_plugin errored at VM level");
+        for (name, lines) in batched_lines {
+            if lines.is_empty() {
+                continue;
+            }
+            if let Err(e) = self
+                .host
+                .invoke_from_plugin_batch(name.as_str(), &lines)
+            {
+                tracing::error!(
+                    error = %e,
+                    peer = %name.as_str(),
+                    "invoke_from_plugin_batch errored at VM level",
+                );
+            }
         }
+
+        // After every peer's batch has fired, drain any new tail entries
+        // through dispatch + subscriptions ONCE so wrapper `to_plugin`
+        // callbacks (and any `nefor.bus.on_event` listeners) fire on
+        // whatever was published this tick.
         self.drain_pending_dispatch();
+
+        // Closed-connection notices teardown last so any in-flight
+        // batched lines from a peer that just closed still flushed above.
+        for (id, reason) in closed_msgs {
+            self.handle_reader_closed(id, reason);
+        }
     }
 
     /// Drain new tail entries into Lua's dispatch + subscription handlers.
@@ -1476,5 +1561,153 @@ mod tests {
 
         handle.shutdown(50).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
+    }
+
+    // ---- Phase B inbound batching (#44) -------------------------------
+
+    /// Multi-line burst from one peer in one dispatch tick reaches the
+    /// `invoke_from_plugin_batch` Lua hook as a single invocation with
+    /// every line in the batch — the inbound mirror of Phase A's
+    /// outbound `to_plugin(envs)` shape.
+    ///
+    /// Pre-batching the broker fired `invoke_from_plugin(source, payload)`
+    /// once per stdin line, so a 5-line burst reached the wrapper as 5
+    /// 1-element batches. Now the broker accumulates the per-tick burst
+    /// and the wrapper sees one 5-element batch.
+    #[tokio::test]
+    async fn multi_line_burst_reaches_wrapper_as_one_batch() {
+        let shared = shared_state();
+        let host = build_host(
+            &shared,
+            r#"
+            invocations = {}
+            function dispatch(current) end
+            function invoke_from_plugin(source, payload) end
+            function invoke_from_plugin_batch(source, payloads)
+                invocations[#invocations + 1] = {
+                    source = source,
+                    count  = #payloads,
+                    first  = payloads[1],
+                    last   = payloads[#payloads],
+                }
+            end
+            "#,
+        );
+        let lua = host.lua().clone();
+
+        let mut broker = Broker::new(Arc::clone(&shared), host);
+        let (mut p, t) = make_transport();
+        broker.attach_transport(t, pn("burst"));
+
+        // Queue all 5 lines into the channel BEFORE the broker run loop
+        // starts ticking. The reader task is already running (spawned by
+        // `attach_transport`), so its bounded pushes onto `inbound_tx`
+        // happen here while the broker is still parked. Once `run()`
+        // ticks, the first inbound message wakes `select!` and the
+        // remaining 4 drain via `try_recv` in the same tick.
+        for i in 0..5u32 {
+            send_line(&mut p, &format!("line-{i}")).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let handle = broker.shutdown_handle();
+        let run = tokio::spawn(broker.run());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle.shutdown(50).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
+
+        let invocations: mlua::Table = lua.globals().get("invocations").unwrap();
+        let len = invocations.len().unwrap();
+        assert_eq!(
+            len, 1,
+            "5-line burst should reach the wrapper as ONE batched invocation; got {len}"
+        );
+        let entry: mlua::Table = invocations.get(1).unwrap();
+        let count: i64 = entry.get("count").unwrap();
+        assert_eq!(
+            count, 5,
+            "the single batched invocation must carry all 5 lines; got {count}"
+        );
+        let source: String = entry.get("source").unwrap();
+        assert_eq!(source, "burst", "source name preserved on the batch");
+        let first: String = entry.get("first").unwrap();
+        let last: String = entry.get("last").unwrap();
+        assert_eq!(first, "line-0", "first line preserves stdin order within a peer's batch");
+        assert_eq!(last, "line-4", "last line preserves stdin order within a peer's batch");
+    }
+
+    /// One stdin line on a tick still fires one `invoke_from_plugin_batch`
+    /// invocation with a 1-element list — the no-burst case is identical
+    /// to the pre-batching behaviour, just with a list-shaped argument.
+    #[tokio::test]
+    async fn single_line_reaches_wrapper_as_one_element_batch() {
+        let shared = shared_state();
+        let host = build_host(
+            &shared,
+            r#"
+            sizes = {}
+            function dispatch(current) end
+            function invoke_from_plugin(source, payload) end
+            function invoke_from_plugin_batch(source, payloads)
+                sizes[#sizes + 1] = #payloads
+            end
+            "#,
+        );
+        let lua = host.lua().clone();
+
+        let mut broker = Broker::new(Arc::clone(&shared), host);
+        let (mut p, t) = make_transport();
+        broker.attach_transport(t, pn("solo"));
+        let handle = broker.shutdown_handle();
+        let run = tokio::spawn(broker.run());
+
+        send_line(&mut p, "alone").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle.shutdown(50).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
+
+        let sizes: mlua::Table = lua.globals().get("sizes").unwrap();
+        let len = sizes.len().unwrap();
+        assert_eq!(len, 1, "exactly one batched invocation for one line");
+        let size: i64 = sizes.get(1).unwrap();
+        assert_eq!(size, 1, "one-line tick → one-element batch");
+    }
+
+    /// A dispatch tick with no inbound lines does NOT fire
+    /// `invoke_from_plugin_batch([])`. The broker only invokes the hook
+    /// when there's at least one line to deliver. (The `select!` arm
+    /// only fires when an inbound message arrives, so an empty-batch
+    /// invocation could only come from an internal bug.)
+    #[tokio::test]
+    async fn no_lines_no_invocation() {
+        let shared = shared_state();
+        let host = build_host(
+            &shared,
+            r#"
+            calls = 0
+            function dispatch(current) end
+            function invoke_from_plugin(source, payload)
+                calls = calls + 1
+            end
+            function invoke_from_plugin_batch(source, payloads)
+                calls = calls + 1
+            end
+            "#,
+        );
+        let lua = host.lua().clone();
+
+        let mut broker = Broker::new(Arc::clone(&shared), host);
+        let (_p, t) = make_transport();
+        broker.attach_transport(t, pn("idle"));
+        let handle = broker.shutdown_handle();
+        let run = tokio::spawn(broker.run());
+
+        // No `send_line` — the peer is silent for this test.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle.shutdown(50).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
+
+        let calls: i64 = lua.globals().get("calls").unwrap();
+        assert_eq!(calls, 0, "no inbound lines → no hook invocation");
     }
 }
