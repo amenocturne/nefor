@@ -179,6 +179,17 @@ local function parse_spec(spec, index)
   if spec.dir ~= nil and not is_string(spec.dir) then
     fail(label, "`dir` must be a string, got " .. type(spec.dir))
   end
+  -- Resolve relative dir overrides to absolute. A symlink target that's
+  -- relative is interpreted relative to the LINK's own directory (not
+  -- cwd) — passing a relative dir from a consumer that's launched from
+  -- somewhere else would create a broken symlink. Absolutize once at
+  -- the entrypoint so spec.dir is always a real, link-portable path.
+  if spec.dir ~= nil then
+    if spec.dir:sub(1, 1) ~= "/" then
+      local cwd = os.getenv("PWD") or "."
+      spec.dir = cwd .. "/" .. spec.dir
+    end
+  end
 
   -- Non-dir specs need a url to clone from.
   if not spec.dir and not is_string(url) then

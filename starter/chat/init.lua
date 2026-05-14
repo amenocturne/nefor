@@ -35,13 +35,21 @@ do
     return true
   end
 
+  -- `fallbacks` is a `table.pack` result so callers can pass `nil`
+  -- entries (e.g. for unset env vars) without losing later candidates.
+  -- ipairs would stop at the first nil hole; we iterate up to
+  -- `fallbacks.n` and skip nils explicitly. This is the bug that hid
+  -- the bootstrap-clone fallback when NEFOR_DEV_DIR was unset.
   local function pick_dir(env_var, sentinel, fallbacks)
     local candidates = {}
     local explicit = os.getenv(env_var)
     if explicit and explicit ~= "" then
       candidates[#candidates + 1] = explicit
     end
-    for _, f in ipairs(fallbacks) do candidates[#candidates + 1] = f end
+    for i = 1, fallbacks.n do
+      local f = fallbacks[i]
+      if f and f ~= "" then candidates[#candidates + 1] = f end
+    end
     for _, c in ipairs(candidates) do
       if path_exists(c .. sentinel) then return c end
     end
@@ -49,12 +57,29 @@ do
   end
 
   local config_dir = os.getenv("NEFOR_CONFIG_DIR")
+  local dev_dir    = os.getenv("NEFOR_DEV_DIR")
+  local data_dir   = os.getenv("NEFOR_DATA_DIR")
+  -- Bootstrap clone path (team consumers); mirrors how
+  -- nefor.fs.data_root resolves $XDG_DATA_HOME/nefor or
+  -- $HOME/.local/share/nefor on a fresh machine.
+  local xdg_data   = os.getenv("XDG_DATA_HOME")
+  local home       = os.getenv("HOME")
+  local pm_root
+  if data_dir and data_dir ~= "" then
+    pm_root = data_dir .. "/nefor"
+  elseif xdg_data and xdg_data ~= "" then
+    pm_root = xdg_data .. "/nefor/nefor"
+  elseif home and home ~= "" then
+    pm_root = home .. "/.local/share/nefor/nefor"
+  end
 
-  local tui_lua_dir = pick_dir("NEFOR_TUI_LUA_DIR", "/init.lua", {
+  local tui_lua_dir = pick_dir("NEFOR_TUI_LUA_DIR", "/init.lua", table.pack(
+    dev_dir    and (dev_dir    .. "/plugins/nefor-tui/lua") or nil,
+    pm_root    and (pm_root    .. "/plugins/nefor-tui/lua") or nil,
     config_dir and (config_dir .. "/../plugins/nefor-tui/lua") or nil,
     "./plugins/nefor-tui/lua",
-    "../plugins/nefor-tui/lua",
-  })
+    "../plugins/nefor-tui/lua"
+  ))
   if tui_lua_dir == nil then
     error("starter/chat.lua: could not locate plugins/nefor-tui/lua/init.lua")
   end
@@ -62,11 +87,18 @@ do
   -- Starter chat-sub dir holds the submodules. Defaults to
   -- `<NEFOR_CONFIG_DIR>/chat` (the user installs starter/ as their
   -- config dir; chat/ is a sibling of init.lua).
-  local chat_dir = pick_dir("NEFOR_STARTER_CHAT_DIR", "/common.lua", {
+  -- Order matters: chat/* is the user-editable surface (the engine
+  -- runs the copy at $NEFOR_CONFIG_DIR/chat/init.lua, and user edits
+  -- to sibling submodules should win). Prefer config_dir over the
+  -- pm-cloned upstream copy. NEFOR_DEV_DIR still wins overall for
+  -- in-repo iteration.
+  local chat_dir = pick_dir("NEFOR_STARTER_CHAT_DIR", "/common.lua", table.pack(
+    dev_dir    and (dev_dir    .. "/starter/chat") or nil,
     config_dir and (config_dir .. "/chat") or nil,
+    pm_root    and (pm_root    .. "/starter/chat") or nil,
     "./starter/chat",
-    "../starter/chat",
-  })
+    "../starter/chat"
+  ))
   if chat_dir == nil then
     error("starter/chat.lua: could not locate starter/chat submodules")
   end

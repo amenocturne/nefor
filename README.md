@@ -8,15 +8,30 @@ A pure string-bus engine plus separate-process plugins (NCP v0.1 over JSON-line 
 
 ## Install
 
+### From a checkout (recommended)
+
+```sh
+git clone https://github.com/amenocturne/nefor
+cd nefor
+just install
+```
+
+`just install` builds the workspace, copies every binary into `~/.local/bin`, installs `da` (the bash-command classifier the tool-validator uses) via `cargo install --locked dabin` if it isn't already on `PATH`, and copies the in-repo `starter/` to `~/.config/nefor` so a bare `nefor` from any cwd picks up the config. Re-run `just install` to refresh binaries.
+
+If `~/.config/nefor` already exists, the copy step is skipped (your config is yours — re-copying would clobber local tweaks). Move the existing dir aside and re-run if you want a fresh copy from this checkout.
+
+### From brew
+
 ```sh
 brew install amenocturne/tap/nefor
 ```
 
-Then scaffold a config in your XDG config dir:
+Brew doesn't install `da` (cargo-only at the moment) and doesn't drop the starter config. Either run `just install` from a checkout once to wire those up, or do it manually:
 
 ```sh
 mkdir -p ~/.config/nefor
 cp -r $(brew --prefix)/share/nefor/starter/* ~/.config/nefor/
+cargo install --locked dabin
 ```
 
 The starter config talks to `localhost:11434` (Ollama default). Edit `~/.config/nefor/init.lua` to change provider / model.
