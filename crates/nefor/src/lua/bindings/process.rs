@@ -267,6 +267,10 @@ pub fn install_process(lua: &Lua, nefor_tbl: &Table) -> mlua::Result<()> {
 /// Uses `std::process::Command` (sync) deliberately: callers reach for
 /// `process.run` from a plain sync Lua context (e.g. `pm.install` at
 /// `init.lua` load time) where yielding into an async runtime is wrong.
+///
+/// Optional opts:
+///   * `stdin` — string written to the child's stdin then closed. Required
+///     for callers that read the payload off stdin (e.g. `da`).
 fn run_impl(opts: Table) -> mlua::Result<RunOutcome> {
     let cmd_name: String = opts.get("cmd").map_err(|e| {
         mlua::Error::runtime(format!(
@@ -284,10 +288,15 @@ fn run_impl(opts: Table) -> mlua::Result<RunOutcome> {
         .unwrap_or_default();
     let cwd: Option<String> = opts.get::<Option<String>>("cwd").unwrap_or(None);
     let env_tbl: Option<Table> = opts.get::<Option<Table>>("env").unwrap_or(None);
+    let stdin_data: Option<String> = opts.get::<Option<String>>("stdin").unwrap_or(None);
 
     let mut cmd = std::process::Command::new(&cmd_name);
     cmd.args(&args)
-        .stdin(Stdio::null())
+        .stdin(if stdin_data.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(dir) = cwd {
@@ -300,7 +309,27 @@ fn run_impl(opts: Table) -> mlua::Result<RunOutcome> {
         }
     }
 
-    match cmd.output() {
+    // When stdin is requested we spawn + manually write so the child sees
+    // its input before we wait_with_output it. `cmd.output()` is the
+    // null-stdin fast path; both branches collapse to the same RunOutcome
+    // shape so callers don't need to know which fired.
+    let result = match stdin_data {
+        Some(input) => match cmd.spawn() {
+            Ok(mut child) => {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = std::io::Write::write_all(&mut stdin, input.as_bytes());
+                    // Drop stdin to signal EOF; without this readers like
+                    // `da` (read_to_string on stdin) block forever.
+                    drop(stdin);
+                }
+                child.wait_with_output()
+            }
+            Err(e) => Err(e),
+        },
+        None => cmd.output(),
+    };
+
+    match result {
         Ok(out) => Ok(RunOutcome {
             code: out.status.code().unwrap_or(SPAWN_FAILURE_CODE),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -550,6 +579,27 @@ mod tests {
             .eval()
             .expect("run ok");
         assert_eq!(code, 7);
+    }
+
+    #[test]
+    fn run_pipes_stdin_to_child() {
+        // `cat` echoes stdin to stdout; if the stdin pipe + EOF wiring is
+        // right, the captured stdout contains the input verbatim.
+        let lua = setup();
+        let (code, stdout): (i32, String) = lua
+            .load(
+                r#"
+                local r = nefor.process.run({
+                  cmd   = "cat",
+                  stdin = "hello-from-stdin",
+                })
+                return r.code, r.stdout
+                "#,
+            )
+            .eval()
+            .expect("run ok");
+        assert_eq!(code, 0);
+        assert_eq!(stdout, "hello-from-stdin");
     }
 
     #[test]

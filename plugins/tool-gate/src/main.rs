@@ -524,12 +524,20 @@ async fn handle_permission_response(
         )
         .await?;
     } else {
+        // Optional `reason` carries auto-deny context from a non-user
+        // approver (e.g. tool-validator pre-rejecting a dispatch-graph
+        // call that lacks an approved plan). When present we surface it
+        // verbatim in the tool.result.error so the agent learns why
+        // and what to do next, instead of getting the generic
+        // "denied by user" string and having to guess.
+        let reason = body.get("reason").and_then(Value::as_str);
+        let error_msg = match reason {
+            Some(r) if !r.is_empty() => format!("tool `{}` denied: {r}", approval.name),
+            _ => format!("tool `{}` denied by user", approval.name),
+        };
         send_event(
             out_tx,
-            tool_result_error_body(
-                &approval.outer_id,
-                &format!("tool `{}` denied by user", approval.name),
-            ),
+            tool_result_error_body(&approval.outer_id, &error_msg),
         )
         .await?;
     }
@@ -888,6 +896,65 @@ mod tests {
         assert_eq!(body.get("id").and_then(Value::as_str), Some("prov-9"));
         let err = body.get("error").and_then(Value::as_str).unwrap();
         assert!(err.contains("denied by user"));
+    }
+
+    #[tokio::test]
+    async fn denial_with_reason_surfaces_reason_in_tool_result_error() {
+        // tool-validator emits permission_response{decision="deny",
+        // reason="..."} when it auto-rejects an invocation (e.g. a
+        // dispatch-graph call without an approved plan). The reason
+        // must reach the agent verbatim — that's the whole point of
+        // the auto-deny: tell the agent what to do next instead of
+        // letting it discover the rejection only by re-asking the
+        // user via popup.
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+        let mut state = make_state();
+        let advertise = advertise_body(
+            "basic-tools",
+            json!([{"name": "dispatch-graph", "description": "", "parameters": {}}]),
+        );
+        handle_tools_advertise(&tx, &advertise, &mut state)
+            .await
+            .unwrap();
+        let _ = rx.recv().await;
+
+        let invoke = json!({
+            "kind": "tool-gate.tool.invoke",
+            "id": "prov-11",
+            "name": "dispatch-graph",
+            "args": {}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        handle_tool_invoke(&tx, &invoke, &mut state).await.unwrap();
+        let _ = rx.recv().await;
+
+        let response = json!({
+            "kind": "tool.permission_response",
+            "id": "prov-11",
+            "decision": "deny",
+            "reason": "writer roles need an approved plan, but no plan was submitted yet"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        handle_permission_response(&tx, &response, &mut state)
+            .await
+            .unwrap();
+
+        let msg = rx.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
+        let body = v.get("body").unwrap();
+        let err = body.get("error").and_then(Value::as_str).unwrap();
+        assert!(
+            err.contains("writer roles need an approved plan"),
+            "tool.result.error must surface the validator's reason verbatim, got: {err}"
+        );
+        assert!(
+            !err.contains("denied by user"),
+            "deny-with-reason must not fall through to the generic 'denied by user' message, got: {err}"
+        );
     }
 
     #[tokio::test]

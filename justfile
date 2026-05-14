@@ -26,6 +26,40 @@ fmt:
 build:
     cargo build --workspace --release
 
+# Build release and copy every shipped binary into $PREFIX/bin
+# (default: ~/.local/bin). Copies (not symlinks), so subsequent dev
+# rebuilds in target/release/ don't silently mutate the installed
+# binaries — re-run `just install` to refresh.
+# Override the destination: PREFIX=/usr/local just install.
+install:
+    #!/usr/bin/env bash
+    set -eu
+    PREFIX="${PREFIX:-$HOME/.local}"
+    cargo build --workspace --release
+    mkdir -p "$PREFIX/bin"
+    cd "{{justfile_directory()}}"
+    for bin in nefor openai-provider tool-gate basic-tools reasoner-graph nefor-tui mock-plugin generic-provider generic-tool nefor-combinators; do
+      install -m 0755 "target/release/$bin" "$PREFIX/bin/$bin"
+      echo "  $PREFIX/bin/$bin"
+    done
+    # The starter ships a tool-validator that classifies bash commands
+    # via `da` (https://github.com/amenocturne/da) before any popup
+    # fires. Install it on PATH if the user doesn't already have it —
+    # the validator falls back to "always defer to user" without it,
+    # but auto-approval of safe read-only commands needs the binary.
+    if command -v da >/dev/null 2>&1; then
+      echo "  da (already installed) -> $(command -v da)"
+    else
+      echo "Installing da (bash-command classifier)..."
+      cargo install --locked dabin
+      echo "  da -> $(command -v da || echo '?')"
+    fi
+    echo
+    echo "Installed -> $PREFIX/bin"
+    echo "Make sure your shell has:"
+    echo "  export PATH=\"$PREFIX/bin:\$PATH\""
+    echo "  export NEFOR_PLUGIN_DIR=\"$PREFIX/bin\""
+
 # Remove the entire target/ directory. Next build is a full cold compile.
 clean:
     cargo clean

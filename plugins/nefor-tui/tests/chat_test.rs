@@ -1379,11 +1379,11 @@ fn slash_yolo_emits_tool_gate_set_mode() {
 
 #[test]
 fn tool_permission_request_opens_popup_with_approve_deny() {
-    // Wire-shape contract: the event the popup listens for is the EXACT
-    // body tool-gate emits when policy=Prompt — `chat.tool.permission_request`
-    // with `id`, `tool`, `args` (see plugins/tool-gate/src/main.rs:
-    // permission_request_body). Test against the real shape so a future
-    // protocol drift breaks here, not silently in production.
+    // Wire-shape contract: the event the popup listens for is
+    // `chat.tool.popup_request` — emitted by starter/tool-validator
+    // after it has chosen NOT to auto-approve or auto-deny. tool-gate's
+    // `chat.tool.permission_request` goes to the validator; only the
+    // validator's popup_request reaches the chat surface.
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -1391,7 +1391,7 @@ fn tool_permission_request_opens_popup_with_approve_deny() {
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "chat.tool.permission_request",
+            "kind": "chat.tool.popup_request",
             "id": "perm-1",
             "tool": "Bash",
             "args": { "command": "ls -la /tmp" }
@@ -1442,7 +1442,7 @@ fn tool_permission_request_opens_popup_with_approve_deny() {
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "chat.tool.permission_request",
+            "kind": "chat.tool.popup_request",
             "id": "perm-2",
             "tool": "Bash",
             "args": { "command": "rm -rf /" }
@@ -1470,7 +1470,7 @@ fn tool_permission_request_opens_popup_with_approve_deny() {
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "chat.tool.permission_request",
+            "kind": "chat.tool.popup_request",
             "id": "perm-3",
             "tool": "Bash",
             "args": {}
@@ -1507,7 +1507,7 @@ fn tool_permission_request_opens_popup_with_approve_deny() {
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "chat.tool.permission_request",
+            "kind": "chat.tool.popup_request",
             "id": "perm-4",
             "tool": "Bash",
             "args": {}
@@ -3660,7 +3660,7 @@ fn popup_paints_opaque_background_over_transcript() {
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "chat.tool.permission_request",
+            "kind": "chat.tool.popup_request",
             "id": "t1",
             "tool": "spawn_graph",
             "args": {

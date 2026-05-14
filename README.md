@@ -21,6 +21,18 @@ cp -r $(brew --prefix)/share/nefor/starter/* ~/.config/nefor/
 
 The starter config talks to `localhost:11434` (Ollama default). Edit `~/.config/nefor/init.lua` to change provider / model.
 
+## Bash safety
+
+The starter ships a `tool-validator` actor that classifies every `bash` invocation through [`da`](https://github.com/amenocturne/da) before any approval popup appears. The validator owns three outcomes:
+
+- `da` exits 0 (approve) — the call is auto-approved; no popup. Covers read-only binaries (`ls`, `find`, `grep`, …), `--help`/`--version` for any binary, `git read,add,commit,restore-staged,tag,fetch,pull,push`, `cargo local` operations.
+- `da` exits 2 (deny) — the call is auto-denied; no popup.
+- `da` exits 1 (defer) or `da` is absent — defers to a user popup. The popup is the only way the human sees a permission prompt; tool-gate's `chat.tool.permission_request` never reaches the chat surface directly.
+
+`just install` installs `da` automatically (`cargo install --locked dabin`). If the binary isn't on `PATH` the validator logs a warning at startup and falls back to "always defer" — safe by construction.
+
+To change the policy stack (e.g. add `--cargo crates-publish` for a release pipeline), edit `DA_ARGS` in `starter/tool-validator/init.lua`.
+
 ## Quick start
 
 ```sh
