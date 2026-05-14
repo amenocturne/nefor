@@ -1,96 +1,39 @@
 -- starter/agentic-loop/init.lua — orchestrator actor.
 --
--- ## Layout
+-- The orchestrator owns single-flight run state, the firing→node map,
+-- and the observer registries chat.lua subscribes to. Per-plugin
+-- wrapper actors (under `compositors/`, plus `reasoner-graph/`,
+-- `tool-gate/`) translate each binary's wire shape to the canonical
+-- `tool.invoke` / `tool.result` pair; this actor only consumes the
+-- canonical shape.
 --
--- This plugin is a folder. `init.lua` (this file) is the production
--- actor — `require("agentic-loop")` returns it. Test escape hatches
--- live in `agentic-loop/test.lua` if needed.
---
--- ## Shape
---
--- Returns the actor table — `{ name, receive_msg, send_msg, ..., public API }`.
--- The starter registers it via `actor.spawn(require("agentic-loop"))`
--- alongside the per-plugin wrapper actors.
---
--- ## What this actor owns
---
--- All orchestrator state that used to live at module scope in
--- `starter/agentic_workflow.lua`:
---
---   * `config` — provider/model/system seeds for the orchestrator
---     template graph
---   * `current_run_id`, `current_state` — single-flight orchestrator
---     run tracking
---   * `pending`, `pending_runs`, `pending_dispatches` — in-flight firings,
---     spawn_graph runs, queued sub-graph dispatches
---   * `chat_id_to_key`, `tool_id_to_key`, `chat_id_stream_visible` —
---     reverse maps for plugin-replies that don't carry firing_id, plus
---     D-26 stream gating
---   * `deferred_queue`, `pending_user_inputs` — spawn_graph completions
---     and busy-time submits
---   * Public observer lists (on_stream/on_reasoning/on_tool_start/...)
---
--- ## Interplay with per-plugin wrappers
---
--- The wrapper folders (`openai-provider/`, `tool-gate/`, `reasoner-graph/`,
--- `nefor-tui/`) own the wire-protocol translation between each plugin's
--- native envelope shape and the canonical bus shape. Post Phase 3b the
--- canonical wire is `tool.invoke` / `tool.result` — reasoner-graph
--- (the Rust binary) dispatches nodes via `tool.invoke { id=firing_id,
--- name=<reasoner>, args }`, expects `tool.result { id=firing_id, result }`
--- back, and closes the run with `tool.result { id=run_id, result: { status,
--- results } }`. `graph.node.fired` is the paired observer envelope
--- broadcast alongside each `tool.invoke` so observers can map firing_id
--- → (run_id, node_id, reasoner) without parsing dispatch traffic.
---
--- The agentic-loop dispatches on these inbound kinds:
---
---   * `chat.input.submit { text }`        — user submit; build orchestrator
---                                           graph + emit canonical
---                                           tool.invoke{name=spawn_graph}
---   * `chat.interrupt_all`                — double-Esc; cancel everything
---   * `chat.reset`                        — /new: clear state + broadcast
---   * `chat.model.set`                    — runtime model switch
---   * `graph.run_started { run_id, total_nodes }` — observability only
---   * `graph.node.fired { run_id, node_id, firing_id, reasoner }` —
---                                           observer paired with each
---                                           tool.invoke; agentic-loop uses
---                                           it to map firing_id → node_id
---                                           for the orchestrator run so
---                                           `tool.result` for the wrap
---                                           firing can capture next_state
---   * `tool.result { id, result | error }` — three flavours, disambiguated
---                                           by `id`:
---                                              - `id == current_run_id`     → orchestrator complete
---                                              - `id` in `pending_runs`     → sub-graph complete
---                                              - `id` in firing→node map   → wrap-node next_state capture
---                                           Other tool.result envelopes (real
---                                           tool returns, spawn_graph acks)
---                                           pass through to other consumers.
---   * `<provider>.chat.complete.result`   — translated by provider wrapper into
---                                           a `tool.result` keyed by
---                                           firing_id. The wrapper does the
---                                           chat_id → firing lookup +
---                                           emission.
---   * `<provider>.stream.delta` etc.      — observed via wrapper translations
---                                           (fire stream/reasoning observers)
---   * `tool-gate.tool.invoke` (spawn_graph) — gate-forwarded tool invocation;
---                                            handled by per-plugin tool-gate
---                                            wrapper for the spawn_graph case
+-- Inbound dispatch:
+--   * `chat.input.submit { text }`       — build orchestrator graph,
+--                                          emit tool.invoke{name=spawn_graph}
+--   * `chat.interrupt_all`               — double-Esc; cancel everything
+--   * `chat.reset`                       — /new: clear state + broadcast
+--   * `chat.model.set`                   — runtime model switch
+--   * `graph.run_started`/`node.fired`   — observer envelopes
+--   * `tool.result { id, result|error }` — three flavours keyed by id:
+--                                          orchestrator run, sub-graph
+--                                          run, or wrap-node next_state
+--   * `<provider>.chat.complete.result`  — translated by provider wrapper
+--   * `<provider>.stream.delta` etc.     — fire stream/reasoning observers
 --   * `sessions.session_start/end/resume_done` — replay lifecycle
---   * `engine.shutdown`                   — no-op (sessions handles)
+--   * `engine.shutdown`                  — no-op (sessions handles)
 
 local json = nefor.json
 
-local envelope      = require("lib.envelope")
-local ids           = require("lib.ids")
-local results_lib   = require("lib.results")
-local graph_lib     = require("lib.graph")
-local replay_window = require("lib.replay_window")
-
--- ------------------------------------------------------------------
--- module-private state — held in `state` table; mutations are explicit
--- ------------------------------------------------------------------
+local envelope        = require("core.envelope")
+local ids             = require("core.ids")
+local results_lib     = require("agentic-loop.results")
+local topology        = require("agentic-loop.topology")
+local spawn_graph     = require("libs.spawn-graph")
+local history_replay  = require("core.history_replay")
+local replay_window   = history_replay
+local session_config  = require("agentic-loop.session_config")
+local generic_provider = require("libs.generic-provider")
+local generic_tool     = require("libs.generic-tool")
 
 local state = {
   -- Orchestrator config — mutated by configure() / chat.model.set.
@@ -106,7 +49,7 @@ local state = {
   pending_user_inputs  = {},    ---@type table       -- queued submits while busy
   pending              = {},    ---@type table       -- run_id:firing_id → entry
   pending_runs         = {},    ---@type table       -- sub-graph run_id → meta
-  pending_dispatches   = {},    ---@type table       -- queued sub-graph dispatches (D-31)
+  pending_dispatches   = {},    ---@type table       -- queued sub-graph dispatches
   chat_id_to_key       = {},    ---@type table
   tool_id_to_key       = {},    ---@type table
   chat_id_stream_visible = {},  ---@type table
@@ -130,7 +73,7 @@ local state = {
 -- Reasoner types whose streaming should reach nefor-tui.
 local STREAM_VISIBLE_TYPES = { ["provider-wrapper"] = true }
 
-local SPAWN_GRAPH_SOURCE = graph_lib.SPAWN_GRAPH_SOURCE
+local SPAWN_GRAPH_SOURCE = spawn_graph.SPAWN_GRAPH_SOURCE
 
 local emit           = envelope.emit
 local emit_to        = envelope.emit_to
@@ -141,19 +84,11 @@ local uuid_lite      = envelope.uuid_lite
 local serialise_results = results_lib.serialise_results
 local format_deferred   = results_lib.format_deferred
 
--- ------------------------------------------------------------------
--- helpers
--- ------------------------------------------------------------------
-
 local function fire_observers(list, ...)
   for _, cb in ipairs(list) do pcall(cb, ...) end
 end
 
--- ------------------------------------------------------------------
--- D-31 / cancel / dispatch helpers
--- ------------------------------------------------------------------
-
--- Release every queued sub-graph dispatch. Idempotent. D-31.
+-- Release every queued sub-graph dispatch. Idempotent.
 local function flush_pending_dispatches()
   if #state.pending_dispatches == 0 then return 0 end
   local n = #state.pending_dispatches
@@ -191,18 +126,18 @@ local function cancel_all_pending_runs()
   return n
 end
 
--- ------------------------------------------------------------------
--- run lifecycle — submit / flush
--- ------------------------------------------------------------------
-
 local function submit_orchestrator_run(user_text)
   if state.current_run_id ~= nil then return nil end
 
-  local g = graph_lib.build_orchestrator_graph({
-    provider  = state.config.provider,
-    model     = state.config.model,
-    system    = state.config.system,
-    user_text = user_text or "",
+  local g = topology.build_orchestrator_graph({
+    provider       = state.config.provider,
+    model          = state.config.model,
+    system         = state.config.system,
+    user_text      = user_text or "",
+    tool_allowlist = state.config.tool_allowlist,
+    provider_out   = generic_provider.PROVIDER_OUT,
+    final_answer   = generic_provider.FINAL_ANSWER,
+    tool_calls     = generic_tool.TOOL_CALLS,
   })
 
   if type(state.current_state) == "table"
@@ -248,8 +183,9 @@ local function flush_pending_user_inputs()
   submit_orchestrator_run(text)
 end
 
--- Cancel everything. D-32 fan-out order:
---   (1) cancel current orchestrator run
+-- Cancel everything. Fan-out order:
+--   (1) cancel current orchestrator run + interrupt the in-flight
+--       provider stream so deltas stop spilling
 --   (2) cancel sub-graph runs + clear queued dispatches
 --   (3) drop deferred queue + pending user inputs
 --   (4) clear pending bookkeeping
@@ -295,6 +231,33 @@ local function new_chat()
   emit(nil, { kind = "chat.reset" })
 end
 
+-- Mid-chat /model picker.
+--
+-- A model-only switch (same provider, different model) keeps
+-- state.current_state intact — chat_id continues to live on the
+-- existing provider plugin, the wrapper's chat.model.set →
+-- <prefix>.model.set carries the active chat_id so the provider
+-- learns the new model for that chat, conversation continuity holds.
+--
+-- A provider switch (different provider name) crosses a process
+-- boundary: the new provider's binary has no per-chat_id history
+-- table for the active chat. Without rebuild the model would reply
+-- with no memory of prior turns. We rebuild by walking the
+-- on-disk session log for the prior chat's `<old>.chat.{create,append}`
+-- + wrap-firing tool.result envelopes and re-emitting them as
+-- `<new>.chat.{create,append}` against a fresh chat_id under the new
+-- provider. The bus traffic flows through every wrapper's `to_plugin`
+-- the same way live envelopes do; the new provider's wrapper delivers
+-- to its binary, every other wrapper drops on prefix mismatch. The
+-- next submit seeds the wrap node with the new chat_id (via
+-- state.current_state) so reasoners.lua's no-create branch fires
+-- (prev_state.chat_id is set → no new chat.create, just chat.append +
+-- chat.complete on the already-rebuilt chat).
+--
+-- If the session log is unavailable (no path, open failure, no prior
+-- chat.create matching the chat_id), we fall back to clearing
+-- current_state — user loses prior context but the chat stays
+-- consistent.
 local function set_model(provider, model)
   if type(provider) == "string" and #provider > 0 then
     state.config.provider = provider
@@ -322,10 +285,6 @@ local function cancel()
     kind = state.config.provider .. ".interrupt",
   })
 end
-
--- ------------------------------------------------------------------
--- envelope handlers — chat.input.submit / chat.reset / chat.model.set
--- ------------------------------------------------------------------
 
 local function handle_chat_input_submit(body)
   local text = body.text or ""
@@ -387,10 +346,6 @@ local function handle_chat_model_set(body)
     set_model(provider, model)
   end
 end
-
--- ------------------------------------------------------------------
--- envelope handlers — graph.node.fired + tool.result
--- ------------------------------------------------------------------
 
 -- graph.node.fired observer: track firing_id → (run_id, node_id) for
 -- runs we care about (current orchestrator run + every sub-graph run
@@ -544,10 +499,6 @@ local function handle_tool_result(body)
   end
 end
 
--- ------------------------------------------------------------------
--- session lifecycle
--- ------------------------------------------------------------------
-
 local function teardown_for_session_end()
   if state.current_run_id ~= nil then
     emit("reasoner-graph", {
@@ -573,15 +524,11 @@ local function teardown_for_session_end()
   nefor.log.info("agentic-loop: sessions.session_end → state cleared", {})
 end
 
--- ------------------------------------------------------------------
--- sub-graph dispatch hook (used by tool-gate wrapper)
--- ------------------------------------------------------------------
-
 -- Queue a sub-graph dispatch and return the minted run_id. Called by
 -- the tool-gate wrapper when it intercepts the gate-forwarded
 -- spawn_graph invocation. The dispatch is held in pending_dispatches
--- (D-31) and released on first wrap-stream delta, or via the backup
--- path on chat.complete.result.
+-- and released on first wrap-stream delta, or via the backup path on
+-- chat.complete.result.
 local function queue_sub_graph(args, gate_inner_id)
   local g = args.graph
   local on_failure = args.on_node_failure or "abort"
@@ -666,9 +613,54 @@ local function peek_pending_for_chat(chat_id)
   return state.pending[key]
 end
 
--- Stream-visible check by chat_id (D-26 gate).
+-- Stream-visible check by chat_id (sub-graph stream gating).
 local function stream_visible(chat_id)
   return state.chat_id_stream_visible[chat_id] == true
+end
+
+-- Per-chat stream-visibility registration for chats the agentic-loop
+-- doesn't itself own (e.g. agent-reasoner sub-firings). The provider
+-- wrapper's gate normally requires both a pending entry AND
+-- stream_visible == false to suppress; the agent reasoner's chat_id
+-- has neither because it's not driven through `track_provider_firing`
+-- (the agent reasoner is its own state machine and would conflict
+-- with the wrapper's chat.complete.result close path). We expose a
+-- separate flag table so the wrapper can ask "is this chat
+-- explicitly stream-suppressed?" without a pending entry.
+--
+-- The wrapper's stream gate becomes:
+--   stream_suppressed(chat_id) = (existing wrapper-pending gate)
+--                              OR (explicitly hidden via the helper)
+local function register_chat_stream_hidden(chat_id)
+  if type(chat_id) ~= "string" or chat_id == "" then return end
+  state.chat_id_stream_visible[chat_id] = false
+  state.chat_id_stream_explicitly_hidden = state.chat_id_stream_explicitly_hidden or {}
+  state.chat_id_stream_explicitly_hidden[chat_id] = true
+end
+
+local function unregister_chat_stream_hidden(chat_id)
+  if type(chat_id) ~= "string" or chat_id == "" then return end
+  state.chat_id_stream_visible[chat_id] = nil
+  if state.chat_id_stream_explicitly_hidden ~= nil then
+    state.chat_id_stream_explicitly_hidden[chat_id] = nil
+  end
+end
+
+-- Single-call gate the provider wrappers use on inbound stream events.
+-- True when EITHER (a) the chat has a tracked pending entry whose
+-- reasoner type is not stream-visible, OR (b)
+-- the chat was explicitly registered hidden by an agent reasoner.
+local function stream_suppressed(chat_id)
+  if type(chat_id) ~= "string" or chat_id == "" then return false end
+  if state.chat_id_to_key[chat_id] ~= nil
+      and state.chat_id_stream_visible[chat_id] == false then
+    return true
+  end
+  if state.chat_id_stream_explicitly_hidden ~= nil
+      and state.chat_id_stream_explicitly_hidden[chat_id] == true then
+    return true
+  end
+  return false
 end
 
 -- Tool-result correlation: look up by tool_id, returns
@@ -709,13 +701,11 @@ local function fire_tool_end_observers(id, output, err)
   fire_observers(state.tool_end_observers, id, output, err)
 end
 
--- ------------------------------------------------------------------
--- module-level exports made available to wrappers + reasoner actors
+-- Module-level exports made available to wrappers + reasoner actors
 -- via `require("agentic-loop").<helper>`. Centralising the state-
--- mutation surface here keeps the wrappers structurally simple
--- (pure translation; no module-private state of their own) and
--- keeps the agentic-loop the single owner of orchestrator state.
--- ------------------------------------------------------------------
+-- mutation surface here keeps wrappers structurally simple (pure
+-- translation; no private state) and the agentic-loop the single
+-- owner of orchestrator state.
 
 local M = {}
 
@@ -791,20 +781,28 @@ function M.fire_tool_end_observers(id, output, err) fire_tool_end_observers(id, 
 
 function M.config() return state.config end
 
+-- Public read-only accessor for the orchestrator's current state
+-- (last-seen chat_id, anything else carried forward across firings).
+-- Returns the underlying table or nil — callers must treat the result
+-- as read-only; mutations leak into orchestrator state. Provider
+-- compositors use this to thread the active chat_id into
+-- `chat.model.set` bodies; tests use it to assert state transitions.
+function M.current_state() return state.current_state end
+
 -- Back-compat with agentic_workflow.build_template (used by tests).
 function M.build_template(user_text, opts)
   opts = opts or {}
-  return graph_lib.build_orchestrator_graph({
-    provider  = opts.provider or state.config.provider,
-    model     = opts.model    or state.config.model,
-    system    = opts.system   or state.config.system,
-    user_text = user_text or "",
+  return topology.build_orchestrator_graph({
+    provider       = opts.provider       or state.config.provider,
+    model          = opts.model          or state.config.model,
+    system         = opts.system         or state.config.system,
+    user_text      = user_text or "",
+    tool_allowlist = opts.tool_allowlist or state.config.tool_allowlist,
+    provider_out   = generic_provider.PROVIDER_OUT,
+    final_answer   = generic_provider.FINAL_ANSWER,
+    tool_calls     = generic_tool.TOOL_CALLS,
   })
 end
-
--- ------------------------------------------------------------------
--- receive_msg — actor runtime hook
--- ------------------------------------------------------------------
 
 local function receive_msg(entry)
   -- Skip per-peer broadcast fan-out entries. The broker (and ncp.lua)
@@ -860,6 +858,28 @@ local function receive_msg(entry)
   if replay_window.active() then
     if kind == "graph.node.fired" then return end
     if kind == "tool.result" then
+      -- Cross-process /resume rebuild: capture the active chat_id from
+      -- replayed wrap-firing close envelopes. Live path keys this on
+      -- `firing_to_node[firing_id]` populated by `graph.node.fired`,
+      -- but on a fresh-process /resume firing_to_node is empty (the
+      -- run completed in the prior process). The wire signature of a
+      -- wrap firing close is `result.next_state.chat_id`; run-close /
+      -- terminal-close / sub-graph-synth tool.results carry
+      -- `result.results` / `result.text` / `result.status` instead, so
+      -- the next_state.chat_id check is the discriminator.
+      --
+      -- Without this, the next live submit reaches submit_orchestrator_run
+      -- with state.current_state==nil → no seed_chat_id → reasoners.lua
+      -- mints a fresh chat-N → openai-provider's painstakingly-rebuilt
+      -- history (on the OLD chat_id) is orphaned, model replies with no
+      -- memory of prior turns.
+      local result = body.result
+      if type(result) == "table" and type(result.next_state) == "table" then
+        local cid = result.next_state.chat_id
+        if type(cid) == "string" and cid ~= "" then
+          state.current_state = result.next_state
+        end
+      end
       -- Drop only tool.result envelopes that target one of our tracked
       -- ids; pass the rest to other consumers (real tool returns,
       -- spawn_graph synth replies). Matters because tool-gate's own
@@ -886,7 +906,7 @@ local function receive_msg(entry)
 end
 
 -- Drive `teardown_for_session_end` from the bus marker. Replay-mode
--- gating is owned by `lib/replay_window`, which subscribes to
+-- gating is owned by `core.history_replay`, which subscribes to
 -- `sessions.replay.start` / `sessions.replay.end` independently — the
 -- old `session_start` / `resume_done` lifecycle hooks are dead weight
 -- now that the gate flips on the framing markers instead.
@@ -895,10 +915,6 @@ if nefor.bus and nefor.bus.on_event then
     teardown_for_session_end()
   end)
 end
-
--- ------------------------------------------------------------------
--- module table — actor contract + public API
--- ------------------------------------------------------------------
 
 M.name        = "agentic-loop"
 M.receive_msg = receive_msg

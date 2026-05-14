@@ -86,8 +86,6 @@ ncp.spawn {
 }
 ```
 
-Full multi-instance recipe: `starter/openai-providers-example.lua`.
-
 ### Wire shape — request
 
 ```json
@@ -196,5 +194,3 @@ Each pair maps `<prefix>stream.delta` → `chat.stream.delta`, `<prefix>stream.e
 ### Multi-instance pattern
 
 Wire one provider into nefor-chat at a time. Spawning two providers (e.g. `ollama` and `groq`) means **both** would translate their `<prefix>.stream.*` events to `chat.stream.*`, so nefor-chat would render interleaved deltas from both. A future router plugin could fan `chat.input.submit` out to a chosen provider based on a model-selector UI; until that exists, pick one.
-
-See `starter/openai-providers-example.lua` for the full multi-instance recipe (commented out — uncomment the spawn you want).

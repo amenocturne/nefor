@@ -14,16 +14,67 @@ use std::time::Duration;
 use nefor_tui::engine::Engine;
 use nefor_tui::input::KeyMessage;
 use nefor_tui::mouse::{MouseKind, MouseMessage};
-use serde_json::{json, Map as JsonMap, Value as JsonValue};
+use serde_json::{Map as JsonMap, Value as JsonValue, json};
+
+/// Per-process tempdir kept alive for the lifetime of `cargo test` and
+/// pointed at by `NEFOR_DATA_DIR` on first access. Ensures chat.lua's
+/// `load_input_history` (issue #39) reads from / writes to a clean
+/// throwaway path instead of the developer's `$HOME/.local/share/
+/// nefor/input-history` — without this, parallel test runs would
+/// pollute (and read pre-existing entries from) the user's real
+/// shell-style history file.
+///
+/// Per-test ResumeEnv overrides this default for tests that need a
+/// per-test isolated data dir (e.g. session-picker, input-history
+/// regression tests); they restore back to whatever was set before
+/// (which is this process-wide tempdir) on Drop.
+static TEST_DATA_HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+
+fn ensure_test_data_home() {
+    let dir = TEST_DATA_HOME
+        .get_or_init(|| tempfile::tempdir().expect("create per-process test data home"));
+    // set_var is process-global; OnceLock guarantees the assignment
+    // runs only once. Subsequent ResumeEnv-style overrides save +
+    // restore around their scope, so this default is what they read
+    // at construction time and what they restore on Drop.
+    if std::env::var_os("NEFOR_DATA_DIR").is_none() {
+        std::env::set_var("NEFOR_DATA_DIR", dir.path());
+    }
+}
 
 fn chat_lua_source() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    // Side-effect on first call: install a per-process data home so
+    // chat.lua's input-history loader doesn't reach into the user's
+    // real `$HOME/.local/share/nefor`. Centralised here because every
+    // chat-surface test reads this function — no per-test wiring.
+    ensure_test_data_home();
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
         .expect("repo root")
-        .join("starter")
-        .join("chat.lua");
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {:?}: {e}", path))
+        .to_path_buf();
+    // Tell chat.lua's package.path bootstrap where the nefor-tui plugin
+    // lib lives. In a normal `nefor` run, the engine sets NEFOR_CONFIG_DIR
+    // and chat.lua derives the plugin-lib dir relative to that; tests
+    // load chat.lua directly into the engine's Lua VM (no env from the
+    // engine entry point) so we set the explicit override here.
+    let plugin_lua = repo_root
+        .join("plugins")
+        .join("nefor-tui")
+        .join("lua");
+    if std::env::var_os("NEFOR_TUI_LUA_DIR").is_none() {
+        std::env::set_var("NEFOR_TUI_LUA_DIR", &plugin_lua);
+    }
+    // Tell chat.lua's package.path bootstrap where the chat/ submodule
+    // dir lives. Same rationale as NEFOR_TUI_LUA_DIR above — tests
+    // load chat.lua directly into the engine VM with no NEFOR_CONFIG_DIR
+    // (which is how the binary normally seeds this path).
+    let chat_subdir = repo_root.join("starter").join("chat");
+    if std::env::var_os("NEFOR_STARTER_CHAT_DIR").is_none() {
+        std::env::set_var("NEFOR_STARTER_CHAT_DIR", &chat_subdir);
+    }
+    let chat_path = repo_root.join("starter").join("chat").join("init.lua");
+    std::fs::read_to_string(&chat_path).unwrap_or_else(|e| panic!("read {:?}: {e}", chat_path))
 }
 
 fn render_str(engine: &mut Engine) -> String {
@@ -2185,13 +2236,13 @@ fn model_picker_typing_filters_query() {
 // /resume slash + session picker
 // ============================================================
 //
-// The picker reads from `$NEFOR_DATA_HOME/sessions/` (overridable via
+// The picker reads from `$NEFOR_DATA_DIR/sessions/` (overridable via
 // env var, set per-test for isolation). Selecting a row emits a
 // `sessions.resume_request { session_id }` envelope onto the NCP bus —
 // no process exit, no sidechannel file. The starter's `sessions` Lua
 // module subscribes to that kind and runs the in-process swap.
 //
-// Test isolation: each test creates a tempdir, sets NEFOR_DATA_HOME to
+// Test isolation: each test creates a tempdir, sets NEFOR_DATA_DIR to
 // it, and tears it down on completion. Env var manipulation is
 // process-global so we serialize via a mutex.
 
@@ -2200,7 +2251,7 @@ use std::sync::Mutex;
 
 // Process-global lock — env var mutation is unsafe across threads.
 // `cargo test` runs unit tests in parallel by default; this serializes
-// only the tests that touch NEFOR_DATA_HOME.
+// only the tests that touch NEFOR_DATA_DIR.
 static RESUME_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct ResumeEnv {
@@ -2216,10 +2267,10 @@ impl ResumeEnv {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let data_home = tempdir.path().to_path_buf();
         std::fs::create_dir_all(data_home.join("sessions")).expect("mkdir sessions");
-        let prev = std::env::var("NEFOR_DATA_HOME").ok();
+        let prev = std::env::var("NEFOR_DATA_DIR").ok();
         // Tests serialize via RESUME_ENV_LOCK so concurrent reads/writes
         // don't race. set_var is safe under edition 2021.
-        std::env::set_var("NEFOR_DATA_HOME", &data_home);
+        std::env::set_var("NEFOR_DATA_DIR", &data_home);
         ResumeEnv {
             _guard: guard,
             _tempdir: tempdir,
@@ -2266,8 +2317,8 @@ impl Drop for ResumeEnv {
     fn drop(&mut self) {
         // Still under RESUME_ENV_LOCK.
         match self.prev.as_deref() {
-            Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
-            None => std::env::remove_var("NEFOR_DATA_HOME"),
+            Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+            None => std::env::remove_var("NEFOR_DATA_DIR"),
         }
     }
 }
@@ -3513,5 +3564,842 @@ fn slash_clear_is_alias_for_slash_new() {
     assert!(
         kinds.contains(&"chat.interrupt_all") && kinds.contains(&"sessions.new_request"),
         "/clear must emit interrupt_all + new_request like /new; got {kinds:?}",
+    );
+}
+
+// ── persistent input history (issue #39) ────────────────────────────
+//
+// Like shell history: a submit on session A writes the prompt to
+// `<NEFOR_DATA_DIR>/input-history`; a fresh nefor process (session B)
+// reads it back at init so arrow-up recalls it. Cap is INPUT_HISTORY_MAX
+// (50) — pushing the 51st entry rolls the oldest off the disk file
+// the next time we trim.
+//
+// Reuses the `ResumeEnv` harness above for tempdir + NEFOR_DATA_DIR
+// isolation. Each test scopes its own env so the file lives in a
+// per-test tmp dir and tests don't race over the shared XDG path.
+
+fn read_history_file(path: &std::path::Path) -> Vec<String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    raw.lines().map(|l| l.to_string()).collect()
+}
+
+#[test]
+fn submit_persists_input_history_to_disk_for_next_session() {
+    let env = ResumeEnv::new();
+
+    // Session A: submit two prompts. Each Enter must mirror the text
+    // to `<data_home>/input-history`, newest at line 1.
+    {
+        let mut engine = Engine::new(80, 24).expect("engine A");
+        engine.load_scenario(&chat_lua_source()).expect("load");
+        let _ = render_str(&mut engine);
+
+        for ch in "hello".chars() {
+            engine.handle_key(key(&ch.to_string())).expect("type");
+        }
+        engine.handle_key(key("enter")).expect("submit hello");
+        let _ = render_str(&mut engine);
+
+        for ch in "world".chars() {
+            engine.handle_key(key(&ch.to_string())).expect("type");
+        }
+        engine.handle_key(key("enter")).expect("submit world");
+        let _ = render_str(&mut engine);
+    }
+
+    let path = env.data_home.join("input-history");
+    let lines = read_history_file(&path);
+    assert_eq!(
+        lines,
+        vec!["world".to_string(), "hello".to_string()],
+        "input-history must hold both submits, newest first"
+    );
+
+    // Session B: a fresh engine on the same NEFOR_DATA_DIR hydrates
+    // its `prompt_history` from disk. Arrow-up on the empty input
+    // recalls the most-recent ("world") on the first press.
+    let mut engine_b = Engine::new(80, 24).expect("engine B");
+    engine_b.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine_b);
+
+    engine_b.handle_key(key("up")).expect("arrow up");
+    let _ = render_str(&mut engine_b);
+
+    // Probe state.input_value via Lua. The state table is held inside
+    // the engine's frame closure; expose it indirectly by triggering
+    // a render and inspecting the rendered input field. But since the
+    // text_input desc carries the value verbatim, easier: pull it via
+    // the engine's snapshot — the input row contains the recalled
+    // text.
+    let snap = engine_b.snapshot();
+    assert!(
+        snap.contains("world"),
+        "expected last-session's prompt 'world' to recall via arrow-up, got snapshot:\n{snap}"
+    );
+
+    // Second arrow-up walks to the older entry.
+    engine_b.handle_key(key("up")).expect("arrow up 2");
+    let _ = render_str(&mut engine_b);
+    let snap = engine_b.snapshot();
+    assert!(
+        snap.contains("hello"),
+        "expected older prompt 'hello' on second arrow-up, got snapshot:\n{snap}"
+    );
+}
+
+#[test]
+fn submit_caps_input_history_at_max_and_rolls_oldest() {
+    // Pump 51 distinct prompts. The disk file must hold exactly 50
+    // entries (INPUT_HISTORY_MAX), with the OLDEST submission rolled
+    // off. Newest-first ordering means line 1 is the 51st prompt
+    // ("p51") and line 50 is the second-oldest ("p2"); "p1" is gone.
+    let env = ResumeEnv::new();
+
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for i in 1..=51 {
+        let prompt = format!("p{i}");
+        for ch in prompt.chars() {
+            engine.handle_key(key(&ch.to_string())).expect("type");
+        }
+        engine.handle_key(key("enter")).expect("submit");
+        let _ = render_str(&mut engine);
+    }
+
+    let path = env.data_home.join("input-history");
+    let lines = read_history_file(&path);
+    assert_eq!(
+        lines.len(),
+        50,
+        "input-history must trim to INPUT_HISTORY_MAX (50); got {} lines",
+        lines.len()
+    );
+    assert_eq!(
+        lines[0], "p51",
+        "newest submit must be at the top of the file"
+    );
+    assert_eq!(
+        lines[49], "p2",
+        "the 50th line must be the second-oldest — p1 rolled off"
+    );
+    assert!(
+        !lines.iter().any(|l| l == "p1"),
+        "oldest submit (p1) must have rolled off past the cap"
+    );
+}
+
+#[test]
+fn input_history_round_trips_multiline_payload_through_disk() {
+    // A multi-line paste landed via Shift+Enter / bracketed-paste +
+    // Enter must round-trip through the on-disk file: the file format
+    // escapes \n / \r so each entry stays on a single physical line,
+    // and the loader decodes back to the original verbatim. Without
+    // that escaping the second line of a multi-line paste would be
+    // read back as a separate history entry.
+    let env = ResumeEnv::new();
+
+    // Session A: paste a 3-line block, submit it. Use the engine's
+    // bracketed-paste path so the test exercises the same code path
+    // a real paste would.
+    {
+        let mut engine = Engine::new(80, 24).expect("engine A");
+        engine.load_scenario(&chat_lua_source()).expect("load");
+        let _ = render_str(&mut engine);
+
+        let payload = "line1\nline2\nline3";
+        engine.handle_paste(payload).expect("paste");
+        engine.handle_key(key("enter")).expect("submit");
+        let _ = render_str(&mut engine);
+    }
+
+    let path = env.data_home.join("input-history");
+    let lines = read_history_file(&path);
+    assert_eq!(
+        lines.len(),
+        1,
+        "multi-line submit must occupy exactly one physical line in the file (got {lines:?})"
+    );
+    assert!(
+        lines[0].contains(r"\n"),
+        "multi-line submit must have its real \\n escaped to the literal two-char `\\n` sequence \
+         on disk so the per-line frame survives — got: {:?}",
+        lines[0]
+    );
+
+    // Session B reloads. The first arrow-up recall puts the FULL
+    // multi-line text into the input — verify by a substring of each
+    // line in the snapshot.
+    let mut engine_b = Engine::new(80, 24).expect("engine B");
+    engine_b.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine_b);
+    engine_b.handle_key(key("up")).expect("arrow up");
+    let _ = render_str(&mut engine_b);
+    let snap = engine_b.snapshot();
+    assert!(
+        snap.contains("line1") && snap.contains("line2") && snap.contains("line3"),
+        "all three lines of the multi-line history entry must be visible \
+         in the recalled input — got snapshot:\n{snap}"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// @path preprocessor (#47)
+// ──────────────────────────────────────────────────────────────────────
+// chat.lua's submit reducer scans plain-text submits for `@<path>`
+// tokens and inlines the file contents as a `<file path="…">` block
+// before emitting `chat.input.submit`. The lead workflow spec
+// (lead-workflow-spec §1, §6, §8) treats this as a starter-config
+// prerequisite: the orchestrator's first turn sees `@`-files already
+// resolved, with the existing `read_file` tool as the fallback for
+// truncated or larger files.
+
+fn type_text(engine: &mut Engine, s: &str) {
+    for ch in s.chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+}
+
+fn submit_text(engine: &mut Engine, s: &str) {
+    type_text(engine, s);
+    engine.handle_key(key("enter")).expect("enter");
+}
+
+#[test]
+fn at_path_inlines_existing_file_into_wire_envelope() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("hello.lua");
+    std::fs::write(&path, "print('hi from fixture')\n").expect("write fixture");
+
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Absolute paths sidestep CWD assumptions — the io.open fallback
+    // for absolute tokens is the codepath this test pins.
+    let prompt = format!("summarize @{}", path.display());
+    submit_text(&mut engine, &prompt);
+
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "submit should produce exactly one emit");
+    let (target_hint, body) = &emits[0];
+    assert_eq!(target_hint.as_deref(), Some("engine"));
+    assert_eq!(
+        body.get("kind").and_then(|v| v.as_str()),
+        Some("chat.input.submit")
+    );
+    let wire = body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .expect("text on the envelope");
+
+    assert!(
+        wire.contains("print('hi from fixture')"),
+        "file contents missing from wire text: {wire:?}"
+    );
+    assert!(
+        wire.contains(&format!("<file path=\"{}\">", path.display())),
+        "expected `<file path=\"…\">` wrapper in wire text: {wire:?}"
+    );
+    assert!(
+        wire.contains("```lua"),
+        "expected lua fence inferred from .lua extension: {wire:?}"
+    );
+    assert!(
+        wire.contains("</file>"),
+        "expected closing `</file>` in wire text: {wire:?}"
+    );
+    // The raw `@<path>` token must NOT survive into the wire envelope —
+    // the inlined block replaced it. (`@` may still appear inside the
+    // file path attribute, but the standalone `@<path>` token gone.)
+    let needle = format!("@{}", path.display());
+    assert!(
+        !wire.contains(&needle),
+        "@-token should be replaced, not present verbatim: {wire:?}"
+    );
+}
+
+#[test]
+fn at_path_missing_file_leaves_token_untouched_no_error() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Absolute path that does not exist — chat.lua MUST leave the
+    // token verbatim and emit a normal `chat.input.submit` envelope.
+    // The orchestrator + model can ask the user about it; chat.lua's
+    // job is just to not error.
+    let prompt = "look at @/this/does/not/exist/anywhere.lua please";
+    submit_text(&mut engine, prompt);
+
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "submit should produce exactly one emit");
+    let body = &emits[0].1;
+    assert_eq!(
+        body.get("kind").and_then(|v| v.as_str()),
+        Some("chat.input.submit")
+    );
+    let wire = body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .expect("text on the envelope");
+    assert!(
+        wire.contains("@/this/does/not/exist/anywhere.lua"),
+        "missing-file token should pass through unchanged: {wire:?}"
+    );
+    assert!(
+        !wire.contains("<file path"),
+        "no <file> wrapper should appear when the file is missing: {wire:?}"
+    );
+}
+
+#[test]
+fn at_path_truncates_files_over_inline_budget() {
+    // Budget in chat.lua is 16 KiB — write 32 KiB so the truncation
+    // marker fires regardless of any +1 boundary off-by-one.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("big.txt");
+    let payload = "x".repeat(32 * 1024);
+    std::fs::write(&path, &payload).expect("write big fixture");
+
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    let prompt = format!("summarize @{}", path.display());
+    submit_text(&mut engine, &prompt);
+
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "submit should produce exactly one emit");
+    let body = &emits[0].1;
+    let wire = body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .expect("text on the envelope");
+    assert!(
+        wire.contains("[truncated; use read_file tool for full contents]"),
+        "expected truncation marker in wire text: {wire:?}"
+    );
+    // Total size of the inlined content + wrapper should be far below
+    // the original 32 KiB — pin a soft upper bound so a regression
+    // that emits the full file slips the assertion. 24 KiB is well
+    // above the 16 KiB budget + wrapper text but well below 32 KiB.
+    assert!(
+        wire.len() < 24 * 1024,
+        "wire text should be truncated near 16 KiB budget; got {} bytes",
+        wire.len()
+    );
+}
+
+#[test]
+fn at_path_expands_multiple_references_in_one_message() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let a = dir.path().join("alpha.lua");
+    let b = dir.path().join("beta.md");
+    std::fs::write(&a, "ALPHA_CONTENTS\n").expect("write alpha");
+    std::fs::write(&b, "BETA_CONTENTS\n").expect("write beta");
+
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    let prompt = format!("compare @{} and @{}", a.display(), b.display());
+    submit_text(&mut engine, &prompt);
+
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "submit should produce exactly one emit");
+    let body = &emits[0].1;
+    let wire = body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .expect("text on the envelope");
+    assert!(
+        wire.contains("ALPHA_CONTENTS"),
+        "alpha file contents missing: {wire:?}"
+    );
+    assert!(
+        wire.contains("BETA_CONTENTS"),
+        "beta file contents missing: {wire:?}"
+    );
+    // Two `<file path="…">` wrappers — one per resolved reference.
+    let opens = wire.matches("<file path=\"").count();
+    assert_eq!(
+        opens, 2,
+        "expected exactly two <file> blocks for two refs: {wire:?}"
+    );
+}
+
+#[test]
+fn at_path_strips_trailing_punctuation_when_resolving() {
+    // User types `@<path>.` at end of sentence — the trailing period
+    // is prompt punctuation, not part of the filename. chat.lua peels
+    // common trailing punctuation off the captured token before
+    // resolution and re-attaches it verbatim after the inlined block.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ref.md");
+    std::fs::write(&path, "PUNCT_FIXTURE\n").expect("write ref");
+
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Period after the path; the model still gets the file inlined.
+    let prompt = format!("see @{}.", path.display());
+    submit_text(&mut engine, &prompt);
+
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1);
+    let wire = emits[0]
+        .1
+        .get("text")
+        .and_then(|v| v.as_str())
+        .expect("text");
+    assert!(
+        wire.contains("PUNCT_FIXTURE"),
+        "expected file contents inlined despite trailing period: {wire:?}"
+    );
+    assert!(
+        wire.contains(&format!("<file path=\"{}\">", path.display())),
+        "wrapper should carry the trimmed (no-trailing-period) path: {wire:?}"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────
+// plan-message contract — yellow-bordered render-only entry kind
+// emitted by the lead-workflow actor's `write-review` tool. The plan
+// body is shown to the user and reviewed via /approve | /reject; it
+// does NOT enter model context (the model already saw it via the
+// tool call's args).
+// ───────────────────────────────────────────────────────────────────
+
+/// SGR fragment for the plan border colour `#FFD75F`. The 24-bit
+/// colour gets written as `38;2;255;215;95` per ansi.rs's `write_fg`.
+/// Asserting the literal SGR substring is the cheapest way to confirm
+/// the renderer painted the yellow chrome — the plan border is the
+/// only thing in chat.lua that uses this RGB triple, so a hit on this
+/// substring uniquely identifies the plan box.
+const PLAN_YELLOW_SGR: &str = "38;2;255;215;95";
+
+#[test]
+fn chat_plan_append_renders_yellow_bordered_plan_entry() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.plan.append",
+            "plan_id": "p1",
+            "text": "Step one\nStep two",
+            "submitted_at": "2026-05-08T14:30:00Z",
+        }),
+    );
+
+    let out = render_str(&mut engine);
+
+    // Body lines from the markdown plan land in the transcript.
+    assert!(
+        out.contains("Step one"),
+        "plan body line 1 missing: {out:?}"
+    );
+    assert!(
+        out.contains("Step two"),
+        "plan body line 2 missing: {out:?}"
+    );
+
+    // The bordered_box helper paints all four rounded corners, same as
+    // the user block — confirms render_plan_entry routed through
+    // bordered_box rather than dropping to the plain-text fallback.
+    for corner in ['╭', '╮', '╰', '╯'] {
+        assert!(
+            out.contains(corner),
+            "plan block missing corner {corner:?}: {out:?}"
+        );
+    }
+
+    // Yellow border colour (#FFD75F → SGR 38;2;255;215;95). This is the
+    // load-bearing assertion: a non-yellow border (e.g. blue user_chrome)
+    // would emit `38;2;127;180;255` instead, and this substring would
+    // NOT appear.
+    assert!(
+        out.contains(PLAN_YELLOW_SGR),
+        "yellow plan border SGR `{PLAN_YELLOW_SGR}` missing in: {out:?}",
+    );
+
+    // Subtitle carries the timestamp the actor stamped.
+    assert!(
+        out.contains("submitted at 14:30"),
+        "plan subtitle missing timestamp: {out:?}"
+    );
+
+    // Pending plans show the action hint so the user knows the
+    // /approve | /reject convention without leaving the chat surface.
+    assert!(
+        out.contains("/approve"),
+        "pending plan should show /approve hint: {out:?}"
+    );
+    assert!(
+        out.contains("/reject"),
+        "pending plan should show /reject hint: {out:?}"
+    );
+}
+
+#[test]
+fn lead_workflow_plan_approved_updates_status() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.plan.append",
+            "plan_id": "abc-123",
+            "text": "Refactor the bus reducer",
+            "submitted_at": "2026-05-08T09:15:00Z",
+        }),
+    );
+    let pre = render_str(&mut engine);
+    assert!(
+        pre.contains("/approve"),
+        "pre-approval should show pending hint: {pre:?}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "lead-workflow.plan.approved",
+            "plan_id": "abc-123",
+            "approved": true,
+        }),
+    );
+    let out = render_str(&mut engine);
+
+    // After approval the hint disappears and a check-mark status row
+    // takes its place.
+    assert!(
+        !out.contains("/approve"),
+        "approved plan should NOT carry the pending hint: {out:?}"
+    );
+    assert!(
+        out.contains("✓ approved"),
+        "approved plan should show the check-mark status: {out:?}"
+    );
+    // Plan body still in the transcript — approval doesn't hide it.
+    assert!(
+        out.contains("Refactor the bus reducer"),
+        "approved plan body missing: {out:?}"
+    );
+}
+
+#[test]
+fn lead_workflow_plan_rejected_marks_entry() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.plan.append",
+            "plan_id": "rej-1",
+            "text": "Drop the index",
+            "submitted_at": "2026-05-08T10:00:00Z",
+        }),
+    );
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "lead-workflow.plan.approved",
+            "plan_id": "rej-1",
+            "approved": false,
+        }),
+    );
+    let out = render_str(&mut engine);
+
+    assert!(
+        out.contains("✗ rejected"),
+        "rejected plan should show the cross status: {out:?}"
+    );
+    assert!(
+        !out.contains("/approve"),
+        "rejected plan should NOT carry the pending hint: {out:?}"
+    );
+}
+
+#[test]
+fn multiple_plans_track_status_independently() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.plan.append",
+            "plan_id": "first",
+            "text": "FIRST_PLAN_BODY",
+            "submitted_at": "2026-05-08T08:00:00Z",
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.plan.append",
+            "plan_id": "second",
+            "text": "SECOND_PLAN_BODY",
+            "submitted_at": "2026-05-08T08:05:00Z",
+        }),
+    );
+    let _ = render_str(&mut engine);
+
+    // Approve only the FIRST one — second must stay pending.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "lead-workflow.plan.approved",
+            "plan_id": "first",
+            "approved": true,
+        }),
+    );
+    let out = render_str(&mut engine);
+
+    assert!(
+        out.contains("FIRST_PLAN_BODY"),
+        "first plan body missing: {out:?}"
+    );
+    assert!(
+        out.contains("SECOND_PLAN_BODY"),
+        "second plan body missing: {out:?}"
+    );
+    // Exactly one approved row — the FIRST plan's status changed; the
+    // second is still pending and shouldn't carry the check-mark.
+    let approved_count = out.matches("✓ approved").count();
+    assert_eq!(
+        approved_count, 1,
+        "expected exactly one approved row after approving plan_id=first; out: {out:?}"
+    );
+    // The second plan's pending hint must still be visible — its
+    // status didn't change. (Note: the first plan's hint also went
+    // away; both contribute to the count, so we just assert the hint
+    // string is present at least once.)
+    assert!(
+        out.contains("/approve"),
+        "second (still-pending) plan should still show the action hint: {out:?}"
+    );
+}
+
+#[test]
+fn approval_for_unknown_plan_id_is_dropped() {
+    // Defence: an approval envelope for a plan_id we never appended is
+    // a no-op — chat.lua's reducer leaves state untouched rather than
+    // creating a synthetic entry. Pre-fix a sloppy reducer that pushed
+    // an entry on approval would surface a phantom row here.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "lead-workflow.plan.approved",
+            "plan_id": "ghost",
+            "approved": true,
+        }),
+    );
+    let out = render_str(&mut engine);
+
+    // No plan body → no approval check should appear.
+    assert!(
+        !out.contains("✓ approved"),
+        "approval for unknown plan_id should NOT paint a status row: {out:?}"
+    );
+}
+
+#[test]
+fn chat_plan_append_does_not_emit_chat_message_append_or_input_submit() {
+    // Render-only contract: the plan envelope drops into the chat
+    // surface as a yellow-bordered entry but MUST NOT cause chat.lua
+    // to re-emit a `chat.message.append` (which would feed the
+    // assistant/orchestrator history) or a `chat.input.submit` (which
+    // would re-trigger model inference). The model already saw the
+    // plan via the write-review tool's args; chat.lua's job is purely
+    // visual review-and-approve.
+    //
+    // This is the "plan content is NOT included in model context"
+    // assertion: model context is built from `chat.message.append`
+    // envelopes the orchestrator/agentic-loop replays into providers.
+    // If chat.lua doesn't echo the plan back as a message, the
+    // provider's history never sees it — preventing the duplication
+    // the user flagged on the spec.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.plan.append",
+            "plan_id": "p1",
+            "text": "PLAN_TEXT_THAT_MUST_NOT_LEAK",
+            "submitted_at": "2026-05-08T12:00:00Z",
+        }),
+    );
+
+    let emits = engine.take_emit_queue();
+    for (_target, body) in &emits {
+        let kind = body
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert_ne!(
+            kind, "chat.message.append",
+            "chat.plan.append must NOT echo as chat.message.append (would land in model context): {body:?}"
+        );
+        assert_ne!(
+            kind, "chat.input.submit",
+            "chat.plan.append must NOT trigger a chat.input.submit: {body:?}"
+        );
+        // The plan body is the load-bearing thing to NOT leak. Even if
+        // some other envelope did get emitted, the plan text itself
+        // must not be a payload field of it.
+        let serialized = serde_json::to_string(body).unwrap_or_default();
+        assert!(
+            !serialized.contains("PLAN_TEXT_THAT_MUST_NOT_LEAK"),
+            "plan body leaked into emitted envelope {kind:?}: {body:?}"
+        );
+    }
+
+    // And the plan body still rendered visibly — proving the entry
+    // landed locally without going through any wire echo.
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("PLAN_TEXT_THAT_MUST_NOT_LEAK"),
+        "plan body missing from local render: {out:?}"
+    );
+}
+
+#[test]
+fn user_submit_after_plan_does_not_carry_plan_body_in_wire_text() {
+    // Tighter version of the previous test: even after the plan lands
+    // and the user types their next prompt, the `chat.input.submit`
+    // wire envelope must carry ONLY the user's typed text — the plan
+    // body must never be appended (e.g. as context glue) into that
+    // text field. Pre-fix a naive reducer that built `text` by
+    // concatenating recent entries would leak the plan here.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.plan.append",
+            "plan_id": "p1",
+            "text": "PLAN_BODY_PRIVATE_TO_RENDER",
+            "submitted_at": "2026-05-08T12:00:00Z",
+        }),
+    );
+    let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+
+    submit_text(&mut engine, "/approve");
+
+    let emits = engine.take_emit_queue();
+    for (_target, body) in &emits {
+        let serialized = serde_json::to_string(body).unwrap_or_default();
+        assert!(
+            !serialized.contains("PLAN_BODY_PRIVATE_TO_RENDER"),
+            "plan body leaked into post-plan emit {body:?}"
+        );
+    }
+}
+
+#[test]
+fn chat_plan_append_is_idempotent_on_plan_id() {
+    // The lead-workflow actor's plan.submitted reducer fires
+    // chat.plan.append on every handling — once on live (via bus
+    // feedback) and again on /resume (sessions replays both the
+    // persisted chat.plan.append and re-fires the reducer for the
+    // replayed plan.submitted). chat.lua's reducer must dedupe by
+    // plan_id so the same plan doesn't paint two yellow boxes after
+    // every resume.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    let envelope = json!({
+        "kind": "chat.plan.append",
+        "plan_id": "dup-plan",
+        "text": "DUP_PLAN_BODY",
+        "submitted_at": "2026-05-08T12:00:00Z",
+    });
+    dispatch_event(&mut engine, envelope.clone());
+    dispatch_event(&mut engine, envelope);
+    let out = render_str(&mut engine);
+
+    let body_count = out.matches("DUP_PLAN_BODY").count();
+    assert_eq!(
+        body_count, 1,
+        "duplicate chat.plan.append for same plan_id must render only one yellow box; out: {out:?}"
+    );
+}
+
+#[test]
+fn chat_plan_append_dedup_preserves_approved_status() {
+    // After a plan is approved, a duplicate chat.plan.append for the
+    // same plan_id (e.g. from /resume's replay path) must NOT regress
+    // the entry's status back to "pending". The dedup branch returns
+    // the existing entry untouched.
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.plan.append",
+            "plan_id": "dup-approve",
+            "text": "PLAN_TO_APPROVE",
+            "submitted_at": "2026-05-08T12:00:00Z",
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "lead-workflow.plan.approved",
+            "plan_id": "dup-approve",
+            "approved": true,
+        }),
+    );
+    // Duplicate append for the already-approved plan_id.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.plan.append",
+            "plan_id": "dup-approve",
+            "text": "PLAN_TO_APPROVE",
+            "submitted_at": "2026-05-08T12:00:00Z",
+        }),
+    );
+
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("✓ approved"),
+        "approved status must survive a duplicate chat.plan.append: {out:?}"
+    );
+    let body_count = out.matches("PLAN_TO_APPROVE").count();
+    assert_eq!(
+        body_count, 1,
+        "duplicate append must not paint a second entry: {out:?}"
     );
 }

@@ -37,9 +37,9 @@
 
 local json = nefor.json
 
-local envelope      = require("lib.envelope")
-local ids           = require("lib.ids")
-local replay_window = require("lib.replay_window")
+local envelope      = require("core.envelope")
+local ids           = require("core.ids")
+local replay_window = require("core.history_replay")
 
 local emit_as        = envelope.emit_as
 local emit_to        = envelope.emit_to
@@ -47,10 +47,6 @@ local next_id        = envelope.next_id
 
 -- Forward-declare; populated after agentic_loop module is required.
 local agentic_loop
-
--- ------------------------------------------------------------------
--- tool.result helpers
--- ------------------------------------------------------------------
 
 local function send_tool_result_ok(reasoner_type, firing_id, output, next_state)
   local result = {}
@@ -75,14 +71,12 @@ local function send_tool_result_err(reasoner_type, firing_id, err)
   })
 end
 
--- ------------------------------------------------------------------
--- handler: dummy / provider-wrapper / responder
--- ------------------------------------------------------------------
+-- Handler for dummy / provider-wrapper / responder.
 --
 -- Owns invariants:
---   * D-26 (sub-graph stream gating) — chat_id_stream_visible flag set
+--   * Sub-graph stream gating — chat_id_stream_visible flag set
 --     via agentic_loop.track_provider_firing.
---   * D-29 (responder tools=false)   — tools off for sub-graph responders.
+--   * Responder tools=false — tools off for sub-graph responders.
 --
 -- Three-step chat_id precedence:
 --   1. prev_state.chat_id (cyclic re-fire within one run).
@@ -134,7 +128,7 @@ local function provider_run_node(reasoner_type, body)
     if type(model) == "string" and #model > 0 then
       create_body.model = model
     end
-    -- D-29: sub-graph responder nodes must produce text, not tool calls.
+    -- Sub-graph responder nodes must produce text, not tool calls.
     if reasoner_type == "responder" then
       create_body.tools = false
     end
@@ -198,10 +192,7 @@ local function provider_run_node(reasoner_type, body)
   return nil
 end
 
--- ------------------------------------------------------------------
--- handler: tool-executor
--- ------------------------------------------------------------------
-
+-- Handler for tool-executor.
 local function tool_executor_run_node(body)
   local run_id = body.run_id
   local node_id = body.node_id
@@ -257,10 +248,7 @@ local function tool_executor_run_node(body)
   return nil
 end
 
--- ------------------------------------------------------------------
--- handler: adapter (pure Lua; ToolResults → ProviderIn)
--- ------------------------------------------------------------------
-
+-- Handler for adapter (pure Lua; ToolResults → ProviderIn).
 local function adapter_run_node(body)
   local firing_id = body.firing_id
   local inputs = body.inputs or {}
@@ -300,10 +288,7 @@ local function adapter_run_node(body)
   return "_already_replied"
 end
 
--- ------------------------------------------------------------------
--- handler: terminal (D-30 sorted-id concat)
--- ------------------------------------------------------------------
-
+-- Handler for terminal — concat upstream outputs in sorted-id order.
 local function terminal_run_node(body)
   local firing_id = body.firing_id
   local inputs = body.inputs or {}
@@ -335,9 +320,21 @@ local function terminal_run_node(body)
   return "_already_replied"
 end
 
--- ------------------------------------------------------------------
--- handlers registry
--- ------------------------------------------------------------------
+-- Handlers registry.
+-- agent reasoner (lead workflow keystone) — self-contained module.
+-- Lazy-required on first dispatch to avoid circular import at module load.
+local agent_reasoner
+
+local function agent_handle(body)
+  if agent_reasoner == nil then
+    agent_reasoner = require("reasoners.agent")
+  end
+  return agent_reasoner.handle(body)
+end
+
+local run_reasoner          = require("reasoners.run")
+local run_wrappers_reasoner = require("reasoners.run-wrappers")
+local loop_counter_reasoner = require("reasoners.loop_counter")
 
 local handlers = {
   ["dummy"]            = function(body) return provider_run_node("dummy", body) end,
@@ -373,10 +370,7 @@ local function seed_once()
   seed_peer_set()
 end
 
--- ------------------------------------------------------------------
--- receive_msg — react to tool.invoke { name in handlers }
--- ------------------------------------------------------------------
-
+-- receive_msg — react to tool.invoke { name in handlers }.
 -- Extract the dispatch body from a tool.invoke envelope. The Rust
 -- scheduler packs `{ run_id, node_id, args, inputs, prev_state }` into
 -- `body.args`; firing_id is `body.id`. Flatten back into the shape the

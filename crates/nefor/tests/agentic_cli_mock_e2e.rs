@@ -528,7 +528,7 @@ fn scenario_6_yolo_flag_accepted() {
 //
 // The slow path is gated on the literal substring
 // "SLOW_STREAM_REGRESSION_" in the user prompt — see
-// `starter/mock_provider.lua`.
+// `starter/mock-provider/init.lua`.
 
 #[test]
 fn long_stream_completes_without_timeout() {

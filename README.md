@@ -16,7 +16,7 @@ Then scaffold a config in your XDG config dir:
 
 ```sh
 mkdir -p ~/.config/nefor
-cp $(brew --prefix)/share/nefor/starter/*.lua ~/.config/nefor/
+cp -r $(brew --prefix)/share/nefor/starter/* ~/.config/nefor/
 ```
 
 The starter config talks to `localhost:11434` (Ollama default). Edit `~/.config/nefor/init.lua` to change provider / model.
@@ -31,7 +31,7 @@ Launches the chat TUI. `Ctrl+C` or `/quit` exits; `/new` clears the transcript.
 
 ## Architecture
 
-The engine is a pure string-layer event bus: it reads plugin stdin, stamps `{origin, ts}`, persists to a session log, and invokes a required Lua `dispatch` hook. NCP v0.1 (handshake, broadcast, replay, errors) lives entirely in Lua under `starter/ncp.lua`. Plugins are independent OS processes communicating via JSON lines.
+The engine is a pure string-layer event bus: it reads plugin stdin, stamps `{origin, ts}`, persists to a session log, and invokes a required Lua `dispatch` hook. NCP v0.1 (handshake, broadcast, replay, errors) lives entirely in Lua under `lua/core/`. Plugins are independent OS processes communicating via JSON lines.
 
 ### Layout
 
@@ -45,7 +45,8 @@ The engine is a pure string-layer event bus: it reads plugin stdin, stamps `{ori
 - `plugins/generic-provider/`, `plugins/generic-tool/` — passive type-registry hubs.
 - `plugins/nefor-combinators/` — typed combinator registry plugin.
 - `plugins/mock-plugin/` — scriptable NCP actor for integration tests.
-- `starter/init.lua`, `starter/chat.lua`, `starter/ncp.lua` — default composition, chat surface, NCP-in-Lua.
+- `starter/` — default composition (`starter/init.lua`), chat surface (`starter/chat/`), per-actor folders.
+- `lua/core/` — shared protocol primitives (NCP v0.1, actor runtime, history replay).
 
 ### Paths
 

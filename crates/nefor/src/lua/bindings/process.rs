@@ -38,6 +38,12 @@ use tokio::process::{ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 
+/// Errors-as-data sentinel for `nefor.process.run` spawn failures. The
+/// caller branches on `code` (any non-zero value) rather than handling
+/// a Lua-level error — keeps "process couldn't be created" symmetric
+/// with "process ran and exited non-zero".
+const SPAWN_FAILURE_CODE: i32 = -1;
+
 /// Install `nefor.process.spawn` onto `nefor_tbl`.
 pub fn install_process(lua: &Lua, nefor_tbl: &Table) -> mlua::Result<()> {
     let process = lua.create_table()?;
@@ -245,8 +251,83 @@ pub fn install_process(lua: &Lua, nefor_tbl: &Table) -> mlua::Result<()> {
     })?;
     process.set("spawn", spawn_fn)?;
 
+    let run_fn = lua.create_function(|_, opts: Table| run_impl(opts))?;
+    process.set("run", run_fn)?;
+
     nefor_tbl.set("process", process)?;
     Ok(())
+}
+
+/// Synchronous subprocess invocation. Blocks the calling thread until
+/// the child exits and returns a Lua table `{ code, stdout, stderr }`.
+/// Spawn failures are folded into the same shape with `code = -1` and a
+/// descriptive `stderr` — the caller branches on `code` rather than
+/// catching a Lua error.
+///
+/// Uses `std::process::Command` (sync) deliberately: callers reach for
+/// `process.run` from a plain sync Lua context (e.g. `pm.install` at
+/// `init.lua` load time) where yielding into an async runtime is wrong.
+fn run_impl(opts: Table) -> mlua::Result<RunOutcome> {
+    let cmd_name: String = opts.get("cmd").map_err(|e| {
+        mlua::Error::runtime(format!(
+            "nefor.process.run: missing or invalid 'cmd' field: {e}"
+        ))
+    })?;
+    if cmd_name.is_empty() {
+        return Err(mlua::Error::runtime(
+            "nefor.process.run: 'cmd' must be a non-empty string",
+        ));
+    }
+    let args: Vec<String> = opts
+        .get::<Option<Vec<String>>>("args")
+        .unwrap_or(None)
+        .unwrap_or_default();
+    let cwd: Option<String> = opts.get::<Option<String>>("cwd").unwrap_or(None);
+    let env_tbl: Option<Table> = opts.get::<Option<Table>>("env").unwrap_or(None);
+
+    let mut cmd = std::process::Command::new(&cmd_name);
+    cmd.args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    if let Some(env) = env_tbl {
+        for pair in env.pairs::<String, String>() {
+            let (k, v) = pair?;
+            cmd.env(k, v);
+        }
+    }
+
+    match cmd.output() {
+        Ok(out) => Ok(RunOutcome {
+            code: out.status.code().unwrap_or(SPAWN_FAILURE_CODE),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }),
+        Err(e) => Ok(RunOutcome {
+            code: SPAWN_FAILURE_CODE,
+            stdout: String::new(),
+            stderr: format!("spawn failed: {e}"),
+        }),
+    }
+}
+
+struct RunOutcome {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+impl mlua::IntoLua for RunOutcome {
+    fn into_lua(self, lua: &Lua) -> mlua::Result<mlua::Value> {
+        let t = lua.create_table()?;
+        t.set("code", self.code)?;
+        t.set("stdout", self.stdout)?;
+        t.set("stderr", self.stderr)?;
+        Ok(mlua::Value::Table(t))
+    }
 }
 
 enum DispatchMsg {
@@ -438,5 +519,52 @@ mod tests {
             .await
             .expect_err("missing binary must error");
         assert!(err.to_string().contains("failed to spawn"));
+    }
+
+    #[test]
+    fn run_captures_stdout_and_zero_exit() {
+        let lua = setup();
+        let (code, stdout): (i32, String) = lua
+            .load(
+                r#"
+                local r = nefor.process.run({ cmd = "sh", args = { "-c", "echo hi" } })
+                return r.code, r.stdout
+                "#,
+            )
+            .eval()
+            .expect("run ok");
+        assert_eq!(code, 0);
+        assert!(stdout.contains("hi"));
+    }
+
+    #[test]
+    fn run_propagates_non_zero_exit_as_data() {
+        let lua = setup();
+        let code: i32 = lua
+            .load(
+                r#"
+                local r = nefor.process.run({ cmd = "sh", args = { "-c", "exit 7" } })
+                return r.code
+                "#,
+            )
+            .eval()
+            .expect("run ok");
+        assert_eq!(code, 7);
+    }
+
+    #[test]
+    fn run_spawn_failure_returns_data_not_error() {
+        let lua = setup();
+        let (code, stderr): (i32, String) = lua
+            .load(
+                r#"
+                local r = nefor.process.run({ cmd = "definitely-not-a-real-binary-xxxyyyzzz" })
+                return r.code, r.stderr
+                "#,
+            )
+            .eval()
+            .expect("run ok — spawn failure must be data, not a Lua error");
+        assert_eq!(code, -1);
+        assert!(stderr.contains("spawn failed"), "got: {stderr}");
     }
 }

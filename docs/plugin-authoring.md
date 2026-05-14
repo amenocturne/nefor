@@ -227,7 +227,7 @@ The engine inherits its environment to the child and nothing more. To inject env
 
 nefor.plugins.spawn {
   name    = "mock-plugin",
-  command = { "/home/user/bin/launcher.sh", "claude", "-p", "--output-format", "stream-json" },
+  command = { "./launcher.sh", "claude", "-p", "--output-format", "stream-json" },
 }
 ```
 

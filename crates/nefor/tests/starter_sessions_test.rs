@@ -1,7 +1,7 @@
 //! Unit tests for `starter/sessions.lua`'s persistence + control-event
 //! filtering, driven from Rust. Mirrors the `starter_ncp_test.rs`
 //! harness pattern: install a stub `nefor.*` surface, point
-//! NEFOR_DATA_HOME at a tempdir, then exercise the module directly.
+//! NEFOR_DATA_DIR at a tempdir, then exercise the module directly.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -9,12 +9,20 @@ use std::sync::Mutex;
 use mlua::{Function, Lua, Table, Value};
 
 fn starter_dir() -> PathBuf {
+    repo_root().join("starter")
+}
+
+fn lua_dir() -> PathBuf {
+    repo_root().join("lua")
+}
+
+fn repo_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest
         .parent()
         .and_then(|p| p.parent())
         .expect("repo root is two levels above crates/nefor")
-        .join("starter")
+        .to_path_buf()
 }
 
 #[test]
@@ -27,9 +35,9 @@ fn jsonl_excludes_session_control_events() {
     // the normal one (plus the header).
     let tempdir = tempfile::tempdir().expect("tempdir");
     // Point sessions.lua's data root at our tempdir.
-    let prev = std::env::var("NEFOR_DATA_HOME").ok();
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
 
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
@@ -122,8 +130,8 @@ fn jsonl_excludes_session_control_events() {
 
     // Restore env.
     match prev.as_deref() {
-        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
-        None => std::env::remove_var("NEFOR_DATA_HOME"),
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
     }
 }
 
@@ -137,8 +145,8 @@ fn inbound_outbound_cycle_lands_in_jsonl() {
     // picker keeps working unchanged.
     let tempdir = tempfile::tempdir().expect("tempdir");
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = std::env::var("NEFOR_DATA_HOME").ok();
-    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
 
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
@@ -222,8 +230,8 @@ fn inbound_outbound_cycle_lands_in_jsonl() {
     );
 
     match prev.as_deref() {
-        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
-        None => std::env::remove_var("NEFOR_DATA_HOME"),
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
     }
 }
 
@@ -248,8 +256,8 @@ fn resume_emits_lifecycle_markers_in_order() {
     // kind into a trace; the order assertion below is the contract.
     let tempdir = tempfile::tempdir().expect("tempdir");
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = std::env::var("NEFOR_DATA_HOME").ok();
-    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
 
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
@@ -311,8 +319,8 @@ fn resume_emits_lifecycle_markers_in_order() {
     );
 
     match prev.as_deref() {
-        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
-        None => std::env::remove_var("NEFOR_DATA_HOME"),
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
     }
 }
 
@@ -327,8 +335,8 @@ fn shutdown_prunes_truly_empty_session_preserves_session_with_any_envelope() {
     //   (b) at least one envelope persisted → preserved.
     let tempdir = tempfile::tempdir().expect("tempdir");
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = std::env::var("NEFOR_DATA_HOME").ok();
-    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
 
     // (a) empty session.
     {
@@ -395,8 +403,8 @@ fn shutdown_prunes_truly_empty_session_preserves_session_with_any_envelope() {
     }
 
     match prev.as_deref() {
-        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
-        None => std::env::remove_var("NEFOR_DATA_HOME"),
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
     }
 }
 
@@ -414,8 +422,8 @@ fn new_mints_fresh_session_and_prunes_empty_outgoing() {
     // outgoing file is gone.
     let tempdir = tempfile::tempdir().expect("tempdir");
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = std::env::var("NEFOR_DATA_HOME").ok();
-    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
 
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
@@ -469,8 +477,8 @@ fn new_mints_fresh_session_and_prunes_empty_outgoing() {
     );
 
     match prev.as_deref() {
-        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
-        None => std::env::remove_var("NEFOR_DATA_HOME"),
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
     }
 }
 
@@ -484,8 +492,8 @@ fn resume_to_existing_session_appends_in_order() {
     // submits in the original order.
     let tempdir = tempfile::tempdir().expect("tempdir");
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = std::env::var("NEFOR_DATA_HOME").ok();
-    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
 
     let target_id = "44444444-2222-4333-8444-555555555555";
     let sessions_dir = tempdir.path().join("sessions");
@@ -554,8 +562,8 @@ fn resume_to_existing_session_appends_in_order() {
     );
 
     match prev.as_deref() {
-        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
-        None => std::env::remove_var("NEFOR_DATA_HOME"),
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
     }
 }
 
@@ -567,8 +575,8 @@ fn resume_to_self_is_noop() {
     // for nothing.
     let tempdir = tempfile::tempdir().expect("tempdir");
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = std::env::var("NEFOR_DATA_HOME").ok();
-    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
 
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
@@ -609,8 +617,8 @@ fn resume_to_self_is_noop() {
     );
 
     match prev.as_deref() {
-        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
-        None => std::env::remove_var("NEFOR_DATA_HOME"),
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
     }
 }
 
@@ -623,8 +631,8 @@ fn resume_to_nonexistent_session_succeeds_with_zero_replayed() {
     // the engine.
     let tempdir = tempfile::tempdir().expect("tempdir");
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = std::env::var("NEFOR_DATA_HOME").ok();
-    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
 
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
@@ -678,72 +686,17 @@ fn resume_to_nonexistent_session_succeeds_with_zero_replayed() {
     );
 
     match prev.as_deref() {
-        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
-        None => std::env::remove_var("NEFOR_DATA_HOME"),
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
     }
 }
 
-#[test]
-fn data_root_resolves_xdg_then_home_fallback() {
-    // Picker reads from sessions.lua's data root; the resolver MUST
-    // walk: NEFOR_DATA_HOME → XDG_DATA_HOME/nefor → HOME/.local/share/nefor.
-    // chat.lua's picker resolver mirrors this — they have to agree or
-    // the picker shows nothing while writes go elsewhere (the bug from
-    // the rework session).
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev_data = std::env::var("NEFOR_DATA_HOME").ok();
-    let prev_xdg = std::env::var("XDG_DATA_HOME").ok();
-    let prev_home = std::env::var("HOME").ok();
-
-    let lua = Lua::new();
-    install_stub_nefor(&lua).expect("install nefor stub");
-    set_package_path(&lua).expect("set package.path");
-    lua.load(r#"sessions = require("sessions"); sessions_test = require("sessions.test")"#)
-        .exec()
-        .expect("require");
-
-    // Case 1: NEFOR_DATA_HOME wins.
-    std::env::remove_var("XDG_DATA_HOME");
-    std::env::set_var("HOME", "/tmp/test-home");
-    std::env::set_var("NEFOR_DATA_HOME", "/tmp/forced/root");
-    let r1: String = lua
-        .load(r#"return sessions_test._data_root()"#)
-        .eval()
-        .expect("r1");
-    assert_eq!(r1, "/tmp/forced/root");
-
-    // Case 2: NEFOR_DATA_HOME unset, XDG_DATA_HOME wins (with /nefor suffix).
-    std::env::remove_var("NEFOR_DATA_HOME");
-    std::env::set_var("XDG_DATA_HOME", "/tmp/xdg/root");
-    let r2: String = lua
-        .load(r#"return sessions_test._data_root()"#)
-        .eval()
-        .expect("r2");
-    assert_eq!(r2, "/tmp/xdg/root/nefor");
-
-    // Case 3: both unset, HOME fallback.
-    std::env::remove_var("XDG_DATA_HOME");
-    std::env::set_var("HOME", "/tmp/test-home");
-    let r3: String = lua
-        .load(r#"return sessions_test._data_root()"#)
-        .eval()
-        .expect("r3");
-    assert_eq!(r3, "/tmp/test-home/.local/share/nefor");
-
-    // Restore env.
-    match prev_data.as_deref() {
-        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
-        None => std::env::remove_var("NEFOR_DATA_HOME"),
-    }
-    match prev_xdg.as_deref() {
-        Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-        None => std::env::remove_var("XDG_DATA_HOME"),
-    }
-    match prev_home.as_deref() {
-        Some(v) => std::env::set_var("HOME", v),
-        None => std::env::remove_var("HOME"),
-    }
-}
+// `data_root_resolves_xdg_then_home_fallback` was deleted alongside the
+// per-call Lua-side env-var resolver. sessions.lua now delegates to
+// `nefor.fs.data_root()`, which snapshots the engine's resolved DataDir
+// at install time — Rust-side `config::tests::data_*` already pins the
+// CLI flag > NEFOR_DATA_DIR > XDG_DATA_HOME precedence the deleted test
+// duplicated through the Lua layer.
 
 #[test]
 fn new_then_new_prunes_each_empty_predecessor() {
@@ -751,8 +704,8 @@ fn new_then_new_prunes_each_empty_predecessor() {
     // stubs. Each cycle prunes the prior file; the picker stays clean.
     let tempdir = tempfile::tempdir().expect("tempdir");
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = std::env::var("NEFOR_DATA_HOME").ok();
-    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
 
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
@@ -789,8 +742,8 @@ fn new_then_new_prunes_each_empty_predecessor() {
     );
 
     match prev.as_deref() {
-        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
-        None => std::env::remove_var("NEFOR_DATA_HOME"),
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
     }
 }
 
@@ -801,8 +754,8 @@ fn new_after_submit_preserves_prior_session() {
     // would vanish the moment they typed `/new`.
     let tempdir = tempfile::tempdir().expect("tempdir");
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = std::env::var("NEFOR_DATA_HOME").ok();
-    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
 
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
@@ -842,8 +795,8 @@ fn new_after_submit_preserves_prior_session() {
     assert_ne!(boot_path, new_path, "/new must mint a different id");
 
     match prev.as_deref() {
-        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
-        None => std::env::remove_var("NEFOR_DATA_HOME"),
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
     }
 }
 
@@ -857,8 +810,8 @@ fn replay_window_frames_resume_and_skips_persistence_inside() {
     // markers themselves are NOT persisted (sessions.* filter).
     let tempdir = tempfile::tempdir().expect("tempdir");
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = std::env::var("NEFOR_DATA_HOME").ok();
-    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
 
     // Pre-seed a target session jsonl with one step-origin entry so
     // replay_jsonl has something to do. The header line carries the
@@ -997,17 +950,26 @@ fn replay_window_frames_resume_and_skips_persistence_inside() {
     );
 
     match prev.as_deref() {
-        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
-        None => std::env::remove_var("NEFOR_DATA_HOME"),
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
     }
 }
 
-// Process-global lock to serialise tests that mutate NEFOR_DATA_HOME.
+// Process-global lock to serialise tests that mutate NEFOR_DATA_DIR.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
     let nefor = lua.create_table()?;
     nefor::lua::bindings::install_json(lua, &nefor)?;
+
+    // nefor.fs — real binding, with data_dir captured from the env var
+    // set by the test. Tests mutate NEFOR_DATA_DIR before calling
+    // install_stub_nefor; the binding snapshots that value at install
+    // time, matching production semantics.
+    let data_dir = std::env::var("NEFOR_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/var/empty/nefor-test-data"));
+    nefor::lua::bindings::install_fs(lua, &nefor, nefor::paths::DataDir(data_dir))?;
 
     // log.* — no-op
     let log_tbl = lua.create_table()?;
@@ -1051,15 +1013,33 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
 fn set_package_path(lua: &Lua) -> mlua::Result<()> {
     let starter = starter_dir();
     let starter_str = starter.display().to_string();
+    let lua_root = lua_dir();
+    let lua_root_str = lua_root.display().to_string();
+    let rg_plugin_lua = repo_root().join("plugins").join("reasoner-graph").join("lua");
+    let rg_plugin_lua_str = rg_plugin_lua.display().to_string();
+    // `tests/lua/?.lua` so `require("sessions.test")` resolves to the
+    // test-only escape hatch at `tests/lua/sessions/test.lua` — the file
+    // is not shipped under starter/ to keep the installed config pure.
+    let tests_lua = repo_root().join("tests").join("lua");
+    let tests_lua_str = tests_lua.display().to_string();
     let script = format!(
         r#"
         package.path = table.concat({{
           "{starter}/?.lua",
           "{starter}/?/init.lua",
+          "{rg_plugin_lua}/?.lua",
+          "{rg_plugin_lua}/?/init.lua",
+          "{lua_root}/?.lua",
+          "{lua_root}/?/init.lua",
+          "{tests_lua}/?.lua",
+          "{tests_lua}/?/init.lua",
           package.path,
         }}, ";")
         "#,
-        starter = starter_str
+        starter = starter_str,
+        lua_root = lua_root_str,
+        rg_plugin_lua = rg_plugin_lua_str,
+        tests_lua = tests_lua_str,
     );
     lua.load(&script).exec()
 }

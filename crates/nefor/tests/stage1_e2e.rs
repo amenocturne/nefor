@@ -90,6 +90,10 @@ fn starter_dir() -> PathBuf {
     workspace_root().join("starter")
 }
 
+fn lua_dir() -> PathBuf {
+    workspace_root().join("lua")
+}
+
 /// Build all plugin binaries we depend on. No-op on a warm cache.
 fn ensure_binaries_built() {
     let status = Command::new("cargo")
@@ -162,7 +166,7 @@ fn make_driver_transport() -> (Driver, Transport) {
 }
 
 /// Write a test init.lua under `dir`. Wires:
-///   * `package.path` so `require("ncp")` etc. resolve to `starter/`.
+///   * `package.path` so `require("core.ncp")` etc. resolve to `starter/`.
 ///   * `dispatch` hook → `ncp.dispatch`.
 ///   * Transforms registered for "nefor-tui", "ollama", "reasoner-graph",
 ///     "tool-gate" via `ncp._test_set_transforms` — the test attaches the
@@ -171,17 +175,26 @@ fn make_driver_transport() -> (Driver, Transport) {
 fn write_test_init_lua(dir: &Path) {
     let starter = starter_dir();
     let starter_str = format!("{:?}", starter.display().to_string());
+    let lua_root = lua_dir();
+    let lua_root_str = format!("{:?}", lua_root.display().to_string());
+    let rg_plugin_lua = workspace_root().join("plugins").join("reasoner-graph").join("lua");
+    let rg_plugin_lua_str = format!("{:?}", rg_plugin_lua.display().to_string());
     // Use a templated string with a placeholder that's unlikely to collide
-    // with Lua syntax — we substitute @@STARTER@@ rather than wrestle with
-    // format!'s `{` escaping rules across a long Lua program.
+    // with Lua syntax — we substitute @@STARTER@@ / @@LUA_ROOT@@ / @@RG@@
+    // rather than wrestle with format!'s `{` escaping rules across a long
+    // Lua program.
     let template = r#"-- Stage 1 e2e test init.lua.
 package.path = table.concat({
   @@STARTER@@ .. "/?.lua",
   @@STARTER@@ .. "/?/init.lua",
+  @@RG@@ .. "/?.lua",
+  @@RG@@ .. "/?/init.lua",
+  @@LUA_ROOT@@ .. "/?.lua",
+  @@LUA_ROOT@@ .. "/?/init.lua",
   package.path,
 }, ";")
 
-local ncp              = require("ncp")
+local ncp              = require("core.ncp")
 local agentic_workflow = require("agentic_workflow")
 
 function dispatch(current_log)
@@ -216,7 +229,10 @@ ncp._test_set_transforms("nefor-tui", {
   from_plugin = chat_chain.from_plugin,
 })
 "#;
-    let src = template.replace("@@STARTER@@", &starter_str);
+    let src = template
+        .replace("@@STARTER@@", &starter_str)
+        .replace("@@LUA_ROOT@@", &lua_root_str)
+        .replace("@@RG@@", &rg_plugin_lua_str);
     std::fs::write(dir.join("init.lua"), src).expect("write test init.lua");
 }
 
@@ -316,12 +332,14 @@ fn write_mock_script(dir: &Path) -> PathBuf {
     path
 }
 
-fn build_host(shared: Arc<Mutex<BrokerShared>>, config_dir: &Path) -> LuaHost {
+async fn build_host(shared: Arc<Mutex<BrokerShared>>, config_dir: &Path) -> LuaHost {
     let bus = Arc::new(EventBus::new());
     let plugins = Arc::new(Mutex::new(PluginRegistry::new()));
     let ops: Arc<dyn EngineOps> = Arc::new(BrokerOps::new(Arc::clone(&shared)));
-    let mut host = LuaHost::new(bus, plugins, ops).expect("lua host");
+    let data_dir = nefor::paths::DataDir(PathBuf::from("/var/empty/stage1-e2e-data"));
+    let mut host = LuaHost::new(bus, plugins, ops, data_dir).expect("lua host");
     host.load_init(&config_dir.join("init.lua"))
+        .await
         .expect("load init.lua");
     host.cache_dispatch().expect("cache dispatch");
     host
@@ -395,7 +413,7 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
     let mock_script = write_mock_script(tmp.path());
 
     let shared = Arc::new(Mutex::new(BrokerShared::new()));
-    let host = build_host(Arc::clone(&shared), tmp.path());
+    let host = build_host(Arc::clone(&shared), tmp.path()).await;
 
     // Plugin root must be a directory containing one subdir per plugin
     // name (the runner uses `<root>/<name>/` as cwd). The repo's

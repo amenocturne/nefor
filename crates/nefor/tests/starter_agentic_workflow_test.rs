@@ -8,19 +8,27 @@
 //! config — but the surface still has to be present so module load and
 //! the for_chat closure don't blow up on first invocation.
 //!
-//! The Lua test file itself is `starter/agentic_workflow_test.lua`.
+//! The Lua test file itself is `tests/lua/agentic-loop/workflow_test.lua`.
 
 use std::path::PathBuf;
 
 use mlua::{Function, Lua, Table, Value};
 
 fn starter_dir() -> PathBuf {
+    repo_root().join("starter")
+}
+
+fn lua_dir() -> PathBuf {
+    repo_root().join("lua")
+}
+
+fn repo_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest
         .parent()
         .and_then(|p| p.parent())
         .expect("repo root is two levels above crates/nefor")
-        .join("starter")
+        .to_path_buf()
 }
 
 #[test]
@@ -29,7 +37,7 @@ fn starter_agentic_workflow_for_chat_model_switch() {
     install_stub_nefor(&lua).expect("install nefor stub");
     set_package_path(&lua).expect("set package.path");
 
-    let test_path = starter_dir().join("agentic_workflow_test.lua");
+    let test_path = repo_root().join("tests/lua/agentic-loop/workflow_test.lua");
     let src = std::fs::read_to_string(&test_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", test_path.display()));
 
@@ -46,6 +54,15 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
     let nefor = lua.create_table()?;
 
     nefor::lua::bindings::install_json(lua, &nefor)?;
+
+    // nefor.fs — sessions module (transitively required) calls
+    // nefor.fs.data_root() at load time. Capture NEFOR_DATA_DIR from
+    // the env if the test set it, otherwise a /var/empty default keeps
+    // disk writes failing harmlessly.
+    let data_dir = std::env::var("NEFOR_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/var/empty/agentic-workflow-test"));
+    nefor::lua::bindings::install_fs(lua, &nefor, nefor::paths::DataDir(data_dir))?;
 
     let log_tbl = lua.create_table()?;
     let no_op: Function = lua.create_function(|_, _: mlua::Variadic<Value>| Ok(()))?;
@@ -204,15 +221,25 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
 fn set_package_path(lua: &Lua) -> mlua::Result<()> {
     let starter = starter_dir();
     let starter_str = starter.display().to_string();
+    let lua_root = lua_dir();
+    let lua_root_str = lua_root.display().to_string();
+    let rg_plugin_lua = repo_root().join("plugins").join("reasoner-graph").join("lua");
+    let rg_plugin_lua_str = rg_plugin_lua.display().to_string();
     let script = format!(
         r#"
         package.path = table.concat({{
           "{starter}/?.lua",
           "{starter}/?/init.lua",
+          "{rg_plugin_lua}/?.lua",
+          "{rg_plugin_lua}/?/init.lua",
+          "{lua_root}/?.lua",
+          "{lua_root}/?/init.lua",
           package.path,
         }}, ";")
         "#,
-        starter = starter_str
+        starter = starter_str,
+        lua_root = lua_root_str,
+        rg_plugin_lua = rg_plugin_lua_str,
     );
     lua.load(&script).exec()
 }

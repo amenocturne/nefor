@@ -163,7 +163,7 @@ mod tests {
     #[test]
     fn config_cli_flag_beats_env_and_default() {
         let cli = cli_with_config("/tmp/my-config");
-        let env = FakeEnv::new(Some("/home/u/.config"), None)
+        let env = FakeEnv::new(Some("/tmp/u/.config"), None)
             .with("NEFOR_CONFIG_DIR", "/env/config");
         let got = resolve_config_from(&cli, &env).expect("resolve ok");
         assert_eq!(got, ConfigDir(PathBuf::from("/tmp/my-config")));
@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn config_env_var_beats_xdg_default() {
         let cli = cli_bare();
-        let env = FakeEnv::new(Some("/home/u/.config"), None)
+        let env = FakeEnv::new(Some("/tmp/u/.config"), None)
             .with("NEFOR_CONFIG_DIR", "/env/config");
         let got = resolve_config_from(&cli, &env).expect("resolve ok");
         assert_eq!(got, ConfigDir(PathBuf::from("/env/config")));
@@ -181,9 +181,9 @@ mod tests {
     #[test]
     fn config_xdg_default_when_no_flag_or_env() {
         let cli = cli_bare();
-        let env = FakeEnv::new(Some("/home/u/.config"), None);
+        let env = FakeEnv::new(Some("/tmp/u/.config"), None);
         let got = resolve_config_from(&cli, &env).expect("resolve ok");
-        assert_eq!(got, ConfigDir(PathBuf::from("/home/u/.config/nefor")));
+        assert_eq!(got, ConfigDir(PathBuf::from("/tmp/u/.config/nefor")));
     }
 
     #[test]
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn data_cli_flag_beats_env_and_default() {
         let cli = cli_with_data("/tmp/my-data");
-        let env = FakeEnv::new(None, Some("/home/u/.local/share"))
+        let env = FakeEnv::new(None, Some("/tmp/u/.local/share"))
             .with("NEFOR_DATA_DIR", "/env/data");
         let got = resolve_data_from(&cli, &env).expect("resolve ok");
         assert_eq!(got, DataDir(PathBuf::from("/tmp/my-data")));
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn data_env_var_beats_xdg_default() {
         let cli = cli_bare();
-        let env = FakeEnv::new(None, Some("/home/u/.local/share"))
+        let env = FakeEnv::new(None, Some("/tmp/u/.local/share"))
             .with("NEFOR_DATA_DIR", "/env/data");
         let got = resolve_data_from(&cli, &env).expect("resolve ok");
         assert_eq!(got, DataDir(PathBuf::from("/env/data")));
@@ -225,9 +225,9 @@ mod tests {
     #[test]
     fn data_xdg_default_when_no_flag_or_env() {
         let cli = cli_bare();
-        let env = FakeEnv::new(None, Some("/home/u/.local/share"));
+        let env = FakeEnv::new(None, Some("/tmp/u/.local/share"));
         let got = resolve_data_from(&cli, &env).expect("resolve ok");
-        assert_eq!(got, DataDir(PathBuf::from("/home/u/.local/share/nefor")));
+        assert_eq!(got, DataDir(PathBuf::from("/tmp/u/.local/share/nefor")));
     }
 
     #[test]

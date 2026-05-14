@@ -1,7 +1,7 @@
 # nefor-tui
 
 Declarative TUI plugin for nefor — Rust engine + reconciler + Lua-driven
-primitives. Chat is composed as a Lua module (`starter/chat.lua`) that
+primitives. Chat is composed as a Lua module (`starter/chat/init.lua`) that
 runs inside this plugin's Lua VM. The legacy split (`nefor-chat` chat-
 state owner + ratatui-based `nefor-tui` renderer over a grid protocol)
 collapsed into this single plugin at phase 6 of the rewrite.
@@ -31,7 +31,7 @@ nefor-tui --script <path-to-lua>
 
 `--script` (or `-s`) loads a user-authored Lua module that calls
 `tui.start { ... }`. The shipped chat surface lives at
-`starter/chat.lua`. Without `--script`, a built-in counter scenario
+`starter/chat/init.lua`. Without `--script`, a built-in counter scenario
 loads (useful for `cargo run -p nefor-tui` smoke runs).
 
 ## Quick run
