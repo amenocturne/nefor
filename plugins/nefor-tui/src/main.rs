@@ -246,6 +246,17 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
                 if engine.has_active_animations() {
                     engine.mark_animation_tick();
                 }
+                // Continuous-tick auto-scroll while the user holds the
+                // cursor motionless past a captured selectable's edge:
+                // crossterm only emits `Drag` events on cursor MOTION, so
+                // the per-Drag scroll path stalls when the cursor stops.
+                // The latch armed by `auto_scroll_for_drag` keeps
+                // advancing `scroll_y` here, gated by an internal
+                // interval so the speed feels controllable. No-op when
+                // the latch is clear.
+                if engine.has_drag_auto_scroll_latch() {
+                    engine.drive_drag_auto_scroll_tick();
+                }
             }
             _ = wallclock_tick.tick() => {
                 // Force a repaint so live elapsed-ms labels (DAG node

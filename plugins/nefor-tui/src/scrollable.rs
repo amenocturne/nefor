@@ -74,6 +74,32 @@ pub enum StickTo {
 /// Default rows-per-wheel-notch (matches the legacy chat plugin's choice).
 pub const WHEEL_STEP_ROWS: u16 = 3;
 
+/// Rows the auto-scroll-while-dragging path advances per fresh `Drag`
+/// event past (or near) the edge. One row keeps the scroll smooth
+/// relative to mouse movement: a 30-row drag past the bottom advances
+/// `scroll_y` by ~30, which in chat / transcript surfaces matches the
+/// natural "selection follows the cursor as content scrolls into view".
+pub const DRAG_AUTO_SCROLL_STEP: u16 = 1;
+
+/// Edge zone (in rows from the top / bottom of the painted rect) where
+/// a `Drag` event triggers an auto-scroll tick. `0` would only trigger
+/// past the rect entirely (a strict "past-the-edge" interpretation);
+/// `1` matches what browsers expose — drag onto the last visible row
+/// AND past it both kick the auto-scroll, so the user doesn't have to
+/// land the cursor exactly past the boundary to start scrolling.
+pub const DRAG_AUTO_SCROLL_EDGE_ROWS: u16 = 1;
+
+/// Minimum gap between continuous-tick auto-scroll advances while the
+/// user holds the cursor motionless past the edge of a captured
+/// scrollable. Drives the latch's tick gate: every animation frame
+/// that's at least this many ms past the previous tick advances
+/// `scroll_y` by `DRAG_AUTO_SCROLL_STEP`. 60ms ≈ 16 rows/sec, matching
+/// typical text-editor auto-scroll speed — fast enough that long
+/// selections feel responsive, slow enough to stay controllable. The
+/// 60Hz animation tick (~16ms) is too fast on its own; this gate
+/// throttles it down to something the human eye can track.
+pub const DRAG_AUTO_SCROLL_LATCH_INTERVAL_MS: u64 = 60;
+
 /// Apply a wheel notch to `state`, clamping against the cached geometry.
 /// Positive `delta` scrolls down (toward end); negative scrolls up.
 ///

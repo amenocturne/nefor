@@ -55,6 +55,14 @@ pub enum WidgetDescription {
         children: Vec<WidgetDescription>,
         gap: u16,
         key: Option<String>,
+        /// Opt-in for drag-to-select. When `true`, this column defines a
+        /// selection region — clicks inside it open a selection, drags
+        /// clamp to its painted rect, and the highlight paints only
+        /// inside the rect. Default `false`. Useful for non-scrolling
+        /// read-output surfaces (sidebar, status panel) that the user
+        /// wants to copy from. Requires a `key` so the engine can
+        /// re-resolve the captured widget after `view` rebuilds.
+        selectable: bool,
     },
     Row {
         children: Vec<WidgetDescription>,
@@ -149,6 +157,14 @@ pub enum WidgetDescription {
         scrollbar: crate::scrollable::ScrollbarMode,
         /// Per-element style overrides. `None` = neutral terminal output.
         style: Option<ScrollableStyle>,
+        /// Opt-in for drag-to-select. When `true`, this scrollable defines
+        /// a selection region — clicks inside it open a selection,
+        /// drags clamp to its painted rect, and the highlight paints only
+        /// inside the rect. Default `false`: clicks bubble as
+        /// `mouse.click` without starting a selection. Selection is
+        /// always scoped to the captured widget; cross-panel highlight
+        /// bleed and cross-widget copy are both eliminated by clamping.
+        selectable: bool,
     },
     TextInput {
         /// User key — required for text_input so Lua can reference it
@@ -188,6 +204,12 @@ pub enum WidgetDescription {
         cursor_blink: bool,
         /// Style record. `None` = neutral terminal fg/bg, no attrs.
         style: Option<TextInputStyle>,
+        /// Opt-in for drag-to-select. When `true`, dragging across the
+        /// input opens a selection that copies the visible text on
+        /// release. Default `false`. Distinct from the input's internal
+        /// editing-cursor state — this is the transcript-style mouse
+        /// selection mechanism for copying displayed text.
+        selectable: bool,
     },
 }
 
@@ -815,7 +837,22 @@ fn parse_column(t: &Table) -> Result<WidgetDescription, TuiError> {
     };
     let gap = parse_u16(t, "gap", 0, "tui.column")?;
     let key = parse_key(t)?;
-    Ok(WidgetDescription::Column { children, gap, key })
+    let selectable = match t.get::<Value>("selectable")? {
+        Value::Nil => false,
+        Value::Boolean(b) => b,
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.column: `selectable` must be a boolean (got {})",
+                other.type_name()
+            )));
+        }
+    };
+    Ok(WidgetDescription::Column {
+        children,
+        gap,
+        key,
+        selectable,
+    })
 }
 
 fn parse_row(t: &Table) -> Result<WidgetDescription, TuiError> {
@@ -1048,6 +1085,16 @@ fn parse_text_input(t: &Table) -> Result<WidgetDescription, TuiError> {
     let placeholder = parse_optional_string(t, "placeholder", "tui.text_input")?;
     let cursor_blink = parse_optional_bool(t, "cursor_blink", "tui.text_input")?.unwrap_or(false);
     let style = parse_text_input_style(t)?;
+    let selectable = match t.get::<Value>("selectable")? {
+        Value::Nil => false,
+        Value::Boolean(b) => b,
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.text_input: `selectable` must be a boolean (got {})",
+                other.type_name()
+            )));
+        }
+    };
     Ok(WidgetDescription::TextInput {
         key,
         value,
@@ -1059,6 +1106,7 @@ fn parse_text_input(t: &Table) -> Result<WidgetDescription, TuiError> {
         placeholder,
         cursor_blink,
         style,
+        selectable,
     })
 }
 
@@ -1131,6 +1179,17 @@ fn parse_scrollable(t: &Table) -> Result<WidgetDescription, TuiError> {
 
     let style = parse_scrollable_style(t)?;
 
+    let selectable = match t.get::<Value>("selectable")? {
+        Value::Nil => false,
+        Value::Boolean(b) => b,
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.scrollable: `selectable` must be a boolean (got {})",
+                other.type_name()
+            )));
+        }
+    };
+
     Ok(WidgetDescription::Scrollable {
         key,
         child,
@@ -1138,6 +1197,7 @@ fn parse_scrollable(t: &Table) -> Result<WidgetDescription, TuiError> {
         on_scroll,
         scrollbar,
         style,
+        selectable,
     })
 }
 
@@ -2119,6 +2179,7 @@ mod tests {
                 placeholder,
                 cursor_blink,
                 style,
+                selectable,
             } => {
                 assert_eq!(key.as_deref(), Some("input"));
                 assert!(value.is_empty());
@@ -2130,6 +2191,7 @@ mod tests {
                 assert!(placeholder.is_none());
                 assert!(!cursor_blink);
                 assert!(style.is_none());
+                assert!(!selectable);
             }
             _ => panic!("expected text_input"),
         }

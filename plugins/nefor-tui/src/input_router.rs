@@ -468,6 +468,7 @@ mod tests {
             placeholder: None,
             cursor_blink: false,
             style: None,
+            selectable: false,
         }
     }
 
@@ -476,6 +477,7 @@ mod tests {
             children,
             gap: 0,
             key: None,
+            selectable: false,
         }
     }
 
@@ -644,6 +646,7 @@ mod tests {
             placeholder: None,
             cursor_blink: false,
             style: None,
+            selectable: false,
         };
         let mut r = build(multi);
         let root = r.root.as_mut().unwrap();
@@ -669,6 +672,7 @@ mod tests {
             placeholder: None,
             cursor_blink: false,
             style: None,
+            selectable: false,
         };
         let mut r = build(single);
         let root = r.root.as_mut().unwrap();
@@ -721,6 +725,7 @@ mod tests {
             placeholder: None,
             cursor_blink: false,
             style: None,
+            selectable: false,
         };
         let mut r = build(multi);
         let root = r.root.as_mut().unwrap();
@@ -855,6 +860,7 @@ mod tests {
             placeholder: None,
             cursor_blink: false,
             style: None,
+            selectable: false,
         };
         let mut r = build(multi);
         let root = r.root.as_mut().unwrap();
@@ -883,6 +889,7 @@ mod tests {
             placeholder: None,
             cursor_blink: false,
             style: None,
+            selectable: false,
         };
         let mut r = build(multi);
         let root = r.root.as_mut().unwrap();
@@ -926,6 +933,7 @@ mod tests {
             placeholder: None,
             cursor_blink: false,
             style: None,
+            selectable: false,
         }
     }
 

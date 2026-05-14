@@ -203,6 +203,7 @@ mod tests {
             children,
             gap: 0,
             key: key.map(|s| s.to_string()),
+            selectable: false,
         }
     }
 
