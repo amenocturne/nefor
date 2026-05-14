@@ -25,8 +25,8 @@ use crate::paths::DataDir;
 
 /// Install `nefor.fs.*` onto `nefor_tbl`.
 ///
-/// `data_dir` is the engine's canonical resolved data directory (CLI flag
-/// > `NEFOR_DATA_DIR` > `XDG_DATA_HOME/nefor`). It's captured into
+/// `data_dir` is the engine's canonical resolved data directory (CLI flag,
+/// then `NEFOR_DATA_DIR`, then `XDG_DATA_HOME/nefor`). It's captured into
 /// `nefor.fs.data_root()` so Lua reads the same value the engine resolved
 /// at startup — without re-evaluating env vars on the Lua side (which
 /// historically drifted: Lua-side helpers invented a `NEFOR_DATA_HOME`

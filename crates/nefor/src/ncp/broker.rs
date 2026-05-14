@@ -652,17 +652,14 @@ impl Broker {
         // is non-blocking; we stop as soon as the channel is empty so the
         // tick boundary stays bounded by what's actually pending. New
         // messages that arrive after this point ride the next tick.
-        loop {
-            match self.inbound_rx.try_recv() {
-                Ok((id, msg)) => sort(
-                    &self.conns_by_id,
-                    &mut batched_lines,
-                    &mut closed_msgs,
-                    id,
-                    msg,
-                ),
-                Err(_) => break,
-            }
+        while let Ok((id, msg)) = self.inbound_rx.try_recv() {
+            sort(
+                &self.conns_by_id,
+                &mut batched_lines,
+                &mut closed_msgs,
+                id,
+                msg,
+            );
         }
 
         // Inbound plugin lines are NOT auto-logged: the broker invokes

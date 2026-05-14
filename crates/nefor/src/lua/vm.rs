@@ -463,6 +463,7 @@ fn extract_body_kind(payload: &str) -> Option<String> {
 }
 
 /// Install every `nefor.*` sub-table.
+#[allow(clippy::too_many_arguments)]
 fn install_nefor_surface(
     lua: &Lua,
     bus: Arc<EventBus>,

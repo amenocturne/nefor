@@ -454,7 +454,7 @@ fn paths_to_check_skips_existing_directory_arg_starting_at_self() {
     let dir_str = tempdir.path().display().to_string();
 
     let collected: Vec<String> = lua
-        .load(&format!(
+        .load(format!(
             r#"
             local d = require("tool-gate.agents_md")
             local dirs = d.paths_to_check("{dir}")
@@ -505,7 +505,7 @@ fn find_unloaded_skips_already_loaded_paths() {
     let outer_agents_str = outer_agents.display().to_string();
 
     let counts: Table = lua
-        .load(&format!(
+        .load(format!(
             r#"
             local d = require("tool-gate.agents_md")
             d._reset()
@@ -576,7 +576,7 @@ fn emit_for_tool_call_emits_outer_first_then_inner_with_marker() {
 
     let touched_str = touched.display().to_string();
     let result: Table = lua
-        .load(&format!(
+        .load(format!(
             r#"
             local d = require("tool-gate.agents_md")
             d._reset()
@@ -663,7 +663,7 @@ fn emit_for_tool_call_deduplicates_across_calls_in_same_chat() {
     set_package_path(&lua).expect("set package.path");
 
     let result: Table = lua
-        .load(&format!(
+        .load(format!(
             r#"
             local d = require("tool-gate.agents_md")
             d._reset()
@@ -748,7 +748,7 @@ fn emit_for_tool_call_skips_empty_agents_md() {
     set_package_path(&lua).expect("set package.path");
 
     let count: i64 = lua
-        .load(&format!(
+        .load(format!(
             r#"
             local d = require("tool-gate.agents_md")
             d._reset()
@@ -802,7 +802,7 @@ fn tool_gate_wrapper_emits_agents_md_on_outbound_path_touching_invoke() {
     set_package_path(&lua).expect("set package.path");
 
     let touched_str = touched.display().to_string();
-    lua.load(&format!(
+    lua.load(format!(
         r#"
         require("tool-gate.agents_md")._reset()
         local tools = require("compositors.tools")
