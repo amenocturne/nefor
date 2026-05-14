@@ -24,16 +24,17 @@
 
 local json = nefor.json
 
-local envelope        = require("core.envelope")
-local ids             = require("core.ids")
-local results_lib     = require("agentic-loop.results")
-local topology        = require("agentic-loop.topology")
-local spawn_graph     = require("libs.spawn-graph")
-local history_replay  = require("core.history_replay")
-local replay_window   = history_replay
-local session_config  = require("agentic-loop.session_config")
-local generic_provider = require("libs.generic-provider")
-local generic_tool     = require("libs.generic-tool")
+local envelope        = require("lib.envelope")
+local ids             = require("lib.ids")
+local results_lib     = require("lib.results")
+local graph_lib       = require("lib.graph")
+local replay_window   = require("lib.replay_window")
+local history_replay  = require("lib.history_replay")
+local session_config  = require("lib.session_config")
+
+-- ------------------------------------------------------------------
+-- module-private state — held in `state` table; mutations are explicit
+-- ------------------------------------------------------------------
 
 local state = {
   -- Orchestrator config — mutated by configure() / chat.model.set.
@@ -242,7 +243,7 @@ end
 -- A provider switch (different provider name) crosses a process
 -- boundary: the new provider's binary has no per-chat_id history
 -- table for the active chat. Without rebuild the model would reply
--- with no memory of prior turns. We rebuild by walking the
+-- with no memory of prior turns (Bug B2). We rebuild by walking the
 -- on-disk session log for the prior chat's `<old>.chat.{create,append}`
 -- + wrap-firing tool.result envelopes and re-emitting them as
 -- `<new>.chat.{create,append}` against a fresh chat_id under the new
@@ -256,15 +257,72 @@ end
 --
 -- If the session log is unavailable (no path, open failure, no prior
 -- chat.create matching the chat_id), we fall back to clearing
--- current_state — user loses prior context but the chat stays
--- consistent.
+-- current_state — the legacy behaviour. User loses prior context but
+-- the chat stays consistent.
 local function set_model(provider, model)
+  local prior_provider = state.config.provider
+  local prior_chat_id  =
+    (type(state.current_state) == "table" and type(state.current_state.chat_id) == "string")
+      and state.current_state.chat_id or nil
+  local provider_changed = false
   if type(provider) == "string" and #provider > 0 then
+    if state.config.provider ~= provider then
+      provider_changed = true
+    end
     state.config.provider = provider
   end
   if type(model) == "string" and #model > 0 then
     state.config.model = model
   end
+  if not provider_changed then return end
+
+  if prior_chat_id == nil then
+    -- Cross-provider switch with no prior chat — nothing to rebuild.
+    nefor.log.info("agentic-loop.set_model: provider changed, no prior chat", {
+      prior_provider = prior_provider, new_provider = provider,
+    })
+    state.current_state = nil
+    return
+  end
+
+  -- Rebuild prior chat under the new provider. The session log path is
+  -- resolved through the sessions module; we lazy-require it to avoid
+  -- a circular dep at module-load time (sessions doesn't depend on
+  -- agentic-loop, but lazy keeps the surface symmetric with the
+  -- agentic-loop ↔ openai-provider lazy-bind below).
+  local sessions = require("sessions")
+  local path = sessions.current_path()
+  if type(path) ~= "string" or path == "" then
+    nefor.log.warn("agentic-loop.set_model: no session log path available; clearing current_state", {
+      prior_provider = prior_provider, new_provider = provider,
+    })
+    state.current_state = nil
+    return
+  end
+
+  local target_chat_id = envelope.next_id("chat")
+  local n, err = history_replay.replay_chat_history {
+    path             = path,
+    src_prefix       = prior_provider,
+    src_chat_id      = prior_chat_id,
+    target_provider  = provider,
+    target_chat_id   = target_chat_id,
+    model            = state.config.model,
+  }
+  if err ~= nil then
+    nefor.log.warn("agentic-loop.set_model: history replay failed; clearing current_state", {
+      prior_provider = prior_provider, new_provider = provider,
+      prior_chat_id = prior_chat_id, error = err,
+    })
+    state.current_state = nil
+    return
+  end
+  state.current_state = { chat_id = target_chat_id }
+  nefor.log.info("agentic-loop.set_model: chat history fed to new provider", {
+    prior_provider  = prior_provider, new_provider = provider,
+    prior_chat_id   = prior_chat_id,  new_chat_id  = target_chat_id,
+    envelopes_emitted = n,
+  })
 end
 
 local function set_yolo(enabled)
@@ -872,7 +930,7 @@ local function receive_msg(entry)
       -- with state.current_state==nil → no seed_chat_id → reasoners.lua
       -- mints a fresh chat-N → openai-provider's painstakingly-rebuilt
       -- history (on the OLD chat_id) is orphaned, model replies with no
-      -- memory of prior turns.
+      -- memory of prior turns. (issue #38 follow-up to e831dd9.)
       local result = body.result
       if type(result) == "table" and type(result.next_state) == "table" then
         local cid = result.next_state.chat_id
@@ -892,6 +950,16 @@ local function receive_msg(entry)
           return
         end
       end
+      -- Wrap-firing close — silently swallow during replay (state
+      -- already captured above). Without this short-circuit it falls
+      -- through to handle_tool_result below, which is a no-op anyway
+      -- (firing_to_node is empty), but the early return makes the
+      -- intent explicit.
+      if type(result) == "table" and type(result.next_state) == "table"
+          and type(result.next_state.chat_id) == "string"
+          and result.next_state.chat_id ~= "" then
+        return
+      end
     end
   end
 
@@ -905,6 +973,68 @@ local function receive_msg(entry)
   end
 end
 
+-- Restore `state.config.{provider,model}` from the resumed session's
+-- on-disk log. Without this, /resume of a chat that was originally
+-- under provider A leaves state.config.provider pointing at whatever
+-- the LIVE session had switched to (e.g., the user did /model B before
+-- /resume-ing) — and the next live submit dispatches the resumed
+-- chat_id (restored separately by the replayed wrap-firing
+-- tool.result, per 91d49ef) against provider B, which doesn't own that
+-- chat. Symptom: "[Error: chat 'chat-1' not found]" on the first turn
+-- after /resume.
+--
+-- The walk reads the log fresh on every replay start; sessions's
+-- `current_path()` returns the path of the session being resumed
+-- (do_resume swaps state before emitting the replay markers). The
+-- helper picks the latest `chat.model.set` if the session ever saw
+-- /model, otherwise falls back to the prefix + model on the latest
+-- `<prefix>.chat.create`. Empty / unreadable logs leave config as-is.
+--
+-- The model picker UI tracks the model via `chat.model.set_ack` (gated
+-- against replayed acks per e647451 — replayed acks are stale relative
+-- to live state). After this restore, we emit a fresh LIVE
+-- `chat.model.set_ack` so chat.lua's status bar repaints with the
+-- resumed session's model. The ack must be live (not gated) because
+-- it carries the post-replay truth, not a replayed envelope.
+local function restore_active_model_from_session_log()
+  local sessions_mod = require("sessions")
+  local path = sessions_mod.current_path()
+  if type(path) ~= "string" or path == "" then return end
+  local active = session_config.read_active_model(path)
+  local provider = active.provider
+  local model    = active.model
+
+  local changed = false
+  if type(provider) == "string" and #provider > 0
+      and state.config.provider ~= provider then
+    state.config.provider = provider
+    changed = true
+  end
+  if type(model) == "string" and #model > 0
+      and state.config.model ~= model then
+    state.config.model = model
+    changed = true
+  end
+
+  if changed then
+    nefor.log.info("agentic-loop: /resume restored active provider/model from session log", {
+      provider = state.config.provider, model = state.config.model,
+    })
+    -- Surface the restored selection to chat.lua's status bar / model
+    -- picker. Live ack (not a replayed envelope) so chat.lua's
+    -- replay_mode gate doesn't drop it. We emit it broadcast so any
+    -- observer (statusline, picker, future surfaces) picks it up.
+    if type(state.config.provider) == "string" and #state.config.provider > 0
+        and type(state.config.model) == "string" and #state.config.model > 0 then
+      emit_broadcast({
+        kind     = "chat.model.set_ack",
+        provider = state.config.provider,
+        model    = state.config.model,
+      })
+    end
+  end
+end
+
 -- Drive `teardown_for_session_end` from the bus marker. Replay-mode
 -- gating is owned by `core.history_replay`, which subscribes to
 -- `sessions.replay.start` / `sessions.replay.end` independently — the
@@ -913,6 +1043,12 @@ end
 if nefor.bus and nefor.bus.on_event then
   nefor.bus.on_event("sessions.session_end", function(_entry)
     teardown_for_session_end()
+  end)
+  -- Restore active provider+model on every replay start. /resume drives
+  -- the replay markers; /new fires them too with an empty log, where
+  -- the helper is a no-op (no chat.create / chat.model.set to read).
+  nefor.bus.on_event("sessions.replay.start", function(_entry)
+    restore_active_model_from_session_log()
   end)
 end
 

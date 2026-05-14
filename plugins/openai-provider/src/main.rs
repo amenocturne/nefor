@@ -446,7 +446,14 @@ async fn dispatch_event(
         }
         "models.list_requested" => {
             let token = auth.token().await;
-            match list_models(client, &config.base_url, token.as_deref(), &config.auth_header).await {
+            match list_models(
+                client,
+                &config.base_url,
+                token.as_deref(),
+                &config.auth_header,
+            )
+            .await
+            {
                 Ok(models) => {
                     send_event(out_tx, models_listed_body(config, &models)).await?;
                 }
@@ -460,6 +467,11 @@ async fn dispatch_event(
                         }
                         StreamError::Request(s) => format!("request failed: {s}"),
                         StreamError::Body(s) => format!("read error: {s}"),
+                        // list_models doesn't send `tools`; the variant
+                        // can't fire here, but match exhaustively.
+                        StreamError::ToolsUnsupported { body } => {
+                            format!("HTTP 400: {}", snippet(body))
+                        }
                     };
                     if matches!(e, StreamError::Unauthorized { .. }) {
                         let snap = auth.mark_auth_error(HTTP_401_MESSAGE.to_owned()).await;
@@ -643,7 +655,15 @@ fn spawn_turn(
                 "history snapshot for turn iteration",
             );
             let chat_tools_on = chats.tools_enabled(&chat_id).await.unwrap_or(true);
-            let tools_array = if chat_tools_on {
+            // Per-model cache: a model the upstream previously rejected
+            // with the "does not support tools" signature stays disabled
+            // for the rest of this process — even on a fresh chat. The
+            // chat-level flag stays the discriminator for explicit opt-
+            // outs (sub-graph responder, etc); the model-level cache is
+            // a lazy capability cache populated reactively on the first
+            // 400 we see for each model.
+            let model_tools_supported = chats.model_supports_tools(&active_model).await;
+            let tools_array = if chat_tools_on && model_tools_supported {
                 catalog.to_openai_tools().await
             } else {
                 Vec::new()
@@ -869,6 +889,31 @@ fn spawn_turn(
                     final_tool_calls = outcome.tool_calls;
                     break;
                 }
+                Err(StreamError::ToolsUnsupported { body }) => {
+                    // Reactive fallback: the upstream rejected the request
+                    // because the active model lacks the `tools` capability
+                    // (e.g. ollama against `translategemma`). User's mental
+                    // model is "I sent a message, the model should reply" —
+                    // surfacing the raw 400 fails that. Mark the model as
+                    // tools-incapable for the rest of this process and the
+                    // chat as tools-off so subsequent iterations + future
+                    // turns skip the round-trip, then `continue` to retry
+                    // *this* iteration with no tools array. The retry can't
+                    // re-enter this arm because the next iteration's
+                    // `tools_array` is empty (chat flag flipped + model-
+                    // cache populated).
+                    tracing::info!(
+                        target: "openai_provider::tools",
+                        chat_id = %chat_id,
+                        model = %active_model,
+                        body = %body,
+                        "model rejected tools — falling back to chat-only mode for this model",
+                    );
+                    chats.mark_model_tools_unsupported(&active_model).await;
+                    let _ = chats.set_tools_enabled(&chat_id, false).await;
+                    iterations = iterations.saturating_sub(1);
+                    continue;
+                }
                 Err(e) => {
                     let msg = match &e {
                         StreamError::Unauthorized { body } => {
@@ -879,6 +924,11 @@ fn spawn_turn(
                         }
                         StreamError::Request(s) => format!("request failed: {s}"),
                         StreamError::Body(s) => format!("stream read error: {s}"),
+                        // Handled above in its own arm — unreachable here,
+                        // listed for exhaustiveness.
+                        StreamError::ToolsUnsupported { body } => {
+                            format!("HTTP 400: {}", extract_error_message(body))
+                        }
                     };
                     tracing::warn!(error = %e, "turn failed");
                     if matches!(e, StreamError::Unauthorized { .. }) {
@@ -2691,6 +2741,246 @@ mod tests {
         assert_eq!(
             emitted[0].get("kind").and_then(Value::as_str),
             Some("ollama.chat.error")
+        );
+    }
+
+    /// Regression for the cancel-mid-stream contract: when a `/cancel`
+    /// fires while the model is mid-response, the partial assistant
+    /// text the model has already emitted MUST land in the chat's
+    /// history table on the provider binary side. The user-facing
+    /// motivation: "you started thinking wrong, reconsider" only works
+    /// if the next turn's request includes what the model just said
+    /// before being cut off.
+    ///
+    /// Drive: spin up an SSE server that streams 5 deltas with a 30ms
+    /// pause between each (well past the watchdog floor of any path
+    /// here, well below the test's 5s timeout); fire chat.create →
+    /// chat.append (user) → chat.complete; wait for at least 2 deltas
+    /// to reach the writer channel; call chats.interrupt(&chat_id)
+    /// directly (the bus-side path is `<prefix>.interrupt` →
+    /// `chats.interrupt_all()`, which is functionally identical for
+    /// the per-chat case here); wait for chat.complete.result; assert
+    /// chats.history_snapshot's last message is an assistant message
+    /// with non-empty content equal to a prefix of the deltas the
+    /// server actually wrote.
+    #[tokio::test]
+    async fn chat_complete_persists_partial_assistant_to_history_on_interrupt_midstream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        // Slow-stream SSE: send each delta line, flush, wait 30ms,
+        // repeat. Five deltas → ~150ms total before [DONE]; the test
+        // interrupts after the second delta lands in the writer
+        // channel, so the server may still be mid-write when the
+        // cancel fires. That's the production shape — the cancel
+        // token lives inside `run_chat_stream`'s `tokio::select!` and
+        // races the `byte_stream.next()` arm.
+        let _server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.expect("accept");
+            // Drain request headers + body before responding.
+            let mut buf = vec![0u8; 4096];
+            let mut acc = String::new();
+            while !acc.contains("\r\n\r\n") {
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+            // Headers + chunked transfer (Content-Length unknown for a
+            // paced stream).
+            let _ = s
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\n\
+                      Connection: close\r\n\r\n",
+                )
+                .await;
+            for word in ["alpha", "beta", "gamma", "delta", "epsilon"] {
+                let frame = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{word} \"}}}}]}}\n\n",
+                );
+                let chunk = format!("{:x}\r\n{}\r\n", frame.len(), frame);
+                if s.write_all(chunk.as_bytes()).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            let finish = "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n";
+            let usage =
+                "data: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5}}\n\n";
+            let done = "data: [DONE]\n\n";
+            for frame in [finish, usage, done] {
+                let chunk = format!("{:x}\r\n{}\r\n", frame.len(), frame);
+                if s.write_all(chunk.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+            let _ = s.write_all(b"0\r\n\r\n").await;
+            let _ = s.shutdown().await;
+        });
+
+        let (auth, tx, mut rx) = auth_test_rig(Some("envkey"));
+        let chats = fresh_chats("test-model");
+        let catalog = Arc::new(ToolCatalog::new());
+        let broker = Arc::new(ToolBroker::new());
+        let mut config = cfg("ollama");
+        config.base_url = format!("http://{}", addr);
+        let client = reqwest::Client::builder().build().expect("client");
+
+        let chat_id = ChatId::new("c-interrupt");
+
+        // 1. chat.create.
+        let create_body = make_event_body(
+            "ollama.chat.create",
+            &[("chat_id", Value::String("c-interrupt".into()))],
+        );
+        dispatch_event(
+            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &from_plugin("reasoner-graph"),
+            &create_body,
+        )
+        .await
+        .expect("create");
+
+        // 2. chat.append { role=user }.
+        let append_body = make_event_body(
+            "ollama.chat.append",
+            &[
+                ("chat_id", Value::String("c-interrupt".into())),
+                (
+                    "message",
+                    serde_json::json!({"role": "user", "content": "hi"}),
+                ),
+            ],
+        );
+        dispatch_event(
+            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &from_plugin("reasoner-graph"),
+            &append_body,
+        )
+        .await
+        .expect("append");
+
+        // 3. chat.complete — kicks off the spawned turn.
+        let complete_body = make_event_body(
+            "ollama.chat.complete",
+            &[("chat_id", Value::String("c-interrupt".into()))],
+        );
+        dispatch_event(
+            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &from_plugin("reasoner-graph"),
+            &complete_body,
+        )
+        .await
+        .expect("complete");
+
+        // 4. Wait for at least 2 stream.delta envelopes to reach the
+        //    writer channel — confirms we're mid-stream when the
+        //    cancel fires.
+        let mut delta_count = 0;
+        let mut wire_partial = String::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while delta_count < 2 && std::time::Instant::now() < deadline {
+            if let Ok(msg) = rx.try_recv() {
+                let line = msg.to_line();
+                let v: Value = serde_json::from_str(&line).expect("plugin out json");
+                if let Some(body) = v.get("body").and_then(Value::as_object) {
+                    if body.get("kind").and_then(Value::as_str)
+                        == Some("ollama.stream.delta")
+                    {
+                        delta_count += 1;
+                        if let Some(t) = body.get("text").and_then(Value::as_str) {
+                            wire_partial.push_str(t);
+                        }
+                    }
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        assert!(
+            delta_count >= 2,
+            "expected at least 2 stream.delta envelopes before timeout; got {delta_count}",
+        );
+        assert!(
+            !wire_partial.is_empty(),
+            "wire_partial must accumulate the delta text",
+        );
+
+        // 5. Interrupt the in-flight turn directly. The bus-side path
+        //    is `<prefix>.interrupt` → chats.interrupt_all(); the
+        //    per-chat shape calls chats.interrupt(&chat_id).
+        let was_in_flight = chats.interrupt(&chat_id).await;
+        assert!(was_in_flight, "interrupt should land on an in-flight turn");
+
+        // 6. Wait for chat.complete.result on the writer channel —
+        //    that's the marker the spawned turn finished its cleanup.
+        let mut saw_complete_result = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Ok(msg) = rx.try_recv() {
+                let line = msg.to_line();
+                let v: Value = serde_json::from_str(&line).expect("json");
+                if let Some(body) = v.get("body").and_then(Value::as_object) {
+                    if body.get("kind").and_then(Value::as_str)
+                        == Some("ollama.chat.complete.result")
+                    {
+                        saw_complete_result = true;
+                        break;
+                    }
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        assert!(
+            saw_complete_result,
+            "chat.complete.result must arrive after interrupt"
+        );
+
+        // 7. The persistence assertion. History should be:
+        //    [user="hi", assistant=<partial>]. The partial assistant
+        //    content must be non-empty (regression: pre-fix it would
+        //    not be pushed when the path was wrong).
+        let history = chats
+            .history_snapshot(&chat_id)
+            .await
+            .expect("history snapshot");
+        assert_eq!(
+            history.len(),
+            2,
+            "expected [user, assistant] in history, got {history:?}",
+        );
+        assert_eq!(history[0].role, "user");
+        assert_eq!(history[0].content.as_deref(), Some("hi"));
+        assert_eq!(history[1].role, "assistant");
+        let assistant_content = history[1]
+            .content
+            .as_deref()
+            .expect("assistant content set");
+        assert!(
+            !assistant_content.is_empty(),
+            "assistant content must hold the partial text streamed before interrupt; \
+             history was {history:?}; wire_partial = {wire_partial:?}",
+        );
+        // The persisted partial is whatever the stream loop accumulated
+        // into `outcome.full_text` at the moment the cancel token fired
+        // — usually equal to or a 1-2-chunk superset of what the writer
+        // channel had at the moment we called `chats.interrupt`. Either
+        // direction (wire is a prefix of stored, or stored is a prefix
+        // of wire) is acceptable; both indicate the same underlying
+        // delta accumulator.
+        assert!(
+            assistant_content.starts_with(wire_partial.trim_end())
+                || wire_partial.starts_with(assistant_content),
+            "stored partial and wire-observed partial must share a prefix; \
+             stored={assistant_content:?} wire={wire_partial:?}",
         );
     }
 
