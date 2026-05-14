@@ -1434,6 +1434,7 @@ local tests = {
   { name = "replay_window_suppresses_replayed_tool_invoke_in_same_batch", fn = test_replay_window_suppresses_replayed_tool_invoke_in_same_batch },
   { name = "replay_window_does_not_starve_nefor_tui", fn = test_replay_window_does_not_starve_nefor_tui },
   { name = "tool_gate_wrapper_forwards_error_message_to_chat_tool_end", fn = test_tool_gate_wrapper_forwards_error_message_to_chat_tool_end },
+  { name = "to_plugin_receives_full_batch_in_one_call", fn = test_to_plugin_receives_full_batch_in_one_call },
 }
 
 for _, t in ipairs(tests) do

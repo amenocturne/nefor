@@ -37,8 +37,6 @@
 -- restart), this means writer dispatches always need a fresh approval
 -- across session boundaries.
 --
--- Per lead-workflow-spec §2 / §6 / §7-c.
---
 -- ## Tools the lead invokes
 --
 -- Advertised to tool-gate as a virtual source `lead-workflow`. The
@@ -49,9 +47,9 @@
 --   * `dispatch-graph` — args:
 --       { nodes = [{ id, role, agent_args, dependencies? }, ...] }
 --     Builds a reasoner-graph spec from the role-keyed nodes (looking
---     up `role -> reasoner config` from `lead_role.AGENT_CONFIGS` when
---     available; falling back to a default `agent`-reasoner shape so
---     the actor stays usable before C3 lands), submits it via the same
+--     up `role -> reasoner config` from `lead-workflow.role.AGENT_CONFIGS`
+--     when available; falling back to a default `agent`-reasoner shape
+--     when the role module is not yet loaded), submits it via the same
 --     `tool.invoke{name=spawn_graph}` shape `agentic-loop`'s
 --     `submit_orchestrator_run` uses. Returns the minted run_id.
 --     Writer roles (read_only=false) require `state.active_plan.status
@@ -75,12 +73,11 @@
 
 local json = nefor.json
 
-local envelope      = require("lib.envelope")
-local replay_window = require("lib.replay_window")
+local envelope      = require("core.envelope")
+local replay_window = require("core.history_replay")
 
 local emit_as = envelope.emit_as
 local emit    = envelope.emit
-local next_id = envelope.next_id
 
 local state = {
   -- The in-flight graph's run_id; nil when no graph is running.
@@ -112,16 +109,12 @@ local SOURCE_NAME = "lead-workflow"
 -- module not being loaded: returns nil instead of erroring at module
 -- load. Each call retries the require so a later install picks up.
 local function role_config(role)
-  local ok, mod = pcall(require, "lead_role")
+  local ok, mod = pcall(require, "lead-workflow.role")
   if not ok or type(mod) ~= "table" then return nil end
   local configs = mod.AGENT_CONFIGS
   if type(configs) ~= "table" then return nil end
   return configs[role]
 end
-
--- ------------------------------------------------------------------
--- envelope emit helpers
--- ------------------------------------------------------------------
 
 local function emit_tool_result_ok(firing_id, output)
   emit_as(SOURCE_NAME, nil, {
@@ -139,10 +132,7 @@ local function emit_tool_result_err(firing_id, err)
   })
 end
 
--- ------------------------------------------------------------------
--- tool: dispatch-graph
--- ------------------------------------------------------------------
-
+-- Tool: dispatch-graph.
 -- Validate that the role-keyed node spec has exactly one terminal
 -- (sink) node — one node id that no other node lists in its
 -- `dependencies`. Reasoner-graph treats the sole terminal node's result
@@ -226,11 +216,10 @@ end
 --   { id, role, agent_args = { prompt, ... }, dependencies? = { upstream_ids } }
 --
 -- For each node we resolve `role -> { system_prompt, tool_allowlist,
--- model? }` from lead_role.AGENT_CONFIGS. If unavailable (C3 not yet
--- landed), we fall back to passing the role straight through as an
--- `agent` reasoner with the caller's `agent_args` only — the agent
--- reasoner will fail the firing if `prompt` is missing, which is fine
--- (the lead retries).
+-- model? }` from `lead-workflow.role.AGENT_CONFIGS`. If unavailable
+-- we fall back to passing the role straight through as an `agent`
+-- reasoner with the caller's `agent_args` only — the agent reasoner
+-- will fail the firing if `prompt` is missing.
 local function build_graph_spec(node_specs)
   if type(node_specs) ~= "table" or #node_specs == 0 then
     return nil, "dispatch-graph: nodes list must be a non-empty array"
@@ -279,6 +268,13 @@ local function build_graph_spec(node_specs)
       id       = spec.id,
       reasoner = "agent",
       args     = agent_args,
+      -- Carries the lead's role label (explorer / builder / reviewer /
+      -- …) through to the chat surface so the graph_result block can
+      -- show role per node rather than the generic `agent` reasoner.
+      -- reasoner-graph parses by `id` + `reasoner` only and silently
+      -- ignores unknown fields; the field round-trips through
+      -- agentic-loop's pending_runs without touching the wire.
+      role     = spec.role,
     }
 
     if type(spec.dependencies) == "table" then
@@ -375,9 +371,26 @@ local function dispatch_graph(firing_id, args)
   al.flush_pending_dispatches()
   state.active_run_id = run_id
 
+  -- The ack body carries an explicit async-contract instruction. Without
+  -- it, smaller models (qwen2.5:7b observed in practice) read the bare
+  -- {run_id, nodes} response as "tool returned nothing useful" and
+  -- re-call dispatch-graph for the same task, producing duplicate
+  -- sub-graph runs. The wording deliberately avoids "or chain another
+  -- tool call" — that phrase nudges the model toward immediate
+  -- redispatch — and reserves "you may dispatch a different task" as
+  -- the only sanctioned chained-call path.
+  local n = #graph.nodes
   emit_tool_result_ok(firing_id, {
     run_id = run_id,
-    nodes  = #graph.nodes,
+    nodes  = n,
+    notice = string.format(
+      "Submitted (async, %d node%s). Acknowledge briefly to the user " ..
+      "in one short sentence, then WAIT for the result. Do NOT call " ..
+      "dispatch-graph again for this same task — the result will arrive " ..
+      "later as a user message tagged `[spawn_graph(run_id=%s) result]`. " ..
+      "You may dispatch a DIFFERENT task in parallel if the user asked " ..
+      "for one.",
+      n, n == 1 and "" or "s", run_id),
   })
 end
 
@@ -469,10 +482,7 @@ local function emit_verdict_discarded(firing_id, comment)
   emit_tool_result_ok(firing_id, out)
 end
 
--- ------------------------------------------------------------------
--- chat.input.submit watcher — /approve and /reject patterns
--- ------------------------------------------------------------------
-
+-- chat.input.submit watcher — /approve and /reject patterns.
 -- Match `/approve` or `/approve <reason>` and `/reject <reason>`. The
 -- patterns are lenient: surrounding whitespace is stripped. Returns
 -- (verdict, reason) or nil if the text doesn't match.
@@ -567,10 +577,6 @@ local function reduce_plan_approved(_body)
   -- rebuilt from replay.
 end
 
--- ------------------------------------------------------------------
--- session_end → terminate active graph
--- ------------------------------------------------------------------
-
 local function terminate_active_graph()
   -- Session boundary flushes the plan slot unconditionally — no
   -- approval survives across sessions. If a write-review was in-flight
@@ -595,22 +601,17 @@ local function terminate_active_graph()
   })
 end
 
--- ------------------------------------------------------------------
--- run-close watcher — clear active_run_id when the in-flight graph
--- finishes on its own
--- ------------------------------------------------------------------
-
+-- Run-close watcher — clear active_run_id when the in-flight graph
+-- finishes on its own.
 local function maybe_clear_active_run(run_id)
   if state.active_run_id ~= nil and state.active_run_id == run_id then
     state.active_run_id = nil
   end
 end
 
--- ------------------------------------------------------------------
 -- tools.advertise on first <gate>.hello (best-effort; the actor still
 -- works without the gate being up — tests drive tool.invoke envelopes
--- synthetically)
--- ------------------------------------------------------------------
+-- synthetically).
 
 local advertised = false
 
@@ -671,10 +672,6 @@ local function advertise_tools(gate_name)
   })
 end
 
--- ------------------------------------------------------------------
--- bus dispatcher — invoked from receive_msg
--- ------------------------------------------------------------------
-
 local TOOL_HANDLERS = {
   ["dispatch-graph"]  = dispatch_graph,
   ["write-review"]    = submit_plan,
@@ -692,10 +689,6 @@ local function handle_tool_invoke(body)
   end
   handler(firing_id, body.args or {})
 end
-
--- ------------------------------------------------------------------
--- receive_msg
--- ------------------------------------------------------------------
 
 local function receive_msg(entry)
   if entry.origin == "step" and entry.target ~= nil then return end
@@ -779,19 +772,12 @@ local function receive_msg(entry)
   end
 end
 
--- ------------------------------------------------------------------
--- bus subscriptions — session_end + replay markers
--- ------------------------------------------------------------------
-
+-- Bus subscriptions — session_end + replay markers.
 if nefor.bus and nefor.bus.on_event then
   nefor.bus.on_event("sessions.session_end", function(_entry)
     terminate_active_graph()
   end)
 end
-
--- ------------------------------------------------------------------
--- module table
--- ------------------------------------------------------------------
 
 return {
   name        = "lead-workflow",

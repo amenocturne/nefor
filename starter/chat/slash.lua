@@ -44,9 +44,7 @@ function M.parse(text)
   return cmd, (rest ~= "" and rest or nil), has_ws
 end
 
-------------------------------------------------------------------------
--- @-path filesystem source
-------------------------------------------------------------------------
+-- @-path filesystem source.
 -- The user types `@<path>` mid-message; the prompt widget routes
 -- per-keystroke trigger detection + Tab application, this module
 -- supplies the directory listing + filter:

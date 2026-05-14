@@ -350,21 +350,6 @@ local run_reasoner          = require("reasoners.run")
 local run_wrappers_reasoner = require("reasoners.run-wrappers")
 local loop_counter_reasoner = require("reasoners.loop_counter")
 
--- agent reasoner (lead workflow keystone) — self-contained module.
--- Lazy-required on first dispatch to avoid circular import at module load.
-local agent_reasoner
-
-local function agent_handle(body)
-  if agent_reasoner == nil then
-    agent_reasoner = require("reasoners.agent")
-  end
-  return agent_reasoner.handle(body)
-end
-
-local run_reasoner          = require("reasoners.run")
-local run_wrappers_reasoner = require("reasoners.run-wrappers")
-local loop_counter_reasoner = require("reasoners.loop_counter")
-
 local handlers = {
   ["provider-wrapper"] = function(body) return provider_run_node("provider-wrapper", body) end,
   ["responder"]        = function(body) return provider_run_node("responder", body) end,

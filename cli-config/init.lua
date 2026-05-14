@@ -9,8 +9,6 @@
 -- Run:
 --   ./target/debug/nefor --config cli-config/ plugin agentic-cli "your prompt"
 --   NEFOR_CONFIG=test ./target/debug/nefor --config cli-config/ plugin agentic-cli "..."
--- (USE_MOCK_PROVIDER=true is still honored as a deprecated alias for
---  NEFOR_CONFIG=test — see cli-config/config.lua.)
 
 local CONFIG_ROOT = NEFOR_CONFIG_DIR or "."
 
@@ -104,42 +102,19 @@ sessions.init()
 local agentic_cli = require("cli")
 
 -- ------------------------------------------------------------------
--- Provider selection — driven by config.lua (cfg.provider + cfg.plugins).
+-- Plugin spawn order (mirrors starter/init.lua minus chat/tui).
 -- ------------------------------------------------------------------
 
-local PROVIDER_NAME  = cfg.provider.name
-local PROVIDER_MODEL = cfg.provider.model
-local provider_chain, provider_command
+require("libs.generic-provider").declare()
+require("libs.generic-tool").declare()
 
-if cfg.plugins.spawn_mock then
-  provider_chain = agentic_workflow.for_provider(PROVIDER_NAME)
-  provider_command = {
-    bin("mock-plugin"),
-    "--script", STARTER_ROOT .. "/" .. cfg.provider.mock_script,
-  }
-else
-  provider_chain = agentic_workflow.for_provider(PROVIDER_NAME, {
-    static_token = cfg.provider.static_token,
-  })
-  provider_command = {
-    bin("openai-provider"),
-    "--name",     PROVIDER_NAME,
-    "--base-url", cfg.provider.base_url,
-  }
-  if PROVIDER_MODEL then
-    table.insert(provider_command, "--model")
-    table.insert(provider_command, PROVIDER_MODEL)
-  end
-  for _, a in ipairs(cfg.provider.extra_args or {}) do
-    table.insert(provider_command, a)
-  end
-end
+actor.spawn(require("compositors.combinators"))
 
--- ------------------------------------------------------------------
--- Orchestrator setup — same prompt as starter/init.lua.
--- ------------------------------------------------------------------
-
-local ORCHESTRATOR_SYSTEM_PROMPT = [[
+local agentic_loop = require("agentic-loop")
+agentic_loop.configure {
+  provider = cfg.provider.name,
+  model    = cfg.provider.model,
+  system   = [[
 You are a helpful assistant. Use the `spawn_graph` tool for parallel decomposition tasks (multiple independent sub-questions to combine).
 
 Graph schema:
@@ -192,8 +167,9 @@ else
   ))
 end
 
-actor.spawn(require("reasoner-graph").spawn_spec({ require("config").bin("reasoner-graph") }))
+actor.spawn(require("compositors.graph").spawn_spec({ require("config").bin("reasoner-graph") }))
 
+local tools = require("compositors.tools")
 local tool_gate_argv = { require("config").bin("tool-gate") }
 for _, t in ipairs(cfg.tool_gate.prompt_tools or {}) do
   tool_gate_argv[#tool_gate_argv + 1] = "--prompt"
@@ -202,11 +178,7 @@ end
 tool_gate_argv[#tool_gate_argv + 1] = "--default"
 tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
 
-ncp.spawn {
-  name        = "tool-gate",
-  command     = tool_gate_argv,
-  from_plugin = agentic_workflow.for_tool_gate("tool-gate").from_plugin,
-}
+actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
 
 actor.spawn(tools.basic_actor_spec())
 

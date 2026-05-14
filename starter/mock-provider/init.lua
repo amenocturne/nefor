@@ -1,9 +1,9 @@
--- starter/mock_provider.lua — script for mock-plugin to impersonate an
--- openai-provider for deterministic smoke testing of the spawn_graph
--- pipeline AND a self-documenting interactive test machine for
--- developers who launch `nefor --config ./starter`. Spawns alongside
--- the openai-provider/ollama instance unconditionally; both register
--- on the bus and show up in the /model picker (see config.lua).
+-- starter/mock-provider/init.lua — script for mock-plugin to
+-- impersonate an openai-provider for deterministic smoke testing of
+-- the spawn_graph pipeline AND a self-documenting interactive test
+-- machine for developers who launch `nefor --config ./starter`. Spawns
+-- alongside the openai-provider/ollama instance unconditionally; both
+-- register on the bus and show up in the /model picker.
 --
 -- Speaks the same wire shape as openai-provider:
 --   <name>.chat.create  { chat_id, model? }
@@ -31,7 +31,7 @@
 --      text since the canonical prompt matches both).
 --   3. Sub-graph canned text (responder nodes inside the spawn_graph
 --      run — Summarise octopuses / lighthouses / Combine paragraph).
---   4. SLOW_STREAM_REGRESSION_ marker — Bug 1 watchdog regression hook.
+--   4. SLOW_STREAM_REGRESSION_ marker — long-stream watchdog regression hook.
 --   5. Interactive triggers (read readme, cwd/pwd, secret key memory,
 --      list files, count to N, think out loud, fail).
 --   6. Help fallback — the banner-prefixed help block is also what
@@ -190,10 +190,6 @@ local HELP_BODY = table.concat({
 }, "\n")
 
 local HELP_TEXT = MOCK_PROVIDER_BANNER .. "\n" .. HELP_BODY
-
--- ------------------------------------------------------------------
--- helpers
--- ------------------------------------------------------------------
 
 -- UTF-8-safe truncate: returns `s` truncated to at most `n` codepoints.
 -- `string.sub` is byte-indexed; slicing inside a multibyte codepoint
@@ -402,11 +398,9 @@ local function pick_response_for(chat_id)
     end
   end
 
-  -- ----------------------------------------------------------------
-  -- 4. SLOW_STREAM_REGRESSION_ — Bug 1 watchdog regression hook
-  --    (commit 0941531). Triggered by the literal substring; mock
-  --    blocks for ~1.2s before emitting.
-  -- ----------------------------------------------------------------
+  -- SLOW_STREAM_REGRESSION_ marker: triggered by the literal
+  -- substring; mock blocks for ~1.2s before emitting. Long-stream
+  -- watchdog regression hook for the agentic-cli timeout path.
   if string.find(last_user, "SLOW_STREAM_REGRESSION_") then
     -- Coarse sleep — `os.execute` is fine because the mock already
     -- runs in its own subprocess.
@@ -601,11 +595,8 @@ local CANNED_REASONING_CHUNKS = {
 -- at 20ms intervals. Slower than instant so streaming reads as live
 -- output instead of paste; faster than 80 tok/s so it doesn't become
 -- the dominant cost of an interactive turn.
--- `os.execute("sleep …")` spawns a sleep subprocess per chunk; cheap
--- enough at this rate (~20/sec) and the mock has no other concurrent
--- work to do while a stream is in flight.
 local STREAM_CHUNK_CODEPOINTS = 16
-local STREAM_PACE_SECONDS     = 0.02
+local STREAM_PACE_MS          = 20
 
 -- Skip pacing under tests — agentic_cli_mock_e2e fires several
 -- scenarios with a 10s wall-clock cap and the long-stream regression
@@ -617,11 +608,25 @@ local function pacing_enabled()
   return not (v == "1" or v == "true")
 end
 
+-- Yield-style pace: `nefor.sleep` is a tokio timer awaited from inside
+-- the host's async task, so the runtime can poll *other* dispatch tasks
+-- (notably the in-flight `<NAME>.interrupt` handler that sets the
+-- per-chat cancel flag) while we're paused between chunks. Earlier shape
+-- used `os.execute("sleep …")`, which spawns a blocking subprocess and
+-- holds the Lua coroutine; the dispatch loop still couldn't deliver an
+-- interrupt mid-stream, so /cancel only landed after the canned text
+-- finished — visible bug.
 local function pace()
   if pacing_enabled() then
-    os.execute("sleep " .. tostring(STREAM_PACE_SECONDS))
+    nefor.sleep(STREAM_PACE_MS)
   end
 end
+
+-- Per-chat interrupt flag. Set by the `<NAME>.interrupt` handler when an
+-- envelope lands during a stream; the streaming loops check it on every
+-- chunk boundary and break early. Keyed by chat_id so concurrent chats
+-- (one per active spawn_graph node) don't mistakenly cancel each other.
+local interrupted = {}
 
 local function emit_reasoning(chat_id, id)
   -- Emit reasoning chunks ahead of the content stream, then a
@@ -629,6 +634,7 @@ local function emit_reasoning(chat_id, id)
   -- openai-provider does on a real Qwen 3 turn.
   local full = ""
   for i, chunk in ipairs(CANNED_REASONING_CHUNKS) do
+    if interrupted[chat_id] then return false end
     full = full .. chunk
     nefor.emit("stream.reasoning_delta", {
       id      = id,
@@ -759,7 +765,7 @@ nefor.on(NAME .. ".chat.complete", function(body)
     resp.tool_calls and #resp.tool_calls or 0))
 
   -- Error branch: emit `<name>.chat.error` and skip the result wire.
-  -- The wrapper actor (starter/openai-provider/init.lua) translates
+  -- The wrapper actor (starter/wrappers/openai-provider.lua) translates
   -- chat.error into `tool.result { error }` for the agentic-loop's
   -- run-error path, which is the rendering target the brief asks for.
   if resp.finish_reason == "error" then
@@ -907,6 +913,30 @@ end)
 -- `<NAME>.models.list_requested`. We answer with a single-model list.
 nefor.on(NAME .. ".models.list_requested", function(_body)
   nefor.emit("models.listed", { models = { "mock-model" } })
+end)
+
+-- Debug-only history snapshot. Used by integration tests (and ad-hoc
+-- diagnostics) to peek at the per-chat messages table without
+-- re-driving a full chat.complete cycle. The production chat path
+-- doesn't depend on it; nothing on the bus emits or subscribes to
+-- `<NAME>.debug.history.*` outside of test harnesses.
+nefor.on(NAME .. ".debug.history.dump", function(body)
+  local chat_id = body and body.chat_id
+  if type(chat_id) ~= "string" then return end
+  local history = chats[chat_id] or {}
+  local snapshot = {}
+  for i, m in ipairs(history) do
+    snapshot[i] = {
+      role         = m.role,
+      content      = m.content,
+      tool_call_id = m.tool_call_id,
+      tool_calls   = m.tool_calls,
+    }
+  end
+  nefor.emit("debug.history.result", {
+    chat_id  = chat_id,
+    messages = snapshot,
+  })
 end)
 
 -- /model <name> selection. Mock has only one model; whatever model the

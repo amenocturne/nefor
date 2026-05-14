@@ -61,8 +61,8 @@
 
 local json = nefor.json
 
-local envelope      = require("lib.envelope")
-local replay_window = require("lib.replay_window")
+local envelope      = require("core.envelope")
+local replay_window = require("core.history_replay")
 
 local emit_as = envelope.emit_as
 local emit    = envelope.emit
@@ -73,10 +73,8 @@ local M = {}
 -- tool_to_firing[tool_id] = firing_id
 local tool_to_firing = {}
 
--- ------------------------------------------------------------------
--- bash output parser
--- ------------------------------------------------------------------
-
+-- Bash output parser.
+--
 -- Split the bash plugin's combined output into { stdout, stderr,
 -- exit_code }. Exit footer is always present; "[stderr]" marker is
 -- only present when stderr was non-empty.
@@ -109,9 +107,7 @@ local function parse_bash_output(text)
   return { stdout = stdout, stderr = stderr, exit_code = exit_code }
 end
 
--- ------------------------------------------------------------------
--- dispatch handler — called from reasoners/init.lua
--- ------------------------------------------------------------------
+-- Dispatch handler — called from reasoners/init.lua.
 
 -- Returns nil on accept (reply lands later via the bus), or a string
 -- error to synth-fail the firing.
@@ -141,9 +137,7 @@ end
 
 M.handle = handle
 
--- ------------------------------------------------------------------
--- bus event handler — tool.result correlation by tool_id
--- ------------------------------------------------------------------
+-- Bus event handler — tool.result correlation by tool_id.
 
 local function on_tool_result(body)
   local tool_id = body.id
@@ -205,10 +199,6 @@ local function receive_msg(entry)
 end
 
 M.receive_msg = receive_msg
-
--- ------------------------------------------------------------------
--- test escape hatch
--- ------------------------------------------------------------------
 
 M._internals = {
   tool_to_firing  = tool_to_firing,

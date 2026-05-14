@@ -28,7 +28,7 @@ local envelope        = require("core.envelope")
 local ids             = require("core.ids")
 local results_lib     = require("agentic-loop.results")
 local topology        = require("agentic-loop.topology")
-local spawn_graph     = require("reasoner-graph.spawn_graph")
+local spawn_graph     = require("libs.spawn-graph")
 local history_replay  = require("core.history_replay")
 local session_config  = require("agentic-loop.session_config")
 local generic_provider = require("libs.generic-provider")
@@ -131,12 +131,15 @@ end
 local function submit_orchestrator_run(user_text)
   if state.current_run_id ~= nil then return nil end
 
-  local g = graph_lib.build_orchestrator_graph({
+  local g = topology.build_orchestrator_graph({
     provider       = state.config.provider,
     model          = state.config.model,
     system         = state.config.system,
     user_text      = user_text or "",
     tool_allowlist = state.config.tool_allowlist,
+    provider_out   = generic_provider.PROVIDER_OUT,
+    final_answer   = generic_provider.FINAL_ANSWER,
+    tool_calls     = generic_tool.TOOL_CALLS,
   })
 
   if type(state.current_state) == "table"
@@ -187,7 +190,7 @@ local function flush_pending_user_inputs()
   submit_orchestrator_run(text)
 end
 
--- Cancel everything. D-32 fan-out order:
+-- Cancel everything. Fan-out order:
 --   (1) cancel current orchestrator run + interrupt the in-flight
 --       provider stream so deltas stop spilling
 --   (2) cancel sub-graph runs + clear queued dispatches
@@ -278,7 +281,7 @@ end
 -- A provider switch (different provider name) crosses a process
 -- boundary: the new provider's binary has no per-chat_id history
 -- table for the active chat. Without rebuild the model would reply
--- with no memory of prior turns (Bug B2). We rebuild by walking the
+-- with no memory of prior turns. We rebuild by walking the
 -- on-disk session log for the prior chat's `<old>.chat.{create,append}`
 -- + wrap-firing tool.result envelopes and re-emitting them as
 -- `<new>.chat.{create,append}` against a fresh chat_id under the new
@@ -292,8 +295,8 @@ end
 --
 -- If the session log is unavailable (no path, open failure, no prior
 -- chat.create matching the chat_id), we fall back to clearing
--- current_state — the legacy behaviour. User loses prior context but
--- the chat stays consistent.
+-- current_state — user loses prior context but the chat stays
+-- consistent.
 local function set_model(provider, model)
   local prior_provider = state.config.provider
   local prior_chat_id  =
@@ -761,7 +764,6 @@ local function stream_visible(chat_id)
   return state.chat_id_stream_visible[chat_id] == true
 end
 
--- ------------------------------------------------------------------
 -- Per-chat stream-visibility registration for chats the agentic-loop
 -- doesn't itself own (e.g. agent-reasoner sub-firings). The provider
 -- wrapper's gate normally requires both a pending entry AND
@@ -792,7 +794,7 @@ end
 
 -- Single-call gate the provider wrappers use on inbound stream events.
 -- True when EITHER (a) the chat has a tracked pending entry whose
--- reasoner type is not stream-visible (existing D-26 path), OR (b)
+-- reasoner type is not stream-visible, OR (b)
 -- the chat was explicitly registered hidden by an agent reasoner.
 local function stream_suppressed(chat_id)
   if type(chat_id) ~= "string" or chat_id == "" then return false end
@@ -943,12 +945,15 @@ function M.current_state() return state.current_state end
 -- Back-compat with agentic_workflow.build_template (used by tests).
 function M.build_template(user_text, opts)
   opts = opts or {}
-  return graph_lib.build_orchestrator_graph({
+  return topology.build_orchestrator_graph({
     provider       = opts.provider       or state.config.provider,
     model          = opts.model          or state.config.model,
     system         = opts.system         or state.config.system,
     user_text      = user_text or "",
     tool_allowlist = opts.tool_allowlist or state.config.tool_allowlist,
+    provider_out   = generic_provider.PROVIDER_OUT,
+    final_answer   = generic_provider.FINAL_ANSWER,
+    tool_calls     = generic_tool.TOOL_CALLS,
   })
 end
 
@@ -1017,7 +1022,7 @@ local function receive_msg(entry)
       -- with state.current_state==nil → no seed_chat_id → reasoners.lua
       -- mints a fresh chat-N → openai-provider's painstakingly-rebuilt
       -- history (on the OLD chat_id) is orphaned, model replies with no
-      -- memory of prior turns. (issue #38 follow-up to e831dd9.)
+      -- memory of prior turns.
       local result = body.result
       if type(result) == "table" and type(result.next_state) == "table" then
         local cid = result.next_state.chat_id

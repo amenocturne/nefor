@@ -20,12 +20,12 @@ local CURSOR_ROW_STYLE = common.CURSOR_ROW_STYLE
 
 local M = {}
 
--- Spec section 6: pre-first-delta placeholder is `[thinking... Ns]`,
--- static (no spinner) but with per-second elapsed counter. We
--- piggyback on tui.animation for its frame-rate side effect — it
--- keeps the render loop alive at ~1Hz so the counter advances even
--- without inbound events — but render zero-width frames, so visually
--- there's no spinner.
+-- Pre-first-delta placeholder is `[thinking... Ns]`, static (no
+-- spinner) but with per-second elapsed counter. We piggyback on
+-- tui.animation for its frame-rate side effect — it keeps the render
+-- loop alive at ~1Hz so the counter advances even without inbound
+-- events — but render zero-width frames, so visually there's no
+-- spinner.
 local THINKING_TICK_FRAMES = { "", "" }
 
 local function thinking_widget(state)

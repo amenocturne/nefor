@@ -57,7 +57,7 @@
 --
 -- ## Usage
 --
---   local history_replay = require("lib.history_replay")
+--   local history_replay = require("core.history_replay")
 --   local count = history_replay.replay_chat_history {
 --     path             = sessions.current_path(),
 --     src_prefix       = "mock-plugin",
@@ -68,7 +68,7 @@
 --   }
 
 local json     = nefor.json
-local envelope = require("lib.envelope")
+local envelope = require("core.envelope")
 
 local M = {}
 

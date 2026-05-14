@@ -212,17 +212,24 @@ async fn echo_script_mirrors_events_back() {
 /// can run for a long time (paced canned text); the wrapper translates
 /// `chat.interrupt` to `<NAME>.interrupt`, and the handler is expected
 /// to flip a per-chat flag the streaming loop checks. The fix has two
-/// halves: (a) `main::run_dispatch_loop` spawns each dispatch as its own
-/// tokio task so the loop itself never blocks on an in-flight handler;
-/// (b) the streaming script uses `nefor.sleep` (yields the runtime) and
-/// checks the flag between chunks. This test exercises both.
+/// halves: (a) `main::run_dispatch_loop` spawns each `chat.complete`
+/// dispatch as its own tokio task so the loop itself never blocks on
+/// an in-flight stream; (b) the streaming script uses `nefor.sleep`
+/// (yields the runtime) and checks the flag between chunks. This test
+/// exercises both.
+///
+/// The script uses a `*.chat.complete`-shaped kind because that's the
+/// kind the dispatch loop spawns for. Non-streaming kinds dispatch
+/// inline post batch-protocol refactor (so back-to-back deliveries of
+/// `chat.create` + `chat.append` + `chat.complete` from the engine's
+/// batched fan-out keep deterministic ordering).
 #[tokio::test]
 async fn interrupt_envelope_breaks_streaming_loop_at_next_sleep_yield() {
     let script = temp_script(
         "interrupt-mid-stream",
         r#"
         local interrupted = false
-        nefor.on("peer.start", function()
+        nefor.on("peer.chat.complete", function()
             for i = 1, 50 do
                 if interrupted then
                     nefor.emit("stopped", { at = i })
@@ -248,7 +255,7 @@ async fn interrupt_envelope_breaks_streaming_loop_at_next_sleep_yield() {
 
     // Kick off the slow loop.
     let mut start_body = serde_json::Map::new();
-    start_body.insert("kind".into(), serde_json::Value::String("peer.start".into()));
+    start_body.insert("kind".into(), serde_json::Value::String("peer.chat.complete".into()));
     let start = Envelope::event(
         PluginName::new("peer").expect("valid"),
         Timestamp::now(),
@@ -376,7 +383,7 @@ async fn interrupt_mid_stream_persists_partial_assistant_text_to_history() {
         .expect("plugins/")
         .parent()
         .expect("repo root")
-        .join("starter/mock_provider.lua");
+        .join("starter/mock-provider/init.lua");
     assert!(
         script_path.exists(),
         "production mock_provider.lua not found at {script_path:?}",

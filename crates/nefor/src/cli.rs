@@ -2,7 +2,7 @@
 //!
 //! Two modes:
 //!
-//! - **TUI / standard mode** — `nefor` (no subcommand). Engine boots, spawns
+//! - **Serve mode** — `nefor` (no subcommand). Engine boots, spawns
 //!   plugins per `init.lua`, runs the broker until shutdown.
 //! - **CLI dispatch mode** — `nefor plugin [<name> [args...]]`. Engine still
 //!   boots normally (so the spawn registry populates), then either lists the
@@ -19,7 +19,11 @@ use clap::{Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(
     name = "nefor",
-    version,
+    // Embedded by build.rs: prefer `git describe --tags --always --dirty`
+    // (so tagged builds report `0.1.5`, between-tag builds report
+    // `0.1.5-12-gabcdef`, builds with local changes report `…-dirty`).
+    // Falls back to CARGO_PKG_VERSION when no git context is available.
+    version = env!("NEFOR_VERSION"),
     about = "nefor — Lua-composable agent runtime (plugin broker on top of nefor-combinators).",
     long_about = "nefor is a plugin broker for composing agent runtimes. The binary ships voiceless — \
                   providers, harnesses, DAG orchestration, personas, UIs, and statusline \
@@ -44,8 +48,8 @@ pub struct Cli {
     #[arg(long, value_name = "DIR", global = true)]
     pub plugin_dir: Option<PathBuf>,
 
-    /// Optional subcommand. When omitted, the engine runs in TUI / standard
-    /// mode (boot init.lua, spawn plugins, broker). When present, see
+    /// Optional subcommand. When omitted, the engine runs in serve mode
+    /// (boot init.lua, spawn plugins, broker). When present, see
     /// [`Command`].
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -76,7 +80,7 @@ pub use crate::lua::mode::EngineMode;
 /// Derive the engine mode from a parsed [`Cli`].
 pub fn engine_mode_from_cli(cli: &Cli) -> EngineMode {
     match &cli.command {
-        None => EngineMode::Tui,
+        None => EngineMode::Serve,
         Some(Command::Plugin { name: None, .. }) => EngineMode::PluginList,
         Some(Command::Plugin {
             name: Some(name),
@@ -99,10 +103,10 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn no_subcommand_is_tui_mode() {
+    fn no_subcommand_is_serve_mode() {
         let cli = Cli::try_parse_from(["nefor"]).expect("parse ok");
         assert!(cli.command.is_none());
-        assert!(matches!(engine_mode_from_cli(&cli), EngineMode::Tui));
+        assert!(matches!(engine_mode_from_cli(&cli), EngineMode::Serve));
     }
 
     #[test]

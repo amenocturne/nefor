@@ -2893,11 +2893,7 @@ mod tests {
         let rows = wrap_text("abcdefghij", 4, WrapMode::Word);
         assert_eq!(
             rows,
-            vec![
-                "abcd".to_string(),
-                "efgh".to_string(),
-                "ij".to_string(),
-            ]
+            vec!["abcd".to_string(), "efgh".to_string(), "ij".to_string(),]
         );
     }
 

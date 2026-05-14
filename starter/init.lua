@@ -184,7 +184,7 @@ agentic_loop.configure {
   -- Restrict the lead's chat catalog to the orchestration-tool surface.
   -- Without this filter the lead sees every wire-advertised tool — most
   -- problematically `spawn_graph` (the reasoner-graph internal that
-  -- `dispatch-graph` translates into) — and can call them directly,
+  -- `dispatch-graph` translates into) — and could call them directly,
   -- bypassing the role-keyed sub-agent contract and bottoming out in
   -- `reasoner '<role>' not connected` runtime errors. The agent
   -- reasoner already enforces a per-role allowlist on its sub-firings
@@ -195,15 +195,12 @@ agentic_loop.configure {
 actor.spawn(agentic_loop)
 actor.spawn(require("reasoners"))
 
--------------------------------------------------------------------------
--- 3b. Providers — every entry in cfg.providers is spawned. The picker
---     aggregates connected providers via auth.status; no hard-coded
---     test/prod switch.
--------------------------------------------------------------------------
-
+local provider = require("compositors.provider")
 for _, p in ipairs(cfg.providers or {}) do
   if p.kind == "mock" then
-    actor.spawn(require("mock-plugin").spawn_spec(
+    -- mock-plugin speaks the same wire protocol as the openai-provider
+    -- binary, so the same actor spec works — only the binary differs.
+    actor.spawn(provider.spawn_spec(
       p.name,
       {
         require("config").bin("mock-plugin"),
@@ -223,7 +220,7 @@ for _, p in ipairs(cfg.providers or {}) do
     for _, a in ipairs(p.extra_args or {}) do
       table.insert(provider_command, a)
     end
-    actor.spawn(require("openai-provider").spawn_spec(
+    actor.spawn(provider.spawn_spec(
       p.name,
       provider_command,
       { static_token = p.static_token }
@@ -235,61 +232,11 @@ end
 
 actor.spawn(require("compositors.graph").spawn_spec({ require("config").bin("reasoner-graph") }))
 
-ncp.spawn {
-  name    = "nefor-combinators",
-  command = { bin("nefor-combinators") },
-}
-
-ncp.spawn {
-  name    = "generic-provider",
-  command = { bin("generic-provider") },
-}
-
-ncp.spawn {
-  name    = "generic-tool",
-  command = { bin("generic-tool") },
-}
-
--------------------------------------------------------------------------
--- 4b. Provider — selected by config.lua (prod = openai-provider, test = mock).
--------------------------------------------------------------------------
---
--- The `prod` table runs openai-provider against the configured base_url
--- (Ollama by default). The `test` table runs mock-plugin loading
--- `mock_provider.lua` for deterministic smoke / e2e tests. Both emit
--- the same `<name>.chat.*` / `<name>.stream.*` envelope shape so the
--- rest of the composition is provider-agnostic.
---
--- The `static_token=ollama-local` trick on prod unlocks openai-provider's
--- auth gate without a real key (required for local Ollama). Real remote
--- providers would supply an --api-key CLI arg via provider.extra_args.
-
-local PROVIDER_NAME  = cfg.provider.name
-local PROVIDER_MODEL = cfg.provider.model
-local provider_chain, provider_command
-
-if cfg.plugins.spawn_mock then
-  provider_chain = agentic_workflow.for_provider(PROVIDER_NAME)
-  provider_command = {
-    bin("mock-plugin"),
-    "--script", STARTER_ROOT .. "/" .. cfg.provider.mock_script,
-  }
-else
-  provider_chain = agentic_workflow.for_provider(PROVIDER_NAME, {
-    static_token = cfg.provider.static_token,
-  })
-  provider_command = {
-    bin("openai-provider"),
-    "--name",     PROVIDER_NAME,
-    "--base-url", cfg.provider.base_url,
-  }
-  if PROVIDER_MODEL then
-    table.insert(provider_command, "--model")
-    table.insert(provider_command, PROVIDER_MODEL)
-  end
-  for _, a in ipairs(cfg.provider.extra_args or {}) do
-    table.insert(provider_command, a)
-  end
+local tools = require("compositors.tools")
+local tool_gate_argv = { require("config").bin("tool-gate") }
+for _, t in ipairs(cfg.tool_gate.prompt_tools or {}) do
+  tool_gate_argv[#tool_gate_argv + 1] = "--prompt"
+  tool_gate_argv[#tool_gate_argv + 1] = t
 end
 tool_gate_argv[#tool_gate_argv + 1] = "--default"
 tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action

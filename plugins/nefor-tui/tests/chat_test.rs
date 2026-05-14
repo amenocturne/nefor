@@ -18,7 +18,7 @@ use nefor_tui::mouse::{MouseKind, MouseMessage};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 
 /// Per-process tempdir kept alive for the lifetime of `cargo test` and
-/// pointed at by `NEFOR_DATA_HOME` on first access. Ensures chat.lua's
+/// pointed at by `NEFOR_DATA_DIR` on first access. Ensures chat.lua's
 /// `load_input_history` (issue #39) reads from / writes to a clean
 /// throwaway path instead of the developer's `$HOME/.local/share/
 /// nefor/input-history` — without this, parallel test runs would
@@ -38,8 +38,8 @@ fn ensure_test_data_home() {
     // runs only once. Subsequent ResumeEnv-style overrides save +
     // restore around their scope, so this default is what they read
     // at construction time and what they restore on Drop.
-    if std::env::var_os("NEFOR_DATA_HOME").is_none() {
-        std::env::set_var("NEFOR_DATA_HOME", dir.path());
+    if std::env::var_os("NEFOR_DATA_DIR").is_none() {
+        std::env::set_var("NEFOR_DATA_DIR", dir.path());
     }
 }
 
@@ -49,7 +49,7 @@ fn chat_lua_source() -> String {
     // real `$HOME/.local/share/nefor`. Centralised here because every
     // chat-surface test reads this function — no per-test wiring.
     ensure_test_data_home();
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
         .expect("repo root")
@@ -74,7 +74,7 @@ fn chat_lua_source() -> String {
     if std::env::var_os("NEFOR_STARTER_CHAT_DIR").is_none() {
         std::env::set_var("NEFOR_STARTER_CHAT_DIR", &chat_subdir);
     }
-    let chat_path = repo_root.join("starter").join("chat.lua");
+    let chat_path = repo_root.join("starter").join("chat").join("init.lua");
     std::fs::read_to_string(&chat_path).unwrap_or_else(|e| panic!("read {:?}: {e}", chat_path))
 }
 
@@ -4422,12 +4422,12 @@ fn slash_clear_is_alias_for_slash_new() {
 // ── persistent input history (issue #39) ────────────────────────────
 //
 // Like shell history: a submit on session A writes the prompt to
-// `<NEFOR_DATA_HOME>/input-history`; a fresh nefor process (session B)
+// `<NEFOR_DATA_DIR>/input-history`; a fresh nefor process (session B)
 // reads it back at init so arrow-up recalls it. Cap is INPUT_HISTORY_MAX
 // (50) — pushing the 51st entry rolls the oldest off the disk file
 // the next time we trim.
 //
-// Reuses the `ResumeEnv` harness above for tempdir + NEFOR_DATA_HOME
+// Reuses the `ResumeEnv` harness above for tempdir + NEFOR_DATA_DIR
 // isolation. Each test scopes its own env so the file lives in a
 // per-test tmp dir and tests don't race over the shared XDG path.
 
@@ -4471,7 +4471,7 @@ fn submit_persists_input_history_to_disk_for_next_session() {
         "input-history must hold both submits, newest first"
     );
 
-    // Session B: a fresh engine on the same NEFOR_DATA_HOME hydrates
+    // Session B: a fresh engine on the same NEFOR_DATA_DIR hydrates
     // its `prompt_history` from disk. Arrow-up on the empty input
     // recalls the most-recent ("world") on the first press.
     let mut engine_b = Engine::new(80, 24).expect("engine B");

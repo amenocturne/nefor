@@ -1,4 +1,5 @@
--- starter/lead_role.lua — lead-workflow role configs for the starter.
+-- starter/lead-workflow/role.lua — lead-workflow role configs for the
+-- starter.
 --
 -- Loads each `prompts/<role>.md` at module-load time and exposes:
 --
@@ -7,29 +8,28 @@
 --                           { system_prompt, model, tool_allowlist }.
 --   * ORCHESTRATION_TOOLS — list of tool names the lead has access to.
 --
--- The team port (`nefor-team`) replaces this file with a richer version
--- that adds more roles, work-specific phrasing, and per-role model
--- pinning. The starter version ships a deliberately small surface
--- (lead + explorer + builder + reviewer) so the public starter runs
--- cleanly against the mock and ollama providers without dragging in
+-- The team port (`nefor-team`) replaces this file with a richer
+-- version that adds more roles, work-specific phrasing, and per-role
+-- model pinning. The starter ships a deliberately small surface (lead
+-- + explorer + builder + reviewer) so the public starter runs cleanly
+-- against the mock and ollama providers without dragging in
 -- team-specific tooling references.
 --
 -- `model = nil` on every role lets the agent reasoner fall back to
--- `state.config.model` (set via `agentic_loop.configure`). Team's
--- override version pins per-role models.
+-- `state.config.model` (set via `agentic_loop.configure`).
 --
--- Prompts are read from disk rather than embedded as Lua string literals
--- because long strings inside Lua are painful (escaping, no syntax
--- highlighting in editors, no clean diffs). Per spec §3.4.
+-- Prompts are read from disk rather than embedded as Lua string
+-- literals because long strings inside Lua are painful (escaping, no
+-- syntax highlighting in editors, no clean diffs).
 
 local M = {}
 
 -- Resolve the starter root the same way the rest of the starter does:
 -- `NEFOR_CONFIG_DIR` is the canonical global the engine sets to the
--- directory containing `init.lua` (`crates/nefor/src/lua/vm.rs:172`).
--- For tests that load the module directly without booting the full
--- engine, `package.path` is set so `require` can find `lead_role.lua`,
--- and the test rig sets `NEFOR_CONFIG_DIR` to the starter dir.
+-- directory containing `init.lua`. For tests that load the module
+-- directly without booting the full engine, `package.path` is set so
+-- `require("lead-workflow.role")` resolves, and the test rig sets
+-- `NEFOR_CONFIG_DIR` to the starter dir.
 local STARTER_ROOT = (rawget(_G, "NEFOR_CONFIG_DIR") or ".")
 local PROMPTS_DIR = STARTER_ROOT .. "/prompts"
 
@@ -40,12 +40,12 @@ local function read_prompt(name)
   local path = PROMPTS_DIR .. "/" .. name .. ".md"
   local f, err = io.open(path, "r")
   if not f then
-    return nil, "lead_role: cannot open " .. path .. ": " .. tostring(err)
+    return nil, "lead-workflow.role: cannot open " .. path .. ": " .. tostring(err)
   end
   local content = f:read("*a")
   f:close()
   if not content or content == "" then
-    return nil, "lead_role: empty prompt at " .. path
+    return nil, "lead-workflow.role: empty prompt at " .. path
   end
   return content
 end
@@ -58,7 +58,7 @@ end
 local function load_or_placeholder(name)
   local content, err = read_prompt(name)
   if content then return content end
-  return "[lead_role: prompt '" .. name .. "' missing — " .. tostring(err) .. "]"
+  return "[lead-workflow.role: prompt '" .. name .. "' missing — " .. tostring(err) .. "]"
 end
 
 M.LEAD_SYSTEM_PROMPT = load_or_placeholder("lead")

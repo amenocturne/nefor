@@ -1,42 +1,26 @@
--- starter/lib/session_config.lua — derive a session's active
+-- starter/agentic-loop/session_config.lua — derive a session's active
 -- (provider, model) from its on-disk jsonl.
 --
--- ## Why
---
 -- The active provider/model lives in agentic-loop's `state.config`,
--- which is mutated by `/model` slash-commands at runtime. This config
--- is NOT persisted as a session-header field — it gets reconstructed
--- across `/resume` by walking the recorded envelopes:
+-- mutated by `/model` at runtime. It is NOT persisted as a session-
+-- header field — `/resume` reconstructs it by walking recorded
+-- envelopes:
 --
---   * `chat.model.set { provider, model }` — explicit user-side switch
---     (the canonical envelope chat.lua emits when the user runs
---     `/model X`). Latest one wins.
+--   * `chat.model.set { provider, model }` — explicit user-side
+--     switch. Latest one wins.
 --   * `<prefix>.chat.create { chat_id, model }` — emitted by the
---     reasoners when a new chat starts. The prefix names the provider;
---     the body's `model` field captures whatever model the create rode
---     with. Default-provider sessions (no /model switch) rely on this
+--     reasoners when a new chat starts. The prefix names the provider.
+--     Default-provider sessions (no /model switch) rely on this
 --     fallback because there's no `chat.model.set` in their log.
 --
--- Without the restore, /resume after a /model switch in the LIVE
+-- Without the restore, /resume after a /model switch in the live
 -- session leaves `state.config.provider` pointing at the live-side
 -- selection while `state.current_state.chat_id` is restored to the
--- resumed session's chat — so the next live submit dispatches the
--- chat against a provider that doesn't own it ("chat 'X' not found").
---
--- ## Wire shape
---
--- A `<prefix>.chat.create` is recognised by the suffix `.chat.create`
--- on the body's `kind`. The provider name is the substring before that
--- suffix. (We can't enumerate "known providers" up-front — the wrapper
--- list is dynamic and the resumed session may name a provider not
--- currently loaded; the model-name restore still helps debug those
--- cases by surfacing the original provider clearly.)
---
--- ## Output
+-- resumed session's chat — so the next submit dispatches the chat
+-- against a provider that doesn't own it ("chat 'X' not found").
 --
 -- `read_active_model(path)` returns `{ provider, model }`. Either
--- field may be nil if the log doesn't carry that signal. Callers
--- decide whether to apply a partial result or fall through to defaults.
+-- field may be nil if the log doesn't carry that signal.
 
 local json = nefor.json
 

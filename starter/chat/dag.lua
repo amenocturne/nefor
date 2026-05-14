@@ -211,10 +211,6 @@ function M.vertical_separator()
   }
 end
 
-------------------------------------------------------------------------
--- state mutators
-------------------------------------------------------------------------
-
 local function apply(state, run_id, fn)
   local prev_runs = state.dag_runs or {}
   local new_runs = {}

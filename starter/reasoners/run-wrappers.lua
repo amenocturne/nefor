@@ -49,7 +49,7 @@
 -- carries `id = firing_id`, which closes the firing without further
 -- bookkeeping in this layer — no correlation map needed.
 
-local envelope = require("lib.envelope")
+local envelope = require("core.envelope")
 
 local emit_as = envelope.emit_as
 
@@ -75,10 +75,8 @@ local function resolve_command(name, registry)
   return nil
 end
 
--- ------------------------------------------------------------------
--- dispatch handler — called from reasoners/init.lua
--- ------------------------------------------------------------------
-
+-- Dispatch handler — called from reasoners/init.lua.
+--
 -- Returns nil on accept (reply lands later via the bus through `run`),
 -- or a string error to synth-fail the firing.
 local function handle(body)
@@ -112,10 +110,6 @@ local function handle(body)
 end
 
 M.handle = handle
-
--- ------------------------------------------------------------------
--- test escape hatch
--- ------------------------------------------------------------------
 
 M._internals = {
   default_registry = DEFAULT_REGISTRY,

@@ -8,6 +8,14 @@
 //! assert the binary saw the right re-fed `<prefix>.chat.create` /
 //! `<prefix>.chat.append` envelopes.
 //!
+//! Post batch-protocol refactor `to_plugin` takes a LIST of envelopes
+//! per invocation (`function to_plugin(envs) for _, env in ipairs(envs)
+//! do ... end end`). The Lua-side helpers below feed the wrapper a
+//! one-element list per "live" call to keep the per-envelope semantics
+//! these tests pin, and per-envelope the test sets `env.replay` to
+//! match what the framework would stamp inline as it walks
+//! `sessions.replay.*` framing.
+//!
 //! Why not e2e: the cross-process flow (kill nefor, start fresh, /resume)
 //! requires driving the engine binary across two process lifetimes plus
 //! a real provider binary. Pinning the contract at the wrapper boundary
@@ -20,12 +28,20 @@ use std::path::PathBuf;
 use mlua::{Function, Lua, Table, Value};
 
 fn starter_dir() -> PathBuf {
+    repo_root().join("starter")
+}
+
+fn lua_dir() -> PathBuf {
+    repo_root().join("lua")
+}
+
+fn repo_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest
         .parent()
         .and_then(|p| p.parent())
         .expect("repo root is two levels above crates/nefor")
-        .join("starter")
+        .to_path_buf()
 }
 
 /// Drive the wrapper's `to_plugin` callback for a sequence of replayed
@@ -54,10 +70,10 @@ fn replay_window_re_feeds_chat_history_into_provider_binary() {
     // just returns the spec table; we drive `to_plugin` directly.
     lua.load(
         r#"
-        local op = require("openai-provider")
+        local op = require("compositors.provider")
         local spec = op.spawn_spec("ollama", { "/bin/true" }, {})
         _to_plugin = spec.to_plugin
-        _replay = require("lib.replay_window")
+        _replay = require("core.history_replay")
         "#,
     )
     .exec()
@@ -65,11 +81,14 @@ fn replay_window_re_feeds_chat_history_into_provider_binary() {
 
     // Replay window open. Drive the recorded envelope sequence — these
     // are the shapes the bus log carries on disk after a normal turn.
+    // Batched signature: every call hands the wrapper a one-element list
+    // with `env.replay = true` (what the framework stamps when iterating
+    // a tail framed by sessions.replay.start/end).
     lua.load(
         r#"
         _replay.set(true)
         local function deliver_env(from, body)
-            _to_plugin({ type = "event", from = from, body = body })
+            _to_plugin({ { type = "event", from = from, body = body, replay = true } })
         end
 
         -- 1. Engine→provider chat.create (recorded with target=ollama).
@@ -178,49 +197,46 @@ fn cross_wrapper_isolation_unowned_chat_ids_drop() {
 
     lua.load(
         r#"
-        local op = require("openai-provider")
-        -- mock_provider chats live on this wrapper; ollama chats on the
-        -- other. The two wrappers don't share state.
+        local op = require("compositors.provider")
+        -- mock_provider chats and ollama chats use independent spawn_spec
+        -- instances; the two actor instances don't share state.
         _mock_to_plugin   = op.spawn_spec("mock-plugin", { "/bin/true" }, {}).to_plugin
         _ollama_to_plugin = op.spawn_spec("ollama",      { "/bin/true" }, {}).to_plugin
-        _replay = require("lib.replay_window")
+        _replay = require("core.history_replay")
         "#,
     )
     .exec()
-    .expect("spawn both wrappers");
+    .expect("spawn both provider instances");
 
     lua.load(
         r#"
         _replay.set(true)
-        local function fire(env)
-            _mock_to_plugin(env)
-            _ollama_to_plugin(env)
+        local function fire(body, from)
+            local envs = { { type = "event", from = from, body = body, replay = true } }
+            _mock_to_plugin(envs)
+            _ollama_to_plugin(envs)
         end
 
         -- Mock chat is created via mock-plugin.chat.create.
-        fire({ type = "event", from = "engine", body = {
-            kind = "mock-plugin.chat.create", chat_id = "chat-mock-1",
-        }})
-        fire({ type = "event", from = "engine", body = {
+        fire({ kind = "mock-plugin.chat.create", chat_id = "chat-mock-1" }, "engine")
+        fire({
             kind    = "mock-plugin.chat.append",
             chat_id = "chat-mock-1",
             message = { role = "user", content = "hi mock" },
-        }})
+        }, "engine")
         -- Ollama chat is created via ollama.chat.create.
-        fire({ type = "event", from = "engine", body = {
-            kind = "ollama.chat.create", chat_id = "chat-ollama-1",
-        }})
-        fire({ type = "event", from = "engine", body = {
+        fire({ kind = "ollama.chat.create", chat_id = "chat-ollama-1" }, "engine")
+        fire({
             kind    = "ollama.chat.append",
             chat_id = "chat-ollama-1",
             message = { role = "user", content = "hi ollama" },
-        }})
+        }, "engine")
         -- tool.result for the ollama chat. Only the ollama wrapper owns
         -- it; mock-plugin must drop.
-        fire({ type = "event", from = "provider-wrapper", body = {
+        fire({
             kind = "tool.result", id = "f1",
             result = { text = "ollama reply", next_state = { chat_id = "chat-ollama-1" } },
-        }})
+        }, "provider-wrapper")
 
         _replay.set(false)
         _delivered = _test.delivered()
@@ -307,21 +323,25 @@ fn in_process_resume_skips_duplicate_chat_create() {
 
     lua.load(
         r#"
-        local op = require("openai-provider")
+        local op = require("compositors.provider")
         _to_plugin = op.spawn_spec("ollama", { "/bin/true" }, {}).to_plugin
-        _replay = require("lib.replay_window")
+        _replay = require("core.history_replay")
         "#,
     )
     .exec()
     .expect("spawn wrapper");
 
     // Live turn — wrapper sees chat.create through the live path.
+    // Batched signature: hand the wrapper a one-element envs list with
+    // `replay = false` (the framework's per-envelope stamp under live
+    // dispatch).
     lua.load(
         r#"
         _replay.set(false)
-        _to_plugin({ type = "event", from = "engine", body = {
-            kind = "ollama.chat.create", chat_id = "chat-1",
-        }})
+        _to_plugin({ {
+            type = "event", from = "engine", replay = false,
+            body = { kind = "ollama.chat.create", chat_id = "chat-1" },
+        } })
         _live_delivered_count = #_test.delivered()
         "#,
     )
@@ -339,9 +359,10 @@ fn in_process_resume_skips_duplicate_chat_create() {
     lua.load(
         r#"
         _replay.set(true)
-        _to_plugin({ type = "event", from = "engine", body = {
-            kind = "ollama.chat.create", chat_id = "chat-1",
-        }})
+        _to_plugin({ {
+            type = "event", from = "engine", replay = true,
+            body = { kind = "ollama.chat.create", chat_id = "chat-1" },
+        } })
         _replay.set(false)
         _replay_delivered = _test.delivered()
         "#,
@@ -418,10 +439,11 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
     log_tbl.set("debug", no_op.clone())?;
     nefor.set("log", log_tbl)?;
 
-    // bus.on_event — record handlers in a Lua-side registry. The
-    // replay_window module's library load registers a handler here
-    // (defense-in-depth fallback); it's no-op for these tests because
-    // we drive replay_window via its public set() helper.
+    // bus.on_event — accept handler registrations as a no-op. The
+    // history_replay module no longer self-subscribes at require-time
+    // (now wired explicitly by starter/init.lua via
+    // history_replay.install()); these tests drive the replay-window
+    // flag via the module's public set() helper instead.
     let bus_tbl = lua.create_table()?;
     let on_event = lua.create_function(|_, _: mlua::Variadic<Value>| Ok(()))?;
     bus_tbl.set("on_event", on_event)?;
@@ -525,15 +547,38 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
 fn set_package_path(lua: &Lua) -> mlua::Result<()> {
     let starter = starter_dir();
     let starter_str = starter.display().to_string();
+    let lua_root = lua_dir();
+    let lua_root_str = lua_root.display().to_string();
+    let plugin_lua = repo_root()
+        .join("plugins")
+        .join("openai-provider")
+        .join("lua");
+    let plugin_lua_str = plugin_lua.display().to_string();
+    let rg_plugin_lua = repo_root().join("plugins").join("reasoner-graph").join("lua");
+    let rg_plugin_lua_str = rg_plugin_lua.display().to_string();
     let script = format!(
         r#"
         package.path = table.concat({{
           "{starter}/?.lua",
           "{starter}/?/init.lua",
+          "{plugin_lua}/?.lua",
+          "{plugin_lua}/?/init.lua",
+          "{rg_plugin_lua}/?.lua",
+          "{rg_plugin_lua}/?/init.lua",
+          "{lua_root}/?.lua",
+          "{lua_root}/?/init.lua",
           package.path,
         }}, ";")
+        -- starter/provider.lua reaches the plugin lib via
+        -- `require("openai-provider")`. The plugin's `lua/` parent is on
+        -- package.path above so that resolves to
+        -- plugins/openai-provider/lua/openai-provider/init.lua.
+        NEFOR_CONFIG_DIR = "{starter}"
         "#,
-        starter = starter_str
+        starter = starter_str,
+        lua_root = lua_root_str,
+        plugin_lua = plugin_lua_str,
+        rg_plugin_lua = rg_plugin_lua_str,
     );
     lua.load(&script).exec()
 }

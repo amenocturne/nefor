@@ -56,16 +56,14 @@
 -- mechanically. `key` is preserved for the downstream error-emit node
 -- to format a meaningful diagnostic.
 
-local envelope = require("lib.envelope")
+local envelope = require("core.envelope")
 
 local emit_as = envelope.emit_as
 
 local M = {}
 
--- ------------------------------------------------------------------
--- dispatch handler — called from reasoners/init.lua
--- ------------------------------------------------------------------
-
+-- Dispatch handler — called from reasoners/init.lua.
+--
 -- Returns "_already_replied" because we emit tool.result synchronously;
 -- reasoners/init.lua's err path is bypassed.
 local function handle(body)
