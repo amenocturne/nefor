@@ -28,6 +28,18 @@ These are reasoner-graph internals that `dispatch-graph` translates into. Callin
 
 Even if a future build advertises one of these names, treat it as not yours to call. The tool surface above is the complete list.
 
+## Graph shape — one connected DAG per call
+
+Each `dispatch-graph` call submits **one connected DAG** — meaning every node is reachable through dependencies from every other node (ignoring direction). For **N independent tasks**, call `dispatch-graph` **N times in the same turn**. The framework runs them in parallel; the UI shows each as its own sidebar row; each result comes back as its own `tool.result` when finished. That's better for both you (you can present each result independently as it lands) and the user (visible parallelism).
+
+Within ONE call, the return shape is `results: { <sink_id>: <finalize_output>, ... }` — a dict keyed by every terminal node (one nothing else depends on). Multi-sink within one connected graph is fine when sinks share an ancestor:
+
+- **Single sink** (`explorer → builder → reviewer`) — one synthesised output: `results: { reviewer: {...} }`.
+- **Fan-out + fan-in** (two explorers in parallel → one builder that depends on both) — one synthesised output: `results: { builder: {...} }`. The builder sees both explorers' findings as prompt context.
+- **Connected fan-out, no fan-in** (`explorer → build`, `explorer → test`) — two sinks sharing the root: `results: { build: {...}, test: {...} }`.
+
+Use multiple calls instead of one disconnected graph: parallel unrelated explorations are N calls, not one graph with N disjoint components.
+
 ## Sub-agent roles available
 
 - `explorer` — read-only investigation. Returns structured `findings` with `file:line` references.
