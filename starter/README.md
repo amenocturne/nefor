@@ -42,6 +42,7 @@ nefor
 
 ## Customize
 
-- **Add/remove plugins**: edit the `actor.spawn` blocks in `init.lua`.
-- **Resume a prior session**: emit `sessions.resume_request { session_id = "<uuid>" }` on the bus (the chat slash-command surface does this for you).
-- **Switch provider/model**: edit the `providers` list in `config/init.lua`. Both `mock-plugin` and `ollama` are spawned out of the box; pick a model interactively via `/model` in the TUI, or change `default_provider` / `default_model` to set the first-turn default.
+- **Add/remove plugins**: edit the `ncp.spawn { ... }` blocks in `init.lua`.
+- **Resume a prior session**: emit `sessions.resume_request { session_id = "<uuid>" }` on the bus (the chat slash-command surface does this for you). `sessions.lua` handles the rest in-process.
+- **Change protocol behavior**: `ncp.lua` is where handshake, broadcast, replay, and error rules live.
+- **Switch provider/model**: edit the `providers` list in `config.lua`. Both `mock-plugin` and `ollama` are spawned out of the box; pick a model interactively via `/model` in the TUI, or change `default_provider` / `default_model` to set the first-turn default.

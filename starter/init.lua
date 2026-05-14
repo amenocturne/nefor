@@ -28,53 +28,9 @@ pm.install({
     dir  = LUA_ROOT .. "/core",
   },
 
-  {
-    "amenocturne/nefor",
-    name = "libs",
-    tag  = "v0.1.5",
-    path = "lua/libs/",
-    dir  = LUA_ROOT .. "/libs",
-  },
-
-  {
-    "amenocturne/nefor",
-    name = "openai-provider",
-    tag  = "v0.1.5",
-    path = "plugins/openai-provider/lua/openai-provider/",
-    dir  = STARTER_ROOT .. "/../plugins/openai-provider/lua/openai-provider",
-  },
-
-  {
-    "amenocturne/nefor",
-    name = "tool-gate",
-    tag  = "v0.1.5",
-    path = "plugins/tool-gate/lua/tool-gate/",
-    dir  = STARTER_ROOT .. "/../plugins/tool-gate/lua/tool-gate",
-  },
-
-  {
-    "amenocturne/nefor",
-    name = "nefor-tui",
-    tag  = "v0.1.5",
-    path = "plugins/nefor-tui/lua/",
-    dir  = STARTER_ROOT .. "/../plugins/nefor-tui/lua",
-  },
-
-  {
-    "amenocturne/nefor",
-    name = "reasoner-graph",
-    tag  = "v0.1.5",
-    path = "plugins/reasoner-graph/lua/reasoner-graph/",
-    dir  = STARTER_ROOT .. "/../plugins/reasoner-graph/lua/reasoner-graph",
-  },
-})
-
-local ncp            = require("core.ncp")
-local actor          = require("core.actor")
-local history_replay = require("core.history_replay")
-local sessions       = require("sessions")
-local cfg            = require("config").active
-local lead_role      = require("lead-workflow.role")
+local ncp      = require("ncp")
+local sessions = require("sessions")
+local cfg      = require("config").active
 
 function dispatch(current_log)
   ncp.dispatch(current_log)
@@ -114,27 +70,34 @@ local agentic_loop = require("agentic-loop")
 agentic_loop.configure {
   provider = cfg.default_provider,
   model    = cfg.default_model,
-  system   = lead_role.LEAD_SYSTEM_PROMPT,
-  -- Restrict the lead's chat catalog to the orchestration-tool surface.
-  -- Without this filter the lead sees every wire-advertised tool — most
-  -- problematically `spawn_graph` (the reasoner-graph internal that
-  -- `dispatch-graph` translates into) — and could call them directly,
-  -- bypassing the role-keyed sub-agent contract and bottoming out in
-  -- `reasoner '<role>' not connected` runtime errors. The agent
-  -- reasoner already enforces a per-role allowlist on its sub-firings
-  -- via the same `chat.create.tools` plumbing; this extends the same
-  -- discipline to the lead's chat at the orchestrator layer.
-  tool_allowlist = lead_role.ORCHESTRATION_TOOLS,
+  system   = [[
+You are a helpful assistant. Use the `spawn_graph` tool for parallel decomposition tasks (multiple independent sub-questions to combine).
+
+Graph schema:
+{ "nodes": [{ "id": str, "reasoner": str, "args": {...} }], "edges": [{ "from": str, "to": str }] }
+
+Reasoner types:
+- `responder` — one-shot LLM call. args: { "prompt": string }. Upstream nodes' outputs become user messages prepended to the prompt.
+- `terminal` — sink. args: {}. Exactly one per graph; its input becomes the run's result.
+
+To combine parallel branches into a single output, add a `responder` combine node downstream of the parallel branches and feed it into terminal. Do NOT wire parallel branches directly into terminal — terminal is a sink, not a combiner. Pattern:
+  branchA, branchB → combine (responder) → terminal
+
+Emit the tool call directly after deciding the structure. For simple chat turns (no decomposition benefit), just answer directly.
+]],
 }
 actor.spawn(agentic_loop)
 actor.spawn(require("reasoners"))
 
-local provider = require("compositors.provider")
+-------------------------------------------------------------------------
+-- 3b. Providers — every entry in cfg.providers is spawned. The picker
+--     aggregates connected providers via auth.status; no hard-coded
+--     test/prod switch.
+-------------------------------------------------------------------------
+
 for _, p in ipairs(cfg.providers or {}) do
   if p.kind == "mock" then
-    -- mock-plugin speaks the same wire protocol as the openai-provider
-    -- binary, so the same actor spec works — only the binary differs.
-    actor.spawn(provider.spawn_spec(
+    actor.spawn(require("mock-plugin").spawn_spec(
       p.name,
       {
         require("config").bin("mock-plugin"),
@@ -154,7 +117,7 @@ for _, p in ipairs(cfg.providers or {}) do
     for _, a in ipairs(p.extra_args or {}) do
       table.insert(provider_command, a)
     end
-    actor.spawn(provider.spawn_spec(
+    actor.spawn(require("openai-provider").spawn_spec(
       p.name,
       provider_command,
       { static_token = p.static_token }
@@ -162,23 +125,65 @@ for _, p in ipairs(cfg.providers or {}) do
   else
     error("starter/init.lua: unknown provider kind: " .. tostring(p.kind))
   end
-  for _, a in ipairs(cfg.provider.extra_args or {}) do
-    table.insert(provider_command, a)
-  end
-  actor.spawn(require("openai-provider").spawn_spec(
-    PROVIDER_NAME,
-    provider_command,
-    { static_token = cfg.provider.static_token }
-  ))
 end
 
 actor.spawn(require("compositors.graph").spawn_spec({ require("config").bin("reasoner-graph") }))
 
-local tools = require("compositors.tools")
-local tool_gate_argv = { require("config").bin("tool-gate") }
-for _, t in ipairs(cfg.tool_gate.prompt_tools or {}) do
-  tool_gate_argv[#tool_gate_argv + 1] = "--prompt"
-  tool_gate_argv[#tool_gate_argv + 1] = t
+ncp.spawn {
+  name    = "nefor-combinators",
+  command = { bin("nefor-combinators") },
+}
+
+ncp.spawn {
+  name    = "generic-provider",
+  command = { bin("generic-provider") },
+}
+
+ncp.spawn {
+  name    = "generic-tool",
+  command = { bin("generic-tool") },
+}
+
+-------------------------------------------------------------------------
+-- 4b. Provider — selected by config.lua (prod = openai-provider, test = mock).
+-------------------------------------------------------------------------
+--
+-- The `prod` table runs openai-provider against the configured base_url
+-- (Ollama by default). The `test` table runs mock-plugin loading
+-- `mock_provider.lua` for deterministic smoke / e2e tests. Both emit
+-- the same `<name>.chat.*` / `<name>.stream.*` envelope shape so the
+-- rest of the composition is provider-agnostic.
+--
+-- The `static_token=ollama-local` trick on prod unlocks openai-provider's
+-- auth gate without a real key (required for local Ollama). Real remote
+-- providers would supply an --api-key CLI arg via provider.extra_args.
+
+local PROVIDER_NAME  = cfg.provider.name
+local PROVIDER_MODEL = cfg.provider.model
+local provider_chain, provider_command
+
+if cfg.plugins.spawn_mock then
+  provider_chain = agentic_workflow.for_provider(PROVIDER_NAME)
+  provider_command = {
+    bin("mock-plugin"),
+    "--script", STARTER_ROOT .. "/" .. cfg.provider.mock_script,
+  }
+else
+  provider_chain = agentic_workflow.for_provider(PROVIDER_NAME, {
+    static_token = cfg.provider.static_token,
+  })
+  provider_command = {
+    bin("openai-provider"),
+    "--name",     PROVIDER_NAME,
+    "--base-url", cfg.provider.base_url,
+  }
+  if PROVIDER_MODEL then
+    table.insert(provider_command, "--model")
+    table.insert(provider_command, PROVIDER_MODEL)
+  end
+  for _, a in ipairs(cfg.provider.extra_args or {}) do
+    table.insert(provider_command, a)
+  end
 end
 tool_gate_argv[#tool_gate_argv + 1] = "--default"
 tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
@@ -192,7 +197,75 @@ actor.spawn(tools.basic_actor_spec())
 -- await-approval to tool-gate.
 actor.spawn(require("lead-workflow"))
 
-actor.spawn(require("compositors.chat_bridge").spawn_spec({
-  require("config").bin("nefor-tui"),
-  "--script", STARTER_ROOT .. "/chat/init.lua",
-}))
+Reasoner types:
+- `responder` — one-shot LLM call. args: { "prompt": string }. Upstream nodes' outputs become user messages prepended to the prompt.
+- `terminal` — sink. args: {}. Exactly one per graph; its input becomes the run's result.
+
+To combine parallel branches into a single output, add a `responder` combine node downstream of the parallel branches and feed it into terminal. Do NOT wire parallel branches directly into terminal — terminal is a sink, not a combiner. Pattern:
+  branchA, branchB → combine (responder) → terminal
+
+Emit the tool call directly after deciding the structure. For simple chat turns (no decomposition benefit), just answer directly.
+]]
+
+agentic_workflow.setup {
+  provider = PROVIDER_NAME,
+  model    = PROVIDER_MODEL,
+  system   = ORCHESTRATOR_SYSTEM_PROMPT,
+}
+
+ncp.spawn {
+  name        = PROVIDER_NAME,
+  command     = provider_command,
+  from_plugin = provider_chain.from_plugin,
+  to_plugin   = provider_chain.to_plugin,
+}
+
+-------------------------------------------------------------------------
+-- 4d. Reasoner graph
+-------------------------------------------------------------------------
+
+ncp.spawn {
+  name        = "reasoner-graph",
+  command     = { bin("reasoner-graph") },
+  from_plugin = agentic_workflow.for_reasoner_graph().from_plugin,
+}
+
+-------------------------------------------------------------------------
+-- 4e. Tool gate + basic-tools + spawn_graph advertisement
+-------------------------------------------------------------------------
+
+local tool_gate_argv = { bin("tool-gate") }
+for _, t in ipairs(cfg.tool_gate.prompt_tools or {}) do
+  tool_gate_argv[#tool_gate_argv + 1] = "--prompt"
+  tool_gate_argv[#tool_gate_argv + 1] = t
+end
+tool_gate_argv[#tool_gate_argv + 1] = "--default"
+tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
+
+ncp.spawn {
+  name        = "tool-gate",
+  command     = tool_gate_argv,
+  from_plugin = agentic_workflow.for_tool_gate("tool-gate").from_plugin,
+}
+
+ncp.spawn {
+  name    = "basic-tools",
+  command = { bin("basic-tools"), "--gate", "tool-gate" },
+}
+
+-------------------------------------------------------------------------
+-- 4f. Chat
+-------------------------------------------------------------------------
+--
+-- Post-phase-6 cutover: the chat surface is a Lua composition (`chat.lua`)
+-- running inside the new declarative `nefor-tui` plugin. The plugin loads
+-- the script via `--script <path>` and exposes a `tui.*` primitive surface
+-- (text, column, row, scrollable, text_input, markdown, ...) that
+-- `chat.lua` composes into the transcript + statusline + input. The
+-- legacy split (`nefor-chat` + ratatui-based `nefor-tui`) is gone.
+
+ncp.spawn {
+  name        = "nefor-tui",
+  command     = { bin("nefor-tui"), "--script", STARTER_ROOT .. "/chat.lua" },
+  from_plugin = agentic_workflow.for_chat().from_plugin,
+}
