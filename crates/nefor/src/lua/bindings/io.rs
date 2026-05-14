@@ -13,7 +13,7 @@
 //!    callable runs in parallel — same as any blocking C function.
 //!    The pump task is on a separate worker thread; the channel
 //!    delivers regardless.
-//! 3. In TUI mode (the default) the host short-circuits the binding
+//! 3. In serve mode (the default) the host short-circuits the binding
 //!    to return Lua `nil` immediately — no pump runs and `read_line`
 //!    is effectively unavailable. Callers are expected to gate use
 //!    behind a CLI-mode check.
@@ -41,7 +41,7 @@ pub struct StdinPump {
 }
 
 impl StdinPump {
-    /// Construct an empty (no-pump) state. Used in TUI mode.
+    /// Construct an empty (no-pump) state. Used in serve mode.
     pub fn empty() -> Self {
         Self::default()
     }
@@ -52,7 +52,7 @@ impl StdinPump {
         self.eof = false;
     }
 
-    /// True when the receiver was never set (TUI mode) or stdin EOF was
+    /// True when the receiver was never set (serve mode) or stdin EOF was
     /// observed.
     pub fn is_eof(&self) -> bool {
         self.rx.is_none() || self.eof
@@ -92,7 +92,7 @@ pub fn spawn_stdin_pump() -> mpsc::UnboundedReceiver<String> {
 
 /// Install `nefor.io.read_line` onto `nefor_tbl`.
 ///
-/// `mode` chooses the dispatch shape: TUI returns nil immediately.
+/// `mode` chooses the dispatch shape: serve returns nil immediately.
 /// `pump` provides the stdin source in CLI dispatch mode.
 ///
 /// # API contract — `read_line` blocks the broker run loop
@@ -126,7 +126,7 @@ pub fn install_io(
     let io_tbl = lua.create_table()?;
 
     let read_line = lua.create_function(move |lua, _: ()| -> mlua::Result<Value> {
-        // TUI mode: stdin is unused at the engine level (plugins own
+        // Serve mode: engine stdin is unused at this level (plugins own
         // their subprocess stdin), so return nil immediately rather than
         // blocking on a channel nobody pumps.
         if !matches!(mode, EngineMode::PluginDispatch { .. }) {
@@ -192,11 +192,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn read_line_returns_nil_in_tui_mode() {
+    async fn read_line_returns_nil_in_serve_mode() {
         let lua = Lua::new();
         let pump: SharedStdinPump = Arc::new(Mutex::new(StdinPump::empty()));
         let nefor = lua.create_table().unwrap();
-        install_io(&lua, &nefor, EngineMode::Tui, Arc::clone(&pump)).unwrap();
+        install_io(&lua, &nefor, EngineMode::Serve, Arc::clone(&pump)).unwrap();
         lua.globals().set("nefor", nefor).unwrap();
         let v: Value = lua
             .load(r#"return nefor.io.read_line()"#)

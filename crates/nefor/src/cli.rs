@@ -19,11 +19,7 @@ use clap::{Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(
     name = "nefor",
-    // Embedded by build.rs: prefer `git describe --tags --always --dirty`
-    // (so tagged builds report `0.1.5`, between-tag builds report
-    // `0.1.5-12-gabcdef`, builds with local changes report `…-dirty`).
-    // Falls back to CARGO_PKG_VERSION when no git context is available.
-    version = env!("NEFOR_VERSION"),
+    version,
     about = "nefor — Lua-composable agent runtime (plugin broker on top of nefor-combinators).",
     long_about = "nefor is a plugin broker for composing agent runtimes. The binary ships voiceless — \
                   providers, harnesses, DAG orchestration, personas, UIs, and statusline \

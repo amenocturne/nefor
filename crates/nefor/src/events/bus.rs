@@ -30,8 +30,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 // Lifecycle events carried by the internal bus. Post-NCP the bus is
-// engine-internal only (plugins never see it); KEY/RESIZE were TUI-specific
-// and moved to the nefor-tui plugin where they originate from crossterm.
+// engine-internal only (plugins never see it); terminal input/resize events
+// live in whichever plugin owns the terminal, not here.
 
 /// Lifecycle event: binary finished startup, plugins loaded.
 pub const STARTUP: &str = "startup";

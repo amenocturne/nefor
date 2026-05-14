@@ -204,16 +204,16 @@ mod tests {
     #[test]
     fn spawn_registers_minimal_plugin() {
         let (lua, plugins) = setup();
-        lua.load(r#"nefor.plugins.spawn { name = "tui", command = { "nefor-tui" } }"#)
+        lua.load(r#"nefor.plugins.spawn { name = "demo", command = { "demo-bin" } }"#)
             .exec()
             .expect("ok");
         let guard = plugins.lock().unwrap();
         let specs = guard.list();
         assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].name.as_str(), "tui");
+        assert_eq!(specs[0].name.as_str(), "demo");
         assert_eq!(
             specs[0].command.as_deref(),
-            Some(&["nefor-tui".to_string()][..])
+            Some(&["demo-bin".to_string()][..])
         );
         assert!(!specs[0].has_cli);
     }

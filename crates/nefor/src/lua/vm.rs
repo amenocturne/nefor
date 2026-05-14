@@ -79,9 +79,9 @@ impl LuaHost {
     /// `init.lua` and drained by the engine after load. `engine_ops`
     /// provides the routing sink used by `nefor.engine.send`.
     ///
-    /// The host starts in [`EngineMode::Tui`]; CLI-dispatch callers must
+    /// The host starts in [`EngineMode::Serve`]; CLI-dispatch callers must
     /// invoke [`LuaHost::set_mode`] (and re-install bindings that depend
-    /// on the mode, namely `nefor.io`). For the common-case TUI path this
+    /// on the mode, namely `nefor.io`). For the common-case serve path this
     /// is a no-op.
     pub fn new(
         bus: Arc<EventBus>,
@@ -98,7 +98,7 @@ impl LuaHost {
             Arc::clone(&plugins),
             Arc::clone(&engine_ops),
             Arc::clone(&subscriptions),
-            EngineMode::Tui,
+            EngineMode::Serve,
             Arc::clone(&stdin_pump),
             data_dir,
         )
