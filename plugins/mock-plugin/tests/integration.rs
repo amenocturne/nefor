@@ -376,7 +376,7 @@ async fn interrupt_mid_stream_persists_partial_assistant_text_to_history() {
         .expect("plugins/")
         .parent()
         .expect("repo root")
-        .join("starter/mock-provider/init.lua");
+        .join("starter/mock_provider.lua");
     assert!(
         script_path.exists(),
         "production mock_provider.lua not found at {script_path:?}",

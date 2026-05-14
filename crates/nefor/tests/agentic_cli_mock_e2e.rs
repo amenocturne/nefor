@@ -114,6 +114,11 @@ fn base_command(xdg: &Path) -> Command {
         .arg("agentic-cli")
         .env("NEFOR_CONFIG", "test")
         .env("NEFOR_PLUGIN_DIR", repo_root().join("plugins"))
+        // Disable the mock provider's 80 tok/s pacing under tests so
+        // the 10s SCENARIO_TIMEOUT stays comfortable. Interactive
+        // launches (the user driving `nefor` directly) get pacing
+        // because the env var isn't set.
+        .env("NEFOR_TEST_FAST_MOCK", "1")
         .env("XDG_DATA_HOME", xdg);
     cmd
 }
@@ -274,11 +279,9 @@ fn truncate_does_not_panic_on_multibyte_boundary() {
 const SPAWN_GRAPH_PROMPT: &str =
     "summarise octopuses and lighthouses in parallel and combine into one paragraph";
 
-/// Two short non-spawn-graph prompts. The mock has no canned match for
-/// either, so it returns the deterministic
-/// "[mock provider: no canned match for: <prompt>]" fallback per turn.
-/// That's enough for REPL multi-turn — we just need each turn to
-/// produce a distinct, recognisable line.
+/// Two short non-spawn-graph prompts. The mock has no canned trigger
+/// for either, so each turn falls through to the help-banner path —
+/// fine for REPL multi-turn since we only need two recognisable turns.
 const SIMPLE_PROMPT_1: &str = "hello";
 const SIMPLE_PROMPT_2: &str = "world";
 
@@ -504,22 +507,17 @@ fn scenario_4_repl_multi_turn() {
     let out = run_scenario(&[], Some(payload.as_bytes()));
     assert_success(&out);
 
-    // The mock returns "[mock provider: no canned match for: <prompt>]"
-    // for unknown prompts. Both should appear on stdout (text format),
-    // each on its own turn.
+    // Unrecognised prompts now route through the mock's help-fallback
+    // path, which prepends the `**MOCK PROVIDER**` banner. Two turns
+    // means the banner shows up at least twice on stdout — one
+    // recognisable marker per turn, without locking to the help body
+    // which gets reformatted whenever triggers are added.
     let stdout = &out.stdout;
-    let needle1 = format!("no canned match for: {SIMPLE_PROMPT_1}");
-    let needle2 = format!("no canned match for: {SIMPLE_PROMPT_2}");
+    let banner_count = stdout.matches("**MOCK PROVIDER**").count();
     assert!(
-        stdout.contains(&needle1),
-        "expected first turn's mock fallback for {SIMPLE_PROMPT_1:?}; \
-         stdout: {:?}",
-        truncate(stdout, 2048)
-    );
-    assert!(
-        stdout.contains(&needle2),
-        "expected second turn's mock fallback for {SIMPLE_PROMPT_2:?}; \
-         stdout: {:?}",
+        banner_count >= 2,
+        "expected the MOCK PROVIDER banner on each of two REPL turns; \
+         saw {banner_count}; stdout: {:?}",
         truncate(stdout, 2048)
     );
 
