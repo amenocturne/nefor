@@ -16,9 +16,9 @@ cd nefor
 just install
 ```
 
-`just install` is a composite of two recipes you can also run independently:
+`just install` is a composite of two recipes you can also run independently. It accepts a `channel` argument (`source`, `latest`, `nightly`) that forwards to `install-nefor`. Default for now is `source` until the brew formula + nightly tag pipeline is set up.
 
-- `just install-nefor` — builds the workspace, copies every binary into `~/.local/bin`, installs `da` (the bash-command classifier the tool-validator uses) via `cargo install --locked dabin` if it isn't already on `PATH`. Re-run after pulling to refresh binaries; never touches your config.
+- `just install-nefor [channel]` — builds the workspace (channel `source`), drops the `nefor` binary into `~/.local/bin` (the only thing on PATH), and lands every plugin binary plus `da` (the bash-command classifier the tool-validator uses, installed via `cargo install --root <libexec> dabin`) into `~/.local/share/nefor/bin`. The engine resolves plugins from there by default — no `NEFOR_PLUGIN_DIR` export required. Re-run after pulling to refresh binaries; never touches your config.
 - `just install-starter` — copies the in-repo `starter/` to `~/.config/nefor` so a bare `nefor` from any cwd picks it up. Refuses if the dir already exists (your config is yours — re-copying would clobber local tweaks). Pass `force` to wipe and re-copy from this checkout: `just install-starter force`.
 
 ### From brew
@@ -84,7 +84,7 @@ The engine is a pure string-layer event bus: it reads plugin stdin, stamps `{ori
 |--------------------|----------------------------------|-------------|
 | `NEFOR_CONFIG_DIR` | `$XDG_CONFIG_HOME/nefor`         | `init.lua`  |
 | `NEFOR_DATA_DIR`   | `$XDG_DATA_HOME/nefor`           | sessions    |
-| `NEFOR_PLUGIN_DIR` | `$NEFOR_DATA_DIR/plugins`        | binaries    |
+| `NEFOR_PLUGIN_DIR` | `$NEFOR_DATA_DIR/bin`            | binaries    |
 
 CLI flags (`--config`, `--data-dir`, `--plugin-dir`) override env vars.
 

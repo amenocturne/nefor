@@ -49,24 +49,29 @@ impl PluginRoot {
 /// Resolve the plugin root directory using, in order of precedence:
 ///
 /// 1. `cli_override` — explicit `--plugin-dir` flag.
-/// 2. `NEFOR_PLUGIN_DIR` environment variable.
-/// 3. `<exe-dir>` if it contains the bundled `nefor-tui` binary
-///    (covers `just install` to `~/.local/bin/` and in-tree
-///    `cargo build` to `target/debug/`). Strong positive signal:
-///    a real plugin binary is sitting next to the engine.
-/// 4. `<exe-dir>/../share/nefor/plugins` if that path is a directory
-///    (covers system installs like Homebrew where the binary lives at
-///    `<prefix>/bin/nefor` and plugins at `<prefix>/share/nefor/plugins`).
-///    Checked **after** `<exe-dir>` because for `just install` the
-///    relative-share path resolves to `~/.local/share/nefor/plugins`,
-///    which collides with nefor-pm's source-overlay directory: the
-///    directory exists but holds source-dir symlinks, not executables.
-///    The exe-dir check has a positive signal (`nefor-tui` is a file)
-///    that this purely path-shape check lacks, so it wins.
-/// 5. `$NEFOR_DATA_DIR/plugins/` if that path is a directory. Late
-///    fallback for the same reason: nefor-pm uses it as a Lua
-///    require() overlay, not an executables directory.
-/// 6. `$XDG_DATA_HOME/nefor/plugins/` (falling back to
+/// 2. `NEFOR_PLUGIN_DIR` environment variable. Override only; the
+///    default install layout (#4) doesn't require it.
+/// 3. `<exe-dir>` if it contains the bundled `nefor-tui` binary.
+///    Covers in-tree `cargo build` (everything in `target/debug/`)
+///    and the brew layout where the formula installs every binary
+///    next to `nefor`. Strong positive signal: a real plugin binary
+///    is sitting next to the engine.
+/// 4. `<data_root>/bin` if it contains `nefor-tui`. This is the
+///    default location for `just install-nefor source` — the recipe
+///    drops every plugin (and `da`) into `~/.local/share/nefor/bin`
+///    so only the user-facing `nefor` CLI is exposed on PATH. The
+///    engine finds them here without any env var being set, matching
+///    the data root the rest of the engine reports.
+/// 5. `<exe-dir>/../share/nefor/plugins` if that path is a directory
+///    (legacy Homebrew layout where the formula put plugins under
+///    `<prefix>/share/nefor/plugins/`). Path-shape only — falls
+///    behind #3/#4 because it collides with nefor-pm's source overlay
+///    on user installs (the dir exists with source-dir symlinks but
+///    no executables; spawn would fail).
+/// 6. `$NEFOR_DATA_DIR/plugins/` if that path is a directory. Late
+///    fallback — nefor-pm uses it as a Lua require() overlay, not an
+///    executables directory.
+/// 7. `$XDG_DATA_HOME/nefor/plugins/` (falling back to
 ///    `~/.local/share/nefor/plugins/`).
 ///
 /// Returns `None` if none of the above produced a usable path. The engine
@@ -81,6 +86,9 @@ pub fn resolve_plugin_root(cli_override: Option<PathBuf>) -> Option<PluginRoot> 
         }
     }
     if let Some(p) = exe_dir_in_tree() {
+        return Some(PluginRoot(p));
+    }
+    if let Some(p) = data_root_bin() {
         return Some(PluginRoot(p));
     }
     if let Some(p) = exe_relative_share_plugins() {
@@ -110,6 +118,28 @@ fn exe_dir_in_tree() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
     let dir = exe.parent()?.to_path_buf();
     dir.join("nefor-tui").is_file().then_some(dir)
+}
+
+/// `<data_root>/bin` if it contains the bundled `nefor-tui` binary.
+/// `data_root` resolves the same way `nefor.fs.data_root` reports it
+/// to Lua: `$NEFOR_DATA_DIR` if set (main.rs propagates this from the
+/// CLI flag / env / XDG default), otherwise `$XDG_DATA_HOME/nefor`,
+/// otherwise `~/.local/share/nefor`. The recipe `just install-nefor
+/// source` lands every plugin binary at `<data_root>/bin/`, so this
+/// is the default plugin root for source installs without requiring
+/// the user to export `NEFOR_PLUGIN_DIR`.
+fn data_root_bin() -> Option<PathBuf> {
+    let data_root = if let Ok(raw) = std::env::var("NEFOR_DATA_DIR") {
+        if !raw.is_empty() {
+            PathBuf::from(raw)
+        } else {
+            xdg_data_home()?.join("nefor")
+        }
+    } else {
+        xdg_data_home()?.join("nefor")
+    };
+    let candidate = data_root.join("bin");
+    candidate.join("nefor-tui").is_file().then_some(candidate)
 }
 
 fn xdg_data_home() -> Option<PathBuf> {

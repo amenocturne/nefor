@@ -26,39 +26,60 @@ fmt:
 build:
     cargo build --workspace --release
 
-# Composite: install-nefor + install-starter. End-to-end first-time setup.
-install: install-nefor install-starter
+# Composite: install-nefor + install-starter. End-to-end first-time setup. Channel forwarded to install-nefor.
+install channel="source": (install-nefor channel) install-starter
     @echo
-    @echo "Installed -> ${PREFIX:-$HOME/.local}/bin"
+    @echo "Installed -> ~/.local/share/nefor/bin (plugins + da), ${PREFIX:-$HOME/.local}/bin/nefor (CLI entry)"
     @echo "Make sure your shell has:"
     @echo "  export PATH=\"${PREFIX:-$HOME/.local}/bin:\$PATH\""
-    @echo "  export NEFOR_PLUGIN_DIR=\"${PREFIX:-$HOME/.local}/bin\""
 
-# Build release + copy every shipped binary to $PREFIX/bin (default ~/.local/bin). Installs `da` if missing. PREFIX=/usr/local just install-nefor to override.
-install-nefor:
+# Install nefor binaries (and `da`) for `channel`: source (cargo build, default for now) | latest (brew, TODO) | nightly (brew --HEAD, TODO). Plugins + da land in ~/.local/share/nefor/bin (the engine's default plugin root); only `nefor` itself goes on PATH.
+install-nefor channel="source":
     #!/usr/bin/env bash
     set -eu
     PREFIX="${PREFIX:-$HOME/.local}"
-    cargo build --workspace --release
-    mkdir -p "$PREFIX/bin"
-    cd "{{justfile_directory()}}"
-    # Copies (not symlinks) so future dev rebuilds in target/release/
-    # don't silently mutate the installed binaries — re-run this recipe
-    # to refresh.
-    for bin in nefor openai-provider tool-gate basic-tools reasoner-graph nefor-tui mock-plugin generic-provider generic-tool nefor-combinators; do
-      install -m 0755 "target/release/$bin" "$PREFIX/bin/$bin"
-      echo "  $PREFIX/bin/$bin"
-    done
-    # The starter ships a tool-validator that classifies bash commands
-    # via `da` (https://github.com/amenocturne/da) before any popup
-    # fires. The validator falls back to "always defer" without it, but
-    # auto-approval of safe read-only commands needs the binary.
-    if command -v da >/dev/null 2>&1; then
-      echo "  da (already installed) -> $(command -v da)"
+    LIBEXEC_ROOT="$HOME/.local/share/nefor"
+    LIBEXEC_BIN="$LIBEXEC_ROOT/bin"
+    case "{{channel}}" in
+      source)
+        cargo build --workspace --release
+        mkdir -p "$PREFIX/bin" "$LIBEXEC_BIN"
+        cd "{{justfile_directory()}}"
+        # Only `nefor` (the CLI entry point) goes on PATH. Every plugin
+        # binary lands in the libexec dir, which the engine treats as
+        # the default plugin root via the data_root_bin resolver path —
+        # no NEFOR_PLUGIN_DIR export required.
+        install -m 0755 "target/release/nefor" "$PREFIX/bin/nefor"
+        echo "  $PREFIX/bin/nefor"
+        for bin in openai-provider tool-gate basic-tools reasoner-graph nefor-tui mock-plugin generic-provider generic-tool nefor-combinators; do
+          install -m 0755 "target/release/$bin" "$LIBEXEC_BIN/$bin"
+          echo "  $LIBEXEC_BIN/$bin"
+        done
+        ;;
+      latest)
+        echo "channel=latest is not yet implemented (brew formula + release pipeline pending). Use 'source' for now: \`just install-nefor source\`"
+        exit 1
+        ;;
+      nightly)
+        echo "channel=nightly is not yet implemented (nightly tag + brew --HEAD pending). Use 'source' for now: \`just install-nefor source\`"
+        exit 1
+        ;;
+      *)
+        echo "unknown channel '{{channel}}'; expected source | latest | nightly"
+        exit 1
+        ;;
+    esac
+    # `da` lands in the same libexec dir (`cargo install --root` puts
+    # the binary at <root>/bin/da). Keeps the user's PATH clean — da is
+    # a nefor implementation detail. The validator finds it via the same
+    # path; PATH is the fallback for users who happen to have it
+    # installed elsewhere (e.g. their own `cargo install dabin`).
+    if [ -x "$LIBEXEC_BIN/da" ]; then
+      echo "  da (already installed) -> $LIBEXEC_BIN/da"
     else
-      echo "Installing da (bash-command classifier)..."
-      cargo install --locked dabin
-      echo "  da -> $(command -v da || echo '?')"
+      echo "Installing da -> $LIBEXEC_BIN/da..."
+      cargo install --locked --root "$LIBEXEC_ROOT" dabin
+      echo "  $LIBEXEC_BIN/da"
     fi
 
 # Copy starter/ to ~/.config/nefor. Refuses if the dir exists; pass `force` to wipe and re-copy.
