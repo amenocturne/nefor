@@ -5,9 +5,15 @@
 //! Boolean-shaped queries (`exists`, `is_dir`, `is_symlink`) return
 //! plain `bool` to keep the call-sites readable.
 //!
-//! Distinct from `plugins/nefor-tui/src/fs.rs` (`nefor.fs.list_dir`),
-//! which is plugin-local to the TUI Lua VM. This module installs onto
-//! the engine's Lua surface for `init.lua` consumers such as `pm`.
+//! `nefor.fs.list_dir(path) -> { { name=string, is_dir=bool }, ... } | nil, err`
+//! enumerates a directory non-recursively, skipping `.` / `..`. `is_dir`
+//! follows symlinks (matches the convention `nefor.fs.is_dir` already
+//! uses on this surface). Returns `(nil, err)` for missing path, not-a-
+//! directory, or permission-denied so callers can branch on shape.
+//!
+//! The TUI plugin's `plugins/nefor-tui/src/fs.rs` exposes a similarly-
+//! named binding scoped to its own Lua VM. Engine-side actors
+//! (read-only-tools, etc.) need their own copy here.
 
 use std::fs;
 use std::os::unix::fs as unix_fs;
@@ -109,6 +115,52 @@ pub fn install_fs(lua: &Lua, nefor_tbl: &Table, data_dir: DataDir) -> mlua::Resu
         "write_file",
         lua.create_function(|lua, (path, content): (String, String)| {
             ok_or_err(lua, fs::write(&path, content))
+        })?,
+    )?;
+
+    fs_tbl.set(
+        "list_dir",
+        lua.create_function(|lua, path: String| {
+            let read_dir = match fs::read_dir(&path) {
+                Ok(rd) => rd,
+                Err(e) => {
+                    let err = lua.create_string(format!("nefor.fs.list_dir({path:?}): {e}"))?;
+                    return Ok((mlua::Value::Nil, mlua::Value::String(err)));
+                }
+            };
+            let out = lua.create_table()?;
+            let mut i = 0i64;
+            for entry in read_dir {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::warn!(target: "nefor::fs", error = %e, "skip readdir entry");
+                        continue;
+                    }
+                };
+                let name_os = entry.file_name();
+                let name = match name_os.to_str() {
+                    Some(s) => s.to_owned(),
+                    None => {
+                        tracing::warn!(
+                            target: "nefor::fs",
+                            name = ?name_os,
+                            "skip non-UTF-8 file name"
+                        );
+                        continue;
+                    }
+                };
+                // fs::metadata follows symlinks so a symlink-to-dir
+                // reports is_dir=true, matching the engine's existing
+                // nefor.fs.is_dir convention.
+                let is_dir = fs::metadata(entry.path()).map(|m| m.is_dir()).unwrap_or(false);
+                let rec = lua.create_table()?;
+                rec.set("name", name)?;
+                rec.set("is_dir", is_dir)?;
+                i += 1;
+                out.set(i, rec)?;
+            }
+            Ok((mlua::Value::Table(out), mlua::Value::Nil))
         })?,
     )?;
 
@@ -284,5 +336,93 @@ mod tests {
             .unwrap();
         assert!(!ok);
         assert!(err.is_some());
+    }
+
+    #[test]
+    fn list_dir_returns_entries_with_dir_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        std::fs::write(tmp.path().join("file.txt"), "x").unwrap();
+        std::fs::write(tmp.path().join(".hidden"), "y").unwrap();
+        let lua = setup();
+        lua.globals()
+            .set("test_path", tmp.path().to_str().unwrap())
+            .unwrap();
+        let ok: bool = lua
+            .load(
+                r#"
+                local entries, err = nefor.fs.list_dir(test_path)
+                if err ~= nil then return false end
+                local by_name = {}
+                for _, e in ipairs(entries) do by_name[e.name] = e end
+                return by_name["sub"]      and by_name["sub"].is_dir == true
+                   and by_name["file.txt"] and by_name["file.txt"].is_dir == false
+                   and by_name[".hidden"]  and by_name[".hidden"].is_dir == false
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(ok);
+    }
+
+    #[test]
+    fn list_dir_missing_path_returns_nil_and_error() {
+        let lua = setup();
+        let (entries_is_nil, err_is_string): (bool, bool) = lua
+            .load(
+                r#"
+                local entries, err = nefor.fs.list_dir("/nope/not/a/path/here")
+                return entries == nil, type(err) == "string"
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(entries_is_nil);
+        assert!(err_is_string);
+    }
+
+    #[test]
+    fn list_dir_skips_dot_and_dotdot() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a"), "x").unwrap();
+        let lua = setup();
+        lua.globals()
+            .set("test_path", tmp.path().to_str().unwrap())
+            .unwrap();
+        let has_dot: bool = lua
+            .load(
+                r#"
+                for _, e in ipairs(nefor.fs.list_dir(test_path)) do
+                  if e.name == "." or e.name == ".." then return true end
+                end
+                return false
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(!has_dot);
+    }
+
+    #[test]
+    fn list_dir_follows_symlink_to_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("real-dir")).unwrap();
+        unix_fs::symlink(tmp.path().join("real-dir"), tmp.path().join("link-to-dir")).unwrap();
+        let lua = setup();
+        lua.globals()
+            .set("test_path", tmp.path().to_str().unwrap())
+            .unwrap();
+        let link_reports_dir: bool = lua
+            .load(
+                r#"
+                for _, e in ipairs(nefor.fs.list_dir(test_path)) do
+                  if e.name == "link-to-dir" then return e.is_dir end
+                end
+                return false
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(link_reports_dir, "symlink-to-dir should report is_dir=true");
     }
 }

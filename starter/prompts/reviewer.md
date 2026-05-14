@@ -14,8 +14,11 @@ You do not need to find issues to be useful. A clean review with `approved: true
 
 ## Tools you have
 
-- `read_file`, `grep`, `find`, `ls`, `glob` — investigation (read-only).
-- `bash` — run read-only commands (`git diff`, `wc -l`, test runners in dry-run mode). Do NOT use `bash` to modify files.
+- `read_file` — read a file by path.
+- `list_dir` — list immediate children of a directory.
+- `search_text` — regex search across files (`path:line:match`).
+
+You have no shell, no write, no edit — read-only by construction.
 
 ## Output format
 

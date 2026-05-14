@@ -328,11 +328,55 @@ local function build_graph_spec(node_specs)
   return { nodes = nodes, edges = edges }
 end
 
+-- Approval gate: write-capable roles (builder, tester, prompt-engineer,
+-- any role explicitly tagged `read_only = false`) require an approved
+-- plan before the lead can dispatch them. Read-only investigation
+-- (explorer, reviewer, critic, reflector) is always allowed.
+--
+-- Returns nil on pass, an error string on rejection.
+local function gate_against_unapproved_plan(node_specs)
+  local approved = type(state.active_plan) == "table"
+                   and state.active_plan.approved == true
+  if approved then return nil end
+  local writers = {}
+  for _, spec in ipairs(node_specs) do
+    local cfg = role_config(spec.role)
+    if type(cfg) == "table" and cfg.read_only == false then
+      writers[#writers + 1] = spec.role .. " (node `" .. tostring(spec.id) .. "`)"
+    end
+  end
+  if #writers == 0 then return nil end
+  local plan_state
+  if type(state.active_plan) ~= "table" then
+    plan_state = "no plan submitted yet"
+  elseif state.active_plan.approved == nil then
+    plan_state = "plan `" .. tostring(state.active_plan.plan_id)
+                 .. "` is awaiting user approval"
+  elseif state.active_plan.approved == false then
+    plan_state = "plan `" .. tostring(state.active_plan.plan_id)
+                 .. "` was rejected by the user"
+  else
+    plan_state = "unknown plan state"
+  end
+  return string.format(
+    "dispatch-graph: write-capable roles require an approved plan, but %s. "
+    .. "Offending node(s): %s. Either restrict this dispatch to read-only roles "
+    .. "(explorer/reviewer/critic/reflector — investigation), or call write-review "
+    .. "+ await-approval first, then dispatch the implementation graph.",
+    plan_state, table.concat(writers, ", "))
+end
+
 local function dispatch_graph(firing_id, args)
   local nodes = args and args.nodes
   local graph, err = build_graph_spec(nodes)
   if err then
     emit_tool_result_err(firing_id, err)
+    return
+  end
+
+  local gate_err = gate_against_unapproved_plan(nodes)
+  if gate_err then
+    emit_tool_result_err(firing_id, gate_err)
     return
   end
 

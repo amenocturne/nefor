@@ -67,17 +67,20 @@ M.AGENT_CONFIGS = {
   explorer = {
     system_prompt  = load_or_placeholder("explorer"),
     model          = nil,
-    tool_allowlist = { "read_file", "grep", "find", "ls", "glob", "bash" },
+    tool_allowlist = { "read_file", "list_dir", "search_text" },
+    read_only      = true,
   },
   builder = {
     system_prompt  = load_or_placeholder("builder"),
     model          = nil,
-    tool_allowlist = { "read_file", "grep", "find", "ls", "glob", "write_file", "edit", "bash" },
+    tool_allowlist = { "read_file", "list_dir", "search_text", "write_file", "bash" },
+    read_only      = false,
   },
   reviewer = {
     system_prompt  = load_or_placeholder("reviewer"),
     model          = nil,
-    tool_allowlist = { "read_file", "grep", "find", "ls", "glob", "bash" },
+    tool_allowlist = { "read_file", "list_dir", "search_text" },
+    read_only      = true,
   },
 }
 

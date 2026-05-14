@@ -103,11 +103,11 @@ do
         { id = "explore-1", role = "explorer",
           agent_args = { prompt = "Investigate auth.lua",
                          system_prompt = "You are an explorer.",
-                         tool_allowlist = { "read", "grep" } } },
-        { id = "build-1",   role = "builder",
-          agent_args = { prompt = "Add login flow",
-                         system_prompt = "You are a builder.",
-                         tool_allowlist = { "read", "write", "edit" } },
+                         tool_allowlist = { "read_file" } } },
+        { id = "explore-2", role = "explorer",
+          agent_args = { prompt = "Map login flow callers",
+                         system_prompt = "You are an explorer.",
+                         tool_allowlist = { "read_file", "search_text" } },
           dependencies = { "explore-1" } },
       },
     },
@@ -133,11 +133,11 @@ do
     "role-keyed nodes become `agent` reasoners")
   assert_eq(graph.nodes[1].args.prompt, "Investigate auth.lua",
     "agent_args.prompt threaded through")
-  assert_eq(graph.nodes[2].id, "build-1", "second node id preserved")
-  -- Edge from explore-1 → build-1.
+  assert_eq(graph.nodes[2].id, "explore-2", "second node id preserved")
+  -- Edge from explore-1 → explore-2.
   local has_edge = false
   for _, e in ipairs(graph.edges or {}) do
-    if e.from == "explore-1" and e.to == "build-1" then has_edge = true end
+    if e.from == "explore-1" and e.to == "explore-2" then has_edge = true end
   end
   assert_true(has_edge, "dependency translates to graph edge")
 
@@ -152,6 +152,74 @@ do
   assert_true(reply ~= nil, "actor replies to dispatch-graph invocation")
   assert_eq(reply.body.output.run_id, invoke.body.id,
     "reply carries the run_id")
+end
+
+-- ------------------------------------------------------------------
+-- Approval gate: builder/writer roles are rejected without an
+-- approved plan.
+-- ------------------------------------------------------------------
+
+do
+  fresh()
+  feed("tool-gate", {
+    kind = "lead-workflow.tool.invoke",
+    id   = "firing-builder-no-plan",
+    name = "dispatch-graph",
+    args = {
+      nodes = {
+        { id = "build-1", role = "builder",
+          agent_args = { prompt = "implement feature X" } },
+      },
+    },
+  })
+  local calls = decode_calls()
+  local err = find_call(calls, function(c)
+    return c.body.kind == "tool.result"
+       and c.body.id == "firing-builder-no-plan"
+       and type(c.body.error) == "string"
+  end)
+  assert_true(err ~= nil,
+    "builder-only dispatch without plan must return a tool.result error")
+  assert_true(err.body.error:find("approved plan", 1, true) ~= nil,
+    "gate-error message names the 'approved plan' precondition")
+  -- No spawn_graph should leak through.
+  local leaked = find_call(calls, function(c)
+    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
+  end)
+  assert_true(leaked == nil,
+    "gate rejection must NOT emit spawn_graph to reasoner-graph")
+end
+
+-- After /approve, the same writer dispatch is accepted.
+do
+  fresh()
+  -- Synthesise an approved plan via the reducer (skips the file write).
+  lw._internals.reduce_plan_submitted({
+    plan_id = "plan-test-approval", plan = "test plan",
+    submitted_at = "2026-05-08T00:00:00.000Z",
+  })
+  lw._internals.reduce_plan_approved({
+    plan_id = "plan-test-approval", approved = true,
+  })
+  _test.calls_clear()
+  feed("tool-gate", {
+    kind = "lead-workflow.tool.invoke",
+    id   = "firing-builder-with-plan",
+    name = "dispatch-graph",
+    args = {
+      nodes = {
+        { id = "build-1", role = "builder",
+          agent_args = { prompt = "implement feature X" } },
+      },
+    },
+  })
+  local calls = decode_calls()
+  local invoke = find_call(calls, function(c)
+    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
+        and c.target == "reasoner-graph"
+  end)
+  assert_true(invoke ~= nil,
+    "after plan approval, builder dispatch must emit spawn_graph")
 end
 
 -- ------------------------------------------------------------------
@@ -752,7 +820,7 @@ do
     args = {
       nodes = {
         { id = "root", role = "explorer", agent_args = { prompt = "x" } },
-        { id = "a",    role = "builder",  agent_args = { prompt = "y" },
+        { id = "a",    role = "explorer", agent_args = { prompt = "y" },
           dependencies = { "root" } },
         { id = "b",    role = "reviewer", agent_args = { prompt = "z" },
           dependencies = { "root" } },
