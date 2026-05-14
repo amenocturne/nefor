@@ -184,18 +184,33 @@ local function flush_pending_user_inputs()
   submit_orchestrator_run(text)
 end
 
--- Cancel everything. Fan-out order:
+-- Cancel everything. D-32 fan-out order:
 --   (1) cancel current orchestrator run + interrupt the in-flight
 --       provider stream so deltas stop spilling
 --   (2) cancel sub-graph runs + clear queued dispatches
 --   (3) drop deferred queue + pending user inputs
 --   (4) clear pending bookkeeping
+--
+-- The single-Esc `cancel()` already fires `<provider>.interrupt` so
+-- the binary aborts the streaming chat completion; `cancel_all` now
+-- matches. Without it, `graph.cancel` on the reasoner-graph side is
+-- "accept-and-drop" (the in-flight provider chat is not torn down by
+-- the scheduler today), so an interrupt-all triggered by `/new`
+-- mid-stream would let the prior turn's provider deltas keep
+-- arriving and paint into the freshly-cleared transcript. The
+-- `chat.reset` that sessions emits later in the `/new` path
+-- translates to `<provider>.reset` which only clears chat history —
+-- it does NOT interrupt the live turn — so the provider-interrupt
+-- has to ride here.
 local function cancel_all()
   local cancelled_chat = state.current_run_id ~= nil
   if cancelled_chat then
     emit("reasoner-graph", {
       kind   = "graph.cancel",
       run_id = state.current_run_id,
+    })
+    emit(state.config.provider, {
+      kind = state.config.provider .. ".interrupt",
     })
     state.current_run_id = nil
   end
@@ -224,12 +239,28 @@ local function cancel_all()
 end
 
 -- /new handler.
+--
+-- Clears orchestrator-side state so the next submit mints a fresh
+-- chat_id under the active provider. Does NOT broadcast `chat.reset`
+-- — that envelope translates to `<provider>.reset` on the wire which
+-- providers handle as `reset_all()`, wiping every chat history they
+-- hold (not just the active chat). With reset_all in the /new path,
+-- a later /resume of any prior chat under the same provider lands on
+-- a chat_id whose history the provider no longer has — the model
+-- replies with no context.
+--
+-- The clean semantics: each chat_id is an independent conversation
+-- that lives on the provider for the lifetime of the provider
+-- process. /new starts a NEW chat_id (fresh state from the model's
+-- perspective by virtue of no prior messages) without touching
+-- siblings. /resume restores any chat_id and the provider still has
+-- its history. Cross-process resume (after restarting nefor) still
+-- needs an explicit replay-from-session-log — tracked separately.
 local function new_chat()
   state.current_state = nil
   state.current_run_id = nil
   state.deferred_queue = {}
   state.pending_user_inputs = {}
-  emit(nil, { kind = "chat.reset" })
 end
 
 -- Mid-chat /model picker.
@@ -578,7 +609,9 @@ local function teardown_for_session_end()
   state.current_state      = nil
   state.deferred_queue     = {}
   state.pending_user_inputs = {}
-  emit(nil, { kind = "chat.reset" })
+  -- Don't broadcast `chat.reset` here either — same reason as new_chat
+  -- above. Provider-side chat histories stay so /resume of any prior
+  -- chat under the same provider gets its history back.
   nefor.log.info("agentic-loop: sessions.session_end → state cleared", {})
 end
 

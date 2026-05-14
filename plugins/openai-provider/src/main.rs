@@ -417,11 +417,31 @@ async fn dispatch_event(
             .await?;
         }
         "interrupt" => {
-            // Legacy `<prefix>.interrupt` is chat-agnostic; cancel
-            // every in-flight turn. Per-chat cancel happens implicitly
-            // through `chat.delete` (and via a future
-            // `<prefix>.chat.interrupt` if a need surfaces).
-            chats.interrupt_all().await;
+            // Per-chat when `chat_id` is present and known; fall back to
+            // global cancel-all when omitted (preserves the original
+            // chat-side cancel-all UX from `ef260cd`). Unknown chat_id
+            // is a logged no-op — neither fanout shape is correct.
+            //
+            // The agent reasoner emits `<provider>.interrupt { chat_id }`
+            // per cancelled sub-graph firing (see `ebea3b8`); pre-fix
+            // this handler treated every interrupt as global and the
+            // sub-graph cancel nuked the lead's chat too.
+            match read_chat_id(body) {
+                Some(chat_id) => {
+                    if chats.exists(&chat_id).await {
+                        chats.interrupt(&chat_id).await;
+                    } else {
+                        tracing::warn!(
+                            target: "openai_provider::interrupt",
+                            chat_id = %chat_id,
+                            "interrupt for unknown chat_id; ignoring",
+                        );
+                    }
+                }
+                None => {
+                    chats.interrupt_all().await;
+                }
+            }
         }
         "reset" => {
             chats.reset_all().await;
@@ -3225,5 +3245,122 @@ mod tests {
             Some(5)
         );
         assert_eq!(usage.get("model").and_then(Value::as_str), Some("qwen"));
+    }
+
+    /// Per-chat interrupt fix (companion to `ebea3b8`): `<prefix>.interrupt`
+    /// with a `chat_id` MUST cancel only that chat's in-flight turn.
+    /// Pre-fix the handler called `chats.interrupt_all()` regardless,
+    /// so the agent reasoner's per-firing fanout up-converted into a
+    /// global cancel that nuked the lead's chat too.
+    #[tokio::test]
+    async fn interrupt_with_chat_id_targets_only_that_chat() {
+        let (auth, tx, _rx) = auth_test_rig(Some("envkey"));
+        let chats = fresh_chats("m");
+        let catalog = Arc::new(ToolCatalog::new());
+        let broker = Arc::new(ToolBroker::new());
+        let config = cfg("ollama");
+        let client = reqwest::Client::builder().build().expect("client");
+
+        let id_a = ChatId::new("chat-1");
+        let id_b = ChatId::new("chat-2");
+        chats.create(id_a.clone(), None, None).await.expect("a");
+        chats.create(id_b.clone(), None, None).await.expect("b");
+        let tok_a = chats.begin_turn(&id_a).await.expect("begin a");
+        let tok_b = chats.begin_turn(&id_b).await.expect("begin b");
+
+        let body = make_event_body(
+            "ollama.interrupt",
+            &[("chat_id", Value::String("chat-1".into()))],
+        );
+        dispatch_event(
+            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &from_plugin("reasoner-graph"),
+            &body,
+        )
+        .await
+        .expect("dispatch ok");
+
+        assert!(
+            tok_a.is_cancelled(),
+            "chat-1 cancel token must fire for the targeted interrupt",
+        );
+        assert!(
+            !tok_b.is_cancelled(),
+            "chat-2 cancel token MUST NOT fire when interrupt targets chat-1; \
+             pre-fix this would be true (interrupt_all up-converted the fanout)",
+        );
+    }
+
+    /// Backwards-compat: bare `<prefix>.interrupt` (no chat_id) keeps
+    /// the original `ef260cd` shape — cancel every in-flight turn. The
+    /// chat-side `/cancel` path emits the bare envelope.
+    #[tokio::test]
+    async fn interrupt_without_chat_id_falls_back_to_interrupt_all() {
+        let (auth, tx, _rx) = auth_test_rig(Some("envkey"));
+        let chats = fresh_chats("m");
+        let catalog = Arc::new(ToolCatalog::new());
+        let broker = Arc::new(ToolBroker::new());
+        let config = cfg("ollama");
+        let client = reqwest::Client::builder().build().expect("client");
+
+        let id_a = ChatId::new("chat-1");
+        let id_b = ChatId::new("chat-2");
+        chats.create(id_a.clone(), None, None).await.expect("a");
+        chats.create(id_b.clone(), None, None).await.expect("b");
+        let tok_a = chats.begin_turn(&id_a).await.expect("begin a");
+        let tok_b = chats.begin_turn(&id_b).await.expect("begin b");
+
+        let body = make_event_body("ollama.interrupt", &[]);
+        dispatch_event(
+            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &from_plugin("nefor-chat"),
+            &body,
+        )
+        .await
+        .expect("dispatch ok");
+
+        assert!(tok_a.is_cancelled(), "bare interrupt cancels chat-1");
+        assert!(tok_b.is_cancelled(), "bare interrupt cancels chat-2");
+    }
+
+    /// Unknown chat_id is a no-op: neither `interrupt_all` (would punish
+    /// every live chat for a misrouted envelope) nor an error (the
+    /// firing might already have closed and de-registered).
+    #[tokio::test]
+    async fn interrupt_with_unknown_chat_id_is_noop() {
+        let (auth, tx, _rx) = auth_test_rig(Some("envkey"));
+        let chats = fresh_chats("m");
+        let catalog = Arc::new(ToolCatalog::new());
+        let broker = Arc::new(ToolBroker::new());
+        let config = cfg("ollama");
+        let client = reqwest::Client::builder().build().expect("client");
+
+        let id_a = ChatId::new("chat-1");
+        let id_b = ChatId::new("chat-2");
+        chats.create(id_a.clone(), None, None).await.expect("a");
+        chats.create(id_b.clone(), None, None).await.expect("b");
+        let tok_a = chats.begin_turn(&id_a).await.expect("begin a");
+        let tok_b = chats.begin_turn(&id_b).await.expect("begin b");
+
+        let body = make_event_body(
+            "ollama.interrupt",
+            &[("chat_id", Value::String("chat-nonexistent".into()))],
+        );
+        dispatch_event(
+            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &from_plugin("reasoner-graph"),
+            &body,
+        )
+        .await
+        .expect("dispatch ok");
+
+        assert!(
+            !tok_a.is_cancelled(),
+            "unknown chat_id MUST NOT cancel chat-1 (would imply interrupt_all fallback)",
+        );
+        assert!(
+            !tok_b.is_cancelled(),
+            "unknown chat_id MUST NOT cancel chat-2",
+        );
     }
 }
