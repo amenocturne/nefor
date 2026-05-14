@@ -1,73 +1,103 @@
-name: Release
+name: release
 
 on:
-  push:
-    tags:
-      - 'v*'
+  schedule:
+    # Daily nightly build at 05:05 UTC. Matches neovim's cadence.
+    - cron: '5 5 * * *'
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Tag to create + release (e.g. v0.1.3). Will be created at the workflow's checked-out ref."
-        required: true
+      tag_name:
+        description: 'Tag to release (vX.Y.Z) or "nightly"'
+        required: false
+        default: nightly
         type: string
+  push:
+    tags:
+      - v[0-9]+.[0-9]+.[0-9]+
 
 env:
   CARGO_TERM_COLOR: always
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    runs-on: macos-14
+  setup:
+    runs-on: ubuntu-latest
     outputs:
-      sha256: ${{ steps.bundle.outputs.sha256 }}
-      tag:    ${{ steps.tag.outputs.tag }}
+      release_kind: ${{ steps.kind.outputs.kind }}
+      tag_name: ${{ steps.kind.outputs.tag_name }}
+    steps:
+      - name: Resolve release kind + tag
+        id: kind
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            KIND=nightly
+            TAG=nightly
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            INPUT="${{ inputs.tag_name }}"
+            if [ "$INPUT" = "nightly" ] || [ -z "$INPUT" ]; then
+              KIND=nightly
+              TAG=nightly
+            else
+              KIND=stable
+              TAG="$INPUT"
+            fi
+          else
+            # push of a v* tag
+            KIND=stable
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "kind=$KIND" >> "$GITHUB_OUTPUT"
+          echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved: kind=$KIND tag=$TAG"
+
+  build:
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            arch_label: macos-arm64
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            arch_label: macos-x86_64
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            arch_label: linux-x86_64
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch_label: linux-arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Resolve tag
-        id: tag
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
-          else
-            TAG="${GITHUB_REF_NAME}"
-          fi
-          if [ -z "$TAG" ]; then
-            echo "could not resolve a tag" >&2
-            exit 1
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Resolved release tag: $TAG"
-
-      - name: Create + push tag (workflow_dispatch only)
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          TAG: ${{ steps.tag.outputs.tag }}
-        run: |
-          set -euo pipefail
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag "$TAG"
-          git push origin "$TAG"
+        with:
+          # Full history + tags so build.rs's `git describe` resolves
+          # the latest reachable tag (otherwise nightly builds report a
+          # stale or shallow version).
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
 
       - name: cargo build release
-        run: cargo build --release --workspace --locked --target aarch64-apple-darwin
+        run: cargo build --release --workspace --locked --target ${{ matrix.target }}
 
       - name: bundle tarball
         id: bundle
+        shell: bash
         run: |
           set -euo pipefail
-          DIST=nefor-aarch64-apple-darwin
-          TARGET_BIN=target/aarch64-apple-darwin/release
+          DIST=nefor-${{ matrix.target }}
+          TARGET_BIN=target/${{ matrix.target }}/release
 
           mkdir -p "$DIST/bin" "$DIST/share/nefor/plugins" "$DIST/share/nefor/starter"
 
@@ -79,30 +109,119 @@ jobs:
             cp "$TARGET_BIN/$p" "$DIST/share/nefor/plugins/$p"
           done
 
-          cp starter/*.lua "$DIST/share/nefor/starter/"
-          cp LICENSE README.md CHANGELOG.md "$DIST/share/nefor/"
+          cp -R starter/* "$DIST/share/nefor/starter/"
+          cp LICENSE README.md "$DIST/share/nefor/"
+          [ -f CHANGELOG.md ] && cp CHANGELOG.md "$DIST/share/nefor/" || true
 
           tar -czf "$DIST.tar.gz" "$DIST"
           SHA256=$(shasum -a 256 "$DIST.tar.gz" | awk '{print $1}')
           printf '%s  %s\n' "$SHA256" "$DIST.tar.gz" > "$DIST.tar.gz.sha256"
 
+          # Capture the binary's self-reported version (from build.rs git
+          # describe). Used by the publish job for release notes.
+          VERSION="$("$TARGET_BIN/nefor" --version | awk '{print $2}')"
           echo "tarball=$DIST.tar.gz" >> "$GITHUB_OUTPUT"
           echo "sha256_file=$DIST.tar.gz.sha256" >> "$GITHUB_OUTPUT"
           echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: gh release
-        uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          files: |
+          name: nefor-${{ matrix.target }}
+          path: |
             ${{ steps.bundle.outputs.tarball }}
             ${{ steps.bundle.outputs.sha256_file }}
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          retention-days: 1
+
+      - name: Emit per-target SHA for publish job
+        run: |
+          mkdir -p sha-out
+          echo "${{ steps.bundle.outputs.sha256 }}" > "sha-out/${{ matrix.target }}.sha256"
+          echo "${{ steps.bundle.outputs.version }}" > "sha-out/${{ matrix.target }}.version"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sha-${{ matrix.target }}
+          path: sha-out/
+          retention-days: 1
+
+  publish:
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha_macos_arm64: ${{ steps.shas.outputs.macos_arm64 }}
+      sha_macos_x86_64: ${{ steps.shas.outputs.macos_x86_64 }}
+      sha_linux_x86_64: ${{ steps.shas.outputs.linux_x86_64 }}
+      sha_linux_arm64: ${{ steps.shas.outputs.linux_arm64 }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG_NAME: ${{ needs.setup.outputs.tag_name }}
+      RELEASE_KIND: ${{ needs.setup.outputs.release_kind }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Stage tarballs + SHAs
+        id: shas
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            cp "artifacts/nefor-$target/nefor-$target.tar.gz"        "assets/"
+            cp "artifacts/nefor-$target/nefor-$target.tar.gz.sha256" "assets/"
+          done
+          echo "macos_arm64=$(cat artifacts/sha-aarch64-apple-darwin/aarch64-apple-darwin.sha256)" >> "$GITHUB_OUTPUT"
+          echo "macos_x86_64=$(cat artifacts/sha-x86_64-apple-darwin/x86_64-apple-darwin.sha256)" >> "$GITHUB_OUTPUT"
+          echo "linux_x86_64=$(cat artifacts/sha-x86_64-unknown-linux-gnu/x86_64-unknown-linux-gnu.sha256)" >> "$GITHUB_OUTPUT"
+          echo "linux_arm64=$(cat artifacts/sha-aarch64-unknown-linux-gnu/aarch64-unknown-linux-gnu.sha256)" >> "$GITHUB_OUTPUT"
+
+      - name: Pick canonical version
+        id: version
+        run: |
+          # All matrix builds report the same version; pick the first.
+          V="$(cat artifacts/sha-aarch64-apple-darwin/aarch64-apple-darwin.version)"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Replace nightly release + tag
+        if: env.RELEASE_KIND == 'nightly'
+        run: |
+          set -euo pipefail
+          # Mirrors neovim's nightly flow: delete the existing release
+          # (and its tag), then recreate. Tolerates first-run when nothing
+          # is there yet.
+          gh release delete nightly --yes --cleanup-tag || true
+
+      - name: Publish release
+        run: |
+          set -euo pipefail
+          if [ "$RELEASE_KIND" = "nightly" ]; then
+            TITLE="Nefor nightly ${{ steps.version.outputs.version }}"
+            FLAGS="--prerelease"
+          else
+            TITLE="Nefor ${{ steps.version.outputs.version }}"
+            FLAGS=""
+          fi
+          NOTES="Built from $GITHUB_SHA on $(date -u +'%Y-%m-%dT%H:%M:%SZ')."
+          gh release create "$TAG_NAME" \
+            --title "$TITLE" \
+            $FLAGS \
+            --target "$GITHUB_SHA" \
+            --notes "$NOTES" \
+            assets/*
 
   update-tap:
-    needs: release
+    needs: [setup, publish]
+    if: needs.setup.outputs.release_kind == 'stable'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout tap
@@ -110,22 +229,61 @@ jobs:
         with:
           repository: amenocturne/homebrew-tap
           token: ${{ secrets.TAP_PUSH_TOKEN }}
+          persist-credentials: true
 
       - name: Update Formula/nefor.rb
         env:
-          SHA256: ${{ needs.release.outputs.sha256 }}
-          TAG:    ${{ needs.release.outputs.tag }}
+          TAG: ${{ needs.setup.outputs.tag_name }}
+          VERSION: ${{ needs.publish.outputs.version }}
+          SHA_MACOS_ARM64: ${{ needs.publish.outputs.sha_macos_arm64 }}
+          SHA_MACOS_X86_64: ${{ needs.publish.outputs.sha_macos_x86_64 }}
+          SHA_LINUX_X86_64: ${{ needs.publish.outputs.sha_linux_x86_64 }}
+          SHA_LINUX_ARM64: ${{ needs.publish.outputs.sha_linux_arm64 }}
         run: |
           set -euo pipefail
-          VERSION="${TAG#v}"
-          URL="https://github.com/amenocturne/nefor/releases/download/${TAG}/nefor-aarch64-apple-darwin.tar.gz"
-          sed -i "s|^  url \".*\"|  url \"$URL\"|"       Formula/nefor.rb
-          sed -i "s|^  sha256 \".*\"|  sha256 \"$SHA256\"|" Formula/nefor.rb
-          sed -i "s|^  version \".*\"|  version \"$VERSION\"|" Formula/nefor.rb
+          BASE="https://github.com/amenocturne/nefor/releases/download/${TAG}"
+          # Replace the four (url, sha256) pairs in the multi-platform
+          # formula. The formula keeps a stable structure (see the
+          # template in the tap repo) so awk can match the marker
+          # comments and substitute the lines beneath.
+          python3 - <<'PY'
+          import os, re, pathlib
+          path = pathlib.Path("Formula/nefor.rb")
+          src = path.read_text()
+          version = os.environ["VERSION"]
+          base    = "https://github.com/amenocturne/nefor/releases/download/" + os.environ["TAG"]
+          shas = {
+              "MACOS_ARM64":  os.environ["SHA_MACOS_ARM64"],
+              "MACOS_X86_64": os.environ["SHA_MACOS_X86_64"],
+              "LINUX_X86_64": os.environ["SHA_LINUX_X86_64"],
+              "LINUX_ARM64":  os.environ["SHA_LINUX_ARM64"],
+          }
+          targets = {
+              "MACOS_ARM64":  "aarch64-apple-darwin",
+              "MACOS_X86_64": "x86_64-apple-darwin",
+              "LINUX_X86_64": "x86_64-unknown-linux-gnu",
+              "LINUX_ARM64":  "aarch64-unknown-linux-gnu",
+          }
+          src = re.sub(r'^(\s*version\s+)"[^"]*"', rf'\1"{version}"', src, count=1, flags=re.MULTILINE)
+          for slot, sha in shas.items():
+              target = targets[slot]
+              url = f"{base}/nefor-{target}.tar.gz"
+              # Match the lines following a `# slot: SLOT` marker comment.
+              # Tap formula keeps that marker so we don't have to parse
+              # ruby block structure.
+              pat = re.compile(
+                  rf'(# slot: {slot}\n\s+url\s+)"[^"]*"(\n\s+sha256\s+)"[^"]*"',
+                  re.MULTILINE,
+              )
+              src, n = pat.subn(rf'\1"{url}"\2"{sha}"', src, count=1)
+              if n != 1:
+                  raise SystemExit(f"slot {slot} not found in Formula/nefor.rb (need '# slot: {slot}' marker)")
+          path.write_text(src)
+          PY
 
       - name: Commit + push
         env:
-          TAG: ${{ needs.release.outputs.tag }}
+          TAG: ${{ needs.setup.outputs.tag_name }}
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"

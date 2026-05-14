@@ -7,7 +7,7 @@
 //! 3. Boot the Lua VM with a [`BrokerOps`] routing sink and run
 //!    `init.lua`. Cache the global `dispatch` function — fatal if missing.
 //! 4. Branch on [`cli::EngineMode`]:
-//!    - `Tui`: build a [`Broker`], spawn every registered plugin, install
+//!    - `Serve`: build a [`Broker`], spawn every registered plugin, install
 //!      a `ctrl_c` shutdown hook, and run the broker until it exits.
 //!    - `PluginList`: print the engine version + every plugin that
 //!      registered a `cli` function, exit 0.
@@ -120,9 +120,9 @@ async fn main() -> anyhow::Result<()> {
     .map_err(NeforError::from)
     .context("initializing Lua VM")?;
 
-    // CLI dispatch vs TUI: the bindings need to know the active mode so
-    // `nefor.io.read_line` short-circuits to nil in TUI (where stdin is
-    // unused) instead of blocking on a channel nothing pumps.
+    // CLI dispatch vs serve: the bindings need to know the active mode so
+    // `nefor.io.read_line` short-circuits to nil in serve mode (where
+    // engine stdin is unused) instead of blocking on a channel nothing pumps.
     host.set_mode(mode.clone());
 
     let init_lua = config_dir.as_path().join("init.lua");
@@ -167,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
         .context("caching dispatch function from init.lua")?;
 
     match mode {
-        EngineMode::Tui => run_tui(host, plugins, shared, args.plugin_dir.clone()).await,
+        EngineMode::Serve => run_serve(host, plugins, shared, args.plugin_dir.clone()).await,
         EngineMode::PluginList => run_plugin_list(plugins),
         EngineMode::PluginDispatch { name, args: argv } => {
             run_plugin_dispatch(host, plugins, shared, args.plugin_dir.clone(), name, argv).await
@@ -176,7 +176,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Standard run loop — broker until shutdown.
-async fn run_tui(
+async fn run_serve(
     host: LuaHost,
     plugins: SharedPluginRegistry,
     shared: Arc<Mutex<BrokerShared>>,
@@ -236,7 +236,7 @@ fn run_plugin_list(plugins: SharedPluginRegistry) -> anyhow::Result<()> {
             .map(|n| n.as_str().to_owned())
             .collect()
     };
-    println!("nefor {}", env!("CARGO_PKG_VERSION"));
+    println!("nefor {}", env!("NEFOR_VERSION"));
     if names.is_empty() {
         println!("(no plugins with a `cli` field registered)");
     } else {
