@@ -336,6 +336,41 @@ local function render_plan_entry(entry)
   )
 end
 
+-- AGENTS.md auto-load: tool-gate emits a system message when a path-
+-- touching tool call lands in a directory with an AGENTS.md. The text
+-- carries project guidance for the model but is noisy in the chat
+-- surface — render it as a foldable block keyed on the path (parallels
+-- the tool_call collapsed/expanded shape).
+local function agents_md_collapsed(entry)
+  local path = entry.path or "AGENTS.md"
+  return tui.column { gap = 0, children = {
+    tui.text {
+      content = "▸ AGENTS.md(" .. path .. ")",
+      style   = STYLE.footer,
+      wrap    = "none",
+    },
+  } }
+end
+
+local function agents_md_expanded(entry)
+  local path = entry.path or "AGENTS.md"
+  local rows = { tui.text {
+    content = "▼ AGENTS.md(" .. path .. ")",
+    style   = STYLE.footer,
+    wrap    = "none",
+  } }
+  local body = entry.text or ""
+  if #body > 0 then
+    local indented = "  " .. body:gsub("\n", "\n  ")
+    rows[#rows + 1] = tui.text {
+      content = pad_block(indented),
+      style   = { fg = C.md_code_fg, bg = C.md_code_block_bg },
+      wrap    = "none",
+    }
+  end
+  return tui.column { gap = 0, children = rows }
+end
+
 function M.render(entry, _i, expanded)
   if entry.kind == "tool_call" then
     if expanded then return tool_expanded(entry) end
@@ -344,6 +379,10 @@ function M.render(entry, _i, expanded)
   if entry.kind == "graph_result" then
     if expanded then return graph_result_expanded(entry) end
     return graph_result_collapsed(entry)
+  end
+  if entry.kind == "agents_md" then
+    if expanded then return agents_md_expanded(entry) end
+    return agents_md_collapsed(entry)
   end
   if entry.kind == "plan" then
     return render_plan_entry(entry)
