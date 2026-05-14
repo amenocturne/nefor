@@ -187,10 +187,7 @@ fn parse_spec_rejects_empty_string_name() {
         )
         .exec()
         .expect_err("empty name must fail");
-    assert!(
-        err.to_string().contains("non-empty string"),
-        "got: {err}"
-    );
+    assert!(err.to_string().contains("non-empty string"), "got: {err}");
 }
 
 #[test]
@@ -289,7 +286,10 @@ fn lockfile_roundtrip_sorted_keys() {
     let alpha_pos = body.find("\"alpha\"").expect("alpha present");
     let mid_pos = body.find("\"mid\"").expect("mid present");
     let zeta_pos = body.find("\"zeta\"").expect("zeta present");
-    assert!(alpha_pos < mid_pos && mid_pos < zeta_pos, "keys must be sorted; got {body}");
+    assert!(
+        alpha_pos < mid_pos && mid_pos < zeta_pos,
+        "keys must be sorted; got {body}"
+    );
 
     let ok: bool = lua
         .load(
@@ -373,11 +373,7 @@ fn dir_override_basename_can_differ_from_name() {
     // was rejected at parse time; post-fix it resolves via the symlink.
     let plug_dir = tempdir.path().join("repo/plugins/nefor-tui/lua");
     std::fs::create_dir_all(&plug_dir).expect("mkdir");
-    std::fs::write(
-        plug_dir.join("init.lua"),
-        "return { tag = 'nefor-tui' }\n",
-    )
-    .expect("write");
+    std::fs::write(plug_dir.join("init.lua"), "return { tag = 'nefor-tui' }\n").expect("write");
 
     let lua = lua_with_pm();
     let tag: String = lua
@@ -625,8 +621,11 @@ fn make_origin_repo(path: &std::path::Path) -> String {
             .current_dir(path)
             .output()
             .expect("run git");
-        assert!(out.status.success(), "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     std::fs::create_dir_all(path).expect("mkdir origin");
     git(&["init", "--initial-branch=main", "--quiet"]);
@@ -673,14 +672,24 @@ fn install_clones_and_creates_lockfile() {
     assert!(ok);
 
     // The clone should exist with README.md present.
-    let cloned = data.path().join("plugins").join("test-plugin").join("README.md");
+    let cloned = data
+        .path()
+        .join("plugins")
+        .join("test-plugin")
+        .join("README.md");
     assert!(cloned.exists(), "clone missing: {}", cloned.display());
 
     // Lockfile must contain the entry with a commit sha.
     let lockfile = data.path().join("plugins").join("nefor-pm.lock.json");
     let body = std::fs::read_to_string(&lockfile).expect("read lockfile");
-    assert!(body.contains("\"test-plugin\""), "lock missing entry: {body}");
-    assert!(body.contains("\"ref\":\"main\""), "ref not recorded: {body}");
+    assert!(
+        body.contains("\"test-plugin\""),
+        "lock missing entry: {body}"
+    );
+    assert!(
+        body.contains("\"ref\":\"main\""),
+        "ref not recorded: {body}"
+    );
 }
 
 #[test]
@@ -714,13 +723,26 @@ fn install_sparse_checkout_pulls_only_subtree() {
     let nested = plug_root.join("lua-libs").join("test-lib.lua");
     let decoy = plug_root.join("rust-bin").join("README");
     let dotgit = plug_root.join(".git");
-    assert!(flat.exists(), "flattened lua file missing: {}", flat.display());
-    assert!(!nested.exists(),
-        "subtree path component not removed: {}", nested.display());
-    assert!(!decoy.exists(),
-        "sparse-checkout leaked rust-bin/: {}", decoy.display());
-    assert!(dotgit.exists(),
-        ".git was disturbed by flatten: {}", dotgit.display());
+    assert!(
+        flat.exists(),
+        "flattened lua file missing: {}",
+        flat.display()
+    );
+    assert!(
+        !nested.exists(),
+        "subtree path component not removed: {}",
+        nested.display()
+    );
+    assert!(
+        !decoy.exists(),
+        "sparse-checkout leaked rust-bin/: {}",
+        decoy.display()
+    );
+    assert!(
+        dotgit.exists(),
+        ".git was disturbed by flatten: {}",
+        dotgit.display()
+    );
 }
 
 /// Build a repo whose contents live deep in a path
@@ -733,8 +755,11 @@ fn make_deep_origin_repo(path: &std::path::Path) -> String {
             .current_dir(path)
             .output()
             .expect("run git");
-        assert!(out.status.success(), "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     std::fs::create_dir_all(path).expect("mkdir origin");
     git(&["init", "--initial-branch=main", "--quiet"]);
@@ -742,16 +767,10 @@ fn make_deep_origin_repo(path: &std::path::Path) -> String {
     git(&["config", "user.name", "Test"]);
     let deep = path.join("subdir").join("deep").join("lib");
     std::fs::create_dir_all(&deep).expect("mkdir deep");
-    std::fs::write(
-        deep.join("init.lua"),
-        "return { name = 'deep-lib' }\n",
-    )
-    .expect("write init.lua");
-    std::fs::write(
-        deep.join("helper.lua"),
-        "return { tag = 'helper' }\n",
-    )
-    .expect("write helper.lua");
+    std::fs::write(deep.join("init.lua"), "return { name = 'deep-lib' }\n")
+        .expect("write init.lua");
+    std::fs::write(deep.join("helper.lua"), "return { tag = 'helper' }\n")
+        .expect("write helper.lua");
     std::fs::write(path.join("README.md"), "root\n").expect("write README");
     git(&["add", "."]);
     git(&["commit", "-m", "init", "--quiet"]);
@@ -781,20 +800,32 @@ fn install_flattens_deeply_nested_sparse_subtree() {
         url
     );
     let name: String = lua.load(&script).eval().expect("install");
-    assert_eq!(name, "deep-lib",
-        "require('deep-lib') must resolve to init.lua flattened up from the subtree");
+    assert_eq!(
+        name, "deep-lib",
+        "require('deep-lib') must resolve to init.lua flattened up from the subtree"
+    );
 
     let plug_root = data.path().join("plugins").join("deep-lib");
     // Files are flat: <plug_root>/init.lua, <plug_root>/helper.lua.
-    assert!(plug_root.join("init.lua").exists(),
-        "init.lua not at flat path: {}", plug_root.join("init.lua").display());
-    assert!(plug_root.join("helper.lua").exists(),
-        "helper.lua not at flat path");
+    assert!(
+        plug_root.join("init.lua").exists(),
+        "init.lua not at flat path: {}",
+        plug_root.join("init.lua").display()
+    );
+    assert!(
+        plug_root.join("helper.lua").exists(),
+        "helper.lua not at flat path"
+    );
     // Intermediate path components are gone.
-    assert!(!plug_root.join("subdir").exists(),
-        "intermediate subdir/ should be removed");
+    assert!(
+        !plug_root.join("subdir").exists(),
+        "intermediate subdir/ should be removed"
+    );
     // .git survives so subsequent updates work.
-    assert!(plug_root.join(".git").exists(), ".git was disturbed by flatten");
+    assert!(
+        plug_root.join(".git").exists(),
+        ".git was disturbed by flatten"
+    );
     // Re-running install is idempotent: the flat layout stays in place.
     let ok: bool = lua
         .load(format!(
@@ -856,13 +887,28 @@ fn install_runs_build_callback_and_records_hash() {
     );
     let bin_path: String = lua.load(&script).eval().expect("install");
 
-    assert!(std::path::Path::new(&bin_path).exists(), "build artefact missing: {bin_path}");
-    let first: i64 = lua.globals().get("_first_invocation_count").expect("first count");
-    let second: i64 = lua.globals().get("_second_invocation_count").expect("second count");
+    assert!(
+        std::path::Path::new(&bin_path).exists(),
+        "build artefact missing: {bin_path}"
+    );
+    let first: i64 = lua
+        .globals()
+        .get("_first_invocation_count")
+        .expect("first count");
+    let second: i64 = lua
+        .globals()
+        .get("_second_invocation_count")
+        .expect("second count");
     assert_eq!(first, 1, "build must run on first install");
-    assert_eq!(second, 1, "build must be skipped on second idempotent install");
+    assert_eq!(
+        second, 1,
+        "build must be skipped on second idempotent install"
+    );
     let last_dir: String = lua.globals().get("_last_plugin_dir").expect("plugin.dir");
-    assert!(last_dir.ends_with("plugins/with-build"), "plugin.dir = {last_dir}");
+    assert!(
+        last_dir.ends_with("plugins/with-build"),
+        "plugin.dir = {last_dir}"
+    );
     let last_tag: String = lua.globals().get("_last_plugin_tag").expect("plugin.tag");
     assert_eq!(last_tag, "main");
 }
@@ -891,15 +937,23 @@ fn install_skips_clone_when_lockfile_matches_head() {
 
     let plug_dir = data.path().join("plugins").join("twice");
     let head_path = plug_dir.join(".git").join("HEAD");
-    let mtime_before = std::fs::metadata(&head_path).expect("stat head").modified().expect("mtime");
+    let mtime_before = std::fs::metadata(&head_path)
+        .expect("stat head")
+        .modified()
+        .expect("mtime");
 
     // Sleep a beat so a second clone would produce a distinguishable mtime.
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     let _: bool = lua.load(&install_script).eval().expect("install 2");
-    let mtime_after = std::fs::metadata(&head_path).expect("stat head 2").modified().expect("mtime");
-    assert_eq!(mtime_before, mtime_after,
-        ".git/HEAD mtime must not change on idempotent re-install");
+    let mtime_after = std::fs::metadata(&head_path)
+        .expect("stat head 2")
+        .modified()
+        .expect("mtime");
+    assert_eq!(
+        mtime_before, mtime_after,
+        ".git/HEAD mtime must not change on idempotent re-install"
+    );
 }
 
 #[test]
@@ -925,8 +979,14 @@ fn install_failed_clone_surfaces_structured_error() {
         .exec()
         .expect_err("clone of missing repo must error");
     let msg = err.to_string();
-    assert!(msg.contains("nefor-pm[broken]"), "error must be labelled by name: {msg}");
-    assert!(msg.contains("git exited"), "error must surface the structured exit: {msg}");
+    assert!(
+        msg.contains("nefor-pm[broken]"),
+        "error must be labelled by name: {msg}"
+    );
+    assert!(
+        msg.contains("git exited"),
+        "error must surface the structured exit: {msg}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -940,16 +1000,9 @@ fn load_resolves_submodule_under_plugin_dir() {
     let _g = DataDirGuard::new(tempdir.path());
     let plug_dir = tempdir.path().join("nefor-libs");
     std::fs::create_dir_all(&plug_dir).expect("mkdir plugin root");
-    std::fs::write(
-        plug_dir.join("subm.lua"),
-        "return { tag = 'subm' }\n",
-    )
-    .expect("write subm");
-    std::fs::write(
-        plug_dir.join("init.lua"),
-        "return { tag = 'root' }\n",
-    )
-    .expect("write root init");
+    std::fs::write(plug_dir.join("subm.lua"), "return { tag = 'subm' }\n").expect("write subm");
+    std::fs::write(plug_dir.join("init.lua"), "return { tag = 'root' }\n")
+        .expect("write root init");
 
     let lua = lua_with_pm();
     let (a, b): (String, String) = lua
@@ -968,4 +1021,3 @@ fn load_resolves_submodule_under_plugin_dir() {
     assert_eq!(a, "root");
     assert_eq!(b, "subm");
 }
-

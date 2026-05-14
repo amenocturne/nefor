@@ -7,7 +7,7 @@ Rust binaries via `nefor-pm`.
 
 In-tree development inside this repo uses `dir`-overrides on every
 `pm.install` spec and never hits the fetch path, so the bootstrap is
-only relevant to configs that *don't* sit next to the upstream tree.
+only relevant to configs that _don't_ sit next to the upstream tree.
 
 ## The chicken-and-egg problem
 
@@ -108,7 +108,7 @@ pm.install({
 - Behaviour is idempotent: the existence check on `pm_init` short-circuits
   on every boot after the first.
 - The engine binary must be installed separately — this bootstrap only
-  fetches the *Lua* side of nefor. Use your platform's package manager
+  fetches the _Lua_ side of nefor. Use your platform's package manager
   for the engine itself (or build from source via `cargo install`).
 - If you want a specific upstream tag for the pm itself (rather than
   default branch), change the `git clone` flags to add `--branch <tag>`.

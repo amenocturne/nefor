@@ -223,7 +223,10 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
     let starter_str = starter.display().to_string();
     let lua_root = lua_dir();
     let lua_root_str = lua_root.display().to_string();
-    let rg_plugin_lua = repo_root().join("plugins").join("reasoner-graph").join("lua");
+    let rg_plugin_lua = repo_root()
+        .join("plugins")
+        .join("reasoner-graph")
+        .join("lua");
     let rg_plugin_lua_str = rg_plugin_lua.display().to_string();
     let script = format!(
         r#"

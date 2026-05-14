@@ -871,7 +871,8 @@ mod tests {
             }],
         )
         .expect("install");
-        r.install("mock-plugin", vec![], vec![]).expect("unregister");
+        r.install("mock-plugin", vec![], vec![])
+            .expect("unregister");
         assert!(r.merge_handler(&fqt("mock-plugin", "Message")).is_none());
         assert_eq!(r.entry_count(), 0);
     }

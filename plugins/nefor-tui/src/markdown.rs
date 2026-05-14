@@ -494,11 +494,7 @@ impl<'a> Walker<'a> {
         // the main output stream, not to cell-internal text. Cell content
         // is only inline (text, code, soft-breaks-as-spaces) so the
         // newline-tracking flags don't need to follow.
-        if let Some(cell) = self
-            .table
-            .as_mut()
-            .and_then(|t| t.current_cell.as_mut())
-        {
+        if let Some(cell) = self.table.as_mut().and_then(|t| t.current_cell.as_mut()) {
             for ch in s.chars() {
                 cell.push(StyledChar { ch, style });
             }
@@ -624,7 +620,11 @@ impl<'a> Walker<'a> {
         let header_count = state.header_rows.min(num_rows);
 
         for (row_idx, wrapped_row) in wrapped.iter().enumerate() {
-            let visual_lines = wrapped_row.iter().map(|c| c.len().max(1)).max().unwrap_or(1);
+            let visual_lines = wrapped_row
+                .iter()
+                .map(|c| c.len().max(1))
+                .max()
+                .unwrap_or(1);
             for line_idx in 0..visual_lines {
                 self.emit_str("│", Style::default());
                 for (col_idx, cell_lines) in wrapped_row.iter().enumerate() {
@@ -890,10 +890,7 @@ mod tests {
     /// Test shim: keeps the historical 2-arg call shape working. Most
     /// tests don't care about the table-fit budget — pass `None` so the
     /// renderer falls back to natural widths.
-    fn render_to_styled_chars(
-        source: &str,
-        theme: Option<&MarkdownTheme>,
-    ) -> Vec<StyledChar> {
+    fn render_to_styled_chars(source: &str, theme: Option<&MarkdownTheme>) -> Vec<StyledChar> {
         super::render_to_styled_chars(source, theme, None)
     }
 
@@ -1265,10 +1262,7 @@ mod tests {
             .iter()
             .position(|l| l.starts_with("│ a"))
             .expect("body row with short cell `a` should exist");
-        let continuation = lines
-            .get(body_row + 1)
-            .copied()
-            .unwrap_or_default();
+        let continuation = lines.get(body_row + 1).copied().unwrap_or_default();
         // Continuation: starts with `│`, then whitespace-only short
         // column, then `│`, then more content.
         let short_col_blank = continuation
@@ -1364,14 +1358,16 @@ code
         // appear with `\n\n` (not more) somewhere between them.
         let boundaries = [
             ("Header", "para text"),
-            ("para text", "│"),     // paragraph → table
-            ("─┤", "code"),          // table-divider → code (header divider just before code body)
-            ("code", "▎"),           // code block → blockquote
-            ("quoted", "-"),         // blockquote → list
-            ("list item", "─"),      // list → horizontal rule (rendered as `─`-fill)
+            ("para text", "│"), // paragraph → table
+            ("─┤", "code"),     // table-divider → code (header divider just before code body)
+            ("code", "▎"),      // code block → blockquote
+            ("quoted", "-"),    // blockquote → list
+            ("list item", "─"), // list → horizontal rule (rendered as `─`-fill)
         ];
         for (a, b) in boundaries {
-            let ai = s.find(a).unwrap_or_else(|| panic!("prefix {a:?} not found in {s:?}"));
+            let ai = s
+                .find(a)
+                .unwrap_or_else(|| panic!("prefix {a:?} not found in {s:?}"));
             let after_a = &s[ai + a.len()..];
             let bi_rel = after_a
                 .find(b)

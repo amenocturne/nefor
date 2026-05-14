@@ -300,9 +300,8 @@ async fn dispatch_event(
             // ignored — same as before.
             let tools_field = body.get("tools");
             let tools_enabled = tools_field.and_then(Value::as_bool);
-            let tool_allowlist: Option<Vec<String>> = tools_field
-                .and_then(Value::as_array)
-                .map(|arr| {
+            let tool_allowlist: Option<Vec<String>> =
+                tools_field.and_then(Value::as_array).map(|arr| {
                     arr.iter()
                         .filter_map(|v| v.as_str().map(str::to_owned))
                         .collect()
@@ -395,7 +394,15 @@ async fn dispatch_event(
                 "chat.complete",
             );
             start_completion_turn(
-                chats, auth, catalog, broker, config, client, out_tx, chat_id, false,
+                chats,
+                auth,
+                catalog,
+                broker,
+                config,
+                client,
+                out_tx,
+                chat_id,
+                false,
                 extra_tools,
             )
             .await?;
@@ -451,7 +458,15 @@ async fn dispatch_event(
             }
             chats.push_user(&chat_id, text).await?;
             start_completion_turn(
-                chats, auth, catalog, broker, config, client, out_tx, chat_id, true,
+                chats,
+                auth,
+                catalog,
+                broker,
+                config,
+                client,
+                out_tx,
+                chat_id,
+                true,
                 Vec::new(),
             )
             .await?;
@@ -732,8 +747,7 @@ fn spawn_turn(
             // filter (the chat sees the full set). Used by the lead
             // orchestrator and the agent reasoner to scope each chat's
             // tool surface; the catalog itself remains process-wide.
-            let chat_tool_allowlist =
-                chats.tool_allowlist(&chat_id).await.unwrap_or(None);
+            let chat_tool_allowlist = chats.tool_allowlist(&chat_id).await.unwrap_or(None);
             let mut tools_array = if chat_tools_on && model_tools_supported {
                 catalog.to_openai_tools().await
             } else {
@@ -2913,8 +2927,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(30)).await;
             }
             let finish = "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n";
-            let usage =
-                "data: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5}}\n\n";
+            let usage = "data: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5}}\n\n";
             let done = "data: [DONE]\n\n";
             for frame in [finish, usage, done] {
                 let chunk = format!("{:x}\r\n{}\r\n", frame.len(), frame);
@@ -2942,7 +2955,13 @@ mod tests {
             &[("chat_id", Value::String("c-interrupt".into()))],
         );
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
             &from_plugin("reasoner-graph"),
             &create_body,
         )
@@ -2961,7 +2980,13 @@ mod tests {
             ],
         );
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
             &from_plugin("reasoner-graph"),
             &append_body,
         )
@@ -2974,7 +2999,13 @@ mod tests {
             &[("chat_id", Value::String("c-interrupt".into()))],
         );
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
             &from_plugin("reasoner-graph"),
             &complete_body,
         )
@@ -2992,9 +3023,7 @@ mod tests {
                 let line = msg.to_line();
                 let v: Value = serde_json::from_str(&line).expect("plugin out json");
                 if let Some(body) = v.get("body").and_then(Value::as_object) {
-                    if body.get("kind").and_then(Value::as_str)
-                        == Some("ollama.stream.delta")
-                    {
+                    if body.get("kind").and_then(Value::as_str) == Some("ollama.stream.delta") {
                         delta_count += 1;
                         if let Some(t) = body.get("text").and_then(Value::as_str) {
                             wire_partial.push_str(t);
@@ -3169,7 +3198,13 @@ mod tests {
             &[("chat_id", Value::String("c-extra".into()))],
         );
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
             &from_plugin("reasoner-graph"),
             &create_body,
         )
@@ -3188,7 +3223,13 @@ mod tests {
             ],
         );
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
             &from_plugin("reasoner-graph"),
             &append_body,
         )
@@ -3221,7 +3262,13 @@ mod tests {
             ],
         );
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
             &from_plugin("reasoner-graph"),
             &complete_body,
         )
@@ -3256,12 +3303,8 @@ mod tests {
         // 5. Assert the captured upstream request body included the
         //    finalize tool in its `tools` array.
         let body = captured.lock().await.clone();
-        assert!(
-            !body.is_empty(),
-            "server must have captured a request body",
-        );
-        let v: serde_json::Value =
-            serde_json::from_str(&body).expect("upstream request body json");
+        assert!(!body.is_empty(), "server must have captured a request body",);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("upstream request body json");
         let tools = v
             .get("tools")
             .and_then(|t| t.as_array())
@@ -3387,7 +3430,13 @@ mod tests {
             ],
         );
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
             &from_plugin("reasoner-graph"),
             &create_body,
         )
@@ -3406,7 +3455,13 @@ mod tests {
             ],
         );
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
             &from_plugin("reasoner-graph"),
             &append_body,
         )
@@ -3419,7 +3474,13 @@ mod tests {
             &[("chat_id", Value::String("c-allow".into()))],
         );
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
             &from_plugin("reasoner-graph"),
             &complete_body,
         )
@@ -3454,12 +3515,8 @@ mod tests {
         //    should be present in the tools array. `spawn_graph` MUST
         //    have been filtered.
         let body = captured.lock().await.clone();
-        assert!(
-            !body.is_empty(),
-            "server must have captured a request body",
-        );
-        let v: serde_json::Value =
-            serde_json::from_str(&body).expect("upstream request body json");
+        assert!(!body.is_empty(), "server must have captured a request body",);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("upstream request body json");
         let tools = v
             .get("tools")
             .and_then(|t| t.as_array())
@@ -3569,8 +3626,14 @@ mod tests {
     #[tokio::test]
     async fn two_concurrent_chats_have_independent_histories() {
         let chats = fresh_chats("m");
-        chats.create(ChatId::new("a"), None, None, None).await.expect("a");
-        chats.create(ChatId::new("b"), None, None, None).await.expect("b");
+        chats
+            .create(ChatId::new("a"), None, None, None)
+            .await
+            .expect("a");
+        chats
+            .create(ChatId::new("b"), None, None, None)
+            .await
+            .expect("b");
         chats
             .push_user(&ChatId::new("a"), "alpha".into())
             .await
@@ -3741,8 +3804,14 @@ mod tests {
 
         let id_a = ChatId::new("chat-1");
         let id_b = ChatId::new("chat-2");
-        chats.create(id_a.clone(), None, None, None).await.expect("a");
-        chats.create(id_b.clone(), None, None, None).await.expect("b");
+        chats
+            .create(id_a.clone(), None, None, None)
+            .await
+            .expect("a");
+        chats
+            .create(id_b.clone(), None, None, None)
+            .await
+            .expect("b");
         let tok_a = chats.begin_turn(&id_a).await.expect("begin a");
         let tok_b = chats.begin_turn(&id_b).await.expect("begin b");
 
@@ -3751,7 +3820,13 @@ mod tests {
             &[("chat_id", Value::String("chat-1".into()))],
         );
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
             &from_plugin("reasoner-graph"),
             &body,
         )
@@ -3783,14 +3858,26 @@ mod tests {
 
         let id_a = ChatId::new("chat-1");
         let id_b = ChatId::new("chat-2");
-        chats.create(id_a.clone(), None, None, None).await.expect("a");
-        chats.create(id_b.clone(), None, None, None).await.expect("b");
+        chats
+            .create(id_a.clone(), None, None, None)
+            .await
+            .expect("a");
+        chats
+            .create(id_b.clone(), None, None, None)
+            .await
+            .expect("b");
         let tok_a = chats.begin_turn(&id_a).await.expect("begin a");
         let tok_b = chats.begin_turn(&id_b).await.expect("begin b");
 
         let body = make_event_body("ollama.interrupt", &[]);
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
             &from_plugin("nefor-chat"),
             &body,
         )
@@ -3815,8 +3902,14 @@ mod tests {
 
         let id_a = ChatId::new("chat-1");
         let id_b = ChatId::new("chat-2");
-        chats.create(id_a.clone(), None, None, None).await.expect("a");
-        chats.create(id_b.clone(), None, None, None).await.expect("b");
+        chats
+            .create(id_a.clone(), None, None, None)
+            .await
+            .expect("a");
+        chats
+            .create(id_b.clone(), None, None, None)
+            .await
+            .expect("b");
         let tok_a = chats.begin_turn(&id_a).await.expect("begin a");
         let tok_b = chats.begin_turn(&id_b).await.expect("begin b");
 
@@ -3825,7 +3918,13 @@ mod tests {
             &[("chat_id", Value::String("chat-nonexistent".into()))],
         );
         dispatch_event(
-            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
             &from_plugin("reasoner-graph"),
             &body,
         )

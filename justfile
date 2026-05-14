@@ -26,8 +26,8 @@ fmt:
 build:
     cargo build --workspace --release
 
-# Composite: install-nefor + install-starter. End-to-end first-time setup. Channel forwarded to install-nefor.
-install channel="source": (install-nefor channel) install-starter
+# Composite: install-nefor + install-starter. End-to-end first-time setup. `channel` (source|latest|nightly) forwards to install-nefor; `mode` (safe|force) forwards to install-starter.
+install channel="source" mode="safe": (install-nefor channel) (install-starter mode)
     @echo
     @echo "Installed -> ~/.local/share/nefor/bin (plugins + da), ${PREFIX:-$HOME/.local}/bin/nefor (CLI entry)"
     @echo "Make sure your shell has:"

@@ -60,6 +60,17 @@ pub struct ToolCallFunction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
+    /// Wire serialization quirk: Ollama's `/api/chat` validator rejects
+    /// `{"role": "assistant", "content": null, "tool_calls": [...]}`
+    /// with `invalid message content type: <nil>`. The OpenAI spec says
+    /// null is correct on a tool-calls-only assistant turn, but Ollama's
+    /// JSON unmarshal trips before reaching the spec-defined branch. We
+    /// `skip_serializing_if = Option::is_none` so the field is omitted
+    /// entirely on that shape — both OpenAI and Ollama accept the
+    /// missing-field form. Without this, every multi-tool turn against
+    /// Ollama 400'd on the next chat.complete after the lead's first
+    /// tool call.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub tool_calls: Vec<ToolCall>,
@@ -442,7 +453,14 @@ mod tests {
     }
 
     #[test]
-    fn message_assistant_tool_calls_has_null_content_on_wire() {
+    fn message_assistant_tool_calls_omits_content_field_on_wire() {
+        // Updated from prior null-on-wire shape to absent-field shape.
+        // Ollama's `/api/chat` validator rejects `content: null` with
+        // `invalid message content type: <nil>`, breaking every
+        // multi-tool turn after the lead's first dispatch. Both OpenAI
+        // and Ollama accept the field-omitted form (Option::None →
+        // skip_serializing_if), so omitting is the safe shape across
+        // providers.
         let calls = vec![ToolCall {
             id: "call_1".into(),
             kind: "function".into(),
@@ -455,8 +473,10 @@ mod tests {
         assert_eq!(msg.role, "assistant");
         assert!(msg.content.is_none());
         let v = serde_json::to_value(&msg).expect("ser");
-        assert!(v.get("content").is_some(), "explicit null serialized");
-        assert_eq!(v.get("content").unwrap(), &serde_json::Value::Null);
+        assert!(
+            v.get("content").is_none(),
+            "content field must be omitted (not null) for Ollama compatibility"
+        );
         assert_eq!(
             v.get("tool_calls")
                 .and_then(|c| c.as_array())

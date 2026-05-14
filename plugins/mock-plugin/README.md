@@ -24,35 +24,35 @@ All entry points live under a global `nefor` table.
 
 ### Identity and state
 
-| Entry | Type | Description |
-|-------|------|-------------|
-| `nefor.name` | string | The plugin's wire identity. Read-only. |
+| Entry         | Type   | Description                                                                                                          |
+| ------------- | ------ | -------------------------------------------------------------------------------------------------------------------- |
+| `nefor.name`  | string | The plugin's wire identity. Read-only.                                                                               |
 | `nefor.state` | string | Current lifecycle state: `"awaiting_ready_ok"`, `"ready"`, or `"shutting_down"`. Reads always return the live value. |
 
 ### Handlers
 
 All handlers are optional — a script with no handlers loads fine and does nothing.
 
-| Entry | Description |
-|-------|-------------|
-| `nefor.on(kind, fn)` | Register a handler for a specific event `kind`. The callback is called with `(body_table, envelope_table)` where `envelope_table` has `type`, `from`, and `ts`. `kind` is matched literally (e.g. `"mock-plugin.delta"`). |
-| `nefor.on_any(fn)` | Register a catch-all handler, called for every event after any specific `on` handler fires. |
-| `nefor.on_ready_ok(fn)` | Called once, immediately after the engine's `ready_ok` arrives. Takes no args. |
-| `nefor.on_shutdown(fn)` | Called once when the engine asks us to shut down (or stdin closes, or a signal arrives). Takes no args. The plugin exits after the handler returns. |
+| Entry                   | Description                                                                                                                                                                                                               |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `nefor.on(kind, fn)`    | Register a handler for a specific event `kind`. The callback is called with `(body_table, envelope_table)` where `envelope_table` has `type`, `from`, and `ts`. `kind` is matched literally (e.g. `"mock-plugin.delta"`). |
+| `nefor.on_any(fn)`      | Register a catch-all handler, called for every event after any specific `on` handler fires.                                                                                                                               |
+| `nefor.on_ready_ok(fn)` | Called once, immediately after the engine's `ready_ok` arrives. Takes no args.                                                                                                                                            |
+| `nefor.on_shutdown(fn)` | Called once when the engine asks us to shut down (or stdin closes, or a signal arrives). Takes no args. The plugin exits after the handler returns.                                                                       |
 
 ### Emitting events
 
-| Entry | Description |
-|-------|-------------|
-| `nefor.emit(sub_kind, body?)` | Emit an event with `kind = "<nefor.name>.<sub_kind>"`. `body` is an optional table; if omitted, an empty body is used. **Error** if `body.kind` is already set (scripts must not bypass the host's prefix; use `emit_raw` if you really mean to). **Error** if emitted before `ready_ok` arrives. |
-| `nefor.emit_raw(full_kind, body?)` | Emit with `body.kind = full_kind` verbatim — no prefixing. Useful for impersonating other plugins' event shapes in tests. Caveat: nothing stops you from sending malformed or namespace-colliding kinds; that's on you. |
+| Entry                              | Description                                                                                                                                                                                                                                                                                       |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `nefor.emit(sub_kind, body?)`      | Emit an event with `kind = "<nefor.name>.<sub_kind>"`. `body` is an optional table; if omitted, an empty body is used. **Error** if `body.kind` is already set (scripts must not bypass the host's prefix; use `emit_raw` if you really mean to). **Error** if emitted before `ready_ok` arrives. |
+| `nefor.emit_raw(full_kind, body?)` | Emit with `body.kind = full_kind` verbatim — no prefixing. Useful for impersonating other plugins' event shapes in tests. Caveat: nothing stops you from sending malformed or namespace-colliding kinds; that's on you.                                                                           |
 
 ### Utilities
 
-| Entry | Description |
-|-------|-------------|
+| Entry             | Description                                                                                                                                                                                                                      |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `nefor.sleep(ms)` | Async sleep. Must be called from inside an async handler context — i.e. from an `on`, `on_any`, `on_ready_ok`, or `on_shutdown` callback. Calling it at script top level panics because the script isn't inside a coroutine yet. |
-| `nefor.log(msg)` | Write `msg` to stderr via `tracing::info!`. Never use Lua's `print` — it goes to stdout, which would corrupt the NCP stream. |
+| `nefor.log(msg)`  | Write `msg` to stderr via `tracing::info!`. Never use Lua's `print` — it goes to stdout, which would corrupt the NCP stream.                                                                                                     |
 
 ## Handshake and lifecycle
 

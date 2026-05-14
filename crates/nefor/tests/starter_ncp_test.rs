@@ -285,7 +285,10 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
     let op_plugin_lua_str = op_plugin_lua.display().to_string();
     let tg_plugin_lua = repo_root().join("plugins").join("tool-gate").join("lua");
     let tg_plugin_lua_str = tg_plugin_lua.display().to_string();
-    let rg_plugin_lua = repo_root().join("plugins").join("reasoner-graph").join("lua");
+    let rg_plugin_lua = repo_root()
+        .join("plugins")
+        .join("reasoner-graph")
+        .join("lua");
     let rg_plugin_lua_str = rg_plugin_lua.display().to_string();
     let script = format!(
         r#"

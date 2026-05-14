@@ -255,13 +255,19 @@ async fn interrupt_envelope_breaks_streaming_loop_at_next_sleep_yield() {
 
     // Kick off the slow loop.
     let mut start_body = serde_json::Map::new();
-    start_body.insert("kind".into(), serde_json::Value::String("peer.chat.complete".into()));
+    start_body.insert(
+        "kind".into(),
+        serde_json::Value::String("peer.chat.complete".into()),
+    );
     let start = Envelope::event(
         PluginName::new("peer").expect("valid"),
         Timestamp::now(),
         start_body,
     );
-    stdin.write_all(start.to_line().as_bytes()).await.expect("w");
+    stdin
+        .write_all(start.to_line().as_bytes())
+        .await
+        .expect("w");
     stdin.write_all(b"\n").await.expect("nl");
     stdin.flush().await.expect("flush");
 
@@ -269,8 +275,14 @@ async fn interrupt_envelope_breaks_streaming_loop_at_next_sleep_yield() {
     // handler is yielding to the runtime instead of blocking.
     let tick1 = read_line(&mut reader).await.expect("tick1");
     let tick2 = read_line(&mut reader).await.expect("tick2");
-    assert!(tick1.contains("\"mock-plugin.tick\""), "first line should be a tick: {tick1}");
-    assert!(tick2.contains("\"mock-plugin.tick\""), "second line should be a tick: {tick2}");
+    assert!(
+        tick1.contains("\"mock-plugin.tick\""),
+        "first line should be a tick: {tick1}"
+    );
+    assert!(
+        tick2.contains("\"mock-plugin.tick\""),
+        "second line should be a tick: {tick2}"
+    );
 
     // Send the interrupt while the loop is paused at `nefor.sleep`.
     let mut stop_body = serde_json::Map::new();
@@ -314,7 +326,10 @@ async fn interrupt_envelope_breaks_streaming_loop_at_next_sleep_yield() {
         .expect("exit in time")
         .expect("wait");
 
-    assert!(saw_stopped, "stopped envelope must arrive after interrupt; tick_count={tick_count} done={saw_done}");
+    assert!(
+        saw_stopped,
+        "stopped envelope must arrive after interrupt; tick_count={tick_count} done={saw_done}"
+    );
     assert!(
         tick_count < 50,
         "interrupt should break the stream early; got {tick_count} ticks (full stream is 50)"
@@ -431,7 +446,10 @@ async fn interrupt_mid_stream_persists_partial_assistant_text_to_history() {
     );
     create_body.insert("chat_id".into(), serde_json::Value::String(chat_id.into()));
     let create = Envelope::event(plugin.clone(), Timestamp::now(), create_body);
-    stdin.write_all(create.to_line().as_bytes()).await.expect("w");
+    stdin
+        .write_all(create.to_line().as_bytes())
+        .await
+        .expect("w");
     stdin.write_all(b"\n").await.expect("nl");
 
     // 2. chat.append { role=user, content=<gibberish, hits help fallback> }.
@@ -452,7 +470,10 @@ async fn interrupt_mid_stream_persists_partial_assistant_text_to_history() {
     );
     append_body.insert("message".into(), serde_json::Value::Object(msg));
     let append = Envelope::event(plugin.clone(), Timestamp::now(), append_body);
-    stdin.write_all(append.to_line().as_bytes()).await.expect("w");
+    stdin
+        .write_all(append.to_line().as_bytes())
+        .await
+        .expect("w");
     stdin.write_all(b"\n").await.expect("nl");
     stdin.flush().await.expect("flush");
 
@@ -464,7 +485,10 @@ async fn interrupt_mid_stream_persists_partial_assistant_text_to_history() {
     );
     complete_body.insert("chat_id".into(), serde_json::Value::String(chat_id.into()));
     let complete = Envelope::event(plugin.clone(), Timestamp::now(), complete_body);
-    stdin.write_all(complete.to_line().as_bytes()).await.expect("w");
+    stdin
+        .write_all(complete.to_line().as_bytes())
+        .await
+        .expect("w");
     stdin.write_all(b"\n").await.expect("nl");
     stdin.flush().await.expect("flush");
 
@@ -509,7 +533,10 @@ async fn interrupt_mid_stream_persists_partial_assistant_text_to_history() {
     );
     interrupt_body.insert("chat_id".into(), serde_json::Value::String(chat_id.into()));
     let interrupt = Envelope::event(plugin.clone(), Timestamp::now(), interrupt_body);
-    stdin.write_all(interrupt.to_line().as_bytes()).await.expect("w");
+    stdin
+        .write_all(interrupt.to_line().as_bytes())
+        .await
+        .expect("w");
     stdin.write_all(b"\n").await.expect("nl");
     stdin.flush().await.expect("flush");
 
@@ -609,8 +636,7 @@ async fn interrupt_mid_stream_persists_partial_assistant_text_to_history() {
     // prefix of stored partial OR stored partial is a prefix of wire
     // partial": both indicate the same underlying buffer.
     assert!(
-        content.starts_with(&accumulated_partial)
-            || accumulated_partial.starts_with(content),
+        content.starts_with(&accumulated_partial) || accumulated_partial.starts_with(content),
         "stored partial and wire partial must share a prefix; \
          stored={:?} wire={:?}",
         truncate_str(content, 80),

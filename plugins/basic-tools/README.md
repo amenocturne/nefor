@@ -15,11 +15,11 @@ flow `LLM → openai-provider → basic-tools → result`.
 See [`docs/chat-contract.md`](../../docs/chat-contract.md) → "Tool calling
 (v1)" for the canonical spec. Quick reference:
 
-| Event              | Direction       | Routing   |
-|--------------------|-----------------|-----------|
-| `tool.register`    | basic-tools → bus | broadcast |
-| `basic-tools.tool.invoke` | caller → basic-tools | targeted (engine prefix-routing) |
-| `tool.result`      | basic-tools → bus | broadcast (caller correlates by `id`) |
+| Event                     | Direction            | Routing                               |
+| ------------------------- | -------------------- | ------------------------------------- |
+| `tool.register`           | basic-tools → bus    | broadcast                             |
+| `basic-tools.tool.invoke` | caller → basic-tools | targeted (engine prefix-routing)      |
+| `tool.result`             | basic-tools → bus    | broadcast (caller correlates by `id`) |
 
 `tool.invoke`'s kind is prefixed with `basic-tools` so the engine's
 `<peer>.<rest>` routing in `starter/ncp.lua` delivers it directly to us.

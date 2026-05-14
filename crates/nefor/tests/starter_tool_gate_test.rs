@@ -121,13 +121,19 @@ fn large_output_writes_full_contents_to_file_and_returns_summary() {
         path.starts_with(&expected_dir.display().to_string()),
         "path under tool-results/<chat_id>/, got {path}"
     );
-    assert!(path.ends_with("call-42.txt"), "leaf is <call_id>.txt: {path}");
+    assert!(
+        path.ends_with("call-42.txt"),
+        "leaf is <call_id>.txt: {path}"
+    );
 
     // File exists with the original bytes verbatim — the model relies
     // on `grep <pattern> <path>` working over the SAME bytes the
     // tool produced; any rewrite (compression, JSON-wrapping,
     // prefix/suffix injection) would break that contract.
-    assert!(std::path::Path::new(&path).exists(), "dump file missing: {path}");
+    assert!(
+        std::path::Path::new(&path).exists(),
+        "dump file missing: {path}"
+    );
     let on_disk = std::fs::read_to_string(&path).expect("read dump file");
     assert_eq!(
         on_disk.len() as i64,
@@ -223,7 +229,10 @@ fn missing_chat_id_falls_back_to_unscoped_directory() {
         path.starts_with(&unscoped_dir.display().to_string()),
         "missing chat_id must route under tool-results/_unscoped/: {path}"
     );
-    assert!(std::path::Path::new(&path).exists(), "dump file missing: {path}");
+    assert!(
+        std::path::Path::new(&path).exists(),
+        "dump file missing: {path}"
+    );
 
     match prev.as_deref() {
         Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
@@ -336,7 +345,12 @@ fn tool_gate_wrapper_swaps_huge_tool_result_output_to_summary() {
     let payloads: Vec<String> = (1..=len)
         .map(|i| trace.get::<String>(i).expect("entry"))
         .collect();
-    assert_eq!(payloads.len(), 2, "expected 2 publishes, got {}: {payloads:?}", payloads.len());
+    assert_eq!(
+        payloads.len(),
+        2,
+        "expected 2 publishes, got {}: {payloads:?}",
+        payloads.len()
+    );
 
     // Small one (call-small) is verbatim — output stays "ok".
     let small = payloads
@@ -363,10 +377,7 @@ fn tool_gate_wrapper_swaps_huge_tool_result_output_to_summary() {
     // ~65 KiB) does NOT land inline. Bound the published-envelope
     // size to comfortably less than the original — well under the
     // 32 KiB inline budget.
-    let big_size: i64 = lua
-        .load(r#"return _big_size"#)
-        .eval()
-        .expect("big size");
+    let big_size: i64 = lua.load(r#"return _big_size"#).eval().expect("big size");
     assert!(
         (big.len() as i64) < big_size / 2,
         "published envelope must be much smaller than original ({} bytes vs {} bytes)",
@@ -834,10 +845,7 @@ fn tool_gate_wrapper_emits_agents_md_on_outbound_path_touching_invoke() {
     // envelopes to the binary — both should land regardless of
     // path-touching status (the wrapper still forwards every envelope
     // it sees).
-    let deliver_trace: Table = lua
-        .globals()
-        .get("_deliver_trace")
-        .expect("deliver_trace");
+    let deliver_trace: Table = lua.globals().get("_deliver_trace").expect("deliver_trace");
     let deliver_len = deliver_trace.len().expect("len") as usize;
     let delivered: Vec<String> = (1..=deliver_len)
         .map(|i| deliver_trace.get::<String>(i).expect("entry"))
@@ -1000,7 +1008,10 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
     let lua_root_str = lua_root.display().to_string();
     let plugin_lua = repo_root().join("plugins").join("tool-gate").join("lua");
     let plugin_lua_str = plugin_lua.display().to_string();
-    let rg_plugin_lua = repo_root().join("plugins").join("reasoner-graph").join("lua");
+    let rg_plugin_lua = repo_root()
+        .join("plugins")
+        .join("reasoner-graph")
+        .join("lua");
     let rg_plugin_lua_str = rg_plugin_lua.display().to_string();
     let script = format!(
         r#"

@@ -782,6 +782,17 @@ local function track_provider_firing(reasoner_type, run_id, node_id, firing_id,
   }
   state.chat_id_to_key[chat_id] = key
   state.chat_id_stream_visible[chat_id] = STREAM_VISIBLE_TYPES[reasoner_type] == true
+  -- Capture the lead's chat_id the moment its provider firing
+  -- starts. `state.current_state.chat_id` only becomes available
+  -- AFTER the wrap firing closes (it's pulled from the wrap's
+  -- next_state), so on turn 1 — before any wrap close has happened —
+  -- cancel() / cancel_all() couldn't find a chat_id and the
+  -- interrupt-notice append silently no-op'd. Tracking it here makes
+  -- the chat_id known the moment streaming starts, so an immediate
+  -- ESC during the very first stream still injects the notice.
+  if STREAM_VISIBLE_TYPES[reasoner_type] then
+    state.current_lead_chat_id = chat_id
+  end
   return key
 end
 

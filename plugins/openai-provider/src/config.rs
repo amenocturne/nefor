@@ -188,7 +188,10 @@ mod tests {
         let (_g, c) = parse_clean(&["openai-provider"]);
         assert_eq!(c.provider_name, "openai");
         assert_eq!(c.base_url, "http://localhost:11434");
-        assert!(c.model.is_none(), "model is opt-in; no compiled-in fallback");
+        assert!(
+            c.model.is_none(),
+            "model is opt-in; no compiled-in fallback"
+        );
         assert!(c.api_key.is_none());
         assert_eq!(c.auth_header, "Authorization");
     }

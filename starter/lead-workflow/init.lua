@@ -594,11 +594,13 @@ local function terminate_active_graph()
   -- firing (sub-graph cancel propagation). The reasoner-graph
   -- binary still receives the broadcast and processes it the same way.
   emit_as(SOURCE_NAME, nil, { kind = "graph.cancel", run_id = run_id })
-  emit("nefor-tui", {
-    kind = "chat.message.append",
-    role = "system",
-    text = "[Graph terminated by user — session exit]",
-  })
+  -- Previously this emitted a "[Graph terminated by user — session
+  -- exit]" chat.message.append for user feedback, but the message
+  -- went into the bus log and leaked into the NEXT session's chat
+  -- when /new replayed bus state. The cancel itself (above) is the
+  -- functional close; the user already knows they ended the
+  -- session. Logging only.
+  nefor.log.info("lead-workflow: graph terminated on session-end", { run_id = run_id })
 end
 
 -- Run-close watcher — clear active_run_id when the in-flight graph

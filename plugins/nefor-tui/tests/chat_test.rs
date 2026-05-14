@@ -15,7 +15,7 @@ use std::time::Duration;
 use nefor_tui::engine::Engine;
 use nefor_tui::input::KeyMessage;
 use nefor_tui::mouse::{MouseKind, MouseMessage};
-use serde_json::{Map as JsonMap, Value as JsonValue, json};
+use serde_json::{json, Map as JsonMap, Value as JsonValue};
 
 /// Per-process tempdir kept alive for the lifetime of `cargo test` and
 /// pointed at by `NEFOR_DATA_DIR` on first access. Ensures chat.lua's
@@ -59,10 +59,7 @@ fn chat_lua_source() -> String {
     // and chat.lua derives the plugin-lib dir relative to that; tests
     // load chat.lua directly into the engine's Lua VM (no env from the
     // engine entry point) so we set the explicit override here.
-    let plugin_lua = repo_root
-        .join("plugins")
-        .join("nefor-tui")
-        .join("lua");
+    let plugin_lua = repo_root.join("plugins").join("nefor-tui").join("lua");
     if std::env::var_os("NEFOR_TUI_LUA_DIR").is_none() {
         std::env::set_var("NEFOR_TUI_LUA_DIR", &plugin_lua);
     }

@@ -14,16 +14,16 @@ If those three pass, the substrate is healthy.
 
 ## Test suite layout
 
-| Suite | Where | What it covers | Cost |
-|---|---|---|---|
-| Workspace unit tests | `cargo test --workspace` | Per-crate unit tests across engine + all plugins | Few seconds, mostly in-process |
-| `agentic_cli_mock_e2e` | `crates/nefor/tests/agentic_cli_mock_e2e.rs` | Full chain (engine binary as subprocess + Lua + mock provider). 6 scenarios. **Default Stage-1 health check.** | ~2.5s wall |
-| `stage1_e2e` | `crates/nefor/tests/stage1_e2e.rs` | In-process duplex driver against a real provider. `#[ignore]`-gated; needs live Ollama at `localhost:11434` | ~10-30s; opt-in |
-| `combinators_slice1` | `crates/nefor/tests/combinators_slice1.rs` | Combinator registry + mock-plugin round-trip | <1s |
-| `session_impersonation` | `crates/nefor/tests/session_impersonation.rs` | Session-log hydration + cross-session impersonation | <1s |
-| `starter_smoke` | `crates/nefor/tests/starter_smoke.rs` | Engine-binary smoke: ready handshake | <1s |
-| `starter_ncp_test` | `crates/nefor/tests/starter_ncp_test.rs` | NCP v0.1 protocol in Lua | <1s |
-| Plugin unit tests | `cargo test -p <plugin>` | Each plugin's own tests (nefor-chat has 482, openai-provider 137, etc.) | Sub-second per plugin |
+| Suite                   | Where                                         | What it covers                                                                                                 | Cost                           |
+| ----------------------- | --------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ------------------------------ |
+| Workspace unit tests    | `cargo test --workspace`                      | Per-crate unit tests across engine + all plugins                                                               | Few seconds, mostly in-process |
+| `agentic_cli_mock_e2e`  | `crates/nefor/tests/agentic_cli_mock_e2e.rs`  | Full chain (engine binary as subprocess + Lua + mock provider). 6 scenarios. **Default Stage-1 health check.** | ~2.5s wall                     |
+| `stage1_e2e`            | `crates/nefor/tests/stage1_e2e.rs`            | In-process duplex driver against a real provider. `#[ignore]`-gated; needs live Ollama at `localhost:11434`    | ~10-30s; opt-in                |
+| `combinators_slice1`    | `crates/nefor/tests/combinators_slice1.rs`    | Combinator registry + mock-plugin round-trip                                                                   | <1s                            |
+| `session_impersonation` | `crates/nefor/tests/session_impersonation.rs` | Session-log hydration + cross-session impersonation                                                            | <1s                            |
+| `starter_smoke`         | `crates/nefor/tests/starter_smoke.rs`         | Engine-binary smoke: ready handshake                                                                           | <1s                            |
+| `starter_ncp_test`      | `crates/nefor/tests/starter_ncp_test.rs`      | NCP v0.1 protocol in Lua                                                                                       | <1s                            |
+| Plugin unit tests       | `cargo test -p <plugin>`                      | Each plugin's own tests (nefor-chat has 482, openai-provider 137, etc.)                                        | Sub-second per plugin          |
 
 The `agentic_cli_mock_e2e` suite is the one to add scenarios to when you ship new agentic-cli flow behavior. It's deterministic, non-ignored, and fast enough to live in CI.
 
@@ -124,13 +124,13 @@ EOF (Ctrl+D or end-of-pipe) exits cleanly with code 0.
 
 ### Other flags
 
-| Flag | What it does |
-|---|---|
-| `-m <model>`, `--model <model>` | Sets the model for new chats; calls `agentic_workflow.set_model` |
-| `--yolo` | Calls `agentic_workflow.set_yolo(true)` — currently a placeholder; emits `tool-gate.policy.set` but tool-gate doesn't honor it yet |
-| `-f <path>`, `--file <path>` | Reads file, prepends to prompt as `### File: <path>\n\`\`\`\n<contents>\n\`\`\`\n\n` |
-| `--debug` | No-op for v1 |
-| `--help`, `-h` | Reachable as `nefor --config cli-config plugin agentic-cli -- --help` (the `--` is needed because outer clap eats `--help` otherwise) |
+| Flag                            | What it does                                                                                                                          |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `-m <model>`, `--model <model>` | Sets the model for new chats; calls `agentic_workflow.set_model`                                                                      |
+| `--yolo`                        | Calls `agentic_workflow.set_yolo(true)` — currently a placeholder; emits `tool-gate.policy.set` but tool-gate doesn't honor it yet    |
+| `-f <path>`, `--file <path>`    | Reads file, prepends to prompt as `### File: <path>\n\`\`\`\n<contents>\n\`\`\`\n\n`                                                  |
+| `--debug`                       | No-op for v1                                                                                                                          |
+| `--help`, `-h`                  | Reachable as `nefor --config cli-config plugin agentic-cli -- --help` (the `--` is needed because outer clap eats `--help` otherwise) |
 
 ### Deferred until further capability ships
 
@@ -225,6 +225,7 @@ fn my_new_scenario() {
 ```
 
 `TestEnv` helper handles:
+
 - TempDir for `XDG_DATA_HOME` (each test gets its own; no pollution)
 - Spawning the engine binary with `USE_MOCK_PROVIDER=true` and `NEFOR_PLUGIN_DIR=$repo/plugins`
 - `--config cli-config` argv prefix

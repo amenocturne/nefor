@@ -34,11 +34,11 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 
 `nefor` resolves directories via XDG-style env vars, with CLI flags taking highest precedence:
 
-| Env var            | CLI flag          | Default                   | Holds       |
-|--------------------|-------------------|---------------------------|-------------|
-| `NEFOR_CONFIG_DIR` | `--config`        | `$XDG_CONFIG_HOME/nefor`  | `init.lua`  |
-| `NEFOR_DATA_DIR`   | `--data-dir`      | `$XDG_DATA_HOME/nefor`    | sessions    |
-| `NEFOR_PLUGIN_DIR` | `--plugin-dir`    | `$NEFOR_DATA_DIR/plugins` | binaries    |
+| Env var            | CLI flag       | Default                   | Holds      |
+| ------------------ | -------------- | ------------------------- | ---------- |
+| `NEFOR_CONFIG_DIR` | `--config`     | `$XDG_CONFIG_HOME/nefor`  | `init.lua` |
+| `NEFOR_DATA_DIR`   | `--data-dir`   | `$XDG_DATA_HOME/nefor`    | sessions   |
+| `NEFOR_PLUGIN_DIR` | `--plugin-dir` | `$NEFOR_DATA_DIR/plugins` | binaries   |
 
 If no `init.lua` is found, the engine prints a friendly error pointing at the README install section.
 
@@ -51,7 +51,7 @@ If no `init.lua` is found, the engine prints a friendly error pointing at the RE
 - Immutability by default; I/O only at boundaries.
 - No YAML/TOML/JSON config schema in core — config is `init.lua`.
 - Plugins are separate OS processes communicating via NCP (see `protocol/v0.1/spec.md`).
-- Comments only for non-obvious *why*; code is self-documenting for *what*.
+- Comments only for non-obvious _why_; code is self-documenting for _what_.
 
 ## Commands
 
@@ -72,17 +72,17 @@ Daily-decision substrate for "where does this code live" and "is this a plugin o
 
 ### Three layers, decreasing opinion budget
 
-| Layer | Opinion budget | What it does |
-|---|---|---|
-| Engine (`crates/nefor`, `crates/nefor-protocol`, `crates/nefor-combinators`) | Irreducible | Pure mechanism: stdin/stdout, NCP envelope stamping, session log, dispatch via `step`. No NCP body parsing. |
-| Plugins (`plugins/*`) | Near zero | Heavy lifting via NCP. Each one a "bash tool" — self-contained, composable, producer-clean namespace. |
-| Starter (`starter/*.lua`) | Fully Turing-complete | All composition, all wiring, all cross-plugin knowledge, all opinion. |
+| Layer                                                                        | Opinion budget        | What it does                                                                                                |
+| ---------------------------------------------------------------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Engine (`crates/nefor`, `crates/nefor-protocol`, `crates/nefor-combinators`) | Irreducible           | Pure mechanism: stdin/stdout, NCP envelope stamping, session log, dispatch via `step`. No NCP body parsing. |
+| Plugins (`plugins/*`)                                                        | Near zero             | Heavy lifting via NCP. Each one a "bash tool" — self-contained, composable, producer-clean namespace.       |
+| Starter (`starter/*.lua`)                                                    | Fully Turing-complete | All composition, all wiring, all cross-plugin knowledge, all opinion.                                       |
 
 Mismatch is the most common architectural bug. Every file gets one layer assignment.
 
 ### "Where does this code live?" — procedure
 
-1. **List what the code does.** Multiple responsibilities are a *signal*, not a verdict. Check whether they decouple cleanly. Clean split → separate units. Splitting would create back-references, shared state across the boundary, or duplicated work that doesn't pull its weight → keep together; the coupling IS the substrate.
+1. **List what the code does.** Multiple responsibilities are a _signal_, not a verdict. Check whether they decouple cleanly. Clean split → separate units. Splitting would create back-references, shared state across the boundary, or duplicated work that doesn't pull its weight → keep together; the coupling IS the substrate.
 2. **For each unit, ask: pure transform or opinionated?**
    - Pure (no bus access, no envelope emission, no plugin-name in `require`) → primitive.
      - Engine-level (every actor uses it: uuid, ncp, envelope, replay-window) → `lua/core/`.
@@ -97,7 +97,7 @@ Mismatch is the most common architectural bug. Every file gets one layer assignm
 
 ### Bash-tool test (for plugin candidates)
 
-*Could this be a self-contained composable unit with standard inputs/outputs, like `ls` / `grep` / `cat`?*
+_Could this be a self-contained composable unit with standard inputs/outputs, like `ls` / `grep` / `cat`?_
 
 - Heaviness is fine. `nefor-tui` runs ratatui + attached terminal and qualifies — clear NCP-shaped I/O, composes through the bus.
 - Cross-plugin knowledge disqualifies. A plugin that names another plugin's wire kind in code isn't a bash tool, it's glue. Glue goes in Lua.

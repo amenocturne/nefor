@@ -187,9 +187,7 @@ pub fn install_engine(lua: &Lua, nefor_tbl: &Table, ops: Arc<dyn EngineOps>) -> 
             }
         };
         if let Err(e) = ops_for_deliver.deliver(peer, payload) {
-            return Err(mlua::Error::runtime(format!(
-                "nefor.engine.deliver: {e}"
-            )));
+            return Err(mlua::Error::runtime(format!("nefor.engine.deliver: {e}")));
         }
         Ok(())
     })?;
@@ -501,7 +499,10 @@ mod tests {
             .load(r#"nefor.engine.deliver(42, "x")"#)
             .exec()
             .expect_err("integer peer must be rejected");
-        assert!(err.to_string().contains("peer must be a string"), "got: {err}");
+        assert!(
+            err.to_string().contains("peer must be a string"),
+            "got: {err}"
+        );
         assert!(ops.delivered().is_empty());
     }
 
@@ -512,7 +513,10 @@ mod tests {
             .load(r#"nefor.engine.deliver("p", {})"#)
             .exec()
             .expect_err("table payload must be rejected");
-        assert!(err.to_string().contains("payload must be a string"), "got: {err}");
+        assert!(
+            err.to_string().contains("payload must be a string"),
+            "got: {err}"
+        );
         assert!(ops.delivered().is_empty());
     }
 
@@ -523,7 +527,10 @@ mod tests {
             .load(r#"nefor.engine.deliver("engine", "x")"#)
             .exec()
             .expect_err("reserved name must be rejected");
-        assert!(err.to_string().contains("nefor.engine.deliver"), "got: {err}");
+        assert!(
+            err.to_string().contains("nefor.engine.deliver"),
+            "got: {err}"
+        );
         assert!(ops.delivered().is_empty());
     }
 

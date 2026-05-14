@@ -297,7 +297,10 @@ fn push_line(out: &mut String, line: &Line) {
 /// coords so a row that scrolled past the viewport edge produces a
 /// fully-highlighted top visible row, matching the user's expectation
 /// of "the rows above the cursor are fully selected".
-fn apply_selection_highlight_in_content_coords(buf: &mut FrameBuffer, highlight: SelectionHighlight) {
+fn apply_selection_highlight_in_content_coords(
+    buf: &mut FrameBuffer,
+    highlight: SelectionHighlight,
+) {
     let height = buf.lines.len() as u16;
     if height == 0 {
         return;

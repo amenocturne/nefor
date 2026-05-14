@@ -117,8 +117,12 @@ NCP only defines `ready`, `ready_ok`, `shutdown`, and `error`. Everything else a
 After receiving `ready_ok`, a plugin MAY emit a `<name>.hello` event declaring its version and any other self-description:
 
 ```json
-{ "type": "event", "from": "nefor-tui", "ts": "…",
-  "body": { "kind": "nefor-tui.hello", "version": "0.1.0" } }
+{
+  "type": "event",
+  "from": "nefor-tui",
+  "ts": "…",
+  "body": { "kind": "nefor-tui.hello", "version": "0.1.0" }
+}
 ```
 
 Peers that want a topology view subscribe to `*.hello` events across the bus. No engine mediation required.
@@ -128,8 +132,12 @@ Peers that want a topology view subscribe to `*.hello` events across the bus. No
 Before closing stdout, a plugin MAY emit a `<name>.goodbye` event with a reason:
 
 ```json
-{ "type": "event", "from": "nefor-tui", "ts": "…",
-  "body": { "kind": "nefor-tui.goodbye", "reason": "stream closed" } }
+{
+  "type": "event",
+  "from": "nefor-tui",
+  "ts": "…",
+  "body": { "kind": "nefor-tui.goodbye", "reason": "stream closed" }
+}
 ```
 
 The engine doesn't relay `goodbye` events, but it does apply one policy when a connection drops: if the departed plugin was fully `ready` and other plugins are still alive, the broker broadcasts `shutdown` to them so the session winds down as a cooperating group. The rationale is that the reference compositions treat the plugin set as one unit — losing the terminal frontend, for example, shouldn't leave the Claude-harness hanging. Plugins that want to survive their peers (daemons, always-on helpers) should be spawned as a separate engine instance, not as part of the same graph.
@@ -139,8 +147,12 @@ The engine doesn't relay `goodbye` events, but it does apply one policy when a c
 A plugin concerned about peer liveness (e.g. "my renderer is stuck") can emit a periodic `<name>.heartbeat` event:
 
 ```json
-{ "type": "event", "from": "mock-plugin", "ts": "…",
-  "body": { "kind": "mock-plugin.heartbeat", "seq": 42 } }
+{
+  "type": "event",
+  "from": "mock-plugin",
+  "ts": "…",
+  "body": { "kind": "mock-plugin.heartbeat", "seq": 42 }
+}
 ```
 
 Consumers tracking a peer's heartbeat can treat N missed beats as "probably gone." The frequency and tolerance are agreements between the interested parties.
@@ -150,13 +162,17 @@ Consumers tracking a peer's heartbeat can treat N missed beats as "probably gone
 A plugin MAY emit a single `<name>.manifest` event right after `ready_ok` (typically alongside `hello`) declaring what it consumes and emits:
 
 ```json
-{ "type": "event", "from": "nefor-chat", "ts": "…",
+{
+  "type": "event",
+  "from": "nefor-chat",
+  "ts": "…",
   "body": {
     "kind": "nefor-chat.manifest",
     "version": "0.2.0",
     "accepts": ["mock-plugin.message_delta", "mock-plugin.tool_start"],
-    "emits":   ["nefor-tui.grid.line", "nefor-tui.grid.flush"]
-  } }
+    "emits": ["nefor-tui.grid.line", "nefor-tui.grid.flush"]
+  }
+}
 ```
 
 This lets peers make compatibility decisions up front ("I need a renderer that accepts `*.grid.line`; `nefor-tui` satisfies that") without hardcoding plugin names. It also gives observability plugins enough information to draw a graph of the live bus.

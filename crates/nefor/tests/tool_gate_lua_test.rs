@@ -32,10 +32,7 @@ fn lua_dir() -> PathBuf {
 }
 
 fn plugin_lib_dir() -> PathBuf {
-    repo_root()
-        .join("plugins")
-        .join("tool-gate")
-        .join("lua")
+    repo_root().join("plugins").join("tool-gate").join("lua")
 }
 
 /// Package path: plugins/tool-gate/lua/ FIRST so `require("tool-gate")`
@@ -44,7 +41,10 @@ fn plugin_lib_dir() -> PathBuf {
 fn set_package_path(lua: &Lua) -> mlua::Result<()> {
     let plugin = plugin_lib_dir();
     let lua_root = lua_dir();
-    let rg_plugin_lua = repo_root().join("plugins").join("reasoner-graph").join("lua");
+    let rg_plugin_lua = repo_root()
+        .join("plugins")
+        .join("reasoner-graph")
+        .join("lua");
     let script = format!(
         r#"
         package.path = table.concat({{

@@ -497,9 +497,7 @@ pub fn parse_submission(body: &Map<String, Value>) -> Result<RunSubmission, Subm
         })?;
     if name != SPAWN_GRAPH_TOOL_NAME {
         return Err(SubmissionError {
-            message: format!(
-                "expected name=\"{SPAWN_GRAPH_TOOL_NAME}\"; got {name:?}"
-            ),
+            message: format!("expected name=\"{SPAWN_GRAPH_TOOL_NAME}\"; got {name:?}"),
             run_id: run_id_for_error,
         });
     }

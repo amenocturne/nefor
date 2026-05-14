@@ -153,7 +153,9 @@ pub fn install_fs(lua: &Lua, nefor_tbl: &Table, data_dir: DataDir) -> mlua::Resu
                 // fs::metadata follows symlinks so a symlink-to-dir
                 // reports is_dir=true, matching the engine's existing
                 // nefor.fs.is_dir convention.
-                let is_dir = fs::metadata(entry.path()).map(|m| m.is_dir()).unwrap_or(false);
+                let is_dir = fs::metadata(entry.path())
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false);
                 let rec = lua.create_table()?;
                 rec.set("name", name)?;
                 rec.set("is_dir", is_dir)?;
@@ -201,10 +203,7 @@ mod tests {
     #[test]
     fn data_root_returns_engine_resolved_path() {
         let lua = setup_with_data_dir(PathBuf::from("/some/explicit/data"));
-        let got: String = lua
-            .load("return nefor.fs.data_root()")
-            .eval()
-            .unwrap();
+        let got: String = lua.load("return nefor.fs.data_root()").eval().unwrap();
         assert_eq!(got, "/some/explicit/data");
     }
 
@@ -248,7 +247,10 @@ mod tests {
         assert!(exists);
         assert!(!is_dir);
         let dir_is_dir: bool = lua
-            .load(format!(r#"return nefor.fs.is_dir("{}")"#, tmp.path().display()))
+            .load(format!(
+                r#"return nefor.fs.is_dir("{}")"#,
+                tmp.path().display()
+            ))
             .eval()
             .unwrap();
         assert!(dir_is_dir);
@@ -271,12 +273,18 @@ mod tests {
             .unwrap();
         assert!(ok);
         let is_link: bool = lua
-            .load(format!(r#"return nefor.fs.is_symlink("{}")"#, link.display()))
+            .load(format!(
+                r#"return nefor.fs.is_symlink("{}")"#,
+                link.display()
+            ))
             .eval()
             .unwrap();
         assert!(is_link);
         let read: Option<String> = lua
-            .load(format!(r#"return nefor.fs.read_link("{}")"#, link.display()))
+            .load(format!(
+                r#"return nefor.fs.read_link("{}")"#,
+                link.display()
+            ))
             .eval()
             .unwrap();
         assert_eq!(read.as_deref(), Some(target.to_string_lossy().as_ref()));
@@ -291,7 +299,10 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let lua = setup();
         let ok: bool = lua
-            .load(format!(r#"return nefor.fs.remove("{}").ok"#, link.display()))
+            .load(format!(
+                r#"return nefor.fs.remove("{}").ok"#,
+                link.display()
+            ))
             .eval()
             .unwrap();
         assert!(ok);

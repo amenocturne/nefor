@@ -210,8 +210,8 @@ fn run_lua_test(plugin: &str, test_file: &str, setup_script: &str) {
         .join("lua")
         .join(plugin)
         .join(test_file);
-    let src = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let src =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     if let Err(e) = lua.load(&src).set_name(path.display().to_string()).exec() {
         panic!("{test_file} failed:\n{e}");
     }

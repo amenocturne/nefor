@@ -737,10 +737,9 @@ fn try_dispatch(state: &mut RunState, node_id: &str, peers: &PeerSet, effects: &
     // Index this firing by its outbound request id (== firing_id under
     // the canonical tool contract) so the matching `tool.result` can be
     // resolved without scanning every node's firing list.
-    state.firing_by_request_id.insert(
-        firing_id.clone(),
-        (node.id.clone(), firing_id.clone()),
-    );
+    state
+        .firing_by_request_id
+        .insert(firing_id.clone(), (node.id.clone(), firing_id.clone()));
     // Lifecycle marker FIRST, then the targeted dispatch. Order matters:
     // an in-process synchronous reasoner (Lua-resident `terminal`,
     // `adapter`, `tool-executor`, …) replies on its own `tool.invoke`
@@ -1598,10 +1597,7 @@ impl Scheduler {
     /// Returns `None` for unknown ids (covers cancellation race,
     /// duplicate results, and ids belonging to combinator query/invoke
     /// pairs which use their own correlation tables).
-    pub fn resolve_request_id(
-        runs: &Runs,
-        request_id: &str,
-    ) -> Option<(String, NodeId, FiringId)> {
+    pub fn resolve_request_id(runs: &Runs, request_id: &str) -> Option<(String, NodeId, FiringId)> {
         let guard = runs.lock().expect("runs mutex poisoned");
         for (rid, st) in guard.iter() {
             if let Some((node_id, firing_id)) = st.firing_by_request_id.get(request_id) {

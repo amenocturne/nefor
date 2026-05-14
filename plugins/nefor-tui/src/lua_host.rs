@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use mlua::{Lua, LuaSerdeExt, RegistryKey, Table, Value};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::desc::{KIND_FIELD, WidgetDescription, from_lua_table};
+use crate::desc::{from_lua_table, WidgetDescription, KIND_FIELD};
 use crate::error::TuiError;
 use crate::fs::install_fs;
 

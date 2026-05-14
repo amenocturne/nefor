@@ -80,10 +80,10 @@ Example (from `scripts/hello-world.jsonl`):
 
 ## Included scripts
 
-| Script                   | Purpose                                                  |
-| ------------------------ | -------------------------------------------------------- |
-| `hello-world.jsonl`      | Basic render path: colors, highlight, grid, line, flush. |
-| `echo-keys.jsonl`        | Minimal grid + hold-open; verify plugin input routing.   |
+| Script              | Purpose                                                  |
+| ------------------- | -------------------------------------------------------- |
+| `hello-world.jsonl` | Basic render path: colors, highlight, grid, line, flush. |
+| `echo-keys.jsonl`   | Minimal grid + hold-open; verify plugin input routing.   |
 
 Passive mode (no `--script`) is equivalent to an empty script that never
 terminates — the default choice when you just want to log plugin output.

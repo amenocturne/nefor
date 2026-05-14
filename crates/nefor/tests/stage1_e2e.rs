@@ -177,7 +177,10 @@ fn write_test_init_lua(dir: &Path) {
     let starter_str = format!("{:?}", starter.display().to_string());
     let lua_root = lua_dir();
     let lua_root_str = format!("{:?}", lua_root.display().to_string());
-    let rg_plugin_lua = workspace_root().join("plugins").join("reasoner-graph").join("lua");
+    let rg_plugin_lua = workspace_root()
+        .join("plugins")
+        .join("reasoner-graph")
+        .join("lua");
     let rg_plugin_lua_str = format!("{:?}", rg_plugin_lua.display().to_string());
     // Use a templated string with a placeholder that's unlikely to collide
     // with Lua syntax — we substitute @@STARTER@@ / @@LUA_ROOT@@ / @@RG@@
@@ -721,8 +724,7 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
                     return false;
                 };
                 let body = v.get("body");
-                body.and_then(|b| b.get("kind")).and_then(Value::as_str)
-                    == Some("tool.invoke")
+                body.and_then(|b| b.get("kind")).and_then(Value::as_str) == Some("tool.invoke")
                     && body.and_then(|b| b.get("name")).and_then(Value::as_str)
                         == Some("spawn_graph")
             })

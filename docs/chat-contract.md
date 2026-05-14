@@ -30,8 +30,8 @@ Append `text` to the in-flight assistant entry. Multiple deltas concatenate; `ne
 {
   "kind": "chat.stream.end",
   "text": "…",
-  "model": "claude-…",       // optional
-  "duration_ms": 1500          // optional, u64
+  "model": "claude-…", // optional
+  "duration_ms": 1500 // optional, u64
 }
 ```
 
@@ -55,7 +55,7 @@ Emitted by `nefor-chat` when the user hits Enter on a non-empty input buffer. Th
 { "kind": "chat.interrupt" }
 ```
 
-Emitted by `nefor-chat` when the user hits Esc *while a turn is in flight* (i.e. between the previous `chat.input.submit` and its terminating `chat.stream.end`). The harness is expected to abort the running turn and send a terminating `chat.stream.end` (with `text: ""`, leaving any partial deltas in place) so the chat plugin's normal finalize codepath winds the turn down.
+Emitted by `nefor-chat` when the user hits Esc _while a turn is in flight_ (i.e. between the previous `chat.input.submit` and its terminating `chat.stream.end`). The harness is expected to abort the running turn and send a terminating `chat.stream.end` (with `text: ""`, leaving any partial deltas in place) so the chat plugin's normal finalize codepath winds the turn down.
 
 The visual marker convention is a system-role `chat.message.append` with `text: "[interrupted]"` appended after the partial assistant entry — picked over a per-entry "interrupted" flag because it requires no schema change and reuses existing rendering. Producers that don't speak `chat.*` can map their native abort-confirmation to this same shape (see [the mock-plugin adapter](../starter/mock_plugin_adapter.lua)).
 
@@ -71,15 +71,15 @@ Producers populate whichever subset they have. Missing fields render as `—` in
 { "kind": "chat.stream.reasoning_delta", "text": "…" }
 ```
 
-Append `text` to the in-flight assistant entry's *reasoning* channel — separate from the content stream consumed by `chat.stream.delta`. Producers that surface a model's thinking trace (Ollama's `delta.reasoning` for Qwen 3 / Gemma 3) emit one of these per chunk. `nefor-chat` renders the accumulating trace as a dim live preview while the entry has no content yet, and collapses it to a single-row marker once content begins (or `reasoning_end` arrives reasoning-only). Reasoning is NOT included in the stored assistant text — it doesn't feed back into the next request's history.
+Append `text` to the in-flight assistant entry's _reasoning_ channel — separate from the content stream consumed by `chat.stream.delta`. Producers that surface a model's thinking trace (Ollama's `delta.reasoning` for Qwen 3 / Gemma 3) emit one of these per chunk. `nefor-chat` renders the accumulating trace as a dim live preview while the entry has no content yet, and collapses it to a single-row marker once content begins (or `reasoning_end` arrives reasoning-only). Reasoning is NOT included in the stored assistant text — it doesn't feed back into the next request's history.
 
 ### `chat.stream.reasoning_end`
 
 ```json
 {
   "kind": "chat.stream.reasoning_end",
-  "text": "…",          // full accumulated reasoning trace
-  "duration_ms": 1840    // optional, u64
+  "text": "…", // full accumulated reasoning trace
+  "duration_ms": 1840 // optional, u64
 }
 ```
 
@@ -90,14 +90,14 @@ Close the in-flight assistant entry's reasoning channel. Fires exactly once per 
 ```json
 {
   "kind": "chat.session.stats",
-  "model": "claude-…",                     // optional
-  "turns": 7,                              // optional, u64
-  "cumulative_cost_usd": 0.42,             // optional, f64
-  "cumulative_input_tokens": 12345,        // optional, u64
-  "cumulative_output_tokens": 6789,        // optional, u64
-  "cumulative_cache_read": 0,              // optional, u64
-  "cumulative_cache_creation": 0,          // optional, u64
-  "last_turn_duration_ms": 1834            // optional, u64
+  "model": "claude-…", // optional
+  "turns": 7, // optional, u64
+  "cumulative_cost_usd": 0.42, // optional, f64
+  "cumulative_input_tokens": 12345, // optional, u64
+  "cumulative_output_tokens": 6789, // optional, u64
+  "cumulative_cache_read": 0, // optional, u64
+  "cumulative_cache_creation": 0, // optional, u64
+  "last_turn_duration_ms": 1834 // optional, u64
 }
 ```
 
@@ -151,7 +151,7 @@ After emitting `chat.history.replay`, a producer that tracks cumulative usage SH
 ### `chat.resume` (nefor-chat → harness)
 
 ```json
-{ "kind": "chat.resume", "session_id": "…" }   // session_id optional
+{ "kind": "chat.resume", "session_id": "…" } // session_id optional
 ```
 
 Emitted when the user runs `/resume` (most-recent session) or `/resume <id>` (specific session). The harness's expected response is a `chat.history.replay`. Harnesses that don't support resumption ignore the event.
@@ -221,17 +221,25 @@ The contract is producer-agnostic the same way `chat.*` is: any future tool-prov
 ### `tool.register` (tool plugin → bus)
 
 ```json
-{ "kind": "tool.register",
+{
+  "kind": "tool.register",
   "tools": [
-    { "name": "read_file",
+    {
+      "name": "read_file",
       "description": "Read the contents of a file. Returns the file's text content or an error.",
       "parameters": {
         "type": "object",
         "properties": {
-          "path": { "type": "string", "description": "Absolute or relative path to the file." }
+          "path": {
+            "type": "string",
+            "description": "Absolute or relative path to the file."
+          }
         },
         "required": ["path"]
-      } } ] }
+      }
+    }
+  ]
+}
 ```
 
 Broadcast by tool-providing plugins immediately after their `ready_ok` handshake completes, before any invokes can land. `parameters` is JSON Schema in OpenAI tool-call format directly — that keeps the provider's mapping into the API's `tools` array trivial (one passthrough, no shape-shifting).
@@ -241,10 +249,12 @@ Broadcast by tool-providing plugins immediately after their `ready_ok` handshake
 ### `<plugin>.tool.invoke` (caller → tool plugin)
 
 ```json
-{ "kind": "basic-tools.tool.invoke",
+{
+  "kind": "basic-tools.tool.invoke",
   "id": "<correlation-id>",
   "name": "read_file",
-  "args": { "path": "/etc/hosts" } }
+  "args": { "path": "/etc/hosts" }
+}
 ```
 
 Invocation is **targeted via kind-prefix routing**: the caller emits a kind shaped `<tool-plugin-name>.tool.invoke` and the engine's `handle_event` in [`starter/ncp.lua`](../starter/ncp.lua) routes events whose kind starts with `<peer>.` only to that peer (when the peer is connected and isn't the sender). With prefix routing, only the named tool plugin sees the invoke — no broadcast traffic, no every-plugin-filters-out branching.

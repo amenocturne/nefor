@@ -80,11 +80,11 @@ The engine is a pure string-layer event bus: it reads plugin stdin, stamps `{ori
 
 `nefor` resolves config and data via XDG-style env vars:
 
-| Env var            | Default                          | Holds       |
-|--------------------|----------------------------------|-------------|
-| `NEFOR_CONFIG_DIR` | `$XDG_CONFIG_HOME/nefor`         | `init.lua`  |
-| `NEFOR_DATA_DIR`   | `$XDG_DATA_HOME/nefor`           | sessions    |
-| `NEFOR_PLUGIN_DIR` | `$NEFOR_DATA_DIR/bin`            | binaries    |
+| Env var            | Default                  | Holds      |
+| ------------------ | ------------------------ | ---------- |
+| `NEFOR_CONFIG_DIR` | `$XDG_CONFIG_HOME/nefor` | `init.lua` |
+| `NEFOR_DATA_DIR`   | `$XDG_DATA_HOME/nefor`   | sessions   |
+| `NEFOR_PLUGIN_DIR` | `$NEFOR_DATA_DIR/bin`    | binaries   |
 
 CLI flags (`--config`, `--data-dir`, `--plugin-dir`) override env vars.
 

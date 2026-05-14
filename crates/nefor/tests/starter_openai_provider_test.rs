@@ -153,10 +153,7 @@ fn replay_window_re_feeds_chat_history_into_provider_binary() {
         delivered
     );
 
-    let roles: Vec<Option<&str>> = delivered
-        .iter()
-        .map(|e| e.role.as_deref())
-        .collect();
+    let roles: Vec<Option<&str>> = delivered.iter().map(|e| e.role.as_deref()).collect();
     assert_eq!(
         roles,
         vec![None, Some("system"), Some("user"), Some("assistant")],
@@ -252,10 +249,8 @@ fn cross_wrapper_isolation_unowned_chat_ids_drop() {
         .iter()
         .filter(|e| e.peer == "mock-plugin")
         .collect();
-    let ollama_payloads: Vec<&DeliveredEntry> = delivered
-        .iter()
-        .filter(|e| e.peer == "ollama")
-        .collect();
+    let ollama_payloads: Vec<&DeliveredEntry> =
+        delivered.iter().filter(|e| e.peer == "ollama").collect();
 
     // mock-plugin: create + user append only. No ollama-prefixed
     // envelopes leaked through, no synthesized assistant for the
@@ -292,7 +287,11 @@ fn cross_wrapper_isolation_unowned_chat_ids_drop() {
     let ollama_kinds: Vec<&str> = ollama_payloads.iter().map(|e| e.kind.as_str()).collect();
     assert_eq!(
         ollama_kinds,
-        vec!["ollama.chat.create", "ollama.chat.append", "ollama.chat.append"],
+        vec![
+            "ollama.chat.create",
+            "ollama.chat.append",
+            "ollama.chat.append"
+        ],
         "ollama re-feed shape; got {:#?}",
         ollama_payloads
     );
@@ -554,7 +553,10 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
         .join("openai-provider")
         .join("lua");
     let plugin_lua_str = plugin_lua.display().to_string();
-    let rg_plugin_lua = repo_root().join("plugins").join("reasoner-graph").join("lua");
+    let rg_plugin_lua = repo_root()
+        .join("plugins")
+        .join("reasoner-graph")
+        .join("lua");
     let rg_plugin_lua_str = rg_plugin_lua.display().to_string();
     let script = format!(
         r#"

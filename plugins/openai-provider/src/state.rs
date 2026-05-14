@@ -494,7 +494,9 @@ mod tests {
     async fn create_then_append_and_snapshot_round_trips_through_history() {
         let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("a");
-        c.create(id.clone(), None, None, None).await.expect("create");
+        c.create(id.clone(), None, None, None)
+            .await
+            .expect("create");
         c.push_user(&id, "hello".into()).await.expect("push user");
         c.push_assistant(&id, "hi there".into())
             .await
@@ -525,7 +527,9 @@ mod tests {
     async fn delete_removes_chat_and_subsequent_ops_404() {
         let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("x");
-        c.create(id.clone(), None, None, None).await.expect("create");
+        c.create(id.clone(), None, None, None)
+            .await
+            .expect("create");
         c.delete(&id).await.expect("delete");
         let err = c.push_user(&id, "y".into()).await.expect_err("post-delete");
         assert!(matches!(err, ChatsError::NotFound(x) if x == id));
@@ -657,7 +661,9 @@ mod tests {
     async fn record_turn_accumulates_per_chat() {
         let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("a");
-        c.create(id.clone(), None, None, None).await.expect("create");
+        c.create(id.clone(), None, None, None)
+            .await
+            .expect("create");
         c.record_turn(&id, Some("qwen"), 100, 50, 1234)
             .await
             .expect("first");
@@ -678,7 +684,9 @@ mod tests {
     async fn push_assistant_tool_calls_and_tool_result_round_trip() {
         let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("a");
-        c.create(id.clone(), None, None, None).await.expect("create");
+        c.create(id.clone(), None, None, None)
+            .await
+            .expect("create");
         c.push_user(&id, "hi".into()).await.expect("u");
         let calls = vec![ToolCall {
             id: "call_1".into(),
@@ -707,8 +715,12 @@ mod tests {
     #[tokio::test]
     async fn ids_returns_every_live_chat() {
         let c = Chats::with_default_model(Some("m".into()));
-        c.create(ChatId::new("a"), None, None, None).await.expect("a");
-        c.create(ChatId::new("b"), None, None, None).await.expect("b");
+        c.create(ChatId::new("a"), None, None, None)
+            .await
+            .expect("a");
+        c.create(ChatId::new("b"), None, None, None)
+            .await
+            .expect("b");
         let mut ids = c.ids().await;
         ids.sort();
         assert_eq!(ids, vec![ChatId::new("a"), ChatId::new("b")]);
@@ -749,7 +761,9 @@ mod tests {
     async fn set_tools_enabled_flips_per_chat_flag() {
         let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("a");
-        c.create(id.clone(), None, None, None).await.expect("create");
+        c.create(id.clone(), None, None, None)
+            .await
+            .expect("create");
         assert!(c.tools_enabled(&id).await.expect("on"));
         c.set_tools_enabled(&id, false).await.expect("flip off");
         assert!(!c.tools_enabled(&id).await.expect("off"));

@@ -213,7 +213,10 @@ fn outbound_renames_stream_end_drops_finish_reason() {
         .eval()
         .expect("eval");
     assert_eq!(kind, "chat.stream.end");
-    assert!(matches!(finish, Value::Nil), "finish_reason must be cleared");
+    assert!(
+        matches!(finish, Value::Nil),
+        "finish_reason must be cleared"
+    );
 }
 
 #[test]
@@ -397,7 +400,10 @@ fn outbound_does_not_mutate_caller_body() {
         )
         .eval()
         .expect("eval");
-    assert_eq!(orig_kind, "ollama.stream.delta", "caller body must not mutate");
+    assert_eq!(
+        orig_kind, "ollama.stream.delta",
+        "caller body must not mutate"
+    );
     assert_eq!(returned_kind, "chat.stream.delta");
 }
 
@@ -493,7 +499,10 @@ fn inbound_chat_auth_set_filters_by_provider() {
         )
         .eval()
         .expect("eval");
-    assert!(matches!(unmatched, Value::Nil), "non-matching provider drops");
+    assert!(
+        matches!(unmatched, Value::Nil),
+        "non-matching provider drops"
+    );
 }
 
 #[test]
@@ -516,7 +525,10 @@ fn inbound_chat_model_set_returns_bare_body() {
         .expect("eval");
     assert_eq!(kind, "ollama.model.set");
     assert_eq!(model, "qwen3");
-    assert!(matches!(chat_id, Value::Nil), "chat_id must NOT be set by the lib");
+    assert!(
+        matches!(chat_id, Value::Nil),
+        "chat_id must NOT be set by the lib"
+    );
 }
 
 #[test]
@@ -534,8 +546,10 @@ fn inbound_self_from_drops() {
         )
         .eval()
         .expect("eval");
-    assert!(matches!(v, Value::Nil),
-        "envelopes the lib itself published must not echo back");
+    assert!(
+        matches!(v, Value::Nil),
+        "envelopes the lib itself published must not echo back"
+    );
 }
 
 #[test]
@@ -566,7 +580,10 @@ fn inbound_live_chat_create_tracks_ownership() {
         )
         .eval()
         .expect("eval");
-    assert!(dup_skipped, "owned chat.create on replay must skip delivery");
+    assert!(
+        dup_skipped,
+        "owned chat.create on replay must skip delivery"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -768,7 +785,10 @@ fn replay_rebuild_tool_result_drops_error_shaped() {
         )
         .eval()
         .expect("eval");
-    assert_eq!(n, 1, "error-shaped tool.result must not synthesize an append");
+    assert_eq!(
+        n, 1,
+        "error-shaped tool.result must not synthesize an append"
+    );
 }
 
 #[test]
@@ -852,7 +872,10 @@ fn replay_rebuild_tool_result_includes_tool_calls_in_synthesis() {
         .eval()
         .expect("eval");
     assert_eq!(n, 2);
-    assert!(has_tool_calls, "synthesized assistant message must carry tool_calls");
+    assert!(
+        has_tool_calls,
+        "synthesized assistant message must carry tool_calls"
+    );
 }
 
 #[test]

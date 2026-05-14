@@ -374,6 +374,11 @@ local function pick_response_for(chat_id)
     return {
       text = "",
       finish_reason = "tool_calls",
+      -- Brief pre-emit pause so the user can see the spawn_graph
+      -- popup land deliberately rather than appearing in the same
+      -- frame as their input. Long enough to read "thinking…",
+      -- short enough not to feel sluggish.
+      pre_delay_ms = 1500,
       tool_calls = {
         {
           id        = mint_tool_id("spawn_graph"),
@@ -393,10 +398,15 @@ local function pick_response_for(chat_id)
   --    spawn_graph workflow — each fires its own chat with a prompt
   --    like "Summarise octopuses..." or "Combine the two summaries
   --    above into one paragraph."
+  --    Each node gets a 5s pre-emit pause so a developer watching
+  --    the DAG sidebar can actually see the run progress through
+  --    nodes (parallel sx+sy → combine → terminal). Without this
+  --    the canned-text responses come back in <100ms each and the
+  --    sidebar flashes done before the user can read it.
   -- ----------------------------------------------------------------
   for _, entry in ipairs(CANNED_TEXT) do
     if string.find(last_user, entry.pattern) then
-      return { text = entry.text, finish_reason = "stop" }
+      return { text = entry.text, finish_reason = "stop", pre_delay_ms = 5000 }
     end
   end
 
@@ -765,6 +775,25 @@ nefor.on(NAME .. ".chat.complete", function(body)
     tostring(resp.finish_reason),
     type(resp.text) == "string" and #resp.text or 0,
     resp.tool_calls and #resp.tool_calls or 0))
+
+  -- Pre-emit "thinking" pause for interactive smoke tests. Skipped
+  -- under NEFOR_TEST_FAST_MOCK so harness runs stay fast. Sliced into
+  -- 100ms chunks so a /cancel during the wait actually lands — the
+  -- yielding `nefor.sleep` lets the dispatch loop deliver the
+  -- `<NAME>.interrupt` envelope between slices.
+  if pacing_enabled() and type(resp.pre_delay_ms) == "number" and resp.pre_delay_ms > 0 then
+    local remaining = resp.pre_delay_ms
+    while remaining > 0 do
+      if interrupted[chat_id] then
+        nefor.emit("chat.error", { chat_id = chat_id, message = "interrupted" })
+        if not chats[chat_id] then chats[chat_id] = {} end
+        return
+      end
+      local slice = remaining > 100 and 100 or remaining
+      nefor.sleep(slice)
+      remaining = remaining - slice
+    end
+  end
 
   -- Error branch: emit `<name>.chat.error` and skip the result wire.
   -- The wrapper actor (starter/wrappers/openai-provider.lua) translates

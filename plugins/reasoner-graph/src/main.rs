@@ -194,8 +194,7 @@ async fn dispatch_event(
                     return Ok(());
                 }
             };
-            let synthesized =
-                synthesize_node_result(&run_id, &node_id, &firing_id, body);
+            let synthesized = synthesize_node_result(&run_id, &node_id, &firing_id, body);
             let snapshot = peers.lock().expect("peers mutex poisoned").clone();
             let effects = Scheduler::handle_node_result(runs, &snapshot, &synthesized);
             emit_effects(out_tx, effects.into_vec()).await?;
@@ -566,7 +565,10 @@ mod tests {
             Some("tool.result")
         );
         assert_eq!(body.get("id").and_then(Value::as_str), Some("run-1"));
-        let result = body.get("result").and_then(Value::as_object).expect("result");
+        let result = body
+            .get("result")
+            .and_then(Value::as_object)
+            .expect("result");
         assert_eq!(
             result.get("status").and_then(Value::as_str),
             Some("partial_failure")
@@ -692,10 +694,7 @@ mod tests {
             let msg = out_rx.recv().await.expect("envelope");
             if let Body::Event(map) = &msg.body {
                 if map.get("kind").and_then(Value::as_str) == Some("tool.invoke") {
-                    firing_id = map
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned);
+                    firing_id = map.get("id").and_then(Value::as_str).map(ToOwned::to_owned);
                     break;
                 }
             }

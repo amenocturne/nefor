@@ -1022,7 +1022,10 @@ fn drag_across_two_adjacent_selectables_clamps_to_origin() {
 /// byte stream tracking whether the current style carries reverse.
 fn count_reverse_cells_on_row(engine: &mut Engine, screen_row: u16) -> u16 {
     use unicode_width::UnicodeWidthStr;
-    let bytes = engine.render_if_dirty().expect("render-if-dirty").unwrap_or_default();
+    let bytes = engine
+        .render_if_dirty()
+        .expect("render-if-dirty")
+        .unwrap_or_default();
     if bytes.is_empty() {
         // Nothing dirty — the snapshot is still the prev frame.
     }
@@ -1300,9 +1303,8 @@ fn drag_back_into_viewport_clears_latch() {
         engine.drive_drag_auto_scroll_tick();
     }
     let post = render_str(&mut engine);
-    let extract_offset = |s: &str| -> Option<String> {
-        s.lines().find(|l| l.contains("offset:")).map(String::from)
-    };
+    let extract_offset =
+        |s: &str| -> Option<String> { s.lines().find(|l| l.contains("offset:")).map(String::from) };
     assert_eq!(
         extract_offset(&pre),
         extract_offset(&post),
@@ -1514,8 +1516,7 @@ fn drag_inside_selectable_column_copies_visible_text() {
     // ("alpha" starts ~col 5 of "main alpha") to row 2 col 12 (end of
     // "main charlie") — captures content under the drag range.
     drag_select(&mut engine, (0, 0), &[(10, 1), (15, 2)], (15, 2));
-    let captured =
-        last_captured_selection(&mut engine).expect("mouse.selection should fire");
+    let captured = last_captured_selection(&mut engine).expect("mouse.selection should fire");
     assert!(
         captured.contains("main alpha"),
         "captured copy must include the anchor row 'main alpha'; got:\n{captured:?}"
@@ -1538,8 +1539,7 @@ fn drag_from_one_selectable_column_into_another_clamps_to_origin() {
     let _ = render_str(&mut engine);
     // Click in main column (col 5, row 0), drag into sidebar (col 30, row 2).
     drag_select(&mut engine, (5, 0), &[(15, 1), (25, 2), (30, 2)], (30, 2));
-    let captured =
-        last_captured_selection(&mut engine).expect("mouse.selection should fire");
+    let captured = last_captured_selection(&mut engine).expect("mouse.selection should fire");
     assert!(
         captured.contains("main"),
         "drag from main origin must include main content; got:\n{captured:?}"
@@ -1589,8 +1589,7 @@ fn drag_inside_selectable_text_input_copies_visible_text() {
     let _ = render_str(&mut engine);
     // Header on row 0; text_input on row 1. Drag across the input's row.
     drag_select(&mut engine, (0, 1), &[(10, 1), (20, 1)], (20, 1));
-    let captured =
-        last_captured_selection(&mut engine).expect("mouse.selection should fire");
+    let captured = last_captured_selection(&mut engine).expect("mouse.selection should fire");
     // The captured text should include "hello world" (or a substring of
     // "hello world from prompt") — exact match depends on the input's
     // visible window, but the displayed prefix must be present.
@@ -1617,8 +1616,7 @@ fn selectable_text_input_still_accepts_typing_keys() {
     // after the initial sync).
     let snap = engine.snapshot();
     assert!(
-        snap.contains("hello world from promptX")
-            || snap.contains("X"),
+        snap.contains("hello world from promptX") || snap.contains("X"),
         "typing into a selectable text_input must still insert at cursor; \
          frame:\n{snap}"
     );

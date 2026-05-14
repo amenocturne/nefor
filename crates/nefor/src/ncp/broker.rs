@@ -227,9 +227,7 @@ impl EngineOps for BrokerOps {
                 // `nefor.engine.plugins()` to pick this peer — so the
                 // explicit error gives them the chance to react to a
                 // TOCTOU disconnect.
-                return Err(format!(
-                    "target plugin '{target}' is not connected"
-                ));
+                return Err(format!("target plugin '{target}' is not connected"));
             }
         };
         let line = with_trailing_newline(payload);
@@ -673,10 +671,7 @@ impl Broker {
             if lines.is_empty() {
                 continue;
             }
-            if let Err(e) = self
-                .host
-                .invoke_from_plugin_batch(name.as_str(), &lines)
-            {
+            if let Err(e) = self.host.invoke_from_plugin_batch(name.as_str(), &lines) {
                 tracing::error!(
                     error = %e,
                     peer = %name.as_str(),
@@ -1092,7 +1087,9 @@ mod tests {
             .count();
         assert_eq!(step_count, 1, "exactly one step entry from the send");
         assert!(
-            !entries.iter().any(|e| matches!(&e.origin, Origin::Plugin(_))),
+            !entries
+                .iter()
+                .any(|e| matches!(&e.origin, Origin::Plugin(_))),
             "no auto-logged plugin entries; got {entries:?}"
         );
 
@@ -1293,7 +1290,9 @@ mod tests {
             .count();
         assert_eq!(step_count, 1, "one step entry from the republish");
         assert!(
-            !entries.iter().any(|e| matches!(&e.origin, Origin::Plugin(_))),
+            !entries
+                .iter()
+                .any(|e| matches!(&e.origin, Origin::Plugin(_))),
             "no auto-logged plugin entries; got {entries:?}"
         );
     }
@@ -1630,8 +1629,14 @@ mod tests {
         assert_eq!(source, "burst", "source name preserved on the batch");
         let first: String = entry.get("first").unwrap();
         let last: String = entry.get("last").unwrap();
-        assert_eq!(first, "line-0", "first line preserves stdin order within a peer's batch");
-        assert_eq!(last, "line-4", "last line preserves stdin order within a peer's batch");
+        assert_eq!(
+            first, "line-0",
+            "first line preserves stdin order within a peer's batch"
+        );
+        assert_eq!(
+            last, "line-4",
+            "last line preserves stdin order within a peer's batch"
+        );
     }
 
     /// One stdin line on a tick still fires one `invoke_from_plugin_batch`
