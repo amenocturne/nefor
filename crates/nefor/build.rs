@@ -11,14 +11,16 @@
 use std::process::Command;
 
 fn main() {
-    // Re-run only when HEAD or refs change; running every build would
-    // force a rebuild of the engine on every cargo invocation even when
-    // nothing changed (incremental compile would still be fast, but the
-    // env-var-changed signal forces relink). The HEAD path covers
-    // commits + tag moves; the workflow's full checkout puts every tag
-    // in place before this script runs.
+    // Re-run when HEAD moves or refs change. `.git/HEAD`'s file content
+    // only changes on branch switch (it's a symbolic ref like
+    // `ref: refs/heads/foo`), so watching it alone misses new commits on
+    // the current branch. `.git/logs/HEAD` records every HEAD movement
+    // (commit, reset, checkout, merge) — that's the right signal. We
+    // also watch the refs dirs so tag creates/moves trigger a rebuild.
     println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/logs/HEAD");
     println!("cargo:rerun-if-changed=../../.git/refs/tags");
+    println!("cargo:rerun-if-changed=../../.git/refs/heads");
     println!("cargo:rerun-if-env-changed=NEFOR_VERSION_OVERRIDE");
 
     let version = if let Ok(v) = std::env::var("NEFOR_VERSION_OVERRIDE") {
