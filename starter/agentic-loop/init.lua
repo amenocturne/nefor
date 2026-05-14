@@ -468,7 +468,18 @@ local function handle_tool_result_run_close(run_id, body)
   end
   results = results or {}
 
-  -- Sub-graph completion: queue + flush deferred relay.
+  -- Sub-graph completion: surface the literal sub-graph output to the
+  -- user, then queue the LLM-instruction-wrapped relay text + flush.
+  --
+  -- The deferred relay text built by `format_deferred` is shaped for the
+  -- LLM (it leads with "[spawn_graph(...) result]" + behavioural framing
+  -- + the actual output). It rides as the next orchestrator-turn user
+  -- message so the model can acknowledge / paraphrase. But the literal
+  -- sub-graph terminal output is the ground truth — the user wants to
+  -- see it directly, between the collapsed `▶ spawn_graph(...)` tool
+  -- view and the model's relay paragraph. Emit it as a transcript-bound
+  -- system message so it lands in the chat scrollback (and persists for
+  -- replay) at the moment the sub-graph closes.
   local sub_pending = state.pending_runs[run_id]
   if sub_pending ~= nil then
     state.pending_runs[run_id] = nil
@@ -487,6 +498,38 @@ local function handle_tool_result_run_close(run_id, body)
     nefor.log.info("agentic-loop: sub-graph completed", {
       run_id = run_id, status = effective_status,
     })
+    -- Surface the sub-graph result as a distinguishable transcript
+    -- block. The chat-bridge forwards this envelope identity-passthrough
+    -- to the TUI; chat/update.lua's reducer pushes a `graph_result`
+    -- entry kind that entries.lua renders with its own glyph + style.
+    -- The deferred-queue user message below still feeds the model.
+    local graph_nodes = {}
+    local pending_graph = sub_pending.graph
+    if type(pending_graph) == "table" and type(pending_graph.nodes) == "table" then
+      for _, n in ipairs(pending_graph.nodes) do
+        if type(n) == "table" then
+          graph_nodes[#graph_nodes + 1] = {
+            id   = tostring(n.id or "?"),
+            -- Prefer the lead-workflow `role` (explorer / builder / …)
+            -- when present; fall back to `reasoner` for orchestrator-
+            -- internal graphs that don't carry the role concept.
+            role = tostring(n.role or n.reasoner or "?"),
+          }
+        end
+      end
+    end
+    local graph_event = {
+      kind   = "chat.graph_result.append",
+      run_id = run_id,
+      status = effective_status == "success" and "success" or "failed",
+      nodes  = graph_nodes,
+    }
+    if effective_status == "success" then
+      graph_event.output = completion.output
+    else
+      graph_event.error = completion.error
+    end
+    emit("nefor-tui", graph_event)
     local text = format_deferred(completion)
     state.deferred_queue[#state.deferred_queue + 1] = { text = text }
     flush_deferred()
@@ -627,7 +670,12 @@ local function queue_sub_graph(args, gate_inner_id)
     return nil, "spawn_graph: missing or non-object `graph` argument"
   end
   local run_id = uuid_lite()
-  state.pending_runs[run_id] = { gate_inner_id = gate_inner_id }
+  -- Retain the submitted graph so the run-close handler can surface a
+  -- per-node id+role list to the TUI's graph_result entry. The graph
+  -- table is otherwise opaque to agentic-loop — reasoner-graph parses
+  -- + owns scheduling — but the node list is exactly the metadata the
+  -- chat surface needs to render the sub-graph result block.
+  state.pending_runs[run_id] = { gate_inner_id = gate_inner_id, graph = g }
   state.pending_dispatches[#state.pending_dispatches + 1] = {
     run_id          = run_id,
     graph           = g,

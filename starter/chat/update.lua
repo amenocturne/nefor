@@ -732,6 +732,26 @@ function M.update(msg, state)
     return transcript.attach_tool_end(state, msg.id or "", msg.output or "", msg.error == true), {}
   end
 
+  -- Sub-graph result block. agentic-loop emits this from its run-close
+  -- handler so the user can see what the dispatched sub-graph actually
+  -- returned (the model-bound user-role echo separately feeds the
+  -- lead's chat history). Distinct entry kind so entries.lua renders
+  -- with its own glyph + style; survives /resume because the chat-bridge
+  -- forwards live envelopes into the session log and the reducer
+  -- re-runs on replay.
+  if kind == "chat.graph_result.append" then
+    return transcript.push_entry(state, {
+      kind        = "graph_result",
+      role        = "graph",
+      run_id      = msg.run_id or "",
+      status      = msg.status or "success",
+      nodes       = msg.nodes or {},
+      output      = msg.output,
+      error       = msg.error,
+      duration_ms = msg.duration_ms,
+    }), {}
+  end
+
   -- ── plan-message contract (lead-workflow `write-review` tool) ──────
   -- The lead-workflow actor's write-review tool fires a plan envelope
   -- the chat surface renders as a yellow-bordered "plan" entry. This

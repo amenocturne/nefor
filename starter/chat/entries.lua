@@ -187,6 +187,85 @@ local function tool_expanded(entry)
   return tui.column { gap = 0, children = rows }
 end
 
+-- Two-column node list (id, role). The id column pads to the widest
+-- id so the role column lines up for scan-ability. Empty when the
+-- envelope carried no nodes (e.g. malformed graph) — caller decides
+-- whether to render the section at all.
+local function graph_result_nodes_block(nodes)
+  if type(nodes) ~= "table" or #nodes == 0 then return nil end
+  local widest = 0
+  for _, n in ipairs(nodes) do
+    local id = tostring(n.id or "")
+    if #id > widest then widest = #id end
+  end
+  local lines = { "nodes:" }
+  for _, n in ipairs(nodes) do
+    local id   = tostring(n.id or "")
+    local role = tostring(n.role or "")
+    local pad  = widest - #id
+    lines[#lines + 1] = "  " .. id .. string.rep(" ", pad) .. "  " .. role
+  end
+  return "  " .. table.concat(lines, "\n  ")
+end
+
+local function graph_result_header(entry, glyph)
+  local failed = (entry.status == "failed")
+  local style = failed and STYLE.graph_result_error or STYLE.graph_result_name
+  local run_id = tostring(entry.run_id or "?")
+  local node_count = (type(entry.nodes) == "table") and #entry.nodes or 0
+  local header
+  if failed then
+    header = glyph .. "graph(run_id=" .. run_id .. ") FAILED"
+  else
+    local nlabel
+    if node_count == 1 then nlabel = "1 node"
+    else nlabel = tostring(node_count) .. " nodes" end
+    header = glyph .. "graph(run_id=" .. run_id .. ", " .. nlabel .. ")"
+  end
+  return tui.text { content = header, style = style, wrap = "none" }
+end
+
+local function graph_result_collapsed(entry)
+  return tui.column { gap = 0, children = { graph_result_header(entry, "◆ ") } }
+end
+
+local function graph_result_expanded(entry)
+  local rows = { graph_result_header(entry, "◇ ") }
+  local nodes_block = graph_result_nodes_block(entry.nodes)
+  if nodes_block then
+    rows[#rows + 1] = tui.text {
+      content = pad_block(nodes_block),
+      style   = { fg = C.md_code_fg, bg = C.md_code_block_bg },
+      wrap    = "none",
+    }
+  end
+  local failed = (entry.status == "failed")
+  if failed then
+    rows[#rows + 1] = tui.text { content = "  error:", style = STYLE.status_danger, wrap = "none" }
+    local err = entry.error
+    if type(err) == "string" and #err > 0 then
+      local indented = "  " .. err:gsub("\n", "\n  ")
+      rows[#rows + 1] = tui.text {
+        content = pad_block(indented),
+        style   = { fg = C.md_code_fg, bg = C.md_code_block_bg },
+        wrap    = "none",
+      }
+    end
+  else
+    rows[#rows + 1] = tui.text { content = "  output:", style = STYLE.footer, wrap = "none" }
+    local out = entry.output
+    if type(out) == "string" and #out > 0 then
+      local indented = "  " .. out:gsub("\n", "\n  ")
+      rows[#rows + 1] = tui.text {
+        content = pad_block(indented),
+        style   = { fg = C.md_code_fg, bg = C.md_code_block_bg },
+        wrap    = "none",
+      }
+    end
+  end
+  return tui.column { gap = 0, children = rows }
+end
+
 -- Plan entries carry a `submitted_at` timestamp the lead-workflow
 -- actor stamps when the write-review tool fires. Render as "HH:MM"
 -- for the plan-box subtitle. Accepts ISO 8601 strings and epoch-ms
@@ -261,6 +340,10 @@ function M.render(entry, _i, expanded)
   if entry.kind == "tool_call" then
     if expanded then return tool_expanded(entry) end
     return tool_collapsed(entry)
+  end
+  if entry.kind == "graph_result" then
+    if expanded then return graph_result_expanded(entry) end
+    return graph_result_collapsed(entry)
   end
   if entry.kind == "plan" then
     return render_plan_entry(entry)
