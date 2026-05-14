@@ -775,6 +775,24 @@ local function receive_msg(entry)
     return
   end
 
+  -- Slash commands `/approve [reason]` and `/reject [reason]` arrive
+  -- as `chat.command` envelopes (the chat surface routes any unknown
+  -- slash through this generic kind). We synthesise the same shape
+  -- handle_chat_input expects so the existing parser handles both
+  -- entry points identically.
+  if kind == "chat.command" then
+    local name = body.name
+    if name == "approve" or name == "reject" then
+      local args = body.args or ""
+      local text = "/" .. name
+      if type(args) == "string" and #args > 0 then
+        text = text .. " " .. args
+      end
+      handle_chat_input({ text = text })
+    end
+    return
+  end
+
   -- Watch for the orchestrator's run-close envelope so we can clear
   -- active_run_id when the graph finishes naturally (mirrors how
   -- agentic-loop tracks pending_runs). The wire shape is
