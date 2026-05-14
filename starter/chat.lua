@@ -14,8 +14,7 @@
 --   chat.session.stats, chat.tool.start, chat.tool.end,
 --   chat.popup, chat.auth.status, chat.model.set_ack, chat.models.listed,
 --   chat.tool.permission_request, tool-gate.mode_changed,
---   graph.run_started, graph.node_dispatched, graph.node_result,
---   graph.run_complete.
+--   graph.run_started, graph.node.fired, tool.result.
 --
 -- Outbound:
 --   chat.input.submit, chat.interrupt, chat.interrupt_all, chat.reset,
@@ -2346,7 +2345,7 @@ local function update(msg, state)
       local cleared = shallow_merge(state, {
         entries = {}, in_flight = NIL_SENTINEL, input_value = "",
         pending = false, slash = NIL_SENTINEL,
-        dag_runs = {},
+        dag_runs = {}, firing_to_node = {},
         turn_started_at = NIL_SENTINEL,
         last_turn_duration_ms = NIL_SENTINEL,
         last_esc_ms = NIL_SENTINEL,
@@ -2452,7 +2451,7 @@ local function update(msg, state)
         return shallow_merge(state, {
           input_value = "", slash = NIL_SENTINEL,
           entries = {}, in_flight = NIL_SENTINEL,
-          pending = false, dag_runs = {},
+          pending = false, dag_runs = {}, firing_to_node = {},
           turn_started_at = NIL_SENTINEL,
           last_turn_duration_ms = NIL_SENTINEL,
         }), {
@@ -2698,7 +2697,7 @@ local function update(msg, state)
       return shallow_merge(state, {
         popup = NIL_SENTINEL,
         entries = {}, in_flight = NIL_SENTINEL,
-        pending = false, dag_runs = {},
+        pending = false, dag_runs = {}, firing_to_node = {},
         turn_started_at = NIL_SENTINEL,
         last_turn_duration_ms = NIL_SENTINEL,
       }), {
@@ -2912,8 +2911,10 @@ local function update(msg, state)
     -- Boot path: state is already empty; the entries-wipe that
     -- USED to live here turned out to break ncp.lua's replay-on-attach
     -- (boot session_start delivered AFTER the user's first prompt
-    -- nuked the local-push), so we deliberately do nothing here.
-    return state, {}
+    -- nuked the local-push), so we deliberately do nothing for
+    -- entries here. dag_runs is independent of that race (no
+    -- pre-boot dispatch path) so we still clear it.
+    return shallow_merge(state, { dag_runs = {}, firing_to_node = {} }), {}
   end
 
   if kind == "sessions.resume_done" then
@@ -3176,27 +3177,67 @@ local function update(msg, state)
     return shallow_merge(state, { gate_yolo = msg.mode == "yolo" }), {}
   end
 
-  -- DAG observation
+  -- DAG observation. Each handler short-circuits during replay: the
+  -- graph.* envelopes seeded into the resumed session's jsonl are
+  -- snapshots from the prior live run, not fresh dispatches, and
+  -- mutating dag_runs from them would re-light a panel that should
+  -- start clean (sessions.session_start clears it). Mirrors the
+  -- chat.tool.permission_request guard above.
+  --
+  -- Wire shape post Phase 3b: reasoner-graph emits
+  --   * graph.run_started  { run_id, total_nodes }
+  --   * graph.node.fired   { run_id, node_id, firing_id, reasoner }
+  --     — paired observer for each tool.invoke dispatch.
+  --   * tool.result        { id, result | error }
+  --     — id == firing_id closes one node; id == run_id closes the run.
+  --   We also keep a firing_id → (run_id, node_id) map per state so
+  --   tool.result events can be routed back to the right node without
+  --   parsing dispatch traffic.
   if kind == "graph.run_started" then
     local now = tui.now_ms()
     return dag_run_started(state, msg.run_id or "", msg.total_nodes or 0, now), {}
   end
-  if kind == "graph.node_dispatched" then
+  if kind == "graph.node.fired" then
+    if state.replay_mode then return state, {} end
     if (msg.run_id or "") == "" or (msg.node_id or "") == "" then return state, {} end
+    if (msg.firing_id or "") == "" then return state, {} end
     local now = tui.now_ms()
-    return dag_node_dispatched(state, msg.run_id, msg.node_id, msg.reasoner or "", now), {}
+    local with_dispatch = dag_node_dispatched(state, msg.run_id, msg.node_id, msg.reasoner or "", now)
+    local prev_map = with_dispatch.firing_to_node or {}
+    local next_map = {}
+    for k, v in pairs(prev_map) do next_map[k] = v end
+    next_map[msg.firing_id] = { run_id = msg.run_id, node_id = msg.node_id }
+    return shallow_merge(with_dispatch, { firing_to_node = next_map }), {}
   end
-  if kind == "graph.node_result" then
-    if (msg.run_id or "") == "" or (msg.node_id or "") == "" then return state, {} end
+  if kind == "tool.result" then
+    if state.replay_mode then return state, {} end
+    local id = msg.id
+    if type(id) ~= "string" or id == "" then return state, {} end
     local now = tui.now_ms()
-    local has_output = msg.output ~= nil
-    local has_error  = msg.error  ~= nil
-    return dag_node_result(state, msg.run_id, msg.node_id, has_output, has_error, now), {}
-  end
-  if kind == "graph.run_complete" then
-    if (msg.run_id or "") == "" then return state, {} end
-    local now = tui.now_ms()
-    return dag_run_complete(state, msg.run_id, msg.status, msg.results, now), {}
+    -- Run-close: id matches a tracked run.
+    if state.dag_runs and state.dag_runs[id] then
+      local result = msg.result
+      local status, results
+      if type(result) == "table" then
+        status  = result.status
+        results = result.results
+      end
+      return dag_run_complete(state, id, status, results, now), {}
+    end
+    -- Per-firing close: look up firing_id → (run_id, node_id) map.
+    local map_entry = (state.firing_to_node or {})[id]
+    if map_entry then
+      local run_id  = map_entry.run_id
+      local node_id = map_entry.node_id
+      local has_output = msg.result ~= nil
+      local has_error  = msg.error  ~= nil
+      local next_state = dag_node_result(state, run_id, node_id, has_output, has_error, now)
+      local next_map = {}
+      for k, v in pairs(state.firing_to_node or {}) do next_map[k] = v end
+      next_map[id] = nil
+      return shallow_merge(next_state, { firing_to_node = next_map }), {}
+    end
+    return state, {}
   end
 
   -- Mouse drag-to-select: the engine extracts the highlighted text from

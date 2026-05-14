@@ -39,6 +39,7 @@ fn jsonl_excludes_session_control_events() {
     lua.load(
         r#"
         sessions = require("sessions")
+        sessions_test = require("sessions.test")
         sessions.init()
         "#,
     )
@@ -70,14 +71,14 @@ fn jsonl_excludes_session_control_events() {
             }
         end
         -- Normal traffic — must be persisted.
-        sessions._persist_envelope(entry("ollama", { kind = "chat.message.append", role = "user", text = "hi" }))
+        sessions_test._persist_envelope(entry("ollama", { kind = "chat.message.append", role = "user", text = "hi" }))
         -- Session control event — must be DROPPED.
-        sessions._persist_envelope(entry("engine", { kind = "sessions.resume_request", session_id = "x" }))
-        sessions._persist_envelope(entry("engine", { kind = "sessions.session_end", session_id = "x" }))
-        sessions._persist_envelope(entry("engine", { kind = "sessions.session_start", session_id = "y" }))
-        sessions._persist_envelope(entry("engine", { kind = "sessions.resume_done", session_id = "y" }))
+        sessions_test._persist_envelope(entry("engine", { kind = "sessions.resume_request", session_id = "x" }))
+        sessions_test._persist_envelope(entry("engine", { kind = "sessions.session_end", session_id = "x" }))
+        sessions_test._persist_envelope(entry("engine", { kind = "sessions.session_start", session_id = "y" }))
+        sessions_test._persist_envelope(entry("engine", { kind = "sessions.resume_done", session_id = "y" }))
         -- Another normal entry.
-        sessions._persist_envelope(entry("nefor-tui", { kind = "chat.input.submit", text = "hello" }))
+        sessions_test._persist_envelope(entry("nefor-tui", { kind = "chat.input.submit", text = "hello" }))
         "#,
     )
     .exec()
@@ -146,6 +147,7 @@ fn inbound_outbound_cycle_lands_in_jsonl() {
     lua.load(
         r#"
         sessions = require("sessions")
+        sessions_test = require("sessions.test")
         sessions.init()
         "#,
     )
@@ -171,11 +173,11 @@ fn inbound_outbound_cycle_lands_in_jsonl() {
             if target ~= nil then e.target = target end
             return e
         end
-        sessions._persist_envelope(entry("nefor-tui", nil,
+        sessions_test._persist_envelope(entry("nefor-tui", nil,
             { kind = "chat.input.submit", text = "hello" }))
-        sessions._persist_envelope(entry("step", "nefor-tui",
+        sessions_test._persist_envelope(entry("step", "nefor-tui",
             { kind = "chat.message.append", role = "user", text = "hello" }))
-        sessions._persist_envelope(entry("ollama", nil,
+        sessions_test._persist_envelope(entry("ollama", nil,
             { kind = "chat.stream.end", chat_id = "c1" }))
         "#,
     )
@@ -274,6 +276,7 @@ fn resume_phase_hooks_fire_synchronously_before_emit() {
     lua.load(
         r#"
         sessions = require("sessions")
+        sessions_test = require("sessions.test")
         sessions.init()
 
         sessions.on_resume_phase("session_end", function(_id)
@@ -324,181 +327,20 @@ fn resume_phase_hooks_fire_synchronously_before_emit() {
 }
 
 #[test]
-fn resume_replay_targets_only_tui_with_step_origin_entries() {
-    // Issue 1 regression: the replay path used to broadcast plugin-
-    // origin entries (raw `<provider-prefix>.stream.delta` etc.)
-    // verbatim via `nefor.engine.send(payload)` — which bypasses the
-    // per-edge `for_provider.from_plugin` translation, so nefor-tui
-    // (which speaks `chat.*`) saw nothing match its handlers and the
-    // transcript stayed empty after `/resume`. The fix is to replay
-    // STEP-ORIGIN entries (post-transform per-peer fan-out the broker
-    // captured in the live session) targeted at `nefor-tui` only —
-    // side-effecting plugins (provider, reasoner-graph, tool-gate)
-    // should never see replay traffic.
+fn shutdown_prunes_truly_empty_session_preserves_session_with_any_envelope() {
+    // Picker-clutter cleanup: a session that boots and quits without
+    // any envelope being persisted has nothing worth keeping, so it's
+    // deleted on shutdown. Once any envelope lands in the jsonl, the
+    // session is preserved.
     //
-    // We synthesise a session log with one of each origin/target shape
-    // and a header, drive `sessions.resume()`, and assert (a) the
-    // engine.send calls that came out target only `nefor-tui`, (b) the
-    // payloads are the step-origin chat.* envelopes, never the raw
-    // `<prefix>.stream.delta`.
+    //   (a) no envelopes persisted → pruned.
+    //   (b) at least one envelope persisted → preserved.
     let tempdir = tempfile::tempdir().expect("tempdir");
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let prev = std::env::var("NEFOR_DATA_HOME").ok();
     std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
 
-    // Pre-seed a session jsonl on disk with a representative mix:
-    //   * header
-    //   * raw plugin-origin chat.input.submit (origin nefor-tui)
-    //   * step-origin chat.message.append targeted nefor-tui (a user echo)
-    //   * step-origin chat.stream.delta targeted nefor-tui
-    //   * step-origin chat.stream.delta targeted reasoner-graph (NOT replayed)
-    //   * raw plugin-origin ollama.stream.delta (NOT replayed)
-    let target_id = "11111111-2222-4333-8444-555555555555";
-    // sessions.lua's `data_root()` uses NEFOR_DATA_HOME as-is (no
-    // `/nefor` suffix — that's the XDG fallback path). Sessions live
-    // at `<root>/sessions/<id>.jsonl`.
-    let sessions_dir = tempdir.path().join("sessions");
-    std::fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
-    let session_path = sessions_dir.join(format!("{target_id}.jsonl"));
-    // Each line is a JSON document the engine's session writer (or
-    // `sessions._persist_envelope`) would have written.
-    let body = concat!(
-        // header
-        r#"{"_session":true,"session_id":"11111111-2222-4333-8444-555555555555","started_at":"2026-05-04T00:00:00.000Z"}"#,
-        "\n",
-        // plugin-origin raw inbound — must NOT be replayed
-        r#"{"ts":"2026-05-04T00:00:00.001Z","origin":"nefor-tui","payload":"{\"type\":\"event\",\"body\":{\"kind\":\"chat.input.submit\",\"text\":\"hi\"}}"}"#,
-        "\n",
-        // step-origin chat.message.append targeted nefor-tui — MUST be replayed
-        r#"{"ts":"2026-05-04T00:00:00.002Z","origin":"step","target":"nefor-tui","payload":"{\"ts\":\"2026-05-04T00:00:00.002Z\",\"type\":\"event\",\"from\":\"engine\",\"body\":{\"kind\":\"chat.message.append\",\"role\":\"user\",\"text\":\"hi\"}}"}"#,
-        "\n",
-        // step-origin chat.stream.delta targeted nefor-tui — MUST be replayed
-        r#"{"ts":"2026-05-04T00:00:00.003Z","origin":"step","target":"nefor-tui","payload":"{\"ts\":\"2026-05-04T00:00:00.003Z\",\"type\":\"event\",\"from\":\"ollama\",\"body\":{\"kind\":\"chat.stream.delta\",\"text\":\"Hello\"}}"}"#,
-        "\n",
-        // step-origin chat.stream.delta targeted reasoner-graph — MUST NOT be replayed
-        r#"{"ts":"2026-05-04T00:00:00.004Z","origin":"step","target":"reasoner-graph","payload":"{\"ts\":\"2026-05-04T00:00:00.004Z\",\"type\":\"event\",\"from\":\"ollama\",\"body\":{\"kind\":\"chat.stream.delta\",\"text\":\"Hello\"}}"}"#,
-        "\n",
-        // plugin-origin raw ollama.stream.delta — MUST NOT be replayed
-        r#"{"ts":"2026-05-04T00:00:00.005Z","origin":"ollama","payload":"{\"type\":\"event\",\"body\":{\"kind\":\"ollama.stream.delta\",\"chat_id\":\"c1\",\"text\":\"Hello\"}}"}"#,
-        "\n",
-    );
-    std::fs::write(&session_path, body).expect("write session");
-
-    let lua = Lua::new();
-    install_stub_nefor(&lua).expect("install nefor stub");
-    set_package_path(&lua).expect("set package.path");
-
-    // Replace engine.send with a recorder. The control-event broadcasts
-    // (sessions.session_end / start / resume_done) come through too; we
-    // capture all of them and assert on the replay-specific subset.
-    lua.load(
-        r#"
-        _sends = {}
-        nefor.engine.send = function(payload, target)
-            _sends[#_sends + 1] = { payload = payload, target = target }
-        end
-        "#,
-    )
-    .exec()
-    .expect("install send recorder");
-
-    lua.load(format!(
-        r#"
-        sessions = require("sessions")
-        sessions.init()
-        sessions.resume("{target_id}")
-        "#,
-        target_id = target_id,
-    ))
-    .exec()
-    .expect("drive resume");
-
-    let sends_tbl: Table = lua.globals().get("_sends").expect("_sends");
-    let len = sends_tbl.len().expect("len") as usize;
-    let mut chat_kind_sends: Vec<(String, Option<String>)> = Vec::new();
-    for i in 1..=len {
-        let entry: Table = sends_tbl.get(i).expect("entry");
-        let payload: String = entry.get("payload").expect("payload");
-        let target: Option<String> = match entry.get::<Value>("target").expect("target") {
-            Value::String(s) => Some(s.to_str().expect("utf8").to_owned()),
-            _ => None,
-        };
-        // Look at the body.kind. Skip control events (sessions.*).
-        let v: serde_json::Value = match serde_json::from_str(&payload) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let kind = v
-            .get("body")
-            .and_then(|b| b.get("kind"))
-            .and_then(|k| k.as_str())
-            .unwrap_or("")
-            .to_owned();
-        if kind.starts_with("sessions.") {
-            continue;
-        }
-        chat_kind_sends.push((kind, target));
-    }
-
-    // Replay should have produced exactly one send — the
-    // chat.message.append. The chat.stream.delta is dropped by the
-    // replay's REPLAY_DROP_KINDS filter (resume is instant: deltas
-    // are subsumed by their stream.end finalizer, so re-streaming
-    // them would just re-render every token live).
-    assert_eq!(
-        chat_kind_sends.len(),
-        1,
-        "replay sent unexpected non-control envelopes: {chat_kind_sends:?}",
-    );
-    for (kind, target) in &chat_kind_sends {
-        assert_eq!(
-            target.as_deref(),
-            Some("nefor-tui"),
-            "replay must target nefor-tui only; saw kind={kind} target={target:?}",
-        );
-        assert_eq!(
-            kind, "chat.message.append",
-            "replay carried unexpected kind {kind}",
-        );
-    }
-    // Belt-and-braces: stream deltas are dropped, raw provider-prefix
-    // kinds must not appear, and reasoner-graph is never targeted.
-    for (kind, _) in &chat_kind_sends {
-        assert_ne!(
-            kind, "chat.stream.delta",
-            "chat.stream.delta must be filtered out of replay (instant resume)",
-        );
-        assert!(
-            !kind.starts_with("ollama."),
-            "raw provider-prefix kind leaked into replay: {kind}",
-        );
-    }
-
-    match prev.as_deref() {
-        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
-        None => std::env::remove_var("NEFOR_DATA_HOME"),
-    }
-}
-
-#[test]
-fn shutdown_prunes_session_with_no_user_submits() {
-    // Picker-clutter regression: sessions that boot, run handshake
-    // (combinators.hello, chat.model.set_ack, etc.), and quit without
-    // a single `chat.input.submit` used to stick around as `(no
-    // submits)` ghost rows in the picker. The fix is to count submits
-    // (matching the picker's preview filter) rather than every non-
-    // control envelope, then delete the file on shutdown when the
-    // count is zero.
-    //
-    // Two shapes here:
-    //   (a) handshake-only — must be pruned.
-    //   (b) one chat.input.submit — must be preserved.
-    let tempdir = tempfile::tempdir().expect("tempdir");
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = std::env::var("NEFOR_DATA_HOME").ok();
-    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
-
-    // (a) handshake-only session.
+    // (a) empty session.
     {
         let lua = Lua::new();
         install_stub_nefor(&lua).expect("install nefor stub");
@@ -506,23 +348,12 @@ fn shutdown_prunes_session_with_no_user_submits() {
         lua.load(
             r#"
             sessions = require("sessions")
+            sessions_test = require("sessions.test")
             sessions.init()
-            local json = nefor.json
-            local function entry(origin, body)
-                return {
-                    ts      = "2026-05-04T00:00:00.000Z",
-                    origin  = origin,
-                    payload = json.encode({ type = "event", body = body }),
-                }
-            end
-            -- Realistic handshake traffic — no chat.input.submit.
-            sessions._persist_envelope(entry("nefor-combinators", { kind = "combinators.hello", version = "0.1.0" }))
-            sessions._persist_envelope(entry("nefor-combinators", { kind = "combinators.ready" }))
-            sessions._persist_envelope(entry("ollama", { kind = "chat.model.set_ack", model = "x", provider = "ollama" }))
             "#,
         )
         .exec()
-        .expect("drive handshake");
+        .expect("drive init");
         let path: String = lua
             .load(r#"return sessions.current_path()"#)
             .eval()
@@ -531,16 +362,16 @@ fn shutdown_prunes_session_with_no_user_submits() {
             std::path::Path::new(&path).exists(),
             "session file should exist before shutdown: {path}"
         );
-        lua.load(r#"sessions._on_engine_shutdown(nil)"#)
+        lua.load(r#"sessions_test._on_engine_shutdown(nil)"#)
             .exec()
             .expect("drive shutdown");
         assert!(
             !std::path::Path::new(&path).exists(),
-            "handshake-only session must be pruned on shutdown: {path}"
+            "truly empty session must be pruned on shutdown: {path}"
         );
     }
 
-    // (b) session with a real submit.
+    // (b) session with at least one persisted envelope.
     {
         let lua = Lua::new();
         install_stub_nefor(&lua).expect("install nefor stub");
@@ -548,17 +379,14 @@ fn shutdown_prunes_session_with_no_user_submits() {
         lua.load(
             r#"
             sessions = require("sessions")
+            sessions_test = require("sessions.test")
             sessions.init()
             local json = nefor.json
-            local function entry(origin, body)
-                return {
-                    ts      = "2026-05-04T00:00:00.000Z",
-                    origin  = origin,
-                    payload = json.encode({ type = "event", body = body }),
-                }
-            end
-            sessions._persist_envelope(entry("nefor-combinators", { kind = "combinators.hello" }))
-            sessions._persist_envelope(entry("nefor-tui", { kind = "chat.input.submit", text = "hi" }))
+            sessions_test._persist_envelope({
+                ts      = "2026-05-04T00:00:00.000Z",
+                origin  = "nefor-combinators",
+                payload = json.encode({ type = "event", body = { kind = "combinators.hello" } }),
+            })
             "#,
         )
         .exec()
@@ -567,12 +395,12 @@ fn shutdown_prunes_session_with_no_user_submits() {
             .load(r#"return sessions.current_path()"#)
             .eval()
             .expect("current_path");
-        lua.load(r#"sessions._on_engine_shutdown(nil)"#)
+        lua.load(r#"sessions_test._on_engine_shutdown(nil)"#)
             .exec()
             .expect("drive shutdown");
         assert!(
             std::path::Path::new(&path).exists(),
-            "session with chat.input.submit must be preserved on shutdown: {path}"
+            "session with any persisted envelope must be preserved on shutdown: {path}"
         );
     }
 
@@ -606,6 +434,7 @@ fn new_mints_fresh_session_and_prunes_empty_outgoing() {
     lua.load(
         r#"
         sessions = require("sessions")
+        sessions_test = require("sessions.test")
         sessions.init()
         "#,
     )
@@ -627,7 +456,7 @@ fn new_mints_fresh_session_and_prunes_empty_outgoing() {
 
     // Drive `/new` via the bus listener entry point so the test
     // exercises the same path the chat surface hits.
-    lua.load(r#"sessions._on_new_request(nil)"#)
+    lua.load(r#"sessions_test._on_new_request(nil)"#)
         .exec()
         .expect("drive new_request");
 
@@ -690,6 +519,7 @@ fn resume_to_existing_session_appends_in_order() {
     lua.load(
         r#"
         sessions = require("sessions")
+        sessions_test = require("sessions.test")
         sessions.init()
         "#,
     )
@@ -705,7 +535,7 @@ fn resume_to_existing_session_appends_in_order() {
     lua.load(
         r#"
         local json = nefor.json
-        sessions._persist_envelope({
+        sessions_test._persist_envelope({
             ts      = "2026-05-04T00:00:01.000Z",
             origin  = "nefor-tui",
             payload = json.encode({ type = "event", body = { kind = "chat.input.submit", text = "second" } }),
@@ -764,6 +594,7 @@ fn resume_to_self_is_noop() {
             return original_send(payload, target)
         end
         sessions = require("sessions")
+        sessions_test = require("sessions.test")
         sessions.init()
         _emit_count = 0  -- reset after init's emit
         "#,
@@ -824,6 +655,7 @@ fn resume_to_nonexistent_session_succeeds_with_zero_replayed() {
             return original_send(payload, target)
         end
         sessions = require("sessions")
+        sessions_test = require("sessions.test")
         sessions.init()
         sessions.resume("{target_id}")
         "#
@@ -876,7 +708,7 @@ fn data_root_resolves_xdg_then_home_fallback() {
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
     set_package_path(&lua).expect("set package.path");
-    lua.load(r#"sessions = require("sessions")"#)
+    lua.load(r#"sessions = require("sessions"); sessions_test = require("sessions.test")"#)
         .exec()
         .expect("require");
 
@@ -885,7 +717,7 @@ fn data_root_resolves_xdg_then_home_fallback() {
     std::env::set_var("HOME", "/tmp/test-home");
     std::env::set_var("NEFOR_DATA_HOME", "/tmp/forced/root");
     let r1: String = lua
-        .load(r#"return sessions._data_root()"#)
+        .load(r#"return sessions_test._data_root()"#)
         .eval()
         .expect("r1");
     assert_eq!(r1, "/tmp/forced/root");
@@ -894,7 +726,7 @@ fn data_root_resolves_xdg_then_home_fallback() {
     std::env::remove_var("NEFOR_DATA_HOME");
     std::env::set_var("XDG_DATA_HOME", "/tmp/xdg/root");
     let r2: String = lua
-        .load(r#"return sessions._data_root()"#)
+        .load(r#"return sessions_test._data_root()"#)
         .eval()
         .expect("r2");
     assert_eq!(r2, "/tmp/xdg/root/nefor");
@@ -903,7 +735,7 @@ fn data_root_resolves_xdg_then_home_fallback() {
     std::env::remove_var("XDG_DATA_HOME");
     std::env::set_var("HOME", "/tmp/test-home");
     let r3: String = lua
-        .load(r#"return sessions._data_root()"#)
+        .load(r#"return sessions_test._data_root()"#)
         .eval()
         .expect("r3");
     assert_eq!(r3, "/tmp/test-home/.local/share/nefor");
@@ -924,85 +756,6 @@ fn data_root_resolves_xdg_then_home_fallback() {
 }
 
 #[test]
-fn replay_drops_chat_stream_delta_keeps_reasoning_delta() {
-    // Replay must produce an INSTANT transcript, not a re-streaming of
-    // the original turn. Per-token `chat.stream.delta` envelopes are
-    // dropped because their finalizer (`chat.stream.end`) carries the
-    // full assistant text. Reasoning deltas are KEPT because their
-    // finalizer (`chat.stream.reasoning_end`) carries no text — the
-    // reasoning view is built from the deltas themselves.
-    let tempdir = tempfile::tempdir().expect("tempdir");
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = std::env::var("NEFOR_DATA_HOME").ok();
-    std::env::set_var("NEFOR_DATA_HOME", tempdir.path());
-
-    let target_id = "66666666-2222-4333-8444-555555555555";
-    let sessions_dir = tempdir.path().join("sessions");
-    std::fs::create_dir_all(&sessions_dir).expect("mkdir");
-    let path = sessions_dir.join(format!("{target_id}.jsonl"));
-    let body = concat!(
-        r#"{"_session":true,"session_id":"66666666-2222-4333-8444-555555555555","started_at":"2026-05-04T00:00:00.000Z"}"#,
-        "\n",
-        // step-origin chat.stream.delta → MUST be dropped on replay
-        r#"{"ts":"2026-05-04T00:00:00.001Z","origin":"step","target":"nefor-tui","payload":"{\"type\":\"event\",\"from\":\"engine\",\"body\":{\"kind\":\"chat.stream.delta\",\"text\":\"tok\"}}"}"#,
-        "\n",
-        // step-origin chat.stream.reasoning_delta → MUST be kept
-        r#"{"ts":"2026-05-04T00:00:00.002Z","origin":"step","target":"nefor-tui","payload":"{\"type\":\"event\",\"from\":\"engine\",\"body\":{\"kind\":\"chat.stream.reasoning_delta\",\"text\":\"hmm\"}}"}"#,
-        "\n",
-        // step-origin chat.stream.end → kept (carries final text)
-        r#"{"ts":"2026-05-04T00:00:00.003Z","origin":"step","target":"nefor-tui","payload":"{\"type\":\"event\",\"from\":\"engine\",\"body\":{\"kind\":\"chat.stream.end\",\"text\":\"final\"}}"}"#,
-        "\n",
-    );
-    std::fs::write(&path, body).expect("seed");
-
-    let lua = Lua::new();
-    install_stub_nefor(&lua).expect("install nefor stub");
-    set_package_path(&lua).expect("set package.path");
-    let resume_call = format!(
-        r#"
-        _replayed_kinds = {{}}
-        local original_send = nefor.engine.send
-        local json = nefor.json
-        nefor.engine.send = function(payload, target)
-            local ok, decoded = pcall(json.decode, payload)
-            if ok and decoded and decoded.body and decoded.body.kind then
-                _replayed_kinds[#_replayed_kinds + 1] = decoded.body.kind
-            end
-            return original_send(payload, target)
-        end
-        sessions = require("sessions")
-        sessions.init()
-        _replayed_kinds = {{}}  -- reset after init's session_start
-        sessions.resume("{target_id}")
-        "#
-    );
-    lua.load(&resume_call).exec().expect("resume");
-
-    let kinds: Table = lua.globals().get("_replayed_kinds").expect("kinds");
-    let len = kinds.len().expect("len") as usize;
-    let collected: Vec<String> = (1..=len)
-        .map(|i| kinds.get::<String>(i).expect("entry"))
-        .collect();
-    assert!(
-        !collected.iter().any(|k| k == "chat.stream.delta"),
-        "chat.stream.delta must be dropped on replay; got {collected:?}"
-    );
-    assert!(
-        collected.iter().any(|k| k == "chat.stream.reasoning_delta"),
-        "chat.stream.reasoning_delta must be kept on replay; got {collected:?}"
-    );
-    assert!(
-        collected.iter().any(|k| k == "chat.stream.end"),
-        "chat.stream.end must be kept on replay; got {collected:?}"
-    );
-
-    match prev.as_deref() {
-        Some(v) => std::env::set_var("NEFOR_DATA_HOME", v),
-        None => std::env::remove_var("NEFOR_DATA_HOME"),
-    }
-}
-
-#[test]
 fn new_then_new_prunes_each_empty_predecessor() {
     // Repeated `/new` without typing must not leave a trail of empty
     // stubs. Each cycle prunes the prior file; the picker stays clean.
@@ -1018,10 +771,11 @@ fn new_then_new_prunes_each_empty_predecessor() {
     lua.load(
         r#"
         sessions = require("sessions")
+        sessions_test = require("sessions.test")
         sessions.init()
-        sessions._on_new_request(nil)  -- /new #1
-        sessions._on_new_request(nil)  -- /new #2
-        sessions._on_new_request(nil)  -- /new #3
+        sessions_test._on_new_request(nil)  -- /new #1
+        sessions_test._on_new_request(nil)  -- /new #2
+        sessions_test._on_new_request(nil)  -- /new #3
         "#,
     )
     .exec()
@@ -1067,16 +821,17 @@ fn new_after_submit_preserves_prior_session() {
     lua.load(
         r#"
         sessions = require("sessions")
+        sessions_test = require("sessions.test")
         sessions.init()
         local json = nefor.json
         -- Real user submit in the boot session.
-        sessions._persist_envelope({
+        sessions_test._persist_envelope({
             ts      = "2026-05-04T00:00:00.000Z",
             origin  = "nefor-tui",
             payload = json.encode({ type = "event", body = { kind = "chat.input.submit", text = "ship-it" } }),
         })
         _boot_path = sessions.current_path()
-        sessions._on_new_request(nil)
+        sessions_test._on_new_request(nil)
         _new_path = sessions.current_path()
         "#,
     )

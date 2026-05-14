@@ -22,10 +22,10 @@
 //! ## Lifecycle keying
 //!
 //! Per parent spec §3 "Lifecycle bookkeeping (per-firing, not per-node)",
-//! the dispatched/acked/completed flags scope to `(node_id, firing_id)`.
-//! For acyclic graphs every node has exactly one firing and the keying is
-//! effectively per-node — backward-compatible shape, just keyed one level
-//! finer. For a cyclic node, each firing gets a fresh `FiringId`.
+//! the completed flag scopes to `(node_id, firing_id)`. For acyclic
+//! graphs every node has exactly one firing and the keying is
+//! effectively per-node — backward-compatible shape, just keyed one
+//! level finer. For a cyclic node, each firing gets a fresh `FiringId`.
 //!
 //! ## Run completion
 //!
@@ -112,7 +112,8 @@ impl NodeStatus {
 /// One firing of a node — bookkeeping at the (node_id, firing_id) level.
 #[derive(Debug, Clone)]
 pub struct NodeFiring {
-    /// Opaque per-dispatch id minted at dispatch time.
+    /// Opaque per-dispatch id minted at dispatch time. Equals the
+    /// `tool.invoke.id` we emit for this dispatch (canonical wire D3).
     pub firing_id: FiringId,
     /// `prev_state` carried into this firing (the previous firing's
     /// `next_state`, or `null` for the first firing on a node).
@@ -120,10 +121,7 @@ pub struct NodeFiring {
     /// debugging when T6 plugs in combinator-driven re-firings.
     #[cfg_attr(not(test), allow(dead_code))]
     pub prev_state: Value,
-    /// True once the reasoner sent `<reasoner>.run_node.ack` for this
-    /// firing within the deadline.
-    pub acked: bool,
-    /// True once `graph.node_result` arrived for this firing OR the
+    /// True once a `tool.result` arrived for this firing OR the
     /// scheduler synthesized a failure (ack timeout, reasoner not
     /// connected).
     pub completed: bool,
@@ -160,8 +158,8 @@ pub struct RunState {
     /// Per-node terminal/intermediate status (latest firing's status).
     pub completed: HashMap<NodeId, NodeStatus>,
     /// All firings so far per node, in order. The last entry's
-    /// `firing_id` is the "current" one — its `acked` / `completed`
-    /// flags drive lifecycle decisions.
+    /// `firing_id` is the "current" one — its `completed` flag drives
+    /// lifecycle decisions.
     pub firings: HashMap<NodeId, Vec<NodeFiring>>,
     /// Per-node current state — the latest completed firing's
     /// `next_state`. Defaults absent (treated as null) for nodes that
@@ -204,6 +202,19 @@ pub struct RunState {
     /// is populated but never read against an already-completed node —
     /// existing fire-once semantics are preserved.
     pub pending_refire: HashSet<NodeId>,
+    /// Per-firing request-id correlation table for the canonical tool
+    /// contract. Keyed by the `id` we mint on the outbound `tool.invoke`
+    /// dispatch (which equals the firing_id by spec D3); the value records
+    /// `(node_id, firing_id)` so the inbound `tool.result { id }` handler
+    /// can resolve back to a specific firing without scanning every
+    /// node's firing list.
+    ///
+    /// Mirrors the pattern used by `pending_fanouts` (combinator
+    /// invocations) and `RunPhase::PendingTypecheck { query_id }`
+    /// (combinator queries). Entries are inserted at dispatch time and
+    /// removed when the matching `tool.result` (or synthesized
+    /// ack-timeout failure) lands.
+    pub firing_by_request_id: HashMap<String, (NodeId, FiringId)>,
 }
 
 /// A fanout invocation in flight. The scheduler emitted
@@ -687,7 +698,6 @@ fn try_dispatch(state: &mut RunState, node_id: &str, peers: &PeerSet, effects: &
                     .get(&node.id)
                     .cloned()
                     .unwrap_or(Value::Null),
-                acked: false,
                 completed: true,
             });
         state
@@ -715,7 +725,6 @@ fn try_dispatch(state: &mut RunState, node_id: &str, peers: &PeerSet, effects: &
         .push(NodeFiring {
             firing_id: firing_id.clone(),
             prev_state: prev_state.clone(),
-            acked: false,
             completed: false,
         });
     // The dispatch consumes the pending re-fire request (if any) — the
@@ -723,6 +732,13 @@ fn try_dispatch(state: &mut RunState, node_id: &str, peers: &PeerSet, effects: &
     // completions during this firing will set the flag again to schedule
     // the next re-fire after this one lands.
     state.pending_refire.remove(&node.id);
+    // Index this firing by its outbound request id (== firing_id under
+    // the canonical tool contract) so the matching `tool.result` can be
+    // resolved without scanning every node's firing list.
+    state.firing_by_request_id.insert(
+        firing_id.clone(),
+        (node.id.clone(), firing_id.clone()),
+    );
     effects.push(Effect::DispatchNode {
         reasoner: node.reasoner.clone(),
         run_id: state.run_id.clone(),
@@ -1221,6 +1237,7 @@ impl Scheduler {
                 suppressed_edges: HashMap::new(),
                 fanout_emitted: HashSet::new(),
                 pending_refire: HashSet::new(),
+                firing_by_request_id: HashMap::new(),
             };
             dispatch_all_runnable(&mut state, peers, &mut effects);
             if run_is_done(&state) {
@@ -1260,6 +1277,7 @@ impl Scheduler {
             suppressed_edges: HashMap::new(),
             fanout_emitted: HashSet::new(),
             pending_refire: HashSet::new(),
+            firing_by_request_id: HashMap::new(),
         };
         runs.lock()
             .expect("runs mutex poisoned")
@@ -1422,45 +1440,6 @@ impl Scheduler {
         effects
     }
 
-    /// Handle a `<reasoner>.run_node.ack` event. Marks the matching
-    /// firing as acked so the ack-timeout watchdog stops counting. No
-    /// effects emitted — this is purely bookkeeping.
-    pub fn handle_node_ack(runs: &Runs, body: &Map<String, Value>) {
-        let run_id = match body.get("run_id").and_then(Value::as_str) {
-            Some(s) => s.to_owned(),
-            None => {
-                tracing::warn!("run_node.ack missing run_id; dropping");
-                return;
-            }
-        };
-        let firing_id = match body.get("firing_id").and_then(Value::as_str) {
-            Some(s) => s.to_owned(),
-            None => {
-                tracing::warn!(run_id = %run_id, "run_node.ack missing firing_id; dropping");
-                return;
-            }
-        };
-        let mut guard = runs.lock().expect("runs mutex poisoned");
-        let state = match guard.get_mut(&run_id) {
-            Some(s) => s,
-            None => return,
-        };
-        // Find the firing across nodes — firing_ids are globally unique
-        // per run, so we don't need node_id (which the ack envelope
-        // doesn't carry per spec).
-        for firings in state.firings.values_mut() {
-            if let Some(f) = firings.iter_mut().find(|f| f.firing_id == firing_id) {
-                f.acked = true;
-                return;
-            }
-        }
-        tracing::debug!(
-            run_id = %run_id,
-            firing_id = %firing_id,
-            "run_node.ack for unknown firing; ignoring (likely cancelled or expired)"
-        );
-    }
-
     /// Handle an ack-deadline expiry. The main loop arms a timer per
     /// dispatch and calls this on expiry; if the firing has been acked
     /// in the meantime this is a no-op, otherwise we synthesize a
@@ -1483,7 +1462,7 @@ impl Scheduler {
             let mut owner_node: Option<String> = None;
             for (nid, firings) in state.firings.iter_mut() {
                 if let Some(f) = firings.iter_mut().find(|f| f.firing_id == firing_id) {
-                    if f.acked || f.completed {
+                    if f.completed {
                         return effects; // late timer; ignore
                     }
                     f.completed = true;
@@ -1495,6 +1474,13 @@ impl Scheduler {
                 Some(n) => n,
                 None => return effects, // unknown firing; ignore
             };
+            // Synthesized `tool.result { id=firing_id, error: "ack_timeout" }`
+            // path (per wire-spec D1): the watchdog manufactures a failure
+            // for this firing without an envelope ever hitting the bus.
+            // Drop the request-id correlation entry — a real
+            // `tool.result` arriving later for this id is a duplicate
+            // and gets dropped by the post-completion guard.
+            state.firing_by_request_id.remove(firing_id);
             state.completed.insert(
                 node_id.clone(),
                 NodeStatus::Error("reasoner ack timeout".to_owned()),
@@ -1596,6 +1582,12 @@ impl Scheduler {
             };
 
             firing.completed = true;
+            // Drop the request-id correlation entry — the matching
+            // `tool.result` has landed (or main.rs synthesized one from
+            // it). Any duplicate result for the same id will hit the
+            // post-completion guard above and be dropped.
+            let firing_request_id = firing.firing_id.clone();
+            state.firing_by_request_id.remove(&firing_request_id);
             // Persist next_state for the next firing's prev_state.
             if let Some(next_state) = body.get("next_state").cloned() {
                 state.current_state.insert(node_id.clone(), next_state);
@@ -1641,6 +1633,26 @@ impl Scheduler {
         effects
     }
 
+    /// Resolve a `tool.result.id` (canonical wire shape) back to the
+    /// `(run_id, node_id, firing_id)` the firing belongs to, by scanning
+    /// every in-flight run's `firing_by_request_id` table.
+    ///
+    /// Returns `None` for unknown ids (covers cancellation race,
+    /// duplicate results, and ids belonging to combinator query/invoke
+    /// pairs which use their own correlation tables).
+    pub fn resolve_request_id(
+        runs: &Runs,
+        request_id: &str,
+    ) -> Option<(String, NodeId, FiringId)> {
+        let guard = runs.lock().expect("runs mutex poisoned");
+        for (rid, st) in guard.iter() {
+            if let Some((node_id, firing_id)) = st.firing_by_request_id.get(request_id) {
+                return Some((rid.clone(), node_id.clone(), firing_id.clone()));
+            }
+        }
+        None
+    }
+
     /// Handle a `graph.cancel` event. Stage 2 implementation per parent
     /// spec §6.2; for Stage 1 we accept-and-drop: delete the run from
     /// the registry, ignore subsequent results. Cancel envelopes
@@ -1669,14 +1681,20 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Build a canonical-tool-contract `tool.invoke { id, name="spawn_graph",
+    /// args: { graph, on_node_failure? } }` body — the post-refactor
+    /// submission shape per `wire_protocol_spec.md` Flow 2.
     fn submit_body(run_id: &str, graph: Value, on_failure: Option<&str>) -> Map<String, Value> {
-        let mut m = Map::new();
-        m.insert("kind".into(), Value::String("reasoner-graph.run".into()));
-        m.insert("run_id".into(), Value::String(run_id.into()));
-        m.insert("graph".into(), graph);
+        let mut args = Map::new();
+        args.insert("graph".into(), graph);
         if let Some(p) = on_failure {
-            m.insert("on_node_failure".into(), Value::String(p.into()));
+            args.insert("on_node_failure".into(), Value::String(p.into()));
         }
+        let mut m = Map::new();
+        m.insert("kind".into(), Value::String("tool.invoke".into()));
+        m.insert("id".into(), Value::String(run_id.into()));
+        m.insert("name".into(), Value::String("spawn_graph".into()));
+        m.insert("args".into(), Value::Object(args));
         m
     }
 
@@ -2356,37 +2374,46 @@ mod tests {
         let st = g.get("run-pf").unwrap();
         let f = &st.firings["n1"];
         assert_eq!(f.len(), 1);
-        assert!(!f[0].acked);
         assert!(!f[0].completed);
-        // The flags are scoped to firing_id (a String, opaque). For a
-        // hypothetical second firing, a fresh firing_id distinguishes
-        // its flags.
+        // The completed flag is scoped to firing_id (a String, opaque).
+        // For a hypothetical second firing, a fresh firing_id
+        // distinguishes its flag.
     }
 
     #[test]
-    fn ack_received_marks_firing_acked() {
+    fn dispatch_indexes_firing_by_request_id() {
+        // tool-contract correlation: the outbound `tool.invoke` id
+        // (== firing_id) must appear in firing_by_request_id keyed to
+        // its (node_id, firing_id), so the inbound `tool.result { id }`
+        // can resolve back to a specific firing without scanning all
+        // firings.
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
             "nodes": [{"id": "n1", "reasoner": "r", "args": {}}],
             "edges": []
         });
-        let outcome = Scheduler::handle_submit(&runs, &peers, &submit_body("run-ack", g, None));
+        let outcome = Scheduler::handle_submit(&runs, &peers, &submit_body("run-idx", g, None));
         let effects = match outcome {
             SubmitOutcome::Accepted(e) => e.into_vec(),
             _ => panic!("accepted"),
         };
         let firing_id = first_dispatch_firing_id(&effects);
-        let mut ack_body = Map::new();
-        ack_body.insert("kind".into(), Value::String("r.run_node.ack".into()));
-        ack_body.insert("run_id".into(), Value::String("run-ack".into()));
-        ack_body.insert("firing_id".into(), Value::String(firing_id.clone()));
-        Scheduler::handle_node_ack(&runs, &ack_body);
-        let g = runs.lock().unwrap();
-        let st = g.get("run-ack").unwrap();
-        let f = &st.firings["n1"][0];
-        assert!(f.acked);
-        assert_eq!(f.firing_id, firing_id);
+        let resolved = Scheduler::resolve_request_id(&runs, &firing_id)
+            .expect("request_id resolves to (run_id, node_id, firing_id)");
+        assert_eq!(resolved.0, "run-idx");
+        assert_eq!(resolved.1, "n1");
+        assert_eq!(resolved.2, firing_id);
+        // Result lands → entry should be cleared.
+        let _ = Scheduler::handle_node_result(
+            &runs,
+            &peers,
+            &result_body("run-idx", "n1", Some(&firing_id), Ok(json!("done")), None),
+        );
+        // After completion the run is dropped from the registry, so
+        // resolve_request_id can no longer find it — same effect as
+        // "entry cleared," verified one level up.
+        assert!(Scheduler::resolve_request_id(&runs, &firing_id).is_none());
     }
 
     #[test]
@@ -2428,35 +2455,6 @@ mod tests {
             }
             _ => unreachable!(),
         }
-    }
-
-    #[test]
-    fn late_ack_after_timeout_is_ignored() {
-        let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
-        let peers = peers_with(&["r"]);
-        let g = json!({
-            "nodes": [{"id": "n1", "reasoner": "r", "args": {}}],
-            "edges": []
-        });
-        let outcome = Scheduler::handle_submit(&runs, &peers, &submit_body("run-la", g, None));
-        let e = match outcome {
-            SubmitOutcome::Accepted(e) => e.into_vec(),
-            _ => panic!("accepted"),
-        };
-        let f1 = first_dispatch_firing_id(&e);
-        // Trigger timeout: run completes (single-node failure).
-        let _ = Scheduler::handle_ack_timeout(&runs, &peers, "run-la", &f1);
-        // Run is gone from registry now.
-        assert!(runs.lock().unwrap().is_empty());
-        // Late ack arrives after registry deletion: handle_node_ack
-        // looks up the run_id, finds nothing, returns silently.
-        let mut ack_body = Map::new();
-        ack_body.insert("kind".into(), Value::String("r.run_node.ack".into()));
-        ack_body.insert("run_id".into(), Value::String("run-la".into()));
-        ack_body.insert("firing_id".into(), Value::String(f1));
-        Scheduler::handle_node_ack(&runs, &ack_body);
-        // No panic, no state change — registry remains empty.
-        assert!(runs.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! End-to-end tests for the agentic-cli plugin against the mock provider.
 //!
 //! Spawns the real `nefor` engine binary as a subprocess against
-//! `cli-config/`, with `USE_MOCK_PROVIDER=true` so no live LLM is needed.
+//! `cli-config/`, with `NEFOR_CONFIG=test` so no live LLM is needed.
 //! Each scenario covers one path through the agentic_workflow + agentic_cli
 //! surface: single-shot text/json/stream-json formats, REPL multi-turn,
 //! `--help`, and the `--yolo` placeholder flag.
@@ -112,7 +112,7 @@ fn base_command(xdg: &Path) -> Command {
         .arg(repo_root().join("cli-config"))
         .arg("plugin")
         .arg("agentic-cli")
-        .env("USE_MOCK_PROVIDER", "true")
+        .env("NEFOR_CONFIG", "test")
         .env("NEFOR_PLUGIN_DIR", repo_root().join("plugins"))
         .env("XDG_DATA_HOME", xdg);
     cmd
@@ -363,7 +363,16 @@ fn scenario_3_single_shot_stream_json() {
 
     // Every non-empty stdout line must be a valid JSON envelope. Parse
     // each and bucket by `body.kind`.
-    let mut run_complete_count = 0usize;
+    //
+    // Run-close on the canonical tool contract is `tool.result { id=run_id,
+    // result: { status, results } }` — the prior `graph.run_complete`
+    // wire shape is gone. We accept either `graph.run_started` (paired
+    // observer that always lands for our single run) or any
+    // `tool.result` body that contains a `result.status` field as the
+    // run-close marker; either is sufficient evidence the run reached
+    // termination.
+    let mut run_close_count = 0usize;
+    let mut run_started_count = 0usize;
     let mut total_lines = 0usize;
     for (idx, line) in out.stdout.lines().enumerate() {
         if line.is_empty() {
@@ -376,13 +385,21 @@ fn scenario_3_single_shot_stream_json() {
                 truncate(line, 512)
             )
         });
-        let kind = v
-            .get("body")
+        let body = v.get("body");
+        let kind = body
             .and_then(|b| b.get("kind"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        if kind == "graph.run_complete" {
-            run_complete_count += 1;
+        if kind == "graph.run_started" {
+            run_started_count += 1;
+        }
+        if kind == "tool.result"
+            && body
+                .and_then(|b| b.get("result"))
+                .and_then(|r| r.get("status"))
+                .is_some()
+        {
+            run_close_count += 1;
         }
     }
 
@@ -395,9 +412,15 @@ fn scenario_3_single_shot_stream_json() {
     // times. Don't lock to an exact count — assert ≥1 to keep the test
     // robust against bus-fan-out tuning.
     assert!(
-        run_complete_count >= 1,
-        "expected at least one graph.run_complete envelope; saw {run_complete_count} \
-         across {total_lines} lines"
+        run_started_count >= 1,
+        "expected at least one graph.run_started envelope; saw \
+         {run_started_count} across {total_lines} lines"
+    );
+    assert!(
+        run_close_count >= 1,
+        "expected at least one run-close tool.result (id=run_id, \
+         result.status set) envelope; saw {run_close_count} across \
+         {total_lines} lines"
     );
 }
 

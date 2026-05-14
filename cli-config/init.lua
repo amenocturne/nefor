@@ -1,22 +1,19 @@
 -- cli-config/init.lua — engine composition for the agentic-cli plugin.
 --
--- Mirrors `starter/init.lua` but:
---   * No nefor-tui, no nefor-chat (the CLI surface IS stdout).
+-- Mirrors `starter/init.lua` post-Phase-3a but:
+--   * No nefor-tui (the CLI surface IS stdout).
 --   * Registers a virtual `agentic-cli` plugin via nefor.plugins.spawn
---     with a `cli` field; the engine dispatches to it via
---     `nefor plugin agentic-cli [args...]`.
---   * Keeps the same providers / reasoner-graph / tool-gate / basic-tools
---     stack so the agentic_workflow runs identically — behaviour parity
---     with the TUI is by construction.
+--     directly (the engine dispatches to it via
+--     `nefor plugin agentic-cli [args...]`).
 --
 -- Run:
 --   ./target/debug/nefor --config cli-config/ plugin agentic-cli "your prompt"
---   USE_MOCK_PROVIDER=true ./target/debug/nefor --config cli-config/ plugin agentic-cli "..."
+--   NEFOR_CONFIG=test ./target/debug/nefor --config cli-config/ plugin agentic-cli "..."
 
 local CONFIG_ROOT = NEFOR_CONFIG_DIR or "."
 
--- Reuse the modules that live in starter/. No symlinks required: just
--- add starter/ to the package path so require() resolves there.
+-- Reuse the modules that live in starter/. Add starter/ to the
+-- package path so require() resolves there.
 local PROJECT_ROOT = CONFIG_ROOT:match("^(.*)/[^/]+$") or "."
 local STARTER_ROOT = PROJECT_ROOT .. "/starter"
 
@@ -29,60 +26,35 @@ package.path = table.concat({
 }, ";")
 
 local ncp      = require("ncp")
+local actor    = require("actor")
 local sessions = require("sessions")
 
--- Forward the engine's `current_log` to ncp.dispatch. The engine is
--- session-blind; cross-run resume + jsonl persistence are owned by
--- `starter/sessions.lua` (loaded above and brought up below).
 function dispatch(current_log)
   ncp.dispatch(current_log)
 end
 
--- Mint a fresh session, install the persistence hook + resume listener,
--- emit `sessions.session_start`. Done before any plugin spawn so the
--- jsonl persistence is already wired when the first envelope routes.
+actor.install()
+actor.spawn(sessions)
 sessions.init()
-sessions.handle_shutdown()
 
-local agentic_workflow = require("agentic_workflow")
-local agentic_cli      = require("agentic_cli")
+local agentic_cli = require("agentic_cli")
 
 local function bin(name) return PROJECT_ROOT .. "/target/debug/" .. name end
 
 -- ------------------------------------------------------------------
--- Provider selection (USE_MOCK_PROVIDER=true swaps in the deterministic
--- mock; same branching as starter/init.lua).
+-- Plugin spawn order (mirrors starter/init.lua minus chat/tui).
 -- ------------------------------------------------------------------
 
-local USE_MOCK_PROVIDER = (os.getenv("USE_MOCK_PROVIDER") == "true")
+require("lib.contracts.provider").declare()
+require("lib.contracts.tool").declare()
 
-local PROVIDER_NAME, PROVIDER_MODEL, provider_chain, provider_command
+actor.spawn(require("nefor-combinators"))
 
-if USE_MOCK_PROVIDER then
-  PROVIDER_NAME  = "mock-plugin"
-  PROVIDER_MODEL = "mock-model"
-  provider_chain = agentic_workflow.for_provider(PROVIDER_NAME)
-  provider_command = {
-    bin("mock-plugin"),
-    "--script", STARTER_ROOT .. "/mock_provider.lua",
-  }
-else
-  PROVIDER_NAME  = "ollama"
-  PROVIDER_MODEL = "qwen3.6:35b-a3b-coding-mxfp8"
-  provider_chain = agentic_workflow.for_provider(PROVIDER_NAME, { static_token = "ollama-local" })
-  provider_command = {
-    bin("openai-provider"),
-    "--name",     PROVIDER_NAME,
-    "--base-url", "http://localhost:11434",
-    "--model",    PROVIDER_MODEL,
-  }
-end
-
--- ------------------------------------------------------------------
--- Orchestrator setup — same prompt as starter/init.lua.
--- ------------------------------------------------------------------
-
-local ORCHESTRATOR_SYSTEM_PROMPT = [[
+local agentic_loop = require("agentic-loop")
+agentic_loop.configure {
+  provider = cfg.provider.name,
+  model    = cfg.provider.model,
+  system   = [[
 You are a helpful assistant. Use the `spawn_graph` tool for parallel decomposition tasks (multiple independent sub-questions to combine).
 
 Graph schema:
@@ -96,54 +68,59 @@ To combine parallel branches into a single output, add a `responder` combine nod
   branchA, branchB → combine (responder) → terminal
 
 Emit the tool call directly after deciding the structure. For simple chat turns (no decomposition benefit), just answer directly.
-]]
-
-agentic_workflow.setup {
-  provider = PROVIDER_NAME,
-  model    = PROVIDER_MODEL,
-  system   = ORCHESTRATOR_SYSTEM_PROMPT,
+]],
 }
+actor.spawn(agentic_loop)
+actor.spawn(require("reasoners"))
 
--- ------------------------------------------------------------------
--- Plugin spawn order (mirrors starter/init.lua minus chat/tui).
--- ------------------------------------------------------------------
+local PROVIDER_NAME  = cfg.provider.name
+local PROVIDER_MODEL = cfg.provider.model
 
-ncp.spawn { name = "nefor-combinators", command = { bin("nefor-combinators") } }
-ncp.spawn { name = "generic-provider",  command = { bin("generic-provider")  } }
-ncp.spawn { name = "generic-tool",      command = { bin("generic-tool")      } }
+if cfg.plugins.spawn_mock then
+  actor.spawn(require("mock-plugin").spawn_spec(
+    PROVIDER_NAME,
+    {
+      bin("mock-plugin"),
+      "--script", STARTER_ROOT .. "/" .. cfg.provider.mock_script,
+    }
+  ))
+else
+  local provider_command = {
+    bin("openai-provider"),
+    "--name",     PROVIDER_NAME,
+    "--base-url", cfg.provider.base_url,
+  }
+  if PROVIDER_MODEL then
+    table.insert(provider_command, "--model")
+    table.insert(provider_command, PROVIDER_MODEL)
+  end
+  for _, a in ipairs(cfg.provider.extra_args or {}) do
+    table.insert(provider_command, a)
+  end
+  actor.spawn(require("openai-provider").spawn_spec(
+    PROVIDER_NAME,
+    provider_command,
+    { static_token = cfg.provider.static_token }
+  ))
+end
 
-ncp.spawn {
-  name        = PROVIDER_NAME,
-  command     = provider_command,
-  from_plugin = provider_chain.from_plugin,
-  to_plugin   = provider_chain.to_plugin,
-}
+actor.spawn(require("reasoner-graph").spawn_spec({ bin("reasoner-graph") }))
 
-ncp.spawn {
-  name        = "reasoner-graph",
-  command     = { bin("reasoner-graph") },
-  from_plugin = agentic_workflow.for_reasoner_graph().from_plugin,
-}
+local tool_gate_argv = { bin("tool-gate") }
+for _, t in ipairs(cfg.tool_gate.prompt_tools or {}) do
+  tool_gate_argv[#tool_gate_argv + 1] = "--prompt"
+  tool_gate_argv[#tool_gate_argv + 1] = t
+end
+tool_gate_argv[#tool_gate_argv + 1] = "--default"
+tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
 
-ncp.spawn {
-  name        = "tool-gate",
-  command     = {
-    bin("tool-gate"),
-    -- CLI surface has no permission-prompt UI in v1. Default `auto` keeps
-    -- the agent unblocked; --yolo on agentic-cli is the documented user
-    -- override (currently a placeholder, see agentic_workflow.set_yolo).
-    -- Phase 3 / Stage 2 should add a prompt-respecting CLI surface and
-    -- flip this back to `prompt`.
-    "--default", "auto",
-  },
-  from_plugin = agentic_workflow.for_tool_gate("tool-gate").from_plugin,
-}
+actor.spawn(require("tool-gate").spawn_spec("tool-gate", tool_gate_argv))
 
-ncp.spawn { name = "basic-tools", command = { bin("basic-tools"), "--gate", "tool-gate" } }
+actor.spawn(require("basic-tools"))
 
 -- ------------------------------------------------------------------
 -- Virtual agentic-cli plugin — calls nefor.plugins.spawn directly to
--- pass the `cli` field (ncp.spawn doesn't accept it).
+-- pass the `cli` field (actor.spawn / ncp.spawn don't accept it).
 -- ------------------------------------------------------------------
 
 nefor.plugins.spawn {

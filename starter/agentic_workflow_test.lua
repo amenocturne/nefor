@@ -1,13 +1,22 @@
--- starter/agentic_workflow_test.lua — unit tests for the for_chat
--- adapter's runtime model-switch handling.
+-- starter/agentic_workflow_test.lua — unit tests for the agentic-loop
+-- actor. The Rust harness (`crates/nefor/tests/starter_agentic_workflow_test.rs`)
+-- installs a stub `nefor.*` surface (json + engine.* + log.* + bus.on_event)
+-- so `require("agentic-loop")` succeeds, then loads this file. Tests
+-- drive the actor's behaviour by:
 --
--- Loaded by `crates/nefor/tests/starter_agentic_workflow_test.rs`. The
--- Rust harness installs a stub `nefor` surface (json + engine.* +
--- log.*) so `require("agentic_workflow")` succeeds; this file then
--- drives `for_chat().from_plugin` directly without spawning anything
--- on the bus.
+--   * calling its public API directly (configure, submit, set_model,
+--     cancel_all, build_template) — these short-circuit the bus and
+--     test the orchestrator state machine in isolation;
+--   * fabricating wire envelopes and feeding them to receive_msg
+--     (replacement for the prior for_chat / for_reasoner_graph
+--     factory tests).
+--
+-- The test surface is the same as before — `_test.fire_bus`,
+-- `_test.calls`, `_test.set_plugins`, `_test.calls_clear` — so the
+-- Rust harness needs no modifications.
 
-local agentic_workflow = require("agentic_workflow")
+local agentic_loop = require("agentic-loop")
+local json = nefor.json
 
 local function assert_eq(actual, expected, msg)
   if actual ~= expected then
@@ -18,23 +27,30 @@ local function assert_eq(actual, expected, msg)
   end
 end
 
--- Configure the orchestrator with a known model so we can detect a
--- runtime switch.
-agentic_workflow.setup {
+-- Build a wire-shaped log entry the actor's receive_msg accepts.
+-- Mirrors the engine's broker output: { ts, origin, payload } where
+-- payload is JSON-encoded { type, body }.
+local function make_entry(origin, body)
+  return {
+    ts      = "2026-05-04T00:00:00.000Z",
+    origin  = origin,
+    payload = json.encode({ type = "event", from = origin, body = body }),
+  }
+end
+
+local function send_to_loop(origin, body)
+  agentic_loop.receive_msg(make_entry(origin, body))
+end
+
+-- Configure with a known model so we can detect a runtime switch.
+agentic_loop.configure {
   provider = "ollama",
   model    = "initial-model",
 }
 
-local for_chat = agentic_workflow.for_chat()
-assert(type(for_chat) == "table", "for_chat returns table")
-assert(type(for_chat.from_plugin) == "function", "for_chat.from_plugin is a function")
-
 -- Sanity: build_template reflects the seeded model.
 do
-  local g = agentic_workflow.build_template("hi")
-  -- The orchestrator graph is opaque, but we can poke at the wrap node's
-  -- args (where the orchestrator stamps the model). Walk the nodes list
-  -- looking for the wrap node and confirm.
+  local g = agentic_loop.build_template("hi")
   local saw = false
   for _, n in ipairs(g.nodes or {}) do
     if n.id == "wrap" and type(n.args) == "table" then
@@ -45,20 +61,10 @@ do
   assert(saw, "wrap node found in template")
 end
 
--- chat.model.set with a non-empty model updates config.model. The
--- envelope is passed through (return env) so the egress transform on
--- the provider can still translate it into <prefix>.model.set.
+-- chat.model.set with a non-empty model updates config.model.
 do
-  local env = {
-    type = "event",
-    from = "nefor-tui",
-    body = { kind = "chat.model.set", provider = "ollama", model = "new-model" },
-  }
-  local out = for_chat.from_plugin(env)
-  assert(out == env, "chat.model.set is passed through unchanged")
-
-  -- Verify config.model was updated by re-building the template.
-  local g = agentic_workflow.build_template("hi")
+  send_to_loop("nefor-tui", { kind = "chat.model.set", provider = "ollama", model = "new-model" })
+  local g = agentic_loop.build_template("hi")
   local saw = false
   for _, n in ipairs(g.nodes or {}) do
     if n.id == "wrap" and type(n.args) == "table" then
@@ -71,15 +77,8 @@ end
 
 -- chat.model.set with an empty model is a no-op (no crash, no update).
 do
-  local env = {
-    type = "event",
-    from = "nefor-tui",
-    body = { kind = "chat.model.set", provider = "ollama", model = "" },
-  }
-  local out = for_chat.from_plugin(env)
-  assert(out == env, "empty-model chat.model.set still passes through")
-  -- config.model should still be "new-model" from the previous case.
-  local g = agentic_workflow.build_template("hi")
+  send_to_loop("nefor-tui", { kind = "chat.model.set", provider = "ollama", model = "" })
+  local g = agentic_loop.build_template("hi")
   for _, n in ipairs(g.nodes or {}) do
     if n.id == "wrap" and type(n.args) == "table" then
       assert_eq(n.args.model, "new-model", "empty-model set did not clobber config.model")
@@ -89,14 +88,8 @@ end
 
 -- chat.model.set with the model field absent is also a no-op.
 do
-  local env = {
-    type = "event",
-    from = "nefor-tui",
-    body = { kind = "chat.model.set", provider = "ollama" },
-  }
-  local out = for_chat.from_plugin(env)
-  assert(out == env, "model-absent chat.model.set still passes through")
-  local g = agentic_workflow.build_template("hi")
+  send_to_loop("nefor-tui", { kind = "chat.model.set", provider = "ollama" })
+  local g = agentic_loop.build_template("hi")
   for _, n in ipairs(g.nodes or {}) do
     if n.id == "wrap" and type(n.args) == "table" then
       assert_eq(n.args.model, "new-model", "missing-model set did not clobber config.model")
@@ -106,13 +99,8 @@ end
 
 -- A second switch updates config.model again.
 do
-  local env = {
-    type = "event",
-    from = "nefor-tui",
-    body = { kind = "chat.model.set", provider = "ollama", model = "another-model" },
-  }
-  for_chat.from_plugin(env)
-  local g = agentic_workflow.build_template("hi")
+  send_to_loop("nefor-tui", { kind = "chat.model.set", provider = "ollama", model = "another-model" })
+  local g = agentic_loop.build_template("hi")
   for _, n in ipairs(g.nodes or {}) do
     if n.id == "wrap" and type(n.args) == "table" then
       assert_eq(n.args.model, "another-model", "second switch sticks")
@@ -121,26 +109,20 @@ do
 end
 
 -- ------------------------------------------------------------------
--- session lifecycle handlers (graph_skips_replay, provider_rebuilds_*,
--- session_end clears state)
+-- session lifecycle (graph_skips_replay → broadcast chat.reset)
 -- ------------------------------------------------------------------
---
--- The bus subscriptions registered in agentic_workflow.setup() are
--- driven via `_test.fire_bus(kind, body)`. After firing the handlers
--- we can observe (a) the recorded engine.send calls (via `_test.calls()`),
--- (b) for_reasoner_graph's behaviour while replay_mode is set.
 
--- Session_end → emits chat.reset broadcast and graph.cancel for any
--- in-flight runs. We seed plugin list so the broadcast fans out.
+-- session_end → emits chat.reset broadcast and graph.cancel for any
+-- in-flight runs.
 do
   _test.set_plugins({ "ollama", "reasoner-graph", "nefor-tui" })
   _test.calls_clear()
 
-  _test.fire_bus("sessions.session_end", { session_id = "old-id" })
+  send_to_loop("sessions", { kind = "sessions.session_end", session_id = "old-id" })
 
   local saw_reset = false
   for _, c in ipairs(_test.calls()) do
-    local ok, decoded = pcall(nefor.json.decode, c.payload)
+    local ok, decoded = pcall(json.decode, c.payload)
     if ok and type(decoded) == "table" and type(decoded.body) == "table"
        and decoded.body.kind == "chat.reset" then
       saw_reset = true
@@ -149,89 +131,29 @@ do
   assert(saw_reset, "session_end must broadcast chat.reset to clear provider+TUI state")
 end
 
--- graph_skips_replay: between session_end and resume_done, the
--- for_reasoner_graph from_plugin transform drops every envelope so the
--- graph plugin's replayed run_node emissions can't re-trigger handlers.
--- Firing session_start (preceded by session_end) enters replay_mode;
--- resume_done lifts it.
+-- replay_mode flag flips during session_end → session_start window.
+-- After resume_done the flag clears.
 do
-  local rg = agentic_workflow.for_reasoner_graph()
-  -- Sanity: a normal envelope passes through pre-replay (replay_mode is
-  -- still false from the boot session_start that didn't follow an end).
-  local pre_env = {
-    type = "event",
-    body = { kind = "irrelevant.kind" },
-    from = "reasoner-graph",
-  }
-  local pre_out = rg.from_plugin(pre_env)
-  assert(pre_out ~= nil, "pre-replay: pass-through")
+  _test.set_plugins({ "ollama", "reasoner-graph", "nefor-tui" })
 
-  -- Enter replay (session_end already fired above; now session_start).
-  _test.fire_bus("sessions.session_start", { session_id = "new-id" })
+  -- session_end (already entered replay-expectation gate above)
+  send_to_loop("sessions", { kind = "sessions.session_start", session_id = "new-id" })
+  assert_eq(agentic_loop.is_replay_mode(), true,
+    "after session_end → session_start, replay_mode is true")
 
-  local replay_env = {
-    type = "event",
-    body = { kind = "responder.run_node", run_id = "r1", node_id = "n1", firing_id = "f1" },
-    from = "reasoner-graph",
-  }
-  local replay_out = rg.from_plugin(replay_env)
-  assert_eq(replay_out, nil,
-    "graph_skips_replay: in replay_mode, reasoner-graph from_plugin drops envelopes")
-
-  -- Lift replay_mode.
-  _test.fire_bus("sessions.resume_done", { session_id = "new-id" })
-
-  local post_env = {
-    type = "event",
-    body = { kind = "irrelevant.kind" },
-    from = "reasoner-graph",
-  }
-  local post_out = rg.from_plugin(post_env)
-  assert(post_out ~= nil, "after resume_done: pass-through restored")
-end
-
--- provider_rebuilds_chat_history: replay paints provider chat.* events
--- (e.g. ollama.chat.create) onto the wire — they reach the openai-provider
--- process directly and are processed by its native state machine. The
--- agentic_workflow per-provider transform's job is to NOT eat them
--- during replay (the inner adapter only intercepts chat.complete.result
--- envelopes for chats it owns). With no such ownership, replayed
--- chat.create/append entries pass through to the outer adapter.
-do
-  local provider_chain = agentic_workflow.for_provider("ollama")
-  local create_env = {
-    type = "event",
-    body = { kind = "ollama.chat.create", chat_id = "old-chat-1" },
-    from = "ollama",
-  }
-  local out = provider_chain.from_plugin(create_env)
-  -- The outer adapter doesn't rewrite chat.create — it stays as-is and
-  -- passes through to broadcast. The inner adapter only intercepts
-  -- chat.complete.result for chats it owns; old-chat-1 isn't in
-  -- chat_id_to_key (cleared by session_end), so the replay flows through.
-  assert(out ~= nil,
-    "provider_rebuilds_chat_history: replayed chat.create passes through")
-  assert_eq(out.body.kind, "ollama.chat.create",
-    "provider replay preserves the provider-prefixed kind")
+  send_to_loop("sessions", { kind = "sessions.resume_done", session_id = "new-id" })
+  assert_eq(agentic_loop.is_replay_mode(), false,
+    "after resume_done, replay_mode lifts")
 end
 
 -- ------------------------------------------------------------------
 -- Issue 1 + Issue 3 — user message echo + busy-submit queue
 -- ------------------------------------------------------------------
---
--- Two intertwined behaviours share the chat.input.submit handler:
---   * Issue 1: chat.input.submit must emit `chat.message.append`
---     `{ role=user, text }` so the user message is persisted (and
---     thus replayable) as a step-origin entry. Without this the
---     resume replay path can't repaint user turns.
---   * Issue 3: when busy, queue subsequent submits; flush on
---     graph.run_complete; clear queue on chat.reset.
 
--- Helpers ---------------------------------------------------------
 local function decode_calls()
   local out = {}
   for _, c in ipairs(_test.calls()) do
-    local ok, decoded = pcall(nefor.json.decode, c.payload)
+    local ok, decoded = pcall(json.decode, c.payload)
     if ok and type(decoded) == "table" and type(decoded.body) == "table" then
       out[#out + 1] = { body = decoded.body, target = c.target }
     end
@@ -252,22 +174,17 @@ local function find_call(calls, kind, role, text_substr)
   return nil
 end
 
-local function fresh_for_chat()
-  agentic_workflow._reset()
-  agentic_workflow.setup { provider = "ollama", model = "test-model" }
+local function fresh_loop()
+  agentic_loop._internals.reset()
+  agentic_loop.configure { provider = "ollama", model = "test-model" }
   _test.set_plugins({ "ollama", "reasoner-graph", "nefor-tui" })
   _test.calls_clear()
-  return agentic_workflow.for_chat()
 end
 
--- (1.A) chat.input.submit emits chat.message.append role=user. -----
+-- (1.A) chat.input.submit emits chat.message.append role=user.
 do
-  local for_chat = fresh_for_chat()
-  for_chat.from_plugin {
-    type = "event",
-    from = "nefor-tui",
-    body = { kind = "chat.input.submit", text = "first prompt" },
-  }
+  fresh_loop()
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "first prompt" })
   local calls = decode_calls()
   local user_echo = find_call(calls, "chat.message.append", "user", "first prompt")
   assert(user_echo ~= nil,
@@ -276,25 +193,12 @@ do
     "user echo must target nefor-tui specifically")
 end
 
--- (3.A) Busy submit is queued, not rejected. --------------------------
+-- (3.A) Busy submit is queued, not rejected.
 do
-  local for_chat = fresh_for_chat()
-  -- First submit — orchestrator becomes busy.
-  for_chat.from_plugin {
-    type = "event",
-    from = "nefor-tui",
-    body = { kind = "chat.input.submit", text = "first" },
-  }
+  fresh_loop()
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "first" })
   _test.calls_clear()
-  -- Second submit while busy. With the old code this emitted
-  -- `[orchestrator busy — wait …]` and dropped the input. With the
-  -- new code the input should queue, AND the user message should
-  -- still echo (so the user sees they were heard).
-  for_chat.from_plugin {
-    type = "event",
-    from = "nefor-tui",
-    body = { kind = "chat.input.submit", text = "second" },
-  }
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "second" })
   local calls = decode_calls()
   local echo = find_call(calls, "chat.message.append", "user", "second")
   assert(echo ~= nil,
@@ -302,110 +206,72 @@ do
   local queued_note = find_call(calls, "chat.message.append", "system", "queued")
   assert(queued_note ~= nil,
     "queued submit must surface a [queued ...] system message; got " ..
-    nefor.json.encode(calls))
-  -- Old-text rejection MUST be gone.
+    json.encode(calls))
   local busy_msg = find_call(calls, "chat.message.append", "system", "orchestrator busy")
   assert_eq(busy_msg, nil,
     "the rejected '[orchestrator busy ...]' must no longer appear")
 end
 
 -- (3.B) Two messages submitted back-to-back BOTH dispatch as the
--- orchestrator frees up. We drive graph.run_complete to flush.
+-- orchestrator frees up. We drive the canonical run-close
+-- `tool.result { id=run_id, result: { status, results } }` to flush.
 do
-  local for_chat = fresh_for_chat()
-  local rg = agentic_workflow.for_reasoner_graph()
-  -- Submit twice in a row.
-  for_chat.from_plugin {
-    type = "event",
-    from = "nefor-tui",
-    body = { kind = "chat.input.submit", text = "alpha" },
-  }
-  for_chat.from_plugin {
-    type = "event",
-    from = "nefor-tui",
-    body = { kind = "chat.input.submit", text = "beta" },
-  }
-  -- Capture run_id by walking emitted reasoner-graph.run envelopes.
+  fresh_loop()
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "alpha" })
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "beta" })
+
+  -- Submission rides on the canonical tool contract:
+  -- `tool.invoke { id=run_id, name="spawn_graph", args: { graph, on_node_failure } }`.
   local function find_run_emit(calls)
     for _, c in ipairs(calls) do
-      if c.body.kind == "reasoner-graph.run" then
-        return c.body.run_id
+      if c.body.kind == "tool.invoke" and c.body.name == "spawn_graph" then
+        return c.body.id
       end
     end
     return nil
   end
   local first_run = find_run_emit(decode_calls())
-  assert(first_run ~= nil, "first submit dispatched a reasoner-graph.run")
-  -- Sanity: only ONE run dispatched so far (second is queued).
+  assert(first_run ~= nil, "first submit dispatched a spawn_graph tool.invoke")
   do
     local count = 0
     for _, c in ipairs(decode_calls()) do
-      if c.body.kind == "reasoner-graph.run" then count = count + 1 end
+      if c.body.kind == "tool.invoke" and c.body.name == "spawn_graph" then
+        count = count + 1
+      end
     end
     assert_eq(count, 1, "second submit must NOT dispatch while first is in flight")
   end
   _test.calls_clear()
-  -- Drive graph.run_complete success for the first run.
-  rg.from_plugin {
-    type = "event",
-    from = "reasoner-graph",
-    body = {
-      kind   = "graph.run_complete",
-      run_id = first_run,
-      status = "success",
-      results = {},
-    },
-  }
-  -- Now the queued "beta" should have dispatched.
+  -- Drive the canonical run-close for the first run.
+  send_to_loop("reasoner-graph", {
+    kind   = "tool.result",
+    id     = first_run,
+    result = { status = "success", results = {} },
+  })
   local second_run = find_run_emit(decode_calls())
   assert(second_run ~= nil,
-    "queued submit must dispatch on graph.run_complete; sends were " ..
-    nefor.json.encode(_test.calls()))
+    "queued submit must dispatch on tool.result run-close; sends were " ..
+    json.encode(_test.calls()))
   assert(second_run ~= first_run,
     "second run must be a fresh run_id, got " .. tostring(second_run))
 end
 
--- (3.C) chat.reset clears the pending-input queue (no surprise dispatch).
+-- (3.C) chat.reset clears the pending-input queue.
 do
-  local for_chat = fresh_for_chat()
-  for_chat.from_plugin {
-    type = "event",
-    from = "nefor-tui",
-    body = { kind = "chat.input.submit", text = "first" },
-  }
-  for_chat.from_plugin {
-    type = "event",
-    from = "nefor-tui",
-    body = { kind = "chat.input.submit", text = "queued-2" },
-  }
-  for_chat.from_plugin {
-    type = "event",
-    from = "nefor-tui",
-    body = { kind = "chat.input.submit", text = "queued-3" },
-  }
-  -- Reset clears queue + current_run_id.
-  for_chat.from_plugin {
-    type = "event",
-    from = "nefor-tui",
-    body = { kind = "chat.reset" },
-  }
+  fresh_loop()
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "first" })
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "queued-2" })
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "queued-3" })
+  send_to_loop("nefor-tui", { kind = "chat.reset" })
   _test.calls_clear()
-  -- Now drive graph.run_complete (orchestrator's old run_id was
-  -- cleared by chat.reset, so this matches nothing — but we want to
-  -- confirm the queue is empty independently of run_complete). Fire
-  -- a fresh submit and assert the dispatched run carries "fresh",
-  -- NOT "queued-2" (which would mean the queue leaked across reset).
-  for_chat.from_plugin {
-    type = "event",
-    from = "nefor-tui",
-    body = { kind = "chat.input.submit", text = "fresh" },
-  }
-  -- Inspect the reasoner-graph.run envelope's user_text. The graph
-  -- builder embeds the prompt inside the wrap node's args.
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "fresh" })
   local function find_run_user_text(calls)
     for _, c in ipairs(calls) do
-      if c.body.kind == "reasoner-graph.run" and type(c.body.graph) == "table" then
-        for _, node in ipairs(c.body.graph.nodes or {}) do
+      if c.body.kind == "tool.invoke"
+          and c.body.name == "spawn_graph"
+          and type(c.body.args) == "table"
+          and type(c.body.args.graph) == "table" then
+        for _, node in ipairs(c.body.args.graph.nodes or {}) do
           if node.id == "wrap" and type(node.args) == "table" then
             return node.args.prompt
           end
@@ -420,33 +286,20 @@ do
     .. tostring(user_text) .. "', expected 'fresh'")
 end
 
--- (3.D) session_end teardown clears the queue (resume implies discard).
+-- (3.D) session_end teardown clears the queue.
 do
-  local for_chat = fresh_for_chat()
-  for_chat.from_plugin {
-    type = "event",
-    from = "nefor-tui",
-    body = { kind = "chat.input.submit", text = "first" },
-  }
-  for_chat.from_plugin {
-    type = "event",
-    from = "nefor-tui",
-    body = { kind = "chat.input.submit", text = "stranded" },
-  }
-  -- Session swap.
-  _test.fire_bus("sessions.session_end", { session_id = "old" })
+  fresh_loop()
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "first" })
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "stranded" })
+  send_to_loop("sessions", { kind = "sessions.session_end", session_id = "old" })
   _test.calls_clear()
-  -- Fresh submit after session swap. The queue should be empty —
-  -- the previously queued "stranded" must NOT dispatch.
-  for_chat.from_plugin {
-    type = "event",
-    from = "nefor-tui",
-    body = { kind = "chat.input.submit", text = "post-swap" },
-  }
-  -- Walk reasoner-graph.run envelopes; assert none carries "stranded".
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "post-swap" })
   for _, c in ipairs(decode_calls()) do
-    if c.body.kind == "reasoner-graph.run" and type(c.body.graph) == "table" then
-      for _, node in ipairs(c.body.graph.nodes or {}) do
+    if c.body.kind == "tool.invoke"
+        and c.body.name == "spawn_graph"
+        and type(c.body.args) == "table"
+        and type(c.body.args.graph) == "table" then
+      for _, node in ipairs(c.body.args.graph.nodes or {}) do
         if node.id == "wrap" and type(node.args) == "table" then
           local txt = node.args.prompt
           assert(txt ~= "stranded",
@@ -461,14 +314,11 @@ end
 -- Issue 2 — cancel_all no longer emits the [interrupted: chat=...] line
 -- ------------------------------------------------------------------
 do
-  agentic_workflow._reset()
-  agentic_workflow.setup { provider = "ollama", model = "test-model" }
+  agentic_loop._internals.reset()
+  agentic_loop.configure { provider = "ollama", model = "test-model" }
   _test.set_plugins({ "ollama", "reasoner-graph", "nefor-tui" })
   _test.calls_clear()
-  -- Trigger cancel_all; ensure the developer-telemetry summary
-  -- (`[interrupted: chat=N sub-graphs=N deferred=N]`) does NOT appear
-  -- as a chat.message.append on the bus.
-  agentic_workflow.cancel_all()
+  agentic_loop.cancel_all()
   for _, c in ipairs(decode_calls()) do
     if c.body.kind == "chat.message.append" and type(c.body.text) == "string" then
       assert(string.find(c.body.text, "interrupted: chat=", 1, true) == nil,
