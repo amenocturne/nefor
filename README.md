@@ -16,9 +16,10 @@ cd nefor
 just install
 ```
 
-`just install` builds the workspace, copies every binary into `~/.local/bin`, installs `da` (the bash-command classifier the tool-validator uses) via `cargo install --locked dabin` if it isn't already on `PATH`, and copies the in-repo `starter/` to `~/.config/nefor` so a bare `nefor` from any cwd picks up the config. Re-run `just install` to refresh binaries.
+`just install` is a composite of two recipes you can also run independently:
 
-If `~/.config/nefor` already exists, the copy step is skipped (your config is yours — re-copying would clobber local tweaks). Move the existing dir aside and re-run if you want a fresh copy from this checkout.
+- `just install-nefor` — builds the workspace, copies every binary into `~/.local/bin`, installs `da` (the bash-command classifier the tool-validator uses) via `cargo install --locked dabin` if it isn't already on `PATH`. Re-run after pulling to refresh binaries; never touches your config.
+- `just install-starter` — copies the in-repo `starter/` to `~/.config/nefor` so a bare `nefor` from any cwd picks it up. Refuses if the dir already exists (your config is yours — re-copying would clobber local tweaks). Pass `force` to wipe and re-copy from this checkout: `just install-starter force`.
 
 ### From brew
 
@@ -44,7 +45,7 @@ The starter ships a `tool-validator` actor that classifies every `bash` invocati
 - `da` exits 2 (deny) — the call is auto-denied; no popup.
 - `da` exits 1 (defer) or `da` is absent — defers to a user popup. The popup is the only way the human sees a permission prompt; tool-gate's `chat.tool.permission_request` never reaches the chat surface directly.
 
-`just install` installs `da` automatically (`cargo install --locked dabin`). If the binary isn't on `PATH` the validator logs a warning at startup and falls back to "always defer" — safe by construction.
+`just install-nefor` installs `da` automatically (`cargo install --locked dabin`). If the binary isn't on `PATH` the validator logs a warning at startup and falls back to "always defer" — safe by construction.
 
 To change the policy stack (e.g. add `--cargo crates-publish` for a release pipeline), edit `DA_ARGS` in `starter/tool-validator/init.lua`.
 
