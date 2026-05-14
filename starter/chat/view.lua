@@ -85,7 +85,7 @@ local function render_keepalive(state)
   -- keeps the toast slide smooth (~60fps engine tick when active);
   -- DAG-elapsed counters only need 1Hz but the extra ticks are free.
   local has_toast = state.toasts and #state.toasts > 0
-  if not (state.pending or dag.any_active(state.dag_runs) or has_toast) then
+  if not (state.pending or dag.any_active(state.dag_runs, tui.now_ms()) or has_toast) then
     return nil
   end
   return tui.animation {
