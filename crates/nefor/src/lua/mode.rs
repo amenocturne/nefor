@@ -15,8 +15,10 @@
 /// Run-time mode the engine adopts after parsing CLI arguments.
 #[derive(Debug, Clone)]
 pub enum EngineMode {
-    /// Standard run: spawn plugins, run the broker until shutdown.
-    Tui,
+    /// Default mode on bare `nefor` invocation: spawn plugins, run the
+    /// broker until shutdown. The engine acts as the bus host; whether a
+    /// UI plugin attaches is up to `init.lua`.
+    Serve,
     /// `nefor plugin` (no name) — list registered plugins with a `cli`
     /// entry, exit 0. Engine boots, init.lua runs, spawn registry is
     /// inspected; no broker, no subprocess spawns.

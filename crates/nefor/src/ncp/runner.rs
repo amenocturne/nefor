@@ -3,12 +3,15 @@
 //! The runner is the engine's process-management surface. Given a
 //! [`PluginSpec`], it:
 //!
-//! 1. Resolves the working directory to `<plugin-root>/<name>/` (errors if
-//!    the directory does not exist — creation is a plugin-manager concern).
-//! 2. Spawns `command[0]` with `command[1..]` as arguments via
-//!    `tokio::process::Command`. No shell. No env map. Working directory
-//!    is the per-plugin directory; all other environment is inherited
-//!    from the engine.
+//! 1. Spawns `command[0]` with `command[1..]` as arguments via
+//!    `tokio::process::Command`. No shell. No env map.
+//! 2. Lets the spawned plugin inherit the engine's current working
+//!    directory. This matches what users expect when they `cd
+//!    ~/projects/foo && nefor` — a `bash` tool running inside
+//!    `basic-tools` should see `/Users/me/projects/foo`, not the
+//!    formula's plugin install dir. Plugins that need a different
+//!    working directory wrap themselves in a `cd ... && exec ...`
+//!    shell script and expose that as their `command`.
 //! 3. Wraps the child's stdio + wait-future in a [`Transport`].
 //!
 //! Plugins that need shell features (expansions, pipes, builtins) or
@@ -112,7 +115,7 @@ fn xdg_data_home() -> Option<PathBuf> {
 /// [`Transport`] the broker can attach. The caller must filter out
 /// virtual specs (`spec.command.is_none()`) before calling — the runner
 /// errors loudly rather than guessing what to spawn.
-pub fn spawn_plugin(spec: &PluginSpec, root: &PluginRoot) -> Result<Transport, BrokerError> {
+pub fn spawn_plugin(spec: &PluginSpec, _root: &PluginRoot) -> Result<Transport, BrokerError> {
     let command = spec.command.as_ref().ok_or_else(|| BrokerError::Spawn {
         name: spec.name.as_str().to_owned(),
         command: Vec::new(),
@@ -122,25 +125,19 @@ pub fn spawn_plugin(spec: &PluginSpec, root: &PluginRoot) -> Result<Transport, B
         ),
     })?;
 
-    // In the nested layout (e.g. `plugins/<name>/`) the per-plugin subdirectory
-    // is the cwd. In the flat layout (e.g. `target/debug/<name>` is a binary,
-    // not a directory) fall back to the plugin root itself as the cwd.
-    let nested = root.as_path().join(spec.name.as_str());
-    let cwd = if nested.is_dir() {
-        nested
-    } else {
-        root.as_path().to_path_buf()
-    };
-
     let (binary, args) = command.split_first().ok_or_else(|| BrokerError::Spawn {
         name: spec.name.as_str().to_owned(),
         command: command.clone(),
         source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command array"),
     })?;
 
+    // No `current_dir(...)`: spawned plugins inherit the engine's cwd, so
+    // tool plugins like `basic-tools` running `bash` resolve relative paths
+    // against the directory the user launched nefor from. The PluginRoot
+    // is still used by the resolver to find binaries on disk; the runner
+    // doesn't need it past that point.
     let mut cmd = Command::new(binary);
     cmd.args(args)
-        .current_dir(&cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -198,11 +195,13 @@ mod tests {
         assert_eq!(root.as_path(), p.as_path());
     }
 
-    #[test]
-    fn spawn_plugin_errors_when_cwd_missing() {
-        // With flat layout the runner uses plugin_root as cwd when no
-        // per-plugin subdir exists. A root that doesn't exist at all
-        // means the spawn itself fails (OS rejects the cwd).
+    #[tokio::test]
+    async fn spawn_plugin_inherits_engine_cwd() {
+        // The runner intentionally does NOT call `current_dir`, so the
+        // child inherits the engine's cwd. The plugin root passed in is
+        // used only for binary lookup at the call site — the runner
+        // itself doesn't read it past basic command-array validation,
+        // so a non-existent root must NOT cause spawn to fail.
         let spec = PluginSpec {
             name: PluginName::new("nonexistent-plugin").expect("valid"),
             command: Some(vec!["echo".into()]),
@@ -210,8 +209,10 @@ mod tests {
         };
         let root = PluginRoot::new(PathBuf::from("/tmp/definitely-not-a-plugin-root-xyz"));
         match spawn_plugin(&spec, &root) {
-            Err(_) => {} // spawn error — OS rejects the non-existent cwd
-            Ok(_) => panic!("expected error for nonexistent cwd"),
+            Ok(_) => {}
+            Err(e) => panic!(
+                "spawn should succeed regardless of plugin-root existence (cwd is inherited from engine), got error: {e:?}"
+            ),
         }
     }
 

@@ -20,9 +20,9 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "nefor",
     version,
-    about = "nefor — TUI agent runtime (Lua plugin host on top of nefor-combinators).",
-    long_about = "nefor is a TUI/GUI agent runtime. The binary ships voiceless — \
-                  providers, harnesses, DAG orchestration, personas, and statusline \
+    about = "nefor — Lua-composable agent runtime (plugin broker on top of nefor-combinators).",
+    long_about = "nefor is a plugin broker for composing agent runtimes. The binary ships voiceless — \
+                  providers, harnesses, DAG orchestration, personas, UIs, and statusline \
                   content all live in plugins loaded from the user's init.lua.\n\n\
                   Config: $NEFOR_CONFIG_DIR or $XDG_CONFIG_HOME/nefor/ (default ~/.config/nefor/).\n\
                   Data:   $NEFOR_DATA_DIR or $XDG_DATA_HOME/nefor/ (default ~/.local/share/nefor/).\n\

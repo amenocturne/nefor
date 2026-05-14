@@ -1,10 +1,10 @@
 //! Tracing setup.
 //!
 //! Writes to `<config_dir>/nefor.log` by default so log output doesn't paint
-//! over the TUI's alternate-screen frame. When `NEFOR_LOG_STDERR` is set (any
-//! non-empty value), logs go to stderr instead — useful for running without
-//! the TUI (e.g. `cargo test`, `--help` inspections, debugging with the
-//! terminal visible).
+//! over a plugin that may have taken over the terminal (alternate-screen
+//! buffer, raw mode, etc.). When `NEFOR_LOG_STDERR` is set (any non-empty
+//! value), logs go to stderr instead — useful for headless runs
+//! (`cargo test`, `--help` inspections, debugging with the terminal visible).
 //!
 //! Filter comes from `RUST_LOG` via `EnvFilter`, defaulting to `info`.
 //!
@@ -72,10 +72,10 @@ pub fn init(log_path: &Path) -> Result<(), LogInitError> {
 
     // Surface ERROR-level events on stderr too. The user's terminal is the
     // primary feedback channel; silent failures (plugin spawn errors, bad
-    // init.lua, etc.) waste a lot of debugging time. The TUI takes over
-    // /dev/tty, not stderr, so these one-line errors print before the
-    // alternate screen — visible after exit, before alt-screen is entered,
-    // and never overwriting live grid frames.
+    // init.lua, etc.) waste a lot of debugging time. Terminal-takeover
+    // plugins claim /dev/tty, not stderr, so these one-line errors print
+    // before any alternate screen is entered and remain visible after exit,
+    // never overwriting live frames.
     let stderr_errors = fmt::layer()
         .with_writer(std::io::stderr)
         .with_target(false)

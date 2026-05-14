@@ -218,6 +218,36 @@ impl EngineOps for BrokerOps {
             }
         }
     }
+
+    fn deliver(&self, target: PluginName, payload: String) -> Result<(), String> {
+        // Per-peer delivery — write the line to one peer's stdin without
+        // appending a LogEntry. The original emission already produced its
+        // canonical Plugin/Step entry at ingress; delivery is a routing
+        // action, not a bus event. See the engine binding's module
+        // docstring for the broader rationale.
+        let guard = match self.shared.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let conn = match guard.conns.get(&target) {
+            Some(c) => c,
+            None => {
+                // Surface upward as a typed error so the Lua caller can
+                // log + drop without crashing dispatch. Symmetric with
+                // `send`'s warn-and-drop on the Targeted branch, except
+                // here the caller asked for a guarantee — they enumerated
+                // `nefor.engine.plugins()` to pick this peer — so the
+                // explicit error gives them the chance to react to a
+                // TOCTOU disconnect.
+                return Err(format!(
+                    "target plugin '{target}' is not connected"
+                ));
+            }
+        };
+        let line = with_trailing_newline(payload);
+        let _ = conn.send(ConnectionOutbound::Send(line));
+        Ok(())
+    }
 }
 
 fn with_trailing_newline(mut s: String) -> String {
@@ -946,6 +976,107 @@ mod tests {
 
         handle.shutdown(50).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_deliver_writes_to_one_peer_without_log_entry() {
+        // `nefor.engine.deliver(peer, payload)` writes to the named peer's
+        // stdin like a targeted `send` — but without appending a LogEntry.
+        // This is the bus's "delivery without emission" path used by
+        // ncp.lua's per-peer fan-out. We assert (a) only the named peer
+        // sees the line, (b) the in-memory event log carries one entry
+        // for the inbound trigger and zero step entries for the deliver.
+        let shared = shared_state();
+        let host = build_host(
+            &shared,
+            r#"function dispatch(current) nefor.engine.deliver("b", "to-b") end"#,
+        );
+
+        let mut broker = Broker::new(Arc::clone(&shared), host);
+        let (mut pa, ta) = make_transport();
+        let (mut pb, tb) = make_transport();
+        broker.attach_transport(ta, pn("a"));
+        broker.attach_transport(tb, pn("b"));
+        let handle = broker.shutdown_handle();
+        let run = tokio::spawn(broker.run());
+
+        send_line(&mut pa, "trigger").await;
+
+        let got_b = tokio::time::timeout(Duration::from_millis(500), recv_line(&mut pb))
+            .await
+            .expect("b timed out");
+        assert_eq!(got_b.as_deref(), Some("to-b"));
+
+        // 'a' must not see anything routed back.
+        let got_a = tokio::time::timeout(Duration::from_millis(150), recv_line(&mut pa)).await;
+        assert!(
+            got_a.is_err() || got_a.unwrap().is_none(),
+            "a must not receive a deliver aimed at b",
+        );
+
+        handle.shutdown(50).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
+
+        let entries: Vec<LogEntry> = {
+            let guard = shared.lock().expect("lock shared");
+            guard.event_log.clone()
+        };
+        // Exactly one entry: the inbound trigger from 'a'. The deliver
+        // produced no Step entry — that's the whole point.
+        let step_count = entries
+            .iter()
+            .filter(|e| matches!(e.origin, Origin::Step))
+            .count();
+        assert_eq!(
+            step_count, 0,
+            "deliver must not append a Step entry; got {entries:?}"
+        );
+        let plugin_count = entries
+            .iter()
+            .filter(|e| matches!(&e.origin, Origin::Plugin(p) if p.as_str() == "a"))
+            .count();
+        assert_eq!(plugin_count, 1, "one inbound entry for the trigger");
+    }
+
+    #[tokio::test]
+    async fn dispatch_deliver_to_unknown_peer_surfaces_error_to_lua() {
+        // The deliver binding is fallible: when the target isn't connected,
+        // the broker returns Err, the Lua binding raises, and dispatch's
+        // pcall (or any other error path) sees the failure rather than
+        // silently dropping. We exercise it by writing a dispatch hook
+        // that catches the error in pcall and stashes the message.
+        let shared = shared_state();
+        let host = build_host(
+            &shared,
+            r#"
+            last_err = nil
+            function dispatch(current)
+                local ok, err = pcall(function()
+                    nefor.engine.deliver("nope", "x")
+                end)
+                if not ok then last_err = tostring(err) end
+            end
+            "#,
+        );
+        let lua = host.lua().clone();
+
+        let mut broker = Broker::new(Arc::clone(&shared), host);
+        let (mut pa, ta) = make_transport();
+        broker.attach_transport(ta, pn("a"));
+        let handle = broker.shutdown_handle();
+        let run = tokio::spawn(broker.run());
+
+        send_line(&mut pa, "trigger").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle.shutdown(50).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), run).await;
+
+        let err: Option<String> = lua.globals().get("last_err").unwrap();
+        let err = err.expect("deliver to unknown peer must raise");
+        assert!(
+            err.contains("not connected"),
+            "expected disconnected-peer message, got {err}"
+        );
     }
 
     #[tokio::test]
