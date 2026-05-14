@@ -340,7 +340,6 @@ local function handle(body)
 
   local system_prompt = args.system_prompt
   local prompt        = args.prompt
-  local model         = args.model
   local additional    = args.additional_context
 
   if type(prompt) ~= "string" or #prompt == 0 then
@@ -349,6 +348,16 @@ local function handle(body)
 
   local cfg = al().config()
   local provider = (type(args.provider) == "string" and args.provider) or cfg.provider
+  -- Inherit the orchestrator's model when the per-node spec doesn't
+  -- pin one. Without this fallback, sub-agent chat.create envelopes
+  -- omit `model`, and the provider binary falls back to its own
+  -- baked-in default (gpt-5-codex for chatgpt-provider) — which is
+  -- rejected for ChatGPT-subscription accounts. The user's
+  -- /model picker writes `cfg.model`, so the lead's choice naturally
+  -- propagates to every node. Mirrors provider-wrapper's resolution
+  -- order in reasoners/init.lua:127.
+  local model = (type(args.model) == "string" and #args.model > 0 and args.model)
+              or cfg.model
   if type(provider) ~= "string" or #provider == 0 then
     return "agent reasoner: no provider configured (set args.provider or config.provider)"
   end

@@ -1434,4 +1434,55 @@ do
     "top-level node sees bare prompt (no upstream-inputs header)")
 end
 
+-- ------------------------------------------------------------------
+-- Scenario 25 (Fix #5): sub-agent inherits orchestrator's cfg.model
+-- ------------------------------------------------------------------
+-- Without per-node model in the dispatch-graph spec, the agent
+-- reasoner must fall back to agentic-loop's `cfg.model` (the
+-- orchestrator's choice). Otherwise the chat.create body omits
+-- `model`, and the provider binary falls back to its baked-in default
+-- — for chatgpt-provider that's `gpt-5-codex`, which a ChatGPT-
+-- subscription account can't use.
+do
+  fresh()
+  -- mock-prov configured with model "test-model" in fresh(); reuse.
+  dispatch_agent("firing-inherit-1", {
+    system_prompt = "You are a builder.",
+    -- Deliberately NO model field.
+    prompt        = "Echo.",
+  })
+
+  local calls = decode_calls()
+  local create = find_call(calls, function(c)
+    return c.body.kind == "mock-prov.chat.create"
+  end)
+  assert(create ~= nil, "agent must emit chat.create even when args.model is nil")
+  assert_eq(create.body.model, "test-model",
+    "agent MUST inherit cfg.model when args.model is absent; got "
+    .. tostring(create.body.model))
+end
+
+-- ------------------------------------------------------------------
+-- Scenario 26 (Fix #5): args.model wins over cfg.model when present
+-- ------------------------------------------------------------------
+-- A per-node `agent_args.model` override is still respected. Regression
+-- cover so the inheritance fallback doesn't accidentally clobber an
+-- intentional per-role pin.
+do
+  fresh()
+  dispatch_agent("firing-inherit-2", {
+    system_prompt = "You are a builder.",
+    model         = "node-pinned-model",
+    prompt        = "Echo.",
+  })
+
+  local calls = decode_calls()
+  local create = find_call(calls, function(c)
+    return c.body.kind == "mock-prov.chat.create"
+  end)
+  assert(create ~= nil, "chat.create emitted")
+  assert_eq(create.body.model, "node-pinned-model",
+    "explicit args.model MUST win over cfg.model")
+end
+
 print("agent_test: ok")
