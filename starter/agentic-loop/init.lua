@@ -165,6 +165,11 @@ local function submit_orchestrator_run(user_text)
   return state.current_run_id
 end
 
+-- Deferred user-text queue. Carries any text that needs to land as a
+-- user-role message in a fresh orchestrator turn: today, sub-graph
+-- completion bodies (`[spawn_graph(run_id=…) result]`). One entry per
+-- turn so a long backlog still produces an observable chat each step
+-- instead of one merged blob.
 local function flush_deferred()
   if state.current_run_id ~= nil then return end
   if #state.deferred_queue == 0 then return end

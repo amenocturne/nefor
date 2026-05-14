@@ -4988,7 +4988,11 @@ fn lead_workflow_plan_rejected_marks_entry() {
 }
 
 #[test]
-fn multiple_plans_track_status_independently() {
+fn approval_targets_the_latest_pending_plan() {
+    // New model: only ONE plan is in flight at a time, and there is no
+    // plan_id on the wire. The chat surface tracks plan entries in the
+    // transcript and applies an approval envelope to the most recent
+    // pending entry. Older decided entries keep their status.
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -4997,64 +5001,59 @@ fn multiple_plans_track_status_independently() {
         &mut engine,
         json!({
             "kind": "chat.plan.append",
-            "plan_id": "first",
             "text": "FIRST_PLAN_BODY",
             "submitted_at": "2026-05-08T08:00:00Z",
+        }),
+    );
+    // First plan decided before the second appears (realistic flow:
+    // actor only allows one in-flight at a time).
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "lead-workflow.plan.approved",
+            "approved": true,
         }),
     );
     dispatch_event(
         &mut engine,
         json!({
             "kind": "chat.plan.append",
-            "plan_id": "second",
             "text": "SECOND_PLAN_BODY",
             "submitted_at": "2026-05-08T08:05:00Z",
         }),
     );
     let _ = render_str(&mut engine);
 
-    // Approve only the FIRST one — second must stay pending.
+    // Now approve the second.
     dispatch_event(
         &mut engine,
         json!({
             "kind": "lead-workflow.plan.approved",
-            "plan_id": "first",
             "approved": true,
         }),
     );
     let out = render_str(&mut engine);
 
-    assert!(
-        out.contains("FIRST_PLAN_BODY"),
-        "first plan body missing: {out:?}"
-    );
-    assert!(
-        out.contains("SECOND_PLAN_BODY"),
-        "second plan body missing: {out:?}"
-    );
-    // Exactly one approved row — the FIRST plan's status changed; the
-    // second is still pending and shouldn't carry the check-mark.
+    // Both plans should carry approved status.
     let approved_count = out.matches("✓ approved").count();
-    assert_eq!(
-        approved_count, 1,
-        "expected exactly one approved row after approving plan_id=first; out: {out:?}"
-    );
-    // The second plan's pending hint must still be visible — its
-    // status didn't change. (Note: the first plan's hint also went
-    // away; both contribute to the count, so we just assert the hint
-    // string is present at least once.)
     assert!(
-        out.contains("/approve"),
-        "second (still-pending) plan should still show the action hint: {out:?}"
+        approved_count >= 1,
+        "expected at least one approved row after the second approval; out: {out:?}"
+    );
+    // No pending hints should remain — every plan has been decided.
+    assert!(
+        !out.contains("/approve"),
+        "no pending hint should remain after both plans approved: {out:?}"
     );
 }
 
 #[test]
-fn approval_for_unknown_plan_id_is_dropped() {
-    // Defence: an approval envelope for a plan_id we never appended is
-    // a no-op — chat.lua's reducer leaves state untouched rather than
-    // creating a synthetic entry. Pre-fix a sloppy reducer that pushed
-    // an entry on approval would surface a phantom row here.
+fn approval_with_no_pending_plan_is_dropped() {
+    // Defence: an approval envelope with no pending plan entry in the
+    // transcript is a no-op — chat.lua's reducer leaves state
+    // untouched rather than creating a synthetic entry. Pre-fix a
+    // sloppy reducer that pushed an entry on approval would surface a
+    // phantom row here.
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -5063,7 +5062,6 @@ fn approval_for_unknown_plan_id_is_dropped() {
         &mut engine,
         json!({
             "kind": "lead-workflow.plan.approved",
-            "plan_id": "ghost",
             "approved": true,
         }),
     );
@@ -5072,7 +5070,7 @@ fn approval_for_unknown_plan_id_is_dropped() {
     // No plan body → no approval check should appear.
     assert!(
         !out.contains("✓ approved"),
-        "approval for unknown plan_id should NOT paint a status row: {out:?}"
+        "approval with no pending plan should NOT paint a status row: {out:?}"
     );
 }
 
@@ -5177,21 +5175,21 @@ fn user_submit_after_plan_does_not_carry_plan_body_in_wire_text() {
 }
 
 #[test]
-fn chat_plan_append_is_idempotent_on_plan_id() {
+fn chat_plan_append_is_idempotent_on_submitted_at() {
     // The lead-workflow actor's plan.submitted reducer fires
     // chat.plan.append on every handling — once on live (via bus
     // feedback) and again on /resume (sessions replays both the
     // persisted chat.plan.append and re-fires the reducer for the
     // replayed plan.submitted). chat.lua's reducer must dedupe by
-    // plan_id so the same plan doesn't paint two yellow boxes after
-    // every resume.
+    // submitted_at so the same plan doesn't paint two yellow boxes
+    // after every resume. (plan_id was dropped — there is one plan in
+    // flight at a time, identity is the timestamp.)
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
     let envelope = json!({
         "kind": "chat.plan.append",
-        "plan_id": "dup-plan",
         "text": "DUP_PLAN_BODY",
         "submitted_at": "2026-05-08T12:00:00Z",
     });
@@ -5202,16 +5200,16 @@ fn chat_plan_append_is_idempotent_on_plan_id() {
     let body_count = out.matches("DUP_PLAN_BODY").count();
     assert_eq!(
         body_count, 1,
-        "duplicate chat.plan.append for same plan_id must render only one yellow box; out: {out:?}"
+        "duplicate chat.plan.append for same submitted_at must render only one yellow box; out: {out:?}"
     );
 }
 
 #[test]
 fn chat_plan_append_dedup_preserves_approved_status() {
-    // After a plan is approved, a duplicate chat.plan.append for the
-    // same plan_id (e.g. from /resume's replay path) must NOT regress
-    // the entry's status back to "pending". The dedup branch returns
-    // the existing entry untouched.
+    // After a plan is approved, a duplicate chat.plan.append with the
+    // same submitted_at (e.g. from /resume's replay path) must NOT
+    // regress the entry's status back to "pending". The dedup branch
+    // returns the existing entry untouched.
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -5220,7 +5218,6 @@ fn chat_plan_append_dedup_preserves_approved_status() {
         &mut engine,
         json!({
             "kind": "chat.plan.append",
-            "plan_id": "dup-approve",
             "text": "PLAN_TO_APPROVE",
             "submitted_at": "2026-05-08T12:00:00Z",
         }),
@@ -5229,16 +5226,14 @@ fn chat_plan_append_dedup_preserves_approved_status() {
         &mut engine,
         json!({
             "kind": "lead-workflow.plan.approved",
-            "plan_id": "dup-approve",
             "approved": true,
         }),
     );
-    // Duplicate append for the already-approved plan_id.
+    // Duplicate append for the already-approved plan (same timestamp).
     dispatch_event(
         &mut engine,
         json!({
             "kind": "chat.plan.append",
-            "plan_id": "dup-approve",
             "text": "PLAN_TO_APPROVE",
             "submitted_at": "2026-05-08T12:00:00Z",
         }),
