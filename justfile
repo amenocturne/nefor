@@ -89,7 +89,7 @@ install-nefor channel="source":
         cd "{{justfile_directory()}}"
         install -m 0755 "target/release/nefor" "$PREFIX/bin/nefor"
         echo "  $PREFIX/bin/nefor"
-        for bin in openai-provider tool-gate basic-tools reasoner-graph nefor-tui mock-plugin generic-provider generic-tool nefor-combinators; do
+        for bin in openai-provider chatgpt-provider tool-gate basic-tools reasoner-graph nefor-tui mock-plugin generic-provider generic-tool nefor-combinators; do
           install -m 0755 "target/release/$bin" "$LIBEXEC_BIN/$bin"
           echo "  $LIBEXEC_BIN/$bin"
         done
