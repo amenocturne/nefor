@@ -45,7 +45,7 @@ function M.build_orchestrator_graph(opts)
 
   -- Provider + model are NOT baked into wrap_args. The picker (state.config
   -- on agentic-loop) is the single source of truth: every reasoner firing
-  -- — orchestrator wrap + every responder/dummy/etc. node spawned via
+  -- — orchestrator wrap + every responder/etc. node spawned via
   -- spawn_graph — falls through `provider_run_node`'s `args.provider or
   -- cfg.provider` precedence to the live config. Per-node routing is still
   -- opt-in: a caller that wants a specific provider/model on a specific

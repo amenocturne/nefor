@@ -127,7 +127,7 @@ function M.gate_spec(gate_name, command)
             error  = body.error,
           }
           al().fire_tool_end_observers(model_call_id, payload_output, err_bool)
-          envelope.emit_to("nefor-tui", {
+          envelope.emit("nefor-tui", {
             kind   = "chat.tool.end",
             id     = model_call_id,
             output = payload_output,

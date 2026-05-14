@@ -72,6 +72,64 @@ local envelope = require("lib.envelope")
 
 local M = {}
 
+-- ## Replay-window flag
+--
+-- A module-scoped flag indicating that the bus is currently delivering
+-- envelopes inside a `sessions.replay.start` / `sessions.replay.end`
+-- window. Wrappers that want to skip side effects during a replay burst
+-- read `M.active()` at the top of their `to_plugin` callback:
+--
+--   local history_replay = require("core.history_replay")
+--   to_plugin = function(env)
+--     if history_replay.active() then return end
+--     ...
+--   end
+--
+-- The flag is flipped two ways on purpose:
+--
+--   1. `sessions` calls `M.set(true)` synchronously before emitting
+--      replayed envelopes and `M.set(false)` after the burst (see
+--      `do_resume` in starter/sessions/init.lua). This is the
+--      load-bearing path: `drain_pending_dispatch` runs the whole
+--      batch's `to_plugin` callbacks BEFORE any `dispatch_subscriptions`
+--      handler fires, so a `bus.on_event` subscriber alone would always
+--      see the flag flip TOO LATE for the wrappers' to_plugin to skip
+--      the replayed envelopes (Bug 5 root cause).
+--   2. An explicit `M.install()` registers a `nefor.bus.on_event`
+--      subscriber on the framing markers as a defense-in-depth fallback
+--      for any non-sessions emitter that might bracket a replay window.
+--      In normal operation it fires after sessions has already toggled
+--      the flag and is a no-op. Callers wire `M.install()` once at
+--      startup (see `starter/init.lua`); the module no longer self-
+--      subscribes at require-time, so test harnesses without a bus
+--      binding load cleanly.
+
+local in_replay = false
+
+---Whether a session replay is currently in progress.
+---@return boolean
+function M.active() return in_replay end
+
+---Synchronously set the replay-window flag. Used by `sessions` to bracket
+---the replay-envelope burst and by tests as an escape hatch.
+---@param flag boolean
+function M.set(flag) in_replay = flag and true or false end
+
+---Subscribe to `sessions.replay.start` / `sessions.replay.end` as a
+---defense-in-depth fallback for the synchronous `M.set` path. Idempotent:
+---safe to call from contexts that don't actually have the bus wired
+---(quietly skips). Call once at startup, after the bus binding is wired.
+function M.install()
+  if nefor.bus and nefor.bus.on_event then
+    nefor.bus.on_event("sessions.replay.start", function(_entry)
+      in_replay = true
+    end)
+    nefor.bus.on_event("sessions.replay.end", function(_entry)
+      in_replay = false
+    end)
+  end
+end
+
 ---@param decoded any
 ---@return table|nil
 local function payload_body(decoded)
@@ -171,11 +229,11 @@ function M.replay_chat_history(opts)
   if type(create_model) == "string" and #create_model > 0 then
     create_body.model = create_model
   end
-  envelope.emit_to(target_provider, create_body)
+  envelope.emit(target_provider, create_body)
   emitted = emitted + 1
 
   for _, message in ipairs(pending_appends) do
-    envelope.emit_to(target_provider, {
+    envelope.emit(target_provider, {
       kind    = target_append_kind,
       chat_id = target_chat_id,
       message = message,

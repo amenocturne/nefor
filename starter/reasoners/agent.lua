@@ -98,7 +98,7 @@ local envelope      = require("lib.envelope")
 local replay_window = require("lib.replay_window")
 
 local emit_as = envelope.emit_as
-local emit_to = envelope.emit_to
+local emit    = envelope.emit
 local next_id = envelope.next_id
 
 local M = {}
@@ -244,7 +244,7 @@ end
 -- only tool source; the model would never learn `finalize` is an
 -- option.
 local function emit_chat_complete(entry)
-  emit_to(entry.provider, {
+  emit(entry.provider, {
     kind        = entry.provider .. ".chat.complete",
     chat_id     = entry.chat_id,
     extra_tools = { FINALIZE_SCHEMA },
@@ -253,7 +253,7 @@ end
 
 -- Append a single message to the chat.
 local function emit_chat_append(entry, message)
-  emit_to(entry.provider, {
+  emit(entry.provider, {
     kind    = entry.provider .. ".chat.append",
     chat_id = entry.chat_id,
     message = message,
@@ -344,7 +344,7 @@ local function handle(body)
     advertised[#advertised + 1] = FINALIZE_NAME
     create_body.tools = advertised
   end
-  emit_to(provider, create_body)
+  emit(provider, create_body)
 
   -- system message: system_prompt + optional additional_context
   if type(system_prompt) == "string" and #system_prompt > 0 then
@@ -404,7 +404,7 @@ local function dispatch_tool_call(entry, call)
     return true
   end
 
-  emit_to("tool-gate", {
+  emit("tool-gate", {
     kind = "tool-gate.tool.invoke",
     id   = tool_id,
     name = name,
@@ -627,6 +627,32 @@ end
 -- receive_msg — bus subscriber for provider replies + tool results
 -- ------------------------------------------------------------------
 
+  -- Snapshot the matching firings before we mutate. clear_firing inside
+  -- send_terminal_err deletes from `agents`; iterating it directly under
+  -- mutation is undefined in Lua.
+  local victims = {}
+  for firing_id, entry in pairs(agents) do
+    if entry.run_id == run_id then
+      victims[#victims + 1] = { firing_id = firing_id, entry = entry }
+    end
+  end
+
+  for _, v in ipairs(victims) do
+    local entry = v.entry
+    -- 1. interrupt the provider stream (per-chat). Mock honours chat_id;
+    -- openai-provider currently fanouts to all chats.
+    emit(entry.provider, {
+      kind    = entry.provider .. ".interrupt",
+      chat_id = entry.chat_id,
+    })
+    -- 2. close the firing with a terminal error so the scheduler
+    -- de-registers it.
+    send_terminal_err(v.firing_id, "[Graph cancelled by user]")
+  end
+end
+
+-- receive_msg — bus subscriber for provider replies + tool results.
+--
 -- Called from reasoners/init.lua's receive_msg before its tool.invoke
 -- dispatch path. We watch for the bus envelopes that carry per-turn
 -- progress (provider replies, tool results, provider errors) targeting
@@ -637,10 +663,8 @@ local function receive_msg(entry)
   -- reasoners/init.lua and agentic-loop/init.lua).
   if entry.origin == "step" and entry.target ~= nil then return end
 
-  local payload = entry.payload
-  if type(payload) ~= "string" or payload == "" then return end
-  local ok, decoded = pcall(json.decode, payload)
-  if not ok or type(decoded) ~= "table" or type(decoded.body) ~= "table" then return end
+  local ok, decoded = pcall(json.decode, entry.payload)
+  if not ok then return end
 
   -- Skip during replay — the agent reasoner's per-firing state lives
   -- in module-level tables that don't survive a process restart, so
@@ -649,7 +673,6 @@ local function receive_msg(entry)
 
   local body = decoded.body
   local kind = body.kind
-  if type(kind) ~= "string" then return end
 
   -- graph.cancel handler — sub-graph cancel propagation (#53). The
   -- lead-workflow actor broadcasts `graph.cancel { run_id }` on

@@ -80,10 +80,7 @@ local replay_window = require("lib.replay_window")
 
 local emit_as = envelope.emit_as
 local emit    = envelope.emit
-
--- ------------------------------------------------------------------
--- module-private state
--- ------------------------------------------------------------------
+local next_id = envelope.next_id
 
 local state = {
   -- The in-flight graph's run_id; nil when no graph is running.
@@ -585,8 +582,13 @@ local function terminate_active_graph()
   local run_id = state.active_run_id
   state.active_run_id = nil
 
-  emit_to("reasoner-graph", { kind = "graph.cancel", run_id = run_id })
-  emit_to("nefor-tui", {
+  -- Broadcast (target = nil) rather than target reasoner-graph: every
+  -- in-flight agent reasoner under this run also needs to see the
+  -- envelope so it can interrupt its provider stream + close its
+  -- firing (sub-graph cancel propagation). The reasoner-graph
+  -- binary still receives the broadcast and processes it the same way.
+  emit_as(SOURCE_NAME, nil, { kind = "graph.cancel", run_id = run_id })
+  emit("nefor-tui", {
     kind = "chat.message.append",
     role = "system",
     text = "[Graph terminated by user — session exit]",
@@ -698,13 +700,10 @@ end
 local function receive_msg(entry)
   if entry.origin == "step" and entry.target ~= nil then return end
 
-  local payload = entry.payload
-  if type(payload) ~= "string" or payload == "" then return end
-  local ok, decoded = pcall(json.decode, payload)
-  if not ok or type(decoded) ~= "table" or type(decoded.body) ~= "table" then return end
+  local ok, decoded = pcall(json.decode, entry.payload)
+  if not ok then return end
   local body = decoded.body
   local kind = body.kind
-  if type(kind) ~= "string" then return end
 
   -- Tool invocations from the gate. Live path only — during replay the
   -- gate doesn't re-issue invokes (replay_window suppresses to_plugin

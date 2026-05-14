@@ -84,20 +84,17 @@
 -- `sessions.replay.start` / `sessions.replay.end` framing markers), so
 -- every envelope inside a replay window carries `env.replay = true` and
 -- every live envelope carries `env.replay = false`. The global
--- `core.history_replay.active()` flag stays in sync as a back-compat
--- channel for `nefor.bus.on_event` subscribers; wrappers should prefer
--- `env.replay` because batched dispatch removes the per-envelope
--- temporal coupling that the global flag implicitly relied on.
+-- `core.history_replay.active()` flag stays in sync for
+-- `nefor.bus.on_event` subscribers; wrappers should prefer `env.replay`
+-- because batched dispatch removes the per-envelope temporal coupling
+-- that the global flag implicitly relied on.
 --
--- ## Why `from_plugin` is no longer a transform
+-- ## Why `from_plugin` is not a transform
 --
--- Pre-refactor, `from_plugin` returned the envelope and dispatch owned
--- the broadcast fan-out + the auto-log of plugin emissions. That coupled
--- two responsibilities to one callback signature: "translate the shape"
--- AND "decide whether to publish". The split — wrapper owns *publishing*,
--- framework owns nothing more than the system handshake — makes
--- per-wrapper decisions explicit (call send or don't) and removes the
--- "wait, is this on the log or not?" ambiguity for replay/persistence.
+-- The wrapper owns *publishing* (call send or don't); the framework
+-- owns nothing more than the system handshake. Keeping translation and
+-- publishing in one callback would conflate "translate the shape" with
+-- "decide whether to publish" and obscure the replay/persistence path.
 
 local json = nefor.json
 local replay_window = require("core.history_replay")
