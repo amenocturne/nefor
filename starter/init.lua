@@ -28,9 +28,11 @@ pm.install({
     dir  = LUA_ROOT .. "/core",
   },
 
-local ncp      = require("ncp")
-local sessions = require("sessions")
-local cfg      = require("config").active
+local ncp       = require("ncp")
+local actor     = require("actor")
+local sessions  = require("sessions")
+local cfg       = require("config").active
+local lead_role = require("lead_role")
 
 function dispatch(current_log)
   ncp.dispatch(current_log)
@@ -70,21 +72,17 @@ local agentic_loop = require("agentic-loop")
 agentic_loop.configure {
   provider = cfg.default_provider,
   model    = cfg.default_model,
-  system   = [[
-You are a helpful assistant. Use the `spawn_graph` tool for parallel decomposition tasks (multiple independent sub-questions to combine).
-
-Graph schema:
-{ "nodes": [{ "id": str, "reasoner": str, "args": {...} }], "edges": [{ "from": str, "to": str }] }
-
-Reasoner types:
-- `responder` — one-shot LLM call. args: { "prompt": string }. Upstream nodes' outputs become user messages prepended to the prompt.
-- `terminal` — sink. args: {}. Exactly one per graph; its input becomes the run's result.
-
-To combine parallel branches into a single output, add a `responder` combine node downstream of the parallel branches and feed it into terminal. Do NOT wire parallel branches directly into terminal — terminal is a sink, not a combiner. Pattern:
-  branchA, branchB → combine (responder) → terminal
-
-Emit the tool call directly after deciding the structure. For simple chat turns (no decomposition benefit), just answer directly.
-]],
+  system   = lead_role.LEAD_SYSTEM_PROMPT,
+  -- Restrict the lead's chat catalog to the orchestration-tool surface.
+  -- Without this filter the lead sees every wire-advertised tool — most
+  -- problematically `spawn_graph` (the reasoner-graph internal that
+  -- `dispatch-graph` translates into) — and can call them directly,
+  -- bypassing the role-keyed sub-agent contract and bottoming out in
+  -- `reasoner '<role>' not connected` runtime errors. The agent
+  -- reasoner already enforces a per-role allowlist on its sub-firings
+  -- via the same `chat.create.tools` plumbing; this extends the same
+  -- discipline to the lead's chat at the orchestrator layer.
+  tool_allowlist = lead_role.ORCHESTRATION_TOOLS,
 }
 actor.spawn(agentic_loop)
 actor.spawn(require("reasoners"))
@@ -188,84 +186,19 @@ end
 tool_gate_argv[#tool_gate_argv + 1] = "--default"
 tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
 
-actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
-actor.spawn(tools.basic_actor_spec())
-
 -- lead-workflow lives alongside agentic-loop, not inside it: separate
 -- bus subscriptions, separate state. Owns plan/approval state and the
 -- active graph run id; advertises dispatch-graph / write-review /
--- await-approval to tool-gate.
+-- await-approval to tool-gate. Registered BEFORE tool-gate's spawn so
+-- its bus subscription is live when tool-gate.hello arrives —
+-- otherwise the advertise is missed and the lead model gets "no such
+-- tool" at runtime.
 actor.spawn(require("lead-workflow"))
 
-Reasoner types:
-- `responder` — one-shot LLM call. args: { "prompt": string }. Upstream nodes' outputs become user messages prepended to the prompt.
-- `terminal` — sink. args: {}. Exactly one per graph; its input becomes the run's result.
+actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
+actor.spawn(tools.basic_actor_spec())
 
-To combine parallel branches into a single output, add a `responder` combine node downstream of the parallel branches and feed it into terminal. Do NOT wire parallel branches directly into terminal — terminal is a sink, not a combiner. Pattern:
-  branchA, branchB → combine (responder) → terminal
-
-Emit the tool call directly after deciding the structure. For simple chat turns (no decomposition benefit), just answer directly.
-]]
-
-agentic_workflow.setup {
-  provider = PROVIDER_NAME,
-  model    = PROVIDER_MODEL,
-  system   = ORCHESTRATOR_SYSTEM_PROMPT,
-}
-
-ncp.spawn {
-  name        = PROVIDER_NAME,
-  command     = provider_command,
-  from_plugin = provider_chain.from_plugin,
-  to_plugin   = provider_chain.to_plugin,
-}
-
--------------------------------------------------------------------------
--- 4d. Reasoner graph
--------------------------------------------------------------------------
-
-ncp.spawn {
-  name        = "reasoner-graph",
-  command     = { bin("reasoner-graph") },
-  from_plugin = agentic_workflow.for_reasoner_graph().from_plugin,
-}
-
--------------------------------------------------------------------------
--- 4e. Tool gate + basic-tools + spawn_graph advertisement
--------------------------------------------------------------------------
-
-local tool_gate_argv = { bin("tool-gate") }
-for _, t in ipairs(cfg.tool_gate.prompt_tools or {}) do
-  tool_gate_argv[#tool_gate_argv + 1] = "--prompt"
-  tool_gate_argv[#tool_gate_argv + 1] = t
-end
-tool_gate_argv[#tool_gate_argv + 1] = "--default"
-tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
-
-ncp.spawn {
-  name        = "tool-gate",
-  command     = tool_gate_argv,
-  from_plugin = agentic_workflow.for_tool_gate("tool-gate").from_plugin,
-}
-
-ncp.spawn {
-  name    = "basic-tools",
-  command = { bin("basic-tools"), "--gate", "tool-gate" },
-}
-
--------------------------------------------------------------------------
--- 4f. Chat
--------------------------------------------------------------------------
---
--- Post-phase-6 cutover: the chat surface is a Lua composition (`chat.lua`)
--- running inside the new declarative `nefor-tui` plugin. The plugin loads
--- the script via `--script <path>` and exposes a `tui.*` primitive surface
--- (text, column, row, scrollable, text_input, markdown, ...) that
--- `chat.lua` composes into the transcript + statusline + input. The
--- legacy split (`nefor-chat` + ratatui-based `nefor-tui`) is gone.
-
-ncp.spawn {
-  name        = "nefor-tui",
-  command     = { bin("nefor-tui"), "--script", STARTER_ROOT .. "/chat.lua" },
-  from_plugin = agentic_workflow.for_chat().from_plugin,
-}
+actor.spawn(require("compositors.chat_bridge").spawn_spec({
+  require("config").bin("nefor-tui"),
+  "--script", STARTER_ROOT .. "/chat/init.lua",
+}))

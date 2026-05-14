@@ -4433,14 +4433,8 @@ fn chat_plan_append_renders_yellow_bordered_plan_entry() {
     let out = render_str(&mut engine);
 
     // Body lines from the markdown plan land in the transcript.
-    assert!(
-        out.contains("Step one"),
-        "plan body line 1 missing: {out:?}"
-    );
-    assert!(
-        out.contains("Step two"),
-        "plan body line 2 missing: {out:?}"
-    );
+    assert!(out.contains("Step one"), "plan body line 1 missing: {out:?}");
+    assert!(out.contains("Step two"), "plan body line 2 missing: {out:?}");
 
     // The bordered_box helper paints all four rounded corners, same as
     // the user block — confirms render_plan_entry routed through

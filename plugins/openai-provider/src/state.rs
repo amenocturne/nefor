@@ -86,6 +86,17 @@ struct ChatState {
     /// Sub-graph responder chats set this so the LLM can't tool-call its
     /// way out of producing the requested text.
     tools_enabled: bool,
+    /// Optional per-chat allowlist of tool names. When `Some(names)`,
+    /// the per-turn `tools` array is filtered to entries whose
+    /// `function.name` appears in `names` (the catalog itself is
+    /// process-wide, so the filter is the only way to scope a chat's
+    /// tool surface). Empty Vec is honoured — the model sees zero
+    /// tools (effectively the same as `tools_enabled = false`, but
+    /// reached via the allowlist code path). `None` = no filter; the
+    /// chat advertises the entire catalog. Used by the lead
+    /// orchestrator (allowlist of orchestration-only tools) and the
+    /// agent reasoner (allowlist of role-specific sub-agent tools).
+    tool_allowlist: Option<Vec<String>>,
 }
 
 impl ChatState {
@@ -97,6 +108,7 @@ impl ChatState {
             cancel: None,
             stats: ChatStats::default(),
             tools_enabled: true,
+            tool_allowlist: None,
         }
     }
 }
@@ -169,12 +181,16 @@ impl Chats {
     /// when neither a per-chat `model` nor the plugin-default is set
     /// (`ChatsError::NoModelConfigured`). `tools_enabled` defaults to
     /// true; set false to omit the tools array on every turn for this
-    /// chat.
+    /// chat. `tool_allowlist`, when `Some(names)`, restricts the chat's
+    /// per-turn `tools` array to entries whose function.name is in the
+    /// list (the catalog itself stays process-wide; this is per-chat
+    /// scoping). Caller passes `None` to leave the chat unrestricted.
     pub async fn create(
         &self,
         id: ChatId,
         model: Option<String>,
         tools_enabled: Option<bool>,
+        tool_allowlist: Option<Vec<String>>,
     ) -> Result<(), ChatsError> {
         let resolved_model = match model {
             Some(m) => m,
@@ -193,6 +209,7 @@ impl Chats {
         if let Some(enabled) = tools_enabled {
             chat.tools_enabled = enabled;
         }
+        chat.tool_allowlist = tool_allowlist;
         g.insert(id, chat);
         Ok(())
     }
@@ -201,6 +218,18 @@ impl Chats {
         let g = self.inner.lock().await;
         g.get(id)
             .map(|c| c.tools_enabled)
+            .ok_or_else(|| ChatsError::NotFound(id.clone()))
+    }
+
+    /// Snapshot the chat's tool-name allowlist. `Ok(None)` means no
+    /// filter (the chat sees the full catalog); `Ok(Some(names))` means
+    /// restrict per-turn `tools` to entries whose name is in `names`
+    /// (empty Vec → no tools advertised). Errors if the chat doesn't
+    /// exist.
+    pub async fn tool_allowlist(&self, id: &ChatId) -> Result<Option<Vec<String>>, ChatsError> {
+        let g = self.inner.lock().await;
+        g.get(id)
+            .map(|c| c.tool_allowlist.clone())
             .ok_or_else(|| ChatsError::NotFound(id.clone()))
     }
 
@@ -465,7 +494,7 @@ mod tests {
     async fn create_then_append_and_snapshot_round_trips_through_history() {
         let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("a");
-        c.create(id.clone(), None, None).await.expect("create");
+        c.create(id.clone(), None, None, None).await.expect("create");
         c.push_user(&id, "hello".into()).await.expect("push user");
         c.push_assistant(&id, "hi there".into())
             .await
@@ -482,11 +511,11 @@ mod tests {
     async fn create_rejects_duplicate_id() {
         let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("dup");
-        c.create(id.clone(), None, None)
+        c.create(id.clone(), None, None, None)
             .await
             .expect("first create");
         let err = c
-            .create(id.clone(), None, None)
+            .create(id.clone(), None, None, None)
             .await
             .expect_err("second create");
         assert!(matches!(err, ChatsError::AlreadyExists(x) if x == id));
@@ -496,7 +525,7 @@ mod tests {
     async fn delete_removes_chat_and_subsequent_ops_404() {
         let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("x");
-        c.create(id.clone(), None, None).await.expect("create");
+        c.create(id.clone(), None, None, None).await.expect("create");
         c.delete(&id).await.expect("delete");
         let err = c.push_user(&id, "y".into()).await.expect_err("post-delete");
         assert!(matches!(err, ChatsError::NotFound(x) if x == id));
@@ -518,8 +547,8 @@ mod tests {
         let c = Chats::with_default_model(Some("m".into()));
         let a = ChatId::new("a");
         let b = ChatId::new("b");
-        c.create(a.clone(), None, None).await.expect("a");
-        c.create(b.clone(), None, None).await.expect("b");
+        c.create(a.clone(), None, None, None).await.expect("a");
+        c.create(b.clone(), None, None, None).await.expect("b");
         c.push_user(&a, "x".into()).await.expect("a push");
         c.push_user(&b, "y".into()).await.expect("b push");
         c.reset(&a).await.expect("reset a");
@@ -532,8 +561,8 @@ mod tests {
         let c = Chats::with_default_model(Some("m".into()));
         let a = ChatId::new("a");
         let b = ChatId::new("b");
-        c.create(a.clone(), None, None).await.expect("a");
-        c.create(b.clone(), None, None).await.expect("b");
+        c.create(a.clone(), None, None, None).await.expect("a");
+        c.create(b.clone(), None, None, None).await.expect("b");
         c.push_user(&a, "x".into()).await.expect("a push");
         c.push_user(&b, "y".into()).await.expect("b push");
         c.reset_all().await;
@@ -546,8 +575,8 @@ mod tests {
         let c = Chats::with_default_model(Some("m".into()));
         let a = ChatId::new("a");
         let b = ChatId::new("b");
-        c.create(a.clone(), None, None).await.expect("a");
-        c.create(b.clone(), None, None).await.expect("b");
+        c.create(a.clone(), None, None, None).await.expect("a");
+        c.create(b.clone(), None, None, None).await.expect("b");
         let _t1 = c.begin_turn(&a).await.expect("a first");
         // Same chat → busy.
         let busy = c.begin_turn(&a).await.expect_err("a busy");
@@ -561,8 +590,8 @@ mod tests {
         let c = Chats::with_default_model(Some("m".into()));
         let a = ChatId::new("a");
         let b = ChatId::new("b");
-        c.create(a.clone(), None, None).await.expect("a");
-        c.create(b.clone(), None, None).await.expect("b");
+        c.create(a.clone(), None, None, None).await.expect("a");
+        c.create(b.clone(), None, None, None).await.expect("b");
         let ta = c.begin_turn(&a).await.expect("a");
         let tb = c.begin_turn(&b).await.expect("b");
         assert!(c.interrupt(&a).await);
@@ -575,8 +604,8 @@ mod tests {
         let c = Chats::with_default_model(Some("m".into()));
         let a = ChatId::new("a");
         let b = ChatId::new("b");
-        c.create(a.clone(), None, None).await.expect("a");
-        c.create(b.clone(), None, None).await.expect("b");
+        c.create(a.clone(), None, None, None).await.expect("a");
+        c.create(b.clone(), None, None, None).await.expect("b");
         let ta = c.begin_turn(&a).await.expect("a");
         let tb = c.begin_turn(&b).await.expect("b");
         c.interrupt_all().await;
@@ -588,7 +617,7 @@ mod tests {
     async fn create_with_explicit_model_overrides_default() {
         let c = Chats::with_default_model(Some("default".into()));
         let id = ChatId::new("a");
-        c.create(id.clone(), Some("explicit".into()), None)
+        c.create(id.clone(), Some("explicit".into()), None, None)
             .await
             .expect("create");
         assert_eq!(c.model(&id).await.expect("model"), "explicit");
@@ -599,8 +628,8 @@ mod tests {
         let c = Chats::with_default_model(Some("default".into()));
         let a = ChatId::new("a");
         let b = ChatId::new("b");
-        c.create(a.clone(), None, None).await.expect("a");
-        c.create(b.clone(), None, None).await.expect("b");
+        c.create(a.clone(), None, None, None).await.expect("a");
+        c.create(b.clone(), None, None, None).await.expect("b");
         c.set_chat_model(&a, "new".into()).await.expect("set a");
         assert_eq!(c.model(&a).await.expect("a"), "new");
         assert_eq!(c.model(&b).await.expect("b"), "default");
@@ -628,7 +657,7 @@ mod tests {
     async fn record_turn_accumulates_per_chat() {
         let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("a");
-        c.create(id.clone(), None, None).await.expect("create");
+        c.create(id.clone(), None, None, None).await.expect("create");
         c.record_turn(&id, Some("qwen"), 100, 50, 1234)
             .await
             .expect("first");
@@ -649,7 +678,7 @@ mod tests {
     async fn push_assistant_tool_calls_and_tool_result_round_trip() {
         let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("a");
-        c.create(id.clone(), None, None).await.expect("create");
+        c.create(id.clone(), None, None, None).await.expect("create");
         c.push_user(&id, "hi".into()).await.expect("u");
         let calls = vec![ToolCall {
             id: "call_1".into(),
@@ -678,8 +707,8 @@ mod tests {
     #[tokio::test]
     async fn ids_returns_every_live_chat() {
         let c = Chats::with_default_model(Some("m".into()));
-        c.create(ChatId::new("a"), None, None).await.expect("a");
-        c.create(ChatId::new("b"), None, None).await.expect("b");
+        c.create(ChatId::new("a"), None, None, None).await.expect("a");
+        c.create(ChatId::new("b"), None, None, None).await.expect("b");
         let mut ids = c.ids().await;
         ids.sort();
         assert_eq!(ids, vec![ChatId::new("a"), ChatId::new("b")]);
@@ -720,7 +749,7 @@ mod tests {
     async fn set_tools_enabled_flips_per_chat_flag() {
         let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("a");
-        c.create(id.clone(), None, None).await.expect("create");
+        c.create(id.clone(), None, None, None).await.expect("create");
         assert!(c.tools_enabled(&id).await.expect("on"));
         c.set_tools_enabled(&id, false).await.expect("flip off");
         assert!(!c.tools_enabled(&id).await.expect("off"));

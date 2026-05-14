@@ -39,9 +39,14 @@ local session_config  = require("lib.session_config")
 local state = {
   -- Orchestrator config — mutated by configure() / chat.model.set.
   config = {
-    provider = "ollama",
-    model    = nil,
-    system   = nil,
+    provider       = "ollama",
+    model          = nil,
+    system         = nil,
+    -- Optional list of tool names the lead's chat is allowed to see in
+    -- its catalog. nil = no filter (advertise the full catalog). Set in
+    -- starter/init.lua to lead_role.ORCHESTRATION_TOOLS so the lead
+    -- can't call reasoner-graph internals like `spawn_graph` directly.
+    tool_allowlist = nil,
   },
 
   current_run_id = nil,         ---@type string|nil
@@ -131,15 +136,12 @@ end
 local function submit_orchestrator_run(user_text)
   if state.current_run_id ~= nil then return nil end
 
-  local g = topology.build_orchestrator_graph({
+  local g = graph_lib.build_orchestrator_graph({
     provider       = state.config.provider,
     model          = state.config.model,
     system         = state.config.system,
     user_text      = user_text or "",
     tool_allowlist = state.config.tool_allowlist,
-    provider_out   = generic_provider.PROVIDER_OUT,
-    final_answer   = generic_provider.FINAL_ANSWER,
-    tool_calls     = generic_tool.TOOL_CALLS,
   })
 
   if type(state.current_state) == "table"
@@ -898,6 +900,14 @@ function M.configure(opts)
   if type(opts.system) == "string" and #opts.system > 0 then
     state.config.system = opts.system
   end
+  -- tool_allowlist: list of tool names the lead's chat catalog is
+  -- restricted to (forwarded as `chat.create.tools = <names>` via the
+  -- orchestrator's wrap-node args). Nil disables the filter — the lead
+  -- sees the full advertised catalog. Empty table means "no tools" at
+  -- all (every name filtered out); pass `nil` if you want unrestricted.
+  if type(opts.tool_allowlist) == "table" then
+    state.config.tool_allowlist = opts.tool_allowlist
+  end
 end
 
 -- Inspectors / mutators used by per-plugin wrappers + resident
@@ -938,15 +948,12 @@ function M.current_state() return state.current_state end
 -- Back-compat with agentic_workflow.build_template (used by tests).
 function M.build_template(user_text, opts)
   opts = opts or {}
-  return topology.build_orchestrator_graph({
+  return graph_lib.build_orchestrator_graph({
     provider       = opts.provider       or state.config.provider,
     model          = opts.model          or state.config.model,
     system         = opts.system         or state.config.system,
     user_text      = user_text or "",
     tool_allowlist = opts.tool_allowlist or state.config.tool_allowlist,
-    provider_out   = generic_provider.PROVIDER_OUT,
-    final_answer   = generic_provider.FINAL_ANSWER,
-    tool_calls     = generic_tool.TOOL_CALLS,
   })
 end
 
@@ -1146,7 +1153,7 @@ M.send_msg    = function(_) end  -- no internal-output translation
 M._internals  = {
   state = state,
   reset = function()
-    state.config = { provider = "ollama", model = nil, system = nil }
+    state.config = { provider = "ollama", model = nil, system = nil, tool_allowlist = nil }
     state.current_run_id = nil
     state.current_state = nil
     state.deferred_queue = {}

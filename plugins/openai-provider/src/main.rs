@@ -285,15 +285,40 @@ async fn dispatch_event(
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned);
-            let tools_enabled = body.get("tools").and_then(Value::as_bool);
+            // `tools` accepts two shapes:
+            //   - bool      → on/off switch (existing semantics).
+            //                 false = omit tools array entirely.
+            //   - [string]  → per-chat name allowlist. The catalog stays
+            //                 process-wide; this filters which entries
+            //                 the chat sees in its per-turn `tools` array.
+            //                 Used by the lead orchestrator (limited to
+            //                 orchestration tools) and the agent reasoner
+            //                 (limited to per-role tool surface).
+            // The two are independent: an array implicitly means "tools
+            // on" (we don't accept the array AND tools_enabled=false on
+            // the same envelope; the array wins). Anything else is
+            // ignored — same as before.
+            let tools_field = body.get("tools");
+            let tools_enabled = tools_field.and_then(Value::as_bool);
+            let tool_allowlist: Option<Vec<String>> = tools_field
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                });
             tracing::info!(
                 target: "openai_provider::chat",
                 chat_id = %chat_id,
                 model = ?model,
                 tools_enabled = ?tools_enabled,
+                tool_allowlist_len = tool_allowlist.as_ref().map(Vec::len),
                 "chat.create",
             );
-            match chats.create(chat_id.clone(), model, tools_enabled).await {
+            match chats
+                .create(chat_id.clone(), model, tools_enabled, tool_allowlist)
+                .await
+            {
                 Ok(()) => {
                     send_event(out_tx, chat_created_body(config, &chat_id)).await?;
                 }
@@ -701,6 +726,14 @@ fn spawn_turn(
             // a lazy capability cache populated reactively on the first
             // 400 we see for each model.
             let model_tools_supported = chats.model_supports_tools(&active_model).await;
+            // Per-chat tool allowlist (set on chat.create via `tools` as
+            // a string array). When `Some`, restrict catalog + extra_tools
+            // to entries whose function.name is in the list. None = no
+            // filter (the chat sees the full set). Used by the lead
+            // orchestrator and the agent reasoner to scope each chat's
+            // tool surface; the catalog itself remains process-wide.
+            let chat_tool_allowlist =
+                chats.tool_allowlist(&chat_id).await.unwrap_or(None);
             let mut tools_array = if chat_tools_on && model_tools_supported {
                 catalog.to_openai_tools().await
             } else {
@@ -716,6 +749,25 @@ fn spawn_turn(
             // at all in that case).
             if chat_tools_on && model_tools_supported && !extra_tools.is_empty() {
                 tools_array.extend(extra_tools.iter().cloned());
+            }
+            // Apply the per-chat allowlist to the assembled tools_array.
+            // Filtering happens AFTER extra_tools are appended so a
+            // caller that wanted `finalize` injected per firing must
+            // also include `finalize` in the chat's allowlist. The
+            // agent reasoner already does this (the Lua side appends
+            // FINALIZE_NAME to the advertised list before sending
+            // chat.create); the lead orchestrator's allowlist
+            // intentionally excludes finalize because the lead
+            // terminates by stopping tool calls, not by calling a
+            // synthetic terminator.
+            if let Some(names) = &chat_tool_allowlist {
+                tools_array.retain(|t| {
+                    let name = t
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str);
+                    matches!(name, Some(n) if names.iter().any(|allowed| allowed == n))
+                });
             }
             let tools_slice: Option<&[serde_json::Value]> = if tools_array.is_empty() {
                 None
@@ -2674,7 +2726,7 @@ mod tests {
         let client = reqwest::Client::builder().build().expect("client");
 
         chats
-            .create(ChatId::new("c-1"), None, None)
+            .create(ChatId::new("c-1"), None, None, None)
             .await
             .expect("seed");
 
@@ -2718,7 +2770,7 @@ mod tests {
         let client = reqwest::Client::builder().build().expect("client");
 
         chats
-            .create(ChatId::new("c-1"), None, None)
+            .create(ChatId::new("c-1"), None, None, None)
             .await
             .expect("seed");
 
@@ -3227,6 +3279,209 @@ mod tests {
         );
     }
 
+    /// Per-chat tool-name allowlist regression: when `chat.create.tools`
+    /// is an array of strings, the per-turn upstream request body's
+    /// `tools` array MUST be filtered to entries whose function.name is
+    /// in the list. Catalog entries outside the list are dropped.
+    ///
+    /// Drives the lead-orchestrator runtime fix — pre-fix the lead's
+    /// chat advertised the full catalog (including reasoner-graph
+    /// internals like `spawn_graph`), so the model would happily call
+    /// `spawn_graph` directly and bottom out in `reasoner '<role>' not
+    /// connected`. The allowlist is the substrate that prevents the
+    /// model from ever seeing names it shouldn't call.
+    ///
+    /// Drive: register two tools in the catalog (`read_file`,
+    /// `spawn_graph`); chat.create with `tools = ["read_file"]`;
+    /// chat.complete. Capture the upstream request body and assert
+    /// `read_file` is present and `spawn_graph` is absent.
+    #[tokio::test]
+    async fn chat_create_tools_string_array_filters_per_turn_tools_array() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let captured: std::sync::Arc<tokio::sync::Mutex<String>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let captured_clone = captured.clone();
+
+        let _server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 8192];
+            let mut acc = String::new();
+            loop {
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if let Some(headers_end) = acc.find("\r\n\r\n") {
+                    let cl: usize = acc
+                        .lines()
+                        .find_map(|l| {
+                            l.strip_prefix("content-length:")
+                                .or_else(|| l.strip_prefix("Content-Length:"))
+                        })
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    let body_so_far = acc.len() - (headers_end + 4);
+                    if body_so_far >= cl {
+                        break;
+                    }
+                }
+            }
+            if let Some(idx) = acc.find("\r\n\r\n") {
+                *captured_clone.lock().await = acc[idx + 4..].to_owned();
+            }
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n\
+                        data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n\
+                        data: [DONE]\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = s.write_all(response.as_bytes()).await;
+            let _ = s.shutdown().await;
+        });
+
+        let (auth, tx, mut rx) = auth_test_rig(Some("envkey"));
+        let chats = fresh_chats("test-model");
+        let catalog = Arc::new(ToolCatalog::new());
+        // Seed two tools: only `read_file` is in the chat's allowlist;
+        // `spawn_graph` is in the catalog but must be filtered out.
+        catalog
+            .register_from(
+                "basic-tools",
+                vec![
+                    openai_provider::catalog::ToolSpec {
+                        name: "read_file".into(),
+                        description: "Read a file.".into(),
+                        parameters: serde_json::json!({"type":"object"}),
+                    },
+                    openai_provider::catalog::ToolSpec {
+                        name: "spawn_graph".into(),
+                        description: "Reasoner-graph internal.".into(),
+                        parameters: serde_json::json!({"type":"object"}),
+                    },
+                ],
+            )
+            .await;
+        let broker = Arc::new(ToolBroker::new());
+        let mut config = cfg("ollama");
+        config.base_url = format!("http://{}", addr);
+        let client = reqwest::Client::builder().build().expect("client");
+
+        // 1. chat.create with `tools = ["read_file"]`.
+        let create_body = make_event_body(
+            "ollama.chat.create",
+            &[
+                ("chat_id", Value::String("c-allow".into())),
+                (
+                    "tools",
+                    Value::Array(vec![Value::String("read_file".into())]),
+                ),
+            ],
+        );
+        dispatch_event(
+            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &from_plugin("reasoner-graph"),
+            &create_body,
+        )
+        .await
+        .expect("create");
+
+        // 2. chat.append { role=user }.
+        let append_body = make_event_body(
+            "ollama.chat.append",
+            &[
+                ("chat_id", Value::String("c-allow".into())),
+                (
+                    "message",
+                    serde_json::json!({"role": "user", "content": "go"}),
+                ),
+            ],
+        );
+        dispatch_event(
+            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &from_plugin("reasoner-graph"),
+            &append_body,
+        )
+        .await
+        .expect("append");
+
+        // 3. chat.complete (no extra_tools).
+        let complete_body = make_event_body(
+            "ollama.chat.complete",
+            &[("chat_id", Value::String("c-allow".into()))],
+        );
+        dispatch_event(
+            &chats, &auth, &catalog, &broker, &config, &client, &tx,
+            &from_plugin("reasoner-graph"),
+            &complete_body,
+        )
+        .await
+        .expect("complete");
+
+        // 4. Wait for chat.complete.result.
+        let mut saw_complete_result = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Ok(msg) = rx.try_recv() {
+                let line = msg.to_line();
+                let v: Value = serde_json::from_str(&line).expect("json");
+                if let Some(body) = v.get("body").and_then(Value::as_object) {
+                    if body.get("kind").and_then(Value::as_str)
+                        == Some("ollama.chat.complete.result")
+                    {
+                        saw_complete_result = true;
+                        break;
+                    }
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        assert!(
+            saw_complete_result,
+            "chat.complete.result must arrive after the SSE server closes",
+        );
+
+        // 5. Inspect the captured upstream body — only `read_file`
+        //    should be present in the tools array. `spawn_graph` MUST
+        //    have been filtered.
+        let body = captured.lock().await.clone();
+        assert!(
+            !body.is_empty(),
+            "server must have captured a request body",
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&body).expect("upstream request body json");
+        let tools = v
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .expect("upstream request body must include `tools`");
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| {
+                t.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .collect();
+        assert!(
+            names.contains(&"read_file"),
+            "allowed tool `read_file` must be present in upstream tools; saw {names:?}",
+        );
+        assert!(
+            !names.contains(&"spawn_graph"),
+            "filtered tool `spawn_graph` MUST be absent from upstream tools; saw {names:?}",
+        );
+    }
+
     #[tokio::test]
     async fn chat_delete_removes_chat_and_emits_deleted() {
         let (auth, tx, mut rx) = auth_test_rig(None);
@@ -3237,7 +3492,7 @@ mod tests {
         let client = reqwest::Client::builder().build().expect("client");
 
         chats
-            .create(ChatId::new("c-1"), None, None)
+            .create(ChatId::new("c-1"), None, None, None)
             .await
             .expect("seed");
 
@@ -3314,8 +3569,8 @@ mod tests {
     #[tokio::test]
     async fn two_concurrent_chats_have_independent_histories() {
         let chats = fresh_chats("m");
-        chats.create(ChatId::new("a"), None, None).await.expect("a");
-        chats.create(ChatId::new("b"), None, None).await.expect("b");
+        chats.create(ChatId::new("a"), None, None, None).await.expect("a");
+        chats.create(ChatId::new("b"), None, None, None).await.expect("b");
         chats
             .push_user(&ChatId::new("a"), "alpha".into())
             .await
@@ -3486,8 +3741,8 @@ mod tests {
 
         let id_a = ChatId::new("chat-1");
         let id_b = ChatId::new("chat-2");
-        chats.create(id_a.clone(), None, None).await.expect("a");
-        chats.create(id_b.clone(), None, None).await.expect("b");
+        chats.create(id_a.clone(), None, None, None).await.expect("a");
+        chats.create(id_b.clone(), None, None, None).await.expect("b");
         let tok_a = chats.begin_turn(&id_a).await.expect("begin a");
         let tok_b = chats.begin_turn(&id_b).await.expect("begin b");
 
@@ -3528,8 +3783,8 @@ mod tests {
 
         let id_a = ChatId::new("chat-1");
         let id_b = ChatId::new("chat-2");
-        chats.create(id_a.clone(), None, None).await.expect("a");
-        chats.create(id_b.clone(), None, None).await.expect("b");
+        chats.create(id_a.clone(), None, None, None).await.expect("a");
+        chats.create(id_b.clone(), None, None, None).await.expect("b");
         let tok_a = chats.begin_turn(&id_a).await.expect("begin a");
         let tok_b = chats.begin_turn(&id_b).await.expect("begin b");
 
@@ -3560,8 +3815,8 @@ mod tests {
 
         let id_a = ChatId::new("chat-1");
         let id_b = ChatId::new("chat-2");
-        chats.create(id_a.clone(), None, None).await.expect("a");
-        chats.create(id_b.clone(), None, None).await.expect("b");
+        chats.create(id_a.clone(), None, None, None).await.expect("a");
+        chats.create(id_b.clone(), None, None, None).await.expect("b");
         let tok_a = chats.begin_turn(&id_a).await.expect("begin a");
         let tok_b = chats.begin_turn(&id_b).await.expect("begin b");
 
