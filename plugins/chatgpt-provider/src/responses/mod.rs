@@ -42,7 +42,8 @@ use crate::error::ChatgptError;
 
 /// Minimal subset of the model metadata returned by
 /// `GET /models`. The real `ModelInfo` codex defines has 30+ fields;
-/// nefor only needs the user-facing identity and ordering hints.
+/// nefor only needs the user-facing identity, ordering hints, and the
+/// capability bits we actually act on (reasoning today; more later).
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ModelEntry {
     pub slug: String,
@@ -54,6 +55,15 @@ pub struct ModelEntry {
     /// backend may omit it for some tiers.
     #[serde(default)]
     pub priority: Option<i32>,
+    /// Whether this model accepts the `reasoning.summary` parameter on
+    /// the Responses endpoint. The Codex backend is the authoritative
+    /// source — some gpt-5 family slugs (`gpt-5.3-codex-spark`) reject
+    /// it even though the slug prefix would suggest support. Default
+    /// `false` so an unknown / missing field never tries to send the
+    /// param: the worst case is a model that COULD reason without a
+    /// summary visible, which is strictly safer than a 400.
+    #[serde(default)]
+    pub supports_reasoning_summaries: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -557,5 +567,51 @@ mod retry_tests {
             started,
             Duration::from_millis(RETRY_BUDGET_MS + 1_000),
         ));
+    }
+}
+
+#[cfg(test)]
+mod model_entry_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn model_entry_deserialises_supports_reasoning_summaries() {
+        let v = json!({
+            "slug": "gpt-5",
+            "display_name": "GPT-5",
+            "priority": 10,
+            "supports_reasoning_summaries": true,
+        });
+        let m: ModelEntry = serde_json::from_value(v).expect("decode");
+        assert_eq!(m.slug, "gpt-5");
+        assert!(m.supports_reasoning_summaries);
+    }
+
+    #[test]
+    fn model_entry_defaults_reasoning_to_false_when_absent() {
+        // Backend omitting the field MUST default to false so a missing
+        // capability never accidentally activates reasoning.
+        let v = json!({ "slug": "mystery-model" });
+        let m: ModelEntry = serde_json::from_value(v).expect("decode");
+        assert!(!m.supports_reasoning_summaries);
+    }
+
+    #[test]
+    fn model_entry_tolerates_unknown_fields_alongside_known_ones() {
+        // The real ModelInfo has 30+ fields; we deserialise a subset.
+        // Unknown fields must not break decoding.
+        let v = json!({
+            "slug": "gpt-5.3-codex-spark",
+            "display_name": "Codex Spark",
+            "priority": 5,
+            "supports_reasoning_summaries": false,
+            "supports_parallel_tool_calls": true,
+            "shell_type": "default",
+            "visibility": "public",
+        });
+        let m: ModelEntry = serde_json::from_value(v).expect("decode");
+        assert_eq!(m.slug, "gpt-5.3-codex-spark");
+        assert!(!m.supports_reasoning_summaries);
     }
 }

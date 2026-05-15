@@ -15,11 +15,6 @@ use clap::{Parser, Subcommand};
 /// Default plugin identity / event-kind prefix.
 pub const DEFAULT_PROVIDER_NAME: &str = "chatgpt";
 
-/// Internal fallback model id used when a `chat.create` arrives with
-/// no `model` field set. Not a CLI flag — the user's selection via
-/// `/model` overrides this.
-pub const DEFAULT_MODEL: &str = "gpt-5-codex";
-
 /// Default base URL for the Responses endpoint on the ChatGPT-
 /// subscription path. Overridable via `--base-url` so tests can point
 /// at a wiremock instance.
@@ -67,10 +62,6 @@ pub struct LoginArgs {
 pub struct ServeArgs {
     pub provider_name: String,
     pub base_url: String,
-    /// Internal default for chats that don't pin their own model. The
-    /// real model list is fetched from `/models` at runtime; this is
-    /// the fallback used when the user hasn't picked yet.
-    pub model: String,
 }
 
 impl ServeArgs {
@@ -86,7 +77,6 @@ impl From<&Cli> for ServeArgs {
         Self {
             provider_name: cli.provider_name.clone(),
             base_url: cli.base_url.clone(),
-            model: DEFAULT_MODEL.to_string(),
         }
     }
 }
@@ -132,7 +122,6 @@ mod tests {
         let cli = Cli::try_parse_from(["chatgpt-provider", "--name", "alt"]).expect("parse");
         let serve: ServeArgs = (&cli).into();
         assert_eq!(serve.provider_name, "alt");
-        assert_eq!(serve.model, DEFAULT_MODEL);
         assert_eq!(serve.event_prefix(), "alt.");
     }
 }

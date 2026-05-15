@@ -25,7 +25,9 @@ fn dummy_tokens() -> TokenData {
 
 #[tokio::test]
 async fn chats_and_catalog_and_broker_compose_for_a_tool_turn_shape() {
-    let chats = Arc::new(Chats::with_default_model(Some("gpt-5-codex".into())));
+    // No baked-in default model — production startup ships with None.
+    // The test passes an explicit per-chat model into `create()` instead.
+    let chats = Arc::new(Chats::with_default_model(None));
     let catalog = Arc::new(ToolCatalog::new());
     let broker = Arc::new(ToolBroker::new());
 
@@ -52,7 +54,7 @@ async fn chats_and_catalog_and_broker_compose_for_a_tool_turn_shape() {
     // 2. chat is created and a user message is appended.
     let chat_id = ChatId::new("c1");
     chats
-        .create(chat_id.clone(), None, None, None, None)
+        .create(chat_id.clone(), Some("test-model".into()), None, None, None)
         .await
         .expect("create");
     chats
@@ -139,15 +141,15 @@ async fn auth_store_apply_error_marks_error_state() {
 
 #[tokio::test]
 async fn interrupt_only_cancels_named_chat() {
-    let chats = Arc::new(Chats::with_default_model(Some("gpt-5-codex".into())));
+    let chats = Arc::new(Chats::with_default_model(None));
     let a = ChatId::new("a");
     let b = ChatId::new("b");
     chats
-        .create(a.clone(), None, None, None, None)
+        .create(a.clone(), Some("test-model".into()), None, None, None)
         .await
         .expect("a");
     chats
-        .create(b.clone(), None, None, None, None)
+        .create(b.clone(), Some("test-model".into()), None, None, None)
         .await
         .expect("b");
     let ta = chats.begin_turn(&a).await.expect("a");
@@ -159,10 +161,10 @@ async fn interrupt_only_cancels_named_chat() {
 
 #[tokio::test]
 async fn chat_snapshot_carries_history_for_translator_use() {
-    let chats = Arc::new(Chats::with_default_model(Some("gpt-5-codex".into())));
+    let chats = Arc::new(Chats::with_default_model(None));
     let id = ChatId::new("a");
     chats
-        .create(id.clone(), None, Some("system prompt".into()), None, None)
+        .create(id.clone(), Some("test-model".into()), Some("system prompt".into()), None, None)
         .await
         .expect("create");
     chats.push_user(&id, "hello".into()).await.expect("user");

@@ -220,6 +220,12 @@ pub enum ChatsError {
     NotFound(ChatId),
     #[error("chat `{0}` is busy")]
     Busy(ChatId),
+    #[error(
+        "no model configured: pass `model` in chat.create or set the \
+         provider default via model.set (the user picks via `/model` in \
+         the chat surface)"
+    )]
+    NoModelConfigured,
 }
 
 /// Snapshot of a chat's state at the moment a turn starts. Carries
@@ -234,10 +240,32 @@ pub struct ChatSnapshot {
     pub tool_overrides: Option<Vec<crate::catalog::ToolSpec>>,
 }
 
+/// Per-slug capability bits learned from the backend's /models
+/// response. Populated by `Chats::record_model_capabilities` whenever
+/// the dispatcher fetches /models. Authoritative source for "does
+/// this model accept the reasoning.summary parameter on /responses".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelCapabilities {
+    pub supports_reasoning_summaries: bool,
+}
+
 #[derive(Default)]
 pub struct Chats {
     default_model: Mutex<Option<String>>,
     inner: Mutex<HashMap<ChatId, ChatState>>,
+    /// Per-model capability cache populated from /models. Populated
+    /// authoritatively by `record_model_capabilities`. When a model is
+    /// absent from this map (we haven't fetched /models yet, or the
+    /// model came in via `model.set` without going through /models),
+    /// the dispatcher's static heuristic is the fallback.
+    capabilities: Mutex<HashMap<String, ModelCapabilities>>,
+    /// Per-model "reasoning unsupported" override populated reactively
+    /// when a 400 from /responses reports `reasoning.summary` (or any
+    /// `reasoning.*`) as an unsupported parameter — defense in depth
+    /// for slugs the /models response says CAN reason but the live
+    /// endpoint disagrees with. Idempotent insert. Mirrors
+    /// openai-provider's `mark_model_tools_unsupported` pattern.
+    reasoning_unsupported: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Chats {
@@ -249,7 +277,53 @@ impl Chats {
         Self {
             default_model: Mutex::new(model),
             inner: Mutex::new(HashMap::new()),
+            capabilities: Mutex::new(HashMap::new()),
+            reasoning_unsupported: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Replace the per-model capability cache with `entries`. Called
+    /// after a successful /models fetch. Subsequent capability queries
+    /// for slugs not in `entries` fall through to the static-heuristic
+    /// path. Replaces rather than merges so a model that was demoted
+    /// (`supports_reasoning_summaries` flipped from true to false)
+    /// loses the stale "true" on next refresh.
+    pub async fn record_model_capabilities<I>(&self, entries: I)
+    where
+        I: IntoIterator<Item = (String, ModelCapabilities)>,
+    {
+        let mut g = self.capabilities.lock().await;
+        g.clear();
+        for (slug, caps) in entries {
+            g.insert(slug, caps);
+        }
+    }
+
+    /// Authoritative reasoning-summary capability for `model` when we
+    /// have a /models record for it. `None` means "we don't know,
+    /// caller should fall back" (the static heuristic in
+    /// `translator::model_supports_reasoning`).
+    pub async fn model_capability_reasoning(&self, model: &str) -> Option<bool> {
+        self.capabilities
+            .lock()
+            .await
+            .get(model)
+            .map(|c| c.supports_reasoning_summaries)
+    }
+
+    /// Mark a model as rejecting the `reasoning` request block (e.g. a
+    /// non-reasoning member of the gpt-5 family the static heuristic
+    /// can't tell from the slug). Subsequent turns on this model omit
+    /// the reasoning fields. Idempotent.
+    pub async fn mark_model_reasoning_unsupported(&self, model: &str) {
+        self.reasoning_unsupported
+            .lock()
+            .await
+            .insert(model.to_owned());
+    }
+
+    pub async fn model_reasoning_unsupported(&self, model: &str) -> bool {
+        self.reasoning_unsupported.lock().await.contains(model)
     }
 
     pub async fn default_model(&self) -> Option<String> {
@@ -278,12 +352,13 @@ impl Chats {
                 .lock()
                 .await
                 .clone()
-                // ChatId-bearing errors only — falling back here is the
-                // dispatcher's call. A missing default_model is treated
-                // as "use the spec default": we plumb something so the
-                // chat exists, and per-turn the request can fail
-                // visibly if the model name is rejected upstream.
-                .unwrap_or_else(|| crate::config::DEFAULT_MODEL.to_string()),
+                // No baked-in default. If no per-call `model` was given
+                // AND no provider default has been set (via model.set
+                // from the user's `/model` picker), surface a clear
+                // error rather than guess. The previous code fell back
+                // to a hardcoded `gpt-5-codex` which Codex rejects for
+                // ChatGPT-subscription accounts.
+                .ok_or(ChatsError::NoModelConfigured)?,
         };
         let mut g = self.inner.lock().await;
         if g.contains_key(&id) {
@@ -298,7 +373,9 @@ impl Chats {
     }
 
     /// Idempotent variant used by the legacy default-chat compat path
-    /// (`<prefix>.prompt`).
+    /// (`<prefix>.prompt`). Errors with `NoModelConfigured` when no
+    /// provider default has been set and the caller didn't pre-create
+    /// the chat with an explicit model.
     pub async fn ensure(&self, id: ChatId) -> Result<(), ChatsError> {
         let mut g = self.inner.lock().await;
         if g.contains_key(&id) {
@@ -309,7 +386,7 @@ impl Chats {
             .lock()
             .await
             .clone()
-            .unwrap_or_else(|| crate::config::DEFAULT_MODEL.to_string());
+            .ok_or(ChatsError::NoModelConfigured)?;
         g.insert(id, ChatState::new(model));
         Ok(())
     }
@@ -648,5 +725,84 @@ mod tests {
     fn chat_id_default_for_prefix_strips_trailing_dot() {
         let id = ChatId::default_for_prefix("chatgpt.");
         assert_eq!(id.as_str(), "chatgpt:default");
+    }
+
+    #[tokio::test]
+    async fn create_errors_when_no_model_and_no_default() {
+        // Production startup ships with `with_default_model(None)`. A
+        // `chat.create` without an explicit `model` field MUST error
+        // rather than fall back to a hardcoded string — the user picks
+        // via `/model` and the picker drives `set_default_model`. The
+        // previous code silently filled in `gpt-5-codex`, which the
+        // backend rejects for ChatGPT-subscription accounts.
+        let c = Chats::with_default_model(None);
+        let id = ChatId::new("a");
+        let err = c
+            .create(id, None, None, None, None)
+            .await
+            .expect_err("must reject");
+        assert_eq!(err, ChatsError::NoModelConfigured);
+    }
+
+    #[tokio::test]
+    async fn create_succeeds_with_explicit_model_when_no_default() {
+        let c = Chats::with_default_model(None);
+        let id = ChatId::new("a");
+        c.create(id.clone(), Some("test-model".into()), None, None, None)
+            .await
+            .expect("explicit model wins");
+        let snap = c.snapshot(&id).await.expect("snap");
+        assert_eq!(snap.model, "test-model");
+    }
+
+    #[tokio::test]
+    async fn ensure_errors_when_no_model_and_no_default() {
+        let c = Chats::with_default_model(None);
+        let id = ChatId::new("a");
+        let err = c.ensure(id).await.expect_err("must reject");
+        assert_eq!(err, ChatsError::NoModelConfigured);
+    }
+
+    #[tokio::test]
+    async fn record_model_capabilities_round_trips_reasoning_flag() {
+        let c = Chats::with_default_model(None);
+        c.record_model_capabilities([
+            (
+                "gpt-5".to_string(),
+                ModelCapabilities {
+                    supports_reasoning_summaries: true,
+                },
+            ),
+            (
+                "gpt-5.3-codex-spark".to_string(),
+                ModelCapabilities {
+                    supports_reasoning_summaries: false,
+                },
+            ),
+        ])
+        .await;
+        assert_eq!(c.model_capability_reasoning("gpt-5").await, Some(true));
+        assert_eq!(
+            c.model_capability_reasoning("gpt-5.3-codex-spark").await,
+            Some(false)
+        );
+        // Unknown model → None (caller falls back to static heuristic).
+        assert_eq!(c.model_capability_reasoning("unknown-model").await, None);
+    }
+
+    #[tokio::test]
+    async fn record_model_capabilities_replaces_prior_snapshot() {
+        let c = Chats::with_default_model(None);
+        c.record_model_capabilities([(
+            "gpt-5".to_string(),
+            ModelCapabilities {
+                supports_reasoning_summaries: true,
+            },
+        )])
+        .await;
+        // Refresh: the model disappears from the new list. Stale "true"
+        // must NOT linger.
+        c.record_model_capabilities(std::iter::empty()).await;
+        assert_eq!(c.model_capability_reasoning("gpt-5").await, None);
     }
 }

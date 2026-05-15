@@ -156,7 +156,7 @@ fn tools_to_responses_format_round_trip_through_request() {
     }];
     let tools = tools_to_responses_format(&specs);
     let req = ResponsesApiRequest {
-        model: "gpt-5-codex".into(),
+        model: "test-model".into(),
         instructions: String::new(),
         input: Vec::new(),
         tools,
@@ -187,6 +187,9 @@ fn tools_to_responses_format_round_trip_through_request() {
 
 #[test]
 fn model_reasoning_capability_check_filters_correctly() {
-    assert!(model_supports_reasoning("gpt-5-codex"));
+    // gpt-5 family + o-series → reasoning; others → no.
+    assert!(model_supports_reasoning("gpt-5"));
+    assert!(model_supports_reasoning("gpt-5.5"));
+    assert!(model_supports_reasoning("o3-mini"));
     assert!(!model_supports_reasoning("gpt-4o"));
 }

@@ -241,11 +241,7 @@ fn session_stats_body(args: &ServeArgs, chat_id: &ChatId, stats: &ChatStats) -> 
     make_event(format!("{}session.stats", args.event_prefix()), m)
 }
 
-fn models_listed_body(
-    args: &ServeArgs,
-    models: &[ModelEntry],
-    _current_default: &str,
-) -> Map<String, Value> {
+fn models_listed_body(args: &ServeArgs, models: &[ModelEntry]) -> Map<String, Value> {
     // Flat list of slug strings, matching openai-provider's wire shape
     // so the chat surface's model picker (which calls tostring(m) on
     // each entry) renders cleanly. Display names + descriptions live
@@ -457,11 +453,22 @@ fn spawn_models_fetch(
                     slugs = ?models.iter().map(|m| m.slug.as_str()).collect::<Vec<_>>(),
                     "fetched /models from backend"
                 );
-                let default_model = chats
-                    .default_model()
-                    .await
-                    .unwrap_or_else(|| args.model.clone());
-                let body = models_listed_body(&args, &models, &default_model);
+                // Cache the API-reported capabilities so subsequent
+                // chat.complete turns can decide on reasoning without
+                // re-fetching. The backend is the authoritative source
+                // (the `supports_reasoning_summaries` field tells us
+                // exactly which models accept the parameter).
+                chats
+                    .record_model_capabilities(models.iter().map(|m| {
+                        (
+                            m.slug.clone(),
+                            crate::state::ModelCapabilities {
+                                supports_reasoning_summaries: m.supports_reasoning_summaries,
+                            },
+                        )
+                    }))
+                    .await;
+                let body = models_listed_body(&args, &models);
                 if let Err(e) = send_event(&out_tx, body).await {
                     tracing::warn!(error = %e, "spawn_models_fetch: send_event failed");
                 }
@@ -721,13 +728,10 @@ async fn dispatch_event(
                 // No tokens to authenticate the /models call. Surface an
                 // empty list rather than 401-erroring on the chat surface.
                 tracing::debug!("models.list_requested while not connected; emitting empty list");
-                return send_event(out_tx, models_listed_body(args, &[], &args.model)).await;
+                return send_event(out_tx, models_listed_body(args, &[])).await;
             }
             match responses_client.list_models(&snap).await {
-                Ok(models) => {
-                    let default_model = chats.default_model().await.unwrap_or(args.model.clone());
-                    send_event(out_tx, models_listed_body(args, &models, &default_model)).await
-                }
+                Ok(models) => send_event(out_tx, models_listed_body(args, &models)).await,
                 Err(e) => {
                     let msg = format!("failed to fetch /models: {e}");
                     tracing::warn!(error = %e, "models.list_requested failed");
@@ -1205,7 +1209,27 @@ fn spawn_turn(
                 "Responses request — final payload summary"
             );
 
-            let supports_reasoning = translator::model_supports_reasoning(&snapshot.model);
+            // Reasoning capability resolution, in order of authority:
+            // 1. Runtime no-reasoning override (set on a 400 below)
+            //    always wins — the live endpoint disagreed with us once.
+            // 2. /models capability cache — backend tells us directly
+            //    whether `reasoning.summary` is accepted for this slug.
+            // 3. Static heuristic by slug prefix (gpt-5* / o-series) —
+            //    only used when /models hasn't been fetched yet for
+            //    this model. The /models fetch fires on startup +
+            //    auth.set, so this fallback is rare in practice.
+            let supports_reasoning = if chats
+                .model_reasoning_unsupported(&snapshot.model)
+                .await
+            {
+                false
+            } else if let Some(api) =
+                chats.model_capability_reasoning(&snapshot.model).await
+            {
+                api
+            } else {
+                translator::model_supports_reasoning(&snapshot.model)
+            };
             let include = if supports_reasoning {
                 vec!["reasoning.encrypted_content".to_string()]
             } else {
@@ -1281,6 +1305,27 @@ fn spawn_turn(
                         let _ = out_tx
                             .send(PluginOutgoing::event(auth_status_body(&args, &snap)))
                             .await;
+                    }
+                    // Reactive fallback: some gpt-5-family slugs
+                    // (`gpt-5.3-codex-spark`, etc.) match
+                    // `model_supports_reasoning`'s `gpt-5` prefix but
+                    // reject the `reasoning.summary` parameter the
+                    // request carries. Mark the model and retry the
+                    // same iteration with reasoning disabled; the
+                    // next pass builds the request without it because
+                    // `chats.model_reasoning_unsupported` is now true.
+                    if status == 400
+                        && supports_reasoning
+                        && body_signals_reasoning_unsupported(&body)
+                    {
+                        tracing::info!(
+                            model = %snapshot.model,
+                            body = %snippet(&body),
+                            "model rejected reasoning — falling back to no-reasoning mode for this model",
+                        );
+                        chats.mark_model_reasoning_unsupported(&snapshot.model).await;
+                        iterations = iterations.saturating_sub(1);
+                        continue;
                     }
                     let _ = out_tx
                         .send(PluginOutgoing::event(turn_error_body(
@@ -1702,6 +1747,17 @@ fn snippet(s: &str) -> String {
     }
 }
 
+/// Does a 400 response body indicate the model rejected the `reasoning`
+/// parameter? Codex's backend phrases the failure as
+/// `"Unsupported parameter: 'reasoning.summary' is not supported with
+/// the '<model>' model."` — we substring-match the `reasoning.` prefix
+/// inside an `Unsupported parameter` clause so future reasoning
+/// sub-fields (effort, etc.) trigger the same fallback.
+fn body_signals_reasoning_unsupported(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("unsupported parameter") && lower.contains("reasoning.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1710,7 +1766,6 @@ mod tests {
         ServeArgs {
             provider_name: "chatgpt".into(),
             base_url: "https://example.invalid".into(),
-            model: "gpt-5-codex".into(),
         }
     }
 
@@ -1772,15 +1827,17 @@ mod tests {
                 display_name: Some("GPT-5".into()),
                 description: None,
                 priority: Some(10),
+                supports_reasoning_summaries: true,
             },
             ModelEntry {
                 slug: "gpt-5-codex".into(),
                 display_name: Some("GPT-5 Codex".into()),
                 description: Some("coding model".into()),
                 priority: Some(20),
+                supports_reasoning_summaries: false,
             },
         ];
-        let body = models_listed_body(&args(), &fetched, "gpt-5-codex");
+        let body = models_listed_body(&args(), &fetched);
         let models = body.get("models").and_then(Value::as_array).expect("array");
         let slugs: Vec<&str> = models.iter().filter_map(Value::as_str).collect();
         assert_eq!(slugs, vec!["gpt-5", "gpt-5-codex"]);
@@ -1788,7 +1845,7 @@ mod tests {
 
     #[test]
     fn models_listed_empty_when_no_models_fetched() {
-        let body = models_listed_body(&args(), &[], "gpt-5-codex");
+        let body = models_listed_body(&args(), &[]);
         let models = body.get("models").and_then(Value::as_array).expect("array");
         assert!(models.is_empty());
     }
@@ -1865,5 +1922,47 @@ mod tests {
         b.on_item_done(Some("call_1"), r#"{"a":1}"#);
         let calls = b.into_tool_calls();
         assert_eq!(calls[0].function.arguments, r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn body_signals_reasoning_unsupported_matches_real_400() {
+        let body = r#"{
+  "error": {
+    "message": "Unsupported parameter: 'reasoning.summary' is not supported with the 'gpt-5.3-codex-spark' model.",
+    "type": "invalid_request_error",
+    "param": "reasoning.summary",
+    "code": null
+  }
+}"#;
+        assert!(body_signals_reasoning_unsupported(body));
+    }
+
+    #[test]
+    fn body_signals_reasoning_unsupported_matches_future_subfields() {
+        // Defensive: if the backend ever flags another reasoning.*
+        // subfield as unsupported, the same fallback fires.
+        let body = r#"{"error":{"message":"Unsupported parameter: 'reasoning.effort' is not supported","type":"invalid_request_error"}}"#;
+        assert!(body_signals_reasoning_unsupported(body));
+    }
+
+    #[test]
+    fn body_signals_reasoning_unsupported_ignores_unrelated_400() {
+        let unrelated = r#"{"error":{"message":"No tool call found for function call output with call_id call_X"}}"#;
+        assert!(!body_signals_reasoning_unsupported(unrelated));
+
+        let model_error = r#"{"detail":"The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account."}"#;
+        assert!(!body_signals_reasoning_unsupported(model_error));
+    }
+
+    #[tokio::test]
+    async fn chats_track_reasoning_unsupported_per_model() {
+        let chats = Chats::with_default_model(None);
+        assert!(!chats.model_reasoning_unsupported("gpt-5.3-codex-spark").await);
+        chats
+            .mark_model_reasoning_unsupported("gpt-5.3-codex-spark")
+            .await;
+        assert!(chats.model_reasoning_unsupported("gpt-5.3-codex-spark").await);
+        // Per-model: other models are unaffected.
+        assert!(!chats.model_reasoning_unsupported("gpt-5.5").await);
     }
 }

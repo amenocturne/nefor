@@ -77,7 +77,6 @@ async fn run_serve(args: ServeArgs) -> Result<(), ChatgptError> {
     tracing::info!(
         engine_version = %engine_version,
         provider = %args.provider_name,
-        model = %args.model,
         base_url = %args.base_url,
         "ready"
     );
@@ -91,7 +90,11 @@ async fn run_serve(args: ServeArgs) -> Result<(), ChatgptError> {
     let auth_path = default_auth_path()?;
     let auth = Arc::new(AuthStore::load_from_disk(&auth_path).await?);
 
-    let chats = Arc::new(Chats::with_default_model(Some(args.model.clone())));
+    // No baked-in default model — the user picks via `/model` (or the
+    // engine sends `model.set` on startup); `chat.create` envelopes
+    // typically include `model` explicitly, so this default is only
+    // consulted for the legacy `prompt` compat path.
+    let chats = Arc::new(Chats::with_default_model(None));
     let catalog = Arc::new(ToolCatalog::new());
     let broker = Arc::new(ToolBroker::new());
     let responses_client = Arc::new(ResponsesClient::new(
