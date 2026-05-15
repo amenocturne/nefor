@@ -220,7 +220,9 @@ impl ResponsesClient {
                     let next_delay = retry_delay(attempt, retry_after);
                     if !budget_allows(started, next_delay) {
                         tracing::warn!(
-                            op, attempt = attempt + 1, status,
+                            op,
+                            attempt = attempt + 1,
+                            status,
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             budget_ms = RETRY_BUDGET_MS,
                             "retry budget exhausted; surfacing error",
@@ -229,7 +231,9 @@ impl ResponsesClient {
                     }
                     drop(resp);
                     tracing::warn!(
-                        op, attempt = attempt + 1, status,
+                        op,
+                        attempt = attempt + 1,
+                        status,
                         delay_ms = next_delay.as_millis() as u64,
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "transient HTTP failure; retrying after backoff",
@@ -296,7 +300,9 @@ impl ResponsesClient {
                     let next_delay = retry_delay(attempt, retry_after);
                     if !budget_allows(started, next_delay) {
                         tracing::warn!(
-                            op = "list_models", attempt = attempt + 1, status,
+                            op = "list_models",
+                            attempt = attempt + 1,
+                            status,
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             budget_ms = RETRY_BUDGET_MS,
                             "retry budget exhausted; surfacing error",
@@ -305,7 +311,9 @@ impl ResponsesClient {
                     }
                     drop(resp);
                     tracing::warn!(
-                        op = "list_models", attempt = attempt + 1, status,
+                        op = "list_models",
+                        attempt = attempt + 1,
+                        status,
                         delay_ms = next_delay.as_millis() as u64,
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "transient HTTP failure; retrying after backoff",
@@ -353,7 +361,7 @@ impl ResponsesClient {
 /// means the request itself was bad (model rejected our shape) and a
 /// retry won't help.
 fn is_transient_status(status: u16) -> bool {
-    matches!(status, 502 | 503 | 504)
+    matches!(status, 502..=504)
 }
 
 /// Whether a `reqwest::Error` reflects a transient transport-level
@@ -501,7 +509,10 @@ mod retry_tests {
         assert_eq!(retry_after_seconds(&HeaderMap::new()), None);
 
         let mut h = HeaderMap::new();
-        h.insert(RETRY_AFTER, HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"));
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
+        );
         assert_eq!(retry_after_seconds(&h), None);
     }
 

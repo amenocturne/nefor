@@ -859,15 +859,16 @@ async fn handle_chat_create(
     // objects, which silently produced an empty override and bypassed
     // the catalog — leaving the model with no tools at all.
     let tools_field = body.get("tools");
-    let tool_allowlist: Option<Vec<String>> = if let Some(false) = tools_field.and_then(Value::as_bool) {
-        Some(Vec::new())
-    } else {
-        tools_field.and_then(Value::as_array).map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect()
-        })
-    };
+    let tool_allowlist: Option<Vec<String>> =
+        if let Some(false) = tools_field.and_then(Value::as_bool) {
+            Some(Vec::new())
+        } else {
+            tools_field.and_then(Value::as_array).map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+        };
     let tool_overrides: Option<Vec<crate::catalog::ToolSpec>> = None;
 
     match chats
@@ -1218,14 +1219,9 @@ fn spawn_turn(
             //    only used when /models hasn't been fetched yet for
             //    this model. The /models fetch fires on startup +
             //    auth.set, so this fallback is rare in practice.
-            let supports_reasoning = if chats
-                .model_reasoning_unsupported(&snapshot.model)
-                .await
-            {
+            let supports_reasoning = if chats.model_reasoning_unsupported(&snapshot.model).await {
                 false
-            } else if let Some(api) =
-                chats.model_capability_reasoning(&snapshot.model).await
-            {
+            } else if let Some(api) = chats.model_capability_reasoning(&snapshot.model).await {
                 api
             } else {
                 translator::model_supports_reasoning(&snapshot.model)
@@ -1323,7 +1319,9 @@ fn spawn_turn(
                             body = %snippet(&body),
                             "model rejected reasoning — falling back to no-reasoning mode for this model",
                         );
-                        chats.mark_model_reasoning_unsupported(&snapshot.model).await;
+                        chats
+                            .mark_model_reasoning_unsupported(&snapshot.model)
+                            .await;
                         iterations = iterations.saturating_sub(1);
                         continue;
                     }
@@ -1957,11 +1955,19 @@ mod tests {
     #[tokio::test]
     async fn chats_track_reasoning_unsupported_per_model() {
         let chats = Chats::with_default_model(None);
-        assert!(!chats.model_reasoning_unsupported("gpt-5.3-codex-spark").await);
+        assert!(
+            !chats
+                .model_reasoning_unsupported("gpt-5.3-codex-spark")
+                .await
+        );
         chats
             .mark_model_reasoning_unsupported("gpt-5.3-codex-spark")
             .await;
-        assert!(chats.model_reasoning_unsupported("gpt-5.3-codex-spark").await);
+        assert!(
+            chats
+                .model_reasoning_unsupported("gpt-5.3-codex-spark")
+                .await
+        );
         // Per-model: other models are unaffected.
         assert!(!chats.model_reasoning_unsupported("gpt-5.5").await);
     }

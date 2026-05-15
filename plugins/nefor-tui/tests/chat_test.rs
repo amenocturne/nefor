@@ -2636,21 +2636,16 @@ fn left_column_lifts_input_and_statusline_off_terminal_edges() {
 }
 
 #[test]
-fn slash_model_no_args_fans_out_per_connected_provider_and_opens_popup() {
-    // Legacy spec section 8/12: `/model` with no args
-    //   1) emits one `chat.model.list_requested { provider }` per
-    //      connected provider, and
-    //   2) opens the ModelPicker popup with `awaiting` set to those
-    //      provider names.
-    // The transport adapter rejects requests that don't carry a
-    // `provider` field (see starter/agentic_workflow.lua:1301), so the
-    // fan-out shape is load-bearing — a single un-targeted request
-    // would be dropped on the floor.
+fn slash_model_no_args_fans_out_per_known_provider_and_opens_popup() {
+    // `/model` with no args fans out one `chat.model.list_requested`
+    // per *known* provider (connected or not). Disconnected providers
+    // respond with an empty list but their section still renders so the
+    // user sees what's available behind a login.
     let mut engine = Engine::new(120, 30).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
-    // Two connected providers + one disconnected.
+    // Two connected providers + one login_required.
     dispatch_event(
         &mut engine,
         json!({ "kind": "chat.auth.status", "provider": "ollama", "status": "connected" }),
@@ -2673,8 +2668,8 @@ fn slash_model_no_args_fans_out_per_connected_provider_and_opens_popup() {
     let emits = engine.take_emit_queue();
     assert_eq!(
         emits.len(),
-        2,
-        "should emit exactly one list_requested per CONNECTED provider (not login_required): {emits:?}"
+        3,
+        "should emit one list_requested per known provider (including login_required): {emits:?}"
     );
     let mut providers: Vec<String> = emits
         .iter()
@@ -2686,17 +2681,17 @@ fn slash_model_no_args_fans_out_per_connected_provider_and_opens_popup() {
         })
         .collect();
     providers.sort();
-    assert_eq!(providers, vec!["anthropic", "ollama"]);
+    assert_eq!(providers, vec!["anthropic", "ollama", "openai"]);
 
-    // Popup is now visible.
+    // Popup is now visible with per-provider sections.
     let out = render_str(&mut engine);
     assert!(
         out.contains("pick a model"),
         "ModelPicker popup title not visible: {out:?}"
     );
     assert!(
-        out.contains("loading from 2 provider"),
-        "ModelPicker should show loading footer for awaiting providers: {out:?}"
+        out.contains("anthropic") && out.contains("ollama") && out.contains("openai"),
+        "ModelPicker should show all known providers: {out:?}"
     );
 }
 

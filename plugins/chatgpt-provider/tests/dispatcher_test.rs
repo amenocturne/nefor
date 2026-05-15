@@ -164,7 +164,13 @@ async fn chat_snapshot_carries_history_for_translator_use() {
     let chats = Arc::new(Chats::with_default_model(None));
     let id = ChatId::new("a");
     chats
-        .create(id.clone(), Some("test-model".into()), Some("system prompt".into()), None, None)
+        .create(
+            id.clone(),
+            Some("test-model".into()),
+            Some("system prompt".into()),
+            None,
+            None,
+        )
         .await
         .expect("create");
     chats.push_user(&id, "hello".into()).await.expect("user");
