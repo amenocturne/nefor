@@ -50,7 +50,8 @@ function M.view(opts)
       heights[i] = estimate_height(entries[i])
     end
 
-    local vis = tui.virtual_scroll_prepare(key, n, heights, gap)
+    local has_vsp = type(tui.virtual_scroll_prepare) == "function"
+    local vis = has_vsp and tui.virtual_scroll_prepare(key, n, heights, gap)
     if vis then
       -- Top spacer.
       if vis.top_h > 0 then
