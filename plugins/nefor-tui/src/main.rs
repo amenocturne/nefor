@@ -275,18 +275,22 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
                 // rendering. Without this, rapid scroll/key events each
                 // trigger a full render — the user sees sluggish scroll
                 // that "catches up" instead of responsive movement.
-                use futures::{StreamExt as _, FutureExt as _};
+                // Uses crossterm's synchronous poll/read (not the async
+                // EventStream) to avoid interfering with the stream's
+                // internal escape-sequence parser state.
                 let mut drain_count = 0u32;
                 while drain_count < 64 {
-                    match term_events.next().now_or_never() {
-                        Some(Some(Ok(evt))) => {
-                            apply_term_event(&mut engine, evt)?;
-                            drain_count += 1;
-                        }
-                        Some(Some(Err(e))) => {
-                            tracing::warn!(error = %e, "crossterm event error");
-                            drain_count += 1;
-                        }
+                    match crossterm::event::poll(Duration::ZERO) {
+                        Ok(true) => match crossterm::event::read() {
+                            Ok(evt) => {
+                                apply_term_event(&mut engine, evt)?;
+                                drain_count += 1;
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "crossterm event error");
+                                drain_count += 1;
+                            }
+                        },
                         _ => break,
                     }
                 }

@@ -535,19 +535,15 @@ impl Engine {
                 return Ok(());
             }
             let absorbed = self.try_wheel_scroll(&evt)?;
-            if let Some(notify) = absorbed {
+            if let Some((moved, notify)) = absorbed {
                 if let Some((kind, target_key, offset)) = notify {
-                    // The scrollable absorbed the wheel and configured
-                    // an `on_scroll` callback — emit it so Lua observes
-                    // the new offset. Same `dispatch_msg` path as any
-                    // other engine-originated message.
                     let msg = self.lua().create_table()?;
                     msg.set("kind", kind)?;
                     msg.set("target_key", target_key)?;
                     msg.set("offset", offset)?;
                     self.dispatch_msg(msg)?;
                 }
-                self.needs_render = true;
+                self.needs_render = moved;
                 return Ok(());
             }
         }
@@ -1137,7 +1133,7 @@ impl Engine {
     fn try_wheel_scroll(
         &mut self,
         evt: &MouseMessage,
-    ) -> Result<Option<Option<(String, String, u16)>>, TuiError> {
+    ) -> Result<Option<(bool, Option<(String, String, u16)>)>, TuiError> {
         let delta_rows: i32 = match evt.button {
             Some("up") => -(WHEEL_STEP_ROWS as i32),
             Some("down") => WHEEL_STEP_ROWS as i32,
@@ -1157,23 +1153,21 @@ impl Engine {
             WidgetDescription::Scrollable { on_scroll, .. } => on_scroll.clone(),
             _ => None,
         };
-        let new_offset = match &mut target.state {
+        match &mut target.state {
             InstanceState::Scrollable(s) => {
                 let prev = s.scroll_y;
                 scroll_by_signed(s, delta_rows);
                 if s.scroll_y == prev {
-                    None
-                } else {
-                    Some(s.scroll_y)
+                    return Ok(Some((false, None)));
                 }
+                let notify = match (on_scroll, target_key) {
+                    (Some(kind), Some(key)) => Some((kind, key, s.scroll_y)),
+                    _ => None,
+                };
+                Ok(Some((true, notify)))
             }
-            _ => None,
-        };
-        let notify = match (on_scroll, target_key, new_offset) {
-            (Some(kind), Some(key), Some(offset)) => Some((kind, key, offset)),
-            _ => None,
-        };
-        Ok(Some(notify))
+            _ => Ok(Some((false, None))),
+        }
     }
 
     /// Wheel-on-prompt: when a focused multi-line text_input lives under

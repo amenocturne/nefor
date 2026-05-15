@@ -240,10 +240,9 @@ fn paint_text(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
 /// the glyphs don't touch still get the widget's style so a bg paints
 /// as a solid rectangle.
 fn blank_run(buf: &mut FrameBuffer, row: u16, col_start: u16, width: u16, style: &Style) {
-    let row_idx = row as usize;
-    if row_idx >= buf.lines.len() {
+    let Some(row_idx) = buf.resolve_row(row as usize) else {
         return;
-    }
+    };
     let line = &mut buf.lines[row_idx];
     let start = col_start as usize;
     let end = start.saturating_add(width as usize).min(line.cells.len());
@@ -1643,16 +1642,20 @@ fn paint_scrollable(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer
         (scroll_y, content_height, show_bar, inner_w)
     };
 
-    // Paint the child into a scratch buffer and then copy the visible
-    // viewport window into `out`. The scratch buffer is capped at
-    // `scroll_y + viewport_h` rows — content below the viewport is never
-    // allocated or painted, which keeps memory and CPU bounded by the
-    // viewport size rather than the total content size.
+    // Paint the child into a viewport-sized scratch buffer with a row
+    // offset equal to scroll_y. The child paints as if writing to the
+    // full content height, but the buffer only materializes the visible
+    // window — rows above scroll_y resolve to None (silently dropped),
+    // rows in [scroll_y, scroll_y + viewport_h) map to buffer rows
+    // [0, viewport_h), and rows below overflow the buffer and clip.
+    // This keeps allocation and paint work at O(viewport), independent
+    // of total content size and scroll position.
     let content_w = inner_w;
     let viewport_h = rect.height;
     let scratch_w = content_w.max(1);
-    let scratch_h = (scroll_y + viewport_h).min(content_height).max(1);
-    let mut scratch = FrameBuffer::new(scratch_w, scratch_h);
+    let scratch_h = viewport_h.min(content_height).max(1);
+    let mut scratch =
+        FrameBuffer::with_offset(scratch_w, scratch_h, scroll_y as usize);
     if let Some(child) = inst.children.first_mut() {
         let child_rect = Rect {
             row: 0,
@@ -1663,17 +1666,15 @@ fn paint_scrollable(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer
         paint(child, child_rect, &mut scratch);
     }
 
-    // Copy `[scroll_y, scroll_y + viewport_h)` of `scratch` into `out`.
-    // Rows/cols that fall outside the scratch bounds are blank-filled so
-    // stale content from a prior frame never bleeds through.
+    // Copy the scratch buffer (which contains only the visible window)
+    // directly into the output framebuffer.
     for r in 0..viewport_h as usize {
         let dst_row = rect.row as usize + r;
         if dst_row >= out.lines.len() {
             break;
         }
-        let src_row = scroll_y as usize + r;
         let dst_line = &mut out.lines[dst_row];
-        let src_line = scratch.lines.get(src_row);
+        let src_line = scratch.lines.get(r);
         for col in 0..content_w as usize {
             let dst_col = rect.col as usize + col;
             if dst_col >= dst_line.cells.len() {
@@ -2028,10 +2029,9 @@ fn write_styled_row(
     max_width: u16,
     line: &[StyledChar],
 ) {
-    let row_idx = row as usize;
-    if row_idx >= buf.lines.len() {
+    let Some(row_idx) = buf.resolve_row(row as usize) else {
         return;
-    }
+    };
     let line_buf = &mut buf.lines[row_idx];
     let limit = max_width as usize;
     let mut col = col_start as usize;
@@ -2210,10 +2210,9 @@ fn char_width(c: char) -> usize {
 }
 
 fn write_run(buf: &mut FrameBuffer, row: u16, col_start: u16, text: &str, style: &Style) {
-    let row_idx = row as usize;
-    if row_idx >= buf.lines.len() {
+    let Some(row_idx) = buf.resolve_row(row as usize) else {
         return;
-    }
+    };
     let line = &mut buf.lines[row_idx];
     let mut col = col_start as usize;
     for ch in text.chars() {

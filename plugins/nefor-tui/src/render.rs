@@ -86,16 +86,45 @@ impl Line {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameBuffer {
     pub lines: Vec<Line>,
+    /// Row offset for viewport-clipped scratch buffers. When non-zero,
+    /// paint calls that target `row_idx` actually write to
+    /// `lines[row_idx - row_offset]`. Rows below the offset are silently
+    /// dropped (above the visible window). Default 0 for normal buffers.
+    pub row_offset: usize,
 }
 
 impl FrameBuffer {
     pub fn new(width: u16, height: u16) -> Self {
         FrameBuffer {
             lines: (0..height as usize).map(|_| Line::blank(width)).collect(),
+            row_offset: 0,
+        }
+    }
+
+    pub fn with_offset(width: u16, height: u16, row_offset: usize) -> Self {
+        FrameBuffer {
+            lines: (0..height as usize).map(|_| Line::blank(width)).collect(),
+            row_offset,
+        }
+    }
+
+    /// Translate a content-space row index to a buffer-space index.
+    /// Returns `None` if the row is outside the buffer window.
+    #[inline]
+    pub fn resolve_row(&self, row: usize) -> Option<usize> {
+        if row < self.row_offset {
+            return None;
+        }
+        let local = row - self.row_offset;
+        if local < self.lines.len() {
+            Some(local)
+        } else {
+            None
         }
     }
 
     fn reset(&mut self, width: u16, height: u16) {
+        self.row_offset = 0;
         if self.lines.len() != height as usize
             || self.lines.first().map(|l| l.cells.len()).unwrap_or(0) != width as usize
         {
