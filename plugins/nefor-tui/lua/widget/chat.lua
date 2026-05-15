@@ -62,33 +62,73 @@ function M.view(opts)
   local n = #entries
   for idx = n + 1, #hcache do hcache[idx] = nil end
 
-  -- Walk entries, accumulate y positions, decide visible window.
-  -- The buffer zone renders 2× viewport above and below the visible
-  -- area so the user can scroll a full page without hitting placeholders.
+  -- Two-pass viewport windowing: first pass computes cumulative y
+  -- positions and identifies the visible entry range. Second pass emits
+  -- at most 3 children: a top spacer (one widget for all above-viewport
+  -- entries), the visible entries, and a bottom spacer. This keeps the
+  -- column's child count at O(viewport) instead of O(total_entries),
+  -- so the Rust reconciler + flex_layout stay fast regardless of
+  -- transcript length.
   local buffer = viewport_h * 2
   local vis_top = scroll_y - buffer
   local vis_bot = scroll_y + viewport_h + buffer
 
-  local widgets = {}
+  local heights = {}
+  local cumul   = {}
   local y = 0
   for i = 1, n do
     local h = hcache[i] or estimate_height(entries[i])
-    local entry_bot = y + h
-    if entry_bot >= vis_top and y <= vis_bot then
-      local w = opts.render_entry(entries[i], i, ctx)
-      widgets[#widgets + 1] = w
-      -- After first render, the layout cache keeps the Rust-side size
-      -- stable. Record the heuristic so scrolling reuses it.
-      if not hcache[i] then hcache[i] = h end
-    else
+    if not hcache[i] then hcache[i] = h end
+    heights[i] = h
+    cumul[i]   = y
+    y = y + h + gap
+  end
+
+  local first_vis, last_vis = n + 1, 0
+  for i = 1, n do
+    local entry_top = cumul[i]
+    local entry_bot = entry_top + heights[i]
+    if entry_bot >= vis_top and entry_top <= vis_bot then
+      if i < first_vis then first_vis = i end
+      if i > last_vis  then last_vis  = i end
+    end
+  end
+
+  local widgets = {}
+
+  -- Top spacer: total height of all entries above the visible window.
+  if first_vis > 1 then
+    local top_h = cumul[first_vis]
+    if top_h > 0 then
       widgets[#widgets + 1] = tui.constrained {
-        key = "e" .. i,
-        min_height = h,
-        max_height = h,
+        key = "_top",
+        min_height = top_h,
+        max_height = top_h,
         child = tui.text { content = "" },
       }
     end
-    y = entry_bot + gap
+  end
+
+  -- Visible entries: fully rendered.
+  for i = first_vis, last_vis do
+    if i >= 1 and i <= n then
+      widgets[#widgets + 1] = opts.render_entry(entries[i], i, ctx)
+    end
+  end
+
+  -- Bottom spacer: total height of all entries below the visible window.
+  if last_vis < n then
+    local bot_start = cumul[last_vis] + heights[last_vis] + gap
+    local total_h   = cumul[n] + heights[n]
+    local bot_h     = total_h - bot_start
+    if bot_h > 0 then
+      widgets[#widgets + 1] = tui.constrained {
+        key = "_bot",
+        min_height = bot_h,
+        max_height = bot_h,
+        child = tui.text { content = "" },
+      }
+    end
   end
 
   if opts.append ~= nil then
