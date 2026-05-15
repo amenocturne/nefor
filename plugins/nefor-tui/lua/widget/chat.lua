@@ -17,6 +17,24 @@
 
 local M = {}
 
+-- Per-key height caches. Maps entry index → estimated row count.
+-- Entries outside the visible window are replaced with a spacer of
+-- this height, avoiding render_entry + Rust layout/paint work.
+local height_caches = {}
+
+local function estimate_height(entry)
+  local text = entry.text or ""
+  local len = #text
+  if len == 0 then return 2 end
+  -- Rough heuristic: ~80 chars per wrapped line + overhead for
+  -- markdown structure, code blocks, separators.
+  local lines = math.ceil(len / 80)
+  if entry.kind == "tool_start" or entry.kind == "tool_end" then
+    return math.max(3, lines)
+  end
+  return math.max(2, lines + 2)
+end
+
 function M.view(opts)
   opts = opts or {}
   if type(opts) ~= "table" then
@@ -27,11 +45,52 @@ function M.view(opts)
   end
   local entries = (opts.entries and opts.entries()) or {}
   local ctx = opts.context
+  local key = opts.key or "chat"
+  local gap = opts.gap or 1
+
+  local scroll_y, viewport_h = 0, 100
+  local ok, snap = pcall(tui.scroll_position, key)
+  if ok and snap then
+    scroll_y   = snap.offset or 0
+    viewport_h = snap.viewport_size or 100
+  end
+
+  local hcache = height_caches[key]
+  if not hcache then hcache = {}; height_caches[key] = hcache end
+
+  -- Trim stale cache entries when the entry list shrinks (e.g. /new).
+  local n = #entries
+  for idx = n + 1, #hcache do hcache[idx] = nil end
+
+  -- Walk entries, accumulate y positions, decide visible window.
+  -- The buffer zone renders 2× viewport above and below the visible
+  -- area so the user can scroll a full page without hitting placeholders.
+  local buffer = viewport_h * 2
+  local vis_top = scroll_y - buffer
+  local vis_bot = scroll_y + viewport_h + buffer
 
   local widgets = {}
-  for i, e in ipairs(entries) do
-    widgets[#widgets + 1] = opts.render_entry(e, i, ctx)
+  local y = 0
+  for i = 1, n do
+    local h = hcache[i] or estimate_height(entries[i])
+    local entry_bot = y + h
+    if entry_bot >= vis_top and y <= vis_bot then
+      local w = opts.render_entry(entries[i], i, ctx)
+      widgets[#widgets + 1] = w
+      -- After first render, the layout cache keeps the Rust-side size
+      -- stable. Record the heuristic so scrolling reuses it.
+      if not hcache[i] then hcache[i] = h end
+    else
+      widgets[#widgets + 1] = tui.constrained {
+        key = "e" .. i,
+        min_height = h,
+        max_height = h,
+        child = tui.text { content = "" },
+      }
+    end
+    y = entry_bot + gap
   end
+
   if opts.append ~= nil then
     local extra = opts.append
     if type(extra) == "function" then extra = extra() end
@@ -39,14 +98,14 @@ function M.view(opts)
   end
 
   local padding = opts.padding or { top = 0, right = 1, bottom = 0, left = 0 }
-  local scroll = tui.scrollable {
-    key        = opts.key or "chat",
+  local scroll_widget = tui.scrollable {
+    key        = key,
     stick_to   = opts.stick_to ~= nil and opts.stick_to or "end",
     scrollbar  = "auto",
     selectable = opts.selectable ~= false,
     child      = tui.padding {
       value = padding,
-      child = tui.column { gap = opts.gap or 1, children = widgets },
+      child = tui.column { gap = gap, children = widgets },
     },
   }
 
@@ -54,10 +113,14 @@ function M.view(opts)
     local empty = opts.empty_view
     if type(empty) == "function" then empty = empty() end
     if empty ~= nil then
-      return tui.stack { children = { scroll, empty } }
+      return tui.stack { children = { scroll_widget, empty } }
     end
   end
-  return scroll
+  return scroll_widget
+end
+
+function M.clear_heights(key_name)
+  height_caches[key_name or "chat"] = {}
 end
 
 -- Route scroll keys to tui.scroll_* against the widget's key. Caller
