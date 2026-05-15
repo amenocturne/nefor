@@ -62,9 +62,6 @@ jobs:
           - runner: macos-14
             target: aarch64-apple-darwin
             arch_label: macos-arm64
-          - runner: macos-13
-            target: x86_64-apple-darwin
-            arch_label: macos-x86_64
           - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             arch_label: linux-x86_64
@@ -176,12 +173,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p assets
-          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
             cp "artifacts/nefor-$target/nefor-$target.tar.gz"        "assets/"
             cp "artifacts/nefor-$target/nefor-$target.tar.gz.sha256" "assets/"
           done
           echo "macos_arm64=$(cat artifacts/sha-aarch64-apple-darwin/aarch64-apple-darwin.sha256)" >> "$GITHUB_OUTPUT"
-          echo "macos_x86_64=$(cat artifacts/sha-x86_64-apple-darwin/x86_64-apple-darwin.sha256)" >> "$GITHUB_OUTPUT"
           echo "linux_x86_64=$(cat artifacts/sha-x86_64-unknown-linux-gnu/x86_64-unknown-linux-gnu.sha256)" >> "$GITHUB_OUTPUT"
           echo "linux_arm64=$(cat artifacts/sha-aarch64-unknown-linux-gnu/aarch64-unknown-linux-gnu.sha256)" >> "$GITHUB_OUTPUT"
 
@@ -236,7 +232,6 @@ jobs:
           TAG: ${{ needs.setup.outputs.tag_name }}
           VERSION: ${{ needs.publish.outputs.version }}
           SHA_MACOS_ARM64: ${{ needs.publish.outputs.sha_macos_arm64 }}
-          SHA_MACOS_X86_64: ${{ needs.publish.outputs.sha_macos_x86_64 }}
           SHA_LINUX_X86_64: ${{ needs.publish.outputs.sha_linux_x86_64 }}
           SHA_LINUX_ARM64: ${{ needs.publish.outputs.sha_linux_arm64 }}
         run: |
@@ -254,13 +249,11 @@ jobs:
           base    = "https://github.com/amenocturne/nefor/releases/download/" + os.environ["TAG"]
           shas = {
               "MACOS_ARM64":  os.environ["SHA_MACOS_ARM64"],
-              "MACOS_X86_64": os.environ["SHA_MACOS_X86_64"],
               "LINUX_X86_64": os.environ["SHA_LINUX_X86_64"],
               "LINUX_ARM64":  os.environ["SHA_LINUX_ARM64"],
           }
           targets = {
               "MACOS_ARM64":  "aarch64-apple-darwin",
-              "MACOS_X86_64": "x86_64-apple-darwin",
               "LINUX_X86_64": "x86_64-unknown-linux-gnu",
               "LINUX_ARM64":  "aarch64-unknown-linux-gnu",
           }
