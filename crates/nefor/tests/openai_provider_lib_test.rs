@@ -926,3 +926,148 @@ fn replay_rebuild_cross_name_ownership_is_isolated() {
     assert_eq!(mock_count, 1, "mock-plugin: chat.create only");
     assert_eq!(ollama_count, 2, "ollama: chat.create + synthesized append");
 }
+
+// ---------------------------------------------------------------------
+// replay_rebuild — chat.complete.result (orchestrator path)
+// ---------------------------------------------------------------------
+//
+// Regression: chatgpt + openai-provider hold model-emitted assistant
+// turns (`push_assistant_tool_calls`) only in process memory. On
+// /resume the bus log re-fires chat.create + chat.append for user/tool
+// messages, but the assistant entries were never on the bus and don't
+// rebuild — leaving orphaned `function_call_output` items in the
+// rebuilt history and a 400 ("No tool call found for function call
+// output") on the next /responses POST. The sub-agent path was covered
+// by the `tool.result` synthesis arm; this is the orchestrator
+// equivalent (chat-1 driven directly via `<prefix>.chat.complete`).
+
+#[test]
+fn replay_rebuild_chat_complete_result_synthesizes_assistant_append() {
+    let lua = lua_with_lib();
+    let (n, kind, role, content, n_tcs): (i64, String, String, String, i64) = lua
+        .load(
+            r#"
+            provider.replay_rebuild({
+                type = "event", from = "engine", replay = true,
+                body = { kind = "ollama.chat.create", chat_id = "c1" },
+            }, "ollama")
+            provider.replay_rebuild({
+                type = "event", from = "ollama", replay = true,
+                body = {
+                    kind    = "ollama.chat.complete.result",
+                    chat_id = "c1",
+                    output  = {
+                        text          = "thinking...",
+                        finish_reason = "tool_calls",
+                        tool_calls    = {
+                            {
+                                id       = "call_abc",
+                                name     = "dispatch-graph",
+                                arguments = { nodes = {} },
+                            },
+                        },
+                    },
+                },
+            }, "ollama")
+            local row = _delivered_log[2]
+            return #_delivered_log, row.body.kind, row.body.message.role,
+                   row.body.message.content, #row.body.message.tool_calls
+            "#,
+        )
+        .eval()
+        .expect("eval");
+    assert_eq!(n, 2, "chat.create + synthesized assistant chat.append");
+    assert_eq!(kind, "ollama.chat.append");
+    assert_eq!(role, "assistant");
+    assert_eq!(content, "thinking...");
+    assert_eq!(
+        n_tcs, 1,
+        "tool_calls from chat.complete.result.output ride into the synthesized message"
+    );
+}
+
+#[test]
+fn replay_rebuild_chat_complete_result_drops_for_unowned_chat() {
+    let lua = lua_with_lib();
+    let n: i64 = lua
+        .load(
+            r#"
+            provider.replay_rebuild({
+                type = "event", from = "ollama", replay = true,
+                body = {
+                    kind    = "ollama.chat.complete.result",
+                    chat_id = "c-other",
+                    output  = { text = "x" },
+                },
+            }, "ollama")
+            return #_delivered_log
+            "#,
+        )
+        .eval()
+        .expect("eval");
+    assert_eq!(n, 0, "unowned chat must not produce a synthesized append");
+}
+
+#[test]
+fn replay_rebuild_chat_complete_result_drops_empty_assistant_turn() {
+    let lua = lua_with_lib();
+    let n: i64 = lua
+        .load(
+            r#"
+            provider.replay_rebuild({
+                type = "event", from = "engine", replay = true,
+                body = { kind = "ollama.chat.create", chat_id = "c1" },
+            }, "ollama")
+            -- finish_reason=error with no text and no tool_calls — the
+            -- chat.complete failed (e.g. HTTP 503). No assistant turn
+            -- to record; must not synthesize a junk message.
+            provider.replay_rebuild({
+                type = "event", from = "ollama", replay = true,
+                body = {
+                    kind    = "ollama.chat.complete.result",
+                    chat_id = "c1",
+                    output  = { text = "", finish_reason = "error" },
+                },
+            }, "ollama")
+            return #_delivered_log
+            "#,
+        )
+        .eval()
+        .expect("eval");
+    assert_eq!(
+        n, 1,
+        "failed chat.complete.result must not produce an empty assistant append"
+    );
+}
+
+#[test]
+fn replay_rebuild_chat_complete_result_text_only_synthesizes() {
+    // Final assistant turn after a tool-call cycle: text + no tool_calls.
+    // Must still synthesize the assistant chat.append so the orchestrator
+    // chat sees its own terminal message on resume.
+    let lua = lua_with_lib();
+    let (n, content, role): (i64, String, String) = lua
+        .load(
+            r#"
+            provider.replay_rebuild({
+                type = "event", from = "engine", replay = true,
+                body = { kind = "ollama.chat.create", chat_id = "c1" },
+            }, "ollama")
+            provider.replay_rebuild({
+                type = "event", from = "ollama", replay = true,
+                body = {
+                    kind    = "ollama.chat.complete.result",
+                    chat_id = "c1",
+                    output  = { text = "Done.", finish_reason = "stop" },
+                },
+            }, "ollama")
+            local row = _delivered_log[2]
+            return #_delivered_log, row.body.message.content, row.body.message.role
+            "#,
+        )
+        .eval()
+        .expect("eval");
+    assert_eq!(n, 2);
+    assert_eq!(content, "Done.");
+    assert_eq!(role, "assistant");
+}

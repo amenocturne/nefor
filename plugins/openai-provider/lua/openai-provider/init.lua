@@ -269,9 +269,27 @@ end
 --                          coexisting providers don't double-feed.
 --   tool.result          : synthesize an assistant <prefix>.chat.append
 --                          (text + tool_calls) so the assistant turn
---                          lands in history. chat.complete is
---                          intentionally not re-delivered on replay, so
---                          there's no other channel for the turn.
+--                          lands in history. Covers the sub-agent /
+--                          provider-wrapper path where the assistant
+--                          turn is wrapped into tool.result with
+--                          `result.next_state.chat_id` identifying the
+--                          owning chat.
+--   <prefix>.chat.complete.result
+--                        : same synthesis as tool.result but for the
+--                          ORCHESTRATOR path — the chat.lua surface
+--                          drives the lead chat directly via
+--                          `<prefix>.chat.complete` (not through a
+--                          provider-wrapper reasoner), so the assistant
+--                          turn arrives on chat.complete.result with
+--                          `chat_id` at the envelope root rather than
+--                          buried in `result.next_state`. Without this
+--                          branch the orchestrator chat's tool_calls
+--                          disappear on resume, leaving orphaned tool
+--                          messages and a 400 from the next /responses
+--                          POST ("No tool call found for function call
+--                          output").
+-- chat.complete itself is intentionally not re-delivered on replay —
+-- the .result branch carries the assistant turn for both paths.
 -- Everything else drops.
 function M.replay_rebuild(env, name)
   assert(type(name) == "string" and #name > 0,
@@ -327,6 +345,35 @@ function M.replay_rebuild(env, name)
     local tcs = result.tool_calls
     local has_text = #text > 0
     local has_tcs = type(tcs) == "table" and #tcs > 0
+    if not has_text and not has_tcs then return end
+
+    local message = { role = "assistant", content = text }
+    if has_tcs then message.tool_calls = tcs end
+    deliver_body({
+      kind    = prefix .. "chat.append",
+      chat_id = cid,
+      message = message,
+    })
+    return
+  end
+
+  if k == prefix .. "chat.complete.result" then
+    -- Orchestrator-path assistant-turn synthesis. The chat surface
+    -- drives the lead chat directly via `<prefix>.chat.complete`, so
+    -- the assistant turn arrives here (not wrapped in tool.result).
+    -- chat_id lives at the envelope root; the model's output is under
+    -- `body.output` (matches the live shape emitted by the binary —
+    -- see chat_complete_result_body in dispatcher.rs).
+    local cid = body.chat_id
+    if type(cid) ~= "string" or not owned[cid] then return end
+    local output = body.output
+    if type(output) ~= "table" then return end
+    local text = type(output.text) == "string" and output.text or ""
+    local tcs  = output.tool_calls
+    local has_text = #text > 0
+    local has_tcs  = type(tcs) == "table" and #tcs > 0
+    -- Skip turns with neither text nor tool_calls (e.g. an errored
+    -- chat.complete.result with finish_reason="error" and text="").
     if not has_text and not has_tcs then return end
 
     local message = { role = "assistant", content = text }
