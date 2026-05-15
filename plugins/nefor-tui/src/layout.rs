@@ -1628,49 +1628,46 @@ fn paint_scrollable(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer
         (scroll_y, content_height, show_bar, inner_w)
     };
 
-    // Compute child's full content rect and paint it into a scratch
-    // buffer the height of `content_height`. The paint pass then copies
-    // a single viewport-height window of cells into `out`. This decouples
-    // wrapping (which the child does once at content_height) from
-    // viewport positioning, and keeps the child's invariants (ranges
-    // outside its allotted rect are not touched).
+    // Paint the child into a scratch buffer and then copy the visible
+    // viewport window into `out`. The scratch buffer is capped at
+    // `scroll_y + viewport_h` rows — content below the viewport is never
+    // allocated or painted, which keeps memory and CPU bounded by the
+    // viewport size rather than the total content size.
     let content_w = inner_w;
-    let content_h = content_height;
+    let viewport_h = rect.height;
     let scratch_w = content_w.max(1);
-    let scratch_h = content_h.max(1);
+    let scratch_h = (scroll_y + viewport_h).min(content_height).max(1);
     let mut scratch = FrameBuffer::new(scratch_w, scratch_h);
     if let Some(child) = inst.children.first_mut() {
         let child_rect = Rect {
             row: 0,
             col: 0,
             width: content_w,
-            height: content_h,
+            height: content_height,
         };
         paint(child, child_rect, &mut scratch);
     }
 
     // Copy `[scroll_y, scroll_y + viewport_h)` of `scratch` into `out`.
-    let viewport_h = rect.height;
+    // Rows/cols that fall outside the scratch bounds are blank-filled so
+    // stale content from a prior frame never bleeds through.
     for r in 0..viewport_h as usize {
-        let src_row = scroll_y as usize + r;
         let dst_row = rect.row as usize + r;
         if dst_row >= out.lines.len() {
             break;
         }
-        if src_row >= scratch.lines.len() {
-            break;
-        }
+        let src_row = scroll_y as usize + r;
         let dst_line = &mut out.lines[dst_row];
-        let src_line = &scratch.lines[src_row];
+        let src_line = scratch.lines.get(src_row);
         for col in 0..content_w as usize {
             let dst_col = rect.col as usize + col;
             if dst_col >= dst_line.cells.len() {
                 break;
             }
-            if col >= src_line.cells.len() {
-                break;
-            }
-            dst_line.cells[dst_col] = src_line.cells[col].clone();
+            dst_line.cells[dst_col] = src_line
+                .and_then(|l| l.cells.get(col))
+                .cloned()
+                .unwrap_or_else(Cell::blank);
         }
     }
 
