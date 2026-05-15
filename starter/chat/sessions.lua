@@ -130,6 +130,8 @@ function M.list_recent(limit)
   -- Enrich each row with header timestamp + first prompt preview. Read
   -- line-by-line and stop at the first chat.input.submit hit so
   -- multi-megabyte sessions don't slurp the whole file.
+  -- Sessions with no user submits are empty — drop them from the list.
+  local enriched = {}
   for _, s in ipairs(sessions) do
     local fh = io.open(s.path, "r")
     if fh ~= nil then
@@ -143,13 +145,13 @@ function M.list_recent(limit)
         end
       end
       fh:close()
-      s.preview = preview or "(no submits)"
-    else
-      s.started_at = "?"
-      s.preview    = "(unreadable)"
+      if preview ~= nil then
+        s.preview = preview
+        enriched[#enriched + 1] = s
+      end
     end
   end
-  return sessions
+  return enriched
 end
 
 -- Truncate `text` to `n` columns (byte-count proxy; non-ASCII
