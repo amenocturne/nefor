@@ -7,19 +7,73 @@ local M = {}
 local json = nefor.json
 
 -- Serialise sub-graph results into a tool-friendly string. Preference:
---   1. results.terminal.output.text — canonical agent-style exit.
---   2. Any node whose key contains "terminal", "out", or "final".
---   3. Any node's output.text (Lua pairs() order; last-resort).
---   4. JSON-encoded results map.
+--   1. When the submitted graph topology is passed, walk it: the sub-
+--      graph's canonical output is its sink node(s) — nodes that no
+--      other node depends on. Single sink → that node's `output.text`.
+--      Multi sink → labeled concatenation in sorted id order.
+--   2. Legacy heuristic for callers that didn't pass the graph:
+--      `results.terminal.output.text` → keys containing "terminal" /
+--      "out" / "final" → first node's `output.text`.
+--   3. JSON-encoded results map (last resort).
+--
+-- The graph-aware path is what we want — node ids are caller-minted
+-- and may not contain any of the legacy substrings (e.g. user picks
+-- `test_explorer` / `test_reviewer`; the legacy heuristic would
+-- silently surface the wrong node).
 function M.extract_text(entry)
   if type(entry) ~= "table" or type(entry.output) ~= "table" then return nil end
   local out = entry.output
   return out.text or (out.final_answer and out.final_answer.text) or nil
 end
 
-function M.serialise_results(results)
+-- Compute the sink-node ids from a submitted graph spec
+-- (`{ nodes: [{ id, ... }], edges?: [{ from, to }] }`). A sink has no
+-- outgoing edges — i.e. no other node depends on its output. Returns
+-- a sorted list (deterministic order for multi-sink concatenation).
+local function sink_ids(graph)
+  if type(graph) ~= "table" or type(graph.nodes) ~= "table" then return nil end
+  local has_successor = {}
+  if type(graph.edges) == "table" then
+    for _, e in ipairs(graph.edges) do
+      if type(e) == "table" and type(e.from) == "string" then
+        has_successor[e.from] = true
+      end
+    end
+  end
+  local sinks = {}
+  for _, n in ipairs(graph.nodes) do
+    if type(n) == "table" and type(n.id) == "string"
+        and not has_successor[n.id] then
+      sinks[#sinks + 1] = n.id
+    end
+  end
+  table.sort(sinks)
+  return sinks
+end
+
+function M.serialise_results(results, graph)
   if type(results) ~= "table" then return tostring(results) end
 
+  -- Graph-aware path: pick by topology, not by node name.
+  local sinks = sink_ids(graph)
+  if type(sinks) == "table" and #sinks > 0 then
+    if #sinks == 1 then
+      local txt = M.extract_text(results[sinks[1]])
+      if type(txt) == "string" then return txt end
+    else
+      local parts = {}
+      for _, sid in ipairs(sinks) do
+        local txt = M.extract_text(results[sid])
+        if type(txt) == "string" then
+          parts[#parts + 1] = "[" .. sid .. "]\n" .. txt
+        end
+      end
+      if #parts > 0 then return table.concat(parts, "\n\n") end
+    end
+  end
+
+  -- Legacy heuristics — only reached when the caller didn't pass a
+  -- graph or sink lookup didn't find usable text on the sink(s).
   local terminal_text = M.extract_text(results.terminal)
   if type(terminal_text) == "string" then return terminal_text end
 

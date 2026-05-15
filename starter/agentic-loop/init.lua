@@ -541,8 +541,14 @@ local function handle_tool_result_run_close(run_id, body)
       run_id = run_id,
       status = effective_status,
     }
+    local pending_graph = sub_pending.graph
     if effective_status == "success" then
-      completion.output = serialise_results(results)
+      -- Pass the graph topology so serialise_results can pick the
+      -- sub-graph's sink node(s) by structure instead of by name —
+      -- caller-minted node ids (`test_explorer`, `test_reviewer`, …)
+      -- don't match the legacy "terminal"/"out"/"final" heuristic and
+      -- would otherwise silently surface the wrong node's output.
+      completion.output = serialise_results(results, pending_graph)
     else
       completion.error = "spawn_graph run completed with status `" .. effective_status ..
                          "`: " .. json.encode(results)
@@ -556,7 +562,6 @@ local function handle_tool_result_run_close(run_id, body)
     -- entry kind that entries.lua renders with its own glyph + style.
     -- The deferred-queue user message below still feeds the model.
     local graph_nodes = {}
-    local pending_graph = sub_pending.graph
     if type(pending_graph) == "table" and type(pending_graph.nodes) == "table" then
       for _, n in ipairs(pending_graph.nodes) do
         if type(n) == "table" then

@@ -1273,4 +1273,165 @@ do
     "stream-hidden registration MUST be released when the firing closes")
 end
 
+-- ------------------------------------------------------------------
+-- Scenario 21 (Fix #4): upstream graph-node dependency outputs land
+-- in the agent's first user message
+-- ------------------------------------------------------------------
+-- Regression cover: a dispatch-graph chain like
+-- `explorer(say "hello") → reviewer(echo input)` was reaching the
+-- reviewer node with an empty `inputs` channel because `handle`
+-- never read `body.inputs`. The reviewer then ran without context
+-- and produced text unrelated to its upstream.
+do
+  fresh()
+  feed("reasoner-graph", {
+    kind = "tool.invoke",
+    id   = "firing-deps-1",
+    name = "agent",
+    args = {
+      run_id     = "run-deps",
+      node_id    = "rev1",
+      args       = {
+        system_prompt  = "You are a reviewer.",
+        model          = "test-model",
+        tool_allowlist = { "read_file" },
+        prompt         = "Echo the upstream output.",
+      },
+      inputs     = {
+        exp1 = { output = { text = "hello from explorer" } },
+      },
+      prev_state = nil,
+    },
+  })
+
+  local calls = decode_calls()
+  local appends = find_calls(calls, function(c)
+    return c.body.kind == "mock-prov.chat.append"
+  end)
+  assert_eq(#appends, 2, "agent emits system + single user message")
+  assert_eq(appends[1].body.message.role, "system",
+    "first append is system (unaffected by inputs)")
+  assert_eq(appends[2].body.message.role, "user", "second append is user")
+  local user_content = appends[2].body.message.content
+  assert(user_content:find("hello from explorer", 1, true) ~= nil,
+    "user message MUST carry upstream output text; got:\n" .. tostring(user_content))
+  assert(user_content:find("[exp1]", 1, true) ~= nil,
+    "user message MUST label upstream output by node id; got:\n" .. tostring(user_content))
+  assert(user_content:find("Echo the upstream output.", 1, true) ~= nil,
+    "user message MUST still carry the prompt; got:\n" .. tostring(user_content))
+  -- Prompt comes first, then `---`, then inputs block. Recency-ordered.
+  local prompt_pos = user_content:find("Echo the upstream output.", 1, true)
+  local inputs_pos = user_content:find("[exp1]", 1, true)
+  assert(prompt_pos < inputs_pos,
+    "prompt MUST come before the inputs block (append, not prepend); got:\n"
+    .. tostring(user_content))
+end
+
+-- ------------------------------------------------------------------
+-- Scenario 22 (Fix #4): structured-finalize output from upstream
+-- ------------------------------------------------------------------
+-- When the upstream agent terminated via the `finalize` tool, its
+-- `result.text` carries the human-readable answer. The downstream
+-- node should see that text, not a JSON dump of `structured`.
+do
+  fresh()
+  feed("reasoner-graph", {
+    kind = "tool.invoke",
+    id   = "firing-deps-2",
+    name = "agent",
+    args = {
+      run_id     = "run-deps",
+      node_id    = "rev1",
+      args       = {
+        system_prompt = "You are a reviewer.",
+        model         = "test-model",
+        prompt        = "Summarise.",
+      },
+      inputs     = {
+        exp1 = {
+          output = {
+            text       = "hello from explorer",
+            structured = { answer = "hello from explorer", findings = { "x" } },
+          },
+        },
+      },
+      prev_state = nil,
+    },
+  })
+
+  local calls = decode_calls()
+  local appends = find_calls(calls, function(c)
+    return c.body.kind == "mock-prov.chat.append"
+  end)
+  local user = appends[#appends]
+  assert_eq(user.body.message.role, "user", "last append is user")
+  local content = user.body.message.content
+  assert(content:find("hello from explorer", 1, true) ~= nil,
+    "user message MUST prefer upstream `output.text` over structured dump")
+end
+
+-- ------------------------------------------------------------------
+-- Scenario 23 (Fix #4): upstream error surfaces in the user message
+-- ------------------------------------------------------------------
+-- on_node_failure=continue lets a graph proceed past a failed upstream;
+-- the dependent node receives `inputs[<dep>] = { error = ... }`. The
+-- agent must surface that error to the model so it can decide what to
+-- do — silently dropping it would make the downstream node think the
+-- upstream succeeded.
+do
+  fresh()
+  feed("reasoner-graph", {
+    kind = "tool.invoke",
+    id   = "firing-deps-3",
+    name = "agent",
+    args = {
+      run_id     = "run-deps",
+      node_id    = "rev1",
+      args       = {
+        system_prompt = "You are a reviewer.",
+        model         = "test-model",
+        prompt        = "Continue.",
+      },
+      inputs     = {
+        exp1 = { error = "explorer crashed: timeout" },
+      },
+      prev_state = nil,
+    },
+  })
+
+  local calls = decode_calls()
+  local appends = find_calls(calls, function(c)
+    return c.body.kind == "mock-prov.chat.append"
+  end)
+  local user = appends[#appends]
+  local content = user.body.message.content
+  assert(content:find("explorer crashed: timeout", 1, true) ~= nil,
+    "user message MUST surface upstream error text")
+  assert(content:find("[error]", 1, true) ~= nil,
+    "user message MUST tag upstream errors")
+end
+
+-- ------------------------------------------------------------------
+-- Scenario 24 (Fix #4): no inputs → bare prompt, no leading block
+-- ------------------------------------------------------------------
+-- Top-level nodes in a graph (and the existing single-node call path)
+-- must keep the original behaviour: the user message is the prompt
+-- alone, with no upstream-inputs header.
+do
+  fresh()
+  dispatch_agent("firing-deps-4", {
+    system_prompt = "You are a builder.",
+    model         = "test-model",
+    prompt        = "Just the prompt.",
+  })
+
+  local calls = decode_calls()
+  local appends = find_calls(calls, function(c)
+    return c.body.kind == "mock-prov.chat.append"
+  end)
+  local user = appends[#appends]
+  assert_eq(user.body.message.content, "Just the prompt.",
+    "top-level node sees bare prompt (no upstream-inputs header)")
+end
+
 print("agent_test: ok")

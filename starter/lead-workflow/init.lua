@@ -225,12 +225,28 @@ local function build_graph_spec(node_specs)
     return nil, "dispatch-graph: nodes list must be a non-empty array"
   end
 
-  -- First pass: per-spec well-formedness (id + role present).
+  -- First pass: per-spec well-formedness (id + role + agent_args.prompt).
+  -- Validate here so the model gets a clear, fast error instead of the
+  -- agent reasoner's downstream "args.prompt must be a non-empty string"
+  -- — which it sees only after the graph dispatches and an agent fires.
+  -- Strict providers (OpenAI Responses API) server-side-validate the
+  -- schema and reject the malformed call before it reaches us; lenient
+  -- ones (ollama) pass it through, so the lead-layer check is the
+  -- backstop.
   for _, spec in ipairs(node_specs) do
     if type(spec) ~= "table" or type(spec.id) ~= "string"
         or type(spec.role) ~= "string" then
       return nil,
         "dispatch-graph: each node must carry { id: string, role: string }"
+    end
+    if type(spec.agent_args) ~= "table"
+        or type(spec.agent_args.prompt) ~= "string"
+        or #spec.agent_args.prompt == 0 then
+      return nil, string.format(
+        "dispatch-graph: node `%s` is missing a non-empty " ..
+        "`agent_args.prompt` — every sub-agent needs a task instruction. " ..
+        "Upstream dependency outputs are auto-appended after the prompt, " ..
+        "so phrase it as instructions that reference those inputs.", spec.id)
     end
   end
 
@@ -646,15 +662,46 @@ local function lead_workflow_tool_schemas()
             items = {
               type = "object",
               properties = {
-                id           = { type = "string" },
-                role         = { type = "string" },
-                agent_args   = { type = "object" },
+                id           = {
+                  type = "string",
+                  description = "Caller-minted node id, unique within this graph. " ..
+                    "Used to reference the node in other nodes' `dependencies`.",
+                },
+                role         = {
+                  type = "string",
+                  description = "Sub-agent role. Drives the system prompt, model, and " ..
+                    "tool allowlist. Roles available in this starter: explorer " ..
+                    "(read-only investigation), builder (writes code; requires an " ..
+                    "approved plan), reviewer (read-only critique).",
+                },
+                agent_args   = {
+                  type        = "object",
+                  description = "Per-node task spec for the sub-agent. `prompt` is " ..
+                    "REQUIRED — it's the task this node performs. Upstream " ..
+                    "dependency outputs are auto-appended after the prompt as " ..
+                    "context, so phrase the prompt as instructions that reference " ..
+                    "those inputs (e.g. \"Using the [explorer_n1] output below, …\").",
+                  properties  = {
+                    prompt = {
+                      type        = "string",
+                      description = "The task for this node, as a natural-language " ..
+                        "instruction. Required, non-empty. Upstream dependency " ..
+                        "outputs are auto-appended after this prompt.",
+                    },
+                  },
+                  required = { "prompt" },
+                },
                 dependencies = {
-                  type = "array",
+                  type        = "array",
+                  description = "Ids of upstream nodes whose outputs this node " ..
+                    "depends on. The graph waits for every listed dependency to " ..
+                    "complete before dispatching this node; each dep's output is " ..
+                    "available to this node as a `[<dep_id>]\\n<output>` block " ..
+                    "appended after its prompt.",
                   items = { type = "string" },
                 },
               },
-              required = { "id", "role" },
+              required = { "id", "role", "agent_args" },
             },
           },
         },

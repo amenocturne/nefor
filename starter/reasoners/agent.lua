@@ -70,7 +70,16 @@
 --        (note: the binary filters its outgoing tool-advertisement set,
 --        but we still enforce per-call in-reasoner — see step 4)
 --     3. emit <prov>.chat.append { role="system", content=system+ctx }
---     4. emit <prov>.chat.append { role="user", content=prompt }
+--     4. emit <prov>.chat.append { role="user", content=prompt+inputs }
+--        Upstream dispatch-graph dependencies arrive on the outer
+--        envelope as `body.inputs[<dep_id>] = { output = ... }`. Each
+--        dep's terminal output is rendered as a `[<dep_id>]\n<text>`
+--        section appended after the prompt — single user message,
+--        prompt first then deps, separated by `---`. The model reads
+--        the task instruction first, then the data it must act on
+--        (recency-ordered so each downstream step sees the freshest
+--        upstream output last). Top-level nodes (no deps) get the
+--        bare prompt.
 --     5. emit <prov>.chat.complete { chat_id }
 --
 --   on <prov>.chat.complete.result for our chat_id:
@@ -132,6 +141,63 @@ local FINALIZE_SCHEMA = {
 
 M.FINALIZE_NAME   = FINALIZE_NAME
 M.FINALIZE_SCHEMA = FINALIZE_SCHEMA
+
+-- Compose upstream graph-node outputs into a single context block to
+-- append after the user prompt. Each dependency's terminal output (the
+-- `result.{text,structured}` send_terminal_ok emitted) arrives as
+--   inputs[<dep_id>] = { output = { text, structured?, ... } }
+-- or as an upstream error
+--   inputs[<dep_id>] = { error = <string> }.
+--
+-- Returns an empty string when there are no upstream inputs (top-level
+-- nodes in the graph). When non-empty the caller appends it to the
+-- user message after the prompt, separated from the prompt by `---`.
+-- Append (not prepend) so the freshest data sits last in the model's
+-- context — long-chain graphs amplify recency benefits.
+local function build_inputs_block(inputs)
+  if type(inputs) ~= "table" then return "" end
+
+  local ids = {}
+  for k, _ in pairs(inputs) do
+    if type(k) == "string" then ids[#ids + 1] = k end
+  end
+  if #ids == 0 then return "" end
+  table.sort(ids)
+
+  local parts = {}
+  for _, dep_id in ipairs(ids) do
+    local entry = inputs[dep_id]
+    local section
+    if type(entry) ~= "table" then
+      -- skip
+    elseif type(entry.error) == "string" and #entry.error > 0 then
+      section = string.format("[%s] [error] %s", dep_id, entry.error)
+    elseif entry.output ~= nil then
+      local out = entry.output
+      local body
+      if type(out) == "string" then
+        body = out
+      elseif type(out) == "table" then
+        if type(out.text) == "string" and #out.text > 0 then
+          body = out.text
+        elseif out.structured ~= nil then
+          body = json.encode(out.structured)
+        else
+          body = json.encode(out)
+        end
+      else
+        body = tostring(out)
+      end
+      section = string.format("[%s]\n%s", dep_id, body)
+    end
+    if section ~= nil then
+      parts[#parts + 1] = section
+    end
+  end
+
+  if #parts == 0 then return "" end
+  return "Inputs from upstream nodes:\n\n" .. table.concat(parts, "\n\n")
+end
 
 -- Forward-declared; bound on first dispatch (require cycle: agent.lua
 -- is loaded by reasoners/init.lua, which is loaded by agentic-loop's
@@ -368,8 +434,18 @@ local function handle(body)
     emit_chat_append(entry, { role = "system", content = additional })
   end
 
-  -- user message: the task
-  emit_chat_append(entry, { role = "user", content = prompt })
+  -- user message: prompt first, then upstream graph-node outputs (when
+  -- this node has dependencies), separated by `---`. Append (not prepend)
+  -- so the freshest upstream data sits last in the model's context —
+  -- the model reads the task instruction first, then the data it must
+  -- act on. Top-level nodes have empty inputs and the block collapses
+  -- to nothing.
+  local inputs_block = build_inputs_block(body.inputs)
+  local user_content = prompt
+  if #inputs_block > 0 then
+    user_content = prompt .. "\n\n---\n\n" .. inputs_block
+  end
+  emit_chat_append(entry, { role = "user", content = user_content })
 
   -- kick off the first turn
   emit_chat_complete(entry)
