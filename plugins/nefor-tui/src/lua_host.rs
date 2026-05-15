@@ -19,6 +19,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use crate::desc::{from_lua_table, WidgetDescription, KIND_FIELD};
 use crate::error::TuiError;
 use crate::fs::install_fs;
+use crate::scrollable::GeoCache;
 
 /// One queued scroll command produced by a Lua call to `tui.scroll_to /
 /// scroll_by / scroll_into_view`. The engine drains the queue after each
@@ -100,6 +101,12 @@ pub struct LuaHost {
     /// — including any synthetic `Engine::advance_time` offset tests
     /// install. No Lua-side `os.time()` round-trip; one source of truth.
     now_ms: Arc<AtomicU64>,
+    /// Per-scrollable-key geometry caches for `tui.virtual_scroll_prepare`.
+    /// Separate from the reconciled instance state — the geo cache is
+    /// purely a Lua-side helper for virtual-scroll widgets that estimate
+    /// heights on the Lua side and delegate the math to Rust.
+    #[allow(dead_code)]
+    geo_caches: Arc<Mutex<HashMap<String, GeoCache>>>,
 }
 
 impl LuaHost {
@@ -112,6 +119,8 @@ impl LuaHost {
             Arc::new(Mutex::new(ScrollPositionMap::new()));
         let emit_queue: Arc<Mutex<Vec<SideEffect>>> = Arc::new(Mutex::new(Vec::new()));
         let now_ms: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let geo_caches: Arc<Mutex<HashMap<String, GeoCache>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         install_tui(
             &lua,
             Arc::clone(&started),
@@ -119,6 +128,7 @@ impl LuaHost {
             Arc::clone(&scroll_positions),
             Arc::clone(&emit_queue),
             Arc::clone(&now_ms),
+            Arc::clone(&geo_caches),
         )?;
         // `nefor.fs.list_dir` — a Rust-backed readdir, used by chat.lua's
         // @-path autocomplete. Stays separate from the `tui` table so the
@@ -138,6 +148,7 @@ impl LuaHost {
             scroll_positions,
             emit_queue,
             now_ms,
+            geo_caches,
         })
     }
 
@@ -360,6 +371,7 @@ fn install_tui(
     scroll_positions: Arc<Mutex<ScrollPositionMap>>,
     emit_queue: Arc<Mutex<Vec<SideEffect>>>,
     now_ms: Arc<AtomicU64>,
+    geo_caches: Arc<Mutex<HashMap<String, GeoCache>>>,
 ) -> Result<(), TuiError> {
     let tui = lua.create_table()?;
 
@@ -543,6 +555,139 @@ fn install_tui(
             Ok(t)
         })?;
     tui.set("scroll_position", scroll_position_fn)?;
+
+    // ── Virtual-scroll geometry API ─────────────────────────────────
+    //
+    // `tui.virtual_scroll_prepare(key, item_count, heights, gap)`
+    //
+    // Computes which items are visible given the current scroll position,
+    // plus spacer heights for the regions above and below. The geometry
+    // cache is incrementally maintained: appending entries (normal chat
+    // flow) only computes the new tail; shrinking triggers a full
+    // recompute. Returns `{ first, last, top_h, bot_h }` or `nil` if
+    // the scrollable hasn't been laid out yet (first frame).
+
+    let positions_for_vscroll = Arc::clone(&scroll_positions);
+    let geo_for_vscroll = Arc::clone(&geo_caches);
+    let virtual_scroll_prepare_fn = lua.create_function(
+        move |lua, (key, item_count, heights_table, gap): (String, usize, Table, u16)| -> mlua::Result<Value> {
+            // Read current scroll position; return nil if the scrollable
+            // hasn't been mounted yet (first frame).
+            let (scroll_y, viewport_h) = {
+                let map = lock(&positions_for_vscroll);
+                match map.get(&key) {
+                    Some(snap) => (snap.offset as u32, snap.viewport_size as u32),
+                    None => return Ok(Value::Nil),
+                }
+            };
+
+            let gap32 = gap as u32;
+            let mut caches = lock(&geo_for_vscroll);
+            let gc = caches.entry(key).or_default();
+
+            // Sync heights from Lua table into the cache.
+            // Shrink: full recompute.
+            if item_count < gc.heights.len() {
+                gc.heights.clear();
+                gc.cumul.clear();
+                gc.total = 0;
+            }
+
+            let old_len = gc.heights.len();
+            // Read new heights from Lua and extend.
+            for i in (old_len + 1)..=(item_count) {
+                let h: u16 = heights_table.get(i as i64)?;
+                gc.heights.push(h);
+            }
+
+            // Recompute cumulative positions from old_len onward.
+            if old_len < item_count {
+                gc.cumul.resize(item_count, 0);
+                let start = if old_len == 0 { 0 } else { old_len };
+                for i in start..item_count {
+                    let y = if i == 0 {
+                        0
+                    } else {
+                        gc.cumul[i - 1] + gc.heights[i - 1] as u32 + gap32
+                    };
+                    gc.cumul[i] = y;
+                }
+                let last = item_count - 1;
+                gc.total = gc.cumul[last] + gc.heights[last] as u32;
+            }
+
+            if item_count == 0 {
+                let t = lua.create_table()?;
+                t.set("first", 1)?;
+                t.set("last", 0)?;
+                t.set("top_h", 0)?;
+                t.set("bot_h", 0)?;
+                return Ok(Value::Table(t));
+            }
+
+            // Binary search for the visible range with 2x viewport buffer.
+            let buffer = viewport_h * 2;
+            let vis_top = scroll_y.saturating_sub(buffer);
+            let vis_bot = scroll_y + viewport_h + buffer;
+
+            // First visible: first entry whose bottom edge >= vis_top.
+            let first_vis = {
+                let mut lo: usize = 0;
+                let mut hi: usize = item_count.saturating_sub(1);
+                while lo <= hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let bot = gc.cumul[mid] + gc.heights[mid] as u32;
+                    if bot < vis_top {
+                        lo = mid + 1;
+                    } else {
+                        if mid == 0 { break; }
+                        hi = mid - 1;
+                    }
+                }
+                lo
+            };
+
+            // Last visible: last entry whose top edge <= vis_bot.
+            let last_vis = {
+                let mut lo: usize = first_vis;
+                let mut hi: usize = item_count.saturating_sub(1);
+                while lo <= hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if gc.cumul[mid] <= vis_bot {
+                        lo = mid + 1;
+                    } else {
+                        if mid == 0 { break; }
+                        hi = mid - 1;
+                    }
+                }
+                // hi is the answer, but lo-1 after the loop overshoots
+                lo.saturating_sub(1).min(item_count.saturating_sub(1))
+            };
+
+            // Spacer heights.
+            let top_h = if first_vis > 0 {
+                gc.cumul[first_vis]
+            } else {
+                0
+            };
+
+            let bot_h = if last_vis < item_count - 1 {
+                let after_last = gc.cumul[last_vis] + gc.heights[last_vis] as u32 + gap32;
+                gc.total.saturating_sub(after_last)
+            } else {
+                0
+            };
+
+            // Return 1-indexed for Lua.
+            let t = lua.create_table()?;
+            t.set("first", first_vis as u64 + 1)?;
+            t.set("last", last_vis as u64 + 1)?;
+            t.set("top_h", top_h)?;
+            t.set("bot_h", bot_h)?;
+            Ok(Value::Table(t))
+        },
+    )?;
+    tui.set("virtual_scroll_prepare", virtual_scroll_prepare_fn)?;
 
     // ── Clock query ──────────────────────────────────────────────────
     //

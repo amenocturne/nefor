@@ -17,8 +17,18 @@
 //! `scroll_y_max`. Once the user scrolls away from the bottom, the sticky
 //! flag clears and content growth no longer drags them along.
 
+/// Per-item geometry cache for virtual-scroll widgets. Holds heights,
+/// cumulative y positions (including gaps), and total content height.
+/// Updated incrementally by `tui.virtual_scroll_prepare`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GeoCache {
+    pub heights: Vec<u16>,
+    pub cumul: Vec<u32>,
+    pub total: u32,
+}
+
 /// Per-instance state preserved across `view` rebuilds via the reconciler.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScrollableState {
     /// Vertical scroll offset, in cells, into the child's content. `0` =
     /// top of content visible at top of viewport.

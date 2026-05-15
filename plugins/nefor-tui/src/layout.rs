@@ -3486,7 +3486,7 @@ mod tests {
     fn scrollable_state(rec: &Reconciler) -> ScrollableState {
         let root = rec.root.as_ref().expect("root");
         match &root.state {
-            InstanceState::Scrollable(s) => *s,
+            InstanceState::Scrollable(s) => s.clone(),
             _ => panic!("expected scrollable root"),
         }
     }
