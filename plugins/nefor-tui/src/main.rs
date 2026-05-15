@@ -176,6 +176,8 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
     // `render_if_dirty` returns `None`, so the loop just goes back to
     // sleep.
     let mut anim_tick = interval(Duration::from_millis(16));
+    let mut last_render = std::time::Instant::now();
+    const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(8);
     // 1Hz wall-clock tick for live elapsed-ms labels — DAG node
     // "running 18s" badges, the [thinking… 5s] turn-elapsed counter,
     // etc. The Lua composition formats these labels against
@@ -245,22 +247,49 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
                 Some(Err(e)) => tracing::warn!(error = %e, "stdin parse error"),
                 None => break,
             },
-            maybe_evt = term_events.next() => match maybe_evt {
-                Some(Ok(Event::Key(k))) => {
-                    if let Some(km) = from_key_event(&k) {
-                        engine.handle_key(km)?;
+            maybe_evt = term_events.next() => {
+                fn apply_term_event(engine: &mut Engine, evt: Event) -> Result<(), TuiError> {
+                    match evt {
+                        Event::Key(k) => {
+                            if let Some(km) = from_key_event(&k) {
+                                engine.handle_key(km)?;
+                            }
+                        }
+                        Event::Resize(w, h) => engine.handle_resize(w, h)?,
+                        Event::Mouse(m) => {
+                            if let Some(mm) = from_mouse_event(&m) {
+                                engine.handle_mouse(mm)?;
+                            }
+                        }
+                        Event::Paste(text) => engine.handle_paste(&text)?,
+                        _ => {}
+                    }
+                    Ok(())
+                }
+                match maybe_evt {
+                    Some(Ok(evt)) => apply_term_event(&mut engine, evt)?,
+                    Some(Err(e)) => tracing::warn!(error = %e, "crossterm event error"),
+                    None => break,
+                }
+                // Drain all remaining queued terminal events before
+                // rendering. Without this, rapid scroll/key events each
+                // trigger a full render — the user sees sluggish scroll
+                // that "catches up" instead of responsive movement.
+                use futures::{StreamExt as _, FutureExt as _};
+                let mut drain_count = 0u32;
+                while drain_count < 64 {
+                    match term_events.next().now_or_never() {
+                        Some(Some(Ok(evt))) => {
+                            apply_term_event(&mut engine, evt)?;
+                            drain_count += 1;
+                        }
+                        Some(Some(Err(e))) => {
+                            tracing::warn!(error = %e, "crossterm event error");
+                            drain_count += 1;
+                        }
+                        _ => break,
                     }
                 }
-                Some(Ok(Event::Resize(w, h))) => engine.handle_resize(w, h)?,
-                Some(Ok(Event::Mouse(m))) => {
-                    if let Some(mm) = from_mouse_event(&m) {
-                        engine.handle_mouse(mm)?;
-                    }
-                }
-                Some(Ok(Event::Paste(text))) => engine.handle_paste(&text)?,
-                Some(Ok(_)) => {} // focus events — not surfaced to Lua
-                Some(Err(e)) => tracing::warn!(error = %e, "crossterm event error"),
-                None => break,
             },
             _ = anim_tick.tick() => {
                 if engine.has_active_animations() {
@@ -293,9 +322,12 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
         // new state.
         drain_emits_to_writer(&mut engine, &out_tx).await?;
 
-        if let Some(bytes) = engine.render_if_dirty()? {
-            tty_main.write_all(&bytes)?;
-            tty_main.flush()?;
+        if last_render.elapsed() >= MIN_RENDER_INTERVAL {
+            if let Some(bytes) = engine.render_if_dirty()? {
+                tty_main.write_all(&bytes)?;
+                tty_main.flush()?;
+                last_render = std::time::Instant::now();
+            }
         }
         if engine.exit_requested() {
             break;
