@@ -101,13 +101,15 @@ pub struct LayoutResult {
     /// painted. Populated by `layout::paint` so the mouse hit-test can
     /// resolve a screen coord to the deepest enclosing instance.
     pub painted_rect: Option<Rect>,
+    /// Constraints from the most recent successful layout. When the next
+    /// frame supplies identical constraints and the description hasn't
+    /// changed, `size` is still valid and the layout pass can skip
+    /// re-measuring children.
+    pub cached_constraints: Option<super::layout::Constraints>,
 }
 
 impl LayoutResult {
-    pub fn reset(&mut self) {
-        self.size = Size::default();
-        self.flex_main_sizes.clear();
-        self.anchored_child_size = None;
+    pub fn reset_for_paint(&mut self) {
         self.painted_rect = None;
     }
 }

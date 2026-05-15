@@ -130,6 +130,18 @@ fn update_instance(
     };
 
     inst.children = reconcile_children(std::mem::take(&mut inst.children), new_children, summary);
+    let is_leaf = matches!(
+        new_desc,
+        WidgetDescription::Text { .. }
+            | WidgetDescription::Spans { .. }
+            | WidgetDescription::Markdown { .. }
+            | WidgetDescription::Animation { .. }
+            | WidgetDescription::Spacer { .. }
+            | WidgetDescription::Fill { .. }
+    );
+    if is_leaf && inst.last_desc != new_desc {
+        inst.layout.cached_constraints = None;
+    }
     inst.last_desc = new_desc;
     inst
 }

@@ -101,6 +101,20 @@ impl Rect {
 /// metadata in `inst.layout`, so the paint pass can position children
 /// without re-measuring.
 pub fn layout(inst: &mut WidgetInstance, c: Constraints) -> Size {
+    if inst.layout.cached_constraints == Some(c) {
+        let cacheable = matches!(
+            inst.kind(),
+            InstanceKind::Text
+                | InstanceKind::Spans
+                | InstanceKind::Markdown
+                | InstanceKind::Animation
+                | InstanceKind::Spacer
+                | InstanceKind::Fill
+        );
+        if cacheable {
+            return inst.layout.size;
+        }
+    }
     let size = match inst.kind() {
         InstanceKind::Text => layout_text(inst, c),
         InstanceKind::Spans => layout_spans(inst, c),
@@ -119,6 +133,7 @@ pub fn layout(inst: &mut WidgetInstance, c: Constraints) -> Size {
         InstanceKind::TextInput => layout_text_input(inst, c),
         InstanceKind::Scrollable => layout_scrollable(inst, c),
     };
+    inst.layout.cached_constraints = Some(c);
     inst.layout.size = size;
     size
 }

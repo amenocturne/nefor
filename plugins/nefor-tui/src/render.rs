@@ -246,7 +246,7 @@ impl Renderer {
 /// (which the reconciler preserves verbatim across rebuilds), but it
 /// still lives on each instance and would otherwise leak per-frame data.
 fn reset_layout_state(inst: &mut WidgetInstance) {
-    inst.layout.reset();
+    inst.layout.reset_for_paint();
     for c in inst.children.iter_mut() {
         reset_layout_state(c);
     }
