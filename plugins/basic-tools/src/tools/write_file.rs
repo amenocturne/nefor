@@ -34,6 +34,10 @@ pub fn schema() -> Value {
             "content": {
                 "type": "string",
                 "description": "UTF-8 text to write. Existing file is overwritten."
+            },
+            "cwd": {
+                "type": "string",
+                "description": "Working directory. Relative paths are resolved against this."
             }
         },
         "required": ["path", "content"]
@@ -41,23 +45,28 @@ pub fn schema() -> Value {
 }
 
 pub async fn run(args: &Value) -> Result<String, ToolError> {
-    let (path, content) = parse_args(args)?;
-    write_text_file(&path, &content).await
+    let parsed = parse_args(args)?;
+    write_text_file(&parsed.path, &parsed.content).await
 }
 
-fn parse_args(args: &Value) -> Result<(String, String), ToolError> {
+struct ParsedArgs {
+    path: String,
+    content: String,
+}
+
+fn parse_args(args: &Value) -> Result<ParsedArgs, ToolError> {
     let obj = args.as_object().ok_or_else(|| ToolError::BadArgs {
         tool: NAME.into(),
         message: "args must be a JSON object".into(),
     })?;
-    let path = obj
+    let raw_path = obj
         .get("path")
         .and_then(Value::as_str)
         .ok_or_else(|| ToolError::BadArgs {
             tool: NAME.into(),
             message: "missing required string field `path`".into(),
         })?;
-    if path.is_empty() {
+    if raw_path.is_empty() {
         return Err(ToolError::BadArgs {
             tool: NAME.into(),
             message: "`path` must be non-empty".into(),
@@ -70,7 +79,29 @@ fn parse_args(args: &Value) -> Result<(String, String), ToolError> {
             tool: NAME.into(),
             message: "missing required string field `content`".into(),
         })?;
-    Ok((path.to_owned(), content.to_owned()))
+    let cwd = obj
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let path = resolve_path(raw_path, cwd);
+    Ok(ParsedArgs {
+        path,
+        content: content.to_owned(),
+    })
+}
+
+fn resolve_path(path: &str, cwd: Option<&str>) -> String {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        return path.to_owned();
+    }
+    match cwd {
+        Some(dir) => std::path::Path::new(dir)
+            .join(p)
+            .to_string_lossy()
+            .into_owned(),
+        None => path.to_owned(),
+    }
 }
 
 async fn write_text_file(path: &str, content: &str) -> Result<String, ToolError> {

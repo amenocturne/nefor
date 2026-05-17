@@ -374,6 +374,7 @@ local function handle(body)
     chat_id        = chat_id,
     provider       = provider,
     tool_allowlist = build_allowlist_set(args.tool_allowlist),
+    cwd            = type(args.cwd) == "string" and args.cwd or nil,
     pending_tools  = {},
     pending_order  = {},
     pending_count  = 0,
@@ -494,6 +495,13 @@ local function dispatch_tool_call(entry, call)
     pt.error = "Tool '" .. name .. "' not in allowlist for this agent"
     entry.pending_count = entry.pending_count - 1
     return true
+  end
+
+  if entry.cwd and type(call_args) == "table" and call_args.cwd == nil then
+    if name == "bash" or name == "write_file" or name == "read_file" then
+      call_args = call_args
+      call_args.cwd = entry.cwd
+    end
   end
 
   emit("tool-gate", {

@@ -47,4 +47,4 @@ finalize({
 
 ## Path discipline
 
-Always use full paths from the workspace root. Never bare filenames in tool calls or in `files_changed`.
+Use paths relative to the workspace root (e.g. `src/main.rs`, not `/src/main.rs`). Never use bare filenames without a directory prefix, and never use absolute paths starting with `/`. The workspace root is set automatically — your tool calls resolve relative to it.

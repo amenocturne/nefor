@@ -256,12 +256,26 @@ local function build_graph_spec(node_specs)
   local terminal_err = validate_terminal_count(node_specs)
   if terminal_err then return nil, terminal_err end
 
+  -- Resolve workspace root once; injected into every node's agent_args
+  -- so file tools operate relative to the user's cwd.
+  local workspace_cwd
+  do
+    local h = io.popen("pwd 2>/dev/null")
+    if h then
+      workspace_cwd = h:read("*l")
+      h:close()
+    end
+  end
+
   local nodes = {}
   local edges = {}
   for _, spec in ipairs(node_specs) do
     local agent_args = {}
     if type(spec.agent_args) == "table" then
       for k, v in pairs(spec.agent_args) do agent_args[k] = v end
+    end
+    if workspace_cwd and agent_args.cwd == nil then
+      agent_args.cwd = workspace_cwd
     end
 
     local cfg = role_config(spec.role)

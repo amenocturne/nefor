@@ -42,6 +42,10 @@ pub fn schema() -> Value {
             "path": {
                 "type": "string",
                 "description": "Absolute or relative path to the file."
+            },
+            "cwd": {
+                "type": "string",
+                "description": "Working directory. Relative paths are resolved against this."
             }
         },
         "required": ["path"]
@@ -73,7 +77,25 @@ fn parse_path(args: &Value) -> Result<String, ToolError> {
             message: "`path` must be non-empty".into(),
         });
     }
-    Ok(raw.to_owned())
+    let cwd = obj
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    Ok(resolve_path(raw, cwd))
+}
+
+fn resolve_path(path: &str, cwd: Option<&str>) -> String {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        return path.to_owned();
+    }
+    match cwd {
+        Some(dir) => std::path::Path::new(dir)
+            .join(p)
+            .to_string_lossy()
+            .into_owned(),
+        None => path.to_owned(),
+    }
 }
 
 async fn read_text_file(path: &str) -> Result<String, ToolError> {
