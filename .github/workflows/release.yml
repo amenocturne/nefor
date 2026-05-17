@@ -100,10 +100,10 @@ jobs:
 
           cp "$TARGET_BIN/nefor" "$DIST/bin/nefor"
 
-          for p in basic-tools generic-provider generic-tool mock-plugin \
-                   nefor-combinators nefor-tui openai-provider \
-                   reasoner-graph tool-gate; do
-            cp "$TARGET_BIN/$p" "$DIST/share/nefor/plugins/$p"
+          for p in plugins/*/; do
+            name=$(basename "$p")
+            bin="$TARGET_BIN/$name"
+            [ -f "$bin" ] && cp "$bin" "$DIST/share/nefor/plugins/$name"
           done
 
           cp -R starter/* "$DIST/share/nefor/starter/"
