@@ -31,8 +31,16 @@
 -- permission_response.reason → tool.result.error so the agent learns
 -- exactly what to do next.
 --
--- Other tools: always defer to the user (no per-tool policy yet). They
--- still get popped up; the validator is just the routing seam.
+-- Other tools: defer to the user (popup) unless the agent is read-only.
+--
+-- ## Read-only agents
+--
+-- When `read_only = true` rides through the permission_request, the
+-- validator never shows a popup. bash goes through da with the strict
+-- policy (git read-only); approve on exit 0, deny on anything else.
+-- Non-bash tools are auto-approved (tool-gate already restricts them
+-- to the role's allowlist). This means read-only agents run fully
+-- autonomously with no user interaction.
 --
 -- ## Failure modes
 --
@@ -180,20 +188,23 @@ local function handle_permission_request(body)
   if type(id) ~= "string" or #id == 0 then return end
   local tool = body.tool or body.name
   local args = body.args
+  local is_ro = body.read_only == true
 
   if tool == "bash" then
     local cmd = (type(args) == "table" and args.command) or nil
-    local is_ro = body.read_only == true
     local verdict = classify_bash(cmd, is_ro)
     if verdict == "approve" then
       emit_response(id, "approve")
       return
     end
-    if verdict == "deny" then
+    if verdict == "deny" or is_ro then
       emit_response(id, "deny")
       return
     end
-    -- defer: fall through to popup.
+    -- defer: fall through to popup (non-read-only agents only).
+  elseif is_ro then
+    emit_response(id, "approve")
+    return
   elseif tool == "dispatch-graph" then
     local rejection = classify_dispatch_graph(args)
     if rejection ~= nil then
