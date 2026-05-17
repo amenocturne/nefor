@@ -88,7 +88,7 @@ M.AGENT_CONFIGS = {
   explorer = {
     system_prompt  = load_or_placeholder("explorer"),
     model          = model_for("explorer"),
-    tool_allowlist = { "read_file", "list_dir", "search_text" },
+    tool_allowlist = { "read_file", "list_dir", "search_text", "bash" },
     read_only      = true,
   },
   builder = {
