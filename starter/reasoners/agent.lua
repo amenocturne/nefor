@@ -834,11 +834,11 @@ local function receive_msg(entry)
       local fid = chat_to_firing[target_chat]
       local fentry = fid and agents[fid]
       if fentry then
-        emit_chat_append(fentry, { role = "user", content = text })
+        emit_chat_append(fentry, { role = "developer", content = text })
       end
     else
       for _, fentry in pairs(agents) do
-        emit_chat_append(fentry, { role = "user", content = text })
+        emit_chat_append(fentry, { role = "developer", content = text })
       end
     end
     return
