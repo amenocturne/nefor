@@ -1,6 +1,6 @@
 # Testing nefor
 
-How to verify a working build, run the test suite, and exercise each surface (CLI, TUI, mock e2e). Written against the post-CLI-plugin-epic main (May 2026 onward); the workspace ships ~1410 tests and the mock-driven CLI e2e suite as the default Stage-1 health check.
+How to verify a working build, run the test suite, and exercise each surface (CLI, TUI, mock e2e). Written against the post-CLI-plugin-epic main (May 2026 onward); the workspace ships ~1600 tests and the mock-driven CLI e2e suite as the default health check.
 
 ## TL;DR — 30-second smoke
 
@@ -19,11 +19,10 @@ If those three pass, the substrate is healthy.
 | Workspace unit tests    | `cargo test --workspace`                      | Per-crate unit tests across engine + all plugins                                                               | Few seconds, mostly in-process |
 | `agentic_cli_mock_e2e`  | `crates/nefor/tests/agentic_cli_mock_e2e.rs`  | Full chain (engine binary as subprocess + Lua + mock provider). 6 scenarios. **Default Stage-1 health check.** | ~2.5s wall                     |
 | `stage1_e2e`            | `crates/nefor/tests/stage1_e2e.rs`            | In-process duplex driver against a real provider. `#[ignore]`-gated; needs live Ollama at `localhost:11434`    | ~10-30s; opt-in                |
-| `combinators_slice1`    | `crates/nefor/tests/combinators_slice1.rs`    | Combinator registry + mock-plugin round-trip                                                                   | <1s                            |
-| `session_impersonation` | `crates/nefor/tests/session_impersonation.rs` | Session-log hydration + cross-session impersonation                                                            | <1s                            |
-| `starter_smoke`         | `crates/nefor/tests/starter_smoke.rs`         | Engine-binary smoke: ready handshake                                                                           | <1s                            |
 | `starter_ncp_test`      | `crates/nefor/tests/starter_ncp_test.rs`      | NCP v0.1 protocol in Lua                                                                                       | <1s                            |
-| Plugin unit tests       | `cargo test -p <plugin>`                      | Each plugin's own tests (nefor-chat has 482, openai-provider 137, etc.)                                        | Sub-second per plugin          |
+| `starter_sessions_test` | `crates/nefor/tests/starter_sessions_test.rs` | Session persistence + resume                                                                                   | <1s                            |
+| `starter_agentic_workflow_test` | `crates/nefor/tests/starter_agentic_workflow_test.rs` | Agentic orchestration Lua tests                                                                  | <1s                            |
+| Plugin unit tests       | `cargo test -p <plugin>`                      | Each plugin's own tests (nefor-tui has chat + layout + reconciler tests, openai-provider 137, etc.)            | Sub-second per plugin          |
 
 The `agentic_cli_mock_e2e` suite is the one to add scenarios to when you ship new agentic-cli flow behavior. It's deterministic, non-ignored, and fast enough to live in CI.
 
@@ -40,7 +39,7 @@ cargo test --test agentic_cli_mock_e2e
 cargo test --test agentic_cli_mock_e2e -- single_shot_text_canonical_happy_path
 
 # A specific plugin
-cargo test -p nefor-chat
+cargo test -p nefor-tui
 cargo test -p openai-provider
 
 # With output (for debugging a failing test)
@@ -268,13 +267,13 @@ Document at the top of `mock-provider/init.lua` what prompts trigger what respon
 
 **TUI doesn't render.** Wrong `TERM`, missing `tput`, or running over a terminal that doesn't support raw mode. Confirm `tput cols` and `tput lines` work.
 
-**TUI shows blank transcript on submit.** Likely a regression in `agentic_workflow.lua` — the chat plugin still emits chat-contract events but no one's translating provider events anymore. Re-run `cargo test -p nefor-chat` and `cargo test --test agentic_cli_mock_e2e`; if those pass but TUI is broken with a real provider, suspect provider-side translation in `agentic_workflow.for_provider`.
+**TUI shows blank transcript on submit.** Likely a regression in `agentic_workflow.lua` — the chat plugin still emits chat-contract events but no one's translating provider events anymore. Re-run `cargo test -p nefor-tui` and `cargo test --test agentic_cli_mock_e2e`; if those pass but TUI is broken with a real provider, suspect provider-side translation in `agentic_workflow.for_provider`.
 
 **`USE_MOCK_PROVIDER=true cmd` doesn't propagate env.** Some shells lose env vars across `bash -c '...'` subshells. Export the var first (`export USE_MOCK_PROVIDER=true; cmd`) or set explicitly per-command (`USE_MOCK_PROVIDER=true exec cmd`). For Rust tests use `Command::env()`, not relying on the parent process.
 
 ## What good looks like
 
-- **Workspace test count**: 1410 passing / 0 failed / 5 ignored on a clean main
+- **Workspace test count**: ~1600 passing / 0 failed on a clean main
 - **Mock e2e suite**: 6 scenarios, all green, ~2.5s wall
 - **Clippy**: clean across `cargo clippy --workspace --all-targets -- -D warnings`
 - **Fmt**: clean

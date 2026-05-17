@@ -40,13 +40,13 @@ The cost is a small amount of plumbing at the composition layer. The payoff is t
 
 ## Per-plugin transforms
 
-Sometimes the cleanest plugin design is to keep the producer in its native vocabulary (`mock-plugin` emitting `cc.*`) while the consumer speaks a vendor-neutral contract (`nefor-chat` consuming [`chat-contract v0.1`](./chat-contract.md)). Per-plugin transforms are the glue: they live in `init.lua`, run inside the engine's Lua step hook, and rename / reshape / drop envelopes so each plugin keeps its own clean surface.
+Sometimes the cleanest plugin design is to keep the producer in its native vocabulary (`mock-plugin` emitting `cc.*`) while the consumer speaks a vendor-neutral contract (the chat surface consuming [`chat-contract v0.1`](../starter/chat/README.md)). Per-plugin transforms are the glue: they live in `init.lua`, run inside the engine's Lua step hook, and rename / reshape / drop envelopes so each plugin keeps its own clean surface.
 
 This is composition layer work, not plugin layer work. The producer doesn't know who's listening; the consumer doesn't know who's producing. `init.lua` wires them together with a transform module per non-conforming peer.
 
 ### Two hooks
 
-`ncp.spawn` (defined in [`starter/ncp.lua`](../starter/ncp.lua)) accepts two optional functions:
+`ncp.spawn` (defined in [`lua/core/ncp.lua`](../lua/core/ncp.lua)) accepts two optional functions:
 
 - **`from_plugin(env)`** — runs once at ingress, after the named plugin emits and before the broker broadcasts. Rename or restructure events the plugin emits in its own namespace.
 - **`to_plugin(env)`** — runs at egress, per peer, before delivering to the named plugin. Rename or restructure events being delivered to it from elsewhere.
@@ -59,7 +59,7 @@ The broker deep-copies `body` before invoking each peer's `to_plugin`. Mutations
 
 ### Worked example
 
-[`starter/mock_plugin_adapter.lua`](../starter/mock_plugin_adapter.lua) bridges `mock-plugin` (`cc.*`) to `chat-contract v0.1` (`chat.*`). Two representative rewrites:
+[`starter/compositors/provider.lua`](../starter/compositors/provider.lua) bridges `mock-plugin` (`cc.*`) to `chat-contract v0.1` (`chat.*`). Two representative rewrites:
 
 ```lua
 -- from_plugin: mock-plugin emits, chat-contract surfaces.
@@ -80,17 +80,15 @@ The full module also drops `cc.assistant.usage` (`return nil`) since the cumulat
 Register the adapter in `init.lua` alongside the spawn:
 
 ```lua
-local cc_adapter = require("mock_plugin_adapter")
+local provider = require("compositors.provider")
 
-ncp.spawn {
-  name        = "mock-plugin",
-  command     = { "../target/debug/mock-plugin" },
-  from_plugin = cc_adapter.from_plugin,
-  to_plugin   = cc_adapter.to_plugin,
-}
+ncp.spawn(provider.compositor {
+  name    = "ollama",
+  command = { bin("openai-provider"), "--name", "ollama", "--base-url", "http://localhost:11434" },
+})
 ```
 
-A new harness gets a sibling adapter file and the same wiring. The chat plugin never has to learn another vendor namespace.
+A new provider gets its own compositor entry and the same wiring. The chat surface never has to learn another vendor namespace.
 
 ## Kind namespacing
 
@@ -164,10 +162,10 @@ A plugin MAY emit a single `<name>.manifest` event right after `ready_ok` (typic
 ```json
 {
   "type": "event",
-  "from": "nefor-chat",
+  "from": "nefor-tui",
   "ts": "…",
   "body": {
-    "kind": "nefor-chat.manifest",
+    "kind": "nefor-tui.manifest",
     "version": "0.2.0",
     "accepts": ["mock-plugin.message_delta", "mock-plugin.tool_start"],
     "emits": ["nefor-tui.grid.line", "nefor-tui.grid.flush"]

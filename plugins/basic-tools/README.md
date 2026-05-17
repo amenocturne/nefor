@@ -12,7 +12,7 @@ flow `LLM → openai-provider → basic-tools → result`.
 
 ## Wire contract
 
-See [`docs/chat-contract.md`](../../docs/chat-contract.md) → "Tool calling
+See [`starter/chat/README.md`](../../starter/chat/README.md) → "Tool calling
 (v1)" for the canonical spec. Quick reference:
 
 | Event                     | Direction            | Routing                               |
