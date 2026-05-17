@@ -827,15 +827,19 @@ local function receive_msg(entry)
   if kind == "chat.message.append" and body.role == "system" then
     local text = body.text or body.content
     if type(text) ~= "string" or #text == 0 then return end
-    -- Fold into every active firing. v0.1: no chat_id correlation on
-    -- the source envelope, so we fan out — this matches the
-    -- per-chat-deduped semantics tool-gate enforces (a single
-    -- AGENTS.md emission triggers one fold per agent, all targeting
-    -- their own provider chat). If finer correlation is ever needed,
-    -- threading a chat_id through tool-gate's smart loader is the
-    -- natural extension.
-    for _, fentry in pairs(agents) do
-      emit_chat_append(fentry, { role = "system", content = text })
+    -- Scope to the matching agent when chat_id is present; fall back
+    -- to fan-out for legacy envelopes without chat_id.
+    local target_chat = body.chat_id
+    if type(target_chat) == "string" and #target_chat > 0 then
+      local fid = chat_to_firing[target_chat]
+      local fentry = fid and agents[fid]
+      if fentry then
+        emit_chat_append(fentry, { role = "system", content = text })
+      end
+    else
+      for _, fentry in pairs(agents) do
+        emit_chat_append(fentry, { role = "system", content = text })
+      end
     end
     return
   end
