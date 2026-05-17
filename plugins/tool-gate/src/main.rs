@@ -401,6 +401,10 @@ async fn handle_tool_invoke(
         .get("args")
         .cloned()
         .unwrap_or(Value::Object(Map::new()));
+    let read_only = body
+        .get("read_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let source = match state.tool_owner.get(&name).cloned() {
         Some(s) => s,
@@ -433,7 +437,7 @@ async fn handle_tool_invoke(
                     args: args.clone(),
                 },
             );
-            send_event(out_tx, permission_request_body(&outer_id, &name, &args)).await?;
+            send_event(out_tx, permission_request_body(&outer_id, &name, &args, read_only)).await?;
         }
         Decision::Deny => {
             send_event(
@@ -585,7 +589,7 @@ fn forward_invoke_body(
     m
 }
 
-fn permission_request_body(id: &str, name: &str, args: &Value) -> Map<String, Value> {
+fn permission_request_body(id: &str, name: &str, args: &Value, read_only: bool) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert(
         "kind".into(),
@@ -594,6 +598,9 @@ fn permission_request_body(id: &str, name: &str, args: &Value) -> Map<String, Va
     m.insert("id".into(), Value::String(id.to_owned()));
     m.insert("tool".into(), Value::String(name.to_owned()));
     m.insert("args".into(), args.clone());
+    if read_only {
+        m.insert("read_only".into(), Value::Bool(true));
+    }
     m
 }
 

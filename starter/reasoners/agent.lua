@@ -505,33 +505,13 @@ local function dispatch_tool_call(entry, call)
     end
   end
 
-  if entry.read_only and name == "bash" then
-    local cmd = type(call_args) == "table" and call_args.command or ""
-    local ALLOWED_PREFIXES = {
-      "git ", "git%s", "find ", "wc ", "ls ", "cat ", "head ", "tail ",
-      "grep ", "rg ", "ag ", "awk ", "sed ", "sort ", "uniq ", "diff ",
-      "file ", "stat ", "du ", "df ", "env ", "echo ", "pwd", "which ",
-      "tree ", "realpath ", "basename ", "dirname ",
-    }
-    local ok = false
-    for _, pfx in ipairs(ALLOWED_PREFIXES) do
-      if cmd:match("^" .. pfx) then ok = true; break end
-    end
-    if not ok then
-      local pt = entry.pending_tools[tool_id]
-      pt.received = true
-      pt.error = "Read-only agent: bash command not in allowed set. Use git, find, grep, wc, etc."
-      entry.pending_count = entry.pending_count - 1
-      return true
-    end
-  end
-
   emit("tool-gate", {
-    kind    = "tool-gate.tool.invoke",
-    id      = tool_id,
-    name    = name,
-    args    = call_args,
-    chat_id = entry.chat_id,
+    kind      = "tool-gate.tool.invoke",
+    id        = tool_id,
+    name      = name,
+    args      = call_args,
+    chat_id   = entry.chat_id,
+    read_only = entry.read_only or nil,
   })
 
   -- Paired observer envelope so the chat surface can show "agent in

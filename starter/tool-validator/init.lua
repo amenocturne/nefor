@@ -65,6 +65,13 @@ local DA_ARGS = {
   "--cargo", "local",
 }
 
+local DA_ARGS_STRICT_READONLY = {
+  "--read-only",
+  "--macos-only",
+  "--help-bypass",
+  "--git", "read",
+}
+
 -- Resolved on first use. The cache holds the resolved cmd path
 -- (e.g. /Users/x/.local/share/nefor/bin/da) when da is reachable, or
 -- false when the probe failed. nil => not probed yet.
@@ -151,18 +158,20 @@ end
 -- Classify a bash command through da. Returns one of:
 --   "approve" | "deny" | "defer"
 -- Spawn / unavailability is treated as defer.
-local function classify_bash(command)
+local function classify_bash(command, read_only)
   if type(command) ~= "string" or #command == 0 then return "defer" end
   local cmd = probe_da()
   if not cmd then return "defer" end
+  local policy = read_only and DA_ARGS_STRICT_READONLY or DA_ARGS
   local r = nefor.process.run {
     cmd   = cmd,
-    args  = DA_ARGS,
+    args  = policy,
     stdin = command,
   }
   if type(r) ~= "table" then return "defer" end
   if r.code == 0 then return "approve" end
   if r.code == 2 then return "deny" end
+  if read_only then return "deny" end
   return "defer"
 end
 
@@ -174,7 +183,8 @@ local function handle_permission_request(body)
 
   if tool == "bash" then
     local cmd = (type(args) == "table" and args.command) or nil
-    local verdict = classify_bash(cmd)
+    local is_ro = body.read_only == true
+    local verdict = classify_bash(cmd, is_ro)
     if verdict == "approve" then
       emit_response(id, "approve")
       return
