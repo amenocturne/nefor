@@ -1248,16 +1248,38 @@ impl Engine {
         // animation primitive computes on the same frame.
         self.lua.set_now_ms(now);
         let desc = self.lua.render_view()?;
-        self.reconciler.reconcile(desc);
         let selection = self.current_selection();
-        let root = self.reconciler.root.as_mut().ok_or(TuiError::NotStarted)?;
-        sync_text_inputs(root);
-        let bytes = self.renderer.render_with_selection(root, selection);
-        // Snapshot geometry post-paint so `tui.scroll_position` is up
-        // to date on the next Lua call.
-        self.refresh_scroll_positions();
-        self.needs_render = false;
-        Ok(Some(bytes))
+        let result = {
+            let reconciler = &mut self.reconciler;
+            let renderer = &mut self.renderer;
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reconciler.reconcile(desc);
+                let root = reconciler.root.as_mut().expect("reconcile always sets root");
+                sync_text_inputs(root);
+                renderer.render_with_selection(root, selection)
+            }))
+        };
+        match result {
+            Ok(bytes) => {
+                // Snapshot geometry post-paint so `tui.scroll_position` is up
+                // to date on the next Lua call.
+                self.refresh_scroll_positions();
+                self.needs_render = false;
+                Ok(Some(bytes))
+            }
+            Err(panic_info) => {
+                let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                tracing::warn!(panic = %msg, "render pass panicked, skipping frame");
+                self.needs_render = true;
+                Ok(None)
+            }
+        }
     }
 
     /// Force a render on the next call to `render_if_dirty`. Used by

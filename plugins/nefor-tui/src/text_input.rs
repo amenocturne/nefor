@@ -586,7 +586,13 @@ pub fn cursor_in_wrap_for(value: &str, rows: &[WrappedRow], cursor: usize) -> (u
         let col: usize = slice.chars().map(char_cell_width).sum();
         return (i, col);
     }
-    let last = rows.last().expect("non-empty");
+    let last = match rows.last() {
+        Some(r) => r,
+        None => {
+            tracing::warn!("cursor_in_wrap_for: empty rows, returning (0, 0)");
+            return (0, 0);
+        }
+    };
     (rows.len() - 1, last.width)
 }
 

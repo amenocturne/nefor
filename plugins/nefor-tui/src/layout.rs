@@ -175,7 +175,10 @@ pub fn paint(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
 fn layout_text(inst: &mut WidgetInstance, c: Constraints) -> Size {
     let (content, wrap) = match &inst.last_desc {
         WidgetDescription::Text { content, wrap, .. } => (content.clone(), *wrap),
-        _ => unreachable!("kind/desc mismatch"),
+        _ => {
+            tracing::warn!("layout_text: kind/desc mismatch");
+            return Size::default();
+        }
     };
     let rows = wrap_text(&content, c.max_width, wrap);
     let height = rows.len() as u16;
@@ -278,7 +281,10 @@ fn enforce_width_contract(line: &str, max_width: u16) -> std::borrow::Cow<'_, st
 fn layout_spans(inst: &mut WidgetInstance, c: Constraints) -> Size {
     let (spans, wrap) = match &inst.last_desc {
         WidgetDescription::Spans { spans, wrap, .. } => (spans.clone(), *wrap),
-        _ => unreachable!("kind/desc mismatch"),
+        _ => {
+            tracing::warn!("layout_spans: kind/desc mismatch");
+            return Size::default();
+        }
     };
     let rows = wrap_styled(&styled_chars_from_spans(&spans), c.max_width, wrap);
     measure_styled_rows(&rows, c)
@@ -394,7 +400,10 @@ pub(crate) fn styled_chars_from_str(s: &str, style: Style) -> Vec<StyledChar> {
 fn layout_column(inst: &mut WidgetInstance, c: Constraints) -> Size {
     let gap = match &inst.last_desc {
         WidgetDescription::Column { gap, .. } => *gap,
-        _ => unreachable!(),
+        _ => {
+            tracing::warn!("layout_column: kind/desc mismatch, defaulting gap to 0");
+            0
+        }
     };
     flex_layout(inst, c, Axis::Vertical, gap)
 }
@@ -412,7 +421,10 @@ fn paint_column(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
 fn layout_row(inst: &mut WidgetInstance, c: Constraints) -> Size {
     let gap = match &inst.last_desc {
         WidgetDescription::Row { gap, .. } => *gap,
-        _ => unreachable!(),
+        _ => {
+            tracing::warn!("layout_row: kind/desc mismatch, defaulting gap to 0");
+            0
+        }
     };
     flex_layout(inst, c, Axis::Horizontal, gap)
 }
@@ -693,7 +705,10 @@ fn layout_padding(inst: &mut WidgetInstance, c: Constraints) -> Size {
             left,
             ..
         } => (*top, *right, *bottom, *left),
-        _ => unreachable!(),
+        _ => {
+            tracing::warn!("layout_padding: kind/desc mismatch, defaulting padding to 0");
+            (0, 0, 0, 0)
+        }
     };
     let h_pad = left.saturating_add(right);
     let v_pad = top.saturating_add(bottom);
@@ -877,7 +892,10 @@ fn layout_constrained(inst: &mut WidgetInstance, c: Constraints) -> Size {
             max_height,
             ..
         } => (*min_width, *max_width, *min_height, *max_height),
-        _ => unreachable!(),
+        _ => {
+            tracing::warn!("layout_constrained: kind/desc mismatch, using unconstrained defaults");
+            (None, None, None, None)
+        }
     };
     // Intersect requested bounds with parent's. `nil` requested fields
     // fall through to the parent's bound.
@@ -950,7 +968,10 @@ fn paint_align(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
 fn layout_anchored(inst: &mut WidgetInstance, c: Constraints) -> Size {
     let (width, height) = match &inst.last_desc {
         WidgetDescription::Anchored { width, height, .. } => (*width, *height),
-        _ => unreachable!(),
+        _ => {
+            tracing::warn!("layout_anchored: kind/desc mismatch, defaulting to intrinsic dimensions");
+            (Dimension::Intrinsic, Dimension::Intrinsic)
+        }
     };
 
     // Resolve fixed/percent dimensions up-front against the parent's max.
@@ -1099,7 +1120,10 @@ fn layout_text_input(inst: &mut WidgetInstance, c: Constraints) -> Size {
             max_lines,
             ..
         } => (value.clone(), *min_lines, *max_lines),
-        _ => unreachable!("kind/desc mismatch"),
+        _ => {
+            tracing::warn!("layout_text_input: kind/desc mismatch");
+            return Size::default();
+        }
     };
     // Width: prefer parent's max so wrapping/scroll can use the full
     // budget. Sync state's `last_value` here so the paint pass and the
@@ -1525,7 +1549,10 @@ fn layout_scrollable(inst: &mut WidgetInstance, c: Constraints) -> Size {
             stick_to,
             ..
         } => (*scrollbar, *stick_to),
-        _ => unreachable!("kind/desc mismatch"),
+        _ => {
+            tracing::warn!("layout_scrollable: kind/desc mismatch");
+            return c.constrain(Size::default());
+        }
     };
 
     // The scrollable claims its parent's max bounds. Then we lay the
