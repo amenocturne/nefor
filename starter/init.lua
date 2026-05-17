@@ -81,21 +81,13 @@ else
             .. "; check network + ref existence on origin")
     end
   else
-    -- Self-heal: if the existing checkout is on a different ref than
-    -- UPSTREAM_REF (e.g. an earlier bootstrap that landed on the github
-    -- default branch, or UPSTREAM_REF got bumped between runs), fetch
-    -- and check out the desired ref. Fast path (no network) when
-    -- already on the right ref.
-    local current = capture("git -C '" .. pm_root .. "' rev-parse --abbrev-ref HEAD 2>/dev/null")
-    if current ~= UPSTREAM_REF then
-      io.stderr:write("[nefor-team bootstrap] " .. pm_root .. " is on "
-                   .. tostring(current) .. ", switching to " .. UPSTREAM_REF .. "\n")
-      if not run("git -C '" .. pm_root .. "' fetch --depth 1 origin '" .. UPSTREAM_REF .. "'") then
-        error("nefor-team bootstrap: git fetch origin " .. UPSTREAM_REF .. " failed in " .. pm_root)
-      end
-      if not run("git -C '" .. pm_root .. "' checkout '" .. UPSTREAM_REF .. "'") then
-        error("nefor-team bootstrap: git checkout " .. UPSTREAM_REF .. " failed in " .. pm_root)
-      end
+    local local_hash = capture("git -C '" .. pm_root .. "' rev-parse HEAD 2>/dev/null") or ""
+    local remote_hash = capture("git ls-remote origin '" .. UPSTREAM_REF .. "' 2>/dev/null") or ""
+    remote_hash = remote_hash:match("^(%x+)") or ""
+    if local_hash ~= remote_hash or local_hash == "" then
+      run("git -C '" .. pm_root .. "' fetch --depth 1 origin '" .. UPSTREAM_REF .. "' 2>/dev/null")
+      run("git -C '" .. pm_root .. "' checkout '" .. UPSTREAM_REF .. "' 2>/dev/null")
+      run("git -C '" .. pm_root .. "' reset --hard origin/" .. UPSTREAM_REF .. " 2>/dev/null")
     end
   end
   if not run("git -C '" .. pm_root .. "' sparse-checkout set " .. SPARSE_CONE) then
