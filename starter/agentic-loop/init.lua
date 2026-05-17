@@ -184,12 +184,17 @@ end
 local function flush_deferred()
   if state.current_run_id ~= nil then return end
   if #state.deferred_queue == 0 then return end
-  local entry = table.remove(state.deferred_queue, 1)
-  nefor.log.info("agentic-loop: flushing deferred spawn_graph result", {
-    text_preview = string.sub(entry.text, 1, 80),
-    queue_remaining = #state.deferred_queue,
+  local parts = {}
+  while #state.deferred_queue > 0 do
+    local entry = table.remove(state.deferred_queue, 1)
+    parts[#parts + 1] = entry.text
+  end
+  local merged = table.concat(parts, "\n\n---\n\n")
+  nefor.log.info("agentic-loop: flushing deferred spawn_graph results", {
+    count = #parts,
+    text_preview = string.sub(merged, 1, 80),
   })
-  submit_orchestrator_run(entry.text)
+  submit_orchestrator_run(merged)
 end
 
 local function flush_pending_user_inputs()
