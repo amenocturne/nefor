@@ -594,7 +594,11 @@ local function handle_tool_result_run_close(run_id, body)
     emit("nefor-tui", graph_event)
     local text = format_deferred(completion)
     state.deferred_queue[#state.deferred_queue + 1] = { text = text }
-    flush_deferred()
+    -- Flush when no more sub-graphs are pending — delivers all results
+    -- in one batch so the lead processes them in a single turn.
+    if next(state.pending_runs) == nil then
+      flush_deferred()
+    end
     -- Note: do NOT return; the orchestrator-match branch below may
     -- also fire if (rare) the sub-graph completion races the
     -- orchestrator's own run-close envelope.

@@ -414,12 +414,12 @@ local function dispatch_graph(firing_id, args)
     run_id = run_id,
     nodes  = n,
     notice = string.format(
-      "Submitted (async, %d node%s). Acknowledge briefly to the user " ..
-      "in one short sentence, then WAIT for the result. Do NOT call " ..
-      "dispatch-graph again for this same task — the result will arrive " ..
-      "later as a user message tagged `[spawn_graph(run_id=%s) result]`. " ..
-      "You may dispatch a DIFFERENT task in parallel if the user asked " ..
-      "for one.",
+      "Graph submitted (async, %d node%s, run_id=%s). " ..
+      "If you have more independent tasks to dispatch, call dispatch-graph " ..
+      "again NOW in this same turn — do not wait. Once all dispatches are " ..
+      "done, acknowledge briefly to the user and stop. Results arrive " ..
+      "later as `[spawn_graph(run_id=...) result]` messages. " ..
+      "Do NOT re-dispatch the same task.",
       n, n == 1 and "" or "s", run_id),
   })
 end
