@@ -109,7 +109,13 @@ fn init_tracing() {
 
     let debug_dir = std::env::var("NEFOR_DEBUG").ok().and_then(|v| {
         if v == "1" || v.eq_ignore_ascii_case("true") || v.is_empty() {
-            dirs::data_dir().map(|d| d.join("nefor").join("debug"))
+            let base = std::env::var("NEFOR_DATA_DIR")
+                .ok()
+                .map(std::path::PathBuf::from)
+                .or_else(|| std::env::var("HOME").ok().map(|h| {
+                    std::path::PathBuf::from(h).join(".local/share/nefor")
+                }));
+            base.map(|d| d.join("debug"))
         } else {
             Some(std::path::PathBuf::from(v))
         }

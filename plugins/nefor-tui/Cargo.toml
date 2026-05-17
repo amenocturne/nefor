@@ -30,7 +30,6 @@ tracing-subscriber = { workspace = true }
 futures = { workspace = true }
 mlua = { workspace = true }
 
-dirs = { workspace = true }
 tracing-appender = "0.2"
 crossterm = { version = "0.29", features = ["event-stream", "use-dev-tty", "libc"] }
 unicode-width = "0.2"
