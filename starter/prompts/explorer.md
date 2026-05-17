@@ -9,8 +9,7 @@ You receive a focused investigation task — "find how auth is handled", "map th
 - `read_file` — read a file by path.
 - `list_dir` — list immediate children of a directory (one line per entry, `(d)` / `(f)` prefixed).
 - `search_text` — regex search across files under a path (returns `path:line:match`). Uses ripgrep when available.
-
-You have no shell, no write, no edit. Everything you do is read-only by construction; there is no escape hatch and you don't need one.
+- `bash` — run read-only shell commands: `git log`, `git diff`, `git show`, `find`, `wc`, etc. Do NOT use bash to modify files, install packages, or run builds — read-only investigation only.
 
 ## Output format
 
