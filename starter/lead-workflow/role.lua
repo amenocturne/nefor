@@ -67,23 +67,16 @@ local function model_for(role) return ROLE_MODELS[role] end
 
 M.LEAD_SYSTEM_PROMPT = load_or_placeholder("lead")
 
--- basic-tools advertises read_file, write_file, bash. read-only-tools
--- (Lua-resident) adds list_dir + search_text — actual read-only
--- primitives for investigation, replacing the previous explorer-with-
--- bash shape (bash is a sandbox-escape hatch via shell composition,
--- so "read-only role with bash" was a contradiction).
---
--- The synthetic `finalize` terminator is appended by the agent reasoner
--- itself; it does not need listing here.
---
 -- Per-role boundaries:
---   * explorer/reviewer/critic/reflector — read-only investigation
---                       (read_file + list_dir + search_text). No shell,
---                       no write.
---   * builder         — read-only set + write_file + bash.
---   * tester          — read-only set + bash (runs the test command).
---   * prompt-engineer — read-only set + write_file (writes prompt
---                       files; no bash).
+--   * explorer        — read-only set + bash (da-gated, strict read-only
+--                       policy). Auto-approved/denied, never prompts user.
+--   * reviewer/critic/reflector — read-only (read_file + list_dir +
+--                       search_text). No shell, no write.
+--   * builder         — read-only set + write_file + bash (da-gated,
+--                       normal policy). Approved commands auto-pass,
+--                       rest prompt user.
+--   * tester          — read-only set + bash.
+--   * prompt-engineer — read-only set + write_file (no bash).
 M.AGENT_CONFIGS = {
   explorer = {
     system_prompt  = load_or_placeholder("explorer"),
