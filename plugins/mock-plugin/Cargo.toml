@@ -1,6 +1,6 @@
 [package]
 name = "mock-plugin"
-version = "0.1.5"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
