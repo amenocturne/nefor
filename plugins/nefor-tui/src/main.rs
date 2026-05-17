@@ -102,15 +102,56 @@ fn load_script_or_placeholder(
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
+fn init_tracing() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer as _;
+
+    let debug_dir = std::env::var("NEFOR_DEBUG").ok().and_then(|v| {
+        if v == "1" || v.eq_ignore_ascii_case("true") || v.is_empty() {
+            dirs::data_dir().map(|d| d.join("nefor").join("debug"))
+        } else {
+            Some(std::path::PathBuf::from(v))
+        }
+    });
+
+    let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
-        .with_env_filter(
+        .with_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .init();
+        );
+
+    if let Some(dir) = debug_dir {
+        let _ = std::fs::create_dir_all(&dir);
+        let file_appender = tracing_appender::rolling::never(&dir, "nefor-tui.log");
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_writer(file_appender)
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::EnvFilter::new("debug"));
+        tracing_subscriber::registry()
+            .with(stderr_layer)
+            .with(file_layer)
+            .init();
+        let crash_dir = dir.clone();
+        std::panic::set_hook(Box::new(move |info| {
+            let msg = format!("{info}");
+            let bt = std::backtrace::Backtrace::force_capture();
+            let crash = format!("{msg}\n\nBacktrace:\n{bt}");
+            let path = crash_dir.join("nefor-tui-crash.log");
+            let _ = std::fs::write(&path, &crash);
+            eprintln!("nefor-tui: panic (written to {})\n{msg}", path.display());
+        }));
+    } else {
+        tracing_subscriber::registry()
+            .with(stderr_layer)
+            .init();
+    }
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    init_tracing();
 
     let script = match parse_script_flag() {
         Ok(s) => s,
@@ -362,8 +403,10 @@ fn process_envelope(engine: &mut Engine, env: Envelope, shutdown: &mut bool) {
             tracing::debug!("post-handshake system message ignored");
         }
         Body::Event(map) => {
+            let kind = map.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+            tracing::debug!(kind = kind, "dispatch envelope");
             if let Err(e) = engine.dispatch_envelope_body(&map) {
-                tracing::warn!(error = %e, "engine.dispatch_envelope_body");
+                tracing::warn!(error = %e, kind = kind, "engine.dispatch_envelope_body");
             }
         }
     }
