@@ -190,7 +190,23 @@ local function handle_permission_request(body)
       emit_response(id, "deny", rejection)
       return
     end
-    -- pass: fall through to popup so the user still confirms execution.
+    -- Auto-approve when every node uses a read-only role.
+    local all_readonly = true
+    local READ_ONLY_ROLES = { explorer = true, reviewer = true, critic = true, reflector = true }
+    local nodes = type(args) == "table" and args.nodes or {}
+    if type(nodes) == "table" then
+      for _, n in ipairs(nodes) do
+        if type(n) == "table" and not READ_ONLY_ROLES[n.role] then
+          all_readonly = false
+          break
+        end
+      end
+    end
+    if all_readonly then
+      emit_response(id, "approve")
+      return
+    end
+    -- write-capable roles: fall through to popup.
   end
 
   emit_popup(body)
