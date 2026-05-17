@@ -17,8 +17,8 @@ use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::openai::{
-    parse_models_response, parse_sse_chunk, ChatRequest, Message, SseEvent, StreamOptions,
-    ToolCall, ToolCallFunction, Usage,
+    parse_models_response, parse_sse_chunk, ChatRequest, Message, ModelInfo, SseEvent,
+    StreamOptions, ToolCall, ToolCallFunction, Usage,
 };
 
 /// Outcome of `run_chat_stream`. Carries everything the caller needs to
@@ -284,7 +284,7 @@ pub async fn list_models(
     base_url: &str,
     api_key: Option<&str>,
     auth_header: &str,
-) -> Result<Vec<String>, StreamError> {
+) -> Result<Vec<ModelInfo>, StreamError> {
     let endpoint = format!("{}/v1/models", base_url.trim_end_matches('/'));
     let mut builder = client.get(&endpoint);
     if let Some(k) = api_key {

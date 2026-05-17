@@ -54,7 +54,7 @@ use openai_provider::auth::{AuthSnapshot, AuthState, AuthStore, LogoutOutcome};
 use openai_provider::broker::{ToolBroker, ToolResult};
 use openai_provider::catalog::ToolCatalog;
 use openai_provider::config::Config;
-use openai_provider::openai::{Message, ToolCall};
+use openai_provider::openai::{Message, ModelInfo, ToolCall};
 use openai_provider::state::{ChatId, ChatStats, Chats, ChatsError};
 use openai_provider::stream::{list_models, run_chat_stream, ReasoningEvent, StreamError};
 use serde_json::{Map, Value};
@@ -1460,7 +1460,7 @@ fn auth_status_body(config: &Config, snap: &AuthSnapshot) -> Map<String, Value> 
     m
 }
 
-fn models_listed_body(config: &Config, models: &[String]) -> Map<String, Value> {
+fn models_listed_body(config: &Config, models: &[ModelInfo]) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert(
         "kind".into(),
@@ -1468,8 +1468,18 @@ fn models_listed_body(config: &Config, models: &[String]) -> Map<String, Value> 
     );
     m.insert(
         "models".into(),
-        Value::Array(models.iter().cloned().map(Value::String).collect()),
+        Value::Array(models.iter().map(|mi| Value::String(mi.id.clone())).collect()),
     );
+    let ctx_map: Map<String, Value> = models
+        .iter()
+        .filter_map(|mi| {
+            mi.context_window
+                .map(|cw| (mi.id.clone(), Value::Number(cw.into())))
+        })
+        .collect();
+    if !ctx_map.is_empty() {
+        m.insert("context_windows".into(), Value::Object(ctx_map));
+    }
     m
 }
 
@@ -2321,7 +2331,11 @@ mod tests {
 
     #[test]
     fn models_listed_body_carries_models_with_prefix() {
-        let b = models_listed_body(&cfg("ollama"), &["a".into(), "b".into()]);
+        let models = vec![
+            ModelInfo { id: "a".into(), context_window: None },
+            ModelInfo { id: "b".into(), context_window: Some(128000) },
+        ];
+        let b = models_listed_body(&cfg("ollama"), &models);
         assert_eq!(
             b.get("kind").unwrap().as_str(),
             Some("ollama.models.listed")
@@ -2330,6 +2344,9 @@ mod tests {
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0].as_str(), Some("a"));
         assert_eq!(arr[1].as_str(), Some("b"));
+        let cw = b.get("context_windows").unwrap().as_object().expect("map");
+        assert_eq!(cw.len(), 1);
+        assert_eq!(cw.get("b").unwrap().as_u64(), Some(128000));
     }
 
     #[test]

@@ -12,7 +12,14 @@ local humanize_duration_ms = common.humanize_duration_ms
 local M = {}
 
 local function ctx_bar(used, max)
-  if used == nil or max == nil or max == 0 then return nil end
+  if used == nil then return nil end
+  if max == nil or max == 0 then
+    return {
+      spans = {
+        { text = "ctx " .. (humanize_tokens(used) or tostring(used)), fg = C.system },
+      },
+    }
+  end
   local pct = math.floor(100 * used / max + 0.5)
   if pct < 0 then pct = 0 end
   if pct > 100 then pct = 100 end
@@ -55,8 +62,8 @@ local function build_segments(state)
   end
 
   local s = state.stats or {}
-  local last_ctx = s.last_turn_context_tokens or s.context_tokens or s.prompt_tokens
-  if last_ctx and state.max_tokens then
+  local last_ctx = s.last_turn_context_tokens or s.last_turn_input_tokens or s.context_tokens or s.prompt_tokens
+  if last_ctx then
     local cb = ctx_bar(last_ctx, state.max_tokens)
     if cb then segs[#segs + 1] = cb end
   end

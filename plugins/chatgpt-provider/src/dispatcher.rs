@@ -242,17 +242,22 @@ fn session_stats_body(args: &ServeArgs, chat_id: &ChatId, stats: &ChatStats) -> 
 }
 
 fn models_listed_body(args: &ServeArgs, models: &[ModelEntry]) -> Map<String, Value> {
-    // Flat list of slug strings, matching openai-provider's wire shape
-    // so the chat surface's model picker (which calls tostring(m) on
-    // each entry) renders cleanly. Display names + descriptions live
-    // on `ModelEntry` if a future UI wants them, but we don't emit
-    // them on the bus today.
     let arr: Vec<Value> = models
         .iter()
         .map(|m| Value::String(m.slug.clone()))
         .collect();
     let mut m = Map::new();
     m.insert("models".into(), Value::Array(arr));
+    let ctx_map: Map<String, Value> = models
+        .iter()
+        .filter_map(|me| {
+            me.context_length
+                .map(|cw| (me.slug.clone(), Value::Number(cw.into())))
+        })
+        .collect();
+    if !ctx_map.is_empty() {
+        m.insert("context_windows".into(), Value::Object(ctx_map));
+    }
     make_event(format!("{}models.listed", args.event_prefix()), m)
 }
 
@@ -1826,6 +1831,7 @@ mod tests {
                 description: None,
                 priority: Some(10),
                 supports_reasoning_summaries: true,
+                context_length: None,
             },
             ModelEntry {
                 slug: "gpt-5-codex".into(),
@@ -1833,6 +1839,7 @@ mod tests {
                 description: Some("coding model".into()),
                 priority: Some(20),
                 supports_reasoning_summaries: false,
+                context_length: None,
             },
         ];
         let body = models_listed_body(&args(), &fetched);

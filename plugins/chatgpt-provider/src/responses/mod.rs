@@ -64,6 +64,9 @@ pub struct ModelEntry {
     /// summary visible, which is strictly safer than a 400.
     #[serde(default)]
     pub supports_reasoning_summaries: bool,
+    /// Context window size if the backend reports it.
+    #[serde(default, alias = "max_input_tokens", alias = "context_window")]
+    pub context_length: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

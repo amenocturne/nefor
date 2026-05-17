@@ -241,7 +241,8 @@ async fn list_models_returns_sorted_ids() {
 
     let _ = server.await;
 
-    assert_eq!(models, vec!["apple", "mango", "zebra"]);
+    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, vec!["apple", "mango", "zebra"]);
 }
 
 #[tokio::test]

@@ -23,10 +23,8 @@ local NEFOR_DEV_DIR = os.getenv("NEFOR_DEV_DIR")
 
 -- Pinned upstream ref for the bootstrap clone. Bumping this is a
 -- single-source change: the clone path AND every pm.install entry
--- below pick it up. Currently tracks the qol-fixes branch — bump to
--- a stable tag (v0.1.6+) once qol-fixes merges and the starter's
--- runtime contract is locked in.
-local UPSTREAM_REF = "qol-fixes"
+-- below pick it up.
+local UPSTREAM_REF = "main"
 local SPARSE_CONE  = "lua starter plugins"
 
 local function path_exists(p)

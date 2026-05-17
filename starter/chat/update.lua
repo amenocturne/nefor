@@ -25,12 +25,9 @@ local DOUBLE_ESC_MS = 600
 
 -- Per-model context window. opus/sonnet/haiku → 200k. Other models
 -- have unknown context windows; the ctx bar hides until we know.
-local function model_max_tokens(model)
-  if model == nil then return nil end
-  local m = model:lower()
-  if m:find("opus") or m:find("sonnet") or m:find("haiku") then return 200000 end
-  return nil
-end
+-- Per-model context window sizes reported by the provider's model list.
+-- Populated by chat.models.listed events; keyed by model id.
+local model_context_windows = {}
 
 -- The prompt widget's `handle()` consumes a fixed set of kinds when a
 -- completion is active (key.up/down/tab/escape) and on every value
@@ -858,11 +855,11 @@ function M.update(msg, state)
       if k ~= "kind" then stats[k] = v end
     end
     local s = shallow_merge(state, { stats = stats })
-    if msg.model and not state.model then
-      s = shallow_merge(s, {
-        model = msg.model,
-        max_tokens = model_max_tokens(msg.model) or state.max_tokens,
-      })
+    if msg.model then
+      local mt = msg.max_context_tokens
+        or model_context_windows[msg.model]
+        or state.max_tokens
+      s = shallow_merge(s, { model = msg.model, max_tokens = mt })
     end
     return s, {}
   end
@@ -1003,13 +1000,20 @@ function M.update(msg, state)
     if state.replay_mode then return state, {} end
     return shallow_merge(state, {
       model = msg.model or state.model,
-      max_tokens = model_max_tokens(msg.model) or state.max_tokens,
+      max_tokens = model_context_windows[msg.model] or state.max_tokens,
     }), {}
   end
 
   if kind == "chat.models.listed" then
-    -- A provider answered the list-request. Update its section in
-    -- the open model_picker popup if one is up; otherwise drop.
+    -- Absorb per-model context windows if the provider reported them.
+    if type(msg.context_windows) == "table" then
+      for model_id, ctx_size in pairs(msg.context_windows) do
+        if type(ctx_size) == "number" and ctx_size > 0 then
+          model_context_windows[model_id] = ctx_size
+        end
+      end
+    end
+    -- Update the open model_picker popup if one is up; otherwise drop.
     if not (state.popup and state.popup.variant == "model_picker") then
       return state, {}
     end

@@ -216,9 +216,19 @@ pub struct Usage {
     pub total_tokens: u64,
 }
 
+/// Parsed model info from `/v1/models`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelInfo {
+    pub id: String,
+    /// Context window size if the backend reports it (vLLM, LiteLLM, etc.).
+    pub context_window: Option<u64>,
+}
+
 /// Parse the `data` array from a `GET /v1/models` response into a sorted
-/// alphabetical list of model IDs. Skips entries without a string `id`.
-pub fn parse_models_response(payload: &str) -> Vec<String> {
+/// alphabetical list of model info. Skips entries without a string `id`.
+/// Opportunistically extracts context window from common extension fields
+/// (`max_model_len`, `max_input_tokens`, `context_length`, `context_window`).
+pub fn parse_models_response(payload: &str) -> Vec<ModelInfo> {
     let value: serde_json::Value = match serde_json::from_str(payload) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
@@ -226,12 +236,21 @@ pub fn parse_models_response(payload: &str) -> Vec<String> {
     let Some(arr) = value.get("data").and_then(|v| v.as_array()) else {
         return Vec::new();
     };
-    let mut ids: Vec<String> = arr
+    let mut models: Vec<ModelInfo> = arr
         .iter()
-        .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(str::to_owned))
+        .filter_map(|m| {
+            let id = m.get("id").and_then(|v| v.as_str())?.to_owned();
+            let context_window = m
+                .get("max_model_len")
+                .or_else(|| m.get("max_input_tokens"))
+                .or_else(|| m.get("context_length"))
+                .or_else(|| m.get("context_window"))
+                .and_then(|v| v.as_u64());
+            Some(ModelInfo { id, context_window })
+        })
         .collect();
-    ids.sort();
-    ids
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models
 }
 
 /// Parse a single SSE `data:` payload (the JSON between `data: ` and the
@@ -509,18 +528,23 @@ mod tests {
         assert!(v.get("tool_call_id").is_none(), "skip-serialized");
     }
 
+    fn model_ids(models: &[ModelInfo]) -> Vec<&str> {
+        models.iter().map(|m| m.id.as_str()).collect()
+    }
+
     #[test]
     fn list_models_parses_data_array() {
         let payload = r#"{"data":[{"id":"gpt-4"},{"id":"gpt-3.5"}]}"#;
-        let ids = parse_models_response(payload);
-        assert_eq!(ids, vec!["gpt-3.5".to_string(), "gpt-4".to_string()]);
+        let models = parse_models_response(payload);
+        assert_eq!(model_ids(&models), vec!["gpt-3.5", "gpt-4"]);
+        assert!(models.iter().all(|m| m.context_window.is_none()));
     }
 
     #[test]
     fn list_models_sorts_alphabetically() {
         let payload = r#"{"data":[{"id":"zebra"},{"id":"apple"},{"id":"mango"}]}"#;
-        let ids = parse_models_response(payload);
-        assert_eq!(ids, vec!["apple", "mango", "zebra"]);
+        let models = parse_models_response(payload);
+        assert_eq!(model_ids(&models), vec!["apple", "mango", "zebra"]);
     }
 
     #[test]
@@ -533,8 +557,21 @@ mod tests {
     #[test]
     fn list_models_skips_entries_without_id() {
         let payload = r#"{"data":[{"id":"a"},{"object":"model"},{"id":"b"}]}"#;
-        let ids = parse_models_response(payload);
-        assert_eq!(ids, vec!["a", "b"]);
+        let models = parse_models_response(payload);
+        assert_eq!(model_ids(&models), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn list_models_extracts_context_window() {
+        let payload = r#"{"data":[
+            {"id":"vllm-model","max_model_len":32768},
+            {"id":"litellm-model","max_input_tokens":128000},
+            {"id":"plain-model"}
+        ]}"#;
+        let models = parse_models_response(payload);
+        assert_eq!(models[0].context_window, Some(128000));
+        assert_eq!(models[1].context_window, None);
+        assert_eq!(models[2].context_window, Some(32768));
     }
 
     // --- Tool-call SSE delta parser tests --------------------------------
