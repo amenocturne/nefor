@@ -644,7 +644,7 @@ fn install_tui(
                         hi = mid - 1;
                     }
                 }
-                lo
+                lo.min(item_count.saturating_sub(1))
             };
 
             // Last visible: last entry whose top edge <= vis_bot.
