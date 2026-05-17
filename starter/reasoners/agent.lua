@@ -375,6 +375,7 @@ local function handle(body)
     provider       = provider,
     tool_allowlist = build_allowlist_set(args.tool_allowlist),
     cwd            = type(args.cwd) == "string" and args.cwd or nil,
+    read_only      = args.read_only == true,
     pending_tools  = {},
     pending_order  = {},
     pending_count  = 0,
@@ -501,6 +502,27 @@ local function dispatch_tool_call(entry, call)
     if name == "bash" or name == "write_file" or name == "read_file" then
       call_args = call_args
       call_args.cwd = entry.cwd
+    end
+  end
+
+  if entry.read_only and name == "bash" then
+    local cmd = type(call_args) == "table" and call_args.command or ""
+    local ALLOWED_PREFIXES = {
+      "git ", "git%s", "find ", "wc ", "ls ", "cat ", "head ", "tail ",
+      "grep ", "rg ", "ag ", "awk ", "sed ", "sort ", "uniq ", "diff ",
+      "file ", "stat ", "du ", "df ", "env ", "echo ", "pwd", "which ",
+      "tree ", "realpath ", "basename ", "dirname ",
+    }
+    local ok = false
+    for _, pfx in ipairs(ALLOWED_PREFIXES) do
+      if cmd:match("^" .. pfx) then ok = true; break end
+    end
+    if not ok then
+      local pt = entry.pending_tools[tool_id]
+      pt.received = true
+      pt.error = "Read-only agent: bash command not in allowed set. Use git, find, grep, wc, etc."
+      entry.pending_count = entry.pending_count - 1
+      return true
     end
   end
 

@@ -292,6 +292,9 @@ local function build_graph_spec(node_specs)
       if type(cfg.model) == "string" and type(agent_args.model) ~= "string" then
         agent_args.model = cfg.model
       end
+      if cfg.read_only == true then
+        agent_args.read_only = true
+      end
     end
 
     nodes[#nodes + 1] = {

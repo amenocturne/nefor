@@ -64,6 +64,7 @@ local function normalise(p)
   p = p:gsub("/+", "/")
   p = p:gsub("/%./", "/")
   if p:sub(1, 2) == "./" then p = p:sub(3) end
+  if #p > 1 and p:sub(-2) == "/." then p = p:sub(1, -3) end
   if #p > 1 and p:sub(-1) == "/" then p = p:sub(1, -2) end
   return p
 end
