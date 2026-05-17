@@ -1,8 +1,0 @@
-provider: nestor
-models:
-  orchestrator: nestor/tgpt/qwen35-397b-a17b-fp8
-  worker: nestor/tgpt/qwen35-397b-a17b-fp8
-  reviewer: nestor/tgpt/qwen35-397b-a17b-fp8
-  explorer: nestor/tgpt/qwen35-397b-a17b-fp8
-  tester: nestor/tgpt/qwen35-397b-a17b-fp8
-  promptEngineer: nestor/tgpt/qwen35-397b-a17b-fp8
