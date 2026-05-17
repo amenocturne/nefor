@@ -65,7 +65,7 @@
 --
 -- ## Termination on session exit
 --
--- Subscribes to `sessions.session_end`. If `state.active_run_id ~= nil`,
+-- Subscribes to `sessions.session_end`. If active graphs exist,
 -- emits `<reasoner-graph>.cancel { run_id }` and appends a system
 -- message `[Graph terminated by user — session exit]` to chat history
 -- so the model sees it on the next turn. Also clears `state.active_plan`
@@ -80,9 +80,9 @@ local emit_as = envelope.emit_as
 local emit    = envelope.emit
 
 local state = {
-  -- The in-flight graph's run_id; nil when no graph is running.
-  ---@type string|nil
-  active_run_id = nil,
+  -- In-flight graph run_ids; empty when no graphs are running.
+  ---@type table<string, boolean>
+  active_run_ids = {},
 
   -- The single in-flight plan slot. Lifetime is one verdict turn:
   -- created by write-review, decided by /approve or /reject, flushed
@@ -399,7 +399,7 @@ local function dispatch_graph(firing_id, args)
     return
   end
   al.flush_pending_dispatches()
-  state.active_run_id = run_id
+  state.active_run_ids[run_id] = true
 
   -- The ack body carries an explicit async-contract instruction. Without
   -- it, smaller models (qwen2.5:7b observed in practice) read the bare
@@ -614,31 +614,23 @@ local function terminate_active_graph()
   -- state is torn down with the session so there's nothing to ack into.
   state.active_plan = nil
 
-  if state.active_run_id == nil then return end
-  local run_id = state.active_run_id
-  state.active_run_id = nil
+  if next(state.active_run_ids) == nil then return end
+  local ids_to_cancel = state.active_run_ids
+  state.active_run_ids = {}
 
   -- Broadcast (target = nil) rather than target reasoner-graph: every
   -- in-flight agent reasoner under this run also needs to see the
   -- envelope so it can interrupt its provider stream + close its
   -- firing (sub-graph cancel propagation). The reasoner-graph
   -- binary still receives the broadcast and processes it the same way.
-  emit_as(SOURCE_NAME, nil, { kind = "graph.cancel", run_id = run_id })
-  -- Previously this emitted a "[Graph terminated by user — session
-  -- exit]" chat.message.append for user feedback, but the message
-  -- went into the bus log and leaked into the NEXT session's chat
-  -- when /new replayed bus state. The cancel itself (above) is the
-  -- functional close; the user already knows they ended the
-  -- session. Logging only.
-  nefor.log.info("lead-workflow: graph terminated on session-end", { run_id = run_id })
+  for run_id in pairs(ids_to_cancel) do
+    emit_as(SOURCE_NAME, nil, { kind = "graph.cancel", run_id = run_id })
+    nefor.log.info("lead-workflow: graph terminated on session-end", { run_id = run_id })
+  end
 end
 
--- Run-close watcher — clear active_run_id when the in-flight graph
--- finishes on its own.
 local function maybe_clear_active_run(run_id)
-  if state.active_run_id ~= nil and state.active_run_id == run_id then
-    state.active_run_id = nil
-  end
+  state.active_run_ids[run_id] = nil
 end
 
 -- tools.advertise on first <gate>.hello (best-effort; the actor still
@@ -887,7 +879,7 @@ return {
     parse_approval_command = parse_approval_command,
     terminate_active_graph = terminate_active_graph,
     reset = function()
-      state.active_run_id = nil
+      state.active_run_ids = {}
       state.active_plan = nil
       advertised = false
     end,
