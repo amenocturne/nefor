@@ -166,8 +166,9 @@ function M.gate_spec(gate_name, command)
   local function to_plugin(envs)
     for _, env in ipairs(envs) do
       if not env.replay and env.from ~= gate_name then
+        local invoke_chat_id = type(env.body) == "table" and env.body.chat_id or nil
         gate_lib.agents_md_emit_for_invoke(
-          translator, env, nil,
+          translator, env, invoke_chat_id,
           function(body) envelope.emit(nil, body) end
         )
         nefor.engine.deliver(gate_name, json.encode({

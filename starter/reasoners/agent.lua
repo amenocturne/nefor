@@ -505,10 +505,11 @@ local function dispatch_tool_call(entry, call)
   end
 
   emit("tool-gate", {
-    kind = "tool-gate.tool.invoke",
-    id   = tool_id,
-    name = name,
-    args = call_args,
+    kind    = "tool-gate.tool.invoke",
+    id      = tool_id,
+    name    = name,
+    args    = call_args,
+    chat_id = entry.chat_id,
   })
 
   -- Paired observer envelope so the chat surface can show "agent in
