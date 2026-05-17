@@ -24,17 +24,31 @@ Each node has:
 - **agent_args.prompt**: What the agent should do. This becomes the prompt the combinator hands to the agent. Be specific — include file paths, expected behaviour, constraints.
 - **dependencies**: Node IDs that must complete first. Their structured-finalize output is automatically composed into this node's prompt as context.
 
-### Graph shape — one connected DAG per call
+### CRITICAL: one connected DAG per call, separate calls for independent work
 
-Each `dispatch-graph` call submits **one connected DAG** — every node reachable through dependencies (ignoring direction) from every other. For **N independent tasks**, call `dispatch-graph` **N times in the same turn**. The framework runs them in parallel; the UI shows each as its own sidebar row; each result comes back as its own `tool.result` when finished. That's better UX (visible parallelism) and better for you (present each as it lands).
+**Independent tasks = separate `dispatch-graph` calls.** If tasks don't share a dependency, they MUST be separate calls. Call `dispatch-graph` N times in the same turn — the framework runs them in parallel automatically. Every time you're about to put multiple nodes in one call, check: do they share an ancestor? If not, split into separate calls.
 
-Within ONE call, the return shape is `results: { <sink_id>: <finalize_output>, ... }` — a dict keyed by every terminal node (one nothing else depends on). Multi-sink within a single connected graph is fine when sinks share an ancestor:
+**WRONG** — three unrelated explorations in one graph (will error: disconnected components):
+```json
+dispatch-graph([
+  { "id": "explore-a", "role": "explorer", "agent_args": { "prompt": "..." } },
+  { "id": "explore-b", "role": "explorer", "agent_args": { "prompt": "..." } },
+  { "id": "explore-c", "role": "explorer", "agent_args": { "prompt": "..." } }
+])
+```
 
-- **Single sink** (`explorer → builder → reviewer → tester`) — `results: { tester: {...} }`.
-- **Fan-out + fan-in** (two explorers → one builder that depends on both) — `results: { builder: {...} }`. The builder sees both findings as prompt context.
-- **Connected fan-out, no fan-in** (`explorer → build`, `explorer → test`) — two sinks sharing the root: `results: { build: {...}, test: {...} }`.
+**RIGHT** — three separate calls in the same turn:
+```
+dispatch-graph([{ "id": "explore-a", "role": "explorer", "agent_args": { "prompt": "..." } }])
+dispatch-graph([{ "id": "explore-b", "role": "explorer", "agent_args": { "prompt": "..." } }])
+dispatch-graph([{ "id": "explore-c", "role": "explorer", "agent_args": { "prompt": "..." } }])
+```
 
-Use multiple calls instead of one disconnected graph: parallel unrelated explorations are N calls, not one graph with N disjoint components.
+Within ONE call, the graph must be connected — every node reachable from every other through dependencies. Multi-sink is fine when sinks share an ancestor:
+
+- **Single chain** (`explorer → builder → reviewer`) — one call.
+- **Fan-out + fan-in** (two explorers → one builder depending on both) — one call.
+- **Connected fan-out** (`explorer → build`, `explorer → test`, shared root) — one call.
 
 ### Example: Feature with exploration, build, review, and test
 
