@@ -1614,6 +1614,7 @@ fn layout_scrollable(inst: &mut WidgetInstance, c: Constraints) -> Size {
     let effective_content_height = vch.unwrap_or(final_size.height);
     if let InstanceState::Scrollable(s) = &mut inst.state {
         s.content_height = effective_content_height;
+        s.measured_content_height = final_size.height;
         s.viewport_height = viewport_h;
     }
 
@@ -1640,7 +1641,7 @@ fn paint_scrollable(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer
     // Read the geometry the layout pass cached, then settle the final
     // scroll_y (apply stick_to, clamp to max). We mutate state through a
     // small scope so the borrow doesn't fight the child paint below.
-    let (scroll_y, content_height, show_bar, inner_w) = {
+    let (scroll_y, content_height, paint_height, show_bar, inner_w) = {
         let st = match &mut inst.state {
             InstanceState::Scrollable(s) => s,
             _ => return,
@@ -1648,6 +1649,7 @@ fn paint_scrollable(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer
         let viewport_h = rect.height;
         st.viewport_height = viewport_h;
         let content_height = st.content_height;
+        let paint_height = st.measured_content_height.max(content_height);
         let show_bar = scrollbar_visible(mode, content_height, viewport_h);
         let inner_w = if show_bar {
             rect.width.saturating_sub(1)
@@ -1672,21 +1674,13 @@ fn paint_scrollable(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer
         st.was_at_end = scroll_y == max;
         st.was_at_start = scroll_y == 0;
         st.seeded = true;
-        (scroll_y, content_height, show_bar, inner_w)
+        (scroll_y, content_height, paint_height, show_bar, inner_w)
     };
 
-    // Paint the child into a viewport-sized scratch buffer with a row
-    // offset equal to scroll_y. The child paints as if writing to the
-    // full content height, but the buffer only materializes the visible
-    // window — rows above scroll_y resolve to None (silently dropped),
-    // rows in [scroll_y, scroll_y + viewport_h) map to buffer rows
-    // [0, viewport_h), and rows below overflow the buffer and clip.
-    // This keeps allocation and paint work at O(viewport), independent
-    // of total content size and scroll position.
     let content_w = inner_w;
     let viewport_h = rect.height;
     let scratch_w = content_w.max(1);
-    let scratch_h = viewport_h.min(content_height).max(1);
+    let scratch_h = viewport_h.min(paint_height).max(1);
     let mut scratch =
         FrameBuffer::with_offset(scratch_w, scratch_h, scroll_y as usize);
     if let Some(child) = inst.children.first_mut() {
@@ -1694,7 +1688,7 @@ fn paint_scrollable(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer
             row: 0,
             col: 0,
             width: content_w,
-            height: content_height,
+            height: paint_height,
         };
         paint(child, child_rect, &mut scratch);
     }

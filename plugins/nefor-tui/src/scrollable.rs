@@ -38,9 +38,14 @@ pub struct ScrollableState {
     /// the public API (`scroll_to`, `scroll_position`) does not need a
     /// future signature break.
     pub scroll_x: u16,
-    /// Most recent measured content height (from the prior layout pass).
-    /// Used by clamp + scrollbar geometry.
+    /// Content height used for scroll math (max scroll, scrollbar).
+    /// When virtual_content_height is set, this holds the virtual value
+    /// (stable, estimate-based). Otherwise holds the measured child height.
     pub content_height: u16,
+    /// Actual measured child height from the layout pass. Used by the
+    /// paint pass for the child rect so content isn't clipped when actual
+    /// height exceeds the virtual content_height.
+    pub measured_content_height: u16,
     /// Most recent viewport height (the scrollable's own measured size).
     pub viewport_height: u16,
     /// Whether the prior render had `scroll_y == scroll_y_max` (i.e. the
