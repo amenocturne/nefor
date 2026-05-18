@@ -4,8 +4,10 @@
 
 ## Пререквизиты
 
-- **DP CLI** — установка по внутренней документации. Ожидается, что `dp` будет в
-  `/usr/local/bin/dp`, `~/.nessy/dp_v13.4.2/dp` или `$PATH`
+- **DP CLI** — установка по [внутренней
+документации](https://devplatform.pages.devplatform.tcsbank.ru/spirit-user-docs/docs/cli/).
+Ожидается, что `dp` будет в `/usr/local/bin/dp`, `~/.nessy/dp_v13.4.2/dp` или
+`$PATH`
 
 ## Установка
 
