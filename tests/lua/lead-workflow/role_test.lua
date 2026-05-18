@@ -52,7 +52,7 @@ for _, role in ipairs({ "explorer", "builder", "reviewer" }) do
   assert_true(#cfg.tool_allowlist > 0, role .. ".tool_allowlist is non-empty")
 end
 
--- Builder gets write_file + bash. Explorer and reviewer don't.
+-- Builder gets write_file + bash.
 assert_true(
   contains(lead_role.AGENT_CONFIGS.builder.tool_allowlist, "write_file"),
   "builder allowlist contains write_file"
@@ -61,11 +61,17 @@ assert_true(
   contains(lead_role.AGENT_CONFIGS.builder.tool_allowlist, "bash"),
   "builder allowlist contains bash"
 )
+-- Explorer gets bash (read_only gated by da) but NOT write_file.
+assert_true(
+  contains(lead_role.AGENT_CONFIGS.explorer.tool_allowlist, "bash"),
+  "explorer allowlist contains bash"
+)
+assert_true(
+  not contains(lead_role.AGENT_CONFIGS.explorer.tool_allowlist, "write_file"),
+  "explorer allowlist does NOT contain write_file"
+)
+-- Reviewer gets neither bash nor write_file.
 for _, tool in ipairs({ "write_file", "bash" }) do
-  assert_true(
-    not contains(lead_role.AGENT_CONFIGS.explorer.tool_allowlist, tool),
-    "explorer allowlist does NOT contain " .. tool
-  )
   assert_true(
     not contains(lead_role.AGENT_CONFIGS.reviewer.tool_allowlist, tool),
     "reviewer allowlist does NOT contain " .. tool
