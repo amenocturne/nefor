@@ -1099,7 +1099,7 @@ do
   local fold = find_call(calls, function(c)
     return c.body.kind == "mock-prov.chat.append"
        and type(c.body.message) == "table"
-       and c.body.message.role == "system"
+       and c.body.message.role == "user"
        and c.body.message.content == agents_md_text
   end)
   assert(fold ~= nil,
