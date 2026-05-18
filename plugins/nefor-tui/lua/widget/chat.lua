@@ -105,8 +105,11 @@ function M.view(opts)
   return scroll_widget
 end
 
--- Geo cache now lives in Rust; this is a no-op kept for API compat.
-function M.clear_heights(_key_name)
+function M.clear_heights(key_name)
+  local key = key_name or "chat"
+  if type(tui.virtual_scroll_invalidate) == "function" then
+    tui.virtual_scroll_invalidate(key)
+  end
 end
 
 -- Route scroll keys to tui.scroll_* against the widget's key. Caller

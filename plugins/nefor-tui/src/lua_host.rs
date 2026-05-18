@@ -693,6 +693,20 @@ fn install_tui(
     )?;
     tui.set("virtual_scroll_prepare", virtual_scroll_prepare_fn)?;
 
+    let geo_for_invalidate = Arc::clone(&geo_caches);
+    let virtual_scroll_invalidate_fn = lua.create_function(
+        move |_lua, key: String| -> mlua::Result<()> {
+            let mut caches = lock(&geo_for_invalidate);
+            if let Some(gc) = caches.get_mut(&key) {
+                gc.heights.clear();
+                gc.cumul.clear();
+                gc.total = 0;
+            }
+            Ok(())
+        },
+    )?;
+    tui.set("virtual_scroll_invalidate", virtual_scroll_invalidate_fn)?;
+
     // ── Clock query ──────────────────────────────────────────────────
     //
     // `tui.now_ms()` returns the engine's current frame-clock in

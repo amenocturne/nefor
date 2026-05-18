@@ -381,7 +381,9 @@ function M.update(msg, state)
   end
 
   if kind == "key.ctrl_o" then
-    -- Global toggle for tool I/O + reasoning expansion.
+    if type(tui.virtual_scroll_invalidate) == "function" then
+      tui.virtual_scroll_invalidate("chat")
+    end
     return shallow_merge(state, { expanded_details = not state.expanded_details }), {}
   end
 
