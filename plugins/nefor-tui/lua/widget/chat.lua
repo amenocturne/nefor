@@ -85,11 +85,12 @@ function M.view(opts)
 
   local padding = opts.padding or { top = 0, right = 1, bottom = 0, left = 0 }
   local scroll_widget = tui.scrollable {
-    key        = key,
-    stick_to   = opts.stick_to ~= nil and opts.stick_to or "end",
-    scrollbar  = "auto",
-    selectable = opts.selectable ~= false,
-    child      = tui.padding {
+    key                    = key,
+    stick_to               = opts.stick_to ~= nil and opts.stick_to or "end",
+    scrollbar              = "auto",
+    selectable             = opts.selectable ~= false,
+    virtual_content_height = vis and vis.total_h or nil,
+    child                  = tui.padding {
       value = padding,
       child = tui.column { gap = gap, children = widgets },
     },

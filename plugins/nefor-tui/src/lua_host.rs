@@ -586,34 +586,32 @@ fn install_tui(
             let gc = caches.entry(key).or_default();
 
             // Sync heights from Lua table into the cache.
-            // Shrink: full recompute.
-            if item_count < gc.heights.len() {
-                gc.heights.clear();
-                gc.cumul.clear();
-                gc.total = 0;
+            // Always re-read all heights so Lua-side estimate changes
+            // (e.g. after state updates) are picked up immediately.
+            gc.heights.resize(item_count, 0);
+            gc.cumul.resize(item_count, 0);
+            let mut any_changed = false;
+            for i in 0..item_count {
+                let h: u16 = heights_table.get((i + 1) as i64)?;
+                if gc.heights[i] != h {
+                    gc.heights[i] = h;
+                    any_changed = true;
+                }
             }
-
-            let old_len = gc.heights.len();
-            // Read new heights from Lua and extend.
-            for i in (old_len + 1)..=(item_count) {
-                let h: u16 = heights_table.get(i as i64)?;
-                gc.heights.push(h);
-            }
-
-            // Recompute cumulative positions from old_len onward.
-            if old_len < item_count {
-                gc.cumul.resize(item_count, 0);
-                let start = if old_len == 0 { 0 } else { old_len };
-                for i in start..item_count {
-                    let y = if i == 0 {
+            if any_changed || gc.cumul.len() != item_count {
+                for i in 0..item_count {
+                    gc.cumul[i] = if i == 0 {
                         0
                     } else {
                         gc.cumul[i - 1] + gc.heights[i - 1] as u32 + gap32
                     };
-                    gc.cumul[i] = y;
                 }
-                let last = item_count - 1;
-                gc.total = gc.cumul[last] + gc.heights[last] as u32;
+                if item_count > 0 {
+                    let last = item_count - 1;
+                    gc.total = gc.cumul[last] + gc.heights[last] as u32;
+                } else {
+                    gc.total = 0;
+                }
             }
 
             if item_count == 0 {
@@ -688,6 +686,12 @@ fn install_tui(
             t.set("last", last_vis as u64 + 1)?;
             t.set("top_h", top_h)?;
             t.set("bot_h", bot_h)?;
+            // Total virtual height for the scrollable to use as
+            // content_height. gc.total accounts for all item heights
+            // plus (item_count-1) inter-item gaps. The spacer gap
+            // compensation (each spacer subtracts one gap) means the
+            // column's rendered total equals gc.total exactly.
+            t.set("total_h", gc.total)?;
             Ok(Value::Table(t))
         },
     )?;

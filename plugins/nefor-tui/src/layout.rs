@@ -1543,12 +1543,13 @@ fn scrollbar_visible(mode: ScrollbarMode, content_height: u16, viewport_height: 
 }
 
 fn layout_scrollable(inst: &mut WidgetInstance, c: Constraints) -> Size {
-    let (mode, _stick_to) = match &inst.last_desc {
+    let (mode, _stick_to, vch) = match &inst.last_desc {
         WidgetDescription::Scrollable {
             scrollbar,
             stick_to,
+            virtual_content_height,
             ..
-        } => (*scrollbar, *stick_to),
+        } => (*scrollbar, *stick_to, *virtual_content_height),
         _ => {
             tracing::warn!("layout_scrollable: kind/desc mismatch");
             return c.constrain(Size::default());
@@ -1606,8 +1607,13 @@ fn layout_scrollable(inst: &mut WidgetInstance, c: Constraints) -> Size {
     };
 
     // Stash the geometry for the paint pass + Lua-visible scroll APIs.
+    // When virtual_content_height is set, use it instead of the measured
+    // child height. This breaks the feedback loop in virtual-scroll
+    // scenarios where estimated heights ≠ actual rendered heights cause
+    // content_height oscillation.
+    let effective_content_height = vch.unwrap_or(final_size.height);
     if let InstanceState::Scrollable(s) = &mut inst.state {
-        s.content_height = final_size.height;
+        s.content_height = effective_content_height;
         s.viewport_height = viewport_h;
     }
 
@@ -3476,6 +3482,7 @@ mod tests {
             scrollbar: ScrollbarMode::Auto,
             style: None,
             selectable: false,
+            virtual_content_height: None,
         }
     }
 
@@ -3493,6 +3500,7 @@ mod tests {
             scrollbar,
             style: None,
             selectable: false,
+            virtual_content_height: None,
         }
     }
 

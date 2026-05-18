@@ -639,6 +639,7 @@ mod tests {
             scrollbar: crate::scrollable::ScrollbarMode::Auto,
             style: None,
             selectable: false,
+            virtual_content_height: None,
         }
     }
 

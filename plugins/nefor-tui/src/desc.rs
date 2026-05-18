@@ -165,6 +165,11 @@ pub enum WidgetDescription {
         /// always scoped to the captured widget; cross-panel highlight
         /// bleed and cross-widget copy are both eliminated by clamping.
         selectable: bool,
+        /// When set, `layout_scrollable` uses this value instead of the
+        /// measured child height for `content_height`. This breaks the
+        /// feedback loop in virtual-scroll scenarios where estimated
+        /// heights ≠ actual rendered heights cause oscillation.
+        virtual_content_height: Option<u16>,
     },
     TextInput {
         /// User key — required for text_input so Lua can reference it
@@ -1190,6 +1195,17 @@ fn parse_scrollable(t: &Table) -> Result<WidgetDescription, TuiError> {
         }
     };
 
+    let virtual_content_height = match t.get::<Value>("virtual_content_height")? {
+        Value::Nil => None,
+        Value::Integer(n) => Some(n as u16),
+        other => {
+            return Err(TuiError::InvalidDesc(format!(
+                "tui.scrollable: `virtual_content_height` must be an integer or nil (got {})",
+                other.type_name()
+            )));
+        }
+    };
+
     Ok(WidgetDescription::Scrollable {
         key,
         child,
@@ -1198,6 +1214,7 @@ fn parse_scrollable(t: &Table) -> Result<WidgetDescription, TuiError> {
         scrollbar,
         style,
         selectable,
+        virtual_content_height,
     })
 }
 
