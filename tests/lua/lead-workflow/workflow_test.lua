@@ -142,8 +142,8 @@ do
   assert_true(has_edge, "dependency translates to graph edge")
 
   -- Active run_id tracked.
-  assert_eq(lw._internals.state.active_run_id, invoke.body.id,
-    "active_run_id == the dispatched run_id")
+  assert_true(lw._internals.state.active_run_ids[invoke.body.id] == true,
+    "active_run_ids contains the dispatched run_id")
 
   -- The actor also replies to the lead's invocation with the run_id.
   local reply = find_call(calls, function(c)
@@ -531,8 +531,8 @@ do
       },
     },
   })
-  local run_id = lw._internals.state.active_run_id
-  assert_true(type(run_id) == "string", "active_run_id set after dispatch")
+  local run_id = next(lw._internals.state.active_run_ids)
+  assert_true(type(run_id) == "string", "active_run_ids has an entry after dispatch")
 
   -- Also submit a plan that's awaiting approval at session-end.
   feed("tool-gate", {
@@ -555,8 +555,8 @@ do
   end)
   assert_true(cancel ~= nil, "session_end emits graph.cancel for the active run")
 
-  assert_eq(lw._internals.state.active_run_id, nil,
-    "active_run_id cleared after termination")
+  assert_eq(next(lw._internals.state.active_run_ids), nil,
+    "active_run_ids cleared after termination")
   assert_eq(lw._internals.state.active_plan, nil,
     "active_plan flushed at session_end — no carry-over approval")
 end
