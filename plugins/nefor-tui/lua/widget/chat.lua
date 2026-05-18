@@ -53,26 +53,22 @@ function M.view(opts)
     local has_vsp = type(tui.virtual_scroll_prepare) == "function"
     local vis = has_vsp and tui.virtual_scroll_prepare(key, n, heights, gap)
     if vis then
-      -- Top spacer.
-      if vis.top_h > 0 then
-        widgets[#widgets + 1] = tui.constrained {
-          key = "_top", min_height = vis.top_h, max_height = vis.top_h,
-          child = tui.text { content = "" },
-        }
-      end
+      -- Top spacer (always present to keep column child count stable).
+      widgets[#widgets + 1] = tui.constrained {
+        key = "_top", min_height = vis.top_h, max_height = vis.top_h,
+        child = tui.text { content = "" },
+      }
       -- Visible entries.
       for i = vis.first, vis.last do
         if i >= 1 and i <= n then
           widgets[#widgets + 1] = opts.render_entry(entries[i], i, opts.context)
         end
       end
-      -- Bottom spacer.
-      if vis.bot_h > 0 then
-        widgets[#widgets + 1] = tui.constrained {
-          key = "_bot", min_height = vis.bot_h, max_height = vis.bot_h,
-          child = tui.text { content = "" },
-        }
-      end
+      -- Bottom spacer (always present to keep column child count stable).
+      widgets[#widgets + 1] = tui.constrained {
+        key = "_bot", min_height = vis.bot_h, max_height = vis.bot_h,
+        child = tui.text { content = "" },
+      }
     else
       -- First frame (no scroll position yet): render all.
       for i = 1, n do

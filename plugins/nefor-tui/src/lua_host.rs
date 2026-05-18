@@ -664,16 +664,20 @@ fn install_tui(
                 lo.saturating_sub(1).min(item_count.saturating_sub(1))
             };
 
-            // Spacer heights.
+            // Spacer heights. The Lua side always emits both spacer
+            // widgets (even at height 0) so the column child count stays
+            // stable. That adds two extra column gaps (spacer↔first,
+            // last↔spacer) compared to gc.total's (item_count-1) gaps.
+            // Subtract one gap from each spacer to compensate.
             let top_h = if first_vis > 0 {
-                gc.cumul[first_vis]
+                gc.cumul[first_vis].saturating_sub(gap32)
             } else {
                 0
             };
 
             let bot_h = if last_vis < item_count - 1 {
                 let after_last = gc.cumul[last_vis] + gc.heights[last_vis] as u32 + gap32;
-                gc.total.saturating_sub(after_last)
+                gc.total.saturating_sub(after_last).saturating_sub(gap32)
             } else {
                 0
             };
