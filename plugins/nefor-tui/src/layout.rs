@@ -1579,9 +1579,9 @@ fn layout_scrollable(inst: &mut WidgetInstance, c: Constraints) -> Size {
         Some(child) => layout(child, prelim_constraints),
         None => Size::default(),
     };
-    let content_height = prelim_size.height;
+    let content_height_for_bar = vch.unwrap_or(prelim_size.height);
 
-    let show_bar = scrollbar_visible(mode, content_height, viewport_h);
+    let show_bar = scrollbar_visible(mode, content_height_for_bar, viewport_h);
 
     // Pass 2 — when the gutter is visible, re-measure the child with the
     // reduced inner width so wrapping reflects the post-gutter geometry.
@@ -1671,8 +1671,8 @@ fn paint_scrollable(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer
         // Update edge bookkeeping so the next paint pass observes a
         // fresh `was_at_*` snapshot. Once content settles, content_height
         // stays small enough to fit, max == 0 so both edges are true.
-        st.was_at_end = scroll_y == max;
-        st.was_at_start = scroll_y == 0;
+        st.was_at_end = max.saturating_sub(scroll_y) <= 1;
+        st.was_at_start = scroll_y <= 1;
         st.seeded = true;
         (scroll_y, content_height, paint_height, show_bar, inner_w)
     };
