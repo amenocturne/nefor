@@ -1247,26 +1247,26 @@ impl Engine {
         // if completed_at_ms + linger > now") agree with what the
         // animation primitive computes on the same frame.
         self.lua.set_now_ms(now);
-        let desc = self.lua.render_view()?;
         let selection = self.current_selection();
         let result = {
+            let lua = &self.lua;
             let reconciler = &mut self.reconciler;
             let renderer = &mut self.renderer;
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Vec<u8>, TuiError> {
+                let desc = lua.render_view()?;
                 reconciler.reconcile(desc);
-                let root = reconciler.root.as_mut().expect("reconcile always sets root");
+                let root = reconciler.root.as_mut().ok_or(TuiError::NotStarted)?;
                 sync_text_inputs(root);
-                renderer.render_with_selection(root, selection)
+                Ok(renderer.render_with_selection(root, selection))
             }))
         };
         match result {
-            Ok(bytes) => {
-                // Snapshot geometry post-paint so `tui.scroll_position` is up
-                // to date on the next Lua call.
+            Ok(Ok(bytes)) => {
                 self.refresh_scroll_positions();
                 self.needs_render = false;
                 Ok(Some(bytes))
             }
+            Ok(Err(e)) => Err(e),
             Err(panic_info) => {
                 let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
                     s.to_string()
