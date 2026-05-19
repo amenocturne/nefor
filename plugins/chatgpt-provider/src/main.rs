@@ -23,7 +23,7 @@ use chatgpt_provider::broker::ToolBroker;
 use chatgpt_provider::catalog::ToolCatalog;
 use chatgpt_provider::config::{Cli, Command, ServeArgs};
 use chatgpt_provider::dispatcher::{
-    emit_goodbye, emit_startup_events, run_dispatch_loop, send_ready,
+    emit_goodbye, emit_startup_events, run_dispatch_loop, send_ready, DispatcherContext,
 };
 use chatgpt_provider::error::ChatgptError;
 use chatgpt_provider::installation::{default_installation_path, read_or_generate};
@@ -92,8 +92,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), ChatgptError> {
 
     // No baked-in default model — the user picks via `/model` (or the
     // engine sends `model.set` on startup); `chat.create` envelopes
-    // typically include `model` explicitly, so this default is only
-    // consulted for the legacy `prompt` compat path.
+    // typically include `model` explicitly.
     let chats = Arc::new(Chats::with_default_model(None));
     let catalog = Arc::new(ToolCatalog::new());
     let broker = Arc::new(ToolBroker::new());
@@ -105,17 +104,16 @@ async fn run_serve(args: ServeArgs) -> Result<(), ChatgptError> {
 
     emit_startup_events(&args, &auth, &chats, &responses_client, &out_tx).await?;
 
-    run_dispatch_loop(
-        args.clone(),
+    let ctx = DispatcherContext {
+        args: args.clone(),
         chats,
         auth,
         catalog,
         broker,
         responses_client,
-        out_tx.clone(),
-        in_rx,
-    )
-    .await?;
+        out_tx: out_tx.clone(),
+    };
+    run_dispatch_loop(ctx, in_rx).await?;
 
     emit_goodbye(&args, &out_tx, "stream closed").await;
     Ok(())

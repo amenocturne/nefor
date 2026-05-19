@@ -142,13 +142,6 @@ impl ChatId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
-
-    /// Stable id used by the legacy `<prefix>.prompt` compat path.
-    /// Per-prefix so two chatgpt-provider spawns don't collide.
-    pub fn default_for_prefix(prefix: &str) -> Self {
-        let trimmed = prefix.trim_end_matches('.');
-        Self(format!("{trimmed}:default"))
-    }
 }
 
 impl fmt::Display for ChatId {
@@ -369,25 +362,6 @@ impl Chats {
         chat.tool_overrides = tool_overrides;
         chat.tool_allowlist = tool_allowlist;
         g.insert(id, chat);
-        Ok(())
-    }
-
-    /// Idempotent variant used by the legacy default-chat compat path
-    /// (`<prefix>.prompt`). Errors with `NoModelConfigured` when no
-    /// provider default has been set and the caller didn't pre-create
-    /// the chat with an explicit model.
-    pub async fn ensure(&self, id: ChatId) -> Result<(), ChatsError> {
-        let mut g = self.inner.lock().await;
-        if g.contains_key(&id) {
-            return Ok(());
-        }
-        let model = self
-            .default_model
-            .lock()
-            .await
-            .clone()
-            .ok_or(ChatsError::NoModelConfigured)?;
-        g.insert(id, ChatState::new(model));
         Ok(())
     }
 
@@ -721,12 +695,6 @@ mod tests {
         assert!(c.snapshot(&b).await.expect("b").history.is_empty());
     }
 
-    #[test]
-    fn chat_id_default_for_prefix_strips_trailing_dot() {
-        let id = ChatId::default_for_prefix("chatgpt.");
-        assert_eq!(id.as_str(), "chatgpt:default");
-    }
-
     #[tokio::test]
     async fn create_errors_when_no_model_and_no_default() {
         // Production startup ships with `with_default_model(None)`. A
@@ -753,14 +721,6 @@ mod tests {
             .expect("explicit model wins");
         let snap = c.snapshot(&id).await.expect("snap");
         assert_eq!(snap.model, "test-model");
-    }
-
-    #[tokio::test]
-    async fn ensure_errors_when_no_model_and_no_default() {
-        let c = Chats::with_default_model(None);
-        let id = ChatId::new("a");
-        let err = c.ensure(id).await.expect_err("must reject");
-        assert_eq!(err, ChatsError::NoModelConfigured);
     }
 
     #[tokio::test]

@@ -6,9 +6,9 @@
 //!    each event to a handler. Cancelled by stdin close, by an
 //!    incoming `Body::System(Shutdown)`, or by ctrl-c.
 //! 2. `spawn_turn` — the per-chat task that POSTs to `/responses`,
-//!    streams events, runs tool loops, persists assistant messages,
-//!    and emits `<prefix>.stream.delta`/`stream.end`/
-//!    `chat.complete.result` along the way.
+//!    streams events, persists assistant messages, and emits
+//!    `<prefix>.stream.delta`/`stream.end`/`chat.complete.result`
+//!    along the way. Tool calls are yielded back to the caller.
 //!
 //! Shape mirrors openai-provider's main.rs but threaded through the
 //! Responses-API typed stream from Phase 3 instead of the
@@ -16,7 +16,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures::StreamExt;
 use nefor_protocol::{Body, Envelope, PluginName, PluginOutgoing, SystemBody};
@@ -40,10 +39,6 @@ pub const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Cap on tool-call iterations per turn. The model can loop forever
 /// asking for tools; this prevents runaways.
 pub const TOOL_LOOP_MAX_ITERATIONS: u32 = 20;
-
-/// Hard cap on how long we'll wait for a `tool.result` before giving
-/// up. Keeps a hung tool plugin from wedging the provider's turn slot.
-pub const TOOL_RESULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 const LOGOUT_REFUSED_ENV_MESSAGE: &str =
     "no login to revoke — credentials come from the environment; restart the plugin without it";
@@ -311,32 +306,6 @@ fn chat_complete_result_body(
     make_event(format!("{}chat.complete.result", args.event_prefix()), m)
 }
 
-fn chat_tool_start_body(id: &str, name: &str, input: &Value) -> Map<String, Value> {
-    let mut m = Map::new();
-    m.insert("id".into(), Value::String(id.to_owned()));
-    m.insert("name".into(), Value::String(name.to_owned()));
-    m.insert("input".into(), input.clone());
-    make_event("chat.tool.start".into(), m)
-}
-
-fn chat_tool_end_body(id: &str, output: &str, is_error: bool) -> Map<String, Value> {
-    let mut m = Map::new();
-    m.insert("id".into(), Value::String(id.to_owned()));
-    m.insert("output".into(), Value::String(output.to_owned()));
-    // Wire field is named `error` to match openai-provider; matches what
-    // nefor-chat reads as a bool. Local var is `is_error` for readability.
-    m.insert("error".into(), Value::Bool(is_error));
-    make_event("chat.tool.end".into(), m)
-}
-
-fn tool_invoke_body(owner: &str, id: &str, name: &str, args: Value) -> Map<String, Value> {
-    let mut m = Map::new();
-    m.insert("id".into(), Value::String(id.to_owned()));
-    m.insert("name".into(), Value::String(name.to_owned()));
-    m.insert("args".into(), args);
-    make_event(format!("{owner}.tool.invoke"), m)
-}
-
 // ---------------------------------------------------------------------
 // Public helpers used by main.rs / tests.
 // ---------------------------------------------------------------------
@@ -485,17 +454,24 @@ fn spawn_models_fetch(
     });
 }
 
+/// Shared state threaded through every dispatch handler. Bundles the
+/// seven Arc'd singletons that every event path needs so function
+/// signatures stay short.
+#[derive(Clone)]
+pub struct DispatcherContext {
+    pub args: Arc<ServeArgs>,
+    pub chats: Arc<Chats>,
+    pub auth: Arc<AuthStore>,
+    pub catalog: Arc<ToolCatalog>,
+    pub broker: Arc<ToolBroker>,
+    pub responses_client: Arc<ResponsesClient>,
+    pub out_tx: mpsc::Sender<PluginOutgoing>,
+}
+
 /// Top-level event loop. Returns on `Body::System(Shutdown)`, stdin
 /// close, or ctrl-c. The caller emits goodbye after we return.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_dispatch_loop(
-    args: Arc<ServeArgs>,
-    chats: Arc<Chats>,
-    auth: Arc<AuthStore>,
-    catalog: Arc<ToolCatalog>,
-    broker: Arc<ToolBroker>,
-    responses_client: Arc<ResponsesClient>,
-    out_tx: mpsc::Sender<PluginOutgoing>,
+    ctx: DispatcherContext,
     mut in_rx: mpsc::Receiver<Result<Envelope, ChatgptError>>,
 ) -> Result<(), ChatgptError> {
     loop {
@@ -505,19 +481,14 @@ pub async fn run_dispatch_loop(
                     Some(Ok(env)) => match &env.body {
                         Body::System(SystemBody::Shutdown { .. }) => {
                             tracing::info!("shutdown received");
-                            chats.interrupt_all().await;
+                            ctx.chats.interrupt_all().await;
                             return Ok(());
                         }
                         Body::System(_) => {
                             tracing::warn!(?env, "unexpected system envelope after handshake");
                         }
                         Body::Event(map) => {
-                            if let Err(e) = dispatch_event(
-                                &args, &chats, &auth, &catalog, &broker, &responses_client,
-                                &out_tx, &env.from, map,
-                            )
-                            .await
-                            {
+                            if let Err(e) = dispatch_event(&ctx, &env.from, map).await {
                                 tracing::error!(error = %e, "dispatch_event errored; continuing");
                             }
                         }
@@ -533,7 +504,7 @@ pub async fn run_dispatch_loop(
             }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("ctrl-c; exiting");
-                chats.interrupt_all().await;
+                ctx.chats.interrupt_all().await;
                 return Ok(());
             }
         }
@@ -547,15 +518,8 @@ pub async fn emit_goodbye(args: &ServeArgs, out_tx: &mpsc::Sender<PluginOutgoing
         .await;
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn dispatch_event(
-    args: &Arc<ServeArgs>,
-    chats: &Arc<Chats>,
-    auth: &Arc<AuthStore>,
-    catalog: &Arc<ToolCatalog>,
-    broker: &Arc<ToolBroker>,
-    responses_client: &Arc<ResponsesClient>,
-    out_tx: &mpsc::Sender<PluginOutgoing>,
+    ctx: &DispatcherContext,
     from: &PluginName,
     body: &Map<String, Value>,
 ) -> Result<(), ChatgptError> {
@@ -573,7 +537,7 @@ async fn dispatch_event(
                 .unwrap_or_default();
             let from_str = from.as_str().to_owned();
             tracing::info!(plugin = %from_str, count = tools.len(), "tool.register");
-            catalog.register_from(&from_str, tools).await;
+            ctx.catalog.register_from(&from_str, tools).await;
             return Ok(());
         }
         "tool.result" => {
@@ -589,7 +553,8 @@ async fn dispatch_event(
                 .and_then(Value::as_str)
                 .map(str::to_owned);
             let error = body.get("error").and_then(Value::as_str).map(str::to_owned);
-            let delivered = broker
+            let delivered = ctx
+                .broker
                 .deliver(ToolResult {
                     id: id.clone(),
                     output,
@@ -604,55 +569,29 @@ async fn dispatch_event(
         _ => {}
     }
 
-    let prefix = args.event_prefix();
+    let prefix = ctx.args.event_prefix();
     let suffix = match kind.strip_prefix(&prefix) {
         Some(s) => s,
         None => return Ok(()),
     };
 
     match suffix {
-        "chat.create" => handle_chat_create(args, chats, out_tx, body).await,
-        "chat.append" => handle_chat_append(args, chats, out_tx, body).await,
-        "chat.complete" => {
-            handle_chat_complete(
-                args,
-                chats,
-                auth,
-                catalog,
-                broker,
-                responses_client,
-                out_tx,
-                body,
-                false,
-            )
-            .await
-        }
-        "chat.delete" => handle_chat_delete(args, chats, out_tx, body).await,
-        "prompt" => {
-            handle_prompt(
-                args,
-                chats,
-                auth,
-                catalog,
-                broker,
-                responses_client,
-                out_tx,
-                body,
-            )
-            .await
-        }
+        "chat.create" => handle_chat_create(&ctx.args, &ctx.chats, &ctx.out_tx, body).await,
+        "chat.append" => handle_chat_append(&ctx.args, &ctx.chats, &ctx.out_tx, body).await,
+        "chat.complete" => handle_chat_complete(ctx, body).await,
+        "chat.delete" => handle_chat_delete(&ctx.args, &ctx.chats, &ctx.out_tx, body).await,
         "interrupt" => {
             match read_chat_id(body) {
                 Some(cid) => {
-                    chats.interrupt(&cid).await;
+                    ctx.chats.interrupt(&cid).await;
                 }
-                None => chats.interrupt_all().await,
+                None => ctx.chats.interrupt_all().await,
             }
             Ok(())
         }
         "reset" => {
-            chats.interrupt_all().await;
-            chats.reset_all().await;
+            ctx.chats.interrupt_all().await;
+            ctx.chats.reset_all().await;
             Ok(())
         }
         "auth.set" => {
@@ -663,49 +602,50 @@ async fn dispatch_event(
                     return Ok(());
                 }
             };
-            let snap = auth.apply_auth_set(token).await;
-            send_event(out_tx, auth_status_body(args, &snap)).await?;
+            let snap = ctx.auth.apply_auth_set(token).await;
+            send_event(&ctx.out_tx, auth_status_body(&ctx.args, &snap)).await?;
             if matches!(snap.state, AuthState::Connected) {
                 spawn_models_fetch(
-                    args.clone(),
-                    auth.clone(),
-                    chats.clone(),
-                    responses_client.clone(),
-                    out_tx.clone(),
+                    ctx.args.clone(),
+                    ctx.auth.clone(),
+                    ctx.chats.clone(),
+                    ctx.responses_client.clone(),
+                    ctx.out_tx.clone(),
                 );
             }
             Ok(())
         }
         "login_requested" => {
-            let snap = auth.snapshot().await;
+            let snap = ctx.auth.snapshot().await;
             if matches!(snap.state, AuthState::LoginRequired | AuthState::Error(_)) {
                 spawn_login_flow(
-                    args.clone(),
-                    auth.clone(),
-                    chats.clone(),
-                    responses_client.clone(),
-                    out_tx.clone(),
+                    ctx.args.clone(),
+                    ctx.auth.clone(),
+                    ctx.chats.clone(),
+                    ctx.responses_client.clone(),
+                    ctx.out_tx.clone(),
                 );
                 Ok(())
             } else {
-                let snap = auth
+                let snap = ctx
+                    .auth
                     .apply_error(NO_LOGIN_FLOW_IN_PROGRESS_MESSAGE.to_owned())
                     .await;
-                send_event(out_tx, auth_status_body(args, &snap)).await
+                send_event(&ctx.out_tx, auth_status_body(&ctx.args, &snap)).await
             }
         }
         "logout_requested" => {
             // Cancel any in-flight turns before tearing down auth — a
             // turn mid-stream would otherwise emit a confusing 401 turn
             // error after the user explicitly asked to log out.
-            chats.interrupt_all().await;
+            ctx.chats.interrupt_all().await;
             // Snapshot the refresh token BEFORE apply_logout clears it;
             // post the revoke on a background task so the user-visible
             // status update lands immediately. Revoke failures are
             // logged and ignored — local-side cleanup happens regardless.
-            let pre = auth.snapshot().await;
+            let pre = ctx.auth.snapshot().await;
             let refresh_token = pre.tokens.as_ref().map(|t| t.refresh_token.clone());
-            match auth.apply_logout().await {
+            match ctx.auth.apply_logout().await {
                 LogoutOutcome::Cleared => {
                     if let Some(rt) = refresh_token {
                         tokio::spawn(async move {
@@ -716,31 +656,34 @@ async fn dispatch_event(
                             }
                         });
                     }
-                    let snap = auth.snapshot().await;
-                    send_event(out_tx, auth_status_body(args, &snap)).await
+                    let snap = ctx.auth.snapshot().await;
+                    send_event(&ctx.out_tx, auth_status_body(&ctx.args, &snap)).await
                 }
                 LogoutOutcome::RefusedEnv => {
-                    let snap = auth
+                    let snap = ctx
+                        .auth
                         .apply_error(LOGOUT_REFUSED_ENV_MESSAGE.to_owned())
                         .await;
-                    send_event(out_tx, auth_status_body(args, &snap)).await
+                    send_event(&ctx.out_tx, auth_status_body(&ctx.args, &snap)).await
                 }
             }
         }
         "models.list_requested" => {
-            let snap = auth.snapshot().await;
+            let snap = ctx.auth.snapshot().await;
             if !matches!(snap.state, AuthState::Connected) {
                 // No tokens to authenticate the /models call. Surface an
                 // empty list rather than 401-erroring on the chat surface.
                 tracing::debug!("models.list_requested while not connected; emitting empty list");
-                return send_event(out_tx, models_listed_body(args, &[])).await;
+                return send_event(&ctx.out_tx, models_listed_body(&ctx.args, &[])).await;
             }
-            match responses_client.list_models(&snap).await {
-                Ok(models) => send_event(out_tx, models_listed_body(args, &models)).await,
+            match ctx.responses_client.list_models(&snap).await {
+                Ok(models) => {
+                    send_event(&ctx.out_tx, models_listed_body(&ctx.args, &models)).await
+                }
                 Err(e) => {
                     let msg = format!("failed to fetch /models: {e}");
                     tracing::warn!(error = %e, "models.list_requested failed");
-                    send_event(out_tx, turn_error_body(args, None, &msg)).await
+                    send_event(&ctx.out_tx, turn_error_body(&ctx.args, None, &msg)).await
                 }
             }
         }
@@ -752,26 +695,30 @@ async fn dispatch_event(
                     return Ok(());
                 }
             };
-            chats.set_default_model(model.clone()).await;
+            ctx.chats.set_default_model(model.clone()).await;
             let chat_id = read_chat_id(body);
             if let Some(cid) = &chat_id {
-                if chats.exists(cid).await {
-                    let _ = chats.set_chat_model(cid, model.clone()).await;
+                if ctx.chats.exists(cid).await {
+                    let _ = ctx.chats.set_chat_model(cid, model.clone()).await;
                 }
             }
-            send_event(out_tx, model_set_ack_body(args, &model, chat_id.as_ref())).await?;
+            send_event(
+                &ctx.out_tx,
+                model_set_ack_body(&ctx.args, &model, chat_id.as_ref()),
+            )
+            .await?;
             // Picking a chatgpt model implicitly opts into auth: if we
             // aren't connected yet, kick off OAuth so the user doesn't
             // have to separately `/login`. Status events keep the chat
             // surface in sync as the flow progresses.
-            let snap = auth.snapshot().await;
+            let snap = ctx.auth.snapshot().await;
             if matches!(snap.state, AuthState::LoginRequired | AuthState::Error(_)) {
                 spawn_login_flow(
-                    args.clone(),
-                    auth.clone(),
-                    chats.clone(),
-                    responses_client.clone(),
-                    out_tx.clone(),
+                    ctx.args.clone(),
+                    ctx.auth.clone(),
+                    ctx.chats.clone(),
+                    ctx.responses_client.clone(),
+                    ctx.out_tx.clone(),
                 );
             }
             Ok(())
@@ -921,52 +868,41 @@ async fn handle_chat_append(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_chat_complete(
-    args: &Arc<ServeArgs>,
-    chats: &Arc<Chats>,
-    auth: &Arc<AuthStore>,
-    catalog: &Arc<ToolCatalog>,
-    broker: &Arc<ToolBroker>,
-    responses_client: &Arc<ResponsesClient>,
-    out_tx: &mpsc::Sender<PluginOutgoing>,
+    ctx: &DispatcherContext,
     body: &Map<String, Value>,
-    legacy_default_chat: bool,
 ) -> Result<(), ChatgptError> {
     let chat_id = match read_chat_id(body) {
         Some(id) => id,
         None => {
             send_event(
-                out_tx,
-                turn_error_body(args, None, "chat.complete missing `chat_id`"),
+                &ctx.out_tx,
+                turn_error_body(&ctx.args, None, "chat.complete missing `chat_id`"),
             )
             .await?;
             return Ok(());
         }
     };
-    let cancel = match chats.begin_turn(&chat_id).await {
+    let cancel = match ctx.chats.begin_turn(&chat_id).await {
         Ok(t) => t,
         Err(ChatsError::Busy(_)) => {
-            send_event(out_tx, turn_error_body(args, Some(&chat_id), "busy")).await?;
+            send_event(
+                &ctx.out_tx,
+                turn_error_body(&ctx.args, Some(&chat_id), "busy"),
+            )
+            .await?;
             return Ok(());
         }
         Err(e) => {
-            send_event(out_tx, chat_error_body(args, &chat_id, e.to_string())).await?;
+            send_event(
+                &ctx.out_tx,
+                chat_error_body(&ctx.args, &chat_id, e.to_string()),
+            )
+            .await?;
             return Ok(());
         }
     };
-    spawn_turn(
-        args.clone(),
-        chats.clone(),
-        auth.clone(),
-        catalog.clone(),
-        broker.clone(),
-        responses_client.clone(),
-        out_tx.clone(),
-        chat_id,
-        cancel,
-        legacy_default_chat,
-    );
+    spawn_turn(ctx.clone(), chat_id, cancel);
     Ok(())
 }
 
@@ -992,57 +928,6 @@ async fn handle_chat_delete(
         Ok(()) => send_event(out_tx, chat_deleted_body(args, &chat_id)).await,
         Err(e) => send_event(out_tx, chat_error_body(args, &chat_id, e.to_string())).await,
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_prompt(
-    args: &Arc<ServeArgs>,
-    chats: &Arc<Chats>,
-    auth: &Arc<AuthStore>,
-    catalog: &Arc<ToolCatalog>,
-    broker: &Arc<ToolBroker>,
-    responses_client: &Arc<ResponsesClient>,
-    out_tx: &mpsc::Sender<PluginOutgoing>,
-    body: &Map<String, Value>,
-) -> Result<(), ChatgptError> {
-    let text = body
-        .get("text")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_owned();
-    if text.is_empty() {
-        send_event(
-            out_tx,
-            turn_error_body(args, None, "prompt text must be non-empty"),
-        )
-        .await?;
-        return Ok(());
-    }
-    let prefix = args.event_prefix();
-    let chat_id = ChatId::default_for_prefix(&prefix);
-    if let Err(e) = chats.ensure(chat_id.clone()).await {
-        send_event(
-            out_tx,
-            turn_error_body(args, Some(&chat_id), &e.to_string()),
-        )
-        .await?;
-        return Ok(());
-    }
-    chats.push_user(&chat_id, text).await?;
-    let mut synthetic = Map::new();
-    synthetic.insert("chat_id".into(), Value::String(chat_id.to_string()));
-    handle_chat_complete(
-        args,
-        chats,
-        auth,
-        catalog,
-        broker,
-        responses_client,
-        out_tx,
-        &synthetic,
-        true,
-    )
-    .await
 }
 
 // ---------------------------------------------------------------------
@@ -1117,18 +1002,10 @@ impl ToolCallBuffer {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spawn_turn(
-    args: Arc<ServeArgs>,
-    chats: Arc<Chats>,
-    auth: Arc<AuthStore>,
-    catalog: Arc<ToolCatalog>,
-    broker: Arc<ToolBroker>,
-    responses_client: Arc<ResponsesClient>,
-    out_tx: mpsc::Sender<PluginOutgoing>,
+    ctx: DispatcherContext,
     chat_id: ChatId,
     cancel: tokio_util::sync::CancellationToken,
-    legacy_default_chat: bool,
 ) {
     tokio::spawn(async move {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -1136,8 +1013,8 @@ fn spawn_turn(
         let mut iterations: u32 = 0;
         let mut final_text = String::new();
         // Every loop path assigns this before break; the initial value
-        // is unused but the linter can't see that across the `'turn`
-        // label, so suppress the false positive.
+        // is unused but the linter can't see that across the loop,
+        // so suppress the false positive.
         #[allow(unused_assignments)]
         let mut final_finish_reason: Option<String> = None;
         let mut final_tool_calls: Vec<ToolCall> = Vec::new();
@@ -1147,15 +1024,16 @@ fn spawn_turn(
         let mut total_output_tokens: u64 = 0;
         let mut active_model = String::new();
 
-        'turn: loop {
+        loop {
             iterations += 1;
             if iterations > TOOL_LOOP_MAX_ITERATIONS {
                 tracing::warn!(cap = TOOL_LOOP_MAX_ITERATIONS, "tool-loop cap hit");
                 errored = true;
                 final_finish_reason = Some("error".into());
-                let _ = out_tx
+                let _ = ctx
+                    .out_tx
                     .send(PluginOutgoing::event(turn_error_body(
-                        &args,
+                        &ctx.args,
                         Some(&chat_id),
                         &format!(
                             "tool-loop iteration cap hit ({} iterations); aborting",
@@ -1166,15 +1044,16 @@ fn spawn_turn(
                 break;
             }
 
-            let snapshot = match chats.snapshot(&chat_id).await {
+            let snapshot = match ctx.chats.snapshot(&chat_id).await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(chat_id = %chat_id, error = %e, "chat vanished mid-turn");
                     errored = true;
                     final_finish_reason = Some("error".into());
-                    let _ = out_tx
+                    let _ = ctx
+                        .out_tx
                         .send(PluginOutgoing::event(chat_error_body(
-                            &args,
+                            &ctx.args,
                             &chat_id,
                             e.to_string(),
                         )))
@@ -1188,7 +1067,7 @@ fn spawn_turn(
             // catalog, optionally filtered by allowlist.
             let tools_specs = match snapshot.tool_overrides.clone() {
                 Some(t) => t,
-                None => catalog.all().await,
+                None => ctx.catalog.all().await,
             };
             let filtered_specs: Vec<_> = match &snapshot.tool_allowlist {
                 Some(allowed) => tools_specs
@@ -1224,13 +1103,16 @@ fn spawn_turn(
             //    only used when /models hasn't been fetched yet for
             //    this model. The /models fetch fires on startup +
             //    auth.set, so this fallback is rare in practice.
-            let supports_reasoning = if chats.model_reasoning_unsupported(&snapshot.model).await {
-                false
-            } else if let Some(api) = chats.model_capability_reasoning(&snapshot.model).await {
-                api
-            } else {
-                translator::model_supports_reasoning(&snapshot.model)
-            };
+            let supports_reasoning =
+                if ctx.chats.model_reasoning_unsupported(&snapshot.model).await {
+                    false
+                } else if let Some(api) =
+                    ctx.chats.model_capability_reasoning(&snapshot.model).await
+                {
+                    api
+                } else {
+                    translator::model_supports_reasoning(&snapshot.model)
+                };
             let include = if supports_reasoning {
                 vec!["reasoning.encrypted_content".to_string()]
             } else {
@@ -1259,14 +1141,16 @@ fn spawn_turn(
 
             // Snapshot auth before sending so we can fail fast on
             // LoginRequired/Error without burning an HTTP round trip.
-            let auth_snap = auth.snapshot().await;
+            let auth_snap = ctx.auth.snapshot().await;
             if !matches!(auth_snap.state, AuthState::Connected) {
-                let _ = out_tx
-                    .send(PluginOutgoing::event(auth_status_body(&args, &auth_snap)))
+                let _ = ctx
+                    .out_tx
+                    .send(PluginOutgoing::event(auth_status_body(&ctx.args, &auth_snap)))
                     .await;
-                let _ = out_tx
+                let _ = ctx
+                    .out_tx
                     .send(PluginOutgoing::event(turn_error_body(
-                        &args,
+                        &ctx.args,
                         Some(&chat_id),
                         "auth not connected; cannot complete turn",
                     )))
@@ -1280,14 +1164,16 @@ fn spawn_turn(
             // current_access_token call refreshes under the hood; we
             // grab a fresh snapshot afterwards because the cached
             // tokens may have rotated.
-            if let Err(e) = auth.current_access_token().await {
-                let snap = auth.apply_error(format!("refresh: {e}")).await;
-                let _ = out_tx
-                    .send(PluginOutgoing::event(auth_status_body(&args, &snap)))
+            if let Err(e) = ctx.auth.current_access_token().await {
+                let snap = ctx.auth.apply_error(format!("refresh: {e}")).await;
+                let _ = ctx
+                    .out_tx
+                    .send(PluginOutgoing::event(auth_status_body(&ctx.args, &snap)))
                     .await;
-                let _ = out_tx
+                let _ = ctx
+                    .out_tx
                     .send(PluginOutgoing::event(turn_error_body(
-                        &args,
+                        &ctx.args,
                         Some(&chat_id),
                         &format!("token refresh failed: {e}"),
                     )))
@@ -1296,15 +1182,16 @@ fn spawn_turn(
                 final_finish_reason = Some("error".into());
                 break;
             }
-            let auth_snap = auth.snapshot().await;
+            let auth_snap = ctx.auth.snapshot().await;
 
-            let mut stream = match responses_client.stream(&req, &auth_snap).await {
+            let mut stream = match ctx.responses_client.stream(&req, &auth_snap).await {
                 Ok(s) => s,
                 Err(ChatgptError::ResponsesEndpoint { status, body }) => {
                     if status == 401 {
-                        let snap = auth.apply_error(HTTP_401_MESSAGE.to_owned()).await;
-                        let _ = out_tx
-                            .send(PluginOutgoing::event(auth_status_body(&args, &snap)))
+                        let snap = ctx.auth.apply_error(HTTP_401_MESSAGE.to_owned()).await;
+                        let _ = ctx
+                            .out_tx
+                            .send(PluginOutgoing::event(auth_status_body(&ctx.args, &snap)))
                             .await;
                     }
                     // Reactive fallback: some gpt-5-family slugs
@@ -1324,15 +1211,16 @@ fn spawn_turn(
                             body = %snippet(&body),
                             "model rejected reasoning — falling back to no-reasoning mode for this model",
                         );
-                        chats
+                        ctx.chats
                             .mark_model_reasoning_unsupported(&snapshot.model)
                             .await;
                         iterations = iterations.saturating_sub(1);
                         continue;
                     }
-                    let _ = out_tx
+                    let _ = ctx
+                        .out_tx
                         .send(PluginOutgoing::event(turn_error_body(
-                            &args,
+                            &ctx.args,
                             Some(&chat_id),
                             &format!("HTTP {status}: {}", snippet(&body)),
                         )))
@@ -1342,9 +1230,10 @@ fn spawn_turn(
                     break;
                 }
                 Err(e) => {
-                    let _ = out_tx
+                    let _ = ctx
+                        .out_tx
                         .send(PluginOutgoing::event(turn_error_body(
-                            &args,
+                            &ctx.args,
                             Some(&chat_id),
                             &format!("request failed: {e}"),
                         )))
@@ -1377,12 +1266,12 @@ fn spawn_turn(
                                 ResponseEvent::OutputTextDelta { delta, .. } => {
                                     output_text.push_str(&delta);
                                     let body = stream_delta_body(
-                                        &args.event_prefix(),
+                                        &ctx.args.event_prefix(),
                                         &turn_id,
                                         &chat_id,
                                         &delta,
                                     );
-                                    let _ = out_tx.try_send(PluginOutgoing::event(body));
+                                    let _ = ctx.out_tx.try_send(PluginOutgoing::event(body));
                                 }
                                 ResponseEvent::ReasoningSummaryDelta { delta, .. }
                                 | ResponseEvent::ReasoningContentDelta { delta, .. } => {
@@ -1391,12 +1280,12 @@ fn spawn_turn(
                                     }
                                     reasoning_text.push_str(&delta);
                                     let body = stream_reasoning_delta_body(
-                                        &args.event_prefix(),
+                                        &ctx.args.event_prefix(),
                                         &turn_id,
                                         &chat_id,
                                         &delta,
                                     );
-                                    let _ = out_tx.try_send(PluginOutgoing::event(body));
+                                    let _ = ctx.out_tx.try_send(PluginOutgoing::event(body));
                                 }
                                 ResponseEvent::FunctionCallArgumentsDelta { delta, item_id } => {
                                     tool_buf.on_args_delta(item_id.as_deref(), &delta);
@@ -1508,22 +1397,23 @@ fn spawn_turn(
                     .map(|s| s.elapsed().as_millis() as u64)
                     .unwrap_or(0);
                 let body = stream_reasoning_end_body(
-                    &args.event_prefix(),
+                    &ctx.args.event_prefix(),
                     &turn_id,
                     &chat_id,
                     &reasoning_text,
                     duration_ms,
                 );
-                let _ = out_tx.send(PluginOutgoing::event(body)).await;
+                let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
             }
 
             total_input_tokens = total_input_tokens.saturating_add(iter_input_tokens);
             total_output_tokens = total_output_tokens.saturating_add(iter_output_tokens);
 
             if let Some(err_msg) = iter_errored {
-                let _ = out_tx
+                let _ = ctx
+                    .out_tx
                     .send(PluginOutgoing::event(turn_error_body(
-                        &args,
+                        &ctx.args,
                         Some(&chat_id),
                         &err_msg,
                     )))
@@ -1535,7 +1425,7 @@ fn spawn_turn(
 
             if iter_interrupted {
                 if !output_text.is_empty() {
-                    let _ = chats.push_assistant(&chat_id, output_text.clone()).await;
+                    let _ = ctx.chats.push_assistant(&chat_id, output_text.clone()).await;
                 }
                 final_text = output_text;
                 final_finish_reason = Some("interrupted".into());
@@ -1545,64 +1435,20 @@ fn spawn_turn(
 
             let tool_calls = tool_buf.into_tool_calls();
             if !tool_calls.is_empty() {
-                let _ = chats
+                let _ = ctx
+                    .chats
                     .push_assistant_tool_calls(&chat_id, output_text.clone(), tool_calls.clone())
                     .await;
 
-                // Legacy path: run the tool loop internally so the
-                // chat-completion result still pops out at the end.
-                // Explicit chat.complete path: yield the calls back to
-                // the caller (reasoner-graph drives the dispatch via
-                // its own tool-executor).
-                if !legacy_default_chat {
-                    final_text = output_text;
-                    final_finish_reason = iter_finish_reason.or(Some("tool_calls".into()));
-                    final_tool_calls = tool_calls;
-                    break;
-                }
-
-                let call_ids: Vec<String> = tool_calls.iter().map(|tc| tc.id.clone()).collect();
-                let mut cancelled_idx: Option<usize> = None;
-                for (idx, tc) in tool_calls.into_iter().enumerate() {
-                    let step = run_one_tool_call(&catalog, &broker, &out_tx, &cancel, tc).await;
-                    match step {
-                        ToolStepOutcome::Result { id, content } => {
-                            let _ = chats.push_tool_result(&chat_id, id, content).await;
-                        }
-                        ToolStepOutcome::Cancelled { id } => {
-                            let _ = chats
-                                .push_tool_result(
-                                    &chat_id,
-                                    id,
-                                    "(tool was interrupted by the user)".into(),
-                                )
-                                .await;
-                            interrupted = true;
-                            cancelled_idx = Some(idx);
-                            break;
-                        }
-                    }
-                }
-                if let Some(c_idx) = cancelled_idx {
-                    for unstarted_id in call_ids.iter().skip(c_idx + 1) {
-                        let _ = chats
-                            .push_tool_result(
-                                &chat_id,
-                                unstarted_id.clone(),
-                                "(tool not run; previous tool call in this turn was interrupted)"
-                                    .into(),
-                            )
-                            .await;
-                    }
-                    final_finish_reason = Some("interrupted".into());
-                    break 'turn;
-                }
-                continue;
+                final_text = output_text;
+                final_finish_reason = iter_finish_reason.or(Some("tool_calls".into()));
+                final_tool_calls = tool_calls;
+                break;
             }
 
             // No tool calls → terminal turn.
             if !output_text.is_empty() {
-                let _ = chats.push_assistant(&chat_id, output_text.clone()).await;
+                let _ = ctx.chats.push_assistant(&chat_id, output_text.clone()).await;
             }
             final_text = output_text;
             final_finish_reason = iter_finish_reason.or(Some("stop".into()));
@@ -1610,7 +1456,8 @@ fn spawn_turn(
         }
 
         let elapsed_ms = started.elapsed().as_millis() as u64;
-        let _ = chats
+        let _ = ctx
+            .chats
             .record_turn(
                 &chat_id,
                 Some(&active_model),
@@ -1621,7 +1468,7 @@ fn spawn_turn(
             .await;
 
         let body = stream_end_body(
-            &args,
+            &ctx.args,
             &turn_id,
             &chat_id,
             &final_text,
@@ -1629,117 +1476,37 @@ fn spawn_turn(
             elapsed_ms,
             final_finish_reason.as_deref(),
         );
-        let _ = out_tx.send(PluginOutgoing::event(body)).await;
-        if let Ok(stats) = chats.stats_snapshot(&chat_id).await {
-            let _ = out_tx
+        let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
+        if let Ok(stats) = ctx.chats.stats_snapshot(&chat_id).await {
+            let _ = ctx
+                .out_tx
                 .send(PluginOutgoing::event(session_stats_body(
-                    &args, &chat_id, &stats,
+                    &ctx.args, &chat_id, &stats,
                 )))
                 .await;
         }
         if interrupted && !errored {
-            let _ = out_tx
+            let _ = ctx
+                .out_tx
                 .send(PluginOutgoing::event(turn_error_body(
-                    &args,
+                    &ctx.args,
                     Some(&chat_id),
                     "interrupted",
                 )))
                 .await;
         }
 
-        if !legacy_default_chat {
-            let body = chat_complete_result_body(
-                &args,
-                &chat_id,
-                &final_text,
-                &final_tool_calls,
-                final_finish_reason.as_deref(),
-            );
-            let _ = out_tx.send(PluginOutgoing::event(body)).await;
-        }
+        let body = chat_complete_result_body(
+            &ctx.args,
+            &chat_id,
+            &final_text,
+            &final_tool_calls,
+            final_finish_reason.as_deref(),
+        );
+        let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
 
-        chats.end_turn(&chat_id).await;
+        ctx.chats.end_turn(&chat_id).await;
     });
-}
-
-// ---------------------------------------------------------------------
-// Tool-call execution (used by legacy chat.prompt path).
-// ---------------------------------------------------------------------
-
-enum ToolStepOutcome {
-    Result { id: String, content: String },
-    Cancelled { id: String },
-}
-
-async fn run_one_tool_call(
-    catalog: &Arc<ToolCatalog>,
-    broker: &Arc<ToolBroker>,
-    out_tx: &mpsc::Sender<PluginOutgoing>,
-    cancel: &tokio_util::sync::CancellationToken,
-    tc: ToolCall,
-) -> ToolStepOutcome {
-    let id = tc.id.clone();
-    let name = tc.function.name.clone();
-    let args_str = tc.function.arguments.clone();
-    let args_value: Value =
-        serde_json::from_str(&args_str).unwrap_or_else(|_| Value::Object(Map::new()));
-
-    let _ = out_tx
-        .send(PluginOutgoing::event(chat_tool_start_body(
-            &id,
-            &name,
-            &args_value,
-        )))
-        .await;
-
-    let owner = match catalog.owner_of(&name).await {
-        Some(o) => o,
-        None => {
-            let err = format!("no tool plugin registered tool `{name}`");
-            let _ = out_tx
-                .send(PluginOutgoing::event(chat_tool_end_body(&id, &err, true)))
-                .await;
-            return ToolStepOutcome::Result { id, content: err };
-        }
-    };
-
-    let rx = broker.register(id.clone()).await;
-    let _ = out_tx
-        .send(PluginOutgoing::event(tool_invoke_body(
-            &owner, &id, &name, args_value,
-        )))
-        .await;
-
-    let result = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => {
-            broker.cancel(&id).await;
-            return ToolStepOutcome::Cancelled { id };
-        }
-        r = rx => r.ok(),
-        _ = tokio::time::sleep(TOOL_RESULT_TIMEOUT) => {
-            broker.cancel(&id).await;
-            let err = format!(
-                "tool `{name}` did not reply within {}s",
-                TOOL_RESULT_TIMEOUT.as_secs()
-            );
-            let _ = out_tx
-                .send(PluginOutgoing::event(chat_tool_end_body(&id, &err, true)))
-                .await;
-            return ToolStepOutcome::Result { id, content: err };
-        }
-    };
-
-    let (content, is_error) = match result {
-        Some(r) => r.into_content(),
-        None => ("tool reply channel closed".into(), true),
-    };
-    let _ = out_tx
-        .send(PluginOutgoing::event(chat_tool_end_body(
-            &id, &content, is_error,
-        )))
-        .await;
-    ToolStepOutcome::Result { id, content }
 }
 
 fn snippet(s: &str) -> String {
