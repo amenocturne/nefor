@@ -25,7 +25,9 @@ use nefor_tui::engine::Engine;
 use nefor_tui::error::TuiError;
 use nefor_tui::input::from_key_event;
 use nefor_tui::mouse::from_crossterm as from_mouse_event;
-use nefor_tui::ncp::{await_ready_ok, spawn_stdin_reader, spawn_stdout_writer, CHANNEL_CAP};
+use nefor_plugin_sdk::{spawn_stdin_reader, spawn_stdout_writer, await_ready_ok, TransportError};
+
+const CHANNEL_CAP: usize = 128;
 use nefor_tui::tty::{open_tty, RawModeGuard};
 
 const PROTOCOL_VERSION: &str = "0.1";
@@ -187,8 +189,8 @@ async fn main() -> ExitCode {
 
 async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
     // Stdout writer first so the handshake can land cleanly.
-    let (out_tx, _writer_handle) = spawn_stdout_writer();
-    let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, TuiError>>(CHANNEL_CAP);
+    let (out_tx, _writer_handle) = spawn_stdout_writer(CHANNEL_CAP);
+    let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(CHANNEL_CAP);
     let _reader_handle = spawn_stdin_reader(in_tx);
 
     out_tx
@@ -196,7 +198,7 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
             protocol_version: PROTOCOL_VERSION.into(),
         }))
         .await
-        .map_err(|_| TuiError::WriterClosed)?;
+        .map_err(|_| TuiError::Transport(TransportError::WriterClosed))?;
 
     let engine_version = await_ready_ok(&mut in_rx).await?;
     tracing::info!(engine_version = %engine_version, "ready");
@@ -435,7 +437,7 @@ async fn drain_emits_to_writer(
         out_tx
             .send(outgoing)
             .await
-            .map_err(|_| TuiError::WriterClosed)?;
+            .map_err(|_| TuiError::Transport(TransportError::WriterClosed))?;
     }
     Ok(())
 }

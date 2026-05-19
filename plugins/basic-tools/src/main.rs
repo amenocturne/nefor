@@ -21,15 +21,17 @@
 //!   `tool.result { id, error }` on failure. Caller correlates by `id`.
 
 mod error;
-mod ncp;
 mod tools;
 
+use nefor_plugin_sdk::{spawn_stdin_reader, spawn_stdout_writer, await_ready_ok, TransportError};
 use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
-use crate::error::{BasicToolsError, ToolError};
+use crate::error::ToolError;
 use crate::tools::{run_tool, TOOLS};
+
+const CHANNEL_CAP: usize = 256;
 
 /// NCP version this plugin speaks.
 const PROTOCOL_VERSION: &str = "0.1";
@@ -83,13 +85,13 @@ fn parse_gate_arg() -> Option<String> {
         .cloned()
 }
 
-async fn run(gate: Option<String>) -> Result<(), BasicToolsError> {
-    let (out_tx, _writer_handle) = ncp::spawn_stdout_writer();
-    let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, BasicToolsError>>(ncp::CHANNEL_CAP);
-    let _reader_handle = ncp::spawn_stdin_reader(in_tx);
+async fn run(gate: Option<String>) -> Result<(), TransportError> {
+    let (out_tx, _writer_handle) = spawn_stdout_writer(CHANNEL_CAP);
+    let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(CHANNEL_CAP);
+    let _reader_handle = spawn_stdin_reader(in_tx);
 
     send_ready(&out_tx).await?;
-    let engine_version = ncp::await_ready_ok(&mut in_rx).await?;
+    let engine_version = await_ready_ok(&mut in_rx).await?;
     tracing::info!(engine_version = %engine_version, tools = TOOLS.len(), gate = ?gate, "ready");
 
     send_event(&out_tx, hello_body()).await?;
@@ -106,8 +108,8 @@ async fn run(gate: Option<String>) -> Result<(), BasicToolsError> {
 
 async fn run_dispatch_loop(
     out_tx: &mpsc::Sender<PluginOutgoing>,
-    in_rx: &mut mpsc::Receiver<Result<Envelope, BasicToolsError>>,
-) -> Result<(), BasicToolsError> {
+    in_rx: &mut mpsc::Receiver<Result<Envelope, TransportError>>,
+) -> Result<(), TransportError> {
     loop {
         tokio::select! {
             maybe = in_rx.recv() => {
@@ -147,7 +149,7 @@ async fn run_dispatch_loop(
 async fn dispatch_event(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: &Map<String, Value>,
-) -> Result<(), BasicToolsError> {
+) -> Result<(), TransportError> {
     let kind = match body.get("kind").and_then(Value::as_str) {
         Some(k) => k,
         None => return Ok(()),
@@ -162,7 +164,7 @@ async fn dispatch_event(
 async fn handle_tool_invoke(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: &Map<String, Value>,
-) -> Result<(), BasicToolsError> {
+) -> Result<(), TransportError> {
     // `id` is the caller's correlation token. If it's missing we can't
     // reply usefully — log and drop. (A v2 protocol could surface this as
     // a generic error event, but there's no caller to address it to.)
@@ -308,20 +310,20 @@ fn goodbye_body() -> Map<String, Value> {
 async fn send_event(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: Map<String, Value>,
-) -> Result<(), BasicToolsError> {
+) -> Result<(), TransportError> {
     out_tx
         .send(PluginOutgoing::event(body))
         .await
-        .map_err(|_| BasicToolsError::WriterClosed)
+        .map_err(|_| TransportError::WriterClosed)
 }
 
-async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), BasicToolsError> {
+async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), TransportError> {
     out_tx
         .send(PluginOutgoing::system(SystemBody::Ready {
             protocol_version: PROTOCOL_VERSION.into(),
         }))
         .await
-        .map_err(|_| BasicToolsError::WriterClosed)
+        .map_err(|_| TransportError::WriterClosed)
 }
 
 #[cfg(test)]

@@ -27,7 +27,9 @@ use chatgpt_provider::dispatcher::{
 };
 use chatgpt_provider::error::ChatgptError;
 use chatgpt_provider::installation::{default_installation_path, read_or_generate};
-use chatgpt_provider::ncp::{await_ready_ok, spawn_stdin_reader, spawn_stdout_writer, CHANNEL_CAP};
+use nefor_plugin_sdk::{spawn_stdin_reader, spawn_stdout_writer, await_ready_ok, TransportError};
+
+const CHANNEL_CAP: usize = 256;
 use chatgpt_provider::responses::{ResponsesClient, DEFAULT_ORIGINATOR};
 use chatgpt_provider::state::Chats;
 
@@ -68,8 +70,8 @@ async fn main() -> anyhow::Result<()> {
 async fn run_serve(args: ServeArgs) -> Result<(), ChatgptError> {
     let args = Arc::new(args);
 
-    let (out_tx, _writer_handle) = spawn_stdout_writer();
-    let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, ChatgptError>>(CHANNEL_CAP);
+    let (out_tx, _writer_handle) = spawn_stdout_writer(CHANNEL_CAP);
+    let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(CHANNEL_CAP);
     let _reader_handle = spawn_stdin_reader(in_tx);
 
     send_ready(&out_tx).await?;

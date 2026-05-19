@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 nefor-protocol = { path = "../../crates/nefor-protocol" }
+nefor-plugin-sdk = { path = "../../crates/nefor-plugin-sdk" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 thiserror = { workspace = true }

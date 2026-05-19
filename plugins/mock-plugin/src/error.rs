@@ -5,8 +5,6 @@
 
 use std::path::PathBuf;
 
-use nefor_protocol::ParseError;
-
 /// All failure modes inside mock-plugin.
 #[derive(Debug, thiserror::Error)]
 pub enum MockError {
@@ -22,23 +20,7 @@ pub enum MockError {
     #[error("lua error: {0}")]
     Lua(#[from] mlua::Error),
 
-    /// I/O error on stdio or inside a transport task.
+    /// NCP transport failure (I/O, handshake, parse, writer closed).
     #[error(transparent)]
-    Io(#[from] std::io::Error),
-
-    /// Engine rejected our ready handshake, or closed before replying.
-    #[error("ready failed: {0}")]
-    ReadyFailed(String),
-
-    /// Stdin closed before we saw `ready_ok`.
-    #[error("engine closed stdio before ready_ok")]
-    ReadyClosed,
-
-    /// Wire-format decode failure we could not recover from.
-    #[error("protocol parse error: {0}")]
-    Parse(#[from] ParseError),
-
-    /// The writer task exited before the outgoing channel drained.
-    #[error("stdout writer closed before outgoing message was delivered")]
-    WriterClosed,
+    Transport(#[from] nefor_plugin_sdk::TransportError),
 }

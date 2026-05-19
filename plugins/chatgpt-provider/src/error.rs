@@ -73,21 +73,9 @@ pub enum ChatgptError {
     #[error("could not build Authorization header: {0}")]
     InvalidHeader(String),
 
-    /// Engine rejected our ready handshake, or closed before replying.
-    #[error("ready failed: {0}")]
-    ReadyFailed(String),
-
-    /// Stdin closed before we saw `ready_ok`.
-    #[error("engine closed stdio before ready_ok")]
-    ReadyClosed,
-
-    /// Wire-format decode failure we could not recover from.
-    #[error("protocol parse error: {0}")]
-    Parse(#[from] nefor_protocol::ParseError),
-
-    /// The writer task exited before the outgoing channel drained.
-    #[error("stdout writer closed before outgoing message was delivered")]
-    WriterClosed,
+    /// NCP transport failure (handshake, parse, writer closed).
+    #[error(transparent)]
+    Transport(#[from] nefor_plugin_sdk::TransportError),
 
     /// Bubbled out of a chats-map operation. The dispatcher catches and
     /// translates these into wire-level error events; surfacing it as a

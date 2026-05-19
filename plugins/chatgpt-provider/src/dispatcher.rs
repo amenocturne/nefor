@@ -27,6 +27,7 @@ use crate::broker::{ToolBroker, ToolResult};
 use crate::catalog::ToolCatalog;
 use crate::config::ServeArgs;
 use crate::error::ChatgptError;
+use nefor_plugin_sdk::TransportError;
 use crate::responses::request::{Reasoning, ReasoningSummary, ResponseItem, ResponsesApiRequest};
 use crate::responses::stream::ResponseEvent;
 use crate::responses::{ModelEntry, ResponsesClient};
@@ -317,7 +318,7 @@ pub async fn send_event(
     out_tx
         .send(PluginOutgoing::event(body))
         .await
-        .map_err(|_| ChatgptError::WriterClosed)
+        .map_err(|_| ChatgptError::Transport(TransportError::WriterClosed))
 }
 
 pub async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), ChatgptError> {
@@ -326,7 +327,7 @@ pub async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), Cha
             protocol_version: PROTOCOL_VERSION.into(),
         }))
         .await
-        .map_err(|_| ChatgptError::WriterClosed)
+        .map_err(|_| ChatgptError::Transport(TransportError::WriterClosed))
 }
 
 /// Convenience used at startup to emit hello/ready/auth.status in order.
@@ -472,7 +473,7 @@ pub struct DispatcherContext {
 /// close, or ctrl-c. The caller emits goodbye after we return.
 pub async fn run_dispatch_loop(
     ctx: DispatcherContext,
-    mut in_rx: mpsc::Receiver<Result<Envelope, ChatgptError>>,
+    mut in_rx: mpsc::Receiver<Result<Envelope, TransportError>>,
 ) -> Result<(), ChatgptError> {
     loop {
         tokio::select! {

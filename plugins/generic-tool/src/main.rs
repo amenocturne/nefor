@@ -46,14 +46,12 @@
 //! }
 //! ```
 
-mod error;
-mod ncp;
-
+use nefor_plugin_sdk::{spawn_stdin_reader, spawn_stdout_writer, await_ready_ok, TransportError};
 use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
-use crate::error::ToolError;
+const CHANNEL_CAP: usize = 64;
 
 /// NCP version this plugin speaks.
 const PROTOCOL_VERSION: &str = "0.1";
@@ -87,13 +85,13 @@ async fn main() {
     std::process::exit(0);
 }
 
-async fn run() -> Result<(), ToolError> {
-    let (out_tx, _writer_handle) = ncp::spawn_stdout_writer();
-    let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, ToolError>>(ncp::CHANNEL_CAP);
-    let _reader_handle = ncp::spawn_stdin_reader(in_tx);
+async fn run() -> Result<(), TransportError> {
+    let (out_tx, _writer_handle) = spawn_stdout_writer(CHANNEL_CAP);
+    let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(CHANNEL_CAP);
+    let _reader_handle = spawn_stdin_reader(in_tx);
 
     send_ready(&out_tx).await?;
-    let engine_version = ncp::await_ready_ok(&mut in_rx).await?;
+    let engine_version = await_ready_ok(&mut in_rx).await?;
     tracing::info!(engine_version = %engine_version, "ready");
 
     send_event(&out_tx, hello_body()).await?;
@@ -108,8 +106,8 @@ async fn run() -> Result<(), ToolError> {
 
 /// The plugin has no incoming work — it only registers types and waits.
 async fn idle_until_shutdown(
-    in_rx: &mut mpsc::Receiver<Result<Envelope, ToolError>>,
-) -> Result<(), ToolError> {
+    in_rx: &mut mpsc::Receiver<Result<Envelope, TransportError>>,
+) -> Result<(), TransportError> {
     loop {
         tokio::select! {
             maybe = in_rx.recv() => {
@@ -183,20 +181,20 @@ fn register_body() -> Map<String, Value> {
 async fn send_event(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: Map<String, Value>,
-) -> Result<(), ToolError> {
+) -> Result<(), TransportError> {
     out_tx
         .send(PluginOutgoing::event(body))
         .await
-        .map_err(|_| ToolError::WriterClosed)
+        .map_err(|_| TransportError::WriterClosed)
 }
 
-async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), ToolError> {
+async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), TransportError> {
     out_tx
         .send(PluginOutgoing::system(SystemBody::Ready {
             protocol_version: PROTOCOL_VERSION.into(),
         }))
         .await
-        .map_err(|_| ToolError::WriterClosed)
+        .map_err(|_| TransportError::WriterClosed)
 }
 
 #[cfg(test)]

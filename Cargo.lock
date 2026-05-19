@@ -122,6 +122,7 @@ name = "basic-tools-plugin"
 version = "0.1.9"
 dependencies = [
  "clap",
+ "nefor-plugin-sdk",
  "nefor-protocol",
  "serde",
  "serde_json",
@@ -202,6 +203,7 @@ dependencies = [
  "clap",
  "dirs",
  "futures",
+ "nefor-plugin-sdk",
  "nefor-protocol",
  "rand 0.8.6",
  "reqwest",
@@ -685,6 +687,7 @@ dependencies = [
 name = "generic-provider"
 version = "0.1.9"
 dependencies = [
+ "nefor-plugin-sdk",
  "nefor-protocol",
  "serde_json",
  "thiserror 2.0.18",
@@ -697,6 +700,7 @@ dependencies = [
 name = "generic-tool"
 version = "0.1.9"
 dependencies = [
+ "nefor-plugin-sdk",
  "nefor-protocol",
  "serde_json",
  "thiserror 2.0.18",
@@ -1264,6 +1268,7 @@ version = "0.1.9"
 dependencies = [
  "clap",
  "mlua",
+ "nefor-plugin-sdk",
  "nefor-protocol",
  "serde",
  "serde_json",
@@ -1303,6 +1308,7 @@ dependencies = [
 name = "nefor-combinators-plugin"
 version = "0.1.9"
 dependencies = [
+ "nefor-plugin-sdk",
  "nefor-protocol",
  "serde",
  "serde_json",
@@ -1311,6 +1317,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "nefor-plugin-sdk"
+version = "0.1.9"
+dependencies = [
+ "nefor-protocol",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1333,6 +1350,7 @@ dependencies = [
  "crossterm",
  "futures",
  "mlua",
+ "nefor-plugin-sdk",
  "nefor-protocol",
  "pulldown-cmark",
  "serde",
@@ -1461,6 +1479,7 @@ version = "0.1.9"
 dependencies = [
  "clap",
  "futures-util",
+ "nefor-plugin-sdk",
  "nefor-protocol",
  "reqwest",
  "serde",
@@ -1722,6 +1741,7 @@ dependencies = [
 name = "reasoner-graph"
 version = "0.1.9"
 dependencies = [
+ "nefor-plugin-sdk",
  "nefor-protocol",
  "serde",
  "serde_json",
@@ -2322,6 +2342,7 @@ name = "tool-gate-plugin"
 version = "0.1.9"
 dependencies = [
  "clap",
+ "nefor-plugin-sdk",
  "nefor-protocol",
  "serde",
  "serde_json",

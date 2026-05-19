@@ -1,39 +1,9 @@
 //! Domain errors for the basic-tools plugin.
 //!
-//! Two layers:
-//!
-//! - [`BasicToolsError`] — plugin-level failures (transport, handshake, parse).
-//!   These are fatal: they halt or short-circuit dispatch.
-//! - [`ToolError`] — tool-call failures surfaced on the wire as
-//!   `tool.result { error }`. These are *not* fatal — they're a tool's
-//!   normal error channel and the plugin keeps serving the bus.
-
-use nefor_protocol::ParseError;
-
-/// Plugin-level failure modes (transport, handshake, parse). Any of these
-/// short-circuits the dispatch loop.
-#[derive(Debug, thiserror::Error)]
-pub enum BasicToolsError {
-    /// I/O error on stdio or inside a transport task.
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-
-    /// Engine rejected our ready handshake, or closed before replying.
-    #[error("ready failed: {0}")]
-    ReadyFailed(String),
-
-    /// Stdin closed before we saw `ready_ok`.
-    #[error("engine closed stdio before ready_ok")]
-    ReadyClosed,
-
-    /// Wire-format decode failure we could not recover from.
-    #[error("protocol parse error: {0}")]
-    Parse(#[from] ParseError),
-
-    /// The writer task exited before the outgoing channel drained.
-    #[error("stdout writer closed before outgoing message was delivered")]
-    WriterClosed,
-}
+//! Plugin-level transport errors come from [`nefor_plugin_sdk::TransportError`].
+//! [`ToolError`] covers tool-call failures surfaced on the wire as
+//! `tool.result { error }`. These are *not* fatal — they're a tool's
+//! normal error channel and the plugin keeps serving the bus.
 
 /// Tool-call failure modes. These surface on the wire as
 /// `tool.result { id, error: "<message>" }`. The variant carries enough

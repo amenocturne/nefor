@@ -18,7 +18,6 @@ pub mod layout;
 pub mod lua_host;
 pub mod markdown;
 pub mod mouse;
-pub mod ncp;
 pub mod reconciler;
 pub mod render;
 pub mod scrollable;

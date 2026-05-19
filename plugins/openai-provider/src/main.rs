@@ -44,12 +44,14 @@
 //! intentionally exercises (`Into.in` cross-namespace).
 
 mod error;
-mod ncp;
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use nefor_plugin_sdk::{spawn_stdin_reader, spawn_stdout_writer, await_ready_ok, TransportError};
 use nefor_protocol::{Body, Envelope, PluginName, PluginOutgoing, SystemBody};
+
+const CHANNEL_CAP: usize = 256;
 use openai_provider::auth::{AuthSnapshot, AuthState, AuthStore, LogoutOutcome};
 use openai_provider::broker::{ToolBroker, ToolResult};
 use openai_provider::catalog::ToolCatalog;
@@ -112,12 +114,12 @@ async fn run() -> Result<(), LlmError> {
         .build()
         .expect("reqwest client build");
 
-    let (out_tx, _writer_handle) = ncp::spawn_stdout_writer();
-    let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, LlmError>>(ncp::CHANNEL_CAP);
-    let _reader_handle = ncp::spawn_stdin_reader(in_tx);
+    let (out_tx, _writer_handle) = spawn_stdout_writer(CHANNEL_CAP);
+    let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(CHANNEL_CAP);
+    let _reader_handle = spawn_stdin_reader(in_tx);
 
     send_ready(&out_tx).await?;
-    let engine_version = ncp::await_ready_ok(&mut in_rx).await?;
+    let engine_version = await_ready_ok(&mut in_rx).await?;
     tracing::info!(
         engine_version = %engine_version,
         provider = %config.provider_name,
@@ -161,7 +163,7 @@ async fn run_dispatch_loop(
     config: &Config,
     client: &reqwest::Client,
     out_tx: &mpsc::Sender<PluginOutgoing>,
-    in_rx: &mut mpsc::Receiver<Result<Envelope, LlmError>>,
+    in_rx: &mut mpsc::Receiver<Result<Envelope, TransportError>>,
 ) -> Result<(), LlmError> {
     loop {
         tokio::select! {
@@ -1770,7 +1772,7 @@ async fn send_event(
     out_tx
         .send(PluginOutgoing::event(body))
         .await
-        .map_err(|_| LlmError::WriterClosed)
+        .map_err(|_| LlmError::Transport(TransportError::WriterClosed))
 }
 
 async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), LlmError> {
@@ -1779,7 +1781,7 @@ async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), LlmErro
             protocol_version: PROTOCOL_VERSION.into(),
         }))
         .await
-        .map_err(|_| LlmError::WriterClosed)
+        .map_err(|_| LlmError::Transport(TransportError::WriterClosed))
 }
 
 #[cfg(test)]

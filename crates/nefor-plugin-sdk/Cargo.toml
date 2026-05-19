@@ -1,0 +1,18 @@
+[package]
+name = "nefor-plugin-sdk"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared NCP stdio transport boilerplate for nefor plugins: stdin reader, stdout writer, ready handshake."
+
+[dependencies]
+nefor-protocol = { path = "../nefor-protocol" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }

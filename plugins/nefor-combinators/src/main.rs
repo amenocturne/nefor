@@ -17,16 +17,18 @@
 
 mod dispatch;
 mod error;
-mod ncp;
 mod registry;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use nefor_plugin_sdk::{spawn_stdin_reader, spawn_stdout_writer, await_ready_ok, TransportError};
 use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
 use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot, Mutex};
+
+const CHANNEL_CAP: usize = 256;
 
 use crate::dispatch::{
     caller_error_body, caller_result_body, classify_reply_kind, handler_dispatch_body,
@@ -76,12 +78,12 @@ async fn main() {
 }
 
 async fn run() -> Result<(), CombinatorsError> {
-    let (out_tx, _writer_handle) = ncp::spawn_stdout_writer();
-    let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, CombinatorsError>>(ncp::CHANNEL_CAP);
-    let _reader_handle = ncp::spawn_stdin_reader(in_tx);
+    let (out_tx, _writer_handle) = spawn_stdout_writer(CHANNEL_CAP);
+    let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(CHANNEL_CAP);
+    let _reader_handle = spawn_stdin_reader(in_tx);
 
     send_ready(&out_tx).await?;
-    let engine_version = ncp::await_ready_ok(&mut in_rx).await?;
+    let engine_version = await_ready_ok(&mut in_rx).await?;
     tracing::info!(engine_version = %engine_version, "ready");
 
     send_event(&out_tx, hello_body()).await?;
@@ -117,7 +119,7 @@ async fn run_dispatch_loop(
     registry: &Arc<Mutex<Registry>>,
     pending: &Arc<Mutex<HashMap<InternalId, PendingSlot>>>,
     out_tx: &mpsc::Sender<PluginOutgoing>,
-    in_rx: &mut mpsc::Receiver<Result<Envelope, CombinatorsError>>,
+    in_rx: &mut mpsc::Receiver<Result<Envelope, TransportError>>,
 ) -> Result<(), CombinatorsError> {
     loop {
         tokio::select! {
@@ -859,7 +861,7 @@ async fn send_event(
     out_tx
         .send(PluginOutgoing::event(body))
         .await
-        .map_err(|_| CombinatorsError::WriterClosed)
+        .map_err(|_| CombinatorsError::Transport(TransportError::WriterClosed))
 }
 
 async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), CombinatorsError> {
@@ -868,7 +870,7 @@ async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), Combina
             protocol_version: PROTOCOL_VERSION.into(),
         }))
         .await
-        .map_err(|_| CombinatorsError::WriterClosed)
+        .map_err(|_| CombinatorsError::Transport(TransportError::WriterClosed))
 }
 
 #[cfg(test)]
