@@ -11,6 +11,4 @@ pub mod mode;
 pub mod vm;
 
 pub use error::LuaError;
-#[allow(unused_imports)]
-pub use mode::EngineMode;
 pub use vm::LuaHost;

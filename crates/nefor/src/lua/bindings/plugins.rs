@@ -80,6 +80,8 @@ pub fn install_plugins(
                     "args" => "put args inside the command array, e.g. command = { binary, \"--flag\", \"value\" }",
                     "env" => "set env vars in a wrapper script and invoke that script as the command",
                     "cwd" => "the engine always uses <plugin-dir>/<name>/ as cwd; use a wrapper script if you need a different one",
+                    // Safety: the `for` loop iterates a fixed 3-element array;
+                    // every element is handled by the branches above.
                     _ => unreachable!(),
                 };
                 return Err(mlua::Error::runtime(format!(

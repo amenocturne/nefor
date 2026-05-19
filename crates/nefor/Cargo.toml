@@ -5,11 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "nefor engine — NCP broker and Lua plugin host on top of nefor-combinators."
+description = "nefor engine — NCP broker and Lua plugin host."
 default-run = "nefor"
 
 [dependencies]
-nefor-combinators = { path = "../nefor-combinators" }
 nefor-protocol = { path = "../nefor-protocol" }
 tokio = { workspace = true }
 clap = { workspace = true }

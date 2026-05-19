@@ -5,10 +5,11 @@
 //! binary with `--script <file>`, walks the handshake, streams a few
 //! engine-authored lines, and reads back whatever the plugin emits.
 //!
-//! TODO: these tests are flaky when run in parallel (process spawn
-//! contention causes timeouts). They pass individually but fail under
-//! `cargo test --workspace`. Marked `#[ignore]` until we add serial
-//! execution or increase timeouts. Run with `cargo test -- --ignored`.
+//! NOTE: all tests are `#[ignore]` — they time out waiting for plugin
+//! output both in parallel and serial (`--test-threads=1`). The
+//! mock-plugin binary's startup or handshake behavior has likely
+//! changed since these tests were written. Needs investigation of the
+//! binary's ready/ready_ok handshake path before un-ignoring.
 
 use std::io::Write;
 use std::path::PathBuf;

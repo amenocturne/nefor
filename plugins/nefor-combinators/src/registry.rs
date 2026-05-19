@@ -426,7 +426,7 @@ impl Registry {
     /// Look up the handler registered for an exact identity. No synthesis.
     /// Used by test code; production callers go through
     /// [`Registry::lookup_or_pass_through`].
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn lookup(&self, identity: &Identity) -> Option<&OwnedHandler> {
         self.entries.get(identity)
     }
@@ -457,7 +457,7 @@ impl Registry {
     /// Convenience: Slice 1's Merge lookup, kept for legacy callers and
     /// the existing test suite. Production dispatch goes through
     /// [`Registry::lookup_or_pass_through`].
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn merge_handler(&self, type_: &FullyQualifiedType) -> Option<&FullyQualifiedKind> {
         let identity = Identity::new(2, type_.clone(), vec![type_.clone()]);
         self.entries.get(&identity).map(|owned| &owned.handler)

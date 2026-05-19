@@ -52,7 +52,6 @@ impl std::fmt::Display for LuaSourceLocation {
 /// this commit, but the variant set is the stable public contract callers
 /// branch on, so the enum is `#[allow(dead_code)]` until more callers arrive.
 #[derive(Debug, thiserror::Error)]
-#[allow(dead_code)]
 pub enum LuaError {
     /// Construction of the [`mlua::Lua`] state itself failed. Rare — usually
     /// only when the `nefor` global table can't be installed (e.g., mlua
@@ -105,6 +104,7 @@ pub enum LuaError {
     /// currently unreachable from Lua since we install one Lua function per
     /// level, but exists as a defensive variant for future dynamic-level
     /// paths (e.g., a plugin-level dispatch from a string).
+    #[allow(dead_code)]
     #[error("invalid log level {got:?}")]
     InvalidLogLevel {
         /// What was passed.
@@ -173,7 +173,7 @@ impl LuaError {
     /// and bubbles back to Rust (e.g., via `load_init`), this helper turns
     /// it back into the typed variant the rest of the binary can branch on.
     /// Unmatched shapes fall through to [`LuaError::Other`].
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn classify_runtime_error(err: mlua::Error) -> LuaError {
         let msg = match &err {
             mlua::Error::RuntimeError(m) => m.clone(),

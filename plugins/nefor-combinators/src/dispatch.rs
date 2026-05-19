@@ -84,7 +84,7 @@ pub type InternalId = String;
 
 /// Map of pending handler dispatches. Retained as a public type alias for
 /// readability of test code; main.rs uses a richer slot type internally.
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub type PendingMap =
     Arc<Mutex<HashMap<InternalId, oneshot::Sender<Result<Value, CombinatorsError>>>>>;
 

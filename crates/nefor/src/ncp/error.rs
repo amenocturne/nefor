@@ -4,7 +4,6 @@ use std::path::PathBuf;
 
 /// Errors produced by the NCP broker.
 #[derive(Debug, thiserror::Error)]
-#[allow(dead_code)]
 pub enum BrokerError {
     /// Spawning the plugin subprocess failed before we could observe a line
     /// of input (exec not found, permission denied, cwd missing).
@@ -22,6 +21,11 @@ pub enum BrokerError {
     /// The plugin's working directory does not exist. The runner expects
     /// `<plugin-root>/<name>/` to be present; directory creation is a
     /// plugin-manager concern, not the engine's.
+    ///
+    /// Not currently constructed — the runner no longer validates cwd
+    /// existence. Retained for the exhaustive match in `main.rs`'s
+    /// spawn-error handler and potential future use.
+    #[allow(dead_code)]
     #[error("plugin {name:?} working directory {cwd:?} does not exist")]
     MissingPluginDir {
         /// Plugin name.

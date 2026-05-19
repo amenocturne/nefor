@@ -1288,7 +1288,6 @@ dependencies = [
  "dirs",
  "futures",
  "mlua",
- "nefor-combinators",
  "nefor-protocol",
  "serde",
  "serde_json",
@@ -1298,14 +1297,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "nefor-combinators"
-version = "0.1.9"
-dependencies = [
- "thiserror 2.0.18",
- "tokio",
 ]
 
 [[package]]

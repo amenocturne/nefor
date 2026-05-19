@@ -29,8 +29,8 @@ use crate::session::LogEntry;
 /// clone the inner handle via [`LuaHost::lua`].
 pub struct LuaHost {
     lua: Lua,
-    #[allow(dead_code)]
     bus: Arc<EventBus>,
+    /// Held to keep the `Arc` alive for Lua closures that captured a clone.
     #[allow(dead_code)]
     plugins: SharedPluginRegistry,
     /// Registry key for the global `dispatch` function, populated by
@@ -66,7 +66,6 @@ pub struct LuaHost {
     subscriptions: SharedSubscriptions,
     /// Stdin-pump receiver shared with `nefor.io.read_line`. Empty until
     /// CLI dispatch mode installs a pump via [`LuaHost::attach_stdin_pump`].
-    #[allow(dead_code)]
     stdin_pump: SharedStdinPump,
 }
 
@@ -146,7 +145,7 @@ impl LuaHost {
     }
 
     /// Borrow the inner Lua VM. Exposed for follow-up bindings and tests.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn lua(&self) -> &Lua {
         &self.lua
     }
@@ -202,7 +201,7 @@ impl LuaHost {
     }
 
     /// Load and execute an in-memory Lua source string under a synthetic name.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn exec_str(&self, name: &str, source: &str) -> Result<(), LuaError> {
         let name_buf = std::path::PathBuf::from(name);
         match self.lua.load(source).set_name(name).exec() {
