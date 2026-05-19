@@ -10,7 +10,7 @@
 //! Layering mirrors `nefor-combinators`:
 //! - `main.rs` — entry, ready handshake, dispatch loop, bus encoding.
 //! - `ncp.rs`  — stdio transport + handshake helpers.
-//! - `error.rs` — typed errors and wire `ErrorCode`.
+//! - `error.rs` — typed errors.
 //! - `graph.rs` — graph parsing (cycles allowed; `fanout` is parsed but
 //!   the runtime hook lands with T6).
 //! - `state.rs` — pure scheduler state machine (RunState, Scheduler,

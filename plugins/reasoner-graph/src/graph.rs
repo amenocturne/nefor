@@ -32,8 +32,7 @@
 //! that doesn't reach the scheduler.
 //!
 //! Cycles are allowed (the plugin used to reject them; per parent spec §3
-//! "DAG is not acyclic" we now accept any topology). [`Graph::detect_cycle`]
-//! stays for hypothetical other consumers — submit no longer calls it.
+//! "DAG is not acyclic" we now accept any topology).
 
 use std::collections::{HashMap, HashSet};
 
@@ -205,48 +204,6 @@ impl Graph {
             .collect()
     }
 
-    /// Detect a cycle via Kahn's algorithm.
-    ///
-    /// Returns `None` if the graph is a DAG. Otherwise returns the ids of
-    /// nodes that are part of (or downstream of) the cycle — the nodes
-    /// whose in-degree never drops to zero.
-    ///
-    /// **Not used by submit.** Cycles are allowed in the v5 wire model;
-    /// this stays available for hypothetical other consumers (debug
-    /// tooling, visualizers).
-    #[allow(dead_code)]
-    pub fn detect_cycle(&self) -> Option<Vec<NodeId>> {
-        let mut in_degree: HashMap<&str, usize> = HashMap::new();
-        for id in &self.order {
-            in_degree.insert(id.as_str(), self.dependencies_of(id).len());
-        }
-        let mut queue: Vec<&str> = in_degree
-            .iter()
-            .filter_map(|(k, v)| if *v == 0 { Some(*k) } else { None })
-            .collect();
-        let mut removed = 0usize;
-        while let Some(n) = queue.pop() {
-            removed += 1;
-            for d in self.dependents_of(n) {
-                let entry = in_degree.entry(d.as_str()).or_insert(0);
-                *entry = entry.saturating_sub(1);
-                if *entry == 0 {
-                    queue.push(d.as_str());
-                }
-            }
-        }
-        if removed == self.order.len() {
-            None
-        } else {
-            let stuck: Vec<NodeId> = self
-                .order
-                .iter()
-                .filter(|id| in_degree.get(id.as_str()).copied().unwrap_or(0) > 0)
-                .cloned()
-                .collect();
-            Some(stuck)
-        }
-    }
 }
 
 /// Parse a `graph` JSON value (the inner object under
@@ -707,40 +664,6 @@ mod tests {
         let g = parse_graph(&v).expect("self-loop ok");
         assert_eq!(g.dependents_of("n1"), &["n1".to_string()]);
         assert_eq!(g.dependencies_of("n1"), &["n1".to_string()]);
-    }
-
-    #[test]
-    fn detects_simple_cycle() {
-        let v = json!({
-            "nodes": [
-                {"id": "n1", "reasoner": "r", "args": {}},
-                {"id": "n2", "reasoner": "r", "args": {}}
-            ],
-            "edges": [
-                {"from": "n1", "to": "n2"},
-                {"from": "n2", "to": "n1"}
-            ]
-        });
-        let g = parse_graph(&v).expect("ok");
-        let stuck = g.detect_cycle().expect("cycle present");
-        assert_eq!(stuck.len(), 2);
-    }
-
-    #[test]
-    fn no_cycle_in_dag() {
-        let v = json!({
-            "nodes": [
-                {"id": "n1", "reasoner": "r", "args": {}},
-                {"id": "n2", "reasoner": "r", "args": {}},
-                {"id": "n3", "reasoner": "r", "args": {}}
-            ],
-            "edges": [
-                {"from": "n1", "to": "n3"},
-                {"from": "n2", "to": "n3"}
-            ]
-        });
-        let g = parse_graph(&v).expect("ok");
-        assert!(g.detect_cycle().is_none());
     }
 
     #[test]

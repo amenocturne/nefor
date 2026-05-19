@@ -227,11 +227,6 @@ pub struct RunState {
 pub struct PendingFanout {
     /// Node whose output triggered the fanout.
     pub node_id: NodeId,
-    /// Firing id at the time of dispatch. Kept on the slot for
-    /// diagnostics / future re-firing of the same node within a cycle —
-    /// not load-bearing in v1 routing logic.
-    #[allow(dead_code)]
-    pub firing_id: FiringId,
 }
 
 impl RunState {
@@ -842,18 +837,11 @@ fn propagate_after_completion(
     // `inputs.<id>.error` (continue) or skip-cascade (abort).
     if let Some(NodeStatus::Output(output)) = state.completed.get(node_id) {
         if let Some(fanout) = state.graph.node(node_id).and_then(|n| n.fanout.clone()) {
-            let firing_id = state
-                .firings
-                .get(node_id)
-                .and_then(|v| v.last())
-                .map(|f| f.firing_id.clone())
-                .unwrap_or_default();
             let invocation_id = mint_firing_id();
             state.pending_fanouts.insert(
                 invocation_id.clone(),
                 PendingFanout {
                     node_id: node_id.to_owned(),
-                    firing_id,
                 },
             );
             effects.push(Effect::CombinatorsInvoke {
@@ -1186,8 +1174,7 @@ impl Scheduler {
             }
         };
 
-        // Cycles are allowed — no detect_cycle() rejection here. (Per
-        // parent spec §3 "DAG is not acyclic".)
+        // Cycles are allowed (per parent spec §3 "DAG is not acyclic").
 
         // Reject duplicate run_id at submit time. The caller must have
         // unique run_ids; reusing one would let a second submission
