@@ -26,6 +26,15 @@
       ];
       forEachSystem = f: nixpkgs.lib.genAttrs systems (system: f system);
 
+      pluginNames = map (d: builtins.baseNameOf d) (
+        builtins.filter (d: builtins.pathExists (d + "/Cargo.toml")) (
+          let
+            entries = builtins.readDir ./plugins;
+          in
+          map (name: ./plugins + "/${name}") (builtins.attrNames entries)
+        )
+      );
+
       mkNefor =
         system:
         let
@@ -71,6 +80,14 @@
 
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
+          pluginInstallCmds = builtins.concatStringsSep "\n" (
+            map (name: ''
+              if [ -f "$out/bin/${name}" ]; then
+                mv "$out/bin/${name}" "$out/share/nefor/plugins/${name}"
+              fi
+            '') pluginNames
+          );
+
           nefor = craneLib.buildPackage (
             commonArgs
             // {
@@ -79,15 +96,12 @@
 
               postInstall = ''
                 mkdir -p $out/share/nefor/plugins
-                for bin in \
-                  basic-tools chatgpt-provider generic-provider generic-tool \
-                  mock-plugin nefor-combinators nefor-tui openai-provider \
-                  reasoner-graph tool-gate; do
-                  if [ -f "$out/bin/$bin" ]; then
-                    mv "$out/bin/$bin" "$out/share/nefor/plugins/$bin"
-                  fi
+                ${pluginInstallCmds}
+                # Remove non-plugin, non-engine binaries (test harnesses, etc.)
+                for bin in $out/bin/*; do
+                  name=$(basename "$bin")
+                  [ "$name" = "nefor" ] || rm -f "$bin"
                 done
-                rm -f "$out/bin/fake-engine"
               '';
 
               meta = {
