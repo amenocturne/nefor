@@ -12,3 +12,6 @@ Cargo.lock.bak
 
 # Runtime logs
 *.log
+
+# nix build result
+result
