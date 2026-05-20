@@ -29,28 +29,17 @@ build:
 # Composite: install-nefor + install-starter. End-to-end first-time setup. `channel` (source|latest|nightly) forwards to install-nefor; `mode` (safe|force) forwards to install-starter.
 install channel="source" mode="safe": (install-nefor channel) (install-starter mode)
     @echo
-    @echo "Installed -> ~/.local/share/nefor/bin (plugins + da), ${PREFIX:-$HOME/.local}/bin/nefor (CLI entry)"
+    @echo "Installed -> ~/.local/share/nefor/bin (plugins), ${PREFIX:-$HOME/.local}/bin/nefor (CLI entry)"
     @echo "Make sure your shell has:"
     @echo "  export PATH=\"${PREFIX:-$HOME/.local}/bin:\$PATH\""
 
-# Install nefor for `channel`: source (cargo build) | latest (brew if available, else stable tarball) | nightly (rolling tarball). Plugins + da land in ~/.local/share/nefor/bin; only `nefor` goes on PATH (or wherever brew puts it).
+# Install nefor for `channel`: source (cargo build) | latest (brew if available, else stable tarball) | nightly (rolling tarball). Plugins land in ~/.local/share/nefor/bin; only `nefor` goes on PATH (or wherever brew puts it).
 install-nefor channel="source":
     #!/usr/bin/env bash
     set -eu
     PREFIX="${PREFIX:-$HOME/.local}"
     LIBEXEC_ROOT="$HOME/.local/share/nefor"
     LIBEXEC_BIN="$LIBEXEC_ROOT/bin"
-
-    install_da_to_libexec() {
-      mkdir -p "$LIBEXEC_BIN"
-      if [ -x "$LIBEXEC_BIN/da" ]; then
-        echo "  da (already installed) -> $LIBEXEC_BIN/da"
-      else
-        echo "Installing da -> $LIBEXEC_BIN/da..."
-        cargo install --locked --root "$LIBEXEC_ROOT" dabin
-        echo "  $LIBEXEC_BIN/da"
-      fi
-    }
 
     install_tarball() {
       # Args: $1 = release tag (e.g. v0.1.5 or "nightly")
@@ -94,24 +83,13 @@ install-nefor channel="source":
           bin="target/release/$name"
           [ -f "$bin" ] && install -m 0755 "$bin" "$LIBEXEC_BIN/$name" && echo "  $LIBEXEC_BIN/$name"
         done
-        install_da_to_libexec
         ;;
       latest)
-        # Prefer brew (handles upgrades + uninstalls), fall back to the
-        # stable tarball when brew isn't on PATH. Both end up with the
-        # same engine layout — brew installs to its own prefix and the
-        # resolver finds plugins via exe_relative_share_plugins; the
-        # tarball path uses the libexec layout the source channel uses.
         if command -v brew >/dev/null 2>&1; then
           echo "Installing nefor via brew (amenocturne/tap)..."
           brew install amenocturne/tap/nefor
-          # `da` ships as a separate formula in the same tap.
-          if ! command -v da >/dev/null 2>&1; then
-            brew install amenocturne/tap/da
-          fi
         else
           echo "brew not on PATH; falling back to stable tarball download."
-          # Resolve the latest non-prerelease release tag from GitHub.
           tag=$(curl -fsSL "https://api.github.com/repos/amenocturne/nefor/releases/latest" \
                 | grep -E '"tag_name"' | head -1 | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
           if [ -z "$tag" ]; then
@@ -119,16 +97,10 @@ install-nefor channel="source":
             exit 1
           fi
           install_tarball "$tag"
-          install_da_to_libexec
         fi
         ;;
       nightly)
-        # Always tarball — brew --HEAD would mean cargo-build-from-main
-        # on the user's machine, defeating the point of "nightly =
-        # pre-built fast install". The release workflow keeps a rolling
-        # `nightly` tag whose assets are rebuilt on every main push.
         install_tarball nightly
-        install_da_to_libexec
         ;;
       *)
         echo "unknown channel '{{channel}}'; expected source | latest | nightly"
@@ -136,11 +108,14 @@ install-nefor channel="source":
         ;;
     esac
 
-# Copy starter/ to ~/.config/nefor. Refuses if the dir exists; pass `force` to wipe and re-copy.
+# Copy starter/ to ~/.config/nefor and install its external dependencies (da). Refuses if the dir exists; pass `force` to wipe and re-copy.
 install-starter mode="safe":
     #!/usr/bin/env bash
     set -eu
     DEST=~/.config/nefor
+    LIBEXEC_ROOT="$HOME/.local/share/nefor"
+    LIBEXEC_BIN="$LIBEXEC_ROOT/bin"
+
     if [ -e "$DEST" ]; then
       if [ "{{mode}}" = "force" ]; then
         rm -rf "$DEST"
@@ -154,6 +129,19 @@ install-starter mode="safe":
     mkdir -p "$DEST"
     cp -R "{{justfile_directory()}}/starter/." "$DEST/"
     echo "  $DEST (copied from {{justfile_directory()}}/starter)"
+
+    # da — bash-command classifier used by starter's tool-validator.
+    mkdir -p "$LIBEXEC_BIN"
+    if [ -x "$LIBEXEC_BIN/da" ]; then
+      echo "  da (already installed) -> $LIBEXEC_BIN/da"
+    elif command -v brew >/dev/null 2>&1; then
+      echo "Installing da via brew (amenocturne/tap)..."
+      brew install amenocturne/tap/da
+    else
+      echo "Installing da -> $LIBEXEC_BIN/da..."
+      cargo install --locked --root "$LIBEXEC_ROOT" dabin
+      echo "  $LIBEXEC_BIN/da"
+    fi
 
 # Remove the entire target/ directory. Next build is a full cold compile.
 clean:
