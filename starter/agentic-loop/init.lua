@@ -236,17 +236,6 @@ local function cancel_all()
     emit(state.config.provider, {
       kind = state.config.provider .. ".interrupt",
     })
-    -- Same interrupt-notice injection as cancel() — the model needs
-    -- to see on its next turn that the previous response was cut
-    -- off, otherwise it has to guess from a truncated partial.
-    local chat_id = state.current_state and state.current_state.chat_id
-    if type(chat_id) == "string" and #chat_id > 0 then
-      emit(state.config.provider, {
-        kind    = state.config.provider .. ".chat.append",
-        chat_id = chat_id,
-        message = { role = "user", content = INTERRUPT_NOTICE },
-      })
-    end
     state.current_run_id = nil
   end
   local sub_n = cancel_all_pending_runs()
@@ -404,32 +393,15 @@ local function set_yolo(enabled)
 end
 
 -- Single-Esc behaviour: cancel the current chat turn at the provider.
---
--- After tearing down the live stream, append a synthetic user-role
--- message to the provider's chat history. The model's NEXT turn will
--- see this marker and understand the previous response was cut off
--- by the user — without it the model has no signal that a turn was
--- interrupted (the partial response is pushed by the provider on
--- interrupt, but the next user input arrives without context, so the
--- model has to guess). The marker phrasing acknowledges both
--- possibilities (feedback or new request) so the model doesn't lock
--- in on either interpretation.
-local INTERRUPT_NOTICE =
-  "[Your previous response was interrupted by the user. They may follow up with feedback or a new request.]"
-
+-- The binary handles the history shape: mid-tool-call interrupts get
+-- synthetic tool results ("tool was interrupted"), mid-stream interrupts
+-- push the partial assistant text. No extra notice needed here — the
+-- next user message provides natural context.
 local function cancel()
   if state.current_run_id == nil then return end
   emit(state.config.provider, {
     kind = state.config.provider .. ".interrupt",
   })
-  local chat_id = state.current_state and state.current_state.chat_id
-  if type(chat_id) == "string" and #chat_id > 0 then
-    emit(state.config.provider, {
-      kind    = state.config.provider .. ".chat.append",
-      chat_id = chat_id,
-      message = { role = "user", content = INTERRUPT_NOTICE },
-    })
-  end
 end
 
 local function handle_chat_input_submit(body)

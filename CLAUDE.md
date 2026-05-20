@@ -102,3 +102,10 @@ _Could this be a self-contained composable unit with standard inputs/outputs, li
 - Heaviness is fine. `nefor-tui` runs ratatui + attached terminal and qualifies — clear NCP-shaped I/O, composes through the bus.
 - Cross-plugin knowledge disqualifies. A plugin that names another plugin's wire kind in code isn't a bash tool, it's glue. Glue goes in Lua.
 - Type registries / interface hubs (`generic-provider`, `generic-tool`) fail the test by definition — they exist to be consumed, not to do work. Lua libs.
+
+## Git
+
+- **Rebase, not merge.** Always rebase feature branches onto main before fast-forwarding. No merge commits in the history.
+- Check `git log --oneline -10` before your first commit to match existing message style.
+- Minimal one-line commit messages — no body unless the "why" isn't obvious from the diff.
+- No Co-Authored-By lines, no emoji prefixes, no conventional-commit prefixes.
