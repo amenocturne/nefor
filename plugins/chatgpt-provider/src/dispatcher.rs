@@ -739,7 +739,25 @@ fn read_chat_id(body: &Map<String, Value>) -> Option<ChatId> {
         .map(ChatId::new)
 }
 
-fn parse_provider_message(value: Option<&Value>) -> Result<Message, String> {
+/// A tool call from the model that failed to parse into a [`ToolCall`].
+/// When `id` is present the caller can surface the error as a synthetic
+/// tool-result message so the model sees what went wrong.
+struct ToolCallParseFailure {
+    id: Option<String>,
+    error: String,
+    raw: Value,
+}
+
+/// Parse result that carries both the message and any tool-call entries
+/// that failed to deserialise. The caller is responsible for surfacing
+/// failures (push synthetic tool results for those with IDs, warn for
+/// the rest).
+struct ParsedMessage {
+    message: Message,
+    tool_call_failures: Vec<ToolCallParseFailure>,
+}
+
+fn parse_provider_message(value: Option<&Value>) -> Result<ParsedMessage, String> {
     let obj = value
         .and_then(Value::as_object)
         .ok_or_else(|| "chat.append `message` must be an object".to_owned())?;
@@ -753,26 +771,43 @@ fn parse_provider_message(value: Option<&Value>) -> Result<Message, String> {
         other => Some(other.to_string()),
     });
     match role {
-        "user" => Ok(Message::User {
-            content: content.unwrap_or_default(),
+        "user" => Ok(ParsedMessage {
+            message: Message::User {
+                content: content.unwrap_or_default(),
+            },
+            tool_call_failures: Vec::new(),
         }),
         "assistant" => {
-            let tool_calls = obj
-                .get("tool_calls")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| serde_json::from_value::<ToolCall>(v.clone()).ok())
-                        .collect()
-                })
-                .unwrap_or_default();
-            Ok(Message::Assistant {
-                content,
-                tool_calls,
+            let mut tool_calls = Vec::new();
+            let mut tool_call_failures = Vec::new();
+            if let Some(arr) = obj.get("tool_calls").and_then(Value::as_array) {
+                for v in arr {
+                    match serde_json::from_value::<ToolCall>(v.clone()) {
+                        Ok(tc) => tool_calls.push(tc),
+                        Err(e) => {
+                            let id = v.get("id").and_then(Value::as_str).map(str::to_owned);
+                            tool_call_failures.push(ToolCallParseFailure {
+                                id,
+                                error: e.to_string(),
+                                raw: v.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(ParsedMessage {
+                message: Message::Assistant {
+                    content,
+                    tool_calls,
+                },
+                tool_call_failures,
             })
         }
-        "system" => Ok(Message::System {
-            content: content.unwrap_or_default(),
+        "system" => Ok(ParsedMessage {
+            message: Message::System {
+                content: content.unwrap_or_default(),
+            },
+            tool_call_failures: Vec::new(),
         }),
         "tool" => {
             let tool_call_id = obj
@@ -781,10 +816,13 @@ fn parse_provider_message(value: Option<&Value>) -> Result<Message, String> {
                 .map(str::to_owned)
                 .unwrap_or_default();
             let name = obj.get("name").and_then(Value::as_str).map(str::to_owned);
-            Ok(Message::Tool {
-                content: content.unwrap_or_default(),
-                tool_call_id,
-                name,
+            Ok(ParsedMessage {
+                message: Message::Tool {
+                    content: content.unwrap_or_default(),
+                    tool_call_id,
+                    name,
+                },
+                tool_call_failures: Vec::new(),
             })
         }
         other => Err(format!("chat.append message has unknown role `{other}`")),
@@ -871,15 +909,36 @@ async fn handle_chat_append(
             return Ok(());
         }
     };
-    let message = match parse_provider_message(body.get("message")) {
+    let parsed = match parse_provider_message(body.get("message")) {
         Ok(m) => m,
         Err(msg) => {
             send_event(out_tx, chat_error_body(args, &chat_id, msg)).await?;
             return Ok(());
         }
     };
-    match chats.append(&chat_id, message).await {
-        Ok(()) => send_event(out_tx, chat_appended_body(args, &chat_id)).await,
+    match chats.append(&chat_id, parsed.message).await {
+        Ok(()) => {
+            // Surface tool-call parse failures as synthetic tool
+            // result messages so the model sees what went wrong and
+            // can self-correct on the next turn.
+            for failure in &parsed.tool_call_failures {
+                if let Some(id) = &failure.id {
+                    let error_content = format!(
+                        "Failed to parse tool call: {}. Raw: {}",
+                        failure.error, failure.raw
+                    );
+                    let tool_msg = Message::tool_result(id.clone(), error_content);
+                    let _ = chats.append(&chat_id, tool_msg).await;
+                } else {
+                    tracing::warn!(
+                        error = %failure.error,
+                        raw = %failure.raw,
+                        "tool_call parse failed and no id to surface error to model",
+                    );
+                }
+            }
+            send_event(out_tx, chat_appended_body(args, &chat_id)).await
+        }
         Err(e) => send_event(out_tx, chat_error_body(args, &chat_id, e.to_string())).await,
     }
 }
@@ -1641,10 +1700,11 @@ mod tests {
     #[test]
     fn parse_provider_message_round_trips_user_role() {
         let v = serde_json::json!({"role": "user", "content": "hello"});
-        let msg = parse_provider_message(Some(&v)).expect("ok");
-        assert_eq!(msg.role(), "user");
-        assert_eq!(msg.content(), Some("hello"));
-        assert!(msg.tool_calls().is_empty());
+        let parsed = parse_provider_message(Some(&v)).expect("ok");
+        assert_eq!(parsed.message.role(), "user");
+        assert_eq!(parsed.message.content(), Some("hello"));
+        assert!(parsed.message.tool_calls().is_empty());
+        assert!(parsed.tool_call_failures.is_empty());
     }
 
     #[test]
@@ -1655,19 +1715,57 @@ mod tests {
             "tool_call_id": "call_1",
             "name": "read_file",
         });
-        let msg = parse_provider_message(Some(&v)).expect("ok");
-        assert_eq!(msg.role(), "tool");
-        assert_eq!(msg.tool_call_id(), Some("call_1"));
-        match &msg {
+        let parsed = parse_provider_message(Some(&v)).expect("ok");
+        assert_eq!(parsed.message.role(), "tool");
+        assert_eq!(parsed.message.tool_call_id(), Some("call_1"));
+        match &parsed.message {
             Message::Tool { name, .. } => assert_eq!(name.as_deref(), Some("read_file")),
             _ => panic!("expected Tool variant"),
         }
+        assert!(parsed.tool_call_failures.is_empty());
     }
 
     #[test]
     fn parse_provider_message_rejects_non_object() {
         let v = serde_json::json!(42);
         assert!(parse_provider_message(Some(&v)).is_err());
+    }
+
+    #[test]
+    fn parse_provider_message_surfaces_malformed_tool_call_with_id() {
+        let v = serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+                {
+                    "id": "call_good",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"/x\"}"}
+                },
+                {
+                    "id": "call_bad",
+                    "garbage": true
+                }
+            ]
+        });
+        let parsed = parse_provider_message(Some(&v)).expect("ok");
+        assert_eq!(parsed.message.tool_calls().len(), 1);
+        assert_eq!(parsed.message.tool_calls()[0].id, "call_good");
+        assert_eq!(parsed.tool_call_failures.len(), 1);
+        assert_eq!(parsed.tool_call_failures[0].id.as_deref(), Some("call_bad"));
+        assert!(!parsed.tool_call_failures[0].error.is_empty());
+    }
+
+    #[test]
+    fn parse_provider_message_surfaces_malformed_tool_call_without_id() {
+        let v = serde_json::json!({
+            "role": "assistant",
+            "content": "hi",
+            "tool_calls": [{"no_id": true}]
+        });
+        let parsed = parse_provider_message(Some(&v)).expect("ok");
+        assert!(parsed.message.tool_calls().is_empty());
+        assert_eq!(parsed.tool_call_failures.len(), 1);
+        assert!(parsed.tool_call_failures[0].id.is_none());
     }
 
     #[test]

@@ -188,7 +188,9 @@ impl LuaHost {
             let resolved = fs::canonicalize(parent)
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| parent.display().to_string());
-            let _ = self.lua.globals().set("NEFOR_CONFIG_DIR", resolved);
+            if let Err(e) = self.lua.globals().set("NEFOR_CONFIG_DIR", resolved) {
+                tracing::warn!("failed to set NEFOR_CONFIG_DIR: {e}");
+            }
         }
 
         match self.lua.load(&src).set_name(chunk_name).exec() {
