@@ -6,9 +6,8 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 
 ## Layout
 
-- `crates/nefor-combinators/` — in-process algebra library (pure Rust, minimal deps). Trait shapes for Rust-native plugins. The canonical combinator library at runtime is the plugin, not the crate.
+- `engine/` — engine binary. Reads plugin stdin, stamps `{origin, ts}`, persists to session log, invokes a required Lua `dispatch` hook, routes the hook's `nefor.engine.send` calls. All NCP semantics live in Lua.
 - `crates/nefor-protocol/` — NCP v0.1 envelope + system-body types. Used by plugins; engine no longer imports it (engine is pure string-bus).
-- `crates/nefor/` — engine binary. Reads plugin stdin, stamps `{origin, ts}`, persists to session log, invokes a required Lua `dispatch` hook, routes the hook's `nefor.engine.send` calls. All NCP semantics live in Lua.
 - `plugins/nefor-tui/` — declarative TUI plugin (Rust): reconciler + line-diff renderer + Lua VM + 15 layout primitives. Hosts the chat surface as a Lua composition (`starter/chat/init.lua`).
 - `plugins/nefor-combinators/` — typed combinator registry keyed by `Identity (arity, input_type, output_multiset)`; per-trait constraint validation (Merge, Into, Fanout, Equivalent).
 - `plugins/generic-provider/`, `plugins/generic-tool/` — passive type-registry hubs owning canonical types (`ProviderIn`, `ProviderOut`, `ChatHistory`, `ToolCalls`, `ToolResults`, …). Concrete providers/tools declare `Into`/`From` against these so graphs are provider-agnostic.
@@ -74,7 +73,7 @@ Daily-decision substrate for "where does this code live" and "is this a plugin o
 
 | Layer                                                                        | Opinion budget        | What it does                                                                                                |
 | ---------------------------------------------------------------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------- |
-| Engine (`crates/nefor`, `crates/nefor-protocol`, `crates/nefor-combinators`) | Irreducible           | Pure mechanism: stdin/stdout, NCP envelope stamping, session log, dispatch via `step`. No NCP body parsing. |
+| Engine (`engine/`, `crates/nefor-protocol`) | Irreducible           | Pure mechanism: stdin/stdout, NCP envelope stamping, session log, dispatch via `step`. No NCP body parsing. |
 | Plugins (`plugins/*`)                                                        | Near zero             | Heavy lifting via NCP. Each one a "bash tool" — self-contained, composable, producer-clean namespace.       |
 | Starter (`starter/*.lua`)                                                    | Fully Turing-complete | All composition, all wiring, all cross-plugin knowledge, all opinion.                                       |
 

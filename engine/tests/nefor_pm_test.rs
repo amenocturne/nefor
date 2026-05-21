@@ -15,14 +15,13 @@ use mlua::{Lua, Value};
 // Harness
 // ---------------------------------------------------------------------------
 
-/// Resolve `<repo-root>/lua/`. CARGO_MANIFEST_DIR points at crates/nefor,
-/// so we walk up two levels.
+/// Resolve `<repo-root>/lua/`. CARGO_MANIFEST_DIR points at engine/,
+/// so we walk up one level.
 fn lua_dir() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest
         .parent()
-        .and_then(|p| p.parent())
-        .expect("repo root two levels above crates/nefor")
+        .expect("repo root is one level above engine")
         .join("lua")
 }
 

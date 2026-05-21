@@ -31,8 +31,7 @@ fn repo_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest
         .parent()
-        .and_then(|p| p.parent())
-        .expect("repo root is two levels above crates/nefor")
+        .expect("repo root is one level above engine")
         .to_path_buf()
 }
 

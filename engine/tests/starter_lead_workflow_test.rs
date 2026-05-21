@@ -1,5 +1,7 @@
-//! Unit tests for `starter/reasoners/loop_counter.lua`. Mirrors the
-//! harness pattern in `starter_agentic_workflow_test.rs`.
+//! Unit tests for `starter/lead-workflow/init.lua`. Mirrors the harness
+//! pattern in `starter_agentic_workflow_test.rs` /
+//! `starter_agent_reasoner_test.rs`: install a stub `nefor.*` surface,
+//! then load the Lua test driver at `starter/lead_workflow_test.lua`.
 
 use std::path::PathBuf;
 
@@ -17,18 +19,17 @@ fn repo_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest
         .parent()
-        .and_then(|p| p.parent())
-        .expect("repo root is two levels above crates/nefor")
+        .expect("repo root is one level above engine")
         .to_path_buf()
 }
 
 #[test]
-fn starter_loop_counter_reasoner_full() {
+fn starter_lead_workflow_full() {
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
     set_package_path(&lua).expect("set package.path");
 
-    let test_path = repo_root().join("tests/lua/reasoners/loop_counter_test.lua");
+    let test_path = repo_root().join("tests/lua/lead-workflow/workflow_test.lua");
     let src = std::fs::read_to_string(&test_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", test_path.display()));
 
@@ -37,7 +38,7 @@ fn starter_loop_counter_reasoner_full() {
         .set_name(test_path.display().to_string())
         .exec()
     {
-        panic!("loop_counter_test.lua failed:\n{e}");
+        panic!("lead_workflow_test.lua failed:\n{e}");
     }
 }
 
@@ -45,6 +46,15 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
     let nefor = lua.create_table()?;
 
     nefor::lua::bindings::install_json(lua, &nefor)?;
+
+    // nefor.fs — lead-workflow's `compute_data_root` + plan-file mkdir
+    // call into this binding. We snapshot NEFOR_DATA_DIR from the env
+    // (the harness sets it per test if needed; otherwise the default
+    // /var/empty path safely no-ops disk writes the test doesn't assert).
+    let data_dir = std::env::var("NEFOR_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/var/empty/lead-workflow-test"));
+    nefor::lua::bindings::install_fs(lua, &nefor, nefor::paths::DataDir(data_dir))?;
 
     let log_tbl = lua.create_table()?;
     let no_op: Function = lua.create_function(|_, _: mlua::Variadic<Value>| Ok(()))?;

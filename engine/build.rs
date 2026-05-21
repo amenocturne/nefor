@@ -17,10 +17,10 @@ fn main() {
     // the current branch. `.git/logs/HEAD` records every HEAD movement
     // (commit, reset, checkout, merge) — that's the right signal. We
     // also watch the refs dirs so tag creates/moves trigger a rebuild.
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/logs/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/refs/tags");
-    println!("cargo:rerun-if-changed=../../.git/refs/heads");
+    println!("cargo:rerun-if-changed=../.git/HEAD");
+    println!("cargo:rerun-if-changed=../.git/logs/HEAD");
+    println!("cargo:rerun-if-changed=../.git/refs/tags");
+    println!("cargo:rerun-if-changed=../.git/refs/heads");
     println!("cargo:rerun-if-env-changed=NEFOR_VERSION_OVERRIDE");
 
     let version = if let Ok(v) = std::env::var("NEFOR_VERSION_OVERRIDE") {

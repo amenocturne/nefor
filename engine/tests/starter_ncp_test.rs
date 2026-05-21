@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use mlua::{Lua, Value};
 
 /// Resolve `<repo-root>/starter/`. `CARGO_MANIFEST_DIR` points at the
-/// engine crate (`crates/nefor`), so we walk up two levels.
+/// engine crate (`engine/`), so we walk up one level.
 fn starter_dir() -> PathBuf {
     repo_root().join("starter")
 }
@@ -33,8 +33,7 @@ fn repo_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest
         .parent()
-        .and_then(|p| p.parent())
-        .expect("repo root is two levels above crates/nefor")
+        .expect("repo root is one level above engine")
         .to_path_buf()
 }
 

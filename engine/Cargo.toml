@@ -9,7 +9,7 @@ description = "nefor engine — NCP broker and Lua plugin host."
 default-run = "nefor"
 
 [dependencies]
-nefor-protocol = { path = "../nefor-protocol" }
+nefor-protocol = { path = "../crates/nefor-protocol" }
 tokio = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }

@@ -34,9 +34,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .and_then(Path::parent)
         .map(PathBuf::from)
-        .expect("repo root is two levels above crates/nefor")
+        .expect("repo root is one level above engine")
 }
 
 fn target_debug(bin: &str) -> PathBuf {

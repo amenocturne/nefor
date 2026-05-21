@@ -77,7 +77,6 @@ fn workspace_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest
         .parent()
-        .and_then(Path::parent)
         .map(PathBuf::from)
         .expect("workspace root resolvable from CARGO_MANIFEST_DIR")
 }
