@@ -114,19 +114,32 @@ end
 --
 -- Without the timeout, a wedged DP daemon (rare but seen in practice)
 -- would hang startup forever — fail fast and tell the user to re-login.
-local function get_dp_token(dp_path)
-  -- Set DP_WORKDIR only if the nessy-managed dir actually exists —
-  -- system-installed dp uses its own default and forcing a
-  -- non-existent path breaks auth lookup.
-  local nessy_workdir = (os.getenv("HOME") or "") .. "/.nessy/" .. DP_WORKDIR_NAME
-  local env_prefix = ""
-  if file_exists(nessy_workdir) then
-    env_prefix = "DP_WORKDIR=" .. sh_quote(nessy_workdir) .. " "
+local function try_dp_print_token(dp_path, env_prefix, timeout_prefix)
+  local cmd = env_prefix .. timeout_prefix .. sh_quote(dp_path) .. " auth print-token"
+  local stdout, stderr, exit = shell_capture(cmd)
+  if exit == 124 then
+    error("dp-timeout", 0)
   end
 
-  -- gtimeout/timeout: use `timeout 5` if present, else fall back to no
-  -- timeout. The macOS coreutils path is `gtimeout`; Linux is `timeout`.
-  -- Both accept identical args.
+  local raw = (stdout or ""):gsub("^%s+", ""):gsub("%s+$", "")
+
+  local err_text = (raw .. "\n" .. (stderr or "")):lower()
+  if #raw == 0
+      or raw:lower():find("no access token", 1, true)
+      or raw:lower():find("authorize", 1, true)
+      or err_text:find("no access token", 1, true)
+      or #raw < 10 then
+    return nil, "not-logged-in"
+  end
+
+  if exit ~= 0 then
+    return nil, "dp-failed: " .. (stderr or "(no stderr)")
+  end
+
+  return raw, nil
+end
+
+local function get_dp_token(dp_path)
   local timeout_prefix = ""
   local _, _, has_timeout = shell_capture("command -v timeout >/dev/null && echo y")
   if has_timeout == 0 then
@@ -138,31 +151,21 @@ local function get_dp_token(dp_path)
     end
   end
 
-  local cmd = env_prefix .. timeout_prefix .. sh_quote(dp_path) .. " auth print-token"
-  local stdout, stderr, exit = shell_capture(cmd)
-  -- timeout/gtimeout exit 124 on timeout fired.
-  if exit == 124 then
-    error("dp-timeout", 0)
+  -- Try dp's default location first (no DP_WORKDIR override).
+  local token, err = try_dp_print_token(dp_path, "", timeout_prefix)
+  if token then return token end
+
+  -- Fall back to nessy-managed workdir only if the directory exists
+  -- and the default location had no token.
+  local nessy_workdir = (os.getenv("HOME") or "") .. "/.nessy/" .. DP_WORKDIR_NAME
+  if file_exists(nessy_workdir) then
+    local nessy_prefix = "DP_WORKDIR=" .. sh_quote(nessy_workdir) .. " "
+    local nessy_token, nessy_err = try_dp_print_token(dp_path, nessy_prefix, timeout_prefix)
+    if nessy_token then return nessy_token end
+    err = nessy_err
   end
 
-  local raw = (stdout or ""):gsub("^%s+", ""):gsub("%s+$", "")
-
-  -- Empty / "no access token" / "authorize" / suspiciously short
-  -- output — treat all as not-logged-in. Real DP tokens are >100 chars.
-  local err_text = (raw .. "\n" .. (stderr or "")):lower()
-  if #raw == 0
-      or raw:lower():find("no access token", 1, true)
-      or raw:lower():find("authorize", 1, true)
-      or err_text:find("no access token", 1, true)
-      or #raw < 10 then
-    error("not-logged-in", 0)
-  end
-
-  if exit ~= 0 then
-    error("dp-failed: " .. (stderr or "(no stderr)"), 0)
-  end
-
-  return raw
+  error(err or "not-logged-in", 0)
 end
 
 -- Best-effort UUID v4-ish for X-Request-Id. The Nestor backend logs
