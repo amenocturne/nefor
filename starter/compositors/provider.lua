@@ -80,6 +80,10 @@ local M = {}
 --     translator. Defaults to "openai-provider". Set to your provider's
 --     lua dir name when the binary emits the same wire kinds but lives
 --     under a different require path (e.g. "chatgpt-provider").
+--
+--   agentic_loop (required) — the agentic-loop module table, injected
+--     by the caller. Eliminates the require-time cycle between this
+--     compositor and agentic-loop.
 function M.spawn_spec(name, command, opts)
   if type(name) ~= "string" or #name == 0 then
     error("provider.spawn_spec: name required, got " .. type(name))
@@ -89,6 +93,10 @@ function M.spawn_spec(name, command, opts)
   end
   opts = opts or {}
   local hooks = opts.hooks or {}
+  local al = opts.agentic_loop
+  if al == nil then
+    error("provider.spawn_spec: opts.agentic_loop is required")
+  end
 
   local provider_lib = require(opts.translator_lib or "openai-provider")
   local translator = provider_lib.translator(name)
@@ -109,16 +117,6 @@ function M.spawn_spec(name, command, opts)
     emit_synthetic = emit_synthetic,
   }
 
-  -- Lazy-bind to agentic-loop — module load order can require this
-  -- file before agentic-loop's spawn line in init.lua.
-  local agentic_loop
-  local function al()
-    if agentic_loop == nil then
-      agentic_loop = require("agentic-loop")
-    end
-    return agentic_loop
-  end
-
   local function handle_orchestrator_outbound(body)
     local k = body.kind
     if type(k) ~= "string" then return body end
@@ -136,23 +134,23 @@ function M.spawn_spec(name, command, opts)
       -- for each sub-firing's chat_id (so the user doesn't see the
       -- sub-agent's internal-turn streams interleaved with the lead's
       -- response).
-      if type(chat_id) == "string" and al().stream_suppressed(chat_id) then
+      if type(chat_id) == "string" and al.stream_suppressed(chat_id) then
         return nil
       end
 
       if (k == "chat.stream.delta" or k == "chat.stream.reasoning_delta")
           and type(chat_id) == "string"
-          and al().stream_visible(chat_id) then
-        al().flush_pending_dispatches()
+          and al.stream_visible(chat_id) then
+        al.flush_pending_dispatches()
       end
 
-      if type(chat_id) == "string" and al().stream_visible(chat_id) then
+      if type(chat_id) == "string" and al.stream_visible(chat_id) then
         if k == "chat.stream.delta" then
           local txt = body.text or body.delta or ""
-          if type(txt) == "string" then al().fire_stream_observers(txt) end
+          if type(txt) == "string" then al.fire_stream_observers(txt) end
         elseif k == "chat.stream.reasoning_delta" then
           local txt = body.text or body.delta or ""
-          if type(txt) == "string" then al().fire_reasoning_observers(txt) end
+          if type(txt) == "string" then al.fire_reasoning_observers(txt) end
         end
       end
       return body
@@ -164,7 +162,7 @@ function M.spawn_spec(name, command, opts)
     if k == kinds.chat_error then
       local chat_id = body.chat_id
       if type(chat_id) == "string" then
-        local entry = al().take_pending_for_chat(chat_id)
+        local entry = al.take_pending_for_chat(chat_id)
         if entry then
           local emsg = tostring(body.message or "provider error")
           nefor.log.warn("provider <- chat.error closing node", {
@@ -190,15 +188,15 @@ function M.spawn_spec(name, command, opts)
     if k == kinds.chat_complete_result then
       local chat_id = body.chat_id
       if type(chat_id) ~= "string" then return body end
-      local entry = al().peek_pending_for_chat(chat_id)
+      local entry = al.peek_pending_for_chat(chat_id)
       if not entry then return body end
 
       local out = body.output
-      local was_stream_visible = al().stream_visible(chat_id)
-      al().take_pending_for_chat(chat_id)
+      local was_stream_visible = al.stream_visible(chat_id)
+      al.take_pending_for_chat(chat_id)
 
       if was_stream_visible then
-        al().flush_pending_dispatches()
+        al.flush_pending_dispatches()
       end
 
       local from_id = entry.reasoner or "reasoners"
@@ -287,7 +285,7 @@ function M.spawn_spec(name, command, opts)
         if body ~= nil then
           if body.kind == kinds.model_set then
             local active_chat_id
-            local current_state = al().current_state()
+            local current_state = al.current_state()
             if type(current_state) == "table"
                 and type(current_state.chat_id) == "string" then
               active_chat_id = current_state.chat_id

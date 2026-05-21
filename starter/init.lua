@@ -211,7 +211,8 @@ for _, p in ipairs(cfg.providers or {}) do
       {
         require("config").bin("mock-plugin"),
         "--script", STARTER_ROOT .. "/" .. p.mock_script,
-      }
+      },
+      { agentic_loop = agentic_loop }
     ))
   elseif p.kind == "openai" then
     local provider_command = {
@@ -229,7 +230,7 @@ for _, p in ipairs(cfg.providers or {}) do
     actor.spawn(provider.spawn_spec(
       p.name,
       provider_command,
-      { static_token = p.static_token }
+      { static_token = p.static_token, agentic_loop = agentic_loop }
     ))
   elseif p.kind == "chatgpt" then
     local provider_command = {
@@ -248,7 +249,7 @@ for _, p in ipairs(cfg.providers or {}) do
     actor.spawn(provider.spawn_spec(
       p.name,
       provider_command,
-      { translator_lib = "chatgpt-provider" }
+      { translator_lib = "chatgpt-provider", agentic_loop = agentic_loop }
     ))
   else
     error("starter/init.lua: unknown provider kind: " .. tostring(p.kind))
@@ -293,7 +294,7 @@ actor.spawn(require("read-only-tools"))
 -- running, gated invocations never reach the popup.
 actor.spawn(require("tool-validator"))
 
-actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
+actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv, { agentic_loop = agentic_loop }))
 actor.spawn(tools.basic_actor_spec())
 
 actor.spawn(require("compositors.chat_bridge").spawn_spec({

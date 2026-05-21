@@ -318,7 +318,7 @@ fn tool_gate_wrapper_swaps_huge_tool_result_output_to_summary() {
     lua.load(
         r#"
         local tools = require("compositors.tools")
-        local spec = tools.gate_spec("tool-gate", { "fake-binary" })
+        local spec = tools.gate_spec("tool-gate", { "fake-binary" }, { agentic_loop = require("agentic-loop") })
         _from_plugin = spec.from_plugin
 
         local big = string.rep("PAYLOAD-LINE\n", 5000)  -- ~65 KiB
@@ -816,7 +816,7 @@ fn tool_gate_wrapper_emits_agents_md_on_outbound_path_touching_invoke() {
         r#"
         require("tool-gate.agents_md")._reset()
         local tools = require("compositors.tools")
-        local spec = tools.gate_spec("tool-gate", {{ "fake-binary" }})
+        local spec = tools.gate_spec("tool-gate", {{ "fake-binary" }}, {{ agentic_loop = require("agentic-loop") }})
         spec.to_plugin({{
             -- Path-touching: must trigger AGENTS.md emission.
             {{ type = "event", from = "agentic-loop",

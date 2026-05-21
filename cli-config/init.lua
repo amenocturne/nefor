@@ -145,7 +145,8 @@ if cfg.plugins.spawn_mock then
     {
       require("config").bin("mock-plugin"),
       "--script", STARTER_ROOT .. "/" .. cfg.provider.mock_script,
-    }
+    },
+    { agentic_loop = agentic_loop }
   ))
 else
   local provider_command = {
@@ -163,7 +164,7 @@ else
   actor.spawn(provider.spawn_spec(
     PROVIDER_NAME,
     provider_command,
-    { static_token = cfg.provider.static_token }
+    { static_token = cfg.provider.static_token, agentic_loop = agentic_loop }
   ))
 end
 
@@ -178,7 +179,7 @@ end
 tool_gate_argv[#tool_gate_argv + 1] = "--default"
 tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
 
-actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
+actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv, { agentic_loop = agentic_loop }))
 
 actor.spawn(tools.basic_actor_spec())
 

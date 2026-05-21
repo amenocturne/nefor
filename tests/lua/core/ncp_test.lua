@@ -524,6 +524,8 @@ local agentic_loop_mod = require("agentic-loop")
 local openai_provider  = require("compositors.provider")
 
 local function build_provider_chain(name, opts)
+  opts = opts or {}
+  opts.agentic_loop = agentic_loop_mod
   local spec = openai_provider.spawn_spec(name, { "/bin/true" }, opts)
   return { from_plugin = spec.from_plugin, to_plugin = spec.to_plugin }
 end
@@ -1119,7 +1121,7 @@ end
 local tools_mod = require("compositors.tools")
 
 local function spawn_tool_gate_wrapper()
-  local spec = tools_mod.gate_spec("tool-gate", { "/bin/true" })
+  local spec = tools_mod.gate_spec("tool-gate", { "/bin/true" }, { agentic_loop = agentic_loop_mod })
   -- Skip the engine-spawn round-trip — register the transforms
   -- directly so we don't try to fork a real binary.
   ncp._test_set_transforms("tool-gate", {

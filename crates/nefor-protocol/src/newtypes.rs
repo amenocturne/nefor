@@ -33,10 +33,10 @@ pub enum PluginNameError {
 /// Names that cannot be assigned to a plugin at spawn time.
 ///
 /// - `"engine"`: reserved for the engine's own envelopes (spec §3).
-/// - `"step"`: reserved by the session log writer as the serialized form of
-///   [`Origin::Step`](../../nefor/session/enum.Origin.html); a plugin with
-///   that name would be indistinguishable from Lua-originated messages in
-///   the on-disk log.
+/// - `"step"`: reserved as the serialized origin for engine-synthesized
+///   messages in session logs. A plugin named "step" would be
+///   indistinguishable from synthesized messages on disk, breaking
+///   session resume correctness.
 const RESERVED_PLUGIN_NAMES: &[&str] = &["engine", "step"];
 
 impl PluginName {
