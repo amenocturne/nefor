@@ -726,14 +726,16 @@ fn spawn_turn(
                     break;
                 }
             };
-            tracing::info!(
-                target: "openai_provider::turn",
-                chat_id = %chat_id,
-                iteration = iterations,
-                history_len = history.len(),
-                roles = ?history.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
-                "history snapshot for turn iteration",
-            );
+            if tracing::enabled!(tracing::Level::INFO) {
+                tracing::info!(
+                    target: "openai_provider::turn",
+                    chat_id = %chat_id,
+                    iteration = iterations,
+                    history_len = history.len(),
+                    roles = ?history.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+                    "history snapshot for turn iteration",
+                );
+            }
             let chat_tools_on = chats.tools_enabled(&chat_id).await.unwrap_or(true);
             // Per-model cache: a model the upstream previously rejected
             // with the "does not support tools" signature stays disabled
@@ -853,6 +855,7 @@ fn spawn_turn(
                 },
             )
             .await;
+            drop(history);
 
             match result {
                 Ok(outcome) => {

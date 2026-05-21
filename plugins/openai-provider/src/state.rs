@@ -20,6 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -78,7 +79,7 @@ pub struct ChatStats {
 /// Chat state stored under a `ChatId`.
 struct ChatState {
     model: String,
-    history: Vec<Message>,
+    history: Arc<Vec<Message>>,
     in_flight: bool,
     cancel: Option<CancellationToken>,
     stats: ChatStats,
@@ -103,7 +104,7 @@ impl ChatState {
     fn new(model: String) -> Self {
         Self {
             model,
-            history: Vec::new(),
+            history: Arc::new(Vec::new()),
             in_flight: false,
             cancel: None,
             stats: ChatStats::default(),
@@ -311,10 +312,10 @@ impl Chats {
         Ok(())
     }
 
-    pub async fn history_snapshot(&self, id: &ChatId) -> Result<Vec<Message>, ChatsError> {
+    pub async fn history_snapshot(&self, id: &ChatId) -> Result<Arc<Vec<Message>>, ChatsError> {
         let g = self.inner.lock().await;
         g.get(id)
-            .map(|c| c.history.clone())
+            .map(|c| Arc::clone(&c.history))
             .ok_or_else(|| ChatsError::NotFound(id.clone()))
     }
 
@@ -323,7 +324,7 @@ impl Chats {
         let chat = g
             .get_mut(id)
             .ok_or_else(|| ChatsError::NotFound(id.clone()))?;
-        chat.history.push(message);
+        Arc::make_mut(&mut chat.history).push(message);
         Ok(())
     }
 
@@ -373,7 +374,7 @@ impl Chats {
         let chat = g
             .get_mut(id)
             .ok_or_else(|| ChatsError::NotFound(id.clone()))?;
-        chat.history.clear();
+        chat.history = Arc::new(Vec::new());
         Ok(())
     }
 
@@ -384,7 +385,7 @@ impl Chats {
     pub async fn reset_all(&self) {
         let mut g = self.inner.lock().await;
         for chat in g.values_mut() {
-            chat.history.clear();
+            chat.history = Arc::new(Vec::new());
         }
     }
 
