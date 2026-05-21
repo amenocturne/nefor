@@ -22,6 +22,7 @@ use crate::error::ToolError;
 
 pub mod bash;
 pub mod read_file;
+pub mod search_text;
 pub mod write_file;
 
 /// Descriptor for a single registered tool. Used by the catalog builder
@@ -54,6 +55,11 @@ pub const TOOLS: &[ToolDescriptor] = &[
         description: bash::DESCRIPTION,
         schema: bash::schema,
     },
+    ToolDescriptor {
+        name: search_text::NAME,
+        description: search_text::DESCRIPTION,
+        schema: search_text::schema,
+    },
 ];
 
 /// Run a tool by name. Returns the tool's textual output on success or a
@@ -68,6 +74,7 @@ pub async fn run_tool(name: &str, args: &Value) -> Result<String, ToolError> {
         read_file::NAME => read_file::run(args).await,
         write_file::NAME => write_file::run(args).await,
         bash::NAME => bash::run(args).await,
+        search_text::NAME => search_text::run(args).await,
         other => Err(ToolError::BadArgs {
             tool: other.to_owned(),
             message: format!("unknown tool `{other}`"),
