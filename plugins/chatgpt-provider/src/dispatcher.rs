@@ -746,34 +746,49 @@ fn parse_provider_message(value: Option<&Value>) -> Result<Message, String> {
     let role = obj
         .get("role")
         .and_then(Value::as_str)
-        .ok_or_else(|| "chat.append message missing `role`".to_owned())?
-        .to_owned();
+        .ok_or_else(|| "chat.append message missing `role`".to_owned())?;
     let content = obj.get("content").and_then(|v| match v {
         Value::Null => None,
         Value::String(s) => Some(s.clone()),
         other => Some(other.to_string()),
     });
-    let tool_calls = obj
-        .get("tool_calls")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| serde_json::from_value::<ToolCall>(v.clone()).ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    let tool_call_id = obj
-        .get("tool_call_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let name = obj.get("name").and_then(Value::as_str).map(str::to_owned);
-    Ok(Message {
-        role,
-        content,
-        tool_calls,
-        tool_call_id,
-        name,
-    })
+    match role {
+        "user" => Ok(Message::User {
+            content: content.unwrap_or_default(),
+        }),
+        "assistant" => {
+            let tool_calls = obj
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| serde_json::from_value::<ToolCall>(v.clone()).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(Message::Assistant {
+                content,
+                tool_calls,
+            })
+        }
+        "system" => Ok(Message::System {
+            content: content.unwrap_or_default(),
+        }),
+        "tool" => {
+            let tool_call_id = obj
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_default();
+            let name = obj.get("name").and_then(Value::as_str).map(str::to_owned);
+            Ok(Message::Tool {
+                content: content.unwrap_or_default(),
+                tool_call_id,
+                name,
+            })
+        }
+        other => Err(format!("chat.append message has unknown role `{other}`")),
+    }
 }
 
 async fn handle_chat_create(
@@ -1627,9 +1642,9 @@ mod tests {
     fn parse_provider_message_round_trips_user_role() {
         let v = serde_json::json!({"role": "user", "content": "hello"});
         let msg = parse_provider_message(Some(&v)).expect("ok");
-        assert_eq!(msg.role, "user");
-        assert_eq!(msg.content.as_deref(), Some("hello"));
-        assert!(msg.tool_calls.is_empty());
+        assert_eq!(msg.role(), "user");
+        assert_eq!(msg.content(), Some("hello"));
+        assert!(msg.tool_calls().is_empty());
     }
 
     #[test]
@@ -1641,9 +1656,12 @@ mod tests {
             "name": "read_file",
         });
         let msg = parse_provider_message(Some(&v)).expect("ok");
-        assert_eq!(msg.role, "tool");
-        assert_eq!(msg.tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(msg.name.as_deref(), Some("read_file"));
+        assert_eq!(msg.role(), "tool");
+        assert_eq!(msg.tool_call_id(), Some("call_1"));
+        match &msg {
+            Message::Tool { name, .. } => assert_eq!(name.as_deref(), Some("read_file")),
+            _ => panic!("expected Tool variant"),
+        }
     }
 
     #[test]

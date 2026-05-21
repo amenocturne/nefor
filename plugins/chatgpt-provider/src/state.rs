@@ -1,7 +1,7 @@
 //! Per-process state for chatgpt-provider.
 //!
 //! Mirror of openai-provider's `Chats`: chat-id-keyed map where each
-//! chat carries `(model, message_history, in_flight slot, stats)`. The
+//! chat carries `(model, message_history, turn state, stats)`. The
 //! provider can hold N concurrent chats; each turn is per-chat
 //! exclusive. The full map is wrapped in a single mutex — operations
 //! are short and the per-turn HTTP call holds no lock (dispatcher
@@ -42,85 +42,104 @@ pub struct ToolCallFunction {
     pub arguments: String,
 }
 
-/// Single chat message in the conversation. Overloaded across four
-/// roles (`user`, `assistant`, `system`, `tool`) — see openai-provider's
-/// Message docstring for the full taxonomy.
+/// Single chat message in the conversation, keyed by role.
 ///
-/// `content` is `Option<String>` so the `null` case (assistant emitted
-/// only tool calls) round-trips cleanly.
+/// Internally tagged on `"role"` so the JSON wire shape is identical to
+/// the old flat struct: `{"role":"user","content":"hi"}` round-trips
+/// through serde unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Message {
-    pub role: String,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub content: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub tool_calls: Vec<ToolCall>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub tool_call_id: Option<String>,
-    /// `name` field used by the `tool` role per the Responses API spec.
-    /// We pass it through if a chat.append carries it but don't require
-    /// it.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub name: Option<String>,
+#[serde(tag = "role", rename_all = "lowercase")]
+pub enum Message {
+    User {
+        content: String,
+    },
+    Assistant {
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        content: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        tool_calls: Vec<ToolCall>,
+    },
+    System {
+        content: String,
+    },
+    Tool {
+        content: String,
+        tool_call_id: String,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        name: Option<String>,
+    },
 }
 
 impl Message {
+    pub fn role(&self) -> &str {
+        match self {
+            Message::User { .. } => "user",
+            Message::Assistant { .. } => "assistant",
+            Message::System { .. } => "system",
+            Message::Tool { .. } => "tool",
+        }
+    }
+
+    pub fn content(&self) -> Option<&str> {
+        match self {
+            Message::User { content, .. }
+            | Message::System { content, .. }
+            | Message::Tool { content, .. } => Some(content),
+            Message::Assistant { content, .. } => content.as_deref(),
+        }
+    }
+
+    pub fn tool_calls(&self) -> &[ToolCall] {
+        match self {
+            Message::Assistant { tool_calls, .. } => tool_calls,
+            _ => &[],
+        }
+    }
+
+    pub fn tool_call_id(&self) -> Option<&str> {
+        match self {
+            Message::Tool { tool_call_id, .. } => Some(tool_call_id),
+            _ => None,
+        }
+    }
+
     pub fn user<S: Into<String>>(text: S) -> Self {
-        Self {
-            role: "user".into(),
-            content: Some(text.into()),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            name: None,
+        Message::User {
+            content: text.into(),
         }
     }
 
     pub fn assistant<S: Into<String>>(text: S) -> Self {
-        Self {
-            role: "assistant".into(),
+        Message::Assistant {
             content: Some(text.into()),
             tool_calls: Vec::new(),
-            tool_call_id: None,
-            name: None,
         }
     }
 
     pub fn system<S: Into<String>>(text: S) -> Self {
-        Self {
-            role: "system".into(),
-            content: Some(text.into()),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            name: None,
+        Message::System {
+            content: text.into(),
         }
     }
 
     pub fn assistant_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
-        Self {
-            role: "assistant".into(),
+        Message::Assistant {
             content: None,
             tool_calls,
-            tool_call_id: None,
-            name: None,
         }
     }
 
     pub fn assistant_with_tool_calls<S: Into<String>>(text: S, tool_calls: Vec<ToolCall>) -> Self {
-        Self {
-            role: "assistant".into(),
+        Message::Assistant {
             content: Some(text.into()),
             tool_calls,
-            tool_call_id: None,
-            name: None,
         }
     }
 
     pub fn tool_result<S: Into<String>>(tool_call_id: String, content: S) -> Self {
-        Self {
-            role: "tool".into(),
-            content: Some(content.into()),
-            tool_calls: Vec::new(),
-            tool_call_id: Some(tool_call_id),
+        Message::Tool {
+            content: content.into(),
+            tool_call_id,
             name: None,
         }
     }
@@ -169,6 +188,11 @@ pub struct ChatStats {
 // Chat state.
 // ---------------------------------------------------------------------
 
+enum TurnState {
+    Idle,
+    InFlight(CancellationToken),
+}
+
 struct ChatState {
     model: String,
     /// Optional system prompt (set on chat.create). Translator pulls
@@ -176,8 +200,7 @@ struct ChatState {
     /// into the `input` array.
     system: Option<String>,
     history: Vec<Message>,
-    in_flight: bool,
-    cancel: Option<CancellationToken>,
+    turn: TurnState,
     stats: ChatStats,
     /// Optional per-chat allowlist of tool names; when `Some(names)`,
     /// the per-turn `tools` array is filtered to entries whose name is
@@ -196,8 +219,7 @@ impl ChatState {
             model,
             system: None,
             history: Vec::new(),
-            in_flight: false,
-            cancel: None,
+            turn: TurnState::Idle,
             stats: ChatStats::default(),
             tool_allowlist: None,
             tool_overrides: None,
@@ -471,20 +493,18 @@ impl Chats {
         let chat = g
             .get_mut(id)
             .ok_or_else(|| ChatsError::NotFound(id.clone()))?;
-        if chat.in_flight {
+        if matches!(chat.turn, TurnState::InFlight(_)) {
             return Err(ChatsError::Busy(id.clone()));
         }
         let token = CancellationToken::new();
-        chat.cancel = Some(token.clone());
-        chat.in_flight = true;
+        chat.turn = TurnState::InFlight(token.clone());
         Ok(token)
     }
 
     pub async fn end_turn(&self, id: &ChatId) {
         let mut g = self.inner.lock().await;
         if let Some(chat) = g.get_mut(id) {
-            chat.in_flight = false;
-            chat.cancel = None;
+            chat.turn = TurnState::Idle;
         }
     }
 
@@ -492,20 +512,23 @@ impl Chats {
     /// `false` for unknown chats rather than erroring.
     pub async fn interrupt(&self, id: &ChatId) -> bool {
         let g = self.inner.lock().await;
-        match g.get(id).and_then(|c| c.cancel.as_ref()) {
-            Some(t) => {
-                t.cancel();
+        match g.get(id) {
+            Some(ChatState {
+                turn: TurnState::InFlight(ref token),
+                ..
+            }) => {
+                token.cancel();
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
     pub async fn interrupt_all(&self) {
         let g = self.inner.lock().await;
         for chat in g.values() {
-            if let Some(t) = &chat.cancel {
-                t.cancel();
+            if let TurnState::InFlight(ref token) = chat.turn {
+                token.cancel();
             }
         }
     }
@@ -569,8 +592,8 @@ mod tests {
             .expect("push assistant");
         let snap = c.snapshot(&id).await.expect("snapshot");
         assert_eq!(snap.history.len(), 2);
-        assert_eq!(snap.history[0].role, "user");
-        assert_eq!(snap.history[1].role, "assistant");
+        assert_eq!(snap.history[0].role(), "user");
+        assert_eq!(snap.history[1].role(), "assistant");
     }
 
     #[tokio::test]

@@ -65,31 +65,33 @@ pub fn history_to_input(history: &[Message], system_prompt: Option<&str>) -> Tra
 
     let mut input: Vec<ResponseItem> = Vec::new();
     for msg in history {
-        match msg.role.as_str() {
-            "system" => {
-                if let Some(text) = &msg.content {
-                    if !text.is_empty() {
-                        instructions_parts.push(text.clone());
-                    }
+        match msg {
+            Message::System { content } => {
+                if !content.is_empty() {
+                    instructions_parts.push(content.clone());
                 }
             }
-            "user" => {
-                let text = msg.content.clone().unwrap_or_default();
+            Message::User { content } => {
                 input.push(ResponseItem::Message {
                     role: "user".into(),
-                    content: vec![MessageContent::InputText { text }],
+                    content: vec![MessageContent::InputText {
+                        text: content.clone(),
+                    }],
                 });
             }
-            "assistant" => {
-                let text = msg.content.clone().unwrap_or_default();
-                if !msg.tool_calls.is_empty() {
+            Message::Assistant {
+                content,
+                tool_calls,
+            } => {
+                let text = content.clone().unwrap_or_default();
+                if !tool_calls.is_empty() {
                     if !text.is_empty() {
                         input.push(ResponseItem::Message {
                             role: "assistant".into(),
                             content: vec![MessageContent::OutputText { text }],
                         });
                     }
-                    for call in &msg.tool_calls {
+                    for call in tool_calls {
                         input.push(ResponseItem::FunctionCall {
                             id: None,
                             call_id: call.id.clone(),
@@ -104,16 +106,15 @@ pub fn history_to_input(history: &[Message], system_prompt: Option<&str>) -> Tra
                     });
                 }
             }
-            "tool" => {
-                let call_id = msg.tool_call_id.clone().unwrap_or_default();
-                let output = msg.content.clone().unwrap_or_default();
-                input.push(ResponseItem::FunctionCallOutput { call_id, output });
-            }
-            _ => {
-                // Unknown role: drop quietly. The chat plugin author
-                // would have caught it at append time; here we just
-                // preserve the rest of the conversation.
-                tracing::warn!(role = %msg.role, "translator: dropping message with unknown role");
+            Message::Tool {
+                content,
+                tool_call_id,
+                ..
+            } => {
+                input.push(ResponseItem::FunctionCallOutput {
+                    call_id: tool_call_id.clone(),
+                    output: content.clone(),
+                });
             }
         }
     }

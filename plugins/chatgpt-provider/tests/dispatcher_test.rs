@@ -259,12 +259,12 @@ async fn catalog_filters_by_allowlist_at_translator_step() {
 #[test]
 fn message_round_trips_through_json_appended_shape() {
     // chat.append carries `message: {role, content, tool_calls?,
-    // tool_call_id?, name?}`. Serde on our Message struct must accept
+    // tool_call_id?, name?}`. Serde on our Message enum must accept
     // both the user/assistant text shape and the tool-result shape.
     let user_json = serde_json::json!({"role":"user","content":"hi"});
     let m: Message = serde_json::from_value(user_json).expect("user");
-    assert_eq!(m.role, "user");
-    assert_eq!(m.content.as_deref(), Some("hi"));
+    assert_eq!(m.role(), "user");
+    assert_eq!(m.content(), Some("hi"));
 
     let tool_json = serde_json::json!({
         "role":"tool",
@@ -273,7 +273,10 @@ fn message_round_trips_through_json_appended_shape() {
         "name":"read_file"
     });
     let m: Message = serde_json::from_value(tool_json).expect("tool");
-    assert_eq!(m.role, "tool");
-    assert_eq!(m.tool_call_id.as_deref(), Some("call_1"));
-    assert_eq!(m.name.as_deref(), Some("read_file"));
+    assert_eq!(m.role(), "tool");
+    assert_eq!(m.tool_call_id(), Some("call_1"));
+    match &m {
+        Message::Tool { name, .. } => assert_eq!(name.as_deref(), Some("read_file")),
+        _ => panic!("expected Tool variant"),
+    }
 }

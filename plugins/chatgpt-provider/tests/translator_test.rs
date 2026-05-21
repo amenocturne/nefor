@@ -127,20 +127,19 @@ fn system_messages_concat_into_instructions_in_order() {
 }
 
 #[test]
-fn unknown_role_is_dropped() {
+fn all_four_roles_translate_correctly() {
+    // With the enum there's no "unknown role" path — exhaustive matching
+    // covers every variant. Verify each variant maps to the right output.
     let history = vec![
+        Message::system("be nice"),
         Message::user("ok"),
-        Message {
-            role: "weird".into(),
-            content: Some("xx".into()),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            name: None,
-        },
-        Message::assistant("end"),
+        Message::assistant("sure"),
+        Message::tool_result("call_1".into(), "result"),
     ];
     let t = history_to_input(&history, None);
-    assert_eq!(t.input.len(), 2);
+    assert_eq!(t.instructions, "be nice");
+    // user + assistant + tool output = 3 items (system → instructions)
+    assert_eq!(t.input.len(), 3);
 }
 
 #[test]
