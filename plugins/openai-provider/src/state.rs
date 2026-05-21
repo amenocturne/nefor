@@ -76,27 +76,26 @@ pub struct ChatStats {
     pub last_turn_duration_ms: Option<u64>,
 }
 
+/// Whether a chat's turn slot is idle or occupied.
+enum TurnState {
+    Idle,
+    InFlight(CancellationToken),
+}
+
 /// Chat state stored under a `ChatId`.
 struct ChatState {
     model: String,
     history: Arc<Vec<Message>>,
-    in_flight: bool,
-    cancel: Option<CancellationToken>,
+    turn: TurnState,
     stats: ChatStats,
-    /// When false the per-turn request omits the `tools` array entirely.
-    /// Sub-graph responder chats set this so the LLM can't tool-call its
-    /// way out of producing the requested text.
-    tools_enabled: bool,
-    /// Optional per-chat allowlist of tool names. When `Some(names)`,
-    /// the per-turn `tools` array is filtered to entries whose
-    /// `function.name` appears in `names` (the catalog itself is
-    /// process-wide, so the filter is the only way to scope a chat's
-    /// tool surface). Empty Vec is honoured — the model sees zero
-    /// tools (effectively the same as `tools_enabled = false`, but
-    /// reached via the allowlist code path). `None` = no filter; the
-    /// chat advertises the entire catalog. Used by the lead
-    /// orchestrator (allowlist of orchestration-only tools) and the
-    /// agent reasoner (allowlist of role-specific sub-agent tools).
+    /// Per-chat tool surface control. Three states:
+    ///
+    /// - `None` — all tools (no filter). Default for new chats.
+    /// - `Some(vec![])` — no tools (disabled). Set when the upstream
+    ///   rejects this model's tools or when the creator explicitly
+    ///   disabled tools (`tools_enabled: false` on the wire).
+    /// - `Some(names)` — filtered to those tool names. The catalog
+    ///   stays process-wide; this is per-chat scoping.
     tool_allowlist: Option<Vec<String>>,
 }
 
@@ -105,10 +104,8 @@ impl ChatState {
         Self {
             model,
             history: Arc::new(Vec::new()),
-            in_flight: false,
-            cancel: None,
+            turn: TurnState::Idle,
             stats: ChatStats::default(),
-            tools_enabled: true,
             tool_allowlist: None,
         }
     }
@@ -180,12 +177,16 @@ impl Chats {
 
     /// Create a chat. Errors if a chat with this id already exists, or
     /// when neither a per-chat `model` nor the plugin-default is set
-    /// (`ChatsError::NoModelConfigured`). `tools_enabled` defaults to
-    /// true; set false to omit the tools array on every turn for this
-    /// chat. `tool_allowlist`, when `Some(names)`, restricts the chat's
-    /// per-turn `tools` array to entries whose function.name is in the
-    /// list (the catalog itself stays process-wide; this is per-chat
-    /// scoping). Caller passes `None` to leave the chat unrestricted.
+    /// (`ChatsError::NoModelConfigured`).
+    ///
+    /// Tool surface is controlled by a single `tool_allowlist`:
+    /// - `None` → all tools (no filter). Default.
+    /// - `Some(vec![])` → no tools (disabled).
+    /// - `Some(names)` → filtered to those tool names.
+    ///
+    /// The `tools_enabled` wire field (bool) is converted here:
+    /// `false` → `Some(vec![])`, `true` without an explicit allowlist
+    /// → `None`. An explicit array wins over the bool.
     pub async fn create(
         &self,
         id: ChatId,
@@ -207,19 +208,15 @@ impl Chats {
             return Err(ChatsError::AlreadyExists(id));
         }
         let mut chat = ChatState::new(resolved_model);
-        if let Some(enabled) = tools_enabled {
-            chat.tools_enabled = enabled;
+        // Explicit array wins over the bool.
+        if let Some(names) = tool_allowlist {
+            chat.tool_allowlist = Some(names);
+        } else if let Some(false) = tools_enabled {
+            chat.tool_allowlist = Some(Vec::new());
         }
-        chat.tool_allowlist = tool_allowlist;
+        // else: None (all tools) — the default from ChatState::new().
         g.insert(id, chat);
         Ok(())
-    }
-
-    pub async fn tools_enabled(&self, id: &ChatId) -> Result<bool, ChatsError> {
-        let g = self.inner.lock().await;
-        g.get(id)
-            .map(|c| c.tools_enabled)
-            .ok_or_else(|| ChatsError::NotFound(id.clone()))
     }
 
     /// Snapshot the chat's tool-name allowlist. `Ok(None)` means no
@@ -234,16 +231,19 @@ impl Chats {
             .ok_or_else(|| ChatsError::NotFound(id.clone()))
     }
 
-    /// Flip a chat's tools-enabled flag — called after the reactive
-    /// "model doesn't support tools" 400 lands so the same chat's next
-    /// turn skips the round-trip. Idempotent; no-op if the chat vanished
-    /// mid-turn (the surrounding error path already logged that).
-    pub async fn set_tools_enabled(&self, id: &ChatId, enabled: bool) -> Result<(), ChatsError> {
+    /// Set a chat's tool allowlist. Called after the reactive
+    /// "model doesn't support tools" 400 lands (with `Some(vec![])`)
+    /// so the same chat's next turn skips the round-trip.
+    pub async fn set_tool_allowlist(
+        &self,
+        id: &ChatId,
+        allowlist: Option<Vec<String>>,
+    ) -> Result<(), ChatsError> {
         let mut g = self.inner.lock().await;
         let chat = g
             .get_mut(id)
             .ok_or_else(|| ChatsError::NotFound(id.clone()))?;
-        chat.tools_enabled = enabled;
+        chat.tool_allowlist = allowlist;
         Ok(())
     }
 
@@ -397,20 +397,18 @@ impl Chats {
         let chat = g
             .get_mut(id)
             .ok_or_else(|| ChatsError::NotFound(id.clone()))?;
-        if chat.in_flight {
+        if matches!(chat.turn, TurnState::InFlight(_)) {
             return Err(ChatsError::Busy(id.clone()));
         }
         let token = CancellationToken::new();
-        chat.cancel = Some(token.clone());
-        chat.in_flight = true;
+        chat.turn = TurnState::InFlight(token.clone());
         Ok(token)
     }
 
     pub async fn end_turn(&self, id: &ChatId) {
         let mut g = self.inner.lock().await;
         if let Some(chat) = g.get_mut(id) {
-            chat.in_flight = false;
-            chat.cancel = None;
+            chat.turn = TurnState::Idle;
         }
     }
 
@@ -421,12 +419,12 @@ impl Chats {
     /// shape; the dispatcher's caller doesn't care which case.
     pub async fn interrupt(&self, id: &ChatId) -> bool {
         let g = self.inner.lock().await;
-        match g.get(id).and_then(|c| c.cancel.as_ref()) {
-            Some(t) => {
-                t.cancel();
+        match g.get(id) {
+            Some(ChatState { turn: TurnState::InFlight(ref token), .. }) => {
+                token.cancel();
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
@@ -435,8 +433,8 @@ impl Chats {
     pub async fn interrupt_all(&self) {
         let g = self.inner.lock().await;
         for chat in g.values() {
-            if let Some(t) = &chat.cancel {
-                t.cancel();
+            if let TurnState::InFlight(ref token) = chat.turn {
+                token.cancel();
             }
         }
     }
@@ -504,10 +502,10 @@ mod tests {
             .expect("push assistant");
         let h = c.history_snapshot(&id).await.expect("snapshot");
         assert_eq!(h.len(), 2);
-        assert_eq!(h[0].role, "user");
-        assert_eq!(h[0].content.as_deref(), Some("hello"));
-        assert_eq!(h[1].role, "assistant");
-        assert_eq!(h[1].content.as_deref(), Some("hi there"));
+        assert_eq!(h[0].role(), "user");
+        assert_eq!(h[0].content(), Some("hello"));
+        assert_eq!(h[1].role(), "assistant");
+        assert_eq!(h[1].content(), Some("hi there"));
     }
 
     #[tokio::test]
@@ -705,12 +703,12 @@ mod tests {
             .expect("t");
         let h = c.history_snapshot(&id).await.expect("h");
         assert_eq!(h.len(), 3);
-        assert_eq!(h[1].role, "assistant");
-        assert!(h[1].content.is_none());
-        assert_eq!(h[1].tool_calls.len(), 1);
-        assert_eq!(h[2].role, "tool");
-        assert_eq!(h[2].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(h[2].content.as_deref(), Some("file contents"));
+        assert_eq!(h[1].role(), "assistant");
+        assert!(h[1].content().is_none());
+        assert_eq!(h[1].tool_calls().len(), 1);
+        assert_eq!(h[2].role(), "tool");
+        assert_eq!(h[2].tool_call_id(), Some("call_1"));
+        assert_eq!(h[2].content(), Some("file contents"));
     }
 
     #[tokio::test]
@@ -759,24 +757,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_tools_enabled_flips_per_chat_flag() {
+    async fn set_tool_allowlist_flips_per_chat_flag() {
         let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("a");
         c.create(id.clone(), None, None, None)
             .await
             .expect("create");
-        assert!(c.tools_enabled(&id).await.expect("on"));
-        c.set_tools_enabled(&id, false).await.expect("flip off");
-        assert!(!c.tools_enabled(&id).await.expect("off"));
-        c.set_tools_enabled(&id, true).await.expect("flip on");
-        assert!(c.tools_enabled(&id).await.expect("on again"));
+        // Default: None = all tools.
+        assert_eq!(c.tool_allowlist(&id).await.expect("default"), None);
+        // Disable tools via empty allowlist.
+        c.set_tool_allowlist(&id, Some(vec![]))
+            .await
+            .expect("disable");
+        assert_eq!(
+            c.tool_allowlist(&id).await.expect("disabled"),
+            Some(vec![])
+        );
+        // Re-enable all tools.
+        c.set_tool_allowlist(&id, None).await.expect("re-enable");
+        assert_eq!(c.tool_allowlist(&id).await.expect("re-enabled"), None);
     }
 
     #[tokio::test]
-    async fn set_tools_enabled_on_unknown_chat_errors() {
+    async fn set_tool_allowlist_on_unknown_chat_errors() {
         let c = Chats::with_default_model(Some("m".into()));
         let err = c
-            .set_tools_enabled(&ChatId::new("ghost"), false)
+            .set_tool_allowlist(&ChatId::new("ghost"), Some(vec![]))
             .await
             .expect_err("ghost");
         assert!(matches!(err, ChatsError::NotFound(_)));

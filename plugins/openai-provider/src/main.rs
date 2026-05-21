@@ -350,11 +350,10 @@ async fn dispatch_event(
             tracing::info!(
                 target: "openai_provider::chat",
                 chat_id = %chat_id,
-                role = %message.role,
-                content_len = message.content.as_deref().map(str::len).unwrap_or(0),
+                role = %message.role(),
+                content_len = message.content().map(str::len).unwrap_or(0),
                 content_preview = %message
-                    .content
-                    .as_deref()
+                    .content()
                     .map(|s| s.chars().take(80).collect::<String>())
                     .unwrap_or_default(),
                 "chat.append",
@@ -732,52 +731,37 @@ fn spawn_turn(
                     chat_id = %chat_id,
                     iteration = iterations,
                     history_len = history.len(),
-                    roles = ?history.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+                    roles = ?history.iter().map(|m| m.role()).collect::<Vec<_>>(),
                     "history snapshot for turn iteration",
                 );
             }
-            let chat_tools_on = chats.tools_enabled(&chat_id).await.unwrap_or(true);
             // Per-model cache: a model the upstream previously rejected
             // with the "does not support tools" signature stays disabled
-            // for the rest of this process — even on a fresh chat. The
-            // chat-level flag stays the discriminator for explicit opt-
-            // outs (sub-graph responder, etc); the model-level cache is
-            // a lazy capability cache populated reactively on the first
-            // 400 we see for each model.
+            // for the rest of this process — even on a fresh chat.
             let model_tools_supported = chats.model_supports_tools(&active_model).await;
-            // Per-chat tool allowlist (set on chat.create via `tools` as
-            // a string array). When `Some`, restrict catalog + extra_tools
-            // to entries whose function.name is in the list. None = no
-            // filter (the chat sees the full set). Used by the lead
-            // orchestrator and the agent reasoner to scope each chat's
-            // tool surface; the catalog itself remains process-wide.
+            // Per-chat tool allowlist (sole mechanism for tool control):
+            //   None          → all tools (no filter)
+            //   Some(vec![])  → no tools (disabled)
+            //   Some(names)   → filtered to those tool names
             let chat_tool_allowlist = chats.tool_allowlist(&chat_id).await.unwrap_or(None);
-            let mut tools_array = if chat_tools_on && model_tools_supported {
-                catalog.to_openai_tools().await
-            } else {
+            let tools_disabled = !model_tools_supported
+                || matches!(&chat_tool_allowlist, Some(names) if names.is_empty());
+            let mut tools_array = if tools_disabled {
                 Vec::new()
+            } else {
+                catalog.to_openai_tools().await
             };
             // Per-firing extra_tools (e.g. agent reasoner's `finalize`
             // synthetic terminator). Appended AFTER the catalog so a
-            // catalog entry of the same name still wins on iteration
-            // (the agent reasoner intercepts `finalize` Lua-side before
-            // any catalog routing, so collisions are not a concern in
-            // practice). Skipped when the chat is in tools-off mode
-            // (matches catalog suppression — the model can't use tools
-            // at all in that case).
-            if chat_tools_on && model_tools_supported && !extra_tools.is_empty() {
+            // catalog entry of the same name still wins on iteration.
+            // Skipped when tools are disabled entirely.
+            if !tools_disabled && !extra_tools.is_empty() {
                 tools_array.extend(extra_tools.iter().cloned());
             }
-            // Apply the per-chat allowlist to the assembled tools_array.
-            // Filtering happens AFTER extra_tools are appended so a
-            // caller that wanted `finalize` injected per firing must
-            // also include `finalize` in the chat's allowlist. The
-            // agent reasoner already does this (the Lua side appends
-            // FINALIZE_NAME to the advertised list before sending
-            // chat.create); the lead orchestrator's allowlist
-            // intentionally excludes finalize because the lead
-            // terminates by stopping tool calls, not by calling a
-            // synthetic terminator.
+            // Apply the per-chat name filter. Entries not in the list
+            // are dropped; the caller that wanted `finalize` injected
+            // per firing must also include `finalize` in the chat's
+            // allowlist.
             if let Some(names) = &chat_tool_allowlist {
                 tools_array.retain(|t| {
                     let name = t
@@ -1030,7 +1014,7 @@ fn spawn_turn(
                         "model rejected tools — falling back to chat-only mode for this model",
                     );
                     chats.mark_model_tools_unsupported(&active_model).await;
-                    let _ = chats.set_tools_enabled(&chat_id, false).await;
+                    let _ = chats.set_tool_allowlist(&chat_id, Some(vec![])).await;
                     iterations = iterations.saturating_sub(1);
                     continue;
                 }
@@ -1303,33 +1287,51 @@ fn parse_provider_message(value: Option<&Value>) -> Result<Message, String> {
     let role = obj
         .get("role")
         .and_then(Value::as_str)
-        .ok_or_else(|| "chat.append message missing `role`".to_owned())?
-        .to_owned();
+        .ok_or_else(|| "chat.append message missing `role`".to_owned())?;
     let content = obj.get("content").and_then(|v| match v {
         Value::Null => None,
         Value::String(s) => Some(s.clone()),
         other => Some(other.to_string()),
     });
-    let tool_calls = obj
-        .get("tool_calls")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| serde_json::from_value::<ToolCall>(v.clone()).ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    let tool_call_id = obj
-        .get("tool_call_id")
-        .or_else(|| obj.get("tool_name"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    Ok(Message {
-        role,
-        content,
-        tool_calls,
-        tool_call_id,
-    })
+    match role {
+        "user" => {
+            let text = content.ok_or_else(|| "user message missing `content`".to_owned())?;
+            Ok(Message::User { content: text })
+        }
+        "system" => {
+            let text = content.ok_or_else(|| "system message missing `content`".to_owned())?;
+            Ok(Message::System { content: text })
+        }
+        "assistant" => {
+            let tool_calls = obj
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| serde_json::from_value::<ToolCall>(v.clone()).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(Message::Assistant {
+                content,
+                tool_calls,
+            })
+        }
+        "tool" => {
+            let text = content.ok_or_else(|| "tool message missing `content`".to_owned())?;
+            let tool_call_id = obj
+                .get("tool_call_id")
+                .or_else(|| obj.get("tool_name"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| "tool message missing `tool_call_id`".to_owned())?
+                .to_owned();
+            Ok(Message::Tool {
+                content: text,
+                tool_call_id,
+            })
+        }
+        other => Err(format!("unknown message role `{other}`")),
+    }
 }
 
 fn stream_delta_body(prefix: &str, id: &str, chat_id: &ChatId, text: &str) -> Map<String, Value> {
@@ -2841,8 +2843,8 @@ mod tests {
             .await
             .expect("snap");
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].role, "user");
-        assert_eq!(history[0].content.as_deref(), Some("hello"));
+        assert_eq!(history[0].role(), "user");
+        assert_eq!(history[0].content(), Some("hello"));
     }
 
     #[tokio::test]
@@ -3109,12 +3111,11 @@ mod tests {
             2,
             "expected [user, assistant] in history, got {history:?}",
         );
-        assert_eq!(history[0].role, "user");
-        assert_eq!(history[0].content.as_deref(), Some("hi"));
-        assert_eq!(history[1].role, "assistant");
+        assert_eq!(history[0].role(), "user");
+        assert_eq!(history[0].content(), Some("hi"));
+        assert_eq!(history[1].role(), "assistant");
         let assistant_content = history[1]
-            .content
-            .as_deref()
+            .content()
             .expect("assistant content set");
         assert!(
             !assistant_content.is_empty(),
@@ -3641,8 +3642,8 @@ mod tests {
         assert!(chats.exists(&default_id).await);
         let history = chats.history_snapshot(&default_id).await.expect("h");
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].role, "user");
-        assert_eq!(history[0].content.as_deref(), Some("hi"));
+        assert_eq!(history[0].role(), "user");
+        assert_eq!(history[0].content(), Some("hi"));
     }
 
     #[tokio::test]
@@ -3668,8 +3669,8 @@ mod tests {
         let hb = chats.history_snapshot(&ChatId::new("b")).await.unwrap();
         assert_eq!(ha.len(), 1);
         assert_eq!(hb.len(), 1);
-        assert_eq!(ha[0].content.as_deref(), Some("alpha"));
-        assert_eq!(hb[0].content.as_deref(), Some("beta"));
+        assert_eq!(ha[0].content(), Some("alpha"));
+        assert_eq!(hb[0].content(), Some("beta"));
     }
 
     // --- combinators.register on startup -----------------------------
@@ -3736,8 +3737,8 @@ mod tests {
     fn parse_provider_message_accepts_role_content_object() {
         let v = serde_json::json!({"role": "user", "content": "hi"});
         let m = parse_provider_message(Some(&v)).expect("ok");
-        assert_eq!(m.role, "user");
-        assert_eq!(m.content.as_deref(), Some("hi"));
+        assert_eq!(m.role(), "user");
+        assert_eq!(m.content(), Some("hi"));
     }
 
     #[test]
@@ -3752,10 +3753,10 @@ mod tests {
             }]
         });
         let m = parse_provider_message(Some(&v)).expect("ok");
-        assert_eq!(m.role, "assistant");
-        assert!(m.content.is_none());
-        assert_eq!(m.tool_calls.len(), 1);
-        assert_eq!(m.tool_calls[0].id, "call_1");
+        assert_eq!(m.role(), "assistant");
+        assert!(m.content().is_none());
+        assert_eq!(m.tool_calls().len(), 1);
+        assert_eq!(m.tool_calls()[0].id, "call_1");
     }
 
     #[test]

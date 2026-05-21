@@ -45,55 +45,89 @@ pub struct ToolCallFunction {
 
 /// Single chat message in the conversation.
 ///
-/// The OpenAI chat schema overloads this shape across four roles:
+/// The OpenAI chat schema has four roles, each with a different field
+/// set. This enum encodes that shape directly so invalid combinations
+/// (e.g. a user message with tool_calls) are unrepresentable.
 ///
-/// - `user` / `system` — `content` is a string.
-/// - `assistant` — `content` may be a string OR null (when the assistant
-///   only emitted tool calls). When tool calls are present, `tool_calls`
-///   carries them.
-/// - `tool` — `content` is the tool's output string and `tool_call_id`
-///   correlates back to the assistant's original `tool_calls[i].id`.
+/// Serde shape: internally tagged on `"role"`, variant names lowercased
+/// to match the wire (`{"role": "user", "content": "…"}`).
 ///
-/// `content` is `Option<String>` so the `null` case round-trips cleanly.
-/// Skip-serializing on `tool_calls` / `tool_call_id` keeps the wire
-/// minimal for the common user/assistant text case.
+/// Wire serialization quirk: Ollama's `/api/chat` validator rejects
+/// `{"role": "assistant", "content": null, "tool_calls": [...]}`
+/// with `invalid message content type: <nil>`. The OpenAI spec says
+/// null is correct on a tool-calls-only assistant turn, but Ollama's
+/// JSON unmarshal trips before reaching the spec-defined branch. We
+/// `skip_serializing_if = Option::is_none` on the assistant's content
+/// so the field is omitted entirely on that shape — both OpenAI and
+/// Ollama accept the missing-field form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Message {
-    pub role: String,
-    /// Wire serialization quirk: Ollama's `/api/chat` validator rejects
-    /// `{"role": "assistant", "content": null, "tool_calls": [...]}`
-    /// with `invalid message content type: <nil>`. The OpenAI spec says
-    /// null is correct on a tool-calls-only assistant turn, but Ollama's
-    /// JSON unmarshal trips before reaching the spec-defined branch. We
-    /// `skip_serializing_if = Option::is_none` so the field is omitted
-    /// entirely on that shape — both OpenAI and Ollama accept the
-    /// missing-field form. Without this, every multi-tool turn against
-    /// Ollama 400'd on the next chat.complete after the lead's first
-    /// tool call.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub content: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub tool_calls: Vec<ToolCall>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub tool_call_id: Option<String>,
+#[serde(tag = "role", rename_all = "lowercase")]
+pub enum Message {
+    User {
+        content: String,
+    },
+    Assistant {
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        content: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        tool_calls: Vec<ToolCall>,
+    },
+    System {
+        content: String,
+    },
+    Tool {
+        content: String,
+        tool_call_id: String,
+    },
 }
 
 impl Message {
+    // --- convenience accessors (minimise diff at call sites) -----------
+
+    pub fn role(&self) -> &str {
+        match self {
+            Message::User { .. } => "user",
+            Message::Assistant { .. } => "assistant",
+            Message::System { .. } => "system",
+            Message::Tool { .. } => "tool",
+        }
+    }
+
+    pub fn content(&self) -> Option<&str> {
+        match self {
+            Message::User { content, .. }
+            | Message::System { content, .. }
+            | Message::Tool { content, .. } => Some(content),
+            Message::Assistant { content, .. } => content.as_deref(),
+        }
+    }
+
+    pub fn tool_calls(&self) -> &[ToolCall] {
+        match self {
+            Message::Assistant { tool_calls, .. } => tool_calls,
+            _ => &[],
+        }
+    }
+
+    pub fn tool_call_id(&self) -> Option<&str> {
+        match self {
+            Message::Tool { tool_call_id, .. } => Some(tool_call_id),
+            _ => None,
+        }
+    }
+
+    // --- factory methods (associated functions) ------------------------
+
     pub fn user<S: Into<String>>(text: S) -> Self {
-        Self {
-            role: "user".into(),
-            content: Some(text.into()),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
+        Message::User {
+            content: text.into(),
         }
     }
 
     pub fn assistant<S: Into<String>>(text: S) -> Self {
-        Self {
-            role: "assistant".into(),
+        Message::Assistant {
             content: Some(text.into()),
             tool_calls: Vec::new(),
-            tool_call_id: None,
         }
     }
 
@@ -101,11 +135,9 @@ impl Message {
     /// OpenAI API requires `content: null` rather than `""` on this
     /// shape.
     pub fn assistant_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
-        Self {
-            role: "assistant".into(),
+        Message::Assistant {
             content: None,
             tool_calls,
-            tool_call_id: None,
         }
     }
 
@@ -113,11 +145,9 @@ impl Message {
     /// model interleaves text deltas with tool-call deltas in the same
     /// turn.
     pub fn assistant_with_tool_calls<S: Into<String>>(text: S, tool_calls: Vec<ToolCall>) -> Self {
-        Self {
-            role: "assistant".into(),
+        Message::Assistant {
             content: Some(text.into()),
             tool_calls,
-            tool_call_id: None,
         }
     }
 
@@ -126,11 +156,9 @@ impl Message {
     /// wire — both are just "what the tool said"). `tool_call_id` MUST
     /// match the corresponding assistant tool_calls entry's `id`.
     pub fn tool_result<S: Into<String>>(tool_call_id: String, content: S) -> Self {
-        Self {
-            role: "tool".into(),
-            content: Some(content.into()),
-            tool_calls: Vec::new(),
-            tool_call_id: Some(tool_call_id),
+        Message::Tool {
+            content: content.into(),
+            tool_call_id,
         }
     }
 }
@@ -465,10 +493,10 @@ mod tests {
 
     #[test]
     fn message_helpers_set_role() {
-        assert_eq!(Message::user("hi").role, "user");
-        assert_eq!(Message::user("hi").content.as_deref(), Some("hi"));
-        assert_eq!(Message::assistant("yo").role, "assistant");
-        assert_eq!(Message::assistant("yo").content.as_deref(), Some("yo"));
+        assert_eq!(Message::user("hi").role(), "user");
+        assert_eq!(Message::user("hi").content(), Some("hi"));
+        assert_eq!(Message::assistant("yo").role(), "assistant");
+        assert_eq!(Message::assistant("yo").content(), Some("yo"));
     }
 
     #[test]
@@ -489,8 +517,8 @@ mod tests {
             },
         }];
         let msg = Message::assistant_tool_calls(calls);
-        assert_eq!(msg.role, "assistant");
-        assert!(msg.content.is_none());
+        assert_eq!(msg.role(), "assistant");
+        assert!(msg.content().is_none());
         let v = serde_json::to_value(&msg).expect("ser");
         assert!(
             v.get("content").is_none(),
@@ -507,8 +535,8 @@ mod tests {
     #[test]
     fn message_tool_result_carries_tool_call_id() {
         let m = Message::tool_result("call_1".into(), "file contents");
-        assert_eq!(m.role, "tool");
-        assert_eq!(m.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(m.role(), "tool");
+        assert_eq!(m.tool_call_id(), Some("call_1"));
         let v = serde_json::to_value(&m).expect("ser");
         assert_eq!(
             v.get("tool_call_id").and_then(|s| s.as_str()),

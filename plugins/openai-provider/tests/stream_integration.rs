@@ -557,7 +557,7 @@ async fn request_body_omits_tools_when_none_attached() {
 /// request, `run_chat_stream` surfaces the dedicated
 /// `StreamError::ToolsUnsupported` variant. The turn loop in main.rs
 /// pattern-matches on this variant to mark the model + flip the chat's
-/// `tools_enabled` flag and retry the iteration.
+/// `tool_allowlist` to empty and retry the iteration.
 #[tokio::test]
 async fn http_400_with_tools_unsupported_signature_yields_dedicated_variant() {
     let (listener, addr) = bind_local().await;
@@ -785,10 +785,12 @@ async fn reactive_fallback_retries_without_tools_after_signature_400() {
     })];
 
     // Mirror the turn-loop contract: build tools-array conditional on
-    // both per-chat flag AND per-model cache.
-    let chat_on = chats.tools_enabled(&chat_id).await.expect("tools_enabled");
+    // both per-chat allowlist AND per-model cache.
+    let chat_allowlist = chats.tool_allowlist(&chat_id).await.expect("allowlist");
     let model_on = chats.model_supports_tools("translategemma").await;
-    let tools_for_first: Option<&[serde_json::Value]> = if chat_on && model_on {
+    let tools_disabled = !model_on
+        || matches!(&chat_allowlist, Some(names) if names.is_empty());
+    let tools_for_first: Option<&[serde_json::Value]> = if !tools_disabled {
         Some(&tools_array)
     } else {
         None
@@ -819,17 +821,19 @@ async fn reactive_fallback_retries_without_tools_after_signature_400() {
     }
 
     // Reactive fallback: mirror the turn-loop's response — mark model +
-    // flip chat-level flag.
+    // disable tools on this chat via empty allowlist.
     chats.mark_model_tools_unsupported("translategemma").await;
     chats
-        .set_tools_enabled(&chat_id, false)
+        .set_tool_allowlist(&chat_id, Some(vec![]))
         .await
-        .expect("set tools off");
+        .expect("disable tools");
 
     // Re-evaluate: the cache must now suppress tools.
-    let chat_on = chats.tools_enabled(&chat_id).await.expect("tools_enabled");
+    let chat_allowlist = chats.tool_allowlist(&chat_id).await.expect("allowlist");
     let model_on = chats.model_supports_tools("translategemma").await;
-    let tools_for_retry: Option<&[serde_json::Value]> = if chat_on && model_on {
+    let tools_disabled = !model_on
+        || matches!(&chat_allowlist, Some(names) if names.is_empty());
+    let tools_for_retry: Option<&[serde_json::Value]> = if !tools_disabled {
         Some(&tools_array)
     } else {
         None
@@ -890,11 +894,12 @@ async fn marked_model_skips_tools_on_first_turn_of_a_brand_new_chat() {
         .await
         .expect("create");
 
-    // Per-chat flag is still default-on (the chat never paid the round-
-    // trip), but the model cache vetoes tools.
-    assert!(
-        chats.tools_enabled(&chat_id).await.expect("tools_enabled"),
-        "per-chat flag stays on"
+    // Per-chat allowlist is still default (None = all tools), since the
+    // chat never paid the round-trip. But the model cache vetoes tools.
+    assert_eq!(
+        chats.tool_allowlist(&chat_id).await.expect("allowlist"),
+        None,
+        "per-chat allowlist stays default (all tools)"
     );
     assert!(
         !chats.model_supports_tools("translategemma").await,
@@ -902,10 +907,9 @@ async fn marked_model_skips_tools_on_first_turn_of_a_brand_new_chat() {
     );
 
     // Combined gate (mirrors the turn-loop logic) → tools omitted.
-    let chat_on = chats.tools_enabled(&chat_id).await.expect("on");
     let model_on = chats.model_supports_tools("translategemma").await;
     assert!(
-        !(chat_on && model_on),
+        !model_on,
         "combined gate should suppress tools on first turn for a known-incapable model"
     );
 
