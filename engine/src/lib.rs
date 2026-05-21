@@ -6,7 +6,7 @@
 //! subprocess-spawned plugins. Only modules needed by out-of-crate consumers
 //! live here; the binary keeps its `cli`, `config`, and `log` submodules
 //! private. `paths` is exposed so test harnesses can build the
-//! `DataDir` newtype `LuaHost::new` requires.
+//! `DataDir` newtype that `LuaHost::new` requires.
 
 pub mod events;
 pub mod lua;

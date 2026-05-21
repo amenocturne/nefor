@@ -50,7 +50,7 @@ use nefor::events::EventBus;
 use nefor::lua::bindings::EngineOps;
 use nefor::lua::LuaHost;
 use nefor::ncp::runner::PluginRoot;
-use nefor::ncp::spawn::PluginSpec;
+use nefor::ncp::spawn::{PluginKind, PluginSpec};
 use nefor::ncp::transport::Transport;
 use nefor::ncp::{spawn_plugin, Broker, BrokerOps, BrokerShared, PluginRegistry};
 use nefor_protocol::PluginName;
@@ -338,7 +338,7 @@ async fn build_host(shared: Arc<Mutex<BrokerShared>>, config_dir: &Path) -> LuaH
     let bus = Arc::new(EventBus::new());
     let plugins = Arc::new(Mutex::new(PluginRegistry::new()));
     let ops: Arc<dyn EngineOps> = Arc::new(BrokerOps::new(Arc::clone(&shared)));
-    let data_dir = nefor::paths::DataDir(PathBuf::from("/var/empty/stage1-e2e-data"));
+    let data_dir = nefor::paths::DataDir::new(PathBuf::from("/var/empty/stage1-e2e-data"));
     let mut host = LuaHost::new(bus, plugins, ops, data_dir).expect("lua host");
     host.load_init(&config_dir.join("init.lua"))
         .await
@@ -452,27 +452,23 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
     // identical to the real openai-provider's `ollama.*` namespace.
     let combinators_spec = PluginSpec {
         name: PluginName::new("nefor-combinators").expect("valid name"),
-        command: Some(vec![debug.join("nefor-combinators").display().to_string()]),
-        has_cli: false,
+        kind: PluginKind::Command(vec![debug.join("nefor-combinators").display().to_string()]),
     };
     let generic_provider_spec = PluginSpec {
         name: PluginName::new("generic-provider").expect("valid name"),
-        command: Some(vec![debug.join("generic-provider").display().to_string()]),
-        has_cli: false,
+        kind: PluginKind::Command(vec![debug.join("generic-provider").display().to_string()]),
     };
     let generic_tool_spec = PluginSpec {
         name: PluginName::new("generic-tool").expect("valid name"),
-        command: Some(vec![debug.join("generic-tool").display().to_string()]),
-        has_cli: false,
+        kind: PluginKind::Command(vec![debug.join("generic-tool").display().to_string()]),
     };
     let rg_spec = PluginSpec {
         name: PluginName::new("reasoner-graph").expect("valid name"),
-        command: Some(vec![debug.join("reasoner-graph").display().to_string()]),
-        has_cli: false,
+        kind: PluginKind::Command(vec![debug.join("reasoner-graph").display().to_string()]),
     };
     let gate_spec = PluginSpec {
         name: PluginName::new("tool-gate").expect("valid name"),
-        command: Some(vec![
+        kind: PluginKind::Command(vec![
             debug.join("tool-gate").display().to_string(),
             // `auto` = "auto-allow unlisted tools" (the gate's no-prompt
             // mode). The starter's prod init.lua passes `prompt` instead
@@ -481,25 +477,22 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
             "--default".into(),
             "auto".into(),
         ]),
-        has_cli: false,
     };
     let basic_tools_spec = PluginSpec {
         name: PluginName::new("basic-tools").expect("valid name"),
-        command: Some(vec![
+        kind: PluginKind::Command(vec![
             debug.join("basic-tools").display().to_string(),
             "--gate".into(),
             "tool-gate".into(),
         ]),
-        has_cli: false,
     };
     let ollama_spec = PluginSpec {
         name: PluginName::new("ollama").expect("valid name"),
-        command: Some(vec![
+        kind: PluginKind::Command(vec![
             debug.join("mock-plugin").display().to_string(),
             "--script".into(),
             mock_script.display().to_string(),
         ]),
-        has_cli: false,
     };
 
     // Spawn order matches §6.1's policy: registry → canonical → reasoner →

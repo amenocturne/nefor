@@ -44,7 +44,7 @@
 use mlua::{Lua, Table, Value};
 use nefor_protocol::PluginName;
 
-use crate::ncp::{PluginSpec, SharedPluginRegistry};
+use crate::ncp::{PluginKind, PluginSpec, SharedPluginRegistry};
 
 /// Lua global holding the per-plugin CLI dispatch table. Populated by
 /// `nefor.plugins.spawn` and read by the engine when running
@@ -155,10 +155,20 @@ pub fn install_plugins(
             }
         };
 
+        let kind = match (command, cli_fn.is_some()) {
+            (Some(cmd), false) => PluginKind::Command(cmd),
+            (Some(cmd), true) => PluginKind::Both { command: cmd },
+            (None, true) => PluginKind::Cli,
+            (None, false) => {
+                return Err(mlua::Error::runtime(format!(
+                    "spawn entry {:?} has neither command nor cli — pointless",
+                    name.as_str(),
+                )));
+            }
+        };
         let spec = PluginSpec {
             name: name.clone(),
-            command,
-            has_cli: cli_fn.is_some(),
+            kind,
         };
 
         // Validate via the registry first — `register` enforces the
@@ -214,10 +224,10 @@ mod tests {
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].name.as_str(), "demo");
         assert_eq!(
-            specs[0].command.as_deref(),
+            specs[0].command(),
             Some(&["demo-bin".to_string()][..])
         );
-        assert!(!specs[0].has_cli);
+        assert!(!specs[0].has_cli());
     }
 
     #[test]
@@ -235,7 +245,7 @@ mod tests {
         let specs = guard.list();
         assert_eq!(specs.len(), 1);
         assert_eq!(
-            specs[0].command.as_deref(),
+            specs[0].command(),
             Some(&["bin".to_string(), "--flag".to_string(), "x".to_string()][..])
         );
     }
@@ -269,8 +279,7 @@ mod tests {
     #[test]
     fn spawn_with_cli_only_registers_virtual_plugin() {
         // cli without command: virtual plugin. Registers in the spec list
-        // with has_cli=true and command=None, and the function lands in
-        // _NEFOR_CLI[name].
+        // with PluginKind::Cli, and the function lands in _NEFOR_CLI[name].
         let (lua, plugins) = setup();
         lua.load(
             r#"nefor.plugins.spawn {
@@ -285,8 +294,8 @@ mod tests {
             let specs = guard.list();
             assert_eq!(specs.len(), 1);
             assert_eq!(specs[0].name.as_str(), "virtual");
-            assert!(specs[0].command.is_none());
-            assert!(specs[0].has_cli);
+            assert!(specs[0].command().is_none());
+            assert!(specs[0].has_cli());
         }
         // Registry table holds a function under "virtual".
         let f: mlua::Function = lua
@@ -311,8 +320,8 @@ mod tests {
         let guard = plugins.lock().unwrap();
         let specs = guard.list();
         assert_eq!(specs.len(), 1);
-        assert!(specs[0].command.is_some());
-        assert!(specs[0].has_cli);
+        assert!(specs[0].command().is_some());
+        assert!(specs[0].has_cli());
     }
 
     #[test]

@@ -34,4 +34,4 @@ pub use broker::{Broker, BrokerOps, BrokerShared};
 pub use error::BrokerError;
 #[allow(unused_imports)]
 pub use runner::{resolve_plugin_root, spawn_plugin, PluginRoot};
-pub use spawn::{PluginRegistry, PluginSpec, SharedPluginRegistry};
+pub use spawn::{PluginKind, PluginRegistry, PluginSpec, SharedPluginRegistry};

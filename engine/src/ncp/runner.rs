@@ -156,7 +156,7 @@ fn xdg_data_home() -> Option<PathBuf> {
 /// virtual specs (`spec.command.is_none()`) before calling — the runner
 /// errors loudly rather than guessing what to spawn.
 pub fn spawn_plugin(spec: &PluginSpec, _root: &PluginRoot) -> Result<Transport, BrokerError> {
-    let command = spec.command.as_ref().ok_or_else(|| BrokerError::Spawn {
+    let command = spec.command().ok_or_else(|| BrokerError::Spawn {
         name: spec.name.as_str().to_owned(),
         command: Vec::new(),
         source: std::io::Error::new(
@@ -167,7 +167,7 @@ pub fn spawn_plugin(spec: &PluginSpec, _root: &PluginRoot) -> Result<Transport, 
 
     let (binary, args) = command.split_first().ok_or_else(|| BrokerError::Spawn {
         name: spec.name.as_str().to_owned(),
-        command: command.clone(),
+        command: command.to_vec(),
         source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command array"),
     })?;
 
@@ -184,7 +184,7 @@ pub fn spawn_plugin(spec: &PluginSpec, _root: &PluginRoot) -> Result<Transport, 
 
     let mut child = cmd.spawn().map_err(|source| BrokerError::Spawn {
         name: spec.name.as_str().to_owned(),
-        command: command.clone(),
+        command: command.to_vec(),
         source,
     })?;
 
@@ -270,8 +270,7 @@ mod tests {
         // so a non-existent root must NOT cause spawn to fail.
         let spec = PluginSpec {
             name: PluginName::new("nonexistent-plugin").expect("valid"),
-            command: Some(vec!["echo".into()]),
-            has_cli: false,
+            kind: crate::ncp::spawn::PluginKind::Command(vec!["echo".into()]),
         };
         let root = PluginRoot::new(PathBuf::from("/tmp/definitely-not-a-plugin-root-xyz"));
         match spawn_plugin(&spec, &root) {
@@ -286,8 +285,7 @@ mod tests {
     fn spawn_plugin_rejects_virtual_spec() {
         let spec = PluginSpec {
             name: PluginName::new("virtual").expect("valid"),
-            command: None,
-            has_cli: true,
+            kind: crate::ncp::spawn::PluginKind::Cli,
         };
         let root = PluginRoot::new(PathBuf::from("/tmp"));
         let res = spawn_plugin(&spec, &root);

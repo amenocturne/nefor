@@ -63,25 +63,25 @@ impl EnvReader for SystemEnv {
 /// Resolve the config directory from CLI args + environment. Pure.
 pub fn resolve_config_from(cli: &Cli, env: &impl EnvReader) -> Result<ConfigDir, ConfigError> {
     if let Some(dir) = &cli.config {
-        return Ok(ConfigDir(dir.clone()));
+        return Ok(ConfigDir::new(dir.clone()));
     }
     if let Some(raw) = env.get("NEFOR_CONFIG_DIR").filter(|s| !s.is_empty()) {
-        return Ok(ConfigDir(PathBuf::from(raw)));
+        return Ok(ConfigDir::new(PathBuf::from(raw)));
     }
     let xdg = env.xdg_config_home().ok_or(ConfigError::NoXdgConfigDir)?;
-    Ok(ConfigDir(xdg.join("nefor")))
+    Ok(ConfigDir::new(xdg.join("nefor")))
 }
 
 /// Resolve the data directory from CLI args + environment. Pure.
 pub fn resolve_data_from(cli: &Cli, env: &impl EnvReader) -> Result<DataDir, ConfigError> {
     if let Some(dir) = &cli.data_dir {
-        return Ok(DataDir(dir.clone()));
+        return Ok(DataDir::new(dir.clone()));
     }
     if let Some(raw) = env.get("NEFOR_DATA_DIR").filter(|s| !s.is_empty()) {
-        return Ok(DataDir(PathBuf::from(raw)));
+        return Ok(DataDir::new(PathBuf::from(raw)));
     }
     let xdg = env.xdg_data_home().ok_or(ConfigError::NoXdgDataDir)?;
-    Ok(DataDir(xdg.join("nefor")))
+    Ok(DataDir::new(xdg.join("nefor")))
 }
 
 /// Resolve the config directory using the real process environment.
@@ -164,7 +164,7 @@ mod tests {
         let env =
             FakeEnv::new(Some("/tmp/u/.config"), None).with("NEFOR_CONFIG_DIR", "/env/config");
         let got = resolve_config_from(&cli, &env).expect("resolve ok");
-        assert_eq!(got, ConfigDir(PathBuf::from("/tmp/my-config")));
+        assert_eq!(got, ConfigDir::new(PathBuf::from("/tmp/my-config")));
     }
 
     #[test]
@@ -173,7 +173,7 @@ mod tests {
         let env =
             FakeEnv::new(Some("/tmp/u/.config"), None).with("NEFOR_CONFIG_DIR", "/env/config");
         let got = resolve_config_from(&cli, &env).expect("resolve ok");
-        assert_eq!(got, ConfigDir(PathBuf::from("/env/config")));
+        assert_eq!(got, ConfigDir::new(PathBuf::from("/env/config")));
     }
 
     #[test]
@@ -181,7 +181,7 @@ mod tests {
         let cli = cli_bare();
         let env = FakeEnv::new(Some("/tmp/u/.config"), None);
         let got = resolve_config_from(&cli, &env).expect("resolve ok");
-        assert_eq!(got, ConfigDir(PathBuf::from("/tmp/u/.config/nefor")));
+        assert_eq!(got, ConfigDir::new(PathBuf::from("/tmp/u/.config/nefor")));
     }
 
     #[test]
@@ -197,7 +197,7 @@ mod tests {
         let cli = cli_with_config("/tmp/x");
         let env = FakeEnv::new(None, None);
         let got = resolve_config_from(&cli, &env).expect("flag bypasses xdg");
-        assert_eq!(got, ConfigDir(PathBuf::from("/tmp/x")));
+        assert_eq!(got, ConfigDir::new(PathBuf::from("/tmp/x")));
     }
 
     // --- data dir ---
@@ -208,7 +208,7 @@ mod tests {
         let env =
             FakeEnv::new(None, Some("/tmp/u/.local/share")).with("NEFOR_DATA_DIR", "/env/data");
         let got = resolve_data_from(&cli, &env).expect("resolve ok");
-        assert_eq!(got, DataDir(PathBuf::from("/tmp/my-data")));
+        assert_eq!(got, DataDir::new(PathBuf::from("/tmp/my-data")));
     }
 
     #[test]
@@ -217,7 +217,7 @@ mod tests {
         let env =
             FakeEnv::new(None, Some("/tmp/u/.local/share")).with("NEFOR_DATA_DIR", "/env/data");
         let got = resolve_data_from(&cli, &env).expect("resolve ok");
-        assert_eq!(got, DataDir(PathBuf::from("/env/data")));
+        assert_eq!(got, DataDir::new(PathBuf::from("/env/data")));
     }
 
     #[test]
@@ -225,7 +225,7 @@ mod tests {
         let cli = cli_bare();
         let env = FakeEnv::new(None, Some("/tmp/u/.local/share"));
         let got = resolve_data_from(&cli, &env).expect("resolve ok");
-        assert_eq!(got, DataDir(PathBuf::from("/tmp/u/.local/share/nefor")));
+        assert_eq!(got, DataDir::new(PathBuf::from("/tmp/u/.local/share/nefor")));
     }
 
     #[test]

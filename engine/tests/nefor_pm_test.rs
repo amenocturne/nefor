@@ -42,7 +42,7 @@ fn install_nefor(lua: &Lua) -> mlua::Result<()> {
     let data_dir_path = std::env::var("NEFOR_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/var/empty/nefor-pm-test-data"));
-    nefor::lua::bindings::install_fs(lua, &nefor, nefor::paths::DataDir(data_dir_path))?;
+    nefor::lua::bindings::install_fs(lua, &nefor, nefor::paths::DataDir::new(data_dir_path))?;
     lua.globals().set("nefor", nefor)?;
     Ok(())
 }

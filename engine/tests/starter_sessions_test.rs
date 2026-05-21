@@ -1019,7 +1019,7 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
     let data_dir = std::env::var("NEFOR_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/var/empty/nefor-test-data"));
-    nefor::lua::bindings::install_fs(lua, &nefor, nefor::paths::DataDir(data_dir))?;
+    nefor::lua::bindings::install_fs(lua, &nefor, nefor::paths::DataDir::new(data_dir))?;
 
     // log.* — no-op
     let log_tbl = lua.create_table()?;

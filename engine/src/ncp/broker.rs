@@ -944,7 +944,7 @@ mod tests {
         let bus = Arc::new(EventBus::new());
         let plugins = Arc::new(StdMutex::new(PluginRegistry::new()));
         let ops: Arc<dyn EngineOps> = Arc::new(BrokerOps::new(Arc::clone(shared)));
-        let data_dir = crate::paths::DataDir(std::path::PathBuf::from("/var/empty/broker-test"));
+        let data_dir = crate::paths::DataDir::new(std::path::PathBuf::from("/var/empty/broker-test"));
         let mut host = LuaHost::new(bus, plugins, ops, data_dir).expect("host ok");
         host.exec_str("init.lua", init_src).expect("exec init");
         host.cache_dispatch().expect("cache dispatch");

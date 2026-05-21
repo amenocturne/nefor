@@ -195,7 +195,7 @@ mod tests {
     fn setup_with_data_dir(data_dir: PathBuf) -> Lua {
         let lua = Lua::new();
         let nefor = lua.create_table().unwrap();
-        install_fs(&lua, &nefor, DataDir(data_dir)).unwrap();
+        install_fs(&lua, &nefor, DataDir::new(data_dir)).unwrap();
         lua.globals().set("nefor", nefor).unwrap();
         lua
     }

@@ -1,10 +1,9 @@
 //! Plugin spawn configuration and registry.
 //!
 //! [`PluginSpec`] captures what `nefor.plugins.spawn { ... }` in `init.lua`
-//! declares: a plugin name plus either a command array (spawn an OS
-//! subprocess) or a `cli` field (Lua function — virtual plugin reachable
-//! only via `nefor plugin <name>`), or both. Validation rejects the case
-//! where both are absent (D-10 — every spawn must do something).
+//! declares: a plugin name plus a [`PluginKind`] — subprocess command, CLI
+//! entry point, or both. The enum makes the "neither" case structurally
+//! unrepresentable (D-10 — every spawn must do something).
 //!
 //! The engine collects these specs during `init.lua` load and hands them
 //! to the broker when it enters the run phase. Virtual plugins (no
@@ -27,17 +26,40 @@ pub struct PluginSpec {
     /// Validated plugin name. The engine stamps `from = name` on every
     /// envelope this connection emits.
     pub name: PluginName,
-    /// The exec command: `[binary, ...args]`. First element is the binary
-    /// path (looked up via `PATH` if not absolute); remaining elements are
-    /// positional arguments. `None` for virtual plugins (no subprocess; the
-    /// plugin exists only as a CLI entry point).
-    pub command: Option<Vec<String>>,
-    /// True iff `nefor.plugins.spawn` was called with a `cli` Lua function.
-    /// The function itself lives in `_NEFOR_CLI[name]` inside the Lua VM —
-    /// the engine looks it up by name at dispatch time. We keep a flag
-    /// here so [`PluginRegistry::list_with_cli`] can be answered without
-    /// reaching into Lua.
-    pub has_cli: bool,
+    /// What this plugin does: subprocess, CLI entry point, or both.
+    /// Replaces the previous `command: Option<Vec<String>>` + `has_cli: bool`
+    /// pair — the old representation allowed an invalid state (neither
+    /// command nor cli) that was caught at runtime. The enum makes it
+    /// unrepresentable at the type level.
+    pub kind: PluginKind,
+}
+
+/// How a plugin is launched. Every variant carries at least one capability,
+/// so the "pointless entry" state is structurally impossible.
+#[derive(Debug, Clone)]
+pub enum PluginKind {
+    /// Subprocess plugin: launch `command[0]` with `command[1..]` as args.
+    Command(Vec<String>),
+    /// Virtual plugin — CLI-only, no subprocess. The cli function lives in
+    /// `_NEFOR_CLI[name]` inside the Lua VM.
+    Cli,
+    /// Subprocess plugin that also exposes a CLI entry point.
+    Both { command: Vec<String> },
+}
+
+impl PluginSpec {
+    /// The exec command, if this spec launches a subprocess.
+    pub fn command(&self) -> Option<&[String]> {
+        match &self.kind {
+            PluginKind::Command(cmd) | PluginKind::Both { command: cmd } => Some(cmd),
+            PluginKind::Cli => None,
+        }
+    }
+
+    /// Whether this spec registered a `cli` function.
+    pub fn has_cli(&self) -> bool {
+        matches!(self.kind, PluginKind::Cli | PluginKind::Both { .. })
+    }
 }
 
 /// Failure modes from [`PluginRegistry::register`].
@@ -48,14 +70,6 @@ pub enum RegisterError {
     /// failure once two processes would share an identity on the wire.
     #[error("plugin {0:?} is already registered")]
     DuplicateName(String),
-    /// Both `command` and `cli` were absent. A spawn entry needs to do
-    /// at least one of: launch a subprocess, register a CLI handler.
-    /// Pointless entries are rejected loudly per D-10.
-    #[error("spawn entry {name:?} has neither command nor cli — pointless")]
-    PointlessEntry {
-        /// The offending plugin name.
-        name: String,
-    },
     /// The command array was present but empty. The first element is the
     /// binary to exec; an empty array can't spawn anything.
     #[error("plugin {name:?} has an empty command array")]
@@ -82,16 +96,11 @@ impl PluginRegistry {
         Self::default()
     }
 
-    /// Register a plugin. Rejects duplicate names, empty command arrays,
-    /// and entries with neither `command` nor `cli` — all would otherwise
-    /// surface as obscure runtime failures.
+    /// Register a plugin. Rejects duplicate names and empty command arrays.
+    /// The "pointless entry" case (neither command nor cli) is structurally
+    /// impossible — [`PluginKind`] always carries at least one capability.
     pub fn register(&mut self, spec: PluginSpec) -> Result<(), RegisterError> {
-        if spec.command.is_none() && !spec.has_cli {
-            return Err(RegisterError::PointlessEntry {
-                name: spec.name.as_str().to_owned(),
-            });
-        }
-        if let Some(cmd) = &spec.command {
+        if let Some(cmd) = spec.command() {
             if cmd.is_empty() {
                 return Err(RegisterError::EmptyCommand {
                     name: spec.name.as_str().to_owned(),
@@ -116,7 +125,7 @@ impl PluginRegistry {
     pub fn list_with_cli(&self) -> Vec<PluginName> {
         self.specs
             .iter()
-            .filter(|s| s.has_cli)
+            .filter(|s| s.has_cli())
             .map(|s| s.name.clone())
             .collect()
     }
@@ -141,16 +150,14 @@ mod tests {
     fn cmd_spec(name: &str) -> PluginSpec {
         PluginSpec {
             name: PluginName::new(name).expect("valid"),
-            command: Some(vec!["echo".into()]),
-            has_cli: false,
+            kind: PluginKind::Command(vec!["echo".into()]),
         }
     }
 
     fn cli_only_spec(name: &str) -> PluginSpec {
         PluginSpec {
             name: PluginName::new(name).expect("valid"),
-            command: None,
-            has_cli: true,
+            kind: PluginKind::Cli,
         }
     }
 
@@ -175,23 +182,10 @@ mod tests {
         let mut r = PluginRegistry::new();
         let empty = PluginSpec {
             name: PluginName::new("p").expect("valid"),
-            command: Some(vec![]),
-            has_cli: false,
+            kind: PluginKind::Command(vec![]),
         };
         let err = r.register(empty).unwrap_err();
         assert_eq!(err, RegisterError::EmptyCommand { name: "p".into() });
-    }
-
-    #[test]
-    fn register_rejects_pointless_entry() {
-        let mut r = PluginRegistry::new();
-        let pointless = PluginSpec {
-            name: PluginName::new("p").expect("valid"),
-            command: None,
-            has_cli: false,
-        };
-        let err = r.register(pointless).unwrap_err();
-        assert_eq!(err, RegisterError::PointlessEntry { name: "p".into() });
     }
 
     #[test]
@@ -199,8 +193,8 @@ mod tests {
         let mut r = PluginRegistry::new();
         r.register(cli_only_spec("virtual")).unwrap();
         assert_eq!(r.list().len(), 1);
-        assert!(r.list()[0].has_cli);
-        assert!(r.list()[0].command.is_none());
+        assert!(r.list()[0].has_cli());
+        assert!(r.list()[0].command().is_none());
     }
 
     #[test]
@@ -210,8 +204,7 @@ mod tests {
         r.register(cli_only_spec("only-cli")).unwrap();
         r.register(PluginSpec {
             name: PluginName::new("both").expect("valid"),
-            command: Some(vec!["bin".into()]),
-            has_cli: true,
+            kind: PluginKind::Both { command: vec!["bin".into()] },
         })
         .unwrap();
         let with_cli: Vec<String> = r

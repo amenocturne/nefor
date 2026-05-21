@@ -541,7 +541,7 @@ mod tests {
     fn host_with_ops(ops: Arc<dyn EngineOps>) -> LuaHost {
         let bus = Arc::new(EventBus::new());
         let plugins: SharedPluginRegistry = Arc::new(Mutex::new(PluginRegistry::new()));
-        let data_dir = crate::paths::DataDir(PathBuf::from("/var/empty/nefor-test"));
+        let data_dir = crate::paths::DataDir::new(PathBuf::from("/var/empty/nefor-test"));
         LuaHost::new(bus, plugins, ops, data_dir).expect("host ok")
     }
 

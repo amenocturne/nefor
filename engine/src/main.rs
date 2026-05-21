@@ -28,7 +28,6 @@ mod cli;
 mod config;
 mod error;
 mod events;
-mod ids;
 mod log;
 mod lua;
 mod ncp;
@@ -330,7 +329,7 @@ pub fn lookup_dispatch_target<'a>(
         .iter()
         .find(|s| s.name.as_str() == name)
         .ok_or_else(|| DispatchLookupError::Unknown(name.to_owned()))?;
-    if !target.has_cli {
+    if !target.has_cli() {
         return Err(DispatchLookupError::NoCli(name.to_owned()));
     }
     Ok(target)
@@ -350,7 +349,7 @@ fn drain_specs(plugins: &SharedPluginRegistry) -> Vec<PluginSpec> {
 /// exist only as CLI entry points.
 fn spawn_specs(broker: &mut Broker, specs: &[PluginSpec], plugin_root: &ncp::PluginRoot) {
     for spec in specs {
-        if spec.command.is_none() {
+        if spec.command().is_none() {
             tracing::debug!(plugin = %spec.name, "skipping virtual plugin spawn (no command)");
             continue;
         }
@@ -359,7 +358,7 @@ fn spawn_specs(broker: &mut Broker, specs: &[PluginSpec], plugin_root: &ncp::Plu
                 let id = broker.attach_transport(transport, spec.name.clone());
                 tracing::info!(
                     plugin = %spec.name,
-                    command = ?spec.command,
+                    command = ?spec.command(),
                     conn = %id,
                     "plugin spawned"
                 );
@@ -367,7 +366,7 @@ fn spawn_specs(broker: &mut Broker, specs: &[PluginSpec], plugin_root: &ncp::Plu
             Err(e) => {
                 tracing::error!(
                     plugin = %spec.name,
-                    command = ?spec.command,
+                    command = ?spec.command(),
                     error = %e,
                     "failed to spawn plugin"
                 );
@@ -398,8 +397,11 @@ mod dispatch_tests {
     fn spec(name: &str, has_cli: bool) -> PluginSpec {
         PluginSpec {
             name: PluginName::new(name).expect("valid"),
-            command: Some(vec!["echo".into()]),
-            has_cli,
+            kind: if has_cli {
+                ncp::PluginKind::Both { command: vec!["echo".into()] }
+            } else {
+                ncp::PluginKind::Command(vec!["echo".into()])
+            },
         }
     }
 
