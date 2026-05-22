@@ -1558,13 +1558,13 @@ fn walk_widget_by_key(
 fn collect_scroll_positions(inst: &WidgetInstance, out: &mut ScrollPositionMap) {
     if matches!(inst.kind(), InstanceKind::Scrollable) {
         if let (Some(k), InstanceState::Scrollable(s)) = (inst.last_desc.user_key(), &inst.state) {
-            let has_bar = s.content_height > s.viewport_height;
             let rect_w = inst.layout.painted_rect.map(|r| r.width).unwrap_or(0);
-            let inner_w = if has_bar {
-                rect_w.saturating_sub(1)
-            } else {
-                rect_w
-            };
+            // Always subtract the scrollbar gutter so the measurement
+            // width is stable. If we conditioned on has_bar, the width
+            // would flip when scrollbar visibility oscillates — that
+            // invalidates all _height caches, changes gc.total, and
+            // creates a feedback loop that makes the scrollbar jump.
+            let inner_w = rect_w.saturating_sub(1);
             out.insert(
                 k.to_string(),
                 ScrollPositionSnapshot {
