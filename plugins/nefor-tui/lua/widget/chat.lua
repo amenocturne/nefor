@@ -17,15 +17,18 @@
 
 local M = {}
 
-local function estimate_height(entry)
-  local text = entry.text or ""
-  local len = #text
-  if len == 0 then return 2 end
-  local lines = math.ceil(len / 80)
-  if entry.kind == "tool_start" or entry.kind == "tool_end" then
-    return math.max(3, lines)
-  end
-  return math.max(2, lines + 2)
+-- Track the last width used for eager measurement so resizes
+-- invalidate cached `_height` values on all entries.
+local last_measure_w = nil
+
+-- Measure width for eager height measurement. Recomputed each frame
+-- from tui.dimensions() so resizes are picked up immediately.
+local function measure_width(padding)
+  local dims = tui.dimensions()
+  local w = dims and dims.width or 80
+  local lr = (padding.left or 0) + (padding.right or 0)
+  -- Scrollbar gutter takes 1 column when visible.
+  return math.max(1, w - lr - 1)
 end
 
 function M.view(opts)
@@ -43,11 +46,27 @@ function M.view(opts)
 
   local widgets = {}
 
+  local padding = opts.padding or { top = 0, right = 1, bottom = 0, left = 0 }
+
   if n > 0 then
-    -- Build heights array for the Rust geometry engine.
+    -- Eagerly measure entry heights via tui.measure so virtual scroll
+    -- geometry uses exact values instead of crude estimates. Heights
+    -- are cached on the entry table as `_height`; streaming entries
+    -- and expand/collapse clear the field to force re-measurement.
+    local mw = measure_width(padding)
+    if last_measure_w ~= mw then
+      for i = 1, n do entries[i]._height = nil end
+      last_measure_w = mw
+    end
     local heights = {}
     for i = 1, n do
-      heights[i] = estimate_height(entries[i])
+      if not entries[i]._height then
+        entries[i]._height = tui.measure(
+          opts.render_entry(entries[i], i, opts.context),
+          mw
+        )
+      end
+      heights[i] = entries[i]._height
     end
 
     local has_vsp = type(tui.virtual_scroll_prepare) == "function"
@@ -97,7 +116,6 @@ function M.view(opts)
     }
   end
 
-  local padding = opts.padding or { top = 0, right = 1, bottom = 0, left = 0 }
   local scroll_widget = tui.scrollable {
     key                    = key,
     stick_to               = opts.stick_to ~= nil and opts.stick_to or "end",

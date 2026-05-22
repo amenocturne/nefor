@@ -19,6 +19,7 @@ function M.append_assistant_delta(state, delta)
     local e = state.entries[state.in_flight]
     e.text = (e.text or "") .. delta
     e.streaming = true
+    e._height = nil
     return shallow_merge(state, { pending = false })
   end
   local entries = state.entries
@@ -50,6 +51,7 @@ function M.append_reasoning_delta(state, delta)
   prev.streaming = true
   cur.reasoning = prev
   cur.streaming = true
+  cur._height = nil
   return shallow_merge(state, { pending = false })
 end
 
@@ -61,6 +63,7 @@ function M.finalize_reasoning(state, duration_ms)
   prev.streaming = false
   prev.duration_ms = duration_ms or prev.duration_ms
   e.reasoning = prev
+  e._height = nil
   return state
 end
 
@@ -96,6 +99,7 @@ function M.finalize_assistant(state, final_text, model, duration_ms)
     e.model = model or e.model
     e.duration_ms = duration_ms or e.duration_ms
     e.streaming = false
+    e._height = nil
   end
   return shallow_merge(state, {
     in_flight        = NIL_SENTINEL,
@@ -111,6 +115,7 @@ function M.attach_tool_end(state, id, output, error_flag)
     if v.kind == "tool_call" and v.id == id then
       v.output = output or ""
       v.error = error_flag
+      v._height = nil
       return state
     end
   end

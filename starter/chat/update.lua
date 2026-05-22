@@ -384,6 +384,10 @@ function M.update(msg, state)
     if type(tui.virtual_scroll_invalidate) == "function" then
       tui.virtual_scroll_invalidate("chat")
     end
+    -- Cached measured heights depend on expanded state; clear them.
+    if state.entries then
+      for _, e in ipairs(state.entries) do e._height = nil end
+    end
     return shallow_merge(state, { expanded_details = not state.expanded_details }), {}
   end
 

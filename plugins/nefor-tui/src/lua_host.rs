@@ -10,7 +10,7 @@
 //! pulls the registry-stored values for each render and dispatch.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use mlua::{Lua, LuaSerdeExt, RegistryKey, Table, Value};
@@ -107,6 +107,10 @@ pub struct LuaHost {
     /// heights on the Lua side and delegate the math to Rust.
     #[allow(dead_code)]
     geo_caches: Arc<Mutex<HashMap<String, GeoCache>>>,
+    /// Terminal dimensions the engine writes after each resize.
+    /// Lua reads via `tui.dimensions()`.
+    term_width: Arc<AtomicU16>,
+    term_height: Arc<AtomicU16>,
 }
 
 impl LuaHost {
@@ -121,6 +125,8 @@ impl LuaHost {
         let now_ms: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         let geo_caches: Arc<Mutex<HashMap<String, GeoCache>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let term_width: Arc<AtomicU16> = Arc::new(AtomicU16::new(0));
+        let term_height: Arc<AtomicU16> = Arc::new(AtomicU16::new(0));
         install_tui(
             &lua,
             Arc::clone(&started),
@@ -129,6 +135,8 @@ impl LuaHost {
             Arc::clone(&emit_queue),
             Arc::clone(&now_ms),
             Arc::clone(&geo_caches),
+            Arc::clone(&term_width),
+            Arc::clone(&term_height),
         )?;
         // `nefor.fs.list_dir` — a Rust-backed readdir, used by chat.lua's
         // @-path autocomplete. Stays separate from the `tui` table so the
@@ -149,6 +157,8 @@ impl LuaHost {
             emit_queue,
             now_ms,
             geo_caches,
+            term_width,
+            term_height,
         })
     }
 
@@ -158,6 +168,13 @@ impl LuaHost {
     /// `Engine::advance_time` offset tests use.
     pub fn set_now_ms(&self, now_ms: u64) {
         self.now_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// Publish the engine's terminal dimensions so `tui.dimensions()`
+    /// returns up-to-date values. Called on init and after each resize.
+    pub fn set_dimensions(&self, width: u16, height: u16) {
+        self.term_width.store(width, Ordering::Relaxed);
+        self.term_height.store(height, Ordering::Relaxed);
     }
 
     /// Drain queued NCP egress so the engine can flush them to stdout.
@@ -181,6 +198,21 @@ impl LuaHost {
     pub fn write_scroll_positions(&self, snapshot: ScrollPositionMap) {
         let mut p = lock(&self.scroll_positions);
         *p = snapshot;
+    }
+
+    /// Feed back measured entry heights into the virtual-scroll geo
+    /// cache. Called after each render pass so that entries rendered at
+    /// least once use their actual height instead of the Lua estimate.
+    /// `entries` maps `(scrollable_key, entry_index)` → measured height.
+    pub fn update_measured_heights(&self, entries: &[(&str, usize, u16)]) {
+        let mut caches = lock(&self.geo_caches);
+        for &(key, idx, height) in entries {
+            if let Some(gc) = caches.get_mut(key) {
+                if idx < gc.measured.len() {
+                    gc.measured[idx] = Some(height);
+                }
+            }
+        }
     }
 
     /// Borrow the underlying VM. Useful for integration tests that load
@@ -364,6 +396,7 @@ fn parse_emit_entry(lua: &Lua, entry: &Table) -> mlua::Result<SideEffect> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install_tui(
     lua: &Lua,
     started: Arc<Mutex<StartedState>>,
@@ -372,6 +405,8 @@ fn install_tui(
     emit_queue: Arc<Mutex<Vec<SideEffect>>>,
     now_ms: Arc<AtomicU64>,
     geo_caches: Arc<Mutex<HashMap<String, GeoCache>>>,
+    term_width: Arc<AtomicU16>,
+    term_height: Arc<AtomicU16>,
 ) -> Result<(), TuiError> {
     let tui = lua.create_table()?;
 
@@ -585,14 +620,18 @@ fn install_tui(
             let mut caches = lock(&geo_for_vscroll);
             let gc = caches.entry(key).or_default();
 
-            // Sync heights from Lua table into the cache.
-            // Always re-read all heights so Lua-side estimate changes
-            // (e.g. after state updates) are picked up immediately.
+            // Sync heights from Lua table into the cache. When a
+            // measured height exists for an entry (fed back after a
+            // prior render pass), prefer it over the Lua estimate.
+            // This self-corrects spacer geometry for entries that have
+            // been rendered at least once.
             gc.heights.resize(item_count, 0);
+            gc.measured.resize(item_count, None);
             gc.cumul.resize(item_count, 0);
             let mut any_changed = false;
             for i in 0..item_count {
-                let h: u16 = heights_table.get((i + 1) as i64)?;
+                let estimate: u16 = heights_table.get((i + 1) as i64)?;
+                let h = gc.measured[i].unwrap_or(estimate);
                 if gc.heights[i] != h {
                     gc.heights[i] = h;
                     any_changed = true;
@@ -703,6 +742,7 @@ fn install_tui(
             let mut caches = lock(&geo_for_invalidate);
             if let Some(gc) = caches.get_mut(&key) {
                 gc.heights.clear();
+                gc.measured.clear();
                 gc.cumul.clear();
                 gc.total = 0;
             }
@@ -817,6 +857,52 @@ fn install_tui(
         },
     )?;
     tui.set("send_to", send_to_fn)?;
+
+    // ── Layout measurement ────────────────────────────────────────────
+    //
+    // `tui.measure(desc_table, max_width) → height`
+    //
+    // Eagerly measures a widget description by building a temporary
+    // instance tree and running the layout pass with loose constraints.
+    // Returns the measured height as a Lua integer. The temporary tree
+    // is dropped immediately — no side effects on the real render tree.
+
+    let measure_fn = lua.create_function(
+        |_lua, (desc_table, max_width): (Table, u16)| -> mlua::Result<u16> {
+            let desc = from_lua_table(&desc_table).map_err(|e| {
+                mlua::Error::runtime(format!("tui.measure: invalid description: {e}"))
+            })?;
+            let mut summary = crate::reconciler::ReconcileSummary::default();
+            let mut inst =
+                crate::reconciler::mount_subtree(desc, 0, &mut summary);
+            let constraints = crate::layout::Constraints {
+                min_width: 0,
+                max_width,
+                min_height: 0,
+                max_height: u16::MAX,
+            };
+            let size = crate::layout::layout(&mut inst, constraints);
+            Ok(size.height)
+        },
+    )?;
+    tui.set("measure", measure_fn)?;
+
+    // ── Terminal dimensions ─────────────────────────────────────────
+    //
+    // `tui.dimensions() → { width, height }`
+    //
+    // Returns the current terminal size. The engine writes updated
+    // values on init and after each resize.
+
+    let tw_for_dims = Arc::clone(&term_width);
+    let th_for_dims = Arc::clone(&term_height);
+    let dimensions_fn = lua.create_function(move |lua, ()| -> mlua::Result<Table> {
+        let t = lua.create_table()?;
+        t.set("width", tw_for_dims.load(Ordering::Relaxed))?;
+        t.set("height", th_for_dims.load(Ordering::Relaxed))?;
+        Ok(t)
+    })?;
+    tui.set("dimensions", dimensions_fn)?;
 
     // tui.start { initial_state, view, update }
     let started_for_start = Arc::clone(&started);

@@ -60,7 +60,7 @@ impl Reconciler {
 /// Build a fresh instance subtree for `desc`. `position` is the slot in
 /// the parent's children list (used as fallback when the description has
 /// no user-supplied `key`).
-fn mount_subtree(
+pub(crate) fn mount_subtree(
     desc: WidgetDescription,
     position: usize,
     summary: &mut ReconcileSummary,

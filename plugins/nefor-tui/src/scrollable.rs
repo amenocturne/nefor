@@ -20,9 +20,15 @@
 /// Per-item geometry cache for virtual-scroll widgets. Holds heights,
 /// cumulative y positions (including gaps), and total content height.
 /// Updated incrementally by `tui.virtual_scroll_prepare`.
+///
+/// `measured` holds actual rendered heights fed back after each paint
+/// pass. When present for an entry, `virtual_scroll_prepare` uses the
+/// measured height instead of the Lua estimate — this self-corrects
+/// spacer geometry as entries scroll through the viewport.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GeoCache {
     pub heights: Vec<u16>,
+    pub measured: Vec<Option<u16>>,
     pub cumul: Vec<u32>,
     pub total: u32,
 }
