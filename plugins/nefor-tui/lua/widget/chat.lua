@@ -17,17 +17,24 @@
 
 local M = {}
 
--- Track the last width used for eager measurement so resizes
--- invalidate cached `_height` values on all entries.
+-- Track the last width used for eager measurement so width changes
+-- (resize, sidebar toggle) invalidate cached `_height` values.
 local last_measure_w = nil
 
--- Measure width for eager height measurement. Recomputed each frame
--- from tui.dimensions() so resizes are picked up immediately.
-local function measure_width(padding)
+-- Measure width for eager height measurement. Uses the scrollable's
+-- actual inner width (from scroll_position) so it matches the exact
+-- constraints the layout pass gives to entry content. Falls back to
+-- terminal width minus padding/gutter on the first frame before the
+-- scrollable has been mounted.
+local function measure_width(key, padding)
+  local ok, snap = pcall(tui.scroll_position, key)
+  if ok and snap and snap.inner_width and snap.inner_width > 0 then
+    local lr = (padding.left or 0) + (padding.right or 0)
+    return math.max(1, snap.inner_width - lr)
+  end
   local dims = tui.dimensions()
   local w = dims and dims.width or 80
   local lr = (padding.left or 0) + (padding.right or 0)
-  -- Scrollbar gutter takes 1 column when visible.
   return math.max(1, w - lr - 1)
 end
 
@@ -53,7 +60,7 @@ function M.view(opts)
     -- geometry uses exact values instead of crude estimates. Heights
     -- are cached on the entry table as `_height`; streaming entries
     -- and expand/collapse clear the field to force re-measurement.
-    local mw = measure_width(padding)
+    local mw = measure_width(key, padding)
     if last_measure_w ~= mw then
       for i = 1, n do entries[i]._height = nil end
       last_measure_w = mw

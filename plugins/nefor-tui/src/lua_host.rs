@@ -48,6 +48,10 @@ pub struct ScrollPositionSnapshot {
     pub offset: u16,
     pub max: u16,
     pub viewport_size: u16,
+    /// Inner width available to children after scrollbar gutter is
+    /// subtracted. Used by Lua's `tui.measure` to match the exact
+    /// width the scrollable's layout pass gives its content.
+    pub inner_width: u16,
 }
 
 pub type ScrollPositionMap = HashMap<String, ScrollPositionSnapshot>;
@@ -572,6 +576,7 @@ fn install_tui(
             t.set("offset", snap.offset)?;
             t.set("max", snap.max)?;
             t.set("viewport_size", snap.viewport_size)?;
+            t.set("inner_width", snap.inner_width)?;
             Ok(t)
         })?;
     tui.set("scroll_position", scroll_position_fn)?;
@@ -1177,6 +1182,7 @@ mod tests {
                 offset: 7,
                 max: 30,
                 viewport_size: 5,
+                inner_width: 80,
             },
         );
         host.write_scroll_positions(map);
