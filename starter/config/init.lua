@@ -53,6 +53,7 @@ local function all_roles(model)
     critic              = model,
     reflector           = model,
     ["prompt-engineer"] = model,
+    docs                = model,
   }
 end
 
@@ -141,6 +142,11 @@ M.mock = {
 
 M.dev     = M.test
 M.staging = M.prod
+
+-- Confluence wiki config — not variant-specific.
+M.confluence = {
+  host = "https://wiki.tcsbank.ru",
+}
 
 local variant = os.getenv("NEFOR_CONFIG")
 if variant == nil or variant == "" then

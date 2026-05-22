@@ -430,6 +430,13 @@ actor.spawn(require("lead-workflow"))
 -- tool-gate spawn so the gate's first hello triggers our advertise.
 actor.spawn(require("read-only-tools"))
 
+-- jira-tools advertises the `jira` tool for the lead orchestrator.
+-- Must be registered before tool-gate spawn for the same reason.
+actor.spawn(require("jira"))
+
+-- confluence-tools advertises the `wiki` tool for the docs subagent.
+actor.spawn(require("confluence"))
+
 -- Tool-validator translates tool-gate's chat.tool.permission_request
 -- into either an auto tool.permission_response (da-classified bash
 -- safe-ops) or a chat.tool.popup_request (defer to user). The chat

@@ -120,6 +120,12 @@ M.AGENT_CONFIGS = {
     tool_allowlist = { "read_file", "list_dir", "search_text", "write_file" },
     read_only      = false,
   },
+  docs = {
+    system_prompt  = load_or_placeholder("docs"),
+    model          = model_for("docs"),
+    tool_allowlist = { "jira", "wiki", "read_file", "list_dir", "search_text" },
+    read_only      = true,
+  },
 }
 
 -- The lead does NOT get read/grep/find/ls/glob/write/edit/bash directly
@@ -127,6 +133,7 @@ M.AGENT_CONFIGS = {
 -- nodes.
 M.ORCHESTRATION_TOOLS = {
   "read_file",
+  "jira",
   "dispatch-graph",
   "write-review",
   "progress",
