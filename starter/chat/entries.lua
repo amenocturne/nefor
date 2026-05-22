@@ -63,14 +63,21 @@ local function turn_footer(entry)
   return nil
 end
 
+-- Stable three-slot layout: each slot is a keyed column so the
+-- reconciler matches by key across frames. When a slot is empty its
+-- column has zero children (zero height, no gap consumed). This
+-- prevents child-count changes from cascading position-based key
+-- mismatches during streaming transitions.
 local function render_assistant_entry(entry, expanded)
   local body_empty = (entry.text or "") == ""
-  local rows = compact {
-    reasoning_rows(entry.reasoning, body_empty, expanded),
-    body_empty and nil or md(entry.text),
-    (not entry.streaming) and turn_footer(entry) or nil,
-  }
-  return tui.column { gap = 0, children = rows }
+  local reason = reasoning_rows(entry.reasoning, body_empty, expanded)
+  local body   = (not body_empty) and md(entry.text) or nil
+  local foot   = (not entry.streaming) and turn_footer(entry) or nil
+  return tui.column { gap = 0, children = {
+    tui.column { key = "reason", gap = 0, children = reason and { reason } or {} },
+    tui.column { key = "body",   gap = 0, children = body   and { body }   or {} },
+    tui.column { key = "foot",   gap = 0, children = foot   and { foot }   or {} },
+  } }
 end
 
 -- Salient input summary for the tool collapsed-line.

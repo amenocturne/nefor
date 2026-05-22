@@ -58,10 +58,15 @@ function M.view(opts)
         key = "_top", min_height = vis.top_h, max_height = vis.top_h,
         child = tui.text { content = "" },
       }
-      -- Visible entries.
+      -- Visible entries. Each wrapped in a keyed column so the
+      -- reconciler matches by entry index, not by position in the
+      -- virtual scroll window — prevents content swaps on window shift.
       for i = vis.first, vis.last do
         if i >= 1 and i <= n then
-          widgets[#widgets + 1] = opts.render_entry(entries[i], i, opts.context)
+          widgets[#widgets + 1] = tui.column {
+            key = "e" .. i, gap = 0,
+            children = { opts.render_entry(entries[i], i, opts.context) },
+          }
         end
       end
       -- Bottom spacer (always present to keep column child count stable).
@@ -70,17 +75,26 @@ function M.view(opts)
         child = tui.text { content = "" },
       }
     else
-      -- First frame (no scroll position yet): render all.
+      -- First frame (no scroll position yet): render all, keyed
+      -- consistently with the virtual-scroll path above.
       for i = 1, n do
-        widgets[#widgets + 1] = opts.render_entry(entries[i], i, opts.context)
+        widgets[#widgets + 1] = tui.column {
+          key = "e" .. i, gap = 0,
+          children = { opts.render_entry(entries[i], i, opts.context) },
+        }
       end
     end
   end
 
-  if opts.append ~= nil then
+  -- Append slot (e.g. thinking indicator) — always present as a keyed
+  -- column so toggling it doesn't mount/unmount and cause height jumps.
+  do
     local extra = opts.append
     if type(extra) == "function" then extra = extra() end
-    if extra ~= nil then widgets[#widgets + 1] = extra end
+    widgets[#widgets + 1] = tui.column {
+      key = "_append", gap = 0,
+      children = extra and { extra } or {},
+    }
   end
 
   local padding = opts.padding or { top = 0, right = 1, bottom = 0, left = 0 }
