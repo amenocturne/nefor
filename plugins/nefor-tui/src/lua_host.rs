@@ -200,21 +200,6 @@ impl LuaHost {
         *p = snapshot;
     }
 
-    /// Feed back measured entry heights into the virtual-scroll geo
-    /// cache. Called after each render pass so that entries rendered at
-    /// least once use their actual height instead of the Lua estimate.
-    /// `entries` maps `(scrollable_key, entry_index)` → measured height.
-    pub fn update_measured_heights(&self, entries: &[(&str, usize, u16)]) {
-        let mut caches = lock(&self.geo_caches);
-        for &(key, idx, height) in entries {
-            if let Some(gc) = caches.get_mut(key) {
-                if idx < gc.measured.len() {
-                    gc.measured[idx] = Some(height);
-                }
-            }
-        }
-    }
-
     /// Borrow the underlying VM. Useful for integration tests that load
     /// scenarios directly.
     pub fn lua(&self) -> &Lua {
@@ -620,18 +605,15 @@ fn install_tui(
             let mut caches = lock(&geo_for_vscroll);
             let gc = caches.entry(key).or_default();
 
-            // Sync heights from Lua table into the cache. When a
-            // measured height exists for an entry (fed back after a
-            // prior render pass), prefer it over the Lua estimate.
-            // This self-corrects spacer geometry for entries that have
-            // been rendered at least once.
+            // Sync heights from Lua table into the cache. With eager
+            // tui.measure() the Lua-side heights are exact, not
+            // estimates — use them directly as the single source of
+            // truth.
             gc.heights.resize(item_count, 0);
-            gc.measured.resize(item_count, None);
             gc.cumul.resize(item_count, 0);
             let mut any_changed = false;
             for i in 0..item_count {
-                let estimate: u16 = heights_table.get((i + 1) as i64)?;
-                let h = gc.measured[i].unwrap_or(estimate);
+                let h: u16 = heights_table.get((i + 1) as i64)?;
                 if gc.heights[i] != h {
                     gc.heights[i] = h;
                     any_changed = true;
@@ -742,7 +724,6 @@ fn install_tui(
             let mut caches = lock(&geo_for_invalidate);
             if let Some(gc) = caches.get_mut(&key) {
                 gc.heights.clear();
-                gc.measured.clear();
                 gc.cumul.clear();
                 gc.total = 0;
             }

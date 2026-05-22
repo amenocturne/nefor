@@ -497,19 +497,6 @@ impl Engine {
         self.lua.write_scroll_positions(snap);
     }
 
-    /// Feed measured entry heights back into the virtual-scroll geo
-    /// cache so subsequent frames use actual heights instead of Lua
-    /// estimates for entries that have been rendered.
-    fn refresh_entry_heights(&self) {
-        let mut heights = Vec::new();
-        if let Some(root) = self.reconciler.root.as_ref() {
-            collect_entry_heights(root, &mut heights);
-        }
-        if !heights.is_empty() {
-            self.lua.update_measured_heights(&heights);
-        }
-    }
-
     /// Apply a terminal resize. Forces a full redraw on the next render.
     pub fn handle_resize(&mut self, width: u16, height: u16) -> Result<(), TuiError> {
         self.renderer.resize(width, height);
@@ -1279,7 +1266,6 @@ impl Engine {
         match result {
             Ok(Ok(bytes)) => {
                 self.refresh_scroll_positions();
-                self.refresh_entry_heights();
                 self.needs_render = false;
                 Ok(Some(bytes))
             }
@@ -1584,50 +1570,6 @@ fn collect_scroll_positions(inst: &WidgetInstance, out: &mut ScrollPositionMap) 
     }
     for c in inst.children.iter() {
         collect_scroll_positions(c, out);
-    }
-}
-
-/// Walk the tree and feed measured entry heights back into the
-/// virtual-scroll geo cache. For every scrollable with a user key,
-/// descend into its child tree and find keyed columns matching `"eN"`
-/// (the entry wrappers emitted by `chat.lua`). Record their
-/// `layout.size.height` so the next `virtual_scroll_prepare` uses
-/// actual heights instead of Lua estimates.
-fn collect_entry_heights<'a>(inst: &'a WidgetInstance, out: &mut Vec<(&'a str, usize, u16)>) {
-    if matches!(inst.kind(), InstanceKind::Scrollable) {
-        if let Some(scrollable_key) = inst.last_desc.user_key() {
-            collect_entry_heights_inside(inst, scrollable_key, out);
-            return;
-        }
-    }
-    for c in inst.children.iter() {
-        collect_entry_heights(c, out);
-    }
-}
-
-/// Walk children of a scrollable and record measured heights for keyed
-/// entry wrappers. The tree shape is: scrollable → padding → column →
-/// [_top, e1, e2, …, _bot, _append]. We look for columns whose key
-/// starts with "e" followed by digits.
-fn collect_entry_heights_inside<'a>(
-    inst: &'a WidgetInstance,
-    scrollable_key: &'a str,
-    out: &mut Vec<(&'a str, usize, u16)>,
-) {
-    if matches!(inst.kind(), InstanceKind::Column) {
-        if let Some(k) = inst.last_desc.user_key() {
-            if let Some(idx_str) = k.strip_prefix('e') {
-                if let Ok(idx) = idx_str.parse::<usize>() {
-                    // idx is 1-based from Lua; geo cache is 0-based
-                    if idx > 0 {
-                        out.push((scrollable_key, idx - 1, inst.layout.size.height));
-                    }
-                }
-            }
-        }
-    }
-    for c in inst.children.iter() {
-        collect_entry_heights_inside(c, scrollable_key, out);
     }
 }
 
