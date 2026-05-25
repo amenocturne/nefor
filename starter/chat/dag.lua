@@ -295,7 +295,17 @@ local function format_tool_args_short(tool_name, args)
   -- and break sidebar layout; replace them.
   picked = picked:gsub("[\r\n]+", " ")
   local MAX = 40
-  if #picked > MAX then picked = picked:sub(1, MAX - 1) .. "…" end
+  if #picked > MAX then
+    local is_path = picked:find("/", 1, true)
+    if is_path then
+      local tail = picked:sub(-(MAX - 1))
+      local slash = tail:find("/", 1, true)
+      if slash then tail = tail:sub(slash) end
+      picked = "…" .. tail
+    else
+      picked = picked:sub(1, MAX - 1) .. "…"
+    end
+  end
   return picked
 end
 

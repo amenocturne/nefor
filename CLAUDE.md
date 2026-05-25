@@ -22,7 +22,7 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 - `starter/agentic-loop/` — orchestrator state machine.
 - `starter/reasoners/` — Lua-resident reasoner type handlers (`responder`, `provider-wrapper`, `tool-executor`, `adapter`, `terminal`, `agent`, `run`, `loop_counter`).
 - `starter/sessions/` — sessions actor: boot/shutdown/resume + jsonl persistence over the bus.
-- `starter/chat/` — chat surface composed over `tui.*` primitives (entry `chat/init.lua`; transcript, statusline, input, popups, slash commands as submodules).
+- `starter/chat/` — chat surface composed over `tui.*` primitives (entry `chat/init.lua`; transcript, statusline, input, popups, slash commands as submodules). Entry model is copy-on-write with a global version counter (`entry.lua`); heights cached by `(version, width)` in `height_cache.lua`; debug logging gated on `NEFOR_CHAT_DEBUG=1` (`log.lua`, writes to `/tmp/nefor-chat-debug.log`). Virtual scroll uses gap=0 outer column with spacers flush against a nested content column to avoid phantom-gap position mismatches.
 - `starter/cli/` — virtual `agentic-cli` plugin: surfaces the loop over stdin/stdout for `nefor plugin agentic-cli "<prompt>"`.
 - `starter/lead-workflow/` — lead role plus the dispatch-graph / write-review / await-approval tool surface.
 - `starter/compositors/` — actor-spec builders per plugin binary (provider, tools, graph, combinators, chat_bridge).
@@ -35,6 +35,7 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 
 | Env var            | CLI flag       | Default                   | Holds      |
 | ------------------ | -------------- | ------------------------- | ---------- |
+| `NEFOR_DEV_DIR`    | —              | (unset)                   | dev repo root — when set, Lua searchers resolve `plugins/*/lua/` and `starter/` from here first |
 | `NEFOR_CONFIG_DIR` | `--config`     | `$XDG_CONFIG_HOME/nefor`  | `init.lua` |
 | `NEFOR_DATA_DIR`   | `--data-dir`   | `$XDG_DATA_HOME/nefor`    | sessions   |
 | `NEFOR_PLUGIN_DIR` | `--plugin-dir` | `$NEFOR_DATA_DIR/plugins` | binaries   |
@@ -54,7 +55,7 @@ If no `init.lua` is found, the engine prints a friendly error pointing at the RE
 
 ## Commands
 
-- `just run` — launch engine with `./starter` config (debug build).
+- `just run` — launch engine with `./starter` config (debug build). Sets `NEFOR_DEV_DIR` so Lua files load from the repo, not the installed copy.
 - `just test` — workspace tests.
 - `just lint` — clippy with `-D warnings`.
 - `just fmt` — rustfmt.

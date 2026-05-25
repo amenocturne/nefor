@@ -68,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
         .context("resolving data directory")?;
     // SAFETY: single-threaded at this point, before any thread spawns.
     unsafe {
+        std::env::set_var("NEFOR_CONFIG_DIR", config_dir.as_path());
         std::env::set_var("NEFOR_DATA_DIR", data_dir.as_path());
     }
 
