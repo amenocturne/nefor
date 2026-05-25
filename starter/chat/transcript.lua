@@ -1,122 +1,148 @@
--- Transcript state mutators. Mutate state.entries in place for
--- single-entry updates (the hot path during streaming). Only allocate
--- a new entries table when structurally appending a new entry.
-
-local common = require("chat.common")
+local Entry   = require("chat.entry")
+local log     = require("chat.log")
+local common  = require("chat.common")
 local shallow_merge = common.shallow_merge
 local NIL_SENTINEL  = common.NIL_SENTINEL
 
 local M = {}
 
+local function replace_entry(entries, idx, new_entry)
+  local new_list = {}
+  for i = 1, #entries do
+    new_list[i] = (i == idx) and new_entry or entries[i]
+  end
+  return new_list
+end
+
+local function append_entry(entries, entry)
+  local new_list = {}
+  for i = 1, #entries do new_list[i] = entries[i] end
+  new_list[#new_list + 1] = entry
+  return new_list
+end
+
 function M.push_entry(state, entry)
-  local entries = state.entries
-  entries[#entries + 1] = entry
-  return shallow_merge(state, { entries = entries })
+  local new_entries = append_entry(state.entries, entry)
+  log.log("transcript", "push role=%s kind=%s v=%d count=%d",
+    entry.role or "?", entry.kind or "?", entry.v or 0, #new_entries)
+  return shallow_merge(state, { entries = new_entries })
 end
 
 function M.append_assistant_delta(state, delta)
   if state.in_flight ~= nil and state.entries[state.in_flight] then
     local e = state.entries[state.in_flight]
-    e.text = (e.text or "") .. delta
-    e.streaming = true
-    e._height = nil
-    return shallow_merge(state, { pending = false })
+    local new_entry = Entry.append_text(e, delta)
+    local new_entries = replace_entry(state.entries, state.in_flight, new_entry)
+    log.log("transcript", "delta in_flight=%d len=%d new_v=%d",
+      state.in_flight, #delta, new_entry.v)
+    return shallow_merge(state, { entries = new_entries, pending = false })
   end
-  local entries = state.entries
-  entries[#entries + 1] = {
-    role = "assistant", text = delta, kind = "stream", streaming = true,
-  }
+  local new_entry = Entry.assistant_stream()
+  new_entry = Entry.append_text(new_entry, delta)
+  local new_entries = append_entry(state.entries, new_entry)
+  log.log("transcript", "delta new_stream v=%d count=%d",
+    new_entry.v, #new_entries)
   return shallow_merge(state, {
-    entries   = entries,
-    in_flight = #entries,
+    entries   = new_entries,
+    in_flight = #new_entries,
     pending   = false,
   })
 end
 
 function M.append_reasoning_delta(state, delta)
   local idx = state.in_flight
-  local entries = state.entries
   if idx == nil then
-    entries[#entries + 1] = {
-      role = "assistant", text = "", kind = "stream", streaming = true,
-      reasoning = { text = delta, streaming = true },
-    }
+    local new_entry = Entry.assistant_stream()
+    new_entry = Entry.append_reasoning(new_entry, delta)
+    local new_entries = append_entry(state.entries, new_entry)
+    log.log("transcript", "reasoning_delta new_stream v=%d count=%d",
+      new_entry.v, #new_entries)
     return shallow_merge(state, {
-      entries = entries, in_flight = #entries, pending = false,
+      entries = new_entries, in_flight = #new_entries, pending = false,
     })
   end
-  local cur = entries[idx]
-  local prev = cur.reasoning or { text = "", streaming = true }
-  prev.text = (prev.text or "") .. delta
-  prev.streaming = true
-  cur.reasoning = prev
-  cur.streaming = true
-  cur._height = nil
-  return shallow_merge(state, { pending = false })
+  local e = state.entries[idx]
+  local new_entry = Entry.append_reasoning(e, delta)
+  local new_entries = replace_entry(state.entries, idx, new_entry)
+  log.log("transcript", "reasoning_delta in_flight=%d new_v=%d",
+    idx, new_entry.v)
+  return shallow_merge(state, { entries = new_entries, pending = false })
 end
 
 function M.finalize_reasoning(state, duration_ms)
   if state.in_flight == nil then return state end
   local e = state.entries[state.in_flight]
   if not e then return state end
-  local prev = e.reasoning or { text = "", streaming = true }
-  prev.streaming = false
-  prev.duration_ms = duration_ms or prev.duration_ms
-  e.reasoning = prev
-  e._height = nil
-  return state
+  local new_entry = Entry.finalize_reasoning(e, duration_ms)
+  local new_entries = replace_entry(state.entries, state.in_flight, new_entry)
+  log.log("transcript", "finalize_reasoning in_flight=%d new_v=%d",
+    state.in_flight, new_entry.v)
+  return shallow_merge(state, { entries = new_entries })
 end
 
 function M.finalize_assistant(state, final_text, model, duration_ms)
   local now = tui.now_ms()
-  local turn_dur = duration_ms or (state.turn_started_at and (now - state.turn_started_at)) or nil
+  local turn_dur = duration_ms
+    or (state.turn_started_at and (now - state.turn_started_at))
+    or nil
+
   if state.in_flight == nil then
     if final_text and #final_text > 0 then
-      local entries = state.entries
-      entries[#entries + 1] = {
-        role        = "assistant",
-        text        = final_text,
-        kind        = "stream",
-        streaming   = false,
-        model       = model,
-        duration_ms = duration_ms,
-      }
+      local new_entry = Entry.assistant_stream()
+      new_entry = Entry.finalize(new_entry, {
+        text = final_text, model = model, duration_ms = duration_ms,
+      })
+      local new_entries = append_entry(state.entries, new_entry)
+      log.log("transcript", "finalize_assistant no_inflight new_v=%d count=%d",
+        new_entry.v, #new_entries)
       return shallow_merge(state, {
-        entries          = entries,
-        pending          = false,
-        turn_started_at  = NIL_SENTINEL,
+        entries              = new_entries,
+        pending              = false,
+        turn_started_at      = NIL_SENTINEL,
         last_turn_duration_ms = turn_dur,
       })
     end
     return shallow_merge(state, {
-      pending = false, turn_started_at = NIL_SENTINEL,
+      pending              = false,
+      turn_started_at      = NIL_SENTINEL,
       last_turn_duration_ms = turn_dur,
     })
   end
+
   local e = state.entries[state.in_flight]
   if e then
-    if final_text and #final_text > 0 then e.text = final_text end
-    e.model = model or e.model
-    e.duration_ms = duration_ms or e.duration_ms
-    e.streaming = false
-    e._height = nil
+    local opts = { model = model or e.model, duration_ms = duration_ms or e.duration_ms }
+    if final_text and #final_text > 0 then opts.text = final_text end
+    local new_entry = Entry.finalize(e, opts)
+    local new_entries = replace_entry(state.entries, state.in_flight, new_entry)
+    log.log("transcript", "finalize_assistant in_flight=%d new_v=%d",
+      state.in_flight, new_entry.v)
+    return shallow_merge(state, {
+      entries              = new_entries,
+      in_flight            = NIL_SENTINEL,
+      pending              = false,
+      turn_started_at      = NIL_SENTINEL,
+      last_turn_duration_ms = turn_dur,
+    })
   end
+
   return shallow_merge(state, {
-    in_flight        = NIL_SENTINEL,
-    pending          = false,
-    turn_started_at  = NIL_SENTINEL,
+    in_flight            = NIL_SENTINEL,
+    pending              = false,
+    turn_started_at      = NIL_SENTINEL,
     last_turn_duration_ms = turn_dur,
   })
 end
 
 function M.attach_tool_end(state, id, output, error_flag)
   for i = #state.entries, 1, -1 do
-    local v = state.entries[i]
-    if v.kind == "tool_call" and v.id == id then
-      v.output = output or ""
-      v.error = error_flag
-      v._height = nil
-      return state
+    local e = state.entries[i]
+    if e.kind == "tool_call" and e.id == id then
+      local new_entry = Entry.set_output(e, output or "", error_flag)
+      local new_entries = replace_entry(state.entries, i, new_entry)
+      log.log("transcript", "attach_tool_end id=%s idx=%d new_v=%d",
+        id or "?", i, new_entry.v)
+      return shallow_merge(state, { entries = new_entries })
     end
   end
   return state
