@@ -166,6 +166,21 @@ pub fn install_fs(lua: &Lua, nefor_tbl: &Table, data_dir: DataDir) -> mlua::Resu
         })?,
     )?;
 
+    fs_tbl.set(
+        "getcwd",
+        lua.create_function(|_, _: ()| match std::env::current_dir() {
+            Ok(p) => Ok(Some(p.to_string_lossy().into_owned())),
+            Err(_) => Ok(None),
+        })?,
+    )?;
+
+    fs_tbl.set(
+        "chdir",
+        lua.create_function(|lua, path: String| {
+            ok_or_err(lua, std::env::set_current_dir(&path))
+        })?,
+    )?;
+
     nefor_tbl.set("fs", fs_tbl)?;
     Ok(())
 }
@@ -412,6 +427,53 @@ mod tests {
             .eval()
             .unwrap();
         assert!(!has_dot);
+    }
+
+    #[test]
+    fn getcwd_returns_current_directory() {
+        let lua = setup();
+        let cwd: Option<String> = lua.load("return nefor.fs.getcwd()").eval().unwrap();
+        assert!(cwd.is_some());
+        let expected = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(cwd.unwrap(), expected);
+    }
+
+    #[test]
+    fn chdir_changes_directory_and_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = std::env::current_dir().unwrap();
+        let lua = setup();
+        lua.globals()
+            .set("test_path", tmp.path().to_str().unwrap())
+            .unwrap();
+        let ok: bool = lua
+            .load(r#"return nefor.fs.chdir(test_path).ok"#)
+            .eval()
+            .unwrap();
+        assert!(ok);
+        let after: String = lua
+            .load("return nefor.fs.getcwd()")
+            .eval::<Option<String>>()
+            .unwrap()
+            .unwrap();
+        let expected = tmp.path().canonicalize().unwrap();
+        let actual = PathBuf::from(&after).canonicalize().unwrap();
+        assert_eq!(actual, expected);
+        // Restore so other tests aren't affected.
+        std::env::set_current_dir(&original).unwrap();
+    }
+
+    #[test]
+    fn chdir_missing_path_returns_error() {
+        let lua = setup();
+        let ok: bool = lua
+            .load(r#"return nefor.fs.chdir("/nope/definitely/not/here").ok"#)
+            .eval()
+            .unwrap();
+        assert!(!ok);
     }
 
     #[test]

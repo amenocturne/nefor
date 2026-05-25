@@ -129,12 +129,14 @@ local function open_session_file(path, session_id)
   if not fh then return nil, tostring(err) end
 
   if not has_content then
-    local header_line = json.encode({
+    local header = {
       _session   = true,
       session_id = session_id,
       started_at = nefor.engine.now(),
-    })
-    fh:write(header_line)
+    }
+    local cwd = nefor.fs.getcwd()
+    if cwd then header.cwd = cwd end
+    fh:write(json.encode(header))
     fh:write("\n")
     fh:flush()
   end
@@ -218,6 +220,21 @@ end
 -- the whole file: one extra read of the JSONL with a substring check
 -- before per-line decode (decode is unavoidable to filter step-origin).
 ---@param path string
+---@return table|nil header
+local function read_session_header(path)
+  local fh = io.open(path, "r")
+  if not fh then return nil end
+  local first = fh:read("*l")
+  fh:close()
+  if not first or first == "" then return nil end
+  local ok, decoded = pcall(json.decode, first)
+  if ok and type(decoded) == "table" and decoded._session then
+    return decoded
+  end
+  return nil
+end
+
+---@param path string
 ---@return integer count
 local function count_replay_entries(path)
   local fh = io.open(path, "r")
@@ -300,6 +317,26 @@ local function do_resume(target_session_id)
     end
     state.current_session_file = fh
     state.should_prune_session = not had_content
+  end
+
+  -- 2b. Restore the session's working directory. chdir before replay
+  -- so any tool calls replayed into live plugins run in the original
+  -- cwd. Falls back silently when the path no longer exists — the
+  -- engine stays in whatever cwd it already has.
+  if new_path then
+    local header = read_session_header(new_path)
+    if header and type(header.cwd) == "string" and header.cwd ~= "" then
+      local result = nefor.fs.chdir(header.cwd)
+      if result.ok then
+        if nefor.log then
+          nefor.log.info("sessions.resume: chdir", { cwd = header.cwd })
+        end
+      elseif nefor.log then
+        nefor.log.warn("sessions.resume: chdir failed, staying in current dir", {
+          target = header.cwd, error = result.error,
+        })
+      end
+    end
   end
 
   -- 3. Announce start of incoming session BEFORE replay.

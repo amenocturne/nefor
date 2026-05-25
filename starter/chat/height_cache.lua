@@ -19,6 +19,9 @@ end
 
 function M.get(entry, render_fn)
   local v = entry.v
+  if v == nil then
+    return tui.measure(render_fn(entry), current_width)
+  end
   local cached = cache[v]
   if cached then
     log.log("cache", "hit v=%d h=%d", v, cached)

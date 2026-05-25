@@ -144,8 +144,13 @@ fn install_mocks(lua: &Lua, shared: std::sync::Arc<Shared>) -> mlua::Result<()> 
 ///     symlink `<staging>/<plugin>` -> `<plugin_lua>` and grafting
 ///     `<staging>/?/init.lua` + `<staging>/?.lua` onto package.path —
 ///     same shape pm.install lays out at runtime for dir overrides)
+fn starter_dir() -> PathBuf {
+    repo_root().join("starter")
+}
+
 fn set_package_path(lua: &Lua, plugin: &str) -> mlua::Result<()> {
     let lua_root = lua_dir().display().to_string();
+    let starter_root = starter_dir().display().to_string();
     let plugin_lua = plugin_lua_dir(plugin);
     let plugin_lua_str = plugin_lua.display().to_string();
 
@@ -172,6 +177,8 @@ fn set_package_path(lua: &Lua, plugin: &str) -> mlua::Result<()> {
           "{plugin_lua_str}/?/init.lua",
           "{staging_str}/?.lua",
           "{staging_str}/?/init.lua",
+          "{starter_root}/?.lua",
+          "{starter_root}/?/init.lua",
           "{lua_root}/?.lua",
           "{lua_root}/?/init.lua",
           package.path,

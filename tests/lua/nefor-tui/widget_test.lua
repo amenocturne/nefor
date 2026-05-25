@@ -45,6 +45,11 @@ function _G.tui.scroll_position(key)
   return { offset = 0, max = 100, key = key }
 end
 function _G.tui.now_ms() return 0 end
+function _G.tui.dimensions() return { width = 120, height = 40 } end
+function _G.tui.virtual_scroll_prepare(key, n, heights, gap) return nil end
+function _G.tui.virtual_scroll_invalidate(key) end
+function _G.tui.copy_to_clipboard(text) end
+function _G.tui.measure(node, width) return 1 end
 
 local function reset_scroll_calls() scroll_calls = {} end
 
@@ -386,7 +391,7 @@ local chat = require("nefor-tui.widget.chat")
 do
   local calls = 0
   local opts = {
-    entries = function() calls = calls + 1; return { { text = "a" } } end,
+    entries = function() calls = calls + 1; return { { text = "a", v = 1 } } end,
     render_entry = function(e) return tui.text { content = e.text } end,
   }
   chat.view(opts)
@@ -397,7 +402,7 @@ end
 do
   local received
   local opts = {
-    entries = function() return { { text = "x" }, { text = "y" } } end,
+    entries = function() return { { text = "x", v = 1 }, { text = "y", v = 2 } } end,
     context = { expanded = true },
     render_entry = function(e, i, ctx)
       if i == 2 then received = { e = e, i = i, ctx = ctx } end
