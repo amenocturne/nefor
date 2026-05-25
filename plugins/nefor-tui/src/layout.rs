@@ -201,8 +201,7 @@ fn paint_text(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
         } => (content.as_str(), style.unwrap_or_default(), *wrap),
         _ => return,
     };
-    let layout_w = inst.layout.size.width.max(1);
-    let rows = wrap_text(content, layout_w, wrap);
+    let rows = wrap_text(content, rect.width, wrap);
     let written_rows = rows.len().min(rect.height as usize);
     for (i, line) in rows.into_iter().enumerate() {
         if i as u16 >= rect.height {
@@ -313,18 +312,12 @@ fn layout_markdown(inst: &mut WidgetInstance, c: Constraints) -> Size {
 }
 
 fn paint_markdown(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer) {
-    // Use the width from the layout pass so table column widths and
-    // word wrapping match exactly what was measured. rect.width can
-    // differ from the layout constraint (e.g. scrollable two-pass
-    // layout), and tables are sensitive to even 1-column differences
-    // because column shrinking is proportional.
-    let layout_w = inst.layout.size.width.max(1);
-    let chars = render_markdown_chars(inst, layout_w);
+    let chars = render_markdown_chars(inst, rect.width);
     let wrap = match &inst.last_desc {
         WidgetDescription::Markdown { wrap, .. } => *wrap,
         _ => WrapMode::Word,
     };
-    let rows = wrap_styled(&chars, layout_w, wrap);
+    let rows = wrap_styled(&chars, rect.width, wrap);
     paint_styled_rows(&rows, rect, out);
 }
 
