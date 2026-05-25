@@ -3,7 +3,7 @@ default:
 
 # Launch the nefor TUI against the in-repo starter and plugins (debug build).
 run:
-    RUST_LOG=debug NEFOR_CONFIG_DIR={{justfile_directory()}}/starter NEFOR_PLUGIN_DIR={{justfile_directory()}}/target/debug cargo run --bin nefor
+    RUST_LOG=debug NEFOR_DEV_DIR={{justfile_directory()}} NEFOR_CONFIG_DIR={{justfile_directory()}}/starter NEFOR_PLUGIN_DIR={{justfile_directory()}}/target/debug cargo run --bin nefor
 
 # Fetch all workspace dependencies without compiling — warms the cache.
 setup:
