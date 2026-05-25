@@ -127,6 +127,7 @@ local function handle_input_submit(msg, state)
       last_esc_ms = NIL_SENTINEL,
       history_cursor = NIL_SENTINEL,
       popup = NIL_SENTINEL,
+      queued_entry_idx = NIL_SENTINEL,
     })
     return cleared, {
       { kind = "send_to", target = "engine",
@@ -260,6 +261,7 @@ local function handle_input_submit(msg, state)
         pending = false, dag_runs = {}, firing_to_node = {},
         turn_started_at = NIL_SENTINEL,
         last_turn_duration_ms = NIL_SENTINEL,
+        queued_entry_idx = NIL_SENTINEL,
       }), {
         sessions.emit_resume_request(id),
       }
@@ -283,13 +285,45 @@ local function handle_input_submit(msg, state)
   end
   -- Plain text submit.
   local wire_text = at_path.expand(text)
-  local with_user = transcript.push_entry(state, Entry.user(wire_text))
   local hist = { text }
   for i, v in ipairs(state.prompt_history or {}) do
     if i >= history.INPUT_HISTORY_MAX then break end
     hist[#hist + 1] = v
   end
   history.persist(hist)
+
+  -- When a turn is already in flight, coalesce into a single queued
+  -- entry instead of pushing a new user bubble per message.
+  if state.pending or state.in_flight ~= nil then
+    local next_state
+    if state.queued_entry_idx then
+      local old = state.entries[state.queued_entry_idx]
+      local combined = Entry.set_text(old, old.text .. "\n" .. wire_text)
+      local new_entries = {}
+      for ei = 1, #state.entries do
+        new_entries[ei] = (ei == state.queued_entry_idx) and combined or state.entries[ei]
+      end
+      next_state = shallow_merge(state, {
+        entries = new_entries,
+        input_value = "", completion = NIL_SENTINEL,
+        prompt_history = hist, history_cursor = NIL_SENTINEL,
+      })
+    else
+      local with_user = transcript.push_entry(state, Entry.user(wire_text))
+      next_state = shallow_merge(with_user, {
+        input_value = "", completion = NIL_SENTINEL,
+        prompt_history = hist, history_cursor = NIL_SENTINEL,
+        queued_entry_idx = #with_user.entries,
+      })
+    end
+    tui.scroll_into_view("transcript")
+    return next_state, {
+      { kind = "send_to", target = "engine",
+        body = { kind = "chat.input.submit", text = wire_text } },
+    }
+  end
+
+  local with_user = transcript.push_entry(state, Entry.user(wire_text))
   local cleared = shallow_merge(with_user, {
     input_value = "", pending = true,
     turn_started_at = tui.now_ms(), completion = NIL_SENTINEL,
@@ -481,7 +515,15 @@ local function handle_stream_delta(msg, state)
 end
 
 local function handle_stream_end(msg, state)
-  return transcript.finalize_assistant(state, msg.text, msg.model, msg.duration_ms), {}
+  local next_state = transcript.finalize_assistant(state, msg.text, msg.model, msg.duration_ms)
+  if state.queued_entry_idx then
+    local qe = next_state.entries[state.queued_entry_idx]
+    next_state = shallow_merge(next_state, {
+      queued_entry_idx = NIL_SENTINEL,
+      pending_user_echo = qe and qe.text or NIL_SENTINEL,
+    })
+  end
+  return next_state, {}
 end
 
 local function handle_reasoning_delta(msg, state)
@@ -972,6 +1014,7 @@ local function route_keys_and_popups(msg, state)
           pending = false, dag_runs = {}, firing_to_node = {},
           turn_started_at = NIL_SENTINEL,
           last_turn_duration_ms = NIL_SENTINEL,
+          queued_entry_idx = NIL_SENTINEL,
         }), {
           sessions.emit_resume_request(result.selected.id),
         }

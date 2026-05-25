@@ -297,6 +297,7 @@ local C = M.C
 
 M.STYLE = {
   user_chrome     = { fg = C.user, bold = true },
+  user_chrome_queued = { fg = C.status_dim, bold = false },
   -- Input-field border. Same blue as user blocks so the input reads as
   -- a peer to user message blocks rather than a separate widget kind.
   input_border          = { fg = C.user, bold = true },

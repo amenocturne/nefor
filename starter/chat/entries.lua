@@ -20,10 +20,11 @@ local M = {}
 
 -- User entry: full-width bordered block in user blue. Body stays in
 -- default fg.
-local function render_user_entry(entry)
+local function render_user_entry(entry, queued)
+  local chrome = queued and STYLE.user_chrome_queued or STYLE.user_chrome
   return bordered_box(
     tui.text { content = entry.text or "", wrap = "word" },
-    STYLE.user_chrome
+    chrome
   )
 end
 
@@ -378,7 +379,7 @@ local function agents_md_expanded(entry)
   return tui.column { gap = 0, children = rows }
 end
 
-function M.render(entry, _i, expanded)
+function M.render(entry, _i, expanded, queued)
   if entry.kind == "tool_call" then
     if expanded then return tool_expanded(entry) end
     return tool_collapsed(entry)
@@ -398,7 +399,7 @@ function M.render(entry, _i, expanded)
     return render_assistant_entry(entry, expanded)
   end
   if entry.role == "user" then
-    return render_user_entry(entry)
+    return render_user_entry(entry, queued)
   end
   if entry.role == "system" then
     return tui.text {

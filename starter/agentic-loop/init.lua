@@ -200,12 +200,18 @@ end
 local function flush_pending_user_inputs()
   if state.current_run_id ~= nil then return end
   if #state.pending_user_inputs == 0 then return end
-  local text = table.remove(state.pending_user_inputs, 1)
-  nefor.log.info("agentic-loop: flushing queued user input", {
-    text_preview = string.sub(text, 1, 80),
-    queue_remaining = #state.pending_user_inputs,
+  local combined = table.concat(state.pending_user_inputs, "\n")
+  nefor.log.info("agentic-loop: flushing queued user inputs", {
+    count = #state.pending_user_inputs,
+    text_preview = string.sub(combined, 1, 80),
   })
-  submit_orchestrator_run(text)
+  state.pending_user_inputs = {}
+  emit("nefor-tui", {
+    kind = "chat.message.append",
+    role = "user",
+    text = combined,
+  })
+  submit_orchestrator_run(combined)
 end
 
 -- Cancel everything. Fan-out order:
@@ -416,6 +422,11 @@ local function handle_chat_input_submit(body)
     user_queued = #state.pending_user_inputs,
   })
 
+  if state.current_run_id ~= nil then
+    state.pending_user_inputs[#state.pending_user_inputs + 1] = text
+    return
+  end
+
   -- Echo the user message to the TUI as a transcript-bound event so
   -- replay can repaint user turns (chat.lua dedupes against the local
   -- push, so live view sees the user line exactly once).
@@ -424,18 +435,6 @@ local function handle_chat_input_submit(body)
     role = "user",
     text = text,
   })
-
-  if state.current_run_id ~= nil then
-    state.pending_user_inputs[#state.pending_user_inputs + 1] = text
-    emit("nefor-tui", {
-      kind = "chat.message.append",
-      role = "system",
-      text = string.format(
-        "[queued — will dispatch when current turn finishes (%d in queue)]",
-        #state.pending_user_inputs),
-    })
-    return
-  end
 
   submit_orchestrator_run(text)
 end
