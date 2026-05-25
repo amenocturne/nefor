@@ -1616,6 +1616,7 @@ fn layout_scrollable(inst: &mut WidgetInstance, c: Constraints) -> Size {
         s.content_height = effective_content_height;
         s.measured_content_height = final_size.height;
         s.viewport_height = viewport_h;
+        s.inner_width = inner_w;
     }
 
     c.constrain(Size {

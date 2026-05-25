@@ -63,6 +63,10 @@ pub struct ScrollableState {
     /// to detect first-paint so `stick_to = "end"` lands at the bottom on
     /// initial mount even before the user scrolls.
     pub seeded: bool,
+    /// Inner content width from the most recent layout pass (post-scrollbar
+    /// gutter subtraction). Exposed to Lua via `tui.scrollable_inner_width`
+    /// so height measurement uses the exact same width as real layout.
+    pub inner_width: u16,
 }
 
 impl ScrollableState {
