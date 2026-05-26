@@ -292,7 +292,7 @@ fn search(args: ParsedArgs) -> Result<String, ToolError> {
                 Ok(e) => e,
                 Err(_) => continue,
             };
-            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 continue;
             }
             let path_str = entry.path().to_string_lossy();

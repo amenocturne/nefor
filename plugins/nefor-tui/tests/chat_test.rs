@@ -25,10 +25,17 @@ use serde_json::{json, Map as JsonMap, Value as JsonValue};
 /// pollute (and read pre-existing entries from) the user's real
 /// shell-style history file.
 ///
+/// **Shared-state caveat**: this dir is shared across all parallel
+/// tests. Tests that submit text write to the input-history file here,
+/// so any test that depends on empty prompt_history (e.g. arrow-up
+/// routing to scroll instead of history-recall) MUST use `ResumeEnv`
+/// to get its own isolated tempdir.
+///
 /// Per-test ResumeEnv overrides this default for tests that need a
 /// per-test isolated data dir (e.g. session-picker, input-history
-/// regression tests); they restore back to whatever was set before
-/// (which is this process-wide tempdir) on Drop.
+/// regression tests, scroll tests that press arrow-up); they restore
+/// back to whatever was set before (which is this process-wide tempdir)
+/// on Drop.
 static TEST_DATA_HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
 
 fn ensure_test_data_home() {
@@ -4158,6 +4165,10 @@ fn popup_paints_opaque_background_over_transcript() {
 /// for the streaming response that lands after.
 #[test]
 fn submit_re_pins_transcript_to_bottom_after_user_scrolled_up() {
+    // ResumeEnv isolates input-history so parallel tests that submit
+    // text don't populate prompt_history and route arrow-up to
+    // history-recall instead of scroll.
+    let _env = ResumeEnv::new();
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -4260,6 +4271,10 @@ fn submit_re_pins_transcript_to_bottom_after_user_scrolled_up() {
 /// chosen offset until they explicitly press End / Ctrl+End to re-pin.
 #[test]
 fn streaming_deltas_do_not_yank_user_back_to_bottom_when_scrolled_up() {
+    // ResumeEnv isolates input-history so parallel tests that submit
+    // text don't populate prompt_history and route arrow-up to
+    // history-recall instead of scroll.
+    let _env = ResumeEnv::new();
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
