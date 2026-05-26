@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -eu
 
-echo "pre-commit: running cargo test --workspace (excluding e2e)..."
-cargo test --workspace --locked -- --skip agentic_cli_mock_e2e --skip stage1_e2e 2>&1
+echo "pre-commit: running cargo test --workspace..."
+cargo test --workspace --locked 2>&1
 echo "pre-commit: tests passed."

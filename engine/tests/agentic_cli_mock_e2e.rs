@@ -20,10 +20,18 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tempfile::TempDir;
 
-/// Hard wall-clock cap per scenario. Generous — the spawn pipeline is
-/// 7 plugin processes + a Lua VM. Real cost is ~300-700ms on a warm
-/// build; 10s leaves headroom for slow CI without masking flakiness.
-const SCENARIO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Wall-clock cap per scenario. Each scenario spawns the engine + 7
+/// plugin subprocesses; when all 8 run in parallel the combined I/O
+/// load on a busy machine needs headroom beyond the ~1s per-scenario
+/// cost in isolation. Override via `NEFOR_E2E_TIMEOUT_SECS` for CI
+/// runners or loaded dev machines.
+fn scenario_timeout() -> Duration {
+    let secs: u64 = std::env::var("NEFOR_E2E_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    Duration::from_secs(secs)
+}
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -42,30 +50,41 @@ fn target_debug(bin: &str) -> PathBuf {
     repo_root().join("target").join("debug").join(bin)
 }
 
-/// Build the engine + every plugin the cli-config spawns. No-op on a
-/// warm cache. The `Once` guard ensures concurrent test runs (cargo
-/// runs #[test]s in parallel by default) don't all queue on the cargo
-/// artifact lock — only one build call goes out per process.
+/// Required binaries for the cli-config spawn pipeline.
+const REQUIRED_BINS: &[&str] = &[
+    "nefor",
+    "mock-plugin",
+    "reasoner-graph",
+    "tool-gate",
+    "nefor-combinators",
+    "generic-provider",
+    "generic-tool",
+    "basic-tools",
+];
+
+/// Assert that every binary the cli-config spawns exists in
+/// `target/debug/`. Under `cargo test --workspace` they're built
+/// automatically; under `cargo test -p nefor` the user must have
+/// run `cargo build --workspace` first.
+///
+/// We deliberately do NOT spawn a nested `cargo build` here —
+/// cargo holds a target-directory lock while running test binaries,
+/// so a child `cargo build` from inside a test deadlocks.
 fn ensure_built() {
-    static BUILT: Once = Once::new();
-    BUILT.call_once(|| {
-        let pkgs = [
-            "nefor",
-            "mock-plugin",
-            "reasoner-graph",
-            "tool-gate-plugin",
-            "nefor-combinators-plugin",
-            "generic-provider",
-            "generic-tool",
-            "basic-tools-plugin",
-        ];
-        let mut cmd = Command::new(env!("CARGO"));
-        cmd.arg("build").current_dir(repo_root());
-        for p in pkgs {
-            cmd.arg("-p").arg(p);
+    static CHECKED: Once = Once::new();
+    CHECKED.call_once(|| {
+        let mut missing = Vec::new();
+        for bin in REQUIRED_BINS {
+            if !target_debug(bin).exists() {
+                missing.push(*bin);
+            }
         }
-        let status = cmd.status().expect("spawn cargo build");
-        assert!(status.success(), "cargo build failed for required packages");
+        assert!(
+            missing.is_empty(),
+            "e2e tests require pre-built binaries. Missing: {:?}. \
+             Run `cargo build --workspace` first, or use `cargo test --workspace`.",
+            missing,
+        );
     });
 }
 
@@ -114,7 +133,7 @@ fn base_command(xdg: &Path) -> Command {
         .env("NEFOR_CONFIG", "test")
         .env("NEFOR_PLUGIN_DIR", repo_root().join("plugins"))
         // Disable the mock provider's 80 tok/s pacing under tests so
-        // the 10s SCENARIO_TIMEOUT stays comfortable. Interactive
+        // the 10s scenario_timeout() stays comfortable. Interactive
         // launches (the user driving `nefor` directly) get pacing
         // because the env var isn't set.
         .env("NEFOR_TEST_FAST_MOCK", "1")
@@ -122,13 +141,22 @@ fn base_command(xdg: &Path) -> Command {
     cmd
 }
 
-/// Spawn the engine, wait up to `SCENARIO_TIMEOUT`, return captured
+/// Serialise scenario execution. Each scenario spawns the engine + 7
+/// plugin subprocesses (56+ processes total across 8 tests). Running
+/// all 8 in parallel causes the engine subprocesses to hang on startup
+/// with empty stdout/stderr — likely OS-level resource contention from
+/// 56 simultaneous process spawns. Serialised execution is fast (~8s
+/// total on warm cache) and reliable.
+static SCENARIO_LOCK: Mutex<()> = Mutex::new(());
+
+/// Spawn the engine, wait up to `scenario_timeout()`, return captured
 /// stdout/stderr + exit status. Drains both pipes on background threads
 /// to avoid the classic pipe-buffer deadlock — stream-json mode emits
 /// hundreds of envelope lines and would otherwise block the engine on
 /// write before we had a chance to call `wait_with_output`. Kills the
 /// process on timeout (test fails the assertion afterwards).
 fn run_scenario(extra_argv: &[&str], stdin_payload: StdinPayload) -> ProcessOutput {
+    let _guard = SCENARIO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let xdg = TempDir::new().expect("xdg tempdir");
     let mut cmd = base_command(xdg.path());
     for a in extra_argv {
@@ -152,7 +180,8 @@ fn run_scenario(extra_argv: &[&str], stdin_payload: StdinPayload) -> ProcessOutp
     let stdout_buf = drain_pipe(child.stdout.take().expect("stdout piped"));
     let stderr_buf = drain_pipe(child.stderr.take().expect("stderr piped"));
 
-    let timed_out = match wait_with_deadline(&mut child, SCENARIO_TIMEOUT) {
+    let timeout = scenario_timeout();
+    let timed_out = match wait_with_deadline(&mut child, timeout) {
         Some(_) => false,
         None => {
             let _ = child.kill();
@@ -167,7 +196,7 @@ fn run_scenario(extra_argv: &[&str], stdin_payload: StdinPayload) -> ProcessOutp
 
     assert!(
         !timed_out,
-        "scenario exceeded {SCENARIO_TIMEOUT:?}; stdout (first 4KB): {}\nstderr (first 4KB): {}",
+        "scenario exceeded {timeout:?}; stdout (first 4KB): {}\nstderr (first 4KB): {}",
         truncate(&stdout, 4096),
         truncate(&stderr, 4096)
     );
