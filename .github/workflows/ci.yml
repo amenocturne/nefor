@@ -26,7 +26,10 @@ jobs:
         run: cargo build --workspace --locked
 
       - name: cargo test
-        run: cargo test --workspace --locked
+        run: |
+          cargo test --workspace --exclude nefor-tui --locked
+          cargo test -p nefor-tui --lib --locked
+          cargo test -p nefor-tui --test chat_test --locked -- --test-threads=1
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings

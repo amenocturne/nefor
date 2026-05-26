@@ -9,9 +9,13 @@ run:
 setup:
     cargo fetch
 
-# Run the full workspace test suite.
+# Run the full workspace test suite. chat_test runs single-threaded
+# because tests share process-global env vars (NEFOR_DATA_DIR) —
+# parallel execution causes getenv/setenv races across threads.
 test:
-    cargo test --workspace
+    cargo test --workspace --exclude nefor-tui
+    cargo test -p nefor-tui --lib
+    cargo test -p nefor-tui --test chat_test -- --test-threads=1
 
 # Clippy across the workspace with warnings promoted to errors — matches CI.
 lint:

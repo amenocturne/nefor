@@ -5,6 +5,6 @@ echo "pre-push: running clippy..."
 cargo clippy --workspace --all-targets -- -D warnings
 
 echo "pre-push: running tests..."
-cargo test --workspace --locked
+just test
 
 echo "pre-push: all checks passed."
