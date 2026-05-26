@@ -113,6 +113,13 @@ const RETRY_BASE_DELAY_MS: u64 = 1_000;
 const RETRY_MAX_DELAY_MS: u64 = 30_000;
 const RETRY_JITTER_MS: i64 = 500;
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Time-to-first-byte cap per attempt. The SSE stream is unbounded once
+/// headers arrive — this only covers the window from "request sent" to
+/// "response headers received". A 16-minute hang (observed in production
+/// via a proxy/VPN layer) is the failure mode this prevents.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// HTTP client for the Responses endpoint.
 ///
 /// One instance is reused across requests — `reqwest::Client` is
@@ -128,8 +135,12 @@ pub struct ResponsesClient {
 
 impl ResponsesClient {
     pub fn new(base_url: String, installation_id: String, originator: String) -> Self {
+        let http = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            http: reqwest::Client::new(),
+            http,
             base_url,
             installation_id,
             originator,
@@ -209,7 +220,7 @@ impl ResponsesClient {
         let mut attempt: u32 = 0;
         loop {
             let headers = headers::build_headers(auth, &self.installation_id, &self.originator)?;
-            let builder = self.http.post(url).headers(headers);
+            let builder = self.http.post(url).headers(headers).timeout(REQUEST_TIMEOUT);
             let send_result = build_body(builder).send().await;
 
             match send_result {
@@ -291,7 +302,7 @@ impl ResponsesClient {
         let mut attempt: u32 = 0;
         let response = loop {
             let headers = headers::build_headers(auth, &self.installation_id, &self.originator)?;
-            let send_result = self.http.get(&url).headers(headers).send().await;
+            let send_result = self.http.get(&url).headers(headers).timeout(REQUEST_TIMEOUT).send().await;
             match send_result {
                 Ok(resp) if resp.status().is_success() => break resp,
                 Ok(resp) => {

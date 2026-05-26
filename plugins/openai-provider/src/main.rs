@@ -111,6 +111,7 @@ async fn main() {
 async fn run() -> Result<(), LlmError> {
     let config = Config::from_args();
     let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
         .build()
         .expect("reqwest client build");
 

@@ -12,6 +12,7 @@
 //! sees a clean list of finished tool calls in `StreamOutcome`.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -150,7 +151,7 @@ where
         );
     }
 
-    let mut builder = client.post(endpoint).json(&req);
+    let mut builder = client.post(endpoint).json(&req).timeout(Duration::from_secs(120));
     if let Some(k) = api_key {
         builder = apply_auth(builder, auth_header, k);
     }
@@ -286,7 +287,7 @@ pub async fn list_models(
     auth_header: &str,
 ) -> Result<Vec<ModelInfo>, StreamError> {
     let endpoint = format!("{}/v1/models", base_url.trim_end_matches('/'));
-    let mut builder = client.get(&endpoint);
+    let mut builder = client.get(&endpoint).timeout(Duration::from_secs(30));
     if let Some(k) = api_key {
         builder = apply_auth(builder, auth_header, k);
     }
