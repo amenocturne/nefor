@@ -103,6 +103,14 @@ _Could this be a self-contained composable unit with standard inputs/outputs, li
 - Cross-plugin knowledge disqualifies. A plugin that names another plugin's wire kind in code isn't a bash tool, it's glue. Glue goes in Lua.
 - Type registries / interface hubs (`generic-provider`, `generic-tool`) fail the test by definition — they exist to be consumed, not to do work. Lua libs.
 
+## Versioning
+
+Workspace version is `0.x.y` in `Cargo.toml`. Users pin Lua libs to the engine's version tag via `nefor-pm`; breaking the API means their install breaks on next fetch.
+
+- **Breaking changes bump `x`** (the minor in `0.x.y`): NCP wire protocol changes, Lua binding removals/renames, pm spec shape changes, starter module interface changes that external configs depend on.
+- **Non-breaking additions bump `y`**: new bindings, new pm features, new starter modules, bug fixes.
+- Tag format: `v0.x.y`. The release workflow and `nefor-pm` both key on this.
+
 ## Git
 
 - **Rebase, not merge.** Always rebase feature branches onto main before fast-forwarding. No merge commits in the history.
