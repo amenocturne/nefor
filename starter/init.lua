@@ -307,7 +307,8 @@ if cfg.provider.kind == "mock" then
     {
       bin("mock-plugin"),
       "--script", STARTER_UPSTREAM .. "/" .. cfg.provider.mock_script,
-    }
+    },
+    { agentic_loop = agentic_loop }
   ))
 
 elseif cfg.provider.kind == "ollama" then
@@ -322,7 +323,7 @@ elseif cfg.provider.kind == "ollama" then
       "--base-url", cfg.provider.base_url,
       "--model",    cfg.provider.model,
     },
-    { static_token = "ollama-local" }
+    { static_token = "ollama-local", agentic_loop = agentic_loop }
   ))
 
 elseif cfg.provider.kind == "nestor" then
@@ -331,11 +332,7 @@ elseif cfg.provider.kind == "nestor" then
   -- the chat.model.list_requested drop into the lib's translation
   -- pipeline via opts.hooks.
   local nestor_opts = {
-    -- openai-provider already has the JWT via --api-key, so
-    -- static_token is redundant on the wire — but
-    -- maybe_inject_static_token emits an auth.set on first ready,
-    -- which keeps the upstream wiring's auth-status signaling
-    -- consistent.
+    agentic_loop                 = agentic_loop,
     static_token                 = jwt,
     enable_think_tag_filter      = true,
     intercept_model_list_request = true,
@@ -434,7 +431,7 @@ actor.spawn(require("read-only-tools"))
 actor.spawn(require("tool-validator"))
 
 local tools = require("compositors.tools")
-actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
+actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv, { agentic_loop = agentic_loop }))
 
 actor.spawn(tools.basic_actor_spec())
 
