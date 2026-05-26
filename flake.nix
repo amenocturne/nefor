@@ -35,6 +35,10 @@
         )
       );
 
+      pluginsWithLua = builtins.filter (
+        name: builtins.pathExists (./plugins + "/${name}/lua")
+      ) pluginNames;
+
       mkNefor =
         system:
         let
@@ -112,10 +116,28 @@
               };
             }
           );
+          nefor-engine = pkgs.runCommandLocal "nefor-engine" { } ''
+            mkdir -p $out/lua $out/plugins
+            cp -r ${./lua/core}     $out/lua/core
+            cp -r ${./lua/libs}     $out/lua/libs
+            cp -r ${./lua/nefor-pm} $out/lua/nefor-pm
+            ${builtins.concatStringsSep "\n" (
+              map (name: ''
+                mkdir -p $out/plugins/${name}
+                cp -r ${./plugins + "/${name}/lua"} $out/plugins/${name}/lua
+              '') pluginsWithLua
+            )}
+          '';
+
+          nefor-starter = pkgs.runCommandLocal "nefor-starter" { } ''
+            cp -r ${./starter} $out
+          '';
         in
         {
           inherit
             nefor
+            nefor-engine
+            nefor-starter
             craneLib
             darwinDeps
             linuxDeps
@@ -132,8 +154,12 @@
         {
           default = n.nefor;
           nefor = n.nefor;
+          nefor-engine = n.nefor-engine;
+          nefor-starter = n.nefor-starter;
         }
       );
+
+      homeManagerModules.default = import ./hm-module.nix { inherit self; };
 
       devShells = forEachSystem (
         system:
