@@ -31,12 +31,20 @@
 -- plugins` in the cone; on subsequent boots, re-apply the cone
 -- (idempotent) in case a previous run used a narrower one.
 --
--- UPSTREAM_REF pins BOTH the bootstrap clone AND the pm.install specs
--- below, so bumping it is a single-source change. Must be a ref that
--- exists on origin (tag or branch) and contains the modern lua/
--- reorg — anything that predates the reorg (v0.1.3 and earlier) will
--- clone successfully but leave `lua/nefor-pm/` missing.
-local UPSTREAM_REF  = "main"
+-- UPSTREAM_REF derived from the engine's version. Exact release tags
+-- (e.g. 0.1.9 → v0.1.9) pin Lua libs to the matching binary version;
+-- nightly/dev builds fall back to "main". Must be a ref that exists on
+-- origin and contains the modern lua/ reorg (v0.1.3 and earlier will
+-- clone successfully but leave `lua/nefor-pm/` missing).
+local UPSTREAM_REF
+do
+  local v = nefor and nefor.version
+  if type(v) == "string" and v:match("^%d+%.%d+%.%d+$") then
+    UPSTREAM_REF = "v" .. v
+  else
+    UPSTREAM_REF = "main"
+  end
+end
 local STARTER_ROOT  = NEFOR_CONFIG_DIR or "."
 local NEFOR_DEV_DIR = os.getenv("NEFOR_DEV_DIR")
 local SPARSE_CONE   = "lua starter plugins"
@@ -122,42 +130,42 @@ end
 pm.install({
   { "amenocturne/nefor",
     name = "core",
-    branch = UPSTREAM_REF,
+    tag  = UPSTREAM_REF,
     path = "lua/core/",
     dir  = dev("lua/core"),
   },
 
   { "amenocturne/nefor",
     name = "libs",
-    branch = UPSTREAM_REF,
+    tag  = UPSTREAM_REF,
     path = "lua/libs/",
     dir  = dev("lua/libs"),
   },
 
   { "amenocturne/nefor",
     name = "openai-provider",
-    branch = UPSTREAM_REF,
+    tag  = UPSTREAM_REF,
     path = "plugins/openai-provider/lua/openai-provider/",
     dir  = dev("plugins/openai-provider/lua/openai-provider"),
   },
 
   { "amenocturne/nefor",
     name = "tool-gate",
-    branch = UPSTREAM_REF,
+    tag  = UPSTREAM_REF,
     path = "plugins/tool-gate/lua/tool-gate/",
     dir  = dev("plugins/tool-gate/lua/tool-gate"),
   },
 
   { "amenocturne/nefor",
     name = "nefor-tui",
-    branch = UPSTREAM_REF,
+    tag  = UPSTREAM_REF,
     path = "plugins/nefor-tui/lua/",
     dir  = dev("plugins/nefor-tui/lua"),
   },
 
   { "amenocturne/nefor",
     name = "reasoner-graph",
-    branch = UPSTREAM_REF,
+    tag  = UPSTREAM_REF,
     path = "plugins/reasoner-graph/lua/reasoner-graph/",
     dir  = dev("plugins/reasoner-graph/lua/reasoner-graph"),
   },
