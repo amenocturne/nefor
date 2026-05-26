@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -eu
+
+echo "pre-push: running clippy..."
+cargo clippy --workspace --all-targets -- -D warnings
+
+echo "pre-push: running tests..."
+cargo test --workspace --locked
+
+echo "pre-push: all checks passed."

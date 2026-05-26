@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -eu
 
-echo "pre-commit: running cargo test --workspace..."
-cargo test --workspace --locked 2>&1
-echo "pre-commit: tests passed."
+echo "pre-commit: checking formatting..."
+cargo fmt --all -- --check
