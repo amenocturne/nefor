@@ -475,6 +475,7 @@ fn install_nefor_surface(
     data_dir: crate::paths::DataDir,
 ) -> mlua::Result<()> {
     let nefor = lua.create_table()?;
+    nefor.set("version", env!("NEFOR_VERSION"))?;
     bindings::install_engine(lua, &nefor, engine_ops)?;
     bindings::install_events(lua, &nefor, Arc::clone(&bus))?;
     bindings::install_fs(lua, &nefor, data_dir)?;

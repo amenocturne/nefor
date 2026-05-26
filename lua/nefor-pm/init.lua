@@ -10,12 +10,14 @@
 --                            installed plugins' dirs are searched.
 --   pm.bin(name[, binname])  resolve <plugin_dir>/bin/<binname> (default: name).
 --   pm.require(name)         alias of pm.load — never triggers install.
+--   pm.engine_ref()          returns (ref, ref_kind) derived from nefor.version:
+--                            exact semver → ("vX.Y.Z", "tag"); otherwise ("main", "branch").
 --
 -- Spec shape (see design note):
 --   {
 --     "owner/repo",                     -- [1] shorthand → https://github.com/owner/repo
 --     name   = "string",                -- required, non-empty.
---     tag    = "v0.1.5",                -- optional. default "main".
+--     tag    = "v0.1.5",                -- optional. default: engine version tag (or "main" for dev).
 --     branch = "main",                  -- optional. mutually exclusive with tag/commit.
 --     commit = "<sha>",                 -- optional. mutually exclusive with tag/branch.
 --     url    = "...",                   -- optional. mutually exclusive with [1].
@@ -43,6 +45,19 @@ local function is_function(v) return type(v) == "function" end
 
 local function fail(label, msg)
   error(string.format("nefor-pm[%s]: %s", label, msg), 0)
+end
+
+-- Derive a git ref from the engine's version string.
+-- Exact semver (e.g. "0.1.9") → tag "v0.1.9".
+-- Anything with a suffix (nightly "0.1.9-12-gabcdef", dirty, etc.) → branch "main".
+-- Returns ref, ref_kind.
+local function engine_ref()
+  local v = nefor and nefor.version
+  if type(v) ~= "string" or v == "" then return "main", "branch" end
+  if v:match("^%d+%.%d+%.%d+$") then
+    return "v" .. v, "tag"
+  end
+  return "main", "branch"
 end
 
 -- Path join — trims trailing slash on a, leading on b.
@@ -133,7 +148,8 @@ end
 
 -- Returns a normalized spec table:
 --   { name, url?, tag?, branch?, commit?, path?, dir?, build?, ref, ref_kind }
--- ref/ref_kind = the resolved ref to check out. Defaults to {branch="main"}.
+-- ref/ref_kind = the resolved ref to check out.
+-- Defaults to the engine's version tag for exact releases, "main" branch otherwise.
 local function parse_spec(spec, index)
   if not is_table(spec) then
     error(string.format("nefor-pm: spec #%d must be a table, got %s",
@@ -166,7 +182,7 @@ local function parse_spec(spec, index)
   if ref_count > 1 then
     fail(label, "at most one of `tag`, `branch`, `commit` may be set")
   end
-  if ref_count == 0 then ref = "main"; ref_kind = "branch" end
+  if ref_count == 0 then ref, ref_kind = engine_ref() end
 
   if spec.build ~= nil and not is_function(spec.build) then
     fail(label, "`build` must be a function, got " .. type(spec.build))
@@ -581,8 +597,11 @@ function M.bin(name, binary_name)
   return path
 end
 
+function M.engine_ref() return engine_ref() end
+
 M._internals = {
   parse_spec      = parse_spec,
+  engine_ref      = engine_ref,
   data_root       = data_root,
   plugins_root    = plugins_root,
   lockfile_path   = lockfile_path,

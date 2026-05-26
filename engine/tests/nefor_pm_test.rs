@@ -155,6 +155,85 @@ fn parse_spec_defaults_to_main_branch() {
 }
 
 #[test]
+fn parse_spec_defaults_to_version_tag_when_set() {
+    let lua = lua_with_pm();
+    lua.load(r#"nefor.version = "0.1.9""#)
+        .exec()
+        .expect("set version");
+    let (ref_val, kind): (String, String) = lua
+        .load(
+            r#"
+            local pm = require("nefor-pm")
+            local s = pm._internals.parse_spec({
+              "owner/repo", name = "x",
+            }, 1)
+            return s.ref, s.ref_kind
+            "#,
+        )
+        .eval()
+        .expect("eval");
+    assert_eq!(ref_val, "v0.1.9", "exact semver → tag ref");
+    assert_eq!(kind, "tag", "exact semver → tag kind");
+}
+
+#[test]
+fn parse_spec_defaults_to_main_for_nightly_version() {
+    let lua = lua_with_pm();
+    lua.load(r#"nefor.version = "0.1.9-12-gabcdef""#)
+        .exec()
+        .expect("set version");
+    let (ref_val, kind): (String, String) = lua
+        .load(
+            r#"
+            local pm = require("nefor-pm")
+            local s = pm._internals.parse_spec({
+              "owner/repo", name = "x",
+            }, 1)
+            return s.ref, s.ref_kind
+            "#,
+        )
+        .eval()
+        .expect("eval");
+    assert_eq!(ref_val, "main", "nightly version → main branch");
+    assert_eq!(kind, "branch", "nightly version → branch kind");
+}
+
+#[test]
+fn engine_ref_returns_tag_for_exact_semver() {
+    let lua = lua_with_pm();
+    lua.load(r#"nefor.version = "1.2.3""#)
+        .exec()
+        .expect("set version");
+    let (ref_val, kind): (String, String) = lua
+        .load(
+            r#"
+            local pm = require("nefor-pm")
+            return pm.engine_ref()
+            "#,
+        )
+        .eval()
+        .expect("eval");
+    assert_eq!(ref_val, "v1.2.3");
+    assert_eq!(kind, "tag");
+}
+
+#[test]
+fn engine_ref_returns_main_when_no_version() {
+    let lua = lua_with_pm();
+    let (ref_val, kind): (String, String) = lua
+        .load(
+            r#"
+            local pm = require("nefor-pm")
+            return pm.engine_ref()
+            "#,
+        )
+        .eval()
+        .expect("eval");
+    assert_eq!(ref_val, "main");
+    assert_eq!(kind, "branch");
+}
+
+#[test]
 fn parse_spec_rejects_missing_name() {
     let lua = lua_with_pm();
     let err = lua

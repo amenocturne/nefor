@@ -21,10 +21,19 @@
 local STARTER_ROOT = NEFOR_CONFIG_DIR or "."
 local NEFOR_DEV_DIR = os.getenv("NEFOR_DEV_DIR")
 
--- Pinned upstream ref for the bootstrap clone. Bumping this is a
--- single-source change: the clone path AND every pm.install entry
--- below pick it up.
-local UPSTREAM_REF = "main"
+-- Upstream ref derived from the engine's version. Exact release tags
+-- (e.g. 0.1.9 → v0.1.9) pin Lua libs to the matching binary version;
+-- nightly/dev builds fall back to "main". The clone path and every
+-- pm.install entry below pick it up.
+local UPSTREAM_REF
+do
+  local v = nefor and nefor.version
+  if type(v) == "string" and v:match("^%d+%.%d+%.%d+$") then
+    UPSTREAM_REF = "v" .. v
+  else
+    UPSTREAM_REF = "main"
+  end
+end
 local SPARSE_CONE  = "lua starter plugins"
 
 local function path_exists(p)
