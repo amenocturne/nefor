@@ -3,7 +3,7 @@ members = ["engine", "crates/*", "plugins/basic-tools", "plugins/chatgpt-provide
 resolver = "2"
 
 [workspace.package]
-version = "0.1.9"
+version = "0.2.0"
 edition = "2021"
 authors = ["amenocturne"]
 license = "MIT"
