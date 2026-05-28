@@ -8,11 +8,10 @@
 --                    so it can't traverse outside whatever the engine
 --                    process can already see.
 --
---   * `search_text` — args { pattern, path?, max_results? }. Shells out
---                    via nefor.process.run to `rg -n --color=never`
---                    (preferred) or `grep -rn --color=never` as fallback.
---                    Path defaults to ".". Pure read; the subprocess
---                    has no write semantics.
+--   * `search_text` — args { pattern, path?, max_results?,
+--                    case_insensitive?, files_only? }. Shells out via
+--                    nefor.process.run to `rg` (preferred) or `grep` as
+--                    fallback. Path defaults to ".". Pure read.
 --
 -- Layered so an explorer / reviewer agent can investigate the codebase
 -- without needing the full `bash` surface (which is a sandbox-escape
@@ -22,14 +21,32 @@ local json = nefor.json
 
 local envelope = require("core.envelope")
 local emit_as  = envelope.emit_as
+local output_dump = require("tool-gate.tool_output_dump")
 
 local SOURCE_NAME = "read-only-tools"
 
-local function emit_ok(firing_id, text)
+local function emit_ok(firing_id, text, meta)
+  local out = tostring(text or "")
+  if output_dump.should_dump(out) then
+    local summary, _, err = output_dump.dump(
+      nil,
+      firing_id,
+      out,
+      meta
+    )
+    if summary then
+      out = summary
+    elseif nefor.log then
+      nefor.log.warn("read-only-tools: dump failed; forwarding original output", {
+        tool_id = firing_id,
+        error = err,
+      })
+    end
+  end
   emit_as(SOURCE_NAME, nil, {
     kind   = "tool.result",
     id     = firing_id,
-    output = { text = tostring(text or "") },
+    output = { text = out },
   })
 end
 
@@ -61,7 +78,10 @@ local function tool_list_dir(firing_id, args)
     lines[#lines + 1] = (e.is_dir and "(d) " or "(f) ") .. e.name
   end
   if #lines == 0 then lines[1] = "(empty directory)" end
-  emit_ok(firing_id, table.concat(lines, "\n"))
+  emit_ok(firing_id, table.concat(lines, "\n"), {
+    tool = "list_dir",
+    args = args,
+  })
 end
 
 -- Pick the search backend on first use. rg is preferred — faster, sane
@@ -78,24 +98,86 @@ local function resolve_search_cmd()
   return search_cmd
 end
 
+local function bool_arg(v)
+  if v == true then return true end
+  if v == false or v == nil then return false end
+  if v == "true" then return true end
+  if v == "false" then return false end
+  return nil
+end
+
+local function append_flag(argv, cond, flag)
+  if cond then argv[#argv + 1] = flag end
+end
+
+local function validate_search_args(args)
+  local allowed = {
+    pattern = true,
+    query = true,
+    text = true,
+    path = true,
+    max_results = true,
+    case_insensitive = true,
+    files_only = true,
+  }
+  for k, _ in pairs(args or {}) do
+    if not allowed[k] then
+      return "search_text: unsupported arg `" .. tostring(k) .. "`"
+    end
+  end
+  return nil
+end
+
 local function tool_search_text(firing_id, args)
-  local pattern = args and args.pattern
+  args = args or {}
+  local arg_err = validate_search_args(args)
+  if arg_err then
+    emit_err(firing_id, arg_err)
+    return
+  end
+
+  local pattern = args.pattern or args.query or args.text
   if type(pattern) ~= "string" or #pattern == 0 then
     emit_err(firing_id, "search_text: args.pattern must be a non-empty string")
     return
   end
   local path = (type(args.path) == "string" and #args.path > 0) and args.path or "."
-  local cap  = tonumber(args.max_results) or 200
+  local cap  = tonumber(args.max_results) or 100
   if cap < 1 then cap = 1 end
-  if cap > 2000 then cap = 2000 end
+  if cap > 500 then cap = 500 end
+  local case_insensitive = bool_arg(args.case_insensitive)
+  if case_insensitive == nil then
+    emit_err(firing_id, "search_text: args.case_insensitive must be boolean")
+    return
+  end
+  local files_only = bool_arg(args.files_only)
+  if files_only == nil then
+    emit_err(firing_id, "search_text: args.files_only must be boolean")
+    return
+  end
 
   local backend = resolve_search_cmd()
   local argv
   if backend == "rg" then
-    argv = { "-n", "--color=never", "--max-count", tostring(cap),
-             "--", pattern, path }
+    argv = {}
+    if files_only then
+      argv[#argv + 1] = "-l"
+    else
+      argv[#argv + 1] = "-n"
+      argv[#argv + 1] = "--max-count"
+      argv[#argv + 1] = tostring(cap)
+    end
+    argv[#argv + 1] = "--color=never"
+    append_flag(argv, case_insensitive, "-i")
+    argv[#argv + 1] = "--"
+    argv[#argv + 1] = pattern
+    argv[#argv + 1] = path
   else
-    argv = { "-rn", "--color=never", "--", pattern, path }
+    argv = { files_only and "-rl" or "-rn", "--color=never" }
+    append_flag(argv, case_insensitive, "-i")
+    argv[#argv + 1] = "--"
+    argv[#argv + 1] = pattern
+    argv[#argv + 1] = path
   end
   local out = nefor.process.run { cmd = backend, args = argv }
   if type(out) ~= "table" then
@@ -112,11 +194,14 @@ local function tool_search_text(firing_id, args)
   end
   local stdout = tostring(out.stdout or "")
   if #stdout == 0 then
-    emit_ok(firing_id, "(no matches)")
+    emit_ok(firing_id, "(no matches)", {
+      tool = "search_text",
+      args = args,
+    })
     return
   end
-  -- Truncate to cap lines defensively (rg's --max-count is per-file,
-  -- not total). One line per match is the expected shape.
+  -- Truncate to cap lines defensively. `rg --max-count` is per-file,
+  -- not total, and files-only mode has no backend-side total cap.
   local truncated = {}
   local n = 0
   for line in stdout:gmatch("[^\n]+") do
@@ -127,7 +212,10 @@ local function tool_search_text(firing_id, args)
     end
     truncated[#truncated + 1] = line
   end
-  emit_ok(firing_id, table.concat(truncated, "\n"))
+  emit_ok(firing_id, table.concat(truncated, "\n"), {
+    tool = "search_text",
+    args = args,
+  })
 end
 
 local TOOL_HANDLERS = {
@@ -175,17 +263,24 @@ local function tool_schemas()
       name = "search_text",
       description =
         "Search for a regex pattern in files under a path (recursively). " ..
-        "Returns matching lines as `path:line:match`. Uses ripgrep when " ..
-        "available, POSIX grep -rn otherwise. Read-only.",
+        "Returns matching lines as `path:line:match` or only matching " ..
+        "paths when files_only=true. Uses ripgrep when available, " ..
+        "POSIX grep otherwise. Read-only.",
       parameters = {
         type = "object",
         properties = {
           pattern = { type = "string",
                       description = "Regex pattern (ERE / rg syntax)." },
+          query = { type = "string",
+                    description = "Alias for pattern." },
           path = { type = "string",
                    description = "Search root (file or directory). Defaults to '.'." },
           max_results = { type = "integer",
-                          description = "Cap on returned lines (default 200, max 2000)." },
+                          description = "Cap on returned lines/files (default 100, max 500)." },
+          case_insensitive = { type = "boolean",
+                               description = "Use case-insensitive matching." },
+          files_only = { type = "boolean",
+                         description = "Return only matching file paths." },
         },
         required = { "pattern" },
       },

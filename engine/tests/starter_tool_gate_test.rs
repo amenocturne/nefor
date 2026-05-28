@@ -892,6 +892,221 @@ fn tool_gate_wrapper_emits_agents_md_on_outbound_path_touching_invoke() {
 }
 
 // ----------------------------------------------------------------
+// starter/read-only-tools.lua — search_text tests
+// ----------------------------------------------------------------
+
+#[test]
+fn read_only_search_text_honors_files_only_and_case_insensitive() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
+
+    let lua = Lua::new();
+    install_stub_nefor_with_send_recorder(&lua).expect("stub");
+    set_package_path(&lua).expect("set package.path");
+
+    let result: Table = lua
+        .load(
+            r#"
+            _run_calls = {}
+            nefor.process = {
+              run = function(req)
+                _run_calls[#_run_calls + 1] = req
+                if req.args and req.args[1] == "--version" then
+                  return { code = 0, stdout = "rg 14" }
+                end
+                return { code = 0, stdout = "Alpha.md\nbeta.md\n" }
+              end
+            }
+
+            local actor = require("read-only-tools")
+            actor.receive_msg({
+              origin = "agent",
+              payload = nefor.json.encode({
+                type = "event",
+                body = {
+                  kind = "read-only-tools.tool.invoke",
+                  id = "search-1",
+                  name = "search_text",
+                  args = {
+                    pattern = "gilza",
+                    path = "/vault",
+                    files_only = true,
+                    case_insensitive = true,
+                    max_results = 10,
+                  },
+                },
+              }),
+            })
+
+            return {
+              argv = _run_calls[2].args,
+              payload = _send_trace[1],
+            }
+            "#,
+        )
+        .eval()
+        .expect("run search");
+
+    let argv: Table = result.get("argv").expect("argv");
+    let args: Vec<String> = argv
+        .sequence_values::<String>()
+        .map(|v| v.expect("arg"))
+        .collect();
+    assert!(
+        args.iter().any(|a| a == "-l"),
+        "files_only must use rg -l, got {args:?}"
+    );
+    assert!(
+        args.iter().any(|a| a == "-i"),
+        "case_insensitive must pass -i, got {args:?}"
+    );
+    assert!(
+        !args.iter().any(|a| a == "-n"),
+        "files_only output must not include line-number mode: {args:?}"
+    );
+
+    let payload: String = result.get("payload").expect("payload");
+    assert!(
+        payload.contains("Alpha.md") && payload.contains("beta.md"),
+        "published result should contain matching files: {payload}"
+    );
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
+    }
+}
+
+#[test]
+fn read_only_search_text_dumps_large_result_summary() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
+
+    let lua = Lua::new();
+    install_stub_nefor_with_send_recorder(&lua).expect("stub");
+    set_package_path(&lua).expect("set package.path");
+
+    let payload: String = lua
+        .load(
+            r#"
+            local line = string.rep("x", 90) .. "\n"
+            _run_calls = {}
+            nefor.process = {
+              run = function(req)
+                _run_calls[#_run_calls + 1] = req
+                if req.args and req.args[1] == "--version" then
+                  return { code = 0, stdout = "rg 14" }
+                end
+                return { code = 0, stdout = string.rep(line, 600) }
+              end
+            }
+
+            local actor = require("read-only-tools")
+            actor.receive_msg({
+              origin = "agent",
+              payload = nefor.json.encode({
+                type = "event",
+                body = {
+                  kind = "read-only-tools.tool.invoke",
+                  id = "search-big",
+                  name = "search_text",
+                  args = {
+                    pattern = "needle",
+                    path = ".",
+                    max_results = 500,
+                  },
+                },
+              }),
+            })
+            return _send_trace[1]
+            "#,
+        )
+        .eval()
+        .expect("run search");
+
+    assert!(
+        payload.contains("Output written to"),
+        "large search output should be replaced by dump summary: {payload}"
+    );
+    assert!(
+        payload.len() < 16 * 1024,
+        "published summary should stay compact; got {} bytes",
+        payload.len()
+    );
+
+    let dump_path = tempdir
+        .path()
+        .join("tool-results")
+        .join("_unscoped")
+        .join("search-big.txt");
+    assert!(dump_path.exists(), "dump file missing: {dump_path:?}");
+    let dump = std::fs::read_to_string(&dump_path).expect("read dump");
+    assert!(
+        dump.contains("x") && dump.contains("[...truncated, raise max_results]"),
+        "dump should contain the capped search output, got {} bytes",
+        dump.len()
+    );
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
+    }
+}
+
+#[test]
+fn read_only_search_text_rejects_unsupported_args() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
+
+    let lua = Lua::new();
+    install_stub_nefor_with_send_recorder(&lua).expect("stub");
+    set_package_path(&lua).expect("set package.path");
+
+    let payload: String = lua
+        .load(
+            r#"
+            nefor.process = {
+              run = function(_)
+                error("process.run should not be called for invalid args")
+              end
+            }
+            local actor = require("read-only-tools")
+            actor.receive_msg({
+              origin = "agent",
+              payload = nefor.json.encode({
+                type = "event",
+                body = {
+                  kind = "read-only-tools.tool.invoke",
+                  id = "search-bad",
+                  name = "search_text",
+                  args = { pattern = "x", unsupported = true },
+                },
+              }),
+            })
+            return _send_trace[1]
+            "#,
+        )
+        .eval()
+        .expect("run invalid search");
+
+    assert!(
+        payload.contains("unsupported arg"),
+        "invalid arg should surface as tool.result error: {payload}"
+    );
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
+    }
+}
+
+// ----------------------------------------------------------------
 // shared harness
 // ----------------------------------------------------------------
 
