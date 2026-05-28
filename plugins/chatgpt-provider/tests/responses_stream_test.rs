@@ -12,6 +12,7 @@ fn parse_all(raw: &str) -> Vec<ResponseEvent> {
     buf.push(&Bytes::copy_from_slice(raw.as_bytes()));
     let mut out = Vec::new();
     for frame in buf.drain() {
+        let frame = frame.expect("valid UTF-8 frame");
         match parse_sse_frame(&frame) {
             None => {}
             Some(Ok(ev)) => out.push(ev),
@@ -256,8 +257,12 @@ fn buffer_handles_split_frames_across_pushes() {
     let frames = buf.drain();
     assert_eq!(frames.len(), 2);
 
-    let ev1 = parse_sse_frame(&frames[0]).expect("Some").expect("Ok");
-    let ev2 = parse_sse_frame(&frames[1]).expect("Some").expect("Ok");
+    let ev1 = parse_sse_frame(frames[0].as_ref().expect("valid"))
+        .expect("Some")
+        .expect("Ok");
+    let ev2 = parse_sse_frame(frames[1].as_ref().expect("valid"))
+        .expect("Some")
+        .expect("Ok");
     match ev1 {
         ResponseEvent::OutputTextDelta { delta, .. } => assert_eq!(delta, "Hello"),
         other => panic!("expected OutputTextDelta, got {other:?}"),
@@ -273,6 +278,8 @@ fn buffer_ignores_non_data_lines() {
     ));
     let frames = buf.drain();
     assert_eq!(frames.len(), 1);
-    let ev = parse_sse_frame(&frames[0]).expect("Some").expect("Ok");
+    let ev = parse_sse_frame(frames[0].as_ref().expect("valid"))
+        .expect("Some")
+        .expect("Ok");
     assert!(matches!(ev, ResponseEvent::Created { .. }));
 }

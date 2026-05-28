@@ -171,7 +171,28 @@ actor.install()
 -- here so module load stays free of bus dependencies.
 history_replay.install()
 actor.spawn(sessions)
-sessions.init()
+
+local function parse_startup_args(argv)
+  local opts = { session_id = nil }
+  local i = 1
+  while i <= #argv do
+    local a = argv[i]
+    if a == "--session" then
+      local v = argv[i + 1]
+      if type(v) ~= "string" or v == "" then
+        error("--session requires a session id")
+      end
+      opts.session_id = v
+      i = i + 2
+    else
+      error("unknown startup arg: " .. tostring(a))
+    end
+  end
+  return opts
+end
+
+local startup = parse_startup_args((nefor.runtime and nefor.runtime.argv) or {})
+sessions.init(startup.session_id)
 
 -- Spawn order matters: provider/tool type-tag registrations must reach
 -- nefor-combinators before the scheduler queries it on submit. Order:

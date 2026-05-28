@@ -741,6 +741,64 @@ fn resume_to_nonexistent_session_succeeds_with_zero_replayed() {
     }
 }
 
+#[test]
+fn init_with_resume_id_cold_starts_without_session_end() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+
+    let target_id = "66666666-2222-4333-8444-555555555555";
+    let script = format!(
+        r#"
+        _seen = {{}}
+        local original_send = nefor.engine.send
+        local json = nefor.json
+        nefor.engine.send = function(payload, target)
+            local ok, decoded = pcall(json.decode, payload)
+            if ok and decoded and decoded.body and decoded.body.kind then
+                table.insert(_seen, decoded.body.kind)
+            end
+            return original_send(payload, target)
+        end
+        sessions = require("sessions")
+        sessions.init("{target_id}")
+        "#
+    );
+    lua.load(&script).exec().expect("init resume");
+
+    let new_id: String = lua
+        .load(r#"return sessions.current_id()"#)
+        .eval()
+        .expect("current_id");
+    assert_eq!(new_id, target_id, "init must swap to requested id");
+
+    let saw_end: bool = lua
+        .load(
+            r#"
+            for _, kind in ipairs(_seen) do
+              if kind == "sessions.session_end" then return true end
+            end
+            return false
+            "#,
+        )
+        .eval()
+        .expect("seen");
+    assert!(
+        !saw_end,
+        "cold-start --session must not emit session_end for a nil outgoing session"
+    );
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
+    }
+}
+
 // `data_root_resolves_xdg_then_home_fallback` was deleted alongside the
 // per-call Lua-side env-var resolver. sessions.lua now delegates to
 // `nefor.fs.data_root()`, which snapshots the engine's resolved DataDir

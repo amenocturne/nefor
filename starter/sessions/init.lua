@@ -297,9 +297,12 @@ local function do_resume(target_session_id)
   -- traffic is what `replay_jsonl` reads, and `should_prune_session`
   -- stays false when the file has content (so no prune happens).
   --
-  -- 1. Announce end of outgoing session.
-  send_msg({ kind = "control", event = "sessions.session_end",
-             extra = { session_id = state.current_session_id } })
+  -- 1. Announce end of outgoing session. Cold-start `--session` resume
+  -- has no outgoing session yet.
+  if state.current_session_id then
+    send_msg({ kind = "control", event = "sessions.session_end",
+               extra = { session_id = state.current_session_id } })
+  end
 
   -- 2. Swap state.
   close_and_prune_if_empty()
@@ -374,7 +377,8 @@ local function do_shutdown()
   close_and_prune_if_empty()
 end
 
-local function do_init()
+---@param resume_id string|nil
+local function do_init(resume_id)
   if state.initialised then
     if nefor.log then
       nefor.log.warn("sessions.init: already initialised; ignoring", {
@@ -382,6 +386,13 @@ local function do_init()
       })
     end
     return state.current_session_id
+  end
+
+  state.initialised = true
+
+  if resume_id and resume_id ~= "" then
+    do_resume(resume_id)
+    return resume_id
   end
 
   local id = uuid_v4()
@@ -400,8 +411,6 @@ local function do_init()
     state.current_session_file = fh
     state.should_prune_session = not had_content
   end
-
-  state.initialised = true
 
   send_msg({ kind = "control", event = "sessions.session_start",
              extra = { session_id = id } })

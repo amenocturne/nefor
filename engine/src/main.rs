@@ -2,7 +2,8 @@
 //!
 //! Startup sequence:
 //!
-//! 1. Parse CLI (`--config`, `--data-dir`, `--plugin-dir`, optional `plugin` subcommand).
+//! 1. Parse CLI (`--config`, `--data-dir`, `--plugin-dir`, optional
+//!    Lua argv / `plugin` subcommand).
 //! 2. Resolve the config dir, initialize tracing to a file under it.
 //! 3. Boot the Lua VM with a [`BrokerOps`] routing sink and run
 //!    `init.lua`. Cache the global `dispatch` function — fatal if missing.
@@ -38,7 +39,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 
-use crate::cli::{engine_mode_from_cli, EngineMode};
+use crate::cli::{engine_mode_from_cli, runtime_argv_from_cli, EngineMode};
 use crate::error::NeforError;
 use crate::events::EventBus;
 use crate::lua::bindings::EngineOps;
@@ -52,6 +53,7 @@ use crate::ncp::{
 async fn main() -> anyhow::Result<()> {
     let args = cli::parse();
     let mode = engine_mode_from_cli(&args);
+    let runtime_argv = runtime_argv_from_cli(&args);
     let config_dir = config::resolve_config(&args)
         .map_err(NeforError::from)
         .context("resolving config directory")?;
@@ -124,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
     // `nefor.io.read_line` short-circuits to nil in serve mode (where
     // engine stdin is unused) instead of blocking on a channel nothing pumps.
     host.set_mode(mode.clone());
+    host.set_runtime_options(&runtime_argv);
 
     let init_lua = config_dir.as_path().join("init.lua");
     if init_lua.exists() {

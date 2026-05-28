@@ -134,6 +134,44 @@ impl LuaHost {
         }
     }
 
+    /// Expose parsed startup options to `init.lua` without using process
+    /// environment variables as an internal handoff. The engine does not
+    /// interpret these fields after parsing; composition code owns their
+    /// semantics.
+    pub fn set_runtime_options(&self, lua_args: &[String]) {
+        let nefor: Table = match self.lua.globals().get("nefor") {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = %e, "set_runtime_options: nefor table missing");
+                return;
+            }
+        };
+        let runtime = match self.lua.create_table() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = %e, "set_runtime_options: failed to create runtime table");
+                return;
+            }
+        };
+        let argv = match self
+            .lua
+            .create_sequence_from(lua_args.iter().map(String::as_str))
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = %e, "set_runtime_options: failed to create argv table");
+                return;
+            }
+        };
+        if let Err(e) = runtime.set("argv", argv) {
+            tracing::error!(error = %e, "set_runtime_options: failed to set argv");
+            return;
+        }
+        if let Err(e) = nefor.set("runtime", runtime) {
+            tracing::error!(error = %e, "set_runtime_options: failed to install runtime table");
+        }
+    }
+
     /// Install the receiver end of the stdin pump. Used by the engine's
     /// dispatch path to bridge the binary's stdin to `nefor.io.read_line`.
     pub fn attach_stdin_pump(&self, rx: tokio::sync::mpsc::UnboundedReceiver<String>) {
@@ -572,6 +610,22 @@ mod tests {
             .eval()
             .unwrap();
         assert!(ok);
+    }
+
+    #[test]
+    fn runtime_options_expose_lua_argv() {
+        let h = host();
+        h.set_runtime_options(&["--session".into(), "session-123".into()]);
+        let got: Vec<String> = h.lua.load("return nefor.runtime.argv").eval().unwrap();
+        assert_eq!(got, vec!["--session", "session-123"]);
+    }
+
+    #[test]
+    fn runtime_options_expose_empty_argv_when_no_lua_args_requested() {
+        let h = host();
+        h.set_runtime_options(&[]);
+        let len: usize = h.lua.load("return #nefor.runtime.argv").eval().unwrap();
+        assert_eq!(len, 0);
     }
 
     #[test]

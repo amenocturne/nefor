@@ -9,7 +9,9 @@
 //!   plugins that registered a `cli` field or invokes the named plugin's
 //!   `cli` function with the leftover argv.
 //!
-//! `--config` / `--data-dir` / `--plugin-dir` are global flags applicable to both modes.
+//! `--config` / `--data-dir` / `--plugin-dir` are engine flags. `nefor run`
+//! enters serve mode with trailing args exposed unchanged to Lua composition
+//! code.
 
 use std::path::PathBuf;
 
@@ -49,8 +51,8 @@ pub struct Cli {
     pub plugin_dir: Option<PathBuf>,
 
     /// Optional subcommand. When omitted, the engine runs in serve mode
-    /// (boot init.lua, spawn plugins, broker). When present, see
-    /// [`Command`].
+    /// with no Lua argv (boot init.lua, spawn plugins, broker). When
+    /// present, see [`Command`].
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -58,6 +60,15 @@ pub struct Cli {
 /// Subcommand selection.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Run the engine in serve mode with trailing args passed verbatim
+    /// to Lua composition code as `nefor.runtime.argv`.
+    Run {
+        /// Opaque args owned by init.lua / starter modules. `--` is not
+        /// required because every token after `run` belongs to Lua.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Dispatch to a plugin's `cli` entry point. With no plugin name, lists
     /// plugins that registered a `cli` field. Trailing args are forwarded
     /// verbatim to the plugin's CLI function.
@@ -81,6 +92,7 @@ pub use crate::lua::mode::EngineMode;
 pub fn engine_mode_from_cli(cli: &Cli) -> EngineMode {
     match &cli.command {
         None => EngineMode::Serve,
+        Some(Command::Run { .. }) => EngineMode::Serve,
         Some(Command::Plugin { name: None, .. }) => EngineMode::PluginList,
         Some(Command::Plugin {
             name: Some(name),
@@ -89,6 +101,14 @@ pub fn engine_mode_from_cli(cli: &Cli) -> EngineMode {
             name: name.clone(),
             args: args.clone(),
         },
+    }
+}
+
+/// Opaque argv exposed to Lua composition code.
+pub fn runtime_argv_from_cli(cli: &Cli) -> Vec<String> {
+    match &cli.command {
+        Some(Command::Run { args }) => args.clone(),
+        _ => Vec::new(),
     }
 }
 
@@ -110,6 +130,16 @@ mod tests {
     }
 
     #[test]
+    fn run_subcommand_args_parse_for_serve_mode() {
+        let cli = Cli::try_parse_from(["nefor", "run", "--session", "abc123"]).expect("parse ok");
+        assert_eq!(
+            runtime_argv_from_cli(&cli),
+            vec!["--session".to_string(), "abc123".to_string()]
+        );
+        assert!(matches!(engine_mode_from_cli(&cli), EngineMode::Serve));
+    }
+
+    #[test]
     fn plugin_with_no_name_is_list_mode() {
         let cli = Cli::try_parse_from(["nefor", "plugin"]).expect("parse ok");
         assert!(matches!(engine_mode_from_cli(&cli), EngineMode::PluginList));
@@ -123,6 +153,19 @@ mod tests {
             EngineMode::PluginDispatch { name, args } => {
                 assert_eq!(name, "foo");
                 assert_eq!(args, vec!["--bar", "baz", "qux"]);
+            }
+            other => panic!("expected PluginDispatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_short_session_like_arg_is_forwarded() {
+        let cli = Cli::try_parse_from(["nefor", "plugin", "agentic-cli", "-s", "abc123"])
+            .expect("parse ok");
+        match engine_mode_from_cli(&cli) {
+            EngineMode::PluginDispatch { name, args } => {
+                assert_eq!(name, "agentic-cli");
+                assert_eq!(args, vec!["-s", "abc123"]);
             }
             other => panic!("expected PluginDispatch, got {other:?}"),
         }
@@ -152,5 +195,15 @@ mod tests {
             engine_mode_from_cli(&cli),
             EngineMode::PluginDispatch { .. }
         ));
+    }
+
+    #[test]
+    fn engine_rejects_unowned_session_flag() {
+        let err = Cli::try_parse_from(["nefor", "--session", "abc123"]).expect_err("parse err");
+        assert!(
+            err.to_string().contains("unexpected argument")
+                || err.to_string().contains("unrecognized subcommand"),
+            "{err}"
+        );
     }
 }

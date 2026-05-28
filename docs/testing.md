@@ -123,6 +123,8 @@ EOF (Ctrl+D or end-of-pipe) exits cleanly with code 0.
 
 ### Other flags
 
+Starter-owned `nefor run --session <id>` opens the TUI on a specific saved session.
+
 | Flag                            | What it does                                                                                                                          |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | `-m <model>`, `--model <model>` | Sets the model for new chats; calls `agentic_workflow.set_model`                                                                      |
@@ -134,7 +136,7 @@ EOF (Ctrl+D or end-of-pipe) exits cleanly with code 0.
 ### Deferred until further capability ships
 
 - `-c, --continue` — most-recent session resume; needs multi-session resume
-- `-s, --session <id>` — specific session resume; same dependency
+- `-s, --session <id>` inside `agentic-cli` — specific session resume for the CLI plugin
 - `--fork` — fork on resume; same dependency
 - `--allowed-tools / --disallowed-tools` — needs tool-gate policy API
 

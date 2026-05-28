@@ -41,6 +41,11 @@ pub const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// asking for tools; this prevents runaways.
 pub const TOOL_LOOP_MAX_ITERATIONS: u32 = 20;
 
+/// Retry read failures only while the failed attempt has not emitted
+/// visible output. Once a delta/reasoning/tool-call fragment is on the
+/// bus, re-POSTing would duplicate transcript/session-log state.
+const MAX_PRE_OUTPUT_STREAM_RETRIES: u32 = 3;
+
 const LOGOUT_REFUSED_ENV_MESSAGE: &str =
     "no login to revoke — credentials come from the environment; restart the plugin without it";
 
@@ -1075,6 +1080,24 @@ impl ToolCallBuffer {
             })
             .collect()
     }
+
+    fn is_empty(&self) -> bool {
+        self.by_item_id.is_empty()
+    }
+}
+
+fn should_retry_pre_output_stream_error(
+    err: &ChatgptError,
+    output_text: &str,
+    reasoning_text: &str,
+    tool_buf: &ToolCallBuffer,
+    retries: u32,
+) -> bool {
+    matches!(err, ChatgptError::ResponsesStreamRead(_))
+        && output_text.is_empty()
+        && reasoning_text.is_empty()
+        && tool_buf.is_empty()
+        && retries < MAX_PRE_OUTPUT_STREAM_RETRIES
 }
 
 fn spawn_turn(
@@ -1098,6 +1121,7 @@ fn spawn_turn(
         let mut total_input_tokens: u64 = 0;
         let mut total_output_tokens: u64 = 0;
         let mut active_model = String::new();
+        let mut pre_output_stream_retries: u32 = 0;
 
         loop {
             iterations += 1;
@@ -1328,6 +1352,7 @@ fn spawn_turn(
             let mut iter_output_tokens: u64 = 0;
             let mut iter_interrupted = false;
             let mut iter_errored: Option<String> = None;
+            let mut iter_retryable_before_output = false;
 
             loop {
                 tokio::select! {
@@ -1457,6 +1482,14 @@ fn spawn_turn(
                                 _ => {}
                             },
                             Some(Err(e)) => {
+                                iter_retryable_before_output =
+                                    should_retry_pre_output_stream_error(
+                                        &e,
+                                        &output_text,
+                                        &reasoning_text,
+                                        &tool_buf,
+                                        pre_output_stream_retries,
+                                    );
                                 iter_errored = Some(format!("stream error: {e}"));
                                 break;
                             }
@@ -1485,6 +1518,18 @@ fn spawn_turn(
             total_output_tokens = total_output_tokens.saturating_add(iter_output_tokens);
 
             if let Some(err_msg) = iter_errored {
+                if iter_retryable_before_output {
+                    pre_output_stream_retries += 1;
+                    iterations = iterations.saturating_sub(1);
+                    tracing::warn!(
+                        chat_id = %chat_id,
+                        attempt = pre_output_stream_retries,
+                        max = MAX_PRE_OUTPUT_STREAM_RETRIES,
+                        error = %err_msg,
+                        "Responses stream read failed before output; retrying turn iteration",
+                    );
+                    continue;
+                }
                 let _ = ctx
                     .out_tx
                     .send(PluginOutgoing::event(turn_error_body(
@@ -1811,6 +1856,54 @@ mod tests {
         b.on_item_done(Some("call_1"), r#"{"a":1}"#);
         let calls = b.into_tool_calls();
         assert_eq!(calls[0].function.arguments, r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn stream_retry_gate_only_allows_read_errors_before_output() {
+        let empty_tools = ToolCallBuffer::default();
+        assert!(should_retry_pre_output_stream_error(
+            &ChatgptError::ResponsesStreamRead("reset".into()),
+            "",
+            "",
+            &empty_tools,
+            0,
+        ));
+        assert!(!should_retry_pre_output_stream_error(
+            &ChatgptError::ResponsesStreamParse("bad frame".into()),
+            "",
+            "",
+            &empty_tools,
+            0,
+        ));
+        assert!(!should_retry_pre_output_stream_error(
+            &ChatgptError::ResponsesStreamRead("reset".into()),
+            "visible",
+            "",
+            &empty_tools,
+            0,
+        ));
+
+        let mut tool_buf = ToolCallBuffer::default();
+        tool_buf.on_item_added(
+            "item_1".into(),
+            "call_1".into(),
+            "read".into(),
+            String::new(),
+        );
+        assert!(!should_retry_pre_output_stream_error(
+            &ChatgptError::ResponsesStreamRead("reset".into()),
+            "",
+            "",
+            &tool_buf,
+            0,
+        ));
+        assert!(!should_retry_pre_output_stream_error(
+            &ChatgptError::ResponsesStreamRead("reset".into()),
+            "",
+            "",
+            &empty_tools,
+            MAX_PRE_OUTPUT_STREAM_RETRIES,
+        ));
     }
 
     #[test]

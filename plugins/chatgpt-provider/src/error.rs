@@ -61,11 +61,17 @@ pub enum ChatgptError {
     #[error("responses endpoint returned {status}: {body}")]
     ResponsesEndpoint { status: u16, body: String },
 
-    /// Mid-stream transport failure (TCP reset, idle timeout, decoder
-    /// error). The string carries a one-line summary suitable for the
-    /// caller's error frame.
-    #[error("responses SSE stream error: {0}")]
-    ResponsesStream(String),
+    /// Mid-stream transport read failure (TCP reset, idle timeout,
+    /// chunked decoder error). Safe to retry only before an attempt has
+    /// emitted any user-visible output.
+    #[error("responses SSE stream read error: {0}")]
+    ResponsesStreamRead(String),
+
+    /// A complete SSE frame arrived, but did not match the schema this
+    /// provider understands. Retrying the same request is unlikely to
+    /// change the payload shape, so callers should surface this.
+    #[error("responses SSE stream parse error: {0}")]
+    ResponsesStreamParse(String),
 
     /// `Authorization: Bearer ...` could not be constructed because the
     /// access token contained bytes that aren't valid in an HTTP header

@@ -2,8 +2,9 @@
 //!
 //! The server sends `data: {json}\n\n` frames with no `event:`
 //! discriminator — the JSON payload's `"type"` field is the
-//! discriminator. We buffer bytes, split on `\n\n`, concatenate `data:`
-//! lines per frame, and deserialize into [`ResponseEvent`].
+//! discriminator. We buffer bytes, split on blank-line frame boundaries,
+//! concatenate `data:` lines per frame, and deserialize into
+//! [`ResponseEvent`].
 //!
 //! Unknown event types deserialize to [`ResponseEvent::Other`] rather
 //! than erroring, so the stream stays alive when the server adds new
@@ -167,7 +168,7 @@ pub fn parse_sse_frame(payload: &str) -> Option<Result<ResponseEvent, ChatgptErr
                 snippet = %truncate_for_log(trimmed),
                 "failed to parse SSE frame",
             );
-            Some(Err(ChatgptError::ResponsesStream(format!(
+            Some(Err(ChatgptError::ResponsesStreamParse(format!(
                 "failed to parse SSE event: {err}"
             ))))
         }
@@ -186,17 +187,19 @@ fn truncate_for_log(s: &str) -> String {
 /// Frame-level buffer that turns a byte stream into a sequence of
 /// `data:` payload strings.
 ///
-/// SSE frames are separated by `\n\n` (a blank line). Inside a frame,
-/// every line that starts with `data:` contributes to the payload;
-/// other line prefixes (`event:`, `id:`, `:` comment, `retry:`) are
-/// ignored per the spec.
+/// SSE frames are separated by a blank line. We keep bytes until a full
+/// frame arrives, then validate UTF-8 once for the whole frame. That
+/// avoids corrupting split multi-byte codepoints across network reads.
+/// Inside a frame, every line that starts with `data:` contributes to
+/// the payload; other line prefixes (`event:`, `id:`, `:` comment,
+/// `retry:`) are ignored per the spec.
 ///
 /// `push` appends raw bytes; `drain` returns every complete frame's
 /// concatenated `data` payload as a `String`. Trailing partial frames
 /// stay in the buffer for the next call.
 #[derive(Debug, Default)]
 pub struct SseBuffer {
-    buf: String,
+    buf: Vec<u8>,
 }
 
 impl SseBuffer {
@@ -205,20 +208,25 @@ impl SseBuffer {
     }
 
     pub fn push(&mut self, bytes: &Bytes) {
-        // `String::push_str` would reject invalid UTF-8 — `from_utf8_lossy`
-        // copes with mid-codepoint splits across reads by inserting U+FFFD;
-        // SSE payloads are JSON which is always UTF-8, so loss is
-        // effectively limited to malformed responses.
-        self.buf.push_str(&String::from_utf8_lossy(bytes));
+        self.buf.extend_from_slice(bytes);
     }
 
     /// Pop every complete frame, returning each one's joined `data`
-    /// payload. Frame terminator is `\n\n`; partial trailing frames
-    /// remain in `self.buf`.
-    pub fn drain(&mut self) -> Vec<String> {
+    /// payload. Partial trailing frames remain in `self.buf`.
+    pub fn drain(&mut self) -> Vec<Result<String, ChatgptError>> {
         let mut out = Vec::new();
-        while let Some(end) = self.buf.find("\n\n") {
-            let frame: String = self.buf.drain(..end + 2).collect();
+        while let Some((end, sep_len)) = find_frame_end(&self.buf) {
+            let drained: Vec<u8> = self.buf.drain(..end + sep_len).collect();
+            let frame_bytes = &drained[..end];
+            let frame = match std::str::from_utf8(frame_bytes) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    out.push(Err(ChatgptError::ResponsesStreamParse(format!(
+                        "SSE frame was not valid UTF-8: {err}"
+                    ))));
+                    continue;
+                }
+            };
             let mut payload = String::new();
             for line in frame.lines() {
                 let line = line.trim_end_matches('\r');
@@ -235,11 +243,23 @@ impl SseBuffer {
                 payload.push_str(rest);
             }
             if !payload.is_empty() {
-                out.push(payload);
+                out.push(Ok(payload));
             }
         }
         out
     }
+}
+
+fn find_frame_end(buf: &[u8]) -> Option<(usize, usize)> {
+    for i in 0..buf.len().saturating_sub(1) {
+        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
+            return Some((i, 2));
+        }
+        if i + 3 < buf.len() && &buf[i..i + 4] == b"\r\n\r\n" {
+            return Some((i, 4));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -256,8 +276,11 @@ mod tests {
         ));
         let frames = b.drain();
         assert_eq!(frames.len(), 2);
-        assert!(frames[0].contains("response.created"));
-        assert!(frames[1].contains("Hi"));
+        assert!(frames[0]
+            .as_ref()
+            .expect("valid")
+            .contains("response.created"));
+        assert!(frames[1].as_ref().expect("valid").contains("Hi"));
     }
 
     #[test]
@@ -271,5 +294,34 @@ mod tests {
         let raw = r#"{"type":"response.brand_new_event","payload":42}"#;
         let parsed = parse_sse_frame(raw).expect("Some").expect("Ok");
         assert_eq!(parsed, ResponseEvent::Other);
+    }
+
+    #[test]
+    fn buffer_handles_crlf_frame_boundaries() {
+        let mut b = SseBuffer::new();
+        b.push(&Bytes::from(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\r\n\r\n",
+        ));
+        let frames = b.drain();
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].as_ref().expect("valid").contains("Hi"));
+    }
+
+    #[test]
+    fn buffer_preserves_utf8_split_across_chunks() {
+        let mut b = SseBuffer::new();
+        let raw = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"é\"}\n\n";
+        let bytes = raw.as_bytes();
+        let split = bytes
+            .windows("é".len())
+            .position(|w| w == "é".as_bytes())
+            .expect("contains e acute")
+            + 1;
+        b.push(&Bytes::copy_from_slice(&bytes[..split]));
+        assert!(b.drain().is_empty());
+        b.push(&Bytes::copy_from_slice(&bytes[split..]));
+        let frames = b.drain();
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].as_ref().expect("valid").contains("é"));
     }
 }

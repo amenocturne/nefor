@@ -12,9 +12,11 @@
 //! sees a clean list of finished tool calls in `StreamOutcome`.
 
 use std::collections::BTreeMap;
+use std::error::Error as _;
 use std::time::Duration;
 
 use futures_util::StreamExt;
+use reqwest::header::{ACCEPT, ACCEPT_ENCODING};
 use tokio_util::sync::CancellationToken;
 
 use crate::openai::{
@@ -151,7 +153,12 @@ where
         );
     }
 
-    let mut builder = client.post(endpoint).json(&req).timeout(Duration::from_secs(120));
+    let mut builder = client
+        .post(endpoint)
+        .header(ACCEPT, "text/event-stream")
+        .header(ACCEPT_ENCODING, "identity")
+        .json(&req)
+        .timeout(Duration::from_secs(120));
     if let Some(k) = api_key {
         builder = apply_auth(builder, auth_header, k);
     }
@@ -166,7 +173,7 @@ where
         }
         r = builder.send() => match r {
             Ok(r) => r,
-            Err(e) => return Err(StreamError::Request(e.to_string())),
+            Err(e) => return Err(StreamError::Request(reqwest_error_detail(&e))),
         },
     };
 
@@ -189,7 +196,7 @@ where
     }
 
     let mut outcome = StreamOutcome::default();
-    let mut buffer = String::new();
+    let mut buffer = Vec::new();
     let mut tc_acc = ToolCallAccumulator::new();
     // Latch flipped once we've fired ReasoningEvent::End — at the
     // boundary where reasoning stops and content/finish/usage takes
@@ -208,9 +215,9 @@ where
             next = byte_stream.next() => {
                 match next {
                     None => break,
-                    Some(Err(e)) => return Err(StreamError::Body(e.to_string())),
+                    Some(Err(e)) => return Err(StreamError::Body(reqwest_error_detail(&e))),
                     Some(Ok(bytes)) => {
-                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        buffer.extend_from_slice(&bytes);
                         drain_complete_frames(
                             &mut buffer,
                             &mut outcome,
@@ -218,7 +225,7 @@ where
                             &mut reasoning_ended,
                             &mut on_delta,
                             &mut on_reasoning,
-                        );
+                        )?;
                     }
                 }
             }
@@ -232,7 +239,7 @@ where
         &mut reasoning_ended,
         &mut on_delta,
         &mut on_reasoning,
-    );
+    )?;
     outcome.tool_calls = tc_acc.finalize();
     maybe_end_reasoning(&outcome, &mut reasoning_ended, &mut on_reasoning);
     Ok(outcome)
@@ -314,7 +321,30 @@ pub async fn list_models(
     Ok(parse_models_response(&body))
 }
 
-/// Pull every `\n\n`-delimited SSE frame out of `buffer`, parse the
+fn reqwest_error_detail(err: &reqwest::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    if err.is_timeout() {
+        parts.push("timeout=true".into());
+    }
+    if err.is_connect() {
+        parts.push("connect=true".into());
+    }
+    if err.is_decode() {
+        parts.push("decode=true".into());
+    }
+    if let Some(status) = err.status() {
+        parts.push(format!("status={status}"));
+    }
+
+    let mut source = err.source();
+    while let Some(err) = source {
+        parts.push(format!("source: {err}"));
+        source = err.source();
+    }
+    parts.join("; ")
+}
+
+/// Pull every blank-line-delimited SSE frame out of `buffer`, parse the
 /// `data:` lines inside each, and apply them to `outcome` / `tc_acc` /
 /// `on_delta` / `on_reasoning`. Trailing partial frames stay in the
 /// buffer for the next read.
@@ -324,100 +354,127 @@ pub async fn list_models(
 /// the model transitions out of thinking — either the first content
 /// delta arrives, or `finish_reason` lands. Subsequent calls are no-ops.
 fn drain_complete_frames<F, R>(
-    buffer: &mut String,
+    buffer: &mut Vec<u8>,
     outcome: &mut StreamOutcome,
     tc_acc: &mut ToolCallAccumulator,
     reasoning_ended: &mut bool,
     on_delta: &mut F,
     on_reasoning: &mut R,
-) where
+) -> Result<(), StreamError>
+where
     F: FnMut(&str),
     R: FnMut(ReasoningEvent<'_>),
 {
-    while let Some(end) = buffer.find("\n\n") {
-        let frame: String = buffer.drain(..end + 2).collect();
-        for line in frame.lines() {
-            let line = line.trim_end_matches('\r');
-            let Some(payload) = line.strip_prefix("data:") else {
-                continue;
-            };
-            let payload = payload.trim_start();
-            match parse_sse_chunk(payload) {
-                SseEvent::Delta(text) => {
-                    // Boundary: first content chunk closes the reasoning
-                    // stream. The chat plugin uses this to flip the
-                    // live reasoning preview into its collapsed form.
-                    if !*reasoning_ended && !outcome.reasoning_text.is_empty() {
-                        *reasoning_ended = true;
-                        on_reasoning(ReasoningEvent::End {
-                            text: &outcome.reasoning_text,
-                        });
+    while let Some((end, sep_len)) = find_frame_end(buffer) {
+        let drained: Vec<u8> = buffer.drain(..end + sep_len).collect();
+        let frame = std::str::from_utf8(&drained[..end])
+            .map_err(|err| StreamError::Body(format!("SSE frame was not valid UTF-8: {err}")))?;
+        let Some(payload) = frame_data_payload(frame) else {
+            continue;
+        };
+        match parse_sse_chunk(&payload) {
+            SseEvent::Delta(text) => {
+                // Boundary: first content chunk closes the reasoning
+                // stream. The chat plugin uses this to flip the
+                // live reasoning preview into its collapsed form.
+                if !*reasoning_ended && !outcome.reasoning_text.is_empty() {
+                    *reasoning_ended = true;
+                    on_reasoning(ReasoningEvent::End {
+                        text: &outcome.reasoning_text,
+                    });
+                }
+                // Defensive strip: when Qwen-style chat templates close
+                // reasoning on a literal `</think>` written inside the
+                // model's monologue, the literal close-tag character
+                // sequence frequently leads the first content chunk
+                // (Ollama emits the matched tag itself onto the content
+                // channel after the reasoning split). The user shouldn't
+                // see `</think>` rendered as the start of an answer.
+                // Strip a single leading `</think>` (with optional
+                // surrounding whitespace) from the content stream.
+                // Only fires when reasoning was non-empty AND we have
+                // not yet emitted any content — covers the leak shape
+                // without disturbing legitimate uses of the literal
+                // string later in the answer.
+                let emit_text: &str = if outcome.full_text.is_empty() && !outcome.reasoning_text.is_empty() {
+                    let trimmed = text.trim_start();
+                    if let Some(rest) = trimmed.strip_prefix("</think>") {
+                        rest.trim_start_matches(|c: char| c == '>' || c.is_whitespace())
+                    } else {
+                        text.as_str()
                     }
-                    // Defensive strip: when Qwen-style chat templates close
-                    // reasoning on a literal `</think>` written inside the
-                    // model's monologue, the literal close-tag character
-                    // sequence frequently leads the first content chunk
-                    // (Ollama emits the matched tag itself onto the content
-                    // channel after the reasoning split). The user shouldn't
-                    // see `</think>` rendered as the start of an answer.
-                    // Strip a single leading `</think>` (with optional
-                    // surrounding whitespace) from the content stream.
-                    // Only fires when reasoning was non-empty AND we have
-                    // not yet emitted any content — covers the leak shape
-                    // without disturbing legitimate uses of the literal
-                    // string later in the answer.
-                    let emit_text: &str =
-                        if outcome.full_text.is_empty() && !outcome.reasoning_text.is_empty() {
-                            let trimmed = text.trim_start();
-                            if let Some(rest) = trimmed.strip_prefix("</think>") {
-                                rest.trim_start_matches(|c: char| c == '>' || c.is_whitespace())
-                            } else {
-                                text.as_str()
-                            }
-                        } else {
-                            text.as_str()
-                        };
-                    if !emit_text.is_empty() {
-                        on_delta(emit_text);
-                        outcome.full_text.push_str(emit_text);
-                    }
+                } else {
+                    text.as_str()
+                };
+                if !emit_text.is_empty() {
+                    on_delta(emit_text);
+                    outcome.full_text.push_str(emit_text);
                 }
-                SseEvent::ReasoningDelta(text) => {
-                    outcome.reasoning_text.push_str(&text);
-                    on_reasoning(ReasoningEvent::Delta(&text));
-                }
-                SseEvent::Finish(reason) => {
-                    outcome.finish_reason = Some(reason);
-                    // Reasoning-only turn (Gemma 3 edge case): finish
-                    // arrives without any content. Still close the
-                    // reasoning channel so the chat plugin renders the
-                    // collapsed/expanded row instead of leaving the
-                    // assistant entry stuck on "streaming".
-                    if !*reasoning_ended && !outcome.reasoning_text.is_empty() {
-                        *reasoning_ended = true;
-                        on_reasoning(ReasoningEvent::End {
-                            text: &outcome.reasoning_text,
-                        });
-                    }
-                }
-                SseEvent::Usage(u) => {
-                    outcome.usage = Some(u);
-                }
-                SseEvent::ToolCallStart {
-                    index,
-                    id,
-                    name,
-                    args,
-                } => {
-                    tc_acc.start(index, id, name, args);
-                }
-                SseEvent::ToolCallArgsDelta { index, delta } => {
-                    tc_acc.append_args(index, &delta);
-                }
-                SseEvent::Done | SseEvent::Empty => {}
             }
+            SseEvent::ReasoningDelta(text) => {
+                outcome.reasoning_text.push_str(&text);
+                on_reasoning(ReasoningEvent::Delta(&text));
+            }
+            SseEvent::Finish(reason) => {
+                outcome.finish_reason = Some(reason);
+                // Reasoning-only turn (Gemma 3 edge case): finish
+                // arrives without any content. Still close the
+                // reasoning channel so the chat plugin renders the
+                // collapsed/expanded row instead of leaving the
+                // assistant entry stuck on "streaming".
+                if !*reasoning_ended && !outcome.reasoning_text.is_empty() {
+                    *reasoning_ended = true;
+                    on_reasoning(ReasoningEvent::End {
+                        text: &outcome.reasoning_text,
+                    });
+                }
+            }
+            SseEvent::Usage(u) => {
+                outcome.usage = Some(u);
+            }
+            SseEvent::ToolCallStart {
+                index,
+                id,
+                name,
+                args,
+            } => {
+                tc_acc.start(index, id, name, args);
+            }
+            SseEvent::ToolCallArgsDelta { index, delta } => {
+                tc_acc.append_args(index, &delta);
+            }
+            SseEvent::Done | SseEvent::Empty => {}
         }
     }
+    Ok(())
+}
+
+fn frame_data_payload(frame: &str) -> Option<String> {
+    let mut payload = String::new();
+    for line in frame.lines() {
+        let line = line.trim_end_matches('\r');
+        let Some(rest) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let rest = rest.strip_prefix(' ').unwrap_or(rest);
+        if !payload.is_empty() {
+            payload.push('\n');
+        }
+        payload.push_str(rest);
+    }
+    (!payload.is_empty()).then_some(payload)
+}
+
+fn find_frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
+    for i in 0..buffer.len().saturating_sub(1) {
+        if buffer[i] == b'\n' && buffer[i + 1] == b'\n' {
+            return Some((i, 2));
+        }
+        if i + 3 < buffer.len() && &buffer[i..i + 4] == b"\r\n\r\n" {
+            return Some((i, 4));
+        }
+    }
+    None
 }
 
 /// Per-stream accumulator for tool-call deltas. Indexed by the model's
@@ -495,6 +552,14 @@ impl ToolCallAccumulator {
 mod tests {
     use super::*;
 
+    fn bytes(s: &str) -> Vec<u8> {
+        s.as_bytes().to_vec()
+    }
+
+    fn push(buffer: &mut Vec<u8>, s: &str) {
+        buffer.extend_from_slice(s.as_bytes());
+    }
+
     #[test]
     fn body_signals_tools_unsupported_matches_ollama_exact_phrase() {
         // Ollama 0.x body shape, lifted from the user-reported bug.
@@ -519,12 +584,21 @@ mod tests {
 
     #[test]
     fn drain_yields_deltas_then_finish_and_usage() {
-        let mut buffer = String::new();
-        buffer.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n");
-        buffer.push_str("data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\n");
-        buffer.push_str("data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n");
-        buffer.push_str("data: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n");
-        buffer.push_str("data: [DONE]\n\n");
+        let mut buffer = Vec::new();
+        push(
+            &mut buffer,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+        );
+        push(
+            &mut buffer,
+            "data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\n",
+        );
+        push(
+            &mut buffer,
+            "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        push(&mut buffer, "data: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n");
+        push(&mut buffer, "data: [DONE]\n\n");
 
         let mut deltas: Vec<String> = Vec::new();
         let mut outcome = StreamOutcome::default();
@@ -537,7 +611,8 @@ mod tests {
             &mut ended,
             &mut |s| deltas.push(s.to_owned()),
             &mut |_| {},
-        );
+        )
+        .expect("drain ok");
         assert_eq!(deltas, vec!["Hi", " there"]);
         assert_eq!(outcome.full_text, "Hi there");
         assert_eq!(outcome.finish_reason.as_deref(), Some("stop"));
@@ -552,7 +627,7 @@ mod tests {
     fn drain_keeps_partial_trailing_frame() {
         // A chunk that arrives split across two reads: the first half
         // doesn't end with a frame terminator. drain must leave it alone.
-        let mut buffer = String::from("data: {\"choices\":[{\"delta\":{\"content\":\"par");
+        let mut buffer = bytes("data: {\"choices\":[{\"delta\":{\"content\":\"par");
         let mut outcome = StreamOutcome::default();
         let mut deltas: Vec<String> = Vec::new();
         let mut tc = ToolCallAccumulator::new();
@@ -564,14 +639,18 @@ mod tests {
             &mut ended,
             &mut |s| deltas.push(s.to_owned()),
             &mut |_| {},
-        );
+        )
+        .expect("drain ok");
         assert!(deltas.is_empty(), "no complete frames yet");
-        assert!(buffer.contains("par"), "buffer retained the partial frame");
+        assert!(
+            std::str::from_utf8(&buffer).expect("utf8").contains("par"),
+            "buffer retained the partial frame"
+        );
     }
 
     #[test]
     fn drain_ignores_non_data_lines_and_blanks() {
-        let mut buffer = String::from(
+        let mut buffer = bytes(
             ": keepalive\nevent: ping\ndata: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n",
         );
         let mut outcome = StreamOutcome::default();
@@ -585,8 +664,90 @@ mod tests {
             &mut ended,
             &mut |s| deltas.push(s.to_owned()),
             &mut |_| {},
-        );
+        )
+        .expect("drain ok");
         assert_eq!(deltas, vec!["x"]);
+    }
+
+    #[test]
+    fn drain_joins_multiline_data_fields() {
+        let mut buffer = bytes(
+            "event: chunk\n\
+             data: {\"choices\":[\n\
+             data: {\"delta\":{\"content\":\"x\"}}\n\
+             data: ]}\n\n",
+        );
+        let mut outcome = StreamOutcome::default();
+        let mut deltas: Vec<String> = Vec::new();
+        let mut tc = ToolCallAccumulator::new();
+        let mut ended = false;
+        drain_complete_frames(
+            &mut buffer,
+            &mut outcome,
+            &mut tc,
+            &mut ended,
+            &mut |s| deltas.push(s.to_owned()),
+            &mut |_| {},
+        )
+        .expect("drain ok");
+        assert_eq!(deltas, vec!["x"]);
+    }
+
+    #[test]
+    fn drain_handles_crlf_frame_boundaries() {
+        let mut buffer = bytes("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\r\n\r\n");
+        let mut outcome = StreamOutcome::default();
+        let mut deltas: Vec<String> = Vec::new();
+        let mut tc = ToolCallAccumulator::new();
+        let mut ended = false;
+        drain_complete_frames(
+            &mut buffer,
+            &mut outcome,
+            &mut tc,
+            &mut ended,
+            &mut |s| deltas.push(s.to_owned()),
+            &mut |_| {},
+        )
+        .expect("drain ok");
+        assert_eq!(deltas, vec!["x"]);
+    }
+
+    #[test]
+    fn drain_preserves_utf8_split_across_chunks() {
+        let raw = "data: {\"choices\":[{\"delta\":{\"content\":\"é\"}}]}\n\n";
+        let raw_bytes = raw.as_bytes();
+        let split = raw_bytes
+            .windows("é".len())
+            .position(|w| w == "é".as_bytes())
+            .expect("contains e acute")
+            + 1;
+        let mut buffer = raw_bytes[..split].to_vec();
+        let mut outcome = StreamOutcome::default();
+        let mut deltas: Vec<String> = Vec::new();
+        let mut tc = ToolCallAccumulator::new();
+        let mut ended = false;
+        drain_complete_frames(
+            &mut buffer,
+            &mut outcome,
+            &mut tc,
+            &mut ended,
+            &mut |s| deltas.push(s.to_owned()),
+            &mut |_| {},
+        )
+        .expect("partial drain ok");
+        assert!(deltas.is_empty());
+
+        buffer.extend_from_slice(&raw_bytes[split..]);
+        drain_complete_frames(
+            &mut buffer,
+            &mut outcome,
+            &mut tc,
+            &mut ended,
+            &mut |s| deltas.push(s.to_owned()),
+            &mut |_| {},
+        )
+        .expect("complete drain ok");
+        assert_eq!(deltas, vec!["é"]);
     }
 
     #[test]
@@ -641,16 +802,18 @@ mod tests {
 
     #[test]
     fn drain_assembles_tool_calls_across_chunks() {
-        let mut buffer = String::new();
+        let mut buffer = Vec::new();
         // Chunk 1: start
-        buffer.push_str("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_x\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]}}]}\n\n");
+        push(&mut buffer, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_x\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]}}]}\n\n");
         // Chunks 2/3: argument fragments
-        buffer.push_str("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n");
-        buffer.push_str("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"/tmp/x\\\"}\"}}]}}]}\n\n");
+        push(&mut buffer, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n");
+        push(&mut buffer, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"/tmp/x\\\"}\"}}]}}]}\n\n");
         // Finish
-        buffer
-            .push_str("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n");
-        buffer.push_str("data: [DONE]\n\n");
+        push(
+            &mut buffer,
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        );
+        push(&mut buffer, "data: [DONE]\n\n");
 
         let mut outcome = StreamOutcome::default();
         let mut deltas: Vec<String> = Vec::new();
@@ -663,7 +826,8 @@ mod tests {
             &mut ended,
             &mut |s| deltas.push(s.to_owned()),
             &mut |_| {},
-        );
+        )
+        .expect("drain ok");
         assert!(deltas.is_empty(), "no text deltas in a tool-call turn");
         assert_eq!(outcome.finish_reason.as_deref(), Some("tool_calls"));
         let calls = tc.finalize();
@@ -679,17 +843,35 @@ mod tests {
     /// first content delta arrives. `full_text` only sees content.
     #[test]
     fn drain_separates_reasoning_from_content_with_boundary_end() {
-        let mut buffer = String::new();
+        let mut buffer = Vec::new();
         // Three reasoning chunks first (Ollama's typical Qwen3 shape).
-        buffer.push_str("data: {\"choices\":[{\"delta\":{\"reasoning\":\"Let me \"}}]}\n\n");
-        buffer.push_str("data: {\"choices\":[{\"delta\":{\"reasoning\":\"think \"}}]}\n\n");
-        buffer.push_str("data: {\"choices\":[{\"delta\":{\"reasoning\":\"about it.\"}}]}\n\n");
+        push(
+            &mut buffer,
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"Let me \"}}]}\n\n",
+        );
+        push(
+            &mut buffer,
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"think \"}}]}\n\n",
+        );
+        push(
+            &mut buffer,
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"about it.\"}}]}\n\n",
+        );
         // Then content. The first content chunk must trigger
         // ReasoningEvent::End with the full accumulated trace.
-        buffer.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"The \"}}]}\n\n");
-        buffer.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"answer.\"}}]}\n\n");
-        buffer.push_str("data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n");
-        buffer.push_str("data: [DONE]\n\n");
+        push(
+            &mut buffer,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"The \"}}]}\n\n",
+        );
+        push(
+            &mut buffer,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer.\"}}]}\n\n",
+        );
+        push(
+            &mut buffer,
+            "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        push(&mut buffer, "data: [DONE]\n\n");
 
         let mut outcome = StreamOutcome::default();
         let mut content_deltas: Vec<String> = Vec::new();
@@ -707,7 +889,8 @@ mod tests {
                 ReasoningEvent::Delta(s) => reasoning_deltas.push(s.to_owned()),
                 ReasoningEvent::End { text } => reasoning_ends.push(text.to_owned()),
             },
-        );
+        )
+        .expect("drain ok");
 
         assert_eq!(content_deltas, vec!["The ", "answer."]);
         assert_eq!(outcome.full_text, "The answer.");
@@ -723,10 +906,16 @@ mod tests {
     /// still fire exactly once so the chat plugin can finalise.
     #[test]
     fn drain_synthesises_reasoning_end_on_finish_when_no_content() {
-        let mut buffer = String::new();
-        buffer.push_str("data: {\"choices\":[{\"delta\":{\"reasoning\":\"thinking only\"}}]}\n\n");
-        buffer.push_str("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
-        buffer.push_str("data: [DONE]\n\n");
+        let mut buffer = Vec::new();
+        push(
+            &mut buffer,
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"thinking only\"}}]}\n\n",
+        );
+        push(
+            &mut buffer,
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        push(&mut buffer, "data: [DONE]\n\n");
 
         let mut outcome = StreamOutcome::default();
         let mut reasoning_ends: Vec<String> = Vec::new();
@@ -743,7 +932,8 @@ mod tests {
                     reasoning_ends.push(text.to_owned());
                 }
             },
-        );
+        )
+        .expect("drain ok");
 
         assert!(outcome.full_text.is_empty(), "no content emitted");
         assert_eq!(outcome.reasoning_text, "thinking only");

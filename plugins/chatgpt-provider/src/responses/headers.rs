@@ -3,7 +3,7 @@
 //! `Content-Type: application/json` is set by reqwest when we call
 //! `.json(...)` on the request builder — we don't insert it here.
 
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, USER_AGENT};
 
 use crate::auth::AuthSnapshot;
 use crate::error::ChatgptError;
@@ -71,6 +71,7 @@ pub fn build_headers(
     );
 
     headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+    headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
 
     headers.insert(
         USER_AGENT,

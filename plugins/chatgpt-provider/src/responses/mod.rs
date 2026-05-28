@@ -22,6 +22,7 @@ pub mod headers;
 pub mod request;
 pub mod stream;
 
+use std::error::Error as _;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
@@ -100,7 +101,8 @@ pub const CODEX_COMPAT_CLIENT_VERSION: &str = "0.130.0";
 ///
 /// Only the *initial* HTTP exchange is retried. Once the SSE stream
 /// has yielded bytes, mid-stream failures route through a different
-/// code path (`ResponsesStream`) and are not recoverable by retry.
+/// code path (`ResponsesStreamRead`) and are only recoverable by the
+/// dispatcher before any visible output has been emitted.
 ///
 /// Budget-driven (not attempt-count-driven): keep retrying as long as
 /// the next backoff would still fit inside the 5-minute window. Backoff
@@ -220,7 +222,11 @@ impl ResponsesClient {
         let mut attempt: u32 = 0;
         loop {
             let headers = headers::build_headers(auth, &self.installation_id, &self.originator)?;
-            let builder = self.http.post(url).headers(headers).timeout(REQUEST_TIMEOUT);
+            let builder = self
+                .http
+                .post(url)
+                .headers(headers)
+                .timeout(REQUEST_TIMEOUT);
             let send_result = build_body(builder).send().await;
 
             match send_result {
@@ -302,7 +308,13 @@ impl ResponsesClient {
         let mut attempt: u32 = 0;
         let response = loop {
             let headers = headers::build_headers(auth, &self.installation_id, &self.originator)?;
-            let send_result = self.http.get(&url).headers(headers).timeout(REQUEST_TIMEOUT).send().await;
+            let send_result = self
+                .http
+                .get(&url)
+                .headers(headers)
+                .timeout(REQUEST_TIMEOUT)
+                .send()
+                .await;
             match send_result {
                 Ok(resp) if resp.status().is_success() => break resp,
                 Ok(resp) => {
@@ -363,10 +375,9 @@ impl ResponsesClient {
             }
         };
 
-        let parsed: ModelsResponse = response
-            .json()
-            .await
-            .map_err(|e| ChatgptError::ResponsesStream(format!("decode /models response: {e}")))?;
+        let parsed: ModelsResponse = response.json().await.map_err(|e| {
+            ChatgptError::ResponsesStreamParse(format!("decode /models response: {e}"))
+        })?;
         Ok(parsed.models)
     }
 }
@@ -467,14 +478,21 @@ where
                     Some(Ok(chunk)) => {
                         buffer.push(&chunk);
                         for frame in buffer.drain() {
-                            if let Some(parsed) = parse_sse_frame(&frame) {
-                                pending.push(parsed);
+                            match frame {
+                                Ok(frame) => {
+                                    if let Some(parsed) = parse_sse_frame(&frame) {
+                                        pending.push(parsed);
+                                    }
+                                }
+                                Err(err) => pending.push(Err(err)),
                             }
                         }
                     }
                     Some(Err(err)) => {
                         return Some((
-                            Err(ChatgptError::ResponsesStream(err.to_string())),
+                            Err(ChatgptError::ResponsesStreamRead(reqwest_error_detail(
+                                &err,
+                            ))),
                             (byte_stream, buffer, pending),
                         ));
                     }
@@ -483,6 +501,29 @@ where
             }
         },
     )
+}
+
+fn reqwest_error_detail(err: &reqwest::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    if err.is_timeout() {
+        parts.push("timeout=true".into());
+    }
+    if err.is_connect() {
+        parts.push("connect=true".into());
+    }
+    if err.is_decode() {
+        parts.push("decode=true".into());
+    }
+    if let Some(status) = err.status() {
+        parts.push(format!("status={status}"));
+    }
+
+    let mut source = err.source();
+    while let Some(err) = source {
+        parts.push(format!("source: {err}"));
+        source = err.source();
+    }
+    parts.join("; ")
 }
 
 fn pop_pending(

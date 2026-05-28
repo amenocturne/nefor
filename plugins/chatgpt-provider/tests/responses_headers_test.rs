@@ -6,7 +6,7 @@ use chatgpt_provider::auth::{AuthSnapshot, AuthState};
 use chatgpt_provider::responses::headers::{
     build_headers, CHATGPT_ACCOUNT_ID, ORIGINATOR, X_CODEX_INSTALLATION_ID,
 };
-use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
+use reqwest::header::{ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, USER_AGENT};
 
 fn snapshot_with_account() -> AuthSnapshot {
     AuthSnapshot {
@@ -86,6 +86,16 @@ fn sets_accept_text_event_stream() {
     let headers = build_headers(&snap, "install-1", "nefor_cli_rs").expect("headers");
     let v = headers.get(ACCEPT).expect("Accept header");
     assert_eq!(v.to_str().unwrap(), "text/event-stream");
+}
+
+#[test]
+fn disables_response_compression_for_sse() {
+    let snap = snapshot_with_account();
+    let headers = build_headers(&snap, "install-1", "nefor_cli_rs").expect("headers");
+    let v = headers
+        .get(ACCEPT_ENCODING)
+        .expect("Accept-Encoding header");
+    assert_eq!(v.to_str().unwrap(), "identity");
 }
 
 #[test]
