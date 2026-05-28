@@ -21,11 +21,11 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
+use nefor_plugin_sdk::{await_ready_ok, spawn_stdin_reader, spawn_stdout_writer, TransportError};
 use nefor_tui::engine::Engine;
 use nefor_tui::error::TuiError;
 use nefor_tui::input::from_key_event;
 use nefor_tui::mouse::from_crossterm as from_mouse_event;
-use nefor_plugin_sdk::{spawn_stdin_reader, spawn_stdout_writer, await_ready_ok, TransportError};
 
 const CHANNEL_CAP: usize = 128;
 use nefor_tui::tty::{open_tty, RawModeGuard};
@@ -114,9 +114,11 @@ fn init_tracing() {
             let base = std::env::var("NEFOR_DATA_DIR")
                 .ok()
                 .map(std::path::PathBuf::from)
-                .or_else(|| std::env::var("HOME").ok().map(|h| {
-                    std::path::PathBuf::from(h).join(".local/share/nefor")
-                }));
+                .or_else(|| {
+                    std::env::var("HOME")
+                        .ok()
+                        .map(|h| std::path::PathBuf::from(h).join(".local/share/nefor"))
+                });
             base.map(|d| d.join("debug"))
         } else {
             Some(std::path::PathBuf::from(v))
@@ -151,9 +153,7 @@ fn init_tracing() {
             eprintln!("nefor-tui: panic (written to {})\n{msg}", path.display());
         }));
     } else {
-        tracing_subscriber::registry()
-            .with(stderr_layer)
-            .init();
+        tracing_subscriber::registry().with(stderr_layer).init();
     }
 }
 

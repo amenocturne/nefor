@@ -203,7 +203,6 @@ impl Graph {
             .cloned()
             .collect()
     }
-
 }
 
 /// Parse a `graph` JSON value (the inner object under

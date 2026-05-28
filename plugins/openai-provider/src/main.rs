@@ -48,7 +48,7 @@ mod error;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nefor_plugin_sdk::{spawn_stdin_reader, spawn_stdout_writer, await_ready_ok, TransportError};
+use nefor_plugin_sdk::{await_ready_ok, spawn_stdin_reader, spawn_stdout_writer, TransportError};
 use nefor_protocol::{Body, Envelope, PluginName, PluginOutgoing, SystemBody};
 
 const CHANNEL_CAP: usize = 256;
@@ -1533,7 +1533,12 @@ fn models_listed_body(config: &Config, models: &[ModelInfo]) -> Map<String, Valu
     );
     m.insert(
         "models".into(),
-        Value::Array(models.iter().map(|mi| Value::String(mi.id.clone())).collect()),
+        Value::Array(
+            models
+                .iter()
+                .map(|mi| Value::String(mi.id.clone()))
+                .collect(),
+        ),
     );
     let ctx_map: Map<String, Value> = models
         .iter()
@@ -2397,8 +2402,14 @@ mod tests {
     #[test]
     fn models_listed_body_carries_models_with_prefix() {
         let models = vec![
-            ModelInfo { id: "a".into(), context_window: None },
-            ModelInfo { id: "b".into(), context_window: Some(128000) },
+            ModelInfo {
+                id: "a".into(),
+                context_window: None,
+            },
+            ModelInfo {
+                id: "b".into(),
+                context_window: Some(128000),
+            },
         ];
         let b = models_listed_body(&cfg("ollama"), &models);
         assert_eq!(
@@ -3172,9 +3183,7 @@ mod tests {
         assert_eq!(history[0].role(), "user");
         assert_eq!(history[0].content(), Some("hi"));
         assert_eq!(history[1].role(), "assistant");
-        let assistant_content = history[1]
-            .content()
-            .expect("assistant content set");
+        let assistant_content = history[1].content().expect("assistant content set");
         assert!(
             !assistant_content.is_empty(),
             "assistant content must hold the partial text streamed before interrupt; \

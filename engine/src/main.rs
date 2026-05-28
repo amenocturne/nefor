@@ -402,7 +402,9 @@ mod dispatch_tests {
         PluginSpec {
             name: PluginName::new(name).expect("valid"),
             kind: if has_cli {
-                ncp::PluginKind::Both { command: vec!["echo".into()] }
+                ncp::PluginKind::Both {
+                    command: vec!["echo".into()],
+                }
             } else {
                 ncp::PluginKind::Command(vec!["echo".into()])
             },

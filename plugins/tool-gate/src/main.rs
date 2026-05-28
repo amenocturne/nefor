@@ -43,7 +43,7 @@ mod policy;
 
 use std::collections::HashMap;
 
-use nefor_plugin_sdk::{spawn_stdin_reader, spawn_stdout_writer, await_ready_ok, TransportError};
+use nefor_plugin_sdk::{await_ready_ok, spawn_stdin_reader, spawn_stdout_writer, TransportError};
 use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
@@ -437,7 +437,11 @@ async fn handle_tool_invoke(
                     args: args.clone(),
                 },
             );
-            send_event(out_tx, permission_request_body(&outer_id, &name, &args, read_only)).await?;
+            send_event(
+                out_tx,
+                permission_request_body(&outer_id, &name, &args, read_only),
+            )
+            .await?;
         }
         Decision::Deny => {
             send_event(
@@ -589,7 +593,12 @@ fn forward_invoke_body(
     m
 }
 
-fn permission_request_body(id: &str, name: &str, args: &Value, read_only: bool) -> Map<String, Value> {
+fn permission_request_body(
+    id: &str,
+    name: &str,
+    args: &Value,
+    read_only: bool,
+) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert(
         "kind".into(),

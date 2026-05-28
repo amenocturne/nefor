@@ -1570,7 +1570,9 @@ fn parse_hex_rgb(hex: &str, key: &str) -> Result<Color, TuiError> {
     }
     let parse_pair = |i: usize| -> u8 {
         u8::from_str_radix(&hex[i..i + 2], 16).unwrap_or_else(|_| {
-            tracing::warn!("parse_hex_rgb: invalid hex pair at offset {i} in `#{hex}`, defaulting to 0");
+            tracing::warn!(
+                "parse_hex_rgb: invalid hex pair at offset {i} in `#{hex}`, defaulting to 0"
+            );
             0
         })
     };

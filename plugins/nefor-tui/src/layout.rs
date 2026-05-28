@@ -969,7 +969,9 @@ fn layout_anchored(inst: &mut WidgetInstance, c: Constraints) -> Size {
     let (width, height) = match &inst.last_desc {
         WidgetDescription::Anchored { width, height, .. } => (*width, *height),
         _ => {
-            tracing::warn!("layout_anchored: kind/desc mismatch, defaulting to intrinsic dimensions");
+            tracing::warn!(
+                "layout_anchored: kind/desc mismatch, defaulting to intrinsic dimensions"
+            );
             (Dimension::Intrinsic, Dimension::Intrinsic)
         }
     };
@@ -1682,8 +1684,7 @@ fn paint_scrollable(inst: &mut WidgetInstance, rect: Rect, out: &mut FrameBuffer
     let viewport_h = rect.height;
     let scratch_w = content_w.max(1);
     let scratch_h = viewport_h.min(paint_height).max(1);
-    let mut scratch =
-        FrameBuffer::with_offset(scratch_w, scratch_h, scroll_y as usize);
+    let mut scratch = FrameBuffer::with_offset(scratch_w, scratch_h, scroll_y as usize);
     if let Some(child) = inst.children.first_mut() {
         let child_rect = Rect {
             row: 0,

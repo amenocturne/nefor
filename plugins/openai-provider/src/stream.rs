@@ -396,16 +396,17 @@ where
                 // not yet emitted any content — covers the leak shape
                 // without disturbing legitimate uses of the literal
                 // string later in the answer.
-                let emit_text: &str = if outcome.full_text.is_empty() && !outcome.reasoning_text.is_empty() {
-                    let trimmed = text.trim_start();
-                    if let Some(rest) = trimmed.strip_prefix("</think>") {
-                        rest.trim_start_matches(|c: char| c == '>' || c.is_whitespace())
+                let emit_text: &str =
+                    if outcome.full_text.is_empty() && !outcome.reasoning_text.is_empty() {
+                        let trimmed = text.trim_start();
+                        if let Some(rest) = trimmed.strip_prefix("</think>") {
+                            rest.trim_start_matches(|c: char| c == '>' || c.is_whitespace())
+                        } else {
+                            text.as_str()
+                        }
                     } else {
                         text.as_str()
-                    }
-                } else {
-                    text.as_str()
-                };
+                    };
                 if !emit_text.is_empty() {
                     on_delta(emit_text);
                     outcome.full_text.push_str(emit_text);

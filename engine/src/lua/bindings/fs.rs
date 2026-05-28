@@ -176,9 +176,7 @@ pub fn install_fs(lua: &Lua, nefor_tbl: &Table, data_dir: DataDir) -> mlua::Resu
 
     fs_tbl.set(
         "chdir",
-        lua.create_function(|lua, path: String| {
-            ok_or_err(lua, std::env::set_current_dir(&path))
-        })?,
+        lua.create_function(|lua, path: String| ok_or_err(lua, std::env::set_current_dir(&path)))?,
     )?;
 
     nefor_tbl.set("fs", fs_tbl)?;

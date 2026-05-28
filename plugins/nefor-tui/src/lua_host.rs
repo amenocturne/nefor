@@ -595,7 +595,9 @@ fn install_tui(
     let positions_for_vscroll = Arc::clone(&scroll_positions);
     let geo_for_vscroll = Arc::clone(&geo_caches);
     let virtual_scroll_prepare_fn = lua.create_function(
-        move |lua, (key, item_count, heights_table, gap): (String, usize, Table, u16)| -> mlua::Result<Value> {
+        move |lua,
+              (key, item_count, heights_table, gap): (String, usize, Table, u16)|
+              -> mlua::Result<Value> {
             // Read current scroll position; return nil if the scrollable
             // hasn't been mounted yet (first frame).
             let (scroll_y, viewport_h) = {
@@ -664,7 +666,9 @@ fn install_tui(
                     if bot < vis_top {
                         lo = mid + 1;
                     } else {
-                        if mid == 0 { break; }
+                        if mid == 0 {
+                            break;
+                        }
                         hi = mid - 1;
                     }
                 }
@@ -680,7 +684,9 @@ fn install_tui(
                     if gc.cumul[mid] <= vis_bot {
                         lo = mid + 1;
                     } else {
-                        if mid == 0 { break; }
+                        if mid == 0 {
+                            break;
+                        }
                         hi = mid - 1;
                     }
                 }
@@ -724,8 +730,8 @@ fn install_tui(
     tui.set("virtual_scroll_prepare", virtual_scroll_prepare_fn)?;
 
     let geo_for_invalidate = Arc::clone(&geo_caches);
-    let virtual_scroll_invalidate_fn = lua.create_function(
-        move |_lua, key: String| -> mlua::Result<()> {
+    let virtual_scroll_invalidate_fn =
+        lua.create_function(move |_lua, key: String| -> mlua::Result<()> {
             let mut caches = lock(&geo_for_invalidate);
             if let Some(gc) = caches.get_mut(&key) {
                 gc.heights.clear();
@@ -733,8 +739,7 @@ fn install_tui(
                 gc.total = 0;
             }
             Ok(())
-        },
-    )?;
+        })?;
     tui.set("virtual_scroll_invalidate", virtual_scroll_invalidate_fn)?;
 
     // ── Clock query ──────────────────────────────────────────────────
@@ -859,8 +864,7 @@ fn install_tui(
                 mlua::Error::runtime(format!("tui.measure: invalid description: {e}"))
             })?;
             let mut summary = crate::reconciler::ReconcileSummary::default();
-            let mut inst =
-                crate::reconciler::mount_subtree(desc, 0, &mut summary);
+            let mut inst = crate::reconciler::mount_subtree(desc, 0, &mut summary);
             let constraints = crate::layout::Constraints {
                 min_width: 0,
                 max_width,

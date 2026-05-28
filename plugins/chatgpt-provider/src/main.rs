@@ -27,7 +27,7 @@ use chatgpt_provider::dispatcher::{
 };
 use chatgpt_provider::error::ChatgptError;
 use chatgpt_provider::installation::{default_installation_path, read_or_generate};
-use nefor_plugin_sdk::{spawn_stdin_reader, spawn_stdout_writer, await_ready_ok, TransportError};
+use nefor_plugin_sdk::{await_ready_ok, spawn_stdin_reader, spawn_stdout_writer, TransportError};
 
 const CHANNEL_CAP: usize = 256;
 use chatgpt_provider::responses::{ResponsesClient, DEFAULT_ORIGINATOR};

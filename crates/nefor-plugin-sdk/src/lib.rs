@@ -145,7 +145,7 @@ pub async fn await_ready_ok(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nefor_protocol::{ErrorCode, Envelope, PluginName, SystemBody, Timestamp};
+    use nefor_protocol::{Envelope, ErrorCode, PluginName, SystemBody, Timestamp};
 
     #[tokio::test]
     async fn await_ready_ok_accepts_ready_ok() {

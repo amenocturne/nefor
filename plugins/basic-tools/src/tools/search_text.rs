@@ -16,8 +16,7 @@ use serde_json::{json, Value};
 use crate::error::ToolError;
 
 pub const NAME: &str = "search_text";
-pub const DESCRIPTION: &str =
-    "Search for a regex pattern in files under a path (recursively). \
+pub const DESCRIPTION: &str = "Search for a regex pattern in files under a path (recursively). \
      Returns matching lines as `path:line:match`. Respects .gitignore. \
      Supports file-type filters, globs, case-insensitive and literal matching.";
 
@@ -206,10 +205,7 @@ fn resolve_path(path: &str, cwd: Option<&str>) -> String {
         return path.to_owned();
     }
     match cwd {
-        Some(dir) => Path::new(dir)
-            .join(p)
-            .to_string_lossy()
-            .into_owned(),
+        Some(dir) => Path::new(dir).join(p).to_string_lossy().into_owned(),
         None => path.to_owned(),
     }
 }
@@ -323,12 +319,7 @@ struct MatchSink<'a> {
 }
 
 impl<'a> MatchSink<'a> {
-    fn new(
-        path: &'a str,
-        results: &'a mut Vec<String>,
-        max: usize,
-        files_only: bool,
-    ) -> Self {
+    fn new(path: &'a str, results: &'a mut Vec<String>, max: usize, files_only: bool) -> Self {
         Self {
             path,
             results,
@@ -365,11 +356,7 @@ impl Sink for MatchSink<'_> {
         Ok(!self.at_limit())
     }
 
-    fn context(
-        &mut self,
-        _searcher: &Searcher,
-        ctx: &SinkContext<'_>,
-    ) -> Result<bool, io::Error> {
+    fn context(&mut self, _searcher: &Searcher, ctx: &SinkContext<'_>) -> Result<bool, io::Error> {
         if self.at_limit() || self.files_only {
             return Ok(false);
         }
@@ -385,10 +372,7 @@ impl Sink for MatchSink<'_> {
         Ok(!self.at_limit())
     }
 
-    fn context_break(
-        &mut self,
-        _searcher: &Searcher,
-    ) -> Result<bool, io::Error> {
+    fn context_break(&mut self, _searcher: &Searcher) -> Result<bool, io::Error> {
         if self.at_limit() || self.files_only {
             return Ok(false);
         }
@@ -405,9 +389,16 @@ mod tests {
 
     fn make_test_dir() -> TempDir {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("hello.txt"), "Hello World\nhello rust\nGoodbye\n").unwrap();
-        fs::write(dir.path().join("code.rs"), "fn main() {\n    println!(\"hello\");\n}\n")
-            .unwrap();
+        fs::write(
+            dir.path().join("hello.txt"),
+            "Hello World\nhello rust\nGoodbye\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("code.rs"),
+            "fn main() {\n    println!(\"hello\");\n}\n",
+        )
+        .unwrap();
         fs::write(dir.path().join("data.py"), "x = 1\ny = 2\nhello = 3\n").unwrap();
         dir
     }
@@ -513,7 +504,10 @@ mod tests {
         // Should contain file paths, not line contents
         let lines: Vec<&str> = out.lines().collect();
         for line in &lines {
-            assert!(!line.contains(':'), "files_only should not have :line:content — got: {line}");
+            assert!(
+                !line.contains(':'),
+                "files_only should not have :line:content — got: {line}"
+            );
         }
     }
 
@@ -528,10 +522,7 @@ mod tests {
         }))
         .await
         .unwrap();
-        let match_lines: Vec<&str> = out
-            .lines()
-            .filter(|l| !l.starts_with("[..."))
-            .collect();
+        let match_lines: Vec<&str> = out.lines().filter(|l| !l.starts_with("[...")).collect();
         assert!(match_lines.len() <= 2);
         assert!(out.contains("[...truncated"));
     }

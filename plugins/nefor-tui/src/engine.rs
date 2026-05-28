@@ -1255,13 +1255,15 @@ impl Engine {
             let lua = &self.lua;
             let reconciler = &mut self.reconciler;
             let renderer = &mut self.renderer;
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Vec<u8>, TuiError> {
-                let desc = lua.render_view()?;
-                reconciler.reconcile(desc);
-                let root = reconciler.root.as_mut().ok_or(TuiError::NotStarted)?;
-                sync_text_inputs(root);
-                Ok(renderer.render_with_selection(root, selection))
-            }))
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || -> Result<Vec<u8>, TuiError> {
+                    let desc = lua.render_view()?;
+                    reconciler.reconcile(desc);
+                    let root = reconciler.root.as_mut().ok_or(TuiError::NotStarted)?;
+                    sync_text_inputs(root);
+                    Ok(renderer.render_with_selection(root, selection))
+                },
+            ))
         };
         match result {
             Ok(Ok(bytes)) => {

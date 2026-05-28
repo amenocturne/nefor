@@ -204,7 +204,9 @@ mod tests {
         r.register(cli_only_spec("only-cli")).unwrap();
         r.register(PluginSpec {
             name: PluginName::new("both").expect("valid"),
-            kind: PluginKind::Both { command: vec!["bin".into()] },
+            kind: PluginKind::Both {
+                command: vec!["bin".into()],
+            },
         })
         .unwrap();
         let with_cli: Vec<String> = r

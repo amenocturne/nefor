@@ -788,8 +788,7 @@ async fn reactive_fallback_retries_without_tools_after_signature_400() {
     // both per-chat allowlist AND per-model cache.
     let chat_allowlist = chats.tool_allowlist(&chat_id).await.expect("allowlist");
     let model_on = chats.model_supports_tools("translategemma").await;
-    let tools_disabled = !model_on
-        || matches!(&chat_allowlist, Some(names) if names.is_empty());
+    let tools_disabled = !model_on || matches!(&chat_allowlist, Some(names) if names.is_empty());
     let tools_for_first: Option<&[serde_json::Value]> = if !tools_disabled {
         Some(&tools_array)
     } else {
@@ -831,8 +830,7 @@ async fn reactive_fallback_retries_without_tools_after_signature_400() {
     // Re-evaluate: the cache must now suppress tools.
     let chat_allowlist = chats.tool_allowlist(&chat_id).await.expect("allowlist");
     let model_on = chats.model_supports_tools("translategemma").await;
-    let tools_disabled = !model_on
-        || matches!(&chat_allowlist, Some(names) if names.is_empty());
+    let tools_disabled = !model_on || matches!(&chat_allowlist, Some(names) if names.is_empty());
     let tools_for_retry: Option<&[serde_json::Value]> = if !tools_disabled {
         Some(&tools_array)
     } else {

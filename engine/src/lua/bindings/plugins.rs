@@ -223,10 +223,7 @@ mod tests {
         let specs = guard.list();
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].name.as_str(), "demo");
-        assert_eq!(
-            specs[0].command(),
-            Some(&["demo-bin".to_string()][..])
-        );
+        assert_eq!(specs[0].command(), Some(&["demo-bin".to_string()][..]));
         assert!(!specs[0].has_cli());
     }
 

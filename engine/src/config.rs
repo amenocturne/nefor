@@ -225,7 +225,10 @@ mod tests {
         let cli = cli_bare();
         let env = FakeEnv::new(None, Some("/tmp/u/.local/share"));
         let got = resolve_data_from(&cli, &env).expect("resolve ok");
-        assert_eq!(got, DataDir::new(PathBuf::from("/tmp/u/.local/share/nefor")));
+        assert_eq!(
+            got,
+            DataDir::new(PathBuf::from("/tmp/u/.local/share/nefor"))
+        );
     }
 
     #[test]

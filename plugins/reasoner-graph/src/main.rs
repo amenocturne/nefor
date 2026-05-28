@@ -22,7 +22,7 @@ mod state;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use nefor_plugin_sdk::{spawn_stdin_reader, spawn_stdout_writer, await_ready_ok, TransportError};
+use nefor_plugin_sdk::{await_ready_ok, spawn_stdin_reader, spawn_stdout_writer, TransportError};
 use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
@@ -62,8 +62,7 @@ async fn main() {
 
 async fn run() -> Result<(), TransportError> {
     let (out_tx, _writer_handle) = spawn_stdout_writer(CHANNEL_CAP);
-    let (in_tx, mut in_rx) =
-        mpsc::channel::<Result<Envelope, TransportError>>(CHANNEL_CAP);
+    let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(CHANNEL_CAP);
     let _reader_handle = spawn_stdin_reader(in_tx);
 
     send_ready(&out_tx).await?;

@@ -27,12 +27,12 @@ use crate::broker::{ToolBroker, ToolResult};
 use crate::catalog::ToolCatalog;
 use crate::config::ServeArgs;
 use crate::error::ChatgptError;
-use nefor_plugin_sdk::TransportError;
 use crate::responses::request::{Reasoning, ReasoningSummary, ResponseItem, ResponsesApiRequest};
 use crate::responses::stream::ResponseEvent;
 use crate::responses::{ModelEntry, ResponsesClient};
 use crate::state::{ChatId, ChatStats, Chats, ChatsError, Message, ToolCall, ToolCallFunction};
 use crate::translator;
+use nefor_plugin_sdk::TransportError;
 
 pub const PROTOCOL_VERSION: &str = "0.1";
 pub const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -683,9 +683,7 @@ async fn dispatch_event(
                 return send_event(&ctx.out_tx, models_listed_body(&ctx.args, &[])).await;
             }
             match ctx.responses_client.list_models(&snap).await {
-                Ok(models) => {
-                    send_event(&ctx.out_tx, models_listed_body(&ctx.args, &models)).await
-                }
+                Ok(models) => send_event(&ctx.out_tx, models_listed_body(&ctx.args, &models)).await,
                 Err(e) => {
                     let msg = format!("failed to fetch /models: {e}");
                     tracing::warn!(error = %e, "models.list_requested failed");
@@ -1202,16 +1200,14 @@ fn spawn_turn(
             //    only used when /models hasn't been fetched yet for
             //    this model. The /models fetch fires on startup +
             //    auth.set, so this fallback is rare in practice.
-            let supports_reasoning =
-                if ctx.chats.model_reasoning_unsupported(&snapshot.model).await {
-                    false
-                } else if let Some(api) =
-                    ctx.chats.model_capability_reasoning(&snapshot.model).await
-                {
-                    api
-                } else {
-                    translator::model_supports_reasoning(&snapshot.model)
-                };
+            let supports_reasoning = if ctx.chats.model_reasoning_unsupported(&snapshot.model).await
+            {
+                false
+            } else if let Some(api) = ctx.chats.model_capability_reasoning(&snapshot.model).await {
+                api
+            } else {
+                translator::model_supports_reasoning(&snapshot.model)
+            };
             let include = if supports_reasoning {
                 vec!["reasoning.encrypted_content".to_string()]
             } else {
@@ -1244,7 +1240,9 @@ fn spawn_turn(
             if !matches!(auth_snap.state, AuthState::Connected) {
                 let _ = ctx
                     .out_tx
-                    .send(PluginOutgoing::event(auth_status_body(&ctx.args, &auth_snap)))
+                    .send(PluginOutgoing::event(auth_status_body(
+                        &ctx.args, &auth_snap,
+                    )))
                     .await;
                 let _ = ctx
                     .out_tx
@@ -1545,7 +1543,10 @@ fn spawn_turn(
 
             if iter_interrupted {
                 if !output_text.is_empty() {
-                    let _ = ctx.chats.push_assistant(&chat_id, output_text.clone()).await;
+                    let _ = ctx
+                        .chats
+                        .push_assistant(&chat_id, output_text.clone())
+                        .await;
                 }
                 final_text = output_text;
                 final_finish_reason = Some("interrupted".into());
@@ -1568,7 +1569,10 @@ fn spawn_turn(
 
             // No tool calls → terminal turn.
             if !output_text.is_empty() {
-                let _ = ctx.chats.push_assistant(&chat_id, output_text.clone()).await;
+                let _ = ctx
+                    .chats
+                    .push_assistant(&chat_id, output_text.clone())
+                    .await;
             }
             final_text = output_text;
             final_finish_reason = iter_finish_reason.or(Some("stop".into()));

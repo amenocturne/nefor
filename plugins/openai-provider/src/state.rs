@@ -420,7 +420,10 @@ impl Chats {
     pub async fn interrupt(&self, id: &ChatId) -> bool {
         let g = self.inner.lock().await;
         match g.get(id) {
-            Some(ChatState { turn: TurnState::InFlight(ref token), .. }) => {
+            Some(ChatState {
+                turn: TurnState::InFlight(ref token),
+                ..
+            }) => {
                 token.cancel();
                 true
             }
@@ -769,10 +772,7 @@ mod tests {
         c.set_tool_allowlist(&id, Some(vec![]))
             .await
             .expect("disable");
-        assert_eq!(
-            c.tool_allowlist(&id).await.expect("disabled"),
-            Some(vec![])
-        );
+        assert_eq!(c.tool_allowlist(&id).await.expect("disabled"), Some(vec![]));
         // Re-enable all tools.
         c.set_tool_allowlist(&id, None).await.expect("re-enable");
         assert_eq!(c.tool_allowlist(&id).await.expect("re-enabled"), None);
