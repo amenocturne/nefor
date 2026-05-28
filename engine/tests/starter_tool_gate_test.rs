@@ -196,6 +196,60 @@ fn large_output_writes_full_contents_to_file_and_returns_summary() {
 }
 
 #[test]
+fn large_output_preview_stays_json_encodable_when_cutting_multibyte_text() {
+    // Regression: the preview used to slice by raw bytes. If the 4 KiB
+    // cut landed inside a multibyte character, mlua exposed the summary
+    // as a byte array and nefor.json.encode failed while publishing the
+    // tool.result back onto the bus.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+
+    let result: Table = lua
+        .load(
+            r#"
+            local d = require("tool-gate.tool_output_dump")
+            local payload = string.rep("A", d.PREVIEW_BYTES - 1)
+              .. "€"
+              .. string.rep("tail", 9000)
+            local summary, path, err = d.dump("chat-utf8", "call-utf8", payload, { tool = "search_text" })
+            local ok, encoded = pcall(nefor.json.encode, { kind = "tool.result", output = summary })
+            return { ok = ok, encoded = encoded, err = err, path = path }
+            "#,
+        )
+        .eval()
+        .expect("dump");
+
+    let err: Option<String> = result.get("err").expect("err");
+    assert!(err.is_none(), "dump must not error: {err:?}");
+
+    let ok: bool = result.get("ok").expect("ok");
+    let encoded: String = result.get("encoded").expect("encoded");
+    assert!(ok, "summary must remain JSON-encodable: {encoded}");
+    assert!(
+        encoded.contains("Output written to"),
+        "encoded summary should carry dump notice: {encoded}"
+    );
+
+    let path: String = result.get("path").expect("path");
+    let on_disk = std::fs::read_to_string(&path).expect("read dump");
+    assert!(
+        on_disk.contains("€"),
+        "dump file must preserve the original multibyte payload"
+    );
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
+    }
+}
+
+#[test]
 fn missing_chat_id_falls_back_to_unscoped_directory() {
     // chat_id is best-effort surface; the lib must not refuse to dump
     // when it's absent. Falling back to `_unscoped/` keeps the dump

@@ -73,6 +73,66 @@ local function stringify(output)
   return encoded, nil
 end
 
+---@param b integer|nil
+---@return boolean
+local function is_continuation(b)
+  return type(b) == "number" and b >= 0x80 and b <= 0xBF
+end
+
+---@param b integer|nil
+---@return boolean
+local function is_continuation_after(first, b)
+  if not is_continuation(b) then return false end
+  if first == 0xE0 then return b >= 0xA0 end
+  if first == 0xED then return b <= 0x9F end
+  if first == 0xF0 then return b >= 0x90 end
+  if first == 0xF4 then return b <= 0x8F end
+  return true
+end
+
+---@param payload string
+---@param max_bytes integer
+---@return string
+local function utf8_preview(payload, max_bytes)
+  local len = #payload
+  local out = {}
+  local out_len = 0
+  local i = 1
+
+  while i <= len and out_len < max_bytes do
+    local b1 = payload:byte(i)
+    local seq_len = 0
+
+    if b1 < 0x80 then
+      seq_len = 1
+    elseif b1 >= 0xC2 and b1 <= 0xDF and is_continuation(payload:byte(i + 1)) then
+      seq_len = 2
+    elseif b1 >= 0xE0 and b1 <= 0xEF
+        and is_continuation_after(b1, payload:byte(i + 1))
+        and is_continuation(payload:byte(i + 2)) then
+      seq_len = 3
+    elseif b1 >= 0xF0 and b1 <= 0xF4
+        and is_continuation_after(b1, payload:byte(i + 1))
+        and is_continuation(payload:byte(i + 2))
+        and is_continuation(payload:byte(i + 3)) then
+      seq_len = 4
+    end
+
+    if seq_len > 0 then
+      if out_len + seq_len > max_bytes then break end
+      out[#out + 1] = payload:sub(i, i + seq_len - 1)
+      out_len = out_len + seq_len
+      i = i + seq_len
+    else
+      out[#out + 1] = "?"
+      out_len = out_len + 1
+      i = i + 1
+    end
+  end
+
+  return table.concat(out)
+end
+
 -- Cheap short-circuit for the common case (small output → no work).
 ---@param output any
 ---@return boolean
@@ -87,8 +147,7 @@ end
 ---@return string
 local function summarise(payload, path)
   local total = #payload
-  local preview_len = math.min(M.PREVIEW_BYTES, total)
-  local preview = payload:sub(1, preview_len)
+  local preview = utf8_preview(payload, math.min(M.PREVIEW_BYTES, total))
   return table.concat({
     "[Output written to " .. path .. "; " .. tostring(total)
       .. " bytes; truncated preview below]",
@@ -168,5 +227,6 @@ M._stringify  = stringify
 M._summarise  = summarise
 M._safe_scope = safe_scope
 M._data_root  = data_root
+M._utf8_preview = utf8_preview
 
 return M
