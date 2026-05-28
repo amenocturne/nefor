@@ -155,8 +155,8 @@ local function summarise(payload, path)
     preview,
     "",
     "... [output continues; full content at " .. path
-      .. "; use `grep <pattern> " .. path .. "` or `head -n <N> "
-      .. path .. "` to extract more] ...",
+      .. "; use search_text/grep on the path, or read_file with offset + "
+      .. "max_bytes to read bounded chunks] ...",
   }, "\n")
 end
 

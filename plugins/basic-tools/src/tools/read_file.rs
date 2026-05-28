@@ -4,7 +4,7 @@
 //!
 //! - Path is missing → [`ToolError::NotFound`].
 //! - Path is a directory → [`ToolError::IsDirectory`].
-//! - File larger than 1 MiB → [`ToolError::TooLarge`].
+//! - Unsliced file larger than 1 MiB → [`ToolError::TooLarge`].
 //! - First 8 KiB contains a NUL byte (binary heuristic) → [`ToolError::BinaryContent`].
 //! - Contents are not valid UTF-8 → [`ToolError::NotUtf8`].
 //! - Any other IO error → [`ToolError::Io`].
@@ -15,7 +15,7 @@
 //! and `bash`.
 
 use serde_json::{json, Value};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::error::ToolError;
 
@@ -26,9 +26,9 @@ pub const NAME: &str = "read_file";
 pub const DESCRIPTION: &str =
     "Read the contents of a file. Returns the file's text content or an error.";
 
-/// 1 MiB cap on file size. Files larger than this are rejected — the LLM
-/// can ask for a slice via a future `read_file_range` tool, or grep / head
-/// via `bash` once that lands.
+/// 1 MiB cap on a single read. Unsliced files larger than this are
+/// rejected; sliced reads may target larger files but never return more
+/// than this many bytes at once.
 pub const MAX_BYTES: u64 = 1024 * 1024;
 
 /// First N bytes inspected for a NUL byte to flag binary content.
@@ -46,6 +46,14 @@ pub fn schema() -> Value {
             "cwd": {
                 "type": "string",
                 "description": "Working directory. Relative paths are resolved against this."
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Byte offset to start reading from. Optional; defaults to 0."
+            },
+            "max_bytes": {
+                "type": "integer",
+                "description": "Maximum bytes to read. Optional; capped at 1 MiB."
             }
         },
         "required": ["path"]
@@ -55,11 +63,19 @@ pub fn schema() -> Value {
 /// Execute `read_file` with the given args. See module docs for rejection
 /// rules.
 pub async fn run(args: &Value) -> Result<String, ToolError> {
-    let path = parse_path(args)?;
-    read_text_file(&path).await
+    let request = parse_args(args)?;
+    read_text_file(request).await
 }
 
-fn parse_path(args: &Value) -> Result<String, ToolError> {
+#[derive(Debug)]
+struct ReadRequest {
+    path: String,
+    offset: u64,
+    max_bytes: u64,
+    sliced: bool,
+}
+
+fn parse_args(args: &Value) -> Result<ReadRequest, ToolError> {
     let obj = args.as_object().ok_or_else(|| ToolError::BadArgs {
         tool: NAME.into(),
         message: "args must be a JSON object".into(),
@@ -81,7 +97,44 @@ fn parse_path(args: &Value) -> Result<String, ToolError> {
         .get("cwd")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty());
-    Ok(resolve_path(raw, cwd))
+
+    let offset = match obj.get("offset") {
+        Some(Value::Number(n)) => n.as_u64().ok_or_else(|| ToolError::BadArgs {
+            tool: NAME.into(),
+            message: "`offset` must be a non-negative integer".into(),
+        })?,
+        Some(_) => {
+            return Err(ToolError::BadArgs {
+                tool: NAME.into(),
+                message: "`offset` must be an integer".into(),
+            });
+        }
+        None => 0,
+    };
+
+    let max_bytes = match obj.get("max_bytes") {
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .ok_or_else(|| ToolError::BadArgs {
+                tool: NAME.into(),
+                message: "`max_bytes` must be a positive integer".into(),
+            })?
+            .clamp(4, MAX_BYTES),
+        Some(_) => {
+            return Err(ToolError::BadArgs {
+                tool: NAME.into(),
+                message: "`max_bytes` must be an integer".into(),
+            });
+        }
+        None => MAX_BYTES,
+    };
+
+    Ok(ReadRequest {
+        path: resolve_path(raw, cwd),
+        offset,
+        max_bytes,
+        sliced: offset > 0 || obj.get("max_bytes").is_some(),
+    })
 }
 
 fn resolve_path(path: &str, cwd: Option<&str>) -> String {
@@ -98,38 +151,48 @@ fn resolve_path(path: &str, cwd: Option<&str>) -> String {
     }
 }
 
-async fn read_text_file(path: &str) -> Result<String, ToolError> {
-    let meta = match tokio::fs::metadata(path).await {
+async fn read_text_file(request: ReadRequest) -> Result<String, ToolError> {
+    let path = request.path;
+    let meta = match tokio::fs::metadata(&path).await {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ToolError::NotFound { path: path.into() });
+            return Err(ToolError::NotFound { path });
         }
         Err(e) => {
             return Err(ToolError::Io {
-                path: path.into(),
+                path,
                 message: e.to_string(),
             });
         }
     };
 
     if meta.is_dir() {
-        return Err(ToolError::IsDirectory { path: path.into() });
+        return Err(ToolError::IsDirectory { path });
     }
 
     let size = meta.len();
-    if size > MAX_BYTES {
-        return Err(ToolError::TooLarge {
-            size,
-            path: path.into(),
-        });
+    if !request.sliced && size > MAX_BYTES {
+        return Err(ToolError::TooLarge { size, path });
     }
 
-    let mut file = tokio::fs::File::open(path)
+    let mut file = tokio::fs::File::open(&path)
         .await
         .map_err(|e| ToolError::Io {
-            path: path.into(),
+            path: path.clone(),
             message: e.to_string(),
         })?;
+
+    if request.offset >= size {
+        if !request.sliced {
+            return Ok(String::new());
+        }
+        return Ok(format!(
+            "[read_file slice: bytes {size}..{size} of {size}]\n"
+        ));
+    }
+
+    let start = seek_to_next_utf8_boundary(&mut file, request.offset, size, &path).await?;
+    let read_limit = request.max_bytes.min(size.saturating_sub(start));
 
     // Probe the first BINARY_PROBE_BYTES for NUL bytes. If we find one,
     // bail early without slurping the whole file. This is the same
@@ -137,7 +200,7 @@ async fn read_text_file(path: &str) -> Result<String, ToolError> {
     // (executables, images, archives) while letting unusual but legitimate
     // text files (UTF-16-with-BOM is a possible false positive — out of
     // scope for v1) through.
-    let probe_cap = std::cmp::min(size as usize, BINARY_PROBE_BYTES);
+    let probe_cap = std::cmp::min(read_limit as usize, BINARY_PROBE_BYTES);
     let mut probe = vec![0u8; probe_cap];
     let mut probe_read = 0usize;
     while probe_read < probe_cap {
@@ -145,7 +208,7 @@ async fn read_text_file(path: &str) -> Result<String, ToolError> {
             .read(&mut probe[probe_read..])
             .await
             .map_err(|e| ToolError::Io {
-                path: path.into(),
+                path: path.clone(),
                 message: e.to_string(),
             })?;
         if n == 0 {
@@ -155,26 +218,91 @@ async fn read_text_file(path: &str) -> Result<String, ToolError> {
     }
     probe.truncate(probe_read);
     if probe.contains(&0u8) {
-        return Err(ToolError::BinaryContent { path: path.into() });
+        return Err(ToolError::BinaryContent { path });
     }
 
-    // Read the remainder. We've already pulled `probe_read` bytes; concat
-    // and slurp the rest. `read_to_end` would be simpler but would re-read
-    // from the start; we use the existing handle to keep the probe data
-    // and continue.
-    let remaining_cap = (size as usize).saturating_sub(probe_read);
+    // Read the remainder of the requested slice. We've already pulled
+    // `probe_read` bytes; keep the same handle and continue from there.
+    let remaining_cap = (read_limit as usize).saturating_sub(probe_read);
     let mut rest = Vec::with_capacity(remaining_cap);
-    file.read_to_end(&mut rest)
+    file.take(remaining_cap as u64)
+        .read_to_end(&mut rest)
         .await
         .map_err(|e| ToolError::Io {
-            path: path.into(),
+            path: path.clone(),
             message: e.to_string(),
         })?;
 
     let mut all = probe;
     all.extend_from_slice(&rest);
+    let valid_len = valid_utf8_prefix_len(&all, &path)?;
+    all.truncate(valid_len);
 
-    String::from_utf8(all).map_err(|_| ToolError::NotUtf8 { path: path.into() })
+    let text = String::from_utf8(all).map_err(|_| ToolError::NotUtf8 { path: path.clone() })?;
+    if !request.sliced {
+        return Ok(text);
+    }
+
+    let end = start + valid_len as u64;
+    let mut out = format!("[read_file slice: bytes {start}..{end} of {size}]\n{text}");
+    if end < size {
+        out.push_str(&format!(
+            "\n[... file continues; next offset: {end}; max_bytes cap: {}]",
+            MAX_BYTES
+        ));
+    }
+    Ok(out)
+}
+
+async fn seek_to_next_utf8_boundary(
+    file: &mut tokio::fs::File,
+    mut offset: u64,
+    size: u64,
+    path: &str,
+) -> Result<u64, ToolError> {
+    while offset < size {
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|e| ToolError::Io {
+                path: path.into(),
+                message: e.to_string(),
+            })?;
+        let mut one = [0u8; 1];
+        let n = file.read(&mut one).await.map_err(|e| ToolError::Io {
+            path: path.into(),
+            message: e.to_string(),
+        })?;
+        if n == 0 || !is_utf8_continuation(one[0]) {
+            file.seek(std::io::SeekFrom::Start(offset))
+                .await
+                .map_err(|e| ToolError::Io {
+                    path: path.into(),
+                    message: e.to_string(),
+                })?;
+            return Ok(offset);
+        }
+        offset += 1;
+    }
+
+    file.seek(std::io::SeekFrom::Start(size))
+        .await
+        .map_err(|e| ToolError::Io {
+            path: path.into(),
+            message: e.to_string(),
+        })?;
+    Ok(size)
+}
+
+fn is_utf8_continuation(b: u8) -> bool {
+    (0x80..=0xBF).contains(&b)
+}
+
+fn valid_utf8_prefix_len(bytes: &[u8], path: &str) -> Result<usize, ToolError> {
+    match std::str::from_utf8(bytes) {
+        Ok(_) => Ok(bytes.len()),
+        Err(e) if e.error_len().is_none() => Ok(e.valid_up_to()),
+        Err(_) => Err(ToolError::NotUtf8 { path: path.into() }),
+    }
 }
 
 #[cfg(test)]
@@ -253,6 +381,72 @@ mod tests {
         let path = f.path().to_str().expect("utf8 path").to_owned();
         let out = run(&json!({ "path": path })).await.expect("ok");
         assert_eq!(out.len(), MAX_BYTES as usize);
+    }
+
+    #[tokio::test]
+    async fn sliced_read_allows_large_file_in_bounded_chunks() {
+        let mut f = NamedTempFile::new().expect("tempfile");
+        let big = format!("{}END", "a".repeat((MAX_BYTES as usize) + 10));
+        f.write_all(big.as_bytes()).expect("write");
+        let path = f.path().to_str().expect("utf8 path").to_owned();
+
+        let out = run(&json!({
+            "path": path,
+            "offset": MAX_BYTES + 5,
+            "max_bytes": 16
+        }))
+        .await
+        .expect("slice ok");
+
+        assert!(out.contains("[read_file slice: bytes "));
+        assert!(out.contains("aaaaaEND"));
+        assert!(!out.contains("file too large"));
+    }
+
+    #[tokio::test]
+    async fn sliced_read_reports_next_offset_when_file_continues() {
+        let mut f = NamedTempFile::new().expect("tempfile");
+        f.write_all(b"0123456789abcdef").expect("write");
+        let path = f.path().to_str().expect("utf8 path").to_owned();
+
+        let out = run(&json!({
+            "path": path,
+            "offset": 2,
+            "max_bytes": 5
+        }))
+        .await
+        .expect("slice ok");
+
+        assert!(out.contains("[read_file slice: bytes 2..7 of 16]"));
+        assert!(out.contains("23456"));
+        assert!(out.contains("next offset: 7"));
+    }
+
+    #[tokio::test]
+    async fn sliced_read_does_not_split_utf8_at_boundaries() {
+        let mut f = NamedTempFile::new().expect("tempfile");
+        f.write_all("aa€b".as_bytes()).expect("write");
+        let path = f.path().to_str().expect("utf8 path").to_owned();
+
+        let first = run(&json!({
+            "path": path,
+            "offset": 0,
+            "max_bytes": 4
+        }))
+        .await
+        .expect("first slice ok");
+        assert!(first.contains("\naa"));
+        assert!(first.contains("next offset: 2"));
+
+        let second = run(&json!({
+            "path": path,
+            "offset": 3,
+            "max_bytes": 4
+        }))
+        .await
+        .expect("second slice ok");
+        assert!(second.contains("[read_file slice: bytes 5..6 of 6]"));
+        assert!(second.contains("\nb"));
     }
 
     #[tokio::test]
