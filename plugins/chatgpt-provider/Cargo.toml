@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 nefor-protocol = { path = "../../crates/nefor-protocol" }
 nefor-plugin-sdk = { path = "../../crates/nefor-plugin-sdk" }
+nefor-sse = { path = "../../crates/nefor-sse" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 thiserror = { workspace = true }
@@ -30,7 +31,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 dirs = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 futures = { workspace = true }
-bytes = "1"
+bytes = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 
 # OAuth flow specifics — declared here rather than via workspace because

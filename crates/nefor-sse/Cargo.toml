@@ -1,0 +1,12 @@
+[package]
+name = "nefor-sse"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Small Server-Sent Events frame decoder shared by nefor providers."
+
+[dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }

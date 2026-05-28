@@ -30,11 +30,12 @@ use futures::stream::StreamExt;
 use rand::Rng;
 
 pub use headers::{build_headers, default_user_agent};
+pub use nefor_sse::SseBuffer;
 pub use request::{
     MessageContent, Reasoning, ReasoningEffort, ReasoningSummary, ReasoningSummaryPart,
     ResponseItem, ResponsesApiRequest, TextControls, Verbosity,
 };
-pub use stream::{parse_sse_frame, ResponseEvent, ResponseStream, SseBuffer};
+pub use stream::{parse_sse_frame, ResponseEvent, ResponseStream};
 
 use serde::Deserialize;
 
@@ -480,11 +481,12 @@ where
                         for frame in buffer.drain() {
                             match frame {
                                 Ok(frame) => {
-                                    if let Some(parsed) = parse_sse_frame(&frame) {
+                                    if let Some(parsed) = parse_sse_frame(&frame.data) {
                                         pending.push(parsed);
                                     }
                                 }
-                                Err(err) => pending.push(Err(err)),
+                                Err(err) => pending
+                                    .push(Err(ChatgptError::ResponsesStreamParse(err.to_string()))),
                             }
                         }
                     }

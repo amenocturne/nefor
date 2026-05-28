@@ -27,5 +27,6 @@ fs2 = "0.4"
 portable-pty = "0.9"
 notify = "7"
 futures = "0.3"
+bytes = "1"
 time = { version = "0.3", features = ["formatting", "parsing", "serde", "serde-well-known", "macros"] }
 semver = "1"

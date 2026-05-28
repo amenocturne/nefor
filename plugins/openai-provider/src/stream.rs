@@ -16,6 +16,7 @@ use std::error::Error as _;
 use std::time::Duration;
 
 use futures_util::StreamExt;
+use nefor_sse::SseBuffer;
 use reqwest::header::{ACCEPT, ACCEPT_ENCODING};
 use tokio_util::sync::CancellationToken;
 
@@ -196,7 +197,7 @@ where
     }
 
     let mut outcome = StreamOutcome::default();
-    let mut buffer = Vec::new();
+    let mut buffer = SseBuffer::new();
     let mut tc_acc = ToolCallAccumulator::new();
     // Latch flipped once we've fired ReasoningEvent::End — at the
     // boundary where reasoning stops and content/finish/usage takes
@@ -217,7 +218,7 @@ where
                     None => break,
                     Some(Err(e)) => return Err(StreamError::Body(reqwest_error_detail(&e))),
                     Some(Ok(bytes)) => {
-                        buffer.extend_from_slice(&bytes);
+                        buffer.push(&bytes);
                         drain_complete_frames(
                             &mut buffer,
                             &mut outcome,
@@ -354,7 +355,7 @@ fn reqwest_error_detail(err: &reqwest::Error) -> String {
 /// the model transitions out of thinking — either the first content
 /// delta arrives, or `finish_reason` lands. Subsequent calls are no-ops.
 fn drain_complete_frames<F, R>(
-    buffer: &mut Vec<u8>,
+    buffer: &mut SseBuffer,
     outcome: &mut StreamOutcome,
     tc_acc: &mut ToolCallAccumulator,
     reasoning_ended: &mut bool,
@@ -365,14 +366,9 @@ where
     F: FnMut(&str),
     R: FnMut(ReasoningEvent<'_>),
 {
-    while let Some((end, sep_len)) = find_frame_end(buffer) {
-        let drained: Vec<u8> = buffer.drain(..end + sep_len).collect();
-        let frame = std::str::from_utf8(&drained[..end])
-            .map_err(|err| StreamError::Body(format!("SSE frame was not valid UTF-8: {err}")))?;
-        let Some(payload) = frame_data_payload(frame) else {
-            continue;
-        };
-        match parse_sse_chunk(&payload) {
+    for frame in buffer.drain() {
+        let frame = frame.map_err(|err| StreamError::Body(err.to_string()))?;
+        match parse_sse_chunk(&frame.data) {
             SseEvent::Delta(text) => {
                 // Boundary: first content chunk closes the reasoning
                 // stream. The chat plugin uses this to flip the
@@ -450,34 +446,6 @@ where
     Ok(())
 }
 
-fn frame_data_payload(frame: &str) -> Option<String> {
-    let mut payload = String::new();
-    for line in frame.lines() {
-        let line = line.trim_end_matches('\r');
-        let Some(rest) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let rest = rest.strip_prefix(' ').unwrap_or(rest);
-        if !payload.is_empty() {
-            payload.push('\n');
-        }
-        payload.push_str(rest);
-    }
-    (!payload.is_empty()).then_some(payload)
-}
-
-fn find_frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
-    for i in 0..buffer.len().saturating_sub(1) {
-        if buffer[i] == b'\n' && buffer[i + 1] == b'\n' {
-            return Some((i, 2));
-        }
-        if i + 3 < buffer.len() && &buffer[i..i + 4] == b"\r\n\r\n" {
-            return Some((i, 4));
-        }
-    }
-    None
-}
-
 /// Per-stream accumulator for tool-call deltas. Indexed by the model's
 /// `tool_calls[*].index` so parallel calls don't interleave.
 ///
@@ -553,12 +521,14 @@ impl ToolCallAccumulator {
 mod tests {
     use super::*;
 
-    fn bytes(s: &str) -> Vec<u8> {
-        s.as_bytes().to_vec()
+    fn bytes(s: &str) -> SseBuffer {
+        let mut buffer = SseBuffer::new();
+        buffer.push_slice(s.as_bytes());
+        buffer
     }
 
-    fn push(buffer: &mut Vec<u8>, s: &str) {
-        buffer.extend_from_slice(s.as_bytes());
+    fn push(buffer: &mut SseBuffer, s: &str) {
+        buffer.push_slice(s.as_bytes());
     }
 
     #[test]
@@ -585,7 +555,7 @@ mod tests {
 
     #[test]
     fn drain_yields_deltas_then_finish_and_usage() {
-        let mut buffer = Vec::new();
+        let mut buffer = SseBuffer::new();
         push(
             &mut buffer,
             "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
@@ -643,10 +613,7 @@ mod tests {
         )
         .expect("drain ok");
         assert!(deltas.is_empty(), "no complete frames yet");
-        assert!(
-            std::str::from_utf8(&buffer).expect("utf8").contains("par"),
-            "buffer retained the partial frame"
-        );
+        assert!(deltas.is_empty(), "buffer retained the partial frame");
     }
 
     #[test]
@@ -722,7 +689,8 @@ mod tests {
             .position(|w| w == "é".as_bytes())
             .expect("contains e acute")
             + 1;
-        let mut buffer = raw_bytes[..split].to_vec();
+        let mut buffer = SseBuffer::new();
+        buffer.push_slice(&raw_bytes[..split]);
         let mut outcome = StreamOutcome::default();
         let mut deltas: Vec<String> = Vec::new();
         let mut tc = ToolCallAccumulator::new();
@@ -738,7 +706,7 @@ mod tests {
         .expect("partial drain ok");
         assert!(deltas.is_empty());
 
-        buffer.extend_from_slice(&raw_bytes[split..]);
+        buffer.push_slice(&raw_bytes[split..]);
         drain_complete_frames(
             &mut buffer,
             &mut outcome,
@@ -803,7 +771,7 @@ mod tests {
 
     #[test]
     fn drain_assembles_tool_calls_across_chunks() {
-        let mut buffer = Vec::new();
+        let mut buffer = SseBuffer::new();
         // Chunk 1: start
         push(&mut buffer, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_x\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]}}]}\n\n");
         // Chunks 2/3: argument fragments
@@ -844,7 +812,7 @@ mod tests {
     /// first content delta arrives. `full_text` only sees content.
     #[test]
     fn drain_separates_reasoning_from_content_with_boundary_end() {
-        let mut buffer = Vec::new();
+        let mut buffer = SseBuffer::new();
         // Three reasoning chunks first (Ollama's typical Qwen3 shape).
         push(
             &mut buffer,
@@ -907,7 +875,7 @@ mod tests {
     /// still fire exactly once so the chat plugin can finalise.
     #[test]
     fn drain_synthesises_reasoning_end_on_finish_when_no_content() {
-        let mut buffer = Vec::new();
+        let mut buffer = SseBuffer::new();
         push(
             &mut buffer,
             "data: {\"choices\":[{\"delta\":{\"reasoning\":\"thinking only\"}}]}\n\n",

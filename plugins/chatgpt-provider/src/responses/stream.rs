@@ -10,7 +10,6 @@
 //! than erroring, so the stream stays alive when the server adds new
 //! variants. JSON parse failures are logged and skipped.
 
-use bytes::Bytes;
 use futures::stream::BoxStream;
 use serde::Deserialize;
 
@@ -184,87 +183,11 @@ fn truncate_for_log(s: &str) -> String {
     }
 }
 
-/// Frame-level buffer that turns a byte stream into a sequence of
-/// `data:` payload strings.
-///
-/// SSE frames are separated by a blank line. We keep bytes until a full
-/// frame arrives, then validate UTF-8 once for the whole frame. That
-/// avoids corrupting split multi-byte codepoints across network reads.
-/// Inside a frame, every line that starts with `data:` contributes to
-/// the payload; other line prefixes (`event:`, `id:`, `:` comment,
-/// `retry:`) are ignored per the spec.
-///
-/// `push` appends raw bytes; `drain` returns every complete frame's
-/// concatenated `data` payload as a `String`. Trailing partial frames
-/// stay in the buffer for the next call.
-#[derive(Debug, Default)]
-pub struct SseBuffer {
-    buf: Vec<u8>,
-}
-
-impl SseBuffer {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn push(&mut self, bytes: &Bytes) {
-        self.buf.extend_from_slice(bytes);
-    }
-
-    /// Pop every complete frame, returning each one's joined `data`
-    /// payload. Partial trailing frames remain in `self.buf`.
-    pub fn drain(&mut self) -> Vec<Result<String, ChatgptError>> {
-        let mut out = Vec::new();
-        while let Some((end, sep_len)) = find_frame_end(&self.buf) {
-            let drained: Vec<u8> = self.buf.drain(..end + sep_len).collect();
-            let frame_bytes = &drained[..end];
-            let frame = match std::str::from_utf8(frame_bytes) {
-                Ok(frame) => frame,
-                Err(err) => {
-                    out.push(Err(ChatgptError::ResponsesStreamParse(format!(
-                        "SSE frame was not valid UTF-8: {err}"
-                    ))));
-                    continue;
-                }
-            };
-            let mut payload = String::new();
-            for line in frame.lines() {
-                let line = line.trim_end_matches('\r');
-                let Some(rest) = line.strip_prefix("data:") else {
-                    continue;
-                };
-                let rest = rest.strip_prefix(' ').unwrap_or(rest);
-                // Multi-line `data` payloads in SSE are joined with a
-                // literal newline per the spec. Single-line frames stay
-                // unchanged.
-                if !payload.is_empty() {
-                    payload.push('\n');
-                }
-                payload.push_str(rest);
-            }
-            if !payload.is_empty() {
-                out.push(Ok(payload));
-            }
-        }
-        out
-    }
-}
-
-fn find_frame_end(buf: &[u8]) -> Option<(usize, usize)> {
-    for i in 0..buf.len().saturating_sub(1) {
-        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
-            return Some((i, 2));
-        }
-        if i + 3 < buf.len() && &buf[i..i + 4] == b"\r\n\r\n" {
-            return Some((i, 4));
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use nefor_sse::SseBuffer;
 
     #[test]
     fn buffer_yields_two_complete_frames_keeps_partial() {
@@ -279,8 +202,9 @@ mod tests {
         assert!(frames[0]
             .as_ref()
             .expect("valid")
+            .data
             .contains("response.created"));
-        assert!(frames[1].as_ref().expect("valid").contains("Hi"));
+        assert!(frames[1].as_ref().expect("valid").data.contains("Hi"));
     }
 
     #[test]
@@ -304,7 +228,7 @@ mod tests {
         ));
         let frames = b.drain();
         assert_eq!(frames.len(), 1);
-        assert!(frames[0].as_ref().expect("valid").contains("Hi"));
+        assert!(frames[0].as_ref().expect("valid").data.contains("Hi"));
     }
 
     #[test]
@@ -322,6 +246,6 @@ mod tests {
         b.push(&Bytes::copy_from_slice(&bytes[split..]));
         let frames = b.drain();
         assert_eq!(frames.len(), 1);
-        assert!(frames[0].as_ref().expect("valid").contains("é"));
+        assert!(frames[0].as_ref().expect("valid").data.contains("é"));
     }
 }

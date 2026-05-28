@@ -209,6 +209,7 @@ dependencies = [
  "futures",
  "nefor-plugin-sdk",
  "nefor-protocol",
+ "nefor-sse",
  "rand 0.8.6",
  "reqwest",
  "serde",
@@ -1458,6 +1459,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nefor-sse"
+version = "0.2.0"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "nefor-tui"
 version = "0.2.0"
 dependencies = [
@@ -1597,6 +1606,7 @@ dependencies = [
  "futures-util",
  "nefor-plugin-sdk",
  "nefor-protocol",
+ "nefor-sse",
  "reqwest",
  "serde",
  "serde_json",
