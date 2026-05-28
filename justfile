@@ -9,23 +9,23 @@ run:
 setup:
     cargo fetch
 
-# Fast validation for normal development and agent iteration.
+# Default fast validation for small, localized changes.
 test: test-fast
 
-# Formatting plus the fast test set.
+# Formatting plus fast tests; use before committing ordinary scoped changes.
 check: fmt-check test-fast
 
 # Rust formatting check only.
 fmt-check:
     cargo fmt --all --check
 
-# Small confidence set for changes around starter Lua, tool plumbing, and core engine code.
+# Core confidence set for engine, starter Lua, and tool plumbing changes.
 test-fast:
     cargo test -p nefor --lib
     cargo test -p nefor --test starter_tool_gate_test
     cargo test -p tool-gate-plugin
 
-# Starter-focused integration tests.
+# Starter Lua, session, workflow, role, and bundled tool integration tests.
 test-starter:
     cargo test -p nefor --test starter_tool_gate_test
     cargo test -p nefor --test starter_sessions_test
@@ -39,7 +39,7 @@ test-starter:
     cargo test -p nefor --test starter_ncp_test
     cargo test -p nefor --test starter_run_reasoner_test
 
-# Provider tests. These may need local socket binding permissions in sandboxed runtimes.
+# Provider/API translation tests; may need local socket binding permissions.
 test-provider:
     cargo test -p openai-provider
     cargo test -p chatgpt-provider
@@ -47,15 +47,15 @@ test-provider:
     cargo test -p nefor --test openai_provider_lib_test
     cargo test -p nefor --test starter_openai_provider_test
 
-# TUI library tests without the slower chat integration suite.
+# TUI rendering, layout, input, scrolling, and widget unit tests.
 test-tui:
     cargo test -p nefor-tui --lib
 
-# Chat integration tests share process-global env vars, so they run single-threaded.
+# TUI chat workflow, replay, autocomplete, and input integration tests.
 test-tui-chat:
     cargo test -p nefor-tui --test chat_test -- --test-threads=1
 
-# Full local suite. CI runs the same Cargo shape directly.
+# Full local suite for cross-cutting or release-level validation.
 test-all:
     cargo test --workspace --exclude nefor-tui
     cargo test -p nefor-tui --lib
