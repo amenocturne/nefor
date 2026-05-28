@@ -9,10 +9,54 @@ run:
 setup:
     cargo fetch
 
-# Run the full workspace test suite. chat_test runs single-threaded
-# because tests share process-global env vars (NEFOR_DATA_DIR) —
-# parallel execution causes getenv/setenv races across threads.
-test:
+# Fast validation for normal development and agent iteration.
+test: test-fast
+
+# Formatting plus the fast test set.
+check: fmt-check test-fast
+
+# Rust formatting check only.
+fmt-check:
+    cargo fmt --all --check
+
+# Small confidence set for changes around starter Lua, tool plumbing, and core engine code.
+test-fast:
+    cargo test -p nefor --lib
+    cargo test -p nefor --test starter_tool_gate_test
+    cargo test -p tool-gate-plugin
+
+# Starter-focused integration tests.
+test-starter:
+    cargo test -p nefor --test starter_tool_gate_test
+    cargo test -p nefor --test starter_sessions_test
+    cargo test -p nefor --test starter_openai_provider_test
+    cargo test -p nefor --test starter_agentic_workflow_test
+    cargo test -p nefor --test starter_agentic_cli_test
+    cargo test -p nefor --test starter_agent_reasoner_test
+    cargo test -p nefor --test starter_lead_workflow_test
+    cargo test -p nefor --test starter_lead_role_test
+    cargo test -p nefor --test starter_loop_counter_reasoner_test
+    cargo test -p nefor --test starter_ncp_test
+    cargo test -p nefor --test starter_run_reasoner_test
+
+# Provider tests. These may need local socket binding permissions in sandboxed runtimes.
+test-provider:
+    cargo test -p openai-provider
+    cargo test -p chatgpt-provider
+    cargo test -p generic-provider
+    cargo test -p nefor --test openai_provider_lib_test
+    cargo test -p nefor --test starter_openai_provider_test
+
+# TUI library tests without the slower chat integration suite.
+test-tui:
+    cargo test -p nefor-tui --lib
+
+# Chat integration tests share process-global env vars, so they run single-threaded.
+test-tui-chat:
+    cargo test -p nefor-tui --test chat_test -- --test-threads=1
+
+# Full local suite. CI runs the same Cargo shape directly.
+test-all:
     cargo test --workspace --exclude nefor-tui
     cargo test -p nefor-tui --lib
     cargo test -p nefor-tui --test chat_test -- --test-threads=1
