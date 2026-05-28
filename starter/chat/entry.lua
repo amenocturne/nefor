@@ -30,6 +30,12 @@ function M.system(text)
   return { role = "system", kind = "text", text = text, v = v }
 end
 
+function M.assistant(text)
+  local v = next_v()
+  log.log("entry", "create kind=text role=assistant v=%d", v)
+  return { role = "assistant", kind = "text", text = text, v = v }
+end
+
 function M.assistant_stream()
   local v = next_v()
   log.log("entry", "create kind=stream role=assistant v=%d", v)

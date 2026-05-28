@@ -43,7 +43,8 @@
 -- `NEFOR_DATA_DIR` env var > `XDG_DATA_HOME/nefor`).
 -- Path: `<root>/sessions/<id>.jsonl`. Parent dir is created on init.
 
-local json = nefor.json
+local json           = nefor.json
+local history_replay = require("core.history_replay")
 
 local state = {
   ---@type string|nil
@@ -243,7 +244,7 @@ local function count_replay_entries(path)
   for line in fh:lines() do
     if line:sub(1, 12) ~= [[{"_session":]] then
       local ok, decoded = pcall(json.decode, line)
-      if ok and decoded.origin == "step" then
+      if ok and type(decoded) == "table" and decoded.origin == "step" then
         count = count + 1
       end
     end
@@ -270,7 +271,7 @@ local function replay_jsonl(path)
       -- target=nil broadcasts and a string targets one peer. Plugin-
       -- origin entries are inputs — we don't re-emit them, peers re-
       -- announce themselves on connect.
-      if ok and decoded.origin == "step" then
+      if ok and type(decoded) == "table" and decoded.origin == "step" then
         send_msg({
           kind    = "replay_envelope",
           payload = decoded.payload,
@@ -356,11 +357,34 @@ local function do_resume(target_session_id)
   -- inline before calling `to_plugin` for each entry — bus.on_event
   -- subscribers fire too late for the same batch).
   local total = new_path and count_replay_entries(new_path) or 0
-  send_msg({ kind = "control", event = "sessions.replay.start",
-             extra = { session_id = target_session_id, count = total } })
-  local replayed = new_path and replay_jsonl(new_path) or 0
-  send_msg({ kind = "control", event = "sessions.replay.end",
-             extra = { session_id = target_session_id } })
+  local replayed = 0
+  local replay_started = false
+  local replay_ended = false
+  history_replay.set(true)
+  state.in_replay_window = true
+  local ok, err = pcall(function()
+    send_msg({ kind = "control", event = "sessions.replay.start",
+               extra = { session_id = target_session_id, count = total } })
+    replay_started = true
+    replayed = new_path and replay_jsonl(new_path) or 0
+    send_msg({ kind = "control", event = "sessions.replay.end",
+               extra = { session_id = target_session_id } })
+    replay_ended = true
+  end)
+  if replay_started and not replay_ended then
+    pcall(function()
+      send_msg({ kind = "control", event = "sessions.replay.end",
+                 extra = { session_id = target_session_id } })
+    end)
+  end
+  history_replay.set(false)
+  state.in_replay_window = false
+  if not ok and nefor.log then
+    nefor.log.error("sessions.resume: replay failed", {
+      session_id = target_session_id,
+      error      = tostring(err),
+    })
+  end
 
   -- 5. Coalesced "we're back" signal.
   send_msg({ kind = "control", event = "sessions.resume_done",

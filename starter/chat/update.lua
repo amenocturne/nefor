@@ -503,6 +503,11 @@ local function handle_message_append(msg, state)
       Entry.system(text)
     ), {}
   end
+  if role == "assistant" then
+    return transcript.push_entry(shallow_merge(state, turn_state),
+      Entry.assistant(text)
+    ), {}
+  end
   return transcript.push_entry(shallow_merge(state, turn_state), {
     role = role, text = text, kind = "text",
   }), {}

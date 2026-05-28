@@ -1063,6 +1063,170 @@ fn replay_window_frames_resume_and_skips_persistence_inside() {
     }
 }
 
+#[test]
+fn resume_sets_global_history_replay_flag_during_replay_burst() {
+    // `core.history_replay.active()` is the synchronous replay gate read by
+    // pure-Lua actors such as agentic-loop. The sessions actor must hold it
+    // true while it emits replay.start, replayed envelopes, and replay.end,
+    // then release it before returning.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
+
+    let target_id = "77777777-2222-4333-8444-555555555555";
+    let sessions_dir = tempdir.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("mkdir");
+    let target_path = sessions_dir.join(format!("{target_id}.jsonl"));
+    let preseed = format!(
+        concat!(
+            r#"{{"_session":true,"session_id":"{id}","started_at":"2026-05-04T00:00:00.000Z"}}"#,
+            "\n",
+            r#"{{"ts":"2026-05-04T00:00:00.001Z","origin":"step","payload":"{{\"type\":\"event\",\"from\":\"nefor-tui\",\"body\":{{\"kind\":\"chat.input.submit\",\"text\":\"old prompt\"}}}}"}}"#,
+            "\n",
+        ),
+        id = target_id
+    );
+    std::fs::write(&target_path, &preseed).expect("seed target");
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+
+    let script = format!(
+        r#"
+        local json = nefor.json
+        local replay = require("core.history_replay")
+        _active_trace = {{}}
+        nefor.engine.send = function(payload, _target)
+            local ok, decoded = pcall(json.decode, payload)
+            if ok and type(decoded) == "table"
+               and type(decoded.body) == "table"
+               and type(decoded.body.kind) == "string" then
+                _active_trace[#_active_trace + 1] = decoded.body.kind .. ":" .. tostring(replay.active())
+            end
+        end
+        sessions = require("sessions")
+        sessions.init()
+        _active_trace = {{}}
+        sessions.resume("{target_id}")
+        _active_after = replay.active()
+        "#
+    );
+    lua.load(&script).exec().expect("resume");
+
+    let trace: Table = lua.globals().get("_active_trace").expect("_active_trace");
+    let len = trace.len().expect("len") as usize;
+    let ordered: Vec<String> = (1..=len)
+        .map(|i| trace.get::<String>(i).expect("trace entry"))
+        .collect();
+
+    assert!(
+        ordered.iter().any(|v| v == "sessions.replay.start:true"),
+        "replay.start must be emitted with history_replay.active=true: {ordered:?}"
+    );
+    assert!(
+        ordered.iter().any(|v| v == "chat.input.submit:true"),
+        "replayed envelope must be emitted with history_replay.active=true: {ordered:?}"
+    );
+    assert!(
+        ordered.iter().any(|v| v == "sessions.replay.end:true"),
+        "replay.end must be emitted before releasing history_replay: {ordered:?}"
+    );
+    let active_after: bool = lua
+        .load(r#"return _active_after"#)
+        .eval()
+        .expect("active after");
+    assert!(
+        !active_after,
+        "history_replay.active() must be false after resume"
+    );
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
+    }
+}
+
+#[test]
+fn resume_skips_malformed_and_non_object_jsonl_rows() {
+    // Session logs are append-only files; a truncated or manually edited row
+    // should not abort resume. Only valid object rows with origin=="step" are
+    // replayed and counted.
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
+
+    let target_id = "88888888-2222-4333-8444-555555555555";
+    let sessions_dir = tempdir.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("mkdir");
+    let target_path = sessions_dir.join(format!("{target_id}.jsonl"));
+    let preseed = format!(
+        concat!(
+            r#"{{"_session":true,"session_id":"{id}","started_at":"2026-05-04T00:00:00.000Z"}}"#,
+            "\n",
+            "42\n",
+            "{{not-json\n",
+            r#"{{"ts":"2026-05-04T00:00:00.001Z","origin":"step","payload":"{{\"type\":\"event\",\"from\":\"agentic-loop\",\"body\":{{\"kind\":\"chat.message.append\",\"role\":\"user\",\"text\":\"survived\"}}}}"}}"#,
+            "\n",
+        ),
+        id = target_id
+    );
+    std::fs::write(&target_path, &preseed).expect("seed target");
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+
+    let script = format!(
+        r#"
+        local json = nefor.json
+        _seen = {{}}
+        _resume_done_replayed = nil
+        nefor.engine.send = function(payload, _target)
+            local ok, decoded = pcall(json.decode, payload)
+            if ok and type(decoded) == "table"
+               and type(decoded.body) == "table"
+               and type(decoded.body.kind) == "string" then
+                _seen[#_seen + 1] = decoded.body.kind
+                if decoded.body.kind == "sessions.resume_done" then
+                  _resume_done_replayed = decoded.body.replayed
+                end
+            end
+        end
+        sessions = require("sessions")
+        sessions.init()
+        _seen = {{}}
+        sessions.resume("{target_id}")
+        "#
+    );
+    lua.load(&script).exec().expect("resume skips bad rows");
+
+    let replayed: i64 = lua
+        .load(r#"return _resume_done_replayed"#)
+        .eval()
+        .expect("replayed");
+    assert_eq!(
+        replayed, 1,
+        "resume_done.replayed must count only the valid step row"
+    );
+    let seen: Table = lua.globals().get("_seen").expect("_seen");
+    let len = seen.len().expect("len") as usize;
+    let kinds: Vec<String> = (1..=len)
+        .map(|i| seen.get::<String>(i).expect("kind"))
+        .collect();
+    assert!(
+        kinds.iter().any(|k| k == "chat.message.append"),
+        "valid row should still replay after malformed rows: {kinds:?}"
+    );
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
+    }
+}
+
 // Process-global lock to serialise tests that mutate NEFOR_DATA_DIR.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
