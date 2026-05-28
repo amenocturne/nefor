@@ -3534,6 +3534,32 @@ fn replay_paints_transcript_between_session_start_and_resume_done() {
     }
 }
 
+#[test]
+fn height_cache_tolerates_unversioned_replay_entries() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+
+    let measured: i64 = engine
+        .lua()
+        .load(
+            r#"
+            local height_cache = require("chat.height_cache")
+            height_cache.set_width(40)
+            return height_cache.get({
+              role = "assistant",
+              kind = "text",
+              text = "legacy replay entry without cache version",
+            }, function(e)
+              return tui.text { content = e.text, wrap = "word" }
+            end)
+            "#,
+        )
+        .eval()
+        .expect("unversioned replay entry must render without cache crash");
+
+    assert!(measured > 0, "expected measured height, got {measured}");
+}
+
 /// `sessions.session_end` deliberately does NOT touch `entries` —
 /// the trigger paths (`/new`, `/resume`) own the local transcript
 /// clear. Earlier the handler wiped entries here, but that was a

@@ -18,13 +18,13 @@ function M.set_width(w)
 end
 
 function M.get(entry, render_fn)
-  local v = entry.v
-  if v == nil then
+  local v = entry and entry.v
+  if type(v) ~= "number" and type(v) ~= "string" then
     return tui.measure(render_fn(entry), current_width)
   end
   local cached = cache[v]
   if cached then
-    log.log("cache", "hit v=%d h=%d", v, cached)
+    log.log("cache", "hit v=%s h=%d", tostring(v), cached)
     return cached
   end
   if cache_size >= MAX_CACHE_SIZE then
@@ -35,7 +35,7 @@ function M.get(entry, render_fn)
   local h = tui.measure(render_fn(entry), current_width)
   cache[v] = h
   cache_size = cache_size + 1
-  log.log("cache", "miss v=%d w=%d -> h=%d (size=%d)", v, current_width, h, cache_size)
+  log.log("cache", "miss v=%s w=%s -> h=%d (size=%d)", tostring(v), tostring(current_width), h, cache_size)
   return h
 end
 
