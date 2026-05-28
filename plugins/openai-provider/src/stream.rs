@@ -158,8 +158,7 @@ where
         .post(endpoint)
         .header(ACCEPT, "text/event-stream")
         .header(ACCEPT_ENCODING, "identity")
-        .json(&req)
-        .timeout(Duration::from_secs(120));
+        .json(&req);
     if let Some(k) = api_key {
         builder = apply_auth(builder, auth_header, k);
     }
@@ -172,9 +171,12 @@ where
                 ..Default::default()
             });
         }
-        r = builder.send() => match r {
-            Ok(r) => r,
-            Err(e) => return Err(StreamError::Request(reqwest_error_detail(&e))),
+        r = tokio::time::timeout(Duration::from_secs(120), builder.send()) => match r {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Err(StreamError::Request(reqwest_error_detail(&e))),
+            Err(_) => return Err(StreamError::Request(
+                "timed out waiting for response headers after 120s".to_owned(),
+            )),
         },
     };
 

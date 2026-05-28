@@ -223,16 +223,13 @@ impl ResponsesClient {
         let mut attempt: u32 = 0;
         loop {
             let headers = headers::build_headers(auth, &self.installation_id, &self.originator)?;
-            let builder = self
-                .http
-                .post(url)
-                .headers(headers)
-                .timeout(REQUEST_TIMEOUT);
-            let send_result = build_body(builder).send().await;
+            let builder = self.http.post(url).headers(headers);
+            let send_result =
+                tokio::time::timeout(REQUEST_TIMEOUT, build_body(builder).send()).await;
 
             match send_result {
-                Ok(resp) if resp.status().is_success() => return Ok(resp),
-                Ok(resp) => {
+                Ok(Ok(resp)) if resp.status().is_success() => return Ok(resp),
+                Ok(Ok(resp)) => {
                     let status = resp.status().as_u16();
                     if !is_transient_status(status) {
                         return Err(http_error_from_response(resp, status).await);
@@ -262,7 +259,7 @@ impl ResponsesClient {
                     tokio::time::sleep(next_delay).await;
                     attempt += 1;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     if !is_transient_transport(&e) {
                         return Err(e.into());
                     }
@@ -283,6 +280,31 @@ impl ResponsesClient {
                         delay_ms = next_delay.as_millis() as u64,
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "network error; retrying after backoff",
+                    );
+                    tokio::time::sleep(next_delay).await;
+                    attempt += 1;
+                }
+                Err(_) => {
+                    let next_delay = retry_delay(attempt, None);
+                    if !budget_allows(started, next_delay) {
+                        tracing::warn!(
+                            op,
+                            attempt = attempt + 1,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            budget_ms = RETRY_BUDGET_MS,
+                            "retry budget exhausted after response-header timeout; surfacing error",
+                        );
+                        return Err(ChatgptError::ResponsesStreamRead(format!(
+                            "timed out waiting for response headers after {}s",
+                            REQUEST_TIMEOUT.as_secs()
+                        )));
+                    }
+                    tracing::warn!(
+                        op,
+                        attempt = attempt + 1,
+                        delay_ms = next_delay.as_millis() as u64,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "response-header timeout; retrying after backoff",
                     );
                     tokio::time::sleep(next_delay).await;
                     attempt += 1;
