@@ -31,6 +31,12 @@
 -- permission_response.reason → tool.result.error so the agent learns
 -- exactly what to do next.
 --
+-- `edit_file` / `write_file`: auto-approved only while lead-workflow
+-- has an approved plan. `edit_file` receives the small-edit policy
+-- below before it reaches basic-tools. Without approval these are
+-- denied instead of popped up, so direct file mutation cannot bypass
+-- the plan gate.
+--
 -- Other tools: defer to the user (popup) unless the agent is read-only.
 --
 -- ## Read-only agents
@@ -120,7 +126,25 @@ local function probe_da()
   return da_cmd
 end
 
-local function emit_response(id, decision, reason)
+local SMALL_EDIT_POLICY = {
+  require_unique_match = true,
+  max_changed_lines    = 40,
+  max_bytes_delta      = 4096,
+}
+
+local function copy_table(t)
+  local out = {}
+  for k, v in pairs(t or {}) do out[k] = v end
+  return out
+end
+
+local function with_policy(args, policy)
+  local out = copy_table(args)
+  out.policy = policy
+  return out
+end
+
+local function emit_response(id, decision, reason, args)
   local body = {
     kind     = "tool.permission_response",
     id       = id,
@@ -128,6 +152,9 @@ local function emit_response(id, decision, reason)
   }
   if type(reason) == "string" and #reason > 0 then
     body.reason = reason
+  end
+  if type(args) == "table" then
+    body.args = args
   end
   emit(nil, body)
 end
@@ -188,6 +215,23 @@ local function handle_permission_request(body)
   local tool = body.tool or body.name
   local args = body.args
   local is_ro = body.read_only == true
+
+  if tool == "edit_file" or tool == "write_file" then
+    if is_ro then
+      emit_response(id, "deny", tool .. " is not available to read-only agents")
+      return
+    end
+    if has_approved_plan() then
+      if tool == "edit_file" then
+        emit_response(id, "approve", nil, with_policy(args, SMALL_EDIT_POLICY))
+      else
+        emit_response(id, "approve")
+      end
+    else
+      emit_response(id, "deny", tool .. " requires an approved plan")
+    end
+    return
+  end
 
   if tool == "bash" then
     local cmd = (type(args) == "table" and args.command) or nil

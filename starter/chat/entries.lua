@@ -101,7 +101,7 @@ local function tool_salient(entry)
   if name == "Read" or name == "Edit" or name == "Write" or name == "MultiEdit" then
     return input.file_path
   end
-  if name == "read_file" or name == "write_file" then return input.path end
+  if name == "read_file" or name == "edit_file" or name == "write_file" then return input.path end
   if name == "Grep" or name == "Glob" then return input.pattern end
   if name == "spawn_graph" then
     local nodes = input.graph and input.graph.nodes or nil

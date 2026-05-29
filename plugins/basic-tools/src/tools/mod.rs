@@ -21,6 +21,7 @@ use serde_json::Value;
 use crate::error::ToolError;
 
 pub mod bash;
+pub mod edit_file;
 pub mod read_file;
 pub mod search_text;
 pub mod write_file;
@@ -51,6 +52,11 @@ pub const TOOLS: &[ToolDescriptor] = &[
         schema: write_file::schema,
     },
     ToolDescriptor {
+        name: edit_file::NAME,
+        description: edit_file::DESCRIPTION,
+        schema: edit_file::schema,
+    },
+    ToolDescriptor {
         name: bash::NAME,
         description: bash::DESCRIPTION,
         schema: bash::schema,
@@ -73,6 +79,7 @@ pub async fn run_tool(name: &str, args: &Value) -> Result<String, ToolError> {
     match name {
         read_file::NAME => read_file::run(args).await,
         write_file::NAME => write_file::run(args).await,
+        edit_file::NAME => edit_file::run(args).await,
         bash::NAME => bash::run(args).await,
         search_text::NAME => search_text::run(args).await,
         other => Err(ToolError::BadArgs {

@@ -107,7 +107,7 @@ M.AGENT_CONFIGS = {
   builder = {
     system_prompt  = load_or_placeholder("builder"),
     model          = nil,
-    tool_allowlist = { "read_file", "list_dir", "search_text", "write_file", "bash" },
+    tool_allowlist = { "read_file", "list_dir", "search_text", "edit_file", "write_file", "bash" },
     read_only      = false,
   },
   reviewer = {
@@ -118,13 +118,12 @@ M.AGENT_CONFIGS = {
   },
 }
 
--- Tools the lead orchestrator has access to. The lead does NOT get
--- read/grep/find/ls/glob/write/edit/bash directly — investigation goes
--- through `explorer` nodes, changes through `builder` nodes. Keep this
--- list minimal in v0.1; the team port adds richer tools (`progress`,
--- `critique`, `terminate`) on top.
+-- Tools the lead orchestrator has access to. Broad writes and bash go
+-- through builder nodes; the lead only gets narrow exact-replace edits
+-- after the plan gate approves the current turn.
 M.ORCHESTRATION_TOOLS = {
   "read_file",
+  "edit_file",
   "dispatch-graph",
   "write-review",
 }

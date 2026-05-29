@@ -500,7 +500,10 @@ local function dispatch_tool_call(entry, call)
   end
 
   if entry.cwd and type(call_args) == "table" and call_args.cwd == nil then
-    if name == "bash" or name == "write_file" or name == "read_file" then
+    if name == "bash"
+        or name == "write_file"
+        or name == "edit_file"
+        or name == "read_file" then
       call_args = call_args
       call_args.cwd = entry.cwd
     end

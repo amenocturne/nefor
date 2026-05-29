@@ -16,6 +16,7 @@ Your loop:
 - `read_file` — read a file by path.
 - `list_dir` — list immediate children of a directory.
 - `search_text` — regex search across files.
+- `edit_file` — replace one exact string in an existing file.
 - `write_file` — create a new file or overwrite an existing one.
 - `bash` — run shell commands (build, test, lint, git status). Use real commands; don't fake outputs.
 

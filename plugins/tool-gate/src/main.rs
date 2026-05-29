@@ -522,13 +522,14 @@ async fn handle_permission_response(
     };
 
     if decision == "approve" {
+        let args = body.get("args").cloned().unwrap_or(approval.args);
         forward_to_source(
             out_tx,
             state,
             &approval.outer_id,
             &approval.source,
             &approval.name,
-            approval.args,
+            args,
         )
         .await?;
     } else {
@@ -863,6 +864,58 @@ mod tests {
             Some("basic-tools.tool.invoke")
         );
         assert!(!state.awaiting_approval.contains_key("prov-7"));
+    }
+
+    #[tokio::test]
+    async fn approval_can_override_forwarded_args() {
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+        let mut state = make_state();
+        let body = advertise_body(
+            "basic-tools",
+            json!([{"name": "edit_file", "description": "", "parameters": {}}]),
+        );
+        handle_tools_advertise(&tx, &body, &mut state)
+            .await
+            .unwrap();
+        let _ = rx.recv().await;
+
+        let invoke = json!({
+            "kind": "tool-gate.tool.invoke",
+            "id": "prov-8",
+            "name": "edit_file",
+            "args": {"path": "/x", "old_string": "a", "new_string": "b"}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        handle_tool_invoke(&tx, &invoke, &mut state).await.unwrap();
+        let _request = rx.recv().await.unwrap();
+
+        let response = json!({
+            "kind": "tool.permission_response",
+            "id": "prov-8",
+            "decision": "approve",
+            "args": {
+                "path": "/x",
+                "old_string": "a",
+                "new_string": "b",
+                "policy": {"max_changed_lines": 4}
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        handle_permission_response(&tx, &response, &mut state)
+            .await
+            .unwrap();
+
+        let msg = rx.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
+        let args = v
+            .get("body")
+            .and_then(|b| b.get("args"))
+            .expect("forwarded args");
+        assert_eq!(args["policy"]["max_changed_lines"], json!(4));
     }
 
     #[tokio::test]
