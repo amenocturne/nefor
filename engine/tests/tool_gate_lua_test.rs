@@ -540,6 +540,38 @@ fn tool_result_payload_treats_bool_error_as_err_with_empty_output() {
     assert!(err);
 }
 
+#[test]
+fn tool_result_payload_summarizes_image_media_output() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("nefor stub");
+    set_package_path(&lua).expect("package.path");
+
+    let result: Table = lua
+        .load(
+            r#"
+            local lib = require("tool-gate")
+            local out, err = lib.tool_result_payload({
+              kind = "tool.result",
+              id = "x",
+              output = {
+                type = "media",
+                media_type = "image/png",
+                filename = "paste.png",
+                data = "abc",
+              },
+            })
+            return { out = out, err = err }
+            "#,
+        )
+        .eval()
+        .expect("eval");
+
+    let out: String = result.get("out").expect("out");
+    let err: bool = result.get("err").expect("err");
+    assert_eq!(out, "[image result: paste.png (image/png)]");
+    assert!(!err);
+}
+
 // ----------------------------------------------------------------
 // maybe_dump_output — disk-write side-effect bridge
 // ----------------------------------------------------------------

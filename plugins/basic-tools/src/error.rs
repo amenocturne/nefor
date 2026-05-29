@@ -40,6 +40,24 @@ pub enum ToolError {
         path: String,
     },
 
+    /// The image is larger than the image-read cap.
+    #[error("image file too large ({size} bytes; cap is {cap} bytes): {path}")]
+    ImageTooLarge {
+        /// Actual size in bytes.
+        size: u64,
+        /// Configured cap in bytes.
+        cap: u64,
+        /// Path the caller asked for.
+        path: String,
+    },
+
+    /// The file is not one of the image formats `read_image` accepts.
+    #[error("unsupported image format: {path}")]
+    UnsupportedImage {
+        /// Path the caller asked for.
+        path: String,
+    },
+
     /// The file contents weren't valid UTF-8.
     #[error("file is not valid UTF-8: {path}")]
     NotUtf8 {

@@ -554,10 +554,7 @@ async fn dispatch_event(
                     return Ok(());
                 }
             };
-            let output = body
-                .get("output")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+            let output = body.get("output").map(tool_output_for_text_model);
             let error = body.get("error").and_then(Value::as_str).map(str::to_owned);
             let delivered = ctx
                 .broker
@@ -982,6 +979,31 @@ async fn handle_chat_complete(
     };
     spawn_turn(ctx.clone(), chat_id, cancel);
     Ok(())
+}
+
+fn tool_output_for_text_model(value: &Value) -> String {
+    if let Some(s) = value.as_str() {
+        return s.to_owned();
+    }
+
+    if value.get("type").and_then(Value::as_str) == Some("media") {
+        let media_type = value
+            .get("media_type")
+            .and_then(Value::as_str)
+            .unwrap_or("media");
+        if media_type.starts_with("image/") {
+            let filename = value
+                .get("filename")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("image");
+            return format!(
+                "ERROR: Cannot read \"{filename}\" (this model does not support image input). Inform the user."
+            );
+        }
+    }
+
+    value.to_string()
 }
 
 async fn handle_chat_delete(
@@ -1711,6 +1733,21 @@ mod tests {
             Some("HTTP 401")
         );
         assert_eq!(body.get("source").and_then(Value::as_str), Some("oauth"));
+    }
+
+    #[test]
+    fn media_tool_output_becomes_user_visible_error_for_text_model() {
+        let output = serde_json::json!({
+            "type": "media",
+            "media_type": "image/png",
+            "filename": "diagram.png",
+            "data": "abc"
+        });
+        let text = tool_output_for_text_model(&output);
+        assert_eq!(
+            text,
+            "ERROR: Cannot read \"diagram.png\" (this model does not support image input). Inform the user."
+        );
     }
 
     #[test]

@@ -213,7 +213,7 @@ async fn handle_tool_invoke(
 
     match run_tool(&name, &args).await {
         Ok(output) => {
-            send_event(out_tx, tool_result_ok_body(&id, &output)).await?;
+            send_event(out_tx, tool_result_ok_body(&id, output)).await?;
         }
         Err(e) => {
             let message = render_tool_error(&e);
@@ -281,11 +281,11 @@ fn tools_advertise_body(gate: &str) -> Map<String, Value> {
     m
 }
 
-fn tool_result_ok_body(id: &str, output: &str) -> Map<String, Value> {
+fn tool_result_ok_body(id: &str, output: Value) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("kind".into(), Value::String("tool.result".into()));
     m.insert("id".into(), Value::String(id.to_owned()));
-    m.insert("output".into(), Value::String(output.to_owned()));
+    m.insert("output".into(), output);
     m
 }
 
@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn tool_result_ok_body_carries_id_and_output() {
-        let b = tool_result_ok_body("call-1", "hello");
+        let b = tool_result_ok_body("call-1", Value::String("hello".into()));
         assert_eq!(b.get("kind").and_then(Value::as_str), Some("tool.result"));
         assert_eq!(b.get("id").and_then(Value::as_str), Some("call-1"));
         assert_eq!(b.get("output").and_then(Value::as_str), Some("hello"));

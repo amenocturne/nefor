@@ -23,6 +23,7 @@ use crate::error::ToolError;
 pub mod bash;
 pub mod edit_file;
 pub mod read_file;
+pub mod read_image;
 pub mod search_text;
 pub mod write_file;
 
@@ -45,6 +46,11 @@ pub const TOOLS: &[ToolDescriptor] = &[
         name: read_file::NAME,
         description: read_file::DESCRIPTION,
         schema: read_file::schema,
+    },
+    ToolDescriptor {
+        name: read_image::NAME,
+        description: read_image::DESCRIPTION,
+        schema: read_image::schema,
     },
     ToolDescriptor {
         name: write_file::NAME,
@@ -75,13 +81,14 @@ pub const TOOLS: &[ToolDescriptor] = &[
 /// closed set. The caller MUST match `name` against [`TOOLS`] before
 /// invoking; this is just a defensive fallback so a stale catalog doesn't
 /// panic.
-pub async fn run_tool(name: &str, args: &Value) -> Result<String, ToolError> {
+pub async fn run_tool(name: &str, args: &Value) -> Result<Value, ToolError> {
     match name {
-        read_file::NAME => read_file::run(args).await,
-        write_file::NAME => write_file::run(args).await,
-        edit_file::NAME => edit_file::run(args).await,
-        bash::NAME => bash::run(args).await,
-        search_text::NAME => search_text::run(args).await,
+        read_file::NAME => read_file::run(args).await.map(Value::String),
+        read_image::NAME => read_image::run(args).await,
+        write_file::NAME => write_file::run(args).await.map(Value::String),
+        edit_file::NAME => edit_file::run(args).await.map(Value::String),
+        bash::NAME => bash::run(args).await.map(Value::String),
+        search_text::NAME => search_text::run(args).await.map(Value::String),
         other => Err(ToolError::BadArgs {
             tool: other.to_owned(),
             message: format!("unknown tool `{other}`"),

@@ -2,9 +2,7 @@
 
 NCP v0.1 plugin: file/bash/etc. tool primitives.
 
-v1 ships a single tool — `read_file`. `write_file` and `bash` land later
-behind permission gating; the wire contract is shaped to accommodate them
-without changes.
+v1 ships read-only file primitives plus gated mutation/execution tools.
 
 This is phase 1 of nefor's tool-calling story. Phase 2 wires the tool
 catalog through `openai-provider`'s API tool-call loop so model-driven calls
@@ -45,6 +43,24 @@ Rejects:
 v1 deliberately does NOT validate path traversal or sandbox. The caller
 passes whatever path they want; basic-tools is trusted on the bus. Sandboxing
 lands with the permission-gating story alongside `write_file` and `bash`.
+
+### `read_image`
+
+Reads an image file and returns a structured media object:
+
+```json
+{
+  "type": "media",
+  "media_type": "image/png",
+  "filename": "screenshot.png",
+  "data": "<base64>"
+}
+```
+
+Supported formats are PNG, JPEG, GIF, and WebP, detected from file bytes. The
+tool does not describe or OCR the image; providers either pass the media to a
+vision-capable model or replace it with an explicit error when the active model
+does not support image input.
 
 ## Future direction
 

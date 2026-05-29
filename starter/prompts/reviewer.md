@@ -14,7 +14,8 @@ You do not need to find issues to be useful. A clean review with `approved: true
 
 ## Tools you have
 
-- `read_file` — read a file by path.
+- `read_file` — read a text file by path.
+- `read_image` — load an image file for visual inspection. If the active model cannot consume images, report that limitation to the user.
 - `list_dir` — list immediate children of a directory.
 - `search_text` — regex search across files (`path:line:match`).
 

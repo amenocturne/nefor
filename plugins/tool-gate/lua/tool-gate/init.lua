@@ -192,6 +192,15 @@ function M.tool_result_payload(body)
   local payload_output
   if type(body.output) == "string" then
     payload_output = body.output
+  elseif type(body.output) == "table"
+      and body.output.type == "media"
+      and type(body.output.media_type) == "string"
+      and body.output.media_type:match("^image/") then
+    local filename = body.output.filename
+    if type(filename) ~= "string" or filename == "" then
+      filename = "image"
+    end
+    payload_output = string.format("[image result: %s (%s)]", filename, body.output.media_type)
   elseif type(raw_err) == "string" then
     payload_output = raw_err
   else
