@@ -324,6 +324,16 @@ impl Chats {
         let chat = g
             .get_mut(id)
             .ok_or_else(|| ChatsError::NotFound(id.clone()))?;
+        if let Message::Tool { tool_call_id, .. } = &message {
+            if !has_unanswered_tool_call(&chat.history, tool_call_id) {
+                tracing::warn!(
+                    chat_id = %id,
+                    tool_call_id = %tool_call_id,
+                    "dropping orphan tool result without matching assistant tool call"
+                );
+                return Ok(());
+            }
+        }
         Arc::make_mut(&mut chat.history).push(message);
         Ok(())
     }
@@ -485,6 +495,27 @@ impl Chats {
     pub async fn ids(&self) -> Vec<ChatId> {
         self.inner.lock().await.keys().cloned().collect()
     }
+}
+
+fn has_unanswered_tool_call(history: &[Message], tool_call_id: &str) -> bool {
+    let mut seen_call = false;
+    for message in history {
+        match message {
+            Message::Assistant { tool_calls, .. }
+                if tool_calls.iter().any(|tc| tc.id == tool_call_id) =>
+            {
+                seen_call = true;
+            }
+            Message::Tool {
+                tool_call_id: answered,
+                ..
+            } if answered == tool_call_id => {
+                seen_call = false;
+            }
+            _ => {}
+        }
+    }
+    seen_call
 }
 
 #[cfg(test)]
@@ -712,6 +743,56 @@ mod tests {
         assert_eq!(h[2].role(), "tool");
         assert_eq!(h[2].tool_call_id(), Some("call_1"));
         assert_eq!(h[2].content(), Some("file contents"));
+    }
+
+    #[tokio::test]
+    async fn orphan_tool_result_is_dropped_from_history() {
+        let c = Chats::with_default_model(Some("m".into()));
+        let id = ChatId::new("a");
+        c.create(id.clone(), None, None, None)
+            .await
+            .expect("create");
+
+        c.push_tool_result(&id, "call_missing".into(), "stale result".into())
+            .await
+            .expect("orphan is non-fatal");
+
+        let h = c.history_snapshot(&id).await.expect("h");
+        assert!(
+            h.is_empty(),
+            "orphan tool result must not poison future provider requests: {h:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_tool_result_is_dropped_from_history() {
+        let c = Chats::with_default_model(Some("m".into()));
+        let id = ChatId::new("a");
+        c.create(id.clone(), None, None, None)
+            .await
+            .expect("create");
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: ToolCallFunction {
+                name: "read_file".into(),
+                arguments: "{\"path\":\"/x\"}".into(),
+            },
+        }];
+
+        c.push_assistant_tool_calls(&id, String::new(), calls)
+            .await
+            .expect("assistant");
+        c.push_tool_result(&id, "call_1".into(), "first".into())
+            .await
+            .expect("first");
+        c.push_tool_result(&id, "call_1".into(), "duplicate".into())
+            .await
+            .expect("duplicate is non-fatal");
+
+        let h = c.history_snapshot(&id).await.expect("h");
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[1].content(), Some("first"));
     }
 
     #[tokio::test]
