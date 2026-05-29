@@ -40,6 +40,10 @@ end
 -- `cmd` nil when text isn't a slash command.
 function M.parse(text)
   if text:sub(1, 1) ~= "/" then return nil, nil, false end
+  -- Absolute filesystem paths also start with `/`. Treat `/Users/a.png`
+  -- or `/tmp/paste.png` as plain chat text so clipboard-image paths can
+  -- be submitted directly instead of becoming an unknown slash command.
+  if text:find("^/[^%s]+/") then return nil, nil, false end
   local cmd, rest = text:match("^/(%S+)%s*(.*)$")
   local has_ws = text:find("^/%S+%s") ~= nil
   return cmd, (rest ~= "" and rest or nil), has_ws

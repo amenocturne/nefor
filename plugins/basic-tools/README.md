@@ -57,10 +57,11 @@ Reads an image file and returns a structured media object:
 }
 ```
 
-Supported formats are PNG, JPEG, GIF, and WebP, detected from file bytes. The
-tool does not describe or OCR the image; providers either pass the media to a
-vision-capable model or replace it with an explicit error when the active model
-does not support image input.
+Supported formats are PNG, JPEG, GIF, and WebP, detected from file bytes.
+Images over 5 MiB are downscaled and re-encoded as JPEG before being returned;
+the source file read has a 50 MiB hard cap. The tool does not describe or OCR
+the image; providers either pass the media to a vision-capable model or replace
+it with an explicit error when the active model does not support image input.
 
 ## Future direction
 

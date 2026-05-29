@@ -1,10 +1,15 @@
 //! `read_image` — read image bytes for vision-capable providers.
 //!
-//! The tool only loads and classifies bytes. It does not OCR, caption, or
-//! downsample; interpretation belongs to the model layer. Providers that
-//! cannot send image parts must turn the structured media result into an
-//! explicit user-visible error before the next model turn.
+//! The tool loads and classifies bytes. It does not OCR or caption;
+//! interpretation belongs to the model layer. Oversized images are
+//! downscaled/re-encoded so clipboard screenshots don't bounce off model
+//! payload limits. Providers that cannot send image parts must turn the
+//! structured media result into an explicit user-visible error before
+//! the next model turn.
 
+use image::codecs::jpeg::JpegEncoder;
+use image::imageops::FilterType;
+use image::{DynamicImage, GenericImageView};
 use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
 
@@ -17,8 +22,13 @@ pub const NAME: &str = "read_image";
 pub const DESCRIPTION: &str =
     "Read an image file for visual inspection. Returns image bytes and metadata; only vision-capable models can use the result.";
 
-/// 5 MiB cap on a single image read.
-pub const MAX_BYTES: u64 = 5 * 1024 * 1024;
+/// Hard cap on the source image read. Larger files are probably not a
+/// pasted screenshot and should fail instead of loading into memory.
+pub const MAX_INPUT_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Target cap for the media bytes returned to the provider. Larger
+/// source images are downscaled/re-encoded before base64 wrapping.
+pub const TARGET_OUTPUT_BYTES: usize = 5 * 1024 * 1024;
 
 /// JSON Schema (OpenAI tool-call format) for `read_image`'s parameters.
 pub fn schema() -> Value {
@@ -110,10 +120,10 @@ async fn read_image_file(request: ReadImageRequest) -> Result<Value, ToolError> 
     }
 
     let size = meta.len();
-    if size > MAX_BYTES {
+    if size > MAX_INPUT_BYTES {
         return Err(ToolError::ImageTooLarge {
             size,
-            cap: MAX_BYTES,
+            cap: MAX_INPUT_BYTES,
             path,
         });
     }
@@ -131,10 +141,10 @@ async fn read_image_file(request: ReadImageRequest) -> Result<Value, ToolError> 
             path: path.clone(),
             message: e.to_string(),
         })?;
-    if bytes.len() as u64 > MAX_BYTES {
+    if bytes.len() as u64 > MAX_INPUT_BYTES {
         return Err(ToolError::ImageTooLarge {
             size: bytes.len() as u64,
-            cap: MAX_BYTES,
+            cap: MAX_INPUT_BYTES,
             path,
         });
     }
@@ -147,12 +157,107 @@ async fn read_image_file(request: ReadImageRequest) -> Result<Value, ToolError> 
         .unwrap_or(&path)
         .to_owned();
 
+    let media = prepare_media_bytes(&bytes, media_type)
+        .map_err(|_| ToolError::UnsupportedImage { path: path.clone() })?;
+
     Ok(json!({
         "type": "media",
-        "media_type": media_type,
+        "media_type": media.media_type,
         "filename": filename,
-        "data": encode_base64(&bytes),
+        "data": encode_base64(&media.bytes),
     }))
+}
+
+struct MediaBytes {
+    media_type: &'static str,
+    bytes: Vec<u8>,
+}
+
+fn prepare_media_bytes(
+    bytes: &[u8],
+    media_type: &'static str,
+) -> Result<MediaBytes, image::ImageError> {
+    if bytes.len() <= TARGET_OUTPUT_BYTES {
+        return Ok(MediaBytes {
+            media_type,
+            bytes: bytes.to_vec(),
+        });
+    }
+
+    let img = image::load_from_memory(bytes)?;
+    let variants = compressed_variants(&img);
+    for encoded in variants.iter().rev() {
+        if encoded.len() <= TARGET_OUTPUT_BYTES {
+            return Ok(MediaBytes {
+                media_type: "image/jpeg",
+                bytes: encoded.clone(),
+            });
+        }
+    }
+
+    Ok(MediaBytes {
+        media_type: "image/jpeg",
+        bytes: variants
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| bytes.to_vec()),
+    })
+}
+
+fn compressed_variants(img: &DynamicImage) -> Vec<Vec<u8>> {
+    const MAX_EDGES: [u32; 7] = [2048, 1600, 1280, 1024, 768, 512, 384];
+    const QUALITIES: [u8; 6] = [85, 75, 65, 55, 45, 35];
+
+    let mut out = Vec::new();
+    for max_edge in MAX_EDGES {
+        let resized = resize_to_max_edge(img, max_edge);
+        let rgb = flatten_alpha(&resized);
+        for quality in QUALITIES {
+            if let Ok(bytes) = encode_jpeg(&rgb, quality) {
+                out.push(bytes);
+            }
+        }
+    }
+    out.sort_by_key(Vec::len);
+    out
+}
+
+fn resize_to_max_edge(img: &DynamicImage, max_edge: u32) -> DynamicImage {
+    let (w, h) = img.dimensions();
+    let longest = w.max(h);
+    if longest <= max_edge {
+        return img.clone();
+    }
+    let ratio = max_edge as f32 / longest as f32;
+    let nw = ((w as f32 * ratio).round() as u32).max(1);
+    let nh = ((h as f32 * ratio).round() as u32).max(1);
+    img.resize(nw, nh, FilterType::Triangle)
+}
+
+fn flatten_alpha(img: &DynamicImage) -> image::RgbImage {
+    let rgba = img.to_rgba8();
+    image::RgbImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+        let p = rgba.get_pixel(x, y);
+        let alpha = p[3] as u16;
+        let inv = 255u16.saturating_sub(alpha);
+        image::Rgb([
+            ((p[0] as u16 * alpha + 255 * inv) / 255) as u8,
+            ((p[1] as u16 * alpha + 255 * inv) / 255) as u8,
+            ((p[2] as u16 * alpha + 255 * inv) / 255) as u8,
+        ])
+    })
+}
+
+fn encode_jpeg(img: &image::RgbImage, quality: u8) -> Result<Vec<u8>, image::ImageError> {
+    let mut out = Vec::new();
+    let mut encoder = JpegEncoder::new_with_quality(&mut out, quality);
+    encoder.encode(
+        img.as_raw(),
+        img.width(),
+        img.height(),
+        image::ExtendedColorType::Rgb8,
+    )?;
+    Ok(out)
 }
 
 fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
@@ -197,6 +302,7 @@ fn encode_base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::ImageEncoder;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -255,5 +361,39 @@ mod tests {
             .and_then(Value::as_array)
             .expect("required");
         assert!(required.iter().any(|v| v.as_str() == Some("path")));
+    }
+
+    #[test]
+    fn large_png_is_reencoded_under_target_cap() {
+        let width = 2048u32;
+        let height = 2048u32;
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        let mut seed = 0x1234_5678u32;
+        for _ in 0..(width * height) {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            rgba.push((seed >> 24) as u8);
+            rgba.push((seed >> 16) as u8);
+            rgba.push((seed >> 8) as u8);
+            rgba.push(255);
+        }
+
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)
+            .expect("encode png");
+        assert!(
+            png.len() > TARGET_OUTPUT_BYTES,
+            "fixture should exceed target cap, got {}",
+            png.len()
+        );
+
+        let media = prepare_media_bytes(&png, "image/png").expect("prepare media");
+        assert_eq!(media.media_type, "image/jpeg");
+        assert!(
+            media.bytes.len() <= TARGET_OUTPUT_BYTES,
+            "re-encoded media should be under target cap, got {}",
+            media.bytes.len()
+        );
+        assert!(media.bytes.starts_with(&[0xff, 0xd8, 0xff]));
     }
 }

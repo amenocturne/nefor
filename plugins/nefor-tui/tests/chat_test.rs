@@ -274,6 +274,33 @@ fn typing_and_enter_emits_chat_input_submit() {
 }
 
 #[test]
+fn absolute_path_submit_is_plain_chat_not_slash_command() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    let path = "/Users/skril/.local/share/nefor/clipboard-images/paste.png";
+    submit_text(&mut engine, path);
+
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "submit should produce exactly one emit");
+    let (target_hint, body) = &emits[0];
+    assert_eq!(target_hint.as_deref(), Some("engine"));
+    assert_eq!(
+        body.get("kind").and_then(|v| v.as_str()),
+        Some("chat.input.submit")
+    );
+    assert_eq!(body.get("text").and_then(|v| v.as_str()), Some(path));
+
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("/Users/skril/.local/share/nefor/clipboard-im")
+            && out.contains("ages/paste.png"),
+        "absolute-path user echo missing: {out:?}"
+    );
+}
+
+#[test]
 fn input_field_renders_full_width_rounded_border() {
     // Per legacy spec section 7: input box has `╭─╮ │ ╰─╯` chrome in
     // HL_USER. The bordered_box helper composes corners + tui.fill for
