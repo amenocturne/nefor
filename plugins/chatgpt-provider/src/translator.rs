@@ -20,6 +20,8 @@
 //! `(text, tool_calls)` and the dispatcher reconstructs `Message`s from
 //! that.)
 
+use std::collections::HashSet;
+
 use serde_json::{Map, Value};
 
 use crate::catalog::ToolSpec;
@@ -50,7 +52,9 @@ pub struct Translated {
 ///   preserved as an empty OutputText to keep the item count stable.
 /// - `role == "tool"` → `FunctionCallOutput { call_id, output }`. The
 ///   call_id is `message.tool_call_id`; output is `message.content`
-///   (empty string if absent).
+///   (empty string if absent). Orphaned or duplicate tool outputs are
+///   dropped because the Responses API rejects function_call_output
+///   items that do not match an earlier unanswered function_call item.
 ///
 /// An optional explicit `system_prompt` (from `chat.create`) is
 /// prepended to any inline system messages — both contribute to the
@@ -64,6 +68,7 @@ pub fn history_to_input(history: &[Message], system_prompt: Option<&str>) -> Tra
     }
 
     let mut input: Vec<ResponseItem> = Vec::new();
+    let mut unanswered_tool_calls = HashSet::new();
     for msg in history {
         match msg {
             Message::System { content } => {
@@ -98,6 +103,7 @@ pub fn history_to_input(history: &[Message], system_prompt: Option<&str>) -> Tra
                             name: call.function.name.clone(),
                             arguments: call.function.arguments.clone(),
                         });
+                        unanswered_tool_calls.insert(call.id.clone());
                     }
                 } else {
                     input.push(ResponseItem::Message {
@@ -111,10 +117,17 @@ pub fn history_to_input(history: &[Message], system_prompt: Option<&str>) -> Tra
                 tool_call_id,
                 ..
             } => {
-                input.push(ResponseItem::FunctionCallOutput {
-                    call_id: tool_call_id.clone(),
-                    output: content.clone(),
-                });
+                if unanswered_tool_calls.remove(tool_call_id) {
+                    input.push(ResponseItem::FunctionCallOutput {
+                        call_id: tool_call_id.clone(),
+                        output: content.clone(),
+                    });
+                } else {
+                    tracing::warn!(
+                        tool_call_id = %tool_call_id,
+                        "dropping orphan function_call_output from Responses translation"
+                    );
+                }
             }
         }
     }
@@ -295,15 +308,52 @@ mod tests {
     }
 
     #[test]
-    fn tool_message_emits_function_call_output() {
-        let history = vec![Message::tool_result("call_1".into(), "file contents")];
+    fn tool_message_emits_function_call_output_after_matching_call() {
+        let history = vec![
+            Message::assistant_tool_calls(vec![ToolCall {
+                id: "call_1".into(),
+                function: ToolCallFunction {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"/x"}"#.into(),
+                },
+            }]),
+            Message::tool_result("call_1".into(), "file contents"),
+        ];
         let t = history_to_input(&history, None);
-        assert_eq!(t.input.len(), 1);
-        match &t.input[0] {
+        assert_eq!(t.input.len(), 2);
+        match &t.input[1] {
             ResponseItem::FunctionCallOutput { call_id, output } => {
                 assert_eq!(call_id, "call_1");
                 assert_eq!(output, "file contents");
             }
+            _ => panic!("expected FunctionCallOutput"),
+        }
+    }
+
+    #[test]
+    fn orphan_tool_message_is_dropped() {
+        let history = vec![Message::tool_result("call_missing".into(), "stale result")];
+        let t = history_to_input(&history, None);
+        assert!(t.input.is_empty());
+    }
+
+    #[test]
+    fn duplicate_tool_message_is_dropped() {
+        let history = vec![
+            Message::assistant_tool_calls(vec![ToolCall {
+                id: "call_1".into(),
+                function: ToolCallFunction {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"/x"}"#.into(),
+                },
+            }]),
+            Message::tool_result("call_1".into(), "first"),
+            Message::tool_result("call_1".into(), "duplicate"),
+        ];
+        let t = history_to_input(&history, None);
+        assert_eq!(t.input.len(), 2);
+        match &t.input[1] {
+            ResponseItem::FunctionCallOutput { output, .. } => assert_eq!(output, "first"),
             _ => panic!("expected FunctionCallOutput"),
         }
     }

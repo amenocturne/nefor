@@ -225,6 +225,19 @@ impl ChatState {
             tool_overrides: None,
         }
     }
+
+    fn from_create(
+        model: String,
+        system: Option<String>,
+        tool_overrides: Option<Vec<crate::catalog::ToolSpec>>,
+        tool_allowlist: Option<Vec<String>>,
+    ) -> Self {
+        let mut chat = Self::new(model);
+        chat.system = system;
+        chat.tool_overrides = tool_overrides;
+        chat.tool_allowlist = tool_allowlist;
+        chat
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -349,19 +362,9 @@ impl Chats {
         *self.default_model.lock().await = Some(model);
     }
 
-    /// Create a chat. `model` overrides the plugin default; `system`
-    /// becomes the Responses-API `instructions` for every turn; the
-    /// two tool fields are optional gates layered over the catalog.
-    pub async fn create(
-        &self,
-        id: ChatId,
-        model: Option<String>,
-        system: Option<String>,
-        tool_overrides: Option<Vec<crate::catalog::ToolSpec>>,
-        tool_allowlist: Option<Vec<String>>,
-    ) -> Result<(), ChatsError> {
-        let resolved_model = match model {
-            Some(m) => m,
+    async fn resolve_model(&self, model: Option<String>) -> Result<String, ChatsError> {
+        match model {
+            Some(m) => Ok(m),
             None => self
                 .default_model
                 .lock()
@@ -373,17 +376,73 @@ impl Chats {
                 // error rather than guess. The previous code fell back
                 // to a hardcoded `gpt-5-codex` which Codex rejects for
                 // ChatGPT-subscription accounts.
-                .ok_or(ChatsError::NoModelConfigured)?,
-        };
+                .ok_or(ChatsError::NoModelConfigured),
+        }
+    }
+
+    /// Create the chat state value shared by strict create and
+    /// recreate. `model` overrides the plugin default; `system` becomes
+    /// the Responses-API `instructions` for every turn; the two tool
+    /// fields are optional gates layered over the catalog.
+    async fn build_chat(
+        &self,
+        model: Option<String>,
+        system: Option<String>,
+        tool_overrides: Option<Vec<crate::catalog::ToolSpec>>,
+        tool_allowlist: Option<Vec<String>>,
+    ) -> Result<ChatState, ChatsError> {
+        let resolved_model = self.resolve_model(model).await?;
+        Ok(ChatState::from_create(
+            resolved_model,
+            system,
+            tool_overrides,
+            tool_allowlist,
+        ))
+    }
+
+    /// Strict create used by tests and callers that need duplicate-id
+    /// detection.
+    pub async fn create(
+        &self,
+        id: ChatId,
+        model: Option<String>,
+        system: Option<String>,
+        tool_overrides: Option<Vec<crate::catalog::ToolSpec>>,
+        tool_allowlist: Option<Vec<String>>,
+    ) -> Result<(), ChatsError> {
+        let chat = self
+            .build_chat(model, system, tool_overrides, tool_allowlist)
+            .await?;
         let mut g = self.inner.lock().await;
         if g.contains_key(&id) {
             return Err(ChatsError::AlreadyExists(id));
         }
-        let mut chat = ChatState::new(resolved_model);
-        chat.system = system;
-        chat.tool_overrides = tool_overrides;
-        chat.tool_allowlist = tool_allowlist;
         g.insert(id, chat);
+        Ok(())
+    }
+
+    /// Create a fresh chat state, replacing any stale in-process state
+    /// with the same id. The agentic loop can replay or restart with a
+    /// reused chat id; replacement prevents an old poisoned history from
+    /// leaking into a nominally new conversation.
+    pub async fn recreate(
+        &self,
+        id: ChatId,
+        model: Option<String>,
+        system: Option<String>,
+        tool_overrides: Option<Vec<crate::catalog::ToolSpec>>,
+        tool_allowlist: Option<Vec<String>>,
+    ) -> Result<(), ChatsError> {
+        let chat = self
+            .build_chat(model, system, tool_overrides, tool_allowlist)
+            .await?;
+        let mut g = self.inner.lock().await;
+        if g.insert(id.clone(), chat).is_some() {
+            tracing::warn!(
+                chat_id = %id,
+                "replacing existing chat state during chat.create"
+            );
+        }
         Ok(())
     }
 
@@ -436,6 +495,16 @@ impl Chats {
         let chat = g
             .get_mut(id)
             .ok_or_else(|| ChatsError::NotFound(id.clone()))?;
+        if let Message::Tool { tool_call_id, .. } = &message {
+            if !has_unanswered_tool_call(&chat.history, tool_call_id) {
+                tracing::warn!(
+                    chat_id = %id,
+                    tool_call_id = %tool_call_id,
+                    "dropping orphan tool result without matching assistant tool call"
+                );
+                return Ok(());
+            }
+        }
         chat.history.push(message);
         Ok(())
     }
@@ -575,6 +644,27 @@ impl Chats {
     }
 }
 
+fn has_unanswered_tool_call(history: &[Message], tool_call_id: &str) -> bool {
+    let mut seen_call = false;
+    for message in history {
+        match message {
+            Message::Assistant { tool_calls, .. }
+                if tool_calls.iter().any(|tc| tc.id == tool_call_id) =>
+            {
+                seen_call = true;
+            }
+            Message::Tool {
+                tool_call_id: answered,
+                ..
+            } if answered == tool_call_id => {
+                seen_call = false;
+            }
+            _ => {}
+        }
+    }
+    seen_call
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,6 +698,31 @@ mod tests {
             .await
             .expect_err("second");
         assert!(matches!(err, ChatsError::AlreadyExists(x) if x == id));
+    }
+
+    #[tokio::test]
+    async fn recreate_replaces_existing_history() {
+        let c = Chats::with_default_model(Some("m".into()));
+        let id = ChatId::new("dup");
+        c.create(id.clone(), None, Some("old".into()), None, None)
+            .await
+            .expect("first");
+        c.push_user(&id, "stale".into()).await.expect("push");
+
+        c.recreate(
+            id.clone(),
+            Some("new-model".into()),
+            Some("new".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("recreate");
+
+        let snap = c.snapshot(&id).await.expect("snapshot");
+        assert!(snap.history.is_empty());
+        assert_eq!(snap.model, "new-model");
+        assert_eq!(snap.system.as_deref(), Some("new"));
     }
 
     #[tokio::test]
@@ -744,6 +859,86 @@ mod tests {
             .expect("explicit model wins");
         let snap = c.snapshot(&id).await.expect("snap");
         assert_eq!(snap.model, "test-model");
+    }
+
+    #[tokio::test]
+    async fn push_assistant_tool_calls_and_tool_result_round_trip() {
+        let c = Chats::with_default_model(Some("m".into()));
+        let id = ChatId::new("a");
+        c.create(id.clone(), None, None, None, None)
+            .await
+            .expect("create");
+        c.push_user(&id, "hi".into()).await.expect("u");
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            function: ToolCallFunction {
+                name: "read_file".into(),
+                arguments: "{\"path\":\"/x\"}".into(),
+            },
+        }];
+        c.push_assistant_tool_calls(&id, String::new(), calls)
+            .await
+            .expect("a");
+        c.push_tool_result(&id, "call_1".into(), "file contents".into())
+            .await
+            .expect("t");
+        let h = c.snapshot(&id).await.expect("h").history;
+        assert_eq!(h.len(), 3);
+        assert_eq!(h[1].role(), "assistant");
+        assert!(h[1].content().is_none());
+        assert_eq!(h[1].tool_calls().len(), 1);
+        assert_eq!(h[2].role(), "tool");
+        assert_eq!(h[2].tool_call_id(), Some("call_1"));
+        assert_eq!(h[2].content(), Some("file contents"));
+    }
+
+    #[tokio::test]
+    async fn orphan_tool_result_is_dropped_from_history() {
+        let c = Chats::with_default_model(Some("m".into()));
+        let id = ChatId::new("a");
+        c.create(id.clone(), None, None, None, None)
+            .await
+            .expect("create");
+
+        c.push_tool_result(&id, "call_missing".into(), "stale result".into())
+            .await
+            .expect("orphan is non-fatal");
+
+        let h = c.snapshot(&id).await.expect("h").history;
+        assert!(
+            h.is_empty(),
+            "orphan tool result must not poison future provider requests: {h:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_tool_result_is_dropped_from_history() {
+        let c = Chats::with_default_model(Some("m".into()));
+        let id = ChatId::new("a");
+        c.create(id.clone(), None, None, None, None)
+            .await
+            .expect("create");
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            function: ToolCallFunction {
+                name: "read_file".into(),
+                arguments: "{\"path\":\"/x\"}".into(),
+            },
+        }];
+
+        c.push_assistant_tool_calls(&id, String::new(), calls)
+            .await
+            .expect("assistant");
+        c.push_tool_result(&id, "call_1".into(), "first".into())
+            .await
+            .expect("first");
+        c.push_tool_result(&id, "call_1".into(), "duplicate".into())
+            .await
+            .expect("duplicate is non-fatal");
+
+        let h = c.snapshot(&id).await.expect("h").history;
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[1].content(), Some("first"));
     }
 
     #[tokio::test]

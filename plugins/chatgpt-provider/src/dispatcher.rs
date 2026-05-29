@@ -881,7 +881,7 @@ async fn handle_chat_create(
     let tool_overrides: Option<Vec<crate::catalog::ToolSpec>> = None;
 
     match chats
-        .create(
+        .recreate(
             chat_id.clone(),
             model,
             system,
