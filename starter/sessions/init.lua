@@ -44,6 +44,7 @@
 -- Path: `<root>/sessions/<id>.jsonl`. Parent dir is created on init.
 
 local json           = nefor.json
+local event          = require("core.event")
 local history_replay = require("core.history_replay")
 
 local state = {
@@ -449,12 +450,10 @@ end
 -- receive_msg — runtime-driven inbound handler.
 ---@param entry { ts: string?, origin: string?, target: string?, payload: string }
 local function receive_msg(entry)
-  local payload = entry.payload
-  if type(payload) ~= "string" or payload == "" then return end
-
-  local ok, decoded = pcall(json.decode, payload)
-  if not ok or type(decoded) ~= "table" or type(decoded.body) ~= "table" then return end
-  local kind = decoded.body.kind
+  local evt = event.decode(entry)
+  if evt == nil then return end
+  local body = evt.body
+  local kind = evt.kind
 
   -- Lifecycle: synthesized engine shutdown.
   if kind == "engine.shutdown" then
@@ -464,7 +463,7 @@ local function receive_msg(entry)
 
   -- Resume to a specific session id.
   if kind == "sessions.resume_request" then
-    local target = decoded.body.session_id
+    local target = body.session_id
     if type(target) == "string" and target ~= "" then
       do_resume(target)
     end

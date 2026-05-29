@@ -19,4 +19,5 @@ M.ncp            = require("core.ncp")
 M.actor          = require("core.actor")
 M.ids            = require("core.ids")
 M.history_replay = require("core.history_replay")
+M.event          = require("core.event")
 return M

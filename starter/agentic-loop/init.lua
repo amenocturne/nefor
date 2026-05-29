@@ -25,6 +25,7 @@
 local json = nefor.json
 
 local envelope        = require("core.envelope")
+local event           = require("core.event")
 local ids             = require("core.ids")
 local results_lib     = require("agentic-loop.results")
 local topology        = require("agentic-loop.topology")
@@ -1058,10 +1059,10 @@ local function receive_msg(entry)
   -- the actor.lua runtime.
   if entry.origin == "step" and entry.target ~= nil then return end
 
-  local ok, decoded = pcall(json.decode, entry.payload)
-  if not ok then return end
-  local body = decoded.body
-  local kind = body.kind
+  local evt = event.decode(entry)
+  if evt == nil then return end
+  local body = evt.body
+  local kind = evt.kind
 
   -- Engine shutdown — sessions handles persistence; nothing for us.
   if kind == "engine.shutdown" then return end

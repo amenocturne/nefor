@@ -7,6 +7,7 @@
 
 local json = nefor.json
 local actor = require("core.actor")
+local event = require("core.event")
 
 local function assert_eq(actual, expected, msg)
   if actual ~= expected then
@@ -35,6 +36,32 @@ do
   assert_eq(type(spec.from_plugin), "function", "from_plugin is fn")
   assert_eq(type(spec.to_plugin), "function", "to_plugin is fn")
   assert_eq(type(spec.receive_msg), "function", "receive_msg is fn")
+end
+
+-- ----------------------------------------------------------------
+-- event.decode accepts only event-shaped payloads with table body+kind
+-- ----------------------------------------------------------------
+do
+  local evt, err = event.decode({
+    payload = json.encode({ type = "event", body = { kind = "tool.result", id = "x" } }),
+  })
+  assert_true(evt ~= nil, "valid event decodes: " .. tostring(err))
+  assert_eq(evt.kind, "tool.result", "decoded kind")
+  assert_eq(evt.body.id, "x", "decoded body preserved")
+end
+
+do
+  local evt = event.decode({
+    payload = json.encode({ type = "event", body = "not a body" }),
+  })
+  assert_eq(evt, nil, "non-table body rejected")
+end
+
+do
+  local evt = event.decode({
+    payload = json.encode({ type = "event", body = { id = "missing kind" } }),
+  })
+  assert_eq(evt, nil, "missing body.kind rejected")
 end
 
 -- ----------------------------------------------------------------

@@ -52,9 +52,8 @@
 -- thing: defer. Better to bother the user than to auto-approve an
 -- unclassified command.
 
-local json = nefor.json
-
 local envelope     = require("core.envelope")
+local event        = require("core.event")
 local replay_window = require("core.history_replay")
 
 local emit = envelope.emit
@@ -241,12 +240,10 @@ local function receive_msg(entry)
   -- a future replay shape change.
   if replay_window.active() then return end
 
-  local payload = entry.payload
-  if type(payload) ~= "string" or payload == "" then return end
-  local ok, decoded = pcall(json.decode, payload)
-  if not ok or type(decoded) ~= "table" or type(decoded.body) ~= "table" then return end
-  local body = decoded.body
-  if body.kind ~= "chat.tool.permission_request" then return end
+  local evt = event.decode(entry)
+  if evt == nil then return end
+  local body = evt.body
+  if evt.kind ~= "chat.tool.permission_request" then return end
   handle_permission_request(body)
 end
 

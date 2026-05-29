@@ -17,9 +17,8 @@
 -- without needing the full `bash` surface (which is a sandbox-escape
 -- hatch via shell composition).
 
-local json = nefor.json
-
 local envelope = require("core.envelope")
+local event    = require("core.event")
 local emit_as  = envelope.emit_as
 local output_dump = require("tool-gate.tool_output_dump")
 
@@ -301,13 +300,10 @@ end
 
 local function receive_msg(entry)
   if entry.origin == "step" and entry.target ~= nil then return end
-  local payload = entry.payload
-  if type(payload) ~= "string" or payload == "" then return end
-  local ok, decoded = pcall(json.decode, payload)
-  if not ok or type(decoded) ~= "table" or type(decoded.body) ~= "table" then return end
-  local body = decoded.body
-  local kind = body.kind
-  if type(kind) ~= "string" then return end
+  local evt = event.decode(entry)
+  if evt == nil then return end
+  local body = evt.body
+  local kind = evt.kind
 
   if kind == SOURCE_NAME .. ".tool.invoke" then
     handle_tool_invoke(body)

@@ -14,6 +14,49 @@ M.shallow_merge   = util.shallow_merge
 M.NIL_SENTINEL    = util.NIL
 M.bordered_box    = util.bordered_box
 
+function M.normalize_chat_state(state)
+  state = type(state) == "table" and state or {}
+  local patch = {}
+
+  local function ensure_table(key, default)
+    if type(state[key]) ~= "table" then
+      patch[key] = default or {}
+      return patch[key]
+    end
+    return state[key]
+  end
+
+  local entries = ensure_table("entries")
+  ensure_table("stats")
+  ensure_table("auth")
+  ensure_table("supports_login")
+  ensure_table("dag_runs")
+  ensure_table("firing_to_node")
+  ensure_table("toasts")
+  ensure_table("prompt_history")
+
+  if state.popup_queue ~= nil and type(state.popup_queue) ~= "table" then
+    patch.popup_queue = M.NIL_SENTINEL
+  end
+
+  local queued = state.queued_entry_idx
+  if queued ~= nil
+      and (type(queued) ~= "number" or queued < 1 or entries[queued] == nil) then
+    patch.queued_entry_idx = M.NIL_SENTINEL
+  end
+
+  local in_flight = state.in_flight
+  if in_flight ~= nil
+      and (type(in_flight) ~= "number" or in_flight < 1 or entries[in_flight] == nil) then
+    patch.in_flight = M.NIL_SENTINEL
+  end
+
+  for _ in pairs(patch) do
+    return M.shallow_merge(state, patch)
+  end
+  return state
+end
+
 -- Resolve the engine's data root from env vars. Must match
 -- `nefor.fs.data_root()` exactly so readers and writers agree on the
 -- on-disk location. Cascade, first hit wins:

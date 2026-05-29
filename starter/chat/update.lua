@@ -1088,6 +1088,7 @@ end
 -- ── main entry point ──────────────────────────────────────────────────
 
 function M.update(msg, state)
+  state = common.normalize_chat_state(state)
   state = prune_expired(state)
   local kind = msg.kind or ""
   log.log("update", "dispatch kind=%s", kind)

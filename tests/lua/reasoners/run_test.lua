@@ -347,3 +347,51 @@ do
   assert_eq(terminal.result.stdout, "/tmp/x\n", "stdout threaded through wrapper layer")
   assert_eq(terminal.result.exit_code, 0, "exit_code threaded through wrapper layer")
 end
+
+-- ------------------------------------------------------------------
+-- Malformed tool.invoke payloads return owed errors instead of raising
+-- ------------------------------------------------------------------
+
+do
+  local reasoners = require("reasoners")
+  reasoners._internals.reset()
+  reasoners._internals.seed()
+  run._internals.reset()
+  _test.calls_clear()
+
+  reasoners.receive_msg({
+    ts      = "2026-05-08T00:00:00.000Z",
+    origin  = "reasoner-graph",
+    payload = json.encode({
+      type = "event",
+      from = "reasoner-graph",
+      body = {
+        kind = "tool.invoke",
+        id   = "f-malformed",
+        name = "run",
+        args = "not a table",
+      },
+    }),
+  })
+
+  local terminal = find_tool_result_for("f-malformed")
+  assert_true(terminal ~= nil,
+    "malformed invoke must still close the firing with tool.result")
+  assert_true(type(terminal.error) == "string"
+      and terminal.error:match("missing args") ~= nil,
+    "malformed invoke reports a structured handler error")
+end
+
+do
+  local reasoners = require("reasoners")
+  reasoners._internals.reset()
+  _test.calls_clear()
+
+  reasoners.receive_msg({
+    ts      = "2026-05-08T00:00:00.000Z",
+    origin  = "reasoner-graph",
+    payload = json.encode({ type = "event", from = "reasoner-graph", body = "bad body" }),
+  })
+
+  assert_eq(#_test.calls(), 0, "malformed event body is ignored without raising")
+end

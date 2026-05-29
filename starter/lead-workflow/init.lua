@@ -71,9 +71,8 @@
 -- so the model sees it on the next turn. Also clears `state.active_plan`
 -- so a resumed/new session starts with no carry-over approval.
 
-local json = nefor.json
-
 local envelope      = require("core.envelope")
+local event         = require("core.event")
 local replay_window = require("core.history_replay")
 
 local emit_as = envelope.emit_as
@@ -762,16 +761,20 @@ local function handle_tool_invoke(body)
     emit_tool_result_err(firing_id, "lead-workflow: unknown tool '" .. tostring(name) .. "'")
     return
   end
-  handler(firing_id, body.args or {})
+  local ok, err = pcall(handler, firing_id, body.args or {})
+  if not ok then
+    emit_tool_result_err(firing_id,
+      "lead-workflow." .. tostring(name) .. ": handler raised: " .. tostring(err))
+  end
 end
 
 local function receive_msg(entry)
   if entry.origin == "step" and entry.target ~= nil then return end
 
-  local ok, decoded = pcall(json.decode, entry.payload)
-  if not ok then return end
-  local body = decoded.body
-  local kind = body.kind
+  local evt = event.decode(entry)
+  if evt == nil then return end
+  local body = evt.body
+  local kind = evt.kind
 
   -- Tool invocations from the gate. Live path only — during replay the
   -- gate doesn't re-issue invokes (replay_window suppresses to_plugin

@@ -103,6 +103,7 @@
 local json = nefor.json
 
 local envelope      = require("core.envelope")
+local event         = require("core.event")
 local replay_window = require("core.history_replay")
 
 local emit_as = envelope.emit_as
@@ -789,16 +790,16 @@ local function receive_msg(entry)
   -- reasoners/init.lua and agentic-loop/init.lua).
   if entry.origin == "step" and entry.target ~= nil then return end
 
-  local ok, decoded = pcall(json.decode, entry.payload)
-  if not ok then return end
+  local evt = event.decode(entry)
+  if evt == nil then return end
 
   -- Skip during replay — the agent reasoner's per-firing state lives
   -- in module-level tables that don't survive a process restart, so
   -- replayed envelopes have nothing to advance.
   if replay_window.active() then return end
 
-  local body = decoded.body
-  local kind = body.kind
+  local body = evt.body
+  local kind = evt.kind
 
   -- graph.cancel handler — sub-graph cancel propagation. The
   -- lead-workflow actor broadcasts `graph.cancel { run_id }` on

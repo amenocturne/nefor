@@ -38,6 +38,7 @@
 local json = nefor.json
 
 local envelope      = require("core.envelope")
+local event         = require("core.event")
 local ids           = require("core.ids")
 local replay_window = require("core.history_replay")
 
@@ -87,7 +88,7 @@ local function provider_run_node(reasoner_type, body)
   local node_id = body.node_id
   local firing_id = body.firing_id
   local args = body.args or {}
-  local inputs = body.inputs or {}
+  local inputs = type(body.inputs) == "table" and body.inputs or {}
   local prev_state = body.prev_state
 
   local cfg = agentic_loop.config()
@@ -211,7 +212,7 @@ local function tool_executor_run_node(body)
   local run_id = body.run_id
   local node_id = body.node_id
   local firing_id = body.firing_id
-  local inputs = body.inputs or {}
+  local inputs = type(body.inputs) == "table" and body.inputs or {}
 
   local calls
   for _, dep_entry in pairs(inputs) do
@@ -265,7 +266,7 @@ end
 -- Handler for adapter (pure Lua; ToolResults → ProviderIn).
 local function adapter_run_node(body)
   local firing_id = body.firing_id
-  local inputs = body.inputs or {}
+  local inputs = type(body.inputs) == "table" and body.inputs or {}
 
   local results
   for _, dep_entry in pairs(inputs) do
@@ -305,7 +306,7 @@ end
 -- Handler for terminal — concat upstream outputs in sorted-id order.
 local function terminal_run_node(body)
   local firing_id = body.firing_id
-  local inputs = body.inputs or {}
+  local inputs = type(body.inputs) == "table" and body.inputs or {}
 
   local ordered_ids = {}
   for upstream_id, dep_entry in pairs(inputs) do
@@ -395,7 +396,7 @@ end
 -- per-handler functions expect (firing_id at root alongside the args
 -- subobject keys).
 local function unwrap_invoke_body(invoke)
-  local args = invoke.args or {}
+  local args = type(invoke.args) == "table" and invoke.args or {}
   return {
     run_id     = args.run_id,
     node_id    = args.node_id,
@@ -422,10 +423,10 @@ local function receive_msg(entry)
     agentic_loop = require("agentic-loop")
   end
 
-  local ok, decoded = pcall(json.decode, entry.payload)
-  if not ok then return end
-  local body = decoded.body
-  local kind = body.kind
+  local evt = event.decode(entry)
+  if evt == nil then return end
+  local body = evt.body
+  local kind = evt.kind
 
   -- Skip during replay — graph already ran; re-dispatch would
   -- duplicate every side effect.
@@ -455,11 +456,17 @@ local function receive_msg(entry)
   if kind ~= "tool.invoke" then return end
   local name = body.name
   if type(name) ~= "string" then return end
+  if type(body.id) ~= "string" or body.id == "" then return end
   local handler = handlers[name]
   if handler == nil then return end
 
   local unwrapped = unwrap_invoke_body(body)
-  local err = handler(unwrapped)
+  local ok, err = pcall(handler, unwrapped)
+  if not ok then
+    send_tool_result_err(name, unwrapped.firing_id,
+      name .. " reasoner raised: " .. tostring(err))
+    return
+  end
   if err == "_already_replied" then return end
   if err ~= nil then
     send_tool_result_err(name, unwrapped.firing_id, err)
