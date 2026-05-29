@@ -118,6 +118,30 @@ pub fn history_to_input(history: &[Message], system_prompt: Option<&str>) -> Tra
                 ..
             } => {
                 if unanswered_tool_calls.remove(tool_call_id) {
+                    if let Some(media) = parse_image_tool_output(content) {
+                        input.push(ResponseItem::FunctionCallOutput {
+                            call_id: tool_call_id.clone(),
+                            output: format!(
+                                "Image result attached in the next input message: {} ({}).",
+                                media.filename, media.media_type
+                            ),
+                        });
+                        input.push(ResponseItem::Message {
+                            role: "user".into(),
+                            content: vec![
+                                MessageContent::InputText {
+                                    text: format!(
+                                        "Image returned by tool call {}: {} ({}). Use this image to answer the user's request.",
+                                        tool_call_id, media.filename, media.media_type
+                                    ),
+                                },
+                                MessageContent::InputImage {
+                                    image_url: media.data_url,
+                                },
+                            ],
+                        });
+                        continue;
+                    }
                     input.push(ResponseItem::FunctionCallOutput {
                         call_id: tool_call_id.clone(),
                         output: content.clone(),
@@ -136,6 +160,39 @@ pub fn history_to_input(history: &[Message], system_prompt: Option<&str>) -> Tra
         instructions: instructions_parts.join("\n\n"),
         input,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImageToolOutput {
+    media_type: String,
+    filename: String,
+    data_url: String,
+}
+
+fn parse_image_tool_output(content: &str) -> Option<ImageToolOutput> {
+    let value: Value = serde_json::from_str(content).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("media") {
+        return None;
+    }
+    let media_type = value.get("media_type")?.as_str()?;
+    if !media_type.starts_with("image/") {
+        return None;
+    }
+    let data = value.get("data")?.as_str()?;
+    if data.is_empty() {
+        return None;
+    }
+    let filename = value
+        .get("filename")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("image")
+        .to_owned();
+    Some(ImageToolOutput {
+        media_type: media_type.to_owned(),
+        filename,
+        data_url: format!("data:{media_type};base64,{data}"),
+    })
 }
 
 /// Convert a set of ToolSpec entries into the Responses-API `tools`
@@ -327,6 +384,53 @@ mod tests {
                 assert_eq!(output, "file contents");
             }
             _ => panic!("expected FunctionCallOutput"),
+        }
+    }
+
+    #[test]
+    fn image_tool_message_emits_function_output_then_input_image() {
+        let history = vec![
+            Message::assistant_tool_calls(vec![ToolCall {
+                id: "call_1".into(),
+                function: ToolCallFunction {
+                    name: "read_image".into(),
+                    arguments: r#"{"path":"/x.png"}"#.into(),
+                },
+            }]),
+            Message::tool_result(
+                "call_1".into(),
+                json!({
+                    "type": "media",
+                    "media_type": "image/png",
+                    "filename": "x.png",
+                    "data": "abc123"
+                })
+                .to_string(),
+            ),
+        ];
+        let t = history_to_input(&history, None);
+        assert_eq!(t.input.len(), 3);
+        match &t.input[1] {
+            ResponseItem::FunctionCallOutput { call_id, output } => {
+                assert_eq!(call_id, "call_1");
+                assert!(output.contains("Image result attached"));
+                assert!(!output.contains("abc123"));
+            }
+            _ => panic!("expected FunctionCallOutput"),
+        }
+        match &t.input[2] {
+            ResponseItem::Message { role, content } => {
+                assert_eq!(role, "user");
+                assert!(matches!(
+                    &content[0],
+                    MessageContent::InputText { text } if text.contains("Image returned by tool call call_1")
+                ));
+                assert!(matches!(
+                    &content[1],
+                    MessageContent::InputImage { image_url } if image_url == "data:image/png;base64,abc123"
+                ));
+            }
+            _ => panic!("expected image Message"),
         }
     }
 

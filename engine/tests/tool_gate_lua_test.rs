@@ -572,6 +572,30 @@ fn tool_result_payload_summarizes_image_media_output() {
     assert!(!err);
 }
 
+#[test]
+fn image_media_output_is_not_dumped() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("nefor stub");
+    set_package_path(&lua).expect("package.path");
+
+    let should_dump: bool = lua
+        .load(
+            r#"
+            local d = require("tool-gate.tool_output_dump")
+            return d.should_dump({
+              type = "media",
+              media_type = "image/jpeg",
+              filename = "paste.jpg",
+              data = string.rep("a", 64 * 1024),
+            })
+            "#,
+        )
+        .eval()
+        .expect("eval");
+
+    assert!(!should_dump);
+}
+
 // ----------------------------------------------------------------
 // maybe_dump_output — disk-write side-effect bridge
 // ----------------------------------------------------------------

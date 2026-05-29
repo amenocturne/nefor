@@ -137,6 +137,12 @@ end
 ---@param output any
 ---@return boolean
 function M.should_dump(output)
+  if type(output) == "table"
+      and output.type == "media"
+      and type(output.media_type) == "string"
+      and output.media_type:match("^image/") then
+    return false
+  end
   local s = stringify(output)
   if not s then return false end
   return #s > M.INLINE_BUDGET

@@ -146,6 +146,7 @@ pub enum ResponseItem {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessageContent {
     InputText { text: String },
+    InputImage { image_url: String },
     OutputText { text: String },
 }
 

@@ -138,8 +138,9 @@ fn all_four_roles_translate_correctly() {
     ];
     let t = history_to_input(&history, None);
     assert_eq!(t.instructions, "be nice");
-    // user + assistant + tool output = 3 items (system → instructions)
-    assert_eq!(t.input.len(), 3);
+    // user + assistant = 2 items. The orphan tool output is dropped
+    // because Responses requires a preceding unanswered function_call.
+    assert_eq!(t.input.len(), 2);
 }
 
 #[test]
