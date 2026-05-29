@@ -3,13 +3,17 @@
 //! once per render; the reconciler diffs descriptions against the prior
 //! instance tree to decide create / reuse / drop.
 
-use mlua::{Table, Value};
+use mlua::{String as LuaString, Table, Value};
 
 use crate::error::TuiError;
 
 /// Sentinel field every primitive's table carries. `desc::from_lua_table`
 /// dispatches on its value.
 pub const KIND_FIELD: &str = "_tui_kind";
+
+fn lua_string_lossy(s: &LuaString) -> String {
+    String::from_utf8_lossy(s.as_bytes().as_ref()).into_owned()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WidgetDescription {
@@ -416,7 +420,7 @@ pub enum AnimationDirection {
 /// column is also dispatched through here.
 pub fn from_lua_table(t: &Table) -> Result<WidgetDescription, TuiError> {
     let kind: String = match t.get::<Value>(KIND_FIELD)? {
-        Value::String(s) => s.to_str()?.to_string(),
+        Value::String(s) => lua_string_lossy(&s),
         Value::Nil => {
             return Err(TuiError::InvalidDesc(format!(
                 "missing `{KIND_FIELD}` field; was this table built via tui.text/column/padding?"
@@ -455,7 +459,7 @@ pub fn from_lua_table(t: &Table) -> Result<WidgetDescription, TuiError> {
 
 fn parse_text(t: &Table) -> Result<WidgetDescription, TuiError> {
     let content: String = match t.get::<Value>("content")? {
-        Value::String(s) => s.to_str()?.to_string(),
+        Value::String(s) => lua_string_lossy(&s),
         Value::Nil => {
             return Err(TuiError::InvalidDesc(
                 "tui.text: `content` is required (got nil)".into(),
@@ -526,7 +530,7 @@ pub(crate) fn parse_span_array(arr: &Table, ctx: &str) -> Result<Vec<Span>, TuiE
 
 fn parse_one_span(t: &Table, ctx: &str, i: usize) -> Result<Span, TuiError> {
     let text: String = match t.get::<Value>("text")? {
-        Value::String(s) => s.to_str()?.to_string(),
+        Value::String(s) => lua_string_lossy(&s),
         Value::Nil => {
             return Err(TuiError::InvalidDesc(format!(
                 "{ctx}: span #{i} requires `text`"
@@ -562,7 +566,7 @@ fn parse_one_span(t: &Table, ctx: &str, i: usize) -> Result<Span, TuiError> {
 
 fn parse_markdown(t: &Table) -> Result<WidgetDescription, TuiError> {
     let source: String = match t.get::<Value>("source")? {
-        Value::String(s) => s.to_str()?.to_string(),
+        Value::String(s) => lua_string_lossy(&s),
         Value::Nil => {
             return Err(TuiError::InvalidDesc(
                 "tui.markdown: `source` is required (got nil)".into(),
@@ -703,7 +707,7 @@ fn parse_animation(t: &Table) -> Result<WidgetDescription, TuiError> {
     };
     let direction = match t.get::<Value>("direction")? {
         Value::Nil => AnimationDirection::Forward,
-        Value::String(s) => match s.to_str()?.as_ref() {
+        Value::String(s) => match lua_string_lossy(&s).as_str() {
             "forward" => AnimationDirection::Forward,
             "reverse" => AnimationDirection::Reverse,
             "alternate" => AnimationDirection::Alternate,
@@ -737,7 +741,7 @@ fn parse_animation_frames(arr: &Table) -> Result<Vec<AnimationFrame>, TuiError> 
         let v: Value = arr.get(i)?;
         match v {
             Value::Nil => continue,
-            Value::String(s) => out.push(AnimationFrame::Text(s.to_str()?.to_string())),
+            Value::String(s) => out.push(AnimationFrame::Text(lua_string_lossy(&s))),
             Value::Table(inner) => {
                 let spans = parse_span_array(&inner, "tui.animation.frame")?;
                 if spans.is_empty() {
@@ -772,7 +776,7 @@ fn parse_heading_entry(t: &Table, key: &str) -> Result<Option<HeadingStyle>, Tui
             let strikethrough = parse_bool(&st, "strikethrough")?;
             let prefix = match st.get::<Value>("prefix")? {
                 Value::Nil => None,
-                Value::String(s) => s.to_str()?.chars().next(),
+                Value::String(s) => lua_string_lossy(&s).chars().next(),
                 other => {
                     return Err(TuiError::InvalidDesc(format!(
                         "tui.markdown.theme: `{key}.prefix` must be a string (got {})",
@@ -923,7 +927,7 @@ fn parse_spacer(t: &Table) -> Result<WidgetDescription, TuiError> {
 
 fn parse_fill(t: &Table) -> Result<WidgetDescription, TuiError> {
     let ch: String = match t.get::<Value>("char")? {
-        Value::String(s) => s.to_str()?.to_string(),
+        Value::String(s) => lua_string_lossy(&s),
         Value::Nil => {
             return Err(TuiError::InvalidDesc(
                 "tui.fill: `char` is required (got nil)".into(),
@@ -985,7 +989,7 @@ fn parse_constrained(t: &Table) -> Result<WidgetDescription, TuiError> {
 fn parse_align(t: &Table) -> Result<WidgetDescription, TuiError> {
     let alignment = match t.get::<Value>("alignment")? {
         Value::Nil => Alignment::Center,
-        Value::String(s) => parse_alignment_str(&s.to_str()?)?,
+        Value::String(s) => parse_alignment_str(&lua_string_lossy(&s))?,
         other => {
             return Err(TuiError::InvalidDesc(format!(
                 "tui.align: `alignment` must be a string (got {})",
@@ -1020,7 +1024,7 @@ fn parse_align(t: &Table) -> Result<WidgetDescription, TuiError> {
 fn parse_anchored(t: &Table) -> Result<WidgetDescription, TuiError> {
     let anchor = match t.get::<Value>("anchor")? {
         Value::Nil => Anchor::Center,
-        Value::String(s) => parse_anchor_str(&s.to_str()?)?,
+        Value::String(s) => parse_anchor_str(&lua_string_lossy(&s))?,
         other => {
             return Err(TuiError::InvalidDesc(format!(
                 "tui.anchored: `anchor` must be a string (got {})",
@@ -1064,7 +1068,7 @@ fn parse_text_input(t: &Table) -> Result<WidgetDescription, TuiError> {
     let key = parse_key(t)?;
     let value: String = match t.get::<Value>("value")? {
         Value::Nil => String::new(),
-        Value::String(s) => s.to_str()?.to_string(),
+        Value::String(s) => lua_string_lossy(&s),
         other => {
             return Err(TuiError::InvalidDesc(format!(
                 "tui.text_input: `value` must be a string or nil (got {})",
@@ -1143,7 +1147,7 @@ fn parse_scrollable(t: &Table) -> Result<WidgetDescription, TuiError> {
 
     let stick_to = match t.get::<Value>("stick_to")? {
         Value::Nil => None,
-        Value::String(s) => match s.to_str()?.as_ref() {
+        Value::String(s) => match lua_string_lossy(&s).as_str() {
             "start" => Some(crate::scrollable::StickTo::Start),
             "end" => Some(crate::scrollable::StickTo::End),
             other => {
@@ -1164,7 +1168,7 @@ fn parse_scrollable(t: &Table) -> Result<WidgetDescription, TuiError> {
 
     let scrollbar = match t.get::<Value>("scrollbar")? {
         Value::Nil => crate::scrollable::ScrollbarMode::Auto,
-        Value::String(s) => match s.to_str()?.as_ref() {
+        Value::String(s) => match lua_string_lossy(&s).as_str() {
             "auto" => crate::scrollable::ScrollbarMode::Auto,
             "always" => crate::scrollable::ScrollbarMode::Always,
             "never" => crate::scrollable::ScrollbarMode::Never,
@@ -1252,7 +1256,7 @@ fn parse_optional_bool(t: &Table, key: &str, ctx: &str) -> Result<Option<bool>, 
 fn parse_optional_string(t: &Table, key: &str, ctx: &str) -> Result<Option<String>, TuiError> {
     match t.get::<Value>(key)? {
         Value::Nil => Ok(None),
-        Value::String(s) => Ok(Some(s.to_str()?.to_string())),
+        Value::String(s) => Ok(Some(lua_string_lossy(&s))),
         other => Err(TuiError::InvalidDesc(format!(
             "{ctx}: `{key}` must be a string or nil (got {})",
             other.type_name()
@@ -1306,7 +1310,7 @@ fn parse_dimension(t: &Table, key: &str) -> Result<Dimension, TuiError> {
         Value::Nil => Ok(Dimension::Intrinsic),
         Value::Integer(n) => clamp_u16(n, &format!("tui.anchored.{key}")).map(Dimension::Cells),
         Value::Number(n) => clamp_u16_f(n, &format!("tui.anchored.{key}")).map(Dimension::Cells),
-        Value::String(s) => parse_percent(&s.to_str()?, key).map(Dimension::Percent),
+        Value::String(s) => parse_percent(&lua_string_lossy(&s), key).map(Dimension::Percent),
         other => Err(TuiError::InvalidDesc(format!(
             "tui.anchored: `{key}` must be nil, an integer, or a percent string like \"50%\" (got {})",
             other.type_name()
@@ -1471,7 +1475,7 @@ fn parse_children(arr: &Table) -> Result<Vec<WidgetDescription>, TuiError> {
 fn parse_key(t: &Table) -> Result<Option<String>, TuiError> {
     match t.get::<Value>("key")? {
         Value::Nil => Ok(None),
-        Value::String(s) => Ok(Some(s.to_str()?.to_string())),
+        Value::String(s) => Ok(Some(lua_string_lossy(&s))),
         other => Err(TuiError::InvalidDesc(format!(
             "`key` must be a string or nil (got {})",
             other.type_name()
@@ -1482,7 +1486,7 @@ fn parse_key(t: &Table) -> Result<Option<String>, TuiError> {
 fn parse_wrap(t: &Table) -> Result<WrapMode, TuiError> {
     match t.get::<Value>("wrap")? {
         Value::Nil => Ok(WrapMode::Word),
-        Value::String(s) => match s.to_str()?.as_ref() {
+        Value::String(s) => match lua_string_lossy(&s).as_str() {
             "word" => Ok(WrapMode::Word),
             "char" => Ok(WrapMode::Char),
             "none" => Ok(WrapMode::None),
@@ -1529,7 +1533,7 @@ fn parse_color(t: &Table, key: &str) -> Result<Option<Color>, TuiError> {
     match t.get::<Value>(key)? {
         Value::Nil => Ok(None),
         Value::String(s) => {
-            let raw = s.to_str()?;
+            let raw = lua_string_lossy(&s);
             let val: &str = raw.as_ref();
             if val == "reset" {
                 Ok(Some(Color::Reset))
@@ -1678,6 +1682,22 @@ mod tests {
         let t = eval_table(&l, r#"return { _tui_kind = "text" }"#);
         let err = from_lua_table(&t).unwrap_err();
         assert!(format!("{err}").contains("`content` is required"));
+    }
+
+    #[test]
+    fn text_content_accepts_non_utf8_lua_bytes_lossily() {
+        let l = lua();
+        let t = eval_table(
+            &l,
+            r#"return { _tui_kind = "text", content = "before " .. string.char(255) .. " after" }"#,
+        );
+        let d = from_lua_table(&t).expect("parse");
+        match d {
+            WidgetDescription::Text { content, .. } => {
+                assert_eq!(content, "before \u{fffd} after");
+            }
+            _ => panic!("expected text"),
+        }
     }
 
     #[test]
