@@ -11,7 +11,9 @@ use crate::animation::sample as animation_sample;
 use crate::desc::WidgetDescription;
 use crate::error::TuiError;
 use crate::input::KeyMessage;
-use crate::input_router::{route_key, route_paste, PasteDecision, RouteDecision};
+use crate::input_router::{
+    find_focused_path, route_key, route_paste, PasteDecision, RouteDecision,
+};
 use crate::instance::{sync_text_inputs, InstanceKind, InstanceState, WidgetInstance};
 use crate::lua_host::{
     LuaHost, ScrollCommand, ScrollPositionMap, ScrollPositionSnapshot, SideEffect,
@@ -302,6 +304,19 @@ impl Engine {
                 Ok(())
             }
         }
+    }
+
+    /// Whether a paste target currently exists. The binary uses this to
+    /// avoid materialising clipboard images on disk when a paste chord
+    /// would have nowhere editable to land.
+    pub fn has_focused_text_input(&mut self) -> Result<bool, TuiError> {
+        self.ensure_reconciled()?;
+        Ok(self
+            .reconciler
+            .root
+            .as_ref()
+            .and_then(find_focused_path)
+            .is_some())
     }
 
     /// Build `{ kind, target_key, value? }` and dispatch through Lua's

@@ -13,8 +13,8 @@
 //!
 //! Ctrl+C bubbles unconditionally — universally "exit/cancel" in raw-mode
 //! terminals. The desktop "Ctrl+C = copy" convention does not apply here
-//! (no system-clipboard integration in v1, and a text_input that swallows
-//! Ctrl+C strands the user with no way out of the app).
+//! (a text_input that swallows Ctrl+C strands the user with no way out of
+//! the app).
 //!
 //! Modifier-prefixed keys (Ctrl+B, Esc, Tab, F-keys, PgUp/PgDn) and
 //! release/repeat events ALWAYS bubble — even when a text_input is
@@ -278,8 +278,9 @@ pub fn apply_editing_key(
         "k" if has_ctrl => state.delete_to_line_end(),
         "w" if has_ctrl => state.delete_word_backward(),
         "v" if has_ctrl => {
-            // Paste: same shape — terminal-driven bracketed paste lives
-            // outside the editing-key path. v1 no-op.
+            // Text paste arrives as crossterm Event::Paste and image
+            // paste is intercepted by the binary before routing here.
+            // If neither happened, Ctrl+V remains a harmless no-op.
             EditOutcome::default()
         }
         "z" if has_ctrl => state.undo(),

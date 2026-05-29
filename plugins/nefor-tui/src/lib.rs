@@ -7,6 +7,7 @@
 
 pub mod animation;
 pub mod ansi;
+pub mod clipboard_image;
 pub mod desc;
 pub mod engine;
 pub mod error;

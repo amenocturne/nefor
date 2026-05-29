@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 
 use nefor_plugin_sdk::{await_ready_ok, spawn_stdin_reader, spawn_stdout_writer, TransportError};
+use nefor_tui::clipboard_image::{is_clipboard_image_paste_key, save_system_clipboard_image};
 use nefor_tui::engine::Engine;
 use nefor_tui::error::TuiError;
 use nefor_tui::input::from_key_event;
@@ -301,6 +302,19 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
                     match evt {
                         Event::Key(k) => {
                             if let Some(km) = from_key_event(&k) {
+                                if is_clipboard_image_paste_key(&km) && engine.has_focused_text_input()? {
+                                    match save_system_clipboard_image() {
+                                        Ok(Some(path)) => {
+                                            let path = path.to_string_lossy();
+                                            engine.handle_paste(&path)?;
+                                            return Ok(());
+                                        }
+                                        Ok(None) => {}
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "clipboard image paste failed");
+                                        }
+                                    }
+                                }
                                 engine.handle_key(km)?;
                             }
                         }
