@@ -350,6 +350,13 @@ fn ctrl_c_exits_even_when_input_is_focused() {
         engine.exit_requested(),
         "Ctrl+C must exit even with a focused text_input",
     );
+    let emits = engine.take_emit_queue();
+    assert!(
+        emits
+            .iter()
+            .any(|(_, b)| b.get("kind").and_then(|v| v.as_str()) == Some("chat.interrupt_all")),
+        "Ctrl+C must interrupt in-flight work before exiting; got {emits:?}",
+    );
 }
 
 #[test]
@@ -367,6 +374,13 @@ fn ctrl_d_exits() {
         })
         .expect("ctrl+d");
     assert!(engine.exit_requested(), "Ctrl+D must exit");
+    let emits = engine.take_emit_queue();
+    assert!(
+        emits
+            .iter()
+            .any(|(_, b)| b.get("kind").and_then(|v| v.as_str()) == Some("chat.interrupt_all")),
+        "Ctrl+D must interrupt in-flight work before exiting; got {emits:?}",
+    );
 }
 
 #[test]

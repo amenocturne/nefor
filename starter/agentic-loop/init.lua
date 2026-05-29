@@ -58,6 +58,7 @@ local state = {
   tool_id_to_key       = {},    ---@type table
   chat_id_stream_visible = {},  ---@type table
   chat_id_stream_explicitly_hidden = {},  ---@type table  -- chats explicitly registered hidden by agent reasoners; gates streams without a pending entry
+  current_lead_chat_id = nil,   ---@type string|nil
   -- firing_id → { run_id, node_id, reasoner } for tracked runs (the
   -- orchestrator run + every sub-graph run we own). Populated by
   -- graph.node.fired observer envelopes; consumed when a tool.result
@@ -164,6 +165,31 @@ local function drain_deferred_text()
   return table.concat(parts, "\n\n---\n\n")
 end
 
+local function active_lead_chat_id()
+  if type(state.current_state) == "table"
+      and type(state.current_state.chat_id) == "string"
+      and #state.current_state.chat_id > 0 then
+    return state.current_state.chat_id
+  end
+  if type(state.current_lead_chat_id) == "string"
+      and #state.current_lead_chat_id > 0 then
+    return state.current_lead_chat_id
+  end
+  return nil
+end
+
+local function append_to_active_lead_chat(text)
+  if type(text) ~= "string" or #text == 0 then return false end
+  local chat_id = active_lead_chat_id()
+  if type(chat_id) ~= "string" then return false end
+  emit(state.config.provider, {
+    kind    = state.config.provider .. ".chat.append",
+    chat_id = chat_id,
+    message = { role = "user", content = text },
+  })
+  return true
+end
+
 -- Deferred user-text queue. Carries any text that needs to land as a
 -- user-role message in a fresh orchestrator turn: today, sub-graph
 -- completion bodies (`[spawn_graph(run_id=…) result]`). One entry per
@@ -242,6 +268,7 @@ local function cancel_all()
   state.chat_id_stream_explicitly_hidden = {}
   state.tool_id_to_key = {}
   state.firing_to_node = {}
+  state.current_lead_chat_id = nil
   nefor.log.info("agentic-loop: cancel_all", {
     cancelled_chat_run = cancelled_chat,
     cancelled_sub_runs = sub_n,
@@ -686,10 +713,15 @@ local function teardown_for_session_end()
       kind = "graph.cancel",
       run_id = state.current_run_id,
     })
+    emit(state.config.provider, {
+      kind = state.config.provider .. ".interrupt",
+    })
     state.current_run_id = nil
   end
-  for run_id, _ in pairs(state.pending_runs) do
-    emit("reasoner-graph", { kind = "graph.cancel", run_id = run_id })
+  cancel_all_pending_runs()
+  local close_notice = drain_deferred_text()
+  if type(close_notice) == "string" then
+    append_to_active_lead_chat(close_notice)
   end
   state.pending_runs       = {}
   state.pending_dispatches = {}
@@ -699,6 +731,7 @@ local function teardown_for_session_end()
   state.chat_id_stream_explicitly_hidden = {}
   state.tool_id_to_key     = {}
   state.firing_to_node     = {}
+  state.current_lead_chat_id = nil
   state.current_state      = nil
   state.deferred_queue     = {}
   state.pending_user_inputs = {}
@@ -1216,6 +1249,7 @@ M._internals  = {
     state.tool_id_to_key = {}
     state.chat_id_stream_visible = {}
     state.chat_id_stream_explicitly_hidden = {}
+    state.current_lead_chat_id = nil
     state.firing_to_node = {}
     state.stream_observers = {}
     state.reasoning_observers = {}

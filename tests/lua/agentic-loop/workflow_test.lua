@@ -665,6 +665,59 @@ do
     .. tostring(prompt))
 end
 
+-- Session boundaries (/new, /resume, shutdown) should behave like
+-- process exit: close the old chat coherently, persist the interrupted
+-- sub-graph notice into the old lead provider history, then clear
+-- in-memory state without relaying anything into the next session.
+do
+  fresh_loop()
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "start lead turn" })
+  agentic_loop._internals.state.current_lead_chat_id = "chat-old"
+  local sub_run = agentic_loop.queue_sub_graph(
+    { graph = { nodes = { { id = "terminal", role = "explorer", agent_args = { prompt = "audit" } } }, edges = {} } },
+    "gate-inner-session-end"
+  )
+  assert(type(sub_run) == "string", "subgraph run id")
+  _test.calls_clear()
+
+  _test.fire_bus("sessions.session_end", { session_id = "old" })
+
+  local saw_provider_interrupt = false
+  local saw_subgraph_cancel = false
+  local saw_old_chat_append = false
+  local saw_relay_run = false
+  for _, c in ipairs(decode_calls()) do
+    if c.body.kind == "ollama.interrupt" then
+      saw_provider_interrupt = true
+    end
+    if c.body.kind == "graph.cancel" and c.body.run_id == sub_run then
+      saw_subgraph_cancel = true
+    end
+    if c.body.kind == "ollama.chat.append"
+        and c.body.chat_id == "chat-old"
+        and type(c.body.message) == "table"
+        and c.body.message.role == "user"
+        and type(c.body.message.content) == "string"
+        and string.find(c.body.message.content, "sub-graph interrupted by user", 1, true) then
+      saw_old_chat_append = true
+    end
+    if c.body.kind == "tool.invoke" and c.body.name == "spawn_graph" then
+      saw_relay_run = true
+    end
+  end
+  assert(saw_provider_interrupt,
+    "session_end must interrupt the active provider turn; got "
+    .. json.encode(_test.calls()))
+  assert(saw_subgraph_cancel,
+    "session_end must cancel pending sub-graphs; got "
+    .. json.encode(_test.calls()))
+  assert(saw_old_chat_append,
+    "session_end must persist interrupted sub-graph notice into old lead chat history; got "
+    .. json.encode(_test.calls()))
+  assert(not saw_relay_run,
+    "session_end must not start an automatic relay turn that would leak into the next session")
+end
+
 -- cancel_all with no in-flight run is a no-op — must NOT spuriously
 -- emit a provider interrupt. The symmetric single-Esc `cancel()`
 -- already gates on current_run_id; cancel_all matches that gate.

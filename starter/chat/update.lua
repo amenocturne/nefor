@@ -339,7 +339,11 @@ local function handle_input_submit(msg, state)
 end
 
 local function handle_exit(_msg, state)
-  return state, { { kind = "exit" } }
+  return state, {
+    { kind = "send_to", target = "engine",
+      body = { kind = "chat.interrupt_all" } },
+    { kind = "exit" },
+  }
 end
 
 local function handle_toggle_sidebar(_msg, state)
