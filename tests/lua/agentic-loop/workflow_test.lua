@@ -580,6 +580,91 @@ do
     .. json.encode(_test.calls()))
 end
 
+-- cancel_all on an async sub-graph must inform both surfaces: the UI
+-- gets a failed graph_result block, and the lead model gets a deferred
+-- `[spawn_graph(... ) FAILED]` prompt. Previously cancel_all only sent
+-- a tool-result-shaped UI notice for the original gate id, so the lead
+-- continued believing the graph was still running.
+do
+  fresh_loop()
+  local run_id = agentic_loop.queue_sub_graph(
+    { graph = { nodes = { { id = "terminal", role = "explorer", agent_args = { prompt = "audit" } } }, edges = {} } },
+    "gate-inner-cancel"
+  )
+  _test.calls_clear()
+  agentic_loop.cancel_all()
+
+  local calls = decode_calls()
+  local visible = find_graph_result(calls, "failed", "sub-graph interrupted by user")
+  assert(visible ~= nil,
+    "cancel_all must surface interrupted sub-graph as failed graph_result; got "
+    .. json.encode(_test.calls()))
+
+  local saw_cancel = false
+  local relay_prompt
+  for _, c in ipairs(calls) do
+    if c.body.kind == "graph.cancel" and c.body.run_id == run_id then
+      saw_cancel = true
+    end
+    if c.body.kind == "tool.invoke"
+        and c.body.name == "spawn_graph"
+        and type(c.body.args) == "table"
+        and type(c.body.args.graph) == "table" then
+      for _, node in ipairs(c.body.args.graph.nodes or {}) do
+        if node.id == "wrap" and type(node.args) == "table" then
+          relay_prompt = node.args.prompt
+        end
+      end
+    end
+  end
+  assert(saw_cancel,
+    "cancel_all must still send graph.cancel to reasoner-graph; got "
+    .. json.encode(_test.calls()))
+  assert(type(relay_prompt) == "string"
+      and string.find(relay_prompt, "[spawn_graph(run_id=", 1, true)
+      and string.find(relay_prompt, "FAILED", 1, true)
+      and string.find(relay_prompt, "sub-graph interrupted by user", 1, true),
+    "cancel_all must relay interrupted sub-graph to the lead model; prompt was "
+    .. tostring(relay_prompt))
+end
+
+-- If cancel_all also interrupts the visible lead turn, the sub-graph
+-- cancellation notice must be retained and prepended to the next user
+-- submit. That is the dogfood case where the user later types
+-- "continue".
+do
+  fresh_loop()
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "start lead turn" })
+  local sub_run = agentic_loop.queue_sub_graph(
+    { graph = { nodes = { { id = "terminal", role = "explorer", agent_args = { prompt = "audit" } } }, edges = {} } },
+    "gate-inner-cancel-with-lead"
+  )
+  assert(type(sub_run) == "string", "subgraph run id")
+  _test.calls_clear()
+  agentic_loop.cancel_all()
+  _test.calls_clear()
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "continue" })
+
+  local prompt
+  for _, c in ipairs(decode_calls()) do
+    if c.body.kind == "tool.invoke"
+        and c.body.name == "spawn_graph"
+        and type(c.body.args) == "table"
+        and type(c.body.args.graph) == "table" then
+      for _, node in ipairs(c.body.args.graph.nodes or {}) do
+        if node.id == "wrap" and type(node.args) == "table" then
+          prompt = node.args.prompt
+        end
+      end
+    end
+  end
+  assert(type(prompt) == "string"
+      and string.find(prompt, "sub-graph interrupted by user", 1, true)
+      and string.find(prompt, "continue", 1, true),
+    "next submit after interrupt must carry both cancellation notice and user text; prompt was "
+    .. tostring(prompt))
+end
+
 -- cancel_all with no in-flight run is a no-op — must NOT spuriously
 -- emit a provider interrupt. The symmetric single-Esc `cancel()`
 -- already gates on current_run_id; cancel_all matches that gate.

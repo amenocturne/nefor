@@ -117,29 +117,7 @@ local function flush_pending_dispatches()
   return n
 end
 
-local function cancel_all_pending_runs()
-  local n = 0
-  for run_id, entry in pairs(state.pending_runs) do
-    emit("reasoner-graph", { kind = "graph.cancel", run_id = run_id })
-    -- Synthesise a tool.result so the lead's deferred-result handler
-    -- closes the spawn_graph slot. Without this, `graph.cancel` tears
-    -- down the sub-graph but the lead's tool_call entry stays pending
-    -- forever, blocking the next chat.complete cycle. The lead never
-    -- learns the sub-graph won't deliver, so the conversation hangs
-    -- on the orchestrator side even after the user interrupted.
-    if entry and type(entry.gate_inner_id) == "string" then
-      emit("nefor-tui", {
-        kind  = "tool.result",
-        id    = entry.gate_inner_id,
-        error = "sub-graph interrupted by user",
-      })
-    end
-    n = n + 1
-  end
-  state.pending_runs = {}
-  state.pending_dispatches = {}
-  return n
-end
+local cancel_all_pending_runs
 
 local function submit_orchestrator_run(user_text)
   if state.current_run_id ~= nil then return nil end
@@ -176,6 +154,16 @@ local function submit_orchestrator_run(user_text)
   return state.current_run_id
 end
 
+local function drain_deferred_text()
+  if #state.deferred_queue == 0 then return nil end
+  local parts = {}
+  while #state.deferred_queue > 0 do
+    local entry = table.remove(state.deferred_queue, 1)
+    parts[#parts + 1] = entry.text
+  end
+  return table.concat(parts, "\n\n---\n\n")
+end
+
 -- Deferred user-text queue. Carries any text that needs to land as a
 -- user-role message in a fresh orchestrator turn: today, sub-graph
 -- completion bodies (`[spawn_graph(run_id=…) result]`). One entry per
@@ -183,15 +171,9 @@ end
 -- instead of one merged blob.
 local function flush_deferred()
   if state.current_run_id ~= nil then return end
-  if #state.deferred_queue == 0 then return end
-  local parts = {}
-  while #state.deferred_queue > 0 do
-    local entry = table.remove(state.deferred_queue, 1)
-    parts[#parts + 1] = entry.text
-  end
-  local merged = table.concat(parts, "\n\n---\n\n")
+  local merged = drain_deferred_text()
+  if type(merged) ~= "string" then return end
   nefor.log.info("agentic-loop: flushing deferred spawn_graph results", {
-    count = #parts,
     text_preview = string.sub(merged, 1, 80),
   })
   submit_orchestrator_run(merged)
@@ -240,9 +222,19 @@ local function cancel_all()
     state.current_run_id = nil
   end
   local sub_n = cancel_all_pending_runs()
-  local dropped = #state.deferred_queue
+  local deferred_after_cancel = #state.deferred_queue
   local dropped_inputs = #state.pending_user_inputs
-  state.deferred_queue = {}
+  if cancelled_chat then
+    -- Keep the synthesized cancellation result queued. The interrupted
+    -- provider turn is being torn down, so starting an automatic relay
+    -- turn here would fight the user's cancellation. The next live user
+    -- submit prepends this queued notice to the model prompt.
+    nefor.log.info("agentic-loop: retaining interrupted sub-graph notice for next submit", {
+      deferred_queued = deferred_after_cancel,
+    })
+  else
+    flush_deferred()
+  end
   state.pending_user_inputs = {}
   state.pending = {}
   state.chat_id_to_key = {}
@@ -253,13 +245,13 @@ local function cancel_all()
   nefor.log.info("agentic-loop: cancel_all", {
     cancelled_chat_run = cancelled_chat,
     cancelled_sub_runs = sub_n,
-    dropped_deferred = dropped,
+    deferred_after_cancel = deferred_after_cancel,
     dropped_pending_inputs = dropped_inputs,
   })
   return {
     chat = cancelled_chat,
     sub_graphs = sub_n,
-    deferred = dropped,
+    deferred = deferred_after_cancel,
     pending_inputs = dropped_inputs,
   }
 end
@@ -441,6 +433,11 @@ local function handle_chat_input_submit(body)
     text = text,
   })
 
+  local deferred = drain_deferred_text()
+  if type(deferred) == "string" then
+    text = deferred .. "\n\n---\n\n" .. text
+  end
+
   submit_orchestrator_run(text)
 end
 
@@ -467,6 +464,70 @@ local function handle_chat_model_set(body)
     })
     set_model(provider, model)
   end
+end
+
+local function sub_graph_nodes(graph)
+  local nodes = {}
+  if type(graph) == "table" and type(graph.nodes) == "table" then
+    for _, n in ipairs(graph.nodes) do
+      if type(n) == "table" then
+        nodes[#nodes + 1] = {
+          id   = tostring(n.id or "?"),
+          role = tostring(n.role or n.reasoner or "?"),
+        }
+      end
+    end
+  end
+  return nodes
+end
+
+local function close_sub_graph(run_id, sub_pending, status, results, explicit_error)
+  local effective_status = status or "unknown"
+  local completion = {
+    kind   = "spawn_graph.completed",
+    run_id = run_id,
+    status = effective_status,
+  }
+  local pending_graph = sub_pending and sub_pending.graph or nil
+  if effective_status == "success" then
+    completion.output = serialise_results(results or {}, pending_graph)
+  elseif type(explicit_error) == "string" and #explicit_error > 0 then
+    completion.error = explicit_error
+  else
+    completion.error = "spawn_graph run completed with status `" .. effective_status ..
+                       "`: " .. json.encode(results or {})
+  end
+
+  nefor.log.info("agentic-loop: sub-graph completed", {
+    run_id = run_id, status = effective_status,
+  })
+
+  local graph_event = {
+    kind   = "chat.graph_result.append",
+    run_id = run_id,
+    status = effective_status == "success" and "success" or "failed",
+    nodes  = sub_graph_nodes(pending_graph),
+  }
+  if effective_status == "success" then
+    graph_event.output = completion.output
+  else
+    graph_event.error = completion.error
+  end
+  emit("nefor-tui", graph_event)
+  state.deferred_queue[#state.deferred_queue + 1] = { text = format_deferred(completion) }
+end
+
+cancel_all_pending_runs = function()
+  local n = 0
+  for run_id, entry in pairs(state.pending_runs) do
+    emit("reasoner-graph", { kind = "graph.cancel", run_id = run_id })
+    close_sub_graph(run_id, entry, "interrupted", {},
+      "sub-graph interrupted by user")
+    state.pending_runs[run_id] = nil
+    n = n + 1
+  end
+  state.pending_dispatches = {}
+  return n
 end
 
 -- graph.node.fired observer: track firing_id → (run_id, node_id) for
@@ -516,60 +577,7 @@ local function handle_tool_result_run_close(run_id, body)
   local sub_pending = state.pending_runs[run_id]
   if sub_pending ~= nil then
     state.pending_runs[run_id] = nil
-    local effective_status = status or "unknown"
-    local completion = {
-      kind   = "spawn_graph.completed",
-      run_id = run_id,
-      status = effective_status,
-    }
-    local pending_graph = sub_pending.graph
-    if effective_status == "success" then
-      -- Pass the graph topology so serialise_results can pick the
-      -- sub-graph's sink node(s) by structure instead of by name —
-      -- caller-minted node ids (`test_explorer`, `test_reviewer`, …)
-      -- don't match the legacy "terminal"/"out"/"final" heuristic and
-      -- would otherwise silently surface the wrong node's output.
-      completion.output = serialise_results(results, pending_graph)
-    else
-      completion.error = "spawn_graph run completed with status `" .. effective_status ..
-                         "`: " .. json.encode(results)
-    end
-    nefor.log.info("agentic-loop: sub-graph completed", {
-      run_id = run_id, status = effective_status,
-    })
-    -- Surface the sub-graph result as a distinguishable transcript
-    -- block. The chat-bridge forwards this envelope identity-passthrough
-    -- to the TUI; chat/update.lua's reducer pushes a `graph_result`
-    -- entry kind that entries.lua renders with its own glyph + style.
-    -- The deferred-queue user message below still feeds the model.
-    local graph_nodes = {}
-    if type(pending_graph) == "table" and type(pending_graph.nodes) == "table" then
-      for _, n in ipairs(pending_graph.nodes) do
-        if type(n) == "table" then
-          graph_nodes[#graph_nodes + 1] = {
-            id   = tostring(n.id or "?"),
-            -- Prefer the lead-workflow `role` (explorer / builder / …)
-            -- when present; fall back to `reasoner` for orchestrator-
-            -- internal graphs that don't carry the role concept.
-            role = tostring(n.role or n.reasoner or "?"),
-          }
-        end
-      end
-    end
-    local graph_event = {
-      kind   = "chat.graph_result.append",
-      run_id = run_id,
-      status = effective_status == "success" and "success" or "failed",
-      nodes  = graph_nodes,
-    }
-    if effective_status == "success" then
-      graph_event.output = completion.output
-    else
-      graph_event.error = completion.error
-    end
-    emit("nefor-tui", graph_event)
-    local text = format_deferred(completion)
-    state.deferred_queue[#state.deferred_queue + 1] = { text = text }
+    close_sub_graph(run_id, sub_pending, status, results, nil)
     -- Flush when no more sub-graphs are pending — delivers all results
     -- in one batch so the lead processes them in a single turn.
     if next(state.pending_runs) == nil then
