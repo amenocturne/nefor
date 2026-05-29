@@ -4,9 +4,9 @@
 
 Small core. User-owned config. Replaceable everything else.
 
-Think Neovim for agent-era systems: a programmable core, process plugins, and a
-Lua config you own. The engine spawns processes, routes lines, hosts Lua, and
-stamps identity. Your `init.lua` decides what exists, how it talks, what gets
+Think Neovim as a runtime: a programmable core, process plugins, and a Lua
+config you own. The engine spawns processes, routes lines, hosts Lua, and stamps
+identity. Your `init.lua` decides what exists, how it talks, what gets
 persisted, and which interface sits on top.
 
 Nefor does not require LLMs. Models, scripts, tools, agents, orchestrators, and
@@ -109,9 +109,6 @@ Bash-tool test: a plugin should feel like a self-contained utility you could run
 from a shell, then compose elsewhere. Plugins should not know their neighbors;
 composition belongs in Lua.
 
-Agents are one possible composition on top of this ladder. They are not Nefor's
-identity.
-
 ## Development
 
 All commands live in the [`justfile`](justfile). Run `just` to see the full list.
@@ -126,27 +123,6 @@ All commands live in the [`justfile`](justfile). Run `just` to see the full list
 - [Plugins](plugins/README.md)
 - [Starter composition](starter/README.md)
 - [Lua core](lua/core/README.md)
-
-## FAQ
-
-**Why Lua?** Composition is configuration. Configuration should be a real
-language. Lua embeds cleanly, starts small, and stays easy to rewrite.
-
-**Is this like Neovim?** In spirit, yes: small programmable core, plugin
-ecosystem, user-owned Lua config. Nefor is not an editor; the analogy is about
-control boundaries.
-
-**Is Nefor for agents?** It can be. The starter includes an agent-oriented
-composition, but Nefor itself is the runtime underneath it.
-
-**Can I use this without LLMs?** Yes. The engine routes lines between processes.
-It does not know what an LLM is.
-
-**Who owns composition?** Your `init.lua`. If you disagree with a design choice,
-replace the plugin or rewrite the wiring.
-
-**What is Nefor not?** Not a hosted service, not a closed system, not a UI you
-have to accept, and not a promise that one blessed workflow fits everyone.
 
 ## License
 
