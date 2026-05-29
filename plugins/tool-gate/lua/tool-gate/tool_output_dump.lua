@@ -73,6 +73,45 @@ local function stringify(output)
   return encoded, nil
 end
 
+---@param value any
+---@return boolean
+local function is_image_media_table(value)
+  return type(value) == "table"
+      and value.type == "media"
+      and type(value.media_type) == "string"
+      and value.media_type:match("^image/") ~= nil
+end
+
+---@param output any
+---@return table|nil
+local function image_media_output(output)
+  if is_image_media_table(output) then return output end
+  if type(output) ~= "string" then return nil end
+
+  local ok, decoded = pcall(json.decode, output)
+  if not ok then return nil end
+  if is_image_media_table(decoded) then return decoded end
+  return nil
+end
+
+---@param output any
+---@return boolean
+function M.is_image_media_output(output)
+  return image_media_output(output) ~= nil
+end
+
+---@param output any
+---@return string|nil
+function M.image_media_summary(output)
+  local media = image_media_output(output)
+  if not media then return nil end
+  local filename = media.filename
+  if type(filename) ~= "string" or filename == "" then
+    filename = "image"
+  end
+  return string.format("[image result: %s (%s)]", filename, media.media_type)
+end
+
 ---@param b integer|nil
 ---@return boolean
 local function is_continuation(b)
@@ -137,10 +176,7 @@ end
 ---@param output any
 ---@return boolean
 function M.should_dump(output)
-  if type(output) == "table"
-      and output.type == "media"
-      and type(output.media_type) == "string"
-      and output.media_type:match("^image/") then
+  if M.is_image_media_output(output) then
     return false
   end
   local s = stringify(output)

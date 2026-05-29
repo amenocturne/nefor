@@ -160,12 +160,17 @@ async fn read_image_file(request: ReadImageRequest) -> Result<Value, ToolError> 
     let media = prepare_media_bytes(&bytes, media_type)
         .map_err(|_| ToolError::UnsupportedImage { path: path.clone() })?;
 
-    Ok(json!({
+    let debug_path = maybe_write_debug_media(&filename, &media).await?;
+    let mut out = json!({
         "type": "media",
         "media_type": media.media_type,
         "filename": filename,
         "data": encode_base64(&media.bytes),
-    }))
+    });
+    if let Some(debug_path) = debug_path {
+        out["debug_path"] = Value::String(debug_path);
+    }
+    Ok(out)
 }
 
 struct MediaBytes {
@@ -258,6 +263,64 @@ fn encode_jpeg(img: &image::RgbImage, quality: u8) -> Result<Vec<u8>, image::Ima
         image::ExtendedColorType::Rgb8,
     )?;
     Ok(out)
+}
+
+async fn maybe_write_debug_media(
+    filename: &str,
+    media: &MediaBytes,
+) -> Result<Option<String>, ToolError> {
+    let Some(dir) = std::env::var_os("NEFOR_READ_IMAGE_DEBUG_DIR") else {
+        return Ok(None);
+    };
+    let dir = std::path::PathBuf::from(dir);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| ToolError::Io {
+            path: dir.to_string_lossy().into_owned(),
+            message: e.to_string(),
+        })?;
+
+    let stem = std::path::Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("image");
+    let safe_stem = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!(
+        "{safe_stem}-{millis}.{}",
+        extension_for_media_type(media.media_type)
+    ));
+
+    tokio::fs::write(&path, &media.bytes)
+        .await
+        .map_err(|e| ToolError::Io {
+            path: path.to_string_lossy().into_owned(),
+            message: e.to_string(),
+        })?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+fn extension_for_media_type(media_type: &str) -> &'static str {
+    match media_type {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "img",
+    }
 }
 
 fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {

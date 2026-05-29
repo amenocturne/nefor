@@ -573,6 +573,38 @@ fn tool_result_payload_summarizes_image_media_output() {
 }
 
 #[test]
+fn tool_result_payload_summarizes_image_media_json_string_output() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("nefor stub");
+    set_package_path(&lua).expect("package.path");
+
+    let result: Table = lua
+        .load(
+            r#"
+            local lib = require("tool-gate")
+            local out, err = lib.tool_result_payload({
+              kind = "tool.result",
+              id = "x",
+              output = nefor.json.encode({
+                type = "media",
+                media_type = "image/png",
+                filename = "paste.png",
+                data = string.rep("a", 64 * 1024),
+              }),
+            })
+            return { out = out, err = err }
+            "#,
+        )
+        .eval()
+        .expect("eval");
+
+    let out: String = result.get("out").expect("out");
+    let err: bool = result.get("err").expect("err");
+    assert_eq!(out, "[image result: paste.png (image/png)]");
+    assert!(!err);
+}
+
+#[test]
 fn image_media_output_is_not_dumped() {
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("nefor stub");
@@ -588,6 +620,30 @@ fn image_media_output_is_not_dumped() {
               filename = "paste.jpg",
               data = string.rep("a", 64 * 1024),
             })
+            "#,
+        )
+        .eval()
+        .expect("eval");
+
+    assert!(!should_dump);
+}
+
+#[test]
+fn image_media_json_string_output_is_not_dumped() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("nefor stub");
+    set_package_path(&lua).expect("package.path");
+
+    let should_dump: bool = lua
+        .load(
+            r#"
+            local d = require("tool-gate.tool_output_dump")
+            return d.should_dump(nefor.json.encode({
+              type = "media",
+              media_type = "image/jpeg",
+              filename = "paste.jpg",
+              data = string.rep("a", 64 * 1024),
+            }))
             "#,
         )
         .eval()
