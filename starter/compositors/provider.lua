@@ -235,6 +235,22 @@ function M.spawn_spec(name, command, opts)
     return body
   end
 
+  local function active_chat_id()
+    local current_state = al.current_state and al.current_state() or nil
+    if type(current_state) == "table"
+        and type(current_state.chat_id) == "string"
+        and #current_state.chat_id > 0 then
+      return current_state.chat_id
+    end
+    if al.current_lead_chat_id then
+      local chat_id = al.current_lead_chat_id()
+      if type(chat_id) == "string" and #chat_id > 0 then
+        return chat_id
+      end
+    end
+    return nil
+  end
+
   -- from_plugin (binary → bus) — four steps per envelope:
   --   1. translator.maybe_inject_static_token: bus-quiet auth.set
   --      injection on first ready (no-op otherwise).
@@ -297,13 +313,7 @@ function M.spawn_spec(name, command, opts)
           if body.kind == kinds.model_set
               or body.kind == kinds.reasoning_set
               or body.kind == kinds.chat_compact then
-            local active_chat_id
-            local current_state = al.current_state()
-            if type(current_state) == "table"
-                and type(current_state.chat_id) == "string" then
-              active_chat_id = current_state.chat_id
-            end
-            body.chat_id = active_chat_id
+            body.chat_id = active_chat_id()
           end
           translator.deliver(body)
         end

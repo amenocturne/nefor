@@ -1060,6 +1060,11 @@ function M.config() return state.config end
 -- `chat.model.set` bodies; tests use it to assert state transitions.
 function M.current_state() return state.current_state end
 
+-- Best-effort active lead chat id. This falls back to the chat_id
+-- captured at provider-firing start, so UI commands issued after a
+-- completed turn can still address the lead conversation.
+function M.current_lead_chat_id() return active_lead_chat_id() end
+
 -- Back-compat with agentic_workflow.build_template (used by tests).
 function M.build_template(user_text, opts)
   opts = opts or {}
