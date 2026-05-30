@@ -201,7 +201,7 @@ history_replay.install()
 actor.spawn(sessions)
 
 local function parse_startup_args(argv)
-  local opts = { session_id = nil }
+  local opts = { session_id = nil, prompt = nil }
   local i = 1
   while i <= #argv do
     local a = argv[i]
@@ -211,6 +211,13 @@ local function parse_startup_args(argv)
         error("--session requires a session id")
       end
       opts.session_id = v
+      i = i + 2
+    elseif a == "--prompt" then
+      local v = argv[i + 1]
+      if type(v) ~= "string" or v == "" then
+        error("--prompt requires a prompt")
+      end
+      opts.prompt = v
       i = i + 2
     else
       error("unknown startup arg: " .. tostring(a))
@@ -359,3 +366,17 @@ actor.spawn(require("compositors.chat_bridge").spawn_spec({
   require("config").bin("nefor-tui"),
   "--script", STARTER_ROOT .. "/chat/init.lua",
 }))
+
+if startup.prompt ~= nil then
+  local submitted = false
+  nefor.bus.on_event("basic-tools.hello", function(_env)
+    if submitted then return end
+    submitted = true
+    nefor.engine.send(nefor.json.encode({
+      type = "event",
+      from = "startup",
+      ts   = nefor.engine.now(),
+      body = { kind = "chat.input.submit", text = startup.prompt },
+    }))
+  end)
+end
