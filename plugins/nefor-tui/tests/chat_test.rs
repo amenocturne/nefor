@@ -108,11 +108,13 @@ fn chat_lua_loads_and_renders_initial_frame() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let out = render_str(&mut engine);
-    // Pre-stats statusline shows the dim "Start chatting" placeholder
-    // (legacy-spec parity, not the old MVP "model: —" format).
     assert!(
-        out.contains("Start chatting to see stats"),
-        "pre-stats placeholder missing: {out:?}"
+        out.contains("mock-model"),
+        "initial statusline should show configured default model: {out:?}"
+    );
+    assert!(
+        !out.contains("Start chatting to see stats"),
+        "configured defaults should replace pre-chat placeholder: {out:?}"
     );
     // The input field should NOT carry a default hint — the bordered
     // box below the transcript is self-explanatory. Substrings from the
@@ -125,6 +127,32 @@ fn chat_lua_loads_and_renders_initial_frame() {
     }
     // Drain — the script doesn't emit anything at boot.
     assert!(engine.take_emit_queue().is_empty());
+}
+
+#[test]
+fn initial_statusline_adds_context_window_from_model_list() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.models.listed",
+            "provider": "mock-plugin",
+            "models": ["mock-model"],
+            "context_windows": { "mock-model": 128000 },
+        }),
+    );
+
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("mock-model"),
+        "initial statusline should keep configured model: {out:?}"
+    );
+    assert!(
+        out.contains("ctx 128k"),
+        "initial statusline should show known model context window: {out:?}"
+    );
 }
 
 #[test]

@@ -103,6 +103,23 @@ do
     error("starter/chat.lua: could not locate starter/chat submodules")
   end
 
+  local chat_parent = chat_dir:match("^(.*)/chat$")
+  local config_lua_dir = pick_dir("NEFOR_STARTER_CONFIG_DIR", "/config/init.lua", table.pack(
+    chat_parent,
+    dev_dir    and (dev_dir    .. "/starter") or nil,
+    config_dir,
+    pm_root    and (pm_root    .. "/starter") or nil,
+    "./starter",
+    "../starter"
+  ))
+  if config_lua_dir ~= nil then
+    package.path = table.concat({
+      config_lua_dir .. "/?.lua",
+      config_lua_dir .. "/?/init.lua",
+      package.path,
+    }, ";")
+  end
+
   local function make_prefix_searcher(prefix, root)
     return function(name)
       if name ~= prefix and name:sub(1, #prefix + 1) ~= prefix .. "." then
@@ -136,7 +153,14 @@ local history = require("chat.history")
 local view    = require("chat.view")
 local update  = require("chat.update")
 
+local function active_config()
+  local ok, cfg = pcall(function() return require("config").active end)
+  if ok and type(cfg) == "table" then return cfg end
+  return {}
+end
+
 local function initial_state()
+  local cfg = active_config()
   return {
     entries          = {},
     in_flight        = nil,
@@ -147,9 +171,9 @@ local function initial_state()
     pending          = false,
     turn_started_at  = nil,
     last_turn_duration_ms = nil,
-    model            = nil,
-    provider         = nil,
-    reasoning_effort = nil,
+    model            = cfg.default_model,
+    provider         = cfg.default_provider,
+    reasoning_effort = cfg.default_reasoning_effort,
     max_tokens       = nil,
     gate_yolo        = false,
     auth             = {},

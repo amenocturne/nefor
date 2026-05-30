@@ -701,13 +701,16 @@ end
 
 local function handle_models_listed(msg, state)
   -- Absorb per-model context windows if the provider reported them.
+  local active_ctx = nil
   if type(msg.context_windows) == "table" then
     for model_id, ctx_size in pairs(msg.context_windows) do
       if type(ctx_size) == "number" and ctx_size > 0 then
         model_context_windows[model_id] = ctx_size
+        if model_id == state.model then active_ctx = ctx_size end
       end
     end
   end
+  local active_effort = nil
   if type(msg.model_capabilities) == "table" then
     local provider = msg.provider or ""
     for model_id, caps in pairs(msg.model_capabilities) do
@@ -716,12 +719,22 @@ local function handle_models_listed(msg, state)
       local k = model_key(provider, model_id)
       if k ~= nil and type(default) == "string" and #default > 0 then
         model_reasoning_defaults[k] = default
+        if provider == state.provider and model_id == state.model then
+          active_effort = default
+        end
       end
     end
   end
+  local next_state = state
+  if active_ctx ~= nil or (active_effort ~= nil and state.reasoning_effort == nil) then
+    next_state = shallow_merge(state, {
+      max_tokens       = active_ctx or state.max_tokens,
+      reasoning_effort = state.reasoning_effort or active_effort,
+    })
+  end
   -- Update the open model_picker popup if one is up; otherwise drop.
-  if not (state.popup and state.popup.variant == "model_picker") then
-    return state, {}
+  if not (next_state.popup and next_state.popup.variant == "model_picker") then
+    return next_state, {}
   end
   local provider = msg.provider or ""
   local list = msg.models or {}
@@ -732,7 +745,7 @@ local function handle_models_listed(msg, state)
   table.sort(models)
   local new_providers = {}
   local found = false
-  for _, prov in ipairs(state.popup.providers or {}) do
+  for _, prov in ipairs(next_state.popup.providers or {}) do
     if prov.name == provider then
       new_providers[#new_providers + 1] = shallow_merge(prov, { models = models })
       found = true
@@ -747,12 +760,12 @@ local function handle_models_listed(msg, state)
     }
     table.sort(new_providers, function(a, b) return a.name < b.name end)
   end
-  local prev_awaiting = state.popup.awaiting or {}
+  local prev_awaiting = next_state.popup.awaiting or {}
   local new_awaiting = {}
   for k, v in pairs(prev_awaiting) do new_awaiting[k] = v end
   new_awaiting[provider] = nil
-  return shallow_merge(state, {
-    popup = shallow_merge(state.popup, {
+  return shallow_merge(next_state, {
+    popup = shallow_merge(next_state.popup, {
       providers = new_providers,
       awaiting  = new_awaiting,
     }),
