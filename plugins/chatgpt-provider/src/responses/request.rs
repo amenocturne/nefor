@@ -7,6 +7,7 @@
 //! (`client_metadata`, websocket-bridging shapes).
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 /// Canonical request body POSTed to `…/codex/responses`.
 ///
@@ -98,12 +99,13 @@ pub enum Verbosity {
 ///     turns to preserve state on the subscription path)
 ///   - `compaction` — native opaque compaction state returned by the
 ///     Responses compaction endpoint
+///   - `compaction_summary` — server-provided compacted summary item;
+///     keep it native because the backend may evolve its exact fields
 ///
-/// `Other` is a catch-all so unknown items round-trip without losing
-/// data; serde's `tag = "type"` with an inner `serde_json::Value`
-/// requires the untagged escape hatch (see serde issue #912), so we
-/// model `Other` as the externally-tagged value and rely on the
-/// `untagged` fallback ordering.
+/// Keep this enum in sync with every Responses item that can appear in
+/// live stream output or compacted replacement history; unknown tags
+/// fail loudly because dropping model-context items would corrupt the
+/// next turn.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseItem {
@@ -140,6 +142,18 @@ pub enum ResponseItem {
     },
     Compaction {
         encrypted_content: String,
+    },
+    CompactionSummary {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<Value>,
+        #[serde(flatten)]
+        extra: Map<String, Value>,
     },
 }
 

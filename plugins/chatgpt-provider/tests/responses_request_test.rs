@@ -174,6 +174,37 @@ fn reasoning_item_round_trips_encrypted_content() {
 }
 
 #[test]
+fn compaction_summary_item_round_trips_unknown_fields() {
+    let v = json!({
+        "type": "compaction_summary",
+        "id": "cs_1",
+        "encrypted_content": "opaque-summary",
+        "text": "Short user-visible summary.",
+        "server_field": {"kept": true}
+    });
+
+    let item: ResponseItem = serde_json::from_value(v.clone()).expect("deserialize");
+    let ResponseItem::CompactionSummary {
+        id,
+        encrypted_content,
+        text,
+        extra,
+        ..
+    } = &item
+    else {
+        panic!("expected compaction summary");
+    };
+    assert_eq!(id.as_deref(), Some("cs_1"));
+    assert_eq!(encrypted_content.as_deref(), Some("opaque-summary"));
+    assert_eq!(text.as_deref(), Some("Short user-visible summary."));
+    assert_eq!(extra["server_field"], json!({"kept": true}));
+
+    let back = serde_json::to_value(&item).expect("serialize");
+    assert_eq!(back["type"], json!("compaction_summary"));
+    assert_eq!(back["server_field"], json!({"kept": true}));
+}
+
+#[test]
 fn message_content_input_text_uses_snake_case_tag() {
     let mc = MessageContent::InputText {
         text: "hello".into(),

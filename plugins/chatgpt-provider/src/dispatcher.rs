@@ -369,10 +369,15 @@ fn chat_compaction_commit_body(
         "items".into(),
         serde_json::to_value(compacted_items).unwrap_or(Value::Array(Vec::new())),
     );
-    let encrypted = compacted_items
-        .iter()
-        .any(|item| matches!(item, ResponseItem::Compaction { .. }));
+    let encrypted = compacted_items.iter().any(|item| match item {
+        ResponseItem::Compaction { .. } => true,
+        ResponseItem::CompactionSummary {
+            encrypted_content, ..
+        } => encrypted_content.is_some(),
+        _ => false,
+    });
     artifact.insert("encrypted".into(), Value::Bool(encrypted));
+    let summary_text = compaction_summary_text(compacted_items);
 
     let mut metadata = Map::new();
     metadata.insert(
@@ -387,6 +392,10 @@ fn chat_compaction_commit_body(
         "retained_messages".into(),
         Value::Number((after_items as u64).into()),
     );
+    metadata.insert(
+        "has_summary".into(),
+        Value::Bool(summary_text.as_deref().is_some_and(|s| !s.is_empty())),
+    );
 
     let mut m = Map::new();
     m.insert("chat_id".into(), Value::String(chat_id.to_string()));
@@ -395,13 +404,58 @@ fn chat_compaction_commit_body(
     m.insert("model".into(), Value::String(model.to_owned()));
     m.insert(
         "display_summary".into(),
-        Value::String(format!(
-            "Native compaction installed: {before_items} history items sealed into {after_items} model-context items."
-        )),
+        Value::String(summary_text.unwrap_or_else(|| {
+            format!(
+                "Native compaction installed: {before_items} history items sealed into {after_items} model-context items."
+            )
+        })),
     );
     m.insert("model_context_artifact".into(), Value::Object(artifact));
     m.insert("metadata".into(), Value::Object(metadata));
     make_event(format!("{}chat.compaction.commit", args.event_prefix()), m)
+}
+
+fn compaction_summary_text(items: &[ResponseItem]) -> Option<String> {
+    for item in items.iter().rev() {
+        let ResponseItem::CompactionSummary { text, summary, .. } = item else {
+            continue;
+        };
+        if let Some(text) = non_empty_trimmed(text.as_deref()) {
+            return Some(text.to_owned());
+        }
+        if let Some(text) = summary.as_ref().and_then(text_from_summary_value) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn text_from_summary_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => non_empty_trimmed(Some(s)).map(str::to_owned),
+        Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| {
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .and_then(|s| non_empty_trimmed(Some(s)))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            non_empty_trimmed(Some(&text)).map(str::to_owned)
+        }
+        Value::Object(map) => map
+            .get("text")
+            .and_then(Value::as_str)
+            .and_then(|s| non_empty_trimmed(Some(s)).map(str::to_owned)),
+        _ => None,
+    }
+}
+
+fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
+    let trimmed = value?.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 // ---------------------------------------------------------------------
