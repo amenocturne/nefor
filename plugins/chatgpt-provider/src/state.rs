@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::responses::request::ReasoningEffort;
+use crate::responses::request::{ReasoningEffort, ResponseItem};
 
 // ---------------------------------------------------------------------
 // Message shape — internal history representation.
@@ -70,6 +70,19 @@ pub enum Message {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         name: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HistoryEntry {
+    Message { message: Message },
+    Native { item: ResponseItem },
+}
+
+impl From<Message> for HistoryEntry {
+    fn from(message: Message) -> Self {
+        Self::Message { message }
+    }
 }
 
 impl Message {
@@ -201,7 +214,7 @@ struct ChatState {
     /// this out into the Responses-API `instructions` field; never goes
     /// into the `input` array.
     system: Option<String>,
-    history: Vec<Message>,
+    history: Vec<HistoryEntry>,
     turn: TurnState,
     stats: ChatStats,
     /// Optional per-chat allowlist of tool names; when `Some(names)`,
@@ -269,7 +282,7 @@ pub enum ChatsError {
 pub struct ChatSnapshot {
     pub model: String,
     pub system: Option<String>,
-    pub history: Vec<Message>,
+    pub history: Vec<HistoryEntry>,
     pub tool_allowlist: Option<Vec<String>>,
     pub tool_overrides: Option<Vec<crate::catalog::ToolSpec>>,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -542,7 +555,23 @@ impl Chats {
                 return Ok(());
             }
         }
-        chat.history.push(message);
+        chat.history.push(message.into());
+        Ok(())
+    }
+
+    pub async fn replace_with_native_history(
+        &self,
+        id: &ChatId,
+        items: Vec<ResponseItem>,
+    ) -> Result<(), ChatsError> {
+        let mut g = self.inner.lock().await;
+        let chat = g
+            .get_mut(id)
+            .ok_or_else(|| ChatsError::NotFound(id.clone()))?;
+        chat.history = items
+            .into_iter()
+            .map(|item| HistoryEntry::Native { item })
+            .collect();
         Ok(())
     }
 
@@ -681,9 +710,12 @@ impl Chats {
     }
 }
 
-fn has_unanswered_tool_call(history: &[Message], tool_call_id: &str) -> bool {
+fn has_unanswered_tool_call(history: &[HistoryEntry], tool_call_id: &str) -> bool {
     let mut seen_call = false;
-    for message in history {
+    for entry in history {
+        let HistoryEntry::Message { message } = entry else {
+            continue;
+        };
         match message {
             Message::Assistant { tool_calls, .. }
                 if tool_calls.iter().any(|tc| tc.id == tool_call_id) =>
@@ -719,8 +751,14 @@ mod tests {
             .expect("push assistant");
         let snap = c.snapshot(&id).await.expect("snapshot");
         assert_eq!(snap.history.len(), 2);
-        assert_eq!(snap.history[0].role(), "user");
-        assert_eq!(snap.history[1].role(), "assistant");
+        match &snap.history[0] {
+            HistoryEntry::Message { message } => assert_eq!(message.role(), "user"),
+            _ => panic!("expected message"),
+        }
+        match &snap.history[1] {
+            HistoryEntry::Message { message } => assert_eq!(message.role(), "assistant"),
+            _ => panic!("expected message"),
+        }
     }
 
     #[tokio::test]
@@ -930,12 +968,22 @@ mod tests {
             .expect("t");
         let h = c.snapshot(&id).await.expect("h").history;
         assert_eq!(h.len(), 3);
-        assert_eq!(h[1].role(), "assistant");
-        assert!(h[1].content().is_none());
-        assert_eq!(h[1].tool_calls().len(), 1);
-        assert_eq!(h[2].role(), "tool");
-        assert_eq!(h[2].tool_call_id(), Some("call_1"));
-        assert_eq!(h[2].content(), Some("file contents"));
+        match &h[1] {
+            HistoryEntry::Message { message } => {
+                assert_eq!(message.role(), "assistant");
+                assert!(message.content().is_none());
+                assert_eq!(message.tool_calls().len(), 1);
+            }
+            _ => panic!("expected assistant message"),
+        }
+        match &h[2] {
+            HistoryEntry::Message { message } => {
+                assert_eq!(message.role(), "tool");
+                assert_eq!(message.tool_call_id(), Some("call_1"));
+                assert_eq!(message.content(), Some("file contents"));
+            }
+            _ => panic!("expected tool message"),
+        }
     }
 
     #[tokio::test]
@@ -984,7 +1032,10 @@ mod tests {
 
         let h = c.snapshot(&id).await.expect("h").history;
         assert_eq!(h.len(), 2);
-        assert_eq!(h[1].content(), Some("first"));
+        match &h[1] {
+            HistoryEntry::Message { message } => assert_eq!(message.content(), Some("first")),
+            _ => panic!("expected tool message"),
+        }
     }
 
     #[tokio::test]
@@ -1012,6 +1063,29 @@ mod tests {
         );
         // Unknown model → None (caller falls back to static heuristic).
         assert_eq!(c.model_capability_reasoning("unknown-model").await, None);
+    }
+
+    #[tokio::test]
+    async fn replace_with_native_history_installs_compaction_items() {
+        let c = Chats::with_default_model(Some("m".into()));
+        let id = ChatId::new("a");
+        c.create(id.clone(), None, None, None, None, None)
+            .await
+            .expect("create");
+        c.push_user(&id, "old".into()).await.expect("push");
+
+        c.replace_with_native_history(
+            &id,
+            vec![ResponseItem::Compaction {
+                encrypted_content: "sealed".into(),
+            }],
+        )
+        .await
+        .expect("replace");
+
+        let h = c.snapshot(&id).await.expect("h").history;
+        assert_eq!(h.len(), 1);
+        assert!(matches!(h[0], HistoryEntry::Native { .. }));
     }
 
     #[tokio::test]

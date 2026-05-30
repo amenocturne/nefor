@@ -82,6 +82,24 @@ function M.agents_md(path, dir, text)
   }
 end
 
+function M.compaction(opts)
+  opts = opts or {}
+  local v = next_v()
+  log.log("entry", "create kind=compaction chat_id=%s v=%d", opts.chat_id or "?", v)
+  return {
+    kind = "compaction", role = "system",
+    chat_id = opts.chat_id,
+    provider = opts.provider,
+    model = opts.model,
+    strategy = opts.strategy,
+    trigger = opts.trigger,
+    display_summary = opts.display_summary,
+    model_context_artifact = opts.model_context_artifact,
+    metadata = opts.metadata,
+    v = v,
+  }
+end
+
 -- mutations (copy-on-write, never mutate input)
 
 function M.append_text(entry, delta)

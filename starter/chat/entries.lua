@@ -387,6 +387,78 @@ local function agents_md_expanded(entry)
   return tui.column { gap = 0, children = rows }
 end
 
+local function compaction_label(entry, glyph)
+  local parts = { glyph .. "context compacted" }
+  if type(entry.trigger) == "string" and #entry.trigger > 0 then
+    parts[#parts + 1] = entry.trigger
+  end
+  local provider_model = nil
+  if type(entry.provider) == "string" and #entry.provider > 0
+      and type(entry.model) == "string" and #entry.model > 0 then
+    provider_model = entry.provider .. "/" .. entry.model
+  elseif type(entry.provider) == "string" and #entry.provider > 0 then
+    provider_model = entry.provider
+  elseif type(entry.model) == "string" and #entry.model > 0 then
+    provider_model = entry.model
+  end
+  if provider_model ~= nil then parts[#parts + 1] = provider_model end
+  return table.concat(parts, " · ")
+end
+
+local function compaction_collapsed(entry)
+  local rows = {
+    tui.text {
+      content = compaction_label(entry, "▸ "),
+      style   = STYLE.system,
+      wrap    = "none",
+    },
+  }
+  if type(entry.display_summary) == "string" and #entry.display_summary > 0 then
+    rows[#rows + 1] = tui.text {
+      content = "  " .. entry.display_summary,
+      style   = STYLE.footer,
+      wrap    = "word",
+    }
+  end
+  return tui.column { gap = 0, children = rows }
+end
+
+local function compaction_expanded(entry)
+  local rows = {
+    tui.text {
+      content = compaction_label(entry, "▼ "),
+      style   = STYLE.system,
+      wrap    = "none",
+    },
+  }
+  if type(entry.display_summary) == "string" and #entry.display_summary > 0 then
+    rows[#rows + 1] = tui.text {
+      content = "  " .. entry.display_summary,
+      style   = STYLE.footer,
+      wrap    = "word",
+    }
+  end
+  local artifact = entry.model_context_artifact
+  if type(artifact) == "table" then
+    local slim = {}
+    for k, v in pairs(artifact) do
+      if k ~= "items" then slim[k] = v end
+    end
+    artifact = slim
+  end
+  local details = {
+    strategy = entry.strategy,
+    model_context_artifact = artifact,
+    metadata = entry.metadata,
+  }
+  rows[#rows + 1] = tui.text {
+    content = pad_block("  " .. pretty_json(details):gsub("\n", "\n  ")),
+    style   = { fg = C.md_code_fg, bg = C.md_code_block_bg },
+    wrap    = "none",
+  }
+  return tui.column { gap = 0, children = rows }
+end
+
 function M.render(entry, _i, expanded, queued)
   if entry.kind == "tool_call" then
     if expanded then return tool_expanded(entry) end
@@ -399,6 +471,10 @@ function M.render(entry, _i, expanded, queued)
   if entry.kind == "agents_md" then
     if expanded then return agents_md_expanded(entry) end
     return agents_md_collapsed(entry)
+  end
+  if entry.kind == "compaction" then
+    if expanded then return compaction_expanded(entry) end
+    return compaction_collapsed(entry)
   end
   if entry.kind == "plan" then
     return render_plan_entry(entry)

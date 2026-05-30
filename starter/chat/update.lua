@@ -280,6 +280,16 @@ local function handle_input_submit(msg, state)
       { kind = "send_to", target = "engine", body = body },
     }
   end
+  if cmd == "compact" then
+    local body = {
+      kind     = "chat.compaction.request",
+      trigger  = "manual",
+      provider = state.provider,
+    }
+    return shallow_merge(state, { input_value = "", completion = NIL_SENTINEL }), {
+      { kind = "send_to", target = "engine", body = body },
+    }
+  end
   if cmd == "resume" then
     if args and #args > 0 then
       local id = args:match("^([%w%-]+)") or args
@@ -631,6 +641,19 @@ local function handle_plan_append(msg, state)
   ), {}
 end
 
+local function handle_compaction_commit(msg, state)
+  return transcript.push_entry(state, Entry.compaction({
+    chat_id = msg.chat_id,
+    provider = msg.provider,
+    model = msg.model,
+    strategy = msg.strategy,
+    trigger = msg.trigger,
+    display_summary = msg.display_summary,
+    model_context_artifact = msg.model_context_artifact,
+    metadata = msg.metadata,
+  })), {}
+end
+
 local function handle_plan_approved(msg, state)
   local approved = (msg.approved == true)
   local entries = {}
@@ -959,6 +982,7 @@ local handlers = {
   ["chat.tool.end"]               = handle_tool_end,
   ["chat.graph_result.append"]    = handle_graph_result_append,
   ["chat.plan.append"]            = handle_plan_append,
+  ["chat.compaction.commit"]      = handle_compaction_commit,
   ["lead-workflow.plan.approved"] = handle_plan_approved,
   ["chat.popup"]                  = handle_popup,
   ["chat.toast"]                  = handle_toast,

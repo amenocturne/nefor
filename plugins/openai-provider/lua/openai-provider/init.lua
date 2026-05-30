@@ -50,6 +50,9 @@ function M.translator(name)
     turn_error              = prefix .. "turn.error",
     chat_error              = prefix .. "chat.error",
     chat_complete_result    = prefix .. "chat.complete.result",
+    chat_compact            = prefix .. "chat.compact",
+    chat_compaction_commit  = prefix .. "chat.compaction.commit",
+    chat_compaction_restore = prefix .. "chat.compaction.restore",
     chat_create             = prefix .. "chat.create",
     chat_append             = prefix .. "chat.append",
     hello                   = prefix .. "hello",
@@ -110,6 +113,10 @@ function M.translator(name)
       return body
     elseif k == kinds.reasoning_set_ack then
       body.kind = "chat.reasoning.set_ack"
+      body.provider = name
+      return body
+    elseif k == kinds.chat_compaction_commit then
+      body.kind = "chat.compaction.commit"
       body.provider = name
       return body
     elseif k == kinds.turn_error then
@@ -213,6 +220,12 @@ function M.translator(name)
       return {
         kind   = kinds.reasoning_set,
         effort = body.effort or body.reasoning_effort,
+      }
+    elseif k == "chat.compaction.request" then
+      if body.provider ~= name then return nil end
+      return {
+        kind    = kinds.chat_compact,
+        trigger = body.trigger or "manual",
       }
     end
 
@@ -394,6 +407,21 @@ function M.replay_rebuild(env, name)
       kind    = prefix .. "chat.append",
       chat_id = cid,
       message = message,
+    })
+    return
+  end
+
+  if k == "chat.compaction.commit" then
+    local cid = body.chat_id
+    if type(cid) ~= "string" or not owned[cid] then return end
+    if body.provider ~= nil and body.provider ~= name then return end
+    local artifact = body.model_context_artifact
+    local items = type(artifact) == "table" and artifact.items or nil
+    if type(items) ~= "table" then return end
+    deliver_body({
+      kind    = prefix .. "chat.compaction.restore",
+      chat_id = cid,
+      items   = items,
     })
     return
   end

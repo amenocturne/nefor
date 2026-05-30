@@ -13,6 +13,7 @@ M.COMMANDS = {
   { name = "logout",  aliases = {},          hint = "revoke a provider's auth",               takes_args = true },
   { name = "model",   aliases = {},          hint = "list/switch active model",               takes_args = true },
   { name = "think",   aliases = { "effort" }, hint = "set reasoning effort",                  takes_args = true },
+  { name = "compact", aliases = {},          hint = "compact active model context",           takes_args = false },
   { name = "resume",  aliases = {},          hint = "resume previous session",                takes_args = true },
   { name = "yolo",    aliases = {},          hint = "disable tool permission prompts (DANGEROUS)", takes_args = false },
   { name = "safe",    aliases = {},          hint = "re-enable tool permission prompts",      takes_args = false },

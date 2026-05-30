@@ -294,7 +294,9 @@ function M.spawn_spec(name, command, opts)
 
         local body = translator.inbound(env)
         if body ~= nil then
-          if body.kind == kinds.model_set or body.kind == kinds.reasoning_set then
+          if body.kind == kinds.model_set
+              or body.kind == kinds.reasoning_set
+              or body.kind == kinds.chat_compact then
             local active_chat_id
             local current_state = al.current_state()
             if type(current_state) == "table"

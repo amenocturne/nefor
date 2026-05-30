@@ -437,6 +437,28 @@ async fn dispatch_event(
             )
             .await?;
         }
+        "chat.compact" => {
+            let chat_id = match read_chat_id(body) {
+                Some(id) => id,
+                None => {
+                    send_event(
+                        out_tx,
+                        turn_error_body(config, "chat.compact missing `chat_id`"),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            send_event(
+                out_tx,
+                chat_error_body_msg(
+                    config,
+                    &chat_id,
+                    "native compaction is not supported by openai-provider".into(),
+                ),
+            )
+            .await?;
+        }
         "chat.delete" => {
             let chat_id = match read_chat_id(body) {
                 Some(id) => id,

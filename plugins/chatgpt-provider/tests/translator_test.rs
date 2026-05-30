@@ -5,15 +5,19 @@
 //! `translator.rs`. Hits the public surface via `lib::translator`.
 
 use chatgpt_provider::responses::request::{MessageContent, ResponseItem};
-use chatgpt_provider::state::{Message, ToolCall, ToolCallFunction};
+use chatgpt_provider::state::{HistoryEntry, Message, ToolCall, ToolCallFunction};
 use chatgpt_provider::translator::{
     history_to_input, model_supports_reasoning, tools_to_responses_format,
 };
 
+fn h(messages: Vec<Message>) -> Vec<HistoryEntry> {
+    messages.into_iter().map(HistoryEntry::from).collect()
+}
+
 #[test]
 fn full_round_trip_realistic_history() {
     // user → assistant tool call → tool result → assistant final
-    let history = vec![
+    let history = h(vec![
         Message::user("What's in /etc/hostname?"),
         Message::assistant_with_tool_calls(
             "Let me read that.",
@@ -27,7 +31,7 @@ fn full_round_trip_realistic_history() {
         ),
         Message::tool_result("call_1".into(), "darwin"),
         Message::assistant("Your hostname is darwin."),
-    ];
+    ]);
 
     let t = history_to_input(&history, Some("Be concise."));
 
@@ -89,7 +93,7 @@ fn full_round_trip_realistic_history() {
 
 #[test]
 fn empty_assistant_with_only_tool_calls_omits_prose_message() {
-    let history = vec![Message::assistant_tool_calls(vec![
+    let history = h(vec![Message::assistant_tool_calls(vec![
         ToolCall {
             id: "call_a".into(),
             function: ToolCallFunction {
@@ -104,7 +108,7 @@ fn empty_assistant_with_only_tool_calls_omits_prose_message() {
                 arguments: "{}".into(),
             },
         },
-    ])];
+    ])]);
     let t = history_to_input(&history, None);
     // Just the two function calls — no leading Message item.
     assert_eq!(t.input.len(), 2);
@@ -114,12 +118,12 @@ fn empty_assistant_with_only_tool_calls_omits_prose_message() {
 
 #[test]
 fn system_messages_concat_into_instructions_in_order() {
-    let history = vec![
+    let history = h(vec![
         Message::user("hi"),
         Message::system("rule one"),
         Message::system("rule two"),
         Message::user("hi again"),
-    ];
+    ]);
     let t = history_to_input(&history, Some("base"));
     assert_eq!(t.instructions, "base\n\nrule one\n\nrule two");
     // Only the two user messages — systems are stripped.
@@ -130,12 +134,12 @@ fn system_messages_concat_into_instructions_in_order() {
 fn all_four_roles_translate_correctly() {
     // With the enum there's no "unknown role" path — exhaustive matching
     // covers every variant. Verify each variant maps to the right output.
-    let history = vec![
+    let history = h(vec![
         Message::system("be nice"),
         Message::user("ok"),
         Message::assistant("sure"),
         Message::tool_result("call_1".into(), "result"),
-    ];
+    ]);
     let t = history_to_input(&history, None);
     assert_eq!(t.instructions, "be nice");
     // user + assistant = 2 items. The orphan tool output is dropped

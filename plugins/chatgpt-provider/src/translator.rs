@@ -1,4 +1,4 @@
-//! Translate between nefor's chat history shape (`Vec<Message>`) and
+//! Translate between nefor's chat history shape (`Vec<HistoryEntry>`) and
 //! the Responses API's `(instructions, input: Vec<ResponseItem>)` pair.
 //!
 //! The Responses API differs from chat-completions in two ways that
@@ -26,7 +26,7 @@ use serde_json::{Map, Value};
 
 use crate::catalog::ToolSpec;
 use crate::responses::request::{MessageContent, ResponseItem};
-use crate::state::Message;
+use crate::state::{HistoryEntry, Message};
 
 /// Output of `history_to_input`: the Responses-API `instructions`
 /// (concatenated system messages, empty if none) plus the `input`
@@ -37,7 +37,7 @@ pub struct Translated {
     pub input: Vec<ResponseItem>,
 }
 
-/// Convert a `Vec<Message>` into the Responses-API request shape.
+/// Convert stored chat history into the Responses-API request shape.
 ///
 /// Rules:
 /// - `role == "system"` → concatenated into `instructions` (joined with
@@ -59,7 +59,7 @@ pub struct Translated {
 /// An optional explicit `system_prompt` (from `chat.create`) is
 /// prepended to any inline system messages — both contribute to the
 /// final `instructions`.
-pub fn history_to_input(history: &[Message], system_prompt: Option<&str>) -> Translated {
+pub fn history_to_input(history: &[HistoryEntry], system_prompt: Option<&str>) -> Translated {
     let mut instructions_parts: Vec<String> = Vec::new();
     if let Some(s) = system_prompt {
         if !s.is_empty() {
@@ -69,7 +69,14 @@ pub fn history_to_input(history: &[Message], system_prompt: Option<&str>) -> Tra
 
     let mut input: Vec<ResponseItem> = Vec::new();
     let mut unanswered_tool_calls = HashSet::new();
-    for msg in history {
+    for entry in history {
+        let msg = match entry {
+            HistoryEntry::Native { item } => {
+                input.push(item.clone());
+                continue;
+            }
+            HistoryEntry::Message { message } => message,
+        };
         match msg {
             Message::System { content } => {
                 if !content.is_empty() {
@@ -234,8 +241,12 @@ pub fn model_supports_reasoning(model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{Message, ToolCall, ToolCallFunction};
+    use crate::state::{HistoryEntry, Message, ToolCall, ToolCallFunction};
     use serde_json::json;
+
+    fn h(messages: Vec<Message>) -> Vec<HistoryEntry> {
+        messages.into_iter().map(HistoryEntry::from).collect()
+    }
 
     #[test]
     fn empty_history_yields_empty_translation() {
@@ -253,11 +264,11 @@ mod tests {
 
     #[test]
     fn system_messages_concatenate_with_double_newline() {
-        let history = vec![
+        let history = h(vec![
             Message::system("first"),
             Message::user("hi"),
             Message::system("second"),
-        ];
+        ]);
         let t = history_to_input(&history, Some("base"));
         assert_eq!(t.instructions, "base\n\nfirst\n\nsecond");
         // Only the user message lands in input.
@@ -276,7 +287,7 @@ mod tests {
 
     #[test]
     fn user_message_emits_input_text() {
-        let history = vec![Message::user("hello")];
+        let history = h(vec![Message::user("hello")]);
         let t = history_to_input(&history, None);
         assert_eq!(t.input.len(), 1);
         match &t.input[0] {
@@ -294,7 +305,7 @@ mod tests {
 
     #[test]
     fn assistant_text_only_emits_output_text() {
-        let history = vec![Message::assistant("response")];
+        let history = h(vec![Message::assistant("response")]);
         let t = history_to_input(&history, None);
         assert_eq!(t.input.len(), 1);
         match &t.input[0] {
@@ -311,13 +322,13 @@ mod tests {
 
     #[test]
     fn assistant_tool_calls_without_text_emits_only_function_calls() {
-        let history = vec![Message::assistant_tool_calls(vec![ToolCall {
+        let history = h(vec![Message::assistant_tool_calls(vec![ToolCall {
             id: "call_1".into(),
             function: ToolCallFunction {
                 name: "read_file".into(),
                 arguments: r#"{"path":"/x"}"#.into(),
             },
-        }])];
+        }])]);
         let t = history_to_input(&history, None);
         assert_eq!(t.input.len(), 1);
         match &t.input[0] {
@@ -337,7 +348,7 @@ mod tests {
 
     #[test]
     fn assistant_text_plus_tool_calls_emits_message_then_function_calls() {
-        let history = vec![Message::assistant_with_tool_calls(
+        let history = h(vec![Message::assistant_with_tool_calls(
             "thinking...",
             vec![
                 ToolCall {
@@ -355,7 +366,7 @@ mod tests {
                     },
                 },
             ],
-        )];
+        )]);
         let t = history_to_input(&history, None);
         // 1 Message + 2 FunctionCall
         assert_eq!(t.input.len(), 3);
@@ -366,7 +377,7 @@ mod tests {
 
     #[test]
     fn tool_message_emits_function_call_output_after_matching_call() {
-        let history = vec![
+        let history = h(vec![
             Message::assistant_tool_calls(vec![ToolCall {
                 id: "call_1".into(),
                 function: ToolCallFunction {
@@ -375,7 +386,7 @@ mod tests {
                 },
             }]),
             Message::tool_result("call_1".into(), "file contents"),
-        ];
+        ]);
         let t = history_to_input(&history, None);
         assert_eq!(t.input.len(), 2);
         match &t.input[1] {
@@ -389,7 +400,7 @@ mod tests {
 
     #[test]
     fn image_tool_message_emits_function_output_then_input_image() {
-        let history = vec![
+        let history = h(vec![
             Message::assistant_tool_calls(vec![ToolCall {
                 id: "call_1".into(),
                 function: ToolCallFunction {
@@ -407,7 +418,7 @@ mod tests {
                 })
                 .to_string(),
             ),
-        ];
+        ]);
         let t = history_to_input(&history, None);
         assert_eq!(t.input.len(), 3);
         match &t.input[1] {
@@ -436,14 +447,17 @@ mod tests {
 
     #[test]
     fn orphan_tool_message_is_dropped() {
-        let history = vec![Message::tool_result("call_missing".into(), "stale result")];
+        let history = h(vec![Message::tool_result(
+            "call_missing".into(),
+            "stale result",
+        )]);
         let t = history_to_input(&history, None);
         assert!(t.input.is_empty());
     }
 
     #[test]
     fn duplicate_tool_message_is_dropped() {
-        let history = vec![
+        let history = h(vec![
             Message::assistant_tool_calls(vec![ToolCall {
                 id: "call_1".into(),
                 function: ToolCallFunction {
@@ -453,7 +467,7 @@ mod tests {
             }]),
             Message::tool_result("call_1".into(), "first"),
             Message::tool_result("call_1".into(), "duplicate"),
-        ];
+        ]);
         let t = history_to_input(&history, None);
         assert_eq!(t.input.len(), 2);
         match &t.input[1] {
@@ -464,7 +478,7 @@ mod tests {
 
     #[test]
     fn full_round_trip_user_assistant_tool_assistant() {
-        let history = vec![
+        let history = h(vec![
             Message::system("be helpful"),
             Message::user("read /etc/hostname"),
             Message::assistant_with_tool_calls(
@@ -479,7 +493,7 @@ mod tests {
             ),
             Message::tool_result("call_1".into(), "darwin"),
             Message::assistant("Your hostname is darwin."),
-        ];
+        ]);
         let t = history_to_input(&history, None);
         assert_eq!(t.instructions, "be helpful");
         // user msg + assistant msg + function call + function call

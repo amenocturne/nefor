@@ -31,7 +31,7 @@ use crate::responses::request::{
     Reasoning, ReasoningEffort, ReasoningSummary, ResponseItem, ResponsesApiRequest,
 };
 use crate::responses::stream::ResponseEvent;
-use crate::responses::{ModelEntry, ResponsesClient};
+use crate::responses::{CompactRequest, ModelEntry, ResponsesClient};
 use crate::state::{ChatId, ChatStats, Chats, ChatsError, Message, ToolCall, ToolCallFunction};
 use crate::translator;
 use nefor_plugin_sdk::TransportError;
@@ -349,6 +349,61 @@ fn chat_complete_result_body(
     make_event(format!("{}chat.complete.result", args.event_prefix()), m)
 }
 
+fn chat_compaction_commit_body(
+    args: &ServeArgs,
+    chat_id: &ChatId,
+    model: &str,
+    trigger: &str,
+    before_items: usize,
+    after_items: usize,
+    compacted_items: &[ResponseItem],
+) -> Map<String, Value> {
+    let mut artifact = Map::new();
+    artifact.insert("kind".into(), Value::String("responses.compaction".into()));
+    artifact.insert("opaque".into(), Value::Bool(true));
+    artifact.insert(
+        "item_count".into(),
+        Value::Number((after_items as u64).into()),
+    );
+    artifact.insert(
+        "items".into(),
+        serde_json::to_value(compacted_items).unwrap_or(Value::Array(Vec::new())),
+    );
+    let encrypted = compacted_items
+        .iter()
+        .any(|item| matches!(item, ResponseItem::Compaction { .. }));
+    artifact.insert("encrypted".into(), Value::Bool(encrypted));
+
+    let mut metadata = Map::new();
+    metadata.insert(
+        "before_items".into(),
+        Value::Number((before_items as u64).into()),
+    );
+    metadata.insert(
+        "after_items".into(),
+        Value::Number((after_items as u64).into()),
+    );
+    metadata.insert(
+        "retained_messages".into(),
+        Value::Number((after_items as u64).into()),
+    );
+
+    let mut m = Map::new();
+    m.insert("chat_id".into(), Value::String(chat_id.to_string()));
+    m.insert("strategy".into(), Value::String("responses-compact".into()));
+    m.insert("trigger".into(), Value::String(trigger.to_owned()));
+    m.insert("model".into(), Value::String(model.to_owned()));
+    m.insert(
+        "display_summary".into(),
+        Value::String(format!(
+            "Native compaction installed: {before_items} history items sealed into {after_items} model-context items."
+        )),
+    );
+    m.insert("model_context_artifact".into(), Value::Object(artifact));
+    m.insert("metadata".into(), Value::Object(metadata));
+    make_event(format!("{}chat.compaction.commit", args.event_prefix()), m)
+}
+
 // ---------------------------------------------------------------------
 // Public helpers used by main.rs / tests.
 // ---------------------------------------------------------------------
@@ -619,6 +674,10 @@ async fn dispatch_event(
         "chat.create" => handle_chat_create(&ctx.args, &ctx.chats, &ctx.out_tx, body).await,
         "chat.append" => handle_chat_append(&ctx.args, &ctx.chats, &ctx.out_tx, body).await,
         "chat.complete" => handle_chat_complete(ctx, body).await,
+        "chat.compact" => handle_chat_compact(ctx, body).await,
+        "chat.compaction.restore" => {
+            handle_chat_compaction_restore(&ctx.args, &ctx.chats, &ctx.out_tx, body).await
+        }
         "chat.delete" => handle_chat_delete(&ctx.args, &ctx.chats, &ctx.out_tx, body).await,
         "interrupt" => {
             match read_chat_id(body) {
@@ -1044,6 +1103,49 @@ async fn handle_chat_append(
     }
 }
 
+async fn handle_chat_compaction_restore(
+    args: &ServeArgs,
+    chats: &Arc<Chats>,
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    body: &Map<String, Value>,
+) -> Result<(), ChatgptError> {
+    let chat_id = match read_chat_id(body) {
+        Some(id) => id,
+        None => {
+            send_event(
+                out_tx,
+                turn_error_body(args, None, "chat.compaction.restore missing `chat_id`"),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let items_value = body
+        .get("items")
+        .cloned()
+        .or_else(|| {
+            body.get("model_context_artifact")
+                .and_then(|v| v.get("items"))
+                .cloned()
+        })
+        .unwrap_or(Value::Array(Vec::new()));
+    let items: Vec<ResponseItem> = match serde_json::from_value(items_value) {
+        Ok(v) => v,
+        Err(e) => {
+            send_event(
+                out_tx,
+                chat_error_body(args, &chat_id, format!("invalid compaction items: {e}")),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    match chats.replace_with_native_history(&chat_id, items).await {
+        Ok(()) => send_event(out_tx, chat_appended_body(args, &chat_id)).await,
+        Err(e) => send_event(out_tx, chat_error_body(args, &chat_id, e.to_string())).await,
+    }
+}
+
 async fn handle_chat_complete(
     ctx: &DispatcherContext,
     body: &Map<String, Value>,
@@ -1080,6 +1182,220 @@ async fn handle_chat_complete(
     };
     spawn_turn(ctx.clone(), chat_id, cancel);
     Ok(())
+}
+
+async fn handle_chat_compact(
+    ctx: &DispatcherContext,
+    body: &Map<String, Value>,
+) -> Result<(), ChatgptError> {
+    let chat_id = match read_chat_id(body) {
+        Some(id) => id,
+        None => {
+            send_event(
+                &ctx.out_tx,
+                turn_error_body(&ctx.args, None, "chat.compact missing `chat_id`"),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let trigger = body
+        .get("trigger")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("manual")
+        .to_owned();
+
+    let cancel = match ctx.chats.begin_turn(&chat_id).await {
+        Ok(t) => t,
+        Err(ChatsError::Busy(_)) => {
+            send_event(
+                &ctx.out_tx,
+                turn_error_body(&ctx.args, Some(&chat_id), "busy"),
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(e) => {
+            send_event(
+                &ctx.out_tx,
+                chat_error_body(&ctx.args, &chat_id, e.to_string()),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let result = compact_chat(ctx, &chat_id, &trigger, &cancel).await;
+    ctx.chats.end_turn(&chat_id).await;
+    result
+}
+
+async fn compact_chat(
+    ctx: &DispatcherContext,
+    chat_id: &ChatId,
+    trigger: &str,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<(), ChatgptError> {
+    let snapshot = match ctx.chats.snapshot(chat_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            send_event(
+                &ctx.out_tx,
+                chat_error_body(&ctx.args, chat_id, e.to_string()),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let before_items = snapshot.history.len();
+    if before_items == 0 {
+        send_event(
+            &ctx.out_tx,
+            turn_error_body(&ctx.args, Some(chat_id), "nothing to compact"),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let tools_specs = match snapshot.tool_overrides.clone() {
+        Some(t) => t,
+        None => ctx.catalog.all().await,
+    };
+    let filtered_specs: Vec<_> = match &snapshot.tool_allowlist {
+        Some(allowed) => tools_specs
+            .into_iter()
+            .filter(|t| allowed.iter().any(|a| a == &t.name))
+            .collect(),
+        None => tools_specs,
+    };
+    let tools_json = translator::tools_to_responses_format(&filtered_specs);
+    let translated = translator::history_to_input(&snapshot.history, snapshot.system.as_deref());
+    let supports_reasoning = if ctx.chats.model_reasoning_unsupported(&snapshot.model).await {
+        false
+    } else if let Some(api) = ctx.chats.model_capability_reasoning(&snapshot.model).await {
+        api
+    } else {
+        translator::model_supports_reasoning(&snapshot.model)
+    };
+    let reasoning = supports_reasoning.then_some(Reasoning {
+        effort: snapshot.reasoning_effort,
+        summary: Some(ReasoningSummary::Concise),
+    });
+
+    let auth_snap = ctx.auth.snapshot().await;
+    if !matches!(auth_snap.state, AuthState::Connected) {
+        send_event(&ctx.out_tx, auth_status_body(&ctx.args, &auth_snap)).await?;
+        send_event(
+            &ctx.out_tx,
+            turn_error_body(
+                &ctx.args,
+                Some(chat_id),
+                "auth not connected; cannot compact chat",
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+    if let Err(e) = ctx.auth.current_access_token().await {
+        let snap = ctx.auth.apply_error(format!("refresh: {e}")).await;
+        send_event(&ctx.out_tx, auth_status_body(&ctx.args, &snap)).await?;
+        send_event(
+            &ctx.out_tx,
+            turn_error_body(
+                &ctx.args,
+                Some(chat_id),
+                &format!("token refresh failed: {e}"),
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+    let auth_snap = ctx.auth.snapshot().await;
+
+    let req = CompactRequest {
+        model: snapshot.model.clone(),
+        instructions: translated.instructions,
+        input: translated.input,
+        tools: tools_json,
+        parallel_tool_calls: false,
+        reasoning,
+        service_tier: None,
+        prompt_cache_key: None,
+        text: None,
+    };
+
+    let compacted = tokio::select! {
+        _ = cancel.cancelled() => {
+            send_event(
+                &ctx.out_tx,
+                turn_error_body(&ctx.args, Some(chat_id), "interrupted"),
+            )
+            .await?;
+            return Ok(());
+        }
+        result = ctx.responses_client.compact(&req, &auth_snap) => result,
+    };
+
+    let compacted = match compacted {
+        Ok(items) if !items.is_empty() => items,
+        Ok(_) => {
+            send_event(
+                &ctx.out_tx,
+                turn_error_body(&ctx.args, Some(chat_id), "compact returned no items"),
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(ChatgptError::ResponsesEndpoint { status, body }) => {
+            send_event(
+                &ctx.out_tx,
+                turn_error_body(
+                    &ctx.args,
+                    Some(chat_id),
+                    &format!("compact HTTP {status}: {}", snippet(&body)),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(e) => {
+            send_event(
+                &ctx.out_tx,
+                turn_error_body(&ctx.args, Some(chat_id), &format!("compact failed: {e}")),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let after_items = compacted.len();
+    if let Err(e) = ctx
+        .chats
+        .replace_with_native_history(chat_id, compacted.clone())
+        .await
+    {
+        send_event(
+            &ctx.out_tx,
+            chat_error_body(&ctx.args, chat_id, e.to_string()),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    send_event(
+        &ctx.out_tx,
+        chat_compaction_commit_body(
+            &ctx.args,
+            chat_id,
+            &snapshot.model,
+            trigger,
+            before_items,
+            after_items,
+            &compacted,
+        ),
+    )
+    .await
 }
 
 fn tool_output_for_text_model(value: &Value) -> String {

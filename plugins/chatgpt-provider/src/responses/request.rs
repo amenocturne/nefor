@@ -96,6 +96,8 @@ pub enum Verbosity {
 ///   - `function_call_output` — result fed back to the model
 ///   - `reasoning` — chain-of-thought (passed through verbatim across
 ///     turns to preserve state on the subscription path)
+///   - `compaction` — native opaque compaction state returned by the
+///     Responses compaction endpoint
 ///
 /// `Other` is a catch-all so unknown items round-trip without losing
 /// data; serde's `tag = "type"` with an inner `serde_json::Value`
@@ -135,6 +137,9 @@ pub enum ResponseItem {
         encrypted_content: Option<String>,
         #[serde(default)]
         summary: Vec<ReasoningSummaryPart>,
+    },
+    Compaction {
+        encrypted_content: String,
     },
 }
 

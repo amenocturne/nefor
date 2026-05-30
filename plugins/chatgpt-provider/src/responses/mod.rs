@@ -76,6 +76,24 @@ struct ModelsResponse {
     models: Vec<ModelEntry>,
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct CompactRequest {
+    pub model: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub instructions: String,
+    pub input: Vec<ResponseItem>,
+    pub tools: Vec<serde_json::Value>,
+    pub parallel_tool_calls: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Reasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<TextControls>,
+}
+
 /// Default base URL for the ChatGPT-subscription Responses endpoint.
 /// The full URL is `{base}/responses`. Pulled into a constant so tests
 /// can override.
@@ -403,6 +421,46 @@ impl ResponsesClient {
         })?;
         Ok(parsed.models)
     }
+
+    /// POST `{base_url}/responses/compact` and return the native
+    /// compacted Responses items. ChatGPT's Codex backend historically
+    /// returned the compacted item list directly; the public API wraps
+    /// it in an object with `output`, so we accept both shapes.
+    pub async fn compact(
+        &self,
+        request: &CompactRequest,
+        auth: &AuthSnapshot,
+    ) -> Result<Vec<ResponseItem>, ChatgptError> {
+        let url = format!("{}/responses/compact", self.base_url.trim_end_matches('/'));
+        let response = self
+            .post_with_retry(
+                &url,
+                |builder| builder.json(request),
+                auth,
+                "responses.compact",
+            )
+            .await?;
+        let value: serde_json::Value = response.json().await.map_err(|e| {
+            ChatgptError::ResponsesStreamParse(format!("decode /responses/compact response: {e}"))
+        })?;
+        compact_items_from_value(value)
+    }
+}
+
+fn compact_items_from_value(value: serde_json::Value) -> Result<Vec<ResponseItem>, ChatgptError> {
+    if value.is_array() {
+        return serde_json::from_value(value).map_err(|e| {
+            ChatgptError::ResponsesStreamParse(format!("decode compacted item list: {e}"))
+        });
+    }
+    let Some(output) = value.get("output").cloned() else {
+        return Err(ChatgptError::ResponsesStreamParse(
+            "compact response missing `output`".into(),
+        ));
+    };
+    serde_json::from_value(output).map_err(|e| {
+        ChatgptError::ResponsesStreamParse(format!("decode compact response output: {e}"))
+    })
 }
 
 /// 5xx range that's worth retrying. 500 is excluded because it usually
