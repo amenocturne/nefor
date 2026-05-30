@@ -169,6 +169,8 @@ pub struct ChatRequest<'a> {
     pub model: &'a str,
     pub messages: &'a [Message],
     pub stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<&'a str>,
     /// `{"include_usage": true}` so the final frame carries `usage`. Ollama
     /// includes it unconditionally; OpenAI honours this opt-in.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -250,6 +252,8 @@ pub struct ModelInfo {
     pub id: String,
     /// Context window size if the backend reports it (vLLM, LiteLLM, etc.).
     pub context_window: Option<u64>,
+    pub reasoning_efforts: Vec<String>,
+    pub default_reasoning_effort: Option<String>,
 }
 
 /// Parse the `data` array from a `GET /v1/models` response into a sorted
@@ -274,11 +278,38 @@ pub fn parse_models_response(payload: &str) -> Vec<ModelInfo> {
                 .or_else(|| m.get("context_length"))
                 .or_else(|| m.get("context_window"))
                 .and_then(|v| v.as_u64());
-            Some(ModelInfo { id, context_window })
+            let reasoning_efforts = parse_string_array(
+                m.get("reasoning_efforts")
+                    .or_else(|| m.get("supported_reasoning_efforts"))
+                    .or_else(|| m.get("reasoning_effort_levels"))
+                    .or_else(|| m.get("thinking_levels")),
+            );
+            let default_reasoning_effort = m
+                .get("default_reasoning_effort")
+                .or_else(|| m.get("default_thinking_level"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            Some(ModelInfo {
+                id,
+                context_window,
+                reasoning_efforts,
+                default_reasoning_effort,
+            })
         })
         .collect();
     models.sort_by(|a, b| a.id.cmp(&b.id));
     models
+}
+
+fn parse_string_array(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Parse a single SSE `data:` payload (the JSON between `data: ` and the

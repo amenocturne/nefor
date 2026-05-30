@@ -17,6 +17,7 @@
 --   <prefix>.auth.status           → chat.auth.status (+ provider)
 --   <prefix>.models.listed         → chat.models.listed (+ provider)
 --   <prefix>.model.set_ack         → chat.model.set_ack (+ provider)
+--   <prefix>.reasoning.set_ack     → chat.reasoning.set_ack (+ provider)
 --   <prefix>.turn.error            → chat.message.append (system)
 --   <prefix>.hello                 → chat.model.set_ack (model fanout)
 --   <prefix>.ready                 → drop (after auth.set injection)
@@ -32,6 +33,8 @@
 --   chat.model.list_requested      → <prefix>.models.list_requested
 --   chat.model.set                 → <prefix>.model.set (this file adds chat_id
 --                                                       from agentic-loop state)
+--   chat.reasoning.set             → <prefix>.reasoning.set (this file adds chat_id
+--                                                           from agentic-loop state)
 --
 -- ## Orchestrator coupling (lives in this file)
 --
@@ -280,10 +283,18 @@ function M.spawn_spec(name, command, opts)
             goto continue
           end
         end
+        if type(env.body) == "table"
+            and env.body.kind == "chat.reasoning.set"
+            and env.body.provider == nil then
+          local cfg = al.config and al.config() or nil
+          if type(cfg) == "table" and cfg.provider == name then
+            env.body.provider = name
+          end
+        end
 
         local body = translator.inbound(env)
         if body ~= nil then
-          if body.kind == kinds.model_set then
+          if body.kind == kinds.model_set or body.kind == kinds.reasoning_set then
             local active_chat_id
             local current_state = al.current_state()
             if type(current_state) == "table"

@@ -72,6 +72,7 @@ async fn streaming_emits_deltas_then_end() {
         "test-model",
         &messages,
         None,
+        None,
         CancellationToken::new(),
         |d| deltas.push(d.to_owned()),
         |_| {},
@@ -118,6 +119,7 @@ async fn request_failure_emits_turn_error() {
         "Authorization",
         "nonexistent",
         &messages,
+        None,
         None,
         CancellationToken::new(),
         |_| {},
@@ -199,6 +201,7 @@ async fn chat_completion_uses_passed_in_model_not_a_default() {
         "Authorization",
         "the-active-model",
         &messages,
+        None,
         None,
         CancellationToken::new(),
         |_| {},
@@ -302,6 +305,7 @@ async fn unauthorized_response_yields_unauthorized_variant() {
         "any-model",
         &messages,
         None,
+        None,
         CancellationToken::new(),
         |_| {},
         |_| {},
@@ -355,6 +359,7 @@ async fn streaming_assembles_tool_call_from_fragmented_deltas() {
         "Authorization",
         "test-model",
         &messages,
+        None,
         None,
         CancellationToken::new(),
         |_| {},
@@ -449,6 +454,7 @@ async fn request_body_carries_tools_array_when_present() {
         "any-model",
         &messages,
         Some(&tools_array),
+        None,
         CancellationToken::new(),
         |_| {},
         |_| {},
@@ -538,6 +544,7 @@ async fn request_body_omits_tools_when_none_attached() {
         "any-model",
         &messages,
         None,
+        None,
         CancellationToken::new(),
         |_| {},
         |_| {},
@@ -596,6 +603,7 @@ async fn http_400_with_tools_unsupported_signature_yields_dedicated_variant() {
         "translategemma",
         &messages,
         Some(&tools_array),
+        None,
         CancellationToken::new(),
         |_| {},
         |_| {},
@@ -649,6 +657,7 @@ async fn http_400_without_tools_in_request_falls_through_to_http_error() {
         "some-model",
         &messages,
         None, // <-- the discriminator
+        None,
         CancellationToken::new(),
         |_| {},
         |_| {},
@@ -768,7 +777,13 @@ async fn reactive_fallback_retries_without_tools_after_signature_400() {
     let chats = Chats::with_default_model(Some("translategemma".into()));
     let chat_id = ChatId::new("c1");
     chats
-        .create(chat_id.clone(), Some("translategemma".into()), None, None)
+        .create(
+            chat_id.clone(),
+            Some("translategemma".into()),
+            None,
+            None,
+            None,
+        )
         .await
         .expect("create");
 
@@ -804,6 +819,7 @@ async fn reactive_fallback_retries_without_tools_after_signature_400() {
         "translategemma",
         &messages,
         tools_for_first,
+        None,
         CancellationToken::new(),
         |_| {},
         |_| {},
@@ -849,6 +865,7 @@ async fn reactive_fallback_retries_without_tools_after_signature_400() {
         "translategemma",
         &messages,
         tools_for_retry,
+        None,
         CancellationToken::new(),
         |_| {},
         |_| {},
@@ -888,7 +905,13 @@ async fn marked_model_skips_tools_on_first_turn_of_a_brand_new_chat() {
 
     let chat_id = ChatId::new("fresh-chat");
     chats
-        .create(chat_id.clone(), Some("translategemma".into()), None, None)
+        .create(
+            chat_id.clone(),
+            Some("translategemma".into()),
+            None,
+            None,
+            None,
+        )
         .await
         .expect("create");
 
@@ -957,6 +980,7 @@ async fn http_400_with_unrelated_message_falls_through_to_http_error() {
         "any-model",
         &messages,
         Some(&tools_array),
+        None,
         CancellationToken::new(),
         |_| {},
         |_| {},

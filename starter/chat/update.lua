@@ -39,6 +39,15 @@ end
 -- Per-model context window sizes reported by the provider's model list.
 -- Populated by chat.models.listed events; keyed by model id.
 local model_context_windows = {}
+local model_reasoning_defaults = {}
+
+local function model_key(provider, model)
+  if type(provider) ~= "string" or provider == ""
+      or type(model) ~= "string" or model == "" then
+    return nil
+  end
+  return provider .. "\0" .. model
+end
 
 -- The prompt widget's `handle()` consumes a fixed set of kinds when a
 -- completion is active (key.up/down/tab/escape) and on every value
@@ -251,6 +260,25 @@ local function handle_input_submit(msg, state)
         awaiting  = awaiting,
       },
     }), effects
+  end
+  if cmd == "think" or cmd == "effort" then
+    if args == nil or #args == 0 then
+      return shallow_merge(state, {
+        input_value = "", completion = NIL_SENTINEL,
+        popup = {
+          variant = "warning",
+          title   = "/think",
+          body    = "Usage: /think low|medium|high|xhigh",
+        },
+      }), {}
+    end
+    local body = { kind = "chat.reasoning.set", effort = args }
+    if type(state.provider) == "string" and #state.provider > 0 then
+      body.provider = state.provider
+    end
+    return shallow_merge(state, { input_value = "", completion = NIL_SENTINEL }), {
+      { kind = "send_to", target = "engine", body = body },
+    }
   end
   if cmd == "resume" then
     if args and #args > 0 then
@@ -649,9 +677,25 @@ end
 
 local function handle_model_set_ack(msg, state)
   if state.replay_mode then return state, {} end
+  local provider = msg.provider or state.provider
+  local effort = msg.reasoning_effort or state.reasoning_effort
+  local k = model_key(provider, msg.model)
+  if effort == nil and k ~= nil then
+    effort = model_reasoning_defaults[k]
+  end
   return shallow_merge(state, {
     model = msg.model or state.model,
+    provider = provider,
+    reasoning_effort = effort,
     max_tokens = model_context_windows[msg.model] or state.max_tokens,
+  }), {}
+end
+
+local function handle_reasoning_set_ack(msg, state)
+  if state.replay_mode then return state, {} end
+  return shallow_merge(state, {
+    provider = msg.provider or state.provider,
+    reasoning_effort = msg.effort or msg.reasoning_effort or state.reasoning_effort,
   }), {}
 end
 
@@ -661,6 +705,17 @@ local function handle_models_listed(msg, state)
     for model_id, ctx_size in pairs(msg.context_windows) do
       if type(ctx_size) == "number" and ctx_size > 0 then
         model_context_windows[model_id] = ctx_size
+      end
+    end
+  end
+  if type(msg.model_capabilities) == "table" then
+    local provider = msg.provider or ""
+    for model_id, caps in pairs(msg.model_capabilities) do
+      local reasoning = type(caps) == "table" and caps.reasoning or nil
+      local default = type(reasoning) == "table" and reasoning.default or nil
+      local k = model_key(provider, model_id)
+      if k ~= nil and type(default) == "string" and #default > 0 then
+        model_reasoning_defaults[k] = default
       end
     end
   end
@@ -895,6 +950,7 @@ local handlers = {
   ["chat.popup"]                  = handle_popup,
   ["chat.toast"]                  = handle_toast,
   ["chat.model.set_ack"]          = handle_model_set_ack,
+  ["chat.reasoning.set_ack"]      = handle_reasoning_set_ack,
   ["chat.models.listed"]          = handle_models_listed,
   ["chat.auth.status"]            = handle_auth_status,
   ["chat.tool.popup_request"]     = handle_tool_popup_request,

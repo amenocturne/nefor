@@ -27,7 +27,9 @@ use crate::broker::{ToolBroker, ToolResult};
 use crate::catalog::ToolCatalog;
 use crate::config::ServeArgs;
 use crate::error::ChatgptError;
-use crate::responses::request::{Reasoning, ReasoningSummary, ResponseItem, ResponsesApiRequest};
+use crate::responses::request::{
+    Reasoning, ReasoningEffort, ReasoningSummary, ResponseItem, ResponsesApiRequest,
+};
 use crate::responses::stream::ResponseEvent;
 use crate::responses::{ModelEntry, ResponsesClient};
 use crate::state::{ChatId, ChatStats, Chats, ChatsError, Message, ToolCall, ToolCallFunction};
@@ -259,6 +261,25 @@ fn models_listed_body(args: &ServeArgs, models: &[ModelEntry]) -> Map<String, Va
     if !ctx_map.is_empty() {
         m.insert("context_windows".into(), Value::Object(ctx_map));
     }
+    let caps: Map<String, Value> = models
+        .iter()
+        .filter(|me| me.supports_reasoning_summaries)
+        .map(|me| {
+            let levels = ["none", "minimal", "low", "medium", "high", "xhigh"]
+                .iter()
+                .map(|s| Value::String((*s).to_owned()))
+                .collect::<Vec<_>>();
+            let mut reasoning = Map::new();
+            reasoning.insert("levels".into(), Value::Array(levels));
+            reasoning.insert("default".into(), Value::String("medium".into()));
+            let mut entry = Map::new();
+            entry.insert("reasoning".into(), Value::Object(reasoning));
+            (me.slug.clone(), Value::Object(entry))
+        })
+        .collect();
+    if !caps.is_empty() {
+        m.insert("model_capabilities".into(), Value::Object(caps));
+    }
     make_event(format!("{}models.listed", args.event_prefix()), m)
 }
 
@@ -273,6 +294,22 @@ fn model_set_ack_body(
         m.insert("chat_id".into(), Value::String(cid.to_string()));
     }
     make_event(format!("{}model.set_ack", args.event_prefix()), m)
+}
+
+fn reasoning_set_ack_body(
+    args: &ServeArgs,
+    effort: ReasoningEffort,
+    chat_id: Option<&ChatId>,
+) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert(
+        "effort".into(),
+        Value::String(reasoning_effort_wire(effort).to_owned()),
+    );
+    if let Some(cid) = chat_id {
+        m.insert("chat_id".into(), Value::String(cid.to_string()));
+    }
+    make_event(format!("{}reasoning.set_ack", args.event_prefix()), m)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -724,6 +761,36 @@ async fn dispatch_event(
             }
             Ok(())
         }
+        "reasoning.set" => {
+            let effort = match parse_reasoning_effort(
+                body.get("effort").or_else(|| body.get("reasoning_effort")),
+            ) {
+                Ok(Some(v)) => v,
+                Ok(None) => {
+                    tracing::warn!("reasoning.set without non-empty effort; ignoring");
+                    return Ok(());
+                }
+                Err(e) => {
+                    send_event(
+                        &ctx.out_tx,
+                        turn_error_body(&ctx.args, read_chat_id(body).as_ref(), &e),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            let chat_id = read_chat_id(body);
+            if let Some(cid) = &chat_id {
+                if ctx.chats.exists(cid).await {
+                    let _ = ctx.chats.set_chat_reasoning_effort(cid, effort).await;
+                }
+            }
+            send_event(
+                &ctx.out_tx,
+                reasoning_set_ack_body(&ctx.args, effort, chat_id.as_ref()),
+            )
+            .await
+        }
         _ => Ok(()),
     }
 }
@@ -737,6 +804,32 @@ fn read_chat_id(body: &Map<String, Value>) -> Option<ChatId> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(ChatId::new)
+}
+
+fn reasoning_effort_wire(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::None => "none",
+        ReasoningEffort::Minimal => "minimal",
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::XHigh => "xhigh",
+    }
+}
+
+fn parse_reasoning_effort(value: Option<&Value>) -> Result<Option<ReasoningEffort>, String> {
+    let Some(raw) = value.and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "none" | "off" => Ok(Some(ReasoningEffort::None)),
+        "minimal" => Ok(Some(ReasoningEffort::Minimal)),
+        "low" => Ok(Some(ReasoningEffort::Low)),
+        "medium" => Ok(Some(ReasoningEffort::Medium)),
+        "high" => Ok(Some(ReasoningEffort::High)),
+        "xhigh" | "x-high" => Ok(Some(ReasoningEffort::XHigh)),
+        _ => Err(format!("unsupported reasoning effort `{raw}`")),
+    }
 }
 
 /// A tool call from the model that failed to parse into a [`ToolCall`].
@@ -876,6 +969,13 @@ async fn handle_chat_create(
             })
         };
     let tool_overrides: Option<Vec<crate::catalog::ToolSpec>> = None;
+    let reasoning_effort = match parse_reasoning_effort(body.get("reasoning_effort")) {
+        Ok(v) => v,
+        Err(e) => {
+            send_event(out_tx, chat_error_body(args, &chat_id, e)).await?;
+            return Ok(());
+        }
+    };
 
     match chats
         .recreate(
@@ -884,6 +984,7 @@ async fn handle_chat_create(
             system,
             tool_overrides,
             tool_allowlist,
+            reasoning_effort,
         )
         .await
     {
@@ -1236,7 +1337,7 @@ fn spawn_turn(
                 Vec::new()
             };
             let reasoning = supports_reasoning.then_some(Reasoning {
-                effort: None,
+                effort: snapshot.reasoning_effort,
                 summary: Some(ReasoningSummary::Concise),
             });
 

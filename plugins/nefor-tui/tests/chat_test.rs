@@ -827,6 +827,36 @@ fn replayed_chat_model_set_ack_does_not_clobber_live_model() {
 }
 
 #[test]
+fn statusline_shows_model_with_reasoning_effort() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.model.set_ack",
+            "provider": "ollama",
+            "model": "qwen3:32b",
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.reasoning.set_ack",
+            "provider": "ollama",
+            "effort": "high",
+        }),
+    );
+
+    let out = render_snapshot(&mut engine);
+    assert!(
+        out.contains("qwen3:32b · high"),
+        "statusline should render model and effort compactly: {out:?}"
+    );
+}
+
+#[test]
 fn ctrl_o_toggles_expanded_details() {
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
@@ -1798,6 +1828,27 @@ fn slash_quit_emits_exit_side_effect() {
     assert!(
         engine.exit_requested(),
         "/quit must emit `{{ kind = \"exit\" }}` side effect that the engine acts on"
+    );
+}
+
+#[test]
+fn slash_think_emits_reasoning_effort_set() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    type_text(&mut engine, "/think high");
+    engine.handle_key(key("enter")).expect("enter");
+
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "expected one egress");
+    assert_eq!(
+        emits[0].1.get("kind").and_then(|v| v.as_str()),
+        Some("chat.reasoning.set")
+    );
+    assert_eq!(
+        emits[0].1.get("effort").and_then(|v| v.as_str()),
+        Some("high")
     );
 }
 

@@ -56,7 +56,11 @@ local function build_segments(state)
   end
   local model = state.model or (state.stats and state.stats.model)
   if model then
-    segs[#segs + 1] = { spans = { { text = model, fg = C.system } } }
+    local label = model
+    if type(state.reasoning_effort) == "string" and #state.reasoning_effort > 0 then
+      label = label .. " · " .. state.reasoning_effort
+    end
+    segs[#segs + 1] = { spans = { { text = label, fg = C.system } } }
   else
     segs[#segs + 1] = { spans = { { text = "Start chatting to see stats", fg = C.status_dim } } }
   end

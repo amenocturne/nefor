@@ -61,6 +61,18 @@ do
   assert_eq(opts.model, "claude", "long model flag")
 end
 
+-- --think / --reasoning-effort.
+do
+  local opts, err = parse("--think", "high", "test prompt")
+  assert_eq(err, nil, "no error")
+  assert_eq(opts.reasoning_effort, "high", "think flag")
+  assert_eq(opts.prompt, "test prompt", "prompt parsed after --think")
+
+  opts, err = parse("--reasoning-effort", "medium", "x")
+  assert_eq(err, nil, "no error")
+  assert_eq(opts.reasoning_effort, "medium", "reasoning-effort alias")
+end
+
 -- --yolo.
 do
   local opts, err = parse("--yolo", "do dangerous things")
@@ -88,6 +100,11 @@ end
 do
   local opts, err = parse("--model")
   assert_eq(opts, nil, "nil opts on missing value")
+  assert(err ~= nil and string.find(err, "missing value"),
+    "error mentions missing value; got: " .. tostring(err))
+
+  opts, err = parse("--think")
+  assert_eq(opts, nil, "nil opts on missing --think value")
   assert(err ~= nil and string.find(err, "missing value"),
     "error mentions missing value; got: " .. tostring(err))
 
@@ -140,13 +157,15 @@ do
   assert_eq(opts.prompt, "prompt", "prompt also parsed")
 end
 
--- Combined: --yolo --format json -m gpt -f path "the prompt"
+-- Combined: --yolo --format json -m gpt --think high -f path "the prompt"
 do
-  local opts, err = parse("--yolo", "--format", "json", "-m", "gpt", "-f", "/p", "the prompt")
+  local opts, err = parse(
+    "--yolo", "--format", "json", "-m", "gpt", "--think", "high", "-f", "/p", "the prompt")
   assert_eq(err, nil, "no error on combined")
   assert_eq(opts.yolo, true, "yolo")
   assert_eq(opts.format, "json", "format")
   assert_eq(opts.model, "gpt", "model")
+  assert_eq(opts.reasoning_effort, "high", "reasoning effort")
   assert_eq(opts.file, "/p", "file")
   assert_eq(opts.prompt, "the prompt", "prompt")
 end
@@ -158,6 +177,7 @@ do
   assert(string.find(usage, "%-%-format"), "usage mentions --format")
   assert(string.find(usage, "%-%-yolo"), "usage mentions --yolo")
   assert(string.find(usage, "%-%-model"), "usage mentions --model")
+  assert(string.find(usage, "%-%-think"), "usage mentions --think")
 end
 
 print("agentic_cli_test: all assertions passed")

@@ -40,6 +40,7 @@ local state = {
   config = {
     provider       = "ollama",
     model          = nil,
+    reasoning_effort = nil,
     system         = nil,
     -- Optional list of tool names the lead's chat is allowed to see in
     -- its catalog. nil = no filter (advertise the full catalog). Set in
@@ -127,6 +128,7 @@ local function submit_orchestrator_run(user_text)
   local g = topology.build_orchestrator_graph({
     provider       = state.config.provider,
     model          = state.config.model,
+    reasoning_effort = state.config.reasoning_effort,
     system         = state.config.system,
     user_text      = user_text or "",
     tool_allowlist = state.config.tool_allowlist,
@@ -402,6 +404,19 @@ local function set_model(provider, model)
   })
 end
 
+local function set_reasoning_effort(provider, effort)
+  if type(provider) == "string" and #provider > 0 then
+    state.config.provider = provider
+  end
+  if type(effort) ~= "string" or #effort == 0 then return end
+  state.config.reasoning_effort = effort
+  emit(nil, {
+    kind     = "chat.reasoning.set_ack",
+    provider = state.config.provider,
+    effort   = effort,
+  })
+end
+
 local function set_yolo(enabled)
   local default = enabled and "auto" or "prompt"
   emit("tool-gate", {
@@ -491,6 +506,17 @@ local function handle_chat_model_set(body)
       provider = provider, model = model, previous = state.config.model,
     })
     set_model(provider, model)
+  end
+end
+
+local function handle_chat_reasoning_set(body)
+  local effort = body.effort or body.reasoning_effort
+  local provider = body.provider
+  if type(effort) == "string" and #effort > 0 then
+    nefor.log.info("agentic-loop: chat.reasoning.set received", {
+      provider = provider, effort = effort, previous = state.config.reasoning_effort,
+    })
+    set_reasoning_effort(provider, effort)
   end
 end
 
@@ -982,6 +1008,9 @@ function M.configure(opts)
   if type(opts.model) == "string" and #opts.model > 0 then
     state.config.model = opts.model
   end
+  if type(opts.reasoning_effort) == "string" and #opts.reasoning_effort > 0 then
+    state.config.reasoning_effort = opts.reasoning_effort
+  end
   if type(opts.system) == "string" and #opts.system > 0 then
     state.config.system = opts.system
   end
@@ -1019,6 +1048,7 @@ function M.fire_stream_observers(text) fire_stream_observers(text) end
 function M.fire_reasoning_observers(text) fire_reasoning_observers(text) end
 function M.fire_tool_start_observers(id, name, input) fire_tool_start_observers(id, name, input) end
 function M.fire_tool_end_observers(id, output, err) fire_tool_end_observers(id, output, err) end
+function M.set_reasoning_effort(provider, effort) set_reasoning_effort(provider, effort) end
 
 function M.config() return state.config end
 
@@ -1036,6 +1066,7 @@ function M.build_template(user_text, opts)
   return topology.build_orchestrator_graph({
     provider       = opts.provider       or state.config.provider,
     model          = opts.model          or state.config.model,
+    reasoning_effort = opts.reasoning_effort or state.config.reasoning_effort,
     system         = opts.system         or state.config.system,
     user_text      = user_text or "",
     tool_allowlist = opts.tool_allowlist or state.config.tool_allowlist,
@@ -1077,7 +1108,8 @@ local function receive_msg(entry)
     if kind == "chat.input.submit"
         or kind == "chat.reset"
         or kind == "chat.interrupt_all"
-        or kind == "chat.model.set" then
+        or kind == "chat.model.set"
+        or kind == "chat.reasoning.set" then
       return
     end
   end
@@ -1086,6 +1118,7 @@ local function receive_msg(entry)
   if kind == "chat.reset"        then handle_chat_reset(); return end
   if kind == "chat.interrupt_all" then cancel_all(); return end
   if kind == "chat.model.set" then handle_chat_model_set(body); return end
+  if kind == "chat.reasoning.set" then handle_chat_reasoning_set(body); return end
 
   -- Reasoner-graph emissions on the canonical contract:
   --   * graph.node.fired { run_id, node_id, firing_id, reasoner } —
@@ -1183,6 +1216,7 @@ local function restore_active_model_from_session_log()
   local active = session_config.read_active_model(path)
   local provider = active.provider
   local model    = active.model
+  local reasoning_effort = active.reasoning_effort
 
   local changed = false
   if type(provider) == "string" and #provider > 0
@@ -1195,10 +1229,17 @@ local function restore_active_model_from_session_log()
     state.config.model = model
     changed = true
   end
+  if type(reasoning_effort) == "string" and #reasoning_effort > 0
+      and state.config.reasoning_effort ~= reasoning_effort then
+    state.config.reasoning_effort = reasoning_effort
+    changed = true
+  end
 
   if changed then
     nefor.log.info("agentic-loop: /resume restored active provider/model from session log", {
-      provider = state.config.provider, model = state.config.model,
+      provider = state.config.provider,
+      model = state.config.model,
+      reasoning_effort = state.config.reasoning_effort,
     })
     -- Surface the restored selection to chat.lua's status bar / model
     -- picker. Live ack (not a replayed envelope) so chat.lua's
@@ -1210,6 +1251,14 @@ local function restore_active_model_from_session_log()
         kind     = "chat.model.set_ack",
         provider = state.config.provider,
         model    = state.config.model,
+      })
+    end
+    if type(state.config.reasoning_effort) == "string"
+        and #state.config.reasoning_effort > 0 then
+      emit(nil, {
+        kind     = "chat.reasoning.set_ack",
+        provider = state.config.provider,
+        effort   = state.config.reasoning_effort,
       })
     end
   end
@@ -1238,7 +1287,13 @@ M.send_msg    = function(_) end  -- no internal-output translation
 M._internals  = {
   state = state,
   reset = function()
-    state.config = { provider = "ollama", model = nil, system = nil, tool_allowlist = nil }
+    state.config = {
+      provider = "ollama",
+      model = nil,
+      reasoning_effort = nil,
+      system = nil,
+      tool_allowlist = nil,
+    }
     state.current_run_id = nil
     state.current_state = nil
     state.deferred_queue = {}

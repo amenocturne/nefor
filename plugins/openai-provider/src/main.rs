@@ -306,16 +306,28 @@ async fn dispatch_event(
                         .filter_map(|v| v.as_str().map(str::to_owned))
                         .collect()
                 });
+            let reasoning_effort = body
+                .get("reasoning_effort")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
             tracing::info!(
                 target: "openai_provider::chat",
                 chat_id = %chat_id,
                 model = ?model,
                 tools_enabled = ?tools_enabled,
                 tool_allowlist_len = tool_allowlist.as_ref().map(Vec::len),
+                reasoning_effort = ?reasoning_effort,
                 "chat.create",
             );
             match chats
-                .create(chat_id.clone(), model, tools_enabled, tool_allowlist)
+                .create(
+                    chat_id.clone(),
+                    model,
+                    tools_enabled,
+                    tool_allowlist,
+                    reasoning_effort,
+                )
                 .await
             {
                 Ok(()) => {
@@ -610,6 +622,36 @@ async fn dispatch_event(
             }
             send_event(out_tx, model_set_ack_body(config, &model)).await?;
         }
+        "reasoning.set" => {
+            let effort = match body
+                .get("effort")
+                .or_else(|| body.get("reasoning_effort"))
+                .and_then(Value::as_str)
+            {
+                Some(e) if !e.is_empty() => e.to_owned(),
+                _ => {
+                    tracing::warn!("reasoning.set without non-empty effort; ignoring");
+                    return Ok(());
+                }
+            };
+            let active_id = body
+                .get("chat_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(ChatId::new);
+            if let Some(chat_id) = &active_id {
+                if chats.exists(chat_id).await {
+                    let _ = chats
+                        .set_chat_reasoning_effort(chat_id, effort.clone())
+                        .await;
+                }
+            }
+            send_event(
+                out_tx,
+                reasoning_set_ack_body(config, &effort, active_id.as_ref()),
+            )
+            .await?;
+        }
         "logout_requested" => match auth.apply_logout().await {
             LogoutOutcome::Cleared => {
                 let snap = auth.snapshot().await;
@@ -793,6 +835,7 @@ fn spawn_turn(
             } else {
                 Some(tools_array.as_slice())
             };
+            let reasoning_effort = chats.reasoning_effort(&chat_id).await.unwrap_or(None);
 
             let endpoint = config.chat_endpoint();
             let id_for_delta = turn_id.clone();
@@ -817,6 +860,7 @@ fn spawn_turn(
                 &active_model,
                 &history,
                 tools_slice,
+                reasoning_effort.as_deref(),
                 cancel.clone(),
                 |delta| {
                     let body = stream_delta_body(
@@ -1572,6 +1616,29 @@ fn models_listed_body(config: &Config, models: &[ModelInfo]) -> Map<String, Valu
     if !ctx_map.is_empty() {
         m.insert("context_windows".into(), Value::Object(ctx_map));
     }
+    let caps: Map<String, Value> = models
+        .iter()
+        .filter(|mi| !mi.reasoning_efforts.is_empty())
+        .map(|mi| {
+            let levels = mi
+                .reasoning_efforts
+                .iter()
+                .cloned()
+                .map(Value::String)
+                .collect::<Vec<_>>();
+            let mut reasoning = Map::new();
+            reasoning.insert("levels".into(), Value::Array(levels));
+            if let Some(default) = &mi.default_reasoning_effort {
+                reasoning.insert("default".into(), Value::String(default.clone()));
+            }
+            let mut entry = Map::new();
+            entry.insert("reasoning".into(), Value::Object(reasoning));
+            (mi.id.clone(), Value::Object(entry))
+        })
+        .collect();
+    if !caps.is_empty() {
+        m.insert("model_capabilities".into(), Value::Object(caps));
+    }
     m
 }
 
@@ -1582,6 +1649,23 @@ fn model_set_ack_body(config: &Config, model: &str) -> Map<String, Value> {
         Value::String(format!("{}model.set_ack", config.event_prefix())),
     );
     m.insert("model".into(), Value::String(model.to_owned()));
+    m
+}
+
+fn reasoning_set_ack_body(
+    config: &Config,
+    effort: &str,
+    chat_id: Option<&ChatId>,
+) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert(
+        "kind".into(),
+        Value::String(format!("{}reasoning.set_ack", config.event_prefix())),
+    );
+    m.insert("effort".into(), Value::String(effort.to_owned()));
+    if let Some(cid) = chat_id {
+        m.insert("chat_id".into(), Value::String(cid.to_string()));
+    }
     m
 }
 
@@ -2427,10 +2511,14 @@ mod tests {
             ModelInfo {
                 id: "a".into(),
                 context_window: None,
+                reasoning_efforts: Vec::new(),
+                default_reasoning_effort: None,
             },
             ModelInfo {
                 id: "b".into(),
                 context_window: Some(128000),
+                reasoning_efforts: vec!["low".into(), "high".into()],
+                default_reasoning_effort: Some("low".into()),
             },
         ];
         let b = models_listed_body(&cfg("ollama"), &models);
@@ -2445,6 +2533,28 @@ mod tests {
         let cw = b.get("context_windows").unwrap().as_object().expect("map");
         assert_eq!(cw.len(), 1);
         assert_eq!(cw.get("b").unwrap().as_u64(), Some(128000));
+        let caps = b
+            .get("model_capabilities")
+            .unwrap()
+            .as_object()
+            .expect("map");
+        let reasoning = caps
+            .get("b")
+            .and_then(|v| v.get("reasoning"))
+            .and_then(Value::as_object)
+            .expect("reasoning capabilities");
+        assert_eq!(
+            reasoning
+                .get("levels")
+                .and_then(Value::as_array)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            reasoning.get("default").and_then(Value::as_str),
+            Some("low")
+        );
     }
 
     #[test]
@@ -2870,7 +2980,7 @@ mod tests {
         let client = reqwest::Client::builder().build().expect("client");
 
         chats
-            .create(ChatId::new("c-1"), None, None, None)
+            .create(ChatId::new("c-1"), None, None, None, None)
             .await
             .expect("seed");
 
@@ -2914,7 +3024,7 @@ mod tests {
         let client = reqwest::Client::builder().build().expect("client");
 
         chats
-            .create(ChatId::new("c-1"), None, None, None)
+            .create(ChatId::new("c-1"), None, None, None, None)
             .await
             .expect("seed");
 
@@ -3676,7 +3786,7 @@ mod tests {
         let client = reqwest::Client::builder().build().expect("client");
 
         chats
-            .create(ChatId::new("c-1"), None, None, None)
+            .create(ChatId::new("c-1"), None, None, None, None)
             .await
             .expect("seed");
 
@@ -3754,11 +3864,11 @@ mod tests {
     async fn two_concurrent_chats_have_independent_histories() {
         let chats = fresh_chats("m");
         chats
-            .create(ChatId::new("a"), None, None, None)
+            .create(ChatId::new("a"), None, None, None, None)
             .await
             .expect("a");
         chats
-            .create(ChatId::new("b"), None, None, None)
+            .create(ChatId::new("b"), None, None, None, None)
             .await
             .expect("b");
         chats
@@ -3972,11 +4082,11 @@ mod tests {
         let id_a = ChatId::new("chat-1");
         let id_b = ChatId::new("chat-2");
         chats
-            .create(id_a.clone(), None, None, None)
+            .create(id_a.clone(), None, None, None, None)
             .await
             .expect("a");
         chats
-            .create(id_b.clone(), None, None, None)
+            .create(id_b.clone(), None, None, None, None)
             .await
             .expect("b");
         let tok_a = chats.begin_turn(&id_a).await.expect("begin a");
@@ -4026,11 +4136,11 @@ mod tests {
         let id_a = ChatId::new("chat-1");
         let id_b = ChatId::new("chat-2");
         chats
-            .create(id_a.clone(), None, None, None)
+            .create(id_a.clone(), None, None, None, None)
             .await
             .expect("a");
         chats
-            .create(id_b.clone(), None, None, None)
+            .create(id_b.clone(), None, None, None, None)
             .await
             .expect("b");
         let tok_a = chats.begin_turn(&id_a).await.expect("begin a");
@@ -4070,11 +4180,11 @@ mod tests {
         let id_a = ChatId::new("chat-1");
         let id_b = ChatId::new("chat-2");
         chats
-            .create(id_a.clone(), None, None, None)
+            .create(id_a.clone(), None, None, None, None)
             .await
             .expect("a");
         chats
-            .create(id_b.clone(), None, None, None)
+            .create(id_b.clone(), None, None, None, None)
             .await
             .expect("b");
         let tok_a = chats.begin_turn(&id_a).await.expect("begin a");

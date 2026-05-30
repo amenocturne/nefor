@@ -45,6 +45,8 @@ function M.translator(name)
     models_list_requested   = prefix .. "models.list_requested",
     model_set               = prefix .. "model.set",
     model_set_ack           = prefix .. "model.set_ack",
+    reasoning_set           = prefix .. "reasoning.set",
+    reasoning_set_ack       = prefix .. "reasoning.set_ack",
     turn_error              = prefix .. "turn.error",
     chat_error              = prefix .. "chat.error",
     chat_complete_result    = prefix .. "chat.complete.result",
@@ -104,6 +106,10 @@ function M.translator(name)
       return body
     elseif k == kinds.model_set_ack then
       body.kind = "chat.model.set_ack"
+      body.provider = name
+      return body
+    elseif k == kinds.reasoning_set_ack then
+      body.kind = "chat.reasoning.set_ack"
       body.provider = name
       return body
     elseif k == kinds.turn_error then
@@ -201,6 +207,12 @@ function M.translator(name)
       return {
         kind  = kinds.model_set,
         model = body.model,
+      }
+    elseif k == "chat.reasoning.set" then
+      if body.provider ~= name then return nil end
+      return {
+        kind   = kinds.reasoning_set,
+        effort = body.effort or body.reasoning_effort,
       }
     end
 

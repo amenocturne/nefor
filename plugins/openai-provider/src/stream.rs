@@ -122,6 +122,7 @@ pub async fn run_chat_stream<F, R>(
     model: &str,
     messages: &[Message],
     tools: Option<&[serde_json::Value]>,
+    reasoning_effort: Option<&str>,
     cancel: CancellationToken,
     mut on_delta: F,
     mut on_reasoning: R,
@@ -134,6 +135,7 @@ where
         model,
         messages,
         stream: true,
+        reasoning_effort,
         stream_options: Some(StreamOptions {
             include_usage: true,
         }),

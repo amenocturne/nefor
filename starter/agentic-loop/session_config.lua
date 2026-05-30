@@ -19,7 +19,7 @@
 -- resumed session's chat — so the next submit dispatches the chat
 -- against a provider that doesn't own it ("chat 'X' not found").
 --
--- `read_active_model(path)` returns `{ provider, model }`. Either
+-- `read_active_model(path)` returns `{ provider, model, reasoning_effort }`. Either
 -- field may be nil if the log doesn't carry that signal.
 
 local json = nefor.json
@@ -67,16 +67,16 @@ end
 ---to chat.create.
 ---
 ---@param path string
----@return { provider: string|nil, model: string|nil }
+---@return { provider: string|nil, model: string|nil, reasoning_effort: string|nil }
 function M.read_active_model(path)
-  local result = { provider = nil, model = nil }
+  local result = { provider = nil, model = nil, reasoning_effort = nil }
   if type(path) ~= "string" or path == "" then return result end
 
   local fh = io.open(path, "r")
   if not fh then return result end
 
-  local create_provider, create_model
-  local explicit_provider, explicit_model
+  local create_provider, create_model, create_reasoning_effort
+  local explicit_provider, explicit_model, explicit_reasoning_effort
 
   for line in fh:lines() do
     -- Cheap header skip; full parse only on entries.
@@ -94,6 +94,14 @@ function M.read_active_model(path)
             if type(body.model) == "string" and #body.model > 0 then
               explicit_model = body.model
             end
+          elseif k == "chat.reasoning.set" then
+            if type(body.provider) == "string" and #body.provider > 0 then
+              explicit_provider = body.provider
+            end
+            local effort = body.effort or body.reasoning_effort
+            if type(effort) == "string" and #effort > 0 then
+              explicit_reasoning_effort = effort
+            end
           else
             local prov = provider_from_chat_create_kind(k)
             if prov ~= nil then
@@ -103,6 +111,9 @@ function M.read_active_model(path)
               -- model doesn't blank the prior model.
               if type(body.model) == "string" and #body.model > 0 then
                 create_model = body.model
+              end
+              if type(body.reasoning_effort) == "string" and #body.reasoning_effort > 0 then
+                create_reasoning_effort = body.reasoning_effort
               end
             end
           end
@@ -114,6 +125,7 @@ function M.read_active_model(path)
 
   result.provider = explicit_provider or create_provider
   result.model    = explicit_model    or create_model
+  result.reasoning_effort = explicit_reasoning_effort or create_reasoning_effort
   return result
 end
 

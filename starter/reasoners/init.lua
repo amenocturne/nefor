@@ -129,6 +129,11 @@ local function provider_run_node(reasoner_type, body)
     if type(model) == "string" and #model > 0 then
       create_body.model = model
     end
+    local reasoning_effort = (type(args) == "table" and args.reasoning_effort)
+      or cfg.reasoning_effort
+    if type(reasoning_effort) == "string" and #reasoning_effort > 0 then
+      create_body.reasoning_effort = reasoning_effort
+    end
     -- Sub-graph responder nodes must produce text, not tool calls.
     if reasoner_type == "responder" then
       create_body.tools = false

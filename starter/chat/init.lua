@@ -148,6 +148,8 @@ local function initial_state()
     turn_started_at  = nil,
     last_turn_duration_ms = nil,
     model            = nil,
+    provider         = nil,
+    reasoning_effort = nil,
     max_tokens       = nil,
     gate_yolo        = false,
     auth             = {},

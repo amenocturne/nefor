@@ -13,6 +13,7 @@
 --     args = {
 --       system_prompt      = <string>,
 --       model              = <string>,
+--       reasoning_effort   = <string?>,
 --       tool_allowlist     = <list<string>>,
 --       prompt             = <string>,    -- the user task
 --       additional_context = <string?>,   -- optional, inlined after system
@@ -359,6 +360,10 @@ local function handle(body)
   -- order in reasoners/init.lua:127.
   local model = (type(args.model) == "string" and #args.model > 0 and args.model)
               or cfg.model
+  local reasoning_effort =
+    (type(args.reasoning_effort) == "string" and #args.reasoning_effort > 0
+      and args.reasoning_effort)
+    or cfg.reasoning_effort
   if type(provider) ~= "string" or #provider == 0 then
     return "agent reasoner: no provider configured (set args.provider or config.provider)"
   end
@@ -422,6 +427,9 @@ local function handle(body)
   }
   if type(model) == "string" and #model > 0 then
     create_body.model = model
+  end
+  if type(reasoning_effort) == "string" and #reasoning_effort > 0 then
+    create_body.reasoning_effort = reasoning_effort
   end
   -- Advertise the role's allowlist + the synthetic `finalize`
   -- terminator. `finalize` rides on every agent firing regardless of

@@ -52,6 +52,7 @@ local json = nefor.json
 --
 --   <prompt>                       single positional → single-shot mode
 --   -m / --model <model>           switch model on the active provider
+--   --think/--reasoning-effort <L> set reasoning effort on the active provider
 --   --yolo                         set yolo mode
 --   --format text|json|stream-json output format
 --   -f / --file <path>             prepend file contents to prompt
@@ -66,6 +67,9 @@ local USAGE = [[Usage: nefor [--config <DIR>] plugin agentic-cli [--] [OPTIONS] 
 
 OPTIONS:
   -m, --model <MODEL>          Switch model on the active provider before the first turn.
+      --think <LEVEL>          Set reasoning effort before the first turn.
+      --reasoning-effort <LEVEL>
+                               Alias for --think.
       --yolo                   Enable yolo mode (placeholder; tool-gate not yet wired).
       --format <FMT>           Output format: text (default) | json | stream-json.
   -f, --file <PATH>            Read PATH and prepend its contents to the prompt.
@@ -95,6 +99,7 @@ local VALID_FORMATS = { text = true, json = true, ["stream-json"] = true }
 local function parse_argv(argv)
   local opts = {
     model = nil,
+    reasoning_effort = nil,
     yolo = false,
     format = "text",
     file = nil,
@@ -124,6 +129,12 @@ local function parse_argv(argv)
         return nil, "missing value for " .. a
       end
       opts.model = argv[i]
+    elseif a == "--think" or a == "--reasoning-effort" then
+      i = i + 1
+      if argv[i] == nil then
+        return nil, "missing value for " .. a
+      end
+      opts.reasoning_effort = argv[i]
     elseif a == "--format" then
       i = i + 1
       if argv[i] == nil then
@@ -480,6 +491,9 @@ function M.run(argv)
     -- provider". Fall back to a sentinel that set_model treats as
     -- no-op.
     agentic_workflow.set_model(nil, opts.model)
+  end
+  if opts.reasoning_effort ~= nil then
+    agentic_workflow.set_reasoning_effort(nil, opts.reasoning_effort)
   end
   if opts.yolo then
     agentic_workflow.set_yolo(true)

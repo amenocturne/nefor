@@ -19,6 +19,7 @@ local M = {}
 --   provider      — orchestrator provider name (informational; the
 --                   picker is the source of truth at runtime)
 --   model         — orchestrator model name (informational)
+--   reasoning_effort — optional reasoning effort for new provider chats
 --   system        — system prompt; threaded into the wrap node's args
 --   user_text     — current user message; threaded into the wrap
 --                   node's args as `prompt`
@@ -55,6 +56,9 @@ function M.build_orchestrator_graph(opts)
   }
   if type(system) == "string" and #system > 0 then
     wrap_args.system = system
+  end
+  if type(opts.reasoning_effort) == "string" and #opts.reasoning_effort > 0 then
+    wrap_args.reasoning_effort = opts.reasoning_effort
   end
   -- Optional tool-name allowlist for the orchestrator's chat. When set,
   -- provider-wrapper forwards it as `chat.create.tools = <list of names>`

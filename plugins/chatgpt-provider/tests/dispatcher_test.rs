@@ -54,7 +54,14 @@ async fn chats_and_catalog_and_broker_compose_for_a_tool_turn_shape() {
     // 2. chat is created and a user message is appended.
     let chat_id = ChatId::new("c1");
     chats
-        .create(chat_id.clone(), Some("test-model".into()), None, None, None)
+        .create(
+            chat_id.clone(),
+            Some("test-model".into()),
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("create");
     chats
@@ -145,11 +152,11 @@ async fn interrupt_only_cancels_named_chat() {
     let a = ChatId::new("a");
     let b = ChatId::new("b");
     chats
-        .create(a.clone(), Some("test-model".into()), None, None, None)
+        .create(a.clone(), Some("test-model".into()), None, None, None, None)
         .await
         .expect("a");
     chats
-        .create(b.clone(), Some("test-model".into()), None, None, None)
+        .create(b.clone(), Some("test-model".into()), None, None, None, None)
         .await
         .expect("b");
     let ta = chats.begin_turn(&a).await.expect("a");
@@ -168,6 +175,7 @@ async fn chat_snapshot_carries_history_for_translator_use() {
             id.clone(),
             Some("test-model".into()),
             Some("system prompt".into()),
+            None,
             None,
             None,
         )
