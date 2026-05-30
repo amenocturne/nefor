@@ -726,6 +726,19 @@ fn make_origin_repo(path: &std::path::Path) -> String {
     format!("file://{}", path.display())
 }
 
+fn run_git(path: &std::path::Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .output()
+        .expect("run git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn install_clones_and_creates_lockfile() {
     let work = tempfile::tempdir().expect("workdir");
@@ -768,6 +781,65 @@ fn install_clones_and_creates_lockfile() {
         body.contains("\"ref\":\"main\""),
         "ref not recorded: {body}"
     );
+}
+
+#[test]
+fn sync_checkout_updates_existing_checkout_to_requested_tag() {
+    let work = tempfile::tempdir().expect("workdir");
+    let origin = work.path().join("origin");
+    let url = make_origin_repo(&origin);
+    run_git(&origin, &["tag", "v1.0.0"]);
+
+    std::fs::write(origin.join("README.md"), "tag-two\n").expect("update README");
+    run_git(&origin, &["add", "README.md"]);
+    run_git(&origin, &["commit", "-m", "tag two", "--quiet"]);
+    run_git(&origin, &["tag", "v1.0.1"]);
+
+    let data = tempfile::tempdir().expect("datadir");
+    let _g = DataDirGuard::new(data.path());
+    let checkout = data.path().join("managed-upstream");
+
+    let lua = lua_with_pm();
+    let (first_ref, second_ref, first_body, second_body): (String, String, String, String) = lua
+        .load(format!(
+            r#"
+            local pm = require("nefor-pm")
+            local function read_readme(dir)
+              local f = assert(io.open(dir .. "/README.md", "r"))
+              local body = f:read("*a")
+              f:close()
+              return body
+            end
+            local dir = "{}"
+            local first = pm.sync_checkout({{
+              name = "managed-upstream",
+              dir = dir,
+              url = "{}",
+              ref = "v1.0.0",
+              ref_kind = "tag",
+            }})
+            local first_body = read_readme(dir)
+            local second = pm.sync_checkout({{
+              name = "managed-upstream",
+              dir = dir,
+              url = "{}",
+              ref = "v1.0.1",
+              ref_kind = "tag",
+            }})
+            local second_body = read_readme(dir)
+            return first.ref, second.ref, first_body, second_body
+            "#,
+            checkout.display(),
+            url,
+            url
+        ))
+        .eval()
+        .expect("sync checkout");
+
+    assert_eq!(first_ref, "v1.0.0");
+    assert_eq!(second_ref, "v1.0.1");
+    assert_eq!(first_body, "root\n");
+    assert_eq!(second_body, "tag-two\n");
 }
 
 #[test]

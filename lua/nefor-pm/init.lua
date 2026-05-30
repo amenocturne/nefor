@@ -10,6 +10,7 @@
 --                            installed plugins' dirs are searched.
 --   pm.bin(name[, binname])  resolve <plugin_dir>/bin/<binname> (default: name).
 --   pm.require(name)         alias of pm.load — never triggers install.
+--   pm.sync_checkout(opts)   ensure a managed git checkout is present at a ref.
 --   pm.engine_ref()          returns (ref, ref_kind) derived from nefor.version:
 --                            exact semver → ("vX.Y.Z", "tag"); otherwise ("main", "branch").
 --
@@ -109,6 +110,10 @@ end
 
 local function plugins_root()
   return pjoin(data_root(), "plugins")
+end
+
+local function parent_dir(path)
+  return path:match("^(.*)/[^/]+$") or "."
 end
 
 local function lockfile_path()
@@ -308,6 +313,13 @@ local function git(label, args, opts)
   return run_or_die(label, { "git", table.unpack(args) }, opts)
 end
 
+local function git_fetch_ref(spec)
+  if spec.ref_kind == "tag" then
+    return { "tag", spec.ref }
+  end
+  return { spec.ref }
+end
+
 local function current_commit(dir)
   local res = run_cmd({ "git", "-C", dir, "rev-parse", "HEAD" })
   if not res.ok then return nil end
@@ -351,17 +363,107 @@ local function clone(label, spec, target_dir)
 end
 
 local function update_to_ref(label, spec, target_dir)
-  git(label, { "-C", target_dir, "fetch", "--depth", "1", "origin", spec.ref })
+  local fetch_args = { "-C", target_dir, "fetch", "--depth", "1", "origin" }
+  for _, arg in ipairs(git_fetch_ref(spec)) do
+    fetch_args[#fetch_args + 1] = arg
+  end
+  git(label, fetch_args)
   if spec.ref_kind == "commit" then
     git(label, { "-C", target_dir, "checkout", spec.ref })
   else
-    -- For branches/tags `origin/<ref>` follows the remote head after fetch.
-    git(label, { "-C", target_dir, "checkout", spec.ref })
-    git(label, { "-C", target_dir, "reset", "--hard", "FETCH_HEAD" })
+    git(label, { "-C", target_dir, "checkout", "--force", "FETCH_HEAD" })
   end
   if spec.path then
     git(label, { "-C", target_dir, "sparse-checkout", "set", spec.path })
   end
+end
+
+local function normalize_sparse_paths(paths)
+  if paths == nil then return nil end
+  if is_string(paths) then return { paths } end
+  if not is_table(paths) then
+    error("nefor-pm.sync_checkout: `sparse` must be a string or list of strings", 0)
+  end
+  local out = {}
+  for i, path in ipairs(paths) do
+    if not is_string(path) then
+      error(string.format(
+        "nefor-pm.sync_checkout: sparse path #%d must be a non-empty string",
+        i), 0)
+    end
+    out[#out + 1] = path
+  end
+  return out
+end
+
+local function sync_checkout(opts)
+  if not is_table(opts) then
+    error("nefor-pm.sync_checkout: opts must be a table", 0)
+  end
+  local label = opts.name or opts.dir or "checkout"
+  if not is_string(opts.dir) then
+    fail(label, "`dir` must be a non-empty string")
+  end
+  if not is_string(opts.url) then
+    fail(label, "`url` must be a non-empty string")
+  end
+  local ref = opts.ref
+  local ref_kind = opts.ref_kind
+  if not is_string(ref) then
+    ref, ref_kind = engine_ref()
+  elseif ref_kind == nil then
+    ref_kind = ref:match("^v%d+%.%d+%.%d+$") and "tag" or "branch"
+  end
+  if ref_kind ~= "branch" and ref_kind ~= "tag" and ref_kind ~= "commit" then
+    fail(label, "`ref_kind` must be branch, tag, or commit")
+  end
+
+  local spec = {
+    url      = opts.url,
+    ref      = ref,
+    ref_kind = ref_kind,
+  }
+  local sparse_paths = normalize_sparse_paths(opts.sparse)
+  local fs = require_fs()
+  local parent_mk = fs.mkdir_p(parent_dir(opts.dir))
+  if not parent_mk.ok then
+    fail(label, "cannot create checkout parent: " .. tostring(parent_mk.error))
+  end
+
+  if not is_cloned(opts.dir) then
+    local args = { "clone", "--depth", "1" }
+    if sparse_paths then
+      args[#args + 1] = "--filter=blob:none"
+      args[#args + 1] = "--sparse"
+    end
+    if ref_kind == "branch" or ref_kind == "tag" then
+      args[#args + 1] = "--branch"
+      args[#args + 1] = ref
+    end
+    args[#args + 1] = opts.url
+    args[#args + 1] = opts.dir
+    git(label, args)
+    if ref_kind == "commit" then
+      update_to_ref(label, spec, opts.dir)
+    end
+  else
+    update_to_ref(label, spec, opts.dir)
+  end
+
+  if sparse_paths then
+    local sparse_args = { "-C", opts.dir, "sparse-checkout", "set" }
+    for _, path in ipairs(sparse_paths) do
+      sparse_args[#sparse_args + 1] = path
+    end
+    git(label, sparse_args)
+  end
+
+  return {
+    dir      = opts.dir,
+    ref      = ref,
+    ref_kind = ref_kind,
+    commit   = current_commit(opts.dir),
+  }
 end
 
 -- Trim leading and trailing slashes. "/a/b/" -> "a/b", "a" -> "a", "" -> "".
@@ -577,6 +679,10 @@ function M.require(name)
   return M.load(name)
 end
 
+function M.sync_checkout(opts)
+  return sync_checkout(opts)
+end
+
 function M.bin(name, binary_name)
   if not is_string(name) then
     error("nefor-pm.bin: name must be a non-empty string", 0)
@@ -608,6 +714,8 @@ M._internals = {
   read_lockfile   = read_lockfile,
   write_lockfile  = write_lockfile,
   compute_build_hash = compute_build_hash,
+  sync_checkout   = sync_checkout,
+  git_fetch_ref   = git_fetch_ref,
   djb2            = djb2,
   stable_encode   = stable_encode,
   plugins         = plugins,

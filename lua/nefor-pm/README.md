@@ -18,22 +18,25 @@ pm has to already be on disk and on `package.path` before the
 consumer's `init.lua` runs `pm.install({...})`.
 
 The solution is the same shape lazy.nvim uses: a small bootstrap
-snippet at the very top of the consumer's `init.lua` that clones a
-sparse subtree of the upstream repo into `$NEFOR_DATA_DIR` if missing,
-then puts the pm dir on `package.path`. After that the rest of
-`init.lua` is plain composition.
+snippet at the very top of the consumer's `init.lua` that ensures a
+sparse subtree of the upstream repo exists at the ref implied by the
+engine version, then puts the pm dir on `package.path`. After that the
+rest of `init.lua` is plain composition.
 
 ## The snippet
 
 ```lua
--- Bootstrap nefor-pm. Runs once on first boot of a fresh machine;
--- a no-op on subsequent boots when the pm dir already exists.
+-- Bootstrap nefor-pm. A release binary (nefor.version = "X.Y.Z") always
+-- runs against upstream tag vX.Y.Z; dev/nightly builds use main.
 local function bootstrap_pm()
   local data_dir = os.getenv("NEFOR_DATA_DIR")
                 or (os.getenv("XDG_DATA_HOME") or (os.getenv("HOME") .. "/.local/share"))
                    .. "/nefor"
   local pm_root  = data_dir .. "/nefor"
   local pm_init  = pm_root .. "/lua/nefor-pm/init.lua"
+  local upstream_ref = (nefor and nefor.version and nefor.version:match("^%d+%.%d+%.%d+$"))
+                    and ("v" .. nefor.version)
+                    or "main"
 
   -- Lua 5.2+ returns (true|nil, "exit"|"signal", code); 5.1 returns
   -- the raw exit code. Capture once — re-checking by re-calling
@@ -43,23 +46,36 @@ local function bootstrap_pm()
     local ok = os.execute(cmd)
     return ok == true or ok == 0
   end
+  local function sh_quote(s)
+    return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+  end
+  local function fetch_ref()
+    if upstream_ref:match("^v%d+%.%d+%.%d+$") then
+      return "tag " .. sh_quote(upstream_ref)
+    end
+    return sh_quote(upstream_ref)
+  end
 
   local f = io.open(pm_init, "r")
   if f then
     f:close()
   else
-    -- First boot: sparse-clone just lua/nefor-pm. os.execute is fine
-    -- here because nefor.process.spawn isn't wired yet (the binding
-    -- exists, but the pm that uses it isn't loaded).
     os.execute("mkdir -p '" .. data_dir .. "'")
     local clone_cmd = "git clone --depth 1 --filter=blob:none --sparse "
-                   .. "https://github.com/amenocturne/nefor.git '" .. pm_root .. "'"
+                   .. "--branch " .. sh_quote(upstream_ref) .. " "
+                   .. "https://github.com/amenocturne/nefor.git " .. sh_quote(pm_root)
     if not run(clone_cmd) then
       error("nefor bootstrap: git clone failed; check network + git availability")
     end
-    if not run("git -C '" .. pm_root .. "' sparse-checkout set lua/nefor-pm") then
-      error("nefor bootstrap: git sparse-checkout set failed")
-    end
+  end
+  if not run("git -C " .. sh_quote(pm_root) .. " fetch --depth 1 origin " .. fetch_ref()) then
+    error("nefor bootstrap: git fetch failed for " .. upstream_ref)
+  end
+  if not run("git -C " .. sh_quote(pm_root) .. " checkout --force FETCH_HEAD") then
+    error("nefor bootstrap: git checkout failed for " .. upstream_ref)
+  end
+  if not run("git -C " .. sh_quote(pm_root) .. " sparse-checkout set lua/nefor-pm") then
+    error("nefor bootstrap: git sparse-checkout set failed")
   end
 
   package.path = table.concat({
@@ -105,12 +121,11 @@ pm.install({
 - The bootstrap path uses `git` directly — same cross-platform constraint
   the rest of the pm honours (`git` is the only binary the bootstrap
   invokes, and it's available on every developer machine).
-- Behaviour is idempotent: the existence check on `pm_init` short-circuits
-  on every boot after the first.
+- Behaviour is version-synchronising: a cached checkout is fetched and
+  force-checked-out to the ref selected from `nefor.version` on each boot.
 - The engine binary must be installed separately — this bootstrap only
   fetches the _Lua_ side of nefor. Use your platform's package manager
   for the engine itself (or build from source via `cargo install`).
-- If you want a specific upstream tag for the pm itself (rather than
-  default branch), change the `git clone` flags to add `--branch <tag>`.
-  Most consumer configs are fine pinning their plugin specs to specific
-  tags and letting the pm float on the upstream default branch.
+- After `nefor-pm` is loaded, use `pm.sync_checkout({...})` for any other
+  managed upstream checkout that must stay aligned with a branch, tag, or
+  commit.

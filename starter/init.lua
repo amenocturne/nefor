@@ -50,6 +50,47 @@ local function run(cmd)
   return ok == true or ok == 0
 end
 
+local function sh_quote(s)
+  return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
+local function bootstrap_fetch_ref()
+  if UPSTREAM_REF:match("^v%d+%.%d+%.%d+$") then
+    return "tag " .. sh_quote(UPSTREAM_REF)
+  end
+  return sh_quote(UPSTREAM_REF)
+end
+
+local function ensure_bootstrap_checkout(pm_root)
+  local root = sh_quote(pm_root)
+  local ref = sh_quote(UPSTREAM_REF)
+
+  if not path_exists(pm_root) then
+    nefor.fs.mkdir_p(nefor.fs.data_root())
+    local clone_cmd = "git clone --depth 1 --filter=blob:none --sparse "
+                   .. "--branch " .. ref .. " "
+                   .. "https://github.com/amenocturne/nefor.git " .. root
+    if not run(clone_cmd) then
+      error("nefor bootstrap: git clone failed for ref " .. UPSTREAM_REF
+            .. ". Check git is on PATH, the network is reachable, and the "
+            .. "ref exists on origin.")
+    end
+  elseif not path_exists(pm_root .. "/.git") then
+    error("nefor bootstrap: " .. pm_root .. " exists but is not a git checkout")
+  else
+    if not run("git -C " .. root .. " fetch --depth 1 origin " .. bootstrap_fetch_ref()) then
+      error("nefor bootstrap: git fetch failed for ref " .. UPSTREAM_REF)
+    end
+    if not run("git -C " .. root .. " checkout --force FETCH_HEAD") then
+      error("nefor bootstrap: git checkout failed for ref " .. UPSTREAM_REF)
+    end
+  end
+
+  if not run("git -C " .. root .. " sparse-checkout set " .. SPARSE_CONE) then
+    error("nefor bootstrap: git sparse-checkout failed for " .. pm_root)
+  end
+end
+
 -- Resolve NEFOR_ROOT — the directory whose `lua/` and `plugins/`
 -- mirror the github repo layout.
 local NEFOR_ROOT
@@ -60,20 +101,7 @@ elseif path_exists(STARTER_ROOT .. "/../lua/nefor-pm/init.lua") then
 else
   local data_dir = nefor.fs.data_root()
   local pm_root  = data_dir .. "/nefor"
-  if not path_exists(pm_root) then
-    nefor.fs.mkdir_p(data_dir)
-    local clone_cmd = "git clone --depth 1 --filter=blob:none --sparse "
-                   .. "--branch '" .. UPSTREAM_REF .. "' "
-                   .. "https://github.com/amenocturne/nefor.git '" .. pm_root .. "'"
-    if not run(clone_cmd) then
-      error("nefor bootstrap: git clone failed for ref " .. UPSTREAM_REF
-            .. ". Check git is on PATH, the network is reachable, and the "
-            .. "ref exists on origin.")
-    end
-  end
-  if not run("git -C '" .. pm_root .. "' sparse-checkout set " .. SPARSE_CONE) then
-    error("nefor bootstrap: git sparse-checkout failed for " .. pm_root)
-  end
+  ensure_bootstrap_checkout(pm_root)
   NEFOR_ROOT = pm_root
 end
 
@@ -89,8 +117,8 @@ package.path = table.concat({
 
 -- nefor-pm wires the core primitives, generic libs, and every plugin
 -- lib. Every entry's `dir` resolves from NEFOR_ROOT (whichever way
--- the bootstrap above picked it). `tag` matches UPSTREAM_REF so a
--- future pm consistency check or refresh path uses one source of truth.
+-- the bootstrap above picked it). `tag` matches UPSTREAM_REF so pm and
+-- the bootstrap checkout use one source of truth.
 local pm = require("nefor-pm")
 pm.install({
   {
