@@ -67,11 +67,11 @@
 --
 --   on tool.invoke{name="agent"}:
 --     1. mint chat_id, register agents[firing_id] = { chat_id, ... }
---     2. emit <prov>.chat.create { chat_id, model, tools = allowlist }
+--     2. emit <prov>.chat.create { chat_id, model, system,
+--                                  tools = allowlist }
 --        (note: the binary filters its outgoing tool-advertisement set,
 --        but we still enforce per-call in-reasoner — see step 4)
---     3. emit <prov>.chat.append { role="system", content=system+ctx }
---     4. emit <prov>.chat.append { role="user", content=prompt+inputs }
+--     3. emit <prov>.chat.append { role="user", content=prompt+inputs }
 --        Upstream dispatch-graph dependencies arrive on the outer
 --        envelope as `body.inputs[<dep_id>] = { output = ... }`. Each
 --        dep's terminal output is rendered as a `[<dep_id>]\n<text>`
@@ -431,6 +431,18 @@ local function handle(body)
   if type(reasoning_effort) == "string" and #reasoning_effort > 0 then
     create_body.reasoning_effort = reasoning_effort
   end
+  local system
+  if type(system_prompt) == "string" and #system_prompt > 0 then
+    system = system_prompt
+    if type(additional) == "string" and #additional > 0 then
+      system = system .. "\n\n" .. additional
+    end
+  elseif type(additional) == "string" and #additional > 0 then
+    system = additional
+  end
+  if type(system) == "string" and #system > 0 then
+    create_body.system = system
+  end
   -- Advertise the role's allowlist + the synthetic `finalize`
   -- terminator. `finalize` rides on every agent firing regardless of
   -- the caller's allowlist; it's intercepted here, not routed through
@@ -442,17 +454,6 @@ local function handle(body)
     create_body.tools = advertised
   end
   emit(provider, create_body)
-
-  -- system message: system_prompt + optional additional_context
-  if type(system_prompt) == "string" and #system_prompt > 0 then
-    local sys = system_prompt
-    if type(additional) == "string" and #additional > 0 then
-      sys = sys .. "\n\n" .. additional
-    end
-    emit_chat_append(entry, { role = "system", content = sys })
-  elseif type(additional) == "string" and #additional > 0 then
-    emit_chat_append(entry, { role = "system", content = additional })
-  end
 
   -- user message: prompt first, then upstream graph-node outputs (when
   -- this node has dependencies), separated by `---`. Append (not prepend)

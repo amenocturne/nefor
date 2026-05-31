@@ -817,11 +817,9 @@ do
   agentic_loop._internals.state.current_state = { chat_id = "chat-prior" }
 
   with_session_log({
-    step_entry("ollama", { kind = "ollama.chat.create", chat_id = "chat-prior", model = "qwen3" }),
     step_entry("ollama", {
-      kind    = "ollama.chat.append",
-      chat_id = "chat-prior",
-      message = { role = "system", content = "you are helpful" },
+      kind = "ollama.chat.create", chat_id = "chat-prior", model = "qwen3",
+      system = "you are helpful",
     }),
     step_entry("ollama", {
       kind    = "ollama.chat.append",
@@ -849,8 +847,8 @@ do
       .. json.encode(cs or {}))
     local new_chat_id = cs.chat_id
 
-    -- Bus traffic must include <new>.chat.create + 3 chat.append
-    -- (system, user, assistant from synthesised tool.result).
+    -- Bus traffic must include <new>.chat.create(system) + 2
+    -- chat.append (user, assistant from synthesised tool.result).
     local kinds = {}
     local appends_for_new = {}
     for _, c in ipairs(decode_calls()) do
@@ -863,10 +861,12 @@ do
 
     local saw_create = false
     local create_model
+    local create_system
     for _, c in ipairs(decode_calls()) do
       if c.body.kind == "another-provider.chat.create" then
         saw_create = true
         create_model = c.body.model
+        create_system = c.body.system
       end
     end
     assert(saw_create,
@@ -881,13 +881,14 @@ do
     assert_eq(create_model, "qwen-other",
       "<new>.chat.create must carry the NEW model from chat.model.set, not the source-log model; got "
       .. tostring(create_model))
-    assert_eq(#appends_for_new, 3,
-      "set_model rebuild must re-feed 3 messages (system/user + synthesised assistant); got "
+    assert_eq(create_system, "you are helpful",
+      "<new>.chat.create must carry the source chat.create system prompt")
+    assert_eq(#appends_for_new, 2,
+      "set_model rebuild must re-feed 2 history messages (user + synthesised assistant); got "
       .. tostring(#appends_for_new))
-    assert_eq(appends_for_new[1].role,    "system",    "first re-fed message is system")
-    assert_eq(appends_for_new[2].role,    "user",      "second re-fed message is user")
-    assert_eq(appends_for_new[3].role,    "assistant", "third re-fed message is synthesised assistant turn")
-    assert_eq(appends_for_new[3].content, "got it — the secret word is sphinx.",
+    assert_eq(appends_for_new[1].role,    "user",      "first re-fed message is user")
+    assert_eq(appends_for_new[2].role,    "assistant", "second re-fed message is synthesised assistant turn")
+    assert_eq(appends_for_new[2].content, "got it — the secret word is sphinx.",
       "synthesised assistant content comes from result.text")
 
     -- Next submit's wrap node must seed_chat_id with the new chat_id —

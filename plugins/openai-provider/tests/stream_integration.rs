@@ -783,6 +783,7 @@ async fn reactive_fallback_retries_without_tools_after_signature_400() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("create");
@@ -908,6 +909,7 @@ async fn marked_model_skips_tools_on_first_turn_of_a_brand_new_chat() {
         .create(
             chat_id.clone(),
             Some("translategemma".into()),
+            None,
             None,
             None,
             None,

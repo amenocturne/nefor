@@ -124,6 +124,12 @@ impl Message {
         }
     }
 
+    pub fn system<S: Into<String>>(text: S) -> Self {
+        Message::System {
+            content: text.into(),
+        }
+    }
+
     pub fn assistant<S: Into<String>>(text: S) -> Self {
         Message::Assistant {
             content: Some(text.into()),

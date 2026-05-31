@@ -13,8 +13,8 @@
 //!
 //! ### Wire-level chat API (new)
 //!
-//! - `<prefix>.chat.create  { chat_id, model? }` — make a new chat;
-//!   errors if `chat_id` already exists.
+//! - `<prefix>.chat.create  { chat_id, model?, system? }` — make a new
+//!   chat; errors if `chat_id` already exists.
 //! - `<prefix>.chat.append  { chat_id, message }` — append a message
 //!   (typically the user's turn). No upstream call.
 //! - `<prefix>.chat.complete { chat_id }` — send the chat's history to
@@ -285,6 +285,11 @@ async fn dispatch_event(
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned);
+            let system = body
+                .get("system")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
             // `tools` accepts two shapes:
             //   - bool      → on/off switch (existing semantics).
             //                 false = omit tools array entirely.
@@ -318,6 +323,7 @@ async fn dispatch_event(
                 tools_enabled = ?tools_enabled,
                 tool_allowlist_len = tool_allowlist.as_ref().map(Vec::len),
                 reasoning_effort = ?reasoning_effort,
+                system_len = system.as_ref().map(String::len),
                 "chat.create",
             );
             match chats
@@ -327,6 +333,7 @@ async fn dispatch_event(
                     tools_enabled,
                     tool_allowlist,
                     reasoning_effort,
+                    system,
                 )
                 .await
             {
@@ -792,7 +799,7 @@ fn spawn_turn(
 
         loop {
             iterations += 1;
-            let history = match chats.history_snapshot(&chat_id).await {
+            let history = match chats.request_history_snapshot(&chat_id).await {
                 Ok(h) => h,
                 Err(e) => {
                     tracing::warn!(chat_id = %chat_id, error = %e, "chat vanished mid-turn");
@@ -2963,7 +2970,10 @@ mod tests {
 
         let body = make_event_body(
             "ollama.chat.create",
-            &[("chat_id", Value::String("c-1".into()))],
+            &[
+                ("chat_id", Value::String("c-1".into())),
+                ("system", Value::String("durable instructions".into())),
+            ],
         );
         dispatch_event(
             &chats,
@@ -2990,6 +3000,13 @@ mod tests {
             Some("c-1")
         );
         assert!(chats.exists(&ChatId::new("c-1")).await);
+        let request_history = chats
+            .request_history_snapshot(&ChatId::new("c-1"))
+            .await
+            .expect("request history");
+        assert_eq!(request_history.len(), 1);
+        assert_eq!(request_history[0].role(), "system");
+        assert_eq!(request_history[0].content(), Some("durable instructions"));
     }
 
     #[tokio::test]
@@ -3002,7 +3019,7 @@ mod tests {
         let client = reqwest::Client::builder().build().expect("client");
 
         chats
-            .create(ChatId::new("c-1"), None, None, None, None)
+            .create(ChatId::new("c-1"), None, None, None, None, None)
             .await
             .expect("seed");
 
@@ -3046,7 +3063,7 @@ mod tests {
         let client = reqwest::Client::builder().build().expect("client");
 
         chats
-            .create(ChatId::new("c-1"), None, None, None, None)
+            .create(ChatId::new("c-1"), None, None, None, None, None)
             .await
             .expect("seed");
 
@@ -3808,7 +3825,7 @@ mod tests {
         let client = reqwest::Client::builder().build().expect("client");
 
         chats
-            .create(ChatId::new("c-1"), None, None, None, None)
+            .create(ChatId::new("c-1"), None, None, None, None, None)
             .await
             .expect("seed");
 
@@ -3886,11 +3903,11 @@ mod tests {
     async fn two_concurrent_chats_have_independent_histories() {
         let chats = fresh_chats("m");
         chats
-            .create(ChatId::new("a"), None, None, None, None)
+            .create(ChatId::new("a"), None, None, None, None, None)
             .await
             .expect("a");
         chats
-            .create(ChatId::new("b"), None, None, None, None)
+            .create(ChatId::new("b"), None, None, None, None, None)
             .await
             .expect("b");
         chats
@@ -4104,11 +4121,11 @@ mod tests {
         let id_a = ChatId::new("chat-1");
         let id_b = ChatId::new("chat-2");
         chats
-            .create(id_a.clone(), None, None, None, None)
+            .create(id_a.clone(), None, None, None, None, None)
             .await
             .expect("a");
         chats
-            .create(id_b.clone(), None, None, None, None)
+            .create(id_b.clone(), None, None, None, None, None)
             .await
             .expect("b");
         let tok_a = chats.begin_turn(&id_a).await.expect("begin a");
@@ -4158,11 +4175,11 @@ mod tests {
         let id_a = ChatId::new("chat-1");
         let id_b = ChatId::new("chat-2");
         chats
-            .create(id_a.clone(), None, None, None, None)
+            .create(id_a.clone(), None, None, None, None, None)
             .await
             .expect("a");
         chats
-            .create(id_b.clone(), None, None, None, None)
+            .create(id_b.clone(), None, None, None, None, None)
             .await
             .expect("b");
         let tok_a = chats.begin_turn(&id_a).await.expect("begin a");
@@ -4202,11 +4219,11 @@ mod tests {
         let id_a = ChatId::new("chat-1");
         let id_b = ChatId::new("chat-2");
         chats
-            .create(id_a.clone(), None, None, None, None)
+            .create(id_a.clone(), None, None, None, None, None)
             .await
             .expect("a");
         chats
-            .create(id_b.clone(), None, None, None, None)
+            .create(id_b.clone(), None, None, None, None, None)
             .await
             .expect("b");
         let tok_a = chats.begin_turn(&id_a).await.expect("begin a");

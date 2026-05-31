@@ -109,23 +109,21 @@ do
   })
 
   local calls = decode_calls()
-  -- Expect: chat.create + chat.append(system) + chat.append(user) + chat.complete
+  -- Expect: chat.create(system) + chat.append(user) + chat.complete
   local create = find_call(calls, function(c)
     return c.body.kind == "mock-prov.chat.create"
   end)
   assert(create ~= nil, "agent must emit <provider>.chat.create on dispatch; got " .. json.encode(_test.calls()))
   assert_eq(create.body.model, "test-model", "chat.create carries args.model")
+  assert_eq(create.body.system, "You are a builder.", "chat.create carries args.system_prompt")
   assert_eq(create.target, "mock-prov", "chat.create targets the provider")
 
   local appends = find_calls(calls, function(c)
     return c.body.kind == "mock-prov.chat.append"
   end)
-  assert_eq(#appends, 2, "agent must emit chat.append for system + user")
-  assert_eq(appends[1].body.message.role, "system", "first append is system")
-  assert_eq(appends[1].body.message.content, "You are a builder.",
-    "system content matches args.system_prompt")
-  assert_eq(appends[2].body.message.role, "user",   "second append is user")
-  assert_eq(appends[2].body.message.content, "What is 2+2?",
+  assert_eq(#appends, 1, "agent must emit one chat.append for the user message")
+  assert_eq(appends[1].body.message.role, "user", "append is user")
+  assert_eq(appends[1].body.message.content, "What is 2+2?",
     "user content matches args.prompt")
 
   local complete = find_call(calls, function(c)
@@ -1308,11 +1306,14 @@ do
   local appends = find_calls(calls, function(c)
     return c.body.kind == "mock-prov.chat.append"
   end)
-  assert_eq(#appends, 2, "agent emits system + single user message")
-  assert_eq(appends[1].body.message.role, "system",
-    "first append is system (unaffected by inputs)")
-  assert_eq(appends[2].body.message.role, "user", "second append is user")
-  local user_content = appends[2].body.message.content
+  local create = find_call(calls, function(c)
+    return c.body.kind == "mock-prov.chat.create"
+  end)
+  assert(create ~= nil, "agent emits chat.create")
+  assert_eq(create.body.system, "You are a reviewer.", "chat.create carries system prompt")
+  assert_eq(#appends, 1, "agent emits a single user message")
+  assert_eq(appends[1].body.message.role, "user", "append is user")
+  local user_content = appends[1].body.message.content
   assert(user_content:find("hello from explorer", 1, true) ~= nil,
     "user message MUST carry upstream output text; got:\n" .. tostring(user_content))
   assert(user_content:find("[exp1]", 1, true) ~= nil,

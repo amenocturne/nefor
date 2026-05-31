@@ -85,6 +85,10 @@ enum TurnState {
 /// Chat state stored under a `ChatId`.
 struct ChatState {
     model: String,
+    /// Durable per-chat system instructions. Kept outside appendable
+    /// history so reset/compaction can replace history without losing
+    /// the chat's behavioral contract.
+    system: Option<String>,
     history: Arc<Vec<Message>>,
     turn: TurnState,
     stats: ChatStats,
@@ -104,6 +108,7 @@ impl ChatState {
     fn new(model: String) -> Self {
         Self {
             model,
+            system: None,
             history: Arc::new(Vec::new()),
             turn: TurnState::Idle,
             stats: ChatStats::default(),
@@ -196,6 +201,7 @@ impl Chats {
         tools_enabled: Option<bool>,
         tool_allowlist: Option<Vec<String>>,
         reasoning_effort: Option<String>,
+        system: Option<String>,
     ) -> Result<(), ChatsError> {
         let resolved_model = match model {
             Some(m) => m,
@@ -211,6 +217,7 @@ impl Chats {
             return Err(ChatsError::AlreadyExists(id));
         }
         let mut chat = ChatState::new(resolved_model);
+        chat.system = system;
         // Explicit array wins over the bool.
         if let Some(names) = tool_allowlist {
             chat.tool_allowlist = Some(names);
@@ -341,6 +348,26 @@ impl Chats {
         g.get(id)
             .map(|c| Arc::clone(&c.history))
             .ok_or_else(|| ChatsError::NotFound(id.clone()))
+    }
+
+    /// Snapshot the message list used for upstream model requests.
+    /// Durable `chat.create.system` instructions are prepended here,
+    /// but are not part of normal appendable history.
+    pub async fn request_history_snapshot(
+        &self,
+        id: &ChatId,
+    ) -> Result<Arc<Vec<Message>>, ChatsError> {
+        let g = self.inner.lock().await;
+        let chat = g.get(id).ok_or_else(|| ChatsError::NotFound(id.clone()))?;
+        match &chat.system {
+            Some(system) => {
+                let mut messages = Vec::with_capacity(chat.history.len() + 1);
+                messages.push(Message::system(system.clone()));
+                messages.extend(chat.history.iter().cloned());
+                Ok(Arc::new(messages))
+            }
+            None => Ok(Arc::clone(&chat.history)),
+        }
     }
 
     pub async fn append(&self, id: &ChatId, message: Message) -> Result<(), ChatsError> {
@@ -551,7 +578,7 @@ mod tests {
     async fn create_then_append_and_snapshot_round_trips_through_history() {
         let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("a");
-        c.create(id.clone(), None, None, None, None)
+        c.create(id.clone(), None, None, None, None, None)
             .await
             .expect("create");
         c.push_user(&id, "hello".into()).await.expect("push user");
@@ -567,14 +594,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_system_is_durable_request_context_not_append_history() {
+        let c = Chats::with_default_model(Some("m".into()));
+        let id = ChatId::new("a");
+        c.create(
+            id.clone(),
+            None,
+            None,
+            None,
+            None,
+            Some("stay terse".into()),
+        )
+        .await
+        .expect("create");
+        c.push_user(&id, "hello".into()).await.expect("push user");
+
+        let display_history = c.history_snapshot(&id).await.expect("history");
+        assert_eq!(display_history.len(), 1);
+        assert_eq!(display_history[0].role(), "user");
+
+        let request_history = c
+            .request_history_snapshot(&id)
+            .await
+            .expect("request history");
+        assert_eq!(request_history.len(), 2);
+        assert_eq!(request_history[0].role(), "system");
+        assert_eq!(request_history[0].content(), Some("stay terse"));
+        assert_eq!(request_history[1].role(), "user");
+
+        c.reset(&id).await.expect("reset");
+        let after_reset = c
+            .request_history_snapshot(&id)
+            .await
+            .expect("request history after reset");
+        assert_eq!(after_reset.len(), 1);
+        assert_eq!(after_reset[0].role(), "system");
+        assert_eq!(after_reset[0].content(), Some("stay terse"));
+    }
+
+    #[tokio::test]
     async fn create_rejects_duplicate_id() {
         let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("dup");
-        c.create(id.clone(), None, None, None, None)
+        c.create(id.clone(), None, None, None, None, None)
             .await
             .expect("first create");
         let err = c
-            .create(id.clone(), None, None, None, None)
+            .create(id.clone(), None, None, None, None, None)
             .await
             .expect_err("second create");
         assert!(matches!(err, ChatsError::AlreadyExists(x) if x == id));
@@ -584,7 +650,7 @@ mod tests {
     async fn delete_removes_chat_and_subsequent_ops_404() {
         let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("x");
-        c.create(id.clone(), None, None, None, None)
+        c.create(id.clone(), None, None, None, None, None)
             .await
             .expect("create");
         c.delete(&id).await.expect("delete");
@@ -608,10 +674,10 @@ mod tests {
         let c = Chats::with_default_model(Some("m".into()));
         let a = ChatId::new("a");
         let b = ChatId::new("b");
-        c.create(a.clone(), None, None, None, None)
+        c.create(a.clone(), None, None, None, None, None)
             .await
             .expect("a");
-        c.create(b.clone(), None, None, None, None)
+        c.create(b.clone(), None, None, None, None, None)
             .await
             .expect("b");
         c.push_user(&a, "x".into()).await.expect("a push");
@@ -626,10 +692,10 @@ mod tests {
         let c = Chats::with_default_model(Some("m".into()));
         let a = ChatId::new("a");
         let b = ChatId::new("b");
-        c.create(a.clone(), None, None, None, None)
+        c.create(a.clone(), None, None, None, None, None)
             .await
             .expect("a");
-        c.create(b.clone(), None, None, None, None)
+        c.create(b.clone(), None, None, None, None, None)
             .await
             .expect("b");
         c.push_user(&a, "x".into()).await.expect("a push");
@@ -644,10 +710,10 @@ mod tests {
         let c = Chats::with_default_model(Some("m".into()));
         let a = ChatId::new("a");
         let b = ChatId::new("b");
-        c.create(a.clone(), None, None, None, None)
+        c.create(a.clone(), None, None, None, None, None)
             .await
             .expect("a");
-        c.create(b.clone(), None, None, None, None)
+        c.create(b.clone(), None, None, None, None, None)
             .await
             .expect("b");
         let _t1 = c.begin_turn(&a).await.expect("a first");
@@ -663,10 +729,10 @@ mod tests {
         let c = Chats::with_default_model(Some("m".into()));
         let a = ChatId::new("a");
         let b = ChatId::new("b");
-        c.create(a.clone(), None, None, None, None)
+        c.create(a.clone(), None, None, None, None, None)
             .await
             .expect("a");
-        c.create(b.clone(), None, None, None, None)
+        c.create(b.clone(), None, None, None, None, None)
             .await
             .expect("b");
         let ta = c.begin_turn(&a).await.expect("a");
@@ -681,10 +747,10 @@ mod tests {
         let c = Chats::with_default_model(Some("m".into()));
         let a = ChatId::new("a");
         let b = ChatId::new("b");
-        c.create(a.clone(), None, None, None, None)
+        c.create(a.clone(), None, None, None, None, None)
             .await
             .expect("a");
-        c.create(b.clone(), None, None, None, None)
+        c.create(b.clone(), None, None, None, None, None)
             .await
             .expect("b");
         let ta = c.begin_turn(&a).await.expect("a");
@@ -698,7 +764,7 @@ mod tests {
     async fn create_with_explicit_model_overrides_default() {
         let c = Chats::with_default_model(Some("default".into()));
         let id = ChatId::new("a");
-        c.create(id.clone(), Some("explicit".into()), None, None, None)
+        c.create(id.clone(), Some("explicit".into()), None, None, None, None)
             .await
             .expect("create");
         assert_eq!(c.model(&id).await.expect("model"), "explicit");
@@ -709,10 +775,10 @@ mod tests {
         let c = Chats::with_default_model(Some("default".into()));
         let a = ChatId::new("a");
         let b = ChatId::new("b");
-        c.create(a.clone(), None, None, None, None)
+        c.create(a.clone(), None, None, None, None, None)
             .await
             .expect("a");
-        c.create(b.clone(), None, None, None, None)
+        c.create(b.clone(), None, None, None, None, None)
             .await
             .expect("b");
         c.set_chat_model(&a, "new".into()).await.expect("set a");
@@ -742,7 +808,7 @@ mod tests {
     async fn record_turn_accumulates_per_chat() {
         let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("a");
-        c.create(id.clone(), None, None, None, None)
+        c.create(id.clone(), None, None, None, None, None)
             .await
             .expect("create");
         c.record_turn(&id, Some("qwen"), 100, 50, 1234)
@@ -765,7 +831,7 @@ mod tests {
     async fn push_assistant_tool_calls_and_tool_result_round_trip() {
         let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("a");
-        c.create(id.clone(), None, None, None, None)
+        c.create(id.clone(), None, None, None, None, None)
             .await
             .expect("create");
         c.push_user(&id, "hi".into()).await.expect("u");
@@ -797,7 +863,7 @@ mod tests {
     async fn orphan_tool_result_is_dropped_from_history() {
         let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("a");
-        c.create(id.clone(), None, None, None, None)
+        c.create(id.clone(), None, None, None, None, None)
             .await
             .expect("create");
 
@@ -816,7 +882,7 @@ mod tests {
     async fn duplicate_tool_result_is_dropped_from_history() {
         let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("a");
-        c.create(id.clone(), None, None, None, None)
+        c.create(id.clone(), None, None, None, None, None)
             .await
             .expect("create");
         let calls = vec![ToolCall {
@@ -846,10 +912,10 @@ mod tests {
     #[tokio::test]
     async fn ids_returns_every_live_chat() {
         let c = Chats::with_default_model(Some("m".into()));
-        c.create(ChatId::new("a"), None, None, None, None)
+        c.create(ChatId::new("a"), None, None, None, None, None)
             .await
             .expect("a");
-        c.create(ChatId::new("b"), None, None, None, None)
+        c.create(ChatId::new("b"), None, None, None, None, None)
             .await
             .expect("b");
         let mut ids = c.ids().await;
@@ -892,7 +958,7 @@ mod tests {
     async fn set_tool_allowlist_flips_per_chat_flag() {
         let c = Chats::with_default_model(Some("m".into()));
         let id = ChatId::new("a");
-        c.create(id.clone(), None, None, None, None)
+        c.create(id.clone(), None, None, None, None, None)
             .await
             .expect("create");
         // Default: None = all tools.

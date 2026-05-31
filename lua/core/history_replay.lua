@@ -28,7 +28,7 @@
 -- Source envelopes recognised in the log (each is a step entry the
 -- live agentic stack already emitted):
 --
---   `<src_prefix>.chat.create { chat_id, model? }`           — verbatim re-feed
+--   `<src_prefix>.chat.create { chat_id, model?, system? }`  — create re-feed
 --   `<src_prefix>.chat.append { chat_id, message }`          — verbatim re-feed
 --   `tool.result { result.next_state.chat_id == src_chat_id }` — synthesise an
 --                                                                assistant `<tgt>.chat.append`
@@ -48,7 +48,7 @@
 -- (a) persist into the active session log, (b) reach the target
 -- wrapper's `to_plugin` for delivery, (c) surface to any bus observer):
 --
---   `<target_provider>.chat.create { chat_id = target_chat_id, model? }`
+--   `<target_provider>.chat.create { chat_id = target_chat_id, model?, system? }`
 --   `<target_provider>.chat.append { chat_id = target_chat_id, message }`
 --
 -- The first emit is always `chat.create` so the new provider's binary
@@ -184,6 +184,7 @@ function M.replay_chat_history(opts)
   -- provider to spin up an old-namespace model name surfaces as an
   -- API error on the next chat.complete.
   local create_model = model
+  local create_system
   local pending_appends = {}
 
   for line in fh:lines() do
@@ -195,6 +196,9 @@ function M.replay_chat_history(opts)
           local k = body.kind
           if k == src_create_kind and body.chat_id == src_chat_id then
             saw_create = true
+            if type(body.system) == "string" and #body.system > 0 then
+              create_system = body.system
+            end
           elseif k == src_append_kind and body.chat_id == src_chat_id then
             pending_appends[#pending_appends + 1] = body.message
           elseif k == "tool.result" then
@@ -228,6 +232,9 @@ function M.replay_chat_history(opts)
   local create_body = { kind = target_create_kind, chat_id = target_chat_id }
   if type(create_model) == "string" and #create_model > 0 then
     create_body.model = create_model
+  end
+  if type(create_system) == "string" and #create_system > 0 then
+    create_body.system = create_system
   end
   envelope.emit(target_provider, create_body)
   emitted = emitted + 1

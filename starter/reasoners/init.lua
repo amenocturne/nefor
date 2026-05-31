@@ -134,6 +134,9 @@ local function provider_run_node(reasoner_type, body)
     if type(reasoning_effort) == "string" and #reasoning_effort > 0 then
       create_body.reasoning_effort = reasoning_effort
     end
+    if type(args) == "table" and type(args.system) == "string" and #args.system > 0 then
+      create_body.system = args.system
+    end
     -- Sub-graph responder nodes must produce text, not tool calls.
     if reasoner_type == "responder" then
       create_body.tools = false
@@ -153,16 +156,6 @@ local function provider_run_node(reasoner_type, body)
       create_body.tools = advertised
     end
     emit(provider, create_body)
-  end
-
-  if need_create then
-    if type(args) == "table" and type(args.system) == "string" and #args.system > 0 then
-      emit(provider, {
-        kind    = provider .. ".chat.append",
-        chat_id = chat_id,
-        message = { role = "system", content = args.system },
-      })
-    end
   end
 
   for dep_id, dep_entry in pairs(inputs) do

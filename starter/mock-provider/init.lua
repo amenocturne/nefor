@@ -6,7 +6,7 @@
 -- register on the bus and show up in the /model picker.
 --
 -- Speaks the same wire shape as openai-provider:
---   <name>.chat.create  { chat_id, model? }
+--   <name>.chat.create  { chat_id, model?, system? }
 --   <name>.chat.append  { chat_id, message: { role, content, ... } }
 --   <name>.chat.complete { chat_id }
 -- responds with:
@@ -737,6 +737,9 @@ nefor.on(NAME .. ".chat.create", function(body)
   local chat_id = body.chat_id
   if type(chat_id) ~= "string" then return end
   chats[chat_id] = {}
+  if type(body.system) == "string" and #body.system > 0 then
+    table.insert(chats[chat_id], { role = "system", content = body.system })
+  end
   nefor.log("chat.create chat_id=" .. chat_id)
 end)
 
