@@ -81,21 +81,20 @@ end
 -- only differ by which provider/model they point at. The gate is part
 -- of the product, not a per-environment knob.
 --
--- Default runtime mode is /safe: every tool in lead_role.TOOL_ALLOWLIST
--- runs --auto except the two runtime gating points below, which are
--- forced back to --prompt and interpreted by tool-validator:
+-- Default stance: every tool in lead_role.TOOL_ALLOWLIST runs --auto
+-- (read-only investigation tools never need a popup; worker/docs sub-agents
+-- inherit trust from the dispatch-graph plan approval). prompt_tools flips
+-- the two runtime gating points back to --prompt:
 --
---   * dispatch-graph — fan-out gate. Safe mode may defer write-capable
---     graphs to the user popup; read-only graphs auto-pass.
+--   * dispatch-graph — fan-out gate. One click reviews the entire
+--     graph the lead is about to run.
 --   * bash          — per-command classification via tool-validator
 --     (which calls `da`). Safe read-only commands auto-approve;
---     anything else may surface as a popup.
+--     anything else surfaces as a popup.
 --
--- `/auto` keeps the same prompt policy at tool-gate, but tool-validator
--- converts anything that would defer to a human into a denial with
--- recovery text. `/yolo` bypasses the gate entirely and approves all
--- tool calls. default_action stays "prompt" so an unfamiliar tool a
--- future plugin advertises surfaces in front of the user in /safe.
+-- default_action stays "prompt" so an unfamiliar tool a future plugin
+-- advertises (not in TOOL_ALLOWLIST) surfaces in front of the user
+-- instead of running silently.
 local SHARED_TOOL_GATE = {
   default_action     = "prompt",
   use_lead_allowlist = true,
@@ -145,50 +144,6 @@ M.staging = M.prod
 M.confluence = {
   host = "https://wiki.tcsbank.ru",
 }
-
-local function file_exists(path)
-  local f = io.open(path, "r")
-  if f then f:close(); return true end
-  return false
-end
-
-local function load_local_config()
-  local starter_root = rawget(_G, "NEFOR_CONFIG_DIR") or "."
-  local path = starter_root .. "/config/local.lua"
-  if not file_exists(path) then return end
-
-  local chunk, err = loadfile(path)
-  if not chunk then
-    error("config.local: cannot load " .. path .. ": " .. tostring(err))
-  end
-
-  local helpers = {
-    all_roles        = all_roles,
-    workflow_with    = workflow_with,
-    shared_tool_gate = SHARED_TOOL_GATE,
-    env_or           = env_or,
-  }
-  local ok, local_cfg = pcall(chunk, helpers)
-  if not ok then
-    error("config.local: " .. tostring(local_cfg))
-  end
-  if local_cfg == nil then return end
-  if type(local_cfg) ~= "table" then
-    error("config.local: expected table return, got " .. type(local_cfg))
-  end
-
-  local variants = local_cfg.variants or local_cfg
-  if type(variants) ~= "table" then
-    error("config.local: variants must be a table")
-  end
-  for name, cfg in pairs(variants) do
-    if type(name) == "string" and type(cfg) == "table" then
-      M[name] = cfg
-    end
-  end
-end
-
-load_local_config()
 
 local variant = os.getenv("NEFOR_CONFIG")
 if variant == nil or variant == "" then
