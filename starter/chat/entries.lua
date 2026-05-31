@@ -388,7 +388,11 @@ local function agents_md_expanded(entry)
 end
 
 local function compaction_label(entry, glyph)
-  local parts = { glyph .. "context compacted" }
+  local title = "context compacted"
+  if entry.status == "pending" then
+    title = "context compacting..."
+  end
+  local parts = { glyph .. title }
   if type(entry.trigger) == "string" and #entry.trigger > 0 then
     parts[#parts + 1] = entry.trigger
   end

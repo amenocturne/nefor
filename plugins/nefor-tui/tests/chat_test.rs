@@ -1881,6 +1881,54 @@ fn slash_think_emits_reasoning_effort_set() {
 }
 
 #[test]
+fn slash_compact_renders_pending_entry_until_commit() {
+    let mut engine = Engine::new(100, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    submit_text(&mut engine, "/compact");
+
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("context compacting..."),
+        "/compact should show immediate pending feedback: {out:?}"
+    );
+
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "expected one compaction request");
+    assert_eq!(
+        emits[0].1.get("kind").and_then(|v| v.as_str()),
+        Some("chat.compaction.request")
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.compaction.commit",
+            "provider": "chatgpt",
+            "model": "gpt-5.5",
+            "trigger": "manual",
+            "display_summary": "Kept the important bits.",
+            "metadata": { "before_items": 7, "after_items": 2 },
+        }),
+    );
+
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("context compacted"),
+        "commit should replace the pending label: {out:?}"
+    );
+    assert!(
+        out.contains("Kept the important bits."),
+        "commit summary should be rendered: {out:?}"
+    );
+    assert!(
+        !out.contains("context compacting..."),
+        "pending compaction entry should be replaced, not duplicated: {out:?}"
+    );
+}
+
+#[test]
 fn typing_slash_keeps_cursor_after_slash() {
     // Regression: when the user typed `/` from an empty input, the
     // appearance of the slash autocomplete dropdown shifted main_column's

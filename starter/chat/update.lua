@@ -286,7 +286,16 @@ local function handle_input_submit(msg, state)
       trigger  = "manual",
       provider = state.provider,
     }
-    return shallow_merge(state, { input_value = "", completion = NIL_SENTINEL }), {
+    local next_state = transcript.push_entry(
+      shallow_merge(state, { input_value = "", completion = NIL_SENTINEL }),
+      Entry.compaction({
+        provider = state.provider,
+        model = state.model,
+        trigger = "manual",
+        status = "pending",
+      })
+    )
+    return next_state, {
       { kind = "send_to", target = "engine", body = body },
     }
   end
@@ -642,7 +651,7 @@ local function handle_plan_append(msg, state)
 end
 
 local function handle_compaction_commit(msg, state)
-  return transcript.push_entry(state, Entry.compaction({
+  local committed = Entry.compaction({
     chat_id = msg.chat_id,
     provider = msg.provider,
     model = msg.model,
@@ -651,7 +660,22 @@ local function handle_compaction_commit(msg, state)
     display_summary = msg.display_summary,
     model_context_artifact = msg.model_context_artifact,
     metadata = msg.metadata,
-  })), {}
+  })
+  local entries = {}
+  local replaced = false
+  for i = 1, #state.entries do entries[i] = state.entries[i] end
+  for i = #entries, 1, -1 do
+    local e = entries[i]
+    if type(e) == "table" and e.kind == "compaction" and e.status == "pending" then
+      entries[i] = committed
+      replaced = true
+      break
+    end
+  end
+  if replaced then
+    return shallow_merge(state, { entries = entries }), {}
+  end
+  return transcript.push_entry(state, committed), {}
 end
 
 local function handle_plan_approved(msg, state)
