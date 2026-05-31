@@ -36,6 +36,7 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 | Env var            | CLI flag       | Default                   | Holds      |
 | ------------------ | -------------- | ------------------------- | ---------- |
 | `NEFOR_DEV_DIR`    | —              | (unset)                   | dev repo root — when set, Lua searchers resolve `plugins/*/lua/` and `starter/` from here first |
+| `NEFOR_LOCAL_DIR`  | —              | (unset)                   | installed-config local checkout override — lets pm use an unpushed local repo instead of fetching GitHub |
 | `NEFOR_CONFIG_DIR` | `--config`     | `$XDG_CONFIG_HOME/nefor`  | `init.lua` |
 | `NEFOR_DATA_DIR`   | `--data-dir`   | `$XDG_DATA_HOME/nefor`    | sessions   |
 | `NEFOR_PLUGIN_DIR` | `--plugin-dir` | `$NEFOR_DATA_DIR/plugins` | binaries   |

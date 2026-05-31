@@ -9,9 +9,10 @@
 --
 -- Bootstrap order:
 --   1. NEFOR_DEV_DIR set     → in-checkout dev mode; resolve from there.
---   2. STARTER_ROOT/../lua/nefor-pm exists → in-checkout (running via
+--   2. NEFOR_LOCAL_DIR set   → local checkout override for installed configs.
+--   3. STARTER_ROOT/../lua/nefor-pm exists → in-checkout (running via
 --                                            `just run`); use ../lua etc.
---   3. otherwise             → sparse-clone amenocturne/nefor at the
+--   4. otherwise             → sparse-clone amenocturne/nefor at the
 --                              pinned ref into <DATA>/nefor/, use that.
 --
 -- Once the bootstrap picks NEFOR_ROOT, every pm.install entry resolves
@@ -20,6 +21,7 @@
 
 local STARTER_ROOT = NEFOR_CONFIG_DIR or "."
 local NEFOR_DEV_DIR = os.getenv("NEFOR_DEV_DIR")
+local NEFOR_LOCAL_DIR = os.getenv("NEFOR_LOCAL_DIR")
 
 -- Upstream ref derived from the engine's version. Exact release tags
 -- (e.g. 0.1.9 → v0.1.9) pin Lua libs to the matching binary version;
@@ -52,6 +54,17 @@ end
 
 local function sh_quote(s)
   return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
+local function valid_nefor_root(root)
+  return root and #root > 0 and path_exists(root .. "/lua/nefor-pm/init.lua")
+end
+
+local function explicit_nefor_root(env_name, root)
+  if not root or #root == 0 then return nil end
+  if valid_nefor_root(root) then return root end
+  error("nefor bootstrap: " .. env_name .. "=" .. root
+        .. " does not contain lua/nefor-pm/init.lua")
 end
 
 local function bootstrap_fetch_ref()
@@ -94,8 +107,10 @@ end
 -- Resolve NEFOR_ROOT — the directory whose `lua/` and `plugins/`
 -- mirror the github repo layout.
 local NEFOR_ROOT
-if NEFOR_DEV_DIR and #NEFOR_DEV_DIR > 0 then
-  NEFOR_ROOT = NEFOR_DEV_DIR
+local explicit_root = explicit_nefor_root("NEFOR_DEV_DIR", NEFOR_DEV_DIR)
+                   or explicit_nefor_root("NEFOR_LOCAL_DIR", NEFOR_LOCAL_DIR)
+if explicit_root then
+  NEFOR_ROOT = explicit_root
 elseif path_exists(STARTER_ROOT .. "/../lua/nefor-pm/init.lua") then
   NEFOR_ROOT = STARTER_ROOT .. "/.."
 else

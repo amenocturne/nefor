@@ -58,6 +58,7 @@ do
 
   local config_dir = os.getenv("NEFOR_CONFIG_DIR")
   local dev_dir    = os.getenv("NEFOR_DEV_DIR")
+  local local_dir  = os.getenv("NEFOR_LOCAL_DIR")
   local data_dir   = os.getenv("NEFOR_DATA_DIR")
   -- Bootstrap clone path (team consumers); mirrors how
   -- nefor.fs.data_root resolves $XDG_DATA_HOME/nefor or
@@ -75,6 +76,7 @@ do
 
   local tui_lua_dir = pick_dir("NEFOR_TUI_LUA_DIR", "/init.lua", table.pack(
     dev_dir    and (dev_dir    .. "/plugins/nefor-tui/lua") or nil,
+    local_dir  and (local_dir  .. "/plugins/nefor-tui/lua") or nil,
     pm_root    and (pm_root    .. "/plugins/nefor-tui/lua") or nil,
     config_dir and (config_dir .. "/../plugins/nefor-tui/lua") or nil,
     "./plugins/nefor-tui/lua",
@@ -94,6 +96,7 @@ do
   -- in-repo iteration.
   local chat_dir = pick_dir("NEFOR_STARTER_CHAT_DIR", "/common.lua", table.pack(
     dev_dir    and (dev_dir    .. "/starter/chat") or nil,
+    local_dir  and (local_dir  .. "/starter/chat") or nil,
     config_dir and (config_dir .. "/chat") or nil,
     pm_root    and (pm_root    .. "/starter/chat") or nil,
     "./starter/chat",
@@ -107,6 +110,7 @@ do
   local config_lua_dir = pick_dir("NEFOR_STARTER_CONFIG_DIR", "/config/init.lua", table.pack(
     chat_parent,
     dev_dir    and (dev_dir    .. "/starter") or nil,
+    local_dir  and (local_dir  .. "/starter") or nil,
     config_dir,
     pm_root    and (pm_root    .. "/starter") or nil,
     "./starter",
