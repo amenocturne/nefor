@@ -25,8 +25,7 @@ end
 local lead_role = require("lead-workflow.role")
 
 local team_roles = {
-  "explorer", "builder", "reviewer",
-  "tester", "critic", "reflector", "prompt-engineer", "docs",
+  "explorer", "worker", "reviewer", "docs", "critic",
 }
 
 for _, role in ipairs(team_roles) do

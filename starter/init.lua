@@ -49,6 +49,35 @@ local STARTER_ROOT  = NEFOR_CONFIG_DIR or "."
 local NEFOR_DEV_DIR = os.getenv("NEFOR_DEV_DIR")
 local SPARSE_CONE   = "lua starter plugins"
 
+local function read_env_value(path, key)
+  local f = io.open(path, "r")
+  if not f then return nil end
+  for line in f:lines() do
+    local k, v = line:match("^%s*([A-Za-z_][A-Za-z0-9_]*)%s*=%s*(.-)%s*$")
+    if k == key then
+      f:close()
+      return v
+    end
+  end
+  f:close()
+  return nil
+end
+
+local PINNED_ENV_PATH = STARTER_ROOT .. "/.env"
+local PINNED_NEFOR_VERSION = read_env_value(PINNED_ENV_PATH, "NEFOR_VERSION")
+if type(PINNED_NEFOR_VERSION) ~= "string" or PINNED_NEFOR_VERSION == "" then
+  PINNED_ENV_PATH = STARTER_ROOT .. "/../.env"
+  PINNED_NEFOR_VERSION = read_env_value(PINNED_ENV_PATH, "NEFOR_VERSION")
+end
+if type(PINNED_NEFOR_VERSION) ~= "string" or PINNED_NEFOR_VERSION == "" then
+  error("nefor-team startup: missing NEFOR_VERSION in " .. STARTER_ROOT .. "/.env or " .. STARTER_ROOT .. "/../.env; run `just sync` from the nefor-team repo")
+end
+if not nefor or nefor.version ~= PINNED_NEFOR_VERSION then
+  error("nefor-team startup: nefor version " .. tostring(nefor and nefor.version)
+        .. " does not match pinned NEFOR_VERSION=" .. PINNED_NEFOR_VERSION
+        .. "; run `just sync` from the nefor-team repo")
+end
+
 -- Lua 5.2+ returns (true|nil, "exit"|"signal", code); 5.1 returns the
 -- raw exit code. Normalise to a single bool so callers don't have to
 -- re-invoke os.execute to inspect the result.
@@ -421,7 +450,7 @@ tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
 
 -- Register lead-workflow BEFORE spawning tool-gate so the lead's
 -- bus subscription is live when tool-gate.hello arrives — otherwise
--- the advertise of dispatch-graph / write-review / await-approval
+-- the advertise of dispatch-graph / write-review
 -- is missed and the lead model gets "no such tool" at runtime.
 actor.spawn(require("lead-workflow"))
 

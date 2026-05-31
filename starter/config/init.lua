@@ -47,13 +47,10 @@ local DEFAULT_WORKFLOW = {
 local function all_roles(model)
   return {
     explorer            = model,
-    builder             = model,
+    worker              = model,
     reviewer            = model,
-    tester              = model,
-    critic              = model,
-    reflector           = model,
-    ["prompt-engineer"] = model,
     docs                = model,
+    critic              = model,
   }
 end
 
@@ -85,8 +82,8 @@ end
 -- of the product, not a per-environment knob.
 --
 -- Default stance: every tool in lead_role.TOOL_ALLOWLIST runs --auto
--- (read-only investigation tools never need a popup; writer sub-agents
--- inherit trust from the dispatch-graph approval). prompt_tools flips
+-- (read-only investigation tools never need a popup; worker/docs sub-agents
+-- inherit trust from the dispatch-graph plan approval). prompt_tools flips
 -- the two runtime gating points back to --prompt:
 --
 --   * dispatch-graph — fan-out gate. One click reviews the entire

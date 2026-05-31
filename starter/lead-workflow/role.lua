@@ -8,8 +8,7 @@
 --   * ORCHESTRATION_TOOLS — list of tool names the lead has access to.
 --   * TOOL_ALLOWLIST      — union fed to tool-gate's --prompt argv.
 --
--- The team port carries seven sub-agent roles (explorer, builder,
--- reviewer, tester, critic, reflector, prompt-engineer) plus per-role
+-- The team port carries five sub-agent roles (explorer, worker, reviewer, docs, critic) plus per-role
 -- model overrides drawn from cfg.workflow.role_models.
 --
 -- Prompts are read from disk rather than embedded as Lua string
@@ -68,25 +67,21 @@ local function model_for(role) return ROLE_MODELS[role] end
 M.LEAD_SYSTEM_PROMPT = load_or_placeholder("lead")
 
 -- Per-role boundaries:
---   * explorer        — read-only set + bash (da-gated, strict read-only
---                       policy). Auto-approved/denied, never prompts user.
---   * reviewer/critic/reflector — read-only (read_file + list_dir +
---                       search_text). No shell, no write.
---   * builder         — read-only set + write_file + bash (da-gated,
---                       normal policy). Approved commands auto-pass,
---                       rest prompt user.
---   * tester          — read-only set + bash.
---   * prompt-engineer — read-only set + write_file (no bash).
+--   * explorer        — read-only set (read_file + list_dir + search_text).
+--   * reviewer/critic — read-only set. No shell, no write.
+--   * worker          — general write-capable executor for approved work.
+--   * docs            — specialized write-capable documentation agent with
+--                       Jira/Confluence access.
 M.AGENT_CONFIGS = {
   explorer = {
     system_prompt  = load_or_placeholder("explorer"),
     model          = model_for("explorer"),
-    tool_allowlist = { "read_file", "list_dir", "search_text", "bash" },
+    tool_allowlist = { "read_file", "list_dir", "search_text" },
     read_only      = true,
   },
-  builder = {
-    system_prompt  = load_or_placeholder("builder"),
-    model          = model_for("builder"),
+  worker = {
+    system_prompt  = load_or_placeholder("worker"),
+    model          = model_for("worker"),
     tool_allowlist = { "read_file", "list_dir", "search_text", "write_file", "bash" },
     read_only      = false,
   },
@@ -96,10 +91,10 @@ M.AGENT_CONFIGS = {
     tool_allowlist = { "read_file", "list_dir", "search_text" },
     read_only      = true,
   },
-  tester = {
-    system_prompt  = load_or_placeholder("tester"),
-    model          = model_for("tester"),
-    tool_allowlist = { "read_file", "list_dir", "search_text", "bash" },
+  docs = {
+    system_prompt  = load_or_placeholder("docs"),
+    model          = model_for("docs"),
+    tool_allowlist = { "jira", "wiki", "read_file", "list_dir", "search_text", "write_file" },
     read_only      = false,
   },
   critic = {
@@ -108,37 +103,15 @@ M.AGENT_CONFIGS = {
     tool_allowlist = { "read_file", "list_dir", "search_text" },
     read_only      = true,
   },
-  reflector = {
-    system_prompt  = load_or_placeholder("reflector"),
-    model          = model_for("reflector"),
-    tool_allowlist = { "read_file", "list_dir", "search_text" },
-    read_only      = true,
-  },
-  ["prompt-engineer"] = {
-    system_prompt  = load_or_placeholder("prompt-engineer"),
-    model          = model_for("prompt-engineer"),
-    tool_allowlist = { "read_file", "list_dir", "search_text", "write_file" },
-    read_only      = false,
-  },
-  docs = {
-    system_prompt  = load_or_placeholder("docs"),
-    model          = model_for("docs"),
-    tool_allowlist = { "jira", "wiki", "read_file", "list_dir", "search_text" },
-    read_only      = true,
-  },
 }
 
 -- The lead does NOT get read/grep/find/ls/glob/write/edit/bash directly
--- — investigation goes through explorer nodes, changes through builder
--- nodes.
+-- — investigation goes through explorer nodes, changes through worker/docs nodes.
 M.ORCHESTRATION_TOOLS = {
   "read_file",
   "jira",
   "dispatch-graph",
   "write-review",
-  "progress",
-  "critique",
-  "terminate",
 }
 
 -- TOOL_ALLOWLIST — union of every role's tool surface plus the lead's
