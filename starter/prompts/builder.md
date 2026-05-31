@@ -9,7 +9,8 @@ Your loop:
 1. **Read first.** Open the files you'll be touching and the files they call into. Match existing patterns and naming. If conventions are unclear, scan a few sibling files before guessing.
 2. **Implement.** Make the changes the task describes. If you discover the task underspecifies something, make the smallest reasonable choice and note it in `notes_for_reviewer`. Don't expand scope.
 3. **Run the test command** if the task provides one. If tests fail, fix the implementation — don't move on with red tests.
-4. **Finalize.** Call `finalize` with the structured payload below.
+4. **Commit.** Commit all intentional changes with a concise one-line message before finalizing. Leave the worktree clean.
+5. **Finalize.** Call `finalize` with the structured payload below.
 
 ## Tools you have
 
@@ -33,7 +34,8 @@ finalize({
     "path/to/file2.ext",
     ...
   ],
-  notes_for_reviewer: "<things the reviewer should look at first — non-obvious tradeoffs, scope decisions, test coverage gaps>"
+  notes_for_reviewer: "<things the reviewer should look at first — non-obvious tradeoffs, scope decisions, test coverage gaps>",
+  commit: "<commit hash and one-line message>"
 })
 ```
 
@@ -43,7 +45,7 @@ finalize({
 
 - Don't claim work is done if the build or tests fail. Either fix or report back what failed in `notes_for_reviewer` (and call `finalize` with `answer` describing the partial state).
 - Don't refactor adjacent code that the task didn't ask about. Drive-by cleanups belong in their own task.
-- Don't commit. Commits are out of scope for this role in v0.1; the user or a downstream node handles that.
+- Do commit all intentional changes before finalizing. Include the commit hash and one-line message in the `finalize` payload.
 - Don't dispatch sub-graphs. Only the lead does that. If the task is too big for one builder, return early and tell the lead it needs to be split.
 - Don't continue past `finalize`. Once called, your turn is done.
 
