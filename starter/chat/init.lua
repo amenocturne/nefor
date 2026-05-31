@@ -91,13 +91,13 @@ do
   -- config dir; chat/ is a sibling of init.lua).
   -- Order matters: chat/* is the user-editable surface (the engine
   -- runs the copy at $NEFOR_CONFIG_DIR/chat/init.lua, and user edits
-  -- to sibling submodules should win). Prefer config_dir over the
-  -- pm-cloned upstream copy. NEFOR_DEV_DIR still wins overall for
+  -- to sibling submodules should win). Prefer config_dir over local or
+  -- pm-cloned upstream copies. NEFOR_DEV_DIR still wins overall for
   -- in-repo iteration.
   local chat_dir = pick_dir("NEFOR_STARTER_CHAT_DIR", "/common.lua", table.pack(
     dev_dir    and (dev_dir    .. "/starter/chat") or nil,
-    local_dir  and (local_dir  .. "/starter/chat") or nil,
     config_dir and (config_dir .. "/chat") or nil,
+    local_dir  and (local_dir  .. "/starter/chat") or nil,
     pm_root    and (pm_root    .. "/starter/chat") or nil,
     "./starter/chat",
     "../starter/chat"
@@ -108,10 +108,10 @@ do
 
   local chat_parent = chat_dir:match("^(.*)/chat$")
   local config_lua_dir = pick_dir("NEFOR_STARTER_CONFIG_DIR", "/config/init.lua", table.pack(
-    chat_parent,
     dev_dir    and (dev_dir    .. "/starter") or nil,
-    local_dir  and (local_dir  .. "/starter") or nil,
     config_dir,
+    local_dir  and (local_dir  .. "/starter") or nil,
+    chat_parent,
     pm_root    and (pm_root    .. "/starter") or nil,
     "./starter",
     "../starter"
