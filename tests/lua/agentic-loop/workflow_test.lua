@@ -299,12 +299,11 @@ do
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "second" })
   local calls = decode_calls()
   local echo = find_call(calls, "chat.message.append", "user", "second")
-  assert(echo ~= nil,
-    "queued submit must still echo a chat.message.append role=user")
+  assert_eq(echo, nil,
+    "busy queued submit must not echo a chat.message.append role=user")
   local queued_note = find_call(calls, "chat.message.append", "system", "queued")
-  assert(queued_note ~= nil,
-    "queued submit must surface a [queued ...] system message; got " ..
-    json.encode(calls))
+  assert_eq(queued_note, nil,
+    "busy queued submit must not surface a [queued ...] system message")
   local busy_msg = find_call(calls, "chat.message.append", "system", "orchestrator busy")
   assert_eq(busy_msg, nil,
     "the rejected '[orchestrator busy ...]' must no longer appear")

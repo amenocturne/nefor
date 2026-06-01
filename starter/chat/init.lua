@@ -173,6 +173,7 @@ local function initial_state()
     popup            = nil,
     stats            = {},
     pending          = false,
+    pending_followups = "",
     turn_started_at  = nil,
     last_turn_duration_ms = nil,
     model            = cfg.default_model,

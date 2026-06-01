@@ -98,6 +98,16 @@ function M.compact(list)
   return out
 end
 
+function M.join_nonempty(parts, sep)
+  local out = {}
+  for _, part in ipairs(parts or {}) do
+    if type(part) == "string" and #part > 0 then
+      out[#out + 1] = part
+    end
+  end
+  return table.concat(out, sep or "\n")
+end
+
 -- Pretty-print a Lua table as 2-space-indented JSON-ish text. Used by
 -- the tool expanded view to render structured `input` payloads.
 -- Strings are quoted, numbers and booleans render verbatim, nested

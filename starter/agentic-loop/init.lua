@@ -454,16 +454,6 @@ local function handle_chat_input_submit(body)
 
   if state.current_run_id ~= nil then
     state.pending_user_inputs[#state.pending_user_inputs + 1] = text
-    emit("nefor-tui", {
-      kind = "chat.message.append",
-      role = "user",
-      text = text,
-    })
-    emit("nefor-tui", {
-      kind = "chat.message.append",
-      role = "system",
-      text = "[queued — will dispatch when current run completes]",
-    })
     return
   end
 

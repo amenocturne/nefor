@@ -302,6 +302,80 @@ fn typing_and_enter_emits_chat_input_submit() {
 }
 
 #[test]
+fn busy_plain_text_buffers_until_stream_end() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    submit_text(&mut engine, "first");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    submit_text(&mut engine, "second");
+    let _ = render_str(&mut engine);
+    submit_text(&mut engine, "third");
+    let emits = engine.take_emit_queue();
+    assert!(
+        emits.is_empty(),
+        "busy follow-ups must not emit immediately: {emits:?}"
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("queued follow-up") && out.contains("second") && out.contains("third"),
+        "pending follow-up widget should render above prompt: {out:?}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
+    );
+    let emits = engine.take_emit_queue();
+    assert_eq!(
+        emits.len(),
+        1,
+        "stream end should emit exactly one buffered submit"
+    );
+    let (target_hint, body) = &emits[0];
+    assert_eq!(target_hint.as_deref(), Some("engine"));
+    assert_eq!(
+        body.get("kind").and_then(|v| v.as_str()),
+        Some("chat.input.submit")
+    );
+    assert_eq!(
+        body.get("text").and_then(|v| v.as_str()),
+        Some("second\nthird")
+    );
+}
+
+#[test]
+fn interrupt_moves_pending_followups_back_to_prompt() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    submit_text(&mut engine, "first");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+
+    submit_text(&mut engine, "queued");
+    type_text(&mut engine, "draft");
+    let _ = engine.take_emit_queue();
+    engine.handle_key(key("escape")).expect("escape");
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "interrupt emit");
+    assert_eq!(
+        emits[0].1.get("kind").and_then(|v| v.as_str()),
+        Some("chat.interrupt")
+    );
+
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("queued follow-up") && out.contains("queued") && out.contains("draft"),
+        "interrupt should clear widget and restore queued text before draft in prompt: {out:?}"
+    );
+}
+
+#[test]
 fn absolute_path_submit_is_plain_chat_not_slash_command() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");

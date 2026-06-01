@@ -21,6 +21,7 @@ local height_cache = require("chat.height_cache")
 local shallow_merge = common.shallow_merge
 local NIL_SENTINEL  = common.NIL_SENTINEL
 local format_args   = common.format_args
+local join_nonempty = common.join_nonempty
 
 local M = {}
 
@@ -130,6 +131,7 @@ local function handle_input_submit(msg, state)
     local cleared = shallow_merge(state, {
       entries = {}, in_flight = NIL_SENTINEL, input_value = "",
       pending = false, completion = NIL_SENTINEL,
+      pending_followups = "",
       dag_runs = {}, firing_to_node = {},
       turn_started_at = NIL_SENTINEL,
       last_turn_duration_ms = NIL_SENTINEL,
@@ -306,6 +308,7 @@ local function handle_input_submit(msg, state)
         input_value = "", completion = NIL_SENTINEL,
         entries = {}, in_flight = NIL_SENTINEL,
         pending = false, dag_runs = {}, firing_to_node = {},
+        pending_followups = "",
         turn_started_at = NIL_SENTINEL,
         last_turn_duration_ms = NIL_SENTINEL,
         queued_entry_idx = NIL_SENTINEL,
@@ -339,35 +342,16 @@ local function handle_input_submit(msg, state)
   end
   history.persist(hist)
 
-  -- When a turn is already in flight, coalesce into a single queued
-  -- entry instead of pushing a new user bubble per message.
+  -- While a turn is already in flight, buffer plain-text follow-ups
+  -- locally. They are submitted as one combined turn when the current
+  -- lead turn finishes.
   if state.pending or state.in_flight ~= nil then
-    local next_state
-    if state.queued_entry_idx then
-      local old = state.entries[state.queued_entry_idx]
-      local combined = Entry.set_text(old, old.text .. "\n" .. wire_text)
-      local new_entries = {}
-      for ei = 1, #state.entries do
-        new_entries[ei] = (ei == state.queued_entry_idx) and combined or state.entries[ei]
-      end
-      next_state = shallow_merge(state, {
-        entries = new_entries,
-        input_value = "", completion = NIL_SENTINEL,
-        prompt_history = hist, history_cursor = NIL_SENTINEL,
-      })
-    else
-      local with_user = transcript.push_entry(state, Entry.user(wire_text))
-      next_state = shallow_merge(with_user, {
-        input_value = "", completion = NIL_SENTINEL,
-        prompt_history = hist, history_cursor = NIL_SENTINEL,
-        queued_entry_idx = #with_user.entries,
-      })
-    end
-    tui.scroll_into_view("transcript")
-    return next_state, {
-      { kind = "send_to", target = "engine",
-        body = { kind = "chat.input.submit", text = wire_text } },
-    }
+    local pending_followups = join_nonempty({ state.pending_followups, wire_text }, "\n")
+    return shallow_merge(state, {
+      input_value = "", completion = NIL_SENTINEL,
+      prompt_history = hist, history_cursor = NIL_SENTINEL,
+      pending_followups = pending_followups,
+    }), {}
   end
 
   local with_user = transcript.push_entry(state, Entry.user(wire_text))
@@ -449,7 +433,12 @@ local function handle_escape(_msg, state)
   local now = tui.now_ms()
   if state.last_esc_ms and (now - state.last_esc_ms) <= DOUBLE_ESC_MS then
     local interrupted = dag.interrupt_all(state, now)
-    return shallow_merge(interrupted, { last_esc_ms = NIL_SENTINEL }), {
+    local prompt = join_nonempty({ state.pending_followups, state.input_value }, "\n")
+    return shallow_merge(interrupted, {
+      last_esc_ms = NIL_SENTINEL,
+      input_value = prompt,
+      pending_followups = "",
+    }), {
       { kind = "send_to", target = "engine",
         body = { kind = "chat.interrupt_all" } },
     }
@@ -457,7 +446,12 @@ local function handle_escape(_msg, state)
   -- 4) single ESC interrupts the current turn
   if state.pending or state.in_flight ~= nil then
     local interrupted = dag.interrupt_all(state, now)
-    return shallow_merge(interrupted, { last_esc_ms = now }), {
+    local prompt = join_nonempty({ state.pending_followups, state.input_value }, "\n")
+    return shallow_merge(interrupted, {
+      last_esc_ms = now,
+      input_value = prompt,
+      pending_followups = "",
+    }), {
       { kind = "send_to", target = "engine",
         body = { kind = "chat.interrupt" } },
     }
@@ -472,6 +466,7 @@ local function handle_session_end(_msg, state)
   return shallow_merge(state, {
     in_flight        = NIL_SENTINEL,
     pending          = false,
+    pending_followups = "",
     turn_started_at  = NIL_SENTINEL,
     last_turn_duration_ms = NIL_SENTINEL,
     popup            = NIL_SENTINEL,
@@ -494,7 +489,7 @@ local function handle_replay_end(_msg, state)
 end
 
 local function handle_chat_reset(_msg, state)
-  return state, {}
+  return shallow_merge(state, { pending_followups = "" }), {}
 end
 
 -- ── inbound chat-contract events ──────────────────────────────────────
@@ -572,14 +567,23 @@ end
 
 local function handle_stream_end(msg, state)
   local next_state = transcript.finalize_assistant(state, msg.text, msg.model, msg.duration_ms)
-  if state.queued_entry_idx then
-    local qe = next_state.entries[state.queued_entry_idx]
-    next_state = shallow_merge(next_state, {
-      queued_entry_idx = NIL_SENTINEL,
-      pending_user_echo = qe and qe.text or NIL_SENTINEL,
-    })
+  local followup = state.pending_followups or ""
+  if #followup == 0 then
+    return next_state, {}
   end
-  return next_state, {}
+
+  local with_user = transcript.push_entry(next_state, Entry.user(followup))
+  local started = shallow_merge(with_user, {
+    pending = true,
+    turn_started_at = tui.now_ms(),
+    pending_followups = "",
+    pending_user_echo = followup,
+  })
+  tui.scroll_into_view("transcript")
+  return started, {
+    { kind = "send_to", target = "engine",
+      body = { kind = "chat.input.submit", text = followup } },
+  }
 end
 
 local function handle_reasoning_delta(msg, state)
@@ -1138,6 +1142,7 @@ local function route_keys_and_popups(msg, state)
           popup = NIL_SENTINEL,
           entries = {}, in_flight = NIL_SENTINEL,
           pending = false, dag_runs = {}, firing_to_node = {},
+          pending_followups = "",
           turn_started_at = NIL_SENTINEL,
           last_turn_duration_ms = NIL_SENTINEL,
           queued_entry_idx = NIL_SENTINEL,
