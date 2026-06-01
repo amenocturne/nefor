@@ -3160,6 +3160,39 @@ fn session_picker_lists_recent_sessions_with_preview() {
 }
 
 #[test]
+fn session_picker_skips_empty_recent_sessions_until_it_finds_resumable_ones() {
+    let env = ResumeEnv::new();
+    env.write_session(
+        "11111111-1111-1111-1111-111111111111",
+        "2026-05-01T10:00:00.000Z",
+        Some("older real prompt"),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    for i in 0..10 {
+        env.write_session(
+            &format!("empty0000-0000-0000-0000-00000000000{i}"),
+            "2026-05-02T10:00:00.000Z",
+            None,
+        );
+    }
+
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    for ch in "/resume".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let out = render_str(&mut engine);
+
+    assert!(
+        out.contains("older real prompt"),
+        "picker should scan past empty newest sessions: {out:?}"
+    );
+}
+
+#[test]
 fn resume_keeps_tui_alive() {
     // Picker selection must NOT terminate the TUI process. Instead it
     // emits a `sessions.resume_request { session_id }` envelope onto the

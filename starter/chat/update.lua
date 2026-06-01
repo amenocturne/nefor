@@ -313,7 +313,7 @@ local function handle_input_submit(msg, state)
         sessions.emit_resume_request(id),
       }
     end
-    local rows = sessions.list_recent(10)
+    local rows = sessions.list_recent()
     return shallow_merge(state, {
       input_value = "", completion = NIL_SENTINEL,
       popup = {

@@ -77,15 +77,15 @@ fn jsonl_excludes_session_control_events() {
                 payload = json.encode({ type = "event", body = body }),
             }
         end
-        -- Normal traffic — must be persisted.
-        sessions_test._persist_envelope(entry("ollama", { kind = "chat.message.append", role = "user", text = "hi" }))
+        -- User submit opens the lazy session file.
+        sessions_test._persist_envelope(entry("nefor-tui", { kind = "chat.input.submit", text = "hello" }))
         -- Session control event — must be DROPPED.
         sessions_test._persist_envelope(entry("engine", { kind = "sessions.resume_request", session_id = "x" }))
         sessions_test._persist_envelope(entry("engine", { kind = "sessions.session_end", session_id = "x" }))
         sessions_test._persist_envelope(entry("engine", { kind = "sessions.session_start", session_id = "y" }))
         sessions_test._persist_envelope(entry("engine", { kind = "sessions.resume_done", session_id = "y" }))
         -- Another normal entry.
-        sessions_test._persist_envelope(entry("nefor-tui", { kind = "chat.input.submit", text = "hello" }))
+        sessions_test._persist_envelope(entry("ollama", { kind = "chat.message.append", role = "user", text = "hi" }))
         "#,
     )
     .exec()
@@ -107,16 +107,16 @@ fn jsonl_excludes_session_control_events() {
         "header line missing: {}",
         lines[0]
     );
-    // Two retained entries — the chat.message.append and the
-    // chat.input.submit, in append order.
+    // Two retained entries — the chat.input.submit and the
+    // chat.message.append, in append order.
     assert!(
-        lines[1].contains("chat.message.append"),
-        "first non-header entry should be chat.message.append: {}",
+        lines[1].contains("chat.input.submit"),
+        "first non-header entry should be chat.input.submit: {}",
         lines[1]
     );
     assert!(
-        lines[2].contains("chat.input.submit"),
-        "second non-header entry should be chat.input.submit: {}",
+        lines[2].contains("chat.message.append"),
+        "second non-header entry should be chat.message.append: {}",
         lines[2]
     );
     // Belt-and-braces: confirm no sessions.* string snuck through.
@@ -327,11 +327,11 @@ fn resume_emits_lifecycle_markers_in_order() {
 fn shutdown_prunes_truly_empty_session_preserves_session_with_any_envelope() {
     // Picker-clutter cleanup: a session that boots and quits without
     // any envelope being persisted has nothing worth keeping, so it's
-    // deleted on shutdown. Once any envelope lands in the jsonl, the
-    // session is preserved.
+    // deleted on shutdown. Startup-only traffic never creates the jsonl;
+    // the file appears only once a real user submit lands.
     //
-    //   (a) no envelopes persisted → pruned.
-    //   (b) at least one envelope persisted → preserved.
+    //   (a) no user submit → no file.
+    //   (b) at least one user submit → preserved.
     let tempdir = tempfile::tempdir().expect("tempdir");
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let prev = std::env::var("NEFOR_DATA_DIR").ok();
@@ -356,8 +356,8 @@ fn shutdown_prunes_truly_empty_session_preserves_session_with_any_envelope() {
             .eval()
             .expect("current_path");
         assert!(
-            std::path::Path::new(&path).exists(),
-            "session file should exist before shutdown: {path}"
+            !std::path::Path::new(&path).exists(),
+            "startup must not create a session file: {path}"
         );
         lua.load(r#"sessions_test._on_engine_shutdown(nil)"#)
             .exec()
@@ -368,7 +368,7 @@ fn shutdown_prunes_truly_empty_session_preserves_session_with_any_envelope() {
         );
     }
 
-    // (b) session with at least one persisted envelope.
+    // (b) session with at least one user submit.
     {
         let lua = Lua::new();
         install_stub_nefor(&lua).expect("install nefor stub");
@@ -381,8 +381,8 @@ fn shutdown_prunes_truly_empty_session_preserves_session_with_any_envelope() {
             local json = nefor.json
             sessions_test._persist_envelope({
                 ts      = "2026-05-04T00:00:00.000Z",
-                origin  = "nefor-combinators",
-                payload = json.encode({ type = "event", body = { kind = "combinators.hello" } }),
+                origin  = "nefor-tui",
+                payload = json.encode({ type = "event", body = { kind = "chat.input.submit", text = "hello" } }),
             })
             "#,
         )
@@ -397,7 +397,7 @@ fn shutdown_prunes_truly_empty_session_preserves_session_with_any_envelope() {
             .expect("drive shutdown");
         assert!(
             std::path::Path::new(&path).exists(),
-            "session with any persisted envelope must be preserved on shutdown: {path}"
+            "session with a user submit must be preserved on shutdown: {path}"
         );
     }
 
@@ -417,8 +417,8 @@ fn new_mints_fresh_session_and_prunes_empty_outgoing() {
     // `sessions.new_request` bus event) — mints a fresh id, runs the
     // resume lifecycle (end → swap → start → resume_done), and prunes
     // the outgoing file when it had no submits. We assert (a) the id
-    // changed, (b) the new file exists with a header, (c) the empty
-    // outgoing file is gone.
+    // changed, (b) neither the empty outgoing nor fresh idle session
+    // leaves a file behind.
     let tempdir = tempfile::tempdir().expect("tempdir");
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let prev = std::env::var("NEFOR_DATA_DIR").ok();
@@ -447,8 +447,8 @@ fn new_mints_fresh_session_and_prunes_empty_outgoing() {
         .eval()
         .expect("boot path");
     assert!(
-        std::path::Path::new(&boot_path).exists(),
-        "boot session file should exist"
+        !std::path::Path::new(&boot_path).exists(),
+        "boot session file should not exist before a submit"
     );
 
     // Drive `/new` via the bus listener entry point so the test
@@ -467,8 +467,8 @@ fn new_mints_fresh_session_and_prunes_empty_outgoing() {
         .expect("new path");
     assert_ne!(boot_id, new_id, "/new must mint a fresh id");
     assert!(
-        std::path::Path::new(&new_path).exists(),
-        "new session file should exist after /new"
+        !std::path::Path::new(&new_path).exists(),
+        "new idle session should not create a file before a submit"
     );
     assert!(
         !std::path::Path::new(&boot_path).exists(),
@@ -721,8 +721,8 @@ fn resume_to_nonexistent_session_succeeds_with_zero_replayed() {
         .eval()
         .expect("current_path");
     assert!(
-        std::path::Path::new(&new_path).exists(),
-        "fresh file should exist with header at {new_path}"
+        !std::path::Path::new(&new_path).exists(),
+        "missing resume target must not create an empty file at {new_path}"
     );
 
     let payload: Option<String> = lua
@@ -833,18 +833,22 @@ fn new_then_new_prunes_each_empty_predecessor() {
     .expect("triple-new");
 
     let sessions_dir = tempdir.path().join("sessions");
-    let mut entries: Vec<_> = std::fs::read_dir(&sessions_dir)
-        .expect("read sessions dir")
-        .filter_map(|r| r.ok())
-        .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
-        .collect();
+    let mut entries: Vec<_> = if sessions_dir.exists() {
+        std::fs::read_dir(&sessions_dir)
+            .expect("read sessions dir")
+            .filter_map(|r| r.ok())
+            .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
+            .collect()
+    } else {
+        Vec::new()
+    };
     entries.sort_by_key(|e| e.path());
-    // Only the latest active session file should remain — three
-    // predecessors must have been pruned.
+    // No active file should exist yet: repeated `/new` without a submit
+    // must not create startup-only stubs.
     assert_eq!(
         entries.len(),
-        1,
-        "expected one active session file, got {}: {:?}",
+        0,
+        "expected no session files, got {}: {:?}",
         entries.len(),
         entries.iter().map(|e| e.path()).collect::<Vec<_>>(),
     );
@@ -897,8 +901,8 @@ fn new_after_submit_preserves_prior_session() {
         "session with prior submit must survive /new: {boot_path}"
     );
     assert!(
-        std::path::Path::new(&new_path).exists(),
-        "/new must open a fresh file: {new_path}"
+        !std::path::Path::new(&new_path).exists(),
+        "/new must not open a fresh file until the next submit: {new_path}"
     );
     assert_ne!(boot_path, new_path, "/new must mint a different id");
 

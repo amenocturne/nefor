@@ -120,7 +120,6 @@ function M.list_recent(limit)
   if pipe == nil then return {} end
   local sessions = {}
   for fname in pipe:lines() do
-    if #sessions >= limit then break end
     local id = fname:match("^([%w%-]+)%.jsonl$")
     if id ~= nil then
       sessions[#sessions + 1] = { id = id, path = dir .. "/" .. fname }
@@ -131,8 +130,12 @@ function M.list_recent(limit)
   -- line-by-line and stop at the first chat.input.submit hit so
   -- multi-megabyte sessions don't slurp the whole file.
   -- Sessions with no user submits are empty — drop them from the list.
+  -- Keep scanning past empty startup-only logs until we have `limit`
+  -- resumable rows; otherwise a burst of fresh empty sessions hides
+  -- older real conversations.
   local enriched = {}
   for _, s in ipairs(sessions) do
+    if limit ~= nil and #enriched >= limit then break end
     local fh = io.open(s.path, "r")
     if fh ~= nil then
       local header_line = fh:read("*l") or ""

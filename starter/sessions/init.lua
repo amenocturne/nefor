@@ -56,8 +56,8 @@ local state = {
   current_session_file = nil,
 
   -- True when the active session has nothing worth keeping; flipped
-  -- false when (a) the file is opened on a non-empty pre-existing
-  -- file, or (b) any envelope is persisted to it.
+  -- false when a real user submit is persisted. Startup-only sessions
+  -- never open a file, so crashes/restarts do not leave empty logs.
   should_prune_session = true,
 
   initialised = false,
@@ -161,6 +161,34 @@ local function close_and_prune_if_empty()
   state.should_prune_session = true
 end
 
+local function session_file_exists(path)
+  local fh = io.open(path, "r")
+  if fh then
+    fh:close()
+    return true
+  end
+  return false
+end
+
+local function ensure_current_session_file()
+  if state.current_session_file then return state.current_session_file end
+  if not state.current_session_path then return nil end
+  if SESSIONS_DIR then ensure_dir(SESSIONS_DIR) end
+  local fh, err, had_content =
+      open_session_file(state.current_session_path, state.current_session_id)
+  if not fh then
+    if nefor.log then
+      nefor.log.error("sessions: failed to open session file", {
+        path = state.current_session_path, error = err,
+      })
+    end
+    return nil
+  end
+  state.current_session_file = fh
+  state.should_prune_session = not had_content
+  return fh
+end
+
 -- send_msg — translate plugin-internal output to wire envelope, emit.
 ---@param internal table
 local function send_msg(internal)
@@ -183,8 +211,6 @@ end
 -- Persistence — write each non-control envelope verbatim to jsonl.
 ---@param entry { ts: string?, origin: string?, target: string?, payload: string }
 local function persist_envelope(entry)
-  if not state.current_session_file then return end
-
   -- Drop everything inside the replay window. Pure-Lua actors process
   -- replayed envelopes (via bus.on_event) and may emit derived ones —
   -- persisting those would duplicate state on next resume. The window
@@ -201,6 +227,15 @@ local function persist_envelope(entry)
     if type(kind) == "string" and kind:sub(1, 9) == "sessions." then return end
   end
 
+  local is_user_submit = ok
+      and type(decoded) == "table"
+      and type(decoded.body) == "table"
+      and decoded.body.kind == "chat.input.submit"
+
+  if not state.current_session_file and not is_user_submit then return end
+  local fh = ensure_current_session_file()
+  if not fh then return end
+
   local row = {
     ts      = entry.ts or nefor.engine.now(),
     origin  = entry.origin or "unknown",
@@ -208,11 +243,13 @@ local function persist_envelope(entry)
   }
   if entry.target then row.target = entry.target end
 
-  state.current_session_file:write(json.encode(row))
-  state.current_session_file:write("\n")
-  state.current_session_file:flush()
+  fh:write(json.encode(row))
+  fh:write("\n")
+  fh:flush()
 
-  state.should_prune_session = false
+  if is_user_submit then
+    state.should_prune_session = false
+  end
 end
 
 -- Resume — re-broadcast every step-origin entry to its original target.
@@ -309,11 +346,10 @@ local function do_resume(target_session_id)
   -- 2. Swap state.
   close_and_prune_if_empty()
   local new_path = session_path_for(target_session_id)
-  if new_path then ensure_dir(SESSIONS_DIR) end
   state.current_session_id   = target_session_id
   state.current_session_path = new_path
 
-  if new_path then
+  if new_path and session_file_exists(new_path) then
     local fh, err, had_content = open_session_file(new_path, target_session_id)
     if not fh and nefor.log then
       nefor.log.error("sessions.resume: failed to open session file", {
@@ -422,20 +458,11 @@ local function do_init(resume_id)
 
   local id = uuid_v4()
   local path = session_path_for(id)
-  if path then ensure_dir(SESSIONS_DIR) end
 
   state.current_session_id   = id
   state.current_session_path = path
-  if path then
-    local fh, err, had_content = open_session_file(path, id)
-    if not fh and nefor.log then
-      nefor.log.error("sessions.init: failed to open session file", {
-        path = path, error = err,
-      })
-    end
-    state.current_session_file = fh
-    state.should_prune_session = not had_content
-  end
+  state.current_session_file = nil
+  state.should_prune_session = true
 
   send_msg({ kind = "control", event = "sessions.session_start",
              extra = { session_id = id } })
