@@ -93,8 +93,9 @@ async fn run() -> Result<(), CombinatorsError> {
     let pending: Arc<Mutex<HashMap<InternalId, PendingSlot>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    // Built-in registration: tool_split.
+    // Built-in registrations: tool_split and retry_split.
     install_builtin_tool_split(&registry).await;
+    install_builtin_retry_split(&registry).await;
 
     run_dispatch_loop(&registry, &pending, &out_tx, &mut in_rx).await?;
 
@@ -500,6 +501,22 @@ async fn handle_invoke(
                     return Ok(());
                 }
             },
+            RETRY_SPLIT_HANDLER => match synthesise_retry_split(&req) {
+                Ok(o) => o,
+                Err(msg) => {
+                    send_event(
+                        out_tx,
+                        caller_error_body(
+                            caller,
+                            Some(&req.caller_id),
+                            ErrorCode::HandlerError,
+                            &msg,
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            },
             // Future built-ins land here; for now any other bare name owned
             // by us is a bug.
             other => {
@@ -686,6 +703,114 @@ fn synthesise_tool_split(req: &InvokeRequest) -> Result<Vec<TypedOutput>, String
             },
         ])
     }
+}
+
+// ---- Built-in `retry_split` ------------------------------------------------
+
+/// Bare handler name for the `retry_split` built-in.
+const RETRY_SPLIT_HANDLER: &str = "retry_split";
+
+const GENERIC_CONTROL_NS: &str = "generic-control";
+const RETRY_DECISION_NAME: &str = "RetryDecision";
+const RETRY_BRANCH_NAME: &str = "Retry";
+const PASS_BRANCH_NAME: &str = "Pass";
+const EXHAUSTED_BRANCH_NAME: &str = "Exhausted";
+
+async fn install_builtin_retry_split(registry: &Arc<Mutex<Registry>>) {
+    let decision = FullyQualifiedType {
+        plugin: GENERIC_CONTROL_NS.to_owned(),
+        name: RETRY_DECISION_NAME.to_owned(),
+    };
+    let retry = FullyQualifiedType {
+        plugin: GENERIC_CONTROL_NS.to_owned(),
+        name: RETRY_BRANCH_NAME.to_owned(),
+    };
+    let pass = FullyQualifiedType {
+        plugin: GENERIC_CONTROL_NS.to_owned(),
+        name: PASS_BRANCH_NAME.to_owned(),
+    };
+    let exhausted = FullyQualifiedType {
+        plugin: GENERIC_CONTROL_NS.to_owned(),
+        name: EXHAUSTED_BRANCH_NAME.to_owned(),
+    };
+    let handler = FullyQualifiedKind {
+        plugin: PASS_THROUGH_OWNER.to_owned(),
+        bare: RETRY_SPLIT_HANDLER.to_owned(),
+    };
+    let mut guard = registry.lock().await;
+    if let Err(e) = guard.install_builtin(
+        PASS_THROUGH_OWNER,
+        vec![TraitImpl::Fanout {
+            in_: decision,
+            outs: vec![retry, pass, exhausted],
+            handler,
+        }],
+    ) {
+        tracing::error!(error = %e, "failed to install built-in retry_split");
+    }
+}
+
+fn synthesise_retry_split(req: &InvokeRequest) -> Result<Vec<TypedOutput>, String> {
+    let input = req.inputs.first().cloned().unwrap_or(Value::Null);
+    let route = input
+        .get("route")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "retry_split input missing string `route`".to_owned())?;
+
+    let branch_value = input
+        .get("passthrough")
+        .cloned()
+        .or_else(|| input.get("input").cloned())
+        .unwrap_or_else(|| input.clone());
+
+    let mut retry_type = None;
+    let mut pass_type = None;
+    let mut exhausted_type = None;
+    for t in &req.identity.output_multiset {
+        if t.plugin == GENERIC_CONTROL_NS && t.name == RETRY_BRANCH_NAME {
+            retry_type = Some(t.clone());
+        } else if t.plugin == GENERIC_CONTROL_NS && t.name == PASS_BRANCH_NAME {
+            pass_type = Some(t.clone());
+        } else if t.plugin == GENERIC_CONTROL_NS && t.name == EXHAUSTED_BRANCH_NAME {
+            exhausted_type = Some(t.clone());
+        }
+    }
+    let retry_type =
+        retry_type.ok_or_else(|| "retry_split output missing Retry slot".to_owned())?;
+    let pass_type = pass_type.ok_or_else(|| "retry_split output missing Pass slot".to_owned())?;
+    let exhausted_type =
+        exhausted_type.ok_or_else(|| "retry_split output missing Exhausted slot".to_owned())?;
+
+    let retry_value = if route == "retry" {
+        branch_value.clone()
+    } else {
+        Value::Null
+    };
+    let pass_value = if route == "pass" {
+        branch_value.clone()
+    } else {
+        Value::Null
+    };
+    let exhausted_value = if route == "exhausted" {
+        branch_value
+    } else {
+        Value::Null
+    };
+
+    Ok(vec![
+        TypedOutput {
+            type_: retry_type,
+            value: retry_value,
+        },
+        TypedOutput {
+            type_: pass_type,
+            value: pass_value,
+        },
+        TypedOutput {
+            type_: exhausted_type,
+            value: exhausted_value,
+        },
+    ])
 }
 
 // ---- Reply forwarding -----------------------------------------------------
@@ -998,6 +1123,60 @@ mod tests {
             answer.value.get("text").and_then(Value::as_str),
             Some("Hi there.")
         );
+    }
+
+    #[test]
+    fn retry_split_emits_only_selected_branch() {
+        let req = InvokeRequest {
+            caller_id: "c".into(),
+            identity: Identity::new(
+                1,
+                fqt("generic-control", "RetryDecision"),
+                vec![
+                    fqt("generic-control", "Retry"),
+                    fqt("generic-control", "Pass"),
+                    fqt("generic-control", "Exhausted"),
+                ],
+            ),
+            inputs: vec![json!({
+                "route": "retry",
+                "passthrough": { "text": "try again" },
+            })],
+        };
+        let outs = synthesise_retry_split(&req).expect("ok");
+        let retry = outs
+            .iter()
+            .find(|o| o.type_.to_wire() == "generic-control.Retry")
+            .expect("retry slot");
+        let pass = outs
+            .iter()
+            .find(|o| o.type_.to_wire() == "generic-control.Pass")
+            .expect("pass slot");
+        let exhausted = outs
+            .iter()
+            .find(|o| o.type_.to_wire() == "generic-control.Exhausted")
+            .expect("exhausted slot");
+        assert_eq!(retry.value, json!({"text": "try again"}));
+        assert_eq!(pass.value, Value::Null);
+        assert_eq!(exhausted.value, Value::Null);
+    }
+
+    #[tokio::test]
+    async fn install_retry_split_succeeds_at_startup() {
+        let r: Arc<Mutex<Registry>> = Arc::new(Mutex::new(Registry::new()));
+        install_builtin_retry_split(&r).await;
+        let id = Identity::new(
+            1,
+            fqt("generic-control", "RetryDecision"),
+            vec![
+                fqt("generic-control", "Retry"),
+                fqt("generic-control", "Pass"),
+                fqt("generic-control", "Exhausted"),
+            ],
+        );
+        let guard = r.lock().await;
+        let owned = guard.lookup(&id).expect("retry_split registered");
+        assert_eq!(owned.handler.to_wire(), "nefor-combinators.retry_split");
     }
 
     #[tokio::test]

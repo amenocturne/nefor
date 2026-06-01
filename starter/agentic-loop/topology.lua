@@ -30,7 +30,7 @@ local M = {}
 --   final_answer  — fanout-out type tag for the terminal branch
 --   tool_calls    — fanout-out type tag for the tool-executor branch
 --
--- Returns the graph spec `{ nodes = {...}, edges = {...} }` ready to
+-- Returns the graph spec `{ terminal = "terminal", nodes = {...}, edges = {...} }` ready to
 -- send through `tool.invoke { name = "spawn_graph", args = { graph } }`.
 function M.build_orchestrator_graph(opts)
   opts = opts or {}
@@ -74,6 +74,7 @@ function M.build_orchestrator_graph(opts)
   end
 
   return {
+    terminal = "terminal",
     nodes = {
       {
         id       = "wrap",

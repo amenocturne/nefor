@@ -114,6 +114,10 @@ impl OnNodeFailure {
 /// Parsed and topology-validated graph (cycles allowed).
 #[derive(Debug, Clone)]
 pub struct Graph {
+    /// Graph-level terminal node. Exactly one output-producing node is
+    /// designated terminal; its result is the graph result returned to the
+    /// orchestrator/lead.
+    terminal: NodeId,
     /// Nodes keyed by id for O(1) lookup.
     nodes: HashMap<NodeId, Node>,
     /// Forward adjacency: `n` → nodes that depend on `n`.
@@ -138,6 +142,11 @@ impl Graph {
     /// All node ids, in submission order.
     pub fn ids_in_order(&self) -> &[NodeId] {
         &self.order
+    }
+
+    /// The graph-level terminal node id.
+    pub fn terminal(&self) -> &str {
+        &self.terminal
     }
 
     /// Nodes that depend on `id` (i.e. edges `id → x`).
@@ -282,6 +291,17 @@ pub fn parse_graph(graph_value: &Value) -> Result<Graph, String> {
         order.push(id);
     }
 
+    let terminal = obj
+        .get("terminal")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "`graph.terminal` is required (string node id)".to_owned())?
+        .to_owned();
+    if !nodes.contains_key(&terminal) {
+        return Err(format!(
+            "`graph.terminal` references unknown node id {terminal:?}"
+        ));
+    }
+
     let mut forward: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
     let mut reverse: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
     let mut out_edges: HashMap<NodeId, Vec<Edge>> = HashMap::new();
@@ -332,13 +352,54 @@ pub fn parse_graph(graph_value: &Value) -> Result<Graph, String> {
             .push(Edge { from, to, type_tag });
     }
 
-    Ok(Graph {
+    let mut undirected: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for id in &order {
+        undirected.entry(id.clone()).or_default();
+    }
+    for targets in forward.iter() {
+        let from = targets.0;
+        for to in targets.1 {
+            undirected.entry(from.clone()).or_default().push(to.clone());
+            undirected.entry(to.clone()).or_default().push(from.clone());
+        }
+    }
+    if !order.is_empty() {
+        let mut stack = vec![order[0].clone()];
+        let mut visited: HashSet<NodeId> = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            if let Some(neighbors) = undirected.get(&id) {
+                for n in neighbors {
+                    stack.push(n.clone());
+                }
+            }
+        }
+        if visited.len() != order.len() {
+            return Err("graph must be one connected directed graph; disconnected components are not allowed".to_owned());
+        }
+    }
+
+    let graph = Graph {
+        terminal,
         nodes,
         forward,
         reverse,
         out_edges,
         order,
-    })
+    };
+
+    for id in graph.ids_in_order() {
+        if id != graph.terminal() && !graph.is_reachable_forward(id, graph.terminal()) {
+            return Err(format!(
+                "node {id:?} has no route to graph.terminal {:?}",
+                graph.terminal()
+            ));
+        }
+    }
+
+    Ok(graph)
 }
 
 /// Parse a `{ "in": "<plugin>.<Type>", "out": ["<plugin>.<Type>", ...] }`
@@ -500,6 +561,7 @@ mod tests {
     #[test]
     fn parse_minimal_graph_with_one_node() {
         let v = json!({
+            "terminal": "n1",
             "nodes": [{"id": "n1", "reasoner": "r", "args": {"k": 1}}],
             "edges": []
         });
@@ -513,6 +575,7 @@ mod tests {
     #[test]
     fn parse_node_with_fanout_signature() {
         let v = json!({
+            "terminal": "n1",
             "nodes": [{
                 "id": "n1",
                 "reasoner": "openai-provider",
@@ -544,6 +607,7 @@ mod tests {
     #[test]
     fn parse_rejects_fanout_without_dot_in_in_type() {
         let v = json!({
+            "terminal": "n1",
             "nodes": [{
                 "id": "n1",
                 "reasoner": "r",
@@ -558,6 +622,7 @@ mod tests {
     #[test]
     fn parse_rejects_fanout_with_empty_out() {
         let v = json!({
+            "terminal": "n1",
             "nodes": [{
                 "id": "n1",
                 "reasoner": "r",
@@ -572,6 +637,7 @@ mod tests {
     #[test]
     fn parse_edge_with_type_tag() {
         let v = json!({
+            "terminal": "n2",
             "nodes": [
                 {"id": "n1", "reasoner": "r"},
                 {"id": "n2", "reasoner": "r"}
@@ -587,6 +653,7 @@ mod tests {
     #[test]
     fn parse_edge_without_type_tag_keeps_none() {
         let v = json!({
+            "terminal": "n2",
             "nodes": [
                 {"id": "n1", "reasoner": "r"},
                 {"id": "n2", "reasoner": "r"}
@@ -602,6 +669,7 @@ mod tests {
     #[test]
     fn parse_linear_chain() {
         let v = json!({
+            "terminal": "n3",
             "nodes": [
                 {"id": "n1", "reasoner": "r", "args": {}},
                 {"id": "n2", "reasoner": "r", "args": {}},
@@ -622,6 +690,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_id() {
         let v = json!({
+            "terminal": "n1",
             "nodes": [
                 {"id": "n1", "reasoner": "r", "args": {}},
                 {"id": "n1", "reasoner": "r", "args": {}}
@@ -635,6 +704,7 @@ mod tests {
     #[test]
     fn rejects_dangling_edge() {
         let v = json!({
+            "terminal": "n1",
             "nodes": [{"id": "n1", "reasoner": "r", "args": {}}],
             "edges": [{"from": "n1", "to": "missing"}]
         });
@@ -643,8 +713,30 @@ mod tests {
     }
 
     #[test]
+    fn rejects_missing_terminal() {
+        let v = json!({
+            "nodes": [{"id": "n1", "reasoner": "r", "args": {}}],
+            "edges": []
+        });
+        let err = parse_graph(&v).unwrap_err();
+        assert!(err.contains("graph.terminal"));
+    }
+
+    #[test]
+    fn rejects_unknown_terminal() {
+        let v = json!({
+            "terminal": "missing",
+            "nodes": [{"id": "n1", "reasoner": "r", "args": {}}],
+            "edges": []
+        });
+        let err = parse_graph(&v).unwrap_err();
+        assert!(err.contains("unknown node id"));
+    }
+
+    #[test]
     fn rejects_underscore_id_reserved_for_scheduler() {
         let v = json!({
+            "terminal": "_cycle",
             "nodes": [{"id": "_cycle", "reasoner": "r", "args": {}}],
             "edges": []
         });
@@ -657,6 +749,7 @@ mod tests {
         // Cycles (including 1-node self-loops) parse cleanly. The
         // scheduler no longer rejects cycles at submit.
         let v = json!({
+            "terminal": "n1",
             "nodes": [{"id": "n1", "reasoner": "r", "args": {}}],
             "edges": [{"from": "n1", "to": "n1"}]
         });
@@ -690,7 +783,7 @@ mod tests {
             "id": "r1",
             "name": "not_spawn_graph",
             "args": {
-                "graph": {"nodes": [{"id": "n1", "reasoner": "r"}], "edges": []}
+                "graph": {"terminal": "n1", "nodes": [{"id": "n1", "reasoner": "r"}], "edges": []}
             }
         });
         let err = parse_submission(body.as_object().unwrap()).unwrap_err();
@@ -709,7 +802,7 @@ mod tests {
             "name": "spawn_graph",
             "graph_id": "outer-run-xyz",
             "args": {
-                "graph": {"nodes": [{"id": "n1", "reasoner": "r"}], "edges": []}
+                "graph": {"terminal": "n1", "nodes": [{"id": "n1", "reasoner": "r"}], "edges": []}
             }
         });
         let sub = parse_submission(body.as_object().unwrap())

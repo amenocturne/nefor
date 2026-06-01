@@ -104,6 +104,21 @@ local state = {
 
 local SOURCE_NAME = "lead-workflow"
 
+local RETRY_FANOUT = {
+  ["in"] = "generic-control.RetryDecision",
+  out = {
+    "generic-control.Retry",
+    "generic-control.Pass",
+    "generic-control.Exhausted",
+  },
+}
+
+local RETRY_EDGE_TYPES = {
+  retry = "generic-control.Retry",
+  pass = "generic-control.Pass",
+  exhausted = "generic-control.Exhausted",
+}
+
 -- Look up `lead-workflow.role.AGENT_CONFIGS[role]`. Tolerates the role
 -- module not being loaded: returns nil instead of erroring at module
 -- load. Each call retries the require so a later install picks up.
@@ -131,43 +146,58 @@ local function emit_tool_result_err(firing_id, err)
   })
 end
 
--- Tool: dispatch-graph.
--- Validate that the role-keyed node spec has exactly one terminal
--- (sink) node — one node id that no other node lists in its
--- `dependencies`. Reasoner-graph treats the sole terminal node's result
--- as the graph's return value; without exactly one, that contract is
--- ambiguous (zero = cycle, more than one = no canonical result), so
--- dispatch-graph rejects at the lead-facing layer rather than letting
--- reasoner-graph receive an ill-shaped DAG. Reasoner-graph itself stays
--- a primitive — the role-aware shape is enforced here.
---
--- Returns nil on success, an error string on failure.
-local function validate_terminal_count(node_specs)
-  local has_successor = {}
-  for _, spec in ipairs(node_specs) do
-    if type(spec.dependencies) == "table" then
-      for _, dep_id in ipairs(spec.dependencies) do
-        has_successor[dep_id] = true
+local function spec_edges(spec)
+  local edges = {}
+  if type(spec.dependencies) == "table" then
+    for _, dep_id in ipairs(spec.dependencies) do
+      edges[#edges + 1] = { from = dep_id, to = spec.id }
+    end
+  end
+  if type(spec.routes) == "table" then
+    for route, target_id in pairs(spec.routes) do
+      if RETRY_EDGE_TYPES[route] ~= nil and type(target_id) == "string" and #target_id > 0 then
+        edges[#edges + 1] = {
+          from = spec.id,
+          to = target_id,
+          type = RETRY_EDGE_TYPES[route],
+        }
       end
     end
   end
+  return edges
+end
 
-  local sink_count = 0
+-- Tool: dispatch-graph.
+-- Validate that the role-keyed node spec designates exactly one explicit
+-- graph-level terminal node. Reasoner-graph treats that node's result as
+-- the graph's return value for the lead/orchestrator. The graph must be one
+-- connected directed graph; disconnected components and nodes with no route
+-- to the terminal are rejected at the lead-facing layer.
+local function validate_graph_shape(node_specs, terminal_id)
+  if type(terminal_id) ~= "string" or #terminal_id == 0 then
+    return "dispatch-graph: args.terminal must designate exactly one terminal node id"
+  end
+
+  local ids = {}
+  for _, spec in ipairs(node_specs) do ids[spec.id] = true end
+  if not ids[terminal_id] then
+    return "dispatch-graph: terminal references unknown node id `" .. tostring(terminal_id) .. "`"
+  end
+
   for _, spec in ipairs(node_specs) do
-    if not has_successor[spec.id] then sink_count = sink_count + 1 end
-  end
-  if sink_count == 0 then
-    return "dispatch-graph: graph has 0 terminal nodes — every node is "
-        .. "depended on by another. Likely cause: a cycle in dependencies. "
-        .. "Break the cycle, or move loop-guard logic into a single "
-        .. "counter-node graph."
+    if spec.role == "retry" and (type(spec.routes) ~= "table"
+        or type(spec.routes.retry) ~= "string"
+        or type(spec.routes.pass) ~= "string"
+        or type(spec.routes.exhausted) ~= "string") then
+      return "dispatch-graph: retry node `" .. tostring(spec.id) ..
+        "` requires routes = { retry = <node_id>, pass = <node_id>, exhausted = <node_id> }"
+    end
   end
 
-  -- Connectedness: each `dispatch-graph` call must be ONE connected DAG.
+  -- Connectedness: each `dispatch-graph` call must be ONE connected directed graph.
   -- Disconnected components = N independent tasks bundled into one run,
   -- which loses the UX wins of parallel sidebar rows + independent
   -- tool.result returns. Lead should call dispatch-graph N times instead.
-  -- Union-find over dependency edges; count distinct roots.
   local parent = {}
   for _, spec in ipairs(node_specs) do parent[spec.id] = spec.id end
   local function find(x)
@@ -178,13 +208,17 @@ local function validate_terminal_count(node_specs)
     return x
   end
   for _, spec in ipairs(node_specs) do
-    if type(spec.dependencies) == "table" then
-      for _, dep_id in ipairs(spec.dependencies) do
-        if parent[dep_id] ~= nil then
-          local a, b = find(spec.id), find(dep_id)
-          if a ~= b then parent[a] = b end
-        end
+    for _, edge in ipairs(spec_edges(spec)) do
+      if not ids[edge.from] then
+        return "dispatch-graph: node `" .. tostring(spec.id) ..
+          "` references unknown dependency/route source `" .. tostring(edge.from) .. "`"
       end
+      if not ids[edge.to] then
+        return "dispatch-graph: node `" .. tostring(spec.id) ..
+          "` references unknown dependency/route target `" .. tostring(edge.to) .. "`"
+      end
+      local a, b = find(edge.from), find(edge.to)
+      if a ~= b then parent[a] = b end
     end
   end
   local components = {}
@@ -194,8 +228,8 @@ local function validate_terminal_count(node_specs)
     components[r][#components[r] + 1] = spec.id
   end
   local component_strs = {}
-  for _, ids in pairs(components) do
-    component_strs[#component_strs + 1] = "[" .. table.concat(ids, ", ") .. "]"
+  for _, ids_in_component in pairs(components) do
+    component_strs[#component_strs + 1] = "[" .. table.concat(ids_in_component, ", ") .. "]"
   end
   if #component_strs > 1 then
     return string.format(
@@ -205,6 +239,30 @@ local function validate_terminal_count(node_specs)
       .. "the UI, and its result comes back independently. Combine "
       .. "nodes into one graph only when they share data dependencies.",
       #component_strs, table.concat(component_strs, " "))
+  end
+
+  local forward = {}
+  for _, spec in ipairs(node_specs) do forward[spec.id] = {} end
+  for _, spec in ipairs(node_specs) do
+    for _, edge in ipairs(spec_edges(spec)) do
+      if forward[edge.from] then forward[edge.from][#forward[edge.from] + 1] = edge.to end
+    end
+  end
+  for _, spec in ipairs(node_specs) do
+    if spec.id ~= terminal_id then
+      local stack, seen, reachable = { spec.id }, {}, false
+      while #stack > 0 do
+        local id = table.remove(stack)
+        if id == terminal_id then reachable = true; break end
+        if not seen[id] then
+          seen[id] = true
+          for _, next_id in ipairs(forward[id] or {}) do stack[#stack + 1] = next_id end
+        end
+      end
+      if not reachable then
+        return "dispatch-graph: node `" .. tostring(spec.id) .. "` has no route to terminal `" .. terminal_id .. "`"
+      end
+    end
   end
 
   return nil
@@ -219,12 +277,12 @@ end
 -- we fall back to passing the role straight through as an `agent`
 -- reasoner with the caller's `agent_args` only — the agent reasoner
 -- will fail the firing if `prompt` is missing.
-local function build_graph_spec(node_specs)
+local function build_graph_spec(node_specs, terminal_id)
   if type(node_specs) ~= "table" or #node_specs == 0 then
     return nil, "dispatch-graph: nodes list must be a non-empty array"
   end
 
-  -- First pass: per-spec well-formedness (id + role + agent_args.prompt).
+  -- First pass: per-spec well-formedness (id + role + role-specific args).
   -- Validate here so the model gets a clear, fast error instead of the
   -- agent reasoner's downstream "args.prompt must be a non-empty string"
   -- — which it sees only after the graph dispatches and an agent fires.
@@ -238,7 +296,21 @@ local function build_graph_spec(node_specs)
       return nil,
         "dispatch-graph: each node must carry { id: string, role: string }"
     end
-    if type(spec.agent_args) ~= "table"
+    if spec.role == "accumulate" then
+      -- No args required.
+    elseif spec.role == "retry" then
+      local args = type(spec.args) == "table" and spec.args or {}
+      if args.max_attempts ~= nil and tonumber(args.max_attempts) == nil then
+        return nil, "dispatch-graph: retry node `" .. spec.id ..
+          "` args.max_attempts must be numeric when provided"
+      end
+    elseif spec.role == "bash_command" then
+      local args = type(spec.args) == "table" and spec.args or {}
+      if type(args.command) ~= "string" or #args.command == 0 then
+        return nil, "dispatch-graph: bash_command node `" .. spec.id ..
+          "` requires args.command"
+      end
+    elseif type(spec.agent_args) ~= "table"
         or type(spec.agent_args.prompt) ~= "string"
         or #spec.agent_args.prompt == 0 then
       return nil, string.format(
@@ -252,7 +324,7 @@ local function build_graph_spec(node_specs)
   -- Structural: exactly one terminal node. Validated before translation
   -- so the error names role-level node ids the lead recognises, not
   -- post-translation reasoner-graph internals.
-  local terminal_err = validate_terminal_count(node_specs)
+  local terminal_err = validate_graph_shape(node_specs, terminal_id)
   if terminal_err then return nil, terminal_err end
 
   -- Resolve workspace root once; injected into every node's agent_args
@@ -269,50 +341,64 @@ local function build_graph_spec(node_specs)
   local nodes = {}
   local edges = {}
   for _, spec in ipairs(node_specs) do
-    local agent_args = {}
-    if type(spec.agent_args) == "table" then
-      for k, v in pairs(spec.agent_args) do agent_args[k] = v end
-    end
-    if workspace_cwd and agent_args.cwd == nil then
-      agent_args.cwd = workspace_cwd
-    end
+    local node
+    if spec.role == "accumulate" then
+      node = { id = spec.id, reasoner = "accumulate", args = type(spec.args) == "table" and spec.args or {}, role = spec.role }
+    elseif spec.role == "retry" then
+      node = {
+        id       = spec.id,
+        reasoner = "retry",
+        args     = type(spec.args) == "table" and spec.args or {},
+        fanout   = RETRY_FANOUT,
+        role     = spec.role,
+      }
+    elseif spec.role == "bash_command" then
+      node = { id = spec.id, reasoner = "bash_command", args = spec.args or {}, role = spec.role }
+    else
+      local agent_args = {}
+      if type(spec.agent_args) == "table" then
+        for k, v in pairs(spec.agent_args) do agent_args[k] = v end
+      end
+      if workspace_cwd and agent_args.cwd == nil then
+        agent_args.cwd = workspace_cwd
+      end
 
-    local cfg = role_config(spec.role)
-    if type(cfg) == "table" then
-      if type(cfg.system_prompt) == "string" and #cfg.system_prompt > 0
-          and type(agent_args.system_prompt) ~= "string" then
-        agent_args.system_prompt = cfg.system_prompt
+      local cfg = role_config(spec.role)
+      if type(cfg) == "table" then
+        if type(cfg.system_prompt) == "string" and #cfg.system_prompt > 0
+            and type(agent_args.system_prompt) ~= "string" then
+          agent_args.system_prompt = cfg.system_prompt
+        end
+        if type(cfg.tools) == "table" and type(agent_args.tool_allowlist) ~= "table" then
+          agent_args.tool_allowlist = cfg.tools
+        elseif type(cfg.tool_allowlist) == "table" and type(agent_args.tool_allowlist) ~= "table" then
+          agent_args.tool_allowlist = cfg.tool_allowlist
+        end
+        if type(cfg.model) == "string" and type(agent_args.model) ~= "string" then
+          agent_args.model = cfg.model
+        end
+        if cfg.read_only == true then
+          agent_args.read_only = true
+        end
       end
-      if type(cfg.tools) == "table" and type(agent_args.tool_allowlist) ~= "table" then
-        agent_args.tool_allowlist = cfg.tools
-      elseif type(cfg.tool_allowlist) == "table" and type(agent_args.tool_allowlist) ~= "table" then
-        agent_args.tool_allowlist = cfg.tool_allowlist
-      end
-      if type(cfg.model) == "string" and type(agent_args.model) ~= "string" then
-        agent_args.model = cfg.model
-      end
-      if cfg.read_only == true then
-        agent_args.read_only = true
-      end
+
+      node = {
+        id       = spec.id,
+        reasoner = "agent",
+        args     = agent_args,
+        -- Carries the lead's role label (explorer / builder / reviewer /
+        -- …) through to the chat surface so the graph_result block can
+        -- show role per node rather than the generic `agent` reasoner.
+        -- reasoner-graph parses by `id` + `reasoner` only and silently
+        -- ignores unknown fields; the field round-trips through
+        -- agentic-loop's pending_runs without touching the wire.
+        role     = spec.role,
+      }
     end
+    nodes[#nodes + 1] = node
 
-    nodes[#nodes + 1] = {
-      id       = spec.id,
-      reasoner = "agent",
-      args     = agent_args,
-      -- Carries the lead's role label (explorer / builder / reviewer /
-      -- …) through to the chat surface so the graph_result block can
-      -- show role per node rather than the generic `agent` reasoner.
-      -- reasoner-graph parses by `id` + `reasoner` only and silently
-      -- ignores unknown fields; the field round-trips through
-      -- agentic-loop's pending_runs without touching the wire.
-      role     = spec.role,
-    }
-
-    if type(spec.dependencies) == "table" then
-      for _, dep_id in ipairs(spec.dependencies) do
-        edges[#edges + 1] = { from = dep_id, to = spec.id }
-      end
+    for _, edge in ipairs(spec_edges(spec)) do
+      edges[#edges + 1] = edge
     end
   end
 
@@ -323,9 +409,9 @@ local function build_graph_spec(node_specs)
   -- graphs and any chain-shape where deps are encoded purely in
   -- `dependencies`.
   if #edges == 0 then
-    return { nodes = nodes }
+    return { terminal = terminal_id, nodes = nodes }
   end
-  return { nodes = nodes, edges = edges }
+  return { terminal = terminal_id, nodes = nodes, edges = edges }
 end
 
 -- Approval gate: write-capable roles (builder, tester, prompt-engineer,
@@ -367,7 +453,7 @@ end
 
 local function dispatch_graph(firing_id, args)
   local nodes = args and args.nodes
-  local graph, err = build_graph_spec(nodes)
+  local graph, err = build_graph_spec(nodes, args and args.terminal)
   if err then
     emit_tool_result_err(firing_id, err)
     return
@@ -646,21 +732,26 @@ local function lead_workflow_tool_schemas()
     {
       name        = "dispatch-graph",
       description =
-        "Dispatch ONE connected sub-graph of role-keyed sub-agents and return its " ..
+        "Dispatch ONE connected directed graph of sub-agent and deterministic nodes and return its " ..
         "run_id. For N independent tasks call dispatch-graph N times — each call " ..
         "gets its own run_id, appears as a separate row in the UI, and returns its " ..
         "result independently when finished. The graph's result.results is a dict " ..
-        "keyed by terminal (sink) node id; multi-sink within ONE connected DAG is " ..
-        "fine (e.g. explore → build, explore → test = two sinks sharing a root). " ..
-        "Disconnected components and cycles are rejected.",
+        "keyed by the explicit graph-level terminal node id; use accumulate as " ..
+        "the terminal for parallel fan-in. Disconnected components and " ..
+        "invalid/no/multi-terminal graphs are rejected.",
       parameters  = {
         type = "object",
         properties = {
+          terminal = {
+            type = "string",
+            description = "Exactly one terminal node id for this graph. The terminal node output is the graph result returned to the lead/orchestrator; any output-producing node may be terminal.",
+          },
           nodes = {
             type = "array",
             description =
-              "Role-keyed node specs: { id, role, agent_args, dependencies? }. " ..
-              "Use `dependencies` (array of node ids) to wire up the DAG. " ..
+              "Node specs: sub-agent roles use { id, role, agent_args, dependencies? }; " ..
+              "deterministic nodes use role = accumulate, retry, or bash_command with args/routes as needed. " ..
+              "Use `dependencies` and retry `routes` to wire up the connected directed graph. " ..
               "Each dependency's structured-finalize output is auto-composed " ..
               "into the dependent node's prompt as context.",
             -- OpenAI's Responses API server-side validates tool
@@ -677,10 +768,11 @@ local function lead_workflow_tool_schemas()
                 },
                 role         = {
                   type = "string",
-                  description = "Sub-agent role. Drives the system prompt, model, and " ..
-                    "tool allowlist. Roles available in this starter: explorer " ..
-                    "(read-only investigation), builder (writes code; requires an " ..
-                    "approved plan), reviewer (read-only critique).",
+                  description = "Node role. Sub-agent roles: explorer, builder, reviewer. Deterministic roles: accumulate, retry, bash_command.",
+                },
+                args         = {
+                  type        = "object",
+                  description = "Args for deterministic nodes. retry accepts max_attempts (default 3, hard-capped below 7). bash_command requires command and optional cwd. accumulate takes no required args.",
                 },
                 agent_args   = {
                   type        = "object",
@@ -708,12 +800,21 @@ local function lead_workflow_tool_schemas()
                     "appended after its prompt.",
                   items = { type = "string" },
                 },
+                routes = {
+                  type        = "object",
+                  description = "retry-only branch targets: { retry, pass, exhausted } mapping to node ids. The selected branch fires; unselected branches are suppressed.",
+                  properties  = {
+                    retry     = { type = "string" },
+                    pass      = { type = "string" },
+                    exhausted = { type = "string" },
+                  },
+                },
               },
-              required = { "id", "role", "agent_args" },
+              required = { "id", "role" },
             },
           },
         },
-        required = { "nodes" },
+        required = { "nodes", "terminal" },
       },
     },
     {

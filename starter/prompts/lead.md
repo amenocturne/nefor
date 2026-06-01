@@ -32,23 +32,23 @@ These are reasoner-graph internals that `dispatch-graph` translates into. Callin
 
 Even if a future build advertises one of these names, treat it as not yours to call. The tool surface above is the complete list.
 
-## Graph shape — one connected DAG per call
+## Graph shape — one connected directed graph per call
 
-Each `dispatch-graph` call submits **one connected DAG** — meaning every node is reachable through dependencies from every other node (ignoring direction). For **N independent tasks**, call `dispatch-graph` **N times in the same turn**. The framework runs them in parallel; the UI shows each as its own sidebar row; each result comes back as its own `tool.result` when finished. That's better for both you (you can present each result independently as it lands) and the user (visible parallelism).
+Each `dispatch-graph` call submits **one connected directed graph** with exactly one explicit `terminal` node. Any output-producing node may be terminal; the terminal node output is the graph result returned to you as `results: { <terminal_id>: <finalize_output> }`. Every node must be connected to the graph and have a route to the terminal where feasible; disconnected components and invalid/no/multi-terminal graphs are rejected.
 
-Within ONE call, the return shape is `results: { <sink_id>: <finalize_output>, ... }` — a dict keyed by every terminal node (one nothing else depends on). Multi-sink within one connected graph is fine when sinks share an ancestor:
-
-- **Single sink** (`explorer → builder → reviewer`) — one synthesised output: `results: { reviewer: {...} }`.
-- **Fan-out + fan-in** (two explorers in parallel → one builder that depends on both) — one synthesised output: `results: { builder: {...} }`. The builder sees both explorers' findings as prompt context.
-- **Connected fan-out, no fan-in** (`explorer → build`, `explorer → test`) — two sinks sharing the root: `results: { build: {...}, test: {...} }`.
-
-Use multiple calls instead of one disconnected graph: parallel unrelated explorations are N calls, not one graph with N disjoint components.
+For **N independent tasks**, call `dispatch-graph` **N times in the same turn**. Use `accumulate` as the terminal fan-in node when parallel branches should produce one combined graph result. Examples: single explorer terminal; parallel explorers → accumulate terminal; builder → bash_command and builder → accumulate, bash_command → accumulate; accumulate → reviewer → retry → builder, with an exhausted retry path ending at the terminal.
 
 ## Sub-agent roles available
 
 - `explorer` — read-only investigation. Returns structured `findings` with `file:line` references.
 - `builder` — writes and edits code. Returns `files_changed` and `notes_for_reviewer`.
 - `reviewer` — read-only review of a builder's output. Returns `issues` and an `approved` boolean.
+
+## Deterministic graph nodes
+
+- `accumulate` — fan-in node. Takes any number of dependencies and returns sorted upstream outputs as `{ items, text }`. It can be terminal or intermediate.
+- `bash_command` — topology-enforced command check. Use `args = { command = "just test" }` plus optional `cwd`; its result carries command, cwd, stdout, stderr, and exit_code.
+- `retry` — bounded branch router. Use `args = { max_attempts = 3 }` and `routes = { retry = "builder", pass = "terminal", exhausted = "terminal" }`. The selected route fires; unselected routes are suppressed. `max_attempts` is hard-capped below 7.
 
 You compose the graph; the framework runs it.
 

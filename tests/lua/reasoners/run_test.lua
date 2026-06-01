@@ -9,6 +9,7 @@
 local json = nefor.json
 
 local run          = require("reasoners.run")
+local bash_command = require("reasoners.bash_command")
 local run_wrappers = require("reasoners.run-wrappers")
 
 -- ------------------------------------------------------------------
@@ -67,6 +68,17 @@ local function find_tool_result_for(id)
     end
   end
   return nil
+end
+
+local function count_tool_results_for(id)
+  local count = 0
+  for _, c in ipairs(_test.calls()) do
+    local d = json.decode(c.payload)
+    if d and d.body and d.body.kind == "tool.result" and d.body.id == id then
+      count = count + 1
+    end
+  end
+  return count
 end
 
 -- Simulate tool-gate's tool.result fan-out for a specific tool_id.
@@ -140,6 +152,40 @@ do
   assert_eq(result_env.result.stdout, "hello\n", "stdout surfaced")
   assert_eq(result_env.result.stderr, "", "stderr empty")
   assert_eq(result_env.result.exit_code, 0, "exit_code = 0")
+end
+
+-- ------------------------------------------------------------------
+-- bash_command reasoner — graph-safe bash wrapper emits one result
+-- ------------------------------------------------------------------
+
+do
+  run._internals.reset()
+  _test.calls_clear()
+
+  local ret = dispatch(bash_command.handle, "f-bash-command", { command = "pwd", cwd = "/tmp" })
+  assert_true(ret == nil, "bash_command handle returns nil on accept")
+
+  local invoke = find_call_with_kind("tool-gate.tool.invoke")
+  assert_true(invoke ~= nil, "bash_command dispatched tool-gate.tool.invoke")
+  assert_eq(invoke.body.name, "bash", "bash_command targets the bash tool through tool-gate")
+  assert_eq(invoke.body.args.command, "pwd", "bash_command forwards command verbatim")
+  local tool_id = invoke.body.id
+
+  _test.calls_clear()
+  bash_command.receive_msg(make_entry("tool-gate", {
+    kind = "tool.result",
+    id = tool_id,
+    output = "/tmp\n[exit 0]",
+  }))
+
+  local result_env = find_tool_result_for("f-bash-command")
+  assert_true(result_env ~= nil, "bash_command emitted a terminal tool.result")
+  assert_eq(count_tool_results_for("f-bash-command"), 1,
+    "bash_command emits exactly one correlated result")
+  assert_eq(result_env.result.command, "pwd", "command included in normalized result")
+  assert_eq(result_env.result.cwd, "/tmp", "cwd included in normalized result")
+  assert_eq(result_env.result.stdout, "/tmp\n", "stdout surfaced")
+  assert_eq(result_env.result.exit_code, 0, "exit_code surfaced")
 end
 
 -- ------------------------------------------------------------------
@@ -394,4 +440,41 @@ do
   })
 
   assert_eq(#_test.calls(), 0, "malformed event body is ignored without raising")
+end
+
+-- ------------------------------------------------------------------
+-- accumulate / retry deterministic helpers
+-- ------------------------------------------------------------------
+
+do
+  local accumulate = require("reasoners.accumulate")
+  _test.calls_clear()
+  local err = accumulate.handle({
+    firing_id = "f-acc",
+    inputs = {
+      b = { output = { text = "bee" } },
+      a = { output = { text = "aye" } },
+    },
+  })
+  assert_eq(err, "_already_replied", "accumulate replies synchronously")
+  local call = find_call_with_kind("tool.result")
+  assert_true(call ~= nil, "accumulate emitted tool.result")
+  assert_eq(call.body.result.items[1].id, "a", "accumulate sorts upstream ids")
+  assert_eq(call.body.result.items[2].id, "b", "accumulate preserves identity")
+end
+
+do
+  local retry = require("reasoners.retry")
+  _test.calls_clear()
+  retry.handle({ firing_id = "f-retry", args = { max_attempts = 99 }, prev_state = { attempt = 5 }, inputs = { r = { output = { ok = false } } } })
+  local call = find_call_with_kind("tool.result")
+  assert_eq(call.body.result.max_attempts, 6, "retry hard cap is less than 7")
+  assert_eq(call.body.result.route, "exhausted", "retry routes exhausted attempts")
+
+  _test.calls_clear()
+  retry.handle({ firing_id = "f-pass", args = {}, inputs = { r = { output = { ok = true, value = 1 } } } })
+  call = find_call_with_kind("tool.result")
+  assert_eq(call.body.result.route, "pass", "retry passes successful input through")
+  assert_true(call.body.result.traits.pass_through == true and call.body.result.traits.branch_routing == true,
+    "retry exposes pass-through and branch-routing metadata")
 end

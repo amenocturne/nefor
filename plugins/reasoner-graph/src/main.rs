@@ -625,6 +625,7 @@ mod tests {
         args.insert(
             "graph".into(),
             json!({
+                "terminal": "n1",
                 "nodes": [{"id": "n1", "reasoner": "r", "args": {}}],
                 "edges": []
             }),
@@ -673,6 +674,7 @@ mod tests {
         args.insert(
             "graph".into(),
             json!({
+                "terminal": "n1",
                 "nodes": [{"id": "n1", "reasoner": "r", "args": {}}],
                 "edges": []
             }),

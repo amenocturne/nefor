@@ -455,18 +455,17 @@ fn final_status(state: &RunState) -> RunStatus {
 /// Build the `results` map for a `graph.run_complete` from the run state.
 fn build_results(state: &RunState) -> Map<String, Value> {
     let mut m = Map::new();
-    for id in state.graph.ids_in_order() {
-        let v = state
-            .completed
-            .get(id)
-            .map(NodeStatus::to_results_value)
-            .unwrap_or_else(|| {
-                let mut o = Map::new();
-                o.insert("skipped".into(), Value::Bool(true));
-                Value::Object(o)
-            });
-        m.insert(id.clone(), v);
-    }
+    let id = state.graph.terminal().to_owned();
+    let v = state
+        .completed
+        .get(&id)
+        .map(NodeStatus::to_results_value)
+        .unwrap_or_else(|| {
+            let mut o = Map::new();
+            o.insert("skipped".into(), Value::Bool(true));
+            Value::Object(o)
+        });
+    m.insert(id, v);
     m
 }
 
@@ -1688,6 +1687,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
+            "terminal": "n1",
             "nodes": [{"id": "n1", "reasoner": "r", "args": {"x": 1}}],
             "edges": []
         });
@@ -1747,6 +1747,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
+            "terminal": "a",
             "nodes": [
                 {"id": "a", "reasoner": "r", "args": {}},
                 {"id": "b", "reasoner": "r", "args": {}}
@@ -1783,6 +1784,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
+            "terminal": "n1",
             "nodes": [{"id": "n1", "reasoner": "r", "args": {}}],
             "edges": [{"from": "n1", "to": "n1"}]
         });
@@ -1816,6 +1818,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&[]);
         let g = json!({
+            "terminal": "n3",
             "nodes": [{"id": "n1", "reasoner": "r", "args": {}}],
             "edges": [{"from": "n1", "to": "missing"}]
         });
@@ -1837,6 +1840,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
+            "terminal": "n3",
             "nodes": [
                 {"id": "n1", "reasoner": "r", "args": {}},
                 {"id": "n2", "reasoner": "r", "args": {}},
@@ -1917,6 +1921,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
+            "terminal": "n4",
             "nodes": [
                 {"id": "n1", "reasoner": "r", "args": {}},
                 {"id": "n2", "reasoner": "r", "args": {}},
@@ -2010,6 +2015,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
+            "terminal": "n3",
             "nodes": [
                 {"id": "n1", "reasoner": "r", "args": {}},
                 {"id": "n2", "reasoner": "r", "args": {}},
@@ -2046,7 +2052,6 @@ mod tests {
                 status, results, ..
             } => {
                 assert_eq!(*status, RunStatus::Failure);
-                assert_eq!(results.get("n2"), Some(&json!({"error": "boom"})));
                 assert_eq!(results.get("n3"), Some(&json!({"skipped": true})));
             }
             other => panic!("unexpected: {other:?}"),
@@ -2058,6 +2063,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
+            "terminal": "n3",
             "nodes": [
                 {"id": "n1", "reasoner": "r", "args": {}},
                 {"id": "n2", "reasoner": "r", "args": {}},
@@ -2123,6 +2129,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&[]);
         let g = json!({
+            "terminal": "n2",
             "nodes": [
                 {"id": "n1", "reasoner": "ghost", "args": {}},
                 {"id": "n2", "reasoner": "ghost", "args": {}}
@@ -2143,11 +2150,6 @@ mod tests {
                 status, results, ..
             } => {
                 assert_eq!(*status, RunStatus::Failure);
-                let n1_err = results
-                    .get("n1")
-                    .and_then(|v| v.get("error"))
-                    .and_then(Value::as_str);
-                assert!(n1_err.unwrap().contains("not connected"));
                 assert_eq!(results.get("n2"), Some(&json!({"skipped": true})));
             }
             _ => unreachable!(),
@@ -2159,6 +2161,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
+            "terminal": "n3",
             "nodes": [
                 {"id": "n1", "reasoner": "r", "args": {}},
                 {"id": "n2", "reasoner": "r", "args": {}},
@@ -2241,7 +2244,8 @@ mod tests {
         let peers = peers_with(&["r"]);
         let g = || {
             json!({
-                "nodes": [{"id": "n1", "reasoner": "r", "args": {}}],
+                "terminal": "n1",
+            "nodes": [{"id": "n1", "reasoner": "r", "args": {}}],
                 "edges": []
             })
         };
@@ -2273,6 +2277,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
+            "terminal": "n1",
             "nodes": [{"id": "n1", "reasoner": "r", "args": {}}],
             "edges": []
         });
@@ -2301,6 +2306,7 @@ mod tests {
         // Since the registry is empty, we build a fresh state to drive
         // a second firing manually.
         let g2 = json!({
+            "terminal": "n1",
             "nodes": [{"id": "n1", "reasoner": "r", "args": {}}],
             "edges": []
         });
@@ -2331,6 +2337,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
+            "terminal": "n1",
             "nodes": [{"id": "n1", "reasoner": "r", "args": {}}],
             "edges": []
         });
@@ -2356,6 +2363,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
+            "terminal": "n1",
             "nodes": [{"id": "n1", "reasoner": "r", "args": {}}],
             "edges": []
         });
@@ -2387,6 +2395,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
+            "terminal": "n1",
             "nodes": [{"id": "n1", "reasoner": "r", "args": {}}],
             "edges": []
         });
@@ -2411,12 +2420,16 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
+            "terminal": "n3",
             "nodes": [
                 {"id": "n1", "reasoner": "r", "args": {}},
                 {"id": "n2", "reasoner": "r", "args": {}},
                 {"id": "n3", "reasoner": "r", "args": {}}
             ],
-            "edges": []
+            "edges": [
+                {"from": "n1", "to": "n2"},
+                {"from": "n2", "to": "n3"}
+            ]
         });
         let outcome = Scheduler::handle_submit(&runs, &peers, &submit_body("run-pair", g, None));
         let effects = match outcome {
@@ -2458,7 +2471,7 @@ mod tests {
             .filter(|e| matches!(e, Effect::NodeDispatched { .. }))
             .count();
         assert_eq!(dispatched_count, node_dispatched_count);
-        assert_eq!(dispatched_count, 3);
+        assert_eq!(dispatched_count, 1);
     }
 
     #[test]
@@ -2466,6 +2479,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&[]);
         let g = json!({
+            "terminal": "n1",
             "nodes": [{"id": "n1", "reasoner": "ghost", "args": {}}],
             "edges": []
         });
@@ -2492,6 +2506,7 @@ mod tests {
 
     fn fanout_graph(node_id: &str, reasoner: &str, in_t: &str, outs: Vec<&str>) -> Value {
         json!({
+            "terminal": node_id,
             "nodes": [{
                 "id": node_id,
                 "reasoner": reasoner,
@@ -2700,6 +2715,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
+            "terminal": "n2",
             "nodes": [
                 { "id": "n1", "reasoner": "r", "args": {},
                   "fanout": { "in": "generic-provider.ProviderOut",
@@ -2790,6 +2806,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
+            "terminal": "n2",
             "nodes": [
                 { "id": "n1", "reasoner": "r",
                   "fanout": { "in": "generic-provider.ProviderOut",
@@ -2878,6 +2895,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
+            "terminal": "n2",
             "nodes": [
                 {"id": "n1", "reasoner": "r", "args": {}},
                 {"id": "n2", "reasoner": "r", "args": {}}
@@ -2964,6 +2982,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
+            "terminal": "A",
             "nodes": [{
                 "id": "A",
                 "reasoner": "r",
@@ -3090,6 +3109,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
+            "terminal": "A",
             "nodes": [{
                 "id": "A",
                 "reasoner": "r",
@@ -3150,6 +3170,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
+            "terminal": "A",
             "nodes": [{
                 "id": "A",
                 "reasoner": "r",
@@ -3246,6 +3267,7 @@ mod tests {
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
+            "terminal": "terminal",
             "nodes": [
                 { "id": "wrap", "reasoner": "r", "args": {},
                   "fanout": { "in": "p.POut", "out": ["p.ToolCalls", "p.FinalAnswer"] } },

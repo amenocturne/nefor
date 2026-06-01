@@ -348,6 +348,9 @@ end
 local run_reasoner          = require("reasoners.run")
 local run_wrappers_reasoner = require("reasoners.run-wrappers")
 local loop_counter_reasoner = require("reasoners.loop_counter")
+local accumulate_reasoner   = require("reasoners.accumulate")
+local retry_reasoner        = require("reasoners.retry")
+local bash_command_reasoner = require("reasoners.bash_command")
 
 local handlers = {
   ["provider-wrapper"] = function(body) return provider_run_node("provider-wrapper", body) end,
@@ -355,6 +358,9 @@ local handlers = {
   ["tool-executor"]    = tool_executor_run_node,
   ["adapter"]          = adapter_run_node,
   ["terminal"]         = terminal_run_node,
+  ["accumulate"]       = accumulate_reasoner.handle,
+  ["retry"]            = retry_reasoner.handle,
+  ["bash_command"]     = bash_command_reasoner.handle,
   -- agent reasoner (lead workflow keystone)
   ["agent"]            = agent_handle,
   ["run"]              = run_reasoner.handle,
@@ -447,6 +453,7 @@ local function receive_msg(entry)
   -- so its receive_msg can pick the ones it owns; non-matching
   -- tool_ids are silently skipped inside the module.
   run_reasoner.receive_msg(entry)
+  bash_command_reasoner.receive_msg(entry)
 
   -- Dispatch tool.invoke { name in handlers }. Anything else on the
   -- bus is for someone else (real tools, spawn_graph routed to

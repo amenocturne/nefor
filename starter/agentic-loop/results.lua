@@ -7,14 +7,15 @@ local M = {}
 local json = nefor.json
 
 -- Serialise sub-graph results into a tool-friendly string. Preference:
---   1. When the submitted graph topology is passed, walk it: the sub-
---      graph's canonical output is its sink node(s) — nodes that no
---      other node depends on. Single sink → that node's `output.text`.
---      Multi sink → labeled concatenation in sorted id order.
---   2. Legacy heuristic for callers that didn't pass the graph:
+--   1. When the submitted graph topology has an explicit `terminal`,
+--      use that node's result.
+--   2. Legacy graph-aware fallback: walk sink node(s) — nodes that no
+--      other node depends on. Single sink -> that node's `output.text`.
+--      Multi sink -> labeled concatenation in sorted id order.
+--   3. Legacy heuristic for callers that didn't pass the graph:
 --      `results.terminal.output.text` → keys containing "terminal" /
 --      "out" / "final" → first node's `output.text`.
---   3. JSON-encoded results map (last resort).
+--   4. JSON-encoded results map (last resort).
 --
 -- The graph-aware path is what we want — node ids are caller-minted
 -- and may not contain any of the legacy substrings (e.g. user picks
@@ -54,7 +55,13 @@ end
 function M.serialise_results(results, graph)
   if type(results) ~= "table" then return tostring(results) end
 
-  -- Graph-aware path: pick by topology, not by node name.
+  -- Explicit-terminal path: reasoner-graph's canonical output contract.
+  if type(graph) == "table" and type(graph.terminal) == "string" then
+    local txt = M.extract_text(results[graph.terminal])
+    if type(txt) == "string" then return txt end
+  end
+
+  -- Legacy graph-aware path: pick by topology, not by node name.
   local sinks = sink_ids(graph)
   if type(sinks) == "table" and #sinks > 0 then
     if #sinks == 1 then

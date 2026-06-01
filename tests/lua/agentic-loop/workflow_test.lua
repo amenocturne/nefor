@@ -524,6 +524,43 @@ do
     "visible sub-graph output must target nefor-tui")
 end
 
+do
+  fresh_loop()
+  local terminal_text = "explicit terminal output wins over sink fallback"
+  local run_id = agentic_loop.queue_sub_graph(
+    {
+      graph = {
+        terminal = "review",
+        nodes = {
+          { id = "review", reasoner = "agent", args = {} },
+          { id = "followup", reasoner = "agent", args = {} },
+        },
+        edges = { { from = "review", to = "followup" } },
+      },
+    },
+    "gate-inner-terminal"
+  )
+  _test.calls_clear()
+
+  send_to_loop("reasoner-graph", {
+    kind   = "tool.result",
+    id     = run_id,
+    result = {
+      status  = "success",
+      results = {
+        review = { output = { text = terminal_text } },
+        followup = { output = { text = "sink fallback should not win" } },
+      },
+    },
+  })
+
+  local calls = decode_calls()
+  local visible = find_graph_result(calls, "success", terminal_text)
+  assert(visible ~= nil,
+    "sub-graph completion must prefer graph.terminal over sink lookup; got "
+    .. json.encode(_test.calls()))
+end
+
 -- Sub-graph failure surfaces a chat.graph_result.append with status=failed.
 do
   fresh_loop()

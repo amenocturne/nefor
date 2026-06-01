@@ -99,6 +99,7 @@ do
     id   = "firing-dispatch-1",
     name = "dispatch-graph",
     args = {
+      terminal = "explore-2",
       nodes = {
         { id = "explore-1", role = "explorer",
           agent_args = { prompt = "Investigate auth.lua",
@@ -154,6 +155,57 @@ do
     "reply carries the run_id")
 end
 
+do
+  fresh()
+  feed("tool-gate", {
+    kind = "lead-workflow.tool.invoke",
+    id   = "firing-deterministic-graph",
+    name = "dispatch-graph",
+    args = {
+      terminal = "join",
+      nodes = {
+        { id = "build", role = "explorer",
+          agent_args = { prompt = "produce candidate" } },
+        { id = "check", role = "bash_command",
+          args = { command = "just test" },
+          dependencies = { "build" } },
+        { id = "retry", role = "retry",
+          args = { max_attempts = 3 },
+          dependencies = { "check" },
+          routes = { retry = "build", pass = "join", exhausted = "join" } },
+        { id = "join", role = "accumulate",
+          dependencies = { "build", "check" } },
+      },
+    },
+  })
+  local calls = decode_calls()
+  local invoke = find_call(calls, function(c)
+    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
+  end)
+  assert_true(invoke ~= nil, "deterministic nodes dispatch through spawn_graph")
+  local graph = invoke.body.args.graph
+  assert_eq(graph.terminal, "join", "explicit terminal forwarded")
+  local by_id = {}
+  for _, node in ipairs(graph.nodes) do by_id[node.id] = node end
+  assert_eq(by_id.check.reasoner, "bash_command", "bash_command maps to deterministic reasoner")
+  assert_eq(by_id.retry.reasoner, "retry", "retry maps to deterministic reasoner")
+  assert_eq(by_id.join.reasoner, "accumulate", "accumulate maps to deterministic reasoner")
+  assert_eq(by_id.retry.fanout["in"], "generic-control.RetryDecision", "retry carries fanout signature")
+  local saw_retry_edge, saw_pass_edge, saw_exhausted_edge = false, false, false
+  for _, edge in ipairs(graph.edges or {}) do
+    if edge.from == "retry" and edge.to == "build" and edge.type == "generic-control.Retry" then
+      saw_retry_edge = true
+    elseif edge.from == "retry" and edge.to == "join" and edge.type == "generic-control.Pass" then
+      saw_pass_edge = true
+    elseif edge.from == "retry" and edge.to == "join" and edge.type == "generic-control.Exhausted" then
+      saw_exhausted_edge = true
+    end
+  end
+  assert_true(saw_retry_edge, "retry route emits typed Retry edge")
+  assert_true(saw_pass_edge, "pass route emits typed Pass edge")
+  assert_true(saw_exhausted_edge, "exhausted route emits typed Exhausted edge")
+end
+
 -- ------------------------------------------------------------------
 -- Approval gate: builder/writer roles are rejected without an
 -- approved plan.
@@ -166,6 +218,7 @@ do
     id   = "firing-builder-no-plan",
     name = "dispatch-graph",
     args = {
+      terminal = "build-1",
       nodes = {
         { id = "build-1", role = "builder",
           agent_args = { prompt = "implement feature X" } },
@@ -208,6 +261,7 @@ do
     id   = "firing-builder-with-plan",
     name = "dispatch-graph",
     args = {
+      terminal = "build-1",
       nodes = {
         { id = "build-1", role = "builder",
           agent_args = { prompt = "implement feature X" } },
@@ -413,6 +467,7 @@ do
     id   = "firing-builder-expired",
     name = "dispatch-graph",
     args = {
+      terminal = "b",
       nodes = {
         { id = "b", role = "builder", agent_args = { prompt = "x" } },
       },
@@ -524,6 +579,7 @@ do
     id   = "firing-dispatch-end",
     name = "dispatch-graph",
     args = {
+      terminal = "explore",
       nodes = {
         { id = "explore", role = "explorer",
           agent_args = { prompt = "x", system_prompt = "you are an explorer",
