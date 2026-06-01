@@ -417,15 +417,18 @@ local function set_reasoning_effort(provider, effort)
   })
 end
 
-local function set_yolo(enabled)
-  local default = enabled and "auto" or "prompt"
+local function set_mode(mode)
+  if mode == "normal" then mode = "safe" end
+  if mode ~= "safe" and mode ~= "auto" and mode ~= "yolo" then return end
   emit("tool-gate", {
-    kind    = "tool-gate.policy.set",
-    default = default,
+    kind = "tool-gate.set_mode",
+    mode = mode,
   })
-  nefor.log.info("agentic-loop.set_yolo: placeholder event emitted", {
-    enabled = enabled, default = default,
-  })
+  nefor.log.info("agentic-loop.set_mode: tool-gate mode requested", { mode = mode })
+end
+
+local function set_yolo(enabled)
+  set_mode(enabled and "yolo" or "safe")
 end
 
 -- Single-Esc behaviour: cancel the current chat turn at the provider.
@@ -966,6 +969,7 @@ function M.cancel_all()  return cancel_all() end
 function M.new_chat()    new_chat() end
 function M.set_model(provider, model) set_model(provider, model) end
 function M.set_yolo(enabled) set_yolo(enabled) end
+function M.set_mode(mode) set_mode(mode) end
 
 function M.on_stream(fn)
   assert(type(fn) == "function", "on_stream: callback must be a function")

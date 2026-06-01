@@ -101,19 +101,19 @@ M.AGENT_CONFIGS = {
   explorer = {
     system_prompt  = load_or_placeholder("explorer"),
     model          = nil,
-    tool_allowlist = { "read_file", "read_image", "list_dir", "search_text", "bash" },
+    tool_allowlist = { "read_file", "read_image", "list_dir", "search_text", "python-read", "bash" },
     read_only      = true,
   },
   builder = {
     system_prompt  = load_or_placeholder("builder"),
     model          = nil,
-    tool_allowlist = { "read_file", "read_image", "list_dir", "search_text", "edit_file", "write_file", "bash" },
+    tool_allowlist = { "read_file", "read_image", "list_dir", "search_text", "python-read", "edit_file", "write_file", "bash" },
     read_only      = false,
   },
   reviewer = {
     system_prompt  = load_or_placeholder("reviewer"),
     model          = nil,
-    tool_allowlist = { "read_file", "read_image", "list_dir", "search_text" },
+    tool_allowlist = { "read_file", "read_image", "list_dir", "search_text", "python-read" },
     read_only      = true,
   },
 }

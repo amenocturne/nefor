@@ -34,7 +34,7 @@ Slash commands:
   /new /clear  new chat (clears transcript)
   /help        this help
   /quit /exit  exit nefor
-  /yolo /safe  toggle tool permission gate
+  /safe /auto /yolo  set tool permission mode
   /login /logout  provider auth
   /model       list/switch model
   /resume      resume a previous session]]

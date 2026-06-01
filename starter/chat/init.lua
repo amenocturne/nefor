@@ -180,7 +180,7 @@ local function initial_state()
     provider         = cfg.default_provider,
     reasoning_effort = cfg.default_reasoning_effort,
     max_tokens       = nil,
-    gate_yolo        = false,
+    gate_mode        = "safe",
     auth             = {},
     expanded_details = false,
     completion       = nil,

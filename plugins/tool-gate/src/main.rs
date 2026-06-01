@@ -27,11 +27,13 @@
 //! - `--deny <name>`   : reject immediately.
 //! - `--default <auto|prompt|deny>` : fallback for unlisted tools (default: prompt).
 //!
-//! Runtime override (yolo mode): `tool-gate.set_mode { mode: "yolo" | "normal" }`
-//! flips a global override. While `yolo`, every tool resolves to `Auto`
-//! regardless of per-tool policy — useful for unattended testing. The gate
-//! broadcasts `tool-gate.mode_changed { mode }` on transitions and also on
-//! startup so observers (chat statusline) can render the current mode.
+//! Runtime mode: `tool-gate.set_mode { mode: "safe" | "auto" | "yolo" }`
+//! selects the permission profile. Legacy `normal` maps to `safe`. While
+//! `yolo`, every tool resolves to `Auto` regardless of per-tool policy —
+//! useful for unattended testing. `safe` and `auto` continue to use the
+//! configured per-tool policy. The gate broadcasts `tool-gate.mode_changed
+//! { mode }` on transitions and also on startup so observers (chat statusline)
+//! can render the current mode.
 //!
 //! Wire id mapping: the provider's outer id is preserved through the
 //! permission-request flow (chat sees the same id the provider issued).
@@ -51,6 +53,32 @@ use tokio::sync::mpsc;
 use crate::policy::{Decision, Policy};
 
 const CHANNEL_CAP: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateMode {
+    Safe,
+    Auto,
+    Yolo,
+}
+
+impl GateMode {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "safe" | "normal" => Some(Self::Safe),
+            "auto" => Some(Self::Auto),
+            "yolo" => Some(Self::Yolo),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Safe => "safe",
+            Self::Auto => "auto",
+            Self::Yolo => "yolo",
+        }
+    }
+}
 
 const PROTOCOL_VERSION: &str = "0.1";
 pub(crate) const PLUGIN_NAME: &str = "tool-gate";
@@ -135,10 +163,8 @@ async fn run(policy: Policy) -> Result<(), TransportError> {
     send_event(&out_tx, hello_body()).await?;
 
     let mut state = GateState::new(policy);
-    // Announce the initial mode so any UI that comes up after us still sees
-    // it (chat starts fresh assuming `normal`; this keeps them in sync if a
-    // future starter ever boots the gate in `yolo` from the CLI).
-    send_event(&out_tx, mode_changed_body(state.yolo)).await?;
+    // Announce the initial mode so any UI that comes up after us still sees it.
+    send_event(&out_tx, mode_changed_body(state.mode)).await?;
     run_dispatch_loop(&out_tx, &mut in_rx, &mut state).await?;
 
     let _ = out_tx.send(PluginOutgoing::event(goodbye_body())).await;
@@ -186,9 +212,9 @@ struct GateState {
     /// Monotonic counter for inner-id minting.
     inner_id_counter: u64,
     policy: Policy,
-    /// Global override: while true, every tool resolves to `Auto` regardless
-    /// of per-tool policy. Toggled by `tool-gate.set_mode`.
-    yolo: bool,
+    /// Runtime permission mode. `safe` and `auto` use per-tool policy;
+    /// `yolo` resolves every tool to `Auto`.
+    mode: GateMode,
 }
 
 impl GateState {
@@ -200,7 +226,7 @@ impl GateState {
             awaiting_approval: HashMap::new(),
             inner_id_counter: 0,
             policy,
-            yolo: false,
+            mode: GateMode::Safe,
         }
     }
 
@@ -296,23 +322,19 @@ async fn handle_set_mode(
             return Ok(());
         }
     };
-    let target = match mode {
-        "yolo" => true,
-        "normal" => false,
-        other => {
-            tracing::warn!(mode = %other, "tool-gate.set_mode: unknown mode; expected yolo|normal");
-            return Ok(());
-        }
+    let Some(target) = GateMode::parse(mode) else {
+        tracing::warn!(mode = %mode, "tool-gate.set_mode: unknown mode; expected safe|auto|yolo");
+        return Ok(());
     };
-    if state.yolo == target {
+    if state.mode == target {
         // No-op: still re-broadcast so a late observer (newly-spawned chat)
         // sees the current mode.
-        send_event(out_tx, mode_changed_body(state.yolo)).await?;
+        send_event(out_tx, mode_changed_body(state.mode)).await?;
         return Ok(());
     }
-    state.yolo = target;
-    tracing::info!(yolo = state.yolo, "mode changed");
-    send_event(out_tx, mode_changed_body(state.yolo)).await?;
+    state.mode = target;
+    tracing::info!(mode = state.mode.as_str(), "mode changed");
+    send_event(out_tx, mode_changed_body(state.mode)).await?;
     Ok(())
 }
 
@@ -418,7 +440,7 @@ async fn handle_tool_invoke(
         }
     };
 
-    let decision = if state.yolo {
+    let decision = if state.mode == GateMode::Yolo {
         Decision::Auto
     } else {
         state.policy.decide(&name)
@@ -614,16 +636,13 @@ fn permission_request_body(
     m
 }
 
-fn mode_changed_body(yolo: bool) -> Map<String, Value> {
+fn mode_changed_body(mode: GateMode) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert(
         "kind".into(),
         Value::String(format!("{PLUGIN_NAME}.mode_changed")),
     );
-    m.insert(
-        "mode".into(),
-        Value::String(if yolo { "yolo" } else { "normal" }.into()),
-    );
+    m.insert("mode".into(), Value::String(mode.as_str().into()));
     m
 }
 
@@ -1078,7 +1097,7 @@ mod tests {
         let mut policy = Policy::new(Decision::Prompt);
         policy.set("bash", Decision::Deny);
         let mut state = GateState::new(policy);
-        state.yolo = true;
+        state.mode = GateMode::Yolo;
         let advertise = advertise_body(
             "basic-tools",
             json!([
@@ -1128,7 +1147,7 @@ mod tests {
         .unwrap()
         .clone();
         handle_set_mode(&tx, &body, &mut state).await.unwrap();
-        assert!(state.yolo);
+        assert_eq!(state.mode, GateMode::Yolo);
         let msg = rx.recv().await.unwrap();
         let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
         let body = v.get("body").unwrap();
@@ -1143,7 +1162,7 @@ mod tests {
     async fn set_mode_normal_clears_yolo() {
         let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
         let mut state = make_state();
-        state.yolo = true;
+        state.mode = GateMode::Yolo;
         let body = json!({
             "kind": "tool-gate.set_mode",
             "mode": "normal"
@@ -1152,11 +1171,57 @@ mod tests {
         .unwrap()
         .clone();
         handle_set_mode(&tx, &body, &mut state).await.unwrap();
-        assert!(!state.yolo);
+        assert_eq!(state.mode, GateMode::Safe);
         let msg = rx.recv().await.unwrap();
         let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
         let body = v.get("body").unwrap();
-        assert_eq!(body.get("mode").and_then(Value::as_str), Some("normal"));
+        assert_eq!(body.get("mode").and_then(Value::as_str), Some("safe"));
+    }
+
+    #[tokio::test]
+    async fn set_mode_auto_emits_mode_changed_and_uses_policy() {
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+        let mut state = make_state();
+        let body = json!({
+            "kind": "tool-gate.set_mode",
+            "mode": "auto"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        handle_set_mode(&tx, &body, &mut state).await.unwrap();
+        assert_eq!(state.mode, GateMode::Auto);
+        let msg = rx.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
+        let body = v.get("body").unwrap();
+        assert_eq!(body.get("mode").and_then(Value::as_str), Some("auto"));
+
+        let advertise = advertise_body(
+            "basic-tools",
+            json!([{"name": "read_file", "description": "", "parameters": {}}]),
+        );
+        handle_tools_advertise(&tx, &advertise, &mut state)
+            .await
+            .unwrap();
+        let _ = rx.recv().await.unwrap();
+        let invoke = json!({
+            "kind": "tool-gate.tool.invoke",
+            "id": "prov-read",
+            "name": "read_file",
+            "args": {}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        handle_tool_invoke(&tx, &invoke, &mut state).await.unwrap();
+        let msg = rx.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
+        let body = v.get("body").unwrap();
+        assert_eq!(
+            body.get("kind").and_then(Value::as_str),
+            Some("chat.tool.permission_request"),
+            "auto mode still uses per-tool policy"
+        );
     }
 
     #[tokio::test]
@@ -1171,7 +1236,7 @@ mod tests {
         .unwrap()
         .clone();
         handle_set_mode(&tx, &body, &mut state).await.unwrap();
-        assert!(!state.yolo);
+        assert_eq!(state.mode, GateMode::Safe);
         drop(tx);
         assert!(rx.recv().await.is_none());
     }

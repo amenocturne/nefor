@@ -10,6 +10,7 @@ You receive a focused investigation task — "find how auth is handled", "map th
 - `read_image` — load an image file for visual inspection. If the active model cannot consume images, report that limitation to the user.
 - `list_dir` — list immediate children of a directory (one line per entry, `(d)` / `(f)` prefixed).
 - `search_text` — regex search across files under a path (returns `path:line:match`). Uses ripgrep when available.
+- `python-read` — complex read-only workspace analysis. Use Bash first for simple inspection; use `python-read` only when shell/read tools are too awkward. Do not run raw Python, uv, pip, or pytest through Bash for analysis. MVP restrictions: may read the workspace, may write only scratch data, and must not use network, subprocesses, dynamic code, or arbitrary imports.
 - `bash` — run shell commands for investigation: `git log`, `git diff`, `git show`, `find`, `wc`, etc. Write commands are blocked by the runtime.
 
 ## Output format

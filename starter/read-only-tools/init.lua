@@ -217,9 +217,17 @@ local function tool_search_text(firing_id, args)
   })
 end
 
+local function tool_python_read(firing_id, _args)
+  emit_err(firing_id,
+    "python-read: sandboxed Python analysis is not available in this MVP. " ..
+    "Use Bash/read tools for simple inspection; do not route raw Python, " ..
+    "uv, pip, or pytest through Bash for analysis.")
+end
+
 local TOOL_HANDLERS = {
-  list_dir    = tool_list_dir,
-  search_text = tool_search_text,
+  list_dir        = tool_list_dir,
+  search_text     = tool_search_text,
+  ["python-read"] = tool_python_read,
 }
 
 local function handle_tool_invoke(body)
@@ -256,6 +264,23 @@ local function tool_schemas()
                    description = "Directory path. Use '.' for the workspace root." },
         },
         required = { "path" },
+      },
+    },
+    {
+      name = "python-read",
+      description =
+        "Run complex read-only Python analysis over workspace files. " ..
+        "Prefer Bash/read tools for simple inspection. Do not use raw " ..
+        "Python, uv, pip, or pytest through Bash for analysis. MVP " ..
+        "restrictions: read workspace, write scratch only, no network, " ..
+        "subprocesses, dynamic code, or arbitrary imports.",
+      parameters = {
+        type = "object",
+        properties = {
+          task = { type = "string",
+                   description = "Read-only analysis request to perform." },
+        },
+        required = { "task" },
       },
     },
     {

@@ -32,6 +32,7 @@ do
   assert_eq(opts.prompt, nil, "no prompt for REPL")
   assert_eq(opts.format, "text", "default format")
   assert_eq(opts.yolo, false, "yolo off by default")
+  assert_eq(opts.mode, nil, "mode unset by default")
   assert_eq(opts.help, false, "help off by default")
 end
 
@@ -78,7 +79,22 @@ do
   local opts, err = parse("--yolo", "do dangerous things")
   assert_eq(err, nil, "no error")
   assert_eq(opts.yolo, true, "yolo set")
+  assert_eq(opts.mode, "yolo", "--yolo maps to mode=yolo")
   assert_eq(opts.prompt, "do dangerous things", "prompt after --yolo")
+end
+
+-- --mode safe|auto|yolo.
+do
+  for _, mode in ipairs({ "safe", "auto", "yolo" }) do
+    local opts, err = parse("--mode", mode, "p")
+    assert_eq(err, nil, "no error for mode=" .. mode)
+    assert_eq(opts.mode, mode, "mode=" .. mode)
+  end
+
+  local opts, err = parse("--mode", "normal", "p")
+  assert_eq(opts, nil, "nil opts on bad mode")
+  assert(err ~= nil and string.find(err, "invalid --mode", 1, true),
+    "error mentions invalid mode; got: " .. tostring(err))
 end
 
 -- --format with each valid value.
@@ -163,6 +179,7 @@ do
     "--yolo", "--format", "json", "-m", "gpt", "--think", "high", "-f", "/p", "the prompt")
   assert_eq(err, nil, "no error on combined")
   assert_eq(opts.yolo, true, "yolo")
+  assert_eq(opts.mode, "yolo", "mode")
   assert_eq(opts.format, "json", "format")
   assert_eq(opts.model, "gpt", "model")
   assert_eq(opts.reasoning_effort, "high", "reasoning effort")
@@ -175,6 +192,7 @@ do
   local usage = agentic_cli._usage()
   assert(type(usage) == "string" and #usage > 0, "usage non-empty")
   assert(string.find(usage, "%-%-format"), "usage mentions --format")
+  assert(string.find(usage, "%-%-mode"), "usage mentions --mode")
   assert(string.find(usage, "%-%-yolo"), "usage mentions --yolo")
   assert(string.find(usage, "%-%-model"), "usage mentions --model")
   assert(string.find(usage, "%-%-think"), "usage mentions --think")

@@ -153,18 +153,11 @@ local function handle_input_submit(msg, state)
       popup = { variant = "help" },
     }), {}
   end
-  if cmd == "yolo" then
+  if cmd == "safe" or cmd == "auto" or cmd == "yolo" then
     local s = shallow_merge(state, { input_value = "", completion = NIL_SENTINEL })
     return s, {
       { kind = "send_to", target = "engine",
-        body = { kind = "tool-gate.set_mode", mode = "yolo" } },
-    }
-  end
-  if cmd == "safe" then
-    local s = shallow_merge(state, { input_value = "", completion = NIL_SENTINEL })
-    return s, {
-      { kind = "send_to", target = "engine",
-        body = { kind = "tool-gate.set_mode", mode = "normal" } },
+        body = { kind = "tool-gate.set_mode", mode = cmd } },
     }
   end
   if cmd == "debug" then
@@ -891,7 +884,10 @@ local function handle_tool_popup_request(msg, state)
 end
 
 local function handle_gate_mode_changed(msg, state)
-  return shallow_merge(state, { gate_yolo = msg.mode == "yolo" }), {}
+  local mode = msg.mode
+  if mode == "normal" then mode = "safe" end
+  if mode ~= "safe" and mode ~= "auto" and mode ~= "yolo" then return state, {} end
+  return shallow_merge(state, { gate_mode = mode }), {}
 end
 
 -- ── DAG observation ───────────────────────────────────────────────────

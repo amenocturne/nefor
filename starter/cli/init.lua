@@ -53,7 +53,8 @@ local json = nefor.json
 --   <prompt>                       single positional → single-shot mode
 --   -m / --model <model>           switch model on the active provider
 --   --think/--reasoning-effort <L> set reasoning effort on the active provider
---   --yolo                         set yolo mode
+--   --mode safe|auto|yolo          set permission mode
+--   --yolo                         alias for --mode yolo
 --   --format text|json|stream-json output format
 --   -f / --file <path>             prepend file contents to prompt
 --   --debug                        log-level hint (no-op for v1)
@@ -70,7 +71,8 @@ OPTIONS:
       --think <LEVEL>          Set reasoning effort before the first turn.
       --reasoning-effort <LEVEL>
                                Alias for --think.
-      --yolo                   Enable yolo mode (placeholder; tool-gate not yet wired).
+      --mode <MODE>            Permission mode: safe | auto | yolo.
+      --yolo                   Alias for --mode yolo.
       --format <FMT>           Output format: text (default) | json | stream-json.
   -f, --file <PATH>            Read PATH and prepend its contents to the prompt.
       --debug                  No-op for v1.
@@ -100,6 +102,7 @@ local function parse_argv(argv)
   local opts = {
     model = nil,
     reasoning_effort = nil,
+    mode = nil,
     yolo = false,
     format = "text",
     file = nil,
@@ -121,6 +124,17 @@ local function parse_argv(argv)
       return opts
     elseif a == "--yolo" then
       opts.yolo = true
+      opts.mode = "yolo"
+    elseif a == "--mode" then
+      i = i + 1
+      if argv[i] == nil then
+        return nil, "missing value for --mode"
+      end
+      if argv[i] ~= "safe" and argv[i] ~= "auto" and argv[i] ~= "yolo" then
+        return nil, "invalid --mode value: " .. tostring(argv[i]) ..
+                    " (expected: safe | auto | yolo)"
+      end
+      opts.mode = argv[i]
     elseif a == "--debug" then
       opts.debug = true
     elseif a == "-m" or a == "--model" then
@@ -495,8 +509,8 @@ function M.run(argv)
   if opts.reasoning_effort ~= nil then
     agentic_workflow.set_reasoning_effort(nil, opts.reasoning_effort)
   end
-  if opts.yolo then
-    agentic_workflow.set_yolo(true)
+  if opts.mode ~= nil then
+    agentic_workflow.set_mode(opts.mode)
   end
 
   local state = {}

@@ -50,13 +50,9 @@
 --
 -- ## Failure modes
 --
--- If `da` isn't on PATH, the bash path silently degrades to "defer" so
--- the user keeps full control. The error is logged once at startup so
--- the operator sees it, but runtime keeps working.
---
--- If `nefor.process.run` fails to spawn (e.g. da binary moved), same
--- thing: defer. Better to bother the user than to auto-approve an
--- unclassified command.
+-- `da` is installed by the plugin manager. If it is missing or cannot be
+-- probed, fail loudly: the runtime is mis-installed and bash classification
+-- must not silently degrade.
 
 local envelope     = require("core.envelope")
 local event        = require("core.event")
@@ -65,6 +61,7 @@ local replay_window = require("core.history_replay")
 local emit = envelope.emit
 
 local SOURCE_NAME = "tool-validator"
+local gate_mode = "safe"
 
 -- da policy stack. Mirrors the README example, minus --mkdir-cwd
 -- (which is `--path`-bound; the agent's cwd is the engine's cwd, not
@@ -86,8 +83,8 @@ local DA_ARGS_STRICT_READONLY = {
 }
 
 -- Resolved on first use. The cache holds the resolved cmd path
--- (e.g. /Users/x/.local/share/nefor/bin/da) when da is reachable, or
--- false when the probe failed. nil => not probed yet.
+-- (e.g. /Users/x/.local/share/nefor/bin/da) when da is reachable.
+-- nil => not probed yet.
 local da_cmd = nil
 
 -- Find da via two paths, in priority order:
@@ -118,12 +115,9 @@ local function probe_da()
     return da_cmd
   end
 
-  da_cmd = false
-  nefor.log.warn("tool-validator: `da` not found at " ..
-                 (private or "<data_root>/bin/da") .. " or on PATH; bash " ..
-                 "invocations will defer to the user popup. Re-run " ..
-                 "`just install-nefor` to install it under the libexec dir.")
-  return da_cmd
+  error("tool-validator: `da` not found at " ..
+        (private or "<data_root>/bin/da") .. " or on PATH; re-run " ..
+        "`just install-nefor` to install it under the libexec dir.")
 end
 
 local SMALL_EDIT_POLICY = {
@@ -191,28 +185,60 @@ end
 
 -- Classify a bash command through da. Returns one of:
 --   "approve" | "deny" | "defer"
--- Spawn / unavailability is treated as defer.
+-- `da` probe/spawn failure is a runtime install error and raises.
 local function classify_bash(command, read_only)
   if type(command) ~= "string" or #command == 0 then return "defer" end
   local cmd = probe_da()
-  if not cmd then return "defer" end
   local policy = read_only and DA_ARGS_STRICT_READONLY or DA_ARGS
   local r = nefor.process.run {
     cmd   = cmd,
     args  = policy,
     stdin = command,
   }
-  if type(r) ~= "table" then return "defer" end
+  if type(r) ~= "table" then
+    error("tool-validator: `da` classifier returned a non-table result")
+  end
   if r.code == 0 then return "approve" end
   if r.code == 2 then return "deny" end
   if read_only then return "deny" end
   return "defer"
 end
 
+local function has_approved_plan()
+  local ok, lw = pcall(require, "lead-workflow")
+  if not ok or type(lw) ~= "table" then return false end
+  local internals = lw._internals
+  local st = type(internals) == "table" and internals.state or nil
+  local plan = type(st) == "table" and st.active_plan or nil
+  return type(plan) == "table" and plan.status == "approved"
+end
+
+local function auto_denial_reason(tool)
+  return "permission_denied[auto]: tool `" .. tostring(tool) .. "` requires human approval. " ..
+         "Recovery: switch to /safe and approve the request manually, or revise the task to use read-only/auto-approved tools."
+end
+
+local function defer_or_deny(body)
+  if gate_mode == "yolo" then
+    emit_response(body.id, "approve")
+  elseif gate_mode == "auto" then
+    emit_response(body.id, "deny", auto_denial_reason(body.tool or body.name))
+  else
+    emit_popup(body)
+  end
+end
+
 local function handle_permission_request(body)
   local id = body.id
   if type(id) ~= "string" or #id == 0 then return end
   local tool = body.tool or body.name
+  if type(tool) ~= "string" or #tool == 0 then return end
+
+  if gate_mode == "yolo" then
+    emit_response(id, "approve")
+    return
+  end
+
   local args = body.args
   local is_ro = body.read_only == true
 
@@ -273,7 +299,7 @@ local function handle_permission_request(body)
     -- write-capable roles: fall through to popup.
   end
 
-  emit_popup(body)
+  defer_or_deny(body)
 end
 
 local function receive_msg(entry)
@@ -287,6 +313,12 @@ local function receive_msg(entry)
   local evt = event.decode(entry)
   if evt == nil then return end
   local body = evt.body
+  if evt.kind == "tool-gate.mode_changed" then
+    local mode = body.mode
+    if mode == "normal" then mode = "safe" end
+    if mode == "safe" or mode == "auto" or mode == "yolo" then gate_mode = mode end
+    return
+  end
   if evt.kind ~= "chat.tool.permission_request" then return end
   handle_permission_request(body)
 end
@@ -300,6 +332,12 @@ return {
     classify_bash             = classify_bash,
     classify_dispatch_graph   = classify_dispatch_graph,
     handle_permission_request = handle_permission_request,
-    reset = function() da_cmd = nil end,
+    set_mode = function(mode)
+      if mode == "normal" then mode = "safe" end
+      if mode == "safe" or mode == "auto" or mode == "yolo" then gate_mode = mode end
+    end,
+    get_mode = function() return gate_mode end,
+    has_approved_plan = has_approved_plan,
+    reset = function() da_cmd = nil; gate_mode = "safe" end,
   },
 }

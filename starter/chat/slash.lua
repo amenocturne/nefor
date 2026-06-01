@@ -15,8 +15,9 @@ M.COMMANDS = {
   { name = "think",   aliases = { "effort" }, hint = "set reasoning effort",                  takes_args = true },
   { name = "compact", aliases = {},          hint = "compact active model context",           takes_args = false },
   { name = "resume",  aliases = {},          hint = "resume previous session",                takes_args = true },
-  { name = "yolo",    aliases = {},          hint = "disable tool permission prompts (DANGEROUS)", takes_args = false },
-  { name = "safe",    aliases = {},          hint = "re-enable tool permission prompts",      takes_args = false },
+  { name = "safe",    aliases = {},          hint = "use safe permission prompts",           takes_args = false },
+  { name = "auto",    aliases = {},          hint = "auto-deny requests needing humans",      takes_args = false },
+  { name = "yolo",    aliases = {},          hint = "approve all tool requests (DANGEROUS)",  takes_args = false },
   { name = "approve", aliases = {},          hint = "approve the pending plan (optional reason)", takes_args = true },
   { name = "reject",  aliases = {},          hint = "reject the pending plan with a reason", takes_args = true },
   { name = "debug",   aliases = {},          hint = "toggle diagnostic logging",             takes_args = false },
@@ -42,11 +43,19 @@ end
 -- `cmd` nil when text isn't a slash command.
 function M.parse(text)
   if text:sub(1, 1) ~= "/" then return nil, nil, false end
+  local cmd, rest = text:match("^/(%S+)%s*(.*)$")
   -- Absolute filesystem paths also start with `/`. Treat `/Users/a.png`
   -- or `/tmp/paste.png` as plain chat text so clipboard-image paths can
-  -- be submitted directly instead of becoming an unknown slash command.
-  if text:find("^/[^%s]+/") then return nil, nil, false end
-  local cmd, rest = text:match("^/(%S+)%s*(.*)$")
+  -- be submitted directly instead of becoming an unknown slash command,
+  -- but only after extracting the command word so known slash commands
+  -- like `/safe`, `/auto`, and `/yolo` still work.
+  if text:find("^/[^%s]+/") then
+    local known = false
+    for _, entry in ipairs(M.COMMANDS) do
+      if entry.name == cmd then known = true; break end
+    end
+    if not known then return nil, nil, false end
+  end
   local has_ws = text:find("^/%S+%s") ~= nil
   return cmd, (rest ~= "" and rest or nil), has_ws
 end

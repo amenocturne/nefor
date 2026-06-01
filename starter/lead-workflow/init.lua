@@ -100,6 +100,7 @@ local state = {
   --   }
   ---@type table|nil
   active_plan = nil,
+  gate_mode = "safe",
 }
 
 local SOURCE_NAME = "lead-workflow"
@@ -420,18 +421,27 @@ end
 -- (explorer, reviewer, critic, reflector) is always allowed.
 --
 -- Returns nil on pass, an error string on rejection.
-local function gate_against_unapproved_plan(node_specs)
+local function writer_denial_message(prefix, plan_state, writers)
+  return string.format(
+    "%s: write-capable roles require an approved plan with human approval, but %s. " ..
+    "Offending node(s): %s. Recovery: switch to /safe, submit a plan with " ..
+    "write-review, and wait for the user's /approve before dispatching " ..
+    "the implementation graph; or restrict this dispatch to read-only " ..
+    "roles (explorer/reviewer/critic/reflector).",
+    prefix, plan_state, table.concat(writers, ", "))
+end
+
+local function writer_gate_state(node_specs)
   local approved = type(state.active_plan) == "table"
                    and state.active_plan.status == "approved"
-  if approved then return nil end
   local writers = {}
-  for _, spec in ipairs(node_specs) do
+  for _, spec in ipairs(node_specs or {}) do
     local cfg = role_config(spec.role)
     if type(cfg) == "table" and cfg.read_only == false then
       writers[#writers + 1] = spec.role .. " (node `" .. tostring(spec.id) .. "`)"
     end
   end
-  if #writers == 0 then return nil end
+  if #writers == 0 then return approved, nil, nil end
   local plan_state
   if type(state.active_plan) ~= "table" then
     plan_state = "no plan submitted yet"
@@ -442,15 +452,15 @@ local function gate_against_unapproved_plan(node_specs)
   else
     plan_state = "no approved plan in this turn"
   end
-  return string.format(
-    "dispatch-graph: write-capable roles require an approved plan, but %s. "
-    .. "Offending node(s): %s. Either restrict this dispatch to read-only "
-    .. "roles (explorer/reviewer/critic/reflector — investigation), or "
-    .. "submit a plan with write-review and wait for the user's /approve "
-    .. "before dispatching the implementation graph.",
-    plan_state, table.concat(writers, ", "))
+  return approved, writers, plan_state
 end
 
+local function gate_against_unapproved_plan(node_specs)
+  if state.gate_mode == "yolo" then return nil end
+  local approved, writers, plan_state = writer_gate_state(node_specs)
+  if approved or writers == nil then return nil end
+  return writer_denial_message("dispatch-graph", plan_state, writers)
+end
 local function dispatch_graph(firing_id, args)
   local nodes = args and args.nodes
   local graph, err = build_graph_spec(nodes, args and args.terminal)
@@ -523,6 +533,19 @@ local function submit_plan(firing_id, args)
   local plan = args and args.plan
   if type(plan) ~= "string" or #plan == 0 then
     emit_tool_result_err(firing_id, "write-review: args.plan must be a non-empty string")
+    return
+  end
+
+  if state.gate_mode == "yolo" then
+    emit_tool_result_ok(firing_id, {
+      status = "approved",
+      notice = "YOLO mode: write-review approval gate bypassed; proceed with implementation.",
+    })
+    return
+  elseif state.gate_mode == "auto" then
+    emit_tool_result_err(firing_id,
+      "permission_denied[auto]: write-review requires human approval, and /auto never opens a pending approval. " ..
+      "Recovery: switch to /safe to review and approve a plan manually, or continue with read-only investigation.")
     return
   end
 
@@ -898,6 +921,13 @@ local function receive_msg(entry)
     return
   end
 
+  if kind == "tool-gate.mode_changed" then
+    local mode = body.mode
+    if mode == "normal" then mode = "safe" end
+    if mode == "safe" or mode == "auto" or mode == "yolo" then state.gate_mode = mode end
+    return
+  end
+
   -- Skip the rest during replay — chat input + run-close watching are
   -- live-only concerns (they drive new bus emissions which sessions
   -- shouldn't double-record).
@@ -988,6 +1018,7 @@ return {
     reset = function()
       state.active_run_ids = {}
       state.active_plan = nil
+      state.gate_mode = "safe"
       advertised = false
     end,
   },

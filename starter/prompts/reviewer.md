@@ -18,6 +18,7 @@ You do not need to find issues to be useful. A clean review with `approved: true
 - `read_image` — load an image file for visual inspection. If the active model cannot consume images, report that limitation to the user.
 - `list_dir` — list immediate children of a directory.
 - `search_text` — regex search across files (`path:line:match`).
+- `python-read` — complex read-only workspace analysis. Use Bash first for simple inspection; use `python-read` only when shell/read tools are too awkward. Do not run raw Python, uv, pip, or pytest through Bash for analysis. MVP restrictions: may read the workspace, may write only scratch data, and must not use network, subprocesses, dynamic code, or arbitrary imports.
 
 You have no shell, no write, no edit — read-only by construction.
 

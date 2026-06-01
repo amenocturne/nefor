@@ -1591,24 +1591,25 @@ fn slash_help_popup_side_bars_paint_every_body_row() {
 }
 
 #[test]
-fn slash_yolo_emits_tool_gate_set_mode() {
-    let mut engine = Engine::new(80, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
-    let _ = render_str(&mut engine);
-    for ch in "/yolo".chars() {
-        engine.handle_key(key(&ch.to_string())).expect("type");
+fn slash_permission_modes_emit_tool_gate_set_mode() {
+    for mode in ["safe", "auto", "yolo"] {
+        let mut engine = Engine::new(80, 24).expect("engine");
+        engine.load_scenario(&chat_lua_source()).expect("load");
+        let _ = render_str(&mut engine);
+
+        for ch in format!("/{mode}").chars() {
+            engine.handle_key(key(&ch.to_string())).expect("type");
+        }
+        engine.handle_key(key("enter")).expect("enter");
+        let emits = engine.take_emit_queue();
+        let emit = emits
+            .iter()
+            .find(|(_, body)| {
+                body.get("kind").and_then(|v| v.as_str()) == Some("tool-gate.set_mode")
+            })
+            .unwrap_or_else(|| panic!("expected tool-gate.set_mode for /{mode}; got {emits:?}"));
+        assert_eq!(emit.1.get("mode").and_then(|v| v.as_str()), Some(mode));
     }
-    engine.handle_key(key("enter")).expect("enter");
-    let emits = engine.take_emit_queue();
-    assert_eq!(emits.len(), 1, "expected one egress");
-    assert_eq!(
-        emits[0].1.get("kind").and_then(|v| v.as_str()),
-        Some("tool-gate.set_mode")
-    );
-    assert_eq!(
-        emits[0].1.get("mode").and_then(|v| v.as_str()),
-        Some("yolo")
-    );
 }
 
 #[test]
