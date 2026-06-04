@@ -1,107 +1,112 @@
 # nefor-team starter config
 
-Team configuration for the nefor engine — DP→JWT auth against Nestor,
-the lead orchestrator workflow, Jira/Confluence tools, and a think-tag
-filter for qwen-family models. This is a plain consumer of upstream
-nefor: generic engine plumbing comes from upstream via `nefor-pm`; this
-directory carries only team-specific overrides.
+Командная конфигурация для движка nefor: DP→JWT-авторизация в Nestor, рабочий
+процесс lead-оркестратора, Jira/Confluence-инструменты и фильтр тегов
+рассуждения для моделей семейства qwen. Это обычный потребитель поверх upstream
+nefor: общая движковая обвязка приходит из upstream через `nefor-pm`, а этот
+каталог хранит только командные наложения.
 
-For run / sync instructions see [`../README.md`](../README.md) and the
-repo-level [`justfile`](../justfile).
+Инструкции по запуску и синхронизации находятся в [`../README.md`](../README.md)
+и корневом [`justfile`](../justfile).
 
-## Exact version pin
+## Точная версия
 
-The repo root `.env` is the source of truth for the runtime version:
+Корневой `.env` — источник истины для версии среды выполнения:
 
 ```sh
 NEFOR_VERSION=0.3.0
 ```
 
-`just sync` reads that file, asks for explicit confirmation, installs the exact
-pinned nefor version, overwrites `~/.config/nefor` from `starter/`, and copies
-`.env` to `~/.config/nefor/.env`. It does not run tests and must not mutate repo
-files.
+`just sync` читает этот файл, просит явное подтверждение, устанавливает ровно
+закреплённую версию nefor, перезаписывает `~/.config/nefor` из `starter/` и
+копирует `.env` в `~/.config/nefor/.env`. Команда не запускает тесты и не должна
+изменять файлы репозитория.
 
-At startup `init.lua` reads `NEFOR_CONFIG_DIR/.env` first, then falls back to
-`NEFOR_CONFIG_DIR/../.env` when the local file is missing or empty. It
-hard-errors when `nefor.version` differs from `NEFOR_VERSION`, with a `just
-sync` remediation. That keeps the installed binary and installed Lua config in
-lockstep while allowing `just run` to use the repo-root pin.
+При старте `init.lua` сначала читает `NEFOR_CONFIG_DIR/.env`, затем падает
+обратно на `NEFOR_CONFIG_DIR/../.env`, если локального файла нет или он пустой.
+Если `nefor.version` отличается от `NEFOR_VERSION`, запуск останавливается с
+подсказкой выполнить `just sync`. Так установленный бинарь и установленная Lua
+конфигурация остаются синхронизированы, а `just run` может использовать корневое
+закрепление версии.
 
-## File inventory
+## Состав файлов
 
-### Composition root
+### Корень композиции
 
-- `init.lua` — checks the exact version pin, bootstraps nefor-pm,
-  installs plugin libs, grafts package paths, and composes the team's
-  variant-driven actor graph (Nestor / ollama / mock).
+- `init.lua` — проверяет точную версию, запускает `nefor-pm`, устанавливает
+  библиотеки плагинов, настраивает `package.path` и собирает граф акторов по
+  выбранному варианту для Nestor, Ollama или mock.
 
-### Team-only modules
+### Командные модули
 
-- `config/init.lua` — variant table (prod=Nestor / test=ollama / mock),
-  per-role model pinning via `workflow.role_models`, and binary-path
-  resolver (`config.bin("<name>")`).
-- `lead-workflow/role.lua` — role roster: `explorer`, `worker`,
-  `reviewer`, `docs`, `critic`. Exposes `LEAD_SYSTEM_PROMPT`,
-  `AGENT_CONFIGS`, `ORCHESTRATION_TOOLS`, and `TOOL_ALLOWLIST`.
-- `auth/init.lua` — DP CLI subprocess + JWT exchange against Nestor's
-  `/api/v2/token`. Used only by the Nestor variant.
-- `compositors/qwen_hooks.lua` — team-owned hooks wired into upstream's
-  provider compositor for qwen think-tag filtering and Nestor model-list
-  interception.
+- `config/init.lua` — таблица вариантов (`prod` = Nestor, `test` = Ollama,
+  `mock` = mock), закрепление моделей по ролям через `workflow.role_models` и
+  разрешение путей к бинарям (`config.bin("<name>")`).
+- `lead-workflow/role.lua` — список ролей: `explorer`, `worker`, `reviewer`,
+  `docs`, `critic`. Экспортирует `LEAD_SYSTEM_PROMPT`, `AGENT_CONFIGS`,
+  `ORCHESTRATION_TOOLS` и `TOOL_ALLOWLIST`.
+- `auth/init.lua` — подпроцесс к DP CLI и обмен JWT через Nestor
+  `/api/v2/token`. Используется только Nestor-вариантом.
+- `compositors/qwen_hooks.lua` — командные хуки, подключённые к upstream
+  композитору провайдера для фильтрации qwen-тегов рассуждения и перехвата
+  списка моделей Nestor.
 
-### Team-only prompts
+### Командные промпты
 
-- `prompts/lead.md` — Qwen-oriented lead orchestrator prompt with explicit
-  routing rules, planning/critic workflow, approval semantics, and graph rules.
-- `prompts/explorer.md` — read-only investigation.
-- `prompts/worker.md` — general write-capable approved-work executor.
-- `prompts/reviewer.md` — read-only review.
-- `prompts/docs.md` — Jira/Confluence/local docs agent; write-capable for
-  approved documentation changes.
-- `prompts/critic.md` — read-only plan critique.
+- `prompts/lead.md` — qwen-ориентированный промпт для lead-оркестратора с
+  явными правилами маршрутизации, рабочим процессом планирования и критики,
+  семантикой одобрений и правилами графа.
+- `prompts/explorer.md` — исследование только для чтения.
+- `prompts/worker.md` — исполнитель одобренной работы с правом записи.
+- `prompts/reviewer.md` — ревью только для чтения.
+- `prompts/docs.md` — агент для Jira, Confluence и локальной документации;
+  может писать docs после approval.
+- `prompts/critic.md` — критика плана только для чтения.
 
-Tests live outside `starter/` under [`../tests/lua/`](../tests/lua/) so the
-installed config has no test code.
+Тесты лежат вне `starter/`, в [`../tests/lua/`](../tests/lua/), чтобы в
+установленную конфигурацию не попадал тестовый код.
 
-## Approval policy
+## Политика одобрений
 
-Plan approval gates only write-capable roles: `worker` and `docs`.
-Read-only roles (`explorer`, `reviewer`, `critic`) may dispatch without plan
-approval. After approval, normal file edit/write tools inside write-capable
-agents do not require another plan approval.
+Одобрение плана требуется только для ролей с правом записи: `worker` и `docs`.
+Роли только для чтения (`explorer`, `reviewer`, `critic`) могут запускаться без
+одобрения плана. После одобрения обычные инструменты изменения и записи файлов
+внутри агентов с правом записи не требуют ещё одного одобрения плана.
 
-Permission modes mirror upstream: `/safe` is the default interactive
-approve/deny/defer mode; `dispatch-graph` and ambiguous `bash` stay
-runtime-gated there. `/auto` is unattended approve/deny-only mode: anything
-that would defer to the user is denied with recovery text. `/yolo` fully
-approves all tool calls.
+Режимы разрешений повторяют upstream: `/safe` — интерактивный режим по умолчанию
+с одобрением, отклонением или отложенным решением; `dispatch-graph` и
+неоднозначные `bash` остаются под проверкой во время выполнения. `/auto` —
+автономный режим только с одобрением или отклонением: всё, что потребовало бы
+отложенного решения пользователя, превращается в отклонение с подсказкой по
+восстановлению. `/yolo` полностью одобряет все вызовы инструментов.
 
-The team config declares read-only/write-capable role metadata explicitly via
-`AGENT_CONFIGS[role].read_only`; it does not rely on an implicit upstream helper
-or missing default.
+Командная конфигурация явно объявляет метаданные «только чтение / право записи»
+через `AGENT_CONFIGS[role].read_only`; она не полагается на неявную
+вспомогательную функцию upstream или отсутствующее значение по умолчанию.
 
-## Run modes (NEFOR_DEV_DIR)
+## Режимы запуска (`NEFOR_DEV_DIR`)
 
-The team's `init.lua` supports two run modes:
+`init.lua` поддерживает два режима:
 
-- **Dev mode** (`NEFOR_DEV_DIR=/path/to/personal/nefor`) — `pm.install` specs
-  use local `dir` overrides and `STARTER_UPSTREAM = NEFOR_DEV_DIR/starter`.
-- **Prod mode** (`NEFOR_DEV_DIR` unset) — the upstream nefor repo is sparse
-  cloned under `$NEFOR_DATA_DIR/nefor/` and pinned from the running engine
-  version (`0.3.0` → `v0.3.0`; dev/nightly versions fall back to `main`).
+- **Режим разработки** (`NEFOR_DEV_DIR=/path/to/personal/nefor`) — спецификации
+  `pm.install` используют локальные переопределения `dir`, а `STARTER_UPSTREAM`
+  указывает на `NEFOR_DEV_DIR/starter`.
+- **Продуктовый режим** (`NEFOR_DEV_DIR` не задан) — upstream nefor клонируется
+  через sparse-checkout в `$NEFOR_DATA_DIR/nefor/` и закрепляется по версии
+  запущенного движка (`0.3.0` → `v0.3.0`; dev/nightly версии используют `main`).
 
-For private local provider experiments, put local variants in
-`starter/config/local.lua`. The file is gitignored and loaded before
-`NEFOR_CONFIG` is resolved. `just run` also sources root `.env.local` after the
-tracked `.env` so local-only env vars can feed that variant.
+Для приватных локальных экспериментов с провайдерами добавьте варианты в
+`starter/config/local.lua`. Файл игнорируется git и загружается до разрешения
+`NEFOR_CONFIG`. `just run` также загружает корневой `.env.local` после
+отслеживаемого `.env`, чтобы локальные переменные окружения могли питать этот
+вариант.
 
-## Sync procedure when upstream advances
+## Процедура синхронизации при изменении upstream
 
-1. Update root `.env` to the new target `NEFOR_VERSION`.
-2. Inspect upstream changes for actor/spec shape, lead-workflow API,
-   agentic-loop behavior, provider compositor hooks, tool allowlists, and plugin
-   binary layout.
-3. Apply only team-side overlay changes needed for compatibility; do not rewrite
-   toward generated agentic-kit config.
-4. Run Lua tests locally. `just sync` intentionally does not run tests.
+1. Обновить корневой `.env` до нового `NEFOR_VERSION`.
+2. Проверить изменения upstream: форму actor/spec, API `lead-workflow`,
+   поведение `agentic-loop`, хуки композитора провайдера, списки разрешённых
+   инструментов и раскладку бинарей плагинов.
+3. Применить только изменения командных наложений, нужные для совместимости; не
+   переписывать конфиг в сторону сгенерированной конфигурации agentic-kit.
+4. Запустить Lua-тесты локально. `just sync` намеренно не запускает тесты.
