@@ -406,9 +406,9 @@ impl Registry {
             }
         }
 
-        // Wipe prior entries owned by this sender (so re-installing during
-        // tests is idempotent), then insert.
-        self.entries.retain(|_, owned| owned.owner != sender);
+        // Built-ins share the host namespace, so each install must preserve
+        // the other built-ins. Inserting by identity is enough for
+        // idempotency: reinstalling the same built-in replaces that entry.
         for imp in impls {
             let identity = imp.identity();
             let handler = imp.handler().clone();

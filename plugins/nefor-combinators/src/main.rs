@@ -1197,6 +1197,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_builtins_do_not_replace_each_other() {
+        let r: Arc<Mutex<Registry>> = Arc::new(Mutex::new(Registry::new()));
+        install_builtin_tool_split(&r).await;
+        install_builtin_retry_split(&r).await;
+
+        let tool_split_id = Identity::new(
+            1,
+            fqt("generic-provider", "ProviderOut"),
+            vec![
+                fqt("generic-tool", "ToolCalls"),
+                fqt("generic-provider", "FinalAnswer"),
+            ],
+        );
+        let retry_split_id = Identity::new(
+            1,
+            fqt("generic-control", "RetryDecision"),
+            vec![
+                fqt("generic-control", "Retry"),
+                fqt("generic-control", "Pass"),
+                fqt("generic-control", "Exhausted"),
+            ],
+        );
+
+        let guard = r.lock().await;
+        assert_eq!(
+            guard
+                .lookup(&tool_split_id)
+                .expect("tool_split registered")
+                .handler
+                .to_wire(),
+            "nefor-combinators.tool_split"
+        );
+        assert_eq!(
+            guard
+                .lookup(&retry_split_id)
+                .expect("retry_split registered")
+                .handler
+                .to_wire(),
+            "nefor-combinators.retry_split"
+        );
+    }
+
+    #[tokio::test]
     async fn query_round_trip_resolves_pass_through_via_synthesis() {
         // Drives the full query path: registry has only an Into entry; a
         // query for one resolved + one missing + one pass-through-synthesised
