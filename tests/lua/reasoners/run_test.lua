@@ -130,6 +130,7 @@ end
 
 do
   run._internals.reset()
+  bash_command._internals.reset()
   _test.calls_clear()
 
   local ret = dispatch(run.handle, "f-echo", { command = "echo hello" })
@@ -170,6 +171,8 @@ do
   assert_eq(invoke.body.name, "bash", "bash_command targets the bash tool through tool-gate")
   assert_eq(invoke.body.args.command, "pwd", "bash_command forwards command verbatim")
   local tool_id = invoke.body.id
+  assert_true(bash_command._internals.tool_to_firing[tool_id] == "f-bash-command",
+    "bash_command owns its correlation table")
 
   _test.calls_clear()
   bash_command.receive_msg(make_entry("tool-gate", {

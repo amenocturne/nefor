@@ -73,4 +73,36 @@ do
   assert_eq(calls[1].decision, "approve", "yolo decision is approve")
 end
 
+-- yolo: full-approve happens before read-only and approved-plan gates.
+do
+  fresh("yolo")
+  feed({
+    kind = "chat.tool.permission_request",
+    id = "perm-yolo-edit-readonly",
+    tool = "edit_file",
+    read_only = true,
+    args = { path = "some/file.lua", old_string = "a", new_string = "b" },
+  })
+  local calls = decode_calls()
+  assert_eq(#calls, 1, "yolo edit_file read-only emits one envelope")
+  assert_eq(calls[1].kind, "tool.permission_response", "yolo edit_file read-only approves")
+  assert_eq(calls[1].decision, "approve", "yolo edit_file read-only decision is approve")
+  assert_eq(calls[1].reason, nil, "yolo edit_file approval has no denial reason")
+end
+
+-- yolo: write_file also bypasses the approved-plan denial path.
+do
+  fresh("yolo")
+  feed({
+    kind = "chat.tool.permission_request",
+    id = "perm-yolo-write-no-plan",
+    tool = "write_file",
+    args = { path = "some/file.lua", content = "return true\n" },
+  })
+  local calls = decode_calls()
+  assert_eq(#calls, 1, "yolo write_file no-plan emits one envelope")
+  assert_eq(calls[1].kind, "tool.permission_response", "yolo write_file no-plan approves")
+  assert_eq(calls[1].decision, "approve", "yolo write_file no-plan decision is approve")
+end
+
 print("tool_validator_mode_test: all assertions passed")
