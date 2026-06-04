@@ -91,6 +91,52 @@ nefor
 just run
 ```
 
+Для локальных приватных вариантов используйте файлы, которые git игнорирует:
+
+- `.env.local` — локальные env vars; `just run` загружает его после `.env`.
+- `starter/config/local.lua` — локальные варианты `NEFOR_CONFIG` и provider
+  spawn hook'и.
+
+`starter/config/local.lua` должен вернуть таблицу `variants`. В chunk первым
+аргументом передаются helpers: `all_roles`, `workflow_with`,
+`shared_tool_gate`, `env_or`.
+
+```lua
+local h = ...
+
+return {
+  variants = {
+    local_provider = {
+      provider = {
+        kind = "local",
+        name = "local-provider",
+        model = os.getenv("NEFOR_LOCAL_MODEL"),
+      },
+      tool_gate = h.shared_tool_gate,
+      workflow = h.workflow_with(h.all_roles(os.getenv("NEFOR_LOCAL_MODEL"))),
+      log_level = "info",
+      spawn_provider = function(ctx)
+        ctx.actor.spawn(require("compositors.provider").spawn_spec(
+          ctx.provider_name,
+          {
+            ctx.bin(os.getenv("NEFOR_LOCAL_PROVIDER_BIN")),
+            "--name", ctx.provider_name,
+            "--model", ctx.chosen_model,
+          },
+          { agentic_loop = ctx.agentic_loop }
+        ))
+      end,
+    },
+  },
+}
+```
+
+Запуск:
+
+```sh
+NEFOR_CONFIG=local_provider just run
+```
+
 ## Выбор модели
 
 По умолчанию используется модель, отмеченная `is_default` в Nestor.

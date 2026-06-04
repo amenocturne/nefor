@@ -146,6 +146,50 @@ M.confluence = {
   host = "https://wiki.tcsbank.ru",
 }
 
+local function file_exists(path)
+  local f = io.open(path, "r")
+  if f then f:close(); return true end
+  return false
+end
+
+local function load_local_config()
+  local starter_root = rawget(_G, "NEFOR_CONFIG_DIR") or "."
+  local path = starter_root .. "/config/local.lua"
+  if not file_exists(path) then return end
+
+  local chunk, err = loadfile(path)
+  if not chunk then
+    error("config.local: cannot load " .. path .. ": " .. tostring(err))
+  end
+
+  local helpers = {
+    all_roles        = all_roles,
+    workflow_with    = workflow_with,
+    shared_tool_gate = SHARED_TOOL_GATE,
+    env_or           = env_or,
+  }
+  local ok, local_cfg = pcall(chunk, helpers)
+  if not ok then
+    error("config.local: " .. tostring(local_cfg))
+  end
+  if local_cfg == nil then return end
+  if type(local_cfg) ~= "table" then
+    error("config.local: expected table return, got " .. type(local_cfg))
+  end
+
+  local variants = local_cfg.variants or local_cfg
+  if type(variants) ~= "table" then
+    error("config.local: variants must be a table")
+  end
+  for name, cfg in pairs(variants) do
+    if type(name) == "string" and type(cfg) == "table" then
+      M[name] = cfg
+    end
+  end
+end
+
+load_local_config()
+
 local variant = os.getenv("NEFOR_CONFIG")
 if variant == nil or variant == "" then
   variant = "prod"

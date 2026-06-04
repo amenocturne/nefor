@@ -66,4 +66,13 @@ copy mode="safe":
 
 # Run nefor with team config.
 run:
-    RUST_LOG=info nefor --config $PWD/starter
+    #!/usr/bin/env bash
+    set -eu
+    ROOT="{{justfile_directory()}}"
+    set -a
+    . "$ROOT/.env"
+    if [ -f "$ROOT/.env.local" ]; then
+      . "$ROOT/.env.local"
+    fi
+    set +a
+    RUST_LOG="${RUST_LOG:-info}" nefor --config "$ROOT/starter"

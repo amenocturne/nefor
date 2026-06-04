@@ -336,7 +336,25 @@ actor.spawn(require("reasoners"))
 local PROVIDER_NAME = cfg.provider.name
 local bin           = config.bin
 
-if cfg.provider.kind == "mock" then
+if type(cfg.spawn_provider) == "function" then
+  local ok, err = pcall(cfg.spawn_provider, {
+    actor          = actor,
+    bin            = bin,
+    provider_name  = PROVIDER_NAME,
+    chosen_model   = CHOSEN_MODEL,
+    agentic_loop   = agentic_loop,
+    config         = config,
+    cfg            = cfg,
+    starter_root   = STARTER_ROOT,
+    starter_upstream = STARTER_UPSTREAM,
+    log_banner     = log_banner,
+  })
+  if not ok then
+    error("local provider spawn failed for variant " .. tostring(config.variant) ..
+          ": " .. tostring(err))
+  end
+
+elseif cfg.provider.kind == "mock" then
   -- mock-plugin speaks the same wire protocol as openai-provider, so
   -- the upstream provider compositor works as-is.
   actor.spawn(require("compositors.provider").spawn_spec(
@@ -415,7 +433,7 @@ elseif cfg.provider.kind == "nestor" then
 
 else
   error("unknown cfg.provider.kind: " .. tostring(cfg.provider.kind) ..
-        " (expected one of: mock, ollama, nestor)")
+        " (expected one of: mock, ollama, nestor, or local spawn_provider)")
 end
 
 actor.spawn(require("compositors.graph").spawn_spec({ bin("reasoner-graph") }))

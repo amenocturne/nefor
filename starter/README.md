@@ -91,6 +91,11 @@ The team's `init.lua` supports two run modes:
   cloned under `$NEFOR_DATA_DIR/nefor/` and pinned from the running engine
   version (`0.3.0` → `v0.3.0`; dev/nightly versions fall back to `main`).
 
+For private local provider experiments, put local variants in
+`starter/config/local.lua`. The file is gitignored and loaded before
+`NEFOR_CONFIG` is resolved. `just run` also sources root `.env.local` after the
+tracked `.env` so local-only env vars can feed that variant.
+
 ## Sync procedure when upstream advances
 
 1. Update root `.env` to the new target `NEFOR_VERSION`.
