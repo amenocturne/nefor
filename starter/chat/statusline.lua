@@ -58,10 +58,12 @@ end
 
 local function build_segments(state)
   local segs = {}
-  if state.gate_mode == "yolo" then
-    segs[#segs + 1] = { spans = { { text = "YOLO", fg = C.status_danger, bold = true } } }
+  if state.gate_mode == "safe" then
+    segs[#segs + 1] = { spans = { { text = "SAFE", fg = C.status_ok, bold = true } } }
   elseif state.gate_mode == "auto" then
     segs[#segs + 1] = { spans = { { text = "AUTO", fg = C.status_warn, bold = true } } }
+  elseif state.gate_mode == "yolo" then
+    segs[#segs + 1] = { spans = { { text = "YOLO", fg = C.status_danger, bold = true } } }
   end
   local model = state.model or (state.stats and state.stats.model)
   if model then

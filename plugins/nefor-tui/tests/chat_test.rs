@@ -1613,6 +1613,29 @@ fn slash_permission_modes_emit_tool_gate_set_mode() {
 }
 
 #[test]
+fn statusline_shows_current_permission_mode() {
+    for (mode, label) in [("safe", "SAFE"), ("auto", "AUTO"), ("yolo", "YOLO")] {
+        let mut engine = Engine::new(80, 24).expect("engine");
+        engine.load_scenario(&chat_lua_source()).expect("load");
+        let _ = render_str(&mut engine);
+
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "tool-gate.mode_changed",
+                "mode": mode,
+            }),
+        );
+        let _ = render_str(&mut engine);
+        let out = engine.snapshot();
+        assert!(
+            out.contains(label),
+            "statusline should show current permission mode {mode:?}: {out:?}"
+        );
+    }
+}
+
+#[test]
 fn tool_permission_request_opens_popup_with_approve_deny() {
     // Wire-shape contract: the event the popup listens for is
     // `chat.tool.popup_request` — emitted by starter/tool-validator
