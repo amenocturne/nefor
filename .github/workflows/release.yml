@@ -227,7 +227,7 @@ jobs:
           token: ${{ secrets.TAP_PUSH_TOKEN }}
           persist-credentials: true
 
-      - name: Update Formula/nefor.rb
+      - name: Update Homebrew formulas
         env:
           TAG: ${{ needs.setup.outputs.tag_name }}
           VERSION: ${{ needs.publish.outputs.version }}
@@ -243,6 +243,7 @@ jobs:
           # comments and substitute the lines beneath.
           python3 - <<'PY'
           import os, re, pathlib
+          DESC = 'Agentic runtime with Lua-composed tools, providers, and workflows'
           path = pathlib.Path("Formula/nefor.rb")
           src = path.read_text()
           version = os.environ["VERSION"]
@@ -257,6 +258,7 @@ jobs:
               "LINUX_X86_64": "x86_64-unknown-linux-gnu",
               "LINUX_ARM64":  "aarch64-unknown-linux-gnu",
           }
+          src = re.sub(r'^(\s*desc\s+)"[^"]*"', rf'\1"{DESC}"', src, count=1, flags=re.MULTILINE)
           src = re.sub(r'^(\s*version\s+)"[^"]*"', rf'\1"{version}"', src, count=1, flags=re.MULTILINE)
           for slot, sha in shas.items():
               target = targets[slot]
@@ -272,18 +274,77 @@ jobs:
               if n != 1:
                   raise SystemExit(f"slot {slot} not found in Formula/nefor.rb (need '# slot: {slot}' marker)")
           path.write_text(src)
+
+          class_suffix = re.sub(r"\D", "", version)
+          versioned = re.sub(
+              r'^class Nefor < Formula$',
+              f'class NeforAT{class_suffix} < Formula',
+              src,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          versioned = re.sub(
+              r'^(  license "MIT"\n)(?:\n  keg_only :versioned_formula\n)?',
+              r'\1\n  keg_only :versioned_formula\n',
+              versioned,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          versioned = re.sub(
+              r'\n  # `brew install --HEAD .*?\n  head do\n.*?\n  end\n',
+              '\n',
+              versioned,
+              count=1,
+              flags=re.DOTALL,
+          )
+          versioned = re.sub(
+              r'\n  def install\n.*?\n  end\n',
+              (
+                  '\n  def install\n'
+                  '    bin.install "bin/nefor"\n'
+                  '    (share/"nefor/plugins").install Dir["share/nefor/plugins/*"]\n'
+                  '    (share/"nefor/starter").install Dir["share/nefor/starter/*"]\n'
+                  '    share.install "share/nefor/LICENSE", "share/nefor/README.md"\n'
+                  '    share.install "share/nefor/CHANGELOG.md" if File.exist?("share/nefor/CHANGELOG.md")\n'
+                  '  end\n'
+              ),
+              versioned,
+              count=1,
+              flags=re.DOTALL,
+          )
+          versioned = re.sub(
+              r'  def caveats\n    <<~EOS\n.*?    EOS\n  end\n',
+              (
+                  '  def caveats\n'
+                  '    <<~EOS\n'
+                  '      This is a keg-only versioned formula. To use it without linking:\n'
+                  '        #{opt_bin}/nefor\n'
+                  '\n'
+                  '      To scaffold a config for this version:\n'
+                  '        mkdir -p ~/.config/nefor\n'
+                  '        cp -R #{share}/nefor/starter/. ~/.config/nefor/\n'
+                  '    EOS\n'
+                  '  end\n'
+              ),
+              versioned,
+              count=1,
+              flags=re.DOTALL,
+          )
+          pathlib.Path(f"Formula/nefor@{version}.rb").write_text(versioned)
           PY
 
       - name: Commit + push
         env:
           TAG: ${{ needs.setup.outputs.tag_name }}
+          VERSION: ${{ needs.publish.outputs.version }}
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet Formula/nefor.rb; then
+          if [ -z "$(git status --porcelain Formula)" ]; then
             echo "No formula changes; skipping commit."
             exit 0
           fi
-          git commit -am "Bump nefor to ${TAG}"
+          git add Formula/nefor.rb "Formula/nefor@${VERSION}.rb"
+          git commit -m "Bump nefor to ${TAG}"
           git push
