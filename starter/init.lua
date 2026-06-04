@@ -445,8 +445,12 @@ for _, t in ipairs(cfg.tool_gate.auto_tools or {}) do
   tool_gate_argv[#tool_gate_argv + 1] = "--auto"
   tool_gate_argv[#tool_gate_argv + 1] = t
 end
+for _, t in ipairs(cfg.tool_gate.deny_tools or {}) do
+  tool_gate_argv[#tool_gate_argv + 1] = "--deny"
+  tool_gate_argv[#tool_gate_argv + 1] = t
+end
 tool_gate_argv[#tool_gate_argv + 1] = "--default"
-tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
+tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action or "prompt"
 
 -- Register lead-workflow BEFORE spawning tool-gate so the lead's
 -- bus subscription is live when tool-gate.hello arrives — otherwise

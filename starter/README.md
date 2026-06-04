@@ -14,7 +14,7 @@ repo-level [`justfile`](../justfile).
 The repo root `.env` is the source of truth for the runtime version:
 
 ```sh
-NEFOR_VERSION=0.2.0
+NEFOR_VERSION=0.3.0
 ```
 
 `just sync` reads that file, asks for explicit confirmation, installs the exact
@@ -69,8 +69,13 @@ installed config has no test code.
 Plan approval gates only write-capable roles: `worker` and `docs`.
 Read-only roles (`explorer`, `reviewer`, `critic`) may dispatch without plan
 approval. After approval, normal file edit/write tools inside write-capable
-agents do not require another plan approval. Ambiguous `bash` commands still go
-through tool approval when deterministic policy / `da` cannot classify them.
+agents do not require another plan approval.
+
+Permission modes mirror upstream: `/safe` is the default interactive
+approve/deny/defer mode; `dispatch-graph` and ambiguous `bash` stay
+runtime-gated there. `/auto` is unattended approve/deny-only mode: anything
+that would defer to the user is denied with recovery text. `/yolo` fully
+approves all tool calls.
 
 The team config declares read-only/write-capable role metadata explicitly via
 `AGENT_CONFIGS[role].read_only`; it does not rely on an implicit upstream helper
@@ -84,7 +89,7 @@ The team's `init.lua` supports two run modes:
   use local `dir` overrides and `STARTER_UPSTREAM = NEFOR_DEV_DIR/starter`.
 - **Prod mode** (`NEFOR_DEV_DIR` unset) — the upstream nefor repo is sparse
   cloned under `$NEFOR_DATA_DIR/nefor/` and pinned from the running engine
-  version (`0.2.0` → `v0.2.0`; dev/nightly versions fall back to `main`).
+  version (`0.3.0` → `v0.3.0`; dev/nightly versions fall back to `main`).
 
 ## Sync procedure when upstream advances
 

@@ -81,20 +81,21 @@ end
 -- only differ by which provider/model they point at. The gate is part
 -- of the product, not a per-environment knob.
 --
--- Default stance: every tool in lead_role.TOOL_ALLOWLIST runs --auto
--- (read-only investigation tools never need a popup; worker/docs sub-agents
--- inherit trust from the dispatch-graph plan approval). prompt_tools flips
--- the two runtime gating points back to --prompt:
+-- Default runtime mode is /safe: every tool in lead_role.TOOL_ALLOWLIST
+-- runs --auto except the two runtime gating points below, which are
+-- forced back to --prompt and interpreted by tool-validator:
 --
---   * dispatch-graph — fan-out gate. One click reviews the entire
---     graph the lead is about to run.
+--   * dispatch-graph — fan-out gate. Safe mode may defer write-capable
+--     graphs to the user popup; read-only graphs auto-pass.
 --   * bash          — per-command classification via tool-validator
 --     (which calls `da`). Safe read-only commands auto-approve;
---     anything else surfaces as a popup.
+--     anything else may surface as a popup.
 --
--- default_action stays "prompt" so an unfamiliar tool a future plugin
--- advertises (not in TOOL_ALLOWLIST) surfaces in front of the user
--- instead of running silently.
+-- `/auto` keeps the same prompt policy at tool-gate, but tool-validator
+-- converts anything that would defer to a human into a denial with
+-- recovery text. `/yolo` bypasses the gate entirely and approves all
+-- tool calls. default_action stays "prompt" so an unfamiliar tool a
+-- future plugin advertises surfaces in front of the user in /safe.
 local SHARED_TOOL_GATE = {
   default_action     = "prompt",
   use_lead_allowlist = true,
