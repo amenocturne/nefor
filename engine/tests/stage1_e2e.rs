@@ -247,11 +247,16 @@ ncp._test_set_transforms("nefor-tui", {
 /// the final text, which the orchestrator then renders to the driver.
 const MOCK_SCRIPT: &str = r#"
 local SUB_GRAPH = {
+  terminal = "terminal",
   nodes = {
     { id = "octo",  reasoner = "dummy", args = { provider = "ollama", model = "mock-model", prompt = "summarise octopuses" } },
     { id = "light", reasoner = "dummy", args = { provider = "ollama", model = "mock-model", prompt = "summarise lighthouses" } },
+    { id = "terminal", reasoner = "terminal", args = {} },
   },
-  edges = {},
+  edges = {
+    { from = "octo", to = "terminal" },
+    { from = "light", to = "terminal" },
+  },
 }
 
 -- chat_id → completion count.
