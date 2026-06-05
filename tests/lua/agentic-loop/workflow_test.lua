@@ -272,6 +272,22 @@ local function find_graph_result(calls, status, body_substr)
   return nil
 end
 
+local function spawn_graph_prompt(calls)
+  for _, c in ipairs(calls) do
+    if c.body.kind == "tool.invoke"
+        and c.body.name == "spawn_graph"
+        and type(c.body.args) == "table"
+        and type(c.body.args.graph) == "table" then
+      for _, node in ipairs(c.body.args.graph.nodes or {}) do
+        if node.id == "wrap" and type(node.args) == "table" then
+          return node.args.prompt
+        end
+      end
+    end
+  end
+  return nil
+end
+
 local function fresh_loop()
   agentic_loop._internals.reset()
   agentic_loop.configure { provider = "ollama", model = "test-model" }
@@ -579,6 +595,43 @@ do
   assert(err_msg ~= nil,
     "sub-graph failure must emit a chat.graph_result.append with status=failed; got "
     .. json.encode(_test.calls()))
+end
+
+-- Multiple async sub-graphs must not batch until all pending runs finish.
+-- The first completion should wake the lead immediately while the second
+-- graph keeps running; the lead can then decide whether to wait, dispatch
+-- more work, or answer with the partial result.
+do
+  fresh_loop()
+  local first_text = "first graph finished"
+  local second_text = "second graph still pending"
+  local run1 = agentic_loop.queue_sub_graph(
+    { graph = { nodes = { { id = "terminal", reasoner = "terminal", args = {} } }, edges = {} } },
+    "gate-inner-a"
+  )
+  local run2 = agentic_loop.queue_sub_graph(
+    { graph = { nodes = { { id = "terminal", reasoner = "terminal", args = {} } }, edges = {} } },
+    "gate-inner-b"
+  )
+  assert(type(run1) == "string" and type(run2) == "string" and run1 ~= run2,
+    "queue_sub_graph must mint two distinct run ids")
+  _test.calls_clear()
+
+  send_to_loop("reasoner-graph", {
+    kind   = "tool.result",
+    id     = run1,
+    result = {
+      status  = "success",
+      results = { terminal = { output = { text = first_text } } },
+    },
+  })
+
+  local prompt = spawn_graph_prompt(decode_calls())
+  assert(type(prompt) == "string" and string.find(prompt, first_text, 1, true),
+    "first completed sub-graph must immediately dispatch a lead turn even while another graph is pending; got "
+    .. json.encode(_test.calls()))
+  assert(string.find(prompt, second_text, 1, true) == nil,
+    "first relay turn must not fabricate or wait for the still-pending second graph")
 end
 
 -- ------------------------------------------------------------------

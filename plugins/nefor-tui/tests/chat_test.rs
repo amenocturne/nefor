@@ -843,6 +843,80 @@ fn graph_run_complete_removes_run_after_linger_window() {
 }
 
 #[test]
+fn graph_sidebar_scrolls_when_many_nodes_overflow() {
+    let mut engine = Engine::new(100, 12).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.run_started",
+            "run_id": "run-scroll",
+            "total_nodes": 30,
+        }),
+    );
+    for i in 1..=30 {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "graph.node.fired",
+                "run_id": "run-scroll",
+                "node_id": format!("n{i:02}"),
+                "firing_id": format!("f-{i:02}"),
+                "reasoner": "agent",
+            }),
+        );
+    }
+    let _ = render_str(&mut engine);
+
+    fn read_offset(engine: &mut Engine, key: &str) -> u16 {
+        let lua = engine.lua();
+        let chunk = format!(
+            r#"
+            local p = tui.scroll_position("{key}")
+            return p and p.offset or -1
+            "#
+        );
+        let v: i64 = lua
+            .load(chunk.as_str())
+            .eval()
+            .expect("scroll_position eval");
+        if v < 0 {
+            panic!("no scroll_position for `{key}`");
+        }
+        v as u16
+    }
+
+    let before = read_offset(&mut engine, "sidebar");
+    assert!(
+        before > 0,
+        "sidebar should stick to the bottom when graph rows overflow"
+    );
+    let snap = engine.snapshot();
+    assert!(
+        snap.contains("n30"),
+        "bottom graph rows should be visible by default:\n{snap}"
+    );
+
+    engine
+        .handle_mouse(MouseMessage {
+            kind: MouseKind::Wheel,
+            x: 90,
+            y: 5,
+            button: Some("up"),
+            mods: vec![],
+        })
+        .expect("wheel up over sidebar");
+    let _ = render_str(&mut engine);
+    let after = read_offset(&mut engine, "sidebar");
+    assert!(
+        after < before,
+        "wheel over sidebar must scroll that panel independently (before={before}, after={after})"
+    );
+}
+
+#[test]
 fn chat_session_stats_updates_statusline() {
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");

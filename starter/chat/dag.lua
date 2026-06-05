@@ -180,28 +180,37 @@ end
 function M.panel(state)
   local narrow = true
   local now_ms = tui.now_ms()
-  local children = {
+  local header = {
     tui.text { content = "Graph", style = STYLE.footer, wrap = "none" },
     tui.text { content = string.rep("─", 30), style = STYLE.footer, wrap = "none" },
   }
-  for _, c in ipairs(panel_children(state, now_ms, narrow)) do
-    children[#children + 1] = c
-  end
+  local body_children = panel_children(state, now_ms, narrow)
   return tui.constrained {
     min_width = 28,
     max_width = 36,
     child = tui.padding {
       value = 1,
-      -- Drag-to-select scopes to this column. The sidebar doesn't
-      -- scroll, so the selection's content geometry equals the
-      -- column's painted rect — the engine paints into a rect-sized
-      -- scratch buffer and extracts plain text. Keyed so the engine
-      -- can re-resolve the captured widget across view rebuilds.
       child = tui.column {
-        gap        = 0,
-        key        = "sidebar",
-        selectable = true,
-        children   = children,
+        gap = 0,
+        children = {
+          header[1],
+          header[2],
+          tui.expanded {
+            child = tui.constrained {
+              max_width = 30,
+              child = tui.scrollable {
+                key        = "sidebar",
+                stick_to   = "end",
+                scrollbar  = "auto",
+                selectable = true,
+                child      = tui.column {
+                  gap      = 0,
+                  children = body_children,
+                },
+              },
+            },
+          },
+        },
       },
     },
   }

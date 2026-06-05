@@ -625,11 +625,10 @@ local function handle_tool_result_run_close(run_id, body)
   if sub_pending ~= nil then
     state.pending_runs[run_id] = nil
     close_sub_graph(run_id, sub_pending, status, results, nil)
-    -- Flush when no more sub-graphs are pending — delivers all results
-    -- in one batch so the lead processes them in a single turn.
-    if next(state.pending_runs) == nil then
-      flush_deferred()
-    end
+    -- Deliver each finished graph as soon as the lead is idle. If the
+    -- lead is currently processing another completion, flush_deferred()
+    -- naturally leaves the text queued until that turn closes.
+    flush_deferred()
     -- Note: do NOT return; the orchestrator-match branch below may
     -- also fire if (rare) the sub-graph completion races the
     -- orchestrator's own run-close envelope.
