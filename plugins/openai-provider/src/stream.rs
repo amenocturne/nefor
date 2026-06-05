@@ -25,6 +25,9 @@ use crate::openai::{
     StreamOptions, ToolCall, ToolCallFunction, Usage,
 };
 
+const CHAT_STREAM_MAX_ATTEMPTS: usize = 3;
+const CHAT_STREAM_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(250);
+
 /// Outcome of `run_chat_stream`. Carries everything the caller needs to
 /// either finalize the turn (`tool_calls` empty, `finish_reason ==
 /// "stop"`) or run the tool loop (`tool_calls` non-empty,
@@ -156,49 +159,96 @@ where
         );
     }
 
-    let mut builder = client
-        .post(endpoint)
-        .header(ACCEPT, "text/event-stream")
-        .header(ACCEPT_ENCODING, "identity")
-        .json(&req);
-    if let Some(k) = api_key {
-        builder = apply_auth(builder, auth_header, k);
-    }
+    let response = {
+        let mut attempt = 1usize;
+        loop {
+            let mut builder = client
+                .post(endpoint)
+                .header(ACCEPT, "text/event-stream")
+                .header(ACCEPT_ENCODING, "identity")
+                .json(&req);
+            if let Some(k) = api_key {
+                builder = apply_auth(builder, auth_header, k);
+            }
 
-    let response = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => {
-            return Ok(StreamOutcome {
-                interrupted: true,
-                ..Default::default()
-            });
+            let sent = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    return Ok(StreamOutcome {
+                        interrupted: true,
+                        ..Default::default()
+                    });
+                }
+                r = tokio::time::timeout(Duration::from_secs(120), builder.send()) => match r {
+                    Ok(Ok(r)) => Ok(r),
+                    Ok(Err(e)) => Err(StreamError::Request(reqwest_error_detail(&e))),
+                    Err(_) => Err(StreamError::Request(
+                        "timed out waiting for response headers after 120s".to_owned(),
+                    )),
+                },
+            };
+
+            let response = match sent {
+                Ok(response) => response,
+                Err(e) => {
+                    if attempt < CHAT_STREAM_MAX_ATTEMPTS && stream_error_is_retriable(&e) {
+                        tracing::warn!(
+                            attempt,
+                            max_attempts = CHAT_STREAM_MAX_ATTEMPTS,
+                            error = %e,
+                            "chat completion request failed; retrying"
+                        );
+                        if !sleep_before_retry(&cancel, attempt).await {
+                            return Ok(StreamOutcome {
+                                interrupted: true,
+                                ..Default::default()
+                            });
+                        }
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            };
+
+            if response.status().is_success() {
+                break response;
+            }
+
+            let status = response.status().as_u16();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable response body>".into());
+            if status == 401 {
+                return Err(StreamError::Unauthorized { body });
+            }
+            // Reactive fallback: only meaningful when the request actually
+            // carried tools. If we sent no tools and still got the signature,
+            // the server is telling us something else — fall through to Http.
+            if status == 400 && tools.is_some() && body_signals_tools_unsupported(&body) {
+                return Err(StreamError::ToolsUnsupported { body });
+            }
+            let err = StreamError::Http { status, body };
+            if attempt < CHAT_STREAM_MAX_ATTEMPTS && stream_error_is_retriable(&err) {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = CHAT_STREAM_MAX_ATTEMPTS,
+                    error = %err,
+                    "chat completion returned retriable HTTP status; retrying"
+                );
+                if !sleep_before_retry(&cancel, attempt).await {
+                    return Ok(StreamOutcome {
+                        interrupted: true,
+                        ..Default::default()
+                    });
+                }
+                attempt += 1;
+                continue;
+            }
+            return Err(err);
         }
-        r = tokio::time::timeout(Duration::from_secs(120), builder.send()) => match r {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => return Err(StreamError::Request(reqwest_error_detail(&e))),
-            Err(_) => return Err(StreamError::Request(
-                "timed out waiting for response headers after 120s".to_owned(),
-            )),
-        },
     };
-
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unreadable response body>".into());
-        if status == 401 {
-            return Err(StreamError::Unauthorized { body });
-        }
-        // Reactive fallback: only meaningful when the request actually
-        // carried tools. If we sent no tools and still got the signature,
-        // the server is telling us something else — fall through to Http.
-        if status == 400 && tools.is_some() && body_signals_tools_unsupported(&body) {
-            return Err(StreamError::ToolsUnsupported { body });
-        }
-        return Err(StreamError::Http { status, body });
-    }
 
     let mut outcome = StreamOutcome::default();
     let mut buffer = SseBuffer::new();
@@ -248,6 +298,28 @@ where
     outcome.tool_calls = tc_acc.finalize();
     maybe_end_reasoning(&outcome, &mut reasoning_ended, &mut on_reasoning);
     Ok(outcome)
+}
+
+fn stream_error_is_retriable(err: &StreamError) -> bool {
+    match err {
+        StreamError::Request(_) => true,
+        StreamError::Http { status, .. } => (500..600).contains(status),
+        StreamError::Unauthorized { .. }
+        | StreamError::ToolsUnsupported { .. }
+        | StreamError::Body(_) => false,
+    }
+}
+
+async fn sleep_before_retry(cancel: &CancellationToken, failed_attempt: usize) -> bool {
+    let factor = 1u32
+        .checked_shl(failed_attempt.saturating_sub(1) as u32)
+        .unwrap_or(u32::MAX);
+    let delay = CHAT_STREAM_INITIAL_RETRY_DELAY.saturating_mul(factor);
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
 }
 
 /// Apply the API key to the request builder under the configured

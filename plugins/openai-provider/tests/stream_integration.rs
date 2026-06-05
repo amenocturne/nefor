@@ -8,6 +8,10 @@ use openai_provider::openai::Message;
 use openai_provider::state::{ChatId, Chats};
 use openai_provider::stream::{list_models, run_chat_stream, StreamError};
 use std::net::SocketAddr;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -34,6 +38,69 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
         acc.push_str(&String::from_utf8_lossy(&buf[..n]));
     }
     acc
+}
+
+#[tokio::test]
+async fn chat_stream_retries_transient_500_then_succeeds() {
+    let (listener, addr) = bind_local().await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_server = attempts.clone();
+
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut s, _) = listener.accept().await.expect("accept");
+            let _ = read_request(&mut s).await;
+            let n = attempts_server.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                let body = "{\"error\":\"temporary upstream failure\"}";
+                let response = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(response.as_bytes()).await;
+            } else {
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Recovered\"}}]}\n\n\
+                            data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n\
+                            data: [DONE]\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(response.as_bytes()).await;
+            }
+            let _ = s.shutdown().await;
+        }
+    });
+
+    let client = reqwest::Client::builder().build().expect("client");
+    let endpoint = format!("http://{}/v1/chat/completions", addr);
+    let messages = vec![Message::user("hello")];
+
+    let mut deltas: Vec<String> = Vec::new();
+    let outcome = run_chat_stream(
+        &client,
+        &endpoint,
+        None,
+        "Authorization",
+        "test-model",
+        &messages,
+        None,
+        None,
+        CancellationToken::new(),
+        |d| deltas.push(d.to_owned()),
+        |_| {},
+    )
+    .await
+    .expect("second attempt succeeds");
+
+    let _ = server.await;
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(deltas, vec!["Recovered"]);
+    assert_eq!(outcome.full_text, "Recovered");
+    assert_eq!(outcome.finish_reason.as_deref(), Some("stop"));
 }
 
 #[tokio::test]

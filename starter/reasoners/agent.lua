@@ -636,6 +636,14 @@ local function on_chat_complete_result(body)
   end
 
   if not has_calls then
+    if out.finish_reason == "error" then
+      local msg = out.error or out.message or out.text
+      if type(msg) ~= "string" or #msg == 0 then
+        msg = "provider returned finish_reason=error"
+      end
+      send_terminal_err(firing_id, msg)
+      return
+    end
     -- Terminal: text-only reply ends the agent loop.
     send_terminal_ok(firing_id, out.text)
     return

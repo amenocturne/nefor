@@ -478,6 +478,51 @@ do
 end
 
 -- ------------------------------------------------------------------
+-- Scenario 5b: provider finish_reason=error surfaces as terminal error
+-- ------------------------------------------------------------------
+--
+-- openai-provider emits chat.complete.result even after an HTTP failure
+-- so callers get a closed turn. The agent reasoner must not treat that
+-- empty error-shaped result as a successful explorer/worker output.
+do
+  fresh()
+  dispatch_agent("firing-finish-err", {
+    system_prompt  = "You are an explorer.",
+    model          = "test-model",
+    tool_allowlist = { "read_file" },
+    prompt         = "Investigate.",
+  })
+  local create = find_call(decode_calls(), function(c)
+    return c.body.kind == "mock-prov.chat.create"
+  end)
+  local chat_id = create.body.chat_id
+
+  _test.calls_clear()
+  feed("mock-prov", {
+    kind    = "mock-prov.chat.complete.result",
+    chat_id = chat_id,
+    output  = {
+      text          = "",
+      finish_reason = "error",
+    },
+  })
+
+  local terminal = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result" and c.body.id == "firing-finish-err"
+  end)
+  assert(terminal ~= nil,
+    "finish_reason=error must emit terminal tool.result; got "
+    .. json.encode(_test.calls()))
+  assert(terminal.body.error ~= nil,
+    "finish_reason=error must surface as terminal error, not empty success")
+  assert(string.find(tostring(terminal.body.error), "finish_reason=error", 1, true),
+    "fallback error mentions finish_reason=error; got: "
+    .. tostring(terminal.body.error))
+  assert(terminal.body.result == nil,
+    "error terminal must not carry a success result")
+end
+
+-- ------------------------------------------------------------------
 -- Scenario 6: finalize tool — answer-only terminates with structured
 -- ------------------------------------------------------------------
 --
