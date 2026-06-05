@@ -110,7 +110,14 @@ function M.parse_spawn_graph_invoke(body)
   end
   -- Empty args is legitimate (binary may forward an invoke whose args
   -- was an empty object); downstream queue_sub_graph needs a table.
-  local args = type(body.args) == "table" and body.args or {}
+  local args = body.args
+  if args == nil then args = {} end
+  if type(args) ~= "table" then
+    local ok, encoded = pcall(nefor.json.encode, args)
+    local raw = ok and encoded or tostring(args)
+    return nil, "spawn_graph: args must be a JSON object; got " ..
+      type(args) .. ". Raw args: " .. raw
+  end
   return { name = name, invoke_id = invoke_id, args = args }, nil
 end
 

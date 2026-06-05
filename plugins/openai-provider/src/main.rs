@@ -1232,12 +1232,50 @@ async fn run_one_tool_call(
     let name = tc.function.name.clone();
     let args_str = tc.function.arguments.clone();
 
-    // Parse the args string into a JSON Value for the wire — fall back
-    // to a raw-string carrier if parsing fails (the tool plugin is
-    // welcome to reject it). The chat-contract calls for `args` to be
-    // an object; we send whatever we can parse, defaulting to {}.
-    let args_value: Value =
-        serde_json::from_str(&args_str).unwrap_or_else(|_| Value::Object(Map::new()));
+    let args_value: Value = match serde_json::from_str(&args_str) {
+        Ok(v) => v,
+        Err(e) => {
+            let err = format!(
+                "tool `{name}` arguments are not valid JSON: {e}. Raw arguments: {}",
+                snippet(&args_str)
+            );
+            let _ = out_tx
+                .send(PluginOutgoing::event(chat_tool_start_body(
+                    &id,
+                    &name,
+                    &Value::String(args_str),
+                )))
+                .await;
+            let _ = out_tx
+                .send(PluginOutgoing::event(chat_tool_end_body(&id, &err, true)))
+                .await;
+            return ToolStepOutcome::Result {
+                id: id.clone(),
+                content: err,
+            };
+        }
+    };
+    if !args_value.is_object() {
+        let err = format!(
+            "tool `{name}` arguments must be a JSON object; got {}. Raw arguments: {}",
+            json_type_name(&args_value),
+            snippet(&args_str)
+        );
+        let _ = out_tx
+            .send(PluginOutgoing::event(chat_tool_start_body(
+                &id,
+                &name,
+                &args_value,
+            )))
+            .await;
+        let _ = out_tx
+            .send(PluginOutgoing::event(chat_tool_end_body(&id, &err, true)))
+            .await;
+        return ToolStepOutcome::Result {
+            id: id.clone(),
+            content: err,
+        };
+    }
 
     // chat.tool.start — emit `input` (the chat-contract's optional
     // events section field name). The new tool-calling section in
@@ -1332,6 +1370,17 @@ fn snippet(s: &str) -> String {
         s.to_owned()
     } else {
         format!("{}…", &s[..200])
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -2955,6 +3004,67 @@ mod tests {
             Some("chat.tool.end")
         );
         assert_eq!(events[1].get("error").and_then(Value::as_bool), Some(true));
+    }
+
+    #[tokio::test]
+    async fn run_one_tool_call_reports_malformed_arguments_to_model() {
+        let catalog = Arc::new(ToolCatalog::new());
+        catalog
+            .register_from(
+                "basic-tools",
+                vec![openai_provider::catalog::ToolSpec {
+                    name: "read_file".into(),
+                    description: "Read a file.".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }],
+            )
+            .await;
+        let broker = Arc::new(ToolBroker::new());
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(16);
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let tc = ToolCall {
+            id: "call_bad".into(),
+            kind: "function".into(),
+            function: ToolCallFunction {
+                name: "read_file".into(),
+                arguments: "{\"path\":".into(),
+            },
+        };
+
+        let outcome = run_one_tool_call(&catalog, &broker, &tx, &cancel, tc).await;
+        match outcome {
+            ToolStepOutcome::Result { id, content } => {
+                assert_eq!(id, "call_bad");
+                assert!(content.contains("not valid JSON"), "{content}");
+                assert!(content.contains("Raw arguments: {\"path\":"), "{content}");
+            }
+            ToolStepOutcome::Cancelled { .. } => panic!("unexpected cancel"),
+        }
+
+        let mut events = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            let line = msg.to_line();
+            let v: Value = serde_json::from_str(&line).expect("json");
+            if v.get("type").and_then(Value::as_str) == Some("event") {
+                events.push(v.get("body").unwrap().clone());
+            }
+        }
+        assert_eq!(events.len(), 2, "start + error end, no tool.invoke");
+        assert_eq!(
+            events[0].get("kind").and_then(Value::as_str),
+            Some("chat.tool.start")
+        );
+        assert_eq!(
+            events[1].get("kind").and_then(Value::as_str),
+            Some("chat.tool.end")
+        );
+        assert_eq!(events[1].get("error").and_then(Value::as_bool), Some(true));
+        assert!(events[1]
+            .get("output")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("not valid JSON"));
     }
 
     // --- New explicit chat.* API -------------------------------------

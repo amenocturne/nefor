@@ -252,6 +252,21 @@ local function build_allowlist_set(list)
   return s
 end
 
+local function value_type_name(v)
+  if v == nil then return "nil" end
+  local t = type(v)
+  if t ~= "table" then return t end
+  if v[1] ~= nil then return "array" end
+  return "object"
+end
+
+local function raw_preview(v)
+  if type(v) == "string" then return v end
+  local ok, encoded = pcall(json.encode, v)
+  if ok and type(encoded) == "string" then return encoded end
+  return tostring(v)
+end
+
 local function clear_firing(firing_id)
   local entry = agents[firing_id]
   if entry == nil then return end
@@ -483,7 +498,8 @@ local function dispatch_tool_call(entry, call)
   if type(call) ~= "table" then return false end
   local name = call.name or call.tool
   if type(name) ~= "string" or #name == 0 then return false end
-  local call_args = call.arguments or call.args or {}
+  local raw_args = call.arguments or call.args
+  local call_args = raw_args or {}
   local model_call_id = call.id
 
   local tool_id = next_id("tool")
@@ -504,6 +520,15 @@ local function dispatch_tool_call(entry, call)
     local pt = entry.pending_tools[tool_id]
     pt.received = true
     pt.error = "Tool '" .. name .. "' not in allowlist for this agent"
+    entry.pending_count = entry.pending_count - 1
+    return true
+  end
+
+  if type(call_args) ~= "table" then
+    local pt = entry.pending_tools[tool_id]
+    pt.received = true
+    pt.error = "Tool '" .. name .. "' arguments must be a JSON object; got " ..
+      value_type_name(call_args) .. ". Raw arguments: " .. raw_preview(call_args)
     entry.pending_count = entry.pending_count - 1
     return true
   end

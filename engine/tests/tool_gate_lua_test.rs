@@ -382,6 +382,39 @@ fn parse_spawn_graph_invoke_defaults_args_to_empty_table() {
     assert!(args_is_table);
 }
 
+#[test]
+fn parse_spawn_graph_invoke_rejects_non_object_args_with_raw_value() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("nefor stub");
+    set_package_path(&lua).expect("package.path");
+
+    let err: String = lua
+        .load(
+            r#"
+            local lib = require("tool-gate")
+            local parsed, err = lib.parse_spawn_graph_invoke({
+              id = "inv-1",
+              name = "spawn_graph",
+              args = "{\"graph\":",
+            })
+            assert(parsed == nil)
+            return err
+            "#,
+        )
+        .eval()
+        .expect("eval");
+
+    assert!(
+        err.contains("args must be a JSON object"),
+        "err names required shape: {err}"
+    );
+    assert!(err.contains("string"), "err names actual type: {err}");
+    assert!(
+        err.contains(r#""{\"graph\":"#),
+        "err includes raw args preview: {err}"
+    );
+}
+
 // ----------------------------------------------------------------
 // spawn_graph_ack_body / spawn_graph_error_body
 // ----------------------------------------------------------------

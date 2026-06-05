@@ -326,6 +326,66 @@ do
 end
 
 -- ------------------------------------------------------------------
+-- Scenario 3b: malformed tool-call arguments surface to the agent
+-- ------------------------------------------------------------------
+--
+-- Providers preserve malformed tool-call argument JSON as a raw string
+-- on chat.complete.result. The agent reasoner must turn that into a
+-- model-visible tool error instead of forwarding `{}` or a string into
+-- tool-gate, otherwise the agent has no clue what to correct.
+do
+  fresh()
+  dispatch_agent("firing-bad-args", {
+    system_prompt  = "You are an explorer.",
+    model          = "test-model",
+    tool_allowlist = { "read_file" },
+    prompt         = "Investigate.",
+  })
+
+  local create = find_call(decode_calls(), function(c)
+    return c.body.kind == "mock-prov.chat.create"
+  end)
+  local chat_id = create.body.chat_id
+
+  _test.calls_clear()
+  feed("mock-prov", {
+    kind    = "mock-prov.chat.complete.result",
+    chat_id = chat_id,
+    output  = {
+      text          = "",
+      finish_reason = "tool_calls",
+      tool_calls    = {
+        { id = "model-call-bad", name = "read_file", arguments = "{\"path\":" },
+      },
+    },
+  })
+
+  local calls_after = decode_calls()
+  local leaked = find_call(calls_after, function(c)
+    return c.body.kind == "tool-gate.tool.invoke"
+  end)
+  assert(leaked == nil,
+    "malformed arguments MUST NOT reach tool-gate; saw " .. json.encode(_test.calls()))
+
+  local tool_append = find_call(calls_after, function(c)
+    return c.body.kind == "mock-prov.chat.append"
+       and type(c.body.message) == "table"
+       and c.body.message.role == "tool"
+  end)
+  assert(tool_append ~= nil,
+    "agent must append a synthetic tool error for malformed arguments; got "
+    .. json.encode(_test.calls()))
+  assert(tool_append.body.message.content:find("arguments must be a JSON object", 1, true),
+    "synthetic error must explain the required argument shape; got: "
+    .. tostring(tool_append.body.message.content))
+  assert(tool_append.body.message.content:find("Raw arguments: {\"path\":", 1, true),
+    "synthetic error must include raw malformed arguments; got: "
+    .. tostring(tool_append.body.message.content))
+  assert_eq(tool_append.body.message.tool_call_id, "model-call-bad",
+    "synthetic error still correlates to the model-side call.id")
+end
+
+-- ------------------------------------------------------------------
 -- Scenario 4: chat_id stable across multiple turns
 -- ------------------------------------------------------------------
 do
