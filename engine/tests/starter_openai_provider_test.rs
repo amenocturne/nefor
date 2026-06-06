@@ -306,16 +306,19 @@ fn cross_wrapper_isolation_unowned_chat_ids_drop() {
 }
 
 /// In-process /resume of a chat already created in the same process must
-/// not re-deliver `<prefix>.chat.create` to the binary — the binary's
-/// `chats.create` errors on duplicate ids. The wrapper tracks
+/// not re-deliver `<prefix>.chat.create` or any provider-history re-feed
+/// to the binary. The binary already has that chat's in-memory history;
+/// mutating it during replay can trip the per-chat busy guard or produce
+/// orphaned tool outputs on the next live turn. The wrapper tracks
 /// `owned_chat_ids` on the live path too, so the replay handler can
-/// recognise an in-process duplicate and skip re-delivery.
+/// recognise an in-process duplicate and skip the replay rebuild for
+/// that chat.
 ///
 /// Cross-process resume (the bug we fixed) is the OPPOSITE of this:
 /// fresh process, owned set is empty, first-seen chat.create gets
 /// through.
 #[test]
-fn in_process_resume_skips_duplicate_chat_create() {
+fn in_process_resume_skips_live_owned_provider_refeed() {
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
     set_package_path(&lua).expect("set package.path");
@@ -354,14 +357,32 @@ fn in_process_resume_skips_duplicate_chat_create() {
     assert_eq!(live_count, 1, "live path delivers chat.create to binary");
 
     // /resume of the same chat_id while still in-process — replay path
-    // sees chat.create again. Must skip (otherwise binary errors).
+    // sees chat.create again plus historical turns. All must skip.
     lua.load(
         r#"
         _replay.set(true)
-        _to_plugin({ {
-            type = "event", from = "engine", replay = true,
-            body = { kind = "ollama.chat.create", chat_id = "chat-1" },
-        } })
+        _to_plugin({
+            {
+                type = "event", from = "engine", replay = true,
+                body = { kind = "ollama.chat.create", chat_id = "chat-1" },
+            },
+            {
+                type = "event", from = "engine", replay = true,
+                body = {
+                    kind    = "ollama.chat.append",
+                    chat_id = "chat-1",
+                    message = { role = "user", content = "historical user" },
+                },
+            },
+            {
+                type = "event", from = "ollama", replay = true,
+                body = {
+                    kind    = "ollama.chat.complete.result",
+                    chat_id = "chat-1",
+                    output  = { text = "historical assistant", finish_reason = "stop" },
+                },
+            },
+        })
         _replay.set(false)
         _replay_delivered = _test.delivered()
         "#,
@@ -373,9 +394,10 @@ fn in_process_resume_skips_duplicate_chat_create() {
     assert_eq!(
         after.len(),
         0,
-        "in-process /resume must NOT re-deliver an already-created chat.create; \
-         live path already delivered it once and `_test.delivered()` drains the \
-         log between snapshots, so the replay-window snapshot must be empty. \
+        "in-process /resume must NOT re-deliver an already-created provider \
+         chat or mutate its existing history; live path already delivered \
+         chat.create once and `_test.delivered()` drains the log between \
+         snapshots, so the replay-window snapshot must be empty. \
          Got {:#?}",
         after
     );

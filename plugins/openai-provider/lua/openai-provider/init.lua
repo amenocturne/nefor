@@ -12,6 +12,7 @@ local M = {}
 -- react to every replayed tool.result and re-feed chat.append envelopes
 -- for chat_ids it never owned, causing the binary to emit chat.error.
 local owned_by_name = {}
+local replay_skip_by_name = {}
 
 local function owned_for(name)
   local t = owned_by_name[name]
@@ -22,9 +23,19 @@ local function owned_for(name)
   return t
 end
 
+local function replay_skip_for(name)
+  local t = replay_skip_by_name[name]
+  if t == nil then
+    t = {}
+    replay_skip_by_name[name] = t
+  end
+  return t
+end
+
 -- Test-only: drop module-level state.
 function M._reset()
   owned_by_name = {}
+  replay_skip_by_name = {}
 end
 
 function M.translator(name)
@@ -290,6 +301,9 @@ end
 --
 -- Per-kind behaviour:
 --   <prefix>.chat.create : delivered verbatim; skip if already owned.
+--                          If already owned by this live process, mark
+--                          the chat_id so replay does not mutate the
+--                          binary's existing in-memory history.
 --   <prefix>.chat.append : delivered verbatim, gated on ownership so
 --                          coexisting providers don't double-feed.
 --   tool.result          : synthesize an assistant <prefix>.chat.append
@@ -330,6 +344,7 @@ function M.replay_rebuild(env, name)
 
   local prefix = name .. "."
   local owned = owned_for(name)
+  local replay_skip = replay_skip_for(name)
 
   local function deliver_body(b)
     nefor.engine.deliver(name, json.encode({
@@ -342,15 +357,21 @@ function M.replay_rebuild(env, name)
 
   if k == prefix .. "chat.create" then
     local cid = body.chat_id
-    if type(cid) == "string" and owned[cid] then return end
-    if type(cid) == "string" then owned[cid] = true end
+    if type(cid) == "string" and owned[cid] then
+      replay_skip[cid] = true
+      return
+    end
+    if type(cid) == "string" then
+      owned[cid] = true
+      replay_skip[cid] = nil
+    end
     deliver_body(body)
     return
   end
 
   if k == prefix .. "chat.append" then
     local cid = body.chat_id
-    if type(cid) ~= "string" or not owned[cid] then return end
+    if type(cid) ~= "string" or not owned[cid] or replay_skip[cid] then return end
     deliver_body(body)
     return
   end
@@ -362,7 +383,7 @@ function M.replay_rebuild(env, name)
     local ns = result.next_state
     if type(ns) ~= "table" then return end
     local cid = ns.chat_id
-    if type(cid) ~= "string" or not owned[cid] then return end
+    if type(cid) ~= "string" or not owned[cid] or replay_skip[cid] then return end
 
     -- Empty-string text + missing tool_calls is the sentinel for "no
     -- assistant turn to record" (e.g. a control-only tool.result).
@@ -390,7 +411,7 @@ function M.replay_rebuild(env, name)
     -- `body.output` (matches the live shape emitted by the binary —
     -- see chat_complete_result_body in dispatcher.rs).
     local cid = body.chat_id
-    if type(cid) ~= "string" or not owned[cid] then return end
+    if type(cid) ~= "string" or not owned[cid] or replay_skip[cid] then return end
     local output = body.output
     if type(output) ~= "table" then return end
     local text = type(output.text) == "string" and output.text or ""
@@ -413,7 +434,7 @@ function M.replay_rebuild(env, name)
 
   if k == "chat.compaction.commit" then
     local cid = body.chat_id
-    if type(cid) ~= "string" or not owned[cid] then return end
+    if type(cid) ~= "string" or not owned[cid] or replay_skip[cid] then return end
     if body.provider ~= nil and body.provider ~= name then return end
     local artifact = body.model_context_artifact
     local items = type(artifact) == "table" and artifact.items or nil

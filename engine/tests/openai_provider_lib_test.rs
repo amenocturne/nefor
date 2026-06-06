@@ -21,8 +21,9 @@
 //! - translator.maybe_inject_static_token — fires once on the first
 //!   ready when opts.static_token is set; idempotent thereafter; no-op
 //!   when token absent or kind isn't ready.
-//! - replay_rebuild — chat.create re-feed (+ duplicate skip);
-//!   chat.append re-feed gated on ownership; tool.result → synthesized
+//! - replay_rebuild — chat.create re-feed (+ duplicate skip and
+//!   in-process history re-feed skip); chat.append re-feed gated on
+//!   ownership; tool.result → synthesized
 //!   assistant chat.append (+ drops for non-owned, error-shaped,
 //!   empty-content cases).
 
@@ -555,7 +556,8 @@ fn inbound_self_from_drops() {
 fn inbound_live_chat_create_tracks_ownership() {
     // After inbound() observes a live <prefix>.chat.create, the
     // subsequent replay_rebuild for the same chat_id must skip the
-    // duplicate (otherwise the binary's chats.create errors on dup).
+    // duplicate and every history re-feed for that chat_id (otherwise
+    // replay mutates a live binary chat that already has the history).
     let lua = lua_with_lib();
     let dup_skipped: bool = lua
         .load(
@@ -574,6 +576,33 @@ fn inbound_live_chat_create_tracks_ownership() {
                 type = "event", from = "engine", replay = true,
                 body = { kind = "ollama.chat.create", chat_id = "c1" },
             }, "ollama")
+            provider.replay_rebuild({
+                type = "event", from = "engine", replay = true,
+                body = {
+                    kind    = "ollama.chat.append",
+                    chat_id = "c1",
+                    message = { role = "user", content = "hi again" },
+                },
+            }, "ollama")
+            provider.replay_rebuild({
+                type = "event", from = "provider-wrapper", replay = true,
+                body = {
+                    kind   = "tool.result",
+                    id     = "f1",
+                    result = {
+                        text       = "assistant text",
+                        next_state = { chat_id = "c1" },
+                    },
+                },
+            }, "ollama")
+            provider.replay_rebuild({
+                type = "event", from = "ollama", replay = true,
+                body = {
+                    kind    = "ollama.chat.complete.result",
+                    chat_id = "c1",
+                    output  = { text = "final text", finish_reason = "stop" },
+                },
+            }, "ollama")
             return #_delivered_log == 0
             "#,
         )
@@ -581,7 +610,7 @@ fn inbound_live_chat_create_tracks_ownership() {
         .expect("eval");
     assert!(
         dup_skipped,
-        "owned chat.create on replay must skip delivery"
+        "owned chat replay must not re-deliver create, appends, or synthesized assistant turns"
     );
 }
 
