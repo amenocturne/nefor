@@ -57,7 +57,7 @@ use openai_provider::broker::{ToolBroker, ToolResult};
 use openai_provider::catalog::ToolCatalog;
 use openai_provider::config::Config;
 use openai_provider::openai::{Message, ModelInfo, ToolCall};
-use openai_provider::state::{ChatId, ChatStats, Chats, ChatsError};
+use openai_provider::state::{ChatId, ChatRestore, ChatStats, Chats, ChatsError};
 use openai_provider::stream::{list_models, run_chat_stream, ReasoningEvent, StreamError};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
@@ -339,6 +339,98 @@ async fn dispatch_event(
             {
                 Ok(()) => {
                     send_event(out_tx, chat_created_body(config, &chat_id)).await?;
+                }
+                Err(e) => {
+                    send_event(out_tx, chat_error_body(config, &chat_id, &e)).await?;
+                }
+            }
+        }
+        "chat.restore" => {
+            let chat_id = match read_chat_id(body) {
+                Some(id) => id,
+                None => {
+                    send_event(
+                        out_tx,
+                        turn_error_body(config, "chat.restore missing `chat_id`"),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            let model = body
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let system = body
+                .get("system")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let tools_field = body.get("tools");
+            let tools_enabled = tools_field.and_then(Value::as_bool);
+            let tool_allowlist: Option<Vec<String>> =
+                tools_field.and_then(Value::as_array).map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                });
+            let reasoning_effort = body
+                .get("reasoning_effort")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let mut history = Vec::new();
+            if let Some(items) = body.get("history").and_then(Value::as_array) {
+                for item in items {
+                    let parsed = match parse_provider_message(Some(item)) {
+                        Ok(m) => m,
+                        Err(msg) => {
+                            send_event(out_tx, chat_error_body_msg(config, &chat_id, msg)).await?;
+                            return Ok(());
+                        }
+                    };
+                    history.push(parsed.message);
+                    for failure in &parsed.tool_call_failures {
+                        if let Some(id) = &failure.id {
+                            history.push(Message::tool_result(
+                                id.clone(),
+                                format!(
+                                    "Failed to parse tool call: {}. Raw: {}",
+                                    failure.error, failure.raw
+                                ),
+                            ));
+                        } else {
+                            tracing::warn!(
+                                error = %failure.error,
+                                raw = %failure.raw,
+                                "tool_call parse failed and no id to surface error to model",
+                            );
+                        }
+                    }
+                }
+            }
+            tracing::info!(
+                target: "openai_provider::chat",
+                chat_id = %chat_id,
+                model = ?model,
+                history_len = history.len(),
+                "chat.restore",
+            );
+            match chats
+                .restore(ChatRestore {
+                    id: chat_id.clone(),
+                    model,
+                    tools_enabled,
+                    tool_allowlist,
+                    reasoning_effort,
+                    system,
+                    history,
+                })
+                .await
+            {
+                Ok(()) => {
+                    send_event(out_tx, chat_appended_body(config, &chat_id)).await?;
                 }
                 Err(e) => {
                     send_event(out_tx, chat_error_body(config, &chat_id, &e)).await?;

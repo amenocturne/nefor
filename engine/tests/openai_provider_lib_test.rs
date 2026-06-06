@@ -614,6 +614,35 @@ fn inbound_live_chat_create_tracks_ownership() {
     );
 }
 
+#[test]
+fn inbound_history_facts_drop_before_binary_delivery() {
+    let lua = lua_with_lib();
+    let (create_v, message_v): (Value, Value) = lua
+        .load(
+            r#"
+            local t = provider.translator("ollama")
+            local create = t.inbound({
+                type = "event", from = "engine",
+                body = { kind = "chat.history.create", provider = "ollama", chat_id = "c1" },
+            })
+            local message = t.inbound({
+                type = "event", from = "engine",
+                body = {
+                    kind = "chat.history.message",
+                    provider = "ollama",
+                    chat_id = "c1",
+                    message = { role = "user", content = "hi" },
+                },
+            })
+            return create, message
+            "#,
+        )
+        .eval()
+        .expect("eval");
+    assert!(matches!(create_v, Value::Nil));
+    assert!(matches!(message_v, Value::Nil));
+}
+
 // ---------------------------------------------------------------------
 // maybe_inject_static_token
 // ---------------------------------------------------------------------
@@ -687,6 +716,76 @@ fn static_token_no_op_when_kind_not_ready() {
 // ---------------------------------------------------------------------
 // replay_rebuild
 // ---------------------------------------------------------------------
+
+#[test]
+fn replay_rebuild_folds_history_facts_into_single_restore() {
+    let lua = lua_with_lib();
+    let (n, kind, chat_id, model, history_len, first_role, second_role): (
+        i64,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        String,
+    ) = lua
+        .load(
+            r#"
+            provider.replay_rebuild({
+                type = "event", from = "sessions", replay = true,
+                body = { kind = "sessions.replay.start" },
+            }, "ollama")
+            provider.replay_rebuild({
+                type = "event", from = "ollama", replay = true,
+                body = {
+                    kind = "chat.history.create",
+                    provider = "ollama",
+                    chat_id = "c1",
+                    model = "qwen3",
+                },
+            }, "ollama")
+            provider.replay_rebuild({
+                type = "event", from = "ollama", replay = true,
+                body = {
+                    kind = "chat.history.message",
+                    provider = "ollama",
+                    chat_id = "c1",
+                    message = { role = "user", content = "hi" },
+                },
+            }, "ollama")
+            provider.replay_rebuild({
+                type = "event", from = "ollama", replay = true,
+                body = {
+                    kind = "chat.history.message",
+                    provider = "ollama",
+                    chat_id = "c1",
+                    message = { role = "assistant", content = "hello" },
+                },
+            }, "ollama")
+            provider.replay_rebuild({
+                type = "event", from = "sessions", replay = false,
+                body = { kind = "sessions.replay.end" },
+            }, "ollama")
+            local row = _delivered_log[1]
+            return #_delivered_log,
+                row.body.kind,
+                row.body.chat_id,
+                row.body.model,
+                #row.body.history,
+                row.body.history[1].role,
+                row.body.history[2].role
+            "#,
+        )
+        .eval()
+        .expect("eval");
+    assert_eq!(n, 1);
+    assert_eq!(kind, "ollama.chat.restore");
+    assert_eq!(chat_id, "c1");
+    assert_eq!(model, "qwen3");
+    assert_eq!(history_len, 2);
+    assert_eq!(first_role, "user");
+    assert_eq!(second_role, "assistant");
+}
 
 #[test]
 fn replay_rebuild_chat_create_first_seen_delivers() {

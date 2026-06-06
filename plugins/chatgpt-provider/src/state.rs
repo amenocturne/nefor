@@ -288,6 +288,16 @@ pub struct ChatSnapshot {
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
+pub struct MessageRestore {
+    pub id: ChatId,
+    pub model: Option<String>,
+    pub system: Option<String>,
+    pub tool_overrides: Option<Vec<crate::catalog::ToolSpec>>,
+    pub tool_allowlist: Option<Vec<String>>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub history: Vec<Message>,
+}
+
 /// Per-slug capability bits learned from the backend's /models
 /// response. Populated by `Chats::record_model_capabilities` whenever
 /// the dispatcher fetches /models. Authoritative source for "does
@@ -479,6 +489,25 @@ impl Chats {
                 "replacing existing chat state during chat.create"
             );
         }
+        Ok(())
+    }
+
+    pub async fn restore_messages(&self, restore: MessageRestore) -> Result<(), ChatsError> {
+        let mut chat = self
+            .build_chat(
+                restore.model,
+                restore.system,
+                restore.tool_overrides,
+                restore.tool_allowlist,
+                restore.reasoning_effort,
+            )
+            .await?;
+        chat.history = repair_tool_call_history(restore.history)
+            .into_iter()
+            .map(HistoryEntry::from)
+            .collect();
+        let mut g = self.inner.lock().await;
+        g.insert(restore.id, chat);
         Ok(())
     }
 
@@ -732,6 +761,51 @@ fn has_unanswered_tool_call(history: &[HistoryEntry], tool_call_id: &str) -> boo
         }
     }
     seen_call
+}
+
+fn repair_tool_call_history(history: Vec<Message>) -> Vec<Message> {
+    let mut repaired = Vec::with_capacity(history.len());
+    let mut pending: Vec<String> = Vec::new();
+
+    for message in history {
+        match &message {
+            Message::Assistant { tool_calls, .. } => {
+                for tc in tool_calls {
+                    if !tc.id.is_empty() {
+                        pending.push(tc.id.clone());
+                    }
+                }
+                repaired.push(message);
+            }
+            Message::Tool { tool_call_id, .. } => {
+                if let Some(i) = pending.iter().position(|id| id == tool_call_id) {
+                    pending.remove(i);
+                    repaired.push(message);
+                } else {
+                    tracing::warn!(
+                        tool_call_id = %tool_call_id,
+                        "dropping orphan tool result during chat.restore"
+                    );
+                }
+            }
+            Message::User { .. } | Message::System { .. } => {
+                close_pending_tool_calls(&mut repaired, &mut pending);
+                repaired.push(message);
+            }
+        }
+    }
+
+    close_pending_tool_calls(&mut repaired, &mut pending);
+    repaired
+}
+
+fn close_pending_tool_calls(repaired: &mut Vec<Message>, pending: &mut Vec<String>) {
+    for id in pending.drain(..) {
+        repaired.push(Message::tool_result(
+            id,
+            "Tool call was interrupted before producing output.",
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -1035,6 +1109,52 @@ mod tests {
         match &h[1] {
             HistoryEntry::Message { message } => assert_eq!(message.content(), Some("first")),
             _ => panic!("expected tool message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_repairs_unanswered_tool_calls_before_next_user() {
+        let c = Chats::with_default_model(Some("m".into()));
+        let id = ChatId::new("a");
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            function: ToolCallFunction {
+                name: "read_file".into(),
+                arguments: "{\"path\":\"/x\"}".into(),
+            },
+        }];
+        c.restore_messages(MessageRestore {
+            id: id.clone(),
+            model: None,
+            system: None,
+            tool_overrides: None,
+            tool_allowlist: None,
+            reasoning_effort: None,
+            history: vec![
+                Message::user("hi"),
+                Message::assistant_with_tool_calls("", calls),
+                Message::user("continue"),
+            ],
+        })
+        .await
+        .expect("restore");
+
+        let h = c.snapshot(&id).await.expect("history").history;
+        assert_eq!(h.len(), 4);
+        match &h[2] {
+            HistoryEntry::Message { message } => {
+                assert_eq!(message.role(), "tool");
+                assert_eq!(message.tool_call_id(), Some("call_1"));
+                assert_eq!(
+                    message.content(),
+                    Some("Tool call was interrupted before producing output.")
+                );
+            }
+            _ => panic!("expected repaired tool result"),
+        }
+        match &h[3] {
+            HistoryEntry::Message { message } => assert_eq!(message.role(), "user"),
+            _ => panic!("expected user message"),
         }
     }
 

@@ -13,6 +13,7 @@ local M = {}
 -- for chat_ids it never owned, causing the binary to emit chat.error.
 local owned_by_name = {}
 local replay_skip_by_name = {}
+local replay_batches_by_name = {}
 
 local function owned_for(name)
   local t = owned_by_name[name]
@@ -32,10 +33,20 @@ local function replay_skip_for(name)
   return t
 end
 
+local function replay_batch_for(name)
+  local t = replay_batches_by_name[name]
+  if t == nil then
+    t = { active = false, plans = {} }
+    replay_batches_by_name[name] = t
+  end
+  return t
+end
+
 -- Test-only: drop module-level state.
 function M._reset()
   owned_by_name = {}
   replay_skip_by_name = {}
+  replay_batches_by_name = {}
 end
 
 function M.translator(name)
@@ -66,6 +77,7 @@ function M.translator(name)
     chat_compaction_restore = prefix .. "chat.compaction.restore",
     chat_create             = prefix .. "chat.create",
     chat_append             = prefix .. "chat.append",
+    chat_restore            = prefix .. "chat.restore",
     hello                   = prefix .. "hello",
     ready                   = prefix .. "ready",
     goodbye                 = prefix .. "goodbye",
@@ -185,6 +197,10 @@ function M.translator(name)
     local k = body.kind
     if type(k) ~= "string" then return body end
 
+    if k == "chat.history.create" or k == "chat.history.message" then
+      return nil
+    end
+
     -- Track live-path chat.create so an in-process /resume (which replays
     -- the same chat.create through replay_rebuild) can skip the
     -- duplicate delivery — the binary's chats.create errors on dup ids.
@@ -295,6 +311,184 @@ function M.translator(name)
   }
 end
 
+local function clone_table(t)
+  if type(t) ~= "table" then return t end
+  local out = {}
+  for k, v in pairs(t) do
+    out[k] = type(v) == "table" and clone_table(v) or v
+  end
+  return out
+end
+
+local function replay_plan_for(batch, cid)
+  local plan = batch.plans[cid]
+  if plan == nil then
+    plan = { chat_id = cid, history = {}, saw_canonical = false, saw_legacy = false }
+    batch.plans[cid] = plan
+  end
+  return plan
+end
+
+local function append_plan_message(plan, message)
+  if type(message) ~= "table" or type(message.role) ~= "string" then return end
+  table.insert(plan.history, clone_table(message))
+end
+
+local function normalize_tool_calls(tcs)
+  if type(tcs) ~= "table" then return nil end
+  local out = {}
+  for _, tc in ipairs(tcs) do
+    if type(tc) == "table" then
+      if type(tc["function"]) == "table" then
+        table.insert(out, clone_table(tc))
+      elseif type(tc.id) == "string" and type(tc.name) == "string" then
+        local arguments = tc.arguments
+        if type(arguments) ~= "string" then
+          local ok, encoded = pcall(json.encode, arguments == nil and {} or arguments)
+          arguments = ok and encoded or "{}"
+        end
+        table.insert(out, {
+          id = tc.id,
+          type = "function",
+          ["function"] = {
+            name = tc.name,
+            arguments = arguments,
+          },
+        })
+      end
+    end
+  end
+  if #out == 0 then return nil end
+  return out
+end
+
+local function assistant_message_from_output(output)
+  if type(output) ~= "table" then return nil end
+  local text = type(output.text) == "string" and output.text or ""
+  local tcs = normalize_tool_calls(output.tool_calls)
+  local has_text = #text > 0
+  local has_tcs = type(tcs) == "table" and #tcs > 0
+  if not has_text and not has_tcs then return nil end
+  local message = { role = "assistant", content = text }
+  if has_tcs then message.tool_calls = tcs end
+  return message
+end
+
+local function deliver_to_provider(name, body)
+  nefor.engine.deliver(name, json.encode({
+    type = "event",
+    from = "engine",
+    ts   = nefor.engine.now(),
+    body = body,
+  }))
+end
+
+local function flush_replay_batch(name)
+  local batch = replay_batch_for(name)
+  local prefix = name .. "."
+  local owned = owned_for(name)
+  local replay_skip = replay_skip_for(name)
+  for cid, plan in pairs(batch.plans) do
+    if not plan.skip and not replay_skip[cid] then
+      local restore = {
+        kind             = prefix .. "chat.restore",
+        chat_id          = cid,
+        history          = plan.history,
+      }
+      if plan.model ~= nil then restore.model = plan.model end
+      if plan.system ~= nil then restore.system = plan.system end
+      if plan.tools ~= nil then restore.tools = plan.tools end
+      if plan.reasoning_effort ~= nil then restore.reasoning_effort = plan.reasoning_effort end
+      deliver_to_provider(name, restore)
+      if type(plan.compaction_items) == "table" then
+        deliver_to_provider(name, {
+          kind    = prefix .. "chat.compaction.restore",
+          chat_id = cid,
+          items   = plan.compaction_items,
+        })
+      end
+      owned[cid] = true
+    end
+  end
+  batch.active = false
+  batch.plans = {}
+end
+
+local function replay_rebuild_immediate(env, name)
+  local body = env.body
+  local k = body.kind
+  local prefix = name .. "."
+  local owned = owned_for(name)
+  local replay_skip = replay_skip_for(name)
+
+  if k == prefix .. "chat.create" then
+    local cid = body.chat_id
+    if type(cid) == "string" and owned[cid] then
+      replay_skip[cid] = true
+      return
+    end
+    if type(cid) == "string" then
+      owned[cid] = true
+      replay_skip[cid] = nil
+    end
+    deliver_to_provider(name, body)
+    return
+  end
+
+  if k == prefix .. "chat.append" then
+    local cid = body.chat_id
+    if type(cid) ~= "string" or not owned[cid] or replay_skip[cid] then return end
+    deliver_to_provider(name, body)
+    return
+  end
+
+  if k == "tool.result" then
+    if body.error ~= nil then return end
+    local result = body.result
+    if type(result) ~= "table" then return end
+    local ns = result.next_state
+    if type(ns) ~= "table" then return end
+    local cid = ns.chat_id
+    if type(cid) ~= "string" or not owned[cid] or replay_skip[cid] then return end
+    local message = assistant_message_from_output(result)
+    if message == nil then return end
+    deliver_to_provider(name, {
+      kind    = prefix .. "chat.append",
+      chat_id = cid,
+      message = message,
+    })
+    return
+  end
+
+  if k == prefix .. "chat.complete.result" then
+    local cid = body.chat_id
+    if type(cid) ~= "string" or not owned[cid] or replay_skip[cid] then return end
+    local message = assistant_message_from_output(body.output)
+    if message == nil then return end
+    deliver_to_provider(name, {
+      kind    = prefix .. "chat.append",
+      chat_id = cid,
+      message = message,
+    })
+    return
+  end
+
+  if k == "chat.compaction.commit" then
+    local cid = body.chat_id
+    if type(cid) ~= "string" or not owned[cid] or replay_skip[cid] then return end
+    if body.provider ~= nil and body.provider ~= name then return end
+    local artifact = body.model_context_artifact
+    local items = type(artifact) == "table" and artifact.items or nil
+    if type(items) ~= "table" then return end
+    deliver_to_provider(name, {
+      kind    = prefix .. "chat.compaction.restore",
+      chat_id = cid,
+      items   = items,
+    })
+    return
+  end
+end
+
 -- Cross-process resume: filter recorded session envelopes down to the
 -- ones that carry chat state for THIS provider and deliver them to the
 -- binary to rebuild its per-chat_id history table.
@@ -345,34 +539,81 @@ function M.replay_rebuild(env, name)
   local prefix = name .. "."
   local owned = owned_for(name)
   local replay_skip = replay_skip_for(name)
+  local batch = replay_batch_for(name)
 
-  local function deliver_body(b)
-    nefor.engine.deliver(name, json.encode({
-      type = "event",
-      from = "engine",
-      ts   = nefor.engine.now(),
-      body = b,
-    }))
+  if k == "sessions.replay.start" then
+    batch.active = true
+    batch.plans = {}
+    return
+  end
+
+  if k == "sessions.replay.end" then
+    flush_replay_batch(name)
+    return
+  end
+
+  if not batch.active then
+    replay_rebuild_immediate(env, name)
+    return
+  end
+
+  if k == "chat.history.create" then
+    if body.provider ~= nil and body.provider ~= name then return end
+    local cid = body.chat_id
+    if type(cid) ~= "string" then return end
+    local plan = replay_plan_for(batch, cid)
+    if owned[cid] then
+      replay_skip[cid] = true
+      plan.skip = true
+      return
+    end
+    plan.saw_canonical = true
+    plan.model = body.model
+    plan.system = body.system
+    plan.tools = clone_table(body.tools)
+    plan.reasoning_effort = body.reasoning_effort
+    return
+  end
+
+  if k == "chat.history.message" then
+    if body.provider ~= nil and body.provider ~= name then return end
+    local cid = body.chat_id
+    if type(cid) ~= "string" or replay_skip[cid] then return end
+    local plan = replay_plan_for(batch, cid)
+    plan.saw_canonical = true
+    append_plan_message(plan, body.message)
+    return
   end
 
   if k == prefix .. "chat.create" then
     local cid = body.chat_id
     if type(cid) == "string" and owned[cid] then
       replay_skip[cid] = true
+      local plan = replay_plan_for(batch, cid)
+      plan.skip = true
       return
     end
-    if type(cid) == "string" then
-      owned[cid] = true
-      replay_skip[cid] = nil
+    if type(cid) ~= "string" then return end
+    replay_skip[cid] = nil
+    local plan = replay_plan_for(batch, cid)
+    if not plan.saw_canonical then
+      plan.saw_legacy = true
+      plan.model = body.model
+      plan.system = body.system
+      plan.tools = clone_table(body.tools)
+      plan.reasoning_effort = body.reasoning_effort
     end
-    deliver_body(body)
     return
   end
 
   if k == prefix .. "chat.append" then
     local cid = body.chat_id
-    if type(cid) ~= "string" or not owned[cid] or replay_skip[cid] then return end
-    deliver_body(body)
+    if type(cid) ~= "string" or replay_skip[cid] then return end
+    local plan = replay_plan_for(batch, cid)
+    if not plan.saw_canonical then
+      plan.saw_legacy = true
+      append_plan_message(plan, body.message)
+    end
     return
   end
 
@@ -383,23 +624,16 @@ function M.replay_rebuild(env, name)
     local ns = result.next_state
     if type(ns) ~= "table" then return end
     local cid = ns.chat_id
-    if type(cid) ~= "string" or not owned[cid] or replay_skip[cid] then return end
-
-    -- Empty-string text + missing tool_calls is the sentinel for "no
-    -- assistant turn to record" (e.g. a control-only tool.result).
-    local text = type(result.text) == "string" and result.text or ""
-    local tcs = result.tool_calls
-    local has_text = #text > 0
-    local has_tcs = type(tcs) == "table" and #tcs > 0
-    if not has_text and not has_tcs then return end
-
-    local message = { role = "assistant", content = text }
-    if has_tcs then message.tool_calls = tcs end
-    deliver_body({
-      kind    = prefix .. "chat.append",
-      chat_id = cid,
-      message = message,
-    })
+    if type(cid) ~= "string" or replay_skip[cid] then return end
+    local plan = batch.plans[cid]
+    if plan == nil then return end
+    if not plan.saw_canonical then
+      local message = assistant_message_from_output(result)
+      if message ~= nil then
+        plan.saw_legacy = true
+        append_plan_message(plan, message)
+      end
+    end
     return
   end
 
@@ -411,39 +645,27 @@ function M.replay_rebuild(env, name)
     -- `body.output` (matches the live shape emitted by the binary —
     -- see chat_complete_result_body in dispatcher.rs).
     local cid = body.chat_id
-    if type(cid) ~= "string" or not owned[cid] or replay_skip[cid] then return end
-    local output = body.output
-    if type(output) ~= "table" then return end
-    local text = type(output.text) == "string" and output.text or ""
-    local tcs  = output.tool_calls
-    local has_text = #text > 0
-    local has_tcs  = type(tcs) == "table" and #tcs > 0
-    -- Skip turns with neither text nor tool_calls (e.g. an errored
-    -- chat.complete.result with finish_reason="error" and text="").
-    if not has_text and not has_tcs then return end
-
-    local message = { role = "assistant", content = text }
-    if has_tcs then message.tool_calls = tcs end
-    deliver_body({
-      kind    = prefix .. "chat.append",
-      chat_id = cid,
-      message = message,
-    })
+    if type(cid) ~= "string" or replay_skip[cid] then return end
+    local plan = replay_plan_for(batch, cid)
+    if not plan.saw_canonical then
+      local message = assistant_message_from_output(body.output)
+      if message ~= nil then
+        plan.saw_legacy = true
+        append_plan_message(plan, message)
+      end
+    end
     return
   end
 
   if k == "chat.compaction.commit" then
     local cid = body.chat_id
-    if type(cid) ~= "string" or not owned[cid] or replay_skip[cid] then return end
+    if type(cid) ~= "string" or replay_skip[cid] then return end
     if body.provider ~= nil and body.provider ~= name then return end
     local artifact = body.model_context_artifact
     local items = type(artifact) == "table" and artifact.items or nil
     if type(items) ~= "table" then return end
-    deliver_body({
-      kind    = prefix .. "chat.compaction.restore",
-      chat_id = cid,
-      items   = items,
-    })
+    local plan = replay_plan_for(batch, cid)
+    plan.compaction_items = clone_table(items)
     return
   end
 end

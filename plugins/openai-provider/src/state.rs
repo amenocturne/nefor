@@ -76,6 +76,16 @@ pub struct ChatStats {
     pub last_turn_duration_ms: Option<u64>,
 }
 
+pub struct ChatRestore {
+    pub id: ChatId,
+    pub model: Option<String>,
+    pub tools_enabled: Option<bool>,
+    pub tool_allowlist: Option<Vec<String>>,
+    pub reasoning_effort: Option<String>,
+    pub system: Option<String>,
+    pub history: Vec<Message>,
+}
+
 /// Whether a chat's turn slot is idle or occupied.
 enum TurnState {
     Idle,
@@ -227,6 +237,31 @@ impl Chats {
         chat.reasoning_effort = reasoning_effort;
         // else: None (all tools) — the default from ChatState::new().
         g.insert(id, chat);
+        Ok(())
+    }
+
+    pub async fn restore(&self, restore: ChatRestore) -> Result<(), ChatsError> {
+        let resolved_model = match restore.model {
+            Some(m) => m,
+            None => self
+                .default_model
+                .lock()
+                .await
+                .clone()
+                .ok_or(ChatsError::NoModelConfigured)?,
+        };
+        let mut chat = ChatState::new(resolved_model);
+        chat.system = restore.system;
+        if let Some(names) = restore.tool_allowlist {
+            chat.tool_allowlist = Some(names);
+        } else if let Some(false) = restore.tools_enabled {
+            chat.tool_allowlist = Some(Vec::new());
+        }
+        chat.reasoning_effort = restore.reasoning_effort;
+        chat.history = Arc::new(repair_tool_call_history(restore.history));
+
+        let mut g = self.inner.lock().await;
+        g.insert(restore.id, chat);
         Ok(())
     }
 
@@ -569,6 +604,51 @@ fn has_unanswered_tool_call(history: &[Message], tool_call_id: &str) -> bool {
     seen_call
 }
 
+fn repair_tool_call_history(history: Vec<Message>) -> Vec<Message> {
+    let mut repaired = Vec::with_capacity(history.len());
+    let mut pending: Vec<String> = Vec::new();
+
+    for message in history {
+        match &message {
+            Message::Assistant { tool_calls, .. } => {
+                for tc in tool_calls {
+                    if !tc.id.is_empty() {
+                        pending.push(tc.id.clone());
+                    }
+                }
+                repaired.push(message);
+            }
+            Message::Tool { tool_call_id, .. } => {
+                if let Some(i) = pending.iter().position(|id| id == tool_call_id) {
+                    pending.remove(i);
+                    repaired.push(message);
+                } else {
+                    tracing::warn!(
+                        tool_call_id = %tool_call_id,
+                        "dropping orphan tool result during chat.restore"
+                    );
+                }
+            }
+            Message::User { .. } | Message::System { .. } => {
+                close_pending_tool_calls(&mut repaired, &mut pending);
+                repaired.push(message);
+            }
+        }
+    }
+
+    close_pending_tool_calls(&mut repaired, &mut pending);
+    repaired
+}
+
+fn close_pending_tool_calls(repaired: &mut Vec<Message>, pending: &mut Vec<String>) {
+    for id in pending.drain(..) {
+        repaired.push(Message::tool_result(
+            id,
+            "Tool call was interrupted before producing output.",
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -907,6 +987,45 @@ mod tests {
         let h = c.history_snapshot(&id).await.expect("h");
         assert_eq!(h.len(), 2);
         assert_eq!(h[1].content(), Some("first"));
+    }
+
+    #[tokio::test]
+    async fn restore_repairs_unanswered_tool_calls_before_next_user() {
+        let c = Chats::with_default_model(Some("m".into()));
+        let id = ChatId::new("a");
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: ToolCallFunction {
+                name: "read_file".into(),
+                arguments: "{\"path\":\"/x\"}".into(),
+            },
+        }];
+        c.restore(ChatRestore {
+            id: id.clone(),
+            model: None,
+            tools_enabled: None,
+            tool_allowlist: None,
+            reasoning_effort: None,
+            system: None,
+            history: vec![
+                Message::user("hi"),
+                Message::assistant_with_tool_calls("", calls),
+                Message::user("continue"),
+            ],
+        })
+        .await
+        .expect("restore");
+
+        let h = c.history_snapshot(&id).await.expect("history");
+        assert_eq!(h.len(), 4);
+        assert_eq!(h[2].role(), "tool");
+        assert_eq!(h[2].tool_call_id(), Some("call_1"));
+        assert_eq!(
+            h[2].content(),
+            Some("Tool call was interrupted before producing output.")
+        );
+        assert_eq!(h[3].role(), "user");
     }
 
     #[tokio::test]

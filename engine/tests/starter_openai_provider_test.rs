@@ -403,6 +403,64 @@ fn in_process_resume_skips_live_owned_provider_refeed() {
     );
 }
 
+#[test]
+fn live_provider_writes_emit_history_facts() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+
+    lua.load(
+        r#"
+        local op = require("compositors.provider")
+        local spec = op.spawn_spec("ollama", { "/bin/true" }, { agentic_loop = {} })
+        _to_plugin = spec.to_plugin
+        "#,
+    )
+    .exec()
+    .expect("spawn wrapper");
+
+    lua.load(
+        r#"
+        _to_plugin({ {
+            type = "event", from = "engine", replay = false,
+            body = { kind = "ollama.chat.create", chat_id = "chat-1", model = "qwen3" },
+        } })
+        _to_plugin({ {
+            type = "event", from = "engine", replay = false,
+            body = {
+                kind = "ollama.chat.append",
+                chat_id = "chat-1",
+                message = { role = "user", content = "hi" },
+            },
+        } })
+        _delivered = _test.delivered()
+        _sent = _test.sent()
+        "#,
+    )
+    .exec()
+    .expect("drive live provider writes");
+
+    let delivered = collect_delivered(&lua, "_delivered");
+    let sent = collect_sent(&lua, "_sent");
+
+    let delivered_kinds: Vec<&str> = delivered.iter().map(|e| e.kind.as_str()).collect();
+    assert_eq!(
+        delivered_kinds,
+        vec!["ollama.chat.create", "ollama.chat.append"],
+        "live provider wire events must still reach the binary"
+    );
+
+    let sent_kinds: Vec<&str> = sent.iter().map(|e| e.kind.as_str()).collect();
+    assert_eq!(
+        sent_kinds,
+        vec!["chat.history.create", "chat.history.message"],
+        "live provider writes must also emit canonical history facts"
+    );
+    assert_eq!(sent[0].from, "ollama");
+    assert_eq!(sent[0].chat_id.as_deref(), Some("chat-1"));
+    assert_eq!(sent[1].role.as_deref(), Some("user"));
+}
+
 // --------------------------------------------------------------------
 // harness
 // --------------------------------------------------------------------
@@ -414,6 +472,14 @@ struct DeliveredEntry {
     chat_id: Option<String>,
     role: Option<String>,
     content: Option<String>,
+}
+
+#[derive(Debug)]
+struct SentEntry {
+    from: String,
+    kind: String,
+    chat_id: Option<String>,
+    role: Option<String>,
 }
 
 fn collect_delivered(lua: &Lua, global: &str) -> Vec<DeliveredEntry> {
@@ -447,6 +513,32 @@ fn collect_delivered(lua: &Lua, global: &str) -> Vec<DeliveredEntry> {
     out
 }
 
+fn collect_sent(lua: &Lua, global: &str) -> Vec<SentEntry> {
+    let tbl: Table = lua.globals().get(global).expect("sent table");
+    let len = tbl.len().expect("len") as usize;
+    let mut out = Vec::with_capacity(len);
+    for i in 1..=len {
+        let row: Table = tbl.get(i).expect("row");
+        let from: String = row.get("from").expect("from");
+        let kind: String = row.get("kind").expect("kind");
+        let chat_id: Option<String> = match row.get::<Value>("chat_id").ok() {
+            Some(Value::String(s)) => s.to_str().ok().map(|bs| bs.to_string()),
+            _ => None,
+        };
+        let role: Option<String> = match row.get::<Value>("role").ok() {
+            Some(Value::String(s)) => s.to_str().ok().map(|bs| bs.to_string()),
+            _ => None,
+        };
+        out.push(SentEntry {
+            from,
+            kind,
+            chat_id,
+            role,
+        });
+    }
+    out
+}
+
 fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
     let nefor = lua.create_table()?;
     nefor::lua::bindings::install_json(lua, &nefor)?;
@@ -470,12 +562,45 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
     bus_tbl.set("on_event", on_event)?;
     nefor.set("bus", bus_tbl)?;
 
-    // engine — record `deliver(peer, payload)` calls into a global
-    // `_delivered_log` table that tests inspect via `_test.delivered()`.
-    // `send` is a no-op (the wrapper doesn't `send` from to_plugin in
-    // the replay path; only `deliver`).
+    // engine — record `deliver(peer, payload)` and `send(payload)` calls
+    // into globals that tests inspect via `_test`.
     let engine_tbl = lua.create_table()?;
-    let send_fn = lua.create_function(|_, _: mlua::Variadic<Value>| Ok(()))?;
+    let sent_log = lua.create_table()?;
+    lua.globals().set("_sent_log", sent_log)?;
+    let send_fn = lua.create_function(|lua, args: mlua::Variadic<Value>| {
+        let payload = match args.first() {
+            Some(Value::String(s)) => s.to_str()?.to_owned(),
+            _ => return Ok(()),
+        };
+        let json: Table = lua.globals().get::<Table>("nefor")?.get::<Table>("json")?;
+        let decode: Function = json.get("decode")?;
+        let decoded: Value = decode.call(lua.create_string(&payload)?)?;
+        let env: Table = match decoded {
+            Value::Table(t) => t,
+            _ => return Ok(()),
+        };
+        let body: Table = env
+            .get::<Value>("body")?
+            .as_table()
+            .cloned()
+            .unwrap_or(lua.create_table()?);
+        let message_role: Value = match body.get::<Value>("message").ok() {
+            Some(Value::Table(m)) => m.get::<Value>("role").unwrap_or(Value::Nil),
+            _ => Value::Nil,
+        };
+        let log: Table = lua.globals().get("_sent_log")?;
+        let row = lua.create_table()?;
+        row.set("from", env.get::<Value>("from")?)?;
+        row.set("kind", body.get::<Value>("kind").unwrap_or(Value::Nil))?;
+        row.set(
+            "chat_id",
+            body.get::<Value>("chat_id").unwrap_or(Value::Nil),
+        )?;
+        row.set("role", message_role)?;
+        let n = log.len()?;
+        log.set(n + 1, row)?;
+        Ok(())
+    })?;
     engine_tbl.set("send", send_fn)?;
     let now_fn = lua.create_function(|_, _: ()| Ok("2026-05-07T00:00:00.000Z".to_owned()))?;
     engine_tbl.set("now", now_fn)?;
@@ -560,6 +685,19 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
         Ok(snap)
     })?;
     test_tbl.set("delivered", delivered_fn)?;
+    let sent_fn = lua.create_function(|lua, _: ()| {
+        let log: Table = lua.globals().get("_sent_log")?;
+        let snap = lua.create_table()?;
+        let len = log.len()?;
+        for i in 1..=len {
+            let row: Value = log.get(i)?;
+            snap.set(i, row)?;
+        }
+        let fresh = lua.create_table()?;
+        lua.globals().set("_sent_log", fresh)?;
+        Ok(snap)
+    })?;
+    test_tbl.set("sent", sent_fn)?;
     lua.globals().set("_test", test_tbl)?;
 
     Ok(())

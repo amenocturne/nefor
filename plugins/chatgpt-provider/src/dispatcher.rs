@@ -32,7 +32,9 @@ use crate::responses::request::{
 };
 use crate::responses::stream::ResponseEvent;
 use crate::responses::{CompactRequest, ModelEntry, ResponsesClient};
-use crate::state::{ChatId, ChatStats, Chats, ChatsError, Message, ToolCall, ToolCallFunction};
+use crate::state::{
+    ChatId, ChatStats, Chats, ChatsError, Message, MessageRestore, ToolCall, ToolCallFunction,
+};
 use crate::translator;
 use nefor_plugin_sdk::TransportError;
 
@@ -726,6 +728,7 @@ async fn dispatch_event(
 
     match suffix {
         "chat.create" => handle_chat_create(&ctx.args, &ctx.chats, &ctx.out_tx, body).await,
+        "chat.restore" => handle_chat_restore(&ctx.args, &ctx.chats, &ctx.out_tx, body).await,
         "chat.append" => handle_chat_append(&ctx.args, &ctx.chats, &ctx.out_tx, body).await,
         "chat.complete" => handle_chat_complete(ctx, body).await,
         "chat.compact" => handle_chat_compact(ctx, body).await,
@@ -1153,6 +1156,101 @@ async fn handle_chat_append(
             }
             send_event(out_tx, chat_appended_body(args, &chat_id)).await
         }
+        Err(e) => send_event(out_tx, chat_error_body(args, &chat_id, e.to_string())).await,
+    }
+}
+
+async fn handle_chat_restore(
+    args: &ServeArgs,
+    chats: &Arc<Chats>,
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    body: &Map<String, Value>,
+) -> Result<(), ChatgptError> {
+    let chat_id = match read_chat_id(body) {
+        Some(id) => id,
+        None => {
+            send_event(
+                out_tx,
+                turn_error_body(args, None, "chat.restore missing `chat_id`"),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let system = body
+        .get("system")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let tools_field = body.get("tools");
+    let tool_allowlist: Option<Vec<String>> =
+        if let Some(false) = tools_field.and_then(Value::as_bool) {
+            Some(Vec::new())
+        } else {
+            tools_field.and_then(Value::as_array).map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+        };
+    let tool_overrides: Option<Vec<crate::catalog::ToolSpec>> = None;
+    let reasoning_effort = match parse_reasoning_effort(body.get("reasoning_effort")) {
+        Ok(v) => v,
+        Err(e) => {
+            send_event(out_tx, chat_error_body(args, &chat_id, e)).await?;
+            return Ok(());
+        }
+    };
+
+    let mut history = Vec::new();
+    if let Some(items) = body.get("history").and_then(Value::as_array) {
+        for item in items {
+            let parsed = match parse_provider_message(Some(item)) {
+                Ok(m) => m,
+                Err(msg) => {
+                    send_event(out_tx, chat_error_body(args, &chat_id, msg)).await?;
+                    return Ok(());
+                }
+            };
+            history.push(parsed.message);
+            for failure in &parsed.tool_call_failures {
+                if let Some(id) = &failure.id {
+                    history.push(Message::tool_result(
+                        id.clone(),
+                        format!(
+                            "Failed to parse tool call: {}. Raw: {}",
+                            failure.error, failure.raw
+                        ),
+                    ));
+                } else {
+                    tracing::warn!(
+                        error = %failure.error,
+                        raw = %failure.raw,
+                        "tool_call parse failed and no id to surface error to model",
+                    );
+                }
+            }
+        }
+    }
+
+    match chats
+        .restore_messages(MessageRestore {
+            id: chat_id.clone(),
+            model,
+            system,
+            tool_overrides,
+            tool_allowlist,
+            reasoning_effort,
+            history,
+        })
+        .await
+    {
+        Ok(()) => send_event(out_tx, chat_appended_body(args, &chat_id)).await,
         Err(e) => send_event(out_tx, chat_error_body(args, &chat_id, e.to_string())).await,
     }
 }

@@ -120,6 +120,78 @@ function M.spawn_spec(name, command, opts)
     emit_synthetic = emit_synthetic,
   }
 
+  local function clone_table(t)
+    if type(t) ~= "table" then return t end
+    local out = {}
+    for k, v in pairs(t) do
+      out[k] = type(v) == "table" and clone_table(v) or v
+    end
+    return out
+  end
+
+  local function publish_history_create(body)
+    if type(body.chat_id) ~= "string" then return end
+    emit_synthetic(name, {
+      kind             = "chat.history.create",
+      provider         = name,
+      chat_id          = body.chat_id,
+      model            = body.model,
+      system           = body.system,
+      tools            = clone_table(body.tools),
+      reasoning_effort = body.reasoning_effort,
+    })
+  end
+
+  local function publish_history_message(chat_id, message)
+    if type(chat_id) ~= "string" or type(message) ~= "table" then return end
+    emit_synthetic(name, {
+      kind     = "chat.history.message",
+      provider = name,
+      chat_id  = chat_id,
+      message  = clone_table(message),
+    })
+  end
+
+  local function normalize_tool_calls(tcs)
+    if type(tcs) ~= "table" then return nil end
+    local out = {}
+    for _, tc in ipairs(tcs) do
+      if type(tc) == "table" then
+        if type(tc["function"]) == "table" then
+          table.insert(out, clone_table(tc))
+        elseif type(tc.id) == "string" and type(tc.name) == "string" then
+          local arguments = tc.arguments
+          if type(arguments) ~= "string" then
+            local ok, encoded = pcall(nefor.json.encode, arguments == nil and {} or arguments)
+            arguments = ok and encoded or "{}"
+          end
+          table.insert(out, {
+            id = tc.id,
+            type = "function",
+            ["function"] = {
+              name = tc.name,
+              arguments = arguments,
+            },
+          })
+        end
+      end
+    end
+    if #out == 0 then return nil end
+    return out
+  end
+
+  local function assistant_message_from_output(output)
+    if type(output) ~= "table" then return nil end
+    local text = type(output.text) == "string" and output.text or ""
+    local tcs = normalize_tool_calls(output.tool_calls)
+    local has_text = #text > 0
+    local has_tcs = type(tcs) == "table" and #tcs > 0
+    if not has_text and not has_tcs then return nil end
+    local message = { role = "assistant", content = text }
+    if has_tcs then message.tool_calls = tcs end
+    return message
+  end
+
   local function handle_orchestrator_outbound(body)
     local k = body.kind
     if type(k) ~= "string" then return body end
@@ -191,6 +263,7 @@ function M.spawn_spec(name, command, opts)
     if k == kinds.chat_complete_result then
       local chat_id = body.chat_id
       if type(chat_id) ~= "string" then return body end
+      publish_history_message(chat_id, assistant_message_from_output(body.output))
       local entry = al.peek_pending_for_chat(chat_id)
       if not entry then return body end
 
@@ -291,7 +364,8 @@ function M.spawn_spec(name, command, opts)
   --   4. translator.deliver to the peer's stdin.
   local function to_plugin(envs)
     for _, env in ipairs(envs) do
-      if env.replay then
+      local kind = type(env.body) == "table" and env.body.kind or nil
+      if env.replay or kind == "sessions.replay.end" then
         provider_lib.replay_rebuild(env, name)
       else
         if hooks.intercept_to_plugin then
@@ -314,6 +388,11 @@ function M.spawn_spec(name, command, opts)
               or body.kind == kinds.reasoning_set
               or body.kind == kinds.chat_compact then
             body.chat_id = active_chat_id()
+          end
+          if body.kind == kinds.chat_create then
+            publish_history_create(body)
+          elseif body.kind == kinds.chat_append then
+            publish_history_message(body.chat_id, body.message)
           end
           translator.deliver(body)
         end
