@@ -695,15 +695,15 @@ local function handle_user_turn_after_verdict(_body)
   end
 end
 
--- Replay reducers — UI re-emission only. Plan state is ephemeral
+-- Replay reducers. Plan state is ephemeral
 -- per session (see header doc): we do NOT rebuild state.active_plan
 -- from the bus log, since carrying an approval into a new session
 -- would let a writer dispatch run without a fresh user verdict.
 
 local function reduce_plan_submitted(body)
-  -- Re-emit the chat-surface envelope so the yellow review block
-  -- reappears after /resume. chat.lua keys plan entries by submission
-  -- order; no plan_id is needed.
+  -- Live write-review feedback emits the chat-surface envelope once.
+  -- Replay uses the persisted chat.plan.append envelope directly; regenerating
+  -- it here appends historical plans at the tail on reattach.
   emit_as(SOURCE_NAME, nil, {
     kind         = "chat.plan.append",
     text         = body.plan,
@@ -908,10 +908,10 @@ local function receive_msg(entry)
     return
   end
 
-  -- Plan envelopes — used live AND on replay to rebuild state.
-  -- `env.replay` rides per-envelope from sessions's replay path, but
-  -- our reducer is identical for both, so we just consume both.
+  -- Plan envelopes: live feedback paints the review block. Replay relies on
+  -- the persisted chat.plan.append event to restore chat order.
   if kind == "lead-workflow.plan.submitted" then
+    if replay_window.active() then return end
     reduce_plan_submitted(body)
     return
   end

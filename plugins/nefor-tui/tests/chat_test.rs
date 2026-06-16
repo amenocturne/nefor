@@ -5619,14 +5619,8 @@ fn plan_review_reply_emits_review_response_not_chat_input_submit() {
 
 #[test]
 fn chat_plan_append_is_idempotent_on_submitted_at() {
-    // The lead-workflow actor's plan.submitted reducer fires
-    // chat.plan.append on every handling — once on live (via bus
-    // feedback) and again on /resume (sessions replays both the
-    // persisted chat.plan.append and re-fires the reducer for the
-    // replayed plan.submitted). chat.lua's reducer must dedupe by
-    // submitted_at so the same plan doesn't paint two yellow boxes
-    // after every resume. (plan_id was dropped — there is one plan in
-    // flight at a time, identity is the timestamp.)
+    // Plan identity is the submission timestamp. Even if a duplicate
+    // chat.plan.append arrives, the chat surface must render one block.
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -5650,9 +5644,8 @@ fn chat_plan_append_is_idempotent_on_submitted_at() {
 #[test]
 fn chat_plan_append_dedup_preserves_approved_status() {
     // After a plan is approved, a duplicate chat.plan.append with the
-    // same submitted_at (e.g. from /resume's replay path) must NOT
-    // regress the entry's status back to "pending". The dedup branch
-    // returns the existing entry untouched.
+    // same submitted_at must NOT regress the entry's status back to
+    // "pending". The dedup branch returns the existing entry untouched.
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);

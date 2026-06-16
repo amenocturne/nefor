@@ -483,11 +483,10 @@ do
 end
 
 -- ------------------------------------------------------------------
--- chat.plan.append re-emit: replaying lead-workflow.plan.submitted on
--- /resume must produce a chat.plan.append envelope so the chat surface
--- can re-render the yellow plan box. Without this, the visual entry
--- is lost on resume (the actor state is intentionally NOT rebuilt
--- — verdicts don't carry across sessions — but the chat history does).
+-- Replay must not synthesize fresh chat.plan.append envelopes from
+-- lead-workflow.plan.submitted. The session log already contains the
+-- original chat.plan.append in chronological order; regenerating it
+-- during replay appends historical plans at the tail on reattach.
 -- ------------------------------------------------------------------
 
 do
@@ -504,13 +503,10 @@ do
   local calls = decode_calls()
   local appended = find_call(calls, function(c)
     return c.body.kind == "chat.plan.append"
-       and c.body.submitted_at == "2026-05-08T00:00:00.000Z"
   end)
-  assert_true(appended ~= nil,
-    "replayed plan.submitted must re-emit chat.plan.append for the chat surface; got "
+  assert_eq(appended, nil,
+    "replayed plan.submitted must not synthesize chat.plan.append; got "
     .. json.encode(_test.calls()))
-  assert_eq(appended.body.text, "Replayed plan body",
-    "replayed chat.plan.append carries the plan text")
 end
 
 -- Replay does NOT rebuild state.active_plan. Approval/verdict state is
