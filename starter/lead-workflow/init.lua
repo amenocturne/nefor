@@ -23,13 +23,10 @@
 --                                with implementation". status="approved".
 --   * `/reject [reason]`       — emit tool.result = "rejected: <reason>,
 --                                revise". status="rejected".
---   * any other user message   — emit tool.result = "user replied with
+--   * any other review reply   — emit tool.result = "user replied with
 --                                a comment, plan discarded — address
 --                                their reply: <text>". active_plan is
---                                cleared. The same chat.input.submit
---                                ALSO lands as a regular user.message
---                                via agentic-loop's normal path, so the
---                                lead's next inference has both.
+--                                cleared.
 --
 -- After the verdict resolves, the approval is single-use per turn: the
 -- next genuine user message clears `state.active_plan`. Combined with
@@ -623,7 +620,7 @@ local function emit_verdict_discarded(firing_id, comment)
   emit_tool_result_ok(firing_id, out)
 end
 
--- chat.input.submit watcher — /approve and /reject patterns.
+-- chat.review.respond watcher — /approve and /reject patterns.
 -- Match `/approve` or `/approve <reason>` and `/reject <reason>`. The
 -- patterns are lenient: surrounding whitespace is stripped. Returns
 -- (verdict, reason) or nil if the text doesn't match.
@@ -678,12 +675,7 @@ local function handle_chat_input(body)
 
   if plan.status == "pending" then
     -- Comment arrived while the plan was awaiting a verdict. Discard
-    -- the plan, ack the deferred firing with the comment text inlined,
-    -- and clear active_plan. The same chat.input.submit also rides
-    -- through agentic-loop as a normal user.message, so the lead's
-    -- next inference sees the user's text on both channels — the
-    -- redundancy is harmless and the tool.result keeps the agent from
-    -- assuming the plan still applies.
+    -- the plan and ack the deferred firing with the comment text inlined.
     local firing_id = plan.pending_firing_id
     state.active_plan = nil
     emit_verdict_discarded(firing_id, body.text)
@@ -694,6 +686,13 @@ local function handle_chat_input(body)
   -- message ends the verdict's validity window; flush so any further
   -- writer dispatch needs a fresh plan + approval cycle.
   state.active_plan = nil
+end
+
+local function handle_user_turn_after_verdict(_body)
+  local plan = state.active_plan
+  if type(plan) == "table" and plan.status ~= "pending" then
+    state.active_plan = nil
+  end
 end
 
 -- Replay reducers — UI re-emission only. Plan state is ephemeral
@@ -933,8 +932,12 @@ local function receive_msg(entry)
   -- shouldn't double-record).
   if replay_window.active() then return end
 
-  if kind == "chat.input.submit" then
+  if kind == "chat.review.respond" then
     handle_chat_input(body)
+    return
+  end
+  if kind == "chat.input.submit" then
+    handle_user_turn_after_verdict(body)
     return
   end
 

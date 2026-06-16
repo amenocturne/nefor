@@ -5581,6 +5581,43 @@ fn user_submit_after_plan_does_not_carry_plan_body_in_wire_text() {
 }
 
 #[test]
+fn plan_review_reply_emits_review_response_not_chat_input_submit() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.plan.append",
+            "plan_id": "p1",
+            "text": "Plan awaiting review",
+            "submitted_at": "2026-05-08T12:00:00Z",
+        }),
+    );
+    let _ = render_str(&mut engine);
+    let _ = engine.take_emit_queue();
+
+    let reply = "please delete the disposable audio stems";
+    submit_text(&mut engine, reply);
+
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "review reply should emit one envelope");
+    let (target, body) = &emits[0];
+    assert_eq!(target.as_deref(), Some("engine"));
+    assert_eq!(
+        body.get("kind").and_then(|v| v.as_str()),
+        Some("chat.review.respond")
+    );
+    assert_eq!(body.get("text").and_then(|v| v.as_str()), Some(reply));
+    assert_ne!(
+        body.get("kind").and_then(|v| v.as_str()),
+        Some("chat.input.submit"),
+        "review replies must not enter the normal prompt queue"
+    );
+}
+
+#[test]
 fn chat_plan_append_is_idempotent_on_submitted_at() {
     // The lead-workflow actor's plan.submitted reducer fires
     // chat.plan.append on every handling — once on live (via bus

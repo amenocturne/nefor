@@ -78,6 +78,17 @@ local function fold_prompt_patch(state, patch)
   return shallow_merge(state, out)
 end
 
+local function has_pending_plan(state)
+  local entries = state.entries or {}
+  for i = #entries, 1, -1 do
+    local entry = entries[i]
+    if type(entry) == "table" and entry.kind == "plan" then
+      return entry.status == "pending"
+    end
+  end
+  return false
+end
+
 -- Pure-update prune for stale dag runs + expired toasts.
 local function prune_expired(state)
   local now = tui.now_ms()
@@ -318,6 +329,21 @@ local function handle_input_submit(msg, state)
         cursor   = 1,
       },
     }), {}
+  end
+  if has_pending_plan(state) then
+    local hist = { text }
+    for i, v in ipairs(state.prompt_history or {}) do
+      if i >= history.INPUT_HISTORY_MAX then break end
+      hist[#hist + 1] = v
+    end
+    history.persist(hist)
+    return shallow_merge(state, {
+      input_value = "", completion = NIL_SENTINEL,
+      prompt_history = hist, history_cursor = NIL_SENTINEL,
+    }), {
+      { kind = "send_to", target = "engine",
+        body = { kind = "chat.review.respond", text = text } },
+    }
   end
   if cmd ~= nil then
     -- Unknown slash → generic chat.command for user-defined Lua handlers.

@@ -253,7 +253,7 @@ do
     name = "write-review",
     args = { plan = "test plan" },
   })
-  feed("nefor-tui", { kind = "chat.input.submit", text = "/approve" })
+  feed("nefor-tui", { kind = "chat.review.respond", text = "/approve" })
   _test.calls_clear()
 
   feed("tool-gate", {
@@ -337,7 +337,7 @@ do
   })
   _test.calls_clear()
 
-  feed("nefor-tui", { kind = "chat.input.submit", text = "/approve" })
+  feed("nefor-tui", { kind = "chat.review.respond", text = "/approve" })
 
   local calls = decode_calls()
 
@@ -383,7 +383,7 @@ do
   })
   _test.calls_clear()
 
-  feed("nefor-tui", { kind = "chat.input.submit",
+  feed("nefor-tui", { kind = "chat.review.respond",
                       text = "/reject too aggressive timeline" })
 
   local calls = decode_calls()
@@ -420,7 +420,7 @@ do
   })
   _test.calls_clear()
 
-  feed("nefor-tui", { kind = "chat.input.submit",
+  feed("nefor-tui", { kind = "chat.review.respond",
                       text = "actually can you also add step 4" })
 
   local calls = decode_calls()
@@ -452,7 +452,7 @@ do
     name = "write-review",
     args = { plan = "Plan D" },
   })
-  feed("nefor-tui", { kind = "chat.input.submit", text = "/approve" })
+  feed("nefor-tui", { kind = "chat.review.respond", text = "/approve" })
   assert_eq(lw._internals.state.active_plan.status, "approved",
     "verdict applied")
 
