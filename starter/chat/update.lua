@@ -592,7 +592,11 @@ local function handle_stream_delta(msg, state)
 end
 
 local function handle_stream_end(msg, state)
-  return transcript.finalize_assistant(state, msg.text, msg.model, msg.duration_ms), {}
+  local next = transcript.finalize_assistant(state, msg.text, msg.model, msg.duration_ms)
+  return next, {
+    { kind = "send_to", target = "engine",
+      body = { kind = "chat.turn.idle.check" } },
+  }
 end
 
 local function handle_turn_idle(_msg, state)

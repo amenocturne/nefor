@@ -1115,11 +1115,18 @@ local function receive_msg(entry)
         or kind == "chat.reset"
         or kind == "chat.interrupt_all"
         or kind == "chat.model.set"
-        or kind == "chat.reasoning.set" then
+        or kind == "chat.reasoning.set"
+        or kind == "chat.turn.idle.check" then
       return
     end
   end
 
+  if kind == "chat.turn.idle.check" then
+    if state.current_run_id == nil then
+      emit("nefor-tui", { kind = "chat.turn.idle" })
+    end
+    return
+  end
   if kind == "chat.input.submit" then handle_chat_input_submit(body); return end
   if kind == "chat.reset"        then handle_chat_reset(); return end
   if kind == "chat.interrupt_all" then cancel_all(); return end
