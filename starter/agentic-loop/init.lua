@@ -1111,6 +1111,20 @@ local function receive_msg(entry)
       end
       return
     end
+    -- Fallback: provider-scoped chat.create events are always persisted
+    -- (they're emitted by the graph before the provider processes them).
+    -- chat.history.create is emitted by the compositor but may not reach
+    -- the session log (emit_synthetic from inside to_plugin). Accept
+    -- <provider>.chat.create as a restorable-chat fact so cross-process
+    -- resume restores current_state via the wrap tool.result path.
+    if kind == state.config.provider .. ".chat.create" then
+      local cid = body.chat_id
+      if type(cid) == "string" and cid ~= "" then
+        state.replay_restorable_chat_ids[cid] = true
+        envelope.advance_id_past(cid)
+      end
+      return
+    end
     if kind == "chat.input.submit"
         or kind == "chat.reset"
         or kind == "chat.interrupt_all"

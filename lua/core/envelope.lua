@@ -37,6 +37,13 @@ function M.next_id(prefix)
   return prefix .. "-" .. tostring(id_counter)
 end
 
+function M.advance_id_past(id_string)
+  local n = tonumber(id_string:match("%-(%d+)$"))
+  if n and n >= id_counter then
+    id_counter = n
+  end
+end
+
 function M.uuid_lite()
   id_seq = id_seq + 1
   return string.format(
