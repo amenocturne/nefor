@@ -35,7 +35,7 @@ function M.append_assistant_delta(state, delta)
     local new_entries = replace_entry(state.entries, state.in_flight, new_entry)
     log.log("transcript", "delta in_flight=%d len=%d new_v=%d",
       state.in_flight, #delta, new_entry.v)
-    return shallow_merge(state, { entries = new_entries, pending = false })
+    return shallow_merge(state, { entries = new_entries })
   end
   local new_entry = Entry.assistant_stream()
   new_entry = Entry.append_text(new_entry, delta)
@@ -45,7 +45,6 @@ function M.append_assistant_delta(state, delta)
   return shallow_merge(state, {
     entries   = new_entries,
     in_flight = #new_entries,
-    pending   = false,
   })
 end
 
@@ -58,7 +57,7 @@ function M.append_reasoning_delta(state, delta)
     log.log("transcript", "reasoning_delta new_stream v=%d count=%d",
       new_entry.v, #new_entries)
     return shallow_merge(state, {
-      entries = new_entries, in_flight = #new_entries, pending = false,
+      entries = new_entries, in_flight = #new_entries,
     })
   end
   local e = state.entries[idx]
@@ -66,7 +65,7 @@ function M.append_reasoning_delta(state, delta)
   local new_entries = replace_entry(state.entries, idx, new_entry)
   log.log("transcript", "reasoning_delta in_flight=%d new_v=%d",
     idx, new_entry.v)
-  return shallow_merge(state, { entries = new_entries, pending = false })
+  return shallow_merge(state, { entries = new_entries })
 end
 
 function M.finalize_reasoning(state, duration_ms)
