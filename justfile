@@ -25,10 +25,17 @@ sync:
       *) echo "Aborted."; exit 1 ;;
     esac
     brew tap amenocturne/tap 2>/dev/null || true
-    if ! brew info "amenocturne/tap/nefor@$NEFOR_VERSION" >/dev/null 2>&1; then
-      echo "Pinned nefor formula amenocturne/tap/nefor@$NEFOR_VERSION is unavailable; refusing to install latest." >&2
+    FORMULA="amenocturne/tap/nefor@$NEFOR_VERSION"
+    BREW_INFO_OUTPUT="$(brew info "$FORMULA" 2>&1)" || {
+      printf '%s\n' "$BREW_INFO_OUTPUT" >&2
+      if printf '%s\n' "$BREW_INFO_OUTPUT" | grep -Eiq 'untrusted tap|Refusing to load formula|brew trust'; then
+        echo "Homebrew refused to load the amenocturne/tap formula because the tap is not trusted." >&2
+        echo "Review the tap before trusting it, then run: brew trust amenocturne/tap" >&2
+        exit 2
+      fi
+      echo "Pinned nefor formula $FORMULA is unavailable; refusing to install latest." >&2
       exit 1
-    fi
+    }
     brew install "amenocturne/tap/nefor@$NEFOR_VERSION"
     INSTALLED="$(nefor --version 2>/dev/null | awk '{print $2}')"
     if [ "$INSTALLED" != "$NEFOR_VERSION" ]; then
