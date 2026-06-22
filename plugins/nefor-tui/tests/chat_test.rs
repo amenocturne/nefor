@@ -641,6 +641,52 @@ fn graph_run_started_creates_a_dag_panel_row() {
 }
 
 #[test]
+fn graph_node_tool_invoke_uses_path_tail_label() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.run_started",
+            "run_id": "run-path-tail",
+            "total_nodes": 1,
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.node.fired",
+            "run_id": "run-path-tail",
+            "node_id": "inspect",
+            "firing_id": "f-inspect-1",
+            "reasoner": "codex",
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.node.tool.invoke",
+            "run_id": "run-path-tail",
+            "node_id": "inspect",
+            "tool_name": "read_file",
+            "tool_args": { "path": "/Users/skril/Vault/Projects/personal/nefor/starter/chat/dag.lua" },
+        }),
+    );
+
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("read_file(.../starter/chat/dag.lua)"),
+        "path tool label should keep the meaningful file tail: {out:?}"
+    );
+    assert!(
+        !out.contains("read_file(/Users/skril"),
+        "path tool label should not expose the absolute path head: {out:?}"
+    );
+}
+
+#[test]
 fn graph_node_dispatched_then_result_updates_status_glyph() {
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");

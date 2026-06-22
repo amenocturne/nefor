@@ -270,11 +270,36 @@ end
 local TOOL_ARG_KEYS = {
   bash         = { "command" },
   read_file    = { "path", "file_path" },
+  read_image   = { "path", "file_path" },
   write_file   = { "path", "file_path" },
   edit_file    = { "path", "file_path", "target_path" },
   list_dir     = { "path" },
   search_text  = { "pattern", "query", "text" },
 }
+
+local PATH_TOOLS = {
+  read_file  = true,
+  read_image = true,
+  write_file = true,
+  edit_file  = true,
+  list_dir   = true,
+}
+
+local function format_path_arg_short(path, max_len)
+  if #path <= max_len then return path end
+  local prefix = ".../"
+  local budget = max_len - #prefix
+  local parts = {}
+  for part in path:gmatch("[^/]+") do parts[#parts + 1] = part end
+  local tail = ""
+  for i = #parts, 1, -1 do
+    local candidate = tail == "" and parts[i] or (parts[i] .. "/" .. tail)
+    if #candidate > budget then break end
+    tail = candidate
+  end
+  if tail == "" then tail = path:sub(-budget) end
+  return prefix .. tail
+end
 
 local function format_tool_args_short(tool_name, args)
   if type(args) ~= "table" then return "" end
@@ -304,16 +329,10 @@ local function format_tool_args_short(tool_name, args)
   -- and break sidebar layout; replace them.
   picked = picked:gsub("[\r\n]+", " ")
   local MAX = 40
-  if #picked > MAX then
-    local is_path = picked:find("/", 1, true)
-    if is_path then
-      local tail = picked:sub(-(MAX - 1))
-      local slash = tail:find("/", 1, true)
-      if slash then tail = tail:sub(slash) end
-      picked = "…" .. tail
-    else
-      picked = picked:sub(1, MAX - 1) .. "…"
-    end
+  if PATH_TOOLS[tool_name] then
+    picked = format_path_arg_short(picked, MAX)
+  elseif #picked > MAX then
+    picked = picked:sub(1, MAX - 1) .. "…"
   end
   return picked
 end
