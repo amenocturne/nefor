@@ -1601,6 +1601,65 @@ fn thinking_indicator_has_no_braille_spinner() {
 }
 
 #[test]
+fn escape_with_pending_lead_active_graph_and_queued_text_interrupts_lead_only() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    submit_text(&mut engine, "lead prompt");
+    let _ = engine.take_emit_queue();
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "graph.run_started", "run_id": "graph-1", "total_nodes": 1 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.node.fired",
+            "run_id": "graph-1",
+            "node_id": "n1",
+            "firing_id": "f-n1",
+            "reasoner": "agent",
+        }),
+    );
+    submit_text(&mut engine, "queued one");
+    submit_text(&mut engine, "queued two");
+    type_text(&mut engine, "draft");
+    let _ = engine.take_emit_queue();
+
+    engine.handle_key(key("escape")).expect("escape");
+    let emits = engine.take_emit_queue();
+    assert_eq!(
+        emits.len(),
+        1,
+        "Esc must emit only lead interrupt: {emits:?}"
+    );
+    assert_eq!(
+        emits[0].1.get("kind").and_then(|v| v.as_str()),
+        Some("chat.interrupt")
+    );
+
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("DAG graph-1") && out.contains('●') && !out.contains('✗'),
+        "active graph should remain running after lead interrupt: {out:?}"
+    );
+    assert!(
+        !out.contains("queued follow-up"),
+        "queued follow-up widget should clear after restoring prompt: {out:?}"
+    );
+    assert!(
+        out.contains("queued one") && out.contains("queued two") && out.contains("draft"),
+        "queued text and draft should return to input preserving newlines: {out:?}"
+    );
+    assert!(
+        !out.contains("│ queued one") && !out.contains("│ queued two"),
+        "queued text must not be promoted into transcript/history: {out:?}"
+    );
+}
+
+#[test]
 fn double_escape_after_lead_stops_emits_interrupt_all() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
@@ -1609,6 +1668,16 @@ fn double_escape_after_lead_stops_emits_interrupt_all() {
     dispatch_event(
         &mut engine,
         json!({ "kind": "graph.run_started", "run_id": "graph-1", "total_nodes": 1 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.node.fired",
+            "run_id": "graph-1",
+            "node_id": "n1",
+            "firing_id": "f-n1",
+            "reasoner": "agent",
+        }),
     );
     let _ = engine.take_emit_queue();
 
@@ -1624,6 +1693,11 @@ fn double_escape_after_lead_stops_emits_interrupt_all() {
         second[0].1.get("kind").and_then(|v| v.as_str()),
         Some("chat.interrupt_all"),
         "second ESC after lead stops should cancel active graphs"
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains('✗') || out.contains("error"),
+        "graph interrupt path should mark running graph interrupted locally: {out:?}"
     );
 }
 

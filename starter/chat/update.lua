@@ -456,24 +456,27 @@ local function handle_escape(_msg, state)
       input_value = join_nonempty({ state.pending_followups, state.input_value }, "\n"),
       pending_followups = "",
     }
-    local graphs_active = dag.any_active(state.dag_runs, now)
-    if state.in_flight ~= nil or (state.pending and not graphs_active) then
+    if state.in_flight ~= nil or state.pending then
       return shallow_merge(state, patch), {
         { kind = "send_to", target = "engine",
           body = { kind = "chat.interrupt" } },
       }
     end
-    local interrupted = dag.interrupt_all(state, now)
-    return shallow_merge(interrupted, patch), {
-      { kind = "send_to", target = "engine",
-        body = { kind = "chat.interrupt_all" } },
-    }
+    if dag.any_active(state.dag_runs, now) then
+      local interrupted = dag.interrupt_all(state, now)
+      return shallow_merge(interrupted, patch), {
+        { kind = "send_to", target = "engine",
+          body = { kind = "chat.interrupt_all" } },
+      }
+    end
+    return shallow_merge(state, patch), {}
   end
-  -- 5) single ESC interrupts the current turn
+  -- 5) single ESC interrupts the current lead turn only. Queued
+  -- follow-ups move back into the prompt so the user can edit/resubmit
+  -- them; active graphs are left running.
   if state.pending or state.in_flight ~= nil then
-    local interrupted = dag.interrupt_all(state, now)
     local prompt = join_nonempty({ state.pending_followups, state.input_value }, "\n")
-    return shallow_merge(interrupted, {
+    return shallow_merge(state, {
       last_esc_ms = now,
       input_value = prompt,
       pending_followups = "",
