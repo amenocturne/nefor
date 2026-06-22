@@ -32,6 +32,10 @@ function M.active_token(text, trigger, anchor)
     if text:find("%s") ~= nil then return nil end
     return text, 1, text:sub(2)
   end
+  if anchor == "start-spaced" then
+    if text:sub(1, 1) ~= trigger then return nil end
+    return text, 1, text:sub(2)
+  end
   -- anchor "word": last `trigger` at position 1 or after whitespace,
   -- with no whitespace in the body that follows.
   local pos = nil
