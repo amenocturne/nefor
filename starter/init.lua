@@ -46,7 +46,6 @@ do
   end
 end
 local STARTER_ROOT  = NEFOR_CONFIG_DIR or "."
-local NEFOR_DEV_DIR = os.getenv("NEFOR_DEV_DIR")
 local SPARSE_CONE   = "lua starter plugins"
 
 local function read_env_value(path, key)
@@ -64,15 +63,26 @@ local function read_env_value(path, key)
 end
 
 local PINNED_ENV_PATH = STARTER_ROOT .. "/.env"
+local PINNED_LOCAL_ENV_PATH = STARTER_ROOT .. "/.env.local"
 local PINNED_NEFOR_VERSION = read_env_value(PINNED_ENV_PATH, "NEFOR_VERSION")
 if type(PINNED_NEFOR_VERSION) ~= "string" or PINNED_NEFOR_VERSION == "" then
   PINNED_ENV_PATH = STARTER_ROOT .. "/../.env"
+  PINNED_LOCAL_ENV_PATH = STARTER_ROOT .. "/../.env.local"
   PINNED_NEFOR_VERSION = read_env_value(PINNED_ENV_PATH, "NEFOR_VERSION")
 end
 if type(PINNED_NEFOR_VERSION) ~= "string" or PINNED_NEFOR_VERSION == "" then
   error("nefor-team startup: missing NEFOR_VERSION in " .. STARTER_ROOT .. "/.env or " .. STARTER_ROOT .. "/../.env; run `just sync` from the nefor-team repo")
 end
-if not nefor or nefor.version ~= PINNED_NEFOR_VERSION then
+
+local NEFOR_DEV_DIR = os.getenv("NEFOR_DEV_DIR")
+if type(NEFOR_DEV_DIR) ~= "string" or NEFOR_DEV_DIR == "" then
+  NEFOR_DEV_DIR = read_env_value(PINNED_LOCAL_ENV_PATH, "NEFOR_DEV_DIR")
+end
+if type(NEFOR_DEV_DIR) ~= "string" or NEFOR_DEV_DIR == "" then
+  NEFOR_DEV_DIR = nil
+end
+
+if not NEFOR_DEV_DIR and (not nefor or nefor.version ~= PINNED_NEFOR_VERSION) then
   error("nefor-team startup: nefor version " .. tostring(nefor and nefor.version)
         .. " does not match pinned NEFOR_VERSION=" .. PINNED_NEFOR_VERSION
         .. "; run `just sync` from the nefor-team repo")
