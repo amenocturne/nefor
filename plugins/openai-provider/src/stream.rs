@@ -398,8 +398,9 @@ fn retry_after_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     if let Ok(seconds) = value.parse::<u64>() {
         return Some(Duration::from_secs(seconds));
     }
+    let now = std::time::SystemTime::now();
     let when = httpdate::parse_http_date(value).ok()?;
-    when.duration_since(std::time::SystemTime::now()).ok()
+    Some(when.duration_since(now).unwrap_or(Duration::ZERO))
 }
 
 async fn sleep_before_retry(cancel: &CancellationToken, delay: Duration) -> bool {

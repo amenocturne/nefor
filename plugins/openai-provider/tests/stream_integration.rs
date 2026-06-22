@@ -241,6 +241,124 @@ async fn chat_stream_429_retry_respects_retry_after_seconds() {
 }
 
 #[tokio::test]
+async fn chat_stream_429_retry_respects_past_retry_after_http_date_as_zero_delay() {
+    let (listener, addr) = bind_local().await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_server = attempts.clone();
+
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut s, _) = listener.accept().await.expect("accept");
+            let _ = read_request(&mut s).await;
+            let n = attempts_server.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                let body = "{\"error\":\"rate limited\"}";
+                let response = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: Sun, 06 Nov 1994 08:49:37 GMT\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(response.as_bytes()).await;
+            } else {
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n\
+                            data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n\
+                            data: [DONE]\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(response.as_bytes()).await;
+            }
+            let _ = s.shutdown().await;
+        }
+    });
+
+    let client = reqwest::Client::builder().build().expect("client");
+    let endpoint = format!("http://{}/v1/chat/completions", addr);
+    let messages = vec![Message::user("hello")];
+
+    let mut progress: Vec<RetryProgress> = Vec::new();
+    let outcome = run_chat_stream_with_retry_progress(
+        &client,
+        &endpoint,
+        None,
+        "Authorization",
+        "test-model",
+        &messages,
+        None,
+        None,
+        CancellationToken::new(),
+        |_| {},
+        |_| {},
+        |p| progress.push(p),
+    )
+    .await
+    .expect("second attempt succeeds");
+
+    let _ = server.await;
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(outcome.full_text, "OK");
+    assert_eq!(progress.len(), 1);
+    assert_eq!(progress[0].status, Some(429));
+    assert_eq!(progress[0].next_delay, std::time::Duration::ZERO);
+}
+
+#[tokio::test]
+async fn chat_stream_cancellation_during_backoff_interrupts_without_second_request() {
+    let (listener, addr) = bind_local().await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_server = attempts.clone();
+
+    let server = tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.expect("accept");
+        let _ = read_request(&mut s).await;
+        attempts_server.fetch_add(1, Ordering::SeqCst);
+        let body = "{\"error\":\"rate limited\"}";
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = s.write_all(response.as_bytes()).await;
+        let _ = s.shutdown().await;
+    });
+
+    let client = reqwest::Client::builder().build().expect("client");
+    let endpoint = format!("http://{}/v1/chat/completions", addr);
+    let messages = vec![Message::user("hello")];
+    let cancel = CancellationToken::new();
+    let cancel_from_progress = cancel.clone();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        run_chat_stream_with_retry_progress(
+            &client,
+            &endpoint,
+            None,
+            "Authorization",
+            "test-model",
+            &messages,
+            None,
+            None,
+            cancel,
+            |_| {},
+            |_| {},
+            move |_| cancel_from_progress.cancel(),
+        ),
+    )
+    .await
+    .expect("cancellation should interrupt retry sleep promptly")
+    .expect("cancellation returns an interrupted outcome");
+
+    let _ = server.await;
+
+    assert!(outcome.interrupted);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn streaming_emits_deltas_then_end() {
     let (listener, addr) = bind_local().await;
 
