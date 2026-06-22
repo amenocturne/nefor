@@ -250,6 +250,58 @@ local function test_late_attacher_receives_prior_events_in_order()
   assert_eq(replayed[3], "e3", "third is e3")
 end
 
+local function test_late_attacher_preserves_replay_flags_from_prior_log()
+  reset()
+  _test.set_plugins({})
+  local replay_window = require("core.history_replay")
+  replay_window.set(false)
+
+  local function send_step(from, body)
+    nefor.engine.send(json.encode({
+      type = "event",
+      from = from,
+      ts   = "2026-05-04T00:00:00.000Z",
+      body = body,
+    }))
+  end
+
+  send_step("live",     { kind = "chat.message.append", role = "user", text = "before" })
+  send_step("sessions", { kind = "sessions.replay.start", session_id = "s", count = 1 })
+  send_step("ollama",   { kind = "ollama.chat.complete", chat_id = "c1" })
+  send_step("sessions", { kind = "sessions.replay.end",   session_id = "s" })
+  send_step("live",     { kind = "chat.message.append", role = "user", text = "after" })
+
+  ncp.dispatch(_test.bus_log())
+  assert_eq(replay_window.active(), false,
+    "normal dispatch must leave the global replay flag released")
+
+  local seen = {}
+  ncp._test_set_transforms("late", {
+    to_plugin = function(envs)
+      for _, env in ipairs(envs) do
+        seen[#seen + 1] = { kind = env.body.kind, replay = env.replay }
+      end
+    end,
+  })
+
+  _test.set_plugins({ "late" })
+  _test.calls_clear()
+  ready("late")
+
+  assert_eq(#seen, 5, "late attacher saw the whole prior bus log")
+  assert_eq(seen[1].kind, "chat.message.append", "pre-replay entry preserved")
+  assert_eq(seen[1].replay, false, "pre-replay entry is live")
+  assert_eq(seen[2].kind, "sessions.replay.start", "start marker preserved")
+  assert_eq(seen[2].replay, true, "start marker opens replay for late attach")
+  assert_eq(seen[3].kind, "ollama.chat.complete", "provider command preserved")
+  assert_eq(seen[3].replay, true,
+    "replayed provider command must not be delivered as fresh live work")
+  assert_eq(seen[4].kind, "sessions.replay.end", "end marker preserved")
+  assert_eq(seen[4].replay, false, "end marker closes replay for late attach")
+  assert_eq(seen[5].kind, "chat.message.append", "post-replay entry preserved")
+  assert_eq(seen[5].replay, false, "post-replay entry is live")
+end
+
 -- ------------------------------------------------------------------
 -- transforms: from_plugin callback decides what to publish
 -- ------------------------------------------------------------------
@@ -1402,6 +1454,7 @@ local tests = {
   { name = "malformed_json_triggers_error", fn = test_malformed_json_triggers_error },
   { name = "second_ready_from_same_plugin_errors", fn = test_second_ready_from_same_plugin_errors },
   { name = "late_attacher_receives_prior_events_in_order", fn = test_late_attacher_receives_prior_events_in_order },
+  { name = "late_attacher_preserves_replay_flags_from_prior_log", fn = test_late_attacher_preserves_replay_flags_from_prior_log },
   { name = "from_plugin_callback_can_transform_kind", fn = test_from_plugin_callback_can_transform_kind },
   { name = "from_plugin_callback_can_drop", fn = test_from_plugin_callback_can_drop },
   { name = "to_plugin_callback_per_target_only", fn = test_to_plugin_callback_per_target_only },

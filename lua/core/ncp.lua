@@ -324,14 +324,14 @@ end
 -- list (one entry per replayed envelope), and fires the new attacher's
 -- to_plugin once with the whole batch.
 --
--- Replay-on-attach happens outside the live `sessions.replay.*` framing
--- (the new attacher is just catching up to "what's already on the bus";
--- it isn't a session-replay event), so every envelope's `replay` flag
--- is whatever the global replay_window state says at this moment —
--- normally false, but if a session replay is in progress the new peer
--- sees the same view as everyone else.
+-- Replay-on-attach replays "what's already on the bus" to one late
+-- attacher. Recompute the replay cursor from the framing markers while
+-- walking the prior log, mirroring `dispatch` without mutating the
+-- global replay flag. A peer that readies after `sessions.replay.end`
+-- must still treat recorded provider/tool commands as replay, not as
+-- fresh live work.
 replay_prior_events = function(target, current_log)
-  local current_replay = replay_window.active()
+  local current_replay = false
   local envs = {}
   local entry_targets = {}
   for _, entry in ipairs(current_log) do
@@ -343,6 +343,12 @@ replay_prior_events = function(target, current_log)
         local decoded = select(1, try_decode(entry.payload))
         if type(decoded) == "table" and decoded.type == "event"
             and type(decoded.body) == "table" then
+          local kind = decoded.body.kind
+          if kind == "sessions.replay.start" then
+            current_replay = true
+          elseif kind == "sessions.replay.end" then
+            current_replay = false
+          end
           local from = (type(decoded.from) == "string") and decoded.from or "engine"
           envs[#envs + 1] = {
             type   = decoded.type,
