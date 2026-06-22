@@ -98,12 +98,12 @@ wiring.
 The engine spawns processes and routes lines through Lua. Everything else is
 composition.
 
-| Layer | What it owns |
-|-------|-------------|
-| **Engine / bus** | Process spawning, line routing, Lua hosting, and identity stamping (`origin`, `ts`). It does not parse message bodies. |
-| **Plugins** (`plugins/`) | Self-contained work over stdio. Each plugin owns one scoped task. |
-| **Lua config / starter** (`init.lua`, `starter/`) | Dispatch hooks, actor spawning, policies, persistence, provider/tool wiring, and interfaces. |
-| **Interfaces** | User surfaces composed over the same bus. The starter uses `nefor-tui`; you can wire another. |
+| Layer                                             | What it owns                                                                                                           |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| **Engine / bus**                                  | Process spawning, line routing, Lua hosting, and identity stamping (`origin`, `ts`). It does not parse message bodies. |
+| **Plugins** (`plugins/`)                          | Self-contained work over stdio. Each plugin owns one scoped task.                                                      |
+| **Lua config / starter** (`init.lua`, `starter/`) | Dispatch hooks, actor spawning, policies, persistence, provider/tool wiring, and interfaces.                           |
+| **Interfaces**                                    | User surfaces composed over the same bus. The starter uses `nefor-tui`; you can wire another.                          |
 
 Bash-tool test: a plugin should feel like a self-contained utility you could run
 from a shell, then compose elsewhere. Plugins should not know their neighbors;

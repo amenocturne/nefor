@@ -43,10 +43,10 @@ On each `<prefix>.prompt`:
 
 Four CLI flags, all optional:
 
-| Flag               | Default                  | Notes                                                                                                                                                                                                                                                                                                                                                                                                        |
-| ------------------ | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `--name <NAME>`    | `openai`                 | Per-instance identity. Used as the event-kind prefix (`<name>.hello`, `<name>.stream.delta`, ...).                                                                                                                                                                                                                                                                                                             |
-| `--base-url <URL>` | `http://localhost:11434` | OpenAI-compatible base. Trailing slash trimmed automatically; the plugin appends `/v1/chat/completions`.                                                                                                                                                                                                                                                                                                     |
+| Flag               | Default                  | Notes                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ------------------ | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--name <NAME>`    | `openai`                 | Per-instance identity. Used as the event-kind prefix (`<name>.hello`, `<name>.stream.delta`, ...).                                                                                                                                                                                                                                                                                                            |
+| `--base-url <URL>` | `http://localhost:11434` | OpenAI-compatible base. Trailing slash trimmed automatically; the plugin appends `/v1/chat/completions`.                                                                                                                                                                                                                                                                                                      |
 | `--model <MODEL>`  | --                       | Model id passed verbatim in the request body. Optional -- omitting it means `chat.create` without a model fails with `NoModelConfigured` until one is set via `/model`.                                                                                                                                                                                                                                       |
 | `--api-key <KEY>`  | --                       | Initial bearer token. Falls back to the `OPENAI_PROVIDER_API_KEY` env var (so secrets can stay out of `init.lua`). When set, plugin starts in `auth_state = connected`; when unset, `login_required` (chat will prompt the user to `/login`). For local providers like Ollama that don't actually need credentials, leave it unset and ignore the `login_required` status -- request still goes through fine. |
 
@@ -56,13 +56,13 @@ Why CLI flags and not env vars: the engine's `nefor.plugins.spawn` API does not 
 
 The defaults match a local Ollama install. Override the four flags per spawn for everything else.
 
-| Provider       | `--base-url`                  | Example `--model`                   | Auth                                   |
-| -------------- | ----------------------------- | ----------------------------------- | -------------------------------------- |
-| Ollama (local) | `http://localhost:11434`      | `qwen2.5-coder:7b`                  | none                                   |
+| Provider       | `--base-url`                  | Example `--model`                   | Auth                                    |
+| -------------- | ----------------------------- | ----------------------------------- | --------------------------------------- |
+| Ollama (local) | `http://localhost:11434`      | `qwen2.5-coder:7b`                  | none                                    |
 | Groq           | `https://api.groq.com/openai` | `llama-3.3-70b-versatile`           | `GROQ_API_KEY` env -> `--api-key`       |
 | OpenRouter     | `https://openrouter.ai/api`   | `meta-llama/llama-3.3-70b-instruct` | `OPENROUTER_API_KEY` env -> `--api-key` |
 | OpenAI         | `https://api.openai.com`      | `gpt-4o-mini`                       | `OPENAI_API_KEY` env -> `--api-key`     |
-| vLLM (local)   | `http://localhost:8000`       | (whatever you served)               | none                                   |
+| vLLM (local)   | `http://localhost:8000`       | (whatever you served)               | none                                    |
 
 Example spawn (Lua):
 

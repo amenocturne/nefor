@@ -33,13 +33,13 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 
 `nefor` resolves directories via XDG-style env vars, with CLI flags taking highest precedence:
 
-| Env var            | CLI flag       | Default                   | Holds      |
-| ------------------ | -------------- | ------------------------- | ---------- |
-| `NEFOR_DEV_DIR`    | —              | (unset)                   | dev repo root — when set, Lua searchers resolve `plugins/*/lua/` and `starter/` from here first |
+| Env var            | CLI flag       | Default                   | Holds                                                                                                    |
+| ------------------ | -------------- | ------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `NEFOR_DEV_DIR`    | —              | (unset)                   | dev repo root — when set, Lua searchers resolve `plugins/*/lua/` and `starter/` from here first          |
 | `NEFOR_LOCAL_DIR`  | —              | (unset)                   | installed-config local checkout override — lets pm use an unpushed local repo instead of fetching GitHub |
-| `NEFOR_CONFIG_DIR` | `--config`     | `$XDG_CONFIG_HOME/nefor`  | `init.lua` |
-| `NEFOR_DATA_DIR`   | `--data-dir`   | `$XDG_DATA_HOME/nefor`    | sessions   |
-| `NEFOR_PLUGIN_DIR` | `--plugin-dir` | `$NEFOR_DATA_DIR/plugins` | binaries   |
+| `NEFOR_CONFIG_DIR` | `--config`     | `$XDG_CONFIG_HOME/nefor`  | `init.lua`                                                                                               |
+| `NEFOR_DATA_DIR`   | `--data-dir`   | `$XDG_DATA_HOME/nefor`    | sessions                                                                                                 |
+| `NEFOR_PLUGIN_DIR` | `--plugin-dir` | `$NEFOR_DATA_DIR/plugins` | binaries                                                                                                 |
 
 If no `init.lua` is found, the engine prints a friendly error pointing at the README install section.
 
@@ -73,11 +73,11 @@ Daily-decision substrate for "where does this code live" and "is this a plugin o
 
 ### Three layers, decreasing opinion budget
 
-| Layer                                                                        | Opinion budget        | What it does                                                                                                |
-| ---------------------------------------------------------------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Layer                                       | Opinion budget        | What it does                                                                                                |
+| ------------------------------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------- |
 | Engine (`engine/`, `crates/nefor-protocol`) | Irreducible           | Pure mechanism: stdin/stdout, NCP envelope stamping, session log, dispatch via `step`. No NCP body parsing. |
-| Plugins (`plugins/*`)                                                        | Near zero             | Heavy lifting via NCP. Each one a "bash tool" — self-contained, composable, producer-clean namespace.       |
-| Starter (`starter/*.lua`)                                                    | Fully Turing-complete | All composition, all wiring, all cross-plugin knowledge, all opinion.                                       |
+| Plugins (`plugins/*`)                       | Near zero             | Heavy lifting via NCP. Each one a "bash tool" — self-contained, composable, producer-clean namespace.       |
+| Starter (`starter/*.lua`)                   | Fully Turing-complete | All composition, all wiring, all cross-plugin knowledge, all opinion.                                       |
 
 Mismatch is the most common architectural bug. Every file gets one layer assignment.
 

@@ -14,15 +14,15 @@ If those three pass, the substrate is healthy.
 
 ## Test suite layout
 
-| Suite                   | Where                                         | What it covers                                                                                                 | Cost                           |
-| ----------------------- | --------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ------------------------------ |
-| Workspace unit tests    | `cargo test --workspace`                      | Per-crate unit tests across engine + all plugins                                                               | Few seconds, mostly in-process |
-| `agentic_cli_mock_e2e`  | `engine/tests/agentic_cli_mock_e2e.rs`  | Full chain (engine binary as subprocess + Lua + mock provider). 6 scenarios. **Default Stage-1 health check.** | ~2.5s wall                     |
-| `stage1_e2e`            | `engine/tests/stage1_e2e.rs`            | In-process duplex driver against a real provider. `#[ignore]`-gated; needs live Ollama at `localhost:11434`    | ~10-30s; opt-in                |
-| `starter_ncp_test`      | `engine/tests/starter_ncp_test.rs`      | NCP v0.1 protocol in Lua                                                                                       | <1s                            |
-| `starter_sessions_test` | `engine/tests/starter_sessions_test.rs` | Session persistence + resume                                                                                   | <1s                            |
-| `starter_agentic_workflow_test` | `engine/tests/starter_agentic_workflow_test.rs` | Agentic orchestration Lua tests                                                                  | <1s                            |
-| Plugin unit tests       | `cargo test -p <plugin>`                      | Each plugin's own tests (nefor-tui has chat + layout + reconciler tests, openai-provider 137, etc.)            | Sub-second per plugin          |
+| Suite                           | Where                                           | What it covers                                                                                                 | Cost                           |
+| ------------------------------- | ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ------------------------------ |
+| Workspace unit tests            | `cargo test --workspace`                        | Per-crate unit tests across engine + all plugins                                                               | Few seconds, mostly in-process |
+| `agentic_cli_mock_e2e`          | `engine/tests/agentic_cli_mock_e2e.rs`          | Full chain (engine binary as subprocess + Lua + mock provider). 6 scenarios. **Default Stage-1 health check.** | ~2.5s wall                     |
+| `stage1_e2e`                    | `engine/tests/stage1_e2e.rs`                    | In-process duplex driver against a real provider. `#[ignore]`-gated; needs live Ollama at `localhost:11434`    | ~10-30s; opt-in                |
+| `starter_ncp_test`              | `engine/tests/starter_ncp_test.rs`              | NCP v0.1 protocol in Lua                                                                                       | <1s                            |
+| `starter_sessions_test`         | `engine/tests/starter_sessions_test.rs`         | Session persistence + resume                                                                                   | <1s                            |
+| `starter_agentic_workflow_test` | `engine/tests/starter_agentic_workflow_test.rs` | Agentic orchestration Lua tests                                                                                | <1s                            |
+| Plugin unit tests               | `cargo test -p <plugin>`                        | Each plugin's own tests (nefor-tui has chat + layout + reconciler tests, openai-provider 137, etc.)            | Sub-second per plugin          |
 
 The `agentic_cli_mock_e2e` suite is the one to add scenarios to when you ship new agentic-cli flow behavior. It's deterministic, non-ignored, and fast enough to live in CI.
 
