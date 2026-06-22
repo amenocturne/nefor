@@ -81,11 +81,10 @@ function M.finalize_reasoning(state, duration_ms)
 end
 
 function M.finalize_assistant(state, final_text, model, duration_ms)
-  local now = tui.now_ms()
-  local turn_dur = duration_ms
-    or (state.turn_started_at and (now - state.turn_started_at))
-    or nil
-
+  -- Finalizes the streaming assistant entry only.  Lifecycle fields
+  -- (pending, turn_started_at, last_turn_duration_ms) are owned by
+  -- `chat.turn.idle` so that the TUI's busy-state tracks the
+  -- orchestrator run, not the visible stream.
   if state.in_flight == nil then
     if final_text and #final_text > 0 then
       local new_entry = Entry.assistant_stream()
@@ -96,17 +95,10 @@ function M.finalize_assistant(state, final_text, model, duration_ms)
       log.log("transcript", "finalize_assistant no_inflight new_v=%d count=%d",
         new_entry.v, #new_entries)
       return shallow_merge(state, {
-        entries              = new_entries,
-        pending              = false,
-        turn_started_at      = NIL_SENTINEL,
-        last_turn_duration_ms = turn_dur,
+        entries = new_entries,
       })
     end
-    return shallow_merge(state, {
-      pending              = false,
-      turn_started_at      = NIL_SENTINEL,
-      last_turn_duration_ms = turn_dur,
-    })
+    return state
   end
 
   local e = state.entries[state.in_flight]
@@ -118,19 +110,13 @@ function M.finalize_assistant(state, final_text, model, duration_ms)
     log.log("transcript", "finalize_assistant in_flight=%d new_v=%d",
       state.in_flight, new_entry.v)
     return shallow_merge(state, {
-      entries              = new_entries,
-      in_flight            = NIL_SENTINEL,
-      pending              = false,
-      turn_started_at      = NIL_SENTINEL,
-      last_turn_duration_ms = turn_dur,
+      entries   = new_entries,
+      in_flight = NIL_SENTINEL,
     })
   end
 
   return shallow_merge(state, {
-    in_flight            = NIL_SENTINEL,
-    pending              = false,
-    turn_started_at      = NIL_SENTINEL,
-    last_turn_duration_ms = turn_dur,
+    in_flight = NIL_SENTINEL,
   })
 end
 

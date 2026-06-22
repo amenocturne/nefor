@@ -260,6 +260,9 @@ local function cancel_all()
     deferred_after_cancel = deferred_after_cancel,
     dropped_pending_inputs = dropped_inputs,
   })
+  if state.current_run_id == nil then
+    emit("nefor-tui", { kind = "chat.turn.idle" })
+  end
   return {
     chat = cancelled_chat,
     sub_graphs = sub_n,
@@ -438,6 +441,11 @@ local function handle_chat_input_submit(body)
   })
 
   if state.current_run_id ~= nil then
+    emit("nefor-tui", {
+      kind = "chat.message.append",
+      role = "user",
+      text = text,
+    })
     state.pending_user_inputs[#state.pending_user_inputs + 1] = text
     return
   end
@@ -468,6 +476,7 @@ local function handle_chat_reset()
   state.current_run_id = nil
   state.deferred_queue = {}
   state.pending_user_inputs = {}
+  emit("nefor-tui", { kind = "chat.turn.idle" })
 end
 
 local function handle_chat_model_set(body)
@@ -632,6 +641,9 @@ local function handle_tool_result_run_close(run_id, body)
     if status == "success" then
       flush_deferred()
       flush_pending_user_inputs()
+      if state.current_run_id == nil then
+        emit("nefor-tui", { kind = "chat.turn.idle" })
+      end
       return
     end
 
@@ -662,6 +674,9 @@ local function handle_tool_result_run_close(run_id, body)
     })
     flush_deferred()
     flush_pending_user_inputs()
+    if state.current_run_id == nil then
+      emit("nefor-tui", { kind = "chat.turn.idle" })
+    end
   end
 end
 
@@ -736,6 +751,7 @@ local function teardown_for_session_end()
   -- Don't broadcast `chat.reset` here either — same reason as new_chat
   -- above. Provider-side chat histories stay so /resume of any prior
   -- chat under the same provider gets its history back.
+  emit("nefor-tui", { kind = "chat.turn.idle" })
   nefor.log.info("agentic-loop: sessions.session_end → state cleared", {})
 end
 

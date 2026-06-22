@@ -446,9 +446,8 @@ local function handle_escape(_msg, state)
       history_cursor = NIL_SENTINEL,
     }), {}
   end
-  -- 4) double-ESC escalation. If a lead turn is still running, route
-  -- the second Esc to that turn only; graph cancellation is the next
-  -- rung once the lead is idle/stopped.
+  -- 4) double-ESC escalation. If actively streaming (in_flight),
+  -- interrupt the stream. Otherwise escalate to full cancel.
   local now = tui.now_ms()
   if state.last_esc_ms and (now - state.last_esc_ms) <= DOUBLE_ESC_MS then
     local patch = {
@@ -456,15 +455,15 @@ local function handle_escape(_msg, state)
       input_value = join_nonempty({ state.pending_followups, state.input_value }, "\n"),
       pending_followups = "",
     }
-    if state.in_flight ~= nil or state.pending then
+    if state.in_flight ~= nil then
       return shallow_merge(state, patch), {
         { kind = "send_to", target = "engine",
           body = { kind = "chat.interrupt" } },
       }
     end
-    if dag.any_active(state.dag_runs, now) then
+    if state.pending or dag.any_active(state.dag_runs, now) then
       local interrupted = dag.interrupt_all(state, now)
-      return shallow_merge(interrupted, patch), {
+      return shallow_merge(interrupted or state, patch), {
         { kind = "send_to", target = "engine",
           body = { kind = "chat.interrupt_all" } },
       }
@@ -544,9 +543,7 @@ local function handle_message_append(msg, state)
       Entry.user(text)
     ), {}
   end
-  local turn_state = role == "system"
-    and { pending = false, in_flight = NIL_SENTINEL, turn_started_at = NIL_SENTINEL }
-    or  {}
+  local turn_state = {}
 
   -- AGENTS.md auto-load routing.
   if role == "system" then
@@ -595,19 +592,28 @@ local function handle_stream_delta(msg, state)
 end
 
 local function handle_stream_end(msg, state)
-  local next_state = transcript.finalize_assistant(state, msg.text, msg.model, msg.duration_ms)
+  return transcript.finalize_assistant(state, msg.text, msg.model, msg.duration_ms), {}
+end
+
+local function handle_turn_idle(_msg, state)
+  local now = tui.now_ms()
+  local turn_dur = state.turn_started_at and (now - state.turn_started_at) or nil
+  local next_state = shallow_merge(state, {
+    pending              = false,
+    in_flight            = NIL_SENTINEL,
+    turn_started_at      = NIL_SENTINEL,
+    last_turn_duration_ms = turn_dur or state.last_turn_duration_ms,
+  })
   local followup = state.pending_followups or ""
   if #followup == 0 then
     return next_state, {}
   end
-
-  local started = shallow_merge(next_state, {
+  return shallow_merge(next_state, {
     pending = true,
-    turn_started_at = tui.now_ms(),
+    turn_started_at = now,
     pending_followups = "",
     pending_user_echo = followup,
-  })
-  return started, {
+  }), {
     { kind = "send_to", target = "engine",
       body = { kind = "chat.input.submit", text = followup } },
   }
@@ -1036,6 +1042,7 @@ local handlers = {
   ["chat.message.append"]         = handle_message_append,
   ["chat.stream.delta"]           = handle_stream_delta,
   ["chat.stream.end"]             = handle_stream_end,
+  ["chat.turn.idle"]               = handle_turn_idle,
   ["chat.stream.reasoning_delta"] = handle_reasoning_delta,
   ["chat.stream.reasoning_end"]   = handle_reasoning_end,
   ["chat.session.stats"]          = handle_session_stats,
