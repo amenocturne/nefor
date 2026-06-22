@@ -361,9 +361,9 @@ local function handle_input_submit(msg, state)
   end
   history.persist(hist)
 
-  -- While a turn is already in flight, buffer plain-text follow-ups
-  -- locally. They are submitted as one combined turn when the current
-  -- lead turn finishes.
+  -- While the lead is busy, queued input belongs to the composer, not
+  -- the transcript. It is submitted as one combined turn when the
+  -- current lead turn finishes.
   if state.pending or state.in_flight ~= nil then
     local pending_followups = join_nonempty({ state.pending_followups, wire_text }, "\n")
     return shallow_merge(state, {
@@ -373,15 +373,13 @@ local function handle_input_submit(msg, state)
     }), {}
   end
 
-  local with_user = transcript.push_entry(state, Entry.user(wire_text))
-  local cleared = shallow_merge(with_user, {
+  local cleared = shallow_merge(state, {
     input_value = "", pending = true,
     turn_started_at = tui.now_ms(), completion = NIL_SENTINEL,
     prompt_history = hist,
     history_cursor = NIL_SENTINEL,
     pending_user_echo = wire_text,
   })
-  tui.scroll_into_view("transcript")
   return cleared, {
     { kind = "send_to", target = "engine",
       body = { kind = "chat.input.submit", text = wire_text } },
@@ -448,21 +446,30 @@ local function handle_escape(_msg, state)
       history_cursor = NIL_SENTINEL,
     }), {}
   end
-  -- 4) double-ESC escalation
+  -- 4) double-ESC escalation. If a lead turn is still running, route
+  -- the second Esc to that turn only; graph cancellation is the next
+  -- rung once the lead is idle/stopped.
   local now = tui.now_ms()
   if state.last_esc_ms and (now - state.last_esc_ms) <= DOUBLE_ESC_MS then
-    local interrupted = dag.interrupt_all(state, now)
-    local prompt = join_nonempty({ state.pending_followups, state.input_value }, "\n")
-    return shallow_merge(interrupted, {
+    local patch = {
       last_esc_ms = NIL_SENTINEL,
-      input_value = prompt,
+      input_value = join_nonempty({ state.pending_followups, state.input_value }, "\n"),
       pending_followups = "",
-    }), {
+    }
+    local graphs_active = dag.any_active(state.dag_runs, now)
+    if state.in_flight ~= nil or (state.pending and not graphs_active) then
+      return shallow_merge(state, patch), {
+        { kind = "send_to", target = "engine",
+          body = { kind = "chat.interrupt" } },
+      }
+    end
+    local interrupted = dag.interrupt_all(state, now)
+    return shallow_merge(interrupted, patch), {
       { kind = "send_to", target = "engine",
         body = { kind = "chat.interrupt_all" } },
     }
   end
-  -- 4) single ESC interrupts the current turn
+  -- 5) single ESC interrupts the current turn
   if state.pending or state.in_flight ~= nil then
     local interrupted = dag.interrupt_all(state, now)
     local prompt = join_nonempty({ state.pending_followups, state.input_value }, "\n")
@@ -535,7 +542,7 @@ local function handle_message_append(msg, state)
     ), {}
   end
   local turn_state = role == "system"
-    and { pending = false, turn_started_at = NIL_SENTINEL }
+    and { pending = false, in_flight = NIL_SENTINEL, turn_started_at = NIL_SENTINEL }
     or  {}
 
   -- AGENTS.md auto-load routing.
@@ -591,14 +598,12 @@ local function handle_stream_end(msg, state)
     return next_state, {}
   end
 
-  local with_user = transcript.push_entry(next_state, Entry.user(followup))
-  local started = shallow_merge(with_user, {
+  local started = shallow_merge(next_state, {
     pending = true,
     turn_started_at = tui.now_ms(),
     pending_followups = "",
     pending_user_echo = followup,
   })
-  tui.scroll_into_view("transcript")
   return started, {
     { kind = "send_to", target = "engine",
       body = { kind = "chat.input.submit", text = followup } },
@@ -719,6 +724,7 @@ local function handle_plan_approved(msg, state)
 end
 
 local function handle_popup(msg, state)
+  if state.replay_mode then return state, {} end
   local v = msg.level or "info"
   return shallow_merge(state, {
     popup = {
@@ -731,6 +737,7 @@ local function handle_popup(msg, state)
 end
 
 local function handle_toast(msg, state)
+  if state.replay_mode then return state, {} end
   local now = tui.now_ms()
   local ttl = msg.ttl_ms or 2000
   local toasts = {}
@@ -987,6 +994,7 @@ local function handle_tool_result(msg, state)
 end
 
 local function handle_mouse_selection(msg, state)
+  if state.replay_mode then return state, {} end
   local text = msg.text or ""
   if #text > 0 then
     local now = tui.now_ms()

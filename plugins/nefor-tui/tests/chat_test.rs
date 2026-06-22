@@ -302,7 +302,7 @@ fn typing_and_enter_emits_chat_input_submit() {
 }
 
 #[test]
-fn busy_plain_text_buffers_until_stream_end() {
+fn queued_plain_text_stays_out_of_transcript_until_promoted() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -323,6 +323,10 @@ fn busy_plain_text_buffers_until_stream_end() {
     assert!(
         out.contains("queued follow-up") && out.contains("second") && out.contains("third"),
         "pending follow-up widget should render above prompt: {out:?}"
+    );
+    assert!(
+        !out.contains("│ second") && !out.contains("│ third"),
+        "queued follow-ups must not render as transcript user blocks: {out:?}"
     );
 
     dispatch_event(
@@ -1049,6 +1053,43 @@ fn replayed_chat_model_set_ack_does_not_clobber_live_model() {
 }
 
 #[test]
+fn replayed_notifications_do_not_surface_as_popups_or_toasts() {
+    let mut engine = Engine::new(100, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(&mut engine, json!({ "kind": "sessions.replay.start" }));
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.popup",
+            "level": "warning",
+            "title": "replay-popup",
+            "message": "should stay silent",
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.toast",
+            "text": "resume-toast",
+            "ttl_ms": 60_000,
+        }),
+    );
+    dispatch_event(&mut engine, json!({ "kind": "sessions.replay.end" }));
+
+    let out = render_snapshot(&mut engine);
+    assert!(
+        !out.contains("should stay silent"),
+        "replayed chat.popup must not open a notification popup: {out:?}"
+    );
+    assert!(
+        !out.contains("resume-toast"),
+        "replayed chat.toast must not display a toast notification: {out:?}"
+    );
+}
+
+#[test]
 fn statusline_shows_model_with_reasoning_effort() {
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
@@ -1560,32 +1601,29 @@ fn thinking_indicator_has_no_braille_spinner() {
 }
 
 #[test]
-fn double_escape_within_window_emits_interrupt_all() {
+fn double_escape_after_lead_stops_emits_interrupt_all() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
-    // Mid-turn → first ESC interrupts.
-    for ch in "hi".chars() {
-        engine.handle_key(key(&ch.to_string())).expect("type");
-    }
-    engine.handle_key(key("enter")).expect("enter");
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "graph.run_started", "run_id": "graph-1", "total_nodes": 1 }),
+    );
     let _ = engine.take_emit_queue();
+
     engine.handle_key(key("escape")).expect("first esc");
-    let first = engine.take_emit_queue();
-    assert_eq!(
-        first[0].1.get("kind").and_then(|v| v.as_str()),
-        Some("chat.interrupt"),
-        "first ESC should emit chat.interrupt"
+    assert!(
+        engine.take_emit_queue().is_empty(),
+        "first ESC while lead is idle only arms the graph-cancel rung"
     );
 
-    // Second ESC within 600ms → escalates to interrupt_all.
     engine.handle_key(key("escape")).expect("second esc");
     let second = engine.take_emit_queue();
     assert_eq!(
         second[0].1.get("kind").and_then(|v| v.as_str()),
         Some("chat.interrupt_all"),
-        "second ESC within window should escalate"
+        "second ESC after lead stops should cancel active graphs"
     );
 }
 

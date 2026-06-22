@@ -1,10 +1,11 @@
 -- starter/lead-workflow/init.lua — lead-workflow actor.
 --
--- Owns two pieces of state on top of the lead's chat-side agentic-loop
+-- Owns three pieces of state on top of the lead's chat-side agentic-loop
 -- (see `agentic-loop/init.lua`):
 --
---   1. The currently-executing graph (if any) — its run_id, so a
---      session-end can cancel it cleanly.
+--   1. Currently-executing graphs — their run_ids plus a small status
+--      snapshot so the lead can answer status questions and cancel
+--      specific runs.
 --   2. The currently-in-flight plan slot — one plan at a time.
 --      Ephemeral: lives in process memory, never replayed across
 --      session boundaries. Flushed when the user types anything
@@ -60,6 +61,16 @@
 --     tool.result — the agentic-loop blocks until the user verdict
 --     resolves the deferred ack.
 --
+--   * `graph-status` — args:
+--       { run_id? = <string>, include_completed? = <boolean> }
+--     Returns active graph status, or one graph when run_id is supplied.
+--
+--   * `terminate-graph` — args:
+--       { run_id? = <string> }
+--     Cancels one active graph. If run_id is omitted and exactly one graph
+--     is active, cancels that graph; if multiple are active, asks the lead
+--     to specify run_id.
+--
 -- ## Termination on session exit
 --
 -- Subscribes to `sessions.session_end`. If active graphs exist,
@@ -79,6 +90,15 @@ local state = {
   -- In-flight graph run_ids; empty when no graphs are running.
   ---@type table<string, boolean>
   active_run_ids = {},
+
+  -- Graph status snapshots keyed by run_id. This is live-session control
+  -- state, not durable history; replay deliberately does not rebuild it.
+  ---@type table<string, table>
+  graph_runs = {},
+
+  -- Per-firing lookup for node result status.
+  ---@type table<string, { run_id: string, node_id: string }>
+  firing_to_node = {},
 
   -- The single in-flight plan slot. Lifetime is one verdict turn:
   -- created by write-review, decided by /approve or /reject, flushed
@@ -144,6 +164,98 @@ local function emit_tool_result_err(firing_id, err)
   })
 end
 
+local function now_ms()
+  if nefor.engine and nefor.engine.now then
+    return nefor.engine.now()
+  end
+  return nil
+end
+
+local function sorted_keys(map)
+  local keys = {}
+  for k in pairs(map or {}) do keys[#keys + 1] = k end
+  table.sort(keys)
+  return keys
+end
+
+local function ensure_graph_run(run_id)
+  if type(run_id) ~= "string" or #run_id == 0 then return nil end
+  local run = state.graph_runs[run_id]
+  if run == nil then
+    run = {
+      run_id = run_id,
+      status = "unknown",
+      total_nodes = 0,
+      nodes = {},
+      started_at = nil,
+      updated_at = now_ms(),
+    }
+    state.graph_runs[run_id] = run
+  end
+  return run
+end
+
+local function ensure_graph_node(run, node_id)
+  if type(run) ~= "table" or type(node_id) ~= "string" or #node_id == 0 then
+    return nil
+  end
+  local node = run.nodes[node_id]
+  if node == nil then
+    node = { id = node_id, status = "pending" }
+    run.nodes[node_id] = node
+  end
+  return node
+end
+
+local function graph_summary(run)
+  local nodes = {}
+  for _, node_id in ipairs(sorted_keys(run.nodes or {})) do
+    local n = run.nodes[node_id]
+    nodes[#nodes + 1] = {
+      id = node_id,
+      reasoner = n.reasoner,
+      status = n.status,
+      firing_id = n.firing_id,
+      last_tool = n.last_tool,
+      error = n.error,
+    }
+  end
+  return {
+    run_id = run.run_id,
+    status = run.status,
+    total_nodes = run.total_nodes,
+    started_at = run.started_at,
+    updated_at = run.updated_at,
+    completed_at = run.completed_at,
+    nodes = nodes,
+    result_status = run.result_status,
+    results = run.results,
+  }
+end
+
+local function active_run_count()
+  local count, only = 0, nil
+  for run_id in pairs(state.active_run_ids or {}) do
+    count = count + 1
+    only = run_id
+  end
+  return count, only
+end
+
+local mark_graph_cancelled
+
+local function cancel_active_graphs()
+  local ids = state.active_run_ids
+  state.active_run_ids = {}
+  local n = 0
+  for run_id in pairs(ids or {}) do
+    if mark_graph_cancelled then mark_graph_cancelled(run_id) end
+    emit_as(SOURCE_NAME, nil, { kind = "graph.cancel", run_id = run_id })
+    n = n + 1
+  end
+  return n
+end
+
 local function spec_edges(spec)
   local edges = {}
   if type(spec.dependencies) == "table" then
@@ -192,10 +304,10 @@ local function validate_graph_shape(node_specs, terminal_id)
     end
   end
 
-  -- Connectedness: each `dispatch-graph` call must be ONE connected directed graph.
-  -- Disconnected components = N independent tasks bundled into one run,
-  -- which loses the UX wins of parallel sidebar rows + independent
-  -- tool.result returns. Lead should call dispatch-graph N times instead.
+  -- Connectedness: each `dispatch-graph` call must be ONE connected directed
+  -- graph. Same-scope parallel branches should be joined with deterministic
+  -- fan-in nodes such as accumulate; truly separate runs should be separate
+  -- dispatch-graph calls.
   local parent = {}
   for _, spec in ipairs(node_specs) do parent[spec.id] = spec.id end
   local function find(x)
@@ -232,10 +344,10 @@ local function validate_graph_shape(node_specs, terminal_id)
   if #component_strs > 1 then
     return string.format(
       "dispatch-graph: graph has %d disconnected components: %s. Each "
-      .. "independent task must be dispatched as its own dispatch-graph "
-      .. "call so it gets its own run_id, appears as a separate row in "
-      .. "the UI, and its result comes back independently. Combine "
-      .. "nodes into one graph only when they share data dependencies.",
+      .. "dispatch-graph call must be one connected graph. If these "
+      .. "branches belong to one task scope, connect them with a "
+      .. "deterministic fan-in node such as accumulate; if they are "
+      .. "genuinely separate goals, submit separate dispatch-graph calls.",
       #component_strs, table.concat(component_strs, " "))
   end
 
@@ -495,6 +607,19 @@ local function dispatch_graph(firing_id, args)
   end
   al.flush_pending_dispatches()
   state.active_run_ids[run_id] = true
+  local run = ensure_graph_run(run_id)
+  if run then
+    run.status = "queued"
+    run.total_nodes = #graph.nodes
+    run.updated_at = now_ms()
+    for _, node in ipairs(graph.nodes or {}) do
+      local tracked = ensure_graph_node(run, node.id)
+      if tracked then
+        tracked.reasoner = node.role or node.reasoner
+        tracked.status = "pending"
+      end
+    end
+  end
 
   -- The ack body carries an explicit async-contract instruction. Without
   -- it, smaller models (qwen2.5:7b observed in practice) read the bare
@@ -510,12 +635,83 @@ local function dispatch_graph(firing_id, args)
     nodes  = n,
     notice = string.format(
       "Graph submitted (async, %d node%s, run_id=%s). " ..
-      "If you have more independent tasks to dispatch, call dispatch-graph " ..
-      "again NOW in this same turn — do not wait. Once all dispatches are " ..
-      "done, acknowledge briefly to the user and stop. Results arrive " ..
-      "later as `[spawn_graph(run_id=...) result]` messages. " ..
-      "Do NOT re-dispatch the same task.",
+      "Acknowledge briefly, then wait for graph results or call " ..
+      "graph-status if the user asks for progress. Do NOT re-dispatch " ..
+      "the same task.",
       n, n == 1 and "" or "s", run_id),
+  })
+end
+
+local function graph_status(firing_id, args)
+  local run_id = args and args.run_id
+  if run_id ~= nil then
+    local run = state.graph_runs[run_id]
+    if type(run) ~= "table" then
+      emit_tool_result_err(firing_id, "graph-status: unknown run_id `" .. tostring(run_id) .. "`")
+      return
+    end
+    emit_tool_result_ok(firing_id, graph_summary(run))
+    return
+  end
+
+  local include_completed = args and args.include_completed == true
+  local runs = {}
+  for _, id in ipairs(sorted_keys(state.graph_runs)) do
+    local run = state.graph_runs[id]
+    if include_completed or state.active_run_ids[id] then
+      runs[#runs + 1] = graph_summary(run)
+    end
+  end
+  emit_tool_result_ok(firing_id, {
+    active_count = active_run_count(),
+    runs = runs,
+  })
+end
+
+mark_graph_cancelled = function(run_id)
+  local run = ensure_graph_run(run_id)
+  if not run then return end
+  run.status = "cancelled"
+  run.updated_at = now_ms()
+  run.completed_at = run.updated_at
+  for _, node in pairs(run.nodes or {}) do
+    if node.status == "pending" or node.status == "running" then
+      node.status = "cancelled"
+    end
+  end
+end
+
+local function terminate_graph(firing_id, args)
+  local run_id = args and args.run_id
+  if type(run_id) ~= "string" or #run_id == 0 then
+    local count, only = active_run_count()
+    if count == 0 then
+      emit_tool_result_ok(firing_id, {
+        status = "noop",
+        notice = "No active graph is running.",
+      })
+      return
+    end
+    if count > 1 then
+      emit_tool_result_err(firing_id,
+        "terminate-graph: multiple graphs are active; call graph-status, then pass run_id")
+      return
+    end
+    run_id = only
+  end
+
+  if not state.active_run_ids[run_id] then
+    emit_tool_result_err(firing_id, "terminate-graph: run_id `" .. tostring(run_id) .. "` is not active")
+    return
+  end
+
+  state.active_run_ids[run_id] = nil
+  mark_graph_cancelled(run_id)
+  emit_as(SOURCE_NAME, nil, { kind = "graph.cancel", run_id = run_id })
+  emit_tool_result_ok(firing_id, {
+    status = "cancelled",
+    run_id = run_id,
+    notice = "Graph cancellation requested. Subsequent late node results for this run should be ignored.",
   })
 end
 
@@ -717,6 +913,82 @@ local function reduce_plan_approved(_body)
   -- rebuilt from replay.
 end
 
+local function handle_graph_run_started(body)
+  local run = ensure_graph_run(body.run_id)
+  if not run then return end
+  run.status = "running"
+  run.total_nodes = tonumber(body.total_nodes) or run.total_nodes or 0
+  run.started_at = run.started_at or now_ms()
+  run.updated_at = now_ms()
+  state.active_run_ids[run.run_id] = true
+end
+
+local function handle_graph_node_fired(body)
+  local run = ensure_graph_run(body.run_id)
+  if not run then return end
+  local node = ensure_graph_node(run, body.node_id)
+  if not node then return end
+  node.status = "running"
+  node.reasoner = body.reasoner or node.reasoner
+  node.firing_id = body.firing_id
+  node.updated_at = now_ms()
+  run.updated_at = node.updated_at
+  if type(body.firing_id) == "string" and #body.firing_id > 0 then
+    state.firing_to_node[body.firing_id] = {
+      run_id = run.run_id,
+      node_id = body.node_id,
+    }
+  end
+end
+
+local function handle_graph_node_tool_invoke(body)
+  local run = ensure_graph_run(body.run_id)
+  if not run then return end
+  local node = ensure_graph_node(run, body.node_id)
+  if not node then return end
+  node.last_tool = body.tool_name
+  node.last_tool_args = body.tool_args
+  node.updated_at = now_ms()
+  run.updated_at = node.updated_at
+end
+
+local function handle_tool_result_for_status(body)
+  local id = body.id
+  if type(id) ~= "string" or #id == 0 then return end
+
+  local run = state.graph_runs[id]
+  if type(run) == "table" and type(body.result) == "table" and body.result.status ~= nil then
+    run.status = body.result.status
+    run.result_status = body.result.status
+    run.results = body.result.results
+    run.completed_at = now_ms()
+    run.updated_at = run.completed_at
+    state.active_run_ids[id] = nil
+    for _, node in pairs(run.nodes or {}) do
+      if node.status == "pending" or node.status == "running" then
+        node.status = "complete"
+      end
+    end
+    return
+  end
+
+  local binding = state.firing_to_node[id]
+  if type(binding) ~= "table" then return end
+  local bound_run = state.graph_runs[binding.run_id]
+  if type(bound_run) ~= "table" then return end
+  local node = ensure_graph_node(bound_run, binding.node_id)
+  if not node then return end
+  if body.error ~= nil then
+    node.status = "error"
+    node.error = body.error
+  else
+    node.status = "complete"
+  end
+  node.updated_at = now_ms()
+  bound_run.updated_at = node.updated_at
+  state.firing_to_node[id] = nil
+end
+
 local function terminate_active_graph()
   -- Session boundary flushes the plan slot unconditionally — no
   -- approval survives across sessions. If a write-review was in-flight
@@ -726,15 +998,8 @@ local function terminate_active_graph()
 
   if next(state.active_run_ids) == nil then return end
   local ids_to_cancel = state.active_run_ids
-  state.active_run_ids = {}
-
-  -- Broadcast (target = nil) rather than target reasoner-graph: every
-  -- in-flight agent reasoner under this run also needs to see the
-  -- envelope so it can interrupt its provider stream + close its
-  -- firing (sub-graph cancel propagation). The reasoner-graph
-  -- binary still receives the broadcast and processes it the same way.
+  cancel_active_graphs()
   for run_id in pairs(ids_to_cancel) do
-    emit_as(SOURCE_NAME, nil, { kind = "graph.cancel", run_id = run_id })
     nefor.log.info("lead-workflow: graph terminated on session-end", { run_id = run_id })
   end
 end
@@ -755,11 +1020,11 @@ local function lead_workflow_tool_schemas()
       name        = "dispatch-graph",
       description =
         "Dispatch ONE connected directed graph of sub-agent and deterministic nodes and return its " ..
-        "run_id. For N independent tasks call dispatch-graph N times — each call " ..
-        "gets its own run_id, appears as a separate row in the UI, and returns its " ..
-        "result independently when finished. The graph's result.results is a dict " ..
-        "keyed by the explicit graph-level terminal node id; use accumulate as " ..
-        "the terminal for parallel fan-in. Disconnected components and " ..
+        "run_id. Use deterministic fan-in nodes such as accumulate to connect " ..
+        "parallel branches that belong to one task scope. Split into separate " ..
+        "dispatch-graph calls only when the work is genuinely separate and should " ..
+        "return as separate runs. The graph's result.results is a dict keyed by " ..
+        "the explicit graph-level terminal node id. Disconnected components and " ..
         "invalid/no/multi-terminal graphs are rejected.",
       parameters  = {
         type = "object",
@@ -856,6 +1121,40 @@ local function lead_workflow_tool_schemas()
         required = { "plan" },
       },
     },
+    {
+      name        = "graph-status",
+      description =
+        "Return status for active graph runs, or for one run_id when provided. " ..
+        "Use this before answering user status questions instead of guessing.",
+      parameters  = {
+        type = "object",
+        properties = {
+          run_id = {
+            type = "string",
+            description = "Optional run_id to inspect. Omit to list active runs.",
+          },
+          include_completed = {
+            type = "boolean",
+            description = "When run_id is omitted, include completed/cancelled runs from this session.",
+          },
+        },
+      },
+    },
+    {
+      name        = "terminate-graph",
+      description =
+        "Cancel an active graph run. Pass run_id when multiple graphs are active. " ..
+        "If exactly one graph is active, run_id may be omitted.",
+      parameters  = {
+        type = "object",
+        properties = {
+          run_id = {
+            type = "string",
+            description = "Active run_id to cancel. Optional only when exactly one graph is active.",
+          },
+        },
+      },
+    },
   }
 end
 
@@ -873,6 +1172,8 @@ local TOOL_HANDLERS = {
   ["dispatch-graph"]  = dispatch_graph,
   ["write-review"]    = submit_plan,
   ["submit-plan"]     = submit_plan,
+  ["graph-status"]    = graph_status,
+  ["terminate-graph"] = terminate_graph,
 }
 
 local function handle_tool_invoke(body)
@@ -932,6 +1233,24 @@ local function receive_msg(entry)
   -- shouldn't double-record).
   if replay_window.active() then return end
 
+  if kind == "graph.run_started" then
+    handle_graph_run_started(body)
+    return
+  end
+  if kind == "graph.node.fired" then
+    handle_graph_node_fired(body)
+    return
+  end
+  if kind == "graph.node.tool.invoke" then
+    handle_graph_node_tool_invoke(body)
+    return
+  end
+
+  if kind == "chat.interrupt_all" then
+    cancel_active_graphs()
+    return
+  end
+
   if kind == "chat.review.respond" then
     handle_chat_input(body)
     return
@@ -960,10 +1279,11 @@ local function receive_msg(entry)
   end
 
   -- Watch for the orchestrator's run-close envelope so we can clear
-  -- active_run_id when the graph finishes naturally (mirrors how
+  -- active_run_ids when graphs finish naturally (mirrors how
   -- agentic-loop tracks pending_runs). The wire shape is
   -- `tool.result { id=run_id, result: { status, results } }`.
   if kind == "tool.result" then
+    handle_tool_result_for_status(body)
     local id = body.id
     if type(id) == "string"
         and type(body.result) == "table"
@@ -1020,6 +1340,8 @@ return {
     terminate_active_graph = terminate_active_graph,
     reset = function()
       state.active_run_ids = {}
+      state.graph_runs = {}
+      state.firing_to_node = {}
       state.active_plan = nil
       state.gate_mode = "safe"
       advertised = false

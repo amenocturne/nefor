@@ -636,13 +636,8 @@ end
 
 -- ------------------------------------------------------------------
 -- Bug 6 regression — cancel_all interrupts the in-flight provider
--- stream, not just the orchestrator graph. Without this, /new
--- (chat.interrupt_all) lets the prior turn's `<provider>.stream.
--- delta` envelopes keep arriving and paint into the freshly-cleared
--- transcript. graph.cancel on the reasoner-graph side is
--- accept-and-drop today, and the chat.reset that sessions emits
--- later in the /new path only resets chat history — neither tears
--- down the live provider turn.
+-- stream for the visible lead turn. graph.cancel on the orchestrator
+-- run does not tear down the provider stream by itself.
 -- ------------------------------------------------------------------
 do
   fresh_loop()
@@ -669,11 +664,9 @@ do
     .. json.encode(_test.calls()))
 end
 
--- cancel_all on an async sub-graph must inform both surfaces: the UI
--- gets a failed graph_result block, and the lead model gets a deferred
--- `[spawn_graph(... ) FAILED]` prompt. Previously cancel_all only sent
--- a tool-result-shaped UI notice for the original gate id, so the lead
--- continued believing the graph was still running.
+-- cancel_all on an async sub-graph while the lead is idle must inform
+-- both surfaces: the UI gets a failed graph_result block, and the lead
+-- model gets a deferred `[spawn_graph(... ) FAILED]` prompt.
 do
   fresh_loop()
   local run_id = agentic_loop.queue_sub_graph(
@@ -717,10 +710,9 @@ do
     .. tostring(relay_prompt))
 end
 
--- If cancel_all also interrupts the visible lead turn, the sub-graph
--- cancellation notice must be retained and prepended to the next user
--- submit. That is the dogfood case where the user later types
--- "continue".
+-- If cancel_all interrupts the visible lead turn, sub-graphs stay
+-- active. A later user submit should not inherit a cancellation notice;
+-- graph cancellation is handled by the next stop-ladder rung.
 do
   fresh_loop()
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "start lead turn" })
@@ -747,11 +739,8 @@ do
       end
     end
   end
-  assert(type(prompt) == "string"
-      and string.find(prompt, "sub-graph interrupted by user", 1, true)
-      and string.find(prompt, "continue", 1, true),
-    "next submit after interrupt must carry both cancellation notice and user text; prompt was "
-    .. tostring(prompt))
+  assert_eq(prompt, "continue",
+    "double-Esc while the lead is running must stop the lead only; sub-graph cancellation is a later ladder rung")
 end
 
 -- Session boundaries (/new, /resume, shutdown) should behave like
@@ -1032,10 +1021,11 @@ end
 
 -- ------------------------------------------------------------------
 -- Cross-process /resume — agentic-loop restores state.current_state
--- chat_id from replayed wrap-firing tool.result. Without this, the
--- next live submit mints a fresh chat_id, and the openai-provider
--- wrapper's painstakingly-rebuilt history (on the prior chat_id)
--- is unused — the model replies with no memory of prior turns.
+-- chat_id from replayed wrap-firing tool.result only when the same
+-- replay includes canonical chat.history.create for that chat_id.
+-- Without this, old/non-canonical logs can leave current_state pointing
+-- at a chat_id the fresh provider process did not restore, and the next
+-- live submit hard-fails with "chat not found".
 --
 -- The replay window flips to active at sessions.replay.start; sessions
 -- replays each step-origin envelope through the bus; agentic-loop
@@ -1050,11 +1040,14 @@ do
 
   -- Sessions replay opens.
   _test.fire_bus("sessions.replay.start", { session_id = "old-session", count = 0 })
-  -- Replayed envelopes flow through the bus. The wrap firing's
-  -- tool.result is the canonical close envelope sessions persisted —
-  -- replay re-sends it. agentic-loop's firing_to_node table is empty
-  -- (fresh process boot), so the existing live firing-close handler
-  -- returns early. Replay path must capture chat_id independently.
+  -- Replayed envelopes flow through the bus. The canonical history
+  -- fact proves the provider replay path can restore this chat_id; the
+  -- wrap firing's tool.result identifies it as the active chat.
+  send_to_loop("chatgpt", {
+    kind     = "chat.history.create",
+    provider = "ollama",
+    chat_id  = "chat-resumed-1",
+  })
   send_to_loop("provider-wrapper", {
     kind   = "tool.result",
     id     = "firing-replayed-1",
@@ -1094,6 +1087,26 @@ do
     "post-/resume submit must seed the wrap node with the recovered chat_id")
 end
 
+-- Old/non-canonical logs may contain wrap-firing next_state without
+-- chat.history.create. Do NOT preserve that pointer: the fresh provider
+-- may not have restored the chat, so the next live submit should mint a
+-- new chat instead of targeting a missing provider chat forever.
+do
+  fresh_loop()
+  _test.fire_bus("sessions.replay.start", { session_id = "old-session", count = 0 })
+  send_to_loop("provider-wrapper", {
+    kind   = "tool.result",
+    id     = "firing-replayed-legacy",
+    result = {
+      text       = "legacy reply",
+      next_state = { chat_id = "chat-legacy" },
+    },
+  })
+  _test.fire_bus("sessions.replay.end", { session_id = "old-session" })
+  assert_eq(agentic_loop._internals.state.current_state, nil,
+    "replayed next_state without canonical chat.history.create must not restore a stale provider chat_id")
+end
+
 -- Multiple replayed tool.results in one window — latest chat_id wins.
 -- A session may carry several wrap-firings (one per turn) plus one
 -- /new mid-session that mints a fresh chat_id. The most recent
@@ -1101,6 +1114,11 @@ end
 do
   fresh_loop()
   _test.fire_bus("sessions.replay.start", { session_id = "old-session", count = 0 })
+  send_to_loop("chatgpt", {
+    kind     = "chat.history.create",
+    provider = "ollama",
+    chat_id  = "chat-old-1",
+  })
   send_to_loop("provider-wrapper", {
     kind   = "tool.result",
     id     = "firing-replayed-old",
@@ -1108,6 +1126,11 @@ do
       text       = "first turn reply",
       next_state = { chat_id = "chat-old-1" },
     },
+  })
+  send_to_loop("chatgpt", {
+    kind     = "chat.history.create",
+    provider = "ollama",
+    chat_id  = "chat-new-1",
   })
   send_to_loop("provider-wrapper", {
     kind   = "tool.result",
@@ -1195,7 +1218,13 @@ do
     }),
   }, function()
     _test.fire_bus("sessions.replay.start", { session_id = "old", count = 0 })
-    -- The replayed wrap-firing tool.result restores chat_id (per 91d49ef).
+    -- Canonical history proves the resumed provider can restore this chat;
+    -- the replayed wrap-firing tool.result marks it as active.
+    send_to_loop("mock-plugin", {
+      kind     = "chat.history.create",
+      provider = "mock-plugin",
+      chat_id  = "chat-1",
+    })
     send_to_loop("provider-wrapper", {
       kind   = "tool.result",
       id     = "firing-original",

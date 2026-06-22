@@ -660,3 +660,32 @@ do
   assert_eq(lw._internals.state.active_plan, nil,
     "active_plan flushed at session_end — no carry-over approval")
 end
+
+-- chat.interrupt_all is the graph-cancel rung after the lead has stopped.
+do
+  fresh()
+  feed("tool-gate", {
+    kind = "lead-workflow.tool.invoke",
+    id   = "firing-dispatch-interrupt-all",
+    name = "dispatch-graph",
+    args = {
+      terminal = "explore",
+      nodes = {
+        { id = "explore", role = "explorer",
+          agent_args = { prompt = "x", system_prompt = "you are an explorer" } },
+      },
+    },
+  })
+  local run_id = next(lw._internals.state.active_run_ids)
+  assert_true(type(run_id) == "string", "active graph exists before interrupt_all")
+  _test.calls_clear()
+
+  feed("nefor-tui", { kind = "chat.interrupt_all" })
+
+  local cancel = find_call(decode_calls(), function(c)
+    return c.body.kind == "graph.cancel" and c.body.run_id == run_id
+  end)
+  assert_true(cancel ~= nil, "chat.interrupt_all cancels active graphs when routed to lead-workflow")
+  assert_eq(next(lw._internals.state.active_run_ids), nil,
+    "chat.interrupt_all clears active graph ids")
+end

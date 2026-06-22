@@ -10,7 +10,7 @@
 -- Inbound dispatch:
 --   * `chat.input.submit { text }`       — build orchestrator graph,
 --                                          emit tool.invoke{name=spawn_graph}
---   * `chat.interrupt_all`               — double-Esc; cancel everything
+--   * `chat.interrupt_all`               — stop lead turn; graphs handled by lead-workflow when idle
 --   * `chat.reset`                       — /new: clear state + broadcast
 --   * `chat.model.set`                   — runtime model switch
 --   * `graph.run_started`/`node.fired`   — observer envelopes
@@ -51,6 +51,7 @@ local state = {
 
   current_run_id = nil,         ---@type string|nil
   current_state  = nil,         ---@type table|nil   -- next_state from wrap
+  replay_restorable_chat_ids = {}, ---@type table     -- canonical chat.history.create ids seen during replay
   deferred_queue       = {},    ---@type table       -- queued spawn_graph results { text }
   pending_user_inputs  = {},    ---@type table       -- queued submits while busy
   pending              = {},    ---@type table       -- run_id:firing_id → entry
@@ -220,24 +221,13 @@ local function flush_pending_user_inputs()
   submit_orchestrator_run(combined)
 end
 
--- Cancel everything. Fan-out order:
---   (1) cancel current orchestrator run + interrupt the in-flight
---       provider stream so deltas stop spilling
---   (2) cancel sub-graph runs + clear queued dispatches
---   (3) drop deferred queue + pending user inputs
---   (4) clear pending bookkeeping
+-- Stop-ladder cancel. While the lead is running, stop the visible lead
+-- turn only; when idle, cancel sub-graphs and queued dispatches.
+-- In both cases queued user inputs are dropped because the user just
+-- chose an interrupt path.
 --
--- The single-Esc `cancel()` already fires `<provider>.interrupt` so
--- the binary aborts the streaming chat completion; `cancel_all` now
--- matches. Without it, `graph.cancel` on the reasoner-graph side is
--- "accept-and-drop" (the in-flight provider chat is not torn down by
--- the scheduler today), so an interrupt-all triggered by `/new`
--- mid-stream would let the prior turn's provider deltas keep
--- arriving and paint into the freshly-cleared transcript. The
--- `chat.reset` that sessions emits later in the `/new` path
--- translates to `<provider>.reset` which only clears chat history —
--- it does NOT interrupt the live turn — so the provider-interrupt
--- has to ride here.
+-- The provider interrupt is still required because graph.cancel on the
+-- orchestrator run does not tear down the provider stream by itself.
 local function cancel_all()
   local cancelled_chat = state.current_run_id ~= nil
   if cancelled_chat then
@@ -250,18 +240,10 @@ local function cancel_all()
     })
     state.current_run_id = nil
   end
-  local sub_n = cancel_all_pending_runs()
+  local sub_n = cancelled_chat and 0 or cancel_all_pending_runs()
   local deferred_after_cancel = #state.deferred_queue
   local dropped_inputs = #state.pending_user_inputs
-  if cancelled_chat then
-    -- Keep the synthesized cancellation result queued. The interrupted
-    -- provider turn is being torn down, so starting an automatic relay
-    -- turn here would fight the user's cancellation. The next live user
-    -- submit prepends this queued notice to the model prompt.
-    nefor.log.info("agentic-loop: retaining interrupted sub-graph notice for next submit", {
-      deferred_queued = deferred_after_cancel,
-    })
-  else
+  if not cancelled_chat then
     flush_deferred()
   end
   state.pending_user_inputs = {}
@@ -460,9 +442,6 @@ local function handle_chat_input_submit(body)
     return
   end
 
-  -- Echo the user message to the TUI as a transcript-bound event so
-  -- replay can repaint user turns (chat.lua dedupes against the local
-  -- push, so live view sees the user line exactly once).
   emit("nefor-tui", {
     kind = "chat.message.append",
     role = "user",
@@ -1103,6 +1082,19 @@ local function receive_msg(entry)
   -- input handlers. The `tool.result` / `graph.node.fired` block
   -- below handles the same concern for reasoner-graph emissions.
   if history_replay.active() then
+    if kind == "sessions.replay.start" then
+      state.replay_restorable_chat_ids = {}
+      return
+    end
+    if kind == "chat.history.create" then
+      local cid = body.chat_id
+      local provider = body.provider
+      if type(cid) == "string" and cid ~= ""
+          and (provider == nil or provider == state.config.provider) then
+        state.replay_restorable_chat_ids[cid] = true
+      end
+      return
+    end
     if kind == "chat.input.submit"
         or kind == "chat.reset"
         or kind == "chat.interrupt_all"
@@ -1142,10 +1134,19 @@ local function receive_msg(entry)
       -- mints a fresh chat-N → openai-provider's painstakingly-rebuilt
       -- history (on the OLD chat_id) is orphaned, model replies with no
       -- memory of prior turns.
+      --
+      -- Only restore chat IDs that also had a canonical
+      -- chat.history.create fact in this replay. Old logs may contain
+      -- tool.result.next_state for provider chats the fresh provider
+      -- process cannot restore; keeping those stale pointers makes the
+      -- next live submit hard-fail with "chat not found". In active
+      -- development, breaking old logs by starting a fresh chat is
+      -- better than preserving a broken pointer.
       local result = body.result
       if type(result) == "table" and type(result.next_state) == "table" then
         local cid = result.next_state.chat_id
-        if type(cid) == "string" and cid ~= "" then
+        if type(cid) == "string" and cid ~= ""
+            and state.replay_restorable_chat_ids[cid] then
           state.current_state = result.next_state
         end
       end
@@ -1294,6 +1295,7 @@ M._internals  = {
     }
     state.current_run_id = nil
     state.current_state = nil
+    state.replay_restorable_chat_ids = {}
     state.deferred_queue = {}
     state.pending_user_inputs = {}
     state.pending = {}
