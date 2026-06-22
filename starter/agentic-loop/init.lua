@@ -1124,6 +1124,12 @@ local function receive_msg(entry)
   if kind == "chat.turn.idle.check" then
     if state.current_run_id == nil then
       emit("nefor-tui", { kind = "chat.turn.idle" })
+    else
+      nefor.log.info("agentic-loop: idle.check while busy", {
+        run_id = state.current_run_id,
+        pending_inputs = #state.pending_user_inputs,
+        deferred = #state.deferred_queue,
+      })
     end
     return
   end
