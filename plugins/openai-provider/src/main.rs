@@ -58,7 +58,9 @@ use openai_provider::catalog::ToolCatalog;
 use openai_provider::config::Config;
 use openai_provider::openai::{Message, ModelInfo, ToolCall};
 use openai_provider::state::{ChatId, ChatRestore, ChatStats, Chats, ChatsError};
-use openai_provider::stream::{list_models, run_chat_stream, ReasoningEvent, StreamError};
+use openai_provider::stream::{
+    list_models, run_chat_stream_with_retry_progress, ReasoningEvent, RetryProgress, StreamError,
+};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
@@ -967,13 +969,17 @@ fn spawn_turn(
             let chat_id_for_reason = chat_id.clone();
             let out_tx_for_reason = out_tx.clone();
             let prefix_for_reason = config.event_prefix();
+            let id_for_retry = turn_id.clone();
+            let chat_id_for_retry = chat_id.clone();
+            let out_tx_for_retry = out_tx.clone();
+            let prefix_for_retry = config.event_prefix();
             let token = auth.token().await;
             // Stamp the reasoning duration from first reasoning chunk
             // → ReasoningEvent::End. Captured in the closure so each
             // firing in a tool loop gets its own timer (per-firing
             // reasoning, never accumulated across firings).
             let mut reasoning_started_at: Option<std::time::Instant> = None;
-            let result = run_chat_stream(
+            let result = run_chat_stream_with_retry_progress(
                 &client,
                 &endpoint,
                 token.as_deref(),
@@ -1018,6 +1024,15 @@ fn spawn_turn(
                         );
                         let _ = out_tx_for_reason.try_send(PluginOutgoing::event(body));
                     }
+                },
+                |progress| {
+                    let body = retry_progress_body(
+                        &prefix_for_retry,
+                        &id_for_retry,
+                        &chat_id_for_retry,
+                        progress,
+                    );
+                    let _ = out_tx_for_retry.try_send(PluginOutgoing::event(body));
                 },
             )
             .await;
@@ -1683,6 +1698,52 @@ fn stream_reasoning_end_body(
     m.insert("text".into(), Value::String(text.to_owned()));
     m.insert("duration_ms".into(), Value::Number(duration_ms.into()));
     m
+}
+
+fn retry_progress_body(
+    prefix: &str,
+    id: &str,
+    chat_id: &ChatId,
+    progress: RetryProgress,
+) -> Map<String, Value> {
+    let retry_index = progress.retry_index();
+    let max_retries = progress.max_retries();
+    let delay_ms = progress.next_delay.as_millis() as u64;
+    let code = progress
+        .status
+        .map(|status| format!("HTTP {status}"))
+        .unwrap_or_else(|| "request error".to_owned());
+    let mut m = Map::new();
+    m.insert(
+        "kind".into(),
+        Value::String(format!("{prefix}stream.retry")),
+    );
+    m.insert("id".into(), Value::String(id.to_owned()));
+    m.insert("chat_id".into(), Value::String(chat_id.to_string()));
+    if let Some(status) = progress.status {
+        m.insert("status".into(), Value::Number(status.into()));
+    }
+    m.insert("attempt".into(), Value::Number(retry_index.into()));
+    m.insert("max_retries".into(), Value::Number(max_retries.into()));
+    m.insert("delay_ms".into(), Value::Number(delay_ms.into()));
+    m.insert(
+        "message".into(),
+        Value::String(format!(
+            "{code}; retrying {retry_index}/{max_retries} in {}",
+            format_retry_delay(progress.next_delay)
+        )),
+    );
+    m
+}
+
+fn format_retry_delay(delay: Duration) -> String {
+    if delay.as_secs() == 0 {
+        format!("{}ms", delay.as_millis())
+    } else if delay.subsec_millis() == 0 {
+        format!("{}s", delay.as_secs())
+    } else {
+        format!("{:.1}s", delay.as_secs_f64())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

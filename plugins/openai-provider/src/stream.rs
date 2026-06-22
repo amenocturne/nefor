@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use nefor_sse::SseBuffer;
-use reqwest::header::{ACCEPT, ACCEPT_ENCODING};
+use reqwest::header::{ACCEPT, ACCEPT_ENCODING, RETRY_AFTER};
 use tokio_util::sync::CancellationToken;
 
 use crate::openai::{
@@ -106,6 +106,24 @@ pub enum ReasoningEvent<'a> {
     End { text: &'a str },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryProgress {
+    pub status: Option<u16>,
+    pub failed_attempt: usize,
+    pub max_attempts: usize,
+    pub next_delay: Duration,
+}
+
+impl RetryProgress {
+    pub fn retry_index(&self) -> usize {
+        self.failed_attempt
+    }
+
+    pub fn max_retries(&self) -> usize {
+        self.max_attempts.saturating_sub(1)
+    }
+}
+
 /// Drive a single chat-completions streaming call.
 ///
 /// `on_delta` is invoked synchronously for every content chunk; the
@@ -127,12 +145,49 @@ pub async fn run_chat_stream<F, R>(
     tools: Option<&[serde_json::Value]>,
     reasoning_effort: Option<&str>,
     cancel: CancellationToken,
-    mut on_delta: F,
-    mut on_reasoning: R,
+    on_delta: F,
+    on_reasoning: R,
 ) -> Result<StreamOutcome, StreamError>
 where
     F: FnMut(&str),
     R: FnMut(ReasoningEvent<'_>),
+{
+    run_chat_stream_with_retry_progress(
+        client,
+        endpoint,
+        api_key,
+        auth_header,
+        model,
+        messages,
+        tools,
+        reasoning_effort,
+        cancel,
+        on_delta,
+        on_reasoning,
+        |_| {},
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_chat_stream_with_retry_progress<F, R, P>(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+    auth_header: &str,
+    model: &str,
+    messages: &[Message],
+    tools: Option<&[serde_json::Value]>,
+    reasoning_effort: Option<&str>,
+    cancel: CancellationToken,
+    mut on_delta: F,
+    mut on_reasoning: R,
+    mut on_retry_progress: P,
+) -> Result<StreamOutcome, StreamError>
+where
+    F: FnMut(&str),
+    R: FnMut(ReasoningEvent<'_>),
+    P: FnMut(RetryProgress),
 {
     let req = ChatRequest {
         model,
@@ -192,13 +247,21 @@ where
                 Ok(response) => response,
                 Err(e) => {
                     if attempt < CHAT_STREAM_MAX_ATTEMPTS && stream_error_is_retriable(&e) {
+                        let delay = retry_delay(attempt, None);
                         tracing::warn!(
                             attempt,
                             max_attempts = CHAT_STREAM_MAX_ATTEMPTS,
+                            delay_ms = delay.as_millis(),
                             error = %e,
                             "chat completion request failed; retrying"
                         );
-                        if !sleep_before_retry(&cancel, attempt).await {
+                        on_retry_progress(RetryProgress {
+                            status: None,
+                            failed_attempt: attempt,
+                            max_attempts: CHAT_STREAM_MAX_ATTEMPTS,
+                            next_delay: delay,
+                        });
+                        if !sleep_before_retry(&cancel, delay).await {
                             return Ok(StreamOutcome {
                                 interrupted: true,
                                 ..Default::default()
@@ -216,6 +279,7 @@ where
             }
 
             let status = response.status().as_u16();
+            let retry_after = retry_after_delay(response.headers());
             let body = response
                 .text()
                 .await
@@ -231,13 +295,21 @@ where
             }
             let err = StreamError::Http { status, body };
             if attempt < CHAT_STREAM_MAX_ATTEMPTS && stream_error_is_retriable(&err) {
+                let delay = retry_delay(attempt, retry_after);
                 tracing::warn!(
                     attempt,
                     max_attempts = CHAT_STREAM_MAX_ATTEMPTS,
+                    delay_ms = delay.as_millis(),
                     error = %err,
                     "chat completion returned retriable HTTP status; retrying"
                 );
-                if !sleep_before_retry(&cancel, attempt).await {
+                on_retry_progress(RetryProgress {
+                    status: Some(status),
+                    failed_attempt: attempt,
+                    max_attempts: CHAT_STREAM_MAX_ATTEMPTS,
+                    next_delay: delay,
+                });
+                if !sleep_before_retry(&cancel, delay).await {
                     return Ok(StreamOutcome {
                         interrupted: true,
                         ..Default::default()
@@ -303,18 +375,34 @@ where
 fn stream_error_is_retriable(err: &StreamError) -> bool {
     match err {
         StreamError::Request(_) => true,
-        StreamError::Http { status, .. } => (500..600).contains(status),
+        StreamError::Http { status, .. } => *status == 429 || (500..600).contains(status),
         StreamError::Unauthorized { .. }
         | StreamError::ToolsUnsupported { .. }
         | StreamError::Body(_) => false,
     }
 }
 
-async fn sleep_before_retry(cancel: &CancellationToken, failed_attempt: usize) -> bool {
+fn retry_delay(failed_attempt: usize, retry_after: Option<Duration>) -> Duration {
+    retry_after.unwrap_or_else(|| exponential_retry_delay(failed_attempt))
+}
+
+fn exponential_retry_delay(failed_attempt: usize) -> Duration {
     let factor = 1u32
         .checked_shl(failed_attempt.saturating_sub(1) as u32)
         .unwrap_or(u32::MAX);
-    let delay = CHAT_STREAM_INITIAL_RETRY_DELAY.saturating_mul(factor);
+    CHAT_STREAM_INITIAL_RETRY_DELAY.saturating_mul(factor)
+}
+
+fn retry_after_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let when = httpdate::parse_http_date(value).ok()?;
+    when.duration_since(std::time::SystemTime::now()).ok()
+}
+
+async fn sleep_before_retry(cancel: &CancellationToken, delay: Duration) -> bool {
     tokio::select! {
         biased;
         _ = cancel.cancelled() => false,

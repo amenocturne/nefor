@@ -13,6 +13,7 @@
 --   <prefix>.stream.delta          → chat.stream.delta
 --   <prefix>.stream.end            → chat.stream.end
 --   <prefix>.stream.reasoning_*    → chat.stream.reasoning_*
+--   <prefix>.stream.retry          → chat.toast
 --   <prefix>.session.stats         → chat.session.stats
 --   <prefix>.auth.status           → chat.auth.status (+ provider)
 --   <prefix>.models.listed         → chat.models.listed (+ provider)

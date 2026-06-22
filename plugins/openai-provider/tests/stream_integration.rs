@@ -6,7 +6,9 @@
 
 use openai_provider::openai::Message;
 use openai_provider::state::{ChatId, Chats};
-use openai_provider::stream::{list_models, run_chat_stream, StreamError};
+use openai_provider::stream::{
+    list_models, run_chat_stream, run_chat_stream_with_retry_progress, RetryProgress, StreamError,
+};
 use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -101,6 +103,141 @@ async fn chat_stream_retries_transient_500_then_succeeds() {
     assert_eq!(deltas, vec!["Recovered"]);
     assert_eq!(outcome.full_text, "Recovered");
     assert_eq!(outcome.finish_reason.as_deref(), Some("stop"));
+}
+
+#[tokio::test]
+async fn chat_stream_retries_429_then_succeeds_and_reports_progress() {
+    let (listener, addr) = bind_local().await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_server = attempts.clone();
+
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut s, _) = listener.accept().await.expect("accept");
+            let _ = read_request(&mut s).await;
+            let n = attempts_server.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                let body = "{\"error\":\"rate limited\"}";
+                let response = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(response.as_bytes()).await;
+            } else {
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Recovered\"}}]}\n\n\
+                            data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n\
+                            data: [DONE]\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(response.as_bytes()).await;
+            }
+            let _ = s.shutdown().await;
+        }
+    });
+
+    let client = reqwest::Client::builder().build().expect("client");
+    let endpoint = format!("http://{}/v1/chat/completions", addr);
+    let messages = vec![Message::user("hello")];
+
+    let mut progress = Vec::new();
+    let outcome = run_chat_stream_with_retry_progress(
+        &client,
+        &endpoint,
+        None,
+        "Authorization",
+        "test-model",
+        &messages,
+        None,
+        None,
+        CancellationToken::new(),
+        |_| {},
+        |_| {},
+        |p| progress.push(p),
+    )
+    .await
+    .expect("second attempt succeeds");
+
+    let _ = server.await;
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(outcome.full_text, "Recovered");
+    assert_eq!(progress.len(), 1);
+    assert_eq!(progress[0].status, Some(429));
+    assert_eq!(progress[0].retry_index(), 1);
+    assert_eq!(progress[0].max_retries(), 2);
+    assert_eq!(
+        progress[0].next_delay,
+        std::time::Duration::from_millis(250)
+    );
+}
+
+#[tokio::test]
+async fn chat_stream_429_retry_respects_retry_after_seconds() {
+    let (listener, addr) = bind_local().await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_server = attempts.clone();
+
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut s, _) = listener.accept().await.expect("accept");
+            let _ = read_request(&mut s).await;
+            let n = attempts_server.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                let body = "{\"error\":\"rate limited\"}";
+                let response = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 2\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(response.as_bytes()).await;
+            } else {
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n\
+                            data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n\
+                            data: [DONE]\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(response.as_bytes()).await;
+            }
+            let _ = s.shutdown().await;
+        }
+    });
+
+    let client = reqwest::Client::builder().build().expect("client");
+    let endpoint = format!("http://{}/v1/chat/completions", addr);
+    let messages = vec![Message::user("hello")];
+
+    let mut progress: Vec<RetryProgress> = Vec::new();
+    let outcome = run_chat_stream_with_retry_progress(
+        &client,
+        &endpoint,
+        None,
+        "Authorization",
+        "test-model",
+        &messages,
+        None,
+        None,
+        CancellationToken::new(),
+        |_| {},
+        |_| {},
+        |p| progress.push(p),
+    )
+    .await
+    .expect("second attempt succeeds");
+
+    let _ = server.await;
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(outcome.full_text, "OK");
+    assert_eq!(progress.len(), 1);
+    assert_eq!(progress[0].status, Some(429));
+    assert_eq!(progress[0].next_delay, std::time::Duration::from_secs(2));
 }
 
 #[tokio::test]

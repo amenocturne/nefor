@@ -60,6 +60,7 @@ function M.translator(name)
     stream_end              = prefix .. "stream.end",
     stream_reasoning_delta  = prefix .. "stream.reasoning_delta",
     stream_reasoning_end    = prefix .. "stream.reasoning_end",
+    stream_retry            = prefix .. "stream.retry",
     session_stats           = prefix .. "session.stats",
     auth_status             = prefix .. "auth.status",
     auth_set                = prefix .. "auth.set",
@@ -115,6 +116,14 @@ function M.translator(name)
     elseif k == kinds.stream_reasoning_end then
       body.kind = "chat.stream.reasoning_end"
       return body
+    elseif k == kinds.stream_retry then
+      return {
+        kind   = "chat.toast",
+        id     = body.id,
+        text   = body.message or "retrying provider request",
+        level  = "warn",
+        ttl_ms = (body.delay_ms or 2000) + 1500,
+      }
     elseif k == kinds.stream_end then
       body.kind = "chat.stream.end"
       body.finish_reason = nil
