@@ -38,6 +38,10 @@ impl SseBuffer {
         self.buf.extend_from_slice(bytes);
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
     pub fn drain(&mut self) -> Vec<Result<SseFrame, SseError>> {
         let mut out = Vec::new();
         while let Some((end, sep_len)) = find_frame_end(&self.buf) {

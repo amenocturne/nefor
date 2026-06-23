@@ -414,6 +414,97 @@ async fn streaming_emits_deltas_then_end() {
 }
 
 #[tokio::test]
+async fn completed_chunked_stream_tolerates_missing_http_terminator() {
+    let (listener, addr) = bind_local().await;
+
+    let server = tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.expect("accept");
+        let _ = read_request(&mut s).await;
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n\
+                    data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n\
+                    data: [DONE]\n\n";
+        let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+        let chunk = format!("{:x}\r\n{}\r\n", body.len(), body);
+        let _ = s.write_all(headers.as_bytes()).await;
+        let _ = s.write_all(chunk.as_bytes()).await;
+        let _ = s.shutdown().await;
+    });
+
+    let client = reqwest::Client::builder().build().expect("client");
+    let endpoint = format!("http://{}/v1/chat/completions", addr);
+    let messages = vec![Message::user("hello")];
+
+    let mut deltas: Vec<String> = Vec::new();
+    let outcome = run_chat_stream(
+        &client,
+        &endpoint,
+        None,
+        "Authorization",
+        "test-model",
+        &messages,
+        None,
+        None,
+        CancellationToken::new(),
+        |d| deltas.push(d.to_owned()),
+        |_| {},
+    )
+    .await
+    .expect("semantic SSE completion wins over missing chunk terminator");
+
+    let _ = server.await;
+
+    assert_eq!(deltas, vec!["Hi"]);
+    assert_eq!(outcome.full_text, "Hi");
+    assert_eq!(outcome.finish_reason.as_deref(), Some("stop"));
+}
+
+#[tokio::test]
+async fn incomplete_chunked_stream_still_errors_without_finish_reason() {
+    let (listener, addr) = bind_local().await;
+
+    let server = tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.expect("accept");
+        let _ = read_request(&mut s).await;
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+        let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+        let chunk = format!("{:x}\r\n{}\r\n", body.len(), body);
+        let _ = s.write_all(headers.as_bytes()).await;
+        let _ = s.write_all(chunk.as_bytes()).await;
+        let _ = s.shutdown().await;
+    });
+
+    let client = reqwest::Client::builder().build().expect("client");
+    let endpoint = format!("http://{}/v1/chat/completions", addr);
+    let messages = vec![Message::user("hello")];
+
+    let err = run_chat_stream(
+        &client,
+        &endpoint,
+        None,
+        "Authorization",
+        "test-model",
+        &messages,
+        None,
+        None,
+        CancellationToken::new(),
+        |_| {},
+        |_| {},
+    )
+    .await
+    .expect_err("stream without finish_reason is still truncated");
+
+    let _ = server.await;
+
+    match err {
+        StreamError::Body(body) => assert!(
+            body.contains("unexpected EOF") || body.contains("end of file"),
+            "body error carried: {body}"
+        ),
+        other => panic!("expected body read error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn request_failure_emits_turn_error() {
     let (listener, addr) = bind_local().await;
 

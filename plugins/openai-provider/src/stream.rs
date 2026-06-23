@@ -342,7 +342,12 @@ where
             next = byte_stream.next() => {
                 match next {
                     None => break,
-                    Some(Err(e)) => return Err(StreamError::Body(reqwest_error_detail(&e))),
+                    Some(Err(e)) => {
+                        if stream_semantically_complete(&outcome) && buffer.is_empty() {
+                            break;
+                        }
+                        return Err(StreamError::Body(reqwest_error_detail(&e)));
+                    }
                     Some(Ok(bytes)) => {
                         buffer.push(&bytes);
                         drain_complete_frames(
@@ -370,6 +375,10 @@ where
     outcome.tool_calls = tc_acc.finalize();
     maybe_end_reasoning(&outcome, &mut reasoning_ended, &mut on_reasoning);
     Ok(outcome)
+}
+
+fn stream_semantically_complete(outcome: &StreamOutcome) -> bool {
+    outcome.finish_reason.is_some()
 }
 
 fn stream_error_is_retriable(err: &StreamError) -> bool {
