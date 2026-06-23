@@ -128,7 +128,7 @@ Starter-owned `nefor run --session <id>` opens the TUI on a specific saved sessi
 | Flag                            | What it does                                                                                                                          |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | `-m <model>`, `--model <model>` | Sets the model for new chats; calls `agentic_workflow.set_model`                                                                      |
-| `--yolo`                        | Calls `agentic_workflow.set_yolo(true)` — currently a placeholder; emits `tool-gate.policy.set` but tool-gate doesn't honor it yet    |
+| `--yolo`                        | Calls `agentic_workflow.set_yolo(true)`; requests `tool-gate.set_mode { mode = "yolo" }`                                              |
 | `-f <path>`, `--file <path>`    | Reads file, prepends to prompt as `### File: <path>\n\`\`\`\n<contents>\n\`\`\`\n\n`                                                  |
 | `--debug`                       | No-op for v1                                                                                                                          |
 | `--help`, `-h`                  | Reachable as `nefor --config cli-config plugin agentic-cli -- --help` (the `--` is needed because outer clap eats `--help` otherwise) |
@@ -157,7 +157,7 @@ Things to verify:
 - Reasoning collapses to `▸ reasoning (Ns)` if your model emits `delta.reasoning`
 - Tool calls render as collapsible rows (Ctrl+O toggles expansion of all tool/reasoning rows globally)
 - `/model <model-id>` switches model at runtime
-- `/yolo` and `/safe` toggle policy (placeholder; same wire as the CLI's `--yolo`)
+- `/safe`, `/auto`, and `/yolo` toggle policy; see `docs/approval-model.md`
 - `/new` clears transcript and starts a fresh chat
 - Single Esc cancels in-flight turn (chat unblocks for next submit)
 - Double Esc within 600ms → fan-cancel (chat run + every sub-graph + deferred queue) → system message reports counts
@@ -203,13 +203,11 @@ Documented workaround: `--` separator.
 
 Fix (future work): `disable_help_flag = true` on the `Plugin` subcommand in `engine/src/cli.rs`.
 
-### `set_yolo` is a placeholder
+### Permission modes
 
-Calling `agentic_workflow.set_yolo(true)` emits `tool-gate.policy.set { default = "auto" }` to the bus, but `tool-gate` doesn't currently subscribe to that event. The `cli-config/init.lua` works around this by configuring `tool-gate` with `--default auto` at spawn time so the CLI is never blocked by permission prompts.
-
-Practically: in CLI mode, ALL tool calls auto-approve, regardless of `--yolo`. In TUI mode, the slash command `/yolo` toggles a chat-plugin local flag that does nothing on the wire.
-
-Fix (future work): wire `agentic_workflow.set_yolo` to actually emit a tool-gate event tool-gate honors. Then flip `cli-config` back to `--default prompt` and use `--yolo` to opt out.
+`agentic_workflow.set_mode` emits `tool-gate.set_mode`, and the starter mirrors
+the selected mode through `tool-validator`, `lead-workflow`, and chat status.
+The current mode contract is documented in `docs/approval-model.md`.
 
 ## Adding a test scenario to the mock e2e suite
 

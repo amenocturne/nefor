@@ -565,7 +565,7 @@ do
 end
 
 -- ------------------------------------------------------------------
--- Permission modes: auto denies write-review immediately; yolo bypasses
+-- Permission modes: auto does not block on human approval; yolo bypasses
 -- writer gates.
 -- ------------------------------------------------------------------
 
@@ -583,11 +583,36 @@ do
     return c.body.kind == "tool.result" and c.body.id == "firing-plan-auto"
   end)
   assert_true(reply ~= nil, "auto write-review returns immediately")
-  assert_true(type(reply.body.error) == "string"
-              and reply.body.error:find("permission_denied[auto]", 1, true) ~= nil,
-    "auto write-review denial is descriptive")
-  assert_eq(lw._internals.state.active_plan, nil,
+  assert_eq(reply.body.output.status, "approved",
+    "auto write-review auto-resolves the human approval turn")
+  assert_true(reply.body.output.notice:find("AUTO mode", 1, true) ~= nil,
+    "auto write-review approval names the mode")
+  assert_eq(lw._internals.state.active_plan.status, "approved",
+    "auto write-review records an approved plan slot")
+  assert_eq(lw._internals.state.active_plan.pending_firing_id, nil,
     "auto write-review must not leave a pending approval")
+end
+
+do
+  fresh()
+  feed("tool-gate", { kind = "tool-gate.mode_changed", mode = "auto" })
+  feed("tool-gate", {
+    kind = "lead-workflow.tool.invoke",
+    id   = "firing-builder-auto",
+    name = "dispatch-graph",
+    args = {
+      terminal = "build-auto",
+      nodes = {
+        { id = "build-auto", role = "builder",
+          agent_args = { prompt = "implement feature Y" } },
+      },
+    },
+  })
+  local calls = decode_calls()
+  local invoke = find_call(calls, function(c)
+    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
+  end)
+  assert_true(invoke ~= nil, "auto bypasses the human plan gate for writer dispatch")
 end
 
 do

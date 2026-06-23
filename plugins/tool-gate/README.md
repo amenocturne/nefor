@@ -15,5 +15,6 @@ Per-tool policy via CLI flags:
 - `--deny <name>` -- reject immediately
 - `--default <auto|prompt|deny>` -- fallback for unlisted tools (default: `prompt`)
 
-Yolo mode: `tool-gate.set_mode { mode: "yolo" }` overrides all policies
-to auto-approve. Useful for unattended testing.
+Runtime modes are `safe`, `auto`, and `yolo`. The starter's full mode × action
+class table lives in [`docs/approval-model.md`](../../docs/approval-model.md).
+At the transport layer, `yolo` overrides all policies to auto-approve.

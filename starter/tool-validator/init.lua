@@ -32,12 +32,26 @@
 -- exactly what to do next.
 --
 -- `edit_file` / `write_file`: auto-approved only while lead-workflow
--- has an approved plan. `edit_file` receives the small-edit policy
--- below before it reaches basic-tools. Without approval these are
--- denied instead of popped up, so direct file mutation cannot bypass
--- the plan gate.
+-- has an approved plan in safe mode, or while `/auto`/`/yolo` is active.
+-- `edit_file` receives the small-edit policy below before it reaches
+-- basic-tools. Without approval in safe mode these are denied instead
+-- of popped up, so direct file mutation cannot bypass the plan gate.
 --
 -- Other tools: defer to the user (popup) unless the agent is read-only.
+--
+-- ## Approval model
+--
+-- The mode table is intentionally a cross-product of mode × action class:
+--
+--   safe      — safe: approve; human: ask/block; guarded: ask; forbidden: ask
+--   auto      — safe: approve; human: auto-resolve; guarded: deny; forbidden: deny
+--   yolo      — approve every class
+--
+-- Examples:
+--   safe      = read_file
+--   human     = write-review's plan approval turn
+--   guarded   = bash that da cannot prove safe
+--   forbidden = bash that da classifies as deny
 --
 -- ## Read-only agents
 --
@@ -213,16 +227,16 @@ local function has_approved_plan()
   return type(plan) == "table" and plan.status == "approved"
 end
 
-local function auto_denial_reason(tool)
-  return "permission_denied[auto]: tool `" .. tostring(tool) .. "` requires human approval. " ..
-         "Recovery: switch to /safe and approve the request manually, or revise the task to use read-only/auto-approved tools."
+local function guarded_denial_reason(tool)
+  return "permission_denied[auto]: guarded tool `" .. tostring(tool) .. "` needs human review. " ..
+         "Recovery: switch to /safe and approve the request manually, or revise the task to use safe/auto-approved tools."
 end
 
 local function defer_or_deny(body)
   if gate_mode == "yolo" then
     emit_response(body.id, "approve")
   elseif gate_mode == "auto" then
-    emit_response(body.id, "deny", auto_denial_reason(body.tool or body.name))
+    emit_response(body.id, "deny", guarded_denial_reason(body.tool or body.name))
   else
     emit_popup(body)
   end
@@ -247,7 +261,7 @@ local function handle_permission_request(body)
       emit_response(id, "deny", tool .. " is not available to read-only agents")
       return
     end
-    if has_approved_plan() then
+    if gate_mode == "auto" or has_approved_plan() then
       if tool == "edit_file" then
         emit_response(id, "approve", nil, with_policy(args, SMALL_EDIT_POLICY))
       else
@@ -266,7 +280,15 @@ local function handle_permission_request(body)
       emit_response(id, "approve")
       return
     end
-    if verdict == "deny" or is_ro then
+    if verdict == "deny" then
+      if is_ro then
+        emit_response(id, "deny")
+      else
+        defer_or_deny(body)
+      end
+      return
+    end
+    if is_ro then
       emit_response(id, "deny")
       return
     end
@@ -278,6 +300,10 @@ local function handle_permission_request(body)
     local rejection = classify_dispatch_graph(args)
     if rejection ~= nil then
       emit_response(id, "deny", rejection)
+      return
+    end
+    if gate_mode == "auto" then
+      emit_response(id, "approve")
       return
     end
     -- Auto-approve when every node uses a read-only role.

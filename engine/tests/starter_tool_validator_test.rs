@@ -45,17 +45,31 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
 
     let process_tbl = lua.create_table()?;
     let run_fn = lua.create_function(|lua, args: Value| {
-        let is_probe = match args {
-            Value::Table(t) => match t.get::<Value>("args")? {
-                Value::Table(argv) => argv
-                    .sequence_values::<String>()
-                    .any(|v| matches!(v, Ok(s) if s == "--version")),
-                _ => false,
-            },
-            _ => false,
+        let (is_probe, stdin) = match args {
+            Value::Table(t) => {
+                let is_probe = match t.get::<Value>("args")? {
+                    Value::Table(argv) => argv
+                        .sequence_values::<String>()
+                        .any(|v| matches!(v, Ok(s) if s == "--version")),
+                    _ => false,
+                };
+                let stdin = match t.get::<Value>("stdin")? {
+                    Value::String(s) => Some(s.to_str()?.to_owned()),
+                    _ => None,
+                };
+                (is_probe, stdin)
+            }
+            _ => (false, None),
         };
         let t = lua.create_table()?;
-        t.set("code", if is_probe { 0 } else { 1 })?;
+        let code = if is_probe {
+            0
+        } else if stdin.as_deref().is_some_and(|s| s.contains("forbidden")) {
+            2
+        } else {
+            1
+        };
+        t.set("code", code)?;
         Ok(t)
     })?;
     process_tbl.set("run", run_fn)?;

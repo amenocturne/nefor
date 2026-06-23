@@ -73,6 +73,9 @@ The starter ships with a deterministic offline mock provider, plus
 `openai-provider` for OpenAI-compatible APIs and `chatgpt-provider` for the
 ChatGPT Responses API.
 
+The starter's permission modes are mapped in
+[`docs/approval-model.md`](docs/approval-model.md).
+
 ## Quick Start
 
 Run the starter:

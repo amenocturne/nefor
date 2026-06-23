@@ -51,6 +51,17 @@ do
   assert_eq(calls[1].id, "perm-safe", "popup keeps id")
 end
 
+-- safe: even a forbidden bash classification opens a popup. Safe mode
+-- means interactive governance, not hard runtime denial.
+do
+  fresh("safe")
+  feed({ kind = "chat.tool.permission_request", id = "perm-safe-forbidden", tool = "bash", args = { command = "forbidden rm" } })
+  local calls = decode_calls()
+  assert_eq(#calls, 1, "safe forbidden emits one envelope")
+  assert_eq(calls[1].kind, "chat.tool.popup_request", "safe forbidden opens popup")
+  assert_eq(calls[1].id, "perm-safe-forbidden", "popup keeps forbidden id")
+end
+
 -- auto: the same deferred request is denied with recovery text and no popup.
 do
   fresh("auto")
@@ -61,6 +72,16 @@ do
   assert_eq(calls[1].decision, "deny", "auto decision is deny")
   assert_true(type(calls[1].reason) == "string" and calls[1].reason:find("permission_denied[auto]", 1, true) ~= nil,
     "auto denial includes recovery marker")
+end
+
+-- auto: forbidden bash stays denied because auto has no human in the loop.
+do
+  fresh("auto")
+  feed({ kind = "chat.tool.permission_request", id = "perm-auto-forbidden", tool = "bash", args = { command = "forbidden rm" } })
+  local calls = decode_calls()
+  assert_eq(#calls, 1, "auto forbidden emits one envelope")
+  assert_eq(calls[1].kind, "tool.permission_response", "auto forbidden denies")
+  assert_eq(calls[1].decision, "deny", "auto forbidden decision is deny")
 end
 
 -- yolo: defensive approve if a prompt-mode request reaches the validator.
@@ -103,6 +124,24 @@ do
   assert_eq(#calls, 1, "yolo write_file no-plan emits one envelope")
   assert_eq(calls[1].kind, "tool.permission_response", "yolo write_file no-plan approves")
   assert_eq(calls[1].decision, "approve", "yolo write_file no-plan decision is approve")
+end
+
+-- auto: direct edit/write is autonomous, with edit_file still constrained
+-- by the small-edit policy before it reaches basic-tools.
+do
+  fresh("auto")
+  feed({
+    kind = "chat.tool.permission_request",
+    id = "perm-auto-edit",
+    tool = "edit_file",
+    args = { path = "some/file.lua", old_string = "a", new_string = "b" },
+  })
+  local calls = decode_calls()
+  assert_eq(#calls, 1, "auto edit_file emits one envelope")
+  assert_eq(calls[1].kind, "tool.permission_response", "auto edit_file approves")
+  assert_eq(calls[1].decision, "approve", "auto edit_file decision is approve")
+  assert_true(type(calls[1].args) == "table" and type(calls[1].args.policy) == "table",
+    "auto edit_file carries small-edit policy")
 end
 
 print("tool_validator_mode_test: all assertions passed")

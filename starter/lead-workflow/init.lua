@@ -529,6 +529,12 @@ end
 -- plan before the lead can dispatch them. Read-only investigation
 -- (explorer, reviewer, critic, reflector) is always allowed.
 --
+-- Mode semantics:
+--   safe — require the human approval turn.
+--   auto — do not block on humans; downstream tool-validator still blocks
+--          actually dangerous tool calls inside the graph.
+--   yolo — bypass all approval gates.
+--
 -- Returns nil on pass, an error string on rejection.
 local function writer_denial_message(prefix, plan_state, writers)
   return string.format(
@@ -565,7 +571,7 @@ local function writer_gate_state(node_specs)
 end
 
 local function gate_against_unapproved_plan(node_specs)
-  if state.gate_mode == "yolo" then return nil end
+  if state.gate_mode == "auto" or state.gate_mode == "yolo" then return nil end
   local approved, writers, plan_state = writer_gate_state(node_specs)
   if approved or writers == nil then return nil end
   return writer_denial_message("dispatch-graph", plan_state, writers)
@@ -729,6 +735,8 @@ local function submit_plan(firing_id, args)
     return
   end
 
+  local submitted_at = nefor.engine.now()
+
   if state.gate_mode == "yolo" then
     emit_tool_result_ok(firing_id, {
       status = "approved",
@@ -736,9 +744,27 @@ local function submit_plan(firing_id, args)
     })
     return
   elseif state.gate_mode == "auto" then
-    emit_tool_result_err(firing_id,
-      "permission_denied[auto]: write-review requires human approval, and /auto never opens a pending approval. " ..
-      "Recovery: switch to /safe to review and approve a plan manually, or continue with read-only investigation.")
+    state.active_plan = {
+      content           = plan,
+      submitted_at      = submitted_at,
+      pending_firing_id = nil,
+      status            = "approved",
+      reason            = "auto mode",
+    }
+    emit_as(SOURCE_NAME, nil, {
+      kind         = "lead-workflow.plan.submitted",
+      plan         = plan,
+      submitted_at = submitted_at,
+    })
+    emit_as(SOURCE_NAME, nil, {
+      kind             = "lead-workflow.plan.approved",
+      approved         = true,
+      approval_reason  = "auto mode",
+    })
+    emit_tool_result_ok(firing_id, {
+      status = "approved",
+      notice = "AUTO mode: plan recorded and approval gate auto-resolved; proceed with implementation.",
+    })
     return
   end
 
@@ -753,8 +779,6 @@ local function submit_plan(firing_id, args)
     emit_tool_result_err(state.active_plan.pending_firing_id,
       "write-review: superseded by a newer plan submitted in the same turn")
   end
-
-  local submitted_at = nefor.engine.now()
 
   state.active_plan = {
     content           = plan,
