@@ -39,6 +39,16 @@ local function fmt_elapsed_ms(ms)
   return string.format("%ds", math.floor(ms / 1000))
 end
 
+local function graph_display_name(name)
+  if type(name) ~= "string" or #name == 0 then return nil end
+  local parts = {}
+  for part in name:gmatch("[^-]+") do
+    parts[#parts + 1] = part:sub(1, 1):upper() .. part:sub(2)
+  end
+  if #parts == 0 then return nil end
+  return table.concat(parts, " ")
+end
+
 -- A completed run lingers in the panel for `LINGER_MS` after its
 -- `completed_at_ms` so the user can see the final state. Past that
 -- window the run is dropped — visually by the view (this helper),
@@ -84,6 +94,7 @@ end
 
 local function run_header(run)
   local short = run.run_id and run.run_id:sub(1, 8) or "?"
+  local label = graph_display_name(run.name) or ("DAG " .. short)
   local total = run.total_nodes or 0
   local nodes = run.nodes or {}
   local done = 0
@@ -95,7 +106,7 @@ local function run_header(run)
     end
   end
   if nodes_count > total then total = nodes_count end
-  local title = string.format("DAG %s (%d/%d)", short, done, total)
+  local title = string.format("%s (%d/%d)", label, done, total)
   return tui.text { content = title, style = STYLE.footer, wrap = "none" }
 end
 
@@ -232,11 +243,12 @@ local function apply(state, run_id, fn)
   return shallow_merge(state, { dag_runs = new_runs })
 end
 
-function M.run_started(state, run_id, total_nodes, now_ms)
+function M.run_started(state, run_id, total_nodes, now_ms, name)
   if state.dag_runs and state.dag_runs[run_id] then return state end
   return apply(state, run_id, function(_)
     return {
       run_id = run_id, total_nodes = total_nodes or 0,
+      name = name,
       started_at_ms = now_ms, nodes = {},
       completed_at_ms = nil, status = nil,
     }

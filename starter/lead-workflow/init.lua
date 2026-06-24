@@ -43,7 +43,7 @@
 -- back. The gate's id-rewriting machinery handles the round-trip.
 --
 --   * `dispatch-graph` — args:
---       { nodes = [{ id, role, agent_args, dependencies? }, ...] }
+--       { name = <kebab-case string>, nodes = [{ id, role, agent_args, dependencies? }, ...] }
 --     Builds a reasoner-graph spec from the role-keyed nodes (looking
 --     up `role -> reasoner config` from `lead-workflow.role.AGENT_CONFIGS`
 --     when available; falling back to a default `agent`-reasoner shape
@@ -178,6 +178,23 @@ local function sorted_keys(map)
   return keys
 end
 
+local GRAPH_NAME_MAX = 20
+
+local function validate_graph_name(name)
+  if type(name) ~= "string" or #name == 0 then
+    return nil, "dispatch-graph: args.name must be a non-empty kebab-case string"
+  end
+  if #name > GRAPH_NAME_MAX then
+    return nil, "dispatch-graph: args.name must be at most " .. GRAPH_NAME_MAX .. " characters"
+  end
+  if not name:match("^[a-z][a-z0-9%-]*$") or name:match("%-$")
+      or name:match("%-%-") then
+    return nil,
+      "dispatch-graph: args.name must be kebab-case lowercase words, e.g. `fix-graph-names`"
+  end
+  return name, nil
+end
+
 local function ensure_graph_run(run_id)
   if type(run_id) ~= "string" or #run_id == 0 then return nil end
   local run = state.graph_runs[run_id]
@@ -185,6 +202,7 @@ local function ensure_graph_run(run_id)
     run = {
       run_id = run_id,
       status = "unknown",
+      name = nil,
       total_nodes = 0,
       nodes = {},
       started_at = nil,
@@ -222,6 +240,7 @@ local function graph_summary(run)
   end
   return {
     run_id = run.run_id,
+    name = run.name,
     status = run.status,
     total_nodes = run.total_nodes,
     started_at = run.started_at,
@@ -577,6 +596,12 @@ local function gate_against_unapproved_plan(node_specs)
   return writer_denial_message("dispatch-graph", plan_state, writers)
 end
 local function dispatch_graph(firing_id, args)
+  local graph_name, name_err = validate_graph_name(args and args.name)
+  if name_err then
+    emit_tool_result_err(firing_id, name_err)
+    return
+  end
+
   local nodes = args and args.nodes
   local graph, err = build_graph_spec(nodes, args and args.terminal)
   if err then
@@ -605,7 +630,7 @@ local function dispatch_graph(firing_id, args)
   -- without going through that path.
   local al = require("agentic-loop")
   local run_id = al.queue_sub_graph(
-    { graph = graph, on_node_failure = "abort" }, firing_id)
+    { graph = graph, name = graph_name, on_node_failure = "abort" }, firing_id)
   if type(run_id) ~= "string" then
     emit_tool_result_err(firing_id,
       "dispatch-graph: agentic-loop refused the graph (queue_sub_graph returned nil)")
@@ -615,6 +640,7 @@ local function dispatch_graph(firing_id, args)
   state.active_run_ids[run_id] = true
   local run = ensure_graph_run(run_id)
   if run then
+    run.name = graph_name
     run.status = "queued"
     run.total_nodes = #graph.nodes
     run.updated_at = now_ms()
@@ -638,13 +664,14 @@ local function dispatch_graph(firing_id, args)
   local n = #graph.nodes
   emit_tool_result_ok(firing_id, {
     run_id = run_id,
+    name   = graph_name,
     nodes  = n,
     notice = string.format(
-      "Graph submitted (async, %d node%s, run_id=%s). " ..
+      "Graph `%s` submitted (async, %d node%s, run_id=%s). " ..
       "Acknowledge briefly, then wait for graph results or call " ..
       "graph-status if the user asks for progress. Do NOT re-dispatch " ..
       "the same task.",
-      n, n == 1 and "" or "s", run_id),
+      graph_name, n, n == 1 and "" or "s", run_id),
   })
 end
 
@@ -940,6 +967,9 @@ end
 local function handle_graph_run_started(body)
   local run = ensure_graph_run(body.run_id)
   if not run then return end
+  if type(body.name) == "string" and #body.name > 0 then
+    run.name = body.name
+  end
   run.status = "running"
   run.total_nodes = tonumber(body.total_nodes) or run.total_nodes or 0
   run.started_at = run.started_at or now_ms()
@@ -1057,6 +1087,10 @@ local function lead_workflow_tool_schemas()
             type = "string",
             description = "Exactly one terminal node id for this graph. The terminal node output is the graph result returned to the lead/orchestrator; any output-producing node may be terminal.",
           },
+          name = {
+            type = "string",
+            description = "Short kebab-case graph name for agent use and sidebar display. Lowercase letters/digits/hyphens only, max 20 chars, e.g. fix-graph-names.",
+          },
           nodes = {
             type = "array",
             description =
@@ -1125,7 +1159,7 @@ local function lead_workflow_tool_schemas()
             },
           },
         },
-        required = { "nodes", "terminal" },
+        required = { "name", "nodes", "terminal" },
       },
     },
     {

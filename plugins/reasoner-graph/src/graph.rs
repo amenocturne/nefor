@@ -456,6 +456,8 @@ pub struct RunSubmission {
     pub run_id: String,
     /// Validated graph (cycles permitted).
     pub graph: Graph,
+    /// Optional human-readable run name, carried to observer events.
+    pub name: Option<String>,
     /// Failure policy (default abort).
     pub on_failure: OnNodeFailure,
 }
@@ -536,6 +538,12 @@ pub fn parse_submission(body: &Map<String, Value>) -> Result<RunSubmission, Subm
         run_id: run_id_for_error.clone(),
     })?;
 
+    let graph_name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+
     let on_failure = args
         .get("on_node_failure")
         .map(|v| v.as_str().unwrap_or(""))
@@ -549,6 +557,7 @@ pub fn parse_submission(body: &Map<String, Value>) -> Result<RunSubmission, Subm
     Ok(RunSubmission {
         run_id,
         graph,
+        name: graph_name,
         on_failure,
     })
 }
@@ -808,5 +817,20 @@ mod tests {
         let sub = parse_submission(body.as_object().unwrap())
             .expect("unknown envelope fields must be ignored");
         assert_eq!(sub.run_id, "r1");
+    }
+
+    #[test]
+    fn parse_submission_carries_optional_graph_name() {
+        let body = json!({
+            "kind": "tool.invoke",
+            "id": "r1",
+            "name": "spawn_graph",
+            "args": {
+                "name": "fix-graph-names",
+                "graph": {"terminal": "n1", "nodes": [{"id": "n1", "reasoner": "r"}], "edges": []}
+            }
+        });
+        let sub = parse_submission(body.as_object().unwrap()).expect("graph name should parse");
+        assert_eq!(sub.name.as_deref(), Some("fix-graph-names"));
     }
 }

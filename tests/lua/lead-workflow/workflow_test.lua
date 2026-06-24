@@ -99,6 +99,7 @@ do
     id   = "firing-dispatch-1",
     name = "dispatch-graph",
     args = {
+      name = "auth-login-map",
       terminal = "explore-2",
       nodes = {
         { id = "explore-1", role = "explorer",
@@ -127,6 +128,8 @@ do
     "spawn_graph tool.invoke carries a non-empty id (run_id)")
 
   local graph = invoke.body.args and invoke.body.args.graph
+  assert_eq(invoke.body.args.name, "auth-login-map",
+    "graph name forwarded to spawn_graph args")
   assert_true(type(graph) == "table", "args.graph present")
   assert_eq(#graph.nodes, 2, "two nodes in graph")
   assert_eq(graph.nodes[1].id, "explore-1", "first node id preserved")
@@ -153,6 +156,33 @@ do
   assert_true(reply ~= nil, "actor replies to dispatch-graph invocation")
   assert_eq(reply.body.output.run_id, invoke.body.id,
     "reply carries the run_id")
+  assert_eq(reply.body.output.name, "auth-login-map",
+    "reply carries the graph name")
+end
+
+do
+  fresh()
+  feed("tool-gate", {
+    kind = "lead-workflow.tool.invoke",
+    id   = "firing-bad-name",
+    name = "dispatch-graph",
+    args = {
+      name = "Too Long Or Spaced",
+      terminal = "explore",
+      nodes = {
+        { id = "explore", role = "explorer",
+          agent_args = { prompt = "x" } },
+      },
+    },
+  })
+  local err = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result"
+       and c.body.id == "firing-bad-name"
+       and type(c.body.error) == "string"
+  end)
+  assert_true(err ~= nil, "invalid graph name returns a tool.result error")
+  assert_true(err.body.error:find("kebab%-case") ~= nil,
+    "invalid graph name error explains kebab-case")
 end
 
 do
@@ -162,6 +192,7 @@ do
     id   = "firing-deterministic-graph",
     name = "dispatch-graph",
     args = {
+      name = "deterministic-check",
       terminal = "join",
       nodes = {
         { id = "build", role = "explorer",
@@ -218,6 +249,7 @@ do
     id   = "firing-builder-no-plan",
     name = "dispatch-graph",
     args = {
+      name = "feature-build",
       terminal = "build-1",
       nodes = {
         { id = "build-1", role = "builder",
@@ -261,6 +293,7 @@ do
     id   = "firing-builder-with-plan",
     name = "dispatch-graph",
     args = {
+      name = "feature-build",
       terminal = "build-1",
       nodes = {
         { id = "build-1", role = "builder",
@@ -467,6 +500,7 @@ do
     id   = "firing-builder-expired",
     name = "dispatch-graph",
     args = {
+      name = "expired-build",
       terminal = "b",
       nodes = {
         { id = "b", role = "builder", agent_args = { prompt = "x" } },
@@ -601,6 +635,7 @@ do
     id   = "firing-builder-auto",
     name = "dispatch-graph",
     args = {
+      name = "auto-build",
       terminal = "build-auto",
       nodes = {
         { id = "build-auto", role = "builder",
@@ -623,6 +658,7 @@ do
     id   = "firing-builder-yolo",
     name = "dispatch-graph",
     args = {
+      name = "yolo-build",
       terminal = "build-yolo",
       nodes = {
         { id = "build-yolo", role = "builder",
@@ -648,6 +684,7 @@ do
     id   = "firing-dispatch-end",
     name = "dispatch-graph",
     args = {
+      name = "session-end",
       terminal = "explore",
       nodes = {
         { id = "explore", role = "explorer",
@@ -694,6 +731,7 @@ do
     id   = "firing-dispatch-interrupt-all",
     name = "dispatch-graph",
     args = {
+      name = "interrupt-all",
       terminal = "explore",
       nodes = {
         { id = "explore", role = "explorer",

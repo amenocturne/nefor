@@ -941,7 +941,7 @@ end
 local function handle_graph_run_started(msg, state)
   if state.replay_mode then return state, {} end
   local now = tui.now_ms()
-  return dag.run_started(state, msg.run_id or "", msg.total_nodes or 0, now), {}
+  return dag.run_started(state, msg.run_id or "", msg.total_nodes or 0, now, msg.name), {}
 end
 
 local function handle_graph_node_fired(msg, state)

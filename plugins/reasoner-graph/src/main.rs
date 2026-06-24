@@ -279,11 +279,15 @@ fn effect_to_body(effect: Effect) -> Map<String, Value> {
     match effect {
         Effect::RunStarted {
             run_id,
+            name,
             total_nodes,
         } => {
             let mut m = Map::new();
             m.insert("kind".into(), Value::String("graph.run_started".into()));
             m.insert("run_id".into(), Value::String(run_id));
+            if let Some(name) = name {
+                m.insert("name".into(), Value::String(name));
+            }
             m.insert("total_nodes".into(), Value::Number(total_nodes.into()));
             m
         }
@@ -521,6 +525,7 @@ mod tests {
     fn run_started_effect_renders_kind_and_total_nodes() {
         let body = effect_to_body(Effect::RunStarted {
             run_id: "run-1".into(),
+            name: Some("test-graph".into()),
             total_nodes: 3,
         });
         assert_eq!(
@@ -528,6 +533,7 @@ mod tests {
             Some("graph.run_started")
         );
         assert_eq!(body.get("run_id").and_then(Value::as_str), Some("run-1"));
+        assert_eq!(body.get("name").and_then(Value::as_str), Some("test-graph"));
         assert_eq!(body.get("total_nodes").and_then(Value::as_u64), Some(3));
     }
 

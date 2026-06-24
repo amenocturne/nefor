@@ -645,6 +645,33 @@ fn graph_run_started_creates_a_dag_panel_row() {
 }
 
 #[test]
+fn graph_run_started_displays_name_as_title_words() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "graph.run_started",
+            "run_id": "run-aaaaaaaa",
+            "name": "fix-graph-names",
+            "total_nodes": 3,
+        }),
+    );
+
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("Fix Graph Names"),
+        "dag header should display title-cased graph name: {out:?}"
+    );
+    assert!(
+        !out.contains("fix-graph-names"),
+        "dag header should not display raw kebab-case graph name: {out:?}"
+    );
+}
+
+#[test]
 fn graph_node_tool_invoke_uses_path_tail_label() {
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");

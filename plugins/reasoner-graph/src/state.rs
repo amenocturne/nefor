@@ -277,6 +277,8 @@ pub enum Effect {
     RunStarted {
         /// Run id (echoed).
         run_id: String,
+        /// Optional human-readable run name.
+        name: Option<String>,
         /// Total nodes in the submitted graph.
         total_nodes: usize,
     },
@@ -1228,6 +1230,7 @@ impl Scheduler {
         let mut effects = Effects::new();
         effects.push(Effect::RunStarted {
             run_id: submission.run_id.clone(),
+            name: submission.name.clone(),
             total_nodes,
         });
 
@@ -1704,7 +1707,7 @@ mod tests {
         // firing's graph.node.fired (Bug A6 root cause).
         assert_eq!(effects.len(), 3);
         assert!(
-            matches!(&effects[0], Effect::RunStarted { run_id, total_nodes } if run_id == "run-1" && *total_nodes == 1)
+            matches!(&effects[0], Effect::RunStarted { run_id, total_nodes, .. } if run_id == "run-1" && *total_nodes == 1)
         );
         match &effects[1] {
             Effect::NodeDispatched {

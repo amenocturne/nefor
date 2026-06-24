@@ -114,6 +114,7 @@ local function flush_pending_dispatches()
       name = "spawn_graph",
       args = {
         graph           = entry.graph,
+        name            = entry.name,
         on_node_failure = entry.on_node_failure,
       },
     })
@@ -772,10 +773,11 @@ local function queue_sub_graph(args, gate_inner_id)
   -- table is otherwise opaque to agentic-loop — reasoner-graph parses
   -- + owns scheduling — but the node list is exactly the metadata the
   -- chat surface needs to render the sub-graph result block.
-  state.pending_runs[run_id] = { gate_inner_id = gate_inner_id, graph = g }
+  state.pending_runs[run_id] = { gate_inner_id = gate_inner_id, graph = g, name = args.name }
   state.pending_dispatches[#state.pending_dispatches + 1] = {
     run_id          = run_id,
     graph           = g,
+    name            = args.name,
     on_node_failure = on_failure,
   }
   nefor.log.info("agentic-loop: queued sub-graph dispatch (will flush on wrap stream.delta)", {
