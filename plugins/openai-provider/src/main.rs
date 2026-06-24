@@ -817,6 +817,25 @@ async fn start_completion_turn(
     legacy_default_chat: bool,
     extra_tools: Vec<Value>,
 ) -> Result<(), LlmError> {
+    let history = match chats.request_history_snapshot(&chat_id).await {
+        Ok(h) => h,
+        Err(e) => {
+            send_event(out_tx, chat_error_body(config, &chat_id, &e)).await?;
+            return Ok(());
+        }
+    };
+    if !request_history_has_model_input(&history) {
+        let message =
+            "openai-provider: chat.complete needs at least one non-empty user or tool message";
+        let body = if legacy_default_chat {
+            turn_error_body(config, message)
+        } else {
+            chat_error_body_msg(config, &chat_id, message.to_owned())
+        };
+        send_event(out_tx, body).await?;
+        return Ok(());
+    }
+
     let cancel = match chats.begin_turn(&chat_id).await {
         Ok(t) => t,
         Err(ChatsError::Busy(_)) => {
@@ -888,6 +907,7 @@ fn spawn_turn(
         // (each firing produces its own thinking trace; we surface the
         // most recent one on `chat.complete.result`).
         let mut final_reasoning = String::new();
+        let mut final_error: Option<String> = None;
         let mut interrupted = false;
         let mut errored = false;
 
@@ -1240,6 +1260,7 @@ fn spawn_turn(
                     }
                     errored = true;
                     final_finish_reason = Some("error".to_string());
+                    final_error = Some(msg.clone());
                     let _ = out_tx
                         .send(PluginOutgoing::event(turn_error_body(&config, &msg)))
                         .await;
@@ -1295,7 +1316,14 @@ fn spawn_turn(
         // `<prefix>.prompt` path skips it — the chat plugin reads
         // stream.end directly and doesn't speak the chat.* protocol
         // yet.
-        if !legacy_default_chat {
+        if !legacy_default_chat && errored {
+            let message = final_error
+                .as_deref()
+                .unwrap_or("provider turn failed")
+                .to_owned();
+            let body = chat_error_body_msg(&config, &chat_id, message);
+            let _ = out_tx.send(PluginOutgoing::event(body)).await;
+        } else if !legacy_default_chat {
             let body = chat_complete_result_body(
                 &config,
                 &chat_id,
@@ -1584,14 +1612,14 @@ fn parse_provider_message(value: Option<&Value>) -> Result<ParsedMessage, String
     });
     match role {
         "user" => {
-            let text = content.ok_or_else(|| "user message missing `content`".to_owned())?;
+            let text = non_empty_message_content("user", content)?;
             Ok(ParsedMessage {
                 message: Message::User { content: text },
                 tool_call_failures: Vec::new(),
             })
         }
         "system" => {
-            let text = content.ok_or_else(|| "system message missing `content`".to_owned())?;
+            let text = non_empty_message_content("system", content)?;
             Ok(ParsedMessage {
                 message: Message::System { content: text },
                 tool_call_failures: Vec::new(),
@@ -1615,6 +1643,12 @@ fn parse_provider_message(value: Option<&Value>) -> Result<ParsedMessage, String
                     }
                 }
             }
+            let content = content.filter(|s| !s.trim().is_empty());
+            if content.is_none() && tool_calls.is_empty() {
+                return Err(
+                    "assistant message must have non-empty `content` or `tool_calls`".to_owned(),
+                );
+            }
             Ok(ParsedMessage {
                 message: Message::Assistant {
                     content,
@@ -1624,7 +1658,7 @@ fn parse_provider_message(value: Option<&Value>) -> Result<ParsedMessage, String
             })
         }
         "tool" => {
-            let text = content.ok_or_else(|| "tool message missing `content`".to_owned())?;
+            let text = non_empty_message_content("tool", content)?;
             let tool_call_id = obj
                 .get("tool_call_id")
                 .or_else(|| obj.get("tool_name"))
@@ -1641,6 +1675,28 @@ fn parse_provider_message(value: Option<&Value>) -> Result<ParsedMessage, String
         }
         other => Err(format!("unknown message role `{other}`")),
     }
+}
+
+fn non_empty_message_content(role: &str, content: Option<String>) -> Result<String, String> {
+    content
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| format!("{role} message `content` must be non-empty"))
+}
+
+fn request_history_has_model_input(history: &[Message]) -> bool {
+    history.iter().any(|message| match message {
+        Message::User { content } | Message::Tool { content, .. } => !content.trim().is_empty(),
+        Message::Assistant {
+            content,
+            tool_calls,
+        } => {
+            content
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty())
+                || !tool_calls.is_empty()
+        }
+        Message::System { .. } => false,
+    })
 }
 
 fn stream_delta_body(prefix: &str, id: &str, chat_id: &ChatId, text: &str) -> Map<String, Value> {
@@ -3366,6 +3422,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_complete_empty_history_emits_chat_error_to_unblock_reasoner() {
+        let (auth, tx, mut rx) = auth_test_rig(None);
+        let chats = fresh_chats("m");
+        let catalog = Arc::new(ToolCatalog::new());
+        let broker = Arc::new(ToolBroker::new());
+        let config = cfg("ollama");
+        let client = reqwest::Client::builder().build().expect("client");
+
+        chats
+            .create(ChatId::new("c-1"), None, None, None, None, None)
+            .await
+            .expect("seed");
+
+        let body = make_event_body(
+            "ollama.chat.complete",
+            &[("chat_id", Value::String("c-1".into()))],
+        );
+        dispatch_event(
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("reasoner-graph"),
+            &body,
+        )
+        .await
+        .expect("dispatch ok");
+
+        let emitted = drain(&mut rx).await;
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(
+            emitted[0].get("kind").and_then(Value::as_str),
+            Some("ollama.chat.error")
+        );
+        assert_eq!(
+            emitted[0].get("chat_id").and_then(Value::as_str),
+            Some("c-1")
+        );
+        assert_eq!(
+            emitted[0].get("message").and_then(Value::as_str),
+            Some(
+                "openai-provider: chat.complete needs at least one non-empty user or tool message"
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn chat_append_to_unknown_chat_emits_chat_error() {
         let (auth, tx, mut rx) = auth_test_rig(None);
         let chats = fresh_chats("m");
@@ -3861,6 +3967,160 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn chat_complete_http_error_emits_chat_error_not_empty_result() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let _server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 8192];
+            let mut acc = String::new();
+            loop {
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if let Some(headers_end) = acc.find("\r\n\r\n") {
+                    let cl: usize = acc
+                        .lines()
+                        .find_map(|l| {
+                            l.strip_prefix("content-length:")
+                                .or_else(|| l.strip_prefix("Content-Length:"))
+                        })
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    let body_so_far = acc.len() - (headers_end + 4);
+                    if body_so_far >= cl {
+                        break;
+                    }
+                }
+            }
+            let body = "{\"error\":{\"message\":\"Input is a zero-length, empty document: line 1 column 1 (char 0)\"}}";
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = s.write_all(response.as_bytes()).await;
+            let _ = s.shutdown().await;
+        });
+
+        let (auth, tx, mut rx) = auth_test_rig(Some("envkey"));
+        let chats = fresh_chats("test-model");
+        let catalog = Arc::new(ToolCatalog::new());
+        let broker = Arc::new(ToolBroker::new());
+        let mut config = cfg("ollama");
+        config.base_url = format!("http://{}", addr);
+        let client = reqwest::Client::builder().build().expect("client");
+
+        let create_body = make_event_body(
+            "ollama.chat.create",
+            &[("chat_id", Value::String("c-http-error".into()))],
+        );
+        dispatch_event(
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("reasoner-graph"),
+            &create_body,
+        )
+        .await
+        .expect("create");
+
+        let append_body = make_event_body(
+            "ollama.chat.append",
+            &[
+                ("chat_id", Value::String("c-http-error".into())),
+                (
+                    "message",
+                    serde_json::json!({"role": "user", "content": "hello"}),
+                ),
+            ],
+        );
+        dispatch_event(
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("reasoner-graph"),
+            &append_body,
+        )
+        .await
+        .expect("append");
+        let _ = drain(&mut rx).await;
+
+        let complete_body = make_event_body(
+            "ollama.chat.complete",
+            &[("chat_id", Value::String("c-http-error".into()))],
+        );
+        dispatch_event(
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("reasoner-graph"),
+            &complete_body,
+        )
+        .await
+        .expect("complete");
+
+        let mut saw_chat_error = false;
+        let mut saw_complete_result = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Ok(msg) = rx.try_recv() {
+                let line = msg.to_line();
+                let v: Value = serde_json::from_str(&line).expect("json");
+                if let Some(body) = v.get("body").and_then(Value::as_object) {
+                    match body.get("kind").and_then(Value::as_str) {
+                        Some("ollama.chat.error") => {
+                            saw_chat_error = true;
+                            let message = body
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            assert!(
+                                message.contains("Input is a zero-length"),
+                                "message was: {message}",
+                            );
+                        }
+                        Some("ollama.chat.complete.result") => {
+                            saw_complete_result = true;
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            if saw_chat_error {
+                break;
+            }
+        }
+
+        assert!(saw_chat_error, "chat.error must arrive for HTTP failures");
+        assert!(
+            !saw_complete_result,
+            "HTTP failure must not be lowered to chat.complete.result"
+        );
+    }
+
     /// Per-chat tool-name allowlist regression: when `chat.create.tools`
     /// is an array of strings, the per-turn upstream request body's
     /// `tools` array MUST be filtered to entries whose function.name is
@@ -4256,6 +4516,29 @@ mod tests {
         assert_eq!(parsed.message.role(), "user");
         assert_eq!(parsed.message.content(), Some("hi"));
         assert!(parsed.tool_call_failures.is_empty());
+    }
+
+    #[test]
+    fn parse_provider_message_rejects_empty_user_content() {
+        let v = serde_json::json!({"role": "user", "content": ""});
+        let err = match parse_provider_message(Some(&v)) {
+            Ok(_) => panic!("empty content should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err, "user message `content` must be non-empty");
+    }
+
+    #[test]
+    fn parse_provider_message_rejects_assistant_without_content_or_tools() {
+        let v = serde_json::json!({"role": "assistant", "content": ""});
+        let err = match parse_provider_message(Some(&v)) {
+            Ok(_) => panic!("empty assistant should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err,
+            "assistant message must have non-empty `content` or `tool_calls`"
+        );
     }
 
     #[test]
