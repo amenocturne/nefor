@@ -268,6 +268,7 @@ fn tools_advertise_body(gate: &str) -> Map<String, Value> {
             m.insert("name".into(), Value::String(t.name.into()));
             m.insert("description".into(), Value::String(t.description.into()));
             m.insert("parameters".into(), (t.schema)());
+            m.insert("context".into(), (t.context)());
             Value::Object(m)
         })
         .collect();
@@ -360,6 +361,30 @@ mod tests {
             .is_some());
         let params = read_file.get("parameters").expect("parameters");
         assert_eq!(params.get("type").and_then(Value::as_str), Some("object"));
+        assert!(
+            read_file.get("context").is_none(),
+            "public tool.register must not expose internal context metadata"
+        );
+    }
+
+    #[test]
+    fn tools_advertise_body_carries_private_context_metadata() {
+        let b = tools_advertise_body("tool-gate");
+        assert_eq!(
+            b.get("kind").and_then(Value::as_str),
+            Some("tool-gate.tools.advertise")
+        );
+        let arr = b.get("tools").and_then(Value::as_array).expect("tools");
+        let read_file = arr
+            .iter()
+            .find(|v| v.get("name").and_then(Value::as_str) == Some("read_file"))
+            .expect("read_file in tools");
+        let folders = read_file
+            .get("context")
+            .and_then(|v| v.get("folders"))
+            .and_then(Value::as_array)
+            .expect("context.folders");
+        assert_eq!(folders.len(), 1);
     }
 
     #[test]

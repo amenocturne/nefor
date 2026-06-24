@@ -24,6 +24,11 @@ See [`starter/chat/README.md`](../../starter/chat/README.md) → "Tool calling
 `tool.register` and `tool.result` are unprefixed because consumers — the
 provider's tool-call loop, debug listeners — need to see them.
 
+When basic-tools advertises privately through `tool-gate.tools.advertise`, each
+tool also includes internal `context.folders` metadata. The gate wrapper uses
+that metadata for runtime hooks such as instruction-file reminders. This field
+is stripped from public `tool.register` and is not exposed to models.
+
 ## v1 tool list
 
 ### `read_file`

@@ -40,11 +40,12 @@ local M = {}
 -- ## to_plugin (bus → binary)
 --
 --   * Skip self-emissions and envelopes flagged `env.replay`.
---   * On outbound `<gate>.tool.invoke`: walk the touched file's
---     ancestors via the plugin lib's AGENTS.md hook and emit any
---     not-yet-loaded `chat.message.append { role = "system" }`
---     envelopes BEFORE the invoke is forwarded to the binary (ordering
---     is load-bearing for chat history).
+--   * On private `<gate>.tools.advertise`: record internal tool context
+--     metadata before forwarding it to the binary.
+--   * On outbound `<gate>.tool.invoke`: derive normalized folders via
+--     the plugin lib's context registry and emit any not-yet-shown
+--     instruction-file reminders BEFORE the invoke is forwarded to the
+--     binary (ordering is load-bearing for chat history).
 --   * Then forward the envelope verbatim to the binary's stdin.
 -- opts.agentic_loop (required) — the agentic-loop module table,
 -- injected by the caller. Eliminates the require-time cycle between
@@ -167,6 +168,10 @@ function M.gate_spec(gate_name, command, opts)
     for _, env in ipairs(envs) do
       if not env.replay and env.from ~= gate_name then
         local invoke_chat_id = type(env.body) == "table" and env.body.chat_id or nil
+        if type(env.body) == "table"
+            and env.body.kind == translator.kinds.tool_advertise then
+          gate_lib.record_tool_contexts_from_advertise(env.body)
+        end
         gate_lib.agents_md_emit_for_invoke(
           translator, env, invoke_chat_id,
           function(body) envelope.emit(nil, body) end

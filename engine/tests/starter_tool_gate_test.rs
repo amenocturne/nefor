@@ -457,388 +457,254 @@ fn tool_gate_wrapper_swaps_huge_tool_result_output_to_summary() {
 }
 
 // ----------------------------------------------------------------
-// lib/agents_md.lua — unit tests
+// instruction discovery/reminder unit tests
 // ----------------------------------------------------------------
-//
-// Spec context: lead-workflow-spec §5 — when a `read`/`write`/`edit`
-// tool call touches a file under `long/path/to/file`, the tool-gate
-// walks up from the touched file's dir, loads any `AGENTS.md` not yet
-// loaded for this chat, and appends its contents to chat history with
-// an explicit "automatic context" marker so the model isn't confused
-// by content turning up out of context. The dedup-set is per-chat
-// in-memory; symlinks normalised once via `realpath` semantics; empty
-// AGENTS.md skipped; permission errors logged + skipped.
 
 #[test]
-fn paths_to_check_walks_outermost_first_to_root() {
-    // Given a file at `/a/b/c/d.txt`, the dirs to check for AGENTS.md
-    // are `[/, /a, /a/b, /a/b/c]` — outermost-first so a caller
-    // iterating the list emits the root-most AGENTS.md first (outer
-    // rules govern, inner refines, matching how a human reads the
-    // tree). This is the load-bearing ordering: getting it backwards
-    // would mean the model sees `[inner: foo/bar/AGENTS.md]
-    // [outer: foo/AGENTS.md]` which is the wrong reading order.
-    let lua = Lua::new();
-    install_stub_nefor(&lua).expect("install nefor stub");
-    set_package_path(&lua).expect("set package.path");
-
-    let dirs: Table = lua
-        .load(
-            r#"
-            local d = require("tool-gate.agents_md")
-            return d.paths_to_check("/a/b/c/d.txt")
-            "#,
-        )
-        .eval()
-        .expect("paths_to_check");
-
-    let len = dirs.len().expect("len") as usize;
-    let collected: Vec<String> = (1..=len)
-        .map(|i| dirs.get::<String>(i).expect("entry"))
-        .collect();
-    assert_eq!(
-        collected,
-        vec!["/", "/a", "/a/b", "/a/b/c"],
-        "expected outermost-first walk to root"
-    );
-}
-
-#[test]
-fn paths_to_check_skips_existing_directory_arg_starting_at_self() {
-    // When the `path` arg resolves to a directory rather than a file
-    // (legitimate for a tool like `grep` scoped to a dir), the walk
-    // starts from the directory itself, not its parent. Otherwise we'd
-    // miss AGENTS.md sitting at the directory the caller targeted.
-    let lua = Lua::new();
-    install_stub_nefor(&lua).expect("install nefor stub");
-    set_package_path(&lua).expect("set package.path");
-
-    // Use a real tempdir so `is_directory` finds it.
+fn discover_subfolders_lists_instruction_files_without_contents() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tempdir = tempfile::tempdir().expect("tempdir");
-    let dir_str = tempdir.path().display().to_string();
-
-    let collected: Vec<String> = lua
-        .load(format!(
-            r#"
-            local d = require("tool-gate.agents_md")
-            local dirs = d.paths_to_check("{dir}")
-            return dirs
-            "#,
-            dir = dir_str
-        ))
-        .eval::<Table>()
-        .expect("paths_to_check dir")
-        .sequence_values::<String>()
-        .map(|v| v.expect("entry"))
-        .collect();
-
-    // The starting dir (the tempdir itself) must be IN the list — it
-    // would not be if the walk had started from its parent. The exact
-    // ancestor count varies by tempdir depth, so we just assert the
-    // tempdir itself is there as the deepest entry (last after the
-    // outermost-first reverse).
-    assert!(
-        collected.iter().any(|p| p == &dir_str),
-        "directory-arg walk must include the directory itself; got {collected:?}"
-    );
-    let last = collected.last().expect("non-empty");
-    assert_eq!(last, &dir_str, "tempdir should be the leaf (last) entry");
-}
-
-#[test]
-fn find_unloaded_skips_already_loaded_paths() {
-    // The dedup set is the whole point of the loader: hitting the
-    // same dir twice across two tool calls in the same chat must NOT
-    // re-emit AGENTS.md. Pre-mark a path as loaded; the second
-    // find_unloaded over the same dirs returns nothing for it.
-    let tempdir = tempfile::tempdir().expect("tempdir");
-    let outer = tempdir.path().join("outer");
-    let inner = outer.join("inner");
-    std::fs::create_dir_all(&inner).expect("mkdir");
-    let outer_agents = outer.join("AGENTS.md");
-    let inner_agents = inner.join("AGENTS.md");
-    std::fs::write(&outer_agents, "outer rules\n").expect("write outer");
-    std::fs::write(&inner_agents, "inner rules\n").expect("write inner");
+    let root = tempdir.path().join("proj");
+    let nested = root.join("docs");
+    std::fs::create_dir_all(&nested).expect("mkdir");
+    std::fs::write(root.join("AGENTS.md"), "ROOT-RULES\n").expect("write agents");
+    std::fs::write(nested.join("CLAUDE.md"), "DOC-RULES\n").expect("write claude");
 
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
     set_package_path(&lua).expect("set package.path");
 
-    let outer_str = outer.display().to_string();
-    let inner_str = inner.display().to_string();
-    let outer_agents_str = outer_agents.display().to_string();
-
-    let counts: Table = lua
+    let out: String = lua
         .load(format!(
             r#"
             local d = require("tool-gate.agents_md")
             d._reset()
-            local dirs = {{ "{outer}", "{inner}" }}
-            local first = d.find_unloaded_agents_md("chat-1", dirs)
-            -- Mark only the OUTER AGENTS.md as loaded; the inner one
-            -- is still unloaded.
-            d.mark_loaded("chat-1", {{ "{outer_agents}" }})
-            local second = d.find_unloaded_agents_md("chat-1", dirs)
-            return {{
-              first_count = #first,
-              second_count = #second,
-              second_path = second[1] and second[1].path or nil,
-              second_contents = second[1] and second[1].contents or nil,
-            }}
+            local result = d.discover("{root}", {{ scope = "subfolders" }})
+            return d.format_discovery(result)
             "#,
-            outer = outer_str,
-            inner = inner_str,
-            outer_agents = outer_agents_str,
+            root = root.display(),
         ))
         .eval()
-        .expect("eval");
+        .expect("discover");
 
-    let first_count: i64 = counts.get("first_count").expect("first_count");
-    let second_count: i64 = counts.get("second_count").expect("second_count");
-    let second_path: String = counts.get("second_path").expect("second_path");
-    let second_contents: String = counts.get("second_contents").expect("second_contents");
-
-    assert_eq!(first_count, 2, "first walk must find both AGENTS.md");
-    assert_eq!(
-        second_count, 1,
-        "second walk must skip the already-loaded outer one"
-    );
-    assert_eq!(
-        second_path,
-        inner.join("AGENTS.md").display().to_string(),
-        "second walk should surface only the inner (still-unloaded) AGENTS.md"
-    );
+    assert!(out.contains("status: all files shown"), "bad output: {out}");
+    assert!(out.contains("AGENTS.md"), "missing AGENTS.md: {out}");
+    assert!(out.contains("docs/CLAUDE.md"), "missing CLAUDE.md: {out}");
     assert!(
-        second_contents.contains("inner rules"),
-        "second walk should carry the inner contents: {second_contents}"
+        !out.contains("ROOT-RULES") && !out.contains("DOC-RULES"),
+        "discovery must not include file contents: {out}"
     );
 }
 
 #[test]
-fn emit_for_tool_call_emits_outer_first_then_inner_with_marker() {
-    // The integration of walk + dedup + emit. Touch a file at
-    // /tmp/xxx/outer/inner/file.txt with both outer/AGENTS.md and
-    // inner/AGENTS.md present: the emitter callback is called TWICE,
-    // outer first then inner, with `chat.message.append { role =
-    // system, text = <marker + body> }` envelopes. The marker line
-    // contains the AGENTS.md path and the dir that triggered it
-    // (load-bearing — the model otherwise can't distinguish auto
-    // context from user instruction).
+fn instruction_files_lib_can_be_used_directly_without_tool_gate() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tempdir = tempfile::tempdir().expect("tempdir");
-    let outer = tempdir.path().join("outer");
-    let inner = outer.join("inner");
-    std::fs::create_dir_all(&inner).expect("mkdir");
-    let outer_agents = outer.join("AGENTS.md");
-    let inner_agents = inner.join("AGENTS.md");
-    std::fs::write(&outer_agents, "OUTER-RULES\n").expect("write outer");
-    std::fs::write(&inner_agents, "INNER-RULES\n").expect("write inner");
-    let touched = inner.join("file.txt");
+    let root = tempdir.path().join("proj");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    std::fs::write(root.join("AGENTS.md"), "ROOT-RULES\n").expect("write agents");
 
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
     set_package_path(&lua).expect("set package.path");
 
-    let touched_str = touched.display().to_string();
+    let out: String = lua
+        .load(format!(
+            r#"
+            local instructions = require("libs.instruction-files")
+            local state = instructions.new()
+            local result = state.discover("{root}", {{ scope = "subfolders" }})
+            return instructions.format_discovery(result)
+            "#,
+            root = root.display(),
+        ))
+        .eval()
+        .expect("discover");
+
+    assert!(out.contains("status: all files shown"), "bad output: {out}");
+    assert!(out.contains("AGENTS.md"), "missing AGENTS.md: {out}");
+    assert!(
+        !out.contains("ROOT-RULES"),
+        "generic discovery must not include file contents: {out}"
+    );
+}
+
+#[test]
+fn discover_auto_uses_git_repo_scope_when_available() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let root = tempdir.path().join("repo");
+    let nested = root.join("packages").join("api");
+    std::fs::create_dir_all(&nested).expect("mkdir");
+    std::fs::write(root.join("AGENTS.md"), "ROOT\n").expect("write root");
+    std::fs::write(nested.join("CLAUDE.md"), "API\n").expect("write nested");
+
+    let git_ok = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .arg("init")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !git_ok {
+        return;
+    }
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+
     let result: Table = lua
         .load(format!(
             r#"
             local d = require("tool-gate.agents_md")
             d._reset()
-            local emitted = {{}}
-            local count = d.emit_for_tool_call("chat-1", "read_file",
-              {{ path = "{touched}" }},
-              function(body) emitted[#emitted + 1] = body end)
-            return {{ count = count, emitted = emitted }}
+            return d.discover("{nested}", {{ scope = "auto" }})
             "#,
-            touched = touched_str,
+            nested = nested.display(),
         ))
         .eval()
-        .expect("emit_for_tool_call");
+        .expect("discover");
 
-    let count: i64 = result.get("count").expect("count");
+    let resolved_scope: String = result.get("resolved_scope").expect("scope");
+    let found_root: String = result.get("root").expect("root");
+    let files: Table = result.get("files").expect("files");
+    assert_eq!(resolved_scope, "git_repo");
+    assert!(
+        found_root == root.display().to_string()
+            || found_root == format!("/private{}", root.display()),
+        "git root should resolve to the temp repo; got {found_root}"
+    );
+    assert_eq!(files.len().expect("len"), 2);
+}
+
+#[test]
+fn reminder_uses_declared_context_and_dedupes_by_scope() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let dir = tempdir.path().join("proj");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("AGENTS.md"), "PROJECT-RULES\n").expect("write");
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+
+    let result: Table = lua
+        .load(format!(
+            r#"
+            local d = require("tool-gate.agents_md")
+            d._reset()
+            d.record_tool_contexts_from_advertise({{
+              tools = {{
+                {{ name = "read_file",
+                   context = {{ folders = {{ {{ from = "file_path", arg = "path" }} }} }} }}
+              }}
+            }})
+            local emitted = {{}}
+            local emit = function(body) emitted[#emitted + 1] = body end
+            local n1 = d.remind_for_tool_call("chat-1", "read_file",
+              {{ path = "{p1}" }}, emit)
+            local n2 = d.remind_for_tool_call("chat-1", "read_file",
+              {{ path = "{p2}" }}, emit)
+            return {{ n1 = n1, n2 = n2, emitted = emitted }}
+            "#,
+            p1 = dir.join("a.txt").display(),
+            p2 = dir.join("b.txt").display(),
+        ))
+        .eval()
+        .expect("remind");
+
+    let n1: i64 = result.get("n1").expect("n1");
+    let n2: i64 = result.get("n2").expect("n2");
     let emitted: Table = result.get("emitted").expect("emitted");
-    let emitted_len = emitted.len().expect("len") as usize;
-
-    assert_eq!(count, 2, "must emit one envelope per AGENTS.md found");
-    assert_eq!(
-        emitted_len, 2,
-        "emitter callback must be called once per AGENTS.md; got {emitted_len}"
-    );
-
-    // Order: outer first, inner second.
+    assert_eq!(n1, 1, "first touch should emit one reminder");
+    assert_eq!(n2, 0, "second touch in same scope should be silent");
+    assert_eq!(emitted.len().expect("len"), 1);
     let first: Table = emitted.get(1).expect("first");
-    let second: Table = emitted.get(2).expect("second");
-    let first_kind: String = first.get("kind").expect("first kind");
-    let first_role: String = first.get("role").expect("first role");
-    let first_text: String = first.get("text").expect("first text");
-    let second_text: String = second.get("text").expect("second text");
-
-    assert_eq!(
-        first_kind, "chat.message.append",
-        "envelope kind must match the brief's literal choice"
-    );
-    assert_eq!(first_role, "system", "AGENTS.md is system context");
-
-    // First envelope corresponds to the OUTER AGENTS.md.
-    let outer_str = outer.display().to_string();
+    let text: String = first.get("text").expect("text");
+    assert!(text.contains("Local instruction files available"), "{text}");
+    assert!(text.contains("AGENTS.md"), "{text}");
     assert!(
-        first_text.contains(&outer_str),
-        "first envelope must reference the outer dir: {first_text}"
-    );
-    assert!(
-        first_text.contains("OUTER-RULES"),
-        "first envelope must inline outer body: {first_text}"
-    );
-    // Marker must be present and load-bearing — explicitly says it's
-    // automatic context, not a user request.
-    assert!(
-        first_text.contains("Loaded ") && first_text.contains("not a user request"),
-        "first envelope must carry the load-bearing marker: {first_text}"
-    );
-
-    // Second envelope corresponds to the INNER AGENTS.md.
-    let inner_str = inner.display().to_string();
-    assert!(
-        second_text.contains(&inner_str),
-        "second envelope must reference the inner dir: {second_text}"
-    );
-    assert!(
-        second_text.contains("INNER-RULES"),
-        "second envelope must inline inner body: {second_text}"
+        !text.contains("PROJECT-RULES"),
+        "reminder must not load instruction contents: {text}"
     );
 }
 
 #[test]
-fn emit_for_tool_call_deduplicates_across_calls_in_same_chat() {
-    // Two tool calls touching files in the same dir tree must emit
-    // each AGENTS.md ONCE. Without dedup the model would see the same
-    // AGENTS.md content repeating on every read_file in the same
-    // directory, which is both noise and a context-budget killer.
+fn reminder_is_silent_for_empty_results_and_does_not_mark_scope() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let dir = tempdir.path().join("proj");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("install nefor stub");
+    set_package_path(&lua).expect("set package.path");
+
+    let result: Table = lua
+        .load(format!(
+            r#"
+            local d = require("tool-gate.agents_md")
+            d._reset()
+            d.record_tool_contexts_from_advertise({{
+              tools = {{
+                {{ name = "list_dir",
+                   context = {{ folders = {{ {{ from = "directory", arg = "path" }} }} }} }}
+              }}
+            }})
+            local emitted = {{}}
+            local emit = function(body) emitted[#emitted + 1] = body end
+            local n1 = d.remind_for_tool_call("chat-1", "list_dir",
+              {{ path = "{dir}" }}, emit)
+            local f = io.open("{dir}/AGENTS.md", "w")
+            f:write("rules later\n")
+            f:close()
+            local n2 = d.remind_for_tool_call("chat-1", "list_dir",
+              {{ path = "{dir}" }}, emit)
+            return {{ n1 = n1, n2 = n2, total = #emitted }}
+            "#,
+            dir = dir.display(),
+        ))
+        .eval()
+        .expect("empty reminder");
+
+    let n1: i64 = result.get("n1").expect("n1");
+    let n2: i64 = result.get("n2").expect("n2");
+    let total: i64 = result.get("total").expect("total");
+    assert_eq!(n1, 0, "empty discovery should emit no reminder");
+    assert_eq!(n2, 1, "empty discovery must not mark the scope as reminded");
+    assert_eq!(total, 1);
+}
+
+#[test]
+fn ordinary_read_file_marks_instruction_file_as_read() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tempdir = tempfile::tempdir().expect("tempdir");
     let dir = tempdir.path().join("proj");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let agents = dir.join("AGENTS.md");
     std::fs::write(&agents, "PROJECT-RULES\n").expect("write");
-    let touched1 = dir.join("a.txt");
-    let touched2 = dir.join("b.txt");
 
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
     set_package_path(&lua).expect("set package.path");
 
-    let result: Table = lua
+    let status: String = lua
         .load(format!(
             r#"
             local d = require("tool-gate.agents_md")
             d._reset()
-            local emitted = {{}}
-            local emit = function(body) emitted[#emitted + 1] = body end
-            local n1 = d.emit_for_tool_call("chat-1", "read_file",
-              {{ path = "{p1}" }}, emit)
-            local n2 = d.emit_for_tool_call("chat-1", "read_file",
-              {{ path = "{p2}" }}, emit)
-            return {{ n1 = n1, n2 = n2, total = #emitted }}
+            d.mark_read_for_tool_call("chat-1", "read_file", {{ path = "{agents}" }})
+            local result = d.discover("{dir}", {{ scope = "subfolders", chat_id = "chat-1" }})
+            return result.files[1].status
             "#,
-            p1 = touched1.display(),
-            p2 = touched2.display(),
+            agents = agents.display(),
+            dir = dir.display(),
         ))
         .eval()
-        .expect("eval");
+        .expect("read status");
 
-    let n1: i64 = result.get("n1").expect("n1");
-    let n2: i64 = result.get("n2").expect("n2");
-    let total: i64 = result.get("total").expect("total");
-
-    // First call emits at least the project AGENTS.md (could also pick
-    // up ancestor AGENTS.md from the test runner's tree, but in our
-    // tempdir there isn't one).
-    assert!(n1 >= 1, "first call must emit at least one AGENTS.md");
-    // Second call's contribution for THIS dir must be 0 — already
-    // loaded. (n2 may still be > 0 in theory if a parent dir had an
-    // AGENTS.md the first walk missed, but with both calls in the
-    // same dir that's impossible.)
-    assert_eq!(
-        n2, 0,
-        "second call against the same dir must NOT re-emit any AGENTS.md"
-    );
-    assert_eq!(
-        total as i64, n1,
-        "emitter callback total must equal the first-call count"
-    );
-}
-
-#[test]
-fn emit_for_tool_call_noops_for_non_path_touching_tools() {
-    // `bash { command = "echo hi" }` doesn't carry a path-shaped arg;
-    // the loader must NOT walk anything for it. Same for spawn_graph,
-    // run, runCommand, finalize, and any future tool whose args don't
-    // include a file path. The whole point of the heuristic is to be
-    // CONSERVATIVE — false positives would emit AGENTS.md on every
-    // bash call, drowning the model.
-    let lua = Lua::new();
-    install_stub_nefor(&lua).expect("install nefor stub");
-    set_package_path(&lua).expect("set package.path");
-
-    let count: i64 = lua
-        .load(
-            r#"
-            local d = require("tool-gate.agents_md")
-            d._reset()
-            local emitted = {}
-            local n = d.emit_for_tool_call("chat-1", "bash",
-              { command = "echo hi" },
-              function(body) emitted[#emitted + 1] = body end)
-            return n
-            "#,
-        )
-        .eval()
-        .expect("eval");
-
-    assert_eq!(count, 0, "bash must trigger no AGENTS.md emission");
-}
-
-#[test]
-fn emit_for_tool_call_skips_empty_agents_md() {
-    // Empty AGENTS.md would just push the marker line into context —
-    // pure noise without any guidance. Skip silently.
-    let tempdir = tempfile::tempdir().expect("tempdir");
-    let dir = tempdir.path().join("emptyrules");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(dir.join("AGENTS.md"), "").expect("write empty");
-    let touched = dir.join("a.txt");
-
-    let lua = Lua::new();
-    install_stub_nefor(&lua).expect("install nefor stub");
-    set_package_path(&lua).expect("set package.path");
-
-    let count: i64 = lua
-        .load(format!(
-            r#"
-            local d = require("tool-gate.agents_md")
-            d._reset()
-            local emitted = {{}}
-            local n = d.emit_for_tool_call("chat-2", "read_file",
-              {{ path = "{p}" }},
-              function(body) emitted[#emitted + 1] = body end)
-            return n
-            "#,
-            p = touched.display(),
-        ))
-        .eval()
-        .expect("eval");
-
-    // The empty AGENTS.md in our tempdir is skipped. (The walk may
-    // still hit ancestor AGENTS.md in the test runner's tree — we
-    // bound the assertion to "the tempdir's empty file didn't push a
-    // marker": count is a coarse signal, but with the tempdir the
-    // dominant case is 0.)
-    assert!(
-        count == 0 || count >= 1,
-        "empty AGENTS.md must not push noise; ancestor walks may still emit: count={count}"
-    );
-    // Stronger: regardless of count, no emitted envelope should have a
-    // text body that's just the marker (i.e. ends in "not a user
-    // request.]\n\n" with nothing after).
+    assert_eq!(status, "read");
 }
 
 // ----------------------------------------------------------------
@@ -846,14 +712,12 @@ fn emit_for_tool_call_skips_empty_agents_md() {
 // ----------------------------------------------------------------
 
 #[test]
-fn tool_gate_wrapper_emits_agents_md_on_outbound_path_touching_invoke() {
-    // The wrapper hook in starter/tool-gate/init.lua: on each outbound
-    // `tool-gate.tool.invoke` for a path-touching tool, walk up from
-    // the touched file's dir and emit `chat.message.append` envelopes
-    // for any AGENTS.md not yet loaded in this chat. Drives the
-    // wrapper's `to_plugin` callback directly with two tool.invoke
-    // envelopes — one for read_file (path-touching, must trigger
-    // emission), one for bash (no path arg, must NOT trigger).
+fn tool_gate_wrapper_emits_instruction_reminder_on_outbound_folder_touching_invoke() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // The wrapper records private context metadata from tools.advertise,
+    // then uses it to derive folders for outbound tool.invoke calls. The
+    // emitted reminder lists instruction files only; it does not include
+    // their contents.
     let tempdir = tempfile::tempdir().expect("tempdir");
     let dir = tempdir.path().join("proj");
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -872,11 +736,18 @@ fn tool_gate_wrapper_emits_agents_md_on_outbound_path_touching_invoke() {
         local tools = require("compositors.tools")
         local spec = tools.gate_spec("tool-gate", {{ "fake-binary" }}, {{ agentic_loop = require("agentic-loop") }})
         spec.to_plugin({{
-            -- Path-touching: must trigger AGENTS.md emission.
+            -- Private advertisement teaches the wrapper how to derive folders.
+            {{ type = "event", from = "basic-tools",
+              body = {{ kind = "tool-gate.tools.advertise", source = "basic-tools",
+                       tools = {{
+                         {{ name = "read_file", description = "", parameters = {{}},
+                            context = {{ folders = {{ {{ from = "file_path", arg = "path" }} }} }} }},
+                       }} }} }},
+            -- Folder-touching: must trigger instruction reminder.
             {{ type = "event", from = "agentic-loop",
               body = {{ kind = "tool-gate.tool.invoke", id = "call-1",
                        name = "read_file", args = {{ path = "{p}" }} }} }},
-            -- Non-path-touching: must NOT trigger any emission.
+            -- No instruction files under cwd in this test, so this contributes no reminder.
             {{ type = "event", from = "agentic-loop",
               body = {{ kind = "tool-gate.tool.invoke", id = "call-2",
                        name = "bash", args = {{ command = "echo hi" }} }} }},
@@ -904,7 +775,7 @@ fn tool_gate_wrapper_emits_agents_md_on_outbound_path_touching_invoke() {
         .map(|i| deliver_trace.get::<String>(i).expect("entry"))
         .collect();
 
-    // Both tool.invoke envelopes must have been forwarded to the
+    // Both tool.invoke envelopes and the advertise envelope must have been forwarded to the
     // binary (the loader is additive, never blocks the underlying
     // call).
     let invoke_count = delivered
@@ -917,26 +788,34 @@ fn tool_gate_wrapper_emits_agents_md_on_outbound_path_touching_invoke() {
     );
 
     // Among the engine.send-published envelopes, exactly one must be
-    // the AGENTS.md marker for the project dir. The bash call
-    // contributed zero AGENTS.md publications.
+    // the instruction reminder for the project dir. The bash call
+    // contributed no project reminder.
     let agents_envelopes: Vec<&String> = sent
         .iter()
-        .filter(|p| p.contains("chat.message.append") && p.contains("PROJECT-MARKER-RULES"))
+        .filter(|p| {
+            p.contains("chat.message.append")
+                && p.contains("AGENTS.md")
+                && p.contains(&dir.display().to_string())
+        })
         .collect();
     assert_eq!(
         agents_envelopes.len(),
         1,
-        "expected exactly one AGENTS.md emission carrying PROJECT-MARKER-RULES; got {} in {sent:?}",
+        "expected exactly one instruction reminder carrying AGENTS.md; got {} in {sent:?}",
         agents_envelopes.len()
     );
     let agents_payload = agents_envelopes[0];
     assert!(
         agents_payload.contains("\"role\":\"system\""),
-        "AGENTS.md envelope must carry role=system: {agents_payload}"
+        "instruction reminder must carry role=system: {agents_payload}"
     );
     assert!(
-        agents_payload.contains("not a user request"),
-        "AGENTS.md envelope must carry the load-bearing marker: {agents_payload}"
+        agents_payload.contains("Contents are not loaded automatically"),
+        "instruction reminder must be low-authority: {agents_payload}"
+    );
+    assert!(
+        !agents_payload.contains("PROJECT-MARKER-RULES"),
+        "instruction reminder must not include file contents: {agents_payload}"
     );
     let dir_str = dir.display().to_string();
     assert!(
@@ -1152,6 +1031,53 @@ fn read_only_search_text_rejects_unsupported_args() {
     assert!(
         payload.contains("unsupported arg"),
         "invalid arg should surface as tool.result error: {payload}"
+    );
+
+    match prev.as_deref() {
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
+    }
+}
+
+#[test]
+fn read_only_discover_instruction_files_returns_no_found_message() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
+
+    let lua = Lua::new();
+    install_stub_nefor_with_send_recorder(&lua).expect("stub");
+    set_package_path(&lua).expect("set package.path");
+
+    let empty = tempdir.path().join("empty");
+    std::fs::create_dir_all(&empty).expect("mkdir");
+    let payload: String = lua
+        .load(format!(
+            r#"
+            local actor = require("read-only-tools")
+            actor.receive_msg({{
+              origin = "agent",
+              payload = nefor.json.encode({{
+                type = "event",
+                body = {{
+                  kind = "read-only-tools.tool.invoke",
+                  id = "discover-empty",
+                  name = "discover_instruction_files",
+                  args = {{ path = "{empty}", scope = "subfolders" }},
+                }},
+              }}),
+            }})
+            return _send_trace[1]
+            "#,
+            empty = empty.display(),
+        ))
+        .eval()
+        .expect("run discover");
+
+    assert!(
+        payload.contains("No instruction files found"),
+        "explicit discovery should answer empty results: {payload}"
     );
 
     match prev.as_deref() {

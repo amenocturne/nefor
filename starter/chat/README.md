@@ -244,6 +244,23 @@ The contract is producer-agnostic the same way `chat.*` is: any future tool-prov
 
 Broadcast by tool-providing plugins immediately after their `ready_ok` handshake completes, before any invokes can land. `parameters` is JSON Schema in OpenAI tool-call format directly — that keeps the provider's mapping into the API's `tools` array trivial (one passthrough, no shape-shifting).
 
+Private advertisements sent to `tool-gate.tools.advertise` may include internal metadata that is not part of public `tool.register`, for example:
+
+```json
+{
+  "name": "read_file",
+  "description": "...",
+  "parameters": { "type": "object" },
+  "context": {
+    "folders": [
+      { "from": "file_path", "arg": "path", "cwd_arg": "cwd" }
+    ]
+  }
+}
+```
+
+The gate wrapper consumes `context.folders` before forwarding invokes so runtime hooks can know which folders a tool call touched without parsing tool-specific arguments. The public registry strips this field before providers see the tool list.
+
 `tool.register` is broadcast (no plugin-name prefix on the kind) so every consumer — the provider's catalog builder, debug listeners, future logging plugins — sees it. Multiple tool-providing plugins may each emit their own `tool.register`; consumers union the catalogs. Tool names are global across the bus: if two plugins register the same `name`, behaviour is "last register wins" at the consumer's catalog layer (consumers MAY warn). This v1 mirrors how OpenAI's API itself flattens names — fixing it requires either disambiguation in the provider's `tool_call_id` mapping or a `qualified_name` field, both deferred until a clash actually shows up.
 
 ### `<plugin>.tool.invoke` (caller → tool plugin)

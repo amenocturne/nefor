@@ -858,7 +858,7 @@ fn maybe_dump_output_ignores_bodies_without_string_id() {
 }
 
 // ----------------------------------------------------------------
-// agents_md_emit_for_invoke — translation + side-effect bridge
+// agents_md_emit_for_invoke — instruction reminder bridge
 // ----------------------------------------------------------------
 
 #[test]
@@ -894,7 +894,7 @@ fn agents_md_emit_for_invoke_no_ops_on_non_outbound_invoke_envelopes() {
 }
 
 #[test]
-fn agents_md_emit_for_invoke_emits_for_path_touching_outbound_invoke() {
+fn agents_md_emit_for_invoke_emits_for_folder_touching_outbound_invoke() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let dir = tempdir.path().join("proj");
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -910,7 +910,14 @@ fn agents_md_emit_for_invoke_emits_for_path_touching_outbound_invoke() {
             r#"
             local lib = require("tool-gate")
             local t = lib.translator("tool-gate")
-            require("tool-gate.agents_md")._reset()
+            local agents_md = require("tool-gate.agents_md")
+            agents_md._reset()
+            agents_md.record_tool_contexts_from_advertise({{
+              tools = {{
+                {{ name = "read_file",
+                   context = {{ folders = {{ {{ from = "file_path", arg = "path" }} }} }} }}
+              }}
+            }})
             local emitted = {{}}
             local n = lib.agents_md_emit_for_invoke(
               t,
@@ -931,7 +938,7 @@ fn agents_md_emit_for_invoke_emits_for_path_touching_outbound_invoke() {
     let n: i64 = result.get("n").expect("n");
     let emitted: Table = result.get("emitted").expect("emitted");
     let emitted_len: i64 = emitted.len().expect("len");
-    assert!(n >= 1, "must emit at least the project AGENTS.md");
+    assert_eq!(n, 1, "must emit one reminder for the project scope");
     assert_eq!(emitted_len, n);
 
     // Each emitted body is a chat.message.append { role = system }.
@@ -941,12 +948,17 @@ fn agents_md_emit_for_invoke_emits_for_path_touching_outbound_invoke() {
     let text: String = first.get("text").expect("text");
     assert_eq!(kind, "chat.message.append");
     assert_eq!(role, "system");
-    assert!(text.contains("not a user request"));
+    assert!(text.contains("Local instruction files available"));
+    assert!(text.contains("AGENTS.md"));
+    assert!(
+        !text.contains("PROJ-RULES"),
+        "reminder must not include instruction contents: {text}"
+    );
 }
 
 #[test]
 fn agents_md_emit_for_invoke_swallows_underlying_errors_returns_zero() {
-    // pcall-guard contract: a bug in `agents_md.emit_for_tool_call`
+    // pcall-guard contract: a bug in `agents_md.remind_for_tool_call`
     // must not crash the wrapper. We monkey-patch the lib to error,
     // then verify the helper returns 0 instead of propagating.
     let lua = Lua::new();
@@ -960,8 +972,8 @@ fn agents_md_emit_for_invoke_swallows_underlying_errors_returns_zero() {
             local t = lib.translator("tool-gate")
             local agents_md = require("tool-gate.agents_md")
             agents_md._reset()
-            local prev = agents_md.emit_for_tool_call
-            agents_md.emit_for_tool_call = function() error("boom") end
+            local prev = agents_md.remind_for_tool_call
+            agents_md.remind_for_tool_call = function() error("boom") end
 
             local n = lib.agents_md_emit_for_invoke(
               t,
@@ -973,7 +985,7 @@ fn agents_md_emit_for_invoke_swallows_underlying_errors_returns_zero() {
               function(_) end
             )
 
-            agents_md.emit_for_tool_call = prev
+            agents_md.remind_for_tool_call = prev
             return n
             "#,
         )

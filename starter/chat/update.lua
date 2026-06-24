@@ -545,8 +545,30 @@ local function handle_message_append(msg, state)
   end
   local turn_state = {}
 
-  -- AGENTS.md auto-load routing.
+  -- Instruction-file reminder routing.
   if role == "system" then
+    local path = msg.path
+    local dir = msg.dir or path
+    if type(path) == "string" and #path > 0
+        and text:match("^Local instruction files available") then
+      local mc = msg.chat_id
+      if type(mc) == "string" and #mc > 0 then
+        local binding = state.chat_id_to_node and state.chat_id_to_node[mc]
+        if binding then
+          local now = tui.now_ms()
+          local synth = "instruction files(" .. path .. ")"
+          return shallow_merge(
+            dag.node_tool_invoked(state, binding.run_id, binding.node_id, synth, nil, now),
+            turn_state
+          ), {}
+        end
+        return shallow_merge(state, turn_state), {}
+      end
+      return transcript.push_entry(shallow_merge(state, turn_state),
+        Entry.agents_md(path, dir, text)
+      ), {}
+    end
+
     local path, dir = text:match(
       "^%[Loaded (.-) because tool call touched a file in (.-)%. This is project guidance for that directory, not a user request%.%]")
     if path and dir then

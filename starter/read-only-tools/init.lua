@@ -21,6 +21,7 @@ local envelope = require("core.envelope")
 local event    = require("core.event")
 local emit_as  = envelope.emit_as
 local output_dump = require("tool-gate.tool_output_dump")
+local instruction_files = require("libs.instruction-files")
 
 local SOURCE_NAME = "read-only-tools"
 
@@ -224,10 +225,26 @@ local function tool_python_read(firing_id, _args)
     "uv, pip, or pytest through Bash for analysis.")
 end
 
+local function tool_discover_instruction_files(firing_id, args)
+  args = args or {}
+  local path = type(args.path) == "string" and args.path or "."
+  local scope = args.scope == "subfolders" and "subfolders" or "auto"
+  local unread_only = args.unread_only == true
+  local result = instruction_files.discover(path, {
+    scope = scope,
+    unread_only = unread_only,
+  })
+  emit_ok(firing_id, instruction_files.format_discovery(result), {
+    tool = "discover_instruction_files",
+    args = args,
+  })
+end
+
 local TOOL_HANDLERS = {
-  list_dir        = tool_list_dir,
-  search_text     = tool_search_text,
-  ["python-read"] = tool_python_read,
+  list_dir                   = tool_list_dir,
+  search_text                = tool_search_text,
+  ["python-read"]            = tool_python_read,
+  discover_instruction_files = tool_discover_instruction_files,
 }
 
 local function handle_tool_invoke(body)
@@ -264,6 +281,11 @@ local function tool_schemas()
                    description = "Directory path. Use '.' for the workspace root." },
         },
         required = { "path" },
+      },
+      context = {
+        folders = {
+          { from = "directory", arg = "path" },
+        },
       },
     },
     {
@@ -307,6 +329,38 @@ local function tool_schemas()
                          description = "Return only matching file paths." },
         },
         required = { "pattern" },
+      },
+      context = {
+        folders = {
+          { from = "path_or_file", arg = "path", default = "." },
+        },
+      },
+    },
+    {
+      name = "discover_instruction_files",
+      description =
+        "List AGENTS.md and CLAUDE.md instruction files available near " ..
+        "a path. Does not read file contents. Use ordinary read_file on " ..
+        "any file that seems relevant.",
+      parameters = {
+        type = "object",
+        properties = {
+          path = {
+            type = "string",
+            description = "Directory or file path to inspect. Defaults to '.'.",
+          },
+          scope = {
+            type = "string",
+            enum = { "auto", "subfolders" },
+            description =
+              "auto: git repo when inside one, otherwise subfolders. " ..
+              "subfolders: only below path.",
+          },
+          unread_only = {
+            type = "boolean",
+            description = "Only show instruction files not read this session.",
+          },
+        },
       },
     },
   }

@@ -352,16 +352,13 @@ local function render_plan_entry(entry)
   )
 end
 
--- AGENTS.md auto-load: tool-gate emits a system message when a path-
--- touching tool call lands in a directory with an AGENTS.md. The text
--- carries project guidance for the model but is noisy in the chat
--- surface — render it as a foldable block keyed on the path (parallels
--- the tool_call collapsed/expanded shape).
+-- Instruction-file reminders are useful model context but noisy in the
+-- chat surface; render them as foldable blocks keyed on the path.
 local function agents_md_collapsed(entry)
-  local path = entry.path or "AGENTS.md"
+  local path = entry.path or "instructions"
   return tui.column { gap = 0, children = {
     tui.text {
-      content = "▸ AGENTS.md(" .. path .. ")",
+      content = "▸ instructions(" .. path .. ")",
       style   = STYLE.footer,
       wrap    = "none",
     },
@@ -369,9 +366,9 @@ local function agents_md_collapsed(entry)
 end
 
 local function agents_md_expanded(entry)
-  local path = entry.path or "AGENTS.md"
+  local path = entry.path or "instructions"
   local rows = { tui.text {
-    content = "▼ AGENTS.md(" .. path .. ")",
+    content = "▼ instructions(" .. path .. ")",
     style   = STYLE.footer,
     wrap    = "none",
   } }

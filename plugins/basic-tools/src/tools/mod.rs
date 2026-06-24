@@ -1,12 +1,14 @@
 //! Tool registry for basic-tools.
 //!
 //! One module per tool. Each tool is a small struct (or zero-sized type)
-//! with three pieces:
+//! with four pieces:
 //!
 //! - `NAME` — the wire name advertised in `tool.register` and matched in
 //!   `tool.invoke`.
 //! - `schema()` — JSON Schema (OpenAI tool-call shape) for the tool's
 //!   parameters; included in `tool.register`.
+//! - `context()` — internal metadata consumed by wrappers. It is not part
+//!   of the model-facing schema.
 //! - `run(args)` — the implementation. Async because future tools (bash)
 //!   will be inherently async; read_file fits naturally here too via
 //!   `tokio::fs`.
@@ -16,7 +18,7 @@
 //! [`crate::error::ToolError`]; the dispatcher folds them into
 //! `tool.result { error }` envelopes.
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::error::ToolError;
 
@@ -36,6 +38,32 @@ pub struct ToolDescriptor {
     pub description: &'static str,
     /// JSON Schema for the tool's parameters (OpenAI tool-call format).
     pub schema: fn() -> Value,
+    /// Internal context metadata for runtime hooks.
+    pub context: fn() -> Value,
+}
+
+fn file_path_context() -> Value {
+    json!({
+        "folders": [
+            { "from": "file_path", "arg": "path", "cwd_arg": "cwd" }
+        ]
+    })
+}
+
+fn path_or_file_context() -> Value {
+    json!({
+        "folders": [
+            { "from": "path_or_file", "arg": "path", "cwd_arg": "cwd", "default": "." }
+        ]
+    })
+}
+
+fn cwd_context() -> Value {
+    json!({
+        "folders": [
+            { "from": "cwd", "arg": "cwd", "default": "." }
+        ]
+    })
 }
 
 /// Static catalog of every tool this plugin exposes. The dispatch layer
@@ -46,31 +74,37 @@ pub const TOOLS: &[ToolDescriptor] = &[
         name: read_file::NAME,
         description: read_file::DESCRIPTION,
         schema: read_file::schema,
+        context: file_path_context,
     },
     ToolDescriptor {
         name: read_image::NAME,
         description: read_image::DESCRIPTION,
         schema: read_image::schema,
+        context: file_path_context,
     },
     ToolDescriptor {
         name: write_file::NAME,
         description: write_file::DESCRIPTION,
         schema: write_file::schema,
+        context: file_path_context,
     },
     ToolDescriptor {
         name: edit_file::NAME,
         description: edit_file::DESCRIPTION,
         schema: edit_file::schema,
+        context: file_path_context,
     },
     ToolDescriptor {
         name: bash::NAME,
         description: bash::DESCRIPTION,
         schema: bash::schema,
+        context: cwd_context,
     },
     ToolDescriptor {
         name: search_text::NAME,
         description: search_text::DESCRIPTION,
         schema: search_text::schema,
+        context: path_or_file_context,
     },
 ];
 

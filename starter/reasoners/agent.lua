@@ -405,8 +405,8 @@ local function handle(body)
   chat_to_firing[chat_id] = firing_id
 
   -- Bind chat_id ↔ (run_id, node_id) for the chat surface. Sub-agent
-  -- emissions that ride on chat_id (notably the AGENTS.md auto-load
-  -- system message from tool-gate) are routed by the chat reducer to
+  -- emissions that ride on chat_id (notably instruction-file reminders
+  -- from tool-gate) are routed by the chat reducer to
   -- the matching DAG node's "last tool" slot rather than the main
   -- transcript. Without this binding the chat surface has no way to
   -- know whether a chat_id refers to the lead's chat (render) or a

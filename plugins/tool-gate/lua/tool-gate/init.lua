@@ -1,5 +1,5 @@
 -- Plugin lib for the tool-gate binary. Translation primitives + two
--- side-effect bridges (huge-output dump-to-file, AGENTS.md emission).
+-- side-effect bridges (huge-output dump-to-file, instruction reminders).
 
 local envelope         = require("core.envelope")
 local spawn_graph      = require("libs.spawn-graph")
@@ -214,11 +214,31 @@ function M.tool_result_payload(body)
   return payload_output, err_bool
 end
 
--- AGENTS.md side-effect bridge: on a path-touching outbound tool.invoke,
--- walk the touched file's ancestor dirs and emit a system message for
--- each unloaded AGENTS.md. Dedup state lives in tool-gate.agents_md
--- (keyed by chat_id). pcall-guarded so a transient filesystem failure
--- doesn't crash the caller; returns the count emitted (0 on no-op or
+-- Record internal context metadata from private tools.advertise bodies.
+-- The model-facing tool.register strips this field; wrappers use it to
+-- derive normalized tool-call locality without knowing per-tool args.
+---@param body table|nil
+---@return integer count
+function M.record_tool_contexts_from_advertise(body)
+  local ok, count_or_err = pcall(
+    agents_md.record_tool_contexts_from_advertise,
+    body
+  )
+  if not ok then
+    nefor.log.warn("tool-gate: context advertise parse errored", {
+      error = tostring(count_or_err),
+    })
+    return 0
+  end
+  return count_or_err
+end
+
+-- Instruction reminder side-effect bridge: on a folder-touching outbound
+-- tool.invoke, emit a low-authority reminder listing available instruction
+-- files. Contents are not loaded. Discovery primitives live in
+-- libs.instruction-files; tool-gate.agents_md keeps this bridge's state
+-- behind the historical import path. pcall-guarded so a transient filesystem
+-- failure doesn't crash the caller; returns the count emitted (0 on no-op or
 -- failure).
 ---@param translator table
 ---@param env table
@@ -229,11 +249,11 @@ function M.agents_md_emit_for_invoke(translator, env, chat_id, emitter)
   if not translator.is_outbound_tool_invoke(env) then return 0 end
   local body = env.body
   local ok, count_or_err = pcall(
-    agents_md.emit_for_tool_call,
+    agents_md.remind_for_tool_call,
     chat_id, body.name, body.args, emitter
   )
   if not ok then
-    nefor.log.warn("tool-gate: agents_md.emit_for_tool_call errored", {
+    nefor.log.warn("tool-gate: agents_md.remind_for_tool_call errored", {
       tool = body.name, error = tostring(count_or_err),
     })
     return 0
