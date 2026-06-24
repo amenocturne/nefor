@@ -199,6 +199,8 @@ function M.tool_result_payload(body)
   local payload_output
   if type(body.output) == "string" then
     payload_output = tool_output_dump.image_media_summary(body.output) or body.output
+  elseif type(body.output) == "table" and type(body.output.text) == "string" then
+    payload_output = body.output.text
   elseif type(body.output) == "table"
       and body.output.type == "media"
       and type(body.output.media_type) == "string"

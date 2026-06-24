@@ -519,6 +519,32 @@ fn tool_result_payload_passes_through_normal_output() {
 }
 
 #[test]
+fn tool_result_payload_extracts_text_table_output() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("nefor stub");
+    set_package_path(&lua).expect("package.path");
+
+    let result: Table = lua
+        .load(
+            r#"
+            local lib = require("tool-gate")
+            local out, err = lib.tool_result_payload({
+              kind = "tool.result", id = "x",
+              output = { text = "hello from a read-only tool" },
+            })
+            return { out = out, err = err }
+            "#,
+        )
+        .eval()
+        .expect("eval");
+
+    let out: String = result.get("out").expect("out");
+    let err: bool = result.get("err").expect("err");
+    assert_eq!(out, "hello from a read-only tool");
+    assert!(!err);
+}
+
+#[test]
 fn tool_result_payload_lifts_error_string_into_output_when_output_missing() {
     // Mirrors the bug fix in starter_tool_gate that drove the lift:
     // a denied tool comes back with { error = "denied by gate policy" }
