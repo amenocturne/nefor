@@ -22,6 +22,7 @@ pub const DESCRIPTION: &str = "Search for a regex pattern in files under a path 
 
 const DEFAULT_MAX_RESULTS: usize = 200;
 const MAX_MAX_RESULTS: usize = 2000;
+const MAX_RESULT_LINE_BYTES: usize = 4 * 1024;
 
 pub fn schema() -> Value {
     json!({
@@ -349,8 +350,7 @@ impl Sink for MatchSink<'_> {
             return Ok(false);
         }
         let line_num = mat.line_number().unwrap_or(0);
-        let content = String::from_utf8_lossy(mat.bytes());
-        let content = content.trim_end();
+        let content = bounded_line_preview(mat.bytes());
         self.results
             .push(format!("{}:{}:{}", self.path, line_num, content));
         Ok(!self.at_limit())
@@ -361,8 +361,7 @@ impl Sink for MatchSink<'_> {
             return Ok(false);
         }
         let line_num = ctx.line_number().unwrap_or(0);
-        let content = String::from_utf8_lossy(ctx.bytes());
-        let content = content.trim_end();
+        let content = bounded_line_preview(ctx.bytes());
         let sep = match ctx.kind() {
             &SinkContextKind::Before | &SinkContextKind::After => "-",
             _ => "-",
@@ -379,6 +378,39 @@ impl Sink for MatchSink<'_> {
         self.results.push("--".into());
         Ok(true)
     }
+}
+
+fn bounded_line_preview(bytes: &[u8]) -> String {
+    let bytes = trim_line_end(bytes);
+    if bytes.len() <= MAX_RESULT_LINE_BYTES {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+
+    let mut end = MAX_RESULT_LINE_BYTES;
+    while end > 0 && !is_utf8_boundary_byte(bytes[end]) {
+        end -= 1;
+    }
+    if end == 0 {
+        end = MAX_RESULT_LINE_BYTES;
+    }
+
+    let preview = String::from_utf8_lossy(&bytes[..end]);
+    format!(
+        "{}[... search_text line truncated: {} bytes omitted from this matching line]",
+        preview,
+        bytes.len().saturating_sub(end)
+    )
+}
+
+fn trim_line_end(mut bytes: &[u8]) -> &[u8] {
+    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+fn is_utf8_boundary_byte(byte: u8) -> bool {
+    (byte & 0b1100_0000) != 0b1000_0000
 }
 
 #[cfg(test)]
@@ -525,6 +557,28 @@ mod tests {
         let match_lines: Vec<&str> = out.lines().filter(|l| !l.starts_with("[...")).collect();
         assert!(match_lines.len() <= 2);
         assert!(out.contains("[...truncated"));
+    }
+
+    #[tokio::test]
+    async fn huge_matching_line_is_previewed() {
+        let dir = TempDir::new().unwrap();
+        let huge_line = format!("prefix-needle-{}\n", "x".repeat(MAX_RESULT_LINE_BYTES * 4));
+        fs::write(dir.path().join("session.jsonl"), huge_line).unwrap();
+
+        let out = run(&json!({
+            "pattern": "needle",
+            "path": dir.path().to_str().unwrap()
+        }))
+        .await
+        .unwrap();
+
+        assert!(
+            out.len() < MAX_RESULT_LINE_BYTES * 2,
+            "search_text should not return the whole huge matching line; got {} bytes",
+            out.len()
+        );
+        assert!(out.contains("prefix-needle-"));
+        assert!(out.contains("search_text line truncated"));
     }
 
     #[tokio::test]
