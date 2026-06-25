@@ -1,0 +1,22 @@
+[package]
+name = "nefor-mag"
+description = "MAG (Meta-Algebraic Grammar) — typed graph description language for composing reasoner workflows"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "mag"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
+sha2 = "0.10"
+
+[dev-dependencies]
+pretty_assertions = "1"
