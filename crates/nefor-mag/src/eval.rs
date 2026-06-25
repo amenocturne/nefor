@@ -679,9 +679,9 @@ fn eval_graph(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
     // Track which node IDs we've seen (for deduplication)
     let mut seen_node_ids = std::collections::HashSet::new();
 
-    let mut add_node = |node: &NodeValue,
-                        nodes: &mut Vec<NodeValue>,
-                        seen: &mut std::collections::HashSet<String>| {
+    let add_node = |node: &NodeValue,
+                    nodes: &mut Vec<NodeValue>,
+                    seen: &mut std::collections::HashSet<String>| {
         if seen.insert(node.id.clone()) {
             nodes.push(node.clone());
         }
