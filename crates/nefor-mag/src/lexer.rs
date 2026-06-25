@@ -73,7 +73,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, MagError> {
                 if chars.peek() == Some(&'>') {
                     chars.next();
                     tokens.push(Token::Arrow);
-                } else if chars.peek().map_or(false, |c| c.is_ascii_digit()) {
+                } else if chars.peek().is_some_and(|c| c.is_ascii_digit()) {
                     // negative number
                     let num = read_number(&mut chars, true);
                     tokens.push(num);
@@ -96,7 +96,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, MagError> {
             // colon: keyword or bare colon
             ':' => {
                 chars.next();
-                if chars.peek().map_or(false, |c| is_symbol_start(*c)) {
+                if chars.peek().is_some_and(|c| is_symbol_start(*c)) {
                     let name = read_symbol_chars(&mut chars);
                     tokens.push(Token::Keyword(name));
                 } else {

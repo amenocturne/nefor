@@ -2,32 +2,53 @@ use crate::ast::{GraphValue, NodeValue, Value};
 use crate::types::MagType;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphIr {
+    pub terminal: String,
     pub nodes: Vec<NodeIr>,
     pub edges: Vec<EdgeIr>,
-    pub terminals: Vec<String>,
     pub hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeIr {
     pub id: String,
-    #[serde(rename = "type")]
-    pub node_type: String,
+    pub reasoner: String,
     pub args: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fanout: Option<FanoutIr>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FanoutIr {
     #[serde(rename = "in")]
-    pub input_type: String,
-    #[serde(rename = "out")]
-    pub output_type: String,
+    pub input: String,
+    pub out: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgeIr {
     pub from: String,
     pub to: String,
+    #[serde(rename = "type")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge_type: Option<String>,
+}
+
+fn qualify_type(ty: &MagType) -> String {
+    match ty {
+        MagType::Named(name) => format!("mag.{name}"),
+        MagType::Var(name) => format!("mag.{name}"),
+        MagType::Union(types) => {
+            let parts: Vec<_> = types.iter().map(qualify_type).collect();
+            parts.join("|")
+        }
+        MagType::Intersection(types) => {
+            let parts: Vec<_> = types.iter().map(qualify_type).collect();
+            parts.join("+")
+        }
+    }
 }
 
 fn value_to_json(val: &Value) -> serde_json::Value {
@@ -60,12 +81,36 @@ fn node_to_ir(node: &NodeValue) -> NodeIr {
         .map(|(k, v)| (k.clone(), value_to_json(v)))
         .collect();
 
+    let fanout = match &node.output_type {
+        MagType::Union(variants) => Some(FanoutIr {
+            input: qualify_type(&node.input_type),
+            out: variants.iter().map(qualify_type).collect(),
+        }),
+        _ => None,
+    };
+
     NodeIr {
         id: node.id.clone(),
-        node_type: node.node_type.clone(),
+        reasoner: node.node_type.clone(),
         args: serde_json::Value::Object(args),
-        input_type: node.input_type.to_string(),
-        output_type: node.output_type.to_string(),
+        fanout,
+    }
+}
+
+fn compute_edge_type(graph: &GraphValue, from: &str, to: &str) -> Option<String> {
+    let from_node = graph.nodes.iter().find(|n| n.id == from)?;
+    let to_node = graph.nodes.iter().find(|n| n.id == to)?;
+
+    match &from_node.output_type {
+        MagType::Union(variants) => {
+            for variant in variants {
+                if to_node.input_type.accepts(variant) {
+                    return Some(qualify_type(variant));
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -76,20 +121,21 @@ pub fn normalize(graph: GraphValue) -> GraphIr {
     let mut edges: Vec<EdgeIr> = graph
         .edges
         .iter()
-        .map(|e| EdgeIr {
-            from: e.from.clone(),
-            to: e.to.clone(),
+        .map(|e| {
+            let edge_type = compute_edge_type(&graph, &e.from, &e.to);
+            EdgeIr {
+                from: e.from.clone(),
+                to: e.to.clone(),
+                edge_type,
+            }
         })
         .collect();
     edges.sort_by(|a, b| (&a.from, &a.to).cmp(&(&b.from, &b.to)));
 
-    let mut terminals = graph.terminals.clone();
-    terminals.sort();
-
     let canonical = serde_json::json!({
+        "terminal": &graph.terminal,
         "nodes": nodes,
         "edges": edges,
-        "terminals": terminals,
     });
     let hash = {
         let mut hasher = Sha256::new();
@@ -98,9 +144,9 @@ pub fn normalize(graph: GraphValue) -> GraphIr {
     };
 
     GraphIr {
+        terminal: graph.terminal,
         nodes,
         edges,
-        terminals,
         hash,
     }
 }

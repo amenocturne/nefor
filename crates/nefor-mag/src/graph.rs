@@ -55,23 +55,22 @@ fn reverse_adjacency(graph: &GraphValue) -> HashMap<&str, Vec<&str>> {
     rev
 }
 
-// 1. At least one terminal declared
+// 1. Terminal declared
 fn validate_has_terminals(graph: &GraphValue) -> Result<(), MagError> {
-    if graph.terminals.is_empty() {
+    if graph.terminal.is_empty() {
         return Err(MagError::NoTerminal);
     }
     Ok(())
 }
 
-// 2. Each terminal references an actual node
+// 2. Terminal references an actual node
 fn validate_terminals_exist(graph: &GraphValue) -> Result<(), MagError> {
     let nodes = node_map(graph);
-    for terminal in &graph.terminals {
-        if !nodes.contains_key(terminal.as_str()) {
-            return Err(MagError::Graph(format!(
-                "terminal '{terminal}' does not reference an existing node"
-            )));
-        }
+    if !nodes.contains_key(graph.terminal.as_str()) {
+        return Err(MagError::Graph(format!(
+            "terminal '{}' does not reference an existing node",
+            graph.terminal
+        )));
     }
     Ok(())
 }
@@ -124,20 +123,18 @@ fn validate_connected(graph: &GraphValue) -> Result<(), MagError> {
     Ok(())
 }
 
-// 4. Every node has a path to at least one terminal
+// 4. Every node has a path to the terminal
 fn validate_path_to_terminal(graph: &GraphValue) -> Result<(), MagError> {
     let adj = adjacency(graph);
-    let terminal_set: HashSet<&str> = graph.terminals.iter().map(|s| s.as_str()).collect();
+    let terminal = graph.terminal.as_str();
 
-    // BFS backward from terminals through reverse edges
+    // BFS backward from terminal through reverse edges
     let rev = reverse_adjacency(graph);
     let mut reaches_terminal: HashSet<&str> = HashSet::new();
     let mut queue: VecDeque<&str> = VecDeque::new();
 
-    for &t in &terminal_set {
-        reaches_terminal.insert(t);
-        queue.push_back(t);
-    }
+    reaches_terminal.insert(terminal);
+    queue.push_back(terminal);
 
     while let Some(node) = queue.pop_front() {
         if let Some(preds) = rev.get(node) {
@@ -250,7 +247,7 @@ fn find_cycles_dfs<'a>(
                 let has_loop_counter = cycle.iter().any(|&n| {
                     nodes
                         .get(n)
-                        .map_or(false, |node| node.node_type == "loop-counter")
+                        .is_some_and(|node| node.node_type == "loop-counter")
                 });
 
                 if !has_loop_counter {
@@ -329,7 +326,7 @@ mod tests {
         let graph = GraphValue {
             nodes: vec![],
             edges: vec![],
-            terminals: vec![],
+            terminal: String::new(),
         };
         let val = Value::Graph(graph);
         assert!(extract_graph(val).is_ok());
@@ -348,7 +345,7 @@ mod tests {
                 make_node("b", "check", MagType::named("B"), MagType::named("C")),
             ],
             edges: vec![make_edge("a", "b")],
-            terminals: vec!["b".into()],
+            terminal: "b".into(),
         };
         assert!(validate(&graph).is_ok());
     }
@@ -363,7 +360,7 @@ mod tests {
                 MagType::named("B"),
             )],
             edges: vec![],
-            terminals: vec![],
+            terminal: String::new(),
         };
         assert!(matches!(validate(&graph), Err(MagError::NoTerminal)));
     }
@@ -378,7 +375,7 @@ mod tests {
                 MagType::named("B"),
             )],
             edges: vec![],
-            terminals: vec!["missing".into()],
+            terminal: "missing".into(),
         };
         assert!(validate(&graph).is_err());
     }
@@ -392,7 +389,7 @@ mod tests {
                 make_node("c", "isolated", MagType::named("X"), MagType::named("Y")),
             ],
             edges: vec![make_edge("a", "b")],
-            terminals: vec!["b".into()],
+            terminal: "b".into(),
         };
         let err = validate(&graph).unwrap_err();
         // "c" is disconnected (not connected to the main component)
@@ -414,7 +411,7 @@ mod tests {
                 make_node("c", "output", MagType::named("C"), MagType::named("D")),
             ],
             edges: vec![make_edge("a", "b")],
-            terminals: vec!["b".into()],
+            terminal: "b".into(),
         };
         // 'c' is weakly disconnected from a-b
         let err = validate(&graph).unwrap_err();
@@ -435,7 +432,7 @@ mod tests {
                 make_node("b", "handler-x", MagType::named("X"), MagType::named("Out")),
             ],
             edges: vec![make_edge("a", "b")],
-            terminals: vec!["b".into()],
+            terminal: "b".into(),
         };
         let err = validate(&graph).unwrap_err();
         assert!(
@@ -457,9 +454,15 @@ mod tests {
                 ),
                 make_node("b", "handler-x", MagType::named("X"), MagType::named("Out")),
                 make_node("c", "handler-y", MagType::named("Y"), MagType::named("Out")),
+                make_node("sink", "sink", MagType::named("Out"), MagType::named("Out")),
             ],
-            edges: vec![make_edge("a", "b"), make_edge("a", "c")],
-            terminals: vec!["b".into(), "c".into()],
+            edges: vec![
+                make_edge("a", "b"),
+                make_edge("a", "c"),
+                make_edge("b", "sink"),
+                make_edge("c", "sink"),
+            ],
+            terminal: "sink".into(),
         };
         assert!(validate(&graph).is_ok());
     }
@@ -473,7 +476,7 @@ mod tests {
                 make_node("b", "check", MagType::named("B"), MagType::named("A")),
             ],
             edges: vec![make_edge("a", "b"), make_edge("b", "a")],
-            terminals: vec!["b".into()],
+            terminal: "b".into(),
         };
         let err = validate(&graph).unwrap_err();
         assert!(
@@ -501,7 +504,7 @@ mod tests {
                 make_edge("b", "counter"),
                 make_edge("counter", "a"),
             ],
-            terminals: vec!["counter".into()],
+            terminal: "counter".into(),
         };
         assert!(validate(&graph).is_ok());
     }
@@ -514,7 +517,7 @@ mod tests {
                 make_node("b", "check", MagType::named("C"), MagType::named("D")),
             ],
             edges: vec![make_edge("a", "b")],
-            terminals: vec!["b".into()],
+            terminal: "b".into(),
         };
         let err = validate(&graph).unwrap_err();
         assert!(
@@ -532,7 +535,7 @@ mod tests {
                 make_node("b", "check", MagType::var("INPUT"), MagType::named("D")),
             ],
             edges: vec![make_edge("a", "b")],
-            terminals: vec!["b".into()],
+            terminal: "b".into(),
         };
         assert!(validate(&graph).is_ok());
     }
@@ -550,9 +553,15 @@ mod tests {
                 ),
                 make_node("b", "handler-x", MagType::named("X"), MagType::named("Out")),
                 make_node("c", "handler-y", MagType::named("Y"), MagType::named("Out")),
+                make_node("sink", "sink", MagType::named("Out"), MagType::named("Out")),
             ],
-            edges: vec![make_edge("a", "b"), make_edge("a", "c")],
-            terminals: vec!["b".into(), "c".into()],
+            edges: vec![
+                make_edge("a", "b"),
+                make_edge("a", "c"),
+                make_edge("b", "sink"),
+                make_edge("c", "sink"),
+            ],
+            terminal: "sink".into(),
         };
         assert!(validate(&graph).is_ok());
     }

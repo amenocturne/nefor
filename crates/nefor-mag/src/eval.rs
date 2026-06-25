@@ -450,9 +450,14 @@ fn eval_builtin(env: &mut Env, name: &str, args: &[Expr]) -> Result<Value, MagEr
                 .map_err(|e| MagError::Eval(format!("cannot read module {path}: {e}")))?;
             let tokens = crate::lexer::tokenize(&content)?;
             let exprs = crate::parser::parse(&tokens)?;
-            let result = eval_program(env, &exprs);
+            let mut module_env = env.create_module_env();
+            let _last = eval_program(&mut module_env, &exprs)?;
             env.end_loading(&canonical);
-            result
+            let defs = module_env.top_scope_user_defs();
+            let map = defs
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
+            Ok(Value::Map(map))
         }
         other => Err(MagError::Eval(format!("unknown builtin: {other}"))),
     }
@@ -1629,7 +1634,7 @@ mod tests {
     // --- require tests ---
 
     #[test]
-    fn require_loads_defs() {
+    fn require_returns_namespace_map() {
         let dir = std::env::temp_dir().join("mag_test_require_defs");
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(
@@ -1639,44 +1644,57 @@ mod tests {
         .unwrap();
 
         let mut env = Env::new_with_stdlib_and_source_dir(&dir);
-        eval_with_env(
+        let result = eval_with_env(
             &mut env,
             vec![Expr::List(vec![
-                Expr::Symbol("require".into()),
-                Expr::Str("constants".into()),
+                Expr::Symbol("def".into()),
+                Expr::Symbol("c".into()),
+                Expr::List(vec![
+                    Expr::Symbol("require".into()),
+                    Expr::Str("constants".into()),
+                ]),
             ])],
         )
         .unwrap();
 
-        let val = env.lookup("answer").unwrap();
-        assert!(matches!(val, Value::Int(42)));
-        let val = env.lookup("greeting").unwrap();
-        assert!(matches!(val, Value::Str(ref s) if s == "hello"));
+        if let Value::Map(map) = result {
+            assert!(matches!(map.get("answer"), Some(Value::Int(42))));
+            assert!(matches!(map.get("greeting"), Some(Value::Str(ref s)) if s == "hello"));
+        } else {
+            panic!("expected map, got {:?}", result);
+        }
+        // defs do NOT leak into caller's scope
+        assert!(env.lookup("answer").is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn require_returns_last_value() {
+    fn require_captures_all_defs_in_map() {
         let dir = std::env::temp_dir().join("mag_test_require_ret");
         let _ = std::fs::create_dir_all(&dir);
-        std::fs::write(dir.join("last.mag"), "(def x 1)\n99\n").unwrap();
+        std::fs::write(dir.join("multi.mag"), "(def x 1)\n(def y 2)\n").unwrap();
 
         let mut env = Env::new_with_stdlib_and_source_dir(&dir);
         let result = eval_with_env(
             &mut env,
             vec![Expr::List(vec![
                 Expr::Symbol("def".into()),
-                Expr::Symbol("result".into()),
+                Expr::Symbol("m".into()),
                 Expr::List(vec![
                     Expr::Symbol("require".into()),
-                    Expr::Str("last".into()),
+                    Expr::Str("multi".into()),
                 ]),
             ])],
         )
         .unwrap();
 
-        assert!(matches!(result, Value::Int(99)));
+        if let Value::Map(map) = result {
+            assert!(matches!(map.get("x"), Some(Value::Int(1))));
+            assert!(matches!(map.get("y"), Some(Value::Int(2))));
+        } else {
+            panic!("expected map, got {:?}", result);
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1743,20 +1761,27 @@ mod tests {
         .unwrap();
 
         let mut env = Env::new_with_stdlib_and_source_dir(&dir);
-        eval_with_env(
+        let result = eval_with_env(
             &mut env,
             vec![Expr::List(vec![
-                Expr::Symbol("require".into()),
-                Expr::Str("lib/utils".into()),
+                Expr::Symbol("def".into()),
+                Expr::Symbol("u".into()),
+                Expr::List(vec![
+                    Expr::Symbol("require".into()),
+                    Expr::Str("lib/utils".into()),
+                ]),
             ])],
         )
         .unwrap();
 
-        let val = env.lookup("tools").unwrap();
-        if let Value::Vector(items) = val {
-            assert_eq!(items.len(), 2);
+        if let Value::Map(map) = result {
+            if let Some(Value::Vector(items)) = map.get("tools") {
+                assert_eq!(items.len(), 2);
+            } else {
+                panic!("expected tools vector in map, got {:?}", map);
+            }
         } else {
-            panic!("expected vector, got {:?}", val);
+            panic!("expected map, got {:?}", result);
         }
 
         let _ = std::fs::remove_dir_all(&dir);

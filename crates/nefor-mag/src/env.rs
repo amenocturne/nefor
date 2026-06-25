@@ -113,4 +113,31 @@ impl Env {
         }
         result
     }
+
+    pub fn top_scope_user_defs(&self) -> HashMap<String, Value> {
+        let builtins = [
+            "str", "map", "filter", "fold", "concat", "get", "assoc", "keys", "count", "or", "not",
+            "=", "node", "graph", "type", "template", "require",
+        ];
+        self.scopes
+            .last()
+            .map(|scope| {
+                scope
+                    .iter()
+                    .filter(|(k, _)| !builtins.contains(&k.as_str()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn create_module_env(&self) -> Self {
+        let mut env = Self {
+            scopes: vec![HashMap::new()],
+            source_dir: self.source_dir.clone(),
+            loading_modules: self.loading_modules.clone(),
+        };
+        env.define_stdlib();
+        env
+    }
 }

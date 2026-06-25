@@ -120,7 +120,7 @@ pub struct NodeValue {
 pub struct GraphValue {
     pub nodes: Vec<NodeValue>,
     pub edges: Vec<EdgeValue>,
-    pub terminals: Vec<String>,
+    pub terminal: String,
 }
 
 #[derive(Debug, Clone)]
