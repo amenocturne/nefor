@@ -1,0 +1,37 @@
+;; Research synthesis — multi-angle exploration with verification
+;; Three explorers search different angles → synthesize → verify → report
+
+(type Query)
+(type Evidence)
+(type Draft)
+(type Report)
+
+(let [by-code     (node "agent" {:prompt "search GitHub for Rust plugin hot-reload implementations"
+                                 :model "opus"
+                                 :tools ["web/search" "web/fetch"]}
+                    : Query -> Evidence)
+
+      by-docs     (node "agent" {:prompt "search docs and blog posts about Rust dynamic loading"
+                                 :model "opus"
+                                 :tools ["web/search" "web/fetch"]}
+                    : Query -> Evidence)
+
+      by-crates   (node "agent" {:prompt "search crates.io for hot-reload crates, read their docs"
+                                 :model "sonnet"
+                                 :tools ["web/search" "web/fetch"]}
+                    : Query -> Evidence)
+
+      synthesize  (node "llm" {:prompt "synthesize research findings into a structured draft"}
+                    : Evidence -> Draft)
+
+      verify      (node "agent" {:prompt "fact-check claims in this draft against source material"
+                                 :model "opus"
+                                 :tools ["web/fetch"]}
+                    : Draft -> Report)]
+
+  (graph
+    by-code   -> synthesize
+    by-docs   -> synthesize
+    by-crates -> synthesize
+    synthesize -> verify
+    :terminal verify))

@@ -1,0 +1,6 @@
+;; Da policy definitions for per-node bash approval
+
+(def read-only-bash {:allow ["ls" "cat" "grep" "find" "git *"]
+                     :deny ["rm" "mv" "chmod" "sudo"]})
+(def build-bash {:allow ["just *" "cargo *" "npm *" "bun *"]
+                 :deny ["rm -rf" "sudo"]})

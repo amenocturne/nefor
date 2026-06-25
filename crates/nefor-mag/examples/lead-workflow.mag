@@ -1,0 +1,141 @@
+;; Full lead workflow: explore → plan → critique → human approval →
+;; parallel build → compile → test → review
+;; With retry loops on both compile and test failures
+
+(type Task)
+(type Findings)
+(type Summary)
+(type Plan)
+(type Approved)
+(type Rejected)
+(type Patch)
+(type BuildResult)
+(type BuildError)
+(type TestResult)
+(type TestError)
+(type LoopExhausted)
+(type Review)
+
+(let [;; Exploration phase (parallel — no dependencies between them)
+      explore-code   (node "agent" {:prompt "explore existing middleware and auth patterns"
+                                    :model "opus"
+                                    :tools ["fs/read" "grep" "find"]}
+                       : Task -> Findings)
+
+      explore-tests  (node "agent" {:prompt "explore test patterns and coverage gaps"
+                                    :model "opus"
+                                    :tools ["fs/read" "grep" "find"]}
+                       : Task -> Findings)
+
+      ;; Summarize findings (receives from both explorers)
+      summarize      (node "llm" {:prompt "synthesize explorer findings into a coherent picture"}
+                       : Findings -> Summary)
+
+      ;; Planning
+      planner        (node "agent" {:prompt "create detailed implementation plan"
+                                    :model "opus"
+                                    :tools ["fs/read"]}
+                       : Summary -> Plan)
+
+      critic         (node "agent" {:prompt "critique this plan: find gaps, risks, missed edge cases"
+                                    :model "opus"
+                                    :tools ["fs/read"]}
+                       : Plan -> Plan)
+
+      ;; Human approval gate
+      approve        (node "human" {:prompt "Review the implementation plan. Approve or reject?"}
+                       : Plan -> (Approved | Rejected))
+
+      ;; Implementation (parallel builders)
+      build-auth     (node "agent" {:prompt "implement auth middleware"
+                                    :model "opus"
+                                    :tools ["fs/read" "fs/edit" "grep" "shell"]}
+                       : Approved -> Patch)
+
+      build-tests    (node "agent" {:prompt "implement auth tests"
+                                    :model "opus"
+                                    :tools ["fs/read" "fs/edit" "grep" "shell"]}
+                       : Approved -> Patch)
+
+      ;; Compile verification with retry
+      compile        (node "shell" {:cmd "just build"}
+                       : Patch -> (BuildResult | BuildError))
+
+      compile-ctr    (node "loop-counter" {:max 3}
+                       : BuildError -> (BuildError | LoopExhausted))
+
+      fix-build      (node "agent" {:prompt "fix the build errors"
+                                    :model "sonnet"
+                                    :tools ["fs/read" "fs/edit" "shell"]}
+                       : BuildError -> Patch)
+
+      ;; Test verification with retry
+      test           (node "shell" {:cmd "just test"}
+                       : BuildResult -> (TestResult | TestError))
+
+      test-ctr       (node "loop-counter" {:max 3}
+                       : TestError -> (TestError | LoopExhausted))
+
+      fix-test       (node "agent" {:prompt "fix the failing tests"
+                                    :model "sonnet"
+                                    :tools ["fs/read" "fs/edit" "shell"]}
+                       : TestError -> Patch)
+
+      ;; Final review
+      review         (node "agent" {:prompt "review all changes for correctness and style"
+                                    :model "opus"
+                                    :tools ["fs/read" "grep"]}
+                       : TestResult -> Review)
+
+      ;; Failure terminals
+      rejected       (node "llm" {:prompt "plan was rejected by reviewer"}
+                       : Rejected -> Review)
+
+      build-failed   (node "llm" {:prompt "build failed after 3 retry attempts"}
+                       : LoopExhausted -> Review)
+
+      test-failed    (node "llm" {:prompt "tests failed after 3 retry attempts"}
+                       : LoopExhausted -> Review)
+
+      ;; Single sink — all paths converge here
+      out            (node "sink" {} : Review -> Review)]
+
+  (graph
+    ;; Explore in parallel
+    explore-code  -> summarize
+    explore-tests -> summarize
+
+    ;; Plan and critique
+    summarize -> planner
+    planner   -> critic
+    critic    -> approve
+
+    ;; Human gate branches
+    approve -> build-auth
+    approve -> build-tests
+    approve -> rejected
+
+    ;; Both builders feed compile
+    build-auth  -> compile
+    build-tests -> compile
+
+    ;; Compile retry loop
+    compile     -> test
+    compile     -> compile-ctr
+    compile-ctr -> fix-build
+    compile-ctr -> build-failed
+    fix-build   -> compile
+
+    ;; Test retry loop
+    test     -> review
+    test     -> test-ctr
+    test-ctr -> fix-test
+    test-ctr -> test-failed
+    fix-test -> compile
+
+    ;; All paths to sink
+    review       -> out
+    rejected     -> out
+    build-failed -> out
+    test-failed  -> out
+    :terminal out))

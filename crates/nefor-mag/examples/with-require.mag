@@ -1,0 +1,25 @@
+(require "lib/tools")
+(require "lib/policies")
+
+(type Task)
+(type Findings)
+(type Patch)
+
+(let [exp (node "agent" {:prompt "explore the codebase"
+                         :model "opus"
+                         :tools read-tools
+                         :da-policy read-only-bash}
+            : Task -> Findings)
+
+      build (node "agent" {:prompt "implement changes"
+                           :model "opus"
+                           :tools write-tools
+                           :da-policy build-bash}
+              : Findings -> Patch)
+
+      out (node "sink" {} : Patch -> Patch)]
+
+  (graph
+    exp -> build
+    build -> out
+    :terminal out))

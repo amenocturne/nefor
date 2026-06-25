@@ -6,6 +6,10 @@ use std::path::PathBuf;
 struct Cli {
     /// Path to .mag source file
     source: PathBuf,
+
+    /// Directory for template and module resolution
+    #[arg(short = 's', long, default_value = ".")]
+    source_dir: PathBuf,
 }
 
 fn main() {
@@ -18,7 +22,7 @@ fn main() {
         }
     };
 
-    match nefor_mag::compile(&source) {
+    match nefor_mag::compile(&source, &cli.source_dir) {
         Ok(ir) => {
             println!("{}", serde_json::to_string_pretty(&ir).unwrap());
         }

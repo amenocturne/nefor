@@ -1,0 +1,44 @@
+;; The agentic loop — agent as a composition of primitives
+;; This is what stdlib's (agent) would expand to
+;;
+;; The types form a clean cycle:
+;;   Context -> (ToolCalls | FinalAnswer)
+;;   ToolCalls -> ToolHandle -> Context (tool results become context)
+;;   Context feeds back to llm call
+
+(type Context)
+(type ToolCalls)
+(type ToolHandle)
+(type FinalAnswer)
+(type LoopExhausted)
+
+(let [call     (node "llm" {:model "opus"
+                            :system "You are a helpful coding assistant."
+                            :tools ["fs/read" "fs/edit" "grep" "shell"]}
+                 : Context -> (ToolCalls | FinalAnswer))
+
+      dispatch (node "run-tool" {}
+                 : ToolCalls -> ToolHandle)
+
+      result   (node "tool-result" {}
+                 : ToolHandle -> Context)
+
+      bound    (node "loop-counter" {:max 50}
+                 : Context -> (Context | LoopExhausted))
+
+      exhaust  (node "llm" {:model "opus"
+                            :system "Summarize what you accomplished so far."}
+                 : LoopExhausted -> FinalAnswer)
+
+      output   (node "sink" {}
+                 : FinalAnswer -> FinalAnswer)]
+
+  (graph
+    call     -> dispatch
+    call     -> output
+    dispatch -> result
+    result   -> bound
+    bound    -> call
+    bound    -> exhaust
+    exhaust  -> output
+    :terminal output))

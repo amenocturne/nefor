@@ -1,38 +1,82 @@
 use crate::ast::Value;
 use crate::error::MagError;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct Env {
     scopes: Vec<HashMap<String, Value>>,
+    source_dir: PathBuf,
+    loading_modules: HashSet<PathBuf>,
+}
+
+impl Default for Env {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Env {
     pub fn new() -> Self {
         Self {
             scopes: vec![HashMap::new()],
+            source_dir: PathBuf::from("."),
+            loading_modules: HashSet::new(),
         }
+    }
+
+    fn define_stdlib(&mut self) {
+        self.define("str", Value::BuiltinFn("str".into()));
+        self.define("map", Value::BuiltinFn("map".into()));
+        self.define("filter", Value::BuiltinFn("filter".into()));
+        self.define("fold", Value::BuiltinFn("fold".into()));
+        self.define("concat", Value::BuiltinFn("concat".into()));
+        self.define("get", Value::BuiltinFn("get".into()));
+        self.define("assoc", Value::BuiltinFn("assoc".into()));
+        self.define("keys", Value::BuiltinFn("keys".into()));
+        self.define("count", Value::BuiltinFn("count".into()));
+        self.define("or", Value::BuiltinFn("or".into()));
+        self.define("not", Value::BuiltinFn("not".into()));
+        self.define("=", Value::BuiltinFn("=".into()));
+        self.define("node", Value::BuiltinFn("node".into()));
+        self.define("graph", Value::BuiltinFn("graph".into()));
+        self.define("type", Value::BuiltinFn("type".into()));
+        self.define("template", Value::BuiltinFn("template".into()));
+        self.define("require", Value::BuiltinFn("require".into()));
     }
 
     pub fn new_with_stdlib() -> Self {
         let mut env = Self::new();
-        env.define("str", Value::BuiltinFn("str".into()));
-        env.define("map", Value::BuiltinFn("map".into()));
-        env.define("filter", Value::BuiltinFn("filter".into()));
-        env.define("fold", Value::BuiltinFn("fold".into()));
-        env.define("concat", Value::BuiltinFn("concat".into()));
-        env.define("get", Value::BuiltinFn("get".into()));
-        env.define("assoc", Value::BuiltinFn("assoc".into()));
-        env.define("keys", Value::BuiltinFn("keys".into()));
-        env.define("count", Value::BuiltinFn("count".into()));
-        env.define("or", Value::BuiltinFn("or".into()));
-        env.define("not", Value::BuiltinFn("not".into()));
-        env.define("=", Value::BuiltinFn("=".into()));
-        env.define("node", Value::BuiltinFn("node".into()));
-        env.define("graph", Value::BuiltinFn("graph".into()));
-        env.define("type", Value::BuiltinFn("type".into()));
-        env.define("template", Value::BuiltinFn("template".into()));
+        env.define_stdlib();
         env
+    }
+
+    pub fn new_with_stdlib_and_source_dir(source_dir: &Path) -> Self {
+        let mut env = Self {
+            scopes: vec![HashMap::new()],
+            source_dir: source_dir.to_path_buf(),
+            loading_modules: HashSet::new(),
+        };
+        env.define_stdlib();
+        env
+    }
+
+    pub fn source_dir(&self) -> &Path {
+        &self.source_dir
+    }
+
+    pub fn begin_loading(&mut self, path: &Path) -> Result<(), MagError> {
+        if !self.loading_modules.insert(path.to_path_buf()) {
+            return Err(MagError::Eval(format!(
+                "circular require: {} is already being loaded",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn end_loading(&mut self, path: &Path) {
+        self.loading_modules.remove(path);
     }
 
     pub fn push_scope(&mut self) {

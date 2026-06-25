@@ -395,15 +395,64 @@ fn eval_builtin(env: &mut Env, name: &str, args: &[Expr]) -> Result<Value, MagEr
         "node" => eval_node(env, args),
         "graph" => eval_graph(env, args),
         "template" => {
-            if args.len() != 2 {
+            if args.is_empty() || args.len() > 2 {
+                return Err(MagError::Eval(
+                    "template requires 1-2 args: (template \"path\") or (template \"path\" data-map)"
+                        .into(),
+                ));
+            }
+            let path_val = eval_expr(env, &args[0])?;
+            let path_str = match &path_val {
+                Value::Str(s) => s.clone(),
+                other => {
+                    return Err(MagError::Eval(format!(
+                        "template path must be a string, got {}",
+                        other.type_name()
+                    )))
+                }
+            };
+            let full_path = env.source_dir().join(&path_str);
+            let contents = std::fs::read_to_string(&full_path)
+                .map_err(|_| MagError::Eval(format!("template not found: {path_str}")))?;
+            if args.len() == 2 {
+                let data = eval_expr(env, &args[1])?;
+                let data_map = match &data {
+                    Value::Map(m) => m,
+                    other => {
+                        return Err(MagError::Eval(format!(
+                            "template data must be a map, got {}",
+                            other.type_name()
+                        )))
+                    }
+                };
+                Ok(Value::Str(interpolate_template(&contents, data_map)))
+            } else {
+                Ok(Value::Str(contents))
+            }
+        }
+        "require" => {
+            if args.len() != 1 {
                 return Err(MagError::Arity {
-                    expected: 2,
+                    expected: 1,
                     got: args.len(),
                 });
             }
-            let name = eval_expr(env, &args[0])?;
-            let _data = eval_expr(env, &args[1])?;
-            Ok(Value::Str(format!("template:{}", value_to_string(&name))))
+            let path_val = eval_expr(env, &args[0])?;
+            let path = path_val
+                .as_str()
+                .ok_or_else(|| MagError::Eval("require expects a string path".into()))?;
+            let full_path = env.source_dir().join(format!("{path}.mag"));
+            let canonical = full_path
+                .canonicalize()
+                .unwrap_or_else(|_| full_path.clone());
+            env.begin_loading(&canonical)?;
+            let content = std::fs::read_to_string(&full_path)
+                .map_err(|e| MagError::Eval(format!("cannot read module {path}: {e}")))?;
+            let tokens = crate::lexer::tokenize(&content)?;
+            let exprs = crate::parser::parse(&tokens)?;
+            let result = eval_program(env, &exprs);
+            env.end_loading(&canonical);
+            result
         }
         other => Err(MagError::Eval(format!("unknown builtin: {other}"))),
     }
@@ -674,7 +723,7 @@ fn eval_graph(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
 
     let mut nodes: Vec<NodeValue> = Vec::new();
     let mut edges: Vec<EdgeValue> = Vec::new();
-    let mut terminals: Vec<String> = Vec::new();
+    let mut terminal: Option<String> = None;
 
     // Track which node IDs we've seen (for deduplication)
     let mut seen_node_ids = std::collections::HashSet::new();
@@ -693,17 +742,21 @@ fn eval_graph(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
         if let Value::Keyword(kw) = &vals[i] {
             if kw == "terminal" {
                 i += 1;
-                while i < vals.len() {
+                if i < vals.len() {
                     match &vals[i] {
                         Value::Node(n) => {
-                            terminals.push(n.id.clone());
+                            if terminal.is_some() {
+                                return Err(MagError::Eval(
+                                    "graph must have exactly one :terminal (sink) node".into(),
+                                ));
+                            }
+                            terminal = Some(n.id.clone());
                             add_node(n, &mut nodes, &mut seen_node_ids);
                             i += 1;
                         }
-                        Value::Keyword(_) => break,
                         _ => {
                             return Err(MagError::Eval(format!(
-                                "terminal expects node values, got {}",
+                                "terminal expects a node value, got {}",
                                 vals[i].type_name()
                             )));
                         }
@@ -759,11 +812,49 @@ fn eval_graph(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
         i += 1;
     }
 
+    let terminal = terminal.ok_or_else(|| MagError::Eval("graph has no :terminal node".into()))?;
+
     Ok(Value::Graph(GraphValue {
         nodes,
         edges,
-        terminals,
+        terminal,
     }))
+}
+
+/// Simple `{key}` interpolation: scan for `{` and `}`, look up the key in the data map.
+fn interpolate_template(template: &str, data: &BTreeMap<String, Value>) -> String {
+    let mut result = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '{' {
+            let mut key = String::new();
+            let mut found_close = false;
+            for inner in chars.by_ref() {
+                if inner == '}' {
+                    found_close = true;
+                    break;
+                }
+                key.push(inner);
+            }
+            if found_close {
+                if let Some(val) = data.get(&key) {
+                    result.push_str(&value_to_string(val));
+                } else {
+                    // No match — preserve the original `{key}` literal
+                    result.push('{');
+                    result.push_str(&key);
+                    result.push('}');
+                }
+            } else {
+                // Unclosed `{` — preserve literally
+                result.push('{');
+                result.push_str(&key);
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
 }
 
 fn is_truthy(val: &Value) -> bool {
@@ -1366,7 +1457,7 @@ mod tests {
             assert_eq!(g.edges.len(), 1);
             assert_eq!(g.edges[0].from, "a");
             assert_eq!(g.edges[0].to, "b");
-            assert_eq!(g.terminals, vec!["b"]);
+            assert_eq!(g.terminal, "b");
         } else {
             panic!("expected graph, got {:?}", result);
         }
@@ -1419,15 +1510,70 @@ mod tests {
     }
 
     #[test]
-    fn template_mvp() {
-        // (template "review" {}) -> Str("template:review")
-        let result = eval(vec![Expr::List(vec![
-            Expr::Symbol("template".into()),
-            Expr::Str("review".into()),
-            Expr::Map(vec![]),
-        ])])
+    fn template_reads_file() {
+        let dir = std::env::temp_dir().join("mag_test_template_reads");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("test.md"), "hello from template").unwrap();
+
+        let mut env = Env::new_with_stdlib_and_source_dir(&dir);
+        let result = eval_with_env(
+            &mut env,
+            vec![Expr::List(vec![
+                Expr::Symbol("template".into()),
+                Expr::Str("test.md".into()),
+            ])],
+        )
         .unwrap();
-        assert!(matches!(result, Value::Str(ref s) if s == "template:review"));
+        assert!(matches!(result, Value::Str(ref s) if s == "hello from template"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn template_interpolates_data() {
+        let dir = std::env::temp_dir().join("mag_test_template_interp");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("greet.md"), "hello {name}, you are {role}").unwrap();
+
+        let mut env = Env::new_with_stdlib_and_source_dir(&dir);
+        let result = eval_with_env(
+            &mut env,
+            vec![Expr::List(vec![
+                Expr::Symbol("template".into()),
+                Expr::Str("greet.md".into()),
+                Expr::Map(vec![
+                    (Expr::Keyword("name".into()), Expr::Str("world".into())),
+                    (Expr::Keyword("role".into()), Expr::Str("explorer".into())),
+                ]),
+            ])],
+        )
+        .unwrap();
+        assert!(matches!(result, Value::Str(ref s) if s == "hello world, you are explorer"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn template_missing_file_errors() {
+        let dir = std::env::temp_dir().join("mag_test_template_missing");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut env = Env::new_with_stdlib_and_source_dir(&dir);
+        let result = eval_with_env(
+            &mut env,
+            vec![Expr::List(vec![
+                Expr::Symbol("template".into()),
+                Expr::Str("nonexistent.md".into()),
+            ])],
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("template not found: nonexistent.md"),
+            "got: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1478,5 +1624,141 @@ mod tests {
     fn empty_program() {
         let result = eval(vec![]).unwrap();
         assert!(matches!(result, Value::Nil));
+    }
+
+    // --- require tests ---
+
+    #[test]
+    fn require_loads_defs() {
+        let dir = std::env::temp_dir().join("mag_test_require_defs");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(
+            dir.join("constants.mag"),
+            "(def answer 42)\n(def greeting \"hello\")\n",
+        )
+        .unwrap();
+
+        let mut env = Env::new_with_stdlib_and_source_dir(&dir);
+        eval_with_env(
+            &mut env,
+            vec![Expr::List(vec![
+                Expr::Symbol("require".into()),
+                Expr::Str("constants".into()),
+            ])],
+        )
+        .unwrap();
+
+        let val = env.lookup("answer").unwrap();
+        assert!(matches!(val, Value::Int(42)));
+        let val = env.lookup("greeting").unwrap();
+        assert!(matches!(val, Value::Str(ref s) if s == "hello"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn require_returns_last_value() {
+        let dir = std::env::temp_dir().join("mag_test_require_ret");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("last.mag"), "(def x 1)\n99\n").unwrap();
+
+        let mut env = Env::new_with_stdlib_and_source_dir(&dir);
+        let result = eval_with_env(
+            &mut env,
+            vec![Expr::List(vec![
+                Expr::Symbol("def".into()),
+                Expr::Symbol("result".into()),
+                Expr::List(vec![
+                    Expr::Symbol("require".into()),
+                    Expr::Str("last".into()),
+                ]),
+            ])],
+        )
+        .unwrap();
+
+        assert!(matches!(result, Value::Int(99)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn require_circular_errors() {
+        let dir = std::env::temp_dir().join("mag_test_require_circ");
+        let _ = std::fs::create_dir_all(&dir);
+        // a.mag requires b.mag, b.mag requires a.mag
+        std::fs::write(dir.join("a.mag"), "(require \"b\")\n").unwrap();
+        std::fs::write(dir.join("b.mag"), "(require \"a\")\n").unwrap();
+
+        let mut env = Env::new_with_stdlib_and_source_dir(&dir);
+        let result = eval_with_env(
+            &mut env,
+            vec![Expr::List(vec![
+                Expr::Symbol("require".into()),
+                Expr::Str("a".into()),
+            ])],
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("circular require"),
+            "expected circular require error, got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn require_missing_module_errors() {
+        let dir = std::env::temp_dir().join("mag_test_require_missing");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let mut env = Env::new_with_stdlib_and_source_dir(&dir);
+        let result = eval_with_env(
+            &mut env,
+            vec![Expr::List(vec![
+                Expr::Symbol("require".into()),
+                Expr::Str("nonexistent".into()),
+            ])],
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("cannot read module nonexistent"),
+            "expected clear error about missing module, got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn require_nested_subdirectory() {
+        let dir = std::env::temp_dir().join("mag_test_require_nested");
+        let _ = std::fs::create_dir_all(dir.join("lib"));
+        std::fs::write(
+            dir.join("lib/utils.mag"),
+            "(def tools [\"grep\" \"find\"])\n",
+        )
+        .unwrap();
+
+        let mut env = Env::new_with_stdlib_and_source_dir(&dir);
+        eval_with_env(
+            &mut env,
+            vec![Expr::List(vec![
+                Expr::Symbol("require".into()),
+                Expr::Str("lib/utils".into()),
+            ])],
+        )
+        .unwrap();
+
+        let val = env.lookup("tools").unwrap();
+        if let Value::Vector(items) = val {
+            assert_eq!(items.len(), 2);
+        } else {
+            panic!("expected vector, got {:?}", val);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

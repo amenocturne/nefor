@@ -1,0 +1,18 @@
+(type Task)
+(type Findings)
+(type Summary)
+
+(let [exp (node "agent" {:prompt (template "templates/explore.md" {:focus "auth patterns"})
+                         :model "opus"
+                         :tools ["fs/read" "grep"]}
+            : Task -> Findings)
+
+      sum (node "llm" {:prompt "synthesize findings"}
+            : Findings -> Summary)
+
+      out (node "sink" {} : Summary -> Summary)]
+
+  (graph
+    exp -> sum
+    sum -> out
+    :terminal out))

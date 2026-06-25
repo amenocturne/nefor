@@ -1,0 +1,64 @@
+;; Feature implementation workflow
+;; Parallel exploration → summarize → build → compile with retry → review
+
+(type Task)
+(type Findings)
+(type Summary)
+(type Patch)
+(type BuildResult)
+(type BuildError)
+(type LoopExhausted)
+(type Review)
+
+(let [exp1       (node "agent" {:prompt "explore API endpoints"
+                                :model "opus"
+                                :tools ["fs/read" "grep"]}
+                   : Task -> Findings)
+
+      exp2       (node "agent" {:prompt "explore rate limiting patterns"
+                                :model "opus"
+                                :tools ["fs/read" "grep"]}
+                   : Task -> Findings)
+
+      summarize  (node "llm" {:prompt "synthesize explorer findings"}
+                   : Findings -> Summary)
+
+      build      (node "agent" {:prompt "implement rate limiting"
+                                :model "opus"
+                                :tools ["fs/read" "fs/edit" "shell"]}
+                   : Summary -> Patch)
+
+      compile    (node "shell" {:cmd "just build"}
+                   : Patch -> (BuildResult | BuildError))
+
+      counter    (node "loop-counter" {:max 3}
+                   : BuildError -> (BuildError | LoopExhausted))
+
+      fix        (node "agent" {:prompt "fix build errors"
+                                :model "sonnet"
+                                :tools ["fs/read" "fs/edit" "shell"]}
+                   : BuildError -> Patch)
+
+      review     (node "agent" {:prompt "review the changes"
+                                :model "opus"
+                                :tools ["fs/read" "grep"]}
+                   : BuildResult -> Review)
+
+      escalate   (node "llm" {:prompt "build failed after 3 attempts, summarize"}
+                   : LoopExhausted -> Review)
+
+      out        (node "sink" {} : Review -> Review)]
+
+  (graph
+    exp1      -> summarize
+    exp2      -> summarize
+    summarize -> build
+    build     -> compile
+    compile   -> review
+    compile   -> counter
+    counter   -> fix
+    counter   -> escalate
+    fix       -> compile
+    review    -> out
+    escalate  -> out
+    :terminal out))
