@@ -1675,6 +1675,107 @@ impl ToolCallBuffer {
     }
 }
 
+struct ReasoningSummaryFormatter {
+    buffer: String,
+    next_step: usize,
+    detail_active: bool,
+}
+
+impl Default for ReasoningSummaryFormatter {
+    fn default() -> Self {
+        Self {
+            buffer: String::new(),
+            next_step: 1,
+            detail_active: false,
+        }
+    }
+}
+
+impl ReasoningSummaryFormatter {
+    fn push_delta(&mut self, delta: &str) -> Vec<String> {
+        self.buffer.push_str(delta);
+        self.drain(false)
+    }
+
+    fn finish(&mut self) -> Vec<String> {
+        self.drain(true)
+    }
+
+    fn drain(&mut self, flush: bool) -> Vec<String> {
+        let mut out = Vec::new();
+        loop {
+            if self.buffer.is_empty() {
+                break;
+            }
+
+            if self.buffer.starts_with("**") {
+                let Some(close_rel) = self.buffer[2..].find("**") else {
+                    if flush {
+                        let title = self.buffer[2..].trim().to_owned();
+                        self.buffer.clear();
+                        self.push_title(&mut out, &title);
+                    }
+                    break;
+                };
+                let close = 2 + close_rel;
+                let title = self.buffer[2..close].trim().to_owned();
+                self.buffer.drain(..close + 2);
+                self.push_title(&mut out, &title);
+                continue;
+            }
+
+            let marker = self.buffer.find("**");
+            let take_len = marker.unwrap_or_else(|| {
+                if !flush && self.buffer.ends_with('*') {
+                    self.buffer.len() - 1
+                } else {
+                    self.buffer.len()
+                }
+            });
+            if take_len == 0 {
+                break;
+            }
+            let detail = self.buffer[..take_len].to_owned();
+            self.buffer.drain(..take_len);
+            self.push_detail(&mut out, &detail);
+        }
+        out
+    }
+
+    fn push_title(&mut self, out: &mut Vec<String>, title: &str) {
+        if title.is_empty() {
+            return;
+        }
+        let prefix = if self.next_step == 1 {
+            ""
+        } else if self.detail_active {
+            "\n"
+        } else {
+            ""
+        };
+        out.push(format!("{prefix}{}. {title}\n", self.next_step));
+        self.next_step = self.next_step.saturating_add(1);
+        self.detail_active = false;
+    }
+
+    fn push_detail(&mut self, out: &mut Vec<String>, detail: &str) {
+        let text = if self.detail_active {
+            detail.to_owned()
+        } else {
+            detail.trim_start().to_owned()
+        };
+        if text.trim().is_empty() {
+            return;
+        }
+        let mut formatted = text.replace('\n', "\n   ");
+        if !self.detail_active {
+            formatted = format!("   {formatted}");
+        }
+        self.detail_active = true;
+        out.push(formatted);
+    }
+}
+
 fn should_retry_pre_output_stream_error(
     err: &ChatgptError,
     output_text: &str,
@@ -1934,6 +2035,7 @@ fn spawn_turn(
 
             let mut output_text = String::new();
             let mut reasoning_text = String::new();
+            let mut reasoning_formatter = ReasoningSummaryFormatter::default();
             let mut reasoning_started_at: Option<std::time::Instant> = None;
             let mut tool_buf = ToolCallBuffer::default();
             let mut iter_finish_reason: Option<String> = None;
@@ -1962,10 +2064,40 @@ fn spawn_turn(
                                     );
                                     let _ = ctx.out_tx.try_send(PluginOutgoing::event(body));
                                 }
-                                ResponseEvent::ReasoningSummaryDelta { delta, .. }
-                                | ResponseEvent::ReasoningContentDelta { delta, .. } => {
+                                ResponseEvent::ReasoningSummaryDelta { delta, .. } => {
                                     if reasoning_started_at.is_none() {
                                         reasoning_started_at = Some(std::time::Instant::now());
+                                    }
+                                    for formatted in reasoning_formatter.push_delta(&delta) {
+                                        if formatted.is_empty() {
+                                            continue;
+                                        }
+                                        reasoning_text.push_str(&formatted);
+                                        let body = stream_reasoning_delta_body(
+                                            &ctx.args.event_prefix(),
+                                            &turn_id,
+                                            &chat_id,
+                                            &formatted,
+                                        );
+                                        let _ = ctx.out_tx.try_send(PluginOutgoing::event(body));
+                                    }
+                                }
+                                ResponseEvent::ReasoningContentDelta { delta, .. } => {
+                                    if reasoning_started_at.is_none() {
+                                        reasoning_started_at = Some(std::time::Instant::now());
+                                    }
+                                    for formatted in reasoning_formatter.finish() {
+                                        if formatted.is_empty() {
+                                            continue;
+                                        }
+                                        reasoning_text.push_str(&formatted);
+                                        let body = stream_reasoning_delta_body(
+                                            &ctx.args.event_prefix(),
+                                            &turn_id,
+                                            &chat_id,
+                                            &formatted,
+                                        );
+                                        let _ = ctx.out_tx.try_send(PluginOutgoing::event(body));
                                     }
                                     reasoning_text.push_str(&delta);
                                     let body = stream_reasoning_delta_body(
@@ -2086,6 +2218,20 @@ fn spawn_turn(
                         }
                     }
                 }
+            }
+
+            for formatted in reasoning_formatter.finish() {
+                if formatted.is_empty() {
+                    continue;
+                }
+                reasoning_text.push_str(&formatted);
+                let body = stream_reasoning_delta_body(
+                    &ctx.args.event_prefix(),
+                    &turn_id,
+                    &chat_id,
+                    &formatted,
+                );
+                let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
             }
 
             // Emit per-turn reasoning_end if we accumulated any.
@@ -2466,6 +2612,48 @@ mod tests {
         b.on_item_done(Some("call_1"), r#"{"a":1}"#);
         let calls = b.into_tool_calls();
         assert_eq!(calls[0].function.arguments, r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn reasoning_summary_formatter_formats_adjacent_titles_and_detail() {
+        let mut f = ReasoningSummaryFormatter::default();
+        let out = f.push_delta(
+            "**Discussing design considerations**\
+             **Exploring validation abstractions**\
+             **Planning compiler validation flow**\
+             I'm working through validated data structures.\
+             **Designing checked value compilation flow**",
+        );
+        assert_eq!(
+            out.concat(),
+            concat!(
+                "1. Discussing design considerations\n",
+                "2. Exploring validation abstractions\n",
+                "3. Planning compiler validation flow\n",
+                "   I'm working through validated data structures.\n",
+                "4. Designing checked value compilation flow\n",
+            )
+        );
+    }
+
+    #[test]
+    fn reasoning_summary_formatter_buffers_split_title_markers() {
+        let mut f = ReasoningSummaryFormatter::default();
+        assert!(f.push_delta("**Clarifying validator").is_empty());
+        assert_eq!(
+            f.push_delta(" sequencing and safety**detail").concat(),
+            "1. Clarifying validator sequencing and safety\n   detail"
+        );
+    }
+
+    #[test]
+    fn reasoning_summary_formatter_flushes_partial_streaming_title() {
+        let mut f = ReasoningSummaryFormatter::default();
+        assert_eq!(
+            f.push_delta("**Done**body**Partial").concat(),
+            "1. Done\n   body"
+        );
+        assert_eq!(f.finish().concat(), "\n2. Partial\n");
     }
 
     #[test]
