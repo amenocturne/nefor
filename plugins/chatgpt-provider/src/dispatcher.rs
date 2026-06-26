@@ -121,6 +121,37 @@ fn auth_status_body(args: &ServeArgs, snap: &AuthSnapshot) -> Map<String, Value>
     make_event(format!("{}auth.status", args.event_prefix()), m)
 }
 
+async fn handle_refresh_error(
+    ctx: &DispatcherContext,
+    chat_id: Option<&ChatId>,
+    error: ChatgptError,
+) -> Result<(), ChatgptError> {
+    match error {
+        ChatgptError::Http(e) => {
+            let snap = ctx.auth.snapshot().await;
+            send_event(&ctx.out_tx, auth_status_body(&ctx.args, &snap)).await?;
+            send_event(
+                &ctx.out_tx,
+                turn_error_body(
+                    &ctx.args,
+                    chat_id,
+                    &format!("token refresh failed: HTTP transport error: {e}"),
+                ),
+            )
+            .await
+        }
+        e => {
+            let snap = ctx.auth.apply_error(format!("refresh: {e}")).await;
+            send_event(&ctx.out_tx, auth_status_body(&ctx.args, &snap)).await?;
+            send_event(
+                &ctx.out_tx,
+                turn_error_body(&ctx.args, chat_id, &format!("token refresh failed: {e}")),
+            )
+            .await
+        }
+    }
+}
+
 fn chat_created_body(args: &ServeArgs, chat_id: &ChatId) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("chat_id".into(), Value::String(chat_id.to_string()));
@@ -1450,17 +1481,7 @@ async fn compact_chat(
         return Ok(());
     }
     if let Err(e) = ctx.auth.current_access_token().await {
-        let snap = ctx.auth.apply_error(format!("refresh: {e}")).await;
-        send_event(&ctx.out_tx, auth_status_body(&ctx.args, &snap)).await?;
-        send_event(
-            &ctx.out_tx,
-            turn_error_body(
-                &ctx.args,
-                Some(chat_id),
-                &format!("token refresh failed: {e}"),
-            ),
-        )
-        .await?;
+        handle_refresh_error(ctx, Some(chat_id), e).await?;
         return Ok(());
     }
     let auth_snap = ctx.auth.snapshot().await;
@@ -1954,19 +1975,7 @@ fn spawn_turn(
             // grab a fresh snapshot afterwards because the cached
             // tokens may have rotated.
             if let Err(e) = ctx.auth.current_access_token().await {
-                let snap = ctx.auth.apply_error(format!("refresh: {e}")).await;
-                let _ = ctx
-                    .out_tx
-                    .send(PluginOutgoing::event(auth_status_body(&ctx.args, &snap)))
-                    .await;
-                let _ = ctx
-                    .out_tx
-                    .send(PluginOutgoing::event(turn_error_body(
-                        &ctx.args,
-                        Some(&chat_id),
-                        &format!("token refresh failed: {e}"),
-                    )))
-                    .await;
+                let _ = handle_refresh_error(&ctx, Some(&chat_id), e).await;
                 errored = true;
                 final_finish_reason = Some("error".into());
                 break;
