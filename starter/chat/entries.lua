@@ -44,6 +44,10 @@ end
 --   live  (streaming + body empty)  → "▼ thinking…"  + body
 --   expanded (Ctrl+O)               → "▼ reasoning"  + body
 --   collapsed                       → "▸ reasoning (Ns)"
+local function indent_block(text, prefix)
+  return prefix .. (text or ""):gsub("\n", "\n" .. prefix)
+end
+
 local function reasoning_rows(reasoning, body_empty, expanded)
   if reasoning == nil or (reasoning.text or "") == "" then return nil end
   local live = reasoning.streaming and body_empty
@@ -53,7 +57,7 @@ local function reasoning_rows(reasoning, body_empty, expanded)
       gap = 0,
       children = {
         tui.text { content = header_text, style = STYLE.footer, wrap = "none" },
-        tui.text { content = "  " .. (reasoning.text or ""), style = STYLE.reasoning, wrap = "word" },
+        tui.text { content = indent_block(reasoning.text, "  "), style = STYLE.reasoning, wrap = "word" },
       },
     }
   end

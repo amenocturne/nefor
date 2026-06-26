@@ -82,6 +82,26 @@ local function find_child(node, kind)
   return nil
 end
 
+local function collect_text_content(node, out)
+  out = out or {}
+  if node == nil then return out end
+  if node.__kind == "text" and type(node.content) == "string" then
+    out[#out + 1] = node.content
+  end
+  if node.children ~= nil then
+    for _, c in ipairs(node.children) do collect_text_content(c, out) end
+  end
+  if node.child ~= nil then collect_text_content(node.child, out) end
+  return out
+end
+
+local function contains_text(node, expected)
+  for _, text in ipairs(collect_text_content(node)) do
+    if text == expected then return true end
+  end
+  return false
+end
+
 -- popup
 local popup = require("nefor-tui.widget.popup")
 
@@ -515,4 +535,24 @@ do
   local out = util.shallow_merge({ a = 1, b = 2 }, { b = util.NIL })
   assert_eq(out.a, 1, "shallow_merge unrelated key preserved")
   assert_eq(out.b, nil, "shallow_merge NIL sentinel clears")
+end
+
+-- chat entries
+local entries = require("chat.entries")
+
+do
+  local tree = entries.render({
+    role = "assistant",
+    kind = "stream",
+    text = "",
+    streaming = true,
+    reasoning = {
+      streaming = true,
+      text = "1. Planning exploration of MAG changes\n2. Determining exploration methods and tools",
+    },
+  }, 1, false, false)
+
+  assert_true(contains_text(tree,
+    "  1. Planning exploration of MAG changes\n  2. Determining exploration methods and tools"),
+    "multi-line reasoning block must indent every line equally")
 end
