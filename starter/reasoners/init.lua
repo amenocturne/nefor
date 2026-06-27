@@ -72,6 +72,40 @@ local function send_tool_result_err(reasoner_type, firing_id, err)
   })
 end
 
+local function spawn_graph_ack_run_id(content)
+  if type(content) ~= "string" then return nil end
+  local ok, decoded = pcall(json.decode, content)
+  if ok and type(decoded) == "table"
+      and type(decoded.run_id) == "string"
+      and type(decoded.notice) == "string"
+      and string.find(decoded.notice, "Submitted %(async", 1, false) == 1 then
+    return decoded.run_id
+  end
+  return string.match(content, "^Submitted sub%-graph run_id=([^%.%s]+)%.")
+end
+
+local function async_spawn_graph_ack_run_ids(messages)
+  if type(messages) ~= "table" or #messages == 0 then return nil end
+  local run_ids = {}
+  for _, msg in ipairs(messages) do
+    if type(msg) ~= "table" or msg.role ~= "tool" then return nil end
+    local run_id = spawn_graph_ack_run_id(msg.content)
+    if type(run_id) ~= "string" or #run_id == 0 then return nil end
+    run_ids[#run_ids + 1] = run_id
+  end
+  return run_ids
+end
+
+local function async_spawn_graph_ack_summary(run_ids)
+  if type(run_ids) ~= "table" or #run_ids == 0 then return "" end
+  if #run_ids == 1 then
+    return "Dispatched sub-graph run " .. run_ids[1] ..
+           ". Results will appear as they finish."
+  end
+  return "Dispatched sub-graph runs:\n- " .. table.concat(run_ids, "\n- ") ..
+         "\nResults will appear as they finish."
+end
+
 -- Handler for provider-wrapper / responder.
 --
 -- Owns invariants:
@@ -138,7 +172,7 @@ local function provider_run_node(reasoner_type, body)
       create_body.system = args.system
     end
     -- Sub-graph responder nodes must produce text, not tool calls.
-    if reasoner_type == "responder" then
+    if reasoner_type == "responder" or reasoner_type == "llm" then
       create_body.tools = false
     elseif type(args) == "table" and type(args.tool_allowlist) == "table" then
       -- Provider-side tool-name allowlist for this chat (matches the
@@ -158,11 +192,13 @@ local function provider_run_node(reasoner_type, body)
     emit(provider, create_body)
   end
 
+  local appended_messages = {}
   for dep_id, dep_entry in pairs(inputs) do
     if type(dep_entry) == "table" and dep_entry.output ~= nil then
       local out = dep_entry.output
       if type(out) == "table" and type(out.messages) == "table" then
         for _, msg in ipairs(out.messages) do
+          appended_messages[#appended_messages + 1] = msg
           emit(provider, {
             kind    = provider .. ".chat.append",
             chat_id = chat_id,
@@ -199,6 +235,27 @@ local function provider_run_node(reasoner_type, body)
         message = { role = "user", content = prompt },
       })
     end
+  end
+
+  local async_run_ids = async_spawn_graph_ack_run_ids(appended_messages)
+  if not first_firing and type(async_run_ids) == "table" then
+    local text = async_spawn_graph_ack_summary(async_run_ids)
+    emit(provider, {
+      kind    = provider .. ".chat.append",
+      chat_id = chat_id,
+      message = { role = "assistant", content = text },
+    })
+    emit("nefor-tui", {
+      kind = "chat.message.append",
+      role = "assistant",
+      text = text,
+    })
+    agentic_loop.take_pending_for_chat(chat_id)
+    send_tool_result_ok(reasoner_type, firing_id, {
+      text = text,
+      finish_reason = "stop",
+    }, { chat_id = chat_id })
+    return "_already_replied"
   end
 
   emit(provider, { kind = provider .. ".chat.complete", chat_id = chat_id })
@@ -301,7 +358,9 @@ local function adapter_run_node(body)
   return "_already_replied"
 end
 
--- Handler for terminal — concat upstream outputs in sorted-id order.
+-- Handler for terminal/sink — concat upstream outputs in sorted-id order.
+-- When args.path is set, writes output to that file and returns a short
+-- confirmation instead of the full text.
 local function terminal_run_node(body)
   local firing_id = body.firing_id
   local inputs = type(body.inputs) == "table" and body.inputs or {}
@@ -314,11 +373,12 @@ local function terminal_run_node(body)
   end
   table.sort(ordered_ids)
 
-  local final
+  local content
   if #ordered_ids == 0 then
-    final = { text = "" }
+    content = ""
   elseif #ordered_ids == 1 then
-    final = inputs[ordered_ids[1]].output
+    local out = inputs[ordered_ids[1]].output
+    content = (type(out) == "table" and out.text) or tostring(out)
   else
     local parts = {}
     for _, uid in ipairs(ordered_ids) do
@@ -326,10 +386,27 @@ local function terminal_run_node(body)
       local txt = (type(out) == "table" and out.text) or ""
       parts[#parts + 1] = "## " .. tostring(uid) .. "\n" .. tostring(txt)
     end
-    final = { text = table.concat(parts, "\n\n") }
+    content = table.concat(parts, "\n\n")
   end
 
-  send_tool_result_ok("terminal", firing_id, final, nil)
+  local outer_args = type(body.args) == "table" and body.args or {}
+  local node_args = type(outer_args.args) == "table" and outer_args.args or outer_args
+  local path = type(node_args.path) == "string" and #node_args.path > 0 and node_args.path or nil
+
+  if path then
+    local f, err = io.open(path, "w")
+    if not f then
+      send_tool_result_ok("terminal", firing_id,
+        { text = "sink: failed to write " .. path .. ": " .. tostring(err) }, nil)
+      return "_already_replied"
+    end
+    f:write(content)
+    f:close()
+    send_tool_result_ok("terminal", firing_id,
+      { text = "Output written to " .. path .. " (" .. #content .. " chars)" }, nil)
+  else
+    send_tool_result_ok("terminal", firing_id, { text = content }, nil)
+  end
   return "_already_replied"
 end
 
@@ -355,9 +432,11 @@ local bash_command_reasoner = require("reasoners.bash_command")
 local handlers = {
   ["provider-wrapper"] = function(body) return provider_run_node("provider-wrapper", body) end,
   ["responder"]        = function(body) return provider_run_node("responder", body) end,
+  ["llm"]              = function(body) return provider_run_node("llm", body) end,
   ["tool-executor"]    = tool_executor_run_node,
   ["adapter"]          = adapter_run_node,
   ["terminal"]         = terminal_run_node,
+  ["sink"]             = terminal_run_node,
   ["accumulate"]       = accumulate_reasoner.handle,
   ["retry"]            = retry_reasoner.handle,
   ["bash_command"]     = bash_command_reasoner.handle,

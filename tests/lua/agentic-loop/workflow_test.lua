@@ -315,8 +315,10 @@ do
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "second" })
   local calls = decode_calls()
   local echo = find_call(calls, "chat.message.append", "user", "second")
-  assert_eq(echo, nil,
-    "busy queued submit must not echo a chat.message.append role=user")
+  assert(echo ~= nil,
+    "busy queued submit must echo a chat.message.append role=user")
+  assert_eq(echo.target, "nefor-tui",
+    "busy queued submit echo must target nefor-tui")
   local queued_note = find_call(calls, "chat.message.append", "system", "queued")
   assert_eq(queued_note, nil,
     "busy queued submit must not surface a [queued ...] system message")
@@ -632,6 +634,75 @@ do
     .. json.encode(_test.calls()))
   assert(string.find(prompt, second_text, 1, true) == nil,
     "first relay turn must not fabricate or wait for the still-pending second graph")
+end
+
+-- If two async sub-graphs finish while the lead is busy, relay them as
+-- distinct lead turns once the current turn closes. This pins the
+-- already-queued case; the pending-case test above would still pass if
+-- drain_deferred_text accidentally drained the whole queue.
+do
+  fresh_loop()
+  local first_text = "first queued graph finished"
+  local second_text = "second queued graph finished"
+  local run1 = agentic_loop.queue_sub_graph(
+    { graph = { nodes = { { id = "terminal", reasoner = "terminal", args = {} } }, edges = {} } },
+    "gate-inner-queued-a"
+  )
+  local run2 = agentic_loop.queue_sub_graph(
+    { graph = { nodes = { { id = "terminal", reasoner = "terminal", args = {} } }, edges = {} } },
+    "gate-inner-queued-b"
+  )
+
+  agentic_loop._internals.state.current_run_id = "lead-run-busy"
+  _test.calls_clear()
+
+  send_to_loop("reasoner-graph", {
+    kind   = "tool.result",
+    id     = run1,
+    result = {
+      status  = "success",
+      results = { terminal = { output = { text = first_text } } },
+    },
+  })
+  send_to_loop("reasoner-graph", {
+    kind   = "tool.result",
+    id     = run2,
+    result = {
+      status  = "success",
+      results = { terminal = { output = { text = second_text } } },
+    },
+  })
+  assert_eq(#agentic_loop._internals.state.deferred_queue, 2,
+    "both completed sub-graphs should queue while the lead run is busy")
+
+  send_to_loop("reasoner-graph", {
+    kind   = "tool.result",
+    id     = "lead-run-busy",
+    result = { status = "success", results = {} },
+  })
+
+  local first_prompt = spawn_graph_prompt(decode_calls())
+  assert(type(first_prompt) == "string" and string.find(first_prompt, first_text, 1, true),
+    "closing the busy lead must relay the first queued sub-graph; got "
+    .. json.encode(_test.calls()))
+  assert(string.find(first_prompt, second_text, 1, true) == nil,
+    "first queued relay turn must not include the second queued sub-graph")
+  assert_eq(#agentic_loop._internals.state.deferred_queue, 1,
+    "one queued sub-graph should remain after the first relay turn is dispatched")
+
+  _test.calls_clear()
+  send_to_loop("reasoner-graph", {
+    kind   = "tool.result",
+    id     = agentic_loop._internals.state.current_run_id,
+    result = { status = "success", results = {} },
+  })
+
+  local second_prompt = spawn_graph_prompt(decode_calls())
+  assert(type(second_prompt) == "string" and string.find(second_prompt, second_text, 1, true),
+    "closing the first relay must dispatch the next queued sub-graph; got "
+    .. json.encode(_test.calls()))
+  assert(string.find(second_prompt, first_text, 1, true) == nil,
+    "second queued relay turn must not repeat the first queued sub-graph")
 end
 
 -- ------------------------------------------------------------------

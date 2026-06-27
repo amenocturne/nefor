@@ -787,6 +787,66 @@ local function test_rga_prev_state_chat_id_skips_create()
     "complete reuses prev_state.chat_id verbatim")
 end
 
+local function test_rga_async_spawn_graph_ack_short_circuits_provider_loopback()
+  reset_rga()
+  _test.set_plugins({ "ollama" })
+
+  dispatch_run_node({
+    kind = "provider-wrapper.run_node",
+    run_id = "r-async", node_id = "wrap", firing_id = "f-async",
+    args = { provider = "ollama" },
+    inputs = {
+      adapt = {
+        output = {
+          messages = {
+            {
+              role = "tool",
+              tool_call_id = "call-dispatch",
+              content = json.encode({
+                nodes = 1,
+                run_id = "rg-fast",
+                notice = "Submitted (async, 1 node). Acknowledge briefly to the user in one short sentence, then WAIT for the result.",
+              }),
+            },
+          },
+        },
+      },
+    },
+    prev_state = { chat_id = "chat-existing" },
+  })
+
+  local tool_append = find_call_with_kind("ollama.chat.append")
+  assert_true(tool_append ~= nil, "tool ack is still appended to provider history")
+  assert_eq(tool_append.body.message.role, "tool", "tool message preserved")
+
+  for _, c in ipairs(decode_all_calls()) do
+    assert_true(
+      c.decoded.body.kind ~= "ollama.chat.complete",
+      "async-only dispatch ack must not make another provider call"
+    )
+  end
+
+  local result = find_call_with_kind("tool.result")
+  assert_true(result ~= nil, "synthetic provider-wrapper result emitted")
+  assert_eq(result.body.id, "f-async", "result keyed by provider firing")
+  assert_true(type(result.body.result) == "table", "result object present")
+  assert_true(
+    string.find(result.body.result.text or "", "rg%-fast") ~= nil,
+    "synthetic final answer names the dispatched run"
+  )
+  assert_eq(result.body.result.next_state.chat_id, "chat-existing",
+    "next_state keeps the same provider chat")
+  assert_eq(pending_count(), 0, "short-circuit clears provider pending entry")
+
+  local visible = find_call_with_kind("chat.message.append")
+  assert_true(visible ~= nil, "synthetic dispatch ack is visible in chat")
+  assert_eq(visible.body.role, "assistant", "visible ack uses assistant role")
+  assert_true(
+    string.find(visible.body.text or "", "rg%-fast") ~= nil,
+    "visible ack names the dispatched run"
+  )
+end
+
 local function test_rga_provider_result_emits_tool_result_with_next_state()
   reset_rga()
   _test.set_plugins({ "ollama" })
@@ -1501,6 +1561,7 @@ local tests = {
   { name = "rga_unknown_type_is_ignored", fn = test_rga_unknown_type_is_ignored },
   { name = "rga_dispatch_drives_provider_chat_create_and_complete", fn = test_rga_dispatch_drives_provider_chat_create_and_complete },
   { name = "rga_prev_state_chat_id_skips_create", fn = test_rga_prev_state_chat_id_skips_create },
+  { name = "rga_async_spawn_graph_ack_short_circuits_provider_loopback", fn = test_rga_async_spawn_graph_ack_short_circuits_provider_loopback },
   { name = "rga_provider_result_emits_tool_result_with_next_state", fn = test_rga_provider_result_emits_tool_result_with_next_state },
   { name = "rga_provider_result_for_unknown_chat_passes_through", fn = test_rga_provider_result_for_unknown_chat_passes_through },
   { name = "rga_provider_error_closes_pending_firing", fn = test_rga_provider_error_closes_pending_firing },

@@ -162,12 +162,8 @@ end
 
 local function drain_deferred_text()
   if #state.deferred_queue == 0 then return nil end
-  local parts = {}
-  while #state.deferred_queue > 0 do
-    local entry = table.remove(state.deferred_queue, 1)
-    parts[#parts + 1] = entry.text
-  end
-  return table.concat(parts, "\n\n---\n\n")
+  local entry = table.remove(state.deferred_queue, 1)
+  return entry and entry.text or nil
 end
 
 local function active_lead_chat_id()
