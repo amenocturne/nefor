@@ -131,6 +131,9 @@ install-nefor channel="source":
           bin="target/release/$name"
           [ -f "$bin" ] && install -m 0755 "$bin" "$LIBEXEC_BIN/$name" && echo "  $LIBEXEC_BIN/$name"
         done
+        # MAG compiler (lives in crates/, not plugins/)
+        bin="target/release/mag"
+        [ -f "$bin" ] && install -m 0755 "$bin" "$LIBEXEC_BIN/mag" && echo "  $LIBEXEC_BIN/mag"
         ;;
       latest)
         if command -v brew >/dev/null 2>&1; then

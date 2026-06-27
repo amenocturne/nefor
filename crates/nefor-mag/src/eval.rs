@@ -817,7 +817,28 @@ fn eval_graph(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
         i += 1;
     }
 
-    let terminal = terminal.ok_or_else(|| MagError::Eval("graph has no :terminal node".into()))?;
+    let terminal = match terminal {
+        Some(t) => t,
+        None => {
+            // Auto-detect: sink node is terminal by definition.
+            let sinks: Vec<&str> = nodes
+                .iter()
+                .filter(|n| n.node_type == "sink")
+                .map(|n| n.id.as_str())
+                .collect();
+            match sinks.len() {
+                0 => return Err(MagError::Eval(
+                    "graph has no sink node — every graph must end with exactly one (node \"sink\" ...) that collects the final output".into(),
+                )),
+                1 => sinks[0].to_string(),
+                _ => return Err(MagError::Eval(format!(
+                    "graph has {} sink nodes ({}); exactly one is required",
+                    sinks.len(),
+                    sinks.join(", ")
+                ))),
+            }
+        }
+    };
 
     Ok(Value::Graph(GraphValue {
         nodes,
