@@ -918,7 +918,7 @@ mod tests {
                 "path": "/x",
                 "old_string": "a",
                 "new_string": "b",
-                "policy": {"max_changed_lines": 4}
+                "policy": {"require_unique_match": false}
             }
         })
         .as_object()
@@ -934,7 +934,7 @@ mod tests {
             .get("body")
             .and_then(|b| b.get("args"))
             .expect("forwarded args");
-        assert_eq!(args["policy"]["max_changed_lines"], json!(4));
+        assert_eq!(args["policy"]["require_unique_match"], json!(false));
     }
 
     #[tokio::test]

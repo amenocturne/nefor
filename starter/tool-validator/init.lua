@@ -33,9 +33,8 @@
 --
 -- `edit_file` / `write_file`: auto-approved only while lead-workflow
 -- has an approved plan in safe mode, or while `/auto`/`/yolo` is active.
--- `edit_file` receives the small-edit policy below before it reaches
--- basic-tools. Without approval in safe mode these are denied instead
--- of popped up, so direct file mutation cannot bypass the plan gate.
+-- Without approval in safe mode these are denied instead of popped up,
+-- so direct file mutation cannot bypass the plan gate.
 --
 -- Other tools: defer to the user (popup) unless the agent is read-only.
 --
@@ -132,24 +131,6 @@ local function probe_da()
   error("tool-validator: `da` not found at " ..
         (private or "<data_root>/bin/da") .. " or on PATH; re-run " ..
         "`just install-nefor` to install it under the libexec dir.")
-end
-
-local SMALL_EDIT_POLICY = {
-  require_unique_match = true,
-  max_changed_lines    = 40,
-  max_bytes_delta      = 4096,
-}
-
-local function copy_table(t)
-  local out = {}
-  for k, v in pairs(t or {}) do out[k] = v end
-  return out
-end
-
-local function with_policy(args, policy)
-  local out = copy_table(args)
-  out.policy = policy
-  return out
 end
 
 local function emit_response(id, decision, reason, args)
@@ -262,11 +243,7 @@ local function handle_permission_request(body)
       return
     end
     if gate_mode == "auto" or has_approved_plan() then
-      if tool == "edit_file" then
-        emit_response(id, "approve", nil, with_policy(args, SMALL_EDIT_POLICY))
-      else
-        emit_response(id, "approve")
-      end
+      emit_response(id, "approve")
     else
       emit_response(id, "deny", tool .. " requires an approved plan")
     end

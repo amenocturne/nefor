@@ -1,9 +1,9 @@
 //! `edit_file` — edit an existing UTF-8 file by exact string replacement.
 //!
-//! This is the narrow mutation primitive for small, reviewable edits:
-//! callers provide the exact text to replace and the replacement text.
-//! Whole-file overwrites stay in `write_file`; multi-file patches can
-//! grow into a separate patch tool later.
+//! This is a narrow mutation primitive: callers provide the exact text
+//! to replace and the replacement text. Whole-file overwrites stay in
+//! `write_file`; multi-file patches can grow into a separate patch tool
+//! later.
 
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
@@ -13,9 +13,6 @@ use crate::error::ToolError;
 pub const NAME: &str = "edit_file";
 pub const DESCRIPTION: &str =
     "Modify an existing text file by replacing one exact string match with new text.";
-
-const DEFAULT_MAX_CHANGED_LINES: usize = 40;
-const DEFAULT_MAX_BYTES_DELTA: usize = 4096;
 
 pub fn schema() -> Value {
     json!({
@@ -39,19 +36,11 @@ pub fn schema() -> Value {
             },
             "policy": {
                 "type": "object",
-                "description": "Runtime-supplied edit limits. Models should not set this directly.",
+                "description": "Runtime-supplied edit behavior. Models should not set this directly.",
                 "properties": {
                     "require_unique_match": {
                         "type": "boolean",
                         "description": "Require old_string to occur exactly once. Defaults to true."
-                    },
-                    "max_changed_lines": {
-                        "type": "integer",
-                        "description": "Maximum changed line count, additions plus deletions. Defaults to 40."
-                    },
-                    "max_bytes_delta": {
-                        "type": "integer",
-                        "description": "Maximum absolute byte-size delta. Defaults to 4096."
                     }
                 }
             }
@@ -76,8 +65,6 @@ struct ParsedArgs {
 #[derive(Debug)]
 struct EditPolicy {
     require_unique_match: bool,
-    max_changed_lines: usize,
-    max_bytes_delta: usize,
 }
 
 fn parse_args(args: &Value) -> Result<ParsedArgs, ToolError> {
@@ -121,8 +108,6 @@ fn required_string<'a>(
 fn parse_policy(value: Option<&Value>) -> Result<EditPolicy, ToolError> {
     let mut policy = EditPolicy {
         require_unique_match: true,
-        max_changed_lines: DEFAULT_MAX_CHANGED_LINES,
-        max_bytes_delta: DEFAULT_MAX_BYTES_DELTA,
     };
     let Some(value) = value else {
         return Ok(policy);
@@ -135,23 +120,7 @@ fn parse_policy(value: Option<&Value>) -> Result<EditPolicy, ToolError> {
             .as_bool()
             .ok_or_else(|| bad_args("`policy.require_unique_match` must be boolean"))?;
     }
-    if let Some(v) = obj.get("max_changed_lines") {
-        policy.max_changed_lines = positive_usize(v, "policy.max_changed_lines")?;
-    }
-    if let Some(v) = obj.get("max_bytes_delta") {
-        policy.max_bytes_delta = positive_usize(v, "policy.max_bytes_delta")?;
-    }
     Ok(policy)
-}
-
-fn positive_usize(value: &Value, field: &str) -> Result<usize, ToolError> {
-    let n = value
-        .as_u64()
-        .ok_or_else(|| bad_args(&format!("`{field}` must be a positive integer")))?;
-    if n == 0 {
-        return Err(bad_args(&format!("`{field}` must be positive")));
-    }
-    usize::try_from(n).map_err(|_| bad_args(&format!("`{field}` is too large")))
 }
 
 fn resolve_path(path: &str, cwd: Option<&str>) -> String {
@@ -209,7 +178,6 @@ async fn edit_text_file(parsed: ParsedArgs) -> Result<String, ToolError> {
     }
 
     let new_content = old_content.replacen(&parsed.old_string, &parsed.new_string, 1);
-    enforce_policy(&old_content, &new_content, &parsed.policy)?;
 
     let mut file = tokio::fs::File::create(&parsed.path)
         .await
@@ -234,28 +202,6 @@ async fn edit_text_file(parsed: ParsedArgs) -> Result<String, ToolError> {
         changed_lines(&old_content, &new_content),
         byte_delta(old_content.len(), new_content.len())
     ))
-}
-
-fn enforce_policy(
-    old_content: &str,
-    new_content: &str,
-    policy: &EditPolicy,
-) -> Result<(), ToolError> {
-    let changed = changed_lines(old_content, new_content);
-    if changed > policy.max_changed_lines {
-        return Err(bad_args(&format!(
-            "edit changes {changed} line(s), above policy.max_changed_lines={}",
-            policy.max_changed_lines
-        )));
-    }
-    let delta = byte_delta(old_content.len(), new_content.len());
-    if delta > policy.max_bytes_delta {
-        return Err(bad_args(&format!(
-            "edit byte delta {delta}, above policy.max_bytes_delta={}",
-            policy.max_bytes_delta
-        )));
-    }
-    Ok(())
 }
 
 fn changed_lines(old_content: &str, new_content: &str) -> usize {
@@ -335,18 +281,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enforces_line_limit() {
+    async fn permits_large_exact_replacements() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("file.txt");
         std::fs::write(&path, "a\nb\nc\n").unwrap();
-        let err = run(&json!({
+        run(&json!({
             "path": path.to_str().unwrap(),
             "old_string": "a\nb\nc",
-            "new_string": "A\nB\nC",
-            "policy": { "max_changed_lines": 2 }
+            "new_string": "A\nB\nC"
         }))
         .await
-        .unwrap_err();
-        assert!(matches!(err, ToolError::BadArgs { .. }));
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "A\nB\nC\n");
     }
 }

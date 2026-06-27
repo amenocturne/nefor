@@ -126,8 +126,7 @@ do
   assert_eq(calls[1].decision, "approve", "yolo write_file no-plan decision is approve")
 end
 
--- auto: direct edit/write is autonomous, with edit_file still constrained
--- by the small-edit policy before it reaches basic-tools.
+-- auto: direct edit/write is autonomous.
 do
   fresh("auto")
   feed({
@@ -140,8 +139,7 @@ do
   assert_eq(#calls, 1, "auto edit_file emits one envelope")
   assert_eq(calls[1].kind, "tool.permission_response", "auto edit_file approves")
   assert_eq(calls[1].decision, "approve", "auto edit_file decision is approve")
-  assert_true(type(calls[1].args) == "table" and type(calls[1].args.policy) == "table",
-    "auto edit_file carries small-edit policy")
+  assert_eq(calls[1].args, nil, "auto edit_file approval has no policy args")
 end
 
 print("tool_validator_mode_test: all assertions passed")
