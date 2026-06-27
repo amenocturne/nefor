@@ -5542,6 +5542,56 @@ fn lead_workflow_plan_approved_updates_status() {
 }
 
 #[test]
+fn plan_approval_before_append_marks_matching_plan() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "lead-workflow.plan.approved",
+            "plan_id": "early-approval",
+            "approved": true,
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.plan.append",
+            "plan_id": "early-approval",
+            "text": "Plan appended after approval",
+            "submitted_at": "2026-05-08T09:16:00Z",
+        }),
+    );
+    let out = render_str(&mut engine);
+
+    assert!(
+        out.contains("✓ approved"),
+        "plan appended after approval should render as approved: {out:?}"
+    );
+    assert!(
+        !out.contains("/approve"),
+        "approved plan must not trap later input in review mode: {out:?}"
+    );
+
+    let _ = engine.take_emit_queue();
+    submit_text(&mut engine, "so what's the status?");
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1, "status prompt should emit one envelope");
+    let (target, body) = &emits[0];
+    assert_eq!(target.as_deref(), Some("engine"));
+    assert_eq!(
+        body.get("kind").and_then(|v| v.as_str()),
+        Some("chat.input.submit")
+    );
+    assert_eq!(
+        body.get("text").and_then(|v| v.as_str()),
+        Some("so what's the status?")
+    );
+}
+
+#[test]
 fn lead_workflow_plan_rejected_marks_entry() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");

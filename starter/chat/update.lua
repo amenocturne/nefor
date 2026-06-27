@@ -89,6 +89,33 @@ local function has_pending_plan(state)
   return false
 end
 
+local function plan_key(entry)
+  if type(entry) ~= "table" then return nil end
+  return entry.plan_id or entry.submitted_at
+end
+
+local function pending_plan_status(state, key)
+  local pending = state.pending_plan_status
+  if type(pending) ~= "table" or key == nil then return nil end
+  return pending[key]
+end
+
+local function without_pending_plan_status(state, key)
+  local pending = state.pending_plan_status
+  if type(pending) ~= "table" or key == nil or pending[key] == nil then return state end
+  local next_pending = {}
+  local any = false
+  for k, v in pairs(pending) do
+    if k ~= key then
+      next_pending[k] = v
+      any = true
+    end
+  end
+  return shallow_merge(state, {
+    pending_plan_status = any and next_pending or NIL_SENTINEL,
+  })
+end
+
 -- Pure-update prune for stale dag runs + expired toasts.
 local function prune_expired(state)
   local now = tui.now_ms()
@@ -700,17 +727,27 @@ end
 local function handle_plan_append(msg, state)
   local text = msg.text or ""
   if #text == 0 then return state, {} end
+  local key = msg.plan_id or msg.submitted_at
   local submitted_at = msg.submitted_at
-  if submitted_at ~= nil then
+  if key ~= nil then
     for _, v in ipairs(state.entries) do
-      if v.kind == "plan" and v.submitted_at == submitted_at then
+      if v.kind == "plan" and plan_key(v) == key then
         return state, {}
       end
     end
   end
-  return transcript.push_entry(state,
-    Entry.plan(text, submitted_at)
-  ), {}
+  local approved = msg.approved
+  local pending_status = pending_plan_status(state, key)
+  local status
+  if approved == true or pending_status == true then
+    status = "approved"
+  elseif approved == false or pending_status == false then
+    status = "rejected"
+  end
+  local next_state = transcript.push_entry(state,
+    Entry.plan(text, submitted_at, msg.plan_id, status)
+  )
+  return without_pending_plan_status(next_state, key), {}
 end
 
 local function handle_compaction_commit(msg, state)
@@ -743,19 +780,28 @@ end
 
 local function handle_plan_approved(msg, state)
   local approved = (msg.approved == true)
+  local key = msg.plan_id or msg.submitted_at
   local entries = {}
   local target_idx
   for i, v in ipairs(state.entries) do
     if v.kind == "plan" and v.status == "pending" then
-      target_idx = i
+      if key == nil or plan_key(v) == key then
+        target_idx = i
+      end
     end
     entries[i] = v
   end
-  if target_idx == nil then return state, {} end
+  if target_idx == nil then
+    if key == nil then return state, {} end
+    local pending = {}
+    for k, v in pairs(state.pending_plan_status or {}) do pending[k] = v end
+    pending[key] = approved
+    return shallow_merge(state, { pending_plan_status = pending }), {}
+  end
   entries[target_idx] = shallow_merge(entries[target_idx], {
     status = approved and "approved" or "rejected",
   })
-  return shallow_merge(state, { entries = entries }), {}
+  return without_pending_plan_status(shallow_merge(state, { entries = entries }), key), {}
 end
 
 local function handle_popup(msg, state)

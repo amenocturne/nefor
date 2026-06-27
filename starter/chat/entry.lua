@@ -63,12 +63,12 @@ function M.graph_result(run_id, status, nodes, output, err, duration_ms)
   }
 end
 
-function M.plan(text, submitted_at)
+function M.plan(text, submitted_at, plan_id, status)
   local v = next_v()
   log.log("entry", "create kind=plan v=%d", v)
   return {
-    kind = "plan", text = text, submitted_at = submitted_at,
-    status = "pending", v = v,
+    kind = "plan", text = text, submitted_at = submitted_at, plan_id = plan_id,
+    status = status or "pending", v = v,
   }
 end
 

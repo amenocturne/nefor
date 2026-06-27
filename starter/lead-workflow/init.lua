@@ -763,6 +763,7 @@ local function submit_plan(firing_id, args)
   end
 
   local submitted_at = nefor.engine.now()
+  local plan_id = "plan-" .. tostring(firing_id)
 
   if state.gate_mode == "yolo" then
     emit_tool_result_ok(firing_id, {
@@ -772,6 +773,7 @@ local function submit_plan(firing_id, args)
     return
   elseif state.gate_mode == "auto" then
     state.active_plan = {
+      plan_id           = plan_id,
       content           = plan,
       submitted_at      = submitted_at,
       pending_firing_id = nil,
@@ -780,11 +782,14 @@ local function submit_plan(firing_id, args)
     }
     emit_as(SOURCE_NAME, nil, {
       kind         = "lead-workflow.plan.submitted",
+      plan_id      = plan_id,
       plan         = plan,
       submitted_at = submitted_at,
     })
     emit_as(SOURCE_NAME, nil, {
       kind             = "lead-workflow.plan.approved",
+      plan_id          = plan_id,
+      submitted_at     = submitted_at,
       approved         = true,
       approval_reason  = "auto mode",
     })
@@ -808,6 +813,7 @@ local function submit_plan(firing_id, args)
   end
 
   state.active_plan = {
+    plan_id           = plan_id,
     content           = plan,
     submitted_at      = submitted_at,
     pending_firing_id = firing_id,
@@ -821,6 +827,7 @@ local function submit_plan(firing_id, args)
   -- back into actor state and does not survive across sessions.
   emit_as(SOURCE_NAME, nil, {
     kind         = "lead-workflow.plan.submitted",
+    plan_id      = plan_id,
     plan         = plan,
     submitted_at = submitted_at,
   })
@@ -905,6 +912,8 @@ local function handle_chat_input(body)
 
     emit_as(SOURCE_NAME, nil, {
       kind             = "lead-workflow.plan.approved",
+      plan_id          = plan.plan_id,
+      submitted_at     = plan.submitted_at,
       approved         = verdict,
       approval_reason  = reason,
     })
@@ -953,6 +962,7 @@ local function reduce_plan_submitted(body)
   -- it here appends historical plans at the tail on reattach.
   emit_as(SOURCE_NAME, nil, {
     kind         = "chat.plan.append",
+    plan_id      = body.plan_id,
     text         = body.plan,
     submitted_at = body.submitted_at,
   })
