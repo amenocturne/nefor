@@ -938,6 +938,38 @@ local function test_rga_provider_error_closes_pending_firing()
   assert_eq(pending_count(), 0, "provider error clears provider pending entry")
 end
 
+local function test_scoped_turn_error_closes_pending_firing()
+  reset_rga()
+  _test.set_plugins({ "ollama" })
+  dispatch_run_node({
+    kind = "provider-wrapper.run_node",
+    run_id = "rTE", node_id = "nTE", firing_id = "fTE",
+    args = { provider = "ollama", prompt = "p" },
+    inputs = {},
+  })
+  local create = find_call_with_kind("ollama.chat.create")
+  assert_true(create ~= nil, "create envelope captured")
+  local chat_id = create.body.chat_id
+  _test.calls_clear()
+
+  local prov_hook = build_provider_chain("ollama")
+  prov_hook.from_plugin({ {
+    type = "event", from = "ollama",
+    body = {
+      kind = "ollama.turn.error",
+      chat_id = chat_id,
+      message = "stream error: unexpected EOF",
+    },
+  } })
+
+  local result = find_call_with_kind("tool.result")
+  assert_true(result ~= nil, "tool.result emitted")
+  assert_eq(result.body.id, "fTE", "tool.result keyed by firing_id")
+  assert_eq(result.body.error, "stream error: unexpected EOF",
+    "scoped turn.error is surfaced as canonical tool.result error")
+  assert_eq(pending_count(), 0, "scoped turn.error clears provider pending entry")
+end
+
 local function test_rga_per_firing_keying_distinct_firings_resolve_independently()
   reset_rga()
   _test.set_plugins({ "ollama" })
@@ -1565,6 +1597,7 @@ local tests = {
   { name = "rga_provider_result_emits_tool_result_with_next_state", fn = test_rga_provider_result_emits_tool_result_with_next_state },
   { name = "rga_provider_result_for_unknown_chat_passes_through", fn = test_rga_provider_result_for_unknown_chat_passes_through },
   { name = "rga_provider_error_closes_pending_firing", fn = test_rga_provider_error_closes_pending_firing },
+  { name = "scoped_turn_error_closes_pending_firing", fn = test_scoped_turn_error_closes_pending_firing },
   { name = "rga_per_firing_keying_distinct_firings_resolve_independently", fn = test_rga_per_firing_keying_distinct_firings_resolve_independently },
   { name = "rga_register_type_dispatches_custom_handler", fn = test_rga_register_type_dispatches_custom_handler },
   { name = "rga_terminal_handler_emits_tool_result_synchronously", fn = test_rga_terminal_handler_emits_tool_result_synchronously },

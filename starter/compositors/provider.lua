@@ -20,6 +20,7 @@
 --   <prefix>.model.set_ack         → chat.model.set_ack (+ provider)
 --   <prefix>.reasoning.set_ack     → chat.reasoning.set_ack (+ provider)
 --   <prefix>.turn.error            → chat.message.append (system)
+--   <prefix>.turn.error {chat_id}  → <prefix>.chat.error
 --   <prefix>.hello                 → chat.model.set_ack (model fanout)
 --   <prefix>.ready                 → drop (after auth.set injection)
 --   <prefix>.goodbye               → drop
@@ -342,6 +343,13 @@ function M.spawn_spec(name, command, opts)
         if hooks.intercept_inbound(env, hook_helpers) == false then
           goto continue
         end
+      end
+
+      if type(env.body) == "table"
+          and env.body.kind == kinds.turn_error
+          and type(env.body.chat_id) == "string" then
+        env.body.kind = kinds.chat_error
+        env.body.message = env.body.message or env.body.error or "provider error"
       end
 
       local body = translator.outbound(env)
