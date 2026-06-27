@@ -123,7 +123,11 @@ async fn run_dispatch_loop(
                             tracing::warn!(?env, "unexpected system envelope after handshake");
                         }
                         Body::Event(map) => {
-                            dispatch_event(out_tx, map).await?;
+                            if is_tool_invoke_event(map) {
+                                spawn_tool_invoke(out_tx, map);
+                            } else {
+                                dispatch_event(out_tx, map).await?;
+                            }
                         }
                     },
                     Some(Err(e)) => {
@@ -154,11 +158,30 @@ async fn dispatch_event(
         Some(k) => k,
         None => return Ok(()),
     };
-    let invoke_kind = format!("{PLUGIN_NAME}.tool.invoke");
-    if kind == invoke_kind {
+    if is_tool_invoke_kind(kind) {
         handle_tool_invoke(out_tx, body).await?;
     }
     Ok(())
+}
+
+fn is_tool_invoke_event(body: &Map<String, Value>) -> bool {
+    body.get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(is_tool_invoke_kind)
+}
+
+fn is_tool_invoke_kind(kind: &str) -> bool {
+    kind == format!("{PLUGIN_NAME}.tool.invoke")
+}
+
+fn spawn_tool_invoke(out_tx: &mpsc::Sender<PluginOutgoing>, body: &Map<String, Value>) {
+    let out_tx = out_tx.clone();
+    let body = body.clone();
+    tokio::spawn(async move {
+        if let Err(e) = handle_tool_invoke(&out_tx, &body).await {
+            tracing::error!(error = %e, "tool.invoke task failed");
+        }
+    });
 }
 
 async fn handle_tool_invoke(
@@ -331,6 +354,8 @@ async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), Transpo
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::time::Duration;
+    use tokio::time::timeout;
 
     #[test]
     fn hello_body_advertises_plugin_version() {
@@ -524,6 +549,65 @@ mod tests {
         let body = v.get("body").expect("body");
         assert_eq!(body.get("id").and_then(Value::as_str), Some("call-9"));
         assert!(body.get("error").is_some());
+    }
+
+    /// The plugin event loop must not let one long-running tool invocation
+    /// block later independent invocations. Graphs rely on this for async
+    /// branch execution: a fast node should not wait behind a slow sibling.
+    #[tokio::test]
+    async fn spawned_invocations_run_concurrently() {
+        let (out_tx, mut out_rx) = mpsc::channel::<PluginOutgoing>(8);
+
+        let slow = json!({
+            "kind": "basic-tools.tool.invoke",
+            "id": "slow-call",
+            "name": "bash",
+            "args": { "command": "sleep 0.2; echo SLOW_DONE" }
+        })
+        .as_object()
+        .expect("obj")
+        .clone();
+        let fast = json!({
+            "kind": "basic-tools.tool.invoke",
+            "id": "fast-call",
+            "name": "bash",
+            "args": { "command": "echo FAST_DONE" }
+        })
+        .as_object()
+        .expect("obj")
+        .clone();
+
+        spawn_tool_invoke(&out_tx, &slow);
+        spawn_tool_invoke(&out_tx, &fast);
+
+        let first = recv_result_body(&mut out_rx).await;
+        let second = recv_result_body(&mut out_rx).await;
+
+        assert_eq!(
+            first.get("id").and_then(Value::as_str),
+            Some("fast-call"),
+            "fast invocation should not wait for the slow invocation"
+        );
+        assert!(first
+            .get("output")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.contains("FAST_DONE")));
+        assert_eq!(second.get("id").and_then(Value::as_str), Some("slow-call"));
+        assert!(second
+            .get("output")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.contains("SLOW_DONE")));
+    }
+
+    async fn recv_result_body(rx: &mut mpsc::Receiver<PluginOutgoing>) -> Map<String, Value> {
+        let msg = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for tool.result")
+            .expect("tool.result message");
+        match msg.body {
+            Body::Event(body) => body,
+            Body::System(other) => panic!("expected event body, got {other:?}"),
+        }
     }
 
     /// Events with a different kind (e.g. another plugin's broadcast) are
