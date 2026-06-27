@@ -238,6 +238,11 @@ pub enum SseEvent {
     /// every fragment for the same `index` and parses the result at
     /// finish-time.
     ToolCallArgsDelta { index: usize, delta: String },
+    /// Several tool-call fragments arrived in the same SSE frame. Most
+    /// providers emit one fragment per frame, but OpenAI's schema allows
+    /// `tool_calls[]` to carry siblings; keep every item so parallel
+    /// tool calls cannot be silently dropped.
+    ToolCallBatch(Vec<SseEvent>),
     /// Empty / informational frame we can ignore.
     Empty,
 }
@@ -381,15 +386,15 @@ pub fn parse_sse_chunk(payload: &str) -> SseEvent {
     }
 
     // Tool-call deltas live alongside the regular `delta.content` field.
-    // We only look at the first entry in `tool_calls` per chunk: providers
-    // we've seen emit one tool-call shape per chunk even when several
-    // calls are in flight (different `index` values per chunk).
+    // Preserve every entry in `tool_calls[]`; providers often emit one
+    // shape per frame, but a legal parallel-call frame can carry siblings.
     if let Some(tc_array) = first_choice
         .and_then(|c| c.get("delta"))
         .and_then(|d| d.get("tool_calls"))
         .and_then(|tc| tc.as_array())
     {
-        if let Some(tc) = tc_array.first() {
+        let mut events = Vec::new();
+        for tc in tc_array {
             let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
             // Chunk 1 carries id + function.name (and possibly an empty
             // arguments string). Detect by name presence — id alone is
@@ -412,16 +417,21 @@ pub fn parse_sse_chunk(payload: &str) -> SseEvent {
             //   * Delta chunk: id+name absent, args carries a partial
             //     fragment to concatenate.
             if let (Some(id), Some(name)) = (id, name) {
-                return SseEvent::ToolCallStart {
+                events.push(SseEvent::ToolCallStart {
                     index,
                     id: id.to_owned(),
                     name: name.to_owned(),
                     args,
-                };
+                });
+            } else if !args.is_empty() {
+                events.push(SseEvent::ToolCallArgsDelta { index, delta: args });
             }
-            if !args.is_empty() {
-                return SseEvent::ToolCallArgsDelta { index, delta: args };
-            }
+        }
+        if events.len() == 1 {
+            return events.remove(0);
+        }
+        if !events.is_empty() {
+            return SseEvent::ToolCallBatch(events);
         }
     }
 
@@ -719,6 +729,41 @@ mod tests {
                 assert_eq!(name, "write_file");
             }
             other => panic!("expected ToolCallStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sse_chunk_keeps_multiple_tool_calls_from_one_frame() {
+        let payload = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read_file","arguments":""}},{"index":1,"id":"call_b","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"/tmp/x\"}"}}]}}]}"#;
+        match parse_sse_chunk(payload) {
+            SseEvent::ToolCallBatch(events) => {
+                assert_eq!(events.len(), 2);
+                match &events[0] {
+                    SseEvent::ToolCallStart {
+                        index, id, name, ..
+                    } => {
+                        assert_eq!(*index, 0);
+                        assert_eq!(id, "call_a");
+                        assert_eq!(name, "read_file");
+                    }
+                    other => panic!("expected first ToolCallStart, got {other:?}"),
+                }
+                match &events[1] {
+                    SseEvent::ToolCallStart {
+                        index,
+                        id,
+                        name,
+                        args,
+                    } => {
+                        assert_eq!(*index, 1);
+                        assert_eq!(id, "call_b");
+                        assert_eq!(name, "write_file");
+                        assert_eq!(args, r#"{"path":"/tmp/x"}"#);
+                    }
+                    other => panic!("expected second ToolCallStart, got {other:?}"),
+                }
+            }
+            other => panic!("expected ToolCallBatch, got {other:?}"),
         }
     }
 

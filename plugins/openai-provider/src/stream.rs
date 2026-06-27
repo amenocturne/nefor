@@ -614,6 +614,24 @@ where
             SseEvent::ToolCallArgsDelta { index, delta } => {
                 tc_acc.append_args(index, &delta);
             }
+            SseEvent::ToolCallBatch(events) => {
+                for event in events {
+                    match event {
+                        SseEvent::ToolCallStart {
+                            index,
+                            id,
+                            name,
+                            args,
+                        } => {
+                            tc_acc.start(index, id, name, args);
+                        }
+                        SseEvent::ToolCallArgsDelta { index, delta } => {
+                            tc_acc.append_args(index, &delta);
+                        }
+                        _ => {}
+                    }
+                }
+            }
             SseEvent::Done | SseEvent::Empty => {}
         }
     }
@@ -978,6 +996,38 @@ mod tests {
         assert_eq!(calls[0].id, "call_x");
         assert_eq!(calls[0].function.name, "read_file");
         assert_eq!(calls[0].function.arguments, "{\"path\":\"/tmp/x\"}");
+    }
+
+    #[test]
+    fn drain_assembles_multiple_tool_calls_from_one_frame() {
+        let mut buffer = SseBuffer::new();
+        push(&mut buffer, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"/tmp/a\\\"}\"}},{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"/tmp/b\\\"}\"}}]}}]}\n\n");
+        push(
+            &mut buffer,
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        );
+
+        let mut outcome = StreamOutcome::default();
+        let mut tc = ToolCallAccumulator::new();
+        let mut ended = false;
+        drain_complete_frames(
+            &mut buffer,
+            &mut outcome,
+            &mut tc,
+            &mut ended,
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .expect("drain ok");
+        assert_eq!(outcome.finish_reason.as_deref(), Some("tool_calls"));
+        let calls = tc.finalize();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"/tmp/a"}"#);
+        assert_eq!(calls[1].id, "call_b");
+        assert_eq!(calls[1].function.name, "write_file");
+        assert_eq!(calls[1].function.arguments, r#"{"path":"/tmp/b"}"#);
     }
 
     /// Reasoning-then-content interleave assembles correctly into

@@ -45,7 +45,7 @@ use crate::error::ChatgptError;
 /// Minimal subset of the model metadata returned by
 /// `GET /models`. The real `ModelInfo` codex defines has 30+ fields;
 /// nefor only needs the user-facing identity, ordering hints, and the
-/// capability bits we actually act on (reasoning today; more later).
+/// capability bits we actually act on.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ModelEntry {
     pub slug: String,
@@ -66,9 +66,19 @@ pub struct ModelEntry {
     /// summary visible, which is strictly safer than a 400.
     #[serde(default)]
     pub supports_reasoning_summaries: bool,
+    /// Whether this model can emit multiple tool calls in one assistant
+    /// turn. Default `true` preserves the async tool contract when a
+    /// model-list entry omits the flag; the live Responses endpoint is
+    /// still the authority for specific slugs that say otherwise.
+    #[serde(default = "default_supports_parallel_tool_calls")]
+    pub supports_parallel_tool_calls: bool,
     /// Context window size if the backend reports it.
     #[serde(default, alias = "max_input_tokens", alias = "context_window")]
     pub context_length: Option<u64>,
+}
+
+fn default_supports_parallel_tool_calls() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -730,19 +740,22 @@ mod model_entry_tests {
             "display_name": "GPT-5",
             "priority": 10,
             "supports_reasoning_summaries": true,
+            "supports_parallel_tool_calls": true,
         });
         let m: ModelEntry = serde_json::from_value(v).expect("decode");
         assert_eq!(m.slug, "gpt-5");
         assert!(m.supports_reasoning_summaries);
+        assert!(m.supports_parallel_tool_calls);
     }
 
     #[test]
-    fn model_entry_defaults_reasoning_to_false_when_absent() {
+    fn model_entry_defaults_capabilities_when_absent() {
         // Backend omitting the field MUST default to false so a missing
         // capability never accidentally activates reasoning.
         let v = json!({ "slug": "mystery-model" });
         let m: ModelEntry = serde_json::from_value(v).expect("decode");
         assert!(!m.supports_reasoning_summaries);
+        assert!(m.supports_parallel_tool_calls);
     }
 
     #[test]
@@ -761,5 +774,16 @@ mod model_entry_tests {
         let m: ModelEntry = serde_json::from_value(v).expect("decode");
         assert_eq!(m.slug, "gpt-5.3-codex-spark");
         assert!(!m.supports_reasoning_summaries);
+        assert!(m.supports_parallel_tool_calls);
+    }
+
+    #[test]
+    fn model_entry_deserialises_parallel_tool_calls_false() {
+        let v = json!({
+            "slug": "serial-tool-model",
+            "supports_parallel_tool_calls": false,
+        });
+        let m: ModelEntry = serde_json::from_value(v).expect("decode");
+        assert!(!m.supports_parallel_tool_calls);
     }
 }

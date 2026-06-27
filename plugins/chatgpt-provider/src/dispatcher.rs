@@ -623,6 +623,7 @@ fn spawn_models_fetch(
                             m.slug.clone(),
                             crate::state::ModelCapabilities {
                                 supports_reasoning_summaries: m.supports_reasoning_summaries,
+                                supports_parallel_tool_calls: m.supports_parallel_tool_calls,
                             },
                         )
                     }))
@@ -1930,6 +1931,11 @@ fn spawn_turn(
                 effort: snapshot.reasoning_effort,
                 summary: Some(ReasoningSummary::Concise),
             });
+            let supports_parallel_tool_calls = ctx
+                .chats
+                .model_capability_parallel_tool_calls(&snapshot.model)
+                .await
+                .unwrap_or(true);
 
             let req = ResponsesApiRequest {
                 model: snapshot.model.clone(),
@@ -1937,7 +1943,7 @@ fn spawn_turn(
                 input: translated.input,
                 tools: tools_json,
                 tool_choice: "auto".into(),
-                parallel_tool_calls: false,
+                parallel_tool_calls: supports_parallel_tool_calls,
                 reasoning,
                 store: false,
                 stream: true,
@@ -2483,6 +2489,7 @@ mod tests {
                 description: None,
                 priority: Some(10),
                 supports_reasoning_summaries: true,
+                supports_parallel_tool_calls: true,
                 context_length: None,
             },
             ModelEntry {
@@ -2491,6 +2498,7 @@ mod tests {
                 description: Some("coding model".into()),
                 priority: Some(20),
                 supports_reasoning_summaries: false,
+                supports_parallel_tool_calls: false,
                 context_length: None,
             },
         ];

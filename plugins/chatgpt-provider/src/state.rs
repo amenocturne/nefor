@@ -305,6 +305,7 @@ pub struct MessageRestore {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelCapabilities {
     pub supports_reasoning_summaries: bool,
+    pub supports_parallel_tool_calls: bool,
 }
 
 #[derive(Default)]
@@ -367,6 +368,18 @@ impl Chats {
             .await
             .get(model)
             .map(|c| c.supports_reasoning_summaries)
+    }
+
+    /// Authoritative parallel-tool-call capability for `model` when we
+    /// have a /models record for it. `None` means "unknown"; callers
+    /// should default to allowing parallel calls because the rest of the
+    /// runtime already dispatches every returned tool call concurrently.
+    pub async fn model_capability_parallel_tool_calls(&self, model: &str) -> Option<bool> {
+        self.capabilities
+            .lock()
+            .await
+            .get(model)
+            .map(|c| c.supports_parallel_tool_calls)
     }
 
     /// Mark a model as rejecting the `reasoning` request block (e.g. a
@@ -1159,30 +1172,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_model_capabilities_round_trips_reasoning_flag() {
+    async fn record_model_capabilities_round_trips_known_flags() {
         let c = Chats::with_default_model(None);
         c.record_model_capabilities([
             (
                 "gpt-5".to_string(),
                 ModelCapabilities {
                     supports_reasoning_summaries: true,
+                    supports_parallel_tool_calls: true,
                 },
             ),
             (
                 "gpt-5.3-codex-spark".to_string(),
                 ModelCapabilities {
                     supports_reasoning_summaries: false,
+                    supports_parallel_tool_calls: false,
                 },
             ),
         ])
         .await;
         assert_eq!(c.model_capability_reasoning("gpt-5").await, Some(true));
         assert_eq!(
+            c.model_capability_parallel_tool_calls("gpt-5").await,
+            Some(true)
+        );
+        assert_eq!(
             c.model_capability_reasoning("gpt-5.3-codex-spark").await,
+            Some(false)
+        );
+        assert_eq!(
+            c.model_capability_parallel_tool_calls("gpt-5.3-codex-spark")
+                .await,
             Some(false)
         );
         // Unknown model → None (caller falls back to static heuristic).
         assert_eq!(c.model_capability_reasoning("unknown-model").await, None);
+        assert_eq!(
+            c.model_capability_parallel_tool_calls("unknown-model")
+                .await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -1215,6 +1244,7 @@ mod tests {
             "gpt-5".to_string(),
             ModelCapabilities {
                 supports_reasoning_summaries: true,
+                supports_parallel_tool_calls: true,
             },
         )])
         .await;
