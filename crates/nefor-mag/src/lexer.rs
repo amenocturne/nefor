@@ -255,8 +255,8 @@ mod tests {
 
     #[test]
     fn floats() {
-        let tokens = tokenize("3.14 -0.5").unwrap();
-        assert_eq!(tokens, vec![Token::Float(3.14), Token::Float(-0.5)]);
+        let tokens = tokenize("1.25 -0.5").unwrap();
+        assert_eq!(tokens, vec![Token::Float(1.25), Token::Float(-0.5)]);
     }
 
     #[test]

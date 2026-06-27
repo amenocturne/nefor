@@ -945,7 +945,7 @@ fn builtin_map(f: &Value, coll: &Value) -> Result<Value, MagError> {
     let items = extract_list(coll)?;
     let mut result = Vec::new();
     for item in items {
-        result.push(apply_value(f, &[item.clone()])?);
+        result.push(apply_value(f, std::slice::from_ref(item))?);
     }
     Ok(Value::List(result))
 }
@@ -954,7 +954,7 @@ fn builtin_filter(f: &Value, coll: &Value) -> Result<Value, MagError> {
     let items = extract_list(coll)?;
     let mut result = Vec::new();
     for item in items {
-        let test = apply_value(f, &[item.clone()])?;
+        let test = apply_value(f, std::slice::from_ref(item))?;
         if is_truthy(&test) {
             result.push(item.clone());
         }
