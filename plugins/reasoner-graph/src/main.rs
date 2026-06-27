@@ -60,6 +60,25 @@ async fn main() {
     std::process::exit(0);
 }
 
+/// Parse `--peer <name>` flags from argv. Pre-seeds the peer set so the
+/// scheduler knows which reasoners are available at startup, before any
+/// bus events arrive. The starter passes all Lua-resident reasoner names
+/// here so a spawn_graph referencing them never hits "not connected."
+fn parse_seed_peers() -> HashSet<String> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut peers = HashSet::new();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--peer" && i + 1 < args.len() {
+            peers.insert(args[i + 1].clone());
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    peers
+}
+
 async fn run() -> Result<(), TransportError> {
     let (out_tx, _writer_handle) = spawn_stdout_writer(CHANNEL_CAP);
     let (in_tx, mut in_rx) = mpsc::channel::<Result<Envelope, TransportError>>(CHANNEL_CAP);
@@ -73,7 +92,11 @@ async fn run() -> Result<(), TransportError> {
     send_event(&out_tx, ready_body()).await?;
 
     let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
-    let peers: Arc<Mutex<PeerSet>> = Arc::new(Mutex::new(HashSet::new()));
+    let seed = parse_seed_peers();
+    if !seed.is_empty() {
+        tracing::info!(count = seed.len(), "pre-seeded peer set from --peer flags");
+    }
+    let peers: Arc<Mutex<PeerSet>> = Arc::new(Mutex::new(seed));
 
     run_dispatch_loop(&runs, &peers, &out_tx, &mut in_rx).await?;
 

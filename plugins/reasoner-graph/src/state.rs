@@ -455,19 +455,30 @@ fn final_status(state: &RunState) -> RunStatus {
 }
 
 /// Build the `results` map for a `graph.run_complete` from the run state.
+/// Always includes the terminal node. On failure / partial_failure, also
+/// includes every node that errored so the caller can see what went wrong
+/// (without this, a skipped terminal hides the upstream cause).
 fn build_results(state: &RunState) -> Map<String, Value> {
     let mut m = Map::new();
-    let id = state.graph.terminal().to_owned();
-    let v = state
+    let terminal_id = state.graph.terminal().to_owned();
+    let terminal_v = state
         .completed
-        .get(&id)
+        .get(&terminal_id)
         .map(NodeStatus::to_results_value)
         .unwrap_or_else(|| {
             let mut o = Map::new();
             o.insert("skipped".into(), Value::Bool(true));
             Value::Object(o)
         });
-    m.insert(id, v);
+    m.insert(terminal_id.clone(), terminal_v);
+    for id in state.graph.ids_in_order() {
+        if *id == terminal_id {
+            continue;
+        }
+        if let Some(status @ NodeStatus::Error(_)) = state.completed.get(id) {
+            m.insert(id.clone(), status.to_results_value());
+        }
+    }
     m
 }
 
@@ -698,6 +709,10 @@ fn try_dispatch(state: &mut RunState, node_id: &str, peers: &PeerSet, effects: &
                     .unwrap_or(Value::Null),
                 completed: true,
             });
+        // Clear pending_refire: the node is now completed (with error).
+        // Without this, run_is_done() sees a non-empty pending_refire
+        // set and never considers the run finished — the graph hangs.
+        state.pending_refire.remove(&node.id);
         state
             .completed
             .insert(node.id.clone(), NodeStatus::Error(msg));
@@ -822,6 +837,9 @@ fn propagate_after_completion(
             })
             .cloned()
             .collect();
+        for id in &to_skip {
+            state.pending_refire.remove(id);
+        }
         for id in to_skip {
             state.completed.insert(id, NodeStatus::Skipped);
         }
@@ -3497,5 +3515,86 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn fanin_with_missing_downstream_reasoner_completes_as_failure() {
+        // Two source nodes (reasoner "r", connected) fan into a third
+        // node (reasoner "missing", not connected). The scheduler should
+        // synthesize a failure for the missing node, skip the terminal,
+        // and emit RunComplete(Failure) — NOT hang forever.
+        let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
+        let peers = peers_with(&["r"]);
+        let g = json!({
+            "terminal": "out",
+            "nodes": [
+                {"id": "a", "reasoner": "r", "args": {}},
+                {"id": "b", "reasoner": "r", "args": {}},
+                {"id": "join", "reasoner": "missing", "args": {}},
+                {"id": "out", "reasoner": "r", "args": {}}
+            ],
+            "edges": [
+                {"from": "a", "to": "join"},
+                {"from": "b", "to": "join"},
+                {"from": "join", "to": "out"}
+            ]
+        });
+        let outcome = Scheduler::handle_submit(&runs, &peers, &submit_body("run-miss", g, None));
+        let e1 = match outcome {
+            SubmitOutcome::Accepted(e) => e.into_vec(),
+            _ => panic!("expected accepted"),
+        };
+        let fa = e1
+            .iter()
+            .find_map(|e| match e {
+                Effect::DispatchNode {
+                    node_id, firing_id, ..
+                } if node_id == "a" => Some(firing_id.clone()),
+                _ => None,
+            })
+            .expect("a dispatched");
+        let fb = e1
+            .iter()
+            .find_map(|e| match e {
+                Effect::DispatchNode {
+                    node_id, firing_id, ..
+                } if node_id == "b" => Some(firing_id.clone()),
+                _ => None,
+            })
+            .expect("b dispatched");
+
+        // Complete a.
+        let r_a = Scheduler::handle_node_result(
+            &runs,
+            &peers,
+            &result_body("run-miss", "a", Some(&fa), Ok(json!("ok-a")), None),
+        )
+        .into_vec();
+        // join can't fire yet (b not done).
+        assert!(
+            !r_a.iter().any(|e| matches!(e, Effect::RunComplete { .. })),
+            "run must not complete after only a finishes"
+        );
+
+        // Complete b → join becomes runnable, but "missing" is not
+        // connected → synthesized failure → abort → out skipped →
+        // RunComplete(Failure).
+        let r_b = Scheduler::handle_node_result(
+            &runs,
+            &peers,
+            &result_body("run-miss", "b", Some(&fb), Ok(json!("ok-b")), None),
+        )
+        .into_vec();
+        let complete = r_b
+            .iter()
+            .find(|e| matches!(e, Effect::RunComplete { .. }))
+            .expect("run must complete when missing reasoner is detected");
+        match complete {
+            Effect::RunComplete { status, .. } => {
+                assert_eq!(*status, RunStatus::Failure);
+            }
+            _ => unreachable!(),
+        }
+        assert!(runs.lock().unwrap().is_empty(), "run removed from registry");
     }
 }
