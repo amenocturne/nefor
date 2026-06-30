@@ -1,6 +1,7 @@
 ;; Full lead workflow: explore → plan → critique → human approval →
 ;; parallel build → compile → test → review
 ;; With retry loops on both compile and test failures
+;; NOTE: shell fanout types (BuildResult | BuildError) require a custom combinator not yet registered.
 
 (type Task)
 (type Findings)

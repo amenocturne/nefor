@@ -1,5 +1,6 @@
 ;; Feature implementation workflow
 ;; Parallel exploration → summarize → build → compile with retry → review
+;; NOTE: shell fanout types (BuildResult | BuildError) require a custom combinator not yet registered.
 
 (type Task)
 (type Findings)

@@ -38,7 +38,13 @@ pub struct EdgeIr {
 
 fn qualify_type(ty: &MagType) -> String {
     match ty {
-        MagType::Named(name) => format!("mag.{name}"),
+        MagType::Named(name) => {
+            if name.contains('.') {
+                name.clone()
+            } else {
+                format!("mag.{name}")
+            }
+        }
         MagType::Var(name) => format!("mag.{name}"),
         MagType::Union(types) => {
             let parts: Vec<_> = types.iter().map(qualify_type).collect();
@@ -74,7 +80,7 @@ fn value_to_json(val: &Value) -> serde_json::Value {
     }
 }
 
-fn node_to_ir(node: &NodeValue) -> NodeIr {
+pub(crate) fn node_to_ir(node: &NodeValue) -> NodeIr {
     let args: serde_json::Map<String, serde_json::Value> = node
         .args
         .iter()
@@ -148,5 +154,41 @@ pub fn normalize(graph: GraphValue) -> GraphIr {
         nodes,
         edges,
         hash,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::MagType;
+
+    #[test]
+    fn qualify_bare_type() {
+        let ty = MagType::Named("ToolCalls".into());
+        assert_eq!(qualify_type(&ty), "mag.ToolCalls");
+    }
+
+    #[test]
+    fn qualify_dotted_type_passes_through() {
+        let ty = MagType::Named("generic-tool.ToolCalls".into());
+        assert_eq!(qualify_type(&ty), "generic-tool.ToolCalls");
+    }
+
+    #[test]
+    fn qualify_union_with_mixed_types() {
+        let ty = MagType::Union(vec![
+            MagType::Named("generic-tool.ToolCalls".into()),
+            MagType::Named("generic-provider.FinalAnswer".into()),
+        ]);
+        assert_eq!(
+            qualify_type(&ty),
+            "generic-tool.ToolCalls|generic-provider.FinalAnswer"
+        );
+    }
+
+    #[test]
+    fn qualify_var_always_prefixed() {
+        let ty = MagType::Var("INPUT".into());
+        assert_eq!(qualify_type(&ty), "mag.INPUT");
     }
 }

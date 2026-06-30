@@ -1652,6 +1652,54 @@ mod tests {
         assert!(matches!(result, Value::Nil));
     }
 
+    #[test]
+    fn node_with_dotted_types_compiles() {
+        // (node "llm" {} : generic-provider.ProviderOut -> (generic-tool.ToolCalls | generic-provider.FinalAnswer))
+        let mut env = Env::new_with_stdlib();
+        let result = eval_with_env(
+            &mut env,
+            vec![Expr::List(vec![
+                Expr::Symbol("node".into()),
+                Expr::Str("llm".into()),
+                Expr::Map(vec![]),
+                Expr::Symbol(":".into()),
+                Expr::Symbol("generic-provider.ProviderOut".into()),
+                Expr::Symbol("->".into()),
+                Expr::List(vec![
+                    Expr::Symbol("generic-tool.ToolCalls".into()),
+                    Expr::Symbol("|".into()),
+                    Expr::Symbol("generic-provider.FinalAnswer".into()),
+                ]),
+            ])],
+        )
+        .unwrap();
+
+        if let Value::Node(node) = &result {
+            assert_eq!(
+                node.input_type,
+                MagType::Named("generic-provider.ProviderOut".into())
+            );
+            assert_eq!(
+                node.output_type,
+                MagType::Union(vec![
+                    MagType::Named("generic-tool.ToolCalls".into()),
+                    MagType::Named("generic-provider.FinalAnswer".into()),
+                ])
+            );
+
+            // Verify IR normalization passes through qualified types
+            let ir = crate::ir::node_to_ir(node);
+            let fanout = ir.fanout.unwrap();
+            assert_eq!(fanout.input, "generic-provider.ProviderOut");
+            assert_eq!(
+                fanout.out,
+                vec!["generic-tool.ToolCalls", "generic-provider.FinalAnswer"]
+            );
+        } else {
+            panic!("expected node, got {:?}", result);
+        }
+    }
+
     // --- require tests ---
 
     #[test]

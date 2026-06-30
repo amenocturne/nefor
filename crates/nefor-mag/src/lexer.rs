@@ -142,7 +142,8 @@ fn is_symbol_start(c: char) -> bool {
 }
 
 fn is_symbol_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '?' | '!' | '*' | '=' | '<' | '>')
+    c.is_ascii_alphanumeric()
+        || matches!(c, '-' | '_' | '/' | '.' | '?' | '!' | '*' | '=' | '<' | '>')
 }
 
 fn read_symbol_chars(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
@@ -315,6 +316,26 @@ mod tests {
                 Token::Symbol("x".into()),
                 Token::Colon,
                 Token::Symbol("Int".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn dotted_symbol() {
+        let tokens = tokenize("generic-tool.ToolCalls").unwrap();
+        assert_eq!(tokens, vec![Token::Symbol("generic-tool.ToolCalls".into())]);
+    }
+
+    #[test]
+    fn dotted_symbol_in_type() {
+        let tokens = tokenize("(type generic-provider.FinalAnswer)").unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::LParen,
+                Token::Symbol("type".into()),
+                Token::Symbol("generic-provider.FinalAnswer".into()),
+                Token::RParen,
             ]
         );
     }

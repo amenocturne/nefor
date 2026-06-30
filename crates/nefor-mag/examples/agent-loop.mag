@@ -2,36 +2,36 @@
 ;; This is what stdlib's (agent) would expand to
 ;;
 ;; The types form a clean cycle:
-;;   Context -> (ToolCalls | FinalAnswer)
-;;   ToolCalls -> ToolHandle -> Context (tool results become context)
-;;   Context feeds back to llm call
+;;   generic-provider.ProviderOut -> (generic-tool.ToolCalls | generic-provider.FinalAnswer)
+;;   generic-tool.ToolCalls -> ToolHandle -> generic-provider.ProviderOut (tool results become context)
+;;   generic-provider.ProviderOut feeds back to llm call
 
-(type Context)
-(type ToolCalls)
+(type generic-provider.ProviderOut)
+(type generic-tool.ToolCalls)
 (type ToolHandle)
-(type FinalAnswer)
+(type generic-provider.FinalAnswer)
 (type LoopExhausted)
 
 (let [call     (node "llm" {:model "opus"
                             :system "You are a helpful coding assistant."
                             :tools ["fs/read" "fs/edit" "grep" "shell"]}
-                 : Context -> (ToolCalls | FinalAnswer))
+                 : generic-provider.ProviderOut -> (generic-tool.ToolCalls | generic-provider.FinalAnswer))
 
       dispatch (node "run-tool" {}
-                 : ToolCalls -> ToolHandle)
+                 : generic-tool.ToolCalls -> ToolHandle)
 
       result   (node "tool-result" {}
-                 : ToolHandle -> Context)
+                 : ToolHandle -> generic-provider.ProviderOut)
 
       bound    (node "loop-counter" {:max 50}
-                 : Context -> (Context | LoopExhausted))
+                 : generic-provider.ProviderOut -> (generic-provider.ProviderOut | LoopExhausted))
 
       exhaust  (node "llm" {:model "opus"
                             :system "Summarize what you accomplished so far."}
-                 : LoopExhausted -> FinalAnswer)
+                 : LoopExhausted -> generic-provider.FinalAnswer)
 
       output   (node "sink" {}
-                 : FinalAnswer -> FinalAnswer)]
+                 : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]
 
   (graph
     call     -> dispatch
