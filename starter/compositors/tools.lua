@@ -13,9 +13,10 @@
 
 local json = nefor.json
 
-local actor    = require("core.actor")
-local envelope = require("core.envelope")
-local gate_lib = require("tool-gate")
+local actor        = require("core.actor")
+local envelope     = require("core.envelope")
+local gate_lib     = require("tool-gate")
+local chat_emitter = require("libs.chat-emitter")
 
 local M = {}
 
@@ -167,15 +168,16 @@ function M.gate_spec(gate_name, command, opts)
   local function to_plugin(envs)
     for _, env in ipairs(envs) do
       if not env.replay and env.from ~= gate_name then
-        local invoke_chat_id = type(env.body) == "table" and env.body.chat_id or nil
         if type(env.body) == "table"
             and env.body.kind == translator.kinds.tool_advertise then
           gate_lib.record_tool_contexts_from_advertise(env.body)
         end
-        gate_lib.agents_md_emit_for_invoke(
-          translator, env, invoke_chat_id,
+        local invoke_chat_id = type(env.body) == "table" and env.body.chat_id or nil
+        local emitter = chat_emitter.scoped(
+          invoke_chat_id,
           function(body) envelope.emit(nil, body) end
         )
+        gate_lib.agents_md_emit_for_invoke(translator, env, emitter)
         nefor.engine.deliver(gate_name, json.encode({
           type = env.type,
           from = env.from,

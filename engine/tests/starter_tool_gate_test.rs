@@ -593,6 +593,7 @@ fn reminder_uses_declared_context_and_dedupes_by_scope() {
         .load(format!(
             r#"
             local d = require("tool-gate.agents_md")
+            local chat_emitter = require("libs.chat-emitter")
             d._reset()
             d.record_tool_contexts_from_advertise({{
               tools = {{
@@ -601,11 +602,11 @@ fn reminder_uses_declared_context_and_dedupes_by_scope() {
               }}
             }})
             local emitted = {{}}
-            local emit = function(body) emitted[#emitted + 1] = body end
-            local n1 = d.remind_for_tool_call("chat-1", "read_file",
-              {{ path = "{p1}" }}, emit)
-            local n2 = d.remind_for_tool_call("chat-1", "read_file",
-              {{ path = "{p2}" }}, emit)
+            local emitter = chat_emitter.scoped("chat-1", function(body) emitted[#emitted + 1] = body end)
+            local n1 = d.emit_reminders_for_tool_call("read_file",
+              {{ path = "{p1}" }}, emitter)
+            local n2 = d.emit_reminders_for_tool_call("read_file",
+              {{ path = "{p2}" }}, emitter)
             return {{ n1 = n1, n2 = n2, emitted = emitted }}
             "#,
             p1 = dir.join("a.txt").display(),
@@ -645,6 +646,7 @@ fn reminder_is_silent_for_empty_results_and_does_not_mark_scope() {
         .load(format!(
             r#"
             local d = require("tool-gate.agents_md")
+            local chat_emitter = require("libs.chat-emitter")
             d._reset()
             d.record_tool_contexts_from_advertise({{
               tools = {{
@@ -653,14 +655,14 @@ fn reminder_is_silent_for_empty_results_and_does_not_mark_scope() {
               }}
             }})
             local emitted = {{}}
-            local emit = function(body) emitted[#emitted + 1] = body end
-            local n1 = d.remind_for_tool_call("chat-1", "list_dir",
-              {{ path = "{dir}" }}, emit)
+            local emitter = chat_emitter.scoped("chat-1", function(body) emitted[#emitted + 1] = body end)
+            local n1 = d.emit_reminders_for_tool_call("list_dir",
+              {{ path = "{dir}" }}, emitter)
             local f = io.open("{dir}/AGENTS.md", "w")
             f:write("rules later\n")
             f:close()
-            local n2 = d.remind_for_tool_call("chat-1", "list_dir",
-              {{ path = "{dir}" }}, emit)
+            local n2 = d.emit_reminders_for_tool_call("list_dir",
+              {{ path = "{dir}" }}, emitter)
             return {{ n1 = n1, n2 = n2, total = #emitted }}
             "#,
             dir = dir.display(),

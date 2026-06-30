@@ -19,13 +19,8 @@ function M.record_tool_contexts_from_advertise(...)
 end
 function M.folders_for_tool_call(...) return instruction_files.folders_for_tool_call(...) end
 function M.mark_read_for_tool_call(...) return instruction_files.mark_read_for_tool_call(...) end
-
-function M.remind_for_tool_call(chat_id, tool_name, args, emitter)
-  local bodies = instruction_files.reminder_bodies_for_tool_call(chat_id, tool_name, args)
-  for _, body in ipairs(bodies) do
-    emitter(body)
-  end
-  return #bodies
+function M.emit_reminders_for_tool_call(...)
+  return instruction_files.emit_reminders_for_tool_call(...)
 end
 
 function M._reset() return instruction_files._reset() end

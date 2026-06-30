@@ -875,15 +875,16 @@ fn agents_md_emit_for_invoke_no_ops_on_non_outbound_invoke_envelopes() {
         .load(
             r#"
             local lib = require("tool-gate")
+            local chat_emitter = require("libs.chat-emitter")
             local t = lib.translator("tool-gate")
             require("tool-gate.agents_md")._reset()
             local emitted = {}
+            local emitter = chat_emitter.scoped(nil, function(body) emitted[#emitted + 1] = body end)
             local n = lib.agents_md_emit_for_invoke(
               t,
               { type = "event", from = "agentic-loop",
                 body = { kind = "chat.input.submit" } },
-              nil,
-              function(body) emitted[#emitted + 1] = body end
+              emitter
             )
             return n
             "#,
@@ -909,6 +910,7 @@ fn agents_md_emit_for_invoke_emits_for_folder_touching_outbound_invoke() {
         .load(format!(
             r#"
             local lib = require("tool-gate")
+            local chat_emitter = require("libs.chat-emitter")
             local t = lib.translator("tool-gate")
             local agents_md = require("tool-gate.agents_md")
             agents_md._reset()
@@ -919,14 +921,14 @@ fn agents_md_emit_for_invoke_emits_for_folder_touching_outbound_invoke() {
               }}
             }})
             local emitted = {{}}
+            local emitter = chat_emitter.scoped("chat-x", function(body) emitted[#emitted + 1] = body end)
             local n = lib.agents_md_emit_for_invoke(
               t,
               {{ type = "event", from = "agentic-loop",
                 body = {{ kind = "tool-gate.tool.invoke",
                           id = "i1", name = "read_file",
                           args = {{ path = "{p}" }} }} }},
-              "chat-x",
-              function(body) emitted[#emitted + 1] = body end
+              emitter
             )
             return {{ n = n, emitted = emitted }}
             "#,
@@ -958,7 +960,7 @@ fn agents_md_emit_for_invoke_emits_for_folder_touching_outbound_invoke() {
 
 #[test]
 fn agents_md_emit_for_invoke_swallows_underlying_errors_returns_zero() {
-    // pcall-guard contract: a bug in `agents_md.remind_for_tool_call`
+    // pcall-guard contract: a bug in `agents_md.emit_reminders_for_tool_call`
     // must not crash the wrapper. We monkey-patch the lib to error,
     // then verify the helper returns 0 instead of propagating.
     let lua = Lua::new();
@@ -969,23 +971,24 @@ fn agents_md_emit_for_invoke_swallows_underlying_errors_returns_zero() {
         .load(
             r#"
             local lib = require("tool-gate")
+            local chat_emitter = require("libs.chat-emitter")
             local t = lib.translator("tool-gate")
             local agents_md = require("tool-gate.agents_md")
             agents_md._reset()
-            local prev = agents_md.remind_for_tool_call
-            agents_md.remind_for_tool_call = function() error("boom") end
+            local prev = agents_md.emit_reminders_for_tool_call
+            agents_md.emit_reminders_for_tool_call = function() error("boom") end
 
+            local emitter = chat_emitter.scoped(nil, function(_) end)
             local n = lib.agents_md_emit_for_invoke(
               t,
               { type = "event", from = "agentic-loop",
                 body = { kind = "tool-gate.tool.invoke",
                          id = "i1", name = "read_file",
                          args = { path = "/some/path.txt" } } },
-              nil,
-              function(_) end
+              emitter
             )
 
-            agents_md.remind_for_tool_call = prev
+            agents_md.emit_reminders_for_tool_call = prev
             return n
             "#,
         )

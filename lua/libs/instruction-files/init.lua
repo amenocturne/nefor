@@ -106,6 +106,33 @@ local function relative_path(root, path)
   return path
 end
 
+M.NON_GIT_MAX_UP = 5
+M.NON_GIT_MAX_DOWN = 4
+
+local function file_exists(p)
+  if type(p) ~= "string" or p == "" then return false end
+  local ok = os.execute(string.format("[ -f %s ] 2>/dev/null", shell_quote(p)))
+  return ok == true
+end
+
+local function has_instruction_file(dir)
+  for _, name in ipairs(M.INSTRUCTION_FILENAMES) do
+    if file_exists(dir .. "/" .. name) then return true end
+  end
+  return false
+end
+
+local function nearest_ancestor_with_instructions(folder, max_up)
+  local cur = folder
+  for _ = 1, max_up do
+    if has_instruction_file(cur) then return cur end
+    local up = parent_dir(cur)
+    if up == cur then break end
+    cur = up
+  end
+  return nil
+end
+
 local function resolve_scope(path, scope)
   local requested = scope == "subfolders" and "subfolders" or "auto"
   local folder = folder_for_path(path)
@@ -113,13 +140,17 @@ local function resolve_scope(path, scope)
   if requested == "auto" then
     local root = git_root(folder)
     if root then
-      return root, "git_repo"
+      return root, "git_repo", nil
+    end
+    local ancestor = nearest_ancestor_with_instructions(folder, M.NON_GIT_MAX_UP)
+    if ancestor then
+      return ancestor, "nearest_ancestor", M.NON_GIT_MAX_DOWN
     end
   end
-  return folder, "subfolders"
+  return folder, "subfolders", M.NON_GIT_MAX_DOWN
 end
 
-local function find_instruction_files(root)
+local function find_instruction_files(root, max_depth)
   if type(root) ~= "string" or root == "" then return {}, 0 end
   local names = {}
   for _, name in ipairs(M.INSTRUCTION_FILENAMES) do
@@ -139,7 +170,12 @@ local function find_instruction_files(root)
   for _, name in ipairs(prunes) do
     prune_terms[#prune_terms + 1] = "-name " .. shell_quote(name)
   end
+  local depth_flag = ""
+  if type(max_depth) == "number" and max_depth > 0 then
+    depth_flag = " -maxdepth " .. tostring(max_depth)
+  end
   local cmd = "find " .. shell_quote(root) ..
+              depth_flag ..
               " \\( " .. table.concat(prune_terms, " -o ") ..
               " \\) -prune -o -type f \\( " ..
               table.concat(names, " -o ") ..
@@ -207,8 +243,8 @@ function M.new()
 
   function S.discover(path, opts)
     opts = opts or {}
-    local root, resolved_scope = resolve_scope(path or ".", opts.scope)
-    local files, total = find_instruction_files(root)
+    local root, resolved_scope, max_depth = resolve_scope(path or ".", opts.scope)
+    local files, total = find_instruction_files(root, max_depth)
     local result_files = {}
     for _, path in ipairs(files) do
       local read_status = status_for_file(opts.chat_id, path)
@@ -287,14 +323,15 @@ function M.new()
     if path then S.mark_read(chat_id, path) end
   end
 
-  function S.reminder_bodies_for_tool_call(chat_id, tool_name, args)
+  function S.emit_reminders_for_tool_call(tool_name, args, emitter)
+    local chat_id = emitter.chat_id()
     S.mark_read_for_tool_call(chat_id, tool_name, args)
 
     local folders = S.folders_for_tool_call(tool_name, args)
-    if #folders == 0 then return {} end
+    if #folders == 0 then return 0 end
 
     local reminders = bucket(reminded_scopes, chat_id)
-    local bodies = {}
+    local count = 0
     for _, folder in ipairs(folders) do
       local result = S.discover(folder, { scope = "auto", chat_id = chat_id })
       if result.total and result.total > 0 then
@@ -303,20 +340,15 @@ function M.new()
           local text = S.format_reminder(result)
           if text then
             reminders[key] = true
-            bodies[#bodies + 1] = {
-              kind = "chat.message.append",
-              role = "system",
-              text = text,
-              chat_id = chat_id,
-              path = result.root,
-              dir = result.root,
-            }
+            emitter.system(text, { path = result.root, dir = result.root })
+            count = count + 1
           end
         end
       end
     end
-    return bodies
+    return count
   end
+
 
   function S._reset()
     reminded_scopes = {}
@@ -392,8 +424,8 @@ function M.record_tool_contexts_from_advertise(...)
 end
 function M.folders_for_tool_call(...) return default.folders_for_tool_call(...) end
 function M.mark_read_for_tool_call(...) return default.mark_read_for_tool_call(...) end
-function M.reminder_bodies_for_tool_call(...)
-  return default.reminder_bodies_for_tool_call(...)
+function M.emit_reminders_for_tool_call(...)
+  return default.emit_reminders_for_tool_call(...)
 end
 function M._reset() return default._reset() end
 function M._state(...) return default._state(...) end

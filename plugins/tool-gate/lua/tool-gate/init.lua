@@ -240,20 +240,22 @@ end
 -- behind the historical import path. pcall-guarded so a transient filesystem
 -- failure doesn't crash the caller; returns the count emitted (0 on no-op or
 -- failure).
+--
+-- `emitter` is a scoped chat-emitter (libs.chat-emitter) that already
+-- carries the correct chat_id — callers never thread chat_id manually.
 ---@param translator table
 ---@param env table
----@param chat_id string|nil
----@param emitter fun(body: table)
+---@param emitter table  -- chat-emitter scoped instance
 ---@return integer count
-function M.agents_md_emit_for_invoke(translator, env, chat_id, emitter)
+function M.agents_md_emit_for_invoke(translator, env, emitter)
   if not translator.is_outbound_tool_invoke(env) then return 0 end
   local body = env.body
   local ok, count_or_err = pcall(
-    agents_md.remind_for_tool_call,
-    chat_id, body.name, body.args, emitter
+    agents_md.emit_reminders_for_tool_call,
+    body.name, body.args, emitter
   )
   if not ok then
-    nefor.log.warn("tool-gate: agents_md.remind_for_tool_call errored", {
+    nefor.log.warn("tool-gate: agents_md.emit_reminders_for_tool_call errored", {
       tool = body.name, error = tostring(count_or_err),
     })
     return 0
