@@ -7,7 +7,7 @@ struct Cli {
     /// Path to .mag source file
     source: PathBuf,
 
-    /// Directory for template and module resolution
+    /// Directory for file read and module resolution
     #[arg(short = 's', long, default_value = ".")]
     source_dir: PathBuf,
 }

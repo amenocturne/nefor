@@ -268,6 +268,17 @@ fn eval_builtin(env: &mut Env, name: &str, args: &[Expr]) -> Result<Value, MagEr
             let coll = eval_expr(env, &args[1])?;
             builtin_filter(&f, &coll)
         }
+        "flat-map" => {
+            if args.len() != 2 {
+                return Err(MagError::Arity {
+                    expected: 2,
+                    got: args.len(),
+                });
+            }
+            let f = eval_expr(env, &args[0])?;
+            let coll = eval_expr(env, &args[1])?;
+            builtin_flat_map(&f, &coll)
+        }
         "fold" => {
             if args.len() != 3 {
                 return Err(MagError::Arity {
@@ -394,11 +405,10 @@ fn eval_builtin(env: &mut Env, name: &str, args: &[Expr]) -> Result<Value, MagEr
         }
         "node" => eval_node(env, args),
         "graph" => eval_graph(env, args),
-        "template" => {
+        "read" => {
             if args.is_empty() || args.len() > 2 {
                 return Err(MagError::Eval(
-                    "template requires 1-2 args: (template \"path\") or (template \"path\" data-map)"
-                        .into(),
+                    "read requires 1-2 args: (read \"path\") or (read \"path\" data-map)".into(),
                 ));
             }
             let path_val = eval_expr(env, &args[0])?;
@@ -406,21 +416,21 @@ fn eval_builtin(env: &mut Env, name: &str, args: &[Expr]) -> Result<Value, MagEr
                 Value::Str(s) => s.clone(),
                 other => {
                     return Err(MagError::Eval(format!(
-                        "template path must be a string, got {}",
+                        "read path must be a string, got {}",
                         other.type_name()
                     )))
                 }
             };
             let full_path = env.source_dir().join(&path_str);
             let contents = std::fs::read_to_string(&full_path)
-                .map_err(|_| MagError::Eval(format!("template not found: {path_str}")))?;
+                .map_err(|_| MagError::Eval(format!("file not found: {path_str}")))?;
             if args.len() == 2 {
                 let data = eval_expr(env, &args[1])?;
                 let data_map = match &data {
                     Value::Map(m) => m,
                     other => {
                         return Err(MagError::Eval(format!(
-                            "template data must be a map, got {}",
+                            "read data must be a map, got {}",
                             other.type_name()
                         )))
                     }
@@ -511,6 +521,15 @@ fn call_builtin_with_values(name: &str, args: &[Value]) -> Result<Value, MagErro
                 });
             }
             builtin_filter(&args[0], &args[1])
+        }
+        "flat-map" => {
+            if args.len() != 2 {
+                return Err(MagError::Arity {
+                    expected: 2,
+                    got: args.len(),
+                });
+            }
+            builtin_flat_map(&args[0], &args[1])
         }
         "fold" => {
             if args.len() != 3 {
@@ -969,6 +988,19 @@ fn builtin_fold(f: &Value, init: Value, coll: &Value) -> Result<Value, MagError>
         acc = apply_value(f, &[acc, item.clone()])?;
     }
     Ok(acc)
+}
+
+fn builtin_flat_map(f: &Value, coll: &Value) -> Result<Value, MagError> {
+    let items = extract_list(coll)?;
+    let mut result = Vec::new();
+    for item in items {
+        let mapped = apply_value(f, std::slice::from_ref(item))?;
+        match mapped {
+            Value::List(inner) | Value::Vector(inner) => result.extend(inner),
+            other => result.push(other),
+        }
+    }
+    Ok(Value::List(result))
 }
 
 fn builtin_concat(a: &Value, b: &Value) -> Result<Value, MagError> {
@@ -1536,28 +1568,28 @@ mod tests {
     }
 
     #[test]
-    fn template_reads_file() {
-        let dir = std::env::temp_dir().join("mag_test_template_reads");
+    fn read_reads_file() {
+        let dir = std::env::temp_dir().join("mag_test_read_reads");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("test.md"), "hello from template").unwrap();
+        std::fs::write(dir.join("test.md"), "hello from read").unwrap();
 
         let mut env = Env::new_with_stdlib_and_source_dir(&dir);
         let result = eval_with_env(
             &mut env,
             vec![Expr::List(vec![
-                Expr::Symbol("template".into()),
+                Expr::Symbol("read".into()),
                 Expr::Str("test.md".into()),
             ])],
         )
         .unwrap();
-        assert!(matches!(result, Value::Str(ref s) if s == "hello from template"));
+        assert!(matches!(result, Value::Str(ref s) if s == "hello from read"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn template_interpolates_data() {
-        let dir = std::env::temp_dir().join("mag_test_template_interp");
+    fn read_interpolates_data() {
+        let dir = std::env::temp_dir().join("mag_test_read_interp");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("greet.md"), "hello {name}, you are {role}").unwrap();
 
@@ -1565,7 +1597,7 @@ mod tests {
         let result = eval_with_env(
             &mut env,
             vec![Expr::List(vec![
-                Expr::Symbol("template".into()),
+                Expr::Symbol("read".into()),
                 Expr::Str("greet.md".into()),
                 Expr::Map(vec![
                     (Expr::Keyword("name".into()), Expr::Str("world".into())),
@@ -1580,24 +1612,21 @@ mod tests {
     }
 
     #[test]
-    fn template_missing_file_errors() {
-        let dir = std::env::temp_dir().join("mag_test_template_missing");
+    fn read_missing_file_errors() {
+        let dir = std::env::temp_dir().join("mag_test_read_missing");
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut env = Env::new_with_stdlib_and_source_dir(&dir);
         let result = eval_with_env(
             &mut env,
             vec![Expr::List(vec![
-                Expr::Symbol("template".into()),
+                Expr::Symbol("read".into()),
                 Expr::Str("nonexistent.md".into()),
             ])],
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("template not found: nonexistent.md"),
-            "got: {err}"
-        );
+        assert!(err.contains("file not found: nonexistent.md"), "got: {err}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1854,5 +1883,54 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builtin_flat_map_basic() {
+        // (flat-map (fn [x] [x x]) [1 2 3]) => (1 1 2 2 3 3)
+        let result = eval(vec![Expr::List(vec![
+            Expr::Symbol("flat-map".into()),
+            Expr::List(vec![
+                Expr::Symbol("fn".into()),
+                Expr::Vector(vec![Expr::Symbol("x".into())]),
+                Expr::Vector(vec![Expr::Symbol("x".into()), Expr::Symbol("x".into())]),
+            ]),
+            Expr::Vector(vec![Expr::Int(1), Expr::Int(2), Expr::Int(3)]),
+        ])])
+        .unwrap();
+        match result {
+            Value::List(items) => {
+                assert_eq!(items.len(), 6);
+                assert!(matches!(items[0], Value::Int(1)));
+                assert!(matches!(items[1], Value::Int(1)));
+                assert!(matches!(items[2], Value::Int(2)));
+                assert!(matches!(items[3], Value::Int(2)));
+                assert!(matches!(items[4], Value::Int(3)));
+                assert!(matches!(items[5], Value::Int(3)));
+            }
+            other => panic!("expected list from flat-map, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn builtin_flat_map_non_list_result() {
+        // When the mapped fn returns a non-list, treat as single element
+        // (flat-map (fn [x] x) [1 2 3]) => (1 2 3)
+        let result = eval(vec![Expr::List(vec![
+            Expr::Symbol("flat-map".into()),
+            Expr::List(vec![
+                Expr::Symbol("fn".into()),
+                Expr::Vector(vec![Expr::Symbol("x".into())]),
+                Expr::Symbol("x".into()),
+            ]),
+            Expr::Vector(vec![Expr::Int(1), Expr::Int(2), Expr::Int(3)]),
+        ])])
+        .unwrap();
+        match result {
+            Value::List(items) => {
+                assert_eq!(items.len(), 3);
+            }
+            other => panic!("expected list from flat-map, got {:?}", other),
+        }
     }
 }

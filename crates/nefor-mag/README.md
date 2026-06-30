@@ -16,7 +16,8 @@ MAG uses a Lisp-like syntax where code is data. Core constructs:
 - `graph` — compose nodes with directed edges
 - `type` — forward-declare a type name
 - `require` — load modules from the library path
-- `template` — read and interpolate template files
+- `read` — read a file as text, optionally interpolate `{key}` patterns
+- `flat-map` — map a function over a collection and flatten the results
 
 ## Type System
 

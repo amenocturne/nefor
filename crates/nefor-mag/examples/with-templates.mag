@@ -2,7 +2,7 @@
 (type Findings)
 (type Summary)
 
-(let [exp (node "agent" {:prompt (template "templates/explore.md" {:focus "auth patterns"})
+(let [exp (node "agent" {:prompt (read "templates/explore.md" {:focus "auth patterns"})
                          :model "opus"
                          :tools ["fs/read" "grep"]}
             : Task -> Findings)
