@@ -19,5 +19,5 @@ pub fn compile(source: &str, source_dir: &Path) -> Result<GraphIr, MagError> {
     let value = eval::eval_program(&mut env, &exprs)?;
     let graph = graph::extract_graph(value)?;
     graph::validate(&graph)?;
-    Ok(ir::normalize(graph))
+    ir::normalize(graph)
 }

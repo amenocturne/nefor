@@ -52,6 +52,29 @@ fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, MagError> {
     }
 }
 
+fn validate_workspace_path(
+    source_dir: &std::path::Path,
+    relative: &str,
+) -> Result<std::path::PathBuf, MagError> {
+    let path = std::path::Path::new(relative);
+
+    if path.is_absolute() {
+        return Err(MagError::Eval(format!(
+            "absolute paths not allowed: {relative}"
+        )));
+    }
+
+    for component in path.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(MagError::Eval(format!(
+                "path traversal not allowed: {relative}"
+            )));
+        }
+    }
+
+    Ok(source_dir.join(relative))
+}
+
 fn eval_list(env: &mut Env, items: &[Expr]) -> Result<Value, MagError> {
     if items.is_empty() {
         return Ok(Value::List(vec![]));
@@ -421,7 +444,7 @@ fn eval_builtin(env: &mut Env, name: &str, args: &[Expr]) -> Result<Value, MagEr
                     )))
                 }
             };
-            let full_path = env.source_dir().join(&path_str);
+            let full_path = validate_workspace_path(env.source_dir(), &path_str)?;
             let contents = std::fs::read_to_string(&full_path)
                 .map_err(|_| MagError::Eval(format!("file not found: {path_str}")))?;
             if args.len() == 2 {
@@ -451,7 +474,7 @@ fn eval_builtin(env: &mut Env, name: &str, args: &[Expr]) -> Result<Value, MagEr
             let path = path_val
                 .as_str()
                 .ok_or_else(|| MagError::Eval("require expects a string path".into()))?;
-            let full_path = env.source_dir().join(format!("{path}.mag"));
+            let full_path = validate_workspace_path(env.source_dir(), &format!("{path}.mag"))?;
             let canonical = full_path
                 .canonicalize()
                 .unwrap_or_else(|_| full_path.clone());
@@ -1717,7 +1740,7 @@ mod tests {
             );
 
             // Verify IR normalization passes through qualified types
-            let ir = crate::ir::node_to_ir(node);
+            let ir = crate::ir::node_to_ir(node).unwrap();
             let fanout = ir.fanout.unwrap();
             assert_eq!(fanout.input, "generic-provider.ProviderOut");
             assert_eq!(
@@ -1932,5 +1955,71 @@ mod tests {
             }
             other => panic!("expected list from flat-map, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn read_rejects_path_traversal() {
+        let dir = std::env::temp_dir().join("mag_test_traversal");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut env = Env::new_with_stdlib_and_source_dir(&dir);
+        let result = eval_with_env(
+            &mut env,
+            vec![Expr::List(vec![
+                Expr::Symbol("read".into()),
+                Expr::Str("../../etc/passwd".into()),
+            ])],
+        );
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("path traversal"),
+            "expected path traversal error"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_rejects_absolute_path() {
+        let dir = std::env::temp_dir().join("mag_test_absolute");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut env = Env::new_with_stdlib_and_source_dir(&dir);
+        let result = eval_with_env(
+            &mut env,
+            vec![Expr::List(vec![
+                Expr::Symbol("read".into()),
+                Expr::Str("/etc/passwd".into()),
+            ])],
+        );
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("absolute"),
+            "expected absolute path error"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn require_rejects_path_traversal() {
+        let dir = std::env::temp_dir().join("mag_test_require_traversal");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut env = Env::new_with_stdlib_and_source_dir(&dir);
+        let result = eval_with_env(
+            &mut env,
+            vec![Expr::List(vec![
+                Expr::Symbol("require".into()),
+                Expr::Str("../../../etc/evil".into()),
+            ])],
+        );
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("path traversal"),
+            "expected path traversal error"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

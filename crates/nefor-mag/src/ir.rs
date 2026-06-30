@@ -1,4 +1,5 @@
 use crate::ast::{GraphValue, NodeValue, Value};
+use crate::error::MagError;
 use crate::types::MagType;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -57,34 +58,42 @@ fn qualify_type(ty: &MagType) -> String {
     }
 }
 
-fn value_to_json(val: &Value) -> serde_json::Value {
+fn value_to_json(val: &Value) -> Result<serde_json::Value, MagError> {
     match val {
-        Value::Str(s) => serde_json::Value::String(s.clone()),
-        Value::Int(n) => serde_json::json!(n),
-        Value::Float(n) => serde_json::json!(n),
-        Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::Nil => serde_json::Value::Null,
-        Value::Keyword(k) => serde_json::Value::String(format!(":{k}")),
-        Value::Symbol(s) => serde_json::Value::String(s.clone()),
+        Value::Str(s) => Ok(serde_json::Value::String(s.clone())),
+        Value::Int(n) => Ok(serde_json::json!(n)),
+        Value::Float(n) => Ok(serde_json::json!(n)),
+        Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
+        Value::Nil => Ok(serde_json::Value::Null),
+        Value::Keyword(k) => Ok(serde_json::Value::String(format!(":{k}"))),
+        Value::Symbol(s) => Ok(serde_json::Value::String(s.clone())),
         Value::List(items) | Value::Vector(items) => {
-            serde_json::Value::Array(items.iter().map(value_to_json).collect())
+            let arr: Result<Vec<_>, _> = items.iter().map(value_to_json).collect();
+            Ok(serde_json::Value::Array(arr?))
         }
         Value::Map(map) => {
-            let obj: serde_json::Map<String, serde_json::Value> = map
+            let obj: Result<serde_json::Map<String, serde_json::Value>, _> = map
                 .iter()
-                .map(|(k, v)| (k.clone(), value_to_json(v)))
+                .map(|(k, v)| value_to_json(v).map(|jv| (k.clone(), jv)))
                 .collect();
-            serde_json::Value::Object(obj)
+            Ok(serde_json::Value::Object(obj?))
         }
-        _ => serde_json::Value::Null,
+        Value::Node(_)
+        | Value::Graph(_)
+        | Value::Fn(_)
+        | Value::BuiltinFn(_)
+        | Value::TypeDecl(_) => Err(MagError::Eval(format!(
+            "cannot serialize {} to JSON in node args",
+            val.type_name()
+        ))),
     }
 }
 
-pub(crate) fn node_to_ir(node: &NodeValue) -> NodeIr {
-    let args: serde_json::Map<String, serde_json::Value> = node
+pub(crate) fn node_to_ir(node: &NodeValue) -> Result<NodeIr, MagError> {
+    let args: Result<serde_json::Map<String, serde_json::Value>, _> = node
         .args
         .iter()
-        .map(|(k, v)| (k.clone(), value_to_json(v)))
+        .map(|(k, v)| value_to_json(v).map(|jv| (k.clone(), jv)))
         .collect();
 
     let fanout = match &node.output_type {
@@ -95,12 +104,12 @@ pub(crate) fn node_to_ir(node: &NodeValue) -> NodeIr {
         _ => None,
     };
 
-    NodeIr {
+    Ok(NodeIr {
         id: node.id.clone(),
         reasoner: node.node_type.clone(),
-        args: serde_json::Value::Object(args),
+        args: serde_json::Value::Object(args?),
         fanout,
-    }
+    })
 }
 
 fn compute_edge_type(graph: &GraphValue, from: &str, to: &str) -> Option<String> {
@@ -120,8 +129,12 @@ fn compute_edge_type(graph: &GraphValue, from: &str, to: &str) -> Option<String>
     }
 }
 
-pub fn normalize(graph: GraphValue) -> GraphIr {
-    let mut nodes: Vec<NodeIr> = graph.nodes.iter().map(node_to_ir).collect();
+pub fn normalize(graph: GraphValue) -> Result<GraphIr, MagError> {
+    let mut nodes: Vec<NodeIr> = graph
+        .nodes
+        .iter()
+        .map(node_to_ir)
+        .collect::<Result<Vec<_>, _>>()?;
     nodes.sort_by(|a, b| a.id.cmp(&b.id));
 
     let mut edges: Vec<EdgeIr> = graph
@@ -149,12 +162,12 @@ pub fn normalize(graph: GraphValue) -> GraphIr {
         format!("sha256:{:x}", hasher.finalize())
     };
 
-    GraphIr {
+    Ok(GraphIr {
         terminal: graph.terminal,
         nodes,
         edges,
         hash,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -190,5 +203,39 @@ mod tests {
     fn qualify_var_always_prefixed() {
         let ty = MagType::Var("INPUT".into());
         assert_eq!(qualify_type(&ty), "mag.INPUT");
+    }
+
+    #[test]
+    fn value_to_json_rejects_function() {
+        let val = Value::Fn(crate::ast::FnValue {
+            params: vec![],
+            body: vec![],
+            closure: vec![],
+        });
+        let result = value_to_json(&val);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("cannot serialize fn to JSON"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn value_to_json_rejects_node() {
+        let val = Value::Node(NodeValue {
+            id: "test".into(),
+            node_type: "llm".into(),
+            args: std::collections::BTreeMap::new(),
+            input_type: MagType::Named("A".into()),
+            output_type: MagType::Named("B".into()),
+        });
+        let result = value_to_json(&val);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("cannot serialize node to JSON"),
+            "unexpected error: {err}"
+        );
     }
 }
