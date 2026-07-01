@@ -137,6 +137,8 @@ pub struct NodeFiring {
 pub struct RunState {
     /// Run-id assigned by the caller.
     pub run_id: String,
+    /// Optional human-readable run name.
+    pub name: Option<String>,
     /// Validated graph topology.
     pub graph: Graph,
     /// Per-node terminal/intermediate status (latest firing's status).
@@ -249,6 +251,8 @@ pub enum Effect {
         reasoner: String,
         /// Run id (echoed in the dispatch event).
         run_id: String,
+        /// Optional human-readable run name.
+        run_name: Option<String>,
         /// Node id (echoed in the dispatch event).
         node_id: String,
         /// Per-firing correlation id (fresh per dispatch).
@@ -714,6 +718,7 @@ fn try_dispatch(state: &mut RunState, node_id: &str, peers: &PeerSet, effects: &
     effects.push(Effect::DispatchNode {
         reasoner: node.reasoner.clone(),
         run_id: state.run_id.clone(),
+        run_name: state.name.clone(),
         node_id: node.id.clone(),
         firing_id,
         args: node.args.clone(),
@@ -1189,6 +1194,7 @@ impl Scheduler {
 
         let mut state = RunState {
             run_id: submission.run_id.clone(),
+            name: submission.name.clone(),
             graph: submission.graph,
             completed: HashMap::new(),
             firings: HashMap::new(),

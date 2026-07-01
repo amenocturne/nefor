@@ -1,5 +1,6 @@
 -- Deterministic fan-in reasoner. Preserves upstream identity and order.
 local envelope = require("core.envelope")
+local output_persist = require("reasoners.output_persistence")
 local emit_as = envelope.emit_as
 
 local M = {}
@@ -33,13 +34,14 @@ local function handle(body)
     items[#items + 1] = item
   end
 
+  local result = output_persist.persist(body, {
+    items = items,
+    text = table.concat(parts, "\n\n"),
+  })
   emit_as("accumulate", nil, {
     kind = "tool.result",
     id = firing_id,
-    result = {
-      items = items,
-      text = table.concat(parts, "\n\n"),
-    },
+    result = result,
   })
   return "_already_replied"
 end

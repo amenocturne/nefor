@@ -135,6 +135,7 @@ local function flush_pending_dispatches()
       name = "spawn_graph",
       args = {
         graph           = entry.graph,
+        name            = entry.name,
         on_node_failure = entry.on_node_failure,
       },
     })
@@ -808,6 +809,7 @@ local function queue_sub_graph(args, gate_inner_id)
   state.pending_runs[run_id] = { gate_inner_id = gate_inner_id, graph = g }
   state.pending_dispatches[#state.pending_dispatches + 1] = {
     run_id          = run_id,
+    name            = args.name,
     graph           = g,
     on_node_failure = on_failure,
   }
@@ -825,11 +827,19 @@ end
 -- the pre-Phase-3 `pending[key]` for tool-executor:
 --   { type, run_id, node_id, firing_id, reasoner, tool_calls, tool_results,
 --     tool_ids, pending_count }
-local function track_tool_executor(run_id, node_id, firing_id, calls, tool_ids)
+local function track_tool_executor(run_id, run_name, node_id, firing_id, calls, tool_ids)
+  if tool_ids == nil and type(firing_id) == "table" and type(calls) == "table" then
+    tool_ids = calls
+    calls = firing_id
+    firing_id = node_id
+    node_id = run_name
+    run_name = nil
+  end
   local key = pending_key(run_id, firing_id)
   state.pending[key] = {
     type          = "tool-executor",
     run_id        = run_id,
+    run_name      = run_name,
     node_id       = node_id,
     firing_id     = firing_id,
     reasoner      = "tool-executor",
@@ -846,12 +856,20 @@ end
 
 -- Provider-node pending entry constructor — same idea for the provider/
 -- responder/wrapper reasoners.
-local function track_provider_firing(reasoner_type, run_id, node_id, firing_id,
+local function track_provider_firing(reasoner_type, run_id, run_name, node_id, firing_id,
                                      provider_name, chat_id)
+  if chat_id == nil then
+    chat_id = provider_name
+    provider_name = firing_id
+    firing_id = node_id
+    node_id = run_name
+    run_name = nil
+  end
   local key = pending_key(run_id, firing_id)
   state.pending[key] = {
     type          = reasoner_type,
     run_id        = run_id,
+    run_name      = run_name,
     node_id       = node_id,
     firing_id     = firing_id,
     reasoner      = reasoner_type,
@@ -1049,11 +1067,11 @@ end
 -- reasoners. These live on the actor so the wrapper layer stays
 -- stateless.
 function M.queue_sub_graph(args, gate_inner_id) return queue_sub_graph(args, gate_inner_id) end
-function M.track_tool_executor(run_id, node_id, firing_id, calls, tool_ids)
-  return track_tool_executor(run_id, node_id, firing_id, calls, tool_ids)
+function M.track_tool_executor(run_id, run_name, node_id, firing_id, calls, tool_ids)
+  return track_tool_executor(run_id, run_name, node_id, firing_id, calls, tool_ids)
 end
-function M.track_provider_firing(reasoner_type, run_id, node_id, firing_id, provider_name, chat_id)
-  return track_provider_firing(reasoner_type, run_id, node_id, firing_id, provider_name, chat_id)
+function M.track_provider_firing(reasoner_type, run_id, run_name, node_id, firing_id, provider_name, chat_id)
+  return track_provider_firing(reasoner_type, run_id, run_name, node_id, firing_id, provider_name, chat_id)
 end
 function M.take_pending_for_chat(chat_id) return take_pending_for_chat(chat_id) end
 function M.peek_pending_for_chat(chat_id) return peek_pending_for_chat(chat_id) end

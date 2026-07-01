@@ -2,6 +2,7 @@
 -- Uses tool-gate -> bash like run.lua; does not grant direct bash access.
 local envelope = require("core.envelope")
 local event = require("core.event")
+local output_persist = require("reasoners.output_persistence")
 local replay_window = require("core.history_replay")
 local run = require("reasoners.run")
 
@@ -23,7 +24,15 @@ local function handle(body)
   local reasoner = body.reasoner or "bash_command"
   local tool_id = next_id("tool")
   tool_to_firing[tool_id] = firing_id
-  firing_meta[firing_id] = { command = command, cwd = args.cwd, reasoner = reasoner }
+  firing_meta[firing_id] = {
+    command = command,
+    cwd = args.cwd,
+    reasoner = reasoner,
+    run_id = body.run_id,
+    run_name = body.run_name,
+    node_id = body.node_id,
+    firing_id = firing_id,
+  }
   emit("tool-gate", {
     kind = "tool-gate.tool.invoke",
     id = tool_id,
@@ -52,16 +61,17 @@ local function on_tool_result(body)
     return
   end
   local parsed = run._internals.parse_bash_output(body.output)
+  local result = output_persist.persist(meta, {
+    command = meta.command,
+    cwd = meta.cwd,
+    stdout = parsed.stdout,
+    stderr = parsed.stderr,
+    exit_code = parsed.exit_code,
+  })
   emit_as(reasoner, nil, {
     kind = "tool.result",
     id = firing_id,
-    result = {
-      command = meta.command,
-      cwd = meta.cwd,
-      stdout = parsed.stdout,
-      stderr = parsed.stderr,
-      exit_code = parsed.exit_code,
-    },
+    result = result,
   })
 end
 

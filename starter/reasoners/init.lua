@@ -39,6 +39,7 @@ local json = nefor.json
 
 local envelope      = require("core.envelope")
 local ids           = require("core.ids")
+local output_persist = require("reasoners.output_persistence")
 local replay_window = require("core.history_replay")
 
 local emit_as        = envelope.emit_as
@@ -48,7 +49,8 @@ local next_id        = envelope.next_id
 -- Forward-declare; populated after agentic_loop module is required.
 local agentic_loop
 
-local function send_tool_result_ok(reasoner_type, firing_id, output, next_state)
+local function send_tool_result_ok(reasoner_type, body, output, next_state)
+  local firing_id = type(body) == "table" and body.firing_id or body
   local result = {}
   if type(output) == "table" then
     for k, v in pairs(output) do result[k] = v end
@@ -56,6 +58,9 @@ local function send_tool_result_ok(reasoner_type, firing_id, output, next_state)
     result.value = output
   end
   if next_state ~= nil then result.next_state = next_state end
+  if type(body) == "table" then
+    result = output_persist.persist(body, result)
+  end
   emit_as(reasoner_type, nil, {
     kind   = "tool.result",
     id     = firing_id,
@@ -184,7 +189,7 @@ local function provider_run_node(reasoner_type, body)
     has_args_system = type(args) == "table" and type(args.system) == "string" and #args.system or 0,
   })
 
-  agentic_loop.track_provider_firing(reasoner_type, run_id, node_id, firing_id, provider, chat_id)
+  agentic_loop.track_provider_firing(reasoner_type, run_id, body.run_name, node_id, firing_id, provider, chat_id)
 
   if need_create then
     local create_body = { kind = provider .. ".chat.create", chat_id = chat_id }
@@ -279,7 +284,7 @@ local function provider_run_node(reasoner_type, body)
       text = text,
     })
     agentic_loop.take_pending_for_chat(chat_id)
-    send_tool_result_ok(reasoner_type, firing_id, {
+    send_tool_result_ok(reasoner_type, body, {
       text = text,
       finish_reason = "stop",
     }, { chat_id = chat_id })
@@ -322,7 +327,7 @@ local function tool_executor_run_node(body)
     tool_ids[i] = next_id("tool")
   end
 
-  agentic_loop.track_tool_executor(run_id, node_id, firing_id, calls, tool_ids)
+  agentic_loop.track_tool_executor(run_id, body.run_name, node_id, firing_id, calls, tool_ids)
 
   for i, call in ipairs(calls) do
     local tool_id = tool_ids[i]
@@ -382,7 +387,7 @@ local function adapter_run_node(body)
     end
   end
 
-  send_tool_result_ok("adapter", firing_id, { messages = messages }, nil)
+  send_tool_result_ok("adapter", body, { messages = messages }, nil)
   return "_already_replied"
 end
 
@@ -444,7 +449,7 @@ local function terminal_run_node(body)
     }
   end
 
-  send_tool_result_ok("terminal", firing_id, final, nil)
+  send_tool_result_ok("terminal", body, final, nil)
   return "_already_replied"
 end
 
@@ -524,6 +529,7 @@ local function unwrap_invoke_body(invoke)
   local args = invoke.args or {}
   return {
     run_id     = args.run_id,
+    run_name   = args.run_name,
     node_id    = args.node_id,
     firing_id  = invoke.id,
     args       = args.args,

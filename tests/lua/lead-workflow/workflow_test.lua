@@ -186,6 +186,36 @@ do
   assert_true(type(lw._internals.state.active_runs[invoke.body.id]) == "table",
     "active_runs contains the dispatched run_id")
 
+  feed("reasoner-graph", {
+    kind      = "graph.node.fired",
+    run_id    = invoke.body.id,
+    node_id   = "run",
+    firing_id = "firing-node-run",
+    reasoner  = "bash_command",
+  })
+  feed("bash_command", {
+    kind   = "tool.result",
+    id     = "firing-node-run",
+    result = {
+      stdout = "ok\n",
+      exit_code = 0,
+      output_path = "/tmp/nefor-test/sessions/session-1/mag/runs/auth-login-map/run.output",
+      output_relpath = "runs/auth-login-map/run.output",
+    },
+  })
+  _test.calls_clear()
+  invoke_tool("firing-graph-status-paths", "graph-status", { run_id = invoke.body.id })
+  local status = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result" and c.body.id == "firing-graph-status-paths"
+  end)
+  assert_true(status ~= nil, "graph-status returns the active run")
+  local node = status.body.output.run.nodes[1]
+  assert_eq(node.output_path,
+    "/tmp/nefor-test/sessions/session-1/mag/runs/auth-login-map/run.output",
+    "graph-status exposes absolute output_path")
+  assert_eq(node.output_relpath, "runs/auth-login-map/run.output",
+    "graph-status exposes MAG-relative output_relpath")
+
   -- The actor also replies to the lead's invocation with the run_id.
   local reply = find_call(calls, function(c)
     return c.body.kind == "tool.result" and c.body.id == "firing-mag-execute-1"

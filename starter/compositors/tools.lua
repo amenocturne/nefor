@@ -16,6 +16,7 @@ local actor        = require("core.actor")
 local envelope     = require("core.envelope")
 local gate_lib     = require("tool-gate")
 local chat_emitter = require("libs.chat-emitter")
+local output_persist = require("reasoners.output_persistence")
 
 local M = {}
 
@@ -102,10 +103,11 @@ function M.gate_spec(gate_name, command)
           entry.pending_count = entry.pending_count - 1
           if entry.pending_count == 0 then
             al().clear_pending_key(ref.key)
+            local result = output_persist.persist(entry, { tool_results = entry.tool_results })
             envelope.emit_as("tool-executor", nil, {
               kind   = "tool.result",
               id     = entry.firing_id,
-              result = { tool_results = entry.tool_results },
+              result = result,
             })
           end
         end

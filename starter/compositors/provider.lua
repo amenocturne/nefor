@@ -57,6 +57,7 @@
 -- synthesis). This file just delegates.
 
 local envelope = require("core.envelope")
+local output_persist = require("reasoners.output_persistence")
 
 local M = {}
 
@@ -289,6 +290,7 @@ function M.spawn_spec(name, command, opts)
         local result = {}
         for rk, rv in pairs(out) do result[rk] = rv end
         result.next_state = { chat_id = chat_id }
+        result = output_persist.persist(entry, result)
         envelope.emit_as(from_id, nil, {
           kind   = "tool.result",
           id     = entry.firing_id,

@@ -582,6 +582,8 @@ local function ordered_node_summaries(run)
         last_tool = node.last_tool,
         last_tool_args = node.last_tool_args,
         chat_id = node.chat_id,
+        output_path = node.output_path,
+        output_relpath = node.output_relpath,
         error = node.error,
       }
     end
@@ -664,6 +666,9 @@ local function finish_run(run_id, status, results, explicit_error)
         if type(value) == "table" and value.error ~= nil then
           node.status = "error"
           node.error = value.error
+        elseif type(value) == "table" and type(value.output) == "table" then
+          node.output_path = value.output.output_path
+          node.output_relpath = value.output.output_relpath
         end
       end
     end
@@ -740,6 +745,10 @@ local function mark_firing_result(body)
     node.error = body.error
   else
     node.status = "done"
+    if type(body.result) == "table" then
+      node.output_path = body.result.output_path
+      node.output_relpath = body.result.output_relpath
+    end
   end
 end
 

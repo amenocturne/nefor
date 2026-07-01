@@ -25,6 +25,10 @@ fn repo_root() -> PathBuf {
 
 #[test]
 fn starter_run_reasoner_full() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let prev_data_dir = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
+
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
     set_package_path(&lua).expect("set package.path");
@@ -38,7 +42,16 @@ fn starter_run_reasoner_full() {
         .set_name(test_path.display().to_string())
         .exec()
     {
+        match prev_data_dir {
+            Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+            None => std::env::remove_var("NEFOR_DATA_DIR"),
+        }
         panic!("run_test.lua failed:\n{e}");
+    }
+
+    match prev_data_dir {
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
     }
 }
 
@@ -46,6 +59,11 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
     let nefor = lua.create_table()?;
 
     nefor::lua::bindings::install_json(lua, &nefor)?;
+
+    let data_dir = std::env::var("NEFOR_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/var/empty/run-reasoner-test"));
+    nefor::lua::bindings::install_fs(lua, &nefor, nefor::paths::DataDir::new(data_dir))?;
 
     let log_tbl = lua.create_table()?;
     let no_op: Function = lua.create_function(|_, _: mlua::Variadic<Value>| Ok(()))?;

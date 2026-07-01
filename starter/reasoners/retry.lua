@@ -1,5 +1,6 @@
 -- Deterministic retry/pass-through router. Intended for connected graph loops.
 local envelope = require("core.envelope")
+local output_persist = require("reasoners.output_persistence")
 local emit_as = envelope.emit_as
 
 local M = {}
@@ -43,6 +44,7 @@ local function handle(body)
     },
   }
   if route == "pass" and type(entry) == "table" then output.passthrough = entry.output end
+  output = output_persist.persist(body, output)
 
   emit_as("retry", nil, {
     kind = "tool.result",

@@ -62,6 +62,7 @@
 local json = nefor.json
 
 local envelope      = require("core.envelope")
+local output_persist = require("reasoners.output_persistence")
 local replay_window = require("core.history_replay")
 
 local emit_as = envelope.emit_as
@@ -72,6 +73,7 @@ local M = {}
 
 -- tool_to_firing[tool_id] = firing_id
 local tool_to_firing = {}
+local firing_meta = {}
 
 -- Bash output parser.
 --
@@ -124,6 +126,12 @@ local function handle(body)
 
   local tool_id = next_id("tool")
   tool_to_firing[tool_id] = firing_id
+  firing_meta[firing_id] = {
+    run_id = body.run_id,
+    run_name = body.run_name,
+    node_id = body.node_id,
+    firing_id = firing_id,
+  }
 
   emit("tool-gate", {
     kind = "tool-gate.tool.invoke",
@@ -147,6 +155,8 @@ local function on_tool_result(body)
 
   -- Always drop the mapping — one tool_id, one result.
   tool_to_firing[tool_id] = nil
+  local meta = firing_meta[firing_id]
+  firing_meta[firing_id] = nil
 
   -- Surface infrastructure errors (e.g. tool-gate denied the call,
   -- spawn failed, tool unknown) verbatim. parse_bash_output is only
@@ -171,14 +181,15 @@ local function on_tool_result(body)
   end
 
   local parsed = parse_bash_output(output)
+  local result = output_persist.persist(meta, {
+    stdout    = parsed.stdout,
+    stderr    = parsed.stderr,
+    exit_code = parsed.exit_code,
+  })
   emit_as("run", nil, {
     kind   = "tool.result",
     id     = firing_id,
-    result = {
-      stdout    = parsed.stdout,
-      stderr    = parsed.stderr,
-      exit_code = parsed.exit_code,
-    },
+    result = result,
   })
 end
 
@@ -202,10 +213,12 @@ M.receive_msg = receive_msg
 
 M._internals = {
   tool_to_firing  = tool_to_firing,
+  firing_meta = firing_meta,
   parse_bash_output = parse_bash_output,
   on_tool_result  = on_tool_result,
   reset = function()
     for k, _ in pairs(tool_to_firing) do tool_to_firing[k] = nil end
+    for k, _ in pairs(firing_meta) do firing_meta[k] = nil end
   end,
 }
 

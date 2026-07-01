@@ -300,6 +300,7 @@ fn effect_to_body(effect: Effect) -> Map<String, Value> {
         Effect::DispatchNode {
             reasoner,
             run_id,
+            run_name,
             node_id,
             firing_id,
             args,
@@ -313,6 +314,9 @@ fn effect_to_body(effect: Effect) -> Map<String, Value> {
             // and not duplicated.
             let mut tool_args = Map::new();
             tool_args.insert("run_id".into(), Value::String(run_id));
+            if let Some(run_name) = run_name {
+                tool_args.insert("run_name".into(), Value::String(run_name));
+            }
             tool_args.insert("node_id".into(), Value::String(node_id));
             tool_args.insert("args".into(), args);
             tool_args.insert("inputs".into(), Value::Object(inputs));
@@ -456,6 +460,7 @@ mod tests {
         let body = effect_to_body(Effect::DispatchNode {
             reasoner: "openai-provider".into(),
             run_id: "run-1".into(),
+            run_name: Some("test-graph".into()),
             node_id: "n2".into(),
             firing_id: "f-abc".into(),
             args: json!({"prompt": "hi"}),
@@ -473,6 +478,10 @@ mod tests {
         );
         let args = body.get("args").and_then(Value::as_object).expect("args");
         assert_eq!(args.get("run_id").and_then(Value::as_str), Some("run-1"));
+        assert_eq!(
+            args.get("run_name").and_then(Value::as_str),
+            Some("test-graph")
+        );
         assert_eq!(args.get("node_id").and_then(Value::as_str), Some("n2"));
         assert_eq!(args.get("args"), Some(&json!({"prompt": "hi"})));
         assert_eq!(args.get("prev_state"), Some(&json!({"history": [1]})));

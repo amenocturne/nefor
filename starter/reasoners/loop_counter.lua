@@ -57,6 +57,7 @@
 -- to format a meaningful diagnostic.
 
 local envelope = require("core.envelope")
+local output_persist = require("reasoners.output_persistence")
 
 local emit_as = envelope.emit_as
 
@@ -98,6 +99,7 @@ local function handle(body)
   if type(key) == "string" then
     result.key = key
   end
+  result = output_persist.persist(body, result)
 
   emit_as("loop-counter", nil, {
     kind   = "tool.result",

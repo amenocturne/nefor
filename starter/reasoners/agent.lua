@@ -104,6 +104,7 @@
 local json = nefor.json
 
 local envelope      = require("core.envelope")
+local output_persist = require("reasoners.output_persistence")
 local replay_window = require("core.history_replay")
 
 local emit_as = envelope.emit_as
@@ -280,6 +281,7 @@ local function send_terminal_ok(firing_id, text, structured)
   if structured ~= nil then
     result.structured = structured
   end
+  result = output_persist.persist(entry, result)
   emit_as("agent", nil, {
     kind   = "tool.result",
     id     = firing_id,
@@ -375,6 +377,7 @@ local function handle(body)
   local entry = {
     firing_id      = firing_id,
     run_id         = body.run_id,
+    run_name       = body.run_name,
     node_id        = body.node_id,
     chat_id        = chat_id,
     provider       = provider,

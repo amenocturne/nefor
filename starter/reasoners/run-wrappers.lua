@@ -102,6 +102,9 @@ local function handle(body)
     id   = firing_id,
     name = "run",
     args = {
+      run_id = body.run_id,
+      run_name = body.run_name,
+      node_id = body.node_id,
       args = { command = command },
     },
   })

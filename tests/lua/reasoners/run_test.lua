@@ -11,6 +11,7 @@ local json = nefor.json
 local run          = require("reasoners.run")
 local bash_command = require("reasoners.bash_command")
 local run_wrappers = require("reasoners.run-wrappers")
+local sessions     = require("sessions")
 
 -- ------------------------------------------------------------------
 -- helpers
@@ -38,6 +39,11 @@ local function dispatch(handler, firing_id, args, prev_state)
     inputs     = {},
     prev_state = prev_state,
   })
+end
+
+local function dispatch_node(handler, body)
+  body.inputs = body.inputs or {}
+  return handler(body)
 end
 
 -- Build a wire-shaped log entry that run.receive_msg accepts.
@@ -79,6 +85,13 @@ local function count_tool_results_for(id)
     end
   end
   return count
+end
+
+local function read_file(path)
+  local fh = assert(io.open(path, "r"))
+  local content = fh:read("*a")
+  fh:close()
+  return content
 end
 
 -- Simulate tool-gate's tool.result fan-out for a specific tool_id.
@@ -153,6 +166,44 @@ do
   assert_eq(result_env.result.stdout, "hello\n", "stdout surfaced")
   assert_eq(result_env.result.stderr, "", "stderr empty")
   assert_eq(result_env.result.exit_code, 0, "exit_code = 0")
+end
+
+-- ------------------------------------------------------------------
+-- run reasoner — graph node output persists under the MAG workspace
+-- ------------------------------------------------------------------
+
+do
+  run._internals.reset()
+  sessions._internals.reset_state()
+  sessions.init()
+  _test.calls_clear()
+
+  dispatch_node(run.handle, {
+    firing_id = "f-persist",
+    run_id    = "run-opaque",
+    run_name  = "Feature Graph",
+    node_id   = "collect/output",
+    args      = { command = "echo persisted" },
+  })
+  local invoke = find_call_with_kind("tool-gate.tool.invoke")
+  local tool_id = invoke.body.id
+
+  _test.calls_clear()
+  deliver_tool_result(tool_id, "persisted\n[exit 0]")
+
+  local result_env = find_tool_result_for("f-persist")
+  assert_true(result_env ~= nil, "run emitted terminal tool.result")
+  assert_eq(result_env.result.output_relpath,
+    "runs/Feature-Graph/collect-output.output",
+    "output_relpath uses graph and node source names")
+  assert_true(type(result_env.result.output_path) == "string"
+      and result_env.result.output_path:match("/sessions/")
+      and result_env.result.output_path:match("/mag/runs/Feature%-Graph/collect%-output%.output$"),
+    "output_path points at the active session MAG workspace")
+
+  local content = read_file(result_env.result.output_path)
+  assert_true(content:match('"stdout"') ~= nil and content:match("persisted") ~= nil,
+    "persisted file contains the node result payload")
 end
 
 -- ------------------------------------------------------------------
