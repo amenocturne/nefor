@@ -6,7 +6,6 @@
 //!
 //! ```text
 //!   driver(chat.input.submit) → agentic-loop → tool.invoke{name=spawn_graph}
-//!     → combinators.query → nefor-combinators → combinators.query.result
 //!     → reasoner-graph dispatches tool.invoke { name=provider-wrapper }
 //!       → reasoners actor → ollama.chat.{create,append,complete}
 //!     → mock-plugin (impersonating openai-provider as "ollama") returns
@@ -65,9 +64,9 @@ use tokio::time::timeout;
 const RESULT_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// Quiet window after `ready_ok` before driving traffic — lets every
-/// plugin's startup chatter (`combinators.register`, `*.hello`,
-/// `tool-gate.hello`, `tools.advertise`, …) settle so the orchestrator's
-/// submit-time combinator query hits a populated registry.
+/// plugin's startup chatter (`*.hello`, `tool-gate.hello`,
+/// `tools.advertise`, …) settle so the orchestrator's submit-time
+/// graph query hits a populated registry.
 const QUIET_WINDOW: Duration = Duration::from_secs(2);
 
 /// Per-line read timeout while scanning incoming traffic.
@@ -97,8 +96,6 @@ fn lua_dir() -> PathBuf {
 fn ensure_binaries_built() {
     let status = Command::new("cargo")
         .arg("build")
-        .arg("-p")
-        .arg("nefor-combinators-plugin")
         .arg("-p")
         .arg("generic-provider")
         .arg("-p")
@@ -437,7 +434,6 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
     let plugin_root_dir = tmp.path().join("plugins");
     std::fs::create_dir_all(&plugin_root_dir).expect("plugin root dir");
     for name in [
-        "nefor-combinators",
         "generic-provider",
         "generic-tool",
         "reasoner-graph",
@@ -455,10 +451,6 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
     // (the broker stamps `from = ollama` on every line it emits) so
     // events emitted via `nefor.emit_raw("ollama.<sub>", ...)` look
     // identical to the real openai-provider's `ollama.*` namespace.
-    let combinators_spec = PluginSpec {
-        name: PluginName::new("nefor-combinators").expect("valid name"),
-        kind: PluginKind::Command(vec![debug.join("nefor-combinators").display().to_string()]),
-    };
     let generic_provider_spec = PluginSpec {
         name: PluginName::new("generic-provider").expect("valid name"),
         kind: PluginKind::Command(vec![debug.join("generic-provider").display().to_string()]),
@@ -500,11 +492,10 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
         ]),
     };
 
-    // Spawn order matches §6.1's policy: registry → canonical → reasoner →
+    // Spawn order matches §6.1's policy: canonical → reasoner →
     // gate → tools → provider. Order isn't load-bearing here (replay-on-
     // attach covers late attachers) but matching the reference helps if
     // a real timing dependency surfaces later.
-    let combinators_t = spawn_plugin(&combinators_spec, &root).expect("spawn combinators");
     let generic_provider_t =
         spawn_plugin(&generic_provider_spec, &root).expect("spawn generic-provider");
     let generic_tool_t = spawn_plugin(&generic_tool_spec, &root).expect("spawn generic-tool");
@@ -516,7 +507,6 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
     let (mut driver, driver_transport) = make_driver_transport();
 
     let mut broker = Broker::new(Arc::clone(&shared), host);
-    broker.attach_transport(combinators_t, combinators_spec.name.clone());
     broker.attach_transport(generic_provider_t, generic_provider_spec.name.clone());
     broker.attach_transport(generic_tool_t, generic_tool_spec.name.clone());
     broker.attach_transport(rg_t, rg_spec.name.clone());
@@ -544,7 +534,6 @@ async fn stage1_chat_input_submit_round_trips_to_assistant_message() {
         "tool-gate",
         "basic-tools",
         "reasoner-graph",
-        "nefor-combinators",
         "generic-provider",
         "generic-tool",
         // Lua-resident reasoner types — emitted as `<name>.ready` with

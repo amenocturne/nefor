@@ -10,7 +10,6 @@ Process-isolated NCP plugins. Each plugin is its own crate with a binary entry p
 - `tool-gate/` — tool advertisement + permission gate.
 - `basic-tools/` — `read_file` / `write_file` / `bash` built-ins.
 - `generic-provider/`, `generic-tool/` — passive type-registry hubs for graph composition.
-- `nefor-combinators/` — typed combinator registry.
 - `mock-plugin/` — scriptable NCP actor for integration tests.
 
 ## Authoring

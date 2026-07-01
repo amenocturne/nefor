@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "NCP v0.1 plugin: type-registry hub for the canonical tool protocol. Owns generic-tool.{ToolCalls, ToolResults}; concrete tool plugins (basic-tools, mock-plugin, ...) declare Into/From against these tags via nefor-combinators. Sibling to generic-provider — same passive-hub shape, different role."
+description = "NCP v0.1 plugin: type-registry hub for the canonical tool protocol. Owns generic-tool.{ToolCalls, ToolResults}; concrete tool plugins (basic-tools, mock-plugin, ...) declare Into/From against these tags via MAG. Sibling to generic-provider — same passive-hub shape, different role."
 
 [[bin]]
 name = "generic-tool"

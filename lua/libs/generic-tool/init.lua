@@ -4,7 +4,7 @@
 -- agrees on. Replaces the `generic-tool` Rust binary's role as a
 -- passive type-registry hub: instead of a separate process whose only
 -- job is to send `combinators.register` on startup, we declare the same
--- types from Lua against `nefor-combinators`.
+-- types from Lua via MAG's compile-time routing.
 --
 -- ## Types
 --

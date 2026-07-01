@@ -2136,10 +2136,9 @@ fn goodbye_body(config: &Config) -> Map<String, Value> {
 /// can be declared by the implementer).
 ///
 /// We emit the architecturally-correct shape (`Into.in` cross-namespace
-/// when targeting the canonical hub). The current `nefor-combinators`
-/// registry will reject these entries with `MalformedEntry` until the
-/// spec gap is resolved (see writeup in T3 deliverable). The
-/// orchestrator harmonizes between the two specs/implementations.
+/// when targeting the canonical hub). MAG's compile-time routing
+/// handles typed resolution. The orchestrator harmonizes between
+/// the two specs/implementations.
 ///
 /// We *also* include the safe (always-valid) direction
 /// `Into<openai-provider.RawResponse, generic-provider.ProviderOut>`

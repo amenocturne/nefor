@@ -13,7 +13,7 @@
 //! (basic-tools, mock-plugin's tool layer, ...) separately declare
 //! `Into<generic-tool.ToolCalls, <them>.RawCalls>` and
 //! `Into<<them>.RawResults, generic-tool.ToolResults>` against
-//! `nefor-combinators`. Cross-namespace `Into.out` makes the hub-and-spoke
+//! MAG. Cross-namespace `Into.out` makes the hub-and-spoke
 //! shape work without a many-to-many adapter mesh.
 //!
 //! This plugin is a passive type-registry hub. It does not execute tools,
@@ -81,7 +81,7 @@ async fn main() {
         std::process::exit(1);
     }
     // Force exit: `tokio::io::stdin()` parks a non-cancellable blocking
-    // reader thread; same fix as mock-plugin / nefor-combinators.
+    // reader thread; same fix as mock-plugin.
     std::process::exit(0);
 }
 

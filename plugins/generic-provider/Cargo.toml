@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "NCP v0.1 plugin: type-registry hub for the canonical provider protocol. Owns generic-provider.{ProviderIn, ProviderOut, ChatHistory, NoState, FinalAnswer}; concrete provider plugins (openai-provider, anthropic-provider, ...) declare Into/From against these tags via nefor-combinators. This plugin does not run models or hold sessions — it is a thin LSP-shaped registry whose job is to make the canonical type tags exist on the wire."
+description = "NCP v0.1 plugin: type-registry hub for the canonical provider protocol. Owns generic-provider.{ProviderIn, ProviderOut, ChatHistory, NoState, FinalAnswer}; concrete provider plugins (openai-provider, anthropic-provider, ...) declare Into/From against these tags via MAG. This plugin does not run models or hold sessions — it is a thin LSP-shaped registry whose job is to make the canonical type tags exist on the wire."
 
 [[bin]]
 name = "generic-provider"

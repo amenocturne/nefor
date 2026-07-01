@@ -65,7 +65,7 @@ async fn main() {
     // Force exit: `tokio::io::stdin()` parks a non-cancellable blocking
     // reader thread; letting the runtime drop naturally would hang the
     // process and keep the engine's `child.wait()` pending. Same fix as
-    // nefor-combinators / mock-plugin.
+    // mock-plugin.
     std::process::exit(0);
 }
 

@@ -645,7 +645,7 @@ local function handle_tool_result_run_close(run_id, body)
     end
 
     local err_text
-    for _, key in ipairs({ "_typecheck", "_missing_combinators", "_error", "_cycle" }) do
+    for _, key in ipairs({ "_typecheck", "_error", "_cycle" }) do
       local entry = results[key]
       if type(entry) == "table" and type(entry.error) == "string" then
         err_text = "[" .. key .. "] " .. entry.error

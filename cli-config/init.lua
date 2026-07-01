@@ -32,7 +32,7 @@ package.path = table.concat({
 -- lib. The `dir` overrides skip the clone path; pm registers each dir
 -- and puts it on package.path so `require("<name>")` resolves to the
 -- plugin lib. Starter composers live as per-domain files (provider,
--- tools, graph, combinators) at the starter root and are reached via
+-- tools, graph) at the starter root and are reached via
 -- plain `require("<name>")`.
 local pm = require("nefor-pm")
 pm.install({
@@ -96,6 +96,13 @@ function invoke_from_plugin(source, payload)
 end
 
 actor.install()
+
+-- Combinator shim: with nefor-combinators removed, graphs using fanout
+-- hang waiting for combinators.query/invoke replies. The shim responds
+-- from Lua with shape-based routing until MAG replaces this at compile
+-- time.
+require("core.combinator_shim").install()
+
 actor.spawn(sessions)
 sessions.init()
 
@@ -107,8 +114,6 @@ local agentic_cli = require("cli")
 
 require("libs.generic-provider").declare()
 require("libs.generic-tool").declare()
-
-actor.spawn(require("compositors.combinators"))
 
 local agentic_loop = require("agentic-loop")
 agentic_loop.configure {

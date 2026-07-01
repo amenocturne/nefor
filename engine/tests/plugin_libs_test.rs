@@ -1,7 +1,7 @@
 //! Unit tests for the per-plugin Lua libs that still ship Lua source.
 //!
 //! Post Phase-2 shape consolidation:
-//!   * `basic-tools`, `nefor-combinators` no longer ship Lua libs —
+//!   * `basic-tools` no longer ships Lua libs —
 //!     their actor-spec wiring is the generic identity passthrough in
 //!     `core.actor.identity_spec`, exercised by `tests/lua/core/actor_test.lua`.
 //!   * `reasoner-graph` ships only `spawn_graph.lua` (protocol

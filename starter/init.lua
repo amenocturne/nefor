@@ -209,6 +209,13 @@ function invoke_from_plugin(source, payload)
 end
 
 actor.install()
+
+-- Combinator shim: with nefor-combinators removed, graphs using fanout
+-- hang waiting for combinators.query/invoke replies. The shim responds
+-- from Lua with shape-based routing until MAG replaces this at compile
+-- time.
+require("core.combinator_shim").install()
+
 -- Defense-in-depth fallback for the synchronous `history_replay.set`
 -- path that sessions drives around its replay burst. Wired explicitly
 -- here so module load stays free of bus dependencies.
@@ -244,20 +251,16 @@ end
 local startup = parse_startup_args((nefor.runtime and nefor.runtime.argv) or {})
 sessions.init(startup.session_id)
 
--- Spawn order matters: provider/tool type-tag registrations must reach
--- nefor-combinators before the scheduler queries it on submit. Order:
+-- Spawn order:
 --   1. libs.generic-{provider,tool}.declare()
---   2. compositors.combinators
---   3. agentic-loop + reasoners
---   4. providers
---   5. reasoner-graph + tool-gate + basic-tools
---   6. lead-workflow
---   7. chat (declarative TUI)
+--   2. agentic-loop + reasoners
+--   3. providers
+--   4. reasoner-graph + tool-gate + basic-tools
+--   5. lead-workflow
+--   6. chat (declarative TUI)
 
 require("libs.generic-provider").declare()
 require("libs.generic-tool").declare()
-
-actor.spawn(require("compositors.combinators"))
 
 -- The actor runtime queues incoming envelopes during boot, so spawning
 -- the orchestrator and its resident reasoners before the plugins they

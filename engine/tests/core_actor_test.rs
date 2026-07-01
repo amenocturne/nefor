@@ -1,7 +1,7 @@
 //! Unit tests for `lua/core/actor.lua`'s `identity_spec` helper —
 //! the generic identity-passthrough actor-spec factory used by every
 //! plugin whose Rust binary speaks the canonical wire shape (basic-
-//! tools, reasoner-graph, nefor-combinators).
+//! tools, reasoner-graph).
 //!
 //! Drives the helper against a mock `nefor.engine` surface that
 //! records every `send` / `deliver` call into a shared `_test.calls()`

@@ -14,7 +14,7 @@
 //! plugins (openai-provider, anthropic-provider, …) separately declare
 //! `Into<generic-provider.ProviderIn, <them>.RawRequest>` and
 //! `Into<<them>.RawResponse, generic-provider.ProviderOut>` against
-//! `nefor-combinators`. The cross-namespace `Into.out` lane is what makes
+//! MAG. The cross-namespace `Into.out` lane is what makes
 //! this hub-and-spoke shape work without a many-to-many adapter mesh.
 //!
 //! This plugin is a passive type-registry hub. It does not run models, it
@@ -105,7 +105,7 @@ async fn main() {
         std::process::exit(1);
     }
     // Force exit: `tokio::io::stdin()` parks a non-cancellable blocking
-    // reader thread; same fix as mock-plugin / nefor-combinators.
+    // reader thread; same fix as mock-plugin.
     std::process::exit(0);
 }
 
@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn register_body_uses_bare_type_names() {
-        // Per nefor-combinators wire spec D-19: `types[]` are bare names
+        // Per wire spec D-19: `types[]` are bare names
         // (no dots). The registry prepends sender's namespace at install.
         let b = register_body();
         let types = b

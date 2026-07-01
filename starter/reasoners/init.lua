@@ -250,6 +250,10 @@ local function provider_run_node(reasoner_type, body)
       role = "assistant",
       text = text,
     })
+    -- Flush queued sub-graph dispatches now. The normal path flushes on
+    -- the first visible stream.delta, but this shortcut skips the
+    -- provider call entirely — no stream events will arrive.
+    agentic_loop.flush_pending_dispatches()
     agentic_loop.take_pending_for_chat(chat_id)
     send_tool_result_ok(reasoner_type, firing_id, {
       text = text,

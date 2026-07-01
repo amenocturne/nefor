@@ -56,7 +56,6 @@ const REQUIRED_BINS: &[&str] = &[
     "mock-plugin",
     "reasoner-graph",
     "tool-gate",
-    "nefor-combinators",
     "generic-provider",
     "generic-tool",
     "basic-tools",
