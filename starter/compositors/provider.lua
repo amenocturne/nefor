@@ -57,7 +57,7 @@
 -- synthesis). This file just delegates.
 
 local envelope = require("core.envelope")
-local output_persist = require("reasoners.output_persistence")
+local output_persist = require("libs.output-persistence")
 
 local M = {}
 

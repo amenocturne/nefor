@@ -2,7 +2,7 @@
 -- Uses tool-gate -> bash like run.lua; does not grant direct bash access.
 local envelope = require("core.envelope")
 local event = require("core.event")
-local output_persist = require("reasoners.output_persistence")
+local output_persist = require("libs.output-persistence")
 local replay_window = require("core.history_replay")
 local run = require("reasoners.run")
 

@@ -1,6 +1,6 @@
 -- Deterministic fan-in reasoner. Preserves upstream identity and order.
 local envelope = require("core.envelope")
-local output_persist = require("reasoners.output_persistence")
+local output_persist = require("libs.output-persistence")
 local emit_as = envelope.emit_as
 
 local M = {}

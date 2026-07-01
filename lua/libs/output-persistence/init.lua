@@ -1,7 +1,11 @@
--- Shared per-node output persistence for graph reasoners.
+-- Shared per-node output persistence for MAG graph reasoners.
 --
 -- Writes successful node outputs under the active MAG workspace:
 --   <data-root>/sessions/<session-id>/mag/runs/<run-name>/<node-id>.output
+--
+-- The library is intentionally side-effect free until persist() is called.
+-- Callers own policy: which reasoner completions count as successful and
+-- which result shape should be written.
 
 local json = nefor.json
 

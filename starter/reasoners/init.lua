@@ -39,7 +39,7 @@ local json = nefor.json
 
 local envelope      = require("core.envelope")
 local ids           = require("core.ids")
-local output_persist = require("reasoners.output_persistence")
+local output_persist = require("libs.output-persistence")
 local replay_window = require("core.history_replay")
 
 local emit_as        = envelope.emit_as

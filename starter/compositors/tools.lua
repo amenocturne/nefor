@@ -16,7 +16,7 @@ local actor        = require("core.actor")
 local envelope     = require("core.envelope")
 local gate_lib     = require("tool-gate")
 local chat_emitter = require("libs.chat-emitter")
-local output_persist = require("reasoners.output_persistence")
+local output_persist = require("libs.output-persistence")
 
 local M = {}
 
