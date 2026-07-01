@@ -1346,9 +1346,9 @@ local function receive_msg(entry)
 
   -- Tool-gate hello — advertise our tools on first sight. Narrowed
   -- to `tool-gate.hello` specifically: matching any `*.hello` would
-  -- mean the first non-gate plugin to say hello (e.g. nefor-combinators)
-  -- silently locks the advertised flag and tool-gate never sees the
-  -- ad. The advertise_tools target must always be tool-gate.
+  -- mean the first non-gate plugin to say hello silently locks the
+  -- advertised flag and tool-gate never sees the ad. The
+  -- advertise_tools target must always be tool-gate.
   if kind == "tool-gate.hello" then
     advertise_tools("tool-gate")
     return

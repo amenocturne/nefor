@@ -309,14 +309,11 @@ agentic_loop.configure {
   reasoning_effort = cfg.lead_reasoning_effort,
   system           = lead_role.LEAD_SYSTEM_PROMPT .. build_runtime_context(),
   -- Restrict the lead's chat catalog to the orchestration-tool surface.
-  -- Without this filter the lead sees every wire-advertised tool — most
-  -- problematically `spawn_graph` (the reasoner-graph internal that
-  -- `mag` translates into) — and could call them directly,
-  -- bypassing the role-keyed sub-agent contract and bottoming out in
-  -- `reasoner '<role>' not connected` runtime errors. The agent
-  -- reasoner already enforces a per-role allowlist on its sub-firings
-  -- via the same `chat.create.tools` plumbing; this extends the same
-  -- discipline to the lead's chat at the orchestrator layer.
+  -- MAG is the public graph-construction surface; lower-level graph
+  -- primitives stay runtime internals. The agent reasoner already
+  -- enforces a per-role allowlist on sub-firings via the same
+  -- `chat.create.tools` plumbing; this extends the same discipline to
+  -- the lead's chat at the orchestrator layer.
   tool_allowlist = lead_role.ORCHESTRATION_TOOLS,
 }
 actor.spawn(agentic_loop)
@@ -378,8 +375,8 @@ for _, p in ipairs(cfg.providers or {}) do
 end
 
 -- Pre-seed the reasoner-graph binary's peer set with every Lua-resident
--- reasoner type. Without this, a spawn_graph referencing a reasoner that
--- hasn't emitted a bus event yet fails with "reasoner not connected."
+-- reasoner type. MAG execution lowers to reasoner-graph internally, and
+-- the graph must be able to reference Lua reasoners before they emit.
 local rg_argv = { require("config").bin("reasoner-graph") }
 do
   local reasoners_mod = require("reasoners")
@@ -408,8 +405,8 @@ tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
 
 -- lead-workflow lives alongside agentic-loop, not inside it: separate
 -- bus subscriptions, separate state. Owns plan/approval state and the
--- active graph run id; advertises mag / write-review /
--- await-approval to tool-gate. Registered BEFORE tool-gate's spawn so
+-- active graph run id; advertises mag / write-review / graph-status to
+-- tool-gate. Registered BEFORE tool-gate's spawn so
 -- its bus subscription is live when tool-gate.hello arrives —
 -- otherwise the advertise is missed and the lead model gets "no such
 -- tool" at runtime.

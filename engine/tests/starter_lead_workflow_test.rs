@@ -4,6 +4,10 @@
 //! then load the Lua test driver at `starter/lead_workflow_test.lua`.
 
 use std::path::PathBuf;
+use std::{fs, io::Write};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use mlua::{Function, Lua, Table, Value};
 
@@ -25,6 +29,11 @@ fn repo_root() -> PathBuf {
 
 #[test]
 fn starter_lead_workflow_full() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    install_fake_mag(tempdir.path()).expect("install fake mag");
+    let prev_data_dir = std::env::var("NEFOR_DATA_DIR").ok();
+    std::env::set_var("NEFOR_DATA_DIR", tempdir.path());
+
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
     set_package_path(&lua).expect("set package.path");
@@ -38,8 +47,44 @@ fn starter_lead_workflow_full() {
         .set_name(test_path.display().to_string())
         .exec()
     {
+        match prev_data_dir {
+            Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+            None => std::env::remove_var("NEFOR_DATA_DIR"),
+        }
         panic!("lead_workflow_test.lua failed:\n{e}");
     }
+
+    match prev_data_dir {
+        Some(v) => std::env::set_var("NEFOR_DATA_DIR", v),
+        None => std::env::remove_var("NEFOR_DATA_DIR"),
+    }
+}
+
+fn install_fake_mag(root: &std::path::Path) -> std::io::Result<()> {
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir)?;
+    let mag = bin_dir.join("mag");
+    let mut fh = fs::File::create(&mag)?;
+    fh.write_all(
+        br#"#!/bin/sh
+if grep -q 'write_file' "$1"; then
+  cat <<'JSON'
+{"hash":"writer-hash","terminal":"out","nodes":[{"id":"build","reasoner":"agent","args":{"prompt":"implement feature X","profile":"fast","tools":["read_file","write_file"]}},{"id":"out","reasoner":"sink","args":{}}],"edges":[{"from":"build","to":"out"}]}
+JSON
+else
+  cat <<'JSON'
+{"hash":"read-only-hash","terminal":"out","nodes":[{"id":"run","reasoner":"bash_command","args":{"command":"echo ok"}},{"id":"out","reasoner":"sink","args":{}}],"edges":[{"from":"run","to":"out"}]}
+JSON
+fi
+"#,
+    )?;
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&mag)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&mag, perms)?;
+    }
+    Ok(())
 }
 
 fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {

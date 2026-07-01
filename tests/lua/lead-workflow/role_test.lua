@@ -36,69 +36,22 @@ assert_true(
   "LEAD_SYSTEM_PROMPT is the real prompt, not a missing-file placeholder"
 )
 
--- AGENT_CONFIGS has the three v0.1 roles.
-assert_true(type(lead_role.AGENT_CONFIGS) == "table", "AGENT_CONFIGS is a table")
-for _, role in ipairs({ "explorer", "builder", "reviewer" }) do
-  local cfg = lead_role.AGENT_CONFIGS[role]
-  assert_true(type(cfg) == "table", "AGENT_CONFIGS." .. role .. " exists")
-  assert_true(type(cfg.system_prompt) == "string", role .. ".system_prompt is a string")
-  assert_true(#cfg.system_prompt > 0, role .. ".system_prompt is non-empty")
-  assert_true(
-    not cfg.system_prompt:find("^%[lead%-workflow%.role: prompt"),
-    role .. ".system_prompt is the real prompt, not a placeholder"
-  )
-  assert_eq(cfg.model, nil, role .. ".model defaults to nil")
-  assert_true(type(cfg.tool_allowlist) == "table", role .. ".tool_allowlist is a table")
-  assert_true(#cfg.tool_allowlist > 0, role .. ".tool_allowlist is non-empty")
-end
-
--- Builder gets write_file + bash.
-assert_true(
-  contains(lead_role.AGENT_CONFIGS.builder.tool_allowlist, "write_file"),
-  "builder allowlist contains write_file"
-)
-assert_true(
-  contains(lead_role.AGENT_CONFIGS.builder.tool_allowlist, "bash"),
-  "builder allowlist contains bash"
-)
--- Explorer gets bash (read_only gated by da) but NOT write_file.
-assert_true(
-  contains(lead_role.AGENT_CONFIGS.explorer.tool_allowlist, "bash"),
-  "explorer allowlist contains bash"
-)
-assert_true(
-  not contains(lead_role.AGENT_CONFIGS.explorer.tool_allowlist, "write_file"),
-  "explorer allowlist does NOT contain write_file"
-)
--- Reviewer gets neither bash nor write_file.
-for _, tool in ipairs({ "write_file", "bash" }) do
-  assert_true(
-    not contains(lead_role.AGENT_CONFIGS.reviewer.tool_allowlist, tool),
-    "reviewer allowlist does NOT contain " .. tool
-  )
-end
-
--- Explorer and reviewer share the read-only tool set.
-for _, tool in ipairs({ "read_file", "list_dir", "search_text" }) do
-  assert_true(
-    contains(lead_role.AGENT_CONFIGS.explorer.tool_allowlist, tool),
-    "explorer allowlist contains " .. tool
-  )
-  assert_true(
-    contains(lead_role.AGENT_CONFIGS.reviewer.tool_allowlist, tool),
-    "reviewer allowlist contains " .. tool
-  )
-end
-
--- read_only flag mirrors the tool set: true for read-only roles.
-assert_eq(lead_role.AGENT_CONFIGS.explorer.read_only, true, "explorer is read_only")
-assert_eq(lead_role.AGENT_CONFIGS.reviewer.read_only, true, "reviewer is read_only")
-assert_eq(lead_role.AGENT_CONFIGS.builder.read_only,  false, "builder is not read_only")
-
 -- Lead's orchestration tools are minimal and don't include the
--- investigation/edit tools sub-agents have.
+-- shell/new-file tools that MAG agents use.
 assert_true(type(lead_role.ORCHESTRATION_TOOLS) == "table", "ORCHESTRATION_TOOLS is a table")
-for _, tool in ipairs({ "read_file", "dispatch-graph", "write-review" }) do
+for _, tool in ipairs({
+  "read_file",
+  "read_image",
+  "list_dir",
+  "search_text",
+  "instructions",
+  "edit_file",
+  "mag-env",
+  "mag",
+  "write-review",
+  "graph-status",
+  "terminate-graph",
+}) do
   assert_true(
     contains(lead_role.ORCHESTRATION_TOOLS, tool),
     "ORCHESTRATION_TOOLS contains " .. tool
@@ -111,7 +64,11 @@ assert_true(
   not contains(lead_role.ORCHESTRATION_TOOLS, "await-approval"),
   "ORCHESTRATION_TOOLS must NOT contain await-approval (replaced by tagged user-message verdict feedback)"
 )
-for _, tool in ipairs({ "write_file", "bash", "list_dir", "search_text" }) do
+assert_true(
+  not contains(lead_role.ORCHESTRATION_TOOLS, "dispatch-graph"),
+  "ORCHESTRATION_TOOLS must NOT contain dispatch-graph (replaced by MAG)"
+)
+for _, tool in ipairs({ "write_file", "bash" }) do
   assert_true(
     not contains(lead_role.ORCHESTRATION_TOOLS, tool),
     "ORCHESTRATION_TOOLS does NOT contain " .. tool

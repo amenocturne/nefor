@@ -60,6 +60,7 @@ local state = {
   chat_id_stream_visible = {},  ---@type table
   chat_id_stream_explicitly_hidden = {},  ---@type table  -- chats explicitly registered hidden by agent reasoners; gates streams without a pending entry
   current_lead_chat_id = nil,   ---@type string|nil
+  replay_chat_ids = {},         ---@type table<string, boolean>
   -- firing_id → { run_id, node_id, reasoner } for tracked runs (the
   -- orchestrator run + every sub-graph run we own). Populated by
   -- graph.node.fired observer envelopes; consumed when a tool.result
@@ -235,18 +236,13 @@ local function flush_pending_user_inputs()
     text_preview = string.sub(combined, 1, 80),
   })
   state.pending_user_inputs = {}
-  emit("nefor-tui", {
-    kind = "chat.message.append",
-    role = "user",
-    text = combined,
-  })
   submit_orchestrator_run(combined)
 end
 
 -- Cancel everything. Fan-out order:
 --   (1) cancel current orchestrator run + interrupt the in-flight
 --       provider stream so deltas stop spilling
---   (2) cancel sub-graph runs + clear queued dispatches
+--   (2) if the lead was idle, cancel sub-graph runs + clear queued dispatches
 --   (3) drop deferred queue + pending user inputs
 --   (4) clear pending bookkeeping
 --
@@ -273,15 +269,14 @@ local function cancel_all()
     })
     state.current_run_id = nil
   end
-  local sub_n = cancel_all_pending_runs()
+  local sub_n = cancelled_chat and 0 or cancel_all_pending_runs()
   local deferred_after_cancel = #state.deferred_queue
   local dropped_inputs = #state.pending_user_inputs
   if cancelled_chat then
-    -- Keep the synthesized cancellation result queued. The interrupted
-    -- provider turn is being torn down, so starting an automatic relay
-    -- turn here would fight the user's cancellation. The next live user
-    -- submit prepends this queued notice to the model prompt.
-    nefor.log.info("agentic-loop: retaining interrupted sub-graph notice for next submit", {
+    -- The visible lead turn is being torn down. Sub-graph cancellation
+    -- is a later stop-ladder rung, so do not synthesize or relay
+    -- sub-graph interruption notices here.
+    nefor.log.info("agentic-loop: cancelled active lead turn only", {
       deferred_queued = deferred_after_cancel,
     })
   else
@@ -481,6 +476,11 @@ local function handle_chat_input_submit(body)
 
   if state.current_run_id ~= nil then
     state.pending_user_inputs[#state.pending_user_inputs + 1] = text
+    emit("nefor-tui", {
+      kind = "chat.message.append",
+      role = "user",
+      text = text,
+    })
     return
   end
 
@@ -1155,6 +1155,13 @@ local function receive_msg(entry)
   --     run-close and per-firing close share the kind; we disambiguate
   --     by id.
   if history_replay.active() then
+    if kind == "chat.history.create" then
+      local cid = body.chat_id
+      if type(cid) == "string" and cid ~= "" then
+        state.replay_chat_ids[cid] = true
+      end
+      return
+    end
     if kind == "graph.node.fired" then return end
     if kind == "tool.result" then
       -- Cross-process /resume rebuild: capture the active chat_id from
@@ -1175,7 +1182,7 @@ local function receive_msg(entry)
       local result = body.result
       if type(result) == "table" and type(result.next_state) == "table" then
         local cid = result.next_state.chat_id
-        if type(cid) == "string" and cid ~= "" then
+        if type(cid) == "string" and cid ~= "" and state.replay_chat_ids[cid] then
           state.current_state = result.next_state
         end
       end
@@ -1305,7 +1312,11 @@ if nefor.bus and nefor.bus.on_event then
   -- the replay markers; /new fires them too with an empty log, where
   -- the helper is a no-op (no chat.create / chat.model.set to read).
   nefor.bus.on_event("sessions.replay.start", function(_entry)
+    state.replay_chat_ids = {}
     restore_active_model_from_session_log()
+  end)
+  nefor.bus.on_event("sessions.replay.end", function(_entry)
+    state.replay_chat_ids = {}
   end)
 end
 
@@ -1334,6 +1345,7 @@ M._internals  = {
     state.chat_id_stream_visible = {}
     state.chat_id_stream_explicitly_hidden = {}
     state.current_lead_chat_id = nil
+    state.replay_chat_ids = {}
     state.firing_to_node = {}
     state.stream_observers = {}
     state.reasoning_observers = {}

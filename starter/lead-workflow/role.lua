@@ -95,7 +95,6 @@ M.ORCHESTRATION_TOOLS = {
   "read_image",
   "list_dir",
   "search_text",
-  "mirror-projects",
   "instructions",
   "edit_file",
   "graph-status",

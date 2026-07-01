@@ -4,8 +4,7 @@
 --   tools.gate_spec(gate_name, command)
 --     Wraps the tool-gate Rust binary. Threads the plugin lib's
 --     translation primitives with starter-owned agentic-loop state for
---     tool-executor firings, spawn_graph virtual tool, and AGENTS.md
---     emission ordering.
+--     tool-executor firings and AGENTS.md emission ordering.
 --
 --   tools.basic_actor_spec
 --     Default actor spec for the basic-tools Rust binary. Sources the
@@ -22,12 +21,7 @@ local M = {}
 
 -- ## from_plugin (binary → bus)
 --
---   * On first `<gate>.hello`: publish the spawn_graph virtual-tool
---     advertise envelope and republish the hello.
---   * On `spawn-graph-tool.tool.invoke`: parse the invoke, queue the
---     sub-graph through agentic-loop, emit the synthesised ack
---     `tool.result`, and DROP the gate-forwarded envelope before
---     targeting tries to deliver to a non-existent peer.
+--   * On `<gate>.hello`: republish the hello.
 --   * On `tool.result`: when the output exceeds the inline budget,
 --     dump-to-file via the plugin lib's `maybe_dump_output` (full
 --     payload to disk, summary in `body.output`). Then correlate the
@@ -55,7 +49,6 @@ function M.gate_spec(gate_name, command)
   end
 
   local translator = gate_lib.translator(gate_name)
-  local advertised = false
   local agentic_loop  -- bound lazily
 
   local function al()
@@ -73,39 +66,10 @@ function M.gate_spec(gate_name, command)
       return
     end
 
-    -- First hello: advertise the spawn_graph virtual tool. The
-    -- advertise envelope is targeted at the gate's stdin (peer
-    -- delivery, from=engine) so the binary registers spawn_graph as
-    -- one of its known tools. Then republish the hello to the bus.
-    if not advertised and translator.is_hello(env) then
-      advertised = true
-      translator.emit(gate_name, translator.advertise_body())
+    -- Republish hello to the bus. Raw graph submission is no longer
+    -- advertised through tool-gate; MAG owns public graph submission.
+    if translator.is_hello(env) then
       translator.publish(env.body, nil)
-      return
-    end
-
-    -- Spawn-graph: intercept the gate-forwarded invoke and queue a
-    -- sub-graph through agentic-loop. The orchestrator coupling lives
-    -- here in starter code; the plugin lib only parses + builds bodies.
-    if translator.is_spawn_graph_invoke(env) then
-      local parsed, parse_err = gate_lib.parse_spawn_graph_invoke(env.body)
-      if not parsed then
-        -- Best-effort invoke_id surfacing: the parse failure may have
-        -- been about a missing/non-string `id`, in which case there's
-        -- no canonical tool_id to bind the error result to. We still
-        -- emit so callers see a structured failure rather than silent
-        -- swallowing; downstream consumers gate on type(body.id) before
-        -- correlating.
-        local invoke_id = type(env.body) == "table" and env.body.id or nil
-        translator.emit(nil, gate_lib.spawn_graph_error_body(invoke_id, parse_err))
-        return
-      end
-      local run_id, err = al().queue_sub_graph(parsed.args, parsed.invoke_id)
-      if not run_id then
-        translator.emit(nil, gate_lib.spawn_graph_error_body(parsed.invoke_id, err))
-        return
-      end
-      translator.emit(nil, gate_lib.spawn_graph_ack_body(parsed.invoke_id, run_id))
       return
     end
 

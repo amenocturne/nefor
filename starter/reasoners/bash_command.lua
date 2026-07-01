@@ -75,5 +75,13 @@ end
 
 M.handle = handle
 M.receive_msg = receive_msg
-M._internals = { tool_to_firing = tool_to_firing, firing_meta = firing_meta, on_tool_result = on_tool_result }
+M._internals = {
+  tool_to_firing = tool_to_firing,
+  firing_meta = firing_meta,
+  on_tool_result = on_tool_result,
+  reset = function()
+    for k, _ in pairs(tool_to_firing) do tool_to_firing[k] = nil end
+    for k, _ in pairs(firing_meta) do firing_meta[k] = nil end
+  end,
+}
 return M

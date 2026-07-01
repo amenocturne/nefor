@@ -13,10 +13,6 @@
 --
 -- ## Per-tool policies
 --
--- `mirror-projects`: auto-approved. This dedicated typed wrapper is
--- schema-limited to read-only actions (list/tasks/show/find), so it is
--- safe for lead/non-read-only requests as well as read-only agents.
---
 -- `bash`: passes the command through `da` (https://github.com/amenocturne/da),
 -- a bash-command classifier with explicit policy flags. da reads the
 -- command on stdin and exits 0 / 1 / 2 for approve / defer / deny. We
@@ -25,10 +21,6 @@
 --   --read-only --macos-only --help-bypass
 --   --git read,add,commit,restore-staged,tag,fetch,pull,push
 --   --cargo local
---
--- bash invocations of the `mirror-projects` CLI are only fast-pathed for
--- read subcommands, and especially for read-only agents; write-capable
--- task-management commands must stay behind da/popup gating.
 --
 -- `edit_file`: auto-approved for non-read-only agents. The lead prompt
 -- still requires reading the target file before editing, but the tool
@@ -151,26 +143,8 @@ end
 -- Classify a bash command through da. Returns one of:
 --   "approve" | "deny" | "defer"
 -- `da` probe/spawn failure is a runtime install error and raises.
--- Read-only agents also get a narrow `mirror-projects` read fast-path
--- so explorer/reviewer/builder prompts can read project task context
--- without permitting task-management writes.
-local MIRROR_PROJECTS_READ_COMMANDS = {
-  list = true,
-  tasks = true,
-  show = true,
-  find = true,
-}
-
-local function is_mirror_projects_read_command(command)
-  if type(command) ~= "string" or #command == 0 then return false end
-  if command:find("[;&|><`$()]") then return false end
-  local subcommand = command:match("^%s*mirror%-projects%s+(%S+)")
-  return MIRROR_PROJECTS_READ_COMMANDS[subcommand] == true
-end
-
 local function classify_bash(command, read_only)
   if type(command) ~= "string" or #command == 0 then return "defer" end
-  if read_only and is_mirror_projects_read_command(command) then return "approve" end
   local cmd = probe_da()
   local policy = read_only and DA_ARGS_STRICT_READONLY or DA_ARGS
   local r = nefor.process.run {
@@ -244,11 +218,6 @@ local function handle_permission_request(body)
     else
       emit_response(id, "deny", "write_file requires an approved plan")
     end
-    return
-  end
-
-  if tool == "mirror-projects" then
-    emit_response(id, "approve")
     return
   end
 

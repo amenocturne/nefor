@@ -5,6 +5,8 @@
 
 local lw   = require("lead-workflow")
 local json = nefor.json
+local agentic_loop = require("agentic-loop")
+local sessions = require("sessions")
 
 local function assert_eq(actual, expected, msg)
   if actual ~= expected then
@@ -59,8 +61,61 @@ end
 
 local function fresh()
   lw._internals.reset()
+  agentic_loop._internals.reset()
+  sessions._internals.reset_state()
+  sessions.init()
   _test.set_plugins({ "reasoner-graph", "tool-gate", "nefor-tui" })
   _test.calls_clear()
+end
+
+local READ_ONLY_MAG = [[
+(type Input)
+(type Out)
+
+(let [run (node "bash_command" {:command "echo ok"} : Input -> Out)
+      out (node "sink" {} : Out -> Out)]
+  (graph run -> out :terminal out))
+]]
+
+local WRITER_MAG = [[
+(type Task)
+(type Patch)
+
+(let [build (node "agent" {:prompt "implement feature X"
+                           :profile "fast"
+                           :tools ["read_file" "write_file"]}
+              : Task -> Patch)
+      out   (node "sink" {} : Patch -> Patch)]
+  (graph build -> out :terminal out))
+]]
+
+local function invoke_tool(id, name, args)
+  feed("tool-gate", {
+    kind = "lead-workflow.tool.invoke",
+    id   = id,
+    name = name,
+    args = args or {},
+  })
+end
+
+local function write_mag_file(id, file, content)
+  invoke_tool(id, "mag", {
+    action = "write",
+    file = file,
+    content = content,
+  })
+  local reply = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result" and c.body.id == id
+  end)
+  assert_true(reply ~= nil and reply.body.output and reply.body.output.status == "written",
+    "mag write must create " .. file .. "; got " .. json.encode(_test.calls()))
+end
+
+local function execute_mag(id, file)
+  invoke_tool(id, "mag", {
+    action = "execute",
+    file = file,
+  })
 end
 
 -- ------------------------------------------------------------------
@@ -89,152 +144,97 @@ do
 end
 
 -- ------------------------------------------------------------------
--- dispatch-graph builds + submits a graph
+-- mag write/execute builds + submits a graph
 -- ------------------------------------------------------------------
 
 do
   fresh()
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "firing-dispatch-1",
-    name = "dispatch-graph",
-    args = {
-      name = "auth-login-map",
-      terminal = "explore-2",
-      nodes = {
-        { id = "explore-1", role = "explorer",
-          agent_args = { prompt = "Investigate auth.lua",
-                         system_prompt = "You are an explorer.",
-                         tool_allowlist = { "read_file" } } },
-        { id = "explore-2", role = "explorer",
-          agent_args = { prompt = "Map login flow callers",
-                         system_prompt = "You are an explorer.",
-                         tool_allowlist = { "read_file", "search_text" } },
-          dependencies = { "explore-1" } },
-      },
-    },
-  })
+  write_mag_file("firing-mag-write-1", "auth-login-map.mag", READ_ONLY_MAG)
+  _test.calls_clear()
+  execute_mag("firing-mag-execute-1", "auth-login-map.mag")
 
   local calls = decode_calls()
-  -- The actor should emit a tool.invoke{name=spawn_graph} targeting reasoner-graph.
+  -- The actor should submit through agentic-loop, which flushes a
+  -- tool.invoke{name=spawn_graph} targeting reasoner-graph.
   local invoke = find_call(calls, function(c)
     return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
         and c.target == "reasoner-graph"
   end)
   assert_true(invoke ~= nil,
-    "dispatch-graph must emit spawn_graph tool.invoke targeting reasoner-graph; got "
+    "mag execute must emit spawn_graph tool.invoke targeting reasoner-graph; got "
     .. json.encode(_test.calls()))
   assert_true(type(invoke.body.id) == "string" and #invoke.body.id > 0,
     "spawn_graph tool.invoke carries a non-empty id (run_id)")
 
   local graph = invoke.body.args and invoke.body.args.graph
-  assert_eq(invoke.body.args.name, "auth-login-map",
-    "graph name forwarded to spawn_graph args")
   assert_true(type(graph) == "table", "args.graph present")
   assert_eq(#graph.nodes, 2, "two nodes in graph")
-  assert_eq(graph.nodes[1].id, "explore-1", "first node id preserved")
-  assert_eq(graph.nodes[1].reasoner, "agent",
-    "role-keyed nodes become `agent` reasoners")
-  assert_eq(graph.nodes[1].args.prompt, "Investigate auth.lua",
-    "agent_args.prompt threaded through")
-  assert_eq(graph.nodes[2].id, "explore-2", "second node id preserved")
-  -- Edge from explore-1 → explore-2.
+  assert_eq(graph.terminal, "out", "sink node becomes terminal")
+  assert_eq(graph.nodes[1].id, "run", "first node id preserved")
+  assert_eq(graph.nodes[1].reasoner, "bash_command",
+    "MAG node reasoner is forwarded")
+  assert_eq(graph.nodes[1].args.command, "echo ok",
+    "MAG node args are forwarded")
+  assert_eq(graph.nodes[2].id, "out", "sink node id preserved")
   local has_edge = false
   for _, e in ipairs(graph.edges or {}) do
-    if e.from == "explore-1" and e.to == "explore-2" then has_edge = true end
+    if e.from == "run" and e.to == "out" then has_edge = true end
   end
-  assert_true(has_edge, "dependency translates to graph edge")
+  assert_true(has_edge, "MAG graph edge is forwarded")
 
   -- Active run_id tracked.
-  assert_true(lw._internals.state.active_run_ids[invoke.body.id] == true,
-    "active_run_ids contains the dispatched run_id")
+  assert_true(type(lw._internals.state.active_runs[invoke.body.id]) == "table",
+    "active_runs contains the dispatched run_id")
 
   -- The actor also replies to the lead's invocation with the run_id.
   local reply = find_call(calls, function(c)
-    return c.body.kind == "tool.result" and c.body.id == "firing-dispatch-1"
+    return c.body.kind == "tool.result" and c.body.id == "firing-mag-execute-1"
   end)
-  assert_true(reply ~= nil, "actor replies to dispatch-graph invocation")
+  assert_true(reply ~= nil, "actor replies to mag execute invocation")
   assert_eq(reply.body.output.run_id, invoke.body.id,
     "reply carries the run_id")
-  assert_eq(reply.body.output.name, "auth-login-map",
-    "reply carries the graph name")
+  assert_eq(reply.body.output.status, "executing",
+    "reply reports the graph is executing")
 end
 
 do
   fresh()
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "firing-bad-name",
-    name = "dispatch-graph",
-    args = {
-      name = "Too Long Or Spaced",
-      terminal = "explore",
-      nodes = {
-        { id = "explore", role = "explorer",
-          agent_args = { prompt = "x" } },
-      },
-    },
+  invoke_tool("firing-bad-path", "mag", {
+    action = "write",
+    file = "../bad.mag",
+    content = READ_ONLY_MAG,
   })
   local err = find_call(decode_calls(), function(c)
     return c.body.kind == "tool.result"
-       and c.body.id == "firing-bad-name"
+       and c.body.id == "firing-bad-path"
        and type(c.body.error) == "string"
   end)
-  assert_true(err ~= nil, "invalid graph name returns a tool.result error")
-  assert_true(err.body.error:find("kebab%-case") ~= nil,
-    "invalid graph name error explains kebab-case")
+  assert_true(err ~= nil, "invalid MAG path returns a tool.result error")
+  assert_true(err.body.error:find("path traversal", 1, true) ~= nil,
+    "invalid MAG path error explains path traversal")
 end
 
 do
   fresh()
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "firing-deterministic-graph",
-    name = "dispatch-graph",
-    args = {
-      name = "deterministic-check",
-      terminal = "join",
-      nodes = {
-        { id = "build", role = "explorer",
-          agent_args = { prompt = "produce candidate" } },
-        { id = "check", role = "bash_command",
-          args = { command = "just test" },
-          dependencies = { "build" } },
-        { id = "retry", role = "retry",
-          args = { max_attempts = 3 },
-          dependencies = { "check" },
-          routes = { retry = "build", pass = "join", exhausted = "join" } },
-        { id = "join", role = "accumulate",
-          dependencies = { "build", "check" } },
-      },
-    },
+  write_mag_file("firing-mag-write-compile", "deterministic-check.mag", READ_ONLY_MAG)
+  _test.calls_clear()
+  invoke_tool("firing-mag-compile", "mag", {
+    action = "compile",
+    file = "deterministic-check.mag",
   })
   local calls = decode_calls()
-  local invoke = find_call(calls, function(c)
+  local reply = find_call(calls, function(c)
+    return c.body.kind == "tool.result" and c.body.id == "firing-mag-compile"
+  end)
+  assert_true(reply ~= nil, "mag compile returns a tool.result")
+  assert_eq(reply.body.output.status, "compiled", "mag compile reports compiled status")
+  assert_true(type(reply.body.output.preview) == "string"
+              and reply.body.output.preview:find("bash_command", 1, true) ~= nil,
+    "compile preview includes the compiled reasoner")
+  local leaked = find_call(calls, function(c)
     return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
   end)
-  assert_true(invoke ~= nil, "deterministic nodes dispatch through spawn_graph")
-  local graph = invoke.body.args.graph
-  assert_eq(graph.terminal, "join", "explicit terminal forwarded")
-  local by_id = {}
-  for _, node in ipairs(graph.nodes) do by_id[node.id] = node end
-  assert_eq(by_id.check.reasoner, "bash_command", "bash_command maps to deterministic reasoner")
-  assert_eq(by_id.retry.reasoner, "retry", "retry maps to deterministic reasoner")
-  assert_eq(by_id.join.reasoner, "accumulate", "accumulate maps to deterministic reasoner")
-  assert_eq(by_id.retry.fanout["in"], "generic-control.RetryDecision", "retry carries fanout signature")
-  local saw_retry_edge, saw_pass_edge, saw_exhausted_edge = false, false, false
-  for _, edge in ipairs(graph.edges or {}) do
-    if edge.from == "retry" and edge.to == "build" and edge.type == "generic-control.Retry" then
-      saw_retry_edge = true
-    elseif edge.from == "retry" and edge.to == "join" and edge.type == "generic-control.Pass" then
-      saw_pass_edge = true
-    elseif edge.from == "retry" and edge.to == "join" and edge.type == "generic-control.Exhausted" then
-      saw_exhausted_edge = true
-    end
-  end
-  assert_true(saw_retry_edge, "retry route emits typed Retry edge")
-  assert_true(saw_pass_edge, "pass route emits typed Pass edge")
-  assert_true(saw_exhausted_edge, "exhausted route emits typed Exhausted edge")
+  assert_eq(leaked, nil, "mag compile previews only and does not submit spawn_graph")
 end
 
 -- ------------------------------------------------------------------
@@ -244,29 +244,20 @@ end
 
 do
   fresh()
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "firing-builder-no-plan",
-    name = "dispatch-graph",
-    args = {
-      name = "feature-build",
-      terminal = "build-1",
-      nodes = {
-        { id = "build-1", role = "builder",
-          agent_args = { prompt = "implement feature X" } },
-      },
-    },
-  })
+  write_mag_file("firing-writer-write-no-plan", "feature-build.mag", WRITER_MAG)
+  _test.calls_clear()
+  execute_mag("firing-writer-no-plan", "feature-build.mag")
   local calls = decode_calls()
   local err = find_call(calls, function(c)
     return c.body.kind == "tool.result"
-       and c.body.id == "firing-builder-no-plan"
+       and c.body.id == "firing-writer-no-plan"
        and type(c.body.error) == "string"
   end)
   assert_true(err ~= nil,
-    "builder-only dispatch without plan must return a tool.result error")
-  assert_true(err.body.error:find("approved plan", 1, true) ~= nil,
-    "gate-error message names the 'approved plan' precondition")
+    "write-capable MAG execute without plan must return a tool.result error")
+  assert_true(err.body.error:find("write%-capable agents") ~= nil
+              and err.body.error:find("write%-review") ~= nil,
+    "gate-error message names the write-review precondition")
   -- No spawn_graph should leak through.
   local leaked = find_call(calls, function(c)
     return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
@@ -275,39 +266,30 @@ do
     "gate rejection must NOT emit spawn_graph to reasoner-graph")
 end
 
--- After /approve, the same writer dispatch is accepted.
+-- After /approve, the same writer graph is accepted.
 do
   fresh()
+  write_mag_file("firing-writer-write-with-plan", "feature-build.mag", WRITER_MAG)
+  _test.calls_clear()
   -- Submit a plan + approve it via the live path.
   feed("tool-gate", {
     kind = "lead-workflow.tool.invoke",
     id   = "firing-plan-pre",
     name = "write-review",
-    args = { plan = "test plan" },
+    args = { plan = "test plan", view = "inline" },
   })
   feed("nefor-tui", { kind = "chat.review.respond", text = "/approve" })
   _test.calls_clear()
 
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "firing-builder-with-plan",
-    name = "dispatch-graph",
-    args = {
-      name = "feature-build",
-      terminal = "build-1",
-      nodes = {
-        { id = "build-1", role = "builder",
-          agent_args = { prompt = "implement feature X" } },
-      },
-    },
-  })
+  execute_mag("firing-writer-with-plan", "feature-build.mag")
   local calls = decode_calls()
   local invoke = find_call(calls, function(c)
     return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
         and c.target == "reasoner-graph"
   end)
   assert_true(invoke ~= nil,
-    "after plan approval, builder dispatch must emit spawn_graph")
+    "after plan approval, write-capable MAG execute must emit spawn_graph; got "
+    .. json.encode(_test.calls()))
 end
 
 -- ------------------------------------------------------------------
@@ -321,7 +303,7 @@ do
     kind = "lead-workflow.tool.invoke",
     id   = "firing-plan-1",
     name = "write-review",
-    args = { plan = "1. Read auth.lua\n2. Add login flow\n3. Test it" },
+    args = { plan = "1. Read auth.lua\n2. Add login flow\n3. Test it", view = "inline" },
   })
 
   local calls = decode_calls()
@@ -335,8 +317,8 @@ do
     .. json.encode(_test.calls()))
   assert_eq(sub.body.plan, "1. Read auth.lua\n2. Add login flow\n3. Test it",
     "plan text in envelope")
-  assert_true(sub.body.plan_id == nil,
-    "plan_id has been removed from the envelope (one plan in flight, no id needed)")
+  assert_eq(sub.body.plan_id, "plan-firing-plan-1",
+    "plan_id is derived from the write-review firing id")
 
   -- BLOCKING: no tool.result yet for write-review.
   local pre = find_call(calls, function(c)
@@ -366,7 +348,7 @@ do
     kind = "lead-workflow.tool.invoke",
     id   = "firing-plan-2",
     name = "write-review",
-    args = { plan = "Plan A" },
+    args = { plan = "Plan A", view = "inline" },
   })
   _test.calls_clear()
 
@@ -412,7 +394,7 @@ do
     kind = "lead-workflow.tool.invoke",
     id   = "firing-plan-3",
     name = "write-review",
-    args = { plan = "Plan B" },
+    args = { plan = "Plan B", view = "inline" },
   })
   _test.calls_clear()
 
@@ -449,7 +431,7 @@ do
     kind = "lead-workflow.tool.invoke",
     id   = "firing-plan-discard",
     name = "write-review",
-    args = { plan = "Plan C" },
+    args = { plan = "Plan C", view = "inline" },
   })
   _test.calls_clear()
 
@@ -474,16 +456,18 @@ end
 
 -- ------------------------------------------------------------------
 -- Single-use approval: a non-verdict user message AFTER /approve
--- flushes the approval so the next writer dispatch is gated again.
+-- flushes the approval so the next writer MAG execute is gated again.
 -- ------------------------------------------------------------------
 
 do
   fresh()
+  write_mag_file("firing-writer-write-expired", "expired-build.mag", WRITER_MAG)
+  _test.calls_clear()
   feed("tool-gate", {
     kind = "lead-workflow.tool.invoke",
     id   = "firing-plan-single-use",
     name = "write-review",
-    args = { plan = "Plan D" },
+    args = { plan = "Plan D", view = "inline" },
   })
   feed("nefor-tui", { kind = "chat.review.respond", text = "/approve" })
   assert_eq(lw._internals.state.active_plan.status, "approved",
@@ -495,25 +479,14 @@ do
     "next user message after verdict flushes the approval")
 
   _test.calls_clear()
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "firing-builder-expired",
-    name = "dispatch-graph",
-    args = {
-      name = "expired-build",
-      terminal = "b",
-      nodes = {
-        { id = "b", role = "builder", agent_args = { prompt = "x" } },
-      },
-    },
-  })
+  execute_mag("firing-writer-expired", "expired-build.mag")
   local err = find_call(decode_calls(), function(c)
     return c.body.kind == "tool.result"
-       and c.body.id == "firing-builder-expired"
+       and c.body.id == "firing-writer-expired"
        and type(c.body.error) == "string"
   end)
   assert_true(err ~= nil,
-    "after approval expires, the writer dispatch is gated again")
+    "after approval expires, the writer MAG execute is gated again")
 end
 
 -- ------------------------------------------------------------------
@@ -574,7 +547,7 @@ do
     kind = "lead-workflow.tool.invoke",
     id   = "firing-plan-live",
     name = "write-review",
-    args = { plan = "Live plan body" },
+    args = { plan = "Live plan body", view = "inline" },
   })
 
   -- Simulate the bus feedback (in production, actor.lua's bus.on_event
@@ -599,8 +572,8 @@ do
 end
 
 -- ------------------------------------------------------------------
--- Permission modes: auto does not block on human approval; yolo bypasses
--- writer gates.
+-- Permission modes: auto declines human review prompts, while auto/yolo
+-- bypass safe-mode writer gates for execution.
 -- ------------------------------------------------------------------
 
 do
@@ -610,67 +583,44 @@ do
     kind = "lead-workflow.tool.invoke",
     id   = "firing-plan-auto",
     name = "write-review",
-    args = { plan = "Auto mode plan" },
+    args = { plan = "Auto mode plan", view = "inline" },
   })
   local calls = decode_calls()
   local reply = find_call(calls, function(c)
     return c.body.kind == "tool.result" and c.body.id == "firing-plan-auto"
   end)
   assert_true(reply ~= nil, "auto write-review returns immediately")
-  assert_eq(reply.body.output.status, "approved",
-    "auto write-review auto-resolves the human approval turn")
-  assert_true(reply.body.output.notice:find("AUTO mode", 1, true) ~= nil,
-    "auto write-review approval names the mode")
-  assert_eq(lw._internals.state.active_plan.status, "approved",
-    "auto write-review records an approved plan slot")
-  assert_eq(lw._internals.state.active_plan.pending_firing_id, nil,
-    "auto write-review must not leave a pending approval")
+  assert_true(type(reply.body.error) == "string"
+              and reply.body.error:find("permission_denied%[auto%]") ~= nil,
+    "auto write-review returns a permission_denied[auto] error")
+  assert_eq(lw._internals.state.active_plan, nil,
+    "auto write-review must not open or approve a plan slot")
 end
 
 do
   fresh()
   feed("tool-gate", { kind = "tool-gate.mode_changed", mode = "auto" })
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "firing-builder-auto",
-    name = "dispatch-graph",
-    args = {
-      name = "auto-build",
-      terminal = "build-auto",
-      nodes = {
-        { id = "build-auto", role = "builder",
-          agent_args = { prompt = "implement feature Y" } },
-      },
-    },
-  })
+  write_mag_file("firing-writer-write-auto", "auto-build.mag", WRITER_MAG)
+  _test.calls_clear()
+  execute_mag("firing-writer-auto", "auto-build.mag")
   local calls = decode_calls()
   local invoke = find_call(calls, function(c)
     return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
   end)
-  assert_true(invoke ~= nil, "auto bypasses the human plan gate for writer dispatch")
+  assert_true(invoke ~= nil, "auto bypasses the human plan gate for writer MAG execute")
 end
 
 do
   fresh()
   feed("tool-gate", { kind = "tool-gate.mode_changed", mode = "yolo" })
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "firing-builder-yolo",
-    name = "dispatch-graph",
-    args = {
-      name = "yolo-build",
-      terminal = "build-yolo",
-      nodes = {
-        { id = "build-yolo", role = "builder",
-          agent_args = { prompt = "implement feature Y" } },
-      },
-    },
-  })
+  write_mag_file("firing-writer-write-yolo", "yolo-build.mag", WRITER_MAG)
+  _test.calls_clear()
+  execute_mag("firing-writer-yolo", "yolo-build.mag")
   local calls = decode_calls()
   local invoke = find_call(calls, function(c)
     return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
   end)
-  assert_true(invoke ~= nil, "yolo bypasses writer dispatch approval gate")
+  assert_true(invoke ~= nil, "yolo bypasses writer MAG execute approval gate")
 end
 
 -- ------------------------------------------------------------------
@@ -679,29 +629,18 @@ end
 
 do
   fresh()
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "firing-dispatch-end",
-    name = "dispatch-graph",
-    args = {
-      name = "session-end",
-      terminal = "explore",
-      nodes = {
-        { id = "explore", role = "explorer",
-          agent_args = { prompt = "x", system_prompt = "you are an explorer",
-                         tool_allowlist = { "read" } } },
-      },
-    },
-  })
-  local run_id = next(lw._internals.state.active_run_ids)
-  assert_true(type(run_id) == "string", "active_run_ids has an entry after dispatch")
+  write_mag_file("firing-mag-write-end", "session-end.mag", READ_ONLY_MAG)
+  _test.calls_clear()
+  execute_mag("firing-mag-execute-end", "session-end.mag")
+  local run_id = next(lw._internals.state.active_runs)
+  assert_true(type(run_id) == "string", "active_runs has an entry after MAG execute")
 
   -- Also submit a plan that's awaiting approval at session-end.
   feed("tool-gate", {
     kind = "lead-workflow.tool.invoke",
     id   = "firing-plan-at-end",
     name = "write-review",
-    args = { plan = "in-flight plan" },
+    args = { plan = "in-flight plan", view = "inline" },
   })
   assert_eq(lw._internals.state.active_plan.status, "pending",
     "plan slot is pending before session_end")
@@ -717,38 +656,8 @@ do
   end)
   assert_true(cancel ~= nil, "session_end emits graph.cancel for the active run")
 
-  assert_eq(next(lw._internals.state.active_run_ids), nil,
-    "active_run_ids cleared after termination")
+  assert_eq(next(lw._internals.state.active_runs), nil,
+    "active_runs cleared after termination")
   assert_eq(lw._internals.state.active_plan, nil,
     "active_plan flushed at session_end — no carry-over approval")
-end
-
--- chat.interrupt_all is the graph-cancel rung after the lead has stopped.
-do
-  fresh()
-  feed("tool-gate", {
-    kind = "lead-workflow.tool.invoke",
-    id   = "firing-dispatch-interrupt-all",
-    name = "dispatch-graph",
-    args = {
-      name = "interrupt-all",
-      terminal = "explore",
-      nodes = {
-        { id = "explore", role = "explorer",
-          agent_args = { prompt = "x", system_prompt = "you are an explorer" } },
-      },
-    },
-  })
-  local run_id = next(lw._internals.state.active_run_ids)
-  assert_true(type(run_id) == "string", "active graph exists before interrupt_all")
-  _test.calls_clear()
-
-  feed("nefor-tui", { kind = "chat.interrupt_all" })
-
-  local cancel = find_call(decode_calls(), function(c)
-    return c.body.kind == "graph.cancel" and c.body.run_id == run_id
-  end)
-  assert_true(cancel ~= nil, "chat.interrupt_all cancels active graphs when routed to lead-workflow")
-  assert_eq(next(lw._internals.state.active_run_ids), nil,
-    "chat.interrupt_all clears active graph ids")
 end

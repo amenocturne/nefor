@@ -19,11 +19,6 @@
 --                    read workspace, write scratch only, deny network,
 --                    subprocess, dynamic code, and arbitrary imports.
 --
---   * `mirror-projects` — typed read-only wrapper around the Mirror project
---                         task CLI. This gives agents a named task-context
---                         surface instead of making them remember bash
---                         incantations or fall back to manual task searches.
---
 -- Layered so an explorer / reviewer agent can investigate the codebase
 -- without needing the full `bash` surface (which is a sandbox-escape
 -- hatch via shell composition).
@@ -33,6 +28,7 @@ local json = nefor.json
 local envelope = require("core.envelope")
 local emit_as  = envelope.emit_as
 local instruction_files = require("libs.instruction-files")
+local tool_output_dump = require("tool-gate.tool_output_dump")
 
 local INSTRUCTIONS_DIR = (rawget(_G, "NEFOR_CONFIG_DIR") or ".") .. "/instructions"
 
@@ -92,6 +88,21 @@ local function resolve_search_cmd()
 end
 
 local function tool_search_text(firing_id, args)
+  args = args or {}
+  local supported = {
+    pattern = true,
+    path = true,
+    max_results = true,
+    files_only = true,
+    case_insensitive = true,
+  }
+  for k, _ in pairs(args) do
+    if not supported[k] then
+      emit_err(firing_id, "search_text: unsupported arg `" .. tostring(k) .. "`")
+      return
+    end
+  end
+
   local pattern = args and args.pattern
   if type(pattern) ~= "string" or #pattern == 0 then
     emit_err(firing_id, "search_text: args.pattern must be a non-empty string")
@@ -104,12 +115,28 @@ local function tool_search_text(firing_id, args)
 
   local backend = resolve_search_cmd()
   local argv
+  local files_only = args.files_only == true
+  local case_insensitive = args.case_insensitive == true
   if backend == "rg" then
-    argv = { "-n", "--color=never", "--max-count", tostring(cap),
-             "--max-columns", "500", "--max-columns-preview",
-             "--", pattern, path }
+    argv = { "--color=never" }
+    if case_insensitive then argv[#argv + 1] = "-i" end
+    if files_only then
+      argv[#argv + 1] = "-l"
+    else
+      argv[#argv + 1] = "-n"
+      argv[#argv + 1] = "--max-count"
+      argv[#argv + 1] = tostring(cap)
+    end
+    argv[#argv + 1] = "--max-columns"
+    argv[#argv + 1] = "500"
+    argv[#argv + 1] = "--max-columns-preview"
+    argv[#argv + 1] = "--"
+    argv[#argv + 1] = pattern
+    argv[#argv + 1] = path
   else
-    argv = { "-rn", "--color=never", "--", pattern, path }
+    local flags = files_only and "-rl" or "-rn"
+    if case_insensitive then flags = flags .. "i" end
+    argv = { flags, "--color=never", "--", pattern, path }
   end
   local out = nefor.process.run { cmd = backend, args = argv }
   if type(out) ~= "table" then
@@ -138,7 +165,7 @@ local function tool_search_text(firing_id, args)
   for line in stdout:gmatch("[^\n]+") do
     n = n + 1
     if n > cap then
-      truncated[#truncated + 1] = "[...truncated at line cap]"
+      truncated[#truncated + 1] = "[...truncated, raise max_results]"
       break
     end
     total_bytes = total_bytes + #line + 1
@@ -148,7 +175,17 @@ local function tool_search_text(firing_id, args)
     end
     truncated[#truncated + 1] = line
   end
-  emit_ok(firing_id, table.concat(truncated, "\n"))
+  local output = table.concat(truncated, "\n")
+  if tool_output_dump.should_dump(output) then
+    local summary = tool_output_dump.dump(nil, firing_id, output, {
+      tool = "search_text",
+    })
+    if summary then
+      emit_ok(firing_id, summary)
+      return
+    end
+  end
+  emit_ok(firing_id, output)
 end
 
 local function tool_python_read(firing_id, _args)
@@ -156,79 +193,6 @@ local function tool_python_read(firing_id, _args)
     "python-read: sandboxed Python analysis is not available in this MVP. " ..
     "Use Bash/read tools for simple inspection; do not route raw Python, " ..
     "uv, pip, or pytest through Bash for analysis.")
-end
-
-local function add_flag(argv, flag, value)
-  if type(value) == "string" and #value > 0 then
-    argv[#argv + 1] = flag
-    argv[#argv + 1] = value
-  end
-end
-
-local function add_bool(argv, flag, value)
-  if value == true then
-    argv[#argv + 1] = flag
-  end
-end
-
-local function add_limit(argv, value)
-  local n = tonumber(value)
-  if n == nil then return end
-  if n < 1 then n = 1 end
-  if n > 100 then n = 100 end
-  argv[#argv + 1] = "--limit"
-  argv[#argv + 1] = tostring(math.floor(n))
-end
-
-local function tool_mirror_projects(firing_id, args)
-  local action = args and args.action
-  if type(action) ~= "string" or #action == 0 then
-    emit_err(firing_id, "mirror-projects: args.action must be one of list, tasks, show, find")
-    return
-  end
-
-  local argv = {}
-  if action == "list" then
-    argv = { "list", "--json" }
-    add_flag(argv, "--query", args.query)
-    add_limit(argv, args.limit)
-  elseif action == "tasks" then
-    argv = { "tasks", "--json" }
-    add_flag(argv, "--project", args.project)
-    add_flag(argv, "--status", args.status)
-    add_bool(argv, "--blocked", args.blocked)
-  elseif action == "show" then
-    local task_id = args.task_id
-    if type(task_id) ~= "string" or #task_id == 0 then
-      emit_err(firing_id, "mirror-projects: action=show requires args.task_id")
-      return
-    end
-    argv = { "show", task_id, "--json" }
-  elseif action == "find" then
-    local query = args.query
-    if type(query) ~= "string" or #query == 0 then
-      emit_err(firing_id, "mirror-projects: action=find requires args.query")
-      return
-    end
-    argv = { "find", query, "--json" }
-  else
-    emit_err(firing_id, "mirror-projects: unsupported read-only action '" ..
-      tostring(action) .. "'")
-    return
-  end
-
-  local out = nefor.process.run { cmd = "mirror-projects", args = argv }
-  if type(out) ~= "table" then
-    emit_err(firing_id, "mirror-projects: nefor.process.run returned non-table")
-    return
-  end
-  if out.code ~= 0 then
-    emit_err(firing_id, string.format(
-      "mirror-projects %s exited %d: %s",
-      action, out.code, tostring(out.stderr or "")))
-    return
-  end
-  emit_ok(firing_id, tostring(out.stdout or ""))
 end
 
 local function read_one_instruction(raw_name)
@@ -295,7 +259,6 @@ local TOOL_HANDLERS = {
   list_dir                   = tool_list_dir,
   search_text                = tool_search_text,
   ["python-read"]            = tool_python_read,
-  ["mirror-projects"] = tool_mirror_projects,
   instructions               = tool_instructions,
   discover_instruction_files = tool_discover_instruction_files,
 }
@@ -380,35 +343,6 @@ local function tool_schemas()
                    description = "Read-only analysis request to perform." },
         },
         required = { "task" },
-      },
-    },
-    {
-      name = "mirror-projects",
-      description =
-        "Read Mirror project/task context through the mirror-projects CLI. " ..
-        "Use this before manual task-folder searches for project-shaped " ..
-        "work, task IDs, project boards, task status, dependencies, " ..
-        "blocked work, or next-task questions. Read-only actions: list, " ..
-        "tasks, show, find.",
-      parameters = {
-        type = "object",
-        properties = {
-          action = { type = "string",
-                     description = "Read-only action: list, tasks, show, or find." },
-          project = { type = "string",
-                      description = "Project slug for action=tasks." },
-          task_id = { type = "string",
-                      description = "Task id for action=show." },
-          query = { type = "string",
-                    description = "Project/task search text for action=list or action=find." },
-          status = { type = "string",
-                     description = "Optional task status filter for action=tasks." },
-          blocked = { type = "boolean",
-                      description = "When true with action=tasks, only blocked tasks." },
-          limit = { type = "integer",
-                    description = "Optional result cap for action=list, max 100." },
-        },
-        required = { "action" },
       },
     },
     {

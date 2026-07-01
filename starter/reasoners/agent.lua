@@ -480,8 +480,29 @@ local function dispatch_tool_call(entry, call)
   if type(call) ~= "table" then return false end
   local name = call.name or call.tool
   if type(name) ~= "string" or #name == 0 then return false end
-  local call_args = call.arguments or call.args or {}
   local model_call_id = call.id
+  local raw_args = call.arguments or call.args
+  local call_args
+  local arg_error
+  if raw_args == nil then
+    call_args = {}
+  elseif type(raw_args) == "table" then
+    call_args = raw_args
+  elseif type(raw_args) == "string" then
+    local ok, decoded = pcall(json.decode, raw_args)
+    if ok and type(decoded) == "table" then
+      call_args = decoded
+    else
+      arg_error = "arguments must be a JSON object. Raw arguments: " .. raw_args
+      call_args = {}
+    end
+  else
+    local ok, encoded = pcall(json.encode, raw_args)
+    local raw = ok and encoded or tostring(raw_args)
+    arg_error = "arguments must be a JSON object; got " .. type(raw_args) ..
+      ". Raw arguments: " .. raw
+    call_args = {}
+  end
 
   local tool_id = next_id("tool")
   entry.pending_tools[tool_id] = {
@@ -492,6 +513,14 @@ local function dispatch_tool_call(entry, call)
   entry.pending_order[#entry.pending_order + 1] = tool_id
   entry.pending_count = entry.pending_count + 1
   tool_to_firing[tool_id] = entry.firing_id
+
+  if arg_error then
+    local pt = entry.pending_tools[tool_id]
+    pt.received = true
+    pt.error = arg_error
+    entry.pending_count = entry.pending_count - 1
+    return true
+  end
 
   -- In-reasoner allowlist enforcement (§4): synthesise a local error
   -- result for tools outside the allowlist. The result still flows
@@ -605,6 +634,15 @@ local function on_chat_complete_result(body)
 
   local tool_calls = out.tool_calls
   local has_calls = type(tool_calls) == "table" and #tool_calls > 0
+
+  if out.finish_reason == "error" then
+    local err = out.error or out.message or out.text
+    if type(err) ~= "string" or #err == 0 then
+      err = "provider returned finish_reason=error"
+    end
+    send_terminal_err(firing_id, err)
+    return
+  end
 
   -- Finalize wins over any other tool_call in the same response. The
   -- terminator runs BEFORE allowlist enforcement / tool-gate dispatch
@@ -815,7 +853,7 @@ local function receive_msg(entry)
   -- AGENTS.md-bearing dir. The envelope is TUI/persistence-shaped —
   -- nothing translates it into provider chat history by default, so
   -- the model never sees the AGENTS.md content. The agent reasoner
-  -- folds every system-role chat.message.append into a
+  -- folds every system-role chat.message.append into a user-role
   -- <provider>.chat.append for each of OUR active firings so the
   -- model picks up the context on its next turn. role=user / role=
   -- assistant are NOT folded — user input rides through the chat-
@@ -835,7 +873,7 @@ local function receive_msg(entry)
     -- threading a chat_id through tool-gate's smart loader is the
     -- natural extension.
     for _, fentry in pairs(agents) do
-      emit_chat_append(fentry, { role = "system", content = text })
+      emit_chat_append(fentry, { role = "user", content = text })
     end
     return
   end
