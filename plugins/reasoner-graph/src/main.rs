@@ -7,14 +7,12 @@
 //! `projects/software/active/nefor/specs/nefor-agent-and-reasoner-types-spec.md`
 //! §3 for the full contract.
 //!
-//! Layering mirrors `nefor-combinators`:
+//! Layering:
 //! - `main.rs` — entry, ready handshake, dispatch loop, bus encoding.
-//! - `ncp.rs`  — stdio transport + handshake helpers.
-//! - `error.rs` — typed errors.
-//! - `graph.rs` — graph parsing (cycles allowed; `fanout` is parsed but
-//!   the runtime hook lands with T6).
+//! - `graph.rs` — graph parsing (cycles allowed; `fanout` routing is
+//!   inlined in the scheduler).
 //! - `state.rs` — pure scheduler state machine (RunState, Scheduler,
-//!   per-firing keying).
+//!   per-firing keying, inline fanout routing).
 
 mod graph;
 mod state;
@@ -226,21 +224,6 @@ async fn dispatch_event(
             // Stage 2.
             Scheduler::handle_cancel(runs, body);
         }
-        "combinators.query.result" => {
-            // Reply to the submit-time typecheck/availability check.
-            // Either resolves into normal dispatch or synthesises a
-            // `_missing_combinators` failure.
-            let snapshot = peers.lock().expect("peers mutex poisoned").clone();
-            let effects = Scheduler::handle_query_result(runs, &snapshot, body);
-            emit_effects(out_tx, effects.into_vec()).await?;
-        }
-        "combinators.invoke.result" => {
-            // Reply to a runtime fanout dispatch. Routes typed outputs
-            // to outgoing edges by `edge.type` matching.
-            let snapshot = peers.lock().expect("peers mutex poisoned").clone();
-            let effects = Scheduler::handle_invoke_result(runs, &snapshot, body);
-            emit_effects(out_tx, effects.into_vec()).await?;
-        }
         _ => {
             // Not for us.
         }
@@ -375,52 +358,6 @@ fn effect_to_body(effect: Effect) -> Map<String, Value> {
             m.insert("kind".into(), Value::String("tool.result".into()));
             m.insert("id".into(), Value::String(run_id));
             m.insert("result".into(), Value::Object(result_body));
-            m
-        }
-        Effect::CombinatorsQuery {
-            request_id,
-            signatures,
-        } => {
-            let mut m = Map::new();
-            m.insert("kind".into(), Value::String("combinators.query".into()));
-            m.insert("id".into(), Value::String(request_id));
-            let arr: Vec<Value> = signatures
-                .into_iter()
-                .map(|sig| {
-                    let mut e = Map::new();
-                    e.insert("in".into(), Value::String(sig.in_type));
-                    e.insert(
-                        "out".into(),
-                        Value::Array(sig.out_multiset.into_iter().map(Value::String).collect()),
-                    );
-                    Value::Object(e)
-                })
-                .collect();
-            m.insert("signatures".into(), Value::Array(arr));
-            m
-        }
-        Effect::CombinatorsInvoke {
-            invocation_id,
-            signature,
-            input,
-        } => {
-            let mut m = Map::new();
-            m.insert("kind".into(), Value::String("combinators.invoke".into()));
-            m.insert("id".into(), Value::String(invocation_id));
-            let mut sig = Map::new();
-            sig.insert("in".into(), Value::String(signature.in_type));
-            sig.insert(
-                "out".into(),
-                Value::Array(
-                    signature
-                        .out_multiset
-                        .into_iter()
-                        .map(Value::String)
-                        .collect(),
-                ),
-            );
-            m.insert("signature".into(), Value::Object(sig));
-            m.insert("input".into(), input);
             m
         }
     }

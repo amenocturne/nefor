@@ -97,12 +97,6 @@ end
 
 actor.install()
 
--- Combinator shim: with nefor-combinators removed, graphs using fanout
--- hang waiting for combinators.query/invoke replies. The shim responds
--- from Lua with shape-based routing until MAG replaces this at compile
--- time.
-require("core.combinator_shim").install()
-
 actor.spawn(sessions)
 sessions.init()
 

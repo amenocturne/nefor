@@ -40,7 +40,6 @@ local function handle(body)
     traits = {
       pass_through = true,
       branch_routing = true,
-      combinator = "retry",
     },
   }
   if route == "pass" and type(entry) == "table" then output.passthrough = entry.output end

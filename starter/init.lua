@@ -232,7 +232,6 @@ function invoke_from_plugin(source, payload)
 end
 
 actor.install()
-require("core.combinator_shim").install()
 -- Defense-in-depth fallback for the synchronous `history_replay.set`
 -- path that sessions drives around its replay burst. Wired explicitly
 -- here so module load stays free of bus dependencies.

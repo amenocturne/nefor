@@ -132,25 +132,6 @@ pub struct NodeFiring {
     pub completed: bool,
 }
 
-/// Lifecycle phase for a submitted run. Closed enum (D-16); transitions
-/// are documented per variant.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RunPhase {
-    /// Awaiting `combinators.query.result` for the typecheck/availability
-    /// step. No nodes have been dispatched yet. Carries the request id we
-    /// emitted so the result handler can correlate. Transitions to
-    /// `Running` (on resolved query) or to a synthetic-failure
-    /// `graph.run_complete` (on missing combinators) — in the failure
-    /// case the run is removed from the registry and never enters
-    /// `Running`.
-    PendingTypecheck {
-        /// `id` field of the pending `combinators.query` we emitted.
-        query_id: String,
-    },
-    /// Dispatching nodes, awaiting results.
-    Running,
-}
-
 /// State for a single submitted run.
 #[derive(Debug)]
 pub struct RunState {
@@ -158,8 +139,6 @@ pub struct RunState {
     pub run_id: String,
     /// Validated graph topology.
     pub graph: Graph,
-    /// Lifecycle phase.
-    pub phase: RunPhase,
     /// Per-node terminal/intermediate status (latest firing's status).
     pub completed: HashMap<NodeId, NodeStatus>,
     /// All firings so far per node, in order. The last entry's
@@ -175,10 +154,6 @@ pub struct RunState {
     /// True once a node errored under abort mode. Suppresses further
     /// dispatch; not-yet-dispatched nodes are marked skipped immediately.
     pub aborted: bool,
-    /// Per-firing fanout invocations awaiting `combinators.invoke.result`.
-    /// Keyed by the invocation id we minted on emit. The slot records
-    /// which `(node_id, firing_id)` the result must be routed back to.
-    pub pending_fanouts: HashMap<String, PendingFanout>,
     /// For nodes whose upstream is a fanout source: the values seeded
     /// per-upstream-node from non-null fanout outputs that matched an
     /// outgoing edge with the right `type_tag`. Read by `build_inputs`
@@ -210,23 +185,9 @@ pub struct RunState {
     /// dispatch (which equals the firing_id by spec D3); the value records
     /// `(node_id, firing_id)` so the inbound `tool.result { id }` handler
     /// can resolve back to a specific firing without scanning every
-    /// node's firing list.
-    ///
-    /// Mirrors the pattern used by `pending_fanouts` (combinator
-    /// invocations) and `RunPhase::PendingTypecheck { query_id }`
-    /// (combinator queries). Entries are inserted at dispatch time and
+    /// node's firing list. Entries are inserted at dispatch time and
     /// removed when the matching `tool.result` lands.
     pub firing_by_request_id: HashMap<String, (NodeId, FiringId)>,
-}
-
-/// A fanout invocation in flight. The scheduler emitted
-/// `combinators.invoke` and is waiting for `combinators.invoke.result`
-/// before it can route the multiset outputs to the matching outgoing
-/// edges.
-#[derive(Debug, Clone)]
-pub struct PendingFanout {
-    /// Node whose output triggered the fanout.
-    pub node_id: NodeId,
 }
 
 impl RunState {
@@ -328,31 +289,6 @@ pub enum Effect {
         /// submit time before any nodes were dispatched.
         results: Map<String, Value>,
     },
-    /// `combinators.query` — submit-time availability check for every
-    /// fanout signature the graph references. Awaits a
-    /// `combinators.query.result` on a separate handler. Issued once per
-    /// submit when at least one node has a `fanout` signature.
-    CombinatorsQuery {
-        /// Caller correlation id we mint and store in `RunPhase::PendingTypecheck`.
-        request_id: String,
-        /// Distinct fanout signatures referenced by the graph (multiset
-        /// equality is the registry's matching rule, but for the wire we
-        /// pass the multiset in the order we collected it).
-        signatures: Vec<FanoutSignature>,
-    },
-    /// `combinators.invoke` — runtime fanout dispatch. Issued when a
-    /// node with a `fanout` signature finished and the scheduler needs
-    /// to compute the multiset outputs before routing.
-    CombinatorsInvoke {
-        /// Caller correlation id we mint and key the pending-fanout
-        /// record on.
-        invocation_id: String,
-        /// The fanout signature to invoke.
-        signature: FanoutSignature,
-        /// The just-completed node's `output` value — passed as `input`
-        /// to the combinator.
-        input: Value,
-    },
 }
 
 /// Final status reported in `graph.run_complete`.
@@ -401,7 +337,6 @@ impl Effects {
 /// Determine whether the run has reached its fixpoint:
 /// - every node has at least one completed firing
 /// - no node has an in-flight firing
-/// - no fanout invocation is awaiting its `combinators.invoke.result`
 /// - no node is queued for a cycle-driven re-fire
 fn run_is_done(state: &RunState) -> bool {
     for n in state.graph.ids_in_order() {
@@ -411,13 +346,6 @@ fn run_is_done(state: &RunState) -> bool {
         if state.latest_firing_in_flight(n) {
             return false;
         }
-    }
-    // A pending fanout means the cycle's routing decision hasn't
-    // resolved yet — the invoke result may set `pending_refire` or
-    // suppress edges. Calling the run done here would race ahead of
-    // the routing reply.
-    if !state.pending_fanouts.is_empty() {
-        return false;
     }
     // A pending re-fire that hasn't been picked up yet (e.g. the node
     // is currently considered un-runnable for some other reason) keeps
@@ -845,31 +773,21 @@ fn propagate_after_completion(
         }
     }
 
-    // Fanout dispatch path: when a node with a `fanout` signature
-    // produced an `Output(value)`, defer further routing to the
-    // `combinators.invoke.result` handler. The runtime fanout call
-    // computes which outgoing edges fire and with what value; we can't
-    // make that decision without the combinator's reply.
+    // Fanout routing path: when a node with a `fanout` signature
+    // produced an `Output(value)`, compute the typed multiset outputs
+    // inline (no external combinator plugin) and apply them to outgoing
+    // edges. The heuristic inspects the output value to decide which
+    // fanout slot gets the payload and which gets null (suppressed).
     //
     // Errored / skipped fanout nodes fall through to the broadcast
     // path — the failure semantics still surface to downstreams as
     // `inputs.<id>.error` (continue) or skip-cascade (abort).
     if let Some(NodeStatus::Output(output)) = state.completed.get(node_id) {
         if let Some(fanout) = state.graph.node(node_id).and_then(|n| n.fanout.clone()) {
-            let invocation_id = mint_firing_id();
-            state.pending_fanouts.insert(
-                invocation_id.clone(),
-                PendingFanout {
-                    node_id: node_id.to_owned(),
-                },
-            );
-            effects.push(Effect::CombinatorsInvoke {
-                invocation_id,
-                signature: fanout,
-                input: output.clone(),
-            });
-            // Don't dispatch downstreams yet — wait for the invoke
-            // result. It'll re-enter dispatch via apply_fanout_result.
+            let output = output.clone();
+            let typed_outputs = inline_fanout_route(&output, &fanout);
+            apply_fanout_outputs(state, node_id, &typed_outputs);
+            dispatch_all_runnable(state, peers, effects);
             return;
         }
     }
@@ -913,6 +831,53 @@ struct TypedFanoutOutput {
     type_tag: String,
     /// JSON value or `Null` (suppress the matching edge).
     value: Value,
+}
+
+/// Compute typed fanout outputs inline by inspecting the output value.
+///
+/// Heuristic (matches the orchestrator's tool_split / retry_split
+/// patterns):
+/// - If `value.tool_calls` is a non-empty array → route to the output
+///   type containing "ToolCalls".
+/// - Else if `value.route` is "retry" / "pass" / "exhausted" → route
+///   to the output type containing the matching keyword.
+/// - Else → route to the output type containing "FinalAnswer".
+/// - Fallback: if no heuristic matched, route to the first output type.
+///
+/// The matched type gets the full value; all other types get null
+/// (suppressed).
+fn inline_fanout_route(value: &Value, fanout: &FanoutSignature) -> Vec<TypedFanoutOutput> {
+    let out_types = &fanout.out_multiset;
+
+    let has_tool_calls = value
+        .get("tool_calls")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty());
+
+    let matched: Option<&String> = if has_tool_calls {
+        out_types.iter().find(|t| t.contains("ToolCalls"))
+    } else {
+        let route = value.get("route").and_then(|v| v.as_str());
+        match route {
+            Some("retry") => out_types.iter().find(|t| t.contains("Retry")),
+            Some("pass") => out_types.iter().find(|t| t.contains("Pass")),
+            Some("exhausted") => out_types.iter().find(|t| t.contains("Exhausted")),
+            _ => out_types.iter().find(|t| t.contains("FinalAnswer")),
+        }
+    }
+    .or_else(|| out_types.first());
+
+    out_types
+        .iter()
+        .map(|t| TypedFanoutOutput {
+            type_tag: t.clone(),
+            value: if matched == Some(t) {
+                value.clone()
+            } else {
+                Value::Null
+            },
+        })
+        .collect()
 }
 
 /// Apply a typed-multiset fanout reply to `node_id`'s outgoing edges.
@@ -1110,28 +1075,6 @@ fn check_fanout_multiset_no_duplicates(graph: &Graph) -> Result<(), String> {
     Ok(())
 }
 
-/// Collect the distinct fanout signatures referenced by the graph,
-/// preserving submission order. Two fanouts with the same `(in,
-/// out_multiset_sorted)` are de-duped — the registry does multiset
-/// equality.
-fn collect_distinct_fanout_signatures(graph: &Graph) -> Vec<FanoutSignature> {
-    let mut seen: HashSet<(String, Vec<String>)> = HashSet::new();
-    let mut out: Vec<FanoutSignature> = Vec::new();
-    for id in graph.ids_in_order() {
-        if let Some(node) = graph.node(id) {
-            if let Some(fanout) = &node.fanout {
-                let mut sorted_outs = fanout.out_multiset.clone();
-                sorted_outs.sort();
-                let key = (fanout.in_type.clone(), sorted_outs);
-                if seen.insert(key) {
-                    out.push(fanout.clone());
-                }
-            }
-        }
-    }
-    out
-}
-
 /// The set of plugins currently considered "connected" (seen on the bus).
 pub type PeerSet = HashSet<String>;
 
@@ -1167,11 +1110,9 @@ pub enum SubmitOutcome {
 impl Scheduler {
     /// Handle a `reasoner-graph.run` submission.
     ///
-    /// On accept: parse + topology-validate, then either
-    /// 1. (no fanouts) dispatch source nodes immediately and store; OR
-    /// 2. (any fanouts) emit `combinators.query` for the referenced
-    ///    signatures, store the run in `PendingTypecheck` phase, and
-    ///    wait for `combinators.query.result` to resume into dispatch.
+    /// On accept: parse + topology-validate, dispatch source nodes
+    /// immediately and store. Fanout routing is computed inline when
+    /// nodes complete (no external combinator plugin required).
     ///
     /// On reject (malformed, duplicate run_id, submit-time typecheck
     /// failure detectable without async lookup): return a
@@ -1239,12 +1180,6 @@ impl Scheduler {
 
         let total_nodes = submission.graph.ids_in_order().len();
 
-        // Collect distinct fanout signatures. If empty: skip the query
-        // and dispatch sources immediately (legacy v1 path). If
-        // non-empty: emit a `combinators.query` and park the run in
-        // PendingTypecheck.
-        let signatures = collect_distinct_fanout_signatures(&submission.graph);
-
         let mut effects = Effects::new();
         effects.push(Effect::RunStarted {
             run_id: submission.run_id.clone(),
@@ -1252,221 +1187,35 @@ impl Scheduler {
             total_nodes,
         });
 
-        if signatures.is_empty() {
-            let mut state = RunState {
-                run_id: submission.run_id.clone(),
-                graph: submission.graph,
-                phase: RunPhase::Running,
-                completed: HashMap::new(),
-                firings: HashMap::new(),
-                current_state: HashMap::new(),
-                on_failure: submission.on_failure,
-                aborted: false,
-                pending_fanouts: HashMap::new(),
-                fanout_seeded: HashMap::new(),
-                suppressed_edges: HashMap::new(),
-                fanout_emitted: HashSet::new(),
-                pending_refire: HashSet::new(),
-                firing_by_request_id: HashMap::new(),
-            };
-            dispatch_all_runnable(&mut state, peers, &mut effects);
-            if run_is_done(&state) {
-                let status = final_status(&state);
-                let results = build_results(&state);
-                effects.push(Effect::RunComplete {
-                    run_id: state.run_id.clone(),
-                    status,
-                    results,
-                });
-                return SubmitOutcome::Accepted(effects);
-            }
-            runs.lock()
-                .expect("runs mutex poisoned")
-                .insert(state.run_id.clone(), state);
-            return SubmitOutcome::Accepted(effects);
-        }
-
-        // Fanouts present — go through the async typecheck path.
-        let query_id = mint_firing_id();
-        effects.push(Effect::CombinatorsQuery {
-            request_id: query_id.clone(),
-            signatures,
-        });
-        let state = RunState {
+        let mut state = RunState {
             run_id: submission.run_id.clone(),
             graph: submission.graph,
-            phase: RunPhase::PendingTypecheck { query_id },
             completed: HashMap::new(),
             firings: HashMap::new(),
             current_state: HashMap::new(),
             on_failure: submission.on_failure,
             aborted: false,
-            pending_fanouts: HashMap::new(),
             fanout_seeded: HashMap::new(),
             suppressed_edges: HashMap::new(),
             fanout_emitted: HashSet::new(),
             pending_refire: HashSet::new(),
             firing_by_request_id: HashMap::new(),
         };
+        dispatch_all_runnable(&mut state, peers, &mut effects);
+        if run_is_done(&state) {
+            let status = final_status(&state);
+            let results = build_results(&state);
+            effects.push(Effect::RunComplete {
+                run_id: state.run_id.clone(),
+                status,
+                results,
+            });
+            return SubmitOutcome::Accepted(effects);
+        }
         runs.lock()
             .expect("runs mutex poisoned")
             .insert(state.run_id.clone(), state);
         SubmitOutcome::Accepted(effects)
-    }
-
-    /// Handle a `combinators.query.result` event. Looks up the run
-    /// associated with `id`, evaluates the resolution, and either:
-    /// - emits `_missing_combinators` failure + drops the run, or
-    /// - transitions the run to `Running` and dispatches source nodes.
-    pub fn handle_query_result(runs: &Runs, peers: &PeerSet, body: &Map<String, Value>) -> Effects {
-        let mut effects = Effects::new();
-        let request_id = match body.get("id").and_then(Value::as_str) {
-            Some(s) => s.to_owned(),
-            None => return effects,
-        };
-
-        // Locate the run waiting on this request_id.
-        let target_run_id: Option<String> = {
-            let guard = runs.lock().expect("runs mutex poisoned");
-            guard
-                .iter()
-                .find(|(_, st)| {
-                    matches!(&st.phase, RunPhase::PendingTypecheck { query_id } if *query_id == request_id)
-                })
-                .map(|(rid, _)| rid.clone())
-        };
-        let run_id = match target_run_id {
-            Some(r) => r,
-            None => return effects, // not for us
-        };
-
-        // Read missing list from the body. Treat any non-empty `missing`
-        // as a failure; even partial misses block run start.
-        let missing = body
-            .get("missing")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        if !missing.is_empty() {
-            let mut guard = runs.lock().expect("runs mutex poisoned");
-            guard.remove(&run_id);
-            drop(guard);
-            let mut results = Map::new();
-            let mut entry = Map::new();
-            entry.insert(
-                "error".into(),
-                Value::String("one or more fanout combinators are not registered".into()),
-            );
-            entry.insert("missing".into(), Value::Array(missing));
-            results.insert("_missing_combinators".into(), Value::Object(entry));
-            effects.push(Effect::RunComplete {
-                run_id,
-                status: RunStatus::Failure,
-                results,
-            });
-            return effects;
-        }
-
-        // Resolved → flip to Running and dispatch source nodes.
-        let mut completed_run: Option<RunState> = None;
-        {
-            let mut guard = runs.lock().expect("runs mutex poisoned");
-            let state = match guard.get_mut(&run_id) {
-                Some(s) => s,
-                None => return effects,
-            };
-            state.phase = RunPhase::Running;
-            dispatch_all_runnable(state, peers, &mut effects);
-            if run_is_done(state) {
-                if let Some(taken) = guard.remove(&run_id) {
-                    completed_run = Some(taken);
-                }
-            }
-        }
-        if let Some(state) = completed_run {
-            let status = final_status(&state);
-            let results = build_results(&state);
-            effects.push(Effect::RunComplete {
-                run_id: state.run_id.clone(),
-                status,
-                results,
-            });
-        }
-        effects
-    }
-
-    /// Handle a `combinators.invoke.result` event. Looks up the
-    /// `(run_id, node_id)` the invocation belongs to, applies typed
-    /// outputs to outgoing edges (matching `edge.type` against
-    /// `output.type`), and continues dispatch.
-    pub fn handle_invoke_result(
-        runs: &Runs,
-        peers: &PeerSet,
-        body: &Map<String, Value>,
-    ) -> Effects {
-        let mut effects = Effects::new();
-        let invocation_id = match body.get("id").and_then(Value::as_str) {
-            Some(s) => s.to_owned(),
-            None => return effects,
-        };
-
-        let target_run_id: Option<(String, NodeId)> = {
-            let guard = runs.lock().expect("runs mutex poisoned");
-            let mut hit: Option<(String, NodeId)> = None;
-            for (rid, st) in guard.iter() {
-                if let Some(slot) = st.pending_fanouts.get(&invocation_id) {
-                    hit = Some((rid.clone(), slot.node_id.clone()));
-                    break;
-                }
-            }
-            hit
-        };
-        let (run_id, node_id) = match target_run_id {
-            Some(t) => t,
-            None => return effects, // not for us / unknown id
-        };
-
-        // Parse the `outputs` array.
-        let outputs_raw = body.get("outputs").and_then(Value::as_array);
-        let outputs: Vec<TypedFanoutOutput> = match outputs_raw {
-            Some(arr) => arr
-                .iter()
-                .filter_map(|v| {
-                    let obj = v.as_object()?;
-                    let type_tag = obj.get("type").and_then(Value::as_str)?.to_owned();
-                    let value = obj.get("value").cloned().unwrap_or(Value::Null);
-                    Some(TypedFanoutOutput { type_tag, value })
-                })
-                .collect(),
-            None => Vec::new(),
-        };
-
-        let mut completed_run: Option<RunState> = None;
-        {
-            let mut guard = runs.lock().expect("runs mutex poisoned");
-            let state = match guard.get_mut(&run_id) {
-                Some(s) => s,
-                None => return effects,
-            };
-            state.pending_fanouts.remove(&invocation_id);
-            apply_fanout_outputs(state, &node_id, &outputs);
-            dispatch_all_runnable(state, peers, &mut effects);
-            if run_is_done(state) {
-                if let Some(taken) = guard.remove(&run_id) {
-                    completed_run = Some(taken);
-                }
-            }
-        }
-        if let Some(state) = completed_run {
-            let status = final_status(&state);
-            let results = build_results(&state);
-            effects.push(Effect::RunComplete {
-                run_id: state.run_id.clone(),
-                status,
-                results,
-            });
-        }
-        effects
     }
 
     /// Handle a `graph.node_result` event.
@@ -1601,9 +1350,8 @@ impl Scheduler {
     /// `(run_id, node_id, firing_id)` the firing belongs to, by scanning
     /// every in-flight run's `firing_by_request_id` table.
     ///
-    /// Returns `None` for unknown ids (covers cancellation race,
-    /// duplicate results, and ids belonging to combinator query/invoke
-    /// pairs which use their own correlation tables).
+    /// Returns `None` for unknown ids (covers cancellation race and
+    /// duplicate results).
     pub fn resolve_request_id(runs: &Runs, request_id: &str) -> Option<(String, NodeId, FiringId)> {
         let guard = runs.lock().expect("runs mutex poisoned");
         for (rid, st) in guard.iter() {
@@ -2523,216 +2271,13 @@ mod tests {
             .any(|e| matches!(e, Effect::RunComplete { .. })));
     }
 
-    // ---- T6: typed-combinator integration -------------------------------
-
-    fn fanout_graph(node_id: &str, reasoner: &str, in_t: &str, outs: Vec<&str>) -> Value {
-        json!({
-            "terminal": node_id,
-            "nodes": [{
-                "id": node_id,
-                "reasoner": reasoner,
-                "args": {},
-                "fanout": { "in": in_t, "out": outs }
-            }],
-            "edges": []
-        })
-    }
-
-    fn query_result_body(
-        request_id: &str,
-        resolved: Vec<(&str, Vec<&str>, &str)>,
-        missing: Vec<(&str, Vec<&str>)>,
-    ) -> Map<String, Value> {
-        let mut m = Map::new();
-        m.insert(
-            "kind".into(),
-            Value::String("combinators.query.result".into()),
-        );
-        m.insert("id".into(), Value::String(request_id.into()));
-        let resolved_arr: Vec<Value> = resolved
-            .into_iter()
-            .map(|(in_t, outs, owner)| {
-                let mut e = Map::new();
-                e.insert("in".into(), Value::String(in_t.into()));
-                e.insert(
-                    "out".into(),
-                    Value::Array(outs.into_iter().map(|s| Value::String(s.into())).collect()),
-                );
-                e.insert("owner".into(), Value::String(owner.into()));
-                Value::Object(e)
-            })
-            .collect();
-        let missing_arr: Vec<Value> = missing
-            .into_iter()
-            .map(|(in_t, outs)| {
-                let mut e = Map::new();
-                e.insert("in".into(), Value::String(in_t.into()));
-                e.insert(
-                    "out".into(),
-                    Value::Array(outs.into_iter().map(|s| Value::String(s.into())).collect()),
-                );
-                Value::Object(e)
-            })
-            .collect();
-        m.insert("resolved".into(), Value::Array(resolved_arr));
-        m.insert("missing".into(), Value::Array(missing_arr));
-        m
-    }
-
-    fn invoke_result_body(invocation_id: &str, outputs: Vec<(&str, Value)>) -> Map<String, Value> {
-        let mut m = Map::new();
-        m.insert(
-            "kind".into(),
-            Value::String("combinators.invoke.result".into()),
-        );
-        m.insert("id".into(), Value::String(invocation_id.into()));
-        let arr: Vec<Value> = outputs
-            .into_iter()
-            .map(|(t, v)| {
-                let mut e = Map::new();
-                e.insert("type".into(), Value::String(t.into()));
-                e.insert("value".into(), v);
-                Value::Object(e)
-            })
-            .collect();
-        m.insert("outputs".into(), Value::Array(arr));
-        m
-    }
-
-    #[test]
-    fn submit_emits_combinators_query_for_graph_with_fanouts() {
-        let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
-        let peers = peers_with(&["r"]);
-        let g = fanout_graph(
-            "n1",
-            "r",
-            "generic-provider.ProviderOut",
-            vec!["generic-tool.ToolCalls", "generic-provider.FinalAnswer"],
-        );
-        let outcome = Scheduler::handle_submit(&runs, &peers, &submit_body("run-q", g, None));
-        let effects = match outcome {
-            SubmitOutcome::Accepted(e) => e.into_vec(),
-            _ => panic!("expected accepted"),
-        };
-        // RunStarted + CombinatorsQuery, no DispatchNode yet (waiting on
-        // typecheck).
-        assert!(matches!(&effects[0], Effect::RunStarted { .. }));
-        let query = effects
-            .iter()
-            .find(|e| matches!(e, Effect::CombinatorsQuery { .. }))
-            .expect("combinators.query emitted");
-        match query {
-            Effect::CombinatorsQuery { signatures, .. } => {
-                assert_eq!(signatures.len(), 1);
-                assert_eq!(signatures[0].in_type, "generic-provider.ProviderOut");
-            }
-            _ => unreachable!(),
-        }
-        assert!(!effects
-            .iter()
-            .any(|e| matches!(e, Effect::DispatchNode { .. })));
-        // Run is parked in PendingTypecheck.
-        let g = runs.lock().unwrap();
-        let st = g.get("run-q").expect("stored");
-        assert!(matches!(st.phase, RunPhase::PendingTypecheck { .. }));
-    }
-
-    #[test]
-    fn missing_combinators_synthesise_run_complete_failure() {
-        let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
-        let peers = peers_with(&["r"]);
-        let g = fanout_graph(
-            "n1",
-            "r",
-            "generic-provider.ProviderOut",
-            vec!["generic-tool.ToolCalls", "generic-provider.FinalAnswer"],
-        );
-        let submit_effects =
-            match Scheduler::handle_submit(&runs, &peers, &submit_body("run-m", g, None)) {
-                SubmitOutcome::Accepted(e) => e.into_vec(),
-                _ => panic!("accepted"),
-            };
-        let request_id = submit_effects
-            .iter()
-            .find_map(|e| match e {
-                Effect::CombinatorsQuery { request_id, .. } => Some(request_id.clone()),
-                _ => None,
-            })
-            .expect("query effect");
-
-        let body = query_result_body(
-            &request_id,
-            vec![],
-            vec![(
-                "generic-provider.ProviderOut",
-                vec!["generic-tool.ToolCalls", "generic-provider.FinalAnswer"],
-            )],
-        );
-        let result_effects = Scheduler::handle_query_result(&runs, &peers, &body).into_vec();
-        let complete = result_effects
-            .iter()
-            .find(|e| matches!(e, Effect::RunComplete { .. }))
-            .expect("run_complete after missing");
-        match complete {
-            Effect::RunComplete {
-                status, results, ..
-            } => {
-                assert_eq!(*status, RunStatus::Failure);
-                assert!(results.contains_key("_missing_combinators"));
-            }
-            _ => unreachable!(),
-        }
-        // Run cleaned up.
-        assert!(runs.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn typecheck_passes_when_all_signatures_resolve() {
-        let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
-        let peers = peers_with(&["r"]);
-        let g = fanout_graph(
-            "n1",
-            "r",
-            "generic-provider.ProviderOut",
-            vec!["generic-tool.ToolCalls", "generic-provider.FinalAnswer"],
-        );
-        let submit_effects =
-            match Scheduler::handle_submit(&runs, &peers, &submit_body("run-r", g, None)) {
-                SubmitOutcome::Accepted(e) => e.into_vec(),
-                _ => panic!("accepted"),
-            };
-        let request_id = submit_effects
-            .iter()
-            .find_map(|e| match e {
-                Effect::CombinatorsQuery { request_id, .. } => Some(request_id.clone()),
-                _ => None,
-            })
-            .expect("query effect");
-        let body = query_result_body(
-            &request_id,
-            vec![(
-                "generic-provider.ProviderOut",
-                vec!["generic-tool.ToolCalls", "generic-provider.FinalAnswer"],
-                "nefor-combinators",
-            )],
-            vec![],
-        );
-        let r = Scheduler::handle_query_result(&runs, &peers, &body).into_vec();
-        // Source node should now dispatch.
-        assert!(r
-            .iter()
-            .any(|e| matches!(e, Effect::DispatchNode { node_id, .. } if node_id == "n1")));
-        // Run is now Running.
-        let g = runs.lock().unwrap();
-        let st = g.get("run-r").expect("still stored");
-        assert!(matches!(st.phase, RunPhase::Running));
-    }
+    // ---- Inline fanout routing tests --------------------------------------
 
     #[test]
     fn runtime_fanout_routes_outputs_by_edge_type_tag() {
         // Two-node graph: n1 with fanout, n2 reachable via the
-        // ToolCalls-tagged edge. n1 emits ToolCalls (non-null) and
-        // FinalAnswer null → n2 fires with the routed value.
+        // ToolCalls-tagged edge. n1's output has tool_calls → inline
+        // routing matches ToolCalls → n2 fires with the routed value.
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
@@ -2748,37 +2293,14 @@ mod tests {
                 { "from": "n1", "to": "n2", "type": "generic-tool.ToolCalls" }
             ]
         });
+        // Submit dispatches n1 immediately (no typecheck phase).
         let s = match Scheduler::handle_submit(&runs, &peers, &submit_body("run-rf", g, None)) {
             SubmitOutcome::Accepted(e) => e.into_vec(),
             _ => panic!("accepted"),
         };
-        let request_id = s
-            .iter()
-            .find_map(|e| match e {
-                Effect::CombinatorsQuery { request_id, .. } => Some(request_id.clone()),
-                _ => None,
-            })
-            .unwrap();
-        let q_body = query_result_body(
-            &request_id,
-            vec![(
-                "generic-provider.ProviderOut",
-                vec!["generic-tool.ToolCalls", "generic-provider.FinalAnswer"],
-                "nefor-combinators",
-            )],
-            vec![],
-        );
-        let post_query = Scheduler::handle_query_result(&runs, &peers, &q_body).into_vec();
-        let f1 = post_query
-            .iter()
-            .find_map(|e| match e {
-                Effect::DispatchNode {
-                    node_id, firing_id, ..
-                } if node_id == "n1" => Some(firing_id.clone()),
-                _ => None,
-            })
-            .expect("n1 dispatch");
-        // n1 returns an output → fanout invoke is emitted.
+        let f1 = first_dispatch_firing_id(&s);
+        // n1 returns output with tool_calls → inline routing matches
+        // ToolCalls → n2 dispatches immediately.
         let r1 = Scheduler::handle_node_result(
             &runs,
             &peers,
@@ -2791,39 +2313,17 @@ mod tests {
             ),
         )
         .into_vec();
-        let invocation_id = r1
-            .iter()
-            .find_map(|e| match e {
-                Effect::CombinatorsInvoke { invocation_id, .. } => Some(invocation_id.clone()),
-                _ => None,
-            })
-            .expect("CombinatorsInvoke emitted");
-        // n2 not yet dispatched (waiting on fanout).
-        assert!(!r1
-            .iter()
-            .any(|e| matches!(e, Effect::DispatchNode { node_id, .. } if node_id == "n2")));
-        // Combinators reply: ToolCalls populated, FinalAnswer null.
-        let r2 = Scheduler::handle_invoke_result(
-            &runs,
-            &peers,
-            &invoke_result_body(
-                &invocation_id,
-                vec![
-                    ("generic-tool.ToolCalls", json!([{"name": "x"}])),
-                    ("generic-provider.FinalAnswer", Value::Null),
-                ],
-            ),
-        )
-        .into_vec();
-        assert!(r2
+        assert!(r1
             .iter()
             .any(|e| matches!(e, Effect::DispatchNode { node_id, .. } if node_id == "n2")));
     }
 
     #[test]
     fn null_output_suppresses_edge_firing() {
-        // Same shape as the previous test but the fanout suppresses the
-        // n2 edge — n2 is marked skipped (no other incoming edges).
+        // n1 with fanout, n2 reachable via ToolCalls-tagged edge. n1's
+        // output has NO tool_calls → inline routing matches FinalAnswer
+        // → ToolCalls gets null → n2 edge suppressed → n2 marked
+        // FanoutSuppressed → run completes.
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
@@ -2843,60 +2343,17 @@ mod tests {
             SubmitOutcome::Accepted(e) => e.into_vec(),
             _ => panic!("accepted"),
         };
-        let request_id = s
-            .iter()
-            .find_map(|e| match e {
-                Effect::CombinatorsQuery { request_id, .. } => Some(request_id.clone()),
-                _ => None,
-            })
-            .unwrap();
-        let q_body = query_result_body(
-            &request_id,
-            vec![(
-                "generic-provider.ProviderOut",
-                vec!["generic-tool.ToolCalls", "generic-provider.FinalAnswer"],
-                "nefor-combinators",
-            )],
-            vec![],
-        );
-        let pq = Scheduler::handle_query_result(&runs, &peers, &q_body).into_vec();
-        let f1 = pq
-            .iter()
-            .find_map(|e| match e {
-                Effect::DispatchNode {
-                    node_id, firing_id, ..
-                } if node_id == "n1" => Some(firing_id.clone()),
-                _ => None,
-            })
-            .unwrap();
+        let f1 = first_dispatch_firing_id(&s);
+        // n1 output has no tool_calls → FinalAnswer matched →
+        // ToolCalls null → n2 edge suppressed.
         let r1 = Scheduler::handle_node_result(
             &runs,
             &peers,
             &result_body("run-sup", "n1", Some(&f1), Ok(json!({"text": "Hi"})), None),
         )
         .into_vec();
-        let invocation_id = r1
-            .iter()
-            .find_map(|e| match e {
-                Effect::CombinatorsInvoke { invocation_id, .. } => Some(invocation_id.clone()),
-                _ => None,
-            })
-            .unwrap();
-        // FinalAnswer populated, ToolCalls null → n2 edge suppressed.
-        let r2 = Scheduler::handle_invoke_result(
-            &runs,
-            &peers,
-            &invoke_result_body(
-                &invocation_id,
-                vec![
-                    ("generic-tool.ToolCalls", Value::Null),
-                    ("generic-provider.FinalAnswer", json!({"text": "Hi"})),
-                ],
-            ),
-        )
-        .into_vec();
-        // n2 not dispatched; run should complete (n2 marked skipped).
-        let complete = r2
+        // n2 not dispatched; run should complete (n2 suppressed).
+        let complete = r1
             .iter()
             .find(|e| matches!(e, Effect::RunComplete { .. }))
             .expect("run_complete");
@@ -2911,8 +2368,7 @@ mod tests {
     #[test]
     fn node_without_fanout_keeps_broadcast_behavior() {
         // Linear chain with no fanout — should run via the v1 broadcast
-        // path. Verifies the new path doesn't emit a query/invoke when
-        // unnecessary.
+        // path. n1 dispatches immediately at submit.
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
@@ -2927,10 +2383,6 @@ mod tests {
             SubmitOutcome::Accepted(e) => e.into_vec(),
             _ => panic!("accepted"),
         };
-        // No CombinatorsQuery was emitted.
-        assert!(!s
-            .iter()
-            .any(|e| matches!(e, Effect::CombinatorsQuery { .. })));
         // n1 dispatches immediately.
         assert!(s
             .iter()
@@ -2943,7 +2395,16 @@ mod tests {
         // is rejected at submit with `_typecheck` failure.
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
-        let g = fanout_graph("n1", "r", "p.T", vec!["p.U", "p.U"]);
+        let g = json!({
+            "terminal": "n1",
+            "nodes": [{
+                "id": "n1",
+                "reasoner": "r",
+                "args": {},
+                "fanout": { "in": "p.T", "out": ["p.U", "p.U"] }
+            }],
+            "edges": []
+        });
         let outcome = Scheduler::handle_submit(&runs, &peers, &submit_body("run-dup", g, None));
         let effects = match outcome {
             SubmitOutcome::Rejected(e) => e.into_vec(),
@@ -2957,49 +2418,16 @@ mod tests {
         }
     }
 
-    // ---- T6.5: cycle re-firing -------------------------------------------
-
-    /// Resolve combinator typecheck and return the firing-id of the
-    /// node that dispatches first. Helper for cycle tests where every
-    /// graph goes through the async typecheck path.
-    fn resolve_typecheck_and_first_dispatch(
-        runs: &Runs,
-        peers: &PeerSet,
-        submit_effects: &[Effect],
-        first_node_id: &str,
-        sigs: Vec<(&str, Vec<&str>)>,
-    ) -> (String, Vec<Effect>) {
-        let request_id = submit_effects
-            .iter()
-            .find_map(|e| match e {
-                Effect::CombinatorsQuery { request_id, .. } => Some(request_id.clone()),
-                _ => None,
-            })
-            .expect("query effect");
-        let resolved: Vec<(&str, Vec<&str>, &str)> = sigs
-            .into_iter()
-            .map(|(in_t, outs)| (in_t, outs, "nefor-combinators"))
-            .collect();
-        let q_body = query_result_body(&request_id, resolved, vec![]);
-        let post_query = Scheduler::handle_query_result(runs, peers, &q_body).into_vec();
-        let firing_id = post_query
-            .iter()
-            .find_map(|e| match e {
-                Effect::DispatchNode {
-                    node_id, firing_id, ..
-                } if node_id == first_node_id => Some(firing_id.clone()),
-                _ => None,
-            })
-            .expect("first dispatch after typecheck");
-        (firing_id, post_query)
-    }
+    // ---- Cycle re-firing with inline routing ------------------------------
 
     #[test]
     fn self_loop_re_fires_when_back_edge_fires_non_null() {
-        // Node A with self-edge tagged p.Loop. Fanout returns p.Loop=
-        // non-null on firings 1 and 2 → drives firings 2 and 3. On
-        // firing 3 the fanout returns null on p.Loop → cycle terminates.
-        // Expect 3 firings total and a successful run_complete.
+        // Node A with self-edge tagged p.ToolCalls. Fanout has two output
+        // types: p.ToolCalls (loop) and p.FinalAnswer (exit). The inline
+        // routing heuristic routes to ToolCalls when tool_calls is present,
+        // FinalAnswer otherwise. Firings 1-2 output has tool_calls → loop
+        // continues. Firing 3 output has no tool_calls → FinalAnswer
+        // matched → self-edge suppressed → loop terminates.
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
@@ -3008,44 +2436,32 @@ mod tests {
                 "id": "A",
                 "reasoner": "r",
                 "args": {},
-                "fanout": { "in": "p.PIn", "out": ["p.Loop"] }
+                "fanout": { "in": "p.PIn", "out": ["p.ToolCalls", "p.FinalAnswer"] }
             }],
-            "edges": [{ "from": "A", "to": "A", "type": "p.Loop" }]
+            "edges": [{ "from": "A", "to": "A", "type": "p.ToolCalls" }]
         });
         let s_eff = match Scheduler::handle_submit(&runs, &peers, &submit_body("run-sl2", g, None))
         {
             SubmitOutcome::Accepted(e) => e.into_vec(),
             _ => panic!("expected accepted"),
         };
-        let (f1, _) = resolve_typecheck_and_first_dispatch(
-            &runs,
-            &peers,
-            &s_eff,
-            "A",
-            vec![("p.PIn", vec!["p.Loop"])],
-        );
+        let f1 = first_dispatch_firing_id(&s_eff);
 
-        // Firing 1 completes → fanout invoke → loop non-null → re-fire (firing 2).
+        // Firing 1: output with tool_calls → ToolCalls matched → self-edge
+        // fires → re-fire (firing 2).
         let r1 = Scheduler::handle_node_result(
             &runs,
             &peers,
-            &result_body("run-sl2", "A", Some(&f1), Ok(json!({"i": 1})), None),
+            &result_body(
+                "run-sl2",
+                "A",
+                Some(&f1),
+                Ok(json!({"tool_calls": [{"name": "x"}]})),
+                None,
+            ),
         )
         .into_vec();
-        let inv1 = r1
-            .iter()
-            .find_map(|e| match e {
-                Effect::CombinatorsInvoke { invocation_id, .. } => Some(invocation_id.clone()),
-                _ => None,
-            })
-            .expect("invoke 1");
-        let r1b = Scheduler::handle_invoke_result(
-            &runs,
-            &peers,
-            &invoke_result_body(&inv1, vec![("p.Loop", json!({"keep": true}))]),
-        )
-        .into_vec();
-        let f2 = r1b
+        let f2 = r1
             .iter()
             .find_map(|e| match e {
                 Effect::DispatchNode {
@@ -3056,27 +2472,20 @@ mod tests {
             .expect("firing 2 dispatched");
         assert_ne!(f1, f2, "firing 2 has a fresh firing_id");
 
-        // Firing 2 → fanout non-null → firing 3.
+        // Firing 2: tool_calls again → firing 3.
         let r2 = Scheduler::handle_node_result(
             &runs,
             &peers,
-            &result_body("run-sl2", "A", Some(&f2), Ok(json!({"i": 2})), None),
+            &result_body(
+                "run-sl2",
+                "A",
+                Some(&f2),
+                Ok(json!({"tool_calls": [{"name": "y"}]})),
+                None,
+            ),
         )
         .into_vec();
-        let inv2 = r2
-            .iter()
-            .find_map(|e| match e {
-                Effect::CombinatorsInvoke { invocation_id, .. } => Some(invocation_id.clone()),
-                _ => None,
-            })
-            .unwrap();
-        let r2b = Scheduler::handle_invoke_result(
-            &runs,
-            &peers,
-            &invoke_result_body(&inv2, vec![("p.Loop", json!({"keep": true}))]),
-        )
-        .into_vec();
-        let f3 = r2b
+        let f3 = r2
             .iter()
             .find_map(|e| match e {
                 Effect::DispatchNode {
@@ -3087,27 +2496,15 @@ mod tests {
             .expect("firing 3");
         assert_ne!(f2, f3);
 
-        // Firing 3 → fanout null on Loop → no re-fire; run completes.
+        // Firing 3: NO tool_calls → FinalAnswer matched → ToolCalls null →
+        // self-edge suppressed → no re-fire → run completes.
         let r3 = Scheduler::handle_node_result(
             &runs,
             &peers,
-            &result_body("run-sl2", "A", Some(&f3), Ok(json!({"i": 3})), None),
+            &result_body("run-sl2", "A", Some(&f3), Ok(json!({"done": true})), None),
         )
         .into_vec();
-        let inv3 = r3
-            .iter()
-            .find_map(|e| match e {
-                Effect::CombinatorsInvoke { invocation_id, .. } => Some(invocation_id.clone()),
-                _ => None,
-            })
-            .unwrap();
-        let r3b = Scheduler::handle_invoke_result(
-            &runs,
-            &peers,
-            &invoke_result_body(&inv3, vec![("p.Loop", Value::Null)]),
-        )
-        .into_vec();
-        let complete = r3b
+        let complete = r3
             .iter()
             .find(|e| matches!(e, Effect::RunComplete { .. }))
             .expect("run_complete after termination");
@@ -3116,7 +2513,7 @@ mod tests {
             _ => unreachable!(),
         }
         // No fourth firing dispatched.
-        let extra_dispatch = r3b
+        let extra_dispatch = r3
             .iter()
             .filter(|e| matches!(e, Effect::DispatchNode { .. }))
             .count();
@@ -3125,8 +2522,9 @@ mod tests {
 
     #[test]
     fn null_on_back_edge_terminates_cycle() {
-        // Self-loop with fanout that immediately returns null on the
-        // loop edge → no re-fire; run completes after the single firing.
+        // Self-loop with fanout. Output has no tool_calls on first firing
+        // → FinalAnswer matched → ToolCalls-tagged self-edge suppressed →
+        // no re-fire; run completes after the single firing.
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
@@ -3135,44 +2533,27 @@ mod tests {
                 "id": "A",
                 "reasoner": "r",
                 "args": {},
-                "fanout": { "in": "p.PIn", "out": ["p.Loop"] }
+                "fanout": { "in": "p.PIn", "out": ["p.ToolCalls", "p.FinalAnswer"] }
             }],
-            "edges": [{ "from": "A", "to": "A", "type": "p.Loop" }]
+            "edges": [{ "from": "A", "to": "A", "type": "p.ToolCalls" }]
         });
         let s_eff = match Scheduler::handle_submit(&runs, &peers, &submit_body("run-nul", g, None))
         {
             SubmitOutcome::Accepted(e) => e.into_vec(),
             _ => panic!("expected accepted"),
         };
-        let (f1, _) = resolve_typecheck_and_first_dispatch(
-            &runs,
-            &peers,
-            &s_eff,
-            "A",
-            vec![("p.PIn", vec!["p.Loop"])],
-        );
+        let f1 = first_dispatch_firing_id(&s_eff);
+        // Output with no tool_calls → FinalAnswer matched → self-edge
+        // suppressed → loop never starts.
         let r1 = Scheduler::handle_node_result(
             &runs,
             &peers,
-            &result_body("run-nul", "A", Some(&f1), Ok(json!({})), None),
-        )
-        .into_vec();
-        let inv = r1
-            .iter()
-            .find_map(|e| match e {
-                Effect::CombinatorsInvoke { invocation_id, .. } => Some(invocation_id.clone()),
-                _ => None,
-            })
-            .unwrap();
-        let r2 = Scheduler::handle_invoke_result(
-            &runs,
-            &peers,
-            &invoke_result_body(&inv, vec![("p.Loop", Value::Null)]),
+            &result_body("run-nul", "A", Some(&f1), Ok(json!({"done": true})), None),
         )
         .into_vec();
         // No further dispatch — fanout suppressed the loop.
-        assert!(!r2.iter().any(|e| matches!(e, Effect::DispatchNode { .. })));
-        let complete = r2
+        assert!(!r1.iter().any(|e| matches!(e, Effect::DispatchNode { .. })));
+        let complete = r1
             .iter()
             .find(|e| matches!(e, Effect::RunComplete { .. }))
             .expect("run_complete after immediate termination");
@@ -3184,10 +2565,10 @@ mod tests {
 
     #[test]
     fn prev_state_carries_across_re_firings() {
-        // Self-loop with fanout. Each firing returns next_state; the
-        // following firing's dispatch must carry it as prev_state.
-        // Verifies the per-firing chat-history accumulation pattern
-        // from parent spec §3.
+        // Self-loop with fanout (ToolCalls/FinalAnswer). Each firing
+        // returns next_state; the following firing's dispatch must carry
+        // it as prev_state. Verifies the per-firing chat-history
+        // accumulation pattern from parent spec §3.
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
@@ -3196,22 +2577,16 @@ mod tests {
                 "id": "A",
                 "reasoner": "r",
                 "args": {},
-                "fanout": { "in": "p.PIn", "out": ["p.Loop"] }
+                "fanout": { "in": "p.PIn", "out": ["p.ToolCalls", "p.FinalAnswer"] }
             }],
-            "edges": [{ "from": "A", "to": "A", "type": "p.Loop" }]
+            "edges": [{ "from": "A", "to": "A", "type": "p.ToolCalls" }]
         });
         let s_eff = match Scheduler::handle_submit(&runs, &peers, &submit_body("run-ps", g, None)) {
             SubmitOutcome::Accepted(e) => e.into_vec(),
             _ => panic!("expected accepted"),
         };
-        let (f1, _) = resolve_typecheck_and_first_dispatch(
-            &runs,
-            &peers,
-            &s_eff,
-            "A",
-            vec![("p.PIn", vec!["p.Loop"])],
-        );
-        // Firing 1 returns next_state=H1.
+        let f1 = first_dispatch_firing_id(&s_eff);
+        // Firing 1 returns output with tool_calls + next_state=H1.
         let h1 = json!({"history": [{"role": "user", "content": "hi"}]});
         let r1 = Scheduler::handle_node_result(
             &runs,
@@ -3220,26 +2595,13 @@ mod tests {
                 "run-ps",
                 "A",
                 Some(&f1),
-                Ok(json!("first-out")),
+                Ok(json!({"tool_calls": [{"name": "ask"}]})),
                 Some(h1.clone()),
             ),
         )
         .into_vec();
-        let inv1 = r1
-            .iter()
-            .find_map(|e| match e {
-                Effect::CombinatorsInvoke { invocation_id, .. } => Some(invocation_id.clone()),
-                _ => None,
-            })
-            .unwrap();
-        let r1b = Scheduler::handle_invoke_result(
-            &runs,
-            &peers,
-            &invoke_result_body(&inv1, vec![("p.Loop", json!({"k": 1}))]),
-        )
-        .into_vec();
         // Firing 2's DispatchNode must carry prev_state == H1.
-        let firing_2_prev = r1b
+        let firing_2_prev = r1
             .iter()
             .find_map(|e| match e {
                 Effect::DispatchNode {
@@ -3254,10 +2616,10 @@ mod tests {
             firing_2_prev, h1,
             "firing 2's prev_state must equal firing 1's next_state"
         );
-        // Sanity: the new firing's `inputs.A` carries the fanout-routed
-        // value (not the upstream's broadcast output) — preferring
-        // typed routing per the parent spec.
-        let firing_2_inputs = r1b
+        // The new firing's `inputs.A` carries the fanout-routed value
+        // (not the upstream's broadcast output) — typed routing per
+        // the parent spec.
+        let firing_2_inputs = r1
             .iter()
             .find_map(|e| match e {
                 Effect::DispatchNode {
@@ -3268,23 +2630,22 @@ mod tests {
             .unwrap();
         assert_eq!(
             firing_2_inputs.get("A"),
-            Some(&json!({"output": {"k": 1}})),
+            Some(&json!({"output": {"tool_calls": [{"name": "ask"}]}})),
             "fanout-seeded value wins over broadcast output for cycle re-fires"
         );
     }
 
     #[test]
     fn provider_wrapper_cycle_re_fires_on_tool_calls_path() {
-        // Four-node graph mirroring the orchestrator pattern from parent
-        // spec §2:
+        // Four-node graph mirroring the orchestrator pattern:
         //
         //   wrap (fanout) ─ToolCalls→ tools → adapt ──┐
         //         └────────FinalAnswer───→ terminal   │
         //         ▲────────────────────────────────────┘
         //
-        // Firings 1–2 of wrap emit ToolCalls=non-null (cycle continues).
-        // Firing 3 emits FinalAnswer=non-null (cycle escapes via terminal).
-        // Expected counts: wrap=3, tools=2, adapt=2, terminal=1.
+        // Firings 1-2 of wrap output has tool_calls → inline routes to
+        // ToolCalls (cycle continues). Firing 3 output has no tool_calls
+        // → inline routes to FinalAnswer (cycle escapes via terminal).
         let runs: Runs = Arc::new(Mutex::new(HashMap::new()));
         let peers = peers_with(&["r"]);
         let g = json!({
@@ -3308,49 +2669,22 @@ mod tests {
             SubmitOutcome::Accepted(e) => e.into_vec(),
             _ => panic!("expected accepted"),
         };
-        let (f_wrap1, _) = resolve_typecheck_and_first_dispatch(
-            &runs,
-            &peers,
-            &s_eff,
-            "wrap",
-            vec![("p.POut", vec!["p.ToolCalls", "p.FinalAnswer"])],
-        );
+        let f_wrap1 = first_dispatch_firing_id(&s_eff);
 
-        // Helper: drive wrap through one firing → fanout invoke → reply
-        // with the supplied multiset → return any newly-dispatched
-        // node_ids paired with their firing_ids.
-        let drive_wrap = |firing: &str, fanout_outs: Vec<(&str, Value)>| -> Vec<Effect> {
-            let r = Scheduler::handle_node_result(
+        // Helper: drive wrap through one firing. The output value's
+        // tool_calls presence determines inline routing.
+        let drive_wrap = |firing: &str, output: Value| -> Vec<Effect> {
+            Scheduler::handle_node_result(
                 &runs,
                 &peers,
-                &result_body(
-                    "run-orch",
-                    "wrap",
-                    Some(firing),
-                    Ok(json!("provider-out")),
-                    None,
-                ),
+                &result_body("run-orch", "wrap", Some(firing), Ok(output), None),
             )
-            .into_vec();
-            let inv = r
-                .iter()
-                .find_map(|e| match e {
-                    Effect::CombinatorsInvoke { invocation_id, .. } => Some(invocation_id.clone()),
-                    _ => None,
-                })
-                .expect("invoke for wrap");
-            Scheduler::handle_invoke_result(&runs, &peers, &invoke_result_body(&inv, fanout_outs))
-                .into_vec()
+            .into_vec()
         };
 
-        // Firing 1 of wrap → ToolCalls non-null → tools dispatches.
-        let r1 = drive_wrap(
-            &f_wrap1,
-            vec![
-                ("p.ToolCalls", json!([{"name": "x"}])),
-                ("p.FinalAnswer", Value::Null),
-            ],
-        );
+        // Firing 1 of wrap → output with tool_calls → ToolCalls matched →
+        // tools dispatches.
+        let r1 = drive_wrap(&f_wrap1, json!({"tool_calls": [{"name": "x"}]}));
         let f_tools1 = r1
             .iter()
             .find_map(|e| match e {
@@ -3405,14 +2739,8 @@ mod tests {
             .expect("wrap firing 2 after adapt completes");
         assert_ne!(f_wrap1, f_wrap2);
 
-        // Firing 2 of wrap → ToolCalls non-null → tools 2 → adapt 2 → wrap 3.
-        let r2 = drive_wrap(
-            &f_wrap2,
-            vec![
-                ("p.ToolCalls", json!([{"name": "y"}])),
-                ("p.FinalAnswer", Value::Null),
-            ],
-        );
+        // Firing 2 of wrap → tool_calls again → tools 2 → adapt 2 → wrap 3.
+        let r2 = drive_wrap(&f_wrap2, json!({"tool_calls": [{"name": "y"}]}));
         let f_tools2 = r2
             .iter()
             .find_map(|e| match e {
@@ -3468,14 +2796,9 @@ mod tests {
             .expect("wrap firing 3");
         assert_ne!(f_wrap2, f_wrap3);
 
-        // Firing 3 of wrap → FinalAnswer non-null → terminal fires; cycle exits.
-        let r3 = drive_wrap(
-            &f_wrap3,
-            vec![
-                ("p.ToolCalls", Value::Null),
-                ("p.FinalAnswer", json!("done")),
-            ],
-        );
+        // Firing 3 of wrap → NO tool_calls → FinalAnswer matched →
+        // terminal fires; tools edge suppressed; cycle exits.
+        let r3 = drive_wrap(&f_wrap3, json!({"text": "done"}));
         let f_term = r3
             .iter()
             .find_map(|e| match e {
@@ -3508,9 +2831,6 @@ mod tests {
             .expect("run_complete after terminal");
         match complete {
             Effect::RunComplete { status, .. } => {
-                // Expect success — every node has at least one Output;
-                // tools/adapt completed twice each, wrap thrice,
-                // terminal once.
                 assert_eq!(*status, RunStatus::Success);
             }
             _ => unreachable!(),
