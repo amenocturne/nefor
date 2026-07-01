@@ -1,0 +1,6 @@
+;; Reusable tool set definitions
+
+(def read-tools ["fs/read" "grep" "find" "git/log"])
+(def write-tools ["fs/read" "fs/edit" "grep" "shell"])
+(def web-tools ["web/search" "web/fetch"])
+(def review-tools ["fs/read" "grep" "git/diff"])

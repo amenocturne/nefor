@@ -48,22 +48,22 @@ local M = {}
 --     instruction-file reminders BEFORE the invoke is forwarded to the
 --     binary (ordering is load-bearing for chat history).
 --   * Then forward the envelope verbatim to the binary's stdin.
--- opts.agentic_loop (required) — the agentic-loop module table,
--- injected by the caller. Eliminates the require-time cycle between
--- this compositor and agentic-loop.
-function M.gate_spec(gate_name, command, opts)
+function M.gate_spec(gate_name, command)
   gate_name = gate_name or "tool-gate"
   if type(command) ~= "table" then
     error("tools.gate_spec: command must be a table, got " .. type(command))
   end
-  opts = opts or {}
-  local al = opts.agentic_loop
-  if al == nil then
-    error("tools.gate_spec: opts.agentic_loop is required")
-  end
 
   local translator = gate_lib.translator(gate_name)
   local advertised = false
+  local agentic_loop  -- bound lazily
+
+  local function al()
+    if agentic_loop == nil then
+      agentic_loop = require("agentic-loop")
+    end
+    return agentic_loop
+  end
 
   -- Per-envelope inbound logic. Pulled into a local so the batched
   -- from_plugin loop reads as a one-liner.
@@ -100,7 +100,7 @@ function M.gate_spec(gate_name, command, opts)
         translator.emit(nil, gate_lib.spawn_graph_error_body(invoke_id, parse_err))
         return
       end
-      local run_id, err = al.queue_sub_graph(parsed.args, parsed.invoke_id)
+      local run_id, err = al().queue_sub_graph(parsed.args, parsed.invoke_id)
       if not run_id then
         translator.emit(nil, gate_lib.spawn_graph_error_body(parsed.invoke_id, err))
         return
@@ -116,7 +116,7 @@ function M.gate_spec(gate_name, command, opts)
       local body = gate_lib.maybe_dump_output(env.body, nil)
       local tool_id = body.id
       if type(tool_id) == "string" then
-        local ref, entry = al.take_pending_for_tool(tool_id)
+        local ref, entry = al().take_pending_for_tool(tool_id)
         if ref then
           local model_call_id =
             (entry.tool_calls[ref.idx] and entry.tool_calls[ref.idx].id)
@@ -128,7 +128,7 @@ function M.gate_spec(gate_name, command, opts)
             output = body.output,
             error  = body.error,
           }
-          al.fire_tool_end_observers(model_call_id, payload_output, err_bool)
+          al().fire_tool_end_observers(model_call_id, payload_output, err_bool)
           envelope.emit("nefor-tui", {
             kind   = "chat.tool.end",
             id     = model_call_id,
@@ -137,7 +137,7 @@ function M.gate_spec(gate_name, command, opts)
           })
           entry.pending_count = entry.pending_count - 1
           if entry.pending_count == 0 then
-            al.clear_pending_key(ref.key)
+            al().clear_pending_key(ref.key)
             envelope.emit_as("tool-executor", nil, {
               kind   = "tool.result",
               id     = entry.firing_id,

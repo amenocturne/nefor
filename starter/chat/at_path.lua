@@ -29,6 +29,19 @@ local FENCE_LANG = {
   html = "html", css = "css", go = "go", rb = "ruby", java = "java",
 }
 
+local AUDIO_EXT = {
+  mp3 = true, wav = true, flac = true, aif = true, aiff = true, m4a = true,
+}
+
+local function extension(path)
+  local ext = path:match("%.([%w]+)$")
+  return ext and ext:lower() or nil
+end
+
+local function is_audio_path(path)
+  return AUDIO_EXT[extension(path) or ""] == true
+end
+
 local function fence_lang(path)
   local ext = path:match("%.([%w]+)$")
   if ext == nil then return "" end
@@ -62,7 +75,7 @@ function M.expand(text)
   if text == nil or text == "" or text:find("@", 1, true) == nil then
     return text
   end
-  return (text:gsub("@([^%s]+)", function(token)
+  local function replace_token(token)
     -- Strip trailing prompt punctuation that almost never belongs to
     -- a path (`.`, `,`, `;`, `:`, `!`, `?`, `)`). One pass — multiple
     -- trailing punctuation chars (e.g. `@file.lua?!`) all peel off.
@@ -70,13 +83,38 @@ function M.expand(text)
     if trimmed == "" then return nil end
     local data, resolved = resolve(trimmed)
     if data == nil then return nil end
+    if is_audio_path(resolved) then return "@" .. token end
     local trail = token:sub(#trimmed + 1)
     local lang = fence_lang(resolved)
     return string.format(
       "<file path=\"%s\">\n```%s\n%s\n```\n</file>%s",
       resolved, lang, data, trail
     )
-  end))
+  end
+
+  text = text:gsub("@\"([^\"]+)\"", function(token)
+    local data, resolved = resolve(token)
+    if data == nil then return nil end
+    if is_audio_path(resolved) then return "@\"" .. token .. "\"" end
+    local lang = fence_lang(resolved)
+    return string.format(
+      "<file path=\"%s\">\n```%s\n%s\n```\n</file>",
+      resolved, lang, data
+    )
+  end)
+
+  text = text:gsub("@'([^']+)'", function(token)
+    local data, resolved = resolve(token)
+    if data == nil then return nil end
+    if is_audio_path(resolved) then return "@'" .. token .. "'" end
+    local lang = fence_lang(resolved)
+    return string.format(
+      "<file path=\"%s\">\n```%s\n%s\n```\n</file>",
+      resolved, lang, data
+    )
+  end)
+
+  return (text:gsub("@([^%s]+)", replace_token))
 end
 
 return M

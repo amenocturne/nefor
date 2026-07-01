@@ -12,6 +12,12 @@ M.COMMANDS = {
   { name = "login",   aliases = {},          hint = "authenticate a provider",                takes_args = true },
   { name = "logout",  aliases = {},          hint = "revoke a provider's auth",               takes_args = true },
   { name = "model",   aliases = {},          hint = "list/switch active model",               takes_args = true },
+  {
+    name = "mode", aliases = {}, hint = "switch workflow mode", takes_args = true,
+    arg_completions = {
+      { name = "default", hint = "normal agentic workflow" },
+    },
+  },
   { name = "think",   aliases = { "effort" }, hint = "set reasoning effort",                  takes_args = true },
   { name = "compact", aliases = {},          hint = "compact active model context",           takes_args = false },
   { name = "resume",  aliases = {},          hint = "resume previous session",                takes_args = true },
@@ -23,20 +29,71 @@ M.COMMANDS = {
   { name = "debug",   aliases = {},          hint = "toggle diagnostic logging",             takes_args = false },
 }
 
-local function slash_filter(query)
-  -- Case-insensitive prefix match against name OR aliases.
-  local q = (query or ""):lower()
-  local out = {}
+local function command_matches(cmd, q)
+  if cmd.name:lower():sub(1, #q) == q then return true end
+  for _, a in ipairs(cmd.aliases or {}) do
+    if a:lower():sub(1, #q) == q then return true end
+  end
+  return false
+end
+
+local function command_by_exact_name_or_alias(q)
   for _, cmd in ipairs(M.COMMANDS) do
-    local match = cmd.name:lower():sub(1, #q) == q
-    if not match then
-      for _, a in ipairs(cmd.aliases) do
-        if a:lower():sub(1, #q) == q then match = true; break end
-      end
+    if cmd.name:lower() == q then return cmd end
+    for _, a in ipairs(cmd.aliases or {}) do
+      if a:lower() == q then return cmd end
     end
-    if match then out[#out + 1] = cmd end
+  end
+  return nil
+end
+
+local function ranked_command_matches(q)
+  local ranked = {}
+  for idx, cmd in ipairs(M.COMMANDS) do
+    if command_matches(cmd, q) then ranked[#ranked + 1] = { entry = cmd, order = idx } end
+  end
+  table.sort(ranked, function(a, b)
+    local an = a.entry.name:lower()
+    local bn = b.entry.name:lower()
+    local a_exact = an == q
+    local b_exact = bn == q
+    if a_exact ~= b_exact then return a_exact end
+    if #an ~= #bn then return #an < #bn end
+    return a.order < b.order
+  end)
+  local out = {}
+  for _, item in ipairs(ranked) do out[#out + 1] = item.entry end
+  return out
+end
+
+local function slash_arg_filter(query)
+  local q = (query or ""):lower()
+  local cmd_name, arg_query = q:match("^(%S+)%s+(.*)$")
+  if cmd_name == nil then return nil end
+
+  local cmd = command_by_exact_name_or_alias(cmd_name)
+  if cmd == nil or type(cmd.arg_completions) ~= "table" then return {} end
+
+  local out = {}
+  for _, arg in ipairs(cmd.arg_completions) do
+    local arg_name = tostring(arg.name or "")
+    if arg_name:lower():sub(1, #arg_query) == arg_query then
+      out[#out + 1] = {
+        name = cmd.name .. " " .. arg_name,
+        hint = arg.hint,
+        takes_args = false,
+      }
+    end
   end
   return out
+end
+
+local function slash_filter(query)
+  local arg_matches = slash_arg_filter(query)
+  if arg_matches ~= nil then return arg_matches end
+
+  -- Case-insensitive prefix match against name OR aliases.
+  return ranked_command_matches((query or ""):lower())
 end
 
 -- Parse `/cmd args` out of an input value. Returns (cmd, args, has_ws).
@@ -166,11 +223,14 @@ local function at_apply(entry, body, value, token)
   local base_dir = split_body(body or "")
   local replacement = "@" .. base_dir .. entry.name
   if entry.is_dir then replacement = replacement .. "/" end
+  if replacement:find("%s") then
+    replacement = "@\"" .. replacement:sub(2):gsub('"', '\\"') .. "\""
+  end
   return value:sub(1, pos - 1) .. replacement
 end
 
 local function slash_format(cmd)
-  return string.format("/%-12s  %s", cmd.name, cmd.hint or "")
+  return string.format("/%-16s  %s", cmd.name, cmd.hint or "")
 end
 
 local function slash_apply(entry)
@@ -192,6 +252,14 @@ function M.completions()
     {
       trigger      = "/",
       anchor       = "start",
+      source       = function() return M.COMMANDS end,
+      filter       = function(_, body) return slash_filter(body or "") end,
+      format_entry = slash_format,
+      apply        = slash_apply,
+    },
+    {
+      trigger      = "/",
+      anchor       = "start-spaced",
       source       = function() return M.COMMANDS end,
       filter       = function(_, body) return slash_filter(body or "") end,
       format_entry = slash_format,

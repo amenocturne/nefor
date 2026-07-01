@@ -13,6 +13,10 @@
 --
 -- ## Per-tool policies
 --
+-- `mirror-projects`: auto-approved. This dedicated typed wrapper is
+-- schema-limited to read-only actions (list/tasks/show/find), so it is
+-- safe for lead/non-read-only requests as well as read-only agents.
+--
 -- `bash`: passes the command through `da` (https://github.com/amenocturne/da),
 -- a bash-command classifier with explicit policy flags. da reads the
 -- command on stdin and exits 0 / 1 / 2 for approve / defer / deny. We
@@ -22,43 +26,29 @@
 --   --git read,add,commit,restore-staged,tag,fetch,pull,push
 --   --cargo local
 --
--- `dispatch-graph`: asks lead-workflow whether the args would be
--- auto-rejected (writer roles without an approved plan). On a sure
--- rejection we deny here so the user never sees a popup for an
--- invocation that's about to be turned down — without this the UX
--- would be "agent calls tool → popup → user approves → chat shows
--- rejection". The rejection reason rides through tool-gate's
--- permission_response.reason → tool.result.error so the agent learns
--- exactly what to do next.
+-- bash invocations of the `mirror-projects` CLI are only fast-pathed for
+-- read subcommands, and especially for read-only agents; write-capable
+-- task-management commands must stay behind da/popup gating.
 --
--- `edit_file` / `write_file`: auto-approved only while lead-workflow
--- has an approved plan in safe mode, or while `/auto`/`/yolo` is active.
--- Without approval in safe mode these are denied instead of popped up,
--- so direct file mutation cannot bypass the plan gate.
+-- `edit_file`: auto-approved for non-read-only agents. The lead prompt
+-- still requires reading the target file before editing, but the tool
+-- is not size-limited here; the lead sometimes needs to make broad
+-- existing-file edits without paying graph overhead.
+--
+-- `write_file`: auto-approved only while lead-workflow has an approved
+-- plan. Without approval it is denied instead of popped up, so direct
+-- file creation/overwrite cannot bypass the plan gate.
 --
 -- Other tools: defer to the user (popup) unless the agent is read-only.
---
--- ## Approval model
---
--- The mode table is intentionally a cross-product of mode × action class:
---
---   safe      — safe: approve; human: ask/block; guarded: ask; forbidden: ask
---   auto      — safe: approve; human: auto-resolve; guarded: deny; forbidden: deny
---   yolo      — approve every class
---
--- Examples:
---   safe      = read_file
---   human     = write-review's plan approval turn
---   guarded   = bash that da cannot prove safe
---   forbidden = bash that da classifies as deny
 --
 -- ## Read-only agents
 --
 -- When `read_only = true` rides through the permission_request, the
--- validator never shows a popup. bash goes through da with the strict
--- policy (git read-only); approve on exit 0, deny on anything else.
--- Non-bash tools are auto-approved (tool-gate already restricts them
--- to the role's allowlist). This means read-only agents run fully
+-- validator never shows a popup. bash is auto-approved (the role's
+-- tool_allowlist already constrains what the agent can call; da
+-- false-positives on compound read commands cause unnecessary
+-- friction). Non-bash tools are auto-approved (tool-gate already
+-- restricts them to the role's allowlist). This means read-only agents run fully
 -- autonomously with no user interaction.
 --
 -- ## Failure modes
@@ -158,31 +148,29 @@ local function emit_popup(body)
   })
 end
 
--- Pre-execution gate check for `dispatch-graph`. Asks lead-workflow
--- whether the args would be auto-rejected; if so, returns the rich
--- rejection reason so the popup can be skipped. Returns:
---   nil          — args look fine, fall through to popup
---   string reason — auto-deny with this message
--- Tolerates lead-workflow not being loaded (returns nil) so the
--- validator stays useful even when the lead-workflow actor isn't
--- spawned (e.g. minimal test setups).
-local function classify_dispatch_graph(args)
-  local ok, lw = pcall(require, "lead-workflow")
-  if not ok or type(lw) ~= "table" then return nil end
-  local check = lw.gate_against_unapproved_plan
-  if type(check) ~= "function" then return nil end
-  local nodes = args and args.nodes
-  if type(nodes) ~= "table" then return nil end
-  local rejection = check(nodes)
-  if type(rejection) == "string" and #rejection > 0 then return rejection end
-  return nil
-end
-
 -- Classify a bash command through da. Returns one of:
 --   "approve" | "deny" | "defer"
 -- `da` probe/spawn failure is a runtime install error and raises.
+-- Read-only agents also get a narrow `mirror-projects` read fast-path
+-- so explorer/reviewer/builder prompts can read project task context
+-- without permitting task-management writes.
+local MIRROR_PROJECTS_READ_COMMANDS = {
+  list = true,
+  tasks = true,
+  show = true,
+  find = true,
+}
+
+local function is_mirror_projects_read_command(command)
+  if type(command) ~= "string" or #command == 0 then return false end
+  if command:find("[;&|><`$()]") then return false end
+  local subcommand = command:match("^%s*mirror%-projects%s+(%S+)")
+  return MIRROR_PROJECTS_READ_COMMANDS[subcommand] == true
+end
+
 local function classify_bash(command, read_only)
   if type(command) ~= "string" or #command == 0 then return "defer" end
+  if read_only and is_mirror_projects_read_command(command) then return "approve" end
   local cmd = probe_da()
   local policy = read_only and DA_ARGS_STRICT_READONLY or DA_ARGS
   local r = nefor.process.run {
@@ -208,16 +196,16 @@ local function has_approved_plan()
   return type(plan) == "table" and plan.status == "approved"
 end
 
-local function guarded_denial_reason(tool)
-  return "permission_denied[auto]: guarded tool `" .. tostring(tool) .. "` needs human review. " ..
-         "Recovery: switch to /safe and approve the request manually, or revise the task to use safe/auto-approved tools."
+local function auto_denial_reason(tool)
+  return "permission_denied[auto]: tool `" .. tostring(tool) .. "` requires human approval. " ..
+         "Recovery: switch to /safe and approve the request manually, or revise the task to use read-only/auto-approved tools."
 end
 
 local function defer_or_deny(body)
   if gate_mode == "yolo" then
     emit_response(body.id, "approve")
   elseif gate_mode == "auto" then
-    emit_response(body.id, "deny", guarded_denial_reason(body.tool or body.name))
+    emit_response(body.id, "deny", auto_denial_reason(body.tool or body.name))
   else
     emit_popup(body)
   end
@@ -237,20 +225,38 @@ local function handle_permission_request(body)
   local args = body.args
   local is_ro = body.read_only == true
 
-  if tool == "edit_file" or tool == "write_file" then
+  if tool == "edit_file" then
     if is_ro then
-      emit_response(id, "deny", tool .. " is not available to read-only agents")
+      emit_response(id, "deny", "edit_file is not available to read-only agents")
       return
     end
-    if gate_mode == "auto" or has_approved_plan() then
+    emit_response(id, "approve")
+    return
+  end
+
+  if tool == "write_file" then
+    if is_ro then
+      emit_response(id, "deny", "write_file is not available to read-only agents")
+      return
+    end
+    if has_approved_plan() then
       emit_response(id, "approve")
     else
-      emit_response(id, "deny", tool .. " requires an approved plan")
+      emit_response(id, "deny", "write_file requires an approved plan")
     end
     return
   end
 
+  if tool == "mirror-projects" then
+    emit_response(id, "approve")
+    return
+  end
+
   if tool == "bash" then
+    if is_ro then
+      emit_response(id, "approve")
+      return
+    end
     local cmd = (type(args) == "table" and args.command) or nil
     local verdict = classify_bash(cmd, is_ro)
     if verdict == "approve" then
@@ -258,14 +264,6 @@ local function handle_permission_request(body)
       return
     end
     if verdict == "deny" then
-      if is_ro then
-        emit_response(id, "deny")
-      else
-        defer_or_deny(body)
-      end
-      return
-    end
-    if is_ro then
       emit_response(id, "deny")
       return
     end
@@ -273,33 +271,6 @@ local function handle_permission_request(body)
   elseif is_ro then
     emit_response(id, "approve")
     return
-  elseif tool == "dispatch-graph" then
-    local rejection = classify_dispatch_graph(args)
-    if rejection ~= nil then
-      emit_response(id, "deny", rejection)
-      return
-    end
-    if gate_mode == "auto" then
-      emit_response(id, "approve")
-      return
-    end
-    -- Auto-approve when every node uses a read-only role.
-    local all_readonly = true
-    local READ_ONLY_ROLES = { explorer = true, reviewer = true, critic = true, reflector = true }
-    local nodes = type(args) == "table" and args.nodes or {}
-    if type(nodes) == "table" then
-      for _, n in ipairs(nodes) do
-        if type(n) == "table" and not READ_ONLY_ROLES[n.role] then
-          all_readonly = false
-          break
-        end
-      end
-    end
-    if all_readonly then
-      emit_response(id, "approve")
-      return
-    end
-    -- write-capable roles: fall through to popup.
   end
 
   defer_or_deny(body)
@@ -333,13 +304,13 @@ return {
 
   _internals = {
     classify_bash             = classify_bash,
-    classify_dispatch_graph   = classify_dispatch_graph,
     handle_permission_request = handle_permission_request,
     set_mode = function(mode)
       if mode == "normal" then mode = "safe" end
       if mode == "safe" or mode == "auto" or mode == "yolo" then gate_mode = mode end
     end,
     get_mode = function() return gate_mode end,
+    is_mirror_projects_read_command = is_mirror_projects_read_command,
     has_approved_plan = has_approved_plan,
     reset = function() da_cmd = nil; gate_mode = "safe" end,
   },

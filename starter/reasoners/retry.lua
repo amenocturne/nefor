@@ -26,8 +26,7 @@ local function handle(body)
   local inputs = type(body.inputs) == "table" and body.inputs or {}
   local upstream_id, entry = first_input(inputs)
   local attempt = (tonumber(prev_state.attempt) or 0) + 1
-  local output_entry = type(entry) == "table" and type(entry.output) == "table" and entry.output or nil
-  local ok = output_entry ~= nil and (output_entry.ok == true or output_entry.approved == true)
+  local ok = type(entry) == "table" and entry.output ~= nil and entry.output.ok == true
   local exhausted = attempt >= max_attempts
   local route = ok and "pass" or (exhausted and "exhausted" or "retry")
 
@@ -38,7 +37,6 @@ local function handle(body)
     exhausted = (not ok) and exhausted,
     upstream_id = upstream_id,
     input = entry,
-    next_state = { attempt = attempt },
     traits = {
       pass_through = true,
       branch_routing = true,

@@ -53,7 +53,6 @@ local chats = {}
 -- chat.complete.result wire (openai-provider de-nests it before emit;
 -- we emit the de-nested shape directly).
 local CANNED_GRAPH = {
-  terminal = "terminal",
   nodes = {
     { id = "sx",       reasoner = "responder", args = { prompt = "Summarise octopuses in one sentence." } },
     { id = "sy",       reasoner = "responder", args = { prompt = "Summarise lighthouses in one sentence." } },

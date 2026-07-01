@@ -59,8 +59,9 @@
 -- A failed-spawn `tool.result` carries `error` instead of `output`; we
 -- forward those as a structured `error` field.
 
+local json = nefor.json
+
 local envelope      = require("core.envelope")
-local event         = require("core.event")
 local replay_window = require("core.history_replay")
 
 local emit_as = envelope.emit_as
@@ -185,15 +186,15 @@ local function receive_msg(entry)
   -- Matches the broadcast-fan-out filter in reasoners/init.lua.
   if entry.origin == "step" and entry.target ~= nil then return end
 
-  local evt = event.decode(entry)
-  if evt == nil then return end
+  local ok, decoded = pcall(json.decode, entry.payload)
+  if not ok then return end
 
   -- Replayed envelopes from a past run-id can't advance the in-memory
   -- tool_to_firing map; skip during replay (parity with agent.lua).
   if replay_window.active() then return end
 
-  local body = evt.body
-  if evt.kind ~= "tool.result" then return end
+  local body = decoded.body
+  if body.kind ~= "tool.result" then return end
   on_tool_result(body)
 end
 

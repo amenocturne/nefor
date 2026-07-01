@@ -35,7 +35,7 @@ function M.append_assistant_delta(state, delta)
     local new_entries = replace_entry(state.entries, state.in_flight, new_entry)
     log.log("transcript", "delta in_flight=%d len=%d new_v=%d",
       state.in_flight, #delta, new_entry.v)
-    return shallow_merge(state, { entries = new_entries })
+    return shallow_merge(state, { entries = new_entries, pending = false })
   end
   local new_entry = Entry.assistant_stream()
   new_entry = Entry.append_text(new_entry, delta)
@@ -45,6 +45,7 @@ function M.append_assistant_delta(state, delta)
   return shallow_merge(state, {
     entries   = new_entries,
     in_flight = #new_entries,
+    pending   = false,
   })
 end
 
@@ -57,7 +58,7 @@ function M.append_reasoning_delta(state, delta)
     log.log("transcript", "reasoning_delta new_stream v=%d count=%d",
       new_entry.v, #new_entries)
     return shallow_merge(state, {
-      entries = new_entries, in_flight = #new_entries,
+      entries = new_entries, in_flight = #new_entries, pending = false,
     })
   end
   local e = state.entries[idx]
@@ -65,7 +66,7 @@ function M.append_reasoning_delta(state, delta)
   local new_entries = replace_entry(state.entries, idx, new_entry)
   log.log("transcript", "reasoning_delta in_flight=%d new_v=%d",
     idx, new_entry.v)
-  return shallow_merge(state, { entries = new_entries })
+  return shallow_merge(state, { entries = new_entries, pending = false })
 end
 
 function M.finalize_reasoning(state, duration_ms)
@@ -80,10 +81,11 @@ function M.finalize_reasoning(state, duration_ms)
 end
 
 function M.finalize_assistant(state, final_text, model, duration_ms)
-  -- Finalizes the streaming assistant entry only.  Lifecycle fields
-  -- (pending, turn_started_at, last_turn_duration_ms) are owned by
-  -- `chat.turn.idle` so that the TUI's busy-state tracks the
-  -- orchestrator run, not the visible stream.
+  local now = tui.now_ms()
+  local turn_dur = duration_ms
+    or (state.turn_started_at and (now - state.turn_started_at))
+    or nil
+
   if state.in_flight == nil then
     if final_text and #final_text > 0 then
       local new_entry = Entry.assistant_stream()
@@ -94,10 +96,17 @@ function M.finalize_assistant(state, final_text, model, duration_ms)
       log.log("transcript", "finalize_assistant no_inflight new_v=%d count=%d",
         new_entry.v, #new_entries)
       return shallow_merge(state, {
-        entries = new_entries,
+        entries              = new_entries,
+        pending              = false,
+        turn_started_at      = NIL_SENTINEL,
+        last_turn_duration_ms = turn_dur,
       })
     end
-    return state
+    return shallow_merge(state, {
+      pending              = false,
+      turn_started_at      = NIL_SENTINEL,
+      last_turn_duration_ms = turn_dur,
+    })
   end
 
   local e = state.entries[state.in_flight]
@@ -109,13 +118,19 @@ function M.finalize_assistant(state, final_text, model, duration_ms)
     log.log("transcript", "finalize_assistant in_flight=%d new_v=%d",
       state.in_flight, new_entry.v)
     return shallow_merge(state, {
-      entries   = new_entries,
-      in_flight = NIL_SENTINEL,
+      entries              = new_entries,
+      in_flight            = NIL_SENTINEL,
+      pending              = false,
+      turn_started_at      = NIL_SENTINEL,
+      last_turn_duration_ms = turn_dur,
     })
   end
 
   return shallow_merge(state, {
-    in_flight = NIL_SENTINEL,
+    in_flight            = NIL_SENTINEL,
+    pending              = false,
+    turn_started_at      = NIL_SENTINEL,
+    last_turn_duration_ms = turn_dur,
   })
 end
 

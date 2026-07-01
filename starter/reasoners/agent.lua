@@ -72,7 +72,7 @@
 --        (note: the binary filters its outgoing tool-advertisement set,
 --        but we still enforce per-call in-reasoner — see step 4)
 --     3. emit <prov>.chat.append { role="user", content=prompt+inputs }
---        Upstream dispatch-graph dependencies arrive on the outer
+--        Upstream mag dependencies arrive on the outer
 --        envelope as `body.inputs[<dep_id>] = { output = ... }`. Each
 --        dep's terminal output is rendered as a `[<dep_id>]\n<text>`
 --        section appended after the prompt — single user message,
@@ -104,7 +104,6 @@
 local json = nefor.json
 
 local envelope      = require("core.envelope")
-local event         = require("core.event")
 local replay_window = require("core.history_replay")
 
 local emit_as = envelope.emit_as
@@ -252,21 +251,6 @@ local function build_allowlist_set(list)
   return s
 end
 
-local function value_type_name(v)
-  if v == nil then return "nil" end
-  local t = type(v)
-  if t ~= "table" then return t end
-  if v[1] ~= nil then return "array" end
-  return "object"
-end
-
-local function raw_preview(v)
-  if type(v) == "string" then return v end
-  local ok, encoded = pcall(json.encode, v)
-  if ok and type(encoded) == "string" then return encoded end
-  return tostring(v)
-end
-
 local function clear_firing(firing_id)
   local entry = agents[firing_id]
   if entry == nil then return end
@@ -395,8 +379,6 @@ local function handle(body)
     chat_id        = chat_id,
     provider       = provider,
     tool_allowlist = build_allowlist_set(args.tool_allowlist),
-    cwd            = type(args.cwd) == "string" and args.cwd or nil,
-    read_only      = args.read_only == true,
     pending_tools  = {},
     pending_order  = {},
     pending_count  = 0,
@@ -498,8 +480,7 @@ local function dispatch_tool_call(entry, call)
   if type(call) ~= "table" then return false end
   local name = call.name or call.tool
   if type(name) ~= "string" or #name == 0 then return false end
-  local raw_args = call.arguments or call.args
-  local call_args = raw_args or {}
+  local call_args = call.arguments or call.args or {}
   local model_call_id = call.id
 
   local tool_id = next_id("tool")
@@ -524,32 +505,11 @@ local function dispatch_tool_call(entry, call)
     return true
   end
 
-  if type(call_args) ~= "table" then
-    local pt = entry.pending_tools[tool_id]
-    pt.received = true
-    pt.error = "Tool '" .. name .. "' arguments must be a JSON object; got " ..
-      value_type_name(call_args) .. ". Raw arguments: " .. raw_preview(call_args)
-    entry.pending_count = entry.pending_count - 1
-    return true
-  end
-
-  if entry.cwd and type(call_args) == "table" and call_args.cwd == nil then
-    if name == "bash"
-        or name == "write_file"
-        or name == "edit_file"
-        or name == "read_file" then
-      call_args = call_args
-      call_args.cwd = entry.cwd
-    end
-  end
-
   emit("tool-gate", {
-    kind      = "tool-gate.tool.invoke",
-    id        = tool_id,
-    name      = name,
-    args      = call_args,
-    chat_id   = entry.chat_id,
-    read_only = entry.read_only or nil,
+    kind = "tool-gate.tool.invoke",
+    id   = tool_id,
+    name = name,
+    args = call_args,
   })
 
   -- Paired observer envelope so the chat surface can show "agent in
@@ -661,14 +621,6 @@ local function on_chat_complete_result(body)
   end
 
   if not has_calls then
-    if out.finish_reason == "error" then
-      local msg = out.error or out.message or out.text
-      if type(msg) ~= "string" or #msg == 0 then
-        msg = "provider returned finish_reason=error"
-      end
-      send_terminal_err(firing_id, msg)
-      return
-    end
     -- Terminal: text-only reply ends the agent loop.
     send_terminal_ok(firing_id, out.text)
     return
@@ -835,16 +787,16 @@ local function receive_msg(entry)
   -- reasoners/init.lua and agentic-loop/init.lua).
   if entry.origin == "step" and entry.target ~= nil then return end
 
-  local evt = event.decode(entry)
-  if evt == nil then return end
+  local ok, decoded = pcall(json.decode, entry.payload)
+  if not ok then return end
 
   -- Skip during replay — the agent reasoner's per-firing state lives
   -- in module-level tables that don't survive a process restart, so
   -- replayed envelopes have nothing to advance.
   if replay_window.active() then return end
 
-  local body = evt.body
-  local kind = evt.kind
+  local body = decoded.body
+  local kind = body.kind
 
   -- graph.cancel handler — sub-graph cancel propagation. The
   -- lead-workflow actor broadcasts `graph.cancel { run_id }` on
@@ -875,19 +827,15 @@ local function receive_msg(entry)
   if kind == "chat.message.append" and body.role == "system" then
     local text = body.text or body.content
     if type(text) ~= "string" or #text == 0 then return end
-    -- Scope to the matching agent when chat_id is present; fall back
-    -- to fan-out for legacy envelopes without chat_id.
-    local target_chat = body.chat_id
-    if type(target_chat) == "string" and #target_chat > 0 then
-      local fid = chat_to_firing[target_chat]
-      local fentry = fid and agents[fid]
-      if fentry then
-        emit_chat_append(fentry, { role = "user", content = tostring(text) })
-      end
-    else
-      for _, fentry in pairs(agents) do
-        emit_chat_append(fentry, { role = "user", content = tostring(text) })
-      end
+    -- Fold into every active firing. v0.1: no chat_id correlation on
+    -- the source envelope, so we fan out — this matches the
+    -- per-chat-deduped semantics tool-gate enforces (a single
+    -- AGENTS.md emission triggers one fold per agent, all targeting
+    -- their own provider chat). If finer correlation is ever needed,
+    -- threading a chat_id through tool-gate's smart loader is the
+    -- natural extension.
+    for _, fentry in pairs(agents) do
+      emit_chat_append(fentry, { role = "system", content = text })
     end
     return
   end

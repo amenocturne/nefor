@@ -106,10 +106,11 @@ function M.format_deferred(completion)
   if completion.status == "success" then
     return "[spawn_graph(run_id=" .. tostring(run_id) .. ") result]\n" ..
            "The sub-graph you submitted earlier has finished. " ..
-           "Give a short summary (2-3 sentences) of what was found and " ..
-           "reference the output file path if one was written. " ..
-           "Do NOT restate or reproduce the graph output — the user " ..
-           "can read the file directly. Do not re-spawn the graph.\n\n" ..
+           "If the output says a report file was written, read that " ..
+           "file before replying. Reply to the user only with the " ..
+           "filepath and a short summary; for full details, tell them " ..
+           "they can read the report themselves. Do not re-spawn the " ..
+           "graph or reproduce the full report.\n\n" ..
            "--- output ---\n" ..
            tostring(completion.output or "")
   else

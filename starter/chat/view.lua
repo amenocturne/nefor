@@ -77,18 +77,6 @@ end
 -- render, and the engine renders only on state changes / animation
 -- ticks. Without this, the DAG sidebar's "Ns" stalls between events.
 -- Mount only when something needs to refresh.
-local function pending_followups_widget(state)
-  local text = state.pending_followups or ""
-  if #text == 0 then return nil end
-  return tui.column {
-    gap = 0,
-    children = {
-      tui.text { content = "queued follow-up", style = STYLE.status_dim, wrap = "none" },
-      tui.text { content = text, style = STYLE.system, wrap = "word" },
-    },
-  }
-end
-
 local KEEPALIVE_FRAMES = { "", "" }
 
 local function render_keepalive(state)
@@ -173,7 +161,6 @@ function M.render(state)
     children = compact {
       blank_row(),
       tui.expanded { child = transcript(state) },
-      pending_followups_widget(state),
       input_field,
       statusline.view(state),
       blank_row(),

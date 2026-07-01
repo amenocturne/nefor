@@ -21,11 +21,16 @@ local height_cache = require("chat.height_cache")
 local shallow_merge = common.shallow_merge
 local NIL_SENTINEL  = common.NIL_SENTINEL
 local format_args   = common.format_args
-local join_nonempty = common.join_nonempty
 
 local M = {}
 
 local DOUBLE_ESC_MS = 600
+
+local function active_config()
+  local ok, cfg = pcall(function() return require("config").active end)
+  if ok and type(cfg) == "table" then return cfg end
+  return {}
+end
 
 local function pop_next_popup(state_tbl)
   local queue = state_tbl.popup_queue
@@ -169,7 +174,6 @@ local function handle_input_submit(msg, state)
     local cleared = shallow_merge(state, {
       entries = {}, in_flight = NIL_SENTINEL, input_value = "",
       pending = false, completion = NIL_SENTINEL,
-      pending_followups = "",
       dag_runs = {}, firing_to_node = {},
       turn_started_at = NIL_SENTINEL,
       last_turn_duration_ms = NIL_SENTINEL,
@@ -294,6 +298,78 @@ local function handle_input_submit(msg, state)
       },
     }), effects
   end
+  if cmd == "mode" then
+    local mode_arg = (args or ""):lower()
+    if mode_arg == "" then
+      local result = W.prompt.handle(prompt_widget_opts(state), {
+        kind = "input.changed",
+        value = "/mode ",
+      })
+      if result and result.state then
+        return fold_prompt_patch(state, result.state), {}
+      end
+      return shallow_merge(state, {
+        input_value = "/mode ",
+        completion = NIL_SENTINEL,
+        popup = NIL_SENTINEL,
+      }), {}
+    end
+    if mode_arg == "default" or mode_arg == "normal" then
+      local cfg = active_config()
+      local provider = cfg.default_provider or state.provider
+      local model = cfg.default_model or state.model
+      local toasts = {}
+      for _, t in ipairs(state.toasts or {}) do toasts[#toasts + 1] = t end
+      toasts[#toasts + 1] = {
+        id = "mode-default-" .. tostring(tui.now_ms()),
+        text = "new default session: " .. tostring(provider or "?") .. "/" .. tostring(model or "?"),
+        level = "info",
+        started_at_ms = tui.now_ms(),
+        ttl_ms = 3000,
+      }
+      local cleared = shallow_merge(state, {
+        entries = {}, in_flight = NIL_SENTINEL, input_value = "",
+        pending = false, completion = NIL_SENTINEL,
+        dag_runs = {}, firing_to_node = {},
+        turn_started_at = NIL_SENTINEL,
+        last_turn_duration_ms = NIL_SENTINEL,
+        last_esc_ms = NIL_SENTINEL,
+        history_cursor = NIL_SENTINEL,
+        popup = NIL_SENTINEL,
+        queued_entry_idx = NIL_SENTINEL,
+        mode = "default",
+        provider = provider,
+        model = model,
+        toasts = toasts,
+      })
+      local effects = {
+        { kind = "send_to", target = "engine",
+          body = { kind = "chat.interrupt_all" } },
+        { kind = "send_to", target = "engine",
+          body = { kind = "sessions.new_request" } },
+      }
+      if type(provider) == "string" and provider ~= ""
+          and type(model) == "string" and model ~= "" then
+        effects[#effects + 1] = {
+          kind = "send_to", target = "engine",
+          body = {
+            kind = "chat.model.set",
+            provider = provider,
+            model = model,
+          },
+        }
+      end
+      return cleared, effects
+    end
+    return shallow_merge(state, {
+      input_value = "", completion = NIL_SENTINEL,
+      popup = {
+        variant = "warning",
+        title = "/mode",
+        body = "Usage: /mode default",
+      },
+    }), {}
+  end
   if cmd == "think" or cmd == "effort" then
     if args == nil or #args == 0 then
       return shallow_merge(state, {
@@ -339,7 +415,6 @@ local function handle_input_submit(msg, state)
         input_value = "", completion = NIL_SENTINEL,
         entries = {}, in_flight = NIL_SENTINEL,
         pending = false, dag_runs = {}, firing_to_node = {},
-        pending_followups = "",
         turn_started_at = NIL_SENTINEL,
         last_turn_duration_ms = NIL_SENTINEL,
         queued_entry_idx = NIL_SENTINEL,
@@ -388,25 +463,46 @@ local function handle_input_submit(msg, state)
   end
   history.persist(hist)
 
-  -- While the lead is busy, queued input belongs to the composer, not
-  -- the transcript. It is submitted as one combined turn when the
-  -- current lead turn finishes.
+  -- When a turn is already in flight, coalesce into a single queued
+  -- entry instead of pushing a new user bubble per message.
   if state.pending or state.in_flight ~= nil then
-    local pending_followups = join_nonempty({ state.pending_followups, wire_text }, "\n")
-    return shallow_merge(state, {
-      input_value = "", completion = NIL_SENTINEL,
-      prompt_history = hist, history_cursor = NIL_SENTINEL,
-      pending_followups = pending_followups,
-    }), {}
+    local next_state
+    if state.queued_entry_idx then
+      local old = state.entries[state.queued_entry_idx]
+      local combined = Entry.set_text(old, old.text .. "\n" .. wire_text)
+      local new_entries = {}
+      for ei = 1, #state.entries do
+        new_entries[ei] = (ei == state.queued_entry_idx) and combined or state.entries[ei]
+      end
+      next_state = shallow_merge(state, {
+        entries = new_entries,
+        input_value = "", completion = NIL_SENTINEL,
+        prompt_history = hist, history_cursor = NIL_SENTINEL,
+      })
+    else
+      local with_user = transcript.push_entry(state, Entry.user(wire_text))
+      next_state = shallow_merge(with_user, {
+        input_value = "", completion = NIL_SENTINEL,
+        prompt_history = hist, history_cursor = NIL_SENTINEL,
+        queued_entry_idx = #with_user.entries,
+      })
+    end
+    tui.scroll_into_view("transcript")
+    return next_state, {
+      { kind = "send_to", target = "engine",
+        body = { kind = "chat.input.submit", text = wire_text } },
+    }
   end
 
-  local cleared = shallow_merge(state, {
+  local with_user = transcript.push_entry(state, Entry.user(wire_text))
+  local cleared = shallow_merge(with_user, {
     input_value = "", pending = true,
     turn_started_at = tui.now_ms(), completion = NIL_SENTINEL,
     prompt_history = hist,
     history_cursor = NIL_SENTINEL,
     pending_user_echo = wire_text,
   })
+  tui.scroll_into_view("transcript")
   return cleared, {
     { kind = "send_to", target = "engine",
       body = { kind = "chat.input.submit", text = wire_text } },
@@ -473,40 +569,19 @@ local function handle_escape(_msg, state)
       history_cursor = NIL_SENTINEL,
     }), {}
   end
-  -- 4) double-ESC escalation. If actively streaming (in_flight),
-  -- interrupt the stream. Otherwise escalate to full cancel.
+  -- 4) double-ESC escalation
   local now = tui.now_ms()
   if state.last_esc_ms and (now - state.last_esc_ms) <= DOUBLE_ESC_MS then
-    local patch = {
-      last_esc_ms = NIL_SENTINEL,
-      input_value = join_nonempty({ state.pending_followups, state.input_value }, "\n"),
-      pending_followups = "",
+    local interrupted = dag.interrupt_all(state, now)
+    return shallow_merge(interrupted, { last_esc_ms = NIL_SENTINEL }), {
+      { kind = "send_to", target = "engine",
+        body = { kind = "chat.interrupt_all" } },
     }
-    if state.in_flight ~= nil then
-      return shallow_merge(state, patch), {
-        { kind = "send_to", target = "engine",
-          body = { kind = "chat.interrupt" } },
-      }
-    end
-    if state.pending or dag.any_active(state.dag_runs, now) then
-      local interrupted = dag.interrupt_all(state, now)
-      return shallow_merge(interrupted or state, patch), {
-        { kind = "send_to", target = "engine",
-          body = { kind = "chat.interrupt_all" } },
-      }
-    end
-    return shallow_merge(state, patch), {}
   end
-  -- 5) single ESC interrupts the current lead turn only. Queued
-  -- follow-ups move back into the prompt so the user can edit/resubmit
-  -- them; active graphs are left running.
+  -- 4) single ESC interrupts the current turn
   if state.pending or state.in_flight ~= nil then
-    local prompt = join_nonempty({ state.pending_followups, state.input_value }, "\n")
-    return shallow_merge(state, {
-      last_esc_ms = now,
-      input_value = prompt,
-      pending_followups = "",
-    }), {
+    local interrupted = dag.interrupt_all(state, now)
+    return shallow_merge(interrupted, { last_esc_ms = now }), {
       { kind = "send_to", target = "engine",
         body = { kind = "chat.interrupt" } },
     }
@@ -521,7 +596,6 @@ local function handle_session_end(_msg, state)
   return shallow_merge(state, {
     in_flight        = NIL_SENTINEL,
     pending          = false,
-    pending_followups = "",
     turn_started_at  = NIL_SENTINEL,
     last_turn_duration_ms = NIL_SENTINEL,
     popup            = NIL_SENTINEL,
@@ -544,7 +618,7 @@ local function handle_replay_end(_msg, state)
 end
 
 local function handle_chat_reset(_msg, state)
-  return shallow_merge(state, { pending_followups = "" }), {}
+  return state, {}
 end
 
 -- ── inbound chat-contract events ──────────────────────────────────────
@@ -570,7 +644,9 @@ local function handle_message_append(msg, state)
       Entry.user(text)
     ), {}
   end
-  local turn_state = {}
+  local turn_state = role == "system"
+    and { pending = false, turn_started_at = NIL_SENTINEL }
+    or  {}
 
   -- Instruction-file reminder routing.
   if role == "system" then
@@ -624,11 +700,6 @@ local function handle_message_append(msg, state)
       Entry.system(text)
     ), {}
   end
-  if role == "assistant" then
-    return transcript.push_entry(shallow_merge(state, turn_state),
-      Entry.assistant(text)
-    ), {}
-  end
   return transcript.push_entry(shallow_merge(state, turn_state), {
     role = role, text = text, kind = "text",
   }), {}
@@ -641,35 +712,15 @@ local function handle_stream_delta(msg, state)
 end
 
 local function handle_stream_end(msg, state)
-  local next = transcript.finalize_assistant(state, msg.text, msg.model, msg.duration_ms)
-  return next, {
-    { kind = "send_to", target = "engine",
-      body = { kind = "chat.turn.idle.check" } },
-  }
-end
-
-local function handle_turn_idle(_msg, state)
-  local now = tui.now_ms()
-  local turn_dur = state.turn_started_at and (now - state.turn_started_at) or nil
-  local next_state = shallow_merge(state, {
-    pending              = false,
-    in_flight            = NIL_SENTINEL,
-    turn_started_at      = NIL_SENTINEL,
-    last_turn_duration_ms = turn_dur or state.last_turn_duration_ms,
-  })
-  local followup = state.pending_followups or ""
-  if #followup == 0 then
-    return next_state, {}
+  local next_state = transcript.finalize_assistant(state, msg.text, msg.model, msg.duration_ms)
+  if state.queued_entry_idx then
+    local qe = next_state.entries[state.queued_entry_idx]
+    next_state = shallow_merge(next_state, {
+      queued_entry_idx = NIL_SENTINEL,
+      pending_user_echo = qe and qe.text or NIL_SENTINEL,
+    })
   end
-  return shallow_merge(next_state, {
-    pending = true,
-    turn_started_at = now,
-    pending_followups = "",
-    pending_user_echo = followup,
-  }), {
-    { kind = "send_to", target = "engine",
-      body = { kind = "chat.input.submit", text = followup } },
-  }
+  return next_state, {}
 end
 
 local function handle_reasoning_delta(msg, state)
@@ -805,7 +856,6 @@ local function handle_plan_approved(msg, state)
 end
 
 local function handle_popup(msg, state)
-  if state.replay_mode then return state, {} end
   local v = msg.level or "info"
   return shallow_merge(state, {
     popup = {
@@ -818,7 +868,6 @@ local function handle_popup(msg, state)
 end
 
 local function handle_toast(msg, state)
-  if state.replay_mode then return state, {} end
   local now = tui.now_ms()
   local ttl = msg.ttl_ms or 2000
   local toasts = {}
@@ -835,6 +884,9 @@ end
 
 local function handle_model_set_ack(msg, state)
   if state.replay_mode then return state, {} end
+  if type(msg.provider) == "string" and msg.provider ~= state.provider then
+    return state, {}
+  end
   local provider = msg.provider or state.provider
   local effort = msg.reasoning_effort or state.reasoning_effort
   local k = model_key(provider, msg.model)
@@ -1009,7 +1061,7 @@ end
 local function handle_graph_run_started(msg, state)
   if state.replay_mode then return state, {} end
   local now = tui.now_ms()
-  return dag.run_started(state, msg.run_id or "", msg.total_nodes or 0, now, msg.name), {}
+  return dag.run_started(state, msg.run_id or "", msg.total_nodes or 0, now), {}
 end
 
 local function handle_graph_node_fired(msg, state)
@@ -1075,7 +1127,6 @@ local function handle_tool_result(msg, state)
 end
 
 local function handle_mouse_selection(msg, state)
-  if state.replay_mode then return state, {} end
   local text = msg.text or ""
   if #text > 0 then
     local now = tui.now_ms()
@@ -1114,7 +1165,6 @@ local handlers = {
   ["chat.message.append"]         = handle_message_append,
   ["chat.stream.delta"]           = handle_stream_delta,
   ["chat.stream.end"]             = handle_stream_end,
-  ["chat.turn.idle"]               = handle_turn_idle,
   ["chat.stream.reasoning_delta"] = handle_reasoning_delta,
   ["chat.stream.reasoning_end"]   = handle_reasoning_end,
   ["chat.session.stats"]          = handle_session_stats,
@@ -1254,7 +1304,6 @@ local function route_keys_and_popups(msg, state)
           popup = NIL_SENTINEL,
           entries = {}, in_flight = NIL_SENTINEL,
           pending = false, dag_runs = {}, firing_to_node = {},
-          pending_followups = "",
           turn_started_at = NIL_SENTINEL,
           last_turn_duration_ms = NIL_SENTINEL,
           queued_entry_idx = NIL_SENTINEL,
@@ -1322,7 +1371,6 @@ end
 -- ── main entry point ──────────────────────────────────────────────────
 
 function M.update(msg, state)
-  state = common.normalize_chat_state(state)
   state = prune_expired(state)
   local kind = msg.kind or ""
   log.log("update", "dispatch kind=%s", kind)

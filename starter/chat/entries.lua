@@ -18,18 +18,6 @@ local bordered_box = common.bordered_box
 
 local M = {}
 
-local function truncate_salient(s, max)
-  if not s or #s <= max then return s end
-  local is_path = s:find("/", 1, true)
-  if is_path then
-    local tail = s:sub(-(max - 1))
-    local slash = tail:find("/", 1, true)
-    if slash then tail = tail:sub(slash) end
-    return "…" .. tail
-  end
-  return s:sub(1, max - 3) .. "..."
-end
-
 -- User entry: full-width bordered block in user blue. Body stays in
 -- default fg.
 local function render_user_entry(entry, queued)
@@ -129,7 +117,9 @@ local function tool_collapsed(entry)
   local salient = tool_salient(entry)
   local header = glyph .. (entry.name or "?")
   if salient then
-    header = header .. "(" .. truncate_salient(salient, 80) .. ")"
+    local trimmed = salient
+    if #trimmed > 80 then trimmed = trimmed:sub(1, 77) .. "..." end
+    header = header .. "(" .. trimmed .. ")"
   end
   if entry.output == nil and not entry.error then
     header = header .. " …"  -- running indicator
@@ -147,7 +137,9 @@ local function tool_expanded(entry)
   local salient = tool_salient(entry)
   local header = glyph .. (entry.name or "?")
   if salient then
-    header = header .. "(" .. truncate_salient(salient, 80) .. ")"
+    local trimmed = salient
+    if #trimmed > 80 then trimmed = trimmed:sub(1, 77) .. "..." end
+    header = header .. "(" .. trimmed .. ")"
   end
   local rows = { tui.text { content = header, style = header_style, wrap = "none" } }
   rows[#rows + 1] = tui.text { content = "  input:",  style = STYLE.footer, wrap = "none" }
@@ -429,6 +421,14 @@ local function compaction_collapsed(entry)
 end
 
 local function compaction_expanded(entry)
+  local artifact = entry.model_context_artifact
+  if type(artifact) == "table" then
+    local slim = {}
+    for k, v in pairs(artifact) do
+      if k ~= "items" then slim[k] = v end
+    end
+    artifact = slim
+  end
   local rows = {
     tui.text {
       content = compaction_label(entry, "▼ "),
@@ -442,14 +442,6 @@ local function compaction_expanded(entry)
       style   = STYLE.footer,
       wrap    = "word",
     }
-  end
-  local artifact = entry.model_context_artifact
-  if type(artifact) == "table" then
-    local slim = {}
-    for k, v in pairs(artifact) do
-      if k ~= "items" then slim[k] = v end
-    end
-    artifact = slim
   end
   local details = {
     strategy = entry.strategy,

@@ -385,7 +385,7 @@ fn absolute_path_submit_is_plain_chat_not_slash_command() {
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
-    let path = "/Users/skril/.local/share/nefor/clipboard-images/paste.png";
+    let path = "/home/example/.local/share/nefor/clipboard-images/paste.png";
     submit_text(&mut engine, path);
 
     let emits = engine.take_emit_queue();
@@ -400,8 +400,8 @@ fn absolute_path_submit_is_plain_chat_not_slash_command() {
 
     let out = render_str(&mut engine);
     assert!(
-        out.contains("/Users/skril/.local/share/nefor/clipboard-im")
-            && out.contains("ages/paste.png"),
+        out.contains("/home/example/.local/share/nefor/clipboard-i")
+            && out.contains("mages/paste.png"),
         "absolute-path user echo missing: {out:?}"
     );
 }
@@ -702,17 +702,17 @@ fn graph_node_tool_invoke_uses_path_tail_label() {
             "run_id": "run-path-tail",
             "node_id": "inspect",
             "tool_name": "read_file",
-            "tool_args": { "path": "/Users/skril/Vault/Projects/personal/nefor/starter/chat/dag.lua" },
+            "tool_args": { "path": "/home/example/projects/public-nefor-checkout/starter/chat/dag.lua" },
         }),
     );
 
     let out = render_str(&mut engine);
     assert!(
-        out.contains("read_file(.../starter/chat/dag.lua)"),
+        out.contains("read_file(.../starter/chat/dag"),
         "path tool label should keep the meaningful file tail: {out:?}"
     );
     assert!(
-        !out.contains("read_file(/Users/skril"),
+        !out.contains("read_file(/home/example"),
         "path tool label should not expose the absolute path head: {out:?}"
     );
 }

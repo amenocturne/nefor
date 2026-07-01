@@ -43,9 +43,7 @@
 -- `NEFOR_DATA_DIR` env var > `XDG_DATA_HOME/nefor`).
 -- Path: `<root>/sessions/<id>.jsonl`. Parent dir is created on init.
 
-local json           = nefor.json
-local event          = require("core.event")
-local history_replay = require("core.history_replay")
+local json = nefor.json
 
 local state = {
   ---@type string|nil
@@ -131,14 +129,12 @@ local function open_session_file(path, session_id)
   if not fh then return nil, tostring(err) end
 
   if not has_content then
-    local header = {
+    local header_line = json.encode({
       _session   = true,
       session_id = session_id,
       started_at = nefor.engine.now(),
-    }
-    local cwd = nefor.fs.getcwd()
-    if cwd then header.cwd = cwd end
-    fh:write(json.encode(header))
+    })
+    fh:write(header_line)
     fh:write("\n")
     fh:flush()
   end
@@ -259,21 +255,6 @@ end
 -- the whole file: one extra read of the JSONL with a substring check
 -- before per-line decode (decode is unavoidable to filter step-origin).
 ---@param path string
----@return table|nil header
-local function read_session_header(path)
-  local fh = io.open(path, "r")
-  if not fh then return nil end
-  local first = fh:read("*l")
-  fh:close()
-  if not first or first == "" then return nil end
-  local ok, decoded = pcall(json.decode, first)
-  if ok and type(decoded) == "table" and decoded._session then
-    return decoded
-  end
-  return nil
-end
-
----@param path string
 ---@return integer count
 local function count_replay_entries(path)
   local fh = io.open(path, "r")
@@ -282,7 +263,7 @@ local function count_replay_entries(path)
   for line in fh:lines() do
     if line:sub(1, 12) ~= [[{"_session":]] then
       local ok, decoded = pcall(json.decode, line)
-      if ok and type(decoded) == "table" and decoded.origin == "step" then
+      if ok and decoded.origin == "step" then
         count = count + 1
       end
     end
@@ -309,7 +290,7 @@ local function replay_jsonl(path)
       -- target=nil broadcasts and a string targets one peer. Plugin-
       -- origin entries are inputs — we don't re-emit them, peers re-
       -- announce themselves on connect.
-      if ok and type(decoded) == "table" and decoded.origin == "step" then
+      if ok and decoded.origin == "step" then
         send_msg({
           kind    = "replay_envelope",
           payload = decoded.payload,
@@ -360,26 +341,6 @@ local function do_resume(target_session_id)
     state.should_prune_session = not had_content
   end
 
-  -- 2b. Restore the session's working directory. chdir before replay
-  -- so any tool calls replayed into live plugins run in the original
-  -- cwd. Falls back silently when the path no longer exists — the
-  -- engine stays in whatever cwd it already has.
-  if new_path then
-    local header = read_session_header(new_path)
-    if header and type(header.cwd) == "string" and header.cwd ~= "" then
-      local result = nefor.fs.chdir(header.cwd)
-      if result.ok then
-        if nefor.log then
-          nefor.log.info("sessions.resume: chdir", { cwd = header.cwd })
-        end
-      elseif nefor.log then
-        nefor.log.warn("sessions.resume: chdir failed, staying in current dir", {
-          target = header.cwd, error = result.error,
-        })
-      end
-    end
-  end
-
   -- 3. Announce start of incoming session BEFORE replay.
   send_msg({ kind = "control", event = "sessions.session_start",
              extra = { session_id = target_session_id, from_resume = true } })
@@ -394,34 +355,11 @@ local function do_resume(target_session_id)
   -- inline before calling `to_plugin` for each entry — bus.on_event
   -- subscribers fire too late for the same batch).
   local total = new_path and count_replay_entries(new_path) or 0
-  local replayed = 0
-  local replay_started = false
-  local replay_ended = false
-  history_replay.set(true)
-  state.in_replay_window = true
-  local ok, err = pcall(function()
-    send_msg({ kind = "control", event = "sessions.replay.start",
-               extra = { session_id = target_session_id, count = total } })
-    replay_started = true
-    replayed = new_path and replay_jsonl(new_path) or 0
-    send_msg({ kind = "control", event = "sessions.replay.end",
-               extra = { session_id = target_session_id } })
-    replay_ended = true
-  end)
-  if replay_started and not replay_ended then
-    pcall(function()
-      send_msg({ kind = "control", event = "sessions.replay.end",
-                 extra = { session_id = target_session_id } })
-    end)
-  end
-  history_replay.set(false)
-  state.in_replay_window = false
-  if not ok and nefor.log then
-    nefor.log.error("sessions.resume: replay failed", {
-      session_id = target_session_id,
-      error      = tostring(err),
-    })
-  end
+  send_msg({ kind = "control", event = "sessions.replay.start",
+             extra = { session_id = target_session_id, count = total } })
+  local replayed = new_path and replay_jsonl(new_path) or 0
+  send_msg({ kind = "control", event = "sessions.replay.end",
+             extra = { session_id = target_session_id } })
 
   -- 5. Coalesced "we're back" signal.
   send_msg({ kind = "control", event = "sessions.resume_done",
@@ -477,10 +415,12 @@ end
 -- receive_msg — runtime-driven inbound handler.
 ---@param entry { ts: string?, origin: string?, target: string?, payload: string }
 local function receive_msg(entry)
-  local evt = event.decode(entry)
-  if evt == nil then return end
-  local body = evt.body
-  local kind = evt.kind
+  local payload = entry.payload
+  if type(payload) ~= "string" or payload == "" then return end
+
+  local ok, decoded = pcall(json.decode, payload)
+  if not ok or type(decoded) ~= "table" or type(decoded.body) ~= "table" then return end
+  local kind = decoded.body.kind
 
   -- Lifecycle: synthesized engine shutdown.
   if kind == "engine.shutdown" then
@@ -490,7 +430,7 @@ local function receive_msg(entry)
 
   -- Resume to a specific session id.
   if kind == "sessions.resume_request" then
-    local target = body.session_id
+    local target = decoded.body.session_id
     if type(target) == "string" and target ~= "" then
       do_resume(target)
     end

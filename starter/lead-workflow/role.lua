@@ -1,22 +1,10 @@
 -- starter/lead-workflow/role.lua — lead-workflow role configs for the
 -- starter.
 --
--- Loads each `prompts/<role>.md` at module-load time and exposes:
+-- Loads `prompts/lead.md` at module-load time and exposes:
 --
 --   * LEAD_SYSTEM_PROMPT  — string, the lead orchestrator's prompt.
---   * AGENT_CONFIGS       — table keyed by role name; each entry has
---                           { system_prompt, model, tool_allowlist }.
 --   * ORCHESTRATION_TOOLS — list of tool names the lead has access to.
---
--- The team port (`nefor-team`) replaces this file with a richer
--- version that adds more roles, work-specific phrasing, and per-role
--- model pinning. The starter ships a deliberately small surface (lead
--- + explorer + builder + reviewer) so the public starter runs cleanly
--- against the mock and ollama providers without dragging in
--- team-specific tooling references.
---
--- `model = nil` on every role lets the agent reasoner fall back to
--- `state.config.model` (set via `agentic_loop.configure`).
 --
 -- Prompts are read from disk rather than embedded as Lua string
 -- literals because long strings inside Lua are painful (escaping, no
@@ -97,36 +85,24 @@ end
 
 M.LEAD_SYSTEM_PROMPT = load_or_placeholder("lead")
 
-M.AGENT_CONFIGS = {
-  explorer = {
-    system_prompt  = load_or_placeholder("explorer"),
-    model          = nil,
-    tool_allowlist = { "read_file", "read_image", "list_dir", "search_text", "python-read", "bash" },
-    read_only      = true,
-  },
-  builder = {
-    system_prompt  = load_or_placeholder("builder"),
-    model          = nil,
-    tool_allowlist = { "read_file", "read_image", "list_dir", "search_text", "python-read", "edit_file", "write_file", "bash" },
-    read_only      = false,
-  },
-  reviewer = {
-    system_prompt  = load_or_placeholder("reviewer"),
-    model          = nil,
-    tool_allowlist = { "read_file", "read_image", "list_dir", "search_text", "python-read" },
-    read_only      = true,
-  },
-}
-
--- Tools the lead orchestrator has access to. Broad writes and bash go
--- through builder nodes; the lead only gets narrow exact-replace edits
--- after the plan gate approves the current turn.
+-- Tools the lead orchestrator has access to. The lead gets read tools
+-- for quick lookups without spawning a graph node, plus unrestricted
+-- existing-file edits when it has enough context to act directly. New
+-- file creation, bash, and broad delegated writes still go through MAG
+-- agents and the plan gate.
 M.ORCHESTRATION_TOOLS = {
   "read_file",
   "read_image",
+  "list_dir",
+  "search_text",
+  "mirror-projects",
+  "instructions",
   "edit_file",
-  "dispatch-graph",
+  "graph-status",
+  "terminate-graph",
   "write-review",
+  "mag",
+  "mag-env",
 }
 
 return M

@@ -1,32 +1,22 @@
--- starter/init.lua — default engine composition.
+-- init.lua — starter composition.
 --
--- The starter is designed to be COPIED to ~/.config/nefor (`just
--- install` does this) without taking the rest of the repo with it.
--- That means relative paths into `../lua/` and `../plugins/` aren't
--- a usable source for nefor-pm: when the user runs from
--- ~/.config/nefor/, those paths resolve to ~/.config/lua/ etc., which
--- don't exist.
+-- Lua libraries are bootstrapped via sparse-clone of the upstream repo
+-- into ~/.local/share/nefor/nefor/ (same as end-user install).
 --
 -- Bootstrap order:
 --   1. NEFOR_DEV_DIR set     → in-checkout dev mode; resolve from there.
 --   2. NEFOR_LOCAL_DIR set   → local checkout override for installed configs.
---   3. STARTER_ROOT/../lua/nefor-pm exists → in-checkout (running via
+--   3. agentic-kit.json nefor_repo → per-install local checkout override.
+--   4. sibling checkout      → auto-detected from agentic-kit.json dev workspace.
+--   5. STARTER_ROOT/../lua/nefor-pm exists → in-checkout (running via
 --                                            `just run`); use ../lua etc.
---   4. otherwise             → sparse-clone amenocturne/nefor at the
+--   6. otherwise             → sparse-clone amenocturne/nefor at the
 --                              pinned ref into <DATA>/nefor/, use that.
---
--- Once the bootstrap picks NEFOR_ROOT, every pm.install entry resolves
--- its `dir` from that single root — no more "../" walks from the
--- starter location.
 
 local STARTER_ROOT = NEFOR_CONFIG_DIR or "."
 local NEFOR_DEV_DIR = os.getenv("NEFOR_DEV_DIR")
 local NEFOR_LOCAL_DIR = os.getenv("NEFOR_LOCAL_DIR")
 
--- Upstream ref derived from the engine's version. Exact release tags
--- (e.g. 0.1.9 → v0.1.9) pin Lua libs to the matching binary version;
--- nightly/dev builds fall back to "main". The clone path and every
--- pm.install entry below pick it up.
 local UPSTREAM_REF
 do
   local v = nefor and nefor.version
@@ -67,16 +57,44 @@ local function explicit_nefor_root(env_name, root)
         .. " does not contain lua/nefor-pm/init.lua")
 end
 
-local function bootstrap_fetch_ref()
-  if UPSTREAM_REF:match("^v%d+%.%d+%.%d+$") then
-    return "tag " .. sh_quote(UPSTREAM_REF)
+local function read_agentic_kit_path(key)
+  local fh = io.open(STARTER_ROOT .. "/agentic-kit.json", "r")
+  if not fh then return nil end
+  local raw = fh:read("*a")
+  fh:close()
+  local ok, decoded = pcall(nefor.json.decode, raw)
+  if ok and type(decoded) == "table" and type(decoded[key]) == "string" then
+    return decoded[key]
   end
-  return sh_quote(UPSTREAM_REF)
+  return raw:match('"' .. key .. '"%s*:%s*"([^"]+)"')
 end
 
-local function ensure_bootstrap_checkout(pm_root)
+local function read_agentic_kit_nefor_repo()
+  return read_agentic_kit_path("nefor_repo")
+end
+
+local function read_agentic_kit_dev_workspace()
+  return read_agentic_kit_path("dev_workspace")
+end
+
+local function detected_local_nefor_root()
+  local dev_workspace = read_agentic_kit_dev_workspace()
+  if dev_workspace then
+    local candidate = dev_workspace .. "/personal/nefor"
+    if valid_nefor_root(candidate) then return candidate end
+  end
+  local sibling = STARTER_ROOT .. "/../../../../nefor"
+  if valid_nefor_root(sibling) then return sibling end
+  return nil
+end
+
+local function ensure_upstream_checkout(pm_root)
   local root = sh_quote(pm_root)
   local ref = sh_quote(UPSTREAM_REF)
+  local fetch_ref = ref
+  if UPSTREAM_REF:match("^v%d+%.%d+%.%d+$") then
+    fetch_ref = "tag " .. ref
+  end
 
   if not path_exists(pm_root) then
     nefor.fs.mkdir_p(nefor.fs.data_root())
@@ -91,9 +109,10 @@ local function ensure_bootstrap_checkout(pm_root)
   elseif not path_exists(pm_root .. "/.git") then
     error("nefor bootstrap: " .. pm_root .. " exists but is not a git checkout")
   else
-    if not run("git -C " .. root .. " fetch --depth 1 origin " .. bootstrap_fetch_ref()) then
+    if not run("git -C " .. root .. " fetch --depth 1 origin " .. fetch_ref) then
       error("nefor bootstrap: git fetch failed for ref " .. UPSTREAM_REF)
     end
+    -- This tree is a managed cache; keep Lua assets matched to the binary version.
     if not run("git -C " .. root .. " checkout --force FETCH_HEAD") then
       error("nefor bootstrap: git checkout failed for ref " .. UPSTREAM_REF)
     end
@@ -104,19 +123,23 @@ local function ensure_bootstrap_checkout(pm_root)
   end
 end
 
--- Resolve NEFOR_ROOT — the directory whose `lua/` and `plugins/`
--- mirror the github repo layout.
 local NEFOR_ROOT
 local explicit_root = explicit_nefor_root("NEFOR_DEV_DIR", NEFOR_DEV_DIR)
                    or explicit_nefor_root("NEFOR_LOCAL_DIR", NEFOR_LOCAL_DIR)
+                   or explicit_nefor_root(
+                     "agentic-kit.json nefor_repo",
+                     read_agentic_kit_nefor_repo())
+local detected_root = detected_local_nefor_root()
 if explicit_root then
   NEFOR_ROOT = explicit_root
+elseif detected_root then
+  NEFOR_ROOT = detected_root
 elseif path_exists(STARTER_ROOT .. "/../lua/nefor-pm/init.lua") then
   NEFOR_ROOT = STARTER_ROOT .. "/.."
 else
   local data_dir = nefor.fs.data_root()
   local pm_root  = data_dir .. "/nefor"
-  ensure_bootstrap_checkout(pm_root)
+  ensure_upstream_checkout(pm_root)
   NEFOR_ROOT = pm_root
 end
 
@@ -132,8 +155,8 @@ package.path = table.concat({
 
 -- nefor-pm wires the core primitives, generic libs, and every plugin
 -- lib. Every entry's `dir` resolves from NEFOR_ROOT (whichever way
--- the bootstrap above picked it). `tag` matches UPSTREAM_REF so pm and
--- the bootstrap checkout use one source of truth.
+-- the bootstrap above picked it). `tag` matches UPSTREAM_REF so a
+-- future pm consistency check or refresh path uses one source of truth.
 local pm = require("nefor-pm")
 pm.install({
   {
@@ -209,18 +232,13 @@ function invoke_from_plugin(source, payload)
 end
 
 actor.install()
-
--- Combinator shim: with nefor-combinators removed, graphs using fanout
--- hang waiting for combinators.query/invoke replies. The shim responds
--- from Lua with shape-based routing until MAG replaces this at compile
--- time.
 require("core.combinator_shim").install()
-
 -- Defense-in-depth fallback for the synchronous `history_replay.set`
 -- path that sessions drives around its replay burst. Wired explicitly
 -- here so module load stays free of bus dependencies.
 history_replay.install()
 actor.spawn(sessions)
+actor.spawn(require("state-tracking"))
 
 local function parse_startup_args(argv)
   local opts = { session_id = nil, prompt = nil }
@@ -251,7 +269,8 @@ end
 local startup = parse_startup_args((nefor.runtime and nefor.runtime.argv) or {})
 sessions.init(startup.session_id)
 
--- Spawn order:
+-- Spawn order matters: type-tag registrations must complete before the
+-- scheduler queries on submit. Order:
 --   1. libs.generic-{provider,tool}.declare()
 --   2. agentic-loop + reasoners
 --   3. providers
@@ -265,15 +284,35 @@ require("libs.generic-tool").declare()
 -- The actor runtime queues incoming envelopes during boot, so spawning
 -- the orchestrator and its resident reasoners before the plugins they
 -- coordinate is safe even if a plugin's `ready` arrives early.
+-- Build runtime context: cwd, workspace index, agentic-kit paths.
+-- Appended to the lead system prompt so the agent knows where it's
+-- operating and what projects are available.
+local function build_runtime_context()
+  local parts = {}
+
+  local cwd = nefor and nefor.fs and nefor.fs.cwd and nefor.fs.cwd()
+  if not cwd then
+    local p = io.popen("pwd")
+    if p then cwd = p:read("*l"); p:close() end
+  end
+  if cwd then
+    parts[#parts + 1] = "## Working directory\n\n`" .. cwd .. "`"
+  end
+
+  if #parts == 0 then return "" end
+  return "\n\n---\n\n# Runtime Context\n\n" .. table.concat(parts, "\n\n")
+end
+
 local agentic_loop = require("agentic-loop")
 agentic_loop.configure {
-  provider = cfg.default_provider,
-  model    = cfg.default_model,
-  system   = lead_role.LEAD_SYSTEM_PROMPT,
+  provider         = cfg.default_provider,
+  model            = cfg.default_model,
+  reasoning_effort = cfg.lead_reasoning_effort,
+  system           = lead_role.LEAD_SYSTEM_PROMPT .. build_runtime_context(),
   -- Restrict the lead's chat catalog to the orchestration-tool surface.
   -- Without this filter the lead sees every wire-advertised tool — most
   -- problematically `spawn_graph` (the reasoner-graph internal that
-  -- `dispatch-graph` translates into) — and could call them directly,
+  -- `mag` translates into) — and could call them directly,
   -- bypassing the role-keyed sub-agent contract and bottoming out in
   -- `reasoner '<role>' not connected` runtime errors. The agent
   -- reasoner already enforces a per-role allowlist on its sub-firings
@@ -339,7 +378,21 @@ for _, p in ipairs(cfg.providers or {}) do
   end
 end
 
-actor.spawn(require("compositors.graph").spawn_spec({ require("config").bin("reasoner-graph") }))
+-- Pre-seed the reasoner-graph binary's peer set with every Lua-resident
+-- reasoner type. Without this, a spawn_graph referencing a reasoner that
+-- hasn't emitted a bus event yet fails with "reasoner not connected."
+local rg_argv = { require("config").bin("reasoner-graph") }
+do
+  local reasoners_mod = require("reasoners")
+  local known = reasoners_mod._internals and reasoners_mod._internals.handlers
+  if type(known) == "table" then
+    for name, _ in pairs(known) do
+      rg_argv[#rg_argv + 1] = "--peer"
+      rg_argv[#rg_argv + 1] = name
+    end
+  end
+end
+actor.spawn(require("compositors.graph").spawn_spec(rg_argv))
 
 local tools = require("compositors.tools")
 local tool_gate_argv = { require("config").bin("tool-gate") }
@@ -356,7 +409,7 @@ tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
 
 -- lead-workflow lives alongside agentic-loop, not inside it: separate
 -- bus subscriptions, separate state. Owns plan/approval state and the
--- active graph run id; advertises dispatch-graph / write-review /
+-- active graph run id; advertises mag / write-review /
 -- await-approval to tool-gate. Registered BEFORE tool-gate's spawn so
 -- its bus subscription is live when tool-gate.hello arrives —
 -- otherwise the advertise is missed and the lead model gets "no such
@@ -377,7 +430,7 @@ actor.spawn(require("read-only-tools"))
 -- running, gated invocations never reach the popup.
 actor.spawn(require("tool-validator"))
 
-actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv, { agentic_loop = agentic_loop }))
+actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
 actor.spawn(tools.basic_actor_spec())
 
 actor.spawn(require("compositors.chat_bridge").spawn_spec({

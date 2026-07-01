@@ -1,0 +1,10 @@
+;; Da policy definitions — per-node bash approval rules
+
+(def read-only-bash {:allow ["ls" "cat" "head" "tail" "grep" "find" "wc" "git log" "git diff" "git show"]
+                     :deny ["rm" "mv" "cp" "chmod" "chown" "sudo" "curl" "wget"]})
+
+(def build-bash {:allow ["just *" "cargo *" "npm *" "bun *" "uv *" "make *" "git *"]
+                 :deny ["rm -rf" "sudo" "curl" "wget"]})
+
+(def deploy-bash {:allow ["just deploy*" "docker *" "ansible *" "ssh *"]
+                  :deny ["rm -rf" "sudo rm"]})

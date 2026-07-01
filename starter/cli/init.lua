@@ -294,7 +294,7 @@ end
 -- their NCP layer ignores incoming traffic). We wait for the last
 -- plugin in the spawn chain (`basic-tools`) to fire `basic-tools.ready`
 -- via `nefor.bus.on_event`; that guarantees every upstream plugin
--- (provider, reasoner-graph, tool-gate) is also up. Only
+-- (combinators, provider, reasoner-graph, tool-gate) is also up. Only
 -- then do we submit / read_line.
 
 -- Sentinel kind whose arrival means "every plugin is up". Tied to the

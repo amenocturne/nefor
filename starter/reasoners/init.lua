@@ -38,7 +38,6 @@
 local json = nefor.json
 
 local envelope      = require("core.envelope")
-local event         = require("core.event")
 local ids           = require("core.ids")
 local replay_window = require("core.history_replay")
 
@@ -106,6 +105,36 @@ local function async_spawn_graph_ack_summary(run_ids)
          "\nResults will appear as they finish."
 end
 
+local function sh_quote(value)
+  return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
+end
+
+local function mkdir_parent(path)
+  local parent = tostring(path):match("^(.*)/[^/]+$")
+  if type(parent) ~= "string" or parent == "" then return true end
+  if nefor and nefor.fs and type(nefor.fs.mkdir_p) == "function" then
+    local ok = pcall(nefor.fs.mkdir_p, parent)
+    if ok then return true end
+  end
+  local ok = os.execute("mkdir -p " .. sh_quote(parent) .. " >/dev/null 2>&1")
+  return ok == true or ok == 0
+end
+
+local function output_text(output)
+  if type(output) == "string" then return output end
+  if type(output) == "table" then
+    if type(output.text) == "string" then return output.text end
+    if type(output.final_answer) == "table"
+        and type(output.final_answer.text) == "string" then
+      return output.final_answer.text
+    end
+    if output.structured ~= nil then return json.encode(output.structured) end
+    return json.encode(output)
+  end
+  if output == nil then return "" end
+  return tostring(output)
+end
+
 -- Handler for provider-wrapper / responder.
 --
 -- Owns invariants:
@@ -122,7 +151,7 @@ local function provider_run_node(reasoner_type, body)
   local node_id = body.node_id
   local firing_id = body.firing_id
   local args = body.args or {}
-  local inputs = type(body.inputs) == "table" and body.inputs or {}
+  local inputs = body.inputs or {}
   local prev_state = body.prev_state
 
   local cfg = agentic_loop.config()
@@ -171,7 +200,6 @@ local function provider_run_node(reasoner_type, body)
     if type(args) == "table" and type(args.system) == "string" and #args.system > 0 then
       create_body.system = args.system
     end
-    -- Sub-graph responder nodes must produce text, not tool calls.
     if reasoner_type == "responder" or reasoner_type == "llm" then
       create_body.tools = false
     elseif type(args) == "table" and type(args.tool_allowlist) == "table" then
@@ -250,10 +278,6 @@ local function provider_run_node(reasoner_type, body)
       role = "assistant",
       text = text,
     })
-    -- Flush queued sub-graph dispatches now. The normal path flushes on
-    -- the first visible stream.delta, but this shortcut skips the
-    -- provider call entirely — no stream events will arrive.
-    agentic_loop.flush_pending_dispatches()
     agentic_loop.take_pending_for_chat(chat_id)
     send_tool_result_ok(reasoner_type, firing_id, {
       text = text,
@@ -271,7 +295,7 @@ local function tool_executor_run_node(body)
   local run_id = body.run_id
   local node_id = body.node_id
   local firing_id = body.firing_id
-  local inputs = type(body.inputs) == "table" and body.inputs or {}
+  local inputs = body.inputs or {}
 
   local calls
   for _, dep_entry in pairs(inputs) do
@@ -325,7 +349,7 @@ end
 -- Handler for adapter (pure Lua; ToolResults → ProviderIn).
 local function adapter_run_node(body)
   local firing_id = body.firing_id
-  local inputs = type(body.inputs) == "table" and body.inputs or {}
+  local inputs = body.inputs or {}
 
   local results
   for _, dep_entry in pairs(inputs) do
@@ -362,12 +386,13 @@ local function adapter_run_node(body)
   return "_already_replied"
 end
 
--- Handler for terminal/sink — concat upstream outputs in sorted-id order.
--- When args.path is set, writes output to that file and returns a short
--- confirmation instead of the full text.
+-- Handler for terminal/sink. By default it passes upstream output
+-- through; when args.path is present, it writes the full output there
+-- and returns only a compact handoff for the lead.
 local function terminal_run_node(body)
   local firing_id = body.firing_id
-  local inputs = type(body.inputs) == "table" and body.inputs or {}
+  local args = body.args or {}
+  local inputs = body.inputs or {}
 
   local ordered_ids = {}
   for upstream_id, dep_entry in pairs(inputs) do
@@ -377,40 +402,49 @@ local function terminal_run_node(body)
   end
   table.sort(ordered_ids)
 
-  local content
+  local final
   if #ordered_ids == 0 then
-    content = ""
+    final = { text = "" }
   elseif #ordered_ids == 1 then
-    local out = inputs[ordered_ids[1]].output
-    content = (type(out) == "table" and out.text) or tostring(out)
+    final = inputs[ordered_ids[1]].output
   else
     local parts = {}
     for _, uid in ipairs(ordered_ids) do
       local out = inputs[uid].output
-      local txt = (type(out) == "table" and out.text) or ""
+      local txt = output_text(out)
       parts[#parts + 1] = "## " .. tostring(uid) .. "\n" .. tostring(txt)
     end
-    content = table.concat(parts, "\n\n")
+    final = { text = table.concat(parts, "\n\n") }
   end
 
-  local outer_args = type(body.args) == "table" and body.args or {}
-  local node_args = type(outer_args.args) == "table" and outer_args.args or outer_args
-  local path = type(node_args.path) == "string" and #node_args.path > 0 and node_args.path or nil
-
-  if path then
-    local f, err = io.open(path, "w")
-    if not f then
-      send_tool_result_ok("terminal", firing_id,
-        { text = "sink: failed to write " .. path .. ": " .. tostring(err) }, nil)
+  local path = type(args) == "table" and args.path or nil
+  if type(path) == "string" and #path > 0 then
+    local report = output_text(final)
+    if not mkdir_parent(path) then
+      send_tool_result_err("terminal", firing_id,
+        "terminal sink: failed to create parent directory for " .. path)
       return "_already_replied"
     end
-    f:write(content)
-    f:close()
-    send_tool_result_ok("terminal", firing_id,
-      { text = "Output written to " .. path .. " (" .. #content .. " chars)" }, nil)
-  else
-    send_tool_result_ok("terminal", firing_id, { text = content }, nil)
+    local fh, err = io.open(path, "w")
+    if not fh then
+      send_tool_result_err("terminal", firing_id,
+        "terminal sink: failed to open " .. path .. ": " .. tostring(err))
+      return "_already_replied"
+    end
+    fh:write(report)
+    fh:close()
+
+    final = {
+      text = "Graph output written to " .. path .. ". Read that file, " ..
+             "then respond to the user only with the filepath and a " ..
+             "short summary. For full details, the user can read the " ..
+             "report themselves.",
+      path = path,
+      report_path = path,
+    }
   end
+
+  send_tool_result_ok("terminal", firing_id, final, nil)
   return "_already_replied"
 end
 
@@ -429,21 +463,25 @@ end
 local run_reasoner          = require("reasoners.run")
 local run_wrappers_reasoner = require("reasoners.run-wrappers")
 local loop_counter_reasoner = require("reasoners.loop_counter")
-local accumulate_reasoner   = require("reasoners.accumulate")
-local retry_reasoner        = require("reasoners.retry")
+local accumulate_reasoner = require("reasoners.accumulate")
+local retry_reasoner = require("reasoners.retry")
 local bash_command_reasoner = require("reasoners.bash_command")
 
 local handlers = {
   ["provider-wrapper"] = function(body) return provider_run_node("provider-wrapper", body) end,
   ["responder"]        = function(body) return provider_run_node("responder", body) end,
-  ["llm"]              = function(body) return provider_run_node("llm", body) end,
   ["tool-executor"]    = tool_executor_run_node,
   ["adapter"]          = adapter_run_node,
   ["terminal"]         = terminal_run_node,
-  ["sink"]             = terminal_run_node,
   ["accumulate"]       = accumulate_reasoner.handle,
   ["retry"]            = retry_reasoner.handle,
   ["bash_command"]     = bash_command_reasoner.handle,
+  ["shell"]            = function(body)
+    body.reasoner = "shell"
+    return bash_command_reasoner.handle(body)
+  end,
+  ["llm"]              = function(body) return provider_run_node("llm", body) end,
+  ["sink"]             = terminal_run_node,
   -- agent reasoner (lead workflow keystone)
   ["agent"]            = agent_handle,
   ["run"]              = run_reasoner.handle,
@@ -483,7 +521,7 @@ end
 -- per-handler functions expect (firing_id at root alongside the args
 -- subobject keys).
 local function unwrap_invoke_body(invoke)
-  local args = type(invoke.args) == "table" and invoke.args or {}
+  local args = invoke.args or {}
   return {
     run_id     = args.run_id,
     node_id    = args.node_id,
@@ -510,10 +548,10 @@ local function receive_msg(entry)
     agentic_loop = require("agentic-loop")
   end
 
-  local evt = event.decode(entry)
-  if evt == nil then return end
-  local body = evt.body
-  local kind = evt.kind
+  local ok, decoded = pcall(json.decode, entry.payload)
+  if not ok then return end
+  local body = decoded.body
+  local kind = body.kind
 
   -- Skip during replay — graph already ran; re-dispatch would
   -- duplicate every side effect.
@@ -544,17 +582,11 @@ local function receive_msg(entry)
   if kind ~= "tool.invoke" then return end
   local name = body.name
   if type(name) ~= "string" then return end
-  if type(body.id) ~= "string" or body.id == "" then return end
   local handler = handlers[name]
   if handler == nil then return end
 
   local unwrapped = unwrap_invoke_body(body)
-  local ok, err = pcall(handler, unwrapped)
-  if not ok then
-    send_tool_result_err(name, unwrapped.firing_id,
-      name .. " reasoner raised: " .. tostring(err))
-    return
-  end
+  local err = handler(unwrapped)
   if err == "_already_replied" then return end
   if err ~= nil then
     send_tool_result_err(name, unwrapped.firing_id, err)

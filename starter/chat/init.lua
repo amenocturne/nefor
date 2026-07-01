@@ -74,9 +74,32 @@ do
     pm_root = home .. "/.local/share/nefor/nefor"
   end
 
+  local function detected_local_nefor_root()
+    if not config_dir then return nil end
+    local fh = io.open(config_dir .. "/agentic-kit.json", "r")
+    if fh then
+      local raw = fh:read("*a"); fh:close()
+      local nefor_repo = raw:match('"nefor_repo"%s*:%s*"([^"]+)"')
+      if nefor_repo and path_exists(nefor_repo .. "/lua/nefor-pm/init.lua") then
+        return nefor_repo
+      end
+      local dev_workspace = raw:match('"dev_workspace"%s*:%s*"([^"]+)"')
+      if dev_workspace then
+        local candidate = dev_workspace .. "/personal/nefor"
+        if path_exists(candidate .. "/lua/nefor-pm/init.lua") then return candidate end
+      end
+    end
+    local sibling = config_dir .. "/../../../../nefor"
+    if path_exists(sibling .. "/lua/nefor-pm/init.lua") then return sibling end
+    return nil
+  end
+
+  local detected_dir = detected_local_nefor_root()
+
   local tui_lua_dir = pick_dir("NEFOR_TUI_LUA_DIR", "/init.lua", table.pack(
     dev_dir    and (dev_dir    .. "/plugins/nefor-tui/lua") or nil,
     local_dir  and (local_dir  .. "/plugins/nefor-tui/lua") or nil,
+    detected_dir and (detected_dir .. "/plugins/nefor-tui/lua") or nil,
     pm_root    and (pm_root    .. "/plugins/nefor-tui/lua") or nil,
     config_dir and (config_dir .. "/../plugins/nefor-tui/lua") or nil,
     "./plugins/nefor-tui/lua",
@@ -98,6 +121,7 @@ do
     dev_dir    and (dev_dir    .. "/starter/chat") or nil,
     config_dir and (config_dir .. "/chat") or nil,
     local_dir  and (local_dir  .. "/starter/chat") or nil,
+    detected_dir and (detected_dir .. "/starter/chat") or nil,
     pm_root    and (pm_root    .. "/starter/chat") or nil,
     "./starter/chat",
     "../starter/chat"
@@ -111,6 +135,7 @@ do
     dev_dir    and (dev_dir    .. "/starter") or nil,
     config_dir,
     local_dir  and (local_dir  .. "/starter") or nil,
+    detected_dir and (detected_dir .. "/starter") or nil,
     chat_parent,
     pm_root    and (pm_root    .. "/starter") or nil,
     "./starter",
@@ -173,11 +198,11 @@ local function initial_state()
     popup            = nil,
     stats            = {},
     pending          = false,
-    pending_followups = "",
     turn_started_at  = nil,
     last_turn_duration_ms = nil,
     model            = cfg.default_model,
     provider         = cfg.default_provider,
+    mode             = "default",
     reasoning_effort = cfg.default_reasoning_effort,
     max_tokens       = nil,
     gate_mode        = "safe",

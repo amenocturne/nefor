@@ -39,16 +39,6 @@ local function fmt_elapsed_ms(ms)
   return string.format("%ds", math.floor(ms / 1000))
 end
 
-local function graph_display_name(name)
-  if type(name) ~= "string" or #name == 0 then return nil end
-  local parts = {}
-  for part in name:gmatch("[^-]+") do
-    parts[#parts + 1] = part:sub(1, 1):upper() .. part:sub(2)
-  end
-  if #parts == 0 then return nil end
-  return table.concat(parts, " ")
-end
-
 -- A completed run lingers in the panel for `LINGER_MS` after its
 -- `completed_at_ms` so the user can see the final state. Past that
 -- window the run is dropped — visually by the view (this helper),
@@ -94,7 +84,6 @@ end
 
 local function run_header(run)
   local short = run.run_id and run.run_id:sub(1, 8) or "?"
-  local label = graph_display_name(run.name) or ("DAG " .. short)
   local total = run.total_nodes or 0
   local nodes = run.nodes or {}
   local done = 0
@@ -106,7 +95,7 @@ local function run_header(run)
     end
   end
   if nodes_count > total then total = nodes_count end
-  local title = string.format("%s (%d/%d)", label, done, total)
+  local title = string.format("DAG %s (%d/%d)", short, done, total)
   return tui.text { content = title, style = STYLE.footer, wrap = "none" }
 end
 
@@ -191,37 +180,28 @@ end
 function M.panel(state)
   local narrow = true
   local now_ms = tui.now_ms()
-  local header = {
+  local children = {
     tui.text { content = "Graph", style = STYLE.footer, wrap = "none" },
     tui.text { content = string.rep("─", 30), style = STYLE.footer, wrap = "none" },
   }
-  local body_children = panel_children(state, now_ms, narrow)
+  for _, c in ipairs(panel_children(state, now_ms, narrow)) do
+    children[#children + 1] = c
+  end
   return tui.constrained {
     min_width = 28,
     max_width = 36,
     child = tui.padding {
       value = 1,
+      -- Drag-to-select scopes to this column. The sidebar doesn't
+      -- scroll, so the selection's content geometry equals the
+      -- column's painted rect — the engine paints into a rect-sized
+      -- scratch buffer and extracts plain text. Keyed so the engine
+      -- can re-resolve the captured widget across view rebuilds.
       child = tui.column {
-        gap = 0,
-        children = {
-          header[1],
-          header[2],
-          tui.expanded {
-            child = tui.constrained {
-              max_width = 30,
-              child = tui.scrollable {
-                key        = "sidebar",
-                stick_to   = "end",
-                scrollbar  = "auto",
-                selectable = true,
-                child      = tui.column {
-                  gap      = 0,
-                  children = body_children,
-                },
-              },
-            },
-          },
-        },
+        gap        = 0,
+        key        = "sidebar",
+        selectable = true,
+        children   = children,
       },
     },
   }
@@ -243,12 +223,11 @@ local function apply(state, run_id, fn)
   return shallow_merge(state, { dag_runs = new_runs })
 end
 
-function M.run_started(state, run_id, total_nodes, now_ms, name)
+function M.run_started(state, run_id, total_nodes, now_ms)
   if state.dag_runs and state.dag_runs[run_id] then return state end
   return apply(state, run_id, function(_)
     return {
       run_id = run_id, total_nodes = total_nodes or 0,
-      name = name,
       started_at_ms = now_ms, nodes = {},
       completed_at_ms = nil, status = nil,
     }

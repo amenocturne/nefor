@@ -67,7 +67,7 @@ function M.build_orchestrator_graph(opts)
   -- sub-agent firings). Without this the lead's chat sees the full
   -- catalog including reasoner-graph internals like `spawn_graph` —
   -- which the lead can call directly, bypassing the role-keyed
-  -- `dispatch-graph` contract and bottoming out in
+  -- `mag` contract and bottoming out in
   -- `reasoner '<role>' not connected` errors.
   if type(opts.tool_allowlist) == "table" then
     wrap_args.tool_allowlist = opts.tool_allowlist
