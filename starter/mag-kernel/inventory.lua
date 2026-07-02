@@ -259,6 +259,9 @@ local function do_kill(self, id)
   entry.state = DEAD
   entry.mailbox = {}
   entry.routes = {}
+  -- Notify the routing layer so it drops the firing slots and outstanding
+  -- capability correlations too (kill drops mailbox + slots; actor-model.md).
+  self.on_kill(id)
 end
 
 local function execute(self, mod)
@@ -307,6 +310,46 @@ function M.get(self, id)
   return self.actors[id]
 end
 
+-- Iterate every actor record: `for id, record in inv.pairs() do ... end`.
+-- Read-only — the routing layer uses it to derive product slots from the
+-- routes topology (which senders route which types to a given actor).
+function M.pairs(self)
+  return pairs(self.actors)
+end
+
+-- Append one entry to a live actor's pending mailbox; returns true, or false
+-- if the id is absent or dead. This is the routing layer's path for a delivery
+-- to a registered-but-not-ready target (actor-model.md, Lifecycle); the fold's
+-- own `messages` still queue through do_send.
+function M.enqueue(self, id, entry)
+  local e = self.actors[id]
+  if e and e.state == ALIVE then
+    e.mailbox[#e.mailbox + 1] = entry
+    return true
+  end
+  return false
+end
+
+-- Take and clear a live actor's pending mailbox (nil id → empty). The routing
+-- layer drains this through firing, in arrival order, when the factory
+-- confirms ready.
+function M.take_mailbox(self, id)
+  local e = self.actors[id]
+  if not e then
+    return {}
+  end
+  local mb = e.mailbox
+  e.mailbox = {}
+  return mb
+end
+
+-- Register (or replace) the kill notification hook after construction, so the
+-- inventory and the routing layer can be wired without a construction-order
+-- cycle (routing needs the inventory; the inventory needs routing's forget).
+function M.set_on_kill(self, fn)
+  self.on_kill = fn or function() end
+end
+
 local noop = function() end
 
 -- Construct an inventory. `opts.log` is a sink with info/warn/error
@@ -323,6 +366,10 @@ function M.new(opts)
       error = log.error or noop,
     },
     factory = opts.factory,
+    -- Kill notification hook (actor-model.md, Signals: kill drops mailbox +
+    -- slots). Defaults to a no-op; init.lua rebinds it to routing:forget once
+    -- both are built (M.set_on_kill), breaking the construction-order cycle.
+    on_kill = opts.on_kill or noop,
   }
   self.apply = function(mod)
     return M.apply(self, mod)
@@ -332,6 +379,18 @@ function M.new(opts)
   end
   self.get = function(id)
     return M.get(self, id)
+  end
+  self.pairs = function()
+    return M.pairs(self)
+  end
+  self.enqueue = function(id, entry)
+    return M.enqueue(self, id, entry)
+  end
+  self.take_mailbox = function(id)
+    return M.take_mailbox(self, id)
+  end
+  self.set_on_kill = function(fn)
+    return M.set_on_kill(self, fn)
   end
   return self
 end

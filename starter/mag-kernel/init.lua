@@ -15,6 +15,7 @@
 
 local inventory = require("inventory")
 local Registry = require("registry")
+local routing = require("routing")
 local stub = require("factories.stub")
 
 -- Adapt the host's single `nefor.log(msg)` function into the leveled sink
@@ -44,6 +45,29 @@ nefor.log("mag-kernel loading")
 local registry = build_registry()
 local inv = inventory.new({ log = make_logger() })
 
+-- Injected host bus seam. The mag plugin's bus surface (tool.invoke out,
+-- tool.result in) is not wired yet (plugins/mag/src/kernel.rs install_nefor
+-- ships only nefor.log). Until it lands, capability requests are logged and
+-- dropped rather than reaching a plugin; swap this stub for the real host
+-- bus emit when it exists. Kept dependency-injected so the kernel modules
+-- stay pure (routing.lua, correlation.lua).
+local function bus_emit(envelope)
+  nefor.log(string.format("[bus-seam] capability request to '%s' (id=%s) dropped: host bus not wired",
+    tostring(envelope and envelope.name), tostring(envelope and envelope.id)))
+end
+
+local router = routing.new({
+  inventory = inv,
+  registry = registry,
+  log = make_logger(),
+  bus_emit = bus_emit,
+})
+-- Break the construction-order cycle: the inventory's kill hook calls into the
+-- router so a kill drops the router's firing slots + correlations too.
+inv.set_on_kill(function(id)
+  router:forget(id)
+end)
+
 nefor.log("mag-kernel ready (factories: stub)")
 
 return {
@@ -64,8 +88,17 @@ return {
     return inv.get(id)
   end,
 
-  -- The inventory and factory registry, for wiring routing and factory
-  -- construction in their own tasks without re-reaching through this table.
+  -- Deliver a correlated capability response (tool.result-shaped:
+  -- { id, result | error }) back to the requesting actor. The host calls
+  -- this from its bus-inbound path once the bus seam is wired.
+  bus_response = function(response)
+    return router:bus_response(response)
+  end,
+
+  -- The inventory, factory registry, and router, for wiring factory
+  -- construction and host bus I/O in their own tasks without re-reaching
+  -- through this table.
   inventory = inv,
   registry = registry,
+  router = router,
 }
