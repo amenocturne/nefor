@@ -23,9 +23,13 @@ fn main() {
     };
 
     match nefor_mag::compile(&source, &cli.source_dir) {
-        Ok(ir) => {
-            println!("{}", serde_json::to_string_pretty(&ir).unwrap());
-        }
+        Ok(modification) => match serde_json::to_string_pretty(&modification) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                eprintln!("error: cannot serialize modification: {e}");
+                std::process::exit(1);
+            }
+        },
         Err(e) => {
             eprintln!("error: {e}");
             std::process::exit(1);

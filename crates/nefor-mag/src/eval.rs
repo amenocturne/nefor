@@ -1,4 +1,4 @@
-use crate::ast::{EdgeValue, Expr, FnValue, GraphValue, NodeValue, Value};
+use crate::ast::{EdgeValue, Expr, FnValue, GraphValue, NodeValue, Port, SubgraphValue, Value};
 use crate::env::Env;
 use crate::error::MagError;
 use crate::types::MagType;
@@ -428,6 +428,7 @@ fn eval_builtin(env: &mut Env, name: &str, args: &[Expr]) -> Result<Value, MagEr
         }
         "node" => eval_node(env, args),
         "graph" => eval_graph(env, args),
+        "agent" => eval_agent(env, args),
         "read" => {
             if args.is_empty() || args.len() > 2 {
                 return Err(MagError::Eval(
@@ -758,6 +759,83 @@ fn parse_type_expr(expr: &Expr) -> Result<MagType, MagError> {
     }
 }
 
+/// A composition fragment: either a plain node or a spliced subgraph. Both
+/// expose one input handle and one-or-more output handles the enclosing graph
+/// wires edges against, plus the internal actors/edges to splice in.
+struct Fragment {
+    input: String,
+    outputs: Vec<String>,
+    nodes: Vec<NodeValue>,
+    edges: Vec<EdgeValue>,
+}
+
+fn fragment_of(val: &Value) -> Result<Fragment, MagError> {
+    match val {
+        Value::Node(n) => Ok(Fragment {
+            input: n.id.clone(),
+            outputs: vec![n.id.clone()],
+            nodes: vec![n.clone()],
+            edges: vec![],
+        }),
+        Value::Subgraph(s) => Ok(Fragment {
+            input: s.input.actor.clone(),
+            outputs: s.outputs.iter().map(|p| p.actor.clone()).collect(),
+            nodes: s.nodes.clone(),
+            edges: s.edges.clone(),
+        }),
+        other => Err(MagError::Eval(format!(
+            "graph expects node or subgraph values, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// Structural equality for actors sharing an id — distinguishes a legitimate
+/// dedup (same node value referenced by two edges) from an id collision (two
+/// different actors claiming one id).
+fn nodes_equal(a: &NodeValue, b: &NodeValue) -> bool {
+    a.node_type == b.node_type
+        && a.input_type == b.input_type
+        && a.output_type == b.output_type
+        && a.args.len() == b.args.len()
+        && a.args
+            .iter()
+            .all(|(k, v)| b.args.get(k).is_some_and(|bv| values_equal(v, bv)))
+}
+
+/// Splice a fragment's internal actors and edges into the accumulating graph.
+/// Identical duplicate actors dedup silently; an id claimed by two structurally
+/// different actors is a collision — rejected, naming the clash.
+fn splice_fragment(
+    frag_nodes: &[NodeValue],
+    frag_edges: &[EdgeValue],
+    nodes: &mut Vec<NodeValue>,
+    index: &mut std::collections::HashMap<String, NodeValue>,
+    edges: &mut Vec<EdgeValue>,
+) -> Result<(), MagError> {
+    for node in frag_nodes {
+        match index.get(&node.id) {
+            Some(existing) if !nodes_equal(existing, node) => {
+                return Err(MagError::Graph(format!(
+                    "duplicate actor id '{}' — instance ids must be unique across the program",
+                    node.id
+                )));
+            }
+            Some(_) => {}
+            None => {
+                index.insert(node.id.clone(), node.clone());
+                nodes.push(node.clone());
+            }
+        }
+    }
+    for edge in frag_edges {
+        if !edges.iter().any(|e| e.from == edge.from && e.to == edge.to) {
+            edges.push(edge.clone());
+        }
+    }
+    Ok(())
+}
+
 fn eval_graph(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
     // Selectively evaluate args: skip -> symbols and pass keywords through
     let mut vals = Vec::new();
@@ -770,22 +848,12 @@ fn eval_graph(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
 
     let mut nodes: Vec<NodeValue> = Vec::new();
     let mut edges: Vec<EdgeValue> = Vec::new();
+    let mut index: std::collections::HashMap<String, NodeValue> = std::collections::HashMap::new();
     let mut terminal: Option<String> = None;
-
-    // Track which node IDs we've seen (for deduplication)
-    let mut seen_node_ids = std::collections::HashSet::new();
-
-    let add_node = |node: &NodeValue,
-                    nodes: &mut Vec<NodeValue>,
-                    seen: &mut std::collections::HashSet<String>| {
-        if seen.insert(node.id.clone()) {
-            nodes.push(node.clone());
-        }
-    };
 
     let mut i = 0;
     while i < vals.len() {
-        // Check for :terminal keyword
+        // Check for :terminal keyword — the program sink is a plain node.
         if let Value::Keyword(kw) = &vals[i] {
             if kw == "terminal" {
                 i += 1;
@@ -798,13 +866,19 @@ fn eval_graph(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
                                 ));
                             }
                             terminal = Some(n.id.clone());
-                            add_node(n, &mut nodes, &mut seen_node_ids);
+                            splice_fragment(
+                                std::slice::from_ref(n),
+                                &[],
+                                &mut nodes,
+                                &mut index,
+                                &mut edges,
+                            )?;
                             i += 1;
                         }
-                        _ => {
+                        other => {
                             return Err(MagError::Eval(format!(
                                 "terminal expects a node value, got {}",
-                                vals[i].type_name()
+                                other.type_name()
                             )));
                         }
                     }
@@ -813,49 +887,38 @@ fn eval_graph(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
             }
         }
 
-        // Look for edge pattern: node -> node
+        // Edge pattern: fragment -> fragment. Boundary edges from a subgraph
+        // dissolve into one edge per output-port actor (lowering.md).
         if i + 2 < vals.len() {
             if let Value::Symbol(arrow) = &vals[i + 1] {
                 if arrow == "->" {
-                    let from_node = match &vals[i] {
-                        Value::Node(n) => n,
-                        other => {
-                            return Err(MagError::Eval(format!(
-                                "edge source must be a node, got {}",
-                                other.type_name()
-                            )))
+                    let from = fragment_of(&vals[i])?;
+                    let to = fragment_of(&vals[i + 2])?;
+                    splice_fragment(&from.nodes, &from.edges, &mut nodes, &mut index, &mut edges)?;
+                    splice_fragment(&to.nodes, &to.edges, &mut nodes, &mut index, &mut edges)?;
+                    for out in &from.outputs {
+                        if !edges.iter().any(|e| e.from == *out && e.to == to.input) {
+                            edges.push(EdgeValue {
+                                from: out.clone(),
+                                to: to.input.clone(),
+                            });
                         }
-                    };
-                    let to_node = match &vals[i + 2] {
-                        Value::Node(n) => n,
-                        other => {
-                            return Err(MagError::Eval(format!(
-                                "edge target must be a node, got {}",
-                                other.type_name()
-                            )))
-                        }
-                    };
-                    add_node(from_node, &mut nodes, &mut seen_node_ids);
-                    add_node(to_node, &mut nodes, &mut seen_node_ids);
-                    edges.push(EdgeValue {
-                        from: from_node.id.clone(),
-                        to: to_node.id.clone(),
-                    });
+                    }
                     i += 3;
                     continue;
                 }
             }
         }
 
-        // Standalone node (not part of an edge)
-        if let Value::Node(n) = &vals[i] {
-            add_node(n, &mut nodes, &mut seen_node_ids);
+        // Standalone node or subgraph (not part of an edge).
+        if matches!(&vals[i], Value::Node(_) | Value::Subgraph(_)) {
+            let frag = fragment_of(&vals[i])?;
+            splice_fragment(&frag.nodes, &frag.edges, &mut nodes, &mut index, &mut edges)?;
             i += 1;
             continue;
         }
 
-        // Skip arrow symbols that were already evaluated from variables
-        // (shouldn't happen in normal use, but handle gracefully)
+        // Skip arrow symbols that were already evaluated from variables.
         i += 1;
     }
 
@@ -887,6 +950,187 @@ fn eval_graph(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
         edges,
         terminal,
     }))
+}
+
+/// Prefix every internal actor id, edge endpoint, and boundary port of a
+/// subgraph with `prefix.`, so two instantiations of one template occupy
+/// disjoint id subtrees (lowering.md namespacing).
+fn prefix_subgraph(prefix: &str, sub: &mut SubgraphValue) {
+    let ns = |id: &str| format!("{prefix}.{id}");
+    for node in &mut sub.nodes {
+        node.id = ns(&node.id);
+    }
+    for edge in &mut sub.edges {
+        edge.from = ns(&edge.from);
+        edge.to = ns(&edge.to);
+    }
+    sub.input.actor = ns(&sub.input.actor);
+    for port in &mut sub.outputs {
+        port.actor = ns(&port.actor);
+    }
+}
+
+fn provider_out() -> MagType {
+    MagType::Named("generic-provider.ProviderOut".into())
+}
+
+/// `(agent {:id … :model … :system … :tools […] :max-steps N} : IN -> OUT)`
+///
+/// A stdlib template: composes the primitive agentic-loop actors (entry
+/// adapter, llm call, run-tool, tool-result, loop-counter, exhaust summarizer)
+/// into one cyclic constellation, namespaced under `:id`, exposing a single
+/// input port (`entry`) and the boundary output type emitted by `llm`/`exhaust`.
+fn eval_agent(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
+    let colon_pos = args
+        .iter()
+        .position(|e| matches!(e, Expr::Symbol(s) if s == ":"));
+    let (value_args, type_args) = match colon_pos {
+        Some(pos) => (&args[..pos], &args[pos + 1..]),
+        None => {
+            return Err(MagError::Eval(
+                "agent requires a type annotation after ':'".into(),
+            ))
+        }
+    };
+    if value_args.is_empty() {
+        return Err(MagError::Eval("agent requires a config map".into()));
+    }
+
+    let config = match eval_expr(env, &value_args[0])? {
+        Value::Map(m) => m,
+        other => {
+            return Err(MagError::Eval(format!(
+                "agent config must be a map, got {}",
+                other.type_name()
+            )))
+        }
+    };
+    let (input_type, output_type) = parse_type_annotation(type_args)?;
+
+    let id = match config.get("id") {
+        Some(Value::Str(s)) => s.clone(),
+        _ => return Err(MagError::Eval("agent requires a string :id".into())),
+    };
+
+    // llm params: model, system, tools (present keys only, sorted by BTreeMap).
+    let mut llm_args: BTreeMap<String, Value> = BTreeMap::new();
+    if let Some(model) = config.get("model") {
+        llm_args.insert("model".into(), model.clone());
+    }
+    if let Some(system) = config.get("system") {
+        llm_args.insert("system".into(), system.clone());
+    }
+    if let Some(tools) = config.get("tools") {
+        llm_args.insert("tools".into(), tools.clone());
+    }
+
+    // exhaust: a summarizing llm that leaves the bounded loop.
+    let mut exhaust_args: BTreeMap<String, Value> = BTreeMap::new();
+    if let Some(model) = config.get("model") {
+        exhaust_args.insert("model".into(), model.clone());
+    }
+    exhaust_args.insert(
+        "system".into(),
+        Value::Str("Summarize what you found so far.".into()),
+    );
+
+    let max_steps = config.get("max-steps").cloned().unwrap_or(Value::Int(50));
+
+    let entry = NodeValue {
+        id: "entry".into(),
+        node_type: "adapter".into(),
+        args: BTreeMap::from([("seed".into(), Value::Str("provider-in".into()))]),
+        input_type: input_type.clone(),
+        output_type: provider_out(),
+    };
+    let llm = NodeValue {
+        id: "llm".into(),
+        node_type: "llm".into(),
+        args: llm_args,
+        input_type: provider_out(),
+        output_type: MagType::Union(vec![
+            MagType::Named("generic-tool.ToolCalls".into()),
+            output_type.clone(),
+        ]),
+    };
+    let run_tool = NodeValue {
+        id: "run-tool".into(),
+        node_type: "run-tool".into(),
+        args: BTreeMap::new(),
+        input_type: MagType::Named("generic-tool.ToolCalls".into()),
+        output_type: MagType::Named("generic-tool.ToolHandle".into()),
+    };
+    let tool_result = NodeValue {
+        id: "tool-result".into(),
+        node_type: "tool-result".into(),
+        args: BTreeMap::new(),
+        input_type: MagType::Named("generic-tool.ToolHandle".into()),
+        output_type: provider_out(),
+    };
+    let loop_counter = NodeValue {
+        id: "loop-counter".into(),
+        node_type: "loop-counter".into(),
+        args: BTreeMap::from([("max".into(), max_steps)]),
+        input_type: provider_out(),
+        output_type: MagType::Union(vec![
+            provider_out(),
+            MagType::Named("mag.LoopExhausted".into()),
+        ]),
+    };
+    let exhaust = NodeValue {
+        id: "exhaust".into(),
+        node_type: "llm".into(),
+        args: exhaust_args,
+        input_type: MagType::Named("mag.LoopExhausted".into()),
+        output_type: output_type.clone(),
+    };
+
+    let mut sub = SubgraphValue {
+        nodes: vec![entry, llm, run_tool, tool_result, loop_counter, exhaust],
+        edges: vec![
+            EdgeValue {
+                from: "entry".into(),
+                to: "llm".into(),
+            },
+            EdgeValue {
+                from: "llm".into(),
+                to: "run-tool".into(),
+            },
+            EdgeValue {
+                from: "run-tool".into(),
+                to: "tool-result".into(),
+            },
+            EdgeValue {
+                from: "tool-result".into(),
+                to: "loop-counter".into(),
+            },
+            EdgeValue {
+                from: "loop-counter".into(),
+                to: "llm".into(),
+            },
+            EdgeValue {
+                from: "loop-counter".into(),
+                to: "exhaust".into(),
+            },
+        ],
+        input: Port {
+            actor: "entry".into(),
+            ty: input_type,
+        },
+        outputs: vec![
+            Port {
+                actor: "llm".into(),
+                ty: output_type.clone(),
+            },
+            Port {
+                actor: "exhaust".into(),
+                ty: output_type,
+            },
+        ],
+    };
+    prefix_subgraph(&id, &mut sub);
+
+    Ok(Value::Subgraph(sub))
 }
 
 /// Simple `{key}` interpolation: scan for `{` and `}`, look up the key in the data map.
@@ -952,6 +1196,7 @@ fn value_to_string(val: &Value) -> String {
         }
         Value::Node(n) => format!("node:{}", n.id),
         Value::Graph(_) => "graph".to_string(),
+        Value::Subgraph(_) => "subgraph".to_string(),
         Value::Fn(_) => "fn".to_string(),
         Value::BuiltinFn(name) => format!("builtin:{name}"),
     }
@@ -1737,15 +1982,6 @@ mod tests {
                     MagType::Named("generic-tool.ToolCalls".into()),
                     MagType::Named("generic-provider.FinalAnswer".into()),
                 ])
-            );
-
-            // Verify IR normalization passes through qualified types
-            let ir = crate::ir::node_to_ir(node).unwrap();
-            let fanout = ir.fanout.unwrap();
-            assert_eq!(fanout.input, "generic-provider.ProviderOut");
-            assert_eq!(
-                fanout.out,
-                vec!["generic-tool.ToolCalls", "generic-provider.FinalAnswer"]
             );
         } else {
             panic!("expected node, got {:?}", result);

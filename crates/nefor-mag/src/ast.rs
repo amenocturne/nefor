@@ -59,6 +59,7 @@ pub enum Value {
     Map(BTreeMap<String, Value>),
     Node(NodeValue),
     Graph(GraphValue),
+    Subgraph(SubgraphValue),
     Fn(FnValue),
     BuiltinFn(String),
     TypeDecl(String),
@@ -100,6 +101,7 @@ impl Value {
             Value::Map(_) => "map",
             Value::Node(_) => "node",
             Value::Graph(_) => "graph",
+            Value::Subgraph(_) => "subgraph",
             Value::Fn(_) => "fn",
             Value::BuiltinFn(_) => "builtin-fn",
             Value::TypeDecl(_) => "type",
@@ -127,6 +129,26 @@ pub struct GraphValue {
 pub struct EdgeValue {
     pub from: String,
     pub to: String,
+}
+
+/// A boundary handle on a subgraph: the concrete internal actor that receives
+/// the boundary input (`input`) or emits the boundary output type (`outputs`),
+/// paired with the type crossing that boundary.
+#[derive(Debug, Clone)]
+pub struct Port {
+    pub actor: String,
+    pub ty: MagType,
+}
+
+/// A composable subgraph value returned by template functions like `agent`.
+/// Its internal actor ids are already namespaced; `input`/`outputs` are the
+/// boundary ports the enclosing `graph` wires its edges against.
+#[derive(Debug, Clone)]
+pub struct SubgraphValue {
+    pub nodes: Vec<NodeValue>,
+    pub edges: Vec<EdgeValue>,
+    pub input: Port,
+    pub outputs: Vec<Port>,
 }
 
 #[derive(Debug, Clone)]

@@ -41,6 +41,7 @@ impl Env {
         self.define("=", Value::BuiltinFn("=".into()));
         self.define("node", Value::BuiltinFn("node".into()));
         self.define("graph", Value::BuiltinFn("graph".into()));
+        self.define("agent", Value::BuiltinFn("agent".into()));
         self.define("type", Value::BuiltinFn("type".into()));
         self.define("read", Value::BuiltinFn("read".into()));
         self.define("require", Value::BuiltinFn("require".into()));
@@ -118,7 +119,7 @@ impl Env {
     pub fn top_scope_user_defs(&self) -> HashMap<String, Value> {
         let builtins = [
             "str", "map", "flat-map", "filter", "fold", "concat", "get", "assoc", "keys", "count",
-            "or", "not", "=", "node", "graph", "type", "read", "require",
+            "or", "not", "=", "node", "graph", "agent", "type", "read", "require",
         ];
         self.scopes
             .last()
