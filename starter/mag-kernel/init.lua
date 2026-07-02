@@ -23,6 +23,7 @@ local stub = require("factories.stub")
 local loop_counter = require("factories.loop-counter")
 local sink = require("factories.sink")
 local human = require("factories.human")
+local llm = require("factories.llm")
 
 -- Shared per-node output persistence (lua/libs/output-persistence). The mag
 -- plugin host currently exposes only nefor.log (plugins/mag/src/kernel.rs,
@@ -59,6 +60,7 @@ local function build_registry()
   seed(loop_counter)
   seed(sink)
   seed(human)
+  seed(llm)
   return reg
 end
 
@@ -174,7 +176,7 @@ end
 -- inventory itself stays pure; this is the composition layer.
 local obs = observer.new({ inventory = inv, emit_event = emit_event, modlog = mlog })
 
-nefor.log("mag-kernel ready (factories: stub, loop-counter, sink, human)")
+nefor.log("mag-kernel ready (factories: stub, loop-counter, sink, human, llm)")
 
 return {
   name = "mag-kernel",
