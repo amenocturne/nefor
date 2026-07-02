@@ -268,6 +268,78 @@ do
 end
 
 -- ------------------------------------------------------------------
+-- Per-execute switch: mag_execute_kernel routes to the MAG actor
+-- kernel (mag.load + mag.execute over the bus) instead of
+-- reasoner-graph, and mag.run_result closes the run. Default-off path
+-- (spawn_graph) is covered by the block above.
+-- ------------------------------------------------------------------
+
+do
+  fresh()
+  write_mag_file("firing-kernel-write", "kernel-run.mag", READ_ONLY_MAG)
+  _test.calls_clear()
+
+  local config = require("config")
+  local prev = config.active.mag_execute_kernel
+  config.active.mag_execute_kernel = true
+
+  execute_mag("firing-kernel-exec", "kernel-run.mag")
+
+  local calls = decode_calls()
+  local load = find_call(calls, function(c)
+    return c.body.kind == "mag.load" and c.target == "mag"
+  end)
+  assert_true(load ~= nil,
+    "kernel switch emits mag.load to the mag plugin; got " .. json.encode(_test.calls()))
+  assert_eq(load.body.entry, "kernel-run.mag", "mag.load names the .mag entry file")
+
+  local exec = find_call(calls, function(c)
+    return c.body.kind == "mag.execute" and c.target == "mag"
+  end)
+  assert_true(exec ~= nil, "kernel switch emits mag.execute to the mag plugin")
+
+  -- The reasoner-graph path must NOT run on the kernel switch.
+  local leaked = find_call(calls, function(c)
+    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
+  end)
+  assert_eq(leaked, nil, "kernel path does not submit spawn_graph to reasoner-graph")
+
+  local reply = find_call(calls, function(c)
+    return c.body.kind == "tool.result" and c.body.id == "firing-kernel-exec"
+  end)
+  assert_true(reply ~= nil and reply.body.output ~= nil, "kernel execute replies executing")
+  assert_eq(reply.body.output.engine, "mag-kernel", "reply reports the kernel engine")
+  assert_eq(exec.body.run_id, reply.body.output.run_id,
+    "mag.execute run_id matches the reply run_id")
+  assert_true(type(lw._internals.state.active_runs[reply.body.output.run_id]) == "table",
+    "kernel run tracked in active_runs")
+
+  -- Terminal mag.run_result closes the run with the sink output PATH.
+  feed("mag", {
+    kind        = "mag.run_result",
+    run_id      = reply.body.output.run_id,
+    status      = "completed",
+    output_path = "/tmp/nefor/sessions/s/mag/runs/kernel-run/sink.output",
+  })
+  assert_eq(lw._internals.state.active_runs[reply.body.output.run_id], nil,
+    "run archived after mag.run_result closes it")
+
+  config.active.mag_execute_kernel = prev
+end
+
+-- mag.loaded snapshots the kernel factory registry for reasoner validation.
+do
+  fresh()
+  feed("mag", {
+    kind      = "mag.loaded",
+    factories = { "sink", "llm", "stub", "run-tool" },
+  })
+  local set = lw._internals.state.kernel_factories
+  assert_true(type(set) == "table" and set.sink == true and set.llm == true,
+    "mag.loaded populates the kernel factory registry snapshot")
+end
+
+-- ------------------------------------------------------------------
 -- Approval gate: builder/writer roles are rejected without an
 -- approved plan.
 -- ------------------------------------------------------------------

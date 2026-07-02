@@ -73,7 +73,12 @@ function M.persist(body, output)
   if type(node_id) ~= "string" or node_id == "" then return output end
 
   local root = data_root()
-  local session_id = current_session_id()
+  -- Session id is normally read from the resident sessions actor, but a host
+  -- without one (the mag plugin VM) injects it on the body instead.
+  local session_id = body.session_id
+  if type(session_id) ~= "string" or session_id == "" then
+    session_id = current_session_id()
+  end
   if type(root) ~= "string" or type(session_id) ~= "string" then return output end
 
   local run_segment = safe_segment(body.run_name or run_id, safe_segment(run_id, "run"))

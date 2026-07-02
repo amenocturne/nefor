@@ -133,6 +133,18 @@ function registry:lookup(name)
   return self.factories[name]
 end
 
+-- The registered factory names, sorted for a stable surface. This is the
+-- control plane's validation source of truth (the lead validates reasoner /
+-- factory types against it instead of a hand-synced allowlist).
+function registry:names()
+  local names = {}
+  for name in pairs(self.factories) do
+    names[#names + 1] = name
+  end
+  table.sort(names)
+  return names
+end
+
 registry.declaration = function(self, name)
   local f = self.factories[name]
   return f and f.declaration or nil

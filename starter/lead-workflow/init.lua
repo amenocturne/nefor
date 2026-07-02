@@ -107,6 +107,11 @@ local state = {
   ---@type table|nil
   active_plan = nil,
   gate_mode = "safe",
+
+  -- Factory names from the kernel registry, snapshotted from `mag.loaded`
+  -- replies. The source of truth for valid reasoner/factory types on the
+  -- kernel execute path (see known_reasoner).
+  kernel_factories = {},
 }
 
 local SOURCE_NAME = "lead-workflow"
@@ -120,6 +125,32 @@ local emit_verdict_rejected
 local emit_verdict_discarded
 
 local VALID_PROFILES = { fast = true, standard = true, deep = true, max = true }
+
+-- Per-execute switch: run `mag` execute on the actor kernel (mag.load +
+-- mag.execute over the bus) instead of the reasoner-graph path. Default off;
+-- cutover flips it ([[task-nefor-mag-cutover-reasoner-graph]]). Read live so a
+-- config/env change takes effect without reload.
+local function mag_execute_on_kernel()
+  local ok, cfg = pcall(require, "config")
+  local active = ok and type(cfg) == "table" and cfg.active or nil
+  return type(active) == "table" and active.mag_execute_kernel == true
+end
+
+-- The kernel's factory registry is the source-of-truth for valid reasoner /
+-- factory types. It arrives on `mag.loaded` (the `factories` array) and is
+-- cached here; `known_reasoner` validates against it when present, falling back
+-- to the static allowlist until the kernel path is the default (at which point
+-- the allowlist is deleted — [[task-nefor-mag-cutover-reasoner-graph]]).
+-- FLAGGED: the cached set is only populated once a `mag.load` reply has been
+-- seen; the pre-execute validation below still consults the allowlist so the
+-- default-off reasoner-graph path keeps its guarantees.
+local function known_reasoner(name)
+  local set = state.kernel_factories
+  if type(set) == "table" and next(set) ~= nil then
+    return set[name] == true
+  end
+  return nil -- no registry snapshot yet; caller uses the allowlist fallback
+end
 
 local function profile_config(name)
   if not VALID_PROFILES[name] then return nil end
@@ -752,6 +783,36 @@ local function mark_firing_result(body)
   end
 end
 
+-- Snapshot the kernel registry's factory names from a mag.loaded reply. This
+-- becomes the source of truth for reasoner/factory validation (known_reasoner).
+local function capture_kernel_factories(body)
+  if type(body.factories) ~= "table" then return end
+  local set = {}
+  for _, name in ipairs(body.factories) do
+    if type(name) == "string" then set[name] = true end
+  end
+  state.kernel_factories = set
+end
+
+-- Close a kernel run on its terminal mag.run_result. Updates run/graph-status
+-- state with the sink's output PATH (control-plane semantics — path, not data).
+-- FLAGGED: does not yet relay the completion to the model as a fresh turn.
+local function handle_mag_run_result(body)
+  local run_id = body.run_id or body.in_reply_to
+  if type(run_id) ~= "string" then return end
+  local run = state.active_runs[run_id]
+  if not run then return end
+  if body.status == "failed" then
+    finish_run(run_id, "failed", nil, body.error or "mag run failed")
+    return
+  end
+  local results = {}
+  if type(run.terminal) == "string" and body.output_path ~= nil then
+    results[run.terminal] = { output = { output_path = body.output_path } }
+  end
+  finish_run(run_id, "completed", results, nil)
+end
+
 terminate_graph = function(firing_id, args)
   local run_id = args and args.run_id
   if type(run_id) ~= "string" or run_id == "" then
@@ -970,6 +1031,49 @@ local function mag_env_handler(firing_id, _args)
   })
 end
 
+-- Kernel execute path (behind the mag_execute_on_kernel switch): load the
+-- compiled program into the `mag` plugin and run it on the actor kernel, rather
+-- than submitting to reasoner-graph. The plugin serialises inbound events, so
+-- emitting mag.load then mag.execute back-to-back is safe — mag.execute runs the
+-- just-loaded resident program. Lifecycle events (mag.run_started, actor
+-- spawn/ready, mag.run_complete) stream on the bus; the terminal mag.run_result
+-- (carrying the sink's output PATH) closes the run in receive_msg.
+--
+-- FLAGGED — remaining work for cutover: (1) per-node profile params resolved
+-- lead-side (fast/standard/deep/max → llm params, above) are not yet threaded
+-- into the kernel program; the plugin loads the .mag directly via nefor-mag, so
+-- profile overrides don't reach the actors. (2) mag.run_result updates run
+-- state / graph-status but does not yet relay the completion to the model as a
+-- fresh turn (the reasoner-graph path gets that from agentic-loop).
+local function mag_execute_kernel(firing_id, args, ws, graph_spec, sink_id, graph_name)
+  local session_id = sessions.current_id()
+  local run_id = "mag-" .. tostring(graph_name) .. "-" .. tostring(now_ms())
+
+  emit_as(SOURCE_NAME, "mag", {
+    kind       = "mag.load",
+    id         = run_id .. "-load",
+    source_dir = ws,
+    entry      = args.file,
+  })
+  emit_as(SOURCE_NAME, "mag", {
+    kind       = "mag.execute",
+    id         = run_id,
+    run_id     = run_id,
+    run_name   = graph_name,
+    session_id = session_id,
+  })
+
+  register_active_run(run_id, graph_spec, sink_id, firing_id)
+
+  emit_tool_result_ok(firing_id, {
+    status  = "executing",
+    run_id  = run_id,
+    engine  = "mag-kernel",
+    message = "Graph submitted to the MAG actor kernel. Results arrive automatically when the run " ..
+      "completes. STOP here — do not call any more tools until results arrive.",
+  })
+end
+
 local function mag_handler(firing_id, args)
   if type(args.file) ~= "string" or #args.file == 0 then
     emit_tool_result_err(firing_id, "mag: requires a non-empty 'file' argument")
@@ -1076,6 +1180,9 @@ local function mag_handler(firing_id, args)
   -- Validated against the reasoner registry in nefor's reasoner-graph plugin.
   -- Keep in sync: add new reasoner names here when registering them in
   -- agents/nefor/config/reasoners/ or plugins/reasoner-graph/.
+  -- Fallback allowlist for the reasoner-graph path. On the kernel path the
+  -- registry snapshot from mag.loaded (known_reasoner) supersedes this; the
+  -- allowlist is deleted at cutover once the kernel path is the default.
   local KNOWN_REASONERS = {
     agent = true, llm = true, sink = true, terminal = true, shell = true,
     ["provider-wrapper"] = true, responder = true, ["tool-executor"] = true,
@@ -1083,7 +1190,10 @@ local function mag_handler(firing_id, args)
     run = true, runCommand = true, ["loop-counter"] = true, human = true,
   }
   for _, node in ipairs(ir.nodes or {}) do
-    if not KNOWN_REASONERS[node.reasoner] then
+    -- Registry snapshot wins when present; otherwise the static allowlist.
+    local ok = known_reasoner(node.reasoner)
+    if ok == nil then ok = KNOWN_REASONERS[node.reasoner] == true end
+    if not ok then
       emit_tool_result_err(firing_id,
         "mag execute: node '" .. tostring(node.id) .. "' uses unknown reasoner type '" ..
         tostring(node.reasoner) .. "'. Known types: agent, llm, sink, shell, bash_command, loop-counter, human.")
@@ -1203,15 +1313,21 @@ local function mag_handler(firing_id, args)
     end
   end
 
-  -- Submit graph through agentic-loop's sub-graph queue.
-  local al = require("agentic-loop")
   local graph_spec = {
     terminal = sink_id,
     nodes    = ir.nodes,
     edges    = ir.edges,
   }
-
   local graph_name = args.file:gsub("%.mag$", ""):gsub("/", "-"):sub(1, 20)
+
+  -- Per-execute switch: run on the MAG actor kernel instead of reasoner-graph.
+  if mag_execute_on_kernel() then
+    mag_execute_kernel(firing_id, args, ws, graph_spec, sink_id, graph_name)
+    return
+  end
+
+  -- Submit graph through agentic-loop's sub-graph queue (reasoner-graph path).
+  local al = require("agentic-loop")
   local run_id = al.queue_sub_graph(
     { graph = graph_spec, on_node_failure = "abort", name = graph_name },
     firing_id)
@@ -1322,6 +1438,16 @@ local function receive_msg(entry)
     return
   end
 
+  -- MAG kernel path (behind the mag_execute_on_kernel switch).
+  if kind == "mag.loaded" then
+    capture_kernel_factories(body)
+    return
+  end
+  if kind == "mag.run_result" then
+    handle_mag_run_result(body)
+    return
+  end
+
   if kind == "graph.run_started" then
     mark_run_started(body)
     return
@@ -1402,6 +1528,7 @@ return {
       state.firing_to_node = {}
       state.active_plan = nil
       state.gate_mode = "safe"
+      state.kernel_factories = {}
       advertised = false
     end,
   },

@@ -73,30 +73,61 @@ nefor.log("mag-kernel loading")
 local registry = build_registry()
 local inv = inventory.new({ log = make_logger() })
 
--- Host-provided run context (session/run ids). Kept injected — the kernel
--- modules never reach for ambient run identity; begin_run threads it in.
-local run_ctx = { run_id = nil, run_name = nil }
+-- Host-provided run context (session/run ids) plus the two host-facing outputs
+-- the control plane collects: the last sink output path (surfaced on the
+-- run-complete event and via take_run_complete) and the last run-complete
+-- signal itself. Kept injected — the kernel modules never reach for ambient run
+-- identity; begin_run threads it in.
+local run_ctx = {
+  run_id = nil,
+  run_name = nil,
+  session_id = nil,
+  last_output_path = nil,
+  run_complete = nil,
+}
 
 -- Injected lifecycle-event sink (observer.lua's EVENTS set, plus routing's
--- ready/run-complete). No host event-bus surface exists yet (the mag plugin
--- ships only nefor.log), so events are traced and dropped until it lands — swap
--- this for the real host broadcast when it exists. Flagged; mirrors bus_emit.
+-- ready/run-complete). Every lifecycle event is broadcast on the NCP bus as a
+-- Body::Event (via the host's nefor.emit queue, drained by the plugin after
+-- each kernel call). The run-complete event additionally carries the sink's
+-- persisted output PATH (control plane reads paths, never node data) and is
+-- captured so the host can settle the execute reply.
 local function emit_event(event)
-  nefor.log(string.format("[event] %s %s",
-    tostring(event and event.kind),
-    tostring(event and (event.id or event.from or ""))))
+  if type(event) ~= "table" then
+    return
+  end
+  if event.kind == observer.EVENTS.run_complete then
+    -- Attach the path the sink's writer persisted this run (recorded by
+    -- persist_output below) and stash the signal for take_run_complete.
+    event.output_path = run_ctx.last_output_path
+    run_ctx.run_complete = {
+      output_path = run_ctx.last_output_path,
+      persisted = event.persisted,
+    }
+  end
+  nefor.emit(event)
 end
 
 -- Per-node output persistence keyed by actor id, reusing output-persistence's
--- session layout (sessions/<id>/mag/runs/<run>/<node>.output). Degrades to a
--- no-op until the host exposes the lib + nefor.fs/json/sessions.
+-- session layout (sessions/<id>/mag/runs/<run>/<node>.output). The host now
+-- exposes nefor.fs/json and puts the lib on package.path; the session id is
+-- injected through run_ctx (the plugin has no resident sessions actor).
+-- Records the written path so the run-complete event can carry it.
 local function persist_output(node_id, output)
   if not persistence then
     return
   end
-  persistence.persist(
-    { run_id = run_ctx.run_id, run_name = run_ctx.run_name, node_id = node_id },
+  local persisted = persistence.persist(
+    {
+      run_id = run_ctx.run_id,
+      run_name = run_ctx.run_name,
+      session_id = run_ctx.session_id,
+      node_id = node_id,
+    },
     output)
+  if type(persisted) == "table" and type(persisted.output_path) == "string" then
+    run_ctx.last_output_path = persisted.output_path
+  end
 end
 
 -- The sink's construct-time writer seam (factories/sink.lua, deps.writer): the
@@ -117,15 +148,16 @@ local function persist_modlog_entry(entry)
 end
 local mlog = modlog.new({ persist = persist_modlog_entry })
 
--- Injected host bus seam. The mag plugin's bus surface (tool.invoke out,
--- tool.result in) is not wired yet (plugins/mag/src/kernel.rs install_nefor
--- ships only nefor.log). Until it lands, capability requests are logged and
--- dropped rather than reaching a plugin; swap this stub for the real host
--- bus emit when it exists. Kept dependency-injected so the kernel modules
--- stay pure (routing.lua, correlation.lua).
+-- Injected host bus seam. Routing hands this a tool.invoke-shaped envelope
+-- ({ kind = "tool.invoke", id, name, args }; routing.lua on_capability_invoke
+-- already performs the capability→tool.invoke rename). We put it straight on
+-- the NCP bus via the host's nefor.emit queue. Kept dependency-injected so the
+-- kernel modules stay pure (routing.lua, correlation.lua); the capability→wire
+-- naming is the composition layer's job, not the pure modules'.
 local function bus_emit(envelope)
-  nefor.log(string.format("[bus-seam] capability request to '%s' (id=%s) dropped: host bus not wired",
-    tostring(envelope and envelope.name), tostring(envelope and envelope.id)))
+  if type(envelope) == "table" then
+    nefor.emit(envelope)
+  end
 end
 
 local router = routing.new({
@@ -172,11 +204,13 @@ inv.set_deliver(function(to, from, content)
   router:deliver(to, from, content.kind, content)
 end)
 
--- Injected clock (flagged): the host has no time binding yet (kernel.rs
--- install_nefor ships only nefor.log), so the barrier reads os.time at
--- second granularity. Swap for a host-provided millisecond clock when it
--- lands — time stays injected, never read inside the pure modules.
+-- Injected clock: the host provides a millisecond clock (nefor.now_ms); we fall
+-- back to os.time at second granularity only if it is somehow absent. Time stays
+-- injected, never read inside the pure modules (barrier.lua takes `now`).
 local function now_ms()
+  if type(nefor.now_ms) == "function" then
+    return nefor.now_ms()
+  end
   return os.time() * 1000
 end
 
@@ -240,7 +274,27 @@ return {
     meta = meta or {}
     run_ctx.run_id = meta.run_id or run_ctx.run_id
     run_ctx.run_name = meta.run_name or run_ctx.run_name
+    run_ctx.session_id = meta.session_id or run_ctx.session_id
+    -- Fresh run: clear the prior run's terminal capture + persisted path.
+    run_ctx.run_complete = nil
+    run_ctx.last_output_path = nil
     obs:run_started({ run_id = run_ctx.run_id, run_name = run_ctx.run_name })
+  end,
+
+  -- The registered factory names — the control plane validates reasoner/factory
+  -- types against this instead of a hand-synced allowlist. Source of truth is
+  -- the registry (registry.lua).
+  registry_names = function()
+    return registry:names()
+  end,
+
+  -- Take the last run-complete signal (one-shot; cleared on read). The host
+  -- polls this after driving the fold to settle the execute reply with the
+  -- sink's output PATH. Returns nil until the resident run signals completion.
+  take_run_complete = function()
+    local rc = run_ctx.run_complete
+    run_ctx.run_complete = nil
+    return rc
   end,
 
   -- Kernel-injected construct deps for an actor id — the sink's per-node

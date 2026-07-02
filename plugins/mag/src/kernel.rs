@@ -3,39 +3,65 @@
 //! The kernel proper (actor inventory, ready barrier, mailboxes, routing,
 //! the fold over graph modifications) is Lua-resident — see
 //! `plugins/mag/docs/actor-model.md` and `docs/ir.md`. This module is the
-//! thin Rust host: it creates the VM, installs the minimal native surface
-//! the kernel needs, loads the kernel entry file, and holds the returned
-//! table for the process lifetime.
+//! Rust host: it creates the VM, installs the native surface the kernel
+//! needs (log, json, fs, a millisecond clock, and a bus-emit queue), loads
+//! the kernel entry file, and drives the kernel's execute seams
+//! (`begin_run`, `start`, `poll`, `bus_response`) from the plugin's dispatch
+//! loop.
 //!
-//! No evaluator behavior is wired yet — the `nefor-mag` crate is a
-//! dependency but is not called from here in the skeleton.
+//! The bus seam is a queue, not an async callback: the kernel modules call
+//! `nefor.emit` synchronously from inside the fold (never a coroutine), so
+//! emitted bodies land on an in-VM array that the host drains after each
+//! kernel call and forwards to the NCP writer. This mirrors the nefor-tui
+//! plugin's emit-drain pattern.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use mlua::{Lua, Table, Value};
+use mlua::{Function, Lua, LuaSerdeExt, Table, Value};
+use serde_json::{Map, Value as JsonValue};
 
 use crate::error::MagError;
+
+/// Global Lua array `nefor.emit` appends to; drained by [`LuaHost::drain_emits`].
+const EMIT_QUEUE: &str = "__mag_emit_queue";
+
+/// Named-registry slot holding the in-flight ready-barrier handle across polls.
+const BARRIER_SLOT: &str = "mag_barrier";
+
+/// The settled state of a ready barrier (`starter/mag-kernel/barrier.lua`).
+#[derive(Debug, Clone)]
+pub struct BarrierState {
+    pub done: bool,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+/// A run's terminal signal, surfaced from the sink through the kernel
+/// (`mag.run_complete`). Carries the output PATH — control-plane semantics:
+/// the plane reads statuses and paths, never node data (docs/ir.md).
+#[derive(Debug, Clone)]
+pub struct RunCompletion {
+    pub output_path: Option<String>,
+    pub persisted: bool,
+}
 
 /// Owns the Lua VM and the kernel table it produced.
 ///
 /// Kept alive for the whole session: the VM is the kernel's entire world
 /// (per the actor model), so dropping it would tear the kernel down.
 pub struct LuaHost {
-    // Field order matters for drop: the kernel table references registry
-    // state owned by `lua`, so `lua` must outlive it. Both are `mlua`
-    // owned handles (no borrow), so this is safe regardless, but keeping
-    // the VM last documents the intent.
-    _kernel: Table,
-    _lua: Lua,
+    kernel: Table,
+    lua: Lua,
 }
 
 impl LuaHost {
     /// Read, evaluate, and hold the kernel at `path`.
     ///
-    /// The chunk is expected to return a table (the kernel). Anything
-    /// else is a [`MagError::KernelNotTable`]. The kernel may call
-    /// `nefor.log(msg)` during load; those messages route to the plugin's
-    /// tracing subscriber (stderr), never stdout — stdout is the NCP wire.
+    /// The chunk is expected to return a table (the kernel). Anything else is
+    /// a [`MagError::KernelNotTable`]. The kernel may call `nefor.log(msg)`
+    /// during load; those messages route to the plugin's tracing subscriber
+    /// (stderr), never stdout — stdout is the NCP wire.
     pub fn load_kernel(path: &Path) -> Result<Self, MagError> {
         let source = std::fs::read_to_string(path).map_err(|source| MagError::KernelRead {
             path: path.display().to_string(),
@@ -43,7 +69,7 @@ impl LuaHost {
         })?;
 
         let lua = Lua::new();
-        install_nefor(&lua)?;
+        install_nefor(&lua, resolve_data_root())?;
         if let Some(dir) = path.parent() {
             set_kernel_path(&lua, dir)?;
         }
@@ -64,16 +90,152 @@ impl LuaHost {
         let name = kernel_name(&kernel);
         tracing::info!(kernel = %name.as_deref().unwrap_or("<unnamed>"), "mag kernel loaded");
 
-        Ok(LuaHost {
-            _kernel: kernel,
-            _lua: lua,
-        })
+        Ok(LuaHost { kernel, lua })
     }
 
     /// The kernel table's `name` field, if it exposed one.
     pub fn kernel_name(&self) -> Option<String> {
-        kernel_name(&self._kernel)
+        kernel_name(&self.kernel)
     }
+
+    /// The names of the factories the kernel's registry knows — the source of
+    /// truth the control plane validates reasoner types against (replaces the
+    /// lead's hand-synced allowlist). Empty when the kernel predates the
+    /// `registry_names` surface.
+    pub fn registry_names(&self) -> Result<Vec<String>, MagError> {
+        let f: Option<Function> = self.kernel.get("registry_names")?;
+        match f {
+            Some(f) => Ok(f.call::<Vec<String>>(())?),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Set the run context (session/run identity) and emit `mag.run_started`.
+    /// Run identity is injected, never ambient (docs/ir.md).
+    pub fn begin_run(
+        &self,
+        run_id: &str,
+        run_name: &str,
+        session_id: Option<&str>,
+    ) -> Result<(), MagError> {
+        let meta = self.lua.create_table()?;
+        meta.set("run_id", run_id)?;
+        meta.set("run_name", run_name)?;
+        if let Some(s) = session_id {
+            meta.set("session_id", s)?;
+        }
+        let f: Function = self.kernel.get("begin_run")?;
+        f.call::<()>(meta)?;
+        Ok(())
+    }
+
+    /// Apply a program's initial modification behind the ready barrier and
+    /// stash the returned handle for [`LuaHost::poll`]. Synchronous factories
+    /// (the shipped ones) confirm ready in-constructor, so a well-formed static
+    /// program releases and runs to completion inside this call.
+    pub fn start(
+        &self,
+        modification: &JsonValue,
+        deadline_ms: Option<u64>,
+    ) -> Result<BarrierState, MagError> {
+        let mod_val = self.lua.to_value(modification)?;
+        let opts = self.lua.create_table()?;
+        if let Some(d) = deadline_ms {
+            opts.set("deadline_ms", d)?;
+        }
+        let f: Function = self.kernel.get("start")?;
+        let handle: Table = f.call::<Table>((mod_val, opts))?;
+        let state = barrier_state(&handle)?;
+        self.lua.set_named_registry_value(BARRIER_SLOT, handle)?;
+        Ok(state)
+    }
+
+    /// Advance the stashed barrier handle against the current clock. Idempotent
+    /// once settled. Returns the barrier's settled state (or a "done" no-op
+    /// when no run is in flight).
+    pub fn poll(&self) -> Result<BarrierState, MagError> {
+        let handle: Option<Table> = self.lua.named_registry_value(BARRIER_SLOT)?;
+        let handle = match handle {
+            Some(h) => h,
+            None => {
+                return Ok(BarrierState {
+                    done: true,
+                    ok: true,
+                    error: None,
+                })
+            }
+        };
+        let f: Function = self.kernel.get("poll")?;
+        let handle: Table = f.call::<Table>((handle, Value::Nil))?;
+        barrier_state(&handle)
+    }
+
+    /// Deliver a correlated capability response (tool.result-shaped) back to the
+    /// requesting actor, advancing any deferred activation it unblocks.
+    pub fn bus_response(
+        &self,
+        id: &str,
+        result: Option<&JsonValue>,
+        error: Option<&str>,
+    ) -> Result<(), MagError> {
+        let resp = self.lua.create_table()?;
+        resp.set("id", id)?;
+        if let Some(r) = result {
+            resp.set("result", self.lua.to_value(r)?)?;
+        }
+        if let Some(e) = error {
+            resp.set("error", e)?;
+        }
+        let f: Function = self.kernel.get("bus_response")?;
+        f.call::<()>(resp)?;
+        Ok(())
+    }
+
+    /// Take the last run-completion signal, if the resident run has finished.
+    /// One-shot: clears the slot so a subsequent execute starts fresh.
+    pub fn take_run_complete(&self) -> Result<Option<RunCompletion>, MagError> {
+        let f: Option<Function> = self.kernel.get("take_run_complete")?;
+        let f = match f {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let rc: Option<Table> = f.call::<Option<Table>>(())?;
+        match rc {
+            None => Ok(None),
+            Some(t) => Ok(Some(RunCompletion {
+                output_path: t.get::<Option<String>>("output_path")?,
+                persisted: t.get::<Option<bool>>("persisted")?.unwrap_or(false),
+            })),
+        }
+    }
+
+    /// Drain everything the kernel emitted since the last drain (bus + lifecycle
+    /// events), converting each to an NCP event body. The queue is reset atomically.
+    pub fn drain_emits(&self) -> Result<Vec<Map<String, JsonValue>>, MagError> {
+        let queue: Table = self.lua.globals().get(EMIT_QUEUE)?;
+        let mut out = Vec::new();
+        for pair in queue.clone().pairs::<i64, Value>() {
+            let (_, v) = pair?;
+            let json: JsonValue = self.lua.from_value(v)?;
+            if let JsonValue::Object(map) = json {
+                out.push(map);
+            }
+        }
+        // Reset to a fresh array so the next drain starts empty.
+        self.lua
+            .globals()
+            .set(EMIT_QUEUE, self.lua.create_table()?)?;
+        Ok(out)
+    }
+}
+
+/// Read `{ done, ok, error }` off a barrier handle table.
+fn barrier_state(handle: &Table) -> Result<BarrierState, MagError> {
+    Ok(BarrierState {
+        done: handle.get::<Option<bool>>("done")?.unwrap_or(false),
+        ok: handle.get::<Option<bool>>("ok")?.unwrap_or(false),
+        error: handle.get::<Option<String>>("error")?,
+    })
 }
 
 /// Read the `name` field off a kernel table, tolerating its absence or a
@@ -82,33 +244,184 @@ fn kernel_name(kernel: &Table) -> Option<String> {
     kernel.get::<Option<String>>("name").ok().flatten()
 }
 
-/// Point `package.path` at the kernel file's directory so the entry chunk
-/// can `require` sibling modules (`inventory`, and the factory registry as
-/// it lands) by bare name. Without this the VM searches only the
-/// process-default paths and a modular kernel cannot load.
+/// Resolve the data root the same way the ecosystem does: `NEFOR_DATA_DIR`,
+/// then `XDG_DATA_HOME/nefor`, then `~/.local/share/nefor`. Used for the plugin
+/// VM's `nefor.fs.data_root()` so per-node output persistence lands under the
+/// same session layout the rest of nefor writes to.
+fn resolve_data_root() -> String {
+    if let Some(d) = std::env::var_os("NEFOR_DATA_DIR") {
+        if !d.is_empty() {
+            return d.to_string_lossy().into_owned();
+        }
+    }
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return format!("{}/nefor", xdg.to_string_lossy());
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return format!("{}/.local/share/nefor", home.to_string_lossy());
+    }
+    String::from("/tmp/nefor")
+}
+
+/// Point `package.path` at the kernel file's directory (so the entry chunk can
+/// `require` sibling modules by bare name) plus the shared `lua/` and
+/// `lua/libs/` trees (so `output-persistence` resolves). Roots are the
+/// `NEFOR_DEV_DIR` checkout when set, and the kernel dir's grandparent
+/// otherwise (`.../starter/mag-kernel` → repo/config root), mirroring the
+/// `NEFOR_DEV_DIR`-first convention the rest of nefor's Lua loading uses.
 fn set_kernel_path(lua: &Lua, dir: &Path) -> Result<(), MagError> {
     let package: Table = lua.globals().get("package")?;
     let current: String = package.get("path")?;
-    let dir = dir.display().to_string();
-    let new = format!("{dir}/?.lua;{dir}/?/init.lua;{current}");
-    package.set("path", new)?;
+
+    let mut entries: Vec<String> = Vec::new();
+    let kdir = dir.display().to_string();
+    entries.push(format!("{kdir}/?.lua"));
+    entries.push(format!("{kdir}/?/init.lua"));
+
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(dev) = std::env::var_os("NEFOR_DEV_DIR") {
+        if !dev.is_empty() {
+            roots.push(PathBuf::from(dev));
+        }
+    }
+    // .../starter/mag-kernel → grandparent is the repo/config root.
+    if let Some(root) = dir.parent().and_then(Path::parent) {
+        roots.push(root.to_path_buf());
+    }
+    for root in roots {
+        for sub in ["lua", "lua/libs"] {
+            let base = root.join(sub);
+            let base = base.display().to_string();
+            entries.push(format!("{base}/?.lua"));
+            entries.push(format!("{base}/?/init.lua"));
+        }
+    }
+
+    entries.push(current);
+    package.set("path", entries.join(";"))?;
     Ok(())
 }
 
-/// Install the minimal `nefor` global the kernel needs at load time.
-///
-/// For the skeleton that is just `nefor.log`, a bridge into the plugin's
-/// tracing subscriber. The full surface (bus send/deliver, json, spawn)
-/// lands with the kernel behavior.
-fn install_nefor(lua: &Lua) -> Result<(), MagError> {
+/// Install the `nefor` global the kernel needs: `log`, `json`, `fs`, a
+/// millisecond clock, and the bus-emit queue.
+fn install_nefor(lua: &Lua, data_root: String) -> Result<(), MagError> {
     let nefor = lua.create_table()?;
+
     let log = lua.create_function(|_, msg: String| {
         tracing::info!(target: "mag::kernel", "{msg}");
         Ok(())
     })?;
     nefor.set("log", log)?;
+
+    install_json(lua, &nefor)?;
+    install_fs(lua, &nefor, data_root)?;
+
+    let now_ms = lua.create_function(|_, _: ()| {
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        Ok(ms)
+    })?;
+    nefor.set("now_ms", now_ms)?;
+
+    // Bus-emit queue. `nefor.emit(body)` appends onto a global array the host
+    // drains after each kernel call; the kernel's injected `bus_emit`/
+    // `emit_event` seams call it synchronously from inside the fold.
+    lua.globals().set(EMIT_QUEUE, lua.create_table()?)?;
+    let emit = lua.create_function(|lua, body: Table| {
+        let queue: Table = lua.globals().get(EMIT_QUEUE)?;
+        let n = queue.raw_len();
+        queue.raw_set(n + 1, body)?;
+        Ok(())
+    })?;
+    nefor.set("emit", emit)?;
+
     lua.globals().set("nefor", nefor)?;
     Ok(())
+}
+
+/// `nefor.json.{encode, decode}` over serde_json (mlua serialize bridge).
+/// Mirrors the engine's `nefor::lua::bindings::install_json`.
+fn install_json(lua: &Lua, nefor_tbl: &Table) -> Result<(), MagError> {
+    let json = lua.create_table()?;
+
+    let encode = lua.create_function(|lua, value: Value| {
+        let v: JsonValue = lua.from_value(value)?;
+        serde_json::to_string(&v)
+            .map_err(|e| mlua::Error::runtime(format!("nefor.json.encode: {e}")))
+    })?;
+    json.set("encode", encode)?;
+
+    let decode = lua.create_function(|lua, s: String| {
+        let v: JsonValue = serde_json::from_str(&s)
+            .map_err(|e| mlua::Error::runtime(format!("nefor.json.decode: {e}")))?;
+        lua.to_value(&v)
+    })?;
+    json.set("decode", decode)?;
+
+    nefor_tbl.set("json", json)?;
+    Ok(())
+}
+
+/// `nefor.fs.*` — the subset the shared `output-persistence` lib needs:
+/// `data_root`, `mkdir_p`, `read_file`, `write_file`, `exists`. Errors return
+/// as data (`{ ok, error }`), matching the engine's `install_fs` convention.
+fn install_fs(lua: &Lua, nefor_tbl: &Table, data_root: String) -> Result<(), MagError> {
+    let fs_tbl = lua.create_table()?;
+
+    fs_tbl.set(
+        "data_root",
+        lua.create_function(move |_, _: ()| Ok(data_root.clone()))?,
+    )?;
+    fs_tbl.set(
+        "mkdir_p",
+        lua.create_function(|lua, path: String| ok_or_err(lua, std::fs::create_dir_all(&path)))?,
+    )?;
+    fs_tbl.set(
+        "exists",
+        lua.create_function(|_, path: String| Ok(Path::new(&path).exists()))?,
+    )?;
+    fs_tbl.set(
+        "write_file",
+        lua.create_function(|lua, (path, content): (String, String)| {
+            ok_or_err(lua, std::fs::write(&path, content))
+        })?,
+    )?;
+    fs_tbl.set(
+        "read_file",
+        lua.create_function(|lua, path: String| {
+            let t = lua.create_table()?;
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    t.set("ok", true)?;
+                    t.set("content", content)?;
+                }
+                Err(e) => {
+                    t.set("ok", false)?;
+                    t.set("error", e.to_string())?;
+                }
+            }
+            Ok(t)
+        })?,
+    )?;
+
+    nefor_tbl.set("fs", fs_tbl)?;
+    Ok(())
+}
+
+fn ok_or_err(lua: &Lua, result: std::io::Result<()>) -> mlua::Result<Table> {
+    let t = lua.create_table()?;
+    match result {
+        Ok(()) => t.set("ok", true)?,
+        Err(e) => {
+            t.set("ok", false)?;
+            t.set("error", e.to_string())?;
+        }
+    }
+    Ok(t)
 }
 
 #[cfg(test)]
@@ -153,5 +466,33 @@ mod tests {
             Err(e) => e,
         };
         assert!(matches!(err, MagError::KernelRead { .. }));
+    }
+
+    #[test]
+    fn json_and_now_and_emit_bindings_are_installed() {
+        let dir = std::env::temp_dir().join(format!("mag-kernel-bind-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // A kernel that exercises the new native surface and returns a table.
+        let path = write_kernel(
+            &dir,
+            r#"
+            assert(type(nefor.json) == "table", "json missing")
+            assert(nefor.json.decode(nefor.json.encode({a=1})).a == 1, "json roundtrip")
+            assert(type(nefor.now_ms) == "function" and nefor.now_ms() > 0, "now_ms")
+            assert(type(nefor.fs.data_root) == "function", "fs.data_root")
+            nefor.emit({ kind = "test.event", n = 7 })
+            return { name = "bindings" }
+            "#,
+        );
+        let host = LuaHost::load_kernel(&path).expect("load");
+        let drained = host.drain_emits().expect("drain");
+        assert_eq!(drained.len(), 1, "one queued emit");
+        assert_eq!(
+            drained[0].get("kind").and_then(JsonValue::as_str),
+            Some("test.event")
+        );
+        // Draining again yields an empty queue.
+        assert!(host.drain_emits().expect("drain2").is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

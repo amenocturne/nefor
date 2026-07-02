@@ -1,13 +1,16 @@
 //! mag — NCP v0.1 plugin hosting the MAG actor-kernel runtime.
 //!
-//! Skeleton stage: completes the NCP ready handshake, hosts a Lua VM that
-//! loads the (stub) kernel from the config-resolved Lua path, and answers a
-//! trivial `mag.ping` so liveness is testable. No kernel behavior and no
-//! `nefor-mag` evaluator calls yet — those land with the runtime.
+//! Completes the NCP ready handshake, hosts a Lua VM that loads the kernel from
+//! the config-resolved Lua path, and answers the mag protocol: `mag.ping`
+//! (liveness), `mag.load` (evaluate a program, cache it, reply with the initial
+//! modification + the registry's factory names), `mag.eval` (apply a rule fn),
+//! and `mag.execute` (run the resident/inline program through the kernel —
+//! spawn the constellation behind the ready barrier, stream lifecycle events,
+//! and reply `mag.run_result` with the sink's output path).
 //!
 //! Layering mirrors the sibling plugins (`reasoner-graph`, `tool-gate`):
-//! - `main.rs` — entry, handshake, dispatch loop, bus body encoding.
-//! - `kernel.rs` — the embedded Lua VM and kernel loading.
+//! - `main.rs` — entry, handshake, dispatch loop, execute drive, bus encoding.
+//! - `kernel.rs` — the embedded Lua VM, host bindings, and kernel driving.
 //! - `error.rs` — `MagError` domain error hierarchy.
 
 mod error;
@@ -22,7 +25,19 @@ use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
 use crate::error::MagError;
-use crate::kernel::LuaHost;
+use crate::kernel::{LuaHost, RunCompletion};
+
+/// A run driven asynchronously to completion: the execute reply is deferred
+/// until the resident program signals `mag.run_complete` (via inbound
+/// capability responses that unblock deferred activations) or the barrier
+/// deadline elapses. Synchronous programs (the shipped factories) finish inside
+/// the `mag.execute` call and never register one.
+struct ActiveExecute {
+    /// The `mag.execute` request id to correlate the terminal reply to.
+    in_reply_to: Option<String>,
+    /// The run's id, echoed on the reply.
+    run_id: String,
+}
 
 /// Outbound/inbound channel capacity for the stdio transport tasks.
 const CHANNEL_CAP: usize = 128;
@@ -54,6 +69,21 @@ const MODIFICATION_KIND: &str = "mag.modification";
 /// Reply kind for a load/eval failure. A rejected modification or a load error
 /// is data on the bus, not a plugin crash (ir.md: "the run continues").
 const ERROR_KIND: &str = "mag.error";
+
+/// Run the resident (or an inline) program's initial modification through the
+/// kernel: spawn the constellation behind the ready barrier, deliver its initial
+/// messages, stream lifecycle events, and reply with the run's terminal status.
+const EXECUTE_KIND: &str = "mag.execute";
+
+/// Terminal reply for a run: the sink's output PATH plus status. Control-plane
+/// semantics — statuses and paths, never node data (docs/ir.md, architecture.md
+/// §Control plane).
+const RUN_RESULT_KIND: &str = "mag.run_result";
+
+/// Correlation id echoed by capability responses (tool.result). The kernel
+/// mints these on `capability.invoke` (routing.lua); the reply carries `output`
+/// (tool/provider convention) or `result`, plus an optional `error`.
+const TOOL_RESULT_KIND: &str = "tool.result";
 
 #[tokio::main]
 async fn main() {
@@ -94,7 +124,7 @@ async fn run() -> Result<(), MagError> {
 
     send_event(&out_tx, hello_body(host.kernel_name().as_deref())).await?;
 
-    run_dispatch_loop(&out_tx, &mut in_rx).await?;
+    run_dispatch_loop(&out_tx, &mut in_rx, &host).await?;
 
     let _ = out_tx.send(PluginOutgoing::event(goodbye_body())).await;
     Ok(())
@@ -139,10 +169,17 @@ fn resolve_kernel_path() -> Result<PathBuf, MagError> {
 async fn run_dispatch_loop(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     in_rx: &mut mpsc::Receiver<Result<Envelope, TransportError>>,
+    host: &LuaHost,
 ) -> Result<(), MagError> {
     // The session's resident program: loaded once by `mag.load`, then the
-    // source of the cached environment every `mag.eval` evaluates against.
+    // source of the cached environment every `mag.eval` evaluates against and
+    // the default program `mag.execute` runs.
     let mut program: Option<LoadedProgram> = None;
+    // The in-flight async run, if any (deferred-completion path).
+    let mut active: Option<ActiveExecute> = None;
+    // Barrier / deadline tick while a run is in flight (docs/ir.md: the host
+    // polls the barrier on a timer; synchronous programs settle before it fires).
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
     loop {
         tokio::select! {
             maybe = in_rx.recv() => {
@@ -156,7 +193,7 @@ async fn run_dispatch_loop(
                             tracing::warn!(?env, "unexpected system envelope after handshake");
                         }
                         Body::Event(map) => {
-                            handle_event(out_tx, map, &mut program).await?;
+                            handle_event(out_tx, map, &mut program, host, &mut active).await?;
                         }
                     },
                     Some(Err(e)) => {
@@ -168,12 +205,76 @@ async fn run_dispatch_loop(
                     }
                 }
             }
+            _ = ticker.tick() => {
+                if active.is_some() {
+                    poll_active(out_tx, host, &mut active).await?;
+                }
+            }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("ctrl-c; exiting");
                 return Ok(());
             }
         }
     }
+}
+
+/// Forward everything the kernel emitted since the last drain (capability
+/// requests + lifecycle events) onto the NCP wire, in order.
+async fn flush_emits(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    host: &LuaHost,
+) -> Result<(), MagError> {
+    for body in host.drain_emits()? {
+        send_event(out_tx, body).await?;
+    }
+    Ok(())
+}
+
+/// Advance the in-flight run's barrier and settle it if the deadline elapsed.
+/// Run *completion* (the sink's `mag.run_complete`) is settled in
+/// [`settle_if_complete`] off the capability-response path; this only fails a
+/// run whose constellation never confirmed ready.
+async fn poll_active(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    host: &LuaHost,
+    active: &mut Option<ActiveExecute>,
+) -> Result<(), MagError> {
+    let state = host.poll()?;
+    flush_emits(out_tx, host).await?;
+    if state.done && !state.ok {
+        if let Some(a) = active.take() {
+            let msg = state.error.unwrap_or_else(|| "ready barrier failed".into());
+            send_event(
+                out_tx,
+                run_result_failed(a.in_reply_to.as_deref(), &a.run_id, &msg),
+            )
+            .await?;
+        }
+    } else {
+        settle_if_complete(out_tx, host, active).await?;
+    }
+    Ok(())
+}
+
+/// If the resident run signalled completion, send the terminal reply (carrying
+/// the sink's output PATH) and clear the in-flight slot.
+async fn settle_if_complete(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    host: &LuaHost,
+    active: &mut Option<ActiveExecute>,
+) -> Result<(), MagError> {
+    if active.is_none() {
+        return Ok(());
+    }
+    if let Some(rc) = host.take_run_complete()? {
+        let a = active.take().expect("active checked above");
+        send_event(
+            out_tx,
+            run_result_ok(a.in_reply_to.as_deref(), &a.run_id, &rc),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Handle one inbound event body. We answer `mag.ping` (liveness), `mag.load`
@@ -184,6 +285,8 @@ async fn handle_event(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: &Map<String, Value>,
     program: &mut Option<LoadedProgram>,
+    host: &LuaHost,
+    active: &mut Option<ActiveExecute>,
 ) -> Result<(), MagError> {
     let kind = match body.get("kind").and_then(Value::as_str) {
         Some(k) => k,
@@ -192,8 +295,15 @@ async fn handle_event(
     let in_reply_to = body.get("id").and_then(Value::as_str);
     match kind {
         PING_KIND => send_event(out_tx, pong_body(in_reply_to)).await,
-        LOAD_KIND => handle_load(out_tx, body, in_reply_to, program).await,
+        LOAD_KIND => handle_load(out_tx, body, in_reply_to, program, host).await,
         EVAL_KIND => handle_eval(out_tx, body, in_reply_to, program).await,
+        EXECUTE_KIND => handle_execute(out_tx, body, in_reply_to, program, host, active).await,
+        // A capability response correlated to a kernel-minted request id.
+        // Unknown ids are dropped inside the kernel (no open correlation), so
+        // forwarding every tool.result while a run is live is safe.
+        TOOL_RESULT_KIND if active.is_some() => {
+            handle_tool_result(out_tx, body, host, active).await
+        }
         _ => Ok(()),
     }
 }
@@ -206,6 +316,7 @@ async fn handle_load(
     body: &Map<String, Value>,
     in_reply_to: Option<&str>,
     program: &mut Option<LoadedProgram>,
+    host: &LuaHost,
 ) -> Result<(), MagError> {
     let source_dir = match body.get("source_dir").and_then(Value::as_str) {
         Some(s) => s,
@@ -224,8 +335,12 @@ async fn handle_load(
 
     match nefor_mag::load(Path::new(source_dir), entry) {
         Ok(loaded) => {
+            // The registry's factory names ride along so the control plane can
+            // validate reasoner/factory types against the kernel's source of
+            // truth instead of a hand-synced allowlist.
+            let factories = host.registry_names().unwrap_or_default();
             let reply = match serde_json::to_value(&loaded.modification) {
-                Ok(m) => loaded_body(in_reply_to, &loaded.hash, m),
+                Ok(m) => loaded_body(in_reply_to, &loaded.hash, m, &factories),
                 Err(e) => error_body(in_reply_to, &format!("modification serialize: {e}")),
             };
             *program = Some(loaded);
@@ -233,6 +348,124 @@ async fn handle_load(
         }
         Err(e) => send_event(out_tx, error_body(in_reply_to, &e.to_string())).await,
     }
+}
+
+/// Run a program through the kernel. The modification is taken inline from the
+/// request (`modification` — the control plane reaches kernel ops directly,
+/// ir.md) or, absent that, from the session's resident program (`mag.load`).
+/// Spawns the constellation behind the ready barrier, streams lifecycle events,
+/// and — for a synchronous program — replies `mag.run_result` with the sink's
+/// output path in the same turn. An async program (a provider round-trip
+/// pending) defers the reply until `mag.run_complete`.
+async fn handle_execute(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    body: &Map<String, Value>,
+    in_reply_to: Option<&str>,
+    program: &Option<LoadedProgram>,
+    host: &LuaHost,
+    active: &mut Option<ActiveExecute>,
+) -> Result<(), MagError> {
+    let modification: Value = match body.get("modification") {
+        Some(m @ Value::Object(_)) => m.clone(),
+        Some(_) => {
+            return send_event(
+                out_tx,
+                error_body(in_reply_to, "mag.execute modification must be an object"),
+            )
+            .await
+        }
+        None => match program {
+            Some(p) => match serde_json::to_value(&p.modification) {
+                Ok(m) => m,
+                Err(e) => {
+                    return send_event(
+                        out_tx,
+                        error_body(
+                            in_reply_to,
+                            &format!("resident modification serialize: {e}"),
+                        ),
+                    )
+                    .await
+                }
+            },
+            None => {
+                return send_event(
+                    out_tx,
+                    error_body(
+                        in_reply_to,
+                        "mag.execute before any mag.load and no inline modification",
+                    ),
+                )
+                .await
+            }
+        },
+    };
+
+    let run_id = body
+        .get("run_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(default_run_id);
+    let run_name = body
+        .get("run_name")
+        .and_then(Value::as_str)
+        .unwrap_or(&run_id);
+    let session_id = body.get("session_id").and_then(Value::as_str);
+    let deadline_ms = body.get("deadline_ms").and_then(Value::as_u64);
+
+    host.begin_run(&run_id, run_name, session_id)?;
+    let state = host.start(&modification, deadline_ms)?;
+    flush_emits(out_tx, host).await?;
+
+    // A failed apply / rejected initial modification: nothing spawned.
+    if state.done && !state.ok {
+        let msg = state.error.unwrap_or_else(|| "start failed".into());
+        return send_event(out_tx, run_result_failed(in_reply_to, &run_id, &msg)).await;
+    }
+
+    // Synchronous program: the sink fired inside `start`. Reply now.
+    if let Some(rc) = host.take_run_complete()? {
+        return send_event(out_tx, run_result_ok(in_reply_to, &run_id, &rc)).await;
+    }
+
+    // Async program: defer the terminal reply until `mag.run_complete` arrives
+    // via capability responses (or the barrier deadline fails it).
+    *active = Some(ActiveExecute {
+        in_reply_to: in_reply_to.map(str::to_owned),
+        run_id,
+    });
+    Ok(())
+}
+
+/// Route a capability response into the kernel (unblocking a deferred
+/// activation), forward whatever it produced, and settle the run if it
+/// completed.
+async fn handle_tool_result(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    body: &Map<String, Value>,
+    host: &LuaHost,
+    active: &mut Option<ActiveExecute>,
+) -> Result<(), MagError> {
+    let id = match body.get("id").and_then(Value::as_str) {
+        Some(id) => id,
+        None => return Ok(()),
+    };
+    // Providers/tools reply with `output`; some producers use `result`.
+    let result = body.get("output").or_else(|| body.get("result"));
+    let error = body.get("error").and_then(Value::as_str);
+    host.bus_response(id, result, error)?;
+    flush_emits(out_tx, host).await?;
+    settle_if_complete(out_tx, host, active).await
+}
+
+/// A run id for an execute that didn't carry one. Millisecond-stamped; the
+/// control plane usually supplies its own.
+fn default_run_id() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("mag-run-{ms}")
 }
 
 /// Evaluate the named rule fn against `input` over the cached program, replying
@@ -297,7 +530,12 @@ fn pong_body(in_reply_to: Option<&str>) -> Map<String, Value> {
     m
 }
 
-fn loaded_body(in_reply_to: Option<&str>, hash: &str, modification: Value) -> Map<String, Value> {
+fn loaded_body(
+    in_reply_to: Option<&str>,
+    hash: &str,
+    modification: Value,
+    factories: &[String],
+) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("kind".into(), Value::String(LOADED_KIND.into()));
     if let Some(id) = in_reply_to {
@@ -305,6 +543,47 @@ fn loaded_body(in_reply_to: Option<&str>, hash: &str, modification: Value) -> Ma
     }
     m.insert("hash".into(), Value::String(hash.to_owned()));
     m.insert("modification".into(), modification);
+    // The kernel registry's factory names — the control plane's validation
+    // source of truth for reasoner/factory types.
+    m.insert(
+        "factories".into(),
+        Value::Array(factories.iter().cloned().map(Value::String).collect()),
+    );
+    m
+}
+
+/// Terminal run reply on success: status + the sink's output PATH (never node
+/// data — control-plane semantics, docs/ir.md).
+fn run_result_ok(
+    in_reply_to: Option<&str>,
+    run_id: &str,
+    rc: &RunCompletion,
+) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("kind".into(), Value::String(RUN_RESULT_KIND.into()));
+    if let Some(id) = in_reply_to {
+        m.insert("in_reply_to".into(), Value::String(id.to_owned()));
+    }
+    m.insert("run_id".into(), Value::String(run_id.to_owned()));
+    m.insert("status".into(), Value::String("completed".into()));
+    m.insert("persisted".into(), Value::Bool(rc.persisted));
+    if let Some(path) = &rc.output_path {
+        m.insert("output_path".into(), Value::String(path.clone()));
+    }
+    m
+}
+
+/// Terminal run reply on failure: status + the error naming what went wrong
+/// (rejected modification, straggler barrier).
+fn run_result_failed(in_reply_to: Option<&str>, run_id: &str, error: &str) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("kind".into(), Value::String(RUN_RESULT_KIND.into()));
+    if let Some(id) = in_reply_to {
+        m.insert("in_reply_to".into(), Value::String(id.to_owned()));
+    }
+    m.insert("run_id".into(), Value::String(run_id.to_owned()));
+    m.insert("status".into(), Value::String("failed".into()));
+    m.insert("error".into(), Value::String(error.to_owned()));
     m
 }
 
@@ -400,11 +679,17 @@ mod tests {
             Some("load-1"),
             "sha256:abc",
             serde_json::json!({"actors": []}),
+            &["stub".to_owned(), "sink".to_owned()],
         );
         assert_eq!(b.get("kind").and_then(Value::as_str), Some("mag.loaded"));
         assert_eq!(b.get("in_reply_to").and_then(Value::as_str), Some("load-1"));
         assert_eq!(b.get("hash").and_then(Value::as_str), Some("sha256:abc"));
         assert!(b.get("modification").and_then(Value::as_object).is_some());
+        let factories = b
+            .get("factories")
+            .and_then(Value::as_array)
+            .expect("factories");
+        assert!(factories.iter().any(|f| f.as_str() == Some("sink")));
     }
 
     #[test]
