@@ -68,6 +68,16 @@ local UNIT = "mag.Unit"
 local CAP_INVOKE = "capability.invoke"
 local COMPLETE = "mag.complete"
 local FAILED = "mag.failed"
+-- The sink's terminal run-complete signal (factories/sink.lua). Intercepted
+-- here so it reaches the control plane as a lifecycle event rather than routing
+-- nowhere (the sink declares no outputs).
+local RUN_COMPLETE = "mag.RunComplete"
+
+-- Lifecycle event kinds emitted from the delivery layer. The canonical set
+-- lives in observer.lua (M.EVENTS); kept as literals here to avoid a routing →
+-- observer module dependency.
+local EVT_ACTOR_READY = "mag.actor_ready"
+local EVT_RUN_COMPLETE = "mag.run_complete"
 
 local function noop() end
 
@@ -80,6 +90,12 @@ function M.new(opts)
     -- Injected host bus seam. Kept pure by injection: init.lua wires a stub
     -- until the host bus lands; tests pass a capturing sink.
     bus_emit = opts.bus_emit or noop,
+    -- Injected lifecycle-event sink (observer.lua's EVENTS set) and per-node
+    -- output persistence sink. Both default to no-ops so routing stays pure and
+    -- unit-testable; init.lua wires the real emitter and an output-persistence-
+    -- backed writer, tests pass capturing stubs.
+    events = opts.events or noop,
+    persist_output = opts.persist_output or noop,
     log = {
       info = (log.info) or noop,
       warn = (log.warn) or noop,
@@ -122,9 +138,29 @@ function M:on_emit(id, message)
     self:apply_completion(id, { status = "ok" })
   elseif kind == FAILED then
     self:apply_completion(id, { status = "failed", failure = message.failure, value = message.value })
+  elseif kind == RUN_COMPLETE then
+    self:on_run_complete(id, message)
   else
+    -- A declared output: persist it to the sender's per-node file (the control
+    -- plane reads outputs by path) before routing it downstream. Kernel-
+    -- synthesized status types (mag.Unit / failures) go out via apply_completion,
+    -- not here, so only real actor outputs are persisted.
+    self.persist_output(id, message)
     self:route_output(id, kind, message)
   end
+end
+
+-- The sink's terminal completion signal (factories/sink.lua). It carries the
+-- final result and whether the sink's own writer persisted it; surface it to the
+-- control plane as a `mag.run_complete` lifecycle event. The sink declares no
+-- outputs, so there is nothing to route.
+function M:on_run_complete(id, message)
+  self.events({
+    kind = EVT_RUN_COMPLETE,
+    from = id,
+    result = message.result,
+    persisted = message.persisted,
+  })
 end
 
 -- Route one id-signed output along the sender's routes[tag]. A tag with no
@@ -324,6 +360,11 @@ function M:on_ready(id)
     return
   end
   self.ready[id] = true
+  -- Lifecycle: the factory confirmed this id ready (actor-model.md). Surface it
+  -- as a lifecycle event before any draining, so observers see the actor become
+  -- routable ahead of the deliveries that drain into it (even when a barrier
+  -- defers the drain itself).
+  self.events({ kind = EVT_ACTOR_READY, id = id })
   if self.held then
     self.held[id] = true
     return
