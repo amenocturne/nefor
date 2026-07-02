@@ -1,0 +1,134 @@
+{
+  "actors": [
+    {
+      "id": "docs-explorer.entry",
+      "factory": "adapter",
+      "params": { "seed": "provider-in" },
+      "routes": {
+        "generic-provider.ProviderOut": ["docs-explorer.llm"]
+      }
+    },
+    {
+      "id": "docs-explorer.llm",
+      "factory": "llm",
+      "params": {
+        "model": "opus",
+        "system": "Explore the codebase and report findings.",
+        "tools": ["fs/read", "grep"]
+      },
+      "routes": {
+        "generic-tool.ToolCalls": ["docs-explorer.run-tool"],
+        "generic-provider.FinalAnswer": ["code-writer.entry"]
+      }
+    },
+    {
+      "id": "docs-explorer.run-tool",
+      "factory": "run-tool",
+      "params": {},
+      "routes": {
+        "generic-tool.ToolHandle": ["docs-explorer.tool-result"]
+      }
+    },
+    {
+      "id": "docs-explorer.tool-result",
+      "factory": "tool-result",
+      "params": {},
+      "routes": {
+        "generic-provider.ProviderOut": ["docs-explorer.loop-counter"]
+      }
+    },
+    {
+      "id": "docs-explorer.loop-counter",
+      "factory": "loop-counter",
+      "params": { "max": 50 },
+      "routes": {
+        "generic-provider.ProviderOut": ["docs-explorer.llm"],
+        "mag.LoopExhausted": ["docs-explorer.exhaust"]
+      }
+    },
+    {
+      "id": "docs-explorer.exhaust",
+      "factory": "llm",
+      "params": {
+        "model": "opus",
+        "system": "Summarize what you found so far."
+      },
+      "routes": {
+        "generic-provider.FinalAnswer": ["code-writer.entry"]
+      }
+    },
+
+    {
+      "id": "code-writer.entry",
+      "factory": "adapter",
+      "params": { "seed": "provider-in" },
+      "routes": {
+        "generic-provider.ProviderOut": ["code-writer.llm"]
+      }
+    },
+    {
+      "id": "code-writer.llm",
+      "factory": "llm",
+      "params": {
+        "model": "opus",
+        "system": "Implement the change from the findings.",
+        "tools": ["fs/read", "fs/edit", "shell"]
+      },
+      "routes": {
+        "generic-tool.ToolCalls": ["code-writer.run-tool"],
+        "generic-provider.FinalAnswer": ["sink"]
+      }
+    },
+    {
+      "id": "code-writer.run-tool",
+      "factory": "run-tool",
+      "params": {},
+      "routes": {
+        "generic-tool.ToolHandle": ["code-writer.tool-result"]
+      }
+    },
+    {
+      "id": "code-writer.tool-result",
+      "factory": "tool-result",
+      "params": {},
+      "routes": {
+        "generic-provider.ProviderOut": ["code-writer.loop-counter"]
+      }
+    },
+    {
+      "id": "code-writer.loop-counter",
+      "factory": "loop-counter",
+      "params": { "max": 80 },
+      "routes": {
+        "generic-provider.ProviderOut": ["code-writer.llm"],
+        "mag.LoopExhausted": ["code-writer.exhaust"]
+      }
+    },
+    {
+      "id": "code-writer.exhaust",
+      "factory": "llm",
+      "params": {
+        "model": "opus",
+        "system": "Summarize what you found so far."
+      },
+      "routes": {
+        "generic-provider.FinalAnswer": ["sink"]
+      }
+    },
+
+    {
+      "id": "sink",
+      "factory": "sink",
+      "params": {},
+      "routes": {}
+    }
+  ],
+  "messages": [
+    {
+      "to": "docs-explorer.entry",
+      "content": { "kind": "task", "prompt": "<initial task text>" }
+    }
+  ],
+  "kills": [],
+  "rules": []
+}

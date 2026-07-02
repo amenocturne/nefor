@@ -1,0 +1,64 @@
+;; two-agents.mag — two stdlib agents composed in one graph.
+;;
+;; This is a *design fixture* for the loader described in
+;; plugins/mag/docs/lowering.md. It is written as if the stdlib `(agent ...)`
+;; function already existed. The current compiler cannot evaluate it (see the
+;; gap list in lowering.md); its hand-lowered output lives beside it in
+;; two-agents.modification.json and is the acceptance-test target.
+;;
+;; What it demonstrates:
+;;   - two instantiations of ONE template (`agent`) with disjoint namespaces
+;;     (docs-explorer.* and code-writer.*)
+;;   - per-instance loop counters and per-instance typed cycle exits
+;;   - the graph-level edges between agents dissolving into per-actor routes
+;;   - a single program sink
+;;
+;; The type cycle inside each agent (see examples/agent-loop.mag):
+;;   generic-provider.ProviderOut -> (generic-tool.ToolCalls | generic-provider.FinalAnswer)
+;;   generic-tool.ToolCalls -> generic-tool.ToolHandle -> generic-provider.ProviderOut
+;;   generic-provider.ProviderOut folds back to the llm call, bounded by a loop-counter.
+
+(type mag.Task)
+(type generic-provider.ProviderOut)
+(type generic-provider.FinalAnswer)
+(type generic-tool.ToolCalls)
+(type generic-tool.ToolHandle)
+(type mag.LoopExhausted)
+
+;; `(agent ...)` is a stdlib MAG function, NOT a runtime primitive. It composes
+;; the primitive actors — an entry adapter, an `llm` call, `run-tool`,
+;; `tool-result`, a `loop-counter`, and an `exhaust` summarizer — into one
+;; cyclic constellation and returns a subgraph exposing a single input port and
+;; a single `generic-provider.FinalAnswer` output port. The :id namespaces every
+;; internal actor: the provider loop of `docs-explorer` is `docs-explorer.llm`.
+;;
+;; Boundary contract: `agent : IN -> generic-provider.FinalAnswer` for any IN —
+;; the entry adapter lifts whatever arrives into the initial ProviderOut, which
+;; is why the same template instantiates against `mag.Task` (agent 1) and
+;; `generic-provider.FinalAnswer` (agent 2) without change.
+
+(let [explorer (agent {:id        "docs-explorer"
+                       :model     "opus"
+                       :system    "Explore the codebase and report findings."
+                       :tools     ["fs/read" "grep"]
+                       :max-steps 50}
+                 : mag.Task -> generic-provider.FinalAnswer)
+
+      writer   (agent {:id        "code-writer"
+                       :model     "opus"
+                       :system    "Implement the change from the findings."
+                       :tools     ["fs/read" "fs/edit" "shell"]
+                       :max-steps 80}
+                 : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)
+
+      out      (node "sink" {}
+                 : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]
+
+  ;; The edges below are graph-level composition. Lowering dissolves them into
+  ;; the `routes` field of the emitting actors:
+  ;;   explorer -> writer   becomes  docs-explorer.{llm,exhaust}.FinalAnswer -> code-writer.entry
+  ;;   writer   -> out      becomes  code-writer.{llm,exhaust}.FinalAnswer   -> sink
+  (graph
+    explorer -> writer
+    writer   -> out
+    :terminal out))
