@@ -13,6 +13,7 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 - `plugins/openai-provider/` — generic OpenAI-compatible provider with chat-id-keyed `Chats` map (`<prefix>.chat.{create, append, complete, delete}`). Configurable base URL + model. Declares `Into` against `generic-provider` types.
 - `plugins/reasoner-graph/` — typed graph scheduler. Cycles allowed. Per-firing lifecycle, `prev_state`/`next_state` carry, fanout-based type-dispatched routing, ack/result lifecycle, broadcast `dag.run_started` / `dag.node_dispatched` for UI observability.
 - `plugins/tool-gate/` — tool advertisement aggregator + permission gate. Sources advertise via `tools.advertise`; callers invoke via `tool.invoke`; gate forwards as `<source>.tool.invoke` and echoes `tool.result`.
+- `plugins/mag/` — MAG runtime (design stage, docs only): actor kernel executing compiled `.mag` programs as in-memory actor constellations. Slated to replace `reasoner-graph`. See its `docs/`.
 - `plugins/basic-tools/` — `read_file` / `write_file` / `bash` built-ins.
 - `plugins/mock-plugin/` — scriptable NCP actor for integration tests. Local Ollama works through `openai-provider` directly with `static_token = "ollama-local"`.
 - `tools/fake-engine/` — harness that impersonates the engine for plugin-side tests.
@@ -65,6 +66,7 @@ If no `init.lua` is found, the engine prints a friendly error pointing at the RE
 
 - NCP wire spec: `protocol/v0.1/spec.md`.
 - Architecture/writing principles: `docs/principles.md`.
+- Execution layers (engine / plugins / Lua trait layer / MAG): `docs/architecture.md`.
 
 ## Architecture
 
