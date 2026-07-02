@@ -562,6 +562,7 @@ fn eval_builtin(env: &mut Env, name: &str, args: &[Expr]) -> Result<Value, MagEr
         }
         "node" => eval_node(env, args),
         "graph" => eval_graph(env, args),
+        "subgraph" => eval_subgraph(env, args),
         "agent" => eval_agent(env, args),
         "read" => {
             if args.is_empty() || args.len() > 2 {
@@ -1084,6 +1085,138 @@ fn eval_graph(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
         edges,
         terminal,
     }))
+}
+
+/// `(subgraph {:id N :in IN-NODE :out [OUT-NODE …]} a -> b …)`
+///
+/// The composition primitive templates are built from: it collects an
+/// `a -> b` body into internal actors + edges (exactly as `graph` does, minus
+/// the sink/terminal requirement), tags the boundary ports named by `:in`/`:out`,
+/// namespaces every id under `:id`, and returns a `Value::Subgraph` the
+/// enclosing `graph` can wire like any node. This is what lets `gate`,
+/// `retry-bounded`, and any future template live as MAG library code rather
+/// than Rust builtins: they are `.mag` functions that build nodes and hand them
+/// to `subgraph`.
+fn eval_subgraph(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
+    if args.is_empty() {
+        return Err(MagError::Eval(
+            "subgraph requires a config map {:id :in :out} then an edge body".into(),
+        ));
+    }
+
+    let config = match eval_expr(env, &args[0])? {
+        Value::Map(m) => m,
+        other => {
+            return Err(MagError::Eval(format!(
+                "subgraph config must be a map, got {}",
+                other.type_name()
+            )))
+        }
+    };
+
+    let id = match config.get("id") {
+        Some(Value::Str(s)) => s.clone(),
+        _ => return Err(MagError::Eval("subgraph requires a string :id".into())),
+    };
+
+    // Boundary ports reference node values (already id-renamed by their `let`
+    // binding). We keep only their id + boundary type; the type is decorative
+    // for lowering (routes are keyed by the actor's own output variants), but
+    // recording it keeps the port self-describing.
+    let input = match config.get("in") {
+        Some(Value::Node(n)) => Port {
+            actor: n.id.clone(),
+            ty: n.input_type.clone(),
+        },
+        _ => {
+            return Err(MagError::Eval(
+                "subgraph requires :in to be a single node value".into(),
+            ))
+        }
+    };
+    let outputs = match config.get("out") {
+        Some(Value::Vector(items)) | Some(Value::List(items)) => {
+            let mut ports = Vec::with_capacity(items.len());
+            for it in items {
+                match it {
+                    Value::Node(n) => ports.push(Port {
+                        actor: n.id.clone(),
+                        ty: n.output_type.clone(),
+                    }),
+                    other => {
+                        return Err(MagError::Eval(format!(
+                            "subgraph :out entries must be node values, got {}",
+                            other.type_name()
+                        )))
+                    }
+                }
+            }
+            ports
+        }
+        _ => {
+            return Err(MagError::Eval(
+                "subgraph requires :out to be a vector of node values".into(),
+            ))
+        }
+    };
+
+    // Collect the edge body — the same fragment/splice discipline as `graph`,
+    // deliberately without terminal handling (a subgraph is open: its exits are
+    // the declared output ports, not a sink). Duplicated rather than shared with
+    // `eval_graph` to keep the acceptance-critical `graph` path untouched.
+    let mut vals = Vec::new();
+    for e in &args[1..] {
+        match e {
+            Expr::Symbol(s) if s == "->" => vals.push(Value::Symbol("->".into())),
+            _ => vals.push(eval_expr(env, e)?),
+        }
+    }
+
+    let mut nodes: Vec<NodeValue> = Vec::new();
+    let mut edges: Vec<EdgeValue> = Vec::new();
+    let mut index: std::collections::HashMap<String, NodeValue> = std::collections::HashMap::new();
+
+    let mut i = 0;
+    while i < vals.len() {
+        if i + 2 < vals.len() {
+            if let Value::Symbol(arrow) = &vals[i + 1] {
+                if arrow == "->" {
+                    let from = fragment_of(&vals[i])?;
+                    let to = fragment_of(&vals[i + 2])?;
+                    splice_fragment(&from.nodes, &from.edges, &mut nodes, &mut index, &mut edges)?;
+                    splice_fragment(&to.nodes, &to.edges, &mut nodes, &mut index, &mut edges)?;
+                    for out in &from.outputs {
+                        if !edges.iter().any(|e| e.from == *out && e.to == to.input) {
+                            edges.push(EdgeValue {
+                                from: out.clone(),
+                                to: to.input.clone(),
+                            });
+                        }
+                    }
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+
+        if matches!(&vals[i], Value::Node(_) | Value::Subgraph(_)) {
+            let frag = fragment_of(&vals[i])?;
+            splice_fragment(&frag.nodes, &frag.edges, &mut nodes, &mut index, &mut edges)?;
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    let mut sub = SubgraphValue {
+        nodes,
+        edges,
+        input,
+        outputs,
+    };
+    prefix_subgraph(&id, &mut sub);
+    Ok(Value::Subgraph(sub))
 }
 
 /// Prefix every internal actor id, edge endpoint, and boundary port of a
