@@ -97,6 +97,12 @@ end
 -- Open the barrier and apply the initial modification. `opts`:
 --   inventory   the fold (register + queue + construct)
 --   router      the delivery layer (barrier hold + readiness)
+--   apply       fn(mod) -> result — the single composition point through which
+--               the initial modification is applied. init.lua passes the
+--               observer-wrapped apply, so modification #0 is recorded in the
+--               modlog and its lifecycle events fire, exactly like every later
+--               modification. Defaults to `inventory.apply` (the bare fold) when
+--               absent, so bare-VM barrier tests still run without an observer.
 --   mod         the program's initial modification
 --   now         fn() -> ms (injected clock); defaults to a zero clock
 --   deadline_ms per-program budget (default DEFAULT_DEADLINE_MS)
@@ -106,13 +112,14 @@ function M.start(opts)
   opts = opts or {}
   local inv = assert(opts.inventory, "barrier needs an inventory")
   local router = assert(opts.router, "barrier needs a router")
+  local apply = opts.apply or inv.apply
   local now = opts.now or function()
     return 0
   end
   local deadline_ms = opts.deadline_ms or DEFAULT_DEADLINE_MS
 
   router:begin_barrier()
-  local res = inv.apply(opts.mod)
+  local res = apply(opts.mod)
   if not res.ok then
     -- Validation rejected the initial modification: nothing spawned, nothing
     -- held. Clear the barrier and surface the rejection.

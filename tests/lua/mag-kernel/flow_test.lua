@@ -308,7 +308,7 @@ do
   local cancel = find_kind(msgs, "mag.ApprovalCancel")
   assert_true(cancel ~= nil, "drain cancels the outstanding approval request")
   assert_eq(cancel.correlation, "gate", "cancel carries the correlation handle")
-  assert_true(find_kind(msgs, "mag.Completed") ~= nil, "drain ends with a signed completion")
+  assert_true(find_kind(msgs, "mag.complete") ~= nil, "drain ends with a signed completion")
 
   -- After drain the pending request is gone: a late reply resolves nothing.
   local before = count_kind(msgs, "human.Approved")

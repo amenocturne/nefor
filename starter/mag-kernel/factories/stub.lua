@@ -6,6 +6,8 @@
 -- Nothing wraps it; the `drain` handler below is written out explicitly, and
 -- the declaration's `signals` list matches what the constructor implements.
 
+local kinds = require("kinds")
+
 local M = {}
 
 -- Plain, readable declaration data. The kernel and the validator read this;
@@ -73,14 +75,16 @@ function M.construct(id, params, emit, deps)
   end
 
   -- Explicit drain handler (SIGTERM analog): flush, then a signed completion.
-  -- Written inline — no wrapper composed this in.
+  -- Written inline — no wrapper composed this in. The completion ack is the
+  -- reserved kinds.complete (the kernel routes mag.Unit along dependency edges);
+  -- there is no separate "Completed" kind.
   function instance.handle_drain()
-    emit(sign({ kind = "mag.Completed" }))
+    emit(sign({ kind = kinds.complete }))
   end
 
   -- Confirm ready for this id (Lifecycle: factory creates instance, emits
   -- ready; the kernel then drains the pending mailbox to it).
-  emit(sign({ kind = "mag.ready" }))
+  emit(sign({ kind = kinds.ready }))
 
   return instance
 end

@@ -61,6 +61,8 @@
 --   the result is voided. So kill has nothing to abort; the handler only drops
 --   local batch state and documents the void. Written inline — no wrapper.
 
+local kinds = require("kinds")
+
 local M = {}
 
 M.declaration = {
@@ -127,7 +129,7 @@ function M.construct(id, params, emit, deps)
     emit(sign({ kind = "generic-tool.ToolHandle", results = results }))
     -- Deferred completion resolves: async success so the kernel emits mag.Unit
     -- along dependency edges. The reply delivery returns nil.
-    emit(sign({ kind = "mag.complete" }))
+    emit(sign({ kind = kinds.complete }))
   end
 
   -- A correlated tool answer. Fill its slot; fire only on the complete batch.
@@ -170,8 +172,11 @@ function M.construct(id, params, emit, deps)
     batches[bid] = { expected = #calls, received = 0, results = {} }
 
     for i, call in ipairs(calls) do
-      local call_name = call.name or call.tool
-      local call_args = call.args or call.arguments or {}
+      -- Canonical ToolCalls entries (actor-model.md, Canonical payloads):
+      -- { id, name, args }. llm emits exactly this shape, so read it directly —
+      -- no name/tool or args/arguments alias fallbacks.
+      local call_name = call.name
+      local call_args = call.args or {}
       emit(sign({
         kind = "capability.invoke",
         capability = call_name,
@@ -212,7 +217,7 @@ function M.construct(id, params, emit, deps)
   end
 
   -- Ready barrier (actor-model.md, Lifecycle): confirm creation for this id.
-  emit(sign({ kind = "mag.ready" }))
+  emit(sign({ kind = kinds.ready }))
 
   return instance
 end

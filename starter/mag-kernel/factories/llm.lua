@@ -51,34 +51,26 @@
 -- is a param, so the prefix is taken from it and the shape inlined rather than
 -- coupling this factory to one provider module (which also would not resolve on
 -- the mag-kernel package.path).
---   Delivery seam (FLAGGED): `<provider>.chat.cancel` is neither a reserved
---   kernel kind nor a declared/routed output, and at kill time the actor is
---   unrouted — so the current on_emit → route_output path drops it, exactly as
---   it would drop human.lua's `mag.ApprovalCancel`. Physically landing it on
---   the bus needs a kernel raw-emit seam (or emit-before-forget ordering) that
---   the landed kernel does not wire yet. The handler is written to the correct
---   shape and verified by capturing `emit`; kernel signal dispatch + raw-bus
---   forwarding is the routing/signal task's job — the same unwired status as
---   human.lua/stub.lua's drain handlers today.
+--   Delivery seam: `<provider>.chat.cancel` is neither a reserved kernel kind
+--   nor a declared/routed output, and at kill time the actor is unrouted — so
+--   on_emit → route_output would drop it. The kernel now wires the raw-emit
+--   path: dispatch_kill runs this handler with the id in signaling mode, so a
+--   non-reserved envelope it emits lands straight on bus_emit, strictly before
+--   forget (emit-before-forget; routing.lua on_emit, init.lua on_kill).
 --
 -- Explicit drain handler (SIGTERM analog): no new requests; finish the current
--- one, then die. If idle, complete immediately (`mag.Completed`, matching
--- stub.lua / human.lua). If in flight, mark draining so the pending reply
--- resolves normally (its `mag.complete`) and the kernel then removes the actor;
--- a new input arriving mid-drain is dropped (no new request is started).
+-- one, then die. If idle, complete immediately (the reserved kinds.complete,
+-- matching stub.lua / human.lua). If in flight, mark draining so the pending
+-- reply resolves normally (its mag.complete) and the kernel then removes the
+-- actor; a new input arriving mid-drain is dropped (no new request is started).
+
+local kinds = require("kinds")
 
 local M = {}
 
--- Default provider capability name when params omit `provider`. Flagged: a
--- placeholder — a real modification authors `params.provider` (scope: provider
--- selection). Used for BOTH the capability.invoke name and the `<prefix>.chat.
--- cancel` kind so the request and its abort address the same plugin.
-local DEFAULT_PROVIDER = "provider"
-
 -- Reserved suffered-failure tag (registry.lua RESERVED_ROUTE_KEYS). The
--- codebase has no canonical constant; picked per the `mag.` qualify-prefix
--- convention. Flagged there and mirrored here.
-local FAILED_TAG = "mag.Failed"
+-- canonical constant is kinds.Failed, shared with the kernel and registry.
+local FAILED_TAG = kinds.Failed
 
 M.declaration = {
   name = "llm",
@@ -115,8 +107,17 @@ M.declaration = {
 -- construct(id, params, emit, deps) -> instance
 function M.construct(id, params, emit, deps)
   params = params or {}
-  local provider = (type(params.provider) == "string" and #params.provider > 0)
-      and params.provider or DEFAULT_PROVIDER
+  -- Provider selection is authored data (params), matching the fixture. Its
+  -- absence is a construct-time validation error, never a silent default: a
+  -- modification that authors an llm node must say which provider capability it
+  -- targets. Returning nil + message (not error()) keeps the failure on the
+  -- construction seam — the instance never binds, never readies, and the ready
+  -- barrier names it a straggler (init.lua set_construct logs the message).
+  local provider = params.provider
+  if type(provider) ~= "string" or #provider == 0 then
+    return nil, string.format(
+      "llm '%s': params.provider is required (which provider capability to target)", tostring(id))
+  end
 
   -- Sign: stamp the actor id onto every outbound message (actor-model.md,
   -- Factories: "sign with the id").
@@ -177,16 +178,30 @@ function M.construct(id, params, emit, deps)
         -- Suffered provider error → deferred failure. The kernel routes the
         -- failure tag (ir.md, Firing: a suffered failure is kernel-synthesized
         -- so failure routes work uniformly).
-        emit(sign({ kind = "mag.failed", failure = FAILED_TAG, value = { error = activation.error } }))
+        emit(sign({ kind = kinds.failed, failure = FAILED_TAG, value = { error = activation.error } }))
         return nil
       end
 
       local result = activation.result
       if has_tool_calls(result) then
+        -- Canonical ToolCalls payload (actor-model.md, Canonical payloads):
+        -- { kind, from, calls = { { id, name, args }, ... } }. This is the
+        -- provider boundary, so it normalizes the provider's native tool-call
+        -- shape into the pinned form once — downstream (run-tool) reads exactly
+        -- id/name/args with no alias fallbacks.
+        local calls = {}
+        for i, tc in ipairs(result.tool_calls) do
+          tc = tc or {}
+          local fn = type(tc["function"]) == "table" and tc["function"] or {}
+          calls[i] = {
+            id = tc.id,
+            name = tc.name or fn.name,
+            args = tc.args or tc.arguments or fn.arguments,
+          }
+        end
         emit(sign({
           kind = "generic-tool.ToolCalls",
-          tool_calls = result.tool_calls,
-          result = result,
+          calls = calls,
         }))
       else
         local final = { kind = "generic-provider.FinalAnswer", result = result }
@@ -200,7 +215,7 @@ function M.construct(id, params, emit, deps)
       -- Deferred completion resolves: signal async success so the kernel emits
       -- mag.Unit along dependency edges. If we were draining, this same emit is
       -- the flush; the kernel removes the actor afterward.
-      emit(sign({ kind = "mag.complete" }))
+      emit(sign({ kind = kinds.complete }))
       return nil
     end
 
@@ -242,14 +257,14 @@ function M.construct(id, params, emit, deps)
   -- removes the actor.
   function instance.handle_drain()
     if pending == nil then
-      emit(sign({ kind = "mag.Completed" }))
+      emit(sign({ kind = kinds.complete }))
     else
       draining = true
     end
   end
 
   -- Ready barrier (actor-model.md, Lifecycle): confirm creation for this id.
-  emit(sign({ kind = "mag.ready" }))
+  emit(sign({ kind = kinds.ready }))
 
   return instance
 end

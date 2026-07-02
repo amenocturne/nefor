@@ -43,6 +43,8 @@
 -- is meaningful: cancel the outstanding request (`mag.ApprovalCancel`, so the
 -- chat surface can retract the prompt), drop the pending state, then die.
 
+local kinds = require("kinds")
+
 local M = {}
 
 M.declaration = {
@@ -112,7 +114,7 @@ function M.construct(id, params, emit, deps)
       end
       -- Deferred completion resolves now: signal async success so the kernel
       -- emits mag.Unit along dependency edges. The delivery returns nil.
-      emit(sign({ kind = "mag.complete" }))
+      emit(sign({ kind = kinds.complete }))
       return nil
     end
 
@@ -129,17 +131,21 @@ function M.construct(id, params, emit, deps)
   end
 
   -- Explicit drain handler (SIGTERM analog): abort the outstanding request,
-  -- then a signed completion. Written inline — no wrapper composed this in.
+  -- then a signed completion. Written inline — no wrapper composed this in. The
+  -- `mag.ApprovalCancel` is a bus-bound cancel (not a declared output): when the
+  -- kernel drives drain through router:drain it takes the raw-emit path to the
+  -- bus so the chat surface can retract the prompt. The completion ack is the
+  -- reserved kinds.complete — no separate "Completed" kind.
   function instance.handle_drain()
     if pending ~= nil then
       emit(sign({ kind = "mag.ApprovalCancel", correlation = id }))
       pending = nil
     end
-    emit(sign({ kind = "mag.Completed" }))
+    emit(sign({ kind = kinds.complete }))
   end
 
   -- Ready barrier (actor-model.md, Lifecycle): confirm creation for this id.
-  emit(sign({ kind = "mag.ready" }))
+  emit(sign({ kind = kinds.ready }))
 
   return instance
 end

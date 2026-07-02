@@ -26,6 +26,7 @@
 -- validated before applying").
 
 local shape = require("shape")
+local kinds = require("kinds")
 
 local registry = {}
 registry.__index = registry
@@ -37,13 +38,13 @@ registry.__index = registry
 -- So they are implicitly-permitted route keys on any actor:
 --   mag.Unit   — successful completion (a pure dependency edge, `C -> A`)
 --   mag.Failed — a suffered failure the kernel synthesizes (provider error,
---                kill mid-flight, budget). (Tag name flagged: the codebase has
---                no canonical constant; picked per the `mag.` qualify-prefix
---                convention. A factory's OWN computed failure output is a
---                declared tag and needs no exception.)
+--                kill mid-flight, budget). A factory's OWN computed failure
+--                output is a declared tag and needs no exception.
+-- Both names are the canonical constants (kinds.lua), shared with routing and
+-- the factories so no route key is re-spelled inline.
 local RESERVED_ROUTE_KEYS = {
-  ["mag.Unit"] = true,
-  ["mag.Failed"] = true,
+  [kinds.Unit] = true,
+  [kinds.Failed] = true,
 }
 
 -- ---- declaration validation -------------------------------------------------

@@ -140,3 +140,26 @@ low-level knowledge already is (the factory necessarily knows the plugin's
 request shapes; it knows the abort shape too). When several factories share a
 stateful plugin, the plugin's Lua-side adapter module owns the messy envelope
 once and factories call it: reuse via library, not via protocol.
+
+## Canonical payloads
+
+The message shapes the shipped factories emit and consume, as they exist in
+code today. Every outbound message is id-signed (`from = <actor id>`, omitted
+below). These are pinned contracts: a producer emits exactly this, a consumer
+reads exactly this — no alias fallbacks, no shape sniffing.
+
+| Kind                           | Emitter → consumer            | Payload (beyond `kind`, `from`)                                                                         |
+| ------------------------------ | ----------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `generic-tool.ToolCalls`       | llm → run-tool                | `calls = { { id, name, args }, … }`                                                                     |
+| `generic-tool.ToolHandle`      | run-tool → tool-result        | `results = { { id, name, output, error }, … }` (index-ordered to the calls)                             |
+| `generic-provider.FinalAnswer` | llm → sink / human            | `result` (raw provider result); `text?`, `final_answer?` (lifted when result is a table)                |
+| `mag.LoopExhausted`            | loop-counter → exhaust        | `reason`, `count`, `max?`, `last` (the most recent ProviderOut)                                         |
+| `mag.ApprovalRequest`          | human → control plane         | `correlation = <id>`, `prompt?`, `subject` (the input message)                                          |
+| `mag.ApprovalReply`            | control plane → human         | delivered as a graph activation tagged `mag.ApprovalReply`, `message = { approved, content?, reason? }` |
+| `mag.ApprovalCancel`           | human (drain) → control plane | `correlation = <id>`                                                                                    |
+| `human.Approved`               | human → downstream            | `subject`, `content`                                                                                    |
+| `human.Rejected`               | human → downstream            | `subject`, `reason`                                                                                     |
+
+The llm factory is the provider boundary: it normalizes the provider's native
+tool-call shape (`name`/`arguments`, or a nested `function`) into the pinned
+`{ id, name, args }` once, so `run-tool` reads `id`/`name`/`args` directly.

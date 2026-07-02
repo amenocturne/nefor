@@ -137,11 +137,16 @@ local router = routing.new({
   persist_output = persist_output,
 })
 -- Break the construction-order cycle (both hooks need the router, which needs
--- the inventory): the kill hook drops the router's firing slots + correlations;
--- the construct hook builds each freshly-spawned instance via the registry and
--- binds it into the router; the deliver hook routes live-target sends through
--- routing's single fire-vs-queue decision.
+-- the inventory): the kill hook first hands the dying instance its final kill
+-- message (dispatch_kill runs handle_kill; its abort envelopes take the raw-emit
+-- path to the bus) and THEN drops the router's firing slots + correlations
+-- (forget). The order is load-bearing — emit-before-forget — so a dying actor's
+-- provider-cancel/ApprovalCancel reaches the bus while it is still bound. The
+-- construct hook builds each freshly-spawned instance via the registry and binds
+-- it into the router; the deliver hook routes live-target sends through routing's
+-- single fire-vs-queue decision.
 inv.set_on_kill(function(id)
+  router:dispatch_kill(id)
   router:forget(id)
 end)
 
@@ -197,15 +202,18 @@ return {
   -- Start a program: apply its initial modification behind the ready barrier
   -- (spawn all → await readies → deliver initial messages; docs/ir.md). Returns
   -- a barrier handle; if `handle.done` is false the host polls it as late
-  -- readies arrive. `o.deadline_ms` overrides the per-program default.
-  -- NOTE: the barrier applies the initial modification through the inventory
-  -- directly, bypassing the observer — the initial modification is not yet
-  -- modlogged (reconciliation pending; single composition point).
+  -- readies arrive. `o.deadline_ms` overrides the per-program default. The
+  -- barrier applies the initial modification through the observer-wrapped apply
+  -- (the same path as `apply` below), so modification #0 is recorded in the
+  -- modlog and its lifecycle events fire — one composition point, no bypass.
   start = function(mod, o)
     o = o or {}
     return barrier.start({
       inventory = inv,
       router = router,
+      apply = function(m)
+        return obs:apply(m)
+      end,
       mod = mod,
       now = o.now or now_ms,
       deadline_ms = o.deadline_ms,
@@ -215,6 +223,14 @@ return {
   -- Advance a pending barrier handle against the host clock (ms).
   poll = function(handle, t)
     return barrier.poll(handle, t or now_ms())
+  end,
+
+  -- Drain one actor gracefully (actor-model.md, Signals: drain / SIGTERM):
+  -- calls its handle_drain where declared. This is the graceful path and is
+  -- never auto-invoked from kill; removal, when it comes, is a separate kill in
+  -- a modification. Returns true when a drain handler ran.
+  drain = function(id)
+    return router:drain(id)
   end,
 
   -- Begin a run: set the host-provided run context (session/run ids) and emit

@@ -59,7 +59,12 @@ local function harness(factories)
     bus_emit = function(env) bus[#bus + 1] = env end,
     gen_id = function() seq = seq + 1; return "req-" .. seq end,
   })
-  inv.set_on_kill(function(id) router:forget(id) end)
+  -- Mirror init.lua: hand the dying instance its final kill message
+  -- (dispatch_kill) BEFORE dropping routing state (forget) — emit-before-forget.
+  inv.set_on_kill(function(id)
+    router:dispatch_kill(id)
+    router:forget(id)
+  end)
   return { inv = inv, reg = reg, router = router, log = rec, bus = bus }
 end
 
@@ -344,6 +349,81 @@ do
   assert_eq(count(h.router.correlation.pending), 0, "kill dropped the outstanding correlation")
   assert_eq(h.router.machines["w"], nil, "kill dropped the firing machine (slots)")
   assert_eq(h.router.ready["w"], nil, "kill dropped the ready flag")
+end
+
+-- ==================================================================
+-- kill dispatch: handle_kill runs and its cancel envelope reaches bus_emit
+-- BEFORE forget drops the instance (emit-before-forget, raw-emit path)
+-- ==================================================================
+
+do
+  local h = harness({
+    canceller = { name = "canceller", inputs = { input = "job.Start" }, outputs = { "job.Done" } },
+  })
+
+  -- Register + bind an instance whose kill handler emits a bus-bound cancel
+  -- envelope (a non-reserved, non-declared kind — exactly llm's
+  -- `<provider>.chat.cancel` / human's `mag.ApprovalCancel` case).
+  local res = h.inv.apply({ actors = { { id = "k", factory = "canceller", params = {}, routes = {} } } })
+  assert_true(res.ok, "spawn canceller: " .. tostring(res.error))
+
+  local observed = {}
+  local inst = { id = "k", emit = h.router:emitter("k") }
+  inst.deliver = function() return "ok" end
+  function inst.handle_kill()
+    inst.emit({ kind = "prov.chat.cancel", from = "k", chat_id = "c1" })
+    -- Still bound at emit time? (forget has not run yet — emit-before-forget.)
+    observed.bound_at_emit = h.router.instances["k"] ~= nil
+  end
+  h.router:bind("k", inst)
+  inst.emit({ kind = "mag.ready", from = "k" })
+
+  h.inv.apply({ kills = { "k" } })
+
+  local cancel
+  for _, env in ipairs(h.bus) do
+    if env.kind == "prov.chat.cancel" then cancel = env end
+  end
+  assert_true(cancel ~= nil, "the kill handler's cancel envelope reached bus_emit via the raw path")
+  assert_eq(cancel.chat_id, "c1", "the cancel carries its provider handle")
+  assert_true(observed.bound_at_emit, "the cancel was emitted before forget (instance still bound)")
+  assert_eq(h.router.instances["k"], nil, "forget ran after dispatch — the instance is dropped")
+end
+
+-- ==================================================================
+-- drain(id): calls handle_drain (graceful path); kill never auto-drains
+-- ==================================================================
+
+do
+  local h = harness({ worker = { name = "worker", inputs = { input = "job.Start" }, outputs = {} } })
+
+  local drained = { count = 0 }
+  local inst = { id = "d", emit = h.router:emitter("d") }
+  inst.deliver = function() return "ok" end
+  function inst.handle_drain()
+    drained.count = drained.count + 1
+    inst.emit({ kind = "mag.complete", from = "d" })
+  end
+  h.inv.apply({ actors = { { id = "d", factory = "worker", params = {}, routes = {} } } })
+  h.router:bind("d", inst)
+  inst.emit({ kind = "mag.ready", from = "d" })
+
+  assert_eq(h.router:drain("d"), true, "drain runs the handler where declared")
+  assert_eq(drained.count, 1, "handle_drain was called exactly once")
+
+  -- drain on an id with no handler (or unknown) is a no-op returning false.
+  assert_eq(h.router:drain("nonexistent"), false, "drain on an unknown id returns false")
+
+  -- kill does NOT auto-invoke handle_drain (drain is a distinct op).
+  local flags = { drained = false }
+  local i2 = { id = "z", emit = h.router:emitter("z") }
+  i2.deliver = function() return "ok" end
+  function i2.handle_drain() flags.drained = true end
+  h.inv.apply({ actors = { { id = "z", factory = "worker", params = {}, routes = {} } } })
+  h.router:bind("z", i2)
+  i2.emit({ kind = "mag.ready", from = "z" })
+  h.inv.apply({ kills = { "z" } })
+  assert_true(not flags.drained, "kill does not auto-invoke handle_drain")
 end
 
 print("mag-kernel routing_test: all cases passed")

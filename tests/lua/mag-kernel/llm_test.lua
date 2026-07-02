@@ -131,7 +131,11 @@ do
   local calls = find_kind(msgs, "generic-tool.ToolCalls")
   assert_true(calls ~= nil, "a reply with tool calls emits generic-tool.ToolCalls")
   assert_eq(calls.from, "code-writer.llm", "ToolCalls is id-signed")
-  assert_eq(calls.tool_calls[1].name, "fs/read", "ToolCalls carries the provider's calls")
+  -- Canonical ToolCalls payload: { kind, from, calls = { { id, name, args } } }.
+  -- The provider boundary normalizes the native shape (name/arguments) here.
+  assert_eq(calls.calls[1].name, "fs/read", "ToolCalls carries a canonical call name")
+  assert_eq(calls.calls[1].args.path, "x", "the provider arguments are normalized to .args")
+  assert_true(calls.tool_calls == nil, "the raw provider tool_calls field is not surfaced")
   assert_true(find_kind(msgs, "mag.complete") ~= nil, "deferred success signalled with mag.complete")
   assert_true(find_kind(msgs, "generic-provider.FinalAnswer") == nil,
     "no FinalAnswer when tool calls are present")
@@ -160,11 +164,35 @@ do
     "no ToolCalls when the result has none")
 
   -- An empty tool_calls array is not "tool calls present" — classifies as final.
-  local i2, m2 = make("x.llm", {})
+  local i2, m2 = make("x.llm", { provider = "p" })
   i2.deliver(turn({}))
   i2.deliver({ kind = "reply", ref = find_kind(m2, "capability.invoke").ref, result = { tool_calls = {}, text = "hi" } })
   assert_true(find_kind(m2, "generic-provider.FinalAnswer") ~= nil,
     "an empty tool_calls array classifies as a FinalAnswer")
+end
+
+-- ==================================================================
+-- provider selection is required: no params.provider fails construction
+-- ==================================================================
+
+do
+  local _, emit = capture()
+  local inst, err = llm.construct("naked.llm", {}, emit)
+  assert_true(inst == nil, "an llm with no params.provider does not construct")
+  assert_true(type(err) == "string" and err:find("provider", 1, true) ~= nil,
+    "the construction error names the missing provider requirement")
+
+  -- An empty-string provider is likewise rejected (not a valid capability name).
+  local i2, e2 = llm.construct("naked2.llm", { provider = "" }, emit)
+  assert_true(i2 == nil and type(e2) == "string", "an empty provider string also fails construction")
+
+  -- Registry construction propagates the same nil + error (init.lua's
+  -- set_construct then logs it and never binds, so the actor never readies).
+  local reg = Registry.new()
+  reg:register({ declaration = llm.declaration, construct = llm.construct })
+  local rinst, rerr = reg:construct("llm", "r.llm", {}, emit, {})
+  assert_true(rinst == nil and type(rerr) == "string" and rerr:find("provider", 1, true) ~= nil,
+    "registry:construct forwards the missing-provider error")
 end
 
 -- ==================================================================
@@ -220,10 +248,10 @@ end
 -- ==================================================================
 
 do
-  -- Idle drain → mag.Completed now.
+  -- Idle drain → mag.complete now (the unified completion ack).
   local idle, im = make("idle.llm", { provider = "p" })
   idle.handle_drain()
-  assert_true(find_kind(im, "mag.Completed") ~= nil, "drain while idle completes immediately")
+  assert_true(find_kind(im, "mag.complete") ~= nil, "drain while idle completes immediately")
 
   -- In-flight drain → no immediate completion; a new turn is refused; the
   -- pending reply still flushes its output and completes.
@@ -231,7 +259,7 @@ do
   busy.deliver(turn({}))
   local invoke = find_kind(bm, "capability.invoke")
   busy.handle_drain()
-  assert_true(find_kind(bm, "mag.Completed") == nil, "drain while in flight does not complete yet")
+  assert_true(find_kind(bm, "mag.complete") == nil, "drain while in flight does not complete yet")
 
   local refused = busy.deliver(turn({ another = true }))
   assert_eq(refused, nil, "a new turn arriving mid-drain is refused (no completion)")

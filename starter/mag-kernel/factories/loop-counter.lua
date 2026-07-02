@@ -28,6 +28,8 @@
 -- so per actor-model.md ("explicit signal handlers only where meaningful") it
 -- declares and implements none. Its whole state is an integer.
 
+local kinds = require("kinds")
+
 local M = {}
 
 M.declaration = {
@@ -106,7 +108,7 @@ function M.construct(id, params, emit, deps)
   end
 
   -- Ready barrier (actor-model.md, Lifecycle): confirm creation for this id.
-  emit(sign({ kind = "mag.ready" }))
+  emit(sign({ kind = kinds.ready }))
 
   return instance
 end

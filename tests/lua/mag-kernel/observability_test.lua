@@ -17,6 +17,7 @@ local Registry = require("registry")
 local routing = require("routing")
 local modlog = require("modlog")
 local observer = require("observer")
+local barrier = require("barrier")
 local sink = require("factories.sink")
 
 -- ------------------------------------------------------------------
@@ -262,6 +263,59 @@ do
   })
   assert_true(sink_persisted["sink"] ~= nil, "the sink's final output landed via deps.writer, keyed by id")
   assert_eq(sink_persisted["sink"].text, "final", "the sink persisted the final answer")
+end
+
+-- ==================================================================
+-- 4. the barrier's initial modification is recorded in the modlog
+-- (barrier.start applies through the observer-wrapped apply — one composition
+-- point, modification #0 is modlogged like every later one)
+-- ==================================================================
+
+do
+  local inv = inventory.new({ log = silent_log() })
+  local reg = Registry.new()
+  reg:register({
+    declaration = { name = "entry", params = {}, inputs = { input = "seed.In" }, outputs = {} },
+    construct = function(id, params, emit)
+      local i = { id = id }
+      i.deliver = function() return "ok" end
+      emit({ kind = "mag.ready", from = id }) -- synchronous ready → barrier releases
+      return i
+    end,
+  })
+  local router = routing.new({ inventory = inv, registry = reg, log = silent_log() })
+  inv.set_on_kill(function(id) router:forget(id) end)
+  inv.set_construct(function(record)
+    local emit = router:emitter(record.id)
+    local i, e = reg:construct(record.factory, record.id, record.params, emit, {})
+    if i and not e then router:bind(record.id, i) end
+  end)
+  inv.set_deliver(function(to, from, content)
+    content = content or {}
+    router:deliver(to, from, content.kind, content)
+  end)
+
+  local mlog = modlog.new({}) -- in-memory only
+  local obs = observer.new({ inventory = inv, emit_event = noop, modlog = mlog })
+
+  local mod = {
+    actors = { actor_spec("entry", "entry", {}, {}) },
+    messages = { { to = "entry", content = { kind = "seed.In", payload = "go" } } },
+  }
+  local handle = barrier.start({
+    inventory = inv,
+    router = router,
+    apply = function(m) return obs:apply(m) end, -- the single composition point
+    mod = mod,
+    now = function() return 0 end,
+  })
+  assert_true(handle.done and handle.ok, "the synchronous program starts and releases")
+
+  assert_eq(mlog:count(), 1, "the initial modification is recorded (modification #0)")
+  local entry = mlog:all()[1]
+  assert_eq(entry.outcome, "applied", "the initial modification is logged as applied")
+  assert_eq(entry.modification, mod, "the logged entry carries the initial modification")
+  assert_eq(entry.spawned[1], "entry", "the entry records the spawned actor id")
 end
 
 print("mag-kernel observability_test: all cases passed")

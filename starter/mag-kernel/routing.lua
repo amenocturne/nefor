@@ -57,27 +57,31 @@
 local shape = require("shape")
 local firing = require("firing")
 local correlation = require("correlation")
+local kinds = require("kinds")
 
 local M = {}
 M.__index = M
 
 -- Reserved emit kinds (namespaced, so they never collide with a factory's
--- fully-qualified declared output tags).
-local READY = "mag.ready"
-local UNIT = "mag.Unit"
+-- fully-qualified declared output tags). The canonical spellings live in
+-- kinds.lua; only capability.invoke stays local (a bus-bound request kind, not
+-- part of the reserved completion vocabulary).
+local READY = kinds.ready
+local UNIT = kinds.Unit
 local CAP_INVOKE = "capability.invoke"
-local COMPLETE = "mag.complete"
-local FAILED = "mag.failed"
+local COMPLETE = kinds.complete
+local FAILED = kinds.failed
 -- The sink's terminal run-complete signal (factories/sink.lua). Intercepted
 -- here so it reaches the control plane as a lifecycle event rather than routing
 -- nowhere (the sink declares no outputs).
-local RUN_COMPLETE = "mag.RunComplete"
+local RUN_COMPLETE = kinds.RunComplete
 
--- Lifecycle event kinds emitted from the delivery layer. The canonical set
--- lives in observer.lua (M.EVENTS); kept as literals here to avoid a routing →
--- observer module dependency.
+-- Lifecycle event kinds emitted from the delivery layer. actor_ready mirrors
+-- observer.lua's canonical set (kept literal to avoid a routing → observer
+-- dependency); run_complete is shared through kinds.lua because it drifted
+-- against the RunComplete message kind and both must stay in lockstep.
 local EVT_ACTOR_READY = "mag.actor_ready"
-local EVT_RUN_COMPLETE = "mag.run_complete"
+local EVT_RUN_COMPLETE = kinds.run_complete
 
 local function noop() end
 
@@ -106,6 +110,7 @@ function M.new(opts)
     machines = {}, -- id -> { port -> firing machine }
     ready = {}, -- id -> true once the factory confirmed ready
     held = nil, -- set of held ids while a program-start barrier is active
+    signaling = {}, -- id -> true while a signal handler (kill/drain) is running
   }, M)
   return self
 end
@@ -140,6 +145,16 @@ function M:on_emit(id, message)
     self:apply_completion(id, { status = "failed", failure = message.failure, value = message.value })
   elseif kind == RUN_COMPLETE then
     self:on_run_complete(id, message)
+  elseif self.signaling[id] then
+    -- A non-reserved emit from an actor whose signal handler (kill/drain) is
+    -- running: these are final abort/cancel envelopes bound for a capability
+    -- plugin (llm's `<provider>.chat.cancel`, human's `mag.ApprovalCancel`),
+    -- not declared outputs. They must bypass route_output's declared-tag routing
+    -- — which would drop them (a killed actor is already unrouted; a cancel is
+    -- not on any route) — and land straight on the bus. This is the raw-emit
+    -- seam; on kill it runs strictly before forget (dispatch_kill), so the
+    -- envelope reaches bus_emit while the instance is still bound.
+    self.bus_emit(message)
   else
     -- A declared output: persist it to the sender's per-node file (the control
     -- plane reads outputs by path) before routing it downstream. Kernel-
@@ -412,14 +427,51 @@ function M:release_barrier()
   end
 end
 
+-- Hand a dying instance its one final kill message (actor-model.md, Signals:
+-- kill). Removal is unconditional; the handler is a courtesy so an actor holding
+-- live external work (an open provider request) can abort it. Runs the handler
+-- with `signaling[id]` set, so any non-reserved envelope it emits takes the
+-- raw-emit path to the bus (on_emit) instead of route_output — which would drop
+-- it, the id being already unrouted. Called from the inventory's on_kill seam
+-- BEFORE forget (init.lua), so the abort envelope reaches bus_emit while the
+-- instance is still bound: emit-before-forget.
+function M:dispatch_kill(id)
+  local instance = self.instances[id]
+  if not instance or type(instance.handle_kill) ~= "function" then
+    return false
+  end
+  self.signaling[id] = true
+  instance.handle_kill()
+  self.signaling[id] = nil
+  return true
+end
+
+-- Graceful drain (actor-model.md, Signals: drain / SIGTERM). The kernel exposes
+-- this as a distinct op (init.lua `drain(id)`) — it is NEVER auto-called from
+-- kill. Calls the instance's drain handler where declared, with `signaling[id]`
+-- set so a bus-bound cancel envelope it emits (human's `mag.ApprovalCancel`)
+-- reaches the bus by the same raw path; reserved acks (mag.complete) still route
+-- normally. Returns true when a handler ran.
+function M:drain(id)
+  local instance = self.instances[id]
+  if not instance or type(instance.handle_drain) ~= "function" then
+    return false
+  end
+  self.signaling[id] = true
+  instance.handle_drain()
+  self.signaling[id] = nil
+  return true
+end
+
 -- Drop all routing state for a killed id (kill drops the mailbox — inventory's
 -- do_kill already clears it — plus the firing slots and outstanding capability
 -- correlations; actor-model.md, Signals: kill). Wired from the inventory's
--- on_kill seam in init.lua.
+-- on_kill seam in init.lua, strictly after dispatch_kill.
 function M:forget(id)
   self.machines[id] = nil
   self.ready[id] = nil
   self.instances[id] = nil
+  self.signaling[id] = nil
   self.correlation:drop_requester(id)
 end
 

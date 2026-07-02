@@ -33,6 +33,8 @@
 -- the node holds no in-flight external work to abort or flush (actor-model.md,
 -- Signals: "explicit signal handlers only where meaningful").
 
+local kinds = require("kinds")
+
 local M = {}
 
 M.declaration = {
@@ -103,7 +105,7 @@ function M.construct(id, params, emit, deps)
   end
 
   -- Ready barrier (actor-model.md, Lifecycle): confirm creation for this id.
-  emit(sign({ kind = "mag.ready" }))
+  emit(sign({ kind = kinds.ready }))
 
   return instance
 end

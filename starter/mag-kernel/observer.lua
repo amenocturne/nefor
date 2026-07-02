@@ -28,6 +28,8 @@
 --   mag.modification_noop      a validated mod whose ops were all race no-ops
 --   mag.run_complete           the sink signaled terminal completion (routing)
 
+local kinds = require("kinds")
+
 local M = {}
 M.__index = M
 
@@ -39,7 +41,9 @@ M.EVENTS = {
   modification_applied = "mag.modification_applied",
   modification_rejected = "mag.modification_rejected",
   modification_noop = "mag.modification_noop",
-  run_complete = "mag.run_complete",
+  -- Shared with routing.lua through kinds.lua: the run-complete event kind
+  -- drifted against the RunComplete message kind, so both are sourced here.
+  run_complete = kinds.run_complete,
 }
 
 local EVENTS = M.EVENTS

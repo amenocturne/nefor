@@ -14,6 +14,7 @@
 local Registry    = require("registry")
 local run_tool    = require("factories.run-tool")
 local tool_result = require("factories.tool-result")
+local llm         = require("factories.llm")
 
 -- ------------------------------------------------------------------
 -- helpers
@@ -267,6 +268,53 @@ do
   -- an errored result becomes readable content plus the raw error
   assert_eq(out.messages[3].content, "[tool error] exit 1", "an error becomes readable content")
   assert_eq(out.messages[3].error, "exit 1", "the raw error is preserved on the message")
+end
+
+-- ==================================================================
+-- pinned ToolCalls payload round-trips llm → run-tool
+-- (llm emits the canonical { calls = { { id, name, args } } }; run-tool reads
+-- it with no alias fallbacks and fans out one invoke per call)
+-- ==================================================================
+
+do
+  -- Drive an llm to a tool-calls reply so it emits a real ToolCalls message.
+  local lm, lemit = capture()
+  local linst = llm.construct("dx.llm", { provider = "p" }, lemit)
+  linst.deliver({
+    shape = "single",
+    messages = { { from = "up", tag = "generic-provider.ProviderOut", message = { messages = {} } } },
+  })
+  local invoke = find_kind(lm, "capability.invoke")
+  linst.deliver({
+    kind = "reply",
+    ref = invoke.ref,
+    result = { tool_calls = {
+      { id = "tc-1", name = "grep", arguments = { pattern = "foo" } },
+      { id = "tc-2", name = "fs/read", arguments = { path = "a.txt" } },
+    } },
+  })
+
+  local toolcalls = find_kind(lm, "generic-tool.ToolCalls")
+  assert_true(toolcalls ~= nil, "llm emits a generic-tool.ToolCalls")
+  assert_eq(#toolcalls.calls, 2, "the canonical payload carries one entry per provider call")
+  assert_eq(toolcalls.calls[1].id, "tc-1", "canonical call keeps the model's id")
+  assert_eq(toolcalls.calls[1].name, "grep", "canonical call carries the tool name")
+  assert_eq(toolcalls.calls[1].args.pattern, "foo", "canonical call normalizes arguments to .args")
+
+  -- Feed exactly that payload into run-tool: it must fan out per call, reading
+  -- id/name/args directly (no name/tool or args/arguments fallbacks).
+  local rm, remit = capture()
+  local rinst = run_tool.construct("dx.run-tool", {}, remit)
+  local pending = rinst.deliver(single("dx.llm", "generic-tool.ToolCalls", toolcalls))
+  assert_eq(pending.status, "pending", "run-tool defers on the round-tripped batch")
+
+  local invokes = collect_kind(rm, "capability.invoke")
+  assert_eq(#invokes, 2, "run-tool fans out one invoke per canonical call")
+  assert_eq(invokes[1].capability, "grep", "invoke 1 targets the canonical call name")
+  assert_eq(invokes[1].request.args.pattern, "foo", "invoke 1 carries the canonical call args")
+  assert_eq(invokes[1].ref.call_id, "tc-1", "invoke 1 correlation keeps the canonical call id")
+  assert_eq(invokes[2].capability, "fs/read", "invoke 2 targets the second canonical call name")
+  assert_eq(invokes[2].request.args.path, "a.txt", "invoke 2 carries the second call args")
 end
 
 print("mag-kernel tools_test: all assertions passed")

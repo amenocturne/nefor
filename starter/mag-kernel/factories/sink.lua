@@ -28,6 +28,8 @@
 -- handlers: the sink persists synchronously on activation, holding no pending
 -- work to drain or abort.
 
+local kinds = require("kinds")
+
 local M = {}
 
 M.declaration = {
@@ -76,9 +78,11 @@ function M.construct(id, params, emit, deps)
       persisted = true
     end
 
-    -- Run-complete signal (flagged): reserved kind for the control plane.
+    -- Run-complete signal: the reserved terminal MESSAGE kind for the control
+    -- plane (kinds.RunComplete). Routing surfaces it as the mag.run_complete
+    -- lifecycle event — two names, two channels (kinds.lua).
     emit(sign({
-      kind = "mag.RunComplete",
+      kind = kinds.RunComplete,
       result = final,
       persisted = persisted,
     }))
@@ -86,7 +90,7 @@ function M.construct(id, params, emit, deps)
   end
 
   -- Ready barrier (actor-model.md, Lifecycle): confirm creation for this id.
-  emit(sign({ kind = "mag.ready" }))
+  emit(sign({ kind = kinds.ready }))
 
   return instance
 end
