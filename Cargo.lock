@@ -1436,6 +1436,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "mag-plugin"
+version = "0.2.0"
+dependencies = [
+ "clap",
+ "mlua",
+ "nefor-mag",
+ "nefor-plugin-sdk",
+ "nefor-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

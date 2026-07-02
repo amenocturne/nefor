@@ -1,0 +1,33 @@
+[package]
+name = "mag-plugin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NCP v0.1 plugin: MAG actor-kernel runtime. Hosts a Lua VM that loads the kernel/factory modules and (eventually) folds graph modifications produced by the resident nefor-mag evaluator."
+
+# Binary is `mag-plugin`, not `mag`: the `nefor-mag` crate already owns a
+# `mag` binary (the compiler CLI), so the plugin gets a distinct name to
+# avoid a workspace output-filename collision. Bus identity stays `mag`
+# (assigned in starter/init.lua).
+[[bin]]
+name = "mag-plugin"
+path = "src/main.rs"
+
+[dependencies]
+nefor-protocol = { path = "../../crates/nefor-protocol" }
+nefor-plugin-sdk = { path = "../../crates/nefor-plugin-sdk" }
+nefor-mag = { path = "../../crates/nefor-mag" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+mlua = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }

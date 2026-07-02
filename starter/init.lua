@@ -390,6 +390,19 @@ do
 end
 actor.spawn(require("compositors.graph").spawn_spec(rg_argv))
 
+-- mag: the MAG actor-kernel runtime. Coexists with reasoner-graph (it
+-- will eventually replace it, but the skeleton just handshakes, hosts a
+-- Lua VM, and loads the stub kernel). Speaks the canonical wire shape,
+-- so it spawns via `identity_spec` like reasoner-graph. The `--kernel`
+-- path points the plugin's embedded VM at the config-resident kernel
+-- entry; STARTER_ROOT is NEFOR_CONFIG_DIR (the repo's `starter/` under
+-- `just run`). Binary is `mag-plugin` (the `mag` binary is nefor-mag's
+-- compiler CLI); bus identity is `mag`.
+actor.spawn(actor.identity_spec("mag", {
+  require("config").bin("mag-plugin"),
+  "--kernel", STARTER_ROOT .. "/mag-kernel/init.lua",
+}))
+
 local tools = require("compositors.tools")
 local tool_gate_argv = { require("config").bin("tool-gate") }
 for _, t in ipairs(cfg.tool_gate.auto_tools or {}) do
