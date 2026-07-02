@@ -181,17 +181,27 @@ do
 end
 
 -- ------------------------------------------------------------------
--- message to a dead target — rejected (dead is not a live target)
+-- message to a dead target — dropped as a logged no-op, not rejected
+-- (race artifact of first-applied-wins: the sender computed the send
+-- while the target lived; docs/ir.md)
 -- ------------------------------------------------------------------
 
 do
-  local inv = new_inv()
-  inv.apply({ actors = { actor_spec("a", "llm", {}, {}) } })
+  local inv, rec = new_inv()
+  inv.apply({ actors = { actor_spec("a", "llm", {}, {}), actor_spec("b", "llm", {}, {}) } })
   inv.apply({ kills = { "a" } })
 
-  local res = inv.apply({ messages = { { to = "a", content = {} } } })
-  assert_true(not res.ok, "message to a dead target is rejected")
-  assert_contains(res.error, "unknown message target", "dead target treated as unreachable")
+  local res = inv.apply({ messages = {
+    { to = "a", content = {} },
+    { to = "b", content = { note = "sibling delivery" } },
+  } })
+  assert_true(res.ok, "modification with a dead-target send still applies")
+  assert_eq(#inv.get("b").mailbox, 1, "sibling send in the same modification delivered")
+  local dropped = false
+  for _, m in ipairs(rec.info) do
+    if m:find("send dropped", 1, true) then dropped = true end
+  end
+  assert_true(dropped, "dead-target send logged as dropped at info")
 end
 
 -- ------------------------------------------------------------------

@@ -117,9 +117,14 @@ is to encode the ordering. No second vocabulary exists.
   (warning) — but semantics stay uniform: ignored.
 - **Every modification is validated before applying**, with the same
   validator that checked the program at load: contract compatibility, id
-  uniqueness against the live inventory, message targets alive or created
-  within the same modification. A rejected modification is an error routed
-  to the control plane; the run continues.
+  uniqueness *within* the modification (the same id spawned twice in one
+  `actors` list is a program bug and rejects), and message targets that
+  exist or are created within the same modification. A rejected
+  modification is an error routed to the control plane; the run continues.
+  Race artifacts are never rejections: spawning an id that is already alive
+  is the logged no-op above, and a send to a dead id drops as a logged
+  no-op at apply (the sender computed it while the target lived). Only
+  never-existed targets reject — that is a typo, not a race.
 - **The modification log is the run.** Graph state at any moment is a
   prefix of the fold; replay is deterministic even though arrival order was
   not. Debugging is diffing prefixes.

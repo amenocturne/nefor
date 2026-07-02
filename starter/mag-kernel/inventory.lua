@@ -169,10 +169,12 @@ local function validate(self, mod)
     end
   end
 
-  -- messages: shape + target reachability. A target is valid when it is
-  -- alive in the inventory or created within this same modification
-  -- (docs/ir.md, "message targets alive or created within the same
-  -- modification").
+  -- messages: shape + target reachability. A target is valid when it
+  -- exists in the inventory (alive or dead) or is created within this same
+  -- modification (docs/ir.md). Never-existed targets are program bugs and
+  -- reject the modification; dead targets are race artifacts (the sender
+  -- computed the send while the target lived) and drop at execution as
+  -- logged no-ops.
   for idx, msg in ipairs(messages) do
     if type(msg) ~= "table" then
       return nil, string.format("messages[%d] is not a table", idx)
@@ -181,8 +183,7 @@ local function validate(self, mod)
       return nil, string.format("messages[%d] missing string 'to'", idx)
     end
     local entry = self.actors[msg.to]
-    local alive = entry ~= nil and entry.state == ALIVE
-    if not alive and not spawned[msg.to] then
+    if entry == nil and not spawned[msg.to] then
       return nil, string.format("unknown message target '%s'", msg.to)
     end
   end
@@ -231,10 +232,14 @@ end
 
 local function do_send(self, msg)
   local entry = self.actors[msg.to]
-  -- validate guaranteed a live-or-just-created target; a live target with
-  -- no factory yet simply accumulates in its mailbox (actor-model.md).
+  -- validate guaranteed the target exists (alive or just created) or is
+  -- dead. A live target with no factory yet accumulates in its mailbox
+  -- (actor-model.md); a dead target drops the send as a logged no-op —
+  -- the race artifact of first-applied-wins (docs/ir.md).
   if entry and entry.state == ALIVE then
     entry.mailbox[#entry.mailbox + 1] = msg.content
+  else
+    self.log.info(string.format("send dropped: target '%s' is dead", msg.to))
   end
 end
 
