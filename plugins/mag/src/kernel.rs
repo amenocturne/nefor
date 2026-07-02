@@ -44,6 +44,9 @@ impl LuaHost {
 
         let lua = Lua::new();
         install_nefor(&lua)?;
+        if let Some(dir) = path.parent() {
+            set_kernel_path(&lua, dir)?;
+        }
 
         let chunk_name = format!("@{}", path.display());
         let value: Value = lua.load(&source).set_name(chunk_name.as_str()).eval()?;
@@ -77,6 +80,19 @@ impl LuaHost {
 /// non-string value.
 fn kernel_name(kernel: &Table) -> Option<String> {
     kernel.get::<Option<String>>("name").ok().flatten()
+}
+
+/// Point `package.path` at the kernel file's directory so the entry chunk
+/// can `require` sibling modules (`inventory`, and the factory registry as
+/// it lands) by bare name. Without this the VM searches only the
+/// process-default paths and a modular kernel cannot load.
+fn set_kernel_path(lua: &Lua, dir: &Path) -> Result<(), MagError> {
+    let package: Table = lua.globals().get("package")?;
+    let current: String = package.get("path")?;
+    let dir = dir.display().to_string();
+    let new = format!("{dir}/?.lua;{dir}/?/init.lua;{current}");
+    package.set("path", new)?;
+    Ok(())
 }
 
 /// Install the minimal `nefor` global the kernel needs at load time.

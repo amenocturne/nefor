@@ -36,6 +36,7 @@ test-starter:
     cargo test -p nefor --test starter_lead_workflow_test
     cargo test -p nefor --test starter_lead_role_test
     cargo test -p nefor --test starter_loop_counter_reasoner_test
+    cargo test -p nefor --test starter_mag_kernel_test
     cargo test -p nefor --test starter_ncp_test
     cargo test -p nefor --test starter_run_reasoner_test
 
