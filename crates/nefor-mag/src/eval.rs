@@ -12,6 +12,117 @@ fn next_node_id() -> String {
     format!("node_{n}")
 }
 
+/// Bounded-evaluation fuel. Two coupled rails, both surfacing `MagError::Budget`
+/// so a runaway evaluation is always a clean error, never a hang or a native
+/// stack overflow:
+///
+/// - **Step budget** (`STEPS`, decremented once per `eval_expr`): caps total
+///   work. Catches wide non-recursive blowups (e.g. folding an enormous list).
+/// - **Recursion-depth cap** (`DEPTH`, tracked across `apply_fn`): caps native
+///   call-stack growth. Catches non-terminating recursion — the only way a MAG
+///   program can loop, since the interpreter has no TCO. This is the rail that
+///   actually fires for `(fn [x] (self x))`, well before the step budget and
+///   far below the stack ceiling of the dedicated evaluation thread.
+///
+/// Both are dormant by default (`STEPS == UNLIMITED`) so the `compile` dev path
+/// and unit tests evaluate unbounded, exactly as before. A budget is armed only
+/// by the resident entry points (`load`, `eval_fn` in lib.rs), which run on a
+/// large-stack thread so the depth cap has ample headroom.
+pub(crate) mod fuel {
+    use crate::error::MagError;
+    use std::cell::Cell;
+
+    const UNLIMITED: u64 = u64::MAX;
+
+    /// Native-stack safety rail. Each MAG call frame nests a handful of Rust
+    /// frames; the resident evaluator runs on a 64 MiB stack (lib.rs), leaving
+    /// this cap a wide margin. Ample for any real rule fn — recursion this deep
+    /// is a non-terminating program, not legitimate work.
+    const MAX_DEPTH: usize = 4096;
+
+    thread_local! {
+        static STEPS: Cell<u64> = const { Cell::new(UNLIMITED) };
+        static DEPTH: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Arm a step budget for the current thread; restores the prior budget and
+    /// depth on drop so nested evaluations compose.
+    pub(crate) struct Guard {
+        prev_steps: u64,
+        prev_depth: usize,
+    }
+
+    pub(crate) fn install(steps: u64) -> Guard {
+        let prev_steps = STEPS.with(|c| c.replace(steps));
+        let prev_depth = DEPTH.with(|c| c.replace(0));
+        Guard {
+            prev_steps,
+            prev_depth,
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            STEPS.with(|c| c.set(self.prev_steps));
+            DEPTH.with(|c| c.set(self.prev_depth));
+        }
+    }
+
+    fn is_bounded() -> bool {
+        STEPS.with(|c| c.get()) != UNLIMITED
+    }
+
+    /// Consume one evaluation step. Called once per `eval_expr`.
+    pub(crate) fn step() -> Result<(), MagError> {
+        STEPS.with(|c| {
+            let remaining = c.get();
+            if remaining == UNLIMITED {
+                Ok(())
+            } else if remaining == 0 {
+                Err(MagError::Budget("step budget exhausted".into()))
+            } else {
+                c.set(remaining - 1);
+                Ok(())
+            }
+        })
+    }
+
+    /// Enter a function application, incrementing native-recursion depth. The
+    /// returned guard decrements on drop. Only enforced while a budget is armed
+    /// (the unbounded `compile`/test paths keep their prior behavior).
+    pub(crate) fn enter_call() -> Result<CallGuard, MagError> {
+        if !is_bounded() {
+            return Ok(CallGuard { active: false });
+        }
+        let depth = DEPTH.with(|c| {
+            let d = c.get() + 1;
+            c.set(d);
+            d
+        });
+        if depth > MAX_DEPTH {
+            // Undo this frame's increment before erroring so the count stays
+            // consistent for the unwinding path.
+            DEPTH.with(|c| c.set(c.get() - 1));
+            return Err(MagError::Budget(format!(
+                "recursion depth limit ({MAX_DEPTH}) exceeded"
+            )));
+        }
+        Ok(CallGuard { active: true })
+    }
+
+    pub(crate) struct CallGuard {
+        active: bool,
+    }
+
+    impl Drop for CallGuard {
+        fn drop(&mut self) {
+            if self.active {
+                DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+            }
+        }
+    }
+}
+
 pub fn eval_program(env: &mut Env, exprs: &[Expr]) -> Result<Value, MagError> {
     let mut result = Value::Nil;
     for expr in exprs {
@@ -21,6 +132,7 @@ pub fn eval_program(env: &mut Env, exprs: &[Expr]) -> Result<Value, MagError> {
 }
 
 fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, MagError> {
+    fuel::step()?;
     match expr {
         Expr::Int(n) => Ok(Value::Int(*n)),
         Expr::Float(n) => Ok(Value::Float(*n)),
@@ -246,6 +358,7 @@ fn apply_fn(fv: &FnValue, args: &[Value]) -> Result<Value, MagError> {
             got: args.len(),
         });
     }
+    let _call = fuel::enter_call()?;
     let mut fn_env = Env::new();
     // Restore closure
     for (k, v) in &fv.closure {
@@ -261,6 +374,27 @@ fn apply_fn(fv: &FnValue, args: &[Value]) -> Result<Value, MagError> {
     }
     fn_env.pop_scope();
     Ok(result)
+}
+
+/// Apply a named unary function from a resident environment to one argument.
+/// The entry point for fire-time rule evaluation: the kernel hands a name and a
+/// value, this resolves the name in the cached env and evaluates the body. Runs
+/// under whatever fuel budget the caller installed on this thread.
+pub fn apply_named(env: &Env, name: &str, arg: Value) -> Result<Value, MagError> {
+    match env.lookup(name)? {
+        Value::Fn(fv) if fv.params.len() == 1 => {
+            let fv = fv.clone();
+            apply_fn(&fv, &[arg])
+        }
+        Value::Fn(fv) => Err(MagError::Eval(format!(
+            "rule fn '{name}' must be unary, takes {} arguments",
+            fv.params.len()
+        ))),
+        other => Err(MagError::Eval(format!(
+            "rule fn '{name}' is not a function (got {})",
+            other.type_name()
+        ))),
+    }
 }
 
 fn eval_builtin(env: &mut Env, name: &str, args: &[Expr]) -> Result<Value, MagError> {

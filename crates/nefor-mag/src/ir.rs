@@ -1,6 +1,7 @@
 use crate::ast::{GraphValue, NodeValue, Value};
 use crate::env::Env;
 use crate::error::MagError;
+use crate::json::value_to_json;
 use crate::types::MagType;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -14,14 +15,24 @@ const SINK_ID: &str = "sink";
 /// A graph modification — the shape the MAG runtime consumes (see ir.md).
 /// Replaces the older graph-shaped `GraphIr{terminal, nodes, edges}`: edges
 /// dissolve into each actor's `routes`, and terminality is structural.
+/// A graph modification. Produced by `lower` at load time and by rule
+/// functions at fire time; both go through `validate_modification`. The
+/// section vectors and `hash` default when absent so a rule can return a
+/// partial map (e.g. only `kills`, or `actors` without pre-computed routes)
+/// and have it deserialize — `hash` is then recomputed by `finalize_hash`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModificationIr {
+    #[serde(default)]
     pub actors: Vec<ActorIr>,
+    #[serde(default)]
     pub messages: Vec<MessageIr>,
+    #[serde(default)]
     pub kills: Vec<String>,
+    #[serde(default)]
     pub rules: Vec<RuleIr>,
     /// Deterministic hash over the canonicalized modification. Out-of-band
     /// bookkeeping — not part of the modification the kernel folds.
+    #[serde(default)]
     pub hash: String,
 }
 
@@ -29,11 +40,13 @@ pub struct ModificationIr {
 pub struct ActorIr {
     pub id: String,
     pub factory: String,
+    #[serde(default)]
     pub params: serde_json::Value,
     /// Typed output → destination ids. Kernel-owned wiring, sibling of
     /// `params`. Keys are fully-qualified output type tags; values are always
     /// arrays (fanout needs no special-casing). Insertion order is preserved
     /// for readable emission; hashing sorts.
+    #[serde(default)]
     pub routes: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -68,38 +81,6 @@ fn qualify_type(ty: &MagType) -> String {
             let parts: Vec<_> = types.iter().map(qualify_type).collect();
             parts.join("+")
         }
-    }
-}
-
-fn value_to_json(val: &Value) -> Result<serde_json::Value, MagError> {
-    match val {
-        Value::Str(s) => Ok(serde_json::Value::String(s.clone())),
-        Value::Int(n) => Ok(serde_json::json!(n)),
-        Value::Float(n) => Ok(serde_json::json!(n)),
-        Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
-        Value::Nil => Ok(serde_json::Value::Null),
-        Value::Keyword(k) => Ok(serde_json::Value::String(format!(":{k}"))),
-        Value::Symbol(s) => Ok(serde_json::Value::String(s.clone())),
-        Value::List(items) | Value::Vector(items) => {
-            let arr: Result<Vec<_>, _> = items.iter().map(value_to_json).collect();
-            Ok(serde_json::Value::Array(arr?))
-        }
-        Value::Map(map) => {
-            let obj: Result<serde_json::Map<String, serde_json::Value>, _> = map
-                .iter()
-                .map(|(k, v)| value_to_json(v).map(|jv| (k.clone(), jv)))
-                .collect();
-            Ok(serde_json::Value::Object(obj?))
-        }
-        Value::Node(_)
-        | Value::Graph(_)
-        | Value::Subgraph(_)
-        | Value::Fn(_)
-        | Value::BuiltinFn(_)
-        | Value::TypeDecl(_) => Err(MagError::Eval(format!(
-            "cannot serialize {} to JSON in node args",
-            val.type_name()
-        ))),
     }
 }
 
@@ -279,6 +260,14 @@ fn hash_modification(
     format!("sha256:{:x}", hasher.finalize())
 }
 
+/// Recompute and set the canonical hash of a modification. A rule function
+/// returns a plain data map that carries no `hash`; after deserializing it into
+/// a `ModificationIr` the hash is stamped here so fire-time modifications hash
+/// on the same canonical shape as load-time ones.
+pub fn finalize_hash(ir: &mut ModificationIr) {
+    ir.hash = hash_modification(&ir.actors, &ir.messages, &ir.kills, &ir.rules);
+}
+
 /// Load-time validation of a modification: id uniqueness, message targets, and
 /// rule references (the rule `fn` exists, is a function, and is unary).
 pub fn validate_modification(ir: &ModificationIr, env: &Env) -> Result<(), MagError> {
@@ -381,16 +370,6 @@ mod tests {
     #[test]
     fn qualify_var_always_prefixed() {
         assert_eq!(qualify_type(&MagType::Var("INPUT".into())), "mag.INPUT");
-    }
-
-    #[test]
-    fn value_to_json_rejects_function() {
-        let val = Value::Fn(crate::ast::FnValue {
-            params: vec![],
-            body: vec![],
-            closure: vec![],
-        });
-        assert!(value_to_json(&val).is_err());
     }
 
     #[test]

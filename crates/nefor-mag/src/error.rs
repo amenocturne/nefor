@@ -11,6 +11,9 @@ pub enum MagError {
     #[error("eval: {0}")]
     Eval(String),
 
+    #[error("evaluation budget exceeded: {0}")]
+    Budget(String),
+
     #[error("type error: {0}")]
     Type(String),
 
