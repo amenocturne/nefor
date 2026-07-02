@@ -34,6 +34,7 @@ use crate::responses::stream::ResponseEvent;
 use crate::responses::{CompactRequest, ModelEntry, ResponsesClient};
 use crate::state::{
     ChatId, ChatStats, Chats, ChatsError, Message, MessageRestore, ToolCall, ToolCallFunction,
+    TurnToken,
 };
 use crate::translator;
 use nefor_plugin_sdk::TransportError;
@@ -777,6 +778,29 @@ async fn dispatch_event(
             }
             Ok(())
         }
+        // Hard cancel of an in-flight completion, keyed by the caller's
+        // request id (`chat_id` — one in-flight completion per chat).
+        // Aborts the streaming HTTP call and suppresses the terminal
+        // result. Idempotent: unknown or already-finished ids are a
+        // logged no-op, never an error. Pure capability-surface
+        // completion — this handler knows nothing about actors, runs, or
+        // graphs.
+        "chat.cancel" => {
+            match read_chat_id(body) {
+                Some(cid) => {
+                    if !ctx.chats.cancel_turn(&cid).await {
+                        tracing::debug!(
+                            chat_id = %cid,
+                            "chat.cancel for unknown or finished request; no-op"
+                        );
+                    }
+                }
+                None => {
+                    tracing::debug!("chat.cancel without chat_id; no-op");
+                }
+            }
+            Ok(())
+        }
         "reset" => {
             ctx.chats.interrupt_all().await;
             ctx.chats.reset_all().await;
@@ -1419,7 +1443,7 @@ async fn compact_chat(
     ctx: &DispatcherContext,
     chat_id: &ChatId,
     trigger: &str,
-    cancel: &tokio_util::sync::CancellationToken,
+    cancel: &TurnToken,
 ) -> Result<(), ChatgptError> {
     let snapshot = match ctx.chats.snapshot(chat_id).await {
         Ok(s) => s,
@@ -1812,11 +1836,7 @@ fn should_retry_pre_output_stream_error(
         && retries < MAX_PRE_OUTPUT_STREAM_RETRIES
 }
 
-fn spawn_turn(
-    ctx: DispatcherContext,
-    chat_id: ChatId,
-    cancel: tokio_util::sync::CancellationToken,
-) {
+fn spawn_turn(ctx: DispatcherContext, chat_id: ChatId, cancel: TurnToken) {
     tokio::spawn(async move {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let started = std::time::Instant::now();
@@ -2235,6 +2255,17 @@ fn spawn_turn(
                 }
             }
 
+            // Hard cancel arrived mid-stream: drop this turn entirely.
+            // The reqwest byte stream was already aborted when the select
+            // took the `cancelled()` branch above (the stream future is
+            // dropped on break); suppress every terminal emission by
+            // breaking out before any result is built. A graceful
+            // `interrupt` is NOT suppressed and falls through to the
+            // interrupted-result path below.
+            if cancel.is_suppressed() {
+                break;
+            }
+
             for formatted in reasoning_formatter.finish() {
                 if formatted.is_empty() {
                     continue;
@@ -2329,6 +2360,18 @@ fn spawn_turn(
             final_text = output_text;
             final_finish_reason = iter_finish_reason.or(Some("stop".into()));
             break;
+        }
+
+        // Suppressed hard-cancel: release the slot and return without
+        // emitting stream.end / session.stats / turn.error /
+        // chat.complete.result. No result is delivered for a cancelled
+        // request — that is the honor side of graph.cancel. Any partial
+        // stream.delta already put on the bus before the abort is
+        // unavoidable (it was emitted live), but no terminal completion
+        // lands.
+        if cancel.is_suppressed() {
+            ctx.chats.end_turn(&chat_id).await;
+            return;
         }
 
         let elapsed_ms = started.elapsed().as_millis() as u64;
