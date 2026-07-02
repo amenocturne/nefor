@@ -39,6 +39,7 @@
 
 (let [explorer (agent {:id        "docs-explorer"
                        :model     "opus"
+                       :provider  "chatgpt-provider"
                        :system    "Explore the codebase and report findings."
                        :tools     ["fs/read" "grep"]
                        :max-steps 50}
@@ -46,6 +47,7 @@
 
       writer   (agent {:id        "code-writer"
                        :model     "opus"
+                       :provider  "chatgpt-provider"
                        :system    "Implement the change from the findings."
                        :tools     ["fs/read" "fs/edit" "shell"]
                        :max-steps 80}

@@ -13,6 +13,7 @@
       "factory": "llm",
       "params": {
         "model": "opus",
+        "provider": "chatgpt-provider",
         "system": "Explore the codebase and report findings.",
         "tools": ["fs/read", "grep"]
       },
@@ -51,6 +52,7 @@
       "factory": "llm",
       "params": {
         "model": "opus",
+        "provider": "chatgpt-provider",
         "system": "Summarize what you found so far."
       },
       "routes": {
@@ -71,6 +73,7 @@
       "factory": "llm",
       "params": {
         "model": "opus",
+        "provider": "chatgpt-provider",
         "system": "Implement the change from the findings.",
         "tools": ["fs/read", "fs/edit", "shell"]
       },
@@ -109,6 +112,7 @@
       "factory": "llm",
       "params": {
         "model": "opus",
+        "provider": "chatgpt-provider",
         "system": "Summarize what you found so far."
       },
       "routes": {

@@ -1146,7 +1146,10 @@ fn eval_agent(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
         _ => return Err(MagError::Eval("agent requires a string :id".into())),
     };
 
-    // llm params: model, system, tools (present keys only, sorted by BTreeMap).
+    // llm params: model, system, tools, provider (present keys only, sorted by
+    // BTreeMap). `provider` names the provider capability the llm actor targets;
+    // the kernel llm factory rejects construction without it, so it is authored
+    // on the agent and threaded through to both llm actors below.
     let mut llm_args: BTreeMap<String, Value> = BTreeMap::new();
     if let Some(model) = config.get("model") {
         llm_args.insert("model".into(), model.clone());
@@ -1156,6 +1159,9 @@ fn eval_agent(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
     }
     if let Some(tools) = config.get("tools") {
         llm_args.insert("tools".into(), tools.clone());
+    }
+    if let Some(provider) = config.get("provider") {
+        llm_args.insert("provider".into(), provider.clone());
     }
 
     // exhaust: a summarizing llm that leaves the bounded loop.
@@ -1167,6 +1173,9 @@ fn eval_agent(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
         "system".into(),
         Value::Str("Summarize what you found so far.".into()),
     );
+    if let Some(provider) = config.get("provider") {
+        exhaust_args.insert("provider".into(), provider.clone());
+    }
 
     let max_steps = config.get("max-steps").cloned().unwrap_or(Value::Int(50));
 
