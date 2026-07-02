@@ -39,6 +39,7 @@ test-starter:
     cargo test -p nefor --test starter_mag_kernel_test
     cargo test -p nefor --test starter_ncp_test
     cargo test -p nefor --test starter_run_reasoner_test
+    cargo test -p nefor --test starter_mag_kernel_test
 
 # Provider/API translation tests; may need local socket binding permissions.
 test-provider:
