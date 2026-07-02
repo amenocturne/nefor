@@ -34,6 +34,8 @@ local ok_persist, persistence = pcall(require, "output-persistence")
 if not ok_persist then
   persistence = nil
 end
+local run_tool = require("factories.run-tool")
+local tool_result = require("factories.tool-result")
 
 -- Adapt the host's single `nefor.log(msg)` function into the leveled sink
 -- the kernel modules expect. Level travels as a prefix so the one host
@@ -61,6 +63,8 @@ local function build_registry()
   seed(sink)
   seed(human)
   seed(llm)
+  seed(run_tool)
+  seed(tool_result)
   return reg
 end
 
@@ -176,7 +180,7 @@ end
 -- inventory itself stays pure; this is the composition layer.
 local obs = observer.new({ inventory = inv, emit_event = emit_event, modlog = mlog })
 
-nefor.log("mag-kernel ready (factories: stub, loop-counter, sink, human, llm)")
+nefor.log("mag-kernel ready (factories: stub, loop-counter, sink, human, llm, run-tool, tool-result)")
 
 return {
   name = "mag-kernel",
