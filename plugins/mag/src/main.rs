@@ -13,8 +13,9 @@
 mod error;
 mod kernel;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use nefor_mag::LoadedProgram;
 use nefor_plugin_sdk::{await_ready_ok, spawn_stdin_reader, spawn_stdout_writer, TransportError};
 use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
 use serde_json::{Map, Value};
@@ -39,6 +40,20 @@ const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Liveness ping we answer, and the reply kind.
 const PING_KIND: &str = "mag.ping";
 const PONG_KIND: &str = "mag.pong";
+
+/// Load a MAG program in-process and cache its resident environment for the
+/// session; reply with the initial modification (`mag.loaded`).
+const LOAD_KIND: &str = "mag.load";
+const LOADED_KIND: &str = "mag.loaded";
+
+/// Evaluate a named rule fn against a node output over the cached program;
+/// reply with the produced modification (`mag.modification`).
+const EVAL_KIND: &str = "mag.eval";
+const MODIFICATION_KIND: &str = "mag.modification";
+
+/// Reply kind for a load/eval failure. A rejected modification or a load error
+/// is data on the bus, not a plugin crash (ir.md: "the run continues").
+const ERROR_KIND: &str = "mag.error";
 
 #[tokio::main]
 async fn main() {
@@ -125,6 +140,9 @@ async fn run_dispatch_loop(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     in_rx: &mut mpsc::Receiver<Result<Envelope, TransportError>>,
 ) -> Result<(), MagError> {
+    // The session's resident program: loaded once by `mag.load`, then the
+    // source of the cached environment every `mag.eval` evaluates against.
+    let mut program: Option<LoadedProgram> = None;
     loop {
         tokio::select! {
             maybe = in_rx.recv() => {
@@ -138,7 +156,7 @@ async fn run_dispatch_loop(
                             tracing::warn!(?env, "unexpected system envelope after handshake");
                         }
                         Body::Event(map) => {
-                            handle_event(out_tx, map).await?;
+                            handle_event(out_tx, map, &mut program).await?;
                         }
                     },
                     Some(Err(e)) => {
@@ -158,21 +176,104 @@ async fn run_dispatch_loop(
     }
 }
 
-/// Handle one inbound event body. The skeleton only answers `mag.ping`;
-/// everything else on the broadcast bus is not ours and drops silently.
+/// Handle one inbound event body. We answer `mag.ping` (liveness), `mag.load`
+/// (load a program, cache it, reply with the initial modification), and
+/// `mag.eval` (apply a rule fn over the cached program). Everything else on the
+/// broadcast bus is not ours and drops silently.
 async fn handle_event(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: &Map<String, Value>,
+    program: &mut Option<LoadedProgram>,
 ) -> Result<(), MagError> {
     let kind = match body.get("kind").and_then(Value::as_str) {
         Some(k) => k,
         None => return Ok(()),
     };
-    if kind == PING_KIND {
-        let in_reply_to = body.get("id").and_then(Value::as_str);
-        send_event(out_tx, pong_body(in_reply_to)).await?;
+    let in_reply_to = body.get("id").and_then(Value::as_str);
+    match kind {
+        PING_KIND => send_event(out_tx, pong_body(in_reply_to)).await,
+        LOAD_KIND => handle_load(out_tx, body, in_reply_to, program).await,
+        EVAL_KIND => handle_eval(out_tx, body, in_reply_to, program).await,
+        _ => Ok(()),
     }
-    Ok(())
+}
+
+/// Load `source_dir/entry` in-process, cache the resident program for the
+/// session, and reply with its initial modification. A load failure replies
+/// `mag.error` and leaves any previously-loaded program untouched.
+async fn handle_load(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    body: &Map<String, Value>,
+    in_reply_to: Option<&str>,
+    program: &mut Option<LoadedProgram>,
+) -> Result<(), MagError> {
+    let source_dir = match body.get("source_dir").and_then(Value::as_str) {
+        Some(s) => s,
+        None => {
+            return send_event(
+                out_tx,
+                error_body(in_reply_to, "mag.load missing source_dir"),
+            )
+            .await
+        }
+    };
+    let entry = match body.get("entry").and_then(Value::as_str) {
+        Some(s) => s,
+        None => return send_event(out_tx, error_body(in_reply_to, "mag.load missing entry")).await,
+    };
+
+    match nefor_mag::load(Path::new(source_dir), entry) {
+        Ok(loaded) => {
+            let reply = match serde_json::to_value(&loaded.modification) {
+                Ok(m) => loaded_body(in_reply_to, &loaded.hash, m),
+                Err(e) => error_body(in_reply_to, &format!("modification serialize: {e}")),
+            };
+            *program = Some(loaded);
+            send_event(out_tx, reply).await
+        }
+        Err(e) => send_event(out_tx, error_body(in_reply_to, &e.to_string())).await,
+    }
+}
+
+/// Evaluate the named rule fn against `input` over the cached program, replying
+/// with the produced modification. No cached program, an unknown fn, a budget
+/// overrun, or an ill-shaped result all reply `mag.error`.
+async fn handle_eval(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    body: &Map<String, Value>,
+    in_reply_to: Option<&str>,
+    program: &mut Option<LoadedProgram>,
+) -> Result<(), MagError> {
+    let name = match body.get("name").and_then(Value::as_str) {
+        Some(s) => s,
+        None => return send_event(out_tx, error_body(in_reply_to, "mag.eval missing name")).await,
+    };
+    let input = body.get("input").cloned().unwrap_or(Value::Null);
+
+    let loaded = match program {
+        Some(p) => p,
+        None => {
+            return send_event(
+                out_tx,
+                error_body(
+                    in_reply_to,
+                    "mag.eval before any mag.load: no resident program",
+                ),
+            )
+            .await
+        }
+    };
+
+    match nefor_mag::eval_fn(loaded, name, input) {
+        Ok(modification) => {
+            let reply = match serde_json::to_value(&modification) {
+                Ok(m) => modification_body(in_reply_to, m),
+                Err(e) => error_body(in_reply_to, &format!("modification serialize: {e}")),
+            };
+            send_event(out_tx, reply).await
+        }
+        Err(e) => send_event(out_tx, error_body(in_reply_to, &e.to_string())).await,
+    }
 }
 
 // ---- static body constructors ----------------------------------------------
@@ -193,6 +294,37 @@ fn pong_body(in_reply_to: Option<&str>) -> Map<String, Value> {
     if let Some(id) = in_reply_to {
         m.insert("in_reply_to".into(), Value::String(id.to_owned()));
     }
+    m
+}
+
+fn loaded_body(in_reply_to: Option<&str>, hash: &str, modification: Value) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("kind".into(), Value::String(LOADED_KIND.into()));
+    if let Some(id) = in_reply_to {
+        m.insert("in_reply_to".into(), Value::String(id.to_owned()));
+    }
+    m.insert("hash".into(), Value::String(hash.to_owned()));
+    m.insert("modification".into(), modification);
+    m
+}
+
+fn modification_body(in_reply_to: Option<&str>, modification: Value) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("kind".into(), Value::String(MODIFICATION_KIND.into()));
+    if let Some(id) = in_reply_to {
+        m.insert("in_reply_to".into(), Value::String(id.to_owned()));
+    }
+    m.insert("modification".into(), modification);
+    m
+}
+
+fn error_body(in_reply_to: Option<&str>, message: &str) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("kind".into(), Value::String(ERROR_KIND.into()));
+    if let Some(id) = in_reply_to {
+        m.insert("in_reply_to".into(), Value::String(id.to_owned()));
+    }
+    m.insert("message".into(), Value::String(message.to_owned()));
     m
 }
 
@@ -260,5 +392,37 @@ mod tests {
         let b = goodbye_body();
         assert_eq!(b.get("kind").and_then(Value::as_str), Some("mag.goodbye"));
         assert!(b.get("reason").and_then(Value::as_str).is_some());
+    }
+
+    #[test]
+    fn loaded_body_carries_hash_and_modification() {
+        let b = loaded_body(
+            Some("load-1"),
+            "sha256:abc",
+            serde_json::json!({"actors": []}),
+        );
+        assert_eq!(b.get("kind").and_then(Value::as_str), Some("mag.loaded"));
+        assert_eq!(b.get("in_reply_to").and_then(Value::as_str), Some("load-1"));
+        assert_eq!(b.get("hash").and_then(Value::as_str), Some("sha256:abc"));
+        assert!(b.get("modification").and_then(Value::as_object).is_some());
+    }
+
+    #[test]
+    fn modification_body_names_the_kind() {
+        let b = modification_body(None, serde_json::json!({"kills": ["x"]}));
+        assert_eq!(
+            b.get("kind").and_then(Value::as_str),
+            Some("mag.modification")
+        );
+        assert!(b.get("in_reply_to").is_none());
+        assert!(b.get("modification").is_some());
+    }
+
+    #[test]
+    fn error_body_carries_message() {
+        let b = error_body(Some("req-9"), "boom");
+        assert_eq!(b.get("kind").and_then(Value::as_str), Some("mag.error"));
+        assert_eq!(b.get("in_reply_to").and_then(Value::as_str), Some("req-9"));
+        assert_eq!(b.get("message").and_then(Value::as_str), Some("boom"));
     }
 }
