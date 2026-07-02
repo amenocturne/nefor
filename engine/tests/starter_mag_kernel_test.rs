@@ -34,6 +34,11 @@ fn starter_mag_kernel_routing() {
     run_lua_test("tests/lua/mag-kernel/routing_test.lua");
 }
 
+#[test]
+fn starter_mag_kernel_flow_primitives() {
+    run_lua_test("tests/lua/mag-kernel/flow_test.lua");
+}
+
 fn run_lua_test(rel_path: &str) {
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");

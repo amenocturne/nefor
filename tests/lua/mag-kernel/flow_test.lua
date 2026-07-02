@@ -1,0 +1,272 @@
+-- tests/lua/mag-kernel/flow_test.lua — factory-level unit tests for the
+-- flow-control primitives: loop-counter, sink, human.
+--
+-- Driven from `engine/tests/starter_mag_kernel_test.rs` (same harness as
+-- factory_test.lua): a bare Lua VM with a stub `nefor.log` and package.path
+-- pointed at `starter/mag-kernel/`.
+--
+-- These tests exercise the factories directly — construct an instance, feed it
+-- activation messages, assert what it emits. No routing, no fold, no cycle
+-- execution (a sibling owns routing; full-cycle e2e comes later).
+
+local Registry     = require("registry")
+local loop_counter = require("factories.loop-counter")
+local sink         = require("factories.sink")
+local human        = require("factories.human")
+
+-- ------------------------------------------------------------------
+-- helpers
+-- ------------------------------------------------------------------
+
+local function assert_eq(actual, expected, msg)
+  if actual ~= expected then
+    error(string.format(
+      "assertion failed: %s\n  expected: %s\n  actual:   %s",
+      msg or "values differ", tostring(expected), tostring(actual)), 2)
+  end
+end
+
+local function assert_true(cond, msg)
+  if not cond then error("assertion failed: " .. (msg or "(no message)"), 2) end
+end
+
+-- Capturing emit sink standing in for the kernel's outbound.
+local function capture()
+  local out = {}
+  return out, function(message) out[#out + 1] = message end
+end
+
+local function find_kind(msgs, kind)
+  for _, m in ipairs(msgs) do
+    if m.kind == kind then return m end
+  end
+  return nil
+end
+
+local function count_kind(msgs, kind)
+  local n = 0
+  for _, m in ipairs(msgs) do
+    if m.kind == kind then n = n + 1 end
+  end
+  return n
+end
+
+-- ==================================================================
+-- all three factories declare well-formed contracts and register
+-- ==================================================================
+
+do
+  local reg = Registry.new()
+  for _, mod in ipairs({ loop_counter, sink, human }) do
+    local decl, err = reg:register({ declaration = mod.declaration, construct = mod.construct })
+    assert_true(decl ~= nil and err == nil,
+      "factory " .. tostring(mod.declaration.name) .. " registers cleanly: " .. tostring(err))
+  end
+
+  -- loop-counter's union output is a declared typed exit.
+  local lc = reg:declaration("loop-counter")
+  assert_eq(lc.outputs[1], "generic-provider.ProviderOut", "loop-counter output 1")
+  assert_eq(lc.outputs[2], "mag.LoopExhausted", "loop-counter output 2")
+
+  -- sink is terminal: no outputs.
+  assert_eq(#reg:declaration("sink").outputs, 0, "sink declares no outputs (terminal)")
+
+  -- human declares a union approve/reject exit and the drain signal.
+  local hd = reg:declaration("human")
+  assert_eq(hd.outputs[1], "human.Approved", "human output 1")
+  assert_eq(hd.outputs[2], "human.Rejected", "human output 2")
+  assert_eq(hd.signals[1], "drain", "human declares the drain signal")
+end
+
+-- ==================================================================
+-- loop-counter: ready on construct, signs with id
+-- ==================================================================
+
+do
+  local msgs, emit = capture()
+  local inst = loop_counter.construct("docs-explorer.loop-counter", { max = 3 }, emit)
+  assert_true(inst ~= nil, "loop-counter constructs")
+  local ready = find_kind(msgs, "mag.ready")
+  assert_true(ready ~= nil, "loop-counter emits ready")
+  assert_eq(ready.from, "docs-explorer.loop-counter", "ready is id-signed")
+end
+
+-- ==================================================================
+-- loop-counter: below max passes through, at exhaustion diverts
+-- (boundary: max pass-throughs permitted, then LoopExhausted)
+-- ==================================================================
+
+do
+  local msgs, emit = capture()
+  local inst = loop_counter.construct("lc", { max = 2 }, emit)
+
+  -- activation 1 (count 1 <= 2): pass-through ProviderOut
+  inst.activate({ kind = "generic-provider.ProviderOut", payload = "a" })
+  -- activation 2 (count 2 <= 2): pass-through ProviderOut
+  inst.activate({ kind = "generic-provider.ProviderOut", payload = "b" })
+  -- activation 3 (count 3 > 2): exhausted → LoopExhausted
+  inst.activate({ kind = "generic-provider.ProviderOut", payload = "c" })
+
+  assert_eq(count_kind(msgs, "generic-provider.ProviderOut"), 2,
+    "two pass-throughs below the bound")
+  assert_eq(count_kind(msgs, "mag.LoopExhausted"), 1,
+    "exactly one exhaustion at the bound")
+
+  -- pass-throughs preserve payload, re-signed with the instance id
+  local first = nil
+  for _, m in ipairs(msgs) do
+    if m.kind == "generic-provider.ProviderOut" then first = m; break end
+  end
+  assert_eq(first.payload, "a", "pass-through preserves the input payload")
+  assert_eq(first.from, "lc", "pass-through is re-signed with the instance id")
+
+  -- LoopExhausted carries summarizer context: the last input, the bound, count
+  local exhausted = find_kind(msgs, "mag.LoopExhausted")
+  assert_eq(exhausted.from, "lc", "exhaustion is id-signed")
+  assert_eq(exhausted.max, 2, "exhaustion reports the bound")
+  assert_eq(exhausted.count, 3, "exhaustion reports the crossing count")
+  assert_eq(exhausted.last.payload, "c", "exhaustion carries the last input for the summarizer")
+end
+
+-- ==================================================================
+-- loop-counter: two instances count independently (per-instance state)
+-- ==================================================================
+
+do
+  local a_msgs, a_emit = capture()
+  local b_msgs, b_emit = capture()
+  local a = loop_counter.construct("docs-explorer.loop-counter", { max = 1 }, a_emit)
+  local b = loop_counter.construct("code-writer.loop-counter", { max = 5 }, b_emit)
+
+  -- Drive A twice: max=1 → first passes, second exhausts.
+  a.activate({ kind = "generic-provider.ProviderOut", payload = "a1" })
+  a.activate({ kind = "generic-provider.ProviderOut", payload = "a2" })
+  -- Drive B twice: max=5 → both pass, B is nowhere near its own bound.
+  b.activate({ kind = "generic-provider.ProviderOut", payload = "b1" })
+  b.activate({ kind = "generic-provider.ProviderOut", payload = "b2" })
+
+  assert_eq(count_kind(a_msgs, "mag.LoopExhausted"), 1, "instance A exhausts at its own max=1")
+  assert_eq(count_kind(b_msgs, "mag.LoopExhausted"), 0, "instance B unaffected by A's counter")
+  assert_eq(count_kind(b_msgs, "generic-provider.ProviderOut"), 2, "instance B passes both through")
+end
+
+-- ==================================================================
+-- sink: persists via the injected writer and emits run-complete
+-- ==================================================================
+
+do
+  local msgs, emit = capture()
+
+  -- The kernel-injected persistence seam, stubbed as a capturing writer.
+  local persisted = {}
+  local writer = function(final) persisted[#persisted + 1] = final end
+
+  local inst = sink.construct("sink", { writer = writer }, emit)
+  local ready = find_kind(msgs, "mag.ready")
+  assert_true(ready ~= nil and ready.from == "sink", "sink emits an id-signed ready")
+
+  inst.activate({ kind = "generic-provider.FinalAnswer", text = "the final answer" })
+
+  assert_eq(#persisted, 1, "sink persisted the final output via the injected writer")
+  assert_eq(persisted[1].text, "the final answer", "writer received the final output")
+
+  local done = find_kind(msgs, "mag.RunComplete")
+  assert_true(done ~= nil, "sink emits the run-complete signal")
+  assert_eq(done.from, "sink", "run-complete is id-signed")
+  assert_eq(done.persisted, true, "run-complete flags that the output was persisted")
+  assert_eq(done.result.text, "the final answer", "run-complete carries the result")
+end
+
+-- ==================================================================
+-- sink: without an injected writer, persistence is skipped and flagged
+-- (a mis-wired kernel is observable, not silent)
+-- ==================================================================
+
+do
+  local msgs, emit = capture()
+  local inst = sink.construct("sink", {}, emit) -- no writer
+  inst.activate({ kind = "generic-provider.FinalAnswer", text = "x" })
+  local done = find_kind(msgs, "mag.RunComplete")
+  assert_true(done ~= nil, "sink still signals completion without a writer")
+  assert_eq(done.persisted, false, "run-complete flags persisted=false when no writer wired")
+end
+
+-- ==================================================================
+-- human: request out, reply in — approval round-trip
+-- ==================================================================
+
+do
+  local msgs, emit = capture()
+  local inst = human.construct("gate", { prompt = "Approve the plan?" }, emit)
+  local ready = find_kind(msgs, "mag.ready")
+  assert_true(ready ~= nil and ready.from == "gate", "human emits an id-signed ready")
+
+  -- A subject arrives → an approval request goes out.
+  inst.activate({ kind = "generic-provider.FinalAnswer", text = "proposed plan" })
+  local req = find_kind(msgs, "mag.ApprovalRequest")
+  assert_true(req ~= nil, "human emits an approval request for the subject")
+  assert_eq(req.from, "gate", "request is id-signed")
+  assert_eq(req.correlation, "gate", "request carries a correlation handle")
+  assert_eq(req.prompt, "Approve the plan?", "request carries the configured prompt")
+  assert_eq(req.subject.text, "proposed plan", "request carries the subject")
+  assert_true(find_kind(msgs, "human.Approved") == nil, "no output before the reply")
+
+  -- The reply arrives (stubbed chat surface) → the gate resolves to Approved.
+  inst.activate({ kind = "mag.ApprovalReply", approved = true, content = "plan ok" })
+  local approved = find_kind(msgs, "human.Approved")
+  assert_true(approved ~= nil, "reply resolves the gate to an approved output")
+  assert_eq(approved.from, "gate", "approved output is id-signed")
+  assert_eq(approved.content, "plan ok", "approved output carries the human's content")
+  assert_eq(approved.subject.text, "proposed plan", "approved output carries the subject")
+end
+
+-- ==================================================================
+-- human: a rejecting reply resolves to the human.Rejected exit
+-- ==================================================================
+
+do
+  local msgs, emit = capture()
+  local inst = human.construct("gate", {}, emit)
+  inst.activate({ kind = "generic-provider.FinalAnswer", text = "risky plan" })
+  inst.activate({ kind = "mag.ApprovalReply", approved = false, reason = "too risky" })
+  local rejected = find_kind(msgs, "human.Rejected")
+  assert_true(rejected ~= nil, "a non-approving reply takes the rejected exit")
+  assert_eq(rejected.reason, "too risky", "rejected output carries the reason")
+  assert_true(find_kind(msgs, "human.Approved") == nil, "no approved output on rejection")
+end
+
+-- ==================================================================
+-- human: a reply with no request outstanding is ignored (not an activation)
+-- ==================================================================
+
+do
+  local msgs, emit = capture()
+  local inst = human.construct("gate", {}, emit)
+  inst.activate({ kind = "mag.ApprovalReply", approved = true, content = "stray" })
+  assert_true(find_kind(msgs, "human.Approved") == nil,
+    "a stray reply with no pending request emits nothing")
+end
+
+-- ==================================================================
+-- human: drain cancels an outstanding request, then completes
+-- ==================================================================
+
+do
+  local msgs, emit = capture()
+  local inst = human.construct("gate", {}, emit)
+  inst.activate({ kind = "generic-provider.FinalAnswer", text = "awaiting" })
+
+  inst.handle_drain()
+  local cancel = find_kind(msgs, "mag.ApprovalCancel")
+  assert_true(cancel ~= nil, "drain cancels the outstanding approval request")
+  assert_eq(cancel.correlation, "gate", "cancel carries the correlation handle")
+  assert_true(find_kind(msgs, "mag.Completed") ~= nil, "drain ends with a signed completion")
+
+  -- After drain the pending request is gone: a late reply resolves nothing.
+  local before = count_kind(msgs, "human.Approved")
+  inst.activate({ kind = "mag.ApprovalReply", approved = true, content = "late" })
+  assert_eq(count_kind(msgs, "human.Approved"), before,
+    "a reply after drain-cancel produces no output")
+end
+
+print("mag-kernel flow_test: all assertions passed")

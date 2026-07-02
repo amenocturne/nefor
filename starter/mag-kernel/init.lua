@@ -17,6 +17,9 @@ local inventory = require("inventory")
 local Registry = require("registry")
 local routing = require("routing")
 local stub = require("factories.stub")
+local loop_counter = require("factories.loop-counter")
+local sink = require("factories.sink")
+local human = require("factories.human")
 
 -- Adapt the host's single `nefor.log(msg)` function into the leveled sink
 -- the kernel modules expect. Level travels as a prefix so the one host
@@ -33,10 +36,16 @@ end
 -- Build the registry and seed the factories shipped with the kernel.
 local function build_registry()
   local reg = Registry.new()
-  local _, err = reg:register({ declaration = stub.declaration, construct = stub.construct })
-  if err then
-    error("mag-kernel: failed to register stub factory: " .. err)
+  local function seed(mod)
+    local _, err = reg:register({ declaration = mod.declaration, construct = mod.construct })
+    if err then
+      error("mag-kernel: failed to register factory '" .. tostring(mod.declaration and mod.declaration.name) .. "': " .. err)
+    end
   end
+  seed(stub)
+  seed(loop_counter)
+  seed(sink)
+  seed(human)
   return reg
 end
 
@@ -68,7 +77,7 @@ inv.set_on_kill(function(id)
   router:forget(id)
 end)
 
-nefor.log("mag-kernel ready (factories: stub)")
+nefor.log("mag-kernel ready (factories: stub, loop-counter, sink, human)")
 
 return {
   name = "mag-kernel",
