@@ -6,25 +6,35 @@
 -- factory is kept purely to the message shape (request out, reply in), so it is
 -- fully testable by feeding it a stubbed reply.
 --
--- Flow:
---   * A subject arrives on the declared data input → record it as pending and
---     emit an approval request (`mag.ApprovalRequest`) for the control plane /
---     chat surface to render.
---   * The reply arrives later as a control-plane message with the reserved
---     kind `mag.ApprovalReply` (delivered through the same activate entry, the
---     way a signal is just a message — actor-model.md). It is NOT a routed
---     data input: replies originate at the chat surface, not upstream actors,
---     so they carry a reserved kind rather than a declared input port.
+-- Flow (async factory — routing.lua, the kernel⇄factory contract):
+--   * A subject arrives as a graph activation on the declared data input →
+--     record it as pending, emit an approval request (`mag.ApprovalRequest`)
+--     for the control plane / chat surface to render, and return
+--     `{ status = "pending" }`: the gate defers completion until a human answers.
+--   * The reply arrives later as a SECOND graph delivery whose one message
+--     carries the reserved tag `mag.ApprovalReply` (delivered through the same
+--     `deliver` entry, the way a signal is just a message — actor-model.md). It
+--     is NOT a routed declared data input: replies originate at the chat
+--     surface, not upstream actors, so the control plane injects them by tag
+--     rather than through a factory-declared input port. (Delivery choice,
+--     flagged: a graph second-delivery, not the capability `{kind="reply"}`
+--     activation — the gate never issues a `capability.invoke`, so it is not on
+--     the correlation channel; the reply reuses the same graph channel as the
+--     subject, tag-discriminated, mirroring the pre-contract kind-discrimination.)
 --   * The reply resolves the gate to a typed exit: `human.Approved` (carrying
 --     the human's content) or `human.Rejected` (carrying a reason). A union
 --     output makes the approve/reject fork a type fact for downstream wiring,
---     consistent with the constitution's typed-exit rule.
+--     consistent with the constitution's typed-exit rule. Because completion was
+--     deferred, the resolved gate signals success with a `mag.complete` emit
+--     (the async-completion path — routing.lua), so the kernel emits mag.Unit
+--     along any dependency edges; the reply delivery itself returns nil.
 --
 -- Message shapes (all flagged for review):
 --   request out : { kind="mag.ApprovalRequest", from=id, correlation=id,
 --                   prompt=<params.prompt?>, subject=<the input message> }
---   reply  in   : { kind="mag.ApprovalReply", approved=<bool>,
---                   content=<approved value?>, reason=<rejection reason?> }
+--   reply  in   : graph activation carrying { tag="mag.ApprovalReply",
+--                   message = { approved=<bool>, content=<approved value?>,
+--                               reason=<rejection reason?> } }
 --   output      : human.Approved { subject, content } | human.Rejected { subject, reason }
 --
 -- drain handler (flagged): a human gate CAN hold pending external work — an
@@ -56,8 +66,8 @@ M.declaration = {
   },
 }
 
--- construct(id, params, emit) -> instance
-function M.construct(id, params, emit)
+-- construct(id, params, emit, deps) -> instance
+function M.construct(id, params, emit, deps)
   params = params or {}
 
   local function sign(message)
@@ -70,14 +80,20 @@ function M.construct(id, params, emit)
   -- Per-instance boundary state: the subject awaiting a human reply, or nil.
   local pending = nil
 
-  function instance.activate(message)
-    message = message or {}
+  -- deliver(activation) -> completion (routing.lua, the kernel⇄factory
+  -- contract). One delivered message per graph activation; the reserved
+  -- `mag.ApprovalReply` tag discriminates a reply from a subject.
+  function instance.deliver(activation)
+    activation = activation or {}
+    local one = (activation.messages or {})[1] or {}
+    local tag = one.tag
+    local message = one.message or {}
 
-    if message.kind == "mag.ApprovalReply" then
+    if tag == "mag.ApprovalReply" then
       -- A reply for an outstanding request. With none outstanding, ignore it
       -- (a late or duplicate reply is not an activation).
       if pending == nil then
-        return
+        return nil
       end
       local subject = pending
       pending = nil
@@ -94,10 +110,14 @@ function M.construct(id, params, emit)
           reason = message.reason,
         }))
       end
-      return
+      -- Deferred completion resolves now: signal async success so the kernel
+      -- emits mag.Unit along dependency edges. The delivery returns nil.
+      emit(sign({ kind = "mag.complete" }))
+      return nil
     end
 
-    -- Otherwise: a subject to approve. Record it and raise the request.
+    -- Otherwise: a subject to approve. Record it, raise the request, and defer
+    -- completion until the human answers.
     pending = message
     emit(sign({
       kind = "mag.ApprovalRequest",
@@ -105,6 +125,7 @@ function M.construct(id, params, emit)
       prompt = params.prompt,
       subject = message,
     }))
+    return { status = "pending" }
   end
 
   -- Explicit drain handler (SIGTERM analog): abort the outstanding request,

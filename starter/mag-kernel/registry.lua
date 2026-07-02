@@ -9,9 +9,12 @@
 --                 it accepts (firing-bearing), the output tags it produces,
 --                 and the signals it handles. Reading the declaration is the
 --                 whole contract; no handler is generated from it.
---   constructor — `fn(id, params, emit) -> instance`. The instance signs all
---                 output with its id and confirms creation with a ready
---                 message for that id (actor-model.md, Lifecycle).
+--   constructor — `fn(id, params, emit, deps) -> instance`. The instance signs
+--                 all output with its id and confirms creation with a ready
+--                 message for that id (actor-model.md, Lifecycle). `params` is
+--                 authored plain data; `deps` carries kernel-injected
+--                 capabilities (e.g. the sink's output writer), kept distinct
+--                 so MAG programs never author a runtime closure.
 --
 -- No injected behavior: the declaration lists which signals a factory handles,
 -- but nothing here wraps or synthesizes a handler. The stub factory's source
@@ -26,6 +29,22 @@ local shape = require("shape")
 
 local registry = {}
 registry.__index = registry
+
+-- Kernel-synthesized status types (docs/ir.md, Firing: "Reserved status types
+-- are kernel-emitted"). Lowering encodes ordering/failure edges as route keys
+-- carrying these tags, yet a factory never declares them as outputs — the
+-- kernel emits them when applying a completion (routing.lua, apply_completion).
+-- So they are implicitly-permitted route keys on any actor:
+--   mag.Unit   — successful completion (a pure dependency edge, `C -> A`)
+--   mag.Failed — a suffered failure the kernel synthesizes (provider error,
+--                kill mid-flight, budget). (Tag name flagged: the codebase has
+--                no canonical constant; picked per the `mag.` qualify-prefix
+--                convention. A factory's OWN computed failure output is a
+--                declared tag and needs no exception.)
+local RESERVED_ROUTE_KEYS = {
+  ["mag.Unit"] = true,
+  ["mag.Failed"] = true,
+}
 
 -- ---- declaration validation -------------------------------------------------
 
@@ -130,13 +149,15 @@ end
 
 -- Construct an instance via the named factory. `emit` is the kernel's outbound
 -- sink — the actor's entire world (actor-model.md): ready and every signed
--- output leave through it. Rejects an unknown factory.
-function registry:construct(name, id, params, emit)
+-- output leave through it. `deps` (optional) carries kernel-injected
+-- capabilities — plain data authored in `params`, runtime closures in `deps` —
+-- threaded through untouched to the factory. Rejects an unknown factory.
+function registry:construct(name, id, params, emit, deps)
   local f = self.factories[name]
   if not f then
     return nil, string.format("unknown factory %q", tostring(name))
   end
-  return f.construct(id, params, emit)
+  return f.construct(id, params, emit, deps)
 end
 
 -- ---- modification validation ------------------------------------------------
@@ -145,10 +166,13 @@ end
 -- (docs/ir.md). Two checks per actor spec { id, factory, params, routes }:
 --
 --   1. `factory` names a registered factory        (unknown -> rejection).
---   2. every `routes` key is a declared output tag  of that factory, and each
---      destination actor's declared input shape accepts that output tag
---      (wiring compatibility — the v1 "sniff inputs for output.tool_calls"
---      mode is gone; compatibility is a type fact over declared shapes).
+--   2. every `routes` key is a declared output tag of that factory OR a
+--      reserved kernel-synthesized status tag (RESERVED_ROUTE_KEYS — mag.Unit
+--      dependency edges and the suffered-failure tag, which lowering emits but
+--      no factory declares), and each destination actor's declared input shape
+--      accepts that tag (wiring compatibility — the v1 "sniff inputs for
+--      output.tool_calls" mode is gone; compatibility is a type fact over
+--      declared shapes). The check stays strict for every other key.
 --
 -- Destination input compatibility only checks destinations that are actors in
 -- the same modification (an id -> factory map built from `actors`); a
@@ -179,7 +203,7 @@ function registry:validate_modification(modification)
       end
 
       for tag, dests in pairs(spec.routes or {}) do
-        if not declared_output[tag] then
+        if not declared_output[tag] and not RESERVED_ROUTE_KEYS[tag] then
           table.insert(errors, string.format(
             "actor %q: route key %q is not a declared output of factory %q",
             tostring(spec.id), tostring(tag), spec.factory))

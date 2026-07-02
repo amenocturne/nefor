@@ -224,6 +224,17 @@ function M:derive_slots(dest_id, product_shape)
       end
     end
   end
+  -- Arity check: a well-lowered product has exactly one sender-bound slot per
+  -- component (docs/ir.md, Firing: slot identity is the incoming edge). A
+  -- mismatch means the routes topology under-/over-fills the product — a
+  -- lowering bug that would otherwise leave the actor silently unable to fire
+  -- (too few edges) or assembling ill-defined sets (too many). Surface it.
+  local component_count = #shape.tags(product_shape)
+  if #edges ~= component_count then
+    self.log.warn(string.format(
+      "actor '%s': product input derives %d sender-bound slot(s) but the shape has %d component(s)",
+      tostring(dest_id), #edges, component_count))
+  end
   return edges
 end
 

@@ -54,6 +54,38 @@ Two obligations:
   single type fires per message, union fires on any, product fires on all
   (see ir.md, Firing).
 
+### Construction and delivery
+
+`construct(id, params, emit, deps) -> instance`.
+
+- `id` — the actor id; sign every outbound message with it.
+- `params` — authored plain data from the modification (opaque to the kernel).
+- `emit` — the outbound sink; the instance's whole world for sending.
+- `deps` — kernel-injected capabilities (runtime closures the MAG program can't
+  author, e.g. the sink's output writer). Distinct from `params` by design:
+  params are data, deps are the kernel's side-channel.
+
+The instance exposes `deliver(activation) -> completion`.
+
+- **activation** is one of
+  - graph — `{ shape = "single"|"union"|"product", messages = { { from, tag, message }, … } }`
+  - reply — `{ kind = "reply", ref, result, error }` (a correlated capability response)
+- **completion** is the return value the kernel applies:
+  - `"ok"` / `{ status = "ok" }` — success; the kernel emits `mag.Unit` along the
+    actor's dependency edges.
+  - `{ status = "failed", failure = <tag>, value }` — a computed failure; the
+    kernel emits `<tag>`.
+  - `nil` / `{ status = "pending" }` — deferred (async); completion arrives later
+    as a reserved emit.
+
+Declared outputs flow through `emit` (routed by tag); the return value is only
+the completion status. Reserved emit kinds the kernel intercepts: `mag.ready`
+(the ready barrier), `capability.invoke` (a correlated request), and
+`mag.complete` / `mag.failed` (the async completion of a deferred activation).
+Kernel-synthesized status tags (`mag.Unit` on success, the failure tag) are
+emitted by the kernel, never returned by a factory and never declared as
+outputs — a factory does not know a dependency edge exists.
+
 ## Lifecycle
 
 Spawning is asynchronous: between spawn request and ready, the rest of the
@@ -78,10 +110,10 @@ The conventions are Unix-shaped. You can write any actor you want and ignore
 all of it — but the system expects the shape, and non-conforming actors lose
 the graceful path, not the system its correctness.
 
-| Signal | Analog | Semantics |
-|---|---|---|
-| kill | SIGKILL | The kernel unilaterally deletes the id from the inventory and drops its pending mailbox — no further messages route to it, nothing waits for it, no handler can veto or delay the removal. The dying instance is then handed one final kill message: handling is optional, but an actor holding live external work (an open provider request) implements the handler to abort it |
-| drain | SIGTERM | Finish or abort current work, flush outputs, then die. The handleable convention actors are expected to implement |
+| Signal | Analog  | Semantics                                                                                                                                                                                                                                                                                                                                                                        |
+| ------ | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| kill   | SIGKILL | The kernel unilaterally deletes the id from the inventory and drops its pending mailbox — no further messages route to it, nothing waits for it, no handler can veto or delay the removal. The dying instance is then handed one final kill message: handling is optional, but an actor holding live external work (an open provider request) implements the handler to abort it |
+| drain  | SIGTERM | Finish or abort current work, flush outputs, then die. The handleable convention actors are expected to implement                                                                                                                                                                                                                                                                |
 
 The universal set stays aggressively small: each entry taxes every actor
 forever. The bar is "the system cannot work without it", not "handy".

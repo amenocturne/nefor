@@ -81,12 +81,17 @@ do
   assert_true(ready ~= nil, "construction emits a ready confirmation")
   assert_eq(ready.from, "docs-explorer.stub", "ready is signed with the actor id")
 
-  -- All output is signed with the id.
-  instance.emit_output("payload-1")
+  -- A delivered activation drives the declared output; all output is
+  -- id-signed and the return value is the completion (routing.lua contract).
+  local completion = instance.deliver({
+    shape = "single",
+    messages = { { from = "upstream", tag = "stub.In", message = "payload-1" } },
+  })
+  assert_eq(completion.status, "ok", "synchronous stub returns a successful completion")
   local out = find_kind(msgs, "stub.Out")
   assert_true(out ~= nil, "instance emits its declared output tag")
   assert_eq(out.from, "docs-explorer.stub", "output is signed with the actor id")
-  assert_eq(out.payload, "payload-1", "output carries the emitted payload")
+  assert_eq(out.payload, "payload-1", "output carries the delivered message")
   assert_eq(out.greeting, "hi", "output reflects the factory's own params")
 end
 

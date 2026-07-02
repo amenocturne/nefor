@@ -38,12 +38,13 @@ M.declaration = {
   },
 }
 
--- construct(id, params, emit) -> instance
+-- construct(id, params, emit, deps) -> instance
 --
--- `emit` is the kernel's outbound sink (the actor's whole world). The instance
--- signs every message with `id` and, per the ready barrier, confirms creation
--- immediately with a ready message for that id.
-function M.construct(id, params, emit)
+-- `emit` is the kernel's outbound sink (the actor's whole world). `deps` carries
+-- kernel-injected capabilities (unused by the stub — it holds no external
+-- seam). The instance signs every message with `id` and, per the ready barrier,
+-- confirms creation immediately with a ready message for that id.
+function M.construct(id, params, emit, deps)
   params = params or {}
 
   -- Sign: stamp the actor id onto every outbound message so each instance is
@@ -55,13 +56,20 @@ function M.construct(id, params, emit)
 
   local instance = { id = id }
 
-  -- Emit an id-signed output carrying the declared `stub.Out` tag.
-  function instance.emit_output(payload)
+  -- deliver(activation) -> completion (routing.lua, the kernel⇄factory
+  -- contract). The stub is single-input and synchronous: it reads the one
+  -- delivered message, emits its declared `stub.Out` (id-signed, routed by
+  -- tag), and returns a successful completion so the kernel emits mag.Unit
+  -- along this actor's dependency edges.
+  function instance.deliver(activation)
+    activation = activation or {}
+    local one = (activation.messages or {})[1] or {}
     emit(sign({
       kind = "stub.Out",
       greeting = params.greeting,
-      payload = payload,
+      payload = one.message,
     }))
+    return { status = "ok" }
   end
 
   -- Explicit drain handler (SIGTERM analog): flush, then a signed completion.

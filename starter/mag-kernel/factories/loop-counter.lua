@@ -49,8 +49,8 @@ M.declaration = {
   signals = {},
 }
 
--- construct(id, params, emit) -> instance
-function M.construct(id, params, emit)
+-- construct(id, params, emit, deps) -> instance
+function M.construct(id, params, emit, deps)
   params = params or {}
 
   -- Per-instance state — the reason this primitive is Lua, not MAG. Two
@@ -77,9 +77,15 @@ function M.construct(id, params, emit)
     return sign(out)
   end
 
-  -- Fire per arriving ProviderOut (single input contract).
-  function instance.activate(message)
-    message = message or {}
+  -- deliver(activation) -> completion (routing.lua, the kernel⇄factory
+  -- contract). Single input: fires per arriving ProviderOut. Emits one union
+  -- variant (pass-through below the bound, LoopExhausted at exhaustion) and
+  -- returns a successful completion — the kernel then emits mag.Unit along any
+  -- dependency edges (the typed variant is the data output; mag.Unit is the
+  -- kernel-synthesized status).
+  function instance.deliver(activation)
+    activation = activation or {}
+    local message = ((activation.messages or {})[1] or {}).message or {}
     count = count + 1
     if count > max then
       -- LoopExhausted payload (flagged for review): carries enough context for
@@ -96,6 +102,7 @@ function M.construct(id, params, emit)
     else
       emit(passthrough(message))
     end
+    return { status = "ok" }
   end
 
   -- Ready barrier (actor-model.md, Lifecycle): confirm creation for this id.
