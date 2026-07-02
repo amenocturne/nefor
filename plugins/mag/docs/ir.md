@@ -12,7 +12,7 @@ primitives — logic lives in MAG, reached through the evaluator.
 
 ```json
 {
-  "actors":   [ { "id": "...", "factory": "...", "params": { } } ],
+  "actors":   [ { "id": "...", "factory": "...", "params": { }, "routes": { } } ],
   "messages": [ { "to": "...", "content": { } } ],
   "kills":    [ "..." ],
   "rules":    [ { "on": "...", "fn": "..." } ]
@@ -24,6 +24,12 @@ primitives — logic lives in MAG, reached through the evaluator.
   instantiation: an agent named `docs-explorer` prefixes its internal
   actors, so its provider loop is `docs-explorer.llm` — each instance gets
   its own subtree of names.
+- `routes` — kernel-owned typed wiring, sibling of `params` by design:
+  params belong to the factory, routes belong to the kernel, and an actor
+  never reads its own routes. A map from fully-qualified output type to an
+  array of destination ids; the authoring graph's edges dissolve here. A
+  union exit becomes multiple keys; one type to many targets is fanout with
+  no special casing. See lowering.md for the full mapping.
 - `messages` — sends: initial activation for new actors, inputs for
   existing ones.
 - `kills` — ids to remove.
@@ -48,6 +54,49 @@ the actor is a black box until it returns its output. The output routes
 along the compiled wiring, and if a rule is bound to the node, the rule's
 function computes the next modification. The runtime operates over nothing
 but modifications — running a workflow *is* this fold.
+
+## Firing — when an actor activates
+
+An actor activates when its declared input contract is satisfied. Firing is a
+type fact, symmetric to routing: output types decide where results go, input
+types decide when the actor runs.
+
+| Input contract | Fires |
+|---|---|
+| single type `A` | per message — every arriving `A` is one activation |
+| union `(A \| B)` | on any — whichever arrives first activates alone |
+| product `(A + B)` | on all — the kernel accumulates components and delivers one assembled activation |
+
+Data flow subsumes dependency: if `A -> B` carries data, B structurally cannot
+fire before A's output arrives. There is no separate dependency graph in the
+IR — the authoring layer may present dataflow and firing constraints as two
+views, but both lower to routes plus input contracts. Ordering without data
+is a status-typed route (`mag.Completed`, failure variants), consumed like any
+other input.
+
+Dependencies use the same language: "A depends on C finishing" is the edge
+`C -> A` carrying `mag.Unit` — an informationless payload whose sole purpose
+is to encode the ordering. No second vocabulary exists.
+
+- **Slot identity is the incoming edge, not the type.** The kernel assembles
+  product activations with per-slot FIFO queues, where each slot is bound to
+  its sender at lowering time (messages are id-signed, routes are
+  directional, so the binding is known statically). This is what makes
+  `(Unit + Unit)` from two different upstreams — or `(Findings + Findings)`
+  from two explorers — unambiguous: two completions of the same sender fill
+  one slot twice, never two slots. One activation per complete set; the same
+  hold-until machinery as the pending mailbox, with "until ready" extended
+  to "until complete".
+- **Reserved status types are kernel-emitted.** Route keys matching the
+  factory's declared output types dispatch from the returned value;
+  `mag.Unit` (successful completion) and the failure types are emitted by
+  the kernel as part of applying the completion — a factory never returns
+  them and never knows a dependency edge exists. A failure the factory
+  computes is returned like any value; a failure the actor suffers (provider
+  error, kill mid-flight, budget exceeded) is kernel-synthesized, so failure
+  routes work uniformly regardless of how the failure happened.
+- There is deliberately no "fire when X did *not* happen" — absence is
+  expressed as a timeout or a failure route, never a negative predicate.
 
 ## Application semantics
 

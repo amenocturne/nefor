@@ -50,7 +50,9 @@ Two obligations:
   their shape. In a cyclic composition (the agentic loop), which output exits
   the cycle is a type fact — a declared algebraic type, built from sums and
   products, e.g. `ProviderOut -> (ToolCalls | FinalAnswer)` — never a
-  position heuristic.
+  position heuristic. The input side carries firing semantics the same way:
+  single type fires per message, union fires on any, product fires on all
+  (see ir.md, Firing).
 
 ## Lifecycle
 
