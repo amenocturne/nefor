@@ -150,6 +150,25 @@ impl LuaHost {
         Ok(state)
     }
 
+    /// Apply one graph modification directly through the fold (no ready
+    /// barrier). This is the control plane's direct kernel op (docs/ir.md,
+    /// "Kernel operations": modifications reach `actors`/`kills`/`messages`
+    /// through the fold, and "the control plane reaches them directly"). The
+    /// mid-run kill surface uses it: a `{ kills = [...] }` modification unroutes
+    /// the target, hands it its final kill message (the factory's abort envelope
+    /// reaches the bus), and drops its correlations. Returns the fold's verbatim
+    /// `{ ok, error }`.
+    pub fn apply(&self, modification: &JsonValue) -> Result<BarrierState, MagError> {
+        let mod_val = self.lua.to_value(modification)?;
+        let f: Function = self.kernel.get("apply")?;
+        let res: Table = f.call::<Table>(mod_val)?;
+        Ok(BarrierState {
+            done: true,
+            ok: res.get::<Option<bool>>("ok")?.unwrap_or(false),
+            error: res.get::<Option<String>>("error")?,
+        })
+    }
+
     /// Advance the stashed barrier handle against the current clock. Idempotent
     /// once settled. Returns the barrier's settled state (or a "done" no-op
     /// when no run is in flight).

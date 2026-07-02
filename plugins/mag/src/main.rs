@@ -80,6 +80,19 @@ const EXECUTE_KIND: &str = "mag.execute";
 /// §Control plane).
 const RUN_RESULT_KIND: &str = "mag.run_result";
 
+/// Apply one graph modification directly to the resident kernel, no ready
+/// barrier — the control plane's direct kernel op (docs/ir.md, "Kernel
+/// operations": the control plane reaches `actors`/`kills`/`messages`
+/// directly). This is the mid-run control-plane surface the actor-kernel
+/// cutover needs: a `{ kills = [...] }` modification is how the plane kills an
+/// in-flight actor (its abort/cancel envelope reaches the bus, its correlations
+/// drop, its late reply voids). Guarded — the modification must be an object —
+/// and acknowledged with `mag.applied` (or `mag.error` on a rejected/ill-shaped
+/// modification). Any lifecycle events the apply produced stream on the wire as
+/// usual, and a completion it triggers settles the in-flight run.
+const APPLY_KIND: &str = "mag.apply";
+const APPLIED_KIND: &str = "mag.applied";
+
 /// Correlation id echoed by capability responses (tool.result). The kernel
 /// mints these on `capability.invoke` (routing.lua); the reply carries `output`
 /// (tool/provider convention) or `result`, plus an optional `error`.
@@ -298,6 +311,7 @@ async fn handle_event(
         LOAD_KIND => handle_load(out_tx, body, in_reply_to, program, host).await,
         EVAL_KIND => handle_eval(out_tx, body, in_reply_to, program).await,
         EXECUTE_KIND => handle_execute(out_tx, body, in_reply_to, program, host, active).await,
+        APPLY_KIND => handle_apply(out_tx, body, in_reply_to, host, active).await,
         // A capability response correlated to a kernel-minted request id.
         // Unknown ids are dropped inside the kernel (no open correlation), so
         // forwarding every tool.result while a run is live is safe.
@@ -435,6 +449,47 @@ async fn handle_execute(
         run_id,
     });
     Ok(())
+}
+
+/// Apply one graph modification directly to the resident kernel — the control
+/// plane's mid-run kernel op (docs/ir.md, "Kernel operations"). The initial
+/// modification runs behind the ready barrier via `mag.execute`; this is the
+/// *later* path, with no barrier: a `{ kills = [...] }` modification kills an
+/// in-flight actor (the factory's abort envelope reaches the bus, correlations
+/// drop, the late reply voids), a `{ messages = [...] }` delivers a signal, a
+/// `{ actors = [...] }` spawns into the live constellation. Guarded: the
+/// modification must be an object. Lifecycle events the apply emits stream on
+/// the wire; a completion it triggers settles the run.
+async fn handle_apply(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    body: &Map<String, Value>,
+    in_reply_to: Option<&str>,
+    host: &LuaHost,
+    active: &mut Option<ActiveExecute>,
+) -> Result<(), MagError> {
+    let modification = match body.get("modification") {
+        Some(m @ Value::Object(_)) => m.clone(),
+        _ => {
+            return send_event(
+                out_tx,
+                error_body(in_reply_to, "mag.apply modification must be an object"),
+            )
+            .await
+        }
+    };
+
+    let state = host.apply(&modification)?;
+    // Forward the lifecycle events + any abort/cancel envelopes the apply queued
+    // (a kill hands the dying actor its final message, which reaches the bus here).
+    flush_emits(out_tx, host).await?;
+    send_event(
+        out_tx,
+        applied_body(in_reply_to, state.ok, state.error.as_deref()),
+    )
+    .await?;
+    // A modification that completes the run (e.g. a send that unblocks the sink)
+    // settles the in-flight execute reply.
+    settle_if_complete(out_tx, host, active).await
 }
 
 /// Route a capability response into the kernel (unblocking a deferred
@@ -587,6 +642,23 @@ fn run_result_failed(in_reply_to: Option<&str>, run_id: &str, error: &str) -> Ma
     m
 }
 
+/// Acknowledge a `mag.apply`: whether the fold accepted the modification, plus
+/// the rejection error when it did not. The applied modification's own
+/// lifecycle events (`mag.modification_applied` / `mag.actor_killed` / …) carry
+/// the detail; this is just the control-plane ack.
+fn applied_body(in_reply_to: Option<&str>, ok: bool, error: Option<&str>) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("kind".into(), Value::String(APPLIED_KIND.into()));
+    if let Some(id) = in_reply_to {
+        m.insert("in_reply_to".into(), Value::String(id.to_owned()));
+    }
+    m.insert("ok".into(), Value::Bool(ok));
+    if let Some(e) = error {
+        m.insert("error".into(), Value::String(e.to_owned()));
+    }
+    m
+}
+
 fn modification_body(in_reply_to: Option<&str>, modification: Value) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("kind".into(), Value::String(MODIFICATION_KIND.into()));
@@ -701,6 +773,22 @@ mod tests {
         );
         assert!(b.get("in_reply_to").is_none());
         assert!(b.get("modification").is_some());
+    }
+
+    #[test]
+    fn applied_body_acks_ok_and_error() {
+        let ok = applied_body(Some("apply-1"), true, None);
+        assert_eq!(ok.get("kind").and_then(Value::as_str), Some("mag.applied"));
+        assert_eq!(
+            ok.get("in_reply_to").and_then(Value::as_str),
+            Some("apply-1")
+        );
+        assert_eq!(ok.get("ok").and_then(Value::as_bool), Some(true));
+        assert!(ok.get("error").is_none());
+
+        let bad = applied_body(None, false, Some("rejected"));
+        assert_eq!(bad.get("ok").and_then(Value::as_bool), Some(false));
+        assert_eq!(bad.get("error").and_then(Value::as_str), Some("rejected"));
     }
 
     #[test]
