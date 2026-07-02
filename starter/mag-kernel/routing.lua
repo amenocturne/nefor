@@ -89,6 +89,7 @@ function M.new(opts)
     instances = {}, -- id -> instance handle (with :deliver)
     machines = {}, -- id -> { port -> firing machine }
     ready = {}, -- id -> true once the factory confirmed ready
+    held = nil, -- set of held ids while a program-start barrier is active
   }, M)
   return self
 end
@@ -314,21 +315,58 @@ function M:bus_response(response)
 end
 
 -- The factory confirmed the id is ready (actor-model.md, Lifecycle). Mark it
--- routable and drain its pending mailbox through firing, in arrival order.
--- Both mailbox shapes are handled: routed entries ({ __routed, from, kind,
--- message }) and MAG-seed content stored bare by the fold's do_send (a content
--- table carrying its own .kind).
+-- routable, then drain its pending mailbox — unless a program-start barrier is
+-- holding, in which case draining is deferred until the barrier releases (so
+-- initial messages are delivered strictly after every actor has readied;
+-- docs/ir.md, Running a program — the two-step handshake).
 function M:on_ready(id)
   if self.ready[id] then
     return
   end
   self.ready[id] = true
+  if self.held then
+    self.held[id] = true
+    return
+  end
+  self:drain_pending(id)
+end
+
+-- Drain an id's pending mailbox through firing, in arrival order. Both mailbox
+-- shapes are handled: routed entries ({ __routed, from, kind, message }) and
+-- MAG-seed content stored bare (a content table carrying its own .kind).
+function M:drain_pending(id)
   local queued = self.inventory.take_mailbox(id)
   for _, m in ipairs(queued or {}) do
     if m.__routed then
       self:fire(id, m.from, m.kind, m.message)
     else
       self:fire(id, m.from, m.kind, m)
+    end
+  end
+end
+
+-- Read-only readiness probe — the barrier consults this to decide when the
+-- whole constellation has confirmed (barrier.lua). Readiness is owned here in
+-- the delivery layer: on_ready is its sole writer and deliver its sole reader,
+-- so there is one fire-vs-queue decision point (the fold delegates its live
+-- sends here rather than judging readiness itself; see inventory do_send).
+function M:is_ready(id)
+  return self.ready[id] == true
+end
+
+-- Program-start barrier hooks. begin_barrier makes on_ready defer draining;
+-- release_barrier drains every held id's mailbox, delivering all initial
+-- messages at once, after the barrier has confirmed the constellation ready.
+function M:begin_barrier()
+  self.held = self.held or {}
+end
+
+function M:release_barrier()
+  local held = self.held
+  self.held = nil
+  if held then
+    for id in pairs(held) do
+      self:drain_pending(id)
     end
   end
 end

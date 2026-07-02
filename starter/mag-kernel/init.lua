@@ -16,6 +16,7 @@
 local inventory = require("inventory")
 local Registry = require("registry")
 local routing = require("routing")
+local barrier = require("barrier")
 local stub = require("factories.stub")
 local loop_counter = require("factories.loop-counter")
 local sink = require("factories.sink")
@@ -71,11 +72,43 @@ local router = routing.new({
   log = make_logger(),
   bus_emit = bus_emit,
 })
--- Break the construction-order cycle: the inventory's kill hook calls into the
--- router so a kill drops the router's firing slots + correlations too.
+-- Break the construction-order cycle (both hooks need the router, which needs
+-- the inventory): the kill hook drops the router's firing slots + correlations;
+-- the construct hook builds each freshly-spawned instance via the registry and
+-- binds it into the router; the deliver hook routes live-target sends through
+-- routing's single fire-vs-queue decision.
 inv.set_on_kill(function(id)
   router:forget(id)
 end)
+
+local construct_log = make_logger()
+inv.set_construct(function(record)
+  -- `deps` carries kernel-injected capabilities (actor-model.md). The sink's
+  -- output writer is not wired yet (no run output location at this layer), so
+  -- deps is empty for now; a sink constructed here flags persisted = false.
+  local emit = router:emitter(record.id)
+  local instance, err = registry:construct(record.factory, record.id, record.params, emit, {})
+  if err or not instance then
+    -- Construction failed: the instance is not bound and never readies, so the
+    -- program-start barrier will name this id as a straggler.
+    construct_log.error(string.format("construct failed for '%s' (factory '%s'): %s",
+      tostring(record.id), tostring(record.factory), tostring(err)))
+    return
+  end
+  router:bind(record.id, instance)
+end)
+inv.set_deliver(function(to, from, content)
+  content = content or {}
+  router:deliver(to, from, content.kind, content)
+end)
+
+-- Injected clock (flagged): the host has no time binding yet (kernel.rs
+-- install_nefor ships only nefor.log), so the barrier reads os.time at
+-- second granularity. Swap for a host-provided millisecond clock when it
+-- lands — time stays injected, never read inside the pure modules.
+local function now_ms()
+  return os.time() * 1000
+end
 
 nefor.log("mag-kernel ready (factories: stub, loop-counter, sink, human)")
 
@@ -87,6 +120,26 @@ return {
   -- { ok = false, error = "..." }.
   apply = function(mod)
     return inv.apply(mod)
+  end,
+
+  -- Start a program: apply its initial modification behind the ready barrier
+  -- (spawn all → await readies → deliver initial messages; docs/ir.md). Returns
+  -- a barrier handle; if `handle.done` is false the host polls it as late
+  -- readies arrive. `o.deadline_ms` overrides the per-program default.
+  start = function(mod, o)
+    o = o or {}
+    return barrier.start({
+      inventory = inv,
+      router = router,
+      mod = mod,
+      now = o.now or now_ms,
+      deadline_ms = o.deadline_ms,
+    })
+  end,
+
+  -- Advance a pending barrier handle against the host clock (ms).
+  poll = function(handle, t)
+    return barrier.poll(handle, t or now_ms())
   end,
 
   -- Read-only introspection for the host / tests.

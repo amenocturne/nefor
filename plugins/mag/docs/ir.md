@@ -55,6 +55,39 @@ along the compiled wiring, and if a rule is bound to the node, the rule's
 function computes the next modification. The runtime operates over nothing
 but modifications — running a workflow *is* this fold.
 
+## Running a program — the two-step handshake
+
+Program start is not fire-and-forget. Applying a program's *initial*
+modification is a two-step handshake:
+
+1. **Spawn** every actor in the initial constellation — register the id, open
+   its pending mailbox, and construct the instance via its factory. The
+   initial messages queue in those pending mailboxes.
+2. **Await** each actor's ready confirmation (the factory's `mag.ready` emit),
+   then **deliver** the queued initial messages — strictly after the whole
+   constellation is ready. A synchronous factory (the shipped ones) confirms
+   in its constructor, so a well-formed static program passes the barrier the
+   moment it is applied.
+
+The barrier covers the initial constellation only; actors spawned later by
+rules rely on the pending mailbox alone (spawn reserves + queues, ready
+drains), with no barrier.
+
+**Deadline — per-program (decided).** The barrier carries one deadline for the
+whole constellation, measured from program start, not one per actor. The
+initial modification spawns every actor atomically, so their clocks start
+together; a single shared budget is the natural unit and names the whole
+straggler set at once. An actor that fails to confirm before the deadline
+**fails the run** with an error naming exactly the stragglers, and no initial
+message is delivered. Default budget: 5000 ms, overridable per start. (This
+resolves the "ready-barrier deadline: per-actor or per-program, and value"
+open item.)
+
+**Time is injected.** The kernel Lua has no event loop, so the barrier never
+blocks: the host supplies a `now()` clock and polls the barrier as late
+confirmations arrive or on a timer tick. No wall-clock is read inside the fold
+or the barrier.
+
 ## Firing — when an actor activates
 
 An actor activates when its declared input contract is satisfied. Firing is a
