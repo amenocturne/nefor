@@ -1,13 +1,12 @@
 //! Embedded Lua VM that hosts the MAG kernel.
 //!
-//! The kernel proper (actor inventory, ready barrier, mailboxes, routing,
-//! the fold over graph modifications) is Lua-resident — see
+//! The kernel proper (actor inventory, lazy construction, routing, the fold
+//! over graph modifications) is Lua-resident — see
 //! `plugins/mag/docs/actor-model.md` and `docs/ir.md`. This module is the
 //! Rust host: it creates the VM, installs the native surface the kernel
 //! needs (log, json, fs, a millisecond clock, and a bus-emit queue), loads
 //! the kernel entry file, and drives the kernel's execute seams
-//! (`begin_run`, `start`, `poll`, `bus_response`) from the plugin's dispatch
-//! loop.
+//! (`begin_run`, `start`, `bus_response`) from the plugin's dispatch loop.
 //!
 //! The bus seam is a queue, not an async callback: the kernel modules call
 //! `nefor.emit` synchronously from inside the fold (never a coroutine), so
@@ -26,13 +25,10 @@ use crate::error::MagError;
 /// Global Lua array `nefor.emit` appends to; drained by [`LuaHost::drain_emits`].
 const EMIT_QUEUE: &str = "__mag_emit_queue";
 
-/// Named-registry slot holding the in-flight ready-barrier handle across polls.
-const BARRIER_SLOT: &str = "mag_barrier";
-
-/// The settled state of a ready barrier (`starter/mag-kernel/barrier.lua`).
+/// The fold's verdict on one applied modification (`{ ok, error }` from the
+/// kernel's `start` / `apply` seams).
 #[derive(Debug, Clone)]
-pub struct BarrierState {
-    pub done: bool,
+pub struct ApplyOutcome {
     pub ok: bool,
     pub error: Option<String>,
 }
@@ -138,64 +134,30 @@ impl LuaHost {
         Ok(())
     }
 
-    /// Apply a program's initial modification behind the ready barrier and
-    /// stash the returned handle for [`LuaHost::poll`]. Synchronous factories
-    /// (the shipped ones) confirm ready in-constructor, so a well-formed static
-    /// program releases and runs to completion inside this call.
-    pub fn start(
-        &self,
-        modification: &JsonValue,
-        deadline_ms: Option<u64>,
-    ) -> Result<BarrierState, MagError> {
+    /// Apply a program's initial modification through the fold. Actors
+    /// register at apply and construct lazily at their first satisfied input
+    /// contract, so a synchronous program runs to completion inside this call;
+    /// an async one (a provider round-trip pending) progresses via
+    /// [`LuaHost::bus_response`].
+    pub fn start(&self, modification: &JsonValue) -> Result<ApplyOutcome, MagError> {
         let mod_val = self.lua.to_value(modification)?;
-        let opts = self.lua.create_table()?;
-        if let Some(d) = deadline_ms {
-            opts.set("deadline_ms", d)?;
-        }
         let f: Function = self.kernel.get("start")?;
-        let handle: Table = f.call::<Table>((mod_val, opts))?;
-        let state = barrier_state(&handle)?;
-        self.lua.set_named_registry_value(BARRIER_SLOT, handle)?;
-        Ok(state)
+        let res: Table = f.call::<Table>(mod_val)?;
+        apply_outcome(&res)
     }
 
-    /// Apply one graph modification directly through the fold (no ready
-    /// barrier). This is the control plane's direct kernel op (docs/ir.md,
-    /// "Kernel operations": modifications reach `actors`/`kills`/`messages`
-    /// through the fold, and "the control plane reaches them directly"). The
-    /// mid-run kill surface uses it: a `{ kills = [...] }` modification unroutes
-    /// the target, hands it its final kill message (the factory's abort envelope
-    /// reaches the bus), and drops its correlations. Returns the fold's verbatim
-    /// `{ ok, error }`.
-    pub fn apply(&self, modification: &JsonValue) -> Result<BarrierState, MagError> {
+    /// Apply one graph modification directly through the fold — the control
+    /// plane's direct kernel op (docs/ir.md, "Kernel operations": modifications
+    /// reach `actors`/`kills`/`messages` through the fold, and "the control
+    /// plane reaches them directly"). The mid-run kill surface uses it: a
+    /// `{ kills = [...] }` modification unroutes the target, hands it its final
+    /// kill message (the factory's abort envelope reaches the bus), and drops
+    /// its correlations. Returns the fold's verbatim `{ ok, error }`.
+    pub fn apply(&self, modification: &JsonValue) -> Result<ApplyOutcome, MagError> {
         let mod_val = self.lua.to_value(modification)?;
         let f: Function = self.kernel.get("apply")?;
         let res: Table = f.call::<Table>(mod_val)?;
-        Ok(BarrierState {
-            done: true,
-            ok: res.get::<Option<bool>>("ok")?.unwrap_or(false),
-            error: res.get::<Option<String>>("error")?,
-        })
-    }
-
-    /// Advance the stashed barrier handle against the current clock. Idempotent
-    /// once settled. Returns the barrier's settled state (or a "done" no-op
-    /// when no run is in flight).
-    pub fn poll(&self) -> Result<BarrierState, MagError> {
-        let handle: Option<Table> = self.lua.named_registry_value(BARRIER_SLOT)?;
-        let handle = match handle {
-            Some(h) => h,
-            None => {
-                return Ok(BarrierState {
-                    done: true,
-                    ok: true,
-                    error: None,
-                })
-            }
-        };
-        let f: Function = self.kernel.get("poll")?;
-        let handle: Table = f.call::<Table>((handle, Value::Nil))?;
-        barrier_state(&handle)
+        apply_outcome(&res)
     }
 
     /// Deliver a correlated capability response (tool.result-shaped) back to the
@@ -286,12 +248,11 @@ impl LuaHost {
     }
 }
 
-/// Read `{ done, ok, error }` off a barrier handle table.
-fn barrier_state(handle: &Table) -> Result<BarrierState, MagError> {
-    Ok(BarrierState {
-        done: handle.get::<Option<bool>>("done")?.unwrap_or(false),
-        ok: handle.get::<Option<bool>>("ok")?.unwrap_or(false),
-        error: handle.get::<Option<String>>("error")?,
+/// Read `{ ok, error }` off a fold-result table.
+fn apply_outcome(res: &Table) -> Result<ApplyOutcome, MagError> {
+    Ok(ApplyOutcome {
+        ok: res.get::<Option<bool>>("ok")?.unwrap_or(false),
+        error: res.get::<Option<String>>("error")?,
     })
 }
 

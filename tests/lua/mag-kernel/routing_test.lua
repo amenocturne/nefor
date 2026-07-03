@@ -2,13 +2,14 @@
 -- routing layer (starter/mag-kernel/routing.lua, firing.lua, correlation.lua).
 -- Driven from engine/tests/starter_mag_kernel_test.rs.
 --
--- Covers the task's done-when list: two stub actors exchange by id; a send
--- between spawn-request and ready is delivered after ready in order; a
--- dead-target send drops with a log entry; a capability round-trip correlates
--- through a stubbed bus; a product-input actor fires once per complete
--- sender-bound set with per-slot FIFO ((Unit + Unit) needs one from each of
--- two distinct upstreams); a dependency-only edge delivers kernel-emitted
--- mag.Unit on the upstream's completion.
+-- Covers: two stub actors exchange by id; a delivery to a registered-but-
+-- unconstructed id constructs the instance lazily (ready first, then the
+-- activation) and reuses it afterward; a dead-target send drops with a log
+-- entry; a capability round-trip correlates through a stubbed bus; a
+-- product-input actor fires once per complete sender-bound set with per-slot
+-- FIFO ((Unit + Unit) needs one from each of two distinct upstreams); a
+-- dependency-only edge delivers kernel-emitted mag.Unit on the upstream's
+-- completion.
 
 local inventory = require("inventory")
 local Registry = require("registry")
@@ -72,7 +73,7 @@ end
 
 -- Build a test actor instance implementing the kernel<->instance contract:
 -- an id-signed emitter (from the router) and a deliver(activation) whose body
--- is supplied per test. Emitting mag.ready confirms the ready barrier.
+-- is supplied per test. Emitting mag.ready confirms readiness.
 local function spawn_actor(h, id, factory, routes, deliver_fn)
   local res = h.inv.apply({
     actors = { { id = id, factory = factory, params = {}, routes = routes or {} } },
@@ -154,7 +155,9 @@ do
 end
 
 -- ==================================================================
--- a send between spawn-request and ready is delivered after ready, in order
+-- lazy construction: a delivery to a registered-but-unconstructed id
+-- constructs the instance (ready first), fires it immediately, and reuses
+-- the instance on later deliveries
 -- ==================================================================
 
 do
@@ -163,20 +166,35 @@ do
   })
 
   local order = {}
-  local b = spawn_actor(h, "b", "sink", {}, function(_, activation)
-    order[#order + 1] = activation.messages[1].message.n
-    return "ok"
+  -- Register the spec through the fold, but bind nothing: the router's
+  -- construct hook (init.lua's seam) builds the instance on demand.
+  local res = h.inv.apply({ actors = { { id = "b", factory = "sink", params = {}, routes = {} } } })
+  assert_true(res.ok, "spawn b: " .. tostring(res.error))
+  h.router:set_construct(function(record)
+    order[#order + 1] = "construct:" .. record.id
+    local inst = { id = record.id, emit = h.router:emitter(record.id) }
+    inst.deliver = function(activation)
+      order[#order + 1] = "deliver:" .. tostring(activation.messages[1].message.n)
+      return "ok"
+    end
+    inst.emit({ kind = "mag.ready", from = record.id })
+    return inst
   end)
-  -- b is registered but NOT ready yet: two deliveries must queue in arrival
-  -- order, not drop and not fire.
-  h.router:deliver("b", "a", "q.Item", { n = 1 })
-  h.router:deliver("b", "a", "q.Item", { n = 2 })
-  assert_eq(#order, 0, "nothing fires before ready")
 
-  ready(h, b)
-  assert_eq(#order, 2, "both queued messages drain on ready")
-  assert_eq(order[1], 1, "drained in arrival order (first)")
-  assert_eq(order[2], 2, "drained in arrival order (second)")
+  assert_eq(#order, 0, "registration alone constructs nothing")
+  h.router:deliver("b", "a", "q.Item", { n = 1 })
+  assert_eq(order[1], "construct:b", "the first delivery constructs the instance")
+  assert_eq(order[2], "deliver:1", "the first activation lands right after construct")
+
+  h.router:deliver("b", "a", "q.Item", { n = 2 })
+  assert_eq(#order, 3, "a later delivery reuses the instance")
+  assert_eq(order[3], "deliver:2", "no re-construct on the second activation")
+
+  local readied = 0
+  for _, e in ipairs(h.events) do
+    if e.kind == "mag.actor_ready" and e.id == "b" then readied = readied + 1 end
+  end
+  assert_eq(readied, 1, "construction surfaced exactly one mag.actor_ready")
 end
 
 -- ==================================================================

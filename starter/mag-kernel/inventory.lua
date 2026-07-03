@@ -7,16 +7,18 @@
 -- atomically — spawns, sends, kills — with monotone per-id lifecycles.
 --
 -- It is deliberately free of host/bus knowledge. All side effects it needs
--- are injected: a `log` sink (info/warn/error), a `construct` hook that builds
--- real instances, and a `deliver` hook that hands live-target sends to the
--- routing layer. That keeps the fold unit-testable in a bare Lua VM (both
--- hooks absent → records stand in as placeholders, sends queue directly) and
--- keeps this file mergeable alongside the sibling routing/registry modules.
+-- are injected: a `log` sink (info/warn/error), an `on_spawn` hook fired at
+-- registration (the observer emits `mag.actor_spawned` through it), and a
+-- `deliver` hook that hands live-target sends to the routing layer. That
+-- keeps the fold unit-testable in a bare Lua VM (hooks absent → records stand
+-- in as placeholders, sends queue directly) and keeps this file mergeable
+-- alongside the sibling routing/registry modules.
 --
--- The ready barrier itself (spawn all → await readies → deliver initial
--- messages) lives in barrier.lua, which composes this fold with the router;
--- rule evaluation is still a separate task (a non-empty `rules` list is
--- rejected "not implemented").
+-- Construction is NOT the fold's concern: a spawn only registers the spec
+-- (id, factory, params, routes). The routing layer constructs the instance
+-- lazily, at the actor's first satisfied input contract (actor-model.md,
+-- Lifecycle). Rule evaluation is still a separate task (a non-empty `rules`
+-- list is rejected "not implemented").
 
 local M = {}
 
@@ -196,15 +198,14 @@ end
 -- execution — mutates the inventory. Only reached after validate passed,
 -- so shape and targets are already sound. Order: spawns, then sends, then
 -- kills, so a message addressed to an id created in the same modification
--- queues in the freshly-opened mailbox.
+-- finds its spec (routes, input contract) already registered.
 -- ---------------------------------------------------------------------------
 
--- Register a new actor record + open its pending mailbox. Returns true when a
--- fresh id was created (so the caller constructs its instance), false for a
--- monotone no-op (already alive, or dead and unrevivable). Construction is a
--- separate pass (construct_spawn) so sends can queue into the mailbox *before*
--- the factory readies — a synchronous factory that emits mag.ready in its
--- constructor would otherwise drain an empty mailbox and never see the seeds.
+-- Register a new actor record. Returns true when a fresh id was created,
+-- false for a monotone no-op (already alive, or dead and unrevivable). No
+-- instance is built here: construction is lazy — the routing layer constructs
+-- via the factory at the actor's first satisfied input contract
+-- (actor-model.md, Lifecycle).
 local function do_spawn(self, actor)
   local existing = self.actors[actor.id]
   if existing then
@@ -222,10 +223,11 @@ local function do_spawn(self, actor)
     return false
   end
 
-  -- New id: register the instance record and open its pending mailbox. The
-  -- real instance is built later by construct_spawn via the injected
-  -- `construct` hook (init.lua bridges to registry:construct + router:bind);
-  -- `routes` are retained verbatim for the routing layer.
+  -- New id: register the spec record. `routes` are retained verbatim for the
+  -- routing layer; the record also opens a mailbox used only by the hook-less
+  -- bare-VM path (see do_send). The on_spawn hook surfaces the registration
+  -- (the observer emits mag.actor_spawned through it) before any send in the
+  -- same modification can fire the actor.
   self.actors[actor.id] = {
     id = actor.id,
     factory = actor.factory,
@@ -235,30 +237,20 @@ local function do_spawn(self, actor)
     state = ALIVE,
     mailbox = {},
   }
+  self.on_spawn(self.actors[actor.id])
   return true
-end
-
--- Construct the instance for a freshly-spawned record via the injected hook.
--- The hook (init.lua) calls registry:construct(factory, id, params, emit, deps)
--- and binds the instance into the router; the factory confirms ready through
--- its emitter. Absent a hook (bare-VM fold tests) construction is skipped and
--- the record stands in as a placeholder.
-local function construct_spawn(self, actor)
-  local record = self.actors[actor.id]
-  if record and record.state == ALIVE and self.construct then
-    self.construct(record)
-  end
 end
 
 local function do_send(self, msg)
   local entry = self.actors[msg.to]
   -- validate guaranteed the target exists (alive or just created) or is
   -- dead. A live target routes through the injected `deliver` hook, the
-  -- single delivery decision point: routing consults readiness and either
-  -- fires a ready target or queues in its pending mailbox (actor-model.md).
-  -- Absent a hook (bare-VM fold tests) the send queues directly — there is no
-  -- routing layer to make the fire-vs-queue call. A dead target drops the
-  -- send as a logged no-op — the race artifact of first-applied-wins.
+  -- single delivery decision point: routing feeds the firing machine, which
+  -- buffers partial product inputs and constructs + fires the actor when its
+  -- input contract is satisfied (actor-model.md). Absent a hook (bare-VM fold
+  -- tests) the send queues in the record's mailbox — there is no routing
+  -- layer to fire into. A dead target drops the send as a logged no-op — the
+  -- race artifact of first-applied-wins.
   if entry and entry.state == ALIVE then
     if self.deliver then
       self.deliver(msg.to, "mag.control", msg.content)
@@ -281,20 +273,23 @@ local function do_kill(self, id)
     self.log.info(string.format("kill no-op: '%s' already dead", id))
     return
   end
-  -- Unroute + drop the pending mailbox; the id stays in the map as a
-  -- tombstone so the lifecycle stays monotone (spawn can never revive it).
+  -- Unroute; the id stays in the map as a tombstone so the lifecycle stays
+  -- monotone (spawn can never revive it). A registered-but-unconstructed
+  -- actor dies the same way: the spec drops, no instance ever exists.
   entry.state = DEAD
   entry.mailbox = {}
   entry.routes = {}
-  -- Notify the routing layer so it drops the firing slots and outstanding
-  -- capability correlations too (kill drops mailbox + slots; actor-model.md).
+  -- Notify the routing layer so it drops the instance (when one was
+  -- constructed), the firing slots, and outstanding capability correlations
+  -- (kill drops slots; actor-model.md).
   self.on_kill(id)
 end
 
--- Apply order (docs/ir.md, "Application semantics"): register spawns, queue
--- sends, construct the freshly-spawned instances, then kills. Construction
--- runs *after* sends so a synchronous factory's ready drains a populated
--- mailbox. Returns the set of ids spawned by this modification.
+-- Apply order (docs/ir.md, "Application semantics"): register spawns, then
+-- sends, then kills. Registration precedes sends so every route and input
+-- contract in the modification resolves before the first delivery can
+-- construct + fire an actor. Returns the set of ids spawned by this
+-- modification.
 local function execute(self, mod)
   local created = {}
   for _, actor in ipairs(mod.actors or {}) do
@@ -304,11 +299,6 @@ local function execute(self, mod)
   end
   for _, msg in ipairs(mod.messages or {}) do
     do_send(self, msg)
-  end
-  for _, actor in ipairs(mod.actors or {}) do
-    if created[actor.id] then
-      construct_spawn(self, actor)
-    end
   end
   for _, id in ipairs(mod.kills or {}) do
     do_kill(self, id)
@@ -367,32 +357,6 @@ function M.pairs(self)
   return pairs(self.actors)
 end
 
--- Append one entry to a live actor's pending mailbox; returns true, or false
--- if the id is absent or dead. This is the routing layer's path for a delivery
--- to a registered-but-not-ready target (actor-model.md, Lifecycle); the fold's
--- own `messages` still queue through do_send.
-function M.enqueue(self, id, entry)
-  local e = self.actors[id]
-  if e and e.state == ALIVE then
-    e.mailbox[#e.mailbox + 1] = entry
-    return true
-  end
-  return false
-end
-
--- Take and clear a live actor's pending mailbox (nil id → empty). The routing
--- layer drains this through firing, in arrival order, when the factory
--- confirms ready.
-function M.take_mailbox(self, id)
-  local e = self.actors[id]
-  if not e then
-    return {}
-  end
-  local mb = e.mailbox
-  e.mailbox = {}
-  return mb
-end
-
 -- Register (or replace) the kill notification hook after construction, so the
 -- inventory and the routing layer can be wired without a construction-order
 -- cycle (routing needs the inventory; the inventory needs routing's forget).
@@ -400,13 +364,22 @@ function M.set_on_kill(self, fn)
   self.on_kill = fn or function() end
 end
 
+-- Register (or replace) the spawn notification hook: fn(record) fires at
+-- registration, inside the fold's spawn pass — before any send in the same
+-- modification can construct or fire the actor. The observer wires this to
+-- emit `mag.actor_spawned`, keeping the wire order truthful (spawned strictly
+-- before the ready an activation may trigger).
+function M.set_on_spawn(self, fn)
+  self.on_spawn = fn or function() end
+end
+
 local noop = function() end
 
 -- Construct an inventory. `opts.log` is a sink with info/warn/error
--- functions (defaults to no-ops). `opts.construct` and `opts.deliver` are the
--- factory-construction and delivery hooks; both are usually set after the
--- router exists (set_construct / set_deliver) to break the construction-order
--- cycle, and both default to nil (bare-VM fold tests run without them).
+-- functions (defaults to no-ops). `opts.deliver` is the delivery hook,
+-- usually set after the router exists (set_deliver) to break the
+-- construction-order cycle; it defaults to nil (bare-VM fold tests run
+-- without it, queueing sends in the record mailbox).
 function M.new(opts)
   opts = opts or {}
   local log = opts.log or {}
@@ -417,16 +390,17 @@ function M.new(opts)
       warn = log.warn or noop,
       error = log.error or noop,
     },
-    -- Factory-construction hook: fn(record) -> builds the real instance and
-    -- binds it into the router. Called by construct_spawn after a fresh spawn.
-    construct = opts.construct,
-    -- Delivery hook: fn(to, from, content) -> routing's single fire-vs-queue
-    -- decision for a live target. Absent, do_send queues into the mailbox.
+    -- Delivery hook: fn(to, from, content) -> routing feeds the firing
+    -- machine for a live target. Absent, do_send queues into the mailbox.
     deliver = opts.deliver,
-    -- Kill notification hook (actor-model.md, Signals: kill drops mailbox +
-    -- slots). Defaults to a no-op; init.lua rebinds it to routing:forget once
-    -- both are built (M.set_on_kill), breaking the construction-order cycle.
+    -- Kill notification hook (actor-model.md, Signals: kill drops slots).
+    -- Defaults to a no-op; init.lua rebinds it to routing's dispatch_kill +
+    -- forget once both are built (M.set_on_kill), breaking the
+    -- construction-order cycle.
     on_kill = opts.on_kill or noop,
+    -- Spawn notification hook (set_on_spawn); the observer emits
+    -- mag.actor_spawned through it at registration time.
+    on_spawn = opts.on_spawn or noop,
   }
   self.apply = function(mod)
     return M.apply(self, mod)
@@ -443,17 +417,11 @@ function M.new(opts)
   self.pairs = function()
     return M.pairs(self)
   end
-  self.enqueue = function(id, entry)
-    return M.enqueue(self, id, entry)
-  end
-  self.take_mailbox = function(id)
-    return M.take_mailbox(self, id)
-  end
   self.set_on_kill = function(fn)
     return M.set_on_kill(self, fn)
   end
-  self.set_construct = function(fn)
-    self.construct = fn
+  self.set_on_spawn = function(fn)
+    return M.set_on_spawn(self, fn)
   end
   self.set_deliver = function(fn)
     self.deliver = fn

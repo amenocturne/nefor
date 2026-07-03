@@ -135,8 +135,8 @@ function M.construct(id, params, emit, deps)
   -- absence is a construct-time validation error, never a silent default: a
   -- modification that authors an llm node must say which provider capability it
   -- targets. Returning nil + message (not error()) keeps the failure on the
-  -- construction seam — the instance never binds, never readies, and the ready
-  -- barrier names it a straggler (init.lua set_construct logs the message).
+  -- construction seam — the instance never binds; routing escalates the
+  -- construct failure as mag.run_failed (routing.lua construct_instance).
   local provider = params.provider
   if type(provider) ~= "string" or #provider == 0 then
     return nil, string.format(
@@ -377,7 +377,8 @@ function M.construct(id, params, emit, deps)
     end
   end
 
-  -- Ready barrier (actor-model.md, Lifecycle): confirm creation for this id.
+  -- Readiness confirmation (actor-model.md, Lifecycle): construction happens at
+  -- the first activation, so this emit coincides with beginning work.
   emit(sign({ kind = kinds.ready }))
 
   return instance

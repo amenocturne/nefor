@@ -281,6 +281,8 @@ async fn minimal_agent_sink_program_compiles_and_runs_kernel_path() {
     let complete_kind = format!("{PROVIDER}.chat.complete");
     let mut saw_create = false;
     let mut saw_append = false;
+    let mut spawned_ids: Vec<String> = Vec::new();
+    let mut ready_ids: Vec<String> = Vec::new();
     let run_result;
 
     loop {
@@ -294,7 +296,15 @@ async fn minimal_agent_sink_program_compiles_and_runs_kernel_path() {
             None => continue,
         };
 
-        if kind == create_kind {
+        if kind == "mag.actor_spawned" {
+            if let Some(id) = body.get("id").and_then(Value::as_str) {
+                spawned_ids.push(id.to_owned());
+            }
+        } else if kind == "mag.actor_ready" {
+            if let Some(id) = body.get("id").and_then(Value::as_str) {
+                ready_ids.push(id.to_owned());
+            }
+        } else if kind == create_kind {
             saw_create = true;
             let chat_id = body
                 .get("chat_id")
@@ -346,6 +356,24 @@ async fn minimal_agent_sink_program_compiles_and_runs_kernel_path() {
         Some("completed"),
         "the session's program runs to completion on the kernel path"
     );
+    // Lazy construction: every actor is spawned (registered) at apply, but
+    // ready — "began work" — fires only for actors that actually activated.
+    // The bounded loop finished without exhausting, so the routed-but-never-
+    // activated exhaust summarizer is spawned yet NEVER ready.
+    assert!(
+        spawned_ids.iter().any(|id| id == "worker.exhaust"),
+        "the exhaust summarizer is spawned at apply; saw {spawned_ids:?}"
+    );
+    assert!(
+        !ready_ids.iter().any(|id| id == "worker.exhaust"),
+        "the exhaust summarizer never fired, so it never constructs/readies; saw {ready_ids:?}"
+    );
+    for id in ["worker.entry", "worker.llm", "sink"] {
+        assert!(
+            ready_ids.iter().any(|r| r == id),
+            "{id} fired and readied; saw {ready_ids:?}"
+        );
+    }
     assert_eq!(
         run_result.get("in_reply_to").and_then(Value::as_str),
         Some("exec-agent-sink")

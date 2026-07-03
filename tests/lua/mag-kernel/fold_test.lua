@@ -79,7 +79,7 @@ do
   assert_eq(entry.factory, "adapter", "factory retained")
   assert_eq(entry.routes["generic-provider.ProviderOut"][1], "docs-explorer.llm",
     "routes retained verbatim, kernel-side")
-  assert_eq(#entry.mailbox, 1, "message queued in pending mailbox")
+  assert_eq(#entry.mailbox, 1, "message queued in the bare-VM mailbox (no deliver hook)")
   assert_eq(entry.mailbox[1].prompt, "go", "queued message content preserved")
 end
 

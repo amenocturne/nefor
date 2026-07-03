@@ -40,8 +40,8 @@ fn starter_mag_kernel_flow_primitives() {
 }
 
 #[test]
-fn starter_mag_kernel_ready_barrier() {
-    run_lua_test("tests/lua/mag-kernel/barrier_test.lua");
+fn starter_mag_kernel_lazy_construction() {
+    run_lua_test("tests/lua/mag-kernel/lazy_construct_test.lua");
 }
 
 #[test]

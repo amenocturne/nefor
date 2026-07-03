@@ -5,8 +5,9 @@
 //! asserts:
 //!   - the constellation's lifecycle events stream onto the NCP wire
 //!     (`mag.run_started`, actor spawn/ready, `mag.modification_applied`,
-//!     `mag.run_complete`),
-//!   - the ready barrier releases and the run completes in the same turn, and
+//!     `mag.run_complete`), spawn at registration strictly before the ready
+//!     its first firing triggers (lazy construction),
+//!   - the run completes in the same turn, and
 //!   - the terminal `mag.run_result` carries the sink's final result INLINE
 //!     (text the lead relays to the model) plus the persisted output PATH,
 //!     and that file was persisted (`persisted` reflects the actual write).
@@ -17,7 +18,7 @@
 //! hang every actor pending on a provider round-trip. A single `sink` seeded
 //! with a `generic-provider.FinalAnswer` uses only the synchronous shipped
 //! factory and runs to completion with no bus round-trip — exercising the full
-//! begin_run → start → barrier → deliver → run-complete drive.
+//! begin_run → start → deliver (lazy construct + fire) → run-complete drive.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -188,6 +189,7 @@ async fn executes_synchronous_sink_program_and_streams_lifecycle_events() {
 
     for expected in [
         "mag.run_started",
+        "mag.actor_spawned",
         "mag.actor_ready",
         "mag.modification_applied",
         "mag.run_complete",
@@ -197,6 +199,14 @@ async fn executes_synchronous_sink_program_and_streams_lifecycle_events() {
             "expected lifecycle event {expected} on the wire; saw {seen:?}"
         );
     }
+    // Lazy construction keeps the wire order truthful: the sink is spawned at
+    // registration, and readies only when its seed fires it — strictly after.
+    let spawned_at = seen.iter().position(|k| k == "mag.actor_spawned");
+    let ready_at = seen.iter().position(|k| k == "mag.actor_ready");
+    assert!(
+        spawned_at < ready_at,
+        "actor_spawned (registration) precedes actor_ready (first firing); saw {seen:?}"
+    );
 
     let body = event_body(&result).expect("run_result event body");
     assert_eq!(

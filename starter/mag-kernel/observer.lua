@@ -11,8 +11,9 @@
 --
 -- Two lifecycle events originate in the delivery layer, not the fold, and so are
 -- emitted by routing.lua through the same injected emitter: `mag.actor_ready`
--- (the ready barrier) and `mag.run_complete` (the sink's mag.RunComplete). The
--- event kinds below are the canonical set; routing references the same strings.
+-- (lazy construction confirmed — the actor began work) and `mag.run_complete`
+-- (the sink's mag.RunComplete). The event kinds below are the canonical set;
+-- routing references the same strings.
 --
 -- ── event-kind set (flagged) ────────────────────────────────────────────────
 -- Parity+ with reasoner-graph's broadcast markers (graph.run_started,
@@ -21,7 +22,8 @@
 -- the control-plane view is structurally better, not just non-regressed:
 --   mag.run_started            a run/program began (wiring, before the first mod)
 --   mag.actor_spawned          the fold registered a new id (never-existed→alive)
---   mag.actor_ready            the factory confirmed the instance ready (routing)
+--   mag.actor_ready            the instance constructed at its first activation
+--                              and confirmed (routing) — "began work"
 --   mag.actor_killed           the fold killed a live id (alive→dead)
 --   mag.modification_applied   a validated mod that changed state
 --   mag.modification_rejected  a validation failure (carries the error)
@@ -58,13 +60,23 @@ local function noop() end
 -- `opts.emit_event` is `fn(event) -> ()`, the injected lifecycle-event sink
 -- (defaults to no-op). `opts.modlog` is an optional modification log to record
 -- into (modlog.lua).
+--
+-- `mag.actor_spawned` is emitted through the inventory's on_spawn seam, AT
+-- REGISTRATION — inside the fold's spawn pass, before any send in the same
+-- modification can construct + fire an actor. A post-apply diff would emit it
+-- after the ready/output events the sends cascade, inverting the wire order
+-- (spawned must precede the ready its first activation triggers).
 function M.new(opts)
   opts = opts or {}
-  return setmetatable({
+  local self = setmetatable({
     inventory = assert(opts.inventory, "observer needs an inventory"),
     emit_event = opts.emit_event or noop,
     modlog = opts.modlog,
   }, M)
+  self.inventory.set_on_spawn(function(record)
+    self.emit_event({ kind = EVENTS.actor_spawned, id = record.id, factory = record.factory })
+  end)
+  return self
 end
 
 -- Emit `mag.run_started`. The wiring/host calls this at the start of a run,
@@ -124,12 +136,14 @@ function M:observe(modification, pre, result)
 
   -- Spawns: a real spawn is never-existed → alive; anything else is a monotone
   -- no-op whose flavor mirrors the inventory's own log levels (docs/ir.md).
+  -- The per-actor mag.actor_spawned event already fired at registration (the
+  -- on_spawn seam, M.new); this diff only classifies for the applied/noop
+  -- summary and the modlog entry.
   for _, actor in ipairs(modification.actors or {}) do
     local id = actor.id
     if type(id) == "string" then
       if pre[id] == "never-existed" and self.inventory.state_of(id) == "alive" then
         spawned[#spawned + 1] = id
-        self.emit_event({ kind = EVENTS.actor_spawned, id = id, factory = actor.factory })
       else
         noops[#noops + 1] = {
           op = "spawn",

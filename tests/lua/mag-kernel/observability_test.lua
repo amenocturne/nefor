@@ -17,7 +17,6 @@ local Registry = require("registry")
 local routing = require("routing")
 local modlog = require("modlog")
 local observer = require("observer")
-local barrier = require("barrier")
 local sink = require("factories.sink")
 
 -- ------------------------------------------------------------------
@@ -180,7 +179,8 @@ do
     },
   })
 
-  -- The factory confirms A ready through its id-signed emitter (ready barrier).
+  -- The factory confirms A ready through its id-signed emitter (as it does
+  -- when lazy construction builds it at first activation).
   local emit_a = router:emitter("A")
   emit_a({ kind = "mag.ready", from = "A" })
 
@@ -266,29 +266,31 @@ do
 end
 
 -- ==================================================================
--- 4. the barrier's initial modification is recorded in the modlog
--- (barrier.start applies through the observer-wrapped apply — one composition
--- point, modification #0 is modlogged like every later one)
+-- 4. the initial modification is recorded in the modlog, and its seeds fire
+-- through lazy construction inside the same observer-wrapped apply — one
+-- composition point, modification #0 is modlogged like every later one
 -- ==================================================================
 
 do
   local inv = inventory.new({ log = silent_log() })
   local reg = Registry.new()
+  local delivered = {}
   reg:register({
     declaration = { name = "entry", params = {}, inputs = { input = "seed.In" }, outputs = {} },
     construct = function(id, params, emit)
       local i = { id = id }
-      i.deliver = function() return "ok" end
-      emit({ kind = "mag.ready", from = id }) -- synchronous ready → barrier releases
+      i.deliver = function(activation)
+        delivered[#delivered + 1] = activation.messages[1].message
+        return "ok"
+      end
+      emit({ kind = "mag.ready", from = id })
       return i
     end,
   })
   local router = routing.new({ inventory = inv, registry = reg, log = silent_log() })
   inv.set_on_kill(function(id) router:forget(id) end)
-  inv.set_construct(function(record)
-    local emit = router:emitter(record.id)
-    local i, e = reg:construct(record.factory, record.id, record.params, emit, {})
-    if i and not e then router:bind(record.id, i) end
+  router:set_construct(function(record)
+    return reg:construct(record.factory, record.id, record.params, router:emitter(record.id), {})
   end)
   inv.set_deliver(function(to, from, content)
     content = content or {}
@@ -302,14 +304,10 @@ do
     actors = { actor_spec("entry", "entry", {}, {}) },
     messages = { { to = "entry", content = { kind = "seed.In", payload = "go" } } },
   }
-  local handle = barrier.start({
-    inventory = inv,
-    router = router,
-    apply = function(m) return obs:apply(m) end, -- the single composition point
-    mod = mod,
-    now = function() return 0 end,
-  })
-  assert_true(handle.done and handle.ok, "the synchronous program starts and releases")
+  local res = obs:apply(mod)
+  assert_true(res.ok, "the initial modification applies")
+  assert_eq(#delivered, 1, "the seed constructed the entry actor and fired it")
+  assert_eq(delivered[1].payload, "go", "seed payload delivered intact")
 
   assert_eq(mlog:count(), 1, "the initial modification is recorded (modification #0)")
   local entry = mlog:all()[1]

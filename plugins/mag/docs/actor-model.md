@@ -36,6 +36,8 @@ ir.md). An actor receives messages and emits messages, nothing else.
 
 A factory is a Lua-defined constructor: given an actor id and setup params, it
 creates the actor and confirms creation with a ready message for that id.
+Construction is lazy — the kernel invokes the factory at the actor's first
+satisfied input contract, never at modification apply (see Lifecycle).
 Factories are the trait layer — abstract shapes that become concrete actors
 when MAG instantiates them.
 
@@ -84,28 +86,53 @@ The instance exposes `deliver(activation) -> completion`.
 
 Declared outputs flow through `emit` (routed by tag); the return value is only
 the completion status. Reserved emit kinds the kernel intercepts: `mag.ready`
-(the ready barrier), `capability.invoke` (a correlated request), and
-`mag.complete` / `mag.failed` (the async completion of a deferred activation).
-Kernel-synthesized status tags (`mag.Unit` on success, the failure tag) are
-emitted by the kernel, never returned by a factory and never declared as
-outputs — a factory does not know a dependency edge exists.
+(the readiness confirm — emitted inside `construct`, which lazy construction
+places at the first activation, so it coincides with beginning work),
+`capability.invoke` (a correlated request), and `mag.complete` / `mag.failed`
+(the async completion of a deferred activation). Kernel-synthesized status
+tags (`mag.Unit` on success, the failure tag) are emitted by the kernel, never
+returned by a factory and never declared as outputs — a factory does not know
+a dependency edge exists.
+
+**No construct-time emitters — a rule, not a flag.** The only thing a
+constructor emits is its `mag.ready` confirm. Actors are driven: every output
+is produced inside `deliver`, in response to an activation. Spontaneity lives
+in the modification's initial `messages`, never in a constructor — a factory
+that emitted data or started timers at construct time would make construction
+timing observable behavior, and lazy construction deliberately keeps it
+unobservable (a never-activated actor never constructs). All shipped
+factories conform; a new factory must too.
 
 ## Lifecycle
 
-Spawning is asynchronous: between spawn request and ready, the rest of the
-constellation may already be sending to the new id. The convention:
+Construction is lazy: spawn registers, first firing constructs. The
+convention:
 
-1. On spawn request the kernel registers the id in the inventory and opens a
-   pending mailbox for it.
-2. Messages routed to a registered-but-not-ready id queue in that mailbox —
-   discriminated by actor id, not replayed from the bus. Full-bus replay would
-   make every actor pay for history it doesn't need; the mailbox delivers
-   exactly the messages addressed to you, in arrival order.
-3. The factory creates the instance and emits ready; the kernel drains the
-   mailbox to it and routes live from then on.
+1. **On spawn request the kernel registers the spec** — id, factory, params,
+   routes — in the inventory. Routes and slot buffering exist from this
+   moment: senders resolve destinations, and messages to the id are accepted
+   whether or not an instance exists. The `mag.actor_spawned` lifecycle event
+   fires here, at registration.
+2. **Messages feed the id's firing machine immediately** (ir.md, Firing). A
+   single or union input contract is satisfied by the first arriving message;
+   a product input buffers components in its sender-bound slots until every
+   slot holds one. Partial inputs queue in the machine — discriminated by
+   actor id and edge, not replayed from the bus — so no separate pending
+   mailbox exists.
+3. **The factory constructs at the first satisfied input contract.** The
+   instance is built, emits its `mag.ready` confirm (surfaced as
+   `mag.actor_ready` — ready MEANS "began work"), and the first activation is
+   delivered immediately after. Later activations reuse the instance.
 
-The mailbox lives in the kernel because it is the flip side of kill —
-spawn = reserve id + queue, kill = unroute + drop — and factory-side buffering
+An actor whose input contract is never satisfied never constructs: no side
+effects, no timers, no provider handles — a routed-but-never-activated actor
+(an exhaust branch on a loop that finishes early) costs nothing and never
+readies. Externally the lifecycle is unchanged and monotone (never-existed →
+alive → dead): a registered-but-unconstructed actor counts as alive —
+duplicate spawns no-op, sends to it are accepted.
+
+The buffering lives in the kernel because it is the flip side of kill —
+spawn = register + buffer, kill = unroute + drop — and factory-side buffering
 would have every factory reimplement the same machinery.
 
 ## Signals
@@ -114,10 +141,10 @@ The conventions are Unix-shaped. You can write any actor you want and ignore
 all of it — but the system expects the shape, and non-conforming actors lose
 the graceful path, not the system its correctness.
 
-| Signal | Analog  | Semantics                                                                                                                                                                                                                                                                                                                                                                        |
-| ------ | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| kill   | SIGKILL | The kernel unilaterally deletes the id from the inventory and drops its pending mailbox — no further messages route to it, nothing waits for it, no handler can veto or delay the removal. The dying instance is then handed one final kill message: handling is optional, but an actor holding live external work (an open provider request) implements the handler to abort it |
-| drain  | SIGTERM | Finish or abort current work, flush outputs, then die. The handleable convention actors are expected to implement                                                                                                                                                                                                                                                                |
+| Signal | Analog  | Semantics                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ------ | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| kill   | SIGKILL | The kernel unilaterally deletes the id from the inventory and drops its buffered slot inputs — no further messages route to it, nothing waits for it, no handler can veto or delay the removal. A dying instance is then handed one final kill message: handling is optional, but an actor holding live external work (an open provider request) implements the handler to abort it. A kill before construction just drops the spec — no instance exists, so there is no courtesy delivery; `mag.actor_killed` still fires for observability |
+| drain  | SIGTERM | Finish or abort current work, flush outputs, then die. The handleable convention actors are expected to implement                                                                                                                                                                                                                                                                                                                                                                                                                            |
 
 The universal set stays aggressively small: each entry taxes every actor
 forever. The bar is "the system cannot work without it", not "handy".

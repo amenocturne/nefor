@@ -16,14 +16,15 @@
 //! The graph: TWO agents (`a1.*`, `a2.*`) composed in one modification, each a
 //! full provider loop (`llm → run-tool → tool-result → loop-counter → llm`),
 //! sharing one program `sink`. Each agent is seeded with a
-//! `generic-provider.ProviderOut`, so both fire their `llm` turn behind the
-//! ready barrier with no `adapter` factory needed (the shipped kernel registers
+//! `generic-provider.ProviderOut`, so both fire their `llm` turn straight off
+//! the initial messages with no `adapter` factory needed (the shipped kernel registers
 //! no `adapter`; the entry adapter of the design fixture is elided by seeding
 //! the `llm` input directly).
 //!
 //! The six acceptance steps, each asserted below (see `SIX STEPS` markers):
 //!   1. Two stdlib agents in one graph.
-//!   2. Load → initial modification → constellation spawns → ready barrier passes.
+//!   2. Load → initial modification → constellation registers, actors
+//!      construct + ready at their first firing.
 //!   3. Both agents run their provider loops against the deterministic
 //!      provider; every surviving-agent node output persists to its per-node
 //!      file, typed per the declared contracts.
@@ -133,7 +134,7 @@ fn body_kind(body: &Map<String, Value>) -> Option<&str> {
 /// Build the two-agent modification. Each agent `aN` is a full provider loop:
 /// `aN.llm → aN.run-tool → aN.tool-result → aN.loop-counter → aN.llm`, exiting
 /// to the shared `sink` on `generic-provider.FinalAnswer`. Both `llm`s are
-/// seeded with a `generic-provider.ProviderOut` so they fire behind the barrier.
+/// seeded with a `generic-provider.ProviderOut` so they fire off the initial messages.
 fn two_agent_modification() -> Value {
     fn agent(prefix: &str) -> Vec<Value> {
         vec![
@@ -264,9 +265,10 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
     )
     .await;
 
-    // Start the run. Both agents spawn behind the ready barrier; both `llm`s
-    // fire their first provider turn inside `start`, so two bridged provider
-    // conversations (one per agent) reach the wire before any reply.
+    // Start the run. Both agents register at apply; both `llm`s construct and
+    // fire their first provider turn inside `start` (lazy construction), so two
+    // bridged provider conversations (one per agent) reach the wire before any
+    // reply.
     let mut execute = Map::new();
     execute.insert("kind".into(), Value::String("mag.execute".into()));
     execute.insert("id".into(), Value::String("exec-accept".into()));
@@ -446,7 +448,7 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
         "both agents ran their loop and issued a provider request"
     );
 
-    // ── SIX STEPS #2: load/start lifecycle passed the ready barrier. ────────
+    // ── SIX STEPS #2: load/start lifecycle events reached the wire. ─────────
     for expected in [
         "mag.run_started",
         "mag.actor_ready",

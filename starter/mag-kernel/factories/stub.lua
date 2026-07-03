@@ -44,8 +44,9 @@ M.declaration = {
 --
 -- `emit` is the kernel's outbound sink (the actor's whole world). `deps` carries
 -- kernel-injected capabilities (unused by the stub — it holds no external
--- seam). The instance signs every message with `id` and, per the ready barrier,
--- confirms creation immediately with a ready message for that id.
+-- seam). The instance signs every message with `id` and confirms creation with
+-- a ready message for that id — construction happens at the first activation,
+-- so the confirm coincides with beginning work (actor-model.md, Lifecycle).
 function M.construct(id, params, emit, deps)
   params = params or {}
 
@@ -82,8 +83,8 @@ function M.construct(id, params, emit, deps)
     emit(sign({ kind = kinds.complete }))
   end
 
-  -- Confirm ready for this id (Lifecycle: factory creates instance, emits
-  -- ready; the kernel then drains the pending mailbox to it).
+  -- Readiness confirmation (actor-model.md, Lifecycle): construction happens at
+  -- the first activation, so this emit coincides with beginning work.
   emit(sign({ kind = kinds.ready }))
 
   return instance

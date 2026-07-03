@@ -1,11 +1,11 @@
 -- starter/mag-kernel/routing.lua — everything between an actor's output and
--- its destination (task: routing, correlation, pending mailboxes).
+-- its destination (task: routing, correlation, lazy construction).
 --
 -- Actors are bus-unaware (actor-model.md): the kernel is their entire world.
 -- This module is that world's delivery layer. It composes three primitives —
--- the inventory (lifecycle + routes + mailbox), the firing machine
--- (firing.lua, input contracts), and correlation (correlation.lua, capability
--- request/response) — into the id-signed message flow:
+-- the inventory (lifecycle + routes), the firing machine (firing.lua, input
+-- contracts), and correlation (correlation.lua, capability request/response)
+-- — into the id-signed message flow:
 --
 --   * Id-signed delivery. Every outbound message an instance emits carries its
 --     actor id; the kernel routes it by looking up the *sender's*
@@ -13,8 +13,16 @@
 --     edges dissolve into per-actor routes; fanout is a multi-element array).
 --   * Firing by input contract. A delivered message feeds the destination's
 --     firing machine; single fires per message, union on any, product on a
---     complete sender-bound set (per-slot FIFO). One assembled activation per
---     complete set reaches the instance.
+--     complete sender-bound set (per-slot FIFO). Partial product inputs buffer
+--     in the machine's slots — a registered spec accepts messages whether or
+--     not its instance exists yet. One assembled activation per complete set
+--     reaches the instance.
+--   * Lazy construction. The instance is built at the actor's FIRST assembled
+--     activation (actor-model.md, Lifecycle): activate calls the injected
+--     construct hook, the factory confirms with its `mag.ready` emit (surfaced
+--     as `mag.actor_ready` — "began work"), and the activation is delivered
+--     immediately after. An actor whose contract is never satisfied never
+--     constructs.
 --   * Kernel-emitted status types. On an activation's successful completion the
 --     kernel emits `mag.Unit` along that actor's `mag.Unit` routes; on a
 --     suffered failure, the failure-typed output. A factory never returns
@@ -22,9 +30,9 @@
 --   * Capability correlation. A `capability.invoke` emit goes out on the
 --     injected bus with a kernel-minted request id; the matching `tool.result`
 --     routes back to the requesting actor as a reply activation.
---   * Pending mailboxes. A delivery to a registered-but-not-ready id queues in
---     its inventory mailbox and drains through firing, in arrival order, on
---     ready. Kill drops the mailbox, the firing slots, and any correlations.
+--   * Kill drops the instance, the firing slots, and any correlations. A kill
+--     before construction just drops the spec — no instance exists, so no
+--     final kill message is delivered.
 --
 -- ── the kernel ⇄ factory-instance contract (flagged; primitive tasks build on
 --    this) ──────────────────────────────────────────────────────────────────
@@ -44,7 +52,7 @@
 -- Actor → kernel: the instance emits id-signed messages through the emitter
 --   this module hands the factory (M:emitter). Reserved kinds are intercepted;
 --   everything else is a declared output routed by type:
---     { kind = "mag.ready", from }                          — ready barrier
+--     { kind = "mag.ready", from }                          — readiness confirm
 --     { kind = "capability.invoke", from, capability, request, ref } — request
 --     { kind = "mag.complete", from }                       — async success
 --     { kind = "mag.failed", from, failure, value }         — async failure
@@ -108,20 +116,29 @@ function M.new(opts)
       error = (log.error) or noop,
     },
     correlation = correlation.new(opts.gen_id),
+    -- Lazy-construction hook: fn(record) -> instance | nil, err. init.lua
+    -- wires registry:construct with the kernel-injected deps; activate calls
+    -- it at an actor's first assembled activation (set_construct).
+    construct = opts.construct,
     instances = {}, -- id -> instance handle (with :deliver)
     machines = {}, -- id -> { port -> firing machine }
     ready = {}, -- id -> true once the factory confirmed ready
-    held = nil, -- set of held ids while a program-start barrier is active
     signaling = {}, -- id -> true while a signal handler (kill/drain) is running
   }, M)
   return self
 end
 
--- Register the constructed instance for an id. The factory-construction layer
--- (a sibling task) calls this after registry:construct(name, id, params,
--- router:emitter(id)); tests bind stub instances directly.
+-- Register the constructed instance for an id. activate binds through here
+-- after the construct hook returns; tests bind stub instances directly.
 function M:bind(id, instance)
   self.instances[id] = instance
+end
+
+-- Register (or replace) the lazy-construction hook after wiring, breaking the
+-- construction-order cycle (the hook needs the router's emitter; the router
+-- needs the hook).
+function M:set_construct(fn)
+  self.construct = fn
 end
 
 -- The outbound sink for one actor id — its entire world for emitting
@@ -198,16 +215,13 @@ end
 
 -- Deliver one typed message to a destination id. Dead target → dropped as a
 -- logged no-op (docs/ir.md: the sender computed the send while the target
--- lived). Not-yet-ready target → queued in its pending mailbox
--- (actor-model.md, Lifecycle). Ready target → fed to the firing machine.
+-- lived). Live target → fed to the firing machine, constructed or not: the
+-- machine buffers partial product inputs, and an assembled activation
+-- constructs the instance on demand (activate).
 function M:deliver(dest_id, from, tag, message)
   local dest = self.inventory.get(dest_id)
   if not dest or dest.state == "dead" then
     self.log.info(string.format("send dropped: target '%s' is dead", tostring(dest_id)))
-    return
-  end
-  if not self.ready[dest_id] then
-    self.inventory.enqueue(dest_id, { __routed = true, from = from, kind = tag, message = message })
     return
   end
   self:fire(dest_id, from, tag, message)
@@ -292,18 +306,46 @@ function M:derive_slots(dest_id, product_shape)
   return edges
 end
 
--- Hand one assembled activation to the instance and apply its completion. The
+-- Hand one assembled activation to the instance — constructing it first when
+-- this is the actor's first activation — and apply its completion. The
 -- instance emits its declared outputs synchronously through its emitter (so
 -- they are already routed by the time deliver returns); the kernel then emits
 -- the reserved status type for the completion (docs/ir.md, Firing).
 function M:activate(id, activation)
-  local instance = self.instances[id]
+  local instance = self.instances[id] or self:construct_instance(id)
   if not instance or type(instance.deliver) ~= "function" then
     self.log.warn(string.format("actor '%s' has no deliver entry point", tostring(id)))
     return
   end
   local completion = instance.deliver(activation)
   self:apply_completion(id, completion)
+end
+
+-- Construct the instance for a registered spec via the injected hook — the
+-- lazy-construction point, reached exactly at the actor's first satisfied
+-- input contract. The factory confirms with its `mag.ready` emit DURING the
+-- hook (on_emit → on_ready → the `mag.actor_ready` event), so ready precedes
+-- the first delivery. A construct failure must not strand the run — with no
+-- readiness deadline, nothing else would ever surface it — so it escalates to
+-- the control plane as `mag.run_failed` and the host fails the run.
+function M:construct_instance(id)
+  if not self.construct then
+    return nil
+  end
+  local record = self.inventory.get(id)
+  if not record or record.state ~= "alive" then
+    return nil
+  end
+  local instance, err = self.construct(record)
+  if err or not instance then
+    local detail = string.format("construct failed for '%s' (factory '%s'): %s",
+      tostring(id), tostring(record.factory), tostring(err))
+    self.log.error(detail)
+    self.events({ kind = EVT_RUN_FAILED, from = id, failure = "construct", error = detail })
+    return nil
+  end
+  self:bind(id, instance)
+  return instance
 end
 
 -- Emit the kernel-synthesized status type for a completion. Successful
@@ -391,72 +433,30 @@ function M:bus_response(response)
   self:apply_completion(entry.requester, completion)
 end
 
--- The factory confirmed the id is ready (actor-model.md, Lifecycle). Mark it
--- routable, then drain its pending mailbox — unless a program-start barrier is
--- holding, in which case draining is deferred until the barrier releases (so
--- initial messages are delivered strictly after every actor has readied;
--- docs/ir.md, Running a program — the two-step handshake).
+-- The factory confirmed the id is ready (actor-model.md, Lifecycle). With
+-- lazy construction this fires inside construct_instance, at the actor's
+-- first activation — ready now MEANS "began work". Surface it as a lifecycle
+-- event ahead of the first delivery.
 function M:on_ready(id)
   if self.ready[id] then
     return
   end
   self.ready[id] = true
-  -- Lifecycle: the factory confirmed this id ready (actor-model.md). Surface it
-  -- as a lifecycle event before any draining, so observers see the actor become
-  -- routable ahead of the deliveries that drain into it (even when a barrier
-  -- defers the drain itself).
   self.events({ kind = EVT_ACTOR_READY, id = id })
-  if self.held then
-    self.held[id] = true
-    return
-  end
-  self:drain_pending(id)
 end
 
--- Drain an id's pending mailbox through firing, in arrival order. Both mailbox
--- shapes are handled: routed entries ({ __routed, from, kind, message }) and
--- MAG-seed content stored bare (a content table carrying its own .kind).
-function M:drain_pending(id)
-  local queued = self.inventory.take_mailbox(id)
-  for _, m in ipairs(queued or {}) do
-    if m.__routed then
-      self:fire(id, m.from, m.kind, m.message)
-    else
-      self:fire(id, m.from, m.kind, m)
-    end
-  end
-end
-
--- Read-only readiness probe — the barrier consults this to decide when the
--- whole constellation has confirmed (barrier.lua). Readiness is owned here in
--- the delivery layer: on_ready is its sole writer and deliver its sole reader,
--- so there is one fire-vs-queue decision point (the fold delegates its live
--- sends here rather than judging readiness itself; see inventory do_send).
+-- Read-only readiness probe: has this id constructed and confirmed? True only
+-- for actors that began work (fired at least once).
 function M:is_ready(id)
   return self.ready[id] == true
 end
 
--- Program-start barrier hooks. begin_barrier makes on_ready defer draining;
--- release_barrier drains every held id's mailbox, delivering all initial
--- messages at once, after the barrier has confirmed the constellation ready.
-function M:begin_barrier()
-  self.held = self.held or {}
-end
-
-function M:release_barrier()
-  local held = self.held
-  self.held = nil
-  if held then
-    for id in pairs(held) do
-      self:drain_pending(id)
-    end
-  end
-end
-
 -- Hand a dying instance its one final kill message (actor-model.md, Signals:
 -- kill). Removal is unconditional; the handler is a courtesy so an actor holding
--- live external work (an open provider request) can abort it. Runs the handler
--- with `signaling[id]` set, so any non-reserved envelope it emits takes the
+-- live external work (an open provider request) can abort it. A kill before
+-- construction finds no instance and returns false — the spec just drops, no
+-- courtesy delivery (nothing exists to receive it). Runs the handler with
+-- `signaling[id]` set, so any non-reserved envelope it emits takes the
 -- raw-emit path to the bus (on_emit) instead of route_output — which would drop
 -- it, the id being already unrouted. Called from the inventory's on_kill seam
 -- BEFORE forget (init.lua), so the abort envelope reaches bus_emit while the
@@ -489,10 +489,10 @@ function M:drain(id)
   return true
 end
 
--- Drop all routing state for a killed id (kill drops the mailbox — inventory's
--- do_kill already clears it — plus the firing slots and outstanding capability
--- correlations; actor-model.md, Signals: kill). Wired from the inventory's
--- on_kill seam in init.lua, strictly after dispatch_kill.
+-- Drop all routing state for a killed id — the instance, the firing slots
+-- (buffered partial inputs included), and outstanding capability correlations
+-- (actor-model.md, Signals: kill). Wired from the inventory's on_kill seam in
+-- init.lua, strictly after dispatch_kill.
 function M:forget(id)
   self.machines[id] = nil
   self.ready[id] = nil

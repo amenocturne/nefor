@@ -16,7 +16,6 @@
 local inventory = require("inventory")
 local Registry = require("registry")
 local routing = require("routing")
-local barrier = require("barrier")
 local modlog = require("modlog")
 local observer = require("observer")
 local stub = require("factories.stub")
@@ -188,51 +187,35 @@ local router = routing.new({
   events = emit_event,
   persist_output = persist_output,
 })
--- Break the construction-order cycle (both hooks need the router, which needs
+-- Break the construction-order cycle (the hooks need the router, which needs
 -- the inventory): the kill hook first hands the dying instance its final kill
 -- message (dispatch_kill runs handle_kill; its abort envelopes take the raw-emit
 -- path to the bus) and THEN drops the router's firing slots + correlations
 -- (forget). The order is load-bearing — emit-before-forget — so a dying actor's
--- provider-cancel/ApprovalCancel reaches the bus while it is still bound. The
--- construct hook builds each freshly-spawned instance via the registry and binds
--- it into the router; the deliver hook routes live-target sends through routing's
--- single fire-vs-queue decision.
+-- provider-cancel/ApprovalCancel reaches the bus while it is still bound. A
+-- kill before construction finds no instance: the spec drops, no courtesy
+-- delivery. The deliver hook routes live-target sends into routing's firing
+-- machines.
 inv.set_on_kill(function(id)
   router:dispatch_kill(id)
   router:forget(id)
 end)
 
-local construct_log = make_logger()
-inv.set_construct(function(record)
-  -- `deps` carries kernel-injected capabilities (actor-model.md): the per-node
-  -- persistence writer (deps.writer), consumed by the sink and available to
-  -- any factory that declares a use for it.
+-- Lazy-construction hook (routing.lua construct_instance): builds the
+-- instance via the registry at the actor's FIRST satisfied input contract —
+-- never at apply. `deps` carries kernel-injected capabilities
+-- (actor-model.md): the per-node persistence writer (deps.writer), consumed
+-- by the sink and available to any factory that declares a use for it. A
+-- failure return escalates inside routing (mag.run_failed).
+router:set_construct(function(record)
   local emit = router:emitter(record.id)
   local deps = { writer = writer_for(record.id) }
-  local instance, err = registry:construct(record.factory, record.id, record.params, emit, deps)
-  if err or not instance then
-    -- Construction failed: the instance is not bound and never readies, so the
-    -- program-start barrier will name this id as a straggler.
-    construct_log.error(string.format("construct failed for '%s' (factory '%s'): %s",
-      tostring(record.id), tostring(record.factory), tostring(err)))
-    return
-  end
-  router:bind(record.id, instance)
+  return registry:construct(record.factory, record.id, record.params, emit, deps)
 end)
 inv.set_deliver(function(to, from, content)
   content = content or {}
   router:deliver(to, from, content.kind, content)
 end)
-
--- Injected clock: the host provides a millisecond clock (nefor.now_ms); we fall
--- back to os.time at second granularity only if it is somehow absent. Time stays
--- injected, never read inside the pure modules (barrier.lua takes `now`).
-local function now_ms()
-  if type(nefor.now_ms) == "function" then
-    return nefor.now_ms()
-  end
-  return os.time() * 1000
-end
 
 -- Observability: the observer wraps apply, deriving lifecycle events and one
 -- ordered modification-log entry from the fold boundary (observer.lua). The
@@ -253,15 +236,15 @@ return {
     return obs:apply(mod)
   end,
 
-  -- Start a program: apply its initial modification behind the ready barrier
-  -- (spawn all → await readies → deliver initial messages; docs/ir.md). Returns
-  -- a barrier handle; if `handle.done` is false the host polls it as late
-  -- readies arrive. `o.deadline_ms` overrides the per-program default. The
-  -- barrier applies the initial modification through the observer-wrapped apply
-  -- (the same path as `apply` below), so modification #0 is recorded in the
-  -- modlog and its lifecycle events fire — one composition point, no bypass.
-  start = function(mod, o)
-    o = o or {}
+  -- Start a program: apply its initial modification through the fold. Spawns
+  -- register specs, initial messages deliver immediately (registration already
+  -- put every route and input contract in place), and each actor constructs
+  -- lazily at its first satisfied input contract (docs/ir.md, Running a
+  -- program). Applied through the observer-wrapped apply (the same path as
+  -- `apply` below), so modification #0 is recorded in the modlog and its
+  -- lifecycle events fire — one composition point, no bypass. Returns the
+  -- fold's verbatim { ok = true } | { ok = false, error = "..." }.
+  start = function(mod)
     -- A program start owns the whole constellation: reset the previous run's
     -- actors before applying the new program. Kill every live id through the
     -- fold (kill handlers run — a mid-flight llm's provider-cancel envelope
@@ -282,21 +265,7 @@ return {
       obs:apply({ kills = leftovers })
     end
     inv.clear()
-    return barrier.start({
-      inventory = inv,
-      router = router,
-      apply = function(m)
-        return obs:apply(m)
-      end,
-      mod = mod,
-      now = o.now or now_ms,
-      deadline_ms = o.deadline_ms,
-    })
-  end,
-
-  -- Advance a pending barrier handle against the host clock (ms).
-  poll = function(handle, t)
-    return barrier.poll(handle, t or now_ms())
+    return obs:apply(mod)
   end,
 
   -- Drain one actor gracefully (actor-model.md, Signals: drain / SIGTERM):

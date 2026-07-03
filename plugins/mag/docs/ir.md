@@ -55,38 +55,29 @@ along the compiled wiring, and if a rule is bound to the node, the rule's
 function computes the next modification. The runtime operates over nothing
 but modifications — running a workflow *is* this fold.
 
-## Running a program — the two-step handshake
+## Running a program — registration, then lazy firing
 
-Program start is not fire-and-forget. Applying a program's *initial*
-modification is a two-step handshake:
+Program start is one fold application, no barrier. Applying a program's
+_initial_ modification:
 
-1. **Spawn** every actor in the initial constellation — register the id, open
-   its pending mailbox, and construct the instance via its factory. The
-   initial messages queue in those pending mailboxes.
-2. **Await** each actor's ready confirmation (the factory's `mag.ready` emit),
-   then **deliver** the queued initial messages — strictly after the whole
-   constellation is ready. A synchronous factory (the shipped ones) confirms
-   in its constructor, so a well-formed static program passes the barrier the
-   moment it is applied.
+1. **Register** every actor in the initial constellation — id, factory,
+   params, routes. Registration puts every route and input contract in place
+   before any message moves, so senders resolve destinations and partial
+   inputs buffer (per-slot, in the firing machine). `mag.actor_spawned` fires
+   per actor, here.
+2. **Deliver** the initial messages. Each delivery feeds the target's firing
+   machine; an actor **constructs at its first satisfied input contract**
+   (actor-model.md, Lifecycle) — the factory builds the instance, `mag.ready`
+   / `mag.actor_ready` confirm ("began work"), and the activation is
+   delivered. The cascade runs synchronously through the constellation in
+   data-flow order; a fully synchronous program completes inside the apply.
 
-The barrier covers the initial constellation only; actors spawned later by
-rules rely on the pending mailbox alone (spawn reserves + queues, ready
-drains), with no barrier.
-
-**Deadline — per-program (decided).** The barrier carries one deadline for the
-whole constellation, measured from program start, not one per actor. The
-initial modification spawns every actor atomically, so their clocks start
-together; a single shared budget is the natural unit and names the whole
-straggler set at once. An actor that fails to confirm before the deadline
-**fails the run** with an error naming exactly the stragglers, and no initial
-message is delivered. Default budget: 5000 ms, overridable per start. (This
-resolves the "ready-barrier deadline: per-actor or per-program, and value"
-open item.)
-
-**Time is injected.** The kernel Lua has no event loop, so the barrier never
-blocks: the host supplies a `now()` clock and polls the barrier as late
-confirmations arrive or on a timer tick. No wall-clock is read inside the fold
-or the barrier.
+There is no ready barrier and no readiness deadline: nothing waits on
+construction, because nothing constructs until it has work. Actors spawned
+later by rules or control-plane applies follow the identical convention —
+register, buffer, construct on first firing. A factory that rejects at
+construct time (invalid params) surfaces at its first firing as a
+`mag.run_failed` escalation, and the host fails the run.
 
 ## Firing — when an actor activates
 
@@ -117,9 +108,10 @@ is to encode the ordering. No second vocabulary exists.
   directional, so the binding is known statically). This is what makes
   `(Unit + Unit)` from two different upstreams — or `(Findings + Findings)`
   from two explorers — unambiguous: two completions of the same sender fill
-  one slot twice, never two slots. One activation per complete set; the same
-  hold-until machinery as the pending mailbox, with "until ready" extended
-  to "until complete".
+  one slot twice, never two slots. One activation per complete set. The slot
+  queues are also the only buffering the lifecycle needs: they accept
+  components from the moment the spec registers, and the assembled first set
+  is what triggers lazy construction (actor-model.md, Lifecycle).
 - **Reserved status types are kernel-emitted.** Route keys matching the
   factory's declared output types dispatch from the returned value;
   `mag.Unit` (successful completion) and the failure types are emitted by
@@ -144,10 +136,14 @@ is to encode the ordering. No second vocabulary exists.
   applying has its output voided — no window for a dead agent's
   modification to sneak in.
 - **Monotone lifecycles.** Every id moves never-existed → alive → dead,
-  each transition at most once. Spawn on a live id: no-op. Kill on a dead
-  id: no-op. No-ops are logged — an identical-spec duplicate is a race
-  artifact (info), same id with a different spec is likely an authoring bug
-  (warning) — but semantics stay uniform: ignored.
+  each transition at most once. Alive means _registered_ — construction is
+  lazy and invisible to the lifecycle: a registered-but-unconstructed actor
+  counts as alive (duplicate spawns still no-op, sends to it still accepted),
+  and killing it just drops the spec (`mag.actor_killed` still fires; no
+  final kill message, no instance to receive one). Spawn on a live id:
+  no-op. Kill on a dead id: no-op. No-ops are logged — an identical-spec
+  duplicate is a race artifact (info), same id with a different spec is
+  likely an authoring bug (warning) — but semantics stay uniform: ignored.
 - **Every modification is validated before applying**, with the same
   validator that checked the program at load: contract compatibility, id
   uniqueness *within* the modification (the same id spawned twice in one
@@ -193,20 +189,20 @@ Three operations, all environment-side. Modifications reach them through
 Actors reach none of them — an actor receives messages and emits messages,
 nothing else.
 
-| Op | Meaning |
-|---|---|
-| `spawn(id, factory, params)` | Instantiate via the named factory; the instance signs all output with `id` and confirms ready |
-| `kill(id)` | Unilateral removal: unroute, drop the pending mailbox, hand the instance one final kill message. See actor-model.md |
-| `send(id, message)` | Deliver one message to one instance |
+| Op                           | Meaning                                                                                                                                                                    |
+| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `spawn(id, factory, params)` | Register the spec; the named factory constructs the instance at the actor's first satisfied input contract, and the instance signs all output with `id` and confirms ready |
+| `kill(id)`                   | Unilateral removal: unroute, drop the buffered slot inputs, hand the instance (when one was constructed) one final kill message. See actor-model.md                        |
+| `send(id, message)`          | Deliver one message to one instance                                                                                                                                        |
 
 Signals are not a fourth operation — a signal is a `send` with a reserved
 kind.
 
 ## Division of responsibility
 
-| Concern | Owner |
-|---|---|
-| Parsing, load-time evaluation, validation, rule-function evaluation, id namespacing | MAG evaluator (`crates/nefor-mag`, resident in this plugin) |
-| The fold: applying modifications, ready barrier, pending mailboxes, routing, correlation, no-op/lifecycle logging, output persistence | Kernel (this plugin's Lua) |
-| What an actor actually does with a message | The factory, entirely |
-| Capability quirks (provider protocols, aborts) | The capability plugin's own API |
+| Concern                                                                                                                                | Owner                                                       |
+| -------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| Parsing, load-time evaluation, validation, rule-function evaluation, id namespacing                                                    | MAG evaluator (`crates/nefor-mag`, resident in this plugin) |
+| The fold: applying modifications, lazy construction, slot buffering, routing, correlation, no-op/lifecycle logging, output persistence | Kernel (this plugin's Lua)                                  |
+| What an actor actually does with a message                                                                                             | The factory, entirely                                       |
+| Capability quirks (provider protocols, aborts)                                                                                         | The capability plugin's own API                             |

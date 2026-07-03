@@ -18,8 +18,8 @@
 //!   - the first agent's `FinalAnswer` routes into `code-writer.entry`
 //!     (adapter), which lifts it into `code-writer.llm`'s turn (agent hand-off
 //!     direction);
-//!   - both entry adapters construct and ready behind the barrier, and the
-//!     pipeline runs to the shared sink and completes.
+//!   - both entry adapters construct and ready at their first firing (lazy
+//!     construction), and the pipeline runs to the shared sink and completes.
 //!
 //! PROVIDER NAME (flagged). The fixture's `llm` actors target the capability
 //! `chatgpt-provider` (two-agents.modification.json). Rather than add a
@@ -282,7 +282,7 @@ async fn compiled_two_agents_program_runs_through_the_entry_adapters_to_the_sink
         }
     }
 
-    // Both entry adapters constructed and readied behind the barrier.
+    // Both entry adapters constructed and readied at their first firing.
     for entry in ["docs-explorer.entry", "code-writer.entry"] {
         assert!(
             ready_ids.iter().any(|id| id == entry),
@@ -298,7 +298,7 @@ async fn compiled_two_agents_program_runs_through_the_entry_adapters_to_the_sink
         "both agents fired their provider turn through their entry adapter"
     );
 
-    // Lifecycle: the ready barrier passed and the initial modification applied.
+    // Lifecycle: the run started and the initial modification applied.
     for expected in [
         "mag.run_started",
         "mag.actor_ready",

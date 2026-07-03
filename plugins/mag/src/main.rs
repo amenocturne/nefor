@@ -5,8 +5,9 @@
 //! (liveness), `mag.load` (evaluate a program, cache it, reply with the initial
 //! modification + the registry's factory names), `mag.eval` (apply a rule fn),
 //! and `mag.execute` (run the resident/inline program through the kernel —
-//! spawn the constellation behind the ready barrier, stream lifecycle events,
-//! and reply `mag.run_result` with the sink's final result + output path).
+//! register the constellation, deliver its initial messages (actors construct
+//! lazily at first firing), stream lifecycle events, and reply
+//! `mag.run_result` with the sink's final result + output path).
 //!
 //! Layering mirrors the sibling plugins (`reasoner-graph`, `tool-gate`):
 //! - `main.rs` — entry, handshake, dispatch loop, execute drive, bus encoding.
@@ -30,10 +31,10 @@ use crate::error::MagError;
 use crate::kernel::{LuaHost, RunCompletion};
 
 /// A run driven asynchronously to completion: the execute reply is deferred
-/// until the resident program signals `mag.run_complete` (via inbound
-/// capability responses that unblock deferred activations) or the barrier
-/// deadline elapses. Synchronous programs (the shipped factories) finish inside
-/// the `mag.execute` call and never register one.
+/// until the resident program signals `mag.run_complete` or `mag.run_failed`
+/// (via inbound capability responses that unblock deferred activations).
+/// Synchronous programs (the shipped factories) finish inside the
+/// `mag.execute` call and never register one.
 struct ActiveExecute {
     /// The `mag.execute` request id to correlate the terminal reply to.
     in_reply_to: Option<String>,
@@ -73,8 +74,9 @@ const MODIFICATION_KIND: &str = "mag.modification";
 const ERROR_KIND: &str = "mag.error";
 
 /// Run the resident (or an inline) program's initial modification through the
-/// kernel: spawn the constellation behind the ready barrier, deliver its initial
-/// messages, stream lifecycle events, and reply with the run's terminal status.
+/// kernel: register the constellation, deliver its initial messages (actors
+/// construct lazily at first firing), stream lifecycle events, and reply with
+/// the run's terminal status.
 const EXECUTE_KIND: &str = "mag.execute";
 
 /// Terminal reply for a run: status, the sink's final result INLINE, and the
@@ -84,8 +86,8 @@ const EXECUTE_KIND: &str = "mag.execute";
 /// carries the sink's result rather than forcing a read-back through the path.
 const RUN_RESULT_KIND: &str = "mag.run_result";
 
-/// Apply one graph modification directly to the resident kernel, no ready
-/// barrier — the control plane's direct kernel op (docs/ir.md, "Kernel
+/// Apply one graph modification directly to the resident kernel — the
+/// control plane's direct kernel op (docs/ir.md, "Kernel
 /// operations": the control plane reaches `actors`/`kills`/`messages`
 /// directly). This is the mid-run control-plane surface the actor-kernel
 /// cutover needs: a `{ kills = [...] }` modification is how the plane kills an
@@ -229,9 +231,6 @@ async fn run_dispatch_loop(
     // by chat_id) and rewrites each tool-class `tool.invoke` onto the
     // composition-named gate's `<gate>.tool.invoke` contract (bridge.rs).
     let mut bridge = CapabilityBridge::new(resolve_gate_target());
-    // Barrier / deadline tick while a run is in flight (docs/ir.md: the host
-    // polls the barrier on a timer; synchronous programs settle before it fires).
-    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
     loop {
         tokio::select! {
             maybe = in_rx.recv() => {
@@ -258,11 +257,6 @@ async fn run_dispatch_loop(
                     }
                 }
             }
-            _ = ticker.tick() => {
-                if active.is_some() {
-                    poll_active(out_tx, host, &mut active, &mut bridge).await?;
-                }
-            }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("ctrl-c; exiting");
                 return Ok(());
@@ -286,33 +280,6 @@ async fn flush_emits(
         for envelope in bridge.translate_emit(body) {
             send_event(out_tx, envelope).await?;
         }
-    }
-    Ok(())
-}
-
-/// Advance the in-flight run's barrier and settle it if the deadline elapsed.
-/// Run *completion* (the sink's `mag.run_complete`) is settled in
-/// [`settle_if_complete`] off the capability-response path; this only fails a
-/// run whose constellation never confirmed ready.
-async fn poll_active(
-    out_tx: &mpsc::Sender<PluginOutgoing>,
-    host: &LuaHost,
-    active: &mut Option<ActiveExecute>,
-    bridge: &mut CapabilityBridge,
-) -> Result<(), MagError> {
-    let state = host.poll()?;
-    flush_emits(out_tx, host, bridge).await?;
-    if state.done && !state.ok {
-        if let Some(a) = active.take() {
-            let msg = state.error.unwrap_or_else(|| "ready barrier failed".into());
-            send_event(
-                out_tx,
-                run_result_failed(a.in_reply_to.as_deref(), &a.run_id, &msg),
-            )
-            .await?;
-        }
-    } else {
-        settle_if_complete(out_tx, host, active).await?;
     }
     Ok(())
 }
@@ -437,9 +404,10 @@ async fn handle_load(
 /// Run a program through the kernel. The modification is taken inline from the
 /// request (`modification` — the control plane reaches kernel ops directly,
 /// ir.md) or, absent that, from the session's resident program (`mag.load`).
-/// Spawns the constellation behind the ready barrier, streams lifecycle events,
-/// and — for a synchronous program — replies `mag.run_result` with the sink's
-/// final result + output path in the same turn. An async program (a provider
+/// Registers the constellation, delivers the initial messages (each actor
+/// constructs lazily at its first firing), streams lifecycle events, and — for
+/// a synchronous program — replies `mag.run_result` with the sink's final
+/// result + output path in the same turn. An async program (a provider
 /// round-trip pending) defers the reply until `mag.run_complete`.
 async fn handle_execute(
     out_tx: &mpsc::Sender<PluginOutgoing>,
@@ -506,15 +474,14 @@ async fn handle_execute(
         .and_then(Value::as_str)
         .unwrap_or(&run_id);
     let session_id = body.get("session_id").and_then(Value::as_str);
-    let deadline_ms = body.get("deadline_ms").and_then(Value::as_u64);
 
     host.begin_run(&run_id, run_name, session_id)?;
-    let state = host.start(&modification, deadline_ms)?;
+    let outcome = host.start(&modification)?;
     flush_emits(out_tx, host, bridge).await?;
 
     // A failed apply / rejected initial modification: nothing spawned.
-    if state.done && !state.ok {
-        let msg = state.error.unwrap_or_else(|| "start failed".into());
+    if !outcome.ok {
+        let msg = outcome.error.unwrap_or_else(|| "start failed".into());
         return send_event(out_tx, run_result_failed(in_reply_to, &run_id, &msg)).await;
     }
 
@@ -522,13 +489,14 @@ async fn handle_execute(
     if let Some(rc) = host.take_run_complete()? {
         return send_event(out_tx, run_result_ok(in_reply_to, &run_id, &rc)).await;
     }
-    // Synchronous failure: an actor failed with no failure route inside `start`.
+    // Synchronous failure inside `start`: an actor failed with no failure
+    // route, or a factory's construct rejected at first firing.
     if let Some(error) = host.take_run_failed()? {
         return send_event(out_tx, run_result_failed(in_reply_to, &run_id, &error)).await;
     }
 
-    // Async program: defer the terminal reply until `mag.run_complete` arrives
-    // via capability responses (or the barrier deadline fails it).
+    // Async program: defer the terminal reply until `mag.run_complete` (or
+    // `mag.run_failed`) arrives via capability responses.
     *active = Some(ActiveExecute {
         in_reply_to: in_reply_to.map(str::to_owned),
         run_id,
@@ -583,11 +551,11 @@ const APPLY_NO_LIVE_RUN: &str =
 
 /// Apply one graph modification directly to the resident kernel — the control
 /// plane's mid-run kernel op (docs/ir.md, "Kernel operations"). The initial
-/// modification runs behind the ready barrier via `mag.execute`; this is the
-/// *later* path, with no barrier: a `{ kills = [...] }` modification kills an
-/// in-flight actor (the factory's abort envelope reaches the bus, correlations
-/// drop, the late reply voids), a `{ messages = [...] }` delivers a signal, a
-/// `{ actors = [...] }` spawns into the live constellation.
+/// modification runs via `mag.execute`; this is the *later* path: a
+/// `{ kills = [...] }` modification kills an in-flight actor (the factory's
+/// abort envelope reaches the bus, correlations drop, the late reply voids), a
+/// `{ messages = [...] }` delivers a signal, a `{ actors = [...] }` registers
+/// into the live constellation (constructing at first firing).
 ///
 /// Guard policy: an apply is accepted only while a run is live (`active`), and
 /// every accepted apply is logged with its `source`. Outside a live run the
@@ -835,7 +803,7 @@ fn run_result_ok(
 }
 
 /// Terminal run reply on failure: status + the error naming what went wrong
-/// (rejected modification, straggler barrier).
+/// (rejected modification, unhandled actor failure).
 fn run_result_failed(in_reply_to: Option<&str>, run_id: &str, error: &str) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("kind".into(), Value::String(RUN_RESULT_KIND.into()));

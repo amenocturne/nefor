@@ -42,7 +42,7 @@ local function find_kind(msgs, kind)
   return nil
 end
 
--- Construct an llm instance with a fresh capture. Consumes the ready barrier.
+-- Construct an llm instance with a fresh capture. Consumes the ready confirm.
 local function make(id, params)
   local msgs, emit = capture()
   local instance = llm.construct(id, params or {}, emit)
@@ -93,7 +93,7 @@ do
 
   local ready = find_kind(msgs, "mag.ready")
   assert_true(ready ~= nil and ready.from == "docs-explorer.llm",
-    "construction emits an id-signed ready barrier")
+    "construction emits an id-signed ready confirm")
 
   local completion = instance.deliver(turn({ messages = { "prior turn" } }))
   assert_eq(completion.status, "pending", "a provider turn defers completion")

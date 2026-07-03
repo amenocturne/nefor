@@ -31,7 +31,7 @@ local M = {
   Failed = "mag.Failed", -- a suffered failure the kernel synthesizes
 
   -- Reserved emit acks an actor sends through its emitter (routing intercepts).
-  ready = "mag.ready", -- the ready barrier confirmation
+  ready = "mag.ready", -- readiness confirm (emitted in construct, at first activation)
   complete = "mag.complete", -- deferred-activation success (async completion / drain flush)
   failed = "mag.failed", -- deferred-activation failure (async completion)
 

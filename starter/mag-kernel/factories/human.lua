@@ -144,7 +144,8 @@ function M.construct(id, params, emit, deps)
     emit(sign({ kind = kinds.complete }))
   end
 
-  -- Ready barrier (actor-model.md, Lifecycle): confirm creation for this id.
+  -- Readiness confirmation (actor-model.md, Lifecycle): construction happens at
+  -- the first activation, so this emit coincides with beginning work.
   emit(sign({ kind = kinds.ready }))
 
   return instance
