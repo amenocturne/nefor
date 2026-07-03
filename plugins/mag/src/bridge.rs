@@ -1,20 +1,53 @@
-//! Provider capability bridge — adapts the kernel's single-shot capability
-//! request/response contract onto a provider plugin's multi-message `chat.*`
-//! conversation.
+//! Capability bridge — adapts the kernel's single-shot capability
+//! request/response contract onto the bus dialects real capability plugins
+//! actually speak: a provider's multi-message `chat.*` conversation, and the
+//! tool gate's prefix-routed `<gate>.tool.invoke` surface.
 //!
 //! ## The gap this closes
 //!
-//! The kernel is provider-agnostic. An `llm` actor emits one `capability.invoke`;
+//! The kernel is capability-agnostic. An actor emits one `capability.invoke`;
 //! routing.lua mints a correlation id and puts one
-//! `tool.invoke { id, name = <provider>, args = <request> }` on the bus, then
+//! `tool.invoke { id, name = <capability>, args = <request> }` on the bus, then
 //! awaits one correlated `tool.result` (routing.lua `on_capability_invoke` /
-//! `bus_response`). But a real provider plugin (chatgpt-provider, mock-provider)
-//! speaks a conversation — `<provider>.chat.create` → `.chat.append`× →
-//! `.chat.complete` → a streamed result (`<provider>.chat.complete.result`) — and
-//! advertises no `tool.invoke` surface. Nothing bridged the two, so a real
-//! kernel-path graph stalled at the first `llm` call.
+//! `bus_response`). But nothing on the bus subscribes to a bare `tool.invoke`:
 //!
-//! ## What the bridge does
+//! * A real provider plugin (chatgpt-provider, mock-provider) speaks a
+//!   conversation — `<provider>.chat.create` → `.chat.append`× →
+//!   `.chat.complete` → a streamed result (`<provider>.chat.complete.result`) —
+//!   and advertises no `tool.invoke` surface.
+//! * Tool invocations are owned by the tool gate, which prefix-routes on
+//!   `<gate>.tool.invoke { id, name, args }` (plugins/tool-gate/src/main.rs)
+//!   and answers with a broadcast `tool.result { id, output | error }` keyed by
+//!   the caller's id.
+//!
+//! Nothing bridged either dialect, so a real kernel-path graph stalled at its
+//! first `llm` call (pre-provider-bridge) and, once that landed, at its first
+//! tool call.
+//!
+//! ## The tool leg
+//!
+//! A tool-class `tool.invoke` (no `args.chat_id` — see Discrimination) is
+//! rewritten to `<gate>.tool.invoke` with the payload unwrapped to the gate's
+//! contract. The kernel's request is double-wrapped —
+//! `{ id, name, args = { name, args = <tool args>, allowlist, da-policy } }`
+//! (factories/run-tool.lua carries per-node gating alongside the call) — while
+//! the gate reads `{ id, name, args = <tool args> }` and forwards `args`
+//! verbatim to the owning tool plugin. So the inner `args` is lifted out, and
+//! `allowlist` / `da-policy` ride as top-level siblings (where the gate reads
+//! its other policy input, `read_only`; it ignores them today — threading them
+//! on the wire is this side's whole job, enforcement is the gate's).
+//!
+//! The kernel correlation id is kept as the gate's outer id: the gate echoes it
+//! on its `tool.result`, which the plugin's existing tool.result path feeds to
+//! `kernel.bus_response` (main.rs handle_tool_result). The tool leg therefore
+//! needs no bridge state — it is a pure envelope rewrite.
+//!
+//! The gate's bus name is composition-owned (the starter names the gate when it
+//! spawns it — starter/init.lua `tools.gate_spec("tool-gate", …)`), so it is
+//! threaded here through the plugin's spawn config (`--tool-gate`), not
+//! hard-coded.
+//!
+//! ## What the provider leg does
 //!
 //! Option (a): a host-side adapter now (the clean fix is a pure single-shot
 //! `complete(messages, config)` provider API that deletes this — see
@@ -89,22 +122,30 @@ pub struct ProviderReply {
     pub error: Option<String>,
 }
 
-/// Correlation table for the driven provider conversations, keyed by chat_id.
-#[derive(Default)]
-pub struct ProviderBridge {
+/// Capability-invoke translator: correlation table for the driven provider
+/// conversations (keyed by chat_id) plus the stateless tool-leg rewrite onto
+/// the composition-named gate.
+pub struct CapabilityBridge {
     pending: HashMap<String, PendingChat>,
+    /// The tool gate's bus name — the prefix tool-class invokes are rewritten
+    /// to. Composition-owned; threaded from the plugin's spawn config.
+    gate: String,
 }
 
-impl ProviderBridge {
-    pub fn new() -> Self {
-        Self::default()
+impl CapabilityBridge {
+    pub fn new(gate: impl Into<String>) -> Self {
+        Self {
+            pending: HashMap::new(),
+            gate: gate.into(),
+        }
     }
 
     /// Translate one kernel-drained emit body into the bus envelope(s) that go on
     /// the wire. A provider-class `tool.invoke` becomes the
-    /// create/append/complete sequence (and records the correlation); everything
-    /// else — lifecycle events, tool `tool.invoke`s, the raw kill-time cancel
-    /// envelope — passes through untouched.
+    /// create/append/complete sequence (and records the correlation); a
+    /// tool-class `tool.invoke` is rewritten to the gate's
+    /// `<gate>.tool.invoke` contract; everything else — lifecycle events, the
+    /// raw kill-time cancel envelope — passes through untouched.
     pub fn translate_emit(&mut self, body: Map<String, Value>) -> Vec<Map<String, Value>> {
         if body.get("kind").and_then(Value::as_str) != Some(TOOL_INVOKE) {
             return vec![body];
@@ -115,10 +156,12 @@ impl ProviderBridge {
             .and_then(|a| a.get("chat_id"))
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty());
-        // Not provider-class (no chat_id handle) → a tool invocation; forward it.
+        // Not provider-class (no chat_id handle) → a tool invocation; rewrite it
+        // onto the gate. Nothing on the bus subscribes to a bare `tool.invoke`,
+        // so forwarding it verbatim would strand the kernel's open correlation.
         let chat_id = match chat_id {
             Some(c) => c.to_owned(),
-            None => return vec![body],
+            None => return vec![gate_invoke(&self.gate, &body)],
         };
         // A provider-class invoke with no correlation id or name can't be driven;
         // forward it and let the bus surface the anomaly rather than swallow it.
@@ -183,6 +226,54 @@ impl ProviderBridge {
             error,
         })
     }
+}
+
+/// Rewrite a tool-class `tool.invoke` onto the gate's contract
+/// (plugins/tool-gate: `<gate>.tool.invoke { id, name, args }`, answered by a
+/// broadcast `tool.result` keyed by the same id).
+///
+/// The kernel's request is double-wrapped
+/// (`args = { name, args = <tool args>, allowlist, da-policy }` —
+/// factories/run-tool.lua), so the inner `args` is lifted out as the gate's
+/// `args`; a request without the wrap (a hand-authored capability request) is
+/// forwarded as the args whole. The kernel correlation id rides through as the
+/// gate's outer id, so the gate's `tool.result` correlates straight back to the
+/// kernel's open request. Per-node gating (`allowlist` / `da-policy`) rides
+/// top-level, sibling to the gate's `read_only` policy input.
+fn gate_invoke(gate: &str, body: &Map<String, Value>) -> Map<String, Value> {
+    let request = body
+        .get("args")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut m = Map::new();
+    m.insert("kind".into(), Value::String(format!("{gate}.tool.invoke")));
+    if let Some(id) = body.get("id").and_then(Value::as_str) {
+        m.insert("id".into(), Value::String(id.to_owned()));
+    }
+    // The tool name: routing.lua stamps the capability name on the envelope;
+    // the wrapped request carries the same name (run-tool sets both).
+    if let Some(name) = body
+        .get("name")
+        .or_else(|| request.get("name"))
+        .and_then(Value::as_str)
+    {
+        m.insert("name".into(), Value::String(name.to_owned()));
+    }
+    let args = match request.get("args") {
+        Some(inner @ Value::Object(_)) => inner.clone(),
+        _ => Value::Object(request.clone()),
+    };
+    m.insert("args".into(), args);
+    for key in ["allowlist", "da-policy"] {
+        match request.get(key) {
+            Some(v) if !v.is_null() => {
+                m.insert(key.into(), v.clone());
+            }
+            _ => {}
+        }
+    }
+    m
 }
 
 /// The provider-side cleanup envelope: delete the chat once its single result is
@@ -282,13 +373,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const GATE: &str = "tool-gate";
+
     fn obj(v: Value) -> Map<String, Value> {
         v.as_object().expect("object").clone()
     }
 
     #[test]
     fn provider_invoke_drives_the_chat_conversation_and_records_correlation() {
-        let mut bridge = ProviderBridge::new();
+        let mut bridge = CapabilityBridge::new(GATE);
         let invoke = obj(json!({
             "kind": "tool.invoke",
             "id": "corr-1",
@@ -342,7 +435,7 @@ mod tests {
             "chat_id": "agent@r1",
             "output": { "text": "done" }
         }));
-        assert!(ProviderBridge::is_provider_reply(
+        assert!(CapabilityBridge::is_provider_reply(
             result.get("kind").and_then(Value::as_str).unwrap()
         ));
         let reply = bridge
@@ -367,21 +460,85 @@ mod tests {
     }
 
     #[test]
-    fn tool_invoke_without_chat_id_forwards_unchanged() {
-        let mut bridge = ProviderBridge::new();
+    fn tool_invoke_is_rewritten_to_the_gate_with_the_payload_unwrapped() {
+        let mut bridge = CapabilityBridge::new(GATE);
+        // The kernel's double-wrapped request (routing.lua on_capability_invoke
+        // forwarding run-tool's { name, args, allowlist, da-policy } verbatim).
         let invoke = obj(json!({
             "kind": "tool.invoke",
-            "id": "corr-2",
-            "name": "fs/read",
-            "args": { "name": "fs/read", "args": { "path": "x" } }
+            "id": "cap-4",
+            "name": "list_dir",
+            "args": {
+                "name": "list_dir",
+                "args": { "path": "." },
+                "allowlist": ["list_dir", "read_file"],
+                "da-policy": { "git": "read" }
+            }
         }));
-        let out = bridge.translate_emit(invoke.clone());
-        assert_eq!(out, vec![invoke], "a tool invocation passes through bare");
+        let out = bridge.translate_emit(invoke);
+        assert_eq!(out.len(), 1, "one invoke in, one gate envelope out");
+        let gate = &out[0];
+        assert_eq!(
+            gate.get("kind").and_then(Value::as_str),
+            Some("tool-gate.tool.invoke"),
+            "a tool invocation is rewritten onto the gate's prefix"
+        );
+        // The kernel correlation id is kept as the gate's outer id, so the
+        // gate's tool.result correlates straight back to the open request.
+        assert_eq!(gate.get("id").and_then(Value::as_str), Some("cap-4"));
+        assert_eq!(gate.get("name").and_then(Value::as_str), Some("list_dir"));
+        // The inner args are unwrapped to the gate's contract.
+        assert_eq!(
+            gate.get("args"),
+            Some(&json!({ "path": "." })),
+            "the double-wrapped payload is unwrapped for the gate"
+        );
+        // Per-node gating rides top-level, sibling to the gate's read_only.
+        assert_eq!(
+            gate.get("allowlist"),
+            Some(&json!(["list_dir", "read_file"]))
+        );
+        assert_eq!(gate.get("da-policy"), Some(&json!({ "git": "read" })));
+    }
+
+    #[test]
+    fn tool_invoke_gate_target_is_config_threaded_not_hardcoded() {
+        let mut bridge = CapabilityBridge::new("custom-gate");
+        let out = bridge.translate_emit(obj(json!({
+            "kind": "tool.invoke",
+            "id": "cap-1",
+            "name": "echo",
+            "args": { "name": "echo", "args": {} }
+        })));
+        assert_eq!(
+            out[0].get("kind").and_then(Value::as_str),
+            Some("custom-gate.tool.invoke")
+        );
+    }
+
+    #[test]
+    fn unwrapped_tool_request_is_forwarded_as_the_args_whole() {
+        // A hand-authored capability request without the run-tool wrap: the
+        // request itself is the tool args.
+        let mut bridge = CapabilityBridge::new(GATE);
+        let out = bridge.translate_emit(obj(json!({
+            "kind": "tool.invoke",
+            "id": "cap-2",
+            "name": "read_file",
+            "args": { "path": "/etc/hosts" }
+        })));
+        let gate = &out[0];
+        assert_eq!(
+            gate.get("kind").and_then(Value::as_str),
+            Some("tool-gate.tool.invoke")
+        );
+        assert_eq!(gate.get("name").and_then(Value::as_str), Some("read_file"));
+        assert_eq!(gate.get("args"), Some(&json!({ "path": "/etc/hosts" })));
     }
 
     #[test]
     fn non_invoke_emit_forwards_unchanged() {
-        let mut bridge = ProviderBridge::new();
+        let mut bridge = CapabilityBridge::new(GATE);
         let event = obj(json!({ "kind": "mag.actor_ready", "id": "sink" }));
         let out = bridge.translate_emit(event.clone());
         assert_eq!(out, vec![event]);
@@ -389,7 +546,7 @@ mod tests {
 
     #[test]
     fn chat_error_resolves_as_an_error_reply() {
-        let mut bridge = ProviderBridge::new();
+        let mut bridge = CapabilityBridge::new(GATE);
         bridge.translate_emit(obj(json!({
             "kind": "tool.invoke", "id": "corr-3", "name": "p",
             "args": { "chat_id": "a@r1", "input": { "messages": [] } }
@@ -406,7 +563,7 @@ mod tests {
 
     #[test]
     fn reply_for_unknown_chat_is_ignored() {
-        let mut bridge = ProviderBridge::new();
+        let mut bridge = CapabilityBridge::new(GATE);
         let result = obj(json!({
             "kind": "p.chat.complete.result", "chat_id": "not-ours", "output": {}
         }));
@@ -417,7 +574,7 @@ mod tests {
 
     #[test]
     fn concurrent_chats_stay_independent_and_resolve_in_any_order() {
-        let mut bridge = ProviderBridge::new();
+        let mut bridge = CapabilityBridge::new(GATE);
         for (corr, chat) in [("corr-a", "agentA@r1"), ("corr-b", "agentB@r1")] {
             bridge.translate_emit(obj(json!({
                 "kind": "tool.invoke", "id": corr, "name": "p",

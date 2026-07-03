@@ -245,14 +245,15 @@ async fn compiled_two_agents_program_runs_through_the_entry_adapters_to_the_sink
                     ready_ids.push(id.to_owned());
                 }
             }
-            // The bridge must translate provider requests to the chat.* protocol;
-            // a bare provider tool.invoke on the wire is the exact regression this
-            // test guards against.
+            // The bridge must translate every capability invoke — provider
+            // requests to the chat.* protocol, tool invocations onto the gate's
+            // `<gate>.tool.invoke`. A bare tool.invoke on the wire is the exact
+            // deadlock regression this guards against: nothing subscribes to it.
             "tool.invoke" => {
-                let name = body.get("name").and_then(Value::as_str).unwrap_or("");
-                assert_ne!(
-                    name, PROVIDER,
-                    "a provider request must be bridged to chat.*, never a bare tool.invoke"
+                panic!(
+                    "bare tool.invoke reached the wire (name {:?}) — every capability \
+                     invoke must be bridged (provider → chat.*, tool → <gate>.tool.invoke)",
+                    body.get("name")
                 );
             }
             k if k == complete_kind => {

@@ -398,9 +398,14 @@ actor.spawn(require("compositors.graph").spawn_spec(rg_argv))
 -- entry; STARTER_ROOT is NEFOR_CONFIG_DIR (the repo's `starter/` under
 -- `just run`). Binary is `mag-plugin` (the `mag` binary is nefor-mag's
 -- compiler CLI); bus identity is `mag`.
+-- `--tool-gate` threads the composition-owned gate identity (the same name
+-- tools.gate_spec below spawns the gate under): the plugin rewrites the
+-- kernel's tool-class capability invokes onto `<gate>.tool.invoke`, and the
+-- composition layer — not the plugin — owns cross-plugin names.
 actor.spawn(actor.identity_spec("mag", {
   require("config").bin("mag-plugin"),
   "--kernel", STARTER_ROOT .. "/mag-kernel/init.lua",
+  "--tool-gate", "tool-gate",
 }))
 
 local tools = require("compositors.tools")

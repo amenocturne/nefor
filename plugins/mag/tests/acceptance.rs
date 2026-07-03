@@ -3,13 +3,15 @@
 //!
 //! It spawns the real `mag-plugin`, drives its stdio, and acts as the
 //! deterministic provider/tool capability itself. Crucially it speaks the REAL
-//! provider protocol: the mag plugin's provider bridge drives each provider turn
-//! as `chat.create` → `chat.append` → `chat.complete` (NOT a bare `tool.invoke`),
-//! and this harness answers each `chat.complete` with a `chat.complete.result` —
-//! the exchange a scripted `tool.invoke` responder skipped, which is why the
-//! provider-bridge gap went unnoticed. Real TOOL invocations (`echo`) stay bare
-//! `tool.invoke`s. No wall-clock synchronization — every step is driven off an
-//! observed event.
+//! protocols on both capability legs: the mag plugin's capability bridge drives
+//! each provider turn as `chat.create` → `chat.append` → `chat.complete` (NOT a
+//! bare `tool.invoke`), answered here with a `chat.complete.result`; and it
+//! rewrites each tool invocation onto the gate's `<gate>.tool.invoke` contract
+//! (unwrapped `{ id, name, args }` — NOT the kernel's bare double-wrapped
+//! `tool.invoke`, which nothing on the bus subscribes to), answered here with
+//! the gate's broadcast `tool.result { id, output }`. Scripted bare-`tool.invoke`
+//! responders are exactly how both bridge gaps survived earlier tests. No
+//! wall-clock synchronization — every step is driven off an observed event.
 //!
 //! The graph: TWO agents (`a1.*`, `a2.*`) composed in one modification, each a
 //! full provider loop (`llm → run-tool → tool-result → loop-counter → llm`),
@@ -64,6 +66,10 @@ fn kernel_path() -> PathBuf {
 /// The provider capability name the `llm` actors target — the shipped fixture's
 /// provider, so the abort envelope is the real `chatgpt-provider.chat.cancel`.
 const PROVIDER: &str = "chatgpt-provider";
+/// The gate bus name threaded via `--tool-gate`, mirroring the starter
+/// composition (starter/init.lua). Tool invocations must reach the wire as
+/// `<GATE>.tool.invoke`, never a bare `tool.invoke`.
+const GATE: &str = "tool-gate";
 const SESSION_ID: &str = "acceptance-session";
 const RUN_NAME: &str = "acceptance-run";
 
@@ -71,6 +77,8 @@ async fn spawn_mag(data_dir: &std::path::Path) -> Child {
     let mut cmd = tokio::process::Command::new(binary_path());
     cmd.arg("--kernel")
         .arg(kernel_path())
+        .arg("--tool-gate")
+        .arg(GATE)
         .env("NEFOR_DATA_DIR", data_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -185,9 +193,10 @@ fn parse_chat_id(chat_id: &str) -> (String, u32) {
     (agent, turn)
 }
 
-/// A `tool.result` reply carrying `output` (the tool convention the plugin reads
-/// — main.rs handle_tool_result). Used for real TOOL invocations (`echo`), which
-/// the bridge leaves as bare `tool.invoke`s.
+/// A `tool.result` reply carrying `output` — the gate's reply shape
+/// (plugins/tool-gate: broadcast `tool.result { id, output | error }` keyed by
+/// the caller's id), which the plugin reads via main.rs handle_tool_result.
+/// Answers each `<GATE>.tool.invoke` the bridge put on the wire.
 fn tool_result(id: &str, output: Value) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("kind".into(), Value::String("tool.result".into()));
@@ -256,8 +265,8 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
     .await;
 
     // Start the run. Both agents spawn behind the ready barrier; both `llm`s
-    // fire their first provider turn inside `start`, so two provider
-    // `tool.invoke`s (one per agent) reach the wire before any reply.
+    // fire their first provider turn inside `start`, so two bridged provider
+    // conversations (one per agent) reach the wire before any reply.
     let mut execute = Map::new();
     execute.insert("kind".into(), Value::String("mag.execute".into()));
     execute.insert("id".into(), Value::String("exec-accept".into()));
@@ -303,25 +312,42 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
                     killed_ids.push(id.to_owned());
                 }
             }
-            // Real TOOL invocations stay bare `tool.invoke`s; a provider request
-            // must NOT (the bridge translates it to chat.*), which this guards.
+            // Nothing on the bus subscribes to a bare `tool.invoke`: a provider
+            // request must be bridged to chat.*, a tool invocation onto the
+            // gate's `<GATE>.tool.invoke`. Any bare invoke is a bridge regression
+            // (a run would hang at its first capability call).
             "tool.invoke" => {
+                panic!(
+                    "bare tool.invoke reached the wire (name {:?}) — every capability \
+                     invoke must be bridged (provider → chat.*, tool → {GATE}.tool.invoke)",
+                    body.get("name")
+                );
+            }
+            // a1's tool call (from a1.run-tool), rewritten onto the gate's
+            // contract with the payload unwrapped and the kernel correlation id
+            // as the outer id. Answer like the gate does: a broadcast
+            // `tool.result` keyed by that id.
+            k if k == format!("{GATE}.tool.invoke") => {
                 let name = body.get("name").and_then(Value::as_str).unwrap_or("");
+                assert_eq!(name, "echo", "unexpected gated tool invoke: {name}");
                 let req_id = body
                     .get("id")
                     .and_then(Value::as_str)
-                    .expect("tool.invoke carries a correlation id")
+                    .expect("gate invoke carries the kernel correlation id")
                     .to_owned();
-                assert_ne!(
-                    name, PROVIDER,
-                    "a provider request must be bridged to chat.*, never a bare tool.invoke"
+                // The double-wrapped kernel payload was unwrapped: `args` is the
+                // tool's own args, not `{ name, args, allowlist, da-policy }`.
+                let args = body.get("args").and_then(Value::as_object).expect("args");
+                assert_eq!(
+                    args.get("text").and_then(Value::as_str),
+                    Some("hi"),
+                    "gate invoke carries the unwrapped tool args; got {args:?}"
                 );
-                if name == "echo" {
-                    // a1's tool call (from a1.run-tool). Deterministic tool output.
-                    send_event(&mut stdin, tool_result(&req_id, json!("echo-ran"))).await;
-                } else {
-                    panic!("unexpected capability invoke: {name}");
-                }
+                assert!(
+                    !args.contains_key("args"),
+                    "gate invoke args must be unwrapped, not the kernel's double-wrap"
+                );
+                send_event(&mut stdin, tool_result(&req_id, json!("echo-ran"))).await;
             }
             // A driven provider turn: the bridge finished `chat.create`/`.append`
             // and asks the provider to complete. Answer with a `chat.complete.result`
@@ -341,7 +367,7 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
                             &mut stdin,
                             chat_result(
                                 &chat_id,
-                                json!({ "tool_calls": [{ "id": "c1", "name": "echo", "args": {} }] }),
+                                json!({ "tool_calls": [{ "id": "c1", "name": "echo", "args": { "text": "hi" } }] }),
                             ),
                         )
                         .await;

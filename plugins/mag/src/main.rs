@@ -25,7 +25,7 @@ use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
-use crate::bridge::ProviderBridge;
+use crate::bridge::CapabilityBridge;
 use crate::error::MagError;
 use crate::kernel::{LuaHost, RunCompletion};
 
@@ -97,8 +97,16 @@ const APPLIED_KIND: &str = "mag.applied";
 
 /// Correlation id echoed by capability responses (tool.result). The kernel
 /// mints these on `capability.invoke` (routing.lua); the reply carries `output`
-/// (tool/provider convention) or `result`, plus an optional `error`.
+/// (tool/provider convention) or `result`, plus an optional `error`. The tool
+/// gate answers its `<gate>.tool.invoke` with exactly this shape, keyed by the
+/// caller's id, so gated tool invocations correlate back through this path.
 const TOOL_RESULT_KIND: &str = "tool.result";
+
+/// Fallback tool-gate bus name when the spawn config passes no `--tool-gate`.
+/// The gate's name is composition-owned (starter/init.lua names the gate when
+/// spawning it and threads the same name here); this default only keeps a bare
+/// `mag-plugin` spawn functional against the shipped starter composition.
+const DEFAULT_GATE_TARGET: &str = "tool-gate";
 
 #[tokio::main]
 async fn main() {
@@ -190,6 +198,22 @@ fn resolve_kernel_path() -> Result<PathBuf, MagError> {
     Err(MagError::NoKernelPath)
 }
 
+/// Resolve the tool gate's bus name from `--tool-gate <name>` argv — how the
+/// starter threads the composition-owned gate identity into this plugin
+/// (mirroring how it names the gate itself: `tools.gate_spec("tool-gate", …)`).
+/// Falls back to [`DEFAULT_GATE_TARGET`] when the flag is absent.
+fn resolve_gate_target() -> String {
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--tool-gate" && i + 1 < args.len() {
+            return args[i + 1].clone();
+        }
+        i += 1;
+    }
+    DEFAULT_GATE_TARGET.to_owned()
+}
+
 async fn run_dispatch_loop(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     in_rx: &mut mpsc::Receiver<Result<Envelope, TransportError>>,
@@ -201,10 +225,11 @@ async fn run_dispatch_loop(
     let mut program: Option<LoadedProgram> = None;
     // The in-flight async run, if any (deferred-completion path).
     let mut active: Option<ActiveExecute> = None;
-    // Provider capability bridge: drives each provider-class `tool.invoke` as a
-    // `chat.*` conversation and correlates the streamed result back. State
-    // persists across the session, keyed by chat_id (bridge.rs).
-    let mut bridge = ProviderBridge::new();
+    // Capability bridge: drives each provider-class `tool.invoke` as a
+    // `chat.*` conversation (correlating the streamed result back; state keyed
+    // by chat_id) and rewrites each tool-class `tool.invoke` onto the
+    // composition-named gate's `<gate>.tool.invoke` contract (bridge.rs).
+    let mut bridge = CapabilityBridge::new(resolve_gate_target());
     // Barrier / deadline tick while a run is in flight (docs/ir.md: the host
     // polls the barrier on a timer; synchronous programs settle before it fires).
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
@@ -249,13 +274,14 @@ async fn run_dispatch_loop(
 
 /// Forward everything the kernel emitted since the last drain (capability
 /// requests + lifecycle events) onto the NCP wire, in order. Each drained body
-/// passes through the provider bridge first: a provider-class `tool.invoke` is
-/// rewritten into its `chat.*` conversation (bridge.rs), everything else forwards
-/// unchanged.
+/// passes through the capability bridge first: a provider-class `tool.invoke`
+/// is rewritten into its `chat.*` conversation, a tool-class `tool.invoke` onto
+/// the gate's `<gate>.tool.invoke` contract (bridge.rs); everything else
+/// forwards unchanged.
 async fn flush_emits(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     host: &LuaHost,
-    bridge: &mut ProviderBridge,
+    bridge: &mut CapabilityBridge,
 ) -> Result<(), MagError> {
     for body in host.drain_emits()? {
         for envelope in bridge.translate_emit(body) {
@@ -273,7 +299,7 @@ async fn poll_active(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     host: &LuaHost,
     active: &mut Option<ActiveExecute>,
-    bridge: &mut ProviderBridge,
+    bridge: &mut CapabilityBridge,
 ) -> Result<(), MagError> {
     let state = host.poll()?;
     flush_emits(out_tx, host, bridge).await?;
@@ -323,7 +349,7 @@ async fn handle_event(
     program: &mut Option<LoadedProgram>,
     host: &LuaHost,
     active: &mut Option<ActiveExecute>,
-    bridge: &mut ProviderBridge,
+    bridge: &mut CapabilityBridge,
 ) -> Result<(), MagError> {
     let kind = match body.get("kind").and_then(Value::as_str) {
         Some(k) => k,
@@ -334,7 +360,7 @@ async fn handle_event(
     // the kernel's capability channel. A reply for a chat we don't drive resolves
     // to nothing and is ignored inside the bridge, so this is safe to check ahead
     // of the mag protocol arms (the suffixes never collide with a mag.* kind).
-    if ProviderBridge::is_provider_reply(kind) {
+    if CapabilityBridge::is_provider_reply(kind) {
         return handle_provider_reply(out_tx, kind, body, host, active, bridge).await;
     }
     let in_reply_to = body.get("id").and_then(Value::as_str);
@@ -412,7 +438,7 @@ async fn handle_execute(
     program: &Option<LoadedProgram>,
     host: &LuaHost,
     active: &mut Option<ActiveExecute>,
-    bridge: &mut ProviderBridge,
+    bridge: &mut CapabilityBridge,
 ) -> Result<(), MagError> {
     let mut modification: Value = match body.get("modification") {
         Some(m @ Value::Object(_)) => m.clone(),
@@ -561,7 +587,7 @@ async fn handle_apply(
     in_reply_to: Option<&str>,
     host: &LuaHost,
     active: &mut Option<ActiveExecute>,
-    bridge: &mut ProviderBridge,
+    bridge: &mut CapabilityBridge,
 ) -> Result<(), MagError> {
     // Guard: reject applies with no live run before touching the kernel.
     let run_id = match active.as_ref() {
@@ -620,7 +646,7 @@ async fn handle_tool_result(
     body: &Map<String, Value>,
     host: &LuaHost,
     active: &mut Option<ActiveExecute>,
-    bridge: &mut ProviderBridge,
+    bridge: &mut CapabilityBridge,
 ) -> Result<(), MagError> {
     let id = match body.get("id").and_then(Value::as_str) {
         Some(id) => id,
@@ -647,7 +673,7 @@ async fn handle_provider_reply(
     body: &Map<String, Value>,
     host: &LuaHost,
     active: &mut Option<ActiveExecute>,
-    bridge: &mut ProviderBridge,
+    bridge: &mut CapabilityBridge,
 ) -> Result<(), MagError> {
     let reply = match bridge.take_reply(kind, body) {
         Some(r) => r,
