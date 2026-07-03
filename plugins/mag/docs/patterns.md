@@ -46,12 +46,15 @@ finisher whose function returns `{kills: [<the others>]}`. First-applied
 wins; the losers' in-flight outputs are void; duplicate kills are logged
 no-ops. No coordination logic anywhere in the actors.
 
-## Bounded cycle (the agentic loop)
+## Cycle (the agentic loop)
 
-Any cycle must pass through a `loop-counter` actor — load-time validation
-enforces it. The exit is a typed variant (`mag.LoopExhausted`), routed like
-any type, usually to a summarizer that turns partial work into a
-`FinalAnswer`. Never encode "give up after N tries" in a prompt.
+Cycles are legal as-is. Every cycle exits through a typed variant — the llm's
+union output routes `FinalAnswer` out of the loop — so no bound is required or
+injected. To budget a loop, opt in: thread a `loop-counter` actor into the
+cycle (the agent template does this when `:max-steps` is authored). Its
+exhaustion exit is a typed variant (`mag.LoopExhausted`), routed like any
+type, usually to a summarizer that turns partial work into a `FinalAnswer`.
+Never encode "give up after N tries" in a prompt.
 
 ## Fire on failure / repair
 
@@ -84,7 +87,7 @@ instead of living in a prompt convention.
 
 ## Absence and timeouts
 
-There is no "fire when X did *not* happen." Express absence positively: a
+There is no "fire when X did _not_ happen." Express absence positively: a
 timeout is an actor whose failure output routes to the fallback; a missed
 precondition is a failure route. Negative predicates over graph state do not
 exist by design.

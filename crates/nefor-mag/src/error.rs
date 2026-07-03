@@ -33,9 +33,6 @@ pub enum MagError {
         source_type: MagType,
     },
 
-    #[error("unbounded loop: cycle through [{nodes}] has no loop-counter node")]
-    UnboundedLoop { nodes: String },
-
     #[error("disconnected node: '{node}' has no path to any terminal")]
     Disconnected { node: String },
 

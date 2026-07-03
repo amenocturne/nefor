@@ -18,7 +18,6 @@ pub fn validate(graph: &GraphValue) -> Result<(), MagError> {
     validate_connected(graph)?;
     validate_path_to_terminal(graph)?;
     validate_dead_branches(graph)?;
-    validate_bounded_loops(graph)?;
     validate_edge_types(graph)?;
     Ok(())
 }
@@ -197,74 +196,7 @@ fn validate_dead_branches(graph: &GraphValue) -> Result<(), MagError> {
     Ok(())
 }
 
-// 6. Every cycle must pass through a loop-counter node
-fn validate_bounded_loops(graph: &GraphValue) -> Result<(), MagError> {
-    let adj = adjacency(graph);
-    let node_ids: Vec<&str> = graph.nodes.iter().map(|n| n.id.as_str()).collect();
-    let nodes = node_map(graph);
-
-    // Find all cycles using DFS and check each contains a loop-counter
-    let mut visited: HashSet<&str> = HashSet::new();
-    let mut on_stack: HashSet<&str> = HashSet::new();
-    let mut stack_path: Vec<&str> = Vec::new();
-
-    for &start in &node_ids {
-        if !visited.contains(start) {
-            find_cycles_dfs(
-                start,
-                &adj,
-                &nodes,
-                &mut visited,
-                &mut on_stack,
-                &mut stack_path,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn find_cycles_dfs<'a>(
-    node: &'a str,
-    adj: &HashMap<&'a str, Vec<&'a str>>,
-    nodes: &HashMap<&'a str, &'a NodeValue>,
-    visited: &mut HashSet<&'a str>,
-    on_stack: &mut HashSet<&'a str>,
-    stack_path: &mut Vec<&'a str>,
-) -> Result<(), MagError> {
-    visited.insert(node);
-    on_stack.insert(node);
-    stack_path.push(node);
-
-    if let Some(successors) = adj.get(node) {
-        for &succ in successors {
-            if !visited.contains(succ) {
-                find_cycles_dfs(succ, adj, nodes, visited, on_stack, stack_path)?;
-            } else if on_stack.contains(succ) {
-                // Found a cycle: extract it from stack_path
-                let cycle_start = stack_path.iter().position(|&n| n == succ).unwrap_or(0);
-                let cycle: Vec<&str> = stack_path[cycle_start..].to_vec();
-
-                let has_loop_counter = cycle.iter().any(|&n| {
-                    nodes
-                        .get(n)
-                        .is_some_and(|node| node.node_type == "loop-counter")
-                });
-
-                if !has_loop_counter {
-                    return Err(MagError::UnboundedLoop {
-                        nodes: cycle.join(", "),
-                    });
-                }
-            }
-        }
-    }
-
-    stack_path.pop();
-    on_stack.remove(node);
-    Ok(())
-}
-
-// 7. Edge type compatibility
+// 6. Edge type compatibility
 fn validate_edge_types(graph: &GraphValue) -> Result<(), MagError> {
     let nodes = node_map(graph);
 
@@ -468,8 +400,10 @@ mod tests {
     }
 
     #[test]
-    fn unbounded_loop_errors() {
-        // a -> b -> a (cycle, no loop-counter)
+    fn bare_cycle_is_accepted() {
+        // a -> b -> a (cycle, no loop-counter). The bound is opt-in; a bare
+        // cycle is a legal shape — the exit is a typed output port, and
+        // runaway protection is the observer's concern.
         let graph = GraphValue {
             nodes: vec![
                 make_node("a", "llm", MagType::named("A"), MagType::named("B")),
@@ -478,11 +412,7 @@ mod tests {
             edges: vec![make_edge("a", "b"), make_edge("b", "a")],
             terminal: "b".into(),
         };
-        let err = validate(&graph).unwrap_err();
-        assert!(
-            matches!(err, MagError::UnboundedLoop { .. }),
-            "got: {err:?}"
-        );
+        assert!(validate(&graph).is_ok());
     }
 
     #[test]

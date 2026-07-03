@@ -30,15 +30,15 @@ ir.md documents an actor as `{id, factory, params}`. Lowering needs one more
 field, so the target actor spec is:
 
 ```json
-{ "id": "...", "factory": "...", "params": { }, "routes": { } }
+{ "id": "...", "factory": "...", "params": {}, "routes": {} }
 ```
 
-| Field | Consumer | Holds |
-|---|---|---|
-| `id` | kernel | namespaced actor id (`docs-explorer.llm`) |
-| `factory` | kernel → factory | which Lua factory constructs the instance |
-| `params` | factory (opaque to kernel) | factory setup: model, system, tools, `max`, … |
-| `routes` | kernel (opaque to factory) | typed output → destination ids |
+| Field     | Consumer                   | Holds                                         |
+| --------- | -------------------------- | --------------------------------------------- |
+| `id`      | kernel                     | namespaced actor id (`docs-explorer.llm`)     |
+| `factory` | kernel → factory           | which Lua factory constructs the instance     |
+| `params`  | factory (opaque to kernel) | factory setup: model, system, tools, `max`, … |
+| `routes`  | kernel (opaque to factory) | typed output → destination ids                |
 
 `routes` is a **sibling of `params`, not nested inside it** — see the design
 decision below. `params` is handed opaquely to the factory (ir.md: "What an
@@ -57,13 +57,13 @@ that travels the edge, valued by an **array of destination actor ids**.
 routes : { "<qualified-output-type>": ["<dest-id>", ...], ... }
 ```
 
-| Graph construct | Route encoding |
-|---|---|
-| `a -> b` (single output type T) | `a.routes["T"] = ["b"]` |
-| Typed exit `a : IN -> (X \| Y)` with `a -> bx`, `a -> by` | `a.routes = {"X":["bx"], "Y":["by"]}` |
-| Fanout: same type T to `b` and `c` | `a.routes["T"] = ["b", "c"]` |
-| Back-edge (cycle) `counter -> llm` | `counter.routes["ProviderOut"] = ["llm"]` — no different from a forward edge |
-| Terminal sink `out` | `out.routes = {}` (emits nothing downstream) |
+| Graph construct                                           | Route encoding                                                               |
+| --------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `a -> b` (single output type T)                           | `a.routes["T"] = ["b"]`                                                      |
+| Typed exit `a : IN -> (X \| Y)` with `a -> bx`, `a -> by` | `a.routes = {"X":["bx"], "Y":["by"]}`                                        |
+| Fanout: same type T to `b` and `c`                        | `a.routes["T"] = ["b", "c"]`                                                 |
+| Back-edge (cycle) `counter -> llm`                        | `counter.routes["ProviderOut"] = ["llm"]` — no different from a forward edge |
+| Terminal sink `out`                                       | `out.routes = {}` (emits nothing downstream)                                 |
 
 Type tags are produced exactly as `qualify_type` does today (ir.rs:40): dotted
 names pass through (`generic-provider.FinalAnswer`), bare names get a `mag.`
@@ -79,18 +79,32 @@ special-casing in the kernel.
 
 `(agent {:id "docs-explorer" ...})` is a stdlib function returning a subgraph.
 Every internal actor it composes is named under the `:id` prefix, and every
-route destination that points *inside* the same instance is rewritten with the
+route destination that points _inside_ the same instance is rewritten with the
 same prefix. Two instantiations of one template therefore occupy disjoint id
 subtrees.
 
-| Template-internal name | `docs-explorer` instance | `code-writer` instance |
-|---|---|---|
-| `entry` | `docs-explorer.entry` | `code-writer.entry` |
-| `llm` | `docs-explorer.llm` | `code-writer.llm` |
-| `run-tool` | `docs-explorer.run-tool` | `code-writer.run-tool` |
-| `tool-result` | `docs-explorer.tool-result` | `code-writer.tool-result` |
-| `loop-counter` | `docs-explorer.loop-counter` | `code-writer.loop-counter` |
-| `exhaust` | `docs-explorer.exhaust` | `code-writer.exhaust` |
+The agent template has two expansions; the loop bound is opt-in:
+
+- **No `:max-steps`** (default): the bare agentic cycle — `entry`, `llm`,
+  `run-tool`, `tool-result`, with the back-edge `tool-result → llm` and a
+  single output port on `llm`. The loop's terminator is structural: the llm's
+  output is the union `ToolCalls | OUT`, so a final answer exits through the
+  output port. Runaway protection is the author's/observer's concern.
+- **`:max-steps N` authored**: the bounded expansion — the back-edge threads a
+  `loop-counter` (`params.max = N`, no default) whose exhaustion variant exits
+  through an `exhaust` summarizer llm, a second output port.
+
+Both fixture agents author `:max-steps`, so the worked example lowers the
+bounded expansion:
+
+| Template-internal name             | `docs-explorer` instance     | `code-writer` instance     |
+| ---------------------------------- | ---------------------------- | -------------------------- |
+| `entry`                            | `docs-explorer.entry`        | `code-writer.entry`        |
+| `llm`                              | `docs-explorer.llm`          | `code-writer.llm`          |
+| `run-tool`                         | `docs-explorer.run-tool`     | `code-writer.run-tool`     |
+| `tool-result`                      | `docs-explorer.tool-result`  | `code-writer.tool-result`  |
+| `loop-counter` (`:max-steps` only) | `docs-explorer.loop-counter` | `code-writer.loop-counter` |
+| `exhaust` (`:max-steps` only)      | `docs-explorer.exhaust`      | `code-writer.exhaust`      |
 
 Namespacing rewrites three things at instantiation: (1) each actor `id`, (2)
 every internal route destination, (3) any rule `on` id the template binds. The
@@ -104,7 +118,8 @@ to concrete internal actor ids:
 
 - input port → the internal actor that receives the boundary input (`entry`).
 - output port → the set of internal actors that emit the boundary output type
-  (`llm` and `exhaust`, both of which produce `FinalAnswer`).
+  (`llm` and `exhaust` here, both of which produce `FinalAnswer`; just `llm`
+  for an unbounded agent).
 
 So the graph-level edge `explorer -> writer` dissolves into a route on **every**
 actor behind `explorer`'s output port:
@@ -119,16 +134,16 @@ docs-explorer.exhaust.routes["generic-provider.FinalAnswer"] = ["code-writer.ent
 The agentic loop is a cycle; it needs zero rules. All of its control flow is
 static typed wiring:
 
-| Concern | Lowering |
-|---|---|
-| Cycle | Ordinary routes that happen to point back: `loop-counter.routes["ProviderOut"] = ["llm"]`. No cycle marker in the IR |
-| Loop bound | `loop-counter` is a normal actor, factory `loop-counter`, `params.max` per instance (50 for the explorer, 80 for the writer). State lives in the instance, not the modification |
-| Typed exit | The union output `ProviderOut -> (ProviderOut \| LoopExhausted)` becomes two `routes` keys; the `llm` exit `ProviderOut -> (ToolCalls \| FinalAnswer)` likewise. The variant that leaves the cycle is a type fact, never a position — actor-model.md forbids position heuristics |
-| Per-instance disjointness | Because ids are namespaced, `docs-explorer.loop-counter` and `code-writer.loop-counter` are independent instances with independent `max` and independent back-routes to their own `llm` |
+| Concern                   | Lowering                                                                                                                                                                                                                                                                         |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Cycle                     | Ordinary routes that happen to point back: `loop-counter.routes["ProviderOut"] = ["llm"]` (or `tool-result.routes["ProviderOut"] = ["llm"]` unbounded). No cycle marker in the IR                                                                                                |
+| Loop bound                | Opt-in via `:max-steps`. When authored, `loop-counter` is a normal actor, factory `loop-counter`, `params.max` per instance (50 for the explorer, 80 for the writer). State lives in the instance, not the modification. Without `:max-steps` no counter exists                  |
+| Typed exit                | The union output `ProviderOut -> (ProviderOut \| LoopExhausted)` becomes two `routes` keys; the `llm` exit `ProviderOut -> (ToolCalls \| FinalAnswer)` likewise. The variant that leaves the cycle is a type fact, never a position — actor-model.md forbids position heuristics |
+| Per-instance disjointness | Because ids are namespaced, `docs-explorer.loop-counter` and `code-writer.loop-counter` are independent instances with independent `max` and independent back-routes to their own `llm`                                                                                          |
 
-The load-time cycle check (every cycle passes through a `loop-counter`,
-graph.rs:201) stays useful as a *validation* over the pre-lowering graph; it
-does not change what is emitted.
+Cycles are legal as-is — there is no load-time boundedness check. Every cycle
+already has a typed exit (the llm's `FinalAnswer` variant); bounding it is an
+authoring decision, not a compiler guarantee.
 
 ## The program sink
 
@@ -140,16 +155,16 @@ plane). The old `GraphIr.terminal` string (ir.rs:8) is dropped.
 
 ## Messages, kills, rules (initial modification)
 
-| Section | Initial modification content | Notes |
-|---|---|---|
+| Section    | Initial modification content                                                                          | Notes                                                                                                                                                                                  |
+| ---------- | ----------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `messages` | one activation to the entry port of the first agent: `{to: "docs-explorer.entry", content: {…task…}}` | The two-step handshake (spawn all, await readies, then deliver) means this message queues in `docs-explorer.entry`'s pending mailbox until the factory confirms ready (actor-model.md) |
-| `kills` | `[]` | The initial constellation removes nothing. Kills appear in *rule-produced* modifications (e.g. the race pattern: first completion's rule kills the losers) |
-| `rules` | `[]` | A fully static graph binds no rules — all routing is wiring. Rules are for data-dependent composition only |
+| `kills`    | `[]`                                                                                                  | The initial constellation removes nothing. Kills appear in _rule-produced_ modifications (e.g. the race pattern: first completion's rule kills the losers)                             |
+| `rules`    | `[]`                                                                                                  | A fully static graph binds no rules — all routing is wiring. Rules are for data-dependent composition only                                                                             |
 
 ### Where rules would attach
 
 Rules are `{on: <actor-id>, fn: <name>}` and fire when `<actor-id>` returns
-(ir.md). They enter the picture only when the *shape* of the next graph depends
+(ir.md). They enter the picture only when the _shape_ of the next graph depends
 on runtime data. Illustrative (not in this fixture):
 
 - **For-each fanout.** If `docs-explorer` returned a list of sub-tasks and the
@@ -167,40 +182,40 @@ unary, and matches the contract (ir.md). None of that machinery exists yet.
 
 ## Master mapping table
 
-| MAG construct | Modification element |
-|---|---|
-| `(node "T" {…} : IN -> OUT)` | one actor `{id, factory: "T", params: {…}, routes}` |
-| `(agent {:id N …} : IN -> FinalAnswer)` | a namespaced constellation of actors under prefix `N.` |
-| edge `a -> b` | entry in `a.routes` keyed by the crossing type |
-| union output + its outgoing edges | multiple keys in the source actor's `routes` |
-| fanout (one type, many targets) | one `routes` key with a multi-element array |
-| cycle back-edge | an ordinary `routes` entry pointing upstream |
-| `loop-counter` node | actor `{factory: "loop-counter", params:{max}}` |
-| `:terminal out` (sink) | `sink` actor with `routes: {}`; no `terminal` field |
-| initial input | one entry in `messages` to the entry port |
-| control edge (fire `b` after `a`, no data) | status-typed route entry on `a` (`mag.Completed`, failure variants) |
-| all-of join ("fire when A and B done") | destination actor declares a product input `(A + B)` — no IR element; firing is the input contract (ir.md, Firing) |
-| static graph | `kills: []`, `rules: []` |
-| data-dependent composition | `rules: [{on, fn}]` binding a MAG function |
+| MAG construct                              | Modification element                                                                                               |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
+| `(node "T" {…} : IN -> OUT)`               | one actor `{id, factory: "T", params: {…}, routes}`                                                                |
+| `(agent {:id N …} : IN -> FinalAnswer)`    | a namespaced constellation of actors under prefix `N.`                                                             |
+| edge `a -> b`                              | entry in `a.routes` keyed by the crossing type                                                                     |
+| union output + its outgoing edges          | multiple keys in the source actor's `routes`                                                                       |
+| fanout (one type, many targets)            | one `routes` key with a multi-element array                                                                        |
+| cycle back-edge                            | an ordinary `routes` entry pointing upstream                                                                       |
+| `loop-counter` node                        | actor `{factory: "loop-counter", params:{max}}`                                                                    |
+| `:terminal out` (sink)                     | `sink` actor with `routes: {}`; no `terminal` field                                                                |
+| initial input                              | one entry in `messages` to the entry port                                                                          |
+| control edge (fire `b` after `a`, no data) | status-typed route entry on `a` (`mag.Completed`, failure variants)                                                |
+| all-of join ("fire when A and B done")     | destination actor declares a product input `(A + B)` — no IR element; firing is the input contract (ir.md, Firing) |
+| static graph                               | `kills: []`, `rules: []`                                                                                           |
+| data-dependent composition                 | `rules: [{on, fn}]` binding a MAG function                                                                         |
 
 ## Compiler gap list — `crates/nefor-mag`
 
 Every point where the compiler today cannot produce this lowering. This scopes
 the loader-modifications task.
 
-| # | Gap | Where | Needed |
-|---|---|---|---|
-| 1 | **No modification IR.** Only `GraphIr{terminal, nodes, edges, hash}` is emitted; `compile` ends at `ir::normalize`. | `ir.rs:7-13`, `lib.rs:compile` | New `ModificationIr{actors, messages, kills, rules}` type + a lowering pass replacing/after `normalize` |
-| 2 | **Edges are first-class, not dissolved.** `EdgeIr{from,to,type}` and a top-level `edges` vec; `NodeIr` has no `routes`. | `ir.rs:31-38`, `ir.rs:15-22`, `ir.rs:140-152` | Invert the edge list into per-source `routes: {type: [dest]}`; drop `EdgeIr` |
-| 3 | **No namespacing.** Ids are `next_node_id()` → `node_N`, overwritten verbatim by the `let`/`def` binding name — a single flat name, no prefixing. `docs-explorer.llm` is unreachable. | `eval.rs:10-13`, `eval.rs:124-126`, `eval.rs:183-185` | An instantiation namespace that prefixes internal ids + rewrites route destinations and rule `on` ids |
-| 4 | **No `agent` stdlib fn / subgraph-returning fn / splicing.** A bare `(agent {…} : …)` hits function application and fails (undefined). Even a user `fn` returning a `Value::Graph` cannot be embedded: `eval_graph` only consumes `Value::Node`, `->`, `:terminal`; a `Value::Graph` in the edge stream is silently skipped, never spliced. | `eval.rs:96-107`, `eval.rs:761-890` (skip at `857-859`) | An `agent` stdlib function; subgraphs as first-class composable values; `graph` splicing that dissolves boundary edges into internal-actor routes |
-| 5 | **No ports on nodes/graphs.** `NodeValue`/`GraphValue` carry `nodes, edges, terminal` — no input/output port handles, so agent-as-node composition has nothing to resolve boundary edges against. | `ast.rs:110-130` | Port metadata on subgraph values (which internal actors are the in/out boundary) |
-| 6 | **Single-terminal / single-component assumptions.** Exactly one `:terminal`/`sink` required; weak-connectivity enforced. The modification model has no `terminal` field. | `graph.rs:59-76`, `graph.rs:79-124`, `eval.rs:862-883` | Drop `terminal` from emission; re-express terminality as a sink with empty routes. (Cycle/dead-branch/type checks stay useful as pre-lowering validation) |
-| 7 | **No rules / messages / kills emission.** Nothing produces any of the three; no initial-activation message synthesis. | whole of `ir.rs` | Emit `messages` (initial activation), `kills: []`, `rules` |
-| 8 | **No rule machinery.** No `NodeOutput -> GraphModification` contract, no load-time rule checks (fn exists / unary / contract), no resident source-snapshot for fire-time evaluation, no JSON↔MAG value bridge for feeding node outputs to rule fns. | absent | The rules-as-names layer (ir.md); out of scope for the *static* fixture but required for the model |
-| 9 | **`reasoner` vs `factory` field name.** `NodeIr.reasoner` sourced from `node.node_type`. | `ir.rs:17`, `ir.rs:110` | Rename to `factory` in the actor spec |
-| 10 | **Fanout shape differs.** `FanoutIr{in, out}` records that an output is a union but not *where each variant goes* (that lives on edges). | `ir.rs:24-29`, `ir.rs:99-105` | Merge "is a union" + "per-variant destination" into the single `routes` map; drop the `in` field (input type is the actor's own contract, not routing data) |
-| 11 | **Hashing covers the wrong shape.** `normalize` hashes canonical `{terminal, nodes, edges}`. | `ir.rs:154-164` | Canonicalize + hash the modification (sorted actors, sorted route keys and destination arrays) to preserve deterministic hashing |
+| #   | Gap                                                                                                                                                                                                                                                                                                                                         | Where                                                   | Needed                                                                                                                                                      |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | **No modification IR.** Only `GraphIr{terminal, nodes, edges, hash}` is emitted; `compile` ends at `ir::normalize`.                                                                                                                                                                                                                         | `ir.rs:7-13`, `lib.rs:compile`                          | New `ModificationIr{actors, messages, kills, rules}` type + a lowering pass replacing/after `normalize`                                                     |
+| 2   | **Edges are first-class, not dissolved.** `EdgeIr{from,to,type}` and a top-level `edges` vec; `NodeIr` has no `routes`.                                                                                                                                                                                                                     | `ir.rs:31-38`, `ir.rs:15-22`, `ir.rs:140-152`           | Invert the edge list into per-source `routes: {type: [dest]}`; drop `EdgeIr`                                                                                |
+| 3   | **No namespacing.** Ids are `next_node_id()` → `node_N`, overwritten verbatim by the `let`/`def` binding name — a single flat name, no prefixing. `docs-explorer.llm` is unreachable.                                                                                                                                                       | `eval.rs:10-13`, `eval.rs:124-126`, `eval.rs:183-185`   | An instantiation namespace that prefixes internal ids + rewrites route destinations and rule `on` ids                                                       |
+| 4   | **No `agent` stdlib fn / subgraph-returning fn / splicing.** A bare `(agent {…} : …)` hits function application and fails (undefined). Even a user `fn` returning a `Value::Graph` cannot be embedded: `eval_graph` only consumes `Value::Node`, `->`, `:terminal`; a `Value::Graph` in the edge stream is silently skipped, never spliced. | `eval.rs:96-107`, `eval.rs:761-890` (skip at `857-859`) | An `agent` stdlib function; subgraphs as first-class composable values; `graph` splicing that dissolves boundary edges into internal-actor routes           |
+| 5   | **No ports on nodes/graphs.** `NodeValue`/`GraphValue` carry `nodes, edges, terminal` — no input/output port handles, so agent-as-node composition has nothing to resolve boundary edges against.                                                                                                                                           | `ast.rs:110-130`                                        | Port metadata on subgraph values (which internal actors are the in/out boundary)                                                                            |
+| 6   | **Single-terminal / single-component assumptions.** Exactly one `:terminal`/`sink` required; weak-connectivity enforced. The modification model has no `terminal` field.                                                                                                                                                                    | `graph.rs:59-76`, `graph.rs:79-124`, `eval.rs:862-883`  | Drop `terminal` from emission; re-express terminality as a sink with empty routes. (Cycle/dead-branch/type checks stay useful as pre-lowering validation)   |
+| 7   | **No rules / messages / kills emission.** Nothing produces any of the three; no initial-activation message synthesis.                                                                                                                                                                                                                       | whole of `ir.rs`                                        | Emit `messages` (initial activation), `kills: []`, `rules`                                                                                                  |
+| 8   | **No rule machinery.** No `NodeOutput -> GraphModification` contract, no load-time rule checks (fn exists / unary / contract), no resident source-snapshot for fire-time evaluation, no JSON↔MAG value bridge for feeding node outputs to rule fns.                                                                                         | absent                                                  | The rules-as-names layer (ir.md); out of scope for the _static_ fixture but required for the model                                                          |
+| 9   | **`reasoner` vs `factory` field name.** `NodeIr.reasoner` sourced from `node.node_type`.                                                                                                                                                                                                                                                    | `ir.rs:17`, `ir.rs:110`                                 | Rename to `factory` in the actor spec                                                                                                                       |
+| 10  | **Fanout shape differs.** `FanoutIr{in, out}` records that an output is a union but not _where each variant goes_ (that lives on edges).                                                                                                                                                                                                    | `ir.rs:24-29`, `ir.rs:99-105`                           | Merge "is a union" + "per-variant destination" into the single `routes` map; drop the `in` field (input type is the actor's own contract, not routing data) |
+| 11  | **Hashing covers the wrong shape.** `normalize` hashes canonical `{terminal, nodes, edges}`.                                                                                                                                                                                                                                                | `ir.rs:154-164`                                         | Canonicalize + hash the modification (sorted actors, sorted route keys and destination arrays) to preserve deterministic hashing                            |
 
 Partially present (reuse, not gaps): `qualify_type` (ir.rs:40) already produces
 the route-key tags; `MagType`/`accepts` (types.rs) already resolves which union

@@ -2,8 +2,8 @@
 //! `starter/mag/lib/templates.mag` are MAG library functions (built on the
 //! `subgraph` primitive), not compiler builtins. Each test compiles a small
 //! program that requires the stdlib and instantiates a template, then asserts
-//! the whole program validates and lowers — including the bounded-loop check
-//! passing through the template's internal loop-counter.
+//! the whole program validates and lowers — including the template's internal
+//! loop-counter and its typed exhaustion exit.
 
 use std::path::PathBuf;
 
@@ -65,8 +65,7 @@ fn retry_bounded_lowers_and_bounds_its_loop() {
     }
 
     // Bounded cycle: the loop-counter routes the failure back to repair and the
-    // exhausted variant out. (That this compiled at all means validate_bounded_loops
-    // accepted the cycle — it passes through fixer.bound.)
+    // exhausted variant out.
     assert_eq!(
         route_dests(&ir, "fixer.bound", "generic-control.Fail"),
         vec!["fixer.repair"]

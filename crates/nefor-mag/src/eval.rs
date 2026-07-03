@@ -1241,12 +1241,18 @@ fn provider_out() -> MagType {
     MagType::Named("generic-provider.ProviderOut".into())
 }
 
-/// `(agent {:id … :model … :system … :tools […] :max-steps N} : IN -> OUT)`
+/// `(agent {:id … :model … :system … :tools […] :max-steps N?} : IN -> OUT)`
 ///
 /// A stdlib template: composes the primitive agentic-loop actors (entry
-/// adapter, llm call, run-tool, tool-result, loop-counter, exhaust summarizer)
-/// into one cyclic constellation, namespaced under `:id`, exposing a single
-/// input port (`entry`) and the boundary output type emitted by `llm`/`exhaust`.
+/// adapter, llm call, run-tool, tool-result) into one cyclic constellation,
+/// namespaced under `:id`. The loop's natural terminator is structural: the
+/// llm's output is the union `ToolCalls | OUT`, so a final answer exits
+/// through the output port.
+///
+/// The loop bound is opt-in. Without `:max-steps` the expansion is the bare
+/// cycle with a single output port on `llm`. Authoring `:max-steps N` adds a
+/// `loop-counter` (max N) on the tool-result → llm back-edge plus an
+/// `exhaust` summarizer llm, giving a second output port on `exhaust`.
 fn eval_agent(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
     let colon_pos = args
         .iter()
@@ -1304,24 +1310,6 @@ fn eval_agent(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
         llm_args.insert("profile".into(), profile.clone());
     }
 
-    // exhaust: a summarizing llm that leaves the bounded loop.
-    let mut exhaust_args: BTreeMap<String, Value> = BTreeMap::new();
-    if let Some(model) = config.get("model") {
-        exhaust_args.insert("model".into(), model.clone());
-    }
-    exhaust_args.insert(
-        "system".into(),
-        Value::Str("Summarize what you found so far.".into()),
-    );
-    if let Some(provider) = config.get("provider") {
-        exhaust_args.insert("provider".into(), provider.clone());
-    }
-    if let Some(profile) = config.get("profile") {
-        exhaust_args.insert("profile".into(), profile.clone());
-    }
-
-    let max_steps = config.get("max-steps").cloned().unwrap_or(Value::Int(50));
-
     let entry = NodeValue {
         id: "entry".into(),
         node_type: "adapter".into(),
@@ -1353,66 +1341,95 @@ fn eval_agent(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
         input_type: MagType::Named("generic-tool.ToolHandle".into()),
         output_type: provider_out(),
     };
-    let loop_counter = NodeValue {
-        id: "loop-counter".into(),
-        node_type: "loop-counter".into(),
-        args: BTreeMap::from([("max".into(), max_steps)]),
-        input_type: provider_out(),
-        output_type: MagType::Union(vec![
-            provider_out(),
-            MagType::Named("mag.LoopExhausted".into()),
-        ]),
-    };
-    let exhaust = NodeValue {
-        id: "exhaust".into(),
-        node_type: "llm".into(),
-        args: exhaust_args,
-        input_type: MagType::Named("mag.LoopExhausted".into()),
-        output_type: output_type.clone(),
-    };
 
-    let mut sub = SubgraphValue {
-        nodes: vec![entry, llm, run_tool, tool_result, loop_counter, exhaust],
-        edges: vec![
-            EdgeValue {
-                from: "entry".into(),
-                to: "llm".into(),
-            },
-            EdgeValue {
-                from: "llm".into(),
-                to: "run-tool".into(),
-            },
-            EdgeValue {
-                from: "run-tool".into(),
-                to: "tool-result".into(),
-            },
-            EdgeValue {
+    let mut nodes = vec![entry, llm, run_tool, tool_result];
+    let mut edges = vec![
+        EdgeValue {
+            from: "entry".into(),
+            to: "llm".into(),
+        },
+        EdgeValue {
+            from: "llm".into(),
+            to: "run-tool".into(),
+        },
+        EdgeValue {
+            from: "run-tool".into(),
+            to: "tool-result".into(),
+        },
+    ];
+    let mut outputs = vec![Port {
+        actor: "llm".into(),
+        ty: output_type.clone(),
+    }];
+
+    match config.get("max-steps") {
+        Some(max_steps) => {
+            // exhaust: a summarizing llm that leaves the bounded loop.
+            let mut exhaust_args: BTreeMap<String, Value> = BTreeMap::new();
+            if let Some(model) = config.get("model") {
+                exhaust_args.insert("model".into(), model.clone());
+            }
+            exhaust_args.insert(
+                "system".into(),
+                Value::Str("Summarize what you found so far.".into()),
+            );
+            if let Some(provider) = config.get("provider") {
+                exhaust_args.insert("provider".into(), provider.clone());
+            }
+            if let Some(profile) = config.get("profile") {
+                exhaust_args.insert("profile".into(), profile.clone());
+            }
+
+            nodes.push(NodeValue {
+                id: "loop-counter".into(),
+                node_type: "loop-counter".into(),
+                args: BTreeMap::from([("max".into(), max_steps.clone())]),
+                input_type: provider_out(),
+                output_type: MagType::Union(vec![
+                    provider_out(),
+                    MagType::Named("mag.LoopExhausted".into()),
+                ]),
+            });
+            nodes.push(NodeValue {
+                id: "exhaust".into(),
+                node_type: "llm".into(),
+                args: exhaust_args,
+                input_type: MagType::Named("mag.LoopExhausted".into()),
+                output_type: output_type.clone(),
+            });
+            edges.push(EdgeValue {
                 from: "tool-result".into(),
                 to: "loop-counter".into(),
-            },
-            EdgeValue {
+            });
+            edges.push(EdgeValue {
                 from: "loop-counter".into(),
                 to: "llm".into(),
-            },
-            EdgeValue {
+            });
+            edges.push(EdgeValue {
                 from: "loop-counter".into(),
                 to: "exhaust".into(),
-            },
-        ],
+            });
+            outputs.push(Port {
+                actor: "exhaust".into(),
+                ty: output_type,
+            });
+        }
+        None => {
+            edges.push(EdgeValue {
+                from: "tool-result".into(),
+                to: "llm".into(),
+            });
+        }
+    }
+
+    let mut sub = SubgraphValue {
+        nodes,
+        edges,
         input: Port {
             actor: "entry".into(),
             ty: input_type,
         },
-        outputs: vec![
-            Port {
-                actor: "llm".into(),
-                ty: output_type.clone(),
-            },
-            Port {
-                actor: "exhaust".into(),
-                ty: output_type,
-            },
-        ],
+        outputs,
     };
     prefix_subgraph(&id, &mut sub);
 

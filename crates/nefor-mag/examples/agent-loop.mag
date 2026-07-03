@@ -1,5 +1,6 @@
 ;; The agentic loop — agent as a composition of primitives
-;; This is what stdlib's (agent) would expand to
+;; This is what stdlib's (agent) would expand to with :max-steps authored;
+;; without it, drop bound/exhaust and route result straight back to call
 ;;
 ;; The types form a clean cycle:
 ;;   generic-provider.ProviderOut -> (generic-tool.ToolCalls | generic-provider.FinalAnswer)

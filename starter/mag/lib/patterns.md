@@ -13,8 +13,9 @@ types — don't encode the reason in a prompt.
 
 Reach for a template before hand-wiring a constellation:
 
-- `(agent {:id N :model … :provider … :tools […] :max-steps N} : IN -> generic-provider.FinalAnswer)`
-  — the bounded tool-use loop (llm ⇄ run-tool, loop-counter exit). Builtin.
+- `(agent {:id N :model … :provider … :tools […] :max-steps N?} : IN -> generic-provider.FinalAnswer)`
+  — the tool-use loop (llm ⇄ run-tool), unbounded by default. Authoring
+  `:max-steps N` opts into a loop-counter + exhaust-summarizer exit. Builtin.
 - `((get tpl "retry-bounded") {:id N :model … :provider … :max-steps N})`
   — produce / typed-failure / repair, bounded. Library (`require "lib/templates"`).
 - `((get tpl "gate") {:id N :model … :provider … :max-steps N})`
@@ -51,12 +52,15 @@ bind a rule on each finisher returning `{kills: [<the others>]}`. First-applied
 wins, losers' outputs go void, duplicate kills are no-ops. No coordination logic
 in the actors. (Needs rules — post-MVP.)
 
-## Bounded cycle
+## Cycle
 
-Every cycle must pass through a `loop-counter` — load-time enforced. The exit is
-a typed variant (`mag.LoopExhausted`), routed like any type, usually to a
-summarizer that turns partial work into a `FinalAnswer`. Never "give up after N"
-in a prompt. This is the spine of `agent`, `retry-bounded`, and `gate`.
+Cycles are legal as-is; every cycle exits through a typed variant (the llm's
+`FinalAnswer` route out of the loop), so no bound is required. To budget a
+loop, opt in with a `loop-counter` — `agent` threads one in when `:max-steps`
+is authored; `retry-bounded` and `gate` always carry one. The counter's exit
+is a typed variant (`mag.LoopExhausted`), routed like any type, usually to a
+summarizer that turns partial work into a `FinalAnswer`. Never "give up after
+N" in a prompt.
 
 ## Fire on failure / repair
 

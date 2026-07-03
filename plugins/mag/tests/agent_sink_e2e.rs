@@ -50,7 +50,8 @@ const PROGRAM: &str = r#"
                      :system "Answer the task."
                      :provider "test-provider"
                      :profile "standard"
-                     :tools ["fs/read"]}
+                     :tools ["fs/read"]
+                     :max-steps 50}
                : mag.Task -> generic-provider.FinalAnswer)
       out    (node "sink" {} : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]
   (graph worker -> out :terminal out))
