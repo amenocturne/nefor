@@ -164,6 +164,123 @@ local function node_rows(node_id, node, now_ms, narrow)
   return rows
 end
 
+-- ── MAG namespace grouping (display model) ────────────────────────────
+--
+-- The MAG run panel collapses a run's actors into top-level namespace
+-- groups: an actor id's group is its segment up to the first ".". Group
+-- rows aggregate member state; per-member states are retained inside each
+-- group (a future expand/collapse toggle reads them straight off the same
+-- `run.nodes` store). An undotted id (e.g. `sink`) is its own single-
+-- member group. This path is MAG-only — reasoner-graph runs keep the flat
+-- per-node rendering in `run_header` / `node_rows`.
+
+local function group_of(actor_id)
+  return actor_id:match("^([^.]+)") or actor_id
+end
+
+-- Aggregate a group's member states into one status. Precedence, highest
+-- first: killed (any member killed) → running (any member live) → done
+-- (run finished) → pending (no member ready yet). `killed` outranks
+-- `running` so a group with any killed member reads as terminated — the
+-- "killed if any member was killed" rule — even while a sibling is still
+-- mid-flight.
+local function group_status(members, run_completed)
+  local any_killed, any_running = false, false
+  local count = 0
+  for _, m in ipairs(members) do
+    count = count + 1
+    if m.node.status == "killed" then any_killed = true
+    elseif m.node.status == "running" then any_running = true end
+  end
+  if count == 0 then return "pending" end
+  if any_killed then return "killed" end
+  if any_running then return "running" end
+  if run_completed then return "done" end
+  return "pending"
+end
+
+-- Build the ordered group model for a MAG run: a list of groups in stable
+-- first-appearance order (each group keyed on the earliest spawn `seq` of
+-- its members), every group carrying its member nodes plus an aggregated
+-- status and elapsed window.
+local function build_groups(run)
+  local buckets = {}
+  local order = {}
+  for id, node in pairs(run.nodes or {}) do
+    local g = group_of(id)
+    local b = buckets[g]
+    if b == nil then
+      b = { name = g, members = {}, min_seq = math.huge }
+      buckets[g] = b
+      order[#order + 1] = b
+    end
+    b.members[#b.members + 1] = { id = id, node = node }
+    local seq = node.seq or math.huge
+    if seq < b.min_seq then b.min_seq = seq end
+  end
+  local run_completed = run.completed_at_ms ~= nil
+  for _, b in ipairs(order) do
+    table.sort(b.members, function(x, y)
+      local sx, sy = x.node.seq or math.huge, y.node.seq or math.huge
+      if sx ~= sy then return sx < sy end
+      return x.id < y.id
+    end)
+    b.status = group_status(b.members, run_completed)
+    local first_start, last_finish
+    for _, m in ipairs(b.members) do
+      local s = m.node.started_at_ms
+      if s and (first_start == nil or s < first_start) then first_start = s end
+      local f = m.node.finished_at_ms
+      if f and (last_finish == nil or f > last_finish) then last_finish = f end
+    end
+    b.first_start, b.last_finish = first_start, last_finish
+  end
+  table.sort(order, function(a, b)
+    if a.min_seq ~= b.min_seq then return a.min_seq < b.min_seq end
+    return a.name < b.name
+  end)
+  return order
+end
+
+local function group_row(group, now_ms)
+  local glyph = GLYPHS[group.status] or "·"
+  local style = NODE_STYLE[group.status] or STYLE.status_dim
+  local elapsed
+  if group.status == "running" then
+    elapsed = now_ms - (group.first_start or now_ms)
+  elseif TERMINAL_STATUS[group.status] and group.last_finish then
+    elapsed = group.last_finish - (group.first_start or group.last_finish)
+  end
+  local elapsed_str = elapsed and (" " .. fmt_elapsed_ms(elapsed)) or ""
+  local n = #group.members
+  local count_str = n > 1 and (" (" .. n .. ")") or ""
+  local text = glyph .. " " .. group.name .. count_str .. elapsed_str
+  return tui.text { content = text, style = style, wrap = "none" }
+end
+
+-- MAG run header. Counts GROUPS (not raw actors): "(done/total)" where a
+-- group is done once its aggregated status is terminal. Mirrors the flat
+-- header's rejected / no-op modification tail.
+local function mag_run_header(run, groups)
+  local ident
+  if type(run.run_name) == "string" and #run.run_name > 0 then
+    ident = run.run_name
+  else
+    ident = run.run_id and run.run_id:sub(1, 8) or "?"
+  end
+  local label = run.label or "MAG"
+  local done = 0
+  for _, g in ipairs(groups) do
+    if TERMINAL_STATUS[g.status] then done = done + 1 end
+  end
+  local title = string.format("%s %s (%d/%d)", label, ident, done, #groups)
+  local extra = {}
+  if (run.rejected or 0) > 0 then extra[#extra + 1] = "✗" .. run.rejected .. " rej" end
+  if (run.noops or 0) > 0 then extra[#extra + 1] = "⊘" .. run.noops end
+  if #extra > 0 then title = title .. "  " .. table.concat(extra, " ") end
+  return tui.text { content = title, style = STYLE.footer, wrap = "none" }
+end
+
 local function panel_children(state, now_ms, narrow)
   local children = {}
   local run_ids = sorted_keys(state.dag_runs)
@@ -182,11 +299,20 @@ local function panel_children(state, now_ms, narrow)
         children[#children + 1] = tui.text { content = "", wrap = "none" }
       end
       first = false
-      children[#children + 1] = run_header(run)
-      local node_ids = sorted_keys(run.nodes or {})
-      for _, node_id in ipairs(node_ids) do
-        for _, row in ipairs(node_rows(node_id, run.nodes[node_id], now_ms, narrow)) do
-          children[#children + 1] = row
+      if run.label == "MAG" then
+        -- MAG panel path: group actors by namespace, one row per group.
+        local groups = build_groups(run)
+        children[#children + 1] = mag_run_header(run, groups)
+        for _, g in ipairs(groups) do
+          children[#children + 1] = group_row(g, now_ms)
+        end
+      else
+        children[#children + 1] = run_header(run)
+        local node_ids = sorted_keys(run.nodes or {})
+        for _, node_id in ipairs(node_ids) do
+          for _, row in ipairs(node_rows(node_id, run.nodes[node_id], now_ms, narrow)) do
+            children[#children + 1] = row
+          end
         end
       end
     end
@@ -471,6 +597,7 @@ function M.mag_run_started(state, run_id, run_name, now_ms)
       run_id = run_id, run_name = run_name, label = "MAG",
       total_nodes = 0, started_at_ms = now_ms, nodes = {},
       completed_at_ms = nil, status = nil, rejected = 0, noops = 0,
+      actor_seq = 0,
     }
   end)
 end
@@ -481,13 +608,17 @@ function M.actor_spawned(state, run_id, actor_id, factory, now_ms)
     if prev.nodes and prev.nodes[actor_id] then return prev end
     local nodes = {}
     for k, v in pairs(prev.nodes or {}) do nodes[k] = v end
+    local seq = (prev.actor_seq or 0) + 1
     nodes[actor_id] = {
       reasoner = factory or "",
       status = "pending",
       started_at_ms = now_ms,
       finished_at_ms = nil,
+      -- First-appearance order for namespace grouping (stable across the
+      -- unordered `nodes` map).
+      seq = seq,
     }
-    return shallow_merge(prev, { nodes = nodes })
+    return shallow_merge(prev, { nodes = nodes, actor_seq = seq })
   end)
 end
 
@@ -499,11 +630,18 @@ function M.actor_ready(state, run_id, actor_id, now_ms)
     -- A ready without a prior spawn observation (out-of-order tail) still
     -- surfaces as a running node rather than being dropped.
     local node = nodes[actor_id] or { reasoner = "", started_at_ms = now_ms }
+    local actor_seq = prev.actor_seq or 0
+    local seq = node.seq
+    if seq == nil then
+      actor_seq = actor_seq + 1
+      seq = actor_seq
+    end
     nodes[actor_id] = shallow_merge(node, {
       status = "running",
       started_at_ms = node.started_at_ms or now_ms,
+      seq = seq,
     })
-    return shallow_merge(prev, { nodes = nodes })
+    return shallow_merge(prev, { nodes = nodes, actor_seq = actor_seq })
   end)
 end
 

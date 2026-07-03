@@ -780,6 +780,8 @@ fn graph_node_dispatched_then_result_updates_status_glyph() {
 // MAG kernel parity: the `mag.*` lifecycle stream drives the same run
 // panel reasoner-graph `graph.*` events do. Only `mag.run_started` carries
 // the run id; actor events are keyed to the in-flight run by the surface.
+// The MAG panel groups actors by top-level namespace segment — an agent's
+// whole subtree collapses to a single group row.
 #[test]
 fn mag_run_lifecycle_renders_in_dag_panel() {
     let mut engine = Engine::new(120, 24).expect("engine");
@@ -795,10 +797,15 @@ fn mag_run_lifecycle_renders_in_dag_panel() {
         }),
     );
     // Actor events carry no run_id — the surface attaches them to the
-    // single in-flight kernel run stamped by mag.run_started.
+    // single in-flight kernel run stamped by mag.run_started. Two actors
+    // in the same namespace collapse into one `explorer` group row.
     dispatch_event(
         &mut engine,
-        json!({ "kind": "mag.actor_spawned", "id": "worker", "factory": "llm" }),
+        json!({ "kind": "mag.actor_spawned", "id": "explorer.entry", "factory": "llm" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_spawned", "id": "explorer.loop-counter", "factory": "llm" }),
     );
     let out = render_str(&mut engine);
     assert!(
@@ -806,22 +813,30 @@ fn mag_run_lifecycle_renders_in_dag_panel() {
         "mag run header should show the run name: {out:?}"
     );
     assert!(
-        out.contains("worker"),
-        "spawned actor row missing from panel: {out:?}"
+        out.contains("explorer"),
+        "explorer group row missing from panel: {out:?}"
+    );
+    assert!(
+        !out.contains("explorer.entry"),
+        "group row must collapse the subtree, not expose member ids: {out:?}"
     );
     assert!(
         out.contains('○'),
-        "pending glyph (○) missing for a spawned actor: {out:?}"
+        "pending glyph (○) missing for a pending group: {out:?}"
+    );
+    assert!(
+        out.contains("(0/1)"),
+        "header should count one pending group: {out:?}"
     );
 
     dispatch_event(
         &mut engine,
-        json!({ "kind": "mag.actor_ready", "id": "worker" }),
+        json!({ "kind": "mag.actor_ready", "id": "explorer.entry" }),
     );
     let out = render_str(&mut engine);
     assert!(
         out.contains('●'),
-        "running glyph (●) missing after actor_ready: {out:?}"
+        "running glyph (●) missing once a group member is ready: {out:?}"
     );
 
     dispatch_event(
@@ -835,12 +850,13 @@ fn mag_run_lifecycle_renders_in_dag_panel() {
     );
     assert!(
         out.contains("(1/1)"),
-        "counter should read 1/1 after run completes: {out:?}"
+        "counter should read 1/1 (groups) after run completes: {out:?}"
     );
 }
 
 // Richer-than-parity: a killed actor renders with its own glyph, distinct
-// from a failed/errored node (reasoner-graph never had this state).
+// from a failed/errored node (reasoner-graph never had this state). Under
+// grouping, killing the group's members marks the group row ⊗.
 #[test]
 fn mag_killed_actor_renders_distinct_glyph() {
     let mut engine = Engine::new(120, 24).expect("engine");
@@ -853,24 +869,119 @@ fn mag_killed_actor_renders_distinct_glyph() {
     );
     dispatch_event(
         &mut engine,
-        json!({ "kind": "mag.actor_spawned", "id": "doomed", "factory": "llm" }),
+        json!({ "kind": "mag.actor_spawned", "id": "writer.draft", "factory": "llm" }),
     );
     dispatch_event(
         &mut engine,
-        json!({ "kind": "mag.actor_ready", "id": "doomed" }),
+        json!({ "kind": "mag.actor_ready", "id": "writer.draft" }),
     );
     dispatch_event(
         &mut engine,
-        json!({ "kind": "mag.actor_killed", "id": "doomed" }),
+        json!({ "kind": "mag.actor_killed", "id": "writer.draft" }),
     );
     let out = render_str(&mut engine);
     assert!(
         out.contains('⊗'),
-        "killed glyph (⊗) missing for a killed actor: {out:?}"
+        "killed glyph (⊗) missing for a killed group: {out:?}"
     );
     assert!(
-        out.contains("doomed"),
-        "killed actor row missing from panel: {out:?}"
+        out.contains("writer"),
+        "killed group row missing from panel: {out:?}"
+    );
+    assert!(
+        !out.contains("writer.draft"),
+        "group row must not expose member ids: {out:?}"
+    );
+}
+
+// Grouping across multiple agents: a two-agent run (explorer.* + writer.*)
+// plus a standalone `sink` actor collapses to exactly three group rows.
+// Killing the whole writer subtree marks only the writer group ⊗; the
+// explorer group keeps running.
+#[test]
+fn mag_two_agent_run_groups_by_namespace() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Sum of the four group-status glyphs == one per rendered group row.
+    let glyphs = |s: &str| {
+        s.matches('○').count()
+            + s.matches('●').count()
+            + s.matches('✓').count()
+            + s.matches('⊗').count()
+    };
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "mag-multi-1", "run_name": "multi" }),
+    );
+    for id in [
+        "explorer.entry",
+        "explorer.exhaust",
+        "writer.plan",
+        "writer.draft",
+        "sink",
+    ] {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "mag.actor_spawned", "id": id, "factory": "llm" }),
+        );
+    }
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("explorer") && out.contains("writer") && out.contains("sink"),
+        "all three group rows should be present: {out:?}"
+    );
+    assert!(
+        !out.contains("explorer.entry") && !out.contains("writer.plan"),
+        "group rows must collapse subtrees, not expose member ids: {out:?}"
+    );
+    assert_eq!(
+        glyphs(&out),
+        3,
+        "five actors across three namespaces should render exactly 3 group rows: {out:?}"
+    );
+    assert!(
+        out.contains("(0/3)"),
+        "header should count three groups: {out:?}"
+    );
+
+    // Bring one member of each agent live.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_ready", "id": "explorer.entry" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_ready", "id": "writer.plan" }),
+    );
+    // Kill the entire writer subtree.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_killed", "id": "writer.plan" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_killed", "id": "writer.draft" }),
+    );
+    let out = render_str(&mut engine);
+    assert_eq!(
+        out.matches('⊗').count(),
+        1,
+        "only the writer group should be marked killed: {out:?}"
+    );
+    // Header still counts three groups (writer now terminal). The frame is
+    // an incremental line-diff, so sink's unchanged pending row isn't
+    // re-emitted here — the header total, always repainted, is the reliable
+    // group-count signal.
+    assert!(
+        out.contains("(1/3)"),
+        "header should still count three groups with writer completed: {out:?}"
+    );
+    assert!(
+        out.contains('●'),
+        "explorer group should still be running: {out:?}"
     );
 }
 
