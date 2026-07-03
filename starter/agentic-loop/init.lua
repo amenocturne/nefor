@@ -1067,6 +1067,19 @@ end
 -- reasoners. These live on the actor so the wrapper layer stays
 -- stateless.
 function M.queue_sub_graph(args, gate_inner_id) return queue_sub_graph(args, gate_inner_id) end
+
+-- Relay a completed run to the model as a fresh orchestrator turn. This is the
+-- SAME mechanism sub-graph completions use (close_sub_graph): the completion is
+-- formatted into a user-role message (format_deferred) and submitted as a new
+-- orchestrator run once the lead is idle (deferred_queue + flush_deferred).
+-- Callers that drive execution OUTSIDE agentic-loop's sub-graph queue — the mag
+-- actor-kernel path — use this to inject their own completion turn with parity.
+-- `completion` shape: { run_id, status = "success"|"failed", output|error }.
+function M.relay_run_completion(completion)
+  if type(completion) ~= "table" then return end
+  state.deferred_queue[#state.deferred_queue + 1] = { text = format_deferred(completion) }
+  flush_deferred()
+end
 function M.track_tool_executor(run_id, run_name, node_id, firing_id, calls, tool_ids)
   return track_tool_executor(run_id, run_name, node_id, firing_id, calls, tool_ids)
 end

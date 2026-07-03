@@ -108,10 +108,19 @@ local state = {
   active_plan = nil,
   gate_mode = "safe",
 
-  -- Factory names from the kernel registry, snapshotted from `mag.loaded`
-  -- replies. The source of truth for valid reasoner/factory types on the
-  -- kernel execute path (see known_reasoner).
+  -- Factory names from the kernel registry, snapshotted from `mag.hello` (at
+  -- plugin startup) and refreshed by every `mag.loaded` reply. The single
+  -- source of truth for valid reasoner/factory types on both execute paths
+  -- (see validate_reasoners). Deleting the old static KNOWN_REASONERS allowlist
+  -- ([[task-nefor-mag-cutover-reasoner-graph]]).
   kernel_factories = {},
+
+  -- Kernel-path executes awaiting their `mag.load` reply, keyed by the load
+  -- request id. The synchronous handshake: `mag.load` is sent, the reply is
+  -- awaited, factory validation runs against the reply's registry, then
+  -- `mag.execute` is sent (resume_pending_execute). One entry per in-flight
+  -- handshake; cleared when the load reply resolves it.
+  pending_kernel_execute = {},
 }
 
 local SOURCE_NAME = "lead-workflow"
@@ -134,22 +143,6 @@ local function mag_execute_on_kernel()
   local ok, cfg = pcall(require, "config")
   local active = ok and type(cfg) == "table" and cfg.active or nil
   return type(active) == "table" and active.mag_execute_kernel == true
-end
-
--- The kernel's factory registry is the source-of-truth for valid reasoner /
--- factory types. It arrives on `mag.loaded` (the `factories` array) and is
--- cached here; `known_reasoner` validates against it when present, falling back
--- to the static allowlist until the kernel path is the default (at which point
--- the allowlist is deleted — [[task-nefor-mag-cutover-reasoner-graph]]).
--- FLAGGED: the cached set is only populated once a `mag.load` reply has been
--- seen; the pre-execute validation below still consults the allowlist so the
--- default-off reasoner-graph path keeps its guarantees.
-local function known_reasoner(name)
-  local set = state.kernel_factories
-  if type(set) == "table" and next(set) ~= nil then
-    return set[name] == true
-  end
-  return nil -- no registry snapshot yet; caller uses the allowlist fallback
 end
 
 local function profile_config(name)
@@ -179,6 +172,40 @@ local function emit_tool_result_err(firing_id, err)
     id    = firing_id,
     error = tostring(err),
   })
+end
+
+-- The kernel's factory registry is the single source-of-truth for valid
+-- reasoner/factory types on BOTH execute paths. It arrives on `mag.hello` (at
+-- plugin startup) and every `mag.loaded` reply (the `factories` array) and is
+-- cached in state.kernel_factories. `validate_reasoners` rejects any node whose
+-- reasoner is not a registered factory. The old hand-synced KNOWN_REASONERS
+-- allowlist is deleted ([[task-nefor-mag-cutover-reasoner-graph]]).
+--
+-- When no snapshot exists yet (mag plugin not up, or an older plugin that does
+-- not advertise factories), validation is skipped and the kernel's own
+-- spawn-time "unknown factory" failure is the backstop — a graceful degrade,
+-- never a false rejection.
+local function sorted_keys(set)
+  local keys = {}
+  for k in pairs(set) do keys[#keys + 1] = k end
+  table.sort(keys)
+  return keys
+end
+
+local function validate_reasoners(nodes, firing_id)
+  local set = state.kernel_factories
+  if type(set) ~= "table" or next(set) == nil then
+    return true -- no registry snapshot yet; runtime spawn is the backstop
+  end
+  for _, node in ipairs(nodes or {}) do
+    if set[node.reasoner] ~= true then
+      emit_tool_result_err(firing_id,
+        "mag execute: node '" .. tostring(node.id) .. "' uses unknown reasoner type '" ..
+        tostring(node.reasoner) .. "'. Known types: " .. table.concat(sorted_keys(set), ", ") .. ".")
+      return false
+    end
+  end
+  return true
 end
 
 local function sh_quote(value)
@@ -783,8 +810,9 @@ local function mark_firing_result(body)
   end
 end
 
--- Snapshot the kernel registry's factory names from a mag.loaded reply. This
--- becomes the source of truth for reasoner/factory validation (known_reasoner).
+-- Snapshot the kernel registry's factory names from a mag.hello / mag.loaded
+-- body. This is the source of truth for reasoner/factory validation
+-- (validate_reasoners).
 local function capture_kernel_factories(body)
   if type(body.factories) ~= "table" then return end
   local set = {}
@@ -794,9 +822,51 @@ local function capture_kernel_factories(body)
   state.kernel_factories = set
 end
 
+-- The lead reads paths; the model needs content. Read the sink's output file so
+-- the run-completion turn carries the actual result, not just a path. Best
+-- effort — an unreadable path yields nil and the turn still relays the path.
+local function read_output_file(path)
+  if type(path) ~= "string" or path == "" then return nil end
+  local fh = io.open(path, "r")
+  if not fh then return nil end
+  local content = fh:read("*a")
+  fh:close()
+  return content
+end
+
+-- Relay a kernel run's completion to the model as a fresh orchestrator turn,
+-- via the SAME mechanism agentic-loop's sub-graph completions use
+-- (deferred-queue + flush → new user-role turn). Parity: the reasoner-graph
+-- path gets this relay from agentic-loop's close_sub_graph; the kernel path
+-- drives execution outside that queue, so the lead injects the completion turn
+-- itself. `format_deferred` frames it; the output carries the sink PATH plus the
+-- content read from it.
+local function relay_kernel_completion(run_id, ok, output_path, content, err)
+  local al = require("agentic-loop")
+  if type(al.relay_run_completion) ~= "function" then return end
+  if ok then
+    local parts = {}
+    if type(output_path) == "string" and #output_path > 0 then
+      parts[#parts + 1] = "output_path: " .. output_path
+    end
+    parts[#parts + 1] = tostring(content or "")
+    al.relay_run_completion({
+      run_id = run_id,
+      status = "success",
+      output = table.concat(parts, "\n\n"),
+    })
+  else
+    al.relay_run_completion({
+      run_id = run_id,
+      status = "failed",
+      error  = err,
+    })
+  end
+end
+
 -- Close a kernel run on its terminal mag.run_result. Updates run/graph-status
--- state with the sink's output PATH (control-plane semantics — path, not data).
--- FLAGGED: does not yet relay the completion to the model as a fresh turn.
+-- state with the sink's output PATH (control-plane semantics — path, not data),
+-- then relays the completion to the model as a fresh turn (item 2 parity).
 local function handle_mag_run_result(body)
   local run_id = body.run_id or body.in_reply_to
   if type(run_id) ~= "string" then return end
@@ -804,6 +874,7 @@ local function handle_mag_run_result(body)
   if not run then return end
   if body.status == "failed" then
     finish_run(run_id, "failed", nil, body.error or "mag run failed")
+    relay_kernel_completion(run_id, false, nil, nil, body.error or "mag run failed")
     return
   end
   local results = {}
@@ -811,6 +882,8 @@ local function handle_mag_run_result(body)
     results[run.terminal] = { output = { output_path = body.output_path } }
   end
   finish_run(run_id, "completed", results, nil)
+  relay_kernel_completion(run_id, true, body.output_path,
+    read_output_file(body.output_path), nil)
 end
 
 terminate_graph = function(firing_id, args)
@@ -1031,43 +1104,79 @@ local function mag_env_handler(firing_id, _args)
   })
 end
 
--- Kernel execute path (behind the mag_execute_on_kernel switch): load the
--- compiled program into the `mag` plugin and run it on the actor kernel, rather
--- than submitting to reasoner-graph. The plugin serialises inbound events, so
--- emitting mag.load then mag.execute back-to-back is safe — mag.execute runs the
--- just-loaded resident program. Lifecycle events (mag.run_started, actor
--- spawn/ready, mag.run_complete) stream on the bus; the terminal mag.run_result
--- (carrying the sink's output PATH) closes the run in receive_msg.
+-- Kernel execute path (behind the mag_execute_on_kernel switch): a synchronous
+-- load → validate → execute handshake. `mag.load` is sent, its reply is awaited
+-- (resume_pending_execute, triggered by the mag.loaded event), factory
+-- validation runs against the reply's registry, and only then is `mag.execute`
+-- sent. The kernel then loads the compiled program and runs it on the actor
+-- kernel rather than submitting to reasoner-graph. Lifecycle events
+-- (mag.run_started, actor spawn/ready, mag.run_complete) stream on the bus; the
+-- terminal mag.run_result (carrying the sink's output PATH) closes the run and
+-- relays a fresh model turn in receive_msg.
 --
--- FLAGGED — remaining work for cutover: (1) per-node profile params resolved
--- lead-side (fast/standard/deep/max → llm params, above) are not yet threaded
--- into the kernel program; the plugin loads the .mag directly via nefor-mag, so
--- profile overrides don't reach the actors. (2) mag.run_result updates run
--- state / graph-status but does not yet relay the completion to the model as a
--- fresh turn (the reasoner-graph path gets that from agentic-loop).
-local function mag_execute_kernel(firing_id, args, ws, graph_spec, sink_id, graph_name)
+-- Profile params resolved lead-side (fast/standard/deep/max → provider/model/
+-- reasoning_effort) are threaded to the actors via `params_overlay` on
+-- mag.execute — a per-actor-id param patch the kernel merges before spawn (actor
+-- params are kernel-opaque, so an overlay is legitimate control-plane input,
+-- ir.md). `overlay` is built lead-side in the profile-resolution loop.
+local function mag_execute_kernel(firing_id, args, ws, graph_spec, sink_id, graph_name, overlay)
   local session_id = sessions.current_id()
   local run_id = "mag-" .. tostring(graph_name) .. "-" .. tostring(now_ms())
+  local load_id = run_id .. "-load"
 
-  emit_as(SOURCE_NAME, "mag", {
-    kind       = "mag.load",
-    id         = run_id .. "-load",
-    source_dir = ws,
-    entry      = args.file,
-  })
-  emit_as(SOURCE_NAME, "mag", {
-    kind       = "mag.execute",
-    id         = run_id,
+  -- Stash the execute context; resume_pending_execute completes it when the
+  -- load reply arrives (keyed by the load request id, echoed as in_reply_to).
+  state.pending_kernel_execute[load_id] = {
+    firing_id  = firing_id,
     run_id     = run_id,
     run_name   = graph_name,
     session_id = session_id,
+    graph_spec = graph_spec,
+    sink_id    = sink_id,
+    nodes      = graph_spec.nodes,
+    overlay    = overlay,
+  }
+
+  emit_as(SOURCE_NAME, "mag", {
+    kind       = "mag.load",
+    id         = load_id,
+    source_dir = ws,
+    entry      = args.file,
   })
+end
 
-  register_active_run(run_id, graph_spec, sink_id, firing_id)
+-- Resume a kernel execute once its `mag.load` reply arrives. The reply's
+-- registry has already refreshed state.kernel_factories (capture_kernel_factories
+-- runs first); validate every node's factory against it, then send mag.execute
+-- with the resolved session_id, run_id, and params overlay. Validation failure
+-- acks the firing with an error and drops the pending execute — nothing runs.
+local function resume_pending_execute(body)
+  local load_id = body.in_reply_to
+  local pending = type(load_id) == "string" and state.pending_kernel_execute[load_id] or nil
+  if not pending then return end
+  state.pending_kernel_execute[load_id] = nil
 
-  emit_tool_result_ok(firing_id, {
+  if not validate_reasoners(pending.nodes, pending.firing_id) then
+    return
+  end
+
+  local exec = {
+    kind       = "mag.execute",
+    id         = pending.run_id,
+    run_id     = pending.run_id,
+    run_name   = pending.run_name,
+    session_id = pending.session_id,
+  }
+  if type(pending.overlay) == "table" and next(pending.overlay) ~= nil then
+    exec.params_overlay = pending.overlay
+  end
+  emit_as(SOURCE_NAME, "mag", exec)
+
+  register_active_run(pending.run_id, pending.graph_spec, pending.sink_id, pending.firing_id)
+
+  emit_tool_result_ok(pending.firing_id, {
     status  = "executing",
-    run_id  = run_id,
+    run_id  = pending.run_id,
     engine  = "mag-kernel",
     message = "Graph submitted to the MAG actor kernel. Results arrive automatically when the run " ..
       "completes. STOP here — do not call any more tools until results arrive.",
@@ -1174,37 +1283,30 @@ local function mag_handler(firing_id, args)
     end
   end
 
-  -- Validate that every node's reasoner type is registered. Catches
-  -- typos and missing plugins at compile time with a clear message
-  -- instead of a runtime "reasoner not connected" abort.
-  -- Validated against the reasoner registry in nefor's reasoner-graph plugin.
-  -- Keep in sync: add new reasoner names here when registering them in
-  -- agents/nefor/config/reasoners/ or plugins/reasoner-graph/.
-  -- Fallback allowlist for the reasoner-graph path. On the kernel path the
-  -- registry snapshot from mag.loaded (known_reasoner) supersedes this; the
-  -- allowlist is deleted at cutover once the kernel path is the default.
-  local KNOWN_REASONERS = {
-    agent = true, llm = true, sink = true, terminal = true, shell = true,
-    ["provider-wrapper"] = true, responder = true, ["tool-executor"] = true,
-    adapter = true, accumulate = true, retry = true, bash_command = true,
-    run = true, runCommand = true, ["loop-counter"] = true, human = true,
-  }
-  for _, node in ipairs(ir.nodes or {}) do
-    -- Registry snapshot wins when present; otherwise the static allowlist.
-    local ok = known_reasoner(node.reasoner)
-    if ok == nil then ok = KNOWN_REASONERS[node.reasoner] == true end
-    if not ok then
-      emit_tool_result_err(firing_id,
-        "mag execute: node '" .. tostring(node.id) .. "' uses unknown reasoner type '" ..
-        tostring(node.reasoner) .. "'. Known types: agent, llm, sink, shell, bash_command, loop-counter, human.")
-      return
-    end
+  -- Reasoner/factory validation catches typos + missing factories before
+  -- submission, against the kernel registry (validate_reasoners). On the kernel
+  -- path this runs post-load against the load reply's registry
+  -- (resume_pending_execute), so it is skipped here. On the legacy
+  -- reasoner-graph path, validate now against the startup registry snapshot
+  -- (from mag.hello); when no snapshot exists it degrades to the runtime
+  -- spawn-time check.
+  local on_kernel = mag_execute_on_kernel()
+  if not on_kernel then
+    if not validate_reasoners(ir.nodes, firing_id) then return end
   end
 
   -- Resolve per-node profiles to reasoning_effort before submission.
   -- Agent/llm nodes with :profile get provider/model/reasoning_effort
   -- from orchestration_profiles. Nodes without a profile are rejected
   -- so the lead always makes an explicit reasoning-depth decision.
+  --
+  -- The resolution mutates node.args (carried into the legacy reasoner-graph
+  -- program) AND records a per-node params overlay keyed by node id, which the
+  -- kernel path threads onto mag.execute (params_overlay) — the kernel loads
+  -- the .mag directly and never sees the mutated node.args, so the overlay is
+  -- how profile params reach its actors. node.id == the actor id (the loader
+  -- keeps ids; only the sink is renamed, and sinks are never profiled).
+  local overlay = {}
   local PROFILED_REASONERS = { agent = true, llm = true }
   for _, node in ipairs(ir.nodes or {}) do
     if PROFILED_REASONERS[node.reasoner] and type(node.args) == "table" then
@@ -1226,15 +1328,20 @@ local function mag_handler(firing_id, args)
         end
         local resolved = profile_config(profile_name)
         if type(resolved) == "table" then
+          local patch = {}
           if type(resolved.reasoning_effort) == "string" then
             node.args.reasoning_effort = resolved.reasoning_effort
+            patch.reasoning_effort = resolved.reasoning_effort
           end
           if type(resolved.provider) == "string" and #resolved.provider > 0 then
             node.args.provider = resolved.provider
+            patch.provider = resolved.provider
           end
           if type(resolved.model) == "string" and #resolved.model > 0 then
             node.args.model = resolved.model
+            patch.model = resolved.model
           end
+          if next(patch) ~= nil then overlay[node.id] = patch end
         end
         node.args.profile = nil
       elseif not has_raw_effort then
@@ -1321,8 +1428,8 @@ local function mag_handler(firing_id, args)
   local graph_name = args.file:gsub("%.mag$", ""):gsub("/", "-"):sub(1, 20)
 
   -- Per-execute switch: run on the MAG actor kernel instead of reasoner-graph.
-  if mag_execute_on_kernel() then
-    mag_execute_kernel(firing_id, args, ws, graph_spec, sink_id, graph_name)
+  if on_kernel then
+    mag_execute_kernel(firing_id, args, ws, graph_spec, sink_id, graph_name, overlay)
     return
   end
 
@@ -1439,8 +1546,17 @@ local function receive_msg(entry)
   end
 
   -- MAG kernel path (behind the mag_execute_on_kernel switch).
+  -- mag.hello advertises the factory registry at plugin startup — the startup
+  -- validation snapshot for both paths.
+  if kind == "mag.hello" then
+    capture_kernel_factories(body)
+    return
+  end
+  -- mag.loaded is the load-reply half of the synchronous handshake: refresh the
+  -- registry, then resume the awaiting execute (validate → mag.execute).
   if kind == "mag.loaded" then
     capture_kernel_factories(body)
+    resume_pending_execute(body)
     return
   end
   if kind == "mag.run_result" then
@@ -1529,6 +1645,7 @@ return {
       state.active_plan = nil
       state.gate_mode = "safe"
       state.kernel_factories = {}
+      state.pending_kernel_execute = {}
       advertised = false
     end,
   },

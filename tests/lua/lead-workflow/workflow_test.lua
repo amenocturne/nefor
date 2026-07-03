@@ -285,6 +285,8 @@ do
 
   execute_mag("firing-kernel-exec", "kernel-run.mag")
 
+  -- Synchronous handshake: mag.load is sent first; mag.execute is withheld
+  -- until the mag.loaded reply validates against the registry.
   local calls = decode_calls()
   local load = find_call(calls, function(c)
     return c.body.kind == "mag.load" and c.target == "mag"
@@ -293,10 +295,31 @@ do
     "kernel switch emits mag.load to the mag plugin; got " .. json.encode(_test.calls()))
   assert_eq(load.body.entry, "kernel-run.mag", "mag.load names the .mag entry file")
 
+  local premature = find_call(calls, function(c) return c.body.kind == "mag.execute" end)
+  assert_eq(premature, nil,
+    "mag.execute must NOT be sent before mag.loaded (synchronous handshake)")
+  local pre_reply = find_call(calls, function(c)
+    return c.body.kind == "tool.result" and c.body.id == "firing-kernel-exec"
+  end)
+  assert_eq(pre_reply, nil, "no executing reply until the load handshake resolves")
+
+  -- The load reply carries the registry (bash_command + sink cover READ_ONLY_MAG);
+  -- it validates and releases mag.execute.
+  _test.calls_clear()
+  feed("mag", {
+    kind        = "mag.loaded",
+    in_reply_to = load.body.id,
+    factories   = { "bash_command", "sink" },
+  })
+  calls = decode_calls()
+
   local exec = find_call(calls, function(c)
     return c.body.kind == "mag.execute" and c.target == "mag"
   end)
-  assert_true(exec ~= nil, "kernel switch emits mag.execute to the mag plugin")
+  assert_true(exec ~= nil,
+    "mag.loaded releases mag.execute; got " .. json.encode(_test.calls()))
+  assert_true(type(exec.body.session_id) == "string" and #exec.body.session_id > 0,
+    "lead injects session_id on mag.execute")
 
   -- The reasoner-graph path must NOT run on the kernel switch.
   local leaked = find_call(calls, function(c)
@@ -314,15 +337,77 @@ do
   assert_true(type(lw._internals.state.active_runs[reply.body.output.run_id]) == "table",
     "kernel run tracked in active_runs")
 
-  -- Terminal mag.run_result closes the run with the sink output PATH.
+  -- Terminal mag.run_result closes the run AND relays a fresh model turn
+  -- carrying the sink output content read from the path (item 2 parity).
+  local out_path = os.tmpname()
+  local ofh = io.open(out_path, "w")
+  ofh:write("SINK OUTPUT CONTENT")
+  ofh:close()
+  _test.calls_clear()
   feed("mag", {
     kind        = "mag.run_result",
     run_id      = reply.body.output.run_id,
     status      = "completed",
-    output_path = "/tmp/nefor/sessions/s/mag/runs/kernel-run/sink.output",
+    output_path = out_path,
   })
   assert_eq(lw._internals.state.active_runs[reply.body.output.run_id], nil,
     "run archived after mag.run_result closes it")
+
+  -- The completion is relayed as a fresh orchestrator turn (parity with the
+  -- reasoner-graph completion path — a spawn_graph tool.invoke re-prompt).
+  local turn = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
+        and c.target == "reasoner-graph"
+  end)
+  assert_true(turn ~= nil,
+    "mag.run_result relays a fresh orchestrator turn; got " .. json.encode(_test.calls()))
+  local prompt = turn.body.args and turn.body.args.graph
+    and turn.body.args.graph.nodes[1].args.prompt
+  assert_true(type(prompt) == "string"
+              and prompt:find("SINK OUTPUT CONTENT", 1, true) ~= nil,
+    "the relayed turn carries the sink output content read from the path")
+  assert_true(prompt:find(out_path, 1, true) ~= nil,
+    "the relayed turn carries the sink output path")
+
+  os.remove(out_path)
+  config.active.mag_execute_kernel = prev
+end
+
+-- Kernel handshake rejects an unknown factory against the load-reply registry
+-- BEFORE mag.execute is sent.
+do
+  fresh()
+  write_mag_file("firing-kernel-badfactory-write", "kernel-bad.mag", READ_ONLY_MAG)
+  _test.calls_clear()
+  local config = require("config")
+  local prev = config.active.mag_execute_kernel
+  config.active.mag_execute_kernel = true
+
+  execute_mag("firing-kernel-badfactory", "kernel-bad.mag")
+  local load = find_call(decode_calls(), function(c)
+    return c.body.kind == "mag.load" and c.target == "mag"
+  end)
+  assert_true(load ~= nil, "kernel switch emits mag.load")
+
+  _test.calls_clear()
+  -- Registry omits bash_command → validation must reject before execute.
+  feed("mag", {
+    kind        = "mag.loaded",
+    in_reply_to = load.body.id,
+    factories   = { "sink", "llm" },
+  })
+  local calls = decode_calls()
+  local exec = find_call(calls, function(c) return c.body.kind == "mag.execute" end)
+  assert_eq(exec, nil, "unknown factory blocks mag.execute")
+  local err = find_call(calls, function(c)
+    return c.body.kind == "tool.result"
+       and c.body.id == "firing-kernel-badfactory"
+       and type(c.body.error) == "string"
+  end)
+  assert_true(err ~= nil and err.body.error:find("unknown reasoner type", 1, true) ~= nil,
+    "validation rejects the unknown factory with a clear error; got " .. json.encode(_test.calls()))
+  assert_true(err.body.error:find("bash_command", 1, true) ~= nil,
+    "rejection names the offending reasoner")
 
   config.active.mag_execute_kernel = prev
 end

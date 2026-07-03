@@ -221,3 +221,172 @@ async fn executes_synchronous_sink_program_and_streams_lifecycle_events() {
     let _ = timeout(Duration::from_secs(10), child.wait()).await;
     std::fs::remove_dir_all(&data_dir).ok();
 }
+
+/// Complete the NCP ready handshake for a freshly spawned mag plugin.
+async fn handshake<R: AsyncBufReadExt + Unpin>(reader: &mut R, stdin: &mut ChildStdin) {
+    let ready = read_outgoing(reader, "system ready").await;
+    assert!(matches!(ready.body, Body::System(SystemBody::Ready { .. })));
+    write_env(
+        stdin,
+        Envelope::system(
+            PluginName::engine(),
+            Timestamp::now(),
+            SystemBody::ReadyOk {
+                engine_version: "test".into(),
+            },
+        ),
+    )
+    .await;
+}
+
+/// A `mag.execute` carrying a `params_overlay` runs to completion: the overlay
+/// is parsed and applied before spawn (unknown ids ignored, named ids patched)
+/// and never breaks the run. The precise merge semantics are unit-tested in
+/// `apply_params_overlay`; this asserts the wire surface end-to-end.
+#[tokio::test]
+async fn execute_accepts_and_applies_params_overlay() {
+    let data_dir = std::env::temp_dir().join(format!("mag-overlay-{}", std::process::id()));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+
+    let mut child = spawn_mag(&data_dir).await;
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let stderr = child.stderr.take().expect("stderr");
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            eprintln!("[mag stderr] {line}");
+        }
+    });
+
+    handshake(&mut reader, &mut stdin).await;
+
+    let mut execute = Map::new();
+    execute.insert("kind".into(), Value::String("mag.execute".into()));
+    execute.insert("id".into(), Value::String("exec-overlay".into()));
+    execute.insert("session_id".into(), Value::String("test-session".into()));
+    execute.insert("run_id".into(), Value::String("overlay-run".into()));
+    execute.insert("run_name".into(), Value::String("overlay-run".into()));
+    execute.insert(
+        "modification".into(),
+        json!({
+            "actors": [ { "id": "sink", "factory": "sink", "params": {}, "routes": {} } ],
+            "messages": [
+                { "to": "sink", "content": { "kind": "generic-provider.FinalAnswer", "text": "overlaid" } }
+            ],
+            "kills": [],
+            "rules": []
+        }),
+    );
+    // A patch for the sink plus a no-op patch for an id that isn't in the
+    // constellation — the unknown id must be ignored, not error.
+    execute.insert(
+        "params_overlay".into(),
+        json!({
+            "sink":    { "reasoning_effort": "high" },
+            "ghost":   { "model": "does-not-exist" }
+        }),
+    );
+    send_event(&mut stdin, execute).await;
+
+    let mut seen: Vec<String> = Vec::new();
+    let result = read_collecting(&mut reader, "mag.run_result", &mut seen).await;
+    let body = event_body(&result).expect("run_result body");
+    assert_eq!(
+        body.get("status").and_then(Value::as_str),
+        Some("completed"),
+        "overlay-carrying execute still runs to completion; saw {seen:?}"
+    );
+    assert_eq!(
+        body.get("in_reply_to").and_then(Value::as_str),
+        Some("exec-overlay")
+    );
+
+    write_env(
+        &mut stdin,
+        Envelope::system(
+            PluginName::engine(),
+            Timestamp::now(),
+            SystemBody::Shutdown {
+                reason: None,
+                grace_ms: None,
+            },
+        ),
+    )
+    .await;
+    drop(stdin);
+    let _ = timeout(Duration::from_secs(10), child.wait()).await;
+    std::fs::remove_dir_all(&data_dir).ok();
+}
+
+/// `mag.apply` outside a live run is rejected with the named guard error — the
+/// control plane's apply authority is scoped to an active session with an
+/// in-flight run (docs/ir.md, Kernel operations).
+#[tokio::test]
+async fn apply_without_live_run_is_rejected() {
+    let data_dir = std::env::temp_dir().join(format!("mag-apply-guard-{}", std::process::id()));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+
+    let mut child = spawn_mag(&data_dir).await;
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let stderr = child.stderr.take().expect("stderr");
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            eprintln!("[mag stderr] {line}");
+        }
+    });
+
+    handshake(&mut reader, &mut stdin).await;
+
+    // No mag.execute first → no live run. The apply must be rejected.
+    let mut apply = Map::new();
+    apply.insert("kind".into(), Value::String("mag.apply".into()));
+    apply.insert("id".into(), Value::String("apply-norun".into()));
+    apply.insert("source".into(), Value::String("test".into()));
+    apply.insert(
+        "modification".into(),
+        json!({ "actors": [], "messages": [], "kills": ["whatever"], "rules": [] }),
+    );
+    send_event(&mut stdin, apply).await;
+
+    let mut seen: Vec<String> = Vec::new();
+    let applied = read_collecting(&mut reader, "mag.applied", &mut seen).await;
+    let body = event_body(&applied).expect("applied body");
+    assert_eq!(
+        body.get("in_reply_to").and_then(Value::as_str),
+        Some("apply-norun")
+    );
+    assert_eq!(
+        body.get("ok").and_then(Value::as_bool),
+        Some(false),
+        "apply outside a live run is rejected"
+    );
+    let err = body
+        .get("error")
+        .and_then(Value::as_str)
+        .expect("rejection carries a named error");
+    assert!(
+        err.contains("no live run"),
+        "named guard error explains the policy; got {err:?}"
+    );
+
+    write_env(
+        &mut stdin,
+        Envelope::system(
+            PluginName::engine(),
+            Timestamp::now(),
+            SystemBody::Shutdown {
+                reason: None,
+                grace_ms: None,
+            },
+        ),
+    )
+    .await;
+    drop(stdin);
+    let _ = timeout(Duration::from_secs(10), child.wait()).await;
+    std::fs::remove_dir_all(&data_dir).ok();
+}

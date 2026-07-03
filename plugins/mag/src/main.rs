@@ -135,7 +135,16 @@ async fn run() -> Result<(), MagError> {
     tracing::info!(path = %kernel_path.display(), "loading mag kernel");
     let host = LuaHost::load_kernel(&kernel_path)?;
 
-    send_event(&out_tx, hello_body(host.kernel_name().as_deref())).await?;
+    // Advertise the registry's factory names on hello so the control plane has
+    // a validation snapshot from plugin startup — the source of truth for
+    // reasoner/factory types on both execute paths (replaces a hand-synced
+    // allowlist; docs/ir.md division-of-responsibility).
+    let factories = host.registry_names().unwrap_or_default();
+    send_event(
+        &out_tx,
+        hello_body(host.kernel_name().as_deref(), &factories),
+    )
+    .await?;
 
     run_dispatch_loop(&out_tx, &mut in_rx, &host).await?;
 
@@ -379,7 +388,7 @@ async fn handle_execute(
     host: &LuaHost,
     active: &mut Option<ActiveExecute>,
 ) -> Result<(), MagError> {
-    let modification: Value = match body.get("modification") {
+    let mut modification: Value = match body.get("modification") {
         Some(m @ Value::Object(_)) => m.clone(),
         Some(_) => {
             return send_event(
@@ -414,6 +423,16 @@ async fn handle_execute(
             }
         },
     };
+
+    // Apply the control plane's per-actor params overlay before spawn. Actor
+    // params are kernel-opaque data owned by the factory (docs/ir.md), so an
+    // overlay patched at apply time is legitimate control-plane input — it is
+    // how the lead threads resolved profile params (provider/model/reasoning)
+    // into the program without re-authoring the modification. Shallow per-actor
+    // top-level merge; unknown ids are ignored (a race artifact, not an error).
+    if let Some(overlay) = body.get("params_overlay").and_then(Value::as_object) {
+        apply_params_overlay(&mut modification, overlay);
+    }
 
     let run_id = body
         .get("run_id")
@@ -451,15 +470,65 @@ async fn handle_execute(
     Ok(())
 }
 
+/// Merge a per-actor params overlay into a modification's actors before spawn.
+/// The overlay is `{ actor_id: { param: value, ... }, ... }`. Each patch is a
+/// shallow top-level merge into the matching actor's `params` (created if
+/// absent, replaced if non-object). Actors not named in the overlay are
+/// untouched; overlay keys with no matching actor are ignored.
+fn apply_params_overlay(modification: &mut Value, overlay: &Map<String, Value>) {
+    let actors = match modification.get_mut("actors").and_then(Value::as_array_mut) {
+        Some(a) => a,
+        None => return,
+    };
+    for actor in actors.iter_mut() {
+        let obj = match actor.as_object_mut() {
+            Some(o) => o,
+            None => continue,
+        };
+        let id = match obj.get("id").and_then(Value::as_str) {
+            Some(id) => id.to_owned(),
+            None => continue,
+        };
+        let patch = match overlay.get(&id).and_then(Value::as_object) {
+            Some(p) => p,
+            None => continue,
+        };
+        let params = obj
+            .entry("params")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !params.is_object() {
+            *params = Value::Object(Map::new());
+        }
+        if let Some(pobj) = params.as_object_mut() {
+            for (k, v) in patch {
+                pobj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
+/// Named rejection for a `mag.apply` outside a live run. The control plane's
+/// apply authority (docs/ir.md, "Kernel operations": the plane reaches
+/// `actors`/`kills`/`messages` directly) is scoped to an active session with an
+/// in-flight run — there is no constellation to modify otherwise.
+const APPLY_NO_LIVE_RUN: &str =
+    "mag.apply rejected: no live run (control-plane apply requires an active \
+     session with an in-flight run — docs/ir.md, Kernel operations)";
+
 /// Apply one graph modification directly to the resident kernel — the control
 /// plane's mid-run kernel op (docs/ir.md, "Kernel operations"). The initial
 /// modification runs behind the ready barrier via `mag.execute`; this is the
 /// *later* path, with no barrier: a `{ kills = [...] }` modification kills an
 /// in-flight actor (the factory's abort envelope reaches the bus, correlations
 /// drop, the late reply voids), a `{ messages = [...] }` delivers a signal, a
-/// `{ actors = [...] }` spawns into the live constellation. Guarded: the
-/// modification must be an object. Lifecycle events the apply emits stream on
-/// the wire; a completion it triggers settles the run.
+/// `{ actors = [...] }` spawns into the live constellation.
+///
+/// Guard policy: an apply is accepted only while a run is live (`active`), and
+/// every accepted apply is logged with its `source`. Outside a live run the
+/// apply is rejected with [`APPLY_NO_LIVE_RUN`] — the control-plane authority
+/// ir.md grants the plane exists only *over a running constellation*, so a
+/// session-less apply has nothing to act on. Lifecycle events the apply emits
+/// stream on the wire; a completion it triggers settles the run.
 async fn handle_apply(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: &Map<String, Value>,
@@ -467,6 +536,18 @@ async fn handle_apply(
     host: &LuaHost,
     active: &mut Option<ActiveExecute>,
 ) -> Result<(), MagError> {
+    // Guard: reject applies with no live run before touching the kernel.
+    let run_id = match active.as_ref() {
+        Some(a) => a.run_id.clone(),
+        None => {
+            return send_event(
+                out_tx,
+                applied_body(in_reply_to, false, Some(APPLY_NO_LIVE_RUN)),
+            )
+            .await
+        }
+    };
+
     let modification = match body.get("modification") {
         Some(m @ Value::Object(_)) => m.clone(),
         _ => {
@@ -477,6 +558,14 @@ async fn handle_apply(
             .await
         }
     };
+
+    // Audit every accepted apply with its declared source (docs/ir.md: the
+    // modification log is the run — the plane's mid-run ops are part of it).
+    let source = body
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("<unspecified>");
+    tracing::info!(source = %source, run_id = %run_id, "mag.apply accepted");
 
     let state = host.apply(&modification)?;
     // Forward the lifecycle events + any abort/cancel envelopes the apply queued
@@ -566,13 +655,19 @@ async fn handle_eval(
 
 // ---- static body constructors ----------------------------------------------
 
-fn hello_body(kernel: Option<&str>) -> Map<String, Value> {
+fn hello_body(kernel: Option<&str>, factories: &[String]) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("kind".into(), Value::String(format!("{PLUGIN_NAME}.hello")));
     m.insert("version".into(), Value::String(PLUGIN_VERSION.into()));
     if let Some(k) = kernel {
         m.insert("kernel".into(), Value::String(k.to_owned()));
     }
+    // The kernel registry's factory names — the control plane's pre-execute
+    // validation source of truth, available from startup.
+    m.insert(
+        "factories".into(),
+        Value::Array(factories.iter().cloned().map(Value::String).collect()),
+    );
     m
 }
 
@@ -716,19 +811,29 @@ mod tests {
 
     #[test]
     fn hello_body_advertises_version_and_kernel() {
-        let b = hello_body(Some("mag-kernel"));
+        let b = hello_body(Some("mag-kernel"), &["sink".to_owned(), "llm".to_owned()]);
         assert_eq!(b.get("kind").and_then(Value::as_str), Some("mag.hello"));
         assert_eq!(
             b.get("version").and_then(Value::as_str),
             Some(PLUGIN_VERSION)
         );
         assert_eq!(b.get("kernel").and_then(Value::as_str), Some("mag-kernel"));
+        let factories = b
+            .get("factories")
+            .and_then(Value::as_array)
+            .expect("hello advertises factories");
+        assert!(factories.iter().any(|f| f.as_str() == Some("sink")));
     }
 
     #[test]
     fn hello_body_omits_kernel_when_absent() {
-        let b = hello_body(None);
+        let b = hello_body(None, &[]);
         assert!(b.get("kernel").is_none());
+        // Factories always present, even when empty.
+        assert_eq!(
+            b.get("factories").and_then(Value::as_array).map(Vec::len),
+            Some(0)
+        );
     }
 
     #[test]
@@ -789,6 +894,45 @@ mod tests {
         let bad = applied_body(None, false, Some("rejected"));
         assert_eq!(bad.get("ok").and_then(Value::as_bool), Some(false));
         assert_eq!(bad.get("error").and_then(Value::as_str), Some("rejected"));
+    }
+
+    #[test]
+    fn params_overlay_patches_named_actors_only() {
+        let mut modification = serde_json::json!({
+            "actors": [
+                { "id": "build", "factory": "llm", "params": { "prompt": "x" }, "routes": {} },
+                { "id": "sink",  "factory": "sink", "params": {}, "routes": {} }
+            ]
+        });
+        let overlay = serde_json::json!({
+            "build": { "provider": "chatgpt", "model": "gpt-5.5", "reasoning_effort": "high" }
+        });
+        apply_params_overlay(&mut modification, overlay.as_object().unwrap());
+
+        let actors = modification["actors"].as_array().unwrap();
+        let build = &actors[0]["params"];
+        assert_eq!(build["prompt"].as_str(), Some("x"), "existing param kept");
+        assert_eq!(
+            build["provider"].as_str(),
+            Some("chatgpt"),
+            "overlay merged"
+        );
+        assert_eq!(build["reasoning_effort"].as_str(), Some("high"));
+        // The unnamed actor is untouched.
+        assert!(actors[1]["params"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn params_overlay_creates_params_when_missing_or_non_object() {
+        let mut modification = serde_json::json!({
+            "actors": [ { "id": "a", "factory": "llm" } ]
+        });
+        let overlay = serde_json::json!({ "a": { "model": "m" } });
+        apply_params_overlay(&mut modification, overlay.as_object().unwrap());
+        assert_eq!(
+            modification["actors"][0]["params"]["model"].as_str(),
+            Some("m")
+        );
     }
 
     #[test]
