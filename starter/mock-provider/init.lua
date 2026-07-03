@@ -399,7 +399,7 @@ local function pick_response_for(chat_id)
   --    like "Summarise octopuses..." or "Combine the two summaries
   --    above into one paragraph."
   --    Each node gets a 5s pre-emit pause so a developer watching
-  --    the DAG sidebar can actually see the run progress through
+  --    the run panel can actually see the run progress through
   --    nodes (parallel sx+sy → combine → terminal). Without this
   --    the canned-text responses come back in <100ms each and the
   --    sidebar flashes done before the user can read it.

@@ -214,7 +214,7 @@ local function initial_state()
     expanded_details = false,
     completion       = nil,
     last_esc_ms      = nil,
-    dag_runs         = {},
+    runs             = {},
     toasts           = {},
     -- Hydrate from <data_root>/input-history so arrow-up in the chat
     -- input recalls submissions from prior nefor processes. Empty on

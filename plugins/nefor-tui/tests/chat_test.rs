@@ -625,12 +625,12 @@ fn slash_new_clears_transcript_and_mints_new_session() {
 }
 
 #[test]
-fn slash_new_clears_dag_runs() {
+fn slash_new_clears_panel_runs() {
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
-    // Seed an active DAG run.
+    // Seed an active graph run.
     dispatch_event(
         &mut engine,
         json!({
@@ -641,8 +641,8 @@ fn slash_new_clears_dag_runs() {
     );
     let out = render_str(&mut engine);
     assert!(
-        out.contains("DAG run-aaaa"),
-        "dag header should appear pre-/new: {out:?}"
+        out.contains("Graph run-aaaa"),
+        "run-panel header should appear pre-/new: {out:?}"
     );
 
     // /new + Enter.
@@ -654,12 +654,12 @@ fn slash_new_clears_dag_runs() {
     let _ = engine.take_emit_queue();
     let out = render_str(&mut engine);
     assert!(
-        !out.contains("DAG run-aaaa"),
-        "dag panel should be empty after /new: {out:?}"
+        !out.contains("Graph run-aaaa"),
+        "run panel should be empty after /new: {out:?}"
     );
 }
 
-// ── DAG panel (phase 7) ───────────────────────────────────────────────
+// ── Run panel (phase 7) ───────────────────────────────────────────────
 //
 // These exercise the sidebar that subscribes to `reasoner-graph` plugin
 // lifecycle events on the canonical tool contract:
@@ -669,12 +669,12 @@ fn slash_new_clears_dag_runs() {
 //     — id == firing_id closes one node; id == run_id closes the run.
 // The panel is visible by default; Ctrl+B toggles it off. Linger
 // handling is pure-update, so a completed run drops on the next event
-// after `DAG_LINGER_MS` of engine time has passed — `Engine::advance_time`
+// after `LINGER_MS` of engine time has passed — `Engine::advance_time`
 // plus a synthetic event drives the prune deterministically without
 // sleeping.
 
 #[test]
-fn graph_run_started_creates_a_dag_panel_row() {
+fn graph_run_started_creates_a_run_panel_row() {
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -691,12 +691,12 @@ fn graph_run_started_creates_a_dag_panel_row() {
     let out = render_str(&mut engine);
     // Header shows the abbreviated run id and (done/total) counter.
     assert!(
-        out.contains("DAG run-aaaa"),
-        "dag header missing for run-aaaaaaaa: {out:?}"
+        out.contains("Graph run-aaaa"),
+        "run-panel header missing for run-aaaaaaaa: {out:?}"
     );
     assert!(
         out.contains("(0/3)"),
-        "dag counter missing 0/3 for fresh run: {out:?}"
+        "run-panel counter missing 0/3 for fresh run: {out:?}"
     );
 }
 
@@ -719,11 +719,11 @@ fn graph_run_started_displays_name_as_title_words() {
     let out = render_str(&mut engine);
     assert!(
         out.contains("Fix Graph Names"),
-        "dag header should display title-cased graph name: {out:?}"
+        "run-panel header should display title-cased graph name: {out:?}"
     );
     assert!(
         !out.contains("fix-graph-names"),
-        "dag header should not display raw kebab-case graph name: {out:?}"
+        "run-panel header should not display raw kebab-case graph name: {out:?}"
     );
 }
 
@@ -758,13 +758,13 @@ fn graph_node_tool_invoke_uses_path_tail_label() {
             "run_id": "run-path-tail",
             "node_id": "inspect",
             "tool_name": "read_file",
-            "tool_args": { "path": "/home/example/projects/public-nefor-checkout/starter/chat/dag.lua" },
+            "tool_args": { "path": "/home/example/projects/public-nefor-checkout/starter/chat/log.lua" },
         }),
     );
 
     let out = render_str(&mut engine);
     assert!(
-        out.contains("read_file(.../starter/chat/dag"),
+        out.contains("read_file(.../starter/chat/log"),
         "path tool label should keep the meaningful file tail: {out:?}"
     );
     assert!(
@@ -839,7 +839,7 @@ fn graph_node_dispatched_then_result_updates_status_glyph() {
 // The MAG panel groups actors by top-level namespace segment — an agent's
 // whole subtree collapses to a single group row.
 #[test]
-fn mag_run_lifecycle_renders_in_dag_panel() {
+fn mag_run_lifecycle_renders_in_run_panel() {
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -1048,8 +1048,8 @@ fn graph_run_complete_hides_run_after_linger_without_dispatch() {
     // every second so live elapsed labels advance, but the reducer
     // only runs on dispatched messages — so the prune in `update`
     // never ran between user keystrokes and the completed run lingered
-    // on screen as a fully-done DAG. The view-side `is_expired`
-    // filter in `dag.panel_children` drops the run at paint time so
+    // on screen as a fully-done run. The view-side `is_expired`
+    // filter in `run_panel.panel_children` drops the run at paint time so
     // wallclock_tick re-renders surface the empty panel without
     // needing a synthetic event.
     let mut engine = Engine::new(120, 24).expect("engine");
@@ -1093,7 +1093,7 @@ fn graph_run_complete_hides_run_after_linger_without_dispatch() {
 
     let out = render_str(&mut engine);
     assert!(
-        out.contains("DAG run-dddd"),
+        out.contains("Graph run-dddd"),
         "completed run should linger initially: {out:?}"
     );
 
@@ -1104,7 +1104,7 @@ fn graph_run_complete_hides_run_after_linger_without_dispatch() {
     engine.advance_time(Duration::from_millis(3000));
     let out = render_str(&mut engine);
     assert!(
-        !out.contains("DAG run-dddd"),
+        !out.contains("Graph run-dddd"),
         "completed run should be hidden past linger window without a dispatch: {out:?}"
     );
     assert!(
@@ -1158,14 +1158,14 @@ fn graph_run_complete_removes_run_after_linger_window() {
     // The run is still within its linger window — header is visible.
     let out = render_str(&mut engine);
     assert!(
-        out.contains("DAG run-cccc"),
+        out.contains("Graph run-cccc"),
         "completed run should linger initially: {out:?}"
     );
 
     // Advance past the 2s linger and dispatch a no-op event so update
     // runs and prunes the stale entry. (The pure-update prune fires on
     // every dispatch — we use any event with a kind chat.lua handles
-    // and that doesn't touch dag_runs; chat.session.stats fits.)
+    // and that doesn't touch panel runs; chat.session.stats fits.)
     engine.advance_time(Duration::from_millis(3000));
     dispatch_event(
         &mut engine,
@@ -1173,7 +1173,7 @@ fn graph_run_complete_removes_run_after_linger_window() {
     );
     let out = render_str(&mut engine);
     assert!(
-        !out.contains("DAG run-cccc"),
+        !out.contains("Graph run-cccc"),
         "completed run should be pruned past linger window: {out:?}"
     );
     // The empty-state hint should now show in the sidebar.
@@ -1933,7 +1933,7 @@ fn escape_with_pending_lead_active_graph_and_queued_text_interrupts_lead_only() 
 
     let out = render_str(&mut engine);
     assert!(
-        out.contains("DAG graph-1") && out.contains('●') && !out.contains('✗'),
+        out.contains("Graph graph-1") && out.contains('●') && !out.contains('✗'),
         "active graph should remain running after lead interrupt: {out:?}"
     );
     assert!(

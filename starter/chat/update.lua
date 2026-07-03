@@ -11,7 +11,7 @@ local slash        = require("chat.slash")
 local sessions     = require("chat.sessions")
 local at_path      = require("chat.at_path")
 local history      = require("chat.history")
-local dag          = require("chat.dag")
+local run_panel    = require("chat.run_panel")
 local transcript   = require("chat.transcript")
 local popups       = require("chat.popups")
 local Entry        = require("chat.entry")
@@ -121,12 +121,12 @@ local function without_pending_plan_status(state, key)
   })
 end
 
--- Pure-update prune for stale dag runs + expired toasts.
+-- Pure-update prune for stale panel runs + expired toasts.
 local function prune_expired(state)
   local now = tui.now_ms()
-  local pruned = dag.prune(state.dag_runs or {}, now)
-  if pruned ~= state.dag_runs then
-    state = shallow_merge(state, { dag_runs = pruned })
+  local pruned = run_panel.prune(state.runs or {}, now)
+  if pruned ~= state.runs then
+    state = shallow_merge(state, { runs = pruned })
   end
   local toasts = state.toasts
   if toasts ~= nil and #toasts > 0 then
@@ -174,7 +174,7 @@ local function handle_input_submit(msg, state)
     local cleared = shallow_merge(state, {
       entries = {}, in_flight = NIL_SENTINEL, input_value = "",
       pending = false, completion = NIL_SENTINEL,
-      dag_runs = {}, firing_to_node = {},
+      runs = {}, firing_to_node = {},
       turn_started_at = NIL_SENTINEL,
       last_turn_duration_ms = NIL_SENTINEL,
       last_esc_ms = NIL_SENTINEL,
@@ -330,7 +330,7 @@ local function handle_input_submit(msg, state)
       local cleared = shallow_merge(state, {
         entries = {}, in_flight = NIL_SENTINEL, input_value = "",
         pending = false, completion = NIL_SENTINEL,
-        dag_runs = {}, firing_to_node = {},
+        runs = {}, firing_to_node = {},
         turn_started_at = NIL_SENTINEL,
         last_turn_duration_ms = NIL_SENTINEL,
         last_esc_ms = NIL_SENTINEL,
@@ -414,7 +414,7 @@ local function handle_input_submit(msg, state)
       return shallow_merge(state, {
         input_value = "", completion = NIL_SENTINEL,
         entries = {}, in_flight = NIL_SENTINEL,
-        pending = false, dag_runs = {}, firing_to_node = {},
+        pending = false, runs = {}, firing_to_node = {},
         turn_started_at = NIL_SENTINEL,
         last_turn_duration_ms = NIL_SENTINEL,
         queued_entry_idx = NIL_SENTINEL,
@@ -572,7 +572,7 @@ local function handle_escape(_msg, state)
   -- 4) double-ESC escalation
   local now = tui.now_ms()
   if state.last_esc_ms and (now - state.last_esc_ms) <= DOUBLE_ESC_MS then
-    local interrupted = dag.interrupt_all(state, now)
+    local interrupted = run_panel.interrupt_all(state, now)
     return shallow_merge(interrupted, { last_esc_ms = NIL_SENTINEL }), {
       { kind = "send_to", target = "engine",
         body = { kind = "chat.interrupt_all" } },
@@ -580,7 +580,7 @@ local function handle_escape(_msg, state)
   end
   -- 4) single ESC interrupts the current turn
   if state.pending or state.in_flight ~= nil then
-    local interrupted = dag.interrupt_all(state, now)
+    local interrupted = run_panel.interrupt_all(state, now)
     return shallow_merge(interrupted, { last_esc_ms = now }), {
       { kind = "send_to", target = "engine",
         body = { kind = "chat.interrupt" } },
@@ -601,7 +601,7 @@ local function handle_session_end(_msg, state)
     popup            = NIL_SENTINEL,
     toasts           = {},
     completion       = NIL_SENTINEL,
-    dag_runs         = {},
+    runs             = {},
     mag_active_run_id = NIL_SENTINEL,
     lead_chat_id     = NIL_SENTINEL,
   }), {}
@@ -609,7 +609,7 @@ end
 
 local function handle_session_start(_msg, state)
   return shallow_merge(state, {
-    dag_runs = {}, firing_to_node = {}, mag_active_run_id = NIL_SENTINEL,
+    runs = {}, firing_to_node = {}, mag_active_run_id = NIL_SENTINEL,
     lead_chat_id = NIL_SENTINEL,
   }), {}
 end
@@ -666,7 +666,7 @@ local function handle_message_append(msg, state)
           local now = tui.now_ms()
           local synth = "instruction files(" .. path .. ")"
           return shallow_merge(
-            dag.node_tool_invoked(state, binding.run_id, binding.node_id, synth, nil, now),
+            run_panel.node_tool_invoked(state, binding.run_id, binding.node_id, synth, nil, now),
             turn_state
           ), {}
         end
@@ -687,7 +687,7 @@ local function handle_message_append(msg, state)
           local now = tui.now_ms()
           local synth = "AGENTS.md(" .. path .. ")"
           return shallow_merge(
-            dag.node_tool_invoked(state, binding.run_id, binding.node_id, synth, nil, now),
+            run_panel.node_tool_invoked(state, binding.run_id, binding.node_id, synth, nil, now),
             turn_state
           ), {}
         end
@@ -1091,12 +1091,16 @@ local function handle_gate_mode_changed(msg, state)
   return shallow_merge(state, { gate_mode = mode }), {}
 end
 
--- ── DAG observation ───────────────────────────────────────────────────
+-- ── Graph-run observation ────────────────────────────────────────────
+--
+-- Consumes the reasoner-graph plugin's `graph.*` broadcast kinds. Those
+-- kinds are scheduled to die with reasoner-graph at the lead-as-program
+-- flip; the run panel itself outlives them via the `mag.*` stream below.
 
 local function handle_graph_run_started(msg, state)
   if state.replay_mode then return state, {} end
   local now = tui.now_ms()
-  return dag.run_started(state, msg.run_id or "", msg.total_nodes or 0, now), {}
+  return run_panel.run_started(state, msg.run_id or "", msg.total_nodes or 0, now), {}
 end
 
 local function handle_graph_node_fired(msg, state)
@@ -1104,7 +1108,7 @@ local function handle_graph_node_fired(msg, state)
   if (msg.run_id or "") == "" or (msg.node_id or "") == "" then return state, {} end
   if (msg.firing_id or "") == "" then return state, {} end
   local now = tui.now_ms()
-  local with_dispatch = dag.node_dispatched(state, msg.run_id, msg.node_id, msg.reasoner or "", now)
+  local with_dispatch = run_panel.node_dispatched(state, msg.run_id, msg.node_id, msg.reasoner or "", now)
   local prev_map = with_dispatch.firing_to_node or {}
   local next_map = {}
   for k, v in pairs(prev_map) do next_map[k] = v end
@@ -1117,7 +1121,7 @@ local function handle_graph_node_tool_invoke(msg, state)
   if (msg.run_id or "") == "" or (msg.node_id or "") == "" then return state, {} end
   if type(msg.tool_name) ~= "string" or #msg.tool_name == 0 then return state, {} end
   local now = tui.now_ms()
-  return dag.node_tool_invoked(state, msg.run_id, msg.node_id, msg.tool_name, msg.tool_args, now), {}
+  return run_panel.node_tool_invoked(state, msg.run_id, msg.node_id, msg.tool_name, msg.tool_args, now), {}
 end
 
 local function handle_graph_node_chat_bound(msg, state)
@@ -1136,14 +1140,14 @@ local function handle_tool_result(msg, state)
   if type(id) ~= "string" or id == "" then return state, {} end
   local now = tui.now_ms()
   -- Run-close: id matches a tracked run.
-  if state.dag_runs and state.dag_runs[id] then
+  if state.runs and state.runs[id] then
     local result = msg.result
     local status, results
     if type(result) == "table" then
       status  = result.status
       results = result.results
     end
-    return dag.run_complete(state, id, status, results, now), {}
+    return run_panel.run_complete(state, id, status, results, now), {}
   end
   -- Per-firing close: look up firing_id → (run_id, node_id) map.
   local map_entry = (state.firing_to_node or {})[id]
@@ -1152,7 +1156,7 @@ local function handle_tool_result(msg, state)
     local node_id = map_entry.node_id
     local has_output = msg.result ~= nil
     local has_error  = msg.error  ~= nil
-    local next_state = dag.node_result(state, run_id, node_id, has_output, has_error, now)
+    local next_state = run_panel.node_result(state, run_id, node_id, has_output, has_error, now)
     local next_map = {}
     for k, v in pairs(state.firing_to_node or {}) do next_map[k] = v end
     next_map[id] = nil
@@ -1173,7 +1177,7 @@ local function handle_mag_run_started(msg, state)
   if state.replay_mode then return state, {} end
   local run_id = msg.run_id
   if type(run_id) ~= "string" or run_id == "" then return state, {} end
-  local next_state = dag.mag_run_started(state, run_id, msg.run_name, tui.now_ms())
+  local next_state = run_panel.mag_run_started(state, run_id, msg.run_name, tui.now_ms())
   return shallow_merge(next_state, { mag_active_run_id = run_id }), {}
 end
 
@@ -1182,7 +1186,7 @@ local function handle_mag_actor_spawned(msg, state)
   local run_id = state.mag_active_run_id
   local id = msg.id
   if type(run_id) ~= "string" or type(id) ~= "string" or id == "" then return state, {} end
-  return dag.actor_spawned(state, run_id, id, msg.factory, tui.now_ms()), {}
+  return run_panel.actor_spawned(state, run_id, id, msg.factory, tui.now_ms()), {}
 end
 
 local function handle_mag_actor_ready(msg, state)
@@ -1190,7 +1194,7 @@ local function handle_mag_actor_ready(msg, state)
   local run_id = state.mag_active_run_id
   local id = msg.id
   if type(run_id) ~= "string" or type(id) ~= "string" or id == "" then return state, {} end
-  return dag.actor_ready(state, run_id, id, tui.now_ms()), {}
+  return run_panel.actor_ready(state, run_id, id, tui.now_ms()), {}
 end
 
 local function handle_mag_actor_killed(msg, state)
@@ -1198,28 +1202,28 @@ local function handle_mag_actor_killed(msg, state)
   local run_id = state.mag_active_run_id
   local id = msg.id
   if type(run_id) ~= "string" or type(id) ~= "string" or id == "" then return state, {} end
-  return dag.actor_killed(state, run_id, id, tui.now_ms()), {}
+  return run_panel.actor_killed(state, run_id, id, tui.now_ms()), {}
 end
 
 local function handle_mag_modification_rejected(msg, state)
   if state.replay_mode then return state, {} end
   local run_id = state.mag_active_run_id
   if type(run_id) ~= "string" then return state, {} end
-  return dag.modification_rejected(state, run_id), {}
+  return run_panel.modification_rejected(state, run_id), {}
 end
 
 local function handle_mag_modification_noop(msg, state)
   if state.replay_mode then return state, {} end
   local run_id = state.mag_active_run_id
   if type(run_id) ~= "string" then return state, {} end
-  return dag.modification_noop(state, run_id), {}
+  return run_panel.modification_noop(state, run_id), {}
 end
 
 local function handle_mag_run_complete(msg, state)
   if state.replay_mode then return state, {} end
   local run_id = state.mag_active_run_id
   if type(run_id) ~= "string" then return state, {} end
-  local next_state = dag.mag_run_complete(state, run_id, "success", tui.now_ms())
+  local next_state = run_panel.mag_run_complete(state, run_id, "success", tui.now_ms())
   return shallow_merge(next_state, { mag_active_run_id = NIL_SENTINEL }), {}
 end
 
@@ -1408,7 +1412,7 @@ local function route_keys_and_popups(msg, state)
         return shallow_merge(state, {
           popup = NIL_SENTINEL,
           entries = {}, in_flight = NIL_SENTINEL,
-          pending = false, dag_runs = {}, firing_to_node = {},
+          pending = false, runs = {}, firing_to_node = {},
           turn_started_at = NIL_SENTINEL,
           last_turn_duration_ms = NIL_SENTINEL,
           queued_entry_idx = NIL_SENTINEL,

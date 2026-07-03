@@ -356,7 +356,7 @@ impl Engine {
     pub fn dispatch_msg(&mut self, msg: mlua::Table) -> Result<(), TuiError> {
         // Publish the current frame-clock to Lua so `tui.now_ms()` reads
         // the same value the animation sampler sees on the next render —
-        // critical for time-stamped composition (DAG-panel linger, "X
+        // critical for time-stamped composition (run-panel linger, "X
         // seconds since" labels) where divergence between the two clocks
         // would surface as flicker or off-by-one prune timing.
         self.lua.set_now_ms(self.now_ms());

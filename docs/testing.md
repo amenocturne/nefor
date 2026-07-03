@@ -161,7 +161,7 @@ Things to verify:
 - `/new` clears transcript and starts a fresh chat
 - Single Esc cancels in-flight turn (chat unblocks for next submit)
 - Double Esc within 600ms → fan-cancel (chat run + every sub-graph + deferred queue) → system message reports counts
-- `/dag-test` smoke triggers a 2-node parallel graph; sidebar widget shows running → done
+- A sub-graph run (lead `spawn_graph` tool) appears in the sidebar run panel; nodes go running → done
 
 ## Verifying known concerns
 

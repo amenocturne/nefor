@@ -392,7 +392,7 @@ local function handle(body)
   -- Bind chat_id ↔ (run_id, node_id) for the chat surface. Sub-agent
   -- emissions that ride on chat_id (notably instruction-file reminders
   -- from tool-gate) are routed by the chat reducer to
-  -- the matching DAG node's "last tool" slot rather than the main
+  -- the matching graph node's "last tool" slot rather than the main
   -- transcript. Without this binding the chat surface has no way to
   -- know whether a chat_id refers to the lead's chat (render) or a
   -- sub-agent's chat (route to sidebar).
@@ -545,7 +545,7 @@ local function dispatch_tool_call(entry, call)
   })
 
   -- Paired observer envelope so the chat surface can show "agent in
-  -- node X is currently calling tool Y" in the DAG sidebar. Only emit
+  -- node X is currently calling tool Y" in the run panel. Only emit
   -- when the agent is running inside a graph node (run_id + node_id
   -- both present); standalone agent firings have no node to attach to.
   if type(entry.run_id) == "string" and type(entry.node_id) == "string"
@@ -556,7 +556,7 @@ local function dispatch_tool_call(entry, call)
       node_id   = entry.node_id,
       tool_id   = tool_id,
       tool_name = name,
-      -- Args ride alongside so the DAG sidebar can render
+      -- Args ride alongside so the run panel can render
       -- `bash(grep …)` instead of bare `bash` — distinguishes
       -- parallel agents that all happen to use the same tool.
       tool_args = call_args,

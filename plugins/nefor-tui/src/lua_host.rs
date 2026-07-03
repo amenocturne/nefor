@@ -100,7 +100,7 @@ pub struct LuaHost {
     emit_queue: Arc<Mutex<Vec<SideEffect>>>,
     /// Frame-clock value the engine installs before each dispatch /
     /// render. Lua reads it via `tui.now_ms()` so timing-sensitive
-    /// composition (DAG-panel linger windows, cooldowns, time-since-X
+    /// composition (run-panel linger windows, cooldowns, time-since-X
     /// labels) sees the same monotonic clock the animation sampler does
     /// — including any synthetic `Engine::advance_time` offset tests
     /// install. No Lua-side `os.time()` round-trip; one source of truth.

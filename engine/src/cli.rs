@@ -28,7 +28,7 @@ use clap::{Parser, Subcommand};
     version = env!("NEFOR_VERSION"),
     about = "nefor — Lua-composable agent runtime.",
     long_about = "nefor is a plugin broker for composing agent runtimes. The binary ships voiceless — \
-                  providers, harnesses, DAG orchestration, personas, UIs, and statusline \
+                  providers, harnesses, graph orchestration, personas, UIs, and statusline \
                   content all live in plugins loaded from the user's init.lua.\n\n\
                   Config: $NEFOR_CONFIG_DIR or $XDG_CONFIG_HOME/nefor/ (default ~/.config/nefor/).\n\
                   Data:   $NEFOR_DATA_DIR or $XDG_DATA_HOME/nefor/ (default ~/.local/share/nefor/).\n\

@@ -1491,7 +1491,7 @@ end
 -- Pin the symmetric guarantee: nefor-tui DOES still receive replayed
 -- envelopes during the window, because the TUI surface needs them to
 -- repaint the transcript on resume. The chat.lua reducer gates side
--- effects (popup, dag observation) with its own state.replay_mode
+-- effects (popup, run-panel observation) with its own state.replay_mode
 -- flag — that's the level where "replay vs live" rendering policy
 -- lives, not the wrapper.
 local function test_replay_window_does_not_starve_nefor_tui()

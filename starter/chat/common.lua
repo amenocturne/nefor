@@ -151,7 +151,7 @@ end
 --    or chain another tool call. The real result will arrive later as
 --    a user message tagged `[spawn_graph(run_id=<id>) result]`."
 -- That whole blob is LLM instruction noise. Surface just the run_id —
--- progress is already visible in the DAG sidebar.
+-- progress is already visible in the run panel.
 function M.format_spawn_graph_output(output)
   if type(output) ~= "string" or #output == 0 then return output end
   local run_id = output:match("run_id=([%w%-]+)")
@@ -286,12 +286,12 @@ M.STYLE = {
   popup_danger    = { fg = C.status_danger, bold = true },
   popup_info      = { fg = C.user, bold = true },
   toast           = { fg = C.user },
-  dag_separator   = { fg = C.footer },
-  dag_pending     = { fg = C.status_dim },
-  dag_running     = { fg = C.status_warn },
-  dag_done        = { fg = C.status_ok },
-  dag_error       = { fg = C.status_danger, bold = true },
-  dag_skipped     = { fg = C.status_dim, italic = true },
+  panel_separator   = { fg = C.footer },
+  panel_pending     = { fg = C.status_dim },
+  panel_running     = { fg = C.status_warn },
+  panel_done        = { fg = C.status_ok },
+  panel_error       = { fg = C.status_danger, bold = true },
+  panel_skipped     = { fg = C.status_dim, italic = true },
   -- Plan-entry chrome (yellow border). `bold = true` matches
   -- user_chrome's weight so the two read as parallel "input/output of
   -- a decision" frames at equal visual weight.

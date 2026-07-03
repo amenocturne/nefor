@@ -1,5 +1,5 @@
 -- Full chat-surface layout. Composes transcript, input, statusline,
--- DAG sidebar, popups, and toast into a single `tui.stack`. This file
+-- run-panel sidebar, popups, and toast into a single `tui.stack`. This file
 -- is the only place that knows about the overall geometry — every
 -- sub-renderer hands back a single node and the layout decides where
 -- it goes.
@@ -10,7 +10,7 @@ local W       = tui_lib.widget
 local common      = require("chat.common")
 local entries_mod = require("chat.entries")
 local statusline  = require("chat.statusline")
-local dag         = require("chat.dag")
+local run_panel   = require("chat.run_panel")
 local popups      = require("chat.popups")
 local slash       = require("chat.slash")
 
@@ -75,7 +75,7 @@ end
 -- Keep the engine's render loop alive at ~1Hz while any per-second
 -- elapsed counter is on screen — tui.now_ms() only re-evaluates on a
 -- render, and the engine renders only on state changes / animation
--- ticks. Without this, the DAG sidebar's "Ns" stalls between events.
+-- ticks. Without this, the run panel's "Ns" stalls between events.
 -- Mount only when something needs to refresh.
 local KEEPALIVE_FRAMES = { "", "" }
 
@@ -84,9 +84,9 @@ local function render_keepalive(state)
   -- only on state changes, so the toast appears once and never
   -- re-renders to run its slide-out / disappearance. duration_ms = 100
   -- keeps the toast slide smooth (~60fps engine tick when active);
-  -- DAG-elapsed counters only need 1Hz but the extra ticks are free.
+  -- Run-panel elapsed counters only need 1Hz but the extra ticks are free.
   local has_toast = state.toasts and #state.toasts > 0
-  if not (state.pending or dag.any_active(state.dag_runs, tui.now_ms()) or has_toast) then
+  if not (state.pending or run_panel.any_active(state.runs, tui.now_ms()) or has_toast) then
     return nil
   end
   return tui.animation {
@@ -171,13 +171,13 @@ function M.render(state)
   -- Outer row: left column (chat) | separator | sidebar. No outer
   -- padding — the sidebar's vertical separator reaches the full
   -- window height (top and bottom edges flush), and per-element
-  -- spacing is handled inside left_column and dag.panel.
+  -- spacing is handled inside left_column and run_panel.panel.
   local main_row = tui.row {
     gap = 0,
     children = compact {
       tui.expanded { child = left_column },
-      state.show_sidebar and dag.vertical_separator() or nil,
-      state.show_sidebar and dag.panel(state)         or nil,
+      state.show_sidebar and run_panel.vertical_separator() or nil,
+      state.show_sidebar and run_panel.panel(state)         or nil,
     },
   }
 

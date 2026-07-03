@@ -1,4 +1,4 @@
--- DAG sidebar widget: renders the active reasoner-graph runs as a
+-- Run-panel sidebar widget: renders the active graph/kernel runs as a
 -- column of run-headers + per-node rows, and owns the small set of
 -- pure-state mutators (run_started, node_dispatched, node_result,
 -- run_complete, prune) the chat reducer calls.
@@ -23,12 +23,12 @@ local GLYPHS = {
 }
 
 local NODE_STYLE = {
-  pending = STYLE.dag_pending,
-  running = STYLE.dag_running,
-  done    = STYLE.dag_done,
-  error   = STYLE.dag_error,
-  skipped = STYLE.dag_skipped,
-  killed  = STYLE.dag_error,
+  pending = STYLE.panel_pending,
+  running = STYLE.panel_running,
+  done    = STYLE.panel_done,
+  error   = STYLE.panel_error,
+  skipped = STYLE.panel_skipped,
+  killed  = STYLE.panel_error,
 }
 
 -- Node statuses that count as terminal (drive the done/total counter and
@@ -58,19 +58,19 @@ local function is_expired(run, now_ms)
      and (now_ms - run.completed_at_ms) > M.LINGER_MS
 end
 
-function M.prune(dag_runs, now_ms)
-  if dag_runs == nil then return {} end
+function M.prune(runs, now_ms)
+  if runs == nil then return {} end
   local pruned = nil
-  for run_id, run in pairs(dag_runs) do
+  for run_id, run in pairs(runs) do
     if is_expired(run, now_ms) then
       if pruned == nil then
         pruned = {}
-        for k, v in pairs(dag_runs) do pruned[k] = v end
+        for k, v in pairs(runs) do pruned[k] = v end
       end
       pruned[run_id] = nil
     end
   end
-  return pruned or dag_runs
+  return pruned or runs
 end
 
 -- `any_active` drives the render-keepalive animation in view.lua, so
@@ -84,9 +84,9 @@ end
 -- the linger-window countdown advances even after `any_active` flips
 -- false; the next reducer dispatch (or the view-side `is_expired`
 -- filter on the next paint) finalises the removal.
-function M.any_active(dag_runs, now_ms)
-  if type(dag_runs) ~= "table" then return false end
-  for _, run in pairs(dag_runs) do
+function M.any_active(runs, now_ms)
+  if type(runs) ~= "table" then return false end
+  for _, run in pairs(runs) do
     if not is_expired(run, now_ms or 0) then return true end
   end
   return false
@@ -101,7 +101,7 @@ local function run_header(run)
   else
     ident = run.run_id and run.run_id:sub(1, 8) or "?"
   end
-  local label = run.label or "DAG"
+  local label = run.label or "Graph"
   local total = run.total_nodes or 0
   local nodes = run.nodes or {}
   local done = 0
@@ -283,10 +283,10 @@ end
 
 local function panel_children(state, now_ms, narrow)
   local children = {}
-  local run_ids = sorted_keys(state.dag_runs)
+  local run_ids = sorted_keys(state.runs)
   local first = true
   for _, run_id in ipairs(run_ids) do
-    local run = state.dag_runs[run_id]
+    local run = state.runs[run_id]
     -- View-side filter: a completed run past its linger window is
     -- dropped at paint time so the panel updates on the
     -- wallclock_tick re-render even though the reducer-side `prune`
@@ -361,20 +361,20 @@ function M.vertical_separator()
   return tui.constrained {
     min_width = 1,
     max_width = 1,
-    child = tui.fill { char = "│", style = STYLE.dag_separator },
+    child = tui.fill { char = "│", style = STYLE.panel_separator },
   }
 end
 
 local function apply(state, run_id, fn)
-  local prev_runs = state.dag_runs or {}
+  local prev_runs = state.runs or {}
   local new_runs = {}
   for k, v in pairs(prev_runs) do new_runs[k] = v end
   new_runs[run_id] = fn(prev_runs[run_id])
-  return shallow_merge(state, { dag_runs = new_runs })
+  return shallow_merge(state, { runs = new_runs })
 end
 
 function M.run_started(state, run_id, total_nodes, now_ms)
-  if state.dag_runs and state.dag_runs[run_id] then return state end
+  if state.runs and state.runs[run_id] then return state end
   return apply(state, run_id, function(_)
     return {
       run_id = run_id, total_nodes = total_nodes or 0,
@@ -402,8 +402,8 @@ function M.node_dispatched(state, run_id, node_id, reasoner, now_ms)
   end)
 end
 
--- Format a tool's args into a short single-line string for the DAG
--- sidebar's "currently calling X" sub-row. The goal is to make
+-- Format a tool's args into a short single-line string for the run
+-- panel's "currently calling X" sub-row. The goal is to make
 -- parallel agents distinguishable when they happen to use the same
 -- tool name (e.g. three explorers all running `bash` with different
 -- commands). Per-tool extractors for the common cases; generic first-
@@ -483,9 +483,9 @@ function M.node_tool_invoked(state, run_id, node_id, tool_name, tool_args, now_m
   -- haven't seen `graph.node.fired` for this (run, node) yet — out-of-
   -- order delivery, replay tail, whatever — drop quietly rather than
   -- synthesise a partial node row that misses `reasoner` / start time.
-  if not (state.dag_runs and state.dag_runs[run_id]
-      and state.dag_runs[run_id].nodes
-      and state.dag_runs[run_id].nodes[node_id]) then
+  if not (state.runs and state.runs[run_id]
+      and state.runs[run_id].nodes
+      and state.runs[run_id].nodes[node_id]) then
     return state
   end
   local short_args = format_tool_args_short(tool_name, tool_args)
@@ -510,9 +510,9 @@ function M.node_result(state, run_id, node_id, has_output, has_error, now_ms)
   -- mode this shouldn't happen; if it does, the result is visible in
   -- logs and that's the right place to investigate, not a synthetic
   -- panel entry that papers over the gap.
-  if not (state.dag_runs and state.dag_runs[run_id]
-      and state.dag_runs[run_id].nodes
-      and state.dag_runs[run_id].nodes[node_id]) then
+  if not (state.runs and state.runs[run_id]
+      and state.runs[run_id].nodes
+      and state.runs[run_id].nodes[node_id]) then
     return state
   end
   return apply(state, run_id, function(prev)
@@ -534,9 +534,9 @@ end
 -- "Ns" timers because cancel_all on the engine side never emits the
 -- run.completed envelope a clean termination would.
 function M.interrupt_all(state, now_ms)
-  if type(state.dag_runs) ~= "table" then return state end
+  if type(state.runs) ~= "table" then return state end
   local new_runs = {}
-  for run_id, run in pairs(state.dag_runs) do
+  for run_id, run in pairs(state.runs) do
     local nodes = {}
     for node_id, node in pairs(run.nodes or {}) do
       if node.status == "running" or node.status == "pending" then
@@ -554,11 +554,11 @@ function M.interrupt_all(state, now_ms)
       status          = run.status or "interrupted",
     })
   end
-  return shallow_merge(state, { dag_runs = new_runs })
+  return shallow_merge(state, { runs = new_runs })
 end
 
 function M.run_complete(state, run_id, status, results, now_ms)
-  if not (state.dag_runs and state.dag_runs[run_id]) then return state end
+  if not (state.runs and state.runs[run_id]) then return state end
   return apply(state, run_id, function(prev)
     local nodes = {}
     for k, v in pairs(prev.nodes or {}) do nodes[k] = v end
@@ -583,7 +583,8 @@ end
 -- ── MAG actor-kernel lifecycle ────────────────────────────────────────
 --
 -- The kernel's `mag.*` event stream drives the same run panel the
--- reasoner-graph `dag.*`/`graph.*` events do, so a kernel run is visible
+-- reasoner-graph `graph.*` events do (kinds that die with reasoner-graph
+-- at the lead-as-program flip), so a kernel run is visible
 -- the same way. Actors are the panel's "nodes": spawned → pending,
 -- ready → running, killed → killed (distinct), run-complete → the run
 -- finalises (still-live actors flip to done). Only `mag.run_started`
@@ -591,7 +592,7 @@ end
 -- to the single in-flight run it stamps.
 
 function M.mag_run_started(state, run_id, run_name, now_ms)
-  if state.dag_runs and state.dag_runs[run_id] then return state end
+  if state.runs and state.runs[run_id] then return state end
   return apply(state, run_id, function(_)
     return {
       run_id = run_id, run_name = run_name, label = "MAG",
@@ -603,7 +604,7 @@ function M.mag_run_started(state, run_id, run_name, now_ms)
 end
 
 function M.actor_spawned(state, run_id, actor_id, factory, now_ms)
-  if not (state.dag_runs and state.dag_runs[run_id]) then return state end
+  if not (state.runs and state.runs[run_id]) then return state end
   return apply(state, run_id, function(prev)
     if prev.nodes and prev.nodes[actor_id] then return prev end
     local nodes = {}
@@ -623,7 +624,7 @@ function M.actor_spawned(state, run_id, actor_id, factory, now_ms)
 end
 
 function M.actor_ready(state, run_id, actor_id, now_ms)
-  if not (state.dag_runs and state.dag_runs[run_id]) then return state end
+  if not (state.runs and state.runs[run_id]) then return state end
   return apply(state, run_id, function(prev)
     local nodes = {}
     for k, v in pairs(prev.nodes or {}) do nodes[k] = v end
@@ -646,9 +647,9 @@ function M.actor_ready(state, run_id, actor_id, now_ms)
 end
 
 function M.actor_killed(state, run_id, actor_id, now_ms)
-  if not (state.dag_runs and state.dag_runs[run_id]
-      and state.dag_runs[run_id].nodes
-      and state.dag_runs[run_id].nodes[actor_id]) then
+  if not (state.runs and state.runs[run_id]
+      and state.runs[run_id].nodes
+      and state.runs[run_id].nodes[actor_id]) then
     return state
   end
   return apply(state, run_id, function(prev)
@@ -662,14 +663,14 @@ function M.actor_killed(state, run_id, actor_id, now_ms)
 end
 
 function M.modification_rejected(state, run_id)
-  if not (state.dag_runs and state.dag_runs[run_id]) then return state end
+  if not (state.runs and state.runs[run_id]) then return state end
   return apply(state, run_id, function(prev)
     return shallow_merge(prev, { rejected = (prev.rejected or 0) + 1 })
   end)
 end
 
 function M.modification_noop(state, run_id)
-  if not (state.dag_runs and state.dag_runs[run_id]) then return state end
+  if not (state.runs and state.runs[run_id]) then return state end
   return apply(state, run_id, function(prev)
     return shallow_merge(prev, { noops = (prev.noops or 0) + 1 })
   end)
@@ -680,7 +681,7 @@ end
 -- actor keeps its terminal state. Stamps `completed_at_ms` so the linger +
 -- prune path fades the run out exactly like a reasoner-graph completion.
 function M.mag_run_complete(state, run_id, status, now_ms)
-  if not (state.dag_runs and state.dag_runs[run_id]) then return state end
+  if not (state.runs and state.runs[run_id]) then return state end
   return apply(state, run_id, function(prev)
     local nodes = {}
     for k, v in pairs(prev.nodes or {}) do

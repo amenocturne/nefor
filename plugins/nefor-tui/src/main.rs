@@ -228,7 +228,7 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
     let mut anim_tick = interval(Duration::from_millis(16));
     let mut last_render = std::time::Instant::now();
     const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(8);
-    // 1Hz wall-clock tick for live elapsed-ms labels — DAG node
+    // 1Hz wall-clock tick for live elapsed-ms labels — run-panel node
     // "running 18s" badges, the [thinking… 5s] turn-elapsed counter,
     // etc. The Lua composition formats these labels against
     // `tui.now_ms()` at paint time, so the *value* changes once per
@@ -375,7 +375,7 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
                 }
             }
             _ = wallclock_tick.tick() => {
-                // Force a repaint so live elapsed-ms labels (DAG node
+                // Force a repaint so live elapsed-ms labels (run-panel node
                 // 'running Ns', [thinking… Ns]) advance even when no
                 // bus envelope or keystroke arrives. The Lua composition
                 // re-reads tui.now_ms() at paint time, so flipping the
