@@ -13,6 +13,7 @@
 //! - `kernel.rs` — the embedded Lua VM, host bindings, and kernel driving.
 //! - `error.rs` — `MagError` domain error hierarchy.
 
+mod bridge;
 mod error;
 mod kernel;
 
@@ -24,6 +25,7 @@ use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
+use crate::bridge::ProviderBridge;
 use crate::error::MagError;
 use crate::kernel::{LuaHost, RunCompletion};
 
@@ -199,6 +201,10 @@ async fn run_dispatch_loop(
     let mut program: Option<LoadedProgram> = None;
     // The in-flight async run, if any (deferred-completion path).
     let mut active: Option<ActiveExecute> = None;
+    // Provider capability bridge: drives each provider-class `tool.invoke` as a
+    // `chat.*` conversation and correlates the streamed result back. State
+    // persists across the session, keyed by chat_id (bridge.rs).
+    let mut bridge = ProviderBridge::new();
     // Barrier / deadline tick while a run is in flight (docs/ir.md: the host
     // polls the barrier on a timer; synchronous programs settle before it fires).
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
@@ -215,7 +221,8 @@ async fn run_dispatch_loop(
                             tracing::warn!(?env, "unexpected system envelope after handshake");
                         }
                         Body::Event(map) => {
-                            handle_event(out_tx, map, &mut program, host, &mut active).await?;
+                            handle_event(out_tx, map, &mut program, host, &mut active, &mut bridge)
+                                .await?;
                         }
                     },
                     Some(Err(e)) => {
@@ -229,7 +236,7 @@ async fn run_dispatch_loop(
             }
             _ = ticker.tick() => {
                 if active.is_some() {
-                    poll_active(out_tx, host, &mut active).await?;
+                    poll_active(out_tx, host, &mut active, &mut bridge).await?;
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -241,13 +248,19 @@ async fn run_dispatch_loop(
 }
 
 /// Forward everything the kernel emitted since the last drain (capability
-/// requests + lifecycle events) onto the NCP wire, in order.
+/// requests + lifecycle events) onto the NCP wire, in order. Each drained body
+/// passes through the provider bridge first: a provider-class `tool.invoke` is
+/// rewritten into its `chat.*` conversation (bridge.rs), everything else forwards
+/// unchanged.
 async fn flush_emits(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     host: &LuaHost,
+    bridge: &mut ProviderBridge,
 ) -> Result<(), MagError> {
     for body in host.drain_emits()? {
-        send_event(out_tx, body).await?;
+        for envelope in bridge.translate_emit(body) {
+            send_event(out_tx, envelope).await?;
+        }
     }
     Ok(())
 }
@@ -260,9 +273,10 @@ async fn poll_active(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     host: &LuaHost,
     active: &mut Option<ActiveExecute>,
+    bridge: &mut ProviderBridge,
 ) -> Result<(), MagError> {
     let state = host.poll()?;
-    flush_emits(out_tx, host).await?;
+    flush_emits(out_tx, host, bridge).await?;
     if state.done && !state.ok {
         if let Some(a) = active.take() {
             let msg = state.error.unwrap_or_else(|| "ready barrier failed".into());
@@ -309,23 +323,34 @@ async fn handle_event(
     program: &mut Option<LoadedProgram>,
     host: &LuaHost,
     active: &mut Option<ActiveExecute>,
+    bridge: &mut ProviderBridge,
 ) -> Result<(), MagError> {
     let kind = match body.get("kind").and_then(Value::as_str) {
         Some(k) => k,
         None => return Ok(()),
     };
+    // Provider bridge inbound: a driven chat's streamed completion result (or
+    // error), correlated by chat_id. Feeds the single final result back through
+    // the kernel's capability channel. A reply for a chat we don't drive resolves
+    // to nothing and is ignored inside the bridge, so this is safe to check ahead
+    // of the mag protocol arms (the suffixes never collide with a mag.* kind).
+    if ProviderBridge::is_provider_reply(kind) {
+        return handle_provider_reply(out_tx, kind, body, host, active, bridge).await;
+    }
     let in_reply_to = body.get("id").and_then(Value::as_str);
     match kind {
         PING_KIND => send_event(out_tx, pong_body(in_reply_to)).await,
         LOAD_KIND => handle_load(out_tx, body, in_reply_to, program, host).await,
         EVAL_KIND => handle_eval(out_tx, body, in_reply_to, program).await,
-        EXECUTE_KIND => handle_execute(out_tx, body, in_reply_to, program, host, active).await,
-        APPLY_KIND => handle_apply(out_tx, body, in_reply_to, host, active).await,
+        EXECUTE_KIND => {
+            handle_execute(out_tx, body, in_reply_to, program, host, active, bridge).await
+        }
+        APPLY_KIND => handle_apply(out_tx, body, in_reply_to, host, active, bridge).await,
         // A capability response correlated to a kernel-minted request id.
         // Unknown ids are dropped inside the kernel (no open correlation), so
         // forwarding every tool.result while a run is live is safe.
         TOOL_RESULT_KIND if active.is_some() => {
-            handle_tool_result(out_tx, body, host, active).await
+            handle_tool_result(out_tx, body, host, active, bridge).await
         }
         _ => Ok(()),
     }
@@ -387,6 +412,7 @@ async fn handle_execute(
     program: &Option<LoadedProgram>,
     host: &LuaHost,
     active: &mut Option<ActiveExecute>,
+    bridge: &mut ProviderBridge,
 ) -> Result<(), MagError> {
     let mut modification: Value = match body.get("modification") {
         Some(m @ Value::Object(_)) => m.clone(),
@@ -448,7 +474,7 @@ async fn handle_execute(
 
     host.begin_run(&run_id, run_name, session_id)?;
     let state = host.start(&modification, deadline_ms)?;
-    flush_emits(out_tx, host).await?;
+    flush_emits(out_tx, host, bridge).await?;
 
     // A failed apply / rejected initial modification: nothing spawned.
     if state.done && !state.ok {
@@ -535,6 +561,7 @@ async fn handle_apply(
     in_reply_to: Option<&str>,
     host: &LuaHost,
     active: &mut Option<ActiveExecute>,
+    bridge: &mut ProviderBridge,
 ) -> Result<(), MagError> {
     // Guard: reject applies with no live run before touching the kernel.
     let run_id = match active.as_ref() {
@@ -568,9 +595,13 @@ async fn handle_apply(
     tracing::info!(source = %source, run_id = %run_id, "mag.apply accepted");
 
     let state = host.apply(&modification)?;
-    // Forward the lifecycle events + any abort/cancel envelopes the apply queued
-    // (a kill hands the dying actor its final message, which reaches the bus here).
-    flush_emits(out_tx, host).await?;
+    // Forward the lifecycle events + any abort/cancel envelopes the apply queued.
+    // A kill hands the dying `llm` its final message — the `<provider>.chat.cancel`
+    // envelope keyed by the chat_id handle (factories/llm.lua handle_kill) — which
+    // takes the raw-emit path to the kernel's queue (routing.lua on_emit) and
+    // reaches the bus here verbatim: not a `tool.invoke`, so the bridge forwards
+    // it untouched to the provider that owns that chat.
+    flush_emits(out_tx, host, bridge).await?;
     send_event(
         out_tx,
         applied_body(in_reply_to, state.ok, state.error.as_deref()),
@@ -589,6 +620,7 @@ async fn handle_tool_result(
     body: &Map<String, Value>,
     host: &LuaHost,
     active: &mut Option<ActiveExecute>,
+    bridge: &mut ProviderBridge,
 ) -> Result<(), MagError> {
     let id = match body.get("id").and_then(Value::as_str) {
         Some(id) => id,
@@ -598,7 +630,40 @@ async fn handle_tool_result(
     let result = body.get("output").or_else(|| body.get("result"));
     let error = body.get("error").and_then(Value::as_str);
     host.bus_response(id, result, error)?;
-    flush_emits(out_tx, host).await?;
+    flush_emits(out_tx, host, bridge).await?;
+    settle_if_complete(out_tx, host, active).await
+}
+
+/// Route a provider bridge reply (a driven chat's `chat.complete.result` or
+/// `chat.error`) into the kernel as the correlated capability response. The
+/// single final result feeds `kernel.bus_response`; a `chat.delete` then frees
+/// the provider-side chat. The reply may re-fire the requesting actor (a next
+/// turn → a fresh provider `tool.invoke` the bridge drives again) or complete the
+/// run, so forward whatever it produced and settle. A reply for a chat we don't
+/// drive resolves to `None` and is a no-op.
+async fn handle_provider_reply(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    kind: &str,
+    body: &Map<String, Value>,
+    host: &LuaHost,
+    active: &mut Option<ActiveExecute>,
+    bridge: &mut ProviderBridge,
+) -> Result<(), MagError> {
+    let reply = match bridge.take_reply(kind, body) {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+    host.bus_response(
+        &reply.request_id,
+        reply.result.as_ref(),
+        reply.error.as_deref(),
+    )?;
+    send_event(
+        out_tx,
+        bridge::delete_envelope(&reply.provider, &reply.chat_id),
+    )
+    .await?;
+    flush_emits(out_tx, host, bridge).await?;
     settle_if_complete(out_tx, host, active).await
 }
 

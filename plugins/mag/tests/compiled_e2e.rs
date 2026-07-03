@@ -114,12 +114,18 @@ fn body_kind(body: &Map<String, Value>) -> Option<&str> {
     body.get("kind").and_then(Value::as_str)
 }
 
-/// A `tool.result` reply carrying `output` (the provider/tool convention the
-/// plugin reads — main.rs handle_tool_result).
-fn tool_result(id: &str, output: Value) -> Map<String, Value> {
+/// A provider `chat.complete.result` reply — the REAL provider protocol shape
+/// (starter/mock-provider: `<name>.chat.complete.result { chat_id, output }`).
+/// The mag plugin's provider bridge correlates it back to the driving `llm`
+/// actor by chat_id. This is the shape a scripted `tool.invoke` responder would
+/// never exercise — the exact gap this test now covers.
+fn chat_result(chat_id: &str, output: Value) -> Map<String, Value> {
     let mut m = Map::new();
-    m.insert("kind".into(), Value::String("tool.result".into()));
-    m.insert("id".into(), Value::String(id.to_owned()));
+    m.insert(
+        "kind".into(),
+        Value::String(format!("{PROVIDER}.chat.complete.result")),
+    );
+    m.insert("chat_id".into(), Value::String(chat_id.to_owned()));
     m.insert("output".into(), output);
     m
 }
@@ -208,13 +214,17 @@ async fn compiled_two_agents_program_runs_through_the_entry_adapters_to_the_sink
     execute.insert("run_name".into(), Value::String(RUN_NAME.into()));
     send_event(&mut stdin, execute).await;
 
-    // Deterministic event loop. Every provider request is answered with a final
-    // answer (no tool_calls), so each agent's llm exits straight to FinalAnswer:
+    // Deterministic event loop speaking the REAL provider protocol. The bridge
+    // drives each provider turn as `chat.create` → `chat.append` → `chat.complete`
+    // (NOT a bare tool.invoke — asserted below); we answer each `chat.complete`
+    // with a `chat.complete.result` carrying a distinguishable final answer, so
+    // each agent's llm exits straight to FinalAnswer (no tool_calls):
     //   seed -> docs-explorer.entry -> docs-explorer.llm -(FinalAnswer)->
     //   code-writer.entry -> code-writer.llm -(FinalAnswer)-> sink.
     let mut seen: Vec<String> = Vec::new();
     let mut ready_ids: Vec<String> = Vec::new();
     let mut provider_agents: std::collections::BTreeSet<String> = Default::default();
+    let complete_kind = format!("{PROVIDER}.chat.complete");
     let run_result;
 
     loop {
@@ -235,22 +245,21 @@ async fn compiled_two_agents_program_runs_through_the_entry_adapters_to_the_sink
                     ready_ids.push(id.to_owned());
                 }
             }
+            // The bridge must translate provider requests to the chat.* protocol;
+            // a bare provider tool.invoke on the wire is the exact regression this
+            // test guards against.
             "tool.invoke" => {
                 let name = body.get("name").and_then(Value::as_str).unwrap_or("");
-                let req_id = body
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .expect("tool.invoke carries a correlation id")
-                    .to_owned();
-                assert_eq!(
+                assert_ne!(
                     name, PROVIDER,
-                    "the only capability the program invokes is the provider"
+                    "a provider request must be bridged to chat.*, never a bare tool.invoke"
                 );
+            }
+            k if k == complete_kind => {
                 let chat_id = body
-                    .get("args")
-                    .and_then(|a| a.get("chat_id"))
+                    .get("chat_id")
                     .and_then(Value::as_str)
-                    .expect("provider request carries chat_id")
+                    .expect("chat.complete carries chat_id")
                     .to_owned();
                 // Answer each agent's turn with a distinguishable final answer.
                 let text = if chat_id.starts_with("docs-explorer") {
@@ -262,7 +271,7 @@ async fn compiled_two_agents_program_runs_through_the_entry_adapters_to_the_sink
                 } else {
                     panic!("unexpected provider chat_id {chat_id}");
                 };
-                send_event(&mut stdin, tool_result(&req_id, json!({ "text": text }))).await;
+                send_event(&mut stdin, chat_result(&chat_id, json!({ "text": text }))).await;
             }
             "mag.run_result" => {
                 run_result = body;

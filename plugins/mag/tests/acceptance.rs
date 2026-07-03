@@ -2,9 +2,14 @@
 //! done, in code, deterministic and rerunnable.
 //!
 //! It spawns the real `mag-plugin`, drives its stdio, and acts as the
-//! deterministic provider/tool capability itself: the kernel puts
-//! `tool.invoke` envelopes on the wire, this test answers them from a script.
-//! No wall-clock synchronization — every step is driven off an observed event.
+//! deterministic provider/tool capability itself. Crucially it speaks the REAL
+//! provider protocol: the mag plugin's provider bridge drives each provider turn
+//! as `chat.create` → `chat.append` → `chat.complete` (NOT a bare `tool.invoke`),
+//! and this harness answers each `chat.complete` with a `chat.complete.result` —
+//! the exchange a scripted `tool.invoke` responder skipped, which is why the
+//! provider-bridge gap went unnoticed. Real TOOL invocations (`echo`) stay bare
+//! `tool.invoke`s. No wall-clock synchronization — every step is driven off an
+//! observed event.
 //!
 //! The graph: TWO agents (`a1.*`, `a2.*`) composed in one modification, each a
 //! full provider loop (`llm → run-tool → tool-result → loop-counter → llm`),
@@ -180,12 +185,29 @@ fn parse_chat_id(chat_id: &str) -> (String, u32) {
     (agent, turn)
 }
 
-/// A `tool.result` reply carrying `output` (the provider/tool convention the
-/// plugin reads — main.rs handle_tool_result).
+/// A `tool.result` reply carrying `output` (the tool convention the plugin reads
+/// — main.rs handle_tool_result). Used for real TOOL invocations (`echo`), which
+/// the bridge leaves as bare `tool.invoke`s.
 fn tool_result(id: &str, output: Value) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("kind".into(), Value::String("tool.result".into()));
     m.insert("id".into(), Value::String(id.to_owned()));
+    m.insert("output".into(), output);
+    m
+}
+
+/// A provider `chat.complete.result` reply — the REAL provider protocol shape
+/// (starter/mock-provider: `<name>.chat.complete.result { chat_id, output }`),
+/// correlated back to the driving `llm` actor by chat_id through the mag plugin's
+/// provider bridge. Provider turns are answered with this, NOT a bare
+/// `tool.result` — the exact protocol a scripted `tool.invoke` responder skipped.
+fn chat_result(chat_id: &str, output: Value) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert(
+        "kind".into(),
+        Value::String(format!("{PROVIDER}.chat.complete.result")),
+    );
+    m.insert("chat_id".into(), Value::String(chat_id.to_owned()));
     m.insert("output".into(), output);
     m
 }
@@ -252,9 +274,10 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
     let mut provider_agents: std::collections::BTreeSet<String> = Default::default();
     let mut killed_ids: Vec<String> = Vec::new();
     let mut cancel_chat_id: Option<String> = None;
-    let mut a2_pending_request: Option<String> = None;
+    let mut a2_pending_chat: Option<String> = None;
     let mut a2_kill_sent = false;
     let mut a2_void_sent = false;
+    let complete_kind = format!("{PROVIDER}.chat.complete");
     let run_result;
 
     loop {
@@ -280,6 +303,8 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
                     killed_ids.push(id.to_owned());
                 }
             }
+            // Real TOOL invocations stay bare `tool.invoke`s; a provider request
+            // must NOT (the bridge translates it to chat.*), which this guards.
             "tool.invoke" => {
                 let name = body.get("name").and_then(Value::as_str).unwrap_or("");
                 let req_id = body
@@ -287,64 +312,71 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
                     .and_then(Value::as_str)
                     .expect("tool.invoke carries a correlation id")
                     .to_owned();
-                if name == PROVIDER {
-                    let chat_id = body
-                        .get("args")
-                        .and_then(|a| a.get("chat_id"))
-                        .and_then(Value::as_str)
-                        .expect("provider request carries chat_id")
-                        .to_owned();
-                    let (agent, turn) = parse_chat_id(&chat_id);
-                    provider_agents.insert(agent.clone());
-                    match (agent.as_str(), turn) {
-                        // a1 turn 1 → tool calls; drives the loop one turn.
-                        ("a1", 1) => {
-                            send_event(
-                                &mut stdin,
-                                tool_result(
-                                    &req_id,
-                                    json!({ "tool_calls": [{ "id": "c1", "name": "echo", "args": {} }] }),
-                                ),
-                            )
-                            .await;
-                        }
-                        // a1 turn 2 → final answer; exits the loop to the sink.
-                        ("a1", 2) => {
-                            send_event(
-                                &mut stdin,
-                                tool_result(&req_id, json!({ "text": "final-a1" })),
-                            )
-                            .await;
-                        }
-                        // a2 turn 1 → the doomed request. Withhold the reply and
-                        // kill a2 mid-flight (SIX STEPS #4). Record the request
-                        // id so its late reply can be sent and asserted voided.
-                        ("a2", 1) => {
-                            a2_pending_request = Some(req_id.clone());
-                            if !a2_kill_sent {
-                                a2_kill_sent = true;
-                                let mut apply = Map::new();
-                                apply.insert("kind".into(), Value::String("mag.apply".into()));
-                                apply.insert("id".into(), Value::String("kill-a2".into()));
-                                apply.insert(
-                                    "modification".into(),
-                                    json!({
-                                        "actors": [],
-                                        "messages": [],
-                                        "kills": ["a2.llm", "a2.run-tool", "a2.tool-result", "a2.loop-counter"],
-                                        "rules": []
-                                    }),
-                                );
-                                send_event(&mut stdin, apply).await;
-                            }
-                        }
-                        other => panic!("unexpected provider turn {other:?} (chat_id {chat_id})"),
-                    }
-                } else if name == "echo" {
+                assert_ne!(
+                    name, PROVIDER,
+                    "a provider request must be bridged to chat.*, never a bare tool.invoke"
+                );
+                if name == "echo" {
                     // a1's tool call (from a1.run-tool). Deterministic tool output.
                     send_event(&mut stdin, tool_result(&req_id, json!("echo-ran"))).await;
                 } else {
                     panic!("unexpected capability invoke: {name}");
+                }
+            }
+            // A driven provider turn: the bridge finished `chat.create`/`.append`
+            // and asks the provider to complete. Answer with a `chat.complete.result`
+            // keyed by the same chat_id (the REAL protocol).
+            k if k == complete_kind => {
+                let chat_id = body
+                    .get("chat_id")
+                    .and_then(Value::as_str)
+                    .expect("chat.complete carries chat_id")
+                    .to_owned();
+                let (agent, turn) = parse_chat_id(&chat_id);
+                provider_agents.insert(agent.clone());
+                match (agent.as_str(), turn) {
+                    // a1 turn 1 → tool calls; drives the loop one turn.
+                    ("a1", 1) => {
+                        send_event(
+                            &mut stdin,
+                            chat_result(
+                                &chat_id,
+                                json!({ "tool_calls": [{ "id": "c1", "name": "echo", "args": {} }] }),
+                            ),
+                        )
+                        .await;
+                    }
+                    // a1 turn 2 → final answer; exits the loop to the sink.
+                    ("a1", 2) => {
+                        send_event(
+                            &mut stdin,
+                            chat_result(&chat_id, json!({ "text": "final-a1" })),
+                        )
+                        .await;
+                    }
+                    // a2 turn 1 → the doomed request. Withhold the reply and kill
+                    // a2 mid-completion (SIX STEPS #4). Record the chat_id so its
+                    // late reply can be delivered and asserted voided.
+                    ("a2", 1) => {
+                        a2_pending_chat = Some(chat_id.clone());
+                        if !a2_kill_sent {
+                            a2_kill_sent = true;
+                            let mut apply = Map::new();
+                            apply.insert("kind".into(), Value::String("mag.apply".into()));
+                            apply.insert("id".into(), Value::String("kill-a2".into()));
+                            apply.insert(
+                                "modification".into(),
+                                json!({
+                                    "actors": [],
+                                    "messages": [],
+                                    "kills": ["a2.llm", "a2.run-tool", "a2.tool-result", "a2.loop-counter"],
+                                    "rules": []
+                                }),
+                            );
+                            send_event(&mut stdin, apply).await;
+                        }
+                    }
+                    other => panic!("unexpected provider turn {other:?} (chat_id {chat_id})"),
                 }
             }
             k if k == format!("{PROVIDER}.chat.cancel") => {
@@ -356,14 +388,15 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
                     .expect("cancel envelope carries chat_id")
                     .to_owned();
                 cancel_chat_id = Some(chat_id);
-                // Now deliver a2's withheld provider reply: it must be voided
-                // (the requester is dead, its correlation dropped).
+                // Now deliver a2's withheld provider reply on the same chat: it
+                // must be voided (the requester is dead, its correlation dropped),
+                // so the bridge's bus_response lands on no open correlation.
                 if !a2_void_sent {
                     a2_void_sent = true;
-                    let req = a2_pending_request.clone().expect("a2 request recorded");
+                    let chat = a2_pending_chat.clone().expect("a2 chat recorded");
                     send_event(
                         &mut stdin,
-                        tool_result(&req, json!({ "text": "late-a2-should-be-voided" })),
+                        chat_result(&chat, json!({ "text": "late-a2-should-be-voided" })),
                     )
                     .await;
                 }
