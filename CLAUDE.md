@@ -105,6 +105,10 @@ _Could this be a self-contained composable unit with standard inputs/outputs, li
 - Cross-plugin knowledge disqualifies. A plugin that names another plugin's wire kind in code isn't a bash tool, it's glue. Glue goes in Lua.
 - Type registries / interface hubs (`generic-provider`, `generic-tool`) fail the test by definition — they exist to be consumed, not to do work. Lua libs.
 
+## Compatibility policy (pre-public)
+
+The only compatibility guarantee is within a single minor line: `0.y.x` stays backwards compatible with `0.y.0`. Across minor lines there are none — breaking changes ride the `0.y → 0.y+1` bump, and the flow is to mark a stable release as `0.y.0` and move on, breaking freely toward the next. In practice patch releases haven't occurred under this policy (existing `0.y.z>0` tags predate it). Prefer the clean shape over migration paths, compat shims, or old-session support: do not build fallbacks for prior wire formats, session layouts, or config shapes; delete replaced code instead of deprecating it. Old sessions failing to resume across a minor bump is acceptable. This holds until the project goes public and gains daily-driver users.
+
 ## Versioning
 
 Workspace version is `0.x.y` in `Cargo.toml`. Users pin Lua libs to the engine's version tag via `nefor-pm`; breaking the API means their install breaks on next fetch.
