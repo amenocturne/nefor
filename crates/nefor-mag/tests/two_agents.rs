@@ -72,3 +72,37 @@ fn colliding_agent_ids_are_rejected() {
         "expected a named collision error, got: {err}"
     );
 }
+
+#[test]
+fn agent_profile_lowers_onto_its_llm_actors() {
+    // The agent's :profile is the control plane's hook: the lead resolves it
+    // and overlays provider/model/reasoning_effort keyed by the namespaced
+    // llm actor ids, so :profile must land on exactly those actors' params.
+    let source = r#"
+(type mag.Task)
+(type generic-provider.FinalAnswer)
+
+(let [worker (agent {:id "worker" :system "Answer." :provider "chatgpt"
+                     :profile "standard" :tools ["fs/read"]}
+               : mag.Task -> generic-provider.FinalAnswer)
+      out (node "sink" {}
+          : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]
+  (graph worker -> out :terminal out))
+"#;
+    let ir = nefor_mag::compile(source, &fixtures_dir()).expect("agent program compiles");
+    for id in ["worker.llm", "worker.exhaust"] {
+        let actor = ir
+            .actors
+            .iter()
+            .find(|a| a.id == id)
+            .unwrap_or_else(|| panic!("no actor {id}"));
+        assert_eq!(
+            actor.params.get("profile").and_then(|v| v.as_str()),
+            Some("standard"),
+            "{id} carries the agent's :profile"
+        );
+    }
+    // Non-llm internals stay unprofiled.
+    let entry = ir.actors.iter().find(|a| a.id == "worker.entry").unwrap();
+    assert!(entry.params.get("profile").is_none());
+}

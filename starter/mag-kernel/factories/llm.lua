@@ -79,7 +79,10 @@ M.declaration = {
     model = "string?", -- provider model id
     system = "string?", -- system prompt
     tools = "table?", -- advertised tool list for this call
-    profile = "table?", -- opaque provider profile, passed through untouched
+    profile = "string?", -- orchestration profile name; resolved by the control
+    -- plane into provider/model/reasoning_effort via the params overlay
+    -- before spawn (starter/lead-workflow resolve_profiles)
+    reasoning_effort = "string?", -- resolved reasoning effort for the call
     provider = "string?", -- provider capability name (selection)
   },
 
@@ -148,14 +151,16 @@ function M.construct(id, params, emit, deps)
   -- Build the provider request from params + the incoming turn message. The
   -- exact provider-capability request schema is the capability plugin's own
   -- concern (behind the tool.invoke abstraction); this carries the fields a
-  -- provider needs plus the chat_id handle and the profile passthrough.
+  -- provider needs plus the chat_id handle. `reasoning_effort` is the
+  -- control-plane-resolved profile depth (the bridge threads it into
+  -- chat.create alongside model/system/tools).
   local function build_request(input_message)
     return {
       chat_id = pending.chat_id,
       model = params.model,
       system = params.system,
       tools = params.tools,
-      profile = params.profile,
+      reasoning_effort = params.reasoning_effort,
       input = input_message,
     }
   end

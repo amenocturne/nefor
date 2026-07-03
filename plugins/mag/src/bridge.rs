@@ -208,7 +208,9 @@ fn create_envelope(provider: &str, chat_id: &str, args: &Map<String, Value>) -> 
     m.insert("chat_id".into(), Value::String(chat_id.to_owned()));
     // Thread the call config the provider needs from the request. Absent/null
     // fields are omitted so the provider falls back to its own defaults.
-    for key in ["model", "system", "tools"] {
+    // `reasoning_effort` is the control-plane-resolved profile depth
+    // (factories/llm.lua build_request); providers parse it off chat.create.
+    for key in ["model", "system", "tools", "reasoning_effort"] {
         match args.get(key) {
             Some(v) if !v.is_null() => {
                 m.insert(key.into(), v.clone());

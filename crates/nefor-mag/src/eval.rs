@@ -1279,10 +1279,14 @@ fn eval_agent(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
         _ => return Err(MagError::Eval("agent requires a string :id".into())),
     };
 
-    // llm params: model, system, tools, provider (present keys only, sorted by
-    // BTreeMap). `provider` names the provider capability the llm actor targets;
-    // the kernel llm factory rejects construction without it, so it is authored
-    // on the agent and threaded through to both llm actors below.
+    // llm params: model, system, tools, provider, profile (present keys only,
+    // sorted by BTreeMap). `provider` names the provider capability the llm
+    // actor targets; the kernel llm factory rejects construction without it, so
+    // it is authored on the agent and threaded through to both llm actors
+    // below. `profile` is the orchestration profile name (fast/standard/deep/
+    // max) — lowering it onto the llm actors' params is what lets the control
+    // plane resolve it and land the resolved provider/model/reasoning params on
+    // exactly these actors via the per-actor-id params overlay.
     let mut llm_args: BTreeMap<String, Value> = BTreeMap::new();
     if let Some(model) = config.get("model") {
         llm_args.insert("model".into(), model.clone());
@@ -1296,6 +1300,9 @@ fn eval_agent(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
     if let Some(provider) = config.get("provider") {
         llm_args.insert("provider".into(), provider.clone());
     }
+    if let Some(profile) = config.get("profile") {
+        llm_args.insert("profile".into(), profile.clone());
+    }
 
     // exhaust: a summarizing llm that leaves the bounded loop.
     let mut exhaust_args: BTreeMap<String, Value> = BTreeMap::new();
@@ -1308,6 +1315,9 @@ fn eval_agent(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
     );
     if let Some(provider) = config.get("provider") {
         exhaust_args.insert("provider".into(), provider.clone());
+    }
+    if let Some(profile) = config.get("profile") {
+        exhaust_args.insert("profile".into(), profile.clone());
     }
 
     let max_steps = config.get("max-steps").cloned().unwrap_or(Value::Int(50));
