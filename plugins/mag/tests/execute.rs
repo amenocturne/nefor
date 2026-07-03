@@ -7,8 +7,9 @@
 //!     (`mag.run_started`, actor spawn/ready, `mag.modification_applied`,
 //!     `mag.run_complete`),
 //!   - the ready barrier releases and the run completes in the same turn, and
-//!   - the terminal `mag.run_result` carries the sink's output PATH (control
-//!     plane reads paths, never node data), and that file was persisted.
+//!   - the terminal `mag.run_result` carries the sink's final result INLINE
+//!     (text the lead relays to the model) plus the persisted output PATH,
+//!     and that file was persisted (`persisted` reflects the actual write).
 //!
 //! The modification is passed **inline** rather than compiled from a shipped
 //! `.mag` fixture: the shipped programs (`two-agents.mag`) instantiate `llm`
@@ -37,10 +38,24 @@ fn kernel_path() -> PathBuf {
 }
 
 async fn spawn_mag(data_dir: &std::path::Path) -> Child {
+    spawn_mag_args(data_dir, &kernel_path(), &[]).await
+}
+
+/// Spawn the plugin with an explicit kernel path plus extra argv. Clears
+/// `NEFOR_DEV_DIR` so shared-lib resolution is exactly what the arguments
+/// say, independent of the developer's shell.
+async fn spawn_mag_args(
+    data_dir: &std::path::Path,
+    kernel: &std::path::Path,
+    extra: &[&std::ffi::OsStr],
+) -> Child {
     let mut cmd = tokio::process::Command::new(binary_path());
-    cmd.arg("--kernel")
-        .arg(kernel_path())
-        .env("NEFOR_DATA_DIR", data_dir)
+    cmd.arg("--kernel").arg(kernel);
+    for a in extra {
+        cmd.arg(a);
+    }
+    cmd.env("NEFOR_DATA_DIR", data_dir)
+        .env_remove("NEFOR_DEV_DIR")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -195,13 +210,36 @@ async fn executes_synchronous_sink_program_and_streams_lifecycle_events() {
         "synchronous sink run completes"
     );
     assert_eq!(body.get("run_id").and_then(Value::as_str), Some("sink-run"));
+
+    // The sink's final result rides the terminal reply inline — the lead
+    // relays this text to the model without another tool call.
+    let result = body
+        .get("result")
+        .and_then(Value::as_object)
+        .expect("run_result carries the sink's final result inline");
+    assert_eq!(
+        result.get("text").and_then(Value::as_str),
+        Some("hello from mag execute"),
+        "the inline result is the sink's final answer"
+    );
+
+    assert_eq!(
+        body.get("persisted").and_then(Value::as_bool),
+        Some(true),
+        "persisted flags an actual write"
+    );
     let output_path = body
         .get("output_path")
         .and_then(Value::as_str)
-        .expect("run_result carries the sink output PATH (control-plane semantics)");
+        .expect("run_result carries the sink output PATH");
     assert!(
-        std::path::Path::new(output_path).exists(),
-        "the persisted sink output file exists at {output_path}"
+        output_path.contains("sessions/test-session/mag/runs/sink-run/"),
+        "output persists under the session's mag run dir; got {output_path}"
+    );
+    let content = std::fs::read_to_string(output_path).expect("read persisted sink output");
+    assert!(
+        content.contains("hello from mag execute"),
+        "the persisted file carries the final answer; got {content:?}"
     );
 
     // Teardown.
@@ -318,6 +356,148 @@ async fn execute_accepts_and_applies_params_overlay() {
     drop(stdin);
     let _ = timeout(Duration::from_secs(10), child.wait()).await;
     std::fs::remove_dir_all(&data_dir).ok();
+}
+
+/// Recursively copy a directory tree (the kernel sources into an isolated
+/// location that carries no sibling `lua/` tree).
+fn copy_dir(src: &std::path::Path, dest: &std::path::Path) {
+    std::fs::create_dir_all(dest).expect("mkdir copy dest");
+    for entry in std::fs::read_dir(src).expect("read copy src") {
+        let entry = entry.expect("dir entry");
+        let path = entry.path();
+        let target = dest.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir(&path, &target);
+        } else {
+            std::fs::copy(&path, &target).expect("copy file");
+        }
+    }
+}
+
+/// Drive one synchronous sink execute to its terminal reply and return the
+/// `mag.run_result` body.
+async fn drive_sink_execute(child: &mut Child, run_id: &str, text: &str) -> Map<String, Value> {
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let stderr = child.stderr.take().expect("stderr");
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            eprintln!("[mag stderr] {line}");
+        }
+    });
+
+    handshake(&mut reader, &mut stdin).await;
+
+    let mut execute = Map::new();
+    execute.insert("kind".into(), Value::String("mag.execute".into()));
+    execute.insert("id".into(), Value::String(format!("exec-{run_id}")));
+    execute.insert("session_id".into(), Value::String("test-session".into()));
+    execute.insert("run_id".into(), Value::String(run_id.to_owned()));
+    execute.insert("run_name".into(), Value::String(run_id.to_owned()));
+    execute.insert(
+        "modification".into(),
+        json!({
+            "actors": [ { "id": "sink", "factory": "sink", "params": {}, "routes": {} } ],
+            "messages": [
+                { "to": "sink", "content": { "kind": "generic-provider.FinalAnswer", "text": text } }
+            ],
+            "kills": [],
+            "rules": []
+        }),
+    );
+    send_event(&mut stdin, execute).await;
+
+    let mut seen: Vec<String> = Vec::new();
+    let result = read_collecting(&mut reader, "mag.run_result", &mut seen).await;
+    let body = event_body(&result).expect("run_result body").clone();
+
+    write_env(
+        &mut stdin,
+        Envelope::system(
+            PluginName::engine(),
+            Timestamp::now(),
+            SystemBody::Shutdown {
+                reason: None,
+                grace_ms: None,
+            },
+        ),
+    )
+    .await;
+    drop(stdin);
+    let _ = timeout(Duration::from_secs(10), child.wait()).await;
+    body
+}
+
+/// `persisted` reflects an actual write, and `--lua-root` is the composition
+/// seam that makes persistence work for a kernel whose config dir carries no
+/// sibling `lua/` tree (installed configs). With no resolvable shared tree the
+/// run still completes and the reply still carries the result inline, but
+/// claims `persisted:false` and no path; with `--lua-root` the write lands.
+#[tokio::test]
+async fn persisted_flag_reflects_actual_persistence() {
+    let base = std::env::temp_dir().join(format!("mag-persist-{}", std::process::id()));
+    let data_dir = base.join("data");
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+
+    // An isolated kernel copy: grandparent has no `lua/`, so the shared
+    // output-persistence lib is unresolvable without --lua-root.
+    let kernel_dir = base.join("isolated/mag-kernel");
+    copy_dir(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../starter/mag-kernel"),
+        &kernel_dir,
+    );
+    let kernel = kernel_dir.join("init.lua");
+
+    // No shared Lua tree → no persistence, and the reply says so.
+    let mut child = spawn_mag_args(&data_dir, &kernel, &[]).await;
+    let body = drive_sink_execute(&mut child, "no-libs-run", "answer without libs").await;
+    assert_eq!(
+        body.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+    assert_eq!(
+        body.get("persisted").and_then(Value::as_bool),
+        Some(false),
+        "no write happened, so persisted must be false; got {body:?}"
+    );
+    assert!(
+        body.get("output_path").is_none(),
+        "no output_path is claimed when nothing was written"
+    );
+    assert_eq!(
+        body.get("result")
+            .and_then(Value::as_object)
+            .and_then(|r| r.get("text"))
+            .and_then(Value::as_str),
+        Some("answer without libs"),
+        "the result still rides the reply inline"
+    );
+
+    // The composition's --lua-root wiring restores persistence for the same
+    // isolated kernel.
+    let lua_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lua");
+    let mut child = spawn_mag_args(
+        &data_dir,
+        &kernel,
+        &["--lua-root".as_ref(), lua_root.as_os_str()],
+    )
+    .await;
+    let body = drive_sink_execute(&mut child, "with-libs-run", "answer with libs").await;
+    assert_eq!(
+        body.get("persisted").and_then(Value::as_bool),
+        Some(true),
+        "--lua-root makes persistence real; got {body:?}"
+    );
+    let output_path = body
+        .get("output_path")
+        .and_then(Value::as_str)
+        .expect("persisted run carries the output path");
+    let content = std::fs::read_to_string(output_path).expect("read persisted output");
+    assert!(content.contains("answer with libs"));
+
+    std::fs::remove_dir_all(&base).ok();
 }
 
 /// `mag.apply` outside a live run is rejected with the named guard error — the

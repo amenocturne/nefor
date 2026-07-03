@@ -120,6 +120,15 @@ local state = {
   -- validates and sends `mag.execute`. A `mag.error` reply fails the firing
   -- with the compiler message. One entry per in-flight handshake.
   pending_mag_load = {},
+
+  -- The in-flight kernel run's id. Only `mag.run_started` carries the run
+  -- identity; the kernel's later actor lifecycle events (`mag.actor_spawned` /
+  -- `mag.actor_ready` / `mag.actor_killed`) carry the actor id alone, so we
+  -- stamp the run id here and key them to it — kernel runs are serial, one
+  -- in flight at a time (same convention as the chat surface's
+  -- `mag_active_run_id`, starter/chat/update.lua).
+  ---@type string|nil
+  mag_active_run_id = nil,
 }
 
 local SOURCE_NAME = "lead-workflow"
@@ -919,6 +928,74 @@ local function mark_firing_result(body)
   end
 end
 
+-- The active kernel run the id-only `mag.actor_*` events key to (see
+-- state.mag_active_run_id).
+local function mag_active_run()
+  local run_id = state.mag_active_run_id
+  return type(run_id) == "string" and state.active_runs[run_id] or nil
+end
+
+-- `mag.run_started`: mark the run running and stamp it as the kernel's
+-- in-flight run so the actor lifecycle events below find it.
+local function mark_mag_run_started(body)
+  if type(body.run_id) == "string" and state.active_runs[body.run_id] then
+    state.mag_active_run_id = body.run_id
+    mark_run_started(body)
+  end
+end
+
+-- Track one kernel actor lifecycle transition against the in-flight run's
+-- node table — the same truth the chat surface's live panel tracks
+-- (starter/chat/dag.lua): spawned → pending, ready → running, killed →
+-- killed. A mid-run spawn (`mag.apply`) appends a node the dispatch-time
+-- modification didn't carry.
+local function mark_mag_actor(actor_id, status, factory)
+  local run = mag_active_run()
+  if not run or type(actor_id) ~= "string" or actor_id == "" then return end
+  local ts = now_ms()
+  run.updated_at = ts
+  local node = run.nodes[actor_id]
+  if not node then
+    node = {
+      id = actor_id,
+      role = factory,
+      reasoner = factory,
+      status = "pending",
+    }
+    run.nodes[actor_id] = node
+    run.nodes_order[#run.nodes_order + 1] = actor_id
+  end
+  if type(factory) == "string" then
+    node.reasoner = factory
+    node.role = node.role or factory
+  end
+  if status == "running" then
+    node.status = "running"
+    node.started_at = node.started_at or ts
+  elseif status == "killed" then
+    node.status = "killed"
+    node.completed_at = node.completed_at or ts
+  end
+end
+
+-- `mag.run_complete` (the sink's terminal signal, ahead of the terminal
+-- mag.run_result): the kernel emits no per-actor "done", so every actor still
+-- pending/running flips to done here; killed actors keep their terminal
+-- state. Mirrors the chat surface's dag.mag_run_complete.
+local function mark_mag_run_complete(_body)
+  local run = mag_active_run()
+  if not run then return end
+  local ts = now_ms()
+  run.updated_at = ts
+  for _, id in ipairs(run.nodes_order or {}) do
+    local node = run.nodes[id]
+    if node and (node.status == "pending" or node.status == "running") then
+      node.status = "done"
+      node.completed_at = node.completed_at or ts
+    end
+  end
+end
+
 -- Snapshot the kernel registry's factory names from a mag.hello / mag.loaded
 -- body. This is the source of truth for factory validation
 -- (validate_factories).
@@ -941,6 +1018,20 @@ local function read_output_file(path)
   local content = fh:read("*a")
   fh:close()
   return content
+end
+
+-- The relay text for a run result's inline `result` (the sink's final answer
+-- riding mag.run_result): its text when it carries one, the encoded payload
+-- otherwise. nil when there is no usable result — the caller falls back to
+-- reading the persisted output file.
+local function mag_result_text(result)
+  if type(result) ~= "table" then return nil end
+  if type(result.text) == "string" and #result.text > 0 then
+    return result.text
+  end
+  local ok, encoded = pcall(json.encode, result)
+  if ok and type(encoded) == "string" then return encoded end
+  return nil
 end
 
 -- Relay a kernel run's completion to the model as a fresh orchestrator turn,
@@ -998,14 +1089,17 @@ local function emit_mag_result_block(run, status, output_path, err)
 end
 
 -- Close a kernel run on its terminal mag.run_result. Updates run/graph-status
--- state with the sink's output PATH (control-plane semantics — path, not data),
--- appends the visible run-result block, then relays the completion to the model
--- as a fresh turn (item 2 parity).
+-- state with the sink's output PATH, appends the visible run-result block,
+-- then relays the completion to the model as a fresh turn (item 2 parity).
+-- The relayed content is the sink's final result carried INLINE on the reply
+-- (`body.result` — the model needs the answer, not a path); the persisted
+-- output file is the fallback when the reply predates the inline result.
 local function handle_mag_run_result(body)
   local run_id = body.run_id or body.in_reply_to
   if type(run_id) ~= "string" then return end
   local run = state.active_runs[run_id]
   if not run then return end
+  if state.mag_active_run_id == run_id then state.mag_active_run_id = nil end
   if body.status == "failed" then
     finish_run(run_id, "failed", nil, body.error or "mag run failed")
     emit_mag_result_block(run, "failed", nil, body.error or "mag run failed")
@@ -1018,8 +1112,9 @@ local function handle_mag_run_result(body)
   end
   finish_run(run_id, "completed", results, nil)
   emit_mag_result_block(run, "success", body.output_path, nil)
-  relay_kernel_completion(run_id, true, body.output_path,
-    read_output_file(body.output_path), nil)
+  local content = mag_result_text(body.result)
+    or read_output_file(body.output_path)
+  relay_kernel_completion(run_id, true, body.output_path, content, nil)
 end
 
 terminate_graph = function(firing_id, args)
@@ -1569,6 +1664,29 @@ local function receive_msg(entry)
     handle_mag_run_result(body)
     return
   end
+  -- Kernel actor lifecycle: keep the tracked run's node statuses at the same
+  -- truth the chat surface's live panel tracks, so graph-status and the
+  -- run-result block report done/killed rather than dispatch-time pending.
+  if kind == "mag.run_started" then
+    mark_mag_run_started(body)
+    return
+  end
+  if kind == "mag.actor_spawned" then
+    mark_mag_actor(body.id, "pending", body.factory)
+    return
+  end
+  if kind == "mag.actor_ready" then
+    mark_mag_actor(body.id, "running")
+    return
+  end
+  if kind == "mag.actor_killed" then
+    mark_mag_actor(body.id, "killed")
+    return
+  end
+  if kind == "mag.run_complete" then
+    mark_mag_run_complete(body)
+    return
+  end
 
   if kind == "graph.run_started" then
     mark_run_started(body)
@@ -1652,6 +1770,7 @@ return {
       state.gate_mode = "safe"
       state.kernel_factories = {}
       state.pending_mag_load = {}
+      state.mag_active_run_id = nil
       advertised = false
     end,
   },

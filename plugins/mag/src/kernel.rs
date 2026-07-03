@@ -38,12 +38,15 @@ pub struct BarrierState {
 }
 
 /// A run's terminal signal, surfaced from the sink through the kernel
-/// (`mag.run_complete`). Carries the output PATH — control-plane semantics:
-/// the plane reads statuses and paths, never node data (docs/ir.md).
+/// (`mag.run_complete`). Carries the sink's final result INLINE plus the
+/// persisted output path: the terminal reply is the one place the control
+/// plane consumes the result itself (the lead relays it to the model), so
+/// the result rides here; everything mid-run stays paths-only (docs/ir.md).
 #[derive(Debug, Clone)]
 pub struct RunCompletion {
     pub output_path: Option<String>,
     pub persisted: bool,
+    pub result: Option<JsonValue>,
 }
 
 /// Owns the Lua VM and the kernel table it produced.
@@ -58,20 +61,26 @@ pub struct LuaHost {
 impl LuaHost {
     /// Read, evaluate, and hold the kernel at `path`.
     ///
+    /// `lua_root` is the composition-owned shared Lua tree (the repo/checkout
+    /// `lua/` directory holding `libs/output-persistence` etc.), threaded in
+    /// via `--lua-root` argv; `None` falls back to the search in
+    /// [`set_kernel_path`].
+    ///
     /// The chunk is expected to return a table (the kernel). Anything else is
     /// a [`MagError::KernelNotTable`]. The kernel may call `nefor.log(msg)`
     /// during load; those messages route to the plugin's tracing subscriber
     /// (stderr), never stdout — stdout is the NCP wire.
-    pub fn load_kernel(path: &Path) -> Result<Self, MagError> {
+    pub fn load_kernel(path: &Path, lua_root: Option<&Path>) -> Result<Self, MagError> {
         let source = std::fs::read_to_string(path).map_err(|source| MagError::KernelRead {
             path: path.display().to_string(),
             source,
         })?;
 
         let lua = Lua::new();
-        install_nefor(&lua, resolve_data_root())?;
+        let data_root = resolve_data_root();
+        install_nefor(&lua, data_root.clone())?;
         if let Some(dir) = path.parent() {
-            set_kernel_path(&lua, dir)?;
+            set_kernel_path(&lua, dir, lua_root, &data_root)?;
         }
 
         let chunk_name = format!("@{}", path.display());
@@ -221,10 +230,17 @@ impl LuaHost {
         let rc: Option<Table> = f.call::<Option<Table>>(())?;
         match rc {
             None => Ok(None),
-            Some(t) => Ok(Some(RunCompletion {
-                output_path: t.get::<Option<String>>("output_path")?,
-                persisted: t.get::<Option<bool>>("persisted")?.unwrap_or(false),
-            })),
+            Some(t) => {
+                let result = match t.get::<Value>("result")? {
+                    Value::Nil => None,
+                    v => Some(self.lua.from_value(v)?),
+                };
+                Ok(Some(RunCompletion {
+                    output_path: t.get::<Option<String>>("output_path")?,
+                    persisted: t.get::<Option<bool>>("persisted")?.unwrap_or(false),
+                    result,
+                }))
+            }
         }
     }
 
@@ -308,11 +324,23 @@ fn resolve_data_root() -> String {
 
 /// Point `package.path` at the kernel file's directory (so the entry chunk can
 /// `require` sibling modules by bare name) plus the shared `lua/` and
-/// `lua/libs/` trees (so `output-persistence` resolves). Roots are the
-/// `NEFOR_DEV_DIR` checkout when set, and the kernel dir's grandparent
-/// otherwise (`.../starter/mag-kernel` → repo/config root), mirroring the
-/// `NEFOR_DEV_DIR`-first convention the rest of nefor's Lua loading uses.
-fn set_kernel_path(lua: &Lua, dir: &Path) -> Result<(), MagError> {
+/// `lua/libs/` trees (so `output-persistence` resolves). Lua trees, highest
+/// precedence first:
+///
+/// 1. `lua_root` — the composition-owned `--lua-root` (starter/init.lua
+///    threads its resolved `NEFOR_ROOT/lua` here).
+/// 2. `NEFOR_DEV_DIR/lua` — in-checkout dev mode.
+/// 3. the kernel dir's grandparent's `lua/` (`.../starter/mag-kernel` →
+///    repo root) — covers a bare `--kernel` pointing into a checkout.
+/// 4. `<data_root>/nefor/lua` — the pm-managed sparse-clone every installed
+///    config bootstraps (starter/init.lua), so an installed kernel whose
+///    config dir carries no `lua/` tree still resolves the shared libs.
+fn set_kernel_path(
+    lua: &Lua,
+    dir: &Path,
+    lua_root: Option<&Path>,
+    data_root: &str,
+) -> Result<(), MagError> {
     let package: Table = lua.globals().get("package")?;
     let current: String = package.get("path")?;
 
@@ -321,19 +349,22 @@ fn set_kernel_path(lua: &Lua, dir: &Path) -> Result<(), MagError> {
     entries.push(format!("{kdir}/?.lua"));
     entries.push(format!("{kdir}/?/init.lua"));
 
-    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut trees: Vec<PathBuf> = Vec::new();
+    if let Some(root) = lua_root {
+        trees.push(root.to_path_buf());
+    }
     if let Some(dev) = std::env::var_os("NEFOR_DEV_DIR") {
         if !dev.is_empty() {
-            roots.push(PathBuf::from(dev));
+            trees.push(PathBuf::from(dev).join("lua"));
         }
     }
     // .../starter/mag-kernel → grandparent is the repo/config root.
     if let Some(root) = dir.parent().and_then(Path::parent) {
-        roots.push(root.to_path_buf());
+        trees.push(root.join("lua"));
     }
-    for root in roots {
-        for sub in ["lua", "lua/libs"] {
-            let base = root.join(sub);
+    trees.push(PathBuf::from(data_root).join("nefor/lua"));
+    for tree in trees {
+        for base in [tree.clone(), tree.join("libs")] {
             let base = base.display().to_string();
             entries.push(format!("{base}/?.lua"));
             entries.push(format!("{base}/?/init.lua"));
@@ -482,7 +513,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mag-kernel-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         let path = write_kernel(&dir, "nefor.log(\"hi\")\nreturn { name = \"k\" }");
-        let host = LuaHost::load_kernel(&path).expect("load");
+        let host = LuaHost::load_kernel(&path, None).expect("load");
         assert_eq!(host.kernel_name().as_deref(), Some("k"));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -492,7 +523,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mag-kernel-nt-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         let path = write_kernel(&dir, "return 42");
-        let err = match LuaHost::load_kernel(&path) {
+        let err = match LuaHost::load_kernel(&path, None) {
             Ok(_) => panic!("expected KernelNotTable error"),
             Err(e) => e,
         };
@@ -502,10 +533,11 @@ mod tests {
 
     #[test]
     fn surfaces_missing_kernel_file() {
-        let err = match LuaHost::load_kernel(std::path::Path::new("/nonexistent/mag/kernel.lua")) {
-            Ok(_) => panic!("expected KernelRead error"),
-            Err(e) => e,
-        };
+        let err =
+            match LuaHost::load_kernel(std::path::Path::new("/nonexistent/mag/kernel.lua"), None) {
+                Ok(_) => panic!("expected KernelRead error"),
+                Err(e) => e,
+            };
         assert!(matches!(err, MagError::KernelRead { .. }));
     }
 
@@ -525,7 +557,7 @@ mod tests {
             return { name = "bindings" }
             "#,
         );
-        let host = LuaHost::load_kernel(&path).expect("load");
+        let host = LuaHost::load_kernel(&path, None).expect("load");
         let drained = host.drain_emits().expect("drain");
         assert_eq!(drained.len(), 1, "one queued emit");
         assert_eq!(

@@ -32,6 +32,9 @@ local llm = require("factories.llm")
 -- on package.path plus nefor.fs/json/sessions on the host to activate it.
 local ok_persist, persistence = pcall(require, "output-persistence")
 if not ok_persist then
+  nefor.log("[warn] output-persistence lib not on package.path; per-node "
+    .. "output persistence disabled (runs will report persisted=false): "
+    .. tostring(persistence))
   persistence = nil
 end
 local run_tool = require("factories.run-tool")
@@ -101,11 +104,17 @@ local function emit_event(event)
   end
   if event.kind == observer.EVENTS.run_complete then
     -- Attach the path the sink's writer persisted this run (recorded by
-    -- persist_output below) and stash the signal for take_run_complete.
+    -- persist_output below) and stash the signal — result included — for
+    -- take_run_complete. The sink's own `persisted` flag only says a writer
+    -- was wired; the kernel knows whether a write actually landed (the
+    -- persistence lib may be absent or the write may have failed), so the
+    -- flag surfaced to the control plane is recomputed from that truth.
     event.output_path = run_ctx.last_output_path
+    event.persisted = run_ctx.last_output_path ~= nil
     run_ctx.run_complete = {
       output_path = run_ctx.last_output_path,
       persisted = event.persisted,
+      result = event.result,
     }
   elseif event.kind == observer.EVENTS.run_failed then
     -- An unhandled actor failure (routing.lua apply_completion). Stash it for

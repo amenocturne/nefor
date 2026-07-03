@@ -402,10 +402,15 @@ actor.spawn(require("compositors.graph").spawn_spec(rg_argv))
 -- tools.gate_spec below spawns the gate under): the plugin rewrites the
 -- kernel's tool-class capability invokes onto `<gate>.tool.invoke`, and the
 -- composition layer — not the plugin — owns cross-plugin names.
+-- `--lua-root` threads the bootstrap-resolved shared Lua tree (LUA_ROOT
+-- above) into the plugin's embedded VM so the kernel resolves the shared
+-- libs (`output-persistence`) regardless of where the config dir lives —
+-- installed configs carry no `lua/` tree of their own.
 actor.spawn(actor.identity_spec("mag", {
   require("config").bin("mag-plugin"),
   "--kernel", STARTER_ROOT .. "/mag-kernel/init.lua",
   "--tool-gate", "tool-gate",
+  "--lua-root", LUA_ROOT,
 }))
 
 local tools = require("compositors.tools")

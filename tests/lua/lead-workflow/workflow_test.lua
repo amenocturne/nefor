@@ -456,6 +456,75 @@ do
   os.remove(out_path)
 end
 
+-- The kernel's lifecycle stream drives node statuses (mag.run_started stamps
+-- the run; the id-only actor events key to it), and a mag.run_result carrying
+-- the sink's result INLINE relays its text without any file read.
+do
+  fresh()
+  write_mag_file("firing-kernel-inline-write", "kernel-inline.mag", READ_ONLY_MAG)
+  _test.calls_clear()
+  execute_mag("firing-kernel-inline", "kernel-inline.mag")
+  feed_loaded(read_only_modification())
+  local reply = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result" and c.body.id == "firing-kernel-inline"
+  end)
+  assert_true(reply ~= nil and reply.body.output ~= nil, "execute replies executing")
+  local run_id = reply.body.output.run_id
+
+  -- Kernel lifecycle: run_started carries the run id; actor events only the
+  -- actor id. worker.entry is killed mid-run; the rest complete.
+  feed("mag", { kind = "mag.run_started", run_id = run_id, run_name = "kernel-inline" })
+  for _, actor in ipairs({
+    { id = "worker.entry", factory = "adapter" },
+    { id = "worker.llm",   factory = "llm" },
+    { id = "sink",         factory = "sink" },
+  }) do
+    feed("mag", { kind = "mag.actor_spawned", id = actor.id, factory = actor.factory })
+    feed("mag", { kind = "mag.actor_ready",   id = actor.id })
+  end
+  feed("mag", { kind = "mag.actor_killed", id = "worker.entry" })
+  feed("mag", {
+    kind = "mag.run_complete", from = "sink",
+    result = { text = "INLINE RESULT TEXT" }, persisted = false,
+  })
+
+  _test.calls_clear()
+  feed("mag", {
+    kind      = "mag.run_result",
+    run_id    = run_id,
+    status    = "completed",
+    persisted = false,
+    result    = { from = "worker.llm", kind = "generic-provider.FinalAnswer",
+                  text = "INLINE RESULT TEXT" },
+  })
+
+  -- The relayed fresh turn carries the inline result text — no output file
+  -- exists anywhere in this scenario.
+  local turn = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
+        and c.target == "reasoner-graph"
+  end)
+  assert_true(turn ~= nil,
+    "inline mag.run_result relays a fresh orchestrator turn; got " .. json.encode(_test.calls()))
+  local prompt = turn.body.args and turn.body.args.graph
+    and turn.body.args.graph.nodes[1].args.prompt
+  assert_true(type(prompt) == "string"
+              and prompt:find("INLINE RESULT TEXT", 1, true) ~= nil,
+    "the relayed turn carries the inline result text; got " .. tostring(prompt))
+
+  -- The result block carries the actors' final statuses, not dispatch-time
+  -- pending: killed stays killed, everything else is done.
+  local block = find_call(decode_calls(), function(c)
+    return c.body.kind == "chat.graph_result.append" and c.target == "nefor-tui"
+  end)
+  assert_true(block ~= nil, "run-result block appended")
+  local statuses = {}
+  for _, n in ipairs(block.body.nodes) do statuses[n.id] = n.status end
+  assert_eq(statuses["worker.entry"], "killed", "killed actor keeps its terminal state")
+  assert_eq(statuses["worker.llm"], "done", "completed actor is done, not pending")
+  assert_eq(statuses["sink"], "done", "sink is done, not pending")
+end
+
 -- A failed run appends a failed run-result block carrying the error.
 do
   fresh()

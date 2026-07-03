@@ -6,7 +6,7 @@
 //! modification + the registry's factory names), `mag.eval` (apply a rule fn),
 //! and `mag.execute` (run the resident/inline program through the kernel —
 //! spawn the constellation behind the ready barrier, stream lifecycle events,
-//! and reply `mag.run_result` with the sink's output path).
+//! and reply `mag.run_result` with the sink's final result + output path).
 //!
 //! Layering mirrors the sibling plugins (`reasoner-graph`, `tool-gate`):
 //! - `main.rs` — entry, handshake, dispatch loop, execute drive, bus encoding.
@@ -77,9 +77,11 @@ const ERROR_KIND: &str = "mag.error";
 /// messages, stream lifecycle events, and reply with the run's terminal status.
 const EXECUTE_KIND: &str = "mag.execute";
 
-/// Terminal reply for a run: the sink's output PATH plus status. Control-plane
-/// semantics — statuses and paths, never node data (docs/ir.md, architecture.md
-/// §Control plane).
+/// Terminal reply for a run: status, the sink's final result INLINE, and the
+/// persisted output path. Mid-run events stay paths-and-statuses-only
+/// (docs/ir.md, architecture.md §Control plane); the terminal reply is the
+/// one envelope whose consumer (the lead) relays the result itself, so it
+/// carries the sink's result rather than forcing a read-back through the path.
 const RUN_RESULT_KIND: &str = "mag.run_result";
 
 /// Apply one graph modification directly to the resident kernel, no ready
@@ -142,8 +144,9 @@ async fn run() -> Result<(), MagError> {
     // `mag.hello` truthfully reports the loaded kernel. `host` is held for
     // the whole session — the VM is the kernel's entire world.
     let kernel_path = resolve_kernel_path()?;
+    let lua_root = arg_value("--lua-root").map(PathBuf::from);
     tracing::info!(path = %kernel_path.display(), "loading mag kernel");
-    let host = LuaHost::load_kernel(&kernel_path)?;
+    let host = LuaHost::load_kernel(&kernel_path, lua_root.as_deref())?;
 
     // Advertise the registry's factory names on hello so the control plane has
     // a validation snapshot from plugin startup — the source of truth for
@@ -172,13 +175,8 @@ async fn run() -> Result<(), MagError> {
 /// The engine exports `NEFOR_CONFIG_DIR` into every spawned plugin's env,
 /// so (3) works even when the starter passes no explicit flag.
 fn resolve_kernel_path() -> Result<PathBuf, MagError> {
-    let args: Vec<String> = std::env::args().collect();
-    let mut i = 1;
-    while i < args.len() {
-        if (args[i] == "--kernel" || args[i] == "-k") && i + 1 < args.len() {
-            return Ok(PathBuf::from(&args[i + 1]));
-        }
-        i += 1;
+    if let Some(path) = arg_value("--kernel").or_else(|| arg_value("-k")) {
+        return Ok(PathBuf::from(path));
     }
 
     if let Some(dev) = std::env::var_os("NEFOR_DEV_DIR") {
@@ -203,15 +201,16 @@ fn resolve_kernel_path() -> Result<PathBuf, MagError> {
 /// (mirroring how it names the gate itself: `tools.gate_spec("tool-gate", …)`).
 /// Falls back to [`DEFAULT_GATE_TARGET`] when the flag is absent.
 fn resolve_gate_target() -> String {
+    arg_value("--tool-gate").unwrap_or_else(|| DEFAULT_GATE_TARGET.to_owned())
+}
+
+/// The value following a `<flag> <value>` argv pair, if present.
+fn arg_value(flag: &str) -> Option<String> {
     let args: Vec<String> = std::env::args().collect();
-    let mut i = 1;
-    while i < args.len() {
-        if args[i] == "--tool-gate" && i + 1 < args.len() {
-            return args[i + 1].clone();
-        }
-        i += 1;
-    }
-    DEFAULT_GATE_TARGET.to_owned()
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
 }
 
 async fn run_dispatch_loop(
@@ -319,9 +318,9 @@ async fn poll_active(
 }
 
 /// If the resident run signalled a terminal state, send the terminal reply and
-/// clear the in-flight slot: completion carries the sink's output PATH; an
-/// unhandled actor failure (the kernel's `mag.run_failed` escalation) fails the
-/// run with the failure detail surfaced.
+/// clear the in-flight slot: completion carries the sink's final result plus
+/// its output PATH; an unhandled actor failure (the kernel's `mag.run_failed`
+/// escalation) fails the run with the failure detail surfaced.
 async fn settle_if_complete(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     host: &LuaHost,
@@ -440,8 +439,8 @@ async fn handle_load(
 /// ir.md) or, absent that, from the session's resident program (`mag.load`).
 /// Spawns the constellation behind the ready barrier, streams lifecycle events,
 /// and — for a synchronous program — replies `mag.run_result` with the sink's
-/// output path in the same turn. An async program (a provider round-trip
-/// pending) defers the reply until `mag.run_complete`.
+/// final result + output path in the same turn. An async program (a provider
+/// round-trip pending) defers the reply until `mag.run_complete`.
 async fn handle_execute(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: &Map<String, Value>,
@@ -808,8 +807,11 @@ fn loaded_body(
     m
 }
 
-/// Terminal run reply on success: status + the sink's output PATH (never node
-/// data — control-plane semantics, docs/ir.md).
+/// Terminal run reply on success: status, the sink's final result INLINE
+/// (`result` — text/kind/structured payload, exactly what the sink signalled
+/// on `mag.run_complete`), and the persisted output PATH when the kernel's
+/// writer landed one. `persisted` reflects an actual write (an output path
+/// exists), not merely a wired writer.
 fn run_result_ok(
     in_reply_to: Option<&str>,
     run_id: &str,
@@ -825,6 +827,9 @@ fn run_result_ok(
     m.insert("persisted".into(), Value::Bool(rc.persisted));
     if let Some(path) = &rc.output_path {
         m.insert("output_path".into(), Value::String(path.clone()));
+    }
+    if let Some(result) = &rc.result {
+        m.insert("result".into(), result.clone());
     }
     m
 }
