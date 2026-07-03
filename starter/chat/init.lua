@@ -194,9 +194,12 @@ local function initial_state()
   return {
     entries          = {},
     in_flight        = nil,
-    -- chat_id of the lead conversation, set by `chat.lead.bound`.
-    -- Stream events for other chat_ids never render here.
+    -- The lead conversation's binding, set by `chat.lead.bound`: either
+    -- an exact chat_id or a chat_prefix (the lead's kernel turn-programs
+    -- mint a scoped chat handle per round; the run-scoped prefix is the
+    -- stable identity). Stream events for other chats never render here.
     lead_chat_id     = nil,
+    lead_chat_prefix = nil,
     input_value      = "",
     show_sidebar     = true,
     popup            = nil,

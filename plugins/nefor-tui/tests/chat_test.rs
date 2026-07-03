@@ -834,10 +834,10 @@ fn graph_node_dispatched_then_result_updates_status_glyph() {
 }
 
 // MAG kernel parity: the `mag.*` lifecycle stream drives the same run
-// panel reasoner-graph `graph.*` events do. Only `mag.run_started` carries
-// the run id; actor events are keyed to the in-flight run by the surface.
-// The MAG panel groups actors by top-level namespace segment — an agent's
-// whole subtree collapses to a single group row.
+// panel reasoner-graph `graph.*` events do. Kernel runs are concurrent and
+// every event carries its run_id; the surface keys panel state straight
+// off it. The MAG panel groups actors by top-level namespace segment — an
+// agent's whole subtree collapses to a single group row.
 #[test]
 fn mag_run_lifecycle_renders_in_run_panel() {
     let mut engine = Engine::new(120, 24).expect("engine");
@@ -852,16 +852,16 @@ fn mag_run_lifecycle_renders_in_run_panel() {
             "run_name": "demo",
         }),
     );
-    // Actor events carry no run_id — the surface attaches them to the
-    // single in-flight kernel run stamped by mag.run_started. Two actors
-    // in the same namespace collapse into one `explorer` group row.
+    // Actor events carry their run_id — the surface keys them into that
+    // run's panel entry. Two actors in the same namespace collapse into
+    // one `explorer` group row.
     dispatch_event(
         &mut engine,
-        json!({ "kind": "mag.actor_spawned", "id": "explorer.entry", "factory": "llm" }),
+        json!({ "kind": "mag.actor_spawned", "run_id": "mag-demo-1", "id": "explorer.entry", "factory": "llm" }),
     );
     dispatch_event(
         &mut engine,
-        json!({ "kind": "mag.actor_spawned", "id": "explorer.loop-counter", "factory": "llm" }),
+        json!({ "kind": "mag.actor_spawned", "run_id": "mag-demo-1", "id": "explorer.loop-counter", "factory": "llm" }),
     );
     let out = render_str(&mut engine);
     assert!(
@@ -887,7 +887,7 @@ fn mag_run_lifecycle_renders_in_run_panel() {
 
     dispatch_event(
         &mut engine,
-        json!({ "kind": "mag.actor_ready", "id": "explorer.entry" }),
+        json!({ "kind": "mag.actor_ready", "run_id": "mag-demo-1", "id": "explorer.entry" }),
     );
     let out = render_str(&mut engine);
     assert!(
@@ -897,7 +897,7 @@ fn mag_run_lifecycle_renders_in_run_panel() {
 
     dispatch_event(
         &mut engine,
-        json!({ "kind": "mag.run_complete", "from": "sink" }),
+        json!({ "kind": "mag.run_complete", "run_id": "mag-demo-1", "from": "sink" }),
     );
     let out = render_str(&mut engine);
     assert!(
@@ -925,15 +925,15 @@ fn mag_killed_actor_renders_distinct_glyph() {
     );
     dispatch_event(
         &mut engine,
-        json!({ "kind": "mag.actor_spawned", "id": "writer.draft", "factory": "llm" }),
+        json!({ "kind": "mag.actor_spawned", "run_id": "mag-kill-1", "id": "writer.draft", "factory": "llm" }),
     );
     dispatch_event(
         &mut engine,
-        json!({ "kind": "mag.actor_ready", "id": "writer.draft" }),
+        json!({ "kind": "mag.actor_ready", "run_id": "mag-kill-1", "id": "writer.draft" }),
     );
     dispatch_event(
         &mut engine,
-        json!({ "kind": "mag.actor_killed", "id": "writer.draft" }),
+        json!({ "kind": "mag.actor_killed", "run_id": "mag-kill-1", "id": "writer.draft" }),
     );
     let out = render_str(&mut engine);
     assert!(
@@ -981,7 +981,7 @@ fn mag_two_agent_run_groups_by_namespace() {
     ] {
         dispatch_event(
             &mut engine,
-            json!({ "kind": "mag.actor_spawned", "id": id, "factory": "llm" }),
+            json!({ "kind": "mag.actor_spawned", "run_id": "mag-multi-1", "id": id, "factory": "llm" }),
         );
     }
     let out = render_str(&mut engine);
@@ -1006,20 +1006,20 @@ fn mag_two_agent_run_groups_by_namespace() {
     // Bring one member of each agent live.
     dispatch_event(
         &mut engine,
-        json!({ "kind": "mag.actor_ready", "id": "explorer.entry" }),
+        json!({ "kind": "mag.actor_ready", "run_id": "mag-multi-1", "id": "explorer.entry" }),
     );
     dispatch_event(
         &mut engine,
-        json!({ "kind": "mag.actor_ready", "id": "writer.plan" }),
+        json!({ "kind": "mag.actor_ready", "run_id": "mag-multi-1", "id": "writer.plan" }),
     );
     // Kill the entire writer subtree.
     dispatch_event(
         &mut engine,
-        json!({ "kind": "mag.actor_killed", "id": "writer.plan" }),
+        json!({ "kind": "mag.actor_killed", "run_id": "mag-multi-1", "id": "writer.plan" }),
     );
     dispatch_event(
         &mut engine,
-        json!({ "kind": "mag.actor_killed", "id": "writer.draft" }),
+        json!({ "kind": "mag.actor_killed", "run_id": "mag-multi-1", "id": "writer.draft" }),
     );
     let out = render_str(&mut engine);
     assert_eq!(
@@ -1038,6 +1038,155 @@ fn mag_two_agent_run_groups_by_namespace() {
     assert!(
         out.contains('●'),
         "explorer group should still be running: {out:?}"
+    );
+}
+
+// Concurrent kernel runs render independently, keyed by run_id: the
+// lead's own turn-program overlaps its dispatched sub-runs, and the two
+// author overlapping actor ids (fresh run contexts reuse names freely).
+// Events must land in exactly the run their run_id names.
+#[test]
+fn mag_concurrent_runs_key_panel_state_by_run_id() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "lead-run-1", "run_name": "lead", "scope": "r1" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "sub-run-1", "run_name": "auth-fix", "scope": "r2" }),
+    );
+    // Same actor id in both runs — panel state must not cross.
+    for run_id in ["lead-run-1", "sub-run-1"] {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "mag.actor_spawned", "run_id": run_id, "id": "worker.llm", "factory": "llm" }),
+        );
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "mag.actor_ready", "run_id": run_id, "id": "worker.llm" }),
+        );
+    }
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    assert!(
+        snap.contains("MAG lead") && snap.contains("MAG auth-fix"),
+        "both concurrent runs render, distinguishable by run_name:\n{snap}"
+    );
+
+    // Kill the sub-run's actor: only ITS group flips ⊗; the lead's
+    // same-named group keeps running.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_killed", "run_id": "sub-run-1", "id": "worker.llm" }),
+    );
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    assert_eq!(
+        snap.matches('\u{2297}').count(),
+        1,
+        "the kill lands in exactly the run its run_id names:\n{snap}"
+    );
+    assert!(
+        snap.contains('\u{25cf}'),
+        "the lead run's same-named actor keeps running:\n{snap}"
+    );
+
+    // Completing the sub-run finalises only that run's panel entry.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_complete", "run_id": "sub-run-1", "from": "sink" }),
+    );
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    assert!(
+        snap.contains("MAG lead") && snap.contains("MAG auth-fix"),
+        "the completed sub-run lingers alongside the live lead run:\n{snap}"
+    );
+    assert!(
+        snap.contains('\u{25cf}'),
+        "run_complete for the sub-run must not finalise the lead run:\n{snap}"
+    );
+}
+
+// The lead's kernel turn-program mints a scoped provider chat handle per
+// round (`r<K>/<actor>@r<seq>`), so exact-match binding can't follow it.
+// `chat.lead.bound { chat_prefix }` binds the run's prefix instead: every
+// round's chat renders, foreign scopes stay out, and a later exact-form
+// binding supersedes the prefix.
+#[test]
+fn lead_prefix_binding_renders_scoped_rounds_and_filters_foreign_scopes() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.lead.bound", "chat_prefix": "r3/lead.llm@" }),
+    );
+    // Round 1 and round 2 mint different chat ids under the same prefix.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "chat_id": "r3/lead.llm@r1", "text": "round-one " }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "chat_id": "r3/lead.llm@r2", "text": "round-two" }),
+    );
+    // A dispatched sub-run's actor chat (different scope) is foreign.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "chat_id": "r4/worker.llm@r1", "text": "sub-internal-bytes" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.stream.end",
+            "chat_id": "r3/lead.llm@r2",
+            "model": "qwen-test",
+            "duration_ms": 7,
+        }),
+    );
+
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("round-one") && out.contains("round-two"),
+        "every round under the bound prefix renders: {out:?}"
+    );
+    assert!(
+        !out.contains("sub-internal-bytes"),
+        "foreign-scope chats must stay out of the transcript: {out:?}"
+    );
+
+    // An exact-form binding supersedes the prefix (the reasoner-graph
+    // provider-wrapper path stays exact-match).
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.lead.bound", "chat_id": "chat-9" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "chat_id": "r3/lead.llm@r3", "text": "stale-prefix-bytes" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "chat_id": "chat-9", "text": "exact-bound-reply" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "chat_id": "chat-9", "model": "m", "duration_ms": 1 }),
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("stale-prefix-bytes"),
+        "a later exact binding supersedes the prefix: {out:?}"
+    );
+    assert!(
+        out.contains("exact-bound-reply"),
+        "the exact-bound chat renders after the switch: {out:?}"
     );
 }
 

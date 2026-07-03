@@ -602,15 +602,15 @@ local function handle_session_end(_msg, state)
     toasts           = {},
     completion       = NIL_SENTINEL,
     runs             = {},
-    mag_active_run_id = NIL_SENTINEL,
     lead_chat_id     = NIL_SENTINEL,
+    lead_chat_prefix = NIL_SENTINEL,
   }), {}
 end
 
 local function handle_session_start(_msg, state)
   return shallow_merge(state, {
-    runs = {}, firing_to_node = {}, mag_active_run_id = NIL_SENTINEL,
-    lead_chat_id = NIL_SENTINEL,
+    runs = {}, firing_to_node = {},
+    lead_chat_id = NIL_SENTINEL, lead_chat_prefix = NIL_SENTINEL,
   }), {}
 end
 
@@ -711,28 +711,55 @@ local function handle_message_append(msg, state)
 end
 
 -- The transcript renders exactly one conversation: the lead's. Its
--- chat_id arrives via `chat.lead.bound` (broadcast by the agentic-loop
--- when the lead's provider firing starts, and replayed from the session
--- log on /resume). Kernel-run actor chats (mag `<actor>@rN`, …) stream
--- on the same bus deliberately — the session log and run-panel
--- consumers want the deltas — but they are foreign to the transcript.
--- Events without a chat_id, or arriving before any binding is known,
--- stay renderable (mock providers and pre-binding turns).
+-- binding arrives via `chat.lead.bound` (broadcast by the agentic-loop,
+-- and replayed from the session log on /resume) in one of two forms:
+--
+--   * `{ chat_id }` — exact-match; a single long-lived provider chat
+--     (reasoner-graph provider-wrapper firings).
+--   * `{ chat_prefix }` — prefix-match; the lead's kernel turn-program.
+--     Kernel chat handles are run-scoped and per-round
+--     (`r<K>/<actor>@r<seq>` — a new id every round), so the spawner
+--     binds the `r<K>/<actor>@` prefix once per run instead.
+--
+-- Foreign chats (dispatched kernel runs' actor chats, other scopes)
+-- stream on the same bus deliberately — the session log and run-panel
+-- consumers want the deltas — but stay out of the transcript. Events
+-- without a chat_id, or arriving before any binding is known, stay
+-- renderable (mock providers and pre-binding turns).
 local function is_foreign_chat(msg, state)
   local cid = msg.chat_id
   if type(cid) ~= "string" or #cid == 0 then return false end
+  local prefix = state.lead_chat_prefix
+  if type(prefix) == "string" and #prefix > 0 then
+    return cid:sub(1, #prefix) ~= prefix
+  end
   local lead = state.lead_chat_id
   if type(lead) ~= "string" or #lead == 0 then return false end
   return cid ~= lead
 end
 
 -- Not gated on replay_mode: replay must rebuild the binding so
--- replayed foreign deltas stay out of the transcript too.
+-- replayed foreign deltas stay out of the transcript too. A binding in
+-- either form supersedes the other (the newest broadcast wins — one
+-- lead conversation at a time).
 local function handle_lead_chat_bound(msg, state)
+  local prefix = msg.chat_prefix
+  if type(prefix) == "string" and #prefix > 0 then
+    if state.lead_chat_prefix == prefix then return state, {} end
+    return shallow_merge(state, {
+      lead_chat_prefix = prefix,
+      lead_chat_id     = NIL_SENTINEL,
+    }), {}
+  end
   local cid = msg.chat_id
   if type(cid) ~= "string" or #cid == 0 then return state, {} end
-  if state.lead_chat_id == cid then return state, {} end
-  return shallow_merge(state, { lead_chat_id = cid }), {}
+  if state.lead_chat_id == cid and state.lead_chat_prefix == nil then
+    return state, {}
+  end
+  return shallow_merge(state, {
+    lead_chat_id     = cid,
+    lead_chat_prefix = NIL_SENTINEL,
+  }), {}
 end
 
 local function handle_stream_delta(msg, state)
@@ -1169,21 +1196,21 @@ end
 --
 -- The mag plugin relays the kernel's `mag.*` lifecycle stream onto the bus
 -- as broadcasts; the chat surface consumes them to drive the same run
--- panel reasoner-graph `graph.*` events do. Only `mag.run_started` carries
--- the run id, so we stamp `mag_active_run_id` (kernel runs are serial — one
--- in-flight at a time) and key every later actor/mod event to it.
+-- panel reasoner-graph `graph.*` events do. Kernel runs are concurrent
+-- (the lead's own turn-program overlaps its dispatched sub-runs), and
+-- every event carries its `run_id` — panel state keys straight off it,
+-- so overlapping runs render independently.
 
 local function handle_mag_run_started(msg, state)
   if state.replay_mode then return state, {} end
   local run_id = msg.run_id
   if type(run_id) ~= "string" or run_id == "" then return state, {} end
-  local next_state = run_panel.mag_run_started(state, run_id, msg.run_name, tui.now_ms())
-  return shallow_merge(next_state, { mag_active_run_id = run_id }), {}
+  return run_panel.mag_run_started(state, run_id, msg.run_name, tui.now_ms()), {}
 end
 
 local function handle_mag_actor_spawned(msg, state)
   if state.replay_mode then return state, {} end
-  local run_id = state.mag_active_run_id
+  local run_id = msg.run_id
   local id = msg.id
   if type(run_id) ~= "string" or type(id) ~= "string" or id == "" then return state, {} end
   return run_panel.actor_spawned(state, run_id, id, msg.factory, tui.now_ms()), {}
@@ -1191,7 +1218,7 @@ end
 
 local function handle_mag_actor_ready(msg, state)
   if state.replay_mode then return state, {} end
-  local run_id = state.mag_active_run_id
+  local run_id = msg.run_id
   local id = msg.id
   if type(run_id) ~= "string" or type(id) ~= "string" or id == "" then return state, {} end
   return run_panel.actor_ready(state, run_id, id, tui.now_ms()), {}
@@ -1199,7 +1226,7 @@ end
 
 local function handle_mag_actor_killed(msg, state)
   if state.replay_mode then return state, {} end
-  local run_id = state.mag_active_run_id
+  local run_id = msg.run_id
   local id = msg.id
   if type(run_id) ~= "string" or type(id) ~= "string" or id == "" then return state, {} end
   return run_panel.actor_killed(state, run_id, id, tui.now_ms()), {}
@@ -1207,24 +1234,23 @@ end
 
 local function handle_mag_modification_rejected(msg, state)
   if state.replay_mode then return state, {} end
-  local run_id = state.mag_active_run_id
+  local run_id = msg.run_id
   if type(run_id) ~= "string" then return state, {} end
   return run_panel.modification_rejected(state, run_id), {}
 end
 
 local function handle_mag_modification_noop(msg, state)
   if state.replay_mode then return state, {} end
-  local run_id = state.mag_active_run_id
+  local run_id = msg.run_id
   if type(run_id) ~= "string" then return state, {} end
   return run_panel.modification_noop(state, run_id), {}
 end
 
 local function handle_mag_run_complete(msg, state)
   if state.replay_mode then return state, {} end
-  local run_id = state.mag_active_run_id
+  local run_id = msg.run_id
   if type(run_id) ~= "string" then return state, {} end
-  local next_state = run_panel.mag_run_complete(state, run_id, "success", tui.now_ms())
-  return shallow_merge(next_state, { mag_active_run_id = NIL_SENTINEL }), {}
+  return run_panel.mag_run_complete(state, run_id, "success", tui.now_ms()), {}
 end
 
 local function handle_mouse_selection(msg, state)
