@@ -136,6 +136,9 @@ install-nefor channel="source":
         # MAG compiler (lives in crates/, not plugins/)
         bin="target/release/mag"
         [ -f "$bin" ] && install -m 0755 "$bin" "$LIBEXEC_BIN/mag" && echo "  $LIBEXEC_BIN/mag"
+        # MAG plugin (bin `mag-plugin` != dir basename `mag`, so the plugins/* loop misses it)
+        bin="target/release/mag-plugin"
+        [ -f "$bin" ] && install -m 0755 "$bin" "$LIBEXEC_BIN/mag-plugin" && echo "  $LIBEXEC_BIN/mag-plugin"
         ;;
       latest)
         if command -v brew >/dev/null 2>&1; then
