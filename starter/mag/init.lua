@@ -1,14 +1,16 @@
--- mag/init.lua — MAG workspace management and compiler bridge.
+-- mag/init.lua — MAG workspace management and preview formatting.
 --
--- Provides three things:
+-- Provides two things:
 --   1. Workspace lifecycle: init a per-session MAG workspace seeded
 --      from the config library (mag/lib/).
---   2. Compiler bridge: shell out to the `mag` binary, parse the
---      resulting graph IR JSON.
---   3. Preview formatting: render IR into a human-readable string
---      the lead can inspect before executing.
-
-local json = nefor.json
+--   2. Preview formatting: render a graph modification (the shape the
+--      mag plugin replies with on `mag.loaded`) into a human-readable
+--      string the lead can inspect before executing.
+--
+-- Compilation itself lives in the mag plugin: the lead emits `mag.load`
+-- and reads the modification off the `mag.loaded` reply
+-- (starter/lead-workflow/init.lua). The `mag` CLI binary remains a dev
+-- tool for humans; nothing here shells out to it.
 
 local M = {}
 
@@ -63,59 +65,99 @@ function M.init_workspace(session_id, config_dir)
   return ws, nil
 end
 
--- Compile a .mag file and return the parsed IR or nil + error.
-function M.compile(file_path, source_dir)
-  local root = data_root()
-  if not root then return nil, "no data root available" end
-  local mag_bin = root .. "/bin/mag"
+-- Render one param value compactly: quoted strings (truncated), inline
+-- arrays, `{…}` for nested maps.
+local MAX_STR = 48
 
-  local cmd = mag_bin .. " " .. sh_quote(file_path) .. " --source-dir " .. sh_quote(source_dir) .. " 2>&1"
-  local pipe = io.popen(cmd, "r")
-  if not pipe then
-    return nil, "failed to run mag compiler"
+local function format_value(value)
+  local t = type(value)
+  if t == "string" then
+    local s = value
+    if #s > MAX_STR then s = s:sub(1, MAX_STR - 1) .. "…" end
+    return string.format("%q", s)
   end
-  local output = pipe:read("*a") or ""
-  local ok, _, code = pipe:close()
-
-  if not ok or code ~= 0 then
-    return nil, output  -- compiler error message
+  if t == "table" then
+    -- Array: render inline. Map: elide (params summaries stay one line).
+    if #value > 0 or next(value) == nil then
+      local parts = {}
+      for _, v in ipairs(value) do parts[#parts + 1] = tostring(v) end
+      return "[" .. table.concat(parts, ", ") .. "]"
+    end
+    return "{…}"
   end
-
-  local decode_ok, ir = pcall(json.decode, output)
-  if not decode_ok or type(ir) ~= "table" then
-    return nil, "failed to parse compiler output: " .. tostring(ir or output)
-  end
-
-  return ir, nil
+  return tostring(value)
 end
 
--- Format IR into a human-readable preview string.
-function M.preview(ir)
-  if type(ir) ~= "table" then return "(invalid IR)" end
-  local nodes = ir.nodes or {}
-  local edges = ir.edges or {}
+local function format_params(params)
+  if type(params) ~= "table" or next(params) == nil then return "" end
+  local keys = {}
+  for k in pairs(params) do keys[#keys + 1] = tostring(k) end
+  table.sort(keys)
+  local parts = {}
+  for _, k in ipairs(keys) do
+    parts[#parts + 1] = k .. ": " .. format_value(params[k])
+  end
+  return " {" .. table.concat(parts, ", ") .. "}"
+end
+
+local function format_routes(routes)
+  if type(routes) ~= "table" or next(routes) == nil then return nil end
+  local keys = {}
+  for k in pairs(routes) do keys[#keys + 1] = tostring(k) end
+  table.sort(keys)
+  local parts = {}
+  for _, ty in ipairs(keys) do
+    local dests = routes[ty]
+    local names = {}
+    if type(dests) == "table" then
+      for _, d in ipairs(dests) do names[#names + 1] = tostring(d) end
+    end
+    parts[#parts + 1] = ty .. " -> " .. table.concat(names, ", ")
+  end
+  return table.concat(parts, "; ")
+end
+
+-- Format a graph modification (`mag.loaded` reply shape) into a
+-- human-readable preview: actors with factory + params summary, their
+-- typed routes, the initial messages, the hash, and the kernel
+-- registry's factory names.
+function M.preview(modification, hash, factories)
+  if type(modification) ~= "table" then return "(invalid modification)" end
+  local actors = modification.actors or {}
+  local messages = modification.messages or {}
 
   local lines = {}
-  lines[#lines + 1] = string.format("Graph: %d nodes, %d edges", #nodes, #edges)
-  lines[#lines + 1] = string.format("Terminal: %s", tostring(ir.terminal))
-  lines[#lines + 1] = string.format("Hash: %s", tostring(ir.hash))
+  lines[#lines + 1] = string.format("Modification: %d actors, %d initial messages",
+    #actors, #messages)
+  lines[#lines + 1] = "Hash: " .. tostring(hash or modification.hash)
   lines[#lines + 1] = ""
 
-  lines[#lines + 1] = "Nodes:"
-  for _, node in ipairs(nodes) do
-    local fanout_str = ""
-    if type(node.fanout) == "table" then
-      local out_ids = type(node.fanout.out) == "table" and table.concat(node.fanout.out, ", ") or "?"
-      fanout_str = string.format(" [fanout: %s -> %s]", tostring(node.fanout["in"]), out_ids)
+  lines[#lines + 1] = "Actors:"
+  for _, actor in ipairs(actors) do
+    lines[#lines + 1] = string.format("  %s (%s)%s",
+      tostring(actor.id), tostring(actor.factory), format_params(actor.params))
+    local routes = format_routes(actor.routes)
+    if routes then
+      lines[#lines + 1] = "    routes: " .. routes
     end
-    lines[#lines + 1] = string.format("  %s (%s)%s", tostring(node.id), tostring(node.reasoner), fanout_str)
   end
 
-  lines[#lines + 1] = ""
-  lines[#lines + 1] = "Edges:"
-  for _, edge in ipairs(edges) do
-    local type_str = edge.type and (" [" .. edge.type .. "]") or ""
-    lines[#lines + 1] = string.format("  %s -> %s%s", tostring(edge.from), tostring(edge.to), type_str)
+  if #messages > 0 then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "Initial messages:"
+    for _, msg in ipairs(messages) do
+      local kind = type(msg.content) == "table" and msg.content.kind or nil
+      lines[#lines + 1] = string.format("  -> %s (%s)",
+        tostring(msg.to), tostring(kind or "message"))
+    end
+  end
+
+  if type(factories) == "table" and #factories > 0 then
+    local names = {}
+    for _, f in ipairs(factories) do names[#names + 1] = tostring(f) end
+    table.sort(names)
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "Registry factories: " .. table.concat(names, ", ")
   end
 
   return table.concat(lines, "\n")

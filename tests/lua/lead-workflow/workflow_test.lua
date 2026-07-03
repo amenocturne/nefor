@@ -68,26 +68,77 @@ local function fresh()
   _test.calls_clear()
 end
 
+-- Current authoring dialect: agents are the compiler's `agent` template,
+-- composed with a sink via (graph … :terminal out). The lead's validators
+-- never parse this source — compilation happens in the mag plugin and the
+-- validators run over the modification in the mag.loaded reply — so these
+-- strings only document what the lead writes to disk.
 local READ_ONLY_MAG = [[
-(type Input)
-(type Out)
+(type mag.Task)
+(type generic-provider.FinalAnswer)
 
-(let [run (node "bash_command" {:command "echo ok"} : Input -> Out)
-      out (node "sink" {} : Out -> Out)]
-  (graph run -> out :terminal out))
+(let [worker (agent {:id "worker"
+                     :system "Answer the task."
+                     :provider "chatgpt"
+                     :profile "standard"
+                     :tools ["read_file"]}
+               : mag.Task -> generic-provider.FinalAnswer)
+      out    (node "sink" {} : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]
+  (graph worker -> out :terminal out))
 ]]
 
 local WRITER_MAG = [[
-(type Task)
-(type Patch)
+(type mag.Task)
+(type generic-provider.FinalAnswer)
 
-(let [build (node "agent" {:prompt "implement feature X"
-                           :profile "fast"
-                           :tools ["read_file" "write_file"]}
-              : Task -> Patch)
-      out   (node "sink" {} : Patch -> Patch)]
+(let [build (agent {:id "build"
+                    :system "Implement feature X."
+                    :provider "chatgpt"
+                    :profile "fast"
+                    :tools ["read_file" "write_file"]}
+              : mag.Task -> generic-provider.FinalAnswer)
+      out   (node "sink" {} : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]
   (graph build -> out :terminal out))
 ]]
+
+-- Modification shapes the mag plugin replies with on mag.loaded — the
+-- ModificationIr {actors, messages, kills, rules} the loader lowers to.
+-- The agent template namespaces its internals under :id (worker.llm etc.);
+-- these are trimmed to the actors the validators care about.
+local KERNEL_FACTORIES = { "adapter", "llm", "loop-counter", "run-tool", "sink", "stub", "tool-result" }
+
+local function read_only_modification()
+  return {
+    actors = {
+      { id = "worker.entry", factory = "adapter",
+        params = { seed = "provider-in" },
+        routes = { ["generic-provider.ProviderOut"] = { "worker.llm" } } },
+      { id = "worker.llm", factory = "llm",
+        params = { system = "Answer the task.", provider = "chatgpt",
+                   profile = "standard", tools = { "read_file" } },
+        routes = { ["generic-provider.FinalAnswer"] = { "sink" } } },
+      { id = "sink", factory = "sink", params = {}, routes = {} },
+    },
+    messages = { { to = "worker.entry", content = { kind = "task", prompt = "<initial task text>" } } },
+    kills = {},
+    rules = {},
+  }
+end
+
+local function writer_modification()
+  return {
+    actors = {
+      { id = "build.llm", factory = "llm",
+        params = { system = "Implement feature X.", provider = "chatgpt",
+                   profile = "fast", tools = { "read_file", "write_file" } },
+        routes = { ["generic-provider.FinalAnswer"] = { "sink" } } },
+      { id = "sink", factory = "sink", params = {}, routes = {} },
+    },
+    messages = { { to = "build.llm", content = { kind = "task", prompt = "<initial task text>" } } },
+    kills = {},
+    rules = {},
+  }
+end
 
 local function invoke_tool(id, name, args)
   feed("tool-gate", {
@@ -118,6 +169,26 @@ local function execute_mag(id, file)
   })
 end
 
+-- Drive the load handshake: find the emitted mag.load, feed the mag.loaded
+-- reply carrying `modification`, return the load call. `factories` defaults
+-- to the full kernel registry.
+local function feed_loaded(modification, factories)
+  local load = find_call(decode_calls(), function(c)
+    return c.body.kind == "mag.load" and c.target == "mag"
+  end)
+  assert_true(load ~= nil,
+    "mag compile/execute must emit mag.load to the mag plugin; got "
+    .. json.encode(_test.calls()))
+  feed("mag", {
+    kind        = "mag.loaded",
+    in_reply_to = load.body.id,
+    hash        = "sha256:test",
+    factories   = factories or KERNEL_FACTORIES,
+    modification = modification,
+  })
+  return load
+end
+
 -- ------------------------------------------------------------------
 -- parse_approval_command — pin the command grammar
 -- ------------------------------------------------------------------
@@ -144,7 +215,8 @@ do
 end
 
 -- ------------------------------------------------------------------
--- mag write/execute builds + submits a graph
+-- mag execute: the load handshake — mag.load first, mag.execute only
+-- after the mag.loaded reply validates the modification.
 -- ------------------------------------------------------------------
 
 do
@@ -153,78 +225,78 @@ do
   _test.calls_clear()
   execute_mag("firing-mag-execute-1", "auth-login-map.mag")
 
+  -- Synchronous handshake: mag.load is sent first; mag.execute is withheld
+  -- until the mag.loaded reply carries the modification.
   local calls = decode_calls()
-  -- The actor should submit through agentic-loop, which flushes a
-  -- tool.invoke{name=spawn_graph} targeting reasoner-graph.
-  local invoke = find_call(calls, function(c)
-    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
-        and c.target == "reasoner-graph"
+  local load = find_call(calls, function(c)
+    return c.body.kind == "mag.load" and c.target == "mag"
   end)
-  assert_true(invoke ~= nil,
-    "mag execute must emit spawn_graph tool.invoke targeting reasoner-graph; got "
-    .. json.encode(_test.calls()))
-  assert_true(type(invoke.body.id) == "string" and #invoke.body.id > 0,
-    "spawn_graph tool.invoke carries a non-empty id (run_id)")
+  assert_true(load ~= nil,
+    "mag execute emits mag.load to the mag plugin; got " .. json.encode(_test.calls()))
+  assert_eq(load.body.entry, "auth-login-map.mag", "mag.load names the .mag entry file")
+  assert_true(type(load.body.source_dir) == "string" and #load.body.source_dir > 0,
+    "mag.load carries the workspace source_dir")
 
-  local graph = invoke.body.args and invoke.body.args.graph
-  assert_true(type(graph) == "table", "args.graph present")
-  assert_eq(#graph.nodes, 2, "two nodes in graph")
-  assert_eq(graph.terminal, "out", "sink node becomes terminal")
-  assert_eq(graph.nodes[1].id, "run", "first node id preserved")
-  assert_eq(graph.nodes[1].reasoner, "bash_command",
-    "MAG node reasoner is forwarded")
-  assert_eq(graph.nodes[1].args.command, "echo ok",
-    "MAG node args are forwarded")
-  assert_eq(graph.nodes[2].id, "out", "sink node id preserved")
-  local has_edge = false
-  for _, e in ipairs(graph.edges or {}) do
-    if e.from == "run" and e.to == "out" then has_edge = true end
-  end
-  assert_true(has_edge, "MAG graph edge is forwarded")
+  local premature = find_call(calls, function(c) return c.body.kind == "mag.execute" end)
+  assert_eq(premature, nil,
+    "mag.execute must NOT be sent before mag.loaded (synchronous handshake)")
+  local pre_reply = find_call(calls, function(c)
+    return c.body.kind == "tool.result" and c.body.id == "firing-mag-execute-1"
+  end)
+  assert_eq(pre_reply, nil, "no executing reply until the load handshake resolves")
 
-  -- Active run_id tracked.
-  assert_true(type(lw._internals.state.active_runs[invoke.body.id]) == "table",
-    "active_runs contains the dispatched run_id")
-
-  feed("reasoner-graph", {
-    kind      = "graph.node.fired",
-    run_id    = invoke.body.id,
-    node_id   = "run",
-    firing_id = "firing-node-run",
-    reasoner  = "bash_command",
-  })
-  feed("bash_command", {
-    kind   = "tool.result",
-    id     = "firing-node-run",
-    result = {
-      stdout = "ok\n",
-      exit_code = 0,
-      output_path = "/tmp/nefor-test/sessions/session-1/mag/runs/auth-login-map/run.output",
-      output_relpath = "runs/auth-login-map/run.output",
-    },
-  })
   _test.calls_clear()
-  invoke_tool("firing-graph-status-paths", "graph-status", { run_id = invoke.body.id })
-  local status = find_call(decode_calls(), function(c)
-    return c.body.kind == "tool.result" and c.body.id == "firing-graph-status-paths"
-  end)
-  assert_true(status ~= nil, "graph-status returns the active run")
-  local node = status.body.output.run.nodes[1]
-  assert_eq(node.output_path,
-    "/tmp/nefor-test/sessions/session-1/mag/runs/auth-login-map/run.output",
-    "graph-status exposes absolute output_path")
-  assert_eq(node.output_relpath, "runs/auth-login-map/run.output",
-    "graph-status exposes MAG-relative output_relpath")
+  feed("mag", {
+    kind        = "mag.loaded",
+    in_reply_to = load.body.id,
+    hash        = "sha256:read-only",
+    factories   = KERNEL_FACTORIES,
+    modification = read_only_modification(),
+  })
+  calls = decode_calls()
 
-  -- The actor also replies to the lead's invocation with the run_id.
+  local exec = find_call(calls, function(c)
+    return c.body.kind == "mag.execute" and c.target == "mag"
+  end)
+  assert_true(exec ~= nil,
+    "mag.loaded releases mag.execute; got " .. json.encode(_test.calls()))
+  assert_true(type(exec.body.session_id) == "string" and #exec.body.session_id > 0,
+    "lead injects session_id on mag.execute")
+
+  -- Profiles land via the params overlay, keyed by the ACTOR id that
+  -- authors params.profile — the agent template's namespaced llm actor.
+  local overlay = exec.body.params_overlay
+  assert_true(type(overlay) == "table" and type(overlay["worker.llm"]) == "table",
+    "params_overlay keys on the profiled llm actor id; got " .. json.encode(_test.calls()))
+  assert_eq(overlay["worker.llm"].reasoning_effort, "medium",
+    "profile 'standard' resolves to reasoning_effort=medium")
+  assert_true(type(overlay["worker.llm"].provider) == "string",
+    "profile resolution threads the provider")
+
   local reply = find_call(calls, function(c)
     return c.body.kind == "tool.result" and c.body.id == "firing-mag-execute-1"
   end)
-  assert_true(reply ~= nil, "actor replies to mag execute invocation")
-  assert_eq(reply.body.output.run_id, invoke.body.id,
-    "reply carries the run_id")
-  assert_eq(reply.body.output.status, "executing",
-    "reply reports the graph is executing")
+  assert_true(reply ~= nil and reply.body.output ~= nil, "execute replies executing")
+  assert_eq(reply.body.output.status, "executing", "reply reports the program is executing")
+  assert_eq(reply.body.output.engine, "mag-kernel", "reply reports the kernel engine")
+  assert_eq(reply.body.output.hash, "sha256:read-only", "reply carries the program hash")
+  assert_eq(exec.body.run_id, reply.body.output.run_id,
+    "mag.execute run_id matches the reply run_id")
+
+  -- Active run tracked from the modification's actors: factory under the
+  -- summary's reasoner key (what the chat surface renders).
+  local run = lw._internals.state.active_runs[reply.body.output.run_id]
+  assert_true(type(run) == "table", "active_runs contains the dispatched run_id")
+  assert_eq(run.terminal, "sink", "the canonical sink actor is the terminal")
+  _test.calls_clear()
+  invoke_tool("firing-graph-status-actors", "graph-status", { run_id = reply.body.output.run_id })
+  local status = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result" and c.body.id == "firing-graph-status-actors"
+  end)
+  assert_true(status ~= nil, "graph-status returns the active run")
+  local nodes = status.body.output.run.nodes
+  assert_eq(nodes[1].id, "worker.entry", "actor ids preserved in run summaries")
+  assert_eq(nodes[2].reasoner, "llm", "actor factory carried under the reasoner key")
 end
 
 do
@@ -244,6 +316,11 @@ do
     "invalid MAG path error explains path traversal")
 end
 
+-- ------------------------------------------------------------------
+-- mag compile: mag.load through the plugin, preview rendered from the
+-- mag.loaded modification. Compile never executes.
+-- ------------------------------------------------------------------
+
 do
   fresh()
   write_mag_file("firing-mag-write-compile", "deterministic-check.mag", READ_ONLY_MAG)
@@ -252,93 +329,83 @@ do
     action = "compile",
     file = "deterministic-check.mag",
   })
+  feed_loaded(read_only_modification())
+
   local calls = decode_calls()
   local reply = find_call(calls, function(c)
     return c.body.kind == "tool.result" and c.body.id == "firing-mag-compile"
   end)
   assert_true(reply ~= nil, "mag compile returns a tool.result")
   assert_eq(reply.body.output.status, "compiled", "mag compile reports compiled status")
-  assert_true(type(reply.body.output.preview) == "string"
-              and reply.body.output.preview:find("bash_command", 1, true) ~= nil,
-    "compile preview includes the compiled reasoner")
+  assert_eq(reply.body.output.hash, "sha256:test", "mag compile reports the program hash")
+  local preview = reply.body.output.preview
+  assert_true(type(preview) == "string", "mag compile returns a preview string")
+  for _, needle in ipairs({
+    "worker.llm (llm)",                                    -- actor id + factory
+    "provider: \"chatgpt\"",                               -- params summary
+    "routes: generic-provider.FinalAnswer -> sink",        -- typed routes
+    "-> worker.entry (task)",                              -- initial message
+    "Hash: sha256:test",                                   -- hash
+    "Registry factories: adapter, llm",                    -- kernel registry
+  }) do
+    assert_true(preview:find(needle, 1, true) ~= nil,
+      "compile preview includes '" .. needle .. "'; got:\n" .. preview)
+  end
   local leaked = find_call(calls, function(c)
-    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
+    return c.body.kind == "mag.execute"
   end)
-  assert_eq(leaked, nil, "mag compile previews only and does not submit spawn_graph")
+  assert_eq(leaked, nil, "mag compile previews only and does not send mag.execute")
+end
+
+-- A mag.error reply (compile failure) fails the firing with the compiler
+-- message instead of leaving it hanging.
+do
+  fresh()
+  write_mag_file("firing-mag-write-badsrc", "broken.mag", "(graph nope)")
+  _test.calls_clear()
+  invoke_tool("firing-mag-compile-fail", "mag", {
+    action = "compile",
+    file = "broken.mag",
+  })
+  local load = find_call(decode_calls(), function(c)
+    return c.body.kind == "mag.load" and c.target == "mag"
+  end)
+  assert_true(load ~= nil, "compile emits mag.load")
+  _test.calls_clear()
+  feed("mag", {
+    kind        = "mag.error",
+    in_reply_to = load.body.id,
+    message     = "graph requires a :terminal binding",
+  })
+  local err = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result"
+       and c.body.id == "firing-mag-compile-fail"
+       and type(c.body.error) == "string"
+  end)
+  assert_true(err ~= nil, "mag.error resolves the pending compile as a tool error")
+  assert_true(err.body.error:find("compilation failed", 1, true) ~= nil
+              and err.body.error:find("terminal binding", 1, true) ~= nil,
+    "compile failure carries the compiler message; got " .. json.encode(_test.calls()))
 end
 
 -- ------------------------------------------------------------------
--- Per-execute switch: mag_execute_kernel routes to the MAG actor
--- kernel (mag.load + mag.execute over the bus) instead of
--- reasoner-graph, and mag.run_result closes the run. Default-off path
--- (spawn_graph) is covered by the block above.
+-- Run close: terminal mag.run_result closes the run, relays a fresh
+-- model turn, and appends the visible run-result block.
 -- ------------------------------------------------------------------
 
 do
   fresh()
   write_mag_file("firing-kernel-write", "kernel-run.mag", READ_ONLY_MAG)
   _test.calls_clear()
-
-  local config = require("config")
-  local prev = config.active.mag_execute_kernel
-  config.active.mag_execute_kernel = true
-
   execute_mag("firing-kernel-exec", "kernel-run.mag")
-
-  -- Synchronous handshake: mag.load is sent first; mag.execute is withheld
-  -- until the mag.loaded reply validates against the registry.
-  local calls = decode_calls()
-  local load = find_call(calls, function(c)
-    return c.body.kind == "mag.load" and c.target == "mag"
-  end)
-  assert_true(load ~= nil,
-    "kernel switch emits mag.load to the mag plugin; got " .. json.encode(_test.calls()))
-  assert_eq(load.body.entry, "kernel-run.mag", "mag.load names the .mag entry file")
-
-  local premature = find_call(calls, function(c) return c.body.kind == "mag.execute" end)
-  assert_eq(premature, nil,
-    "mag.execute must NOT be sent before mag.loaded (synchronous handshake)")
-  local pre_reply = find_call(calls, function(c)
+  feed_loaded(read_only_modification())
+  local reply = find_call(decode_calls(), function(c)
     return c.body.kind == "tool.result" and c.body.id == "firing-kernel-exec"
   end)
-  assert_eq(pre_reply, nil, "no executing reply until the load handshake resolves")
-
-  -- The load reply carries the registry (bash_command + sink cover READ_ONLY_MAG);
-  -- it validates and releases mag.execute.
-  _test.calls_clear()
-  feed("mag", {
-    kind        = "mag.loaded",
-    in_reply_to = load.body.id,
-    factories   = { "bash_command", "sink" },
-  })
-  calls = decode_calls()
-
-  local exec = find_call(calls, function(c)
-    return c.body.kind == "mag.execute" and c.target == "mag"
-  end)
-  assert_true(exec ~= nil,
-    "mag.loaded releases mag.execute; got " .. json.encode(_test.calls()))
-  assert_true(type(exec.body.session_id) == "string" and #exec.body.session_id > 0,
-    "lead injects session_id on mag.execute")
-
-  -- The reasoner-graph path must NOT run on the kernel switch.
-  local leaked = find_call(calls, function(c)
-    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
-  end)
-  assert_eq(leaked, nil, "kernel path does not submit spawn_graph to reasoner-graph")
-
-  local reply = find_call(calls, function(c)
-    return c.body.kind == "tool.result" and c.body.id == "firing-kernel-exec"
-  end)
-  assert_true(reply ~= nil and reply.body.output ~= nil, "kernel execute replies executing")
-  assert_eq(reply.body.output.engine, "mag-kernel", "reply reports the kernel engine")
-  assert_eq(exec.body.run_id, reply.body.output.run_id,
-    "mag.execute run_id matches the reply run_id")
-  assert_true(type(lw._internals.state.active_runs[reply.body.output.run_id]) == "table",
-    "kernel run tracked in active_runs")
+  assert_true(reply ~= nil and reply.body.output ~= nil, "execute replies executing")
 
   -- Terminal mag.run_result closes the run AND relays a fresh model turn
-  -- carrying the sink output content read from the path (item 2 parity).
+  -- carrying the sink output content read from the path.
   local out_path = os.tmpname()
   local ofh = io.open(out_path, "w")
   ofh:write("SINK OUTPUT CONTENT")
@@ -353,8 +420,8 @@ do
   assert_eq(lw._internals.state.active_runs[reply.body.output.run_id], nil,
     "run archived after mag.run_result closes it")
 
-  -- The completion is relayed as a fresh orchestrator turn (parity with the
-  -- reasoner-graph completion path — a spawn_graph tool.invoke re-prompt).
+  -- The completion is relayed as a fresh orchestrator turn (agentic-loop's
+  -- lead-turn relay — a spawn_graph tool.invoke re-prompt).
   local turn = find_call(decode_calls(), function(c)
     return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
         and c.target == "reasoner-graph"
@@ -369,10 +436,9 @@ do
   assert_true(prompt:find(out_path, 1, true) ~= nil,
     "the relayed turn carries the sink output path")
 
-  -- The visible run-result block is appended to the chat surface — kernel
-  -- parity with the reasoner-graph close_sub_graph → chat.graph_result.append.
-  -- It carries status + run id + the sink output PATH, but NOT the output
-  -- content (that rides the relayed turn above; no double-render).
+  -- The visible run-result block is appended to the chat surface. It carries
+  -- status + run id + the sink output PATH, but NOT the output content (that
+  -- rides the relayed turn above; no double-render).
   local block = find_call(decode_calls(), function(c)
     return c.body.kind == "chat.graph_result.append" and c.target == "nefor-tui"
   end)
@@ -388,33 +454,19 @@ do
     "result block must NOT duplicate the relayed output content")
 
   os.remove(out_path)
-  config.active.mag_execute_kernel = prev
 end
 
--- A failed kernel run appends a failed run-result block carrying the error.
+-- A failed run appends a failed run-result block carrying the error.
 do
   fresh()
   write_mag_file("firing-kernel-fail-write", "kernel-fail.mag", READ_ONLY_MAG)
   _test.calls_clear()
-  local config = require("config")
-  local prev = config.active.mag_execute_kernel
-  config.active.mag_execute_kernel = true
-
   execute_mag("firing-kernel-fail", "kernel-fail.mag")
-  local load = find_call(decode_calls(), function(c)
-    return c.body.kind == "mag.load" and c.target == "mag"
-  end)
-  assert_true(load ~= nil, "kernel switch emits mag.load")
-  _test.calls_clear()
-  feed("mag", {
-    kind        = "mag.loaded",
-    in_reply_to = load.body.id,
-    factories   = { "bash_command", "sink" },
-  })
+  feed_loaded(read_only_modification())
   local reply = find_call(decode_calls(), function(c)
     return c.body.kind == "tool.result" and c.body.id == "firing-kernel-fail"
   end)
-  assert_true(reply ~= nil and reply.body.output ~= nil, "kernel execute replies executing")
+  assert_true(reply ~= nil and reply.body.output ~= nil, "execute replies executing")
 
   _test.calls_clear()
   feed("mag", {
@@ -432,33 +484,21 @@ do
   assert_true(type(block.body.error) == "string"
               and block.body.error:find("kernel boom", 1, true) ~= nil,
     "failed result block carries the error")
-
-  config.active.mag_execute_kernel = prev
 end
 
--- Kernel handshake rejects an unknown factory against the load-reply registry
--- BEFORE mag.execute is sent.
+-- ------------------------------------------------------------------
+-- Execute validators over the modification's actors.
+-- ------------------------------------------------------------------
+
+-- Unknown factory against the load-reply registry blocks mag.execute.
 do
   fresh()
   write_mag_file("firing-kernel-badfactory-write", "kernel-bad.mag", READ_ONLY_MAG)
   _test.calls_clear()
-  local config = require("config")
-  local prev = config.active.mag_execute_kernel
-  config.active.mag_execute_kernel = true
-
   execute_mag("firing-kernel-badfactory", "kernel-bad.mag")
-  local load = find_call(decode_calls(), function(c)
-    return c.body.kind == "mag.load" and c.target == "mag"
-  end)
-  assert_true(load ~= nil, "kernel switch emits mag.load")
+  -- Registry omits adapter/llm → validation must reject before execute.
+  feed_loaded(read_only_modification(), { "sink", "stub" })
 
-  _test.calls_clear()
-  -- Registry omits bash_command → validation must reject before execute.
-  feed("mag", {
-    kind        = "mag.loaded",
-    in_reply_to = load.body.id,
-    factories   = { "sink", "llm" },
-  })
   local calls = decode_calls()
   local exec = find_call(calls, function(c) return c.body.kind == "mag.execute" end)
   assert_eq(exec, nil, "unknown factory blocks mag.execute")
@@ -467,15 +507,116 @@ do
        and c.body.id == "firing-kernel-badfactory"
        and type(c.body.error) == "string"
   end)
-  assert_true(err ~= nil and err.body.error:find("unknown reasoner type", 1, true) ~= nil,
+  assert_true(err ~= nil and err.body.error:find("unknown factory", 1, true) ~= nil,
     "validation rejects the unknown factory with a clear error; got " .. json.encode(_test.calls()))
-  assert_true(err.body.error:find("bash_command", 1, true) ~= nil,
-    "rejection names the offending reasoner")
-
-  config.active.mag_execute_kernel = prev
+  assert_true(err.body.error:find("worker.entry", 1, true) ~= nil
+              and err.body.error:find("adapter", 1, true) ~= nil,
+    "rejection names the offending actor and factory")
 end
 
--- mag.loaded snapshots the kernel factory registry for reasoner validation.
+-- Sink validators: missing sink, and sink without inbound routes. The
+-- missing-sink error teaches the current dialect (agent + :terminal sink).
+do
+  fresh()
+  write_mag_file("firing-sink-missing-write", "no-sink.mag", READ_ONLY_MAG)
+  _test.calls_clear()
+  execute_mag("firing-sink-missing", "no-sink.mag")
+  local m = read_only_modification()
+  table.remove(m.actors, 3) -- drop the sink actor
+  m.actors[2].routes = {}
+  feed_loaded(m)
+  local calls = decode_calls()
+  assert_eq(find_call(calls, function(c) return c.body.kind == "mag.execute" end), nil,
+    "missing sink blocks mag.execute")
+  local err = find_call(calls, function(c)
+    return c.body.kind == "tool.result"
+       and c.body.id == "firing-sink-missing"
+       and type(c.body.error) == "string"
+  end)
+  assert_true(err ~= nil and err.body.error:find("no sink actor", 1, true) ~= nil,
+    "missing sink is rejected; got " .. json.encode(_test.calls()))
+  assert_true(err.body.error:find("(agent {", 1, true) ~= nil
+              and err.body.error:find(":terminal out", 1, true) ~= nil,
+    "the sink error teaches the current (agent …) + :terminal dialect; got "
+    .. tostring(err.body.error))
+end
+
+do
+  fresh()
+  write_mag_file("firing-sink-orphan-write", "orphan-sink.mag", READ_ONLY_MAG)
+  _test.calls_clear()
+  execute_mag("firing-sink-orphan", "orphan-sink.mag")
+  local m = read_only_modification()
+  m.actors[2].routes = {} -- nothing routes to the sink any more
+  feed_loaded(m)
+  local err = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result"
+       and c.body.id == "firing-sink-orphan"
+       and type(c.body.error) == "string"
+  end)
+  assert_true(err ~= nil and err.body.error:find("no inbound routes", 1, true) ~= nil,
+    "a sink nothing routes to is rejected; got " .. json.encode(_test.calls()))
+end
+
+-- Profile validators: an llm actor must author :profile (or raw
+-- reasoning_effort); both at once and unknown names are rejected.
+do
+  fresh()
+  write_mag_file("firing-profile-missing-write", "no-profile.mag", READ_ONLY_MAG)
+  _test.calls_clear()
+  execute_mag("firing-profile-missing", "no-profile.mag")
+  local m = read_only_modification()
+  m.actors[2].params.profile = nil
+  feed_loaded(m)
+  local err = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result"
+       and c.body.id == "firing-profile-missing"
+       and type(c.body.error) == "string"
+  end)
+  assert_true(err ~= nil and err.body.error:find("missing required :profile", 1, true) ~= nil,
+    "an llm actor without profile/reasoning_effort is rejected; got "
+    .. json.encode(_test.calls()))
+  assert_true(err.body.error:find("worker.llm", 1, true) ~= nil,
+    "the profile error names the llm actor")
+end
+
+do
+  fresh()
+  write_mag_file("firing-profile-both-write", "both-profile.mag", READ_ONLY_MAG)
+  _test.calls_clear()
+  execute_mag("firing-profile-both", "both-profile.mag")
+  local m = read_only_modification()
+  m.actors[2].params.reasoning_effort = "high"
+  feed_loaded(m)
+  local err = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result"
+       and c.body.id == "firing-profile-both"
+       and type(c.body.error) == "string"
+  end)
+  assert_true(err ~= nil
+              and err.body.error:find("both profile and reasoning_effort", 1, true) ~= nil,
+    "profile + raw reasoning_effort together are rejected; got "
+    .. json.encode(_test.calls()))
+end
+
+do
+  fresh()
+  write_mag_file("firing-profile-unknown-write", "bad-profile.mag", READ_ONLY_MAG)
+  _test.calls_clear()
+  execute_mag("firing-profile-unknown", "bad-profile.mag")
+  local m = read_only_modification()
+  m.actors[2].params.profile = "turbo"
+  feed_loaded(m)
+  local err = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result"
+       and c.body.id == "firing-profile-unknown"
+       and type(c.body.error) == "string"
+  end)
+  assert_true(err ~= nil and err.body.error:find("unknown profile 'turbo'", 1, true) ~= nil,
+    "unknown profile names are rejected; got " .. json.encode(_test.calls()))
+end
+
+-- mag.loaded snapshots the kernel factory registry for factory validation.
 do
   fresh()
   feed("mag", {
@@ -497,6 +638,7 @@ do
   write_mag_file("firing-writer-write-no-plan", "feature-build.mag", WRITER_MAG)
   _test.calls_clear()
   execute_mag("firing-writer-no-plan", "feature-build.mag")
+  feed_loaded(writer_modification())
   local calls = decode_calls()
   local err = find_call(calls, function(c)
     return c.body.kind == "tool.result"
@@ -508,15 +650,16 @@ do
   assert_true(err.body.error:find("write%-capable agents") ~= nil
               and err.body.error:find("write%-review") ~= nil,
     "gate-error message names the write-review precondition")
-  -- No spawn_graph should leak through.
+  -- No mag.execute should leak through.
   local leaked = find_call(calls, function(c)
-    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
+    return c.body.kind == "mag.execute"
   end)
   assert_true(leaked == nil,
-    "gate rejection must NOT emit spawn_graph to reasoner-graph")
+    "gate rejection must NOT send mag.execute to the kernel")
 end
 
--- After /approve, the same writer graph is accepted.
+-- After /approve, the same writer program is accepted; the profile overlay
+-- keys on the writer's namespaced llm actor.
 do
   fresh()
   write_mag_file("firing-writer-write-with-plan", "feature-build.mag", WRITER_MAG)
@@ -532,14 +675,19 @@ do
   _test.calls_clear()
 
   execute_mag("firing-writer-with-plan", "feature-build.mag")
+  feed_loaded(writer_modification())
   local calls = decode_calls()
-  local invoke = find_call(calls, function(c)
-    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
-        and c.target == "reasoner-graph"
+  local exec = find_call(calls, function(c)
+    return c.body.kind == "mag.execute" and c.target == "mag"
   end)
-  assert_true(invoke ~= nil,
-    "after plan approval, write-capable MAG execute must emit spawn_graph; got "
+  assert_true(exec ~= nil,
+    "after plan approval, write-capable MAG execute must send mag.execute; got "
     .. json.encode(_test.calls()))
+  local overlay = exec.body.params_overlay
+  assert_true(type(overlay) == "table" and type(overlay["build.llm"]) == "table",
+    "writer profile overlay keys on the namespaced llm actor")
+  assert_eq(overlay["build.llm"].reasoning_effort, "low",
+    "profile 'fast' resolves to reasoning_effort=low")
 end
 
 -- ------------------------------------------------------------------
@@ -730,6 +878,7 @@ do
 
   _test.calls_clear()
   execute_mag("firing-writer-expired", "expired-build.mag")
+  feed_loaded(writer_modification())
   local err = find_call(decode_calls(), function(c)
     return c.body.kind == "tool.result"
        and c.body.id == "firing-writer-expired"
@@ -853,11 +1002,12 @@ do
   write_mag_file("firing-writer-write-auto", "auto-build.mag", WRITER_MAG)
   _test.calls_clear()
   execute_mag("firing-writer-auto", "auto-build.mag")
+  feed_loaded(writer_modification())
   local calls = decode_calls()
-  local invoke = find_call(calls, function(c)
-    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
+  local exec = find_call(calls, function(c)
+    return c.body.kind == "mag.execute" and c.target == "mag"
   end)
-  assert_true(invoke ~= nil, "auto bypasses the human plan gate for writer MAG execute")
+  assert_true(exec ~= nil, "auto bypasses the human plan gate for writer MAG execute")
 end
 
 do
@@ -866,11 +1016,12 @@ do
   write_mag_file("firing-writer-write-yolo", "yolo-build.mag", WRITER_MAG)
   _test.calls_clear()
   execute_mag("firing-writer-yolo", "yolo-build.mag")
+  feed_loaded(writer_modification())
   local calls = decode_calls()
-  local invoke = find_call(calls, function(c)
-    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
+  local exec = find_call(calls, function(c)
+    return c.body.kind == "mag.execute" and c.target == "mag"
   end)
-  assert_true(invoke ~= nil, "yolo bypasses writer MAG execute approval gate")
+  assert_true(exec ~= nil, "yolo bypasses writer MAG execute approval gate")
 end
 
 -- ------------------------------------------------------------------
@@ -882,6 +1033,7 @@ do
   write_mag_file("firing-mag-write-end", "session-end.mag", READ_ONLY_MAG)
   _test.calls_clear()
   execute_mag("firing-mag-execute-end", "session-end.mag")
+  feed_loaded(read_only_modification())
   local run_id = next(lw._internals.state.active_runs)
   assert_true(type(run_id) == "string", "active_runs has an entry after MAG execute")
 

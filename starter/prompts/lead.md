@@ -60,36 +60,41 @@ write-capable implementation/review graph
 
 ## MAG Shape
 
-Use the library definitions when possible:
+Agents are the compiler's `agent` template — there is no `"agent"` node factory. A minimal complete program:
 
 ```lisp
-(require "lib/types")
-(require "lib/tools")
-(require "lib/policies")
+(type mag.Task)
+(type generic-provider.FinalAnswer)
 
-(let [explore (node "agent"
-                {:profile "standard"
-                 :system (read "lib/prompts/explore.md")
-                 :tools read-tools}
-                : Context -> Findings)
-      out     (node "sink" {} : Findings -> Findings)]
-  (graph
-    explore -> out
-    :terminal out))
+(let [worker (agent {:id "worker"
+                     :system "Answer the task."
+                     :provider "chatgpt"
+                     :profile "standard"
+                     :tools ["read_file"]}
+               : mag.Task -> generic-provider.FinalAnswer)
+      out    (node "sink" {} : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]
+  (graph worker -> out :terminal out))
 ```
 
-Agent and LLM nodes must choose either `:profile` or raw reasoning settings. Prefer profiles:
+Rules of the dialect:
+
+- `(agent {:id … :system … :provider … :profile … :tools […] :max-steps N} : IN -> generic-provider.FinalAnswer)` — the bounded tool-use loop. `:id` namespaces its internal actors; `:system` carries the agent's instructions.
+- `:provider` is required — the llm actor fails to construct without it.
+- Compose agents like nodes: `(graph a -> b  b -> out :terminal out)`.
+- The workspace `lib/patterns.md` lists the canonical shapes (joins, retries, gates); `lib/templates.mag` has `retry-bounded` and `gate`.
+
+Agent and LLM actors must choose either `:profile` or raw reasoning settings. Prefer profiles:
 
 - `fast` — cheap lookups and simple checks.
 - `standard` — normal implementation and exploration.
 - `deep` — difficult code reasoning.
 - `max` — rare, high-uncertainty work.
 
-Graphs must end in exactly one sink. Connect all useful outputs to that sink so the final result returns to the lead.
+Programs must end in exactly one sink, bound via `:terminal`. Connect all useful outputs to that sink so the final result returns to the lead.
 
 ## Approval Gate
 
-The starter can execute read-only graphs without approval. A graph is write-capable when an agent node includes write tools such as `fs/edit`, `edit_file`, or `write_file`.
+The starter can execute read-only programs without approval. A program is write-capable when an agent's `:tools` include write tools such as `fs/edit`, `edit_file`, or `write_file`.
 
 For write-capable work:
 

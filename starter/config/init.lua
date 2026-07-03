@@ -82,13 +82,6 @@ M.active = {
   default_reasoning_effort = DEFAULT_REASONING_EFFORT,
   lead_reasoning_effort = DEFAULT_REASONING_EFFORT,
 
-  -- Per-execute switch for the lead's `mag` tool: when true, `action=execute`
-  -- runs the compiled program on the MAG actor kernel (mag.load + mag.execute
-  -- over the bus) instead of the reasoner-graph path. Default off — cutover
-  -- flips it later ([[task-nefor-mag-cutover-reasoner-graph]]). Overridable via
-  -- NEFOR_MAG_EXECUTE_KERNEL=1 for opt-in testing.
-  mag_execute_kernel = env_truthy("NEFOR_MAG_EXECUTE_KERNEL"),
-
   providers = {
     {
       kind = "chatgpt",

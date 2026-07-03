@@ -110,17 +110,16 @@ local state = {
 
   -- Factory names from the kernel registry, snapshotted from `mag.hello` (at
   -- plugin startup) and refreshed by every `mag.loaded` reply. The single
-  -- source of truth for valid reasoner/factory types on both execute paths
-  -- (see validate_reasoners). Deleting the old static KNOWN_REASONERS allowlist
-  -- ([[task-nefor-mag-cutover-reasoner-graph]]).
+  -- source of truth for valid factory types (see validate_factories).
   kernel_factories = {},
 
-  -- Kernel-path executes awaiting their `mag.load` reply, keyed by the load
-  -- request id. The synchronous handshake: `mag.load` is sent, the reply is
-  -- awaited, factory validation runs against the reply's registry, then
-  -- `mag.execute` is sent (resume_pending_execute). One entry per in-flight
-  -- handshake; cleared when the load reply resolves it.
-  pending_kernel_execute = {},
+  -- `mag` tool invocations awaiting their `mag.load` reply, keyed by the load
+  -- request id. Both compile and execute go through this handshake: `mag.load`
+  -- is sent, the `mag.loaded` reply (carrying the modification + the registry)
+  -- resolves it (resume_pending_load) — compile renders the preview, execute
+  -- validates and sends `mag.execute`. A `mag.error` reply fails the firing
+  -- with the compiler message. One entry per in-flight handshake.
+  pending_mag_load = {},
 }
 
 local SOURCE_NAME = "lead-workflow"
@@ -134,16 +133,6 @@ local emit_verdict_rejected
 local emit_verdict_discarded
 
 local VALID_PROFILES = { fast = true, standard = true, deep = true, max = true }
-
--- Per-execute switch: run `mag` execute on the actor kernel (mag.load +
--- mag.execute over the bus) instead of the reasoner-graph path. Default off;
--- cutover flips it ([[task-nefor-mag-cutover-reasoner-graph]]). Read live so a
--- config/env change takes effect without reload.
-local function mag_execute_on_kernel()
-  local ok, cfg = pcall(require, "config")
-  local active = ok and type(cfg) == "table" and cfg.active or nil
-  return type(active) == "table" and active.mag_execute_kernel == true
-end
 
 local function profile_config(name)
   if not VALID_PROFILES[name] then return nil end
@@ -175,11 +164,10 @@ local function emit_tool_result_err(firing_id, err)
 end
 
 -- The kernel's factory registry is the single source-of-truth for valid
--- reasoner/factory types on BOTH execute paths. It arrives on `mag.hello` (at
--- plugin startup) and every `mag.loaded` reply (the `factories` array) and is
--- cached in state.kernel_factories. `validate_reasoners` rejects any node whose
--- reasoner is not a registered factory. The old hand-synced KNOWN_REASONERS
--- allowlist is deleted ([[task-nefor-mag-cutover-reasoner-graph]]).
+-- factory types. It arrives on `mag.hello` (at plugin startup) and every
+-- `mag.loaded` reply (the `factories` array) and is cached in
+-- state.kernel_factories. `validate_factories` rejects any actor whose factory
+-- is not registered.
 --
 -- When no snapshot exists yet (mag plugin not up, or an older plugin that does
 -- not advertise factories), validation is skipped and the kernel's own
@@ -192,20 +180,137 @@ local function sorted_keys(set)
   return keys
 end
 
-local function validate_reasoners(nodes, firing_id)
+local function validate_factories(actors, firing_id)
   local set = state.kernel_factories
   if type(set) ~= "table" or next(set) == nil then
     return true -- no registry snapshot yet; runtime spawn is the backstop
   end
-  for _, node in ipairs(nodes or {}) do
-    if set[node.reasoner] ~= true then
+  for _, actor in ipairs(actors or {}) do
+    if set[actor.factory] ~= true then
       emit_tool_result_err(firing_id,
-        "mag execute: node '" .. tostring(node.id) .. "' uses unknown reasoner type '" ..
-        tostring(node.reasoner) .. "'. Known types: " .. table.concat(sorted_keys(set), ", ") .. ".")
+        "mag execute: actor '" .. tostring(actor.id) .. "' uses unknown factory '" ..
+        tostring(actor.factory) .. "'. Known factories: " ..
+        table.concat(sorted_keys(set), ", ") .. ".")
       return false
     end
   end
   return true
+end
+
+-- Write-capable detection over a modification's actors: any actor whose
+-- params.tools names a write-capable tool makes the program write-capable and
+-- subject to the plan-approval gate. Shell and read-tool actors run freely —
+-- the tool-gate and da-policies enforce runtime permissions.
+local WRITE_TOOLS = { ["fs/edit"] = true, ["edit_file"] = true, ["write_file"] = true }
+
+local function actors_have_writers(actors)
+  for _, actor in ipairs(actors or {}) do
+    local tools = type(actor.params) == "table" and actor.params.tools or nil
+    if type(tools) == "table" then
+      for _, t in ipairs(tools) do
+        if WRITE_TOOLS[t] then return true end
+      end
+    end
+  end
+  return false
+end
+
+-- Sink validation over a modification's actors: exactly one actor with
+-- factory "sink" (the loader canonicalizes the `:terminal` node's id to
+-- "sink"), terminal (no routes), with at least one inbound route.
+-- Returns sink_id or nil + error text in the current authoring dialect.
+local SINK_EXAMPLE = table.concat({
+  'Every program must end in exactly one sink that collects the final output, e.g.',
+  '  (let [worker (agent {:id "worker" :system "…" :provider "chatgpt"',
+  '                       :profile "standard" :tools ["read_file"]}',
+  '                 : mag.Task -> generic-provider.FinalAnswer)',
+  '        out    (node "sink" {} : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]',
+  '    (graph worker -> out :terminal out))',
+}, "\n")
+
+local function validate_sink(actors)
+  local sinks = {}
+  for _, actor in ipairs(actors or {}) do
+    if actor.factory == "sink" then sinks[#sinks + 1] = actor end
+  end
+  if #sinks == 0 then
+    return nil, "program has no sink actor. " .. SINK_EXAMPLE
+  end
+  if #sinks > 1 then
+    local ids = {}
+    for _, s in ipairs(sinks) do ids[#ids + 1] = tostring(s.id) end
+    return nil, "program has multiple sink actors (" .. table.concat(ids, ", ") ..
+      "). Every program must have exactly one sink."
+  end
+  local sink = sinks[1]
+  if type(sink.routes) == "table" and next(sink.routes) ~= nil then
+    return nil, "sink actor '" .. tostring(sink.id) .. "' has outgoing routes. " ..
+      "The sink must be the terminal actor — bind it with :terminal in (graph …)."
+  end
+  local inbound = false
+  for _, actor in ipairs(actors or {}) do
+    if actor ~= sink and type(actor.routes) == "table" then
+      for _, dests in pairs(actor.routes) do
+        if type(dests) == "table" then
+          for _, d in ipairs(dests) do
+            if d == sink.id then inbound = true end
+          end
+        end
+      end
+    end
+  end
+  if not inbound then
+    return nil, "sink actor '" .. tostring(sink.id) .. "' has no inbound routes. " ..
+      "Route at least one actor's output to the sink: (graph worker -> out :terminal out)."
+  end
+  return sink.id, nil
+end
+
+-- Profile resolution over a modification's actors. Any actor authoring
+-- params.profile gets its resolved provider/model/reasoning_effort recorded
+-- in the params overlay keyed by the ACTOR id — for the agent template that
+-- is the namespaced llm actor (e.g. "worker.llm"), because eval_agent lowers
+-- the agent's :profile onto its llm actors' params. llm-factory actors must
+-- carry :profile or raw reasoning_effort so the lead always makes an explicit
+-- reasoning-depth decision. Returns overlay or nil + error text.
+local function resolve_profiles(actors)
+  local overlay = {}
+  for _, actor in ipairs(actors or {}) do
+    local params = type(actor.params) == "table" and actor.params or {}
+    local profile_name = params.profile
+    local has_raw_effort = params.reasoning_effort ~= nil
+    if profile_name ~= nil and has_raw_effort then
+      return nil, "actor '" .. tostring(actor.id) ..
+        "' sets both profile and reasoning_effort; use profile only"
+    end
+    if type(profile_name) == "string" and #profile_name > 0 then
+      if not VALID_PROFILES[profile_name] then
+        return nil, "actor '" .. tostring(actor.id) ..
+          "' has unknown profile '" .. profile_name ..
+          "' (valid: fast, standard, deep, max)"
+      end
+      local resolved = profile_config(profile_name)
+      if type(resolved) == "table" then
+        local patch = {}
+        if type(resolved.reasoning_effort) == "string" then
+          patch.reasoning_effort = resolved.reasoning_effort
+        end
+        if type(resolved.provider) == "string" and #resolved.provider > 0 then
+          patch.provider = resolved.provider
+        end
+        if type(resolved.model) == "string" and #resolved.model > 0 then
+          patch.model = resolved.model
+        end
+        if next(patch) ~= nil then overlay[actor.id] = patch end
+      end
+    elseif actor.factory == "llm" and not has_raw_effort then
+      return nil, "llm actor '" .. tostring(actor.id) ..
+        "' is missing required :profile (fast, standard, deep, or max). " ..
+        "Author :profile on the (agent {…}) config — it lowers onto the " ..
+        "agent's llm actors — or directly on a (node \"llm\" {…})."
+    end
+  end
+  return overlay, nil
 end
 
 local function sh_quote(value)
@@ -596,16 +701,20 @@ now_ms = function()
   return os.time()
 end
 
-register_active_run = function(run_id, graph, terminal, firing_id)
+-- Track a submitted run for graph-status. `actors` is the modification's
+-- actor list ({ id, factory, … }); node summaries carry the factory under the
+-- `reasoner` key, matching what the chat surface renders (chat/dag.lua maps
+-- kernel factory → reasoner the same way).
+register_active_run = function(run_id, actors, terminal, firing_id)
   local nodes_order, nodes = {}, {}
-  for _, node in ipairs((type(graph) == "table" and graph.nodes) or {}) do
-    local id = tostring(node.id or "")
+  for _, actor in ipairs(actors or {}) do
+    local id = tostring(actor.id or "")
     if id ~= "" then
       nodes_order[#nodes_order + 1] = id
       nodes[id] = {
         id = id,
-        role = node.role or node.reasoner,
-        reasoner = node.reasoner,
+        role = actor.factory,
+        reasoner = actor.factory,
         status = "pending",
       }
     end
@@ -811,8 +920,8 @@ local function mark_firing_result(body)
 end
 
 -- Snapshot the kernel registry's factory names from a mag.hello / mag.loaded
--- body. This is the source of truth for reasoner/factory validation
--- (validate_reasoners).
+-- body. This is the source of truth for factory validation
+-- (validate_factories).
 local function capture_kernel_factories(body)
   if type(body.factories) ~= "table" then return end
   local set = {}
@@ -1061,10 +1170,27 @@ local function lead_workflow_tool_schemas()
     {
       name        = "mag",
       description =
-        "Write, compile, and execute MAG workflow graphs. " ..
+        "Write, compile, and execute MAG programs on the actor kernel. " ..
         "Use action='write' to create/update a .mag file in the workspace. " ..
-        "Use action='compile' (default) to compile and preview. " ..
-        "Use action='execute' to compile and submit for execution.",
+        "Use action='compile' (default) to compile and preview the actor " ..
+        "modification. Use action='execute' to compile, validate, and run. " ..
+        "Agents are the compiler's agent template — there is no \"agent\" " ..
+        "node factory. Minimal working program:\n\n" ..
+        "(type mag.Task)\n" ..
+        "(type generic-provider.FinalAnswer)\n\n" ..
+        "(let [worker (agent {:id \"worker\"\n" ..
+        "                     :system \"Answer the task.\"\n" ..
+        "                     :provider \"chatgpt\"\n" ..
+        "                     :profile \"standard\"\n" ..
+        "                     :tools [\"read_file\"]}\n" ..
+        "               : mag.Task -> generic-provider.FinalAnswer)\n" ..
+        "      out    (node \"sink\" {} : generic-provider.FinalAnswer " ..
+        "-> generic-provider.FinalAnswer)]\n" ..
+        "  (graph worker -> out :terminal out))\n\n" ..
+        ":provider is required — the llm actor fails to construct without " ..
+        "it. Every program ends in exactly one sink bound via :terminal. " ..
+        "See lib/patterns.md and lib/templates.mag in the workspace for " ..
+        "composition patterns.",
       parameters  = {
         type = "object",
         properties = {
@@ -1110,7 +1236,7 @@ end
 -- MAG tool handlers.
 --
 -- mag-env: initialise and return the MAG workspace path.
--- mag: compile a .mag file, optionally execute the resulting graph.
+-- mag: write a .mag file, or compile/execute it through the mag plugin.
 
 local function mag_env_handler(firing_id, _args)
   local session_id = sessions.current_id()
@@ -1131,37 +1257,28 @@ local function mag_env_handler(firing_id, _args)
   })
 end
 
--- Kernel execute path (behind the mag_execute_on_kernel switch): a synchronous
--- load → validate → execute handshake. `mag.load` is sent, its reply is awaited
--- (resume_pending_execute, triggered by the mag.loaded event), factory
--- validation runs against the reply's registry, and only then is `mag.execute`
--- sent. The kernel then loads the compiled program and runs it on the actor
--- kernel rather than submitting to reasoner-graph. Lifecycle events
--- (mag.run_started, actor spawn/ready, mag.run_complete) stream on the bus; the
--- terminal mag.run_result (carrying the sink's output PATH) closes the run and
--- relays a fresh model turn in receive_msg.
---
--- Profile params resolved lead-side (fast/standard/deep/max → provider/model/
--- reasoning_effort) are threaded to the actors via `params_overlay` on
--- mag.execute — a per-actor-id param patch the kernel merges before spawn (actor
--- params are kernel-opaque, so an overlay is legitimate control-plane input,
--- ir.md). `overlay` is built lead-side in the profile-resolution loop.
-local function mag_execute_kernel(firing_id, args, ws, graph_spec, sink_id, graph_name, overlay)
-  local session_id = sessions.current_id()
+-- Compile/execute both run a synchronous load handshake against the mag
+-- plugin: `mag.load` is sent, the `mag.loaded` reply carries the lowered
+-- modification {actors, messages, kills, rules}, the hash, and the kernel
+-- registry's factory names. resume_pending_load then either renders the
+-- compile preview or validates and sends `mag.execute`. A `mag.error` reply
+-- (compile failure) fails the firing with the compiler message
+-- (fail_pending_load). Lifecycle events (mag.run_started, actor spawn/ready,
+-- mag.run_complete) stream on the bus; the terminal mag.run_result (carrying
+-- the sink's output PATH) closes the run and relays a fresh model turn in
+-- receive_msg.
+local function begin_mag_load(firing_id, action, args, ws)
+  local graph_name = args.file:gsub("%.mag$", ""):gsub("/", "-"):sub(1, 20)
   local run_id = "mag-" .. tostring(graph_name) .. "-" .. tostring(now_ms())
   local load_id = run_id .. "-load"
 
-  -- Stash the execute context; resume_pending_execute completes it when the
-  -- load reply arrives (keyed by the load request id, echoed as in_reply_to).
-  state.pending_kernel_execute[load_id] = {
+  state.pending_mag_load[load_id] = {
+    action     = action,
     firing_id  = firing_id,
+    file       = args.file,
     run_id     = run_id,
     run_name   = graph_name,
-    session_id = session_id,
-    graph_spec = graph_spec,
-    sink_id    = sink_id,
-    nodes      = graph_spec.nodes,
-    overlay    = overlay,
+    session_id = sessions.current_id(),
   }
 
   emit_as(SOURCE_NAME, "mag", {
@@ -1172,18 +1289,68 @@ local function mag_execute_kernel(firing_id, args, ws, graph_spec, sink_id, grap
   })
 end
 
--- Resume a kernel execute once its `mag.load` reply arrives. The reply's
--- registry has already refreshed state.kernel_factories (capture_kernel_factories
--- runs first); validate every node's factory against it, then send mag.execute
--- with the resolved session_id, run_id, and params overlay. Validation failure
--- acks the firing with an error and drops the pending execute — nothing runs.
-local function resume_pending_execute(body)
+-- Resume a pending compile/execute once its `mag.load` reply arrives. The
+-- reply's registry has already refreshed state.kernel_factories
+-- (capture_kernel_factories runs first). Compile renders the preview from the
+-- modification. Execute validates — factories, write gate, sink, profiles —
+-- and only then sends `mag.execute` with the resolved session_id, run_id, and
+-- params overlay. Validation failure acks the firing with an error and drops
+-- the pending entry — nothing runs.
+--
+-- Profile params resolved lead-side (fast/standard/deep/max → provider/model/
+-- reasoning_effort) are threaded to the actors via `params_overlay` on
+-- mag.execute — a per-actor-id param patch the kernel merges before spawn
+-- (actor params are kernel-opaque, so an overlay is legitimate control-plane
+-- input, ir.md). The overlay keys on the ACTOR ids that author params.profile;
+-- for the agent template those are its namespaced llm actors (eval_agent
+-- lowers the agent's :profile onto them).
+local function resume_pending_load(body)
   local load_id = body.in_reply_to
-  local pending = type(load_id) == "string" and state.pending_kernel_execute[load_id] or nil
+  local pending = type(load_id) == "string" and state.pending_mag_load[load_id] or nil
   if not pending then return end
-  state.pending_kernel_execute[load_id] = nil
+  state.pending_mag_load[load_id] = nil
 
-  if not validate_reasoners(pending.nodes, pending.firing_id) then
+  local modification = body.modification
+  if type(modification) ~= "table" then
+    emit_tool_result_err(pending.firing_id,
+      "mag " .. pending.action .. ": mag.loaded reply carried no modification")
+    return
+  end
+  local actors = modification.actors or {}
+
+  if pending.action == "compile" then
+    emit_tool_result_ok(pending.firing_id, {
+      status  = "compiled",
+      preview = mag.preview(modification, body.hash, body.factories),
+      hash    = body.hash,
+      message = "Program compiled successfully. Review the preview above. " ..
+        "Call mag with action='execute' to run it.",
+    })
+    return
+  end
+
+  -- Execute: validators over the modification's actors.
+  if not validate_factories(actors, pending.firing_id) then return end
+
+  -- Approval gate for write-capable programs (safe mode only; auto/yolo
+  -- bypass — the tool-gate enforces runtime permissions there).
+  if actors_have_writers(actors) and state.gate_mode == "safe"
+      and not has_approved_plan() then
+    emit_tool_result_err(pending.firing_id,
+      "Program contains write-capable agents. Submit a plan via write-review " ..
+      "and get approval before executing.")
+    return
+  end
+
+  local sink_id, sink_err = validate_sink(actors)
+  if not sink_id then
+    emit_tool_result_err(pending.firing_id, "mag execute: " .. sink_err)
+    return
+  end
+
+  local overlay, profile_err = resolve_profiles(actors)
+  if not overlay then
+    emit_tool_result_err(pending.firing_id, "mag execute: " .. profile_err)
     return
   end
 
@@ -1194,20 +1361,33 @@ local function resume_pending_execute(body)
     run_name   = pending.run_name,
     session_id = pending.session_id,
   }
-  if type(pending.overlay) == "table" and next(pending.overlay) ~= nil then
-    exec.params_overlay = pending.overlay
+  if next(overlay) ~= nil then
+    exec.params_overlay = overlay
   end
   emit_as(SOURCE_NAME, "mag", exec)
 
-  register_active_run(pending.run_id, pending.graph_spec, pending.sink_id, pending.firing_id)
+  register_active_run(pending.run_id, actors, sink_id, pending.firing_id)
 
   emit_tool_result_ok(pending.firing_id, {
     status  = "executing",
     run_id  = pending.run_id,
+    hash    = body.hash,
     engine  = "mag-kernel",
-    message = "Graph submitted to the MAG actor kernel. Results arrive automatically when the run " ..
+    message = "Program submitted to the MAG actor kernel. Results arrive automatically when the run " ..
       "completes. STOP here — do not call any more tools until results arrive.",
   })
+end
+
+-- A `mag.error` reply to an in-flight load: the compiler rejected the
+-- program. Fail the firing with the compiler's message so the lead can fix
+-- the source and retry.
+local function fail_pending_load(body)
+  local load_id = body.in_reply_to
+  local pending = type(load_id) == "string" and state.pending_mag_load[load_id] or nil
+  if not pending then return end
+  state.pending_mag_load[load_id] = nil
+  emit_tool_result_err(pending.firing_id,
+    "compilation failed:\n" .. tostring(body.message))
 end
 
 local function mag_handler(firing_id, args)
@@ -1262,225 +1442,16 @@ local function mag_handler(firing_id, args)
     return
   end
 
-  -- Compile.
-  local ir, err = mag.compile(file_path, ws)
-  if not ir then
-    emit_tool_result_err(firing_id, "compilation failed:\n" .. tostring(err))
-    return
-  end
-
-  -- Preview (compile action, default).
-  if action == "compile" then
-    local preview = mag.preview(ir)
-    emit_tool_result_ok(firing_id, {
-      status  = "compiled",
-      preview = preview,
-      hash    = ir.hash,
-      message = "Graph compiled successfully. Review the preview above. " ..
-        "Call mag with action='execute' to run this graph.",
-    })
-    return
-  end
-
-  -- Execute: check approval gate for write-capable nodes.
-  -- Only agent nodes with explicit write tools (edit_file, write_file)
-  -- count as writers. Shell nodes and read-tool agents are allowed
-  -- freely — the tool-gate and da-policies enforce runtime permissions.
-  local WRITE_TOOLS = { ["fs/edit"] = true, ["edit_file"] = true, ["write_file"] = true }
-  local has_writers = false
-  for _, node in ipairs(ir.nodes or {}) do
-    local tools = type(node.args) == "table" and node.args.tools or nil
-    if type(tools) == "table" then
-      for _, t in ipairs(tools) do
-        if WRITE_TOOLS[t] then
-          has_writers = true
-          break
-        end
-      end
-    end
-    if has_writers then break end
-  end
-
-  if has_writers and state.gate_mode == "safe" then
-    if not has_approved_plan() then
-      emit_tool_result_err(firing_id,
-        "Graph contains write-capable agents. Submit a plan via write-review " ..
-        "and get approval before executing.")
-      return
-    end
-  end
-
-  -- Reasoner/factory validation catches typos + missing factories before
-  -- submission, against the kernel registry (validate_reasoners). On the kernel
-  -- path this runs post-load against the load reply's registry
-  -- (resume_pending_execute), so it is skipped here. On the legacy
-  -- reasoner-graph path, validate now against the startup registry snapshot
-  -- (from mag.hello); when no snapshot exists it degrades to the runtime
-  -- spawn-time check.
-  local on_kernel = mag_execute_on_kernel()
-  if not on_kernel then
-    if not validate_reasoners(ir.nodes, firing_id) then return end
-  end
-
-  -- Resolve per-node profiles to reasoning_effort before submission.
-  -- Agent/llm nodes with :profile get provider/model/reasoning_effort
-  -- from orchestration_profiles. Nodes without a profile are rejected
-  -- so the lead always makes an explicit reasoning-depth decision.
-  --
-  -- The resolution mutates node.args (carried into the legacy reasoner-graph
-  -- program) AND records a per-node params overlay keyed by node id, which the
-  -- kernel path threads onto mag.execute (params_overlay) — the kernel loads
-  -- the .mag directly and never sees the mutated node.args, so the overlay is
-  -- how profile params reach its actors. node.id == the actor id (the loader
-  -- keeps ids; only the sink is renamed, and sinks are never profiled).
-  local overlay = {}
-  local PROFILED_REASONERS = { agent = true, llm = true }
-  for _, node in ipairs(ir.nodes or {}) do
-    if PROFILED_REASONERS[node.reasoner] and type(node.args) == "table" then
-      local profile_name = node.args.profile
-      local has_raw_effort = node.args.reasoning_effort ~= nil
-      if profile_name ~= nil and has_raw_effort then
-        emit_tool_result_err(firing_id,
-          "mag execute: node '" .. tostring(node.id) ..
-          "' sets both profile and reasoning_effort; use profile only")
-        return
-      end
-      if type(profile_name) == "string" and #profile_name > 0 then
-        if not VALID_PROFILES[profile_name] then
-          emit_tool_result_err(firing_id,
-            "mag execute: node '" .. tostring(node.id) ..
-            "' has unknown profile '" .. profile_name ..
-            "' (valid: fast, standard, deep, max)")
-          return
-        end
-        local resolved = profile_config(profile_name)
-        if type(resolved) == "table" then
-          local patch = {}
-          if type(resolved.reasoning_effort) == "string" then
-            node.args.reasoning_effort = resolved.reasoning_effort
-            patch.reasoning_effort = resolved.reasoning_effort
-          end
-          if type(resolved.provider) == "string" and #resolved.provider > 0 then
-            node.args.provider = resolved.provider
-            patch.provider = resolved.provider
-          end
-          if type(resolved.model) == "string" and #resolved.model > 0 then
-            node.args.model = resolved.model
-            patch.model = resolved.model
-          end
-          if next(patch) ~= nil then overlay[node.id] = patch end
-        end
-        node.args.profile = nil
-      elseif not has_raw_effort then
-        emit_tool_result_err(firing_id,
-          "mag execute: node '" .. tostring(node.id) ..
-          "' is missing required :profile (fast, standard, deep, or max)")
-        return
-      end
-    end
-  end
-
-  -- Sink validation: exactly one sink node, it must have inputs and no
-  -- outputs, and it becomes the terminal automatically.
-  local sink_ids = {}
-  for _, node in ipairs(ir.nodes or {}) do
-    if node.reasoner == "sink" or node.reasoner == "terminal" then
-      sink_ids[#sink_ids + 1] = node.id
-    end
-  end
-  if #sink_ids == 0 then
+  if action ~= "compile" and action ~= "execute" then
     emit_tool_result_err(firing_id,
-      "mag execute: graph has no sink node. Every graph must end with exactly one " ..
-      "(node \"sink\" {:path \"/tmp/output.md\"} : Input -> Input) that collects the final output.")
-    return
-  end
-  if #sink_ids > 1 then
-    emit_tool_result_err(firing_id,
-      "mag execute: graph has multiple sink nodes (" .. table.concat(sink_ids, ", ") ..
-      "). Every graph must have exactly one sink.")
-    return
-  end
-  local sink_id = sink_ids[1]
-
-  local has_input, has_output = false, false
-  for _, edge in ipairs(ir.edges or {}) do
-    if edge.to == sink_id then has_input = true end
-    if edge.from == sink_id then has_output = true end
-  end
-  if not has_input then
-    emit_tool_result_err(firing_id,
-      "mag execute: sink node '" .. sink_id .. "' has no inputs. " ..
-      "Connect at least one upstream node to the sink.")
-    return
-  end
-  if has_output then
-    emit_tool_result_err(firing_id,
-      "mag execute: sink node '" .. sink_id .. "' has outgoing edges. " ..
-      "The sink must be the final node with no outputs.")
+      "mag: unknown action '" .. tostring(action) ..
+      "' (valid: write, compile, execute)")
     return
   end
 
-  -- Auto-set sink :path when missing.
-  for _, node in ipairs(ir.nodes or {}) do
-    if node.id == sink_id then
-      if type(node.args) ~= "table" then node.args = {} end
-      if type(node.args.path) ~= "string" or #node.args.path == 0 then
-        node.args.path = "/tmp/nefor-output-" .. (ir.hash or "graph") .. ".md"
-      end
-      break
-    end
-  end
-
-  -- Infer read_only for agent nodes without write tools.
-  for _, node in ipairs(ir.nodes or {}) do
-    if node.reasoner == "agent" and type(node.args) == "table" then
-      local has_write = false
-      local tools = node.args.tools
-      if type(tools) == "table" then
-        for _, t in ipairs(tools) do
-          if WRITE_TOOLS[t] then has_write = true; break end
-        end
-      end
-      if not has_write then
-        node.args.read_only = true
-      end
-    end
-  end
-
-  local graph_spec = {
-    terminal = sink_id,
-    nodes    = ir.nodes,
-    edges    = ir.edges,
-  }
-  local graph_name = args.file:gsub("%.mag$", ""):gsub("/", "-"):sub(1, 20)
-
-  -- Per-execute switch: run on the MAG actor kernel instead of reasoner-graph.
-  if on_kernel then
-    mag_execute_kernel(firing_id, args, ws, graph_spec, sink_id, graph_name, overlay)
-    return
-  end
-
-  -- Submit graph through agentic-loop's sub-graph queue (reasoner-graph path).
-  local al = require("agentic-loop")
-  local run_id = al.queue_sub_graph(
-    { graph = graph_spec, on_node_failure = "abort", name = graph_name },
-    firing_id)
-  if type(run_id) ~= "string" then
-    emit_tool_result_err(firing_id,
-      "mag: agentic-loop refused the graph (queue_sub_graph returned nil)")
-    return
-  end
-  register_active_run(run_id, graph_spec, sink_id, firing_id)
-  al.flush_pending_dispatches()
-
-  emit_tool_result_ok(firing_id, {
-    status  = "executing",
-    run_id  = run_id,
-    hash    = ir.hash,
-    message = "Graph submitted for execution. Results will arrive automatically when nodes complete. " ..
-      "STOP here — do not call any more tools until results arrive. " ..
-      "Do not investigate the same topic with your own tools while the graph is running.",
-  })
+  -- Compile and execute both go through the mag plugin's load handshake;
+  -- the mag.loaded reply resolves them (resume_pending_load).
+  begin_mag_load(firing_id, action, args, ws)
 end
 
 local TOOL_HANDLERS = {
@@ -1572,18 +1543,24 @@ local function receive_msg(entry)
     return
   end
 
-  -- MAG kernel path (behind the mag_execute_on_kernel switch).
+  -- MAG kernel path.
   -- mag.hello advertises the factory registry at plugin startup — the startup
-  -- validation snapshot for both paths.
+  -- validation snapshot.
   if kind == "mag.hello" then
     capture_kernel_factories(body)
     return
   end
-  -- mag.loaded is the load-reply half of the synchronous handshake: refresh the
-  -- registry, then resume the awaiting execute (validate → mag.execute).
+  -- mag.loaded is the load-reply half of the synchronous handshake: refresh
+  -- the registry, then resume the awaiting compile (preview) or execute
+  -- (validate → mag.execute).
   if kind == "mag.loaded" then
     capture_kernel_factories(body)
-    resume_pending_execute(body)
+    resume_pending_load(body)
+    return
+  end
+  -- mag.error correlated to an in-flight load is a compile failure.
+  if kind == "mag.error" then
+    fail_pending_load(body)
     return
   end
   if kind == "mag.run_result" then
@@ -1672,7 +1649,7 @@ return {
       state.active_plan = nil
       state.gate_mode = "safe"
       state.kernel_factories = {}
-      state.pending_kernel_execute = {}
+      state.pending_mag_load = {}
       advertised = false
     end,
   },
