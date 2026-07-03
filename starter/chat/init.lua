@@ -8,6 +8,7 @@
 -- `tui.start`.
 --
 -- Inbound chat-contract events handled here:
+--   chat.lead.bound (which chat_id the transcript renders),
 --   chat.message.append, chat.stream.delta, chat.stream.end,
 --   chat.stream.reasoning_delta, chat.stream.reasoning_end,
 --   chat.session.stats, chat.tool.start, chat.tool.end,
@@ -193,6 +194,9 @@ local function initial_state()
   return {
     entries          = {},
     in_flight        = nil,
+    -- chat_id of the lead conversation, set by `chat.lead.bound`.
+    -- Stream events for other chat_ids never render here.
+    lead_chat_id     = nil,
     input_value      = "",
     show_sidebar     = true,
     popup            = nil,

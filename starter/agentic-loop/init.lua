@@ -887,6 +887,13 @@ local function track_provider_firing(reasoner_type, run_id, run_name, node_id, f
   -- the chat_id known the moment streaming starts, so an immediate
   -- ESC during the very first stream still injects the notice.
   if STREAM_VISIBLE_TYPES[reasoner_type] then
+    -- Announce the binding so surfaces can positively identify the
+    -- lead conversation's chat. Other chats stream on the same bus
+    -- deliberately (kernel-run actor chats feed the session log and
+    -- run-panel consumers); a transcript renders only the bound chat.
+    if state.current_lead_chat_id ~= chat_id then
+      emit(nil, { kind = "chat.lead.bound", chat_id = chat_id })
+    end
     state.current_lead_chat_id = chat_id
   end
   return key

@@ -603,12 +603,14 @@ local function handle_session_end(_msg, state)
     completion       = NIL_SENTINEL,
     dag_runs         = {},
     mag_active_run_id = NIL_SENTINEL,
+    lead_chat_id     = NIL_SENTINEL,
   }), {}
 end
 
 local function handle_session_start(_msg, state)
   return shallow_merge(state, {
     dag_runs = {}, firing_to_node = {}, mag_active_run_id = NIL_SENTINEL,
+    lead_chat_id = NIL_SENTINEL,
   }), {}
 end
 
@@ -708,13 +710,40 @@ local function handle_message_append(msg, state)
   }), {}
 end
 
+-- The transcript renders exactly one conversation: the lead's. Its
+-- chat_id arrives via `chat.lead.bound` (broadcast by the agentic-loop
+-- when the lead's provider firing starts, and replayed from the session
+-- log on /resume). Kernel-run actor chats (mag `<actor>@rN`, …) stream
+-- on the same bus deliberately — the session log and run-panel
+-- consumers want the deltas — but they are foreign to the transcript.
+-- Events without a chat_id, or arriving before any binding is known,
+-- stay renderable (mock providers and pre-binding turns).
+local function is_foreign_chat(msg, state)
+  local cid = msg.chat_id
+  if type(cid) ~= "string" or #cid == 0 then return false end
+  local lead = state.lead_chat_id
+  if type(lead) ~= "string" or #lead == 0 then return false end
+  return cid ~= lead
+end
+
+-- Not gated on replay_mode: replay must rebuild the binding so
+-- replayed foreign deltas stay out of the transcript too.
+local function handle_lead_chat_bound(msg, state)
+  local cid = msg.chat_id
+  if type(cid) ~= "string" or #cid == 0 then return state, {} end
+  if state.lead_chat_id == cid then return state, {} end
+  return shallow_merge(state, { lead_chat_id = cid }), {}
+end
+
 local function handle_stream_delta(msg, state)
+  if is_foreign_chat(msg, state) then return state, {} end
   local t = msg.text or msg.delta or ""
   if #t == 0 then return state, {} end
   return transcript.append_assistant_delta(state, t), {}
 end
 
 local function handle_stream_end(msg, state)
+  if is_foreign_chat(msg, state) then return state, {} end
   local next_state = transcript.finalize_assistant(state, msg.text, msg.model, msg.duration_ms)
   if state.queued_entry_idx then
     local qe = next_state.entries[state.queued_entry_idx]
@@ -727,16 +756,19 @@ local function handle_stream_end(msg, state)
 end
 
 local function handle_reasoning_delta(msg, state)
+  if is_foreign_chat(msg, state) then return state, {} end
   local t = msg.text or msg.delta or ""
   if #t == 0 then return state, {} end
   return transcript.append_reasoning_delta(state, t), {}
 end
 
 local function handle_reasoning_end(msg, state)
+  if is_foreign_chat(msg, state) then return state, {} end
   return transcript.finalize_reasoning(state, msg.duration_ms), {}
 end
 
 local function handle_session_stats(msg, state)
+  if is_foreign_chat(msg, state) then return state, {} end
   local stats = shallow_merge(state.stats or {}, {})
   for k, v in pairs(msg) do
     if k ~= "kind" then stats[k] = v end
@@ -1228,6 +1260,7 @@ local handlers = {
   ["sessions.replay.end"]         = handle_replay_end,
   ["chat.reset"]                  = handle_chat_reset,
   ["chat.message.append"]         = handle_message_append,
+  ["chat.lead.bound"]             = handle_lead_chat_bound,
   ["chat.stream.delta"]           = handle_stream_delta,
   ["chat.stream.end"]             = handle_stream_end,
   ["chat.stream.reasoning_delta"] = handle_reasoning_delta,

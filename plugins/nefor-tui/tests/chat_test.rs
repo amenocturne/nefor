@@ -273,6 +273,62 @@ fn streaming_delta_appends_to_transcript() {
     );
 }
 
+// Kernel-run actor chats (mag `<actor>@rN`) stream on the same bus as
+// the lead's chat — deliberately, so the session log and run-panel
+// consumers capture the deltas — but the transcript renders only the
+// lead conversation. `chat.lead.bound` tells the surface which chat_id
+// that is; stream events carrying any other chat_id must not append.
+#[test]
+fn foreign_chat_stream_delta_stays_out_of_transcript() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.lead.bound", "chat_id": "chat-1" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.stream.delta",
+            "chat_id": "explorer.llm@r2",
+            "text": "kernel-internal-bytes",
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.stream.reasoning_delta",
+            "chat_id": "explorer.llm@r2",
+            "text": "kernel-internal-thoughts",
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "chat_id": "chat-1", "text": "lead-visible-reply" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.stream.end",
+            "chat_id": "chat-1",
+            "model": "qwen-test",
+            "duration_ms": 42,
+        }),
+    );
+
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("kernel-internal"),
+        "foreign chat's stream must not render in the transcript: {out:?}"
+    );
+    assert!(
+        out.contains("lead-visible-reply"),
+        "lead chat's delta must still render: {out:?}"
+    );
+}
+
 #[test]
 fn typing_and_enter_emits_chat_input_submit() {
     let mut engine = Engine::new(80, 24).expect("engine");
