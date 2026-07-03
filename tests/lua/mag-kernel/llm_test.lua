@@ -8,7 +8,10 @@
 -- level list: capability.invoke on a graph activation; tool-calls reply →
 -- ToolCalls + mag.complete; no-tool-calls reply → FinalAnswer + mag.complete;
 -- provider-error reply → mag.failed; kill mid-flight → provider cancel
--- envelope; drain idle vs in-flight.
+-- envelope; drain idle vs in-flight. Plus transcript seeding (params.history):
+-- seed replays ahead of the round-1 activation, seed + accumulated turns stay
+-- ordered across a tool round, malformed seeds fail construction with the
+-- detail, and an absent seed is today's behavior.
 
 local Registry = require("registry")
 local llm = require("factories.llm")
@@ -222,6 +225,167 @@ do
     "arguments re-encode as the wire's JSON string")
   assert_eq(replay[3].role, "tool", "the tool result follows the call")
   assert_eq(replay[3].tool_call_id, "call-1", "the tool result pairs with the call id")
+end
+
+-- ==================================================================
+-- transcript seeding (params.history, turn-as-function): the seed replays
+-- ahead of the current activation on round 1
+-- ==================================================================
+
+do
+  local seed = {
+    { role = "user", content = "what is the plan?" },
+    { role = "assistant", content = "step one, then step two." },
+  }
+  local instance, msgs = make("turn.llm", {
+    provider = "p",
+    system = "You are the lead.",
+    history = seed,
+  })
+  instance.deliver(turn({ messages = { { role = "user", content = "do step one" } } }))
+
+  local inv = find_kind(msgs, "capability.invoke")
+  local sent = inv.request.input.messages
+  assert_eq(#sent, 3, "round 1 replays the seed ahead of the activation turn")
+  assert_eq(sent[1].role, "user", "seed message 1 leads the request")
+  assert_eq(sent[1].content, "what is the plan?", "seed message 1 is verbatim")
+  assert_eq(sent[2].role, "assistant", "seed message 2 follows in order")
+  assert_eq(sent[2].content, "step one, then step two.", "seed message 2 is verbatim")
+  assert_eq(sent[3].role, "user", "the activation turn comes after the whole seed")
+  assert_eq(sent[3].content, "do step one", "the activation turn is verbatim")
+
+  -- System precedence: params.system and params.history are orthogonal
+  -- channels. params.system rides the request's system field; a system-role
+  -- seed entry is neither lifted into it nor stripped — it replays verbatim
+  -- as an ordinary leading transcript message.
+  assert_eq(inv.request.system, "You are the lead.", "params.system stays the system channel")
+  local i2, m2 = make("sys.llm", {
+    provider = "p",
+    system = "from params",
+    history = { { role = "system", content = "from seed" } },
+  })
+  i2.deliver(turn({ messages = { { role = "user", content = "go" } } }))
+  local inv2 = find_kind(m2, "capability.invoke")
+  assert_eq(inv2.request.system, "from params",
+    "a system-role seed entry does not displace params.system")
+  assert_eq(inv2.request.input.messages[1].role, "system",
+    "the system-role seed entry replays verbatim in the transcript")
+  assert_eq(inv2.request.input.messages[1].content, "from seed",
+    "the seed's system content is untouched")
+end
+
+-- ==================================================================
+-- transcript seeding + multi-round: the seed prefix and accumulated turns
+-- stay in order across a tool round
+-- ==================================================================
+
+do
+  local instance, msgs = make("turn.llm", {
+    provider = "p",
+    history = {
+      { role = "user", content = "earlier question" },
+      {
+        role = "assistant",
+        content = "",
+        tool_calls = { { id = "call-0", type = "function", ["function"] = { name = "grep", arguments = "{\"q\":\"x\"}" } } },
+      },
+      { role = "tool", tool_call_id = "call-0", name = "grep", content = "earlier result" },
+      { role = "assistant", content = "earlier answer" },
+    },
+  })
+  instance.deliver(turn({ messages = { { role = "user", content = "new question" } } }))
+  local r1 = find_kind(msgs, "capability.invoke")
+  assert_eq(#r1.request.input.messages, 5, "round 1 carries seed (4) + activation (1)")
+
+  instance.deliver({
+    kind = "reply",
+    ref = r1.ref,
+    result = {
+      text = "",
+      finish_reason = "tool_calls",
+      tool_calls = { { id = "call-1", name = "list_dir", arguments = { path = "." } } },
+    },
+  })
+  instance.deliver(turn({ messages = {
+    { role = "tool", tool_call_id = "call-1", name = "list_dir", content = "dir-listing" },
+  } }))
+
+  local r2
+  for _, m in ipairs(msgs) do
+    if m.kind == "capability.invoke" and m ~= r1 then r2 = m end
+  end
+  local replay = r2.request.input.messages
+  assert_eq(#replay, 7, "round 2 replays seed + accumulated turns")
+  assert_eq(replay[1].content, "earlier question", "the seed prefix still leads")
+  assert_eq(replay[2].tool_calls[1].id, "call-0", "the seeded tool-call turn survives verbatim")
+  assert_eq(replay[3].tool_call_id, "call-0", "the seeded tool result stays paired")
+  assert_eq(replay[4].content, "earlier answer", "the seeded final answer stays in place")
+  assert_eq(replay[5].content, "new question", "the first live turn follows the seed")
+  assert_eq(replay[6].role, "assistant", "the accumulated tool-call turn is recorded after it")
+  assert_eq(replay[6].tool_calls[1].id, "call-1", "the live call keeps the model's id")
+  assert_eq(replay[7].tool_call_id, "call-1", "the live tool result closes the sequence")
+end
+
+-- ==================================================================
+-- transcript seeding: a malformed seed fails construction with the detail
+-- ==================================================================
+
+do
+  local _, emit = capture()
+
+  local inst, err = llm.construct("bad.llm", { provider = "p", history = "not a list" }, emit)
+  assert_true(inst == nil, "a non-table params.history does not construct")
+  assert_true(err:find("params.history", 1, true) ~= nil and err:find("string", 1, true) ~= nil,
+    "the error names params.history and the offending type")
+
+  local i2, e2 = llm.construct("bad.llm", { provider = "p", history = { role = "user", content = "x" } }, emit)
+  assert_true(i2 == nil, "a single message passed instead of a list does not construct")
+  assert_true(e2:find("not a map", 1, true) ~= nil, "the error explains the array requirement")
+
+  local i3, e3 = llm.construct("bad.llm", { provider = "p", history = { { role = "user" }, "loose string" } }, emit)
+  assert_true(i3 == nil, "a non-table entry does not construct")
+  assert_true(e3:find("params.history[2]", 1, true) ~= nil, "the error points at the offending index")
+
+  local i4, e4 = llm.construct("bad.llm", { provider = "p", history = { { content = "no role" } } }, emit)
+  assert_true(i4 == nil, "an entry without a role does not construct")
+  assert_true(e4:find("missing a role", 1, true) ~= nil, "the error names the missing role")
+
+  local i5, e5 = llm.construct("bad.llm",
+    { provider = "p", history = { { role = "assistant", tool_calls = "call-1" } } }, emit)
+  assert_true(i5 == nil, "a non-array tool_calls does not construct")
+  assert_true(e5:find("tool_calls", 1, true) ~= nil, "the error names the malformed tool_calls")
+end
+
+-- ==================================================================
+-- transcript seeding: absent params.history is today's behavior, and an empty
+-- seed is indistinguishable from no seed
+-- ==================================================================
+
+do
+  local plain, pm = make("plain.llm", { provider = "p", model = "opus" })
+  plain.deliver(turn({ messages = { { role = "user", content = "go" } } }))
+  local pi = find_kind(pm, "capability.invoke")
+  assert_eq(#pi.request.input.messages, 1, "no seed: round 1 carries the activation turn alone")
+  assert_eq(pi.request.input.messages[1].content, "go", "the activation turn is verbatim")
+  assert_true(pi.request.chat_id:find("@r1", 1, true) ~= nil, "no seed: the round counter starts at @r1")
+
+  local empty, em = make("empty.llm", { provider = "p", model = "opus", history = {} })
+  empty.deliver(turn({ messages = { { role = "user", content = "go" } } }))
+  local ei = find_kind(em, "capability.invoke")
+  assert_eq(#ei.request.input.messages, #pi.request.input.messages,
+    "an empty seed sends the same message count as no seed")
+  assert_eq(ei.request.input.messages[1].content, pi.request.input.messages[1].content,
+    "an empty seed sends the same content as no seed")
+
+  -- The seed is copied, not aliased: mutating the caller's table after
+  -- construct does not bleed into the replayed transcript.
+  local caller_seed = { { role = "user", content = "seeded" } }
+  local aliased, am = make("alias.llm", { provider = "p", history = caller_seed })
+  caller_seed[2] = { role = "user", content = "injected later" }
+  aliased.deliver(turn({ messages = { { role = "user", content = "go" } } }))
+  local ai = find_kind(am, "capability.invoke")
+  assert_eq(#ai.request.input.messages, 2,
+    "post-construct mutation of the caller's seed table does not reach the transcript")
 end
 
 -- ==================================================================

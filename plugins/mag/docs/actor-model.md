@@ -194,3 +194,35 @@ reads exactly this — no alias fallbacks, no shape sniffing.
 The llm factory is the provider boundary: it normalizes the provider's native
 tool-call shape (`name`/`arguments`, or a nested `function`) into the pinned
 `{ id, name, args }` once, so `run-tool` reads `id`/`name`/`args` directly.
+
+### llm params
+
+Authored data on the llm actor spec (all optional unless noted):
+
+| Param              | Meaning                                                                                                                                                                                                                                                                               |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `provider`         | provider capability name — **required**; construction fails without it                                                                                                                                                                                                                |
+| `model`            | provider model id                                                                                                                                                                                                                                                                     |
+| `system`           | system prompt; rides the request's `system` field every round                                                                                                                                                                                                                         |
+| `tools`            | advertised tool list for the call                                                                                                                                                                                                                                                     |
+| `profile`          | orchestration profile name, resolved by the control plane into provider/model/`reasoning_effort` via the params overlay before spawn                                                                                                                                                  |
+| `reasoning_effort` | resolved reasoning effort for the call                                                                                                                                                                                                                                                |
+| `history`          | transcript seed: an array of provider-dialect messages (role-tagged turns; assistant tool-call turns in the wire shape the transcript records) that becomes the owned transcript's initial contents at construct — every round replays it ahead of the turns the instance accumulates |
+
+`history` is the turn-as-function seam: the lead's turn is a short-lived
+kernel program over a persistent chat, `(history, message) -> response`, and
+the spawner passes the conversation so far as content via params (the
+per-actor params overlay) — never paths, so construct stays I/O-free. Because
+the llm actor already replays its full transcript to a fresh provider chat
+each round, a seeded prefix and accumulated turns are indistinguishable at
+replay.
+
+System precedence: `system` and `history` are orthogonal channels. `system`
+is THE system-prompt channel; a system-role entry inside the seed is neither
+lifted into the request's `system` field nor stripped — it replays verbatim
+as an ordinary leading transcript message. A spawner forwarding a transcript
+that already contains the system turn passes it through exactly one channel.
+
+A malformed seed (non-array, entry without a `role`, non-array `tool_calls`)
+fails construction with the offending detail; the instance never binds and
+the kernel escalates the construct failure as a run failure.

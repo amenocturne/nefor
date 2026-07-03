@@ -46,6 +46,28 @@
 --   result the provider would reject ("tool message without preceding
 --   tool_calls").
 --
+-- Transcript seeding (`params.history`; turn-as-function):
+--   The lead's turn is a short-lived kernel program over a persistent chat:
+--   `(history, message) -> response`. The spawner passes the conversation so
+--   far as `params.history` — an array of provider-dialect messages in the
+--   exact shape the owned transcript uses (role/content turns; assistant
+--   tool-call turns in the wire shape recorded above), so a seeded prefix and
+--   accumulated turns are indistinguishable at replay. The seed becomes the
+--   transcript's initial contents at construct; every round then replays it
+--   ahead of the turns this instance accumulates, riding the existing
+--   full-transcript-per-round mechanism unchanged. Content rides params (the
+--   per-actor params overlay), never paths — construct stays I/O-free.
+--   System precedence: `params.system` and `params.history` are orthogonal
+--   channels. `params.system` is THE system-prompt channel and rides the
+--   request's `system` field every round; a system-role entry in the seed is
+--   neither lifted into that field nor stripped — it replays verbatim as an
+--   ordinary transcript message after it. A spawner forwarding a transcript
+--   that already carries the system turn should pass it in exactly one channel.
+--   Malformed seeds fail construction (nil + message, like the provider
+--   check): the instance never binds and routing escalates the construct
+--   failure as a run failure — a garbled conversation must not silently
+--   drive a provider round.
+--
 -- The request handle / cancel mechanics (FLAGGED — the reconciliation the task
 -- asked for):
 --   * The kernel mints its OWN correlation request id inside
@@ -105,6 +127,10 @@ M.declaration = {
     -- before spawn (starter/lead-workflow resolve_profiles)
     reasoning_effort = "string?", -- resolved reasoning effort for the call
     provider = "string?", -- provider capability name (selection)
+    history = "table?", -- transcript seed: array of provider-dialect messages
+    -- prepended to the owned transcript at construct (see the header's
+    -- "Transcript seeding" — turn-as-function; params.system stays the
+    -- system-prompt channel, a system-role seed entry replays verbatim)
   },
 
   -- Single input: fires per arriving ProviderOut (the assembled turn state the
@@ -143,6 +169,50 @@ function M.construct(id, params, emit, deps)
       "llm '%s': params.provider is required (which provider capability to target)", tostring(id))
   end
 
+  -- Transcript seed (header, "Transcript seeding"): validate shape at
+  -- construct — a malformed seed fails construction with the offending detail
+  -- rather than driving a provider round with a garbled conversation. Entries
+  -- mirror the internal transcript format (role-tagged message tables;
+  -- tool_calls, when present, an array), so seeded prefix and accumulated
+  -- turns are indistinguishable at replay. The seed is copied into a fresh
+  -- table: the transcript mutates per round and must never alias params.
+  local seeded = {}
+  if params.history ~= nil then
+    if type(params.history) ~= "table" then
+      return nil, string.format(
+        "llm '%s': params.history must be an array of transcript messages (got %s)",
+        tostring(id), type(params.history))
+    end
+    local key_count = 0
+    for _ in pairs(params.history) do
+      key_count = key_count + 1
+    end
+    if key_count ~= #params.history then
+      return nil, string.format(
+        "llm '%s': params.history must be an array of transcript messages, not a map "
+        .. "(did you pass a single message instead of a list?)", tostring(id))
+    end
+    for i = 1, #params.history do
+      local entry = params.history[i]
+      if type(entry) ~= "table" then
+        return nil, string.format(
+          "llm '%s': params.history[%d] must be a role-tagged message table (got %s)",
+          tostring(id), i, type(entry))
+      end
+      if type(entry.role) ~= "string" or #entry.role == 0 then
+        return nil, string.format(
+          "llm '%s': params.history[%d] is missing a role (transcript messages are role-tagged)",
+          tostring(id), i)
+      end
+      if entry.tool_calls ~= nil and type(entry.tool_calls) ~= "table" then
+        return nil, string.format(
+          "llm '%s': params.history[%d].tool_calls must be an array (got %s)",
+          tostring(id), i, type(entry.tool_calls))
+      end
+      seeded[i] = entry
+    end
+  end
+
   -- Sign: stamp the actor id onto every outbound message (actor-model.md,
   -- Factories: "sign with the id").
   local function sign(message)
@@ -156,7 +226,8 @@ function M.construct(id, params, emit, deps)
   local seq = 0 -- monotone request counter → distinct chat_ids across cycles
   local pending = nil -- { chat_id = <handle> } while a request is in flight
   local draining = false -- drain arrived while in flight; finish then die
-  local history = {} -- the accumulated transcript, replayed whole per round
+  local history = seeded -- the accumulated transcript (seed-prefixed),
+  -- replayed whole per round
 
   -- Classification rule (FLAGGED): tool calls are "present" when the provider
   -- result carries a non-empty `tool_calls` array. This matches the landed
