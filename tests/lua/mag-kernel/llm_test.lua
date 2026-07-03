@@ -88,7 +88,7 @@ do
     system = "Explore the codebase.",
     tools = { "fs/read", "grep" },
     provider = "chatgpt-provider",
-    profile = { temperature = 0 },
+    reasoning_effort = "high",
   })
 
   local ready = find_kind(msgs, "mag.ready")
@@ -105,7 +105,7 @@ do
   assert_eq(inv.request.model, "opus", "request carries params.model")
   assert_eq(inv.request.system, "Explore the codebase.", "request carries params.system")
   assert_eq(inv.request.tools[1], "fs/read", "request carries params.tools")
-  assert_eq(inv.request.profile.temperature, 0, "request passes the profile through")
+  assert_eq(inv.request.reasoning_effort, "high", "request carries the resolved reasoning effort")
   assert_eq(inv.request.input.messages[1], "prior turn", "request carries the incoming turn message")
   assert_true(type(inv.request.chat_id) == "string" and #inv.request.chat_id > 0,
     "factory mints a chat_id request handle")
