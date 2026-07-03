@@ -228,6 +228,28 @@ impl LuaHost {
         }
     }
 
+    /// Take the last unhandled-failure signal, if an actor failure escalated to
+    /// a run failure (an unrouted failure tag — routing.lua apply_completion →
+    /// `mag.run_failed`). One-shot: clears the slot. Returns the failure detail
+    /// the run's terminal reply surfaces.
+    pub fn take_run_failed(&self) -> Result<Option<String>, MagError> {
+        let f: Option<Function> = self.kernel.get("take_run_failed")?;
+        let f = match f {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let rf: Option<Table> = f.call::<Option<Table>>(())?;
+        match rf {
+            None => Ok(None),
+            Some(t) => {
+                let error = t
+                    .get::<Option<String>>("error")?
+                    .unwrap_or_else(|| "mag run failed".into());
+                Ok(Some(error))
+            }
+        }
+    }
+
     /// Drain everything the kernel emitted since the last drain (bus + lifecycle
     /// events), converting each to an NCP event body. The queue is reset atomically.
     pub fn drain_emits(&self) -> Result<Vec<Map<String, JsonValue>>, MagError> {

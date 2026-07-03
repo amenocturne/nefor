@@ -334,11 +334,11 @@ fn complete_envelope(provider: &str, chat_id: &str) -> Map<String, Value> {
 }
 
 /// The turn messages to append from a provider request. The `llm` factory hands
-/// the whole ProviderOut through as `input`, whose canonical shape carries a
-/// `messages` array of role-tagged turn messages (factories/adapter.lua,
-/// factories/tool-result.lua). Append each. A bare single message (`{ role, … }`)
-/// or a `{ text }` shape are tolerated as fallbacks so a hand-authored request
-/// still drives.
+/// its FULL transcript through as `input.messages` — each round runs on a fresh
+/// provider chat, so the whole conversation replays (factories/llm.lua, "The
+/// transcript"); the array is role-tagged turn messages. Append each. A bare
+/// single message (`{ role, … }`) or a `{ text }` shape are tolerated as
+/// fallbacks so a hand-authored request still drives.
 fn append_messages(args: &Map<String, Value>) -> Vec<Value> {
     let input = match args.get("input") {
         Some(i) => i,

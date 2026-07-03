@@ -39,6 +39,13 @@ local M = {
   -- lifecycle EVENT the delivery layer surfaces from it (observer.lua).
   RunComplete = "mag.RunComplete", -- actor -> kernel emit (message)
   run_complete = "mag.run_complete", -- kernel -> control plane (event)
+
+  -- The lifecycle EVENT for an UNHANDLED actor failure: a failed completion
+  -- whose failure tag routes nowhere (routing.lua apply_completion). Routing
+  -- it into the void would strand the run (the sink never fires, the host
+  -- waits forever), so the delivery layer escalates it to the control plane
+  -- and the host fails the run.
+  run_failed = "mag.run_failed", -- kernel -> control plane (event)
 }
 
 return M

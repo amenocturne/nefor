@@ -45,6 +45,7 @@ end
 local function harness(factories)
   local log, rec = new_logger()
   local bus = {}
+  local events = {}
   local inv = inventory.new({ log = log })
   local reg = Registry.new()
   for _, decl in pairs(factories) do
@@ -57,6 +58,7 @@ local function harness(factories)
     registry = reg,
     log = log,
     bus_emit = function(env) bus[#bus + 1] = env end,
+    events = function(e) events[#events + 1] = e end,
     gen_id = function() seq = seq + 1; return "req-" .. seq end,
   })
   -- Mirror init.lua: hand the dying instance its final kill message
@@ -65,7 +67,7 @@ local function harness(factories)
     router:dispatch_kill(id)
     router:forget(id)
   end)
-  return { inv = inv, reg = reg, router = router, log = rec, bus = bus }
+  return { inv = inv, reg = reg, router = router, log = rec, bus = bus, events = events }
 end
 
 -- Build a test actor instance implementing the kernel<->instance contract:
@@ -424,6 +426,67 @@ do
   i2.emit({ kind = "mag.ready", from = "z" })
   h.inv.apply({ kills = { "z" } })
   assert_true(not flags.drained, "kill does not auto-invoke handle_drain")
+end
+
+-- ==================================================================
+-- failed completions: routed failure routes; unrouted failure escalates to a
+-- run-failed event (mag.run_failed) instead of vanishing
+-- ==================================================================
+
+do
+  local h = harness({
+    worker = { name = "worker", inputs = { input = "start.Kick" }, outputs = {} },
+    catcher = { name = "catcher", inputs = { input = "mag.Failed" }, outputs = {} },
+  })
+
+  -- No route for the failure tag → the delivery layer escalates: the run would
+  -- otherwise strand (nothing downstream ever fires, the sink never completes).
+  local w = spawn_actor(h, "w", "worker", {}, function()
+    return { status = "failed", failure = "mag.Failed", value = { error = "provider blew up" } }
+  end)
+  ready(h, w)
+  h.router:deliver("w", "test", "start.Kick", { kind = "start.Kick" })
+
+  local run_failed
+  for _, e in ipairs(h.events) do
+    if e.kind == "mag.run_failed" then run_failed = e end
+  end
+  assert_true(run_failed ~= nil, "an unrouted failure escalates to mag.run_failed")
+  assert_eq(run_failed.from, "w", "the event names the failing actor")
+  assert_eq(run_failed.failure, "mag.Failed", "the event carries the failure tag")
+  assert_eq(run_failed.error, "provider blew up", "the event surfaces the failure detail")
+
+  -- A failure without an error string still produces a readable detail.
+  local w0 = spawn_actor(h, "w0", "worker", {}, function()
+    return { status = "failed", failure = "mag.Failed" }
+  end)
+  ready(h, w0)
+  h.router:deliver("w0", "test", "start.Kick", { kind = "start.Kick" })
+  local last
+  for _, e in ipairs(h.events) do
+    if e.kind == "mag.run_failed" and e.from == "w0" then last = e end
+  end
+  assert_true(last ~= nil and type(last.error) == "string" and #last.error > 0,
+    "a detail-less failure still carries a readable error")
+
+  -- A ROUTED failure is composed failure handling: it routes, no escalation.
+  local caught = {}
+  local c = spawn_actor(h, "c", "catcher", {}, function(_, activation)
+    caught[#caught + 1] = activation.messages[1]
+    return "ok"
+  end)
+  ready(h, c)
+  local w2 = spawn_actor(h, "w2", "worker", { ["mag.Failed"] = { "c" } }, function()
+    return { status = "failed", failure = "mag.Failed", value = { error = "handled" } }
+  end)
+  ready(h, w2)
+  h.router:deliver("w2", "test", "start.Kick", { kind = "start.Kick" })
+  assert_eq(#caught, 1, "a routed failure delivers the failure-typed output")
+  assert_eq(caught[1].message.value.error, "handled", "the routed failure carries its value")
+  for _, e in ipairs(h.events) do
+    assert_true(not (e.kind == "mag.run_failed" and e.from == "w2"),
+      "a routed failure does not escalate to run-failed")
+  end
 end
 
 print("mag-kernel routing_test: all cases passed")

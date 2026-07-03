@@ -86,6 +86,7 @@ local run_ctx = {
   session_id = nil,
   last_output_path = nil,
   run_complete = nil,
+  run_failed = nil,
 }
 
 -- Injected lifecycle-event sink (observer.lua's EVENTS set, plus routing's
@@ -105,6 +106,14 @@ local function emit_event(event)
     run_ctx.run_complete = {
       output_path = run_ctx.last_output_path,
       persisted = event.persisted,
+    }
+  elseif event.kind == observer.EVENTS.run_failed then
+    -- An unhandled actor failure (routing.lua apply_completion). Stash it for
+    -- take_run_failed so the host fails the run with the detail surfaced.
+    run_ctx.run_failed = {
+      error = event.error,
+      failure = event.failure,
+      from = event.from,
     }
   end
   nefor.emit(event)
@@ -244,6 +253,26 @@ return {
   -- modlog and its lifecycle events fire — one composition point, no bypass.
   start = function(mod, o)
     o = o or {}
+    -- A program start owns the whole constellation: reset the previous run's
+    -- actors before applying the new program. Kill every live id through the
+    -- fold (kill handlers run — a mid-flight llm's provider-cancel envelope
+    -- reaches the bus — and the routing layer forgets per-id state), then drop
+    -- the tombstones so the new program can reuse ids. Without this, a
+    -- re-executed program found its ids still alive in the resident kernel:
+    -- every spawn degraded to a duplicate-alive no-op — no construct, no
+    -- actor_spawned/actor_ready events — and stale instances leaked state
+    -- across runs (an llm's request counter continuing at @r3).
+    local leftovers = {}
+    for id, record in inv.pairs() do
+      if record.state == "alive" then
+        leftovers[#leftovers + 1] = id
+      end
+    end
+    if #leftovers > 0 then
+      table.sort(leftovers)
+      obs:apply({ kills = leftovers })
+    end
+    inv.clear()
     return barrier.start({
       inventory = inv,
       router = router,
@@ -277,8 +306,9 @@ return {
     run_ctx.run_id = meta.run_id or run_ctx.run_id
     run_ctx.run_name = meta.run_name or run_ctx.run_name
     run_ctx.session_id = meta.session_id or run_ctx.session_id
-    -- Fresh run: clear the prior run's terminal capture + persisted path.
+    -- Fresh run: clear the prior run's terminal captures + persisted path.
     run_ctx.run_complete = nil
+    run_ctx.run_failed = nil
     run_ctx.last_output_path = nil
     obs:run_started({ run_id = run_ctx.run_id, run_name = run_ctx.run_name })
   end,
@@ -297,6 +327,16 @@ return {
     local rc = run_ctx.run_complete
     run_ctx.run_complete = nil
     return rc
+  end,
+
+  -- Take the last unhandled-failure signal (one-shot; cleared on read). Set
+  -- when a failed completion's tag routes nowhere (routing.lua
+  -- apply_completion → mag.run_failed). The host fails the run with the
+  -- carried error detail. Returns nil while no failure escalated.
+  take_run_failed = function()
+    local rf = run_ctx.run_failed
+    run_ctx.run_failed = nil
+    return rf
   end,
 
   -- Kernel-injected construct deps for an actor id — the sink's per-node

@@ -10,8 +10,9 @@
 --
 -- Flow (async factory — routing.lua, the kernel⇄factory contract):
 --   * A `generic-provider.ProviderOut` arrives as a graph activation on the
---     single declared input. Build a provider request from params + that
---     message, mint a provider-domain request handle (chat_id), emit a
+--     single declared input. Extend the per-instance transcript with its turn
+--     messages, build a provider request from params + the FULL transcript,
+--     mint a provider-domain request handle (chat_id), emit a
 --     `capability.invoke` (the kernel correlates it and forwards a tool.invoke
 --     onto the bus — routing.lua on_capability_invoke), and return
 --     `{ status = "pending" }`: completion is deferred until the provider
@@ -22,8 +23,28 @@
 --       - tool calls present  → `generic-tool.ToolCalls`
 --       - otherwise           → `generic-provider.FinalAnswer`
 --     then signal deferred success with a `mag.complete` emit (the kernel emits
---     mag.Unit along dependency edges). A provider ERROR in the reply is a
---     suffered failure: emit `mag.failed` so the kernel routes the failure tag.
+--     mag.Unit along dependency edges). A provider ERROR in the reply — the
+--     correlation-level `error` field OR a result whose `finish_reason` is
+--     "error" (the chat.complete.result dialect: the provider streams a
+--     terminal result even when the upstream call failed) — is a suffered
+--     failure: emit `mag.failed` carrying the provider's detail so the kernel
+--     escalates it (an unrouted failure fails the run; routing.lua
+--     apply_completion). An error must never classify as a FinalAnswer — that
+--     masked a dead provider round as a "successful" empty answer.
+--
+-- The transcript (per-round history replay; FLAGGED):
+--   Each activation drives ONE provider round on a FRESH chat (the bridge
+--   creates/completes/deletes a provider chat per request — bridge.rs, "What
+--   the provider leg does"), so the request must carry the whole conversation
+--   so far, not just the newest turn. This instance owns that state: it is the
+--   provider boundary, and the loop's other factories (run-tool, tool-result)
+--   stay transcript-free. Incoming ProviderOut messages extend the transcript;
+--   each reply appends the assistant message it produced (tool calls in the
+--   provider wire shape — `function.arguments` as a JSON string when an
+--   encoder is available, see encode_args). Round 2's request therefore
+--   replays [user, assistant(tool_calls), tool] instead of the bare tool
+--   result the provider would reject ("tool message without preceding
+--   tool_calls").
 --
 -- The request handle / cancel mechanics (FLAGGED — the reconciliation the task
 -- asked for):
@@ -135,6 +156,7 @@ function M.construct(id, params, emit, deps)
   local seq = 0 -- monotone request counter → distinct chat_ids across cycles
   local pending = nil -- { chat_id = <handle> } while a request is in flight
   local draining = false -- drain arrived while in flight; finish then die
+  local history = {} -- the accumulated transcript, replayed whole per round
 
   -- Classification rule (FLAGGED): tool calls are "present" when the provider
   -- result carries a non-empty `tool_calls` array. This matches the landed
@@ -148,20 +170,71 @@ function M.construct(id, params, emit, deps)
         and #result.tool_calls > 0
   end
 
-  -- Build the provider request from params + the incoming turn message. The
+  -- Extend the transcript with one incoming turn payload. The canonical
+  -- ProviderOut carries a `messages` array of role-tagged turn messages
+  -- (factories/adapter.lua, factories/tool-result.lua); each is appended
+  -- verbatim. The bare-single-message / `{ text }` / string shapes are
+  -- tolerated as fallbacks, mirroring the bridge's own reading of a request
+  -- (bridge.rs append_messages), so a hand-authored seed still drives.
+  local function extend_history(input_message)
+    if type(input_message) == "string" then
+      history[#history + 1] = { role = "user", content = input_message }
+      return
+    end
+    if type(input_message) ~= "table" then
+      return
+    end
+    if type(input_message.messages) == "table" then
+      for _, m in ipairs(input_message.messages) do
+        history[#history + 1] = m
+      end
+    elseif input_message.role ~= nil then
+      history[#history + 1] = input_message
+    elseif input_message.text ~= nil then
+      history[#history + 1] = { role = "user", content = input_message.text }
+    end
+  end
+
+  -- Serialize tool-call arguments for the transcript's assistant message. The
+  -- OpenAI-dialect wire carries `function.arguments` as a JSON STRING; the
+  -- classified reply carries them decoded (`args` as a table). Re-encode via
+  -- the host's nefor.json when present (the mag plugin host installs it —
+  -- plugins/mag/src/kernel.rs install_nefor); a bare VM without the binding
+  -- passes the raw value through rather than failing the round.
+  local function encode_args(args)
+    if type(args) == "string" then
+      return args
+    end
+    if type(nefor) == "table" and type(nefor.json) == "table"
+        and type(nefor.json.encode) == "function" then
+      local ok, encoded = pcall(nefor.json.encode, args or {})
+      if ok and type(encoded) == "string" then
+        return encoded
+      end
+    end
+    return args
+  end
+
+  -- Build the provider request from params + the full transcript so far. The
   -- exact provider-capability request schema is the capability plugin's own
   -- concern (behind the tool.invoke abstraction); this carries the fields a
-  -- provider needs plus the chat_id handle. `reasoning_effort` is the
+  -- provider needs plus the chat_id handle. `input.messages` is a snapshot of
+  -- the transcript (each round runs on a fresh provider chat, so the whole
+  -- conversation replays — see the header). `reasoning_effort` is the
   -- control-plane-resolved profile depth (the bridge threads it into
   -- chat.create alongside model/system/tools).
-  local function build_request(input_message)
+  local function build_request()
+    local messages = {}
+    for i, m in ipairs(history) do
+      messages[i] = m
+    end
     return {
       chat_id = pending.chat_id,
       model = params.model,
       system = params.system,
       tools = params.tools,
       reasoning_effort = params.reasoning_effort,
-      input = input_message,
+      input = { messages = messages },
     }
   end
 
@@ -188,6 +261,21 @@ function M.construct(id, params, emit, deps)
       end
 
       local result = activation.result
+      if type(result) == "table" and result.finish_reason == "error" then
+        -- The provider dialect's in-band failure: the streamed terminal result
+        -- of a round whose upstream call died carries finish_reason "error"
+        -- (and, when the provider surfaces it, the error detail). This is a
+        -- suffered failure, exactly like a correlation-level error — it must
+        -- never classify as a FinalAnswer, which would route an empty answer
+        -- onward and complete the run "successfully".
+        local detail = result.error
+        if type(detail) ~= "string" or #detail == 0 then
+          detail = "provider returned finish_reason \"error\" with no detail"
+        end
+        emit(sign({ kind = kinds.failed, failure = FAILED_TAG, value = { error = detail } }))
+        return nil
+      end
+
       if has_tool_calls(result) then
         -- Canonical ToolCalls payload (actor-model.md, Canonical payloads):
         -- { kind, from, calls = { { id, name, args }, ... } }. This is the
@@ -204,6 +292,22 @@ function M.construct(id, params, emit, deps)
             args = tc.args or tc.arguments or fn.arguments,
           }
         end
+        -- Record the assistant tool-call message in the transcript (wire
+        -- shape), so the next round's replay pairs the coming tool results
+        -- with the calls that produced them.
+        local wire_calls = {}
+        for i, c in ipairs(calls) do
+          wire_calls[i] = {
+            id = c.id,
+            type = "function",
+            ["function"] = { name = c.name, arguments = encode_args(c.args) },
+          }
+        end
+        history[#history + 1] = {
+          role = "assistant",
+          content = (type(result.text) == "string") and result.text or "",
+          tool_calls = wire_calls,
+        }
         emit(sign({
           kind = "generic-tool.ToolCalls",
           calls = calls,
@@ -213,6 +317,11 @@ function M.construct(id, params, emit, deps)
         if type(result) == "table" then
           final.text = result.text
           final.final_answer = result.final_answer
+          -- Keep the transcript coherent for a possible next activation (an
+          -- llm inside a cycle can be re-fired after answering).
+          if type(result.text) == "string" and #result.text > 0 then
+            history[#history + 1] = { role = "assistant", content = result.text }
+          end
         end
         emit(sign(final))
       end
@@ -229,7 +338,7 @@ function M.construct(id, params, emit, deps)
       return nil
     end
 
-    local input_message = ((activation.messages or {})[1] or {}).message
+    extend_history(((activation.messages or {})[1] or {}).message)
     seq = seq + 1
     pending = { chat_id = id .. "@r" .. tostring(seq) }
 
@@ -240,7 +349,7 @@ function M.construct(id, params, emit, deps)
     emit(sign({
       kind = "capability.invoke",
       capability = provider,
-      request = build_request(input_message),
+      request = build_request(),
       ref = pending.chat_id,
     }))
     return { status = "pending" }

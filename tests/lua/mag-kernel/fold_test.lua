@@ -258,4 +258,27 @@ do
   assert_true(not res2.ok, "non-string route destination is rejected")
 end
 
+-- ==================================================================
+-- clear: the per-program reset drops all records, tombstones included
+-- ==================================================================
+
+do
+  local inv = new_inv()
+  assert_true(inv.apply({ actors = { actor_spec("a", "f"), actor_spec("b", "f") } }).ok,
+    "spawn a + b")
+  assert_true(inv.apply({ kills = { "a" } }).ok, "kill a (tombstoned)")
+  assert_eq(inv.state_of("a"), "dead", "a is a tombstone before clear")
+  assert_eq(inv.state_of("b"), "alive", "b is alive before clear")
+
+  inv.clear()
+
+  assert_eq(inv.state_of("a"), "never-existed", "clear drops the tombstone")
+  assert_eq(inv.state_of("b"), "never-existed", "clear drops the live record")
+  -- Monotone lifecycles are scoped to one program run: after clear the same
+  -- ids spawn fresh (the re-execute path — init.lua start resets, then applies).
+  local res = inv.apply({ actors = { actor_spec("a", "f") } })
+  assert_true(res.ok and res.spawned["a"] == true, "a cleared id spawns fresh, not as a duplicate no-op")
+  assert_eq(inv.state_of("a"), "alive", "the respawned id is alive")
+end
+
 print("mag-kernel fold_test: all cases passed")

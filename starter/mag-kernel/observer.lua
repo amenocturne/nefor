@@ -27,6 +27,7 @@
 --   mag.modification_rejected  a validation failure (carries the error)
 --   mag.modification_noop      a validated mod whose ops were all race no-ops
 --   mag.run_complete           the sink signaled terminal completion (routing)
+--   mag.run_failed             an unhandled actor failure ended the run (routing)
 
 local kinds = require("kinds")
 
@@ -44,6 +45,9 @@ M.EVENTS = {
   -- Shared with routing.lua through kinds.lua: the run-complete event kind
   -- drifted against the RunComplete message kind, so both are sourced here.
   run_complete = kinds.run_complete,
+  -- Shared with routing.lua through kinds.lua: the unhandled-failure
+  -- escalation the delivery layer emits (apply_completion).
+  run_failed = kinds.run_failed,
 }
 
 local EVENTS = M.EVENTS

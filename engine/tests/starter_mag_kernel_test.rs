@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use mlua::{Function, Lua, Value, Variadic};
+use mlua::{Function, Lua, LuaSerdeExt, Value, Variadic};
 
 fn repo_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -84,12 +84,30 @@ fn run_lua_test(rel_path: &str) {
 
 /// Install the minimal `nefor` global the mag kernel needs at load time:
 /// `nefor.log` as a function (matching the plugin host), captured as a
-/// no-op. Kernel modules take their logger by injection, so nothing else
-/// is required.
+/// no-op, plus `nefor.json.{encode, decode}` over serde_json — the same
+/// surface the plugin host installs (`plugins/mag/src/kernel.rs`,
+/// `install_json`), which the llm factory uses to serialize tool-call
+/// arguments for its transcript. Kernel modules take their logger by
+/// injection, so nothing else is required.
 fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
     let nefor = lua.create_table()?;
     let log: Function = lua.create_function(|_, _: Variadic<Value>| Ok(()))?;
     nefor.set("log", log)?;
+
+    let json = lua.create_table()?;
+    let encode = lua.create_function(|lua, value: Value| {
+        let v: serde_json::Value = lua.from_value(value)?;
+        serde_json::to_string(&v).map_err(|e| mlua::Error::runtime(format!("json.encode: {e}")))
+    })?;
+    json.set("encode", encode)?;
+    let decode = lua.create_function(|lua, s: String| {
+        let v: serde_json::Value = serde_json::from_str(&s)
+            .map_err(|e| mlua::Error::runtime(format!("json.decode: {e}")))?;
+        lua.to_value(&v)
+    })?;
+    json.set("decode", decode)?;
+    nefor.set("json", json)?;
+
     lua.globals().set("nefor", nefor)?;
     Ok(())
 }

@@ -336,6 +336,16 @@ function M.apply(self, mod)
   return { ok = true, spawned = created }
 end
 
+-- Drop every actor record, dead tombstones included. This is the per-program
+-- reset seam (init.lua `start`): monotone lifecycles are scoped to ONE program
+-- run, so a new program starts its fold from never-existed and may reuse ids a
+-- previous run held. Live actors must be killed through a modification FIRST
+-- (so kill handlers run and the routing layer forgets them — do_kill's on_kill
+-- seam); clear itself runs no hooks.
+function M.clear(self)
+  self.actors = {}
+end
+
 -- Read-only lifecycle probe: "alive" | "dead" | "never-existed".
 function M.state_of(self, id)
   local entry = self.actors[id]
@@ -420,6 +430,9 @@ function M.new(opts)
   }
   self.apply = function(mod)
     return M.apply(self, mod)
+  end
+  self.clear = function()
+    return M.clear(self)
   end
   self.state_of = function(id)
     return M.state_of(self, id)

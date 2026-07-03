@@ -172,6 +172,95 @@ do
 end
 
 -- ==================================================================
+-- per-round transcript replay: round 2 carries the whole conversation, and the
+-- round counter increments by one per activation
+-- ==================================================================
+
+do
+  local instance, msgs = make("agent.llm", { provider = "p" })
+  instance.deliver(turn({ messages = { { role = "user", content = "list the repo" } } }))
+  local r1 = find_kind(msgs, "capability.invoke")
+  assert_true(r1.request.chat_id:find("@r1", 1, true) ~= nil,
+    "the first activation mints @r1, not a continued counter")
+  assert_eq(#r1.request.input.messages, 1, "round 1 carries the seed turn alone")
+
+  instance.deliver({
+    kind = "reply",
+    ref = r1.ref,
+    result = {
+      text = "",
+      finish_reason = "tool_calls",
+      tool_calls = { { id = "call-1", name = "list_dir", arguments = { path = "." } } },
+    },
+  })
+
+  -- The tool result comes back as the next ProviderOut turn (tool-result.lua).
+  instance.deliver(turn({ messages = {
+    { role = "tool", tool_call_id = "call-1", name = "list_dir", content = "dir-listing" },
+  } }))
+  local r2
+  for _, m in ipairs(msgs) do
+    if m.kind == "capability.invoke" and m ~= r1 then r2 = m end
+  end
+  assert_true(r2 ~= nil, "round 2 emits a second capability.invoke")
+  assert_true(r2.request.chat_id:find("@r2", 1, true) ~= nil,
+    "round 2 mints @r2 — one increment per activation")
+
+  -- Each round runs on a fresh provider chat, so the request must replay the
+  -- WHOLE conversation: [user, assistant(tool_calls), tool]. A request carrying
+  -- only the tool result is exactly what a real provider rejects ("tool message
+  -- without preceding tool_calls") — the session-27c60892 r4 failure.
+  local replay = r2.request.input.messages
+  assert_eq(#replay, 3, "round 2 replays the whole transcript")
+  assert_eq(replay[1].role, "user", "transcript starts with the seed turn")
+  assert_eq(replay[1].content, "list the repo", "the seed turn is verbatim")
+  assert_eq(replay[2].role, "assistant", "the model's tool-call turn is recorded")
+  assert_eq(replay[2].tool_calls[1].id, "call-1", "the recorded call keeps the model's id")
+  assert_eq(replay[2].tool_calls[1]["function"].name, "list_dir",
+    "the recorded call is in the provider wire shape")
+  assert_eq(replay[2].tool_calls[1]["function"].arguments, "{\"path\":\".\"}",
+    "arguments re-encode as the wire's JSON string")
+  assert_eq(replay[3].role, "tool", "the tool result follows the call")
+  assert_eq(replay[3].tool_call_id, "call-1", "the tool result pairs with the call id")
+end
+
+-- ==================================================================
+-- a result with finish_reason "error" is a suffered failure, never a FinalAnswer
+-- ==================================================================
+
+do
+  local instance, msgs = make("agent.llm", { provider = "p" })
+  instance.deliver(turn({ messages = { { role = "user", content = "go" } } }))
+  local invoke = find_kind(msgs, "capability.invoke")
+
+  instance.deliver({
+    kind = "reply",
+    ref = invoke.ref,
+    result = { text = "", finish_reason = "error", error = "HTTP 400: boom" },
+  })
+
+  local failed = find_kind(msgs, "mag.failed")
+  assert_true(failed ~= nil, "a finish_reason error emits mag.failed")
+  assert_eq(failed.failure, "mag.Failed", "mag.failed names the reserved suffered-failure tag")
+  assert_eq(failed.value.error, "HTTP 400: boom", "the failure threads the provider's detail")
+  assert_true(find_kind(msgs, "generic-provider.FinalAnswer") == nil,
+    "an errored round must never classify as a FinalAnswer (error masking)")
+  assert_true(find_kind(msgs, "mag.complete") == nil, "an errored round does not complete-ok")
+
+  -- A detail-less provider error still carries a readable failure.
+  local i2, m2 = make("x.llm", { provider = "p" })
+  i2.deliver(turn({}))
+  i2.deliver({
+    kind = "reply",
+    ref = find_kind(m2, "capability.invoke").ref,
+    result = { text = "", finish_reason = "error" },
+  })
+  local f2 = find_kind(m2, "mag.failed")
+  assert_true(f2 ~= nil and type(f2.value.error) == "string" and #f2.value.error > 0,
+    "a detail-less provider error still names the failure")
+end
+
+-- ==================================================================
 -- provider selection is required: no params.provider fails construction
 -- ==================================================================
 

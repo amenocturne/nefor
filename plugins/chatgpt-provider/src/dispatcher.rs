@@ -353,6 +353,7 @@ fn chat_complete_result_body(
     text: &str,
     tool_calls: &[ToolCall],
     finish_reason: Option<&str>,
+    error: Option<&str>,
 ) -> Map<String, Value> {
     let mut output = Map::new();
     output.insert("text".into(), Value::String(text.to_owned()));
@@ -374,11 +375,22 @@ fn chat_complete_result_body(
     if let Some(r) = finish_reason {
         output.insert("finish_reason".into(), Value::String(r.to_owned()));
     }
+    // The turn's failure detail, threaded so a consumer of the single terminal
+    // result (the mag capability bridge) sees WHY a finish_reason "error"
+    // round died without also tracking the separate turn.error/chat.error
+    // events. Carried in the output (the ProviderOut consumers read) and
+    // top-level (envelope-level symmetry with finish_reason).
+    if let Some(e) = error {
+        output.insert("error".into(), Value::String(e.to_owned()));
+    }
     let mut m = Map::new();
     m.insert("chat_id".into(), Value::String(chat_id.to_string()));
     m.insert("output".into(), Value::Object(output));
     if let Some(r) = finish_reason {
         m.insert("finish_reason".into(), Value::String(r.to_owned()));
+    }
+    if let Some(e) = error {
+        m.insert("error".into(), Value::String(e.to_owned()));
     }
     make_event(format!("{}chat.complete.result", args.event_prefix()), m)
 }
@@ -1847,6 +1859,10 @@ fn spawn_turn(ctx: DispatcherContext, chat_id: ChatId, cancel: TurnToken) {
         // so suppress the false positive.
         #[allow(unused_assignments)]
         let mut final_finish_reason: Option<String> = None;
+        // The failure detail of an errored turn, threaded into the terminal
+        // chat.complete.result so its single consumer sees why the round died
+        // (turn.error/chat.error stay the live-surface signals).
+        let mut final_error: Option<String> = None;
         let mut final_tool_calls: Vec<ToolCall> = Vec::new();
         let mut interrupted = false;
         let mut errored = false;
@@ -1861,15 +1877,17 @@ fn spawn_turn(ctx: DispatcherContext, chat_id: ChatId, cancel: TurnToken) {
                 tracing::warn!(cap = TOOL_LOOP_MAX_ITERATIONS, "tool-loop cap hit");
                 errored = true;
                 final_finish_reason = Some("error".into());
+                let msg = format!(
+                    "tool-loop iteration cap hit ({} iterations); aborting",
+                    TOOL_LOOP_MAX_ITERATIONS
+                );
+                final_error = Some(msg.clone());
                 let _ = ctx
                     .out_tx
                     .send(PluginOutgoing::event(turn_error_body(
                         &ctx.args,
                         Some(&chat_id),
-                        &format!(
-                            "tool-loop iteration cap hit ({} iterations); aborting",
-                            TOOL_LOOP_MAX_ITERATIONS
-                        ),
+                        &msg,
                     )))
                     .await;
                 break;
@@ -1881,6 +1899,7 @@ fn spawn_turn(ctx: DispatcherContext, chat_id: ChatId, cancel: TurnToken) {
                     tracing::warn!(chat_id = %chat_id, error = %e, "chat vanished mid-turn");
                     errored = true;
                     final_finish_reason = Some("error".into());
+                    final_error = Some(e.to_string());
                     let _ = ctx
                         .out_tx
                         .send(PluginOutgoing::event(chat_error_body(
@@ -1993,6 +2012,7 @@ fn spawn_turn(ctx: DispatcherContext, chat_id: ChatId, cancel: TurnToken) {
                     .await;
                 errored = true;
                 final_finish_reason = Some("error".into());
+                final_error = Some("auth not connected; cannot complete turn".into());
                 break;
             }
 
@@ -2001,6 +2021,7 @@ fn spawn_turn(ctx: DispatcherContext, chat_id: ChatId, cancel: TurnToken) {
             // grab a fresh snapshot afterwards because the cached
             // tokens may have rotated.
             if let Err(e) = ctx.auth.current_access_token().await {
+                final_error = Some(format!("token refresh failed: {e}"));
                 let _ = handle_refresh_error(&ctx, Some(&chat_id), e).await;
                 errored = true;
                 final_finish_reason = Some("error".into());
@@ -2041,12 +2062,14 @@ fn spawn_turn(ctx: DispatcherContext, chat_id: ChatId, cancel: TurnToken) {
                         iterations = iterations.saturating_sub(1);
                         continue;
                     }
+                    let msg = format!("HTTP {status}: {}", snippet(&body));
+                    final_error = Some(msg.clone());
                     let _ = ctx
                         .out_tx
                         .send(PluginOutgoing::event(turn_error_body(
                             &ctx.args,
                             Some(&chat_id),
-                            &format!("HTTP {status}: {}", snippet(&body)),
+                            &msg,
                         )))
                         .await;
                     errored = true;
@@ -2054,12 +2077,14 @@ fn spawn_turn(ctx: DispatcherContext, chat_id: ChatId, cancel: TurnToken) {
                     break;
                 }
                 Err(e) => {
+                    let msg = format!("request failed: {e}");
+                    final_error = Some(msg.clone());
                     let _ = ctx
                         .out_tx
                         .send(PluginOutgoing::event(turn_error_body(
                             &ctx.args,
                             Some(&chat_id),
-                            &format!("request failed: {e}"),
+                            &msg,
                         )))
                         .await;
                     errored = true;
@@ -2321,6 +2346,7 @@ fn spawn_turn(ctx: DispatcherContext, chat_id: ChatId, cancel: TurnToken) {
                     .await;
                 errored = true;
                 final_finish_reason = Some("error".into());
+                final_error = Some(err_msg);
                 break;
             }
 
@@ -2421,6 +2447,7 @@ fn spawn_turn(ctx: DispatcherContext, chat_id: ChatId, cancel: TurnToken) {
             &final_text,
             &final_tool_calls,
             final_finish_reason.as_deref(),
+            final_error.as_deref(),
         );
         let _ = ctx.out_tx.send(PluginOutgoing::event(body)).await;
 
@@ -2456,6 +2483,50 @@ mod tests {
             provider_name: "chatgpt".into(),
             base_url: "https://example.invalid".into(),
         }
+    }
+
+    #[test]
+    fn chat_complete_result_threads_the_turn_error_detail() {
+        let chat_id = ChatId::new("agent@r2");
+        let body = chat_complete_result_body(
+            &args(),
+            &chat_id,
+            "",
+            &[],
+            Some("error"),
+            Some("HTTP 400: tool message without preceding tool_calls"),
+        );
+        assert_eq!(
+            body.get("kind").and_then(Value::as_str),
+            Some("chatgpt.chat.complete.result")
+        );
+        assert_eq!(
+            body.get("finish_reason").and_then(Value::as_str),
+            Some("error")
+        );
+        // The detail rides in the output (what ProviderOut consumers read) and
+        // top-level, so the single terminal result explains WHY the round died.
+        let output = body
+            .get("output")
+            .and_then(Value::as_object)
+            .expect("output");
+        assert_eq!(
+            output.get("error").and_then(Value::as_str),
+            Some("HTTP 400: tool message without preceding tool_calls")
+        );
+        assert_eq!(
+            body.get("error").and_then(Value::as_str),
+            Some("HTTP 400: tool message without preceding tool_calls")
+        );
+
+        // A clean turn carries no error field at all.
+        let clean = chat_complete_result_body(&args(), &chat_id, "hi", &[], Some("stop"), None);
+        assert!(clean.get("error").is_none());
+        let clean_output = clean
+            .get("output")
+            .and_then(Value::as_object)
+            .expect("output");
+        assert!(clean_output.get("error").is_none());
     }
 
     #[test]

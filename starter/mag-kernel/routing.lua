@@ -79,9 +79,11 @@ local RUN_COMPLETE = kinds.RunComplete
 -- Lifecycle event kinds emitted from the delivery layer. actor_ready mirrors
 -- observer.lua's canonical set (kept literal to avoid a routing → observer
 -- dependency); run_complete is shared through kinds.lua because it drifted
--- against the RunComplete message kind and both must stay in lockstep.
+-- against the RunComplete message kind and both must stay in lockstep;
+-- run_failed is the unhandled-failure escalation (apply_completion).
 local EVT_ACTOR_READY = "mag.actor_ready"
 local EVT_RUN_COMPLETE = kinds.run_complete
+local EVT_RUN_FAILED = kinds.run_failed
 
 local function noop() end
 
@@ -306,9 +308,14 @@ end
 
 -- Emit the kernel-synthesized status type for a completion. Successful
 -- completion emits mag.Unit along the actor's mag.Unit routes (dependency
--- edges); a suffered failure emits the failure-typed output. Routing a status
--- with no matching route entry is a silent no-op — an actor with no dependents
--- simply notifies no one. `nil`/"pending" defers (async capability path).
+-- edges); mag.Unit with no matching route entry is a silent no-op — an actor
+-- with no dependents simply notifies no one. A suffered failure emits the
+-- failure-typed output where the sender routes that tag (composed failure
+-- handling); an UNROUTED failure must not vanish the same way — nothing else
+-- would ever fire, the sink never completes, and the host waits forever on a
+-- run that silently died. Escalate it to the control plane as a run failure
+-- (mag.run_failed) carrying the failure detail. `nil`/"pending" defers (async
+-- capability path).
 function M:apply_completion(id, completion)
   if completion == nil then
     return
@@ -319,7 +326,26 @@ function M:apply_completion(id, completion)
   if completion.status == "ok" then
     self:route_output(id, UNIT, { kind = UNIT, from = id })
   elseif completion.status == "failed" and completion.failure then
-    self:route_output(id, completion.failure, { kind = completion.failure, from = id, value = completion.value })
+    local sender = self.inventory.get(id)
+    local routed = sender and (sender.routes or {})[completion.failure]
+    if routed then
+      self:route_output(id, completion.failure, { kind = completion.failure, from = id, value = completion.value })
+      return
+    end
+    local value = completion.value
+    local detail
+    if type(value) == "table" and type(value.error) == "string" and #value.error > 0 then
+      detail = value.error
+    else
+      detail = string.format("actor '%s' failed with %s", tostring(id), tostring(completion.failure))
+    end
+    self.events({
+      kind = EVT_RUN_FAILED,
+      from = id,
+      failure = completion.failure,
+      error = detail,
+      value = value,
+    })
   end
 end
 

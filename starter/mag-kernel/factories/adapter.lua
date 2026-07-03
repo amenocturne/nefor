@@ -27,8 +27,7 @@
 --   Both inputs lift into ONE user-role turn message, the shape the provider
 --   loop consumes (the canonical ProviderOut carries a `messages` array of
 --   role-tagged turn messages — factories/tool-result.lua emits exactly this,
---   and factories/llm.lua hands the whole ProviderOut to the provider as the
---   turn `input`):
+--   and factories/llm.lua extends its per-instance transcript with them):
 --     { kind = "generic-provider.ProviderOut", from = id,
 --       messages = { { role = "user", content = <lifted> } } }
 --

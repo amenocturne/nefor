@@ -318,8 +318,10 @@ async fn poll_active(
     Ok(())
 }
 
-/// If the resident run signalled completion, send the terminal reply (carrying
-/// the sink's output PATH) and clear the in-flight slot.
+/// If the resident run signalled a terminal state, send the terminal reply and
+/// clear the in-flight slot: completion carries the sink's output PATH; an
+/// unhandled actor failure (the kernel's `mag.run_failed` escalation) fails the
+/// run with the failure detail surfaced.
 async fn settle_if_complete(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     host: &LuaHost,
@@ -333,6 +335,15 @@ async fn settle_if_complete(
         send_event(
             out_tx,
             run_result_ok(a.in_reply_to.as_deref(), &a.run_id, &rc),
+        )
+        .await?;
+        return Ok(());
+    }
+    if let Some(error) = host.take_run_failed()? {
+        let a = active.take().expect("active checked above");
+        send_event(
+            out_tx,
+            run_result_failed(a.in_reply_to.as_deref(), &a.run_id, &error),
         )
         .await?;
     }
@@ -511,6 +522,10 @@ async fn handle_execute(
     // Synchronous program: the sink fired inside `start`. Reply now.
     if let Some(rc) = host.take_run_complete()? {
         return send_event(out_tx, run_result_ok(in_reply_to, &run_id, &rc)).await;
+    }
+    // Synchronous failure: an actor failed with no failure route inside `start`.
+    if let Some(error) = host.take_run_failed()? {
+        return send_event(out_tx, run_result_failed(in_reply_to, &run_id, &error)).await;
     }
 
     // Async program: defer the terminal reply until `mag.run_complete` arrives

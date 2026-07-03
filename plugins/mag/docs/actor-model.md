@@ -74,7 +74,11 @@ The instance exposes `deliver(activation) -> completion`.
   - `"ok"` / `{ status = "ok" }` — success; the kernel emits `mag.Unit` along the
     actor's dependency edges.
   - `{ status = "failed", failure = <tag>, value }` — a computed failure; the
-    kernel emits `<tag>`.
+    kernel emits `<tag>` where the failing actor routes it (composed failure
+    handling). An UNROUTED failure does not vanish: the kernel escalates it to
+    the control plane as a `mag.run_failed` lifecycle event carrying the
+    failure detail (`value.error` when present), and the host fails the run
+    (`mag.run_result status:"failed"`).
   - `nil` / `{ status = "pending" }` — deferred (async); completion arrives later
     as a reserved emit.
 
