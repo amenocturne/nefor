@@ -602,11 +602,14 @@ local function handle_session_end(_msg, state)
     toasts           = {},
     completion       = NIL_SENTINEL,
     dag_runs         = {},
+    mag_active_run_id = NIL_SENTINEL,
   }), {}
 end
 
 local function handle_session_start(_msg, state)
-  return shallow_merge(state, { dag_runs = {}, firing_to_node = {} }), {}
+  return shallow_merge(state, {
+    dag_runs = {}, firing_to_node = {}, mag_active_run_id = NIL_SENTINEL,
+  }), {}
 end
 
 local function handle_replay_start(_msg, state)
@@ -1126,6 +1129,68 @@ local function handle_tool_result(msg, state)
   return state, {}
 end
 
+-- ── MAG kernel observation ────────────────────────────────────────────
+--
+-- The mag plugin relays the kernel's `mag.*` lifecycle stream onto the bus
+-- as broadcasts; the chat surface consumes them to drive the same run
+-- panel reasoner-graph `graph.*` events do. Only `mag.run_started` carries
+-- the run id, so we stamp `mag_active_run_id` (kernel runs are serial — one
+-- in-flight at a time) and key every later actor/mod event to it.
+
+local function handle_mag_run_started(msg, state)
+  if state.replay_mode then return state, {} end
+  local run_id = msg.run_id
+  if type(run_id) ~= "string" or run_id == "" then return state, {} end
+  local next_state = dag.mag_run_started(state, run_id, msg.run_name, tui.now_ms())
+  return shallow_merge(next_state, { mag_active_run_id = run_id }), {}
+end
+
+local function handle_mag_actor_spawned(msg, state)
+  if state.replay_mode then return state, {} end
+  local run_id = state.mag_active_run_id
+  local id = msg.id
+  if type(run_id) ~= "string" or type(id) ~= "string" or id == "" then return state, {} end
+  return dag.actor_spawned(state, run_id, id, msg.factory, tui.now_ms()), {}
+end
+
+local function handle_mag_actor_ready(msg, state)
+  if state.replay_mode then return state, {} end
+  local run_id = state.mag_active_run_id
+  local id = msg.id
+  if type(run_id) ~= "string" or type(id) ~= "string" or id == "" then return state, {} end
+  return dag.actor_ready(state, run_id, id, tui.now_ms()), {}
+end
+
+local function handle_mag_actor_killed(msg, state)
+  if state.replay_mode then return state, {} end
+  local run_id = state.mag_active_run_id
+  local id = msg.id
+  if type(run_id) ~= "string" or type(id) ~= "string" or id == "" then return state, {} end
+  return dag.actor_killed(state, run_id, id, tui.now_ms()), {}
+end
+
+local function handle_mag_modification_rejected(msg, state)
+  if state.replay_mode then return state, {} end
+  local run_id = state.mag_active_run_id
+  if type(run_id) ~= "string" then return state, {} end
+  return dag.modification_rejected(state, run_id), {}
+end
+
+local function handle_mag_modification_noop(msg, state)
+  if state.replay_mode then return state, {} end
+  local run_id = state.mag_active_run_id
+  if type(run_id) ~= "string" then return state, {} end
+  return dag.modification_noop(state, run_id), {}
+end
+
+local function handle_mag_run_complete(msg, state)
+  if state.replay_mode then return state, {} end
+  local run_id = state.mag_active_run_id
+  if type(run_id) ~= "string" then return state, {} end
+  local next_state = dag.mag_run_complete(state, run_id, "success", tui.now_ms())
+  return shallow_merge(next_state, { mag_active_run_id = NIL_SENTINEL }), {}
+end
+
 local function handle_mouse_selection(msg, state)
   local text = msg.text or ""
   if #text > 0 then
@@ -1186,6 +1251,13 @@ local handlers = {
   ["graph.node.fired"]            = handle_graph_node_fired,
   ["graph.node.tool.invoke"]      = handle_graph_node_tool_invoke,
   ["graph.node.chat.bound"]       = handle_graph_node_chat_bound,
+  ["mag.run_started"]             = handle_mag_run_started,
+  ["mag.actor_spawned"]           = handle_mag_actor_spawned,
+  ["mag.actor_ready"]             = handle_mag_actor_ready,
+  ["mag.actor_killed"]            = handle_mag_actor_killed,
+  ["mag.modification_rejected"]   = handle_mag_modification_rejected,
+  ["mag.modification_noop"]       = handle_mag_modification_noop,
+  ["mag.run_complete"]            = handle_mag_run_complete,
   ["tool.result"]                 = handle_tool_result,
   ["mouse.selection"]             = handle_mouse_selection,
 }

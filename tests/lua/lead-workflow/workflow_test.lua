@@ -369,7 +369,70 @@ do
   assert_true(prompt:find(out_path, 1, true) ~= nil,
     "the relayed turn carries the sink output path")
 
+  -- The visible run-result block is appended to the chat surface — kernel
+  -- parity with the reasoner-graph close_sub_graph → chat.graph_result.append.
+  -- It carries status + run id + the sink output PATH, but NOT the output
+  -- content (that rides the relayed turn above; no double-render).
+  local block = find_call(decode_calls(), function(c)
+    return c.body.kind == "chat.graph_result.append" and c.target == "nefor-tui"
+  end)
+  assert_true(block ~= nil,
+    "mag.run_result appends a chat.graph_result block; got " .. json.encode(_test.calls()))
+  assert_eq(block.body.run_id, reply.body.output.run_id,
+    "result block names the run id")
+  assert_eq(block.body.status, "success", "result block status is success")
+  assert_true(type(block.body.output) == "string"
+              and block.body.output:find(out_path, 1, true) ~= nil,
+    "result block surfaces the sink output path")
+  assert_true(block.body.output:find("SINK OUTPUT CONTENT", 1, true) == nil,
+    "result block must NOT duplicate the relayed output content")
+
   os.remove(out_path)
+  config.active.mag_execute_kernel = prev
+end
+
+-- A failed kernel run appends a failed run-result block carrying the error.
+do
+  fresh()
+  write_mag_file("firing-kernel-fail-write", "kernel-fail.mag", READ_ONLY_MAG)
+  _test.calls_clear()
+  local config = require("config")
+  local prev = config.active.mag_execute_kernel
+  config.active.mag_execute_kernel = true
+
+  execute_mag("firing-kernel-fail", "kernel-fail.mag")
+  local load = find_call(decode_calls(), function(c)
+    return c.body.kind == "mag.load" and c.target == "mag"
+  end)
+  assert_true(load ~= nil, "kernel switch emits mag.load")
+  _test.calls_clear()
+  feed("mag", {
+    kind        = "mag.loaded",
+    in_reply_to = load.body.id,
+    factories   = { "bash_command", "sink" },
+  })
+  local reply = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result" and c.body.id == "firing-kernel-fail"
+  end)
+  assert_true(reply ~= nil and reply.body.output ~= nil, "kernel execute replies executing")
+
+  _test.calls_clear()
+  feed("mag", {
+    kind   = "mag.run_result",
+    run_id = reply.body.output.run_id,
+    status = "failed",
+    error  = "kernel boom",
+  })
+  local block = find_call(decode_calls(), function(c)
+    return c.body.kind == "chat.graph_result.append" and c.target == "nefor-tui"
+  end)
+  assert_true(block ~= nil,
+    "failed mag.run_result appends a chat.graph_result block; got " .. json.encode(_test.calls()))
+  assert_eq(block.body.status, "failed", "result block status is failed")
+  assert_true(type(block.body.error) == "string"
+              and block.body.error:find("kernel boom", 1, true) ~= nil,
+    "failed result block carries the error")
+
   config.active.mag_execute_kernel = prev
 end
 

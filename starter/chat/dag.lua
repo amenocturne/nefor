@@ -17,6 +17,9 @@ local GLYPHS = {
   done    = "✓",
   error   = "✗",
   skipped = "⊘",
+  -- MAG-only: a killed actor is a deliberate termination, distinct from a
+  -- failed one (reasoner-graph never had this state — richer-than-parity).
+  killed  = "⊗",
 }
 
 local NODE_STYLE = {
@@ -25,6 +28,13 @@ local NODE_STYLE = {
   done    = STYLE.dag_done,
   error   = STYLE.dag_error,
   skipped = STYLE.dag_skipped,
+  killed  = STYLE.dag_error,
+}
+
+-- Node statuses that count as terminal (drive the done/total counter and
+-- freeze the elapsed timer). MAG's `killed` joins the reasoner-graph set.
+local TERMINAL_STATUS = {
+  done = true, error = true, skipped = true, killed = true,
 }
 
 local function sorted_keys(m)
@@ -83,19 +93,33 @@ function M.any_active(dag_runs, now_ms)
 end
 
 local function run_header(run)
-  local short = run.run_id and run.run_id:sub(1, 8) or "?"
+  -- Reasoner-graph runs key on the abbreviated run id; MAG runs carry a
+  -- human `run_name` (the .mag graph name) worth showing verbatim.
+  local ident
+  if type(run.run_name) == "string" and #run.run_name > 0 then
+    ident = run.run_name
+  else
+    ident = run.run_id and run.run_id:sub(1, 8) or "?"
+  end
+  local label = run.label or "DAG"
   local total = run.total_nodes or 0
   local nodes = run.nodes or {}
   local done = 0
   local nodes_count = 0
   for _, n in pairs(nodes) do
     nodes_count = nodes_count + 1
-    if n.status == "done" or n.status == "error" or n.status == "skipped" then
+    if TERMINAL_STATUS[n.status] then
       done = done + 1
     end
   end
   if nodes_count > total then total = nodes_count end
-  local title = string.format("DAG %s (%d/%d)", short, done, total)
+  local title = string.format("%s %s (%d/%d)", label, ident, done, total)
+  -- Rejected / no-op modification counters (MAG-only) trail the counter so
+  -- a run that is churning against validation reads distinctly.
+  local extra = {}
+  if (run.rejected or 0) > 0 then extra[#extra + 1] = "✗" .. run.rejected .. " rej" end
+  if (run.noops or 0) > 0 then extra[#extra + 1] = "⊘" .. run.noops end
+  if #extra > 0 then title = title .. "  " .. table.concat(extra, " ") end
   return tui.text { content = title, style = STYLE.footer, wrap = "none" }
 end
 
@@ -105,7 +129,7 @@ local function node_rows(node_id, node, now_ms, narrow)
   local elapsed
   if node.status == "running" then
     elapsed = now_ms - (node.started_at_ms or now_ms)
-  elseif node.status == "done" or node.status == "error" then
+  elseif node.status == "done" or node.status == "error" or node.status == "killed" then
     if node.finished_at_ms ~= nil then
       elapsed = node.finished_at_ms - (node.started_at_ms or node.finished_at_ms)
     end
@@ -426,6 +450,110 @@ function M.run_complete(state, run_id, status, results, now_ms)
     end
     return shallow_merge(prev, {
       nodes = nodes, completed_at_ms = now_ms, status = status,
+    })
+  end)
+end
+
+-- ── MAG actor-kernel lifecycle ────────────────────────────────────────
+--
+-- The kernel's `mag.*` event stream drives the same run panel the
+-- reasoner-graph `dag.*`/`graph.*` events do, so a kernel run is visible
+-- the same way. Actors are the panel's "nodes": spawned → pending,
+-- ready → running, killed → killed (distinct), run-complete → the run
+-- finalises (still-live actors flip to done). Only `mag.run_started`
+-- carries the run identity; the reducer keys every later actor/mod event
+-- to the single in-flight run it stamps.
+
+function M.mag_run_started(state, run_id, run_name, now_ms)
+  if state.dag_runs and state.dag_runs[run_id] then return state end
+  return apply(state, run_id, function(_)
+    return {
+      run_id = run_id, run_name = run_name, label = "MAG",
+      total_nodes = 0, started_at_ms = now_ms, nodes = {},
+      completed_at_ms = nil, status = nil, rejected = 0, noops = 0,
+    }
+  end)
+end
+
+function M.actor_spawned(state, run_id, actor_id, factory, now_ms)
+  if not (state.dag_runs and state.dag_runs[run_id]) then return state end
+  return apply(state, run_id, function(prev)
+    if prev.nodes and prev.nodes[actor_id] then return prev end
+    local nodes = {}
+    for k, v in pairs(prev.nodes or {}) do nodes[k] = v end
+    nodes[actor_id] = {
+      reasoner = factory or "",
+      status = "pending",
+      started_at_ms = now_ms,
+      finished_at_ms = nil,
+    }
+    return shallow_merge(prev, { nodes = nodes })
+  end)
+end
+
+function M.actor_ready(state, run_id, actor_id, now_ms)
+  if not (state.dag_runs and state.dag_runs[run_id]) then return state end
+  return apply(state, run_id, function(prev)
+    local nodes = {}
+    for k, v in pairs(prev.nodes or {}) do nodes[k] = v end
+    -- A ready without a prior spawn observation (out-of-order tail) still
+    -- surfaces as a running node rather than being dropped.
+    local node = nodes[actor_id] or { reasoner = "", started_at_ms = now_ms }
+    nodes[actor_id] = shallow_merge(node, {
+      status = "running",
+      started_at_ms = node.started_at_ms or now_ms,
+    })
+    return shallow_merge(prev, { nodes = nodes })
+  end)
+end
+
+function M.actor_killed(state, run_id, actor_id, now_ms)
+  if not (state.dag_runs and state.dag_runs[run_id]
+      and state.dag_runs[run_id].nodes
+      and state.dag_runs[run_id].nodes[actor_id]) then
+    return state
+  end
+  return apply(state, run_id, function(prev)
+    local nodes = {}
+    for k, v in pairs(prev.nodes or {}) do nodes[k] = v end
+    nodes[actor_id] = shallow_merge(nodes[actor_id], {
+      status = "killed", finished_at_ms = now_ms,
+    })
+    return shallow_merge(prev, { nodes = nodes })
+  end)
+end
+
+function M.modification_rejected(state, run_id)
+  if not (state.dag_runs and state.dag_runs[run_id]) then return state end
+  return apply(state, run_id, function(prev)
+    return shallow_merge(prev, { rejected = (prev.rejected or 0) + 1 })
+  end)
+end
+
+function M.modification_noop(state, run_id)
+  if not (state.dag_runs and state.dag_runs[run_id]) then return state end
+  return apply(state, run_id, function(prev)
+    return shallow_merge(prev, { noops = (prev.noops or 0) + 1 })
+  end)
+end
+
+-- Terminal completion for a kernel run. There is no per-actor "done" event
+-- in the stream, so every still-live actor flips to done here; a killed
+-- actor keeps its terminal state. Stamps `completed_at_ms` so the linger +
+-- prune path fades the run out exactly like a reasoner-graph completion.
+function M.mag_run_complete(state, run_id, status, now_ms)
+  if not (state.dag_runs and state.dag_runs[run_id]) then return state end
+  return apply(state, run_id, function(prev)
+    local nodes = {}
+    for k, v in pairs(prev.nodes or {}) do
+      if v.status == "running" or v.status == "pending" then
+        nodes[k] = shallow_merge(v, { status = "done", finished_at_ms = now_ms })
+      else
+        nodes[k] = v
+      end
+    end
+    return shallow_merge(prev, {
+      nodes = nodes, completed_at_ms = now_ms, status = status or "success",
     })
   end)
 end

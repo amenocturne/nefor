@@ -777,6 +777,103 @@ fn graph_node_dispatched_then_result_updates_status_glyph() {
     );
 }
 
+// MAG kernel parity: the `mag.*` lifecycle stream drives the same run
+// panel reasoner-graph `graph.*` events do. Only `mag.run_started` carries
+// the run id; actor events are keyed to the in-flight run by the surface.
+#[test]
+fn mag_run_lifecycle_renders_in_dag_panel() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.run_started",
+            "run_id": "mag-demo-1",
+            "run_name": "demo",
+        }),
+    );
+    // Actor events carry no run_id — the surface attaches them to the
+    // single in-flight kernel run stamped by mag.run_started.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_spawned", "id": "worker", "factory": "llm" }),
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("MAG demo"),
+        "mag run header should show the run name: {out:?}"
+    );
+    assert!(
+        out.contains("worker"),
+        "spawned actor row missing from panel: {out:?}"
+    );
+    assert!(
+        out.contains('○'),
+        "pending glyph (○) missing for a spawned actor: {out:?}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_ready", "id": "worker" }),
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains('●'),
+        "running glyph (●) missing after actor_ready: {out:?}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_complete", "from": "sink" }),
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains('✓'),
+        "done glyph (✓) missing after run_complete: {out:?}"
+    );
+    assert!(
+        out.contains("(1/1)"),
+        "counter should read 1/1 after run completes: {out:?}"
+    );
+}
+
+// Richer-than-parity: a killed actor renders with its own glyph, distinct
+// from a failed/errored node (reasoner-graph never had this state).
+#[test]
+fn mag_killed_actor_renders_distinct_glyph() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "mag-kill-1", "run_name": "killer" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_spawned", "id": "doomed", "factory": "llm" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_ready", "id": "doomed" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_killed", "id": "doomed" }),
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains('⊗'),
+        "killed glyph (⊗) missing for a killed actor: {out:?}"
+    );
+    assert!(
+        out.contains("doomed"),
+        "killed actor row missing from panel: {out:?}"
+    );
+}
+
 #[test]
 fn graph_run_complete_hides_run_after_linger_without_dispatch() {
     // Regression for the "fully green sidebar until I interact" bug:

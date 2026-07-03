@@ -864,9 +864,34 @@ local function relay_kernel_completion(run_id, ok, output_path, content, err)
   end
 end
 
+-- Append the transcript run-result block for a closed kernel run, the kernel
+-- equivalent of the reasoner-graph path's close_sub_graph → chat.graph_result
+-- .append (agentic-loop). Carries status + run id/name + the sink's output
+-- PATH; the output CONTENT is deliberately omitted — it arrives separately as
+-- the relayed fresh turn (relay_kernel_completion), so duplicating it here
+-- would double-render it. `run` is read after finish_run, whose node-status
+-- finalisation is exactly what the block should show.
+local function emit_mag_result_block(run, status, output_path, err)
+  local block = {
+    kind   = "chat.graph_result.append",
+    run_id = run.run_id,
+    status = status,
+    nodes  = ordered_node_summaries(run),
+  }
+  if status == "success" then
+    if type(output_path) == "string" and #output_path > 0 then
+      block.output = "output_path: " .. output_path
+    end
+  elseif type(err) == "string" and #err > 0 then
+    block.error = err
+  end
+  emit("nefor-tui", block)
+end
+
 -- Close a kernel run on its terminal mag.run_result. Updates run/graph-status
 -- state with the sink's output PATH (control-plane semantics — path, not data),
--- then relays the completion to the model as a fresh turn (item 2 parity).
+-- appends the visible run-result block, then relays the completion to the model
+-- as a fresh turn (item 2 parity).
 local function handle_mag_run_result(body)
   local run_id = body.run_id or body.in_reply_to
   if type(run_id) ~= "string" then return end
@@ -874,6 +899,7 @@ local function handle_mag_run_result(body)
   if not run then return end
   if body.status == "failed" then
     finish_run(run_id, "failed", nil, body.error or "mag run failed")
+    emit_mag_result_block(run, "failed", nil, body.error or "mag run failed")
     relay_kernel_completion(run_id, false, nil, nil, body.error or "mag run failed")
     return
   end
@@ -882,6 +908,7 @@ local function handle_mag_run_result(body)
     results[run.terminal] = { output = { output_path = body.output_path } }
   end
   finish_run(run_id, "completed", results, nil)
+  emit_mag_result_block(run, "success", body.output_path, nil)
   relay_kernel_completion(run_id, true, body.output_path,
     read_output_file(body.output_path), nil)
 end
