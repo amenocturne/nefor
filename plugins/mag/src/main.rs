@@ -103,6 +103,14 @@ const RUN_RESULT_KIND: &str = "mag.run_result";
 const APPLY_KIND: &str = "mag.apply";
 const APPLIED_KIND: &str = "mag.applied";
 
+/// Kill a live run outright — the control plane's interrupt surface (the
+/// TUI's Esc path). Ends the run's kernel context through the fold (kill
+/// handlers run, so in-flight provider requests are cancelled — the dying
+/// llm's `<provider>.chat.cancel` reaches the bus) and settles the pending
+/// execute as `mag.run_result status:"killed"`. A kill for a run that is
+/// not live is a logged no-op (monotone lifecycles: kill on dead, no-op).
+const KILL_RUN_KIND: &str = "mag.kill_run";
+
 /// Correlation id echoed by capability responses (tool.result). The kernel
 /// mints these on `capability.invoke` (routing.lua); the reply carries `output`
 /// (tool/provider convention) or `result`, plus an optional `error`. The tool
@@ -390,6 +398,7 @@ async fn handle_event(
             handle_execute(out_tx, body, in_reply_to, program, host, active, bridge).await
         }
         APPLY_KIND => handle_apply(out_tx, body, in_reply_to, host, active, bridge).await,
+        KILL_RUN_KIND => handle_kill_run(out_tx, body, host, active, bridge).await,
         // A capability response correlated to a kernel-minted request id.
         // Unknown ids are dropped inside the kernel (no open correlation), so
         // forwarding every tool.result while any run is live is safe.
@@ -711,6 +720,36 @@ async fn handle_apply(
     settle_run(out_tx, host, active, bridge, &run_id).await
 }
 
+/// Kill one live run: end its kernel context — reaping its actors through
+/// the fold, so kill handlers run and their abort/cancel envelopes (a
+/// mid-flight llm's `<provider>.chat.cancel`) reach the bus — then settle
+/// the pending execute with `mag.run_result status:"killed"`. The cancel
+/// envelopes are flushed BEFORE the terminal reply so a consumer that
+/// treats the reply as "turn closed" observes the aborts first. A kill for
+/// a run without a live execute is a logged no-op.
+async fn handle_kill_run(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    body: &Map<String, Value>,
+    host: &LuaHost,
+    active: &mut ActiveExecutes,
+    bridge: &mut CapabilityBridge,
+) -> Result<(), MagError> {
+    let run_id = match body.get("run_id").and_then(Value::as_str) {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+    let a = match active.remove(run_id) {
+        Some(a) => a,
+        None => {
+            tracing::info!(run_id = %run_id, "mag.kill_run for a run that is not live; no-op");
+            return Ok(());
+        }
+    };
+    host.end_run(run_id)?;
+    flush_emits(out_tx, host, bridge).await?;
+    send_event(out_tx, run_result_killed(a.in_reply_to.as_deref(), run_id)).await
+}
+
 /// Route a capability response into the kernel (unblocking a deferred
 /// activation in the owning run's context), forward whatever it produced, and
 /// settle that run if it completed. Correlation ids are run-scoped, so the
@@ -911,6 +950,21 @@ fn run_result_failed(in_reply_to: Option<&str>, run_id: &str, error: &str) -> Ma
     m.insert("run_id".into(), Value::String(run_id.to_owned()));
     m.insert("status".into(), Value::String("failed".into()));
     m.insert("error".into(), Value::String(error.to_owned()));
+    m
+}
+
+/// Terminal run reply for a control-plane kill (`mag.kill_run`): the pending
+/// execute settles as status "killed". Distinct from "failed" so consumers
+/// treat it as "turn aborted" (no history append, no error surface), not as
+/// an error.
+fn run_result_killed(in_reply_to: Option<&str>, run_id: &str) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("kind".into(), Value::String(RUN_RESULT_KIND.into()));
+    if let Some(id) = in_reply_to {
+        m.insert("in_reply_to".into(), Value::String(id.to_owned()));
+    }
+    m.insert("run_id".into(), Value::String(run_id.to_owned()));
+    m.insert("status".into(), Value::String("killed".into()));
     m
 }
 

@@ -82,13 +82,19 @@ end
 -- Emit `mag.run_started`. The wiring/host calls this at the start of a run,
 -- before the initial modification is applied, so observers record the run up
 -- front (parity with reasoner-graph's RunStarted). Run identity is host-
--- provided and passed through untouched.
+-- provided and passed through untouched. `scope` is the run's wire-id scope
+-- token (`r<K>` — init.lua, run contexts): everything this run puts on the
+-- shared bus that must resolve back to it is `<scope>/`-prefixed (capability
+-- correlation ids, provider chat handles), so surfacing the token here lets
+-- the run's spawner do prefix-form correlation (e.g. the lead turn's
+-- `chat.lead.bound { chat_prefix }`) without ever parsing an opaque id.
 function M:run_started(meta)
   meta = meta or {}
   self.emit_event({
     kind = EVENTS.run_started,
     run_id = meta.run_id,
     run_name = meta.run_name,
+    scope = meta.scope,
   })
 end
 

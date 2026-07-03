@@ -369,7 +369,10 @@ return {
     end
     local ctx = new_run_context(meta)
     runs[meta.run_id] = ctx
-    ctx.observer:run_started({ run_id = ctx.run_id, run_name = ctx.run_name })
+    -- The scope token rides run_started so the run's spawner can bind
+    -- prefix-scoped wire ids (chat handles, correlation ids) to this run
+    -- without parsing them (observer.lua run_started).
+    ctx.observer:run_started({ run_id = ctx.run_id, run_name = ctx.run_name, scope = ctx.scope })
     return { ok = true, reaped = stale }
   end,
 
