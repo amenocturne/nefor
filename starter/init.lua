@@ -308,13 +308,14 @@ agentic_loop.configure {
   model            = cfg.default_model,
   reasoning_effort = cfg.lead_reasoning_effort,
   system           = lead_role.LEAD_SYSTEM_PROMPT .. build_runtime_context(),
-  -- Restrict the lead's chat catalog to the orchestration-tool surface.
-  -- MAG is the public graph-construction surface; lower-level graph
-  -- primitives stay runtime internals. The agent reasoner already
-  -- enforces a per-role allowlist on sub-firings via the same
-  -- `chat.create.tools` plumbing; this extends the same discipline to
-  -- the lead's chat at the orchestrator layer.
-  tool_allowlist = lead_role.ORCHESTRATION_TOOLS,
+  -- The lead's turn-program (config-as-program): each user message spawns
+  -- this constellation on the mag kernel. The lead's tool surface is
+  -- authored INSIDE the program (:tools on the agent config); the system
+  -- prompt / provider / model above overlay onto its llm actor per turn.
+  lead_program = {
+    source_dir = STARTER_ROOT,
+    entry      = "agentic-loop/lead-turn.mag",
+  },
 }
 actor.spawn(agentic_loop)
 actor.spawn(require("reasoners"))

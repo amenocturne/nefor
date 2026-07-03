@@ -62,8 +62,8 @@
 --
 -- ## Termination on session exit
 --
--- Subscribes to `sessions.session_end`. If any lead-owned graph runs are
--- active, emits one `graph.cancel { run_id }` per run and archives each as
+-- Subscribes to `sessions.session_end`. If any lead-owned kernel runs are
+-- active, emits one `mag.kill_run { run_id }` per run and archives each as
 -- canceled. Also clears `state.active_plan` so a resumed/new session starts
 -- with no carry-over approval.
 
@@ -1097,10 +1097,16 @@ local function handle_mag_run_result(body)
   if type(run_id) ~= "string" then return end
   local run = state.active_runs[run_id]
   if not run then return end
-  if body.status == "failed" then
-    finish_run(run_id, "failed", nil, body.error or "mag run failed")
-    emit_mag_result_block(run, "failed", nil, body.error or "mag run failed")
-    relay_kernel_completion(run_id, false, nil, nil, body.error or "mag run failed")
+  -- "killed" closes a run the control plane terminated out from under us
+  -- (a mag.kill_run this actor didn't issue — terminate-graph archives
+  -- before the reply lands, so those never reach here). Surfaced like a
+  -- failure so the lead learns its dispatched run died.
+  if body.status == "failed" or body.status == "killed" then
+    local err = body.error
+      or (body.status == "killed" and "run killed" or "mag run failed")
+    finish_run(run_id, "failed", nil, err)
+    emit_mag_result_block(run, "failed", nil, err)
+    relay_kernel_completion(run_id, false, nil, nil, err)
     return
   end
   local results = {}
@@ -1131,7 +1137,12 @@ terminate_graph = function(firing_id, args)
     return
   end
 
-  emit_as(SOURCE_NAME, nil, { kind = "graph.cancel", run_id = run_id })
+  -- Kernel kill machinery: the kernel reaps the run's live actors through
+  -- the fold (kill handlers run — provider cancels fire) and settles the
+  -- pending execute as `mag.run_result status:"killed"`. The run is
+  -- archived here first, so that terminal reply finds no tracked run and
+  -- drops (no double relay).
+  emit_as(SOURCE_NAME, "mag", { kind = "mag.kill_run", run_id = run_id })
   local summary = archive_canceled_run(run_id, "terminate-graph")
   emit_tool_result_ok(firing_id, { canceled = true, run_id = run_id, run = summary })
 end
@@ -1186,13 +1197,12 @@ local function terminate_active_graph()
   table.sort(run_ids)
   if #run_ids == 0 then return end
 
-  -- Broadcast (target = nil) rather than target reasoner-graph: every
-  -- in-flight agent reasoner under this run also needs to see the
-  -- envelope so it can interrupt its provider stream + close its
-  -- firing (sub-graph cancel propagation). The reasoner-graph
-  -- binary still receives the broadcast and processes it the same way.
+  -- Every tracked run is a kernel run (register_active_run fires only on
+  -- the mag execute path), so session-end termination rides the kernel
+  -- kill machinery: end_run reaps the constellation through the fold and
+  -- the dying actors' provider-cancel envelopes reach the bus.
   for _, run_id in ipairs(run_ids) do
-    emit_as(SOURCE_NAME, nil, { kind = "graph.cancel", run_id = run_id })
+    emit_as(SOURCE_NAME, "mag", { kind = "mag.kill_run", run_id = run_id })
     archive_canceled_run(run_id, "session-end")
     -- Previously this emitted a "[Graph terminated by user — session
     -- exit]" chat.message.append for user feedback, but the message
@@ -1448,12 +1458,17 @@ local function resume_pending_load(body)
     return
   end
 
+  -- The modification rides INLINE on the execute rather than relying on
+  -- the plugin's resident program: concurrent loaders share the plugin
+  -- (the turn spawner loads the lead's own turn-program through the same
+  -- mag.load surface), so "execute whatever was loaded last" would race.
   local exec = {
-    kind       = "mag.execute",
-    id         = pending.run_id,
-    run_id     = pending.run_id,
-    run_name   = pending.run_name,
-    session_id = pending.session_id,
+    kind         = "mag.execute",
+    id           = pending.run_id,
+    run_id       = pending.run_id,
+    run_name     = pending.run_name,
+    session_id   = pending.session_id,
+    modification = modification,
   }
   if next(overlay) ~= nil then
     exec.params_overlay = overlay

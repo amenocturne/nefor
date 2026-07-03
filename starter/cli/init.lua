@@ -315,12 +315,21 @@ local READY_SENTINEL = "basic-tools.hello"
 -- second turn to print the actual final answer. Heuristic: if any tool
 -- call this turn was spawn_graph, suppress the first on_complete and
 -- wait for the next.
+-- A tool call that dispatches an async run whose result relays back as a
+-- deferred follow-up turn: the legacy `spawn_graph`, or the lead's `mag`
+-- tool with action=execute (the kernel path). Either way the first
+-- on_complete is a transitional ack turn, not the final answer.
+local function is_async_dispatch(name, input)
+  if name == "spawn_graph" then return true end
+  return name == "mag" and type(input) == "table" and input.action == "execute"
+end
+
 local function run_single_shot(prompt, format, json_state, turn_start_ms, gate)
   local spawn_graph_inflight = false
   local already_exited = false
 
-  agentic_workflow.on_tool_start(function(_id, name, _input)
-    if name == "spawn_graph" then
+  agentic_workflow.on_tool_start(function(_id, name, input)
+    if is_async_dispatch(name, input) then
       spawn_graph_inflight = true
       -- Suppress text streaming for the first turn — the user wants the
       -- final relayed answer, not the transitional "Started the sub-graph"
@@ -413,8 +422,8 @@ local function run_repl(format, json_state, gate)
     end
   end
 
-  agentic_workflow.on_tool_start(function(_id, name, _input)
-    if name == "spawn_graph" then
+  agentic_workflow.on_tool_start(function(_id, name, input)
+    if is_async_dispatch(name, input) then
       spawn_graph_inflight = true
       if gate then gate.suppress_stream = true end
     end

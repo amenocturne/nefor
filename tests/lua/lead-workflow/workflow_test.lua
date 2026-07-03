@@ -393,6 +393,49 @@ end
 -- model turn, and appends the visible run-result block.
 -- ------------------------------------------------------------------
 
+-- The kernel lead: agentic-loop relays a dispatched run's completion as
+-- a fresh turn-program spawn. On first use the spawner loads its shipped
+-- turn-program (a mag.load with a distinct entry from the lead tool's
+-- workspace loads) — answer it with a minimal compiled lead shape — and
+-- the relayed text rides the mag.execute's initial task payload.
+local function lead_turn_modification()
+  return {
+    actors = {
+      { id = "lead.entry", factory = "adapter", params = { seed = "provider-in" },
+        routes = { ["generic-provider.ProviderOut"] = { "lead.llm" } } },
+      { id = "lead.llm", factory = "llm", params = {},
+        routes = { ["generic-provider.FinalAnswer"] = { "sink" } } },
+      { id = "sink", factory = "sink", params = {}, routes = {} },
+    },
+    messages = { { to = "lead.entry", content = { kind = "task", prompt = "<initial task text>" } } },
+    kills = {},
+    rules = {},
+  }
+end
+
+local function relayed_lead_prompt()
+  local calls = decode_calls()
+  local load = find_call(calls, function(c)
+    return c.body.kind == "mag.load"
+       and c.body.entry == "agentic-loop/lead-turn.mag"
+  end)
+  if load ~= nil then
+    agentic_loop.receive_msg(make_entry("mag", {
+      kind = "mag.loaded", in_reply_to = load.body.id,
+      hash = "sha256:lead", modification = lead_turn_modification(),
+    }))
+    calls = decode_calls()
+  end
+  local exec = find_call(calls, function(c)
+    return c.body.kind == "mag.execute" and c.target == "mag"
+       and c.body.run_name == "lead"
+  end)
+  if exec == nil then return nil end
+  local msg = exec.body.modification and exec.body.modification.messages
+    and exec.body.modification.messages[1]
+  return msg and msg.content and msg.content.prompt or nil
+end
+
 do
   fresh()
   write_mag_file("firing-kernel-write", "kernel-run.mag", READ_ONLY_MAG)
@@ -420,18 +463,12 @@ do
   assert_eq(lw._internals.state.active_runs[reply.body.output.run_id], nil,
     "run archived after mag.run_result closes it")
 
-  -- The completion is relayed as a fresh orchestrator turn (agentic-loop's
-  -- lead-turn relay — a spawn_graph tool.invoke re-prompt).
-  local turn = find_call(decode_calls(), function(c)
-    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
-        and c.target == "reasoner-graph"
-  end)
-  assert_true(turn ~= nil,
-    "mag.run_result relays a fresh orchestrator turn; got " .. json.encode(_test.calls()))
-  local prompt = turn.body.args and turn.body.args.graph
-    and turn.body.args.graph.nodes[1].args.prompt
-  assert_true(type(prompt) == "string"
-              and prompt:find("SINK OUTPUT CONTENT", 1, true) ~= nil,
+  -- The completion is relayed as a fresh lead turn (agentic-loop's kernel
+  -- turn spawner — a lead turn-program mag.execute re-prompt).
+  local prompt = relayed_lead_prompt()
+  assert_true(type(prompt) == "string",
+    "mag.run_result relays a fresh lead turn; got " .. json.encode(_test.calls()))
+  assert_true(prompt:find("SINK OUTPUT CONTENT", 1, true) ~= nil,
     "the relayed turn carries the sink output content read from the path")
   assert_true(prompt:find(out_path, 1, true) ~= nil,
     "the relayed turn carries the sink output path")
@@ -503,16 +540,10 @@ do
 
   -- The relayed fresh turn carries the inline result text — no output file
   -- exists anywhere in this scenario.
-  local turn = find_call(decode_calls(), function(c)
-    return c.body.kind == "tool.invoke" and c.body.name == "spawn_graph"
-        and c.target == "reasoner-graph"
-  end)
-  assert_true(turn ~= nil,
-    "inline mag.run_result relays a fresh orchestrator turn; got " .. json.encode(_test.calls()))
-  local prompt = turn.body.args and turn.body.args.graph
-    and turn.body.args.graph.nodes[1].args.prompt
-  assert_true(type(prompt) == "string"
-              and prompt:find("INLINE RESULT TEXT", 1, true) ~= nil,
+  local prompt = relayed_lead_prompt()
+  assert_true(type(prompt) == "string",
+    "inline mag.run_result relays a fresh lead turn; got " .. json.encode(_test.calls()))
+  assert_true(prompt:find("INLINE RESULT TEXT", 1, true) ~= nil,
     "the relayed turn carries the inline result text; got " .. tostring(prompt))
 
   -- The result block carries the actors' final statuses, not dispatch-time
@@ -1125,10 +1156,12 @@ do
   lw._internals.terminate_active_graph()
 
   local calls = decode_calls()
-  local cancel = find_call(calls, function(c)
-    return c.body.kind == "graph.cancel" and c.body.run_id == run_id
+  local kill = find_call(calls, function(c)
+    return c.body.kind == "mag.kill_run" and c.body.run_id == run_id
+       and c.target == "mag"
   end)
-  assert_true(cancel ~= nil, "session_end emits graph.cancel for the active run")
+  assert_true(kill ~= nil,
+    "session_end emits mag.kill_run for the active kernel run")
 
   assert_eq(next(lw._internals.state.active_runs), nil,
     "active_runs cleared after termination")

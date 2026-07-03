@@ -1,72 +1,107 @@
--- starter/agentic-loop/init.lua — orchestrator actor.
+-- starter/agentic-loop/init.lua — the lead's turn spawner.
 --
--- The orchestrator owns single-flight run state, the firing→node map,
--- and the observer registries chat.lua subscribes to. Per-plugin
--- wrapper actors (under `compositors/`, plus `reasoner-graph/`,
--- `tool-gate/`) translate each binary's wire shape to the canonical
--- `tool.invoke` / `tool.result` pair; this actor only consumes the
--- canonical shape.
+-- The lead's turn is a short-lived MAG program over a persistent chat:
+-- turn-as-function, `(history, message) -> response`. Per user message this
+-- actor clones the shipped turn-program (agentic-loop/lead-turn.mag,
+-- compiled once via `mag.load` and cached), sets the initial `mag.Task`
+-- payload to the message, overlays the live config (system prompt,
+-- provider/model/reasoning effort) plus the canonical history onto the lead
+-- llm actor, and submits it with `mag.execute`. The constellation runs on
+-- the mag kernel — the lead's tool surface rides the tool-gate capability
+-- bridge like any kernel run — the final response lands in the sink, the
+-- terminal `mag.run_result` closes the turn, and the constellation dies.
+--
+-- What outlives turns lives HERE:
+--   * canonical history — per completed turn `{ user message, final answer
+--     text }` is appended (intra-turn tool exchanges die with the
+--     turn-program) and seeded into the next turn's llm via
+--     `params.history`. `agentic_loop.turn_recorded` markers on the bus
+--     make the history rebuildable on /resume.
+--   * queueing/orchestration — queued-message promotion while busy, the
+--     deferred relay queue for dispatched-run completions
+--     (lead-workflow → relay_run_completion), model/profile switching, the
+--     statusline runtime states.
+--
+-- Transcript binding: kernel wire ids are run-scoped (`r<K>/…`), so per
+-- run this actor broadcasts `chat.lead.bound { chat_prefix }` — the scope
+-- token off `mag.run_started` plus the lead llm's actor id — and the chat
+-- surface renders exactly the chats under that prefix. The same prefix
+-- keys the lead's gated tool invocations (`<scope>/cap-N`) into
+-- `chat.tool.start` / `chat.tool.end` transcript events.
+--
+-- Interrupt = kill: Esc (`chat.interrupt` / `chat.interrupt_all`) kills the
+-- active run via `mag.kill_run`; the kernel reaps the constellation through
+-- the fold (provider cancels fire) and settles the turn as
+-- `mag.run_result status:"killed"` — turn aborted, no history append.
+--
+-- The pending/chat_id/tool-id tracking tables below serve the resident
+-- reasoners + provider/tool compositors for reasoner-graph runs (non-lead
+-- consumers — the agent reasoner's sub-firings and any directly submitted
+-- graph). The lead no longer compiles onto reasoner-graph.
 --
 -- Inbound dispatch:
---   * `chat.input.submit { text }`       — build orchestrator graph,
---                                          emit tool.invoke{name=spawn_graph}
---   * `chat.interrupt_all`               — double-Esc; cancel everything
---   * `chat.reset`                       — /new: clear state + broadcast
+--   * `chat.input.submit { text }`       — spawn a turn-program (or queue)
+--   * `chat.interrupt`                   — Esc; kill the active lead run
+--   * `chat.interrupt_all`               — double-Esc; kill + drop queues
+--   * `chat.reset`                       — /new: clear state + history
 --   * `chat.model.set`                   — runtime model switch
---   * `graph.run_started`/`node.fired`   — observer envelopes
---   * `tool.result { id, result|error }` — three flavours keyed by id:
---                                          orchestrator run, sub-graph
---                                          run, or wrap-node next_state
---   * `<provider>.chat.complete.result`  — translated by provider wrapper
---   * `<provider>.stream.delta` etc.     — fire stream/reasoning observers
---   * `sessions.session_start/end/resume_done` — replay lifecycle
---   * `engine.shutdown`                  — no-op (sessions handles)
+--   * `mag.loaded` / `mag.error`         — the turn-program load handshake
+--   * `mag.run_started { run_id, scope }`— bind the transcript prefix
+--   * `mag.run_result { run_id, status }`— close the turn
+--   * `<gate>.tool.invoke` / `tool.result` (lead-scoped ids) — transcript
+--     tool events + observers
+--   * `agentic_loop.turn_recorded`       — replay: rebuild history
+--   * `sessions.session_end`             — teardown
 
 local json = nefor.json
 
 local envelope        = require("core.envelope")
 local ids             = require("core.ids")
 local results_lib     = require("agentic-loop.results")
-local topology        = require("agentic-loop.topology")
-local spawn_graph     = require("libs.spawn-graph")
 local history_replay  = require("core.history_replay")
 local session_config  = require("agentic-loop.session_config")
-local generic_provider = require("libs.generic-provider")
-local generic_tool     = require("libs.generic-tool")
 
 local state = {
   -- Orchestrator config — mutated by configure() / chat.model.set.
   config = {
-    provider       = "ollama",
-    model          = nil,
+    provider         = "ollama",
+    model            = nil,
     reasoning_effort = nil,
-    system         = nil,
-    -- Optional list of tool names the lead's chat is allowed to see in
-    -- its catalog. nil = no filter (advertise the full catalog). Set in
-    -- starter/init.lua to lead_role.ORCHESTRATION_TOOLS so the lead
-    -- can't call reasoner-graph internals like `spawn_graph` directly.
-    tool_allowlist = nil,
+    system           = nil,
   },
 
+  -- The shipped turn-program. `source_dir`/`entry` are composition-owned
+  -- (configure { lead_program = … }); the modification is loaded once per
+  -- session through the mag plugin and cached here, then cloned per turn.
+  lead_program = {
+    source_dir = nil,   ---@type string|nil  resolved lazily (NEFOR_CONFIG_DIR)
+    entry      = "agentic-loop/lead-turn.mag",
+    modification = nil, ---@type table|nil   cached compiled modification
+    hash       = nil,   ---@type string|nil
+    entry_actor = nil,  ---@type string|nil  the task message's target
+    llm_actor  = nil,   ---@type string|nil  the overlay/binding target
+    load_id    = nil,   ---@type string|nil  in-flight mag.load request id
+  },
+
+  -- Canonical conversation history: provider-dialect messages, one
+  -- user+assistant pair per completed turn. Seeded into each turn's llm
+  -- via params.history; rebuilt on /resume from turn_recorded markers.
+  history = {},                 ---@type table
+
   current_run_id = nil,         ---@type string|nil
-  current_state  = nil,         ---@type table|nil   -- next_state from wrap
-  deferred_queue       = {},    ---@type table       -- queued spawn_graph results { text }
-  pending_user_inputs  = {},    ---@type table       -- queued submits while busy
-  pending              = {},    ---@type table       -- run_id:firing_id → entry
-  pending_runs         = {},    ---@type table       -- sub-graph run_id → meta
-  pending_dispatches   = {},    ---@type table       -- queued sub-graph dispatches
+  -- The in-flight turn: { run_id, user_text, scope, chat_prefix, streamed }.
+  current_turn   = nil,         ---@type table|nil
+  deferred_queue       = {},    ---@type table  queued relay texts { text }
+  pending_user_inputs  = {},    ---@type table  queued submits while busy
+
+  -- reasoner-graph firing bookkeeping (non-lead consumers: resident
+  -- reasoners + compositors).
+  pending              = {},    ---@type table  run_id:firing_id → entry
   chat_id_to_key       = {},    ---@type table
   tool_id_to_key       = {},    ---@type table
   chat_id_stream_visible = {},  ---@type table
-  chat_id_stream_explicitly_hidden = {},  ---@type table  -- chats explicitly registered hidden by agent reasoners; gates streams without a pending entry
+  chat_id_stream_explicitly_hidden = {},  ---@type table
   current_lead_chat_id = nil,   ---@type string|nil
-  replay_chat_ids = {},         ---@type table<string, boolean>
-  -- firing_id → { run_id, node_id, reasoner } for tracked runs (the
-  -- orchestrator run + every sub-graph run we own). Populated by
-  -- graph.node.fired observer envelopes; consumed when a tool.result
-  -- arrives for a firing_id we care about (today: only wrap-node
-  -- next_state capture).
-  firing_to_node       = {},    ---@type table
 
   -- Observer registries. Public on_* setters append; producers fire via
   -- pcall so a bad observer doesn't break the chain.
@@ -77,17 +112,19 @@ local state = {
   complete_observers     = {},  ---@type table
 }
 
--- Reasoner types whose streaming should reach nefor-tui.
+-- Reasoner types whose streaming should reach nefor-tui (reasoner-graph
+-- runs; the lead's kernel chats are prefix-bound instead).
 local STREAM_VISIBLE_TYPES = { ["provider-wrapper"] = true }
-
-local SPAWN_GRAPH_SOURCE = spawn_graph.SPAWN_GRAPH_SOURCE
 
 local emit           = envelope.emit
 local pending_key    = ids.pending_key
-local uuid_lite      = envelope.uuid_lite
 
-local serialise_results = results_lib.serialise_results
-local format_deferred   = results_lib.format_deferred
+local format_deferred = results_lib.format_deferred
+
+local function starts_with(s, prefix)
+  return type(s) == "string" and type(prefix) == "string" and #prefix > 0
+    and s:sub(1, #prefix) == prefix
+end
 
 local function emit_runtime_state(kind, extra)
   extra = extra or {}
@@ -107,7 +144,6 @@ local function emit_idle_if_idle(run_id)
   if state.current_run_id ~= nil then return end
   if #state.deferred_queue > 0 then return end
   if #state.pending_user_inputs > 0 then return end
-  if next(state.pending_runs) ~= nil then return end
   emit_runtime_state("agentic_loop.idle", { run_id = run_id })
 end
 
@@ -115,71 +151,177 @@ local function fire_observers(list, ...)
   for _, cb in ipairs(list) do pcall(cb, ...) end
 end
 
--- Release every queued sub-graph dispatch. Idempotent.
-local function flush_pending_dispatches()
-  if #state.pending_dispatches == 0 then return 0 end
-  local n = #state.pending_dispatches
-  local snapshot = state.pending_dispatches
-  state.pending_dispatches = {}
-  for _, entry in ipairs(snapshot) do
-    nefor.log.info("agentic-loop: dispatching queued sub-graph", {
-      run_id = entry.run_id,
-    })
-    -- Canonical tool contract: submit a graph by issuing a
-    -- `tool.invoke { id=run_id, name="spawn_graph", args: { graph,
-    -- on_node_failure } }`. The reasoner-graph binary parses this in
-    -- its dispatch_event when name matches SPAWN_GRAPH_TOOL_NAME.
-    emit("reasoner-graph", {
-      kind = "tool.invoke",
-      id   = entry.run_id,
-      name = "spawn_graph",
-      args = {
-        graph           = entry.graph,
-        name            = entry.name,
-        on_node_failure = entry.on_node_failure,
-      },
-    })
+-- ── the turn-program ──────────────────────────────────────────────────
+
+local function lead_program_source_dir()
+  if type(state.lead_program.source_dir) == "string"
+      and #state.lead_program.source_dir > 0 then
+    return state.lead_program.source_dir
   end
-  return n
+  return rawget(_G, "NEFOR_CONFIG_DIR") or os.getenv("NEFOR_CONFIG_DIR") or "."
 end
 
-local cancel_all_pending_runs
+-- Deep-copy plain data (the cached modification / history are cloned per
+-- turn so per-turn mutation never leaks into the cache).
+local function deep_clone(value)
+  if type(value) ~= "table" then return value end
+  local out = {}
+  for k, v in pairs(value) do out[k] = deep_clone(v) end
+  return out
+end
 
+-- Derive the turn-program's seams from its compiled modification:
+--   * entry actor — the initial task message's target;
+--   * lead llm — the llm-factory actor the entry adapter routes
+--     `generic-provider.ProviderOut` into (the overlay + binding target).
+-- Derivation over hardcoding keeps the program hackable: rename the agent
+-- in lead-turn.mag and the spawner follows.
+local function derive_program_seams(modification)
+  local msg = (modification.messages or {})[1]
+  local entry_actor = type(msg) == "table" and msg.to or nil
+  if type(entry_actor) ~= "string" then
+    return nil, "turn-program has no initial message (no entry actor)"
+  end
+  local llm_actor
+  for _, actor in ipairs(modification.actors or {}) do
+    if actor.id == entry_actor then
+      local dests = type(actor.routes) == "table"
+        and actor.routes["generic-provider.ProviderOut"] or nil
+      llm_actor = type(dests) == "table" and dests[1] or nil
+    end
+  end
+  if type(llm_actor) ~= "string" then
+    return nil, "turn-program entry actor '" .. tostring(entry_actor)
+      .. "' routes no ProviderOut (no lead llm actor)"
+  end
+  return { entry_actor = entry_actor, llm_actor = llm_actor }, nil
+end
+
+-- Kick the turn-program load handshake (idempotent while in flight). The
+-- mag.loaded reply caches the modification and flushes queued submits.
+local function ensure_lead_program_loaded()
+  local p = state.lead_program
+  if p.modification ~= nil or p.load_id ~= nil then return end
+  p.load_id = "lead-turn-load-" .. envelope.uuid_lite()
+  emit("mag", {
+    kind       = "mag.load",
+    id         = p.load_id,
+    source_dir = lead_program_source_dir(),
+    entry      = p.entry,
+  })
+  nefor.log.info("agentic-loop: loading lead turn-program", {
+    source_dir = lead_program_source_dir(), entry = p.entry,
+  })
+end
+
+local flush_pending_user_inputs
+
+local function handle_lead_program_loaded(body)
+  local p = state.lead_program
+  if body.in_reply_to ~= p.load_id then return end
+  p.load_id = nil
+  local modification = body.modification
+  if type(modification) ~= "table" then
+    emit("nefor-tui", {
+      kind = "chat.message.append", role = "system",
+      text = "[lead turn-program load carried no modification]",
+    })
+    return
+  end
+  local seams, err = derive_program_seams(modification)
+  if not seams then
+    emit("nefor-tui", {
+      kind = "chat.message.append", role = "system",
+      text = "[lead turn-program invalid] " .. tostring(err),
+    })
+    return
+  end
+  p.modification = modification
+  p.hash = body.hash
+  p.entry_actor = seams.entry_actor
+  p.llm_actor = seams.llm_actor
+  nefor.log.info("agentic-loop: lead turn-program cached", {
+    hash = p.hash, entry_actor = p.entry_actor, llm_actor = p.llm_actor,
+  })
+  flush_pending_user_inputs()
+end
+
+local function handle_lead_program_error(body)
+  local p = state.lead_program
+  if body.in_reply_to ~= p.load_id then return end
+  p.load_id = nil
+  emit("nefor-tui", {
+    kind = "chat.message.append", role = "system",
+    text = "[lead turn-program failed to compile]\n" .. tostring(body.message),
+  })
+  -- Queued submits stay queued; the next submit retries the load.
+  emit_idle_state("lead-program-load-failed")
+end
+
+-- Spawn one turn-program for `user_text`. Clones the cached modification,
+-- points the initial mag.Task at the message, overlays live config +
+-- canonical history onto the lead llm actor, and submits `mag.execute`.
 local function submit_orchestrator_run(user_text)
   if state.current_run_id ~= nil then return nil end
-
-  local g = topology.build_orchestrator_graph({
-    provider       = state.config.provider,
-    model          = state.config.model,
-    reasoning_effort = state.config.reasoning_effort,
-    system         = state.config.system,
-    user_text      = user_text or "",
-    tool_allowlist = state.config.tool_allowlist,
-    provider_out   = generic_provider.PROVIDER_OUT,
-    final_answer   = generic_provider.FINAL_ANSWER,
-    tool_calls     = generic_tool.TOOL_CALLS,
-  })
-
-  if type(state.current_state) == "table"
-      and type(state.current_state.chat_id) == "string" then
-    g.nodes[1].args.seed_chat_id = state.current_state.chat_id
+  local p = state.lead_program
+  if p.modification == nil then
+    -- Program not compiled yet: queue the text and (re)kick the load; the
+    -- mag.loaded reply flushes the queue.
+    state.pending_user_inputs[#state.pending_user_inputs + 1] = user_text
+    ensure_lead_program_loaded()
+    return nil
   end
 
-  state.current_run_id = ids.mint_chat_run_id()
-  emit_runtime_state("agentic_loop.run_start", { run_id = state.current_run_id })
-  -- Canonical tool contract: graph submission is a `tool.invoke` with
-  -- name="spawn_graph". The reasoner-graph binary's dispatch_event
-  -- routes by name and parses graph + policy from inside `args`.
-  emit("reasoner-graph", {
-    kind = "tool.invoke",
-    id   = state.current_run_id,
-    name = "spawn_graph",
-    args = {
-      graph           = g,
-      on_node_failure = "abort",
-    },
+  local mod = deep_clone(p.modification)
+  for _, msg in ipairs(mod.messages or {}) do
+    if msg.to == p.entry_actor and type(msg.content) == "table" then
+      msg.content.prompt = user_text
+    end
+  end
+
+  local overlay_params = {
+    history = deep_clone(state.history),
+  }
+  if type(state.config.provider) == "string" and #state.config.provider > 0 then
+    overlay_params.provider = state.config.provider
+  end
+  if type(state.config.model) == "string" and #state.config.model > 0 then
+    overlay_params.model = state.config.model
+  end
+  if type(state.config.reasoning_effort) == "string" and #state.config.reasoning_effort > 0 then
+    overlay_params.reasoning_effort = state.config.reasoning_effort
+  end
+  if type(state.config.system) == "string" and #state.config.system > 0 then
+    overlay_params.system = state.config.system
+  end
+
+  local run_id = ids.mint_chat_run_id()
+  state.current_run_id = run_id
+  state.current_turn = {
+    run_id    = run_id,
+    user_text = user_text or "",
+    scope     = nil,
+    chat_prefix = nil,
+    streamed  = false,
+  }
+  emit_runtime_state("agentic_loop.run_start", { run_id = run_id })
+
+  local sessions = require("sessions")
+  emit("mag", {
+    kind           = "mag.execute",
+    id             = run_id,
+    run_id         = run_id,
+    run_name       = "lead",
+    session_id     = sessions.current_id(),
+    modification   = mod,
+    params_overlay = { [p.llm_actor] = overlay_params },
   })
-  return state.current_run_id
+  nefor.log.info("agentic-loop: lead turn submitted to mag kernel", {
+    run_id = run_id,
+    text_preview = string.sub(user_text or "", 1, 80),
+    history_len = #state.history,
+  })
+  return run_id
 end
 
 local function drain_deferred_text()
@@ -188,47 +330,21 @@ local function drain_deferred_text()
   return entry and entry.text or nil
 end
 
-local function active_lead_chat_id()
-  if type(state.current_state) == "table"
-      and type(state.current_state.chat_id) == "string"
-      and #state.current_state.chat_id > 0 then
-    return state.current_state.chat_id
-  end
-  if type(state.current_lead_chat_id) == "string"
-      and #state.current_lead_chat_id > 0 then
-    return state.current_lead_chat_id
-  end
-  return nil
-end
-
-local function append_to_active_lead_chat(text)
-  if type(text) ~= "string" or #text == 0 then return false end
-  local chat_id = active_lead_chat_id()
-  if type(chat_id) ~= "string" then return false end
-  emit(state.config.provider, {
-    kind    = state.config.provider .. ".chat.append",
-    chat_id = chat_id,
-    message = { role = "user", content = text },
-  })
-  return true
-end
-
--- Deferred user-text queue. Carries any text that needs to land as a
--- user-role message in a fresh orchestrator turn: today, sub-graph
--- completion bodies (`[spawn_graph(run_id=…) result]`). One entry per
--- turn so a long backlog still produces an observable chat each step
--- instead of one merged blob.
+-- Deferred relay queue. Carries any text that needs to land as the next
+-- turn's user-role task: dispatched kernel-run completion bodies relayed
+-- by lead-workflow (relay_run_completion). One entry per turn so a long
+-- backlog still produces an observable chat each step.
 local function flush_deferred()
   if state.current_run_id ~= nil then return end
   local merged = drain_deferred_text()
   if type(merged) ~= "string" then return end
-  nefor.log.info("agentic-loop: flushing deferred spawn_graph results", {
+  nefor.log.info("agentic-loop: flushing deferred run completion", {
     text_preview = string.sub(merged, 1, 80),
   })
   submit_orchestrator_run(merged)
 end
 
-local function flush_pending_user_inputs()
+flush_pending_user_inputs = function()
   if state.current_run_id ~= nil then return end
   if #state.pending_user_inputs == 0 then return end
   local combined = table.concat(state.pending_user_inputs, "\n")
@@ -240,188 +356,77 @@ local function flush_pending_user_inputs()
   submit_orchestrator_run(combined)
 end
 
--- Cancel everything. Fan-out order:
---   (1) cancel current orchestrator run + interrupt the in-flight
---       provider stream so deltas stop spilling
---   (2) if the lead was idle, cancel sub-graph runs + clear queued dispatches
---   (3) drop deferred queue + pending user inputs
---   (4) clear pending bookkeeping
---
--- The single-Esc `cancel()` already fires `<provider>.interrupt` so
--- the binary aborts the streaming chat completion; `cancel_all` now
--- matches. Without it, `graph.cancel` on the reasoner-graph side is
--- "accept-and-drop" (the in-flight provider chat is not torn down by
--- the scheduler today), so an interrupt-all triggered by `/new`
--- mid-stream would let the prior turn's provider deltas keep
--- arriving and paint into the freshly-cleared transcript. The
--- `chat.reset` that sessions emits later in the `/new` path
--- translates to `<provider>.reset` which only clears chat history —
--- it does NOT interrupt the live turn — so the provider-interrupt
--- has to ride here.
+-- ── interrupt = kill ──────────────────────────────────────────────────
+
+-- Kill the active lead run via the kernel kill machinery. The kernel
+-- reaps the constellation through the fold — kill handlers run, so the
+-- in-flight provider request's cancel envelope reaches the bus — and
+-- settles the turn as `mag.run_result status:"killed"` (handled below:
+-- turn aborted, no history append). Run state clears on that reply, not
+-- here, so a duplicate Esc is a kernel-side no-op.
+local function kill_active_lead_run()
+  if state.current_run_id == nil then return false end
+  emit("mag", { kind = "mag.kill_run", run_id = state.current_run_id })
+  nefor.log.info("agentic-loop: kill requested for active lead run", {
+    run_id = state.current_run_id,
+  })
+  return true
+end
+
+-- Single-Esc: abort the current turn.
+local function cancel()
+  kill_active_lead_run()
+end
+
+-- Double-Esc / interrupt-all: abort the current turn and drop everything
+-- queued behind it. The deferred relay queue is kept (matching the prior
+-- behaviour): a dispatched run's completion still reaches the model on
+-- the next submit.
 local function cancel_all()
-  local cancelled_chat = state.current_run_id ~= nil
-  if cancelled_chat then
-    emit("reasoner-graph", {
-      kind   = "graph.cancel",
-      run_id = state.current_run_id,
-    })
-    emit(state.config.provider, {
-      kind = state.config.provider .. ".interrupt",
-    })
-    state.current_run_id = nil
-  end
-  local sub_n = cancelled_chat and 0 or cancel_all_pending_runs()
-  local deferred_after_cancel = #state.deferred_queue
+  local killed = kill_active_lead_run()
   local dropped_inputs = #state.pending_user_inputs
-  if cancelled_chat then
-    -- The visible lead turn is being torn down. Sub-graph cancellation
-    -- is a later stop-ladder rung, so do not synthesize or relay
-    -- sub-graph interruption notices here.
-    nefor.log.info("agentic-loop: cancelled active lead turn only", {
-      deferred_queued = deferred_after_cancel,
-    })
-  else
-    flush_deferred()
-  end
   state.pending_user_inputs = {}
   state.pending = {}
   state.chat_id_to_key = {}
   state.chat_id_stream_visible = {}
   state.chat_id_stream_explicitly_hidden = {}
   state.tool_id_to_key = {}
-  state.firing_to_node = {}
   state.current_lead_chat_id = nil
   emit_idle_state("cancelled")
   nefor.log.info("agentic-loop: cancel_all", {
-    cancelled_chat_run = cancelled_chat,
-    cancelled_sub_runs = sub_n,
-    deferred_after_cancel = deferred_after_cancel,
+    killed_lead_run = killed,
+    deferred_queued = #state.deferred_queue,
     dropped_pending_inputs = dropped_inputs,
   })
   return {
-    chat = cancelled_chat,
-    sub_graphs = sub_n,
-    deferred = deferred_after_cancel,
+    chat = killed,
+    deferred = #state.deferred_queue,
     pending_inputs = dropped_inputs,
   }
 end
 
--- /new handler.
---
--- Clears orchestrator-side state so the next submit mints a fresh
--- chat_id under the active provider. Does NOT broadcast `chat.reset`
--- — that envelope translates to `<provider>.reset` on the wire which
--- providers handle as `reset_all()`, wiping every chat history they
--- hold (not just the active chat). With reset_all in the /new path,
--- a later /resume of any prior chat under the same provider lands on
--- a chat_id whose history the provider no longer has — the model
--- replies with no context.
---
--- The clean semantics: each chat_id is an independent conversation
--- that lives on the provider for the lifetime of the provider
--- process. /new starts a NEW chat_id (fresh state from the model's
--- perspective by virtue of no prior messages) without touching
--- siblings. /resume restores any chat_id and the provider still has
--- its history. Cross-process resume (after restarting nefor) still
--- needs an explicit replay-from-session-log — tracked separately.
+-- /new handler: clear turn + queue + canonical history so the next submit
+-- starts a fresh conversation. The turn-program cache survives — the
+-- program is per-session config, not per-conversation state.
 local function new_chat()
-  state.current_state = nil
   state.current_run_id = nil
+  state.current_turn = nil
   state.deferred_queue = {}
   state.pending_user_inputs = {}
+  state.history = {}
 end
 
--- Mid-chat /model picker.
---
--- A model-only switch (same provider, different model) keeps
--- state.current_state intact — chat_id continues to live on the
--- existing provider plugin, the wrapper's chat.model.set →
--- <prefix>.model.set carries the active chat_id so the provider
--- learns the new model for that chat, conversation continuity holds.
---
--- A provider switch (different provider name) crosses a process
--- boundary: the new provider's binary has no per-chat_id history
--- table for the active chat. Without rebuild the model would reply
--- with no memory of prior turns. We rebuild by walking the
--- on-disk session log for the prior chat's `<old>.chat.{create,append}`
--- + wrap-firing tool.result envelopes and re-emitting them as
--- `<new>.chat.{create,append}` against a fresh chat_id under the new
--- provider. The bus traffic flows through every wrapper's `to_plugin`
--- the same way live envelopes do; the new provider's wrapper delivers
--- to its binary, every other wrapper drops on prefix mismatch. The
--- next submit seeds the wrap node with the new chat_id (via
--- state.current_state) so reasoners.lua's no-create branch fires
--- (prev_state.chat_id is set → no new chat.create, just chat.append +
--- chat.complete on the already-rebuilt chat).
---
--- If the session log is unavailable (no path, open failure, no prior
--- chat.create matching the chat_id), we fall back to clearing
--- current_state — user loses prior context but the chat stays
--- consistent.
+-- Mid-chat /model picker. History is canonical here and seeded per turn
+-- via params.history, so BOTH a model-only switch and a cross-provider
+-- switch keep full conversation continuity with no provider-side rebuild:
+-- the next turn replays the same history against the new provider/model.
 local function set_model(provider, model)
-  local prior_provider = state.config.provider
-  local prior_chat_id  =
-    (type(state.current_state) == "table" and type(state.current_state.chat_id) == "string")
-      and state.current_state.chat_id or nil
-  local provider_changed = false
   if type(provider) == "string" and #provider > 0 then
-    if state.config.provider ~= provider then
-      provider_changed = true
-    end
     state.config.provider = provider
   end
   if type(model) == "string" and #model > 0 then
     state.config.model = model
   end
-  if not provider_changed then return end
-
-  if prior_chat_id == nil then
-    -- Cross-provider switch with no prior chat — nothing to rebuild.
-    nefor.log.info("agentic-loop.set_model: provider changed, no prior chat", {
-      prior_provider = prior_provider, new_provider = provider,
-    })
-    state.current_state = nil
-    return
-  end
-
-  -- Rebuild prior chat under the new provider. The session log path is
-  -- resolved through the sessions module; we lazy-require it to avoid
-  -- a circular dep at module-load time (sessions doesn't depend on
-  -- agentic-loop, but lazy keeps the surface symmetric with the
-  -- agentic-loop ↔ openai-provider lazy-bind below).
-  local sessions = require("sessions")
-  local path = sessions.current_path()
-  if type(path) ~= "string" or path == "" then
-    nefor.log.warn("agentic-loop.set_model: no session log path available; clearing current_state", {
-      prior_provider = prior_provider, new_provider = provider,
-    })
-    state.current_state = nil
-    return
-  end
-
-  local target_chat_id = envelope.next_id("chat")
-  local n, err = history_replay.replay_chat_history {
-    path             = path,
-    src_prefix       = prior_provider,
-    src_chat_id      = prior_chat_id,
-    target_provider  = provider,
-    target_chat_id   = target_chat_id,
-    model            = state.config.model,
-  }
-  if err ~= nil then
-    nefor.log.warn("agentic-loop.set_model: history replay failed; clearing current_state", {
-      prior_provider = prior_provider, new_provider = provider,
-      prior_chat_id = prior_chat_id, error = err,
-    })
-    state.current_state = nil
-    return
-  end
-  state.current_state = { chat_id = target_chat_id }
-  nefor.log.info("agentic-loop.set_model: chat history fed to new provider", {
-    prior_provider  = prior_provider, new_provider = provider,
-    prior_chat_id   = prior_chat_id,  new_chat_id  = target_chat_id,
-    envelopes_emitted = n,
-  })
 end
 
 local function set_reasoning_effort(provider, effort)
@@ -449,18 +454,6 @@ end
 
 local function set_yolo(enabled)
   set_mode(enabled and "yolo" or "safe")
-end
-
--- Single-Esc behaviour: cancel the current chat turn at the provider.
--- The binary handles the history shape: mid-tool-call interrupts get
--- synthetic tool results ("tool was interrupted"), mid-stream interrupts
--- push the partial assistant text. No extra notice needed here — the
--- next user message provides natural context.
-local function cancel()
-  if state.current_run_id == nil then return end
-  emit(state.config.provider, {
-    kind = state.config.provider .. ".interrupt",
-  })
 end
 
 local function handle_chat_input_submit(body)
@@ -503,17 +496,13 @@ local function handle_chat_input_submit(body)
 end
 
 local function handle_chat_reset()
-  nefor.log.info("agentic-loop: chat.reset received, clearing current_state", {
-    had_state = state.current_state ~= nil,
-    prior_chat_id = type(state.current_state) == "table" and state.current_state.chat_id or nil,
+  nefor.log.info("agentic-loop: chat.reset received, clearing turn state", {
     dropped_deferred = #state.deferred_queue,
     dropped_pending_inputs = #state.pending_user_inputs,
     had_run = state.current_run_id ~= nil,
+    history_len = #state.history,
   })
-  state.current_state = nil
-  state.current_run_id = nil
-  state.deferred_queue = {}
-  state.pending_user_inputs = {}
+  new_chat()
   emit_idle_state("reset")
 end
 
@@ -539,294 +528,192 @@ local function handle_chat_reasoning_set(body)
   end
 end
 
-local function sub_graph_nodes(graph)
-  local nodes = {}
-  if type(graph) == "table" and type(graph.nodes) == "table" then
-    for _, n in ipairs(graph.nodes) do
-      if type(n) == "table" then
-        nodes[#nodes + 1] = {
-          id   = tostring(n.id or "?"),
-          role = tostring(n.role or n.reasoner or "?"),
-        }
-      end
-    end
-  end
-  return nodes
-end
+-- ── turn lifecycle (kernel events) ────────────────────────────────────
 
-local function close_sub_graph(run_id, sub_pending, status, results, explicit_error)
-  local effective_status = status or "unknown"
-  local completion = {
-    kind   = "spawn_graph.completed",
-    run_id = run_id,
-    status = effective_status,
-  }
-  local pending_graph = sub_pending and sub_pending.graph or nil
-  if effective_status == "success" then
-    completion.output = serialise_results(results or {}, pending_graph)
-  elseif type(explicit_error) == "string" and #explicit_error > 0 then
-    completion.error = explicit_error
-  else
-    completion.error = "spawn_graph run completed with status `" .. effective_status ..
-                       "`: " .. json.encode(results or {})
-  end
-
-  nefor.log.info("agentic-loop: sub-graph completed", {
-    run_id = run_id, status = effective_status,
-  })
-
-  local graph_event = {
-    kind   = "chat.graph_result.append",
-    run_id = run_id,
-    status = effective_status == "success" and "success" or "failed",
-    nodes  = sub_graph_nodes(pending_graph),
-  }
-  if effective_status == "success" then
-    graph_event.output = completion.output
-  else
-    graph_event.error = completion.error
-  end
-  emit("nefor-tui", graph_event)
-  state.deferred_queue[#state.deferred_queue + 1] = { text = format_deferred(completion) }
-end
-
-cancel_all_pending_runs = function()
-  local n = 0
-  for run_id, entry in pairs(state.pending_runs) do
-    emit("reasoner-graph", { kind = "graph.cancel", run_id = run_id })
-    close_sub_graph(run_id, entry, "interrupted", {},
-      "sub-graph interrupted by user")
-    state.pending_runs[run_id] = nil
-    n = n + 1
-  end
-  state.pending_dispatches = {}
-  return n
-end
-
--- graph.node.fired observer: track firing_id → (run_id, node_id) for
--- runs we care about (current orchestrator run + every sub-graph run
--- we own). The Rust scheduler emits one of these per dispatch alongside
--- the targeted tool.invoke; we use it to correlate the eventual
--- tool.result back to a node so the wrap-node next_state capture works.
-local function handle_graph_node_fired(body)
-  local run_id = body.run_id
-  local firing_id = body.firing_id
-  local node_id = body.node_id
-  if type(run_id) ~= "string" or type(firing_id) ~= "string" then return end
-  if run_id ~= state.current_run_id and state.pending_runs[run_id] == nil then
+-- The lead run began: bind the transcript to its scoped wire ids. The
+-- kernel's chat handles are `<scope>/<actor>@r<seq>` and change every
+-- round, so the binding is prefix-form — `<scope>/<llm actor>@` — and the
+-- chat surface's foreign-chat guard honors it for exactly this run.
+local function handle_mag_run_started(body)
+  local turn = state.current_turn
+  if turn == nil or body.run_id ~= turn.run_id then return end
+  if type(body.scope) ~= "string" or #body.scope == 0 then
+    nefor.log.warn("agentic-loop: mag.run_started carried no scope; transcript binding skipped", {
+      run_id = body.run_id,
+    })
     return
   end
-  state.firing_to_node[firing_id] = {
-    run_id   = run_id,
-    node_id  = node_id,
-    reasoner = body.reasoner,
-  }
+  turn.scope = body.scope
+  turn.chat_prefix = body.scope .. "/" .. state.lead_program.llm_actor .. "@"
+  emit(nil, { kind = "chat.lead.bound", chat_prefix = turn.chat_prefix })
 end
 
--- A tool.result with id == one of our tracked run_ids closes that run.
-local function handle_tool_result_run_close(run_id, body)
-  -- tool.result { id=run_id, result: { status, results } } — Rust packs
-  -- the prior `graph.run_complete` shape verbatim into result.
-  local result = body.result
-  local status, results
-  if type(result) == "table" then
-    status  = result.status
-    results = result.results
+-- The relay text for a run result's inline `result` (the sink's final
+-- answer riding mag.run_result): its text when it carries one.
+local function mag_result_text(result)
+  if type(result) ~= "table" then return nil end
+  if type(result.text) == "string" and #result.text > 0 then
+    return result.text
   end
-  results = results or {}
-
-  -- Sub-graph completion: surface the literal sub-graph output to the
-  -- user, then queue the LLM-instruction-wrapped relay text + flush.
-  --
-  -- The deferred relay text built by `format_deferred` is shaped for the
-  -- LLM (it leads with "[spawn_graph(...) result]" + behavioural framing
-  -- + the actual output). It rides as the next orchestrator-turn user
-  -- message so the model can acknowledge / paraphrase. But the literal
-  -- sub-graph terminal output is the ground truth — the user wants to
-  -- see it directly, between the collapsed `▶ spawn_graph(...)` tool
-  -- view and the model's relay paragraph. Emit it as a transcript-bound
-  -- system message so it lands in the chat scrollback (and persists for
-  -- replay) at the moment the sub-graph closes.
-  local sub_pending = state.pending_runs[run_id]
-  if sub_pending ~= nil then
-    state.pending_runs[run_id] = nil
-    close_sub_graph(run_id, sub_pending, status, results, nil)
-    -- Deliver each finished graph as soon as the lead is idle. If the
-    -- lead is currently processing another completion, flush_deferred()
-    -- naturally leaves the text queued until that turn closes.
-    flush_deferred()
-    -- Note: do NOT return; the orchestrator-match branch below may
-    -- also fire if (rare) the sub-graph completion races the
-    -- orchestrator's own run-close envelope.
+  if type(result.final_answer) == "string" and #result.final_answer > 0 then
+    return result.final_answer
   end
+  local ok, encoded = pcall(json.encode, result)
+  if ok and type(encoded) == "string" then return encoded end
+  return nil
+end
 
-  -- Orchestrator completion: clear current_run_id, surface results.
-  if run_id == state.current_run_id then
-    nefor.log.info("agentic-loop: tool.result run-close for our run", {
-      run_id = run_id, status = status,
-      had_state = state.current_state ~= nil,
-      chat_id = type(state.current_state) == "table" and state.current_state.chat_id or nil,
-      deferred_queued = #state.deferred_queue,
+-- Terminal close of the lead's turn-program.
+--   completed — the answer already painted into the transcript via the
+--     prefix-bound stream (exactly how the lead's final answer renders
+--     today); when no stream flowed (a non-streaming provider), the text
+--     is appended so the turn is never silently empty. Canonical history
+--     gains the `{ user, answer }` pair, and a turn_recorded marker rides
+--     the bus so /resume can rebuild it.
+--   failed — surfaced in chat as a system line (no silent nothing).
+--   killed — turn aborted (Esc): no history append, no transcript append.
+local function handle_mag_run_result(body)
+  local turn = state.current_turn
+  if turn == nil or body.run_id ~= turn.run_id then return end
+  local run_id = turn.run_id
+  state.current_run_id = nil
+  state.current_turn = nil
+
+  if body.status == "completed" then
+    local answer = mag_result_text(body.result) or ""
+    state.history[#state.history + 1] = { role = "user", content = turn.user_text }
+    state.history[#state.history + 1] = { role = "assistant", content = answer }
+    -- Durable marker: the canonical history delta for this turn. Replayed
+    -- on /resume to rebuild state.history (receive_msg below).
+    emit(nil, {
+      kind   = "agentic_loop.turn_recorded",
+      run_id = run_id,
+      user   = turn.user_text,
+      answer = answer,
     })
-    state.current_run_id = nil
-    -- Drop firing→node mappings owned by this run.
-    for fid, ref in pairs(state.firing_to_node) do
-      if ref.run_id == run_id then state.firing_to_node[fid] = nil end
+    if not turn.streamed and #answer > 0 then
+      emit("nefor-tui", {
+        kind = "chat.message.append",
+        role = "assistant",
+        text = answer,
+      })
     end
-
-    fire_observers(state.complete_observers, run_id, tostring(status))
-
-    if status == "success" then
-      flush_deferred()
-      flush_pending_user_inputs()
-      emit_idle_if_idle(run_id)
-      return
-    end
-
-    local err_text
-    for _, key in ipairs({ "_typecheck", "_error", "_cycle" }) do
-      local entry = results[key]
-      if type(entry) == "table" and type(entry.error) == "string" then
-        err_text = "[" .. key .. "] " .. entry.error
-        break
-      end
-    end
-    if err_text == nil then
-      for nid, entry in pairs(results) do
-        if type(entry) == "table" and type(entry.error) == "string" then
-          err_text = "[" .. tostring(nid) .. " errored] " .. entry.error
-          break
-        end
-      end
-    end
-    if type(err_text) ~= "string" or #err_text == 0 then
-      err_text = "[orchestrator finished with status: " .. tostring(status) .. "]"
-    end
-
-    emit("nefor-tui", {
-      kind = "chat.message.append",
-      role = "system",
-      text = err_text,
+    nefor.log.info("agentic-loop: lead turn completed", {
+      run_id = run_id, streamed = turn.streamed,
+      answer_len = #answer, history_len = #state.history,
     })
+    fire_observers(state.complete_observers, run_id, "success")
     flush_deferred()
     flush_pending_user_inputs()
     emit_idle_if_idle(run_id)
+    return
   end
+
+  if body.status == "killed" then
+    nefor.log.info("agentic-loop: lead turn killed", { run_id = run_id })
+    fire_observers(state.complete_observers, run_id, "killed")
+    if #state.pending_user_inputs > 0 then
+      flush_pending_user_inputs()
+    else
+      emit_idle_state("cancelled", run_id)
+    end
+    return
+  end
+
+  -- failed (and anything else terminal we don't recognize).
+  local err_text = "[lead turn failed] " .. tostring(body.error or body.status or "unknown error")
+  emit("nefor-tui", {
+    kind = "chat.message.append",
+    role = "system",
+    text = err_text,
+  })
+  nefor.log.warn("agentic-loop: lead turn failed", {
+    run_id = run_id, error = body.error, status = body.status,
+  })
+  fire_observers(state.complete_observers, run_id, tostring(body.status))
+  flush_deferred()
+  flush_pending_user_inputs()
+  emit_idle_if_idle(run_id)
 end
 
--- Per-firing tool.result close: capture wrap node's next_state →
--- current_state for chat continuity. Only the wrap-firing's next_state
--- matters to the orchestrator.
-local function handle_tool_result_firing_close(firing_id, body)
-  local ref = state.firing_to_node[firing_id]
-  if ref == nil then return end
-  -- Drop the mapping; firing is closed.
-  state.firing_to_node[firing_id] = nil
-  if ref.run_id ~= state.current_run_id then return end
-  if ref.node_id ~= "wrap" then return end
-  -- next_state lives inside `result` per the wire-protocol spec
-  -- (coordination point 1).
-  local result = body.result
-  if type(result) ~= "table" then return end
-  local next_state = result.next_state
-  if type(next_state) ~= "table" then return end
-  state.current_state = next_state
-  nefor.log.info("agentic-loop: captured next_state from wrap", {
-    run_id  = ref.run_id,
-    chat_id = next_state.chat_id,
+-- Lead-scoped gated tool invocations → transcript tool events + the
+-- on_tool_* observer registries. The kernel mints run-scoped correlation
+-- ids (`<scope>/cap-N`); the bridge keeps them as the gate's outer id and
+-- the gate echoes them on its broadcast tool.result, so a prefix match on
+-- the current turn's scope identifies exactly the lead's own calls
+-- (dispatched sub-runs carry their own scopes). Provider-class invokes
+-- never reach the gate (the bridge drives them as chat.* conversations),
+-- so this observes real tools only.
+local function lead_scoped_id(body_id)
+  local turn = state.current_turn
+  if turn == nil or type(turn.scope) ~= "string" then return false end
+  return starts_with(body_id, turn.scope .. "/")
+end
+
+local function handle_gate_invoke(body)
+  if not lead_scoped_id(body.id) then return end
+  fire_observers(state.tool_start_observers, body.id, body.name, body.args)
+  emit("nefor-tui", {
+    kind  = "chat.tool.start",
+    id    = body.id,
+    name  = body.name,
+    input = body.args,
   })
 end
 
--- Top-level dispatcher for tool.result. Disambiguates by `id`:
---   - matches a tracked run_id           → run close
---   - matches a tracked firing_id        → wrap-node next_state capture
---   - neither (real tool, spawn_graph ack, etc.) → ignore
-local function handle_tool_result(body)
-  local id = body.id
-  if type(id) ~= "string" or id == "" then return end
-  if id == state.current_run_id or state.pending_runs[id] ~= nil then
-    handle_tool_result_run_close(id, body)
-    return
+local function handle_gate_result(body)
+  if not lead_scoped_id(body.id) then return end
+  local output = body.output
+  if type(output) == "table" then
+    local ok, encoded = pcall(json.encode, output)
+    output = ok and encoded or "(object)"
   end
-  if state.firing_to_node[id] ~= nil then
-    handle_tool_result_firing_close(id, body)
-    return
+  local err = body.error ~= nil
+  if err then output = tostring(body.error) end
+  fire_observers(state.tool_end_observers, body.id, output, err)
+  emit("nefor-tui", {
+    kind   = "chat.tool.end",
+    id     = body.id,
+    output = output,
+    error  = err,
+  })
+end
+
+-- Track whether the lead's answer painted via the stream this turn (the
+-- chat surface finalizes the assistant entry off `chat.stream.end`); when
+-- it did, the run-result close must not append the text a second time.
+local function handle_stream_marker(body)
+  local turn = state.current_turn
+  if turn == nil or type(turn.chat_prefix) ~= "string" then return end
+  if not starts_with(body.chat_id, turn.chat_prefix) then return end
+  local text = body.text or body.delta
+  if type(text) == "string" and #text > 0 then
+    turn.streamed = true
   end
 end
 
 local function teardown_for_session_end()
-  if state.current_run_id ~= nil then
-    emit("reasoner-graph", {
-      kind = "graph.cancel",
-      run_id = state.current_run_id,
-    })
-    emit(state.config.provider, {
-      kind = state.config.provider .. ".interrupt",
-    })
-    state.current_run_id = nil
-  end
-  cancel_all_pending_runs()
-  local close_notice = drain_deferred_text()
-  if type(close_notice) == "string" then
-    append_to_active_lead_chat(close_notice)
-  end
-  state.pending_runs       = {}
-  state.pending_dispatches = {}
+  kill_active_lead_run()
+  state.current_run_id = nil
+  state.current_turn   = nil
   state.pending            = {}
   state.chat_id_to_key     = {}
   state.chat_id_stream_visible = {}
   state.chat_id_stream_explicitly_hidden = {}
   state.tool_id_to_key     = {}
-  state.firing_to_node     = {}
   state.current_lead_chat_id = nil
-  state.current_state      = nil
   state.deferred_queue     = {}
   state.pending_user_inputs = {}
+  state.history            = {}
   emit_idle_state("session-ended")
-  -- Don't broadcast `chat.reset` here either — same reason as new_chat
-  -- above. Provider-side chat histories stay so /resume of any prior
-  -- chat under the same provider gets its history back.
   nefor.log.info("agentic-loop: sessions.session_end → state cleared", {})
 end
 
--- Queue a sub-graph dispatch and return the minted run_id. Called by
--- the tool-gate wrapper when it intercepts the gate-forwarded
--- spawn_graph invocation. The dispatch is held in pending_dispatches
--- and released on first wrap-stream delta, or via the backup path on
--- chat.complete.result.
-local function queue_sub_graph(args, gate_inner_id)
-  local g = args.graph
-  local on_failure = args.on_node_failure or "abort"
-  if type(g) ~= "table" then
-    return nil, "spawn_graph: missing or non-object `graph` argument"
-  end
-  local run_id = uuid_lite()
-  -- Retain the submitted graph so the run-close handler can surface a
-  -- per-node id+role list to the TUI's graph_result entry. The graph
-  -- table is otherwise opaque to agentic-loop — reasoner-graph parses
-  -- + owns scheduling — but the node list is exactly the metadata the
-  -- chat surface needs to render the sub-graph result block.
-  state.pending_runs[run_id] = { gate_inner_id = gate_inner_id, graph = g }
-  state.pending_dispatches[#state.pending_dispatches + 1] = {
-    run_id          = run_id,
-    name            = args.name,
-    graph           = g,
-    on_node_failure = on_failure,
-  }
-  nefor.log.info("agentic-loop: queued sub-graph dispatch (will flush on wrap stream.delta)", {
-    run_id = run_id,
-    gate_inner_id = gate_inner_id,
-    queue_depth = #state.pending_dispatches,
-  })
-  return run_id
-end
+-- ── reasoner-graph firing bookkeeping (non-lead consumers) ────────────
 
 -- Tool-executor pending entry constructor — called by the tool-executor
 -- resident reasoner when it dispatches per-call invocations and needs to
--- correlate results back to its node firing. The shape is the same as
--- the pre-Phase-3 `pending[key]` for tool-executor:
---   { type, run_id, node_id, firing_id, reasoner, tool_calls, tool_results,
---     tool_ids, pending_count }
+-- correlate results back to its node firing.
 local function track_tool_executor(run_id, run_name, node_id, firing_id, calls, tool_ids)
   if tool_ids == nil and type(firing_id) == "table" and type(calls) == "table" then
     tool_ids = calls
@@ -878,19 +765,11 @@ local function track_provider_firing(reasoner_type, run_id, run_name, node_id, f
   }
   state.chat_id_to_key[chat_id] = key
   state.chat_id_stream_visible[chat_id] = STREAM_VISIBLE_TYPES[reasoner_type] == true
-  -- Capture the lead's chat_id the moment its provider firing
-  -- starts. `state.current_state.chat_id` only becomes available
-  -- AFTER the wrap firing closes (it's pulled from the wrap's
-  -- next_state), so on turn 1 — before any wrap close has happened —
-  -- cancel() / cancel_all() couldn't find a chat_id and the
-  -- interrupt-notice append silently no-op'd. Tracking it here makes
-  -- the chat_id known the moment streaming starts, so an immediate
-  -- ESC during the very first stream still injects the notice.
+  -- Announce the binding so surfaces can positively identify a
+  -- stream-visible provider-wrapper conversation (reasoner-graph runs;
+  -- exact-match form). The lead's own turns bind prefix-form off
+  -- mag.run_started instead.
   if STREAM_VISIBLE_TYPES[reasoner_type] then
-    -- Announce the binding so surfaces can positively identify the
-    -- lead conversation's chat. Other chats stream on the same bus
-    -- deliberately (kernel-run actor chats feed the session log and
-    -- run-panel consumers); a transcript renders only the bound chat.
     if state.current_lead_chat_id ~= chat_id then
       emit(nil, { kind = "chat.lead.bound", chat_id = chat_id })
     end
@@ -918,24 +797,22 @@ local function peek_pending_for_chat(chat_id)
   return state.pending[key]
 end
 
--- Stream-visible check by chat_id (sub-graph stream gating).
+-- Stream-visible check by chat_id. True for tracked stream-visible
+-- reasoner-graph firings AND for the active lead turn's prefix-scoped
+-- kernel chats (so the provider compositor fires the public stream
+-- observers for the lead's own deltas — the CLI surface reads those).
 local function stream_visible(chat_id)
-  return state.chat_id_stream_visible[chat_id] == true
+  if state.chat_id_stream_visible[chat_id] == true then return true end
+  local turn = state.current_turn
+  if turn ~= nil and type(turn.chat_prefix) == "string"
+      and starts_with(chat_id, turn.chat_prefix) then
+    return true
+  end
+  return false
 end
 
 -- Per-chat stream-visibility registration for chats the agentic-loop
--- doesn't itself own (e.g. agent-reasoner sub-firings). The provider
--- wrapper's gate normally requires both a pending entry AND
--- stream_visible == false to suppress; the agent reasoner's chat_id
--- has neither because it's not driven through `track_provider_firing`
--- (the agent reasoner is its own state machine and would conflict
--- with the wrapper's chat.complete.result close path). We expose a
--- separate flag table so the wrapper can ask "is this chat
--- explicitly stream-suppressed?" without a pending entry.
---
--- The wrapper's stream gate becomes:
---   stream_suppressed(chat_id) = (existing wrapper-pending gate)
---                              OR (explicitly hidden via the helper)
+-- doesn't itself own (e.g. agent-reasoner sub-firings).
 local function register_chat_stream_hidden(chat_id)
   if type(chat_id) ~= "string" or chat_id == "" then return end
   state.chat_id_stream_visible[chat_id] = false
@@ -1006,15 +883,11 @@ local function fire_tool_end_observers(id, output, err)
   fire_observers(state.tool_end_observers, id, output, err)
 end
 
--- Module-level exports made available to wrappers + reasoner actors
--- via `require("agentic-loop").<helper>`. Centralising the state-
--- mutation surface here keeps wrappers structurally simple (pure
--- translation; no private state) and the agentic-loop the single
--- owner of orchestrator state.
+-- ── public API ────────────────────────────────────────────────────────
 
 local M = {}
 
--- Public API (consumed by agentic_cli.lua + chat.lua).
+-- Public API (consumed by cli/init.lua + chat surfaces).
 function M.submit(text, _opts) return submit_orchestrator_run(text) end
 function M.cancel()      cancel() end
 function M.cancel_all()  return cancel_all() end
@@ -1045,7 +918,7 @@ function M.on_complete(fn)
 end
 
 -- Configuration. Called once at boot from init.lua to set provider /
--- model / system. Idempotent for config rebinds.
+-- model / system / turn-program location. Idempotent for config rebinds.
 function M.configure(opts)
   if type(opts) ~= "table" then return end
   if type(opts.provider) == "string" and #opts.provider > 0 then
@@ -1060,27 +933,24 @@ function M.configure(opts)
   if type(opts.system) == "string" and #opts.system > 0 then
     state.config.system = opts.system
   end
-  -- tool_allowlist: list of tool names the lead's chat catalog is
-  -- restricted to (forwarded as `chat.create.tools = <names>` via the
-  -- orchestrator's wrap-node args). Nil disables the filter — the lead
-  -- sees the full advertised catalog. Empty table means "no tools" at
-  -- all (every name filtered out); pass `nil` if you want unrestricted.
-  if type(opts.tool_allowlist) == "table" then
-    state.config.tool_allowlist = opts.tool_allowlist
+  -- lead_program: where the shipped turn-program lives. `source_dir`
+  -- defaults to the config dir (NEFOR_CONFIG_DIR); compositions whose
+  -- config dir is not the starter (cli-config) pass it explicitly.
+  if type(opts.lead_program) == "table" then
+    if type(opts.lead_program.source_dir) == "string" and #opts.lead_program.source_dir > 0 then
+      state.lead_program.source_dir = opts.lead_program.source_dir
+    end
+    if type(opts.lead_program.entry) == "string" and #opts.lead_program.entry > 0 then
+      state.lead_program.entry = opts.lead_program.entry
+    end
   end
 end
 
--- Inspectors / mutators used by per-plugin wrappers + resident
--- reasoners. These live on the actor so the wrapper layer stays
--- stateless.
-function M.queue_sub_graph(args, gate_inner_id) return queue_sub_graph(args, gate_inner_id) end
-
--- Relay a completed run to the model as a fresh orchestrator turn. This is the
--- SAME mechanism sub-graph completions use (close_sub_graph): the completion is
--- formatted into a user-role message (format_deferred) and submitted as a new
--- orchestrator run once the lead is idle (deferred_queue + flush_deferred).
--- Callers that drive execution OUTSIDE agentic-loop's sub-graph queue — the mag
--- actor-kernel path — use this to inject their own completion turn with parity.
+-- Relay a completed dispatched run to the model as a fresh turn. The
+-- completion is formatted into a user-role task (format_deferred) and
+-- submitted as a new turn-program once the lead is idle (deferred_queue +
+-- flush_deferred). lead-workflow drives this for kernel runs the lead
+-- dispatched via its `mag` tool.
 -- `completion` shape: { run_id, status = "success"|"failed", output|error }.
 function M.relay_run_completion(completion)
   if type(completion) ~= "table" then return end
@@ -1099,7 +969,6 @@ function M.stream_visible(chat_id) return stream_visible(chat_id) end
 function M.register_chat_stream_hidden(chat_id) register_chat_stream_hidden(chat_id) end
 function M.unregister_chat_stream_hidden(chat_id) unregister_chat_stream_hidden(chat_id) end
 function M.stream_suppressed(chat_id) return stream_suppressed(chat_id) end
-function M.flush_pending_dispatches() return flush_pending_dispatches() end
 function M.take_pending_for_tool(tool_id) return take_pending_for_tool(tool_id) end
 function M.clear_pending_key(key) clear_pending_key(key) end
 
@@ -1113,47 +982,25 @@ function M._teardown_for_session_end() return teardown_for_session_end() end
 
 function M.config() return state.config end
 
--- Public read-only accessor for the orchestrator's current state
--- (last-seen chat_id, anything else carried forward across firings).
--- Returns the underlying table or nil — callers must treat the result
--- as read-only; mutations leak into orchestrator state. Provider
--- compositors use this to thread the active chat_id into
--- `chat.model.set` bodies; tests use it to assert state transitions.
-function M.current_state() return state.current_state end
+-- The canonical conversation history (read-only view; one user+assistant
+-- pair per completed turn). Tests and surfaces read it; mutations belong
+-- to the turn lifecycle only.
+function M.history() return state.history end
 
--- Best-effort active lead chat id. This falls back to the chat_id
--- captured at provider-firing start, so UI commands issued after a
--- completed turn can still address the lead conversation.
-function M.current_lead_chat_id() return active_lead_chat_id() end
+-- Compat accessor: the reasoner-graph lead carried chat continuity in a
+-- wrap-node next_state. The kernel lead has no persistent provider chat,
+-- so this is always nil; the provider compositor's chat_id fallbacks
+-- handle nil.
+function M.current_state() return nil end
 
--- Back-compat with agentic_workflow.build_template (used by tests).
-function M.build_template(user_text, opts)
-  opts = opts or {}
-  return topology.build_orchestrator_graph({
-    provider       = opts.provider       or state.config.provider,
-    model          = opts.model          or state.config.model,
-    reasoning_effort = opts.reasoning_effort or state.config.reasoning_effort,
-    system         = opts.system         or state.config.system,
-    user_text      = user_text or "",
-    tool_allowlist = opts.tool_allowlist or state.config.tool_allowlist,
-    provider_out   = generic_provider.PROVIDER_OUT,
-    final_answer   = generic_provider.FINAL_ANSWER,
-    tool_calls     = generic_tool.TOOL_CALLS,
-  })
-end
+-- Best-effort active provider-wrapper chat id (reasoner-graph firings).
+function M.current_lead_chat_id() return state.current_lead_chat_id end
 
 local function receive_msg(entry)
   -- Skip per-peer broadcast fan-out entries. The broker (and ncp.lua)
   -- emit ONE entry with origin=plugin/engine and target=nil for the
   -- "logical" envelope, then N more with origin=step and target=<peer>
-  -- as the fan-out copies for each ready peer. Acting on every fan-out
-  -- entry would dispatch the same logical envelope N times — see
-  -- e.g. reasoners.provider_run_node firing once per peer for a single
-  -- reasoner-graph dispatch.
-  --
-  -- Sessions's actor needs the per-peer copies for replay fidelity,
-  -- so we filter here (in agentic-loop's receive_msg) rather than in
-  -- the actor.lua runtime.
+  -- as the fan-out copies for each ready peer.
   if entry.origin == "step" and entry.target ~= nil then return end
 
   local ok, decoded = pcall(json.decode, entry.payload)
@@ -1164,124 +1011,65 @@ local function receive_msg(entry)
   -- Engine shutdown — sessions handles persistence; nothing for us.
   if kind == "engine.shutdown" then return end
 
-  -- Chat-input surface from the TUI. These envelopes drive new
-  -- orchestration (a `chat.input.submit` minted on resume would spawn
-  -- a fresh graph the user already saw the answer for); a session
-  -- replay rebuilds state via the bus markers, not by re-firing the
-  -- input handlers. The `tool.result` / `graph.node.fired` block
-  -- below handles the same concern for reasoner-graph emissions.
   if history_replay.active() then
+    -- Replay rebuilds state from markers; input handlers must not
+    -- re-fire (a replayed chat.input.submit would spawn a fresh turn
+    -- the user already saw the answer for).
     if kind == "chat.input.submit"
         or kind == "chat.reset"
+        or kind == "chat.interrupt"
         or kind == "chat.interrupt_all"
         or kind == "chat.model.set"
         or kind == "chat.reasoning.set" then
       return
     end
+    -- Canonical-history rebuild: each completed turn logged one
+    -- turn_recorded marker; replaying them restores the conversation the
+    -- next turn seeds into its llm.
+    if kind == "agentic_loop.turn_recorded" then
+      if type(body.user) == "string" then
+        state.history[#state.history + 1] = { role = "user", content = body.user }
+        state.history[#state.history + 1] = { role = "assistant", content = tostring(body.answer or "") }
+      end
+      return
+    end
+    -- Everything else during replay: kernel/turn lifecycle events are
+    -- keyed to the (empty) live turn state and fall through harmlessly.
+    return
   end
 
   if kind == "chat.input.submit" then handle_chat_input_submit(body); return end
   if kind == "chat.reset"        then handle_chat_reset(); return end
+  if kind == "chat.interrupt"    then cancel(); return end
   if kind == "chat.interrupt_all" then cancel_all(); return end
   if kind == "chat.model.set" then handle_chat_model_set(body); return end
   if kind == "chat.reasoning.set" then handle_chat_reasoning_set(body); return end
 
-  -- Reasoner-graph emissions on the canonical contract:
-  --   * graph.node.fired { run_id, node_id, firing_id, reasoner } —
-  --     observer paired with each tool.invoke dispatch.
-  --   * tool.result { id=<run_id|firing_id>, result | error } — both
-  --     run-close and per-firing close share the kind; we disambiguate
-  --     by id.
-  if history_replay.active() then
-    if kind == "chat.history.create" then
-      local cid = body.chat_id
-      if type(cid) == "string" and cid ~= "" then
-        state.replay_chat_ids[cid] = true
-      end
+  -- Turn-program load handshake.
+  if kind == "mag.loaded" then handle_lead_program_loaded(body); return end
+  if kind == "mag.error"  then handle_lead_program_error(body); return end
+
+  -- Turn lifecycle.
+  if kind == "mag.run_started" then handle_mag_run_started(body); return end
+  if kind == "mag.run_result"  then handle_mag_run_result(body); return end
+
+  -- Lead-scoped tool + stream observation.
+  if type(kind) == "string" then
+    if kind:match("%.tool%.invoke$") then handle_gate_invoke(body); return end
+    if kind == "tool.result" then handle_gate_result(body); return end
+    if kind == "chat.stream.delta" or kind == "chat.stream.end" then
+      handle_stream_marker(body)
       return
     end
-    if kind == "graph.node.fired" then return end
-    if kind == "tool.result" then
-      -- Cross-process /resume rebuild: capture the active chat_id from
-      -- replayed wrap-firing close envelopes. Live path keys this on
-      -- `firing_to_node[firing_id]` populated by `graph.node.fired`,
-      -- but on a fresh-process /resume firing_to_node is empty (the
-      -- run completed in the prior process). The wire signature of a
-      -- wrap firing close is `result.next_state.chat_id`; run-close /
-      -- terminal-close / sub-graph-synth tool.results carry
-      -- `result.results` / `result.text` / `result.status` instead, so
-      -- the next_state.chat_id check is the discriminator.
-      --
-      -- Without this, the next live submit reaches submit_orchestrator_run
-      -- with state.current_state==nil → no seed_chat_id → reasoners.lua
-      -- mints a fresh chat-N → openai-provider's painstakingly-rebuilt
-      -- history (on the OLD chat_id) is orphaned, model replies with no
-      -- memory of prior turns.
-      local result = body.result
-      if type(result) == "table" and type(result.next_state) == "table" then
-        local cid = result.next_state.chat_id
-        if type(cid) == "string" and cid ~= "" and state.replay_chat_ids[cid] then
-          state.current_state = result.next_state
-        end
-      end
-      -- Drop only tool.result envelopes that target one of our tracked
-      -- ids; pass the rest to other consumers (real tool returns,
-      -- spawn_graph synth replies). Matters because tool-gate's own
-      -- emission goes through this same bus.
-      local id = body.id
-      if type(id) == "string" then
-        if id == state.current_run_id
-            or state.pending_runs[id] ~= nil
-            or state.firing_to_node[id] ~= nil then
-          return
-        end
-      end
-      -- Wrap-firing close — silently swallow during replay (state
-      -- already captured above). Without this short-circuit it falls
-      -- through to handle_tool_result below, which is a no-op anyway
-      -- (firing_to_node is empty), but the early return makes the
-      -- intent explicit.
-      if type(result) == "table" and type(result.next_state) == "table"
-          and type(result.next_state.chat_id) == "string"
-          and result.next_state.chat_id ~= "" then
-        return
-      end
-    end
-  end
-
-  if kind == "graph.node.fired" then
-    handle_graph_node_fired(body)
-    return
-  end
-  if kind == "tool.result" then
-    handle_tool_result(body)
-    return
   end
 end
 
 -- Restore `state.config.{provider,model}` from the resumed session's
 -- on-disk log. Without this, /resume of a chat that was originally
 -- under provider A leaves state.config.provider pointing at whatever
--- the LIVE session had switched to (e.g., the user did /model B before
--- /resume-ing) — and the next live submit dispatches the resumed
--- chat_id (restored separately by the replayed wrap-firing
--- tool.result, per 91d49ef) against provider B, which doesn't own that
--- chat. Symptom: "[Error: chat 'chat-1' not found]" on the first turn
--- after /resume.
---
--- The walk reads the log fresh on every replay start; sessions's
--- `current_path()` returns the path of the session being resumed
--- (do_resume swaps state before emitting the replay markers). The
--- helper picks the latest `chat.model.set` if the session ever saw
--- /model, otherwise falls back to the prefix + model on the latest
--- `<prefix>.chat.create`. Empty / unreadable logs leave config as-is.
---
--- The model picker UI tracks the model via `chat.model.set_ack` (gated
--- against replayed acks per e647451 — replayed acks are stale relative
--- to live state). After this restore, we emit a fresh LIVE
--- `chat.model.set_ack` so chat.lua's status bar repaints with the
--- resumed session's model. The ack must be live (not gated) because
--- it carries the post-replay truth, not a replayed envelope.
+-- the LIVE session had switched to. The helper picks the latest
+-- `chat.model.set` if the session ever saw /model, otherwise falls back
+-- to the prefix + model on the latest `<prefix>.chat.create`.
 local function restore_active_model_from_session_log()
   local sessions_mod = require("sessions")
   local path = sessions_mod.current_path()
@@ -1314,10 +1102,6 @@ local function restore_active_model_from_session_log()
       model = state.config.model,
       reasoning_effort = state.config.reasoning_effort,
     })
-    -- Surface the restored selection to chat.lua's status bar / model
-    -- picker. Live ack (not a replayed envelope) so chat.lua's
-    -- replay_mode gate doesn't drop it. We emit it broadcast so any
-    -- observer (statusline, picker, future surfaces) picks it up.
     if type(state.config.provider) == "string" and #state.config.provider > 0
         and type(state.config.model) == "string" and #state.config.model > 0 then
       emit(nil, {
@@ -1339,22 +1123,18 @@ end
 
 -- Drive `teardown_for_session_end` from the bus marker. Replay-mode
 -- gating is owned by `core.history_replay`, which subscribes to
--- `sessions.replay.start` / `sessions.replay.end` independently — the
--- old `session_start` / `resume_done` lifecycle hooks are dead weight
--- now that the gate flips on the framing markers instead.
+-- `sessions.replay.start` / `sessions.replay.end` independently.
 if nefor.bus and nefor.bus.on_event then
   nefor.bus.on_event("sessions.session_end", function(_entry)
     teardown_for_session_end()
   end)
-  -- Restore active provider+model on every replay start. /resume drives
+  -- Restore active provider+model, and start the canonical-history
+  -- rebuild from a clean slate, on every replay start. /resume drives
   -- the replay markers; /new fires them too with an empty log, where
-  -- the helper is a no-op (no chat.create / chat.model.set to read).
+  -- both are no-ops.
   nefor.bus.on_event("sessions.replay.start", function(_entry)
-    state.replay_chat_ids = {}
+    state.history = {}
     restore_active_model_from_session_log()
-  end)
-  nefor.bus.on_event("sessions.replay.end", function(_entry)
-    state.replay_chat_ids = {}
   end)
 end
 
@@ -1369,22 +1149,27 @@ M._internals  = {
       model = nil,
       reasoning_effort = nil,
       system = nil,
-      tool_allowlist = nil,
     }
+    state.lead_program = {
+      source_dir = nil,
+      entry = "agentic-loop/lead-turn.mag",
+      modification = nil,
+      hash = nil,
+      entry_actor = nil,
+      llm_actor = nil,
+      load_id = nil,
+    }
+    state.history = {}
     state.current_run_id = nil
-    state.current_state = nil
+    state.current_turn = nil
     state.deferred_queue = {}
     state.pending_user_inputs = {}
     state.pending = {}
-    state.pending_runs = {}
-    state.pending_dispatches = {}
     state.chat_id_to_key = {}
     state.tool_id_to_key = {}
     state.chat_id_stream_visible = {}
     state.chat_id_stream_explicitly_hidden = {}
     state.current_lead_chat_id = nil
-    state.replay_chat_ids = {}
-    state.firing_to_node = {}
     state.stream_observers = {}
     state.reasoning_observers = {}
     state.tool_start_observers = {}

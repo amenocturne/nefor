@@ -46,8 +46,8 @@
 -- envelopes' bodies unchanged; this file pattern-matches on the
 -- prefixed kind and does the lookup itself.
 --
--- Stream-delta gating (suppressed sub-graph chats) and pending-dispatch
--- flushing are pure orchestrator state — the lib doesn't see them.
+-- Stream-delta gating (suppressed sub-graph chats) is pure orchestrator
+-- state — the lib doesn't see it.
 --
 -- ## Replay window
 --
@@ -216,12 +216,6 @@ function M.spawn_spec(name, command, opts)
         return nil
       end
 
-      if (k == "chat.stream.delta" or k == "chat.stream.reasoning_delta")
-          and type(chat_id) == "string"
-          and al.stream_visible(chat_id) then
-        al.flush_pending_dispatches()
-      end
-
       if type(chat_id) == "string" and al.stream_visible(chat_id) then
         if k == "chat.stream.delta" then
           local txt = body.text or body.delta or ""
@@ -271,12 +265,7 @@ function M.spawn_spec(name, command, opts)
       if not entry then return body end
 
       local out = body.output
-      local was_stream_visible = al.stream_visible(chat_id)
       al.take_pending_for_chat(chat_id)
-
-      if was_stream_visible then
-        al.flush_pending_dispatches()
-      end
 
       local from_id = entry.reasoner or "reasoners"
       if type(out) == "table" then

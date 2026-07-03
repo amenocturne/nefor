@@ -128,6 +128,12 @@ To combine parallel branches into a single output, add a `responder` combine nod
 
 Emit the tool call directly after deciding the structure. For simple chat turns (no decomposition benefit), just answer directly.
 ]],
+  -- The lead's turn-program ships in starter/ (the CLI config reuses the
+  -- starter modules; the program lives beside them).
+  lead_program = {
+    source_dir = STARTER_ROOT,
+    entry      = "agentic-loop/lead-turn.mag",
+  },
 }
 actor.spawn(agentic_loop)
 actor.spawn(require("reasoners"))
@@ -168,6 +174,17 @@ else
 end
 
 actor.spawn(require("compositors.graph").spawn_spec({ require("config").bin("reasoner-graph") }))
+
+-- mag: the MAG actor-kernel runtime — the lead's turn-programs execute
+-- here (agentic-loop spawns one per user message). Mirrors the starter
+-- composition: kernel entry from starter/, gate identity threaded, shared
+-- Lua tree for output-persistence.
+actor.spawn(actor.identity_spec("mag", {
+  require("config").bin("mag-plugin"),
+  "--kernel", STARTER_ROOT .. "/mag-kernel/init.lua",
+  "--tool-gate", "tool-gate",
+  "--lua-root", LUA_ROOT,
+}))
 
 local tools = require("compositors.tools")
 local tool_gate_argv = { require("config").bin("tool-gate") }
