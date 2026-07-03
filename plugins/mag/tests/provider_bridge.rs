@@ -222,11 +222,12 @@ async fn one_llm_actor_completes_end_to_end_through_the_bridge() {
                 .and_then(Value::as_str)
                 .expect("create carries chat_id")
                 .to_owned();
-            // The factory's chat_id (agent@r<seq>) is kept, and call config is
-            // threaded from the request.
+            // The factory's chat_id (agent@r<seq>) rides through under the
+            // kernel's run-scope prefix (`r<K>/agent@r<seq>`), and call
+            // config is threaded from the request.
             assert!(
-                chat_id.starts_with("agent@r"),
-                "create keeps the factory chat_id; got {chat_id}"
+                chat_id.ends_with("/agent@r1"),
+                "create keeps the factory chat_id under the run scope; got {chat_id}"
             );
             assert_eq!(body.get("model").and_then(Value::as_str), Some("opus"));
             assert_eq!(

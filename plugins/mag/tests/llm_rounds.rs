@@ -576,12 +576,16 @@ async fn provider_error_fails_the_run_with_the_detail_surfaced() {
     shutdown_plugin(plugin).await;
 }
 
-/// Bug 3 pin: `mag.execute` owns the whole constellation. A second execute of
-/// the same program in the same resident kernel must kill the leftovers
-/// (`mag.actor_killed`), respawn fresh — `mag.actor_spawned` and
-/// `mag.actor_ready` reach the bus AGAIN — and the fresh llm instance's rounds
-/// restart at @r1. (Regression: session 27c60892 re-executed a program whose
-/// ids were still alive: zero spawn/ready events, rounds continuing at @r3.)
+/// Bug 3 pin: each execute owns a fresh constellation. The first run's
+/// leftovers are reaped at its terminal settle (run-context teardown —
+/// `mag.actor_killed` for its still-live actors, stamped with ITS run_id),
+/// and a second execute of the same program spawns fresh in its own run
+/// context — `mag.actor_spawned` and `mag.actor_ready` reach the bus AGAIN —
+/// with the fresh llm instance's rounds restarting at @r1. (Regression:
+/// session 27c60892 re-executed a program whose ids were still alive in a
+/// single global constellation: zero spawn/ready events, rounds continuing
+/// at @r3. The global kill-sweep that first fixed it is now the per-run
+/// context teardown.)
 #[tokio::test]
 async fn re_execute_respawns_a_fresh_constellation_with_lifecycle_events() {
     let mut plugin = start_plugin("llm-rounds-reexec").await;

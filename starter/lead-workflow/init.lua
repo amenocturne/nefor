@@ -121,14 +121,11 @@ local state = {
   -- with the compiler message. One entry per in-flight handshake.
   pending_mag_load = {},
 
-  -- The in-flight kernel run's id. Only `mag.run_started` carries the run
-  -- identity; the kernel's later actor lifecycle events (`mag.actor_spawned` /
-  -- `mag.actor_ready` / `mag.actor_killed`) carry the actor id alone, so we
-  -- stamp the run id here and key them to it — kernel runs are serial, one
-  -- in flight at a time (same convention as the chat surface's
-  -- `mag_active_run_id`, starter/chat/update.lua).
-  ---@type string|nil
-  mag_active_run_id = nil,
+  -- Kernel runs are concurrent: every kernel lifecycle event
+  -- (`mag.actor_spawned` / `mag.actor_ready` / `mag.actor_killed` /
+  -- `mag.run_complete`) carries its run_id, and the tracker keys straight
+  -- into state.active_runs by it — overlapping runs track independently,
+  -- no "the in-flight run" singleton.
 }
 
 local SOURCE_NAME = "lead-workflow"
@@ -712,8 +709,8 @@ end
 
 -- Track a submitted run for graph-status. `actors` is the modification's
 -- actor list ({ id, factory, … }); node summaries carry the factory under the
--- `reasoner` key, matching what the chat surface renders (chat/dag.lua maps
--- kernel factory → reasoner the same way).
+-- `reasoner` key, matching what the chat surface renders (chat/run_panel.lua
+-- maps kernel factory → reasoner the same way).
 register_active_run = function(run_id, actors, terminal, firing_id)
   local nodes_order, nodes = {}, {}
   for _, actor in ipairs(actors or {}) do
@@ -928,29 +925,30 @@ local function mark_firing_result(body)
   end
 end
 
--- The active kernel run the id-only `mag.actor_*` events key to (see
--- state.mag_active_run_id).
-local function mag_active_run()
-  local run_id = state.mag_active_run_id
+-- The tracked run a kernel lifecycle event belongs to. Every kernel event
+-- carries its run_id (runs are concurrent — overlapping runs must track
+-- independently); an event for a run we don't track (already closed, or not
+-- ours) resolves to nil and is ignored.
+local function mag_event_run(body)
+  local run_id = body.run_id
   return type(run_id) == "string" and state.active_runs[run_id] or nil
 end
 
--- `mag.run_started`: mark the run running and stamp it as the kernel's
--- in-flight run so the actor lifecycle events below find it.
+-- `mag.run_started`: mark the run running.
 local function mark_mag_run_started(body)
-  if type(body.run_id) == "string" and state.active_runs[body.run_id] then
-    state.mag_active_run_id = body.run_id
+  if mag_event_run(body) then
     mark_run_started(body)
   end
 end
 
--- Track one kernel actor lifecycle transition against the in-flight run's
--- node table — the same truth the chat surface's live panel tracks
--- (starter/chat/dag.lua): spawned → pending, ready → running, killed →
--- killed. A mid-run spawn (`mag.apply`) appends a node the dispatch-time
--- modification didn't carry.
-local function mark_mag_actor(actor_id, status, factory)
-  local run = mag_active_run()
+-- Track one kernel actor lifecycle transition against its run's node table —
+-- the same truth the chat surface's live panel tracks
+-- (starter/chat/run_panel.lua): spawned → pending, ready → running, killed →
+-- killed. The event's run_id names the run. A mid-run spawn (`mag.apply`)
+-- appends a node the dispatch-time modification didn't carry.
+local function mark_mag_actor(body, status)
+  local run = mag_event_run(body)
+  local actor_id, factory = body.id, body.factory
   if not run or type(actor_id) ~= "string" or actor_id == "" then return end
   local ts = now_ms()
   run.updated_at = ts
@@ -981,9 +979,9 @@ end
 -- `mag.run_complete` (the sink's terminal signal, ahead of the terminal
 -- mag.run_result): the kernel emits no per-actor "done", so every actor still
 -- pending/running flips to done here; killed actors keep their terminal
--- state. Mirrors the chat surface's dag.mag_run_complete.
-local function mark_mag_run_complete(_body)
-  local run = mag_active_run()
+-- state. Mirrors the chat surface's run panel (starter/chat/run_panel.lua).
+local function mark_mag_run_complete(body)
+  local run = mag_event_run(body)
   if not run then return end
   local ts = now_ms()
   run.updated_at = ts
@@ -1099,7 +1097,6 @@ local function handle_mag_run_result(body)
   if type(run_id) ~= "string" then return end
   local run = state.active_runs[run_id]
   if not run then return end
-  if state.mag_active_run_id == run_id then state.mag_active_run_id = nil end
   if body.status == "failed" then
     finish_run(run_id, "failed", nil, body.error or "mag run failed")
     emit_mag_result_block(run, "failed", nil, body.error or "mag run failed")
@@ -1672,15 +1669,15 @@ local function receive_msg(entry)
     return
   end
   if kind == "mag.actor_spawned" then
-    mark_mag_actor(body.id, "pending", body.factory)
+    mark_mag_actor(body, "pending")
     return
   end
   if kind == "mag.actor_ready" then
-    mark_mag_actor(body.id, "running")
+    mark_mag_actor(body, "running")
     return
   end
   if kind == "mag.actor_killed" then
-    mark_mag_actor(body.id, "killed")
+    mark_mag_actor(body, "killed")
     return
   end
   if kind == "mag.run_complete" then
@@ -1770,7 +1767,6 @@ return {
       state.gate_mode = "safe"
       state.kernel_factories = {}
       state.pending_mag_load = {}
-      state.mag_active_run_id = nil
       advertised = false
     end,
   },

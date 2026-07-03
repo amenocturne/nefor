@@ -64,6 +64,11 @@ fn starter_mag_kernel_adapter_factory() {
     run_lua_test("tests/lua/mag-kernel/adapter_test.lua");
 }
 
+#[test]
+fn starter_mag_kernel_multi_run() {
+    run_lua_test("tests/lua/mag-kernel/multi_run_test.lua");
+}
+
 fn run_lua_test(rel_path: &str) {
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
@@ -87,12 +92,23 @@ fn run_lua_test(rel_path: &str) {
 /// no-op, plus `nefor.json.{encode, decode}` over serde_json — the same
 /// surface the plugin host installs (`plugins/mag/src/kernel.rs`,
 /// `install_json`), which the llm factory uses to serialize tool-call
-/// arguments for its transcript. Kernel modules take their logger by
-/// injection, so nothing else is required.
+/// arguments for its transcript — plus `nefor.emit`, the host's bus-emit
+/// queue seam, appended to a global `__emitted` array so tests loading the
+/// full kernel entry (multi_run_test) can assert on the wire traffic. Kernel
+/// modules take their logger by injection, so nothing else is required.
 fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
     let nefor = lua.create_table()?;
     let log: Function = lua.create_function(|_, _: Variadic<Value>| Ok(()))?;
     nefor.set("log", log)?;
+
+    lua.globals().set("__emitted", lua.create_table()?)?;
+    let emit = lua.create_function(|lua, body: mlua::Table| {
+        let emitted: mlua::Table = lua.globals().get("__emitted")?;
+        let n = emitted.raw_len();
+        emitted.raw_set(n + 1, body)?;
+        Ok(())
+    })?;
+    nefor.set("emit", emit)?;
 
     let json = lua.create_table()?;
     let encode = lua.create_function(|lua, value: Value| {

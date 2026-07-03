@@ -156,7 +156,14 @@ do
   assert_eq(#fired, 1, "one complete sender-bound set fires exactly once")
   assert_eq(fired[1].shape, "product", "the assembled activation is a product")
   assert_eq(#fired[1].messages, 2, "the set carries one message per slot")
-  assert_eq(fired[1].messages[1].message.part, "left", "the buffered first component is in the set")
+  -- Slot order derives from a hash-ordered routes scan (derive_slots), so the
+  -- assembled set's order is nondeterministic: assert membership, not position.
+  local parts = {}
+  for _, m in ipairs(fired[1].messages) do
+    parts[m.message.part] = true
+  end
+  assert_true(parts.left, "the buffered first component is in the set")
+  assert_true(parts.right, "the completing component is in the set")
 end
 
 -- ==================================================================

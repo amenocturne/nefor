@@ -83,10 +83,15 @@
 //!
 //! ## Concurrency / interleaving (FLAGGED)
 //!
-//! All bridge state is keyed by `chat_id`, and each `chat_id` is
-//! `<actor_id>@r<seq>` (factories/llm.lua), so two in-flight `llm` actors hold two
-//! independent chats with disjoint ids. A result routes back to exactly the actor
-//! whose chat_id it names; responses may arrive in any order (reverse of request
+//! All bridge state is keyed by `chat_id`. The kernel's run-scoped bus seam
+//! prefixes every chat handle with the run's scope token before it reaches
+//! this bridge — the wire shape is `r<K>/<actor_id>@r<seq>`
+//! (starter/mag-kernel/init.lua bus_emit; the unscoped `<actor_id>@r<seq>` is
+//! minted in factories/llm.lua) — so two in-flight `llm` actors hold disjoint
+//! chats even across CONCURRENT RUNS of the same program, where actor ids and
+//! round counters coincide. The bridge never parses a chat_id: it is an
+//! opaque exact-match key. A result routes back to exactly the actor whose
+//! chat_id it names; responses may arrive in any order (reverse of request
 //! order included) and never cross.
 
 use std::collections::HashMap;

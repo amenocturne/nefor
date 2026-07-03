@@ -183,10 +183,14 @@ fn two_agent_modification() -> Value {
     })
 }
 
-/// `("a1.llm@r2")` → `("a1", 2)`.
+/// `("r1/a1.llm@r2")` → `("a1", 2)`. Wire chat handles are run-scoped by the
+/// kernel (`r<K>/<actor>@r<seq>` — starter/mag-kernel/init.lua bus_emit); the
+/// test peels the scope prefix off the node segment only to script per-agent
+/// behavior — real consumers never parse a chat_id.
 fn parse_chat_id(chat_id: &str) -> (String, u32) {
     let idx = chat_id.find("@r").expect("chat_id carries @r turn suffix");
     let node = &chat_id[..idx];
+    let node = node.split('/').next_back().unwrap_or(node);
     let turn: u32 = chat_id[idx + 2..]
         .parse()
         .expect("chat_id turn is a number");
@@ -472,11 +476,14 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
     }
 
     // ── SIX STEPS #4: a2 killed mid-flight; abort envelope on the wire; late
-    //    reply voided (no a2 node output). ────────────────────────────────────
-    assert_eq!(
-        cancel_chat_id.as_deref(),
-        Some("a2.llm@r1"),
-        "the in-flight provider request's cancel envelope reached the wire"
+    //    reply voided (no a2 node output). The wire handle is the kernel's
+    //    run-scoped form (`r<K>/a2.llm@r1`). ──────────────────────────────────
+    let cancel = cancel_chat_id
+        .as_deref()
+        .expect("the in-flight provider request's cancel envelope reached the wire");
+    assert!(
+        cancel.ends_with("/a2.llm@r1"),
+        "the cancel names a2's run-scoped chat handle; got {cancel:?}"
     );
     assert!(
         killed_ids.iter().any(|id| id == "a2.llm"),

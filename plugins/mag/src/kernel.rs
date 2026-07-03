@@ -33,6 +33,17 @@ pub struct ApplyOutcome {
     pub error: Option<String>,
 }
 
+/// `begin_run`'s verdict: whether the run context was created, plus the ids
+/// of stale runs the kernel reaped at the session boundary (contexts left by
+/// a previous session's never-terminated runs) — the host fails their
+/// still-pending execute replies.
+#[derive(Debug, Clone)]
+pub struct BeginRunOutcome {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub reaped: Vec<String>,
+}
+
 /// A run's terminal signal, surfaced from the sink through the kernel
 /// (`mag.run_complete`). Carries the sink's final result INLINE plus the
 /// persisted output path: the terminal reply is the one place the control
@@ -115,14 +126,16 @@ impl LuaHost {
         }
     }
 
-    /// Set the run context (session/run identity) and emit `mag.run_started`.
-    /// Run identity is injected, never ambient (docs/ir.md).
+    /// Create the run's kernel context (inventory, router, modlog, observer)
+    /// and emit `mag.run_started`. Run identity is injected, never ambient
+    /// (docs/ir.md). The outcome carries the stale run ids the kernel reaped
+    /// at the session boundary; a duplicate live `run_id` rejects.
     pub fn begin_run(
         &self,
         run_id: &str,
         run_name: &str,
         session_id: Option<&str>,
-    ) -> Result<(), MagError> {
+    ) -> Result<BeginRunOutcome, MagError> {
         let meta = self.lua.create_table()?;
         meta.set("run_id", run_id)?;
         meta.set("run_name", run_name)?;
@@ -130,44 +143,62 @@ impl LuaHost {
             meta.set("session_id", s)?;
         }
         let f: Function = self.kernel.get("begin_run")?;
-        f.call::<()>(meta)?;
-        Ok(())
+        let res: Table = f.call::<Table>(meta)?;
+        Ok(BeginRunOutcome {
+            ok: res.get::<Option<bool>>("ok")?.unwrap_or(false),
+            error: res.get::<Option<String>>("error")?,
+            reaped: res
+                .get::<Option<Vec<String>>>("reaped")?
+                .unwrap_or_default(),
+        })
     }
 
-    /// Apply a program's initial modification through the fold. Actors
+    /// Apply a program's initial modification through the run's fold. Actors
     /// register at apply and construct lazily at their first satisfied input
     /// contract, so a synchronous program runs to completion inside this call;
     /// an async one (a provider round-trip pending) progresses via
     /// [`LuaHost::bus_response`].
-    pub fn start(&self, modification: &JsonValue) -> Result<ApplyOutcome, MagError> {
+    pub fn start(&self, run_id: &str, modification: &JsonValue) -> Result<ApplyOutcome, MagError> {
         let mod_val = self.lua.to_value(modification)?;
         let f: Function = self.kernel.get("start")?;
-        let res: Table = f.call::<Table>(mod_val)?;
+        let res: Table = f.call::<Table>((run_id, mod_val))?;
         apply_outcome(&res)
     }
 
-    /// Apply one graph modification directly through the fold — the control
+    /// Apply one graph modification directly through a run's fold — the control
     /// plane's direct kernel op (docs/ir.md, "Kernel operations": modifications
     /// reach `actors`/`kills`/`messages` through the fold, and "the control
     /// plane reaches them directly"). The mid-run kill surface uses it: a
     /// `{ kills = [...] }` modification unroutes the target, hands it its final
     /// kill message (the factory's abort envelope reaches the bus), and drops
     /// its correlations. Returns the fold's verbatim `{ ok, error }`.
-    pub fn apply(&self, modification: &JsonValue) -> Result<ApplyOutcome, MagError> {
+    pub fn apply(&self, run_id: &str, modification: &JsonValue) -> Result<ApplyOutcome, MagError> {
         let mod_val = self.lua.to_value(modification)?;
         let f: Function = self.kernel.get("apply")?;
-        let res: Table = f.call::<Table>(mod_val)?;
+        let res: Table = f.call::<Table>((run_id, mod_val))?;
         apply_outcome(&res)
     }
 
-    /// Deliver a correlated capability response (tool.result-shaped) back to the
-    /// requesting actor, advancing any deferred activation it unblocks.
+    /// End a run: the kernel reaps the context's live actors through the fold
+    /// (kill handlers run — abort/cancel envelopes land on the emit queue; the
+    /// caller drains them) and drops the context. Returns whether a live
+    /// context existed.
+    pub fn end_run(&self, run_id: &str) -> Result<bool, MagError> {
+        let f: Function = self.kernel.get("end_run")?;
+        Ok(f.call::<bool>(run_id)?)
+    }
+
+    /// Deliver a correlated capability response (tool.result-shaped) back to
+    /// the requesting actor, advancing any deferred activation it unblocks.
+    /// Correlation ids are run-scoped, so the kernel dispatches to the owning
+    /// run context and returns its run_id — the caller settles exactly that
+    /// run. `None` means the id names no open correlation of ours.
     pub fn bus_response(
         &self,
         id: &str,
         result: Option<&JsonValue>,
         error: Option<&str>,
-    ) -> Result<(), MagError> {
+    ) -> Result<Option<String>, MagError> {
         let resp = self.lua.create_table()?;
         resp.set("id", id)?;
         if let Some(r) = result {
@@ -177,19 +208,18 @@ impl LuaHost {
             resp.set("error", e)?;
         }
         let f: Function = self.kernel.get("bus_response")?;
-        f.call::<()>(resp)?;
-        Ok(())
+        Ok(f.call::<Option<String>>(resp)?)
     }
 
-    /// Take the last run-completion signal, if the resident run has finished.
-    /// One-shot: clears the slot so a subsequent execute starts fresh.
-    pub fn take_run_complete(&self) -> Result<Option<RunCompletion>, MagError> {
+    /// Take a run's completion signal, if that run has finished.
+    /// One-shot: clears the slot.
+    pub fn take_run_complete(&self, run_id: &str) -> Result<Option<RunCompletion>, MagError> {
         let f: Option<Function> = self.kernel.get("take_run_complete")?;
         let f = match f {
             Some(f) => f,
             None => return Ok(None),
         };
-        let rc: Option<Table> = f.call::<Option<Table>>(())?;
+        let rc: Option<Table> = f.call::<Option<Table>>(run_id)?;
         match rc {
             None => Ok(None),
             Some(t) => {
@@ -206,17 +236,17 @@ impl LuaHost {
         }
     }
 
-    /// Take the last unhandled-failure signal, if an actor failure escalated to
+    /// Take a run's unhandled-failure signal, if an actor failure escalated to
     /// a run failure (an unrouted failure tag — routing.lua apply_completion →
     /// `mag.run_failed`). One-shot: clears the slot. Returns the failure detail
     /// the run's terminal reply surfaces.
-    pub fn take_run_failed(&self) -> Result<Option<String>, MagError> {
+    pub fn take_run_failed(&self, run_id: &str) -> Result<Option<String>, MagError> {
         let f: Option<Function> = self.kernel.get("take_run_failed")?;
         let f = match f {
             Some(f) => f,
             None => return Ok(None),
         };
-        let rf: Option<Table> = f.call::<Option<Table>>(())?;
+        let rf: Option<Table> = f.call::<Option<Table>>(run_id)?;
         match rf {
             None => Ok(None),
             Some(t) => {

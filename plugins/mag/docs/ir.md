@@ -79,6 +79,36 @@ register, buffer, construct on first firing. A factory that rejects at
 construct time (invalid params) surfaces at its first firing as a
 `mag.run_failed` escalation, and the host fails the run.
 
+## Run contexts — concurrent runs
+
+Runs are concurrent. Each `mag.execute` gets its own **run context**: an
+inventory, routing/firing state, capability correlations, and a modification
+log, created at run start (`begin_run`) and dropped at run end — complete,
+failed, or superseded. A fresh context IS starting from NullGraph, so nothing
+resets between runs; ids are freely reusable across runs, and a run starting
+mid-another-run touches nothing outside its own context. Cross-run
+interaction does not exist: routes and sends resolve within the run's context
+only.
+
+- **Every kernel→control-plane event carries `run_id`** — `mag.run_started`,
+  `mag.actor_spawned/ready/killed`,
+  `mag.modification_applied/rejected/noop`, `mag.run_complete`,
+  `mag.run_failed` — so consumers key overlapping runs apart.
+- **Wire-id scoping.** Two runs of the same program author identical actor
+  ids, so anything the kernel puts on the shared bus that must resolve back
+  to one run is prefixed with the run's scope token `r<K>` (kernel-session
+  monotone, never reused): capability correlation ids are `r<K>/cap-<n>`,
+  provider chat handles `r<K>/<actor>@r<seq>`. The prefixed strings are
+  opaque downstream — consumers match exactly, never parse.
+- **Kill semantics are per run.** Ending a run (terminal state, or an
+  explicit end) reaps that run's live actors through the fold — kill
+  handlers run, abort/cancel envelopes reach the bus — and drops the
+  context. Other runs are untouched.
+- **Session-boundary reaping.** The engine (and the resident kernel) outlive
+  TUI sessions. Beginning a run under a new `session_id` reaps every live
+  context left by a different session — the scoped analogue of a global
+  reset; concurrent runs of the current session are never touched.
+
 ## Firing — when an actor activates
 
 An actor activates when its declared input contract is satisfied. Firing is a
@@ -125,8 +155,9 @@ is to encode the ordering. No second vocabulary exists.
 
 ## Application semantics
 
-- **Serialized and atomic.** Modifications apply one at a time; the graph
-  never sees half of one.
+- **Serialized and atomic.** Modifications apply one at a time within a run;
+  the graph never sees half of one. Concurrent runs interleave at whole-
+  modification granularity — each run's fold is its own (Run contexts above).
 - **Arrival order is a race, by design.** Nodes complete at their own pace;
   which modification applies first is timing. The race is a feature: spawn
   several agents on the same job with different approaches, and the first

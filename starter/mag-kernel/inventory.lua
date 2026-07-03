@@ -326,12 +326,14 @@ function M.apply(self, mod)
   return { ok = true, spawned = created }
 end
 
--- Drop every actor record, dead tombstones included. This is the per-program
--- reset seam (init.lua `start`): monotone lifecycles are scoped to ONE program
--- run, so a new program starts its fold from never-existed and may reuse ids a
--- previous run held. Live actors must be killed through a modification FIRST
--- (so kill handlers run and the routing layer forgets them — do_kill's on_kill
--- seam); clear itself runs no hooks.
+-- Drop every actor record, dead tombstones included. Monotone lifecycles are
+-- scoped to ONE run, and the composition layer enforces that by giving each
+-- run its own inventory (init.lua run contexts) — a new run's fold starts
+-- from never-existed by construction, so nothing calls this per run anymore.
+-- Kept for bare-VM fold tests that reuse one inventory across scenarios.
+-- Live actors must be killed through a modification FIRST (so kill handlers
+-- run and the routing layer forgets them — do_kill's on_kill seam); clear
+-- itself runs no hooks.
 function M.clear(self)
   self.actors = {}
 end

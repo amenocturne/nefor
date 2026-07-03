@@ -262,11 +262,13 @@ async fn compiled_two_agents_program_runs_through_the_entry_adapters_to_the_sink
                     .and_then(Value::as_str)
                     .expect("chat.complete carries chat_id")
                     .to_owned();
-                // Answer each agent's turn with a distinguishable final answer.
-                let text = if chat_id.starts_with("docs-explorer") {
+                // Answer each agent's turn with a distinguishable final
+                // answer. The wire handle is run-scoped by the kernel
+                // (`r<K>/<actor>@r<seq>`); match on the actor segment.
+                let text = if chat_id.contains("docs-explorer") {
                     provider_agents.insert("docs-explorer".to_owned());
                     "explorer-findings"
-                } else if chat_id.starts_with("code-writer") {
+                } else if chat_id.contains("code-writer") {
                     provider_agents.insert("code-writer".to_owned());
                     "writer-final-answer"
                 } else {

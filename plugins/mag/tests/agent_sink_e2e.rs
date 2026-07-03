@@ -310,8 +310,10 @@ async fn minimal_agent_sink_program_compiles_and_runs_kernel_path() {
                 .get("chat_id")
                 .and_then(Value::as_str)
                 .expect("create carries chat_id");
+            // The wire handle is run-scoped by the kernel:
+            // `r<K>/worker.llm@r<seq>`.
             assert!(
-                chat_id.starts_with("worker.llm@r"),
+                chat_id.contains("worker.llm@r"),
                 "the namespaced llm actor drives the provider turn; got {chat_id}"
             );
             assert_eq!(

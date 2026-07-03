@@ -456,9 +456,10 @@ do
   os.remove(out_path)
 end
 
--- The kernel's lifecycle stream drives node statuses (mag.run_started stamps
--- the run; the id-only actor events key to it), and a mag.run_result carrying
--- the sink's result INLINE relays its text without any file read.
+-- The kernel's lifecycle stream drives node statuses (every kernel event
+-- carries its run_id — runs are concurrent, the tracker keys by it), and a
+-- mag.run_result carrying the sink's result INLINE relays its text without
+-- any file read.
 do
   fresh()
   write_mag_file("firing-kernel-inline-write", "kernel-inline.mag", READ_ONLY_MAG)
@@ -471,20 +472,22 @@ do
   assert_true(reply ~= nil and reply.body.output ~= nil, "execute replies executing")
   local run_id = reply.body.output.run_id
 
-  -- Kernel lifecycle: run_started carries the run id; actor events only the
-  -- actor id. worker.entry is killed mid-run; the rest complete.
+  -- Kernel lifecycle: every event carries its run_id (concurrent runs track
+  -- independently). worker.entry is killed mid-run; the rest complete.
   feed("mag", { kind = "mag.run_started", run_id = run_id, run_name = "kernel-inline" })
   for _, actor in ipairs({
     { id = "worker.entry", factory = "adapter" },
     { id = "worker.llm",   factory = "llm" },
     { id = "sink",         factory = "sink" },
   }) do
-    feed("mag", { kind = "mag.actor_spawned", id = actor.id, factory = actor.factory })
-    feed("mag", { kind = "mag.actor_ready",   id = actor.id })
+    feed("mag", { kind = "mag.actor_spawned", run_id = run_id, id = actor.id, factory = actor.factory })
+    feed("mag", { kind = "mag.actor_ready",   run_id = run_id, id = actor.id })
   end
-  feed("mag", { kind = "mag.actor_killed", id = "worker.entry" })
+  feed("mag", { kind = "mag.actor_killed", run_id = run_id, id = "worker.entry" })
+  -- An event for a DIFFERENT run must not leak into this one's node table.
+  feed("mag", { kind = "mag.actor_killed", run_id = "some-other-run", id = "worker.llm" })
   feed("mag", {
-    kind = "mag.run_complete", from = "sink",
+    kind = "mag.run_complete", run_id = run_id, from = "sink",
     result = { text = "INLINE RESULT TEXT" }, persisted = false,
   })
 

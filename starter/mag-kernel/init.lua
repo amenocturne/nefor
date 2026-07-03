@@ -4,9 +4,13 @@
 -- the wiring layer: it adapts the host `nefor` surface into the plain
 -- dependencies the kernel modules expect, builds the factory registry (the
 -- trait layer composition validates against — see registry.lua, shape.lua),
--- constructs the inventory (which owns the fold over graph modifications —
--- see inventory.lua, plugins/mag/docs/actor-model.md, docs/ir.md), and
--- returns the kernel table the plugin holds for the session.
+-- and manages RUN CONTEXTS: one per `mag.execute`, each with its own
+-- inventory (the fold over graph modifications — see inventory.lua,
+-- plugins/mag/docs/actor-model.md, docs/ir.md), router, modification log,
+-- and observer. Runs are concurrent: a context is created at begin_run,
+-- lives while its constellation works, and is dropped at end_run
+-- (complete / failed / superseded). Nothing crosses contexts — routes,
+-- sends, correlations, and firing state all resolve within one run.
 --
 -- `nefor.log` is a host binding that writes to the plugin's tracing
 -- subscriber (stderr). The kernel must never write to stdout — that is the
@@ -41,18 +45,20 @@ local tool_result = require("factories.tool-result")
 local adapter = require("factories.adapter")
 
 -- Adapt the host's single `nefor.log(msg)` function into the leveled sink
--- the kernel modules expect. Level travels as a prefix so the one host
+-- the kernel modules expect. Level travels as a prefix (plus the run scope,
+-- so interleaved concurrent-run logs stay attributable) — the one host
 -- binding covers info/warn/error without a wider native surface.
-local function make_logger()
+local function make_logger(scope)
   local function at(level)
     return function(msg)
-      nefor.log(string.format("[%s] %s", level, msg))
+      nefor.log(string.format("[%s] [%s] %s", level, scope, msg))
     end
   end
   return { info = at("info"), warn = at("warn"), error = at("error") }
 end
 
--- Build the registry and seed the factories shipped with the kernel.
+-- Build the registry and seed the factories shipped with the kernel. The
+-- registry is read-only after seeding and shared by every run context.
 local function build_registry()
   local reg = Registry.new()
   local function seed(mod)
@@ -75,220 +81,344 @@ end
 nefor.log("mag-kernel loading")
 
 local registry = build_registry()
-local inv = inventory.new({ log = make_logger() })
 
--- Host-provided run context (session/run ids) plus the two host-facing outputs
--- the control plane collects: the last sink output path (surfaced on the
--- run-complete event and via take_run_complete) and the last run-complete
--- signal itself. Kept injected — the kernel modules never reach for ambient run
--- identity; begin_run threads it in.
-local run_ctx = {
-  run_id = nil,
-  run_name = nil,
-  session_id = nil,
-  last_output_path = nil,
-  run_complete = nil,
-  run_failed = nil,
-}
-
--- Injected lifecycle-event sink (observer.lua's EVENTS set, plus routing's
--- ready/run-complete). Every lifecycle event is broadcast on the NCP bus as a
--- Body::Event (via the host's nefor.emit queue, drained by the plugin after
--- each kernel call). The run-complete event additionally carries the sink's
--- persisted output PATH (control plane reads paths, never node data) and is
--- captured so the host can settle the execute reply.
-local function emit_event(event)
-  if type(event) ~= "table" then
-    return
-  end
-  if event.kind == observer.EVENTS.run_complete then
-    -- Attach the path the sink's writer persisted this run (recorded by
-    -- persist_output below) and stash the signal — result included — for
-    -- take_run_complete. The sink's own `persisted` flag only says a writer
-    -- was wired; the kernel knows whether a write actually landed (the
-    -- persistence lib may be absent or the write may have failed), so the
-    -- flag surfaced to the control plane is recomputed from that truth.
-    event.output_path = run_ctx.last_output_path
-    event.persisted = run_ctx.last_output_path ~= nil
-    run_ctx.run_complete = {
-      output_path = run_ctx.last_output_path,
-      persisted = event.persisted,
-      result = event.result,
-    }
-  elseif event.kind == observer.EVENTS.run_failed then
-    -- An unhandled actor failure (routing.lua apply_completion). Stash it for
-    -- take_run_failed so the host fails the run with the detail surfaced.
-    run_ctx.run_failed = {
-      error = event.error,
-      failure = event.failure,
-      from = event.from,
-    }
-  end
-  nefor.emit(event)
-end
-
--- Per-node output persistence keyed by actor id, reusing output-persistence's
--- session layout (sessions/<id>/mag/runs/<run>/<node>.output). The host now
--- exposes nefor.fs/json and puts the lib on package.path; the session id is
--- injected through run_ctx (the plugin has no resident sessions actor).
--- Records the written path so the run-complete event can carry it.
-local function persist_output(node_id, output)
-  if not persistence then
-    return
-  end
-  local persisted = persistence.persist(
-    {
-      run_id = run_ctx.run_id,
-      run_name = run_ctx.run_name,
-      session_id = run_ctx.session_id,
-      node_id = node_id,
-    },
-    output)
-  if type(persisted) == "table" and type(persisted.output_path) == "string" then
-    run_ctx.last_output_path = persisted.output_path
-  end
-end
-
--- The sink's construct-time writer seam (factories/sink.lua, deps.writer): the
--- same per-node persistence, bound to one id, threaded through deps by the
--- construction layer via deps_for below.
-local function writer_for(node_id)
-  return function(output)
-    return persist_output(node_id, output)
-  end
-end
+-- ── run contexts ────────────────────────────────────────────────────────────
+--
+-- runs: run_id → context. Each context is a complete kernel-in-miniature:
+-- inventory + router + modlog + observer, plus the host-facing run state
+-- (terminal captures, last persisted path). A fresh context IS starting from
+-- NullGraph — this replaces the old kill-sweep-and-clear a single global
+-- constellation needed per execute.
+--
+-- Wire-id scoping: two concurrent runs of the same program author identical
+-- actor ids, so anything the kernel puts on the SHARED bus that must resolve
+-- back to one run carries the run's scope token as a `<scope>/` prefix:
+--
+--   * capability correlation ids:  r3/cap-7
+--   * provider chat handles:       r3/agent.llm@r2
+--
+-- The scope token `r<K>` is kernel-session-monotone (never reused, even
+-- across begin_run/end_run of the same run_id). The prefixed strings stay
+-- opaque downstream — the bridge and the providers key on exact match, never
+-- parse. Inside a context ids stay unscoped: actors, routes, refs, and events
+-- all speak the program's own names; scoping happens only at the bus seam.
+local runs = {}
+local run_seq = 0
 
 -- Modification-log JSONL sink (one line per entry; docs/ir.md). No host fs/json
--- surface yet, so entries are traced until it lands; the in-memory log is always
--- retained regardless.
+-- surface yet, so entries are traced until it lands; the in-memory log is
+-- always retained regardless.
 local function persist_modlog_entry(entry)
   nefor.log(string.format("[modlog] #%d %s",
     tonumber(entry.seq) or -1, tostring(entry.outcome)))
 end
-local mlog = modlog.new({ persist = persist_modlog_entry })
 
--- Injected host bus seam. Routing hands this a tool.invoke-shaped envelope
--- ({ kind = "tool.invoke", id, name, args }; routing.lua on_capability_invoke
--- already performs the capability→tool.invoke rename). We put it straight on
--- the NCP bus via the host's nefor.emit queue. Kept dependency-injected so the
--- kernel modules stay pure (routing.lua, correlation.lua); the capability→wire
--- naming is the composition layer's job, not the pure modules'.
-local function bus_emit(envelope)
-  if type(envelope) == "table" then
-    nefor.emit(envelope)
+-- Build one run context. `meta` carries the host-provided run identity
+-- (run_id/run_name/session_id) — injected, never ambient (docs/ir.md).
+local function new_run_context(meta)
+  run_seq = run_seq + 1
+  local scope = "r" .. tostring(run_seq)
+  local log = make_logger(scope)
+
+  local ctx = {
+    scope = scope,
+    run_id = meta.run_id,
+    run_name = meta.run_name,
+    session_id = meta.session_id,
+    last_output_path = nil,
+    run_complete = nil,
+    run_failed = nil,
+  }
+
+  -- Injected lifecycle-event sink (observer.lua's EVENTS set, plus routing's
+  -- ready/run-complete). Every lifecycle event is broadcast on the NCP bus as
+  -- a Body::Event (via the host's nefor.emit queue, drained by the plugin
+  -- after each kernel call) and stamped with this run's id — every
+  -- kernel→control-plane event carries run_id, so consumers key overlapping
+  -- runs apart. The run-complete event additionally carries the sink's
+  -- persisted output PATH (control plane reads paths, never node data) and is
+  -- captured so the host can settle the execute reply.
+  local function emit_event(event)
+    if type(event) ~= "table" then
+      return
+    end
+    event.run_id = ctx.run_id
+    if event.kind == observer.EVENTS.run_complete then
+      -- Attach the path the sink's writer persisted this run (recorded by
+      -- persist_output below) and stash the signal — result included — for
+      -- take_run_complete. The sink's own `persisted` flag only says a writer
+      -- was wired; the kernel knows whether a write actually landed (the
+      -- persistence lib may be absent or the write may have failed), so the
+      -- flag surfaced to the control plane is recomputed from that truth.
+      event.output_path = ctx.last_output_path
+      event.persisted = ctx.last_output_path ~= nil
+      ctx.run_complete = {
+        output_path = ctx.last_output_path,
+        persisted = event.persisted,
+        result = event.result,
+      }
+    elseif event.kind == observer.EVENTS.run_failed then
+      -- An unhandled actor failure (routing.lua apply_completion). Stash it
+      -- for take_run_failed so the host fails the run with the detail
+      -- surfaced.
+      ctx.run_failed = {
+        error = event.error,
+        failure = event.failure,
+        from = event.from,
+      }
+    end
+    nefor.emit(event)
   end
+
+  -- Per-node output persistence keyed by actor id, reusing output-persistence's
+  -- session layout (sessions/<id>/mag/runs/<run>/<node>.output). The run DIR is
+  -- keyed by run_id, not run_name: the lead's run_name is the bare program name
+  -- and two concurrent runs of the same program would collide on it, while the
+  -- run_id is minted unique per dispatch (and embeds the name, so the layout
+  -- stays readable). Consumers are unaffected — the control plane reads output
+  -- paths off the wire, never reconstructs them.
+  local function persist_output(node_id, output)
+    if not persistence then
+      return
+    end
+    local persisted = persistence.persist(
+      {
+        run_id = ctx.run_id,
+        run_name = ctx.run_id,
+        session_id = ctx.session_id,
+        node_id = node_id,
+      },
+      output)
+    if type(persisted) == "table" and type(persisted.output_path) == "string" then
+      ctx.last_output_path = persisted.output_path
+    end
+  end
+
+  -- Injected host bus seam. Routing hands this tool.invoke-shaped envelopes
+  -- ({ kind = "tool.invoke", id, name, args }) and raw signal-time envelopes
+  -- (a dying llm's `<provider>.chat.cancel`). Before an envelope reaches the
+  -- shared bus, any provider chat handle it carries — `chat_id` top-level
+  -- (cancel envelopes) or under `args` (provider-class invokes,
+  -- factories/llm.lua build_request) — is prefixed with this run's scope, so
+  -- two runs of the same program hold disjoint provider-side chats and the
+  -- bridge's chat-keyed correlation never crosses runs. The rewrite copies
+  -- rather than mutates: the emitting actor's own tables stay untouched.
+  local function scope_chat_id(chat_id)
+    return scope .. "/" .. chat_id
+  end
+  local function bus_emit(envelope)
+    if type(envelope) ~= "table" then
+      return
+    end
+    local out = envelope
+    if type(envelope.chat_id) == "string" or
+        (type(envelope.args) == "table" and type(envelope.args.chat_id) == "string") then
+      out = {}
+      for k, v in pairs(envelope) do
+        out[k] = v
+      end
+      if type(out.chat_id) == "string" then
+        out.chat_id = scope_chat_id(out.chat_id)
+      end
+      if type(out.args) == "table" and type(out.args.chat_id) == "string" then
+        local args = {}
+        for k, v in pairs(out.args) do
+          args[k] = v
+        end
+        args.chat_id = scope_chat_id(args.chat_id)
+        out.args = args
+      end
+    end
+    nefor.emit(out)
+  end
+
+  local inv = inventory.new({ log = log })
+
+  -- Capability correlation ids are minted scope-prefixed (`r3/cap-7`) so two
+  -- concurrent runs' requests stay distinct on the shared bus and an inbound
+  -- tool.result dispatches to exactly one context (bus_response below tries
+  -- each run; unique ids make at most one claim it).
+  local cap_seq = 0
+  local router = routing.new({
+    inventory = inv,
+    registry = registry,
+    log = log,
+    bus_emit = bus_emit,
+    events = emit_event,
+    persist_output = persist_output,
+    gen_id = function()
+      cap_seq = cap_seq + 1
+      return scope .. "/cap-" .. tostring(cap_seq)
+    end,
+  })
+
+  -- Break the construction-order cycle (the hooks need the router, which needs
+  -- the inventory): the kill hook first hands the dying instance its final kill
+  -- message (dispatch_kill runs handle_kill; its abort envelopes take the
+  -- raw-emit path to the bus) and THEN drops the router's firing slots +
+  -- correlations (forget). The order is load-bearing — emit-before-forget — so
+  -- a dying actor's provider-cancel/ApprovalCancel reaches the bus while it is
+  -- still bound. A kill before construction finds no instance: the spec drops,
+  -- no courtesy delivery. The deliver hook routes live-target sends into
+  -- routing's firing machines.
+  inv.set_on_kill(function(id)
+    router:dispatch_kill(id)
+    router:forget(id)
+  end)
+
+  -- Lazy-construction hook (routing.lua construct_instance): builds the
+  -- instance via the registry at the actor's FIRST satisfied input contract —
+  -- never at apply. `deps` carries kernel-injected capabilities
+  -- (actor-model.md): the per-node persistence writer (deps.writer), consumed
+  -- by the sink and available to any factory that declares a use for it. A
+  -- failure return escalates inside routing (mag.run_failed).
+  router:set_construct(function(record)
+    local emit = router:emitter(record.id)
+    local deps = {
+      writer = function(output)
+        return persist_output(record.id, output)
+      end,
+    }
+    return registry:construct(record.factory, record.id, record.params, emit, deps)
+  end)
+  inv.set_deliver(function(to, from, content)
+    content = content or {}
+    router:deliver(to, from, content.kind, content)
+  end)
+
+  -- Observability: the observer wraps apply, deriving lifecycle events and one
+  -- ordered modification-log entry from the fold boundary (observer.lua). The
+  -- inventory itself stays pure; this is the composition layer.
+  local mlog = modlog.new({ persist = persist_modlog_entry })
+  local obs = observer.new({ inventory = inv, emit_event = emit_event, modlog = mlog })
+
+  ctx.inventory = inv
+  ctx.router = router
+  ctx.modlog = mlog
+  ctx.observer = obs
+  return ctx
 end
 
-local router = routing.new({
-  inventory = inv,
-  registry = registry,
-  log = make_logger(),
-  bus_emit = bus_emit,
-  events = emit_event,
-  persist_output = persist_output,
-})
--- Break the construction-order cycle (the hooks need the router, which needs
--- the inventory): the kill hook first hands the dying instance its final kill
--- message (dispatch_kill runs handle_kill; its abort envelopes take the raw-emit
--- path to the bus) and THEN drops the router's firing slots + correlations
--- (forget). The order is load-bearing — emit-before-forget — so a dying actor's
--- provider-cancel/ApprovalCancel reaches the bus while it is still bound. A
--- kill before construction finds no instance: the spec drops, no courtesy
--- delivery. The deliver hook routes live-target sends into routing's firing
--- machines.
-inv.set_on_kill(function(id)
-  router:dispatch_kill(id)
-  router:forget(id)
-end)
+-- Tear one run context down: kill every live id through the fold — kill
+-- handlers run, so a mid-flight llm's provider-cancel envelope reaches the
+-- bus and the routing layer forgets per-id state — then drop the context.
+-- Dropping is the whole "reset": the next run gets a fresh context, i.e. a
+-- fold starting from NullGraph, so ids are freely reusable across runs.
+local function reap_run(run_id)
+  local ctx = runs[run_id]
+  if not ctx then
+    return false
+  end
+  local leftovers = {}
+  for id, record in ctx.inventory.pairs() do
+    if record.state == "alive" then
+      leftovers[#leftovers + 1] = id
+    end
+  end
+  if #leftovers > 0 then
+    table.sort(leftovers)
+    ctx.observer:apply({ kills = leftovers })
+  end
+  runs[run_id] = nil
+  return true
+end
 
--- Lazy-construction hook (routing.lua construct_instance): builds the
--- instance via the registry at the actor's FIRST satisfied input contract —
--- never at apply. `deps` carries kernel-injected capabilities
--- (actor-model.md): the per-node persistence writer (deps.writer), consumed
--- by the sink and available to any factory that declares a use for it. A
--- failure return escalates inside routing (mag.run_failed).
-router:set_construct(function(record)
-  local emit = router:emitter(record.id)
-  local deps = { writer = writer_for(record.id) }
-  return registry:construct(record.factory, record.id, record.params, emit, deps)
-end)
-inv.set_deliver(function(to, from, content)
-  content = content or {}
-  router:deliver(to, from, content.kind, content)
-end)
-
--- Observability: the observer wraps apply, deriving lifecycle events and one
--- ordered modification-log entry from the fold boundary (observer.lua). The
--- inventory itself stays pure; this is the composition layer.
-local obs = observer.new({ inventory = inv, emit_event = emit_event, modlog = mlog })
+local function context_of(run_id)
+  local ctx = runs[run_id]
+  if ctx then
+    return ctx
+  end
+  return nil, string.format("unknown run '%s' (not begun, or already ended)", tostring(run_id))
+end
 
 nefor.log("mag-kernel ready (factories: stub, loop-counter, sink, human, llm, run-tool, tool-result, adapter)")
 
 return {
   name = "mag-kernel",
 
-  -- Apply one graph modification through the fold. Strictly serialized —
-  -- one call, one modification (docs/ir.md). Routed through the observer so
-  -- each apply also emits lifecycle events and records a modification-log
-  -- entry; the returned result is the fold's verbatim
-  -- { ok = true } or { ok = false, error = "..." }.
-  apply = function(mod)
-    return obs:apply(mod)
-  end,
-
-  -- Start a program: apply its initial modification through the fold. Spawns
-  -- register specs, initial messages deliver immediately (registration already
-  -- put every route and input contract in place), and each actor constructs
-  -- lazily at its first satisfied input contract (docs/ir.md, Running a
-  -- program). Applied through the observer-wrapped apply (the same path as
-  -- `apply` below), so modification #0 is recorded in the modlog and its
-  -- lifecycle events fire — one composition point, no bypass. Returns the
-  -- fold's verbatim { ok = true } | { ok = false, error = "..." }.
-  start = function(mod)
-    -- A program start owns the whole constellation: reset the previous run's
-    -- actors before applying the new program. Kill every live id through the
-    -- fold (kill handlers run — a mid-flight llm's provider-cancel envelope
-    -- reaches the bus — and the routing layer forgets per-id state), then drop
-    -- the tombstones so the new program can reuse ids. Without this, a
-    -- re-executed program found its ids still alive in the resident kernel:
-    -- every spawn degraded to a duplicate-alive no-op — no construct, no
-    -- actor_spawned/actor_ready events — and stale instances leaked state
-    -- across runs (an llm's request counter continuing at @r3).
-    local leftovers = {}
-    for id, record in inv.pairs() do
-      if record.state == "alive" then
-        leftovers[#leftovers + 1] = id
-      end
-    end
-    if #leftovers > 0 then
-      table.sort(leftovers)
-      obs:apply({ kills = leftovers })
-    end
-    inv.clear()
-    return obs:apply(mod)
-  end,
-
-  -- Drain one actor gracefully (actor-model.md, Signals: drain / SIGTERM):
-  -- calls its handle_drain where declared. This is the graceful path and is
-  -- never auto-invoked from kill; removal, when it comes, is a separate kill in
-  -- a modification. Returns true when a drain handler ran.
-  drain = function(id)
-    return router:drain(id)
-  end,
-
-  -- Begin a run: set the host-provided run context (session/run ids) and emit
-  -- mag.run_started before the first modification (parity with reasoner-graph's
-  -- RunStarted). Run identity is injected, never ambient.
+  -- Begin a run: create its context, then emit mag.run_started before the
+  -- first modification (parity with reasoner-graph's RunStarted). Run identity
+  -- is injected, never ambient. Returns { ok = true, reaped = {...} } or
+  -- { ok = false, error } — a duplicate live run_id rejects (the id is the
+  -- context key and the reply correlation; two runs may not share it).
+  --
+  -- Session-boundary reaping: the engine (and this resident kernel) outlives
+  -- TUI sessions, so a run context whose run never terminated in a PREVIOUS
+  -- session would leak actors forever. Beginning a run under a new session_id
+  -- reaps every live context from a different session — the per-run analogue
+  -- of the old global kill-sweep, scoped so concurrent runs of the CURRENT
+  -- session are never touched. Reaped run_ids are returned so the host can
+  -- fail their still-pending execute replies.
   begin_run = function(meta)
     meta = meta or {}
-    run_ctx.run_id = meta.run_id or run_ctx.run_id
-    run_ctx.run_name = meta.run_name or run_ctx.run_name
-    run_ctx.session_id = meta.session_id or run_ctx.session_id
-    -- Fresh run: clear the prior run's terminal captures + persisted path.
-    run_ctx.run_complete = nil
-    run_ctx.run_failed = nil
-    run_ctx.last_output_path = nil
-    obs:run_started({ run_id = run_ctx.run_id, run_name = run_ctx.run_name })
+    if type(meta.run_id) ~= "string" or meta.run_id == "" then
+      return { ok = false, error = "begin_run requires a string run_id" }
+    end
+    if runs[meta.run_id] then
+      return { ok = false, error = string.format("run '%s' is already live", meta.run_id) }
+    end
+    local stale = {}
+    for run_id, ctx in pairs(runs) do
+      if ctx.session_id ~= meta.session_id then
+        stale[#stale + 1] = run_id
+      end
+    end
+    table.sort(stale)
+    for _, run_id in ipairs(stale) do
+      reap_run(run_id)
+    end
+    local ctx = new_run_context(meta)
+    runs[meta.run_id] = ctx
+    ctx.observer:run_started({ run_id = ctx.run_id, run_name = ctx.run_name })
+    return { ok = true, reaped = stale }
+  end,
+
+  -- Start a run's program: apply its initial modification through that run's
+  -- fold. Spawns register specs, initial messages deliver immediately
+  -- (registration already put every route and input contract in place), and
+  -- each actor constructs lazily at its first satisfied input contract
+  -- (docs/ir.md, Running a program). Applied through the observer-wrapped
+  -- apply, so modification #0 is recorded in the run's modlog and its
+  -- lifecycle events fire. The context is fresh from begin_run — starting IS
+  -- starting from NullGraph; no sweep, and a run starting mid-another-run
+  -- touches nothing outside its own context. Returns the fold's verbatim
+  -- { ok = true } | { ok = false, error = "..." }.
+  start = function(run_id, mod)
+    local ctx, err = context_of(run_id)
+    if not ctx then
+      return { ok = false, error = err }
+    end
+    return ctx.observer:apply(mod)
+  end,
+
+  -- Apply one graph modification through a run's fold. Strictly serialized
+  -- within the run — one call, one modification (docs/ir.md).
+  apply = function(run_id, mod)
+    local ctx, err = context_of(run_id)
+    if not ctx then
+      return { ok = false, error = err }
+    end
+    return ctx.observer:apply(mod)
+  end,
+
+  -- Drain one actor gracefully within a run (actor-model.md, Signals: drain /
+  -- SIGTERM): calls its handle_drain where declared. This is the graceful path
+  -- and is never auto-invoked from kill; removal, when it comes, is a separate
+  -- kill in a modification. Returns true when a drain handler ran.
+  drain = function(run_id, id)
+    local ctx = runs[run_id]
+    if not ctx then
+      return false
+    end
+    return ctx.router:drain(id)
+  end,
+
+  -- End a run: reap its live actors through the fold (kill handlers run —
+  -- abort/cancel envelopes reach the bus) and drop the context. The host calls
+  -- this once the run settled (complete / failed); killing a run outright is
+  -- the same call. Returns true when a context existed.
+  end_run = function(run_id)
+    return reap_run(run_id)
   end,
 
   -- The registered factory names — the control plane validates reasoner/factory
@@ -298,60 +428,81 @@ return {
     return registry:names()
   end,
 
-  -- Take the last run-complete signal (one-shot; cleared on read). The host
+  -- Take a run's run-complete signal (one-shot; cleared on read). The host
   -- polls this after driving the fold to settle the execute reply with the
-  -- sink's output PATH. Returns nil until the resident run signals completion.
-  take_run_complete = function()
-    local rc = run_ctx.run_complete
-    run_ctx.run_complete = nil
+  -- sink's output PATH. Returns nil until the run signals completion.
+  take_run_complete = function(run_id)
+    local ctx = runs[run_id]
+    if not ctx then
+      return nil
+    end
+    local rc = ctx.run_complete
+    ctx.run_complete = nil
     return rc
   end,
 
-  -- Take the last unhandled-failure signal (one-shot; cleared on read). Set
+  -- Take a run's unhandled-failure signal (one-shot; cleared on read). Set
   -- when a failed completion's tag routes nowhere (routing.lua
   -- apply_completion → mag.run_failed). The host fails the run with the
   -- carried error detail. Returns nil while no failure escalated.
-  take_run_failed = function()
-    local rf = run_ctx.run_failed
-    run_ctx.run_failed = nil
+  take_run_failed = function(run_id)
+    local ctx = runs[run_id]
+    if not ctx then
+      return nil
+    end
+    local rf = ctx.run_failed
+    ctx.run_failed = nil
     return rf
   end,
 
-  -- Kernel-injected construct deps for an actor id — the sink's per-node
-  -- persistence writer (factories/sink.lua, deps.writer). The construction
-  -- layer threads this into registry:construct(name, id, params, emit, deps).
-  deps_for = function(id)
-    return { writer = writer_for(id) }
-  end,
-
-  -- The modification log ("the modification log is the run"; docs/ir.md) and a
-  -- replay helper folding it back into a caller-supplied fresh inventory.
-  modlog = mlog,
-  replay = function(fresh_inv)
-    return modlog.replay(mlog:all(), fresh_inv)
-  end,
-  observer = obs,
-
-
-  -- Read-only introspection for the host / tests.
-  state_of = function(id)
-    return inv.state_of(id)
-  end,
-  actor = function(id)
-    return inv.get(id)
-  end,
-
   -- Deliver a correlated capability response (tool.result-shaped:
-  -- { id, result | error }) back to the requesting actor. The host calls
-  -- this from its bus-inbound path once the bus seam is wired.
+  -- { id, result | error }) back to the requesting actor. Correlation ids are
+  -- scope-prefixed and kernel-unique, so trying each live run finds at most
+  -- one owner; the owning run's id is returned (nil when the id is not ours —
+  -- another consumer's reply on the broadcast bus). The host uses the return
+  -- to settle exactly the run the response advanced.
   bus_response = function(response)
-    return router:bus_response(response)
+    for run_id, ctx in pairs(runs) do
+      if ctx.router:bus_response(response) then
+        return run_id
+      end
+    end
+    return nil
   end,
 
-  -- The inventory, factory registry, and router, for wiring factory
-  -- construction and host bus I/O in their own tasks without re-reaching
-  -- through this table.
-  inventory = inv,
+  -- The live run ids, sorted (host/tests iteration).
+  run_ids = function()
+    local ids = {}
+    for run_id in pairs(runs) do
+      ids[#ids + 1] = run_id
+    end
+    table.sort(ids)
+    return ids
+  end,
+
+  -- Read-only introspection for the host / tests, per run.
+  state_of = function(run_id, id)
+    local ctx = runs[run_id]
+    if not ctx then
+      return "never-existed"
+    end
+    return ctx.inventory.state_of(id)
+  end,
+  actor = function(run_id, id)
+    local ctx = runs[run_id]
+    if not ctx then
+      return nil
+    end
+    return ctx.inventory.get(id)
+  end,
+
+  -- A run's whole context — inventory, router, observer, modlog ("the
+  -- modification log is the run"; docs/ir.md), scope token — for tests and
+  -- host wiring that need more than the seams above. nil once the run ended.
+  context = function(run_id)
+    return runs[run_id]
+  end,
+
+  -- The shared factory registry (read-only after seeding).
   registry = registry,
-  router = router,
 }

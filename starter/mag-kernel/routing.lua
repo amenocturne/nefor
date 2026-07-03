@@ -407,22 +407,24 @@ end
 
 -- The host calls this when a correlated bus response (tool.result-shaped:
 -- { id, result | error }) arrives. The reply routes back to the requesting
--- actor as a reply activation. An unknown id is not ours and is ignored; a
--- dead requester drops the reply as a logged no-op.
+-- actor as a reply activation. Returns true when the correlation was OURS
+-- (open in this router) — even when the reply then drops on a dead requester
+-- — so a multi-run host can dispatch a response across run contexts and stop
+-- at the owner. An unknown id is not ours: returns false, ignored.
 function M:bus_response(response)
   response = response or {}
   local entry = self.correlation:close(response.id)
   if not entry then
-    return
+    return false
   end
   local dest = self.inventory.get(entry.requester)
   if not dest or dest.state == "dead" then
     self.log.info(string.format("capability reply dropped: requester '%s' is dead", tostring(entry.requester)))
-    return
+    return true
   end
   local instance = self.instances[entry.requester]
   if not instance or type(instance.deliver) ~= "function" then
-    return
+    return true
   end
   local completion = instance.deliver({
     kind = "reply",
@@ -431,6 +433,7 @@ function M:bus_response(response)
     error = response.error,
   })
   self:apply_completion(entry.requester, completion)
+  return true
 end
 
 -- The factory confirmed the id is ready (actor-model.md, Lifecycle). With

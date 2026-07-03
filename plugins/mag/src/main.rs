@@ -18,6 +18,7 @@ mod bridge;
 mod error;
 mod kernel;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use nefor_mag::LoadedProgram;
@@ -31,16 +32,19 @@ use crate::error::MagError;
 use crate::kernel::{LuaHost, RunCompletion};
 
 /// A run driven asynchronously to completion: the execute reply is deferred
-/// until the resident program signals `mag.run_complete` or `mag.run_failed`
-/// (via inbound capability responses that unblock deferred activations).
-/// Synchronous programs (the shipped factories) finish inside the
-/// `mag.execute` call and never register one.
+/// until that run signals `mag.run_complete` or `mag.run_failed` (via inbound
+/// capability responses that unblock deferred activations). Runs are
+/// concurrent — each `mag.execute` gets its own run-scoped kernel context and
+/// its own entry here, keyed by run_id, settling independently. Synchronous
+/// programs (the shipped factories) finish inside the `mag.execute` call and
+/// never register one.
 struct ActiveExecute {
     /// The `mag.execute` request id to correlate the terminal reply to.
     in_reply_to: Option<String>,
-    /// The run's id, echoed on the reply.
-    run_id: String,
 }
+
+/// The in-flight async runs, keyed by run_id.
+type ActiveExecutes = HashMap<String, ActiveExecute>;
 
 /// Outbound/inbound channel capacity for the stdio transport tasks.
 const CHANNEL_CAP: usize = 128;
@@ -224,8 +228,10 @@ async fn run_dispatch_loop(
     // source of the cached environment every `mag.eval` evaluates against and
     // the default program `mag.execute` runs.
     let mut program: Option<LoadedProgram> = None;
-    // The in-flight async run, if any (deferred-completion path).
-    let mut active: Option<ActiveExecute> = None;
+    // The in-flight async runs, keyed by run_id (deferred-completion path).
+    // Concurrent `mag.execute` requests each hold one entry; each settles
+    // independently against its own run-scoped kernel context.
+    let mut active: ActiveExecutes = HashMap::new();
     // Capability bridge: drives each provider-class `tool.invoke` as a
     // `chat.*` conversation (correlating the streamed result back; state keyed
     // by chat_id) and rewrites each tool-class `tool.invoke` onto the
@@ -284,34 +290,69 @@ async fn flush_emits(
     Ok(())
 }
 
-/// If the resident run signalled a terminal state, send the terminal reply and
-/// clear the in-flight slot: completion carries the sink's final result plus
-/// its output PATH; an unhandled actor failure (the kernel's `mag.run_failed`
-/// escalation) fails the run with the failure detail surfaced.
-async fn settle_if_complete(
+/// If the named run signalled a terminal state, send its terminal reply,
+/// drop its in-flight slot, and end its run context: completion carries the
+/// sink's final result plus its output PATH; an unhandled actor failure (the
+/// kernel's `mag.run_failed` escalation) fails the run with the failure
+/// detail surfaced. Ending the context reaps the run's remaining live actors
+/// through the fold — kill handlers run, so a still-open provider request on
+/// a parallel branch is cancelled — and the reap's envelopes are flushed.
+/// Other runs are untouched: kill semantics are per run.
+async fn settle_run(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     host: &LuaHost,
-    active: &mut Option<ActiveExecute>,
+    active: &mut ActiveExecutes,
+    bridge: &mut CapabilityBridge,
+    run_id: &str,
 ) -> Result<(), MagError> {
-    if active.is_none() {
+    if !active.contains_key(run_id) {
         return Ok(());
     }
-    if let Some(rc) = host.take_run_complete()? {
-        let a = active.take().expect("active checked above");
-        send_event(
-            out_tx,
-            run_result_ok(a.in_reply_to.as_deref(), &a.run_id, &rc),
-        )
-        .await?;
+    let terminal = if let Some(rc) = host.take_run_complete(run_id)? {
+        Some(run_result_ok(None, run_id, &rc))
+    } else {
+        host.take_run_failed(run_id)?
+            .map(|error| run_result_failed(None, run_id, &error))
+    };
+    let mut reply = match terminal {
+        Some(reply) => reply,
+        None => return Ok(()),
+    };
+    let a = active.remove(run_id).expect("checked above");
+    if let Some(id) = a.in_reply_to {
+        reply.insert("in_reply_to".into(), Value::String(id));
+    }
+    send_event(out_tx, reply).await?;
+    host.end_run(run_id)?;
+    flush_emits(out_tx, host, bridge).await
+}
+
+/// Fail the still-pending execute replies of runs the kernel reaped at a
+/// session boundary (begin_run's `reaped` list) and flush the reap's
+/// envelopes (actor_killed events, abort/cancel emits).
+async fn settle_reaped(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    host: &LuaHost,
+    active: &mut ActiveExecutes,
+    bridge: &mut CapabilityBridge,
+    reaped: &[String],
+) -> Result<(), MagError> {
+    if reaped.is_empty() {
         return Ok(());
     }
-    if let Some(error) = host.take_run_failed()? {
-        let a = active.take().expect("active checked above");
-        send_event(
-            out_tx,
-            run_result_failed(a.in_reply_to.as_deref(), &a.run_id, &error),
-        )
-        .await?;
+    flush_emits(out_tx, host, bridge).await?;
+    for run_id in reaped {
+        if let Some(a) = active.remove(run_id) {
+            send_event(
+                out_tx,
+                run_result_failed(
+                    a.in_reply_to.as_deref(),
+                    run_id,
+                    "run reaped at session boundary (a later session began a new run)",
+                ),
+            )
+            .await?;
+        }
     }
     Ok(())
 }
@@ -325,7 +366,7 @@ async fn handle_event(
     body: &Map<String, Value>,
     program: &mut Option<LoadedProgram>,
     host: &LuaHost,
-    active: &mut Option<ActiveExecute>,
+    active: &mut ActiveExecutes,
     bridge: &mut CapabilityBridge,
 ) -> Result<(), MagError> {
     let kind = match body.get("kind").and_then(Value::as_str) {
@@ -351,8 +392,8 @@ async fn handle_event(
         APPLY_KIND => handle_apply(out_tx, body, in_reply_to, host, active, bridge).await,
         // A capability response correlated to a kernel-minted request id.
         // Unknown ids are dropped inside the kernel (no open correlation), so
-        // forwarding every tool.result while a run is live is safe.
-        TOOL_RESULT_KIND if active.is_some() => {
+        // forwarding every tool.result while any run is live is safe.
+        TOOL_RESULT_KIND if !active.is_empty() => {
             handle_tool_result(out_tx, body, host, active, bridge).await
         }
         _ => Ok(()),
@@ -404,18 +445,21 @@ async fn handle_load(
 /// Run a program through the kernel. The modification is taken inline from the
 /// request (`modification` — the control plane reaches kernel ops directly,
 /// ir.md) or, absent that, from the session's resident program (`mag.load`).
-/// Registers the constellation, delivers the initial messages (each actor
-/// constructs lazily at its first firing), streams lifecycle events, and — for
-/// a synchronous program — replies `mag.run_result` with the sink's final
-/// result + output path in the same turn. An async program (a provider
-/// round-trip pending) defers the reply until `mag.run_complete`.
+/// Creates the run's own kernel context (begin_run), registers the
+/// constellation, delivers the initial messages (each actor constructs lazily
+/// at its first firing), streams lifecycle events, and — for a synchronous
+/// program — replies `mag.run_result` with the sink's final result + output
+/// path in the same turn. An async program (a provider round-trip pending)
+/// defers the reply until `mag.run_complete`. Concurrent executes are
+/// accepted: each run lives in its own context and a run starting mid-flight
+/// touches nothing of the others.
 async fn handle_execute(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: &Map<String, Value>,
     in_reply_to: Option<&str>,
     program: &Option<LoadedProgram>,
     host: &LuaHost,
-    active: &mut Option<ActiveExecute>,
+    active: &mut ActiveExecutes,
     bridge: &mut CapabilityBridge,
 ) -> Result<(), MagError> {
     let mut modification: Value = match body.get("modification") {
@@ -475,32 +519,49 @@ async fn handle_execute(
         .unwrap_or(&run_id);
     let session_id = body.get("session_id").and_then(Value::as_str);
 
-    host.begin_run(&run_id, run_name, session_id)?;
-    let outcome = host.start(&modification)?;
-    flush_emits(out_tx, host, bridge).await?;
-
-    // A failed apply / rejected initial modification: nothing spawned.
-    if !outcome.ok {
-        let msg = outcome.error.unwrap_or_else(|| "start failed".into());
+    let begun = host.begin_run(&run_id, run_name, session_id)?;
+    // The kernel reaps stale contexts from a previous session at the boundary
+    // (begin_run); fail their pending replies before driving the new run.
+    settle_reaped(out_tx, host, active, bridge, &begun.reaped).await?;
+    if !begun.ok {
+        let msg = begun.error.unwrap_or_else(|| "begin_run failed".into());
         return send_event(out_tx, run_result_failed(in_reply_to, &run_id, &msg)).await;
     }
+    let outcome = host.start(&run_id, &modification)?;
+    flush_emits(out_tx, host, bridge).await?;
 
-    // Synchronous program: the sink fired inside `start`. Reply now.
-    if let Some(rc) = host.take_run_complete()? {
-        return send_event(out_tx, run_result_ok(in_reply_to, &run_id, &rc)).await;
+    // A failed apply / rejected initial modification: nothing useful spawned;
+    // drop the context.
+    if !outcome.ok {
+        let msg = outcome.error.unwrap_or_else(|| "start failed".into());
+        send_event(out_tx, run_result_failed(in_reply_to, &run_id, &msg)).await?;
+        host.end_run(&run_id)?;
+        return flush_emits(out_tx, host, bridge).await;
     }
-    // Synchronous failure inside `start`: an actor failed with no failure
-    // route, or a factory's construct rejected at first firing.
-    if let Some(error) = host.take_run_failed()? {
-        return send_event(out_tx, run_result_failed(in_reply_to, &run_id, &error)).await;
+
+    // Synchronous terminal state inside `start`: reply now and tear the run's
+    // context down (reaping any still-live actors — e.g. a parallel branch —
+    // through the fold).
+    let terminal = if let Some(rc) = host.take_run_complete(&run_id)? {
+        Some(run_result_ok(in_reply_to, &run_id, &rc))
+    } else {
+        host.take_run_failed(&run_id)?
+            .map(|error| run_result_failed(in_reply_to, &run_id, &error))
+    };
+    if let Some(reply) = terminal {
+        send_event(out_tx, reply).await?;
+        host.end_run(&run_id)?;
+        return flush_emits(out_tx, host, bridge).await;
     }
 
     // Async program: defer the terminal reply until `mag.run_complete` (or
     // `mag.run_failed`) arrives via capability responses.
-    *active = Some(ActiveExecute {
-        in_reply_to: in_reply_to.map(str::to_owned),
+    active.insert(
         run_id,
-    });
+        ActiveExecute {
+            in_reply_to: in_reply_to.map(str::to_owned),
+        },
+    );
     Ok(())
 }
 
@@ -549,6 +610,12 @@ const APPLY_NO_LIVE_RUN: &str =
     "mag.apply rejected: no live run (control-plane apply requires an active \
      session with an in-flight run — docs/ir.md, Kernel operations)";
 
+/// Named rejection for a run-id-less `mag.apply` while several runs are live:
+/// the plane must say which constellation it is modifying.
+const APPLY_AMBIGUOUS_RUN: &str =
+    "mag.apply rejected: several runs are live; pass run_id to name the \
+     target constellation";
+
 /// Apply one graph modification directly to the resident kernel — the control
 /// plane's mid-run kernel op (docs/ir.md, "Kernel operations"). The initial
 /// modification runs via `mag.execute`; this is the *later* path: a
@@ -558,29 +625,53 @@ const APPLY_NO_LIVE_RUN: &str =
 /// into the live constellation (constructing at first firing).
 ///
 /// Guard policy: an apply is accepted only while a run is live (`active`), and
-/// every accepted apply is logged with its `source`. Outside a live run the
-/// apply is rejected with [`APPLY_NO_LIVE_RUN`] — the control-plane authority
-/// ir.md grants the plane exists only *over a running constellation*, so a
-/// session-less apply has nothing to act on. Lifecycle events the apply emits
-/// stream on the wire; a completion it triggers settles the run.
+/// every accepted apply is logged with its `source`. The target run is the
+/// request's `run_id`; a run-id-less apply falls back to the single live run
+/// and is rejected as ambiguous when several are live. Outside any live run
+/// the apply is rejected with [`APPLY_NO_LIVE_RUN`] — the control-plane
+/// authority ir.md grants the plane exists only *over a running
+/// constellation*, so a session-less apply has nothing to act on. Lifecycle
+/// events the apply emits stream on the wire; a completion it triggers
+/// settles that run.
 async fn handle_apply(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: &Map<String, Value>,
     in_reply_to: Option<&str>,
     host: &LuaHost,
-    active: &mut Option<ActiveExecute>,
+    active: &mut ActiveExecutes,
     bridge: &mut CapabilityBridge,
 ) -> Result<(), MagError> {
-    // Guard: reject applies with no live run before touching the kernel.
-    let run_id = match active.as_ref() {
-        Some(a) => a.run_id.clone(),
-        None => {
+    // Resolve the target run: explicit run_id, else the single live run.
+    let run_id = match body.get("run_id").and_then(Value::as_str) {
+        Some(rid) if active.contains_key(rid) => rid.to_owned(),
+        Some(rid) => {
             return send_event(
                 out_tx,
-                applied_body(in_reply_to, false, Some(APPLY_NO_LIVE_RUN)),
+                applied_body(
+                    in_reply_to,
+                    false,
+                    Some(&format!("mag.apply rejected: run '{rid}' is not live")),
+                ),
             )
             .await
         }
+        None => match active.len() {
+            0 => {
+                return send_event(
+                    out_tx,
+                    applied_body(in_reply_to, false, Some(APPLY_NO_LIVE_RUN)),
+                )
+                .await
+            }
+            1 => active.keys().next().expect("len checked").clone(),
+            _ => {
+                return send_event(
+                    out_tx,
+                    applied_body(in_reply_to, false, Some(APPLY_AMBIGUOUS_RUN)),
+                )
+                .await
+            }
+        },
     };
 
     let modification = match body.get("modification") {
@@ -602,7 +693,7 @@ async fn handle_apply(
         .unwrap_or("<unspecified>");
     tracing::info!(source = %source, run_id = %run_id, "mag.apply accepted");
 
-    let state = host.apply(&modification)?;
+    let state = host.apply(&run_id, &modification)?;
     // Forward the lifecycle events + any abort/cancel envelopes the apply queued.
     // A kill hands the dying `llm` its final message — the `<provider>.chat.cancel`
     // envelope keyed by the chat_id handle (factories/llm.lua handle_kill) — which
@@ -616,18 +707,19 @@ async fn handle_apply(
     )
     .await?;
     // A modification that completes the run (e.g. a send that unblocks the sink)
-    // settles the in-flight execute reply.
-    settle_if_complete(out_tx, host, active).await
+    // settles that run's in-flight execute reply.
+    settle_run(out_tx, host, active, bridge, &run_id).await
 }
 
 /// Route a capability response into the kernel (unblocking a deferred
-/// activation), forward whatever it produced, and settle the run if it
-/// completed.
+/// activation in the owning run's context), forward whatever it produced, and
+/// settle that run if it completed. Correlation ids are run-scoped, so the
+/// kernel names the run the response advanced.
 async fn handle_tool_result(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: &Map<String, Value>,
     host: &LuaHost,
-    active: &mut Option<ActiveExecute>,
+    active: &mut ActiveExecutes,
     bridge: &mut CapabilityBridge,
 ) -> Result<(), MagError> {
     let id = match body.get("id").and_then(Value::as_str) {
@@ -637,9 +729,12 @@ async fn handle_tool_result(
     // Providers/tools reply with `output`; some producers use `result`.
     let result = body.get("output").or_else(|| body.get("result"));
     let error = body.get("error").and_then(Value::as_str);
-    host.bus_response(id, result, error)?;
+    let advanced = host.bus_response(id, result, error)?;
     flush_emits(out_tx, host, bridge).await?;
-    settle_if_complete(out_tx, host, active).await
+    match advanced {
+        Some(run_id) => settle_run(out_tx, host, active, bridge, &run_id).await,
+        None => Ok(()),
+    }
 }
 
 /// Route a provider bridge reply (a driven chat's `chat.complete.result` or
@@ -654,14 +749,14 @@ async fn handle_provider_reply(
     kind: &str,
     body: &Map<String, Value>,
     host: &LuaHost,
-    active: &mut Option<ActiveExecute>,
+    active: &mut ActiveExecutes,
     bridge: &mut CapabilityBridge,
 ) -> Result<(), MagError> {
     let reply = match bridge.take_reply(kind, body) {
         Some(r) => r,
         None => return Ok(()),
     };
-    host.bus_response(
+    let advanced = host.bus_response(
         &reply.request_id,
         reply.result.as_ref(),
         reply.error.as_deref(),
@@ -672,7 +767,10 @@ async fn handle_provider_reply(
     )
     .await?;
     flush_emits(out_tx, host, bridge).await?;
-    settle_if_complete(out_tx, host, active).await
+    match advanced {
+        Some(run_id) => settle_run(out_tx, host, active, bridge, &run_id).await,
+        None => Ok(()),
+    }
 }
 
 /// A run id for an execute that didn't carry one. Millisecond-stamped; the

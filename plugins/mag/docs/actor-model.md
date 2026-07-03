@@ -16,9 +16,13 @@ returning — per activation; a node activated twice returns twice. What the
 runtime does with the returned output (routing, rules) is described in
 ir.md.
 
-The kernel holds one actor inventory: a single map from actor id to instance,
-shared across all factories. Spawn inserts, kill deletes, routing consults
-nothing else.
+The kernel holds one actor inventory **per run**: a single map from actor id
+to instance, shared across all factories. Spawn inserts, kill deletes, routing
+consults nothing else. Runs are concurrent — each `mag.execute` gets its own
+run context (inventory, routing/firing state, correlations, modification log),
+created at run start and dropped at run end — so actor ids, routes, and sends
+resolve within one run only, and two runs of the same program coexist without
+touching each other (see Run contexts in ir.md).
 
 **Actors are unaware of the bus.** The mag plugin, like any plugin, receives
 every bus message; what it does with them is its own business. It filters and
