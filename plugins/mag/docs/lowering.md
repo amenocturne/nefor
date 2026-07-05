@@ -57,17 +57,17 @@ that travels the edge, valued by an **array of destination actor ids**.
 routes : { "<qualified-output-type>": ["<dest-id>", ...], ... }
 ```
 
-| Graph construct                                           | Route encoding                                                               |
-| --------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `a -> b` (single output type T)                           | `a.routes["T"] = ["b"]`                                                      |
-| Typed exit `a : IN -> (X \| Y)` with `a -> bx`, `a -> by` | `a.routes = {"X":["bx"], "Y":["by"]}`                                        |
-| Fanout: same type T to `b` and `c`                        | `a.routes["T"] = ["b", "c"]`                                                 |
-| Back-edge (cycle) `counter -> llm`                        | `counter.routes["ProviderOut"] = ["llm"]` — no different from a forward edge |
-| Terminal sink `out`                                       | `out.routes = {}` (emits nothing downstream)                                 |
+| Graph construct                    | Route encoding                                                                                                                                                                                        |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `a -> b` (single output type T)    | `a.routes["T"] = ["b"]`                                                                                                                                                                               |
+| Typed exit                         | The `llm` exit `ProviderOut -> (ToolCalls \| FinalAnswer)` becomes two `routes` keys. The variant that leaves the cycle is a type fact, never a position — actor-model.md forbids position heuristics |
+| Fanout: same type T to `b` and `c` | `a.routes["T"] = ["b", "c"]`                                                                                                                                                                          |
+| Back-edge (cycle) `counter -> llm` | `counter.routes["ProviderOut"] = ["llm"]` — no different from a forward edge                                                                                                                          |
+| Terminal sink `out`                | `out.routes = {}` (emits nothing downstream)                                                                                                                                                          |
 
 Type tags are produced exactly as `qualify_type` does today (ir.rs:40): dotted
 names pass through (`generic-provider.FinalAnswer`), bare names get a `mag.`
-prefix (`mag.LoopExhausted`). The kernel dispatches an actor's returned output
+prefix (`mag.Task`). The kernel dispatches an actor's returned output
 by looking up its runtime type in `routes` — an O(1) type dispatch, the same
 type-driven fanout the `reasoner-graph` plugin already performs, now carried by
 the actor instead of a separate edge record.
@@ -83,28 +83,22 @@ route destination that points _inside_ the same instance is rewritten with the
 same prefix. Two instantiations of one template therefore occupy disjoint id
 subtrees.
 
-The agent template has two expansions; the loop bound is opt-in:
+The agent template has ONE expansion — the bare agentic cycle: `entry`,
+`llm`, `run-tool`, `tool-result`, with the back-edge `tool-result → llm` and
+a single output port on `llm`. The loop's terminator is structural: the
+llm's output is the union `ToolCalls | OUT`, so a final answer exits through
+the output port. Loops are unbounded — stopping a runaway run is the control
+plane's kill/interrupt, not a compiled bound. (A `:max-steps` loop bound
+shipped once, broken and untested — its exhaust wiring routed a tag no input
+port accepted and hung the run — and was removed rather than repaired;
+`:max-steps` now rejects at compile like any other unknown agent config key.)
 
-- **No `:max-steps`** (default): the bare agentic cycle — `entry`, `llm`,
-  `run-tool`, `tool-result`, with the back-edge `tool-result → llm` and a
-  single output port on `llm`. The loop's terminator is structural: the llm's
-  output is the union `ToolCalls | OUT`, so a final answer exits through the
-  output port. Runaway protection is the author's/observer's concern.
-- **`:max-steps N` authored**: the bounded expansion — the back-edge threads a
-  `loop-counter` (`params.max = N`, no default) whose exhaustion variant exits
-  through an `exhaust` summarizer llm, a second output port.
-
-Both fixture agents author `:max-steps`, so the worked example lowers the
-bounded expansion:
-
-| Template-internal name             | `docs-explorer` instance     | `code-writer` instance     |
-| ---------------------------------- | ---------------------------- | -------------------------- |
-| `entry`                            | `docs-explorer.entry`        | `code-writer.entry`        |
-| `llm`                              | `docs-explorer.llm`          | `code-writer.llm`          |
-| `run-tool`                         | `docs-explorer.run-tool`     | `code-writer.run-tool`     |
-| `tool-result`                      | `docs-explorer.tool-result`  | `code-writer.tool-result`  |
-| `loop-counter` (`:max-steps` only) | `docs-explorer.loop-counter` | `code-writer.loop-counter` |
-| `exhaust` (`:max-steps` only)      | `docs-explorer.exhaust`      | `code-writer.exhaust`      |
+| Template-internal name | `docs-explorer` instance    | `code-writer` instance    |
+| ---------------------- | --------------------------- | ------------------------- |
+| `entry`                | `docs-explorer.entry`       | `code-writer.entry`       |
+| `llm`                  | `docs-explorer.llm`         | `code-writer.llm`         |
+| `run-tool`             | `docs-explorer.run-tool`    | `code-writer.run-tool`    |
+| `tool-result`          | `docs-explorer.tool-result` | `code-writer.tool-result` |
 
 Namespacing rewrites three things at instantiation: (1) each actor `id`, (2)
 every internal route destination, (3) any rule `on` id the template binds. The
@@ -118,32 +112,30 @@ to concrete internal actor ids:
 
 - input port → the internal actor that receives the boundary input (`entry`).
 - output port → the set of internal actors that emit the boundary output type
-  (`llm` and `exhaust` here, both of which produce `FinalAnswer`; just `llm`
-  for an unbounded agent).
+  (just `llm` for an agent; a template with several boundary emitters resolves
+  to all of them).
 
 So the graph-level edge `explorer -> writer` dissolves into a route on **every**
 actor behind `explorer`'s output port:
 
 ```
-docs-explorer.llm.routes["generic-provider.FinalAnswer"]     = ["code-writer.entry"]
-docs-explorer.exhaust.routes["generic-provider.FinalAnswer"] = ["code-writer.entry"]
+docs-explorer.llm.routes["generic-provider.FinalAnswer"] = ["code-writer.entry"]
 ```
 
-## Cycles, loop-counters, typed exits
+## Cycles and typed exits
 
 The agentic loop is a cycle; it needs zero rules. All of its control flow is
 static typed wiring:
 
-| Concern                   | Lowering                                                                                                                                                                                                                                                                         |
-| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Cycle                     | Ordinary routes that happen to point back: `loop-counter.routes["ProviderOut"] = ["llm"]` (or `tool-result.routes["ProviderOut"] = ["llm"]` unbounded). No cycle marker in the IR                                                                                                |
-| Loop bound                | Opt-in via `:max-steps`. When authored, `loop-counter` is a normal actor, factory `loop-counter`, `params.max` per instance (50 for the explorer, 80 for the writer). State lives in the instance, not the modification. Without `:max-steps` no counter exists                  |
-| Typed exit                | The union output `ProviderOut -> (ProviderOut \| LoopExhausted)` becomes two `routes` keys; the `llm` exit `ProviderOut -> (ToolCalls \| FinalAnswer)` likewise. The variant that leaves the cycle is a type fact, never a position — actor-model.md forbids position heuristics |
-| Per-instance disjointness | Because ids are namespaced, `docs-explorer.loop-counter` and `code-writer.loop-counter` are independent instances with independent `max` and independent back-routes to their own `llm`                                                                                          |
+| Concern                   | Lowering                                                                                                                                                                                              |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Cycle                     | Ordinary routes that happen to point back: `tool-result.routes["ProviderOut"] = ["llm"]`. No cycle marker in the IR                                                                                   |
+| Typed exit                | The `llm` exit `ProviderOut -> (ToolCalls \| FinalAnswer)` becomes two `routes` keys. The variant that leaves the cycle is a type fact, never a position — actor-model.md forbids position heuristics |
+| Per-instance disjointness | Because ids are namespaced, `docs-explorer.tool-result` and `code-writer.tool-result` are independent instances with independent back-routes to their own `llm`                                       |
 
 Cycles are legal as-is — there is no load-time boundedness check. Every cycle
-already has a typed exit (the llm's `FinalAnswer` variant); bounding it is an
-authoring decision, not a compiler guarantee.
+already has a typed exit (the llm's `FinalAnswer` variant); stopping a run
+that never reaches it is the control plane's kill/interrupt.
 
 ## The program sink
 
@@ -158,7 +150,7 @@ plane). The old `GraphIr.terminal` string (ir.rs:8) is dropped.
 | Section    | Initial modification content                                                                          | Notes                                                                                                                                                                                                                         |
 | ---------- | ----------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `messages` | one activation to the entry port of the first agent: `{to: "docs-explorer.entry", content: {…task…}}` | Delivered after the whole constellation registers (spawns precede messages in the apply); it satisfies `docs-explorer.entry`'s input contract, which constructs the adapter and fires it (lazy construction — actor-model.md) |
-| `kills`    | `[]`                                                                                                  | The initial constellation removes nothing. Kills appear in *rule-produced* modifications (e.g. the race pattern: first completion's rule kills the losers)                                                                    |
+| `kills`    | `[]`                                                                                                  | The initial constellation removes nothing. Kills appear in _rule-produced_ modifications (e.g. the race pattern: first completion's rule kills the losers)                                                                    |
 | `rules`    | `[]`                                                                                                  | A fully static graph binds no rules — all routing is wiring. Rules are for data-dependent composition only                                                                                                                    |
 
 ### Where rules would attach
@@ -169,11 +161,11 @@ on runtime data. Illustrative (not in this fixture):
 
 - **For-each fanout.** If `docs-explorer` returned a list of sub-tasks and the
   writer should spawn one sub-agent per item:
-  `{on: "docs-explorer.exhaust", fn: "fan-out-writers"}`. The rule receives the
+  `{on: "docs-explorer.llm", fn: "fan-out-writers"}`. The rule receives the
   FinalAnswer, and returns a modification whose `actors` are N namespaced
   `code-writer.<i>.*` constellations plus the `messages` to seed them.
 - **Race-and-kill.** Spawn three explorers on the same task, bind
-  `{on: "explorer-a.exhaust", fn: "kill-siblings"}` (and symmetric rules) so the
+  `{on: "explorer-a.llm", fn: "kill-siblings"}` (and symmetric rules) so the
   first to finish returns a modification with `kills: ["explorer-b", …]`.
 
 The rule `fn` is a name into the program's source snapshot with declared
@@ -190,7 +182,6 @@ unary, and matches the contract (ir.md). None of that machinery exists yet.
 | union output + its outgoing edges          | multiple keys in the source actor's `routes`                                                                       |
 | fanout (one type, many targets)            | one `routes` key with a multi-element array                                                                        |
 | cycle back-edge                            | an ordinary `routes` entry pointing upstream                                                                       |
-| `loop-counter` node                        | actor `{factory: "loop-counter", params:{max}}`                                                                    |
 | `:terminal out` (sink)                     | `sink` actor with `routes: {}`; no `terminal` field                                                                |
 | initial input                              | one entry in `messages` to the entry port                                                                          |
 | control edge (fire `b` after `a`, no data) | status-typed route entry on `a` (`mag.Completed`, failure variants)                                                |

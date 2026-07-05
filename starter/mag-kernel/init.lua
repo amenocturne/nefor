@@ -23,7 +23,6 @@ local routing = require("routing")
 local modlog = require("modlog")
 local observer = require("observer")
 local stub = require("factories.stub")
-local loop_counter = require("factories.loop-counter")
 local sink = require("factories.sink")
 local human = require("factories.human")
 local llm = require("factories.llm")
@@ -68,7 +67,6 @@ local function build_registry()
     end
   end
   seed(stub)
-  seed(loop_counter)
   seed(sink)
   seed(human)
   seed(llm)
@@ -232,7 +230,11 @@ local function new_run_context(meta)
     nefor.emit(out)
   end
 
-  local inv = inventory.new({ log = log })
+  -- The registry is injected so the fold validates every modification's
+  -- routes against factory-declared contracts at apply (inventory.lua,
+  -- validate_routes) — a route no destination port accepts REJECTS the
+  -- modification instead of warn-dropping at delivery.
+  local inv = inventory.new({ log = log, registry = registry })
 
   -- Capability correlation ids are minted scope-prefixed (`r3/cap-7`) so two
   -- concurrent runs' requests stay distinct on the shared bus and an inbound
@@ -336,7 +338,7 @@ local function context_of(run_id)
   return nil, string.format("unknown run '%s' (not begun, or already ended)", tostring(run_id))
 end
 
-nefor.log("mag-kernel ready (factories: stub, loop-counter, sink, human, llm, run-tool, tool-result, adapter)")
+nefor.log("mag-kernel ready (factories: stub, sink, human, llm, run-tool, tool-result, adapter)")
 
 return {
   name = "mag-kernel",

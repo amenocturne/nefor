@@ -134,8 +134,8 @@ fn tool_result(id: &str, output: Value) -> Map<String, Value> {
 }
 
 /// One agent loop (`agent.llm → agent.run-tool → agent.tool-result →
-/// agent.loop-counter → agent.llm`) exiting to the program sink. BOTH runs
-/// execute exactly this — identical actor ids, identical routes.
+/// agent.llm`) exiting to the program sink. BOTH runs execute exactly this
+/// — identical actor ids, identical routes.
 fn agent_loop_modification() -> Value {
     json!({
         "actors": [
@@ -158,12 +158,6 @@ fn agent_loop_modification() -> Value {
                 "id": "agent.tool-result",
                 "factory": "tool-result",
                 "params": {},
-                "routes": { "generic-provider.ProviderOut": ["agent.loop-counter"] }
-            },
-            {
-                "id": "agent.loop-counter",
-                "factory": "loop-counter",
-                "params": { "max": 10 },
                 "routes": { "generic-provider.ProviderOut": ["agent.llm"] }
             },
             { "id": "sink", "factory": "sink", "params": {}, "routes": {} }
@@ -400,8 +394,8 @@ async fn two_overlapping_executes_of_the_same_program_settle_independently() {
             .unwrap_or_else(|| panic!("no events for {run}"));
         assert_eq!(
             events.iter().filter(|k| *k == "mag.actor_spawned").count(),
-            5,
-            "{run} spawned its own five actors; saw {events:?}"
+            4,
+            "{run} spawned its own four actors; saw {events:?}"
         );
         assert!(
             !events.iter().any(|k| k == "mag.actor_killed"),

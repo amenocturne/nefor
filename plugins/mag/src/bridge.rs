@@ -256,6 +256,13 @@ fn gate_invoke(gate: &str, body: &Map<String, Value>) -> Map<String, Value> {
     if let Some(id) = body.get("id").and_then(Value::as_str) {
         m.insert("id".into(), Value::String(id.to_owned()));
     }
+    // The emitting actor's plain address (routing.lua on_capability_invoke
+    // stamps `from` on the kernel's envelope): threaded through so bus
+    // observers can attribute the invoke to an actor without parsing the
+    // scoped correlation id.
+    if let Some(from) = body.get("from").and_then(Value::as_str) {
+        m.insert("from".into(), Value::String(from.to_owned()));
+    }
     // The tool name: routing.lua stamps the capability name on the envelope;
     // the wrapped request carries the same name (run-tool sets both).
     if let Some(name) = body

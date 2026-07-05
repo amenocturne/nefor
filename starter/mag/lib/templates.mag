@@ -6,78 +6,35 @@
 ;; disjoint id subtrees; load-time uniqueness validation rejects a shared `:id`.
 ;;
 ;; Require this module and call a template with a config map:
-;;   (let [tpl   (require "lib/templates")
-;;         retry ((get tpl "retry-bounded") {:id "fixer" :model "opus"
-;;                                           :provider "chatgpt-provider"
-;;                                           :max-steps 10})]
-;;     (graph entry -> retry  retry -> out  :terminal out))
+;;   (let [tpl  (require "lib/templates")
+;;         gate ((get tpl "gate") {:id "review" :model "opus"
+;;                                 :provider "chatgpt-provider"})]
+;;     (graph entry -> gate  gate -> out  :terminal out))
 ;;
 ;; `agent` is NOT here: its call carries a load-bearing polymorphic type
 ;; annotation (`: IN -> generic-provider.FinalAnswer` for any IN) that a plain
-;; MAG function cannot receive, so it stays a compiler builtin. gate and
-;; retry-bounded are monomorphic over concrete provider/control/human types and
-;; so express cleanly as library functions.
+;; MAG function cannot receive, so it stays a compiler builtin. gate is
+;; monomorphic over concrete provider/human types and so expresses cleanly as
+;; a library function.
 
 (type generic-provider.ProviderOut)
 (type generic-provider.FinalAnswer)
-(type generic-control.Fail)
-(type mag.LoopExhausted)
 (type human.Approved)
 (type human.Rejected)
 
-;; retry-bounded — produce / check / repair, bounded by a loop-counter.
-;;
-;; `produce` emits either a good answer or a *typed* computed failure
-;; (generic-control.Fail); the failure folds through a loop-counter into a
-;; `repair` step and back, exiting the cycle as mag.LoopExhausted once the bound
-;; is hit. Failure is a type, never parsed out of a success-shaped output
-;; (patterns.md, "Fire on failure / repair").
-;;
-;; Boundary: ProviderOut in; generic-provider.FinalAnswer out (the happy-path
-;; answer from `produce`, or the summarized best-effort from `exhaust`).
-(def retry-bounded (fn [cfg]
-  (let [model    (get cfg "model")
-        provider (get cfg "provider")
-        max      (or (get cfg "max-steps") 10)
-
-        produce (node "llm" {:model model :provider provider
-                             :system (or (get cfg "system")
-                                         "Produce a candidate answer.")}
-                  : generic-provider.ProviderOut
-                  -> (generic-provider.FinalAnswer | generic-control.Fail))
-
-        bound   (node "loop-counter" {:max max}
-                  : generic-control.Fail
-                  -> (generic-control.Fail | mag.LoopExhausted))
-
-        repair  (node "llm" {:model model :provider provider
-                             :system (or (get cfg "repair")
-                                         "The previous attempt failed. Repair it and try again.")}
-                  : generic-control.Fail -> generic-provider.ProviderOut)
-
-        exhaust (node "llm" {:model model :provider provider
-                             :system "Summarize the best result reached before the retry bound."}
-                  : mag.LoopExhausted -> generic-provider.FinalAnswer)]
-
-    (subgraph {:id (get cfg "id") :in produce :out [produce exhaust]}
-      produce -> bound
-      bound   -> repair
-      repair  -> produce
-      bound   -> exhaust))))
-
 ;; gate — produce a result, put it to a `human` approval gate, revise on
-;; rejection, bounded by a loop-counter.
+;; rejection.
 ;;
 ;; Approval and rejection are the human factory's typed outputs
-;; (human.Approved | human.Rejected); rejection folds through the loop-counter
-;; into a `revise` step and back to `produce`. The exit is human.Approved,
-;; either from a real approval or from `exhaust` once the revision bound is hit.
+;; (human.Approved | human.Rejected); rejection folds through a `revise` step
+;; and back to `produce`. The exit is human.Approved — the human is the loop's
+;; terminator, and a stuck revision cycle is stopped via the control plane's
+;; kill/interrupt like any other loop.
 ;;
 ;; Boundary: ProviderOut in; human.Approved out.
 (def gate (fn [cfg]
   (let [model    (get cfg "model")
         provider (get cfg "provider")
-        max      (or (get cfg "max-steps") 5)
 
         produce (node "llm" {:model model :provider provider
                              :system (or (get cfg "system")
@@ -88,21 +45,12 @@
                   : generic-provider.FinalAnswer
                   -> (human.Approved | human.Rejected))
 
-        bound   (node "loop-counter" {:max max}
-                  : human.Rejected -> (human.Rejected | mag.LoopExhausted))
-
         revise  (node "llm" {:model model :provider provider
                              :system (or (get cfg "revise")
                                          "Revise the result using the rejection feedback.")}
-                  : human.Rejected -> generic-provider.ProviderOut)
+                  : human.Rejected -> generic-provider.ProviderOut)]
 
-        exhaust (node "llm" {:model model :provider provider
-                             :system "Summarize the last revision after the approval bound."}
-                  : mag.LoopExhausted -> human.Approved)]
-
-    (subgraph {:id (get cfg "id") :in produce :out [approve exhaust]}
+    (subgraph {:id (get cfg "id") :in produce :out [approve]}
       produce -> approve
-      approve -> bound
-      bound   -> revise
-      revise  -> produce
-      bound   -> exhaust))))
+      approve -> revise
+      revise  -> produce))))

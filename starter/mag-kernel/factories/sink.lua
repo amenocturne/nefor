@@ -24,7 +24,7 @@
 --      plane can read the run result and mark the run done.
 --
 -- Input contract: `generic-provider.FinalAnswer` (single), matching the
--- fixture's `code-writer.llm -> sink` and `*.exhaust -> sink` edges. No signal
+-- fixture's `code-writer.llm -> sink` edge. No signal
 -- handlers: the sink persists synchronously on activation, holding no pending
 -- work to drain or abort.
 

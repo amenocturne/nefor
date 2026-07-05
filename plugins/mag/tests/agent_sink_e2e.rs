@@ -44,14 +44,12 @@ const PROGRAM: &str = r#"
 (type generic-provider.FinalAnswer)
 (type generic-tool.ToolCalls)
 (type generic-tool.ToolHandle)
-(type mag.LoopExhausted)
 
 (let [worker (agent {:id "worker"
                      :system "Answer the task."
                      :provider "test-provider"
                      :profile "standard"
-                     :tools ["fs/read"]
-                     :max-steps 50}
+                     :tools ["fs/read"]}
                : mag.Task -> generic-provider.FinalAnswer)
       out    (node "sink" {} : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]
   (graph worker -> out :terminal out))
@@ -125,6 +123,16 @@ fn chat_result(chat_id: &str, output: Value) -> Map<String, Value> {
         Value::String(format!("{PROVIDER}.chat.complete.result")),
     );
     m.insert("chat_id".into(), Value::String(chat_id.to_owned()));
+    m.insert("output".into(), output);
+    m
+}
+
+/// The gate's reply shape (plugins/tool-gate: broadcast `tool.result { id,
+/// output }` keyed by the caller's id).
+fn tool_result(id: &str, output: Value) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("kind".into(), Value::String("tool.result".into()));
+    m.insert("id".into(), Value::String(id.to_owned()));
     m.insert("output".into(), output);
     m
 }
@@ -208,7 +216,13 @@ async fn minimal_agent_sink_program_compiles_and_runs_kernel_path() {
         .iter()
         .filter_map(|a| a.get("id").and_then(Value::as_str))
         .collect();
-    for expected in ["worker.entry", "worker.llm", "worker.loop-counter", "sink"] {
+    for expected in [
+        "worker.entry",
+        "worker.llm",
+        "worker.run-tool",
+        "worker.tool-result",
+        "sink",
+    ] {
         assert!(
             actor_ids.contains(&expected),
             "the agent template lowers {expected}; saw {actor_ids:?}"
@@ -242,7 +256,7 @@ async fn minimal_agent_sink_program_compiles_and_runs_kernel_path() {
         .get("factories")
         .and_then(Value::as_array)
         .expect("mag.loaded carries the registry factories");
-    for f in ["llm", "sink", "adapter", "loop-counter"] {
+    for f in ["llm", "sink", "adapter", "run-tool", "tool-result"] {
         assert!(
             factories.iter().any(|v| v.as_str() == Some(f)),
             "registry advertises {f}"
@@ -360,16 +374,18 @@ async fn minimal_agent_sink_program_compiles_and_runs_kernel_path() {
     );
     // Lazy construction: every actor is spawned (registered) at apply, but
     // ready — "began work" — fires only for actors that actually activated.
-    // The bounded loop finished without exhausting, so the routed-but-never-
-    // activated exhaust summarizer is spawned yet NEVER ready.
-    assert!(
-        spawned_ids.iter().any(|id| id == "worker.exhaust"),
-        "the exhaust summarizer is spawned at apply; saw {spawned_ids:?}"
-    );
-    assert!(
-        !ready_ids.iter().any(|id| id == "worker.exhaust"),
-        "the exhaust summarizer never fired, so it never constructs/readies; saw {ready_ids:?}"
-    );
+    // The one-turn run never called a tool, so the routed-but-never-activated
+    // tool leg (run-tool, tool-result) is spawned yet NEVER ready.
+    for id in ["worker.run-tool", "worker.tool-result"] {
+        assert!(
+            spawned_ids.iter().any(|s| s == id),
+            "{id} is spawned at apply; saw {spawned_ids:?}"
+        );
+        assert!(
+            !ready_ids.iter().any(|r| r == id),
+            "{id} never fired, so it never constructs/readies; saw {ready_ids:?}"
+        );
+    }
     for id in ["worker.entry", "worker.llm", "sink"] {
         assert!(
             ready_ids.iter().any(|r| r == id),
@@ -387,6 +403,237 @@ async fn minimal_agent_sink_program_compiles_and_runs_kernel_path() {
     let sink_output = std::fs::read_to_string(sink_path).expect("read persisted sink output");
     assert!(
         sink_output.contains("session-final-answer"),
+        "the sink persisted the final answer; got {sink_output:?}"
+    );
+
+    write_env(
+        &mut stdin,
+        Envelope::system(
+            PluginName::engine(),
+            Timestamp::now(),
+            SystemBody::Shutdown {
+                reason: None,
+                grace_ms: None,
+            },
+        ),
+    )
+    .await;
+    drop(stdin);
+    let _ = timeout(Duration::from_secs(10), child.wait()).await;
+    std::fs::remove_dir_all(&data_dir).ok();
+}
+
+/// THE test the shipped hang proved missing: an agent-template program driven
+/// through SEVERAL tool rounds to its typed final answer. Each round the same
+/// `worker.llm` actor runs a fresh provider chat carrying the WHOLE transcript
+/// so far (seed task, prior tool outputs), the tool leg round-trips through
+/// the gate contract, and the loop terminates structurally — the FinalAnswer
+/// variant exits to the sink and the run completes. No bound, no counter:
+/// the typed exit is the terminator.
+#[tokio::test]
+async fn multi_round_agent_completes_via_typed_final_answer() {
+    let data_dir = std::env::temp_dir().join(format!("mag-agent-rounds-{}", std::process::id()));
+    std::fs::remove_dir_all(&data_dir).ok();
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+
+    let source_dir = data_dir.join("workspace");
+    std::fs::create_dir_all(&source_dir).expect("mkdir workspace");
+    std::fs::write(source_dir.join("task.mag"), PROGRAM).expect("write program");
+
+    let mut child = spawn_mag(&data_dir).await;
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let stderr = child.stderr.take().expect("stderr");
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            eprintln!("[mag stderr] {line}");
+        }
+    });
+
+    handshake(&mut reader, &mut stdin).await;
+
+    let mut load = Map::new();
+    load.insert("kind".into(), Value::String("mag.load".into()));
+    load.insert("id".into(), Value::String("load-agent-rounds".into()));
+    load.insert(
+        "source_dir".into(),
+        Value::String(source_dir.display().to_string()),
+    );
+    load.insert("entry".into(), Value::String("task.mag".into()));
+    send_event(&mut stdin, load).await;
+
+    loop {
+        let out = read_outgoing(&mut reader, "mag.loaded").await;
+        let body = match event_body(&out) {
+            Some(b) => b.clone(),
+            None => continue,
+        };
+        match body_kind(&body) {
+            Some("mag.loaded") => break,
+            Some("mag.error") => panic!("compile failed: {body:?}"),
+            _ => continue,
+        }
+    }
+
+    let mut execute = Map::new();
+    execute.insert("kind".into(), Value::String("mag.execute".into()));
+    execute.insert("id".into(), Value::String("exec-agent-rounds".into()));
+    execute.insert("session_id".into(), Value::String(SESSION_ID.into()));
+    execute.insert("run_id".into(), Value::String("agent-rounds-run".into()));
+    execute.insert("run_name".into(), Value::String("agent-rounds-run".into()));
+    execute.insert(
+        "params_overlay".into(),
+        json!({
+            "worker.llm": {
+                "model": "gpt-test",
+                "reasoning_effort": "medium",
+                "provider": PROVIDER
+            }
+        }),
+    );
+    send_event(&mut stdin, execute).await;
+
+    let create_kind = format!("{PROVIDER}.chat.create");
+    let append_kind = format!("{PROVIDER}.chat.append");
+    let complete_kind = format!("{PROVIDER}.chat.complete");
+    // The lead's default gate name (main.rs DEFAULT_GATE_TARGET): the spawn
+    // config passes no --tool-gate here.
+    let gate_invoke_kind = "tool-gate.tool.invoke".to_owned();
+
+    let mut turn = 0u32;
+    let mut tool_rounds = 0u32;
+    // Per-chat appended transcript, keyed by chat_id; the LAST chat must
+    // replay everything (transcript continuity across rounds).
+    let mut appends: std::collections::HashMap<String, Vec<Value>> =
+        std::collections::HashMap::new();
+    let mut last_chat_id = String::new();
+    let run_result;
+
+    loop {
+        let out = read_outgoing(&mut reader, "agent-rounds event").await;
+        let body = match event_body(&out) {
+            Some(b) => b.clone(),
+            None => continue,
+        };
+        let kind = match body_kind(&body) {
+            Some(k) => k.to_owned(),
+            None => continue,
+        };
+
+        if kind == create_kind {
+            let chat_id = body
+                .get("chat_id")
+                .and_then(Value::as_str)
+                .expect("create carries chat_id");
+            assert!(
+                chat_id.contains("worker.llm@r"),
+                "every round is the SAME llm actor on a fresh chat; got {chat_id}"
+            );
+        } else if kind == append_kind {
+            let chat_id = body
+                .get("chat_id")
+                .and_then(Value::as_str)
+                .expect("append carries chat_id")
+                .to_owned();
+            let message = body.get("message").cloned().unwrap_or(Value::Null);
+            appends.entry(chat_id).or_default().push(message);
+        } else if kind == complete_kind {
+            let chat_id = body
+                .get("chat_id")
+                .and_then(Value::as_str)
+                .expect("complete carries chat_id")
+                .to_owned();
+            last_chat_id = chat_id.clone();
+            turn += 1;
+            match turn {
+                // Rounds 1 and 2: the model asks for a tool.
+                1 | 2 => {
+                    send_event(
+                        &mut stdin,
+                        chat_result(
+                            &chat_id,
+                            json!({ "tool_calls": [
+                                { "id": format!("call-{turn}"), "name": "fs/read",
+                                  "args": { "path": format!("f{turn}.txt") } }
+                            ] }),
+                        ),
+                    )
+                    .await;
+                }
+                // Round 3: the typed final answer — the loop's terminator.
+                3 => {
+                    send_event(
+                        &mut stdin,
+                        chat_result(&chat_id, json!({ "text": "multi-round-final" })),
+                    )
+                    .await;
+                }
+                n => panic!("unexpected provider turn {n} (chat_id {chat_id})"),
+            }
+        } else if kind == gate_invoke_kind {
+            tool_rounds += 1;
+            let id = body
+                .get("id")
+                .and_then(Value::as_str)
+                .expect("gate invoke carries the kernel correlation id")
+                .to_owned();
+            // Observability stamp: the invoke names its emitting actor.
+            assert_eq!(
+                body.get("from").and_then(Value::as_str),
+                Some("worker.run-tool"),
+                "gate invoke carries the emitting actor id"
+            );
+            send_event(
+                &mut stdin,
+                tool_result(&id, json!(format!("tool-out-{tool_rounds}"))),
+            )
+            .await;
+        } else if kind == "tool.invoke" {
+            panic!("bare tool.invoke reached the wire — the tool leg must ride the gate contract");
+        } else if kind == "mag.run_result" {
+            run_result = body;
+            break;
+        }
+    }
+
+    assert_eq!(turn, 3, "three provider rounds: tool, tool, final");
+    assert_eq!(tool_rounds, 2, "two gated tool invocations round-tripped");
+    assert_eq!(
+        run_result.get("status").and_then(Value::as_str),
+        Some("completed"),
+        "the multi-round agent run completes via its typed final answer; got {run_result:?}"
+    );
+    assert_eq!(
+        run_result.get("in_reply_to").and_then(Value::as_str),
+        Some("exec-agent-rounds")
+    );
+
+    // Transcript continuity: the FINAL round's fresh chat replayed the whole
+    // conversation — the seeded task turn plus both tool-result turns.
+    let final_transcript = appends
+        .get(&last_chat_id)
+        .expect("the final round appended its transcript");
+    let flat = serde_json::to_string(final_transcript).expect("serialize transcript");
+    assert!(
+        flat.contains("<initial task text>"),
+        "the final round replays the seed task turn; got {flat}"
+    );
+    for out in ["tool-out-1", "tool-out-2"] {
+        assert!(
+            flat.contains(out),
+            "the final round replays the {out} tool turn; got {flat}"
+        );
+    }
+
+    let sink_path = run_result
+        .get("output_path")
+        .and_then(Value::as_str)
+        .expect("run_result carries the sink output PATH");
+    let sink_output = std::fs::read_to_string(sink_path).expect("read persisted sink output");
+    assert!(
+        sink_output.contains("multi-round-final"),
         "the sink persisted the final answer; got {sink_output:?}"
     );
 

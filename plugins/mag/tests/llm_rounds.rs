@@ -209,8 +209,8 @@ impl StrictChats {
     }
 }
 
-/// One agent loop (`llm → run-tool → tool-result → loop-counter → llm`)
-/// exiting to the program sink.
+/// One agent loop (`llm → run-tool → tool-result → llm`) exiting to the
+/// program sink.
 fn agent_loop_modification() -> Value {
     json!({
         "actors": [
@@ -233,12 +233,6 @@ fn agent_loop_modification() -> Value {
                 "id": "agent.tool-result",
                 "factory": "tool-result",
                 "params": {},
-                "routes": { "generic-provider.ProviderOut": ["agent.loop-counter"] }
-            },
-            {
-                "id": "agent.loop-counter",
-                "factory": "loop-counter",
-                "params": { "max": 10 },
                 "routes": { "generic-provider.ProviderOut": ["agent.llm"] }
             },
             { "id": "sink", "factory": "sink", "params": {}, "routes": {} }

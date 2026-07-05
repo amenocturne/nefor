@@ -4,7 +4,7 @@
 -- produces (see plugins/mag/docs/actor-model.md, Factories; docs/ir.md,
 -- Firing). Type tags are fully-qualified name strings exactly as the
 -- compiler's `qualify_type` emits them (`generic-provider.ProviderOut`,
--- `mag.LoopExhausted`). Composition type-checks against these declared
+-- `mag.Task`). Composition type-checks against these declared
 -- shapes; nothing sniffs a runtime value's shape.
 --
 -- The input shape is also a firing fact (docs/ir.md, Firing):

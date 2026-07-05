@@ -12,10 +12,10 @@ primitives — logic lives in MAG, reached through the evaluator.
 
 ```json
 {
-  "actors":   [ { "id": "...", "factory": "...", "params": { }, "routes": { } } ],
-  "messages": [ { "to": "...", "content": { } } ],
-  "kills":    [ "..." ],
-  "rules":    [ { "on": "...", "fn": "..." } ]
+  "actors": [{ "id": "...", "factory": "...", "params": {}, "routes": {} }],
+  "messages": [{ "to": "...", "content": {} }],
+  "kills": ["..."],
+  "rules": [{ "on": "...", "fn": "..." }]
 }
 ```
 
@@ -53,7 +53,7 @@ Each actor is treated as a function: the kernel fires its input message,
 the actor is a black box until it returns its output. The output routes
 along the compiled wiring, and if a rule is bound to the node, the rule's
 function computes the next modification. The runtime operates over nothing
-but modifications — running a workflow *is* this fold.
+but modifications — running a workflow _is_ this fold.
 
 ## Running a program — registration, then lazy firing
 
@@ -115,10 +115,10 @@ An actor activates when its declared input contract is satisfied. Firing is a
 type fact, symmetric to routing: output types decide where results go, input
 types decide when the actor runs.
 
-| Input contract | Fires |
-|---|---|
-| single type `A` | per message — every arriving `A` is one activation |
-| union `(A \| B)` | on any — whichever arrives first activates alone |
+| Input contract    | Fires                                                                            |
+| ----------------- | -------------------------------------------------------------------------------- |
+| single type `A`   | per message — every arriving `A` is one activation                               |
+| union `(A \| B)`  | on any — whichever arrives first activates alone                                 |
 | product `(A + B)` | on all — the kernel accumulates components and delivers one assembled activation |
 
 Data flow subsumes dependency: if `A -> B` carries data, B structurally cannot
@@ -150,7 +150,7 @@ is to encode the ordering. No second vocabulary exists.
   computes is returned like any value; a failure the actor suffers (provider
   error, kill mid-flight, budget exceeded) is kernel-synthesized, so failure
   routes work uniformly regardless of how the failure happened.
-- There is deliberately no "fire when X did *not* happen" — absence is
+- There is deliberately no "fire when X did _not_ happen" — absence is
   expressed as a timeout or a failure route, never a negative predicate.
 
 ## Application semantics
@@ -177,14 +177,24 @@ is to encode the ordering. No second vocabulary exists.
   likely an authoring bug (warning) — but semantics stay uniform: ignored.
 - **Every modification is validated before applying**, with the same
   validator that checked the program at load: contract compatibility, id
-  uniqueness *within* the modification (the same id spawned twice in one
+  uniqueness _within_ the modification (the same id spawned twice in one
   `actors` list is a program bug and rejects), and message targets that
-  exist or are created within the same modification. A rejected
-  modification is an error routed to the control plane; the run continues.
-  Race artifacts are never rejections: spawning an id that is already alive
-  is the logged no-op above, and a send to a dead id drops as a logged
-  no-op at apply (the sender computed it while the target lived). Only
-  never-existed targets reject — that is a typo, not a race.
+  exist or are created within the same modification. Contract compatibility
+  covers routes end to end: every route key must be a declared output of the
+  sender's factory (or a reserved kernel-synthesized status tag — `mag.Unit`
+  / `mag.Failed`), and every destination — spawned in the same modification
+  or already live in the inventory (the post-apply actor set) — must declare
+  an input port accepting the routed tag. A route no port accepts REJECTS
+  the modification with the precise wiring error; it can never reach
+  delivery and starve an actor. A rejected modification is an error routed
+  to the control plane; the run continues. Race artifacts are never
+  rejections: spawning an id that is already alive is the logged no-op
+  above, a send to a dead id drops as a logged no-op at apply, and a route
+  at a dead id passes validation (the sender computed it while the target
+  lived). Only never-existed targets — message or route — reject: that is a
+  typo, not a race. A DYNAMIC mismatch validation cannot see (a message
+  whose kind no port of a live target accepts) escalates at delivery as
+  `mag.run_failed` instead of silently dropping.
 - **The modification log is the run.** Graph state at any moment is a
   prefix of the fold; replay is deterministic even though arrival order was
   not. Debugging is diffing prefixes.

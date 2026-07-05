@@ -18,7 +18,7 @@
 //!
 //! The harness answers like the gate does — a broadcast `tool.result { id,
 //! output }` keyed by the same id — and the run must proceed through
-//! tool-result/loop-counter to a second provider turn and complete.
+//! tool-result to a second provider turn and complete.
 //!
 //! The gate name is spawn-config-threaded (`--tool-gate`), mirroring how the
 //! starter owns cross-plugin names; this test passes a NON-default name
@@ -149,8 +149,8 @@ async fn handshake<R: AsyncBufReadExt + Unpin>(reader: &mut R, stdin: &mut Child
     .await;
 }
 
-/// One agent loop (`llm → run-tool → tool-result → loop-counter → llm`) with
-/// per-node gating on the run-tool node, exiting to the program sink.
+/// One agent loop (`llm → run-tool → tool-result → llm`) with per-node
+/// gating on the run-tool node, exiting to the program sink.
 fn agent_loop_modification() -> Value {
     json!({
         "actors": [
@@ -176,12 +176,6 @@ fn agent_loop_modification() -> Value {
                 "id": "agent.tool-result",
                 "factory": "tool-result",
                 "params": {},
-                "routes": { "generic-provider.ProviderOut": ["agent.loop-counter"] }
-            },
-            {
-                "id": "agent.loop-counter",
-                "factory": "loop-counter",
-                "params": { "max": 10 },
                 "routes": { "generic-provider.ProviderOut": ["agent.llm"] }
             },
             { "id": "sink", "factory": "sink", "params": {}, "routes": {} }
@@ -299,6 +293,14 @@ async fn tool_call_round_trips_through_the_gate_and_the_run_completes() {
                 body.get("name").and_then(Value::as_str),
                 Some("list_dir"),
                 "gate invoke names the tool"
+            );
+            // Observability stamp: the emitting actor's plain address rides
+            // the gate envelope (routing.lua on_capability_invoke →
+            // bridge.rs gate_invoke).
+            assert_eq!(
+                body.get("from").and_then(Value::as_str),
+                Some("agent.run-tool"),
+                "gate invoke carries the emitting actor id"
             );
             assert_eq!(
                 body.get("args"),

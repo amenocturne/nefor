@@ -78,10 +78,10 @@ Agents are the compiler's `agent` template — there is no `"agent"` node factor
 
 Rules of the dialect:
 
-- `(agent {:id … :system … :provider … :profile … :tools […]} : IN -> generic-provider.FinalAnswer)` — the tool-use loop, unbounded by default (the agent runs until it emits a final answer). Author `:max-steps N` to budget a dispatched agent: it opts into a loop-counter whose exhaustion exits through a summarizer. `:id` namespaces its internal actors; `:system` carries the agent's instructions.
+- `(agent {:id … :system … :provider … :profile … :tools […]} : IN -> generic-provider.FinalAnswer)` — the tool-use loop. Loops are unbounded: the agent runs until it emits a final answer, and that typed final answer is the loop's terminator. A run that must stop early is stopped via interrupt/kill. `:id` namespaces its internal actors; `:system` carries the agent's instructions.
 - `:provider` is required — the llm actor fails to construct without it.
 - Compose agents like nodes: `(graph a -> b  b -> out :terminal out)`.
-- The workspace `lib/patterns.md` lists the canonical shapes (joins, retries, gates); `lib/templates.mag` has `retry-bounded` and `gate`.
+- The workspace `lib/patterns.md` lists the canonical shapes (joins, retries, gates); `lib/templates.mag` has `gate`.
 
 Agent and LLM actors must choose either `:profile` or raw reasoning settings. Prefer profiles:
 

@@ -187,12 +187,25 @@ end
 --      output.tool_calls" mode is gone; compatibility is a type fact over
 --      declared shapes). The check stays strict for every other key.
 --
--- Destination input compatibility only checks destinations that are actors in
--- the same modification (an id -> factory map built from `actors`); a
--- destination already live in the inventory is the kernel fold's concern.
+-- Destination resolution: an id spawned in the same modification resolves
+-- through `actors`; anything else resolves through the optional `resolve`
+-- callback — `fn(id) -> factory, state` for an id the caller (the kernel
+-- fold) already knows, nil for a never-existed id. With a resolver:
+--
+--   * a live destination's declared inputs must accept the tag (mismatch ->
+--     rejection — this is the apply-time seat belt that makes the shipped
+--     "warn-dropped exhaust route" bug class unrepresentable);
+--   * a dead destination is skipped — routes computed while the target lived
+--     are race artifacts, and the delivery layer drops those sends as logged
+--     no-ops (settled race semantics, docs/ir.md);
+--   * a never-existed destination rejects — mirroring message-target
+--     validation ("only never-existed targets reject — that is a typo").
+--
+-- Without a resolver (direct registry use in tests), destinations outside the
+-- modification are skipped, as before.
 --
 -- Returns { ok = true } or { ok = false, errors = { <msg>, ... } }.
-function registry:validate_modification(modification)
+function registry:validate_modification(modification, resolve)
   local errors = {}
   local actors = (modification and modification.actors) or {}
 
@@ -202,6 +215,30 @@ function registry:validate_modification(modification)
     if type(spec.id) == "string" then
       factory_of[spec.id] = spec.factory
     end
+  end
+
+  -- Resolve a route destination to a factory name (or nil + skip/error).
+  -- Same-modification spawns win; then the caller's inventory via `resolve`.
+  local function dest_factory_of(spec, tag, dest_id)
+    local dest_factory = factory_of[dest_id]
+    if dest_factory then
+      return dest_factory
+    end
+    if not resolve then
+      return nil -- no resolver: outside-the-modification dests are skipped
+    end
+    local factory, state = resolve(dest_id)
+    if factory == nil then
+      table.insert(errors, string.format(
+        "actor %q: route %q destination %q does not exist "
+        .. "(not in the inventory, not spawned in this modification)",
+        tostring(spec.id), tag, tostring(dest_id)))
+      return nil
+    end
+    if state == "dead" then
+      return nil -- race artifact; delivery drops these as logged no-ops
+    end
+    return factory
   end
 
   for _, spec in ipairs(actors) do
@@ -222,7 +259,7 @@ function registry:validate_modification(modification)
             tostring(spec.id), tostring(tag), spec.factory))
         else
           for _, dest_id in ipairs(dests) do
-            local dest_factory = factory_of[dest_id]
+            local dest_factory = dest_factory_of(spec, tag, dest_id)
             if dest_factory then
               local dest_decl = self:declaration(dest_factory)
               if not dest_decl then

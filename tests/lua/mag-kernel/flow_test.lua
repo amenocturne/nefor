@@ -1,5 +1,5 @@
 -- tests/lua/mag-kernel/flow_test.lua — factory-level unit tests for the
--- flow-control primitives: loop-counter, sink, human.
+-- flow-control primitives: sink, human.
 --
 -- Driven from `engine/tests/starter_mag_kernel_test.rs` (same harness as
 -- factory_test.lua): a bare Lua VM with a stub `nefor.log` and package.path
@@ -9,10 +9,9 @@
 -- activation messages, assert what it emits. No routing, no fold, no cycle
 -- execution (a sibling owns routing; full-cycle e2e comes later).
 
-local Registry     = require("registry")
-local loop_counter = require("factories.loop-counter")
-local sink         = require("factories.sink")
-local human        = require("factories.human")
+local Registry = require("registry")
+local sink     = require("factories.sink")
+local human    = require("factories.human")
 
 -- ------------------------------------------------------------------
 -- helpers
@@ -59,21 +58,16 @@ local function single(from, tag, message)
 end
 
 -- ==================================================================
--- all three factories declare well-formed contracts and register
+-- both factories declare well-formed contracts and register
 -- ==================================================================
 
 do
   local reg = Registry.new()
-  for _, mod in ipairs({ loop_counter, sink, human }) do
+  for _, mod in ipairs({ sink, human }) do
     local decl, err = reg:register({ declaration = mod.declaration, construct = mod.construct })
     assert_true(decl ~= nil and err == nil,
       "factory " .. tostring(mod.declaration.name) .. " registers cleanly: " .. tostring(err))
   end
-
-  -- loop-counter's union output is a declared typed exit.
-  local lc = reg:declaration("loop-counter")
-  assert_eq(lc.outputs[1], "generic-provider.ProviderOut", "loop-counter output 1")
-  assert_eq(lc.outputs[2], "mag.LoopExhausted", "loop-counter output 2")
 
   -- sink is terminal: no outputs.
   assert_eq(#reg:declaration("sink").outputs, 0, "sink declares no outputs (terminal)")
@@ -83,79 +77,6 @@ do
   assert_eq(hd.outputs[1], "human.Approved", "human output 1")
   assert_eq(hd.outputs[2], "human.Rejected", "human output 2")
   assert_eq(hd.signals[1], "drain", "human declares the drain signal")
-end
-
--- ==================================================================
--- loop-counter: ready on construct, signs with id
--- ==================================================================
-
-do
-  local msgs, emit = capture()
-  local inst = loop_counter.construct("docs-explorer.loop-counter", { max = 3 }, emit)
-  assert_true(inst ~= nil, "loop-counter constructs")
-  local ready = find_kind(msgs, "mag.ready")
-  assert_true(ready ~= nil, "loop-counter emits ready")
-  assert_eq(ready.from, "docs-explorer.loop-counter", "ready is id-signed")
-end
-
--- ==================================================================
--- loop-counter: below max passes through, at exhaustion diverts
--- (boundary: max pass-throughs permitted, then LoopExhausted)
--- ==================================================================
-
-do
-  local msgs, emit = capture()
-  local inst = loop_counter.construct("lc", { max = 2 }, emit)
-
-  -- activation 1 (count 1 <= 2): pass-through ProviderOut
-  local c1 = inst.deliver(single("up", "generic-provider.ProviderOut", { payload = "a" }))
-  assert_eq(c1.status, "ok", "synchronous pass-through returns a successful completion")
-  -- activation 2 (count 2 <= 2): pass-through ProviderOut
-  inst.deliver(single("up", "generic-provider.ProviderOut", { payload = "b" }))
-  -- activation 3 (count 3 > 2): exhausted → LoopExhausted
-  inst.deliver(single("up", "generic-provider.ProviderOut", { payload = "c" }))
-
-  assert_eq(count_kind(msgs, "generic-provider.ProviderOut"), 2,
-    "two pass-throughs below the bound")
-  assert_eq(count_kind(msgs, "mag.LoopExhausted"), 1,
-    "exactly one exhaustion at the bound")
-
-  -- pass-throughs preserve payload, re-signed with the instance id
-  local first = nil
-  for _, m in ipairs(msgs) do
-    if m.kind == "generic-provider.ProviderOut" then first = m; break end
-  end
-  assert_eq(first.payload, "a", "pass-through preserves the input payload")
-  assert_eq(first.from, "lc", "pass-through is re-signed with the instance id")
-
-  -- LoopExhausted carries summarizer context: the last input, the bound, count
-  local exhausted = find_kind(msgs, "mag.LoopExhausted")
-  assert_eq(exhausted.from, "lc", "exhaustion is id-signed")
-  assert_eq(exhausted.max, 2, "exhaustion reports the bound")
-  assert_eq(exhausted.count, 3, "exhaustion reports the crossing count")
-  assert_eq(exhausted.last.payload, "c", "exhaustion carries the last input for the summarizer")
-end
-
--- ==================================================================
--- loop-counter: two instances count independently (per-instance state)
--- ==================================================================
-
-do
-  local a_msgs, a_emit = capture()
-  local b_msgs, b_emit = capture()
-  local a = loop_counter.construct("docs-explorer.loop-counter", { max = 1 }, a_emit)
-  local b = loop_counter.construct("code-writer.loop-counter", { max = 5 }, b_emit)
-
-  -- Drive A twice: max=1 → first passes, second exhausts.
-  a.deliver(single("up", "generic-provider.ProviderOut", { payload = "a1" }))
-  a.deliver(single("up", "generic-provider.ProviderOut", { payload = "a2" }))
-  -- Drive B twice: max=5 → both pass, B is nowhere near its own bound.
-  b.deliver(single("up", "generic-provider.ProviderOut", { payload = "b1" }))
-  b.deliver(single("up", "generic-provider.ProviderOut", { payload = "b2" }))
-
-  assert_eq(count_kind(a_msgs, "mag.LoopExhausted"), 1, "instance A exhausts at its own max=1")
-  assert_eq(count_kind(b_msgs, "mag.LoopExhausted"), 0, "instance B unaffected by A's counter")
-  assert_eq(count_kind(b_msgs, "generic-provider.ProviderOut"), 2, "instance B passes both through")
 end
 
 -- ==================================================================

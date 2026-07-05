@@ -14,7 +14,7 @@
 --       instance ever exists (no courtesy kill delivery), later sends drop,
 --       respawn stays a monotone no-op;
 --   (d) a completed run where a routed-but-never-activated actor NEVER
---       constructs (the exhaust-on-an-early-finishing-loop shape).
+--       constructs (the tool-leg-of-a-toolless-run shape).
 
 local inventory = require("inventory")
 local Registry = require("registry")
@@ -283,7 +283,7 @@ do
 end
 
 -- ==================================================================
--- (d) a completed run: the routed-but-never-activated actor (exhaust on a
+-- (d) a completed run: the routed-but-never-activated actor (a fallback on a
 -- loop that finished early) NEVER constructs
 -- ==================================================================
 

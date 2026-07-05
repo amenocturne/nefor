@@ -1241,18 +1241,19 @@ fn provider_out() -> MagType {
     MagType::Named("generic-provider.ProviderOut".into())
 }
 
-/// `(agent {:id … :model … :system … :tools […] :max-steps N?} : IN -> OUT)`
+/// The agent template's accepted config keys. The config map is a closed
+/// interface (unlike `node` params, which pass through opaquely to a
+/// factory), so an unknown key is an authoring error, rejected generically.
+const AGENT_CONFIG_KEYS: [&str; 6] = ["id", "model", "profile", "provider", "system", "tools"];
+
+/// `(agent {:id … :model … :system … :tools […]} : IN -> OUT)`
 ///
 /// A stdlib template: composes the primitive agentic-loop actors (entry
 /// adapter, llm call, run-tool, tool-result) into one cyclic constellation,
-/// namespaced under `:id`. The loop's natural terminator is structural: the
-/// llm's output is the union `ToolCalls | OUT`, so a final answer exits
-/// through the output port.
-///
-/// The loop bound is opt-in. Without `:max-steps` the expansion is the bare
-/// cycle with a single output port on `llm`. Authoring `:max-steps N` adds a
-/// `loop-counter` (max N) on the tool-result → llm back-edge plus an
-/// `exhaust` summarizer llm, giving a second output port on `exhaust`.
+/// namespaced under `:id`. The loop's terminator is structural: the llm's
+/// output is the union `ToolCalls | OUT`, so a final answer exits through
+/// the single output port on `llm`. Loops are unbounded — stopping a
+/// runaway run is the control plane's kill/interrupt, not a compiled bound.
 fn eval_agent(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
     let colon_pos = args
         .iter()
@@ -1279,6 +1280,19 @@ fn eval_agent(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
         }
     };
     let (input_type, output_type) = parse_type_annotation(type_args)?;
+
+    for key in config.keys() {
+        if !AGENT_CONFIG_KEYS.contains(&key.as_str()) {
+            return Err(MagError::Eval(format!(
+                "agent config: unknown key :{key} (accepted: {})",
+                AGENT_CONFIG_KEYS
+                    .iter()
+                    .map(|k| format!(":{k}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )));
+        }
+    }
 
     let id = match config.get("id") {
         Some(Value::Str(s)) => s.clone(),
@@ -1342,8 +1356,8 @@ fn eval_agent(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
         output_type: provider_out(),
     };
 
-    let mut nodes = vec![entry, llm, run_tool, tool_result];
-    let mut edges = vec![
+    let nodes = vec![entry, llm, run_tool, tool_result];
+    let edges = vec![
         EdgeValue {
             from: "entry".into(),
             to: "llm".into(),
@@ -1356,71 +1370,15 @@ fn eval_agent(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
             from: "run-tool".into(),
             to: "tool-result".into(),
         },
+        EdgeValue {
+            from: "tool-result".into(),
+            to: "llm".into(),
+        },
     ];
-    let mut outputs = vec![Port {
+    let outputs = vec![Port {
         actor: "llm".into(),
-        ty: output_type.clone(),
+        ty: output_type,
     }];
-
-    match config.get("max-steps") {
-        Some(max_steps) => {
-            // exhaust: a summarizing llm that leaves the bounded loop.
-            let mut exhaust_args: BTreeMap<String, Value> = BTreeMap::new();
-            if let Some(model) = config.get("model") {
-                exhaust_args.insert("model".into(), model.clone());
-            }
-            exhaust_args.insert(
-                "system".into(),
-                Value::Str("Summarize what you found so far.".into()),
-            );
-            if let Some(provider) = config.get("provider") {
-                exhaust_args.insert("provider".into(), provider.clone());
-            }
-            if let Some(profile) = config.get("profile") {
-                exhaust_args.insert("profile".into(), profile.clone());
-            }
-
-            nodes.push(NodeValue {
-                id: "loop-counter".into(),
-                node_type: "loop-counter".into(),
-                args: BTreeMap::from([("max".into(), max_steps.clone())]),
-                input_type: provider_out(),
-                output_type: MagType::Union(vec![
-                    provider_out(),
-                    MagType::Named("mag.LoopExhausted".into()),
-                ]),
-            });
-            nodes.push(NodeValue {
-                id: "exhaust".into(),
-                node_type: "llm".into(),
-                args: exhaust_args,
-                input_type: MagType::Named("mag.LoopExhausted".into()),
-                output_type: output_type.clone(),
-            });
-            edges.push(EdgeValue {
-                from: "tool-result".into(),
-                to: "loop-counter".into(),
-            });
-            edges.push(EdgeValue {
-                from: "loop-counter".into(),
-                to: "llm".into(),
-            });
-            edges.push(EdgeValue {
-                from: "loop-counter".into(),
-                to: "exhaust".into(),
-            });
-            outputs.push(Port {
-                actor: "exhaust".into(),
-                ty: output_type,
-            });
-        }
-        None => {
-            edges.push(EdgeValue {
-                from: "tool-result".into(),
-                to: "llm".into(),
-            });
-        }
-    }
 
     let mut sub = SubgraphValue {
         nodes,

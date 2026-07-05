@@ -1298,9 +1298,10 @@ local function lead_workflow_tool_schemas()
         "-> generic-provider.FinalAnswer)]\n" ..
         "  (graph worker -> out :terminal out))\n\n" ..
         ":provider is required — the llm actor fails to construct without " ..
-        "it. Agent loops are unbounded by default — the agent runs until it " ..
-        "emits a final answer. Author :max-steps N in the agent config to " ..
-        "budget a dispatched agent's loop. Every program ends in exactly " ..
+        "it. Agent loops are unbounded — the agent runs until it emits a " ..
+        "final answer, and that typed final answer is the loop's " ..
+        "terminator; stop a run early via interrupt/kill. " ..
+        "Every program ends in exactly " ..
         "one sink bound via :terminal. See lib/patterns.md and " ..
         "lib/templates.mag in the workspace for composition patterns.",
       parameters  = {

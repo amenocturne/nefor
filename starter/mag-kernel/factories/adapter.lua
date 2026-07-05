@@ -20,7 +20,7 @@
 -- activation content the loader seeds a source agent with (crates/nefor-mag
 -- ir.rs initial_activation_content -> `{ kind = "task", prompt = ... }`), and
 -- `generic-provider.FinalAnswer` is what an upstream agent routes in
--- (docs-explorer.{llm,exhaust} -> code-writer.entry). Firing "on any" (shape.lua)
+-- (docs-explorer.llm -> code-writer.entry). Firing "on any" (shape.lua)
 -- means whichever arrives activates alone — no waiting, no accumulation.
 --
 -- ── the boundary mapping (flagged) ──────────────────────────────────────────

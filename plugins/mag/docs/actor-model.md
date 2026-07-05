@@ -130,7 +130,7 @@ convention:
 
 An actor whose input contract is never satisfied never constructs: no side
 effects, no timers, no provider handles — a routed-but-never-activated actor
-(an exhaust branch on a loop that finishes early) costs nothing and never
+(the tool leg of an agent that never calls a tool) costs nothing and never
 readies. Externally the lifecycle is unchanged and monotone (never-existed →
 alive → dead): a registered-but-unconstructed actor counts as alive —
 duplicate spawns no-op, sends to it are accepted.
@@ -207,7 +207,6 @@ reads exactly this — no alias fallbacks, no shape sniffing.
 | `generic-tool.ToolCalls`       | llm → run-tool                | `calls = { { id, name, args }, … }`                                                                     |
 | `generic-tool.ToolHandle`      | run-tool → tool-result        | `results = { { id, name, output, error }, … }` (index-ordered to the calls)                             |
 | `generic-provider.FinalAnswer` | llm → sink / human            | `result` (raw provider result); `text?`, `final_answer?` (lifted when result is a table)                |
-| `mag.LoopExhausted`            | loop-counter → exhaust        | `reason`, `count`, `max?`, `last` (the most recent ProviderOut)                                         |
 | `mag.ApprovalRequest`          | human → control plane         | `correlation = <id>`, `prompt?`, `subject` (the input message)                                          |
 | `mag.ApprovalReply`            | control plane → human         | delivered as a graph activation tagged `mag.ApprovalReply`, `message = { approved, content?, reason? }` |
 | `mag.ApprovalCancel`           | human (drain) → control plane | `correlation = <id>`                                                                                    |

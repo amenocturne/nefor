@@ -1,6 +1,7 @@
 ;; The agentic loop — agent as a composition of primitives
-;; This is what stdlib's (agent) would expand to with :max-steps authored;
-;; without it, drop bound/exhaust and route result straight back to call
+;; This is what stdlib's (agent) expands to. The loop is unbounded: the
+;; FinalAnswer variant is its typed terminator, and a runaway run is stopped
+;; via the control plane's kill/interrupt.
 ;;
 ;; The types form a clean cycle:
 ;;   generic-provider.ProviderOut -> (generic-tool.ToolCalls | generic-provider.FinalAnswer)
@@ -11,7 +12,6 @@
 (type generic-tool.ToolCalls)
 (type ToolHandle)
 (type generic-provider.FinalAnswer)
-(type LoopExhausted)
 
 (let [call     (node "llm" {:model "opus"
                             :system "You are a helpful coding assistant."
@@ -24,13 +24,6 @@
       result   (node "tool-result" {}
                  : ToolHandle -> generic-provider.ProviderOut)
 
-      bound    (node "loop-counter" {:max 50}
-                 : generic-provider.ProviderOut -> (generic-provider.ProviderOut | LoopExhausted))
-
-      exhaust  (node "llm" {:model "opus"
-                            :system "Summarize what you accomplished so far."}
-                 : LoopExhausted -> generic-provider.FinalAnswer)
-
       output   (node "sink" {}
                  : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]
 
@@ -38,8 +31,5 @@
     call     -> dispatch
     call     -> output
     dispatch -> result
-    result   -> bound
-    bound    -> call
-    bound    -> exhaust
-    exhaust  -> output
+    result   -> call
     :terminal output))

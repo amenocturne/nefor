@@ -1,5 +1,7 @@
 ;; Feature implementation workflow
-;; Parallel exploration → summarize → build → compile with retry → review
+;; Parallel exploration → summarize → build → compile with repair → review
+;; The compile/fix cycle is unbounded — a stuck repair loop is stopped via
+;; the control plane's kill/interrupt, like any other loop.
 ;; NOTE: shell fanout types (BuildResult | BuildError) require a custom combinator not yet registered.
 
 (type Task)
@@ -8,7 +10,6 @@
 (type Patch)
 (type BuildResult)
 (type BuildError)
-(type LoopExhausted)
 (type Review)
 
 (let [exp1       (node "agent" {:prompt "explore API endpoints"
@@ -32,9 +33,6 @@
       compile    (node "shell" {:cmd "just build"}
                    : Patch -> (BuildResult | BuildError))
 
-      counter    (node "loop-counter" {:max 3}
-                   : BuildError -> (BuildError | LoopExhausted))
-
       fix        (node "agent" {:prompt "fix build errors"
                                 :model "sonnet"
                                 :tools ["fs/read" "fs/edit" "shell"]}
@@ -45,9 +43,6 @@
                                 :tools ["fs/read" "grep"]}
                    : BuildResult -> Review)
 
-      escalate   (node "llm" {:prompt "build failed after 3 attempts, summarize"}
-                   : LoopExhausted -> Review)
-
       out        (node "sink" {} : Review -> Review)]
 
   (graph
@@ -56,10 +51,7 @@
     summarize -> build
     build     -> compile
     compile   -> review
-    compile   -> counter
-    counter   -> fix
-    counter   -> escalate
+    compile   -> fix
     fix       -> compile
     review    -> out
-    escalate  -> out
     :terminal out))

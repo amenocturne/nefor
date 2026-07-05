@@ -117,6 +117,28 @@ local function validate_actor_shape(actor, idx)
   return nil
 end
 
+-- Route/port contract validation via the injected registry (nil when no
+-- registry is wired — the bare-VM fold path). Destinations resolve against
+-- the POST-APPLY actor set: ids spawned in this modification (the registry
+-- resolves those from `mod.actors` itself) plus the live inventory (the
+-- resolver below). Returns nil on success or the joined error string.
+local function validate_routes(self, mod)
+  if not self.registry then
+    return nil
+  end
+  local result = self.registry:validate_modification(mod, function(dest_id)
+    local entry = self.actors[dest_id]
+    if not entry then
+      return nil
+    end
+    return entry.factory, entry.state
+  end)
+  if result.ok then
+    return nil
+  end
+  return table.concat(result.errors, "; ")
+end
+
 -- Validate the whole modification against `self` (live inventory). On the
 -- first problem returns nil + an error string; otherwise returns the set of
 -- ids spawned by this modification (so message-target checks can treat
@@ -189,6 +211,20 @@ local function validate(self, mod)
     if entry == nil and not spawned[msg.to] then
       return nil, string.format("unknown message target '%s'", msg.to)
     end
+  end
+
+  -- routes: contract validation against the injected registry (when wired —
+  -- init.lua passes it; bare-VM fold tests run without one). Every spawned
+  -- actor's route keys must be declared outputs (or the reserved
+  -- kernel-synthesized status tags), and every destination — spawned in this
+  -- modification OR already in the inventory — must declare an input port
+  -- accepting the routed tag. A violation REJECTS the modification with the
+  -- registry's precise wiring error, so a route no port accepts can never
+  -- reach the delivery layer's drop path (registry.lua,
+  -- validate_modification).
+  local err = validate_routes(self, mod)
+  if err then
+    return nil, err
   end
 
   return spawned, nil
@@ -403,6 +439,10 @@ function M.new(opts)
     -- Spawn notification hook (set_on_spawn); the observer emits
     -- mag.actor_spawned through it at registration time.
     on_spawn = opts.on_spawn or noop,
+    -- Optional factory registry (registry.lua). When present, validate checks
+    -- every modification's routes against factory-declared contracts
+    -- (validate_routes); absent (bare-VM fold tests), the check is skipped.
+    registry = opts.registry,
   }
   self.apply = function(mod)
     return M.apply(self, mod)

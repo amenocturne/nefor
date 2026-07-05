@@ -13,7 +13,7 @@ MAG uses a Lisp-like syntax where code is data. Core constructs:
 - `def`, `fn`, `let`, `if` — standard binding and control flow
 - `->` — threading macro
 - `node` — declare a typed graph node with a kernel factory, params, and type annotation
-- `agent` — the tool-use loop template (`(agent {:id … :system … :provider …} : IN -> OUT)`); unbounded by default, `:max-steps N` opts into a loop-counter + exhaust summarizer; there is no "agent" node factory
+- `agent` — the tool-use loop template (`(agent {:id … :system … :provider …} : IN -> OUT)`); the loop is unbounded — the typed final answer is its terminator, and runs are stopped via kill/interrupt; there is no "agent" node factory
 - `graph` — compose nodes with directed edges
 - `type` — forward-declare a type name
 - `require` — load modules from the library path

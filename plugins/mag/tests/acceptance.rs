@@ -14,7 +14,7 @@
 //! wall-clock synchronization — every step is driven off an observed event.
 //!
 //! The graph: TWO agents (`a1.*`, `a2.*`) composed in one modification, each a
-//! full provider loop (`llm → run-tool → tool-result → loop-counter → llm`),
+//! full provider loop (`llm → run-tool → tool-result → llm`),
 //! sharing one program `sink`. Each agent is seeded with a
 //! `generic-provider.ProviderOut`, so both fire their `llm` turn straight off
 //! the initial messages with no `adapter` factory needed (the shipped kernel registers
@@ -132,9 +132,9 @@ fn body_kind(body: &Map<String, Value>) -> Option<&str> {
 }
 
 /// Build the two-agent modification. Each agent `aN` is a full provider loop:
-/// `aN.llm → aN.run-tool → aN.tool-result → aN.loop-counter → aN.llm`, exiting
-/// to the shared `sink` on `generic-provider.FinalAnswer`. Both `llm`s are
-/// seeded with a `generic-provider.ProviderOut` so they fire off the initial messages.
+/// `aN.llm → aN.run-tool → aN.tool-result → aN.llm`, exiting to the shared
+/// `sink` on `generic-provider.FinalAnswer`. Both `llm`s are seeded with a
+/// `generic-provider.ProviderOut` so they fire off the initial messages.
 fn two_agent_modification() -> Value {
     fn agent(prefix: &str) -> Vec<Value> {
         vec![
@@ -157,12 +157,6 @@ fn two_agent_modification() -> Value {
                 "id": format!("{prefix}.tool-result"),
                 "factory": "tool-result",
                 "params": {},
-                "routes": { "generic-provider.ProviderOut": [format!("{prefix}.loop-counter")] }
-            }),
-            json!({
-                "id": format!("{prefix}.loop-counter"),
-                "factory": "loop-counter",
-                "params": { "max": 10 },
                 "routes": { "generic-provider.ProviderOut": [format!("{prefix}.llm")] }
             }),
         ]
@@ -401,7 +395,7 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
                                 json!({
                                     "actors": [],
                                     "messages": [],
-                                    "kills": ["a2.llm", "a2.run-tool", "a2.tool-result", "a2.loop-counter"],
+                                    "kills": ["a2.llm", "a2.run-tool", "a2.tool-result"],
                                     "rules": []
                                 }),
                             );
@@ -466,8 +460,8 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
 
     // ── SIX STEPS #3: the survivor's every node output persisted, typed per
     //    the declared contracts (llm ToolCalls/FinalAnswer, run-tool ToolHandle,
-    //    tool-result ProviderOut, loop-counter ProviderOut). ─────────────────
-    for node in ["a1.llm", "a1.run-tool", "a1.tool-result", "a1.loop-counter"] {
+    //    tool-result ProviderOut). ─────────────────────────────────────────────
+    for node in ["a1.llm", "a1.run-tool", "a1.tool-result"] {
         assert!(
             node_output(node).exists(),
             "per-node output persisted for {node} at {:?}",
@@ -493,7 +487,7 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
         a2_void_sent,
         "a2's late provider reply was delivered to be voided"
     );
-    for node in ["a2.llm", "a2.run-tool", "a2.tool-result", "a2.loop-counter"] {
+    for node in ["a2.llm", "a2.run-tool", "a2.tool-result"] {
         assert!(
             !node_output(node).exists(),
             "killed agent produced no output — {node} is voided"

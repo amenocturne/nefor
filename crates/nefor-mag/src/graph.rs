@@ -401,9 +401,9 @@ mod tests {
 
     #[test]
     fn bare_cycle_is_accepted() {
-        // a -> b -> a (cycle, no loop-counter). The bound is opt-in; a bare
-        // cycle is a legal shape — the exit is a typed output port, and
-        // runaway protection is the observer's concern.
+        // a -> b -> a. A cycle is a legal shape as-is — the exit is a typed
+        // output port, and stopping a runaway run is the control plane's
+        // kill/interrupt, not a compiled bound.
         let graph = GraphValue {
             nodes: vec![
                 make_node("a", "llm", MagType::named("A"), MagType::named("B")),
@@ -416,25 +416,20 @@ mod tests {
     }
 
     #[test]
-    fn bounded_loop_with_counter() {
-        // a -> b -> counter -> a, terminal counter
+    fn longer_cycle_is_accepted() {
+        // a -> b -> c -> a, terminal c.
         let graph = GraphValue {
             nodes: vec![
                 make_node("a", "llm", MagType::named("A"), MagType::named("B")),
                 make_node("b", "check", MagType::named("B"), MagType::named("C")),
-                make_node(
-                    "counter",
-                    "loop-counter",
-                    MagType::named("C"),
-                    MagType::named("A"),
-                ),
+                make_node("c", "route", MagType::named("C"), MagType::named("A")),
             ],
             edges: vec![
                 make_edge("a", "b"),
-                make_edge("b", "counter"),
-                make_edge("counter", "a"),
+                make_edge("b", "c"),
+                make_edge("c", "a"),
             ],
-            terminal: "counter".into(),
+            terminal: "c".into(),
         };
         assert!(validate(&graph).is_ok());
     }

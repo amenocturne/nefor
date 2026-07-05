@@ -105,7 +105,7 @@ local WRITER_MAG = [[
 -- ModificationIr {actors, messages, kills, rules} the loader lowers to.
 -- The agent template namespaces its internals under :id (worker.llm etc.);
 -- these are trimmed to the actors the validators care about.
-local KERNEL_FACTORIES = { "adapter", "llm", "loop-counter", "run-tool", "sink", "stub", "tool-result" }
+local KERNEL_FACTORIES = { "adapter", "llm", "run-tool", "sink", "stub", "tool-result" }
 
 local function read_only_modification()
   return {

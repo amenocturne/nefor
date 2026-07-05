@@ -10,7 +10,7 @@
 --
 -- Contract (reconciled against tests/fixtures/two-agents.modification.json —
 -- `run-tool` routes `generic-tool.ToolHandle` here, and this node routes
--- `generic-provider.ProviderOut` onward to the loop-counter; flagged):
+-- `generic-provider.ProviderOut` onward, back into the llm; flagged):
 --   input   generic-tool.ToolHandle       (single; fires per handle)
 --   output  generic-provider.ProviderOut  (the next provider turn's input)
 --

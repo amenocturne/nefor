@@ -48,13 +48,11 @@ no-ops. No coordination logic anywhere in the actors.
 
 ## Cycle (the agentic loop)
 
-Cycles are legal as-is. Every cycle exits through a typed variant — the llm's
-union output routes `FinalAnswer` out of the loop — so no bound is required or
-injected. To budget a loop, opt in: thread a `loop-counter` actor into the
-cycle (the agent template does this when `:max-steps` is authored). Its
-exhaustion exit is a typed variant (`mag.LoopExhausted`), routed like any
-type, usually to a summarizer that turns partial work into a `FinalAnswer`.
-Never encode "give up after N tries" in a prompt.
+Cycles are legal as-is and unbounded. Every cycle exits through a typed
+variant — the llm's union output routes `FinalAnswer` out of the loop — so
+the typed exit is the terminator. There is no loop-budget mechanism: a run
+that never reaches its exit is stopped via the control plane's
+kill/interrupt. Never encode "give up after N tries" in a prompt.
 
 ## Fire on failure / repair
 
@@ -63,7 +61,7 @@ Never encode "give up after N tries" in a prompt.
 **Shape:** failures are typed outputs — computed failures returned by the
 factory, suffered failures (provider error, kill, budget) synthesized by the
 kernel. Route the failure type to the repair actor; compose produce → check →
-repair with a loop-counter for bounded retry.
+repair as an ordinary cycle.
 
 **Not:** parsing error text out of a success-shaped output.
 

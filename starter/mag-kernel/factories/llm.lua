@@ -135,8 +135,8 @@ M.declaration = {
 
   -- Single input: fires per arriving ProviderOut (the assembled turn state the
   -- provider consumes). Matches tests/fixtures/two-agents.modification.json,
-  -- where adapters / tool-results / loop-counters all route
-  -- generic-provider.ProviderOut into an `llm`.
+  -- where adapters / tool-results all route generic-provider.ProviderOut
+  -- into an `llm`.
   inputs = {
     provider_out = "generic-provider.ProviderOut",
   },

@@ -13,13 +13,11 @@ types — don't encode the reason in a prompt.
 
 Reach for a template before hand-wiring a constellation:
 
-- `(agent {:id N :model … :provider … :tools […] :max-steps N?} : IN -> generic-provider.FinalAnswer)`
-  — the tool-use loop (llm ⇄ run-tool), unbounded by default. Authoring
-  `:max-steps N` opts into a loop-counter + exhaust-summarizer exit. Builtin.
-- `((get tpl "retry-bounded") {:id N :model … :provider … :max-steps N})`
-  — produce / typed-failure / repair, bounded. Library (`require "lib/templates"`).
-- `((get tpl "gate") {:id N :model … :provider … :max-steps N})`
-  — produce / human approval / revise on reject, bounded. Library.
+- `(agent {:id N :model … :provider … :tools […]} : IN -> generic-provider.FinalAnswer)`
+  — the tool-use loop (llm ⇄ run-tool). Unbounded: the typed final answer is
+  the terminator; a runaway run is stopped via interrupt/kill. Builtin.
+- `((get tpl "gate") {:id N :model … :provider …})`
+  — produce / human approval / revise on reject. Library (`require "lib/templates"`).
 
 Every template namespaces its internals under `:id`; two instances never
 collide, and a shared `:id` is a load-time error. Wire them like nodes:
@@ -54,21 +52,18 @@ in the actors. (Needs rules — post-MVP.)
 
 ## Cycle
 
-Cycles are legal as-is; every cycle exits through a typed variant (the llm's
-`FinalAnswer` route out of the loop), so no bound is required. To budget a
-loop, opt in with a `loop-counter` — `agent` threads one in when `:max-steps`
-is authored; `retry-bounded` and `gate` always carry one. The counter's exit
-is a typed variant (`mag.LoopExhausted`), routed like any type, usually to a
-summarizer that turns partial work into a `FinalAnswer`. Never "give up after
-N" in a prompt.
+Cycles are legal as-is and unbounded; every cycle exits through a typed
+variant (the llm's `FinalAnswer` route out of the loop), so the typed exit is
+the terminator. There is no loop-budget mechanism — a run that never reaches
+its exit is stopped via interrupt/kill. Never "give up after N" in a prompt.
 
 ## Fire on failure / repair
 
 "If it fails, route the evidence to a fixer." Failures are typed outputs —
 computed failures returned by the factory, suffered failures (provider error,
 kill, budget) synthesized by the kernel. Route the failure type to the repair
-actor; compose produce → check → repair with a loop-counter. This is exactly
-`retry-bounded`. Not parsing error text out of a success-shaped output.
+actor; compose produce → check → repair as an ordinary cycle. Not parsing
+error text out of a success-shaped output.
 
 ## Dynamic fanout — for-each
 

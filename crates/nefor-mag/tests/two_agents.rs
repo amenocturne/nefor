@@ -55,9 +55,9 @@ fn colliding_agent_ids_are_rejected() {
 (type mag.Task)
 (type generic-provider.FinalAnswer)
 
-(let [a (agent {:id "dup" :model "opus" :system "one" :max-steps 10}
+(let [a (agent {:id "dup" :model "opus" :system "one"}
           : mag.Task -> generic-provider.FinalAnswer)
-      b (agent {:id "dup" :model "opus" :system "two" :max-steps 20}
+      b (agent {:id "dup" :model "opus" :system "two"}
           : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)
       out (node "sink" {}
           : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]
@@ -83,25 +83,23 @@ fn agent_profile_lowers_onto_its_llm_actors() {
 (type generic-provider.FinalAnswer)
 
 (let [worker (agent {:id "worker" :system "Answer." :provider "chatgpt"
-                     :profile "standard" :tools ["fs/read"] :max-steps 50}
+                     :profile "standard" :tools ["fs/read"]}
                : mag.Task -> generic-provider.FinalAnswer)
       out (node "sink" {}
           : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]
   (graph worker -> out :terminal out))
 "#;
     let ir = nefor_mag::compile(source, &fixtures_dir()).expect("agent program compiles");
-    for id in ["worker.llm", "worker.exhaust"] {
-        let actor = ir
-            .actors
-            .iter()
-            .find(|a| a.id == id)
-            .unwrap_or_else(|| panic!("no actor {id}"));
-        assert_eq!(
-            actor.params.get("profile").and_then(|v| v.as_str()),
-            Some("standard"),
-            "{id} carries the agent's :profile"
-        );
-    }
+    let actor = ir
+        .actors
+        .iter()
+        .find(|a| a.id == "worker.llm")
+        .expect("no actor worker.llm");
+    assert_eq!(
+        actor.params.get("profile").and_then(|v| v.as_str()),
+        Some("standard"),
+        "worker.llm carries the agent's :profile"
+    );
     // Non-llm internals stay unprofiled.
     let entry = ir.actors.iter().find(|a| a.id == "worker.entry").unwrap();
     assert!(entry.params.get("profile").is_none());
@@ -125,10 +123,10 @@ fn route_dests<'a>(ir: &'a nefor_mag::ir::ModificationIr, id: &str, key: &str) -
 }
 
 #[test]
-fn agent_without_max_steps_expands_to_bare_loop() {
-    // No :max-steps → no injected bound: the expansion is the bare cycle
-    // (entry, llm, run-tool, tool-result) with a single output port on llm.
-    // The typed union output on llm is the loop's terminator.
+fn agent_expands_to_bare_loop() {
+    // The one expansion: the bare cycle (entry, llm, run-tool, tool-result)
+    // with a single output port on llm. The typed union output on llm is the
+    // loop's terminator; there is no compiled bound.
     let source = r#"
 (type mag.Task)
 (type generic-provider.FinalAnswer)
@@ -139,7 +137,7 @@ fn agent_without_max_steps_expands_to_bare_loop() {
           : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]
   (graph worker -> out :terminal out))
 "#;
-    let ir = nefor_mag::compile(source, &fixtures_dir()).expect("unbounded agent compiles");
+    let ir = nefor_mag::compile(source, &fixtures_dir()).expect("agent compiles");
 
     let mut ids: Vec<&str> = ir.actors.iter().map(|a| a.id.as_str()).collect();
     ids.sort_unstable();
@@ -152,7 +150,7 @@ fn agent_without_max_steps_expands_to_bare_loop() {
             "worker.run-tool",
             "worker.tool-result",
         ],
-        "no loop-counter, no exhaust"
+        "the bare cycle is the whole expansion"
     );
 
     // The bare cycle: llm -> run-tool -> tool-result -> llm.
@@ -176,56 +174,34 @@ fn agent_without_max_steps_expands_to_bare_loop() {
     );
 }
 
-#[test]
-fn agent_with_max_steps_expands_bounded() {
-    // Authored :max-steps → the bounded expansion: loop-counter on the
-    // back-edge with the authored max (no default), exhaust summarizer as a
-    // second output port.
-    let source = r#"
+fn agent_source_with_key(key_value: &str) -> String {
+    format!(
+        r#"
 (type mag.Task)
 (type generic-provider.FinalAnswer)
 
-(let [worker (agent {:id "worker" :model "opus" :system "Answer." :provider "chatgpt"
-                     :max-steps 7}
+(let [worker (agent {{:id "worker" :model "opus" :system "Answer." :provider "chatgpt"
+                     {key_value}}}
                : mag.Task -> generic-provider.FinalAnswer)
-      out (node "sink" {}
+      out (node "sink" {{}}
           : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]
   (graph worker -> out :terminal out))
-"#;
-    let ir = nefor_mag::compile(source, &fixtures_dir()).expect("bounded agent compiles");
+"#
+    )
+}
 
-    let counter = ir
-        .actors
-        .iter()
-        .find(|a| a.id == "worker.loop-counter")
-        .expect("authored :max-steps lowers a loop-counter");
-    assert_eq!(
-        counter.params.get("max").and_then(|v| v.as_i64()),
-        Some(7),
-        "the counter carries the authored bound, not a default"
-    );
-
-    // The back-edge threads the counter; exhaustion exits to the summarizer.
-    assert_eq!(
-        route_dests(&ir, "worker.tool-result", "generic-provider.ProviderOut"),
-        vec!["worker.loop-counter"]
-    );
-    assert_eq!(
-        route_dests(&ir, "worker.loop-counter", "generic-provider.ProviderOut"),
-        vec!["worker.llm"]
-    );
-    assert_eq!(
-        route_dests(&ir, "worker.loop-counter", "mag.LoopExhausted"),
-        vec!["worker.exhaust"]
-    );
-
-    // Both boundary output ports route to the sink.
-    assert_eq!(
-        route_dests(&ir, "worker.llm", "generic-provider.FinalAnswer"),
-        vec!["sink"]
-    );
-    assert_eq!(
-        route_dests(&ir, "worker.exhaust", "generic-provider.FinalAnswer"),
-        vec!["sink"]
-    );
+#[test]
+fn unknown_agent_config_keys_are_rejected_generically() {
+    // The agent config is a closed key set; any unknown key rejects with the
+    // same generic error shape. `:max-steps` (the removed loop bound) is just
+    // one unknown key among any others — no bespoke handling.
+    for (key_value, key) in [(":max-steps 7", "max-steps"), (":foo \"bar\"", "foo")] {
+        let err = nefor_mag::compile(&agent_source_with_key(key_value), &fixtures_dir())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("unknown key :{key}")) && err.contains("accepted:"),
+            "expected the generic unknown-key rejection for :{key}, got: {err}"
+        );
+    }
 }

@@ -1,9 +1,8 @@
-//! Composition-template lowering: `gate` and `retry-bounded` from
-//! `starter/mag/lib/templates.mag` are MAG library functions (built on the
-//! `subgraph` primitive), not compiler builtins. Each test compiles a small
-//! program that requires the stdlib and instantiates a template, then asserts
-//! the whole program validates and lowers — including the template's internal
-//! loop-counter and its typed exhaustion exit.
+//! Composition-template lowering: `gate` from `starter/mag/lib/templates.mag`
+//! is a MAG library function (built on the `subgraph` primitive), not a
+//! compiler builtin. Each test compiles a small program that requires the
+//! stdlib and instantiates the template, then asserts the whole program
+//! validates and lowers.
 
 use std::path::PathBuf;
 
@@ -35,69 +34,12 @@ fn route_dests<'a>(ir: &'a nefor_mag::ir::ModificationIr, id: &str, key: &str) -
 }
 
 #[test]
-fn retry_bounded_lowers_and_bounds_its_loop() {
-    let source = r#"
-(let [tpl (require "lib/templates")
-      retry ((get tpl "retry-bounded") {:id "fixer"
-                                        :model "opus"
-                                        :provider "chatgpt-provider"
-                                        :max-steps 10})
-      entry (node "adapter" {:seed "provider-in"}
-              : mag.Task -> generic-provider.ProviderOut)
-      out   (node "sink" {}
-              : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]
-  (graph
-    entry -> retry
-    retry -> out
-    :terminal out))
-"#;
-    let ir = nefor_mag::compile(source, &stdlib_dir()).expect("retry-bounded program compiles");
-
-    // The template namespaced every internal id under :id.
-    let ids = actor_ids(&ir);
-    for want in [
-        "fixer.produce",
-        "fixer.bound",
-        "fixer.repair",
-        "fixer.exhaust",
-    ] {
-        assert!(ids.contains(&want), "missing {want}; got {ids:?}");
-    }
-
-    // Bounded cycle: the loop-counter routes the failure back to repair and the
-    // exhausted variant out.
-    assert_eq!(
-        route_dests(&ir, "fixer.bound", "generic-control.Fail"),
-        vec!["fixer.repair"]
-    );
-    assert_eq!(
-        route_dests(&ir, "fixer.bound", "mag.LoopExhausted"),
-        vec!["fixer.exhaust"]
-    );
-    assert_eq!(
-        route_dests(&ir, "fixer.repair", "generic-provider.ProviderOut"),
-        vec!["fixer.produce"]
-    );
-
-    // Both boundary output ports (produce's happy path, exhaust) route to sink.
-    assert_eq!(
-        route_dests(&ir, "fixer.produce", "generic-provider.FinalAnswer"),
-        vec!["sink"]
-    );
-    assert_eq!(
-        route_dests(&ir, "fixer.exhaust", "generic-provider.FinalAnswer"),
-        vec!["sink"]
-    );
-}
-
-#[test]
 fn gate_lowers_with_human_approval_exit() {
     let source = r#"
 (let [tpl (require "lib/templates")
       g ((get tpl "gate") {:id "review"
                            :model "opus"
-                           :provider "chatgpt-provider"
-                           :max-steps 5})
+                           :provider "chatgpt-provider"})
       entry (node "adapter" {:seed "provider-in"}
               : mag.Task -> generic-provider.ProviderOut)
       out   (node "sink" {}
@@ -110,23 +52,14 @@ fn gate_lowers_with_human_approval_exit() {
     let ir = nefor_mag::compile(source, &stdlib_dir()).expect("gate program compiles");
 
     let ids = actor_ids(&ir);
-    for want in [
-        "review.produce",
-        "review.approve",
-        "review.bound",
-        "review.revise",
-        "review.exhaust",
-    ] {
+    for want in ["review.produce", "review.approve", "review.revise"] {
         assert!(ids.contains(&want), "missing {want}; got {ids:?}");
     }
 
-    // Rejection folds through the loop-counter into revise, then back to produce.
+    // Rejection folds through revise, then back to produce — an unbounded
+    // revision cycle whose terminator is the human's approval.
     assert_eq!(
         route_dests(&ir, "review.approve", "human.Rejected"),
-        vec!["review.bound"]
-    );
-    assert_eq!(
-        route_dests(&ir, "review.bound", "human.Rejected"),
         vec!["review.revise"]
     );
     assert_eq!(
@@ -134,28 +67,27 @@ fn gate_lowers_with_human_approval_exit() {
         vec!["review.produce"]
     );
 
-    // Approval leaves via the boundary port to the sink.
+    // Approval leaves via the single boundary port to the sink.
     assert_eq!(
         route_dests(&ir, "review.approve", "human.Approved"),
-        vec!["sink"]
-    );
-    assert_eq!(
-        route_dests(&ir, "review.exhaust", "human.Approved"),
         vec!["sink"]
     );
 }
 
 #[test]
 fn colliding_template_ids_are_rejected() {
-    // Two retry-bounded instances sharing an :id collide on every namespaced id.
+    // Two gate instances sharing an :id collide on every namespaced id.
     let source = r#"
 (let [tpl (require "lib/templates")
-      a ((get tpl "retry-bounded") {:id "dup" :model "opus" :provider "p" :max-steps 3})
-      b ((get tpl "retry-bounded") {:id "dup" :model "opus" :provider "p" :max-steps 4})
+      a ((get tpl "gate") {:id "dup" :model "opus" :provider "p" :system "one"})
+      b ((get tpl "gate") {:id "dup" :model "opus" :provider "p" :system "two"})
+      lift (node "adapter" {:seed "provider-in"}
+            : human.Approved -> generic-provider.ProviderOut)
       out (node "sink" {}
-            : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]
+            : human.Approved -> human.Approved)]
   (graph
-    a -> b
+    a -> lift
+    lift -> b
     b -> out
     :terminal out))
 "#;

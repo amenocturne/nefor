@@ -262,6 +262,7 @@ do
   assert_eq(env.name, "compute", "envelope names the capability")
   assert_eq(env.args.x, 41, "envelope carries the request args")
   assert_true(type(env.id) == "string", "kernel minted a tracked request id")
+  assert_eq(env.from, "w", "envelope is stamped with the emitting actor's address")
   assert_eq(#final, 0, "no final output before the reply arrives")
 
   -- Host delivers the correlated response; router routes it back to w.

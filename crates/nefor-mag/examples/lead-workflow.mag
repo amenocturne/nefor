@@ -1,6 +1,8 @@
 ;; Full lead workflow: explore → plan → critique → human approval →
 ;; parallel build → compile → test → review
-;; With retry loops on both compile and test failures
+;; With repair cycles on both compile and test failures. The cycles are
+;; unbounded — a stuck repair loop is stopped via the control plane's
+;; kill/interrupt, like any other loop.
 ;; NOTE: shell fanout types (BuildResult | BuildError) require a custom combinator not yet registered.
 
 (type Task)
@@ -14,7 +16,6 @@
 (type BuildError)
 (type TestResult)
 (type TestError)
-(type LoopExhausted)
 (type Review)
 
 (let [;; Exploration phase (parallel — no dependencies between them)
@@ -58,24 +59,18 @@
                                     :tools ["fs/read" "fs/edit" "grep" "shell"]}
                        : Approved -> Patch)
 
-      ;; Compile verification with retry
+      ;; Compile verification with repair
       compile        (node "shell" {:cmd "just build"}
                        : Patch -> (BuildResult | BuildError))
-
-      compile-ctr    (node "loop-counter" {:max 3}
-                       : BuildError -> (BuildError | LoopExhausted))
 
       fix-build      (node "agent" {:prompt "fix the build errors"
                                     :model "sonnet"
                                     :tools ["fs/read" "fs/edit" "shell"]}
                        : BuildError -> Patch)
 
-      ;; Test verification with retry
+      ;; Test verification with repair
       test           (node "shell" {:cmd "just test"}
                        : BuildResult -> (TestResult | TestError))
-
-      test-ctr       (node "loop-counter" {:max 3}
-                       : TestError -> (TestError | LoopExhausted))
 
       fix-test       (node "agent" {:prompt "fix the failing tests"
                                     :model "sonnet"
@@ -88,15 +83,9 @@
                                     :tools ["fs/read" "grep"]}
                        : TestResult -> Review)
 
-      ;; Failure terminals
+      ;; Failure terminal
       rejected       (node "llm" {:prompt "plan was rejected by reviewer"}
                        : Rejected -> Review)
-
-      build-failed   (node "llm" {:prompt "build failed after 3 retry attempts"}
-                       : LoopExhausted -> Review)
-
-      test-failed    (node "llm" {:prompt "tests failed after 3 retry attempts"}
-                       : LoopExhausted -> Review)
 
       ;; Single sink — all paths converge here
       out            (node "sink" {} : Review -> Review)]
@@ -120,23 +109,17 @@
     build-auth  -> compile
     build-tests -> compile
 
-    ;; Compile retry loop
-    compile     -> test
-    compile     -> compile-ctr
-    compile-ctr -> fix-build
-    compile-ctr -> build-failed
-    fix-build   -> compile
+    ;; Compile repair cycle
+    compile   -> test
+    compile   -> fix-build
+    fix-build -> compile
 
-    ;; Test retry loop
+    ;; Test repair cycle
     test     -> review
-    test     -> test-ctr
-    test-ctr -> fix-test
-    test-ctr -> test-failed
+    test     -> fix-test
     fix-test -> compile
 
     ;; All paths to sink
-    review       -> out
-    rejected     -> out
-    build-failed -> out
-    test-failed  -> out
+    review   -> out
+    rejected -> out
     :terminal out))

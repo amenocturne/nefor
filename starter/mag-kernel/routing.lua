@@ -227,8 +227,28 @@ function M:deliver(dest_id, from, tag, message)
   self:fire(dest_id, from, tag, message)
 end
 
+-- Tags delivered by tag, past the declared ports (actor-model.md): the
+-- control plane injects an approval reply at the gate it addresses — replies
+-- originate at the chat surface, not upstream actors, so no factory declares
+-- an input port for them. A bypass tag reaches a CONSTRUCTED instance
+-- directly (a gate with an outstanding request necessarily constructed);
+-- with no instance there is nothing awaiting a reply, so it drops logged.
+local PORT_BYPASS_TAGS = {
+  ["mag.ApprovalReply"] = true,
+}
+
 -- Feed one arrival to the destination's firing machine (the port whose input
 -- contract accepts the tag) and dispatch every activation it assembles.
+--
+-- No port accepting the tag is a WIRING BUG, not a race: apply-time
+-- validation catches every statically-visible mismatch (inventory.lua,
+-- validate_routes), so anything reaching this branch is a dynamic mismatch
+-- (a modification message with an unaccepted kind, a contract drifting
+-- mid-run). It used to warn-drop — which starved the destination forever and
+-- hung the run with zero pending work (the shipped exhaust bug) — so it now
+-- escalates to the control plane as mag.run_failed and the host fails the
+-- run. Sends to DEAD targets stay drop-and-log (deliver above — settled race
+-- semantics, untouched).
 function M:fire(dest_id, from, tag, message)
   local ports = self:machines_for(dest_id)
   for _, machine in pairs(ports) do
@@ -239,7 +259,31 @@ function M:fire(dest_id, from, tag, message)
       return
     end
   end
-  self.log.warn(string.format("actor '%s' has no input port accepting tag '%s'", tostring(dest_id), tostring(tag)))
+  if PORT_BYPASS_TAGS[tag] then
+    local instance = self.instances[dest_id]
+    if instance and type(instance.deliver) == "function" then
+      local completion = instance.deliver({
+        shape = "single",
+        messages = { { from = from, tag = tag, message = message } },
+      })
+      self:apply_completion(dest_id, completion)
+    else
+      self.log.info(string.format(
+        "'%s' dropped: actor '%s' is not constructed (nothing awaits a reply)",
+        tostring(tag), tostring(dest_id)))
+    end
+    return
+  end
+  local detail = string.format(
+    "actor '%s' has no input port accepting tag '%s' (sent from '%s'); failing the run",
+    tostring(dest_id), tostring(tag), tostring(from))
+  self.log.error(detail)
+  self.events({
+    kind = EVT_RUN_FAILED,
+    from = dest_id,
+    failure = "no-input-port",
+    error = detail,
+  })
 end
 
 -- Lazily build (and cache) the per-port firing machines for an actor from its
@@ -394,12 +438,17 @@ end
 -- An actor's request to a capability plugin. Mint a tracked request id, record
 -- the requester (+ its opaque ref), and put a tool.invoke-shaped envelope on
 -- the injected bus. This owns as one kernel concern what agentic-loop spread
--- across pending_runs / tool_id_to_key / firing_to_node.
+-- across pending_runs / tool_id_to_key / firing_to_node. `from` stamps the
+-- emitting actor's plain address onto the outbound envelope (observability:
+-- consumers see WHICH actor is invoking without parsing the scoped
+-- correlation id; the run is already identifiable via that id / the run
+-- context).
 function M:on_capability_invoke(id, message)
   local request_id = self.correlation:open(id, message.ref)
   self.bus_emit({
     kind = "tool.invoke",
     id = request_id,
+    from = id,
     name = message.capability,
     args = message.request,
   })
