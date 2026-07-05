@@ -22,6 +22,13 @@ local GLYPHS = {
   -- MAG-only: a killed actor is a deliberate termination, distinct from a
   -- failed one (reasoner-graph never had this state — richer-than-parity).
   killed  = "⊗",
+  -- MAG member activity states (mag.actor_busy / mag.actor_idle): `working`
+  -- is a live activation (ticks its CURRENT activation's elapsed), `idle` is
+  -- constructed-between-activations (renders quietly, no timer). The agent
+  -- loop's members visibly take turns instead of all ticking the run's
+  -- wall clock.
+  working = "●",
+  idle    = "·",
 }
 -- Exported for the agent-view popup header (popups.lua) so the status
 -- glyph vocabulary stays single-sourced.
@@ -34,6 +41,8 @@ local NODE_STYLE = {
   error   = STYLE.panel_error,
   skipped = STYLE.panel_skipped,
   killed  = STYLE.panel_error,
+  working = STYLE.panel_running,
+  idle    = STYLE.status_dim,
 }
 
 -- Node statuses that count as terminal (drive the done/total counter and
@@ -129,11 +138,16 @@ local function run_header_title(run)
   return title
 end
 
--- Elapsed window for a node/actor row: live-ticking while running,
--- frozen at the finish stamp once terminal.
+-- Elapsed window for a node/actor row: live-ticking while running (whole
+-- life; reasoner-graph nodes) or working (the CURRENT activation only,
+-- resetting each mag.actor_busy), frozen at the finish stamp once terminal.
+-- Idle carries no window — a between-activations actor shows no timer.
 local function node_elapsed_ms(node, now_ms)
   if node.status == "running" then
     return now_ms - (node.started_at_ms or now_ms)
+  end
+  if node.status == "working" then
+    return now_ms - (node.activation_started_at_ms or node.started_at_ms or now_ms)
   end
   if TERMINAL_STATUS[node.status] and node.finished_at_ms ~= nil then
     return node.finished_at_ms - (node.started_at_ms or node.finished_at_ms)
@@ -193,18 +207,21 @@ local function group_of(actor_id)
 end
 
 -- Aggregate a group's member states into one status. Precedence, highest
--- first: killed (any member killed) → running (any member live) → done
--- (run finished) → pending (no member ready yet). `killed` outranks
--- `running` so a group with any killed member reads as terminated — the
--- "killed if any member was killed" rule — even while a sibling is still
--- mid-flight.
+-- first: killed (any member killed) → running (any member live — working
+-- and idle both count: an agent loop between provider rounds is still a
+-- live loop) → done (run finished) → pending (no member ready yet).
+-- `killed` outranks `running` so a group with any killed member reads as
+-- terminated — the "killed if any member was killed" rule — even while a
+-- sibling is still mid-flight.
+local LIVE_MEMBER_STATUS = { running = true, working = true, idle = true }
+
 local function group_status(members, run_completed)
   local any_killed, any_running = false, false
   local count = 0
   for _, m in ipairs(members) do
     count = count + 1
     if m.node.status == "killed" then any_killed = true
-    elseif m.node.status == "running" then any_running = true end
+    elseif LIVE_MEMBER_STATUS[m.node.status] then any_running = true end
   end
   if count == 0 then return "pending" end
   if any_killed then return "killed" end
@@ -256,7 +273,13 @@ local function build_groups(run)
   return order
 end
 
-local function group_row_parts(group, now_ms)
+-- Group row. The elapsed window is the WHOLE-RUN clock (first member start →
+-- now while live, frozen at the last finish once terminal) — deliberately
+-- unlike member rows, which tick per activation. `folded` grows a cheap
+-- activity hint on a collapsed row: the working member's short name trails
+-- the timer (`● lead (4) 57s →llm`), so the loop's cycling stays visible
+-- without expanding. Kept to one member (the first working) — 36 cols.
+local function group_row_parts(group, now_ms, folded)
   local glyph = GLYPHS[group.status] or "·"
   local style = NODE_STYLE[group.status] or STYLE.status_dim
   local elapsed
@@ -268,7 +291,16 @@ local function group_row_parts(group, now_ms)
   local elapsed_str = elapsed and (" " .. fmt_elapsed_ms(elapsed)) or ""
   local n = #group.members
   local count_str = n > 1 and (" (" .. n .. ")") or ""
-  local text = glyph .. " " .. group.name .. count_str .. elapsed_str
+  local busy_str = ""
+  if folded then
+    for _, m in ipairs(group.members) do
+      if m.node.status == "working" and m.id ~= group.name then
+        busy_str = " →" .. m.id:sub(#group.name + 2)
+        break
+      end
+    end
+  end
+  local text = glyph .. " " .. group.name .. count_str .. elapsed_str .. busy_str
   return text, style
 end
 
@@ -295,12 +327,15 @@ local function mag_run_header_title(run, groups)
   return title
 end
 
--- MAG member (actor leaf) row, rendered while the sidebar is focused:
--- `  ● explorer.llm  running 47s`. The stuck-agent signature — a
--- running actor whose last stream event went stale — comes back as a
--- second return: an indented sub-row (`    ⚠ idle 32s`), following the
--- last_tool sub-row idiom so the alarm survives the narrow sidebar
--- instead of clipping off the row's tail.
+-- MAG member (actor leaf) row, rendered under an unfolded group:
+-- `  ● explorer.llm  working 47s` (per-activation timer) or
+-- `  · explorer.llm  idle` (between activations — no timer, no noise).
+-- The stuck-agent signature — a BUSY actor whose last stream event went
+-- stale — comes back as a second return: an indented sub-row
+-- (`    ⚠ stale 32s`), following the last_tool sub-row idiom so the alarm
+-- survives the narrow sidebar instead of clipping off the row's tail.
+-- Idle-between-rounds deliberately never warns: silence is that state's
+-- normal shape, only busy-and-silent smells stuck.
 local function actor_row_parts(actor_id, node, stream, now_ms)
   local glyph = GLYPHS[node.status] or "·"
   local style = NODE_STYLE[node.status] or STYLE.status_dim
@@ -308,32 +343,35 @@ local function actor_row_parts(actor_id, node, stream, now_ms)
   local elapsed_str = elapsed and (" " .. fmt_elapsed_ms(elapsed)) or ""
   local text = "  " .. glyph .. " " .. actor_id .. "  "
     .. (node.status or "?") .. elapsed_str
-  local idle_text
-  if node.status == "running" and stream ~= nil
+  local stale_text
+  if node.status == "working" and stream ~= nil
       and stream.last_activity_ms ~= nil then
-    local idle = now_ms - stream.last_activity_ms
-    if idle >= agent_streams.STALE_MS then
-      idle_text = "    ⚠ idle " .. fmt_elapsed_ms(idle)
+    local silent = now_ms - stream.last_activity_ms
+    if silent >= agent_streams.STALE_MS then
+      stale_text = "    ⚠ stale " .. fmt_elapsed_ms(silent)
     end
   end
-  return text, style, idle_text
+  return text, style, stale_text
 end
 
--- ── sidebar row model (focus / cursor navigation) ─────────────────────
+-- ── sidebar row model (fold state / cursor navigation) ────────────────
 --
 -- The ordered list of navigable sidebar rows. Single source of truth
 -- for BOTH rendering order and cursor navigation — update.lua indexes
 -- into the same list to move the cursor and resolve Enter, so the
 -- highlighted row and the row acted on can never drift apart.
 --
--- Focus-implies-expanded: `expanded` (true while the sidebar has key
--- focus) adds each MAG group's member actor rows under the group row.
--- No stored toggle state — the unfocused sidebar renders exactly the
--- collapsed grouping it always did.
-function M.row_model(state, now_ms, expanded)
+-- Per-group stored fold state, DEFAULT COLLAPSED: a MAG group's member
+-- actor rows render only while `state.sidebar_folds[run_id][group]` is
+-- set (Enter on the group row toggles it — update.lua). Members of a
+-- collapsed group are not rows at all, so the cursor skips them by
+-- construction. Fold state survives re-renders, focus changes, and run
+-- updates; it resets with run prune / a new session (update.lua).
+function M.row_model(state, now_ms)
   local rows = {}
   local runs = state.runs or {}
   local streams = state.agent_streams or {}
+  local folds = state.sidebar_folds or {}
   for _, run_id in ipairs(sorted_keys(runs)) do
     local run = runs[run_id]
     if not is_expired(run, now_ms) then
@@ -341,9 +379,13 @@ function M.row_model(state, now_ms, expanded)
         local groups = build_groups(run)
         rows[#rows + 1] = { kind = "run_header", run_id = run_id, run = run, groups = groups }
         local run_streams = streams[run_id] or {}
+        local run_folds = folds[run_id] or {}
         for _, g in ipairs(groups) do
-          rows[#rows + 1] = { kind = "group", run_id = run_id, group = g }
-          if expanded then
+          local unfolded = run_folds[g.name] == true
+          rows[#rows + 1] = {
+            kind = "group", run_id = run_id, group = g, folded = not unfolded,
+          }
+          if unfolded then
             for _, m in ipairs(g.members) do
               rows[#rows + 1] = {
                 kind = "actor", run_id = run_id, actor_id = m.id,
@@ -382,7 +424,7 @@ local function panel_children(state, now_ms, narrow)
   -- runs on a fresh dispatch. Mirrors the toast widget's
   -- defence-in-depth filter at view-time.
   local focused = state.focus == "sidebar"
-  local rows = M.row_model(state, now_ms, focused)
+  local rows = M.row_model(state, now_ms)
   local cursor = M.clamp_cursor(state.sidebar_cursor, #rows)
   local children = {}
   local first_run = true
@@ -402,22 +444,22 @@ local function panel_children(state, now_ms, narrow)
         wrap    = "none",
       }
     elseif row.kind == "group" then
-      local text, style = group_row_parts(row.group, now_ms)
+      local text, style = group_row_parts(row.group, now_ms, row.folded)
       children[#children + 1] = tui.text {
         content = text,
         style   = on_cursor and CURSOR_ROW_STYLE or style,
         wrap    = "none",
       }
     elseif row.kind == "actor" then
-      local text, style, idle_text = actor_row_parts(row.actor_id, row.node, row.stream, now_ms)
+      local text, style, stale_text = actor_row_parts(row.actor_id, row.node, row.stream, now_ms)
       children[#children + 1] = tui.text {
         content = text,
         style   = on_cursor and CURSOR_ROW_STYLE or style,
         wrap    = "none",
       }
-      if idle_text ~= nil then
+      if stale_text ~= nil then
         children[#children + 1] = tui.text {
-          content = idle_text,
+          content = stale_text,
           style   = STYLE.panel_stale,
           wrap    = "none",
         }
@@ -655,7 +697,7 @@ function M.interrupt_all(state, now_ms)
   for run_id, run in pairs(state.runs) do
     local nodes = {}
     for node_id, node in pairs(run.nodes or {}) do
-      if node.status == "running" or node.status == "pending" then
+      if not TERMINAL_STATUS[node.status] then
         nodes[node_id] = shallow_merge(node, {
           status         = "error",
           finished_at_ms = now_ms,
@@ -701,11 +743,12 @@ end
 -- The kernel's `mag.*` event stream drives the same run panel the
 -- reasoner-graph `graph.*` events do (kinds that die with reasoner-graph
 -- at the lead-as-program flip), so a kernel run is visible
--- the same way. Actors are the panel's "nodes": spawned → pending,
--- ready → running, killed → killed (distinct), run-complete → the run
--- finalises (still-live actors flip to done). Only `mag.run_started`
--- carries the run identity; the reducer keys every later actor/mod event
--- to the single in-flight run it stamps.
+-- the same way. Actors are the panel's "nodes", with activity-honest
+-- states: spawned → pending, ready → idle (constructed), busy → working
+-- (ticks its current activation), idle → idle (between activations, no
+-- timer), killed → killed (distinct), run-complete → the run finalises
+-- (still-live actors flip to done). Every event carries its run_id; the
+-- reducer keys panel state straight off it.
 
 function M.mag_run_started(state, run_id, run_name, now_ms)
   if state.runs and state.runs[run_id] then return state end
@@ -739,13 +782,17 @@ function M.actor_spawned(state, run_id, actor_id, factory, now_ms)
   end)
 end
 
-function M.actor_ready(state, run_id, actor_id, now_ms)
+-- Shared body for the constructed-and-alive transitions: ready → "idle"
+-- (constructed; the kernel's actor_busy follows immediately when work
+-- starts), busy → "working" (stamps the CURRENT activation's start so the
+-- row's timer resets per activation). An event without a prior spawn
+-- observation (out-of-order tail) still surfaces as a node rather than
+-- being dropped.
+local function mark_actor(state, run_id, actor_id, now_ms, status, extra)
   if not (state.runs and state.runs[run_id]) then return state end
   return apply(state, run_id, function(prev)
     local nodes = {}
     for k, v in pairs(prev.nodes or {}) do nodes[k] = v end
-    -- A ready without a prior spawn observation (out-of-order tail) still
-    -- surfaces as a running node rather than being dropped.
     local node = nodes[actor_id] or { reasoner = "", started_at_ms = now_ms }
     local actor_seq = prev.actor_seq or 0
     local seq = node.seq
@@ -753,13 +800,40 @@ function M.actor_ready(state, run_id, actor_id, now_ms)
       actor_seq = actor_seq + 1
       seq = actor_seq
     end
-    nodes[actor_id] = shallow_merge(node, {
-      status = "running",
+    local patch = {
+      status = status,
       started_at_ms = node.started_at_ms or now_ms,
       seq = seq,
-    })
+    }
+    for k, v in pairs(extra or {}) do patch[k] = v end
+    nodes[actor_id] = shallow_merge(node, patch)
     return shallow_merge(prev, { nodes = nodes, actor_seq = actor_seq })
   end)
+end
+
+function M.actor_ready(state, run_id, actor_id, now_ms)
+  return mark_actor(state, run_id, actor_id, now_ms, "idle")
+end
+
+-- `mag.actor_busy` — an activation was delivered; the member ticks its
+-- current activation from here.
+function M.actor_busy(state, run_id, actor_id, now_ms)
+  return mark_actor(state, run_id, actor_id, now_ms, "working", {
+    activation_started_at_ms = now_ms,
+  })
+end
+
+-- `mag.actor_idle` — the activation settled; back to quiet idle. Only a
+-- working member flips (a killed/done straggler keeps its terminal state;
+-- an unseen id has nothing to settle).
+function M.actor_idle(state, run_id, actor_id, now_ms)
+  if not (state.runs and state.runs[run_id]
+      and state.runs[run_id].nodes
+      and state.runs[run_id].nodes[actor_id]
+      and state.runs[run_id].nodes[actor_id].status == "working") then
+    return state
+  end
+  return mark_actor(state, run_id, actor_id, now_ms, "idle")
 end
 
 -- `reason` is the kernel's teardown taxonomy (mag-kernel observer.lua):
@@ -782,7 +856,7 @@ function M.actor_killed(state, run_id, actor_id, now_ms, reason)
       -- mag.run_complete normally precedes the teardown and already flipped
       -- live nodes to done; flip any straggler here and leave terminal
       -- states (done/killed/error) untouched.
-      if node.status ~= "pending" and node.status ~= "running" then
+      if TERMINAL_STATUS[node.status] then
         return prev
       end
       nodes[actor_id] = shallow_merge(node, {
@@ -820,7 +894,7 @@ function M.mag_run_complete(state, run_id, status, now_ms)
   return apply(state, run_id, function(prev)
     local nodes = {}
     for k, v in pairs(prev.nodes or {}) do
-      if v.status == "running" or v.status == "pending" then
+      if not TERMINAL_STATUS[v.status] then
         nodes[k] = shallow_merge(v, { status = "done", finished_at_ms = now_ms })
       else
         nodes[k] = v
@@ -830,6 +904,43 @@ function M.mag_run_complete(state, run_id, status, now_ms)
       nodes = nodes, completed_at_ms = now_ms, status = status or "success",
     })
   end)
+end
+
+-- ── fold state (per-run, per-group; default collapsed) ────────────────
+--
+-- `state.sidebar_folds[run_id][group] = true` marks a group UNFOLDED —
+-- absence is the collapsed default, so a fresh run renders collapsed and
+-- pruning a run's entry restores the default for a reused run_id.
+
+function M.toggle_fold(state, run_id, group_name)
+  local prev = state.sidebar_folds or {}
+  local prev_run = prev[run_id] or {}
+  local next_run = {}
+  for k, v in pairs(prev_run) do next_run[k] = v end
+  next_run[group_name] = (not prev_run[group_name]) or nil
+  local next_folds = {}
+  for k, v in pairs(prev) do next_folds[k] = v end
+  next_folds[run_id] = next_run
+  return shallow_merge(state, { sidebar_folds = next_folds })
+end
+
+-- Drop fold entries for runs no longer live (the pruned run map), so fold
+-- state follows the run lifecycle exactly like the capture buffers do
+-- (agent_streams.prune).
+function M.prune_folds(state, runs)
+  local folds = state.sidebar_folds
+  if type(folds) ~= "table" then return state end
+  local live = runs or {}
+  local stale = false
+  for run_id in pairs(folds) do
+    if live[run_id] == nil then stale = true break end
+  end
+  if not stale then return state end
+  local kept = {}
+  for run_id, v in pairs(folds) do
+    if live[run_id] ~= nil then kept[run_id] = v end
+  end
+  return shallow_merge(state, { sidebar_folds = kept })
 end
 
 return M

@@ -30,9 +30,11 @@ local M = {}
 M.MAX_ENTRIES    = 200
 M.MAX_ENTRY_TEXT = 4000
 
--- A running actor whose last stream event is older than this reads as
--- "possibly stuck" — the sidebar leaf row and the agent-view header
--- both style the idle indicator as a warning past it.
+-- A WORKING (busy) actor whose last stream event is older than this reads
+-- as "possibly stuck" — busy-and-silent. The sidebar leaf row and the
+-- agent-view header both style the stale indicator as a warning past it.
+-- An idle actor (between activations) never warns: silence is that
+-- state's normal shape.
 M.STALE_MS = 30000
 
 -- Parse a kernel-scoped chat handle: `<scope>/<actor_id>@r<round>`.

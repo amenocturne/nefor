@@ -128,9 +128,11 @@ local function prune_expired(state)
   local pruned = run_panel.prune(state.runs or {}, now)
   if pruned ~= state.runs then
     state = shallow_merge(state, { runs = pruned })
-    -- Captured agent streams follow the run lifecycle: buffers and
-    -- scope bindings for pruned runs go with them.
+    -- Captured agent streams and sidebar fold state follow the run
+    -- lifecycle: buffers, scope bindings, and fold entries for pruned
+    -- runs go with them.
     state = agent_streams.prune(state, pruned)
+    state = run_panel.prune_folds(state, pruned)
   end
   local toasts = state.toasts
   if toasts ~= nil and #toasts > 0 then
@@ -178,7 +180,7 @@ local function handle_input_submit(msg, state)
     local cleared = shallow_merge(state, {
       entries = {}, in_flight = NIL_SENTINEL, input_value = "",
       pending = false, completion = NIL_SENTINEL,
-      runs = {}, firing_to_node = {},
+      runs = {}, firing_to_node = {}, sidebar_folds = {},
       agent_streams = {}, scope_to_run = {},
       turn_started_at = NIL_SENTINEL,
       last_turn_duration_ms = NIL_SENTINEL,
@@ -335,7 +337,7 @@ local function handle_input_submit(msg, state)
       local cleared = shallow_merge(state, {
         entries = {}, in_flight = NIL_SENTINEL, input_value = "",
         pending = false, completion = NIL_SENTINEL,
-        runs = {}, firing_to_node = {},
+        runs = {}, firing_to_node = {}, sidebar_folds = {},
         agent_streams = {}, scope_to_run = {},
         turn_started_at = NIL_SENTINEL,
         last_turn_duration_ms = NIL_SENTINEL,
@@ -420,7 +422,7 @@ local function handle_input_submit(msg, state)
       return shallow_merge(state, {
         input_value = "", completion = NIL_SENTINEL,
         entries = {}, in_flight = NIL_SENTINEL,
-        pending = false, runs = {}, firing_to_node = {},
+        pending = false, runs = {}, firing_to_node = {}, sidebar_folds = {},
         agent_streams = {}, scope_to_run = {},
         turn_started_at = NIL_SENTINEL,
         last_turn_duration_ms = NIL_SENTINEL,
@@ -647,6 +649,7 @@ local function handle_session_end(_msg, state)
     runs             = {},
     agent_streams    = {},
     scope_to_run     = {},
+    sidebar_folds    = {},
     lead_chat_id     = NIL_SENTINEL,
     lead_chat_prefix = NIL_SENTINEL,
   }), {}
@@ -1287,6 +1290,25 @@ local function handle_mag_actor_ready(msg, state)
   return run_panel.actor_ready(state, run_id, id, tui.now_ms()), {}
 end
 
+-- The kernel's per-actor activity window (mag.actor_busy / mag.actor_idle):
+-- members tick only while actually working, so the panel shows the loop
+-- cycling instead of every row mirroring the run's wall clock.
+local function handle_mag_actor_busy(msg, state)
+  if state.replay_mode then return state, {} end
+  local run_id = msg.run_id
+  local id = msg.id
+  if type(run_id) ~= "string" or type(id) ~= "string" or id == "" then return state, {} end
+  return run_panel.actor_busy(state, run_id, id, tui.now_ms()), {}
+end
+
+local function handle_mag_actor_idle(msg, state)
+  if state.replay_mode then return state, {} end
+  local run_id = msg.run_id
+  local id = msg.id
+  if type(run_id) ~= "string" or type(id) ~= "string" or id == "" then return state, {} end
+  return run_panel.actor_idle(state, run_id, id, tui.now_ms()), {}
+end
+
 local function handle_mag_actor_killed(msg, state)
   if state.replay_mode then return state, {} end
   local run_id = msg.run_id
@@ -1382,6 +1404,8 @@ local handlers = {
   ["mag.run_started"]             = handle_mag_run_started,
   ["mag.actor_spawned"]           = handle_mag_actor_spawned,
   ["mag.actor_ready"]             = handle_mag_actor_ready,
+  ["mag.actor_busy"]              = handle_mag_actor_busy,
+  ["mag.actor_idle"]              = handle_mag_actor_idle,
   ["mag.actor_killed"]            = handle_mag_actor_killed,
   ["mag.modification_rejected"]   = handle_mag_modification_rejected,
   ["mag.modification_noop"]       = handle_mag_modification_noop,
@@ -1512,7 +1536,7 @@ local function route_keys_and_popups(msg, state)
         return shallow_merge(state, {
           popup = NIL_SENTINEL,
           entries = {}, in_flight = NIL_SENTINEL,
-          pending = false, runs = {}, firing_to_node = {},
+          pending = false, runs = {}, firing_to_node = {}, sidebar_folds = {},
           turn_started_at = NIL_SENTINEL,
           last_turn_duration_ms = NIL_SENTINEL,
           queued_entry_idx = NIL_SENTINEL,
@@ -1536,13 +1560,14 @@ local function route_keys_and_popups(msg, state)
   end
 
   -- Sidebar pane focus (popups above win the keyboard first): Up/Down
-  -- move the cursor over the row model, Enter on an actor leaf opens
-  -- the read-only agent view. Enter on group / run-header rows is a
-  -- deliberate no-op — reserved for the epic's fold/unfold task.
+  -- move the cursor over the row model (members of a collapsed group are
+  -- not rows, so the cursor skips them by construction), Enter on a group
+  -- row toggles its fold, Enter on an actor leaf opens the read-only
+  -- agent view. Enter on a run-header row stays a no-op.
   if state.focus == "sidebar" and state.popup == nil then
     local now = tui.now_ms()
     if kind == "key.up" or kind == "key.down" then
-      local rows = run_panel.row_model(state, now, true)
+      local rows = run_panel.row_model(state, now)
       if #rows == 0 then return state, {} end
       local cur = run_panel.clamp_cursor(state.sidebar_cursor, #rows)
       cur = cur + ((kind == "key.down") and 1 or -1)
@@ -1550,8 +1575,11 @@ local function route_keys_and_popups(msg, state)
       return shallow_merge(state, { sidebar_cursor = cur }), {}
     end
     if kind == "key.enter" then
-      local rows = run_panel.row_model(state, now, true)
+      local rows = run_panel.row_model(state, now)
       local row = rows[run_panel.clamp_cursor(state.sidebar_cursor, #rows)]
+      if row ~= nil and row.kind == "group" then
+        return run_panel.toggle_fold(state, row.run_id, row.group.name), {}
+      end
       if row ~= nil and row.kind == "actor" then
         return shallow_merge(state, {
           popup = {

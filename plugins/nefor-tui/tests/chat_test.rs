@@ -6410,15 +6410,18 @@ fn chat_plan_append_dedup_preserves_approved_status() {
     );
 }
 
-// ── Agent view: sidebar focus, stream capture, read-only popup ────────
+// ── Agent view: sidebar focus, fold toggle, stream capture, popup ─────
 //
-// MVP of the agent-view observability feature: Tab/Shift-Tab cycles key
-// focus between the prompt and the sidebar; while the sidebar is
-// focused MAG groups expand to their member actor rows
-// (focus-implies-expanded — no stored toggle state); Enter on an actor
-// leaf opens a read-only popup fed by per-actor capture buffers that
-// tap the scoped `chat.stream.*` broadcasts BEFORE the transcript's
-// foreign-chat guard.
+// Agent-view observability: Tab/Shift-Tab cycles key focus between the
+// prompt and the sidebar; MAG groups carry per-group stored fold state,
+// DEFAULT COLLAPSED — Enter on a group row toggles it (fold state
+// survives re-renders and focus changes, resets with run prune / new
+// session); Enter on an actor leaf opens a read-only popup fed by
+// per-actor capture buffers that tap the scoped `chat.stream.*`
+// broadcasts BEFORE the transcript's foreign-chat guard. Member rows are
+// activity-honest (kernel busy/idle events): working members tick their
+// current activation, idle members render quietly, and only a
+// busy-and-silent member grows the ⚠ stale alarm.
 
 /// Concatenated text of every screen segment painted with the cursor
 /// row style (fg #000000 on bg #7FB4FF). Lets tests assert WHICH
@@ -6439,7 +6442,8 @@ fn cursor_styled_text(out: &str) -> String {
 }
 
 /// Boot a chat surface with one scoped MAG run (`scope: r2`) carrying a
-/// single running actor `worker.llm`, plus a lead prefix binding so the
+/// single WORKING actor `worker.llm` (spawned → ready → busy, the kernel's
+/// activation-delivery order), plus a lead prefix binding so the
 /// foreign-chat guard is active. Shared setup for the capture/view tests.
 fn engine_with_scoped_worker() -> Engine {
     let mut engine = Engine::new(120, 30).expect("engine");
@@ -6461,11 +6465,28 @@ fn engine_with_scoped_worker() -> Engine {
         &mut engine,
         json!({ "kind": "mag.actor_ready", "run_id": "sub-1", "id": "worker.llm" }),
     );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_busy", "run_id": "sub-1", "id": "worker.llm" }),
+    );
     engine
 }
 
+/// Focused-sidebar navigation to the `worker.llm` leaf in
+/// `engine_with_scoped_worker`: Tab, unfold the (default-collapsed)
+/// `worker` group, land the cursor on the member row. Returns the last
+/// render so callers can assert on the freshly-painted leaf.
+fn focus_worker_leaf(engine: &mut Engine) -> String {
+    engine.handle_key(key("tab")).expect("tab");
+    let _ = render_str(engine); // refresh the tree so keys route on focus
+    engine.handle_key(key("down")).expect("down"); // → worker group row
+    engine.handle_key(key("enter")).expect("enter"); // unfold
+    engine.handle_key(key("down")).expect("down"); // → worker.llm leaf
+    render_str(engine)
+}
+
 #[test]
-fn tab_focuses_sidebar_and_expands_mag_groups() {
+fn groups_default_collapsed_and_enter_toggles_fold() {
     let mut engine = Engine::new(120, 30).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -6483,33 +6504,56 @@ fn tab_focuses_sidebar_and_expands_mag_groups() {
         json!({ "kind": "mag.actor_spawned", "run_id": "mag-focus-1", "id": "explorer.loop-counter", "factory": "llm" }),
     );
 
-    // Unfocused sidebar: grouped + collapsed, exactly as before.
+    // Unfocused sidebar: grouped + collapsed.
     let out = render_str(&mut engine);
     assert!(
         !out.contains("explorer.entry"),
-        "members must stay collapsed while the prompt has focus: {out:?}"
+        "members must render collapsed by default: {out:?}"
     );
 
-    // Tab → sidebar focused → focus-implies-expanded member rows.
+    // Tab → sidebar focused. DEFAULT COLLAPSED: focus alone reveals
+    // nothing; the cursor highlight starts on the run header row.
     engine.handle_key(key("tab")).expect("tab");
     let out = render_str(&mut engine);
     assert!(
-        out.contains("explorer.entry") && out.contains("explorer.loop-counter"),
-        "focused sidebar must render member actor rows: {out:?}"
+        !out.contains("explorer.entry"),
+        "focus must not imply expansion — groups stay folded: {out:?}"
     );
-    // Cursor highlight starts on the first row (the run header).
     let cursor = cursor_styled_text(&out);
     assert!(
         cursor.contains("MAG demo"),
         "cursor highlight should start on the run header row: {cursor:?}"
     );
 
-    // Esc → focus returns to the prompt, members collapse again.
-    engine.handle_key(key("escape")).expect("escape");
+    // Down → the group row; Enter unfolds it: member rows appear.
+    engine.handle_key(key("down")).expect("down");
+    engine.handle_key(key("enter")).expect("enter");
     let out = render_str(&mut engine);
     assert!(
-        !out.contains("explorer.entry"),
-        "Esc must return focus to the prompt and collapse members: {out:?}"
+        out.contains("explorer.entry") && out.contains("explorer.loop-counter"),
+        "Enter on the group row must unfold its member rows: {out:?}"
+    );
+
+    // Fold state survives losing focus: Esc back to the prompt keeps the
+    // unfolded members on screen (stored state, not focus-implied). The
+    // full-frame snapshot sees unchanged rows the incremental diff skips.
+    engine.handle_key(key("escape")).expect("escape");
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    assert!(
+        snap.contains("explorer.entry"),
+        "fold state must survive focus changes:\n{snap}"
+    );
+
+    // Re-focus; Enter on the group row again folds it back.
+    engine.handle_key(key("tab")).expect("tab");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    assert!(
+        !snap.contains("explorer.entry"),
+        "Enter on the unfolded group row must fold it again:\n{snap}"
     );
 }
 
@@ -6529,15 +6573,17 @@ fn shift_tab_also_cycles_focus() {
 
     engine.handle_key(key("shift_tab")).expect("shift_tab");
     let out = render_str(&mut engine);
+    let cursor = cursor_styled_text(&out);
     assert!(
-        out.contains("explorer.entry"),
-        "shift_tab must focus the sidebar too (2 panes ⇒ toggle): {out:?}"
+        cursor.contains("MAG demo"),
+        "shift_tab must focus the sidebar too (2 panes ⇒ toggle): {cursor:?}"
     );
     engine.handle_key(key("shift_tab")).expect("shift_tab");
     let out = render_str(&mut engine);
+    let cursor = cursor_styled_text(&out);
     assert!(
-        !out.contains("explorer.entry"),
-        "second shift_tab must hand focus back to the prompt: {out:?}"
+        !cursor.contains("MAG demo"),
+        "second shift_tab must hand focus back to the prompt: {cursor:?}"
     );
 }
 
@@ -6561,18 +6607,20 @@ fn tab_is_noop_while_a_popup_owns_the_keyboard() {
 
     engine.handle_key(key("tab")).expect("tab");
     let out = render_str(&mut engine);
+    let cursor = cursor_styled_text(&out);
     assert!(
-        !out.contains("explorer.entry"),
-        "tab must not switch pane focus while a popup owns keys: {out:?}"
+        !cursor.contains("MAG demo"),
+        "tab must not switch pane focus while a popup owns keys: {cursor:?}"
     );
 
     // Dismiss the popup; tab now works normally.
     engine.handle_key(key("escape")).expect("escape");
     engine.handle_key(key("tab")).expect("tab");
     let out = render_str(&mut engine);
+    let cursor = cursor_styled_text(&out);
     assert!(
-        out.contains("explorer.entry"),
-        "after popup dismissal tab must focus the sidebar: {out:?}"
+        cursor.contains("MAG demo"),
+        "after popup dismissal tab must focus the sidebar: {cursor:?}"
     );
 }
 
@@ -6595,9 +6643,10 @@ fn tab_with_completion_open_completes_instead_of_switching_focus() {
     }
     engine.handle_key(key("tab")).expect("tab");
     let out = render_str(&mut engine);
+    let cursor = cursor_styled_text(&out);
     assert!(
-        !out.contains("explorer.entry"),
-        "tab with the completion popup open must not move pane focus: {out:?}"
+        !cursor.contains("MAG demo"),
+        "tab with the completion popup open must not move pane focus: {cursor:?}"
     );
     assert!(
         out.contains("/help"),
@@ -6606,7 +6655,7 @@ fn tab_with_completion_open_completes_instead_of_switching_focus() {
 }
 
 #[test]
-fn sidebar_cursor_moves_clamps_and_enter_opens_the_leaf_under_it() {
+fn sidebar_cursor_skips_folded_members_and_enter_opens_the_leaf_under_it() {
     let mut engine = Engine::new(120, 30).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -6621,28 +6670,52 @@ fn sidebar_cursor_moves_clamps_and_enter_opens_the_leaf_under_it() {
         );
     }
 
-    // Rows while focused: header / explorer / explorer.entry / writer /
-    // writer.draft. Ten Downs must clamp on the last row.
+    // Rows while folded (the default): header / explorer / writer — the
+    // hidden members are not rows, so one Down from the explorer group
+    // lands on the writer group, never on explorer.entry.
     engine.handle_key(key("tab")).expect("tab");
+    engine.handle_key(key("down")).expect("down");
+    engine.handle_key(key("down")).expect("down");
+    let out = render_str(&mut engine);
+    let cursor = cursor_styled_text(&out);
+    assert!(
+        cursor.contains("writer") && !cursor.contains("writer.draft"),
+        "cursor must skip the folded explorer members and land on the writer group: {cursor:?}"
+    );
+
+    // Ten more Downs clamp on the last row — still the writer group,
+    // because folded members are not rows. The full styled frame carries
+    // the (unchanged) highlight the incremental diff would skip.
     for _ in 0..10 {
         engine.handle_key(key("down")).expect("down");
     }
+    let _ = render_str(&mut engine);
+    let cursor = cursor_styled_text(&engine.snapshot_ansi());
+    assert!(
+        cursor.contains("writer") && !cursor.contains("writer.draft"),
+        "cursor must clamp on the last visible row: {cursor:?}"
+    );
+
+    // Enter unfolds writer; Down reaches the now-visible leaf; Enter
+    // opens ITS agent view.
+    engine.handle_key(key("enter")).expect("enter");
+    engine.handle_key(key("down")).expect("down");
     let out = render_str(&mut engine);
     let cursor = cursor_styled_text(&out);
     assert!(
         cursor.contains("writer.draft"),
-        "cursor must clamp on the last row: {cursor:?}"
+        "after unfolding, Down must land on the member leaf: {cursor:?}"
     );
     engine.handle_key(key("enter")).expect("enter");
     let out = render_str(&mut engine);
     assert!(
         out.contains("agent · writer.draft [read-only]"),
-        "Enter on the clamped leaf must open ITS agent view: {out:?}"
+        "Enter on the leaf must open ITS agent view: {out:?}"
     );
     engine.handle_key(key("q")).expect("q");
 
     // Ten Ups clamp back on row 1 (run header) — Enter there is the
-    // reserved no-op, not a view.
+    // reserved no-op, not a view and not a fold.
     for _ in 0..10 {
         engine.handle_key(key("up")).expect("up");
     }
@@ -6656,15 +6729,6 @@ fn sidebar_cursor_moves_clamps_and_enter_opens_the_leaf_under_it() {
     assert!(
         cursor.contains("MAG demo"),
         "cursor must clamp on the first row: {cursor:?}"
-    );
-
-    // Enter on a GROUP row (row 2) is the reserved no-op too.
-    engine.handle_key(key("down")).expect("down");
-    engine.handle_key(key("enter")).expect("enter");
-    let out = render_str(&mut engine);
-    assert!(
-        !out.contains("[read-only]"),
-        "Enter on a group row must stay a no-op (reserved for fold/unfold): {out:?}"
     );
 }
 
@@ -6697,12 +6761,9 @@ fn scoped_streams_are_captured_per_actor_and_stay_out_of_the_transcript() {
         "foreign deltas must stay out of the lead transcript: {out:?}"
     );
 
-    // Tab → down ×2 (header, group, actor) → Enter opens the agent view
-    // showing the captured buffer.
-    engine.handle_key(key("tab")).expect("tab");
-    engine.handle_key(key("down")).expect("down");
-    engine.handle_key(key("down")).expect("down");
-    let _ = render_str(&mut engine);
+    // Tab → unfold the worker group → cursor on the leaf → Enter opens
+    // the agent view showing the captured buffer.
+    focus_worker_leaf(&mut engine);
     engine.take_emit_queue(); // drain — the view must add nothing
     engine.handle_key(key("enter")).expect("enter");
     let out = render_str(&mut engine);
@@ -6744,13 +6805,11 @@ fn agent_view_is_read_only_and_closes_back_to_sidebar_then_prompt() {
         }),
     );
 
-    engine.handle_key(key("tab")).expect("tab");
-    // Render between the focus flip and Enter: the Rust router reads
-    // the prompt's `focused` flag off the last reconciled tree, and the
-    // real event loop repaints after every event.
-    let _ = render_str(&mut engine);
-    engine.handle_key(key("down")).expect("down");
-    engine.handle_key(key("down")).expect("down");
+    // Tab, unfold the worker group, land on the leaf (the helper renders
+    // between the focus flip and the keys: the Rust router reads the
+    // prompt's `focused` flag off the last reconciled tree, and the real
+    // event loop repaints after every event), then open the view.
+    focus_worker_leaf(&mut engine);
     engine.handle_key(key("enter")).expect("enter");
     let out = render_str(&mut engine);
     assert!(out.contains("[read-only]"), "view should be open: {out:?}");
@@ -6796,14 +6855,21 @@ fn agent_view_is_read_only_and_closes_back_to_sidebar_then_prompt() {
         "Enter must re-open the view for the preserved cursor row: {out:?}"
     );
 
-    // q also closes; a second Esc hands focus back to the prompt, where
-    // typing lands in the input again.
+    // q also closes; a second Esc hands focus back to the prompt. The
+    // unfolded members STAY on screen — fold state is stored, not
+    // focus-implied — and typing lands in the input again.
     engine.handle_key(key("q")).expect("q");
     engine.handle_key(key("escape")).expect("escape");
-    let out = render_str(&mut engine);
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
     assert!(
-        !out.contains("  ● worker.llm"),
-        "second Esc must collapse the members (prompt focused): {out:?}"
+        snap.contains("worker.llm"),
+        "fold state must survive handing focus back to the prompt:\n{snap}"
+    );
+    let cursor = cursor_styled_text(&engine.snapshot_ansi());
+    assert!(
+        !cursor.contains("worker.llm"),
+        "the cursor highlight must leave with sidebar focus: {cursor:?}"
     );
     for ch in ["z", "q", "z"] {
         engine.handle_key(key(ch)).expect("type");
@@ -6816,7 +6882,7 @@ fn agent_view_is_read_only_and_closes_back_to_sidebar_then_prompt() {
 }
 
 #[test]
-fn stale_running_actor_shows_idle_warning_in_sidebar_and_view_header() {
+fn stale_warning_flags_busy_and_silent_only() {
     let mut engine = engine_with_scoped_worker();
     dispatch_event(
         &mut engine,
@@ -6827,21 +6893,20 @@ fn stale_running_actor_shows_idle_warning_in_sidebar_and_view_header() {
         }),
     );
 
-    // Fresh activity: no idle alarm on the focused member row.
-    engine.handle_key(key("tab")).expect("tab");
-    let out = render_str(&mut engine);
+    // Unfold the group; fresh activity: no stale alarm on the working row.
+    let out = focus_worker_leaf(&mut engine);
     assert!(
-        out.contains("worker.llm") && !out.contains("⚠ idle"),
-        "fresh activity must not flag idle: {out:?}"
+        out.contains("worker.llm") && !out.contains('⚠'),
+        "fresh activity must not flag stale: {out:?}"
     );
 
-    // Past the 30s staleness threshold the running row grows the alarm.
+    // Past the 30s silence threshold the WORKING row grows the alarm.
     engine.advance_time(Duration::from_millis(31_000));
-    engine.handle_key(key("down")).expect("down");
+    engine.handle_key(key("up")).expect("up");
     let out = render_str(&mut engine);
     assert!(
-        out.contains("⚠ idle 3"),
-        "stale running actor must carry the idle alarm on its row: {out:?}"
+        out.contains("⚠ stale 3"),
+        "a busy-and-silent actor must carry the stale alarm on its row: {out:?}"
     );
 
     // And the agent-view header carries the same diagnostic.
@@ -6851,6 +6916,20 @@ fn stale_running_actor_shows_idle_warning_in_sidebar_and_view_header() {
     assert!(
         out.contains("⚠ last event 3") && out.contains("(delta)"),
         "view header must warn about the stale last activity: {out:?}"
+    );
+    engine.handle_key(key("q")).expect("q");
+
+    // The activation settles: an IDLE actor with the same silent stream
+    // must NOT warn — idle-between-rounds is silence by design.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_idle", "run_id": "sub-1", "id": "worker.llm" }),
+    );
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    assert!(
+        !snap.contains('⚠'),
+        "an idle (between-activations) actor must never warn:\n{snap}"
     );
 }
 
@@ -6869,10 +6948,7 @@ fn unscoped_and_unknown_scope_chat_ids_are_ignored_by_capture() {
         json!({ "kind": "chat.stream.delta", "chat_id": "r9/ghost.llm@r1", "text": "GHOST" }),
     );
 
-    engine.handle_key(key("tab")).expect("tab");
-    let _ = render_str(&mut engine); // refresh the tree so Enter bubbles
-    engine.handle_key(key("down")).expect("down");
-    engine.handle_key(key("down")).expect("down");
+    focus_worker_leaf(&mut engine);
     engine.handle_key(key("enter")).expect("enter");
     let out = render_str(&mut engine);
     assert!(
@@ -6882,5 +6958,184 @@ fn unscoped_and_unknown_scope_chat_ids_are_ignored_by_capture() {
     assert!(
         !out.contains("UNSCOPED") && !out.contains("GHOST"),
         "unattributable streams must not leak into the view: {out:?}"
+    );
+}
+
+/// Boot a chat surface with one MAG run (`loop`) carrying a two-member
+/// `lead` group cycling like an agent loop: `lead.llm` working,
+/// `lead.run-tool` spawned-but-pending. Shared setup for the
+/// activity-ticking tests.
+fn engine_with_cycling_group() -> Engine {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "loop-1", "run_name": "loop", "scope": "r4" }),
+    );
+    for id in ["lead.llm", "lead.run-tool"] {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "mag.actor_spawned", "run_id": "loop-1", "id": id, "factory": "stub" }),
+        );
+    }
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_ready", "run_id": "loop-1", "id": "lead.llm" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_busy", "run_id": "loop-1", "id": "lead.llm" }),
+    );
+    engine
+}
+
+#[test]
+fn member_rows_tick_per_activation_and_idle_rows_do_not() {
+    let mut engine = engine_with_cycling_group();
+
+    // Unfold the lead group.
+    engine.handle_key(key("tab")).expect("tab");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("down")).expect("down");
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = render_str(&mut engine);
+
+    // 5s in: the working member ticks, the pending one carries no timer.
+    // Full-frame snapshots throughout: the incremental diff repaints only
+    // changed rows, and "does not tick" IS an unchanged row.
+    engine.advance_time(Duration::from_millis(5_000));
+    engine.handle_key(key("down")).expect("down");
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    assert!(
+        snap.contains("lead.llm  working 5s"),
+        "the working member must tick its activation elapsed:\n{snap}"
+    );
+    assert!(
+        snap.contains("lead.run-tool  pending") && !snap.contains("pending 5"),
+        "a pending member must not tick:\n{snap}"
+    );
+
+    // The loop hands over: llm settles idle, run-tool goes busy. Only the
+    // working member ticks; the idle one renders quietly, timer-less.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_idle", "run_id": "loop-1", "id": "lead.llm", "busy_ms": 5000 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_ready", "run_id": "loop-1", "id": "lead.run-tool" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_busy", "run_id": "loop-1", "id": "lead.run-tool" }),
+    );
+    engine.advance_time(Duration::from_millis(3_000));
+    engine.handle_key(key("down")).expect("down");
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    assert!(
+        snap.contains("lead.run-tool  working 3s"),
+        "the newly-busy member ticks its OWN activation window:\n{snap}"
+    );
+    assert!(
+        snap.contains("lead.llm  idle")
+            && !snap.contains("idle 3s")
+            && !snap.contains("idle 5s")
+            && !snap.contains("idle 8s"),
+        "an idle member renders without a timer:\n{snap}"
+    );
+    assert!(
+        !snap.contains("working 8s"),
+        "no member may tick the run's wall clock:\n{snap}"
+    );
+
+    // The loop cycles back: a fresh llm activation RESETS its timer —
+    // per-activation elapsed, not accumulated life.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_idle", "run_id": "loop-1", "id": "lead.run-tool", "busy_ms": 3000 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_busy", "run_id": "loop-1", "id": "lead.llm" }),
+    );
+    engine.advance_time(Duration::from_millis(2_000));
+    engine.handle_key(key("up")).expect("up");
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    assert!(
+        snap.contains("lead.llm  working 2s"),
+        "a fresh activation must reset the member timer:\n{snap}"
+    );
+
+    // Group row: the WHOLE-RUN clock keeps ticking even with every member
+    // idle — the loop is alive between rounds.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_idle", "run_id": "loop-1", "id": "lead.llm", "busy_ms": 2000 }),
+    );
+    engine.advance_time(Duration::from_millis(4_000));
+    engine.handle_key(key("up")).expect("up");
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    assert!(
+        snap.contains("lead (2) 14s"),
+        "the group row must keep ticking the whole-run clock while members idle:\n{snap}"
+    );
+    assert!(
+        !snap.contains("working"),
+        "no member is working between rounds:\n{snap}"
+    );
+}
+
+#[test]
+fn collapsed_group_row_hints_the_busy_member() {
+    let mut engine = engine_with_cycling_group();
+
+    // Collapsed (the default, prompt focused): the busy member's short
+    // name trails the group row.
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("→llm"),
+        "a collapsed group with a busy member must hint it: {out:?}"
+    );
+    assert!(
+        !out.contains("lead.llm"),
+        "the hint must not expand the group: {out:?}"
+    );
+
+    // The activation settles: the hint leaves with the busy state.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_idle", "run_id": "loop-1", "id": "lead.llm", "busy_ms": 100 }),
+    );
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    assert!(
+        !snap.contains("→llm"),
+        "an all-idle collapsed group carries no hint:\n{snap}"
+    );
+
+    // Unfolded, the member row itself carries the signal — no hint on the
+    // group row even while busy.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_busy", "run_id": "loop-1", "id": "lead.llm" }),
+    );
+    engine.handle_key(key("tab")).expect("tab");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("down")).expect("down");
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    assert!(
+        snap.contains("lead.llm  working"),
+        "the unfolded member row carries the busy signal:\n{snap}"
+    );
+    assert!(
+        !snap.contains("→llm"),
+        "an unfolded group row drops the hint:\n{snap}"
     );
 }

@@ -422,7 +422,11 @@ function M.agent_view(state)
   local status_line = glyph .. " " .. status
   if node ~= nil then
     local elapsed
-    if status == "running" then
+    if status == "working" then
+      -- The CURRENT activation's window (mag.actor_busy stamp), matching
+      -- the sidebar member row's per-activation timer.
+      elapsed = now_ms - (node.activation_started_at_ms or node.started_at_ms or now_ms)
+    elseif status == "running" then
       elapsed = now_ms - (node.started_at_ms or now_ms)
     elseif node.finished_at_ms ~= nil then
       elapsed = node.finished_at_ms - (node.started_at_ms or node.finished_at_ms)
@@ -432,12 +436,14 @@ function M.agent_view(state)
     end
   end
 
+  -- Stale = busy-and-silent: only a WORKING actor whose stream went quiet
+  -- past the threshold warns. Idle-between-rounds is silence by design.
   local activity_line, activity_style
   if stream ~= nil and stream.last_activity_ms ~= nil then
-    local idle = now_ms - stream.last_activity_ms
-    activity_line = "last event " .. run_panel.fmt_elapsed_ms(idle)
+    local silent = now_ms - stream.last_activity_ms
+    activity_line = "last event " .. run_panel.fmt_elapsed_ms(silent)
       .. " ago (" .. (stream.last_activity_kind or "?") .. ")"
-    if status == "running" and idle >= agent_streams.STALE_MS then
+    if status == "working" and silent >= agent_streams.STALE_MS then
       activity_line = "⚠ " .. activity_line
       activity_style = STYLE.panel_stale
     else
