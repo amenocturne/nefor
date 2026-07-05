@@ -973,6 +973,14 @@ local function mark_mag_actor(body, status)
   elseif status == "killed" then
     node.status = "killed"
     node.completed_at = node.completed_at or ts
+  elseif status == "done" then
+    -- A completed run's teardown sweep (mag.actor_killed reason
+    -- "run_complete"): the node finished, it wasn't terminated. Terminal
+    -- states (killed from a mid-run kill) keep their truth.
+    if node.status == "pending" or node.status == "running" then
+      node.status = "done"
+      node.completed_at = node.completed_at or ts
+    end
   end
 end
 
@@ -1692,7 +1700,11 @@ local function receive_msg(entry)
     return
   end
   if kind == "mag.actor_killed" then
-    mark_mag_actor(body, "killed")
+    -- Teardown after a successful completion (reason "run_complete") is
+    -- bookkeeping, not death: graph-status/result blocks report done. All
+    -- other reasons (mid-run kill, run_failed, kill_run, session reap)
+    -- report killed as before.
+    mark_mag_actor(body, body.reason == "run_complete" and "done" or "killed")
     return
   end
   if kind == "mag.run_complete" then

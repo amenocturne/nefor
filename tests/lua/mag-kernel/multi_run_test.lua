@@ -175,11 +175,13 @@ assert_true(kernel.take_run_complete("run-A") == nil,
 -- (e) teardown after complete: end_run reaps run-B only
 -- ==================================================================
 
-assert_true(kernel.end_run("run-B"), "run-B context existed")
+assert_true(kernel.end_run("run-B", "run_complete"), "run-B context existed")
 local b_teardown = drain_emitted()
 local b_killed = {}
 for _, e in ipairs(by_kind(b_teardown, "mag.actor_killed")) do
   assert_eq(e.run_id, "run-B", "teardown kills are stamped with run-B")
+  assert_eq(e.reason, "run_complete",
+    "post-complete teardown kills carry reason run_complete")
   b_killed[e.id] = true
 end
 assert_true(b_killed["agent"] and b_killed["sink"], "run-B's leftovers are reaped")
@@ -200,6 +202,8 @@ local a_kill_wire = drain_emitted()
 local a_killed = by_kind(a_kill_wire, "mag.actor_killed")
 assert_eq(#a_killed, 1, "one actor killed")
 assert_eq(a_killed[1].run_id, "run-A", "the kill event is run-A's")
+assert_eq(a_killed[1].reason, "modification",
+  "a kill entry in an applied modification carries reason modification")
 -- The dying llm's provider-cancel reached the bus with run-A's scoped handle.
 local cancels = filter(a_kill_wire, function(b) return b.kind == "prov.chat.cancel" end)
 assert_eq(#cancels, 1, "the dying llm aborts its provider request")
@@ -217,9 +221,17 @@ assert_eq(kernel.bus_response({ id = c_invoke.id, result = { text = "answer-C" }
   "run-C's correlation still resolves after run-A's kill")
 assert_true(kernel.take_run_complete("run-C") ~= nil, "run-C completes")
 drain_emitted()
-kernel.end_run("run-C")
+kernel.end_run("run-C", "run_complete")
+-- An end_run with no reason is an outright kill (the mag.kill_run path):
+-- its teardown kills carry reason "killed".
 kernel.end_run("run-A")
-drain_emitted()
+local kill_teardown = drain_emitted()
+local reasons = {}
+for _, e in ipairs(by_kind(kill_teardown, "mag.actor_killed")) do
+  reasons[e.run_id] = e.reason
+end
+assert_eq(reasons["run-C"], "run_complete", "run-C teardown carries its reason")
+assert_eq(reasons["run-A"], "killed", "kill_run-path teardown carries reason killed")
 
 -- ==================================================================
 -- (f) session-boundary reaping: a new session's begin_run reaps stale
@@ -241,6 +253,7 @@ assert_eq(#reap_cancels, 1, "the reaped run's llm aborts its provider request")
 assert_eq(reap_cancels[1].chat_id, "r4/agent@r1", "the cancel names run-E's scoped chat")
 for _, e in ipairs(by_kind(reap_wire, "mag.actor_killed")) do
   assert_eq(e.run_id, "run-E", "reap kills are stamped with the stale run's id")
+  assert_eq(e.reason, "reaped", "session-boundary reap kills carry reason reaped")
 end
 
 -- A same-session sibling is NOT reaped: run-G under s2 leaves run-F alone.

@@ -24,7 +24,11 @@
 --   mag.actor_spawned          the fold registered a new id (never-existed→alive)
 --   mag.actor_ready            the instance constructed at its first activation
 --                              and confirmed (routing) — "began work"
---   mag.actor_killed           the fold killed a live id (alive→dead)
+--   mag.actor_killed           the fold killed a live id (alive→dead); carries
+--                              `reason` — "modification" for a kill entry in an
+--                              applied mod, or the teardown reason the caller
+--                              threads through apply's opts ("run_complete" /
+--                              "run_failed" / "killed" / "reaped"; init.lua)
 --   mag.modification_applied   a validated mod that changed state
 --   mag.modification_rejected  a validation failure (carries the error)
 --   mag.modification_noop      a validated mod whose ops were all race no-ops
@@ -102,11 +106,15 @@ end
 -- modification-log entry from the state diff around inventory.apply. Returns the
 -- inventory's own result verbatim ({ ok = true } | { ok = false, error = ... }),
 -- so this is a transparent wrapper for callers.
-function M:apply(modification)
+-- `opts.kill_reason` names why this modification's kills happen — display
+-- semantics for the control plane, not mechanics. Absent (the normal in-run
+-- path) it defaults to "modification"; run-context teardown threads its
+-- terminal reason through here (init.lua reap_run).
+function M:apply(modification, opts)
   modification = modification or {}
   local pre = self:snapshot(modification)
   local result = self.inventory.apply(modification)
-  return self:observe(modification, pre, result)
+  return self:observe(modification, pre, result, opts)
 end
 
 -- Snapshot the pre-apply lifecycle state of every id the modification touches,
@@ -127,7 +135,8 @@ function M:snapshot(modification)
 end
 
 -- Diff the fold boundary and emit events + record the log entry.
-function M:observe(modification, pre, result)
+function M:observe(modification, pre, result, opts)
+  local kill_reason = (opts and opts.kill_reason) or "modification"
   if not result.ok then
     self.emit_event({
       kind = EVENTS.modification_rejected,
@@ -165,7 +174,7 @@ function M:observe(modification, pre, result)
     if type(id) == "string" then
       if pre[id] == "alive" and self.inventory.state_of(id) == "dead" then
         killed[#killed + 1] = id
-        self.emit_event({ kind = EVENTS.actor_killed, id = id })
+        self.emit_event({ kind = EVENTS.actor_killed, id = id, reason = kill_reason })
       else
         noops[#noops + 1] = {
           op = "kill",

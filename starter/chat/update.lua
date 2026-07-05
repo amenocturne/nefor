@@ -1229,7 +1229,7 @@ local function handle_mag_actor_killed(msg, state)
   local run_id = msg.run_id
   local id = msg.id
   if type(run_id) ~= "string" or type(id) ~= "string" or id == "" then return state, {} end
-  return run_panel.actor_killed(state, run_id, id, tui.now_ms()), {}
+  return run_panel.actor_killed(state, run_id, id, tui.now_ms(), msg.reason), {}
 end
 
 local function handle_mag_modification_rejected(msg, state)

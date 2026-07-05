@@ -44,6 +44,29 @@ pub struct BeginRunOutcome {
     pub reaped: Vec<String>,
 }
 
+/// Why a run context is torn down. Threaded through `end_run` onto every
+/// `mag.actor_killed` the teardown emits — display semantics for consumers
+/// (a completed run's sweep must not read as death), not mechanics: kill
+/// handlers run and abort envelopes flush identically for every reason.
+/// The kernel's fourth reason, `reaped` (session-boundary sweep), is minted
+/// Lua-side inside `begin_run` and never passes through here.
+#[derive(Debug, Clone, Copy)]
+pub enum TeardownReason {
+    RunComplete,
+    RunFailed,
+    Killed,
+}
+
+impl TeardownReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RunComplete => "run_complete",
+            Self::RunFailed => "run_failed",
+            Self::Killed => "killed",
+        }
+    }
+}
+
 /// A run's terminal signal, surfaced from the sink through the kernel
 /// (`mag.run_complete`). Carries the sink's final result INLINE plus the
 /// persisted output path: the terminal reply is the one place the control
@@ -181,11 +204,14 @@ impl LuaHost {
 
     /// End a run: the kernel reaps the context's live actors through the fold
     /// (kill handlers run — abort/cancel envelopes land on the emit queue; the
-    /// caller drains them) and drops the context. Returns whether a live
-    /// context existed.
-    pub fn end_run(&self, run_id: &str) -> Result<bool, MagError> {
+    /// caller drains them) and drops the context. The reason stamps every
+    /// `mag.actor_killed` the teardown emits, so consumers can tell a
+    /// completed run's bookkeeping sweep from a real termination
+    /// (docs/actor-model.md, Kill reasons). Returns whether a live context
+    /// existed.
+    pub fn end_run(&self, run_id: &str, reason: TeardownReason) -> Result<bool, MagError> {
         let f: Function = self.kernel.get("end_run")?;
-        Ok(f.call::<bool>(run_id)?)
+        Ok(f.call::<bool>((run_id, reason.as_str()))?)
     }
 
     /// Deliver a correlated capability response (tool.result-shaped) back to

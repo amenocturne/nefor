@@ -646,7 +646,13 @@ function M.actor_ready(state, run_id, actor_id, now_ms)
   end)
 end
 
-function M.actor_killed(state, run_id, actor_id, now_ms)
+-- `reason` is the kernel's teardown taxonomy (mag-kernel observer.lua):
+-- "run_complete" marks the bookkeeping sweep after a SUCCESSFUL completion —
+-- the node stays/goes done (✓), never killed, so a finished run doesn't
+-- repaint red. Every other reason ("modification" / "run_failed" / "killed" /
+-- "reaped", or absent) renders killed (⊗) as before; the group rule "killed
+-- if any member killed" thereby scopes to non-teardown kills.
+function M.actor_killed(state, run_id, actor_id, now_ms, reason)
   if not (state.runs and state.runs[run_id]
       and state.runs[run_id].nodes
       and state.runs[run_id].nodes[actor_id]) then
@@ -655,7 +661,20 @@ function M.actor_killed(state, run_id, actor_id, now_ms)
   return apply(state, run_id, function(prev)
     local nodes = {}
     for k, v in pairs(prev.nodes or {}) do nodes[k] = v end
-    nodes[actor_id] = shallow_merge(nodes[actor_id], {
+    local node = nodes[actor_id]
+    if reason == "run_complete" then
+      -- mag.run_complete normally precedes the teardown and already flipped
+      -- live nodes to done; flip any straggler here and leave terminal
+      -- states (done/killed/error) untouched.
+      if node.status ~= "pending" and node.status ~= "running" then
+        return prev
+      end
+      nodes[actor_id] = shallow_merge(node, {
+        status = "done", finished_at_ms = now_ms,
+      })
+      return shallow_merge(prev, { nodes = nodes })
+    end
+    nodes[actor_id] = shallow_merge(node, {
       status = "killed", finished_at_ms = now_ms,
     })
     return shallow_merge(prev, { nodes = nodes })

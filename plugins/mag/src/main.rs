@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 
 use crate::bridge::CapabilityBridge;
 use crate::error::MagError;
-use crate::kernel::{LuaHost, RunCompletion};
+use crate::kernel::{LuaHost, RunCompletion, TeardownReason};
 
 /// A run driven asynchronously to completion: the execute reply is deferred
 /// until that run signals `mag.run_complete` or `mag.run_failed` (via inbound
@@ -316,22 +316,28 @@ async fn settle_run(
     if !active.contains_key(run_id) {
         return Ok(());
     }
-    let terminal = if let Some(rc) = host.take_run_complete(run_id)? {
-        Some(run_result_ok(None, run_id, &rc))
+    // The teardown reason rides the reap's `mag.actor_killed` events so
+    // consumers can tell a completed run's bookkeeping sweep from a real
+    // termination.
+    let (mut reply, reason) = if let Some(rc) = host.take_run_complete(run_id)? {
+        (
+            run_result_ok(None, run_id, &rc),
+            TeardownReason::RunComplete,
+        )
+    } else if let Some(error) = host.take_run_failed(run_id)? {
+        (
+            run_result_failed(None, run_id, &error),
+            TeardownReason::RunFailed,
+        )
     } else {
-        host.take_run_failed(run_id)?
-            .map(|error| run_result_failed(None, run_id, &error))
-    };
-    let mut reply = match terminal {
-        Some(reply) => reply,
-        None => return Ok(()),
+        return Ok(());
     };
     let a = active.remove(run_id).expect("checked above");
     if let Some(id) = a.in_reply_to {
         reply.insert("in_reply_to".into(), Value::String(id));
     }
     send_event(out_tx, reply).await?;
-    host.end_run(run_id)?;
+    host.end_run(run_id, reason)?;
     flush_emits(out_tx, host, bridge).await
 }
 
@@ -544,7 +550,7 @@ async fn handle_execute(
     if !outcome.ok {
         let msg = outcome.error.unwrap_or_else(|| "start failed".into());
         send_event(out_tx, run_result_failed(in_reply_to, &run_id, &msg)).await?;
-        host.end_run(&run_id)?;
+        host.end_run(&run_id, TeardownReason::RunFailed)?;
         return flush_emits(out_tx, host, bridge).await;
     }
 
@@ -552,14 +558,21 @@ async fn handle_execute(
     // context down (reaping any still-live actors — e.g. a parallel branch —
     // through the fold).
     let terminal = if let Some(rc) = host.take_run_complete(&run_id)? {
-        Some(run_result_ok(in_reply_to, &run_id, &rc))
+        Some((
+            run_result_ok(in_reply_to, &run_id, &rc),
+            TeardownReason::RunComplete,
+        ))
     } else {
-        host.take_run_failed(&run_id)?
-            .map(|error| run_result_failed(in_reply_to, &run_id, &error))
+        host.take_run_failed(&run_id)?.map(|error| {
+            (
+                run_result_failed(in_reply_to, &run_id, &error),
+                TeardownReason::RunFailed,
+            )
+        })
     };
-    if let Some(reply) = terminal {
+    if let Some((reply, reason)) = terminal {
         send_event(out_tx, reply).await?;
-        host.end_run(&run_id)?;
+        host.end_run(&run_id, reason)?;
         return flush_emits(out_tx, host, bridge).await;
     }
 
@@ -745,7 +758,7 @@ async fn handle_kill_run(
             return Ok(());
         }
     };
-    host.end_run(run_id)?;
+    host.end_run(run_id, TeardownReason::Killed)?;
     flush_emits(out_tx, host, bridge).await?;
     send_event(out_tx, run_result_killed(a.in_reply_to.as_deref(), run_id)).await
 }

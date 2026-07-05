@@ -216,6 +216,8 @@ do
   assert_eq(events[6].result.text, "done", "run-complete carries the final result")
   assert_eq(events[6].persisted, true, "run-complete carries the persisted flag")
   assert_eq(events[7].id, "B", "kill event names the killed id")
+  assert_eq(events[7].reason, "modification",
+    "an in-run kill entry carries the default reason")
 end
 
 -- ==================================================================

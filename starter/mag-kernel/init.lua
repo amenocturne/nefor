@@ -304,7 +304,12 @@ end
 -- bus and the routing layer forgets per-id state — then drop the context.
 -- Dropping is the whole "reset": the next run gets a fresh context, i.e. a
 -- fold starting from NullGraph, so ids are freely reusable across runs.
-local function reap_run(run_id)
+--
+-- `reason` names WHY the teardown happens and rides every `mag.actor_killed`
+-- the reap emits (observer.lua) — "run_complete" / "run_failed" / "killed" /
+-- "reaped" — so consumers can tell a completed run's bookkeeping sweep from a
+-- real termination. Mechanics are identical for all reasons.
+local function reap_run(run_id, reason)
   local ctx = runs[run_id]
   if not ctx then
     return false
@@ -317,7 +322,7 @@ local function reap_run(run_id)
   end
   if #leftovers > 0 then
     table.sort(leftovers)
-    ctx.observer:apply({ kills = leftovers })
+    ctx.observer:apply({ kills = leftovers }, { kill_reason = reason })
   end
   runs[run_id] = nil
   return true
@@ -365,7 +370,7 @@ return {
     end
     table.sort(stale)
     for _, run_id in ipairs(stale) do
-      reap_run(run_id)
+      reap_run(run_id, "reaped")
     end
     local ctx = new_run_context(meta)
     runs[meta.run_id] = ctx
@@ -419,9 +424,11 @@ return {
   -- End a run: reap its live actors through the fold (kill handlers run —
   -- abort/cancel envelopes reach the bus) and drop the context. The host calls
   -- this once the run settled (complete / failed); killing a run outright is
-  -- the same call. Returns true when a context existed.
-  end_run = function(run_id)
-    return reap_run(run_id)
+  -- the same call. `reason` stamps the teardown's `mag.actor_killed` events
+  -- ("run_complete" / "run_failed" / "killed"); absent, the teardown is an
+  -- outright kill. Returns true when a context existed.
+  end_run = function(run_id, reason)
+    return reap_run(run_id, reason or "killed")
   end,
 
   -- The registered factory names — the control plane validates reasoner/factory

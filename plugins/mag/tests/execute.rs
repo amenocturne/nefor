@@ -252,6 +252,29 @@ async fn executes_synchronous_sink_program_and_streams_lifecycle_events() {
         "the persisted file carries the final answer; got {content:?}"
     );
 
+    // Post-complete teardown: ending the run's context reaps the still-live
+    // sink through the fold, and the sweep's `mag.actor_killed` carries
+    // reason "run_complete" — a completed run's bookkeeping, distinguishable
+    // from a failure or a user kill (docs/actor-model.md, Kill reasons).
+    let mut teardown_seen: Vec<String> = Vec::new();
+    let killed = read_collecting(&mut reader, "mag.actor_killed", &mut teardown_seen).await;
+    let killed_body = event_body(&killed).expect("actor_killed event body");
+    assert_eq!(
+        killed_body.get("run_id").and_then(Value::as_str),
+        Some("sink-run"),
+        "the teardown kill is stamped with the completed run's id"
+    );
+    assert_eq!(
+        killed_body.get("id").and_then(Value::as_str),
+        Some("sink"),
+        "the teardown reaps the still-live sink"
+    );
+    assert_eq!(
+        killed_body.get("reason").and_then(Value::as_str),
+        Some("run_complete"),
+        "post-complete teardown kills carry reason run_complete"
+    );
+
     // Teardown.
     write_env(
         &mut stdin,

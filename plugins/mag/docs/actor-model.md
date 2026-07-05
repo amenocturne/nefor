@@ -153,6 +153,25 @@ the graceful path, not the system its correctness.
 The universal set stays aggressively small: each entry taxes every actor
 forever. The bar is "the system cannot work without it", not "handy".
 
+### Kill reasons (control-plane events)
+
+Every `mag.actor_killed` lifecycle event carries a `reason` naming why the
+kernel killed the id — display semantics for consumers, not mechanics: kill
+handlers run, abort envelopes flush, and ordering is identical for every
+reason.
+
+| Reason         | Emitted when                                                                                  |
+| -------------- | --------------------------------------------------------------------------------------------- |
+| `modification` | a kill entry in an applied modification — the mid-run control-plane / rule kill (the default) |
+| `run_complete` | run-context teardown after the sink signalled successful completion                           |
+| `run_failed`   | run-context teardown after an unhandled actor failure ended the run                           |
+| `killed`       | run-context teardown for an outright kill (`mag.kill_run`)                                    |
+| `reaped`       | session-boundary sweep: a new session's `begin_run` reaped a stale context                    |
+
+Consumers render `run_complete` teardown kills as completion — the node stays
+done, so a successful run never repaints as terminated — and every other
+reason as a real kill.
+
 **No injected behavior.** There is no wrapper that composes standard handlers
 around actor logic. An actor's source is the whole truth: reading a factory
 definition shows exactly which signals it handles and how. Conformance is

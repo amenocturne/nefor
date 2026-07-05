@@ -950,6 +950,81 @@ fn mag_killed_actor_renders_distinct_glyph() {
     );
 }
 
+// A completed run's teardown sweep is bookkeeping, not death: after
+// `mag.run_complete` the kernel reaps the run's still-live actors and stamps
+// those `mag.actor_killed` events with reason "run_complete"
+// (plugins/mag/docs/actor-model.md, Kill reasons). The panel keeps the ✓ the
+// completion painted — a successful run must never repaint ⊗ — while a kill
+// with any other reason still renders ⊗.
+#[test]
+fn mag_post_complete_teardown_keeps_done_glyphs() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "mag-done-1", "run_name": "finisher" }),
+    );
+    for id in ["writer.draft", "sink"] {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "mag.actor_spawned", "run_id": "mag-done-1", "id": id, "factory": "llm" }),
+        );
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "mag.actor_ready", "run_id": "mag-done-1", "id": id }),
+        );
+    }
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_complete", "run_id": "mag-done-1", "from": "sink" }),
+    );
+    // The plugin ends the run context after the terminal reply; the sweep's
+    // killed events arrive on the wire stamped run_complete.
+    for id in ["writer.draft", "sink"] {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "mag.actor_killed", "run_id": "mag-done-1", "id": id, "reason": "run_complete" }),
+        );
+    }
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    assert!(
+        !snap.contains('\u{2297}'),
+        "post-complete teardown kills must not repaint groups killed:\n{snap}"
+    );
+    assert!(
+        snap.contains('\u{2713}'),
+        "completed groups keep the done glyph through the teardown sweep:\n{snap}"
+    );
+
+    // Contrast: a kill with a non-completion reason still renders ⊗.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "mag-done-2", "run_name": "victim" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_spawned", "run_id": "mag-done-2", "id": "worker.llm", "factory": "llm" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_ready", "run_id": "mag-done-2", "id": "worker.llm" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_killed", "run_id": "mag-done-2", "id": "worker.llm", "reason": "killed" }),
+    );
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    assert_eq!(
+        snap.matches('\u{2297}').count(),
+        1,
+        "a real kill still renders the killed glyph:\n{snap}"
+    );
+}
+
 // Grouping across multiple agents: a two-agent run (explorer.* + writer.*)
 // plus a standalone `sink` actor collapses to exactly three group rows.
 // Killing the whole writer subtree marks only the writer group ⊗; the
