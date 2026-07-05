@@ -248,6 +248,10 @@ local function new_run_context(meta)
     bus_emit = bus_emit,
     events = emit_event,
     persist_output = persist_output,
+    -- Host clock for the busy-window stamps (mag.actor_idle's busy_ms).
+    -- nil-safe: routing falls back to a zero clock where the host surface
+    -- lacks now_ms (the bare-VM test stub).
+    now_ms = nefor.now_ms,
     gen_id = function()
       cap_seq = cap_seq + 1
       return scope .. "/cap-" .. tostring(cap_seq)

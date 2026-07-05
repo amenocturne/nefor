@@ -92,6 +92,19 @@ local RUN_COMPLETE = kinds.RunComplete
 local EVT_ACTOR_READY = "mag.actor_ready"
 local EVT_RUN_COMPLETE = kinds.run_complete
 local EVT_RUN_FAILED = kinds.run_failed
+-- Per-actor activity transitions (mirrored in observer.lua's canonical set,
+-- kept literal for the same reason as actor_ready). mag.actor_busy fires at
+-- activation delivery (after construct, before deliver); mag.actor_idle fires
+-- when that activation's completion settles — sync return, async
+-- mag.complete / mag.failed, or a capability reply resolving a pending
+-- completion — failed settles included, carrying the window's busy_ms.
+-- Alternation is strict per actor: an overlapping activation extends the one
+-- open window (no nested busy), and a settle with no open window is a no-op.
+-- Cost: two control-plane events per activation — acceptable; the session
+-- log already carries per-round provider traffic, and activity-honest panel
+-- ticking needs exactly these transitions.
+local EVT_ACTOR_BUSY = "mag.actor_busy"
+local EVT_ACTOR_IDLE = "mag.actor_idle"
 
 local function noop() end
 
@@ -110,6 +123,12 @@ function M.new(opts)
     -- backed writer, tests pass capturing stubs.
     events = opts.events or noop,
     persist_output = opts.persist_output or noop,
+    -- Injected clock for the busy-window stamps (mag.actor_idle's busy_ms).
+    -- init.lua wires the host's nefor.now_ms; pure unit tests pass a fake or
+    -- take the zero default.
+    now_ms = opts.now_ms or function()
+      return 0
+    end,
     log = {
       info = (log.info) or noop,
       warn = (log.warn) or noop,
@@ -123,6 +142,7 @@ function M.new(opts)
     instances = {}, -- id -> instance handle (with :deliver)
     machines = {}, -- id -> { port -> firing machine }
     ready = {}, -- id -> true once the factory confirmed ready
+    busy = {}, -- id -> busy-since stamp while an activation window is open
     signaling = {}, -- id -> true while a signal handler (kill/drain) is running
   }, M)
   return self
@@ -361,8 +381,33 @@ function M:activate(id, activation)
     self.log.warn(string.format("actor '%s' has no deliver entry point", tostring(id)))
     return
   end
+  self:mark_busy(id)
   local completion = instance.deliver(activation)
   self:apply_completion(id, completion)
+end
+
+-- Open the actor's busy window at activation delivery (mag.actor_busy — see
+-- the activity-event comment at the top). Already busy means an overlapping
+-- activation: the one open window extends, no nested busy — the busy/idle
+-- alternation stays strict per actor.
+function M:mark_busy(id)
+  if self.busy[id] then
+    return
+  end
+  self.busy[id] = self.now_ms()
+  self.events({ kind = EVT_ACTOR_BUSY, id = id })
+end
+
+-- Settle the actor's busy window (mag.actor_idle, carrying the window's
+-- busy_ms). A settle with no open window — e.g. a port-bypass delivery that
+-- never went through activate — is a no-op, keeping the alternation strict.
+function M:mark_idle(id)
+  local since = self.busy[id]
+  if since == nil then
+    return
+  end
+  self.busy[id] = nil
+  self.events({ kind = EVT_ACTOR_IDLE, id = id, busy_ms = self.now_ms() - since })
 end
 
 -- Construct the instance for a registered spec via the injected hook — the
@@ -409,9 +454,14 @@ function M:apply_completion(id, completion)
   if completion == "ok" then
     completion = { status = "ok" }
   end
+  -- Any real settle — ok or failed, routed or escalated — closes the busy
+  -- window BEFORE the status type routes downstream, so the wire reads
+  -- idle(this actor) → busy(dependent) in delivery order.
   if completion.status == "ok" then
+    self:mark_idle(id)
     self:route_output(id, UNIT, { kind = UNIT, from = id })
   elseif completion.status == "failed" and completion.failure then
+    self:mark_idle(id)
     local sender = self.inventory.get(id)
     local routed = sender and (sender.routes or {})[completion.failure]
     if routed then
@@ -548,6 +598,7 @@ end
 function M:forget(id)
   self.machines[id] = nil
   self.ready[id] = nil
+  self.busy[id] = nil
   self.instances[id] = nil
   self.signaling[id] = nil
   self.correlation:drop_requester(id)

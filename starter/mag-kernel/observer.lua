@@ -9,11 +9,12 @@
 -- records one ordered entry into the modification log. The inventory is never
 -- modified; every fact here is read from its public surface.
 --
--- Two lifecycle events originate in the delivery layer, not the fold, and so are
--- emitted by routing.lua through the same injected emitter: `mag.actor_ready`
--- (lazy construction confirmed — the actor began work) and `mag.run_complete`
--- (the sink's mag.RunComplete). The event kinds below are the canonical set;
--- routing references the same strings.
+-- Several lifecycle events originate in the delivery layer, not the fold, and
+-- so are emitted by routing.lua through the same injected emitter:
+-- `mag.actor_ready` (lazy construction confirmed — the actor began work),
+-- `mag.actor_busy` / `mag.actor_idle` (the per-activation busy window),
+-- and `mag.run_complete` (the sink's mag.RunComplete). The event kinds below
+-- are the canonical set; routing references the same strings.
 --
 -- ── event-kind set (flagged) ────────────────────────────────────────────────
 -- Parity+ with reasoner-graph's broadcast markers (graph.run_started,
@@ -24,6 +25,13 @@
 --   mag.actor_spawned          the fold registered a new id (never-existed→alive)
 --   mag.actor_ready            the instance constructed at its first activation
 --                              and confirmed (routing) — "began work"
+--   mag.actor_busy             an activation was delivered to the instance —
+--                              the actor's busy window opened (routing)
+--   mag.actor_idle             the activation's completion settled — sync
+--                              return, async ack, or capability reply; failed
+--                              settles included — carrying `busy_ms`, the
+--                              window's length (routing). Strictly alternates
+--                              with actor_busy per actor
 --   mag.actor_killed           the fold killed a live id (alive→dead); carries
 --                              `reason` — "modification" for a kill entry in an
 --                              applied mod, or the teardown reason the caller
@@ -44,6 +52,8 @@ M.EVENTS = {
   run_started = "mag.run_started",
   actor_spawned = "mag.actor_spawned",
   actor_ready = "mag.actor_ready",
+  actor_busy = "mag.actor_busy",
+  actor_idle = "mag.actor_idle",
   actor_killed = "mag.actor_killed",
   modification_applied = "mag.modification_applied",
   modification_rejected = "mag.modification_rejected",

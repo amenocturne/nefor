@@ -204,10 +204,12 @@ impl Wire {
         };
         // Every kernel→control-plane lifecycle event carries its run_id
         // (docs/ir.md, Run contexts), as does the terminal reply.
-        const LIFECYCLE: [&str; 9] = [
+        const LIFECYCLE: [&str; 11] = [
             "mag.run_started",
             "mag.actor_spawned",
             "mag.actor_ready",
+            "mag.actor_busy",
+            "mag.actor_idle",
             "mag.actor_killed",
             "mag.modification_applied",
             "mag.modification_rejected",

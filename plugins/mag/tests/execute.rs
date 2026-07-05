@@ -191,6 +191,8 @@ async fn executes_synchronous_sink_program_and_streams_lifecycle_events() {
         "mag.run_started",
         "mag.actor_spawned",
         "mag.actor_ready",
+        "mag.actor_busy",
+        "mag.actor_idle",
         "mag.modification_applied",
         "mag.run_complete",
     ] {
@@ -200,12 +202,18 @@ async fn executes_synchronous_sink_program_and_streams_lifecycle_events() {
         );
     }
     // Lazy construction keeps the wire order truthful: the sink is spawned at
-    // registration, and readies only when its seed fires it — strictly after.
+    // registration, readies only when its seed fires it, and its busy window
+    // opens strictly after that (activation delivery follows construction).
     let spawned_at = seen.iter().position(|k| k == "mag.actor_spawned");
     let ready_at = seen.iter().position(|k| k == "mag.actor_ready");
+    let busy_at = seen.iter().position(|k| k == "mag.actor_busy");
     assert!(
         spawned_at < ready_at,
         "actor_spawned (registration) precedes actor_ready (first firing); saw {seen:?}"
+    );
+    assert!(
+        ready_at < busy_at,
+        "actor_ready (construction) precedes actor_busy (activation delivery); saw {seen:?}"
     );
 
     let body = event_body(&result).expect("run_result event body");

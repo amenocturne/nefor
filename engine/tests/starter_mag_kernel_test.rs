@@ -50,6 +50,11 @@ fn starter_mag_kernel_observability() {
 }
 
 #[test]
+fn starter_mag_kernel_activity_events() {
+    run_lua_test("tests/lua/mag-kernel/activity_test.lua");
+}
+
+#[test]
 fn starter_mag_kernel_llm_factory() {
     run_lua_test("tests/lua/mag-kernel/llm_test.lua");
 }

@@ -132,6 +132,15 @@ end
 for _, e in ipairs(by_kind(a_wire, "mag.actor_ready")) do
   assert_eq(e.run_id, "run-A", "actor_ready carries run_id")
 end
+-- The activity pair rides the same run-stamped channel: the agent went busy
+-- at its first activation (and stays busy while its provider invoke pends).
+assert_true(#by_kind(a_wire, "mag.actor_busy") >= 1, "actor_busy emitted at activation")
+for _, e in ipairs(by_kind(a_wire, "mag.actor_busy")) do
+  assert_eq(e.run_id, "run-A", "actor_busy carries run_id")
+end
+for _, e in ipairs(by_kind(a_wire, "mag.actor_idle")) do
+  assert_eq(e.run_id, "run-A", "actor_idle carries run_id")
+end
 assert_eq(#by_kind(a_wire, "mag.modification_applied"), 1,
   "run-A initial modification applied")
 assert_eq(by_kind(a_wire, "mag.modification_applied")[1].run_id, "run-A",

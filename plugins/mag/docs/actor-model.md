@@ -139,6 +139,30 @@ The buffering lives in the kernel because it is the flip side of kill —
 spawn = register + buffer, kill = unroute + drop — and factory-side buffering
 would have every factory reimplement the same machinery.
 
+### Activity (control-plane events)
+
+Construction is signaled once, by `mag.actor_ready`. Everything after is a
+cycle of activations, and the kernel announces each one's busy window as a
+pair of control-plane events (snake_case, run_id-stamped like the rest):
+
+- `mag.actor_busy { run_id, id }` — an activation was delivered to the
+  instance (routing's activate, after construct on the first firing). The
+  actor is doing work: an llm actor is busy for exactly its provider round,
+  a run-tool actor for exactly its tool call.
+- `mag.actor_idle { run_id, id, busy_ms }` — that activation's completion
+  settled: a sync return, an async `mag.complete` / `mag.failed` ack, or a
+  capability reply resolving a pending completion. Failed settles emit idle
+  too (alongside the failure's own routing/escalation). `busy_ms` is the
+  window's length.
+
+The pair strictly alternates per actor. An actor that fires again immediately
+just opens a new window — busy follows idle, never nests — and overlapping
+activations extend the one open window instead of emitting a second busy.
+Consumers get activity-honest state for free: busy = working, between
+busy/idle = constructed but idle (an agent loop's actors visibly take turns).
+The cost is two events per activation — accepted; the session log already
+carries per-round provider traffic, which dwarfs this.
+
 ## Signals
 
 The conventions are Unix-shaped. You can write any actor you want and ignore
