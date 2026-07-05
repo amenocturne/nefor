@@ -4,7 +4,9 @@
 -- run_complete, prune) the chat reducer calls.
 
 local common = require("chat.common")
+local agent_streams = require("chat.agent_streams")
 local STYLE   = common.STYLE
+local CURSOR_ROW_STYLE = common.CURSOR_ROW_STYLE
 local shallow_merge = common.shallow_merge
 
 local M = {}
@@ -21,6 +23,9 @@ local GLYPHS = {
   -- failed one (reasoner-graph never had this state — richer-than-parity).
   killed  = "⊗",
 }
+-- Exported for the agent-view popup header (popups.lua) so the status
+-- glyph vocabulary stays single-sourced.
+M.GLYPHS = GLYPHS
 
 local NODE_STYLE = {
   pending = STYLE.panel_pending,
@@ -48,6 +53,7 @@ local function fmt_elapsed_ms(ms)
   if ms == nil then return "" end
   return string.format("%ds", math.floor(ms / 1000))
 end
+M.fmt_elapsed_ms = fmt_elapsed_ms
 
 -- A completed run lingers in the panel for `LINGER_MS` after its
 -- `completed_at_ms` so the user can see the final state. Past that
@@ -92,7 +98,7 @@ function M.any_active(runs, now_ms)
   return false
 end
 
-local function run_header(run)
+local function run_header_title(run)
   -- Reasoner-graph runs key on the abbreviated run id; MAG runs carry a
   -- human `run_name` (the .mag graph name) worth showing verbatim.
   local ident
@@ -120,20 +126,25 @@ local function run_header(run)
   if (run.rejected or 0) > 0 then extra[#extra + 1] = "✗" .. run.rejected .. " rej" end
   if (run.noops or 0) > 0 then extra[#extra + 1] = "⊘" .. run.noops end
   if #extra > 0 then title = title .. "  " .. table.concat(extra, " ") end
-  return tui.text { content = title, style = STYLE.footer, wrap = "none" }
+  return title
 end
 
-local function node_rows(node_id, node, now_ms, narrow)
+-- Elapsed window for a node/actor row: live-ticking while running,
+-- frozen at the finish stamp once terminal.
+local function node_elapsed_ms(node, now_ms)
+  if node.status == "running" then
+    return now_ms - (node.started_at_ms or now_ms)
+  end
+  if TERMINAL_STATUS[node.status] and node.finished_at_ms ~= nil then
+    return node.finished_at_ms - (node.started_at_ms or node.finished_at_ms)
+  end
+  return nil
+end
+
+local function node_row_parts(node_id, node, now_ms, narrow)
   local glyph = GLYPHS[node.status] or "·"
   local style = NODE_STYLE[node.status] or STYLE.status_dim
-  local elapsed
-  if node.status == "running" then
-    elapsed = now_ms - (node.started_at_ms or now_ms)
-  elseif node.status == "done" or node.status == "error" or node.status == "killed" then
-    if node.finished_at_ms ~= nil then
-      elapsed = node.finished_at_ms - (node.started_at_ms or node.finished_at_ms)
-    end
-  end
+  local elapsed = node_elapsed_ms(node, now_ms)
   local elapsed_str = elapsed and (" " .. fmt_elapsed_ms(elapsed)) or ""
   local text
   if narrow then
@@ -144,24 +155,27 @@ local function node_rows(node_id, node, now_ms, narrow)
     text = string.format("%s %s  %s  %s%s",
       glyph, node_id, reasoner, status_word, elapsed_str)
   end
-  local rows = { tui.text { content = text, style = style, wrap = "none" } }
-  -- Indented sub-line: "what the agent inside this node is doing
-  -- right now" (last tool dispatched to tool-gate). Only shown while
-  -- the node is running — once it terminates, the status glyph + the
-  -- transcript carry the signal and the leftover tool name is noise.
-  if node.status == "running" and type(node.last_tool) == "string"
-      and #node.last_tool > 0 then
-    local label = node.last_tool
-    if type(node.last_tool_args) == "string" and #node.last_tool_args > 0 then
-      label = label .. "(" .. node.last_tool_args .. ")"
-    end
-    rows[#rows + 1] = tui.text {
-      content = "  → " .. label,
-      style   = STYLE.status_dim,
-      wrap    = "none",
-    }
+  return text, style
+end
+
+-- Indented sub-line: "what the agent inside this node is doing right
+-- now" (last tool dispatched to tool-gate). Only shown while the node
+-- is running — once it terminates, the status glyph + the transcript
+-- carry the signal and the leftover tool name is noise.
+local function node_tool_subrow(node)
+  if node.status ~= "running" or type(node.last_tool) ~= "string"
+      or #node.last_tool == 0 then
+    return nil
   end
-  return rows
+  local label = node.last_tool
+  if type(node.last_tool_args) == "string" and #node.last_tool_args > 0 then
+    label = label .. "(" .. node.last_tool_args .. ")"
+  end
+  return tui.text {
+    content = "  → " .. label,
+    style   = STYLE.status_dim,
+    wrap    = "none",
+  }
 end
 
 -- ── MAG namespace grouping (display model) ────────────────────────────
@@ -242,7 +256,7 @@ local function build_groups(run)
   return order
 end
 
-local function group_row(group, now_ms)
+local function group_row_parts(group, now_ms)
   local glyph = GLYPHS[group.status] or "·"
   local style = NODE_STYLE[group.status] or STYLE.status_dim
   local elapsed
@@ -255,13 +269,13 @@ local function group_row(group, now_ms)
   local n = #group.members
   local count_str = n > 1 and (" (" .. n .. ")") or ""
   local text = glyph .. " " .. group.name .. count_str .. elapsed_str
-  return tui.text { content = text, style = style, wrap = "none" }
+  return text, style
 end
 
 -- MAG run header. Counts GROUPS (not raw actors): "(done/total)" where a
 -- group is done once its aggregated status is terminal. Mirrors the flat
 -- header's rejected / no-op modification tail.
-local function mag_run_header(run, groups)
+local function mag_run_header_title(run, groups)
   local ident
   if type(run.run_name) == "string" and #run.run_name > 0 then
     ident = run.run_name
@@ -278,43 +292,145 @@ local function mag_run_header(run, groups)
   if (run.rejected or 0) > 0 then extra[#extra + 1] = "✗" .. run.rejected .. " rej" end
   if (run.noops or 0) > 0 then extra[#extra + 1] = "⊘" .. run.noops end
   if #extra > 0 then title = title .. "  " .. table.concat(extra, " ") end
-  return tui.text { content = title, style = STYLE.footer, wrap = "none" }
+  return title
+end
+
+-- MAG member (actor leaf) row, rendered while the sidebar is focused:
+-- `  ● explorer.llm  running 47s`. The stuck-agent signature — a
+-- running actor whose last stream event went stale — comes back as a
+-- second return: an indented sub-row (`    ⚠ idle 32s`), following the
+-- last_tool sub-row idiom so the alarm survives the narrow sidebar
+-- instead of clipping off the row's tail.
+local function actor_row_parts(actor_id, node, stream, now_ms)
+  local glyph = GLYPHS[node.status] or "·"
+  local style = NODE_STYLE[node.status] or STYLE.status_dim
+  local elapsed = node_elapsed_ms(node, now_ms)
+  local elapsed_str = elapsed and (" " .. fmt_elapsed_ms(elapsed)) or ""
+  local text = "  " .. glyph .. " " .. actor_id .. "  "
+    .. (node.status or "?") .. elapsed_str
+  local idle_text
+  if node.status == "running" and stream ~= nil
+      and stream.last_activity_ms ~= nil then
+    local idle = now_ms - stream.last_activity_ms
+    if idle >= agent_streams.STALE_MS then
+      idle_text = "    ⚠ idle " .. fmt_elapsed_ms(idle)
+    end
+  end
+  return text, style, idle_text
+end
+
+-- ── sidebar row model (focus / cursor navigation) ─────────────────────
+--
+-- The ordered list of navigable sidebar rows. Single source of truth
+-- for BOTH rendering order and cursor navigation — update.lua indexes
+-- into the same list to move the cursor and resolve Enter, so the
+-- highlighted row and the row acted on can never drift apart.
+--
+-- Focus-implies-expanded: `expanded` (true while the sidebar has key
+-- focus) adds each MAG group's member actor rows under the group row.
+-- No stored toggle state — the unfocused sidebar renders exactly the
+-- collapsed grouping it always did.
+function M.row_model(state, now_ms, expanded)
+  local rows = {}
+  local runs = state.runs or {}
+  local streams = state.agent_streams or {}
+  for _, run_id in ipairs(sorted_keys(runs)) do
+    local run = runs[run_id]
+    if not is_expired(run, now_ms) then
+      if run.label == "MAG" then
+        local groups = build_groups(run)
+        rows[#rows + 1] = { kind = "run_header", run_id = run_id, run = run, groups = groups }
+        local run_streams = streams[run_id] or {}
+        for _, g in ipairs(groups) do
+          rows[#rows + 1] = { kind = "group", run_id = run_id, group = g }
+          if expanded then
+            for _, m in ipairs(g.members) do
+              rows[#rows + 1] = {
+                kind = "actor", run_id = run_id, actor_id = m.id,
+                node = m.node, stream = run_streams[m.id],
+              }
+            end
+          end
+        end
+      else
+        rows[#rows + 1] = { kind = "run_header", run_id = run_id, run = run }
+        for _, node_id in ipairs(sorted_keys(run.nodes or {})) do
+          rows[#rows + 1] = {
+            kind = "node", run_id = run_id, node_id = node_id,
+            node = run.nodes[node_id],
+          }
+        end
+      end
+    end
+  end
+  return rows
+end
+
+-- Clamp a stored cursor against the current row model (rows shrink when
+-- runs prune). Returns 0 only for an empty model.
+function M.clamp_cursor(cursor, row_count)
+  local cur = cursor or 1
+  if cur > row_count then cur = row_count end
+  if cur < 1 then cur = math.min(1, row_count) end
+  return cur
 end
 
 local function panel_children(state, now_ms, narrow)
+  -- View-side filter note: row_model drops completed runs past their
+  -- linger window at paint time so the panel updates on the
+  -- wallclock_tick re-render even though the reducer-side `prune` only
+  -- runs on a fresh dispatch. Mirrors the toast widget's
+  -- defence-in-depth filter at view-time.
+  local focused = state.focus == "sidebar"
+  local rows = M.row_model(state, now_ms, focused)
+  local cursor = M.clamp_cursor(state.sidebar_cursor, #rows)
   local children = {}
-  local run_ids = sorted_keys(state.runs)
-  local first = true
-  for _, run_id in ipairs(run_ids) do
-    local run = state.runs[run_id]
-    -- View-side filter: a completed run past its linger window is
-    -- dropped at paint time so the panel updates on the
-    -- wallclock_tick re-render even though the reducer-side `prune`
-    -- only runs on a fresh dispatch. Without this, the completed
-    -- run stayed visible (all nodes green) until the next user
-    -- keystroke flushed prune through the reducer. Mirrors the
-    -- toast widget's defence-in-depth filter at view-time.
-    if not is_expired(run, now_ms) then
-      if not first then
+  local first_run = true
+  for i, row in ipairs(rows) do
+    local on_cursor = focused and i == cursor
+    if row.kind == "run_header" then
+      if not first_run then
         children[#children + 1] = tui.text { content = "", wrap = "none" }
       end
-      first = false
-      if run.label == "MAG" then
-        -- MAG panel path: group actors by namespace, one row per group.
-        local groups = build_groups(run)
-        children[#children + 1] = mag_run_header(run, groups)
-        for _, g in ipairs(groups) do
-          children[#children + 1] = group_row(g, now_ms)
-        end
-      else
-        children[#children + 1] = run_header(run)
-        local node_ids = sorted_keys(run.nodes or {})
-        for _, node_id in ipairs(node_ids) do
-          for _, row in ipairs(node_rows(node_id, run.nodes[node_id], now_ms, narrow)) do
-            children[#children + 1] = row
-          end
-        end
+      first_run = false
+      local title = row.groups
+        and mag_run_header_title(row.run, row.groups)
+        or  run_header_title(row.run)
+      children[#children + 1] = tui.text {
+        content = title,
+        style   = on_cursor and CURSOR_ROW_STYLE or STYLE.footer,
+        wrap    = "none",
+      }
+    elseif row.kind == "group" then
+      local text, style = group_row_parts(row.group, now_ms)
+      children[#children + 1] = tui.text {
+        content = text,
+        style   = on_cursor and CURSOR_ROW_STYLE or style,
+        wrap    = "none",
+      }
+    elseif row.kind == "actor" then
+      local text, style, idle_text = actor_row_parts(row.actor_id, row.node, row.stream, now_ms)
+      children[#children + 1] = tui.text {
+        content = text,
+        style   = on_cursor and CURSOR_ROW_STYLE or style,
+        wrap    = "none",
+      }
+      if idle_text ~= nil then
+        children[#children + 1] = tui.text {
+          content = idle_text,
+          style   = STYLE.panel_stale,
+          wrap    = "none",
+        }
       end
+    else
+      local text, style = node_row_parts(row.node_id, row.node, now_ms, narrow)
+      children[#children + 1] = tui.text {
+        content = text,
+        style   = on_cursor and CURSOR_ROW_STYLE or style,
+        wrap    = "none",
+      }
+      local sub = node_tool_subrow(row.node)
+      if sub ~= nil then children[#children + 1] = sub end
     end
   end
   if #children == 0 then

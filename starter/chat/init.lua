@@ -202,6 +202,14 @@ local function initial_state()
     lead_chat_prefix = nil,
     input_value      = "",
     show_sidebar     = true,
+    -- Pane key focus: "prompt" | "sidebar" (Tab/Shift-Tab cycles). The
+    -- prompt widget's `focused` flag derives from this in view.lua.
+    focus            = "prompt",
+    sidebar_cursor   = 1,
+    -- Agent-stream capture (chat/agent_streams.lua): scope→run binding
+    -- from mag.run_started plus bounded per-actor stream buffers.
+    scope_to_run     = {},
+    agent_streams    = {},
     popup            = nil,
     stats            = {},
     pending          = false,

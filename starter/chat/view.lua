@@ -107,9 +107,15 @@ function M.render(state)
     state.popup.variant == "login_picker" or
     state.popup.variant == "info" or
     state.popup.variant == "warning" or
-    state.popup.variant == "error"
+    state.popup.variant == "error" or
+    -- Read-only agent view: prompt structurally inactive while open.
+    state.popup.variant == "agent_view"
   )
-  local input_focused = not popup_owns_keys
+  -- Pane focus (Tab/Shift-Tab) gates the prompt the same way popups
+  -- do: while the sidebar holds key focus the input drops `focused`,
+  -- so the Rust router bubbles every key to the reducer's sidebar
+  -- navigation instead of swallowing it into the text field.
+  local input_focused = not popup_owns_keys and state.focus ~= "sidebar"
   local input_border_style = input_focused
     and STYLE.input_border
     or STYLE.input_border_unfocused
@@ -190,6 +196,7 @@ function M.render(state)
       popups.session_picker(state),
       popups.login_picker(state),
       popups.tool_permission(state),
+      popups.agent_view(state),
       -- Toast renders last so it sits above input, statusline, and
       -- every popup — non-blocking notifications must never be
       -- occluded by chrome below them.

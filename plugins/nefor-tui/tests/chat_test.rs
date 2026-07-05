@@ -6409,3 +6409,478 @@ fn chat_plan_append_dedup_preserves_approved_status() {
         "duplicate append must not paint a second entry: {out:?}"
     );
 }
+
+// ── Agent view: sidebar focus, stream capture, read-only popup ────────
+//
+// MVP of the agent-view observability feature: Tab/Shift-Tab cycles key
+// focus between the prompt and the sidebar; while the sidebar is
+// focused MAG groups expand to their member actor rows
+// (focus-implies-expanded — no stored toggle state); Enter on an actor
+// leaf opens a read-only popup fed by per-actor capture buffers that
+// tap the scoped `chat.stream.*` broadcasts BEFORE the transcript's
+// foreign-chat guard.
+
+/// Concatenated text of every screen segment painted with the cursor
+/// row style (fg #000000 on bg #7FB4FF). Lets tests assert WHICH
+/// sidebar row carries the cursor highlight.
+fn cursor_styled_text(out: &str) -> String {
+    let mut acc = String::new();
+    for chunk in out.split('\u{1b}') {
+        // Each chunk is "[<sgr>m<text>" after the split; keep text from
+        // chunks whose SGR paints the cursor-row background.
+        if let Some(m_idx) = chunk.find('m') {
+            let (sgr, text) = chunk.split_at(m_idx);
+            if sgr.contains("48;2;127;180;255") {
+                acc.push_str(&text[1..]);
+            }
+        }
+    }
+    acc
+}
+
+/// Boot a chat surface with one scoped MAG run (`scope: r2`) carrying a
+/// single running actor `worker.llm`, plus a lead prefix binding so the
+/// foreign-chat guard is active. Shared setup for the capture/view tests.
+fn engine_with_scoped_worker() -> Engine {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.lead.bound", "chat_prefix": "r1/lead.llm@" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "sub-1", "run_name": "auth-fix", "scope": "r2" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_spawned", "run_id": "sub-1", "id": "worker.llm", "factory": "llm" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_ready", "run_id": "sub-1", "id": "worker.llm" }),
+    );
+    engine
+}
+
+#[test]
+fn tab_focuses_sidebar_and_expands_mag_groups() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "mag-focus-1", "run_name": "demo" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_spawned", "run_id": "mag-focus-1", "id": "explorer.entry", "factory": "llm" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_spawned", "run_id": "mag-focus-1", "id": "explorer.loop-counter", "factory": "llm" }),
+    );
+
+    // Unfocused sidebar: grouped + collapsed, exactly as before.
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("explorer.entry"),
+        "members must stay collapsed while the prompt has focus: {out:?}"
+    );
+
+    // Tab → sidebar focused → focus-implies-expanded member rows.
+    engine.handle_key(key("tab")).expect("tab");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("explorer.entry") && out.contains("explorer.loop-counter"),
+        "focused sidebar must render member actor rows: {out:?}"
+    );
+    // Cursor highlight starts on the first row (the run header).
+    let cursor = cursor_styled_text(&out);
+    assert!(
+        cursor.contains("MAG demo"),
+        "cursor highlight should start on the run header row: {cursor:?}"
+    );
+
+    // Esc → focus returns to the prompt, members collapse again.
+    engine.handle_key(key("escape")).expect("escape");
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("explorer.entry"),
+        "Esc must return focus to the prompt and collapse members: {out:?}"
+    );
+}
+
+#[test]
+fn shift_tab_also_cycles_focus() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "mag-focus-2", "run_name": "demo" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_spawned", "run_id": "mag-focus-2", "id": "explorer.entry", "factory": "llm" }),
+    );
+
+    engine.handle_key(key("shift_tab")).expect("shift_tab");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("explorer.entry"),
+        "shift_tab must focus the sidebar too (2 panes ⇒ toggle): {out:?}"
+    );
+    engine.handle_key(key("shift_tab")).expect("shift_tab");
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("explorer.entry"),
+        "second shift_tab must hand focus back to the prompt: {out:?}"
+    );
+}
+
+#[test]
+fn tab_is_noop_while_a_popup_owns_the_keyboard() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "mag-popup-1", "run_name": "demo" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_spawned", "run_id": "mag-popup-1", "id": "explorer.entry", "factory": "llm" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.popup", "level": "info", "title": "hi", "message": "body" }),
+    );
+
+    engine.handle_key(key("tab")).expect("tab");
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("explorer.entry"),
+        "tab must not switch pane focus while a popup owns keys: {out:?}"
+    );
+
+    // Dismiss the popup; tab now works normally.
+    engine.handle_key(key("escape")).expect("escape");
+    engine.handle_key(key("tab")).expect("tab");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("explorer.entry"),
+        "after popup dismissal tab must focus the sidebar: {out:?}"
+    );
+}
+
+#[test]
+fn tab_with_completion_open_completes_instead_of_switching_focus() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "mag-comp-1", "run_name": "demo" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_spawned", "run_id": "mag-comp-1", "id": "explorer.entry", "factory": "llm" }),
+    );
+
+    for ch in ["/", "h", "e"] {
+        engine.handle_key(key(ch)).expect("type");
+    }
+    engine.handle_key(key("tab")).expect("tab");
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("explorer.entry"),
+        "tab with the completion popup open must not move pane focus: {out:?}"
+    );
+    assert!(
+        out.contains("/help"),
+        "tab should have applied the slash completion: {out:?}"
+    );
+}
+
+#[test]
+fn sidebar_cursor_moves_clamps_and_enter_opens_the_leaf_under_it() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "mag-cur-1", "run_name": "demo", "scope": "r7" }),
+    );
+    for id in ["explorer.entry", "writer.draft"] {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "mag.actor_spawned", "run_id": "mag-cur-1", "id": id, "factory": "llm" }),
+        );
+    }
+
+    // Rows while focused: header / explorer / explorer.entry / writer /
+    // writer.draft. Ten Downs must clamp on the last row.
+    engine.handle_key(key("tab")).expect("tab");
+    for _ in 0..10 {
+        engine.handle_key(key("down")).expect("down");
+    }
+    let out = render_str(&mut engine);
+    let cursor = cursor_styled_text(&out);
+    assert!(
+        cursor.contains("writer.draft"),
+        "cursor must clamp on the last row: {cursor:?}"
+    );
+    engine.handle_key(key("enter")).expect("enter");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("agent · writer.draft [read-only]"),
+        "Enter on the clamped leaf must open ITS agent view: {out:?}"
+    );
+    engine.handle_key(key("q")).expect("q");
+
+    // Ten Ups clamp back on row 1 (run header) — Enter there is the
+    // reserved no-op, not a view.
+    for _ in 0..10 {
+        engine.handle_key(key("up")).expect("up");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("[read-only]"),
+        "Enter on a run header row must stay a no-op: {out:?}"
+    );
+    let cursor = cursor_styled_text(&out);
+    assert!(
+        cursor.contains("MAG demo"),
+        "cursor must clamp on the first row: {cursor:?}"
+    );
+
+    // Enter on a GROUP row (row 2) is the reserved no-op too.
+    engine.handle_key(key("down")).expect("down");
+    engine.handle_key(key("enter")).expect("enter");
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("[read-only]"),
+        "Enter on a group row must stay a no-op (reserved for fold/unfold): {out:?}"
+    );
+}
+
+#[test]
+fn scoped_streams_are_captured_per_actor_and_stay_out_of_the_transcript() {
+    let mut engine = engine_with_scoped_worker();
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.stream.reasoning_delta",
+            "chat_id": "r2/worker.llm@r1",
+            "text": "PONDERING_DEEPLY",
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.stream.delta",
+            "chat_id": "r2/worker.llm@r1",
+            "text": "HELLO_FROM_WORKER",
+        }),
+    );
+
+    // Foreign-chat guard unchanged: the lead transcript must not render
+    // the worker's stream (the collapsed sidebar can't leak it either).
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("HELLO_FROM_WORKER") && !out.contains("PONDERING_DEEPLY"),
+        "foreign deltas must stay out of the lead transcript: {out:?}"
+    );
+
+    // Tab → down ×2 (header, group, actor) → Enter opens the agent view
+    // showing the captured buffer.
+    engine.handle_key(key("tab")).expect("tab");
+    engine.handle_key(key("down")).expect("down");
+    engine.handle_key(key("down")).expect("down");
+    let _ = render_str(&mut engine);
+    engine.take_emit_queue(); // drain — the view must add nothing
+    engine.handle_key(key("enter")).expect("enter");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("agent · worker.llm [read-only]"),
+        "agent view popup with read-only marker expected: {out:?}"
+    );
+    assert!(
+        out.contains("HELLO_FROM_WORKER"),
+        "captured assistant delta missing from the timeline: {out:?}"
+    );
+    assert!(
+        out.contains("PONDERING_DEEPLY"),
+        "captured reasoning delta missing from the timeline: {out:?}"
+    );
+    assert!(
+        out.contains("— r1 —"),
+        "round marker expected in the timeline: {out:?}"
+    );
+    assert!(
+        out.contains("run auth-fix") && out.contains("last event"),
+        "header should carry run identity + last-activity diagnostic: {out:?}"
+    );
+    assert!(
+        engine.take_emit_queue().is_empty(),
+        "opening the agent view must not emit any envelope"
+    );
+}
+
+#[test]
+fn agent_view_is_read_only_and_closes_back_to_sidebar_then_prompt() {
+    let mut engine = engine_with_scoped_worker();
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.stream.delta",
+            "chat_id": "r2/worker.llm@r1",
+            "text": "WORKER_OUTPUT",
+        }),
+    );
+
+    engine.handle_key(key("tab")).expect("tab");
+    // Render between the focus flip and Enter: the Rust router reads
+    // the prompt's `focused` flag off the last reconciled tree, and the
+    // real event loop repaints after every event.
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("down")).expect("down");
+    engine.handle_key(key("down")).expect("down");
+    engine.handle_key(key("enter")).expect("enter");
+    let out = render_str(&mut engine);
+    assert!(out.contains("[read-only]"), "view should be open: {out:?}");
+    engine.take_emit_queue();
+
+    // Keys that would type into the prompt (or approve a tool) do
+    // nothing: no envelope, popup stays, prompt receives no text.
+    for ch in ["z", "a", "d", "enter"] {
+        engine.handle_key(key(ch)).expect("keypress");
+    }
+    assert!(
+        engine.take_emit_queue().is_empty(),
+        "keystrokes inside the read-only view must not emit envelopes"
+    );
+    // The render is a diff against the previous frame: a state change
+    // (typed text, dismissed popup, repainted underlay) would repaint
+    // rows. A bare frame wrapper = nothing happened, which is the
+    // read-only guarantee. The Esc below then proves the popup is
+    // still the thing on top.
+    let out = render_str(&mut engine);
+    assert!(
+        out.len() < 40,
+        "read-only keys must produce an empty diff (no typing, no dismiss): {out:?}"
+    );
+
+    // Esc closes back to the sidebar with the cursor preserved on the
+    // same leaf; Enter re-opens the same actor's view.
+    engine.handle_key(key("escape")).expect("escape");
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("[read-only]") && out.contains("worker.llm"),
+        "Esc must close the view and land back on the focused sidebar: {out:?}"
+    );
+    let cursor = cursor_styled_text(&out);
+    assert!(
+        cursor.contains("worker.llm"),
+        "cursor must be preserved on the actor row: {cursor:?}"
+    );
+    engine.handle_key(key("enter")).expect("enter");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("[read-only]"),
+        "Enter must re-open the view for the preserved cursor row: {out:?}"
+    );
+
+    // q also closes; a second Esc hands focus back to the prompt, where
+    // typing lands in the input again.
+    engine.handle_key(key("q")).expect("q");
+    engine.handle_key(key("escape")).expect("escape");
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("  ● worker.llm"),
+        "second Esc must collapse the members (prompt focused): {out:?}"
+    );
+    for ch in ["z", "q", "z"] {
+        engine.handle_key(key(ch)).expect("type");
+    }
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("zqz"),
+        "prompt must receive keys again after leaving the sidebar: {out:?}"
+    );
+}
+
+#[test]
+fn stale_running_actor_shows_idle_warning_in_sidebar_and_view_header() {
+    let mut engine = engine_with_scoped_worker();
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.stream.delta",
+            "chat_id": "r2/worker.llm@r1",
+            "text": "EARLY_OUTPUT",
+        }),
+    );
+
+    // Fresh activity: no idle alarm on the focused member row.
+    engine.handle_key(key("tab")).expect("tab");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("worker.llm") && !out.contains("⚠ idle"),
+        "fresh activity must not flag idle: {out:?}"
+    );
+
+    // Past the 30s staleness threshold the running row grows the alarm.
+    engine.advance_time(Duration::from_millis(31_000));
+    engine.handle_key(key("down")).expect("down");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("⚠ idle 3"),
+        "stale running actor must carry the idle alarm on its row: {out:?}"
+    );
+
+    // And the agent-view header carries the same diagnostic.
+    engine.handle_key(key("down")).expect("down");
+    engine.handle_key(key("enter")).expect("enter");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("⚠ last event 3") && out.contains("(delta)"),
+        "view header must warn about the stale last activity: {out:?}"
+    );
+}
+
+#[test]
+fn unscoped_and_unknown_scope_chat_ids_are_ignored_by_capture() {
+    let mut engine = engine_with_scoped_worker();
+
+    // Unscoped id (no "/") and an unknown scope: neither may crash nor
+    // land in the worker's buffer.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "chat_id": "plainchat-1", "text": "UNSCOPED" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "chat_id": "r9/ghost.llm@r1", "text": "GHOST" }),
+    );
+
+    engine.handle_key(key("tab")).expect("tab");
+    let _ = render_str(&mut engine); // refresh the tree so Enter bubbles
+    engine.handle_key(key("down")).expect("down");
+    engine.handle_key(key("down")).expect("down");
+    engine.handle_key(key("enter")).expect("enter");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("no captured output yet"),
+        "worker buffer must be empty — nothing attributable arrived: {out:?}"
+    );
+    assert!(
+        !out.contains("UNSCOPED") && !out.contains("GHOST"),
+        "unattributable streams must not leak into the view: {out:?}"
+    );
+}

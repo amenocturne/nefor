@@ -6,7 +6,8 @@
 local tui_lib = require("nefor-tui")
 local W       = tui_lib.widget
 
-local common       = require("chat.common")
+local common        = require("chat.common")
+local agent_streams = require("chat.agent_streams")
 local slash        = require("chat.slash")
 local sessions     = require("chat.sessions")
 local at_path      = require("chat.at_path")
@@ -127,6 +128,9 @@ local function prune_expired(state)
   local pruned = run_panel.prune(state.runs or {}, now)
   if pruned ~= state.runs then
     state = shallow_merge(state, { runs = pruned })
+    -- Captured agent streams follow the run lifecycle: buffers and
+    -- scope bindings for pruned runs go with them.
+    state = agent_streams.prune(state, pruned)
   end
   local toasts = state.toasts
   if toasts ~= nil and #toasts > 0 then
@@ -175,6 +179,7 @@ local function handle_input_submit(msg, state)
       entries = {}, in_flight = NIL_SENTINEL, input_value = "",
       pending = false, completion = NIL_SENTINEL,
       runs = {}, firing_to_node = {},
+      agent_streams = {}, scope_to_run = {},
       turn_started_at = NIL_SENTINEL,
       last_turn_duration_ms = NIL_SENTINEL,
       last_esc_ms = NIL_SENTINEL,
@@ -331,6 +336,7 @@ local function handle_input_submit(msg, state)
         entries = {}, in_flight = NIL_SENTINEL, input_value = "",
         pending = false, completion = NIL_SENTINEL,
         runs = {}, firing_to_node = {},
+        agent_streams = {}, scope_to_run = {},
         turn_started_at = NIL_SENTINEL,
         last_turn_duration_ms = NIL_SENTINEL,
         last_esc_ms = NIL_SENTINEL,
@@ -415,6 +421,7 @@ local function handle_input_submit(msg, state)
         input_value = "", completion = NIL_SENTINEL,
         entries = {}, in_flight = NIL_SENTINEL,
         pending = false, runs = {}, firing_to_node = {},
+        agent_streams = {}, scope_to_run = {},
         turn_started_at = NIL_SENTINEL,
         last_turn_duration_ms = NIL_SENTINEL,
         queued_entry_idx = NIL_SENTINEL,
@@ -518,7 +525,37 @@ local function handle_exit(_msg, state)
 end
 
 local function handle_toggle_sidebar(_msg, state)
-  return shallow_merge(state, { show_sidebar = not state.show_sidebar }), {}
+  local showing = not state.show_sidebar
+  local patch = { show_sidebar = showing }
+  -- Hiding a focused sidebar would strand key focus on an invisible
+  -- pane; hand it back to the prompt.
+  if not showing and state.focus == "sidebar" then
+    patch.focus = "prompt"
+  end
+  return shallow_merge(state, patch), {}
+end
+
+-- Tab / Shift-Tab cycle key focus between the prompt and the sidebar.
+-- Two panes ⇒ both keys toggle; the pair future-proofs for >2. The
+-- completion popup wins Tab (existing prompt-widget navigation), and
+-- any open popup owns the keyboard, so both cases leave focus alone.
+local function handle_focus_cycle(msg, state)
+  if state.completion ~= nil then
+    local result = W.prompt.handle(prompt_widget_opts(state), msg)
+    if result ~= nil then
+      return fold_prompt_patch(state, result.state or {}), {}
+    end
+    return state, {}
+  end
+  if state.popup ~= nil then return state, {} end
+  if state.focus == "sidebar" then
+    return shallow_merge(state, { focus = "prompt" }), {}
+  end
+  if not state.show_sidebar then return state, {} end
+  return shallow_merge(state, {
+    focus          = "sidebar",
+    sidebar_cursor = state.sidebar_cursor or 1,
+  }), {}
 end
 
 local function handle_toggle_expand(_msg, state)
@@ -557,6 +594,12 @@ local function handle_escape(_msg, state)
       }
     end
     return shallow_merge(state, { popup = NIL_SENTINEL, toasts = {} }), {}
+  end
+  -- 1c) sidebar focused → hand focus back to the prompt. Sits before
+  -- the interrupt path deliberately: Esc while navigating the sidebar
+  -- is "leave the pane", never "cancel the turn".
+  if state.focus == "sidebar" then
+    return shallow_merge(state, { focus = "prompt" }), {}
   end
   -- 2) close completion dropdown (slash or @-path)
   if state.completion ~= nil then
@@ -602,6 +645,8 @@ local function handle_session_end(_msg, state)
     toasts           = {},
     completion       = NIL_SENTINEL,
     runs             = {},
+    agent_streams    = {},
+    scope_to_run     = {},
     lead_chat_id     = NIL_SENTINEL,
     lead_chat_prefix = NIL_SENTINEL,
   }), {}
@@ -610,6 +655,7 @@ end
 local function handle_session_start(_msg, state)
   return shallow_merge(state, {
     runs = {}, firing_to_node = {},
+    agent_streams = {}, scope_to_run = {},
     lead_chat_id = NIL_SENTINEL, lead_chat_prefix = NIL_SENTINEL,
   }), {}
 end
@@ -632,6 +678,10 @@ local function handle_message_append(msg, state)
   local text = msg.text or ""
   if #text == 0 then return state, {} end
   local role = msg.role or "system"
+  -- Agent-stream tap: scoped chat ids attribute the append to a MAG
+  -- actor's capture buffer. Sits before every transcript decision so
+  -- the transcript's own routing stays byte-identical.
+  state = agent_streams.record(state, msg.chat_id, "message", text, tui.now_ms(), role)
   -- Round-trip echo dedup.
   if role == "user"
      and state.pending_user_echo ~= nil
@@ -762,7 +812,12 @@ local function handle_lead_chat_bound(msg, state)
   }), {}
 end
 
+-- The agent-stream taps below run BEFORE the foreign-chat guard: the
+-- guard keeps foreign chats out of the LEAD transcript (unchanged),
+-- while the capture buffers want exactly those foreign events.
 local function handle_stream_delta(msg, state)
+  state = agent_streams.record(state, msg.chat_id, "delta",
+    msg.text or msg.delta, tui.now_ms())
   if is_foreign_chat(msg, state) then return state, {} end
   local t = msg.text or msg.delta or ""
   if #t == 0 then return state, {} end
@@ -770,6 +825,7 @@ local function handle_stream_delta(msg, state)
 end
 
 local function handle_stream_end(msg, state)
+  state = agent_streams.record(state, msg.chat_id, "stream_end", nil, tui.now_ms())
   if is_foreign_chat(msg, state) then return state, {} end
   local next_state = transcript.finalize_assistant(state, msg.text, msg.model, msg.duration_ms)
   if state.queued_entry_idx then
@@ -783,6 +839,8 @@ local function handle_stream_end(msg, state)
 end
 
 local function handle_reasoning_delta(msg, state)
+  state = agent_streams.record(state, msg.chat_id, "reasoning_delta",
+    msg.text or msg.delta, tui.now_ms())
   if is_foreign_chat(msg, state) then return state, {} end
   local t = msg.text or msg.delta or ""
   if #t == 0 then return state, {} end
@@ -790,6 +848,7 @@ local function handle_reasoning_delta(msg, state)
 end
 
 local function handle_reasoning_end(msg, state)
+  state = agent_streams.record(state, msg.chat_id, "reasoning_end", nil, tui.now_ms())
   if is_foreign_chat(msg, state) then return state, {} end
   return transcript.finalize_reasoning(state, msg.duration_ms), {}
 end
@@ -1205,6 +1264,10 @@ local function handle_mag_run_started(msg, state)
   if state.replay_mode then return state, {} end
   local run_id = msg.run_id
   if type(run_id) ~= "string" or run_id == "" then return state, {} end
+  -- The kernel scope-prefixes every actor chat handle with this run's
+  -- scope; storing the binding is what lets the agent-stream capture
+  -- attribute chat.stream.* events back to (run, actor).
+  state = agent_streams.set_scope(state, msg.scope, run_id)
   return run_panel.mag_run_started(state, run_id, msg.run_name, tui.now_ms()), {}
 end
 
@@ -1280,6 +1343,8 @@ local handlers = {
   ["key.ctrl_c"]                  = handle_exit,
   ["key.ctrl_d"]                  = handle_exit,
   ["key.ctrl_b"]                  = handle_toggle_sidebar,
+  ["key.tab"]                     = handle_focus_cycle,
+  ["key.shift_tab"]               = handle_focus_cycle,
   ["key.ctrl_o"]                  = handle_toggle_expand,
   ["key.?"]                       = handle_help_key,
   ["key.shift_?"]                 = handle_help_key,
@@ -1338,6 +1403,15 @@ local function route_keys_and_popups(msg, state)
        or state.popup.variant == "error")
      and (kind == "key.escape" or kind == "key.enter"
        or kind == "key.q" or kind == "key.Q") then
+    return shallow_merge(state, { popup = NIL_SENTINEL }), {}
+  end
+
+  -- Agent view popup: read-only, so dismiss (q here, Esc via
+  -- handle_escape) and scroll (routed below) are the only verbs. Every
+  -- other key falls through to the no-op tail — structurally no path
+  -- from a keystroke to the actor.
+  if state.popup and state.popup.variant == "agent_view"
+     and (kind == "key.q" or kind == "key.Q") then
     return shallow_merge(state, { popup = NIL_SENTINEL }), {}
   end
 
@@ -1458,6 +1532,36 @@ local function route_keys_and_popups(msg, state)
     local result = W.prompt.handle(prompt_widget_opts(state), msg)
     if result ~= nil then
       return fold_prompt_patch(state, result.state or {}), {}
+    end
+  end
+
+  -- Sidebar pane focus (popups above win the keyboard first): Up/Down
+  -- move the cursor over the row model, Enter on an actor leaf opens
+  -- the read-only agent view. Enter on group / run-header rows is a
+  -- deliberate no-op — reserved for the epic's fold/unfold task.
+  if state.focus == "sidebar" and state.popup == nil then
+    local now = tui.now_ms()
+    if kind == "key.up" or kind == "key.down" then
+      local rows = run_panel.row_model(state, now, true)
+      if #rows == 0 then return state, {} end
+      local cur = run_panel.clamp_cursor(state.sidebar_cursor, #rows)
+      cur = cur + ((kind == "key.down") and 1 or -1)
+      if cur < 1 then cur = 1 elseif cur > #rows then cur = #rows end
+      return shallow_merge(state, { sidebar_cursor = cur }), {}
+    end
+    if kind == "key.enter" then
+      local rows = run_panel.row_model(state, now, true)
+      local row = rows[run_panel.clamp_cursor(state.sidebar_cursor, #rows)]
+      if row ~= nil and row.kind == "actor" then
+        return shallow_merge(state, {
+          popup = {
+            variant  = "agent_view",
+            run_id   = row.run_id,
+            actor_id = row.actor_id,
+          },
+        }), {}
+      end
+      return state, {}
     end
   end
 

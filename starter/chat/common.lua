@@ -292,6 +292,11 @@ M.STYLE = {
   panel_done        = { fg = C.status_ok },
   panel_error       = { fg = C.status_danger, bold = true },
   panel_skipped     = { fg = C.status_dim, italic = true },
+  -- Stale-activity alarm (running actor with no stream events past the
+  -- staleness threshold). Same weight as panel_error — a possibly-stuck
+  -- agent must be impossible to miss — but named separately because it
+  -- marks suspicion, not a terminal state.
+  panel_stale       = { fg = C.status_danger, bold = true },
   -- Plan-entry chrome (yellow border). `bold = true` matches
   -- user_chrome's weight so the two read as parallel "input/output of
   -- a decision" frames at equal visual weight.

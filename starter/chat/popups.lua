@@ -7,6 +7,8 @@ local tui_lib = require("nefor-tui")
 local W       = tui_lib.widget
 local common  = require("chat.common")
 local sessions = require("chat.sessions")
+local agent_streams = require("chat.agent_streams")
+local run_panel     = require("chat.run_panel")
 
 local STYLE         = common.STYLE
 local C             = common.C
@@ -22,6 +24,8 @@ local HELP_BODY = [[Keys:
   Esc          cancel current turn
   Esc Esc      cancel everything (within 600ms)
   Ctrl+B       toggle sidebar
+  Tab          focus sidebar ↔ prompt
+  (sidebar)    ↑/↓ move · Enter agent view · Esc back
   Ctrl+O       expand/collapse tool calls + reasoning
   ?            this help (when input empty)
   Up / Down    scroll transcript by one line
@@ -386,6 +390,121 @@ function M.login_picker(state)
   })
 end
 
+-- Read-only live view of one MAG actor's captured stream, opened by
+-- Enter on a sidebar actor leaf. Diagnostic-first: the header carries
+-- the stuck-agent signature (status + last activity, alarm-styled when
+-- a running actor goes stale); the timeline below is the actor's
+-- buffered reasoning / assistant text / message appends with round
+-- markers. Strictly read-only — the popup renders no text_input, joins
+-- `popup_owns_keys` in view.lua, and its key handling (update.lua)
+-- consumes only scroll + dismiss. No envelope is emitted from here.
+function M.agent_view(state)
+  if not state.popup or state.popup.variant ~= "agent_view" then return nil end
+  local p = state.popup
+  local now_ms = tui.now_ms()
+  local run    = (state.runs or {})[p.run_id]
+  local node   = run and run.nodes and run.nodes[p.actor_id]
+  local stream = agent_streams.actor_stream(state, p.run_id, p.actor_id)
+
+  -- ── header diagnostics ──
+  local run_ident
+  if run and type(run.run_name) == "string" and #run.run_name > 0 then
+    run_ident = run.run_name
+  else
+    run_ident = (p.run_id or "?"):sub(1, 8)
+  end
+  local factory = node and node.reasoner or nil
+  local ident_line = "run " .. run_ident .. " · actor " .. (p.actor_id or "?")
+    .. (factory and #factory > 0 and (" (" .. factory .. ")") or "")
+
+  local status = node and node.status or "gone"
+  local glyph  = run_panel.GLYPHS[status] or "·"
+  local status_line = glyph .. " " .. status
+  if node ~= nil then
+    local elapsed
+    if status == "running" then
+      elapsed = now_ms - (node.started_at_ms or now_ms)
+    elseif node.finished_at_ms ~= nil then
+      elapsed = node.finished_at_ms - (node.started_at_ms or node.finished_at_ms)
+    end
+    if elapsed ~= nil then
+      status_line = status_line .. " " .. run_panel.fmt_elapsed_ms(elapsed)
+    end
+  end
+
+  local activity_line, activity_style
+  if stream ~= nil and stream.last_activity_ms ~= nil then
+    local idle = now_ms - stream.last_activity_ms
+    activity_line = "last event " .. run_panel.fmt_elapsed_ms(idle)
+      .. " ago (" .. (stream.last_activity_kind or "?") .. ")"
+    if status == "running" and idle >= agent_streams.STALE_MS then
+      activity_line = "⚠ " .. activity_line
+      activity_style = STYLE.panel_stale
+    else
+      activity_style = STYLE.status_dim
+    end
+  else
+    activity_line = "no stream events observed yet"
+    activity_style = STYLE.status_dim
+  end
+
+  local header = tui.column { gap = 0, children = {
+    tui.text { content = ident_line, style = STYLE.footer, wrap = "none" },
+    tui.text { content = status_line, style = STYLE.status, wrap = "none" },
+    tui.text { content = activity_line, style = activity_style, wrap = "none" },
+    tui.text { content = string.rep("─", 40), style = STYLE.footer, wrap = "none" },
+  }}
+
+  -- ── timeline (oldest → newest; End jumps to the tail) ──
+  local timeline = {}
+  local last_round = nil
+  for _, e in ipairs(stream and stream.entries or {}) do
+    if e.round ~= nil and e.round ~= last_round then
+      timeline[#timeline + 1] = tui.text {
+        content = "— r" .. e.round .. " —",
+        style   = STYLE.status_dim, wrap = "none",
+      }
+      last_round = e.round
+    end
+    if e.kind == "reasoning" then
+      timeline[#timeline + 1] = tui.text {
+        content = e.text, style = STYLE.reasoning, wrap = "word",
+      }
+    elseif e.kind == "message" then
+      timeline[#timeline + 1] = tui.text {
+        content = "[" .. (e.role or "?") .. "] " .. e.text,
+        style   = STYLE.system, wrap = "word",
+      }
+    else
+      timeline[#timeline + 1] = tui.text { content = e.text, wrap = "word" }
+    end
+  end
+  if #timeline == 0 then
+    timeline[1] = tui.text {
+      content = "(no captured output yet — capture starts when this TUI observes the run)",
+      style   = STYLE.status_dim, wrap = "word",
+    }
+  end
+
+  return W.popup.view({
+    open         = true,
+    border_style = STYLE.popup_user,
+    width        = "80%",
+    height       = "80%",
+    scroll_key   = "popup_agent_view",
+    title        = "── agent · " .. (p.actor_id or "?") .. " [read-only] ──",
+    title_style  = STYLE.popup_user,
+    child        = tui.column { gap = 1, children = {
+      header,
+      tui.column { gap = 0, children = timeline },
+      tui.text {
+        content = "↑/↓ PgUp/PgDn Home/End scroll · Esc/Q close",
+        style   = STYLE.status_dim, wrap = "none",
+      },
+    }},
+  })
+end
+
 -- Map popup variant → inner scrollable key. Used by the scroll-key
 -- router in update.lua so PgUp/PgDn route to the active popup's
 -- scrollable rather than the transcript.
@@ -398,6 +517,7 @@ function M.scroll_key(variant)
   if variant == "model_picker"    then return "popup_model_picker" end
   if variant == "session_picker"  then return "popup_session_picker" end
   if variant == "login_picker"    then return "popup_login_picker" end
+  if variant == "agent_view"      then return "popup_agent_view" end
   return nil
 end
 
