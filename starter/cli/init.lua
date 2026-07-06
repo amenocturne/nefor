@@ -46,7 +46,7 @@
 
 local M = {}
 
-local agentic_workflow = require("agentic-loop")
+local agentic_workflow = require("libs.agentic-loop")
 local json = nefor.json
 
 -- Argv parser. Hand-rolled, no external dep. Recognises:

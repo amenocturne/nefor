@@ -1,4 +1,4 @@
--- starter/agentic-loop/session_config.lua — derive a session's active
+-- lua/libs/agentic-loop/session_config.lua — derive a session's active
 -- (provider, model) from its on-disk jsonl.
 --
 -- The active provider/model lives in agentic-loop's `state.config`,

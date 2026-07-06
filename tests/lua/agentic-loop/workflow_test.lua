@@ -2,7 +2,7 @@
 -- agentic-loop turn spawner. The Rust harness
 -- (`engine/tests/starter_agentic_workflow_test.rs`) installs a stub
 -- `nefor.*` surface (json + engine.* + log.* + bus.on_event) so
--- `require("agentic-loop")` succeeds, then loads this file. Tests drive
+-- `require("libs.agentic-loop")` succeeds, then loads this file. Tests drive
 -- the actor by:
 --
 --   * calling its public API directly (configure, submit, set_model,
@@ -14,7 +14,7 @@
 -- The test surface is `_test.fire_bus`, `_test.calls`,
 -- `_test.set_plugins`, `_test.calls_clear`.
 
-local agentic_loop = require("agentic-loop")
+local agentic_loop = require("libs.agentic-loop")
 local json = nefor.json
 
 -- Seed an active session so the ambient MAG-workspace block can anchor a

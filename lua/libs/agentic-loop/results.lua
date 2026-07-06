@@ -1,4 +1,4 @@
--- starter/agentic-loop/results.lua — result-payload formatting helpers.
+-- lua/libs/agentic-loop/results.lua — result-payload formatting helpers.
 --
 -- Pure helpers; no module-level state. Safe to require from anywhere.
 

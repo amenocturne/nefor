@@ -98,7 +98,7 @@ local agentic_cli = require("cli")
 require("libs.generic-provider").declare()
 require("libs.generic-tool").declare()
 
-local agentic_loop = require("agentic-loop")
+local agentic_loop = require("libs.agentic-loop")
 agentic_loop.configure {
   provider = cfg.provider.name,
   model    = cfg.provider.model,

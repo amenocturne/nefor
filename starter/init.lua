@@ -294,7 +294,7 @@ local function build_runtime_context()
   return "\n\n---\n\n# Runtime Context\n\n" .. table.concat(parts, "\n\n")
 end
 
-local agentic_loop = require("agentic-loop")
+local agentic_loop = require("libs.agentic-loop")
 agentic_loop.configure {
   provider         = cfg.default_provider,
   model            = cfg.default_model,
