@@ -980,6 +980,7 @@ local function handle_plan_approved(msg, state)
 end
 
 local function handle_popup(msg, state)
+  if state.replay_mode then return state, {} end
   local v = msg.level or "info"
   return shallow_merge(state, {
     popup = {
@@ -992,6 +993,7 @@ local function handle_popup(msg, state)
 end
 
 local function handle_toast(msg, state)
+  if state.replay_mode then return state, {} end
   local now = tui.now_ms()
   local ttl = msg.ttl_ms or 2000
   local toasts = {}
