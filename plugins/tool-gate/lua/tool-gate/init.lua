@@ -2,7 +2,6 @@
 -- side-effect bridges (huge-output dump-to-file, instruction reminders).
 
 local envelope         = require("core.envelope")
-local spawn_graph      = require("libs.spawn-graph")
 local tool_output_dump = require("tool-gate.tool_output_dump")
 local agents_md        = require("tool-gate.agents_md")
 
@@ -22,14 +21,12 @@ function M.translator(gate_name)
     "tool-gate.translator: gate_name required")
 
   local hello_kind  = gate_name .. ".hello"
-  local invoke_kind = spawn_graph.SPAWN_GRAPH_SOURCE .. ".tool.invoke"
   local outbound_invoke_kind = gate_name .. ".tool.invoke"
 
   local t = {
     gate_name = gate_name,
     kinds = {
       hello                  = hello_kind,
-      spawn_graph_invoke     = invoke_kind,
       outbound_tool_invoke   = outbound_invoke_kind,
       tool_result            = "tool.result",
       tool_advertise         = gate_name .. ".tools.advertise",
@@ -43,13 +40,6 @@ function M.translator(gate_name)
       and env.body.kind == hello_kind
   end
 
-  function t.is_spawn_graph_invoke(env)
-    return type(env) == "table"
-      and env.type == "event"
-      and type(env.body) == "table"
-      and env.body.kind == invoke_kind
-  end
-
   function t.is_tool_result(env)
     return type(env) == "table"
       and env.type == "event"
@@ -61,10 +51,6 @@ function M.translator(gate_name)
       and env.type == "event"
       and type(env.body) == "table"
       and env.body.kind == outbound_invoke_kind
-  end
-
-  function t.advertise_body()
-    return spawn_graph.advertise_body(gate_name)
   end
 
   -- Publish under the gate's identity. Thin wrapper so callers don't
@@ -86,68 +72,6 @@ function M.translator(gate_name)
   end
 
   return t
-end
-
----@class ParsedSpawnGraphInvoke
----@field name string
----@field invoke_id string
----@field args table
-
----@param body table
----@return ParsedSpawnGraphInvoke|nil parsed
----@return string|nil err
-function M.parse_spawn_graph_invoke(body)
-  if type(body) ~= "table" then
-    return nil, "body not a table"
-  end
-  local name = body.name
-  local invoke_id = body.id
-  if name ~= "spawn_graph" then
-    return nil, "not a spawn_graph invoke (name=" .. tostring(name) .. ")"
-  end
-  if type(invoke_id) ~= "string" then
-    return nil, "missing or non-string id"
-  end
-  -- Empty args is legitimate (binary may forward an invoke whose args
-  -- was an empty object); downstream queue_sub_graph needs a table.
-  local args = body.args
-  if args == nil then args = {} end
-  if type(args) ~= "table" then
-    local ok, encoded = pcall(nefor.json.encode, args)
-    local raw = ok and encoded or tostring(args)
-    return nil, "spawn_graph: args must be a JSON object; got " ..
-      type(args) .. ". Raw args: " .. raw
-  end
-  return { name = name, invoke_id = invoke_id, args = args }, nil
-end
-
--- Tool.result body the model sees after queueing a sub-graph. The
--- `[spawn_graph(run_id=…) result]` tag is load-bearing: the model
--- recognises it when the real result lands later as a user message.
----@param invoke_id string
----@param run_id string
----@return table
-function M.spawn_graph_ack_body(invoke_id, run_id)
-  return {
-    kind   = "tool.result",
-    id     = invoke_id,
-    output = "Submitted sub-graph run_id=" .. run_id ..
-             ". Acknowledge briefly to the user, or chain another " ..
-             "tool call. The real result will arrive later as a " ..
-             "user message tagged `[spawn_graph(run_id=" .. run_id ..
-             ") result]`.",
-  }
-end
-
----@param invoke_id string
----@param err string|nil
----@return table
-function M.spawn_graph_error_body(invoke_id, err)
-  return {
-    kind  = "tool.result",
-    id    = invoke_id,
-    error = err or "spawn_graph: dispatch failed",
-  }
 end
 
 -- Swap huge tool.result outputs for an on-disk dump + summary string.

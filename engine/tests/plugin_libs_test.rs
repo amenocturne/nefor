@@ -4,9 +4,6 @@
 //!   * `basic-tools` no longer ships Lua libs —
 //!     their actor-spec wiring is the generic identity passthrough in
 //!     `core.actor.identity_spec`, exercised by `tests/lua/core/actor_test.lua`.
-//!   * `reasoner-graph` ships only `spawn_graph.lua` (protocol
-//!     primitives); the actor spec is built inline in starter via the
-//!     identity helper.
 //!   * `nefor-tui` keeps its widget primitives.
 //!
 //! Each surviving lib lives at `plugins/<plugin>/lua/<plugin>/...`

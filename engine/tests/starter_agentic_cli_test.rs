@@ -109,18 +109,11 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
     let starter_str = starter.display().to_string();
     let lua_root = lua_dir();
     let lua_root_str = lua_root.display().to_string();
-    let rg_plugin_lua = repo_root()
-        .join("plugins")
-        .join("reasoner-graph")
-        .join("lua");
-    let rg_plugin_lua_str = rg_plugin_lua.display().to_string();
     let script = format!(
         r#"
         package.path = table.concat({{
           "{starter}/?.lua",
           "{starter}/?/init.lua",
-          "{rg_plugin_lua}/?.lua",
-          "{rg_plugin_lua}/?/init.lua",
           "{lua_root}/?.lua",
           "{lua_root}/?/init.lua",
           package.path,
@@ -128,7 +121,6 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
         "#,
         starter = starter_str,
         lua_root = lua_root_str,
-        rg_plugin_lua = rg_plugin_lua_str,
     );
     lua.load(&script).exec()
 }

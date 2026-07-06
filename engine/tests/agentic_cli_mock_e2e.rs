@@ -54,7 +54,6 @@ fn target_debug(bin: &str) -> PathBuf {
 const REQUIRED_BINS: &[&str] = &[
     "nefor",
     "mock-plugin",
-    "reasoner-graph",
     "mag-plugin",
     "tool-gate",
     "generic-provider",
@@ -630,13 +629,11 @@ fn scenario_6_yolo_flag_accepted() {
 // Bug 1 regression — long-running streams complete without a watchdog.
 // --------------------------------------------------------------------
 //
-// `reasoner-graph` lost its ack-timeout watchdog in commit 0941531.
 // This scenario drives a turn where the mock provider deliberately
 // blocks past any short-window ack budget; the assertion is only that
-// the run finishes successfully and emits its answer. With the
-// watchdog removed the test is trivially green; if anything ever
-// reintroduces a watchdog at the protocol level, the slow turn would
-// fail with a deadline error here.
+// the run finishes successfully and emits its answer. If anything ever
+// reintroduces an ack-timeout watchdog at the protocol level, the slow
+// turn would fail with a deadline error here.
 //
 // The slow path is gated on the literal substring
 // "SLOW_STREAM_REGRESSION_" in the user prompt — see

@@ -284,11 +284,6 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
     let op_plugin_lua_str = op_plugin_lua.display().to_string();
     let tg_plugin_lua = repo_root().join("plugins").join("tool-gate").join("lua");
     let tg_plugin_lua_str = tg_plugin_lua.display().to_string();
-    let rg_plugin_lua = repo_root()
-        .join("plugins")
-        .join("reasoner-graph")
-        .join("lua");
-    let rg_plugin_lua_str = rg_plugin_lua.display().to_string();
     let script = format!(
         r#"
         package.path = table.concat({{
@@ -298,8 +293,6 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
           "{op_plugin_lua}/?/init.lua",
           "{tg_plugin_lua}/?.lua",
           "{tg_plugin_lua}/?/init.lua",
-          "{rg_plugin_lua}/?.lua",
-          "{rg_plugin_lua}/?/init.lua",
           "{lua_root}/?.lua",
           "{lua_root}/?/init.lua",
           package.path,
@@ -313,7 +306,6 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
         lua_root = lua_root_str,
         op_plugin_lua = op_plugin_lua_str,
         tg_plugin_lua = tg_plugin_lua_str,
-        rg_plugin_lua = rg_plugin_lua_str,
     );
     lua.load(&script).exec()
 }

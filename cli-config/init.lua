@@ -32,8 +32,8 @@ package.path = table.concat({
 -- lib. The `dir` overrides skip the clone path; pm registers each dir
 -- and puts it on package.path so `require("<name>")` resolves to the
 -- plugin lib. Starter composers live as per-domain files (provider,
--- tools, graph) at the starter root and are reached via
--- plain `require("<name>")`.
+-- tools) at the starter root and are reached via plain
+-- `require("<name>")`.
 local pm = require("nefor-pm")
 pm.install({
   -- Multi-consumer protocol primitives.
@@ -68,17 +68,6 @@ pm.install({
     tag  = "v0.1.5",
     path = "plugins/tool-gate/lua/tool-gate/",
     dir  = PROJECT_ROOT .. "/plugins/tool-gate/lua/tool-gate",
-  },
-
-  -- reasoner-graph's actor-spec wiring is identity passthrough and
-  -- lives in starter/graph.lua via `core.actor.identity_spec`. The
-  -- `spawn_graph` protocol contract lives at `libs.spawn-graph`.
-  {
-    "amenocturne/nefor",
-    name = "reasoner-graph",
-    tag  = "v0.1.5",
-    path = "plugins/reasoner-graph/lua/reasoner-graph/",
-    dir  = PROJECT_ROOT .. "/plugins/reasoner-graph/lua/reasoner-graph",
   },
 })
 
@@ -160,8 +149,6 @@ else
     { static_token = cfg.provider.static_token, agentic_loop = agentic_loop }
   ))
 end
-
-actor.spawn(require("compositors.graph").spawn_spec({ require("config").bin("reasoner-graph") }))
 
 -- mag: the MAG actor-kernel runtime — the lead's turn-programs execute
 -- here (agentic-loop spawns one per user message). Mirrors the starter

@@ -206,14 +206,6 @@ pm.install({
     path = "plugins/nefor-tui/lua/",
     dir  = NEFOR_ROOT .. "/plugins/nefor-tui/lua",
   },
-
-  {
-    "amenocturne/nefor",
-    name = "reasoner-graph",
-    tag  = UPSTREAM_REF,
-    path = "plugins/reasoner-graph/lua/reasoner-graph/",
-    dir  = NEFOR_ROOT .. "/plugins/reasoner-graph/lua/reasoner-graph",
-  },
 })
 
 local ncp            = require("core.ncp")
@@ -269,11 +261,11 @@ local startup = parse_startup_args((nefor.runtime and nefor.runtime.argv) or {})
 sessions.init(startup.session_id)
 
 -- Spawn order matters: type-tag registrations must complete before the
--- scheduler queries on submit. Order:
+-- kernel queries on submit. Order:
 --   1. libs.generic-{provider,tool}.declare()
---   2. agentic-loop + reasoners
+--   2. agentic-loop
 --   3. providers
---   4. reasoner-graph + tool-gate + basic-tools
+--   4. mag + tool-gate + basic-tools
 --   5. lead-workflow
 --   6. chat (declarative TUI)
 
@@ -375,30 +367,13 @@ for _, p in ipairs(cfg.providers or {}) do
   end
 end
 
--- Pre-seed the reasoner-graph binary's peer set with every Lua-resident
--- reasoner type. MAG execution lowers to reasoner-graph internally, and
--- the graph must be able to reference Lua reasoners before they emit.
-local rg_argv = { require("config").bin("reasoner-graph") }
-do
-  local reasoners_mod = require("reasoners")
-  local known = reasoners_mod._internals and reasoners_mod._internals.handlers
-  if type(known) == "table" then
-    for name, _ in pairs(known) do
-      rg_argv[#rg_argv + 1] = "--peer"
-      rg_argv[#rg_argv + 1] = name
-    end
-  end
-end
-actor.spawn(require("compositors.graph").spawn_spec(rg_argv))
-
--- mag: the MAG actor-kernel runtime. Coexists with reasoner-graph (it
--- will eventually replace it, but the skeleton just handshakes, hosts a
--- Lua VM, and loads the stub kernel). Speaks the canonical wire shape,
--- so it spawns via `identity_spec` like reasoner-graph. The `--kernel`
--- path points the plugin's embedded VM at the config-resident kernel
--- entry; STARTER_ROOT is NEFOR_CONFIG_DIR (the repo's `starter/` under
--- `just run`). Binary is `mag-plugin` (the `mag` binary is nefor-mag's
--- compiler CLI); bus identity is `mag`.
+-- mag: the MAG actor-kernel runtime — the only execution path; every
+-- run (the lead's turn-programs and its dispatched sub-runs) executes
+-- here. Speaks the canonical wire shape, so it spawns via
+-- `identity_spec`. The `--kernel` path points the plugin's embedded VM
+-- at the config-resident kernel entry; STARTER_ROOT is NEFOR_CONFIG_DIR
+-- (the repo's `starter/` under `just run`). Binary is `mag-plugin` (the
+-- `mag` binary is nefor-mag's compiler CLI); bus identity is `mag`.
 -- `--tool-gate` threads the composition-owned gate identity (the same name
 -- tools.gate_spec below spawns the gate under): the plugin rewrites the
 -- kernel's tool-class capability invokes onto `<gate>.tool.invoke`, and the

@@ -2059,21 +2059,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "reasoner-graph"
-version = "0.2.0"
-dependencies = [
- "nefor-plugin-sdk",
- "nefor-protocol",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"

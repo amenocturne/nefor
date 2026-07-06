@@ -217,7 +217,7 @@ end
 -- that speaks the canonical wire shape directly (no translation).
 --
 -- Generic shape — shared by every plugin whose lua-side wrapper is
--- pure passthrough (basic-tools, reasoner-graph,
+-- pure passthrough (basic-tools, mag-plugin,
 -- and any future binary that needs no domain translation):
 --
 --   * `from_plugin`: re-emit every envelope onto the bus via

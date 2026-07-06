@@ -6,7 +6,7 @@ Process-isolated NCP plugins. Each plugin is its own crate with a binary entry p
 
 - `nefor-tui/` — declarative TUI: layout primitives + reconciler + line-diff renderer + Lua VM.
 - `openai-provider/` — OpenAI-compatible HTTP provider.
-- `reasoner-graph/` — typed graph scheduler with cycles and per-firing lifecycle.
+- `mag/` — MAG actor kernel: executes compiled `.mag` programs as actor constellations.
 - `tool-gate/` — tool advertisement + permission gate.
 - `basic-tools/` — `read_file` / `write_file` / `bash` built-ins.
 - `generic-provider/`, `generic-tool/` — passive type-registry hubs for graph composition.

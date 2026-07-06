@@ -40,17 +40,11 @@ fn plugin_lib_dir() -> PathBuf {
 fn set_package_path(lua: &Lua) -> mlua::Result<()> {
     let plugin = plugin_lib_dir();
     let lua_root = lua_dir();
-    let rg_plugin_lua = repo_root()
-        .join("plugins")
-        .join("reasoner-graph")
-        .join("lua");
     let script = format!(
         r#"
         package.path = table.concat({{
           "{plugin}/?.lua",
           "{plugin}/?/init.lua",
-          "{rg_plugin_lua}/?.lua",
-          "{rg_plugin_lua}/?/init.lua",
           "{lua_root}/?.lua",
           "{lua_root}/?/init.lua",
           package.path,
@@ -58,7 +52,6 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
         "#,
         plugin = plugin.display(),
         lua_root = lua_root.display(),
-        rg_plugin_lua = rg_plugin_lua.display(),
     );
     lua.load(&script).exec()
 }
@@ -139,13 +132,11 @@ fn translator_exposes_canonical_kinds_for_gate_name() {
         .expect("kinds");
 
     let hello: String = kinds.get("hello").expect("hello");
-    let spawn_graph_invoke: String = kinds.get("spawn_graph_invoke").expect("sgi");
     let outbound_tool_invoke: String = kinds.get("outbound_tool_invoke").expect("oti");
     let tool_result: String = kinds.get("tool_result").expect("tr");
     let tool_advertise: String = kinds.get("tool_advertise").expect("ta");
 
     assert_eq!(hello, "tool-gate.hello");
-    assert_eq!(spawn_graph_invoke, "spawn-graph-tool.tool.invoke");
     assert_eq!(outbound_tool_invoke, "tool-gate.tool.invoke");
     assert_eq!(tool_result, "tool.result");
     assert_eq!(tool_advertise, "tool-gate.tools.advertise");
@@ -165,8 +156,6 @@ fn translator_predicates_match_envelope_shape() {
 
             local hello_env = { type = "event", from = "tool-gate",
               body = { kind = "tool-gate.hello" } }
-            local sg_env = { type = "event", from = "tool-gate",
-              body = { kind = "spawn-graph-tool.tool.invoke", id = "x", name = "spawn_graph" } }
             local tr_env = { type = "event", from = "tool-gate",
               body = { kind = "tool.result", id = "c" } }
             local oti_env = { type = "event", from = "agentic-loop",
@@ -178,8 +167,6 @@ fn translator_predicates_match_envelope_shape() {
             return {
               hello_yes        = t.is_hello(hello_env),
               hello_no_other   = t.is_hello(other_env),
-              sg_yes           = t.is_spawn_graph_invoke(sg_env),
-              sg_no            = t.is_spawn_graph_invoke(hello_env),
               tr_yes           = t.is_tool_result(tr_env),
               tr_no            = t.is_tool_result(hello_env),
               oti_yes          = t.is_outbound_tool_invoke(oti_env),
@@ -191,14 +178,8 @@ fn translator_predicates_match_envelope_shape() {
         .eval()
         .expect("eval");
 
-    let truthy: Vec<&str> = vec!["hello_yes", "sg_yes", "tr_yes", "oti_yes"];
-    let falsy: Vec<&str> = vec![
-        "hello_no_other",
-        "sg_no",
-        "tr_no",
-        "oti_no",
-        "nonevent_rejects",
-    ];
+    let truthy: Vec<&str> = vec!["hello_yes", "tr_yes", "oti_yes"];
+    let falsy: Vec<&str> = vec!["hello_no_other", "tr_no", "oti_no", "nonevent_rejects"];
     for k in &truthy {
         let v: bool = results.get(*k).expect(k);
         assert!(v, "{k} should be true");
@@ -207,33 +188,6 @@ fn translator_predicates_match_envelope_shape() {
         let v: bool = results.get(*k).expect(k);
         assert!(!v, "{k} should be false");
     }
-}
-
-#[test]
-fn translator_advertise_body_carries_spawn_graph_metadata() {
-    let lua = Lua::new();
-    install_stub_nefor(&lua).expect("nefor stub");
-    set_package_path(&lua).expect("package.path");
-
-    let body: Table = lua
-        .load(
-            r#"
-            local lib = require("tool-gate")
-            return lib.translator("tool-gate").advertise_body()
-            "#,
-        )
-        .eval()
-        .expect("advertise_body");
-
-    let kind: String = body.get("kind").expect("kind");
-    let source: String = body.get("source").expect("source");
-    let tools: Table = body.get("tools").expect("tools");
-    let first: Table = tools.get(1).expect("first tool");
-    let tool_name: String = first.get("name").expect("name");
-
-    assert_eq!(kind, "tool-gate.tools.advertise");
-    assert_eq!(source, "spawn-graph-tool");
-    assert_eq!(tool_name, "spawn_graph");
 }
 
 #[test]
@@ -269,224 +223,6 @@ fn translator_publish_routes_through_engine_send_with_gate_identity() {
             "publish entry {i} must carry gate identity: {payload}"
         );
     }
-}
-
-// ----------------------------------------------------------------
-// parse_spawn_graph_invoke — pure parsing
-// ----------------------------------------------------------------
-
-#[test]
-fn parse_spawn_graph_invoke_accepts_well_formed_body() {
-    let lua = Lua::new();
-    install_stub_nefor(&lua).expect("nefor stub");
-    set_package_path(&lua).expect("package.path");
-
-    let result: Table = lua
-        .load(
-            r#"
-            local lib = require("tool-gate")
-            local parsed, err = lib.parse_spawn_graph_invoke({
-              kind = "spawn-graph-tool.tool.invoke",
-              id = "inv-42",
-              name = "spawn_graph",
-              args = { graph = { nodes = {}, edges = {} } },
-            })
-            return { parsed = parsed, err = err }
-            "#,
-        )
-        .eval()
-        .expect("eval");
-
-    let parsed: Table = result.get("parsed").expect("parsed");
-    let err: Option<String> = result.get("err").expect("err");
-    let invoke_id: String = parsed.get("invoke_id").expect("invoke_id");
-    let name: String = parsed.get("name").expect("name");
-
-    assert_eq!(name, "spawn_graph");
-    assert_eq!(invoke_id, "inv-42");
-    assert!(err.is_none());
-}
-
-#[test]
-fn parse_spawn_graph_invoke_rejects_wrong_name() {
-    let lua = Lua::new();
-    install_stub_nefor(&lua).expect("nefor stub");
-    set_package_path(&lua).expect("package.path");
-
-    let err: String = lua
-        .load(
-            r#"
-            local lib = require("tool-gate")
-            local parsed, err = lib.parse_spawn_graph_invoke({
-              kind = "spawn-graph-tool.tool.invoke",
-              id = "inv-1",
-              name = "not_spawn_graph",
-            })
-            assert(parsed == nil, "parsed should be nil")
-            return err
-            "#,
-        )
-        .eval()
-        .expect("eval");
-
-    assert!(
-        err.contains("not a spawn_graph invoke"),
-        "err mentions name mismatch: {err}"
-    );
-}
-
-#[test]
-fn parse_spawn_graph_invoke_rejects_missing_id() {
-    let lua = Lua::new();
-    install_stub_nefor(&lua).expect("nefor stub");
-    set_package_path(&lua).expect("package.path");
-
-    let err: String = lua
-        .load(
-            r#"
-            local lib = require("tool-gate")
-            local parsed, err = lib.parse_spawn_graph_invoke({
-              name = "spawn_graph",
-            })
-            assert(parsed == nil)
-            return err
-            "#,
-        )
-        .eval()
-        .expect("eval");
-
-    assert!(err.contains("id"), "err mentions id: {err}");
-}
-
-#[test]
-fn parse_spawn_graph_invoke_defaults_args_to_empty_table() {
-    // Bodies without an `args` field must parse — the gate's binary
-    // can forward an invoke whose args was an empty object, and tests
-    // that pre-fix relied on `body.args or {}` semantics.
-    let lua = Lua::new();
-    install_stub_nefor(&lua).expect("nefor stub");
-    set_package_path(&lua).expect("package.path");
-
-    let args_is_table: bool = lua
-        .load(
-            r#"
-            local lib = require("tool-gate")
-            local parsed = lib.parse_spawn_graph_invoke({
-              id = "inv-1", name = "spawn_graph",
-            })
-            return type(parsed.args) == "table"
-            "#,
-        )
-        .eval()
-        .expect("eval");
-    assert!(args_is_table);
-}
-
-#[test]
-fn parse_spawn_graph_invoke_rejects_non_object_args_with_raw_value() {
-    let lua = Lua::new();
-    install_stub_nefor(&lua).expect("nefor stub");
-    set_package_path(&lua).expect("package.path");
-
-    let err: String = lua
-        .load(
-            r#"
-            local lib = require("tool-gate")
-            local parsed, err = lib.parse_spawn_graph_invoke({
-              id = "inv-1",
-              name = "spawn_graph",
-              args = "{\"graph\":",
-            })
-            assert(parsed == nil)
-            return err
-            "#,
-        )
-        .eval()
-        .expect("eval");
-
-    assert!(
-        err.contains("args must be a JSON object"),
-        "err names required shape: {err}"
-    );
-    assert!(err.contains("string"), "err names actual type: {err}");
-    assert!(
-        err.contains(r#""{\"graph\":"#),
-        "err includes raw args preview: {err}"
-    );
-}
-
-// ----------------------------------------------------------------
-// spawn_graph_ack_body / spawn_graph_error_body
-// ----------------------------------------------------------------
-
-#[test]
-fn spawn_graph_ack_body_embeds_run_id_in_output_marker() {
-    // The ack output is the message the model sees in chat history.
-    // Two load-bearing fragments: the literal "Submitted sub-graph" lead
-    // + the `[spawn_graph(run_id=…) result]` tag the model needs to
-    // recognise when the real result lands as a user message later.
-    let lua = Lua::new();
-    install_stub_nefor(&lua).expect("nefor stub");
-    set_package_path(&lua).expect("package.path");
-
-    let body: Table = lua
-        .load(
-            r#"
-            local lib = require("tool-gate")
-            return lib.spawn_graph_ack_body("inv-99", "run-abc")
-            "#,
-        )
-        .eval()
-        .expect("ack");
-
-    let kind: String = body.get("kind").expect("kind");
-    let id: String = body.get("id").expect("id");
-    let output: String = body.get("output").expect("output");
-
-    assert_eq!(kind, "tool.result");
-    assert_eq!(id, "inv-99");
-    assert!(output.contains("run-abc"), "ack must name run_id: {output}");
-    assert!(
-        output.contains("[spawn_graph(run_id=run-abc) result]"),
-        "ack must include the literal result-tag fragment: {output}"
-    );
-}
-
-#[test]
-fn spawn_graph_error_body_carries_explicit_error_field() {
-    let lua = Lua::new();
-    install_stub_nefor(&lua).expect("nefor stub");
-    set_package_path(&lua).expect("package.path");
-
-    let body: Table = lua
-        .load(
-            r#"
-            local lib = require("tool-gate")
-            return lib.spawn_graph_error_body("inv-13", "dispatch refused")
-            "#,
-        )
-        .eval()
-        .expect("err body");
-
-    let id: String = body.get("id").expect("id");
-    let err: String = body.get("error").expect("error");
-    assert_eq!(id, "inv-13");
-    assert_eq!(err, "dispatch refused");
-
-    // nil error falls back to the default message.
-    let default_err: String = lua
-        .load(
-            r#"
-            local lib = require("tool-gate")
-            return lib.spawn_graph_error_body("x", nil).error
-            "#,
-        )
-        .eval()
-        .expect("default");
-    assert!(
-        default_err.contains("spawn_graph"),
-        "fallback err names the tool: {default_err}"
-    );
 }
 
 // ----------------------------------------------------------------
