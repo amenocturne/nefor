@@ -37,8 +37,7 @@
                            "terminate-graph"
                            "write-review"
                            "mag"
-                           "mag-eval"
-                           "mag-env"]}
+                           "mag-eval"]}
              : mag.Task -> generic-provider.FinalAnswer)
       out  (node "sink" {}
              : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]

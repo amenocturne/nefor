@@ -96,6 +96,19 @@ local state = {
   tool_start_observers   = {},  ---@type table
   tool_end_observers     = {},  ---@type table
   complete_observers     = {},  ---@type table
+
+  -- Ambient MAG context injected into each turn's system overlay so the
+  -- lead can start writing MAG without a discovery round-trip. `static`
+  -- (inventory + patterns + types + template signatures + prompt roster)
+  -- is read once from the config lib dir and cached process-wide; the
+  -- `workspace` dir is per-session. `static_builds` counts real (re)reads
+  -- so a test can prove the cache holds across turns.
+  mag_context = {
+    static            = nil,  ---@type string|nil
+    static_builds     = 0,    ---@type number
+    workspace         = nil,  ---@type string|nil
+    workspace_session = nil,  ---@type string|nil
+  },
 }
 
 local emit           = envelope.emit
@@ -130,6 +143,187 @@ end
 
 local function fire_observers(list, ...)
   for _, cb in ipairs(list) do pcall(cb, ...) end
+end
+
+-- ── ambient MAG context ───────────────────────────────────────────────
+--
+-- The lead used to pay a `mag-env` round-trip (plus reading patterns.md)
+-- before writing any MAG. That context is now ambient: appended to every
+-- turn's `system` overlay. Contents: the session workspace dir, the seeded
+-- lib/ inventory, patterns.md inlined (the canonical shapes doc), the type
+-- declarations, template signatures (bodies read on demand), and the prompt
+-- roster.
+--
+-- Seam: the MAG workspace is lead-workflow's domain, but its path
+-- resolution and seeding live in the shared `mag` workspace module
+-- (starter/mag) — required here as a composition-layer helper, not a reach
+-- into lead-workflow's internals.
+
+-- The config dir that holds the turn-program and the mag/lib library. Same
+-- resolution as lead_program_source_dir (defined below for the load path);
+-- inlined here to stay independent of definition order.
+local function mag_config_dir()
+  local sd = state.lead_program.source_dir
+  if type(sd) == "string" and #sd > 0 then return sd end
+  return rawget(_G, "NEFOR_CONFIG_DIR") or os.getenv("NEFOR_CONFIG_DIR") or "."
+end
+
+local function read_config_file(path)
+  if not (nefor.fs and type(nefor.fs.read_file) == "function") then return nil end
+  local ok, res = pcall(nefor.fs.read_file, path)
+  if ok and type(res) == "table" and res.ok and type(res.content) == "string" then
+    return res.content
+  end
+  return nil
+end
+
+-- Sorted relative inventory of the config lib dir (top-level files plus one
+-- level of subdirectories, e.g. prompts/*).
+local function lib_inventory(lib_dir)
+  if not (nefor.fs and type(nefor.fs.list_dir) == "function") then return {} end
+  local rels = {}
+  local top = nefor.fs.list_dir(lib_dir)
+  for _, e in ipairs(top or {}) do
+    if e.is_dir then
+      local sub = nefor.fs.list_dir(lib_dir .. "/" .. e.name)
+      for _, s in ipairs(sub or {}) do
+        if not s.is_dir then rels[#rels + 1] = e.name .. "/" .. s.name end
+      end
+    else
+      rels[#rels + 1] = e.name
+    end
+  end
+  table.sort(rels)
+  return rels
+end
+
+-- Names (no extension) of the prompt roster under lib/prompts/.
+local function prompt_names(lib_dir)
+  if not (nefor.fs and type(nefor.fs.list_dir) == "function") then return {} end
+  local names = {}
+  local entries = nefor.fs.list_dir(lib_dir .. "/prompts")
+  for _, e in ipairs(entries or {}) do
+    if not e.is_dir then names[#names + 1] = (e.name:gsub("%.md$", "")) end
+  end
+  table.sort(names)
+  return names
+end
+
+-- Template signatures from templates.mag: the `(def NAME (fn …` name plus
+-- the nearest preceding `;; Boundary:` comment. Bodies stay out — the lead
+-- reads a body with read_file only when composing with it.
+local function template_signatures(src)
+  local sigs = {}
+  if type(src) ~= "string" then return sigs end
+  local pending
+  for line in (src .. "\n"):gmatch("(.-)\n") do
+    local boundary = line:match(";;%s*Boundary:%s*(.+)")
+    if boundary then pending = boundary end
+    local name = line:match("^%(def%s+([%w%-_]+)%s+%(fn")
+    if name then
+      sigs[#sigs + 1] = pending and (name .. " — " .. pending) or name
+      pending = nil
+    end
+  end
+  return sigs
+end
+
+-- Build the static (config-derived) section. Returns (text, complete) where
+-- `complete` is true when patterns.md was readable — an incomplete build is
+-- not cached, so a later turn (once NEFOR_CONFIG_DIR resolves) rebuilds it.
+local function build_mag_static_section(config_dir)
+  local lib_dir  = config_dir .. "/mag/lib"
+  local patterns = read_config_file(lib_dir .. "/patterns.md")
+  local types    = read_config_file(lib_dir .. "/types.mag")
+  local tpl_src  = read_config_file(lib_dir .. "/templates.mag")
+
+  local parts = {}
+  parts[#parts + 1] = "The session MAG workspace is seeded and ready. Paths you pass to " ..
+    "`mag` are relative to it. patterns.md and the type tags are inlined below; " ..
+    "read a template or prompt body with read_file when you compose with it."
+  parts[#parts + 1] = ""
+  parts[#parts + 1] = "lib/ inventory:"
+  for _, rel in ipairs(lib_inventory(lib_dir)) do parts[#parts + 1] = "  " .. rel end
+  parts[#parts + 1] = ""
+  parts[#parts + 1] = "### lib/patterns.md"
+  parts[#parts + 1] = patterns or "(unavailable)"
+  parts[#parts + 1] = ""
+  parts[#parts + 1] = "### lib/types.mag"
+  parts[#parts + 1] = types or "(unavailable)"
+  parts[#parts + 1] = ""
+  parts[#parts + 1] = "### lib/templates.mag — signatures (read the file for the full body before composing)"
+  local sigs = template_signatures(tpl_src)
+  if #sigs == 0 then
+    parts[#parts + 1] = "  (none)"
+  else
+    for _, s in ipairs(sigs) do parts[#parts + 1] = "  " .. s end
+  end
+  parts[#parts + 1] = ""
+  parts[#parts + 1] = "### lib/prompts/ (read a role prompt with read_file to reuse it)"
+  local names = prompt_names(lib_dir)
+  parts[#parts + 1] = "  " .. (#names > 0 and table.concat(names, ", ") or "(none)")
+
+  return table.concat(parts, "\n"), (patterns ~= nil)
+end
+
+-- Cached static section. Read once; cache only a complete build.
+local function mag_static_section(config_dir)
+  local mc = state.mag_context
+  if type(mc.static) == "string" then return mc.static end
+  local text, complete = build_mag_static_section(config_dir)
+  mc.static_builds = mc.static_builds + 1
+  if complete then mc.static = text end
+  return text
+end
+
+-- The session workspace dir, resolved the way the mag tool does (seed +
+-- return); falls back to the pure path when seeding can't run (no writable
+-- data root, e.g. under test). Cached per session.
+local function mag_workspace_dir(session_id, config_dir)
+  local mc = state.mag_context
+  if mc.workspace_session == session_id and type(mc.workspace) == "string" then
+    return mc.workspace
+  end
+  local mag = require("mag")
+  local ws
+  local ok, res = pcall(mag.init_workspace, session_id, config_dir)
+  if ok and type(res) == "string" and #res > 0 then
+    ws = res
+  else
+    ws = mag.workspace_dir(session_id)
+  end
+  mc.workspace = ws
+  mc.workspace_session = session_id
+  return ws
+end
+
+-- The full `## MAG workspace` block, or nil when there is no active session
+-- to anchor the workspace dir.
+local function mag_workspace_block()
+  local sessions = require("sessions")
+  local session_id = sessions.current_id()
+  if type(session_id) ~= "string" or session_id == "" then return nil end
+  local config_dir = mag_config_dir()
+  local ws = mag_workspace_dir(session_id, config_dir)
+  local lines = {
+    "## MAG workspace",
+    "",
+    "workspace dir: " .. tostring(ws),
+    "",
+    mag_static_section(config_dir),
+  }
+  return table.concat(lines, "\n")
+end
+
+-- Append the ambient MAG context to a turn's system prompt. The block is
+-- additive: an empty base system prompt still carries the context.
+local function system_with_mag_context(base)
+  local block = mag_workspace_block()
+  if type(block) ~= "string" then return base end
+  if type(base) == "string" and #base > 0 then
+    return base .. "\n\n" .. block
+  end
+  return block
 end
 
 -- ── the turn-program ──────────────────────────────────────────────────
@@ -272,8 +466,14 @@ local function submit_orchestrator_run(user_text)
   if type(state.config.reasoning_effort) == "string" and #state.config.reasoning_effort > 0 then
     overlay_params.reasoning_effort = state.config.reasoning_effort
   end
-  if type(state.config.system) == "string" and #state.config.system > 0 then
-    overlay_params.system = state.config.system
+  -- Ambient MAG context: append the workspace/lib block to the system
+  -- overlay so the lead can write MAG immediately (no mag-env round-trip).
+  -- Additive — an empty base system prompt still carries the block.
+  local base_system = (type(state.config.system) == "string" and #state.config.system > 0)
+    and state.config.system or nil
+  local system = system_with_mag_context(base_system)
+  if type(system) == "string" and #system > 0 then
+    overlay_params.system = system
   end
 
   local run_id = ids.mint_chat_run_id()
@@ -973,6 +1173,12 @@ M._internals  = {
     state.tool_start_observers = {}
     state.tool_end_observers = {}
     state.complete_observers = {}
+    state.mag_context = {
+      static = nil,
+      static_builds = 0,
+      workspace = nil,
+      workspace_session = nil,
+    }
     envelope._reset()
   end,
 }

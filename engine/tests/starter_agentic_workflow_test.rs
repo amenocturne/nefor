@@ -235,5 +235,9 @@ fn set_package_path(lua: &Lua) -> mlua::Result<()> {
         starter = starter_str,
         lua_root = lua_root_str,
     );
-    lua.load(&script).exec()
+    lua.load(&script).exec()?;
+    // Expose the starter tree so the test can point the lead-program /
+    // mag-lib source dir at it (the ambient MAG-context block reads
+    // mag/lib from there).
+    lua.globals().set("_starter_dir", starter_str)
 }

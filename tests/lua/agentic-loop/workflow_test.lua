@@ -17,6 +17,11 @@
 local agentic_loop = require("agentic-loop")
 local json = nefor.json
 
+-- Seed an active session so the ambient MAG-workspace block can anchor a
+-- workspace dir (mirrors a booted session in the live runtime). Set once —
+-- the sessions module is separate state the loop's reset() doesn't touch.
+require("sessions")._internals.state.current_session_id = "wf-mag-session"
+
 local function assert_eq(actual, expected, msg)
   if actual ~= expected then
     error(string.format(
@@ -181,6 +186,9 @@ local function fresh_loop()
   agentic_loop.configure {
     provider = "mock", model = "test-model",
     reasoning_effort = "high", system = "lead system prompt",
+    -- Point the lead-program / mag-lib source dir at the real starter tree
+    -- so the ambient MAG-context block can read mag/lib/*.
+    lead_program = { source_dir = _starter_dir },
   }
   _test.set_plugins({ "mock", "mag", "nefor-tui" })
   _test.calls_clear()
@@ -252,7 +260,19 @@ do
     "the initial mag.Task payload is the user message")
   local overlay = exec.body.params_overlay["lead.llm"]
   assert(type(overlay) == "table", "params overlay keys the derived llm actor")
-  assert_eq(overlay.system, "lead system prompt", "system prompt overlays the llm actor")
+  -- The base system prompt leads, with the ambient MAG-workspace block
+  -- appended (workspace dir + inlined patterns).
+  assert(type(overlay.system) == "string"
+    and overlay.system:sub(1, #"lead system prompt") == "lead system prompt",
+    "the configured system prompt leads the overlay")
+  assert(string.find(overlay.system, "## MAG workspace", 1, true) ~= nil,
+    "the ambient MAG workspace block is appended to the system overlay")
+  assert(string.find(overlay.system, "workspace dir:", 1, true) ~= nil,
+    "the block names the session workspace dir")
+  assert(string.find(overlay.system, "wf-mag-session", 1, true) ~= nil,
+    "the workspace dir is anchored to the active session")
+  assert(string.find(overlay.system, "MAG patterns", 1, true) ~= nil,
+    "patterns.md is inlined into the block")
   assert_eq(overlay.provider, "mock", "live provider overlays the llm actor")
   assert_eq(overlay.model, "test-model", "live model overlays the llm actor")
   assert_eq(overlay.reasoning_effort, "high", "reasoning effort overlays the llm actor")
@@ -347,6 +367,25 @@ do
   assert_eq(#seeded, 2, "second turn's llm seeds the prior turn's pair")
   assert_eq(seeded[1].content, "hello lead")
   assert_eq(seeded[2].content, "the answer")
+end
+
+-- (ambient MAG context caching) the static section (inventory + patterns +
+-- types + template signatures + prompt roster) is read once and reused
+-- across turns; only the per-session workspace dir varies.
+do
+  fresh_loop()
+  local exec1 = begin_turn("first ambient")
+  assert(string.find(exec1.body.params_overlay["lead.llm"].system,
+    "## MAG workspace", 1, true) ~= nil, "turn 1 carries the MAG workspace block")
+  send_to_loop("mag", {
+    kind = "mag.run_result", run_id = exec1.body.run_id,
+    status = "completed", result = { text = "a1" },
+  })
+  local exec2 = begin_turn("second ambient")
+  assert(string.find(exec2.body.params_overlay["lead.llm"].system,
+    "## MAG workspace", 1, true) ~= nil, "turn 2 also carries the block")
+  assert_eq(agentic_loop._internals.state.mag_context.static_builds, 1,
+    "the static MAG section is read from disk once and cached across turns")
 end
 
 -- (no-stream fallback) a completed turn whose answer never streamed

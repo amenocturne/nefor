@@ -24,7 +24,7 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 - `starter/sessions/` — sessions actor: boot/shutdown/resume + jsonl persistence over the bus.
 - `starter/chat/` — chat surface composed over `tui.*` primitives (entry `chat/init.lua`; transcript, statusline, input, popups, slash commands as submodules). Entry model is copy-on-write with a global version counter (`entry.lua`); heights cached by `(version, width)` in `height_cache.lua`; debug logging gated on `NEFOR_DEBUG` (`log.lua`, writes to `<data_dir>/debug/nefor-chat.log`). Virtual scroll uses gap=0 outer column with spacers flush against a nested content column to avoid phantom-gap position mismatches.
 - `starter/cli/` — virtual `agentic-cli` plugin: surfaces the loop over stdin/stdout for `nefor plugin agentic-cli "<prompt>"`.
-- `starter/lead-workflow/` — lead role plus the mag / mag-eval / mag-env / write-review / graph-status / terminate-graph tool surface.
+- `starter/lead-workflow/` — lead role plus the mag / mag-eval / write-review / graph-status / terminate-graph tool surface.
 - `starter/compositors/` — actor-spec builders per plugin binary (provider, tools, chat_bridge).
 - `starter/mock-provider/` — script loaded by `mock-plugin` to impersonate an openai-compatible provider with deterministic responses.
 - `starter/config/` — settings table consumed by `starter/init.lua`.

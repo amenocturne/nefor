@@ -54,8 +54,6 @@
 --
 --   * `mag` — write, compile, and execute MAG workflow graphs.
 --
---   * `mag-env` — initialise and return the MAG workspace path.
---
 --   * `graph-status` — report active/recent graph run state.
 --
 --   * `terminate-graph` — cancel an active graph run by run_id.
@@ -1255,15 +1253,6 @@ local function lead_workflow_tool_schemas()
         required = { "file" },
       },
     },
-    {
-      name        = "mag-env",
-      description = "Get the MAG workspace directory path. Creates and seeds " ..
-        "the workspace if it doesn't exist yet.",
-      parameters  = {
-        type = "object",
-        properties = {},
-      },
-    },
     mag_eval.schema,
   }
 end
@@ -1280,27 +1269,9 @@ end
 
 -- MAG tool handlers.
 --
--- mag-env: initialise and return the MAG workspace path.
--- mag: write a .mag file, or compile/execute it through the mag plugin.
-
-local function mag_env_handler(firing_id, _args)
-  local session_id = sessions.current_id()
-  if not session_id then
-    emit_tool_result_err(firing_id, "mag-env: no active session")
-    return
-  end
-  local config_dir = os.getenv("NEFOR_CONFIG_DIR") or "."
-  local ws, err = mag.init_workspace(session_id, config_dir)
-  if not ws then
-    emit_tool_result_err(firing_id, "mag-env: " .. tostring(err))
-    return
-  end
-  emit_tool_result_ok(firing_id, {
-    workspace = ws,
-    message = "MAG workspace ready at: " .. ws ..
-      "\nLibrary files seeded in lib/. Write .mag files here, then use the mag tool to compile and execute.",
-  })
-end
+-- mag: write a .mag file, or compile/execute it through the mag plugin. The
+-- workspace path and library shapes are ambient (agentic-loop injects them
+-- into the lead's system prompt each turn), so there is no discovery tool.
 
 -- Compile/execute both run a synchronous load handshake against the mag
 -- plugin: `mag.load` is sent, the `mag.loaded` reply carries the lowered
@@ -1510,7 +1481,6 @@ local TOOL_HANDLERS = {
   ["write-review"]    = submit_plan,
   ["submit-plan"]     = submit_plan,
   ["mag"]             = mag_handler,
-  ["mag-env"]         = mag_env_handler,
   ["mag-eval"]        = mag_eval.handle,
 }
 

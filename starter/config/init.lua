@@ -122,7 +122,7 @@ M.active = {
     auto_tools     = {
       "read_file", "read_image", "python-read", "instructions", "discover_instruction_files",
       "write-review", "submit-plan", "graph-status", "terminate-graph",
-      "mag", "mag-eval", "mag-env",
+      "mag", "mag-eval",
     },
     -- Tools that always go through the popup, regardless of default.
     prompt_tools   = {},

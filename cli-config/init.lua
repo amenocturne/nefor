@@ -170,7 +170,7 @@ tool_gate_argv[#tool_gate_argv + 1] = "--default"
 tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
 
 -- lead-workflow owns the lead's kernel-dispatch tool surface (mag /
--- mag-env / graph-status / terminate-graph / write-review) and relays
+-- mag-eval / graph-status / terminate-graph / write-review) and relays
 -- kernel-run completions back into agentic-loop's deferred queue.
 -- Mirrors starter/init.lua: registered BEFORE tool-gate's spawn so its
 -- bus subscription is live when tool-gate.hello arrives — otherwise

@@ -37,6 +37,15 @@ const GATE: &str = "tool-gate";
 const SESSION_ID: &str = "lead-turn-session";
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The turn spawner appends a `## MAG workspace` block to the system
+/// overlay (starter/agentic-loop): the session workspace dir plus the
+/// inlined patterns/types doc. Here we build a representative overlay the
+/// same way and assert it reaches the provider intact on chat.create.
+const LEAD_SYSTEM: &str = "you are the lead\n\n\
+## MAG workspace\n\n\
+workspace dir: /tmp/nefor/sessions/lead-turn-session/mag\n\n\
+### lib/patterns.md\n# MAG patterns — the shapes to reach for\n";
+
 fn binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_mag-plugin"))
 }
@@ -215,7 +224,7 @@ fn execute_body(
         "modification": modification,
         "params_overlay": {
             "lead.llm": {
-                "system": "you are the lead",
+                "system": LEAD_SYSTEM,
                 "provider": PROVIDER,
                 "model": "test-model",
                 "reasoning_effort": "high",
@@ -291,10 +300,21 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         chat_id.starts_with(&format!("{scope}/lead.llm@")),
         "chat handle {chat_id:?} carries the run scope {scope:?} + the llm actor id"
     );
-    assert_eq!(
-        create.get("system").and_then(Value::as_str),
-        Some("you are the lead"),
-        "the spawner's system overlay reaches the provider"
+    let system = create
+        .get("system")
+        .and_then(Value::as_str)
+        .expect("chat.create carries the spawner's system overlay");
+    assert!(
+        system.contains("## MAG workspace"),
+        "the ambient MAG workspace block reaches the provider; got {system:?}"
+    );
+    assert!(
+        system.contains("workspace dir: /tmp/nefor/sessions/lead-turn-session/mag"),
+        "the block carries the session workspace dir; got {system:?}"
+    );
+    assert!(
+        system.contains("MAG patterns"),
+        "the block inlines the patterns doc; got {system:?}"
     );
     assert_eq!(
         create.get("model").and_then(Value::as_str),
@@ -305,15 +325,16 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         .and_then(Value::as_array)
         .expect("chat.create advertises the program-authored tool surface");
     let tool_names: Vec<&str> = tools.iter().filter_map(Value::as_str).collect();
-    for expected in ["read_file", "write-review", "mag", "mag-eval", "mag-env"] {
+    for expected in ["read_file", "write-review", "mag", "mag-eval"] {
         assert!(
             tool_names.contains(&expected),
             "lead tool surface carries {expected}; got {tool_names:?}"
         );
     }
     // World queries ride mag-eval expressions; the plain query tools are
-    // deliberately off the lead's surface.
-    for absent in ["list_dir", "search_text", "bash"] {
+    // deliberately off the lead's surface. mag-env is gone entirely — the
+    // workspace context is ambient in the system prompt now.
+    for absent in ["list_dir", "search_text", "bash", "mag-env"] {
         assert!(
             !tool_names.contains(&absent),
             "lead tool surface must not carry {absent}; got {tool_names:?}"
