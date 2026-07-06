@@ -104,8 +104,22 @@ fn edge_route_type(from: &NodeValue, to: &NodeValue) -> Option<MagType> {
         .cloned()
 }
 
-fn initial_activation_content() -> serde_json::Value {
-    serde_json::json!({ "kind": "task", "prompt": "<initial task text>" })
+/// The initial activation a source (no-inbound) node is seeded with. A node
+/// whose input contract carries the `mag.Unit` variant (the `bash` capability
+/// node) fires dependency-style — the seed is an informationless Unit, "run
+/// now, no stdin". Everything else keeps the task seed (the agent entry
+/// adapter's initial activation).
+fn initial_activation_content(node: &NodeValue) -> serde_json::Value {
+    let unit_fired = node
+        .input_type
+        .variants()
+        .into_iter()
+        .any(|v| qualify_type(v) == "mag.Unit");
+    if unit_fired {
+        serde_json::json!({ "kind": "mag.Unit" })
+    } else {
+        serde_json::json!({ "kind": "task", "prompt": "<initial task text>" })
+    }
 }
 
 /// Lower a validated authoring graph into a graph modification. Edges invert
@@ -178,7 +192,7 @@ pub fn lower(graph: GraphValue) -> Result<ModificationIr, MagError> {
         .filter(|n| !inbound.contains(n.id.as_str()))
         .map(|n| MessageIr {
             to: rename(&n.id),
-            content: initial_activation_content(),
+            content: initial_activation_content(n),
         })
         .collect();
 

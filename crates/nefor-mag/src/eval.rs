@@ -204,6 +204,15 @@ fn eval_list(env: &mut Env, items: &[Expr]) -> Result<Value, MagError> {
         }
     }
 
+    // Infix pipe chain: `(a -> b -> ...)` — node/subgraph expressions composed
+    // with `->` outside a (graph ...) form. Head-position `->` (the threading
+    // macro) was already handled above, and type annotations never reach
+    // eval_list (node/agent consume them from raw exprs), so a second-position
+    // arrow is unambiguously a chain.
+    if items.len() >= 3 && matches!(&items[1], Expr::Symbol(s) if s == "->") {
+        return eval_chain(env, items);
+    }
+
     // Function application
     let func = eval_expr(env, &items[0])?;
     match func {
@@ -561,6 +570,7 @@ fn eval_builtin(env: &mut Env, name: &str, args: &[Expr]) -> Result<Value, MagEr
             }
         }
         "node" => eval_node(env, args),
+        "bash" => eval_bash(env, args),
         "graph" => eval_graph(env, args),
         "subgraph" => eval_subgraph(env, args),
         "agent" => eval_agent(env, args),
@@ -894,12 +904,115 @@ fn parse_type_expr(expr: &Expr) -> Result<MagType, MagError> {
     }
 }
 
+/// `(bash "command")` — the shell capability node. Sugar for a `bash`-factory
+/// node with an auto-generated id (`bash-1`, `bash-2`, … in appearance order,
+/// deterministic per compilation — Env::next_node_seq):
+///
+///   input   (mag.Unit | mag.Text)  union — a dependency firing runs the
+///           command with no stdin; an upstream text output is delivered as
+///           the command's stdin (pipe semantics: `->` is the pipe)
+///   output  mag.Text               the command's stdout
+///
+/// The command string is evaluated, so `(bash (str "rg " pat))` composes.
+fn eval_bash(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
+    if args.len() != 1 {
+        return Err(MagError::Eval(
+            "bash requires exactly one argument: (bash \"command\")".into(),
+        ));
+    }
+    let command = match eval_expr(env, &args[0])? {
+        Value::Str(s) if !s.is_empty() => s,
+        Value::Str(_) => return Err(MagError::Eval("bash command must be non-empty".into())),
+        other => {
+            return Err(MagError::Eval(format!(
+                "bash command must be a string, got {}",
+                other.type_name()
+            )))
+        }
+    };
+    let n = env.next_node_seq("bash");
+    Ok(Value::Node(NodeValue {
+        id: format!("bash-{n}"),
+        node_type: "bash".into(),
+        args: BTreeMap::from([("command".into(), Value::Str(command))]),
+        // Fully-qualified names so authored annotations (`: mag.Text -> …`)
+        // type-check against bash ports by simple name equality.
+        input_type: MagType::union(vec![MagType::named("mag.Unit"), MagType::named("mag.Text")]),
+        output_type: MagType::named("mag.Text"),
+    }))
+}
+
+/// An infix pipe chain outside a `(graph …)` form: `(a -> b -> c)`. Each
+/// element must evaluate to a node or subgraph; consecutive fragments wire
+/// output-port → input-port exactly as `graph` does. The chain itself is a
+/// subgraph — input port = first fragment's input, output ports = last
+/// fragment's outputs — so it composes inside larger graph forms, and a
+/// bare top-level chain compiles as a program via the implicit-terminal
+/// default (crate::graph::extract_graph).
+fn eval_chain(env: &mut Env, items: &[Expr]) -> Result<Value, MagError> {
+    let mut nodes: Vec<NodeValue> = Vec::new();
+    let mut edges: Vec<EdgeValue> = Vec::new();
+    let mut index: std::collections::HashMap<String, NodeValue> = std::collections::HashMap::new();
+    let mut input: Option<Port> = None;
+    let mut last_outputs: Vec<Port> = Vec::new();
+
+    let mut expect_fragment = true;
+    for item in items {
+        if expect_fragment {
+            if matches!(item, Expr::Symbol(s) if s == "->") {
+                return Err(MagError::Eval(
+                    "chain expects a node or subgraph between '->' arrows".into(),
+                ));
+            }
+            let val = eval_expr(env, item)?;
+            let frag = fragment_of(&val)?;
+            splice_fragment(&frag.nodes, &frag.edges, &mut nodes, &mut index, &mut edges)?;
+            for out in &last_outputs {
+                if !edges
+                    .iter()
+                    .any(|e| e.from == out.actor && e.to == frag.input.actor)
+                {
+                    edges.push(EdgeValue {
+                        from: out.actor.clone(),
+                        to: frag.input.actor.clone(),
+                    });
+                }
+            }
+            if input.is_none() {
+                input = Some(frag.input.clone());
+            }
+            last_outputs = frag.outputs;
+            expect_fragment = false;
+        } else {
+            if !matches!(item, Expr::Symbol(s) if s == "->") {
+                return Err(MagError::Eval(
+                    "chain expects '->' between node expressions".into(),
+                ));
+            }
+            expect_fragment = true;
+        }
+    }
+    if expect_fragment {
+        return Err(MagError::Eval("chain ends with a dangling '->'".into()));
+    }
+
+    let input = input.ok_or_else(|| MagError::Eval("empty chain".into()))?;
+    Ok(Value::Subgraph(SubgraphValue {
+        nodes,
+        edges,
+        input,
+        outputs: last_outputs,
+    }))
+}
+
 /// A composition fragment: either a plain node or a spliced subgraph. Both
-/// expose one input handle and one-or-more output handles the enclosing graph
-/// wires edges against, plus the internal actors/edges to splice in.
+/// expose one typed input port and one-or-more typed output ports the
+/// enclosing graph wires edges against, plus the internal actors/edges to
+/// splice in. Ports carry their boundary types so an implicit terminal can
+/// derive the sink's input contract from the last fragment's outputs.
 struct Fragment {
-    input: String,
-    outputs: Vec<String>,
+    input: Port,
+    outputs: Vec<Port>,
     nodes: Vec<NodeValue>,
     edges: Vec<EdgeValue>,
 }
@@ -907,14 +1020,20 @@ struct Fragment {
 fn fragment_of(val: &Value) -> Result<Fragment, MagError> {
     match val {
         Value::Node(n) => Ok(Fragment {
-            input: n.id.clone(),
-            outputs: vec![n.id.clone()],
+            input: Port {
+                actor: n.id.clone(),
+                ty: n.input_type.clone(),
+            },
+            outputs: vec![Port {
+                actor: n.id.clone(),
+                ty: n.output_type.clone(),
+            }],
             nodes: vec![n.clone()],
             edges: vec![],
         }),
         Value::Subgraph(s) => Ok(Fragment {
-            input: s.input.actor.clone(),
-            outputs: s.outputs.iter().map(|p| p.actor.clone()).collect(),
+            input: s.input.clone(),
+            outputs: s.outputs.clone(),
             nodes: s.nodes.clone(),
             edges: s.edges.clone(),
         }),
@@ -985,6 +1104,10 @@ fn eval_graph(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
     let mut edges: Vec<EdgeValue> = Vec::new();
     let mut index: std::collections::HashMap<String, NodeValue> = std::collections::HashMap::new();
     let mut terminal: Option<String> = None;
+    // The last fragment in appearance order — the implicit-terminal default
+    // (a graph without :terminal ends at the last node of the chain; the
+    // canonical sink is appended after it — see crate::graph::resolve_terminal).
+    let mut last_outputs: Vec<Port> = Vec::new();
 
     let mut i = 0;
     while i < vals.len() {
@@ -1032,13 +1155,17 @@ fn eval_graph(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
                     splice_fragment(&from.nodes, &from.edges, &mut nodes, &mut index, &mut edges)?;
                     splice_fragment(&to.nodes, &to.edges, &mut nodes, &mut index, &mut edges)?;
                     for out in &from.outputs {
-                        if !edges.iter().any(|e| e.from == *out && e.to == to.input) {
+                        if !edges
+                            .iter()
+                            .any(|e| e.from == out.actor && e.to == to.input.actor)
+                        {
                             edges.push(EdgeValue {
-                                from: out.clone(),
-                                to: to.input.clone(),
+                                from: out.actor.clone(),
+                                to: to.input.actor.clone(),
                             });
                         }
                     }
+                    last_outputs = to.outputs;
                     i += 3;
                     continue;
                 }
@@ -1049,6 +1176,7 @@ fn eval_graph(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
         if matches!(&vals[i], Value::Node(_) | Value::Subgraph(_)) {
             let frag = fragment_of(&vals[i])?;
             splice_fragment(&frag.nodes, &frag.edges, &mut nodes, &mut index, &mut edges)?;
+            last_outputs = frag.outputs;
             i += 1;
             continue;
         }
@@ -1059,25 +1187,7 @@ fn eval_graph(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
 
     let terminal = match terminal {
         Some(t) => t,
-        None => {
-            // Auto-detect: sink node is terminal by definition.
-            let sinks: Vec<&str> = nodes
-                .iter()
-                .filter(|n| n.node_type == "sink")
-                .map(|n| n.id.as_str())
-                .collect();
-            match sinks.len() {
-                0 => return Err(MagError::Eval(
-                    "graph has no sink node — every graph must end with exactly one (node \"sink\" ...) that collects the final output".into(),
-                )),
-                1 => sinks[0].to_string(),
-                _ => return Err(MagError::Eval(format!(
-                    "graph has {} sink nodes ({}); exactly one is required",
-                    sinks.len(),
-                    sinks.join(", ")
-                ))),
-            }
-        }
+        None => crate::graph::resolve_terminal(&mut nodes, &mut edges, &last_outputs)?,
     };
 
     Ok(Value::Graph(GraphValue {
@@ -1186,10 +1296,13 @@ fn eval_subgraph(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
                     splice_fragment(&from.nodes, &from.edges, &mut nodes, &mut index, &mut edges)?;
                     splice_fragment(&to.nodes, &to.edges, &mut nodes, &mut index, &mut edges)?;
                     for out in &from.outputs {
-                        if !edges.iter().any(|e| e.from == *out && e.to == to.input) {
+                        if !edges
+                            .iter()
+                            .any(|e| e.from == out.actor && e.to == to.input.actor)
+                        {
                             edges.push(EdgeValue {
-                                from: out.clone(),
-                                to: to.input.clone(),
+                                from: out.actor.clone(),
+                                to: to.input.actor.clone(),
                             });
                         }
                     }

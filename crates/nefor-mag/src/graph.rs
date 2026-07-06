@@ -1,10 +1,124 @@
-use crate::ast::{GraphValue, NodeValue, Value};
+use crate::ast::{EdgeValue, GraphValue, NodeValue, Port, Value};
 use crate::error::MagError;
+use crate::types::MagType;
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// Canonical id of the implicitly-appended program sink (mirrors ir.rs, where
+/// the terminal node is always emitted under this id).
+const SINK_ID: &str = "sink";
+
+/// Resolve a graph's terminal when no `:terminal` was authored. Precedence:
+///
+/// 1. exactly one `sink`-factory node → that node (the pre-existing
+///    auto-detect; several sink nodes stay an error);
+/// 2. otherwise the graph implicitly terminates at its LAST node: the
+///    canonical sink is appended after the last fragment's output ports,
+///    its input contract derived from their types, and becomes the terminal.
+///
+/// `last_outputs` are the output ports of the last fragment in appearance
+/// order (empty for a graph with no nodes — an error either way).
+pub(crate) fn resolve_terminal(
+    nodes: &mut Vec<NodeValue>,
+    edges: &mut Vec<EdgeValue>,
+    last_outputs: &[Port],
+) -> Result<String, MagError> {
+    let sinks: Vec<&str> = nodes
+        .iter()
+        .filter(|n| n.node_type == "sink")
+        .map(|n| n.id.as_str())
+        .collect();
+    match sinks.len() {
+        0 => append_implicit_sink(nodes, edges, last_outputs),
+        1 => Ok(sinks[0].to_string()),
+        _ => Err(MagError::Eval(format!(
+            "graph has {} sink nodes ({}); exactly one is required",
+            sinks.len(),
+            sinks.join(", ")
+        ))),
+    }
+}
+
+/// Append the canonical implicit sink after the given output ports: a
+/// `sink`-factory node whose input contract is the union of the port types,
+/// wired from every port actor. Returns the terminal id.
+pub(crate) fn append_implicit_sink(
+    nodes: &mut Vec<NodeValue>,
+    edges: &mut Vec<EdgeValue>,
+    outputs: &[Port],
+) -> Result<String, MagError> {
+    if outputs.is_empty() {
+        return Err(MagError::Eval(
+            "graph has no nodes to derive a terminal from — a program needs at least one node"
+                .into(),
+        ));
+    }
+    if nodes.iter().any(|n| n.id == SINK_ID) {
+        return Err(MagError::Graph(format!(
+            "actor id '{SINK_ID}' is taken by a non-sink node; \
+             name the terminal explicitly with :terminal"
+        )));
+    }
+    let ty = if outputs.len() == 1 {
+        outputs[0].ty.clone()
+    } else {
+        MagType::union(outputs.iter().map(|p| p.ty.clone()).collect())
+    };
+    nodes.push(NodeValue {
+        id: SINK_ID.into(),
+        node_type: "sink".into(),
+        args: std::collections::BTreeMap::new(),
+        input_type: ty.clone(),
+        output_type: ty,
+    });
+    for port in outputs {
+        if !edges
+            .iter()
+            .any(|e| e.from == port.actor && e.to == SINK_ID)
+        {
+            edges.push(EdgeValue {
+                from: port.actor.clone(),
+                to: SINK_ID.into(),
+            });
+        }
+    }
+    Ok(SINK_ID.into())
+}
+
+/// Extract the program graph from a program's final value.
+///
+/// - a `graph` value passes through (its terminal was resolved at eval);
+/// - a bare node is a one-node program — the node is entry and terminal
+///   (a non-sink node gets the canonical sink appended to carry the run
+///   result);
+/// - a subgraph (an inline `(a -> b)` chain, or a template instance) is a
+///   program ending at its output ports — terminal resolved the same way.
 pub fn extract_graph(value: Value) -> Result<GraphValue, MagError> {
     match value {
         Value::Graph(g) => Ok(g),
+        Value::Node(n) => {
+            let outputs = vec![Port {
+                actor: n.id.clone(),
+                ty: n.output_type.clone(),
+            }];
+            let mut nodes = vec![n];
+            let mut edges = Vec::new();
+            let terminal = resolve_terminal(&mut nodes, &mut edges, &outputs)?;
+            Ok(GraphValue {
+                nodes,
+                edges,
+                terminal,
+            })
+        }
+        Value::Subgraph(s) => {
+            let mut nodes = s.nodes;
+            let mut edges = s.edges;
+            let terminal = resolve_terminal(&mut nodes, &mut edges, &s.outputs)?;
+            Ok(GraphValue {
+                nodes,
+                edges,
+                terminal,
+            })
+        }
         other => Err(MagError::Graph(format!(
             "expected graph value, got {}",
             other.type_name()

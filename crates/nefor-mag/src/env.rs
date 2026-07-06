@@ -8,6 +8,11 @@ pub struct Env {
     scopes: Vec<HashMap<String, Value>>,
     source_dir: PathBuf,
     loading_modules: HashSet<PathBuf>,
+    /// Per-factory counters for auto-generated inline node ids (`bash-1`,
+    /// `bash-2`, …). Env-scoped so ids are deterministic per compilation —
+    /// two loads of the same source mint identical ids — unlike the global
+    /// `node_N` counter, which only guarantees uniqueness.
+    node_seq: HashMap<String, usize>,
 }
 
 impl Default for Env {
@@ -22,6 +27,7 @@ impl Env {
             scopes: vec![HashMap::new()],
             source_dir: PathBuf::from("."),
             loading_modules: HashSet::new(),
+            node_seq: HashMap::new(),
         }
     }
 
@@ -40,6 +46,7 @@ impl Env {
         self.define("not", Value::BuiltinFn("not".into()));
         self.define("=", Value::BuiltinFn("=".into()));
         self.define("node", Value::BuiltinFn("node".into()));
+        self.define("bash", Value::BuiltinFn("bash".into()));
         self.define("graph", Value::BuiltinFn("graph".into()));
         self.define("subgraph", Value::BuiltinFn("subgraph".into()));
         self.define("agent", Value::BuiltinFn("agent".into()));
@@ -59,6 +66,7 @@ impl Env {
             scopes: vec![HashMap::new()],
             source_dir: source_dir.to_path_buf(),
             loading_modules: HashSet::new(),
+            node_seq: HashMap::new(),
         };
         env.define_stdlib();
         env
@@ -120,7 +128,8 @@ impl Env {
     pub fn top_scope_user_defs(&self) -> HashMap<String, Value> {
         let builtins = [
             "str", "map", "flat-map", "filter", "fold", "concat", "get", "assoc", "keys", "count",
-            "or", "not", "=", "node", "graph", "subgraph", "agent", "type", "read", "require",
+            "or", "not", "=", "node", "bash", "graph", "subgraph", "agent", "type", "read",
+            "require",
         ];
         self.scopes
             .last()
@@ -134,11 +143,20 @@ impl Env {
             .unwrap_or_default()
     }
 
+    /// Next per-factory sequence number for auto-generated inline node ids
+    /// (`<factory>-<n>` in appearance order).
+    pub fn next_node_seq(&mut self, factory: &str) -> usize {
+        let n = self.node_seq.entry(factory.to_string()).or_insert(0);
+        *n += 1;
+        *n
+    }
+
     pub fn create_module_env(&self) -> Self {
         let mut env = Self {
             scopes: vec![HashMap::new()],
             source_dir: self.source_dir.clone(),
             loading_modules: self.loading_modules.clone(),
+            node_seq: HashMap::new(),
         };
         env.define_stdlib();
         env
