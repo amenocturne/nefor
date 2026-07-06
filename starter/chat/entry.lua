@@ -46,13 +46,14 @@ function M.tool_call(id, name, input, input_table)
   }
 end
 
-function M.graph_result(run_id, status, nodes, output, err, duration_ms)
+function M.graph_result(run_id, status, nodes, output, err, duration_ms, run_name)
   local v = next_v()
   log.log("entry", "create kind=graph_result run_id=%s v=%d", run_id or "?", v)
   return {
     role = "graph", kind = "graph_result",
     run_id = run_id, status = status, nodes = nodes,
     output = output, error = err, duration_ms = duration_ms,
+    run_name = run_name,
     v = v,
   }
 end

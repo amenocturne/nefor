@@ -228,11 +228,10 @@ M.build_groups = build_groups
 
 -- Group row. The elapsed window is the WHOLE-RUN clock (first member start →
 -- now while live, frozen at the last finish once terminal) — deliberately
--- unlike member rows, which tick per activation. `folded` grows a cheap
--- activity hint on a collapsed row: the working member's short name trails
--- the timer (`● lead (4) 57s →llm`), so the loop's cycling stays visible
--- without expanding. Kept to one member (the first working) — 36 cols.
-local function group_row_parts(group, now_ms, folded)
+-- unlike member rows, which tick per activation. The collapsed row carries
+-- identity + status + count + timer only; which member is currently working
+-- is what unfolding the group is for.
+local function group_row_parts(group, now_ms)
   local glyph = GLYPHS[group.status] or "·"
   local style = NODE_STYLE[group.status] or STYLE.status_dim
   local elapsed
@@ -244,16 +243,7 @@ local function group_row_parts(group, now_ms, folded)
   local elapsed_str = elapsed and (" " .. fmt_elapsed_ms(elapsed)) or ""
   local n = #group.members
   local count_str = n > 1 and (" (" .. n .. ")") or ""
-  local busy_str = ""
-  if folded then
-    for _, m in ipairs(group.members) do
-      if m.node.status == "working" and m.id ~= group.name then
-        busy_str = " →" .. m.id:sub(#group.name + 2)
-        break
-      end
-    end
-  end
-  local text = glyph .. " " .. group.name .. count_str .. elapsed_str .. busy_str
+  local text = glyph .. " " .. group.name .. count_str .. elapsed_str
   return text, style
 end
 
@@ -350,7 +340,7 @@ function M.row_model(state, now_ms)
       for _, g in ipairs(groups) do
         local unfolded = run_folds[g.name] == true
         rows[#rows + 1] = {
-          kind = "group", run_id = run_id, group = g, folded = not unfolded,
+          kind = "group", run_id = run_id, group = g,
         }
         if unfolded then
           for _, m in ipairs(g.members) do
@@ -400,7 +390,7 @@ local function panel_children(state, now_ms)
         wrap    = "none",
       }
     elseif row.kind == "group" then
-      local text, style = group_row_parts(row.group, now_ms, row.folded)
+      local text, style = group_row_parts(row.group, now_ms)
       children[#children + 1] = tui.text {
         content = text,
         style   = on_cursor and CURSOR_ROW_STYLE or style,
@@ -442,7 +432,7 @@ function M.panel(state)
   -- panel_children).
   local focused = state.focus == "sidebar"
   local title_style = focused and STYLE.popup_user or STYLE.footer
-  local title_text  = focused and "▌ Graph · focused" or "Graph"
+  local title_text  = focused and "▌ Workflows · focused" or "Workflows"
   local children = {
     tui.text { content = title_text, style = title_style, wrap = "none" },
     tui.text { content = string.rep("─", 30), style = title_style, wrap = "none" },

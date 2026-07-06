@@ -149,7 +149,7 @@ local function tool_expanded(entry)
     rows[#rows + 1] = tui.text {
       content = pad_block(indented),
       style = { fg = C.md_code_fg, bg = C.md_code_block_bg },
-      wrap = "none",
+      wrap = "word",
     }
   end
   if entry.output == nil and not entry.error then
@@ -173,7 +173,7 @@ local function tool_expanded(entry)
       rows[#rows + 1] = tui.text {
         content = pad_block(indented_out),
         style = { fg = C.md_code_fg, bg = C.md_code_block_bg },
-        wrap = "none",
+        wrap = "word",
       }
     end
   end
@@ -201,21 +201,39 @@ local function graph_result_nodes_block(nodes)
   return "  " .. table.concat(lines, "\n  ")
 end
 
+-- Human-readable identity for the run: the readable run_name the kernel
+-- stamped on mag.run_started, falling back to the raw run_id only when a
+-- name never arrived.
+local function graph_result_ident(entry)
+  local name = entry.run_name
+  if type(name) == "string" and #name > 0 then return name end
+  return tostring(entry.run_id or "?")
+end
+
+-- Collapsed header: `◆ mag workflow · <run_name> · <duration>`. Machine
+-- detail (exact run_id, node count, status/output) lives in the unfolded
+-- state — this line is the at-a-glance summary only. A failed run appends
+-- a FAILED tail so a failure is unmistakable in the collapsed view.
 local function graph_result_header(entry, glyph)
   local failed = (entry.status == "failed")
   local style = failed and STYLE.graph_result_error or STYLE.graph_result_name
+  local parts = { glyph .. "mag workflow", graph_result_ident(entry) }
+  local dur = humanize_duration_ms(entry.duration_ms)
+  if dur then parts[#parts + 1] = dur end
+  if failed then parts[#parts + 1] = "FAILED" end
+  return tui.text { content = table.concat(parts, " · "), style = style, wrap = "none" }
+end
+
+-- The machine detail moved out of the collapsed header: exact run_id and
+-- node count. Rendered as a small code block at the top of the unfolded
+-- body, above the per-node list.
+local function graph_result_meta_block(entry)
   local run_id = tostring(entry.run_id or "?")
   local node_count = (type(entry.nodes) == "table") and #entry.nodes or 0
-  local header
-  if failed then
-    header = glyph .. "graph(run_id=" .. run_id .. ") FAILED"
-  else
-    local nlabel
-    if node_count == 1 then nlabel = "1 node"
-    else nlabel = tostring(node_count) .. " nodes" end
-    header = glyph .. "graph(run_id=" .. run_id .. ", " .. nlabel .. ")"
-  end
-  return tui.text { content = header, style = style, wrap = "none" }
+  local nlabel
+  if node_count == 1 then nlabel = "1 node"
+  else nlabel = tostring(node_count) .. " nodes" end
+  return "  run_id: " .. run_id .. "\n  nodes:  " .. nlabel
 end
 
 local function graph_result_collapsed(entry)
@@ -224,12 +242,17 @@ end
 
 local function graph_result_expanded(entry)
   local rows = { graph_result_header(entry, "◇ ") }
+  rows[#rows + 1] = tui.text {
+    content = pad_block(graph_result_meta_block(entry)),
+    style   = { fg = C.md_code_fg, bg = C.md_code_block_bg },
+    wrap    = "word",
+  }
   local nodes_block = graph_result_nodes_block(entry.nodes)
   if nodes_block then
     rows[#rows + 1] = tui.text {
       content = pad_block(nodes_block),
       style   = { fg = C.md_code_fg, bg = C.md_code_block_bg },
-      wrap    = "none",
+      wrap    = "word",
     }
   end
   local failed = (entry.status == "failed")
@@ -241,7 +264,7 @@ local function graph_result_expanded(entry)
       rows[#rows + 1] = tui.text {
         content = pad_block(indented),
         style   = { fg = C.md_code_fg, bg = C.md_code_block_bg },
-        wrap    = "none",
+        wrap    = "word",
       }
     end
   else
@@ -252,7 +275,7 @@ local function graph_result_expanded(entry)
       rows[#rows + 1] = tui.text {
         content = pad_block(indented),
         style   = { fg = C.md_code_fg, bg = C.md_code_block_bg },
-        wrap    = "none",
+        wrap    = "word",
       }
     end
   end

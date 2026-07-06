@@ -109,8 +109,15 @@ local function build_segments(state)
   -- scrollable has been laid out — pre-first-render the call would
   -- raise `no scrollable with key 'transcript'`. We treat any failure
   -- as "no segment yet" rather than letting the statusline blow up.
+  -- Gate on the reducer's own entry count, not just the scroll snapshot:
+  -- the snapshot map is refreshed one frame behind the view, so right
+  -- after a reset (/new, /mode default, resume) it still reports the old
+  -- session's extent while `state.entries` is already empty. Deriving
+  -- "is there anything to scroll" from live state kills the phantom
+  -- `100% ↓ bottom` segment on an emptied transcript.
+  local has_entries = type(state.entries) == "table" and #state.entries > 0
   local ok, snap = pcall(tui.scroll_position, "transcript")
-  if ok and snap and snap.max and snap.max > 0 then
+  if has_entries and ok and snap and snap.max and snap.max > 0 then
     local offset = snap.offset or 0
     local max = snap.max
     if offset >= max then

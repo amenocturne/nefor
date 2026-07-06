@@ -6987,56 +6987,6 @@ fn member_rows_tick_per_activation_and_idle_rows_do_not() {
     );
 }
 
-#[test]
-fn collapsed_group_row_hints_the_busy_member() {
-    let mut engine = engine_with_cycling_group();
-
-    // Collapsed (the default, prompt focused): the busy member's short
-    // name trails the group row.
-    let out = render_str(&mut engine);
-    assert!(
-        out.contains("→llm"),
-        "a collapsed group with a busy member must hint it: {out:?}"
-    );
-    assert!(
-        !out.contains("lead.llm"),
-        "the hint must not expand the group: {out:?}"
-    );
-
-    // The activation settles: the hint leaves with the busy state.
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "mag.actor_idle", "run_id": "loop-1", "id": "lead.llm", "busy_ms": 100 }),
-    );
-    let _ = render_str(&mut engine);
-    let snap = engine.snapshot();
-    assert!(
-        !snap.contains("→llm"),
-        "an all-idle collapsed group carries no hint:\n{snap}"
-    );
-
-    // Unfolded, the member row itself carries the signal — no hint on the
-    // group row even while busy.
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "mag.actor_busy", "run_id": "loop-1", "id": "lead.llm" }),
-    );
-    engine.handle_key(key("tab")).expect("tab");
-    let _ = render_str(&mut engine);
-    engine.handle_key(key("down")).expect("down");
-    engine.handle_key(key("enter")).expect("enter");
-    let _ = render_str(&mut engine);
-    let snap = engine.snapshot();
-    assert!(
-        snap.contains("lead.llm  working"),
-        "the unfolded member row carries the busy signal:\n{snap}"
-    );
-    assert!(
-        !snap.contains("→llm"),
-        "an unfolded group row drops the hint:\n{snap}"
-    );
-}
-
 /// Space on a group row opens the COMPOSITE view: the merged member
 /// timeline, an llm message and a tool invoke+result attributed to the
 /// distinct members that produced them, in chronological (capture) order.
@@ -7299,7 +7249,7 @@ fn focused_sidebar_highlights_title_and_prompt_states_the_way_back() {
     engine.handle_key(key("tab")).expect("tab");
     let out = render_str(&mut engine);
     assert!(
-        out.contains("Graph · focused"),
+        out.contains("Workflows · focused"),
         "a focused sidebar must carry the highlighted title treatment: {out:?}"
     );
     assert!(
@@ -7311,5 +7261,275 @@ fn focused_sidebar_highlights_title_and_prompt_states_the_way_back() {
     assert!(
         cursor.contains("MAG demo"),
         "the cursor row remains the in-pane focus indicator: {cursor:?}"
+    );
+}
+
+// ── Run-result (mag workflow) rendering ──────────────────────────────────
+
+/// The collapsed run-result entry reads as a `mag workflow` line carrying
+/// the human-readable run name and wall-clock duration — nothing else.
+/// The machine detail (exact run_id, node count) only appears once the
+/// entry is unfolded (Ctrl+O), matching the reasoning/tool fold vocabulary.
+#[test]
+fn graph_result_collapsed_shows_workflow_name_and_duration_only() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.graph_result.append",
+            "run_id": "mag-nefor_bughunt-2026-07-06T14:14:16.709Z",
+            "run_name": "nefor_bughunt",
+            "status": "success",
+            "nodes": [
+                { "id": "worker", "role": "llm" },
+                { "id": "out", "role": "sink" }
+            ],
+            "duration_ms": 34000,
+            "output": "output_path: /tmp/out.md",
+        }),
+    );
+
+    let _ = render_str(&mut engine);
+    let out = engine.snapshot();
+    assert!(
+        out.contains("mag workflow") && out.contains("nefor_bughunt") && out.contains("34s"),
+        "collapsed run-result must show `mag workflow · <name> · <duration>`: {out:?}"
+    );
+    assert!(
+        !out.contains("mag-nefor_bughunt-2026") && !out.contains("2 nodes"),
+        "collapsed run-result must NOT show the raw run_id or node count: {out:?}"
+    );
+
+    // Unfold: run_id, node count, and the output path all surface.
+    engine.handle_key(key("ctrl_o")).expect("ctrl_o");
+    let _ = render_str(&mut engine);
+    let out = engine.snapshot();
+    assert!(
+        out.contains("run_id:") && out.contains("mag-nefor_bughunt"),
+        "unfolded run-result must show the exact run_id: {out:?}"
+    );
+    assert!(
+        out.contains("2 nodes"),
+        "unfolded run-result must show the node count: {out:?}"
+    );
+    assert!(
+        out.contains("output_path:"),
+        "unfolded run-result must show the output path: {out:?}"
+    );
+}
+
+/// A failed run keeps the `mag workflow` framing but appends a FAILED tail
+/// so a failure is unmistakable in the collapsed view.
+#[test]
+fn graph_result_failed_collapsed_reads_failed() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.graph_result.append",
+            "run_id": "mag-broken-123",
+            "run_name": "broken_run",
+            "status": "failed",
+            "nodes": [ { "id": "worker", "role": "llm" } ],
+            "duration_ms": 5000,
+            "error": "node worker crashed",
+        }),
+    );
+
+    let _ = render_str(&mut engine);
+    let out = engine.snapshot();
+    assert!(
+        out.contains("mag workflow") && out.contains("broken_run") && out.contains("FAILED"),
+        "failed run-result must read `mag workflow · <name> · … · FAILED`: {out:?}"
+    );
+}
+
+/// A long output path is fully visible — wrapped across transcript rows —
+/// in the unfolded run-result, never single-line-clipped.
+#[test]
+fn graph_result_long_output_path_wraps_fully() {
+    let mut engine = Engine::new(80, 40).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    let path = "/Users/skril/Vault/Projects/personal/nefor/very/deeply/nested/directory/structure/that/keeps/going/output-artifact-final-result.md";
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.graph_result.append",
+            "run_id": "mag-longpath-1",
+            "run_name": "longpath",
+            "status": "success",
+            "nodes": [ { "id": "out", "role": "sink" } ],
+            "duration_ms": 1000,
+            "output": format!("output_path: {path}"),
+        }),
+    );
+    engine.handle_key(key("ctrl_o")).expect("ctrl_o");
+    let _ = render_str(&mut engine);
+
+    // Strip whitespace so a path wrapped across rows re-joins contiguously.
+    // Reconstruct just the transcript (left) column — the sidebar lives to
+    // the right of a `│` separator on every row, so stripping whitespace
+    // across the full frame would interleave sidebar text between the
+    // wrapped content fragments. Cut each row at the sidebar boundary, then
+    // strip whitespace so content wrapped across rows re-joins contiguously.
+    let joined: String = engine
+        .snapshot()
+        .lines()
+        .map(|l| l.split('│').next().unwrap_or(""))
+        .collect::<String>()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(
+        joined.contains(path),
+        "the full output path must be visible (wrapped) in the unfolded run-result"
+    );
+}
+
+/// A long single-line tool RESULT (path/URL/one-line JSON) wraps to the
+/// transcript width in the unfolded tool entry — no truncation.
+#[test]
+fn tool_result_long_single_line_wraps_fully() {
+    let mut engine = Engine::new(80, 40).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    let long = format!("https://example.com/api/v1/resource/{}", "x".repeat(160));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.tool.start", "id": "t1", "name": "Bash", "input": "curl url" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.tool.end", "id": "t1", "output": long.clone() }),
+    );
+    engine.handle_key(key("ctrl_o")).expect("ctrl_o");
+    let _ = render_str(&mut engine);
+
+    // Reconstruct just the transcript (left) column — the sidebar lives to
+    // the right of a `│` separator on every row, so stripping whitespace
+    // across the full frame would interleave sidebar text between the
+    // wrapped content fragments. Cut each row at the sidebar boundary, then
+    // strip whitespace so content wrapped across rows re-joins contiguously.
+    let joined: String = engine
+        .snapshot()
+        .lines()
+        .map(|l| l.split('│').next().unwrap_or(""))
+        .collect::<String>()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(
+        joined.contains(&long),
+        "the full tool result must be visible (wrapped) in the unfolded tool entry"
+    );
+}
+
+/// A long tool INPUT (a mag-eval expression, long path, write payload) is
+/// fully visible — wrapped — in the unfolded tool entry. The collapsed row
+/// keeps its truncated one-line summary; the requirement is that the full
+/// input is visible somewhere in the unfolded entry.
+#[test]
+fn tool_input_long_single_line_wraps_fully() {
+    let mut engine = Engine::new(80, 40).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    let expr = format!("(pipeline{})", "-step".repeat(40));
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.tool.start",
+            "id": "t1",
+            "name": "mag-eval",
+            "input": { "expression": expr.clone() },
+        }),
+    );
+    engine.handle_key(key("ctrl_o")).expect("ctrl_o");
+    let _ = render_str(&mut engine);
+
+    // Reconstruct just the transcript (left) column — the sidebar lives to
+    // the right of a `│` separator on every row, so stripping whitespace
+    // across the full frame would interleave sidebar text between the
+    // wrapped content fragments. Cut each row at the sidebar boundary, then
+    // strip whitespace so content wrapped across rows re-joins contiguously.
+    let joined: String = engine
+        .snapshot()
+        .lines()
+        .map(|l| l.split('│').next().unwrap_or(""))
+        .collect::<String>()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(
+        joined.contains(&expr),
+        "the full tool input must be visible (wrapped) in the unfolded tool entry"
+    );
+}
+
+/// Regression: `/new` (and the other reset-shaped paths) must collapse the
+/// transcript's scroll geometry immediately. Before the fix, clearing
+/// `state.entries` left the statusline reading a one-frame-stale scroll
+/// snapshot, so an emptied transcript kept the previous session's
+/// `100% ↓ bottom` scrollback indicator until the next user action. After
+/// reset the viewport is at the empty state with no stale scroll region.
+#[test]
+fn slash_new_collapses_stale_scroll_region() {
+    let mut engine = Engine::new(60, 12).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // Overflow the viewport so a scrollback indicator is present.
+    for i in 0..25 {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "chat.message.append",
+                "role": "user",
+                "text": format!("message number {i} filling the transcript"),
+            }),
+        );
+    }
+    // The scroll-position snapshot the statusline reads is refreshed one
+    // frame behind the view, so the indicator only appears once the map has
+    // caught up. Render once to populate the map, dispatch one more entry to
+    // dirty the frame, then render again so the statusline reads the
+    // now-overflowing geometry.
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.message.append", "role": "user", "text": "one more line" }),
+    );
+    let _ = render_str(&mut engine);
+    let before = engine.snapshot();
+    assert!(
+        before.contains("↓ bottom") || before.contains("% ↑"),
+        "precondition: an overflowing transcript shows a scroll indicator: {before:?}"
+    );
+
+    // Reset via /new.
+    for ch in "/new".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let _ = render_str(&mut engine);
+    let after = engine.snapshot();
+
+    assert!(
+        !after.contains("↓ bottom") && !after.contains("% ↑") && !after.contains("% ↓"),
+        "after /new the emptied transcript must carry no stale scroll indicator: {after:?}"
+    );
+    // Scroll offset is reset to the top (nothing to scroll on an empty buffer).
+    assert!(
+        !after.contains("100%"),
+        "after /new the transcript must not report a scrolled position: {after:?}"
     );
 }

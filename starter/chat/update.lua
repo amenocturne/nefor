@@ -149,6 +149,25 @@ end
 
 -- ── dispatch handlers ─────────────────────────────────────────────────
 
+-- Collapse the transcript's virtual-scroll bookkeeping back to the empty
+-- state. Clearing `state.entries` alone leaves the scrollable pinned to the
+-- previous session's extent — the geometry cache keeps the old total height,
+-- the height cache keeps per-entry heights, and the scroll offset stays at
+-- the old bottom — so an emptied transcript renders a long blank scrolled
+-- region until new content forces a recompute. Every reset-shaped path
+-- (/new, /clear, /mode default, resume, session-switch) calls this so the
+-- viewport collapses immediately. Keyed "transcript" to match the chat
+-- widget's scrollable key (chat/view.lua).
+local function reset_transcript_scroll()
+  height_cache.invalidate_all()
+  if type(tui.virtual_scroll_invalidate) == "function" then
+    tui.virtual_scroll_invalidate("transcript")
+  end
+  if type(tui.scroll_to) == "function" then
+    tui.scroll_to("transcript", 0)
+  end
+end
+
 local function handle_input_changed(msg, state)
   local result = W.prompt.handle(prompt_widget_opts(state), msg)
   if result and result.state then
@@ -177,6 +196,7 @@ local function handle_input_submit(msg, state)
     return state, { { kind = "exit" } }
   end
   if cmd == "new" or cmd == "clear" then
+    reset_transcript_scroll()
     local cleared = shallow_merge(state, {
       entries = {}, in_flight = NIL_SENTINEL, input_value = "",
       pending = false, completion = NIL_SENTINEL,
@@ -334,6 +354,7 @@ local function handle_input_submit(msg, state)
         started_at_ms = tui.now_ms(),
         ttl_ms = 3000,
       }
+      reset_transcript_scroll()
       local cleared = shallow_merge(state, {
         entries = {}, in_flight = NIL_SENTINEL, input_value = "",
         pending = false, completion = NIL_SENTINEL,
@@ -419,6 +440,7 @@ local function handle_input_submit(msg, state)
   if cmd == "resume" then
     if args and #args > 0 then
       local id = args:match("^([%w%-]+)") or args
+      reset_transcript_scroll()
       return shallow_merge(state, {
         input_value = "", completion = NIL_SENTINEL,
         entries = {}, in_flight = NIL_SENTINEL,
@@ -894,7 +916,8 @@ local function handle_graph_result_append(msg, state)
       msg.nodes or {},
       msg.output,
       msg.error,
-      msg.duration_ms)
+      msg.duration_ms,
+      msg.run_name)
   ), {}
 end
 
@@ -1487,6 +1510,7 @@ local function route_keys_and_popups(msg, state)
     }, msg)
     if result ~= nil then
       if result.selected ~= nil and result.selected.id then
+        reset_transcript_scroll()
         return shallow_merge(state, {
           popup = NIL_SENTINEL,
           entries = {}, in_flight = NIL_SENTINEL,

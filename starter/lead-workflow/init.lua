@@ -709,7 +709,7 @@ end
 -- actor list ({ id, factory, … }); node summaries carry the factory under the
 -- `reasoner` key, matching what the chat surface renders (chat/run_panel.lua
 -- maps kernel factory → reasoner the same way).
-register_active_run = function(run_id, actors, terminal, firing_id)
+register_active_run = function(run_id, actors, terminal, firing_id, run_name)
   local nodes_order, nodes = {}, {}
   for _, actor in ipairs(actors or {}) do
     local id = tostring(actor.id or "")
@@ -726,6 +726,7 @@ register_active_run = function(run_id, actors, terminal, firing_id)
   local ts = now_ms()
   state.active_runs[run_id] = {
     run_id = run_id,
+    run_name = run_name,
     status = "queued",
     dispatched_at = ts,
     updated_at = ts,
@@ -1006,11 +1007,19 @@ end
 -- finalisation is exactly what the block should show.
 local function emit_mag_result_block(run, status, output_path, err)
   local block = {
-    kind   = "chat.graph_result.append",
-    run_id = run.run_id,
-    status = status,
-    nodes  = ordered_node_summaries(run),
+    kind     = "chat.graph_result.append",
+    run_id   = run.run_id,
+    run_name = run.run_name,
+    status   = status,
+    nodes    = ordered_node_summaries(run),
   }
+  -- Wall time from dispatch to terminal result — the cleanest duration
+  -- source: the run object already stamps dispatched_at at
+  -- register_active_run, so no cross-actor lookup into the sidebar's
+  -- run-panel timestamps is needed.
+  if type(run.dispatched_at) == "number" then
+    block.duration_ms = now_ms() - run.dispatched_at
+  end
   if status == "success" then
     if type(output_path) == "string" and #output_path > 0 then
       block.output = "output_path: " .. output_path
@@ -1387,7 +1396,7 @@ local function resume_pending_load(body)
   end
   emit_as(SOURCE_NAME, "mag", exec)
 
-  register_active_run(pending.run_id, actors, sink_id, pending.firing_id)
+  register_active_run(pending.run_id, actors, sink_id, pending.firing_id, pending.run_name)
 
   emit_tool_result_ok(pending.firing_id, {
     status  = "executing",
