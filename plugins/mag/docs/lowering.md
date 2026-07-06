@@ -68,8 +68,7 @@ routes : { "<qualified-output-type>": ["<dest-id>", ...], ... }
 Type tags are produced exactly as `qualify_type` does today (ir.rs:40): dotted
 names pass through (`generic-provider.FinalAnswer`), bare names get a `mag.`
 prefix (`mag.Task`). The kernel dispatches an actor's returned output
-by looking up its runtime type in `routes` — an O(1) type dispatch, the same
-type-driven fanout the `reasoner-graph` plugin already performs, now carried by
+by looking up its runtime type in `routes` — an O(1) type dispatch carried by
 the actor instead of a separate edge record.
 
 Routes are **always arrays**, even for a single destination, so fanout needs no

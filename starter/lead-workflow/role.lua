@@ -3,8 +3,10 @@
 --
 -- Loads `prompts/lead.md` at module-load time and exposes:
 --
---   * LEAD_SYSTEM_PROMPT  — string, the lead orchestrator's prompt.
---   * ORCHESTRATION_TOOLS — list of tool names the lead has access to.
+--   * LEAD_SYSTEM_PROMPT — string, the lead orchestrator's prompt.
+--
+-- The lead's tool surface is NOT here: it is authored inside the
+-- turn-program (`:tools` in agentic-loop/lead-turn.mag).
 --
 -- Prompts are read from disk rather than embedded as Lua string
 -- literals because long strings inside Lua are painful (escaping, no
@@ -84,24 +86,5 @@ local function load_or_placeholder(name)
 end
 
 M.LEAD_SYSTEM_PROMPT = load_or_placeholder("lead")
-
--- Tools the lead orchestrator has access to. The lead gets read tools
--- for quick lookups without spawning a graph node, plus unrestricted
--- existing-file edits when it has enough context to act directly. New
--- file creation, bash, and broad delegated writes still go through MAG
--- agents and the plan gate.
-M.ORCHESTRATION_TOOLS = {
-  "read_file",
-  "read_image",
-  "list_dir",
-  "search_text",
-  "instructions",
-  "edit_file",
-  "graph-status",
-  "terminate-graph",
-  "write-review",
-  "mag",
-  "mag-env",
-}
 
 return M

@@ -310,7 +310,7 @@ fn truncate_does_not_panic_on_multibyte_boundary() {
 const MAG_DISPATCH_PROMPT: &str =
     "summarise octopuses and lighthouses in parallel and combine into one paragraph";
 
-/// Two short non-spawn-graph prompts. The mock has no canned trigger
+/// Two short non-dispatching prompts. The mock has no canned trigger
 /// for either, so each turn falls through to the help-banner path —
 /// fine for REPL multi-turn since we only need two recognisable turns.
 const SIMPLE_PROMPT_1: &str = "hello";
@@ -329,7 +329,7 @@ fn scenario_1_single_shot_text_canonical() {
     // The mock's combine-step canned text contains "octopus", "lighthouse",
     // and "sentinels". Loose substring match on those three keeps the
     // assertion robust against minor mock_provider tweaks while still
-    // catching regressions in the spawn_graph round-trip.
+    // catching regressions in the kernel-dispatch round-trip.
     let lc = out.stdout.to_lowercase();
     for needle in ["octopus", "lighthouse", "sentinel"] {
         assert!(

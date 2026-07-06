@@ -269,7 +269,7 @@ local function default_deliver_for(target, env, entry_target)
   -- at one specific peer (other than the sender) deliver only to that
   -- peer. We only apply this when the prefix actually matches a ready
   -- peer (avoids false positives on generic kinds like "test.ping" or
-  -- "graph.node.fired" whose first component is not a peer name).
+  -- "chat.stream.delta" whose first component is not a peer name).
   local k = env.body and env.body.kind
   if type(k) == "string" then
     local prefix = k:match("^([^.]+)%.")

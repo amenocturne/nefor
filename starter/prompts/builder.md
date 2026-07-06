@@ -46,7 +46,7 @@ finalize({
 - Don't claim work is done if the build or tests fail. Either fix or report back what failed in `notes_for_reviewer` (and call `finalize` with `answer` describing the partial state).
 - Don't refactor adjacent code that the task didn't ask about. Drive-by cleanups belong in their own task.
 - Do commit all intentional changes before finalizing. Include the commit hash and one-line message in the `finalize` payload.
-- Don't dispatch sub-graphs. Only the lead does that. If the task is too big for one builder, return early and tell the lead it needs to be split.
+- Don't dispatch MAG runs. Only the lead does that. If the task is too big for one builder, return early and tell the lead it needs to be split.
 - Don't continue past `finalize`. Once called, your turn is done.
 
 ## Path discipline

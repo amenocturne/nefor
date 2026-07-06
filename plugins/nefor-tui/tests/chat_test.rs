@@ -763,9 +763,9 @@ fn mag_run_lifecycle_renders_in_run_panel() {
     );
 }
 
-// Richer-than-parity: a killed actor renders with its own glyph, distinct
-// from a failed/errored node (reasoner-graph never had this state). Under
-// grouping, killing the group's members marks the group row ⊗.
+// A killed actor renders with its own glyph, distinct from a
+// failed/errored node. Under grouping, killing the group's members marks
+// the group row ⊗.
 #[test]
 fn mag_killed_actor_renders_distinct_glyph() {
     let mut engine = Engine::new(120, 24).expect("engine");
@@ -1089,8 +1089,8 @@ fn lead_prefix_binding_renders_scoped_rounds_and_filters_foreign_scopes() {
         "foreign-scope chats must stay out of the transcript: {out:?}"
     );
 
-    // An exact-form binding supersedes the prefix (the reasoner-graph
-    // provider-wrapper path stays exact-match).
+    // An exact-form binding supersedes the prefix (replayed logs may
+    // carry the exact-match form).
     dispatch_event(
         &mut engine,
         json!({ "kind": "chat.lead.bound", "chat_id": "chat-9" }),

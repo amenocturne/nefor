@@ -1137,8 +1137,8 @@ async fn handle_chat_create(
     //   - false  → tools disabled (empty allowlist filters everything out)
     //   - [names] → allowlist of tool names (provider filters its catalog)
     //   - absent  → no filter (use the whole catalog)
-    // Reasoners/agentic-loop emit string arrays for the LEAD's
-    // ORCHESTRATION_TOOLS. We previously parsed `tools` as tool-spec
+    // Callers emit string arrays (the lead's :tools list from its
+    // turn-program). We previously parsed `tools` as tool-spec
     // objects, which silently produced an empty override and bypassed
     // the catalog — leaving the model with no tools at all.
     let tools_field = body.get("tools");

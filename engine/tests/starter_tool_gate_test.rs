@@ -253,9 +253,8 @@ fn large_output_preview_stays_json_encodable_when_cutting_multibyte_text() {
 fn missing_chat_id_falls_back_to_unscoped_directory() {
     // chat_id is best-effort surface; the lib must not refuse to dump
     // when it's absent. Falling back to `_unscoped/` keeps the dump
-    // path stable for early firings (where the tool-executor's pending
-    // entry doesn't carry chat_id) and for sub-graph runs whose chat
-    // scoping isn't wired through to the wrapper layer yet.
+    // path stable for results whose chat scoping isn't wired through
+    // to the wrapper layer.
     let tempdir = tempfile::tempdir().expect("tempdir");
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let prev = std::env::var("NEFOR_DATA_DIR").ok();

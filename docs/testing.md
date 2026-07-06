@@ -73,9 +73,9 @@ export USE_MOCK_PROVIDER=true
   "summarise octopuses and lighthouses in parallel and combine into one paragraph"
 ```
 
-**Expect:** stdout contains the canonical mock answer (mentions "octopus" + "lighthouse" + "sentinel"-ish framing). Stderr line `[tool: spawn_graph(...)]`. Exit 0.
+**Expect:** stdout contains the canonical mock answer (mentions "octopus" + "lighthouse" + "sentinel"-ish framing). Stderr lines `[tool: mag(...)]` for the write + execute calls. Exit 0.
 
-This is the canonical e2e flow: `chat.input.submit` → reasoner-graph → spawn_graph → sub-graph (parallel summaries) → terminal merge → orchestrator relay turn → final answer.
+This is the canonical e2e flow: `chat.input.submit` → lead turn-program on the mag kernel → `mag` tool (write, then execute) → kernel run (chained summaries → combine → sink) → deferred relay turn → final answer.
 
 ### Output format modes
 
@@ -160,8 +160,8 @@ Things to verify:
 - `/safe`, `/auto`, and `/yolo` toggle policy; see `docs/approval-model.md`
 - `/new` clears transcript and starts a fresh chat
 - Single Esc cancels in-flight turn (chat unblocks for next submit)
-- Double Esc within 600ms → fan-cancel (chat run + every sub-graph + deferred queue) → system message reports counts
-- A sub-graph run (lead `spawn_graph` tool) appears in the sidebar run panel; nodes go running → done
+- Double Esc within 600ms → fan-cancel (lead run + queued inputs) → system message reports counts
+- A dispatched kernel run (lead `mag` tool, action=execute) appears in the sidebar run panel; actor groups go running → done
 
 ## Verifying known concerns
 
@@ -244,7 +244,7 @@ The mock has a scripted-table pattern: prompt-substring match → response shape
 local SCRIPTS = {
   -- Existing canonical
   ["summarise octopuses and lighthouses"] = {
-    -- spawn_graph response
+    -- mag write/execute response
   },
   -- Add yours here
   ["your test prompt key"] = {

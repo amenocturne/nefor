@@ -11,21 +11,20 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 - `plugins/nefor-tui/` — declarative TUI plugin (Rust): reconciler + line-diff renderer + Lua VM + 15 layout primitives. Hosts the chat surface as a Lua composition (`starter/chat/init.lua`).
 - `plugins/generic-provider/`, `plugins/generic-tool/` — passive type-registry hubs owning canonical types (`ProviderIn`, `ProviderOut`, `ChatHistory`, `ToolCalls`, `ToolResults`, …). Concrete providers/tools declare `Into`/`From` against these so graphs are provider-agnostic.
 - `plugins/openai-provider/` — generic OpenAI-compatible provider with chat-id-keyed `Chats` map (`<prefix>.chat.{create, append, complete, delete}`). Configurable base URL + model. Declares `Into` against `generic-provider` types.
-- `plugins/reasoner-graph/` — typed graph scheduler. Cycles allowed. Per-firing lifecycle, `prev_state`/`next_state` carry, fanout-based type-dispatched routing, ack/result lifecycle, broadcast `graph.run_started` / `graph.node.fired` for UI observability.
 - `plugins/tool-gate/` — tool advertisement aggregator + permission gate. Sources advertise via `tools.advertise`; callers invoke via `tool.invoke`; gate forwards as `<source>.tool.invoke` and echoes `tool.result`.
-- `plugins/mag/` — MAG runtime (design stage, docs only): actor kernel executing compiled `.mag` programs as in-memory actor constellations. Slated to replace `reasoner-graph`. See its `docs/`.
+- `plugins/mag/` — MAG runtime: actor kernel executing compiled `.mag` programs as in-memory actor constellations — the only execution path. See its `docs/`.
 - `plugins/basic-tools/` — `read_file` / `write_file` / `bash` built-ins.
 - `plugins/mock-plugin/` — scriptable NCP actor for integration tests. Local Ollama works through `openai-provider` directly with `static_token = "ollama-local"`.
 - `tools/fake-engine/` — harness that impersonates the engine for plugin-side tests.
 - `starter/init.lua` — default composition. Sets `package.path`, defines the global `dispatch` hook (delegates to `core.ncp.dispatch`), spawns plugins via `nefor.plugins.spawn`, wires per-edge `from_plugin`/`to_plugin` transforms.
 - `lua/core/` — shipped library: NCP v0.1 (handshake, broadcast-minus-sender, replay-on-attach, errors), actor runtime, history replay. JSON via the engine-provided `nefor.json`.
-- `starter/agentic-loop/` — orchestrator state machine.
-- `starter/reasoners/` — Lua-resident reasoner type handlers (`responder`, `provider-wrapper`, `tool-executor`, `adapter`, `terminal`, `agent`, `run`, `loop_counter`).
+- `starter/agentic-loop/` — the lead's turn spawner: per user message it clones the shipped turn-program (`agentic-loop/lead-turn.mag`) and submits it to the mag kernel; owns canonical history + queueing.
+- `starter/mag-kernel/` — the kernel loaded by the mag plugin's embedded VM: actor fold, factories, routing, run contexts, observer stream.
 - `starter/sessions/` — sessions actor: boot/shutdown/resume + jsonl persistence over the bus.
 - `starter/chat/` — chat surface composed over `tui.*` primitives (entry `chat/init.lua`; transcript, statusline, input, popups, slash commands as submodules). Entry model is copy-on-write with a global version counter (`entry.lua`); heights cached by `(version, width)` in `height_cache.lua`; debug logging gated on `NEFOR_DEBUG` (`log.lua`, writes to `<data_dir>/debug/nefor-chat.log`). Virtual scroll uses gap=0 outer column with spacers flush against a nested content column to avoid phantom-gap position mismatches.
 - `starter/cli/` — virtual `agentic-cli` plugin: surfaces the loop over stdin/stdout for `nefor plugin agentic-cli "<prompt>"`.
-- `starter/lead-workflow/` — lead role plus the dispatch-graph / write-review / await-approval tool surface.
-- `starter/compositors/` — actor-spec builders per plugin binary (provider, tools, graph, combinators, chat_bridge).
+- `starter/lead-workflow/` — lead role plus the mag / mag-env / write-review / graph-status / terminate-graph tool surface.
+- `starter/compositors/` — actor-spec builders per plugin binary (provider, tools, chat_bridge).
 - `starter/mock-provider/` — script loaded by `mock-plugin` to impersonate an openai-compatible provider with deterministic responses.
 - `starter/config/` — settings table consumed by `starter/init.lua`.
 

@@ -51,8 +51,7 @@ local NAME = nefor.name -- "mock-plugin"
 local chats = {}
 
 -- The MAG program the orchestrator turn writes + executes via the
--- lead's `mag` tool (the kernel-execute contract that replaced the
--- retired spawn_graph tool-gate contract). A chain — sx feeds sy feeds
+-- lead's `mag` tool. A chain — sx feeds sy feeds
 -- combine — rather than a parallel join: the agent template's entry
 -- adapter lifts exactly one boundary message per activation, so an
 -- all-of product join would silently drop one branch; the chain keeps
@@ -96,24 +95,20 @@ local CANNED_TEXT = {
     text = "Lighthouses are tall coastal towers crowned with bright rotating beams that guide ships safely past hazards and into harbours, dating back to the Pharos of Alexandria." },
 }
 
--- After spawn_graph returns its serialised result, the orchestrator's
--- wrap node fires again with a "tool" message carrying that text. We
--- relay it as the assistant's final answer.
+-- Prefix for relayed final answers (tool results / deferred run
+-- results echoed back as the assistant's reply).
 local FINAL_RELAY_PREFIX = ""
 
 -- Async kernel dispatch: the mag execute's immediate `tool.result` is
 -- just an ack ("Program submitted to the MAG actor kernel..."). The
 -- real result arrives later as a USER-role message starting with
--- "[spawn_graph(run_id=... ) result]" — format_deferred keeps that
--- historical marker name for kernel runs too. Pattern-match on that
--- prefix in the latest user message to drive the relay turn.
+-- "[mag_run(run_id=... ) result]". Pattern-match on that prefix in the
+-- latest user message to drive the relay turn.
 --
 -- The marker shape comes from `agentic-loop.results.format_deferred`;
 -- the ack text from lead-workflow's mag execute tool.result.
-local DEFERRED_RESULT_MARKER = "%[spawn_graph%(run_id="
-local DEFERRED_LEGACY_MARKER = "%[Deferred result for spawn_graph"
-local DEFERRED_FAILURE_MARKER = "%[spawn_graph%(run_id=[^)]*%) FAILED%]"
-local DEFERRED_FAILURE_LEGACY = "%[Deferred FAILURE for spawn_graph"
+local DEFERRED_RESULT_MARKER = "%[mag_run%(run_id="
+local DEFERRED_FAILURE_MARKER = "%[mag_run%(run_id=[^)]*%) FAILED%]"
 local SUBMITTED_ACK_MARKER = "submitted to the MAG actor kernel"
 
 -- Banner prepended to first-turn output and to every help-fallback
@@ -138,7 +133,7 @@ local HELP_BODY = table.concat({
   "You're talking to a **deterministic mock provider** 🧪 — not a real LLM.",
   "Every reply is pattern-matched against the user message, so the same input",
   "always produces the same output. *Useful* for shaking out the chat surface,",
-  "tool-gate, sub-graph orchestration, and ~~caching bugs~~ without waiting on",
+  "tool-gate, kernel-run orchestration, and ~~caching bugs~~ without waiting on",
   "a cloud round-trip.",
   "",
   "Switch to a real model with `/model` 🚀 — the picker lists every connected",
@@ -282,9 +277,9 @@ local function pick_response_for(chat_id)
   -- A tool message is "pending relay" only when it's MORE RECENT than
   -- the latest user message — i.e. a tool result just landed and we
   -- should respond to it. If the user has spoken since (next-turn
-  -- after a prior spawn_graph completed), last_tool is stale chat
+  -- after a prior dispatch completed), last_tool is stale chat
   -- history; pattern-match the new user input instead. Without this
-  -- gate, every turn in a chat that ever ran spawn_graph falls into
+  -- gate, every turn in a chat that ever dispatched a run falls into
   -- the SUBMITTED_ACK_MARKER branch because chat_id (and therefore
   -- mock-side history) persists across orchestrator runs for
   -- conversation continuity.
@@ -299,20 +294,16 @@ local function pick_response_for(chat_id)
   if not tool_is_pending_relay then last_tool = nil end
 
   -- ----------------------------------------------------------------
-  -- 1. Deferred-result branch (async spawn_graph). MUST stay first —
-  --    the orchestrator's wrap-node turn looks like an ordinary user
-  --    message but starts with the deferred marker, and routing it
-  --    through the help fallback would break the existing workflow.
+  -- 1. Deferred-result branch (async kernel run). MUST stay first —
+  --    the relay turn looks like an ordinary user message but starts
+  --    with the deferred marker, and routing it through the help
+  --    fallback would break the existing workflow.
   -- ----------------------------------------------------------------
   if type(last_user) == "string"
-      and (string.find(last_user, DEFERRED_RESULT_MARKER)
-        or string.find(last_user, DEFERRED_LEGACY_MARKER)) then
+      and string.find(last_user, DEFERRED_RESULT_MARKER) then
     -- Strip the leading marker line; what remains is the actual
     -- combined paragraph the model should relay.
     local body = string.match(last_user, "%-%-%- output %-%-%-\n(.*)$")
-    if body == nil then
-      body = string.match(last_user, "^%[Deferred result for spawn_graph%([^)]*%)%]\n(.*)$")
-    end
     return {
       text = FINAL_RELAY_PREFIX .. tostring(body or last_user),
       finish_reason = "stop",
@@ -320,10 +311,9 @@ local function pick_response_for(chat_id)
     }
   end
   if type(last_user) == "string"
-      and (string.find(last_user, DEFERRED_FAILURE_MARKER)
-        or string.find(last_user, DEFERRED_FAILURE_LEGACY)) then
+      and string.find(last_user, DEFERRED_FAILURE_MARKER) then
     return {
-      text = "The spawned sub-graph failed: " .. tostring(last_user),
+      text = "The dispatched MAG run failed: " .. tostring(last_user),
       finish_reason = "stop",
     }
   end
@@ -334,7 +324,7 @@ local function pick_response_for(chat_id)
   -- unblocks; the kernel run's result relays as a fresh deferred turn.
   if last_tool ~= nil and string.find(tostring(last_tool), SUBMITTED_ACK_MARKER) then
     return {
-      text = "Started the sub-graph; I'll relay the results when they arrive.",
+      text = "Started the MAG run; I'll relay the results when they arrive.",
       finish_reason = "stop",
     }
   end
@@ -393,10 +383,8 @@ local function pick_response_for(chat_id)
         finish_reason = "stop",
       }
     end
-    -- Legacy / synchronous-style fallback: relay the tool result text
-    -- as the final answer. Kept for safety if anything reverts
-    -- spawn_graph to synchronous semantics, or for unrecognised tool
-    -- calls in tests.
+    -- Fallback: relay the tool result text as the final answer —
+    -- covers unrecognised tool calls in tests.
     return {
       text = FINAL_RELAY_PREFIX .. tostring(last_tool),
       finish_reason = "stop",
@@ -656,9 +644,8 @@ end
 -- Canned reasoning chunks emitted ahead of content for the orchestrator's
 -- relay turn. Five chunks, deterministic — this is what the user sees as
 -- the live "thinking" preview before it collapses on first content delta.
--- For sub-graph chats, rg_adapter's gate drops these silently.
 local CANNED_REASONING_CHUNKS = {
-  "Reading the deferred sub-graph result.\n",
+  "Reading the deferred run result.\n",
   "It carries a single combined paragraph already, so",
   " I don't need to recompose anything — relaying it",
   " verbatim is the right call.\n",
@@ -700,7 +687,7 @@ end
 -- Per-chat interrupt flag. Set by the `<NAME>.interrupt` handler when an
 -- envelope lands during a stream; the streaming loops check it on every
 -- chunk boundary and break early. Keyed by chat_id so concurrent chats
--- (one per active spawn_graph node) don't mistakenly cancel each other.
+-- (one per active kernel actor) don't mistakenly cancel each other.
 local interrupted = {}
 
 local function emit_reasoning(chat_id, id)
@@ -934,7 +921,7 @@ nefor.on(NAME .. ".chat.complete", function(body)
   end
   if resp.with_reasoning then
     -- Mirrors openai-provider's chat.complete.result.output.reasoning
-    -- field — non-streaming consumers (sub-graph node outputs, audit
+    -- field — non-streaming consumers (kernel node outputs, audit
     -- listeners) get the full trace alongside the content.
     local full = ""
     for _, chunk in ipairs(CANNED_REASONING_CHUNKS) do full = full .. chunk end
@@ -987,12 +974,11 @@ nefor.on(NAME .. ".reset", function()
   interrupted = {}
 end)
 
--- Tool-result accumulation is handled by rg_adapter's `adapter`
--- reasoner: it translates the tool-executor's ToolResults into
--- `{role="tool", content, tool_call_id}` messages that the wrap node
--- then appends via chat.append on its next firing. So mock receives
--- the tool message through the normal chat.append path and doesn't
--- need to subscribe to broadcast `tool.result` directly.
+-- Tool-result accumulation is handled kernel-side (the tool-result
+-- factory turns tool outputs into `{role="tool", content, tool_call_id}`
+-- messages appended via chat.append), so mock receives the tool message
+-- through the normal chat.append path and doesn't need to subscribe to
+-- broadcast `tool.result` directly.
 
 -- The auth dance — chat_orchestrator's openai_provider_adapter expects
 -- to inject a static_token via `<name>.auth.set` after seeing

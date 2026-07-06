@@ -34,17 +34,15 @@
 //!      other agent is unaffected.
 //!   5. The program sink receives the surviving agent's typed result (asserted
 //!      on the persisted sink output).
-//!   6. `reasoner-graph` is not involved anywhere: no `dag.*` / `graph.*` event
-//!      appears on the wire.
+//!   6. The kernel speaks only its own wire vocabulary: no legacy `dag.*` /
+//!      `graph.*` event appears on the wire.
 //!
 //! PLACEMENT (flagged). This runs at plugin level (spawn `mag-plugin`, drive
 //! its stdio), the pattern of `execute.rs` — NOT engine-spawn (the
 //! `agentic_cli_mock_e2e` engine-spawn tests are the repo's known flaky spot).
-//! Step 6 is still meaningful here: the harness spawns ONLY `mag-plugin`, so no
-//! `reasoner-graph` process exists at all — asserting the absence of `dag.*` /
-//! `graph.*` kinds guards against the kernel ever emitting them and against a
-//! future wiring that pulls reasoner-graph into the mag path. The whole run is
-//! event-driven and settles in well under a second.
+//! Step 6 guards against the kernel ever (re)growing the deleted
+//! reasoner-graph kinds. The whole run is event-driven and settles in well
+//! under a second.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -519,16 +517,16 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
         "the sink's per-node output file was written"
     );
 
-    // ── SIX STEPS #6: reasoner-graph is not involved anywhere. No reasoner-
-    //    graph process exists in this harness; assert the kernel emitted no
-    //    dag.* / graph.* event regardless. ────────────────────────────────────
-    let reasoner_events: Vec<&String> = seen
+    // ── SIX STEPS #6: only the kernel's own wire vocabulary appears — the
+    //    legacy dag.* / graph.* kinds died with the reasoner-graph plugin and
+    //    must not regrow. ──────────────────────────────────────────────────
+    let legacy_events: Vec<&String> = seen
         .iter()
         .filter(|k| k.starts_with("dag.") || k.starts_with("graph."))
         .collect();
     assert!(
-        reasoner_events.is_empty(),
-        "reasoner-graph must not participate; saw {reasoner_events:?}"
+        legacy_events.is_empty(),
+        "legacy dag.*/graph.* kinds must not appear; saw {legacy_events:?}"
     );
 
     // Teardown.

@@ -1169,8 +1169,8 @@ end
 -- ── MAG kernel observation ────────────────────────────────────────────
 --
 -- The mag plugin relays the kernel's `mag.*` lifecycle stream onto the bus
--- as broadcasts; the chat surface consumes them to drive the same run
--- panel reasoner-graph `graph.*` events do. Kernel runs are concurrent
+-- as broadcasts; the chat surface consumes them to drive the sidebar run
+-- panel. Kernel runs are concurrent
 -- (the lead's own turn-program overlaps its dispatched sub-runs), and
 -- every event carries its `run_id` — panel state keys straight off it,
 -- so overlapping runs render independently.

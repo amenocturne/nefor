@@ -203,7 +203,7 @@ M.C = {
   -- weight; plans aren't warnings, they're a third entry kind.
   plan            = "#FFD75F",
   -- graph_result header colour. Cyan picks up the orchestration /
-  -- sub-graph register — distinct from tool_name (md_heading orange,
+  -- kernel-run register — distinct from tool_name (md_heading orange,
   -- request side) and plan (yellow, write-review). The blockquote
   -- accent (#7faaaa) is the closest existing neighbour but reads as
   -- "quoted text"; a brighter saturated cyan separates the graph-result

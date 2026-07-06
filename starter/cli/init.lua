@@ -361,7 +361,7 @@ local function run_single_shot(prompt, format, json_state, turn_start_ms, gate)
   agentic_workflow.on_complete(function(_run_id, status)
     if async_dispatch_inflight then
       -- Suppress the first complete; reset the flag so the next turn
-      -- (relay of the deferred sub-graph result) is the one we exit on.
+      -- (relay of the deferred run result) is the one we exit on.
       async_dispatch_inflight = false
       -- Re-open the stream gate so the relay turn's content reaches
       -- stdout.
