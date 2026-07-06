@@ -20,7 +20,7 @@ danger from collapsing into one generic "permission denied" path.
 
 | Class | Meaning | Examples |
 | --- | --- | --- |
-| `safe` | Non-destructive mechanical action. | `read_file`, `list_dir`, read-only graph dispatch. |
+| `safe` | Non-destructive mechanical action. | `read_file`, `mag-eval` dispatch, read-only graph dispatch. |
 | `human` | Safe action whose value is the human judgment itself. | `write-review` plan approval. |
 | `guarded` | Operation that can be acceptable, but needs explicit risk acceptance when no autonomous policy proves it safe. | `bash` that `da` cannot prove safe. |
 | `forbidden` | Operation classified as dangerous. | `bash` that `da` rejects. |

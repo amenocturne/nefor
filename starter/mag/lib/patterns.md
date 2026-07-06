@@ -23,6 +23,34 @@ Every template namespaces its internals under `:id`; two instances never
 collide, and a shared `:id` is a load-time error. Wire them like nodes:
 `(graph entry -> agent  agent -> out  :terminal out)`.
 
+## Shell pipes — MAG as shell
+
+`->` is the pipe. `(bash "cmd")` is a capability node usable inline — no
+`let` binding, no ceremony — and a chain of them composes like a pipeline:
+the first node's stdout becomes the next node's stdin.
+
+- `(bash "ls src")` — a bare expression is a whole program: the implicit
+  terminal carries its stdout out as the run result.
+- `((bash "rg -n TODO src/") -> (bash "sort"))` — an infix chain is a
+  subgraph; it compiles alone or composes inside a larger graph, and its
+  edges are type-checked like any others.
+- A command's non-zero exit is a routable failure (`mag.CommandFailed`);
+  unrouted, the run fails loudly. Route it to a repair actor when failure
+  is part of the design, exactly as in "Fire on failure" below.
+
+Shell nodes go through the same capability gate as agent tool calls —
+piping does not bypass command policy.
+
+## Agent tool surfaces — context I/O vs world work
+
+An agent's `:tools` carries context I/O — tools that pull content into the
+agent's context or author from it (`read_file`, `read_image`, `edit_file`,
+`write_file`) — plus `mag-eval` for world work. World queries whose outputs
+are data (listing, searching, running commands) are `mag-eval` shell
+expressions, not bespoke tools: `:tools ["read_file" "mag-eval"]` is the
+read-only investigator; add the write pair for a builder. Don't reach for
+per-query tools; reach for an expression.
+
 ## Ordering without data — dependency edge
 
 "A must not start before C finishes", where A doesn't consume C's output.

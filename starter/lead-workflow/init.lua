@@ -1232,7 +1232,9 @@ local function lead_workflow_tool_schemas()
         "terminator; stop a run early via interrupt/kill. " ..
         "Every program ends in exactly " ..
         "one sink bound via :terminal. See lib/patterns.md and " ..
-        "lib/templates.mag in the workspace for composition patterns.",
+        "lib/templates.mag in the workspace for composition patterns. " ..
+        "For a one-off shell expression whose result you just need back, " ..
+        "use mag-eval instead — no file, no workspace ceremony.",
       parameters  = {
         type = "object",
         properties = {

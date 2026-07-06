@@ -148,8 +148,8 @@ local HELP_BODY = table.concat({
   "|------|---------|-------------------|",
   "| mag dispatch | `summarize octopuses and lighthouses` | multi-agent kernel run |",
   "| read_file | `read readme` | 📄 tool-gate allowlist |",
-  "| bash (pwd) | `what is my cwd` | tool-gate prompt path |",
-  "| bash (ls -la) | `list files` | 📁 tool-gate prompt path |",
+  "| mag-eval (pwd) | `what is my cwd` | one-off kernel eval |",
+  "| mag-eval (ls -la) | `list files` | 📁 one-off kernel eval |",
   "| memory (set) | `the secret key is <v>` | 🔑 store in chat history |",
   "| memory (recall) | `what is the secret key?` | 🔑 history scan |",
   "| translation | `translate hello to japanese` | 🌐 CJK wide-char render |",
@@ -172,8 +172,8 @@ local HELP_BODY = table.concat({
   "",
   "- 📄 `read readme` — uses the `read_file` tool to fetch `README.md`",
   "  (requires `read_file` on the tool-gate allowlist, or auto)",
-  "- `what is my cwd` — uses `bash` to run `pwd`",
-  "- 📁 `list files` — uses `bash` to run `ls -la`",
+  "- `what is my cwd` — uses `mag-eval` to run `(bash \"pwd\")`",
+  "- 📁 `list files` — uses `mag-eval` to run `(bash \"ls -la\")`",
   "",
   "### 3. Memory",
   "",
@@ -350,9 +350,9 @@ local function pick_response_for(chat_id)
 
   -- ----------------------------------------------------------------
   -- Tool-result relay for the new interactive triggers. When the wrap
-  -- node fires after a read_file / bash tool result, render a friendly
-  -- response that quotes the tool output. Keyed off the most recent
-  -- user-role trigger string already in history.
+  -- node fires after a read_file / mag-eval tool result, render a
+  -- friendly response that quotes the tool output. Keyed off the most
+  -- recent user-role trigger string already in history.
   -- ----------------------------------------------------------------
   if last_tool ~= nil and type(last_user) == "string" then
     local low_user = lc(last_user)
@@ -494,7 +494,7 @@ local function pick_response_for(chat_id)
     }
   end
 
-  -- 5b. cwd / pwd / where am i -> bash tool call (pwd)
+  -- 5b. cwd / pwd / where am i -> mag-eval tool call ((bash "pwd"))
   if string.find(low, "pwd", 1, true)
       or string.find(low, "current cwd", 1, true)
       or string.find(low, "where am i", 1, true)
@@ -507,14 +507,14 @@ local function pick_response_for(chat_id)
       tool_calls = {
         {
           id        = mint_tool_id("pwd"),
-          name      = "bash",
-          arguments = { command = "pwd" },
+          name      = "mag-eval",
+          arguments = { expr = '(bash "pwd")' },
         },
       },
     }
   end
 
-  -- 5c. list files -> bash tool call (ls -la)
+  -- 5c. list files -> mag-eval tool call ((bash "ls -la"))
   if string.find(low, "list files", 1, true) then
     return {
       text = "",
@@ -522,8 +522,8 @@ local function pick_response_for(chat_id)
       tool_calls = {
         {
           id        = mint_tool_id("ls"),
-          name      = "bash",
-          arguments = { command = "ls -la" },
+          name      = "mag-eval",
+          arguments = { expr = '(bash "ls -la")' },
         },
       },
     }

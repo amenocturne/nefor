@@ -31,14 +31,13 @@
 (let [lead (agent {:id "lead"
                    :tools ["read_file"
                            "read_image"
-                           "list_dir"
-                           "search_text"
                            "instructions"
                            "edit_file"
                            "graph-status"
                            "terminate-graph"
                            "write-review"
                            "mag"
+                           "mag-eval"
                            "mag-env"]}
              : mag.Task -> generic-provider.FinalAnswer)
       out  (node "sink" {}

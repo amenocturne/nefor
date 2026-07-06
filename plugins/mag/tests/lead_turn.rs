@@ -305,10 +305,18 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         .and_then(Value::as_array)
         .expect("chat.create advertises the program-authored tool surface");
     let tool_names: Vec<&str> = tools.iter().filter_map(Value::as_str).collect();
-    for expected in ["read_file", "write-review", "mag", "mag-env"] {
+    for expected in ["read_file", "write-review", "mag", "mag-eval", "mag-env"] {
         assert!(
             tool_names.contains(&expected),
             "lead tool surface carries {expected}; got {tool_names:?}"
+        );
+    }
+    // World queries ride mag-eval expressions; the plain query tools are
+    // deliberately off the lead's surface.
+    for absent in ["list_dir", "search_text", "bash"] {
+        assert!(
+            !tool_names.contains(&absent),
+            "lead tool surface must not carry {absent}; got {tool_names:?}"
         );
     }
 
