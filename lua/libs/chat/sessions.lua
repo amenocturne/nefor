@@ -7,7 +7,7 @@
 -- replay jsonl → resume_done). No process exit, no sidechannel file —
 -- the TUI stays alive across the whole flip.
 
-local common = require("chat.common")
+local common = require("libs.chat.common")
 
 local M = {}
 

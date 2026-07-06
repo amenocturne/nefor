@@ -4494,7 +4494,7 @@ fn height_cache_tolerates_unversioned_replay_entries() {
         .lua()
         .load(
             r#"
-            local height_cache = require("chat.height_cache")
+            local height_cache = require("libs.chat.height_cache")
             height_cache.set_width(40)
             return height_cache.get({
               role = "assistant",

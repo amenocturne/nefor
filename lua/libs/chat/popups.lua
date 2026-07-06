@@ -5,10 +5,10 @@
 
 local tui_lib = require("nefor-tui")
 local W       = tui_lib.widget
-local common  = require("chat.common")
-local sessions = require("chat.sessions")
-local agent_streams = require("chat.agent_streams")
-local run_panel     = require("chat.run_panel")
+local common  = require("libs.chat.common")
+local sessions = require("libs.chat.sessions")
+local agent_streams = require("libs.chat.agent_streams")
+local run_panel     = require("libs.chat.run_panel")
 
 local STYLE         = common.STYLE
 local C             = common.C

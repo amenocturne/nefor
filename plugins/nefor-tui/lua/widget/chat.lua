@@ -1,7 +1,7 @@
 local M = {}
 
-local height_cache = require("chat.height_cache")
-local log = require("chat.log")
+local height_cache = require("libs.chat.height_cache")
+local log = require("libs.chat.log")
 
 local function measure_width(key, padding)
   local ok, snap = pcall(tui.scroll_position, key)

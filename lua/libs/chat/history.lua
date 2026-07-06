@@ -4,7 +4,7 @@
 -- so they survive nefor restarts. Past INPUT_HISTORY_MAX entries the
 -- oldest roll off the disk file the next time we trim.
 
-local common = require("chat.common")
+local common = require("libs.chat.common")
 
 local M = {}
 

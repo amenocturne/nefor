@@ -538,7 +538,7 @@ do
 end
 
 -- chat entries
-local entries = require("chat.entries")
+local entries = require("libs.chat.entries")
 
 do
   local tree = entries.render({

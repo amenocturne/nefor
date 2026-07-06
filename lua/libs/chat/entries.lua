@@ -3,7 +3,7 @@
 -- the small helpers (tool_salient, format_submitted_at,
 -- humanize_duration_ms) the renderer pulls in.
 
-local common = require("chat.common")
+local common = require("libs.chat.common")
 
 local C        = common.C
 local STYLE    = common.STYLE

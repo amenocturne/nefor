@@ -1,4 +1,4 @@
-local log = require("chat.log")
+local log = require("libs.chat.log")
 
 local M = {}
 

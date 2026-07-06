@@ -1,6 +1,6 @@
 local M = {}
 
-local log = require("chat.log")
+local log = require("libs.chat.log")
 local cache = {}
 local cache_size = 0
 local current_width = nil

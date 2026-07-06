@@ -3,8 +3,8 @@
 -- (mag_run_started, actor_* transitions, mag_run_complete, prune) the
 -- chat reducer calls.
 
-local common = require("chat.common")
-local agent_streams = require("chat.agent_streams")
+local common = require("libs.chat.common")
+local agent_streams = require("libs.chat.agent_streams")
 local STYLE   = common.STYLE
 local CURSOR_ROW_STYLE = common.CURSOR_ROW_STYLE
 local shallow_merge = common.shallow_merge

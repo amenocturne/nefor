@@ -118,7 +118,7 @@ do
   -- to sibling submodules should win). Prefer config_dir over local or
   -- pm-cloned upstream copies. NEFOR_DEV_DIR still wins overall for
   -- in-repo iteration.
-  local chat_dir = pick_dir("NEFOR_STARTER_CHAT_DIR", "/common.lua", table.pack(
+  local chat_dir = pick_dir("NEFOR_STARTER_CHAT_DIR", "/update.lua", table.pack(
     dev_dir    and (dev_dir    .. "/starter/chat") or nil,
     config_dir and (config_dir .. "/chat") or nil,
     local_dir  and (local_dir  .. "/starter/chat") or nil,
@@ -150,6 +150,33 @@ do
     }, ";")
   end
 
+  -- The shared Lua tree (`NEFOR_ROOT/lua`) holds `core.*` and `libs.*`.
+  -- The chat mechanism modules live at `libs/chat/*`; the opinion files
+  -- in this dir require them as `libs.chat.<m>` (and the moved modules
+  -- require each other the same way). The engine VM exposes this tree
+  -- via its own package.path; the tui VM gets a vanilla one, so graft
+  -- it here. `tui_lua_dir` already resolved to `<root>/plugins/nefor-tui/lua`,
+  -- so `<root>/lua` is its sibling — the standard candidate list mirrors
+  -- the tui/chat dir resolution above.
+  local tui_root = tui_lua_dir:match("^(.*)/plugins/nefor%-tui/lua$")
+  local lua_dir = pick_dir("NEFOR_LUA_DIR", "/core/ncp.lua", table.pack(
+    dev_dir      and (dev_dir      .. "/lua") or nil,
+    tui_root     and (tui_root     .. "/lua") or nil,
+    local_dir    and (local_dir    .. "/lua") or nil,
+    detected_dir and (detected_dir .. "/lua") or nil,
+    pm_root      and (pm_root      .. "/lua") or nil,
+    "./lua",
+    "../lua"
+  ))
+  if lua_dir == nil then
+    error("starter/chat.lua: could not locate the shared lua/ tree (libs.chat.*)")
+  end
+  package.path = table.concat({
+    lua_dir .. "/?.lua",
+    lua_dir .. "/?/init.lua",
+    package.path,
+  }, ";")
+
   local function make_prefix_searcher(prefix, root)
     return function(name)
       if name ~= prefix and name:sub(1, #prefix + 1) ~= prefix .. "." then
@@ -179,8 +206,8 @@ do
   table.insert(searchers, 1, make_prefix_searcher("chat",       chat_dir))
 end
 
-local history = require("chat.history")
-local view    = require("chat.view")
+local history = require("libs.chat.history")
+local view    = require("libs.chat.view")
 local update  = require("chat.update")
 
 local function active_config()

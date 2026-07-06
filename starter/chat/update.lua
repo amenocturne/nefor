@@ -6,18 +6,18 @@
 local tui_lib = require("nefor-tui")
 local W       = tui_lib.widget
 
-local common        = require("chat.common")
-local agent_streams = require("chat.agent_streams")
+local common        = require("libs.chat.common")
+local agent_streams = require("libs.chat.agent_streams")
 local slash        = require("chat.slash")
-local sessions     = require("chat.sessions")
-local at_path      = require("chat.at_path")
-local history      = require("chat.history")
-local run_panel    = require("chat.run_panel")
-local transcript   = require("chat.transcript")
-local popups       = require("chat.popups")
-local Entry        = require("chat.entry")
-local log          = require("chat.log")
-local height_cache = require("chat.height_cache")
+local sessions     = require("libs.chat.sessions")
+local at_path      = require("libs.chat.at_path")
+local history      = require("libs.chat.history")
+local run_panel    = require("libs.chat.run_panel")
+local transcript   = require("libs.chat.transcript")
+local popups       = require("libs.chat.popups")
+local Entry        = require("libs.chat.entry")
+local log          = require("libs.chat.log")
+local height_cache = require("libs.chat.height_cache")
 
 local shallow_merge = common.shallow_merge
 local NIL_SENTINEL  = common.NIL_SENTINEL
@@ -230,7 +230,7 @@ local function handle_input_submit(msg, state)
     }
   end
   if cmd == "debug" then
-    local chatlog = require("chat.log")
+    local chatlog = require("libs.chat.log")
     if chatlog.is_enabled() then chatlog.disable() else chatlog.enable() end
     local toasts = {}
     for _, t in ipairs(state.toasts or {}) do toasts[#toasts + 1] = t end

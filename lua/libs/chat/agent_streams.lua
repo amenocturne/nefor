@@ -19,7 +19,7 @@
 --     },
 --   }
 
-local common = require("chat.common")
+local common = require("libs.chat.common")
 local shallow_merge = common.shallow_merge
 
 local M = {}

@@ -7,11 +7,15 @@
 local tui_lib = require("nefor-tui")
 local W       = tui_lib.widget
 
-local common      = require("chat.common")
-local entries_mod = require("chat.entries")
+local common      = require("libs.chat.common")
+local entries_mod = require("libs.chat.entries")
+-- statusline/slash are config-owned opinion files (they stay in
+-- starter/chat, resolved via the `chat` searcher). This view assembles
+-- them by fixed module name — an implicit interface a later wave should
+-- parameterize (pass the statusline/slash renderers in as deps).
 local statusline  = require("chat.statusline")
-local run_panel   = require("chat.run_panel")
-local popups      = require("chat.popups")
+local run_panel   = require("libs.chat.run_panel")
+local popups      = require("libs.chat.popups")
 local slash       = require("chat.slash")
 
 local STYLE   = common.STYLE

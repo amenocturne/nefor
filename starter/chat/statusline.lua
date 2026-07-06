@@ -3,7 +3,7 @@
 -- return tui nodes, no I/O beyond `tui.scroll_position` for the
 -- scroll-percentage segment.
 
-local common = require("chat.common")
+local common = require("libs.chat.common")
 local C       = common.C
 local STYLE   = common.STYLE
 local humanize_tokens = common.humanize_tokens

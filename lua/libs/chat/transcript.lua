@@ -1,6 +1,6 @@
-local Entry   = require("chat.entry")
-local log     = require("chat.log")
-local common  = require("chat.common")
+local Entry   = require("libs.chat.entry")
+local log     = require("libs.chat.log")
+local common  = require("libs.chat.common")
 local shallow_merge = common.shallow_merge
 local NIL_SENTINEL  = common.NIL_SENTINEL
 
