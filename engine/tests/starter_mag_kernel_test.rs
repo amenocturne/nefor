@@ -35,6 +35,11 @@ fn starter_mag_kernel_routing() {
 }
 
 #[test]
+fn starter_mag_kernel_interrupt() {
+    run_lua_test("tests/lua/mag-kernel/interrupt_test.lua");
+}
+
+#[test]
 fn starter_mag_kernel_flow_primitives() {
     run_lua_test("tests/lua/mag-kernel/flow_test.lua");
 }

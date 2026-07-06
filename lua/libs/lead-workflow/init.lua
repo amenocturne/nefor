@@ -1529,6 +1529,16 @@ local function receive_msg(entry)
     return
   end
 
+  -- The gate forwards a `tool.cancel` for a mag-eval firing here when the
+  -- lead's graceful interrupt cancels it: propagate the cancel down into the
+  -- dispatched sub-run (mag-eval.cancel → mag.interrupt_run), killing its
+  -- in-flight bash. Live path only.
+  if kind == "lead-workflow.tool.cancel" then
+    if replay_window.active() then return end
+    mag_eval.cancel(body.id)
+    return
+  end
+
   -- Plan envelopes: live feedback paints the review block. Replay relies on
   -- the persisted chat.plan.append event to restore chat order.
   if kind == "lead-workflow.plan.submitted" then

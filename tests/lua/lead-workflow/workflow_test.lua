@@ -1168,3 +1168,42 @@ do
   assert_eq(lw._internals.state.active_plan, nil,
     "active_plan flushed at session_end — no carry-over approval")
 end
+
+-- (mag-eval interrupt propagation) A graceful interrupt of the lead cancels a
+-- mag-eval capability by forwarding `lead-workflow.tool.cancel { id }` here;
+-- mag-eval maps the firing to its dispatched sub-run and interrupts IT
+-- (`mag.interrupt_run`), which cancels the sub-run's in-flight bash. Uses
+-- mag-eval's existing pending_runs tracking (firing_id → sub-run id), not
+-- general provenance.
+do
+  local mag_eval = require("libs.lead-workflow.mag-eval")
+  fresh()
+  -- A mag-eval firing that dispatched a sub-run (as on_loaded records it).
+  mag_eval._internals.state.pending_runs = {
+    ["mag-eval-3-1234"] = { firing_id = "gate-77", run_name = "eval-3" },
+  }
+  _test.calls_clear()
+
+  -- The cancel arrives through the gate → lead-workflow's receive_msg wiring.
+  feed("tool-gate", { kind = "lead-workflow.tool.cancel", id = "gate-77" })
+
+  local calls = decode_calls()
+  local interrupt = find_call(calls, function(c)
+    return c.body.kind == "mag.interrupt_run" and c.target == "mag"
+  end)
+  assert_true(interrupt ~= nil,
+    "lead-workflow.tool.cancel propagates into mag.interrupt_run for the sub-run; got "
+    .. json.encode(_test.calls()))
+  assert_eq(interrupt.body.run_id, "mag-eval-3-1234",
+    "the interrupt targets the sub-run mag-eval dispatched for this firing")
+
+  -- A cancel for a firing with no live sub-run is a clean no-op.
+  _test.calls_clear()
+  feed("tool-gate", { kind = "lead-workflow.tool.cancel", id = "gate-does-not-exist" })
+  local none = find_call(decode_calls(), function(c)
+    return c.body.kind == "mag.interrupt_run"
+  end)
+  assert_eq(none, nil, "no sub-run for the firing → no interrupt emitted")
+
+  mag_eval._internals.state.pending_runs = {}
+end

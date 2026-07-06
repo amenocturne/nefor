@@ -42,6 +42,18 @@ function M:close(request_id)
   return entry
 end
 
+-- The wire ids of every open (unanswered) request, sorted for determinism.
+-- The interrupt path snapshots these to settle each in-flight capability as a
+-- failure without mutating the table it iterates (routing.lua interrupt).
+function M:pending_ids()
+  local ids = {}
+  for rid in pairs(self.pending) do
+    ids[#ids + 1] = rid
+  end
+  table.sort(ids)
+  return ids
+end
+
 -- Drop every outstanding request owned by a killed actor. Kill unroutes and
 -- drops the mailbox; it drops pending correlations too, so a late reply to a
 -- dead requester finds nothing and is discarded.

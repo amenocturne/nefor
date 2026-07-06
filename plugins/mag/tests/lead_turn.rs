@@ -553,6 +553,171 @@ async fn kill_run_cancels_the_provider_round_and_settles_killed() {
     std::fs::remove_dir_all(&data_dir).ok();
 }
 
+/// The graceful double-Esc path (`mag.interrupt_run`): interrupting a lead run
+/// blocked on an in-flight tool call cancels the real work (a
+/// `tool-gate.tool.cancel` for the open correlation reaches the wire), settles
+/// that correlation as a failed "interrupted by user" tool result, re-fires the
+/// lead llm with that result in its transcript, and lets the run WIND DOWN to a
+/// real final answer — `mag.run_result status:"completed"`, NOT killed. This is
+/// the incident's tool leg end-to-end through the real plugin + bridge + kernel;
+/// the run is never killed, so the turn records itself (no amnesia).
+#[tokio::test]
+async fn interrupt_run_settles_inflight_tool_and_lead_winds_down_completed() {
+    let data_dir = std::env::temp_dir().join(format!("mag-lead-interrupt-{}", std::process::id()));
+    std::fs::remove_dir_all(&data_dir).ok();
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+
+    let mut child = spawn_mag(&data_dir).await;
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let stderr = child.stderr.take().expect("stderr");
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            eprintln!("[mag stderr] {line}");
+        }
+    });
+
+    handshake(&mut reader, &mut stdin).await;
+    let program = load_lead_program(&mut reader, &mut stdin).await;
+
+    send_event(
+        &mut stdin,
+        execute_body(
+            "exec-interrupt",
+            "lead-run-interrupt",
+            turn_modification(&program, "read a big file for me"),
+            json!([]),
+        ),
+    )
+    .await;
+
+    // Round 1: drive the provider round to a tool call.
+    let create_kind = format!("{PROVIDER}.chat.create");
+    let complete_kind = format!("{PROVIDER}.chat.complete");
+    let create = next_event_of_kind(&mut reader, &create_kind).await;
+    let chat_id = create
+        .get("chat_id")
+        .and_then(Value::as_str)
+        .expect("chat.create carries chat_id")
+        .to_owned();
+    next_event_of_kind(&mut reader, &complete_kind).await;
+    send_event(
+        &mut stdin,
+        chat_result(
+            &chat_id,
+            json!({ "tool_calls": [
+                { "id": "call-1", "name": "read_file", "args": { "path": "HUGE" } }
+            ] }),
+        ),
+    )
+    .await;
+
+    // The gate invoke is now in flight (run-tool blocked awaiting the result).
+    let gate_invoke_kind = format!("{GATE}.tool.invoke");
+    let invoke = next_event_of_kind(&mut reader, &gate_invoke_kind).await;
+    let cap_id = invoke
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("gate invoke carries the kernel correlation id")
+        .to_owned();
+
+    // Double-Esc: gracefully interrupt the run instead of killing it. Do NOT
+    // reply to the tool call — the interrupt is what settles it.
+    send_event(
+        &mut stdin,
+        obj(json!({ "kind": "mag.interrupt_run", "run_id": "lead-run-interrupt" })),
+    )
+    .await;
+
+    // Real termination: a tool.cancel for the open correlation reaches the wire
+    // (→ the gate would forward it to the owning source and kill the child).
+    // The lead llm re-fires: a fresh chat.create whose transcript carries the
+    // interrupted tool result as a readable `[tool error] interrupted by user`.
+    let cancel_kind = format!("{GATE}.tool.cancel");
+    let append_kind = format!("{PROVIDER}.chat.append");
+    let mut saw_cancel = false;
+    let mut saw_interrupted_tool_turn = false;
+    let mut chat_id2: Option<String> = None;
+    loop {
+        let body = next_event(&mut reader, "interrupt aftermath").await;
+        match body.get("kind").and_then(Value::as_str) {
+            Some(k) if k == cancel_kind => {
+                assert_eq!(
+                    body.get("id").and_then(Value::as_str),
+                    Some(cap_id.as_str()),
+                    "the cancel targets the in-flight tool correlation"
+                );
+                saw_cancel = true;
+            }
+            Some(k) if k == create_kind && chat_id2.is_none() => {
+                // Round 2 chat (the re-fire) — a fresh handle, not round 1's.
+                let c2 = body
+                    .get("chat_id")
+                    .and_then(Value::as_str)
+                    .expect("round 2 chat_id")
+                    .to_owned();
+                assert_ne!(c2, chat_id, "the re-fire runs on a fresh provider chat");
+                chat_id2 = Some(c2);
+            }
+            Some(k)
+                if k == append_kind
+                    && body.pointer_str("/message/content")
+                        == Some("[tool error] interrupted by user") =>
+            {
+                assert_eq!(
+                    body.pointer_str("/message/role"),
+                    Some("tool"),
+                    "the interrupted result replays as a tool-role turn"
+                );
+                saw_interrupted_tool_turn = true;
+            }
+            Some(k) if k == complete_kind && chat_id2.is_some() => break,
+            _ => {}
+        }
+    }
+    assert!(
+        saw_cancel,
+        "a tool.cancel for the in-flight call reached the wire"
+    );
+    assert!(
+        saw_interrupted_tool_turn,
+        "the lead re-fired with the interrupted result as a readable tool turn"
+    );
+    let chat_id2 = chat_id2.expect("round 2 chat established");
+
+    // The re-fired round produces the real final answer; the run completes
+    // (NOT killed) so the terminal reply settles the ORIGINAL execute.
+    send_event(
+        &mut stdin,
+        chat_result(
+            &chat_id2,
+            json!({ "text": "I stopped the read as you asked." }),
+        ),
+    )
+    .await;
+    let result = next_event_of_kind(&mut reader, "mag.run_result").await;
+    assert_eq!(
+        result.get("status").and_then(Value::as_str),
+        Some("completed"),
+        "the interrupted turn winds down completed, not killed"
+    );
+    assert_eq!(
+        result.get("in_reply_to").and_then(Value::as_str),
+        Some("exec-interrupt"),
+        "the surviving run settles its original execute reply"
+    );
+    assert_eq!(
+        result.pointer_str("/result/text"),
+        Some("I stopped the read as you asked."),
+        "the lead's post-interrupt final answer rides the terminal reply"
+    );
+
+    shutdown(stdin, child).await;
+    std::fs::remove_dir_all(&data_dir).ok();
+}
+
 /// Tiny JSON-pointer helper for `Map<String, Value>` roots.
 trait PointerStr {
     fn pointer_str(&self, pointer: &str) -> Option<&str>;

@@ -575,6 +575,39 @@ function M:bus_response(response)
   return true
 end
 
+-- Interrupt this run's in-flight work (control-plane double-Esc, NOT a kill).
+-- For every OPEN capability correlation in this run:
+--   1. emit a `tool.cancel { id = request_id }` on the bus so the real work
+--      stops burning — the bridge routes it to the gate (a tool leg → the
+--      owning source kills the child / cancels a sub-run) or to
+--      `<provider>.chat.cancel` (a provider round). Real termination first.
+--   2. settle the correlation by delivering a synthesized FAILED reply
+--      ("interrupted by user") through the EXISTING reply path (bus_response —
+--      close + reply activation). The failure lands on the emitting actor's
+--      pending completion in THIS run and routes onward exactly like any tool
+--      failure (run-tool → tool-result → llm re-fire; bash node → its failure
+--      edge; llm → mag.failed). The run context stays alive.
+-- Ids are snapshotted before settling: a settle may re-fire an actor and open
+-- a FRESH correlation (the lead llm's next provider round), which must NOT be
+-- interrupted — only the work in flight at interrupt time is. Returns the
+-- number of correlations settled. A run with nothing in flight is a clean 0.
+function M:interrupt(failure)
+  failure = failure or "interrupted by user"
+  local ids = self.correlation:pending_ids()
+  -- Phase 1: real termination requests for every open correlation.
+  for _, request_id in ipairs(ids) do
+    self.bus_emit({ kind = "tool.cancel", id = request_id })
+  end
+  -- Phase 2: synthetic failed settle, reusing the reply-delivery path.
+  local settled = 0
+  for _, request_id in ipairs(ids) do
+    if self:bus_response({ id = request_id, error = failure }) then
+      settled = settled + 1
+    end
+  end
+  return settled
+end
+
 -- The factory confirmed the id is ready (actor-model.md, Lifecycle). With
 -- lazy construction this fires inside construct_instance, at the actor's
 -- first activation — ready now MEANS "began work". Surface it as a lifecycle

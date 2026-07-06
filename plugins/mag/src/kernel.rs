@@ -214,6 +214,21 @@ impl LuaHost {
         Ok(f.call::<bool>((run_id, reason.as_str()))?)
     }
 
+    /// Interrupt a live run WITHOUT killing it: settle every in-flight
+    /// capability correlation as a failed reply ("interrupted by user") and
+    /// emit a `tool.cancel` for each so the real work stops. The failure routes
+    /// through the normal tool-failure path and the run stays alive, winding
+    /// down to a real final answer (the graceful double-Esc path — contrast
+    /// [`LuaHost::end_run`]). Returns the number of correlations settled; an
+    /// unknown/ended run returns 0. The caller drains the emit queue (the
+    /// cancels + any re-fire the settle produced) and then settles the run if
+    /// it reached a terminal state (a provider-leg interrupt fails the run).
+    pub fn interrupt_run(&self, run_id: &str, failure: &str) -> Result<u64, MagError> {
+        let f: Function = self.kernel.get("interrupt_run")?;
+        let res: Table = f.call::<Table>((run_id, failure))?;
+        Ok(res.get::<Option<u64>>("interrupted")?.unwrap_or(0))
+    }
+
     /// Deliver a correlated capability response (tool.result-shaped) back to
     /// the requesting actor, advancing any deferred activation it unblocks.
     /// Correlation ids are run-scoped, so the kernel dispatches to the owning

@@ -111,6 +111,20 @@ const APPLIED_KIND: &str = "mag.applied";
 /// not live is a logged no-op (monotone lifecycles: kill on dead, no-op).
 const KILL_RUN_KIND: &str = "mag.kill_run";
 
+/// Interrupt a live run WITHOUT killing it — the control plane's graceful
+/// double-Esc surface. Settles every in-flight capability correlation as a
+/// failed reply ("interrupted by user") and cancels the real work
+/// (subprocess / provider round), then lets the run wind down normally: the
+/// lead llm re-fires with the interrupted tool result and produces a real
+/// final answer, so the turn completes (`mag.run_result status:"completed"`)
+/// and history records itself — no killed-without-record turn, no amnesia.
+/// The run's context stays alive; an interrupt for a run that is not live is a
+/// logged no-op.
+const INTERRUPT_RUN_KIND: &str = "mag.interrupt_run";
+
+/// The failure detail a graceful interrupt settles in-flight capabilities with.
+const INTERRUPT_FAILURE: &str = "interrupted by user";
+
 /// Correlation id echoed by capability responses (tool.result). The kernel
 /// mints these on `capability.invoke` (routing.lua); the reply carries `output`
 /// (tool/provider convention) or `result`, plus an optional `error`. The tool
@@ -410,6 +424,7 @@ async fn handle_event(
         }
         APPLY_KIND => handle_apply(out_tx, body, in_reply_to, host, active, bridge).await,
         KILL_RUN_KIND => handle_kill_run(out_tx, body, host, active, bridge).await,
+        INTERRUPT_RUN_KIND => handle_interrupt_run(out_tx, body, host, active, bridge).await,
         // A capability response correlated to a kernel-minted request id.
         // Unknown ids are dropped inside the kernel (no open correlation), so
         // forwarding every tool.result while any run is live is safe.
@@ -766,6 +781,37 @@ async fn handle_kill_run(
     host.end_run(run_id, TeardownReason::Killed)?;
     flush_emits(out_tx, host, bridge).await?;
     send_event(out_tx, run_result_killed(a.in_reply_to.as_deref(), run_id)).await
+}
+
+/// Interrupt one live run gracefully (the double-Esc path). Settles its
+/// in-flight capabilities as "interrupted by user" and cancels the real work;
+/// the run SURVIVES, so — unlike `handle_kill_run` — the `active` entry is
+/// kept. Flushing forwards the cancels (to the gate / provider) and any
+/// re-fire the settle produced (the lead llm's fresh provider round). A
+/// provider-leg interrupt fails the run synchronously, so settle_run after the
+/// flush closes it; the tool-leg case leaves the run pending on its re-fire and
+/// settle_run is a no-op there. Not live → logged no-op.
+async fn handle_interrupt_run(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    body: &Map<String, Value>,
+    host: &LuaHost,
+    active: &mut ActiveExecutes,
+    bridge: &mut CapabilityBridge,
+) -> Result<(), MagError> {
+    let run_id = match body.get("run_id").and_then(Value::as_str) {
+        Some(r) => r.to_owned(),
+        None => return Ok(()),
+    };
+    if !active.contains_key(&run_id) {
+        tracing::info!(run_id = %run_id, "mag.interrupt_run for a run that is not live; no-op");
+        return Ok(());
+    }
+    let settled = host.interrupt_run(&run_id, INTERRUPT_FAILURE)?;
+    tracing::info!(run_id = %run_id, settled, "mag.interrupt_run: in-flight capabilities settled as interrupted");
+    flush_emits(out_tx, host, bridge).await?;
+    // The run stays alive on the tool leg (re-fire pending); a provider-leg
+    // interrupt may have failed it synchronously — settle if so.
+    settle_run(out_tx, host, active, bridge, &run_id).await
 }
 
 /// Route a capability response into the kernel (unblocking a deferred

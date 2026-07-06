@@ -182,10 +182,13 @@ struct ToolSpec {
 
 /// Pending forwarded invocation: maps the gate-minted inner id (used to
 /// address the underlying plugin) back to the provider's outer id (so when
-/// `tool.result` arrives we can rewrite the id and broadcast it).
+/// `tool.result` arrives we can rewrite the id and broadcast it) plus the
+/// source plugin the call was forwarded to (so a `tool.cancel` for the outer
+/// id can be forwarded on to the same source under the inner id).
 #[derive(Debug, Clone)]
 struct PendingForward {
     outer_id: String,
+    source: String,
 }
 
 /// Pending permission request: maps the provider's outer id to the
@@ -294,12 +297,15 @@ async fn dispatch_event(
     };
     let advertise_kind = format!("{PLUGIN_NAME}.tools.advertise");
     let invoke_kind = format!("{PLUGIN_NAME}.tool.invoke");
+    let cancel_kind = format!("{PLUGIN_NAME}.tool.cancel");
     let set_mode_kind = format!("{PLUGIN_NAME}.set_mode");
 
     if kind == advertise_kind {
         handle_tools_advertise(out_tx, body, state).await?;
     } else if kind == invoke_kind {
         handle_tool_invoke(out_tx, body, state).await?;
+    } else if kind == cancel_kind {
+        handle_tool_cancel(out_tx, body, state).await?;
     } else if kind == "tool.result" {
         handle_tool_result(out_tx, body, state).await?;
     } else if kind == "tool.permission_response" {
@@ -489,9 +495,45 @@ async fn forward_to_source(
         inner_id.clone(),
         PendingForward {
             outer_id: outer_id.to_owned(),
+            source: source.to_owned(),
         },
     );
     send_event(out_tx, forward_invoke_body(source, &inner_id, name, args)).await?;
+    Ok(())
+}
+
+/// Forward a `tool.cancel` for a caller's outer id onto the underlying source.
+/// The kernel's interrupt emits `tool-gate.tool.cancel { id: <outer> }` for
+/// each open tool correlation; we look up the live forward by its outer id,
+/// then re-emit `<source>.tool.cancel { id: <inner> }` so the owning plugin
+/// (basic-tools kills the child; lead-workflow cancels a mag-eval sub-run)
+/// aborts exactly that firing. The `pending` entry is KEPT: the real (now
+/// cancelled) `tool.result` still flows back through the normal path and drops
+/// at the caller's already-settled correlation.
+async fn handle_tool_cancel(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    body: &Map<String, Value>,
+    state: &GateState,
+) -> Result<(), TransportError> {
+    let outer_id = match body.get("id").and_then(Value::as_str) {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+    // Reverse-scan the (small) live-forward table for the matching outer id.
+    let forward = state
+        .pending
+        .iter()
+        .find(|(_, p)| p.outer_id == outer_id)
+        .map(|(inner, p)| (inner.clone(), p.source.clone()));
+    match forward {
+        Some((inner_id, source)) => {
+            tracing::info!(outer_id = %outer_id, inner_id = %inner_id, source = %source, "tool.cancel forwarded");
+            send_event(out_tx, forward_cancel_body(&source, &inner_id)).await?;
+        }
+        None => {
+            tracing::info!(outer_id = %outer_id, "tool.cancel for an unknown/settled forward; no-op");
+        }
+    }
     Ok(())
 }
 
@@ -613,6 +655,16 @@ fn forward_invoke_body(
     m.insert("id".into(), Value::String(inner_id.to_owned()));
     m.insert("name".into(), Value::String(name.to_owned()));
     m.insert("args".into(), args);
+    m
+}
+
+fn forward_cancel_body(source: &str, inner_id: &str) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert(
+        "kind".into(),
+        Value::String(format!("{source}.tool.cancel")),
+    );
+    m.insert("id".into(), Value::String(inner_id.to_owned()));
     m
 }
 
@@ -1054,6 +1106,7 @@ mod tests {
             "gate-1".into(),
             PendingForward {
                 outer_id: "prov-42".into(),
+                source: "basic-tools".into(),
             },
         );
         let body = json!({
@@ -1071,6 +1124,81 @@ mod tests {
         assert_eq!(body.get("id").and_then(Value::as_str), Some("prov-42"));
         assert_eq!(body.get("output").and_then(Value::as_str), Some("abc"));
         assert!(!state.pending.contains_key("gate-1"));
+    }
+
+    #[tokio::test]
+    async fn tool_cancel_forwards_to_source_under_the_inner_id() {
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+        let mut state = make_state();
+        let advertise = advertise_body(
+            "basic-tools",
+            json!([{"name": "bash", "description": "", "parameters": {}}]),
+        );
+        handle_tools_advertise(&tx, &advertise, &mut state)
+            .await
+            .unwrap();
+        let _ = rx.recv().await; // tool.register
+
+        // Establish a live forward: bash auto-forwards under yolo.
+        state.mode = GateMode::Yolo;
+        let invoke = json!({
+            "kind": "tool-gate.tool.invoke",
+            "id": "r16/cap-2",
+            "name": "bash",
+            "args": { "command": "sleep 10" }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        handle_tool_invoke(&tx, &invoke, &mut state).await.unwrap();
+        let fwd = rx.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&fwd.to_line()).unwrap();
+        let inner_id = v
+            .get("body")
+            .and_then(|b| b.get("id"))
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_owned();
+        assert!(inner_id.starts_with("gate-"));
+
+        // Cancel by the OUTER (kernel correlation) id.
+        let cancel = json!({
+            "kind": "tool-gate.tool.cancel",
+            "id": "r16/cap-2"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        handle_tool_cancel(&tx, &cancel, &state).await.unwrap();
+
+        let msg = rx.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
+        let body = v.get("body").unwrap();
+        assert_eq!(
+            body.get("kind").and_then(Value::as_str),
+            Some("basic-tools.tool.cancel"),
+            "cancel is forwarded to the owning source"
+        );
+        assert_eq!(
+            body.get("id").and_then(Value::as_str),
+            Some(inner_id.as_str()),
+            "forwarded under the gate's inner id, matching the forwarded invoke"
+        );
+        // The forward is kept so the real (cancelled) result still correlates.
+        assert!(state.pending.contains_key(&inner_id));
+    }
+
+    #[tokio::test]
+    async fn tool_cancel_for_unknown_outer_id_is_a_noop() {
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+        let state = make_state();
+        let cancel = json!({ "kind": "tool-gate.tool.cancel", "id": "nope" })
+            .as_object()
+            .unwrap()
+            .clone();
+        handle_tool_cancel(&tx, &cancel, &state).await.unwrap();
+        drop(tx);
+        assert!(rx.recv().await.is_none());
     }
 
     #[tokio::test]

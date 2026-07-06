@@ -310,6 +310,9 @@ local function new_run_context(meta)
   ctx.router = router
   ctx.modlog = mlog
   ctx.observer = obs
+  -- Exposed so init-level control ops (interrupt_run) can emit run-scoped
+  -- lifecycle events through the same run_id-stamping sink the observer uses.
+  ctx.emit_event = emit_event
   return ctx
 end
 
@@ -432,6 +435,29 @@ return {
       return false
     end
     return ctx.router:drain(id)
+  end,
+
+  -- Interrupt a live run WITHOUT killing it (the control-plane double-Esc /
+  -- graceful interrupt — contrast end_run). Settles every in-flight capability
+  -- correlation in the run as a failed reply "interrupted by user" and emits a
+  -- `tool.cancel` for each so the real work stops (routing.lua interrupt); the
+  -- failure routes through the normal tool-failure path (run-tool → tool-result
+  -- → llm re-fire), so the run stays alive and winds down to a real final
+  -- answer. Returns { ok = true, interrupted = <count> }; an unknown run
+  -- rejects. A run with nothing in flight interrupts cleanly (count 0).
+  interrupt_run = function(run_id, failure)
+    local ctx, err = context_of(run_id)
+    if not ctx then
+      return { ok = false, error = err }
+    end
+    local settled = ctx.router:interrupt(failure)
+    -- Observable interrupt marker for the panel/transcript (run_id-stamped by
+    -- the sink). Not a kill: no actor_killed, the run continues.
+    ctx.emit_event({
+      kind = "mag.run_interrupted",
+      interrupted = settled,
+    })
+    return { ok = true, interrupted = settled }
   end,
 
   -- End a run: reap its live actors through the fold (kill handlers run —

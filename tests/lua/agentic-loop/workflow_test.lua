@@ -478,23 +478,52 @@ do
   assert_eq(#seeded, 2, "the promoted turn seeds the finished turn's history")
 end
 
--- (interrupt_all) double-Esc kills the run AND drops the queued inputs.
+-- (interrupt_all = graceful) double-Esc GRACEFULLY interrupts the run (not a
+-- kill) and drops the queued inputs. The run SURVIVES and winds down to a
+-- completed turn that records its own history — the amnesia is structurally
+-- gone, because there is no killed-without-record turn on this path.
 do
   fresh_loop()
-  local exec = begin_bound_turn("first", "r8")
+  local exec = begin_bound_turn("run a long bash", "r8")
   send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "queued" })
   _test.calls_clear()
   send_to_loop("nefor-tui", { kind = "chat.interrupt_all" })
   local calls = decode_calls()
-  assert(find_kind(calls, "mag.kill_run") ~= nil,
-    "interrupt_all kills the active run")
+
+  -- graceful interrupt, NOT a kill
+  local interrupt = find_kind(calls, "mag.interrupt_run")
+  assert(interrupt ~= nil, "interrupt_all emits mag.interrupt_run for the active run")
+  assert_eq(interrupt.target, "mag", "interrupt targets the mag plugin")
+  assert_eq(interrupt.body.run_id, exec.body.run_id, "interrupt names the active run")
+  assert_eq(find_kind(calls, "mag.kill_run"), nil,
+    "double-Esc no longer kills the run")
+
+  -- a transcript notice is rendered
+  local notice = find_call(calls, "chat.message.append", "system", "interrupted by user")
+  assert(notice ~= nil, "double-Esc renders an interrupt notice in the transcript")
+
+  -- the run is still active — a new submit queues rather than dispatching.
   _test.calls_clear()
-  send_to_loop("mag", {
-    kind = "mag.run_result", run_id = exec.body.run_id, status = "killed",
-  })
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "post" })
   calls = decode_calls()
   assert_eq(find_kind(calls, "mag.execute"), nil,
-    "interrupt_all dropped the queued input — nothing dispatches after the kill")
+    "the interrupted run is still active — a fresh submit queues, not dispatches")
+
+  -- the interrupted turn winds down COMPLETED (the lead re-fired with the
+  -- interrupted tool result and produced a final answer): history records
+  -- itself and turn_recorded fires. This is the amnesia fix.
+  _test.calls_clear()
+  send_to_loop("mag", {
+    kind = "mag.run_result", run_id = exec.body.run_id,
+    status = "completed", result = { text = "stopped as you asked" },
+  })
+  calls = decode_calls()
+  local recorded = find_kind(calls, "agentic_loop.turn_recorded")
+  assert(recorded ~= nil, "the interrupted-but-completed turn records its history marker")
+  assert_eq(recorded.body.user, "run a long bash",
+    "the marker carries the ORIGINAL user message (the interrupted turn IS in history)")
+  assert_eq(#agentic_loop.history(), 2,
+    "history gains the {user, answer} pair — the interrupted turn is remembered")
 end
 
 -- (relay) a dispatched run's completion relays as a fresh turn through

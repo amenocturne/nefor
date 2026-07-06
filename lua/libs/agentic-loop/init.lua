@@ -29,15 +29,21 @@
 -- keys the lead's gated tool invocations (`<scope>/cap-N`) into
 -- `chat.tool.start` / `chat.tool.end` transcript events.
 --
--- Interrupt = kill: Esc (`chat.interrupt` / `chat.interrupt_all`) kills the
--- active run via `mag.kill_run`; the kernel reaps the constellation through
--- the fold (provider cancels fire) and settles the turn as
--- `mag.run_result status:"killed"` — turn aborted, no history append.
+-- Interrupt semantics split by gesture:
+--   * Single-Esc (`chat.interrupt`) still KILLS the active run via
+--     `mag.kill_run` — the kernel reaps the constellation and settles the turn
+--     as `mag.run_result status:"killed"` (turn aborted, no history append).
+--   * Double-Esc (`chat.interrupt_all`) GRACEFULLY interrupts via
+--     `mag.interrupt_run`: the kernel settles the in-flight capability as a
+--     failed "interrupted by user" result and cancels the real work, the lead
+--     re-fires and winds the turn down to a real final answer, and the turn
+--     closes through the normal `completed` path — so history records itself
+--     and the amnesia is gone.
 --
 -- Inbound dispatch:
 --   * `chat.input.submit { text }`       — spawn a turn-program (or queue)
 --   * `chat.interrupt`                   — Esc; kill the active lead run
---   * `chat.interrupt_all`               — double-Esc; kill + drop queues
+--   * `chat.interrupt_all`               — double-Esc; graceful interrupt + drop queues
 --   * `chat.reset`                       — /new: clear state + history
 --   * `chat.model.set`                   — runtime model switch
 --   * `mag.loaded` / `mag.error`         — the turn-program load handshake
@@ -554,27 +560,54 @@ local function kill_active_lead_run()
   return true
 end
 
+-- Graceful interrupt of the active lead run (the double-Esc path — NOT a
+-- kill). The kernel settles whatever capability the run is blocked on as a
+-- failed "interrupted by user" result and cancels the real work (a bash
+-- subprocess dies, a provider round aborts); the lead re-fires with that
+-- failure in context and winds the turn down with a real final answer. The run
+-- SURVIVES — `current_run_id` stays set — so the turn closes through the normal
+-- `mag.run_result status:"completed"` path: history records itself and
+-- `agentic_loop.turn_recorded` rides the bus. That is what structurally kills
+-- the amnesia: there is no killed-without-record turn on this path.
+local function interrupt_active_lead_run()
+  if state.current_run_id == nil then return false end
+  emit("mag", { kind = "mag.interrupt_run", run_id = state.current_run_id })
+  nefor.log.info("agentic-loop: graceful interrupt requested for active lead run", {
+    run_id = state.current_run_id,
+  })
+  return true
+end
+
 -- Single-Esc: abort the current turn.
 local function cancel()
   kill_active_lead_run()
 end
 
--- Double-Esc / interrupt-all: abort the current turn and drop everything
--- queued behind it. The deferred relay queue is kept (matching the prior
--- behaviour): a dispatched run's completion still reaches the model on
--- the next submit.
+-- Double-Esc / interrupt-all: gracefully interrupt the current turn and drop
+-- everything queued behind it. Unlike the old kill path, the run is NOT killed
+-- — it winds down to a final answer, so we keep `current_run_id` and do NOT
+-- force idle (the run is still working; it settles through the normal
+-- completed path). The deferred relay queue is kept (matching the prior
+-- behaviour): a dispatched run's completion still reaches the model on the next
+-- submit. A transcript notice makes the interrupt visible.
 local function cancel_all()
-  local killed = kill_active_lead_run()
+  local interrupted = interrupt_active_lead_run()
   local dropped_inputs = #state.pending_user_inputs
   state.pending_user_inputs = {}
-  emit_idle_state("cancelled")
-  nefor.log.info("agentic-loop: cancel_all", {
-    killed_lead_run = killed,
+  if interrupted then
+    emit("nefor-tui", {
+      kind = "chat.message.append",
+      role = "system",
+      text = "[interrupted by user — cancelling in-flight work]",
+    })
+  end
+  nefor.log.info("agentic-loop: cancel_all (graceful interrupt)", {
+    interrupted_lead_run = interrupted,
     deferred_queued = #state.deferred_queue,
     dropped_pending_inputs = dropped_inputs,
   })
   return {
-    chat = killed,
+    chat = interrupted,
     deferred = #state.deferred_queue,
     pending_inputs = dropped_inputs,
   }

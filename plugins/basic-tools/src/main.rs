@@ -23,15 +23,24 @@
 mod error;
 mod tools;
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use nefor_plugin_sdk::{await_ready_ok, spawn_stdin_reader, spawn_stdout_writer, TransportError};
 use nefor_protocol::{Body, Envelope, PluginOutgoing, SystemBody};
 use serde_json::{Map, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::error::ToolError;
-use crate::tools::{run_tool, TOOLS};
+use crate::tools::{bash, run_tool, TOOLS};
 
 const CHANNEL_CAP: usize = 256;
+
+/// In-flight cancellable invocations, keyed by the invoke id. Only `bash`
+/// registers here (it is the one tool that holds a killable OS process); a
+/// `basic-tools.tool.cancel { id }` fires the matching sender, which trips the
+/// running task's cancel arm and kills the child's process group.
+type Cancels = Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>;
 
 /// NCP version this plugin speaks.
 const PROTOCOL_VERSION: &str = "0.1";
@@ -110,6 +119,7 @@ async fn run_dispatch_loop(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     in_rx: &mut mpsc::Receiver<Result<Envelope, TransportError>>,
 ) -> Result<(), TransportError> {
+    let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
     loop {
         tokio::select! {
             maybe = in_rx.recv() => {
@@ -124,7 +134,9 @@ async fn run_dispatch_loop(
                         }
                         Body::Event(map) => {
                             if is_tool_invoke_event(map) {
-                                spawn_tool_invoke(out_tx, map);
+                                spawn_tool_invoke(out_tx, map, &cancels);
+                            } else if is_tool_cancel_event(map) {
+                                handle_tool_cancel(&cancels, map);
                             } else {
                                 dispatch_event(out_tx, map).await?;
                             }
@@ -159,7 +171,7 @@ async fn dispatch_event(
         None => return Ok(()),
     };
     if is_tool_invoke_kind(kind) {
-        handle_tool_invoke(out_tx, body).await?;
+        handle_tool_invoke(out_tx, body, None).await?;
     }
     Ok(())
 }
@@ -174,12 +186,65 @@ fn is_tool_invoke_kind(kind: &str) -> bool {
     kind == format!("{PLUGIN_NAME}.tool.invoke")
 }
 
-fn spawn_tool_invoke(out_tx: &mpsc::Sender<PluginOutgoing>, body: &Map<String, Value>) {
+fn is_tool_cancel_event(body: &Map<String, Value>) -> bool {
+    body.get("kind").and_then(Value::as_str) == Some(format!("{PLUGIN_NAME}.tool.cancel").as_str())
+}
+
+/// Handle a `basic-tools.tool.cancel { id }` (the gate forwards the kernel's
+/// interrupt cancel for the in-flight firing id). Fire the matching sender so
+/// the running bash task kills its process group and returns
+/// [`ToolError::Cancelled`]. No entry means the invocation already finished
+/// (or was never a bash) — a clean no-op.
+fn handle_tool_cancel(cancels: &Cancels, body: &Map<String, Value>) {
+    let id = match body.get("id").and_then(Value::as_str) {
+        Some(i) => i,
+        None => return,
+    };
+    let taken = cancels.lock().expect("cancels mutex poisoned").remove(id);
+    match taken {
+        Some(tx) => {
+            // Err means the task already completed and dropped its receiver —
+            // nothing left to cancel.
+            let _ = tx.send(());
+            tracing::info!(id = %id, "tool.cancel: signalled in-flight bash to terminate");
+        }
+        None => {
+            tracing::info!(id = %id, "tool.cancel: no in-flight cancellable invocation; no-op");
+        }
+    }
+}
+
+fn spawn_tool_invoke(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    body: &Map<String, Value>,
+    cancels: &Cancels,
+) {
     let out_tx = out_tx.clone();
     let body = body.clone();
+    let cancels = Arc::clone(cancels);
+    // Register a cancel channel only for bash (the one tool with a killable
+    // process). The id must be present to correlate a cancel back.
+    let id = body.get("id").and_then(Value::as_str).map(str::to_owned);
+    let is_bash = body.get("name").and_then(Value::as_str) == Some(bash::NAME);
+    let cancel_rx = match (&id, is_bash) {
+        (Some(id), true) => {
+            let (tx, rx) = oneshot::channel();
+            cancels
+                .lock()
+                .expect("cancels mutex poisoned")
+                .insert(id.clone(), tx);
+            Some(rx)
+        }
+        _ => None,
+    };
     tokio::spawn(async move {
-        if let Err(e) = handle_tool_invoke(&out_tx, &body).await {
+        if let Err(e) = handle_tool_invoke(&out_tx, &body, cancel_rx).await {
             tracing::error!(error = %e, "tool.invoke task failed");
+        }
+        // Clear the registration on completion so a late cancel is a no-op and
+        // the map doesn't leak finished invocations.
+        if let Some(id) = id {
+            cancels.lock().expect("cancels mutex poisoned").remove(&id);
         }
     });
 }
@@ -187,6 +252,7 @@ fn spawn_tool_invoke(out_tx: &mpsc::Sender<PluginOutgoing>, body: &Map<String, V
 async fn handle_tool_invoke(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: &Map<String, Value>,
+    cancel: Option<oneshot::Receiver<()>>,
 ) -> Result<(), TransportError> {
     // `id` is the caller's correlation token. If it's missing we can't
     // reply usefully — log and drop. (A v2 protocol could surface this as
@@ -234,7 +300,16 @@ async fn handle_tool_invoke(
         return Ok(());
     }
 
-    match run_tool(&name, &args).await {
+    // bash gets the cancellable path (it holds a killable OS process); every
+    // other tool is a pure fast read with nothing to abort.
+    let outcome = if name == bash::NAME {
+        bash::run_cancellable(&args, cancel)
+            .await
+            .map(Value::String)
+    } else {
+        run_tool(&name, &args).await
+    };
+    match outcome {
         Ok(output) => {
             send_event(out_tx, tool_result_ok_body(&id, output)).await?;
         }
@@ -577,8 +652,9 @@ mod tests {
         .expect("obj")
         .clone();
 
-        spawn_tool_invoke(&out_tx, &slow);
-        spawn_tool_invoke(&out_tx, &fast);
+        let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
+        spawn_tool_invoke(&out_tx, &slow, &cancels);
+        spawn_tool_invoke(&out_tx, &fast, &cancels);
 
         let first = recv_result_body(&mut out_rx).await;
         let second = recv_result_body(&mut out_rx).await;

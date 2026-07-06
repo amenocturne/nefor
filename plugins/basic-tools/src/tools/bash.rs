@@ -28,6 +28,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 use crate::error::ToolError;
@@ -67,8 +68,21 @@ pub fn schema() -> Value {
 }
 
 pub async fn run(args: &Value) -> Result<String, ToolError> {
+    run_cancellable(args, None).await
+}
+
+/// Run `bash`, but abortable: when `cancel` fires (the double-Esc interrupt
+/// path — main.rs forwards `basic-tools.tool.cancel` for the in-flight invoke
+/// id), the child's whole process group is killed so grandchildren (the
+/// `sleep` inside `sleep 10 && echo`) die too, and the call returns
+/// [`ToolError::Cancelled`]. A `None` receiver is the ordinary, un-cancellable
+/// invocation.
+pub async fn run_cancellable(
+    args: &Value,
+    cancel: Option<oneshot::Receiver<()>>,
+) -> Result<String, ToolError> {
     let parsed = parse_args(args)?;
-    run_command(parsed).await
+    run_command(parsed, cancel).await
 }
 
 #[derive(Debug)]
@@ -136,7 +150,10 @@ fn parse_args(args: &Value) -> Result<ParsedArgs, ToolError> {
     })
 }
 
-async fn run_command(parsed: ParsedArgs) -> Result<String, ToolError> {
+async fn run_command(
+    parsed: ParsedArgs,
+    cancel: Option<oneshot::Receiver<()>>,
+) -> Result<String, ToolError> {
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg(&parsed.command);
     if let Some(dir) = &parsed.cwd {
@@ -150,18 +167,28 @@ async fn run_command(parsed: ParsedArgs) -> Result<String, ToolError> {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
+    // Put the child in its OWN process group (leader, so pgid == child pid).
+    // A bare `kill_on_drop` only SIGKILLs the direct `/bin/sh`; the shell's
+    // own children (`sleep` in `sleep 10 && echo`) would survive as orphans —
+    // exactly the incident. A group of its own lets the cancel path `killpg`
+    // the whole subtree at once.
+    #[cfg(unix)]
+    cmd.process_group(0);
 
     let mut child = cmd.spawn().map_err(|e| ToolError::Io {
         path: parsed.command.clone(),
         message: format!("spawning /bin/sh: {e}"),
     })?;
+    // Capture the pid (== pgid, group leader) before the child is moved into
+    // the collect future, so the cancel arm can signal the group.
+    let child_pid = child.id();
     let stdin_pipe = child.stdin.take();
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
 
     let dur = Duration::from_millis(parsed.timeout_ms);
     let stdin_text = parsed.stdin.clone();
-    let collect = async {
+    let collect = async move {
         let mut out_buf = Vec::new();
         let mut err_buf = Vec::new();
         // Write stdin concurrently with the output reads (a large input
@@ -183,20 +210,46 @@ async fn run_command(parsed: ParsedArgs) -> Result<String, ToolError> {
         (out_buf, err_buf, status)
     };
 
-    match timeout(dur, collect).await {
-        Ok((out_buf, err_buf, status)) => {
-            let combined = format_output(&out_buf, &err_buf, status_code(&status));
-            Ok(combined)
+    // Pends forever when there is no cancel channel, so the select collapses
+    // to the plain timeout path for an ordinary invocation.
+    let cancelled = async move {
+        match cancel {
+            Some(rx) => {
+                let _ = rx.await;
+            }
+            None => std::future::pending::<()>().await,
         }
-        Err(_elapsed) => {
-            // child was moved into the inner future; on a timeout the future
-            // is dropped, kill_on_drop fires and the OS reaps the child. We
-            // can't recover the partial output here without restructuring;
-            // best we can do is report the timeout cleanly.
-            Err(ToolError::BashTimeout {
-                timeout_ms: parsed.timeout_ms,
-                output: format!("(killed after {}ms)", parsed.timeout_ms),
-            })
+    };
+
+    tokio::select! {
+        result = timeout(dur, collect) => match result {
+            Ok((out_buf, err_buf, status)) => {
+                Ok(format_output(&out_buf, &err_buf, status_code(&status)))
+            }
+            Err(_elapsed) => {
+                // child was moved into the inner future; on a timeout the
+                // future is dropped, kill_on_drop fires and the OS reaps the
+                // child. We can't recover the partial output here without
+                // restructuring; best we can do is report the timeout cleanly.
+                Err(ToolError::BashTimeout {
+                    timeout_ms: parsed.timeout_ms,
+                    output: format!("(killed after {}ms)", parsed.timeout_ms),
+                })
+            }
+        },
+        _ = cancelled => {
+            // Kill the whole process group (the shell AND its children). The
+            // collect future is dropped when this arm wins, so kill_on_drop
+            // also SIGKILLs the shell; killpg is what reaches the grandchildren.
+            #[cfg(unix)]
+            if let Some(pid) = child_pid {
+                // Safe: a bare kill(2)-family syscall on an integer pid.
+                unsafe {
+                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+            let _ = child_pid; // referenced on non-unix to avoid a warning
+            Err(ToolError::Cancelled)
         }
     }
 }
@@ -320,6 +373,52 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::BadArgs { .. }));
+    }
+
+    #[tokio::test]
+    async fn cancel_kills_the_process_group_before_the_child_completes() {
+        use tokio::sync::oneshot;
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker");
+        let marker_str = marker.to_str().unwrap().to_owned();
+        // The shell sleeps, THEN touches the marker. If cancel only killed the
+        // `/bin/sh` and left `sleep` orphaned, the marker would appear after
+        // the sleep elapses. A process-group kill takes the `sleep` with it,
+        // so the marker never lands.
+        let cmd = format!("sleep 2 && touch {marker_str}");
+
+        let (tx, rx) = oneshot::channel();
+        let handle =
+            tokio::spawn(
+                async move { run_cancellable(&json!({ "command": cmd }), Some(rx)).await },
+            );
+
+        // Let the child spawn, then cancel well before the sleep would finish.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        tx.send(()).unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(
+            matches!(result, Err(ToolError::Cancelled)),
+            "cancel must return ToolError::Cancelled, got: {result:?}"
+        );
+
+        // Wait past the original sleep: a surviving orphan would touch it here.
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert!(
+            !marker.exists(),
+            "the child process group must be dead — the sleep's touch must never land"
+        );
+    }
+
+    #[tokio::test]
+    async fn none_cancel_receiver_runs_normally() {
+        let out = run_cancellable(&json!({ "command": "echo hi" }), None)
+            .await
+            .unwrap();
+        assert!(out.contains("hi"));
+        assert!(out.contains("[exit 0]"));
     }
 
     #[test]

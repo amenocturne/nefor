@@ -211,6 +211,29 @@ local function on_run_result(body)
   return true
 end
 
+-- Graceful interrupt (the double-Esc path): the gate forwards
+-- `lead-workflow.tool.cancel { id = firing_id }` when the lead's interrupt
+-- cancels a mag-eval capability. Find the sub-run this firing dispatched and
+-- interrupt IT — `mag.interrupt_run` cancels the sub-run's in-flight bash (its
+-- child process group dies) and settles the sub-run as failed. The sub-run's
+-- terminal `mag.run_result` then flows back through `on_run_result` as the tool
+-- result, which drops at the lead's already-settled correlation. pending_runs
+-- is KEPT so on_run_result cleans it up — this only propagates the cancel down.
+-- Returns true when a matching sub-run was found.
+function M.cancel(firing_id)
+  if type(firing_id) ~= "string" then
+    return false
+  end
+  local hit = false
+  for run_id, pending in pairs(state.pending_runs) do
+    if pending.firing_id == firing_id then
+      emit_as(SOURCE_NAME, "mag", { kind = "mag.interrupt_run", run_id = run_id })
+      hit = true
+    end
+  end
+  return hit
+end
+
 -- A session ending mid-eval must not strand the blocked firing: fail every
 -- pending firing and kill the in-flight runs (the kernel reaps their actors
 -- through the fold). Never consumes the envelope — init.lua's own

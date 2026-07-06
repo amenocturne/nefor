@@ -99,6 +99,7 @@ use std::collections::HashMap;
 use serde_json::{Map, Value};
 
 const TOOL_INVOKE: &str = "tool.invoke";
+const TOOL_CANCEL: &str = "tool.cancel";
 const RESULT_SUFFIX: &str = ".chat.complete.result";
 const ERROR_SUFFIX: &str = ".chat.error";
 
@@ -152,7 +153,11 @@ impl CapabilityBridge {
     /// `<gate>.tool.invoke` contract; everything else — lifecycle events, the
     /// raw kill-time cancel envelope — passes through untouched.
     pub fn translate_emit(&mut self, body: Map<String, Value>) -> Vec<Map<String, Value>> {
-        if body.get("kind").and_then(Value::as_str) != Some(TOOL_INVOKE) {
+        let kind = body.get("kind").and_then(Value::as_str);
+        if kind == Some(TOOL_CANCEL) {
+            return self.translate_cancel(&body);
+        }
+        if kind != Some(TOOL_INVOKE) {
             return vec![body];
         }
         let chat_id = body
@@ -199,6 +204,30 @@ impl CapabilityBridge {
             },
         );
         out
+    }
+
+    /// Translate the kernel's interrupt `tool.cancel { id }` (routing.lua
+    /// interrupt emits one per open capability correlation) onto the dialect
+    /// the owning capability actually speaks — symmetric with the invoke path:
+    ///
+    /// * A correlation that names a driven PROVIDER chat (its `request_id` is
+    ///   in `pending`) becomes `<provider>.chat.cancel { chat_id }`, the abort
+    ///   the llm factory's own kill handler emits (§2.4). We do NOT drop the
+    ///   pending chat: its result/error still arrives and resolves the (now
+    ///   kernel-settled) correlation to nothing, one request one reply.
+    /// * Otherwise it is a TOOL correlation → `<gate>.tool.cancel { id }`, which
+    ///   the gate forwards to the owning source under its inner id.
+    fn translate_cancel(&self, body: &Map<String, Value>) -> Vec<Map<String, Value>> {
+        let id = match body.get("id").and_then(Value::as_str) {
+            Some(id) => id,
+            None => return Vec::new(),
+        };
+        for (chat_id, pending) in &self.pending {
+            if pending.request_id == id {
+                return vec![chat_cancel_envelope(&pending.provider, chat_id)];
+            }
+        }
+        vec![gate_cancel(&self.gate, id)]
     }
 
     /// Whether an inbound event kind is a provider reply the bridge may own.
@@ -285,6 +314,28 @@ fn gate_invoke(gate: &str, body: &Map<String, Value>) -> Map<String, Value> {
             _ => {}
         }
     }
+    m
+}
+
+/// Rewrite a tool-leg `tool.cancel` onto the gate's cancel contract
+/// (`<gate>.tool.cancel { id }`), the id being the kernel correlation the gate
+/// echoes as the forward's outer id.
+fn gate_cancel(gate: &str, id: &str) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("kind".into(), Value::String(format!("{gate}.tool.cancel")));
+    m.insert("id".into(), Value::String(id.to_owned()));
+    m
+}
+
+/// The provider abort envelope, keyed by the chat handle — the same shape the
+/// llm factory's kill handler inlines (`<provider>.chat.cancel { chat_id }`).
+fn chat_cancel_envelope(provider: &str, chat_id: &str) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert(
+        "kind".into(),
+        Value::String(format!("{provider}.chat.cancel")),
+    );
+    m.insert("chat_id".into(), Value::String(chat_id.to_owned()));
     m
 }
 
@@ -546,6 +597,44 @@ mod tests {
         );
         assert_eq!(gate.get("name").and_then(Value::as_str), Some("read_file"));
         assert_eq!(gate.get("args"), Some(&json!({ "path": "/etc/hosts" })));
+    }
+
+    #[test]
+    fn tool_cancel_for_a_tool_correlation_rewrites_to_the_gate() {
+        let mut bridge = CapabilityBridge::new(GATE);
+        // No provider chat named this id → a tool correlation.
+        let out = bridge.translate_emit(obj(json!({
+            "kind": "tool.cancel", "id": "r16/cap-2"
+        })));
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].get("kind").and_then(Value::as_str),
+            Some("tool-gate.tool.cancel")
+        );
+        assert_eq!(out[0].get("id").and_then(Value::as_str), Some("r16/cap-2"));
+    }
+
+    #[test]
+    fn tool_cancel_for_a_provider_correlation_becomes_a_chat_cancel() {
+        let mut bridge = CapabilityBridge::new(GATE);
+        // Drive a provider chat so the correlation id maps to a chat handle.
+        bridge.translate_emit(obj(json!({
+            "kind": "tool.invoke", "id": "corr-9", "name": "chatgpt-provider",
+            "args": { "chat_id": "lead.llm@r1", "input": { "messages": [] } }
+        })));
+        let out = bridge.translate_emit(obj(json!({
+            "kind": "tool.cancel", "id": "corr-9"
+        })));
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].get("kind").and_then(Value::as_str),
+            Some("chatgpt-provider.chat.cancel"),
+            "a provider-round interrupt aborts the driven chat"
+        );
+        assert_eq!(
+            out[0].get("chat_id").and_then(Value::as_str),
+            Some("lead.llm@r1")
+        );
     }
 
     #[test]

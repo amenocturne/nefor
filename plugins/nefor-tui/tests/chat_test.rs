@@ -2112,6 +2112,23 @@ fn double_escape_after_lead_stops_emits_interrupt_all() {
         out.contains("MAG mag-run-"),
         "interrupted run should still render (lingering) after local mark: {out:?}"
     );
+
+    // The graceful interrupt renders a transcript notice: agentic-loop emits a
+    // system `chat.message.append` when it fires `mag.interrupt_run`. Feed that
+    // back the way the loop would and assert it paints in the transcript.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.message.append",
+            "role": "system",
+            "text": "[interrupted by user — cancelling in-flight work]",
+        }),
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("interrupted by user"),
+        "double-Esc's interrupt notice renders in the transcript: {out:?}"
+    );
 }
 
 #[test]

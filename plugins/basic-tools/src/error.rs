@@ -92,4 +92,10 @@ pub enum ToolError {
         /// Combined stdout+stderr captured before the kill.
         output: String,
     },
+
+    /// The invocation was cancelled by the user (double-Esc interrupt): the
+    /// child process group was killed. The message is what the caller sees on
+    /// the wire as `tool.result { error }`.
+    #[error("cancelled by user")]
+    Cancelled,
 }
