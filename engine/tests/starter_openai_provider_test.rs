@@ -69,7 +69,7 @@ fn replay_window_re_feeds_chat_history_into_provider_binary() {
     // just returns the spec table; we drive `to_plugin` directly.
     lua.load(
         r#"
-        local op = require("compositors.provider")
+        local op = require("libs.compositors.provider")
         local spec = op.spawn_spec("ollama", { "/bin/true" }, { agentic_loop = {} })
         _to_plugin = spec.to_plugin
         _replay = require("core.history_replay")
@@ -193,7 +193,7 @@ fn cross_wrapper_isolation_unowned_chat_ids_drop() {
 
     lua.load(
         r#"
-        local op = require("compositors.provider")
+        local op = require("libs.compositors.provider")
         local al_stub = {}
         -- mock_provider chats and ollama chats use independent spawn_spec
         -- instances; the two actor instances don't share state.
@@ -325,7 +325,7 @@ fn in_process_resume_skips_live_owned_provider_refeed() {
 
     lua.load(
         r#"
-        local op = require("compositors.provider")
+        local op = require("libs.compositors.provider")
         _to_plugin = op.spawn_spec("ollama", { "/bin/true" }, { agentic_loop = {} }).to_plugin
         _replay = require("core.history_replay")
         "#,
@@ -411,7 +411,7 @@ fn live_provider_writes_emit_history_facts() {
 
     lua.load(
         r#"
-        local op = require("compositors.provider")
+        local op = require("libs.compositors.provider")
         local spec = op.spawn_spec("ollama", { "/bin/true" }, { agentic_loop = {} })
         _to_plugin = spec.to_plugin
         "#,

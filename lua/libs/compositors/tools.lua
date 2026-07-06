@@ -1,4 +1,4 @@
--- starter/compositors/tools.lua — engine-side actors for the tools domain.
+-- lua/libs/compositors/tools.lua — engine-side actors for the tools domain.
 -- Exposes two spawn specs:
 --
 --   tools.gate_spec(gate_name, command)

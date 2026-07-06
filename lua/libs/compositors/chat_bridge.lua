@@ -1,4 +1,4 @@
--- starter/compositors/chat_bridge.lua — engine-side actor that bridges
+-- lua/libs/compositors/chat_bridge.lua — engine-side actor that bridges
 -- the bus to the nefor-tui plugin binary's stdio. Identity passthrough
 -- on both directions: the binary's outbound envelopes go on the bus
 -- verbatim; inbound envelopes are re-encoded without the framework-only

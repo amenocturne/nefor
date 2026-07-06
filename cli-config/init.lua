@@ -89,7 +89,7 @@ actor.install()
 actor.spawn(sessions)
 sessions.init()
 
-local agentic_cli = require("cli")
+local agentic_cli = require("libs.cli")
 
 -- ------------------------------------------------------------------
 -- Plugin spawn order (mirrors starter/init.lua minus chat/tui).
@@ -117,7 +117,7 @@ actor.spawn(agentic_loop)
 local PROVIDER_NAME  = cfg.provider.name
 local PROVIDER_MODEL = cfg.provider.model
 
-local provider = require("compositors.provider")
+local provider = require("libs.compositors.provider")
 if cfg.plugins.spawn_mock then
   -- mock-plugin uses the same wire protocol as the openai-provider
   -- binary, so the provider actor spec works as-is.
@@ -159,7 +159,7 @@ actor.spawn(actor.identity_spec("mag", {
   "--lua-root", LUA_ROOT,
 }))
 
-local tools = require("compositors.tools")
+local tools = require("libs.compositors.tools")
 local tool_gate_argv = { require("config").bin("tool-gate") }
 for _, t in ipairs(cfg.tool_gate.prompt_tools or {}) do
   tool_gate_argv[#tool_gate_argv + 1] = "--prompt"

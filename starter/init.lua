@@ -311,7 +311,7 @@ agentic_loop.configure {
 }
 actor.spawn(agentic_loop)
 
-local provider = require("compositors.provider")
+local provider = require("libs.compositors.provider")
 for _, p in ipairs(cfg.providers or {}) do
   if p.kind == "mock" then
     -- mock-plugin speaks the same wire protocol as the openai-provider
@@ -388,7 +388,7 @@ actor.spawn(actor.identity_spec("mag", {
   "--lua-root", LUA_ROOT,
 }))
 
-local tools = require("compositors.tools")
+local tools = require("libs.compositors.tools")
 local tool_gate_argv = { require("config").bin("tool-gate") }
 for _, t in ipairs(cfg.tool_gate.auto_tools or {}) do
   tool_gate_argv[#tool_gate_argv + 1] = "--auto"
@@ -427,7 +427,7 @@ actor.spawn(require("tool-validator"))
 actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
 actor.spawn(tools.basic_actor_spec())
 
-actor.spawn(require("compositors.chat_bridge").spawn_spec({
+actor.spawn(require("libs.compositors.chat_bridge").spawn_spec({
   require("config").bin("nefor-tui"),
   "--script", STARTER_ROOT .. "/chat/init.lua",
 }))

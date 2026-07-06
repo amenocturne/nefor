@@ -369,7 +369,7 @@ fn tool_gate_wrapper_swaps_huge_tool_result_output_to_summary() {
     // small tool.result (must pass through verbatim).
     lua.load(
         r#"
-        local tools = require("compositors.tools")
+        local tools = require("libs.compositors.tools")
         local spec = tools.gate_spec("tool-gate", { "fake-binary" }, { agentic_loop = require("agentic-loop") })
         _from_plugin = spec.from_plugin
 
@@ -732,7 +732,7 @@ fn tool_gate_wrapper_emits_instruction_reminder_on_outbound_folder_touching_invo
     lua.load(format!(
         r#"
         require("tool-gate.agents_md")._reset()
-        local tools = require("compositors.tools")
+        local tools = require("libs.compositors.tools")
         local spec = tools.gate_spec("tool-gate", {{ "fake-binary" }}, {{ agentic_loop = require("agentic-loop") }})
         spec.to_plugin({{
             -- Private advertisement teaches the wrapper how to derive folders.

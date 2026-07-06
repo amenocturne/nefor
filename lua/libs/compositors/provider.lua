@@ -1,4 +1,4 @@
--- starter/compositors/provider.lua — engine-side actor for
+-- lua/libs/compositors/provider.lua — engine-side actor for
 -- OpenAI-compatible providers. Threads the openai-provider plugin
 -- lib's translation primitives with starter-owned `agentic-loop`
 -- orchestrator state.
