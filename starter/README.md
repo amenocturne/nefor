@@ -9,7 +9,7 @@ Reference config for the nefor engine. NCP v0.1 protocol semantics live here in 
 - the virtual `agentic-cli` plugin used by `cli-config/init.lua` for `nefor plugin agentic-cli "<prompt>"` now ships in the shared Lua tree at `lua/libs/cli/` (require as `libs.cli`), not here.
 - `agentic-loop/` — the config-owned turn-program (`lead-turn.mag`) plus a re-export shim. The spawner mechanism itself now ships in the shared Lua tree at `lua/libs/agentic-loop/` (require as `libs.agentic-loop`), not here. (The mag kernel likewise ships with the mag plugin at `plugins/mag/lua/mag-kernel/`.)
 - `lead-workflow/` — re-export shims for the lead-workflow mechanism, which now lives in the shared lua tree at `lua/libs/lead-workflow/` (actor plan/approval state, kernel-run tracking, mag-eval tool, and the lead role's prompt loader). The persona prompt itself stays config-owned at `prompts/lead.md`.
-- `sessions/` — session-management actor: boot / shutdown / resume + jsonl persistence over the bus.
+- `sessions/` — a re-export shim; the session-management actor (boot / shutdown / resume + jsonl persistence over the bus) now ships in the shared Lua tree at `lua/libs/sessions/` (require as `libs.sessions`), and `require("sessions")` still resolves through the shim.
 - actor-spec builders per Rust plugin binary (provider, tools) plus the chat-bridge wrapper that hosts `nefor-tui` now ship in the shared Lua tree at `lua/libs/compositors/` and are pulled in as `require("libs.compositors.<m>")`.
 - `mock-provider/` — script the `mock-plugin` binary loads to impersonate an openai-compatible provider with deterministic responses.
 - `config/` — settings table (`require("config").active`) and binary-path resolver.

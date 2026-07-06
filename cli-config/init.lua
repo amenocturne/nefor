@@ -73,7 +73,7 @@ pm.install({
 
 local ncp      = require("core.ncp")
 local actor    = require("core.actor")
-local sessions = require("sessions")
+local sessions = require("libs.sessions")
 local cfg      = require("config").active
 
 function dispatch(current_log)

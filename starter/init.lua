@@ -211,7 +211,7 @@ pm.install({
 local ncp            = require("core.ncp")
 local actor          = require("core.actor")
 local history_replay = require("core.history_replay")
-local sessions       = require("sessions")
+local sessions       = require("libs.sessions")
 local cfg            = require("config").active
 local lead_role      = require("lead-workflow.role")
 
