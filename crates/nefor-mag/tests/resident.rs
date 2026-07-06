@@ -113,3 +113,64 @@ fn unknown_rule_fn_is_an_error() {
     assert!(err.to_string().contains("does-not-exist"), "got: {err}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A rule fn whose body reads a workspace template at fire time. The template
+/// exists only under the program's `source_dir`, never in the process cwd — so
+/// a successful read proves the fire-time env resolves `read` against the
+/// loaded program's `source_dir`, not the process cwd.
+const READ_PROGRAM: &str = r#"
+(type mag.Task)
+(type mag.Done)
+
+(def make-mod
+  (fn [output]
+    {:actors [{:id "spawned" :factory "worker"
+               :params {:tmpl (read "templates/greet.md")}
+               :routes {}}]
+     :messages [{:to "spawned" :content {:kind "go"}}]
+     :kills []
+     :rules []}))
+
+(let [entry (node "adapter" {} : mag.Task -> mag.Done)
+      out   (node "sink" {} : mag.Done -> mag.Done)]
+  (graph
+    entry -> out
+    :terminal out))
+"#;
+
+#[test]
+fn eval_fn_read_resolves_against_source_dir() {
+    let dir = std::env::temp_dir().join(format!("mag-resident-read-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("templates")).expect("mkdir");
+    std::fs::write(dir.join("prog.mag"), READ_PROGRAM).expect("write program");
+    std::fs::write(dir.join("templates/greet.md"), "hello from workspace").expect("write template");
+
+    let program = nefor_mag::load(&dir, "prog.mag").expect("program should load");
+    let modification = nefor_mag::eval_fn(&program, "make-mod", serde_json::json!({}))
+        .expect("rule fn must read the workspace template at fire time");
+    assert_eq!(
+        modification.actors[0].params["tmpl"], "hello from workspace",
+        "read inside a fire-time rule fn must resolve against the program source_dir"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn load_rejects_entry_escaping_the_workspace() {
+    let dir = write_program("entry-escape");
+    let abs = nefor_mag::load(&dir, "/etc/passwd")
+        .err()
+        .expect("an absolute entry must be rejected");
+    assert!(
+        abs.to_string().contains("absolute"),
+        "expected absolute-path rejection, got: {abs}"
+    );
+    let up = nefor_mag::load(&dir, "../prog.mag")
+        .err()
+        .expect("a `..`-escaping entry must be rejected");
+    assert!(
+        up.to_string().contains("path traversal"),
+        "expected traversal rejection, got: {up}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

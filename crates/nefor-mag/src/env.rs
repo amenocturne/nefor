@@ -2,6 +2,7 @@ use crate::ast::Value;
 use crate::error::MagError;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
 pub struct Env {
@@ -12,7 +13,13 @@ pub struct Env {
     /// `bash-2`, …). Env-scoped so ids are deterministic per compilation —
     /// two loads of the same source mint identical ids — unlike the global
     /// `node_N` counter, which only guarantees uniqueness.
-    node_seq: HashMap<String, usize>,
+    ///
+    /// Shared (`Arc<Mutex<…>>`) so that fn-execution envs derived from a
+    /// resident program (see [`Env::child_for_call`]) advance the *same*
+    /// counter across successive `apply_named` calls: repeated rule-fn
+    /// evaluations on one `LoadedProgram` mint monotonic, non-colliding ids
+    /// (`bash-1`, `bash-2`, …) rather than each eval restarting at `bash-1`.
+    node_seq: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl Default for Env {
@@ -27,7 +34,7 @@ impl Env {
             scopes: vec![HashMap::new()],
             source_dir: PathBuf::from("."),
             loading_modules: HashSet::new(),
-            node_seq: HashMap::new(),
+            node_seq: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -66,10 +73,25 @@ impl Env {
             scopes: vec![HashMap::new()],
             source_dir: source_dir.to_path_buf(),
             loading_modules: HashSet::new(),
-            node_seq: HashMap::new(),
+            node_seq: Arc::new(Mutex::new(HashMap::new())),
         };
         env.define_stdlib();
         env
+    }
+
+    /// A child environment for evaluating a fn body: fresh (empty) lexical
+    /// scopes — the closure is overlaid separately, so no dynamic-scope leak
+    /// from the caller — but the program-level execution metadata is carried
+    /// over. `source_dir` so `(read …)` inside the fn resolves against the
+    /// program's workspace (not the process cwd), and the *shared* `node_seq`
+    /// so inline-node ids stay monotonic across repeated evaluations.
+    pub fn child_for_call(&self) -> Self {
+        Self {
+            scopes: vec![HashMap::new()],
+            source_dir: self.source_dir.clone(),
+            loading_modules: self.loading_modules.clone(),
+            node_seq: Arc::clone(&self.node_seq),
+        }
     }
 
     pub fn source_dir(&self) -> &Path {
@@ -144,9 +166,11 @@ impl Env {
     }
 
     /// Next per-factory sequence number for auto-generated inline node ids
-    /// (`<factory>-<n>` in appearance order).
-    pub fn next_node_seq(&mut self, factory: &str) -> usize {
-        let n = self.node_seq.entry(factory.to_string()).or_insert(0);
+    /// (`<factory>-<n>` in appearance order). Interior-mutable via the shared
+    /// counter (recovers a poisoned lock rather than panicking).
+    pub fn next_node_seq(&self, factory: &str) -> usize {
+        let mut seq = self.node_seq.lock().unwrap_or_else(|e| e.into_inner());
+        let n = seq.entry(factory.to_string()).or_insert(0);
         *n += 1;
         *n
     }
@@ -156,7 +180,7 @@ impl Env {
             scopes: vec![HashMap::new()],
             source_dir: self.source_dir.clone(),
             loading_modules: self.loading_modules.clone(),
-            node_seq: HashMap::new(),
+            node_seq: Arc::new(Mutex::new(HashMap::new())),
         };
         env.define_stdlib();
         env

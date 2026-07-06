@@ -57,7 +57,10 @@ const EVAL_STACK: usize = 64 * 1024 * 1024;
 /// [`LOAD_BUDGET`], so a pathological (non-terminating) program errors cleanly
 /// instead of overflowing the stack or hanging.
 pub fn load(source_dir: &Path, entry: &str) -> Result<LoadedProgram, MagError> {
-    let path = source_dir.join(entry);
+    // Same containment check as `read`/`require`: the entry must stay inside the
+    // workspace (an absolute or `..`-escaping entry, or one reached through a
+    // symlink out of the tree, is rejected before any read).
+    let path = eval::resolve_workspace_path(source_dir, entry)?;
     let source = std::fs::read_to_string(&path)
         .map_err(|e| MagError::Eval(format!("cannot read program {}: {e}", path.display())))?;
     run_on_eval_thread(|| {

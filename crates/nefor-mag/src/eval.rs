@@ -164,7 +164,43 @@ fn eval_expr(env: &mut Env, expr: &Expr) -> Result<Value, MagError> {
     }
 }
 
-fn validate_workspace_path(
+/// Canonicalize the longest existing prefix of `path`, re-appending the
+/// not-yet-existing tail. Lets [`resolve_workspace_path`] contain targets that
+/// don't exist yet while still resolving symlinks in the part that does — a
+/// symlinked directory in the prefix canonicalizes to its real location, so a
+/// containment check on the result catches escapes through it.
+fn canonicalize_existing_prefix(path: &std::path::Path) -> std::path::PathBuf {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = path.to_path_buf();
+    loop {
+        if let Ok(canonical) = current.canonicalize() {
+            let mut result = canonical;
+            for part in tail.iter().rev() {
+                result.push(part);
+            }
+            return result;
+        }
+        match current.file_name() {
+            Some(name) => tail.push(name.to_os_string()),
+            None => return path.to_path_buf(),
+        }
+        if !current.pop() {
+            return path.to_path_buf();
+        }
+    }
+}
+
+/// Resolve a workspace-relative path and prove it stays inside the workspace.
+/// The single checker shared by `read`, `require`, and the load entry point.
+///
+/// Two layers: a lexical gate (reject absolute paths and `..` components) for a
+/// clear early error, then a canonicalizing containment check — both the
+/// workspace root and the resolved target are canonicalized, so a symlink
+/// inside the workspace pointing outside it (e.g. `templates/out -> /etc`) is
+/// caught even though the lexical form looks contained. Canonicalizing *both*
+/// sides also keeps tmpdir-based tests working, where the workspace root itself
+/// is reached through a symlink (macOS `/var -> /private/var`).
+pub(crate) fn resolve_workspace_path(
     source_dir: &std::path::Path,
     relative: &str,
 ) -> Result<std::path::PathBuf, MagError> {
@@ -184,7 +220,18 @@ fn validate_workspace_path(
         }
     }
 
-    Ok(source_dir.join(relative))
+    let joined = source_dir.join(path);
+    let canonical_root = source_dir
+        .canonicalize()
+        .unwrap_or_else(|_| source_dir.to_path_buf());
+    let canonical_target = canonicalize_existing_prefix(&joined);
+    if !canonical_target.starts_with(&canonical_root) {
+        return Err(MagError::Eval(format!(
+            "path escapes workspace: {relative}"
+        )));
+    }
+
+    Ok(joined)
 }
 
 fn eval_list(env: &mut Env, items: &[Expr]) -> Result<Value, MagError> {
@@ -219,7 +266,7 @@ fn eval_list(env: &mut Env, items: &[Expr]) -> Result<Value, MagError> {
         Value::BuiltinFn(name) => eval_builtin(env, &name, &items[1..]),
         Value::Fn(fv) => {
             let args: Result<Vec<_>, _> = items[1..].iter().map(|e| eval_expr(env, e)).collect();
-            apply_fn(&fv, &args?)
+            apply_fn(env, &fv, &args?)
         }
         other => Err(MagError::Eval(format!(
             "cannot call value of type {}",
@@ -343,11 +390,11 @@ fn eval_threading(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
     for f_expr in &args[1..] {
         let func = eval_expr(env, f_expr)?;
         match func {
-            Value::Fn(fv) => val = apply_fn(&fv, &[val])?,
+            Value::Fn(fv) => val = apply_fn(env, &fv, &[val])?,
             Value::BuiltinFn(name) => {
                 // Create a synthetic Expr for the arg since builtins expect unevaluated forms
                 // We need to pass the already-evaluated value, so wrap it
-                val = call_builtin_with_values(&name, &[val])?;
+                val = call_builtin_with_values(env, &name, &[val])?;
             }
             other => {
                 return Err(MagError::Eval(format!(
@@ -360,7 +407,7 @@ fn eval_threading(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
     Ok(val)
 }
 
-fn apply_fn(fv: &FnValue, args: &[Value]) -> Result<Value, MagError> {
+fn apply_fn(caller_env: &Env, fv: &FnValue, args: &[Value]) -> Result<Value, MagError> {
     if args.len() != fv.params.len() {
         return Err(MagError::Arity {
             expected: fv.params.len(),
@@ -368,7 +415,11 @@ fn apply_fn(fv: &FnValue, args: &[Value]) -> Result<Value, MagError> {
         });
     }
     let _call = fuel::enter_call()?;
-    let mut fn_env = Env::new();
+    // Derive the execution env from the calling program's env so the fn body
+    // inherits its `source_dir` (workspace-relative `read`/`require`) and its
+    // shared inline-node-id counter — the closure below re-establishes the
+    // lexical bindings, so no dynamic scope leaks in from the caller.
+    let mut fn_env = caller_env.child_for_call();
     // Restore closure
     for (k, v) in &fv.closure {
         fn_env.define(k, v.clone());
@@ -393,7 +444,7 @@ pub fn apply_named(env: &Env, name: &str, arg: Value) -> Result<Value, MagError>
     match env.lookup(name)? {
         Value::Fn(fv) if fv.params.len() == 1 => {
             let fv = fv.clone();
-            apply_fn(&fv, &[arg])
+            apply_fn(env, &fv, &[arg])
         }
         Value::Fn(fv) => Err(MagError::Eval(format!(
             "rule fn '{name}' must be unary, takes {} arguments",
@@ -421,7 +472,7 @@ fn eval_builtin(env: &mut Env, name: &str, args: &[Expr]) -> Result<Value, MagEr
             }
             let f = eval_expr(env, &args[0])?;
             let coll = eval_expr(env, &args[1])?;
-            builtin_map(&f, &coll)
+            builtin_map(env, &f, &coll)
         }
         "filter" => {
             if args.len() != 2 {
@@ -432,7 +483,7 @@ fn eval_builtin(env: &mut Env, name: &str, args: &[Expr]) -> Result<Value, MagEr
             }
             let f = eval_expr(env, &args[0])?;
             let coll = eval_expr(env, &args[1])?;
-            builtin_filter(&f, &coll)
+            builtin_filter(env, &f, &coll)
         }
         "flat-map" => {
             if args.len() != 2 {
@@ -443,7 +494,7 @@ fn eval_builtin(env: &mut Env, name: &str, args: &[Expr]) -> Result<Value, MagEr
             }
             let f = eval_expr(env, &args[0])?;
             let coll = eval_expr(env, &args[1])?;
-            builtin_flat_map(&f, &coll)
+            builtin_flat_map(env, &f, &coll)
         }
         "fold" => {
             if args.len() != 3 {
@@ -455,7 +506,7 @@ fn eval_builtin(env: &mut Env, name: &str, args: &[Expr]) -> Result<Value, MagEr
             let f = eval_expr(env, &args[0])?;
             let init = eval_expr(env, &args[1])?;
             let coll = eval_expr(env, &args[2])?;
-            builtin_fold(&f, init, &coll)
+            builtin_fold(env, &f, init, &coll)
         }
         "concat" => {
             if args.len() != 2 {
@@ -590,7 +641,7 @@ fn eval_builtin(env: &mut Env, name: &str, args: &[Expr]) -> Result<Value, MagEr
                     )))
                 }
             };
-            let full_path = validate_workspace_path(env.source_dir(), &path_str)?;
+            let full_path = resolve_workspace_path(env.source_dir(), &path_str)?;
             let contents = std::fs::read_to_string(&full_path)
                 .map_err(|_| MagError::Eval(format!("file not found: {path_str}")))?;
             if args.len() == 2 {
@@ -620,7 +671,7 @@ fn eval_builtin(env: &mut Env, name: &str, args: &[Expr]) -> Result<Value, MagEr
             let path = path_val
                 .as_str()
                 .ok_or_else(|| MagError::Eval("require expects a string path".into()))?;
-            let full_path = validate_workspace_path(env.source_dir(), &format!("{path}.mag"))?;
+            let full_path = resolve_workspace_path(env.source_dir(), &format!("{path}.mag"))?;
             let canonical = full_path
                 .canonicalize()
                 .unwrap_or_else(|_| full_path.clone());
@@ -643,7 +694,11 @@ fn eval_builtin(env: &mut Env, name: &str, args: &[Expr]) -> Result<Value, MagEr
 }
 
 /// Call a builtin with already-evaluated values (used by threading macro)
-fn call_builtin_with_values(name: &str, args: &[Value]) -> Result<Value, MagError> {
+fn call_builtin_with_values(
+    caller_env: &Env,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, MagError> {
     match name {
         "str" => builtin_str(args),
         "count" => {
@@ -680,7 +735,7 @@ fn call_builtin_with_values(name: &str, args: &[Value]) -> Result<Value, MagErro
                     got: args.len(),
                 });
             }
-            builtin_map(&args[0], &args[1])
+            builtin_map(caller_env, &args[0], &args[1])
         }
         "filter" => {
             if args.len() != 2 {
@@ -689,7 +744,7 @@ fn call_builtin_with_values(name: &str, args: &[Value]) -> Result<Value, MagErro
                     got: args.len(),
                 });
             }
-            builtin_filter(&args[0], &args[1])
+            builtin_filter(caller_env, &args[0], &args[1])
         }
         "flat-map" => {
             if args.len() != 2 {
@@ -698,7 +753,7 @@ fn call_builtin_with_values(name: &str, args: &[Value]) -> Result<Value, MagErro
                     got: args.len(),
                 });
             }
-            builtin_flat_map(&args[0], &args[1])
+            builtin_flat_map(caller_env, &args[0], &args[1])
         }
         "fold" => {
             if args.len() != 3 {
@@ -707,7 +762,7 @@ fn call_builtin_with_values(name: &str, args: &[Value]) -> Result<Value, MagErro
                     got: args.len(),
                 });
             }
-            builtin_fold(&args[0], args[1].clone(), &args[2])
+            builtin_fold(caller_env, &args[0], args[1].clone(), &args[2])
         }
         "concat" => {
             if args.len() != 2 {
@@ -1602,20 +1657,20 @@ fn builtin_str(args: &[Value]) -> Result<Value, MagError> {
     Ok(Value::Str(result))
 }
 
-fn builtin_map(f: &Value, coll: &Value) -> Result<Value, MagError> {
+fn builtin_map(caller_env: &Env, f: &Value, coll: &Value) -> Result<Value, MagError> {
     let items = extract_list(coll)?;
     let mut result = Vec::new();
     for item in items {
-        result.push(apply_value(f, std::slice::from_ref(item))?);
+        result.push(apply_value(caller_env, f, std::slice::from_ref(item))?);
     }
     Ok(Value::List(result))
 }
 
-fn builtin_filter(f: &Value, coll: &Value) -> Result<Value, MagError> {
+fn builtin_filter(caller_env: &Env, f: &Value, coll: &Value) -> Result<Value, MagError> {
     let items = extract_list(coll)?;
     let mut result = Vec::new();
     for item in items {
-        let test = apply_value(f, std::slice::from_ref(item))?;
+        let test = apply_value(caller_env, f, std::slice::from_ref(item))?;
         if is_truthy(&test) {
             result.push(item.clone());
         }
@@ -1623,20 +1678,20 @@ fn builtin_filter(f: &Value, coll: &Value) -> Result<Value, MagError> {
     Ok(Value::List(result))
 }
 
-fn builtin_fold(f: &Value, init: Value, coll: &Value) -> Result<Value, MagError> {
+fn builtin_fold(caller_env: &Env, f: &Value, init: Value, coll: &Value) -> Result<Value, MagError> {
     let items = extract_list(coll)?;
     let mut acc = init;
     for item in items {
-        acc = apply_value(f, &[acc, item.clone()])?;
+        acc = apply_value(caller_env, f, &[acc, item.clone()])?;
     }
     Ok(acc)
 }
 
-fn builtin_flat_map(f: &Value, coll: &Value) -> Result<Value, MagError> {
+fn builtin_flat_map(caller_env: &Env, f: &Value, coll: &Value) -> Result<Value, MagError> {
     let items = extract_list(coll)?;
     let mut result = Vec::new();
     for item in items {
-        let mapped = apply_value(f, std::slice::from_ref(item))?;
+        let mapped = apply_value(caller_env, f, std::slice::from_ref(item))?;
         match mapped {
             Value::List(inner) | Value::Vector(inner) => result.extend(inner),
             other => result.push(other),
@@ -1715,10 +1770,10 @@ fn extract_list(val: &Value) -> Result<&[Value], MagError> {
     }
 }
 
-fn apply_value(f: &Value, args: &[Value]) -> Result<Value, MagError> {
+fn apply_value(caller_env: &Env, f: &Value, args: &[Value]) -> Result<Value, MagError> {
     match f {
-        Value::Fn(fv) => apply_fn(fv, args),
-        Value::BuiltinFn(name) => call_builtin_with_values(name, args),
+        Value::Fn(fv) => apply_fn(caller_env, fv, args),
+        Value::BuiltinFn(name) => call_builtin_with_values(caller_env, name, args),
         other => Err(MagError::Eval(format!(
             "cannot call value of type {}",
             other.type_name()
@@ -2631,5 +2686,76 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A symlink inside the workspace pointing outside it is lexically clean
+    /// (no `..`, not absolute) but must still be rejected: the containment
+    /// check canonicalizes through the symlink and sees the escape.
+    #[cfg(unix)]
+    #[test]
+    fn read_rejects_symlink_escape() {
+        let base = std::env::temp_dir().join(format!("mag_test_symlink_{}", std::process::id()));
+        let workspace = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "escaped").unwrap();
+        // workspace/link -> ../outside (a directory escaping the workspace).
+        std::os::unix::fs::symlink(&outside, workspace.join("link")).unwrap();
+
+        let mut env = Env::new_with_stdlib_and_source_dir(&workspace);
+        let result = eval_with_env(
+            &mut env,
+            vec![Expr::List(vec![
+                Expr::Symbol("read".into()),
+                Expr::Str("link/secret.txt".into()),
+            ])],
+        );
+        assert!(
+            result
+                .as_ref()
+                .err()
+                .map(|e| e.to_string().contains("escapes workspace"))
+                .unwrap_or(false),
+            "symlink escape must be rejected, got: {result:?}"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Inline-node ids (`bash-N`) must stay unique across successive rule-fn
+    /// evaluations on one resident env — the shared counter advances rather
+    /// than each `apply_named` restarting at `bash-1`.
+    #[test]
+    fn sequential_fn_applications_mint_noncolliding_ids() {
+        let mut env = Env::new_with_stdlib();
+        // (def mk (fn [x] (bash "echo hi")))
+        eval_program(
+            &mut env,
+            &[Expr::List(vec![
+                Expr::Symbol("def".into()),
+                Expr::Symbol("mk".into()),
+                Expr::List(vec![
+                    Expr::Symbol("fn".into()),
+                    Expr::Vector(vec![Expr::Symbol("x".into())]),
+                    Expr::List(vec![
+                        Expr::Symbol("bash".into()),
+                        Expr::Str("echo hi".into()),
+                    ]),
+                ]),
+            ])],
+        )
+        .unwrap();
+
+        let id = |v: Value| match v {
+            Value::Node(n) => n.id,
+            other => panic!("expected a node, got {}", other.type_name()),
+        };
+        let first = id(apply_named(&env, "mk", Value::Nil).unwrap());
+        let second = id(apply_named(&env, "mk", Value::Nil).unwrap());
+        assert_ne!(
+            first, second,
+            "sequential evals must mint distinct ids, got {first} then {second}"
+        );
     }
 }
