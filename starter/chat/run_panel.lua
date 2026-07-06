@@ -136,6 +136,9 @@ end
 local function group_of(actor_id)
   return actor_id:match("^([^.]+)") or actor_id
 end
+-- Exported so the composite agent view (popups.lua) can select a group's
+-- members by the same namespace rule the panel groups by.
+M.group_of = group_of
 
 -- Aggregate a group's member states into one status. Precedence, highest
 -- first: killed (any member killed) → running (any member live — working
@@ -203,6 +206,9 @@ local function build_groups(run)
   end)
   return order
 end
+-- Exported for the composite view's header (member count / aggregated
+-- status / activity window of a whole group or run).
+M.build_groups = build_groups
 
 -- Group row. The elapsed window is the WHOLE-RUN clock (first member start →
 -- now while live, frozen at the last finish once terminal) — deliberately
@@ -397,9 +403,18 @@ end
 
 function M.panel(state)
   local now_ms = tui.now_ms()
+  -- Focused pane treatment: the title bar switches to the bright/bold
+  -- highlight vocabulary (popup_user) and carries an explicit focus
+  -- marker, so an active sidebar is unmistakable at a glance. Unfocused
+  -- it reads as quiet chrome (footer), exactly as before. The cursor row
+  -- stays THE in-pane focus indicator (CURSOR_ROW_STYLE, focus-gated in
+  -- panel_children).
+  local focused = state.focus == "sidebar"
+  local title_style = focused and STYLE.popup_user or STYLE.footer
+  local title_text  = focused and "▌ Graph · focused" or "Graph"
   local children = {
-    tui.text { content = "Graph", style = STYLE.footer, wrap = "none" },
-    tui.text { content = string.rep("─", 30), style = STYLE.footer, wrap = "none" },
+    tui.text { content = title_text, style = title_style, wrap = "none" },
+    tui.text { content = string.rep("─", 30), style = title_style, wrap = "none" },
   }
   for _, c in ipairs(panel_children(state, now_ms)) do
     children[#children + 1] = c

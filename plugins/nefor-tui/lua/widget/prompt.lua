@@ -163,14 +163,15 @@ function M.view(opts)
     or  (opts.unfocused_style or opts.border_style)
 
   local input = tui.text_input {
-    key        = opts.key or "prompt",
-    value      = state.value or "",
-    focused    = focused,
-    on_change  = opts.on_change or "prompt.changed",
-    on_submit  = opts.on_submit or "prompt.submit",
-    min_lines  = opts.min_lines or 1,
-    max_lines  = opts.max_lines or 6,
-    selectable = opts.selectable ~= false,
+    key         = opts.key or "prompt",
+    value       = state.value or "",
+    focused     = focused,
+    placeholder = opts.placeholder,
+    on_change   = opts.on_change or "prompt.changed",
+    on_submit   = opts.on_submit or "prompt.submit",
+    min_lines   = opts.min_lines or 1,
+    max_lines   = opts.max_lines or 6,
+    selectable  = opts.selectable ~= false,
   }
 
   local field = util.bordered_box(input, border_style,

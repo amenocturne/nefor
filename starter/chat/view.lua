@@ -124,6 +124,14 @@ function M.render(state)
   -- the completion sources via slash.completions() and reads the
   -- selected match back from state.completion on submit (Enter
   -- promotes the highlighted slash match to its command text).
+  -- When the sidebar owns keys the prompt is dimmed and inactive; its
+  -- placeholder states the way back so the greyed state self-explains
+  -- instead of reading as broken. Shows only while the draft is empty
+  -- (a preserved draft stays visible), which is exactly the confusing
+  -- case.
+  local prompt_placeholder = (not input_focused and state.focus == "sidebar")
+    and "— Tab to return"
+    or nil
   local input_field = W.prompt.view({
     state          = {
       value      = state.input_value,
@@ -131,6 +139,7 @@ function M.render(state)
     },
     key             = "input",
     focused         = input_focused,
+    placeholder     = prompt_placeholder,
     on_change       = "input.changed",
     on_submit       = "input.submit",
     border_style    = input_border_style,

@@ -554,6 +554,21 @@ local function handle_focus_cycle(msg, state)
     return shallow_merge(state, { focus = "prompt" }), {}
   end
   if not state.show_sidebar then return state, {} end
+  -- Empty sidebar refuses focus, loudly: focusing a pane with no
+  -- navigable rows would read as a dead key, so keep prompt focus and
+  -- raise a warning toast that explains the refusal.
+  if #run_panel.row_model(state, tui.now_ms()) == 0 then
+    local toasts = {}
+    for _, t in ipairs(state.toasts or {}) do toasts[#toasts + 1] = t end
+    toasts[#toasts + 1] = {
+      id            = "empty-sidebar-" .. tostring(tui.now_ms()),
+      text          = "can't focus an empty sidebar",
+      level         = "warn",
+      started_at_ms = tui.now_ms(),
+      ttl_ms        = 2500,
+    }
+    return shallow_merge(state, { toasts = toasts }), {}
+  end
   return shallow_merge(state, {
     focus          = "sidebar",
     sidebar_cursor = state.sidebar_cursor or 1,
@@ -1250,6 +1265,25 @@ local function handle_mag_run_complete(msg, state)
   return run_panel.mag_run_complete(state, run_id, "success", tui.now_ms()), {}
 end
 
+-- The tool gate broadcasts `tool-gate.tool.invoke { id, from, name, args }`
+-- for every gated tool call and the correlated `tool.result { id,
+-- output|error }`. `from` is the emitting actor id (e.g. `scout.run-tool`)
+-- and `id` is scope-prefixed (`r<K>/cap-N`), so capture attributes the
+-- invoke straight to (run, actor) and correlates the result back by id.
+-- Buffers feed the composite view; unattributable ids (unknown scope) are
+-- dropped exactly like the chat-stream taps.
+local function handle_gate_tool_invoke(msg, state)
+  if state.replay_mode then return state, {} end
+  return agent_streams.record_tool_invoke(
+    state, msg.from, msg.id, msg.name, msg.args, tui.now_ms()), {}
+end
+
+local function handle_gate_tool_result(msg, state)
+  if state.replay_mode then return state, {} end
+  return agent_streams.record_tool_result(
+    state, msg.id, msg.output, msg.error, tui.now_ms()), {}
+end
+
 local function handle_mouse_selection(msg, state)
   local text = msg.text or ""
   if #text > 0 then
@@ -1318,6 +1352,8 @@ local handlers = {
   ["mag.modification_rejected"]   = handle_mag_modification_rejected,
   ["mag.modification_noop"]       = handle_mag_modification_noop,
   ["mag.run_complete"]            = handle_mag_run_complete,
+  ["tool-gate.tool.invoke"]       = handle_gate_tool_invoke,
+  ["tool.result"]                 = handle_gate_tool_result,
   ["mouse.selection"]             = handle_mouse_selection,
 }
 
@@ -1466,11 +1502,13 @@ local function route_keys_and_popups(msg, state)
     end
   end
 
-  -- Sidebar pane focus (popups above win the keyboard first): Up/Down
-  -- move the cursor over the row model (members of a collapsed group are
-  -- not rows, so the cursor skips them by construction), Enter on a group
-  -- row toggles its fold, Enter on an actor leaf opens the read-only
-  -- agent view. Enter on a run-header row stays a no-op.
+  -- Sidebar pane focus (popups above win the keyboard first). Keys split
+  -- by concern: Enter = STRUCTURE (fold/unfold a group row only; a no-op
+  -- on leaf and run-header rows), Space = OBSERVATION (toggle the row's
+  -- observability view uniformly — a leaf's own timeline, a group's merged
+  -- member timeline, a run-header's whole-run merged timeline). Up/Down
+  -- move the cursor over the row model (folded members are not rows, so
+  -- the cursor skips them by construction).
   if state.focus == "sidebar" and state.popup == nil then
     local now = tui.now_ms()
     if kind == "key.up" or kind == "key.down" then
@@ -1487,13 +1525,27 @@ local function route_keys_and_popups(msg, state)
       if row ~= nil and row.kind == "group" then
         return run_panel.toggle_fold(state, row.run_id, row.group.name), {}
       end
-      if row ~= nil and row.kind == "actor" then
+      -- Leaf and run-header Enter are no-ops: view-opening moved to Space.
+      return state, {}
+    end
+    if kind == "key.space" then
+      local rows = run_panel.row_model(state, now)
+      local row = rows[run_panel.clamp_cursor(state.sidebar_cursor, #rows)]
+      if row == nil then return state, {} end
+      if row.kind == "actor" then
         return shallow_merge(state, {
-          popup = {
-            variant  = "agent_view",
-            run_id   = row.run_id,
-            actor_id = row.actor_id,
-          },
+          popup = { variant = "agent_view", run_id = row.run_id, actor_id = row.actor_id },
+        }), {}
+      elseif row.kind == "group" then
+        return shallow_merge(state, {
+          popup = { variant = "agent_view", run_id = row.run_id, group = row.group.name },
+        }), {}
+      elseif row.kind == "run_header" then
+        -- Run-header Space observes the WHOLE run merged (every actor
+        -- under it) — the natural "observe this run" verb, more useful
+        -- than a no-op.
+        return shallow_merge(state, {
+          popup = { variant = "agent_view", run_id = row.run_id, whole_run = true },
         }), {}
       end
       return state, {}

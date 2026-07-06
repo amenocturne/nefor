@@ -6349,7 +6349,7 @@ fn tab_with_completion_open_completes_instead_of_switching_focus() {
 }
 
 #[test]
-fn sidebar_cursor_skips_folded_members_and_enter_opens_the_leaf_under_it() {
+fn sidebar_cursor_skips_folded_members_and_space_opens_the_leaf_under_it() {
     let mut engine = Engine::new(120, 30).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -6390,8 +6390,8 @@ fn sidebar_cursor_skips_folded_members_and_enter_opens_the_leaf_under_it() {
         "cursor must clamp on the last visible row: {cursor:?}"
     );
 
-    // Enter unfolds writer; Down reaches the now-visible leaf; Enter
-    // opens ITS agent view.
+    // Enter unfolds writer; Down reaches the now-visible leaf; Space
+    // opens ITS agent view (Enter on a leaf is now a no-op).
     engine.handle_key(key("enter")).expect("enter");
     engine.handle_key(key("down")).expect("down");
     let out = render_str(&mut engine);
@@ -6403,13 +6403,20 @@ fn sidebar_cursor_skips_folded_members_and_enter_opens_the_leaf_under_it() {
     engine.handle_key(key("enter")).expect("enter");
     let out = render_str(&mut engine);
     assert!(
+        !out.contains("[read-only]"),
+        "Enter on a leaf must be a no-op — view-opening moved to Space: {out:?}"
+    );
+    engine.handle_key(key("space")).expect("space");
+    let out = render_str(&mut engine);
+    assert!(
         out.contains("agent · writer.draft [read-only]"),
-        "Enter on the leaf must open ITS agent view: {out:?}"
+        "Space on the leaf must open ITS agent view: {out:?}"
     );
     engine.handle_key(key("q")).expect("q");
 
-    // Ten Ups clamp back on row 1 (run header) — Enter there is the
-    // reserved no-op, not a view and not a fold.
+    // Ten Ups clamp back on row 1 (run header) — Enter there is a no-op
+    // (structure key on a non-group row); Space there observes the whole
+    // run, but this test only pins the Enter no-op.
     for _ in 0..10 {
         engine.handle_key(key("up")).expect("up");
     }
@@ -6455,11 +6462,11 @@ fn scoped_streams_are_captured_per_actor_and_stay_out_of_the_transcript() {
         "foreign deltas must stay out of the lead transcript: {out:?}"
     );
 
-    // Tab → unfold the worker group → cursor on the leaf → Enter opens
+    // Tab → unfold the worker group → cursor on the leaf → Space opens
     // the agent view showing the captured buffer.
     focus_worker_leaf(&mut engine);
     engine.take_emit_queue(); // drain — the view must add nothing
-    engine.handle_key(key("enter")).expect("enter");
+    engine.handle_key(key("space")).expect("space");
     let out = render_str(&mut engine);
     assert!(
         out.contains("agent · worker.llm [read-only]"),
@@ -6504,7 +6511,7 @@ fn agent_view_is_read_only_and_closes_back_to_sidebar_then_prompt() {
     // prompt's `focused` flag off the last reconciled tree, and the real
     // event loop repaints after every event), then open the view.
     focus_worker_leaf(&mut engine);
-    engine.handle_key(key("enter")).expect("enter");
+    engine.handle_key(key("space")).expect("space");
     let out = render_str(&mut engine);
     assert!(out.contains("[read-only]"), "view should be open: {out:?}");
     engine.take_emit_queue();
@@ -6530,7 +6537,7 @@ fn agent_view_is_read_only_and_closes_back_to_sidebar_then_prompt() {
     );
 
     // Esc closes back to the sidebar with the cursor preserved on the
-    // same leaf; Enter re-opens the same actor's view.
+    // same leaf; Space re-opens the same actor's view.
     engine.handle_key(key("escape")).expect("escape");
     let out = render_str(&mut engine);
     assert!(
@@ -6542,11 +6549,11 @@ fn agent_view_is_read_only_and_closes_back_to_sidebar_then_prompt() {
         cursor.contains("worker.llm"),
         "cursor must be preserved on the actor row: {cursor:?}"
     );
-    engine.handle_key(key("enter")).expect("enter");
+    engine.handle_key(key("space")).expect("space");
     let out = render_str(&mut engine);
     assert!(
         out.contains("[read-only]"),
-        "Enter must re-open the view for the preserved cursor row: {out:?}"
+        "Space must re-open the view for the preserved cursor row: {out:?}"
     );
 
     // q also closes; a second Esc hands focus back to the prompt. The
@@ -6605,7 +6612,7 @@ fn stale_warning_flags_busy_and_silent_only() {
 
     // And the agent-view header carries the same diagnostic.
     engine.handle_key(key("down")).expect("down");
-    engine.handle_key(key("enter")).expect("enter");
+    engine.handle_key(key("space")).expect("space");
     let out = render_str(&mut engine);
     assert!(
         out.contains("⚠ last event 3") && out.contains("(delta)"),
@@ -6643,7 +6650,7 @@ fn unscoped_and_unknown_scope_chat_ids_are_ignored_by_capture() {
     );
 
     focus_worker_leaf(&mut engine);
-    engine.handle_key(key("enter")).expect("enter");
+    engine.handle_key(key("space")).expect("space");
     let out = render_str(&mut engine);
     assert!(
         out.contains("no captured output yet"),
@@ -6831,5 +6838,282 @@ fn collapsed_group_row_hints_the_busy_member() {
     assert!(
         !snap.contains("→llm"),
         "an unfolded group row drops the hint:\n{snap}"
+    );
+}
+
+/// Space on a group row opens the COMPOSITE view: the merged member
+/// timeline, an llm message and a tool invoke+result attributed to the
+/// distinct members that produced them, in chronological (capture) order.
+/// Also exercises tool-event capture from `tool-gate.tool.invoke`'s `from`
+/// field and the correlated `tool.result`.
+#[test]
+fn space_on_group_merges_llm_and_tool_events_attributed_by_member() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.lead.bound", "chat_prefix": "r1/lead.llm@" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "sub-1", "run_name": "auth-fix", "scope": "r2" }),
+    );
+    for id in ["worker.llm", "worker.run-tool"] {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "mag.actor_spawned", "run_id": "sub-1", "id": id, "factory": "llm" }),
+        );
+    }
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_ready", "run_id": "sub-1", "id": "worker.llm" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_busy", "run_id": "sub-1", "id": "worker.llm" }),
+    );
+
+    // Chronology: llm assistant delta (worker.llm), then the tool
+    // invoke+result the sibling run-tool actor emits.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "chat_id": "r2/worker.llm@r1", "text": "LLM_SAYS_HI" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "tool-gate.tool.invoke",
+            "id": "r2/cap-1",
+            "from": "worker.run-tool",
+            "name": "bash",
+            "args": { "command": "cargotest" },
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "tool.result", "id": "r2/cap-1", "output": "TOOL_OK_OUTPUT" }),
+    );
+
+    // Tab focuses the sidebar; one Down lands on the (folded) worker group
+    // row; Space opens the composite — no unfold needed.
+    engine.handle_key(key("tab")).expect("tab");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("down")).expect("down");
+    engine.handle_key(key("space")).expect("space");
+    let out = render_str(&mut engine);
+
+    assert!(
+        out.contains("agents · worker [read-only]"),
+        "composite header with group name + read-only marker expected: {out:?}"
+    );
+    assert!(
+        out.contains("LLM_SAYS_HI"),
+        "the member llm message must appear in the merged timeline: {out:?}"
+    );
+    assert!(
+        out.contains("bash") && out.contains("cargotest"),
+        "the tool invoke (name + args) must appear: {out:?}"
+    );
+    assert!(
+        out.contains("TOOL_OK_OUTPUT"),
+        "the correlated tool result output must appear: {out:?}"
+    );
+    // Attribution: both distinct members labelled in the merged view.
+    assert!(
+        out.contains("worker.llm") && out.contains("worker.run-tool"),
+        "both members must be attributed in the merged timeline: {out:?}"
+    );
+    // Chronological order: the llm line precedes the later tool line.
+    let llm_at = out.find("LLM_SAYS_HI").expect("llm line");
+    let tool_at = out.find("cargotest").expect("tool line");
+    assert!(
+        llm_at < tool_at,
+        "the earlier llm message must render before the later tool call: {out:?}"
+    );
+}
+
+/// Tool events attribute to the EMITTING actor named by `from`, not to a
+/// sibling: opening the run-tool leaf shows the tool call; the llm leaf,
+/// whose own stream carried no tool, does not.
+#[test]
+fn tool_events_attribute_to_the_emitting_actor_from_the_from_field() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.lead.bound", "chat_prefix": "r1/lead.llm@" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "sub-1", "run_name": "auth-fix", "scope": "r2" }),
+    );
+    for id in ["worker.llm", "worker.run-tool"] {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "mag.actor_spawned", "run_id": "sub-1", "id": id, "factory": "llm" }),
+        );
+    }
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "tool-gate.tool.invoke",
+            "id": "r2/cap-9",
+            "from": "worker.run-tool",
+            "name": "bash",
+            "args": { "command": "RUNTOOL_CMD" },
+        }),
+    );
+
+    // Focus, unfold the worker group, land on the FIRST member (run-tool
+    // sorts before... actually llm; navigate to run-tool explicitly).
+    engine.handle_key(key("tab")).expect("tab");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("down")).expect("down"); // → worker group
+    engine.handle_key(key("enter")).expect("enter"); // unfold
+    let _ = render_str(&mut engine);
+
+    // Members render seq-sorted: worker.llm (spawned first) then
+    // worker.run-tool. Down twice from the group reaches run-tool.
+    engine.handle_key(key("down")).expect("down"); // → worker.llm
+    engine.handle_key(key("space")).expect("space");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("agent · worker.llm [read-only]"),
+        "worker.llm leaf view expected: {out:?}"
+    );
+    assert!(
+        !out.contains("RUNTOOL_CMD"),
+        "the llm leaf must NOT carry the sibling's tool call: {out:?}"
+    );
+    engine.handle_key(key("q")).expect("q");
+    engine.handle_key(key("down")).expect("down"); // → worker.run-tool
+    engine.handle_key(key("space")).expect("space");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("agent · worker.run-tool [read-only]"),
+        "worker.run-tool leaf view expected: {out:?}"
+    );
+    assert!(
+        out.contains("RUNTOOL_CMD"),
+        "the tool call must land on the actor named by `from`: {out:?}"
+    );
+}
+
+/// Space on a run-header row observes the WHOLE run merged (documented
+/// run-header decision): every actor under the run, one timeline.
+#[test]
+fn space_on_run_header_opens_whole_run_view() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.lead.bound", "chat_prefix": "r1/lead.llm@" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "sub-1", "run_name": "auth-fix", "scope": "r2" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_spawned", "run_id": "sub-1", "id": "worker.llm", "factory": "llm" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "chat_id": "r2/worker.llm@r1", "text": "WHOLE_RUN_LINE" }),
+    );
+
+    engine.handle_key(key("tab")).expect("tab");
+    let _ = render_str(&mut engine);
+    // Cursor starts on the run-header row.
+    engine.handle_key(key("space")).expect("space");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("run · auth-fix [read-only]"),
+        "run-header Space must open the whole-run view: {out:?}"
+    );
+    assert!(
+        out.contains("WHOLE_RUN_LINE"),
+        "the whole-run view must merge member output: {out:?}"
+    );
+}
+
+/// Empty sidebar refuses focus, loudly: Tab with no rows keeps prompt
+/// focus AND raises a warning toast that explains the refusal.
+#[test]
+fn empty_sidebar_tab_warns_and_keeps_prompt_focus() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    // No runs → the sidebar has no navigable rows. The toast slides in
+    // from width 0, so advance past the enter animation before reading
+    // the full frame.
+    engine.handle_key(key("tab")).expect("tab");
+    engine.advance_time(Duration::from_millis(300));
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    assert!(
+        snap.contains("can't focus an empty sidebar"),
+        "Tab on an empty sidebar must raise the warning toast:\n{snap}"
+    );
+    assert!(
+        !snap.contains("· focused"),
+        "focus must not move to an empty sidebar (title stays unfocused):\n{snap}"
+    );
+
+    // Prompt still owns keys: typing lands in the input.
+    for ch in ["h", "i"] {
+        engine.handle_key(key(ch)).expect("type");
+    }
+    let _ = render_str(&mut engine);
+    let snap = engine.snapshot();
+    assert!(
+        snap.contains("hi"),
+        "the prompt must keep focus after the refused Tab:\n{snap}"
+    );
+}
+
+/// A focused sidebar is unmistakable: the title bar carries the focused
+/// treatment and the dimmed prompt states the way back in its
+/// placeholder.
+#[test]
+fn focused_sidebar_highlights_title_and_prompt_states_the_way_back() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "sub-1", "run_name": "demo", "scope": "r2" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_spawned", "run_id": "sub-1", "id": "worker.llm", "factory": "llm" }),
+    );
+
+    // Unfocused: plain title, no placeholder hint.
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("· focused") && !out.contains("Tab to return"),
+        "unfocused surface carries no focus treatment: {out:?}"
+    );
+
+    engine.handle_key(key("tab")).expect("tab");
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("Graph · focused"),
+        "a focused sidebar must carry the highlighted title treatment: {out:?}"
+    );
+    assert!(
+        out.contains("Tab to return"),
+        "the dimmed prompt must state the way back in its placeholder: {out:?}"
+    );
+    // The cursor row stays the in-pane focus indicator.
+    let cursor = cursor_styled_text(&out);
+    assert!(
+        cursor.contains("MAG demo"),
+        "the cursor row remains the in-pane focus indicator: {cursor:?}"
     );
 }
