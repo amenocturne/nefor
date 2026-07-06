@@ -1,8 +1,8 @@
 -- tests/lua/mag-kernel/llm_test.lua — unit tests for the llm provider-boundary
--- factory (starter/mag-kernel/factories/llm.lua).
+-- factory (plugins/mag/lua/mag-kernel/factories/llm.lua).
 --
 -- Driven from engine/tests/starter_mag_kernel_test.rs (installs the minimal
--- nefor.log surface, points package.path at starter/mag-kernel/). Tests the
+-- nefor.log surface, points package.path at plugins/mag/lua/mag-kernel/). Tests the
 -- factory in isolation: a capturing `emit` stands in for the kernel outbound,
 -- so no real provider, bus, or router is needed. Covers the task's factory-
 -- level list: capability.invoke on a graph activation; tool-calls reply →

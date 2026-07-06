@@ -369,21 +369,21 @@ end
 -- mag: the MAG actor-kernel runtime — the only execution path; every
 -- run (the lead's turn-programs and its dispatched sub-runs) executes
 -- here. Speaks the canonical wire shape, so it spawns via
--- `identity_spec`. The `--kernel` path points the plugin's embedded VM
--- at the config-resident kernel entry; STARTER_ROOT is NEFOR_CONFIG_DIR
--- (the repo's `starter/` under `just run`). Binary is `mag-plugin` (the
--- `mag` binary is nefor-mag's compiler CLI); bus identity is `mag`.
+-- `identity_spec`. Binary is `mag-plugin` (the `mag` binary is
+-- nefor-mag's compiler CLI); bus identity is `mag`.
+-- The plugin ships and loads its own kernel (`plugins/mag/lua/mag-kernel`),
+-- resolved off `--lua-root`'s parent (NEFOR_ROOT) — the config no longer
+-- carries a kernel copy. Pass `--kernel <path>` only to override it.
 -- `--tool-gate` threads the composition-owned gate identity (the same name
 -- tools.gate_spec below spawns the gate under): the plugin rewrites the
 -- kernel's tool-class capability invokes onto `<gate>.tool.invoke`, and the
 -- composition layer — not the plugin — owns cross-plugin names.
 -- `--lua-root` threads the bootstrap-resolved shared Lua tree (LUA_ROOT
--- above) into the plugin's embedded VM so the kernel resolves the shared
--- libs (`output-persistence`) regardless of where the config dir lives —
--- installed configs carry no `lua/` tree of their own.
+-- above) into the plugin's embedded VM so the kernel resolves both its own
+-- tree and the shared libs (`output-persistence`) regardless of where the
+-- config dir lives — installed configs carry no `lua/` tree of their own.
 actor.spawn(actor.identity_spec("mag", {
   require("config").bin("mag-plugin"),
-  "--kernel", STARTER_ROOT .. "/mag-kernel/init.lua",
   "--tool-gate", "tool-gate",
   "--lua-root", LUA_ROOT,
 }))

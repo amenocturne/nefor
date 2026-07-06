@@ -16,7 +16,7 @@
 --      drop-and-log (settled race semantics).
 --
 -- Driven from engine/tests/starter_mag_kernel_test.rs: bare Lua VM, stub
--- nefor.log, package.path at starter/mag-kernel/.
+-- nefor.log, package.path at plugins/mag/lua/mag-kernel/.
 
 local inventory = require("inventory")
 local Registry = require("registry")

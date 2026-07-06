@@ -3,7 +3,7 @@
 -- approval boundary).
 --
 -- Driven from engine/tests/starter_mag_kernel_test.rs: bare Lua VM, stub
--- nefor.log, package.path at starter/mag-kernel/. The harness wires
+-- nefor.log, package.path at plugins/mag/lua/mag-kernel/. The harness wires
 -- inventory + registry + router + observer exactly the way init.lua does,
 -- INCLUDING the construction probe (set_is_constructed) that guards
 -- control-plane reply injection at apply time.

@@ -157,8 +157,8 @@ async fn run() -> Result<(), MagError> {
     // Host the Lua VM and load the kernel before advertising liveness, so
     // `mag.hello` truthfully reports the loaded kernel. `host` is held for
     // the whole session — the VM is the kernel's entire world.
-    let kernel_path = resolve_kernel_path()?;
     let lua_root = arg_value("--lua-root").map(PathBuf::from);
+    let kernel_path = resolve_kernel_path(lua_root.as_deref())?;
     tracing::info!(path = %kernel_path.display(), "loading mag kernel");
     let host = LuaHost::load_kernel(&kernel_path, lua_root.as_deref())?;
 
@@ -181,27 +181,32 @@ async fn run() -> Result<(), MagError> {
 
 /// Resolve where the kernel entry Lua lives, highest precedence first:
 ///
-/// 1. `--kernel <path>` (or `-k`) argv — how the starter passes it.
-/// 2. `NEFOR_DEV_DIR/starter/mag-kernel/init.lua` — in-checkout dev mode.
-/// 3. `NEFOR_CONFIG_DIR/mag-kernel/init.lua` — installed-config default.
+/// 1. `--kernel <path>` (or `-k`) argv — an explicit override for dev
+///    experiments and the plugin's integration tests.
+/// 2. `<lua-root>/../plugins/mag/lua/mag-kernel/init.lua` — the plugin's own
+///    shipped kernel, the DEFAULT. Located via the composition-threaded
+///    `--lua-root` (`NEFOR_ROOT/lua`), whose parent is `NEFOR_ROOT`. That root
+///    carries the whole `plugins/` tree in every install mode — dev checkout,
+///    `NEFOR_LOCAL_DIR` override, or the pm sparse-clone (its cone includes
+///    `plugins`). So configs no longer copy the kernel; the plugin owns it.
+/// 3. `NEFOR_DEV_DIR/plugins/mag/lua/mag-kernel/init.lua` — in-checkout dev
+///    fallback for a bare spawn that passes no `--lua-root`.
 ///
-/// This mirrors the ecosystem's `NEFOR_DEV_DIR`-first search convention.
-/// The engine exports `NEFOR_CONFIG_DIR` into every spawned plugin's env,
-/// so (3) works even when the starter passes no explicit flag.
-fn resolve_kernel_path() -> Result<PathBuf, MagError> {
+/// Mirrors [`set_kernel_path`]'s own lua-root-then-`NEFOR_DEV_DIR` ordering.
+fn resolve_kernel_path(lua_root: Option<&Path>) -> Result<PathBuf, MagError> {
     if let Some(path) = arg_value("--kernel").or_else(|| arg_value("-k")) {
         return Ok(PathBuf::from(path));
     }
 
-    if let Some(dev) = std::env::var_os("NEFOR_DEV_DIR") {
-        let candidate = PathBuf::from(dev).join("starter/mag-kernel/init.lua");
+    if let Some(nefor_root) = lua_root.and_then(Path::parent) {
+        let candidate = nefor_root.join("plugins/mag/lua/mag-kernel/init.lua");
         if candidate.exists() {
             return Ok(candidate);
         }
     }
 
-    if let Some(cfg) = std::env::var_os("NEFOR_CONFIG_DIR") {
-        let candidate = PathBuf::from(cfg).join("mag-kernel/init.lua");
+    if let Some(dev) = std::env::var_os("NEFOR_DEV_DIR") {
+        let candidate = PathBuf::from(dev).join("plugins/mag/lua/mag-kernel/init.lua");
         if candidate.exists() {
             return Ok(candidate);
         }

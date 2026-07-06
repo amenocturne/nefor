@@ -59,7 +59,7 @@ fn binary_path() -> PathBuf {
 }
 
 fn kernel_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../starter/mag-kernel/init.lua")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua/mag-kernel/init.lua")
 }
 
 /// The provider capability name the `llm` actors target — the shipped fixture's
@@ -176,7 +176,7 @@ fn two_agent_modification() -> Value {
 }
 
 /// `("r1/a1.llm@r2")` → `("a1", 2)`. Wire chat handles are run-scoped by the
-/// kernel (`r<K>/<actor>@r<seq>` — starter/mag-kernel/init.lua bus_emit); the
+/// kernel (`r<K>/<actor>@r<seq>` — plugins/mag/lua/mag-kernel/init.lua bus_emit); the
 /// test peels the scope prefix off the node segment only to script per-agent
 /// behavior — real consumers never parse a chat_id.
 fn parse_chat_id(chat_id: &str) -> (String, u32) {

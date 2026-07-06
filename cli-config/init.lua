@@ -151,11 +151,10 @@ end
 
 -- mag: the MAG actor-kernel runtime — the lead's turn-programs execute
 -- here (agentic-loop spawns one per user message). Mirrors the starter
--- composition: kernel entry from starter/, gate identity threaded, shared
--- Lua tree for output-persistence.
+-- composition: the plugin ships its own kernel (resolved off --lua-root's
+-- parent), gate identity threaded, shared Lua tree for output-persistence.
 actor.spawn(actor.identity_spec("mag", {
   require("config").bin("mag-plugin"),
-  "--kernel", STARTER_ROOT .. "/mag-kernel/init.lua",
   "--tool-gate", "tool-gate",
   "--lua-root", LUA_ROOT,
 }))

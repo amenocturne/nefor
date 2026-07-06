@@ -22,7 +22,7 @@ fn binary_path() -> PathBuf {
 
 /// The in-repo stub kernel, resolved relative to this crate.
 fn kernel_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../starter/mag-kernel/init.lua")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua/mag-kernel/init.lua")
 }
 
 async fn spawn_mag() -> Child {

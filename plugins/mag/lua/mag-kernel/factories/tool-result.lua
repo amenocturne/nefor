@@ -1,4 +1,4 @@
--- starter/mag-kernel/factories/tool-result.lua — the tool-result adaptation
+-- plugins/mag/lua/mag-kernel/factories/tool-result.lua — the tool-result adaptation
 -- boundary.
 --
 -- The contract-declared replacement for the shape-sniffing `adapter` handler

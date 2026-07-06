@@ -1,4 +1,4 @@
--- starter/mag-kernel/inventory.lua — the actor inventory and the fold.
+-- plugins/mag/lua/mag-kernel/inventory.lua — the actor inventory and the fold.
 --
 -- One kernel holds one inventory: a single map from actor id to instance
 -- record, shared across all factories (actor-model.md). This module owns

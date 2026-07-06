@@ -1,4 +1,4 @@
--- starter/mag-kernel/factories/run-tool.lua — the tool-invocation boundary.
+-- plugins/mag/lua/mag-kernel/factories/run-tool.lua — the tool-invocation boundary.
 --
 -- The contract-declared replacement for the shape-sniffing `tool-executor`
 -- handler (starter/reasoners/init.lua): given the model's tool calls, invoke

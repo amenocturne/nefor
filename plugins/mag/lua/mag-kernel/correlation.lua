@@ -1,4 +1,4 @@
--- starter/mag-kernel/correlation.lua — capability request/response tracking.
+-- plugins/mag/lua/mag-kernel/correlation.lua — capability request/response tracking.
 --
 -- When an actor asks a capability plugin for something, the request leaves on
 -- the bus and the answer comes back on the bus, asynchronously. Something has

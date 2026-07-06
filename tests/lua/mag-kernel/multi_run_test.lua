@@ -1,5 +1,5 @@
 -- tests/lua/mag-kernel/multi_run_test.lua — concurrent run contexts
--- (starter/mag-kernel/init.lua, the full kernel entry). Driven from
+-- (plugins/mag/lua/mag-kernel/init.lua, the full kernel entry). Driven from
 -- engine/tests/starter_mag_kernel_test.rs, whose nefor stub queues
 -- `nefor.emit` bodies into the global `__emitted` array.
 --

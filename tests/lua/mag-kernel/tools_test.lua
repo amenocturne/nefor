@@ -3,7 +3,7 @@
 --
 -- Driven from `engine/tests/starter_mag_kernel_test.rs` (same harness as
 -- flow_test.lua): a bare Lua VM with a stub `nefor.log` and package.path
--- pointed at `starter/mag-kernel/`.
+-- pointed at `plugins/mag/lua/mag-kernel/`.
 --
 -- These exercise the factories directly — construct an instance, feed it
 -- activation messages (graph deliveries and correlated replies), assert what

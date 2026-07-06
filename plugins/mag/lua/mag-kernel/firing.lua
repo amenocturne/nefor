@@ -1,4 +1,4 @@
--- starter/mag-kernel/firing.lua — the input-contract firing machine.
+-- plugins/mag/lua/mag-kernel/firing.lua — the input-contract firing machine.
 --
 -- Firing is a type fact, symmetric to routing (docs/ir.md, Firing): output
 -- types decide where results go, input types decide when an actor runs. This

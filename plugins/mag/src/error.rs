@@ -35,8 +35,9 @@ pub enum MagError {
 
     /// No kernel path could be resolved from argv or the environment.
     #[error(
-        "no kernel path: pass --kernel <path>, or set NEFOR_DEV_DIR / NEFOR_CONFIG_DIR \
-         so <dir>/.../mag-kernel/init.lua resolves"
+        "no kernel path: pass --kernel <path>, thread --lua-root so \
+         <lua-root>/../plugins/mag/lua/mag-kernel/init.lua resolves, or set \
+         NEFOR_DEV_DIR to an in-checkout dev tree"
     )]
     NoKernelPath,
 }

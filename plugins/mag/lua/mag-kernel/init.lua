@@ -1,4 +1,4 @@
--- starter/mag-kernel/init.lua — MAG actor-kernel entry.
+-- plugins/mag/lua/mag-kernel/init.lua — MAG actor-kernel entry.
 --
 -- Loaded by the `mag` plugin's embedded Lua VM at startup. This module is
 -- the wiring layer: it adapts the host `nefor` surface into the plain

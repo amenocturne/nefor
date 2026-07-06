@@ -1,4 +1,4 @@
--- starter/mag-kernel/factories/llm.lua — the provider-boundary primitive.
+-- plugins/mag/lua/mag-kernel/factories/llm.lua — the provider-boundary primitive.
 --
 -- The one factory that crosses a plugin boundary (a language model provider),
 -- which is exactly why it earns a Lua-level place: everything composable ABOVE

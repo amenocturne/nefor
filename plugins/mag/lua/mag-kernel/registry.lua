@@ -1,4 +1,4 @@
--- starter/mag-kernel/registry.lua — factory declarations + the kernel-side
+-- plugins/mag/lua/mag-kernel/registry.lua — factory declarations + the kernel-side
 -- registry that composition validates against.
 --
 -- A factory is the trait layer (plugins/mag/docs/actor-model.md, Factories):

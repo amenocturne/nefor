@@ -1,4 +1,4 @@
--- starter/mag-kernel/factories/stub.lua — a minimal factory with a declared
+-- plugins/mag/lua/mag-kernel/factories/stub.lua — a minimal factory with a declared
 -- contract, used by the contract/registry tests.
 --
 -- This file is the whole truth about the stub actor (actor-model.md, Signals:

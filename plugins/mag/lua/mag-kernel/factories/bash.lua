@@ -1,4 +1,4 @@
--- starter/mag-kernel/factories/bash.lua — the shell capability node.
+-- plugins/mag/lua/mag-kernel/factories/bash.lua — the shell capability node.
 --
 -- `(bash "command")` in MAG lowers to one actor of this factory (crates/
 -- nefor-mag eval_bash). Semantics mirror a real shell pipe: the input message

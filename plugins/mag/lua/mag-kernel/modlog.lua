@@ -1,4 +1,4 @@
--- starter/mag-kernel/modlog.lua — the modification log ("the modification log
+-- plugins/mag/lua/mag-kernel/modlog.lua — the modification log ("the modification log
 -- is the run"; docs/ir.md, Application semantics).
 --
 -- An ordered, append-only record of every modification the fold saw, tagged
@@ -10,7 +10,7 @@
 -- function once per entry (one JSONL line fits the repo's session conventions;
 -- docs/ir.md). Persistence is the wiring's concern — the log stays unit-testable
 -- in a bare Lua VM with a capturing persist stub. The observer
--- (starter/mag-kernel/observer.lua) is what classifies outcomes and records
+-- (plugins/mag/lua/mag-kernel/observer.lua) is what classifies outcomes and records
 -- here; this module never reaches into the inventory itself.
 
 local M = {}

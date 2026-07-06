@@ -3,7 +3,7 @@
 --
 -- Driven from `engine/tests/starter_mag_kernel_test.rs`, which installs a
 -- minimal `nefor.log` surface (the mag host binding) and points package.path
--- at `starter/mag-kernel/` so bare requires resolve (matching the real host).
+-- at `plugins/mag/lua/mag-kernel/` so bare requires resolve (matching the real host).
 
 local shape    = require("shape")
 local Registry = require("registry")

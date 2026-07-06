@@ -1,5 +1,5 @@
 -- tests/lua/mag-kernel/activity_test.lua — per-actor busy/idle activity
--- events (starter/mag-kernel/routing.lua wired the way init.lua does).
+-- events (plugins/mag/lua/mag-kernel/routing.lua wired the way init.lua does).
 -- Driven from engine/tests/starter_mag_kernel_test.rs.
 --
 -- The contract under test (actor-model.md, Activity): `mag.actor_busy` fires

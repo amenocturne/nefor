@@ -1,5 +1,5 @@
 -- tests/lua/mag-kernel/fold_test.lua — unit tests for the mag-kernel fold
--- (starter/mag-kernel/inventory.lua). Driven from
+-- (plugins/mag/lua/mag-kernel/inventory.lua). Driven from
 -- engine/tests/starter_mag_kernel_test.rs.
 --
 -- Exercises the fold over scripted modification sequences: normal apply,

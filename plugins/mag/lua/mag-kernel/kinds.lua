@@ -1,4 +1,4 @@
--- starter/mag-kernel/kinds.lua — the canonical reserved-kind constants.
+-- plugins/mag/lua/mag-kernel/kinds.lua — the canonical reserved-kind constants.
 --
 -- The kernel and its factories agree on a small set of reserved message /
 -- event kinds (plugins/mag/docs/actor-model.md, Signals; docs/ir.md, Firing).

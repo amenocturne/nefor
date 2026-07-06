@@ -190,7 +190,7 @@ a shell pipeline, with zero ceremony:
 ### The bash capability node
 
 `(bash "command")` lowers to one actor of the `bash` kernel factory
-(starter/mag-kernel/factories/bash.lua):
+(plugins/mag/lua/mag-kernel/factories/bash.lua):
 
 | Aspect  | Contract                                                                                                                                     |
 | ------- | -------------------------------------------------------------------------------------------------------------------------------------------- |

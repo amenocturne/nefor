@@ -3,7 +3,7 @@
 --
 -- Driven from `plugins/mag/tests/bash_factory_lua.rs` (same bare-VM harness as
 -- engine/tests/starter_mag_kernel_test.rs): stub `nefor.log`, package.path at
--- `starter/mag-kernel/`. There is no real tool gate: capability.invoke
+-- `plugins/mag/lua/mag-kernel/`. There is no real tool gate: capability.invoke
 -- envelopes are captured and their refs replayed as reply activations, exactly
 -- as routing.lua's bus_response would — a scripted capability responder.
 

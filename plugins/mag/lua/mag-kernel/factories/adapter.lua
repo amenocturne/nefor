@@ -1,4 +1,4 @@
--- starter/mag-kernel/factories/adapter.lua — the agent's entry boundary
+-- plugins/mag/lua/mag-kernel/factories/adapter.lua — the agent's entry boundary
 -- type-shift.
 --
 -- Every agent template (crates/nefor-mag eval_agent; plugins/mag/docs/lowering.md,

@@ -1,4 +1,4 @@
--- starter/mag-kernel/routing.lua — everything between an actor's output and
+-- plugins/mag/lua/mag-kernel/routing.lua — everything between an actor's output and
 -- its destination (task: routing, correlation, lazy construction).
 --
 -- Actors are bus-unaware (actor-model.md): the kernel is their entire world.

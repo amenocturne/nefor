@@ -1,4 +1,4 @@
--- starter/mag-kernel/observer.lua — lifecycle events + modification-log
+-- plugins/mag/lua/mag-kernel/observer.lua — lifecycle events + modification-log
 -- recording, derived from the fold boundary.
 --
 -- The kernel's fold (inventory.lua) stays pure and io-free. This module is the

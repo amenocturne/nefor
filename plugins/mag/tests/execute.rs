@@ -35,7 +35,7 @@ fn binary_path() -> PathBuf {
 }
 
 fn kernel_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../starter/mag-kernel/init.lua")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua/mag-kernel/init.lua")
 }
 
 async fn spawn_mag(data_dir: &std::path::Path) -> Child {
@@ -482,11 +482,11 @@ async fn persisted_flag_reflects_actual_persistence() {
     let data_dir = base.join("data");
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
 
-    // An isolated kernel copy: grandparent has no `lua/`, so the shared
-    // output-persistence lib is unresolvable without --lua-root.
+    // An isolated kernel copy under a temp dir with no ancestor `lua/`, so the
+    // shared output-persistence lib is unresolvable without --lua-root.
     let kernel_dir = base.join("isolated/mag-kernel");
     copy_dir(
-        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../starter/mag-kernel"),
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua/mag-kernel"),
         &kernel_dir,
     );
     let kernel = kernel_dir.join("init.lua");

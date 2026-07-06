@@ -55,7 +55,7 @@ fn starter_dir() -> PathBuf {
 }
 
 fn kernel_path() -> PathBuf {
-    starter_dir().join("mag-kernel/init.lua")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua/mag-kernel/init.lua")
 }
 
 async fn spawn_mag(data_dir: &std::path::Path) -> Child {

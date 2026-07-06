@@ -1,8 +1,8 @@
 -- tests/lua/mag-kernel/adapter_test.lua — unit tests for the entry adapter
--- factory (starter/mag-kernel/factories/adapter.lua).
+-- factory (plugins/mag/lua/mag-kernel/factories/adapter.lua).
 --
 -- Driven from engine/tests/starter_mag_kernel_test.rs (installs the minimal
--- nefor.log surface, points package.path at starter/mag-kernel/). Tests the
+-- nefor.log surface, points package.path at plugins/mag/lua/mag-kernel/). Tests the
 -- factory in isolation: a capturing `emit` stands in for the kernel outbound.
 -- The adapter is the agent's boundary type shift — it lifts either the initial
 -- task seed OR an upstream agent's FinalAnswer into the `ProviderOut` turn the

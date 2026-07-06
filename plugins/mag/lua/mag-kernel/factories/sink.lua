@@ -1,4 +1,4 @@
--- starter/mag-kernel/factories/sink.lua — the program's terminal marker.
+-- plugins/mag/lua/mag-kernel/factories/sink.lua — the program's terminal marker.
 --
 -- One sink per program (docs/lowering.md, "The program sink"). Terminality is
 -- structural, not a flag: the sink declares empty `outputs` and lowers with

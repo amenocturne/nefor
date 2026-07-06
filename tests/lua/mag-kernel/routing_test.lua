@@ -1,5 +1,5 @@
 -- tests/lua/mag-kernel/routing_test.lua — unit tests for the mag-kernel
--- routing layer (starter/mag-kernel/routing.lua, firing.lua, correlation.lua).
+-- routing layer (plugins/mag/lua/mag-kernel/routing.lua, firing.lua, correlation.lua).
 -- Driven from engine/tests/starter_mag_kernel_test.rs.
 --
 -- Covers: two stub actors exchange by id; a delivery to a registered-but-

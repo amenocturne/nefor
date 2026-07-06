@@ -347,8 +347,9 @@ fn resolve_data_root() -> String {
 /// 1. `lua_root` — the composition-owned `--lua-root` (starter/init.lua
 ///    threads its resolved `NEFOR_ROOT/lua` here).
 /// 2. `NEFOR_DEV_DIR/lua` — in-checkout dev mode.
-/// 3. the kernel dir's grandparent's `lua/` (`.../starter/mag-kernel` →
-///    repo root) — covers a bare `--kernel` pointing into a checkout.
+/// 3. the repo root's `lua/`, four levels above the kernel dir
+///    (`.../plugins/mag/lua/mag-kernel` → root) — covers a bare `--kernel`
+///    pointing into a checkout.
 /// 4. `<data_root>/nefor/lua` — the pm-managed sparse-clone every installed
 ///    config bootstraps (starter/init.lua), so an installed kernel whose
 ///    config dir carries no `lua/` tree still resolves the shared libs.
@@ -375,8 +376,14 @@ fn set_kernel_path(
             trees.push(PathBuf::from(dev).join("lua"));
         }
     }
-    // .../starter/mag-kernel → grandparent is the repo/config root.
-    if let Some(root) = dir.parent().and_then(Path::parent) {
+    // .../plugins/mag/lua/mag-kernel → the repo/config root is four levels up
+    // (mag-kernel → lua → mag → plugins → root).
+    if let Some(root) = dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+    {
         trees.push(root.join("lua"));
     }
     trees.push(PathBuf::from(data_root).join("nefor/lua"));

@@ -2,7 +2,7 @@
 //! (`tests/lua/mag-kernel/bash_test.lua`) in a bare Lua VM — the same harness
 //! shape as `engine/tests/starter_mag_kernel_test.rs`: a minimal `nefor` stub
 //! (`nefor.log`, matching the plugin host's `install_nefor`), `package.path`
-//! pointed at `starter/mag-kernel/`, then exec the chunk (which `error()`s on
+//! pointed at `plugins/mag/lua/mag-kernel/`, then exec the chunk (which `error()`s on
 //! the first failed assertion). Hosted here rather than in the engine's
 //! harness because the bash factory ships with the mag plugin's kernel.
 
@@ -31,7 +31,7 @@ fn mag_kernel_bash_factory() {
 
     // Bare requires (`require("kinds")`, `require("factories.bash")`) resolve
     // against the kernel directory.
-    let kernel_dir = repo_root().join("starter/mag-kernel");
+    let kernel_dir = repo_root().join("plugins/mag/lua/mag-kernel");
     let package: mlua::Table = lua.globals().get("package").expect("package");
     let current: String = package.get("path").expect("package.path");
     package

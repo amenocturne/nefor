@@ -1,4 +1,4 @@
--- starter/mag-kernel/factories/human.lua — the approval / input boundary.
+-- plugins/mag/lua/mag-kernel/factories/human.lua — the approval / input boundary.
 --
 -- A human-in-the-loop gate expressed as a factory like any other: it declares
 -- a contract, signs its outputs, confirms ready. The chat surface that renders

@@ -1,4 +1,4 @@
--- starter/mag-kernel/shape.lua — algebraic type shapes for factory contracts.
+-- plugins/mag/lua/mag-kernel/shape.lua — algebraic type shapes for factory contracts.
 --
 -- A factory declares the input shapes it accepts and the output tags it
 -- produces (see plugins/mag/docs/actor-model.md, Factories; docs/ir.md,

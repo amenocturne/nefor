@@ -144,7 +144,7 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
 }
 
 fn set_package_path(lua: &Lua) -> mlua::Result<()> {
-    let kernel_dir = repo_root().join("starter").join("mag-kernel");
+    let kernel_dir = repo_root().join("plugins/mag/lua/mag-kernel");
     let kernel_dir = kernel_dir.display().to_string();
     let script = format!(
         r#"

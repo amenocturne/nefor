@@ -1,5 +1,5 @@
 -- tests/lua/mag-kernel/lazy_construct_test.lua — lazy actor construction
--- (starter/mag-kernel/inventory.lua + routing.lua + observer.lua wired the way
+-- (plugins/mag/lua/mag-kernel/inventory.lua + routing.lua + observer.lua wired the way
 -- init.lua does). Driven from engine/tests/starter_mag_kernel_test.rs.
 --
 -- The contract under test (actor-model.md, Lifecycle): apply REGISTERS the
