@@ -2,9 +2,7 @@
 --
 -- When an actor asks a capability plugin for something, the request leaves on
 -- the bus and the answer comes back on the bus, asynchronously. Something has
--- to remember which actor is owed which answer. `starter/agentic-loop/init.lua`
--- does this ad hoc with a scatter of maps (`pending_runs`, `firing_to_node`,
--- `tool_id_to_key`, …), each keyed by some id and reconciled by hand. This
+-- to remember which actor is owed which answer. This
 -- module owns that one concern: a single table from a kernel-minted request id
 -- to the requesting actor (plus the actor's own opaque ref), so a `tool.result`
 -- routes back to exactly the actor that asked — and nothing else.

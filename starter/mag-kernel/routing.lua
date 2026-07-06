@@ -487,8 +487,8 @@ end
 
 -- An actor's request to a capability plugin. Mint a tracked request id, record
 -- the requester (+ its opaque ref), and put a tool.invoke-shaped envelope on
--- the injected bus. This owns as one kernel concern what agentic-loop spread
--- across pending_runs / tool_id_to_key / firing_to_node. `from` stamps the
+-- the injected bus — request/response correlation as one kernel concern
+-- (correlation.lua). `from` stamps the
 -- emitting actor's plain address onto the outbound envelope (observability:
 -- consumers see WHICH actor is invoking without parsing the scoped
 -- correlation id; the run is already identifiable via that id / the run

@@ -11,8 +11,6 @@ local md       = common.md
 local compact  = common.compact
 local pad_block = common.pad_block
 local pretty_json = common.pretty_json
-local format_graph = common.format_graph
-local format_spawn_graph_output = common.format_spawn_graph_output
 local humanize_duration_ms = common.humanize_duration_ms
 local bordered_box = common.bordered_box
 
@@ -95,14 +93,6 @@ local function tool_salient(entry)
   end
   if name == "read_file" or name == "edit_file" or name == "write_file" then return input.path end
   if name == "Grep" or name == "Glob" then return input.pattern end
-  if name == "spawn_graph" then
-    local nodes = input.graph and input.graph.nodes or nil
-    if type(nodes) == "table" then
-      local n = #nodes
-      if n == 1 then return "1 node" end
-      return tostring(n) .. " nodes"
-    end
-  end
   -- Fall back: first short string field, skipping policy-ish names.
   for k, v in pairs(input) do
     local skip = (k == "on_node_failure" or k == "mode" or k == "policy" or k == "strategy")
@@ -143,16 +133,10 @@ local function tool_expanded(entry)
   end
   local rows = { tui.text { content = header, style = header_style, wrap = "none" } }
   rows[#rows + 1] = tui.text { content = "  input:",  style = STYLE.footer, wrap = "none" }
-  -- spawn_graph: render as compact node-list + edge-list. Args of each
-  -- node are intentionally omitted (would clutter); future "focus a
-  -- node" UI surfaces them on demand. For everything else, prefer JSON
-  -- pretty-print of the structured input_table; fall back to the raw
-  -- string when only a string was sent.
+  -- Prefer JSON pretty-print of the structured input_table; fall back
+  -- to the raw string when only a string was sent.
   local input_text
-  if entry.name == "spawn_graph" and entry.input_table
-    and type(entry.input_table.graph) == "table" then
-    input_text = format_graph(entry.input_table.graph)
-  elseif entry.input_table ~= nil then
+  if entry.input_table ~= nil then
     input_text = pretty_json(entry.input_table)
   elseif entry.input and #entry.input > 0 and entry.input ~= "(object)" then
     input_text = entry.input
@@ -185,9 +169,6 @@ local function tool_expanded(entry)
     rows[#rows + 1] = tui.text { content = label, style = label_style, wrap = "none" }
     if entry.output and #entry.output > 0 then
       local out_text = entry.output
-      if entry.name == "spawn_graph" then
-        out_text = format_spawn_graph_output(out_text)
-      end
       local indented_out = "  " .. out_text:gsub("\n", "\n  ")
       rows[#rows + 1] = tui.text {
         content = pad_block(indented_out),

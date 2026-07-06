@@ -350,8 +350,7 @@ return {
   name = "mag-kernel",
 
   -- Begin a run: create its context, then emit mag.run_started before the
-  -- first modification (parity with reasoner-graph's RunStarted). Run identity
-  -- is injected, never ambient. Returns { ok = true, reaped = {...} } or
+  -- first modification. Run identity is injected, never ambient. Returns { ok = true, reaped = {...} } or
   -- { ok = false, error } — a duplicate live run_id rejects (the id is the
   -- context key and the reply correlation; two runs may not share it).
   --

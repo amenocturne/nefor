@@ -654,18 +654,17 @@ fn slash_new_clears_panel_runs() {
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
-    // Seed an active graph run.
+    // Seed an active kernel run.
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "graph.run_started",
+            "kind": "mag.run_started",
             "run_id": "run-aaaaaaaa",
-            "total_nodes": 3,
         }),
     );
     let out = render_str(&mut engine);
     assert!(
-        out.contains("Graph run-aaaa"),
+        out.contains("MAG run-aaaa"),
         "run-panel header should appear pre-/new: {out:?}"
     );
 
@@ -678,163 +677,20 @@ fn slash_new_clears_panel_runs() {
     let _ = engine.take_emit_queue();
     let out = render_str(&mut engine);
     assert!(
-        !out.contains("Graph run-aaaa"),
+        !out.contains("MAG run-aaaa"),
         "run panel should be empty after /new: {out:?}"
     );
 }
 
-// ── Run panel (phase 7) ───────────────────────────────────────────────
+// ── Run panel ─────────────────────────────────────────────────────────
 //
-// These exercise the sidebar that subscribes to `reasoner-graph` plugin
-// lifecycle events on the canonical tool contract:
-//   * `graph.run_started { run_id, total_nodes }`
-//   * `graph.node.fired   { run_id, node_id, firing_id, reasoner }`
-//   * `tool.result        { id, result | error }`
-//     — id == firing_id closes one node; id == run_id closes the run.
-// The panel is visible by default; Ctrl+B toggles it off. Linger
-// handling is pure-update, so a completed run drops on the next event
-// after `LINGER_MS` of engine time has passed — `Engine::advance_time`
-// plus a synthetic event drives the prune deterministically without
-// sleeping.
-
-#[test]
-fn graph_run_started_creates_a_run_panel_row() {
-    let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
-    let _ = render_str(&mut engine);
-
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "graph.run_started",
-            "run_id": "run-aaaaaaaa",
-            "total_nodes": 3,
-        }),
-    );
-
-    let out = render_str(&mut engine);
-    // Header shows the abbreviated run id and (done/total) counter.
-    assert!(
-        out.contains("Graph run-aaaa"),
-        "run-panel header missing for run-aaaaaaaa: {out:?}"
-    );
-    assert!(
-        out.contains("(0/3)"),
-        "run-panel counter missing 0/3 for fresh run: {out:?}"
-    );
-}
-
-#[test]
-fn graph_node_tool_invoke_uses_path_tail_label() {
-    let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
-    let _ = render_str(&mut engine);
-
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "graph.run_started",
-            "run_id": "run-path-tail",
-            "total_nodes": 1,
-        }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "graph.node.fired",
-            "run_id": "run-path-tail",
-            "node_id": "inspect",
-            "firing_id": "f-inspect-1",
-            "reasoner": "codex",
-        }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "graph.node.tool.invoke",
-            "run_id": "run-path-tail",
-            "node_id": "inspect",
-            "tool_name": "read_file",
-            "tool_args": { "path": "/home/example/projects/public-nefor-checkout/starter/chat/log.lua" },
-        }),
-    );
-
-    let out = render_str(&mut engine);
-    assert!(
-        out.contains("read_file(.../starter/chat/log"),
-        "path tool label should keep the meaningful file tail: {out:?}"
-    );
-    assert!(
-        !out.contains("read_file(/home/example"),
-        "path tool label should not expose the absolute path head: {out:?}"
-    );
-}
-
-#[test]
-fn graph_node_dispatched_then_result_updates_status_glyph() {
-    let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
-    let _ = render_str(&mut engine);
-
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "graph.run_started",
-            "run_id": "run-bbbbbbbb",
-            "total_nodes": 2,
-        }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "graph.node.fired",
-            "run_id": "run-bbbbbbbb",
-            "node_id": "summarise",
-            "firing_id": "f-summarise-1",
-            "reasoner": "ollama",
-        }),
-    );
-
-    // After dispatch the node is "running" — the panel should render
-    // the running glyph (●) for it.
-    let out = render_str(&mut engine);
-    assert!(
-        out.contains("summarise"),
-        "node id missing from panel: {out:?}"
-    );
-    assert!(
-        out.contains('●'),
-        "running glyph (●) missing for dispatched node: {out:?}"
-    );
-
-    // Now flip the node to `done` via a tool.result keyed on firing_id.
-    // chat.lua's firing→node map (populated by graph.node.fired)
-    // resolves the id back to (run_id, node_id).
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "tool.result",
-            "id": "f-summarise-1",
-            "result": { "text": "summary text" },
-        }),
-    );
-    let out = render_str(&mut engine);
-    assert!(
-        out.contains('✓'),
-        "done glyph (✓) missing after tool.result: {out:?}"
-    );
-    // The (done/total) counter should now read 1/2.
-    assert!(
-        out.contains("(1/2)"),
-        "counter should read 1/2 after one node done: {out:?}"
-    );
-}
-
-// MAG kernel parity: the `mag.*` lifecycle stream drives the same run
-// panel reasoner-graph `graph.*` events do. Kernel runs are concurrent and
-// every event carries its run_id; the surface keys panel state straight
-// off it. The MAG panel groups actors by top-level namespace segment — an
-// agent's whole subtree collapses to a single group row.
+// The kernel's `mag.*` lifecycle stream drives the sidebar run panel.
+// Kernel runs are concurrent and every event carries its run_id; the
+// surface keys panel state straight off it. The panel groups actors by
+// top-level namespace segment — an agent's whole subtree collapses to a
+// single group row. The panel is visible by default; Ctrl+B toggles it
+// off. Linger handling is pure-update plus a view-side filter, so a
+// completed run drops after `LINGER_MS` of engine time.
 #[test]
 fn mag_run_lifecycle_renders_in_run_panel() {
     let mut engine = Engine::new(120, 24).expect("engine");
@@ -1279,42 +1135,29 @@ fn graph_run_complete_hides_run_after_linger_without_dispatch() {
 
     dispatch_event(
         &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "run-dddddddd" }),
+    );
+    dispatch_event(
+        &mut engine,
         json!({
-            "kind": "graph.run_started",
+            "kind": "mag.actor_spawned",
             "run_id": "run-dddddddd",
-            "total_nodes": 1,
+            "id": "n1",
+            "factory": "llm",
         }),
     );
     dispatch_event(
         &mut engine,
-        json!({
-            "kind": "graph.node.fired",
-            "run_id": "run-dddddddd",
-            "node_id": "n1",
-            "firing_id": "f-n1-1",
-            "reasoner": "ollama",
-        }),
+        json!({ "kind": "mag.actor_ready", "run_id": "run-dddddddd", "id": "n1" }),
     );
     dispatch_event(
         &mut engine,
-        json!({
-            "kind": "tool.result",
-            "id": "f-n1-1",
-            "result": { "text": "ok" },
-        }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "tool.result",
-            "id": "run-dddddddd",
-            "result": { "status": "success", "results": { "n1": { "output": "ok" } } },
-        }),
+        json!({ "kind": "mag.run_complete", "run_id": "run-dddddddd" }),
     );
 
     let out = render_str(&mut engine);
     assert!(
-        out.contains("Graph run-dddd"),
+        out.contains("MAG run-dddd"),
         "completed run should linger initially: {out:?}"
     );
 
@@ -1325,7 +1168,7 @@ fn graph_run_complete_hides_run_after_linger_without_dispatch() {
     engine.advance_time(Duration::from_millis(3000));
     let out = render_str(&mut engine);
     assert!(
-        !out.contains("Graph run-dddd"),
+        !out.contains("MAG run-dddd"),
         "completed run should be hidden past linger window without a dispatch: {out:?}"
     );
     assert!(
@@ -1340,46 +1183,33 @@ fn graph_run_complete_removes_run_after_linger_window() {
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
-    // Stand up a completed run: started, dispatched, result, complete.
+    // Stand up a completed run: started, spawned, ready, complete.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "run-cccccccc" }),
+    );
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "graph.run_started",
+            "kind": "mag.actor_spawned",
             "run_id": "run-cccccccc",
-            "total_nodes": 1,
+            "id": "n1",
+            "factory": "llm",
         }),
     );
     dispatch_event(
         &mut engine,
-        json!({
-            "kind": "graph.node.fired",
-            "run_id": "run-cccccccc",
-            "node_id": "n1",
-            "firing_id": "f-n1-1",
-            "reasoner": "ollama",
-        }),
+        json!({ "kind": "mag.actor_ready", "run_id": "run-cccccccc", "id": "n1" }),
     );
     dispatch_event(
         &mut engine,
-        json!({
-            "kind": "tool.result",
-            "id": "f-n1-1",
-            "result": { "text": "ok" },
-        }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "tool.result",
-            "id": "run-cccccccc",
-            "result": { "status": "success", "results": { "n1": { "output": "ok" } } },
-        }),
+        json!({ "kind": "mag.run_complete", "run_id": "run-cccccccc" }),
     );
 
     // The run is still within its linger window — header is visible.
     let out = render_str(&mut engine);
     assert!(
-        out.contains("Graph run-cccc"),
+        out.contains("MAG run-cccc"),
         "completed run should linger initially: {out:?}"
     );
 
@@ -1394,7 +1224,7 @@ fn graph_run_complete_removes_run_after_linger_window() {
     );
     let out = render_str(&mut engine);
     assert!(
-        !out.contains("Graph run-cccc"),
+        !out.contains("MAG run-cccc"),
         "completed run should be pruned past linger window: {out:?}"
     );
     // The empty-state hint should now show in the sidebar.
@@ -2051,24 +1881,27 @@ fn double_escape_after_lead_stops_emits_interrupt_all() {
 
     dispatch_event(
         &mut engine,
-        json!({ "kind": "graph.run_started", "run_id": "graph-1", "total_nodes": 1 }),
+        json!({ "kind": "mag.run_started", "run_id": "mag-run-1" }),
     );
     dispatch_event(
         &mut engine,
         json!({
-            "kind": "graph.node.fired",
-            "run_id": "graph-1",
-            "node_id": "n1",
-            "firing_id": "f-n1",
-            "reasoner": "agent",
+            "kind": "mag.actor_spawned",
+            "run_id": "mag-run-1",
+            "id": "n1",
+            "factory": "llm",
         }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_busy", "run_id": "mag-run-1", "id": "n1" }),
     );
     let _ = engine.take_emit_queue();
 
     engine.handle_key(key("escape")).expect("first esc");
     assert!(
         engine.take_emit_queue().is_empty(),
-        "first ESC while lead is idle only arms the graph-cancel rung"
+        "first ESC while lead is idle only arms the run-cancel rung"
     );
 
     engine.handle_key(key("escape")).expect("second esc");
@@ -2076,12 +1909,12 @@ fn double_escape_after_lead_stops_emits_interrupt_all() {
     assert_eq!(
         second[0].1.get("kind").and_then(|v| v.as_str()),
         Some("chat.interrupt_all"),
-        "second ESC after lead stops should cancel active graphs"
+        "second ESC after lead stops should cancel active runs"
     );
     let out = render_str(&mut engine);
     assert!(
-        out.contains('✗') || out.contains("error"),
-        "graph interrupt path should mark running graph interrupted locally: {out:?}"
+        out.contains("MAG mag-run-"),
+        "interrupted run should still render (lingering) after local mark: {out:?}"
     );
 }
 
@@ -4837,7 +4670,7 @@ fn echo_repaints_user_message_when_local_push_was_wiped_before_echo() {
         json!({
             "kind": "chat.tool.start",
             "id": "t1",
-            "name": "spawn_graph",
+            "name": "mag",
             "input": "{}",
         }),
     );
@@ -4850,10 +4683,7 @@ fn echo_repaints_user_message_when_local_push_was_wiped_before_echo() {
          between local push and echo (production bug repro). \
          Transcript:\n{out}",
     );
-    assert!(
-        out.contains("spawn_graph"),
-        "tool call must still render:\n{out}"
-    );
+    assert!(out.contains("mag"), "tool call must still render:\n{out}");
 }
 
 /// Direct production repro: at boot the first message renders fine, but
@@ -4863,7 +4693,7 @@ fn echo_repaints_user_message_when_local_push_was_wiped_before_echo() {
 /// 2. `/new` → lifecycle cycle.
 /// 3. Submit message #2 in the new session.
 /// 4. Tool call arrives (no preceding text) — the orchestrator decided
-///    to spawn_graph immediately.
+///    to dispatch a kernel run immediately.
 /// 5. Assistant streams a final answer.
 ///
 /// At step 5, the user must see message #2 above the tool call, not just
@@ -4934,7 +4764,8 @@ fn first_submit_after_slash_new_renders_user_message_when_tool_call_follows() {
     let _ = engine.take_emit_queue();
 
     // Step 4: orchestrator's echo + immediate tool_call (no preceding
-    // text/reasoning — the orchestrator went straight to spawn_graph).
+    // text/reasoning — the orchestrator went straight to the kernel
+    // dispatch).
     dispatch_event(
         &mut engine,
         json!({ "kind": "chat.message.append", "role": "user", "text": "summarize-things" }),
@@ -4944,27 +4775,19 @@ fn first_submit_after_slash_new_renders_user_message_when_tool_call_follows() {
         json!({
             "kind": "chat.tool.start",
             "id": "t1",
-            "name": "spawn_graph",
+            "name": "mag",
             "input": "{}",
         }),
     );
 
-    // Step 5: graph events + final answer.
+    // Step 5: kernel-run events + final answer.
     dispatch_event(
         &mut engine,
-        json!({
-            "kind": "graph.run_started",
-            "run_id": "r1",
-            "total_nodes": 3,
-        }),
+        json!({ "kind": "mag.run_started", "run_id": "r1" }),
     );
     dispatch_event(
         &mut engine,
-        json!({
-            "kind": "tool.result",
-            "id": "r1",
-            "result": { "status": "ok", "results": {} },
-        }),
+        json!({ "kind": "mag.run_complete", "run_id": "r1" }),
     );
     dispatch_event(
         &mut engine,
@@ -4992,7 +4815,7 @@ fn first_submit_after_slash_new_renders_user_message_when_tool_call_follows() {
          above the tool call. Production bug repro. Transcript:\n{out}",
     );
     assert!(
-        out.contains("spawn_graph") || out.contains("final-answer"),
+        out.contains("mag") || out.contains("final-answer"),
         "tool call or final answer must also be visible:\n{out}"
     );
 }
@@ -5032,13 +4855,8 @@ fn popup_paints_opaque_background_over_transcript() {
         json!({
             "kind": "chat.tool.popup_request",
             "id": "t1",
-            "tool": "spawn_graph",
-            "args": {
-                "nodes": [
-                    {"id": "a", "reasoner": "responder"},
-                    {"id": "b", "reasoner": "responder"},
-                ],
-            },
+            "tool": "bash",
+            "args": { "command": "ls -la" },
         }),
     );
     let _ = render_str(&mut engine);

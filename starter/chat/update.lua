@@ -180,7 +180,7 @@ local function handle_input_submit(msg, state)
     local cleared = shallow_merge(state, {
       entries = {}, in_flight = NIL_SENTINEL, input_value = "",
       pending = false, completion = NIL_SENTINEL,
-      runs = {}, firing_to_node = {}, sidebar_folds = {},
+      runs = {}, sidebar_folds = {},
       agent_streams = {}, scope_to_run = {},
       turn_started_at = NIL_SENTINEL,
       last_turn_duration_ms = NIL_SENTINEL,
@@ -337,7 +337,7 @@ local function handle_input_submit(msg, state)
       local cleared = shallow_merge(state, {
         entries = {}, in_flight = NIL_SENTINEL, input_value = "",
         pending = false, completion = NIL_SENTINEL,
-        runs = {}, firing_to_node = {}, sidebar_folds = {},
+        runs = {}, sidebar_folds = {},
         agent_streams = {}, scope_to_run = {},
         turn_started_at = NIL_SENTINEL,
         last_turn_duration_ms = NIL_SENTINEL,
@@ -422,7 +422,7 @@ local function handle_input_submit(msg, state)
       return shallow_merge(state, {
         input_value = "", completion = NIL_SENTINEL,
         entries = {}, in_flight = NIL_SENTINEL,
-        pending = false, runs = {}, firing_to_node = {}, sidebar_folds = {},
+        pending = false, runs = {}, sidebar_folds = {},
         agent_streams = {}, scope_to_run = {},
         turn_started_at = NIL_SENTINEL,
         last_turn_duration_ms = NIL_SENTINEL,
@@ -657,7 +657,7 @@ end
 
 local function handle_session_start(_msg, state)
   return shallow_merge(state, {
-    runs = {}, firing_to_node = {},
+    runs = {},
     agent_streams = {}, scope_to_run = {},
     lead_chat_id = NIL_SENTINEL, lead_chat_prefix = NIL_SENTINEL,
   }), {}
@@ -714,15 +714,7 @@ local function handle_message_append(msg, state)
         and text:match("^Local instruction files available") then
       local mc = msg.chat_id
       if type(mc) == "string" and #mc > 0 then
-        local binding = state.chat_id_to_node and state.chat_id_to_node[mc]
-        if binding then
-          local now = tui.now_ms()
-          local synth = "instruction files(" .. path .. ")"
-          return shallow_merge(
-            run_panel.node_tool_invoked(state, binding.run_id, binding.node_id, synth, nil, now),
-            turn_state
-          ), {}
-        end
+        -- Scoped (actor-chat) reminders stay out of the lead transcript.
         return shallow_merge(state, turn_state), {}
       end
       return transcript.push_entry(shallow_merge(state, turn_state),
@@ -735,15 +727,7 @@ local function handle_message_append(msg, state)
     if path and dir then
       local mc = msg.chat_id
       if type(mc) == "string" and #mc > 0 then
-        local binding = state.chat_id_to_node and state.chat_id_to_node[mc]
-        if binding then
-          local now = tui.now_ms()
-          local synth = "AGENTS.md(" .. path .. ")"
-          return shallow_merge(
-            run_panel.node_tool_invoked(state, binding.run_id, binding.node_id, synth, nil, now),
-            turn_state
-          ), {}
-        end
+        -- Scoped (actor-chat) reminders stay out of the lead transcript.
         return shallow_merge(state, turn_state), {}
       end
       local body = text:match("\n\n(.*)$") or ""
@@ -767,12 +751,12 @@ end
 -- binding arrives via `chat.lead.bound` (broadcast by the agentic-loop,
 -- and replayed from the session log on /resume) in one of two forms:
 --
---   * `{ chat_id }` — exact-match; a single long-lived provider chat
---     (reasoner-graph provider-wrapper firings).
 --   * `{ chat_prefix }` — prefix-match; the lead's kernel turn-program.
 --     Kernel chat handles are run-scoped and per-round
 --     (`r<K>/<actor>@r<seq>` — a new id every round), so the spawner
---     binds the `r<K>/<actor>@` prefix once per run instead.
+--     binds the `r<K>/<actor>@` prefix once per run.
+--   * `{ chat_id }` — exact-match; a single long-lived provider chat
+--     (retained for replayed logs of older sessions).
 --
 -- Foreign chats (dispatched kernel runs' actor chats, other scopes)
 -- stream on the same bus deliberately — the session log and run-panel
@@ -1182,80 +1166,6 @@ local function handle_gate_mode_changed(msg, state)
   return shallow_merge(state, { gate_mode = mode }), {}
 end
 
--- ── Graph-run observation ────────────────────────────────────────────
---
--- Consumes the reasoner-graph plugin's `graph.*` broadcast kinds. Those
--- kinds are scheduled to die with reasoner-graph at the lead-as-program
--- flip; the run panel itself outlives them via the `mag.*` stream below.
-
-local function handle_graph_run_started(msg, state)
-  if state.replay_mode then return state, {} end
-  local now = tui.now_ms()
-  return run_panel.run_started(state, msg.run_id or "", msg.total_nodes or 0, now), {}
-end
-
-local function handle_graph_node_fired(msg, state)
-  if state.replay_mode then return state, {} end
-  if (msg.run_id or "") == "" or (msg.node_id or "") == "" then return state, {} end
-  if (msg.firing_id or "") == "" then return state, {} end
-  local now = tui.now_ms()
-  local with_dispatch = run_panel.node_dispatched(state, msg.run_id, msg.node_id, msg.reasoner or "", now)
-  local prev_map = with_dispatch.firing_to_node or {}
-  local next_map = {}
-  for k, v in pairs(prev_map) do next_map[k] = v end
-  next_map[msg.firing_id] = { run_id = msg.run_id, node_id = msg.node_id }
-  return shallow_merge(with_dispatch, { firing_to_node = next_map }), {}
-end
-
-local function handle_graph_node_tool_invoke(msg, state)
-  if state.replay_mode then return state, {} end
-  if (msg.run_id or "") == "" or (msg.node_id or "") == "" then return state, {} end
-  if type(msg.tool_name) ~= "string" or #msg.tool_name == 0 then return state, {} end
-  local now = tui.now_ms()
-  return run_panel.node_tool_invoked(state, msg.run_id, msg.node_id, msg.tool_name, msg.tool_args, now), {}
-end
-
-local function handle_graph_node_chat_bound(msg, state)
-  if (msg.run_id or "") == "" or (msg.node_id or "") == "" then return state, {} end
-  if type(msg.chat_id) ~= "string" or #msg.chat_id == 0 then return state, {} end
-  local prev = state.chat_id_to_node or {}
-  local next_map = {}
-  for k, v in pairs(prev) do next_map[k] = v end
-  next_map[msg.chat_id] = { run_id = msg.run_id, node_id = msg.node_id }
-  return shallow_merge(state, { chat_id_to_node = next_map }), {}
-end
-
-local function handle_tool_result(msg, state)
-  if state.replay_mode then return state, {} end
-  local id = msg.id
-  if type(id) ~= "string" or id == "" then return state, {} end
-  local now = tui.now_ms()
-  -- Run-close: id matches a tracked run.
-  if state.runs and state.runs[id] then
-    local result = msg.result
-    local status, results
-    if type(result) == "table" then
-      status  = result.status
-      results = result.results
-    end
-    return run_panel.run_complete(state, id, status, results, now), {}
-  end
-  -- Per-firing close: look up firing_id → (run_id, node_id) map.
-  local map_entry = (state.firing_to_node or {})[id]
-  if map_entry then
-    local run_id  = map_entry.run_id
-    local node_id = map_entry.node_id
-    local has_output = msg.result ~= nil
-    local has_error  = msg.error  ~= nil
-    local next_state = run_panel.node_result(state, run_id, node_id, has_output, has_error, now)
-    local next_map = {}
-    for k, v in pairs(state.firing_to_node or {}) do next_map[k] = v end
-    next_map[id] = nil
-    return shallow_merge(next_state, { firing_to_node = next_map }), {}
-  end
-  return state, {}
-end
-
 -- ── MAG kernel observation ────────────────────────────────────────────
 --
 -- The mag plugin relays the kernel's `mag.*` lifecycle stream onto the bus
@@ -1399,10 +1309,6 @@ local handlers = {
   ["chat.auth.status"]            = handle_auth_status,
   ["chat.tool.popup_request"]     = handle_tool_popup_request,
   ["tool-gate.mode_changed"]      = handle_gate_mode_changed,
-  ["graph.run_started"]           = handle_graph_run_started,
-  ["graph.node.fired"]            = handle_graph_node_fired,
-  ["graph.node.tool.invoke"]      = handle_graph_node_tool_invoke,
-  ["graph.node.chat.bound"]       = handle_graph_node_chat_bound,
   ["mag.run_started"]             = handle_mag_run_started,
   ["mag.actor_spawned"]           = handle_mag_actor_spawned,
   ["mag.actor_ready"]             = handle_mag_actor_ready,
@@ -1412,7 +1318,6 @@ local handlers = {
   ["mag.modification_rejected"]   = handle_mag_modification_rejected,
   ["mag.modification_noop"]       = handle_mag_modification_noop,
   ["mag.run_complete"]            = handle_mag_run_complete,
-  ["tool.result"]                 = handle_tool_result,
   ["mouse.selection"]             = handle_mouse_selection,
 }
 
@@ -1538,7 +1443,7 @@ local function route_keys_and_popups(msg, state)
         return shallow_merge(state, {
           popup = NIL_SENTINEL,
           entries = {}, in_flight = NIL_SENTINEL,
-          pending = false, runs = {}, firing_to_node = {}, sidebar_folds = {},
+          pending = false, runs = {}, sidebar_folds = {},
           turn_started_at = NIL_SENTINEL,
           last_turn_duration_ms = NIL_SENTINEL,
           queued_entry_idx = NIL_SENTINEL,

@@ -17,10 +17,7 @@
 -- are the canonical set; routing references the same strings.
 --
 -- ── event-kind set (flagged) ────────────────────────────────────────────────
--- Parity+ with reasoner-graph's broadcast markers (graph.run_started,
--- graph.node_dispatched, graph.run_complete); snake_case, `mag.`-qualified to
--- match that convention. The set is deliberately richer than reasoner-graph so
--- the control-plane view is structurally better, not just non-regressed:
+-- snake_case, `mag.`-qualified broadcast markers:
 --   mag.run_started            a run/program began (wiring, before the first mod)
 --   mag.actor_spawned          the fold registered a new id (never-existed→alive)
 --   mag.actor_ready            the instance constructed at its first activation
@@ -95,7 +92,7 @@ end
 
 -- Emit `mag.run_started`. The wiring/host calls this at the start of a run,
 -- before the initial modification is applied, so observers record the run up
--- front (parity with reasoner-graph's RunStarted). Run identity is host-
+-- front. Run identity is host-
 -- provided and passed through untouched. `scope` is the run's wire-id scope
 -- token (`r<K>` — init.lua, run contexts): everything this run puts on the
 -- shared bus that must resolve back to it is `<scope>/`-prefixed (capability

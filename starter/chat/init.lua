@@ -14,7 +14,7 @@
 --   chat.session.stats, chat.tool.start, chat.tool.end,
 --   chat.popup, chat.auth.status, chat.model.set_ack, chat.models.listed,
 --   chat.tool.popup_request, tool-gate.mode_changed,
---   graph.run_started, graph.node.fired, tool.result.
+--   mag.run_started and the rest of the mag.* kernel lifecycle stream.
 --
 -- Outbound:
 --   chat.input.submit, chat.interrupt, chat.interrupt_all, chat.reset,

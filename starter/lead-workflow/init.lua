@@ -88,7 +88,6 @@ local state = {
   active_runs = {},
   completed_runs = {},
   completed_run_limit = 10,
-  firing_to_node = {},
 
   -- The single in-flight plan slot. Lifetime is one verdict turn:
   -- created by write-review, decided by /approve or /reject, flushed
@@ -750,7 +749,6 @@ local function ordered_node_summaries(run)
         role = node.role,
         reasoner = node.reasoner,
         status = node.status,
-        firing_id = node.firing_id,
         started_at = node.started_at,
         completed_at = node.completed_at,
         last_tool = node.last_tool,
@@ -814,7 +812,6 @@ local function archive_canceled_run(run_id, reason)
         node.status = "canceled"
         node.completed_at = node.completed_at or ts
       end
-      if node.firing_id then state.firing_to_node[node.firing_id] = nil end
     end
   end
   state.active_runs[run_id] = nil
@@ -854,76 +851,10 @@ local function finish_run(run_id, status, results, explicit_error)
       node.completed_at = node.completed_at or ts
       if explicit_error then node.error = explicit_error end
     end
-    if node and node.firing_id then state.firing_to_node[node.firing_id] = nil end
   end
   state.active_runs[run_id] = nil
   if state.active_run_id == run_id then state.active_run_id = nil end
   archive_run(run)
-end
-
-local function mark_run_started(body)
-  local run_id = body.run_id
-  local run = type(run_id) == "string" and state.active_runs[run_id] or nil
-  if not run then return end
-  run.status = "running"
-  run.updated_at = now_ms()
-end
-
-local function mark_node_fired(body)
-  local run_id, node_id, firing_id = body.run_id, body.node_id, body.firing_id
-  local run = type(run_id) == "string" and state.active_runs[run_id] or nil
-  local node = run and run.nodes and run.nodes[node_id]
-  if not node then return end
-  local ts = now_ms()
-  run.status = "running"
-  run.updated_at = ts
-  node.status = "running"
-  node.reasoner = body.reasoner or node.reasoner
-  node.firing_id = firing_id
-  node.started_at = node.started_at or ts
-  if type(firing_id) == "string" and firing_id ~= "" then
-    state.firing_to_node[firing_id] = { run_id = run_id, node_id = node_id }
-  end
-end
-
-local function mark_node_tool(body)
-  local run = type(body.run_id) == "string" and state.active_runs[body.run_id] or nil
-  local node = run and run.nodes and run.nodes[body.node_id]
-  if not node then return end
-  run.updated_at = now_ms()
-  node.last_tool = body.tool_name or body.name
-  node.last_tool_args = body.tool_args or body.args
-end
-
-local function mark_node_chat_bound(body)
-  local run = type(body.run_id) == "string" and state.active_runs[body.run_id] or nil
-  local node = run and run.nodes and run.nodes[body.node_id]
-  if not node then return end
-  run.updated_at = now_ms()
-  node.chat_id = body.chat_id
-end
-
-local function mark_firing_result(body)
-  local id = body.id
-  local map = type(id) == "string" and state.firing_to_node[id] or nil
-  if not map then return end
-  local run = state.active_runs[map.run_id]
-  local node = run and run.nodes and run.nodes[map.node_id]
-  state.firing_to_node[id] = nil
-  if not node then return end
-  local ts = now_ms()
-  run.updated_at = ts
-  node.completed_at = ts
-  if body.error ~= nil then
-    node.status = "error"
-    node.error = body.error
-  else
-    node.status = "done"
-    if type(body.result) == "table" then
-      node.output_path = body.result.output_path
-      node.output_relpath = body.result.output_relpath
-    end
-  end
 end
 
 -- The tracked run a kernel lifecycle event belongs to. Every kernel event
@@ -937,9 +868,10 @@ end
 
 -- `mag.run_started`: mark the run running.
 local function mark_mag_run_started(body)
-  if mag_event_run(body) then
-    mark_run_started(body)
-  end
+  local run = mag_event_run(body)
+  if not run then return end
+  run.status = "running"
+  run.updated_at = now_ms()
 end
 
 -- Track one kernel actor lifecycle transition against its run's node table —
@@ -1041,12 +973,9 @@ local function mag_result_text(result)
   return nil
 end
 
--- Relay a kernel run's completion to the model as a fresh orchestrator turn,
--- via the SAME mechanism agentic-loop's sub-graph completions use
--- (deferred-queue + flush → new user-role turn). Parity: the reasoner-graph
--- path gets this relay from agentic-loop's close_sub_graph; the kernel path
--- drives execution outside that queue, so the lead injects the completion turn
--- itself. `format_deferred` frames it; the output carries the sink PATH plus the
+-- Relay a kernel run's completion to the model as a fresh orchestrator turn
+-- (agentic-loop's deferred-queue + flush → new user-role turn).
+-- `format_deferred` frames it; the output carries the sink PATH plus the
 -- content read from it.
 local function relay_kernel_completion(run_id, ok, output_path, content, err)
   local al = require("agentic-loop")
@@ -1071,9 +1000,8 @@ local function relay_kernel_completion(run_id, ok, output_path, content, err)
   end
 end
 
--- Append the transcript run-result block for a closed kernel run, the kernel
--- equivalent of the reasoner-graph path's close_sub_graph → chat.graph_result
--- .append (agentic-loop). Carries status + run id/name + the sink's output
+-- Append the transcript run-result block (`chat.graph_result.append`) for a
+-- closed kernel run. Carries status + run id/name + the sink's output
 -- PATH; the output CONTENT is deliberately omitted — it arrives separately as
 -- the relayed fresh turn (relay_kernel_completion), so duplicating it here
 -- would double-render it. `run` is read after finish_run, whose node-status
@@ -1720,37 +1648,6 @@ local function receive_msg(entry)
     return
   end
 
-  if kind == "graph.run_started" then
-    mark_run_started(body)
-    return
-  end
-  if kind == "graph.node.fired" then
-    mark_node_fired(body)
-    return
-  end
-  if kind == "graph.node.tool.invoke" then
-    mark_node_tool(body)
-    return
-  end
-  if kind == "graph.node.chat.bound" then
-    mark_node_chat_bound(body)
-    return
-  end
-
-  -- Watch for graph and per-node close envelopes so graph-status can
-  -- report current node state and archive compact summaries on close.
-  if kind == "tool.result" then
-    local id = body.id
-    if type(id) == "string"
-        and type(body.result) == "table"
-        and body.result.status ~= nil then
-      finish_run(id, body.result.status, body.result.results, body.error)
-    else
-      mark_firing_result(body)
-    end
-    return
-  end
-
   -- Tool-gate hello — advertise our tools on first sight. Narrowed
   -- to `tool-gate.hello` specifically: matching any `*.hello` would
   -- mean the first non-gate plugin to say hello silently locks the
@@ -1797,7 +1694,6 @@ return {
       state.active_run_id = nil
       state.active_runs = {}
       state.completed_runs = {}
-      state.firing_to_node = {}
       state.active_plan = nil
       state.gate_mode = "safe"
       state.kernel_factories = {}

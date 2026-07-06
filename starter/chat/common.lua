@@ -146,60 +146,14 @@ function M.pad_block(text)
   return table.concat(lines, "\n")
 end
 
--- The spawn_graph tool returns a verbose acknowledgment string:
---   "Submitted sub-graph run_id=<id>. Acknowledge briefly to the user,
---    or chain another tool call. The real result will arrive later as
---    a user message tagged `[spawn_graph(run_id=<id>) result]`."
--- That whole blob is LLM instruction noise. Surface just the run_id —
--- progress is already visible in the run panel.
-function M.format_spawn_graph_output(output)
-  if type(output) ~= "string" or #output == 0 then return output end
-  local run_id = output:match("run_id=([%w%-]+)")
-  if run_id then return "submitted as " .. run_id end
-  return output
-end
-
--- Render a `spawn_graph` args.graph as a compact node-list + edge-list.
--- Args of each node are deliberately omitted so the popup stays
--- scannable; a future "focus a node" UI can surface them on demand.
-function M.format_graph(graph)
-  if type(graph) ~= "table" then return tostring(graph) end
-  local lines = {}
-  local nodes = graph.nodes
-  if type(nodes) == "table" and #nodes > 0 then
-    lines[#lines + 1] = "nodes:"
-    for _, n in ipairs(nodes) do
-      local id = n.id or n.name or "?"
-      local reasoner = n.reasoner or n.kind or n.type or "?"
-      lines[#lines + 1] = "  " .. id .. " (" .. reasoner .. ")"
-    end
-  end
-  local edges = graph.edges
-  if type(edges) == "table" and #edges > 0 then
-    if #lines > 0 then lines[#lines + 1] = "" end
-    lines[#lines + 1] = "edges:"
-    for _, e in ipairs(edges) do
-      local from = e.from or e.src or e[1] or "?"
-      local to   = e.to   or e.dst or e[2] or "?"
-      lines[#lines + 1] = "  " .. from .. " -> " .. to
-    end
-  end
-  if #lines == 0 then return "(empty graph)" end
-  return table.concat(lines, "\n")
-end
-
 -- Pretty-print an args table from a `chat.tool.popup_request` event
 -- so the popup body shows a human-legible summary of the call.
 -- Stringy values render verbatim; nested tables get a compact `{...}`
 -- placeholder rather than a recursive dump (most tools take flat args,
--- and a long nested blob would blow up the popup anyway). The
--- `spawn_graph` tool gets a dedicated layout.
+-- and a long nested blob would blow up the popup anyway).
 function M.format_args(args)
   if args == nil then return "" end
   if type(args) ~= "table" then return tostring(args) end
-  if type(args.graph) == "table" then
-    return M.format_graph(args.graph)
-  end
   local keys = {}
   for k, _ in pairs(args) do
     if type(k) == "string" then keys[#keys + 1] = k end

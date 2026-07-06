@@ -64,7 +64,7 @@ local function fresh()
   agentic_loop._internals.reset()
   sessions._internals.reset_state()
   sessions.init()
-  _test.set_plugins({ "reasoner-graph", "tool-gate", "nefor-tui" })
+  _test.set_plugins({ "mag", "tool-gate", "nefor-tui" })
   _test.calls_clear()
 end
 

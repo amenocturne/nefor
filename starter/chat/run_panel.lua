@@ -1,7 +1,7 @@
--- Run-panel sidebar widget: renders the active graph/kernel runs as a
--- column of run-headers + per-node rows, and owns the small set of
--- pure-state mutators (run_started, node_dispatched, node_result,
--- run_complete, prune) the chat reducer calls.
+-- Run-panel sidebar widget: renders the active kernel runs as a column
+-- of run-headers + grouped actor rows, and owns the pure-state mutators
+-- (mag_run_started, actor_* transitions, mag_run_complete, prune) the
+-- chat reducer calls.
 
 local common = require("chat.common")
 local agent_streams = require("chat.agent_streams")
@@ -19,8 +19,8 @@ local GLYPHS = {
   done    = "✓",
   error   = "✗",
   skipped = "⊘",
-  -- MAG-only: a killed actor is a deliberate termination, distinct from a
-  -- failed one (reasoner-graph never had this state — richer-than-parity).
+  -- A killed actor is a deliberate termination, distinct from a failed
+  -- one.
   killed  = "⊗",
   -- MAG member activity states (mag.actor_busy / mag.actor_idle): `working`
   -- is a live activation (ticks its CURRENT activation's elapsed), `idle` is
@@ -46,7 +46,7 @@ local NODE_STYLE = {
 }
 
 -- Node statuses that count as terminal (drive the done/total counter and
--- freeze the elapsed timer). MAG's `killed` joins the reasoner-graph set.
+-- freeze the elapsed timer).
 local TERMINAL_STATUS = {
   done = true, error = true, skipped = true, killed = true,
 }
@@ -107,41 +107,10 @@ function M.any_active(runs, now_ms)
   return false
 end
 
-local function run_header_title(run)
-  -- Reasoner-graph runs key on the abbreviated run id; MAG runs carry a
-  -- human `run_name` (the .mag graph name) worth showing verbatim.
-  local ident
-  if type(run.run_name) == "string" and #run.run_name > 0 then
-    ident = run.run_name
-  else
-    ident = run.run_id and run.run_id:sub(1, 8) or "?"
-  end
-  local label = run.label or "Graph"
-  local total = run.total_nodes or 0
-  local nodes = run.nodes or {}
-  local done = 0
-  local nodes_count = 0
-  for _, n in pairs(nodes) do
-    nodes_count = nodes_count + 1
-    if TERMINAL_STATUS[n.status] then
-      done = done + 1
-    end
-  end
-  if nodes_count > total then total = nodes_count end
-  local title = string.format("%s %s (%d/%d)", label, ident, done, total)
-  -- Rejected / no-op modification counters (MAG-only) trail the counter so
-  -- a run that is churning against validation reads distinctly.
-  local extra = {}
-  if (run.rejected or 0) > 0 then extra[#extra + 1] = "✗" .. run.rejected .. " rej" end
-  if (run.noops or 0) > 0 then extra[#extra + 1] = "⊘" .. run.noops end
-  if #extra > 0 then title = title .. "  " .. table.concat(extra, " ") end
-  return title
-end
-
--- Elapsed window for a node/actor row: live-ticking while running (whole
--- life; reasoner-graph nodes) or working (the CURRENT activation only,
--- resetting each mag.actor_busy), frozen at the finish stamp once terminal.
--- Idle carries no window — a between-activations actor shows no timer.
+-- Elapsed window for an actor row: live-ticking while working (the
+-- CURRENT activation only, resetting each mag.actor_busy), frozen at
+-- the finish stamp once terminal. Idle carries no window — a
+-- between-activations actor shows no timer.
 local function node_elapsed_ms(node, now_ms)
   if node.status == "running" then
     return now_ms - (node.started_at_ms or now_ms)
@@ -155,52 +124,14 @@ local function node_elapsed_ms(node, now_ms)
   return nil
 end
 
-local function node_row_parts(node_id, node, now_ms, narrow)
-  local glyph = GLYPHS[node.status] or "·"
-  local style = NODE_STYLE[node.status] or STYLE.status_dim
-  local elapsed = node_elapsed_ms(node, now_ms)
-  local elapsed_str = elapsed and (" " .. fmt_elapsed_ms(elapsed)) or ""
-  local text
-  if narrow then
-    text = glyph .. " " .. node_id .. elapsed_str
-  else
-    local reasoner = node.reasoner or ""
-    local status_word = node.status or "?"
-    text = string.format("%s %s  %s  %s%s",
-      glyph, node_id, reasoner, status_word, elapsed_str)
-  end
-  return text, style
-end
-
--- Indented sub-line: "what the agent inside this node is doing right
--- now" (last tool dispatched to tool-gate). Only shown while the node
--- is running — once it terminates, the status glyph + the transcript
--- carry the signal and the leftover tool name is noise.
-local function node_tool_subrow(node)
-  if node.status ~= "running" or type(node.last_tool) ~= "string"
-      or #node.last_tool == 0 then
-    return nil
-  end
-  local label = node.last_tool
-  if type(node.last_tool_args) == "string" and #node.last_tool_args > 0 then
-    label = label .. "(" .. node.last_tool_args .. ")"
-  end
-  return tui.text {
-    content = "  → " .. label,
-    style   = STYLE.status_dim,
-    wrap    = "none",
-  }
-end
-
 -- ── MAG namespace grouping (display model) ────────────────────────────
 --
--- The MAG run panel collapses a run's actors into top-level namespace
+-- The run panel collapses a run's actors into top-level namespace
 -- groups: an actor id's group is its segment up to the first ".". Group
 -- rows aggregate member state; per-member states are retained inside each
 -- group (a future expand/collapse toggle reads them straight off the same
 -- `run.nodes` store). An undotted id (e.g. `sink`) is its own single-
--- member group. This path is MAG-only — reasoner-graph runs keep the flat
--- per-node rendering in `run_header` / `node_rows`.
+-- member group.
 
 local function group_of(actor_id)
   return actor_id:match("^([^.]+)") or actor_id
@@ -304,9 +235,9 @@ local function group_row_parts(group, now_ms, folded)
   return text, style
 end
 
--- MAG run header. Counts GROUPS (not raw actors): "(done/total)" where a
--- group is done once its aggregated status is terminal. Mirrors the flat
--- header's rejected / no-op modification tail.
+-- Run header. Counts GROUPS (not raw actors): "(done/total)" where a
+-- group is done once its aggregated status is terminal, with a trailing
+-- rejected / no-op modification tail.
 local function mag_run_header_title(run, groups)
   local ident
   if type(run.run_name) == "string" and #run.run_name > 0 then
@@ -314,7 +245,7 @@ local function mag_run_header_title(run, groups)
   else
     ident = run.run_id and run.run_id:sub(1, 8) or "?"
   end
-  local label = run.label or "MAG"
+  local label = "MAG"
   local done = 0
   for _, g in ipairs(groups) do
     if TERMINAL_STATUS[g.status] then done = done + 1 end
@@ -361,7 +292,7 @@ end
 -- into the same list to move the cursor and resolve Enter, so the
 -- highlighted row and the row acted on can never drift apart.
 --
--- Per-group stored fold state, DEFAULT COLLAPSED: a MAG group's member
+-- Per-group stored fold state, DEFAULT COLLAPSED: a group's member
 -- actor rows render only while `state.sidebar_folds[run_id][group]` is
 -- set (Enter on the group row toggles it — update.lua). Members of a
 -- collapsed group are not rows at all, so the cursor skips them by
@@ -375,32 +306,22 @@ function M.row_model(state, now_ms)
   for _, run_id in ipairs(sorted_keys(runs)) do
     local run = runs[run_id]
     if not is_expired(run, now_ms) then
-      if run.label == "MAG" then
-        local groups = build_groups(run)
-        rows[#rows + 1] = { kind = "run_header", run_id = run_id, run = run, groups = groups }
-        local run_streams = streams[run_id] or {}
-        local run_folds = folds[run_id] or {}
-        for _, g in ipairs(groups) do
-          local unfolded = run_folds[g.name] == true
-          rows[#rows + 1] = {
-            kind = "group", run_id = run_id, group = g, folded = not unfolded,
-          }
-          if unfolded then
-            for _, m in ipairs(g.members) do
-              rows[#rows + 1] = {
-                kind = "actor", run_id = run_id, actor_id = m.id,
-                node = m.node, stream = run_streams[m.id],
-              }
-            end
+      local groups = build_groups(run)
+      rows[#rows + 1] = { kind = "run_header", run_id = run_id, run = run, groups = groups }
+      local run_streams = streams[run_id] or {}
+      local run_folds = folds[run_id] or {}
+      for _, g in ipairs(groups) do
+        local unfolded = run_folds[g.name] == true
+        rows[#rows + 1] = {
+          kind = "group", run_id = run_id, group = g, folded = not unfolded,
+        }
+        if unfolded then
+          for _, m in ipairs(g.members) do
+            rows[#rows + 1] = {
+              kind = "actor", run_id = run_id, actor_id = m.id,
+              node = m.node, stream = run_streams[m.id],
+            }
           end
-        end
-      else
-        rows[#rows + 1] = { kind = "run_header", run_id = run_id, run = run }
-        for _, node_id in ipairs(sorted_keys(run.nodes or {})) do
-          rows[#rows + 1] = {
-            kind = "node", run_id = run_id, node_id = node_id,
-            node = run.nodes[node_id],
-          }
         end
       end
     end
@@ -417,7 +338,7 @@ function M.clamp_cursor(cursor, row_count)
   return cur
 end
 
-local function panel_children(state, now_ms, narrow)
+local function panel_children(state, now_ms)
   -- View-side filter note: row_model drops completed runs past their
   -- linger window at paint time so the panel updates on the
   -- wallclock_tick re-render even though the reducer-side `prune` only
@@ -435,9 +356,7 @@ local function panel_children(state, now_ms, narrow)
         children[#children + 1] = tui.text { content = "", wrap = "none" }
       end
       first_run = false
-      local title = row.groups
-        and mag_run_header_title(row.run, row.groups)
-        or  run_header_title(row.run)
+      local title = mag_run_header_title(row.run, row.groups)
       children[#children + 1] = tui.text {
         content = title,
         style   = on_cursor and CURSOR_ROW_STYLE or STYLE.footer,
@@ -464,15 +383,6 @@ local function panel_children(state, now_ms, narrow)
           wrap    = "none",
         }
       end
-    else
-      local text, style = node_row_parts(row.node_id, row.node, now_ms, narrow)
-      children[#children + 1] = tui.text {
-        content = text,
-        style   = on_cursor and CURSOR_ROW_STYLE or style,
-        wrap    = "none",
-      }
-      local sub = node_tool_subrow(row.node)
-      if sub ~= nil then children[#children + 1] = sub end
     end
   end
   if #children == 0 then
@@ -486,13 +396,12 @@ local function panel_children(state, now_ms, narrow)
 end
 
 function M.panel(state)
-  local narrow = true
   local now_ms = tui.now_ms()
   local children = {
     tui.text { content = "Graph", style = STYLE.footer, wrap = "none" },
     tui.text { content = string.rep("─", 30), style = STYLE.footer, wrap = "none" },
   }
-  for _, c in ipairs(panel_children(state, now_ms, narrow)) do
+  for _, c in ipairs(panel_children(state, now_ms)) do
     children[#children + 1] = c
   end
   return tui.constrained {
@@ -531,159 +440,6 @@ local function apply(state, run_id, fn)
   return shallow_merge(state, { runs = new_runs })
 end
 
-function M.run_started(state, run_id, total_nodes, now_ms)
-  if state.runs and state.runs[run_id] then return state end
-  return apply(state, run_id, function(_)
-    return {
-      run_id = run_id, total_nodes = total_nodes or 0,
-      started_at_ms = now_ms, nodes = {},
-      completed_at_ms = nil, status = nil,
-    }
-  end)
-end
-
-function M.node_dispatched(state, run_id, node_id, reasoner, now_ms)
-  return apply(state, run_id, function(prev)
-    local run = prev or {
-      run_id = run_id, total_nodes = 0, started_at_ms = now_ms,
-      nodes = {}, completed_at_ms = nil,
-    }
-    local nodes = {}
-    for k, v in pairs(run.nodes or {}) do nodes[k] = v end
-    nodes[node_id] = {
-      reasoner = reasoner or "",
-      status = "running",
-      started_at_ms = now_ms,
-      finished_at_ms = nil,
-    }
-    return shallow_merge(run, { nodes = nodes })
-  end)
-end
-
--- Format a tool's args into a short single-line string for the run
--- panel's "currently calling X" sub-row. The goal is to make
--- parallel agents distinguishable when they happen to use the same
--- tool name (e.g. three explorers all running `bash` with different
--- commands). Per-tool extractors for the common cases; generic first-
--- string-arg fallback for everything else.
-local TOOL_ARG_KEYS = {
-  bash         = { "command" },
-  read_file    = { "path", "file_path" },
-  read_image   = { "path", "file_path" },
-  write_file   = { "path", "file_path" },
-  edit_file    = { "path", "file_path", "target_path" },
-  list_dir     = { "path" },
-  search_text  = { "pattern", "query", "text" },
-}
-
-local PATH_TOOLS = {
-  read_file  = true,
-  read_image = true,
-  write_file = true,
-  edit_file  = true,
-  list_dir   = true,
-}
-
-local function format_path_arg_short(path, max_len)
-  if #path <= max_len then return path end
-  local prefix = ".../"
-  local budget = max_len - #prefix
-  local parts = {}
-  for part in path:gmatch("[^/]+") do parts[#parts + 1] = part end
-  local tail = ""
-  for i = #parts, 1, -1 do
-    local candidate = tail == "" and parts[i] or (parts[i] .. "/" .. tail)
-    if #candidate > budget then break end
-    tail = candidate
-  end
-  if tail == "" then tail = path:sub(-budget) end
-  return prefix .. tail
-end
-
-local function format_tool_args_short(tool_name, args)
-  if type(args) ~= "table" then return "" end
-  local keys = TOOL_ARG_KEYS[tool_name]
-  local picked
-  if keys then
-    for _, k in ipairs(keys) do
-      local v = args[k]
-      if type(v) == "string" and #v > 0 then picked = v; break end
-    end
-  end
-  if picked == nil then
-    -- Generic: first string-valued arg (sorted-key order for
-    -- determinism so the same args render the same way each turn).
-    local sorted = {}
-    for k, _ in pairs(args) do
-      if type(k) == "string" then sorted[#sorted + 1] = k end
-    end
-    table.sort(sorted)
-    for _, k in ipairs(sorted) do
-      local v = args[k]
-      if type(v) == "string" and #v > 0 then picked = v; break end
-    end
-  end
-  if picked == nil then return "" end
-  -- Compact whitespace + truncate. Newlines turn the row multi-line
-  -- and break sidebar layout; replace them.
-  picked = picked:gsub("[\r\n]+", " ")
-  local MAX = 40
-  if PATH_TOOLS[tool_name] then
-    picked = format_path_arg_short(picked, MAX)
-  elseif #picked > MAX then
-    picked = picked:sub(1, MAX - 1) .. "…"
-  end
-  return picked
-end
-
-function M.node_tool_invoked(state, run_id, node_id, tool_name, tool_args, now_ms)
-  -- Only stamp progress for nodes we've observed dispatch for. If we
-  -- haven't seen `graph.node.fired` for this (run, node) yet — out-of-
-  -- order delivery, replay tail, whatever — drop quietly rather than
-  -- synthesise a partial node row that misses `reasoner` / start time.
-  if not (state.runs and state.runs[run_id]
-      and state.runs[run_id].nodes
-      and state.runs[run_id].nodes[node_id]) then
-    return state
-  end
-  local short_args = format_tool_args_short(tool_name, tool_args)
-  return apply(state, run_id, function(prev)
-    local nodes = {}
-    for k, v in pairs(prev.nodes or {}) do nodes[k] = v end
-    nodes[node_id] = shallow_merge(nodes[node_id], {
-      last_tool       = tool_name,
-      last_tool_args  = short_args,
-      last_tool_at_ms = now_ms,
-    })
-    return shallow_merge(prev, { nodes = nodes })
-  end)
-end
-
-function M.node_result(state, run_id, node_id, has_output, has_error, now_ms)
-  local terminal_status
-  if has_output then terminal_status = "done"
-  elseif has_error then terminal_status = "error"
-  else terminal_status = "error" end
-  -- Drop results for nodes we haven't observed dispatch for. In live
-  -- mode this shouldn't happen; if it does, the result is visible in
-  -- logs and that's the right place to investigate, not a synthetic
-  -- panel entry that papers over the gap.
-  if not (state.runs and state.runs[run_id]
-      and state.runs[run_id].nodes
-      and state.runs[run_id].nodes[node_id]) then
-    return state
-  end
-  return apply(state, run_id, function(prev)
-    local nodes = {}
-    for k, v in pairs(prev.nodes or {}) do nodes[k] = v end
-    local node = nodes[node_id]
-    nodes[node_id] = shallow_merge(node, {
-      status = terminal_status, finished_at_ms = now_ms,
-    })
-    return shallow_merge(prev, { nodes = nodes })
-  end)
-end
-
 -- User-initiated interrupt (double-ESC). Flip every still-running
 -- node to `error` so it renders red — "interrupted" is a failure
 -- from the run's POV, same as a backend crash. Stamp completed_at_ms
@@ -715,46 +471,21 @@ function M.interrupt_all(state, now_ms)
   return shallow_merge(state, { runs = new_runs })
 end
 
-function M.run_complete(state, run_id, status, results, now_ms)
-  if not (state.runs and state.runs[run_id]) then return state end
-  return apply(state, run_id, function(prev)
-    local nodes = {}
-    for k, v in pairs(prev.nodes or {}) do nodes[k] = v end
-    if type(results) == "table" then
-      for node_id, entry in pairs(results) do
-        if type(entry) == "table" and entry.skipped == true then
-          nodes[node_id] = {
-            reasoner = nodes[node_id] and nodes[node_id].reasoner or "",
-            status = "skipped",
-            started_at_ms = nodes[node_id] and nodes[node_id].started_at_ms or now_ms,
-            finished_at_ms = now_ms,
-          }
-        end
-      end
-    end
-    return shallow_merge(prev, {
-      nodes = nodes, completed_at_ms = now_ms, status = status,
-    })
-  end)
-end
-
 -- ── MAG actor-kernel lifecycle ────────────────────────────────────────
 --
--- The kernel's `mag.*` event stream drives the same run panel the
--- reasoner-graph `graph.*` events do (kinds that die with reasoner-graph
--- at the lead-as-program flip), so a kernel run is visible
--- the same way. Actors are the panel's "nodes", with activity-honest
--- states: spawned → pending, ready → idle (constructed), busy → working
--- (ticks its current activation), idle → idle (between activations, no
--- timer), killed → killed (distinct), run-complete → the run finalises
--- (still-live actors flip to done). Every event carries its run_id; the
--- reducer keys panel state straight off it.
+-- The kernel's `mag.*` event stream drives the run panel. Actors are
+-- the panel's "nodes", with activity-honest states: spawned → pending,
+-- ready → idle (constructed), busy → working (ticks its current
+-- activation), idle → idle (between activations, no timer), killed →
+-- killed (distinct), run-complete → the run finalises (still-live
+-- actors flip to done). Every event carries its run_id; the reducer
+-- keys panel state straight off it.
 
 function M.mag_run_started(state, run_id, run_name, now_ms)
   if state.runs and state.runs[run_id] then return state end
   return apply(state, run_id, function(_)
     return {
-      run_id = run_id, run_name = run_name, label = "MAG",
+      run_id = run_id, run_name = run_name,
       total_nodes = 0, started_at_ms = now_ms, nodes = {},
       completed_at_ms = nil, status = nil, rejected = 0, noops = 0,
       actor_seq = 0,
@@ -888,7 +619,7 @@ end
 -- Terminal completion for a kernel run. There is no per-actor "done" event
 -- in the stream, so every still-live actor flips to done here; a killed
 -- actor keeps its terminal state. Stamps `completed_at_ms` so the linger +
--- prune path fades the run out exactly like a reasoner-graph completion.
+-- prune path fades the run out.
 function M.mag_run_complete(state, run_id, status, now_ms)
   if not (state.runs and state.runs[run_id]) then return state end
   return apply(state, run_id, function(prev)
