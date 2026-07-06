@@ -125,7 +125,7 @@ Data flow subsumes dependency: if `A -> B` carries data, B structurally cannot
 fire before A's output arrives. There is no separate dependency graph in the
 IR — the authoring layer may present dataflow and firing constraints as two
 views, but both lower to routes plus input contracts. Ordering without data
-is a status-typed route (`mag.Completed`, failure variants), consumed like any
+is a status-typed route (`mag.Unit`, failure variants), consumed like any
 other input.
 
 Dependencies use the same language: "A depends on C finishing" is the edge
@@ -202,7 +202,12 @@ Unit activation at lowering (lowering.md, Shell defaults).
   lived). Only never-existed targets — message or route — reject: that is a
   typo, not a race. A DYNAMIC mismatch validation cannot see (a message
   whose kind no port of a live target accepts) escalates at delivery as
-  `mag.run_failed` instead of silently dropping.
+  `mag.run_failed` instead of silently dropping. One injected kind gets a
+  stronger message check: a `mag.ApprovalReply` message must target a
+  CONSTRUCTED actor — a reply answers an outstanding request, and a request
+  implies a constructed gate — so a reply at a registered-but-unconstructed
+  target rejects the modification, while a reply at a dead target stays a
+  race-artifact drop (actor-model.md, The approval boundary).
 - **The modification log is the run.** Graph state at any moment is a
   prefix of the fold; replay is deterministic even though arrival order was
   not. Debugging is diffing prefixes.

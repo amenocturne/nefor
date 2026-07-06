@@ -20,6 +20,8 @@
 -- Lifecycle). Rule evaluation is still a separate task (a non-empty `rules`
 -- list is rejected "not implemented").
 
+local kinds = require("kinds")
+
 local M = {}
 
 -- Per-id lifecycle states. Absence from the map is the third state,
@@ -210,6 +212,31 @@ local function validate(self, mod)
     local entry = self.actors[msg.to]
     if entry == nil and not spawned[msg.to] then
       return nil, string.format("unknown message target '%s'", msg.to)
+    end
+    -- Control-plane reply injection (plugins/mag/docs/actor-model.md, The
+    -- approval boundary): a `mag.ApprovalReply` message can only answer an
+    -- outstanding request, and an outstanding request implies a CONSTRUCTED
+    -- gate — the request is emitted inside the gate's first activation. A
+    -- reply at a registered-but-unconstructed target (an actor spawned in
+    -- this same modification included) is a control-plane protocol error,
+    -- rejected loudly here; parking it would let a stale reply resolve a
+    -- FUTURE request the human never saw. A reply at a DEAD target stays a
+    -- race artifact (the gate resolved/was killed while the reply was in
+    -- flight) and drops at execution as a logged no-op, like any other send.
+    -- Checked only when the composition wires a construction probe
+    -- (set_is_constructed; the bare-VM fold path has no routing layer).
+    if self.is_constructed
+        and type(msg.content) == "table"
+        and msg.content.kind == kinds.ApprovalReply then
+      local unconstructed_alive = entry ~= nil
+          and entry.state == ALIVE
+          and not self.is_constructed(msg.to)
+      if entry == nil or unconstructed_alive then
+        return nil, string.format(
+          "'%s' rejected: target '%s' has no outstanding approval request "
+          .. "(the actor never constructed — a reply answers a request)",
+          kinds.ApprovalReply, msg.to)
+      end
     end
   end
 
@@ -411,6 +438,14 @@ function M.set_on_spawn(self, fn)
   self.on_spawn = fn or function() end
 end
 
+-- Register the construction probe: fn(id) -> bool, true when a bound instance
+-- exists (routing.lua is_constructed). Consulted by validate for control-plane
+-- reply injection (a `mag.ApprovalReply` message requires a constructed
+-- target). Optional — absent (bare-VM fold tests), the check is skipped.
+function M.set_is_constructed(self, fn)
+  self.is_constructed = fn
+end
+
 local noop = function() end
 
 -- Construct an inventory. `opts.log` is a sink with info/warn/error
@@ -443,6 +478,10 @@ function M.new(opts)
     -- every modification's routes against factory-declared contracts
     -- (validate_routes); absent (bare-VM fold tests), the check is skipped.
     registry = opts.registry,
+    -- Optional construction probe (set_is_constructed): fn(id) -> bool.
+    -- Consulted by validate for `mag.ApprovalReply` injection; usually wired
+    -- after the router exists, like `deliver`.
+    is_constructed = opts.is_constructed,
   }
   self.apply = function(mod)
     return M.apply(self, mod)
@@ -467,6 +506,9 @@ function M.new(opts)
   end
   self.set_deliver = function(fn)
     self.deliver = fn
+  end
+  self.set_is_constructed = function(fn)
+    return M.set_is_constructed(self, fn)
   end
   return self
 end

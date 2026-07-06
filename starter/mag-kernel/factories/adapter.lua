@@ -13,15 +13,20 @@
 --
 -- Contract (reconciled against tests/fixtures/two-agents.modification.json and
 -- the loader's eval_agent, which authors this node; flagged):
---   input   ( task | generic-provider.FinalAnswer )   union — fires on either
+--   input   ( task | generic-provider.FinalAnswer | human.Rejected )
+--           union — fires on any
 --   output  generic-provider.ProviderOut              the next provider turn
 --
 -- The union input is the whole point of the boundary: `task` is the initial
 -- activation content the loader seeds a source agent with (crates/nefor-mag
--- ir.rs initial_activation_content -> `{ kind = "task", prompt = ... }`), and
+-- ir.rs initial_activation_content -> `{ kind = "task", prompt = ... }`),
 -- `generic-provider.FinalAnswer` is what an upstream agent routes in
--- (docs-explorer.llm -> code-writer.entry). Firing "on any" (shape.lua)
--- means whichever arrives activates alone — no waiting, no accumulation.
+-- (docs-explorer.llm -> code-writer.entry), and `human.Rejected` is the gate
+-- template's revise leg (starter/mag/lib/templates.mag: the rejection reason
+-- re-enters the producing llm as its next turn — the llm's owned transcript
+-- already carries the rejected draft, so the reason alone is the feedback).
+-- Firing "on any" (shape.lua) means whichever arrives activates alone — no
+-- waiting, no accumulation.
 --
 -- ── the boundary mapping (flagged) ──────────────────────────────────────────
 --   Both inputs lift into ONE user-role turn message, the shape the provider
@@ -39,6 +44,7 @@
 --     generic-provider.FinalAnswer  -> content = message.final_answer
 --                                                 or message.text
 --                                                 or message.result
+--     human.Rejected                -> content = message.reason
 --   The FinalAnswer preference order mirrors what factories/llm.lua lifts onto a
 --   FinalAnswer (`final_answer`/`text` when the provider result is a table, else
 --   the raw `result`). A string passes through; a structured value passes
@@ -56,6 +62,7 @@ local kinds = require("kinds")
 local M = {}
 
 local FINAL_ANSWER = "generic-provider.FinalAnswer"
+local REJECTED = "human.Rejected"
 
 M.declaration = {
   name = "adapter",
@@ -64,11 +71,11 @@ M.declaration = {
     seed = "string?", -- boundary-shape label (the loader authors "provider-in")
   },
 
-  -- Union input (shape.lua): the initial task seed OR an upstream FinalAnswer.
-  -- `task` is the loader's initial activation kind; the qualified FinalAnswer is
-  -- what an upstream agent routes in. Firing "on any".
+  -- Union input (shape.lua): the initial task seed, an upstream FinalAnswer,
+  -- or a human gate's rejection re-entering the provider loop (the gate
+  -- template's revise leg). Firing "on any".
   inputs = {
-    boundary = { "task", FINAL_ANSWER },
+    boundary = { "task", FINAL_ANSWER, REJECTED },
   },
 
   outputs = {
@@ -87,6 +94,10 @@ local function to_provider_out(tag, message)
   local content
   if tag == FINAL_ANSWER then
     content = message.final_answer or message.text or message.result
+  elseif tag == REJECTED then
+    -- the gate's rejection feedback ({ subject, reason }); the reason is the
+    -- next turn — the producing llm's transcript already holds the draft
+    content = message.reason
   else
     -- the initial task seed ({ kind = "task", prompt = ... })
     content = message.prompt

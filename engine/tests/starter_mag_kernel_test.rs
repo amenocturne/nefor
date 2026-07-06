@@ -79,6 +79,11 @@ fn starter_mag_kernel_validation() {
     run_lua_test("tests/lua/mag-kernel/validation_test.lua");
 }
 
+#[test]
+fn starter_mag_kernel_human_gate() {
+    run_lua_test("tests/lua/mag-kernel/human_test.lua");
+}
+
 fn run_lua_test(rel_path: &str) {
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");

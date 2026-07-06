@@ -265,13 +265,19 @@ local function new_run_context(meta)
   -- message (dispatch_kill runs handle_kill; its abort envelopes take the
   -- raw-emit path to the bus) and THEN drops the router's firing slots +
   -- correlations (forget). The order is load-bearing — emit-before-forget — so
-  -- a dying actor's provider-cancel/ApprovalCancel reaches the bus while it is
-  -- still bound. A kill before construction finds no instance: the spec drops,
-  -- no courtesy delivery. The deliver hook routes live-target sends into
-  -- routing's firing machines.
+  -- a dying actor's provider-cancel reaches the bus while it is still bound. A
+  -- kill before construction finds no instance: the spec drops, no courtesy
+  -- delivery. The deliver hook routes live-target sends into routing's firing
+  -- machines. The construction probe lets the fold's validate reject a
+  -- control-plane `mag.ApprovalReply` at an unconstructed target (a reply can
+  -- only answer an outstanding request — actor-model.md, The approval
+  -- boundary).
   inv.set_on_kill(function(id)
     router:dispatch_kill(id)
     router:forget(id)
+  end)
+  inv.set_is_constructed(function(id)
+    return router:is_constructed(id)
   end)
 
   -- Lazy-construction hook (routing.lua construct_instance): builds the

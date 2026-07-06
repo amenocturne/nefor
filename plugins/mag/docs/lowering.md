@@ -241,7 +241,7 @@ unary, and matches the contract (ir.md). None of that machinery exists yet.
 | cycle back-edge                            | an ordinary `routes` entry pointing upstream                                                                       |
 | `:terminal out` (sink)                     | `sink` actor with `routes: {}`; no `terminal` field                                                                |
 | initial input                              | one entry in `messages` to the entry port                                                                          |
-| control edge (fire `b` after `a`, no data) | status-typed route entry on `a` (`mag.Completed`, failure variants)                                                |
+| control edge (fire `b` after `a`, no data) | status-typed route entry on `a` (`mag.Unit`, failure variants)                                                     |
 | all-of join ("fire when A and B done")     | destination actor declares a product input `(A + B)` — no IR element; firing is the input contract (ir.md, Firing) |
 | static graph                               | `kills: []`, `rules: []`                                                                                           |
 | data-dependent composition                 | `rules: [{on, fn}]` binding a MAG function                                                                         |

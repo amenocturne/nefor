@@ -83,6 +83,14 @@ local FAILED = kinds.failed
 -- here so it reaches the control plane as a lifecycle event rather than routing
 -- nowhere (the sink declares no outputs).
 local RUN_COMPLETE = kinds.RunComplete
+-- The human gate's control-plane-bound approval request/cancel
+-- (factories/human.lua). Intercepted like RunComplete: neither is a declared
+-- output (there is no downstream actor to route to — the consumer is the
+-- control plane), so letting them fall through to route_output would drop
+-- them silently and no notification would ever surface. Surfaced as run_id-
+-- stamped control-plane events (kinds.lua, the approval boundary).
+local APPROVAL_REQUEST = kinds.ApprovalRequest
+local APPROVAL_CANCEL = kinds.ApprovalCancel
 
 -- Lifecycle event kinds emitted from the delivery layer. actor_ready mirrors
 -- observer.lua's canonical set (kept literal to avoid a routing → observer
@@ -105,6 +113,12 @@ local EVT_RUN_FAILED = kinds.run_failed
 -- ticking needs exactly these transitions.
 local EVT_ACTOR_BUSY = "mag.actor_busy"
 local EVT_ACTOR_IDLE = "mag.actor_idle"
+-- The approval boundary's control-plane events (kinds.lua): the intercepted
+-- ApprovalRequest / ApprovalCancel emits surface under these kinds, run_id-
+-- stamped by the injected events sink like every other control-plane event —
+-- the reply (`mag.apply`) needs the run_id to address the right run.
+local EVT_APPROVAL_REQUEST = kinds.approval_request
+local EVT_APPROVAL_CANCEL = kinds.approval_cancel
 
 local function noop() end
 
@@ -184,11 +198,32 @@ function M:on_emit(id, message)
     self:apply_completion(id, { status = "failed", failure = message.failure, value = message.value })
   elseif kind == RUN_COMPLETE then
     self:on_run_complete(id, message)
+  elseif kind == APPROVAL_REQUEST then
+    -- The human gate raised an approval request (factories/human.lua). Its
+    -- consumer is the control plane, not a routed actor: surface it as the
+    -- run_id-stamped `mag.approval_request` event. Not persisted as a node
+    -- output — the gate's output is the eventual Approved/Rejected exit.
+    self.events({
+      kind = EVT_APPROVAL_REQUEST,
+      from = id,
+      correlation = message.correlation,
+      prompt = message.prompt,
+      subject = message.subject,
+    })
+  elseif kind == APPROVAL_CANCEL then
+    -- The gate retracted an outstanding request (drain). Intercepted before
+    -- the signaling branch so it reaches the control plane as a run_id-stamped
+    -- event (the raw bus path would lose the run attribution).
+    self.events({
+      kind = EVT_APPROVAL_CANCEL,
+      from = id,
+      correlation = message.correlation,
+    })
   elseif self.signaling[id] then
     -- A non-reserved emit from an actor whose signal handler (kill/drain) is
     -- running: these are final abort/cancel envelopes bound for a capability
-    -- plugin (llm's `<provider>.chat.cancel`, human's `mag.ApprovalCancel`),
-    -- not declared outputs. They must bypass route_output's declared-tag routing
+    -- plugin (llm's `<provider>.chat.cancel`), not declared outputs. They must
+    -- bypass route_output's declared-tag routing
     -- — which would drop them (a killed actor is already unrouted; a cancel is
     -- not on any route) — and land straight on the bus. This is the raw-emit
     -- seam; on kill it runs strictly before forget (dispatch_kill), so the
@@ -247,14 +282,19 @@ function M:deliver(dest_id, from, tag, message)
   self:fire(dest_id, from, tag, message)
 end
 
--- Tags delivered by tag, past the declared ports (actor-model.md): the
--- control plane injects an approval reply at the gate it addresses — replies
--- originate at the chat surface, not upstream actors, so no factory declares
--- an input port for them. A bypass tag reaches a CONSTRUCTED instance
--- directly (a gate with an outstanding request necessarily constructed);
--- with no instance there is nothing awaiting a reply, so it drops logged.
+-- Tags delivered by tag, past the declared ports (actor-model.md, The
+-- approval boundary): the control plane injects an approval reply at the gate
+-- it addresses — replies originate at the chat surface, not upstream actors,
+-- so no factory declares an input port for them and no sender edge exists for
+-- a firing slot to bind to. A bypass tag reaches a CONSTRUCTED instance
+-- directly (a gate with an outstanding request necessarily constructed) and
+-- never triggers construction — constructing on a reply would falsely signal
+-- "began work" for an actor that was never activated. The unconstructed case
+-- is rejected upstream at apply (inventory.lua, validate: a reply can only
+-- answer an outstanding request); the warn-drop below is the defensive
+-- backstop for direct router use.
 local PORT_BYPASS_TAGS = {
-  ["mag.ApprovalReply"] = true,
+  [kinds.ApprovalReply] = true,
 }
 
 -- Feed one arrival to the destination's firing machine (the port whose input
@@ -288,7 +328,7 @@ function M:fire(dest_id, from, tag, message)
       })
       self:apply_completion(dest_id, completion)
     else
-      self.log.info(string.format(
+      self.log.warn(string.format(
         "'%s' dropped: actor '%s' is not constructed (nothing awaits a reply)",
         tostring(tag), tostring(dest_id)))
     end
@@ -553,6 +593,14 @@ function M:is_ready(id)
   return self.ready[id] == true
 end
 
+-- Read-only construction probe: does a bound instance exist for this id?
+-- The fold's apply-time validation consults this for control-plane reply
+-- injection (inventory.lua: a `mag.ApprovalReply` message can only answer an
+-- outstanding request, and an outstanding request implies a constructed gate).
+function M:is_constructed(id)
+  return self.instances[id] ~= nil
+end
+
 -- Hand a dying instance its one final kill message (actor-model.md, Signals:
 -- kill). Removal is unconditional; the handler is a courtesy so an actor holding
 -- live external work (an open provider request) can abort it. A kill before
@@ -577,9 +625,11 @@ end
 -- Graceful drain (actor-model.md, Signals: drain / SIGTERM). The kernel exposes
 -- this as a distinct op (init.lua `drain(id)`) — it is NEVER auto-called from
 -- kill. Calls the instance's drain handler where declared, with `signaling[id]`
--- set so a bus-bound cancel envelope it emits (human's `mag.ApprovalCancel`)
--- reaches the bus by the same raw path; reserved acks (mag.complete) still route
--- normally. Returns true when a handler ran.
+-- set so a bus-bound cancel envelope it emits (an llm's `<provider>.chat.cancel`)
+-- reaches the bus by the same raw path; intercepted kinds (mag.complete, the
+-- human gate's `mag.ApprovalCancel`) still take their reserved paths — the
+-- interception branches in on_emit run before the signaling check. Returns true
+-- when a handler ran.
 function M:drain(id)
   local instance = self.instances[id]
   if not instance or type(instance.handle_drain) ~= "function" then

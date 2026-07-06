@@ -6,21 +6,25 @@
 -- factory is kept purely to the message shape (request out, reply in), so it is
 -- fully testable by feeding it a stubbed reply.
 --
--- Flow (async factory — routing.lua, the kernel⇄factory contract):
+-- Flow (async factory — routing.lua, the kernel⇄factory contract; the pinned
+-- contract lives in actor-model.md, The approval boundary):
 --   * A subject arrives as a graph activation on the declared data input →
---     record it as pending, emit an approval request (`mag.ApprovalRequest`)
---     for the control plane / chat surface to render, and return
+--     record it as pending, emit an approval request (`mag.ApprovalRequest` —
+--     a kernel-intercepted emit the delivery layer surfaces to the control
+--     plane as the run_id-stamped `mag.approval_request` event), and return
 --     `{ status = "pending" }`: the gate defers completion until a human answers.
 --   * The reply arrives later as a SECOND graph delivery whose one message
 --     carries the reserved tag `mag.ApprovalReply` (delivered through the same
 --     `deliver` entry, the way a signal is just a message — actor-model.md). It
 --     is NOT a routed declared data input: replies originate at the chat
---     surface, not upstream actors, so the control plane injects them by tag
---     rather than through a factory-declared input port. (Delivery choice,
---     flagged: a graph second-delivery, not the capability `{kind="reply"}`
---     activation — the gate never issues a `capability.invoke`, so it is not on
---     the correlation channel; the reply reuses the same graph channel as the
---     subject, tag-discriminated, mirroring the pre-contract kind-discrimination.)
+--     surface, not upstream actors — the control plane injects them as a
+--     `mag.apply` modification message, and the kernel delivers them by tag
+--     past the declared ports to the CONSTRUCTED instance (routing.lua, port
+--     bypass; a reply at an unconstructed gate rejects the modification).
+--     (Delivery choice: a graph second-delivery, not the capability
+--     `{kind="reply"}` activation — the gate never issues a
+--     `capability.invoke`, so it is not on the correlation channel; the reply
+--     reuses the same graph channel as the subject, tag-discriminated.)
 --   * The reply resolves the gate to a typed exit: `human.Approved` (carrying
 --     the human's content) or `human.Rejected` (carrying a reason). A union
 --     output makes the approve/reject fork a type fact for downstream wiring,
@@ -29,7 +33,7 @@
 --     (the async-completion path — routing.lua), so the kernel emits mag.Unit
 --     along any dependency edges; the reply delivery itself returns nil.
 --
--- Message shapes (all flagged for review):
+-- Message shapes (pinned — actor-model.md, Canonical payloads):
 --   request out : { kind="mag.ApprovalRequest", from=id, correlation=id,
 --                   prompt=<params.prompt?>, subject=<the input message> }
 --   reply  in   : graph activation carrying { tag="mag.ApprovalReply",
@@ -37,7 +41,7 @@
 --                               reason=<rejection reason?> } }
 --   output      : human.Approved { subject, content } | human.Rejected { subject, reason }
 --
--- drain handler (flagged): a human gate CAN hold pending external work — an
+-- drain handler: a human gate CAN hold pending external work — an
 -- outstanding request a person hasn't answered. So per actor-model.md ("an
 -- actor holding live external work implements the handler to abort it") drain
 -- is meaningful: cancel the outstanding request (`mag.ApprovalCancel`, so the
@@ -91,7 +95,7 @@ function M.construct(id, params, emit, deps)
     local tag = one.tag
     local message = one.message or {}
 
-    if tag == "mag.ApprovalReply" then
+    if tag == kinds.ApprovalReply then
       -- A reply for an outstanding request. With none outstanding, ignore it
       -- (a late or duplicate reply is not an activation).
       if pending == nil then
@@ -122,7 +126,7 @@ function M.construct(id, params, emit, deps)
     -- completion until the human answers.
     pending = message
     emit(sign({
-      kind = "mag.ApprovalRequest",
+      kind = kinds.ApprovalRequest,
       correlation = id,
       prompt = params.prompt,
       subject = message,
@@ -132,13 +136,14 @@ function M.construct(id, params, emit, deps)
 
   -- Explicit drain handler (SIGTERM analog): abort the outstanding request,
   -- then a signed completion. Written inline — no wrapper composed this in. The
-  -- `mag.ApprovalCancel` is a bus-bound cancel (not a declared output): when the
-  -- kernel drives drain through router:drain it takes the raw-emit path to the
-  -- bus so the chat surface can retract the prompt. The completion ack is the
-  -- reserved kinds.complete — no separate "Completed" kind.
+  -- `mag.ApprovalCancel` is a control-plane-bound cancel (not a declared
+  -- output): the delivery layer intercepts it and surfaces the run_id-stamped
+  -- `mag.approval_cancel` event so the chat surface can retract the prompt.
+  -- The completion ack is the reserved kinds.complete — no separate
+  -- "Completed" kind.
   function instance.handle_drain()
     if pending ~= nil then
-      emit(sign({ kind = "mag.ApprovalCancel", correlation = id }))
+      emit(sign({ kind = kinds.ApprovalCancel, correlation = id }))
       pending = nil
     end
     emit(sign({ kind = kinds.complete }))

@@ -46,6 +46,21 @@ local M = {
   -- waits forever), so the delivery layer escalates it to the control plane
   -- and the host fails the run.
   run_failed = "mag.run_failed", -- kernel -> control plane (event)
+
+  -- The approval boundary (factories/human.lua; actor-model.md, The approval
+  -- boundary). Request and cancel are actor -> kernel MESSAGE emits the
+  -- delivery layer intercepts (routing.lua on_emit) and surfaces as run_id-
+  -- stamped control-plane EVENTS — the same two-channel split as
+  -- RunComplete/run_complete. The reply travels the other way: the control
+  -- plane injects it as a modification message (`mag.apply`), and the kernel
+  -- delivers it past declared ports to the CONSTRUCTED gate instance
+  -- (routing.lua fire, port bypass) — a reply answers an outstanding request,
+  -- it is not graph dataflow and no factory declares an input port for it.
+  ApprovalRequest = "mag.ApprovalRequest", -- actor -> kernel emit (message)
+  ApprovalCancel = "mag.ApprovalCancel", -- actor -> kernel emit (message, drain)
+  ApprovalReply = "mag.ApprovalReply", -- control plane -> actor (injected message)
+  approval_request = "mag.approval_request", -- kernel -> control plane (event)
+  approval_cancel = "mag.approval_cancel", -- kernel -> control plane (event)
 }
 
 return M

@@ -23,9 +23,11 @@
 --      carries the final result and whether it was persisted, so the control
 --      plane can read the run result and mark the run done.
 --
--- Input contract: `( generic-provider.FinalAnswer | mag.Text )` (union) — the
--- fixture's `code-writer.llm -> sink` edge, plus the shell chain's implicit
--- terminal edge (`bash -> sink`, docs/lowering.md "The program sink"). No
+-- Input contract: `( generic-provider.FinalAnswer | mag.Text | human.Approved )`
+-- (union) — the fixture's `code-writer.llm -> sink` edge, the shell chain's
+-- implicit terminal edge (`bash -> sink`, docs/lowering.md "The program
+-- sink"), and the gate template's approval exit (an approval-terminated
+-- program ends in `human.Approved` — starter/mag/lib/templates.mag). No
 -- signal handlers: the sink persists synchronously on activation, holding no
 -- pending work to drain or abort.
 
@@ -41,10 +43,12 @@ M.declaration = {
   params = {},
 
   inputs = {
-    -- Union (fires on either): an agent program terminates in a FinalAnswer;
+    -- Union (fires on any): an agent program terminates in a FinalAnswer;
     -- a shell program's implicit terminal receives the last command's stdout
-    -- (mag.Text — the bash capability node, factories/bash.lua).
-    final = { "generic-provider.FinalAnswer", "mag.Text" },
+    -- (mag.Text — the bash capability node, factories/bash.lua); a gate
+    -- program terminates in the human's approval (human.Approved —
+    -- factories/human.lua, the gate template's exit).
+    final = { "generic-provider.FinalAnswer", "mag.Text", "human.Approved" },
   },
 
   -- Terminal: emits nothing downstream (routes: {} at lowering).

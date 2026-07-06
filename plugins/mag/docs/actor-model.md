@@ -92,8 +92,13 @@ Declared outputs flow through `emit` (routed by tag); the return value is only
 the completion status. Reserved emit kinds the kernel intercepts: `mag.ready`
 (the readiness confirm — emitted inside `construct`, which lazy construction
 places at the first activation, so it coincides with beginning work),
-`capability.invoke` (a correlated request), and `mag.complete` / `mag.failed`
-(the async completion of a deferred activation). Kernel-synthesized status
+`capability.invoke` (a correlated request), `mag.complete` / `mag.failed`
+(the async completion of a deferred activation), `mag.RunComplete` (the sink's
+terminal completion signal, surfaced to the control plane as the
+`mag.run_complete` lifecycle event), and `mag.ApprovalRequest` /
+`mag.ApprovalCancel` (the human gate's control-plane-bound request/cancel,
+surfaced as the run_id-stamped `mag.approval_request` / `mag.approval_cancel`
+events — see The approval boundary). Kernel-synthesized status
 tags (`mag.Unit` on success, the failure tag) are emitted by the kernel, never
 returned by a factory and never declared as outputs — a factory does not know
 a dependency edge exists.
@@ -226,20 +231,56 @@ code today. Every outbound message is id-signed (`from = <actor id>`, omitted
 below). These are pinned contracts: a producer emits exactly this, a consumer
 reads exactly this — no alias fallbacks, no shape sniffing.
 
-| Kind                           | Emitter → consumer            | Payload (beyond `kind`, `from`)                                                                         |
-| ------------------------------ | ----------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `generic-tool.ToolCalls`       | llm → run-tool                | `calls = { { id, name, args }, … }`                                                                     |
-| `generic-tool.ToolHandle`      | run-tool → tool-result        | `results = { { id, name, output, error }, … }` (index-ordered to the calls)                             |
-| `generic-provider.FinalAnswer` | llm → sink / human            | `result` (raw provider result); `text?`, `final_answer?` (lifted when result is a table)                |
-| `mag.ApprovalRequest`          | human → control plane         | `correlation = <id>`, `prompt?`, `subject` (the input message)                                          |
-| `mag.ApprovalReply`            | control plane → human         | delivered as a graph activation tagged `mag.ApprovalReply`, `message = { approved, content?, reason? }` |
-| `mag.ApprovalCancel`           | human (drain) → control plane | `correlation = <id>`                                                                                    |
-| `human.Approved`               | human → downstream            | `subject`, `content`                                                                                    |
-| `human.Rejected`               | human → downstream            | `subject`, `reason`                                                                                     |
+| Kind                           | Emitter → consumer            | Payload (beyond `kind`, `from`)                                                                                                             |
+| ------------------------------ | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `generic-tool.ToolCalls`       | llm → run-tool                | `calls = { { id, name, args }, … }`                                                                                                         |
+| `generic-tool.ToolHandle`      | run-tool → tool-result        | `results = { { id, name, output, error }, … }` (index-ordered to the calls)                                                                 |
+| `generic-provider.FinalAnswer` | llm → sink / human            | `result` (raw provider result); `text?`, `final_answer?` (lifted when result is a table)                                                    |
+| `mag.ApprovalRequest`          | human → control plane         | intercepted emit, surfaced as the `mag.approval_request` event: `correlation = <id>`, `prompt?`, `subject` (the input message)              |
+| `mag.ApprovalReply`            | control plane → human         | injected via a `mag.apply` message; delivered as a graph activation tagged `mag.ApprovalReply`, `message = { approved, content?, reason? }` |
+| `mag.ApprovalCancel`           | human (drain) → control plane | intercepted emit, surfaced as the `mag.approval_cancel` event: `correlation = <id>`                                                         |
+| `human.Approved`               | human → downstream            | `subject`, `content`                                                                                                                        |
+| `human.Rejected`               | human → downstream            | `subject`, `reason`                                                                                                                         |
 
 The llm factory is the provider boundary: it normalizes the provider's native
 tool-call shape (`name`/`arguments`, or a nested `function`) into the pinned
 `{ id, name, args }` once, so `run-tool` reads `id`/`name`/`args` directly.
+
+### The approval boundary
+
+The human factory is the approval/input boundary, and its two message
+directions travel two different channels — neither is graph routing:
+
+- **Request out.** A subject firing the gate's declared input records it as
+  pending and emits `mag.ApprovalRequest`. The kernel intercepts the emit
+  (there is no downstream actor — the consumer is the control plane) and
+  surfaces it as the `mag.approval_request` control-plane event, run_id-stamped
+  like every lifecycle event, carrying `from` (the gate's actor id),
+  `correlation`, `prompt?`, and `subject`. The chat surface renders it; the
+  gate's activation defers (`pending`).
+- **Reply in.** The reply originates at the chat surface, not an upstream
+  actor: it has no sender edge for a firing slot to bind to, so no factory
+  declares an input port for it. The control plane injects it as a `mag.apply`
+  modification message — to the gate's id, content
+  `{ kind = "mag.ApprovalReply", approved, content?, reason? }`, addressed by
+  the event's `run_id` + `from` — and the kernel delivers it by tag past the
+  declared ports, directly to the CONSTRUCTED instance (the port bypass). The
+  resolved gate emits its typed exit (`human.Approved` / `human.Rejected`,
+  ordinary routed outputs) and acks with `mag.complete`.
+
+Pinned edge semantics:
+
+- **A reply at an unconstructed gate rejects the modification.** A reply can
+  only answer an outstanding request, and a request is emitted inside the
+  gate's first activation — so an outstanding request implies a constructed
+  instance. Apply-time validation rejects the injection (the `mag.applied`
+  ack carries the error) rather than parking it: a parked reply could resolve
+  a FUTURE request the human never saw. Nothing is lost — the gate's own
+  pending subject lives in the constructed instance and buffers indefinitely.
+- **A reply at a dead gate is a race artifact**: it passes validation and
+  drops at delivery as a logged no-op, like any send to a dead target.
+- **A late or duplicate reply at a constructed gate with nothing pending is
+  ignored** — it is not an activation.
 
 ### llm params
 

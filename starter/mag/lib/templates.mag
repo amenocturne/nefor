@@ -26,10 +26,14 @@
 ;; rejection.
 ;;
 ;; Approval and rejection are the human factory's typed outputs
-;; (human.Approved | human.Rejected); rejection folds through a `revise` step
-;; and back to `produce`. The exit is human.Approved — the human is the loop's
-;; terminator, and a stuck revision cycle is stopped via the control plane's
-;; kill/interrupt like any other loop.
+;; (human.Approved | human.Rejected); rejection folds through a `rework`
+;; boundary shift (the `adapter` factory lifts the rejection reason into the
+;; next provider turn) and back into `produce`. Revision is the SAME llm
+;; re-firing: its owned transcript already carries the rejected draft, so the
+;; reason alone is the feedback and the model revises with full memory of what
+;; it produced — a separate revise llm would see only the reason. The exit is
+;; human.Approved — the human is the loop's terminator, and a stuck revision
+;; cycle is stopped via the control plane's kill/interrupt like any other loop.
 ;;
 ;; Boundary: ProviderOut in; human.Approved out.
 (def gate (fn [cfg]
@@ -45,12 +49,10 @@
                   : generic-provider.FinalAnswer
                   -> (human.Approved | human.Rejected))
 
-        revise  (node "llm" {:model model :provider provider
-                             :system (or (get cfg "revise")
-                                         "Revise the result using the rejection feedback.")}
+        rework  (node "adapter" {:seed "provider-in"}
                   : human.Rejected -> generic-provider.ProviderOut)]
 
     (subgraph {:id (get cfg "id") :in produce :out [approve]}
       produce -> approve
-      approve -> revise
-      revise  -> produce))))
+      approve -> rework
+      rework  -> produce))))

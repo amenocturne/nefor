@@ -52,18 +52,20 @@ fn gate_lowers_with_human_approval_exit() {
     let ir = nefor_mag::compile(source, &stdlib_dir()).expect("gate program compiles");
 
     let ids = actor_ids(&ir);
-    for want in ["review.produce", "review.approve", "review.revise"] {
+    for want in ["review.produce", "review.approve", "review.rework"] {
         assert!(ids.contains(&want), "missing {want}; got {ids:?}");
     }
 
-    // Rejection folds through revise, then back to produce — an unbounded
-    // revision cycle whose terminator is the human's approval.
+    // Rejection folds through the rework boundary shift (adapter: reason →
+    // next provider turn), then back into produce — an unbounded revision
+    // cycle whose terminator is the human's approval. Revision is produce
+    // re-firing: its transcript already carries the rejected draft.
     assert_eq!(
         route_dests(&ir, "review.approve", "human.Rejected"),
-        vec!["review.revise"]
+        vec!["review.rework"]
     );
     assert_eq!(
-        route_dests(&ir, "review.revise", "generic-provider.ProviderOut"),
+        route_dests(&ir, "review.rework", "generic-provider.ProviderOut"),
         vec!["review.produce"]
     );
 
