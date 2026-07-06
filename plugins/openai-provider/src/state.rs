@@ -20,6 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -86,10 +87,52 @@ pub struct ChatRestore {
     pub history: Vec<Message>,
 }
 
+/// Handle to an in-flight turn. Bundles the cancellation token (drives
+/// the abort of the streaming HTTP call) with a `suppress` flag that
+/// distinguishes a graceful `interrupt` — stop the work but still deliver
+/// the interrupted result — from a hard `cancel`, which suppresses the
+/// terminal result entirely. Hard cancel is the honor side of the
+/// kernel's kill flush (`<prefix>.chat.cancel`): the caller has torn its
+/// request down and nothing is listening for the completion.
+#[derive(Debug, Clone)]
+pub struct TurnToken {
+    cancel: CancellationToken,
+    suppress: Arc<AtomicBool>,
+}
+
+impl TurnToken {
+    fn new() -> Self {
+        Self {
+            cancel: CancellationToken::new(),
+            suppress: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Clone of the inner cancellation token. The streaming module
+    /// (`stream.rs`) keeps its public API on the plain
+    /// `CancellationToken` — it aborts on cancel regardless of whether
+    /// the terminal result will be suppressed; suppression is the turn
+    /// task's concern, not the stream's.
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    /// True when this turn was hard-cancelled: the turn task must
+    /// suppress every terminal emission (no `chat.complete.result`, no
+    /// `stream.end`, no `session.stats`, no `turn.error`).
+    pub fn is_suppressed(&self) -> bool {
+        self.suppress.load(Ordering::SeqCst)
+    }
+}
+
 /// Whether a chat's turn slot is idle or occupied.
 enum TurnState {
     Idle,
-    InFlight(CancellationToken),
+    InFlight(TurnToken),
 }
 
 /// Chat state stored under a `ChatId`.
@@ -488,7 +531,7 @@ impl Chats {
     /// Begin a turn on `id`. Returns `Ok(token)` if the caller now owns
     /// the chat's turn slot; `Err(Busy)` if the chat is already running
     /// a turn; `Err(NotFound)` if no such chat exists.
-    pub async fn begin_turn(&self, id: &ChatId) -> Result<CancellationToken, ChatsError> {
+    pub async fn begin_turn(&self, id: &ChatId) -> Result<TurnToken, ChatsError> {
         let mut g = self.inner.lock().await;
         let chat = g
             .get_mut(id)
@@ -496,7 +539,7 @@ impl Chats {
         if matches!(chat.turn, TurnState::InFlight(_)) {
             return Err(ChatsError::Busy(id.clone()));
         }
-        let token = CancellationToken::new();
+        let token = TurnToken::new();
         chat.turn = TurnState::InFlight(token.clone());
         Ok(token)
     }
@@ -508,11 +551,13 @@ impl Chats {
         }
     }
 
-    /// Cancel the in-flight turn for `id` if one is running.
-    /// Returns `true` if a turn was running, `false` otherwise.
-    /// Returns `false` (not an error) when the chat doesn't exist —
-    /// matches the previous singleton's "interrupt is best-effort"
-    /// shape; the dispatcher's caller doesn't care which case.
+    /// Gracefully interrupt the in-flight turn for `id` if one is
+    /// running: stop the work but let the turn task deliver its
+    /// interrupted result. Returns `true` if a turn was running,
+    /// `false` otherwise. Returns `false` (not an error) when the chat
+    /// doesn't exist — matches the previous singleton's "interrupt is
+    /// best-effort" shape; the dispatcher's caller doesn't care which
+    /// case.
     pub async fn interrupt(&self, id: &ChatId) -> bool {
         let g = self.inner.lock().await;
         match g.get(id) {
@@ -520,7 +565,7 @@ impl Chats {
                 turn: TurnState::InFlight(ref token),
                 ..
             }) => {
-                token.cancel();
+                token.cancel.cancel();
                 true
             }
             _ => false,
@@ -533,8 +578,33 @@ impl Chats {
         let g = self.inner.lock().await;
         for chat in g.values() {
             if let TurnState::InFlight(ref token) = chat.turn {
-                token.cancel();
+                token.cancel.cancel();
             }
+        }
+    }
+
+    /// Hard-cancel the in-flight turn for `id`: mark its result
+    /// suppressed and abort the streaming request. Unlike `interrupt`,
+    /// no terminal event is delivered for the cancelled turn — this is
+    /// the honor side of the kernel's kill flush, where the caller has
+    /// already torn its request down. Idempotent and best-effort:
+    /// returns `false` (a logged no-op for the caller) when the chat is
+    /// unknown or has no in-flight turn.
+    pub async fn cancel_turn(&self, id: &ChatId) -> bool {
+        let g = self.inner.lock().await;
+        match g.get(id) {
+            Some(ChatState {
+                turn: TurnState::InFlight(ref token),
+                ..
+            }) => {
+                // Order matters: publish the suppress flag before
+                // cancelling so the turn task reliably observes it when
+                // the select's `cancelled()` branch wakes.
+                token.suppress.store(true, Ordering::SeqCst);
+                token.cancel.cancel();
+                true
+            }
+            _ => false,
         }
     }
 
@@ -820,6 +890,72 @@ mod tests {
         assert!(c.interrupt(&a).await);
         assert!(ta.is_cancelled());
         assert!(!tb.is_cancelled(), "interrupt of `a` must not affect `b`");
+    }
+
+    #[tokio::test]
+    async fn interrupt_does_not_suppress_result() {
+        // Graceful interrupt cancels the work but leaves the terminal
+        // result deliverable (the turn task still emits it).
+        let c = Chats::with_default_model(Some("m".into()));
+        let id = ChatId::new("a");
+        c.create(id.clone(), None, None, None, None, None)
+            .await
+            .expect("create");
+        let token = c.begin_turn(&id).await.expect("begin");
+        assert!(c.interrupt(&id).await);
+        assert!(token.is_cancelled());
+        assert!(!token.is_suppressed());
+    }
+
+    #[tokio::test]
+    async fn cancel_turn_suppresses_and_cancels() {
+        // Hard cancel both cancels the work and marks the result
+        // suppressed so the turn task drops every terminal event.
+        let c = Chats::with_default_model(Some("m".into()));
+        let id = ChatId::new("a");
+        c.create(id.clone(), None, None, None, None, None)
+            .await
+            .expect("create");
+        let token = c.begin_turn(&id).await.expect("begin");
+        assert!(c.cancel_turn(&id).await);
+        assert!(token.is_cancelled());
+        assert!(token.is_suppressed());
+    }
+
+    #[tokio::test]
+    async fn cancel_turn_is_noop_for_unknown_or_idle_chat() {
+        let c = Chats::with_default_model(Some("m".into()));
+        // Unknown chat.
+        assert!(!c.cancel_turn(&ChatId::new("ghost")).await);
+        // Known chat with no in-flight turn.
+        let id = ChatId::new("a");
+        c.create(id.clone(), None, None, None, None, None)
+            .await
+            .expect("create");
+        assert!(!c.cancel_turn(&id).await);
+        // After a turn ends, cancel is again a no-op.
+        let _token = c.begin_turn(&id).await.expect("begin");
+        c.end_turn(&id).await;
+        assert!(!c.cancel_turn(&id).await);
+    }
+
+    #[tokio::test]
+    async fn begin_turn_works_again_after_cancel_and_end() {
+        // A hard-cancelled chat stays usable: once the turn task
+        // releases the slot, the same chat id can run a fresh turn.
+        let c = Chats::with_default_model(Some("m".into()));
+        let id = ChatId::new("a");
+        c.create(id.clone(), None, None, None, None, None)
+            .await
+            .expect("create");
+        let _t1 = c.begin_turn(&id).await.expect("first begin");
+        assert!(c.cancel_turn(&id).await);
+        c.end_turn(&id).await;
+        let t2 = c.begin_turn(&id).await.expect("begin after cancel");
+        assert!(
+            !t2.is_cancelled() && !t2.is_suppressed(),
+            "fresh turn token must not inherit the cancelled state",
+        );
     }
 
     #[tokio::test]

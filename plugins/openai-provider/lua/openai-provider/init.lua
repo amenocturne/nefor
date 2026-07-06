@@ -79,6 +79,7 @@ function M.translator(name)
     chat_create             = prefix .. "chat.create",
     chat_append             = prefix .. "chat.append",
     chat_restore            = prefix .. "chat.restore",
+    chat_cancel             = prefix .. "chat.cancel",
     hello                   = prefix .. "hello",
     ready                   = prefix .. "ready",
     goodbye                 = prefix .. "goodbye",
@@ -309,6 +310,21 @@ function M.translator(name)
     return true
   end
 
+  -- Provider-owned cancel helper. Cancellation is keyed by the
+  -- completion's chat_id — the caller-supplied request id: the binary
+  -- runs at most one in-flight completion per chat, so the chat_id IS
+  -- the request handle (no parallel id is invented). Owns the
+  -- `<prefix>.chat.cancel` envelope shape once so factories call
+  -- `cancel(request_id)` instead of hand-rolling the body. It is the
+  -- honor side of the runtime's cancel protocol: fire-and-forget,
+  -- idempotent on the binary side (an unknown or already-finished
+  -- request id is a logged no-op there).
+  local function cancel(request_id)
+    assert(type(request_id) == "string" and #request_id > 0,
+      "openai-provider.cancel: request_id (chat_id) required")
+    return { kind = kinds.chat_cancel, chat_id = request_id }
+  end
+
   return {
     name                       = name,
     kinds                      = kinds,
@@ -316,6 +332,7 @@ function M.translator(name)
     inbound                    = inbound,
     publish                    = publish,
     deliver                    = deliver,
+    cancel                     = cancel,
     maybe_inject_static_token  = maybe_inject_static_token,
   }
 end

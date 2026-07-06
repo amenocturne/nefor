@@ -57,7 +57,7 @@ use openai_provider::broker::{ToolBroker, ToolResult};
 use openai_provider::catalog::ToolCatalog;
 use openai_provider::config::Config;
 use openai_provider::openai::{Message, ModelInfo, ToolCall};
-use openai_provider::state::{ChatId, ChatRestore, ChatStats, Chats, ChatsError};
+use openai_provider::state::{ChatId, ChatRestore, ChatStats, Chats, ChatsError, TurnToken};
 use openai_provider::stream::{
     list_models, run_chat_stream_with_retry_progress, ReasoningEvent, RetryProgress, StreamError,
 };
@@ -584,6 +584,26 @@ async fn dispatch_event(
                 }
             }
         }
+        // Hard cancel of an in-flight completion, keyed by the caller's
+        // request id (`chat_id` — one in-flight completion per chat).
+        // Aborts the streaming HTTP call and suppresses the terminal
+        // result. Idempotent: unknown or already-finished ids are a
+        // logged no-op, never an error. Pure capability-surface
+        // completion — this handler knows nothing about actors, runs, or
+        // graphs.
+        "chat.cancel" => match read_chat_id(body) {
+            Some(cid) => {
+                if !chats.cancel_turn(&cid).await {
+                    tracing::debug!(
+                        chat_id = %cid,
+                        "chat.cancel for unknown or finished request; no-op"
+                    );
+                }
+            }
+            None => {
+                tracing::debug!("chat.cancel without chat_id; no-op");
+            }
+        },
 
         // ---- legacy default-chat compat path --------------------------
         "prompt" => {
@@ -873,11 +893,15 @@ fn spawn_turn(
     client: reqwest::Client,
     out_tx: mpsc::Sender<PluginOutgoing>,
     chat_id: ChatId,
-    cancel: tokio_util::sync::CancellationToken,
+    cancel: TurnToken,
     legacy_default_chat: bool,
     extra_tools: Vec<Value>,
 ) {
     tokio::spawn(async move {
+        // The streaming/tool helpers only need the abort signal; the
+        // suppress flag stays with `cancel` for this task's own
+        // terminal-emission decisions.
+        let cancel_token = cancel.cancellation_token();
         let turn_id = uuid::Uuid::new_v4().to_string();
         let active_model = match chats.model(&chat_id).await {
             Ok(m) => m,
@@ -1008,7 +1032,7 @@ fn spawn_turn(
                 &history,
                 tools_slice,
                 reasoning_effort.as_deref(),
-                cancel.clone(),
+                cancel_token.clone(),
                 |delta| {
                     let body = stream_delta_body(
                         &prefix_for_delta,
@@ -1057,6 +1081,17 @@ fn spawn_turn(
             )
             .await;
             drop(history);
+
+            // Hard cancel arrived mid-stream: drop this turn entirely.
+            // The HTTP stream was already aborted when
+            // `run_chat_stream`'s select took the `cancelled()` branch;
+            // suppress every terminal emission by breaking out before
+            // any result is built or partial text is persisted. A
+            // graceful `interrupt` is NOT suppressed and falls through
+            // to the interrupted-result path below.
+            if cancel.is_suppressed() {
+                break;
+            }
 
             match result {
                 Ok(outcome) => {
@@ -1134,7 +1169,8 @@ fn spawn_turn(
                         let mut cancelled_idx: Option<usize> = None;
                         for (idx, tc) in outcome.tool_calls.into_iter().enumerate() {
                             let tool_step =
-                                run_one_tool_call(&catalog, &broker, &out_tx, &cancel, tc).await;
+                                run_one_tool_call(&catalog, &broker, &out_tx, &cancel_token, tc)
+                                    .await;
                             match tool_step {
                                 ToolStepOutcome::Result { id, content } => {
                                     let _ = chats.push_tool_result(&chat_id, id, content).await;
@@ -1267,6 +1303,18 @@ fn spawn_turn(
                     break;
                 }
             }
+        }
+
+        // Suppressed hard-cancel: release the slot and return without
+        // emitting stream.end / session.stats / turn.error /
+        // chat.complete.result. No result is delivered for a cancelled
+        // request — that is the honor side of the kernel's kill flush.
+        // Any partial stream.delta already put on the bus before the
+        // abort is unavoidable (it was emitted live), but no terminal
+        // completion lands.
+        if cancel.is_suppressed() {
+            chats.end_turn(&chat_id).await;
+            return;
         }
 
         let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -4800,5 +4848,371 @@ mod tests {
             !tok_b.is_cancelled(),
             "unknown chat_id MUST NOT cancel chat-2",
         );
+    }
+
+    /// `<prefix>.chat.cancel { chat_id }` is the hard-cancel receive
+    /// side of the kernel's kill flush: it must cancel AND suppress the
+    /// named chat's in-flight turn, and leave every other chat alone.
+    #[tokio::test]
+    async fn chat_cancel_suppresses_only_named_chat() {
+        let (auth, tx, _rx) = auth_test_rig(Some("envkey"));
+        let chats = fresh_chats("m");
+        let catalog = Arc::new(ToolCatalog::new());
+        let broker = Arc::new(ToolBroker::new());
+        let config = cfg("ollama");
+        let client = reqwest::Client::builder().build().expect("client");
+
+        let id_a = ChatId::new("chat-1");
+        let id_b = ChatId::new("chat-2");
+        chats
+            .create(id_a.clone(), None, None, None, None, None)
+            .await
+            .expect("a");
+        chats
+            .create(id_b.clone(), None, None, None, None, None)
+            .await
+            .expect("b");
+        let tok_a = chats.begin_turn(&id_a).await.expect("begin a");
+        let tok_b = chats.begin_turn(&id_b).await.expect("begin b");
+
+        let body = make_event_body(
+            "ollama.chat.cancel",
+            &[("chat_id", Value::String("chat-1".into()))],
+        );
+        dispatch_event(
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("mag"),
+            &body,
+        )
+        .await
+        .expect("dispatch ok");
+
+        assert!(tok_a.is_cancelled(), "chat.cancel must abort chat-1");
+        assert!(
+            tok_a.is_suppressed(),
+            "chat.cancel must suppress chat-1's terminal result",
+        );
+        assert!(
+            !tok_b.is_cancelled() && !tok_b.is_suppressed(),
+            "chat.cancel for chat-1 must not touch chat-2",
+        );
+    }
+
+    /// Cancel for an unknown request id is a no-op — never an error,
+    /// never a fallback to cancel-all. The kill may race the turn's own
+    /// completion, so "unknown or already finished" is a normal case.
+    #[tokio::test]
+    async fn chat_cancel_with_unknown_or_missing_chat_id_is_noop() {
+        let (auth, tx, _rx) = auth_test_rig(Some("envkey"));
+        let chats = fresh_chats("m");
+        let catalog = Arc::new(ToolCatalog::new());
+        let broker = Arc::new(ToolBroker::new());
+        let config = cfg("ollama");
+        let client = reqwest::Client::builder().build().expect("client");
+
+        let id_a = ChatId::new("chat-1");
+        chats
+            .create(id_a.clone(), None, None, None, None, None)
+            .await
+            .expect("a");
+        let tok_a = chats.begin_turn(&id_a).await.expect("begin a");
+
+        // Unknown chat_id.
+        let body = make_event_body(
+            "ollama.chat.cancel",
+            &[("chat_id", Value::String("ghost".into()))],
+        );
+        dispatch_event(
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("mag"),
+            &body,
+        )
+        .await
+        .expect("unknown chat_id dispatch ok");
+
+        // Missing chat_id entirely.
+        let body = make_event_body("ollama.chat.cancel", &[]);
+        dispatch_event(
+            &chats,
+            &auth,
+            &catalog,
+            &broker,
+            &config,
+            &client,
+            &tx,
+            &from_plugin("mag"),
+            &body,
+        )
+        .await
+        .expect("missing chat_id dispatch ok");
+
+        assert!(
+            !tok_a.is_cancelled() && !tok_a.is_suppressed(),
+            "no-op cancels must not touch the live chat",
+        );
+    }
+
+    /// Hard-cancel mid-stream contract (the receive side of the kernel's
+    /// kill flush, mirroring chatgpt-provider's cancel_integration):
+    ///
+    ///   1. Start a completion, stream some deltas, then
+    ///      `<prefix>.chat.cancel { chat_id }` → the in-flight HTTP
+    ///      stream is aborted and NO terminal event lands — no
+    ///      `chat.complete.result`, no `stream.end`, no `turn.error`,
+    ///      no `session.stats`. Unlike a graceful interrupt, the
+    ///      partial assistant text is NOT persisted to history.
+    ///   2. The chat's turn slot is released (no dangling InFlight
+    ///      state), and the same chat serves a subsequent completion
+    ///      normally.
+    #[tokio::test]
+    async fn chat_cancel_midstream_suppresses_terminal_events_and_chat_stays_usable() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        async fn drain_headers(s: &mut tokio::net::TcpStream) {
+            let mut buf = vec![0u8; 4096];
+            let mut acc = String::new();
+            while !acc.contains("\r\n\r\n") {
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        }
+
+        let _server = tokio::spawn(async move {
+            // conn1: stream two deltas, then hold the socket open until
+            // the client aborts (the hard cancel drops the reqwest byte
+            // stream → EOF here). Never sends finish/[DONE].
+            let (mut s1, _) = listener.accept().await.expect("accept 1");
+            drain_headers(&mut s1).await;
+            let _ = s1
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\n\
+                      Connection: close\r\n\r\n",
+                )
+                .await;
+            for word in ["alpha", "beta"] {
+                let frame = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{word} \"}}}}]}}\n\n",
+                );
+                let chunk = format!("{:x}\r\n{}\r\n", frame.len(), frame);
+                if s1.write_all(chunk.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+            let mut buf = [0u8; 256];
+            while let Ok(n) = s1.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+            }
+
+            // conn2: full streaming completion for the post-cancel turn.
+            let (mut s2, _) = listener.accept().await.expect("accept 2");
+            drain_headers(&mut s2).await;
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n\
+                        data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n\
+                        data: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n\
+                        data: [DONE]\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = s2.write_all(response.as_bytes()).await;
+            let _ = s2.shutdown().await;
+        });
+
+        let auth = Arc::new(AuthStore::from_env_key(Some("envkey".into())));
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(64);
+        let chats = fresh_chats("test-model");
+        let catalog = Arc::new(ToolCatalog::new());
+        let broker = Arc::new(ToolBroker::new());
+        let mut config = cfg("ollama");
+        config.base_url = format!("http://{}", addr);
+        let client = reqwest::Client::builder().build().expect("client");
+
+        let chat_id = ChatId::new("c-cancel");
+        let dispatch = |body: Map<String, Value>| {
+            let chats = chats.clone();
+            let auth = auth.clone();
+            let catalog = catalog.clone();
+            let broker = broker.clone();
+            let config = config.clone();
+            let client = client.clone();
+            let tx = tx.clone();
+            async move {
+                dispatch_event(
+                    &chats,
+                    &auth,
+                    &catalog,
+                    &broker,
+                    &config,
+                    &client,
+                    &tx,
+                    &from_plugin("mag"),
+                    &body,
+                )
+                .await
+                .expect("dispatch ok");
+            }
+        };
+
+        // 1. chat.create → chat.append(user) → chat.complete.
+        dispatch(make_event_body(
+            "ollama.chat.create",
+            &[("chat_id", Value::String("c-cancel".into()))],
+        ))
+        .await;
+        dispatch(make_event_body(
+            "ollama.chat.append",
+            &[
+                ("chat_id", Value::String("c-cancel".into())),
+                (
+                    "message",
+                    serde_json::json!({"role": "user", "content": "hi"}),
+                ),
+            ],
+        ))
+        .await;
+        dispatch(make_event_body(
+            "ollama.chat.complete",
+            &[("chat_id", Value::String("c-cancel".into()))],
+        ))
+        .await;
+
+        // 2. Wait until we're genuinely mid-stream (both deltas on the
+        //    writer channel) before cancelling.
+        let mut delta_count = 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while delta_count < 2 && std::time::Instant::now() < deadline {
+            if let Ok(msg) = rx.try_recv() {
+                let line = msg.to_line();
+                let v: Value = serde_json::from_str(&line).expect("plugin out json");
+                if let Some(body) = v.get("body").and_then(Value::as_object) {
+                    if body.get("kind").and_then(Value::as_str) == Some("ollama.stream.delta") {
+                        delta_count += 1;
+                    }
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        assert_eq!(delta_count, 2, "must be mid-stream before the cancel");
+
+        // 3. Hard cancel via the wire kind the kernel flushes at kill.
+        dispatch(make_event_body(
+            "ollama.chat.cancel",
+            &[("chat_id", Value::String("c-cancel".into()))],
+        ))
+        .await;
+
+        // 4. Settle window: NO terminal event for the cancelled turn.
+        let forbidden = [
+            "ollama.chat.complete.result",
+            "ollama.stream.end",
+            "ollama.turn.error",
+            "ollama.session.stats",
+            "ollama.chat.error",
+        ];
+        let deadline = std::time::Instant::now() + Duration::from_millis(600);
+        while std::time::Instant::now() < deadline {
+            if let Ok(msg) = rx.try_recv() {
+                let line = msg.to_line();
+                let v: Value = serde_json::from_str(&line).expect("json");
+                if let Some(body) = v.get("body").and_then(Value::as_object) {
+                    let kind = body.get("kind").and_then(Value::as_str).unwrap_or("");
+                    assert!(
+                        !forbidden.contains(&kind),
+                        "cancelled completion must not deliver a terminal event; got {body:?}",
+                    );
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        // 5. Unlike graceful interrupt, the partial assistant text is
+        //    NOT persisted — history holds only the user message.
+        let history = chats
+            .history_snapshot(&chat_id)
+            .await
+            .expect("history snapshot");
+        assert_eq!(
+            history.len(),
+            1,
+            "hard cancel must not persist partial assistant text; got {history:?}",
+        );
+        assert_eq!(history[0].role(), "user");
+
+        // 6. The turn slot was released — the same chat runs a fresh
+        //    completion end to end.
+        dispatch(make_event_body(
+            "ollama.chat.append",
+            &[
+                ("chat_id", Value::String("c-cancel".into())),
+                (
+                    "message",
+                    serde_json::json!({"role": "user", "content": "again"}),
+                ),
+            ],
+        ))
+        .await;
+        dispatch(make_event_body(
+            "ollama.chat.complete",
+            &[("chat_id", Value::String("c-cancel".into()))],
+        ))
+        .await;
+
+        let mut result: Option<Map<String, Value>> = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while result.is_none() && std::time::Instant::now() < deadline {
+            if let Ok(msg) = rx.try_recv() {
+                let line = msg.to_line();
+                let v: Value = serde_json::from_str(&line).expect("json");
+                if let Some(body) = v.get("body").and_then(Value::as_object) {
+                    let kind = body.get("kind").and_then(Value::as_str).unwrap_or("");
+                    if kind == "ollama.turn.error" {
+                        panic!("post-cancel completion must not error: {body:?}");
+                    }
+                    if kind == "ollama.chat.complete.result" {
+                        result = Some(body.clone());
+                    }
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        let result = result.expect("post-cancel completion must deliver chat.complete.result");
+        assert_eq!(
+            result.get("chat_id").and_then(Value::as_str),
+            Some("c-cancel"),
+        );
+        let text = result
+            .get("output")
+            .and_then(|o| o.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(text, "hello", "second completion streamed its output");
     }
 }
