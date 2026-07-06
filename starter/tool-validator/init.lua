@@ -233,7 +233,11 @@ local function handle_permission_request(body)
       return
     end
     if verdict == "deny" then
-      emit_response(id, "deny")
+      -- Forbidden is a risk classification, not a runtime verdict: in
+      -- safe mode the human accepts or rejects the risk via the popup;
+      -- auto denies (no human in the loop); yolo approved above.
+      -- (docs/approval-model.md decision matrix, forbidden row.)
+      defer_or_deny(body)
       return
     end
     -- defer: fall through to popup (non-read-only agents only).
