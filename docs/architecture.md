@@ -32,7 +32,16 @@ The lead operates on run statuses and results, never on the data flowing
 between actors. Within a run, actors pass typed messages along routes; the
 run's result reaches the lead inline on `mag.run_result` (and `mag-eval`
 returns the terminal node's output inline). Per-node file persistence
-(`runs/<run_id>/<node>.output`) is implemented but host-gated — the mag plugin
-does not currently put the persistence lib on its `package.path`, so it is
-inactive there and runs report `persisted = false`; the inline result is the
-live channel. The graph is the data bus; the lead is the control plane.
+(`runs/<run_id>/<node>.output`) is host-gated on the shared Lua tree: the mag
+plugin points its kernel VM's `package.path` at the `--lua-root` the composition
+resolves (`starter/init.lua`), so `require("output-persistence")` — and thus
+persistence — is **active** whenever that tree resolves. That is the deployed
+default: `starter` passes `--lua-root`, and installed configs fall back to the
+data-root pm checkout (`<data>/nefor/lua`); a live session persists a full run's
+node outputs under `sessions/<sid>/mag/runs/<run_id>/`. It degrades to a warned
+no-op (`persisted = false`) only when no Lua tree resolves — a kernel loaded
+without `--lua-root` and outside any repo/data tree, as in bare plugin unit
+tests (`LuaHost::load_kernel(path, None)`), which is the vantage point that reads
+as "inactive". Either way the inline result on `mag.run_result` stays the live
+channel; persisted paths are a control-plane convenience the lead may read. The
+graph is the data bus; the lead is the control plane.
