@@ -16,7 +16,7 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 - `plugins/basic-tools/` — `read_file` / `write_file` / `bash` built-ins.
 - `plugins/mock-plugin/` — scriptable NCP actor for integration tests. Local Ollama works through `openai-provider` directly with `static_token = "ollama-local"`.
 - `tools/fake-engine/` — harness that impersonates the engine for plugin-side tests.
-- `starter/init.lua` — default composition. Sets `package.path`, defines the global `dispatch` hook (delegates to `core.ncp.dispatch`), spawns plugins via `nefor.plugins.spawn`, wires per-edge `from_plugin`/`to_plugin` transforms.
+- `starter/init.lua` — default composition. Sets `package.path`, bootstraps the shared Lua tree via `nefor-pm`, defines the global `dispatch` hook (delegates to `core.ncp.dispatch`), and spawns every actor via `actor.spawn` (sessions, agentic-loop, providers, mag kernel, tool-gate, lead-workflow, chat).
 - `lua/core/` — shipped library: NCP v0.1 (handshake, broadcast-minus-sender, replay-on-attach, errors), actor runtime, history replay. JSON via the engine-provided `nefor.json`.
 - `starter/agentic-loop/` — the lead's turn spawner: per user message it clones the shipped turn-program (`agentic-loop/lead-turn.mag`) and submits it to the mag kernel; owns canonical history + queueing.
 - `starter/mag-kernel/` — the kernel loaded by the mag plugin's embedded VM: actor fold, factories, routing, run contexts, observer stream.

@@ -4,7 +4,7 @@ Reference config for the nefor engine. NCP v0.1 protocol semantics live here in 
 
 ## Layout
 
-- `init.lua` — top-level composition. Sets `package.path`, installs the dispatch hook, spawns every plugin, wires the orchestration graph.
+- `init.lua` — top-level composition. Sets `package.path`, defines the global `dispatch` hook, and spawns every actor via `actor.spawn` (sessions, agentic-loop, providers, mag kernel, tool-gate, lead-workflow, chat surface).
 - `chat/` — chat surface composed over `tui.*` primitives. `chat/init.lua` is the entry point loaded by `nefor-tui --script`; submodules under `chat/` carry per-concern code (transcript, statusline, input, popups, history, sessions, slash, at_path, view, update).
 - `cli/` — virtual `agentic-cli` plugin used by `cli-config/init.lua` for `nefor plugin agentic-cli "<prompt>"`.
 - `agentic-loop/` — the lead's turn spawner: per user message it clones the shipped turn-program (`agentic-loop/lead-turn.mag`) and submits it to the mag kernel.

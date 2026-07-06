@@ -1,6 +1,13 @@
-;; Reusable tool set definitions
+;; Reusable tool set definitions.
+;;
+;; These name the real advertised tool surface (see prompts/lead.md and
+;; lib/patterns.md's "Agent tool surfaces" razor): an agent's :tools carries
+;; context I/O — tools that pull content into its context or author from it
+;; (read_file, read_image, edit_file, write_file) — plus mag-eval for world
+;; work. Listing, searching, git, and web fetch are NOT bespoke tools; they
+;; are mag-eval shell expressions — (bash "rg -n foo src/"), (bash "git diff"),
+;; (bash "curl -s URL"). So a set is a context-I/O surface plus mag-eval.
 
-(def read-tools ["fs/read" "grep" "find" "git/log"])
-(def write-tools ["fs/read" "fs/edit" "grep" "shell"])
-(def web-tools ["web/search" "web/fetch"])
-(def review-tools ["fs/read" "grep" "git/diff"])
+(def read-tools ["read_file" "mag-eval"])                           ;; read-only investigator
+(def write-tools ["read_file" "edit_file" "write_file" "mag-eval"]) ;; builder: read + author
+(def review-tools ["read_file" "mag-eval"])                         ;; reviewer: read + git/diff via mag-eval

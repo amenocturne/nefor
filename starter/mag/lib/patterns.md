@@ -35,8 +35,9 @@ the first node's stdout becomes the next node's stdin.
   subgraph; it compiles alone or composes inside a larger graph, and its
   edges are type-checked like any others.
 - A command's non-zero exit is a routable failure (`mag.CommandFailed`);
-  unrouted, the run fails loudly. Route it to a repair actor when failure
-  is part of the design, exactly as in "Fire on failure" below.
+  unrouted, the kernel routing layer escalates it and the run fails loudly.
+  Route it to a repair actor when failure is part of the design, exactly as
+  in "Fire on failure" below.
 
 Shell nodes go through the same capability gate as agent tool calls —
 piping does not bypass command policy.
