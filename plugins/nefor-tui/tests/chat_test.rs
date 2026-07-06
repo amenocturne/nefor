@@ -878,6 +878,202 @@ fn mag_post_complete_teardown_keeps_done_glyphs() {
     );
 }
 
+// A FAILED run must enter the same linger→prune cycle a completed run does:
+// `mag.run_failed` stamps the run terminal so it fades out. Regression for the
+// 0.4.0 acceptance defect where a failed eval run (`bash-1 killed`, `sink`)
+// lingered in the sidebar forever because only `mag.run_complete` stamped
+// `completed_at_ms`.
+#[test]
+fn mag_run_failed_prunes_after_linger() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "run-failaaa", "run_name": "eval-5" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_spawned", "run_id": "run-failaaa", "id": "bash-1", "factory": "bash" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_ready", "run_id": "run-failaaa", "id": "bash-1" }),
+    );
+    // The run fails, then its still-live actors are reaped with reason
+    // "run_failed" (the teardown sweep) — the wire order the kernel produces.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_failed", "run_id": "run-failaaa", "from": "bash-1" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_killed", "run_id": "run-failaaa", "id": "bash-1", "reason": "run_failed" }),
+    );
+
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("MAG eval-5"),
+        "failed run should linger initially: {out:?}"
+    );
+
+    // Past the linger window the failed run must disappear, exactly like a
+    // completed one — no dispatch, view-side filter alone.
+    engine.advance_time(Duration::from_millis(3000));
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("MAG eval-5"),
+        "failed run should be pruned past the linger window: {out:?}"
+    );
+    assert!(
+        out.contains("(no active runs)"),
+        "empty-state hint missing after a failed run prunes: {out:?}"
+    );
+}
+
+// A run torn down by an outright `mag.kill_run` emits no run-level terminal
+// event — only `mag.actor_killed` with reason "killed". That teardown reason
+// must still stamp the run terminal so it prunes; otherwise a killed run
+// lingers forever the same way a failed one used to.
+#[test]
+fn mag_killed_run_prunes_after_linger() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "run-killbbb", "run_name": "victim" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_spawned", "run_id": "run-killbbb", "id": "worker.llm", "factory": "llm" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_ready", "run_id": "run-killbbb", "id": "worker.llm" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_killed", "run_id": "run-killbbb", "id": "worker.llm", "reason": "killed" }),
+    );
+
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("MAG victim"),
+        "killed run should linger initially: {out:?}"
+    );
+
+    engine.advance_time(Duration::from_millis(3000));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.session.stats", "turns": 1 }),
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        !out.contains("MAG victim"),
+        "killed run should be pruned past the linger window: {out:?}"
+    );
+}
+
+// A mid-run control-plane kill (`reason: "modification"`) removes one actor
+// but the RUN stays live — it must NOT be stamped terminal, so it keeps
+// rendering and never prunes while its siblings run. Guards the terminal
+// stamping from over-reaching past genuine teardown reasons.
+#[test]
+fn mag_modification_kill_keeps_run_live() {
+    let mut engine = Engine::new(120, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "run-modccc", "run_name": "living" }),
+    );
+    for id in ["writer.draft", "explorer.entry"] {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "mag.actor_spawned", "run_id": "run-modccc", "id": id, "factory": "llm" }),
+        );
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "mag.actor_ready", "run_id": "run-modccc", "id": id }),
+        );
+    }
+    // One actor is killed by an applied modification — the run continues.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_killed", "run_id": "run-modccc", "id": "writer.draft", "reason": "modification" }),
+    );
+
+    // Well past any linger window, with a dispatch to run the prune: the run
+    // is still live (never stamped terminal), so it must stay on screen.
+    engine.advance_time(Duration::from_millis(5000));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.session.stats", "turns": 1 }),
+    );
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("MAG living"),
+        "a modification kill must not prune the still-live run: {out:?}"
+    );
+}
+
+// Reason-accurate member labels: a run torn down as "run_failed" reads its
+// member rows as `failed`, not the literal word `killed`. Only kill_run /
+// modification reasons read "killed" (covered above). Unfolds the group so the
+// member leaf row — where the status word is painted — renders.
+#[test]
+fn mag_failed_run_member_row_reads_failed() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "run-fmlabel", "run_name": "eval-9" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_spawned", "run_id": "run-fmlabel", "id": "writer.draft", "factory": "llm" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_ready", "run_id": "run-fmlabel", "id": "writer.draft" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_failed", "run_id": "run-fmlabel", "from": "writer.draft" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.actor_killed", "run_id": "run-fmlabel", "id": "writer.draft", "reason": "run_failed" }),
+    );
+
+    // Focus the sidebar and unfold the (default-collapsed) `writer` group so
+    // its member leaf row paints its status word.
+    engine.handle_key(key("tab")).expect("tab");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("down")).expect("down"); // → writer group row
+    engine.handle_key(key("enter")).expect("enter"); // unfold
+    let out = render_str(&mut engine);
+
+    assert!(
+        out.contains("writer.draft"),
+        "unfolded member row should expose the failed actor id: {out:?}"
+    );
+    assert!(
+        out.contains("failed"),
+        "a run_failed member must read `failed`: {out:?}"
+    );
+    assert!(
+        !out.contains("killed"),
+        "a run_failed member must NOT read the literal word `killed`: {out:?}"
+    );
+}
+
 // Grouping across multiple agents: a two-agent run (explorer.* + writer.*)
 // plus a standalone `sink` actor collapses to exactly three group rows.
 // Killing the whole writer subtree marks only the writer group ⊗; the

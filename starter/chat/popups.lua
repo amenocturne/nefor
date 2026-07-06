@@ -548,18 +548,20 @@ local function agent_composite_view(state, p, now_ms)
     predicate = nil -- whole run: every actor
     label, name = "run", run_ident_of(run, p.run_id)
     members = 0
-    local any_live, any_killed, all_terminal = false, false, true
+    local any_live, any_killed, any_failed, all_terminal = false, false, false, true
     for _, g in ipairs(groups) do
       members = members + #g.members
       if g.status == "running" or g.status == "working" then any_live = true end
       if g.status == "killed" then any_killed = true end
-      if g.status ~= "done" and g.status ~= "killed"
+      if g.status == "failed" then any_failed = true end
+      if g.status ~= "done" and g.status ~= "killed" and g.status ~= "failed"
           and g.status ~= "error" and g.status ~= "skipped" then all_terminal = false end
       local s, f = g.first_start, g.last_finish
       if s and (first_start == nil or s < first_start) then first_start = s end
       if f and (last_finish == nil or f > last_finish) then last_finish = f end
     end
     gstatus = any_killed and "killed"
+      or any_failed and "failed"
       or any_live and "running"
       or (run and run.completed_at_ms ~= nil and "done")
       or (all_terminal and members > 0 and "done")

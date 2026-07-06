@@ -1265,6 +1265,16 @@ local function handle_mag_run_complete(msg, state)
   return run_panel.mag_run_complete(state, run_id, "success", tui.now_ms()), {}
 end
 
+-- A run that ended on an unhandled failure. Same linger→prune bookkeeping as
+-- run_complete (without it a failed run lingers in the sidebar forever), but
+-- marks the run failed so its members read red.
+local function handle_mag_run_failed(msg, state)
+  if state.replay_mode then return state, {} end
+  local run_id = msg.run_id
+  if type(run_id) ~= "string" then return state, {} end
+  return run_panel.mag_run_failed(state, run_id, "failed", tui.now_ms()), {}
+end
+
 -- The tool gate broadcasts `tool-gate.tool.invoke { id, from, name, args }`
 -- for every gated tool call and the correlated `tool.result { id,
 -- output|error }`. `from` is the emitting actor id (e.g. `scout.run-tool`)
@@ -1352,6 +1362,7 @@ local handlers = {
   ["mag.modification_rejected"]   = handle_mag_modification_rejected,
   ["mag.modification_noop"]       = handle_mag_modification_noop,
   ["mag.run_complete"]            = handle_mag_run_complete,
+  ["mag.run_failed"]              = handle_mag_run_failed,
   ["tool-gate.tool.invoke"]       = handle_gate_tool_invoke,
   ["tool.result"]                 = handle_gate_tool_result,
   ["mouse.selection"]             = handle_mouse_selection,

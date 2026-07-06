@@ -20,8 +20,11 @@ local GLYPHS = {
   error   = "✗",
   skipped = "⊘",
   -- A killed actor is a deliberate termination, distinct from a failed
-  -- one.
+  -- one. Both share the ⊗ glyph — the distinction rides the row's label
+  -- text ("killed" vs "failed"), not the shape — so a failed run reads red
+  -- and terminated without inventing a second glyph.
   killed  = "⊗",
+  failed  = "⊗",
   -- MAG member activity states (mag.actor_busy / mag.actor_idle): `working`
   -- is a live activation (ticks its CURRENT activation's elapsed), `idle` is
   -- constructed-between-activations (renders quietly, no timer). The agent
@@ -41,6 +44,7 @@ local NODE_STYLE = {
   error   = STYLE.panel_error,
   skipped = STYLE.panel_skipped,
   killed  = STYLE.panel_error,
+  failed  = STYLE.panel_error,
   working = STYLE.panel_running,
   idle    = STYLE.status_dim,
 }
@@ -48,7 +52,16 @@ local NODE_STYLE = {
 -- Node statuses that count as terminal (drive the done/total counter and
 -- freeze the elapsed timer).
 local TERMINAL_STATUS = {
-  done = true, error = true, skipped = true, killed = true,
+  done = true, error = true, skipped = true, killed = true, failed = true,
+}
+
+-- Kill reasons (mag.actor_killed `reason`) that mean the RUN itself ended —
+-- a control-plane teardown — as opposed to "modification", a mid-run kill
+-- that leaves the run live. A teardown reason stamps the run terminal so its
+-- linger→prune cycle starts; "run_complete" is excluded here because
+-- mag.run_complete already owns that run's completion bookkeeping.
+local RUN_TEARDOWN_REASON = {
+  run_failed = true, killed = true, reaped = true,
 }
 
 local function sorted_keys(m)
@@ -141,24 +154,27 @@ end
 M.group_of = group_of
 
 -- Aggregate a group's member states into one status. Precedence, highest
--- first: killed (any member killed) → running (any member live — working
--- and idle both count: an agent loop between provider rounds is still a
--- live loop) → done (run finished) → pending (no member ready yet).
--- `killed` outranks `running` so a group with any killed member reads as
--- terminated — the "killed if any member was killed" rule — even while a
--- sibling is still mid-flight.
+-- first: killed (any member killed) → failed (any member failed) → running
+-- (any member live — working and idle both count: an agent loop between
+-- provider rounds is still a live loop) → done (run finished) → pending (no
+-- member ready yet). `killed`/`failed` outrank `running` so a group with any
+-- terminated member reads as terminated — the "killed if any member was
+-- killed" rule, extended to run-failure teardown — even while a sibling is
+-- still mid-flight.
 local LIVE_MEMBER_STATUS = { running = true, working = true, idle = true }
 
 local function group_status(members, run_completed)
-  local any_killed, any_running = false, false
+  local any_killed, any_failed, any_running = false, false, false
   local count = 0
   for _, m in ipairs(members) do
     count = count + 1
     if m.node.status == "killed" then any_killed = true
+    elseif m.node.status == "failed" then any_failed = true
     elseif LIVE_MEMBER_STATUS[m.node.status] then any_running = true end
   end
   if count == 0 then return "pending" end
   if any_killed then return "killed" end
+  if any_failed then return "failed" end
   if any_running then return "running" end
   if run_completed then return "done" end
   return "pending"
@@ -582,12 +598,21 @@ function M.actor_idle(state, run_id, actor_id, now_ms)
   return mark_actor(state, run_id, actor_id, now_ms, "idle")
 end
 
--- `reason` is the kernel's teardown taxonomy (mag-kernel observer.lua):
--- "run_complete" marks the bookkeeping sweep after a SUCCESSFUL completion —
--- the node stays/goes done (✓), never killed, so a finished run doesn't
--- repaint red. Every other reason ("modification" / "run_failed" / "killed" /
--- "reaped", or absent) renders killed (⊗) as before; the group rule "killed
--- if any member killed" thereby scopes to non-teardown kills.
+-- `reason` is the kernel's teardown taxonomy (mag-kernel observer.lua) and
+-- drives BOTH the node label and the run's terminal bookkeeping:
+--   * "run_complete" — the sweep after a SUCCESSFUL completion; the node
+--     stays/goes done (✓), never killed, so a finished run doesn't repaint
+--     red. mag.run_complete owns the run's completed_at_ms stamp.
+--   * "run_failed" — a run-failure teardown; the node reads "failed" (⊗,
+--     red) and the RUN is stamped terminal here so its linger→prune starts
+--     even when no mag.run_failed reached the panel first.
+--   * "killed" / "reaped" — an outright kill_run / session-sweep teardown;
+--     the node reads "killed" (⊗) and the RUN is stamped terminal (kill_run
+--     emits no run-level event, so this is the only prune trigger for it).
+--   * "modification" (or absent) — a mid-run control-plane kill; the node
+--     reads "killed" but the run stays LIVE (not stamped) — it continues.
+-- An already-terminal node is never downgraded, so a stray or second
+-- teardown of a settled run can't repaint done→killed.
 function M.actor_killed(state, run_id, actor_id, now_ms, reason)
   if not (state.runs and state.runs[run_id]
       and state.runs[run_id].nodes
@@ -601,19 +626,26 @@ function M.actor_killed(state, run_id, actor_id, now_ms, reason)
     if reason == "run_complete" then
       -- mag.run_complete normally precedes the teardown and already flipped
       -- live nodes to done; flip any straggler here and leave terminal
-      -- states (done/killed/error) untouched.
-      if TERMINAL_STATUS[node.status] then
-        return prev
+      -- states (done/killed/failed/error) untouched.
+      if not TERMINAL_STATUS[node.status] then
+        nodes[actor_id] = shallow_merge(node, {
+          status = "done", finished_at_ms = now_ms,
+        })
       end
-      nodes[actor_id] = shallow_merge(node, {
-        status = "done", finished_at_ms = now_ms,
-      })
       return shallow_merge(prev, { nodes = nodes })
     end
-    nodes[actor_id] = shallow_merge(node, {
-      status = "killed", finished_at_ms = now_ms,
-    })
-    return shallow_merge(prev, { nodes = nodes })
+    local new_status = (reason == "run_failed") and "failed" or "killed"
+    if not TERMINAL_STATUS[node.status] then
+      nodes[actor_id] = shallow_merge(node, {
+        status = new_status, finished_at_ms = now_ms,
+      })
+    end
+    local patch = { nodes = nodes }
+    if RUN_TEARDOWN_REASON[reason] then
+      patch.completed_at_ms = prev.completed_at_ms or now_ms
+      patch.status = prev.status or new_status
+    end
+    return shallow_merge(prev, patch)
   end)
 end
 
@@ -648,6 +680,31 @@ function M.mag_run_complete(state, run_id, status, now_ms)
     end
     return shallow_merge(prev, {
       nodes = nodes, completed_at_ms = now_ms, status = status or "success",
+    })
+  end)
+end
+
+-- Terminal FAILURE for a kernel run (mag.run_failed): the run ended on an
+-- unhandled actor failure. Mirrors mag_run_complete's linger bookkeeping —
+-- stamps `completed_at_ms` so the same linger→prune path fades the run out —
+-- but flips still-live actors to "failed" (not "done"), so a failed run
+-- reads red. The teardown's actor_killed(reason="run_failed") events land on
+-- the now-terminal nodes afterwards and leave them (actor_killed's terminal
+-- guard). Idempotent with that path: whichever arrives first stamps the run.
+function M.mag_run_failed(state, run_id, status, now_ms)
+  if not (state.runs and state.runs[run_id]) then return state end
+  return apply(state, run_id, function(prev)
+    local nodes = {}
+    for k, v in pairs(prev.nodes or {}) do
+      if not TERMINAL_STATUS[v.status] then
+        nodes[k] = shallow_merge(v, { status = "failed", finished_at_ms = now_ms })
+      else
+        nodes[k] = v
+      end
+    end
+    return shallow_merge(prev, {
+      nodes = nodes, completed_at_ms = prev.completed_at_ms or now_ms,
+      status = status or "failed",
     })
   end)
 end
