@@ -70,6 +70,7 @@
 local json = nefor.json
 
 local mag            = require("mag")
+local mag_eval      = require("lead-workflow.mag-eval")
 local sessions      = require("sessions")
 local envelope      = require("core.envelope")
 local replay_window = require("core.history_replay")
@@ -1333,6 +1334,7 @@ local function lead_workflow_tool_schemas()
         properties = {},
       },
     },
+    mag_eval.schema,
   }
 end
 
@@ -1579,6 +1581,7 @@ local TOOL_HANDLERS = {
   ["submit-plan"]     = submit_plan,
   ["mag"]             = mag_handler,
   ["mag-env"]         = mag_env_handler,
+  ["mag-eval"]        = mag_eval.handle,
 }
 
 local function handle_tool_invoke(body)
@@ -1660,6 +1663,10 @@ local function receive_msg(entry)
     end
     return
   end
+
+  -- mag-eval's slice of the bus protocol (its own loads, runs, session-end
+  -- cleanup). Consumes only envelopes correlated to a pending eval.
+  if mag_eval.on_bus(kind, body) then return end
 
   -- MAG kernel path.
   -- mag.hello advertises the factory registry at plugin startup — the startup
