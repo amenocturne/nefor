@@ -20,6 +20,7 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 - `lua/core/` — shipped library: NCP v0.1 (handshake, broadcast-minus-sender, replay-on-attach, errors), actor runtime, history replay. JSON via the engine-provided `nefor.json`.
 - `starter/agentic-loop/` — the lead's turn spawner: per user message it clones the shipped turn-program (`agentic-loop/lead-turn.mag`) and submits it to the mag kernel; owns canonical history + queueing.
 - `starter/mag-kernel/` — the kernel loaded by the mag plugin's embedded VM: actor fold, factories, routing, run contexts, observer stream.
+- `starter/mag/` — MAG workspace management (per-session workspace seeded from `mag/lib/`: types, templates, tools, policies, patterns) plus modification preview formatting; compilation itself lives in the mag plugin.
 - `starter/sessions/` — sessions actor: boot/shutdown/resume + jsonl persistence over the bus.
 - `starter/chat/` — chat surface composed over `tui.*` primitives (entry `chat/init.lua`; transcript, statusline, input, popups, slash commands as submodules). Entry model is copy-on-write with a global version counter (`entry.lua`); heights cached by `(version, width)` in `height_cache.lua`; debug logging gated on `NEFOR_DEBUG` (`log.lua`, writes to `<data_dir>/debug/nefor-chat.log`). Virtual scroll uses gap=0 outer column with spacers flush against a nested content column to avoid phantom-gap position mismatches.
 - `starter/cli/` — virtual `agentic-cli` plugin: surfaces the loop over stdin/stdout for `nefor plugin agentic-cli "<prompt>"`.
