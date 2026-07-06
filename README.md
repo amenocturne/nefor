@@ -23,8 +23,9 @@ are another composition. Routing, persistence, orchestration, approvals, and
 protocol semantics live where you can read and rewrite them.
 
 The starter proves the shape with a chat surface, providers, tool gates,
-sessions, and workflow actors. Keep it, strip it down, or use it as a reference
-for your own distribution.
+sessions, and a MAG-based agentic loop — the lead composes work by writing tiny
+MAG programs the runtime folds into live actor constellations. Keep it, strip
+it down, or use it as a reference for your own distribution.
 
 ## What You Can Compose
 
@@ -84,8 +85,10 @@ Run the starter:
 nefor
 ```
 
-The first run uses the mock provider, so no live model is required. Edit the
-copied config for real providers, different tools, or different wiring:
+The starter defaults to the ChatGPT provider (`chatgpt-provider`); set your
+credentials or edit the copied config to point at another provider. A
+deterministic offline mock also ships for credential-free testing. Edit the
+config for real providers, different tools, or different wiring:
 
 ```sh
 $EDITOR ~/.config/nefor/config/init.lua

@@ -220,6 +220,15 @@ time the resident evaluator applies it — pure evaluation, same evaluator as
 load, with runtime data as the argument. The kernel sees a name in and
 plain data out; it never learns what a function is.
 
+> **Status: kernel rule-firing is not yet wired.** The compiler emits and
+> validates rules (load-time exists/unary/contract checks) and the resident
+> evaluator can apply a rule fn, but the kernel fold does not yet fire them:
+> a non-empty `rules` list is rejected at apply with `"rules not implemented"`.
+> Every shipped program is therefore fully static — all composition is routes
+> plus input contracts, `rules: []`. The design below is what firing will do
+> once the fold wires it; patterns that need it (race-and-kill, dynamic fanout)
+> are flagged in patterns.md.
+
 - Name-plus-snapshot instead of embedded code: a MAG function closes over
   its defining environment, and re-entering the source snapshot provides
   that environment deterministically — no closure serialization, ever.

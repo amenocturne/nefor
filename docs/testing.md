@@ -14,15 +14,14 @@ If those three pass, the substrate is healthy.
 
 ## Test suite layout
 
-| Suite                           | Where                                           | What it covers                                                                                                 | Cost                           |
-| ------------------------------- | ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ------------------------------ |
-| Workspace unit tests            | `cargo test --workspace`                        | Per-crate unit tests across engine + all plugins                                                               | Few seconds, mostly in-process |
-| `agentic_cli_mock_e2e`          | `engine/tests/agentic_cli_mock_e2e.rs`          | Full chain (engine binary as subprocess + Lua + mock provider). 6 scenarios. **Default Stage-1 health check.** | ~2.5s wall                     |
-| `stage1_e2e`                    | `engine/tests/stage1_e2e.rs`                    | In-process duplex driver against a real provider. `#[ignore]`-gated; needs live Ollama at `localhost:11434`    | ~10-30s; opt-in                |
-| `starter_ncp_test`              | `engine/tests/starter_ncp_test.rs`              | NCP v0.1 protocol in Lua                                                                                       | <1s                            |
-| `starter_sessions_test`         | `engine/tests/starter_sessions_test.rs`         | Session persistence + resume                                                                                   | <1s                            |
-| `starter_agentic_workflow_test` | `engine/tests/starter_agentic_workflow_test.rs` | Agentic orchestration Lua tests                                                                                | <1s                            |
-| Plugin unit tests               | `cargo test -p <plugin>`                        | Each plugin's own tests (nefor-tui has chat + layout + reconciler tests, openai-provider 137, etc.)            | Sub-second per plugin          |
+| Suite                           | Where                                           | What it covers                                                                                             | Cost                           |
+| ------------------------------- | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | ------------------------------ |
+| Workspace unit tests            | `cargo test --workspace`                        | Per-crate unit tests across engine + all plugins                                                           | Few seconds, mostly in-process |
+| `agentic_cli_mock_e2e`          | `engine/tests/agentic_cli_mock_e2e.rs`          | Full chain (engine binary as subprocess + Lua + mock provider). 6 scenarios. **Default e2e health check.** | ~2.5s wall                     |
+| `starter_ncp_test`              | `engine/tests/starter_ncp_test.rs`              | NCP v0.1 protocol in Lua                                                                                   | <1s                            |
+| `starter_sessions_test`         | `engine/tests/starter_sessions_test.rs`         | Session persistence + resume                                                                               | <1s                            |
+| `starter_agentic_workflow_test` | `engine/tests/starter_agentic_workflow_test.rs` | Agentic orchestration Lua tests                                                                            | <1s                            |
+| Plugin unit tests               | `cargo test -p <plugin>`                        | Each plugin's own tests (nefor-tui has chat + layout + reconciler tests, openai-provider 137, etc.)        | Sub-second per plugin          |
 
 The `agentic_cli_mock_e2e` suite is the one to add scenarios to when you ship new agentic-cli flow behavior. It's deterministic, non-ignored, and fast enough to live in CI.
 
@@ -45,7 +44,7 @@ cargo test -p openai-provider
 # With output (for debugging a failing test)
 cargo test --test agentic_cli_mock_e2e -- --nocapture
 
-# Including ignored tests (needs live Ollama)
+# Including #[ignore]-gated tests (opt-in; may need external services)
 cargo test -- --ignored
 ```
 
@@ -61,10 +60,10 @@ The CLI is a pure-Lua plugin declared in `cli-config/init.lua`. Run via `nefor p
 cd /path/to/nefor
 cargo build --workspace
 export NEFOR_PLUGIN_DIR=$PWD/plugins
-export USE_MOCK_PROVIDER=true
+export NEFOR_CONFIG=test
 ```
 
-`USE_MOCK_PROVIDER=true` switches `cli-config/init.lua` to spawn `mock-plugin` running `starter/mock-provider/init.lua` instead of `openai-provider`. Drop the env var to use a real provider.
+`NEFOR_CONFIG=test` makes `cli-config/config.lua` set `spawn_mock = true`, which spawns `mock-plugin` running `starter/mock-provider/init.lua` (`--script`) instead of a live provider. Drop the env var to use the configured real provider. (`USE_MOCK_PROVIDER=true` is deprecated — it now maps to the `test` config with a warning.)
 
 ### Single-shot mode
 
@@ -97,7 +96,7 @@ The `stream-json` mode is the same wire format the engine logs to disk — a `ta
 
 ```bash
 ./target/debug/nefor --config cli-config plugin agentic-cli --format stream-json "..." \
-  | jq -c 'select(.body.kind == "graph.run_complete")'
+  | jq -c 'select(.body.kind == "mag.run_complete")'
 ```
 
 **Known wart**: broadcast events appear N times (one per recipient peer) due to the engine's broadcast-as-N-targeted-sends pattern. Filter on a primary key like `run_id` if you need uniqueness.
@@ -142,10 +141,10 @@ Starter-owned `nefor run --session <id>` opens the TUI on a specific saved sessi
 
 ## Manual verification — TUI regression
 
-The agentic-cli and TUI share the same `agentic_workflow.lua` library. After any change to that library, smoke the TUI to confirm chat still works.
+The agentic-cli and TUI share the same `agentic-loop` module (`starter/agentic-loop/init.lua`; the CLI binds it to a local `agentic_workflow` alias). After any change to that module, smoke the TUI to confirm chat still works.
 
 ```bash
-unset USE_MOCK_PROVIDER
+unset NEFOR_CONFIG
 ./target/debug/nefor --config starter
 ```
 
@@ -169,7 +168,7 @@ These are documented quirks of the current codebase. Confirming they exist is pa
 
 ### READY_SENTINEL coupling
 
-`starter/agentic_cli.lua` watches for `basic-tools.hello` to know when all plugins are ready. Spawn order in `cli-config/init.lua` ends with `basic-tools`, so this works — but it's fragile.
+`starter/cli/init.lua` watches for `basic-tools.hello` (`READY_SENTINEL`) to know when all plugins are ready. Spawn order in `cli-config/init.lua` ends with `basic-tools`, so this works — but it's fragile.
 
 To confirm: comment out the `basic-tools` spawn line in `cli-config/init.lua`, run any single-shot command. CLI hangs forever waiting for `basic-tools.hello`. Restore after testing.
 
@@ -180,7 +179,7 @@ Fix candidates (future work): engine-level "all spawned plugins are ready" event
 ```bash
 ./target/debug/nefor --config cli-config plugin agentic-cli --format stream-json \
   "summarise octopuses..." \
-  | jq -c 'select(.body.kind == "graph.run_complete")' | wc -l
+  | jq -c 'select(.body.kind == "mag.run_complete")' | wc -l
 ```
 
 Expect `~15` (not 1). Each broadcast is logged N times for N recipient peers; `nefor.bus.on_event` fires once per log entry.
@@ -226,7 +225,7 @@ fn my_new_scenario() {
 `TestEnv` helper handles:
 
 - TempDir for `XDG_DATA_HOME` (each test gets its own; no pollution)
-- Spawning the engine binary with `USE_MOCK_PROVIDER=true` and `NEFOR_PLUGIN_DIR=$repo/plugins`
+- Spawning the engine binary with `NEFOR_CONFIG=test` (mock provider), `NEFOR_TEST_FAST_MOCK=1` (drops the mock's token pacing), and `NEFOR_PLUGIN_DIR=$repo/plugins`
 - `--config cli-config` argv prefix
 - Wall-clock timeout (10s default per scenario)
 - Thread-per-pipe drain (avoids the ~64KB stdout pipe-buffer deadlock that otherwise stalls `wait_with_output` in stream-json mode)
@@ -236,24 +235,21 @@ If the prompt doesn't have a canned response in `starter/mock-provider/init.lua`
 
 ## Adding scenarios to mock-provider/init.lua
 
-The mock has a scripted-table pattern: prompt-substring match → response shape.
+The mock matches on Lua patterns. `CANNED_TEXT` is a list of `{ pattern, text }` entries — the first pattern that matches the (lowercased) prompt wins and its `text` is streamed back:
 
 ```lua
 -- starter/mock-provider/init.lua
 
-local SCRIPTS = {
-  -- Existing canonical
-  ["summarise octopuses and lighthouses"] = {
-    -- mag write/execute response
-  },
+local CANNED_TEXT = {
+  -- Existing canonical: the octopus+lighthouse "sentinel" combiner answer
+  { pattern = "octopus.*lighthouse", text = "Octopuses ... sentinels ..." },
+  { pattern = "[Ss]ummarise octopuses", text = "..." },
   -- Add yours here
-  ["your test prompt key"] = {
-    -- response shape — copy from an existing entry
-  },
+  { pattern = "your test prompt", text = "..." },
 }
 ```
 
-Document at the top of `mock-provider/init.lua` what prompts trigger what responses. Don't change existing scripted responses (other tests depend on them); only add new ones.
+The multi-agent kernel flow uses a separate pair — `CANNED_MAG_FILE` and `CANNED_MAG_PROGRAM` — the `.mag` source the mock emits for the `mag` tool's write/execute calls. Document at the top of `mock-provider/init.lua` what prompts trigger what responses. Don't change existing entries (other tests depend on them); only add new ones.
 
 ## Troubleshooting
 
@@ -267,9 +263,9 @@ Document at the top of `mock-provider/init.lua` what prompts trigger what respon
 
 **TUI doesn't render.** Wrong `TERM`, missing `tput`, or running over a terminal that doesn't support raw mode. Confirm `tput cols` and `tput lines` work.
 
-**TUI shows blank transcript on submit.** Likely a regression in `agentic_workflow.lua` — the chat plugin still emits chat-contract events but no one's translating provider events anymore. Re-run `cargo test -p nefor-tui` and `cargo test --test agentic_cli_mock_e2e`; if those pass but TUI is broken with a real provider, suspect provider-side translation in `agentic_workflow.for_provider`.
+**TUI shows blank transcript on submit.** Likely a regression in the `agentic-loop` module (`starter/agentic-loop/init.lua`) — the chat plugin still emits chat-contract events but no one's translating provider events anymore. Re-run `cargo test -p nefor-tui` and `cargo test --test agentic_cli_mock_e2e`; if those pass but TUI is broken with a real provider, suspect provider-side translation in `agentic-loop`.
 
-**`USE_MOCK_PROVIDER=true cmd` doesn't propagate env.** Some shells lose env vars across `bash -c '...'` subshells. Export the var first (`export USE_MOCK_PROVIDER=true; cmd`) or set explicitly per-command (`USE_MOCK_PROVIDER=true exec cmd`). For Rust tests use `Command::env()`, not relying on the parent process.
+**`NEFOR_CONFIG=test cmd` doesn't propagate env.** Some shells lose env vars across `bash -c '...'` subshells. Export the var first (`export NEFOR_CONFIG=test; cmd`) or set explicitly per-command (`NEFOR_CONFIG=test exec cmd`). For Rust tests use `Command::env()`, not relying on the parent process.
 
 ## What good looks like
 

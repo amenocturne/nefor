@@ -6,17 +6,18 @@ see ir.md). Lowering is the pass that turns the first into the second: it
 dissolves edges into per-actor routing, namespaces template instantiations,
 and emits the single initial modification a program applies at load.
 
-This document specifies that mapping. It is a design spec for the loader task —
-the current compiler (`crates/nefor-mag`) emits the older graph-shaped IR
-(`GraphIr{terminal, nodes, edges, hash}`) and cannot yet produce this shape;
-the gap list at the end enumerates exactly where.
+This document specifies that mapping as the compiler (`crates/nefor-mag`)
+performs it today. `compile` returns a `ModificationIr{actors, messages, kills,
+rules, hash}` directly (`ir.rs`); there is no intermediate graph-shaped IR on
+the wire — the mag plugin serializes the modification straight to `mag.loaded`
+and the kernel folds it (ir.md).
 
-Worked example: `tests/fixtures/two-agents.mag` → `tests/fixtures/two-agents.modification.json`.
+Worked example: `../tests/fixtures/two-agents.mag` → `../tests/fixtures/two-agents.modification.json`.
 
-## Load pipeline (target)
+## Load pipeline
 
 ```
-source ──parse──▶ evaluate defs ──lower──▶ GraphModification ──validate──▶ resident env
+source ──parse──▶ evaluate defs ──extract graph──▶ lower ──▶ GraphModification ──validate──▶ resident env
 ```
 
 `evaluate defs` expands stdlib functions like `(agent ...)` into concrete
@@ -24,24 +25,24 @@ actor constellations. `lower` is this document. `validate` is the same
 validator that checks every runtime modification (ir.md). The environment then
 stays resident; rule functions become entry points.
 
-## The actor spec — proposed shape
+## The actor spec
 
-ir.md documents an actor as `{id, factory, params}`. Lowering needs one more
-field, so the target actor spec is:
+Lowering emits one actor spec per node — the `ActorIr` quad (`ir.rs`), the same
+shape ir.md documents:
 
 ```json
 { "id": "...", "factory": "...", "params": {}, "routes": {} }
 ```
 
-| Field     | Consumer                   | Holds                                         |
-| --------- | -------------------------- | --------------------------------------------- |
-| `id`      | kernel                     | namespaced actor id (`docs-explorer.llm`)     |
-| `factory` | kernel → factory           | which Lua factory constructs the instance     |
-| `params`  | factory (opaque to kernel) | factory setup: model, system, tools, `max`, … |
-| `routes`  | kernel (opaque to factory) | typed output → destination ids                |
+| Field     | Consumer                   | Holds                                            |
+| --------- | -------------------------- | ------------------------------------------------ |
+| `id`      | kernel                     | namespaced actor id (`docs-explorer.llm`)        |
+| `factory` | kernel → factory           | which Lua factory constructs the instance        |
+| `params`  | factory (opaque to kernel) | factory setup: model, system, tools, provider, … |
+| `routes`  | kernel (opaque to factory) | typed output → destination ids                   |
 
-`routes` is a **sibling of `params`, not nested inside it** — see the design
-decision below. `params` is handed opaquely to the factory (ir.md: "What an
+`routes` is a **sibling of `params`, not nested inside it**. `params` is handed
+opaquely to the factory (ir.md: "What an
 actor actually does with a message — the factory, entirely"); `routes` is read
 only by the kernel, which owns routing (ir.md division-of-responsibility
 table). Keeping them siblings keeps the factory contract free of routing data
@@ -65,7 +66,7 @@ routes : { "<qualified-output-type>": ["<dest-id>", ...], ... }
 | Back-edge (cycle) `counter -> llm` | `counter.routes["ProviderOut"] = ["llm"]` — no different from a forward edge                                                                                                                          |
 | Terminal sink `out`                | `out.routes = {}` (emits nothing downstream)                                                                                                                                                          |
 
-Type tags are produced exactly as `qualify_type` does today (ir.rs:40): dotted
+Type tags are produced exactly as `qualify_type` does (ir.rs:66): dotted
 names pass through (`generic-provider.FinalAnswer`), bare names get a `mag.`
 prefix (`mag.Task`). The kernel dispatches an actor's returned output
 by looking up its runtime type in `routes` — an O(1) type dispatch carried by
@@ -87,10 +88,9 @@ The agent template has ONE expansion — the bare agentic cycle: `entry`,
 a single output port on `llm`. The loop's terminator is structural: the
 llm's output is the union `ToolCalls | OUT`, so a final answer exits through
 the output port. Loops are unbounded — stopping a runaway run is the control
-plane's kill/interrupt, not a compiled bound. (A `:max-steps` loop bound
-shipped once, broken and untested — its exhaust wiring routed a tag no input
-port accepted and hung the run — and was removed rather than repaired;
-`:max-steps` now rejects at compile like any other unknown agent config key.)
+plane's kill/interrupt, not a compiled bound. Agent config keys are a fixed
+allowlist (`AGENT_CONFIG_KEYS`, eval.rs): an unknown key like `:max-steps`
+rejects at compile, and there is no loop-budget mechanism to author.
 
 | Template-internal name | `docs-explorer` instance    | `code-writer` instance    |
 | ---------------------- | --------------------------- | ------------------------- |
@@ -140,25 +140,28 @@ that never reaches it is the control plane's kill/interrupt.
 
 The graph's `:terminal` node lowers to a `sink` actor with `routes: {}`. There
 is **no `terminal` field** in a modification — terminality is expressed
-structurally: the sink emits nothing downstream, and its per-node output file
-is what the control plane reads as the run result (architecture.md control
-plane). The old `GraphIr.terminal` string (ir.rs:8) is dropped.
+structurally: the sink emits nothing downstream, and the run's result reaches
+the control plane inline on `mag.run_result` (architecture.md control plane).
+A modification has no `terminal` field at all.
 
 ### Implicit terminal
 
 `:terminal` is a default, not an obligation. Terminal resolution, in
-precedence order (graph.rs `resolve_terminal`):
+precedence order:
 
-1. an explicit `:terminal` node;
-2. exactly one `sink`-factory node in the graph (auto-detect; several stay an
-   error);
+1. an explicit `:terminal` node in a `(graph …)` — carried through as authored
+   (`graph.rs` `extract_graph`);
+2. exactly one `sink`-factory node in the graph — `resolve_terminal`
+   auto-detects it (several stay an error);
 3. otherwise the program terminates at the **last node of the chain** (last
-   fragment in appearance order): the compiler appends the canonical `sink`
-   actor after that node's output ports, its input contract derived from
-   their types, and wires `last -> sink`. The sink actor is the run-result
-   machinery — it persists the final output and signals `mag.RunComplete` —
-   so "the last node is the terminal" materializes as "the last node's output
-   feeds the appended sink".
+   fragment in appearance order): `append_implicit_sink` appends the canonical
+   `sink` actor after that node's output ports, its input contract derived from
+   their types, and wires `last -> sink`. The sink is the run-result
+   machinery — it signals `mag.RunComplete`, the run's result reaches the
+   control plane inline on `mag.run_result`, and (when persistence is active on
+   the host) it also writes the final output to a per-node file — so "the last
+   node is the terminal" materializes as "the last node's output feeds the
+   appended sink".
 
 A bare expression is the degenerate case: `(bash "ls")` alone is a one-node
 program — that node is entry and result-producing terminal, and the appended
@@ -227,7 +230,11 @@ on runtime data. Illustrative (not in this fixture):
 
 The rule `fn` is a name into the program's source snapshot with declared
 contract `NodeOutput -> GraphModification`; load-time checks that it exists, is
-unary, and matches the contract (ir.md). None of that machinery exists yet.
+unary, and matches the contract (ir.md). The compiler emits and validates rules
+and the resident evaluator can apply a rule fn, but the **kernel fold does not
+yet fire rules** — a non-empty `rules` list is rejected at apply
+(`"rules not implemented"`), so shipped programs carry `rules: []` and all
+composition today is static routes plus input contracts (ir.md, Rules).
 
 ## Master mapping table
 
@@ -244,28 +251,4 @@ unary, and matches the contract (ir.md). None of that machinery exists yet.
 | control edge (fire `b` after `a`, no data) | status-typed route entry on `a` (`mag.Unit`, failure variants)                                                     |
 | all-of join ("fire when A and B done")     | destination actor declares a product input `(A + B)` — no IR element; firing is the input contract (ir.md, Firing) |
 | static graph                               | `kills: []`, `rules: []`                                                                                           |
-| data-dependent composition                 | `rules: [{on, fn}]` binding a MAG function                                                                         |
-
-## Compiler gap list — `crates/nefor-mag`
-
-Every point where the compiler today cannot produce this lowering. This scopes
-the loader-modifications task.
-
-| #   | Gap                                                                                                                                                                                                                                                                                                                                         | Where                                                   | Needed                                                                                                                                                      |
-| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | **No modification IR.** Only `GraphIr{terminal, nodes, edges, hash}` is emitted; `compile` ends at `ir::normalize`.                                                                                                                                                                                                                         | `ir.rs:7-13`, `lib.rs:compile`                          | New `ModificationIr{actors, messages, kills, rules}` type + a lowering pass replacing/after `normalize`                                                     |
-| 2   | **Edges are first-class, not dissolved.** `EdgeIr{from,to,type}` and a top-level `edges` vec; `NodeIr` has no `routes`.                                                                                                                                                                                                                     | `ir.rs:31-38`, `ir.rs:15-22`, `ir.rs:140-152`           | Invert the edge list into per-source `routes: {type: [dest]}`; drop `EdgeIr`                                                                                |
-| 3   | **No namespacing.** Ids are `next_node_id()` → `node_N`, overwritten verbatim by the `let`/`def` binding name — a single flat name, no prefixing. `docs-explorer.llm` is unreachable.                                                                                                                                                       | `eval.rs:10-13`, `eval.rs:124-126`, `eval.rs:183-185`   | An instantiation namespace that prefixes internal ids + rewrites route destinations and rule `on` ids                                                       |
-| 4   | **No `agent` stdlib fn / subgraph-returning fn / splicing.** A bare `(agent {…} : …)` hits function application and fails (undefined). Even a user `fn` returning a `Value::Graph` cannot be embedded: `eval_graph` only consumes `Value::Node`, `->`, `:terminal`; a `Value::Graph` in the edge stream is silently skipped, never spliced. | `eval.rs:96-107`, `eval.rs:761-890` (skip at `857-859`) | An `agent` stdlib function; subgraphs as first-class composable values; `graph` splicing that dissolves boundary edges into internal-actor routes           |
-| 5   | **No ports on nodes/graphs.** `NodeValue`/`GraphValue` carry `nodes, edges, terminal` — no input/output port handles, so agent-as-node composition has nothing to resolve boundary edges against.                                                                                                                                           | `ast.rs:110-130`                                        | Port metadata on subgraph values (which internal actors are the in/out boundary)                                                                            |
-| 6   | **Single-terminal / single-component assumptions.** Exactly one `:terminal`/`sink` required; weak-connectivity enforced. The modification model has no `terminal` field.                                                                                                                                                                    | `graph.rs:59-76`, `graph.rs:79-124`, `eval.rs:862-883`  | Drop `terminal` from emission; re-express terminality as a sink with empty routes. (Cycle/dead-branch/type checks stay useful as pre-lowering validation)   |
-| 7   | **No rules / messages / kills emission.** Nothing produces any of the three; no initial-activation message synthesis.                                                                                                                                                                                                                       | whole of `ir.rs`                                        | Emit `messages` (initial activation), `kills: []`, `rules`                                                                                                  |
-| 8   | **No rule machinery.** No `NodeOutput -> GraphModification` contract, no load-time rule checks (fn exists / unary / contract), no resident source-snapshot for fire-time evaluation, no JSON↔MAG value bridge for feeding node outputs to rule fns.                                                                                         | absent                                                  | The rules-as-names layer (ir.md); out of scope for the _static_ fixture but required for the model                                                          |
-| 9   | **`reasoner` vs `factory` field name.** `NodeIr.reasoner` sourced from `node.node_type`.                                                                                                                                                                                                                                                    | `ir.rs:17`, `ir.rs:110`                                 | Rename to `factory` in the actor spec                                                                                                                       |
-| 10  | **Fanout shape differs.** `FanoutIr{in, out}` records that an output is a union but not _where each variant goes_ (that lives on edges).                                                                                                                                                                                                    | `ir.rs:24-29`, `ir.rs:99-105`                           | Merge "is a union" + "per-variant destination" into the single `routes` map; drop the `in` field (input type is the actor's own contract, not routing data) |
-| 11  | **Hashing covers the wrong shape.** `normalize` hashes canonical `{terminal, nodes, edges}`.                                                                                                                                                                                                                                                | `ir.rs:154-164`                                         | Canonicalize + hash the modification (sorted actors, sorted route keys and destination arrays) to preserve deterministic hashing                            |
-
-Partially present (reuse, not gaps): `qualify_type` (ir.rs:40) already produces
-the route-key tags; `MagType`/`accepts` (types.rs) already resolves which union
-variant an edge carries (ir.rs:115-130), the exact computation that assigns a
-destination to a `routes` key.
+| data-dependent composition                 | `rules: [{on, fn}]` binding a MAG function (kernel firing pending — see above)                                     |

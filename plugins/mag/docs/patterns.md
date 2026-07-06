@@ -44,7 +44,9 @@ Firing is the contract; the kernel assembles the activation.
 **Shape:** spawn N constellations on the same task; bind a rule on each
 finisher whose function returns `{kills: [<the others>]}`. First-applied
 wins; the losers' in-flight outputs are void; duplicate kills are logged
-no-ops. No coordination logic anywhere in the actors.
+no-ops. No coordination logic anywhere in the actors. Requires rule firing,
+which the kernel does not yet wire (ir.md, Rules) — pending that, this pattern
+is design-only.
 
 ## Cycle (the agentic loop)
 

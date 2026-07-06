@@ -8,7 +8,7 @@ common architectural bug is putting code one layer too low.
 | Engine            | Dumb string bus                        | Route strings between plugin processes, stamp envelopes, persist the session log, invoke the Lua dispatch hook                                                                                                       | Know about actors, runs, workflows, signals                                                              |
 | Plugins           | Heavyweight OS processes, boot-spawned | Capability providers. Own all provider quirks (e.g. `chatgpt-provider` owns everything about talking to OpenAI). Each exposes its own API — including whether cancellation exists at all                             | Contain workflow logic. Know how their capability is being used                                          |
 | Lua (trait layer) | Actor factories + kernel               | Define the primitive actor shapes (`llm`, `run-tool`, `human`, `sink`, …) with declared I/O contracts and explicit signal handlers. Host the kernel: spawn / kill / send over in-memory actors, routing, correlation | Define composed workflows. Hold two levels of abstraction (building blocks _and_ things built from them) |
-| MAG               | The language                           | Instances and composition. `(agent "prompt")` creates a live actor constellation. Stdlib templates (`agent`, `gate`) are MAG functions composing primitives                                                          | Reach below the primitive contracts                                                                      |
+| MAG               | The language                           | Instances and composition. `(agent {:id "..." ...} : IN -> FinalAnswer)` creates a live actor constellation. `agent` is a MAG stdlib function composing primitives (the bare agentic loop)                           | Reach below the primitive contracts                                                                      |
 
 ## The decoupling rule
 
@@ -24,11 +24,15 @@ Something is Lua-level **iff MAG cannot express it**: either it crosses a plugin
 boundary (`llm`, `run-tool`, `human`) or it is irreducible runtime machinery
 (`llm` transcript state, `sink` routing). Everything composable from primitives
 lives in the MAG stdlib — `agent` included. The lead still writes
-`(agent "prompt")`; it is a stdlib function, not a runtime feature.
+`(agent {:id "..." ...} : ...)`; it is a stdlib function, not a runtime feature.
 
 ## Control plane
 
-The lead operates on statuses and output file paths, never on data flowing
-between actors. Every actor's output persists to a per-node file; downstream
-graphs reference prior outputs by path. The graph is the data bus; the lead is
-the control plane.
+The lead operates on run statuses and results, never on the data flowing
+between actors. Within a run, actors pass typed messages along routes; the
+run's result reaches the lead inline on `mag.run_result` (and `mag-eval`
+returns the terminal node's output inline). Per-node file persistence
+(`runs/<run_id>/<node>.output`) is implemented but host-gated — the mag plugin
+does not currently put the persistence lib on its `package.path`, so it is
+inactive there and runs report `persisted = false`; the inline result is the
+live channel. The graph is the data bus; the lead is the control plane.
