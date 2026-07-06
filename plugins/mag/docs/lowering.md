@@ -145,6 +145,64 @@ structurally: the sink emits nothing downstream, and its per-node output file
 is what the control plane reads as the run result (architecture.md control
 plane). The old `GraphIr.terminal` string (ir.rs:8) is dropped.
 
+### Implicit terminal
+
+`:terminal` is a default, not an obligation. Terminal resolution, in
+precedence order (graph.rs `resolve_terminal`):
+
+1. an explicit `:terminal` node;
+2. exactly one `sink`-factory node in the graph (auto-detect; several stay an
+   error);
+3. otherwise the program terminates at the **last node of the chain** (last
+   fragment in appearance order): the compiler appends the canonical `sink`
+   actor after that node's output ports, its input contract derived from
+   their types, and wires `last -> sink`. The sink actor is the run-result
+   machinery — it persists the final output and signals `mag.RunComplete` —
+   so "the last node is the terminal" materializes as "the last node's output
+   feeds the appended sink".
+
+A bare expression is the degenerate case: `(bash "ls")` alone is a one-node
+program — that node is entry and result-producing terminal, and the appended
+sink carries its stdout out as the run result.
+
+## Shell defaults — MAG as shell
+
+`->` is the pipe. Three authoring defaults make capability nodes compose like
+a shell pipeline, with zero ceremony:
+
+- **Inline node expressions.** `(bash "cmd")` is usable directly inside graph
+  forms without a `let` binding. Unbound capability nodes get deterministic,
+  readable ids in appearance order — `bash-1`, `bash-2`, … (per-compilation
+  counters in the Env, so two loads of one source mint identical ids and an
+  identical modification hash). A `let`/`def` binding still renames the node,
+  as for any node value.
+- **Infix chains.** `((bash "rg foo") -> (bash "sort"))` outside a
+  `(graph …)` form evaluates to a subgraph — input port = the first
+  fragment's input, output ports = the last fragment's outputs — so chains
+  compose inside larger graphs and a bare top-level chain compiles as a whole
+  program. Edges are type-checked exactly as `graph` edges are.
+- **Bare expression = program.** A program whose value is a node or a
+  subgraph (not just a graph) compiles: the implicit terminal (above)
+  completes it.
+
+### The bash capability node
+
+`(bash "command")` lowers to one actor of the `bash` kernel factory
+(starter/mag-kernel/factories/bash.lua):
+
+| Aspect  | Contract                                                                                                                                     |
+| ------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| params  | `{ command }`                                                                                                                                |
+| input   | `(mag.Unit \| mag.Text)` — union, fires on any: Unit is a dependency firing (run the command, no stdin); Text arrives as the command's stdin |
+| output  | `mag.Text` (stdout); `mag.CommandFailed` declared for routable failure edges                                                                 |
+| deliver | one `capability.invoke` (name `bash`, args `{ command, stdin }`) through the gate; gate policy applies unchanged                             |
+| failure | non-zero exit / capability error → failed completion with the stderr detail; unrouted it escalates `mag.run_failed` (run fails loudly)       |
+
+A **source** bash node (no inbound edge) is seeded with `{ kind: "mag.Unit" }`
+as its initial activation — the general rule: a source node whose input
+contract carries the `mag.Unit` variant fires dependency-style; every other
+source keeps the task seed (ir.rs `initial_activation_content`).
+
 ## Messages, kills, rules (initial modification)
 
 | Section    | Initial modification content                                                                          | Notes                                                                                                                                                                                                                         |

@@ -132,6 +132,14 @@ Dependencies use the same language: "A depends on C finishing" is the edge
 `C -> A` carrying `mag.Unit` — an informationless payload whose sole purpose
 is to encode the ordering. No second vocabulary exists.
 
+The `bash` capability node leans on exactly this algebra: its input contract
+is the union `(mag.Unit | mag.Text)` — a Unit firing runs the command with no
+stdin (the initial activation of a source node, or an upstream ordering
+edge), a Text firing delivers the upstream node's stdout as the command's
+stdin. Pipe semantics fall out of the firing table, not a special case; and a
+source node whose contract carries the `mag.Unit` variant is seeded with a
+Unit activation at lowering (lowering.md, Shell defaults).
+
 - **Slot identity is the incoming edge, not the type.** The kernel assembles
   product activations with per-slot FIFO queues, where each slot is bound to
   its sender at lowering time (messages are id-signed, routes are
