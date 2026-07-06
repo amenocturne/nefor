@@ -57,11 +57,15 @@ fn starter_lead_workflow_full() {
 
 /// The retired graph IR shape ({nodes, edges, terminal} + the popen compiler
 /// bridge) must stay dead: the lead reads the modification off `mag.loaded`
-/// replies (starter/lead-workflow/init.lua resume_pending_load), never a
-/// locally-compiled graph IR.
+/// replies (lua/libs/lead-workflow/init.lua resume_pending_load), never a
+/// locally-compiled graph IR. Assert against the lib mechanism modules, not
+/// the starter shims (which re-export them and would pass vacuously).
 #[test]
 fn lead_side_never_reads_the_retired_graph_ir_shape() {
-    for rel in ["lua/libs/lead-workflow/init.lua", "starter/mag/init.lua"] {
+    for rel in [
+        "lua/libs/lead-workflow/init.lua",
+        "lua/libs/mag-workspace/init.lua",
+    ] {
         let path = repo_root().join(rel);
         let src = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
@@ -74,11 +78,11 @@ fn lead_side_never_reads_the_retired_graph_ir_shape() {
     }
     // The popen compiler bridge specifically: the `mag` CLI stays a dev tool
     // for humans; the lead's compile goes through the mag plugin.
-    let mag_lua = repo_root().join("starter/mag/init.lua");
-    let src = std::fs::read_to_string(&mag_lua).expect("read starter/mag/init.lua");
+    let mag_lua = repo_root().join("lua/libs/mag-workspace/init.lua");
+    let src = std::fs::read_to_string(&mag_lua).expect("read lua/libs/mag-workspace/init.lua");
     assert!(
         !src.contains("io.popen"),
-        "starter/mag/init.lua still shells out to the mag CLI"
+        "lua/libs/mag-workspace/init.lua still shells out to the mag CLI"
     );
 }
 
