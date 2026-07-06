@@ -1,4 +1,4 @@
--- starter/lead-workflow/mag-eval.lua — the one-off MAG expression tool.
+-- libs/lead-workflow/mag-eval.lua — the one-off MAG expression tool (mechanism).
 --
 -- `mag-eval` takes one MAG expression source string, compiles it through the
 -- mag plugin (the same load handshake the `mag` tool uses — the compiler's

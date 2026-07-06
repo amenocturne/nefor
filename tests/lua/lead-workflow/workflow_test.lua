@@ -3,7 +3,7 @@
 -- `crates/nefor/tests/starter_lead_workflow_test.rs`. Mirrors the
 -- harness pattern in `starter_agentic_workflow_test.rs`.
 
-local lw   = require("lead-workflow")
+local lw   = require("libs.lead-workflow")
 local json = nefor.json
 local agentic_loop = require("agentic-loop")
 local sessions = require("sessions")

@@ -61,7 +61,7 @@ fn starter_lead_workflow_full() {
 /// locally-compiled graph IR.
 #[test]
 fn lead_side_never_reads_the_retired_graph_ir_shape() {
-    for rel in ["starter/lead-workflow/init.lua", "starter/mag/init.lua"] {
+    for rel in ["lua/libs/lead-workflow/init.lua", "starter/mag/init.lua"] {
         let path = repo_root().join(rel);
         let src = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
