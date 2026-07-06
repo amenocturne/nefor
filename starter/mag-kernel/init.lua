@@ -42,6 +42,7 @@ end
 local run_tool = require("factories.run-tool")
 local tool_result = require("factories.tool-result")
 local adapter = require("factories.adapter")
+local bash = require("factories.bash")
 
 -- Adapt the host's single `nefor.log(msg)` function into the leveled sink
 -- the kernel modules expect. Level travels as a prefix (plus the run scope,
@@ -73,6 +74,7 @@ local function build_registry()
   seed(run_tool)
   seed(tool_result)
   seed(adapter)
+  seed(bash)
   return reg
 end
 
@@ -342,7 +344,7 @@ local function context_of(run_id)
   return nil, string.format("unknown run '%s' (not begun, or already ended)", tostring(run_id))
 end
 
-nefor.log("mag-kernel ready (factories: stub, sink, human, llm, run-tool, tool-result, adapter)")
+nefor.log("mag-kernel ready (factories: stub, sink, human, llm, run-tool, tool-result, adapter, bash)")
 
 return {
   name = "mag-kernel",

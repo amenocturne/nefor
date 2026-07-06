@@ -23,10 +23,11 @@
 --      carries the final result and whether it was persisted, so the control
 --      plane can read the run result and mark the run done.
 --
--- Input contract: `generic-provider.FinalAnswer` (single), matching the
--- fixture's `code-writer.llm -> sink` edge. No signal
--- handlers: the sink persists synchronously on activation, holding no pending
--- work to drain or abort.
+-- Input contract: `( generic-provider.FinalAnswer | mag.Text )` (union) — the
+-- fixture's `code-writer.llm -> sink` edge, plus the shell chain's implicit
+-- terminal edge (`bash -> sink`, docs/lowering.md "The program sink"). No
+-- signal handlers: the sink persists synchronously on activation, holding no
+-- pending work to drain or abort.
 
 local kinds = require("kinds")
 
@@ -40,7 +41,10 @@ M.declaration = {
   params = {},
 
   inputs = {
-    final = "generic-provider.FinalAnswer",
+    -- Union (fires on either): an agent program terminates in a FinalAnswer;
+    -- a shell program's implicit terminal receives the last command's stdout
+    -- (mag.Text — the bash capability node, factories/bash.lua).
+    final = { "generic-provider.FinalAnswer", "mag.Text" },
   },
 
   -- Terminal: emits nothing downstream (routes: {} at lowering).
