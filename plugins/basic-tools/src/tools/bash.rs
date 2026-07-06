@@ -3,6 +3,9 @@
 //! Behavior:
 //!
 //! - `command` is required; passed verbatim to `/bin/sh -c`.
+//! - `stdin` is optional; when present it is written to the command's
+//!   standard input (then the pipe closes). Absent, stdin is null — the
+//!   pre-existing behavior.
 //! - `cwd` is optional; defaults to the plugin's current directory.
 //! - `timeout_ms` is optional; defaults to [`DEFAULT_TIMEOUT_MS`]. Capped at
 //!   [`MAX_TIMEOUT_MS`] so a misbehaving prompt can't pin the plugin
@@ -45,6 +48,10 @@ pub fn schema() -> Value {
                 "type": "string",
                 "description": "Shell command line passed to /bin/sh -c."
             },
+            "stdin": {
+                "type": "string",
+                "description": "Text piped to the command's standard input. Omit for no stdin."
+            },
             "cwd": {
                 "type": "string",
                 "description": "Working directory. Defaults to the plugin's current directory."
@@ -67,6 +74,7 @@ pub async fn run(args: &Value) -> Result<String, ToolError> {
 #[derive(Debug)]
 struct ParsedArgs {
     command: String,
+    stdin: Option<String>,
     cwd: Option<String>,
     timeout_ms: u64,
 }
@@ -89,6 +97,16 @@ fn parse_args(args: &Value) -> Result<ParsedArgs, ToolError> {
             message: "`command` must be non-empty".into(),
         });
     }
+    let stdin = match obj.get("stdin") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(_) => {
+            return Err(ToolError::BadArgs {
+                tool: NAME.into(),
+                message: "`stdin` must be a string".into(),
+            });
+        }
+    };
     let cwd = obj
         .get("cwd")
         .and_then(Value::as_str)
@@ -112,6 +130,7 @@ fn parse_args(args: &Value) -> Result<ParsedArgs, ToolError> {
     };
     Ok(ParsedArgs {
         command: command.to_owned(),
+        stdin,
         cwd,
         timeout_ms,
     })
@@ -123,7 +142,11 @@ async fn run_command(parsed: ParsedArgs) -> Result<String, ToolError> {
     if let Some(dir) = &parsed.cwd {
         cmd.current_dir(dir);
     }
-    cmd.stdin(Stdio::null());
+    cmd.stdin(if parsed.stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
@@ -132,14 +155,27 @@ async fn run_command(parsed: ParsedArgs) -> Result<String, ToolError> {
         path: parsed.command.clone(),
         message: format!("spawning /bin/sh: {e}"),
     })?;
+    let stdin_pipe = child.stdin.take();
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
 
     let dur = Duration::from_millis(parsed.timeout_ms);
+    let stdin_text = parsed.stdin.clone();
     let collect = async {
         let mut out_buf = Vec::new();
         let mut err_buf = Vec::new();
+        // Write stdin concurrently with the output reads (a large input
+        // against a full pipe buffer must not deadlock), then drop the handle
+        // so the child sees EOF.
+        let feed = async {
+            if let (Some(mut pipe), Some(text)) = (stdin_pipe, stdin_text) {
+                use tokio::io::AsyncWriteExt;
+                let _ = pipe.write_all(text.as_bytes()).await;
+                let _ = pipe.shutdown().await;
+            }
+        };
         let _ = tokio::join!(
+            feed,
             stdout.read_to_end(&mut out_buf),
             stderr.read_to_end(&mut err_buf)
         );
@@ -209,6 +245,23 @@ mod tests {
         let out = run(&json!({"command": "echo hello"})).await.unwrap();
         assert!(out.contains("hello"));
         assert!(out.contains("[exit 0]"));
+    }
+
+    #[tokio::test]
+    async fn feeds_stdin_to_the_command() {
+        let out = run(&json!({"command": "sort", "stdin": "b\na\n"}))
+            .await
+            .unwrap();
+        assert!(out.starts_with("a\nb\n"), "sorted stdin: {out}");
+        assert!(out.contains("[exit 0]"));
+    }
+
+    #[tokio::test]
+    async fn rejects_non_string_stdin() {
+        let err = run(&json!({"command": "cat", "stdin": 42}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::BadArgs { .. }));
     }
 
     #[tokio::test]
