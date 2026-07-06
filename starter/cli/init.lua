@@ -22,8 +22,9 @@
 --                      on the orchestrator-run tool.result close.
 --   json             — single JSON line per turn on completion:
 --                      { answer, tool_calls, duration_ms }.
---   stream-json      — passthrough: every chat.* / graph.* envelope as
---                      one JSON line on stdout (NCP wire format). The
+--   stream-json      — passthrough: every chat.* / mag.* / tool.*
+--                      envelope as one JSON line on stdout (NCP wire
+--                      format). The
 --                      user's prompt is NOT emitted as a chat.input.submit
 --                      envelope here because agentic_workflow.submit
 --                      dispatches directly to the orchestrator rather
@@ -92,8 +93,8 @@ OUTPUT FORMATS:
                 stderr; trailing newline on completion. Default.
   json          one JSON line per turn at completion:
                 { "answer": "...", "tool_calls": [...], "duration_ms": ... }
-  stream-json   passthrough: every chat.*/graph.* envelope as one JSON
-                line on stdout. Matches NCP wire format.
+  stream-json   passthrough: every chat.*/mag.*/tool.* envelope as one
+                JSON line on stdout. Matches NCP wire format.
 ]]
 
 local VALID_FORMATS = { text = true, json = true, ["stream-json"] = true }
@@ -200,8 +201,8 @@ end
 --
 -- `text` format streams via on_stream / on_tool_*. `json` accumulates
 -- final state and prints once on on_complete. `stream-json` registers
--- nefor.bus.on_event handlers for every chat.*/graph.* kind and prints
--- each envelope as a JSON line.
+-- nefor.bus.on_event handlers for every chat.*/mag.*/tool.* kind and
+-- prints each envelope as a JSON line.
 
 local function write_stdout(s) io.stdout:write(s); io.stdout:flush() end
 local function write_stderr(s) io.stderr:write(s); io.stderr:flush() end
@@ -278,7 +279,6 @@ local function install_stream_json_format()
     end
   end
   nefor.bus.on_event("chat.*", emit_env)
-  nefor.bus.on_event("graph.*", emit_env)
   -- Kernel-run lifecycle (mag.run_started / mag.run_result / actor
   -- spawn-ready events) — the lead's turn-programs and its dispatched
   -- runs both execute on the mag kernel.
@@ -298,8 +298,8 @@ end
 -- their NCP layer ignores incoming traffic). We wait for the last
 -- plugin in the spawn chain (`basic-tools`) to fire `basic-tools.ready`
 -- via `nefor.bus.on_event`; that guarantees every upstream plugin
--- (combinators, provider, reasoner-graph, tool-gate) is also up. Only
--- then do we submit / read_line.
+-- (provider, mag, tool-gate) is also up. Only then do we submit /
+-- read_line.
 
 -- Sentinel kind whose arrival means "every plugin is up". Tied to the
 -- spawn order in cli-config/init.lua: basic-tools is last in the chain
@@ -312,32 +312,26 @@ local READY_SENTINEL = "basic-tools.hello"
 -- once, return. on_complete prints the final output (text or JSON)
 -- and exits.
 --
--- Async spawn_graph caveat: when the orchestrator turn calls
--- spawn_graph the first on_complete fires WHILE the sub-graph is still
--- running. agentic_workflow then queues the sub-graph's eventual
--- result and re-submits a relay turn. We need to wait through that
--- second turn to print the actual final answer. Heuristic: if any tool
--- call this turn was spawn_graph, suppress the first on_complete and
--- wait for the next.
--- A tool call that dispatches an async run whose result relays back as a
--- deferred follow-up turn: the legacy `spawn_graph`, or the lead's `mag`
--- tool with action=execute (the kernel path). Either way the first
--- on_complete is a transitional ack turn, not the final answer.
+-- Async dispatch caveat: when the orchestrator turn executes a kernel
+-- run (the lead's `mag` tool with action=execute) the first on_complete
+-- fires WHILE the run is still going. agentic_workflow then queues the
+-- run's eventual result and re-submits a relay turn. We need to wait
+-- through that second turn to print the actual final answer —
+-- the first on_complete is a transitional ack turn.
 local function is_async_dispatch(name, input)
-  if name == "spawn_graph" then return true end
   return name == "mag" and type(input) == "table" and input.action == "execute"
 end
 
 local function run_single_shot(prompt, format, json_state, turn_start_ms, gate)
-  local spawn_graph_inflight = false
+  local async_dispatch_inflight = false
   local already_exited = false
 
   agentic_workflow.on_tool_start(function(_id, name, input)
     if is_async_dispatch(name, input) then
-      spawn_graph_inflight = true
-      -- Suppress text streaming for the first turn — the user wants the
-      -- final relayed answer, not the transitional "Started the sub-graph"
-      -- ack. The relay turn re-opens the gate.
+      async_dispatch_inflight = true
+      -- Suppress text streaming for the first turn — the user wants
+      -- the final relayed answer, not the transitional dispatch ack.
+      -- The relay turn re-opens the gate.
       if gate then gate.suppress_stream = true end
     end
   end)
@@ -365,18 +359,18 @@ local function run_single_shot(prompt, format, json_state, turn_start_ms, gate)
   end
 
   agentic_workflow.on_complete(function(_run_id, status)
-    if spawn_graph_inflight then
+    if async_dispatch_inflight then
       -- Suppress the first complete; reset the flag so the next turn
       -- (relay of the deferred sub-graph result) is the one we exit on.
-      spawn_graph_inflight = false
+      async_dispatch_inflight = false
       -- Re-open the stream gate so the relay turn's content reaches
       -- stdout.
       if gate then gate.suppress_stream = false end
       -- Reset accumulated answer text so the JSON payload only carries
       -- the relay turn's content (matches user expectation: "the answer"
-      -- is the final user-facing text). Tool calls accumulate across both
-      -- firings — spawn_graph from the first turn belongs in the report
-      -- alongside any tool calls in the relay turn.
+      -- is the final user-facing text). Tool calls accumulate across
+      -- both turns — the dispatch call from the first turn belongs in
+      -- the report alongside any tool calls in the relay turn.
       if format == "json" then
         json_state.answer_acc = {}
       end
@@ -397,13 +391,13 @@ end
 -- on_complete reads the next line and submits again. EOF on read_line
 -- → exit(0).
 --
--- Async spawn_graph caveat (same as single-shot): if a turn calls
--- spawn_graph, we get TWO on_complete events back to back — one for
+-- Async dispatch caveat (same as single-shot): if a turn executes a
+-- kernel run, we get TWO on_complete events back to back — one for
 -- the orchestrator's first turn (returns the transitional ack) and
 -- one for the deferred-result relay turn. We only want to read the
 -- next user line after the relay turn lands.
 local function run_repl(format, json_state, gate)
-  local spawn_graph_inflight = false
+  local async_dispatch_inflight = false
 
   local function reset_json_state()
     if format == "json" then
@@ -428,7 +422,7 @@ local function run_repl(format, json_state, gate)
 
   agentic_workflow.on_tool_start(function(_id, name, input)
     if is_async_dispatch(name, input) then
-      spawn_graph_inflight = true
+      async_dispatch_inflight = true
       if gate then gate.suppress_stream = true end
     end
   end)
@@ -453,13 +447,13 @@ local function run_repl(format, json_state, gate)
   end
 
   agentic_workflow.on_complete(function(_run_id, _status)
-    if spawn_graph_inflight then
-      spawn_graph_inflight = false
+    if async_dispatch_inflight then
+      async_dispatch_inflight = false
       if gate then gate.suppress_stream = false end
       -- Don't print or prompt yet — wait for the deferred relay turn.
       -- Reset answer_acc so the JSON payload only carries the relay
-      -- turn's text; keep tool_calls so spawn_graph (from this firing)
-      -- stays in the final report.
+      -- turn's text; keep tool_calls so the dispatch call stays in the
+      -- final report.
       if format == "json" then
         json_state.answer_acc = {}
       end
@@ -528,7 +522,7 @@ function M.run(argv)
 
   local state = {}
   -- Stream-suppression gate; mutated by run_single_shot / run_repl when
-  -- async spawn_graph deferral demands holding back the first turn.
+  -- async kernel-dispatch deferral demands holding back the first turn.
   local gate = { suppress_stream = false }
 
   -- Wire output observers based on format.

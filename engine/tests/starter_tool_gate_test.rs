@@ -363,7 +363,6 @@ fn tool_gate_wrapper_swaps_huge_tool_result_output_to_summary() {
 
     let lua = Lua::new();
     install_stub_nefor_with_send_recorder(&lua).expect("stub");
-    install_agentic_loop_stub(&lua).expect("agentic-loop stub");
     set_package_path(&lua).expect("set package.path");
 
     // Build the wrapper and drive its `from_plugin` callback directly
@@ -728,7 +727,6 @@ fn tool_gate_wrapper_emits_instruction_reminder_on_outbound_folder_touching_invo
 
     let lua = Lua::new();
     install_stub_nefor_with_send_and_deliver_recorders(&lua).expect("stub");
-    install_agentic_loop_stub(&lua).expect("agentic-loop stub");
     set_package_path(&lua).expect("set package.path");
 
     let touched_str = touched.display().to_string();
@@ -1168,28 +1166,6 @@ fn install_stub_nefor_with_send_and_deliver_recorders(lua: &Lua) -> mlua::Result
         _deliver_trace = {}
         nefor.engine.deliver = function(_target, payload)
             _deliver_trace[#_deliver_trace + 1] = payload
-        end
-        "#,
-    )
-    .exec()?;
-    Ok(())
-}
-
-/// Stand-in for `require("agentic-loop")` that the tool-gate wrapper
-/// calls into. The dump-and-summarise hook fires BEFORE the
-/// bookkeeping branch, so for these tests we just need the module to
-/// answer `take_pending_for_tool` with nil (no pending firing) — the
-/// wrapper then republishes the (now-summarised) envelope and returns.
-fn install_agentic_loop_stub(lua: &Lua) -> mlua::Result<()> {
-    lua.load(
-        r#"
-        package.preload["agentic-loop"] = function()
-            return {
-                take_pending_for_tool = function(_) return nil, nil end,
-                clear_pending_key      = function(_) end,
-                fire_tool_end_observers = function(_, _, _) end,
-                queue_sub_graph         = function(_, _) return nil, "stub: no sub-graph" end,
-            }
         end
         "#,
     )

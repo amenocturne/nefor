@@ -34,11 +34,6 @@
 -- the fold (provider cancels fire) and settles the turn as
 -- `mag.run_result status:"killed"` — turn aborted, no history append.
 --
--- The pending/chat_id/tool-id tracking tables below serve the resident
--- reasoners + provider/tool compositors for reasoner-graph runs (non-lead
--- consumers — the agent reasoner's sub-firings and any directly submitted
--- graph). The lead no longer compiles onto reasoner-graph.
---
 -- Inbound dispatch:
 --   * `chat.input.submit { text }`       — spawn a turn-program (or queue)
 --   * `chat.interrupt`                   — Esc; kill the active lead run
@@ -94,15 +89,6 @@ local state = {
   deferred_queue       = {},    ---@type table  queued relay texts { text }
   pending_user_inputs  = {},    ---@type table  queued submits while busy
 
-  -- reasoner-graph firing bookkeeping (non-lead consumers: resident
-  -- reasoners + compositors).
-  pending              = {},    ---@type table  run_id:firing_id → entry
-  chat_id_to_key       = {},    ---@type table
-  tool_id_to_key       = {},    ---@type table
-  chat_id_stream_visible = {},  ---@type table
-  chat_id_stream_explicitly_hidden = {},  ---@type table
-  current_lead_chat_id = nil,   ---@type string|nil
-
   -- Observer registries. Public on_* setters append; producers fire via
   -- pcall so a bad observer doesn't break the chain.
   stream_observers       = {},  ---@type table
@@ -112,12 +98,7 @@ local state = {
   complete_observers     = {},  ---@type table
 }
 
--- Reasoner types whose streaming should reach nefor-tui (reasoner-graph
--- runs; the lead's kernel chats are prefix-bound instead).
-local STREAM_VISIBLE_TYPES = { ["provider-wrapper"] = true }
-
 local emit           = envelope.emit
-local pending_key    = ids.pending_key
 
 local format_deferred = results_lib.format_deferred
 
@@ -386,12 +367,6 @@ local function cancel_all()
   local killed = kill_active_lead_run()
   local dropped_inputs = #state.pending_user_inputs
   state.pending_user_inputs = {}
-  state.pending = {}
-  state.chat_id_to_key = {}
-  state.chat_id_stream_visible = {}
-  state.chat_id_stream_explicitly_hidden = {}
-  state.tool_id_to_key = {}
-  state.current_lead_chat_id = nil
   emit_idle_state("cancelled")
   nefor.log.info("agentic-loop: cancel_all", {
     killed_lead_run = killed,
@@ -696,12 +671,6 @@ local function teardown_for_session_end()
   kill_active_lead_run()
   state.current_run_id = nil
   state.current_turn   = nil
-  state.pending            = {}
-  state.chat_id_to_key     = {}
-  state.chat_id_stream_visible = {}
-  state.chat_id_stream_explicitly_hidden = {}
-  state.tool_id_to_key     = {}
-  state.current_lead_chat_id = nil
   state.deferred_queue     = {}
   state.pending_user_inputs = {}
   state.history            = {}
@@ -709,160 +678,17 @@ local function teardown_for_session_end()
   nefor.log.info("agentic-loop: sessions.session_end → state cleared", {})
 end
 
--- ── reasoner-graph firing bookkeeping (non-lead consumers) ────────────
-
--- Tool-executor pending entry constructor — called by the tool-executor
--- resident reasoner when it dispatches per-call invocations and needs to
--- correlate results back to its node firing.
-local function track_tool_executor(run_id, run_name, node_id, firing_id, calls, tool_ids)
-  if tool_ids == nil and type(firing_id) == "table" and type(calls) == "table" then
-    tool_ids = calls
-    calls = firing_id
-    firing_id = node_id
-    node_id = run_name
-    run_name = nil
-  end
-  local key = pending_key(run_id, firing_id)
-  state.pending[key] = {
-    type          = "tool-executor",
-    run_id        = run_id,
-    run_name      = run_name,
-    node_id       = node_id,
-    firing_id     = firing_id,
-    reasoner      = "tool-executor",
-    tool_calls    = calls,
-    tool_results  = {},
-    tool_ids      = tool_ids,
-    pending_count = #calls,
-  }
-  for i, tid in ipairs(tool_ids) do
-    state.tool_id_to_key[tid] = { key = key, idx = i }
-  end
-  return key
-end
-
--- Provider-node pending entry constructor — same idea for the provider/
--- responder/wrapper reasoners.
-local function track_provider_firing(reasoner_type, run_id, run_name, node_id, firing_id,
-                                     provider_name, chat_id)
-  if chat_id == nil then
-    chat_id = provider_name
-    provider_name = firing_id
-    firing_id = node_id
-    node_id = run_name
-    run_name = nil
-  end
-  local key = pending_key(run_id, firing_id)
-  state.pending[key] = {
-    type          = reasoner_type,
-    run_id        = run_id,
-    run_name      = run_name,
-    node_id       = node_id,
-    firing_id     = firing_id,
-    reasoner      = reasoner_type,
-    provider_name = provider_name,
-    chat_id       = chat_id,
-  }
-  state.chat_id_to_key[chat_id] = key
-  state.chat_id_stream_visible[chat_id] = STREAM_VISIBLE_TYPES[reasoner_type] == true
-  -- Announce the binding so surfaces can positively identify a
-  -- stream-visible provider-wrapper conversation (reasoner-graph runs;
-  -- exact-match form). The lead's own turns bind prefix-form off
-  -- mag.run_started instead.
-  if STREAM_VISIBLE_TYPES[reasoner_type] then
-    if state.current_lead_chat_id ~= chat_id then
-      emit(nil, { kind = "chat.lead.bound", chat_id = chat_id })
-    end
-    state.current_lead_chat_id = chat_id
-  end
-  return key
-end
-
--- Look up + clear pending entry by chat_id. Returns the entry or nil.
-local function take_pending_for_chat(chat_id)
-  if type(chat_id) ~= "string" then return nil end
-  local key = state.chat_id_to_key[chat_id]
-  if not key then return nil end
-  local entry = state.pending[key]
-  state.pending[key] = nil
-  state.chat_id_to_key[chat_id] = nil
-  return entry
-end
-
--- Look up pending entry by chat_id without removing it.
-local function peek_pending_for_chat(chat_id)
-  if type(chat_id) ~= "string" then return nil end
-  local key = state.chat_id_to_key[chat_id]
-  if not key then return nil end
-  return state.pending[key]
-end
-
--- Stream-visible check by chat_id. True for tracked stream-visible
--- reasoner-graph firings AND for the active lead turn's prefix-scoped
--- kernel chats (so the provider compositor fires the public stream
--- observers for the lead's own deltas — the CLI surface reads those).
+-- Stream-visible check by chat_id: true for the active lead turn's
+-- prefix-scoped kernel chats (so the provider compositor fires the
+-- public stream observers for the lead's own deltas — the CLI surface
+-- reads those).
 local function stream_visible(chat_id)
-  if state.chat_id_stream_visible[chat_id] == true then return true end
   local turn = state.current_turn
   if turn ~= nil and type(turn.chat_prefix) == "string"
       and starts_with(chat_id, turn.chat_prefix) then
     return true
   end
   return false
-end
-
--- Per-chat stream-visibility registration for chats the agentic-loop
--- doesn't itself own (e.g. agent-reasoner sub-firings).
-local function register_chat_stream_hidden(chat_id)
-  if type(chat_id) ~= "string" or chat_id == "" then return end
-  state.chat_id_stream_visible[chat_id] = false
-  state.chat_id_stream_explicitly_hidden = state.chat_id_stream_explicitly_hidden or {}
-  state.chat_id_stream_explicitly_hidden[chat_id] = true
-end
-
-local function unregister_chat_stream_hidden(chat_id)
-  if type(chat_id) ~= "string" or chat_id == "" then return end
-  state.chat_id_stream_visible[chat_id] = nil
-  if state.chat_id_stream_explicitly_hidden ~= nil then
-    state.chat_id_stream_explicitly_hidden[chat_id] = nil
-  end
-end
-
--- Single-call gate the provider wrappers use on inbound stream events.
--- True when EITHER (a) the chat has a tracked pending entry whose
--- reasoner type is not stream-visible, OR (b)
--- the chat was explicitly registered hidden by an agent reasoner.
-local function stream_suppressed(chat_id)
-  if type(chat_id) ~= "string" or chat_id == "" then return false end
-  if state.chat_id_to_key[chat_id] ~= nil
-      and state.chat_id_stream_visible[chat_id] == false then
-    return true
-  end
-  if state.chat_id_stream_explicitly_hidden ~= nil
-      and state.chat_id_stream_explicitly_hidden[chat_id] == true then
-    return true
-  end
-  return false
-end
-
--- Tool-result correlation: look up by tool_id, returns
--- { key, idx, entry } or nil. Caller decrements pending_count and
--- emits node_result when zero.
-local function take_pending_for_tool(tool_id)
-  if type(tool_id) ~= "string" then return nil end
-  local ref = state.tool_id_to_key[tool_id]
-  if not ref then return nil end
-  local entry = state.pending[ref.key]
-  if not entry then
-    state.tool_id_to_key[tool_id] = nil
-    return nil
-  end
-  state.tool_id_to_key[tool_id] = nil
-  return ref, entry
-end
-
-local function clear_pending_key(key)
-  if state.pending[key] then state.pending[key] = nil end
 end
 
 -- Fire stream / reasoning observers (used by per-provider wrapper to
@@ -957,20 +783,7 @@ function M.relay_run_completion(completion)
   state.deferred_queue[#state.deferred_queue + 1] = { text = format_deferred(completion) }
   flush_deferred()
 end
-function M.track_tool_executor(run_id, run_name, node_id, firing_id, calls, tool_ids)
-  return track_tool_executor(run_id, run_name, node_id, firing_id, calls, tool_ids)
-end
-function M.track_provider_firing(reasoner_type, run_id, run_name, node_id, firing_id, provider_name, chat_id)
-  return track_provider_firing(reasoner_type, run_id, run_name, node_id, firing_id, provider_name, chat_id)
-end
-function M.take_pending_for_chat(chat_id) return take_pending_for_chat(chat_id) end
-function M.peek_pending_for_chat(chat_id) return peek_pending_for_chat(chat_id) end
 function M.stream_visible(chat_id) return stream_visible(chat_id) end
-function M.register_chat_stream_hidden(chat_id) register_chat_stream_hidden(chat_id) end
-function M.unregister_chat_stream_hidden(chat_id) unregister_chat_stream_hidden(chat_id) end
-function M.stream_suppressed(chat_id) return stream_suppressed(chat_id) end
-function M.take_pending_for_tool(tool_id) return take_pending_for_tool(tool_id) end
-function M.clear_pending_key(key) clear_pending_key(key) end
 
 function M.fire_stream_observers(text) fire_stream_observers(text) end
 function M.fire_reasoning_observers(text) fire_reasoning_observers(text) end
@@ -986,15 +799,6 @@ function M.config() return state.config end
 -- pair per completed turn). Tests and surfaces read it; mutations belong
 -- to the turn lifecycle only.
 function M.history() return state.history end
-
--- Compat accessor: the reasoner-graph lead carried chat continuity in a
--- wrap-node next_state. The kernel lead has no persistent provider chat,
--- so this is always nil; the provider compositor's chat_id fallbacks
--- handle nil.
-function M.current_state() return nil end
-
--- Best-effort active provider-wrapper chat id (reasoner-graph firings).
-function M.current_lead_chat_id() return state.current_lead_chat_id end
 
 local function receive_msg(entry)
   -- Skip per-peer broadcast fan-out entries. The broker (and ncp.lua)
@@ -1164,12 +968,6 @@ M._internals  = {
     state.current_turn = nil
     state.deferred_queue = {}
     state.pending_user_inputs = {}
-    state.pending = {}
-    state.chat_id_to_key = {}
-    state.tool_id_to_key = {}
-    state.chat_id_stream_visible = {}
-    state.chat_id_stream_explicitly_hidden = {}
-    state.current_lead_chat_id = nil
     state.stream_observers = {}
     state.reasoning_observers = {}
     state.tool_start_observers = {}

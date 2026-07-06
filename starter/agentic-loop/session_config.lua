@@ -8,16 +8,15 @@
 --
 --   * `chat.model.set { provider, model }` — explicit user-side
 --     switch. Latest one wins.
---   * `<prefix>.chat.create { chat_id, model }` — emitted by the
---     reasoners when a new chat starts. The prefix names the provider.
+--   * `<prefix>.chat.create { chat_id, model }` — emitted when a new
+--     provider chat starts. The prefix names the provider.
 --     Default-provider sessions (no /model switch) rely on this
 --     fallback because there's no `chat.model.set` in their log.
 --
 -- Without the restore, /resume after a /model switch in the live
 -- session leaves `state.config.provider` pointing at the live-side
--- selection while `state.current_state.chat_id` is restored to the
--- resumed session's chat — so the next submit dispatches the chat
--- against a provider that doesn't own it ("chat 'X' not found").
+-- selection — so the next submit dispatches against a provider that
+-- doesn't own the resumed conversation.
 --
 -- `read_active_model(path)` returns `{ provider, model, reasoning_effort }`. Either
 -- field may be nil if the log doesn't carry that signal.

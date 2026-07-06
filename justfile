@@ -32,14 +32,10 @@ test-starter:
     cargo test -p nefor --test starter_openai_provider_test
     cargo test -p nefor --test starter_agentic_workflow_test
     cargo test -p nefor --test starter_agentic_cli_test
-    cargo test -p nefor --test starter_agent_reasoner_test
     cargo test -p nefor --test starter_lead_workflow_test
     cargo test -p nefor --test starter_lead_role_test
-    cargo test -p nefor --test starter_loop_counter_reasoner_test
     cargo test -p nefor --test starter_mag_kernel_test
     cargo test -p nefor --test starter_ncp_test
-    cargo test -p nefor --test starter_run_reasoner_test
-    cargo test -p nefor --test starter_mag_kernel_test
 
 # Provider/API translation tests; may need local socket binding permissions.
 test-provider:

@@ -113,7 +113,6 @@ You are a helpful assistant. For decomposition tasks (multiple independent sub-q
   },
 }
 actor.spawn(agentic_loop)
-actor.spawn(require("reasoners"))
 
 local PROVIDER_NAME  = cfg.provider.name
 local PROVIDER_MODEL = cfg.provider.model

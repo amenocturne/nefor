@@ -33,21 +33,16 @@
 --   chat.login_requested           → <prefix>.login_requested
 --   chat.logout_requested          → <prefix>.logout_requested
 --   chat.model.list_requested      → <prefix>.models.list_requested
---   chat.model.set                 → <prefix>.model.set (this file adds chat_id
---                                                       from agentic-loop state)
---   chat.reasoning.set             → <prefix>.reasoning.set (this file adds chat_id
---                                                           from agentic-loop state)
+--   chat.model.set                 → <prefix>.model.set
+--   chat.reasoning.set             → <prefix>.reasoning.set
 --
 -- ## Orchestrator coupling (lives in this file)
 --
--- `<prefix>.chat.complete.result` and `<prefix>.chat.error` require an
--- agentic-loop lookup (pending entry by chat_id) + a synthesized
--- canonical `tool.result` envelope on the bus. The lib returns these
--- envelopes' bodies unchanged; this file pattern-matches on the
--- prefixed kind and does the lookup itself.
---
--- Stream-delta gating (suppressed sub-graph chats) is pure orchestrator
--- state — the lib doesn't see it.
+-- Stream deltas on the lead's prefix-bound kernel chats fire the
+-- agentic-loop's public stream/reasoning observers (the CLI surface
+-- reads those); `<prefix>.chat.complete.result` feeds the history
+-- mirror. The lib returns these envelopes' bodies unchanged; this file
+-- pattern-matches on the prefixed kind.
 --
 -- ## Replay window
 --
@@ -55,9 +50,6 @@
 -- handles the entire rebuild path (chat.create re-feed, chat.append
 -- re-feed with ownership, tool.result → assistant chat.append
 -- synthesis). This file just delegates.
-
-local envelope = require("core.envelope")
-local output_persist = require("libs.output-persistence")
 
 local M = {}
 
@@ -205,17 +197,6 @@ function M.spawn_spec(name, command, opts)
         or k == "chat.stream.reasoning_end"
         or k == "chat.session.stats" then
       local chat_id = body.chat_id
-      -- Stream-suppression gate. `stream_suppressed`
-      -- collapses tracked pending entries whose reasoner type isn't in
-      -- STREAM_VISIBLE_TYPES (sub-graph responder, etc.) with the
-      -- explicit stream-hidden registration the agent reasoner installs
-      -- for each sub-firing's chat_id (so the user doesn't see the
-      -- sub-agent's internal-turn streams interleaved with the lead's
-      -- response).
-      if type(chat_id) == "string" and al.stream_suppressed(chat_id) then
-        return nil
-      end
-
       if type(chat_id) == "string" and al.stream_visible(chat_id) then
         if k == "chat.stream.delta" then
           local txt = body.text or body.delta or ""
@@ -228,93 +209,19 @@ function M.spawn_spec(name, command, opts)
       return body
     end
 
-    -- chat.error (lib left the prefixed kind alone): if a pending node
-    -- is open for this chat_id, close it with an error tool.result;
-    -- otherwise drop the prefixed envelope on the floor.
-    if k == kinds.chat_error then
-      local chat_id = body.chat_id
-      if type(chat_id) == "string" then
-        local entry = al.take_pending_for_chat(chat_id)
-        if entry then
-          local emsg = tostring(body.message or "provider error")
-          nefor.log.warn("provider <- chat.error closing node", {
-            provider = name, chat_id = chat_id,
-            run_id = entry.run_id, node_id = entry.node_id, error = emsg,
-          })
-          envelope.emit_as(entry.reasoner or "reasoners", nil, {
-            kind  = "tool.result",
-            id    = entry.firing_id,
-            error = emsg,
-          })
-          return body
-        end
-      end
-      return nil
-    end
-
-    -- chat.complete.result: if a pending node is open for this
-    -- chat_id, synthesize a canonical tool.result. Drop the prefixed
-    -- envelope after synthesis (it's the binary-shaped result, not
-    -- the canonical one consumers want). Pass through if no pending
-    -- entry is found.
+    -- chat.error / chat.complete.result keep their prefixed kinds on
+    -- the bus: the mag plugin's provider bridge correlates them back to
+    -- the kernel request by chat_id.
+    -- chat.complete.result additionally mirrors the assistant message
+    -- into the history stream before passing through.
     if k == kinds.chat_complete_result then
       local chat_id = body.chat_id
       if type(chat_id) ~= "string" then return body end
       publish_history_message(chat_id, assistant_message_from_output(body.output))
-      local entry = al.peek_pending_for_chat(chat_id)
-      if not entry then return body end
-
-      local out = body.output
-      al.take_pending_for_chat(chat_id)
-
-      local from_id = entry.reasoner or "reasoners"
-      if type(out) == "table" then
-        nefor.log.info("provider <- chat.complete.result", {
-          provider = name, chat_id = chat_id,
-          run_id = entry.run_id, node_id = entry.node_id,
-          text_len = type(out.text) == "string" and #out.text or 0,
-          text_preview = type(out.text) == "string" and string.sub(out.text, 1, 80) or nil,
-          finish_reason = out.finish_reason,
-        })
-        local result = {}
-        for rk, rv in pairs(out) do result[rk] = rv end
-        result.next_state = { chat_id = chat_id }
-        result = output_persist.persist(entry, result)
-        envelope.emit_as(from_id, nil, {
-          kind   = "tool.result",
-          id     = entry.firing_id,
-          result = result,
-        })
-      else
-        nefor.log.warn("provider <- chat.complete.result with non-object output", {
-          provider = name, chat_id = chat_id, out_type = type(out),
-        })
-        envelope.emit_as(from_id, nil, {
-          kind  = "tool.result",
-          id    = entry.firing_id,
-          error = "provider returned non-object output",
-        })
-      end
-      return nil
+      return body
     end
 
     return body
-  end
-
-  local function active_chat_id()
-    local current_state = al.current_state and al.current_state() or nil
-    if type(current_state) == "table"
-        and type(current_state.chat_id) == "string"
-        and #current_state.chat_id > 0 then
-      return current_state.chat_id
-    end
-    if al.current_lead_chat_id then
-      local chat_id = al.current_lead_chat_id()
-      if type(chat_id) == "string" and #chat_id > 0 then
-        return chat_id
-      end
-    end
-    return nil
   end
 
   -- from_plugin (binary → bus) — four steps per envelope:
@@ -358,10 +265,7 @@ function M.spawn_spec(name, command, opts)
   --   1. env.replay: hand off to lib.replay_rebuild (full rebuild path).
   --   2. translator.inbound: kind rename, drop UI-shaped prompts,
   --      target-filter provider-scoped envelopes.
-  --   3. chat.model.set fix-up: attach the active chat_id from
-  --      agentic-loop's current_state (the lib returns the bare
-  --      provider+model body — orchestrator state lives here).
-  --   4. translator.deliver to the peer's stdin.
+  --   3. translator.deliver to the peer's stdin.
   local function to_plugin(envs)
     for _, env in ipairs(envs) do
       local kind = type(env.body) == "table" and env.body.kind or nil
@@ -384,11 +288,6 @@ function M.spawn_spec(name, command, opts)
 
         local body = translator.inbound(env)
         if body ~= nil then
-          if body.kind == kinds.model_set
-              or body.kind == kinds.reasoning_set
-              or body.kind == kinds.chat_compact then
-            body.chat_id = active_chat_id()
-          end
           if body.kind == kinds.chat_create then
             publish_history_create(body)
           elseif body.kind == kinds.chat_append then

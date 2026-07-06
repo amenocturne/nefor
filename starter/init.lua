@@ -273,8 +273,8 @@ require("libs.generic-provider").declare()
 require("libs.generic-tool").declare()
 
 -- The actor runtime queues incoming envelopes during boot, so spawning
--- the orchestrator and its resident reasoners before the plugins they
--- coordinate is safe even if a plugin's `ready` arrives early.
+-- the orchestrator before the plugins it coordinates is safe even if a
+-- plugin's `ready` arrives early.
 -- Build runtime context: cwd, workspace index, agentic-kit paths.
 -- Appended to the lead system prompt so the agent knows where it's
 -- operating and what projects are available.
@@ -310,7 +310,6 @@ agentic_loop.configure {
   },
 }
 actor.spawn(agentic_loop)
-actor.spawn(require("reasoners"))
 
 local provider = require("compositors.provider")
 for _, p in ipairs(cfg.providers or {}) do

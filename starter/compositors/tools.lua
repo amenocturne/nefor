@@ -3,8 +3,8 @@
 --
 --   tools.gate_spec(gate_name, command)
 --     Wraps the tool-gate Rust binary. Threads the plugin lib's
---     translation primitives with starter-owned agentic-loop state for
---     tool-executor firings and AGENTS.md emission ordering.
+--     translation primitives with the dump-to-file swap and AGENTS.md
+--     emission ordering.
 --
 --   tools.basic_actor_spec
 --     Default actor spec for the basic-tools Rust binary. Sources the
@@ -16,7 +16,6 @@ local actor        = require("core.actor")
 local envelope     = require("core.envelope")
 local gate_lib     = require("tool-gate")
 local chat_emitter = require("libs.chat-emitter")
-local output_persist = require("libs.output-persistence")
 
 local M = {}
 
@@ -25,12 +24,8 @@ local M = {}
 --   * On `<gate>.hello`: republish the hello.
 --   * On `tool.result`: when the output exceeds the inline budget,
 --     dump-to-file via the plugin lib's `maybe_dump_output` (full
---     payload to disk, summary in `body.output`). Then correlate the
---     tool_id to the tool-executor pending entry; on a hit, decrement
---     the firing's pending count, fire tool-end observers, emit the
---     chat-side `chat.tool.end`, and (when all results arrived) the
---     closing `tool.result { id = firing_id }`. The original
---     tool.result is republished so other consumers see it.
+--     payload to disk, summary in `body.output`), then republish the
+--     (possibly rewritten) body.
 --   * Otherwise: republish verbatim.
 --
 -- ## to_plugin (bus → binary)
@@ -50,14 +45,6 @@ function M.gate_spec(gate_name, command)
   end
 
   local translator = gate_lib.translator(gate_name)
-  local agentic_loop  -- bound lazily
-
-  local function al()
-    if agentic_loop == nil then
-      agentic_loop = require("agentic-loop")
-    end
-    return agentic_loop
-  end
 
   -- Per-envelope inbound logic. Pulled into a local so the batched
   -- from_plugin loop reads as a one-liner.
@@ -67,58 +54,16 @@ function M.gate_spec(gate_name, command)
       return
     end
 
-    -- Republish hello to the bus. Raw graph submission is no longer
-    -- advertised through tool-gate; MAG owns public graph submission.
-    if translator.is_hello(env) then
-      translator.publish(env.body, nil)
-      return
-    end
-
-    -- tool.result correlation for tool-executor firings.
+    -- Dump-to-file swap for outputs past the inline budget. Returns
+    -- the original body when below budget or on dump failure. The
+    -- (possibly rewritten) body is republished so consumers (the mag
+    -- bridge, agentic-loop's transcript tap) see it.
     if translator.is_tool_result(env) then
-      -- Dump-to-file swap for outputs past the inline budget. Returns
-      -- the original body when below budget or on dump failure.
-      local body = gate_lib.maybe_dump_output(env.body, nil)
-      local tool_id = body.id
-      if type(tool_id) == "string" then
-        local ref, entry = al().take_pending_for_tool(tool_id)
-        if ref then
-          local model_call_id =
-            (entry.tool_calls[ref.idx] and entry.tool_calls[ref.idx].id)
-            or tool_id
-          local payload_output, err_bool = gate_lib.tool_result_payload(body)
-          entry.tool_results[ref.idx] = {
-            id     = model_call_id,
-            name   = (entry.tool_calls[ref.idx] and entry.tool_calls[ref.idx].name) or "",
-            output = body.output,
-            error  = body.error,
-          }
-          al().fire_tool_end_observers(model_call_id, payload_output, err_bool)
-          envelope.emit("nefor-tui", {
-            kind   = "chat.tool.end",
-            id     = model_call_id,
-            output = payload_output,
-            error  = err_bool,
-          })
-          entry.pending_count = entry.pending_count - 1
-          if entry.pending_count == 0 then
-            al().clear_pending_key(ref.key)
-            local result = output_persist.persist(entry, { tool_results = entry.tool_results })
-            envelope.emit_as("tool-executor", nil, {
-              kind   = "tool.result",
-              id     = entry.firing_id,
-              result = result,
-            })
-          end
-        end
-      end
-      -- Always republish the original (possibly dump-rewritten) body
-      -- so other consumers see it.
-      translator.publish(body, nil)
+      translator.publish(gate_lib.maybe_dump_output(env.body, nil), nil)
       return
     end
 
-    -- Default: republish verbatim.
+    -- Default (hello included): republish verbatim.
     translator.publish(env.body, nil)
   end
 
