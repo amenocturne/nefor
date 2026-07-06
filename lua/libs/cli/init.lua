@@ -1,4 +1,4 @@
--- starter/cli/init.lua — agentic-cli plugin (pure-Lua, virtual).
+-- lua/libs/cli/init.lua — agentic-cli plugin (pure-Lua, virtual).
 --
 -- Surfaces `agentic-loop` as a stdin/stdout CLI: single-shot prompt or
 -- interactive REPL. Behaviour parity with the TUI is by construction —
