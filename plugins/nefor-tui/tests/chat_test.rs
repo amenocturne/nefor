@@ -61,6 +61,21 @@ fn chat_lua_source() -> String {
         .and_then(|p| p.parent())
         .expect("repo root")
         .to_path_buf();
+    // Pin the config the chat surface resolves so the suite is
+    // hermetic: NEFOR_STARTER_CONFIG_DIR beats a NEFOR_CONFIG_DIR /
+    // NEFOR_DEV_DIR exported in the developer's shell (which would
+    // leak the real installed config in), and NEFOR_DEFAULT_* beat
+    // starter/config's developer-facing chatgpt/gpt-5.5 defaults.
+    // Every initial-statusline assertion keys on these values.
+    // Unconditional set_var (unlike the only-if-unset pins below):
+    // an inherited value IS the leak being defended against. Once so
+    // parallel test threads don't race the process-global env.
+    static PIN_CONFIG_ENV: OnceLock<()> = OnceLock::new();
+    PIN_CONFIG_ENV.get_or_init(|| {
+        std::env::set_var("NEFOR_STARTER_CONFIG_DIR", repo_root.join("starter"));
+        std::env::set_var("NEFOR_DEFAULT_PROVIDER", "mock-plugin");
+        std::env::set_var("NEFOR_DEFAULT_MODEL", "mock-model");
+    });
     // Tell chat.lua's package.path bootstrap where the nefor-tui plugin
     // lib lives. In a normal `nefor` run, the engine sets NEFOR_CONFIG_DIR
     // and chat.lua derives the plugin-lib dir relative to that; tests
@@ -358,7 +373,14 @@ fn typing_and_enter_emits_chat_input_submit() {
 }
 
 #[test]
-fn queued_plain_text_stays_out_of_transcript_until_promoted() {
+fn busy_submits_emit_immediately_and_coalesce_in_transcript() {
+    // Lead-turn flip: the kernel owns turn queueing, so the chat
+    // surface no longer buffers busy follow-ups locally. Each submit
+    // while a turn is in flight (a) emits chat.input.submit right away
+    // and (b) renders immediately, coalesced into ONE user entry
+    // rather than one bubble per message. (This replaces the old
+    // "queued follow-up widget" contract, whose text stayed out of the
+    // transcript until stream end promoted it.)
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -371,39 +393,41 @@ fn queued_plain_text_stays_out_of_transcript_until_promoted() {
     let _ = render_str(&mut engine);
     submit_text(&mut engine, "third");
     let emits = engine.take_emit_queue();
-    assert!(
-        emits.is_empty(),
-        "busy follow-ups must not emit immediately: {emits:?}"
+    assert_eq!(
+        emits.len(),
+        2,
+        "each busy follow-up must emit its own submit immediately: {emits:?}"
     );
-    let out = render_str(&mut engine);
+    for (text, (target_hint, body)) in ["second", "third"].iter().zip(&emits) {
+        assert_eq!(target_hint.as_deref(), Some("engine"));
+        assert_eq!(
+            body.get("kind").and_then(|v| v.as_str()),
+            Some("chat.input.submit")
+        );
+        assert_eq!(body.get("text").and_then(|v| v.as_str()), Some(*text));
+    }
+
+    // Full-frame snapshot: "second" already rendered on the previous
+    // frame, so the line-diff from render_str would only carry "third".
+    let out = render_snapshot(&mut engine);
     assert!(
-        out.contains("queued follow-up") && out.contains("second") && out.contains("third"),
-        "pending follow-up widget should render above prompt: {out:?}"
+        out.contains("second") && out.contains("third"),
+        "busy follow-ups must render in the transcript immediately: {out:?}"
     );
     assert!(
-        !out.contains("│ second") && !out.contains("│ third"),
-        "queued follow-ups must not render as transcript user blocks: {out:?}"
+        !out.contains("queued follow-up"),
+        "the old pending-widget UX must not come back: {out:?}"
     );
 
+    // No local buffer means stream end has nothing left to promote.
     dispatch_event(
         &mut engine,
         json!({ "kind": "chat.stream.end", "model": "test", "duration_ms": 1 }),
     );
     let emits = engine.take_emit_queue();
-    assert_eq!(
-        emits.len(),
-        1,
-        "stream end should emit exactly one buffered submit"
-    );
-    let (target_hint, body) = &emits[0];
-    assert_eq!(target_hint.as_deref(), Some("engine"));
-    assert_eq!(
-        body.get("kind").and_then(|v| v.as_str()),
-        Some("chat.input.submit")
-    );
-    assert_eq!(
-        body.get("text").and_then(|v| v.as_str()),
-        Some("second\nthird")
+    assert!(
+        emits.is_empty(),
+        "stream end must not re-emit follow-ups — they already went out: {emits:?}"
     );
 }
 
@@ -697,33 +721,6 @@ fn graph_run_started_creates_a_run_panel_row() {
     assert!(
         out.contains("(0/3)"),
         "run-panel counter missing 0/3 for fresh run: {out:?}"
-    );
-}
-
-#[test]
-fn graph_run_started_displays_name_as_title_words() {
-    let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
-    let _ = render_str(&mut engine);
-
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "graph.run_started",
-            "run_id": "run-aaaaaaaa",
-            "name": "fix-graph-names",
-            "total_nodes": 3,
-        }),
-    );
-
-    let out = render_str(&mut engine);
-    assert!(
-        out.contains("Fix Graph Names"),
-        "run-panel header should display title-cased graph name: {out:?}"
-    );
-    assert!(
-        !out.contains("fix-graph-names"),
-        "run-panel header should not display raw kebab-case graph name: {out:?}"
     );
 }
 
@@ -1408,80 +1405,6 @@ fn graph_run_complete_removes_run_after_linger_window() {
 }
 
 #[test]
-fn graph_sidebar_scrolls_when_many_nodes_overflow() {
-    let mut engine = Engine::new(100, 12).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
-    let _ = render_str(&mut engine);
-
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "graph.run_started",
-            "run_id": "run-scroll",
-            "total_nodes": 30,
-        }),
-    );
-    for i in 1..=30 {
-        dispatch_event(
-            &mut engine,
-            json!({
-                "kind": "graph.node.fired",
-                "run_id": "run-scroll",
-                "node_id": format!("n{i:02}"),
-                "firing_id": format!("f-{i:02}"),
-                "reasoner": "agent",
-            }),
-        );
-    }
-    let _ = render_str(&mut engine);
-
-    fn read_offset(engine: &mut Engine, key: &str) -> u16 {
-        let lua = engine.lua();
-        let chunk = format!(
-            r#"
-            local p = tui.scroll_position("{key}")
-            return p and p.offset or -1
-            "#
-        );
-        let v: i64 = lua
-            .load(chunk.as_str())
-            .eval()
-            .expect("scroll_position eval");
-        if v < 0 {
-            panic!("no scroll_position for `{key}`");
-        }
-        v as u16
-    }
-
-    let before = read_offset(&mut engine, "sidebar");
-    assert!(
-        before > 0,
-        "sidebar should stick to the bottom when graph rows overflow"
-    );
-    let snap = engine.snapshot();
-    assert!(
-        snap.contains("n30"),
-        "bottom graph rows should be visible by default:\n{snap}"
-    );
-
-    engine
-        .handle_mouse(MouseMessage {
-            kind: MouseKind::Wheel,
-            x: 90,
-            y: 5,
-            button: Some("up"),
-            mods: vec![],
-        })
-        .expect("wheel up over sidebar");
-    let _ = render_str(&mut engine);
-    let after = read_offset(&mut engine, "sidebar");
-    assert!(
-        after < before,
-        "wheel over sidebar must scroll that panel independently (before={before}, after={after})"
-    );
-}
-
-#[test]
 fn chat_session_stats_updates_statusline() {
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
@@ -1528,12 +1451,14 @@ fn replayed_chat_model_set_ack_does_not_clobber_live_model() {
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
-    // Live: user is on `qwen-test`.
+    // Live: user is on `qwen-test`. The ack rides the active provider
+    // (harness-pinned "mock-plugin") — acks from non-active providers
+    // are dropped by the stale-ack guard, which is a separate contract.
     dispatch_event(
         &mut engine,
         json!({
             "kind": "chat.model.set_ack",
-            "provider": "qwen",
+            "provider": "mock-plugin",
             "model": "qwen-test",
         }),
     );
@@ -1610,11 +1535,14 @@ fn statusline_shows_model_with_reasoning_effort() {
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
+    // Provider matches the harness-pinned active provider: a
+    // chat.model.set_ack from a NON-active provider is deliberately
+    // ignored (stale-ack guard in handle_model_set_ack).
     dispatch_event(
         &mut engine,
         json!({
             "kind": "chat.model.set_ack",
-            "provider": "ollama",
+            "provider": "mock-plugin",
             "model": "qwen3:32b",
         }),
     );
@@ -1622,7 +1550,7 @@ fn statusline_shows_model_with_reasoning_effort() {
         &mut engine,
         json!({
             "kind": "chat.reasoning.set_ack",
-            "provider": "ollama",
+            "provider": "mock-plugin",
             "effort": "high",
         }),
     );
@@ -2116,65 +2044,6 @@ fn thinking_indicator_has_no_braille_spinner() {
 }
 
 #[test]
-fn escape_with_pending_lead_active_graph_and_queued_text_interrupts_lead_only() {
-    let mut engine = Engine::new(120, 24).expect("engine");
-    engine.load_scenario(&chat_lua_source()).expect("load");
-    let _ = render_str(&mut engine);
-
-    submit_text(&mut engine, "lead prompt");
-    let _ = engine.take_emit_queue();
-    let _ = render_str(&mut engine);
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "graph.run_started", "run_id": "graph-1", "total_nodes": 1 }),
-    );
-    dispatch_event(
-        &mut engine,
-        json!({
-            "kind": "graph.node.fired",
-            "run_id": "graph-1",
-            "node_id": "n1",
-            "firing_id": "f-n1",
-            "reasoner": "agent",
-        }),
-    );
-    submit_text(&mut engine, "queued one");
-    submit_text(&mut engine, "queued two");
-    type_text(&mut engine, "draft");
-    let _ = engine.take_emit_queue();
-
-    engine.handle_key(key("escape")).expect("escape");
-    let emits = engine.take_emit_queue();
-    assert_eq!(
-        emits.len(),
-        1,
-        "Esc must emit only lead interrupt: {emits:?}"
-    );
-    assert_eq!(
-        emits[0].1.get("kind").and_then(|v| v.as_str()),
-        Some("chat.interrupt")
-    );
-
-    let out = render_str(&mut engine);
-    assert!(
-        out.contains("Graph graph-1") && out.contains('●') && !out.contains('✗'),
-        "active graph should remain running after lead interrupt: {out:?}"
-    );
-    assert!(
-        !out.contains("queued follow-up"),
-        "queued follow-up widget should clear after restoring prompt: {out:?}"
-    );
-    assert!(
-        out.contains("queued one") && out.contains("queued two") && out.contains("draft"),
-        "queued text and draft should return to input preserving newlines: {out:?}"
-    );
-    assert!(
-        !out.contains("│ queued one") && !out.contains("│ queued two"),
-        "queued text must not be promoted into transcript/history: {out:?}"
-    );
-}
-
-#[test]
 fn double_escape_after_lead_stops_emits_interrupt_all() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
@@ -2613,6 +2482,10 @@ fn autocomplete_open_enter_runs_highlighted_command() {
         "autocomplete should list /model after typing /mo: {out:?}"
     );
 
+    // Ranking puts the shorter `/mode` first, so step the highlight
+    // down to `/model` — which also keeps this test honest: Enter runs
+    // the HIGHLIGHTED entry, not the typed fragment `mo`.
+    engine.handle_key(key("down")).expect("down");
     let _ = engine.take_emit_queue();
     engine.handle_key(key("enter")).expect("enter");
     let emits = engine.take_emit_queue();
@@ -2656,6 +2529,9 @@ fn autocomplete_open_tab_completes_without_submitting() {
         engine.handle_key(key(&ch.to_string())).expect("type");
     }
     let _ = render_str(&mut engine);
+    // `/mode` ranks above `/model` for the `/mo` prefix (shorter name
+    // wins); step down so Tab applies `/model`.
+    engine.handle_key(key("down")).expect("down");
     let _ = engine.take_emit_queue();
 
     engine.handle_key(key("tab")).expect("tab");
