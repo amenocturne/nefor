@@ -13,7 +13,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -70,22 +70,25 @@ const REQUIRED_BINS: &[&str] = &[
 /// We deliberately do NOT spawn a nested `cargo build` here —
 /// cargo holds a target-directory lock while running test binaries,
 /// so a child `cargo build` from inside a test deadlocks.
+/// The missing-list is computed once and asserted per scenario (not
+/// inside a `Once::call_once`): a panic inside call_once poisons the
+/// Once, so every OTHER scenario would fail with an opaque
+/// "poisoned Once" instead of the actual missing-binaries message.
 fn ensure_built() {
-    static CHECKED: Once = Once::new();
-    CHECKED.call_once(|| {
-        let mut missing = Vec::new();
-        for bin in REQUIRED_BINS {
-            if !target_debug(bin).exists() {
-                missing.push(*bin);
-            }
-        }
-        assert!(
-            missing.is_empty(),
-            "e2e tests require pre-built binaries. Missing: {:?}. \
-             Run `cargo build --workspace` first, or use `cargo test --workspace`.",
-            missing,
-        );
+    static MISSING: OnceLock<Vec<&'static str>> = OnceLock::new();
+    let missing = MISSING.get_or_init(|| {
+        REQUIRED_BINS
+            .iter()
+            .filter(|bin| !target_debug(bin).exists())
+            .copied()
+            .collect()
     });
+    assert!(
+        missing.is_empty(),
+        "e2e tests require pre-built binaries. Missing: {:?}. \
+         Run `cargo build --workspace` first, or use `cargo test --workspace`.",
+        missing,
+    );
 }
 
 // --------------------------------------------------------------------
@@ -302,9 +305,10 @@ fn truncate_does_not_panic_on_multibyte_boundary() {
 // --------------------------------------------------------------------
 
 /// The canonical prompt that drives the mock provider down the
-/// spawn_graph path: orchestrator-turn matches "octopus" + "lighthouse"
-/// + "parallel"/"combine", returning the canned 4-node sub-graph.
-const SPAWN_GRAPH_PROMPT: &str =
+/// kernel-dispatch path: the orchestrator turn matches "octopus" +
+/// "lighthouse" and writes + executes the canned MAG program via the
+/// lead's `mag` tool (write → execute → deferred relay turn).
+const MAG_DISPATCH_PROMPT: &str =
     "summarise octopuses and lighthouses in parallel and combine into one paragraph";
 
 /// Two short non-spawn-graph prompts. The mock has no canned trigger
@@ -320,7 +324,7 @@ const SIMPLE_PROMPT_2: &str = "world";
 #[test]
 fn scenario_1_single_shot_text_canonical() {
     ensure_built();
-    let out = run_scenario(&[SPAWN_GRAPH_PROMPT], None);
+    let out = run_scenario(&[MAG_DISPATCH_PROMPT], None);
     assert_success(&out);
 
     // The mock's combine-step canned text contains "octopus", "lighthouse",
@@ -343,10 +347,11 @@ fn scenario_1_single_shot_text_canonical() {
         "expected trailing newline on text-format stdout"
     );
 
-    // Sanity: the spawn_graph one-liner appeared on stderr.
+    // Sanity: the mag tool one-liners (write + execute) appeared on
+    // stderr — the kernel-dispatch pipeline actually ran.
     assert!(
-        out.stderr.contains("[tool: spawn_graph"),
-        "expected spawn_graph tool one-liner on stderr; got: {:?}",
+        out.stderr.contains("[tool: mag"),
+        "expected mag tool one-liner on stderr; got: {:?}",
         truncate(&out.stderr, 2048)
     );
 }
@@ -359,7 +364,7 @@ fn scenario_1_single_shot_text_canonical() {
 fn scenario_2_single_shot_json() {
     ensure_built();
     let out = run_scenario(
-        &["--format", OutputFormat::Json.as_arg(), SPAWN_GRAPH_PROMPT],
+        &["--format", OutputFormat::Json.as_arg(), MAG_DISPATCH_PROMPT],
         None,
     );
     assert_success(&out);
@@ -416,7 +421,7 @@ fn scenario_3_single_shot_stream_json() {
         &[
             "--format",
             OutputFormat::StreamJson.as_arg(),
-            SPAWN_GRAPH_PROMPT,
+            MAG_DISPATCH_PROMPT,
         ],
         None,
     );
@@ -425,15 +430,16 @@ fn scenario_3_single_shot_stream_json() {
     // Every non-empty stdout line must be a valid JSON envelope. Parse
     // each and bucket by `body.kind`.
     //
-    // Run-close on the canonical tool contract is `tool.result { id=run_id,
-    // result: { status, results } }` — the prior `graph.run_complete`
-    // wire shape is gone. We accept either `graph.run_started` (paired
-    // observer that always lands for our single run) or any
-    // `tool.result` body that contains a `result.status` field as the
-    // run-close marker; either is sufficient evidence the run reached
-    // termination.
-    let mut run_close_count = 0usize;
+    // Kernel-run lifecycle rides `mag.*`: `mag.run_started` fires for
+    // every run (the lead's turn-programs AND the dispatched canned
+    // program), and the terminal `mag.run_result` closes a run. The
+    // dispatch ack itself is a canonical `tool.result` carrying
+    // `output.status` ("written" for the workspace write, "executing"
+    // for the submit) — also asserted, as the seam between the lead's
+    // tool surface and the kernel.
     let mut run_started_count = 0usize;
+    let mut run_result_count = 0usize;
+    let mut dispatch_ack_count = 0usize;
     let mut total_lines = 0usize;
     for (idx, line) in out.stdout.lines().enumerate() {
         if line.is_empty() {
@@ -451,16 +457,19 @@ fn scenario_3_single_shot_stream_json() {
             .and_then(|b| b.get("kind"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        if kind == "graph.run_started" {
+        if kind == "mag.run_started" {
             run_started_count += 1;
+        }
+        if kind == "mag.run_result" {
+            run_result_count += 1;
         }
         if kind == "tool.result"
             && body
-                .and_then(|b| b.get("result"))
-                .and_then(|r| r.get("status"))
+                .and_then(|b| b.get("output"))
+                .and_then(|o| o.get("status"))
                 .is_some()
         {
-            run_close_count += 1;
+            dispatch_ack_count += 1;
         }
     }
 
@@ -474,25 +483,29 @@ fn scenario_3_single_shot_stream_json() {
     // robust against bus-fan-out tuning.
     assert!(
         run_started_count >= 1,
-        "expected at least one graph.run_started envelope; saw \
+        "expected at least one mag.run_started envelope; saw \
          {run_started_count} across {total_lines} lines"
     );
     assert!(
-        run_close_count >= 1,
-        "expected at least one run-close tool.result (id=run_id, \
-         result.status set) envelope; saw {run_close_count} across \
+        run_result_count >= 1,
+        "expected at least one mag.run_result run-close envelope; saw \
+         {run_result_count} across {total_lines} lines"
+    );
+    assert!(
+        dispatch_ack_count >= 1,
+        "expected at least one tool.result with output.status (the mag \
+         write/execute acks); saw {dispatch_ack_count} across \
          {total_lines} lines"
     );
 
-    // Sub-graph completion surfaces the terminal output as a
-    // `chat.graph_result.append` envelope so the TUI renders it as a
-    // distinguishable block. The deferred relay text is a separate
-    // model-facing wrapper; this is the human-visible one. The mock's
-    // combine-step canned text contains "sentinels", which is the
-    // distinguishing keyword from the orchestrator turn's other
-    // emissions. Look for a graph_result envelope carrying it in
-    // `output`.
-    let mut visible_subgraph_count = 0usize;
+    // Run completion surfaces two ways: a `chat.graph_result.append`
+    // block (status + node summary + the sink's output PATH — content
+    // deliberately omitted) and the deferred relay turn that streams
+    // the actual combined text. Assert both: a successful result block,
+    // and the mock's combine keyword ("sentinels") reaching the wire in
+    // some chat.* envelope from the relay turn.
+    let mut result_block_count = 0usize;
+    let mut relay_content_count = 0usize;
     for line in out.stdout.lines() {
         if line.is_empty() {
             continue;
@@ -506,21 +519,25 @@ fn scenario_3_single_shot_stream_json() {
             None => continue,
         };
         let kind = body.get("kind").and_then(Value::as_str).unwrap_or("");
-        if kind != "chat.graph_result.append" {
-            continue;
+        if kind == "chat.graph_result.append"
+            && body.get("status").and_then(Value::as_str) == Some("success")
+        {
+            result_block_count += 1;
         }
-        let status = body.get("status").and_then(Value::as_str).unwrap_or("");
-        let output = body.get("output").and_then(Value::as_str).unwrap_or("");
-        if status == "success" && output.contains("sentinels") {
-            visible_subgraph_count += 1;
+        if kind.starts_with("chat.") && line.contains("sentinels") {
+            relay_content_count += 1;
         }
     }
     assert!(
-        visible_subgraph_count >= 1,
-        "expected the sub-graph terminal text to land as a \
-         chat.graph_result.append envelope on the bus; \
-         saw {visible_subgraph_count} matching envelopes across \
-         {total_lines} lines"
+        result_block_count >= 1,
+        "expected a successful chat.graph_result.append run-result block \
+         on the bus; saw {result_block_count} across {total_lines} lines"
+    );
+    assert!(
+        relay_content_count >= 1,
+        "expected the combine step's text (\"sentinels\") to reach the \
+         wire in a chat.* envelope from the deferred relay turn; saw \
+         {relay_content_count} across {total_lines} lines"
     );
 }
 
@@ -591,7 +608,7 @@ fn scenario_5_help_via_double_dash() {
 #[test]
 fn scenario_6_yolo_flag_accepted() {
     ensure_built();
-    let out = run_scenario(&["--yolo", SPAWN_GRAPH_PROMPT], None);
+    let out = run_scenario(&["--yolo", MAG_DISPATCH_PROMPT], None);
     assert_success(&out);
 
     // --yolo is a placeholder per agentic_workflow.set_yolo. Behaviour

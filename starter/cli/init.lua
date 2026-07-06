@@ -279,7 +279,11 @@ local function install_stream_json_format()
   end
   nefor.bus.on_event("chat.*", emit_env)
   nefor.bus.on_event("graph.*", emit_env)
-  -- Reasoner-graph close envelopes ride the canonical tool contract:
+  -- Kernel-run lifecycle (mag.run_started / mag.run_result / actor
+  -- spawn-ready events) — the lead's turn-programs and its dispatched
+  -- runs both execute on the mag kernel.
+  nefor.bus.on_event("mag.*", emit_env)
+  -- Run-close envelopes ride the canonical tool contract:
   -- `tool.result { id=<run_id|firing_id>, result | error }`. Include
   -- the family so stream-json transcripts retain run-close visibility.
   nefor.bus.on_event("tool.*", emit_env)

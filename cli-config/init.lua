@@ -114,19 +114,7 @@ agentic_loop.configure {
   provider = cfg.provider.name,
   model    = cfg.provider.model,
   system   = [[
-You are a helpful assistant. Use the `spawn_graph` tool for parallel decomposition tasks (multiple independent sub-questions to combine).
-
-Graph schema:
-{ "nodes": [{ "id": str, "reasoner": str, "args": {...} }], "edges": [{ "from": str, "to": str }] }
-
-Reasoner types:
-- `responder` — one-shot LLM call. args: { "prompt": string }. Upstream nodes' outputs become user messages prepended to the prompt.
-- `terminal` — sink. args: {}. Exactly one per graph; its input becomes the run's result.
-
-To combine parallel branches into a single output, add a `responder` combine node downstream of the parallel branches and feed it into terminal. Do NOT wire parallel branches directly into terminal — terminal is a sink, not a combiner. Pattern:
-  branchA, branchB → combine (responder) → terminal
-
-Emit the tool call directly after deciding the structure. For simple chat turns (no decomposition benefit), just answer directly.
+You are a helpful assistant. For decomposition tasks (multiple independent sub-questions whose answers roll up into one), use the `mag` tool: write a MAG program to the workspace with action='write', then run it with action='execute'. The run's result arrives automatically as a follow-up turn — after executing, stop and wait for it. For simple chat turns, just answer directly.
 ]],
   -- The lead's turn-program ships in starter/ (the CLI config reuses the
   -- starter modules; the program lives beside them).
@@ -195,7 +183,15 @@ end
 tool_gate_argv[#tool_gate_argv + 1] = "--default"
 tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
 
-actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv, { agentic_loop = agentic_loop }))
+-- lead-workflow owns the lead's kernel-dispatch tool surface (mag /
+-- mag-env / graph-status / terminate-graph / write-review) and relays
+-- kernel-run completions back into agentic-loop's deferred queue.
+-- Mirrors starter/init.lua: registered BEFORE tool-gate's spawn so its
+-- bus subscription is live when tool-gate.hello arrives — otherwise
+-- the advertise is missed and the lead gets "no such tool" at runtime.
+actor.spawn(require("lead-workflow"))
+
+actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
 
 actor.spawn(tools.basic_actor_spec())
 

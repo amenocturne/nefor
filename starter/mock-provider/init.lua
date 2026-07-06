@@ -1,6 +1,6 @@
 -- starter/mock-provider/init.lua — script for mock-plugin to
 -- impersonate an openai-provider for deterministic smoke testing of
--- the spawn_graph pipeline AND a self-documenting interactive test
+-- the mag kernel-dispatch pipeline AND a self-documenting interactive test
 -- machine for developers who launch `nefor --config ./starter`. Spawns
 -- alongside the openai-provider/ollama instance unconditionally; both
 -- register on the bus and show up in the /model picker.
@@ -23,14 +23,17 @@
 -- For each chat.complete, look at the chat's history and pattern-match
 -- the latest user message against this priority list:
 --
---   1. Deferred result / failure / submitted-ack from a prior
---      spawn_graph (relay path — must run first to keep the original
---      octopus+lighthouse workflow intact).
+--   1. Deferred result / failure / submitted-ack from a prior kernel
+--      dispatch (relay path — must run first to keep the original
+--      octopus+lighthouse workflow intact), plus the mag pipeline's
+--      write→execute intermediate step.
 --   2. Orchestrator-turn octopus + lighthouse + parallel/combine →
---      emit spawn_graph tool call (must come before sub-graph canned
---      text since the canonical prompt matches both).
---   3. Sub-graph canned text (responder nodes inside the spawn_graph
---      run — Summarise octopuses / lighthouses / Combine paragraph).
+--      write + execute the canned MAG program via the lead's `mag`
+--      tool (must come before sub-agent canned text since the
+--      canonical prompt matches both).
+--   3. Sub-agent canned text (agents inside the canned MAG run —
+--      Summarise octopuses / lighthouses / Combine paragraph, matched
+--      on their :system instruction).
 --   4. SLOW_STREAM_REGRESSION_ marker — long-stream watchdog regression hook.
 --   5. Interactive triggers (read readme, cwd/pwd, secret key memory,
 --      list files, count to N, think out loud, fail).
@@ -47,24 +50,38 @@ local NAME = nefor.name -- "mock-plugin"
 -- per-chat history: chat_id -> array of {role, content, tool_call_id?, tool_calls?}
 local chats = {}
 
--- The graph the orchestrator-turn responds with via spawn_graph.
--- Encoded as a Lua table; mock-plugin serialises nested tables to JSON.
--- IMPORTANT: rg_adapter expects `arguments` to be a JSON object on the
--- chat.complete.result wire (openai-provider de-nests it before emit;
--- we emit the de-nested shape directly).
-local CANNED_GRAPH = {
-  nodes = {
-    { id = "sx",       reasoner = "responder", args = { prompt = "Summarise octopuses in one sentence." } },
-    { id = "sy",       reasoner = "responder", args = { prompt = "Summarise lighthouses in one sentence." } },
-    { id = "combine",  reasoner = "responder", args = { prompt = "Combine the two summaries above into one paragraph." } },
-    { id = "terminal", reasoner = "terminal",  args = {} },
-  },
-  edges = {
-    { from = "sx",      to = "combine"  },
-    { from = "sy",      to = "combine"  },
-    { from = "combine", to = "terminal" },
-  },
-}
+-- The MAG program the orchestrator turn writes + executes via the
+-- lead's `mag` tool (the kernel-execute contract that replaced the
+-- retired spawn_graph tool-gate contract). A chain — sx feeds sy feeds
+-- combine — rather than a parallel join: the agent template's entry
+-- adapter lifts exactly one boundary message per activation, so an
+-- all-of product join would silently drop one branch; the chain keeps
+-- the smoke deterministic while still exercising a multi-agent kernel
+-- run end to end. Each agent carries its instruction in :system; the
+-- kernel seeds source agents with a placeholder task prompt, so the
+-- mock pattern-matches sub-agent chats on their SYSTEM message (see
+-- pick_response_for).
+local CANNED_MAG_FILE = "octo-lighthouse.mag"
+local CANNED_MAG_PROGRAM = table.concat({
+  "(type mag.Task)",
+  "(type generic-provider.FinalAnswer)",
+  "",
+  '(let [sx      (agent {:id "sx" :provider "mock-plugin" :profile "standard"',
+  '                      :system "Summarise octopuses in one sentence." :tools []}',
+  "                : mag.Task -> generic-provider.FinalAnswer)",
+  '      sy      (agent {:id "sy" :provider "mock-plugin" :profile "standard"',
+  '                      :system "Summarise lighthouses in one sentence." :tools []}',
+  "                : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)",
+  '      combine (agent {:id "combine" :provider "mock-plugin" :profile "standard"',
+  '                      :system "Combine the two summaries above into one paragraph." :tools []}',
+  "                : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)",
+  '      out     (node "sink" {}',
+  "                : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]",
+  "  (graph sx -> sy",
+  "         sy -> combine",
+  "         combine -> out",
+  "         :terminal out))",
+}, "\n")
 
 -- Canned text responses keyed by pattern in the last user message.
 -- Order matters: more specific patterns must come before general ones.
@@ -84,18 +101,20 @@ local CANNED_TEXT = {
 -- relay it as the assistant's final answer.
 local FINAL_RELAY_PREFIX = ""
 
--- Async spawn_graph: the immediate `tool.result` is just an ack
--- ("Submitted sub-graph run_id=..."). The real result arrives later
--- as a USER-role message starting with "[spawn_graph(run_id=...)
--- result]". Pattern-match on that prefix in the latest user message
--- to drive the relay turn.
+-- Async kernel dispatch: the mag execute's immediate `tool.result` is
+-- just an ack ("Program submitted to the MAG actor kernel..."). The
+-- real result arrives later as a USER-role message starting with
+-- "[spawn_graph(run_id=... ) result]" — format_deferred keeps that
+-- historical marker name for kernel runs too. Pattern-match on that
+-- prefix in the latest user message to drive the relay turn.
 --
--- The marker shape comes from `agentic-loop.results.format_deferred`.
+-- The marker shape comes from `agentic-loop.results.format_deferred`;
+-- the ack text from lead-workflow's mag execute tool.result.
 local DEFERRED_RESULT_MARKER = "%[spawn_graph%(run_id="
 local DEFERRED_LEGACY_MARKER = "%[Deferred result for spawn_graph"
 local DEFERRED_FAILURE_MARKER = "%[spawn_graph%(run_id=[^)]*%) FAILED%]"
 local DEFERRED_FAILURE_LEGACY = "%[Deferred FAILURE for spawn_graph"
-local SUBMITTED_ACK_MARKER = "Submitted sub%-graph run_id="
+local SUBMITTED_ACK_MARKER = "submitted to the MAG actor kernel"
 
 -- Banner prepended to first-turn output and to every help-fallback
 -- response. The marker (`MOCK_PROVIDER_BANNER`) is the substring tests
@@ -132,7 +151,7 @@ local HELP_BODY = table.concat({
   "",
   "| Type | Example | What it exercises |",
   "|------|---------|-------------------|",
-  "| spawn_graph | `summarize octopuses and lighthouses` | 4-node sub-graph |",
+  "| mag dispatch | `summarize octopuses and lighthouses` | multi-agent kernel run |",
   "| read_file | `read readme` | 📄 tool-gate allowlist |",
   "| bash (pwd) | `what is my cwd` | tool-gate prompt path |",
   "| bash (ls -la) | `list files` | 📁 tool-gate prompt path |",
@@ -143,18 +162,15 @@ local HELP_BODY = table.concat({
   "| reasoning | `think out loud about <topic>` (or `reason about <topic>`) | 🤔 reasoning channel |",
   "| error | `fail` | 💥 run-error rendering |",
   "",
-  "### 1. spawn_graph",
+  "### 1. mag dispatch",
   "",
-  "Submits a 4-node sub-graph: parallel summaries → combine → terminal.",
-  "The tool-call payload looks like:",
+  "Writes a canned MAG program to the session workspace and executes it",
+  "on the actor kernel: summarise → summarise → combine → sink. Two",
+  "tool calls back to back:",
   "",
   "```json",
-  "{",
-  "  \"name\": \"spawn_graph\",",
-  "  \"arguments\": {",
-  "    \"graph\": { \"nodes\": [...], \"edges\": [...] }",
-  "  }",
-  "}",
+  "{ \"name\": \"mag\", \"arguments\": { \"action\": \"write\", \"file\": \"octo-lighthouse.mag\", \"content\": \"…\" } }",
+  "{ \"name\": \"mag\", \"arguments\": { \"action\": \"execute\", \"file\": \"octo-lighthouse.mag\" } }",
   "```",
   "",
   "### 2. Tool calls",
@@ -221,6 +237,25 @@ local tool_id_counter = 0
 local function mint_tool_id(label)
   tool_id_counter = tool_id_counter + 1
   return "call_mock_" .. label .. "_" .. tostring(tool_id_counter)
+end
+
+-- Tool results ride the provider wire with structured (table) content
+-- when the tool returned a JSON object (the kernel's tool-result
+-- factory passes structured outputs through verbatim). Flatten to a
+-- matchable string: the human-readable `message` field carries the
+-- markers the orchestrator state machine keys on; fall back to sorted
+-- key=value pairs. Strings pass through untouched.
+local function flatten_content(content)
+  if type(content) ~= "table" then return content end
+  if type(content.message) == "string" then return content.message end
+  local keys = {}
+  for k in pairs(content) do keys[#keys + 1] = tostring(k) end
+  table.sort(keys)
+  local parts = {}
+  for _, k in ipairs(keys) do
+    parts[#parts + 1] = k .. "=" .. tostring(content[k])
+  end
+  return table.concat(parts, " ")
 end
 
 local function pick_response_for(chat_id)
@@ -293,14 +328,33 @@ local function pick_response_for(chat_id)
     }
   end
 
-  -- Async ack branch: the only "tool" message in history is the
-  -- spawn_graph immediate ack. We can't relay that to the user as a
-  -- final answer — emit a short transitional ack so the orchestrator
-  -- terminates and the chat unblocks.
+  -- Async ack branch: the pending tool message is the mag execute's
+  -- immediate ack. We can't relay that to the user as a final answer —
+  -- emit a short transitional ack so the turn terminates and the chat
+  -- unblocks; the kernel run's result relays as a fresh deferred turn.
   if last_tool ~= nil and string.find(tostring(last_tool), SUBMITTED_ACK_MARKER) then
     return {
       text = "Started the sub-graph; I'll relay the results when they arrive.",
       finish_reason = "stop",
+    }
+  end
+
+  -- mag write→execute step 2: the workspace write acked; submit the
+  -- run. Scoped to the canonical octopus+lighthouse orchestrator turn
+  -- so unrelated write-tool relays keep their generic handling below.
+  if last_tool ~= nil and type(last_user) == "string"
+      and string.find(tostring(last_tool), "File written", 1, true)
+      and string.find(last_user, "octopus") and string.find(last_user, "lighthouse") then
+    return {
+      text = "",
+      finish_reason = "tool_calls",
+      tool_calls = {
+        {
+          id        = mint_tool_id("mag_execute"),
+          name      = "mag",
+          arguments = { action = "execute", file = CANNED_MAG_FILE },
+        },
+      },
     }
   end
 
@@ -360,52 +414,61 @@ local function pick_response_for(chat_id)
   end
 
   -- ----------------------------------------------------------------
-  -- 2. Orchestrator-turn spawn_graph: octopus + lighthouse anywhere in
-  --    the latest user message. MUST come before CANNED_TEXT (which
-  --    matches "Combine ... paragraph" for the inner combine node).
-  --    Inner sub-graph nodes don't have both words in their latest
-  --    user message — `sx` sees "Summarise octopuses…", `sy` sees
-  --    "Summarise lighthouses…", `combine` sees "Combine the two
-  --    summaries…" — so the broad two-word match is safe. The
-  --    relay turn's last_user matches the deferred-result branch
-  --    first and returns before reaching here.
+  -- 2. Orchestrator turn: octopus + lighthouse anywhere in the latest
+  --    user message → step 1 of the mag pipeline: write the canned
+  --    program into the session's MAG workspace (the execute call
+  --    follows once the write's tool.result relays back — see the
+  --    write→execute step above). MUST come before CANNED_TEXT. Inner
+  --    sub-agent chats never match here: their latest user message is
+  --    the kernel's task seed or an upstream summary, never both words
+  --    at once, and their instructions ride the SYSTEM message.
   -- ----------------------------------------------------------------
   if string.find(last_user, "octopus") and string.find(last_user, "lighthouse") then
     return {
       text = "",
       finish_reason = "tool_calls",
-      -- Brief pre-emit pause so the user can see the spawn_graph
-      -- popup land deliberately rather than appearing in the same
-      -- frame as their input. Long enough to read "thinking…",
-      -- short enough not to feel sluggish.
+      -- Brief pre-emit pause so the user can see the tool call land
+      -- deliberately rather than appearing in the same frame as their
+      -- input (interactive runs only; tests skip pacing).
       pre_delay_ms = 1500,
       tool_calls = {
         {
-          id        = mint_tool_id("spawn_graph"),
-          name      = "spawn_graph",
-          -- arguments is a JSON OBJECT in the openai-provider's
-          -- de-nested wire shape; rg_adapter forwards verbatim and
-          -- tool-executor reads `arguments` as the call's parameter
-          -- map.
-          arguments = { graph = CANNED_GRAPH },
+          id        = mint_tool_id("mag_write"),
+          name      = "mag",
+          arguments = {
+            action  = "write",
+            file    = CANNED_MAG_FILE,
+            content = CANNED_MAG_PROGRAM,
+          },
         },
       },
     }
   end
 
   -- ----------------------------------------------------------------
-  -- 3. Sub-graph canned text. Used by the responder nodes inside the
-  --    spawn_graph workflow — each fires its own chat with a prompt
-  --    like "Summarise octopuses..." or "Combine the two summaries
-  --    above into one paragraph."
-  --    Each node gets a 5s pre-emit pause so a developer watching
-  --    the run panel can actually see the run progress through
-  --    nodes (parallel sx+sy → combine → terminal). Without this
-  --    the canned-text responses come back in <100ms each and the
-  --    sidebar flashes done before the user can read it.
+  -- 3. Sub-agent canned text. Used by the agents inside the canned
+  --    MAG run. Their instructions ride the SYSTEM message ("Summarise
+  --    octopuses…", "Combine the two summaries…") because the kernel
+  --    seeds source agents with a placeholder task prompt and mid-chain
+  --    agents receive the upstream summary as their user message — so
+  --    match the system first, then the user text. The lead chat's
+  --    system prompt (cli-config / starter config) must not contain
+  --    these patterns, or every unrecognised lead turn would return
+  --    canned text instead of the help banner.
+  --    Each match gets a 5s pre-emit pause (interactive runs only) so
+  --    a developer watching the run panel can see the run progress
+  --    through the chain instead of it flashing done in <100ms.
   -- ----------------------------------------------------------------
+  local system_content
+  for i = 1, #history do
+    if history[i].role == "system" and type(history[i].content) == "string" then
+      system_content = history[i].content
+      break
+    end
+  end
   for _, entry in ipairs(CANNED_TEXT) do
-    if string.find(last_user, entry.pattern) then
+    if (system_content ~= nil and string.find(system_content, entry.pattern))
+        or string.find(last_user, entry.pattern) then
       return { text = entry.text, finish_reason = "stop", pre_delay_ms = 5000 }
     end
   end
@@ -750,7 +813,7 @@ nefor.on(NAME .. ".chat.append", function(body)
   if not chats[chat_id] then chats[chat_id] = {} end
   table.insert(chats[chat_id], {
     role            = message.role,
-    content         = message.content,
+    content         = flatten_content(message.content),
     tool_call_id    = message.tool_call_id,
     tool_calls      = message.tool_calls,
   })
