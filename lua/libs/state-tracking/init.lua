@@ -1,4 +1,4 @@
--- state-tracking/init.lua — best-effort runtime state side effects.
+-- lua/libs/state-tracking/init.lua — best-effort runtime state side effects.
 --
 -- This actor observes generic chat/session/runtime bus traffic, computes a
 -- small Nefor runtime state once, then fans that state out to integrations:

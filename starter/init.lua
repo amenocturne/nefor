@@ -229,7 +229,7 @@ actor.install()
 -- here so module load stays free of bus dependencies.
 history_replay.install()
 actor.spawn(sessions)
-actor.spawn(require("state-tracking"))
+actor.spawn(require("libs.state-tracking"))
 
 local function parse_startup_args(argv)
   local opts = { session_id = nil, prompt = nil }
