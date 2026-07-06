@@ -320,12 +320,27 @@ end
 -- collapsed group are not rows at all, so the cursor skips them by
 -- construction. Fold state survives re-renders, focus changes, and run
 -- updates; it resets with run prune / a new session (update.lua).
+-- Runs render in creation order (started_at_ms, run_id tiebreak), not id
+-- order: the turn's main run stays first and ad-hoc eval runs append below
+-- instead of alphabetically reshuffling the panel on every one-off.
+local function runs_in_creation_order(runs)
+  local out = {}
+  for run_id in pairs(runs) do out[#out + 1] = run_id end
+  table.sort(out, function(a, b)
+    local ta = runs[a].started_at_ms or 0
+    local tb = runs[b].started_at_ms or 0
+    if ta ~= tb then return ta < tb end
+    return a < b
+  end)
+  return out
+end
+
 function M.row_model(state, now_ms)
   local rows = {}
   local runs = state.runs or {}
   local streams = state.agent_streams or {}
   local folds = state.sidebar_folds or {}
-  for _, run_id in ipairs(sorted_keys(runs)) do
+  for _, run_id in ipairs(runs_in_creation_order(runs)) do
     local run = runs[run_id]
     if not is_expired(run, now_ms) then
       local groups = build_groups(run)
