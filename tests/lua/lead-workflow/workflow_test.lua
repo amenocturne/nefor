@@ -1246,7 +1246,14 @@ do
   assert_eq(#interrupts, 2,
     "interrupt_all interrupts EVERY detached run; got " .. json.encode(_test.calls()))
   local hit = {}
-  for _, c in ipairs(interrupts) do hit[c.body.run_id] = true end
+  for _, c in ipairs(interrupts) do
+    hit[c.body.run_id] = true
+    -- A dispatched run is ephemeral: it must be TERMINATED (ended failed), not
+    -- gracefully interrupted — otherwise its agent llm re-fires and answers
+    -- "Completed", relaying a phantom success (the incident this fixes).
+    assert_true(c.body.terminate == true,
+      "detached run " .. tostring(c.body.run_id) .. " is TERMINATED, not gracefully interrupted")
+  end
   for _, rid in ipairs(run_ids) do
     assert_true(hit[rid], "detached run " .. rid .. " was interrupted by double-Esc")
   end
@@ -1307,6 +1314,8 @@ do
   end)
   assert_true(interrupt ~= nil,
     "a cancel for the dispatch firing interrupts the detached run")
+  assert_true(interrupt.body.terminate == true,
+    "the dispatch-firing cancel TERMINATES the detached run (ends it failed)")
 
   _test.calls_clear()
   feed("tool-gate", { kind = "lead-workflow.tool.cancel", id = "firing-nope" })

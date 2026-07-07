@@ -495,6 +495,11 @@ do
   assert(interrupt ~= nil, "interrupt_all emits mag.interrupt_run for the active run")
   assert_eq(interrupt.target, "mag", "interrupt targets the mag plugin")
   assert_eq(interrupt.body.run_id, exec.body.run_id, "interrupt names the active run")
+  -- The lead's OWN turn is interrupted GRACEFULLY (no terminate flag): the run
+  -- survives, re-fires, and records its history. Contrast a DISPATCHED sub-run,
+  -- which lead-workflow terminates (terminate = true).
+  assert(not interrupt.body.terminate,
+    "the lead's own turn is interrupted gracefully, never terminated")
   assert_eq(find_kind(calls, "mag.kill_run"), nil,
     "double-Esc no longer kills the run")
 

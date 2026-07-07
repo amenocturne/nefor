@@ -718,6 +718,135 @@ async fn interrupt_run_settles_inflight_tool_and_lead_winds_down_completed() {
     std::fs::remove_dir_all(&data_dir).ok();
 }
 
+/// The TERMINATING interrupt path (`mag.interrupt_run { terminate: true }`) — a
+/// dispatched sub-run. Contrast the graceful test above: a dispatched run is
+/// ephemeral, so an interrupt must STOP it, not gracefully cancel one tool and
+/// let its llm re-fire to a phantom "Completed". Here the interrupt cancels the
+/// in-flight tool (a `tool-gate.tool.cancel` reaches the wire → the bash dies)
+/// AND ends the run FAILED — `mag.run_result status:"failed" error:"interrupted
+/// by user"`, and the llm NEVER re-fires (no round-2 `chat.create`). This pins
+/// the incident's fix through the real plugin + bridge + kernel.
+#[tokio::test]
+async fn terminating_interrupt_cancels_inflight_tool_and_settles_failed_without_refire() {
+    let data_dir = std::env::temp_dir().join(format!("mag-lead-terminate-{}", std::process::id()));
+    std::fs::remove_dir_all(&data_dir).ok();
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+
+    let mut child = spawn_mag(&data_dir).await;
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let stderr = child.stderr.take().expect("stderr");
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            eprintln!("[mag stderr] {line}");
+        }
+    });
+
+    handshake(&mut reader, &mut stdin).await;
+    let program = load_lead_program(&mut reader, &mut stdin).await;
+
+    send_event(
+        &mut stdin,
+        execute_body(
+            "exec-terminate",
+            "sub-run-terminate",
+            turn_modification(&program, "read a big file for me"),
+            json!([]),
+        ),
+    )
+    .await;
+
+    // Round 1: drive the provider round to a tool call.
+    let create_kind = format!("{PROVIDER}.chat.create");
+    let complete_kind = format!("{PROVIDER}.chat.complete");
+    let create = next_event_of_kind(&mut reader, &create_kind).await;
+    let chat_id = create
+        .get("chat_id")
+        .and_then(Value::as_str)
+        .expect("chat.create carries chat_id")
+        .to_owned();
+    next_event_of_kind(&mut reader, &complete_kind).await;
+    send_event(
+        &mut stdin,
+        chat_result(
+            &chat_id,
+            json!({ "tool_calls": [
+                { "id": "call-1", "name": "read_file", "args": { "path": "HUGE" } }
+            ] }),
+        ),
+    )
+    .await;
+
+    // The gate invoke is now in flight (run-tool blocked awaiting the result).
+    let gate_invoke_kind = format!("{GATE}.tool.invoke");
+    let invoke = next_event_of_kind(&mut reader, &gate_invoke_kind).await;
+    let cap_id = invoke
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("gate invoke carries the kernel correlation id")
+        .to_owned();
+
+    // Double-Esc on the DISPATCHED run: terminate it. Do NOT reply to the tool
+    // call. The terminate cancels it and ends the run — no synthetic settle.
+    send_event(
+        &mut stdin,
+        obj(json!({
+            "kind": "mag.interrupt_run",
+            "run_id": "sub-run-terminate",
+            "terminate": true
+        })),
+    )
+    .await;
+
+    // The run ends failed with NO re-fire: a tool.cancel for the in-flight call
+    // reaches the wire, and the terminal reply is `status:"failed"`. Crucially,
+    // NO round-2 chat.create appears — the llm never gets to answer "Completed".
+    let cancel_kind = format!("{GATE}.tool.cancel");
+    let mut saw_cancel = false;
+    let result = loop {
+        let body = next_event(&mut reader, "terminate aftermath").await;
+        match body.get("kind").and_then(Value::as_str) {
+            Some(k) if k == cancel_kind => {
+                assert_eq!(
+                    body.get("id").and_then(Value::as_str),
+                    Some(cap_id.as_str()),
+                    "the cancel targets the in-flight tool correlation"
+                );
+                saw_cancel = true;
+            }
+            Some(k) if k == create_kind => {
+                panic!("the terminated run's llm must NOT re-fire — saw a round-2 chat.create");
+            }
+            Some("mag.run_result") => break body,
+            _ => {}
+        }
+    };
+    assert!(
+        saw_cancel,
+        "a tool.cancel for the in-flight call reached the wire before the run ended"
+    );
+    assert_eq!(
+        result.get("status").and_then(Value::as_str),
+        Some("failed"),
+        "the terminated dispatched run settles FAILED, not completed"
+    );
+    assert_eq!(
+        result.get("error").and_then(Value::as_str),
+        Some("interrupted by user"),
+        "the failure carries the interruption reason for the relay to the lead"
+    );
+    assert_eq!(
+        result.get("in_reply_to").and_then(Value::as_str),
+        Some("exec-terminate"),
+        "the terminated run settles its original execute reply"
+    );
+
+    shutdown(stdin, child).await;
+    std::fs::remove_dir_all(&data_dir).ok();
+}
+
 /// Tiny JSON-pointer helper for `Map<String, Value>` roots.
 trait PointerStr {
     fn pointer_str(&self, pointer: &str) -> Option<&str>;

@@ -1077,22 +1077,29 @@ end
 -- the sub-run keeps churning. The agentic-loop's own interrupt only sees a run
 -- the lead is BLOCKED on (current_run_id), so those detached runs would sail on
 -- untouched — the incident. lead-workflow owns state.active_runs, so it
--- interrupts EACH live dispatched run directly: `mag.interrupt_run` makes the
--- kernel settle that run's in-flight capability as a failed "interrupted by
--- user" reply and emit a `tool.cancel` for it (the bash's process group dies).
--- The terminal failed `mag.run_result` then relays into the lead's next turn
--- (handle_mag_run_result → relay_kernel_completion), so the cancellation is
--- never a silent disappearance. Idempotent: a run with nothing in flight
--- settles 0, and a run also hit by the agentic-loop path is a kernel no-op the
--- second time (the correlation is already closed).
+-- interrupts EACH live dispatched run directly.
+--
+-- TERMINATING interrupt (`terminate = true`): a dispatched run is ephemeral —
+-- its only output is the relayed result, so an interrupt must STOP it, not
+-- gracefully cancel one tool and let the run's agent llm re-fire. A GRACEFUL
+-- interrupt here reproduced the incident: it cancelled the agent's bash, the
+-- agent llm absorbed that as a normal tool failure and answered "Completed",
+-- and the sub-run settled `completed` — relaying success for an interrupted
+-- run. Terminate instead cancels the in-flight work (the bash's process group
+-- dies, a nested sub-run is interrupted down the chain) AND ends the run
+-- FAILED so no actor re-fires. The terminal failed `mag.run_result` relays
+-- into the lead's next turn (handle_mag_run_result → relay_kernel_completion)
+-- carrying "interrupted by user" as a failure — never a silent disappearance
+-- and never a phantom success. Idempotent: a run with nothing in flight
+-- cancels 0 and still ends failed; a run already reaped is a kernel no-op.
 local function interrupt_active_runs()
   local ids = {}
   for run_id, _ in pairs(state.active_runs) do ids[#ids + 1] = run_id end
   table.sort(ids)
   for _, run_id in ipairs(ids) do
-    emit_as(SOURCE_NAME, "mag", { kind = "mag.interrupt_run", run_id = run_id })
+    emit_as(SOURCE_NAME, "mag", { kind = "mag.interrupt_run", run_id = run_id, terminate = true })
   end
-  nefor.log.info("lead-workflow: interrupt_all — interrupted active dispatched runs", {
+  nefor.log.info("lead-workflow: interrupt_all — terminated active dispatched runs", {
     count = #ids,
   })
   return #ids
@@ -1100,7 +1107,9 @@ end
 
 -- Completeness for the general cancel route: a `tool.cancel` addressed to a
 -- `mag` execute DISPATCH firing (the correlation that acked "executing")
--- propagates into that run just like the interrupt_all entry point. The mag
+-- propagates into that run just like the interrupt_all entry point — and, being
+-- a dispatched run, TERMINATES it (`terminate = true`) so the run ends failed
+-- rather than letting its agent llm re-fire to a phantom success. The mag
 -- execute firing is acked at dispatch, so the kernel rarely emits a cancel for
 -- it — this covers the case where it does, matching mag-eval.cancel's shape for
 -- blocking firings. Returns true when a matching run was found.
@@ -1109,7 +1118,7 @@ local function interrupt_run_by_dispatch_firing(firing_id)
   local hit = false
   for run_id, run in pairs(state.active_runs) do
     if run.dispatch_firing_id == firing_id then
-      emit_as(SOURCE_NAME, "mag", { kind = "mag.interrupt_run", run_id = run_id })
+      emit_as(SOURCE_NAME, "mag", { kind = "mag.interrupt_run", run_id = run_id, terminate = true })
       hit = true
     end
   end

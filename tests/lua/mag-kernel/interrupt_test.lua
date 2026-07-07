@@ -177,4 +177,41 @@ do
   assert_eq(#h.provider_out, 0, "no tool result routed when nothing was interrupted")
 end
 
+-- ==================================================================
+-- TERMINATING primitive (cancel_inflight): tool.cancel fires but NO reply is
+-- delivered — the actor does NOT re-fire. Contrast the graceful path above,
+-- where the settle routes a tool result to the sink (the re-fire). This is what
+-- lets the host end a dispatched run FAILED without its llm answering.
+-- ==================================================================
+
+do
+  local h = harness()
+
+  h.router:fire("rt", "llm", "generic-tool.ToolCalls", {
+    calls = { { id = "call-1", name = "bash", args = { command = "sleep 10" } } },
+  })
+  local invoke = find_kind(h.bus, "tool.invoke")
+  assert_true(invoke ~= nil, "run-tool put a tool.invoke on the bus")
+  local req_id = invoke.id
+
+  -- Terminate primitive: cancel the in-flight work, deliver NOTHING.
+  local cancelled = h.router:cancel_inflight()
+  assert_eq(cancelled, 1, "the one in-flight correlation was cancelled")
+
+  -- 1. real termination: a tool.cancel for the open correlation went on the bus.
+  local cancel = find_kind(h.bus, "tool.cancel")
+  assert_true(cancel ~= nil, "cancel_inflight emits a tool.cancel for the open correlation")
+  assert_eq(cancel.id, req_id, "the cancel targets the in-flight correlation id")
+  assert_eq(count_kind(h.bus, "tool.cancel"), 1, "exactly one cancel for the one correlation")
+
+  -- 2. NO re-fire: no tool result reached the sink — the llm gets no reply to
+  --    absorb and answer on. This is the difference from the graceful interrupt.
+  assert_eq(#h.provider_out, 0,
+    "cancel_inflight delivers no reply — the actor does not re-fire")
+
+  -- 3. the actors are untouched by the primitive itself (the HOST reaps the run
+  --    afterward via end_run — not this call).
+  assert_eq(h.inv.state_of("rt"), "alive", "cancel_inflight does not kill actors")
+end
+
 print("mag-kernel interrupt_test: all assertions passed")

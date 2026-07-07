@@ -575,18 +575,34 @@ function M:bus_response(response)
   return true
 end
 
--- Interrupt this run's in-flight work (control-plane double-Esc, NOT a kill).
--- For every OPEN capability correlation in this run:
---   1. emit a `tool.cancel { id = request_id }` on the bus so the real work
---      stops burning — the bridge routes it to the gate (a tool leg → the
---      owning source kills the child / cancels a sub-run) or to
---      `<provider>.chat.cancel` (a provider round). Real termination first.
+-- Cancel this run's in-flight work WITHOUT settling any correlation: emit a
+-- `tool.cancel { id = request_id }` for every OPEN capability correlation so the
+-- real work stops burning — the bridge routes each to the gate (a tool leg →
+-- the owning source kills the child / cancels a nested sub-run) or to
+-- `<provider>.chat.cancel` (a provider round). No reply is delivered, so no
+-- actor re-fires from this call. Returns the number of correlations cancelled.
+-- Shared by both interrupt paths: the graceful interrupt adds a settle on top;
+-- the terminating interrupt (a dispatched sub-run) cancels only, then the host
+-- ends the run failed — the run's llm never gets a reply to re-fire on.
+function M:cancel_inflight()
+  local ids = self.correlation:pending_ids()
+  for _, request_id in ipairs(ids) do
+    self.bus_emit({ kind = "tool.cancel", id = request_id })
+  end
+  return #ids
+end
+
+-- GRACEFUL interrupt of this run's in-flight work (double-Esc on the lead's OWN
+-- turn, NOT a kill). For every OPEN capability correlation in this run:
+--   1. cancel the real work (cancel_inflight above): a `tool.cancel` per
+--      correlation. Real termination first.
 --   2. settle the correlation by delivering a synthesized FAILED reply
 --      ("interrupted by user") through the EXISTING reply path (bus_response —
 --      close + reply activation). The failure lands on the emitting actor's
 --      pending completion in THIS run and routes onward exactly like any tool
 --      failure (run-tool → tool-result → llm re-fire; bash node → its failure
---      edge; llm → mag.failed). The run context stays alive.
+--      edge; llm → mag.failed). The run context stays alive and winds down to a
+--      real final answer — the no-amnesia path.
 -- Ids are snapshotted before settling: a settle may re-fire an actor and open
 -- a FRESH correlation (the lead llm's next provider round), which must NOT be
 -- interrupted — only the work in flight at interrupt time is. Returns the

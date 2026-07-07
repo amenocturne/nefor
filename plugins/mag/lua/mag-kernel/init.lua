@@ -437,18 +437,38 @@ return {
     return ctx.router:drain(id)
   end,
 
-  -- Interrupt a live run WITHOUT killing it (the control-plane double-Esc /
-  -- graceful interrupt — contrast end_run). Settles every in-flight capability
-  -- correlation in the run as a failed reply "interrupted by user" and emits a
+  -- Interrupt a live run's in-flight work. Two shapes, selected by `terminate`:
+  --
+  -- GRACEFUL (`terminate` falsy — the lead's OWN turn): settle every in-flight
+  -- capability correlation as a failed reply "interrupted by user" and emit a
   -- `tool.cancel` for each so the real work stops (routing.lua interrupt); the
   -- failure routes through the normal tool-failure path (run-tool → tool-result
-  -- → llm re-fire), so the run stays alive and winds down to a real final
-  -- answer. Returns { ok = true, interrupted = <count> }; an unknown run
-  -- rejects. A run with nothing in flight interrupts cleanly (count 0).
-  interrupt_run = function(run_id, failure)
+  -- → llm re-fire), so the run STAYS ALIVE and winds down to a real final
+  -- answer — the no-amnesia path. The host does not end the run; it settles on
+  -- its own completion. Returns { ok = true, interrupted = <count> }.
+  --
+  -- TERMINATING (`terminate` truthy — a dispatched sub-run): a dispatched run
+  -- is ephemeral (its only output is the relayed result), so an interrupt must
+  -- STOP it. Cancel the in-flight work (a `tool.cancel` per open correlation —
+  -- bash dies via killpg, a nested sub-run is interrupted down the chain) but
+  -- deliver NO reply, so the run's llm never re-fires to a "Completed" answer.
+  -- The host then ends the run FAILED. Returns { ok = true, interrupted =
+  -- <count>, terminated = true }. Unknown run rejects; nothing in flight → 0.
+  interrupt_run = function(run_id, failure, terminate)
     local ctx, err = context_of(run_id)
     if not ctx then
       return { ok = false, error = err }
+    end
+    if terminate then
+      local cancelled = ctx.router:cancel_inflight()
+      -- Observable marker; the host follows with end_run(failed) and a
+      -- `mag.run_result status:"failed"` — no re-fire, the run is over.
+      ctx.emit_event({
+        kind = "mag.run_interrupted",
+        interrupted = cancelled,
+        terminated = true,
+      })
+      return { ok = true, interrupted = cancelled, terminated = true }
     end
     local settled = ctx.router:interrupt(failure)
     -- Observable interrupt marker for the panel/transcript (run_id-stamped by

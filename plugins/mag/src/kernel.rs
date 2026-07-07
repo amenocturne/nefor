@@ -214,19 +214,34 @@ impl LuaHost {
         Ok(f.call::<bool>((run_id, reason.as_str()))?)
     }
 
-    /// Interrupt a live run WITHOUT killing it: settle every in-flight
-    /// capability correlation as a failed reply ("interrupted by user") and
-    /// emit a `tool.cancel` for each so the real work stops. The failure routes
-    /// through the normal tool-failure path and the run stays alive, winding
-    /// down to a real final answer (the graceful double-Esc path — contrast
-    /// [`LuaHost::end_run`]). Returns the number of correlations settled; an
-    /// unknown/ended run returns 0. The caller drains the emit queue (the
-    /// cancels + any re-fire the settle produced) and then settles the run if
-    /// it reached a terminal state (a provider-leg interrupt fails the run).
-    pub fn interrupt_run(&self, run_id: &str, failure: &str) -> Result<u64, MagError> {
+    /// Interrupt a live run's in-flight work. Two shapes selected by
+    /// `terminate`:
+    ///
+    /// * `terminate == false` (GRACEFUL — the lead's own turn): settle every
+    ///   in-flight capability correlation as a failed reply ("interrupted by
+    ///   user") and emit a `tool.cancel` for each. The failure routes through
+    ///   the normal tool-failure path and the run STAYS ALIVE, winding down to a
+    ///   real final answer (contrast [`LuaHost::end_run`]). The caller drains
+    ///   the emit queue (the cancels + any re-fire the settle produced) and
+    ///   settles the run only if it reached a terminal state.
+    /// * `terminate == true` (TERMINATING — a dispatched sub-run): emit a
+    ///   `tool.cancel` per open correlation so the real work dies, but deliver
+    ///   NO reply — the run's llm never re-fires. The caller then ends the run
+    ///   failed, so it settles `mag.run_result status:"failed"`.
+    ///
+    /// Returns `(count, terminated)`: correlations touched, and whether the
+    /// terminating path ran. An unknown/ended run returns `(0, false)`.
+    pub fn interrupt_run(
+        &self,
+        run_id: &str,
+        failure: &str,
+        terminate: bool,
+    ) -> Result<(u64, bool), MagError> {
         let f: Function = self.kernel.get("interrupt_run")?;
-        let res: Table = f.call::<Table>((run_id, failure))?;
-        Ok(res.get::<Option<u64>>("interrupted")?.unwrap_or(0))
+        let res: Table = f.call::<Table>((run_id, failure, terminate))?;
+        let count = res.get::<Option<u64>>("interrupted")?.unwrap_or(0);
+        let terminated = res.get::<Option<bool>>("terminated")?.unwrap_or(false);
+        Ok((count, terminated))
     }
 
     /// Deliver a correlated capability response (tool.result-shaped) back to

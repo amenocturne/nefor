@@ -111,18 +111,24 @@ const APPLIED_KIND: &str = "mag.applied";
 /// not live is a logged no-op (monotone lifecycles: kill on dead, no-op).
 const KILL_RUN_KIND: &str = "mag.kill_run";
 
-/// Interrupt a live run WITHOUT killing it — the control plane's graceful
-/// double-Esc surface. Settles every in-flight capability correlation as a
-/// failed reply ("interrupted by user") and cancels the real work
-/// (subprocess / provider round), then lets the run wind down normally: the
-/// lead llm re-fires with the interrupted tool result and produces a real
-/// final answer, so the turn completes (`mag.run_result status:"completed"`)
-/// and history records itself — no killed-without-record turn, no amnesia.
-/// The run's context stays alive; an interrupt for a run that is not live is a
-/// logged no-op.
+/// Interrupt a live run — the control plane's double-Esc surface. Carries an
+/// optional `terminate` flag selecting the semantics (see `handle_interrupt_run`):
+///
+/// * `terminate` absent/false — GRACEFUL (the lead's OWN turn): settle every
+///   in-flight capability as "interrupted by user" and cancel the real work,
+///   then let the run wind down normally — the lead llm re-fires with the
+///   interrupted tool result and produces a real final answer, so the turn
+///   completes (`status:"completed"`) and history records itself (no amnesia).
+///   The run's context stays alive.
+/// * `terminate == true` — TERMINATING (a dispatched sub-run): cancel the
+///   in-flight work but deliver no reply, then END the run FAILED
+///   (`status:"failed"`). The run's llm never re-fires; the failure relays to
+///   the lead. A dispatched run is ephemeral, so an interrupt must stop it.
+///
+/// An interrupt for a run that is not live is a logged no-op.
 const INTERRUPT_RUN_KIND: &str = "mag.interrupt_run";
 
-/// The failure detail a graceful interrupt settles in-flight capabilities with.
+/// The failure detail an interrupt settles in-flight capabilities with.
 const INTERRUPT_FAILURE: &str = "interrupted by user";
 
 /// Correlation id echoed by capability responses (tool.result). The kernel
@@ -783,14 +789,26 @@ async fn handle_kill_run(
     send_event(out_tx, run_result_killed(a.in_reply_to.as_deref(), run_id)).await
 }
 
-/// Interrupt one live run gracefully (the double-Esc path). Settles its
-/// in-flight capabilities as "interrupted by user" and cancels the real work;
-/// the run SURVIVES, so — unlike `handle_kill_run` — the `active` entry is
-/// kept. Flushing forwards the cancels (to the gate / provider) and any
-/// re-fire the settle produced (the lead llm's fresh provider round). A
-/// provider-leg interrupt fails the run synchronously, so settle_run after the
-/// flush closes it; the tool-leg case leaves the run pending on its re-fire and
-/// settle_run is a no-op there. Not live → logged no-op.
+/// Interrupt one live run. `mag.interrupt_run` carries an optional `terminate`
+/// flag that selects between two semantics:
+///
+/// * `terminate` absent/false — GRACEFUL (the lead's OWN turn). Settle the
+///   in-flight capabilities as "interrupted by user" and cancel the real work;
+///   the run SURVIVES, so — unlike `handle_kill_run` — the `active` entry is
+///   kept. Flushing forwards the cancels and any re-fire the settle produced
+///   (the lead llm's fresh provider round). A provider-leg interrupt fails the
+///   run synchronously, so `settle_run` after the flush closes it; the tool-leg
+///   case leaves the run pending on its re-fire and `settle_run` is a no-op.
+///
+/// * `terminate == true` — TERMINATING (a dispatched sub-run). The run is
+///   ephemeral, so the interrupt STOPS it: cancel the in-flight work (a
+///   `tool.cancel` per open correlation → bash dies via killpg, a nested
+///   sub-run is interrupted down the chain) but deliver NO reply, then END the
+///   run FAILED. The run's llm never re-fires to a "Completed" answer; the
+///   terminal `mag.run_result status:"failed"` relays "interrupted by user" to
+///   the lead. Mirrors `handle_kill_run`'s reap-then-terminal-reply ordering.
+///
+/// A run that is not live is a logged no-op.
 async fn handle_interrupt_run(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: &Map<String, Value>,
@@ -802,11 +820,40 @@ async fn handle_interrupt_run(
         Some(r) => r.to_owned(),
         None => return Ok(()),
     };
+    let terminate = body
+        .get("terminate")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if terminate {
+        // A dispatched sub-run: cancel the in-flight work then reap the run so
+        // no actor re-fires, and settle the pending execute FAILED. The cancels
+        // (our explicit `tool.cancel` + the reap's kill-time aborts) flush
+        // BEFORE the terminal reply — a consumer that treats the reply as "run
+        // closed" observes the aborts first.
+        let a = match active.remove(&run_id) {
+            Some(a) => a,
+            None => {
+                tracing::info!(run_id = %run_id, "mag.interrupt_run(terminate) for a run that is not live; no-op");
+                return Ok(());
+            }
+        };
+        let (cancelled, _) = host.interrupt_run(&run_id, INTERRUPT_FAILURE, true)?;
+        host.end_run(&run_id, TeardownReason::RunFailed)?;
+        tracing::info!(run_id = %run_id, cancelled, "mag.interrupt_run(terminate): in-flight cancelled, run ended failed");
+        flush_emits(out_tx, host, bridge).await?;
+        return send_event(
+            out_tx,
+            run_result_failed(a.in_reply_to.as_deref(), &run_id, INTERRUPT_FAILURE),
+        )
+        .await;
+    }
+
     if !active.contains_key(&run_id) {
         tracing::info!(run_id = %run_id, "mag.interrupt_run for a run that is not live; no-op");
         return Ok(());
     }
-    let settled = host.interrupt_run(&run_id, INTERRUPT_FAILURE)?;
+    let (settled, _) = host.interrupt_run(&run_id, INTERRUPT_FAILURE, false)?;
     tracing::info!(run_id = %run_id, settled, "mag.interrupt_run: in-flight capabilities settled as interrupted");
     flush_emits(out_tx, host, bridge).await?;
     // The run stays alive on the tool leg (re-fire pending); a provider-leg
