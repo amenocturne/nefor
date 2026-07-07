@@ -72,6 +72,12 @@ fmt:
 build:
     cargo build --workspace --release
 
+# Print the workspace version — the single source of truth (Cargo.toml
+# [workspace.package]). The pre-push hook derives the release tag from this, so
+# bumping it here (and pushing) is all it takes to cut v<version>.
+version:
+    @cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="nefor") | .version'
+
 # Composite: install-nefor + install-starter. End-to-end first-time setup. `channel` (source|latest|nightly) forwards to install-nefor; `mode` (safe|force) forwards to install-starter.
 install channel="source" mode="safe": (install-nefor channel) (install-starter mode)
     @echo

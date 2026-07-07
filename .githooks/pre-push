@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -eu
 
+# Skip the recursive invocation triggered by the auto-tag push below — no point
+# re-running the whole suite just to push a tag ref.
+[ -n "${NEFOR_AUTOTAG_PUSHING:-}" ] && exit 0
+
 echo "pre-push: running clippy..."
 cargo clippy --workspace --all-targets -- -D warnings
 
@@ -8,3 +12,23 @@ echo "pre-push: running tests..."
 just test
 
 echo "pre-push: all checks passed."
+
+# Auto-tag releases from the single source of truth: the workspace version in
+# Cargo.toml as committed at HEAD. If that version is not yet tagged anywhere in
+# history, tag HEAD v<version> and push the tag alongside. The tag is a pure
+# function of the committed version, so the two can never drift (the old failure
+# mode: Cargo said 0.2.0 while the latest tag was v0.3.0). Runs only after the
+# checks pass, so a tag never lands on a red commit.
+remote="$1"
+version="$(git show HEAD:Cargo.toml 2>/dev/null \
+  | sed -n '/^\[workspace\.package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' | head -1)"
+if [ -n "$version" ] && ! git rev-parse -q --verify "refs/tags/v${version}" >/dev/null; then
+  tag="v${version}"
+  echo "pre-push: ${version} is untagged — tagging HEAD ${tag}"
+  git tag -a "${tag}" -m "Release ${tag}"
+  if NEFOR_AUTOTAG_PUSHING=1 git push "${remote}" "refs/tags/${tag}"; then
+    echo "pre-push: pushed ${tag}"
+  else
+    echo "pre-push: ${tag} created locally but tag push failed — push it manually" >&2
+  fi
+fi
