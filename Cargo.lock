@@ -128,7 +128,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "basic-tools-plugin"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "grep-regex",
@@ -221,7 +221,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chatgpt-provider"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -628,7 +628,7 @@ checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 
 [[package]]
 name = "fake-engine"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "generic-provider"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "nefor-plugin-sdk",
  "nefor-protocol",
@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "generic-tool"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "nefor-plugin-sdk",
  "nefor-protocol",
@@ -1438,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "mag-plugin"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "mlua",
@@ -1533,7 +1533,7 @@ dependencies = [
 
 [[package]]
 name = "mock-plugin"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "mlua",
@@ -1565,7 +1565,7 @@ checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
 
 [[package]]
 name = "nefor"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1585,7 +1585,7 @@ dependencies = [
 
 [[package]]
 name = "nefor-mag"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "pretty_assertions",
@@ -1597,7 +1597,7 @@ dependencies = [
 
 [[package]]
 name = "nefor-plugin-sdk"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "nefor-protocol",
  "serde_json",
@@ -1608,7 +1608,7 @@ dependencies = [
 
 [[package]]
 name = "nefor-protocol"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "semver",
  "serde",
@@ -1619,7 +1619,7 @@ dependencies = [
 
 [[package]]
 name = "nefor-sse"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "thiserror 2.0.18",
@@ -1627,7 +1627,7 @@ dependencies = [
 
 [[package]]
 name = "nefor-tui"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1760,7 +1760,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openai-provider"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "futures-util",
@@ -2666,7 +2666,7 @@ dependencies = [
 
 [[package]]
 name = "tool-gate-plugin"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "nefor-plugin-sdk",
