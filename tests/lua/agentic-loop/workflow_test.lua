@@ -550,6 +550,30 @@ do
     "the relay turn carries the run output")
 end
 
+-- (relay of interruption) an INTERRUPTED dispatched run settles failed
+-- "interrupted by user"; the relay must carry that into the lead's next turn
+-- so a double-Esc cancellation is never a silent disappearance.
+do
+  fresh_loop()
+  local exec = begin_bound_turn("prime", "r11")
+  send_to_loop("mag", {
+    kind = "mag.run_result", run_id = exec.body.run_id,
+    status = "completed", result = { text = "primed" },
+  })
+  _test.calls_clear()
+  agentic_loop.relay_run_completion({
+    run_id = "mag-sub-int", status = "failed", error = "interrupted by user",
+  })
+  local calls = decode_calls()
+  local exec2 = find_kind(calls, "mag.execute")
+  assert(exec2 ~= nil, "an idle lead relays the interrupted failure immediately")
+  local prompt = exec2.body.modification.messages[1].content.prompt
+  assert(string.find(prompt, "FAILED", 1, true) ~= nil,
+    "the relay turn marks the interrupted run as FAILED")
+  assert(string.find(prompt, "interrupted by user", 1, true) ~= nil,
+    "the relay turn carries the interruption reason")
+end
+
 -- (replay gating + history rebuild) replayed input envelopes must not
 -- re-orchestrate; replayed turn_recorded markers rebuild the canonical
 -- history the next live turn seeds.

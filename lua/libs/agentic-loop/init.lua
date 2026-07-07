@@ -570,7 +570,19 @@ end
 -- `agentic_loop.turn_recorded` rides the bus. That is what structurally kills
 -- the amnesia: there is no killed-without-record turn on this path.
 local function interrupt_active_lead_run()
-  if state.current_run_id == nil then return false end
+  if state.current_run_id == nil then
+    -- The lead is idle: it dispatched fire-and-forget sub-runs (the `mag`
+    -- execute tool acks "executing" and the turn completes) and is no longer
+    -- blocked on anything this entry point can see. Those detached runs are
+    -- interrupted by lead-workflow's own `chat.interrupt_all` subscription
+    -- (it owns state.active_runs). Log so the next live repro is diagnosable
+    -- without a full trace — an interrupt landing here is expected whenever the
+    -- churning work is detached rather than a direct lead tool call.
+    nefor.log.warn(
+      "agentic-loop: interrupt with no active lead run — lead is idle; " ..
+      "detached dispatched runs are interrupted by lead-workflow", {})
+    return false
+  end
   emit("mag", { kind = "mag.interrupt_run", run_id = state.current_run_id })
   nefor.log.info("agentic-loop: graceful interrupt requested for active lead run", {
     run_id = state.current_run_id,

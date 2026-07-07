@@ -1207,3 +1207,120 @@ do
 
   mag_eval._internals.state.pending_runs = {}
 end
+
+-- ------------------------------------------------------------------
+-- double-Esc interrupts DETACHED dispatched runs (the tag-blocking incident)
+-- ------------------------------------------------------------------
+--
+-- The `mag` execute tool is FIRE-AND-FORGET: it acks "executing" at dispatch
+-- and the lead's turn completes and goes idle while the sub-run churns. When
+-- the user double-Escs, the agentic-loop's own interrupt sees NOTHING (the lead
+-- is not blocked on a current_run_id), so the detached runs would sail on — the
+-- verified incident. lead-workflow owns state.active_runs, so its own
+-- `chat.interrupt_all` subscription interrupts EACH detached run. This is the
+-- end-to-end test whose absence let the bug ship.
+do
+  fresh()
+  -- Dispatch two detached runs through the real load/execute handshake. Clear
+  -- the call log between them so feed_loaded matches each run's own mag.load
+  -- (both are on the bus otherwise, and the matcher takes the first).
+  write_mag_file("firing-a", "run-a.mag", READ_ONLY_MAG)
+  execute_mag("firing-exec-a", "run-a.mag")
+  feed_loaded(read_only_modification())
+  _test.calls_clear()
+  write_mag_file("firing-b", "run-b.mag", READ_ONLY_MAG)
+  execute_mag("firing-exec-b", "run-b.mag")
+  feed_loaded(read_only_modification())
+
+  local run_ids = {}
+  for id, _ in pairs(lw._internals.state.active_runs) do run_ids[#run_ids + 1] = id end
+  assert_eq(#run_ids, 2, "two detached dispatched runs are tracked in active_runs")
+  _test.calls_clear()
+
+  -- Double-Esc while the lead is idle. nefor-tui broadcasts chat.interrupt_all.
+  feed("nefor-tui", { kind = "chat.interrupt_all" })
+
+  local interrupts = find_calls(decode_calls(), function(c)
+    return c.body.kind == "mag.interrupt_run" and c.target == "mag"
+  end)
+  assert_eq(#interrupts, 2,
+    "interrupt_all interrupts EVERY detached run; got " .. json.encode(_test.calls()))
+  local hit = {}
+  for _, c in ipairs(interrupts) do hit[c.body.run_id] = true end
+  for _, rid in ipairs(run_ids) do
+    assert_true(hit[rid], "detached run " .. rid .. " was interrupted by double-Esc")
+  end
+end
+
+-- (relay of interruption) An interrupted dispatched run settles failed
+-- "interrupted by user"; that failure must reach the lead's next turn through
+-- the relay — never a silent disappearance (the no-amnesia principle). Spies
+-- the relay to prove the failure crosses the layer boundary intact.
+do
+  fresh()
+  write_mag_file("firing-relay", "relay.mag", READ_ONLY_MAG)
+  execute_mag("firing-exec-relay", "relay.mag")
+  feed_loaded(read_only_modification())
+  local run_id = next(lw._internals.state.active_runs)
+  assert_true(type(run_id) == "string", "a run is tracked after dispatch")
+
+  local captured
+  local orig = agentic_loop.relay_run_completion
+  agentic_loop.relay_run_completion = function(c) captured = c end
+  _test.calls_clear()
+
+  feed("mag", {
+    kind = "mag.run_result", run_id = run_id,
+    status = "failed", error = "interrupted by user",
+  })
+  agentic_loop.relay_run_completion = orig
+
+  assert_true(captured ~= nil,
+    "the interrupted run's failure reaches agentic-loop's relay")
+  assert_eq(captured.status, "failed", "relay carries the failed status")
+  assert_true(type(captured.error) == "string"
+    and captured.error:find("interrupted by user") ~= nil,
+    "relay carries the interruption reason — not a silent drop")
+  assert_eq(next(lw._internals.state.active_runs), nil,
+    "the interrupted run is closed out of active_runs")
+end
+
+-- (mag execute dispatch cancel propagation) A `tool.cancel` addressed to a
+-- `mag` execute DISPATCH firing propagates into that detached run —
+-- completeness for the general cancel route, mirroring mag-eval.cancel for
+-- blocking firings.
+do
+  fresh()
+  write_mag_file("firing-c", "run-c.mag", READ_ONLY_MAG)
+  execute_mag("firing-exec-c", "run-c.mag")
+  feed_loaded(read_only_modification())
+  local run_id = next(lw._internals.state.active_runs)
+  local run = lw._internals.state.active_runs[run_id]
+  assert_eq(run.dispatch_firing_id, "firing-exec-c",
+    "the run records its dispatch firing id")
+  _test.calls_clear()
+
+  feed("tool-gate", { kind = "lead-workflow.tool.cancel", id = "firing-exec-c" })
+  local interrupt = find_call(decode_calls(), function(c)
+    return c.body.kind == "mag.interrupt_run" and c.target == "mag"
+       and c.body.run_id == run_id
+  end)
+  assert_true(interrupt ~= nil,
+    "a cancel for the dispatch firing interrupts the detached run")
+
+  _test.calls_clear()
+  feed("tool-gate", { kind = "lead-workflow.tool.cancel", id = "firing-nope" })
+  assert_eq(find_call(decode_calls(), function(c)
+    return c.body.kind == "mag.interrupt_run"
+  end), nil, "a cancel for an unknown firing emits no interrupt")
+end
+
+-- (interrupt_all with nothing dispatched is a clean no-op)
+do
+  fresh()
+  _test.calls_clear()
+  feed("nefor-tui", { kind = "chat.interrupt_all" })
+  assert_eq(find_call(decode_calls(), function(c)
+    return c.body.kind == "mag.interrupt_run"
+  end), nil, "no active runs → interrupt_all emits nothing")
+end

@@ -1071,6 +1071,51 @@ local function handle_mag_run_result(body)
   relay_kernel_completion(run_id, true, body.output_path, content, nil)
 end
 
+-- Double-Esc entry point (`chat.interrupt_all`). The `mag` execute tool is
+-- FIRE-AND-FORGET: it dispatches a detached sub-run into state.active_runs and
+-- acks "executing" at once, so the lead's turn completes and goes idle while
+-- the sub-run keeps churning. The agentic-loop's own interrupt only sees a run
+-- the lead is BLOCKED on (current_run_id), so those detached runs would sail on
+-- untouched — the incident. lead-workflow owns state.active_runs, so it
+-- interrupts EACH live dispatched run directly: `mag.interrupt_run` makes the
+-- kernel settle that run's in-flight capability as a failed "interrupted by
+-- user" reply and emit a `tool.cancel` for it (the bash's process group dies).
+-- The terminal failed `mag.run_result` then relays into the lead's next turn
+-- (handle_mag_run_result → relay_kernel_completion), so the cancellation is
+-- never a silent disappearance. Idempotent: a run with nothing in flight
+-- settles 0, and a run also hit by the agentic-loop path is a kernel no-op the
+-- second time (the correlation is already closed).
+local function interrupt_active_runs()
+  local ids = {}
+  for run_id, _ in pairs(state.active_runs) do ids[#ids + 1] = run_id end
+  table.sort(ids)
+  for _, run_id in ipairs(ids) do
+    emit_as(SOURCE_NAME, "mag", { kind = "mag.interrupt_run", run_id = run_id })
+  end
+  nefor.log.info("lead-workflow: interrupt_all — interrupted active dispatched runs", {
+    count = #ids,
+  })
+  return #ids
+end
+
+-- Completeness for the general cancel route: a `tool.cancel` addressed to a
+-- `mag` execute DISPATCH firing (the correlation that acked "executing")
+-- propagates into that run just like the interrupt_all entry point. The mag
+-- execute firing is acked at dispatch, so the kernel rarely emits a cancel for
+-- it — this covers the case where it does, matching mag-eval.cancel's shape for
+-- blocking firings. Returns true when a matching run was found.
+local function interrupt_run_by_dispatch_firing(firing_id)
+  if type(firing_id) ~= "string" then return false end
+  local hit = false
+  for run_id, run in pairs(state.active_runs) do
+    if run.dispatch_firing_id == firing_id then
+      emit_as(SOURCE_NAME, "mag", { kind = "mag.interrupt_run", run_id = run_id })
+      hit = true
+    end
+  end
+  return hit
+end
+
 terminate_graph = function(firing_id, args)
   local run_id = args and args.run_id
   if type(run_id) ~= "string" or run_id == "" then
@@ -1529,13 +1574,27 @@ local function receive_msg(entry)
     return
   end
 
-  -- The gate forwards a `tool.cancel` for a mag-eval firing here when the
-  -- lead's graceful interrupt cancels it: propagate the cancel down into the
-  -- dispatched sub-run (mag-eval.cancel → mag.interrupt_run), killing its
-  -- in-flight bash. Live path only.
+  -- Double-Esc: interrupt every live dispatched run. The lead is typically
+  -- IDLE here (its `mag` execute dispatches are fire-and-forget), so the
+  -- agentic-loop's own interrupt sees nothing — this is the entry point that
+  -- reaches the detached runs the user is actually trying to stop. Live path
+  -- only (nefor-tui emits it; replay never does).
+  if kind == "chat.interrupt_all" then
+    if replay_window.active() then return end
+    interrupt_active_runs()
+    return
+  end
+
+  -- The gate forwards a `tool.cancel` for one of our firings here when a
+  -- graceful interrupt cancels it. Two firing shapes propagate down:
+  --   * a mag-eval blocking firing → its dispatched sub-run (mag-eval.cancel)
+  --   * a `mag` execute dispatch firing → its fire-and-forget run
+  -- Both resolve to `mag.interrupt_run`, killing the run's in-flight bash. Live
+  -- path only.
   if kind == "lead-workflow.tool.cancel" then
     if replay_window.active() then return end
     mag_eval.cancel(body.id)
+    interrupt_run_by_dispatch_firing(body.id)
     return
   end
 
