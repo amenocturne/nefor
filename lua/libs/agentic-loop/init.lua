@@ -783,6 +783,36 @@ local function mag_result_text(result)
   return nil
 end
 
+-- Commit one turn to the canonical conversation history and log the durable
+-- `turn_recorded` marker (replayed on /resume to rebuild state.history). Every
+-- terminal path that must preserve context routes through here: a completed
+-- turn records its real answer; a killed/failed turn records a placeholder so
+-- the user's message never silently vanishes from the next turn's seed. Skips
+-- empty user_text (a relay/system turn with no message to preserve).
+local function record_turn(run_id, user_text, answer)
+  if type(user_text) ~= "string" or #user_text == 0 then return end
+  state.history[#state.history + 1] = { role = "user", content = user_text }
+  state.history[#state.history + 1] = { role = "assistant", content = answer }
+  emit(nil, {
+    kind   = "agentic_loop.turn_recorded",
+    run_id = run_id,
+    user   = user_text,
+    answer = answer,
+  })
+end
+
+-- The assistant-slot placeholder for a turn that ended without a real answer.
+-- A user-initiated interrupt (single-Esc kill or the graceful "interrupted by
+-- user" settle) records the same honest marker the user saw; any other failure
+-- records its error so the next turn can see what broke.
+local function aborted_turn_marker(err)
+  local text = tostring(err or "")
+  if #text == 0 or text:find("interrupt", 1, true) then
+    return "[interrupted by user]"
+  end
+  return "[turn failed: " .. text .. "]"
+end
+
 -- Terminal close of the lead's turn-program.
 --   completed — the answer already painted into the transcript via the
 --     prefix-bound stream (exactly how the lead's final answer renders
@@ -790,8 +820,12 @@ end
 --     is appended so the turn is never silently empty. Canonical history
 --     gains the `{ user, answer }` pair, and a turn_recorded marker rides
 --     the bus so /resume can rebuild it.
---   failed — surfaced in chat as a system line (no silent nothing).
---   killed — turn aborted (Esc): no history append, no transcript append.
+--   failed — surfaced in chat as a system line, AND the turn is recorded
+--     with a placeholder answer so context survives (an interrupted lead
+--     turn settles here; without the record the next turn seeds blind).
+--   killed — turn aborted (single-Esc / hard kill): no transcript append,
+--     but the turn IS recorded with an interrupted placeholder so the
+--     user's message survives into the next turn's seed.
 local function handle_mag_run_result(body)
   local turn = state.current_turn
   if turn == nil or body.run_id ~= turn.run_id then return end
@@ -801,16 +835,7 @@ local function handle_mag_run_result(body)
 
   if body.status == "completed" then
     local answer = mag_result_text(body.result) or ""
-    state.history[#state.history + 1] = { role = "user", content = turn.user_text }
-    state.history[#state.history + 1] = { role = "assistant", content = answer }
-    -- Durable marker: the canonical history delta for this turn. Replayed
-    -- on /resume to rebuild state.history (receive_msg below).
-    emit(nil, {
-      kind   = "agentic_loop.turn_recorded",
-      run_id = run_id,
-      user   = turn.user_text,
-      answer = answer,
-    })
+    record_turn(run_id, turn.user_text, answer)
     if not turn.streamed and #answer > 0 then
       emit("nefor-tui", {
         kind = "chat.message.append",
@@ -830,7 +855,14 @@ local function handle_mag_run_result(body)
   end
 
   if body.status == "killed" then
-    nefor.log.info("agentic-loop: lead turn killed", { run_id = run_id })
+    -- A killed turn (single-Esc / hard kill) still preserves context: the
+    -- user's message plus an interrupted placeholder land in history so the
+    -- next turn is not seeded blind. The transcript already carries the
+    -- interrupt notice from cancel_all.
+    record_turn(run_id, turn.user_text, aborted_turn_marker(body.error))
+    nefor.log.info("agentic-loop: lead turn killed", {
+      run_id = run_id, history_len = #state.history,
+    })
     fire_observers(state.complete_observers, run_id, "killed")
     if #state.pending_user_inputs > 0 then
       flush_pending_user_inputs()
@@ -847,8 +879,13 @@ local function handle_mag_run_result(body)
     role = "system",
     text = err_text,
   })
+  -- Preserve context: record the turn with a placeholder answer so the user's
+  -- message survives into the next turn's seed (an interrupted lead turn
+  -- settles here). Without this the next turn seeds blind — the amnesia bug.
+  record_turn(run_id, turn.user_text, aborted_turn_marker(body.error))
   nefor.log.warn("agentic-loop: lead turn failed", {
     run_id = run_id, error = body.error, status = body.status,
+    history_len = #state.history,
   })
   fire_observers(state.complete_observers, run_id, tostring(body.status))
   flush_deferred()

@@ -404,8 +404,9 @@ do
   assert_eq(appended.target, "nefor-tui", "answer append targets the TUI")
 end
 
--- (failure surfaces) a failed run puts the error in chat — no silent
--- nothing — and appends no history.
+-- (failure surfaces + preserves context) a failed run puts the error in chat
+-- — no silent nothing — AND records the turn with a placeholder answer so the
+-- user's message survives into the next turn's seed (context never vanishes).
 do
   fresh_loop()
   local exec = begin_bound_turn("doomed", "r4")
@@ -416,14 +417,40 @@ do
   local calls = decode_calls()
   local err_line = find_call(calls, "chat.message.append", "system", "provider exploded")
   assert(err_line ~= nil, "failed turn surfaces the error in chat")
-  assert_eq(#agentic_loop.history(), 0, "failed turn appends no history")
+  local history = agentic_loop.history()
+  assert_eq(#history, 2, "failed turn records {user, placeholder} so context survives")
+  assert_eq(history[1].content, "doomed", "failed turn preserves the user message")
+  assert_eq(history[2].content, "[turn failed: provider exploded]",
+    "a non-interrupt failure records its error as the placeholder answer")
+  local recorded = find_kind(calls, "agentic_loop.turn_recorded")
+  assert(recorded ~= nil, "failed turn emits its turn_recorded marker for /resume")
   -- The loop is free again.
   local exec2 = begin_turn("retry")
   assert(exec2 ~= nil, "a failed turn releases the single-flight slot")
 end
 
--- (interrupt = kill) Esc kills the active run via the kernel kill
--- machinery; the killed terminal reply aborts the turn without history.
+-- (interrupt preserves context) an interrupted lead turn settles failed with
+-- an "interrupted by user" error; it records the honest interrupt placeholder
+-- (not the raw error string) so the next turn sees the message was interrupted.
+do
+  fresh_loop()
+  local exec = begin_bound_turn("I'm testing interrupts", "r4b")
+  send_to_loop("mag", {
+    kind = "mag.run_result", run_id = exec.body.run_id,
+    status = "failed", error = "interrupted by user",
+  })
+  local history = agentic_loop.history()
+  assert_eq(#history, 2, "interrupted turn records {user, placeholder}")
+  assert_eq(history[1].content, "I'm testing interrupts",
+    "interrupted turn preserves the user message — no amnesia")
+  assert_eq(history[2].content, "[interrupted by user]",
+    "an interrupt-origin failure records the interrupt marker, not the raw error")
+end
+
+-- (single-Esc kill preserves context) Esc kills the active run via the kernel
+-- kill machinery; the killed terminal reply aborts the turn but STILL records
+-- the user's message with an interrupt placeholder — a killed turn must not
+-- seed the next turn blind (the amnesia the user hit on a real interrupt).
 do
   fresh_loop()
   local exec = begin_bound_turn("kill me", "r5")
@@ -439,16 +466,25 @@ do
     kind = "mag.run_result", run_id = exec.body.run_id, status = "killed",
   })
   calls = decode_calls()
-  assert_eq(#agentic_loop.history(), 0, "killed turn appends no history")
-  assert_eq(find_kind(calls, "agentic_loop.turn_recorded"), nil,
-    "killed turn records no marker")
+  local history = agentic_loop.history()
+  assert_eq(#history, 2, "killed turn records {user, placeholder} so context survives")
+  assert_eq(history[1].content, "kill me", "killed turn preserves the user message")
+  assert_eq(history[2].content, "[interrupted by user]",
+    "killed turn records the interrupt placeholder as the answer")
+  assert(find_kind(calls, "agentic_loop.turn_recorded") ~= nil,
+    "killed turn emits its turn_recorded marker for /resume")
+  -- A killed turn stays quiet in the transcript (the interrupt notice already
+  -- rode cancel_all) — only the history store is fed.
   assert_eq(find_call(calls, "chat.message.append", "assistant"), nil,
-    "killed turn appends no answer")
+    "killed turn appends no assistant line to the transcript")
   local idle = find_kind(calls, "agentic_loop.runtime_state")
   assert(idle ~= nil and idle.body.state == "idle" and idle.body.reason == "cancelled",
     "killed turn settles the statusline as cancelled")
-  -- The loop is free again.
-  assert(begin_turn("after kill") ~= nil, "a killed turn releases the slot")
+  -- The loop is free again, and the next turn seeds the preserved context.
+  local exec_after = begin_turn("after kill")
+  assert(exec_after ~= nil, "a killed turn releases the slot")
+  assert_eq(#exec_after.body.params_overlay["lead.llm"].history, 2,
+    "the turn after a kill seeds the preserved {user, placeholder} pair")
 end
 
 -- (queued promotion) messages submitted while busy queue, then promote
