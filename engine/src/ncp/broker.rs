@@ -287,6 +287,12 @@ pub struct Broker {
     exit_code_slot: Arc<std::sync::atomic::AtomicI32>,
     /// Latch: true once `nefor.engine.exit` fired at least once.
     exit_fired: Arc<std::sync::atomic::AtomicBool>,
+    /// Plugins that exited abnormally (crash / unobservable exit), in exit
+    /// order. Shared out via [`Broker::abnormal_exits_handle`] so the CLI
+    /// can print a terminal-visible summary after `run()` consumes the
+    /// broker — ERROR log lines emitted during the run may be erased by a
+    /// TUI plugin's alternate-screen teardown.
+    abnormal_exits: Arc<std::sync::Mutex<Vec<(String, &'static str)>>>,
 }
 
 /// Outcome of the broker's run loop.
@@ -338,7 +344,14 @@ impl Broker {
             pending_engine_envelopes: Vec::new(),
             exit_code_slot,
             exit_fired,
+            abnormal_exits: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Handle to the abnormal-exit record. Clone before `run()` — the run
+    /// loop consumes the broker — and read after it returns.
+    pub fn abnormal_exits_handle(&self) -> Arc<std::sync::Mutex<Vec<(String, &'static str)>>> {
+        Arc::clone(&self.abnormal_exits)
     }
 
     /// Read the exit code requested by `nefor.engine.exit`. Returns 0 if
@@ -780,19 +793,28 @@ impl Broker {
         // arm is already guarded against double-arming, and try_send
         // failing (channel full / closed) means a shutdown is already
         // in flight.
+        // Clean exits are normal lifecycle; crashes and unobservable exits
+        // are failures. `should_emit` doubles as the abnormal-exit record
+        // trigger so the CLI can print a summary after the run.
+        let (code, should_emit) = match outcome {
+            ExitOutcome::CleanExit => ("clean_exit", false),
+            ExitOutcome::Crash => ("crash", true),
+            ExitOutcome::Evicted => ("evicted", false),
+            ExitOutcome::Unknown => ("unknown_exit", true),
+        };
+        if should_emit && !name.is_empty() {
+            match self.abnormal_exits.lock() {
+                Ok(mut v) => v.push((name.clone(), code)),
+                Err(p) => p.into_inner().push((name.clone(), code)),
+            }
+        }
+
         if !self.conns_by_id.is_empty() {
             // Surface abnormal exits as engine-originated `engine.plugin_failed`
             // envelopes BEFORE triggering shutdown so dispatch has a chance to
             // translate them into peer-targeted notifications (e.g. a
             // `chat.popup` to nefor-chat) while that peer's writer queue is
-            // still open. Clean exits don't get a synthetic event — they are
-            // normal lifecycle and shouldn't surface as failures.
-            let (code, should_emit) = match outcome {
-                ExitOutcome::CleanExit => ("clean_exit", false),
-                ExitOutcome::Crash => ("crash", true),
-                ExitOutcome::Evicted => ("evicted", false),
-                ExitOutcome::Unknown => ("unknown_exit", true),
-            };
+            // still open.
             if should_emit && !name.is_empty() {
                 self.queue_engine_envelope(serde_json::json!({
                     "kind":   "engine.plugin_failed",

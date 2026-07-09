@@ -170,7 +170,9 @@ async fn main() -> anyhow::Result<()> {
         .context("caching dispatch function from init.lua")?;
 
     match mode {
-        EngineMode::Serve => run_serve(host, plugins, shared, args.plugin_dir.clone()).await,
+        EngineMode::Serve => {
+            run_serve(host, plugins, shared, args.plugin_dir.clone(), &log_path).await
+        }
         EngineMode::PluginList => run_plugin_list(plugins),
         EngineMode::PluginDispatch { name, args: argv } => {
             run_plugin_dispatch(host, plugins, shared, args.plugin_dir.clone(), name, argv).await
@@ -184,6 +186,7 @@ async fn run_serve(
     plugins: SharedPluginRegistry,
     shared: Arc<Mutex<BrokerShared>>,
     plugin_dir_override: Option<std::path::PathBuf>,
+    log_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     let specs = drain_specs(&plugins);
 
@@ -209,6 +212,7 @@ async fn run_serve(
     let mut broker = Broker::new(Arc::clone(&shared), host);
     spawn_specs(&mut broker, &specs, &plugin_root);
 
+    let abnormal_exits = broker.abnormal_exits_handle();
     let shutdown = broker.shutdown_handle();
     let ctrl_c_task = tokio::spawn(async move {
         if let Ok(()) = tokio::signal::ctrl_c().await {
@@ -222,6 +226,20 @@ async fn run_serve(
     let stop_reason = broker.run().await;
     tracing::info!(?stop_reason, "broker stopped");
     ctrl_c_task.abort();
+
+    // Abnormal exits reported here, after the broker (and any TUI plugin's
+    // alternate screen) is gone — ERROR lines mirrored to stderr during the
+    // run get erased by the TUI's screen restore, leaving a silent exit.
+    let exits = match abnormal_exits.lock() {
+        Ok(g) => g.clone(),
+        Err(p) => p.into_inner().clone(),
+    };
+    for (name, code) in &exits {
+        eprintln!(
+            "nefor: plugin '{name}' exited abnormally ({code}); see {} for details",
+            log_path.display()
+        );
+    }
 
     Ok(())
 }
