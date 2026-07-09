@@ -513,4 +513,9 @@ actor.spawn(tools.basic_actor_spec())
 actor.spawn(require("libs.compositors.chat_bridge").spawn_spec({
   bin("nefor-tui"),
   "--script", STARTER_UPSTREAM .. "/chat/init.lua",
+  -- Thread the resolved lua/ tree explicitly (same contract as mag's
+  -- --lua-root above). NEFOR_DEV_DIR read from .env.local is a Lua value,
+  -- not process env — without this argv the TUI's chat script cannot see
+  -- dev mode and silently falls back to the pm overlay tree.
+  "--lua-root", LUA_ROOT,
 }))
