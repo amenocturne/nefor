@@ -1,4 +1,4 @@
-//! `bash` — run a shell command via `/bin/sh -c` with a wall-clock timeout.
+//! `bash` — run a shell command via `/bin/sh -c`, optionally time-bounded.
 //!
 //! Behavior:
 //!
@@ -7,11 +7,13 @@
 //!   standard input (then the pipe closes). Absent, stdin is null — the
 //!   pre-existing behavior.
 //! - `cwd` is optional; defaults to the plugin's current directory.
-//! - `timeout_ms` is optional; defaults to [`DEFAULT_TIMEOUT_MS`]. Capped at
-//!   [`MAX_TIMEOUT_MS`] so a misbehaving prompt can't pin the plugin
-//!   indefinitely.
-//! - On timeout the child is killed and the partial output collected so far
-//!   is returned via [`ToolError::BashTimeout`].
+//! - `timeout_ms` is optional; ABSENT means the command runs until it exits.
+//!   Long-running commands (review UIs, dev servers, watch loops) are
+//!   first-class: runs are observable and interruptible through the kernel,
+//!   so an unbounded default costs nothing — the caller opts INTO a bound
+//!   when a hang would otherwise go unnoticed.
+//! - On timeout the child is killed and the call returns
+//!   [`ToolError::BashTimeout`].
 //! - Combined stdout+stderr is captured (interleaved-by-buffering, not
 //!   true PTY merge — sufficient for typical commands). Output above
 //!   [`MAX_OUTPUT_BYTES`] is truncated with a marker line at the end.
@@ -37,8 +39,6 @@ pub const NAME: &str = "bash";
 pub const DESCRIPTION: &str =
     "Run a shell command via /bin/sh -c. Returns combined stdout+stderr followed by an exit-code footer.";
 
-pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
-pub const MAX_TIMEOUT_MS: u64 = 600_000;
 pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
 pub fn schema() -> Value {
@@ -59,7 +59,7 @@ pub fn schema() -> Value {
             },
             "timeout_ms": {
                 "type": "integer",
-                "description": "Wall-clock timeout in milliseconds (default 30000, max 600000).",
+                "description": "Optional wall-clock timeout in milliseconds. Omit to let the command run until it exits.",
                 "minimum": 1
             }
         },
@@ -90,7 +90,7 @@ struct ParsedArgs {
     command: String,
     stdin: Option<String>,
     cwd: Option<String>,
-    timeout_ms: u64,
+    timeout_ms: Option<u64>,
 }
 
 fn parse_args(args: &Value) -> Result<ParsedArgs, ToolError> {
@@ -127,20 +127,23 @@ fn parse_args(args: &Value) -> Result<ParsedArgs, ToolError> {
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
     let timeout_ms = match obj.get("timeout_ms") {
-        Some(Value::Number(n)) => n
-            .as_u64()
-            .ok_or_else(|| ToolError::BadArgs {
-                tool: NAME.into(),
-                message: "`timeout_ms` must be a non-negative integer".into(),
-            })?
-            .clamp(1, MAX_TIMEOUT_MS),
+        Some(Value::Number(n)) => {
+            Some(
+                n.as_u64()
+                    .filter(|ms| *ms >= 1)
+                    .ok_or_else(|| ToolError::BadArgs {
+                        tool: NAME.into(),
+                        message: "`timeout_ms` must be a positive integer".into(),
+                    })?,
+            )
+        }
+        Some(Value::Null) | None => None,
         Some(_) => {
             return Err(ToolError::BadArgs {
                 tool: NAME.into(),
                 message: "`timeout_ms` must be a number".into(),
             });
         }
-        None => DEFAULT_TIMEOUT_MS,
     };
     Ok(ParsedArgs {
         command: command.to_owned(),
@@ -186,7 +189,6 @@ async fn run_command(
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
 
-    let dur = Duration::from_millis(parsed.timeout_ms);
     let stdin_text = parsed.stdin.clone();
     let collect = async move {
         let mut out_buf = Vec::new();
@@ -221,19 +223,30 @@ async fn run_command(
         }
     };
 
+    // No timeout requested → the command runs until it exits (the collect
+    // future is awaited unbounded; cancellation stays available).
+    let bounded = async {
+        match parsed.timeout_ms {
+            Some(ms) => timeout(Duration::from_millis(ms), collect)
+                .await
+                .map_err(|_elapsed| ms),
+            None => Ok(collect.await),
+        }
+    };
+
     tokio::select! {
-        result = timeout(dur, collect) => match result {
+        result = bounded => match result {
             Ok((out_buf, err_buf, status)) => {
                 Ok(format_output(&out_buf, &err_buf, status_code(&status)))
             }
-            Err(_elapsed) => {
+            Err(ms) => {
                 // child was moved into the inner future; on a timeout the
                 // future is dropped, kill_on_drop fires and the OS reaps the
                 // child. We can't recover the partial output here without
                 // restructuring; best we can do is report the timeout cleanly.
                 Err(ToolError::BashTimeout {
-                    timeout_ms: parsed.timeout_ms,
-                    output: format!("(killed after {}ms)", parsed.timeout_ms),
+                    timeout_ms: ms,
+                    output: format!("(killed after {ms}ms)"),
                 })
             }
         },
@@ -364,6 +377,14 @@ mod tests {
     #[tokio::test]
     async fn rejects_empty_command() {
         let err = run(&json!({"command": ""})).await.unwrap_err();
+        assert!(matches!(err, ToolError::BadArgs { .. }));
+    }
+
+    #[tokio::test]
+    async fn rejects_zero_timeout() {
+        let err = run(&json!({"command": "echo x", "timeout_ms": 0}))
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::BadArgs { .. }));
     }
 

@@ -1614,6 +1614,7 @@ local function receive_msg(entry)
   if kind == "chat.interrupt_all" then
     if replay_window.active() then return end
     interrupt_active_runs()
+    mag_eval.interrupt_all_runs()
     return
   end
 

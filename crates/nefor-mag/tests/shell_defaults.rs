@@ -59,6 +59,41 @@ fn bare_bash_expression_compiles_to_one_node_program() {
 }
 
 #[test]
+fn bash_options_map_carries_timeout_ms() {
+    let ir =
+        compile(r#"(bash "sleep 90" {:timeout_ms 120000})"#).expect("bash with options compiles");
+    let bash = actor(&ir, "bash-1");
+    assert_eq!(bash.params["command"].as_str(), Some("sleep 90"));
+    assert_eq!(bash.params["timeout_ms"].as_i64(), Some(120_000));
+
+    // Without the map no timeout param is authored — the command runs
+    // until it exits.
+    let bare = compile(r#"(bash "ls")"#).expect("compiles");
+    assert!(actor(&bare, "bash-1").params.get("timeout_ms").is_none());
+}
+
+#[test]
+fn bash_options_map_rejects_unknown_and_ill_typed_options() {
+    let unknown = compile(r#"(bash "ls" {:retries 3})"#).unwrap_err();
+    assert!(
+        unknown.to_string().contains("unknown bash option"),
+        "unknown option names itself: {unknown}"
+    );
+
+    let ill_typed = compile(r#"(bash "ls" {:timeout_ms "soon"})"#).unwrap_err();
+    assert!(
+        ill_typed.to_string().contains("timeout_ms"),
+        "ill-typed timeout names the option: {ill_typed}"
+    );
+
+    let non_positive = compile(r#"(bash "ls" {:timeout_ms 0})"#).unwrap_err();
+    assert!(
+        non_positive.to_string().contains("positive"),
+        "zero timeout is rejected: {non_positive}"
+    );
+}
+
+#[test]
 fn bash_source_node_is_seeded_with_a_unit_activation() {
     let ir = compile(r#"(bash "ls")"#).expect("compiles");
     assert_eq!(ir.messages.len(), 1, "one initial activation");

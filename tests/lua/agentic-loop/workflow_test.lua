@@ -752,6 +752,50 @@ do
     "foreign-scope chats are not stream-visible")
 end
 
+-- (lead-scoped firing ids) the public caller-routing seam: the active turn's
+-- scope-prefixed gate correlation ids are the lead's own; a sub-run's are
+-- not (mag-eval detaches by this test).
+do
+  fresh_loop()
+  begin_bound_turn("scoped", "r13")
+  assert_eq(agentic_loop.lead_scoped_id("r13/cap-1"), true,
+    "the active turn's gate ids are lead-scoped")
+  assert_eq(agentic_loop.lead_scoped_id("r99/cap-1"), false,
+    "a dispatched sub-run's gate ids are not lead-scoped")
+  assert_eq(agentic_loop.lead_scoped_id(nil), false,
+    "a missing id is not lead-scoped")
+end
+
+-- (merged relay) completions queued while the lead is busy ride ONE relay
+-- turn — a burst of detached eval completions must not cost a provider turn
+-- each.
+do
+  fresh_loop()
+  local exec = begin_bound_turn("busy work", "r14")
+  agentic_loop.relay_run_completion({
+    run_id = "run-a", status = "success", output = "alpha output",
+  })
+  agentic_loop.relay_run_completion({
+    run_id = "run-b", status = "success", output = "beta output",
+  })
+  _test.calls_clear()
+  send_to_loop("mag", {
+    kind = "mag.run_result", run_id = exec.body.run_id,
+    status = "completed", result = { text = "done" },
+  })
+  local calls = decode_calls()
+  local execs = {}
+  for _, c in ipairs(calls) do
+    if c.body.kind == "mag.execute" then execs[#execs + 1] = c end
+  end
+  assert_eq(#execs, 1, "both queued completions flush as one relay turn")
+  local prompt = execs[1].body.modification.messages[1].content.prompt
+  assert(prompt:find("alpha output", 1, true) ~= nil,
+    "the merged relay carries the first completion")
+  assert(prompt:find("beta output", 1, true) ~= nil,
+    "the merged relay carries the second completion")
+end
+
 -- (load failure) a compile error in the turn-program surfaces in chat
 -- and the next submit retries the load.
 do

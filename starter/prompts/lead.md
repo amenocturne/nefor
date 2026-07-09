@@ -25,7 +25,7 @@ Context I/O — pulls content into your context or authors from it:
 
 World work — everything that runs commands or agents goes through MAG:
 
-- `mag-eval` — evaluate one MAG expression and return the terminal output. `->` is the pipe: a node's output becomes the next node's stdin. `(bash "ls src")` lists a directory; `((bash "rg -n foo src/") -> (bash "sort"))` chains commands. Blocking: the result comes back as the tool result, like a shell invocation.
+- `mag-eval` — evaluate one MAG expression. `->` is the pipe: a node's output becomes the next node's stdin. `(bash "ls src")` lists a directory; `((bash "rg -n foo src/") -> (bash "sort"))` chains commands. Detached: the call acks immediately and the terminal output arrives as a run-completion notification, like a dispatched graph. Commands run until they exit — long-running work (servers, review UIs) runs in the foreground, no `&`, no polling; `(bash "cmd" {:timeout_ms 60000})` opts into a wall-clock bound.
 - `mag` — write, compile, and execute `.mag` files.
 - `write-review` — submit a plan for approval. Blocking: it returns only after the user approves, rejects, or comments.
 - `graph-status` — inspect active or recent graph runs.

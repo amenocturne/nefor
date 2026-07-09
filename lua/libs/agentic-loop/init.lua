@@ -516,21 +516,32 @@ local function submit_orchestrator_run(user_text)
   return run_id
 end
 
+-- Drain the WHOLE deferred queue into one text: every run completion that
+-- arrived while the lead was busy rides a single relay turn (separated so
+-- each block stays readable) instead of costing one provider turn each — a
+-- burst of detached eval completions would otherwise replay the full history
+-- once per result.
 local function drain_deferred_text()
   if #state.deferred_queue == 0 then return nil end
-  local entry = table.remove(state.deferred_queue, 1)
-  return entry and entry.text or nil
+  local parts = {}
+  for _, entry in ipairs(state.deferred_queue) do
+    if type(entry.text) == "string" and #entry.text > 0 then
+      parts[#parts + 1] = entry.text
+    end
+  end
+  state.deferred_queue = {}
+  if #parts == 0 then return nil end
+  return table.concat(parts, "\n\n---\n\n")
 end
 
 -- Deferred relay queue. Carries any text that needs to land as the next
 -- turn's user-role task: dispatched kernel-run completion bodies relayed
--- by lead-workflow (relay_run_completion). One entry per turn so a long
--- backlog still produces an observable chat each step.
+-- by lead-workflow and mag-eval (relay_run_completion).
 local function flush_deferred()
   if state.current_run_id ~= nil then return end
   local merged = drain_deferred_text()
   if type(merged) ~= "string" then return end
-  nefor.log.info("agentic-loop: flushing deferred run completion", {
+  nefor.log.info("agentic-loop: flushing deferred run completions", {
     text_preview = string.sub(merged, 1, 80),
   })
   submit_orchestrator_run(merged)
@@ -1107,6 +1118,14 @@ function M.relay_run_completion(completion)
   flush_deferred()
 end
 function M.stream_visible(chat_id) return stream_visible(chat_id) end
+
+-- Whether a gate correlation id belongs to the lead's ACTIVE turn (ids are
+-- `<scope>/cap-N`; the lead's own tool firings carry its turn scope, a
+-- dispatched sub-run's carry that run's scope). Public so a tool can route
+-- by caller: mag-eval detaches lead-called runs (their results relay through
+-- relay_run_completion) and stays blocking for graph agents, which have no
+-- relay channel.
+function M.lead_scoped_id(id) return lead_scoped_id(id) end
 
 function M.fire_stream_observers(text) fire_stream_observers(text) end
 function M.fire_reasoning_observers(text) fire_reasoning_observers(text) end

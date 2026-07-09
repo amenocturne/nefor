@@ -969,10 +969,15 @@ fn parse_type_expr(expr: &Expr) -> Result<MagType, MagError> {
 ///   output  mag.Text               the command's stdout
 ///
 /// The command string is evaluated, so `(bash (str "rg " pat))` composes.
+///
+/// An optional trailing options map bounds the run:
+/// `(bash "cmd" {:timeout_ms 60000})`. Without it the command runs until it
+/// exits (basic-tools bash has no default timeout).
 fn eval_bash(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
-    if args.len() != 1 {
+    if args.is_empty() || args.len() > 2 {
         return Err(MagError::Eval(
-            "bash requires exactly one argument: (bash \"command\")".into(),
+            "bash requires a command and an optional options map: (bash \"command\" {:timeout_ms 60000}?)"
+                .into(),
         ));
     }
     let command = match eval_expr(env, &args[0])? {
@@ -985,11 +990,40 @@ fn eval_bash(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
             )))
         }
     };
+    let mut node_args = BTreeMap::from([("command".into(), Value::Str(command))]);
+    if args.len() == 2 {
+        let opts = match eval_expr(env, &args[1])? {
+            Value::Map(m) => m,
+            other => {
+                return Err(MagError::Eval(format!(
+                    "bash options must be a map, got {}",
+                    other.type_name()
+                )))
+            }
+        };
+        for (key, value) in opts {
+            match (key.as_str(), &value) {
+                ("timeout_ms", Value::Int(ms)) if *ms >= 1 => {
+                    node_args.insert(key, value);
+                }
+                ("timeout_ms", _) => {
+                    return Err(MagError::Eval(
+                        "bash :timeout_ms must be a positive integer of milliseconds".into(),
+                    ))
+                }
+                _ => {
+                    return Err(MagError::Eval(format!(
+                        "unknown bash option :{key} (supported: :timeout_ms)"
+                    )))
+                }
+            }
+        }
+    }
     let n = env.next_node_seq("bash");
     Ok(Value::Node(NodeValue {
         id: format!("bash-{n}"),
         node_type: "bash".into(),
-        args: BTreeMap::from([("command".into(), Value::Str(command))]),
+        args: node_args,
         // Fully-qualified names so authored annotations (`: mag.Text -> …`)
         // type-check against bash ports by simple name equality.
         input_type: MagType::union(vec![MagType::named("mag.Unit"), MagType::named("mag.Text")]),

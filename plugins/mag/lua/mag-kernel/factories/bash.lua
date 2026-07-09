@@ -5,7 +5,9 @@
 -- is the command's stdin, its stdout is the output message — `->` is the pipe.
 --
 -- Contract:
---   params  { command }                    the shell line, authored in MAG
+--   params  { command, timeout_ms? }       the shell line (authored in MAG,
+--                                          `(bash "cmd" {:timeout_ms N}?)`);
+--                                          absent timeout = run until exit
 --   input   ( mag.Unit | mag.Text )        union — fires on either:
 --             mag.Unit   dependency firing — run the command, no stdin
 --                        (the initial activation of a source bash node, or an
@@ -18,7 +20,7 @@
 --
 -- ── async flow (routing.lua, the kernel⇄factory contract) ───────────────────
 --   An activation emits one `capability.invoke` (name "bash", args carrying
---   { command, stdin }) and returns { status = "pending" }. The gate-forwarded
+--   { command, stdin, timeout_ms? }) and returns { status = "pending" }. The gate-forwarded
 --   answer arrives as a reply activation whose ref names the call; the reply
 --   delivery returns the completion directly — no batching, one call per
 --   activation (cf. run-tool.lua, which aggregates batches).
@@ -54,6 +56,7 @@ M.declaration = {
 
   params = {
     command = "string", -- required; construction fails without it
+    timeout_ms = "number?", -- optional wall-clock bound; absent = unbounded
   },
 
   inputs = {
@@ -102,6 +105,10 @@ function M.construct(id, params, emit, deps)
   local command = params.command
   if type(command) ~= "string" or command == "" then
     return nil, "bash actor requires a non-empty string params.command"
+  end
+  local timeout_ms = params.timeout_ms
+  if timeout_ms ~= nil and (type(timeout_ms) ~= "number" or timeout_ms < 1) then
+    return nil, "bash actor params.timeout_ms must be a positive number of milliseconds"
   end
 
   local function sign(message)
@@ -178,7 +185,7 @@ function M.construct(id, params, emit, deps)
       -- as the gate's tool args (plugins/mag/src/bridge.rs gate_invoke).
       request = {
         name = "bash",
-        args = { command = command, stdin = stdin },
+        args = { command = command, stdin = stdin, timeout_ms = timeout_ms },
       },
       ref = { call = seq },
     }))

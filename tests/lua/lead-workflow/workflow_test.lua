@@ -1233,6 +1233,84 @@ do
   mag_eval._internals.state.pending_runs = {}
 end
 
+-- (mag-eval caller routing) A LEAD-called eval DETACHES: the firing acks at
+-- dispatch and the terminal output relays through agentic-loop's
+-- run-completion channel. A GRAPH AGENT's eval BLOCKS: the firing stays open
+-- and the terminal output is the tool result.
+do
+  local mag_eval = require("libs.lead-workflow.mag-eval")
+
+  -- Detached (lead-called; on_loaded reads the flag M.handle computed off
+  -- agentic-loop.lead_scoped_id).
+  fresh()
+  mag_eval._internals.state.pending_runs = {}
+  mag_eval._internals.state.pending_loads["R1-load"] = {
+    firing_id = "r7/cap-1", run_id = "R1", run_name = "eval-1",
+    session_id = "s", detached = true,
+  }
+  feed("mag", { kind = "mag.loaded", in_reply_to = "R1-load",
+    modification = { actors = {}, messages = {}, kills = {}, rules = {} } })
+  local calls = decode_calls()
+  assert_true(find_call(calls, function(c)
+    return c.body.kind == "mag.execute" and c.body.run_id == "R1"
+  end) ~= nil, "the compiled eval executes on the kernel")
+  local ack = find_call(calls, function(c)
+    return c.body.kind == "tool.result" and c.body.id == "r7/cap-1"
+  end)
+  assert_true(ack ~= nil and ack.body.error == nil,
+    "a lead-called eval acks its firing at dispatch")
+  assert_true(tostring(ack.body.output):find("dispatched", 1, true) ~= nil,
+    "the ack names the dispatch")
+
+  _test.calls_clear()
+  feed("mag", { kind = "mag.run_result", run_id = "R1",
+    status = "completed", result = { text = "the eval output" } })
+  assert_eq(find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result"
+  end), nil, "a detached eval's terminal reply emits no second tool result")
+  -- The relay reached agentic-loop's run-completion channel (no lead
+  -- program is cached in this harness, so the relay text queues for the
+  -- next turn instead of executing one).
+  local queued = agentic_loop._internals.state.pending_user_inputs[1]
+  assert_true(type(queued) == "string"
+      and queued:find("the eval output", 1, true) ~= nil,
+    "the terminal output relays like a dispatched graph completion")
+
+  -- Blocking (graph-agent-called).
+  fresh()
+  mag_eval._internals.state.pending_loads["R2-load"] = {
+    firing_id = "r9/cap-4", run_id = "R2", run_name = "eval-2",
+    session_id = "s", detached = false,
+  }
+  feed("mag", { kind = "mag.loaded", in_reply_to = "R2-load",
+    modification = { actors = {}, messages = {}, kills = {}, rules = {} } })
+  assert_eq(find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result"
+  end), nil, "a graph agent's eval does not ack at dispatch")
+  _test.calls_clear()
+  feed("mag", { kind = "mag.run_result", run_id = "R2",
+    status = "completed", result = { text = "blocking output" } })
+  local reply = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result" and c.body.id == "r9/cap-4"
+  end)
+  assert_true(reply ~= nil, "a graph agent's eval settles on the terminal reply")
+  assert_eq(reply.body.output, "blocking output", "the terminal output IS the tool result")
+
+  -- Double-Esc reaches eval runs: chat.interrupt_all interrupts every
+  -- in-flight eval (a detached firing has no gate capability left to cancel;
+  -- this entry point is how the interrupt reaches the run).
+  fresh()
+  mag_eval._internals.state.pending_runs = {
+    ["R3"] = { firing_id = "r7/cap-9", run_id = "R3", run_name = "eval-3", detached = true },
+  }
+  feed("nefor-tui", { kind = "chat.interrupt_all" })
+  local interrupted = find_call(decode_calls(), function(c)
+    return c.body.kind == "mag.interrupt_run" and c.body.run_id == "R3"
+  end)
+  assert_true(interrupted ~= nil, "chat.interrupt_all interrupts in-flight eval runs")
+  mag_eval._internals.state.pending_runs = {}
+end
+
 -- ------------------------------------------------------------------
 -- double-Esc interrupts DETACHED dispatched runs (the tag-blocking incident)
 -- ------------------------------------------------------------------
