@@ -1,10 +1,12 @@
 -- config/init.lua — starter defaults.
 --
 -- Providers:
---   * chatgpt — default; ChatGPT backend, model picked via /model.
---   * ollama  — openai-provider against http://localhost:11434.
+--   * mock    — default local scripted provider.
+--   * chatgpt — opt in with NEFOR_ENABLE_CHATGPT=1.
+--   * ollama  — opt in with NEFOR_ENABLE_OLLAMA=1; openai-provider
+--               against http://localhost:11434.
 --
--- All providers register on the bus, so the `/model` picker shows
+-- Enabled providers register on the bus, so the `/model` picker shows
 -- entries from each.
 
 local M = {}
@@ -76,31 +78,47 @@ M.bin = function(name)
   return resolved_bin(name, plugin_dir .. "/" .. name, "NEFOR_PLUGIN_DIR")
 end
 
+local DEFAULT_PROVIDER = os.getenv("NEFOR_DEFAULT_PROVIDER") or "mock"
+local DEFAULT_MODEL    = os.getenv("NEFOR_DEFAULT_MODEL") or "mock-model"
+
+local providers = {
+  {
+    kind        = "mock",
+    name        = "mock",
+    mock_script = "mock-provider/init.lua",
+  },
+}
+
+if env_truthy("NEFOR_ENABLE_CHATGPT") then
+  providers[#providers + 1] = {
+    kind = "chatgpt",
+    name = "chatgpt",
+  }
+end
+
+if env_truthy("NEFOR_ENABLE_OLLAMA") then
+  providers[#providers + 1] = {
+    kind         = "openai",
+    name         = "ollama",
+    static_token = "ollama-local",
+    base_url     = "http://localhost:11434",
+    extra_args   = {},
+  }
+end
+
 M.active = {
-  default_provider = os.getenv("NEFOR_DEFAULT_PROVIDER") or "chatgpt",
-  default_model    = os.getenv("NEFOR_DEFAULT_MODEL") or "gpt-5.5",
+  default_provider = DEFAULT_PROVIDER,
+  default_model    = DEFAULT_MODEL,
   default_reasoning_effort = DEFAULT_REASONING_EFFORT,
   lead_reasoning_effort = DEFAULT_REASONING_EFFORT,
 
-  providers = {
-    {
-      kind = "chatgpt",
-      name = "chatgpt",
-    },
-    {
-      kind         = "openai",
-      name         = "ollama",
-      static_token = "ollama-local",
-      base_url     = "http://localhost:11434",
-      extra_args   = {},
-    },
-  },
+  providers = providers,
 
   orchestration_profiles = {
-    fast     = { provider = os.getenv("NEFOR_DEFAULT_PROVIDER") or "chatgpt", model = os.getenv("NEFOR_DEFAULT_MODEL") or "gpt-5.5", reasoning_effort = "low" },
-    standard = { provider = os.getenv("NEFOR_DEFAULT_PROVIDER") or "chatgpt", model = os.getenv("NEFOR_DEFAULT_MODEL") or "gpt-5.5", reasoning_effort = "medium" },
-    deep     = { provider = os.getenv("NEFOR_DEFAULT_PROVIDER") or "chatgpt", model = os.getenv("NEFOR_DEFAULT_MODEL") or "gpt-5.5", reasoning_effort = "high" },
-    max      = { provider = os.getenv("NEFOR_DEFAULT_PROVIDER") or "chatgpt", model = os.getenv("NEFOR_DEFAULT_MODEL") or "gpt-5.5", reasoning_effort = "xhigh" },
+    fast     = { provider = DEFAULT_PROVIDER, model = DEFAULT_MODEL, reasoning_effort = "low" },
+    standard = { provider = DEFAULT_PROVIDER, model = DEFAULT_MODEL, reasoning_effort = "medium" },
+    deep     = { provider = DEFAULT_PROVIDER, model = DEFAULT_MODEL, reasoning_effort = "high" },
+    max      = { provider = DEFAULT_PROVIDER, model = DEFAULT_MODEL, reasoning_effort = "xhigh" },
   },
 
   tool_gate = {

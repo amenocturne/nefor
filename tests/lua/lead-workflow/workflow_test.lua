@@ -1074,8 +1074,8 @@ do
 end
 
 -- ------------------------------------------------------------------
--- Permission modes: auto declines human review prompts, while auto/yolo
--- bypass safe-mode writer gates for execution.
+-- Permission modes: auto/yolo bypass safe-mode writer gates. Auto
+-- write-review immediately approves so the writer can execute.
 -- ------------------------------------------------------------------
 
 do
@@ -1087,16 +1087,41 @@ do
     name = "write-review",
     args = { plan = "Auto mode plan", view = "inline" },
   })
+
   local calls = decode_calls()
+  local sub = find_call(calls, function(c)
+    return c.body.kind == "lead-workflow.plan.submitted"
+  end)
+  assert_true(sub ~= nil, "auto write-review emits plan.submitted")
+  assert_eq(sub.body.plan, "Auto mode plan", "submitted event carries plan text")
+
+  local approved_env = find_call(calls, function(c)
+    return c.body.kind == "lead-workflow.plan.approved"
+  end)
+  assert_true(approved_env ~= nil, "auto write-review emits plan.approved")
+  assert_eq(approved_env.body.approved, true, "auto write-review approves")
+
   local reply = find_call(calls, function(c)
     return c.body.kind == "tool.result" and c.body.id == "firing-plan-auto"
   end)
   assert_true(reply ~= nil, "auto write-review returns immediately")
-  assert_true(type(reply.body.error) == "string"
-              and reply.body.error:find("permission_denied%[auto%]") ~= nil,
-    "auto write-review returns a permission_denied[auto] error")
-  assert_eq(lw._internals.state.active_plan, nil,
-    "auto write-review must not open or approve a plan slot")
+  assert_eq(reply.body.error, nil, "auto write-review does not return an error")
+  assert_eq(reply.body.output.status, "approved", "auto write-review returns approved")
+
+  local ap = lw._internals.state.active_plan
+  assert_true(type(ap) == "table", "auto write-review records active_plan")
+  assert_eq(ap.status, "approved", "auto active_plan is approved")
+  assert_eq(ap.pending_firing_id, nil,
+    "auto active_plan has no pending_firing_id")
+
+  write_mag_file("firing-writer-write-auto-reviewed", "auto-reviewed-build.mag", WRITER_MAG)
+  _test.calls_clear()
+  execute_mag("firing-writer-auto-reviewed", "auto-reviewed-build.mag")
+  feed_loaded(writer_modification())
+  local exec = find_call(decode_calls(), function(c)
+    return c.body.kind == "mag.execute" and c.target == "mag"
+  end)
+  assert_true(exec ~= nil, "auto write-review approval lets writer execute")
 end
 
 do

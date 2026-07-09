@@ -490,13 +490,6 @@ local function submit_plan(firing_id, args)
     emit_tool_result_err(firing_id, "write-review: args.view must be `inline` or `web`")
     return
   end
-  if state.gate_mode == "auto" then
-    emit_tool_result_err(firing_id,
-      "permission_denied[auto]: write-review requires human approval, and /auto never opens a pending approval. " ..
-      "Recovery: switch to /safe to review and approve a plan manually, or continue with read-only investigation.")
-    return
-  end
-
   -- Calling write-review while another plan is in-flight discards the
   -- earlier one. The earlier firing_id is dead-acked so the agentic-
   -- loop doesn't leak the deferred entry (this happens when an agent
@@ -512,13 +505,15 @@ local function submit_plan(firing_id, args)
   local submitted_at = nefor.engine.now()
   local plan_id = "plan-" .. tostring(firing_id)
   local yolo_approved = (state.gate_mode == "yolo")
+  local auto_approved = (state.gate_mode == "auto")
+  local immediately_approved = yolo_approved or auto_approved
 
   state.active_plan = {
     plan_id           = plan_id,
     content           = plan,
     submitted_at      = submitted_at,
-    pending_firing_id = (not yolo_approved) and firing_id or nil,
-    status            = yolo_approved and "approved" or "pending",
+    pending_firing_id = (not immediately_approved) and firing_id or nil,
+    status            = immediately_approved and "approved" or "pending",
     reason            = nil,
   }
 
@@ -533,15 +528,21 @@ local function submit_plan(firing_id, args)
     submitted_at = submitted_at,
   })
 
-  if yolo_approved then
+  if immediately_approved then
     emit_as(SOURCE_NAME, nil, {
       kind     = "lead-workflow.plan.approved",
       plan_id  = plan_id,
       approved = true,
     })
+    local notice
+    if yolo_approved then
+      notice = "YOLO mode: write-review approval gate bypassed; proceed with implementation."
+    else
+      notice = "AUTO mode: write-review approval gate bypassed; proceed with implementation."
+    end
     emit_tool_result_ok(firing_id, {
       status = "approved",
-      notice = "YOLO mode: write-review approval gate bypassed; proceed with implementation.",
+      notice = notice,
     })
     return
   end
