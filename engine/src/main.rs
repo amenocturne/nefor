@@ -97,6 +97,22 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("nefor: failed to initialize logging at {log_path:?}: {e}");
     }
 
+    // Route panics through tracing so a hard engine death leaves evidence in
+    // nefor.log — the default hook prints to stderr, which the TUI plugin's
+    // alternate screen owns and erases. Chained before the default hook so
+    // stderr still gets the message when it survives.
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| "unknown".to_owned());
+            tracing::error!(%location, panic = %info, "engine panicked");
+            default_hook(info);
+        }));
+    }
+
     tracing::info!(
         config_dir = %config_dir,
         data_dir = %data_dir,
