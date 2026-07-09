@@ -1,8 +1,10 @@
 -- libs/read-only-tools — read-only investigation tools (base mechanism).
 --
--- Advertised through tool-gate as source `read-only-tools`. The base
--- ships five tools; a downstream config plugs in more via the
--- registration seam below without forking this file.
+-- Advertised through tool-gate as source `read-only-tools`. The lib holds
+-- five base tool implementations but advertises NONE by default: each config
+-- opts in explicitly via `build{ include = {...} }`, and plugs in its own
+-- tools via `extra_tools`, without forking this file. Opt-in (not opt-out)
+-- keeps a new base tool from leaking into every config the moment it lands.
 --
 --   * `list_dir`   — args { path }. Returns a one-line-per-entry listing
 --                    of `path`, with `(d)` / `(f)` prefixes for dirs vs
@@ -25,19 +27,27 @@
 --   * `instructions` / `discover_instruction_files` — read the config's
 --                    instruction files (`<config>/instructions/*.md`).
 --
+--   * `skill`      — read a workflow skill body by name from the config's
+--                    `<config>/skills/<name>/skill.md`. Sibling of
+--                    `instructions`; carries CLI workflows / conventions.
+--
 -- Layered so an explorer / reviewer agent can investigate the codebase
 -- without needing the full `bash` surface (which is a sandbox-escape
 -- hatch via shell composition).
 --
 -- ## Registration seam
 --
--- `build{ extra_tools = { ... } }` returns the actor spec. Each extra
--- tool is `{ schema = <advertise entry>, handler = function(args, emit) }`
--- where `emit.ok(text)` / `emit.err(msg)` publish the tool.result. The
--- dispatch key is `schema.name`. The base tools plus the extras are
--- advertised together on the first `tool-gate.hello`. A downstream config
--- (e.g. a typed `mirror-projects` wrapper, a `skill` reader) registers its
--- tools this way instead of copying the plumbing.
+-- `build{ include = {...}, extra_tools = {...} }` returns the actor spec.
+-- `include` is the list of base tool names this config advertises (a subset
+-- of list_dir / search_text / python-read / instructions /
+-- discover_instruction_files / skill) — omit a name and it is not advertised.
+-- Each
+-- extra tool is `{ schema = <advertise entry>, handler = function(args, emit) }`
+-- where `emit.ok(text)` / `emit.err(msg)` publish the tool.result; the dispatch
+-- key is `schema.name`. The included base tools plus the extras are advertised
+-- together on the first `tool-gate.hello`. A downstream config (e.g. a typed
+-- `mirror-projects` wrapper, a `skill` reader) registers its tools this way
+-- instead of copying the plumbing.
 
 local json = nefor.json
 
@@ -271,12 +281,60 @@ local function tool_discover_instruction_files(firing_id, args)
   emit_ok(firing_id, instruction_files.format_discovery(result))
 end
 
+-- `skill` — sibling of `instructions`: reads a workflow skill body by name
+-- from `<config>/skills/<name>/skill.md`. Same context-I/O shape; named so the
+-- transcript reads "skill: <name>" instead of a truncated read_file path.
+local SKILLS_DIR = (rawget(_G, "NEFOR_CONFIG_DIR") or ".") .. "/skills"
+
+local function read_one_skill(raw_name)
+  local name = raw_name:gsub("/skill%.md$", ""):gsub("%.md$", "")
+  local path = SKILLS_DIR .. "/" .. name .. "/skill.md"
+  local f, err = io.open(path, "r")
+  if not f then
+    return nil, tostring(err or ("no skill at " .. path))
+  end
+  local content = f:read("*a")
+  f:close()
+  if not content or #content == 0 then
+    return nil, "empty skill at " .. path
+  end
+  return content, nil
+end
+
+local function tool_skill(firing_id, args)
+  local name = args and args.name
+  if type(name) == "string" and #name > 0 then
+    local content, err = read_one_skill(name)
+    if not content then emit_err(firing_id, "skill: " .. err); return end
+    emit_ok(firing_id, content)
+    return
+  end
+  if type(name) == "table" and #name > 0 then
+    local parts = {}
+    for _, n in ipairs(name) do
+      if type(n) == "string" and #n > 0 then
+        local content, err = read_one_skill(n)
+        parts[#parts + 1] = "--- skill: " .. n .. " ---\n" ..
+          (content or ("[error: " .. tostring(err) .. "]"))
+      end
+    end
+    if #parts == 0 then
+      emit_err(firing_id, "skill: name array contained no valid entries")
+      return
+    end
+    emit_ok(firing_id, table.concat(parts, "\n\n"))
+    return
+  end
+  emit_err(firing_id, "skill: args.name must be a non-empty string or array of strings")
+end
+
 local BASE_HANDLERS = {
   list_dir                   = tool_list_dir,
   search_text                = tool_search_text,
   ["python-read"]            = tool_python_read,
   instructions               = tool_instructions,
   discover_instruction_files = tool_discover_instruction_files,
+  skill                      = tool_skill,
 }
 
 local function base_schemas()
@@ -390,6 +448,27 @@ local function base_schemas()
         },
       },
     },
+    {
+      name = "skill",
+      description =
+        "Load a workflow skill by name from the config's skills directory " ..
+        "(<config>/skills/<name>/skill.md). Read the skill BEFORE acting on a " ..
+        "task that matches its description — it carries the workflow, CLI " ..
+        "usage, and conventions. Pass an array to load several at once.",
+      parameters = {
+        type = "object",
+        properties = {
+          name = {
+            oneOf = {
+              { type = "string" },
+              { type = "array", items = { type = "string" } },
+            },
+            description = "Skill name or array of skill names.",
+          },
+        },
+        required = { "name" },
+      },
+    },
   }
 end
 
@@ -405,15 +484,40 @@ local function wrap_extra(handler)
   end
 end
 
--- build{ extra_tools = { { schema, handler }, ... } } -> actor spec.
+-- build{ include = { "list_dir", ... }, extra_tools = { { schema, handler } } }
+--   -> actor spec.
+--
+-- Base tools are OPT-IN: only the names listed in `include` are registered and
+-- advertised. Adding a new base tool to this lib therefore cannot leak into any
+-- config until that config lists it — no silent contamination. `extra_tools`
+-- registers config-specific tools through the same seam.
 local function build(opts)
   opts = opts or {}
+  local include = opts.include or {}
   local extra_tools = opts.extra_tools or {}
 
-  local handlers = {}
-  for name, fn in pairs(BASE_HANDLERS) do handlers[name] = fn end
+  local base_by_name = {}
+  for _, schema in ipairs(base_schemas()) do
+    base_by_name[schema.name] = schema
+  end
 
-  local schemas = base_schemas()
+  local handlers = {}
+  local schemas = {}
+
+  for _, name in ipairs(include) do
+    local schema = base_by_name[name]
+    if not schema then
+      error("read-only-tools.build: unknown base tool '" .. tostring(name) ..
+        "' in include (known: list_dir, search_text, python-read, " ..
+        "instructions, discover_instruction_files, skill)")
+    end
+    if handlers[name] then
+      error("read-only-tools.build: base tool '" .. name .. "' listed twice in include")
+    end
+    handlers[name] = BASE_HANDLERS[name]
+    schemas[#schemas + 1] = schema
+  end
+
   for _, spec in ipairs(extra_tools) do
     local schema = spec.schema
     if type(schema) ~= "table" or type(schema.name) ~= "string" then
@@ -421,6 +525,9 @@ local function build(opts)
     end
     if type(spec.handler) ~= "function" then
       error("read-only-tools.build: extra tool '" .. schema.name .. "' needs a handler function")
+    end
+    if handlers[schema.name] then
+      error("read-only-tools.build: tool '" .. schema.name .. "' already registered")
     end
     handlers[schema.name] = wrap_extra(spec.handler)
     schemas[#schemas + 1] = schema

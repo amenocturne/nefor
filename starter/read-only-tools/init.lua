@@ -3,8 +3,16 @@
 -- The mechanism (list_dir / search_text / python-read / instructions /
 -- discover_instruction_files handlers plus the advertise/dispatch
 -- plumbing) lives in `libs.read-only-tools`. This file is the config's
--- opinion layer: it declares which tools the source advertises. Starter
--- ships only the base set — no extras — so it builds with an empty
--- registration. A downstream config adds typed tools here via
+-- opinion layer: it declares which base tools the source advertises via
+-- `include`. Base tools are opt-in, so the starter names its full set here.
+-- A downstream config picks its own subset and adds typed tools via
 -- `extra_tools = { { schema = ..., handler = function(args, emit) ... } }`.
-return require("libs.read-only-tools").build()
+return require("libs.read-only-tools").build {
+  include = {
+    "list_dir",
+    "search_text",
+    "python-read",
+    "instructions",
+    "discover_instruction_files",
+  },
+}
