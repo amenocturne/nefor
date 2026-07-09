@@ -9,29 +9,29 @@ Keeping those axes separate prevents plan review, ordinary tool risk, and hard d
 
 ## Modes
 
-| Mode | Contract |
-| --- | --- |
-| `safe` | Human is in the loop. Safe actions run; actions requiring judgment or risk acceptance ask. |
+| Mode   | Contract                                                                                                                      |
+| ------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| `safe` | Human is in the loop. Safe actions run; actions requiring judgment or risk acceptance ask.                                    |
 | `auto` | Autonomous but not allowed to invent human approval. Safe actions run; risky actions and write-review human steps are denied. |
-| `yolo` | User has accepted broad risk. Gates approve. |
+| `yolo` | User has accepted broad risk. Gates approve.                                                                                  |
 
 ## Action Classes
 
-| Class | Meaning | Examples |
-| --- | --- | --- |
-| `safe` | Non-destructive mechanical action. | `read_file`, read-only graph dispatch, read-only tools. |
-| `human` | Action whose value is the human judgment itself. | `write-review` plan approval. |
-| `guarded` | Operation that can be acceptable, but needs explicit risk acceptance when no autonomous policy proves it safe. | `bash` that `da` cannot prove safe. |
-| `forbidden` | Operation classified as dangerous. | `bash` that `da` rejects. |
+| Class       | Meaning                                                                                                        | Examples                                                |
+| ----------- | -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| `safe`      | Non-destructive mechanical action.                                                                             | `read_file`, read-only graph dispatch, read-only tools. |
+| `human`     | Action whose value is the human judgment itself.                                                               | `write-review` plan approval.                           |
+| `guarded`   | Operation that can be acceptable, but needs explicit risk acceptance when no autonomous policy proves it safe. | `bash` that `da` cannot prove safe.                     |
+| `forbidden` | Operation classified as dangerous.                                                                             | `bash` that `da` rejects.                               |
 
 ## Decision Table
 
 | Action class | `safe` mode | `auto` mode | `yolo` mode |
-| --- | --- | --- | --- |
-| `safe` | approve | approve | approve |
-| `human` | ask/block | deny | approve |
-| `guarded` | ask | deny | approve |
-| `forbidden` | ask | deny | approve |
+| ------------ | ----------- | ----------- | ----------- |
+| `safe`       | approve     | approve     | approve     |
+| `human`      | ask/block   | deny        | approve     |
+| `guarded`    | ask         | deny        | approve     |
+| `forbidden`  | ask         | deny        | approve     |
 
 ## Current Layering
 

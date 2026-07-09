@@ -2,12 +2,12 @@
 
 nefor runs as a small engine plus user-owned Lua composition. The shipped starter layers MAG, providers, tools, approvals, sessions, and interfaces on top of that substrate; those choices are replaceable composition, not engine behavior.
 
-| Layer | What it owns | What it avoids |
-| --- | --- | --- |
-| Engine / bus | Spawning plugin processes, bridging stdio, hosting Lua, routing raw lines through the Lua dispatch hook, stamping in-memory log entries with origin and timestamp. | Parsing NCP bodies for routing, owning sessions, writing session jsonl, knowing workflows or approvals. |
-| Plugins | Self-contained capabilities over stdin/stdout: providers, tools, TUI, MAG runtime, registries, test actors. | Cross-plugin policy or hard-coded knowledge of how another plugin is used. |
-| Lua composition and libraries | Dispatch, NCP handshake/routing semantics, actor spawning, provider/tool wiring, sessions, approval policy, UI reducers, CLI/TUI surfaces. | Heavy provider/tool implementation that belongs in a process plugin. |
-| MAG | Actor-kernel programs and one-off graph execution used by the starter lead workflow. | Replacing all Lua orchestration; the shipped starter still uses Lua for policy, sessions, routing, and control. |
+| Layer                         | What it owns                                                                                                                                                       | What it avoids                                                                                                  |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| Engine / bus                  | Spawning plugin processes, bridging stdio, hosting Lua, routing raw lines through the Lua dispatch hook, stamping in-memory log entries with origin and timestamp. | Parsing NCP bodies for routing, owning sessions, writing session jsonl, knowing workflows or approvals.         |
+| Plugins                       | Self-contained capabilities over stdin/stdout: providers, tools, TUI, MAG runtime, registries, test actors.                                                        | Cross-plugin policy or hard-coded knowledge of how another plugin is used.                                      |
+| Lua composition and libraries | Dispatch, NCP handshake/routing semantics, actor spawning, provider/tool wiring, sessions, approval policy, UI reducers, CLI/TUI surfaces.                         | Heavy provider/tool implementation that belongs in a process plugin.                                            |
+| MAG                           | Actor-kernel programs and one-off graph execution used by the starter lead workflow.                                                                               | Replacing all Lua orchestration; the shipped starter still uses Lua for policy, sessions, routing, and control. |
 
 ## The decoupling rule
 

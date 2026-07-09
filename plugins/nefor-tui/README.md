@@ -94,25 +94,25 @@ NEFOR_CONFIG_DIR=$PWD/starter NEFOR_PLUGIN_DIR=$PWD/target/debug cargo run --bin
 
 ## Layout
 
-| File                  | Role                                                                                |
-| --------------------- | ----------------------------------------------------------------------------------- |
-| `src/desc.rs`         | Widget descriptions; Lua-table → `WidgetDescription` parser.                        |
-| `src/instance.rs`     | Reconciler-owned instance tree types + key composition.                             |
-| `src/reconciler.rs`   | `(type_tag, key)` match, mount / reuse / unmount.                                   |
-| `src/layout.rs`       | Constraints-down / sizes-up two-pass layout for every primitive.                    |
-| `src/render.rs`       | Line-diff renderer + frame buffer.                                                  |
-| `src/ansi.rs`         | CSI helpers (sync output, SGR, cursor moves).                                       |
-| `src/lua_host.rs`     | mlua VM, `tui.*` install, view/update dispatch, NCP bus bridge.                     |
-| `src/input.rs`        | Crossterm `KeyEvent` → engine `KeyMessage`.                                         |
-| `src/input_router.rs` | Editing-keys-to-focused-text_input vs bubble-to-Lua.                                |
-| `src/mouse.rs`        | Hit-test + auto-wheel-scroll routing.                                               |
-| `src/scrollable.rs`   | Scroll state + wheel-step constants.                                                |
-| `src/text_input.rs`   | Single-line + multiline edit state, IME, paste.                                     |
-| `src/markdown.rs`     | pulldown-cmark adapter for `tui.markdown`.                                          |
-| `src/animation.rs`    | Time-based frame sampler.                                                           |
-| `src/engine.rs`       | State machine — owns reconciler + renderer + lua + NCP queue.                       |
-| `src/ncp.rs`          | NCP stdio transport.                                                                |
-| `src/tty.rs`          | `/dev/tty` open + `RawModeGuard`.                                                   |
+| File                  | Role                                                                                  |
+| --------------------- | ------------------------------------------------------------------------------------- |
+| `src/desc.rs`         | Widget descriptions; Lua-table → `WidgetDescription` parser.                          |
+| `src/instance.rs`     | Reconciler-owned instance tree types + key composition.                               |
+| `src/reconciler.rs`   | `(type_tag, key)` match, mount / reuse / unmount.                                     |
+| `src/layout.rs`       | Constraints-down / sizes-up two-pass layout for every primitive.                      |
+| `src/render.rs`       | Line-diff renderer + frame buffer.                                                    |
+| `src/ansi.rs`         | CSI helpers (sync output, SGR, cursor moves).                                         |
+| `src/lua_host.rs`     | mlua VM, `tui.*` install, view/update dispatch, NCP bus bridge.                       |
+| `src/input.rs`        | Crossterm `KeyEvent` → engine `KeyMessage`.                                           |
+| `src/input_router.rs` | Editing-keys-to-focused-text_input vs bubble-to-Lua.                                  |
+| `src/mouse.rs`        | Hit-test + auto-wheel-scroll routing.                                                 |
+| `src/scrollable.rs`   | Scroll state + wheel-step constants.                                                  |
+| `src/text_input.rs`   | Single-line + multiline edit state, IME, paste.                                       |
+| `src/markdown.rs`     | pulldown-cmark adapter for `tui.markdown`.                                            |
+| `src/animation.rs`    | Time-based frame sampler.                                                             |
+| `src/engine.rs`       | State machine — owns reconciler + renderer + lua + NCP queue.                         |
+| `src/ncp.rs`          | NCP stdio transport.                                                                  |
+| `src/tty.rs`          | `/dev/tty` open + `RawModeGuard`.                                                     |
 | `src/main.rs`         | Binary entrypoint: NCP handshake/stdio loop + crossterm event loop + `--script` flag. |
-| `tests/*_test.rs`     | In-process integration tests for engine, layout, scrollable, text_input, animation. |
-| `scenarios/*.lua`     | Standalone Lua apps for direct inspection.                                          |
+| `tests/*_test.rs`     | In-process integration tests for engine, layout, scrollable, text_input, animation.   |
+| `scenarios/*.lua`     | Standalone Lua apps for direct inspection.                                            |

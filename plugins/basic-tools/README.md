@@ -11,8 +11,8 @@ to be run behind `tool-gate` in the starter composition.
 See [`starter/chat/README.md`](../../starter/chat/README.md) → "Tool calling
 (v1)" for the canonical spec. Quick reference:
 
-| Event                     | Direction            | Routing                               |
-| ------------------------- | -------------------- | ------------------------------------- |
+| Event                       | Direction            | Routing                               |
+| --------------------------- | -------------------- | ------------------------------------- |
 | `tool.register`             | basic-tools → bus    | broadcast (standalone mode)           |
 | `tool-gate.tools.advertise` | basic-tools → gate   | private advertisement (`--gate`)      |
 | `basic-tools.tool.invoke`   | caller → basic-tools | targeted (engine prefix-routing)      |

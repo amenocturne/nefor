@@ -37,6 +37,6 @@ nefor plugin agentic-cli --format stream-json "do something"
 | `-m`, `--model MODEL` | Switch model on the active provider                               |
 | `--format FMT`        | Output format: `text` / `json` / `stream-json`                    |
 | `-f`, `--file PATH`   | Prepend file contents to the prompt                               |
-| `--mode MODE`         | Set approval mode: `safe`, `auto`, or `yolo`                       |
+| `--mode MODE`         | Set approval mode: `safe`, `auto`, or `yolo`                      |
 | `--yolo`              | Alias for `--mode yolo`                                           |
 | `-h`, `--help`        | Show help (pass `--` first: `nefor plugin agentic-cli -- --help`) |

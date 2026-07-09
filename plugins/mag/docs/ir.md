@@ -36,7 +36,7 @@ primitives — logic lives in MAG, reached through the evaluator.
   not currently a general routeable failure output.
 - `rules` — rule bindings. The IR shape can represent them, but the shipped
   kernel rejects any non-empty `rules` list at apply with `"rules not
-  implemented"`; current programs therefore run with `rules: []`.
+implemented"`; current programs therefore run with `rules: []`.
 
 ## The fold
 
@@ -225,7 +225,7 @@ plain data out; it never learns what a function is.
 > **Status: kernel rule-firing is not shipped.** The compiler and resident
 > evaluator can represent/apply rule functions, but the kernel fold does not
 > fire them: a non-empty `rules` list is rejected at apply with `"rules not
-> implemented"`. Current load-time lowering emits `rules: []` for static
+implemented"`. Current load-time lowering emits `rules: []` for static
 > graphs; rule-bearing modifications can only arrive via hand-authored or
 > eval-produced modification data and will be rejected by kernel apply today.
 > Every shipped program is therefore fully static — all composition is routes
