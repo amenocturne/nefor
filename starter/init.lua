@@ -430,6 +430,10 @@ actor.spawn(tools.basic_actor_spec())
 actor.spawn(require("libs.compositors.chat_bridge").spawn_spec({
   require("config").bin("nefor-tui"),
   "--script", STARTER_ROOT .. "/chat/init.lua",
+  -- Thread the composition's resolved lua/ tree explicitly (same contract
+  -- as mag's --lua-root). The chat script's env-based fallbacks can
+  -- otherwise resolve a different tree than the one this init picked.
+  "--lua-root", NEFOR_ROOT .. "/lua",
 }))
 
 if startup.prompt ~= nil then

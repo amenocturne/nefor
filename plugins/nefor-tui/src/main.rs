@@ -54,13 +54,15 @@ const PLACEHOLDER_SCENARIO: &str = r#"
     }
 "#;
 
-/// Parse `--script <path>` (or `-s <path>`) out of `std::env::args`.
-/// Hand-rolled, no external dep — clap would just slow build times for
-/// what is structurally a single-flag CLI. Unrecognised flags abort the
-/// run with a usage hint so a typo doesn't silently load the placeholder.
-fn parse_script_flag() -> Result<Option<PathBuf>, String> {
+/// Parse `--script <path>` (or `-s <path>`) and `--lua-root <dir>` out of
+/// `std::env::args`. Hand-rolled, no external dep — clap would just slow
+/// build times for what is structurally a two-flag CLI. Unrecognised flags
+/// abort the run with a usage hint so a typo doesn't silently load the
+/// placeholder.
+fn parse_flags() -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
     let mut iter = std::env::args().skip(1);
     let mut script: Option<PathBuf> = None;
+    let mut lua_root: Option<PathBuf> = None;
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-s" | "--script" => {
@@ -69,9 +71,18 @@ fn parse_script_flag() -> Result<Option<PathBuf>, String> {
                     .ok_or_else(|| "nefor-tui: --script requires a path argument".to_string())?;
                 script = Some(PathBuf::from(path));
             }
+            "--lua-root" => {
+                let path = iter
+                    .next()
+                    .ok_or_else(|| "nefor-tui: --lua-root requires a path argument".to_string())?;
+                lua_root = Some(PathBuf::from(path));
+            }
             "-h" | "--help" => {
-                return Err("Usage: nefor-tui [--script <path>]\n\n\
+                return Err("Usage: nefor-tui [--script <path>] [--lua-root <dir>]\n\n\
                      --script <path>   Load a Lua composition that calls tui.start { ... }.\n\
+                     --lua-root <dir>  Shared lua/ tree for the composition's requires\n\
+                     \x20                 (same contract as mag-plugin's --lua-root; exported\n\
+                     \x20                 as NEFOR_LUA_DIR / NEFOR_TUI_LUA_DIR for the script).\n\
                      --help            Show this message.\n"
                     .to_string());
             }
@@ -82,7 +93,48 @@ fn parse_script_flag() -> Result<Option<PathBuf>, String> {
             }
         }
     }
-    Ok(script)
+    Ok((script, lua_root))
+}
+
+/// Export `--lua-root` to the script via the env vars the composition
+/// already honors (`pick_dir` in starter/chat/init.lua). Spawn specs carry
+/// no env map, so a composition resolving its lua tree from a non-env
+/// source (e.g. nefor-team reading NEFOR_DEV_DIR from .env.local) has no
+/// other way to thread the tree into this process. Pre-set env wins —
+/// the operator's explicit environment outranks the composition's argv.
+/// Both vars are candidates, not mandates: the script validates each with
+/// a sentinel file and falls back down its candidate list when absent.
+fn export_lua_root(lua_root: &std::path::Path) {
+    // SAFETY: called from the synchronous main before the tokio runtime
+    // (and any other thread) starts.
+    unsafe {
+        if std::env::var_os("NEFOR_LUA_DIR").is_none_or(|v| v.is_empty()) {
+            std::env::set_var("NEFOR_LUA_DIR", lua_root);
+        }
+        if std::env::var_os("NEFOR_TUI_LUA_DIR").is_none_or(|v| v.is_empty()) {
+            if let Some(root) = lua_root.parent() {
+                std::env::set_var("NEFOR_TUI_LUA_DIR", root.join("plugins/nefor-tui/lua"));
+            }
+        }
+    }
+}
+
+/// Export the script's own directory as the starter-chat dir candidate.
+/// The composition script (`chat/init.lua`) is loaded under the chunk name
+/// "scenario", so it cannot self-locate — but its submodules are by
+/// construction its siblings, and this process knows the path it was told
+/// to load. Same pre-set-env-wins / sentinel-validated semantics as
+/// `export_lua_root`.
+fn export_script_dir(script: &std::path::Path) {
+    // SAFETY: called from the synchronous main before the tokio runtime
+    // (and any other thread) starts.
+    unsafe {
+        if std::env::var_os("NEFOR_STARTER_CHAT_DIR").is_none_or(|v| v.is_empty()) {
+            if let Some(dir) = script.parent() {
+                std::env::set_var("NEFOR_STARTER_CHAT_DIR", dir);
+            }
+        }
+    }
 }
 
 /// Read the `--script` file (UTF-8, no encoding sniffing) and feed it to
@@ -158,17 +210,29 @@ fn init_tracing() {
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    init_tracing();
-
-    let script = match parse_script_flag() {
-        Ok(s) => s,
+fn main() -> ExitCode {
+    // Flag parsing and env export happen before the tokio runtime spawns
+    // worker threads — `export_lua_root` mutates the process environment,
+    // which is only sound while the process is single-threaded.
+    let (script, lua_root) = match parse_flags() {
+        Ok(f) => f,
         Err(msg) => {
             eprintln!("{msg}");
             return ExitCode::from(2);
         }
     };
+    if let Some(root) = &lua_root {
+        export_lua_root(root);
+    }
+    if let Some(script) = &script {
+        export_script_dir(script);
+    }
+    async_main(script)
+}
+
+#[tokio::main]
+async fn async_main(script: Option<PathBuf>) -> ExitCode {
+    init_tracing();
 
     let result = run(script.as_ref()).await;
 
