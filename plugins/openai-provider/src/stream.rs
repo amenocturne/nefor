@@ -25,8 +25,14 @@ use crate::openai::{
     StreamOptions, ToolCall, ToolCallFunction, Usage,
 };
 
-const CHAT_STREAM_MAX_ATTEMPTS: usize = 3;
-const CHAT_STREAM_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(250);
+// Retry budget sized for rate-limited internal gateways (429 storms that
+// last tens of seconds): 8 attempts = 7 retries at 0.5s, 1s, 2s, 4s, 8s,
+// 16s, 30s (doubling, capped) ≈ 60s of patience before the turn fails.
+// A `Retry-After` header always overrides the computed delay, and every
+// retry surfaces through RetryProgress so the chat shows what's happening.
+const CHAT_STREAM_MAX_ATTEMPTS: usize = 8;
+const CHAT_STREAM_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(500);
+const CHAT_STREAM_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 /// Outcome of `run_chat_stream`. Carries everything the caller needs to
 /// either finalize the turn (`tool_calls` empty, `finish_reason ==
@@ -399,7 +405,9 @@ fn exponential_retry_delay(failed_attempt: usize) -> Duration {
     let factor = 1u32
         .checked_shl(failed_attempt.saturating_sub(1) as u32)
         .unwrap_or(u32::MAX);
-    CHAT_STREAM_INITIAL_RETRY_DELAY.saturating_mul(factor)
+    CHAT_STREAM_INITIAL_RETRY_DELAY
+        .saturating_mul(factor)
+        .min(CHAT_STREAM_MAX_RETRY_DELAY)
 }
 
 fn retry_after_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {

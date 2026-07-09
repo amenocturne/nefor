@@ -168,10 +168,10 @@ async fn chat_stream_retries_429_then_succeeds_and_reports_progress() {
     assert_eq!(progress.len(), 1);
     assert_eq!(progress[0].status, Some(429));
     assert_eq!(progress[0].retry_index(), 1);
-    assert_eq!(progress[0].max_retries(), 2);
+    assert_eq!(progress[0].max_retries(), 7);
     assert_eq!(
         progress[0].next_delay,
-        std::time::Duration::from_millis(250)
+        std::time::Duration::from_millis(500)
     );
 }
 
