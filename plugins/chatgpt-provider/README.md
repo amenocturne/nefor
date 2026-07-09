@@ -15,10 +15,18 @@ flag. Users pick via `/model` in the chat surface.
 
 ## Wire contract
 
-Same event shape as `openai-provider` (`<prefix>.stream.delta`,
-`<prefix>.stream.end`, `<prefix>.session.stats`, etc.) with `chatgpt` as
-the default prefix. Tool calling is supported via a `ToolBroker` that
-correlates `tool.result` events back to the in-flight turn.
+Same chat-scoped event shape as `openai-provider` with `chatgpt` as the
+default prefix: `<prefix>.chat.create`, `.chat.append`, `.chat.complete`,
+`.chat.delete`, stream events (`<prefix>.stream.delta` / `.stream.end`),
+session stats, auth status, model list/status, and lifecycle events. Tool
+calling is supported via a `ToolBroker` that consumes `tool.register`, invokes
+registered tools, and correlates `tool.result` events back to the in-flight
+turn.
+
+Image media returned by tools such as `read_image` is converted to Responses
+API `InputImage` items for vision-capable models. If the active model cannot
+accept images, the provider returns an explicit model-capability error instead
+of silently dropping the media.
 
 ## Run
 

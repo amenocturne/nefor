@@ -5,11 +5,12 @@ Process-isolated NCP plugins. Each plugin is its own crate with a binary entry p
 ## Layout
 
 - `nefor-tui/` — declarative TUI: layout primitives + reconciler + line-diff renderer + Lua VM.
-- `openai-provider/` — OpenAI-compatible HTTP provider.
+- `openai-provider/` — OpenAI-compatible `/v1/chat/completions` HTTP provider.
+- `chatgpt-provider/` — ChatGPT-subscription Responses API provider with OAuth login.
 - `mag/` — MAG actor kernel: executes compiled `.mag` programs as actor constellations.
 - `tool-gate/` — tool advertisement + permission gate.
-- `basic-tools/` — `read_file` / `write_file` / `bash` built-ins.
-- `generic-provider/`, `generic-tool/` — passive type-registry hubs for graph composition.
+- `basic-tools/` — file/image/search/edit/shell tools (`read_file`, `read_image`, `search_text`, `write_file`, `edit_file`, `bash`).
+- `generic-provider/`, `generic-tool/` — passive hubs that emit type-registry events for graph composition.
 - `mock-plugin/` — scriptable NCP actor for integration tests.
 
 ## Authoring

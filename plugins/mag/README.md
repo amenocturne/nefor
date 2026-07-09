@@ -30,4 +30,4 @@ carry a kernel copy. Resolution order, highest precedence first:
 - [docs/actor-model.md](docs/actor-model.md) — actors, factories, lifecycle, contracts, signals
 - [docs/ir.md](docs/ir.md) — graph modifications, the fold, firing, rules, application semantics
 - [docs/lowering.md](docs/lowering.md) — MAG graph syntax → modification: edges into routes, namespacing, shell defaults
-- [docs/patterns.md](docs/patterns.md) — canonical shapes for MAG programs (dependencies, joins, races, retries)
+- [docs/patterns.md](docs/patterns.md) — canonical shipped shapes for MAG programs (dependencies, joins, cycles, failure repair, fanout/timeouts)

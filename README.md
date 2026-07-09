@@ -125,7 +125,7 @@ All commands live in the [`justfile`](justfile). Run `just` to see the full list
 - [Plugin authoring guide](docs/plugin-authoring.md)
 - [Testing](docs/testing.md)
 - [Glossary](docs/glossary.md)
-- [NCP spec](protocol/v0.1/spec.md)
+- [Current protocol](docs/protocol.md)
 - [Plugins](plugins/README.md)
 - [Starter composition](starter/README.md)
 - [Lua core](lua/core/README.md)

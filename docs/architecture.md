@@ -1,47 +1,35 @@
-# Architecture — four execution layers
+# Architecture
 
-nefor executes work across four layers. Each layer has a fixed job; the most
-common architectural bug is putting code one layer too low.
+nefor runs as a small engine plus user-owned Lua composition. The shipped starter layers MAG, providers, tools, approvals, sessions, and interfaces on top of that substrate; those choices are replaceable composition, not engine behavior.
 
-| Layer             | What it is                             | What it does                                                                                                                                                                                                         | What it never does                                                                                       |
-| ----------------- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| Engine            | Dumb string bus                        | Route strings between plugin processes, stamp envelopes, persist the session log, invoke the Lua dispatch hook                                                                                                       | Know about actors, runs, workflows, signals                                                              |
-| Plugins           | Heavyweight OS processes, boot-spawned | Capability providers. Own all provider quirks (e.g. `chatgpt-provider` owns everything about talking to OpenAI). Each exposes its own API — including whether cancellation exists at all                             | Contain workflow logic. Know how their capability is being used                                          |
-| Lua (trait layer) | Actor factories + kernel               | Define the primitive actor shapes (`llm`, `run-tool`, `human`, `sink`, …) with declared I/O contracts and explicit signal handlers. Host the kernel: spawn / kill / send over in-memory actors, routing, correlation | Define composed workflows. Hold two levels of abstraction (building blocks _and_ things built from them) |
-| MAG               | The language                           | Instances and composition. `(agent {:id "..." ...} : IN -> FinalAnswer)` creates a live actor constellation. `agent` is a MAG stdlib function composing primitives (the bare agentic loop)                           | Reach below the primitive contracts                                                                      |
+| Layer | What it owns | What it avoids |
+| --- | --- | --- |
+| Engine / bus | Spawning plugin processes, bridging stdio, hosting Lua, routing raw lines through the Lua dispatch hook, stamping in-memory log entries with origin and timestamp. | Parsing NCP bodies for routing, owning sessions, writing session jsonl, knowing workflows or approvals. |
+| Plugins | Self-contained capabilities over stdin/stdout: providers, tools, TUI, MAG runtime, registries, test actors. | Cross-plugin policy or hard-coded knowledge of how another plugin is used. |
+| Lua composition and libraries | Dispatch, NCP handshake/routing semantics, actor spawning, provider/tool wiring, sessions, approval policy, UI reducers, CLI/TUI surfaces. | Heavy provider/tool implementation that belongs in a process plugin. |
+| MAG | Actor-kernel programs and one-off graph execution used by the starter lead workflow. | Replacing all Lua orchestration; the shipped starter still uses Lua for policy, sessions, routing, and control. |
 
 ## The decoupling rule
 
-A plugin's capability and the logic that uses it are separate concerns. All
-workflow logic is MAG programs; plugins are pure capability.
+A plugin capability and the logic that uses it are separate concerns. Adding a new workflow or policy should normally touch Lua composition, Lua libraries, or MAG programs, not provider/tool plugin internals.
 
-**The test: adding a new workflow pattern touches zero plugins.** If it means
-editing a handler table or a plugin, the layering is broken.
+Bash-tool test: a plugin should feel like a self-contained utility you could run from a shell, then compose elsewhere. If code names neighboring plugins, rewrites their event shapes, or decides global policy, it is glue; put it in Lua.
 
-## What earns a Lua-level primitive
+## What belongs in Lua
 
-Something is Lua-level **iff MAG cannot express it**: either it crosses a plugin
-boundary (`llm`, `run-tool`, `human`) or it is irreducible runtime machinery
-(`llm` transcript state, `sink` routing). Everything composable from primitives
-lives in the MAG stdlib — `agent` included. The lead still writes
-`(agent {:id "..." ...} : ...)`; it is a stdlib function, not a runtime feature.
+Lua owns behavior that is composition-specific or bus-aware:
+
+- NCP handshake and default routing (`lua/core/ncp.lua`).
+- Actor spawning and dispatch wiring (`starter/init.lua`, `lua/core/actor.lua`).
+- Session persistence and resume (`lua/libs/sessions`).
+- Approval and tool validation policy (`lua/libs/tool-validator`, `lua/libs/lead-workflow`).
+- Provider/tool adapters and interface reducers.
+- MAG submission/control and workspace management.
+
+Pure reusable mechanisms live under `lua/core` or `lua/libs`; starter opinions and concrete wiring live under `starter`.
 
 ## Control plane
 
-The lead operates on run statuses and results, never on the data flowing
-between actors. Within a run, actors pass typed messages along routes; the
-run's result reaches the lead inline on `mag.run_result` (and `mag-eval`
-returns the terminal node's output inline). Per-node file persistence
-(`runs/<run_id>/<node>.output`) is host-gated on the shared Lua tree: the mag
-plugin points its kernel VM's `package.path` at the `--lua-root` the composition
-resolves (`starter/init.lua`), so `require("output-persistence")` — and thus
-persistence — is **active** whenever that tree resolves. That is the deployed
-default: `starter` passes `--lua-root`, and installed configs fall back to the
-data-root pm checkout (`<data>/nefor/lua`); a live session persists a full run's
-node outputs under `sessions/<sid>/mag/runs/<run_id>/`. It degrades to a warned
-no-op (`persisted = false`) only when no Lua tree resolves — a kernel loaded
-without `--lua-root` and outside any repo/data tree, as in bare plugin unit
-tests (`LuaHost::load_kernel(path, None)`), which is the vantage point that reads
-as "inactive". Either way the inline result on `mag.run_result` stays the live
-channel; persisted paths are a control-plane convenience the lead may read. The
-graph is the data bus; the lead is the control plane.
+The lead operates on run statuses and results, not by inspecting every internal message in a graph. MAG run results are delivered inline on bus events, and the lead-workflow tools expose graph status and output lookup as control-plane conveniences.
+
+Persistence is not an engine promise. The engine keeps an in-memory log for dispatch/replay while the process is alive. Long-term session and MAG-output persistence are Lua/plugin mechanisms owned by the starter libraries and MAG kernel integration.

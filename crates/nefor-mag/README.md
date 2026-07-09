@@ -4,7 +4,7 @@ A pure compile-time data-construction language for composing Nefor reasoner work
 
 ## Pipeline
 
-`.mag` source → lexer → parser → evaluator → graph validator → normalized JSON IR + sha256 hash → executor
+`.mag` source → lexer → parser → evaluator → graph validator → graph modification JSON (`ModificationIr`) + sha256 hash → plugin Lua kernel
 
 ## Language
 
@@ -13,7 +13,7 @@ MAG uses a Lisp-like syntax where code is data. Core constructs:
 - `def`, `fn`, `let`, `if` — standard binding and control flow
 - `->` — threading macro
 - `node` — declare a typed graph node with a kernel factory, params, and type annotation
-- `agent` — the tool-use loop template (`(agent {:id … :system … :provider …} : IN -> OUT)`); the loop is unbounded — the typed final answer is its terminator, and runs are stopped via kill/interrupt; there is no "agent" node factory
+- `agent` — the tool-use loop template (`(agent {:id … :system … :provider …} : IN -> OUT)`); the loop is unbounded — the typed final answer is its terminator, and runs are stopped via kill/interrupt; there is no "agent" node factory. Agent config keys are limited to `id`, `model`, `profile`, `provider`, `system`, and `tools`; raw reasoning params belong on direct `llm` nodes or host overlays.
 - `graph` — compose nodes with directed edges
 - `type` — forward-declare a type name
 - `require` — load modules from the library path
@@ -38,7 +38,7 @@ Types annotate node inputs and outputs for graph validation and fanout routing:
   : generic-provider.ProviderOut -> (generic-tool.ToolCalls | generic-provider.FinalAnswer))
 ```
 
-Union types (`A | B`) create fanout nodes. The type names must match registered runtime combinators for fanout routing to work.
+Union types (`A | B`) create multiple route keys / fanout routes. The type names must match registered runtime combinators for routing to work.
 
 ## Examples
 

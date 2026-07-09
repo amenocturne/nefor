@@ -48,8 +48,8 @@ From the workspace root:
 # Passive mode: ready and listen.
 cargo run -p fake-engine -- target/debug/nefor-tui
 
-# Script mode: drive the plugin through a render.
-cargo run -p fake-engine -- target/debug/nefor-tui --script tools/fake-engine/scripts/hello-world.jsonl
+# Script mode: play a JSONL event script into a plugin.
+cargo run -p fake-engine -- target/debug/mock-plugin --script path/to/script.jsonl
 ```
 
 ## Script file format
@@ -65,25 +65,25 @@ cargo run -p fake-engine -- target/debug/nefor-tui --script tools/fake-engine/sc
 - A **comment**: any line whose first non-whitespace character is `#`.
 - A **sleep pragma**: `# sleep 500ms`, `# sleep 2s`. Pauses playback.
 
-Example (from `scripts/hello-world.jsonl`):
+Example:
 
 ```jsonl
-# Draw "Hello, NCP!" to grid 1 then shut down.
-{"type":"event","body":{"kind":"nefor-tui.default_colors","fg":16777215,"bg":0,"sp":16777215}}
-{"type":"event","body":{"kind":"nefor-tui.grid.resize","grid":1,"width":80,"height":24}}
-{"type":"event","body":{"kind":"nefor-tui.grid.clear","grid":1}}
-{"type":"event","body":{"kind":"nefor-tui.grid.line","grid":1,"row":0,"col_start":0,"cells":[["Hello, NCP!",1,null]]}}
-{"type":"event","body":{"kind":"nefor-tui.grid.flush"}}
-# sleep 2s
+# Send a chat-style event, wait, then shut down.
+{"type":"event","body":{"kind":"chat.input.submit","text":"hello"}}
+# sleep 500ms
 {"type":"system","body":{"kind":"shutdown","grace_ms":1000}}
 ```
 
+For `nefor-tui`, current scripts should target the declarative Lua app loaded
+with `nefor-tui --script <lua>` and send the app-specific events its
+`update(msg, state)` handles. The old `nefor-tui.grid.*` protocol is not a
+current TUI input API.
+
 ## Included scripts
 
-| Script              | Purpose                                                  |
-| ------------------- | -------------------------------------------------------- |
-| `hello-world.jsonl` | Basic render path: colors, highlight, grid, line, flush. |
-| `echo-keys.jsonl`   | Minimal grid + hold-open; verify plugin input routing.   |
+No current script is part of the public contract. Treat any checked-in scripts
+that use `nefor-tui.grid.*` as legacy examples for the pre-declarative TUI and
+not as functional protocol documentation.
 
 Passive mode (no `--script`) is equivalent to an empty script that never
 terminates — the default choice when you just want to log plugin output.

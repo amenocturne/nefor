@@ -88,7 +88,8 @@ See `tests/snapshot_test.rs` for the canonical pattern.
 The full chat surface comes up via the engine launcher:
 
 ```sh
-NEFOR_PLUGIN_DIR=$PWD/plugins cargo run --bin nefor -- --config ./starter
+cargo build --workspace
+NEFOR_CONFIG_DIR=$PWD/starter NEFOR_PLUGIN_DIR=$PWD/target/debug cargo run --bin nefor
 ```
 
 ## Layout
@@ -112,6 +113,6 @@ NEFOR_PLUGIN_DIR=$PWD/plugins cargo run --bin nefor -- --config ./starter
 | `src/engine.rs`       | State machine — owns reconciler + renderer + lua + NCP queue.                       |
 | `src/ncp.rs`          | NCP stdio transport.                                                                |
 | `src/tty.rs`          | `/dev/tty` open + `RawModeGuard`.                                                   |
-| `src/main.rs`         | Binary entrypoint: NCP handshake + crossterm event loop + `--script` flag.          |
+| `src/main.rs`         | Binary entrypoint: NCP handshake/stdio loop + crossterm event loop + `--script` flag. |
 | `tests/*_test.rs`     | In-process integration tests for engine, layout, scrollable, text_input, animation. |
 | `scenarios/*.lua`     | Standalone Lua apps for direct inspection.                                          |

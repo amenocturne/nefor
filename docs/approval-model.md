@@ -5,23 +5,22 @@ The starter approval model has two axes:
 1. Mode: how much autonomy the user granted.
 2. Action class: why an action needs approval.
 
-Keeping those axes separate prevents plan review, ordinary tool risk, and hard
-danger from collapsing into one generic "permission denied" path.
+Keeping those axes separate prevents plan review, ordinary tool risk, and hard danger from collapsing into one generic permission path.
 
 ## Modes
 
 | Mode | Contract |
 | --- | --- |
-| `safe` | The human is in the loop. Safe actions run; anything requiring judgment or risk acceptance asks. |
-| `auto` | The agent runs autonomously. Safe actions run; safe human-judgment steps are auto-resolved; risky actions that need a human are denied. |
-| `yolo` | The agent is allowed to do whatever the user asked for. All gates approve. |
+| `safe` | Human is in the loop. Safe actions run; actions requiring judgment or risk acceptance ask. |
+| `auto` | Autonomous but not allowed to invent human approval. Safe actions run; risky actions and write-review human steps are denied. |
+| `yolo` | User has accepted broad risk. Gates approve. |
 
 ## Action Classes
 
 | Class | Meaning | Examples |
 | --- | --- | --- |
-| `safe` | Non-destructive mechanical action. | `read_file`, `mag-eval` dispatch, read-only graph dispatch. |
-| `human` | Safe action whose value is the human judgment itself. | `write-review` plan approval. |
+| `safe` | Non-destructive mechanical action. | `read_file`, read-only graph dispatch, read-only tools. |
+| `human` | Action whose value is the human judgment itself. | `write-review` plan approval. |
 | `guarded` | Operation that can be acceptable, but needs explicit risk acceptance when no autonomous policy proves it safe. | `bash` that `da` cannot prove safe. |
 | `forbidden` | Operation classified as dangerous. | `bash` that `da` rejects. |
 
@@ -30,7 +29,7 @@ danger from collapsing into one generic "permission denied" path.
 | Action class | `safe` mode | `auto` mode | `yolo` mode |
 | --- | --- | --- | --- |
 | `safe` | approve | approve | approve |
-| `human` | ask/block | auto-resolve | approve |
+| `human` | ask/block | deny | approve |
 | `guarded` | ask | deny | approve |
 | `forbidden` | ask | deny | approve |
 
@@ -40,7 +39,12 @@ danger from collapsing into one generic "permission denied" path.
 - `tool-validator` owns tool-risk classification before a popup reaches chat.
 - `lead-workflow` owns plan approval and writer graph dispatch policy.
 
-Plan approval is not a dangerous action. In `safe`, it blocks for the user's
-verdict. In `auto`, it records the plan and auto-resolves so the agent can keep
-running. Dangerous tool calls inside a dispatched graph are still classified by
-`tool-validator`.
+Current shipped behavior:
+
+- `write-review` blocks for `/approve` or `/reject` in `safe`.
+- `write-review` is denied in `auto`; the agent cannot auto-resolve a human review.
+- `write-review` is auto-approved in `yolo`.
+- Read-only tools and configured auto-approved tools can pass without a popup.
+- `edit_file` is approved for non-read-only agents by tool-validator policy.
+- `write_file` requires an approved plan.
+- `bash` is checked by `da` plus configured fast paths; missing `da` is an install/configuration error, not an approval fallback.

@@ -17,7 +17,7 @@ Worked example: `../tests/fixtures/two-agents.mag` → `../tests/fixtures/two-ag
 ## Load pipeline
 
 ```
-source ──parse──▶ evaluate defs ──extract graph──▶ lower ──▶ GraphModification ──validate──▶ resident env
+source ──parse──▶ evaluate defs ──extract graph──▶ validate graph ──▶ lower ──▶ GraphModification ──validate modification──▶ resident env
 ```
 
 `evaluate defs` expands stdlib functions like `(agent ...)` into concrete
@@ -89,8 +89,10 @@ a single output port on `llm`. The loop's terminator is structural: the
 llm's output is the union `ToolCalls | OUT`, so a final answer exits through
 the output port. Loops are unbounded — stopping a runaway run is the control
 plane's kill/interrupt, not a compiled bound. Agent config keys are a fixed
-allowlist (`AGENT_CONFIG_KEYS`, eval.rs): an unknown key like `:max-steps`
-rejects at compile, and there is no loop-budget mechanism to author.
+allowlist (`AGENT_CONFIG_KEYS`, eval.rs): `id`, `model`, `profile`, `provider`,
+`system`, and `tools`. An unknown key like `:max-steps` or raw reasoning params
+rejects at compile, and there is no loop-budget mechanism to author. Use raw
+reasoning params on direct `llm` nodes or host overlays, not on `agent`.
 
 | Template-internal name | `docs-explorer` instance    | `code-writer` instance    |
 | ---------------------- | --------------------------- | ------------------------- |
@@ -99,11 +101,10 @@ rejects at compile, and there is no loop-budget mechanism to author.
 | `run-tool`             | `docs-explorer.run-tool`    | `code-writer.run-tool`    |
 | `tool-result`          | `docs-explorer.tool-result` | `code-writer.tool-result` |
 
-Namespacing rewrites three things at instantiation: (1) each actor `id`, (2)
-every internal route destination, (3) any rule `on` id the template binds. The
-prefix is one segment; rule-driven instantiation (for-each fanout) extends the
-namespace further with item indices (ir.md: `docs-explorer.sub.0`, …), applied
-by the rule function, not by load-time lowering.
+Namespacing rewrites the actor `id`s, internal edge endpoints, boundary input,
+and boundary outputs at instantiation. Current load-time lowering emits no
+rules. If/when templates bind rules, their `on` ids will need the same
+namespacing, but that is not shipped behavior today.
 
 **Boundary ports.** A subgraph exposes one input port and one output port. The
 port is not an actor — it is a handle the caller wires. Composition resolves it
@@ -209,32 +210,18 @@ source keeps the task seed (ir.rs `initial_activation_content`).
 
 | Section    | Initial modification content                                                                          | Notes                                                                                                                                                                                                                         |
 | ---------- | ----------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `messages` | one activation to the entry port of the first agent: `{to: "docs-explorer.entry", content: {…task…}}` | Delivered after the whole constellation registers (spawns precede messages in the apply); it satisfies `docs-explorer.entry`'s input contract, which constructs the adapter and fires it (lazy construction — actor-model.md) |
-| `kills`    | `[]`                                                                                                  | The initial constellation removes nothing. Kills appear in _rule-produced_ modifications (e.g. the race pattern: first completion's rule kills the losers)                                                                    |
-| `rules`    | `[]`                                                                                                  | A fully static graph binds no rules — all routing is wiring. Rules are for data-dependent composition only                                                                                                                    |
+| `messages` | one activation per source actor / entry port; for a single-agent graph this is `{to: "docs-explorer.entry", content: {…task…}}` | Delivered after the whole constellation registers (spawns precede messages in the apply); each message satisfies its target's input contract, which constructs the actor and fires it (lazy construction — actor-model.md) |
+| `kills`    | `[]`                                                                                                  | The initial constellation removes nothing. Kill removes actors and voids late outputs; it is not a general routeable failure output.                                                                    |
+| `rules`    | `[]`                                                                                                  | Static graphs bind no rules — all shipped composition is routes plus input contracts. The kernel rejects non-empty `rules` with `"rules not implemented"`.                                                                                                                    |
 
-### Where rules would attach
+## Rules status
 
-Rules are `{on: <actor-id>, fn: <name>}` and fire when `<actor-id>` returns
-(ir.md). They enter the picture only when the _shape_ of the next graph depends
-on runtime data. Illustrative (not in this fixture):
-
-- **For-each fanout.** If `docs-explorer` returned a list of sub-tasks and the
-  writer should spawn one sub-agent per item:
-  `{on: "docs-explorer.llm", fn: "fan-out-writers"}`. The rule receives the
-  FinalAnswer, and returns a modification whose `actors` are N namespaced
-  `code-writer.<i>.*` constellations plus the `messages` to seed them.
-- **Race-and-kill.** Spawn three explorers on the same task, bind
-  `{on: "explorer-a.llm", fn: "kill-siblings"}` (and symmetric rules) so the
-  first to finish returns a modification with `kills: ["explorer-b", …]`.
-
-The rule `fn` is a name into the program's source snapshot with declared
-contract `NodeOutput -> GraphModification`; load-time checks that it exists, is
-unary, and matches the contract (ir.md). The compiler emits and validates rules
-and the resident evaluator can apply a rule fn, but the **kernel fold does not
-yet fire rules** — a non-empty `rules` list is rejected at apply
-(`"rules not implemented"`), so shipped programs carry `rules: []` and all
-composition today is static routes plus input contracts (ir.md, Rules).
+The IR can represent rule bindings (`{on, fn}`) and the compiler/resident
+evaluator can represent/apply rule functions, but the shipped kernel fold does
+not fire them. A non-empty `rules` list is rejected at apply (`"rules not
+implemented"`). Current load-time lowering emits `rules: []` for static graphs;
+rule-bearing modifications can only arrive through hand-authored/eval-produced
+modification data and will be rejected by kernel apply today.
 
 ## Master mapping table
 

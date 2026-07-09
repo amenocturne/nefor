@@ -9,7 +9,7 @@ Owns two canonical types:
 - `generic-tool.ToolResults` -- list of tool execution outcomes that feed
   back into the provider on the next firing
 
-On startup, registers these types via MAG's compile-time routing. Concrete tool
+On startup, emits a `combinators.register` event consumed by MAG/routing glue. Concrete tool
 sources (basic-tools, mock-plugin, ...) separately declare `Into`/`From`
 conversions against these tags. This plugin does not execute tools -- it is
 a passive hub that makes the canonical type tags exist on the wire.

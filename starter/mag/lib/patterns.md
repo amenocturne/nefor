@@ -72,13 +72,6 @@ an accumulator with counting logic.
 "Proceed on whichever answers first." Union input `(A | B)`; whichever arrives
 fires alone.
 
-## Race and kill
-
-"Try N approaches; first done wins." Spawn N constellations on the same task;
-bind a rule on each finisher returning `{kills: [<the others>]}`. First-applied
-wins, losers' outputs go void, duplicate kills are no-ops. No coordination logic
-in the actors. (Needs rules — post-MVP.)
-
 ## Cycle
 
 Cycles are legal as-is and unbounded; every cycle exits through a typed
@@ -88,18 +81,7 @@ its exit is stopped via interrupt/kill. Never "give up after N" in a prompt.
 
 ## Fire on failure / repair
 
-"If it fails, route the evidence to a fixer." Failures are typed outputs —
-computed failures returned by the factory, suffered failures (provider error,
-kill, budget) synthesized by the kernel. Route the failure type to the repair
-actor; compose produce → check → repair as an ordinary cycle. Not parsing
-error text out of a success-shaped output.
-
-## Dynamic fanout — for-each
-
-"One explorer yields N findings; one agent per finding." A rule
-`{on: explorer, fn: fan-out}` maps findings to a modification with N namespaced
-constellations plus a product-input join. Needs rules (post-MVP); until then,
-fixed-width fanout is static routes.
+"If it fails, route the evidence to a fixer." Factory/completion failures are typed outputs when a factory returns a failure tag (for example `mag.CommandFailed` from `bash`). Route that failure type to the repair actor; compose produce → check → repair as an ordinary cycle. Unhandled failures escalate to `mag.run_failed`. `kill` removes actors and voids late outputs; it is not a general routeable failure output. Not parsing error text out of a success-shaped output.
 
 ## Same type, two meanings
 

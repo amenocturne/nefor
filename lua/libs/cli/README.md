@@ -28,7 +28,7 @@ nefor plugin agentic-cli --format stream-json "do something"
 
 - **text** (default) — streams `chat.stream.delta` to stdout in real time; tool one-liners to stderr.
 - **json** — single JSON line per turn on completion: `{ answer, tool_calls, duration_ms }`.
-- **stream-json** — every `chat.*` / `graph.*` envelope as one JSON line on stdout (NCP wire format).
+- **stream-json** — every `chat.*` / `mag.*` / `tool.*` envelope as one JSON line on stdout (NCP wire format).
 
 ## Flags
 
@@ -37,5 +37,6 @@ nefor plugin agentic-cli --format stream-json "do something"
 | `-m`, `--model MODEL` | Switch model on the active provider                               |
 | `--format FMT`        | Output format: `text` / `json` / `stream-json`                    |
 | `-f`, `--file PATH`   | Prepend file contents to the prompt                               |
-| `--yolo`              | Enable yolo mode                                                  |
+| `--mode MODE`         | Set approval mode: `safe`, `auto`, or `yolo`                       |
+| `--yolo`              | Alias for `--mode yolo`                                           |
 | `-h`, `--help`        | Show help (pass `--` first: `nefor plugin agentic-cli -- --help`) |

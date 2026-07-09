@@ -32,11 +32,11 @@ primitives — logic lives in MAG, reached through the evaluator.
   no special casing. See lowering.md for the full mapping.
 - `messages` — sends: initial activation for new actors, inputs for
   existing ones.
-- `kills` — ids to remove.
-- `rules` — bindings: when the actor named `on` returns its output,
-  evaluate the MAG function named `fn` with that output and apply the
-  modification it returns. Modifications carry rules too, so dynamically
-  spawned actors can bind rules of their own.
+- `kills` — ids to remove. Kill removes actors and voids late outputs; it is
+  not currently a general routeable failure output.
+- `rules` — rule bindings. The IR shape can represent them, but the shipped
+  kernel rejects any non-empty `rules` list at apply with `"rules not
+  implemented"`; current programs therefore run with `rules: []`.
 
 ## The fold
 
@@ -183,14 +183,16 @@ Unit activation at lowering (lowering.md, Shell defaults).
   no-op. Kill on a dead id: no-op. No-ops are logged — an identical-spec
   duplicate is a race artifact (info), same id with a different spec is
   likely an authoring bug (warning) — but semantics stay uniform: ignored.
-- **Every modification is validated before applying**, with the same
-  validator that checked the program at load: contract compatibility, id
+- **Every modification is validated before applying**. Compiler-side
+  modification validation checks references and shape; the Lua-kernel
+  apply-time validator performs the full factory contract checks: contract
+  compatibility, id
   uniqueness _within_ the modification (the same id spawned twice in one
   `actors` list is a program bug and rejects), and message targets that
   exist or are created within the same modification. Contract compatibility
   covers routes end to end: every route key must be a declared output of the
-  sender's factory (or a reserved kernel-synthesized status tag — `mag.Unit`
-  / `mag.Failed`), and every destination — spawned in the same modification
+  sender's factory (or a reserved / registry-accepted status or failure tag such as `mag.Unit` or
+  factory-specific failures like `mag.CommandFailed`), and every destination — spawned in the same modification
   or already live in the inventory (the post-apply actor set) — must declare
   an input port accepting the routed tag. A route no port accepts REJECTS
   the modification with the precise wiring error; it can never reach
@@ -220,14 +222,14 @@ time the resident evaluator applies it — pure evaluation, same evaluator as
 load, with runtime data as the argument. The kernel sees a name in and
 plain data out; it never learns what a function is.
 
-> **Status: kernel rule-firing is not yet wired.** The compiler emits and
-> validates rules (load-time exists/unary/contract checks) and the resident
-> evaluator can apply a rule fn, but the kernel fold does not yet fire them:
-> a non-empty `rules` list is rejected at apply with `"rules not implemented"`.
+> **Status: kernel rule-firing is not shipped.** The compiler and resident
+> evaluator can represent/apply rule functions, but the kernel fold does not
+> fire them: a non-empty `rules` list is rejected at apply with `"rules not
+> implemented"`. Current load-time lowering emits `rules: []` for static
+> graphs; rule-bearing modifications can only arrive via hand-authored or
+> eval-produced modification data and will be rejected by kernel apply today.
 > Every shipped program is therefore fully static — all composition is routes
-> plus input contracts, `rules: []`. The design below is what firing will do
-> once the fold wires it; patterns that need it (race-and-kill, dynamic fanout)
-> are flagged in patterns.md.
+> plus input contracts.
 
 - Name-plus-snapshot instead of embedded code: a MAG function closes over
   its defining environment, and re-entering the source snapshot provides
@@ -241,9 +243,7 @@ plain data out; it never learns what a function is.
   matches the declared contract. A typo'd name is a load error, not a
   runtime surprise.
 - A modification is a plain map — MAG builds it with ordinary data
-  constructors and the standard validator checks its shape. Patterns like
-  for-each fanout are stdlib functions that return modifications, not IR
-  operations.
+  constructors and the standard validator checks its shape.
 
 ## Kernel operations
 

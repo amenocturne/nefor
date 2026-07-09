@@ -85,16 +85,16 @@ Rules of the dialect:
 - Compose agents like nodes: `(graph a -> b  b -> out :terminal out)`.
 - An agent's `:tools` carries context I/O plus `mag-eval`: `["read_file" "mag-eval"]` for a read-only investigator, plus `"edit_file"` / `"write_file"` for a builder. World queries (listing, searching, commands) are `mag-eval` shell expressions, not per-query tools.
 - `(bash "cmd")` is also a graph node: `->` pipes stdout to the next node's stdin, so command steps compose directly into programs — `((bash "cargo test 2>&1") -> (bash "tail -30"))`.
-- The workspace `lib/patterns.md` lists the canonical shapes (shell pipes, joins, retries, gates); `lib/templates.mag` has `gate`.
+- The workspace `lib/patterns.md` lists the canonical shapes (shell pipes, joins, gates, failure repair); `lib/templates.mag` has `gate`.
 
-Agent and LLM actors must choose either `:profile` or raw reasoning settings. Prefer profiles:
+For `agent`, use only the supported config keys: `:id`, `:model`, `:profile`, `:provider`, `:system`, and `:tools`. Prefer profiles for agents; raw provider/model reasoning parameters are for direct `llm` nodes or host overlays, not arbitrary `agent` keys:
 
 - `fast` — cheap lookups and simple checks.
 - `standard` — normal implementation and exploration.
 - `deep` — difficult code reasoning.
 - `max` — rare, high-uncertainty work.
 
-Programs must end in exactly one sink, bound via `:terminal`. Connect all useful outputs to that sink so the final result returns to the lead.
+Programs may use an explicit `:terminal` sink, exactly one `sink`-factory node, or the implicit sink the compiler appends after the last fragment. Use an explicit sink when it makes the graph easier to inspect; otherwise rely on the implicit sink for small chains and one-off programs. Connect all useful outputs to the result path so the final result returns to the lead.
 
 ## Approval Gate
 

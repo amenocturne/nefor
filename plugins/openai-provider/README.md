@@ -9,11 +9,11 @@ to run several providers in parallel.
 
 NCP can spawn the same executable any number of times under different plugin names. `openai-provider` is built around that: each spawn takes a `--name` CLI flag and uses that string as the **event-kind prefix** for everything it emits and consumes. So:
 
-- `--name ollama` -> emits `ollama.hello`, `ollama.stream.delta`, `ollama.stream.end`, `ollama.session.stats`, `ollama.turn.error`, `ollama.goodbye`; consumes `ollama.prompt`, `ollama.interrupt`, `ollama.reset`.
+- `--name ollama` -> emits `ollama.hello`, `ollama.stream.delta`, `ollama.stream.end`, `ollama.session.stats`, `ollama.turn.error`, `ollama.goodbye`; consumes chat-scoped `ollama.chat.*` events plus legacy `ollama.prompt`, `ollama.interrupt`, `ollama.reset`.
 - `--name groq` -> same shape, but `groq.*`.
 - `--name openrouter` -> `openrouter.*`. Etc.
 
-Two providers run as two separate `openai-provider` processes, each owning its own conversation history. Their events never collide on the bus because the prefixes differ.
+Two providers run as two separate `openai-provider` processes. Each process owns its own chat map keyed by chat id, so multiple chats can stream concurrently within a process and prefixes keep separate provider instances from colliding on the bus.
 
 Configuration is via CLI flags (not env vars) because the engine's `nefor.plugins.spawn` API does not propagate per-instance env to children -- args ride the command line straight through. `--api-key` is the one exception: it falls back to the `OPENAI_PROVIDER_API_KEY` env var so secrets can stay out of `init.lua`.
 
@@ -21,23 +21,25 @@ The Lua adapter (`lua/openai-provider/init.lua`) is a factory: `make("ollama")` 
 
 ## What it does
 
-On each `<prefix>.prompt`:
+The current API is chat-scoped:
 
-1. Append the user message to the in-memory conversation history.
-2. POST `{base_url}/v1/chat/completions` with `{model, messages, stream: true, stream_options: {include_usage: true}}`.
-3. Parse the SSE response: each `data: {...}\n\n` frame becomes either a `Delta` (token text), `Finish` (stop reason), or `Usage` (token counts).
-4. For every delta, emit `<prefix>.stream.delta { id, text }` on the bus.
-5. On stream end, push the accumulated assistant text to history; emit `<prefix>.stream.end { id, model, duration_ms, finish_reason, text }`; emit `<prefix>.session.stats`.
+1. `<prefix>.chat.create` creates an in-memory chat with a model.
+2. `<prefix>.chat.append` appends user/assistant/tool context to that chat.
+3. `<prefix>.chat.complete` POSTs `{base_url}/v1/chat/completions` with streaming enabled.
+4. SSE frames become `<prefix>.stream.delta` and `<prefix>.stream.end`; token accounting becomes `<prefix>.session.stats`.
+5. `<prefix>.chat.delete` drops the in-memory chat.
 
-`<prefix>.interrupt` cancels the in-flight HTTP request via a `CancellationToken`. The chat-contract adapter maps `chat.interrupt` -> `<prefix>.interrupt`, so an ESC keypress in the chat surface aborts the active turn. `<prefix>.reset` clears history.
+The provider consumes `tool.register`, sends model `tool_calls` to the registered tool's `<plugin>.tool.invoke` endpoint, waits for matching `tool.result`, emits `chat.tool.start` / `chat.tool.end`, and loops until the model returns final text. This works with gated tools because `tool-gate` advertises itself as the tool entry point.
 
-## What it doesn't do (v1 scope)
+`<prefix>.interrupt` cancels an in-flight HTTP request via a `CancellationToken`. The legacy default-chat path maps `chat.interrupt` -> `<prefix>.interrupt`, so an ESC keypress in the chat surface aborts the active turn. `<prefix>.reset` clears legacy default-chat history.
 
-- **Tool calls** -- chat-completions only. The model can produce text describing what it would do, but no `tool_calls` parsing.
-- **Vision / images** -- `messages[*].content` is a plain string in v1. Multi-modal content arrays are not constructed.
-- **Persistence** -- history lives in process memory. Restarting the plugin starts a fresh conversation.
+## What it doesn't do
+
+- **Vision / images** -- this provider does not construct multimodal OpenAI message content. Image media returned by tools is converted to an explicit "model does not support image input" error in the text-only flow.
+- **Persistence** -- chat history lives in process memory. Restarting the plugin starts fresh.
 - **Resume** -- there is no `<prefix>.resume` analogue. Restart = blank slate.
-- **Streaming concurrency** -- one turn at a time per process. Concurrent prompts come back as `<prefix>.turn.error { "busy" }`.
+
+Legacy `<prefix>.prompt`, `<prefix>.interrupt`, and `<prefix>.reset` remain as default-chat compatibility events; new integrations should prefer `<prefix>.chat.*`.
 
 ## Configuration
 
@@ -122,23 +124,28 @@ Some servers ride `usage` on the same chunk that closes the choices array; the p
 
 ## Events emitted (with `<prefix> = --name .`)
 
-- `<prefix>hello` `{ version, provider, model, base_url }` -- once after `ready_ok`.
-- `<prefix>ready` -- once after hello.
-- `<prefix>auth.status` `{ state, message? }` -- once immediately after `ready` (initial auth posture), then on every state transition (`auth.set` accepted, `login_requested` rejected, `logout_requested` handled, HTTP 401 mid-request). `state` is one of `"connected" | "login_required" | "error"`; `message` is present when `state == "error"`.
-- `<prefix>stream.delta` `{ id, text }` -- per token chunk.
-- `<prefix>stream.end` `{ id, text, model, duration_ms, finish_reason }` -- turn finalization. `text` is the accumulated assistant string.
-- `<prefix>session.stats` `{ model, turns, cumulative_input_tokens, cumulative_output_tokens, last_turn_input_tokens, last_turn_output_tokens, last_turn_context_tokens, last_turn_duration_ms }` -- emitted after every `stream.end`. `last_turn_context_tokens` mirrors `last_turn_input_tokens` (no caching here).
-- `<prefix>turn.error` `{ message }` -- on network failure, non-2xx response, or after an interrupt (with `message: "interrupted"`).
-- `<prefix>goodbye` `{ reason }` -- on shutdown.
+- `<prefix>.hello` `{ version, provider, model, base_url }` -- once after `ready_ok`.
+- `<prefix>.ready` -- once after hello.
+- `<prefix>.auth.status` `{ state, message? }` -- once immediately after `ready` (initial auth posture), then on every state transition (`auth.set` accepted, `login_requested` rejected, `logout_requested` handled, HTTP 401 mid-request). `state` is one of `"connected" | "login_required" | "error"`; `message` is present when `state == "error"`.
+- `<prefix>.stream.delta` `{ id, text }` -- per token chunk.
+- `<prefix>.stream.end` `{ id, text, model, duration_ms, finish_reason }` -- turn finalization. `text` is the accumulated assistant string.
+- `<prefix>.session.stats` `{ model, turns, cumulative_input_tokens, cumulative_output_tokens, last_turn_input_tokens, last_turn_output_tokens, last_turn_context_tokens, last_turn_duration_ms }` -- emitted after every `stream.end`. `last_turn_context_tokens` mirrors `last_turn_input_tokens` (no caching here).
+- `chat.tool.start` / `chat.tool.end` -- tool-call lifecycle while completing a turn.
+- `<prefix>.turn.error` `{ message }` -- on network failure, non-2xx response, or after an interrupt (with `message: "interrupted"`).
+- `<prefix>.models.list` / `<prefix>.model.changed` -- model inventory/status responses.
+- `<prefix>.goodbye` `{ reason }` -- on shutdown.
 
 ## Events consumed
 
-- `<prefix>prompt` `{ text }` -- append `text` as user message, fire request, stream back.
-- `<prefix>interrupt` -- cancel the in-flight request. The turn finalizes with `finish_reason: "interrupted"` and a `turn.error { message: "interrupted" }`.
-- `<prefix>reset` -- clear conversation history (no events emitted).
-- `<prefix>auth.set` `{ token }` -- adopt `token` as the bearer for subsequent requests; transition to `connected`; emit `<prefix>auth.status`. The token's source is recorded as "auth.set" so `<prefix>logout_requested` knows it can be cleared. Empty tokens are ignored (no state change, no status emitted).
-- `<prefix>login_requested` -- openai-provider has **no built-in OAuth/device-code flow**. The plugin transitions to `error` and emits `<prefix>auth.status { state: "error", message: "openai-provider has no built-in login flow -- wire up an auth plugin (e.g. anthropic-auth) and have it push <prefix>.auth.set events" }`. The error stays until something pushes a token via `<prefix>auth.set`. This is intentional: the plugin tells the user exactly what's needed instead of pretending it can log in.
-- `<prefix>logout_requested` -- behaviour depends on where the current token came from:
+- `<prefix>.chat.create` / `.chat.append` / `.chat.complete` / `.chat.delete` -- current chat-scoped API.
+- `<prefix>.model.set`, `<prefix>.models.list_requested` -- model selection/listing.
+- `tool.register`, `tool.result` -- maintain the tool catalog and receive tool outputs.
+- `<prefix>.prompt` `{ text }` -- legacy default-chat compatibility: append `text` as user message, fire request, stream back.
+- `<prefix>.interrupt` -- cancel the in-flight request. The turn finalizes with `finish_reason: "interrupted"` and a `turn.error { message: "interrupted" }`.
+- `<prefix>.reset` -- clear legacy conversation history (no events emitted).
+- `<prefix>.auth.set` `{ token }` -- adopt `token` as the bearer for subsequent requests; transition to `connected`; emit `<prefix>.auth.status`. The token's source is recorded as "auth.set" so `<prefix>.logout_requested` knows it can be cleared. Empty tokens are ignored (no state change, no status emitted).
+- `<prefix>.login_requested` -- openai-provider has **no built-in OAuth/device-code flow**. The plugin transitions to `error` and emits `<prefix>.auth.status { state: "error", message: "openai-provider has no built-in login flow -- wire up an auth plugin (e.g. anthropic-auth) and have it push <prefix>.auth.set events" }`. The error stays until something pushes a token via `<prefix>.auth.set`. This is intentional: the plugin tells the user exactly what's needed instead of pretending it can log in.
+- `<prefix>.logout_requested` -- behaviour depends on where the current token came from:
   - **Token came from `auth.set`** (some auth plugin pushed it): clear the token, transition to `login_required`, emit `<prefix>auth.status { state: "login_required" }`.
   - **Token came from `--api-key` / `OPENAI_PROVIDER_API_KEY` (or no token at all)**: refuse -- emit `<prefix>auth.status { state: "error", message: "no login to revoke -- credentials come from --api-key (or OPENAI_PROVIDER_API_KEY env var); restart the plugin without it to clear" }`. The stored token is **not** cleared; clearing would just make subsequent requests fail without being able to recover.
 
@@ -165,8 +172,8 @@ Some servers ride `usage` on the same chunk that closes the choices array; the p
    +---------------------------+
                |
                | <prefix>.logout_requested  ->  back to LoginRequired
-               | HTTP 401 mid-request       ->  Error
-               | <prefix>.login_requested   ->  Error (no flow available)
+               | HTTP 401 mid-request        ->  Error
+               | <prefix>.login_requested    ->  Error (no flow available)
 
    Error state recovery: only <prefix>.auth.set returns to Connected.
 ```
@@ -183,7 +190,7 @@ local ollama = mk("ollama")          -- transforms scoped to ollama.*
 local groq   = mk("groq")            -- transforms scoped to groq.*
 ```
 
-Each pair maps `<prefix>stream.delta` -> `chat.stream.delta`, `<prefix>stream.end` -> `chat.stream.end`, `<prefix>session.stats` -> `chat.session.stats`, `<prefix>auth.status` -> `chat.auth.status` (injecting `provider = name` so chat can group by provider), `<prefix>turn.error` -> `chat.message.append { role = "system" }`, and drops the internal `<prefix>hello` / `<prefix>ready` / `<prefix>goodbye` lifecycle events. In the other direction it maps `chat.input.submit` -> `<prefix>prompt`, `chat.interrupt` -> `<prefix>interrupt`, `chat.reset` -> `<prefix>reset`, plus the auth-targeted events `chat.auth.set` -> `<prefix>auth.set`, `chat.login_requested` -> `<prefix>login_requested`, `chat.logout_requested` -> `<prefix>logout_requested`. The auth-targeted events carry a `provider` field; the adapter forwards only when `provider == name` and drops otherwise, so the right plugin reacts when multiple providers are wired up. The `chat.interrupt` mapping is what makes the ESC interrupt path work end-to-end through the chat surface.
+Each pair maps `<prefix>.stream.delta` -> `chat.stream.delta`, `<prefix>.stream.end` -> `chat.stream.end`, `<prefix>.session.stats` -> `chat.session.stats`, `<prefix>.auth.status` -> `chat.auth.status` (injecting `provider = name` so chat can group by provider), `<prefix>.turn.error` -> `chat.message.append { role = "system" }`, and drops the internal `<prefix>.hello` / `<prefix>.ready` / `<prefix>.goodbye` lifecycle events. In the other direction it maps `chat.input.submit` -> `<prefix>.prompt`, `chat.interrupt` -> `<prefix>.interrupt`, `chat.reset` -> `<prefix>.reset`, plus the auth-targeted events `chat.auth.set` -> `<prefix>.auth.set`, `chat.login_requested` -> `<prefix>.login_requested`, `chat.logout_requested` -> `<prefix>.logout_requested`. The auth-targeted events carry a `provider` field; the adapter forwards only when `provider == name` and drops otherwise, so the right plugin reacts when multiple providers are wired up. The `chat.interrupt` mapping is what makes the ESC interrupt path work end-to-end through the chat surface.
 
 ## Multi-instance pattern
 

@@ -1,22 +1,22 @@
 # Glossary
 
-Quick lookup for nefor and NCP terminology. Spec-level terms are defined in the [NCP spec](../protocol/v0.1/spec.md); convention-level terms are defined in [`plugin-authoring.md`](plugin-authoring.md). This page is purely a convenience index.
+Quick lookup for current nefor terminology. Protocol behavior is described in [`docs/protocol.md`](protocol.md); plugin conventions are described in [`plugin-authoring.md`](plugin-authoring.md).
 
-| Term               | Definition                                                                                                                                                                   | Defined in                                   |
-| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
-| **Body**           | The content field of an envelope. Spec-defined shapes for system messages, plugin-authored for events.                                                                       | NCP §3                                       |
-| **Broker**         | The part of the engine that parses NCP envelopes, stamps `from`/`ts`, validates system messages, and broadcasts events. Counterpart to the runner.                           | `principles.md`                              |
-| **Bus**            | The engine's broadcast mechanism. Every event message reaches every connected plugin.                                                                                        | NCP §6                                       |
-| **Engine**         | A process implementing NCP's engine role: runs plugins, brokers messages. Reference implementation: the `nefor` binary.                                                      | NCP §1                                       |
-| **Envelope**       | The top-level JSON object with `type`, `from`, `ts`, `body`.                                                                                                                 | NCP §3                                       |
-| **Event**          | A message with `type: "event"`. Body is plugin-authored and opaque to the engine.                                                                                            | NCP §4                                       |
-| **Goodbye event**  | Convention: a plugin-namespaced event a plugin emits just before closing stdout to tell peers why it's leaving. Not spec-level.                                              | `plugin-authoring.md`                        |
-| **Hello event**    | Convention: a plugin-namespaced event a plugin emits immediately after `ready_ok` to advertise its version, capabilities, or other self-description. Not spec-level.         | `plugin-authoring.md`                        |
-| **Kind**           | The discriminator inside `body` identifying the sub-shape.                                                                                                                   | NCP §5                                       |
-| **Manifest**       | Convention: a plugin-namespaced event declaring what kinds the plugin consumes / emits and what version it advertises. Informs peer compatibility decisions. Not spec-level. | `plugin-authoring.md`                        |
-| **NCP**            | Nefor Composition Protocol. The communication protocol between the engine and its plugins.                                                                                   | [`protocol/v0.1/`](../protocol/v0.1/spec.md) |
-| **Plugin**         | Any process that speaks NCP and is connected to an engine.                                                                                                                   | NCP §1                                       |
-| **Ready**          | The first system message a plugin sends, declaring the NCP protocol version it speaks.                                                                                       | NCP §5.1                                     |
-| **Ready OK**       | The engine's reply accepting a `ready`.                                                                                                                                      | NCP §5.2                                     |
-| **Runner**         | The part of the engine that spawns declared subprocesses, assigns their identity from spawn-config, and bridges stdio. Counterpart to the broker.                            | `principles.md`                              |
-| **System message** | A message with `type: "system"`. Body follows a shape defined in NCP §5.                                                                                                     | NCP §4                                       |
+| Term | Definition | Defined in |
+| --- | --- | --- |
+| **Body** | The content object inside a plugin-authored line or delivered envelope. System bodies are handled by Lua NCP; event bodies are plugin-authored. | `docs/protocol.md` |
+| **Broker** | The engine subsystem that attaches plugin transports, records published emissions in an in-memory log, and invokes Lua dispatch. It is a raw line/string bus, not the owner of NCP envelope semantics. | `engine/README.md`, `docs/protocol.md` |
+| **Bus** | The Lua-mediated stream of entries explicitly published with `nefor.engine.send`. Default routing offers Step events to ready wrappers, skips self-emissions, respects targets/legacy peer prefixes, and lets wrappers drop or transform. | `docs/protocol.md` |
+| **Engine** | The `nefor` binary: process spawner, line router, Lua host, and in-memory dispatch log owner. It is session-blind. | `engine/README.md` |
+| **Envelope** | Conventional JSON object used on the bus. Plugin-authored outgoing lines commonly include `type` and `body`; delivered bus envelopes include `type`, `from`, `ts`, and `body`. Current stamping/routing semantics are Lua-owned. | `docs/protocol.md` |
+| **Event** | A message with `type: event`; its body is plugin-authored and opaque to the Rust engine. | `docs/protocol.md` |
+| **Goodbye event** | Convention: a plugin-namespaced event a plugin may publish before exiting. It is ordinary event traffic, not engine-synthesized shutdown. | `plugin-authoring.md` |
+| **Hello event** | Convention: a plugin-namespaced event a plugin emits after `ready_ok` to advertise version/capabilities. | `plugin-authoring.md` |
+| **Kind** | The discriminator inside `body` identifying a sub-shape. | `docs/protocol.md` |
+| **Manifest** | Convention: a plugin-namespaced event declaring what kinds the plugin consumes/emits and what version it advertises. | `plugin-authoring.md` |
+| **NCP** | Nefor Composition Protocol as currently implemented by Lua over the engine string bus. | `docs/protocol.md` |
+| **Plugin** | Any subprocess connected to the engine over stdin/stdout and participating in the current line protocol. | `docs/protocol.md` |
+| **Ready** | System message a plugin sends with `protocol_version = 0.1` to enter the ready set. | `docs/protocol.md` |
+| **Ready OK** | Lua NCP's direct reply accepting `ready`. | `docs/protocol.md` |
+| **Runner** | The engine subsystem that resolves plugin binaries, starts subprocesses with direct `Command::new`, and bridges stdio. | `docs/principles.md` |
+| **System message** | A message with `type: system`; current shipped Lua handles `ready` from plugins plus direct `ready_ok`/`error` replies to plugins. | `docs/protocol.md` |

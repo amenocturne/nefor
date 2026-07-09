@@ -15,143 +15,94 @@ Four sections:
 
 ## Architecture principles
 
-### Three-layer opinion model
+### Current layer model
 
-nefor has three layers, each with increasing opinion:
+nefor has four practical layers:
 
-1. **Combinators** (least opinion) — pure algebra over `Reasoner<C>`. The only escape is to build your own substrate.
-2. **Engine** (medium opinion) — plugin host, NCP broker. If you disagree, rewrite the engine while speaking NCP and inherit the plugin ecosystem for free.
-3. **Plugins** (most opinion) — frontends, harnesses, widgets. Total user choice.
+1. **Engine / bus** — least opinion. Spawns processes, bridges stdio, hosts Lua, and routes raw lines through the Lua dispatch hook. It owns no workflows and no sessions.
+2. **Plugins** — isolated capability processes. Providers, tools, interfaces, registries, and MAG run outside the engine and communicate through lines.
+3. **Lua composition and libraries** — bus-aware policy and wiring. NCP semantics, sessions, approval policy, provider/tool adaptation, actor spawning, UI reducers, and starter defaults live here.
+4. **MAG programs/kernel** — graph execution used by the starter lead workflow. MAG is a shipped capability, not the only place workflow logic exists.
 
-Every layer has an escape hatch one level up. Users never commit to the whole stack without options.
+Every file gets one layer assignment. Mismatch is the most common architectural bug.
 
 ### Contracts, not implementations
 
-The **APIs at layer boundaries are more valuable than the implementations behind them.** Our combinator crate is the reference algebra; our engine binary is the reference NCP implementation; our plugins are reference compositions. None of them are canonical — the contracts are. A third party implementing the same contract inherits the ecosystem.
-
-Consequence: specs, laws, and protocol documents are first-class artifacts. Treat them with the discipline of product surface.
+The APIs at layer boundaries are more valuable than the implementations behind them. The current public boundary is process + JSON Lines + Lua-owned NCP conventions, described in docs/protocol.md. A plugin or config that speaks that boundary should not depend on private implementation details of the engine or another plugin.
 
 ### Unix philosophy, all the way down
 
-Small tools, composed with clear interfaces, over monoliths with configuration surface. No single binary tries to be everything. The engine brokers; plugins specialise. Cross-cutting concerns (logging, metrics, custom buses) are plugins, not features.
+Small tools, composed with clear interfaces, over monoliths with configuration surface. The engine brokers; plugins specialise; cross-cutting concerns such as persistence, policy, metrics, and routing conventions are Lua/plugin work.
 
-When tempted to add "just one more thing" to the engine: write a plugin instead.
+When tempted to add just one more thing to the engine: write a plugin or Lua library instead.
 
 ### YAGNI on speculative design
 
-Build only what the current problem requires. We have one reference implementation of each layer and the problem is tractable; don't design for hypothetical second users until they exist. When they arrive, the contracts are already honest and the refactor follows.
+Build only what the current problem requires. Do not design public docs around hypothetical future transports, protocol suites, or compatibility layers until they ship.
 
 ### No v2 that carries v1's legacy
 
-We do not ship backwards-incompatible major versions that try to live alongside the old paradigm. If a rewrite is different enough to need "v2," it's a different project — a new binary, a new name, its own repo. The model is grep / ripgrep, ls / exa, make / just: similar functionality, distinct tools, each internally coherent. The anti-model is React's concurrent mode / hooks / class components coexisting indefinitely — a codebase whose cognitive surface is the sum of every era.
+We do not ship backwards-incompatible major versions that try to live alongside the old paradigm. If a rewrite is different enough to need v2, it is a different project.
 
 Consequences for how we work:
 
-- **No tech-debt deferral.** We do not accept "fix it properly in v2." There is no v2. Do it right now, or acknowledge the limitation in the current contract.
-- **No compatibility shims.** Breaking changes are fine during development; once shipped, the contract is the contract. If the contract is wrong, it's a new project.
-- **No paradigm cohabitation.** When a better idea lands, we do not keep the old paradigm around "for users who haven't migrated." Migration is a fork-and-replace, not a flag.
-
-Corollary: take the time to get contracts right on the first pass. Short-term pain, long-term stability. Software like `grep(1)` or `ls(1)` has worked for decades without changing shape — that's the target.
+- **No tech-debt deferral.** Do it right now, or acknowledge the limitation in the current contract.
+- **No compatibility shims by default.** During pre-public development, prefer deleting replaced shapes over carrying fallbacks.
+- **No paradigm cohabitation.** When a better idea lands, do not keep the old paradigm around as a flag.
 
 ### No stringly-typed state
 
-Every piece of state that carries meaning — errors, kinds, reasons, codes, modes, phases — is a closed enum. Never a string, never an integer sentinel, never a free-form tag that downstream code pattern-matches on substrings. Strings exist at exactly two boundaries: serialization to the wire, and human-readable output for logs or UI. Everywhere else, variants.
-
-Corollaries:
-
-- **No string-sniffing to classify errors.** If two error conditions need different handling, they are different enum arms. Adding a `Custom(String)` escape hatch is a smell; stop and add a real variant instead.
-- **Display/Error mapping is explicit per arm.** `thiserror`'s per-variant `#[error("...")]` attributes, not a single catch-all format string that tries to describe every case.
-- **Pin message strings in tests** if the wire carries them (e.g., NCP `error.message`). An accidental reword must break a test, not silently change protocol-level behaviour.
-- **Parse errors carry structured context.** Not `Error(String)` with a freeform diagnostic; `Error { kind, field, reason }` with enum-typed slots that consumers can match on.
-
-This is why `nefor-protocol`'s `ParseError` has variants like `InvalidReadyBody(InvalidReadyReason)` and `InvalidSystemBody { kind, reason }` — the broker branches on variants, not message text. When you find yourself writing `msg.contains("...")` to decide what to do, stop: that's a missing enum arm.
+Every piece of state that carries meaning — errors, kinds, reasons, codes, modes, phases — should be a closed enum or table of known values at the layer that owns it. Strings exist at serialization boundaries and for human-readable output.
 
 ### Runner / broker split
 
-The engine binary has exactly two subsystems:
+The engine binary has two relevant subsystems:
 
-- **Runner** — spawns declared subprocesses with direct `Command::new(binary).args(...)`, bridges stdio, detects exit. Does not parse NCP; does not know what the bus is.
-- **Broker** — parses NCP envelopes, stamps `from` (from runner-assigned name) and `ts`, validates system messages, broadcasts event messages, enforces bounded per-peer queues.
+- **Runner** — resolves plugin binaries, starts declared subprocesses with direct Command::new(binary).args(...), bridges stdio, and detects exit. It does not invoke a shell, set per-plugin cwd, or parse NCP.
+- **Broker** — receives raw plugin lines, appends Lua-published emissions to an in-memory log, drains that log through Lua dispatch, and writes direct deliveries to plugin stdin. It does not own NCP envelope parsing, session jsonl, ready timeouts, queue-overflow protocol messages, or shutdown system messages.
 
-Runner does not invoke shell, does not manage env vars, does not handle cwd beyond the `<plugin-dir>/<name>/` convention. Plugins that need shell features, env, supervision, or daemon patterns wrap themselves in a user-chosen wrapper script and expose that as their `command`. A future community plugin can provide these as reusable services.
-
-This split is why nefor is cross-platform for free: the engine never assumes `/bin/sh` exists. It only assumes the declared binary is exec'able — which is how `std::process::Command` works on every supported platform.
+Lua's NCP framework owns ready/ready_ok, event classification, default routing, replay-on-attach, and direct error replies.
 
 ### Do we even need it?
 
-The meta-principle behind every other principle in this section. Every time a feature, field, abstraction, or dependency is proposed — before asking "how do we build it?", ask "do we actually need it?" Default to removing requirements, not accommodating them.
+Before asking how do we build it, ask do we actually need it? Default to removing requirements, not accommodating them.
 
-> Junior engineers write beautiful code with premature abstractions and optimizations. Middles write code that gets the job done. Seniors ask if we even need it.
-
-Deleting a requirement is strictly better than implementing one: no surface area, no tests, no edge cases, no drift, no cognitive tax on future readers. Most "defensible" features are defensible in isolation and lose when weighed against the cost of carrying them.
-
-Track record in nefor — each of these was initially defensible, and each collapsed under the question:
-
-- Capabilities in NCP → dropped (can't enforce them; install-trust is honest)
-- WASM sandbox → dropped (same reason)
-- `plugin_joined` / `plugin_left` / `detach` / bootstrap roster → dropped (plugins advertise themselves; liveness is a plugin convention)
-- `args` / `env` / `cwd` / `build` fields on spawn → dropped (userspace composes via wrapper scripts or Lua)
-- `/bin/sh` dependency in the engine → dropped (direct exec; shell is a plugin's choice)
-- Plugin name in attach body → dropped (engine assigns from spawn config)
-- `InvalidSystemBody(String)` stringly-typed escape hatch → dropped (structured enum)
-- Plugin name override at runtime → dropped (name is a compile-time property of the plugin)
-
-How to apply it:
-
-1. When a feature is proposed, first ask "what breaks if we don't add this?"
-2. If the answer is "some users would need a wrapper" — decline the feature; users write wrappers.
-3. If the answer is "the system is unusable" — proceed, but pick the smallest thing that fixes it.
-4. Before merging any addition, check whether something adjacent can be deleted in the same commit. If yes, do it.
-
-YAGNI, no-v2, no-stringly-typed-state, contracts-over-implementations — they're all specific applications of this reflex. Default to "no" until the need is real and irreducible.
+1. When a feature is proposed, first ask what breaks if we do not add this.
+2. If the answer is some users would need a wrapper, decline the feature; users write wrappers.
+3. If the answer is the system is unusable, proceed, but pick the smallest thing that fixes it.
+4. Before merging any addition, check whether something adjacent can be deleted in the same commit.
 
 ---
 
 ## Engine / protocol principles
 
-These principles shape NCP and the engine's runtime behaviour. They also appear in the [NCP spec §1](../protocol/v0.1/spec.md#1-overview) as design principles — this section is the longer-form version for reference and future contributors.
+These principles shape the current Lua-owned NCP/string-bus behavior. The behavior document is docs/protocol.md.
 
-### Minimal
+### Minimal engine
 
-The engine understands only the system messages defined in the spec. Everything else — event bodies, sub-protocols, request/response patterns, addressing conventions — is opaque to the engine.
+The Rust engine understands process spawning, raw line movement, Lua dispatch, direct delivery, and in-memory log bookkeeping. It does not parse plugin event bodies or enforce plugin sub-protocols.
 
-When adding functionality: first ask "can a plugin do this?" If yes, it's a plugin. Only things that require engine-level privilege (managing the connection lifecycle, stamping delivery facts, brokering the bus) belong in the engine.
+When adding functionality: first ask can Lua or a plugin do this? If yes, keep it out of the engine.
 
-### Broadcast
+### Lua-owned protocol semantics
 
-The bus is a fan-out mechanism. Every event message reaches every connected plugin. Plugins filter by matching on body fields. No subscriptions, no routing tables, no addressing enforcement.
+Ready handshake, event classification, default routing, replay-on-attach, direct error replies, and wrapper callbacks live in lua/core/ncp.lua. Docs should describe that ownership plainly instead of attributing strict NCP behavior to Rust.
 
-This is load-bearing because it gives observability, replay, debug-tapping, and metrics plugins for free. Adding routing would cost more than it saves.
+### Published events, not magical global broadcast
 
-### Non-spoofable delivery
-
-`from` and `ts` are engine-stamped. A plugin cannot lie about sender identity or arrival time. These are the engine's authoritative word — plugins consuming messages trust them unconditionally.
-
-Never add an envelope field that plugins control and the engine forwards unchecked. If plugins want to claim something, put it in body where it's clearly plugin speech.
-
-### Reject, don't repair
-
-The engine validates every message and either delivers it unchanged or drops it with a named `error` back to the sender. It never silently corrects, reinterprets, or best-effort-forwards malformed input.
-
-Every fault has a code and a named recipient. Plugins are never left guessing whether their message was accepted, modified, or dropped. No silent behaviour, anywhere.
+The bus contains what Lua or wrappers explicitly publish with nefor.engine.send. Default routing broadcasts to other ready peers unless a target, legacy peer prefix, or wrapper override narrows delivery. A line a plugin emits but its wrapper does not republish is not bus traffic.
 
 ### Engine narrates delivery; plugins narrate content
 
-The engine's vocabulary is the envelope plus the system kinds. All other semantics — kinds, request/response, addressing, scheduling, role definitions — are plugin speech. The engine doesn't adjudicate plugin-level semantics.
-
-When writing spec or docs, ask: "is this about delivery or about content?" Delivery goes in the spec; content goes in plugin-authoring.
+The engine can say where a raw line came from and when a bus entry was recorded. Plugin-level semantics — kinds, request/response, addressing, scheduling, roles — are plugin or Lua speech.
 
 ### Plugins are processes
 
-The engine does not regulate what plugins do inside their own process. Language, runtime, concurrency model, subprocesses, filesystem access, network calls, other systems — none of it is NCP's concern. The engine's entire contract with a plugin is NCP.
-
-This is how the spec stays small: by refusing to care about anything that isn't the bus.
+The engine does not regulate what plugins do inside their own process. Language, runtime, concurrency model, subprocesses, filesystem access, network calls, and external systems are outside the engine contract.
 
 ### Sub-protocols emerge
 
-Plugins define their own message shapes under their plugin-name namespace. NCP does not register, arbitrate, or validate sub-protocols. De-facto standards emerge from quality and adoption — the Telescope / lazy.nvim pattern, not LSP's central arbitration.
-
-When a pattern feels universal enough to document, it goes in `docs/plugin-authoring.md`, not in the spec.
+Plugins define their own message shapes under their plugin-name namespace. nefor does not centrally register or validate these. When a pattern feels universal enough to document, it goes in docs/plugin-authoring.md, not in engine code.
 
 ---
 

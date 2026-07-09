@@ -117,7 +117,8 @@ pm.install({
 - `os.execute` is fine for the bootstrap step because it runs once,
   before `nefor.process.spawn` is reachable through the (not-yet-loaded)
   pm. Subsequent fetches inside `pm.install` use the Rust-backed
-  `nefor.process.spawn` binding via `handle:wait()` and don't shell out.
+  synchronous `nefor.process.run({ cmd, args, cwd, env })` binding and do not
+  shell out.
 - The bootstrap path uses `git` directly — same cross-platform constraint
   the rest of the pm honours (`git` is the only binary the bootstrap
   invokes, and it's available on every developer machine).

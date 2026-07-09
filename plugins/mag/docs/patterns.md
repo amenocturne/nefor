@@ -1,9 +1,11 @@
 # Patterns — canonical shapes for MAG programs
 
-Every pattern here has a clean expression in routes, input contracts, or
-rules. If a program needs one of these behaviors, use the listed shape —
-inventing a workaround (sentinel messages, polling actors, hand-rolled wait
-nodes) means the type system can no longer see what the program does.
+Every shipped pattern here has a clean expression in routes or input contracts.
+If a program needs one of these behaviors, use the listed shape — inventing a
+workaround (sentinel messages, polling actors, hand-rolled wait nodes) means
+the type system can no longer see what the program does. Non-empty `rules` are
+rejected by the current kernel, so rule-dependent designs are not listed as
+current patterns.
 
 This is the canonical catalog; a lead-facing distillation ships with the
 stdlib so these patterns are available inside session workspaces.
@@ -37,17 +39,6 @@ Firing is the contract; the kernel assembles the activation.
 
 **Shape:** union input `(A | B)` — whichever arrives activates alone.
 
-## Race and kill
-
-"Try N approaches concurrently; first to finish wins."
-
-**Shape:** spawn N constellations on the same task; bind a rule on each
-finisher whose function returns `{kills: [<the others>]}`. First-applied
-wins; the losers' in-flight outputs are void; duplicate kills are logged
-no-ops. No coordination logic anywhere in the actors. Requires rule firing,
-which the kernel does not yet wire (ir.md, Rules) — pending that, this pattern
-is design-only.
-
 ## Cycle (the agentic loop)
 
 Cycles are legal as-is and unbounded. Every cycle exits through a typed
@@ -60,21 +51,13 @@ kill/interrupt. Never encode "give up after N tries" in a prompt.
 
 "If the build fails, route the evidence to a fixer."
 
-**Shape:** failures are typed outputs — computed failures returned by the
-factory, suffered failures (provider error, kill, budget) synthesized by the
-kernel. Route the failure type to the repair actor; compose produce → check →
-repair as an ordinary cycle.
+**Shape:** factory/completion failures are typed outputs when a factory returns
+a failure tag (for example `mag.CommandFailed` from `bash`). Route that failure
+type to the repair actor; compose produce → check → repair as an ordinary cycle.
+Unhandled failures escalate to `mag.run_failed`. `kill` removes actors and voids
+late outputs; it is not a general routeable failure output.
 
 **Not:** parsing error text out of a success-shaped output.
-
-## Dynamic fanout (for-each)
-
-"One explorer yields N findings; one agent per finding."
-
-**Shape:** a rule `{on: explorer, fn: fan-out}` whose function maps the
-findings to a modification with N namespaced constellations
-(`explorer.sub.0.*`, …) and a product-input join for their results. Requires
-rule evaluation (post-MVP); until then, fixed-width fanout is static routes.
 
 ## Same type, two meanings
 

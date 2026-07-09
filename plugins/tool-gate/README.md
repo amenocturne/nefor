@@ -8,12 +8,9 @@ Tool sources advertise privately to the gate via
 public `tool.register` so providers see one canonical registry with
 `tool-gate.tool.invoke` as the entry point.
 
-Private advertisements may carry internal `context.folders` metadata. The
-starter wrapper records that metadata and composes it with the shared
-`libs.instruction-files` Lua library to emit one-shot reminders about nearby
-`AGENTS.md` / `CLAUDE.md` files when a tool call touches a folder. Reminder
-messages list file paths only; contents are never loaded automatically. Agents
-read relevant instruction files through normal file tools.
+Private advertisements may carry internal `context.folders` metadata. The gate
+strips private context from the public registry; any higher-level use of that
+metadata belongs in Lua composition, not in the Rust gate.
 
 Per-tool policy via CLI flags:
 
@@ -25,3 +22,15 @@ Per-tool policy via CLI flags:
 Runtime modes are `safe`, `auto`, and `yolo`. The starter's full mode × action
 class table lives in [`docs/approval-model.md`](../../docs/approval-model.md).
 At the transport layer, `yolo` overrides all policies to auto-approve.
+
+## Runtime events
+
+- `tool-gate.set_mode` `{ mode }` switches the transport mode (`safe`, `auto`,
+  or `yolo`).
+- `tool-gate.mode_changed` announces the active mode after a change.
+- `tool.permission_response` answers a pending prompt with approval/rejection.
+- `tool-gate.tool.cancel` forwards cancellation for an in-flight tool call.
+
+The starter starts `tool-validator` before the gate and routes prompt requests
+through it. The validator may auto-approve, deny, or defer to the chat popup
+before a request reaches the user.

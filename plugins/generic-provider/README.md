@@ -10,7 +10,7 @@ Owns five canonical types that every provider-shaped reasoner agrees on:
 - `generic-provider.NoState` -- unit/empty state for stateless reasoners
 - `generic-provider.FinalAnswer` -- escape-edge type emitted by `tool_split`
 
-On startup, registers these types via MAG's compile-time routing. Concrete
+On startup, emits a `combinators.register` event consumed by MAG/routing glue. Concrete
 providers (openai-provider, anthropic-provider, ...) separately declare
 `Into`/`From` conversions against these tags. This plugin does not run
 models or hold sessions -- it is a passive hub that makes the canonical
