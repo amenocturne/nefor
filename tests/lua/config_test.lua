@@ -1,22 +1,11 @@
 -- tests/lua/config_test.lua — variant-table assertions for config.
 --
--- The team port pins per-role model identifiers in
--- cfg.workflow.role_models, variant-specific: prod → Nestor cluster,
--- test → ollama, mock → empty by design (mock-plugin dispatches by
--- prompt content, not model name).
+-- 0.4 config keeps model selection provider-level. Sub-agent roles do
+-- not pin models; they inherit the default model chosen by starter/init.lua.
 --
--- The config module reads NEFOR_CONFIG at module-load to pick
--- M.active. The tests below read M.prod / M.test / M.mock directly so
--- the env-var resolution path is irrelevant.
-
-local function assert_eq(actual, expected, msg)
-  if actual ~= expected then
-    error(string.format(
-      "assertion failed: %s\n  expected: %s\n  actual:   %s",
-      msg or "values differ",
-      tostring(expected), tostring(actual)), 2)
-  end
-end
+-- The config module reads NEFOR_CONFIG at module-load to pick M.active.
+-- The tests below read M.prod / M.test directly so the env-var
+-- resolution path is irrelevant.
 
 local function assert_true(cond, msg)
   if not cond then error("assertion failed: " .. (msg or "(no message)"), 2) end
@@ -29,64 +18,62 @@ local team_roles = {
 }
 
 for _, role in ipairs(team_roles) do
-  assert_true(lead_role.AGENT_CONFIGS[role] ~= nil,
+  local role_cfg = lead_role.AGENT_CONFIGS[role]
+  assert_true(role_cfg ~= nil,
     "lead-workflow.role AGENT_CONFIGS." .. role .. " must exist")
+  assert_true(role_cfg.model == nil,
+    "lead-workflow.role AGENT_CONFIGS." .. role .. ".model must not be pinned")
 end
 
 local cfg_module = require("config")
 
-local function role_models_of(variant)
-  local v = cfg_module[variant]
-  assert_true(type(v) == "table", "cfg." .. variant .. " is a table")
-  assert_true(type(v.workflow) == "table",
-    "cfg." .. variant .. ".workflow is a table")
-  assert_true(type(v.workflow.role_models) == "table",
-    "cfg." .. variant .. ".workflow.role_models is a table")
-  return v.workflow.role_models
-end
+local required_top_level = {
+  "default_provider",
+  "default_model",
+  "default_reasoning_effort",
+  "lead_reasoning_effort",
+  "providers",
+  "orchestration_profiles",
+  "tool_gate",
+  "log_level",
+}
 
--- prod: every role pinned to a Nestor model identifier.
-local prod_models = role_models_of("prod")
-for _, role in ipairs(team_roles) do
-  assert_true(prod_models[role] ~= nil,
-    "cfg.prod.workflow.role_models." .. role .. " must be set")
-end
-
--- test: every role pinned to an ollama model identifier.
-local test_models = role_models_of("test")
-for _, role in ipairs(team_roles) do
-  assert_true(test_models[role] ~= nil,
-    "cfg.test.workflow.role_models." .. role .. " must be set")
-end
-
--- mock: empty by design — mock-plugin dispatches by prompt content,
--- not model name.
-local mock_models = role_models_of("mock")
-local mock_count = 0
-for _ in pairs(mock_models) do mock_count = mock_count + 1 end
-assert_eq(mock_count, 0,
-  "cfg.mock.workflow.role_models must stay empty")
-
-local function assert_strings_non_empty(map, label)
-  for role, value in pairs(map) do
-    assert_true(type(value) == "string",
-      label .. "." .. tostring(role) .. " must be a string (got "
-      .. type(value) .. ")")
-    assert_true(#value > 0,
-      label .. "." .. tostring(role) .. " must be non-empty")
+for _, variant in ipairs({ "prod", "test" }) do
+  local cfg = cfg_module[variant]
+  assert_true(type(cfg) == "table", "cfg." .. variant .. " is a table")
+  for _, key in ipairs(required_top_level) do
+    assert_true(cfg[key] ~= nil, "cfg." .. variant .. "." .. key .. " must be set")
+  end
+  assert_true(type(cfg.providers[cfg.default_provider]) == "table",
+    "cfg." .. variant .. ".providers[default_provider] must exist")
+  for _, profile_name in ipairs({ "fast", "standard", "deep", "max" }) do
+    local profile = cfg.orchestration_profiles[profile_name]
+    assert_true(type(profile) == "table",
+      "cfg." .. variant .. ".orchestration_profiles." .. profile_name .. " must be a table")
+    assert_true(type(profile.provider) == "string",
+      "cfg." .. variant .. ".orchestration_profiles." .. profile_name .. ".provider must be a string")
+    assert_true(type(profile.reasoning_effort) == "string",
+      "cfg." .. variant .. ".orchestration_profiles." .. profile_name .. ".reasoning_effort must be a string")
+  end
+  for _, tool in ipairs({ "mag", "mag-eval", "write-review", "graph-status", "terminate-graph" }) do
+    local found = false
+    for _, configured in ipairs(cfg.tool_gate.auto_tools or {}) do
+      if configured == tool then found = true end
+    end
+    assert_true(found, "cfg." .. variant .. ".tool_gate.auto_tools contains " .. tool)
   end
 end
 
-assert_strings_non_empty(prod_models, "cfg.prod.workflow.role_models")
-assert_strings_non_empty(test_models, "cfg.test.workflow.role_models")
-
--- Shared workflow keys (concurrency / enabled) survive the per-variant
--- workflow_with() shallow merge so a future config edit can't silently
--- drop them.
-for _, variant in ipairs({ "prod", "test", "mock" }) do
-  local wf = cfg_module[variant].workflow
-  assert_true(wf.enabled ~= nil,
-    "cfg." .. variant .. ".workflow.enabled must be preserved")
-  assert_true(type(wf.concurrency) == "number",
-    "cfg." .. variant .. ".workflow.concurrency must be a number")
+-- chatgpt_local is a developer-only variant loaded from the untracked,
+-- gitignored config/local.lua. Assert its shape only when it is present so a
+-- clean checkout / CI (no local.lua) still passes.
+if cfg_module.chatgpt_local ~= nil then
+  for _, profile_name in ipairs({ "fast", "standard", "deep", "max" }) do
+    assert_true(type(cfg_module.chatgpt_local.orchestration_profiles[profile_name]) == "table",
+      "cfg.chatgpt_local.orchestration_profiles." .. profile_name .. " must be a table")
+  end
 end
+
+assert_true(cfg_module.mock == nil, "cfg.mock must not be defined")
+assert_true(cfg_module.dev == cfg_module.test, "cfg.dev aliases cfg.test")
+assert_true(cfg_module.staging == cfg_module.prod, "cfg.staging aliases cfg.prod")

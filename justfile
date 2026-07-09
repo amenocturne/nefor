@@ -81,6 +81,21 @@ sync mode="":
     if [ -f "$ENV_LOCAL_FILE" ]; then
       cp "$ENV_LOCAL_FILE" "$DEST/.env.local"
     fi
+    # Put team skill CLI wrappers on PATH. Each skills/<name>/bin-style
+    # wrapper is a self-contained `uv` script; symlink the ones that ship an
+    # executable of the skill's own name (e.g. skills/confluence/confluence).
+    BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
+    mkdir -p "$BIN_DIR"
+    for skill_dir in "$DEST"/skills/*/; do
+      name="$(basename "$skill_dir")"
+      wrapper="$skill_dir$name"
+      if [ -f "$wrapper" ]; then
+        chmod +x "$wrapper"
+        ln -sf "$wrapper" "$BIN_DIR/$name"
+        echo "Linked $name -> $BIN_DIR/$name"
+      fi
+    done
+
     if [ -n "${NEFOR_DEV_DIR:-}" ]; then
       echo "Synced nefor dev config to $DEST"
     else

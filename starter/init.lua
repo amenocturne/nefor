@@ -19,7 +19,6 @@
 --   * prod (default) — DP -> JWT exchange + Nestor model list fetch at
 --     boot; qwen think-tag filter + cached-model-list intercept active.
 --   * test (alias: dev) — openai-provider against local ollama. No auth.
---   * mock — mock-plugin scripted via upstream's mock-provider script.
 --
 -- NEFOR_DEV_DIR controls fetch path: when set, pm specs point at a
 -- local upstream checkout via `dir =` overrides; when unset, pm clones
@@ -105,6 +104,7 @@ local function capture(cmd)
 end
 
 local STARTER_UPSTREAM
+local LUA_ROOT
 
 if NEFOR_DEV_DIR and #NEFOR_DEV_DIR > 0 then
   local pm_dir = NEFOR_DEV_DIR .. "/lua"
@@ -114,6 +114,7 @@ if NEFOR_DEV_DIR and #NEFOR_DEV_DIR > 0 then
     package.path,
   }, ";")
   STARTER_UPSTREAM = NEFOR_DEV_DIR .. "/starter"
+  LUA_ROOT = NEFOR_DEV_DIR .. "/lua"
 else
   local data_dir = nefor.fs.data_root()
   local pm_root  = data_dir .. "/nefor"
@@ -147,6 +148,7 @@ else
     package.path,
   }, ";")
   STARTER_UPSTREAM = pm_root .. "/starter"
+  LUA_ROOT = pm_root .. "/lua"
 end
 
 local pm = require("nefor-pm")
@@ -171,43 +173,44 @@ pm.install({
     name = "core",
     tag  = UPSTREAM_REF,
     path = "lua/core/",
-    dir  = dev("lua/core"),
+    dir  = dev("lua/core") or (LUA_ROOT .. "/core"),
   },
 
   { "amenocturne/nefor",
     name = "libs",
     tag  = UPSTREAM_REF,
     path = "lua/libs/",
-    dir  = dev("lua/libs"),
+    dir  = dev("lua/libs") or (LUA_ROOT .. "/libs"),
   },
 
   { "amenocturne/nefor",
     name = "openai-provider",
     tag  = UPSTREAM_REF,
     path = "plugins/openai-provider/lua/openai-provider/",
-    dir  = dev("plugins/openai-provider/lua/openai-provider"),
+    dir  = dev("plugins/openai-provider/lua/openai-provider") or (STARTER_UPSTREAM .. "/../plugins/openai-provider/lua/openai-provider"),
+  },
+
+  { "amenocturne/nefor",
+    name = "chatgpt-provider",
+    tag  = UPSTREAM_REF,
+    path = "plugins/chatgpt-provider/lua/chatgpt-provider/",
+    dir  = dev("plugins/chatgpt-provider/lua/chatgpt-provider") or (STARTER_UPSTREAM .. "/../plugins/chatgpt-provider/lua/chatgpt-provider"),
   },
 
   { "amenocturne/nefor",
     name = "tool-gate",
     tag  = UPSTREAM_REF,
     path = "plugins/tool-gate/lua/tool-gate/",
-    dir  = dev("plugins/tool-gate/lua/tool-gate"),
+    dir  = dev("plugins/tool-gate/lua/tool-gate") or (STARTER_UPSTREAM .. "/../plugins/tool-gate/lua/tool-gate"),
   },
 
   { "amenocturne/nefor",
     name = "nefor-tui",
     tag  = UPSTREAM_REF,
     path = "plugins/nefor-tui/lua/",
-    dir  = dev("plugins/nefor-tui/lua"),
+    dir  = dev("plugins/nefor-tui/lua") or (STARTER_UPSTREAM .. "/../plugins/nefor-tui/lua"),
   },
 
-  { "amenocturne/nefor",
-    name = "reasoner-graph",
-    tag  = UPSTREAM_REF,
-    path = "plugins/reasoner-graph/lua/reasoner-graph/",
-    dir  = dev("plugins/reasoner-graph/lua/reasoner-graph"),
-  },
 })
 
 -- Graft path entries in REVERSE precedence order — later additions win
@@ -229,15 +232,23 @@ package.path = table.concat({
 
 local ncp       = require("core.ncp")
 local actor     = require("core.actor")
-local sessions  = require("sessions")
+local sessions  = require("libs.sessions")
 local lead_role = require("lead-workflow.role")
 local config    = require("config")
 local cfg       = config.active
 
+local PROVIDER_NAME = cfg.default_provider
+local provider_cfg = cfg.providers and cfg.providers[PROVIDER_NAME]
+if type(provider_cfg) ~= "table" then
+  error("config variant " .. tostring(config.variant) ..
+        " must define providers[default_provider]")
+end
+provider_cfg.name = provider_cfg.name or PROVIDER_NAME
+
 -- Lazy-require auth so a developer without DP on their machine can
--- still run the mock/test variants.
+-- still run the test/dev variants.
 local nestor_auth
-if cfg.provider.kind == "nestor" then
+if provider_cfg.kind == "nestor" then
   nestor_auth = require("auth")
 end
 
@@ -249,8 +260,12 @@ function invoke_from_plugin(source, payload)
   ncp.invoke_from_plugin(source, payload)
 end
 
+local history_replay = require("core.history_replay")
+
 actor.install()
+history_replay.install()
 actor.spawn(sessions)
+actor.spawn(require("libs.state-tracking"))
 sessions.init()
 
 -- Auth runs inline at startup so a missing DP session surfaces before
@@ -267,10 +282,10 @@ end
 local jwt, CHOSEN_MODEL
 local NESTOR_MODEL_NAMES = {}
 
-if cfg.provider.kind ~= "nestor" then
-  CHOSEN_MODEL = cfg.provider.model
-  log_banner(string.format("variant %q (kind=%s) active; skipping Nestor auth",
-                           config.variant, cfg.provider.kind))
+if provider_cfg.kind ~= "nestor" then
+  CHOSEN_MODEL = cfg.default_model
+  log_banner(string.format("variant %q (provider=%s kind=%s) active; skipping Nestor auth",
+                           config.variant, PROVIDER_NAME, provider_cfg.kind))
 else
   log_banner("authenticating against Nestor (" .. nestor_auth.NESTOR_BASE .. ")...")
 
@@ -288,13 +303,19 @@ else
   end
 
   -- Model preference order:
-  --   1. NEFOR_TEAM_MODEL env var.
-  --   2. First entry the API marks `is_default = true`.
-  --   3. First entry in the list.
-  --   4. Hardcoded "default".
+  --   1. NEFOR_TEAM_MODEL env var (explicit override).
+  --   2. A concrete cfg.default_model pin — anything other than the
+  --      "default" sentinel forces that exact model (prod pins qwen35).
+  --   3. First entry the API marks `is_default = true`.
+  --   4. First entry in the list.
+  --   5. The "default" sentinel as a last resort.
   local function pick_model()
     local env = os.getenv("NEFOR_TEAM_MODEL")
     if type(env) == "string" and #env > 0 then return env end
+    local pinned = cfg.default_model
+    if type(pinned) == "string" and #pinned > 0 and pinned ~= "default" then
+      return pinned
+    end
     for _, m in ipairs(models) do
       if type(m) == "table" and m.is_default == true and type(m.name) == "string" then
         return m.name
@@ -303,48 +324,34 @@ else
     if type(models[1]) == "table" and type(models[1].name) == "string" then
       return models[1].name
     end
-    return "default"
+    return cfg.default_model or "default"
   end
 
   CHOSEN_MODEL = pick_model()
   log_banner("using model: " .. CHOSEN_MODEL)
 end
 
--- Order matters because plugins register types/Into declarations
--- against nefor-combinators at startup, and the scheduler queries
--- combinators at submit time. Sequence:
---   1. provider/tool contracts declare()
---   2. nefor-combinators (registry)
---   3. agentic-loop (orchestrator state machine)
---   4. reasoners (Lua-resident reasoner handlers)
---   5. provider (openai-provider / mock-plugin)
---   6. reasoner-graph (queries combinators on submit)
---   7. tool-gate (aggregates tool advertisements)
---   8. basic-tools (advertises tools)
---   9. lead-workflow (plan/approval/dispatch state)
---  10. nefor-tui (UI)
+-- Order matters: type-tag registrations must complete before MAG submits.
+-- Sequence: contracts → agentic-loop → provider → mag → tool-gate/tools →
+-- lead-workflow/read-only-tools → TUI.
 
 require("libs.generic-provider").declare()
 require("libs.generic-tool").declare()
 
-actor.spawn(require("compositors.combinators"))
-
-local agentic_loop = require("agentic-loop")
+local agentic_loop = require("libs.agentic-loop")
 agentic_loop.configure {
-  provider = cfg.provider.name,
+  provider = PROVIDER_NAME,
   model    = CHOSEN_MODEL,
+  reasoning_effort = cfg.lead_reasoning_effort,
   system   = lead_role.LEAD_SYSTEM_PROMPT,
-  -- Restrict the lead's chat catalog to the orchestration-tool surface
-  -- so the model can't call `spawn_graph` directly and bottom out in a
-  -- `reasoner '<role>' not connected` runtime error. Per-role agent
-  -- firings get their own allowlist via the agent reasoner.
-  tool_allowlist = lead_role.ORCHESTRATION_TOOLS,
+  lead_program = {
+    source_dir = STARTER_ROOT,
+    entry      = "agentic-loop/lead-turn.mag",
+  },
 }
 actor.spawn(agentic_loop)
-actor.spawn(require("reasoners"))
 
-local PROVIDER_NAME = cfg.provider.name
-local bin           = config.bin
+local bin = config.bin
 
 if type(cfg.spawn_provider) == "function" then
   local ok, err = pcall(cfg.spawn_provider, {
@@ -355,6 +362,7 @@ if type(cfg.spawn_provider) == "function" then
     agentic_loop   = agentic_loop,
     config         = config,
     cfg            = cfg,
+    provider_cfg   = provider_cfg,
     starter_root   = STARTER_ROOT,
     starter_upstream = STARTER_UPSTREAM,
     log_banner     = log_banner,
@@ -364,34 +372,22 @@ if type(cfg.spawn_provider) == "function" then
           ": " .. tostring(err))
   end
 
-elseif cfg.provider.kind == "mock" then
-  -- mock-plugin speaks the same wire protocol as openai-provider, so
-  -- the upstream provider compositor works as-is.
-  actor.spawn(require("compositors.provider").spawn_spec(
-    PROVIDER_NAME,
-    {
-      bin("mock-plugin"),
-      "--script", STARTER_UPSTREAM .. "/" .. cfg.provider.mock_script,
-    },
-    { agentic_loop = agentic_loop }
-  ))
-
-elseif cfg.provider.kind == "ollama" then
+elseif provider_cfg.kind == "ollama" then
   -- static_token is decorative (ollama ignores it, but openai-provider
   -- requires --api-key). No think-tag wiring needed.
-  actor.spawn(require("compositors.provider").spawn_spec(
+  actor.spawn(require("libs.compositors.provider").spawn_spec(
     PROVIDER_NAME,
     {
       bin("openai-provider"),
       "--name",     PROVIDER_NAME,
       "--api-key",  "ollama-local",
-      "--base-url", cfg.provider.base_url,
-      "--model",    cfg.provider.model,
+      "--base-url", provider_cfg.base_url,
+      "--model",    CHOSEN_MODEL,
     },
     { static_token = "ollama-local", agentic_loop = agentic_loop }
   ))
 
-elseif cfg.provider.kind == "nestor" then
+elseif provider_cfg.kind == "nestor" then
   -- Upstream's provider compositor + team-owned qwen_hooks that splice
   -- the `<think>` filter, the chat.complete.result inline-strip, and
   -- the chat.model.list_requested drop into the lib's translation
@@ -403,7 +399,7 @@ elseif cfg.provider.kind == "nestor" then
     intercept_model_list_request = true,
   }
   nestor_opts.hooks = require("compositors.qwen_hooks").make(PROVIDER_NAME, nestor_opts)
-  actor.spawn(require("compositors.provider").spawn_spec(
+  actor.spawn(require("libs.compositors.provider").spawn_spec(
     PROVIDER_NAME,
     {
       bin("openai-provider"),
@@ -442,29 +438,21 @@ elseif cfg.provider.kind == "nestor" then
   end
 
 else
-  error("unknown cfg.provider.kind: " .. tostring(cfg.provider.kind) ..
-        " (expected one of: mock, ollama, nestor, or local spawn_provider)")
+  error("unknown provider kind: " .. tostring(provider_cfg.kind) ..
+        " (expected one of: ollama, nestor, or local spawn_provider)")
 end
 
-actor.spawn(require("compositors.graph").spawn_spec({ bin("reasoner-graph") }))
+actor.spawn(actor.identity_spec("mag", {
+  bin("mag-plugin"),
+  "--tool-gate", "tool-gate",
+  "--lua-root", LUA_ROOT,
+}))
 
--- Build the tool-gate argv. Every tool in lead_role.TOOL_ALLOWLIST
--- (lead orchestration union sub-agent tools) goes to --auto by
--- default; this trusts the dispatch-graph chokepoint to be the place
--- the user reviews work before it fans out. cfg.tool_gate.prompt_tools
--- flips specific names back to --prompt — the runtime gating points
--- (dispatch-graph for the fan-out, bash for tool-validator's da
--- classification). default_action catches anything outside the
--- allowlist (e.g. a new tool a plugin advertises that the lead-role
--- module hasn't been updated for); leave it on prompt so unknowns
--- surface in front of the user instead of running silently.
+-- Build the tool-gate argv. 0.4 MAG dispatch tools are auto-approved at the
+-- outer call; write-capable execution is checked inside lead-workflow before
+-- `mag.execute`, and concrete file/bash capabilities still pass through the
+-- gate/validator. Unknown future tools default to prompt.
 local tool_gate_argv = { bin("tool-gate") }
-if cfg.tool_gate.use_lead_allowlist then
-  for _, t in ipairs(lead_role.TOOL_ALLOWLIST) do
-    tool_gate_argv[#tool_gate_argv + 1] = "--auto"
-    tool_gate_argv[#tool_gate_argv + 1] = t
-  end
-end
 for _, t in ipairs(cfg.tool_gate.prompt_tools or {}) do
   tool_gate_argv[#tool_gate_argv + 1] = "--prompt"
   tool_gate_argv[#tool_gate_argv + 1] = t
@@ -482,21 +470,16 @@ tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action or "prompt"
 
 -- Register lead-workflow BEFORE spawning tool-gate so the lead's
 -- bus subscription is live when tool-gate.hello arrives — otherwise
--- the advertise of dispatch-graph / write-review
--- is missed and the lead model gets "no such tool" at runtime.
+-- the advertise of mag/write-review/graph-status is missed and the lead model
+-- gets "no such tool" at runtime.
 actor.spawn(require("lead-workflow"))
 
--- read-only-tools advertises list_dir + search_text (Lua-resident,
--- pure-read). Same ordering reason as lead-workflow: register before
--- tool-gate spawn so the gate's first hello triggers our advertise.
+-- read-only-tools advertises list_dir + search_text + the `skill` tool
+-- (Lua-resident, pure-read). Same ordering reason as lead-workflow: register
+-- before tool-gate spawn so the gate's first hello triggers our advertise.
+-- Jira/Confluence are no longer Lua tools — the lead loads the `dp` and
+-- `confluence` skills and runs those CLIs through mag-eval/bash.
 actor.spawn(require("read-only-tools"))
-
--- jira-tools advertises the `jira` tool for the lead orchestrator.
--- Must be registered before tool-gate spawn for the same reason.
-actor.spawn(require("jira"))
-
--- confluence-tools advertises the `wiki` tool for the docs subagent.
-actor.spawn(require("confluence"))
 
 -- Tool-validator translates tool-gate's chat.tool.permission_request
 -- into either an auto tool.permission_response (da-classified bash
@@ -506,12 +489,12 @@ actor.spawn(require("confluence"))
 -- starter/tool-validator/init.lua for policy details.
 actor.spawn(require("tool-validator"))
 
-local tools = require("compositors.tools")
-actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv, { agentic_loop = agentic_loop }))
+local tools = require("libs.compositors.tools")
+actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
 
 actor.spawn(tools.basic_actor_spec())
 
-actor.spawn(require("compositors.chat_bridge").spawn_spec({
+actor.spawn(require("libs.compositors.chat_bridge").spawn_spec({
   bin("nefor-tui"),
   "--script", STARTER_UPSTREAM .. "/chat/init.lua",
 }))

@@ -14,7 +14,7 @@ repo-level [`justfile`](../justfile).
 The repo root `.env` is the source of truth for the runtime version:
 
 ```sh
-NEFOR_VERSION=0.2.0
+NEFOR_VERSION=0.4.0
 ```
 
 `just sync` reads that file, asks for explicit confirmation, installs the exact
@@ -34,16 +34,20 @@ lockstep while allowing `just run` to use the repo-root pin.
 
 - `init.lua` — checks the exact version pin, bootstraps nefor-pm,
   installs plugin libs, grafts package paths, and composes the team's
-  variant-driven actor graph (Nestor / ollama / mock).
+  variant-driven actor graph (Nestor / ollama).
 
 ### Team-only modules
 
-- `config/init.lua` — variant table (prod=Nestor / test=ollama / mock),
-  per-role model pinning via `workflow.role_models`, and binary-path
-  resolver (`config.bin("<name>")`).
-- `lead-workflow/role.lua` — role roster: `explorer`, `worker`,
+- `config/init.lua` — 0.4-style variant table (prod/staging=Nestor,
+  test/dev=ollama) with provider-level default model selection,
+  MAG orchestration profiles, tool-gate policy, and binary-path resolver
+  (`config.bin("<name>")`).
+- `lead-workflow/init.lua` — thin re-export of upstream `libs.lead-workflow`
+  (the 0.4 MAG/write-review/graph-status mechanism).
+- `lead-workflow/role.lua` — team role roster: `explorer`, `worker`,
   `reviewer`, `docs`, `critic`. Exposes `LEAD_SYSTEM_PROMPT`,
-  `AGENT_CONFIGS`, `ORCHESTRATION_TOOLS`, and `TOOL_ALLOWLIST`.
+  `AGENT_CONFIGS`, `ORCHESTRATION_TOOLS`, and `TOOL_ALLOWLIST` for prompts,
+  tests, and tool policy.
 - `auth/init.lua` — DP CLI subprocess + JWT exchange against Nestor's
   `/api/v2/token`. Used only by the Nestor variant.
 - `compositors/qwen_hooks.lua` — team-owned hooks wired into upstream's
@@ -53,7 +57,7 @@ lockstep while allowing `just run` to use the repo-root pin.
 ### Team-only prompts
 
 - `prompts/lead.md` — Qwen-oriented lead orchestrator prompt with explicit
-  routing rules, planning/critic workflow, approval semantics, and graph rules.
+  MAG routing rules, planning/critic workflow, approval semantics, and graph rules.
 - `prompts/explorer.md` — read-only investigation.
 - `prompts/worker.md` — general write-capable approved-work executor.
 - `prompts/reviewer.md` — read-only review.
@@ -66,15 +70,17 @@ installed config has no test code.
 
 ## Approval policy
 
-Plan approval gates only write-capable roles: `worker` and `docs`.
-Read-only roles (`explorer`, `reviewer`, `critic`) may dispatch without plan
-approval. After approval, normal file edit/write tools inside write-capable
-agents do not require another plan approval. Ambiguous `bash` commands still go
-through tool approval when deterministic policy / `da` cannot classify them.
+Plan approval gates write-capable MAG programs: `worker` and write-capable
+`docs` agents use `edit_file`/`write_file` and require an approved
+`write-review` before `mag.execute`. Read-only roles (`explorer`, `reviewer`,
+`critic`) may run without plan approval. After approval, normal file edit/write
+tools inside write-capable agents do not require another plan approval.
+Ambiguous `bash` commands still go through tool approval when deterministic
+policy / `da` cannot classify them.
 
 The team config declares read-only/write-capable role metadata explicitly via
-`AGENT_CONFIGS[role].read_only`; it does not rely on an implicit upstream helper
-or missing default.
+`AGENT_CONFIGS[role].read_only`; the 0.4 runtime enforces writes by inspecting
+MAG actor tool surfaces at execution time.
 
 ## Run modes (NEFOR_DEV_DIR)
 
@@ -84,7 +90,7 @@ The team's `init.lua` supports two run modes:
   use local `dir` overrides and `STARTER_UPSTREAM = NEFOR_DEV_DIR/starter`.
 - **Prod mode** (`NEFOR_DEV_DIR` unset) — the upstream nefor repo is sparse
   cloned under `$NEFOR_DATA_DIR/nefor/` and pinned from the running engine
-  version (`0.2.0` → `v0.2.0`; dev/nightly versions fall back to `main`).
+  version (`0.4.0` → `v0.4.0`; dev/nightly versions fall back to `main`).
 
 ## Sync procedure when upstream advances
 

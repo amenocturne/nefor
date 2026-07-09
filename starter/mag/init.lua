@@ -1,0 +1,11 @@
+-- starter/mag/init.lua — re-export shim.
+--
+-- The MAG workspace-management + preview-formatting mechanism moved to
+-- the shared Lua tree at `lua/libs/mag-workspace/` (require as
+-- `libs.mag-workspace`). Only the config-owned seed content stays here
+-- under `mag/lib/` (types, templates, tools, policies, patterns,
+-- prompts) — `init_workspace` seeds a session's workspace from it via
+-- the config dir passed at call time. This shim keeps `require("mag")`
+-- resolving for consumers that still reference it by that bare name
+-- (lead-workflow, the agentic-loop spawner).
+return require("libs.mag-workspace")

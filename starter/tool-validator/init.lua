@@ -22,20 +22,13 @@
 --   --git read,add,commit,restore-staged,tag,fetch,pull,push
 --   --cargo local
 --
--- `dispatch-graph`: asks lead-workflow whether the args would be
--- auto-rejected (writer roles without an approved plan). On a sure
--- rejection we deny here so the user never sees a popup for an
--- invocation that's about to be turned down — without this the UX
--- would be "agent calls tool → popup → user approves → chat shows
--- rejection". The rejection reason rides through tool-gate's
--- permission_response.reason → tool.result.error so the agent learns
--- exactly what to do next.
+-- `mag`: outer MAG dispatch is auto-approved by tool-gate. lead-workflow
+-- validates write-capable programs before `mag.execute` and rejects execution
+-- unless a write-review plan is approved.
 --
 -- `edit_file` / `write_file`: auto-approved only while lead-workflow
--- has an approved plan. `edit_file` receives the small-edit policy
--- below before it reaches basic-tools. Without approval these are
--- denied instead of popped up, so direct file mutation cannot bypass
--- the plan gate.
+-- has an approved plan. Without approval these are denied instead of popped
+-- up, so direct file mutation cannot bypass the plan gate.
 --
 -- Other tools: defer to the user (popup) unless the agent is read-only.
 --
@@ -67,12 +60,18 @@ local gate_mode = "safe"
 -- (which is `--path`-bound; the agent's cwd is the engine's cwd, not
 -- per-call, so the path scope is ambiguous and we'd false-defer on
 -- legitimate mkdirs).
+-- `dp jira issue` (Jira read) and `confluence` (wiki read) are the team's
+-- read-only skill CLIs — auto-approve them so a jira/wiki query is frictionless
+-- via bash. Writes (`dp jira create`, …) aren't matched, so they fall through
+-- to the prompt. jq needs no rule; it is already a read-only binary.
 local DA_ARGS = {
   "--read-only",
   "--macos-only",
   "--help-bypass",
   "--git",   "read,add,commit,restore-staged,tag,fetch,pull,push",
   "--cargo", "local",
+  "--allow", "dp jira issue",
+  "--allow", "confluence",
 }
 
 local DA_ARGS_STRICT_READONLY = {
@@ -80,6 +79,8 @@ local DA_ARGS_STRICT_READONLY = {
   "--macos-only",
   "--help-bypass",
   "--git", "read",
+  "--allow", "dp jira issue",
+  "--allow", "confluence",
 }
 
 -- Resolved on first use. The cache holds the resolved cmd path
@@ -120,24 +121,6 @@ local function probe_da()
         "`just install-nefor` to install it under the libexec dir.")
 end
 
-local SMALL_EDIT_POLICY = {
-  require_unique_match = true,
-  max_changed_lines    = 40,
-  max_bytes_delta      = 4096,
-}
-
-local function copy_table(t)
-  local out = {}
-  for k, v in pairs(t or {}) do out[k] = v end
-  return out
-end
-
-local function with_policy(args, policy)
-  local out = copy_table(args)
-  out.policy = policy
-  return out
-end
-
 local function emit_response(id, decision, reason, args)
   local body = {
     kind     = "tool.permission_response",
@@ -161,26 +144,6 @@ local function emit_popup(body)
     tool = body.tool or body.name,
     args = body.args,
   })
-end
-
--- Pre-execution gate check for `dispatch-graph`. Asks lead-workflow
--- whether the args would be auto-rejected; if so, returns the rich
--- rejection reason so the popup can be skipped. Returns:
---   nil          — args look fine, fall through to popup
---   string reason — auto-deny with this message
--- Tolerates lead-workflow not being loaded (returns nil) so the
--- validator stays useful even when the lead-workflow actor isn't
--- spawned (e.g. minimal test setups).
-local function classify_dispatch_graph(args)
-  local ok, lw = pcall(require, "lead-workflow")
-  if not ok or type(lw) ~= "table" then return nil end
-  local check = lw.gate_against_unapproved_plan
-  if type(check) ~= "function" then return nil end
-  local nodes = args and args.nodes
-  if type(nodes) ~= "table" then return nil end
-  local rejection = check(nodes)
-  if type(rejection) == "string" and #rejection > 0 then return rejection end
-  return nil
 end
 
 -- Classify a bash command through da. Returns one of:
@@ -248,11 +211,7 @@ local function handle_permission_request(body)
       return
     end
     if has_approved_plan() then
-      if tool == "edit_file" then
-        emit_response(id, "approve", nil, with_policy(args, SMALL_EDIT_POLICY))
-      else
-        emit_response(id, "approve")
-      end
+      emit_response(id, "approve")
     else
       emit_response(id, "deny", tool .. " requires an approved plan")
     end
@@ -274,29 +233,6 @@ local function handle_permission_request(body)
   elseif is_ro then
     emit_response(id, "approve")
     return
-  elseif tool == "dispatch-graph" then
-    local rejection = classify_dispatch_graph(args)
-    if rejection ~= nil then
-      emit_response(id, "deny", rejection)
-      return
-    end
-    -- Auto-approve when every node uses a read-only role.
-    local all_readonly = true
-    local READ_ONLY_ROLES = { explorer = true, reviewer = true, critic = true }
-    local nodes = type(args) == "table" and args.nodes or {}
-    if type(nodes) == "table" then
-      for _, n in ipairs(nodes) do
-        if type(n) == "table" and not READ_ONLY_ROLES[n.role] then
-          all_readonly = false
-          break
-        end
-      end
-    end
-    if all_readonly then
-      emit_response(id, "approve")
-      return
-    end
-    -- write-capable roles: fall through to popup.
   end
 
   defer_or_deny(body)
@@ -330,7 +266,6 @@ return {
 
   _internals = {
     classify_bash             = classify_bash,
-    classify_dispatch_graph   = classify_dispatch_graph,
     handle_permission_request = handle_permission_request,
     set_mode = function(mode)
       if mode == "normal" then mode = "safe" end

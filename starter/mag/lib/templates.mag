@@ -1,0 +1,58 @@
+;; Composition templates — MAG library code, not compiler builtins.
+;;
+;; Each template is a plain MAG function that builds primitive nodes and hands
+;; them to `subgraph`, which namespaces every internal id under `:id` and
+;; exposes boundary ports. Two instantiations of one template therefore occupy
+;; disjoint id subtrees; load-time uniqueness validation rejects a shared `:id`.
+;;
+;; Require this module and call a template with a config map:
+;;   (let [tpl  (require "lib/templates")
+;;         gate ((get tpl "gate") {:id "review" :model "opus"
+;;                                 :provider "chatgpt-provider"})]
+;;     (graph entry -> gate  gate -> out  :terminal out))
+;;
+;; `agent` is NOT here: its call carries a load-bearing polymorphic type
+;; annotation (`: IN -> generic-provider.FinalAnswer` for any IN) that a plain
+;; MAG function cannot receive, so it stays a compiler builtin. gate is
+;; monomorphic over concrete provider/human types and so expresses cleanly as
+;; a library function.
+
+(type generic-provider.ProviderOut)
+(type generic-provider.FinalAnswer)
+(type human.Approved)
+(type human.Rejected)
+
+;; gate — produce a result, put it to a `human` approval gate, revise on
+;; rejection.
+;;
+;; Approval and rejection are the human factory's typed outputs
+;; (human.Approved | human.Rejected); rejection folds through a `rework`
+;; boundary shift (the `adapter` factory lifts the rejection reason into the
+;; next provider turn) and back into `produce`. Revision is the SAME llm
+;; re-firing: its owned transcript already carries the rejected draft, so the
+;; reason alone is the feedback and the model revises with full memory of what
+;; it produced — a separate revise llm would see only the reason. The exit is
+;; human.Approved — the human is the loop's terminator, and a stuck revision
+;; cycle is stopped via the control plane's kill/interrupt like any other loop.
+;;
+;; Boundary: ProviderOut in; human.Approved out.
+(def gate (fn [cfg]
+  (let [model    (get cfg "model")
+        provider (get cfg "provider")
+
+        produce (node "llm" {:model model :provider provider
+                             :system (or (get cfg "system")
+                                         "Produce a result for approval.")}
+                  : generic-provider.ProviderOut -> generic-provider.FinalAnswer)
+
+        approve (node "human" {:prompt (or (get cfg "prompt") "Approve this result?")}
+                  : generic-provider.FinalAnswer
+                  -> (human.Approved | human.Rejected))
+
+        rework  (node "adapter" {:seed "provider-in"}
+                  : human.Rejected -> generic-provider.ProviderOut)]
+
+    (subgraph {:id (get cfg "id") :in produce :out [approve]}
+      produce -> approve
+      approve -> rework
+      rework  -> produce))))

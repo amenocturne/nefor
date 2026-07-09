@@ -1,23 +1,23 @@
--- starter/lead-workflow/role.lua — team-port lead-workflow role configs.
+-- starter/lead-workflow/role.lua — team role/prompt metadata.
 --
--- Loads each prompts/<role>.md at module-load time and exposes:
+-- 0.4 execution is MAG-based: the lead writes agent graphs with the `mag`
+-- tool instead of calling the old `dispatch-graph` tool. This module remains
+-- the team-owned roster/prompt loader used by init.lua, tests, docs, and the
+-- MAG role library.
 --
---   * LEAD_SYSTEM_PROMPT  — string, the lead orchestrator's prompt.
+-- Exposes:
+--   * LEAD_SYSTEM_PROMPT  — string, the lead orchestrator's prompt
+--                           (starter/prompts/lead.md).
 --   * AGENT_CONFIGS       — table keyed by role name; each entry has
---                           { system_prompt, model, tool_allowlist }.
---   * ORCHESTRATION_TOOLS — list of tool names the lead has access to.
---   * TOOL_ALLOWLIST      — union fed to tool-gate's --prompt argv.
+--                           { tool_allowlist, read_only }. Role prompt bodies
+--                           live in mag/lib/prompts/<role>.md (the single
+--                           source, read by the lead when it authors a MAG
+--                           graph) — they are not duplicated here.
+--   * ORCHESTRATION_TOOLS — list of direct lead tools authored in lead-turn.mag.
+--   * TOOL_ALLOWLIST      — union used by config/tool-gate policy checks.
 --
--- The team port carries five sub-agent roles (explorer, worker, reviewer, docs, critic) plus per-role
--- model overrides drawn from cfg.workflow.role_models.
---
--- Prompts are read from disk rather than embedded as Lua string
--- literals because long strings inside Lua are painful (escaping, no
--- syntax highlighting in editors, no clean diffs).
---
--- Per-role model resolution: AGENT_CONFIGS[role].model is set from
--- cfg.workflow.role_models[role]; nil falls back to the session default
--- configured via agentic_loop.configure { model = ... }.
+-- Sub-agents intentionally do not set per-role models; MAG profiles resolve
+-- to the provider-level default configured at boot.
 
 local M = {}
 
@@ -50,20 +50,6 @@ local function load_or_placeholder(name)
   return "[lead-workflow.role: prompt '" .. name .. "' missing — " .. tostring(err) .. "]"
 end
 
-local function load_role_models()
-  local cfg_module = require("config")
-  local active = cfg_module.active
-  if type(active) ~= "table" then return {} end
-  local workflow = active.workflow
-  if type(workflow) ~= "table" then return {} end
-  local models = workflow.role_models
-  if type(models) ~= "table" then return {} end
-  return models
-end
-
-local ROLE_MODELS = load_role_models()
-local function model_for(role) return ROLE_MODELS[role] end
-
 M.LEAD_SYSTEM_PROMPT = load_or_placeholder("lead")
 
 -- Per-role boundaries:
@@ -71,47 +57,45 @@ M.LEAD_SYSTEM_PROMPT = load_or_placeholder("lead")
 --   * reviewer/critic — read-only set. No shell, no write.
 --   * worker          — general write-capable executor for approved work.
 --   * docs            — specialized write-capable documentation agent with
---                       Jira/Confluence access.
+--                       Jira/Confluence access via the dp/confluence skills
+--                       (loaded with the `skill` tool, run through mag-eval).
 M.AGENT_CONFIGS = {
   explorer = {
-    system_prompt  = load_or_placeholder("explorer"),
-    model          = model_for("explorer"),
-    tool_allowlist = { "read_file", "list_dir", "search_text" },
+    -- MAG agents use read_file for known paths and mag-eval shell expressions
+    -- for listing/searching. list_dir/search_text remain advertised for direct
+    -- lead convenience and legacy tests, but role prompts steer agents to MAG.
+    tool_allowlist = { "read_file", "mag-eval" },
     read_only      = true,
   },
   worker = {
-    system_prompt  = load_or_placeholder("worker"),
-    model          = model_for("worker"),
-    tool_allowlist = { "read_file", "list_dir", "search_text", "write_file", "bash" },
+    tool_allowlist = { "read_file", "edit_file", "write_file", "mag-eval" },
     read_only      = false,
   },
   reviewer = {
-    system_prompt  = load_or_placeholder("reviewer"),
-    model          = model_for("reviewer"),
-    tool_allowlist = { "read_file", "list_dir", "search_text" },
+    tool_allowlist = { "read_file", "mag-eval" },
     read_only      = true,
   },
   docs = {
-    system_prompt  = load_or_placeholder("docs"),
-    model          = model_for("docs"),
-    tool_allowlist = { "jira", "wiki", "read_file", "list_dir", "search_text", "write_file" },
+    tool_allowlist = { "skill", "read_file", "edit_file", "write_file", "mag-eval" },
     read_only      = false,
   },
   critic = {
-    system_prompt  = load_or_placeholder("critic"),
-    model          = model_for("critic"),
-    tool_allowlist = { "read_file", "list_dir", "search_text" },
+    tool_allowlist = { "read_file", "mag-eval" },
     read_only      = true,
   },
 }
 
--- The lead does NOT get read/grep/find/ls/glob/write/edit/bash directly
--- — investigation goes through explorer nodes, changes through worker/docs nodes.
+-- The lead does NOT get broad shell directly. Quick world reads use mag-eval;
+-- durable delegation uses mag; write-capable MAG programs are gated by
+-- write-review before execute.
 M.ORCHESTRATION_TOOLS = {
   "read_file",
-  "jira",
-  "dispatch-graph",
+  "skill",
+  "mag-eval",
+  "mag",
   "write-review",
+  "graph-status",
+  "terminate-graph",
 }
 
 -- TOOL_ALLOWLIST — union of every role's tool surface plus the lead's

@@ -1,0 +1,17 @@
+;; Team role tool sets for MAG agents.
+;;
+;; Context I/O is explicit (`read_file`, `edit_file`, `write_file`); world
+;; queries and verification commands are `mag-eval` expressions. The docs role
+;; carries `skill` to load the `dp`/`confluence` workflows and runs those CLIs
+;; through mag-eval (Jira/Confluence are no longer dedicated tools).
+
+(def explorer-tools ["read_file" "mag-eval"])
+(def reviewer-tools ["read_file" "mag-eval"])
+(def critic-tools ["read_file" "mag-eval"])
+(def worker-tools ["read_file" "edit_file" "write_file" "mag-eval"])
+(def docs-tools ["skill" "read_file" "edit_file" "write_file" "mag-eval"])
+
+;; Backward-compatible generic aliases used by upstream examples.
+(def read-tools explorer-tools)
+(def write-tools worker-tools)
+(def review-tools reviewer-tools)

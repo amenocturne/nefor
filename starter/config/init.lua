@@ -6,12 +6,11 @@
 --               think-tag filter. Requires DP credentials.
 --   * test    — openai-provider against local ollama with qwen2.5:7b.
 --               No auth, no filter. For machines without Nestor access.
---   * mock    — mock-plugin scripted from upstream's mock-provider.
---               Deterministic; for CI / repro harnesses.
 --   * dev     — alias for test.
 --   * staging — alias for prod.
 
 local M = {}
+local H = {}
 
 -- Plugins call `require("config").bin("<name>")` to get the absolute
 -- path of a sibling plugin binary; the engine sets NEFOR_PLUGIN_DIR
@@ -26,124 +25,124 @@ M.bin = function(name)
   return plugin_dir .. "/" .. name
 end
 
--- Lead-workflow defaults shared by every variant. Per-variant tables
--- can override any key by passing `workflow = workflow_with(...)`. Lua
--- merges shallowly; keys not set in the override fall back to here.
-local DEFAULT_WORKFLOW = {
-  enabled     = true,
-  -- Concurrency cap on simultaneously-firing agent nodes. The
-  -- lead-workflow actor batches dispatches to honour this.
-  concurrency = 3,
-  -- Per-role model overrides. Each variant fills its own table below;
-  -- nil entries fall back to the session default (whatever the boot
-  -- picker chose via NEFOR_TEAM_MODEL / API default).
-  role_models = {},
-}
-
--- Roster keys must match lead-workflow/role.lua's AGENT_CONFIGS and the
--- team_roles list in tests/lua/config_test.lua. Both variants currently
--- run every role on the same model; once smaller/faster models become
--- available, hand-pin per role here and the table stops being uniform.
-local function all_roles(model)
-  return {
-    explorer            = model,
-    worker              = model,
-    reviewer            = model,
-    docs                = model,
-    critic              = model,
-  }
-end
-
--- Prod: Nestor cluster's qwen35-397b.
-local PROD_ROLE_MODELS = all_roles("tgpt/qwen35-397b-a17b-fp8")
-
--- Test (ollama) defaults — overridable via env so the user doesn't have
--- to edit this file to swap which local model nefor talks to. The role
--- list applies the same override so every sub-agent runs on the same
--- model the lead does (matches the prod-side single-model assumption).
 local function env_or(name, fallback)
   local v = os.getenv(name)
   if type(v) == "string" and #v > 0 then return v end
   return fallback
 end
+
+-- Test/dev (ollama) defaults — overridable via env so the user doesn't
+-- have to edit this file to swap which local model nefor talks to.
 local TEST_MODEL    = env_or("NEFOR_OLLAMA_MODEL", "qwen2.5:7b")
 local TEST_BASE_URL = env_or("NEFOR_OLLAMA_BASE_URL", "http://localhost:11434")
-local TEST_ROLE_MODELS = all_roles(TEST_MODEL)
 
-local function workflow_with(role_models)
-  local t = {}
-  for k, v in pairs(DEFAULT_WORKFLOW) do t[k] = v end
-  t.role_models = role_models
-  return t
+-- 0.4 MAG orchestration profiles. Models stay provider-level: profiles only
+-- select provider/model defaults and reasoning depth; roles do not pin models.
+local function orchestration_profiles(provider)
+  return {
+    fast     = { provider = provider, reasoning_effort = "low" },
+    standard = { provider = provider, reasoning_effort = "medium" },
+    deep     = { provider = provider, reasoning_effort = "high" },
+    max      = { provider = provider, reasoning_effort = "xhigh" },
+  }
 end
 
--- Tool-gate policy is shared across variants — prod, test, and mock
--- only differ by which provider/model they point at. The gate is part
--- of the product, not a per-environment knob.
+-- Tool-gate policy is shared across variants — environments only differ
+-- by which provider/model they point at. The gate is part of the
+-- product, not a per-environment knob.
 --
--- Default stance: every tool in lead_role.TOOL_ALLOWLIST runs --auto
--- (read-only investigation tools never need a popup; worker/docs sub-agents
--- inherit trust from the dispatch-graph plan approval). prompt_tools flips
--- the two runtime gating points back to --prompt:
---
---   * dispatch-graph — fan-out gate. One click reviews the entire
---     graph the lead is about to run.
---   * bash          — per-command classification via tool-validator
---     (which calls `da`). Safe read-only commands auto-approve;
---     anything else surfaces as a popup.
---
--- default_action stays "prompt" so an unfamiliar tool a future plugin
--- advertises (not in TOOL_ALLOWLIST) surfaces in front of the user
--- instead of running silently.
+-- Default stance: read/context and orchestration-control tools are auto.
+-- Write-capable work is gated at MAG execute by write-review approval; bash
+-- still goes through a prompt/validator path because shell policy is runtime-
+-- dependent. default_action stays prompt so unfamiliar future tools surface.
 local SHARED_TOOL_GATE = {
-  default_action     = "prompt",
-  use_lead_allowlist = true,
-  prompt_tools       = { "dispatch-graph", "bash" },
+  default_action = "prompt",
+  auto_tools = {
+    "read_file",
+    "list_dir",
+    "search_text",
+    "skill",
+    "discover_instruction_files",
+    "write-review",
+    "submit-plan",
+    "graph-status",
+    "terminate-graph",
+    "mag",
+    "mag-eval",
+  },
+  prompt_tools = { "bash" },
 }
+H.shared_tool_gate = SHARED_TOOL_GATE
+H.env_or = env_or
+H.orchestration_profiles = orchestration_profiles
 
 M.prod = {
-  provider = {
-    kind = "nestor",
-    name = "nestor",
+  default_provider         = "nestor",
+  -- Prod pins the exact model. Boot resolution (see init.lua pick_model):
+  -- NEFOR_TEAM_MODEL env -> a concrete default_model (this pin) -> API
+  -- is_default -> first API model. The "default" sentinel would instead
+  -- defer to the API's own default rather than pinning.
+  default_model            = "tgpt/qwen35-397b-a17b-fp8",
+  default_reasoning_effort = "medium",
+  lead_reasoning_effort    = "medium",
+  providers = {
+    nestor = {
+      kind = "nestor",
+      name = "nestor",
+    },
   },
+  orchestration_profiles = orchestration_profiles("nestor"),
   tool_gate = SHARED_TOOL_GATE,
-  workflow = workflow_with(PROD_ROLE_MODELS),
   log_level = "info",
 }
 
 M.test = {
-  provider = {
-    kind     = "ollama",
-    name     = "ollama",
-    model    = TEST_MODEL,
-    base_url = TEST_BASE_URL,
+  default_provider         = "ollama",
+  default_model            = TEST_MODEL,
+  default_reasoning_effort = "medium",
+  lead_reasoning_effort    = "medium",
+  providers = {
+    ollama = {
+      kind     = "ollama",
+      name     = "ollama",
+      base_url = TEST_BASE_URL,
+    },
   },
+  orchestration_profiles = orchestration_profiles("ollama"),
   tool_gate = SHARED_TOOL_GATE,
-  workflow = workflow_with(TEST_ROLE_MODELS),
   log_level = "info",
-}
-
-M.mock = {
-  provider = {
-    kind        = "mock",
-    name        = "mock-plugin",
-    model       = "mock-model",
-    mock_script = "mock-provider/init.lua",
-  },
-  tool_gate = SHARED_TOOL_GATE,
-  -- mock-plugin dispatches by prompt content, not model name, so
-  -- role_models stays empty.
-  workflow = workflow_with({}),
-  log_level = "warn",
 }
 
 M.dev     = M.test
 M.staging = M.prod
 
--- Confluence wiki config — not variant-specific.
-M.confluence = {
-  host = "https://wiki.tcsbank.ru",
-}
+-- Optional untracked local variants. Kept as a tiny compatibility seam for
+-- developer-only providers while preserving the 0.4 config shape. Loaded via
+-- loadfile (not require) so the chunk actually receives the helper table H —
+-- standard `require` ignores extra arguments, so `require("config.local", H)`
+-- would never deliver the helpers. Absence is fine; a genuine error in
+-- local.lua surfaces loudly instead of being swallowed by pcall(require, ...).
+do
+  local path = package.searchpath("config.local", package.path)
+  if path then
+    local chunk, load_err = loadfile(path)
+    if not chunk then
+      error("config/local.lua failed to parse: " .. tostring(load_err))
+    end
+    local ok, local_cfg = pcall(chunk, H)
+    if not ok then
+      error("config/local.lua failed to run: " .. tostring(local_cfg))
+    end
+    if type(local_cfg) == "table" then
+      local variants = type(local_cfg.variants) == "table" and local_cfg.variants or local_cfg
+      for name, variant in pairs(variants) do
+        if type(variant) == "table" then
+          M[name] = variant
+        end
+      end
+    end
+  end
+end
 
 local variant = os.getenv("NEFOR_CONFIG")
 if variant == nil or variant == "" then

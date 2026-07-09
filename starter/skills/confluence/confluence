@@ -1,0 +1,92 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""confluence <page-id> — fetch a Confluence wiki page as Markdown.
+
+Wraps `npx @acq-tech/confluence`: downloads the page (and any subpages) into a
+temp dir, prints the main page as Markdown, appends discovered subpage IDs, and
+cleans the temp dir up. Read-only.
+
+The wiki host defaults to the team wiki; override with CONFLUENCE_HOST. The
+username comes from `whoami` (matching the retired Lua tool); override with
+CONFLUENCE_USER.
+
+Usage:
+    confluence 12345678
+"""
+
+import getpass
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HOST = os.environ.get("CONFLUENCE_HOST", "https://wiki.tcsbank.ru").rstrip("/")
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"confluence: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def main() -> None:
+    if len(sys.argv) != 2 or not sys.argv[1].strip():
+        die("usage: confluence <page-id>")
+    page_id = sys.argv[1].strip()
+    if not page_id.isdigit():
+        die(f"page id must be numeric, got {page_id!r}")
+
+    username = os.environ.get("CONFLUENCE_USER") or getpass.getuser()
+    if not username:
+        die("could not determine username (set CONFLUENCE_USER)")
+
+    url = f"{HOST}/pages/viewpage.action?pageId={page_id}"
+    tmpdir = tempfile.mkdtemp(prefix=f"confluence-{page_id}-")
+    try:
+        # `@acq-tech/confluence` prompts for confirmation; feed it "Y".
+        proc = subprocess.run(
+            [
+                "npx", "@acq-tech/confluence",
+                "--username", username,
+                "--folder-path", tmpdir,
+                url,
+            ],
+            input="Y\n",
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            die(f"npx exited {proc.returncode}: {(proc.stdout + proc.stderr).strip()}")
+
+        page = Path(tmpdir) / page_id / "index.md"
+        if not page.exists():
+            page = Path(tmpdir) / f"{page_id}.md"
+        if not page.exists():
+            die(f"page file not found after download (page_id={page_id})")
+
+        content = page.read_text()
+
+        # Subpage IDs = numeric directory names (depth 1-2) other than the
+        # main page, created when the downloader pulls children.
+        root = Path(tmpdir)
+        seen: set[str] = set()
+        subpages: list[str] = []
+        for d in list(root.glob("*")) + list(root.glob("*/*")):
+            if d.is_dir() and re.fullmatch(r"\d+", d.name) and d.name != page_id and d.name not in seen:
+                seen.add(d.name)
+                subpages.append(d.name)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    sys.stdout.write(content)
+    if subpages:
+        sys.stdout.write("\n\n---\nSubpages: " + ", ".join(subpages) + "\n")
+
+
+if __name__ == "__main__":
+    main()

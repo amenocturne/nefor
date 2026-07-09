@@ -1,0 +1,28 @@
+;; Standard type definitions matching the Nefor runtime combinator registry.
+;; Require this module to use well-known fanout types in MAG graphs.
+;;
+;; Types with a dot (e.g. generic-tool.ToolCalls) are emitted as-is in
+;; the IR — they must match registered combinator signatures exactly.
+;; Bare types (e.g. Findings) get a mag. prefix and are used for
+;; graph-internal routing only.
+
+;; tool-split combinator: LLM/agent output classification
+;; Use on nodes that produce either tool calls or a final answer.
+(def tool-split-types {
+  :in  "generic-provider.ProviderOut"
+  :out ["generic-tool.ToolCalls" "generic-provider.FinalAnswer"]})
+
+(type generic-provider.ProviderOut)
+(type generic-tool.ToolCalls)
+(type generic-provider.FinalAnswer)
+
+;; retry-split combinator: retry/pass/exhausted routing
+;; Use on retry-decision nodes that gate retry loops.
+(def retry-split-types {
+  :in  "generic-control.RetryDecision"
+  :out ["generic-control.Retry" "generic-control.Pass" "generic-control.Exhausted"]})
+
+(type generic-control.RetryDecision)
+(type generic-control.Retry)
+(type generic-control.Pass)
+(type generic-control.Exhausted)
