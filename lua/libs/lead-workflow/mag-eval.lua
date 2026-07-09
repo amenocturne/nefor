@@ -46,7 +46,9 @@ M.schema = {
     "Evaluate one MAG expression on the actor kernel and return the " ..
     "terminal node's output. `->` is the pipe: a node's output becomes the " ..
     "next node's stdin, e.g. ((bash \"rg -n TODO src/\") -> (bash \"sort\")). " ..
-    "A bare (bash \"cmd\") runs a single command.",
+    "A bare (bash \"cmd\") runs a single command. For one-off queries " ..
+    "whose result you need back right now — multi-step or multi-file " ..
+    "work runs as a .mag program via the mag tool instead.",
   parameters  = {
     type = "object",
     properties = {

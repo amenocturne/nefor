@@ -1302,7 +1302,17 @@ local function lead_workflow_tool_schemas()
         "one sink bound via :terminal. See lib/patterns.md and " ..
         "lib/templates.mag in the workspace for composition patterns. " ..
         "For a one-off shell expression whose result you just need back, " ..
-        "use mag-eval instead — no file, no workspace ceremony.",
+        "use mag-eval instead — no file, no workspace ceremony.\n\n" ..
+        "When to dispatch a graph vs work directly: first identify what " ..
+        "is on the critical path for your next decision vs what is " ..
+        "self-contained sidecar work. Anything multi-file, multi-step, " ..
+        "or long-horizon runs as a graph; keep only glances and " ..
+        "single-file tweaks local. Write each agent's :system prompt " ..
+        "self-contained — goal, relevant paths, constraints, expected " ..
+        "output shape; agents do not see your conversation. Give " ..
+        "parallel builders disjoint write sets. After dispatch, " ..
+        "coordinate: track via graph-status, integrate results, prepare " ..
+        "the next dispatch — do not redo delegated work locally.",
       parameters  = {
         type = "object",
         properties = {
