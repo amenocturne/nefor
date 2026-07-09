@@ -68,6 +68,15 @@
 --   failure as a run failure — a garbled conversation must not silently
 --   drive a provider round.
 --
+-- Transcript delta (turn-as-function, the return leg):
+--   The FinalAnswer carries `transcript_delta` — every transcript message this
+--   instance accumulated BEYOND the seed (the activation's user turn, each
+--   assistant tool-call turn in the wire shape, each tool result, the final
+--   assistant answer). A spawner that seeds `params.history` per turn reads it
+--   back off the terminal result and appends it to its canonical history, so
+--   the next turn's seed replays what the model actually SAW, not just what it
+--   said. The seed itself is never echoed back — the spawner already holds it.
+--
 -- The request handle / cancel mechanics (FLAGGED — the reconciliation the task
 -- asked for):
 --   * The kernel mints its OWN correlation request id inside
@@ -228,6 +237,8 @@ function M.construct(id, params, emit, deps)
   local draining = false -- drain arrived while in flight; finish then die
   local history = seeded -- the accumulated transcript (seed-prefixed),
   -- replayed whole per round
+  local seed_len = #seeded -- the seed/live boundary: messages past this index
+  -- are what this instance accumulated (the FinalAnswer's transcript_delta)
 
   -- Classification rule (FLAGGED): tool calls are "present" when the provider
   -- result carries a non-empty `tool_calls` array. This matches the landed
@@ -393,6 +404,17 @@ function M.construct(id, params, emit, deps)
           if type(result.text) == "string" and #result.text > 0 then
             history[#history + 1] = { role = "assistant", content = result.text }
           end
+        end
+        -- The turn's transcript delta (header, "Transcript delta"): everything
+        -- accumulated beyond the seed, final assistant turn included. Attached
+        -- only when non-empty so an empty Lua table never JSON-encodes as a map
+        -- where consumers expect an array.
+        if #history > seed_len then
+          local delta = {}
+          for i = seed_len + 1, #history do
+            delta[#delta + 1] = history[i]
+          end
+          final.transcript_delta = delta
         end
         emit(sign(final))
       end

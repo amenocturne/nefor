@@ -327,6 +327,63 @@ do
 end
 
 -- ==================================================================
+-- transcript delta: the FinalAnswer carries everything accumulated beyond the
+-- seed — the seed itself is never echoed back
+-- ==================================================================
+
+do
+  local instance, msgs = make("turn.llm", {
+    provider = "p",
+    history = {
+      { role = "user", content = "earlier question" },
+      { role = "assistant", content = "earlier answer" },
+    },
+  })
+  instance.deliver(turn({ messages = { { role = "user", content = "new question" } } }))
+  local r1 = find_kind(msgs, "capability.invoke")
+  instance.deliver({
+    kind = "reply",
+    ref = r1.ref,
+    result = {
+      text = "",
+      finish_reason = "tool_calls",
+      tool_calls = { { id = "call-1", name = "list_dir", arguments = { path = "." } } },
+    },
+  })
+  instance.deliver(turn({ messages = {
+    { role = "tool", tool_call_id = "call-1", name = "list_dir", content = "dir-listing" },
+  } }))
+  local r2
+  for _, m in ipairs(msgs) do
+    if m.kind == "capability.invoke" and m ~= r1 then r2 = m end
+  end
+  instance.deliver({ kind = "reply", ref = r2.ref, result = { text = "the answer" } })
+
+  local final = find_kind(msgs, "generic-provider.FinalAnswer")
+  assert_true(final ~= nil, "the run ends in a FinalAnswer")
+  local delta = final.transcript_delta
+  assert_true(type(delta) == "table", "the FinalAnswer carries a transcript_delta")
+  assert_eq(#delta, 4, "the delta is the live turns alone: user, tool call, tool result, answer")
+  assert_eq(delta[1].role, "user", "the delta opens with the activation's user turn")
+  assert_eq(delta[1].content, "new question", "the seed is not echoed back")
+  assert_eq(delta[2].role, "assistant", "the assistant tool-call turn is recorded")
+  assert_eq(delta[2].tool_calls[1].id, "call-1", "the recorded call keeps the model's id")
+  assert_eq(delta[3].role, "tool", "the tool result follows the call")
+  assert_eq(delta[3].content, "dir-listing", "the tool result is verbatim")
+  assert_eq(delta[4].role, "assistant", "the final answer closes the delta")
+  assert_eq(delta[4].content, "the answer", "the final answer text is verbatim")
+
+  -- Without a seed the delta covers the whole owned transcript.
+  local i2, m2 = make("plain.llm", { provider = "p" })
+  i2.deliver(turn({ messages = { { role = "user", content = "go" } } }))
+  i2.deliver({ kind = "reply", ref = find_kind(m2, "capability.invoke").ref, result = { text = "done" } })
+  local f2 = find_kind(m2, "generic-provider.FinalAnswer")
+  assert_eq(#f2.transcript_delta, 2, "no seed: the delta is the whole transcript")
+  assert_eq(f2.transcript_delta[1].content, "go", "the user turn leads")
+  assert_eq(f2.transcript_delta[2].content, "done", "the answer closes")
+end
+
+-- ==================================================================
 -- transcript seeding: a malformed seed fails construction with the detail
 -- ==================================================================
 

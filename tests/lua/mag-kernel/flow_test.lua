@@ -110,6 +110,36 @@ do
 end
 
 -- ==================================================================
+-- sink: the llm's transcript_delta stays off the persisted output but rides
+-- the run-complete result (the conversation record is not the final answer)
+-- ==================================================================
+
+do
+  local msgs, emit = capture()
+  local persisted = {}
+  local writer = function(final) persisted[#persisted + 1] = final end
+
+  local inst = sink.construct("sink", {}, emit, { writer = writer })
+  inst.deliver(single("up", "generic-provider.FinalAnswer", {
+    kind = "generic-provider.FinalAnswer",
+    text = "the answer",
+    transcript_delta = {
+      { role = "user", content = "the task" },
+      { role = "assistant", content = "the answer" },
+    },
+  }))
+
+  assert_eq(persisted[1].text, "the answer", "writer received the final output")
+  assert_eq(persisted[1].transcript_delta, nil,
+    "the persisted output carries no transcript_delta")
+  local done = find_kind(msgs, "mag.RunComplete")
+  assert_eq(done.result.text, "the answer", "run-complete carries the result")
+  assert_true(type(done.result.transcript_delta) == "table"
+      and #done.result.transcript_delta == 2,
+    "run-complete's result keeps the transcript_delta for the run's spawner")
+end
+
+-- ==================================================================
 -- sink: deps.writer is injected through registry:construct — kernel-side
 -- capabilities travel in `deps`, threaded past the authored params
 -- ==================================================================

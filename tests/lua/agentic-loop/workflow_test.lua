@@ -369,6 +369,66 @@ do
   assert_eq(seeded[2].content, "the answer")
 end
 
+-- (full-transcript recording) a completed turn whose result carries the llm's
+-- transcript_delta records the WHOLE turn — tool exchanges included — so the
+-- next turn's seed replays what the model saw, not just what it said.
+do
+  fresh_loop()
+  local exec = begin_bound_turn("read the config", "r21")
+  local delta = {
+    { role = "user", content = "read the config" },
+    {
+      role = "assistant", content = "",
+      tool_calls = { { id = "call-1", type = "function",
+        ["function"] = { name = "read_file", arguments = "{\"path\":\"init.lua\"}" } } },
+    },
+    { role = "tool", tool_call_id = "call-1", name = "read_file", content = "-- config body" },
+    { role = "assistant", content = "the config sets provider mock" },
+  }
+  _test.calls_clear()
+  send_to_loop("mag", {
+    kind = "mag.run_result", run_id = exec.body.run_id,
+    status = "completed",
+    result = { text = "the config sets provider mock", transcript_delta = delta },
+  })
+
+  local history = agentic_loop.history()
+  assert_eq(#history, 4, "the completed turn records the full transcript delta")
+  assert_eq(history[2].tool_calls[1].id, "call-1",
+    "the assistant tool-call turn survives into canonical history")
+  assert_eq(history[3].role, "tool", "the tool result survives into canonical history")
+  assert_eq(history[3].content, "-- config body", "the tool result is verbatim")
+
+  local recorded = find_kind(decode_calls(), "agentic_loop.turn_recorded")
+  assert(recorded ~= nil, "the turn_recorded marker fires")
+  assert_eq(#recorded.body.messages, 4, "the marker carries the recorded messages for /resume")
+  assert_eq(recorded.body.user, "read the config", "the marker keeps the user summary field")
+  assert_eq(recorded.body.answer, "the config sets provider mock",
+    "the marker keeps the answer summary field")
+
+  local exec2 = begin_turn("and the model?")
+  local seeded = exec2.body.params_overlay["lead.llm"].history
+  assert_eq(#seeded, 4, "the next turn seeds the full recorded transcript")
+  assert_eq(seeded[3].tool_call_id, "call-1", "the seeded tool result stays paired with its call")
+end
+
+-- (ill-shaped delta) a transcript_delta that is not an array of role-tagged
+-- messages falls back to the bare {user, answer} pair instead of corrupting
+-- the next turn's seed.
+do
+  fresh_loop()
+  local exec = begin_bound_turn("odd result", "r22")
+  send_to_loop("mag", {
+    kind = "mag.run_result", run_id = exec.body.run_id,
+    status = "completed",
+    result = { text = "fine", transcript_delta = { "loose string", { content = "no role" } } },
+  })
+  local history = agentic_loop.history()
+  assert_eq(#history, 2, "an ill-shaped delta records the bare pair")
+  assert_eq(history[1].content, "odd result", "the user message survives")
+  assert_eq(history[2].content, "fine", "the answer survives")
+end
+
 -- (ambient MAG context caching) the static section (inventory + patterns +
 -- types + template signatures + prompt roster) is read once and reused
 -- across turns; only the per-session workspace dir varies.
@@ -634,16 +694,33 @@ do
     kind = "agentic_loop.turn_recorded",
     user = "old question", answer = "old answer",
   })
+  -- A marker carrying the turn's recorded transcript replays it verbatim —
+  -- tool exchanges included (the delta-less marker above took the pair path).
+  send_to_loop("engine", {
+    kind = "agentic_loop.turn_recorded",
+    user = "tooled question", answer = "tooled answer",
+    messages = {
+      { role = "user", content = "tooled question" },
+      { role = "assistant", content = "",
+        tool_calls = { { id = "call-9", type = "function",
+          ["function"] = { name = "list_dir", arguments = "{}" } } } },
+      { role = "tool", tool_call_id = "call-9", name = "list_dir", content = "listing" },
+      { role = "assistant", content = "tooled answer" },
+    },
+  })
   _test.fire_bus("sessions.replay.end", { session_id = "resume-1" })
 
   local history = agentic_loop.history()
-  assert_eq(#history, 2, "replayed marker rebuilt the canonical history")
+  assert_eq(#history, 6, "replayed markers rebuilt the canonical history")
   assert_eq(history[1].content, "old question")
   assert_eq(history[2].content, "old answer")
+  assert_eq(history[4].tool_calls[1].id, "call-9",
+    "a messages-carrying marker replays the tool exchange verbatim")
+  assert_eq(history[5].role, "tool", "the replayed tool result keeps its role")
 
   local exec = begin_turn("post-resume")
   local seeded = exec.body.params_overlay["lead.llm"].history
-  assert_eq(#seeded, 2, "the post-resume turn seeds the rebuilt history")
+  assert_eq(#seeded, 6, "the post-resume turn seeds the rebuilt history")
   assert_eq(seeded[1].content, "old question")
 end
 

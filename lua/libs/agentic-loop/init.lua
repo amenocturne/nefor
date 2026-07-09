@@ -12,11 +12,15 @@
 -- terminal `mag.run_result` closes the turn, and the constellation dies.
 --
 -- What outlives turns lives HERE:
---   * canonical history — per completed turn `{ user message, final answer
---     text }` is appended (intra-turn tool exchanges die with the
---     turn-program) and seeded into the next turn's llm via
---     `params.history`. `agentic_loop.turn_recorded` markers on the bus
---     make the history rebuildable on /resume.
+--   * canonical history — per completed turn the llm's FULL transcript delta
+--     (user task, assistant tool-call turns, tool results, final answer —
+--     ridden back on `mag.run_result result.transcript_delta`, see
+--     factories/llm.lua "Transcript delta") is appended and seeded into the
+--     next turn's llm via `params.history`, so the next turn replays what the
+--     model SAW, not just what it said. A turn that ends without a delta
+--     (killed/failed, or a non-llm program) falls back to the bare
+--     `{ user message, answer }` pair. `agentic_loop.turn_recorded` markers
+--     on the bus make the history rebuildable on /resume.
 --   * queueing/orchestration — queued-message promotion while busy, the
 --     deferred relay queue for dispatched-run completions
 --     (lead-workflow → relay_run_completion), model/profile switching, the
@@ -84,9 +88,10 @@ local state = {
     load_id    = nil,   ---@type string|nil  in-flight mag.load request id
   },
 
-  -- Canonical conversation history: provider-dialect messages, one
-  -- user+assistant pair per completed turn. Seeded into each turn's llm
-  -- via params.history; rebuilt on /resume from turn_recorded markers.
+  -- Canonical conversation history: provider-dialect messages, the full
+  -- transcript delta per completed turn (bare user+assistant pair when a
+  -- turn ends without one). Seeded into each turn's llm via params.history;
+  -- rebuilt on /resume from turn_recorded markers.
   history = {},                 ---@type table
 
   current_run_id = nil,         ---@type string|nil
@@ -769,7 +774,9 @@ local function handle_mag_run_started(body)
 end
 
 -- The relay text for a run result's inline `result` (the sink's final
--- answer riding mag.run_result): its text when it carries one.
+-- answer riding mag.run_result): its text when it carries one. The encode
+-- fallback excludes transcript_delta — the conversation record is history's
+-- concern, never part of the answer text.
 local function mag_result_text(result)
   if type(result) ~= "table" then return nil end
   if type(result.text) == "string" and #result.text > 0 then
@@ -778,26 +785,58 @@ local function mag_result_text(result)
   if type(result.final_answer) == "string" and #result.final_answer > 0 then
     return result.final_answer
   end
-  local ok, encoded = pcall(json.encode, result)
+  local bare = {}
+  for k, v in pairs(result) do
+    if k ~= "transcript_delta" then bare[k] = v end
+  end
+  local ok, encoded = pcall(json.encode, bare)
   if ok and type(encoded) == "string" then return encoded end
   return nil
 end
 
+-- Validate a transcript delta into recordable messages: a non-empty array of
+-- role-tagged message tables, or nil. Arrives off the wire (mag.run_result →
+-- result.transcript_delta) or from a replayed turn_recorded marker, so the
+-- shape is checked once here; an ill-shaped delta falls back to the bare
+-- {user, answer} pair rather than corrupting the seed.
+local function transcript_messages(delta)
+  if type(delta) ~= "table" or #delta == 0 then return nil end
+  for i = 1, #delta do
+    local m = delta[i]
+    if type(m) ~= "table" or type(m.role) ~= "string" or #m.role == 0 then
+      return nil
+    end
+  end
+  return delta
+end
+
 -- Commit one turn to the canonical conversation history and log the durable
 -- `turn_recorded` marker (replayed on /resume to rebuild state.history). Every
--- terminal path that must preserve context routes through here: a completed
--- turn records its real answer; a killed/failed turn records a placeholder so
--- the user's message never silently vanishes from the next turn's seed. Skips
--- empty user_text (a relay/system turn with no message to preserve).
-local function record_turn(run_id, user_text, answer)
+-- terminal path that must preserve context routes through here. A completed
+-- turn carries the llm's transcript delta — the user task plus every tool
+-- exchange plus the final answer, recorded verbatim so the next turn's seed
+-- replays what the model saw. A turn without a usable delta (killed/failed,
+-- or a program that didn't end in an llm) records the bare `{ user, answer }`
+-- pair. Skips empty user_text (a relay/system turn with no message to
+-- preserve). The marker carries `messages` (the recorded delta) alongside the
+-- `user`/`answer` summary fields session tooling reads.
+local function record_turn(run_id, user_text, answer, transcript_delta)
   if type(user_text) ~= "string" or #user_text == 0 then return end
-  state.history[#state.history + 1] = { role = "user", content = user_text }
-  state.history[#state.history + 1] = { role = "assistant", content = answer }
+  local messages = transcript_messages(transcript_delta)
+  if messages ~= nil then
+    for _, m in ipairs(messages) do
+      state.history[#state.history + 1] = m
+    end
+  else
+    state.history[#state.history + 1] = { role = "user", content = user_text }
+    state.history[#state.history + 1] = { role = "assistant", content = answer }
+  end
   emit(nil, {
-    kind   = "agentic_loop.turn_recorded",
-    run_id = run_id,
-    user   = user_text,
-    answer = answer,
+    kind     = "agentic_loop.turn_recorded",
+    run_id   = run_id,
+    user     = user_text,
+    answer   = answer,
+    messages = messages,
   })
 end
 
@@ -818,8 +857,9 @@ end
 --     prefix-bound stream (exactly how the lead's final answer renders
 --     today); when no stream flowed (a non-streaming provider), the text
 --     is appended so the turn is never silently empty. Canonical history
---     gains the `{ user, answer }` pair, and a turn_recorded marker rides
---     the bus so /resume can rebuild it.
+--     gains the turn's transcript delta (bare `{ user, answer }` pair when
+--     the result carries none), and a turn_recorded marker rides the bus
+--     so /resume can rebuild it.
 --   failed — surfaced in chat as a system line, AND the turn is recorded
 --     with a placeholder answer so context survives (an interrupted lead
 --     turn settles here; without the record the next turn seeds blind).
@@ -835,7 +875,8 @@ local function handle_mag_run_result(body)
 
   if body.status == "completed" then
     local answer = mag_result_text(body.result) or ""
-    record_turn(run_id, turn.user_text, answer)
+    local delta = type(body.result) == "table" and body.result.transcript_delta or nil
+    record_turn(run_id, turn.user_text, answer, delta)
     if not turn.streamed and #answer > 0 then
       emit("nefor-tui", {
         kind = "chat.message.append",
@@ -1077,9 +1118,9 @@ function M._teardown_for_session_end() return teardown_for_session_end() end
 
 function M.config() return state.config end
 
--- The canonical conversation history (read-only view; one user+assistant
--- pair per completed turn). Tests and surfaces read it; mutations belong
--- to the turn lifecycle only.
+-- The canonical conversation history (read-only view; the recorded
+-- transcript per completed turn). Tests and surfaces read it; mutations
+-- belong to the turn lifecycle only.
 function M.history() return state.history end
 
 local function receive_msg(entry)
@@ -1111,9 +1152,16 @@ local function receive_msg(entry)
     end
     -- Canonical-history rebuild: each completed turn logged one
     -- turn_recorded marker; replaying them restores the conversation the
-    -- next turn seeds into its llm.
+    -- next turn seeds into its llm. A marker carrying the turn's recorded
+    -- transcript messages replays them verbatim; an older/delta-less marker
+    -- falls back to the bare pair.
     if kind == "agentic_loop.turn_recorded" then
-      if type(body.user) == "string" then
+      local messages = transcript_messages(body.messages)
+      if messages ~= nil then
+        for _, m in ipairs(messages) do
+          state.history[#state.history + 1] = m
+        end
+      elseif type(body.user) == "string" then
         state.history[#state.history + 1] = { role = "user", content = body.user }
         state.history[#state.history + 1] = { role = "assistant", content = tostring(body.answer or "") }
       end
