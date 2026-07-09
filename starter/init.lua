@@ -130,12 +130,28 @@ else
     end
   else
     local local_hash = capture("git -C '" .. pm_root .. "' rev-parse HEAD 2>/dev/null") or ""
-    local remote_hash = capture("git ls-remote origin '" .. UPSTREAM_REF .. "' 2>/dev/null") or ""
+    -- Ask for both the plain ref and its peeled form (^{}): annotated tags
+    -- resolve to a tag object under the plain ref, and comparing that
+    -- against a local commit hash would report a permanent mismatch. The
+    -- peeled line sorts directly after the tag line, so the last line is
+    -- always the commit hash for both tags and branches.
+    local remote_hash = capture("git -C '" .. pm_root .. "' ls-remote origin '"
+                                .. UPSTREAM_REF .. "' '" .. UPSTREAM_REF .. "^{}' 2>/dev/null | tail -1") or ""
     remote_hash = remote_hash:match("^(%x+)") or ""
-    if local_hash ~= remote_hash or local_hash == "" then
-      run("git -C '" .. pm_root .. "' fetch --depth 1 origin '" .. UPSTREAM_REF .. "' 2>/dev/null")
-      run("git -C '" .. pm_root .. "' checkout '" .. UPSTREAM_REF .. "' 2>/dev/null")
-      run("git -C '" .. pm_root .. "' reset --hard origin/" .. UPSTREAM_REF .. " 2>/dev/null")
+    if remote_hash == "" then
+      print("[nefor-team] warning: cannot reach origin to refresh " .. pm_root
+            .. " (ref " .. UPSTREAM_REF .. "); continuing with the existing checkout")
+    elseif local_hash ~= remote_hash then
+      -- fetch + reset to FETCH_HEAD works uniformly for branches and tags;
+      -- `checkout <tag>` / `reset origin/<tag>` do not (a shallow tag fetch
+      -- creates no local ref). Failures are fatal: silently keeping a stale
+      -- checkout means running new binaries against old Lua libs.
+      if not run("git -C '" .. pm_root .. "' fetch --depth 1 origin '" .. UPSTREAM_REF .. "'") then
+        error("nefor-team bootstrap: git fetch failed for ref " .. UPSTREAM_REF .. " in " .. pm_root)
+      end
+      if not run("git -C '" .. pm_root .. "' reset --hard FETCH_HEAD") then
+        error("nefor-team bootstrap: git reset --hard FETCH_HEAD failed in " .. pm_root)
+      end
     end
   end
   if not run("git -C '" .. pm_root .. "' sparse-checkout set " .. SPARSE_CONE) then
