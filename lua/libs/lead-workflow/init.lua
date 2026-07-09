@@ -1229,7 +1229,11 @@ local function lead_workflow_tool_schemas()
   return {
     {
       name        = "graph-status",
-      description = "Report active graph runs, or one active/recent completed run when run_id is provided.",
+      description =
+        "Report active graph runs, or one active/recent completed run " ..
+        "when run_id is provided. One-shot snapshot for when you or the " ..
+        "user need to know what's in flight — never call it in a " ..
+        "polling loop; run outcomes are delivered to you when they land.",
       parameters  = {
         type = "object",
         properties = {
@@ -1310,9 +1314,11 @@ local function lead_workflow_tool_schemas()
         "single-file tweaks local. Write each agent's :system prompt " ..
         "self-contained — goal, relevant paths, constraints, expected " ..
         "output shape; agents do not see your conversation. Give " ..
-        "parallel builders disjoint write sets. After dispatch, " ..
-        "coordinate: track via graph-status, integrate results, prepare " ..
-        "the next dispatch — do not redo delegated work locally.",
+        "parallel builders disjoint write sets. After dispatch, do not " ..
+        "poll graph-status — run outcomes (completion, failure, " ..
+        "interruption) are delivered to you by the runtime. Integrate " ..
+        "results as they arrive and prepare the next dispatch; do not " ..
+        "redo delegated work locally.",
       parameters  = {
         type = "object",
         properties = {
