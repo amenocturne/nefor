@@ -155,6 +155,14 @@ struct ChatState {
     ///   stays process-wide; this is per-chat scoping.
     tool_allowlist: Option<Vec<String>>,
     reasoning_effort: Option<String>,
+    /// True for chats rebuilt by `chat.restore` (session replay) that have
+    /// not been touched live since. A live `chat.create` colliding with such
+    /// a chat replaces it: run-scoped ids (`r<K>/…`) restart from r1 when
+    /// the mag kernel restarts, so a resumed session's fresh run
+    /// legitimately reclaims an id last used by a dead run of the crashed
+    /// session. Cleared on first live use (`append` / `begin_turn`) so
+    /// duplicate creates against an in-use chat still error.
+    restored: bool,
 }
 
 impl ChatState {
@@ -167,6 +175,7 @@ impl ChatState {
             stats: ChatStats::default(),
             tool_allowlist: None,
             reasoning_effort: None,
+            restored: false,
         }
     }
 }
@@ -266,8 +275,15 @@ impl Chats {
                 .ok_or(ChatsError::NoModelConfigured)?,
         };
         let mut g = self.inner.lock().await;
-        if g.contains_key(&id) {
-            return Err(ChatsError::AlreadyExists(id));
+        match g.get(&id) {
+            // A restored chat nothing touched live belongs to a dead run of
+            // the pre-resume session — the new session's create reclaims the
+            // id (see ChatState::restored).
+            Some(existing) if existing.restored => {
+                tracing::info!(chat_id = %id, "chat.create replaces restored chat from previous session");
+            }
+            Some(_) => return Err(ChatsError::AlreadyExists(id)),
+            None => {}
         }
         let mut chat = ChatState::new(resolved_model);
         chat.system = system;
@@ -302,6 +318,7 @@ impl Chats {
         }
         chat.reasoning_effort = restore.reasoning_effort;
         chat.history = Arc::new(repair_tool_call_history(restore.history));
+        chat.restored = true;
 
         let mut g = self.inner.lock().await;
         g.insert(restore.id, chat);
@@ -464,6 +481,7 @@ impl Chats {
             }
         }
         Arc::make_mut(&mut chat.history).push(message);
+        chat.restored = false;
         Ok(())
     }
 
@@ -541,6 +559,7 @@ impl Chats {
         }
         let token = TurnToken::new();
         chat.turn = TurnState::InFlight(token.clone());
+        chat.restored = false;
         Ok(token)
     }
 
@@ -793,6 +812,38 @@ mod tests {
             .create(id.clone(), None, None, None, None, None)
             .await
             .expect_err("second create");
+        assert!(matches!(err, ChatsError::AlreadyExists(x) if x == id));
+    }
+
+    #[tokio::test]
+    async fn create_replaces_restored_chat_but_not_live_touched_one() {
+        let c = Chats::with_default_model(Some("m".into()));
+        let id = ChatId::new("r1/lead.llm@r1");
+        let restore = |hist: Vec<Message>| ChatRestore {
+            id: id.clone(),
+            model: None,
+            tools_enabled: None,
+            tool_allowlist: None,
+            reasoning_effort: None,
+            system: None,
+            history: hist,
+        };
+        // Restored-only chat (session replay of a dead run): a new
+        // session's create reclaims the id with a fresh history.
+        c.restore(restore(vec![Message::user("old")]))
+            .await
+            .expect("restore");
+        c.create(id.clone(), None, None, None, None, None)
+            .await
+            .expect("create over restored chat succeeds");
+        let hist = c.history_snapshot(&id).await.expect("snapshot");
+        assert!(hist.is_empty(), "reclaimed chat starts fresh");
+        // Once touched live, the same id is protected again.
+        c.push_user(&id, "live".into()).await.expect("append");
+        let err = c
+            .create(id.clone(), None, None, None, None, None)
+            .await
+            .expect_err("create over live chat still errors");
         assert!(matches!(err, ChatsError::AlreadyExists(x) if x == id));
     }
 
