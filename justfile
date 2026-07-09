@@ -87,13 +87,46 @@ install channel="source" mode="safe": (install-nefor channel) (install-starter m
     @echo "Make sure your shell has:"
     @echo "  export PATH=\"${PREFIX:-$HOME/.local}/bin:\$PATH\""
 
-# Install nefor for `channel`: source (cargo build) | latest (brew if available, else stable tarball) | nightly (rolling tarball). Plugins land in ~/.local/share/nefor/bin; only `nefor` goes on PATH (or wherever brew puts it).
+# Install nefor for `channel`: source (cargo build) | latest (brew if available, else stable tarball) | nightly (rolling tarball). Plugins land in ~/.local/share/nefor/bin; only `nefor` goes on PATH (or wherever brew puts it). Cleans up binaries left by older install layouts.
 install-nefor channel="source":
     #!/usr/bin/env bash
     set -eu
     PREFIX="${PREFIX:-$HOME/.local}"
     LIBEXEC_ROOT="$HOME/.local/share/nefor"
     LIBEXEC_BIN="$LIBEXEC_ROOT/bin"
+
+    # Pre-libexec installs put every plugin next to `nefor` in $PREFIX/bin.
+    # A leftover nefor-tui there makes the engine's plugin-root resolver
+    # pick $PREFIX/bin over $LIBEXEC_BIN, so it spawns stale plugins and
+    # misses ones that never existed in the old layout (mag-plugin).
+    remove_old_layout_bins() {
+      local name
+      for name in openai-provider tool-gate basic-tools reasoner-graph \
+                  nefor-tui mock-plugin generic-provider generic-tool \
+                  nefor-combinators chatgpt-provider mag mag-plugin; do
+        if [ -e "$PREFIX/bin/$name" ]; then
+          rm -f "$PREFIX/bin/$name"
+          echo "  removed stale $PREFIX/bin/$name (old install layout)"
+        fi
+      done
+    }
+
+    # $@ = the bins this install just wrote. Anything else in $LIBEXEC_BIN
+    # is from an older nefor (renamed/removed plugins); `da` is managed by
+    # install-starter and kept.
+    prune_libexec_bin() {
+      local keep=" $* da " f name
+      for f in "$LIBEXEC_BIN"/*; do
+        [ -e "$f" ] || continue
+        name=$(basename "$f")
+        case "$keep" in
+          *" $name "*) ;;
+          *) rm -f "$f"; echo "  removed stale $LIBEXEC_BIN/$name" ;;
+        esac
+      done
+    }
+
+    remove_old_layout_bins
 
     install_tarball() {
       # Args: $1 = release tag (e.g. v0.1.5 or "nightly")
@@ -119,10 +152,13 @@ install-nefor channel="source":
       mkdir -p "$PREFIX/bin" "$LIBEXEC_BIN"
       install -m 0755 "$tmp/nefor-${target}/bin/nefor" "$PREFIX/bin/nefor"
       echo "  $PREFIX/bin/nefor"
+      local installed=""
       for bin in "$tmp/nefor-${target}/share/nefor/plugins/"*; do
         install -m 0755 "$bin" "$LIBEXEC_BIN/$(basename "$bin")"
         echo "  $LIBEXEC_BIN/$(basename "$bin")"
+        installed="$installed $(basename "$bin")"
       done
+      prune_libexec_bin $installed
     }
 
     case "{{channel}}" in
@@ -132,17 +168,18 @@ install-nefor channel="source":
         cd "{{justfile_directory()}}"
         install -m 0755 "target/release/nefor" "$PREFIX/bin/nefor"
         echo "  $PREFIX/bin/nefor"
-        for p in "{{justfile_directory()}}"/plugins/*/; do
-          name=$(basename "$p")
-          bin="target/release/$name"
-          [ -f "$bin" ] && install -m 0755 "$bin" "$LIBEXEC_BIN/$name" && echo "  $LIBEXEC_BIN/$name"
+        # Every workspace [[bin]] except the CLI entry and dev-only tools is
+        # a plugin. cargo metadata keeps bins whose name differs from their
+        # crate directory (mag-plugin) covered, and a missing build artifact
+        # fails the install instead of being silently skipped.
+        plugins=$(cargo metadata --no-deps --format-version 1 \
+          | jq -r '.packages[].targets[] | select(.kind[]=="bin") | .name' \
+          | grep -vx -e nefor -e fake-engine)
+        for name in $plugins; do
+          install -m 0755 "target/release/$name" "$LIBEXEC_BIN/$name"
+          echo "  $LIBEXEC_BIN/$name"
         done
-        # MAG compiler (lives in crates/, not plugins/)
-        bin="target/release/mag"
-        [ -f "$bin" ] && install -m 0755 "$bin" "$LIBEXEC_BIN/mag" && echo "  $LIBEXEC_BIN/mag"
-        # MAG plugin (bin `mag-plugin` != dir basename `mag`, so the plugins/* loop misses it)
-        bin="target/release/mag-plugin"
-        [ -f "$bin" ] && install -m 0755 "$bin" "$LIBEXEC_BIN/mag-plugin" && echo "  $LIBEXEC_BIN/mag-plugin"
+        prune_libexec_bin $plugins
         ;;
       latest)
         if command -v brew >/dev/null 2>&1; then
