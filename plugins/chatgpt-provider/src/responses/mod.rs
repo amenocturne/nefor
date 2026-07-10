@@ -120,7 +120,7 @@ pub const DEFAULT_ORIGINATOR: &str = "nefor_cli_rs";
 /// claim parity with a current codex CLI release so the model list
 /// matches what `codex --model` shows on the same account. Bump this
 /// alongside codex's releases.
-pub const CODEX_COMPAT_CLIENT_VERSION: &str = "0.130.0";
+pub const CODEX_COMPAT_CLIENT_VERSION: &str = "0.144.0";
 
 /// Retry policy for the initial POST to `/responses` and `/models`.
 /// Codex's cloud edge (Envoy) does its own short internal retries and
