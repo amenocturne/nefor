@@ -22,9 +22,7 @@ use crate::lua_host::LuaHost;
 
 const CHANNEL_CAP: usize = 128;
 
-/// Hardcoded plugin identity. Exposed to Lua as `nefor.name`. If callers
-/// need multiple `mock-plugin` instances under distinct wire identities,
-/// extend this with a `--name` flag.
+/// Default plugin identity, exposed to Lua as `nefor.name`.
 pub const PLUGIN_NAME: &str = "mock-plugin";
 
 /// NCP version this plugin speaks.
@@ -34,6 +32,10 @@ pub const PROTOCOL_VERSION: &str = "0.1";
 #[derive(Debug, Parser)]
 #[command(name = "mock-plugin", version, about, long_about)]
 struct Args {
+    /// Wire identity and event-kind prefix exposed to the Lua script.
+    #[arg(long, default_value = PLUGIN_NAME)]
+    name: String,
+
     /// Path to the Lua script that defines this plugin's handlers.
     #[arg(long, value_name = "PATH")]
     script: PathBuf,
@@ -81,7 +83,7 @@ async fn run() -> Result<(), MockError> {
     // Lua host. Load the script before the handshake so we surface
     // syntax errors immediately and never talk to the engine with a
     // broken script.
-    let host = LuaHost::new(PLUGIN_NAME, out_tx.clone())?;
+    let host = LuaHost::new(&args.name, out_tx.clone())?;
     host.exec_script(&script_name, &script_src).await?;
 
     // Handshake.
@@ -96,6 +98,30 @@ async fn run() -> Result<(), MockError> {
     // Shutdown path: fire the Lua handler, then let tasks drop.
     host.on_shutdown().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_defaults_to_mock_plugin_wire_identity() {
+        let args = Args::try_parse_from(["mock-plugin", "--script", "scenario.lua"])
+            .expect("valid default-name CLI");
+
+        assert_eq!(args.name, PLUGIN_NAME);
+        assert_eq!(args.script, PathBuf::from("scenario.lua"));
+    }
+
+    #[test]
+    fn cli_accepts_an_explicit_wire_identity() {
+        let args =
+            Args::try_parse_from(["mock-plugin", "--name", "mock", "--script", "scenario.lua"])
+                .expect("valid explicit-name CLI");
+
+        assert_eq!(args.name, "mock");
+        assert_eq!(args.script, PathBuf::from("scenario.lua"));
+    }
 }
 
 async fn run_dispatch_loop(

@@ -51,6 +51,31 @@ test-provider:
 test-tui:
     cargo test -p nefor-tui --lib
 
+# Drive the real starter through its deterministic mock provider. Override
+# TUI_DRIVER_DIR when the sibling source checkout lives elsewhere.
+test-tui-smoke:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tui_driver_dir="${TUI_DRIVER_DIR:-{{justfile_directory()}}/../tui-driver}"
+    mkdir -p "{{justfile_directory()}}/tmp"
+    data_dir="$(mktemp -d "{{justfile_directory()}}/tmp/tui-driver-data.XXXXXX")"
+    trap 'rm -rf "$data_dir"' EXIT
+    cargo build --workspace --locked
+    cargo run --quiet --locked --manifest-path "$tui_driver_dir/Cargo.toml" -- \
+      run-script tests/tui/starter-mock-smoke.json \
+      --repo-root "{{justfile_directory()}}" \
+      --artifacts-dir "{{justfile_directory()}}/tmp/tui-driver-artifacts" \
+      --env "NEFOR_DATA_DIR=$data_dir" \
+      --env NEFOR_DEFAULT_PROVIDER=mock \
+      --env NEFOR_DEFAULT_MODEL=mock-model \
+      --env NEFOR_ENABLE_CHATGPT=0 \
+      --env NEFOR_ENABLE_OLLAMA=0 \
+      --env NEFOR_USE_REPO_PLUGIN_BINS=0 \
+      --env NEFOR_TEST_FAST_MOCK=1
+
+# All local TUI confidence: renderer/unit coverage plus the real starter smoke.
+test-tui-all: test-tui test-tui-smoke
+
 # TUI chat workflow, replay, autocomplete, and input integration tests.
 test-tui-chat:
     cargo test -p nefor-tui --test chat_test -- --test-threads=1

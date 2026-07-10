@@ -1,0 +1,20 @@
+{
+  "name": "starter-mock-completes-first-turn",
+  "command": {
+    "argv": ["just", "run"],
+    "cwd": ".",
+    "cols": 120,
+    "rows": 36
+  },
+  "steps": [
+    {"kind": "wait_text", "text": "mock-model", "timeout_ms": 30000},
+    {"kind": "type", "text": "count to 3"},
+    {"kind": "key", "key": "Enter"},
+    {"kind": "wait_text", "text": "1, 2, 3", "timeout_ms": 30000},
+    {"kind": "wait_not_text", "text": "[thinking", "timeout_ms": 10000},
+    {"kind": "wait_idle", "idle_ms": 500, "timeout_ms": 10000},
+    {"kind": "key", "key": "CtrlC"},
+    {"kind": "wait_exit", "timeout_ms": 10000},
+    {"kind": "assert_exit_code", "expected": 0}
+  ]
+}
