@@ -1,6 +1,6 @@
 # chatgpt-provider
 
-NCP v0.1 plugin: talks to OpenAI's Responses API using ChatGPT-subscription
+NCP plugin: talks to OpenAI's Responses API using ChatGPT-subscription
 OAuth credentials. Same multi-instance shape as `openai-provider` (`--name`
 flag sets the event-kind prefix), but targets the ChatGPT backend
 (`https://chatgpt.com/backend-api/codex`) instead of the standard

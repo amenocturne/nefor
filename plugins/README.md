@@ -15,4 +15,4 @@ Process-isolated NCP plugins. Each plugin is its own crate with a binary entry p
 
 ## Authoring
 
-A plugin reads NCP envelopes from stdin and writes them to stdout, line-delimited. See `protocol/v0.1/spec.md` for the wire shape and `docs/plugin-authoring.md` for guidance.
+A plugin reads NCP envelopes from stdin and writes them to stdout, line-delimited. See [`../docs/protocol.md`](../docs/protocol.md) for the wire shape and [`../docs/plugin-authoring.md`](../docs/plugin-authoring.md) for guidance.

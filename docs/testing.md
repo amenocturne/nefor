@@ -18,7 +18,7 @@ If those three pass, the substrate is healthy.
 | ------------------------------- | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | ------------------------------ |
 | Workspace unit tests            | `cargo test --workspace`                        | Per-crate unit tests across engine + all plugins                                                           | Few seconds, mostly in-process |
 | `agentic_cli_mock_e2e`          | `engine/tests/agentic_cli_mock_e2e.rs`          | Full chain (engine binary as subprocess + Lua + mock provider). 6 scenarios. **Default e2e health check.** | ~2.5s wall                     |
-| `starter_ncp_test`              | `engine/tests/starter_ncp_test.rs`              | NCP v0.1 protocol in Lua                                                                                   | <1s                            |
+| `starter_ncp_test`              | `engine/tests/starter_ncp_test.rs`              | NCP behavior in Lua                                                                                   | <1s                            |
 | `starter_sessions_test`         | `engine/tests/starter_sessions_test.rs`         | Session persistence + resume                                                                               | <1s                            |
 | `starter_agentic_workflow_test` | `engine/tests/starter_agentic_workflow_test.rs` | Agentic orchestration Lua tests                                                                            | <1s                            |
 | Plugin unit tests               | `cargo test -p <plugin>`                        | Each plugin's own tests (nefor-tui has chat + layout + reconciler tests, openai-provider 137, etc.)        | Sub-second per plugin          |
@@ -59,7 +59,7 @@ The CLI is a pure-Lua plugin declared in `cli-config/init.lua`. Run via `nefor p
 ```bash
 cd /path/to/nefor
 cargo build --workspace
-export NEFOR_PLUGIN_DIR=$PWD/plugins
+export NEFOR_PLUGIN_DIR=$PWD/target/debug
 export NEFOR_CONFIG=test
 ```
 
@@ -165,14 +165,6 @@ Things to verify:
 ## Verifying known concerns
 
 These are documented quirks of the current codebase. Confirming they exist is part of due diligence — they're surfaced for fixing in future sessions, not bugs to be hit by surprise.
-
-### READY_SENTINEL coupling
-
-`starter/cli/init.lua` watches for `basic-tools.hello` (`READY_SENTINEL`) to know when all plugins are ready. Spawn order in `cli-config/init.lua` ends with `basic-tools`, so this works — but it's fragile.
-
-To confirm: comment out the `basic-tools` spawn line in `cli-config/init.lua`, run any single-shot command. CLI hangs forever waiting for `basic-tools.hello`. Restore after testing.
-
-Fix candidates (future work): engine-level "all spawned plugins are ready" event; or a counter-based wait keyed to configured plugin count.
 
 ### Stream-json fan-out duplication
 

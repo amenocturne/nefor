@@ -1,9 +1,9 @@
 //! nefor-protocol — types and wire codec for the Nefor Composition Protocol.
 //!
-//! This crate models the envelope (§3) and the four system message kinds
-//! (§5) of [NCP v0.1][spec], plus encode/decode helpers for the JSON Lines
-//! wire format. It is consumed by the engine broker and by plugin-side
-//! Rust implementations.
+//! This crate models NCP envelope and system-message shapes, plus
+//! encode/decode helpers for the JSON Lines wire format. It is consumed
+//! by plugin-side Rust implementations and tests; the shipped engine's
+//! current behavior is summarized in [docs/protocol.md][spec].
 //!
 //! # Shape
 //!
@@ -11,10 +11,9 @@
 //!   plugin receivers and produced by the engine.
 //! - [`PluginOutgoing`] — the reduced `{type, body}` form a plugin emits;
 //!   the engine stamps `from` / `ts` before broadcast.
-//! - [`SystemBody`] — the closed set of §5 bodies, tagged by `kind`.
-//! - [`ParseError`] — the decoder's failure modes. The engine maps these
-//!   to §8 [`ErrorCode`] values when reporting back to the offending
-//!   sender; the mapping is intentionally outside this crate's surface.
+//! - [`SystemBody`] — supported system bodies, tagged by `kind`.
+//! - [`ParseError`] — the decoder's failure modes. Error reporting policy
+//!   is intentionally outside this crate's surface.
 //!
 //! # Encoding
 //!
@@ -23,7 +22,7 @@
 //! insignificant whitespace, stable key ordering (`type, from, ts, body`
 //! for envelopes). The caller owns newline framing.
 //!
-//! [spec]: https://github.com/amenocturne/nefor/blob/main/protocol/v0.1/spec.md
+//! [spec]: https://github.com/amenocturne/nefor/blob/main/docs/protocol.md
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]

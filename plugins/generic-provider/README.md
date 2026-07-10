@@ -1,6 +1,6 @@
 # generic-provider
 
-NCP v0.1 plugin: type-registry hub for the canonical provider protocol.
+NCP plugin: type-registry hub for the canonical provider protocol.
 
 Owns five canonical types that every provider-shaped reasoner agrees on:
 

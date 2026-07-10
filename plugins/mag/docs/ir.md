@@ -2,11 +2,12 @@
 
 MAG is a scripting language for the runtime hosted by this plugin. A program
 is loaded once — parsed, definitions evaluated, initial modification
-validated — and its environment stays resident for the session; rule
-functions are entry points invoked as nodes complete. The IR is the data
-those entry points produce: a **graph modification**. It is minimal, carries
-only basic operations, and must never grow domain concepts or logic
-primitives — logic lives in MAG, reached through the evaluator.
+validated — and its environment stays resident for the session. The shipped
+control-plane can explicitly call resident functions with `mag.eval`, but the
+kernel does not automatically fire rule bindings. The IR is the data the
+evaluator produces and the kernel folds: a **graph modification**. It is
+minimal, carries only basic operations, and must never grow domain concepts or
+logic primitives — logic lives in MAG, reached through the evaluator.
 
 ## The modification
 
@@ -41,8 +42,9 @@ implemented"`; current programs therefore run with `rules: []`.
 ## The fold
 
 Runtime state is a graph; the initial state is NullGraph — empty. Loading a
-program applies its initial modification; from then on every completed node
-may produce the next one:
+program applies its initial modification. Later modifications, when present,
+come from explicit control-plane apply/eval paths; automatic kernel rule firing
+is not shipped:
 
 ```
 Graph(0)   = NullGraph
@@ -51,9 +53,8 @@ Graph(n+1) = apply(Graph(n), validate(modification(n)))
 
 Each actor is treated as a function: the kernel fires its input message,
 the actor is a black box until it returns its output. The output routes
-along the compiled wiring, and if a rule is bound to the node, the rule's
-function computes the next modification. The runtime operates over nothing
-but modifications — running a workflow _is_ this fold.
+along the compiled wiring. The runtime operates over nothing but
+modifications — running a workflow _is_ this fold.
 
 ## Running a program — registration, then lazy firing
 
@@ -74,8 +75,8 @@ _initial_ modification:
 
 There is no ready barrier and no readiness deadline: nothing waits on
 construction, because nothing constructs until it has work. Actors spawned
-later by rules or control-plane applies follow the identical convention —
-register, buffer, construct on first firing. A factory that rejects at
+later by control-plane applies follow the identical convention — register,
+buffer, construct on first firing. A factory that rejects at
 construct time (invalid params) surfaces at its first firing as a
 `mag.run_failed` escalation, and the host fails the run.
 
@@ -151,13 +152,19 @@ Unit activation at lowering (lowering.md, Shell defaults).
   components from the moment the spec registers, and the assembled first set
   is what triggers lazy construction (actor-model.md, Lifecycle).
 - **Reserved status types are kernel-emitted.** Route keys matching the
-  factory's declared output types dispatch from the returned value;
-  `mag.Unit` (successful completion) and the failure types are emitted by
-  the kernel as part of applying the completion — a factory never returns
-  them and never knows a dependency edge exists. A failure the factory
-  computes is returned like any value; a failure the actor suffers (provider
-  error, kill mid-flight, budget exceeded) is kernel-synthesized, so failure
-  routes work uniformly regardless of how the failure happened.
+  factory's declared output types dispatch from the returned value; reserved
+  route keys `mag.Unit` (successful completion) and `mag.Failed` (generic
+  kernel-synthesized failure) are emitted by the kernel as part of applying
+  the completion — a factory never returns them and never knows a dependency
+  edge exists. Ordinary factory-declared failure outputs such as
+  `mag.CommandFailed` are separate tags; `mag.CommandFailed` is the bash
+  factory's routable non-zero-exit/capability-error failure, not the generic
+  kernel failure tag. The deferred-completion emit kind `mag.failed` is the
+  actor-to-kernel ack envelope that carries a failure tag; it is not itself a
+  route key. A failure the factory computes is returned with its tag; a
+  failure the actor suffers (provider error, kill mid-flight, budget
+  exceeded) is kernel-synthesized as `mag.Failed`, so failure routes work
+  uniformly regardless of how the failure happened.
 - There is deliberately no "fire when X did _not_ happen" — absence is
   expressed as a timeout or a failure route, never a negative predicate.
 
@@ -168,12 +175,12 @@ Unit activation at lowering (lowering.md, Shell defaults).
   modification granularity — each run's fold is its own (Run contexts above).
 - **Arrival order is a race, by design.** Nodes complete at their own pace;
   which modification applies first is timing. The race is a feature: spawn
-  several agents on the same job with different approaches, and the first
-  completion's rule kills the rest.
-- **First-applied wins.** A rule fires only if its source node is alive in
-  the inventory at application time. A node killed between completing and
-  applying has its output voided — no window for a dead agent's
-  modification to sneak in.
+  several agents on the same job with different approaches, and whichever
+  control-plane modification applies first wins.
+- **First-applied wins.** A completion routes only if its source node is alive
+  in the inventory at application time. A node killed between completing and
+  applying has its output voided — no window for a dead agent's completion to
+  sneak in.
 - **Monotone lifecycles.** Every id moves never-existed → alive → dead,
   each transition at most once. Alive means _registered_ — construction is
   lazy and invisible to the lifecycle: a registered-but-unconstructed actor
@@ -191,14 +198,16 @@ Unit activation at lowering (lowering.md, Shell defaults).
   `actors` list is a program bug and rejects), and message targets that
   exist or are created within the same modification. Contract compatibility
   covers routes end to end: every route key must be a declared output of the
-  sender's factory (or a reserved / registry-accepted status or failure tag such as `mag.Unit` or
-  factory-specific failures like `mag.CommandFailed`), and every destination — spawned in the same modification
-  or already live in the inventory (the post-apply actor set) — must declare
-  an input port accepting the routed tag. A route no port accepts REJECTS
-  the modification with the precise wiring error; it can never reach
-  delivery and starve an actor. A rejected modification is an error routed
-  to the control plane; the run continues. Race artifacts are never
-  rejections: spawning an id that is already alive is the logged no-op
+  sender's factory (or a reserved / registry-accepted status or failure tag
+  such as `mag.Unit` or `mag.Failed`, or factory-specific failures like
+  `mag.CommandFailed`), and every destination — spawned in the same
+  modification or already live in the inventory (the post-apply actor set) —
+  must declare an input port accepting the routed tag. A route no port accepts
+  REJECTS the modification with the precise wiring error; it can never reach
+  delivery and starve an actor. A rejected initial `mag.execute` modification
+  fails the run; a rejected mid-run `mag.apply` modification is an error
+  routed to the control plane and normally leaves the run live. Race artifacts
+  are never rejections: spawning an id that is already alive is the logged no-op
   above, a send to a dead id drops as a logged no-op at apply, and a route
   at a dead id passes validation (the sender computed it while the target
   lived). Only never-existed targets — message or route — reject: that is a
@@ -214,22 +223,42 @@ Unit activation at lowering (lowering.md, Shell defaults).
   prefix of the fold; replay is deterministic even though arrival order was
   not. Debugging is diffing prefixes.
 
+
+## Modification rejection events
+
+Initial execution and mid-run apply use the same validator but have different
+control-plane results:
+
+- Invalid `mag.execute`: the kernel creates the run context, flushes queued
+  lifecycle events such as `mag.run_started` and `mag.modification_rejected`,
+  then replies with a terminal `mag.run_result { status = "failed", error = ...
+  }` and tears the context down. The run does not remain available for later
+  applies.
+- Invalid mid-run `mag.apply`: the kernel emits and flushes
+  `mag.modification_rejected`, replies to the caller with
+  `mag.applied { ok = false, error = ... }`, and normally leaves the active run
+  live unless some independent completion/failure/kill settles it.
+
+Thus observers may see the same rejection event in both cases, but only the
+initial-execute rejection is itself terminal.
+
 ## Rules are names, not code
 
 A rule's `fn` is a reference to a function defined in the program's source
-snapshot, with declared shape `NodeOutput -> GraphModification`. At fire
-time the resident evaluator applies it — pure evaluation, same evaluator as
-load, with runtime data as the argument. The kernel sees a name in and
-plain data out; it never learns what a function is.
+snapshot, with declared shape `NodeOutput -> GraphModification`. The compiler
+and resident evaluator know how to validate and explicitly apply such unary
+functions (`mag.eval`), using the same pure evaluator as load with runtime
+data as the argument. The kernel sees a name in and plain data out; it never
+learns what a function is.
 
-> **Status: kernel rule-firing is not shipped.** The compiler and resident
-> evaluator can represent/apply rule functions, but the kernel fold does not
-> fire them: a non-empty `rules` list is rejected at apply with `"rules not
-implemented"`. Current load-time lowering emits `rules: []` for static
-> graphs; rule-bearing modifications can only arrive via hand-authored or
-> eval-produced modification data and will be rejected by kernel apply today.
-> Every shipped program is therefore fully static — all composition is routes
-> plus input contracts.
+> **Status: kernel rule-firing is not shipped.** Rule data can be represented,
+> and `mag.eval` can explicitly apply a named resident function, but the
+> kernel fold does not automatically fire rule bindings: a non-empty `rules`
+> list is rejected at apply with `"rules not implemented"`. Current load-time
+> lowering emits `rules: []` for static graphs; rule-bearing modifications can
+> only arrive via hand-authored or eval-produced modification data and will be
+> rejected by kernel apply today. Every shipped program is therefore fully
+> static — all composition is routes plus input contracts.
 
 - Name-plus-snapshot instead of embedded code: a MAG function closes over
   its defining environment, and re-entering the source snapshot provides

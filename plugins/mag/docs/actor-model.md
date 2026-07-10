@@ -32,9 +32,10 @@ it emits goes through the kernel. No actor subscribes to, or even knows about,
 the bus underneath.
 
 **Actors hold no lifecycle authority.** Composing, spawning, and killing are
-environment operations — actors never spawn actors; composition that depends
-on runtime results is expressed as rules evaluated by the environment (see
-ir.md). An actor receives messages and emits messages, nothing else.
+environment operations — actors never spawn actors. Composition that depends
+on runtime results must come through explicit environment-side apply/eval
+paths; automatic rule firing is not shipped (see ir.md). An actor receives
+messages and emits messages, nothing else.
 
 ## Factories
 
@@ -191,7 +192,7 @@ reason.
 
 | Reason         | Emitted when                                                                                  |
 | -------------- | --------------------------------------------------------------------------------------------- |
-| `modification` | a kill entry in an applied modification — the mid-run control-plane / rule kill (the default) |
+| `modification` | a kill entry in an applied modification — the mid-run control-plane kill (the default) |
 | `run_complete` | run-context teardown after the sink signalled successful completion                           |
 | `run_failed`   | run-context teardown after an unhandled actor failure ended the run                           |
 | `killed`       | run-context teardown for an outright kill (`mag.kill_run`)                                    |
@@ -293,7 +294,7 @@ Authored data on the llm actor spec (all optional unless noted):
 | `system`           | system prompt; rides the request's `system` field every round                                                                                                                                                                                                                         |
 | `tools`            | advertised tool list for the call                                                                                                                                                                                                                                                     |
 | `profile`          | orchestration profile name, resolved by the control plane into provider/model/`reasoning_effort` via the params overlay before spawn                                                                                                                                                  |
-| `reasoning_effort` | resolved reasoning effort for the call                                                                                                                                                                                                                                                |
+| `reasoning_effort` | resolved reasoning effort for the call; this is the only shipped reasoning knob forwarded by the MAG bridge on the direct llm path                                                                                                                                                    |
 | `history`          | transcript seed: an array of provider-dialect messages (role-tagged turns; assistant tool-call turns in the wire shape the transcript records) that becomes the owned transcript's initial contents at construct — every round replays it ahead of the turns the instance accumulates |
 
 `history` is the turn-as-function seam: the lead's turn is a short-lived
@@ -313,3 +314,14 @@ that already contains the system turn passes it through exactly one channel.
 A malformed seed (non-array, entry without a `role`, non-array `tool_calls`)
 fails construction with the offending detail; the instance never binds and
 the kernel escalates the construct failure as a run failure.
+
+The direct `llm` factory schema is the table above: `provider`, `model`,
+`system`, `tools`, `profile`, `reasoning_effort`, and `history`. The MAG bridge
+forwards only `model`, `system`, `tools`, and `reasoning_effort` into the
+provider `chat.create` request; `provider` selects the provider actor at
+construction. Profile resolution is control-plane composition via
+`params_overlay` (for example, the lead-workflow spawner resolves profiles to
+provider/model/`reasoning_effort` before execute). Arbitrary provider-specific
+reasoning settings are not shipped through this path unless both the bridge and
+the provider schema add them; use `reasoning_effort` in MAG examples instead
+of provider-specific reasoning knobs.

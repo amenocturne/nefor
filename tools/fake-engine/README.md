@@ -1,14 +1,11 @@
 # fake-engine
 
-Developer harness that impersonates a nefor engine over NCP stdio. Lets
-plugins (notably `nefor-tui`) be developed and tested without running the
-real engine.
+Developer harness that impersonates enough of a nefor engine over NCP stdio to drive one plugin. Lets plugins be developed and tested without running the real engine.
 
 ## What it does
 
 1. Spawns a plugin binary with stdin and stdout piped.
-2. Reads the plugin's first line and validates it as a [§5.1 `ready`][spec]
-   system message. Malformed ready → print parse error and exit 1.
+2. Reads the plugin's first line and validates it as a [`ready` system message][spec]. Malformed ready → print parse error and exit 1.
 3. Sends a `ready_ok` (with `engine_version: "fake-0.1.0"`) back on the
    plugin's stdin.
 4. Then either:
@@ -34,7 +31,7 @@ The fake-engine does not assign a plugin name from spawn-config (that's
 a real-engine concern); it derives a display label from the binary's
 file stem purely for its own logs.
 
-[spec]: ../../protocol/v0.1/spec.md
+[spec]: ../../docs/protocol.md
 
 ## Usage
 
@@ -76,14 +73,7 @@ Example:
 
 For `nefor-tui`, current scripts should target the declarative Lua app loaded
 with `nefor-tui --script <lua>` and send the app-specific events its
-`update(msg, state)` handles. The old `nefor-tui.grid.*` protocol is not a
-current TUI input API.
-
-## Included scripts
-
-No current script is part of the public contract. Treat any checked-in scripts
-that use `nefor-tui.grid.*` as legacy examples for the pre-declarative TUI and
-not as functional protocol documentation.
+`update(msg, state)` handles.
 
 Passive mode (no `--script`) is equivalent to an empty script that never
 terminates — the default choice when you just want to log plugin output.

@@ -1,6 +1,6 @@
 # generic-tool
 
-NCP v0.1 plugin: type-registry hub for the canonical tool protocol.
+NCP plugin: type-registry hub for the canonical tool protocol.
 Sibling of `generic-provider` for the tool-execution role.
 
 Owns two canonical types:

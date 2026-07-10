@@ -87,7 +87,7 @@ Rules of the dialect:
 - `(bash "cmd")` is also a graph node: `->` pipes stdout to the next node's stdin, so command steps compose directly into programs — `((bash "cargo test 2>&1") -> (bash "tail -30"))`.
 - The workspace `lib/patterns.md` lists the canonical shapes (shell pipes, joins, gates, failure repair); `lib/templates.mag` has `gate`.
 
-For `agent`, use only the supported config keys: `:id`, `:model`, `:profile`, `:provider`, `:system`, and `:tools`. Prefer profiles for agents; raw provider/model reasoning parameters are for direct `llm` nodes or host overlays, not arbitrary `agent` keys:
+For `agent`, use only the supported config keys: `:id`, `:model`, `:profile`, `:provider`, `:system`, and `:tools`. Prefer profiles for agents. Direct `llm` nodes and host overlays support the shipped `reasoning_effort` parameter; arbitrary provider-specific reasoning knobs are not valid `agent` keys and are not forwarded through MAG:
 
 - `fast` — cheap lookups and simple checks.
 - `standard` — normal implementation and exploration.

@@ -23,7 +23,7 @@ source ──parse──▶ evaluate defs ──extract graph──▶ validate 
 `evaluate defs` expands stdlib functions like `(agent ...)` into concrete
 actor constellations. `lower` is this document. `validate` is the same
 validator that checks every runtime modification (ir.md). The environment then
-stays resident; rule functions become entry points.
+stays resident; named functions are available to explicit `mag.eval` calls.
 
 ## The actor spec
 
@@ -90,9 +90,11 @@ llm's output is the union `ToolCalls | OUT`, so a final answer exits through
 the output port. Loops are unbounded — stopping a runaway run is the control
 plane's kill/interrupt, not a compiled bound. Agent config keys are a fixed
 allowlist (`AGENT_CONFIG_KEYS`, eval.rs): `id`, `model`, `profile`, `provider`,
-`system`, and `tools`. An unknown key like `:max-steps` or raw reasoning params
-rejects at compile, and there is no loop-budget mechanism to author. Use raw
-reasoning params on direct `llm` nodes or host overlays, not on `agent`.
+`system`, and `tools`. An unknown key like `:max-steps` or provider-specific
+reasoning knobs rejects at compile, and there is no loop-budget mechanism to
+author. Direct `llm` nodes and host overlays support the shipped
+`reasoning_effort` parameter; arbitrary provider-specific reasoning knobs are
+not forwarded through this MAG path.
 
 | Template-internal name | `docs-explorer` instance    | `code-writer` instance    |
 | ---------------------- | --------------------------- | ------------------------- |
@@ -103,8 +105,7 @@ reasoning params on direct `llm` nodes or host overlays, not on `agent`.
 
 Namespacing rewrites the actor `id`s, internal edge endpoints, boundary input,
 and boundary outputs at instantiation. Current load-time lowering emits no
-rules. If/when templates bind rules, their `on` ids will need the same
-namespacing, but that is not shipped behavior today.
+rules; automatic rule firing is not shipped behavior today.
 
 **Boundary ports.** A subgraph exposes one input port and one output port. The
 port is not an actor — it is a handle the caller wires. Composition resolves it
@@ -217,11 +218,12 @@ source keeps the task seed (ir.rs `initial_activation_content`).
 ## Rules status
 
 The IR can represent rule bindings (`{on, fn}`) and the compiler/resident
-evaluator can represent/apply rule functions, but the shipped kernel fold does
-not fire them. A non-empty `rules` list is rejected at apply (`"rules not
-implemented"`). Current load-time lowering emits `rules: []` for static graphs;
-rule-bearing modifications can only arrive through hand-authored/eval-produced
-modification data and will be rejected by kernel apply today.
+evaluator can validate/apply named unary functions through explicit `mag.eval`,
+but the shipped kernel fold does not fire rule bindings automatically. A
+non-empty `rules` list is rejected at apply (`"rules not implemented"`). Current
+load-time lowering emits `rules: []` for static graphs; rule-bearing
+modifications can only arrive through hand-authored/eval-produced modification
+data and will be rejected by kernel apply today.
 
 ## Master mapping table
 
@@ -238,4 +240,4 @@ modification data and will be rejected by kernel apply today.
 | control edge (fire `b` after `a`, no data) | status-typed route entry on `a` (`mag.Unit`, failure variants)                                                     |
 | all-of join ("fire when A and B done")     | destination actor declares a product input `(A + B)` — no IR element; firing is the input contract (ir.md, Firing) |
 | static graph                               | `kills: []`, `rules: []`                                                                                           |
-| data-dependent composition                 | `rules: [{on, fn}]` binding a MAG function (kernel firing pending — see above)                                     |
+| data-dependent composition                 | not shipped as automatic rule firing; use explicit control-plane apply/eval paths, while non-empty `rules` are rejected by the kernel today |

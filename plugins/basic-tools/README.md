@@ -1,6 +1,6 @@
 # basic-tools
 
-NCP v0.1 plugin: file, image, search, edit, and shell tool primitives.
+NCP plugin: file, image, search, edit, and shell tool primitives.
 
 The shipped tool set is `read_file`, `read_image`, `write_file`, `edit_file`,
 `bash`, and `search_text`. Destructive or long-running operations are intended
@@ -8,8 +8,7 @@ to be run behind `tool-gate` in the starter composition.
 
 ## Wire contract
 
-See [`starter/chat/README.md`](../../starter/chat/README.md) → "Tool calling
-(v1)" for the canonical spec. Quick reference:
+Quick reference:
 
 | Event                       | Direction            | Routing                               |
 | --------------------------- | -------------------- | ------------------------------------- |

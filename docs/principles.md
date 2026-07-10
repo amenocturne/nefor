@@ -187,7 +187,7 @@ Major boundaries get their own versioned artifact (spec, combinator laws, capabi
 
 ### Each doc file has one audience
 
-- `protocol/v0.1/spec.md` — implementers of NCP.
+- `docs/protocol.md` — current shipped protocol behavior.
 - `docs/plugin-authoring.md` — people writing plugins.
 - `docs/glossary.md` — anyone wanting a fast term lookup.
 - `docs/principles.md` — contributors editing anything in the repo.

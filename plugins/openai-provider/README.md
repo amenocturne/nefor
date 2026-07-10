@@ -1,6 +1,6 @@
 # openai-provider
 
-NCP v0.1 plugin: generic OpenAI-compatible LLM provider. One binary that
+NCP plugin: generic OpenAI-compatible LLM provider. One binary that
 talks to any `/v1/chat/completions` endpoint (Ollama, Groq, OpenRouter,
 OpenAI, vLLM, ...). Spawn multiple instances under different plugin names
 to run several providers in parallel.

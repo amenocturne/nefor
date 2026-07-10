@@ -2,12 +2,12 @@
 
 ## What this is
 
-Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP v0.1 over JSON-line stdio) + Lua composition. Plugins can be Rust or any language that can produce JSON lines on stdout and consume them on stdin. Lua stays embedded for `init.lua` composition; the rest is process-isolated.
+Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP over JSON-line stdio) + Lua composition. Plugins can be Rust or any language that can produce JSON lines on stdout and consume them on stdin. Lua stays embedded for `init.lua` composition; the rest is process-isolated.
 
 ## Layout
 
 - `engine/` — engine binary. Reads plugin stdin, stamps `{origin, ts}`, persists to session log, invokes a required Lua `dispatch` hook, routes the hook's `nefor.engine.send` calls. All NCP semantics live in Lua.
-- `crates/nefor-protocol/` — NCP v0.1 envelope + system-body types. Used by plugins; engine no longer imports it (engine is pure string-bus).
+- `crates/nefor-protocol/` — NCP envelope + system-body types. Used by plugins; engine no longer imports it (engine is pure string-bus).
 - `plugins/nefor-tui/` — declarative TUI plugin (Rust): reconciler + line-diff renderer + Lua VM + 15 layout primitives. Hosts the chat surface as a Lua composition (`starter/chat/init.lua`).
 - `plugins/generic-provider/`, `plugins/generic-tool/` — passive type-registry hubs owning canonical types (`ProviderIn`, `ProviderOut`, `ChatHistory`, `ToolCalls`, `ToolResults`, …). Concrete providers/tools declare `Into`/`From` against these so graphs are provider-agnostic.
 - `plugins/openai-provider/` — generic OpenAI-compatible provider with chat-id-keyed `Chats` map (`<prefix>.chat.{create, append, complete, delete}`). Configurable base URL + model. Declares `Into` against `generic-provider` types.
@@ -17,7 +17,7 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 - `plugins/mock-plugin/` — scriptable NCP actor for integration tests. Local Ollama works through `openai-provider` directly with `static_token = "ollama-local"`.
 - `tools/fake-engine/` — harness that impersonates the engine for plugin-side tests.
 - `starter/init.lua` — default composition. Sets `package.path`, bootstraps the shared Lua tree via `nefor-pm`, defines the global `dispatch` hook (delegates to `core.ncp.dispatch`), and spawns every actor via `actor.spawn` (sessions, agentic-loop, providers, mag kernel, tool-gate, lead-workflow, chat).
-- `lua/core/` — shipped library: NCP v0.1 (handshake, broadcast-minus-sender, replay-on-attach, errors), actor runtime, history replay. JSON via the engine-provided `nefor.json`.
+- `lua/core/` — shipped library: NCP (handshake, broadcast-minus-sender, replay-on-attach, errors), actor runtime, history replay. JSON via the engine-provided `nefor.json`.
 - `lua/libs/agentic-loop/` — the lead's turn spawner **mechanism** (`libs.agentic-loop`): per user message it clones the config's turn-program (`starter/agentic-loop/lead-turn.mag`) and submits it to the mag kernel; owns canonical history + queueing. `starter/agentic-loop/` keeps the config-owned turn-program data (`lead-turn.mag`) plus a re-export shim.
 - `lua/libs/mag-workspace/` — MAG workspace management **mechanism** (`libs.mag-workspace`): per-session workspace seeding plus modification preview formatting; compilation itself lives in the mag plugin. `starter/mag/` keeps the config-owned seed content (`mag/lib/`: types, templates, tools, policies, patterns, prompts) that a workspace is seeded from, plus a re-export shim so `require("mag")` still resolves for consumers referencing the bare name (lead-workflow, the agentic-loop spawner).
 - `lua/libs/sessions/` — sessions actor **mechanism** (`libs.sessions`): boot/shutdown/resume + jsonl persistence over the bus. `starter/sessions/` holds a thin re-export shim so `require("sessions")` still resolves for consumers referencing the bare name (lead-workflow, the agentic-loop spawner, test harnesses); the test escape-hatch surface stays at `tests/lua/sessions/test.lua`.
@@ -54,7 +54,7 @@ If no `init.lua` is found, the engine prints a friendly error pointing at the RE
 - Enums (ADTs) for state; no boolean flags alongside sentinel variants.
 - Immutability by default; I/O only at boundaries.
 - No YAML/TOML/JSON config schema in core — config is `init.lua`.
-- Plugins are separate OS processes communicating via NCP (see `protocol/v0.1/spec.md`).
+- Plugins are separate OS processes communicating via NCP (see `docs/protocol.md`).
 - Comments only for non-obvious _why_; code is self-documenting for _what_.
 
 ## Commands
@@ -65,9 +65,9 @@ If no `init.lua` is found, the engine prints a friendly error pointing at the RE
 - `just fmt` — rustfmt.
 - `just build` — release build into `target/release/`.
 
-## Spec
+## Protocol docs
 
-- NCP wire spec: `protocol/v0.1/spec.md`.
+- Current NCP behavior: `docs/protocol.md`.
 - Architecture/writing principles: `docs/principles.md`.
 - Execution layers (engine / plugins / Lua trait layer / MAG): `docs/architecture.md`.
 

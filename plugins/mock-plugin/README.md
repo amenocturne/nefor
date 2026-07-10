@@ -1,6 +1,6 @@
 # mock-plugin
 
-A test/dev NCP peer plugin. Speaks [NCP v0.1](../../protocol/v0.1/spec.md) over stdio and drives its behaviour from a user-supplied Lua script. Use it to exercise the engine or other plugins without having to ship real functionality: the script decides what events to emit, what to do with incoming events, and how to react to the lifecycle hooks.
+A test/dev NCP peer plugin. Speaks the [current NCP behavior](../../docs/protocol.md) over stdio and drives its behaviour from a user-supplied Lua script. Use it to exercise the engine or other plugins without having to ship real functionality: the script decides what events to emit, what to do with incoming events, and how to react to the lifecycle hooks.
 
 ## Usage
 

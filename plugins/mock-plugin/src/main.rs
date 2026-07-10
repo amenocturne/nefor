@@ -1,6 +1,6 @@
-//! mock-plugin — Lua-scriptable NCP v0.1 peer plugin.
+//! mock-plugin — Lua-scriptable NCP peer plugin.
 //!
-//! A test/dev plugin that speaks [NCP v0.1](../../../protocol/v0.1/spec.md)
+//! A test/dev plugin that speaks the [current NCP behavior](../../../docs/protocol.md)
 //! over stdio and drives its behaviour from a user-supplied Lua script.
 //! Useful for exercising the engine and other plugins without having to
 //! ship real functionality.
@@ -30,7 +30,7 @@ pub const PLUGIN_NAME: &str = "mock-plugin";
 /// NCP version this plugin speaks.
 pub const PROTOCOL_VERSION: &str = "0.1";
 
-/// Lua-scriptable NCP v0.1 peer plugin for test/dev.
+/// Lua-scriptable NCP peer plugin for test/dev.
 #[derive(Debug, Parser)]
 #[command(name = "mock-plugin", version, about, long_about)]
 struct Args {

@@ -1,8 +1,6 @@
 # Plugin authoring guide
 
-This is a guide for writing nefor plugins. It documents ecosystem conventions that are not part of NCP (the protocol spec lives at [`protocol/v0.1/spec.md`](../protocol/v0.1/spec.md)). Following them is optional but helps your plugin interoperate with the rest of the ecosystem.
-
-The spec tells you what you MUST do. This document tells you what you're well advised to do.
+This is a guide for writing nefor plugins against the behavior shipped by the current engine and starter. The current protocol behavior is summarized in [`docs/protocol.md`](protocol.md); it is a live implementation document, not a frozen versioned conformance spec.
 
 ## Naming your plugin
 
@@ -23,13 +21,13 @@ nefor.plugins.spawn {
 }
 ```
 
-The engine does not validate plugin flags. The plugin is responsible for parsing its own argv with whatever library it likes. Users customise behaviour by editing the `command` array.
+The engine validates only the spawn shape: `name` is required, `command` is an array of non-empty strings when present, duplicate names are rejected, and removed fields such as `args`, `env`, and `cwd` are rejected. The plugin is responsible for parsing its own argv. Users customise behaviour by editing the `command` array or by wrapping the command.
 
 This is deliberate: a schema at the engine layer would ossify plugin CLIs and force every plugin into the same config shape. Freeform `command` keeps plugins independent and lets each pick the conventions that fit its domain.
 
 ## Structural interfaces, not nominal coupling
 
-Plugins SHOULD declare the minimum input shape they consume and emit, and consumers SHOULD specify which peer satisfies that shape at spawn time. This is structural typing over the bus: a consumer needs "something that emits `*.grid.line` events," not "specifically the `nefor-tui` plugin."
+Plugins SHOULD declare the minimum input shape they consume and emit, and consumers SHOULD specify which peer satisfies that shape at spawn time. This is structural typing over the bus: a consumer needs "something that emits transcript events" or "a provider-compatible peer," not a hard-coded dependency on one binary.
 
 Concretely:
 
@@ -38,57 +36,70 @@ Concretely:
 
 The cost is a small amount of plumbing at the composition layer. The payoff is that plugins compose without knowing each other's names.
 
-## Per-plugin transforms
+## Composition wrappers
 
-Sometimes the cleanest plugin design is to keep the producer in its native vocabulary (`mock-plugin` emitting `cc.*`) while the consumer speaks a vendor-neutral contract (the chat surface consuming [`chat-contract v0.1`](../starter/chat/README.md)). Per-plugin transforms are the glue: they live in `init.lua`, run inside the engine's Lua step hook, and rename / reshape / drop envelopes so each plugin keeps its own clean surface.
-
-This is composition layer work, not plugin layer work. The producer doesn't know who's listening; the consumer doesn't know who's producing. `init.lua` wires them together with a transform module per non-conforming peer.
-
-### Two hooks
-
-`ncp.spawn` (defined in [`lua/core/ncp.lua`](../lua/core/ncp.lua)) accepts two optional functions:
-
-- **`from_plugin(env)`** — runs once at ingress, after the named plugin emits and before the broker broadcasts. Rename or restructure events the plugin emits in its own namespace.
-- **`to_plugin(env)`** — runs at egress, per peer, before delivering to the named plugin. Rename or restructure events being delivered to it from elsewhere.
-
-Both receive `{type, body, from}` (and `ts` on `to_plugin`) and return either a (possibly mutated) envelope table or `nil` to drop. An error inside a transform is caught — `from_plugin` errors surface as `transform_error` to the source plugin and the envelope drops; `to_plugin` errors silently drop for that peer.
-
-### Per-peer isolation
-
-The broker deep-copies `body` before invoking each peer's `to_plugin`. Mutations one peer's transform makes do not leak to subsequent peers in the broadcast fan-out. Treat each transform invocation as owning its own envelope.
-
-### Worked example
-
-[`starter/compositors/provider.lua`](../starter/compositors/provider.lua) bridges `mock-plugin` (`cc.*`) to `chat-contract v0.1` (`chat.*`). Two representative rewrites:
+`lua/core/ncp.lua` owns the shipped handshake and default bus routing. Config code may register a wrapper for a subprocess with `ncp.spawn`:
 
 ```lua
--- from_plugin: mock-plugin emits, chat-contract surfaces.
-if k == "cc.stream.delta" then
-  env.body.kind = "chat.stream.delta"
-end
+local ncp = require("core.ncp")
 
--- to_plugin: chat plugin emits chat.input.submit, mock-plugin expects cc.prompt.
-if k == "chat.input.submit" then
-  env.body.kind = "cc.prompt"
-end
+ncp.spawn {
+  name    = "example-provider",
+  command = { bin("openai-provider"), "--name", "example-provider" },
+  from_plugin = function(envs)
+    for _, env in ipairs(envs) do
+      -- Translate or drop plugin-originated events, then publish if desired.
+      nefor.engine.send(nefor.json.encode({
+        type = "event",
+        from = env.from,
+        ts   = nefor.engine.now(),
+        body = env.body,
+      }))
+    end
+  end,
+  to_plugin = function(envs)
+    for _, env in ipairs(envs) do
+      -- Translate or drop bus events, then deliver if desired.
+      nefor.engine.deliver("example-provider", nefor.json.encode({
+        type = env.type,
+        from = env.from,
+        ts   = env.ts,
+        body = env.body,
+      }))
+    end
+  end,
+}
 ```
 
-The full module also drops `cc.assistant.usage` (`return nil`) since the cumulative view in `chat.session.stats` covers the same statusline ground, and folds `cc.turn.error` into a system-role `chat.message.append` so harness errors land in the transcript.
+These callbacks are batched, side-effecting callbacks, not return-value transforms:
 
-### Wiring it up
+- **`from_plugin(envs)`** receives a list of event envelopes decoded from that peer in the current tick. System handshake messages are handled by `core.ncp` and do not reach this callback. The callback decides what to publish with `nefor.engine.send`; returning a value has no effect.
+- **`to_plugin(envs)`** receives a list of bus envelopes destined for that wrapper in the current dispatch tick. The callback decides what to write to the subprocess with `nefor.engine.deliver`; returning a value has no effect.
 
-Register the adapter in `init.lua` alongside the spawn:
+If a wrapper omits `from_plugin`, `core.ncp` publishes plugin event envelopes verbatim with `nefor.engine.send`. If it omits `to_plugin`, `core.ncp` delivers bus events verbatim to the peer after default filtering.
 
-```lua
-local provider = require("compositors.provider")
+### Default routing
 
-ncp.spawn(provider.compositor {
-  name    = "ollama",
-  command = { bin("openai-provider"), "--name", "ollama", "--base-url", "http://localhost:11434" },
-})
-```
+Default delivery offers published Step events to ready wrappers, then:
 
-A new provider gets its own compositor entry and the same wiring. The chat surface never has to learn another vendor namespace.
+- skips self-emissions;
+- respects an explicit target passed to `nefor.engine.send(payload, target)`;
+- applies the legacy peer-prefix convention when `body.kind` starts with `<ready-peer>.`; and
+- otherwise broadcasts to other ready peers.
+
+`nefor.engine.deliver(peer, payload)` is direct delivery to one peer's stdin and does not append to the bus log. Use `send` for events that should become bus history; use `deliver` for targeted side effects.
+
+### Per-peer isolation and replay
+
+`core.ncp` deep-copies event bodies for each peer before calling `to_plugin`, so one wrapper's mutation does not leak into another wrapper's batch.
+
+When a plugin completes the ready handshake, `core.ncp` replays prior bus-log events to that plugin's wrapper. Replay is an in-memory framework behavior; longer-term session resume is implemented by Lua session actors. During session replay windows, wrappers receive `env.replay = true` and can skip side-effecting work if replayed envelopes should not re-trigger external actions.
+
+### Current provider composition
+
+The shipped provider composition lives in [`lua/libs/compositors/provider.lua`](../lua/libs/compositors/provider.lua). It wraps OpenAI-compatible provider peers, delegates protocol translation to the provider library, publishes canonical `chat.*` events, delivers provider-prefixed commands, handles replay rebuilds, and connects provider stream/completion events to the starter's orchestration state.
+
+Use that file as the current example for a production wrapper: it iterates batched `envs`, explicitly calls `nefor.engine.send` or provider delivery helpers, drops events by doing nothing, and treats replay as a wrapper concern.
 
 ## Kind namespacing
 
@@ -104,11 +115,11 @@ plugin-c.state_changed
 
 Why: a message's `kind` is global across the bus. If your plugin emits a `kind` without its name as a prefix, another plugin's message could collide with yours. The prefix convention makes kinds globally unique by piggybacking on already-unique plugin names.
 
-System `kind` values defined by NCP are unprefixed — they are owned by the protocol spec, not by any plugin.
+System `kind` values handled by the NCP framework are unprefixed.
 
 ## Lifecycle conventions
 
-NCP only defines `ready`, `ready_ok`, `shutdown`, and `error`. Everything else about the plugin lifecycle — "who's on the bus," "is my peer healthy," "what version are you" — is convention.
+The shipped framework handles a small system handshake: plugin sends `ready` with `protocol_version = "0.1"`; Lua replies directly with `ready_ok`; event traffic before readiness is rejected with a direct error. Everything else about the plugin lifecycle — "who's on the bus," "is my peer healthy," "what version are you" — is convention.
 
 ### Hello
 
@@ -117,9 +128,9 @@ After receiving `ready_ok`, a plugin MAY emit a `<name>.hello` event declaring i
 ```json
 {
   "type": "event",
-  "from": "nefor-tui",
+  "from": "example-plugin",
   "ts": "…",
-  "body": { "kind": "nefor-tui.hello", "version": "0.1.0" }
+  "body": { "kind": "example-plugin.hello", "version": "0.1.0" }
 }
 ```
 
@@ -132,24 +143,26 @@ Before closing stdout, a plugin MAY emit a `<name>.goodbye` event with a reason:
 ```json
 {
   "type": "event",
-  "from": "nefor-tui",
+  "from": "example-plugin",
   "ts": "…",
-  "body": { "kind": "nefor-tui.goodbye", "reason": "stream closed" }
+  "body": { "kind": "example-plugin.goodbye", "reason": "finished" }
 }
 ```
 
-The engine doesn't relay `goodbye` events, but it does apply one policy when a connection drops: if the departed plugin was fully `ready` and other plugins are still alive, the broker broadcasts `shutdown` to them so the session winds down as a cooperating group. The rationale is that the reference compositions treat the plugin set as one unit — losing the terminal frontend, for example, shouldn't leave the Claude-harness hanging. Plugins that want to survive their peers (daemons, always-on helpers) should be spawned as a separate engine instance, not as part of the same graph.
+This is ordinary plugin-authored event traffic. The engine does not synthesize an NCP `shutdown` system message for plugins on normal peer departure.
+
+Current broker behavior is cascade-close: when a subprocess exits while other peers are still alive, the broker requests engine shutdown, emits the engine-internal lifecycle shutdown for Lua subscribers, closes peer connections, and waits for the cooperative grace window. Plugins should treat stdin EOF / process termination as the shutdown signal. If a component is meant to survive peer exits, run it outside that engine session or behind a daemon/shim.
 
 ### Heartbeat
 
-A plugin concerned about peer liveness (e.g. "my renderer is stuck") can emit a periodic `<name>.heartbeat` event:
+A plugin concerned about peer liveness can emit a periodic `<name>.heartbeat` event:
 
 ```json
 {
   "type": "event",
-  "from": "mock-plugin",
+  "from": "example-plugin",
   "ts": "…",
-  "body": { "kind": "mock-plugin.heartbeat", "seq": 42 }
+  "body": { "kind": "example-plugin.heartbeat", "seq": 42 }
 }
 ```
 
@@ -162,18 +175,18 @@ A plugin MAY emit a single `<name>.manifest` event right after `ready_ok` (typic
 ```json
 {
   "type": "event",
-  "from": "nefor-tui",
+  "from": "example-plugin",
   "ts": "…",
   "body": {
-    "kind": "nefor-tui.manifest",
+    "kind": "example-plugin.manifest",
     "version": "0.2.0",
-    "accepts": ["mock-plugin.message_delta", "mock-plugin.tool_start"],
-    "emits": ["nefor-tui.grid.line", "nefor-tui.grid.flush"]
+    "accepts": ["chat.input.submit"],
+    "emits": ["chat.message.append", "chat.stream.delta"]
   }
 }
 ```
 
-This lets peers make compatibility decisions up front ("I need a renderer that accepts `*.grid.line`; `nefor-tui` satisfies that") without hardcoding plugin names. It also gives observability plugins enough information to draw a graph of the live bus.
+This lets peers make compatibility decisions up front without hardcoding plugin names. It also gives observability plugins enough information to draw a graph of the live bus.
 
 Manifests are purely informational: emitting one doesn't obligate the plugin to anything, and not emitting one doesn't prevent the plugin from working.
 
@@ -214,7 +227,9 @@ This is a hint, not a filter. Every plugin still receives the message (the bus i
 
 ## Supervision and daemon patterns
 
-The engine's runner spawns `command[0]` directly with `std::process::Command`. No shell. No env map. No supervisor. No reconnect. If your plugin needs more lifecycle plumbing than "exec this binary with these args," you wrap it.
+The engine's runner starts `command[0]` directly with `std::process::Command` and passes `command[1..]` as args. It does not invoke a shell, set a per-plugin cwd, or manage per-plugin env maps. Child processes inherit the engine process cwd and environment. The engine resolves and exports `NEFOR_CONFIG_DIR`, `NEFOR_DATA_DIR`, and `NEFOR_PLUGIN_DIR` before spawning so Lua configs and child processes see the same roots.
+
+If your plugin needs shell features, custom environment setup, a different working directory, supervision, or daemon reconnect behavior, wrap it explicitly.
 
 ### Shell features via explicit invocation
 
@@ -231,7 +246,7 @@ Users on Windows can invoke `cmd.exe /c` or `powershell.exe -Command` with the s
 
 ### Environment variables
 
-The engine inherits its environment to the child and nothing more. To inject env vars, invoke a wrapper script:
+To inject env vars, invoke a wrapper script:
 
 ```lua
 -- launcher.sh:
@@ -240,8 +255,8 @@ The engine inherits its environment to the child and nothing more. To inject env
 --   exec "$@"
 
 nefor.plugins.spawn {
-  name    = "mock-plugin",
-  command = { "./launcher.sh", "claude", "-p", "--output-format", "stream-json" },
+  name    = "service-plugin",
+  command = { "./launcher.sh", "service-plugin-bin", "--mode", "ncp" },
 }
 ```
 
@@ -303,9 +318,3 @@ The engine never invokes a shell, so it has no Unix-specific assumptions. Plugin
 
 - Linux / macOS: `command = { "/bin/sh", "-c", "…" }`
 - Windows: `command = { "cmd.exe", "/c", "…" }` or `command = { "powershell.exe", "-Command", "…" }`
-
-A future `xp-runner` community plugin could dispatch per platform (reading `os.type()` in `init.lua` and picking a shell) if that pattern repeats enough to be worth abstracting. For now, do it yourself when you need it.
-
-## More to come
-
-This guide will grow as ecosystem conventions stabilise. If you find yourself implementing a pattern that feels universal — a way to report progress, a way to discover peer capabilities, a way to offer services — propose it here.
