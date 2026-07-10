@@ -15,6 +15,7 @@ local history      = require("libs.chat.history")
 local run_panel    = require("libs.chat.run_panel")
 local transcript   = require("libs.chat.transcript")
 local popups       = require("libs.chat.popups")
+local usage_view   = require("libs.chat.usage")
 local Entry        = require("libs.chat.entry")
 local log          = require("libs.chat.log")
 local height_cache = require("libs.chat.height_cache")
@@ -221,6 +222,33 @@ local function handle_input_submit(msg, state)
       input_value = "", completion = NIL_SENTINEL,
       popup = { variant = "help" },
     }), {}
+  end
+  if cmd == "usage" then
+    local provider = state.provider
+    if type(provider) ~= "string" or provider == ""
+        or not (state.supports_usage or {})[provider] then
+      return shallow_merge(state, {
+        input_value = "", completion = NIL_SENTINEL,
+        popup = {
+          variant = "warning",
+          title = "/usage",
+          body = "The active provider does not expose account usage.",
+        },
+      }), {}
+    end
+    local cached = (state.usage or {})[provider]
+    return shallow_merge(state, {
+      input_value = "", completion = NIL_SENTINEL,
+      popup = {
+        variant = "info",
+        title = "usage",
+        body = cached and usage_view.markdown(cached) or "Fetching usage…",
+        usage_provider = provider,
+      },
+    }), {
+      { kind = "send_to", target = "engine",
+        body = { kind = "chat.usage.requested", provider = provider } },
+    }
   end
   if cmd == "safe" or cmd == "auto" or cmd == "yolo" then
     local s = shallow_merge(state, { input_value = "", completion = NIL_SENTINEL })
@@ -879,11 +907,18 @@ end
 
 local function handle_session_stats(msg, state)
   if is_foreign_chat(msg, state) then return state, {} end
-  local stats = shallow_merge(state.stats or {}, {})
+  local next_state = state
+  local output_tokens = msg.last_turn_output_tokens or msg.completion_tokens
+  local duration_ms = msg.last_turn_duration_ms or msg.duration_ms
+  if output_tokens ~= nil or duration_ms ~= nil then
+    next_state = transcript.attach_latest_assistant_stats(
+      next_state, output_tokens, duration_ms)
+  end
+  local stats = shallow_merge(next_state.stats or {}, {})
   for k, v in pairs(msg) do
     if k ~= "kind" then stats[k] = v end
   end
-  local s = shallow_merge(state, { stats = stats })
+  local s = shallow_merge(next_state, { stats = stats })
   if msg.model then
     local mt = msg.max_context_tokens
       or model_context_windows[msg.model]
@@ -891,6 +926,53 @@ local function handle_session_stats(msg, state)
     s = shallow_merge(s, { model = msg.model, max_tokens = mt })
   end
   return s, {}
+end
+
+local function handle_usage_updated(msg, state)
+  local provider = msg.provider or ""
+  if provider == "" then return state, {} end
+  local function merge_usage_table(base, incoming)
+    local merged = shallow_merge(type(base) == "table" and base or {}, {})
+    for key, value in pairs(incoming or {}) do
+      if type(value) == "table" and type(merged[key]) == "table" then
+        merged[key] = merge_usage_table(merged[key], value)
+      else
+        merged[key] = value
+      end
+    end
+    return merged
+  end
+  local usage = {}
+  for k, v in pairs(state.usage or {}) do usage[k] = v end
+  local previous = usage[provider] or {}
+  local snapshot = merge_usage_table(previous, msg)
+  snapshot.kind = nil
+  snapshot.provider = nil
+  usage[provider] = snapshot
+  local popup = state.popup
+  if popup and popup.usage_provider == provider then
+    popup = {
+      variant = "info",
+      title = "usage",
+      body = usage_view.markdown(snapshot),
+      usage_provider = provider,
+    }
+  end
+  return shallow_merge(state, { usage = usage, popup = popup }), {}
+end
+
+local function handle_usage_error(msg, state)
+  local provider = msg.provider or ""
+  if not (state.popup and state.popup.usage_provider == provider) then
+    return state, {}
+  end
+  return shallow_merge(state, {
+    popup = {
+      variant = "error",
+      title = "usage",
+      body = msg.message or "Could not refresh usage.",
+    },
+  }), {}
 end
 
 local function handle_tool_start(msg, state)
@@ -1142,6 +1224,14 @@ local function handle_auth_status(msg, state)
   if msg.supports_login ~= nil then
     supports[provider] = msg.supports_login and true or false
   end
+  local supports_usage = {}
+  for k, v in pairs(state.supports_usage or {}) do supports_usage[k] = v end
+  if msg.supports_usage ~= nil then
+    supports_usage[provider] = msg.supports_usage and true or false
+  end
+  local usage = {}
+  for k, v in pairs(state.usage or {}) do usage[k] = v end
+  if status ~= "connected" then usage[provider] = nil end
   local new_popup = state.popup
   if state.popup and state.popup.variant == "model_picker"
      and state.popup.providers then
@@ -1164,7 +1254,11 @@ local function handle_auth_status(msg, state)
     new_popup = shallow_merge(state.popup, { providers = new_providers })
   end
   return shallow_merge(state, {
-    auth = auth, supports_login = supports, popup = new_popup,
+    auth = auth,
+    supports_login = supports,
+    supports_usage = supports_usage,
+    usage = usage,
+    popup = new_popup,
   }), {}
 end
 
@@ -1362,6 +1456,8 @@ local handlers = {
   ["chat.stream.reasoning_delta"] = handle_reasoning_delta,
   ["chat.stream.reasoning_end"]   = handle_reasoning_end,
   ["chat.session.stats"]          = handle_session_stats,
+  ["chat.usage.updated"]          = handle_usage_updated,
+  ["chat.usage.error"]            = handle_usage_error,
   ["chat.tool.start"]             = handle_tool_start,
   ["chat.tool.end"]               = handle_tool_end,
   ["chat.graph_result.append"]    = handle_graph_result_append,

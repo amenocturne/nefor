@@ -1,15 +1,23 @@
 -- Bottom-row statusline + the welcome banner that pre-loads the empty
 -- transcript. Both are pure view functions — they read state and
--- return tui nodes, no I/O beyond `tui.scroll_position` for the
--- scroll-percentage segment.
+-- return tui nodes.
 
 local common = require("libs.chat.common")
 local C       = common.C
 local STYLE   = common.STYLE
 local humanize_tokens = common.humanize_tokens
-local humanize_duration_ms = common.humanize_duration_ms
+local usage_view = require("libs.chat.usage")
 
 local M = {}
+
+M.MODE_BORDER_STYLES = {
+  default = STYLE.input_border,
+}
+
+function M.input_border_style(state, focused)
+  if not focused then return STYLE.input_border_unfocused end
+  return M.MODE_BORDER_STYLES[state.mode or "default"] or STYLE.input_border
+end
 
 local function ctx_bar(used, max)
   if used == nil and max ~= nil and max ~= 0 then
@@ -86,54 +94,13 @@ local function build_segments(state)
   if s.cost_usd ~= nil then
     segs[#segs + 1] = { spans = { { text = string.format("$%.2f", s.cost_usd), fg = C.system } } }
   end
-  if s.turns ~= nil then
-    segs[#segs + 1] = { spans = { { text = tostring(s.turns) .. " turns", fg = C.system } } }
-  end
-  local last_dur = s.last_turn_duration_ms or state.last_turn_duration_ms or s.duration_ms
-  if last_dur ~= nil then
-    segs[#segs + 1] = { spans = { { text = humanize_duration_ms(last_dur), fg = C.system } } }
-  end
-
-  -- Speed: tok/s when both output_tokens and duration are known.
-  local ot = s.last_turn_output_tokens or s.completion_tokens
-  if ot and last_dur and last_dur > 0 then
-    local tps = math.floor((ot * 1000) / last_dur + 0.5)
-    segs[#segs + 1] = { spans = { { text = tostring(tps) .. " tok/s", fg = C.system } } }
-  end
-
-  -- Scroll percentage segment. Hidden when the transcript fits the
-  -- viewport (no scrollback). At-bottom shows `100% ↓ bottom`; at-top
-  -- `0% ↑ top`; mid `{pct}% ↑`.
-  --
-  -- `pcall` because the snapshot map only carries an entry once the
-  -- scrollable has been laid out — pre-first-render the call would
-  -- raise `no scrollable with key 'transcript'`. We treat any failure
-  -- as "no segment yet" rather than letting the statusline blow up.
-  -- Gate on the reducer's own entry count, not just the scroll snapshot:
-  -- the snapshot map is refreshed one frame behind the view, so right
-  -- after a reset (/new, /mode default, resume) it still reports the old
-  -- session's extent while `state.entries` is already empty. Deriving
-  -- "is there anything to scroll" from live state kills the phantom
-  -- `100% ↓ bottom` segment on an emptied transcript.
-  local has_entries = type(state.entries) == "table" and #state.entries > 0
-  local ok, snap = pcall(tui.scroll_position, "transcript")
-  if has_entries and ok and snap and snap.max and snap.max > 0 then
-    local offset = snap.offset or 0
-    local max = snap.max
-    if offset >= max then
-      segs[#segs + 1] = { spans = {
-        { text = "100% ↓ bottom", fg = C.status_dim },
-      } }
-    elseif offset <= 0 then
-      segs[#segs + 1] = { spans = {
-        { text = "0% ↑ top", fg = C.system },
-      } }
-    else
-      local pct = math.floor(100 * (max - offset) / max + 0.5)
-      segs[#segs + 1] = { spans = {
-        { text = tostring(pct) .. "% ↑", fg = C.system },
-      } }
-    end
+  local active_usage = type(state.usage) == "table" and state.usage[state.provider] or nil
+  local usage_text, available = usage_view.footer(active_usage)
+  if usage_text ~= nil then
+    local fg = C.system
+    if available <= 10 then fg = C.status_danger
+    elseif available <= 25 then fg = C.status_warn end
+    segs[#segs + 1] = { spans = { { text = usage_text, fg = fg } } }
   end
 
   return segs

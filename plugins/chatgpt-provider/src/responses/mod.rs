@@ -21,6 +21,7 @@
 pub mod headers;
 pub mod request;
 pub mod stream;
+pub mod usage;
 
 use std::error::Error as _;
 use std::pin::Pin;
@@ -36,6 +37,7 @@ pub use request::{
     ResponseItem, ResponsesApiRequest, TextControls, Verbosity,
 };
 pub use stream::{parse_sse_frame, ResponseEvent, ResponseStream};
+pub use usage::{UsageCredits, UsageRateLimit, UsageSnapshot, UsageWindow};
 
 use serde::Deserialize;
 
@@ -227,9 +229,31 @@ impl ResponsesClient {
             .post_with_retry(&url, |builder| builder.json(request), auth, "responses")
             .await?;
 
+        let usage = UsageSnapshot::from_headers(response.headers());
         let byte_stream = response.bytes_stream();
         let parsed = parse_byte_stream(byte_stream);
-        Ok(ResponseStream::new(Box::pin(parsed)))
+        Ok(ResponseStream::new(Box::pin(parsed), usage))
+    }
+
+    pub async fn usage(&self, auth: &AuthSnapshot) -> Result<UsageSnapshot, ChatgptError> {
+        let url = usage_url(&self.base_url);
+        let mut headers = headers::build_headers(auth, &self.installation_id, &self.originator)?;
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        let response = self
+            .http
+            .get(&url)
+            .headers(headers)
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            return Err(http_error_from_response(response, status).await);
+        }
+        response.json().await.map_err(ChatgptError::from)
     }
 
     /// POST a request to `url` with retry-on-transient-failure. Rebuilds
@@ -454,6 +478,14 @@ impl ResponsesClient {
             ChatgptError::ResponsesStreamParse(format!("decode /responses/compact response: {e}"))
         })?;
         compact_items_from_value(value)
+    }
+}
+
+fn usage_url(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    match base.strip_suffix("/codex") {
+        Some(backend_root) => format!("{backend_root}/wham/usage"),
+        None => format!("{base}/usage"),
     }
 }
 
@@ -732,6 +764,18 @@ mod retry_tests {
 mod model_entry_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn usage_url_uses_wham_sibling_for_codex_backend() {
+        assert_eq!(
+            usage_url("https://chatgpt.com/backend-api/codex"),
+            "https://chatgpt.com/backend-api/wham/usage"
+        );
+        assert_eq!(
+            usage_url("http://127.0.0.1:8080/codex/"),
+            "http://127.0.0.1:8080/wham/usage"
+        );
+    }
 
     #[test]
     fn model_entry_deserialises_supports_reasoning_summaries() {

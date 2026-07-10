@@ -41,6 +41,7 @@ Slash commands:
   /safe /auto /yolo  set tool permission mode
   /login /logout  provider auth
   /model       list/switch model
+  /usage       account quota and reset times
   /resume      resume a previous session]]
 
 function M.help(state)

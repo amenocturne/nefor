@@ -13,6 +13,11 @@ mode (default, no subcommand) runs as an NCP stdio plugin.
 The model list is fetched from the backend at runtime -- no `--model` CLI
 flag. Users pick via `/model` in the chat surface.
 
+Account quota is read from the ChatGPT usage endpoint at startup, every five
+minutes, and on `usage.requested`. Successful Responses headers also refresh
+the same snapshot without another request. The Lua translator exposes these as
+provider-neutral `chat.usage.updated` / `chat.usage.error` events.
+
 ## Wire contract
 
 Same chat-scoped event shape as `openai-provider` with `chatgpt` as the
@@ -22,6 +27,10 @@ session stats, auth status, model list/status, and lifecycle events. Tool
 calling is supported via a `ToolBroker` that consumes `tool.register`, invokes
 registered tools, and correlates `tool.result` events back to the in-flight
 turn.
+
+Usage adds `<prefix>.usage.requested`, `.usage.updated`, and `.usage.error`.
+The update payload carries the backend's primary/secondary windows, reset
+timestamps, plan type, and credits without deriving quota from local tokens.
 
 Image media returned by tools such as `read_image` is converted to Responses
 API `InputImage` items for vision-capable models. If the active model cannot

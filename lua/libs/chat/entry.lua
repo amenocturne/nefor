@@ -133,6 +133,13 @@ function M.set_duration(entry, ms)
   return new
 end
 
+function M.set_turn_stats(entry, output_tokens, duration_ms)
+  local new = copy(entry)
+  if output_tokens ~= nil then new.output_tokens = output_tokens end
+  if duration_ms ~= nil then new.duration_ms = duration_ms end
+  return new
+end
+
 function M.set_output(entry, output, err_flag)
   local new = copy(entry)
   new.output = output

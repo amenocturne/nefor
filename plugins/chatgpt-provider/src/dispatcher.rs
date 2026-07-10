@@ -31,7 +31,7 @@ use crate::responses::request::{
     Reasoning, ReasoningEffort, ReasoningSummary, ResponseItem, ResponsesApiRequest,
 };
 use crate::responses::stream::ResponseEvent;
-use crate::responses::{CompactRequest, ModelEntry, ResponsesClient};
+use crate::responses::{CompactRequest, ModelEntry, ResponsesClient, UsageSnapshot};
 use crate::state::{
     ChatId, ChatStats, Chats, ChatsError, Message, MessageRestore, ToolCall, ToolCallFunction,
     TurnToken,
@@ -58,6 +58,8 @@ const HTTP_401_MESSAGE: &str = "auth failed (HTTP 401) — re-login via chatgpt-
 
 const NO_LOGIN_FLOW_IN_PROGRESS_MESSAGE: &str =
     "login already in progress; wait for completion or restart the plugin";
+
+const USAGE_POLL_INTERVAL_SECS: u64 = 5 * 60;
 
 // ---------------------------------------------------------------------
 // Wire shape helpers — every event we emit is built here.
@@ -119,7 +121,29 @@ fn auth_status_body(args: &ServeArgs, snap: &AuthSnapshot) -> Map<String, Value>
     // filter them out — picking "log in" on an authless provider is a
     // no-op the surface shouldn't offer.
     m.insert("supports_login".into(), Value::Bool(true));
+    m.insert("supports_usage".into(), Value::Bool(true));
     make_event(format!("{}auth.status", args.event_prefix()), m)
+}
+
+fn usage_updated_body(
+    args: &ServeArgs,
+    snapshot: &UsageSnapshot,
+) -> Result<Map<String, Value>, ChatgptError> {
+    let Value::Object(fields) = serde_json::to_value(snapshot)? else {
+        return Err(ChatgptError::ResponsesStreamParse(
+            "usage snapshot did not serialize as an object".into(),
+        ));
+    };
+    Ok(make_event(
+        format!("{}usage.updated", args.event_prefix()),
+        fields,
+    ))
+}
+
+fn usage_error_body(args: &ServeArgs, message: &str) -> Map<String, Value> {
+    let mut fields = Map::new();
+    fields.insert("message".into(), Value::String(message.to_owned()));
+    make_event(format!("{}usage.error", args.event_prefix()), fields)
 }
 
 async fn handle_refresh_error(
@@ -550,6 +574,13 @@ pub async fn emit_startup_events(
             responses_client.clone(),
             out_tx.clone(),
         );
+        spawn_usage_fetch(
+            args.clone(),
+            auth.clone(),
+            responses_client.clone(),
+            out_tx.clone(),
+            false,
+        );
     }
     Ok(())
 }
@@ -589,6 +620,13 @@ fn spawn_login_flow(
                         chats.clone(),
                         responses_client.clone(),
                         out_tx.clone(),
+                    );
+                    spawn_usage_fetch(
+                        args.clone(),
+                        auth.clone(),
+                        responses_client.clone(),
+                        out_tx.clone(),
+                        false,
                     );
                 }
             }
@@ -653,6 +691,46 @@ fn spawn_models_fetch(
     });
 }
 
+fn spawn_usage_fetch(
+    args: Arc<ServeArgs>,
+    auth: Arc<AuthStore>,
+    responses_client: Arc<ResponsesClient>,
+    out_tx: mpsc::Sender<PluginOutgoing>,
+    report_errors: bool,
+) {
+    tokio::spawn(async move {
+        let snap = auth.snapshot().await;
+        if !matches!(snap.state, AuthState::Connected) {
+            if report_errors {
+                let _ =
+                    send_event(&out_tx, usage_error_body(&args, "ChatGPT login required")).await;
+            }
+            return;
+        }
+        if let Err(error) = auth.current_access_token().await {
+            if report_errors {
+                let _ = send_event(&out_tx, usage_error_body(&args, &error.to_string())).await;
+            }
+            return;
+        }
+        let snap = auth.snapshot().await;
+        match responses_client.usage(&snap).await {
+            Ok(usage) => match usage_updated_body(&args, &usage) {
+                Ok(body) => {
+                    let _ = send_event(&out_tx, body).await;
+                }
+                Err(error) => tracing::warn!(%error, "could not encode usage snapshot"),
+            },
+            Err(error) => {
+                tracing::warn!(%error, "usage fetch failed");
+                if report_errors {
+                    let _ = send_event(&out_tx, usage_error_body(&args, &error.to_string())).await;
+                }
+            }
+        }
+    });
+}
+
 /// Shared state threaded through every dispatch handler. Bundles the
 /// seven Arc'd singletons that every event path needs so function
 /// signatures stay short.
@@ -673,6 +751,13 @@ pub async fn run_dispatch_loop(
     ctx: DispatcherContext,
     mut in_rx: mpsc::Receiver<Result<Envelope, TransportError>>,
 ) -> Result<(), ChatgptError> {
+    let first_usage_poll =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(USAGE_POLL_INTERVAL_SECS);
+    let mut usage_interval = tokio::time::interval_at(
+        first_usage_poll,
+        std::time::Duration::from_secs(USAGE_POLL_INTERVAL_SECS),
+    );
+    usage_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             maybe = in_rx.recv() => {
@@ -705,6 +790,15 @@ pub async fn run_dispatch_loop(
                 tracing::info!("ctrl-c; exiting");
                 ctx.chats.interrupt_all().await;
                 return Ok(());
+            }
+            _ = usage_interval.tick() => {
+                spawn_usage_fetch(
+                    ctx.args.clone(),
+                    ctx.auth.clone(),
+                    ctx.responses_client.clone(),
+                    ctx.out_tx.clone(),
+                    false,
+                );
             }
         }
     }
@@ -836,6 +930,13 @@ async fn dispatch_event(
                     ctx.responses_client.clone(),
                     ctx.out_tx.clone(),
                 );
+                spawn_usage_fetch(
+                    ctx.args.clone(),
+                    ctx.auth.clone(),
+                    ctx.responses_client.clone(),
+                    ctx.out_tx.clone(),
+                    false,
+                );
             }
             Ok(())
         }
@@ -908,6 +1009,16 @@ async fn dispatch_event(
                     send_event(&ctx.out_tx, turn_error_body(&ctx.args, None, &msg)).await
                 }
             }
+        }
+        "usage.requested" => {
+            spawn_usage_fetch(
+                ctx.args.clone(),
+                ctx.auth.clone(),
+                ctx.responses_client.clone(),
+                ctx.out_tx.clone(),
+                true,
+            );
+            Ok(())
         }
         "model.set" => {
             let model = match body.get("model").and_then(Value::as_str) {
@@ -2092,6 +2203,12 @@ fn spawn_turn(ctx: DispatcherContext, chat_id: ChatId, cancel: TurnToken) {
                     break;
                 }
             };
+
+            if let Some(usage) = stream.usage() {
+                if let Ok(body) = usage_updated_body(&ctx.args, usage) {
+                    let _ = ctx.out_tx.try_send(PluginOutgoing::event(body));
+                }
+            }
 
             let mut output_text = String::new();
             let mut reasoning_text = String::new();

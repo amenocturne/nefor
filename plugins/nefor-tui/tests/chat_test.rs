@@ -1450,16 +1450,21 @@ fn chat_session_stats_updates_statusline() {
     );
 
     let out = render_str(&mut engine);
-    // Spec section 4 segment order: model · ctx · cost · turns · dur · speed.
-    // "qwen-test" doesn't carry a `claude-` prefix so the stripped form
-    // is identical.
+    // Persistent status carries current configuration/resources only;
+    // completed-turn duration and speed live on the turn itself.
     assert!(
         out.contains("qwen-test"),
         "statusline missing model: {out:?}"
     );
     assert!(out.contains("$0.00"), "cost segment missing: {out:?}");
-    assert!(out.contains("1 turns"), "turns segment missing: {out:?}");
-    assert!(out.contains("1s"), "duration segment missing: {out:?}");
+    assert!(
+        !out.contains("1 turns"),
+        "turn count should stay out of the footer: {out:?}"
+    );
+    assert!(
+        !out.contains("1s"),
+        "turn duration should stay out of the footer: {out:?}"
+    );
 }
 
 /// Bug A7 regression: a replayed `chat.model.set_ack` (the original
@@ -3452,10 +3457,9 @@ fn statusline_omits_scroll_segment_when_transcript_fits_viewport() {
 }
 
 #[test]
-fn statusline_shows_bottom_marker_when_transcript_overflows() {
-    // Push enough messages to overflow a 24-row terminal. The
-    // transcript stick_to=end keeps us at the bottom; the scroll
-    // segment should read `100% ↓ bottom`.
+fn statusline_omits_scroll_marker_when_transcript_overflows() {
+    // The scrollbar is the sole scroll-position indicator; duplicating
+    // it as footer text adds noise even when the transcript overflows.
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -3469,14 +3473,117 @@ fn statusline_shows_bottom_marker_when_transcript_overflows() {
             }),
         );
     }
-    // First render lays out the transcript and populates the
-    // scroll-position snapshot. The second render's `view` call sees
-    // the populated snapshot and emits the scroll segment.
     let _ = render_snapshot(&mut engine);
     let snap = render_snapshot(&mut engine);
     assert!(
-        snap.contains("100% ↓ bottom"),
-        "expected `100% ↓ bottom` segment for at-end overflow:\n{snap}"
+        !snap.contains("100% ↓ bottom") && !snap.contains("0% ↑"),
+        "scroll position should not be duplicated in the footer:\n{snap}"
+    );
+}
+
+#[test]
+fn usage_snapshot_updates_footer_and_usage_command_opens_details() {
+    let mut engine = Engine::new(120, 28).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.auth.status",
+            "provider": "mock-plugin",
+            "state": "connected",
+            "supports_usage": true,
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.usage.updated",
+            "provider": "mock-plugin",
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 66,
+                    "limit_window_seconds": 18000,
+                    "reset_at": 1770000000
+                },
+                "secondary_window": {
+                    "used_percent": 20,
+                    "limit_window_seconds": 604800,
+                    "reset_at": 1770500000
+                }
+            }
+        }),
+    );
+    let snapshot = render_snapshot(&mut engine);
+    assert!(
+        snapshot.contains("◔ 34% until"),
+        "compact available-quota widget missing: {snapshot}"
+    );
+
+    // Per-turn response headers only carry the primary percentage.
+    // Merging that sparse event must retain reset time and weekly data
+    // from the last full endpoint response.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.usage.updated",
+            "provider": "mock-plugin",
+            "rate_limit": { "primary_window": { "used_percent": 70 } }
+        }),
+    );
+    let sparse_snapshot = render_snapshot(&mut engine);
+    assert!(
+        sparse_snapshot.contains("◔ 30% until"),
+        "sparse usage refresh should retain the reset time: {sparse_snapshot}"
+    );
+
+    for ch in "/usage".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+    let emits = engine.take_emit_queue();
+    assert!(emits.iter().any(|(_, body)| {
+        body.get("kind").and_then(|v| v.as_str()) == Some("chat.usage.requested")
+            && body.get("provider").and_then(|v| v.as_str()) == Some("mock-plugin")
+    }));
+    let popup = render_snapshot(&mut engine);
+    assert!(
+        popup.contains("5-hour window"),
+        "primary usage details missing: {popup}"
+    );
+    assert!(
+        popup.contains("Weekly window"),
+        "weekly usage details missing: {popup}"
+    );
+}
+
+#[test]
+fn completed_turn_footer_absorbs_token_speed_from_session_stats() {
+    let mut engine = Engine::new(100, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.delta", "text": "done" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.stream.end", "model": "gpt-test", "duration_ms": 1000 }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.session.stats",
+            "last_turn_output_tokens": 35,
+            "last_turn_duration_ms": 1000
+        }),
+    );
+    let out = render_snapshot(&mut engine);
+    assert!(
+        out.contains("▣ gpt-test · 1s · 35 tok/s"),
+        "turn-local speed missing: {out}"
     );
 }
 
@@ -7493,18 +7600,16 @@ fn tool_input_long_single_line_wraps_fully() {
 }
 
 /// Regression: `/new` (and the other reset-shaped paths) must collapse the
-/// transcript's scroll geometry immediately. Before the fix, clearing
-/// `state.entries` left the statusline reading a one-frame-stale scroll
-/// snapshot, so an emptied transcript kept the previous session's
-/// `100% ↓ bottom` scrollback indicator until the next user action. After
-/// reset the viewport is at the empty state with no stale scroll region.
+/// transcript's scroll geometry immediately. Clearing `state.entries`
+/// without invalidating the virtual scroll cache left an empty viewport
+/// pinned to the previous session's extent.
 #[test]
 fn slash_new_collapses_stale_scroll_region() {
     let mut engine = Engine::new(60, 12).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
 
-    // Overflow the viewport so a scrollback indicator is present.
+    // Overflow the viewport so the virtual-scroll cache has real extent.
     for i in 0..25 {
         dispatch_event(
             &mut engine,
@@ -7515,11 +7620,6 @@ fn slash_new_collapses_stale_scroll_region() {
             }),
         );
     }
-    // The scroll-position snapshot the statusline reads is refreshed one
-    // frame behind the view, so the indicator only appears once the map has
-    // caught up. Render once to populate the map, dispatch one more entry to
-    // dirty the frame, then render again so the statusline reads the
-    // now-overflowing geometry.
     let _ = render_str(&mut engine);
     dispatch_event(
         &mut engine,
@@ -7528,8 +7628,8 @@ fn slash_new_collapses_stale_scroll_region() {
     let _ = render_str(&mut engine);
     let before = engine.snapshot();
     assert!(
-        before.contains("↓ bottom") || before.contains("% ↑"),
-        "precondition: an overflowing transcript shows a scroll indicator: {before:?}"
+        before.contains("one more line"),
+        "precondition: overflowing transcript did not render its tail: {before:?}"
     );
 
     // Reset via /new.
@@ -7541,12 +7641,18 @@ fn slash_new_collapses_stale_scroll_region() {
     let after = engine.snapshot();
 
     assert!(
-        !after.contains("↓ bottom") && !after.contains("% ↑") && !after.contains("% ↓"),
-        "after /new the emptied transcript must carry no stale scroll indicator: {after:?}"
+        !after.contains("one more line"),
+        "reset should remove the previous transcript: {after:?}"
     );
-    // Scroll offset is reset to the top (nothing to scroll on an empty buffer).
-    assert!(
-        !after.contains("100%"),
-        "after /new the transcript must not report a scrolled position: {after:?}"
-    );
+    let max: i64 = engine
+        .lua()
+        .load(
+            r#"
+            local p = tui.scroll_position("transcript")
+            return p and p.max or 0
+            "#,
+        )
+        .eval()
+        .expect("scroll max after /new");
+    assert_eq!(max, 0, "reset should collapse stale scroll extent");
 }

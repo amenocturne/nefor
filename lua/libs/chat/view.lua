@@ -120,9 +120,12 @@ function M.render(state)
   -- so the Rust router bubbles every key to the reducer's sidebar
   -- navigation instead of swallowing it into the text field.
   local input_focused = not popup_owns_keys and state.focus ~= "sidebar"
-  local input_border_style = input_focused
-    and STYLE.input_border
-    or STYLE.input_border_unfocused
+  local input_border_style
+  if type(statusline.input_border_style) == "function" then
+    input_border_style = statusline.input_border_style(state, input_focused)
+  else
+    input_border_style = input_focused and STYLE.input_border or STYLE.input_border_unfocused
+  end
   -- The prompt widget owns trigger detection + popup rendering + Tab
   -- routing for both slash and @-path completion. Chat.lua declares
   -- the completion sources via slash.completions() and reads the

@@ -47,6 +47,10 @@ fn plugin_lua_dir() -> PathBuf {
     repo_root().join("plugins/openai-provider/lua")
 }
 
+fn chatgpt_plugin_lua_dir() -> PathBuf {
+    repo_root().join("plugins/chatgpt-provider/lua")
+}
+
 // ---------------------------------------------------------------------
 // Harness: minimal `nefor.*` surface + package.path covering the plugin
 // lib's parent dir and `core` / `libs`.
@@ -156,18 +160,22 @@ fn install_stub_nefor(lua: &Lua) -> mlua::Result<()> {
 
 fn set_package_path(lua: &Lua) -> mlua::Result<()> {
     let plugin = plugin_lua_dir();
+    let chatgpt_plugin = chatgpt_plugin_lua_dir();
     let core = lua_dir();
     let script = format!(
         r#"
         package.path = table.concat({{
           "{plugin}/?.lua",
           "{plugin}/?/init.lua",
+          "{chatgpt_plugin}/?.lua",
+          "{chatgpt_plugin}/?/init.lua",
           "{core}/?.lua",
           "{core}/?/init.lua",
           package.path,
         }}, ";")
         "#,
         plugin = plugin.display(),
+        chatgpt_plugin = chatgpt_plugin.display(),
         core = core.display(),
     );
     lua.load(&script).exec()
@@ -1197,4 +1205,54 @@ fn replay_rebuild_chat_complete_result_text_only_synthesizes() {
     assert_eq!(n, 2);
     assert_eq!(content, "Done.");
     assert_eq!(role, "assistant");
+}
+
+#[test]
+fn chatgpt_usage_outbound_becomes_provider_neutral() {
+    let lua = lua_with_lib();
+    let (kind, provider_name, used): (String, String, f64) = lua
+        .load(
+            r#"
+            local chatgpt = require("chatgpt-provider")
+            local t = chatgpt.translator("chatgpt")
+            local b = t.outbound({
+                type = "event", from = "chatgpt",
+                body = {
+                    kind = "chatgpt.usage.updated",
+                    rate_limit = { primary_window = { used_percent = 66 } },
+                },
+            })
+            return b.kind, b.provider, b.rate_limit.primary_window.used_percent
+            "#,
+        )
+        .eval()
+        .expect("eval");
+    assert_eq!(kind, "chat.usage.updated");
+    assert_eq!(provider_name, "chatgpt");
+    assert_eq!(used, 66.0);
+}
+
+#[test]
+fn chatgpt_usage_request_filters_by_provider() {
+    let lua = lua_with_lib();
+    let (accepted_kind, rejected): (String, Value) = lua
+        .load(
+            r#"
+            local chatgpt = require("chatgpt-provider")
+            local t = chatgpt.translator("chatgpt")
+            local accepted = t.inbound({
+                type = "event", from = "engine",
+                body = { kind = "chat.usage.requested", provider = "chatgpt" },
+            })
+            local rejected = t.inbound({
+                type = "event", from = "engine",
+                body = { kind = "chat.usage.requested", provider = "other" },
+            })
+            return accepted.kind, rejected
+            "#,
+        )
+        .eval()
+        .expect("eval");
+    assert_eq!(accepted_kind, "chatgpt.usage.requested");
+    assert!(matches!(rejected, Value::Nil));
 }

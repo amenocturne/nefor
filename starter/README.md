@@ -47,3 +47,4 @@ nefor
 - **Add/remove plugins**: edit the `actor.spawn` blocks in `init.lua`.
 - **Resume a prior session**: emit `sessions.resume_request { session_id = "<uuid>" }` on the bus (the chat slash-command surface does this for you).
 - **Switch provider/model**: edit the `providers` list in `config/init.lua`. `mock` is spawned out of the box and is the default provider/model for deterministic startup. `chatgpt` and `ollama` are opt-in via `NEFOR_ENABLE_CHATGPT=1` and `NEFOR_ENABLE_OLLAMA=1` (or by editing `config/init.lua`). Pick a model interactively via `/model` in the TUI, or change `default_provider` / `default_model` to set the first-turn default.
+- **Inspect ChatGPT quota**: `/usage` shows both quota windows and reset times. When the active provider advertises usage support, the footer keeps a compact available-capacity gauge such as `◔ 34% until 14:30`.

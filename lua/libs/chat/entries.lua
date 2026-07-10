@@ -52,18 +52,22 @@ local function reasoning_rows(reasoning, body_empty, expanded)
   return tui.text { content = label, style = STYLE.footer, wrap = "none" }
 end
 
--- Per-turn footer: "▣ <model> · <duration>".
+-- Per-turn footer: "▣ <model> · <duration> · <speed>".
 local function turn_footer(entry)
-  local model = entry.model
+  local parts = {}
+  if entry.model then parts[#parts + 1] = entry.model end
   local dur = humanize_duration_ms(entry.duration_ms)
-  if model and dur then
-    return tui.text { content = "▣ " .. model .. " · " .. dur, style = STYLE.footer, wrap = "none" }
-  elseif model then
-    return tui.text { content = "▣ " .. model, style = STYLE.footer, wrap = "none" }
-  elseif dur then
-    return tui.text { content = "▣ " .. dur, style = STYLE.footer, wrap = "none" }
+  if dur then parts[#parts + 1] = dur end
+  if entry.output_tokens and entry.duration_ms and entry.duration_ms > 0 then
+    local tps = math.floor((entry.output_tokens * 1000) / entry.duration_ms + 0.5)
+    parts[#parts + 1] = tostring(tps) .. " tok/s"
   end
-  return nil
+  if #parts == 0 then return nil end
+  return tui.text {
+    content = "▣ " .. table.concat(parts, " · "),
+    style = STYLE.footer,
+    wrap = "none",
+  }
 end
 
 -- Stable three-slot layout: each slot is a keyed column so the

@@ -249,6 +249,8 @@ local function initial_state()
     max_tokens       = nil,
     gate_mode        = "safe",
     auth             = {},
+    supports_usage   = {},
+    usage            = {},
     expanded_details = false,
     completion       = nil,
     last_esc_ms      = nil,

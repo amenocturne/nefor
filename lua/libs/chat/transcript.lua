@@ -148,4 +148,15 @@ function M.attach_tool_end(state, id, output, error_flag)
   return state
 end
 
+function M.attach_latest_assistant_stats(state, output_tokens, duration_ms)
+  for i = #state.entries, 1, -1 do
+    local entry = state.entries[i]
+    if entry.role == "assistant" and entry.streaming ~= true then
+      local updated = Entry.set_turn_stats(entry, output_tokens, duration_ms)
+      return shallow_merge(state, { entries = replace_entry(state.entries, i, updated) })
+    end
+  end
+  return state
+end
+
 return M

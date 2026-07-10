@@ -12,6 +12,7 @@ M.COMMANDS = {
   { name = "login",   aliases = {},          hint = "authenticate a provider",                takes_args = true },
   { name = "logout",  aliases = {},          hint = "revoke a provider's auth",               takes_args = true },
   { name = "model",   aliases = {},          hint = "list/switch active model",               takes_args = true },
+  { name = "usage",   aliases = {},          hint = "show provider quota and reset times",     takes_args = false },
   {
     name = "mode", aliases = {}, hint = "switch workflow mode", takes_args = true,
     arg_completions = {

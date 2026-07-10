@@ -15,6 +15,7 @@ use serde::Deserialize;
 
 use crate::error::ChatgptError;
 use crate::responses::request::ResponseItem;
+use crate::responses::UsageSnapshot;
 
 /// Typed SSE event. Variant names map to the Responses-API `type`
 /// strings via `#[serde(rename = "...")]`. Numeric index fields are
@@ -113,11 +114,19 @@ pub enum ResponseEvent {
 /// [`ResponsesClient::stream`]: super::ResponsesClient::stream
 pub struct ResponseStream {
     inner: BoxStream<'static, Result<ResponseEvent, ChatgptError>>,
+    usage: Option<UsageSnapshot>,
 }
 
 impl ResponseStream {
-    pub fn new(inner: BoxStream<'static, Result<ResponseEvent, ChatgptError>>) -> Self {
-        Self { inner }
+    pub fn new(
+        inner: BoxStream<'static, Result<ResponseEvent, ChatgptError>>,
+        usage: Option<UsageSnapshot>,
+    ) -> Self {
+        Self { inner, usage }
+    }
+
+    pub fn usage(&self) -> Option<&UsageSnapshot> {
+        self.usage.as_ref()
     }
 
     pub fn into_inner(self) -> BoxStream<'static, Result<ResponseEvent, ChatgptError>> {
