@@ -62,24 +62,38 @@ local chats = {}
 -- pick_response_for).
 local CANNED_MAG_FILE = "octo-lighthouse.mag"
 local CANNED_MAG_PROGRAM = table.concat({
-  "(type mag.Task)",
-  "(type generic-provider.FinalAnswer)",
+  '(require "nefor.actors")',
+  '(require "nefor.artifact")',
+  '(require "nefor.contracts")',
+  '(require "nefor.graph")',
   "",
-  '(let [sx      (agent {:id "sx" :provider "mock-plugin" :profile "standard"',
-  '                      :system "Summarise octopuses in one sentence." :tools []}',
-  "                : mag.Task -> generic-provider.FinalAnswer)",
-  '      sy      (agent {:id "sy" :provider "mock-plugin" :profile "standard"',
-  '                      :system "Summarise lighthouses in one sentence." :tools []}',
-  "                : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)",
-  '      combine (agent {:id "combine" :provider "mock-plugin" :profile "standard"',
-  '                      :system "Combine the two summaries above into one paragraph." :tools []}',
-  "                : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)",
-  '      out     (node "sink" {}',
-  "                : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]",
-  "  (graph sx -> sy",
-  "         sy -> combine",
-  "         combine -> out",
-  "         :terminal out))",
+  "(type OctopusSummary {:content String})",
+  "(type LighthouseSummary {:content String})",
+  "",
+  '(let [sx (nefor.actors.agent',
+  '           (as nefor.actors.AgentConfig',
+  '             {:id "sx" :model nil :profile "standard" :provider "mock-plugin"',
+  '              :system "Summarise octopuses in one sentence." :tools [] :da-policy nil})',
+  '           (type-tag nefor.contracts.Task) "task" (type-tag OctopusSummary))',
+  '      sy (nefor.actors.agent',
+  '           (as nefor.actors.AgentConfig',
+  '             {:id "sy" :model nil :profile "standard" :provider "mock-plugin"',
+  '              :system "Summarise lighthouses in one sentence." :tools [] :da-policy nil})',
+  '           (type-tag OctopusSummary) "generic-provider.FinalAnswer"',
+  '           (type-tag LighthouseSummary))',
+  '      combine (nefor.actors.agent',
+  '                (as nefor.actors.AgentConfig',
+  '                  {:id "combine" :model nil :profile "standard" :provider "mock-plugin"',
+  '                   :system "Combine the two summaries above into one paragraph."',
+  '                   :tools [] :da-policy nil})',
+  '                (type-tag LighthouseSummary) "generic-provider.FinalAnswer"',
+  '                (type-tag nefor.contracts.FinalAnswer))',
+  '      chain (nefor.graph.connect (nefor.graph.connect sx sy) combine)',
+  '      initial (nefor.graph.message "sx.entry"',
+  '                (as Data {:kind "task" :prompt "<initial task text>"}))',
+  '      program (nefor.graph.finish chain [initial]',
+  '                (as (List nefor.graph.Rule) []))]',
+  '  (nefor.artifact.compile program))',
 }, "\n")
 
 -- Canned text responses keyed by pattern in the last user message.
@@ -172,8 +186,8 @@ local HELP_BODY = table.concat({
   "",
   "- 📄 `read readme` — uses the `read_file` tool to fetch `README.md`",
   "  (requires `read_file` on the tool-gate allowlist, or auto)",
-  "- `what is my cwd` — uses `mag-eval` to run `(bash \"pwd\")`",
-  "- 📁 `list files` — uses `mag-eval` to run `(bash \"ls -la\")`",
+  "- `what is my cwd` — uses `mag-eval` with `nefor.shell.command`",
+  "- 📁 `list files` — uses `mag-eval` with `nefor.shell.command`",
   "",
   "### 3. Memory",
   "",
@@ -494,7 +508,7 @@ local function pick_response_for(chat_id)
     }
   end
 
-  -- 5b. cwd / pwd / where am i -> mag-eval tool call ((bash "pwd"))
+  -- 5b. cwd / pwd / where am i -> one shell fragment.
   if string.find(low, "pwd", 1, true)
       or string.find(low, "current cwd", 1, true)
       or string.find(low, "where am i", 1, true)
@@ -508,13 +522,13 @@ local function pick_response_for(chat_id)
         {
           id        = mint_tool_id("pwd"),
           name      = "mag-eval",
-          arguments = { expr = '(bash "pwd")' },
+          arguments = { expr = '(nefor.shell.command "pwd" "pwd")' },
         },
       },
     }
   end
 
-  -- 5c. list files -> mag-eval tool call ((bash "ls -la"))
+  -- 5c. list files -> one shell fragment.
   if string.find(low, "list files", 1, true) then
     return {
       text = "",
@@ -523,7 +537,7 @@ local function pick_response_for(chat_id)
         {
           id        = mint_tool_id("ls"),
           name      = "mag-eval",
-          arguments = { expr = '(bash "ls -la")' },
+          arguments = { expr = '(nefor.shell.command "ls" "ls -la")' },
         },
       },
     }

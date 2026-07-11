@@ -1,9 +1,9 @@
 -- libs/lead-workflow/mag-eval.lua — the one-off MAG expression tool (mechanism).
 --
 -- `mag-eval` takes one MAG expression source string, compiles it through the
--- mag plugin (the same load handshake the `mag` tool uses — the compiler's
--- shell defaults fill in ids and the terminal), and executes it inline on the
--- kernel. Born decomposed: one schema, no action modes — write/compile/execute
+-- mag plugin (the same load handshake the `mag` tool uses), wraps it in the
+-- library-defined Artifact shape, and executes it inline on the kernel. Born
+-- decomposed: one schema, no action modes — write/compile/execute
 -- workflows stay on the `mag` tool.
 --
 -- Settlement routes by CALLER, decided from the firing id's scope
@@ -18,8 +18,8 @@
 --     and a sub-second `rg` both dispatch, show on the run panel (lifecycle
 --     events stream under the readable run_name `eval-<n>`), and come back
 --     as a run-completion notification. Nothing blocks the lead's turn, so
---     commands may run unbounded (basic-tools bash has no default timeout;
---     `(bash "cmd" {:timeout_ms N})` opts into a bound).
+--     commands may run unbounded; `nefor.shell.command-with-options` opts into
+--     a timeout through its explicit options value.
 --   * A GRAPH AGENT's calls BLOCK: the firing settles when the run's
 --     terminal `mag.run_result` arrives, and the output IS the tool result.
 --     The agent's graph node is itself the waiting structure — a sub-run has
@@ -57,13 +57,13 @@ local state = {
 M.schema = {
   name        = "mag-eval",
   description =
-    "Evaluate one MAG expression on the actor kernel. `->` is the pipe: a " ..
-    "node's output becomes the next node's stdin, e.g. " ..
-    "((bash \"rg -n TODO src/\") -> (bash \"sort\")). A bare (bash \"cmd\") " ..
-    "runs a single command. Commands run until they exit — long-running " ..
+    "Evaluate one MAG graph-fragment expression on the actor kernel. " ..
+    "A command is (nefor.shell.command \"step\" \"rg -n TODO src/\"); " ..
+    "pipe fragments with (nefor.graph.connect left right). Commands run " ..
+    "until they exit — long-running " ..
     "work (servers, review UIs, watch loops) needs no backgrounding, no " ..
     "`&`, no polling; run it in the foreground. " ..
-    "(bash \"cmd\" {:timeout_ms 60000}) opts into a wall-clock bound. " ..
+    "nefor.shell.command-with-options opts into a wall-clock bound. " ..
     "As the lead, the call acks immediately with the run name and the " ..
     "terminal output arrives as a run-completion notification, like any " ..
     "dispatched graph; as a graph agent, the output returns as the tool " ..
@@ -161,7 +161,17 @@ function M.handle(firing_id, args)
     tool_err(firing_id, "mag-eval: cannot write " .. rel .. ": " .. tostring(open_err))
     return
   end
-  fh:write(expr)
+  local source = table.concat({
+    '(require "nefor.artifact")\n',
+    '(require "nefor.graph")\n',
+    '(require "nefor.shell")\n',
+    '(let [fragment ', expr, '\n',
+    '      initial (nefor.shell.start-message fragment)\n',
+    '      program (nefor.graph.finish fragment [initial] ',
+    '                (as (List nefor.graph.Rule) []))]\n',
+    '  (nefor.artifact.compile program))\n',
+  })
+  fh:write(source)
   fh:close()
 
   -- Caller routing (header): a lead-scoped firing detaches; anything else
@@ -185,6 +195,7 @@ function M.handle(firing_id, args)
     kind       = "mag.load",
     id         = load_id,
     source_dir = ws,
+    module_roots = { ws .. "/lib" },
     entry      = rel,
   })
 end
@@ -206,8 +217,8 @@ end
 local function on_loaded(body)
   local pending = take(state.pending_loads, body.in_reply_to)
   if not pending then return false end
-  if type(body.modification) ~= "table" then
-    tool_err(pending.firing_id, "mag-eval: mag.loaded reply carried no modification")
+  if type(body.artifact) ~= "table" then
+    tool_err(pending.firing_id, "mag-eval: mag.loaded reply carried no artifact")
     return true
   end
   emit_as(SOURCE_NAME, "mag", {
@@ -216,7 +227,7 @@ local function on_loaded(body)
     run_id       = pending.run_id,
     run_name     = pending.run_name,
     session_id   = pending.session_id,
-    modification = body.modification,
+    artifact     = body.artifact,
   })
   state.pending_runs[pending.run_id] = pending
   if pending.detached then

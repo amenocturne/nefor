@@ -149,6 +149,20 @@ impl LuaHost {
         }
     }
 
+    /// Serializable foreign declarations for MAG library validation. This is
+    /// plain immutable data: no Lua constructor or other runtime capability
+    /// crosses the evaluation boundary.
+    pub fn registry_contracts(&self) -> Result<JsonValue, MagError> {
+        let f: Option<Function> = self.kernel.get("registry_contracts")?;
+        match f {
+            Some(f) => {
+                let value: Value = f.call(self.lua.array_metatable())?;
+                Ok(self.lua.from_value(value)?)
+            }
+            None => Ok(JsonValue::Array(Vec::new())),
+        }
+    }
+
     /// Create the run's kernel context (inventory, router, modlog, observer)
     /// and emit `mag.run_started`. Run identity is injected, never ambient
     /// (docs/ir.md). The outcome carries the stale run ids the kernel reaped
@@ -621,5 +635,81 @@ mod tests {
         // Draining again yields an empty queue.
         assert!(host.drain_emits().expect("drain2").is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reads_registry_contract_snapshot_as_json() {
+        let dir = std::env::temp_dir().join(format!("mag-kernel-contract-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = write_kernel(
+            &dir,
+            r#"
+            return {
+              registry_contracts = function()
+                return {{
+                  identity = "nefor.factory.example",
+                  implementation = "example",
+                  params = { count = "int" },
+                  type_scheme = {
+                    variables = { "T" },
+                    inputs = { value = "T" },
+                    outputs = { "T" },
+                  },
+                  signals = {},
+                }}
+              end,
+            }
+            "#,
+        );
+        let host = LuaHost::load_kernel(&path, None).expect("load");
+        let contracts = host.registry_contracts().expect("contracts");
+        assert_eq!(contracts[0]["identity"], "nefor.factory.example");
+        assert_eq!(contracts[0]["type_scheme"]["variables"][0], "T");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn structural_result_boundary_accepts_arbitrary_declared_wire() {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest.join("lua/mag-kernel/init.lua");
+        let lua_root = manifest.join("../../lua");
+        let host = LuaHost::load_kernel(&path, Some(&lua_root)).expect("load shipped kernel");
+        let begun = host
+            .begin_run("custom-result", "custom-result", None)
+            .expect("begin run");
+        assert!(begun.ok, "begin failed: {:?}", begun.error);
+        let modification = serde_json::json!({
+            "actors": [{
+                "id": "custom",
+                "factory": "nefor.factory.stub",
+                "params": {"greeting": "done"},
+                "routes": {}
+            }],
+            "messages": [{"to": "custom", "content": {"kind": "stub.In"}}],
+            "kills": [],
+            "rules": [],
+            "result": {"from": {
+                "actor": "custom",
+                "type": "example.CustomResult",
+                "wire": "stub.Out"
+            }}
+        });
+        let outcome = host.start("custom-result", &modification).expect("start");
+        assert!(outcome.ok, "start failed: {:?}", outcome.error);
+        let completion = host
+            .take_run_complete("custom-result")
+            .expect("read completion")
+            .expect("custom result completed");
+        assert_eq!(
+            completion.result.as_ref().and_then(|v| v["kind"].as_str()),
+            Some("stub.Out")
+        );
+        assert_eq!(
+            completion
+                .result
+                .as_ref()
+                .and_then(|v| v["greeting"].as_str()),
+            Some("done")
+        );
     }
 }

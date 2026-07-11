@@ -13,6 +13,12 @@
 -- tool for humans; nothing here shells out to it.
 
 local M = {}
+local configured_library_dir = nil
+
+function M.configure(options)
+  options = options or {}
+  configured_library_dir = options.library_dir
+end
 
 local function sh_quote(value)
   return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
@@ -59,7 +65,7 @@ function M.init_workspace(session_id, config_dir)
   end
 
   -- Seed from config mag/lib/ contents. -n = no-clobber.
-  local config_mag = config_dir .. "/mag/lib"
+  local config_mag = configured_library_dir or (config_dir .. "/mag/lib")
   os.execute("cp -Rn " .. sh_quote(config_mag) .. "/. " .. sh_quote(ws) .. "/lib/ 2>/dev/null")
 
   return ws, nil
@@ -118,7 +124,7 @@ local function format_routes(routes)
 end
 
 -- Format a graph modification (`mag.loaded` reply shape) into a
--- human-readable preview: actors with factory + params summary, their
+-- human-readable preview: actors with foreign capability + params summary, their
 -- typed routes, the initial messages, the hash, and the kernel
 -- registry's factory names.
 function M.preview(modification, hash, factories)
@@ -135,7 +141,7 @@ function M.preview(modification, hash, factories)
   lines[#lines + 1] = "Actors:"
   for _, actor in ipairs(actors) do
     lines[#lines + 1] = string.format("  %s (%s)%s",
-      tostring(actor.id), tostring(actor.factory), format_params(actor.params))
+      tostring(actor.id), tostring(actor.foreign), format_params(actor.params))
     local routes = format_routes(actor.routes)
     if routes then
       lines[#lines + 1] = "    routes: " .. routes
@@ -145,11 +151,18 @@ function M.preview(modification, hash, factories)
   if #messages > 0 then
     lines[#lines + 1] = ""
     lines[#lines + 1] = "Initial messages:"
-    for _, msg in ipairs(messages) do
+  for _, msg in ipairs(messages) do
       local kind = type(msg.content) == "table" and msg.content.kind or nil
       lines[#lines + 1] = string.format("  -> %s (%s)",
         tostring(msg.to), tostring(kind or "message"))
     end
+  end
+
+  local result = type(modification.result) == "table" and modification.result.from or nil
+  if type(result) == "table" then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = string.format("Result: %s (%s)",
+      tostring(result.actor), tostring(result.wire))
   end
 
   if type(factories) == "table" and #factories > 0 then

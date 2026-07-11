@@ -88,6 +88,22 @@ local function validate_declaration(decl)
     end
   end
 
+  if decl.type_variables ~= nil then
+    if type(decl.type_variables) ~= "table" then
+      return nil, "declaration.type_variables must be a list of names"
+    end
+    local seen = {}
+    for _, variable in ipairs(decl.type_variables) do
+      if type(variable) ~= "string" or variable == "" then
+        return nil, "declaration.type_variables entries must be non-empty strings"
+      end
+      if seen[variable] then
+        return nil, string.format("duplicate type variable %q", variable)
+      end
+      seen[variable] = true
+    end
+  end
+
   if decl.signals ~= nil then
     if type(decl.signals) ~= "table" then
       return nil, "declaration.signals must be a list of signal names"
@@ -105,7 +121,7 @@ end
 -- ---- construction -----------------------------------------------------------
 
 function registry.new()
-  return setmetatable({ factories = {} }, registry)
+  return setmetatable({ factories = {}, identities = {} }, registry)
 end
 
 -- Register a factory: a declaration plus its constructor. Rejects a
@@ -124,13 +140,22 @@ function registry:register(entry)
   if self.factories[decl.name] then
     return nil, string.format("factory %q already registered", decl.name)
   end
+  local identity = decl.identity or ("nefor.factory." .. decl.name)
+  if type(identity) ~= "string" or identity == "" or not identity:find("%.") then
+    return nil, string.format("factory %q: identity must be a qualified symbol", decl.name)
+  end
+  if self.identities[identity] then
+    return nil, string.format("foreign identity %q already registered", identity)
+  end
+  decl.identity = identity
   self.factories[decl.name] = { declaration = decl, construct = entry.construct }
+  self.identities[identity] = decl.name
   return decl
 end
 
 -- Look up a factory by name; nil if unknown.
 function registry:lookup(name)
-  return self.factories[name]
+  return self.factories[name] or self.factories[self.identities[name]]
 end
 
 -- The registered factory names, sorted for a stable surface. This is the
@@ -146,8 +171,50 @@ function registry:names()
 end
 
 registry.declaration = function(self, name)
-  local f = self.factories[name]
+  local f = self:lookup(name)
   return f and f.declaration or nil
+end
+
+-- Serializable immutable input for MAG libraries and their generic checker.
+-- Constructors and every other runtime closure are deliberately absent. The
+-- type scheme is concrete today, but its data shape admits explicit variables
+-- once a factory needs specialization.
+function registry:contracts(array_mt)
+  local function array_copy(values)
+    local copy = {}
+    for i, value in ipairs(values or {}) do copy[i] = value end
+    if array_mt ~= nil then setmetatable(copy, array_mt) end
+    return copy
+  end
+
+  local out = array_copy()
+  for _, name in ipairs(self:names()) do
+    local decl = self.factories[name].declaration
+    local input_tags = array_copy()
+    local seen_input = {}
+    for _, input_shape in pairs(decl.inputs) do
+      for _, tag in ipairs(shape.tags(input_shape)) do
+        if not seen_input[tag] then
+          input_tags[#input_tags + 1] = tag
+          seen_input[tag] = true
+        end
+      end
+    end
+    table.sort(input_tags)
+    out[#out + 1] = {
+      identity = decl.identity,
+      implementation = decl.name,
+      params = decl.params or {},
+      type_scheme = {
+        variables = array_copy(decl.type_variables),
+        inputs = decl.inputs,
+        input_tags = input_tags,
+        outputs = array_copy(decl.outputs),
+      },
+      signals = array_copy(decl.signals),
+    }
+  end
+  return out
 end
 
 -- The declared input shape of a factory's named port (nil if unknown),
@@ -166,7 +233,7 @@ end
 -- capabilities — plain data authored in `params`, runtime closures in `deps` —
 -- threaded through untouched to the factory. Rejects an unknown factory.
 function registry:construct(name, id, params, emit, deps)
-  local f = self.factories[name]
+  local f = self:lookup(name)
   if not f then
     return nil, string.format("unknown factory %q", tostring(name))
   end

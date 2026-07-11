@@ -36,6 +36,12 @@ M.prod = {
     default_action = "auto",
     prompt_tools   = {},
   },
+  orchestration_profiles = {
+    fast     = { provider = "ollama", model = "qwen3.6:35b-a3b-coding-mxfp8", reasoning_effort = "low" },
+    standard = { provider = "ollama", model = "qwen3.6:35b-a3b-coding-mxfp8", reasoning_effort = "medium" },
+    deep     = { provider = "ollama", model = "qwen3.6:35b-a3b-coding-mxfp8", reasoning_effort = "high" },
+    max      = { provider = "ollama", model = "qwen3.6:35b-a3b-coding-mxfp8", reasoning_effort = "xhigh" },
+  },
   log_level = "info",
 }
 
@@ -52,6 +58,12 @@ M.test = {
   tool_gate = {
     default_action = "auto",
     prompt_tools   = {},
+  },
+  orchestration_profiles = {
+    fast     = { provider = "mock-plugin", model = "mock-model", reasoning_effort = "low" },
+    standard = { provider = "mock-plugin", model = "mock-model", reasoning_effort = "medium" },
+    deep     = { provider = "mock-plugin", model = "mock-model", reasoning_effort = "high" },
+    max      = { provider = "mock-plugin", model = "mock-model", reasoning_effort = "xhigh" },
   },
   log_level = "warn",
 }

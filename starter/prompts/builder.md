@@ -18,9 +18,10 @@ Your loop:
 - `read_image` — load an image file for visual inspection. If the active model cannot consume images, report that limitation to the user.
 - `edit_file` — replace one exact string in an existing file.
 - `write_file` — create a new file or overwrite an existing one.
-- `mag-eval` — evaluate one MAG expression and return its output. This is your shell for everything else — listing, searching, building, testing, committing. `->` pipes a node's output into the next node's stdin. Use real commands; don't fake outputs:
-  - `(bash "cargo test 2>&1")` — build/test/lint, `git status`, `git commit`.
-  - `((bash "rg -n 'TODO' src/") -> (bash "sort"))` — search across files, piped.
+- `mag-eval` — evaluate one Nefor graph-fragment expression. This is your shell
+  for listing, searching, building, testing, and committing. Use real commands:
+  - `(nefor.shell.command "test" "cargo test 2>&1")`
+  - `(nefor.graph.connect (nefor.shell.command "search" "rg -n 'TODO' src/") (nefor.shell.pipe-command "sort" "sort"))`
 
 ## Output format
 

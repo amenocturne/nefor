@@ -117,6 +117,65 @@ local WRITER_MAG = [[
 -- these are trimmed to the actors the validators care about.
 local KERNEL_FACTORIES = { "adapter", "llm", "run-tool", "sink", "stub", "tool-result" }
 
+local function foreign_contracts(factories)
+  local contracts = {}
+  for _, name in ipairs(factories or KERNEL_FACTORIES) do
+    contracts[#contracts + 1] = { identity = "nefor.factory." .. name }
+  end
+  return contracts
+end
+
+-- Test fixtures stay compact by describing the former sink-shaped graph,
+-- then this helper expresses the same program through the current artifact
+-- boundary: qualified foreign actors plus a structural result selector.
+local function artifact_from_modification(modification)
+  local actors, sink_ids = {}, {}
+  for _, actor in ipairs(modification.actors or {}) do
+    if actor.factory == "sink" then
+      sink_ids[actor.id] = true
+    else
+      local routes = {}
+      for wire, destinations in pairs(actor.routes or {}) do
+        local kept = {}
+        for _, destination in ipairs(destinations) do
+          if not sink_ids[destination] and destination ~= "sink" then
+            kept[#kept + 1] = destination
+          end
+        end
+        if #kept > 0 then routes[wire] = kept end
+      end
+      actors[#actors + 1] = {
+        id = actor.id,
+        foreign = "nefor.factory." .. tostring(actor.factory),
+        params = actor.params or {},
+        routes = routes,
+      }
+    end
+  end
+  local result
+  for _, actor in ipairs(modification.actors or {}) do
+    if actor.factory ~= "sink" then
+      for wire, destinations in pairs(actor.routes or {}) do
+        for _, destination in ipairs(destinations) do
+          if destination == "sink" or sink_ids[destination] then
+            result = { from = { actor = actor.id, type = wire, wire = wire } }
+          end
+        end
+      end
+    end
+  end
+  return {
+    format = "nefor.graph-modification/v1",
+    data = {
+      actors = actors,
+      messages = modification.messages or {},
+      kills = modification.kills or {},
+      rules = modification.rules or {},
+      result = result,
+    },
+  }
+end
+
 local function read_only_modification()
   return {
     actors = {
@@ -179,9 +238,7 @@ local function execute_mag(id, file)
   })
 end
 
--- Drive the load handshake: find the emitted mag.load, feed the mag.loaded
--- reply carrying `modification`, return the load call. `factories` defaults
--- to the full kernel registry.
+-- Drive the load handshake and return the load call.
 local function feed_loaded(modification, factories)
   local load = find_call(decode_calls(), function(c)
     return c.body.kind == "mag.load" and c.target == "mag"
@@ -194,7 +251,8 @@ local function feed_loaded(modification, factories)
     in_reply_to = load.body.id,
     hash        = "sha256:test",
     factories   = factories or KERNEL_FACTORIES,
-    modification = modification,
+    foreign_contracts = foreign_contracts(factories),
+    artifact = artifact_from_modification(modification),
   })
   return load
 end
@@ -261,7 +319,8 @@ do
     in_reply_to = load.body.id,
     hash        = "sha256:read-only",
     factories   = KERNEL_FACTORIES,
-    modification = read_only_modification(),
+    foreign_contracts = foreign_contracts(KERNEL_FACTORIES),
+    artifact = artifact_from_modification(read_only_modification()),
   })
   calls = decode_calls()
 
@@ -293,11 +352,10 @@ do
   assert_eq(exec.body.run_id, reply.body.output.run_id,
     "mag.execute run_id matches the reply run_id")
 
-  -- Active run tracked from the modification's actors: factory under the
-  -- summary's reasoner key (what the chat surface renders).
+  -- Active run tracks the structural result actor from artifact metadata.
   local run = lw._internals.state.active_runs[reply.body.output.run_id]
   assert_true(type(run) == "table", "active_runs contains the dispatched run_id")
-  assert_eq(run.terminal, "sink", "the canonical sink actor is the terminal")
+  assert_eq(run.terminal, "worker.llm", "the result-producing actor is terminal")
   _test.calls_clear()
   invoke_tool("firing-graph-status-actors", "graph-status", { run_id = reply.body.output.run_id })
   local status = find_call(decode_calls(), function(c)
@@ -306,7 +364,8 @@ do
   assert_true(status ~= nil, "graph-status returns the active run")
   local nodes = status.body.output.run.nodes
   assert_eq(nodes[1].id, "worker.entry", "actor ids preserved in run summaries")
-  assert_eq(nodes[2].reasoner, "llm", "actor factory carried under the reasoner key")
+  assert_eq(nodes[2].reasoner, "nefor.factory.llm",
+    "qualified foreign capability carried under the reasoner key")
 end
 
 do
@@ -351,9 +410,9 @@ do
   local preview = reply.body.output.preview
   assert_true(type(preview) == "string", "mag compile returns a preview string")
   for _, needle in ipairs({
-    "worker.llm (llm)",                                    -- actor id + factory
+    "worker.llm (nefor.factory.llm)",                      -- actor + capability
     "provider: \"chatgpt\"",                               -- params summary
-    "routes: generic-provider.FinalAnswer -> sink",        -- typed routes
+    "Result: worker.llm (generic-provider.FinalAnswer)",   -- structural result
     "-> worker.entry (task)",                              -- initial message
     "Hash: sha256:test",                                   -- hash
     "Registry factories: adapter, llm",                    -- kernel registry
@@ -432,7 +491,8 @@ local function relayed_lead_prompt()
   if load ~= nil then
     agentic_loop.receive_msg(make_entry("mag", {
       kind = "mag.loaded", in_reply_to = load.body.id,
-      hash = "sha256:lead", modification = lead_turn_modification(),
+      hash = "sha256:lead",
+      artifact = artifact_from_modification(lead_turn_modification()),
     }))
     calls = decode_calls()
   end
@@ -441,8 +501,8 @@ local function relayed_lead_prompt()
        and c.body.run_name == "lead"
   end)
   if exec == nil then return nil end
-  local msg = exec.body.modification and exec.body.modification.messages
-    and exec.body.modification.messages[1]
+  local msg = exec.body.artifact and exec.body.artifact.data
+    and exec.body.artifact.data.messages and exec.body.artifact.data.messages[1]
   return msg and msg.content and msg.content.prompt or nil
 end
 
@@ -620,15 +680,15 @@ do
        and c.body.id == "firing-kernel-badfactory"
        and type(c.body.error) == "string"
   end)
-  assert_true(err ~= nil and err.body.error:find("unknown factory", 1, true) ~= nil,
-    "validation rejects the unknown factory with a clear error; got " .. json.encode(_test.calls()))
+  assert_true(err ~= nil and err.body.error:find("unknown foreign", 1, true) ~= nil,
+    "validation rejects the unknown capability with a clear error; got " .. json.encode(_test.calls()))
   assert_true(err.body.error:find("worker.entry", 1, true) ~= nil
               and err.body.error:find("adapter", 1, true) ~= nil,
-    "rejection names the offending actor and factory")
+    "rejection names the offending actor and capability")
 end
 
--- Sink validators: missing sink, and sink without inbound routes. The
--- missing-sink error teaches the current dialect (agent + :terminal sink).
+-- Structural result metadata is required even though result collection is not
+-- represented as an actor.
 do
   fresh()
   write_mag_file("firing-sink-missing-write", "no-sink.mag", READ_ONLY_MAG)
@@ -640,18 +700,15 @@ do
   feed_loaded(m)
   local calls = decode_calls()
   assert_eq(find_call(calls, function(c) return c.body.kind == "mag.execute" end), nil,
-    "missing sink blocks mag.execute")
+    "missing result boundary blocks mag.execute")
   local err = find_call(calls, function(c)
     return c.body.kind == "tool.result"
        and c.body.id == "firing-sink-missing"
        and type(c.body.error) == "string"
   end)
-  assert_true(err ~= nil and err.body.error:find("no sink actor", 1, true) ~= nil,
-    "missing sink is rejected; got " .. json.encode(_test.calls()))
-  assert_true(err.body.error:find("(agent {", 1, true) ~= nil
-              and err.body.error:find(":terminal out", 1, true) ~= nil,
-    "the sink error teaches the current (agent …) + :terminal dialect; got "
-    .. tostring(err.body.error))
+  assert_true(err ~= nil
+              and err.body.error:find("no structural result boundary", 1, true) ~= nil,
+    "missing result boundary is rejected; got " .. json.encode(_test.calls()))
 end
 
 do
@@ -667,8 +724,9 @@ do
        and c.body.id == "firing-sink-orphan"
        and type(c.body.error) == "string"
   end)
-  assert_true(err ~= nil and err.body.error:find("no inbound routes", 1, true) ~= nil,
-    "a sink nothing routes to is rejected; got " .. json.encode(_test.calls()))
+  assert_true(err ~= nil
+              and err.body.error:find("no structural result boundary", 1, true) ~= nil,
+    "an orphaned result fixture is rejected; got " .. json.encode(_test.calls()))
 end
 
 -- Profile validators: config.active.orchestration_profiles is the open
@@ -799,16 +857,18 @@ assert_profile_config_error({
   broken = { provider = "chatgpt", model = "", reasoning_effort = "low" },
 }, "configured profile 'broken' requires a non-empty string model")
 
--- mag.loaded snapshots the kernel factory registry for factory validation.
+-- mag.loaded snapshots qualified foreign capabilities for validation.
 do
   fresh()
   feed("mag", {
     kind      = "mag.loaded",
-    factories = { "sink", "llm", "stub", "run-tool" },
+    foreign_contracts = foreign_contracts({ "sink", "llm", "stub", "run-tool" }),
   })
   local set = lw._internals.state.kernel_factories
-  assert_true(type(set) == "table" and set.sink == true and set.llm == true,
-    "mag.loaded populates the kernel factory registry snapshot")
+  assert_true(type(set) == "table"
+              and set["nefor.factory.sink"] == true
+              and set["nefor.factory.llm"] == true,
+    "mag.loaded populates the foreign capability registry snapshot")
 end
 
 -- ------------------------------------------------------------------
@@ -1329,7 +1389,8 @@ do
     session_id = "s", detached = true,
   }
   feed("mag", { kind = "mag.loaded", in_reply_to = "R1-load",
-    modification = { actors = {}, messages = {}, kills = {}, rules = {} } })
+    artifact = { format = "nefor.graph-modification/v1",
+      data = { actors = {}, messages = {}, kills = {}, rules = {} } } })
   local calls = decode_calls()
   assert_true(find_call(calls, function(c)
     return c.body.kind == "mag.execute" and c.body.run_id == "R1"
@@ -1363,7 +1424,8 @@ do
     session_id = "s", detached = false,
   }
   feed("mag", { kind = "mag.loaded", in_reply_to = "R2-load",
-    modification = { actors = {}, messages = {}, kills = {}, rules = {} } })
+    artifact = { format = "nefor.graph-modification/v1",
+      data = { actors = {}, messages = {}, kills = {}, rules = {} } } })
   assert_eq(find_call(decode_calls(), function(c)
     return c.body.kind == "tool.result"
   end), nil, "a graph agent's eval does not ack at dispatch")

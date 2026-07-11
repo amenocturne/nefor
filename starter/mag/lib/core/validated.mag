@@ -1,0 +1,28 @@
+(require "core.types")
+
+;; Validation is a library algebra, not a distinguished evaluator result.
+(type Valid [T] {:tag String :value T})
+(type Invalid [E] {:tag String :errors (List E)})
+(type Validated [E T] (| (Valid T) (Invalid E)))
+
+(def valid (fn [T] [[value T]] -> (Valid T)
+  (as (Valid T) {:tag "core.validated.Valid" :value value})))
+
+(def invalid (fn [E] [[errors (List E)]] -> (Invalid E)
+  (as (Invalid E) {:tag "core.validated.Invalid" :errors errors})))
+
+(def valid? (fn [E T] [[validated (Validated E T)]] -> Bool
+  (= (get validated "tag") "core.validated.Valid")))
+
+(def map (fn [E T U] [[f (Fn T U)] [validated (Validated E T)]] -> (Validated E U)
+  (as (Validated E U)
+    (if (= (get validated "tag") "core.validated.Valid")
+      (valid (f (get (as (Valid T) validated) "value")))
+      (as (Invalid E) validated)))))
+
+(def and-then (fn [E T U] [[f (Fn T (Validated E U))]
+                            [validated (Validated E T)]] -> (Validated E U)
+  (as (Validated E U)
+    (if (= (get validated "tag") "core.validated.Valid")
+      (f (get (as (Valid T) validated) "value"))
+      (as (Invalid E) validated)))))

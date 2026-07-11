@@ -191,11 +191,9 @@ local function emit_tool_result_err(firing_id, err)
   })
 end
 
--- The kernel's factory registry is the single source-of-truth for valid
--- factory types. It arrives on `mag.hello` (at plugin startup) and every
--- `mag.loaded` reply (the `factories` array) and is cached in
--- state.kernel_factories. `validate_factories` rejects any actor whose factory
--- is not registered.
+-- The kernel's foreign-contract registry is the source of truth for actor
+-- capabilities. Library validation already checks the complete contracts;
+-- this control-plane pass keeps its pre-execute error localized.
 --
 -- When no snapshot exists yet (mag plugin not up, or an older plugin that does
 -- not advertise factories), validation is skipped and the kernel's own
@@ -208,22 +206,16 @@ local function sorted_keys(set)
   return keys
 end
 
-local function example_profile_name()
-  local profiles = orchestration_profiles()
-  if type(profiles) ~= "table" then return "<configured-profile>" end
-  return sorted_keys(profiles)[1] or "<configured-profile>"
-end
-
 local function validate_factories(actors, firing_id)
   local set = state.kernel_factories
   if type(set) ~= "table" or next(set) == nil then
     return true -- no registry snapshot yet; runtime spawn is the backstop
   end
   for _, actor in ipairs(actors or {}) do
-    if set[actor.factory] ~= true then
+    if set[actor.foreign] ~= true then
       emit_tool_result_err(firing_id,
-        "mag execute: actor '" .. tostring(actor.id) .. "' uses unknown factory '" ..
-        tostring(actor.factory) .. "'. Known factories: " ..
+        "mag execute: actor '" .. tostring(actor.id) .. "' uses unknown foreign '" ..
+        tostring(actor.foreign) .. "'. Known capabilities: " ..
         table.concat(sorted_keys(set), ", ") .. ".")
       return false
     end
@@ -249,64 +241,18 @@ local function actors_have_writers(actors)
   return false
 end
 
--- Sink validation over a modification's actors: exactly one actor with
--- factory "sink" (the loader canonicalizes the `:terminal` node's id to
--- "sink"), terminal (no routes), with at least one inbound route.
--- Returns sink_id or nil + error text in the current authoring dialect.
-local function sink_example()
-  return table.concat({
-    'Every program must end in exactly one sink that collects the final output, e.g.',
-    '  (let [worker (agent {:id "worker" :system "…" :provider "chatgpt"',
-    '                       :profile "' .. example_profile_name() .. '" :tools ["read_file"]}',
-    '                 : mag.Task -> generic-provider.FinalAnswer)',
-    '        out    (node "sink" {} : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]',
-    '    (graph worker -> out :terminal out))',
-  }, "\n")
+local function result_actor(modification)
+  local result = type(modification.result) == "table" and modification.result.from or nil
+  if type(result) ~= "table" or type(result.actor) ~= "string" then
+    return nil, "artifact has no structural result boundary"
+  end
+  return result.actor, nil
 end
 
-local function validate_sink(actors)
-  local sinks = {}
-  for _, actor in ipairs(actors or {}) do
-    if actor.factory == "sink" then sinks[#sinks + 1] = actor end
-  end
-  if #sinks == 0 then
-    return nil, "program has no sink actor. " .. sink_example()
-  end
-  if #sinks > 1 then
-    local ids = {}
-    for _, s in ipairs(sinks) do ids[#ids + 1] = tostring(s.id) end
-    return nil, "program has multiple sink actors (" .. table.concat(ids, ", ") ..
-      "). Every program must have exactly one sink."
-  end
-  local sink = sinks[1]
-  if type(sink.routes) == "table" and next(sink.routes) ~= nil then
-    return nil, "sink actor '" .. tostring(sink.id) .. "' has outgoing routes. " ..
-      "The sink must be the terminal actor — bind it with :terminal in (graph …)."
-  end
-  local inbound = false
-  for _, actor in ipairs(actors or {}) do
-    if actor ~= sink and type(actor.routes) == "table" then
-      for _, dests in pairs(actor.routes) do
-        if type(dests) == "table" then
-          for _, d in ipairs(dests) do
-            if d == sink.id then inbound = true end
-          end
-        end
-      end
-    end
-  end
-  if not inbound then
-    return nil, "sink actor '" .. tostring(sink.id) .. "' has no inbound routes. " ..
-      "Route at least one actor's output to the sink: (graph worker -> out :terminal out)."
-  end
-  return sink.id, nil
-end
-
--- Profile resolution over a modification's actors. Any actor authoring
+-- Profile resolution over an artifact's actors. Any actor authoring
 -- params.profile gets its resolved provider/model/reasoning_effort recorded
--- in the params overlay keyed by the ACTOR id — for the agent template that
--- is the namespaced llm actor (e.g. "worker.llm"), because eval_agent lowers
--- the agent's :profile onto its llm actors' params. llm-factory actors must
+-- in the params overlay keyed by the actor id. The nefor.actors library places
+-- the profile on its namespaced llm capability. Llm actors must
 -- carry :profile or raw reasoning_effort so the lead always makes an explicit
 -- reasoning-depth decision. Returns overlay or nil + error text.
 local function resolve_profiles(actors)
@@ -342,11 +288,11 @@ local function resolve_profiles(actors)
         model = resolved.model,
         reasoning_effort = resolved.reasoning_effort,
       }
-    elseif actor.factory == "llm" and not has_raw_effort then
+    elseif actor.foreign == "nefor.factory.llm" and not has_raw_effort then
       return nil, "llm actor '" .. tostring(actor.id) ..
         "' is missing required :profile. " ..
-        "Author :profile on the (agent {…}) config — it lowers onto the " ..
-        "agent's llm actors — or directly on a (node \"llm\" {…})."
+        "Set :profile in the MAG library wrapper that constructs this " ..
+        "nefor.factory.llm actor."
     end
   end
   return overlay, nil
@@ -753,8 +699,8 @@ register_active_run = function(run_id, actors, terminal, firing_id, run_name)
       nodes_order[#nodes_order + 1] = id
       nodes[id] = {
         id = id,
-        role = actor.factory,
-        reasoner = actor.factory,
+        role = actor.foreign,
+        reasoner = actor.foreign,
         status = "pending",
       }
     end
@@ -974,10 +920,11 @@ end
 -- body. This is the source of truth for factory validation
 -- (validate_factories).
 local function capture_kernel_factories(body)
-  if type(body.factories) ~= "table" then return end
+  if type(body.foreign_contracts) ~= "table" then return end
   local set = {}
-  for _, name in ipairs(body.factories) do
-    if type(name) == "string" then set[name] = true end
+  for _, contract in ipairs(body.foreign_contracts) do
+    local identity = type(contract) == "table" and contract.identity or nil
+    if type(identity) == "string" then set[identity] = true end
   end
   state.kernel_factories = set
 end
@@ -1261,7 +1208,6 @@ end
 local advertised = false
 
 local function lead_workflow_tool_schemas()
-  local example_profile = example_profile_name()
   return {
     {
       name        = "graph-status",
@@ -1321,26 +1267,18 @@ local function lead_workflow_tool_schemas()
         "Use action='write' to create/update a .mag file in the workspace. " ..
         "Use action='compile' (default) to compile and preview the actor " ..
         "modification. Use action='execute' to compile, validate, and run. " ..
-        "Agents are the compiler's agent template — there is no \"agent\" " ..
-        "node factory. Minimal working program:\n\n" ..
-        "(type mag.Task)\n" ..
-        "(type generic-provider.FinalAnswer)\n\n" ..
-        "(let [worker (agent {:id \"worker\"\n" ..
-        "                     :system \"Answer the task.\"\n" ..
-        "                     :provider \"chatgpt\"\n" ..
-        "                     :profile \"" .. example_profile .. "\"\n" ..
-        "                     :tools [\"read_file\"]}\n" ..
-        "               : mag.Task -> generic-provider.FinalAnswer)\n" ..
-        "      out    (node \"sink\" {} : generic-provider.FinalAnswer " ..
-        "-> generic-provider.FinalAnswer)]\n" ..
-        "  (graph worker -> out :terminal out))\n\n" ..
-        ":provider is required — the llm actor fails to construct without " ..
-        "it. Agent loops are unbounded — the agent runs until it emits a " ..
-        "final answer, and that typed final answer is the loop's " ..
-        "terminator; stop a run early via interrupt/kill. " ..
-        "Every program ends in exactly " ..
-        "one sink bound via :terminal. See lib/patterns.md and " ..
-        "lib/templates.mag in the workspace for composition patterns. " ..
+        "Graph and agent semantics live in namespaced MAG libraries. " ..
+        "A program requires nefor.actors, nefor.graph, nefor.contracts, and " ..
+        "nefor.artifact; construct an agent fragment, add an explicit initial " ..
+        "message with nefor.graph.finish, then return " ..
+        "(nefor.artifact.compile program). Agent config requires :id, " ..
+        ":model, :profile, :provider, :system, :tools, and :da-policy. " ..
+        "Pass compiler-checked semantic type witnesses separately from runtime " ..
+        "wire tags; use (type-tag nefor.contracts.Task), wire \"task\", and " ..
+        "an output such as (type-tag nefor.contracts.FinalAnswer). The result boundary is " ..
+        "structural metadata, not a sink actor. Agent loops are unbounded; " ..
+        "stop early via interrupt/kill. See lib/patterns.md and the " ..
+        "lib/nefor/*.mag modules for complete examples. " ..
         "For a one-off shell expression whose result you just need back, " ..
         "use mag-eval instead — no file, no workspace ceremony.\n\n" ..
         "When to dispatch a graph vs work directly: first identify what " ..
@@ -1423,6 +1361,7 @@ local function begin_mag_load(firing_id, action, args, ws)
     kind       = "mag.load",
     id         = load_id,
     source_dir = ws,
+    module_roots = { ws .. "/lib" },
     entry      = args.file,
   })
 end
@@ -1448,10 +1387,11 @@ local function resume_pending_load(body)
   if not pending then return end
   state.pending_mag_load[load_id] = nil
 
-  local modification = body.modification
+  local artifact = body.artifact
+  local modification = type(artifact) == "table" and artifact.data or nil
   if type(modification) ~= "table" then
     emit_tool_result_err(pending.firing_id,
-      "mag " .. pending.action .. ": mag.loaded reply carried no modification")
+      "mag " .. pending.action .. ": mag.loaded reply carried no artifact data")
     return
   end
   local actors = modification.actors or {}
@@ -1480,9 +1420,9 @@ local function resume_pending_load(body)
     return
   end
 
-  local sink_id, sink_err = validate_sink(actors)
-  if not sink_id then
-    emit_tool_result_err(pending.firing_id, "mag execute: " .. sink_err)
+  local terminal_id, result_err = result_actor(modification)
+  if not terminal_id then
+    emit_tool_result_err(pending.firing_id, "mag execute: " .. result_err)
     return
   end
 
@@ -1502,14 +1442,14 @@ local function resume_pending_load(body)
     run_id       = pending.run_id,
     run_name     = pending.run_name,
     session_id   = pending.session_id,
-    modification = modification,
+    artifact     = artifact,
   }
   if next(overlay) ~= nil then
     exec.params_overlay = overlay
   end
   emit_as(SOURCE_NAME, "mag", exec)
 
-  register_active_run(pending.run_id, actors, sink_id, pending.firing_id, pending.run_name)
+  register_active_run(pending.run_id, actors, terminal_id, pending.firing_id, pending.run_name)
 
   emit_tool_result_ok(pending.firing_id, {
     status  = "executing",
@@ -1529,6 +1469,7 @@ local function fail_pending_load(body)
   local pending = type(load_id) == "string" and state.pending_mag_load[load_id] or nil
   if not pending then return end
   state.pending_mag_load[load_id] = nil
+  nefor.log.error("lead-workflow: MAG compilation failed", { message = tostring(body.message) })
   emit_tool_result_err(pending.firing_id,
     "compilation failed:\n" .. tostring(body.message))
 end

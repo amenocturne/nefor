@@ -74,7 +74,9 @@ export NEFOR_CONFIG=test
 
 **Expect:** stdout contains the canonical mock answer (mentions "octopus" + "lighthouse" + "sentinel"-ish framing). Stderr lines `[tool: mag(...)]` for the write + execute calls. Exit 0.
 
-This is the canonical e2e flow: `chat.input.submit` → lead turn-program on the mag kernel → `mag` tool (write, then execute) → kernel run (chained summaries → combine → sink) → deferred relay turn → final answer.
+This is the canonical e2e flow: `chat.input.submit` → lead turn-program on the
+MAG kernel → `mag` tool (write, then execute) → kernel run (chained summaries →
+combine → structural result boundary) → deferred relay turn → final answer.
 
 ### Output format modes
 

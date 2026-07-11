@@ -412,7 +412,43 @@ return {
     if not ctx then
       return { ok = false, error = err }
     end
-    return ctx.observer:apply(mod)
+    local boundary = mod and mod.result and mod.result.from
+    if type(boundary) ~= "table" or type(boundary.actor) ~= "string"
+        or type(boundary.wire) ~= "string" then
+      return { ok = false, error = "initial artifact needs result.from { actor, wire }" }
+    end
+    local source
+    for _, spec in ipairs(mod.actors or {}) do
+      if spec.id == boundary.actor then
+        source = spec
+        break
+      end
+    end
+    if not source then
+      return { ok = false, error = string.format(
+        "result boundary source actor %q does not exist", boundary.actor) }
+    end
+    local declaration = registry:declaration(source.factory)
+    local declared = false
+    for _, output in ipairs((declaration and declaration.outputs) or {}) do
+      if output == boundary.wire then
+        declared = true
+        break
+      end
+    end
+    if not declared then
+      return { ok = false, error = string.format(
+        "result boundary wire %q is not a declared output of actor %q",
+        boundary.wire, boundary.actor) }
+    end
+    ctx.router:set_result_boundary({ actor = boundary.actor, wire = boundary.wire })
+    local modification = {}
+    for key, value in pairs(mod) do
+      if key ~= "result" then
+        modification[key] = value
+      end
+    end
+    return ctx.observer:apply(modification)
   end,
 
   -- Apply one graph modification through a run's fold. Strictly serialized
@@ -495,6 +531,13 @@ return {
   -- the registry (registry.lua).
   registry_names = function()
     return registry:names()
+  end,
+
+  -- Plain-data foreign contracts supplied to MAG compilation as immutable
+  -- input. Qualified identity is the authored/lowered name; implementation is
+  -- retained only so the runtime can bind it to the resident constructor.
+  registry_contracts = function(array_mt)
+    return registry:contracts(array_mt)
   end,
 
   -- Take a run's run-complete signal (one-shot; cleared on read). The host

@@ -69,7 +69,8 @@ Two obligations:
 - `params` — authored plain data from the modification (opaque to the kernel).
 - `emit` — the outbound sink; the instance's whole world for sending.
 - `deps` — kernel-injected capabilities (runtime closures the MAG program can't
-  author, e.g. the sink's output writer). Distinct from `params` by design:
+  author, including the structural result writer). Distinct from `params` by
+  design:
   params are data, deps are the kernel's side-channel.
 
 The instance exposes `deliver(activation) -> completion`.
@@ -94,9 +95,7 @@ the completion status. Reserved emit kinds the kernel intercepts: `mag.ready`
 (the readiness confirm — emitted inside `construct`, which lazy construction
 places at the first activation, so it coincides with beginning work),
 `capability.invoke` (a correlated request), `mag.complete` / `mag.failed`
-(the async completion of a deferred activation), `mag.RunComplete` (the sink's
-terminal completion signal, surfaced to the control plane as the
-`mag.run_complete` lifecycle event), and `mag.ApprovalRequest` /
+(the async completion of a deferred activation), and `mag.ApprovalRequest` /
 `mag.ApprovalCancel` (the human gate's control-plane-bound request/cancel,
 surfaced as the run_id-stamped `mag.approval_request` / `mag.approval_cancel`
 events — see The approval boundary). Kernel-synthesized status
@@ -193,7 +192,7 @@ reason.
 | Reason         | Emitted when                                                                                  |
 | -------------- | --------------------------------------------------------------------------------------------- |
 | `modification` | a kill entry in an applied modification — the mid-run control-plane kill (the default) |
-| `run_complete` | run-context teardown after the sink signalled successful completion                           |
+| `run_complete` | run-context teardown after the selected structural result output was emitted                  |
 | `run_failed`   | run-context teardown after an unhandled actor failure ended the run                           |
 | `killed`       | run-context teardown for an outright kill (`mag.kill_run`)                                    |
 | `reaped`       | session-boundary sweep: a new session's `begin_run` reaped a stale context                    |
@@ -236,7 +235,7 @@ reads exactly this — no alias fallbacks, no shape sniffing.
 | ------------------------------ | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | `generic-tool.ToolCalls`       | llm → run-tool                | `calls = { { id, name, args }, … }`                                                                                                         |
 | `generic-tool.ToolHandle`      | run-tool → tool-result        | `results = { { id, name, output, error }, … }` (index-ordered to the calls)                                                                 |
-| `generic-provider.FinalAnswer` | llm → sink / human            | `result` (raw provider result); `text?`, `final_answer?` (lifted when result is a table)                                                    |
+| `generic-provider.FinalAnswer` | llm → result boundary / human | `result` (raw provider result); `text?`, `final_answer?` (lifted when result is a table)                                                    |
 | `mag.ApprovalRequest`          | human → control plane         | intercepted emit, surfaced as the `mag.approval_request` event: `correlation = <id>`, `prompt?`, `subject` (the input message)              |
 | `mag.ApprovalReply`            | control plane → human         | injected via a `mag.apply` message; delivered as a graph activation tagged `mag.ApprovalReply`, `message = { approved, content?, reason? }` |
 | `mag.ApprovalCancel`           | human (drain) → control plane | intercepted emit, surfaced as the `mag.approval_cancel` event: `correlation = <id>`                                                         |

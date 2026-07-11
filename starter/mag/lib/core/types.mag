@@ -1,0 +1,30 @@
+;; Small algebraic types shared by MAG libraries. These are ordinary nominal
+;; data types; the evaluator has no special knowledge of them.
+
+(type Some [T] {:tag String :value T})
+(type None {:tag String})
+(type Option [T] (| (Some T) None))
+
+(type Left [L] {:tag String :value L})
+(type Right [R] {:tag String :value R})
+(type Either [L R] (| (Left L) (Right R)))
+
+(def some (fn [T] [[value T]] -> (Some T)
+  (as (Some T) {:tag "core.types.Some" :value value})))
+(def none (fn [] -> None (as None {:tag "core.types.None"})))
+(def left (fn [L] [[value L]] -> (Left L)
+  (as (Left L) {:tag "core.types.Left" :value value})))
+(def right (fn [R] [[value R]] -> (Right R)
+  (as (Right R) {:tag "core.types.Right" :value value})))
+
+(def option-map (fn [T U] [[f (Fn T U)] [option (Option T)]] -> (Option U)
+  (as (Option U)
+    (if (= (get option "tag") "core.types.Some")
+      (some (f (get (as (Some T) option) "value")))
+      (none)))))
+
+(def either-map (fn [L T U] [[f (Fn T U)] [either (Either L T)]] -> (Either L U)
+  (as (Either L U)
+    (if (= (get either "tag") "core.types.Right")
+      (right (f (get (as (Right T) either) "value")))
+      (as (Left L) either)))))

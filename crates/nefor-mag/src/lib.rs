@@ -1,140 +1,118 @@
 pub mod ast;
+mod checker;
 pub mod env;
 pub mod error;
 pub mod eval;
-pub mod graph;
-pub mod ir;
 pub mod json;
 pub mod lexer;
 pub mod parser;
 pub mod types;
 
+use ast::{Artifact, Value};
 use env::Env;
 use error::MagError;
-use ir::ModificationIr;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 
-/// Batch compile: parse → evaluate → validate → lower → validate the
-/// modification, returning just the modification. The `mag` CLI dev tool. Runs
-/// unbounded on the caller's stack; the resident, session-bounded path is
-/// [`load`].
-pub fn compile(source: &str, source_dir: &Path) -> Result<ModificationIr, MagError> {
-    let (modification, _env) = compile_resident(source, source_dir)?;
-    Ok(modification)
+const EVALUATION_STEP_LIMIT: u64 = 100_000;
+
+pub fn compile(source: &str, source_dir: &Path) -> Result<Artifact, MagError> {
+    compile_with_inputs(
+        source,
+        source_dir,
+        serde_json::Value::Object(Default::default()),
+    )
 }
 
-/// A loaded program whose environment stays resident for the session. The env
-/// is evaluated exactly once here; because MAG is pure, it is an exact function
-/// of the source snapshot — two loads of the same snapshot produce identical
-/// environments and therefore an identical modification `hash`. Rule functions
-/// are entry points into this retained env, applied by [`eval_fn`].
+pub fn compile_with_inputs(
+    source: &str,
+    source_dir: &Path,
+    inputs: serde_json::Value,
+) -> Result<Artifact, MagError> {
+    compile_with_inputs_and_module_roots(source, source_dir, inputs, &[source_dir.to_path_buf()])
+}
+
+pub fn compile_with_inputs_and_module_roots(
+    source: &str,
+    source_dir: &Path,
+    inputs: serde_json::Value,
+    module_roots: &[std::path::PathBuf],
+) -> Result<Artifact, MagError> {
+    let _fuel = eval::fuel::install(EVALUATION_STEP_LIMIT);
+    let mut env =
+        Env::new_with_stdlib_source_dir_and_module_roots(source_dir, module_roots.to_vec());
+    env.define("inputs", json::json_to_value(&inputs));
+    let exprs = parser::parse(&lexer::tokenize(source)?)?;
+    extract_artifact(eval::eval_program(&mut env, &exprs)?, "top-level program")
+}
+
+#[derive(Debug, Clone)]
 pub struct LoadedProgram {
     pub env: Env,
-    pub modification: ModificationIr,
+    pub artifact: Artifact,
     pub hash: String,
 }
 
-/// Step budget for the whole load pipeline. Generous: loading expands the full
-/// program (agent constellations, module `require`s) once. Shares the fuel
-/// mechanism with rule evaluation; the recursion-depth rail (eval.rs) guards
-/// the stack regardless of this figure.
-const LOAD_BUDGET: u64 = 10_000_000;
-
-/// Step budget for a single rule-function evaluation. A rule maps a node output
-/// into a modification — bounded work. Exceeding it rejects the modification
-/// (see ir.md "Bounded evaluation") rather than hanging the run.
-const EVAL_FN_BUDGET: u64 = 1_000_000;
-
-/// Stack for the dedicated evaluation thread. The interpreter recurses natively
-/// per MAG call; a roomy stack keeps the depth cap (4096) the binding limit and
-/// makes evaluation independent of the caller's stack (a 2 MiB tokio worker in
-/// the plugin, or a test harness thread).
-const EVAL_STACK: usize = 64 * 1024 * 1024;
-
-/// Load a program from `source_dir/entry`, retaining its environment.
-///
-/// The whole pipeline runs on a dedicated large-stack thread under
-/// [`LOAD_BUDGET`], so a pathological (non-terminating) program errors cleanly
-/// instead of overflowing the stack or hanging.
 pub fn load(source_dir: &Path, entry: &str) -> Result<LoadedProgram, MagError> {
-    // Same containment check as `read`/`require`: the entry must stay inside the
-    // workspace (an absolute or `..`-escaping entry, or one reached through a
-    // symlink out of the tree, is rejected before any read).
+    load_with_inputs(
+        source_dir,
+        entry,
+        serde_json::Value::Object(Default::default()),
+    )
+}
+
+pub fn load_with_inputs(
+    source_dir: &Path,
+    entry: &str,
+    inputs: serde_json::Value,
+) -> Result<LoadedProgram, MagError> {
+    load_with_inputs_and_module_roots(source_dir, entry, inputs, &[source_dir.to_path_buf()])
+}
+
+pub fn load_with_inputs_and_module_roots(
+    source_dir: &Path,
+    entry: &str,
+    inputs: serde_json::Value,
+    module_roots: &[std::path::PathBuf],
+) -> Result<LoadedProgram, MagError> {
+    let _fuel = eval::fuel::install(EVALUATION_STEP_LIMIT);
     let path = eval::resolve_workspace_path(source_dir, entry)?;
     let source = std::fs::read_to_string(&path)
         .map_err(|e| MagError::Eval(format!("cannot read program {}: {e}", path.display())))?;
-    run_on_eval_thread(|| {
-        let _budget = eval::fuel::install(LOAD_BUDGET);
-        let (modification, env) = compile_resident(&source, source_dir)?;
-        let hash = modification.hash.clone();
-        Ok(LoadedProgram {
-            env,
-            modification,
-            hash,
-        })
+    let mut env =
+        Env::new_with_stdlib_source_dir_and_module_roots(source_dir, module_roots.to_vec());
+    env.define("inputs", json::json_to_value(&inputs));
+    let exprs = parser::parse(&lexer::tokenize(&source)?)?;
+    let artifact = extract_artifact(eval::eval_program(&mut env, &exprs)?, "top-level program")?;
+    let encoded = serde_json::to_vec(&artifact)
+        .map_err(|e| MagError::Eval(format!("serialize artifact: {e}")))?;
+    let hash = format!("{:x}", Sha256::digest(encoded));
+    Ok(LoadedProgram {
+        env,
+        artifact,
+        hash,
     })
 }
 
-/// Apply the named unary rule function from a loaded program's cached
-/// environment to a JSON node output, returning the modification it produces.
-///
-/// Always runs under [`EVAL_FN_BUDGET`] on the large-stack thread. The input
-/// JSON is lifted to a MAG value, the fn applied, and its returned value lowered
-/// back to a modification, hashed, and validated against the resident env (the
-/// same validator load uses).
 pub fn eval_fn(
     program: &LoadedProgram,
     name: &str,
     input: serde_json::Value,
-) -> Result<ModificationIr, MagError> {
-    run_on_eval_thread(|| {
-        let _budget = eval::fuel::install(EVAL_FN_BUDGET);
-        let arg = json::json_to_value(&input);
-        let result = eval::apply_named(&program.env, name, arg)?;
-        let produced = json::value_to_json(&result)?;
-        let mut modification: ModificationIr = serde_json::from_value(produced).map_err(|e| {
-            MagError::Eval(format!(
-                "rule fn '{name}' did not return a graph modification: {e}"
-            ))
-        })?;
-        ir::finalize_hash(&mut modification);
-        ir::validate_modification(&modification, &program.env)?;
-        Ok(modification)
-    })
+) -> Result<Artifact, MagError> {
+    let _fuel = eval::fuel::install(EVALUATION_STEP_LIMIT);
+    extract_artifact(
+        eval::apply_named(&program.env, name, json::json_to_value(&input))?,
+        &format!("function '{name}'"),
+    )
 }
 
-/// Shared load pipeline that also returns the resident environment. `compile`
-/// discards the env; `load` keeps it.
-fn compile_resident(source: &str, source_dir: &Path) -> Result<(ModificationIr, Env), MagError> {
-    let tokens = lexer::tokenize(source)?;
-    let exprs = parser::parse(&tokens)?;
-    let mut env = Env::new_with_stdlib_and_source_dir(source_dir);
-    let value = eval::eval_program(&mut env, &exprs)?;
-    let graph = graph::extract_graph(value)?;
-    // Authoring-level graph passes stay meaningful over the pre-lowering
-    // representation: single sink, connectivity, dead branches, bounded loops,
-    // edge-type compatibility.
-    graph::validate(&graph)?;
-    let modification = ir::lower(graph)?;
-    ir::validate_modification(&modification, &env)?;
-    Ok((modification, env))
-}
-
-/// Run `f` on a dedicated large-stack thread and return its result. Thread-local
-/// fuel is per-thread, so the budget must be installed *inside* `f` (on the eval
-/// thread), which the callers do.
-fn run_on_eval_thread<T, F>(f: F) -> Result<T, MagError>
-where
-    F: FnOnce() -> Result<T, MagError> + Send,
-    T: Send,
-{
-    std::thread::scope(|scope| {
-        let handle = std::thread::Builder::new()
-            .stack_size(EVAL_STACK)
-            .spawn_scoped(scope, f)
-            .map_err(|e| MagError::Eval(format!("spawn evaluation thread: {e}")))?;
-        handle
-            .join()
-            .map_err(|_| MagError::Eval("evaluation thread panicked".into()))?
-    })
+fn extract_artifact(value: Value, source: &str) -> Result<Artifact, MagError> {
+    match value {
+        Value::Artifact(artifact) => Ok(artifact),
+        Value::Typed(inner, types::MagType::Artifact) => extract_artifact(*inner, source),
+        other => Err(MagError::Eval(format!(
+            "{source} must return Artifact, got {}",
+            other.type_name()
+        ))),
+    }
 }

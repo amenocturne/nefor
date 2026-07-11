@@ -241,9 +241,9 @@ local function install_text_format(gate)
     end
     write_stderr("[tool: " .. tostring(name) .. "(" .. input_preview .. ")]\n")
   end)
-  agentic_workflow.on_tool_end(function(_id, _output, err)
+  agentic_workflow.on_tool_end(function(_id, output, err)
     if err then
-      write_stderr("[tool error]\n")
+      write_stderr("[tool error: " .. tostring(output) .. "]\n")
     end
   end)
 end

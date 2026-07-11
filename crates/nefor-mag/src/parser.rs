@@ -6,22 +6,25 @@ pub fn parse(tokens: &[Token]) -> Result<Vec<Expr>, MagError> {
     let mut pos = 0;
     let mut exprs = Vec::new();
     while pos < tokens.len() {
-        let (expr, next) = parse_expr(tokens, pos)?;
+        let (expr, next) = parse_expr(tokens, pos, 0)?;
         exprs.push(expr);
         pos = next;
     }
     Ok(exprs)
 }
 
-fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Expr, usize), MagError> {
+fn parse_expr(tokens: &[Token], pos: usize, depth: u16) -> Result<(Expr, usize), MagError> {
+    if depth >= 256 {
+        return Err(MagError::Parse("expression nesting limit reached".into()));
+    }
     let token = tokens
         .get(pos)
         .ok_or_else(|| MagError::Parse("unexpected end of input".into()))?;
 
     match token {
-        Token::LParen => parse_list(tokens, pos + 1),
-        Token::LBracket => parse_vector(tokens, pos + 1),
-        Token::LBrace => parse_map(tokens, pos + 1),
+        Token::LParen => parse_list(tokens, pos + 1, depth + 1),
+        Token::LBracket => parse_vector(tokens, pos + 1, depth + 1),
+        Token::LBrace => parse_map(tokens, pos + 1, depth + 1),
 
         Token::RParen | Token::RBracket | Token::RBrace => Err(MagError::Parse(format!(
             "unexpected closing delimiter at position {}",
@@ -45,14 +48,14 @@ fn parse_expr(tokens: &[Token], pos: usize) -> Result<(Expr, usize), MagError> {
     }
 }
 
-fn parse_list(tokens: &[Token], start: usize) -> Result<(Expr, usize), MagError> {
+fn parse_list(tokens: &[Token], start: usize, depth: u16) -> Result<(Expr, usize), MagError> {
     let mut items = Vec::new();
     let mut pos = start;
     loop {
         match tokens.get(pos) {
             Some(Token::RParen) => return Ok((Expr::List(items), pos + 1)),
             Some(_) => {
-                let (expr, next) = parse_expr(tokens, pos)?;
+                let (expr, next) = parse_expr(tokens, pos, depth)?;
                 items.push(expr);
                 pos = next;
             }
@@ -61,14 +64,14 @@ fn parse_list(tokens: &[Token], start: usize) -> Result<(Expr, usize), MagError>
     }
 }
 
-fn parse_vector(tokens: &[Token], start: usize) -> Result<(Expr, usize), MagError> {
+fn parse_vector(tokens: &[Token], start: usize, depth: u16) -> Result<(Expr, usize), MagError> {
     let mut items = Vec::new();
     let mut pos = start;
     loop {
         match tokens.get(pos) {
             Some(Token::RBracket) => return Ok((Expr::Vector(items), pos + 1)),
             Some(_) => {
-                let (expr, next) = parse_expr(tokens, pos)?;
+                let (expr, next) = parse_expr(tokens, pos, depth)?;
                 items.push(expr);
                 pos = next;
             }
@@ -77,15 +80,15 @@ fn parse_vector(tokens: &[Token], start: usize) -> Result<(Expr, usize), MagErro
     }
 }
 
-fn parse_map(tokens: &[Token], start: usize) -> Result<(Expr, usize), MagError> {
+fn parse_map(tokens: &[Token], start: usize, depth: u16) -> Result<(Expr, usize), MagError> {
     let mut pairs = Vec::new();
     let mut pos = start;
     loop {
         match tokens.get(pos) {
             Some(Token::RBrace) => return Ok((Expr::Map(pairs), pos + 1)),
             Some(_) => {
-                let (key, mid) = parse_expr(tokens, pos)?;
-                let (val, next) = parse_expr(tokens, mid)?;
+                let (key, mid) = parse_expr(tokens, pos, depth)?;
+                let (val, next) = parse_expr(tokens, mid, depth)?;
                 pairs.push((key, val));
                 pos = next;
             }

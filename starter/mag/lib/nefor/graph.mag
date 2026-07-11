@@ -1,0 +1,362 @@
+(require "core.validated")
+(require "nefor.contracts")
+
+;; Graphs are plain library data. A port keeps its public semantic MAG type
+;; separate from the foreign actor's runtime wire identity.
+(type Port [T] {:actor String :type (TypeTag T) :wire String})
+(type StoredPort {:actor String :type String :wire String})
+(type Actor {:id String
+             :foreign String
+             :params Data
+             :input StoredPort
+             :outputs (List StoredPort)})
+(type Route [T] {:from (Port T) :to (Port T)})
+(type StoredRoute {:from StoredPort :to StoredPort})
+(type Message {:to String :content Data})
+(type Rule {:on String :fn String})
+(type ResultBoundary {:from StoredPort})
+(type Graph {:actors (List Actor)
+             :routes (List StoredRoute)
+             :messages (List Message)
+             :rules (List Rule)
+             :result ResultBoundary})
+(type Fragment [I O] {:actors (List Actor)
+                      :routes (List StoredRoute)
+                      :input (Port I)
+                      :output (Port O)})
+(type ForeignTypeScheme {:input_tags (List String)
+                         :outputs (List String)})
+(type ForeignContract {:identity String
+                       :type_scheme ForeignTypeScheme})
+(type LowerActor {:id String
+                  :foreign String
+                  :params Data
+                  :routes (Map String (List String))})
+(type LowerMessage {:to String :content Data})
+(type LowerRule {:on String :fn String})
+(type Modification {:actors (List LowerActor)
+                    :messages (List LowerMessage)
+                    :kills (List String)
+                    :rules (List LowerRule)
+                    :result ResultBoundary})
+
+(def port (fn [T] [[actor String] [semantic-type (TypeTag T)] [wire-type String]] -> (Port T)
+  (as (Port T) {:actor actor :type semantic-type :wire wire-type})))
+
+(def store-port (fn [T] [[port (Port T)]] -> StoredPort
+  (as StoredPort {:actor (get port "actor")
+   :type (str (get port "type"))
+   :wire (get port "wire")})))
+
+(def actor (fn [P I O] [[id String] [capability (Foreign P I O)] [params P]
+                [input StoredPort] [outputs (List StoredPort)]] -> Actor
+  (as Actor {:id id :foreign (foreign-id capability)
+   :params (as Data params) :input input :outputs outputs})))
+
+(def route (fn [T] [[from (Port T)] [to (Port T)]] -> (Route T)
+  (as (Route T) {:from from :to to})))
+
+(def store-route (fn [T] [[edge (Route T)]] -> StoredRoute
+  (let [from (get edge "from") to (get edge "to")]
+    (as StoredRoute
+      {:from (as StoredPort {:actor (get from "actor")
+                             :type (str (get from "type"))
+                             :wire (get from "wire")})
+       :to (as StoredPort {:actor (get to "actor")
+                           :type (str (get to "type"))
+                           :wire (get to "wire")})}))))
+(def message (fn [[to String] [content Data]] -> Message
+  (as Message {:to to :content content})))
+(def rule (fn [[on String] [fn-name String]] -> Rule
+  (as Rule {:on on :fn fn-name})))
+
+;; Runtime registry entries contain additional implementation/schema fields.
+;; Project only the structural contract the graph validator consumes.
+(def foreign-contract (fn [[entry Data]] -> ForeignContract
+  (as ForeignContract {:identity (as String (get entry "identity"))
+   :type_scheme
+   {:input_tags
+    (as (List String)
+        (get (get entry "type_scheme") "input_tags"))
+    :outputs
+    (as (List String)
+        (get (get entry "type_scheme") "outputs"))}})))
+
+(def graph (fn [T] [[actors (List Actor)] [routes (List StoredRoute)]
+                 [messages (List Message)] [rules (List Rule)]
+                 [result (Port T)]] -> Graph
+  (as Graph {:actors actors
+   :routes routes
+   :messages messages
+   :rules rules
+   :result (as ResultBoundary
+             {:from (as StoredPort {:actor (get result "actor")
+                                    :type (str (get result "type"))
+                                    :wire (get result "wire")})})})))
+
+;; Compose two single-exit fragments. Fragment construction remains ordinary
+;; list/map work; no graph form or edge syntax is required from the evaluator.
+(def connect (fn [I M O] [[left (Fragment I M)] [right (Fragment M O)]] -> (Fragment I O)
+  (as (Fragment I O) {:actors (concat (get left "actors") (get right "actors"))
+   :routes (concat
+             (concat (get left "routes") (get right "routes"))
+             [(as StoredRoute
+                {:from (as StoredPort
+                         {:actor (get (get left "output") "actor")
+                          :type (str (get (get left "output") "type"))
+                          :wire (get (get left "output") "wire")})
+                 :to (as StoredPort
+                       {:actor (get (get right "input") "actor")
+                        :type (str (get (get right "input") "type"))
+                        :wire (get (get right "input") "wire")})})])
+   :input (get left "input")
+   :output (get right "output")})))
+
+(def finish (fn [I O] [[fragment (Fragment I O)] [messages (List Message)]
+                  [rules (List Rule)]] -> Graph
+  (let [result (get fragment "output")]
+    (as Graph
+      {:actors (get fragment "actors")
+       :routes (get fragment "routes")
+       :messages messages
+       :rules rules
+       :result
+       (as ResultBoundary
+         {:from (as StoredPort
+                  {:actor (get result "actor")
+                   :type (str (get result "type"))
+                   :wire (get result "wire")})})}))))
+
+(def routes-from (fn [[graph Graph] [actor-id String]] -> (List StoredRoute)
+  (filter (fn [[candidate StoredRoute]] -> Bool
+            (= (get (get candidate "from") "actor") actor-id))
+          (get graph "routes"))))
+
+(def actor-routes (fn [[graph Graph] [actor Actor]] -> (Map String (List String))
+  (fold
+    (fn [[routes (Map String (List String))] [edge StoredRoute]]
+        -> (Map String (List String))
+      (let [from (get edge "from")
+            to (get edge "to")
+            wire (get from "wire")
+            old (or (get routes wire) (as (List String) []))]
+        (assoc routes wire (concat old [(get to "actor")]))))
+    (as (Map String (List String)) {})
+    (routes-from graph (get actor "id")))))
+
+(def lower-actor (fn [[graph Graph] [actor Actor]] -> LowerActor
+  (as LowerActor {:id (get actor "id")
+   :foreign (get actor "foreign")
+   :params (get actor "params")
+   :routes (actor-routes graph actor)})))
+
+(def lower-message (fn [[entry Message]] -> LowerMessage
+  (as LowerMessage {:to (get entry "to") :content (get entry "content")})))
+
+(def lower-rule (fn [[entry Rule]] -> LowerRule
+  (as LowerRule {:on (get entry "on") :fn (get entry "fn")})))
+
+;; Local structural checks. Foreign-contract specialization is performed from
+;; the declaration data by the generic MAG type checker before this function
+;; is reached.
+(def actor-id-valid? (fn [[graph Graph] [actor Actor]] -> Bool
+  (= (count
+       (filter (fn [[candidate Actor]] -> Bool
+                 (= (get candidate "id") (get actor "id")))
+               (get graph "actors")))
+     1)))
+
+(def endpoint-exists? (fn [[graph Graph] [port StoredPort]] -> Bool
+  (= (count
+       (filter (fn [[candidate Actor]] -> Bool
+                 (= (get candidate "id") (get port "actor")))
+               (get graph "actors")))
+     1)))
+
+(def output-port-exists? (fn [[graph Graph] [port StoredPort]] -> Bool
+  (= (count
+       (flat-map
+         (fn [[candidate Actor]] -> (List StoredPort)
+           (filter
+             (fn [[output StoredPort]] -> Bool
+               (if (= (get output "actor") (get port "actor"))
+                 (if (= (get output "type") (get port "type"))
+                   (= (get output "wire") (get port "wire"))
+                   false)
+                 false))
+             (get candidate "outputs")))
+         (filter (fn [[candidate Actor]] -> Bool
+                   (= (get candidate "id") (get port "actor")))
+                 (get graph "actors"))))
+     1)))
+
+(def input-port-exists? (fn [[graph Graph] [port StoredPort]] -> Bool
+  (= (count
+       (filter
+         (fn [[candidate Actor]] -> Bool
+           (let [input (get candidate "input")]
+             (if (= (get candidate "id") (get port "actor"))
+               (if (= (get input "type") (get port "type"))
+                 (= (get input "wire") (get port "wire"))
+                 false)
+               false)))
+         (get graph "actors")))
+     1)))
+
+(def route-valid? (fn [[graph Graph] [edge StoredRoute]] -> Bool
+  (if (output-port-exists? graph (get edge "from"))
+    (if (input-port-exists? graph (get edge "to"))
+      (= (get (get edge "from") "type")
+         (get (get edge "to") "type"))
+      false)
+    false)))
+
+(def same-port? (fn [[left StoredPort] [right StoredPort]] -> Bool
+  (if (= (get left "actor") (get right "actor"))
+    (if (= (get left "type") (get right "type"))
+      (= (get left "wire") (get right "wire"))
+      false)
+    false)))
+
+;; A result is a terminal boundary, not a tap. Allowing its source port to
+;; route onward makes the structural result race another consumer at runtime.
+(def result-routed? (fn [[graph Graph]] -> Bool
+  (let [result (get (get graph "result") "from")]
+    (not
+      (= (count
+           (filter
+             (fn [[edge StoredRoute]] -> Bool
+               (same-port? (get edge "from") result))
+             (get graph "routes")))
+         0)))))
+
+(def contains? (fn [T] [[values (List T)] [value T]] -> Bool
+  (= (count (filter (fn [[candidate T]] -> Bool (= candidate value)) values)) 1)))
+
+(def all-in? (fn [T] [[left (List T)] [right (List T)]] -> Bool
+  (= (count
+       (filter (fn [[value T]] -> Bool (not (contains? right value))) left))
+     0)))
+
+(def same-members? (fn [T] [[left (List T)] [right (List T)]] -> Bool
+  (if (all-in? left right) (all-in? right left) false)))
+
+(def actor-output-wires (fn [[actor Actor]] -> (List String)
+  (map (fn [[output StoredPort]] -> String (get output "wire"))
+       (get actor "outputs"))))
+
+(def actor-contract-valid? (fn [[contracts (List ForeignContract)]
+                                 [actor Actor]] -> Bool
+  (= (count
+       (filter
+         (fn [[contract ForeignContract]] -> Bool
+           (if (= (get contract "identity") (get actor "foreign"))
+             (let [scheme (get contract "type_scheme")]
+               (if (contains? (get scheme "input_tags")
+                              (get (get actor "input") "wire"))
+                 (same-members? (actor-output-wires actor)
+                                (get scheme "outputs"))
+                 false))
+             false))
+         contracts))
+     1)))
+
+(def output-covered? (fn [[graph Graph] [output StoredPort]] -> Bool
+  (if (= (count
+           (filter
+             (fn [[edge StoredRoute]] -> Bool
+               (let [from (get edge "from")]
+                 (if (= (get from "actor") (get output "actor"))
+                   (if (= (get from "type") (get output "type"))
+                     (= (get from "wire") (get output "wire"))
+                     false)
+                   false)))
+             (get graph "routes")))
+         0)
+    (let [result (get (get graph "result") "from")]
+      (if (= (get result "actor") (get output "actor"))
+        (if (= (get result "type") (get output "type"))
+          (= (get result "wire") (get output "wire"))
+          false)
+        false))
+    true)))
+
+(def actor-outputs-covered? (fn [[graph Graph] [actor Actor]] -> Bool
+  (= (count
+       (filter (fn [[output StoredPort]] -> Bool (not (output-covered? graph output)))
+               (get actor "outputs")))
+     0)))
+
+(def next-actor-ids (fn [[graph Graph] [actor-id String]] -> (List String)
+  (map
+    (fn [[edge StoredRoute]] -> String (get (get edge "to") "actor"))
+    (routes-from graph actor-id))))
+
+;; Cycle handling is ordinary typed library recursion.
+(def path-to? (fn [[graph Graph] [actor-id String] [target-id String]
+                    [visited (List String)]] -> Bool
+  (if (= actor-id target-id)
+    true
+    (if (contains? visited actor-id)
+      false
+      (not
+        (= (count
+             (filter
+               (fn [[next-id String]] -> Bool
+                 (path-to? graph next-id target-id
+                           (concat visited [actor-id])))
+               (next-actor-ids graph actor-id)))
+           0))))))
+
+(def actor-reaches-result? (fn [[graph Graph] [actor Actor]] -> Bool
+  (path-to? graph
+            (get actor "id")
+            (get (get (get graph "result") "from") "actor")
+            (as (List String) []))))
+
+(def validate (fn [[graph Graph] [contracts (List ForeignContract)]]
+                  -> (core.validated.Validated String Graph)
+  (as (core.validated.Validated String Graph)
+   (let [bad-actors (filter (fn [[actor Actor]] -> Bool
+                             (not (actor-id-valid? graph actor)))
+                           (get graph "actors"))
+        bad-contracts (filter
+                        (fn [[actor Actor]] -> Bool
+                          (not (actor-contract-valid? contracts actor)))
+                        (get graph "actors"))
+        bad-routes (filter (fn [[edge StoredRoute]] -> Bool
+                             (not (route-valid? graph edge)))
+                           (get graph "routes"))
+        uncovered-actors (filter
+                           (fn [[actor Actor]] -> Bool
+                             (not (actor-outputs-covered? graph actor)))
+                           (get graph "actors"))
+        dead-actors (filter (fn [[actor Actor]] -> Bool
+                              (not (actor-reaches-result? graph actor)))
+                            (get graph "actors"))
+        result-ok (output-port-exists? graph (get (get graph "result") "from"))
+        result-routed (result-routed? graph)]
+    (if (= (count bad-actors) 0)
+      (if (= (count bad-contracts) 0)
+        (if (= (count bad-routes) 0)
+          (if (= (count uncovered-actors) 0)
+            (if result-ok
+              (if result-routed
+                (core.validated.invalid ["result boundary output must not also source a route"])
+                (if (= (count dead-actors) 0)
+                  (core.validated.valid graph)
+                  (core.validated.invalid ["every actor must have a path to the result boundary"])))
+              (core.validated.invalid ["result boundary references an unknown actor output"]))
+            (core.validated.invalid ["every foreign output must route or terminate at the result boundary"]))
+          (core.validated.invalid ["graph contains an unknown or incompatible route"]))
+        (core.validated.invalid ["actor foreign identity or wire contract does not match the runtime inventory"]))
+      (core.validated.invalid ["graph actor ids must be unique"]))))))
+
+(def lower (fn [[graph Graph]] -> Modification
+  (as Modification {:actors (map (fn [[actor Actor]] -> LowerActor
+                  (lower-actor graph actor))
+                (get graph "actors"))
+   :messages (map lower-message (get graph "messages"))
+   :kills (as (List String) [])
+   :rules (map lower-rule (get graph "rules"))
+   :result (get graph "result")})))

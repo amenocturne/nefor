@@ -1,44 +1,39 @@
-;; lead-turn.mag — the lead's turn-program.
-;;
-;; Each user message spawns this constellation on the mag kernel; the final
-;; response lands in the sink and the constellation terminates. The chat
-;; outlives turns: agentic-loop (the turn spawner) keeps the canonical
-;; history and seeds it into the lead llm via the params overlay each turn.
-;; Turn-as-function: (history, message) -> response.
-;;
-;; The agent template expands to the unbounded agentic cycle —
-;; lead.entry (adapter) -> lead.llm -> lead.run-tool -> lead.tool-result ->
-;; lead.llm — with the FinalAnswer variant exiting to the sink. The loop
-;; is unbounded: the lead runs until it answers; the user's interrupt
-;; (Esc = kill) is the stop mechanism.
-;;
-;; Spawner-overlaid params (per-actor params overlay on mag.execute, keyed
-;; on the llm actor the entry adapter routes into):
-;;   system            — the lead system prompt (starter/prompts/lead.md +
-;;                       runtime context, via agentic_loop.configure)
-;;   provider / model  — the live /model picker selection
-;;   reasoning_effort  — the configured lead reasoning effort
-;;   history           — the conversation so far, provider-dialect messages
-;;
-;; :tools is authored HERE (config-as-program): this list is the lead's
-;; whole tool surface, riding the tool-gate capability bridge like any
-;; kernel run. write-review stays blocking — lead-workflow defers the
-;; gate's tool.result until the user verdict, which parks the run mid-turn.
+;; Each user message executes one short-lived lead constellation over the
+;; persistent canonical chat history. Runtime-selected provider/model/system
+;; values overlay lead.llm params before execution.
 
-(type mag.Task)
-(type generic-provider.FinalAnswer)
+(require "nefor.actors")
+(require "nefor.artifact")
+(require "nefor.contracts")
+(require "nefor.graph")
 
-(let [lead (agent {:id "lead"
-                   :tools ["read_file"
-                           "read_image"
-                           "instructions"
-                           "edit_file"
-                           "graph-status"
-                           "terminate-graph"
-                           "write-review"
-                           "mag"
-                           "mag-eval"]}
-             : mag.Task -> generic-provider.FinalAnswer)
-      out  (node "sink" {}
-             : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]
-  (graph lead -> out :terminal out))
+(let [lead
+      (nefor.actors.agent
+        (as nefor.actors.AgentConfig {:id "lead"
+         :model nil
+         :profile nil
+         :provider "chatgpt"
+         :system ""
+         :tools ["read_file"
+                 "read_image"
+                 "instructions"
+                 "edit_file"
+                 "graph-status"
+                 "terminate-graph"
+                 "write-review"
+                 "mag"
+                 "mag-eval"]
+         :da-policy nil})
+        (type-tag nefor.contracts.Task)
+        "task"
+        (type-tag nefor.contracts.FinalAnswer))
+      initial
+      (nefor.graph.message
+        "lead.entry"
+        (as Data {:kind "task" :prompt "<initial task text>"}))
+      program
+      (nefor.graph.finish
+        lead
+        [initial]
+        (as (List nefor.graph.Rule) []))]
+  (nefor.artifact.compile program))

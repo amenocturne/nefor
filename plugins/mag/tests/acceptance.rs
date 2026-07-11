@@ -15,7 +15,7 @@
 //!
 //! The graph: TWO agents (`a1.*`, `a2.*`) composed in one modification, each a
 //! full provider loop (`llm → run-tool → tool-result → llm`),
-//! sharing one program `sink`. Each agent is seeded with a
+//! with `a1.llm` declared as the structural result boundary. Each agent is seeded with a
 //! `generic-provider.ProviderOut`, so both fire their `llm` turn straight off
 //! the initial messages with no `adapter` factory needed (the shipped kernel registers
 //! no `adapter`; the entry adapter of the design fixture is elided by seeding
@@ -32,8 +32,8 @@
 //!      aborts (the `<provider>.chat.cancel` envelope observably reaches the
 //!      wire), its late provider reply is voided (no output file), and the
 //!      other agent is unaffected.
-//!   5. The program sink receives the surviving agent's typed result (asserted
-//!      on the persisted sink output).
+//!   5. The structural result boundary receives the surviving agent's typed
+//!      result (asserted inline and on the persisted actor output).
 //!   6. The kernel speaks only its own wire vocabulary: no legacy `dag.*` /
 //!      `graph.*` event appears on the wire.
 //!
@@ -130,8 +130,8 @@ fn body_kind(body: &Map<String, Value>) -> Option<&str> {
 }
 
 /// Build the two-agent modification. Each agent `aN` is a full provider loop:
-/// `aN.llm → aN.run-tool → aN.tool-result → aN.llm`, exiting to the shared
-/// `sink` on `generic-provider.FinalAnswer`. Both `llm`s are seeded with a
+/// `aN.llm → aN.run-tool → aN.tool-result → aN.llm`. `a1.llm` is the declared
+/// result on `generic-provider.FinalAnswer`. Both `llm`s are seeded with a
 /// `generic-provider.ProviderOut` so they fire off the initial messages.
 fn two_agent_modification() -> Value {
     fn agent(prefix: &str) -> Vec<Value> {
@@ -142,7 +142,7 @@ fn two_agent_modification() -> Value {
                 "params": { "model": "opus", "provider": PROVIDER, "system": "work" },
                 "routes": {
                     "generic-tool.ToolCalls": [format!("{prefix}.run-tool")],
-                    "generic-provider.FinalAnswer": ["sink"]
+                    "generic-provider.FinalAnswer": []
                 }
             }),
             json!({
@@ -162,8 +162,6 @@ fn two_agent_modification() -> Value {
 
     let mut actors = agent("a1");
     actors.extend(agent("a2"));
-    actors.push(json!({ "id": "sink", "factory": "sink", "params": {}, "routes": {} }));
-
     json!({
         "actors": actors,
         "messages": [
@@ -171,7 +169,14 @@ fn two_agent_modification() -> Value {
             { "to": "a2.llm", "content": { "kind": "generic-provider.ProviderOut", "messages": [{ "role": "user", "content": "go" }] } }
         ],
         "kills": [],
-        "rules": []
+        "rules": [],
+        "result": {
+            "from": {
+                "actor": "a1.llm",
+                "type": "generic-provider.FinalAnswer",
+                "wire": "generic-provider.FinalAnswer"
+            }
+        }
     })
 }
 
@@ -271,7 +276,13 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
     execute.insert("session_id".into(), Value::String(SESSION_ID.into()));
     execute.insert("run_id".into(), Value::String(RUN_NAME.into()));
     execute.insert("run_name".into(), Value::String(RUN_NAME.into()));
-    execute.insert("modification".into(), two_agent_modification());
+    execute.insert(
+        "artifact".into(),
+        json!({
+            "format": "nefor.graph-modification/v1",
+            "data": two_agent_modification()
+        }),
+    );
     send_event(&mut stdin, execute).await;
 
     // Deterministic event loop. Every action is a reply to an observed event;
@@ -370,7 +381,7 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
                         )
                         .await;
                     }
-                    // a1 turn 2 → final answer; exits the loop to the sink.
+                    // a1 turn 2 → final answer; reaches the structural result boundary.
                     ("a1", 2) => {
                         send_event(
                             &mut stdin,
@@ -492,7 +503,7 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
         );
     }
 
-    // ── SIX STEPS #5: the sink received the survivor's typed result. ────────
+    // ── SIX STEPS #5: the result boundary received the survivor's result. ──
     assert_eq!(
         run_result.get("status").and_then(Value::as_str),
         Some("completed"),
@@ -503,18 +514,23 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
         Some("exec-accept"),
         "run_result correlates to the execute request"
     );
-    let sink_path = run_result
+    assert_eq!(
+        run_result
+            .get("result")
+            .and_then(|result| result.get("text"))
+            .and_then(Value::as_str),
+        Some("final-a1"),
+        "run_result carries the surviving agent's result inline"
+    );
+    let result_path = run_result
         .get("output_path")
         .and_then(Value::as_str)
-        .expect("run_result carries the sink output PATH");
-    let sink_output = std::fs::read_to_string(sink_path).expect("read persisted sink output");
+        .expect("run_result carries the result actor output PATH");
+    let result_output =
+        std::fs::read_to_string(result_path).expect("read persisted result actor output");
     assert!(
-        sink_output.contains("final-a1"),
-        "sink persisted the surviving agent's final answer; got {sink_output:?}"
-    );
-    assert!(
-        node_output("sink").exists(),
-        "the sink's per-node output file was written"
+        result_output.contains("final-a1"),
+        "result actor persisted the surviving agent's final answer; got {result_output:?}"
     );
 
     // ── SIX STEPS #6: only the kernel's own wire vocabulary appears — the

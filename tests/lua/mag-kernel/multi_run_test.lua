@@ -69,8 +69,7 @@ local function by_kind(bodies, kind)
 end
 
 -- ------------------------------------------------------------------
--- the program: one llm exiting straight to the sink (same shape as the
--- plugin-side llm tests). Both runs execute THIS one program.
+-- The program selects the llm's final-answer output structurally.
 -- ------------------------------------------------------------------
 
 local function program()
@@ -80,9 +79,8 @@ local function program()
         id = "agent",
         factory = "llm",
         params = { model = "m", provider = "prov", system = "answer" },
-        routes = { ["generic-provider.FinalAnswer"] = { "sink" } },
+        routes = {},
       },
-      { id = "sink", factory = "sink", params = {}, routes = {} },
     },
     messages = {
       { to = "agent", content = {
@@ -92,6 +90,10 @@ local function program()
     },
     kills = {},
     rules = {},
+    result = { from = {
+      actor = "agent",
+      wire = "generic-provider.FinalAnswer",
+    } },
   }
 end
 
@@ -158,9 +160,8 @@ assert_eq(b_invoke.args.chat_id, "r2/agent@r1",
 -- spawn/ready events fired for run-B (no duplicate-alive degradation), and
 -- run-A saw no kill.
 assert_eq(kernel.state_of("run-A", "agent"), "alive", "run-A agent survives run-B start")
-assert_eq(kernel.state_of("run-A", "sink"), "alive", "run-A sink survives run-B start")
 assert_eq(kernel.state_of("run-B", "agent"), "alive", "run-B agent constructs independently")
-assert_eq(#by_kind(b_wire, "mag.actor_spawned"), 2, "run-B spawns its own constellation")
+assert_eq(#by_kind(b_wire, "mag.actor_spawned"), 1, "run-B spawns its own constellation")
 assert_eq(#by_kind(b_wire, "mag.actor_killed"), 0, "run-B start kills nothing")
 
 -- ==================================================================
@@ -193,7 +194,7 @@ for _, e in ipairs(by_kind(b_teardown, "mag.actor_killed")) do
     "post-complete teardown kills carry reason run_complete")
   b_killed[e.id] = true
 end
-assert_true(b_killed["agent"] and b_killed["sink"], "run-B's leftovers are reaped")
+assert_true(b_killed["agent"], "run-B's leftovers are reaped")
 assert_true(kernel.context("run-B") == nil, "run-B context dropped")
 assert_eq(kernel.state_of("run-A", "agent"), "alive", "run-A untouched by run-B teardown")
 
@@ -231,8 +232,9 @@ assert_eq(kernel.bus_response({ id = c_invoke.id, result = { text = "answer-C" }
 assert_true(kernel.take_run_complete("run-C") ~= nil, "run-C completes")
 drain_emitted()
 kernel.end_run("run-C", "run_complete")
--- An end_run with no reason is an outright kill (the mag.kill_run path):
--- its teardown kills carry reason "killed".
+-- An end_run with no reason is an outright kill (the mag.kill_run path).
+-- run-A's only actor was already killed by the modification, so teardown must
+-- not emit a duplicate actor_killed event for it.
 kernel.end_run("run-A")
 local kill_teardown = drain_emitted()
 local reasons = {}
@@ -240,7 +242,7 @@ for _, e in ipairs(by_kind(kill_teardown, "mag.actor_killed")) do
   reasons[e.run_id] = e.reason
 end
 assert_eq(reasons["run-C"], "run_complete", "run-C teardown carries its reason")
-assert_eq(reasons["run-A"], "killed", "kill_run-path teardown carries reason killed")
+assert_eq(reasons["run-A"], nil, "kill_run does not re-kill an actor already removed")
 
 -- ==================================================================
 -- (f) session-boundary reaping: a new session's begin_run reaps stale

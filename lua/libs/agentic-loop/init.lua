@@ -76,12 +76,12 @@ local state = {
   },
 
   -- The shipped turn-program. `source_dir`/`entry` are composition-owned
-  -- (configure { lead_program = … }); the modification is loaded once per
+  -- (configure { lead_program = … }); the artifact is loaded once per
   -- session through the mag plugin and cached here, then cloned per turn.
   lead_program = {
     source_dir = nil,   ---@type string|nil  resolved lazily (NEFOR_CONFIG_DIR)
     entry      = "agentic-loop/lead-turn.mag",
-    modification = nil, ---@type table|nil   cached compiled modification
+    artifact    = nil,   ---@type table|nil   cached compiled artifact
     hash       = nil,   ---@type string|nil
     entry_actor = nil,  ---@type string|nil  the task message's target
     llm_actor  = nil,   ---@type string|nil  the overlay/binding target
@@ -387,16 +387,18 @@ end
 -- mag.loaded reply caches the modification and flushes queued submits.
 local function ensure_lead_program_loaded()
   local p = state.lead_program
-  if p.modification ~= nil or p.load_id ~= nil then return end
+  if p.artifact ~= nil or p.load_id ~= nil then return end
   p.load_id = "lead-turn-load-" .. envelope.uuid_lite()
+  local source_dir = lead_program_source_dir()
   emit("mag", {
     kind       = "mag.load",
     id         = p.load_id,
-    source_dir = lead_program_source_dir(),
+    source_dir = source_dir,
+    module_roots = { source_dir .. "/mag/lib" },
     entry      = p.entry,
   })
   nefor.log.info("agentic-loop: loading lead turn-program", {
-    source_dir = lead_program_source_dir(), entry = p.entry,
+    source_dir = source_dir, entry = p.entry,
   })
 end
 
@@ -406,11 +408,12 @@ local function handle_lead_program_loaded(body)
   local p = state.lead_program
   if body.in_reply_to ~= p.load_id then return end
   p.load_id = nil
-  local modification = body.modification
+  local artifact = body.artifact
+  local modification = type(artifact) == "table" and artifact.data or nil
   if type(modification) ~= "table" then
     emit("nefor-tui", {
       kind = "chat.message.append", role = "system",
-      text = "[lead turn-program load carried no modification]",
+      text = "[lead turn-program load carried no artifact data]",
     })
     return
   end
@@ -422,7 +425,7 @@ local function handle_lead_program_loaded(body)
     })
     return
   end
-  p.modification = modification
+  p.artifact = artifact
   p.hash = body.hash
   p.entry_actor = seams.entry_actor
   p.llm_actor = seams.llm_actor
@@ -450,7 +453,7 @@ end
 local function submit_orchestrator_run(user_text)
   if state.current_run_id ~= nil then return nil end
   local p = state.lead_program
-  if p.modification == nil then
+  if p.artifact == nil then
     -- Program not compiled yet: queue the text and (re)kick the load; the
     -- mag.loaded reply flushes the queue.
     state.pending_user_inputs[#state.pending_user_inputs + 1] = user_text
@@ -458,7 +461,8 @@ local function submit_orchestrator_run(user_text)
     return nil
   end
 
-  local mod = deep_clone(p.modification)
+  local artifact = deep_clone(p.artifact)
+  local mod = artifact.data
   for _, msg in ipairs(mod.messages or {}) do
     if msg.to == p.entry_actor and type(msg.content) == "table" then
       msg.content.prompt = user_text
@@ -505,7 +509,7 @@ local function submit_orchestrator_run(user_text)
     run_id         = run_id,
     run_name       = "lead",
     session_id     = sessions.current_id(),
-    modification   = mod,
+    artifact       = artifact,
     params_overlay = { [p.llm_actor] = overlay_params },
   })
   nefor.log.info("agentic-loop: lead turn submitted to mag kernel", {
@@ -1306,7 +1310,7 @@ M._internals  = {
     state.lead_program = {
       source_dir = nil,
       entry = "agentic-loop/lead-turn.mag",
-      modification = nil,
+      artifact = nil,
       hash = nil,
       entry_actor = nil,
       llm_actor = nil,

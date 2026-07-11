@@ -1,0 +1,23 @@
+(require "core.validated")
+(require "nefor.graph")
+
+(def format "nefor.graph-modification/v1")
+
+;; Validation and lowering are explicit library calls. The host recognizes
+;; only the final Artifact wrapper.
+(def compile (fn [[graph nefor.graph.Graph]]
+                 -> Artifact
+  (let [checked (nefor.graph.validate
+                  graph
+                  (map nefor.graph.foreign-contract
+                       (as (List Data)
+                           (get (as (Map String Data) inputs)
+                                "foreign_contracts"))))
+        checked-tag (get checked "tag")]
+    (if (= checked-tag "core.validated.Valid")
+      (artifact format
+        (nefor.graph.lower
+          (get (as (core.validated.Valid nefor.graph.Graph) checked)
+               "value")))
+      (let [ignored (fail checked)]
+        (artifact format {}))))))

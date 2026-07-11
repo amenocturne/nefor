@@ -58,6 +58,7 @@ const PLUGIN_NAME: &str = "mag";
 
 /// Plugin version, advertised in `mag.hello`.
 const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
+const GRAPH_MODIFICATION_FORMAT: &str = "nefor.graph-modification/v1";
 
 /// Liveness ping we answer, and the reply kind.
 const PING_KIND: &str = "mag.ping";
@@ -71,7 +72,6 @@ const LOADED_KIND: &str = "mag.loaded";
 /// Evaluate a named rule fn against a node output over the cached program;
 /// reply with the produced modification (`mag.modification`).
 const EVAL_KIND: &str = "mag.eval";
-const MODIFICATION_KIND: &str = "mag.modification";
 
 /// Reply kind for a load/eval failure. A rejected modification or a load error
 /// is data on the bus, not a plugin crash (ir.md: "the run continues").
@@ -187,9 +187,13 @@ async fn run() -> Result<(), MagError> {
     // reasoner/factory types on both execute paths (replaces a hand-synced
     // allowlist; docs/ir.md division-of-responsibility).
     let factories = host.registry_names().unwrap_or_default();
+    let contracts = host.registry_contracts().unwrap_or_else(|error| {
+        tracing::warn!(%error, "failed to serialize registry contracts");
+        Value::Array(Vec::new())
+    });
     send_event(
         &out_tx,
-        hello_body(host.kernel_name().as_deref(), &factories),
+        hello_body(host.kernel_name().as_deref(), &factories, contracts),
     )
     .await?;
 
@@ -465,22 +469,78 @@ async fn handle_load(
         Some(s) => s,
         None => return send_event(out_tx, error_body(in_reply_to, "mag.load missing entry")).await,
     };
+    let module_roots = match load_module_roots(body, Path::new(source_dir)) {
+        Ok(roots) => roots,
+        Err(error) => return send_event(out_tx, error_body(in_reply_to, &error)).await,
+    };
 
-    match nefor_mag::load(Path::new(source_dir), entry) {
+    let contracts = host
+        .registry_contracts()
+        .unwrap_or_else(|_| Value::Array(Vec::new()));
+    let inputs = serde_json::json!({ "foreign_contracts": contracts });
+    match nefor_mag::load_with_inputs_and_module_roots(
+        Path::new(source_dir),
+        entry,
+        inputs,
+        &module_roots,
+    ) {
         Ok(loaded) => {
             // The registry's factory names ride along so the control plane can
             // validate reasoner/factory types against the kernel's source of
             // truth instead of a hand-synced allowlist.
             let factories = host.registry_names().unwrap_or_default();
-            let reply = match serde_json::to_value(&loaded.modification) {
-                Ok(m) => loaded_body(in_reply_to, &loaded.hash, m, &factories),
-                Err(e) => error_body(in_reply_to, &format!("modification serialize: {e}")),
+            let contracts = host
+                .registry_contracts()
+                .unwrap_or_else(|_| Value::Array(Vec::new()));
+            let reply = match serde_json::to_value(&loaded.artifact) {
+                Ok(artifact) => {
+                    loaded_body(in_reply_to, &loaded.hash, artifact, &factories, contracts)
+                }
+                Err(e) => error_body(in_reply_to, &format!("artifact serialize: {e}")),
             };
             *program = Some(loaded);
             send_event(out_tx, reply).await
         }
         Err(e) => send_event(out_tx, error_body(in_reply_to, &e.to_string())).await,
     }
+}
+
+fn load_module_roots(body: &Map<String, Value>, source_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let requested = match body.get("module_roots") {
+        None => return Ok(vec![source_dir.to_path_buf()]),
+        Some(Value::Array(roots)) => roots,
+        Some(_) => return Err("mag.load module_roots must be an array of paths".to_owned()),
+    };
+    let source = source_dir
+        .canonicalize()
+        .map_err(|error| format!("mag.load source_dir cannot be resolved: {error}"))?;
+    requested
+        .iter()
+        .map(|root| {
+            let raw = root
+                .as_str()
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| {
+                    "mag.load module_roots entries must be non-empty strings".to_owned()
+                })?;
+            let path = PathBuf::from(raw);
+            let relative = !path.is_absolute();
+            let candidate = if relative { source.join(path) } else { path };
+            let canonical = candidate.canonicalize().map_err(|error| {
+                format!(
+                    "mag.load module root {} cannot be resolved: {error}",
+                    candidate.display()
+                )
+            })?;
+            if relative && !canonical.starts_with(&source) {
+                return Err(format!(
+                    "mag.load relative module root {} escapes source_dir",
+                    raw
+                ));
+            }
+            Ok(canonical)
+        })
+        .collect()
 }
 
 /// Run a program through the kernel. The modification is taken inline from the
@@ -503,25 +563,21 @@ async fn handle_execute(
     active: &mut ActiveExecutes,
     bridge: &mut CapabilityBridge,
 ) -> Result<(), MagError> {
-    let mut modification: Value = match body.get("modification") {
-        Some(m @ Value::Object(_)) => m.clone(),
-        Some(_) => {
-            return send_event(
-                out_tx,
-                error_body(in_reply_to, "mag.execute modification must be an object"),
-            )
-            .await
-        }
+    let mut modification: Value = match body.get("artifact") {
+        Some(artifact) => match artifact_modification(artifact) {
+            Ok(m) => m,
+            Err(error) => return send_event(out_tx, error_body(in_reply_to, &error)).await,
+        },
         None => match program {
-            Some(p) => match serde_json::to_value(&p.modification) {
-                Ok(m) => m,
+            Some(p) => match serde_json::to_value(&p.artifact) {
+                Ok(artifact) => match artifact_modification(&artifact) {
+                    Ok(m) => m,
+                    Err(error) => return send_event(out_tx, error_body(in_reply_to, &error)).await,
+                },
                 Err(e) => {
                     return send_event(
                         out_tx,
-                        error_body(
-                            in_reply_to,
-                            &format!("resident modification serialize: {e}"),
-                        ),
+                        error_body(in_reply_to, &format!("resident artifact serialize: {e}")),
                     )
                     .await
                 }
@@ -531,7 +587,7 @@ async fn handle_execute(
                     out_tx,
                     error_body(
                         in_reply_to,
-                        "mag.execute before any mag.load and no inline modification",
+                        "mag.execute before any mag.load and no inline artifact",
                     ),
                 )
                 .await
@@ -963,10 +1019,10 @@ async fn handle_eval(
     };
 
     match nefor_mag::eval_fn(loaded, name, input) {
-        Ok(modification) => {
-            let reply = match serde_json::to_value(&modification) {
-                Ok(m) => modification_body(in_reply_to, m),
-                Err(e) => error_body(in_reply_to, &format!("modification serialize: {e}")),
+        Ok(artifact) => {
+            let reply = match serde_json::to_value(&artifact) {
+                Ok(value) => artifact_body(in_reply_to, value),
+                Err(e) => error_body(in_reply_to, &format!("artifact serialize: {e}")),
             };
             send_event(out_tx, reply).await
         }
@@ -976,7 +1032,7 @@ async fn handle_eval(
 
 // ---- static body constructors ----------------------------------------------
 
-fn hello_body(kernel: Option<&str>, factories: &[String]) -> Map<String, Value> {
+fn hello_body(kernel: Option<&str>, factories: &[String], contracts: Value) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("kind".into(), Value::String(format!("{PLUGIN_NAME}.hello")));
     m.insert("version".into(), Value::String(PLUGIN_VERSION.into()));
@@ -989,6 +1045,7 @@ fn hello_body(kernel: Option<&str>, factories: &[String]) -> Map<String, Value> 
         "factories".into(),
         Value::Array(factories.iter().cloned().map(Value::String).collect()),
     );
+    m.insert("foreign_contracts".into(), contracts);
     m
 }
 
@@ -1004,8 +1061,9 @@ fn pong_body(in_reply_to: Option<&str>) -> Map<String, Value> {
 fn loaded_body(
     in_reply_to: Option<&str>,
     hash: &str,
-    modification: Value,
+    artifact: Value,
     factories: &[String],
+    contracts: Value,
 ) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("kind".into(), Value::String(LOADED_KIND.into()));
@@ -1013,18 +1071,57 @@ fn loaded_body(
         m.insert("in_reply_to".into(), Value::String(id.to_owned()));
     }
     m.insert("hash".into(), Value::String(hash.to_owned()));
-    m.insert("modification".into(), modification);
+    m.insert("artifact".into(), artifact);
     // The kernel registry's factory names — the control plane's validation
     // source of truth for reasoner/factory types.
     m.insert(
         "factories".into(),
         Value::Array(factories.iter().cloned().map(Value::String).collect()),
     );
+    m.insert("foreign_contracts".into(), contracts);
     m
 }
 
-/// Terminal run reply on success: status, the sink's final result INLINE
-/// (`result` — text/kind/structured payload, exactly what the sink signalled
+/// Validate the generic host artifact boundary and bind qualified foreign
+/// actor identities to the kernel's existing `factory` field. The kernel sees
+/// the same graph-modification IR and therefore retains all firing, lifecycle,
+/// and defensive contract checks unchanged.
+fn artifact_modification(artifact: &Value) -> Result<Value, String> {
+    let object = artifact
+        .as_object()
+        .ok_or_else(|| "mag.execute artifact must be an object".to_owned())?;
+    let format = object
+        .get("format")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "mag.execute artifact missing string format".to_owned())?;
+    if format != GRAPH_MODIFICATION_FORMAT {
+        return Err(format!("unsupported MAG artifact format {format:?}"));
+    }
+    let mut data = object
+        .get("data")
+        .and_then(Value::as_object)
+        .cloned()
+        .ok_or_else(|| "mag.execute artifact data must be an object".to_owned())?;
+    if let Some(actors) = data.get_mut("actors").and_then(Value::as_array_mut) {
+        for actor in actors {
+            let spec = actor
+                .as_object_mut()
+                .ok_or_else(|| "artifact actors must be objects".to_owned())?;
+            if let Some(foreign) = spec.remove("foreign") {
+                if !foreign.is_string() {
+                    return Err("artifact actor foreign identity must be a string".to_owned());
+                }
+                if spec.insert("factory".to_owned(), foreign).is_some() {
+                    return Err("artifact actor cannot declare both foreign and factory".to_owned());
+                }
+            }
+        }
+    }
+    Ok(Value::Object(data))
+}
+
+/// Terminal run reply on success: status, the declared boundary result INLINE
+/// (`result` — text/kind/structured payload, exactly what the boundary signalled
 /// on `mag.run_complete`), and the persisted output PATH when the kernel's
 /// writer landed one. `persisted` reflects an actual write (an output path
 /// exists), not merely a wired writer.
@@ -1096,13 +1193,13 @@ fn applied_body(in_reply_to: Option<&str>, ok: bool, error: Option<&str>) -> Map
     m
 }
 
-fn modification_body(in_reply_to: Option<&str>, modification: Value) -> Map<String, Value> {
+fn artifact_body(in_reply_to: Option<&str>, artifact: Value) -> Map<String, Value> {
     let mut m = Map::new();
-    m.insert("kind".into(), Value::String(MODIFICATION_KIND.into()));
+    m.insert("kind".into(), Value::String("mag.artifact".into()));
     if let Some(id) = in_reply_to {
         m.insert("in_reply_to".into(), Value::String(id.to_owned()));
     }
-    m.insert("modification".into(), modification);
+    m.insert("artifact".into(), artifact);
     m
 }
 
@@ -1153,7 +1250,12 @@ mod tests {
 
     #[test]
     fn hello_body_advertises_version_and_kernel() {
-        let b = hello_body(Some("mag-kernel"), &["sink".to_owned(), "llm".to_owned()]);
+        let contracts = serde_json::json!([{"identity": "nefor.factory.llm"}]);
+        let b = hello_body(
+            Some("mag-kernel"),
+            &["sink".to_owned(), "llm".to_owned()],
+            contracts,
+        );
         assert_eq!(b.get("kind").and_then(Value::as_str), Some("mag.hello"));
         assert_eq!(
             b.get("version").and_then(Value::as_str),
@@ -1165,11 +1267,12 @@ mod tests {
             .and_then(Value::as_array)
             .expect("hello advertises factories");
         assert!(factories.iter().any(|f| f.as_str() == Some("sink")));
+        assert_eq!(b["foreign_contracts"][0]["identity"], "nefor.factory.llm");
     }
 
     #[test]
     fn hello_body_omits_kernel_when_absent() {
-        let b = hello_body(None, &[]);
+        let b = hello_body(None, &[], Value::Array(Vec::new()));
         assert!(b.get("kernel").is_none());
         // Factories always present, even when empty.
         assert_eq!(
@@ -1193,33 +1296,129 @@ mod tests {
     }
 
     #[test]
-    fn loaded_body_carries_hash_and_modification() {
+    fn loaded_body_carries_hash_and_artifact() {
         let b = loaded_body(
             Some("load-1"),
             "sha256:abc",
-            serde_json::json!({"actors": []}),
+            serde_json::json!({"format": GRAPH_MODIFICATION_FORMAT, "data": {"actors": []}}),
             &["stub".to_owned(), "sink".to_owned()],
+            serde_json::json!([{"identity": "nefor.factory.stub"}]),
         );
         assert_eq!(b.get("kind").and_then(Value::as_str), Some("mag.loaded"));
         assert_eq!(b.get("in_reply_to").and_then(Value::as_str), Some("load-1"));
         assert_eq!(b.get("hash").and_then(Value::as_str), Some("sha256:abc"));
-        assert!(b.get("modification").and_then(Value::as_object).is_some());
+        assert!(b.get("artifact").and_then(Value::as_object).is_some());
         let factories = b
             .get("factories")
             .and_then(Value::as_array)
             .expect("factories");
         assert!(factories.iter().any(|f| f.as_str() == Some("sink")));
+        assert_eq!(b["foreign_contracts"][0]["identity"], "nefor.factory.stub");
     }
 
     #[test]
-    fn modification_body_names_the_kind() {
-        let b = modification_body(None, serde_json::json!({"kills": ["x"]}));
+    fn load_module_roots_default_to_source_dir_only() {
+        let source = std::env::temp_dir().join(format!("mag-roots-default-{}", std::process::id()));
+        std::fs::create_dir_all(&source).expect("source dir");
+        let roots = load_module_roots(&Map::new(), &source).expect("default roots");
+        assert_eq!(roots, vec![source.clone()]);
+        std::fs::remove_dir_all(source).ok();
+    }
+
+    #[test]
+    fn load_module_roots_accept_explicit_absolute_and_contained_roots() {
+        let source =
+            std::env::temp_dir().join(format!("mag-roots-explicit-{}", std::process::id()));
+        let contained = source.join("lib");
+        let external =
+            std::env::temp_dir().join(format!("mag-roots-external-{}", std::process::id()));
+        std::fs::create_dir_all(&contained).expect("contained root");
+        std::fs::create_dir_all(&external).expect("external root");
+        let body = serde_json::json!({"module_roots": ["lib", external.to_string_lossy()]})
+            .as_object()
+            .cloned()
+            .expect("body");
+        let roots = load_module_roots(&body, &source).expect("explicit roots");
         assert_eq!(
-            b.get("kind").and_then(Value::as_str),
-            Some("mag.modification")
+            roots[0],
+            contained.canonicalize().expect("contained canonical")
         );
+        assert_eq!(
+            roots[1],
+            external.canonicalize().expect("external canonical")
+        );
+        std::fs::remove_dir_all(source).ok();
+        std::fs::remove_dir_all(external).ok();
+    }
+
+    #[test]
+    fn load_module_roots_reject_relative_escape() {
+        let source = std::env::temp_dir().join(format!("mag-roots-escape-{}", std::process::id()));
+        std::fs::create_dir_all(&source).expect("source dir");
+        let body = serde_json::json!({"module_roots": [".."]})
+            .as_object()
+            .cloned()
+            .expect("body");
+        assert!(load_module_roots(&body, &source)
+            .expect_err("escape rejected")
+            .contains("escapes source_dir"));
+        std::fs::remove_dir_all(source).ok();
+    }
+
+    #[test]
+    fn artifact_boundary_normalizes_qualified_foreign_identity() {
+        let artifact = serde_json::json!({
+            "format": GRAPH_MODIFICATION_FORMAT,
+            "data": {
+                "actors": [{"id": "answer", "foreign": "nefor.factory.llm"}],
+                "messages": [], "kills": [], "rules": []
+            }
+        });
+        let modification = artifact_modification(&artifact).expect("valid artifact");
+        assert_eq!(modification["actors"][0]["factory"], "nefor.factory.llm");
+        assert!(modification["actors"][0].get("foreign").is_none());
+    }
+
+    #[test]
+    fn artifact_boundary_preserves_structural_result_metadata() {
+        let artifact = serde_json::json!({
+            "format": GRAPH_MODIFICATION_FORMAT,
+            "data": {
+                "actors": [{"id": "answer", "foreign": "nefor.factory.llm", "routes": {}}],
+                "messages": [], "kills": [], "rules": [],
+                "result": {"from": {
+                    "actor": "answer",
+                    "type": "audit.CodeAudit",
+                    "wire": "generic-provider.FinalAnswer"
+                }}
+            }
+        });
+        let modification = artifact_modification(&artifact).expect("valid artifact");
+        assert_eq!(modification["result"]["from"]["actor"], "answer");
+        assert_eq!(
+            modification["result"]["from"]["wire"],
+            "generic-provider.FinalAnswer"
+        );
+        assert_eq!(modification["actors"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn artifact_boundary_rejects_unknown_format() {
+        let artifact = serde_json::json!({"format": "other/v1", "data": {}});
+        assert!(artifact_modification(&artifact)
+            .expect_err("format must be rejected")
+            .contains("unsupported MAG artifact format"));
+    }
+
+    #[test]
+    fn artifact_body_names_the_kind() {
+        let b = artifact_body(
+            None,
+            serde_json::json!({"format": GRAPH_MODIFICATION_FORMAT, "data": {}}),
+        );
+        assert_eq!(b.get("kind").and_then(Value::as_str), Some("mag.artifact"));
         assert!(b.get("in_reply_to").is_none());
-        assert!(b.get("modification").is_some());
+        assert!(b.get("artifact").is_some());
     }
 
     #[test]

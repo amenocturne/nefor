@@ -3,11 +3,11 @@
 //! (starter/agentic-loop) drives it:
 //!
 //!   * `mag.load` the shipped program from the starter tree, take the
-//!     compiled modification off `mag.loaded`;
+//!     compiled artifact off `mag.loaded`;
 //!   * per turn, clone it — point the initial `mag.Task` at the user
 //!     message — and overlay `{ system, provider, model, history }` onto
 //!     the lead llm actor via `params_overlay`;
-//!   * `mag.execute` with the modification inline.
+//!   * `mag.execute` with the artifact inline.
 //!
 //! Test 1 (full turn + seeded history): a turn runs user message → kernel
 //! run (scope-carrying `mag.run_started`) → gated tool round-trip
@@ -108,6 +108,9 @@ async fn next_event_of_kind<R: AsyncBufReadExt + Unpin>(
         if body.get("kind").and_then(Value::as_str) == Some(kind) {
             return body;
         }
+        if body.get("kind").and_then(Value::as_str) == Some("mag.error") {
+            panic!("mag.error while expecting {kind}: {body:?}");
+        }
     }
 }
 
@@ -165,7 +168,7 @@ fn obj(v: Value) -> Map<String, Value> {
     v.as_object().expect("object").clone()
 }
 
-/// Load the shipped lead turn-program and return its compiled modification.
+/// Load the shipped lead turn-program and return its compiled artifact.
 async fn load_lead_program<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,
     stdin: &mut ChildStdin,
@@ -176,6 +179,7 @@ async fn load_lead_program<R: AsyncBufReadExt + Unpin>(
             "kind": "mag.load",
             "id": "lead-turn-load",
             "source_dir": starter_dir().to_string_lossy(),
+            "module_roots": [starter_dir().join("mag/lib").to_string_lossy()],
             "entry": "agentic-loop/lead-turn.mag",
         })),
     )
@@ -186,17 +190,18 @@ async fn load_lead_program<R: AsyncBufReadExt + Unpin>(
         Some("lead-turn-load")
     );
     loaded
-        .get("modification")
+        .get("artifact")
         .cloned()
-        .expect("mag.loaded carries the compiled modification")
+        .expect("mag.loaded carries the compiled artifact")
 }
 
-/// The spawner's per-turn clone: point the initial mag.Task at the user
+/// The spawner's per-turn clone: point the initial task at the user
 /// message.
-fn turn_modification(program: &Value, user_text: &str) -> Value {
+fn turn_artifact(program: &Value, user_text: &str) -> Value {
     let mut m = program.clone();
     let messages = m
-        .get_mut("messages")
+        .get_mut("data")
+        .and_then(|data| data.get_mut("messages"))
         .and_then(Value::as_array_mut)
         .expect("program has messages");
     for msg in messages {
@@ -207,12 +212,12 @@ fn turn_modification(program: &Value, user_text: &str) -> Value {
     m
 }
 
-/// The spawner's per-turn execute: modification inline + the config/history
+/// The spawner's per-turn execute: artifact inline + the config/history
 /// overlay on the lead llm actor.
 fn execute_body(
     exec_id: &str,
     run_id: &str,
-    modification: Value,
+    artifact: Value,
     history: Value,
 ) -> Map<String, Value> {
     obj(json!({
@@ -221,7 +226,7 @@ fn execute_body(
         "run_id": run_id,
         "run_name": "lead",
         "session_id": SESSION_ID,
-        "modification": modification,
+        "artifact": artifact,
         "params_overlay": {
             "lead.llm": {
                 "system": LEAD_SYSTEM,
@@ -269,7 +274,7 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         execute_body(
             "exec-turn-1",
             "lead-run-1",
-            turn_modification(&program, "what is in the repo?"),
+            turn_artifact(&program, "what is in the repo?"),
             json!([]),
         ),
     )
@@ -419,7 +424,7 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         execute_body(
             "exec-turn-2",
             "lead-run-2",
-            turn_modification(&program, "and what else?"),
+            turn_artifact(&program, "and what else?"),
             json!([
                 { "role": "user", "content": "what is in the repo?" },
                 { "role": "assistant", "content": "the repo holds nefor" }
@@ -477,7 +482,7 @@ async fn kill_run_cancels_the_provider_round_and_settles_killed() {
         execute_body(
             "exec-killed",
             "lead-run-killed",
-            turn_modification(&program, "long-running question"),
+            turn_artifact(&program, "long-running question"),
             json!([]),
         ),
     )
@@ -587,7 +592,7 @@ async fn interrupt_run_settles_inflight_tool_and_lead_winds_down_completed() {
         execute_body(
             "exec-interrupt",
             "lead-run-interrupt",
-            turn_modification(&program, "read a big file for me"),
+            turn_artifact(&program, "read a big file for me"),
             json!([]),
         ),
     )
@@ -752,7 +757,7 @@ async fn terminating_interrupt_cancels_inflight_tool_and_settles_failed_without_
         execute_body(
             "exec-terminate",
             "sub-run-terminate",
-            turn_modification(&program, "read a big file for me"),
+            turn_artifact(&program, "read a big file for me"),
             json!([]),
         ),
     )

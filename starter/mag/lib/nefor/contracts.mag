@@ -1,0 +1,65 @@
+;; Runtime-facing data and capability contracts. Foreign identities are
+;; qualified independently of this module so the same names bind in artifacts
+;; and the runtime registry.
+
+(require "core.types")
+
+(type Task {:prompt String})
+(type ProviderInput {:content String})
+(type FinalAnswer {:content String})
+(type ToolCall {:name String :arguments (Map String String)})
+(type ToolCalls {:calls (List ToolCall)})
+(type ToolHandle {:call ToolCall})
+(type ToolResult {:content String})
+(type Approved {:content String})
+(type Rejected {:reason String})
+(type Text {:content String})
+
+(type AdapterParams {:seed String})
+(type LlmParams {:model Data
+                 :profile Data
+                 :provider String
+                 :system String
+                 :tools (List String)})
+(type RunToolParams {:tools (List String)
+                     :da-policy Data})
+(type ToolResultParams {})
+(type BashParams {:command String
+                  :timeout_ms Data})
+(type HumanParams {:prompt String})
+(type SinkParams {})
+
+(foreign nefor.factory.adapter [T]
+  {:params AdapterParams
+   :input T
+   :output ProviderInput})
+
+(foreign nefor.factory.llm
+  {:params LlmParams
+   :input ProviderInput
+   :output (| ToolCalls FinalAnswer)})
+
+(foreign nefor.factory.run-tool
+  {:params RunToolParams
+   :input ToolCalls
+   :output ToolHandle})
+
+(foreign nefor.factory.tool-result
+  {:params ToolResultParams
+   :input ToolHandle
+   :output ProviderInput})
+
+(foreign nefor.factory.bash
+  {:params BashParams
+   :input (| Unit Text)
+   :output Text})
+
+(foreign nefor.factory.human
+  {:params HumanParams
+   :input FinalAnswer
+   :output (| Approved Rejected)})
+
+(foreign nefor.factory.sink [T]
+  {:params SinkParams
+   :input T
+   :output Unit})

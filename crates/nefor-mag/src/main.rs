@@ -23,7 +23,7 @@ fn main() {
     };
 
     match nefor_mag::compile(&source, &cli.source_dir) {
-        Ok(modification) => match serde_json::to_string_pretty(&modification) {
+        Ok(artifact) => match serde_json::to_string_pretty(&artifact) {
             Ok(json) => println!("{json}"),
             Err(e) => {
                 eprintln!("error: cannot serialize modification: {e}");

@@ -1,97 +1,61 @@
-# MAG patterns — the shapes to reach for
+# MAG patterns — library composition
 
-Authoring reference for composing `.mag` programs. Each behavior below has one
-canonical shape. Use it; inventing a workaround (sentinel messages, a "done"
-line in a prompt, a polling actor, parsing error text) hides what the program
-does from the type checker and the validator.
+MAG programs import namespaced libraries, construct typed data, validate it,
+and return an `Artifact`. Graphs, agents, shell commands, and terminal policy
+are library values—not compiler syntax.
 
-Types are the language. Routing is keyed by output type; firing is keyed by
-input type. If two things need to go different places, give them different
-types — don't encode the reason in a prompt.
+## One-off shell work
 
-## Templates first
+`mag-eval` accepts a graph-fragment expression and supplies the imports,
+initial `Unit` message, graph finish, validation, and artifact wrapper:
 
-Reach for a template before hand-wiring a constellation:
+```lisp
+(nefor.shell.command "list" "ls src")
+```
 
-- `(agent {:id N :model … :provider … :tools […]} : IN -> generic-provider.FinalAnswer)`
-  — the tool-use loop (llm ⇄ run-tool). Unbounded: the typed final answer is
-  the terminator; a runaway run is stopped via interrupt/kill. Builtin.
-- `((get tpl "gate") {:id N :model … :provider …})`
-  — produce / human approval / revise on reject. Library (`require "lib/templates"`).
+Pipe stdout into another command by composing fragments:
 
-Every template namespaces its internals under `:id`; two instances never
-collide, and a shared `:id` is a load-time error. Wire them like nodes:
-`(graph entry -> agent  agent -> out  :terminal out)`.
+```lisp
+(nefor.graph.connect
+  (nefor.shell.command "search" "rg -n TODO src/")
+  (nefor.shell.pipe-command "sort" "sort"))
+```
 
-## Shell pipes — MAG as shell
+Use `nefor.shell.command-with-options` for an explicit timeout. Commands still
+pass through the capability gate.
 
-`->` is the pipe. `(bash "cmd")` is a capability node usable inline — no
-`let` binding, no ceremony — and a chain of them composes like a pipeline:
-the first node's stdout becomes the next node's stdin.
+## Agent program
 
-- `(bash "ls src")` — a bare expression is a whole program: the implicit
-  terminal carries its stdout out as the run result.
-- `((bash "rg -n TODO src/") -> (bash "sort"))` — an infix chain is a
-  subgraph; it compiles alone or composes inside a larger graph, and its
-  edges are type-checked like any others.
-- A command's non-zero exit is a routable failure (`mag.CommandFailed`);
-  unrouted, the kernel routing layer escalates it and the run fails loudly.
-  Route it to a repair actor when failure is part of the design, exactly as
-  in "Fire on failure" below.
+Import `nefor.actors`, `nefor.contracts`, `nefor.graph`, and `nefor.artifact`.
+Create an agent fragment with `nefor.actors.agent`, add an explicit initial
+message, finish the graph, and call `nefor.artifact.compile`. Pass semantic
+types with `(type-tag T)`; the compiler rejects unknown types and the library keeps them separate from the
+LLM's runtime wire tag.
 
-Shell nodes go through the same capability gate as agent tool calls —
-piping does not bypass command policy.
+Compose single-exit fragments with `nefor.graph.connect`. Each fragment owns
+human-readable actor ids under its configured prefix. Agent tool lists contain
+context I/O plus `mag-eval` for world work; add `edit_file`/`write_file` only to
+write-capable agents.
 
-## Agent tool surfaces — context I/O vs world work
+## Result boundary
 
-An agent's `:tools` carries context I/O — tools that pull content into the
-agent's context or author from it (`read_file`, `read_image`, `edit_file`,
-`write_file`) — plus `mag-eval` for world work. World queries whose outputs
-are data (listing, searching, running commands) are `mag-eval` shell
-expressions, not bespoke tools: `:tools ["read_file" "mag-eval"]` is the
-read-only investigator; add the write pair for a builder. Don't reach for
-per-query tools; reach for an expression.
+`nefor.graph.finish` selects the fragment output structurally. There is no sink
+node and no implicit terminal. Every useful output must either route onward or
+be the selected result port; library validation rejects uncovered outputs.
 
-## Ordering without data — dependency edge
+## Products, unions, and cycles
 
-"A must not start before C finishes", where A doesn't consume C's output.
+- `A + B` is an all-of product. Runtime slots bind to sender edges, so equal
+  component types from different actors do not conflate.
+- `A | B` is a one-of union. Either arriving variant can satisfy the input.
+- Cycles are ordinary routes. A typed output leaving the cycle is its exit;
+  runaway work is stopped through the control plane.
+- Completion ordering uses explicit `Unit` messages/routes. Absence is modeled
+  positively through a timeout or failure output, never a negative predicate.
 
-Edge `C -> A` carrying `mag.Unit`; A's input contract gains `+ mag.Unit`. The
-kernel emits the Unit when C completes. Not a flag, not a "done" message.
+## Semantic distinctions
 
-## All-of join — product input
-
-"Fire when both A and B have delivered."
-
-The join actor declares a product input `(FindingsA + FindingsB)`. Slots bind to
-sender edges, so `(Findings + Findings)` from two explorers never conflate. Not
-an accumulator with counting logic.
-
-## Any-of / first delivery — union input
-
-"Proceed on whichever answers first." Union input `(A | B)`; whichever arrives
-fires alone.
-
-## Cycle
-
-Cycles are legal as-is and unbounded; every cycle exits through a typed
-variant (the llm's `FinalAnswer` route out of the loop), so the typed exit is
-the terminator. There is no loop-budget mechanism — a run that never reaches
-its exit is stopped via interrupt/kill. Never "give up after N" in a prompt.
-
-## Fire on failure / repair
-
-"If it fails, route the evidence to a fixer." Factory/completion failures are typed outputs when a factory returns a failure tag (for example `mag.CommandFailed` from `bash`). Route that failure type to the repair actor; compose produce → check → repair as an ordinary cycle. Unhandled failures escalate to `mag.run_failed`. `kill` removes actors and voids late outputs; it is not a general routeable failure output. Not parsing error text out of a success-shaped output.
-
-## Same type, two meanings
-
-Routes are keyed by type — two destinations "for different reasons" need the
-reason in the type. Wrap as distinct types (`Approved<X> | Rejected<X>`) and
-route each variant, so the distinction is visible to validation.
-
-## Absence and timeouts
-
-There is no "fire when X did _not_ happen." Express absence positively: a
-timeout is an actor whose failure output routes to the fallback; a missed
-precondition is a failure route. Negative predicates over graph state don't
-exist by design.
+Routing uses runtime wire tags, while library composition checks semantic MAG
+types. When equal payload shapes carry different meanings, declare distinct
+nominal types and expose them at fragment boundaries. Do not encode routing
+meaning only in prompts or parse error text from success-shaped values.

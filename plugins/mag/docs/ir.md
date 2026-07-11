@@ -1,5 +1,42 @@
 # IR — graph modifications
 
+## Host artifact boundary
+
+MAG programs return a generic artifact rather than a bare modification:
+
+```json
+{
+  "format": "nefor.graph-modification/v1",
+  "data": {
+    "actors": [
+      { "id": "answer", "foreign": "nefor.factory.llm", "params": {}, "routes": {} }
+    ],
+    "messages": [], "kills": [], "rules": []
+  }
+}
+```
+
+`foreign` is a qualified identity exported by the runtime registry contract
+snapshot. At the host boundary the plugin resolves it into the kernel's
+`factory` field; the kernel then revalidates concrete contracts before applying
+the normalized modification below.
+
+The registry snapshot is plain immutable data. Each entry carries `identity`,
+the parameter schema, and a `type_scheme` containing explicit variables plus
+input and output contracts. Runtime constructors never cross this boundary.
+
+`data.result.from` selects the structural result boundary by actor id and
+declared wire tag. The kernel validates that the actor exists and its foreign
+contract declares that output. When the selected output is emitted, the kernel
+persists it through the ordinary per-node writer and completes the run directly;
+no sink actor, concrete terminal type, or route is synthesized.
+
+`mag.load` resolves only against `source_dir` unless the request supplies
+`module_roots`. That optional array is passed to MAG as the complete ordered
+module search path. Absolute roots are accepted as explicit host inputs;
+relative roots resolve beneath `source_dir` and may not escape it. The plugin
+does not infer library locations from its installation or configuration.
+
 MAG is a scripting language for the runtime hosted by this plugin. A program
 is loaded once — parsed, definitions evaluated, initial modification
 validated — and its environment stays resident for the session. The shipped
@@ -20,8 +57,9 @@ logic primitives — logic lives in MAG, reached through the evaluator.
 }
 ```
 
-- `actors` — instances to spawn: which factory, with which params, under
-  which id. Ids are human-readable and namespaced per template
+- `actors` — instances to spawn: which resolved factory, with which params,
+  under which id.
+  Ids are human-readable and namespaced per library fragment
   instantiation: an agent named `docs-explorer` prefixes its internal
   actors, so its provider loop is `docs-explorer.llm` — each instance gets
   its own subtree of names.
@@ -30,7 +68,7 @@ logic primitives — logic lives in MAG, reached through the evaluator.
   never reads its own routes. A map from fully-qualified output type to an
   array of destination ids; the authoring graph's edges dissolve here. A
   union exit becomes multiple keys; one type to many targets is fanout with
-  no special casing. See lowering.md for the full mapping.
+  no special casing. See lowering.md for the authoring-to-artifact mapping.
 - `messages` — sends: initial activation for new actors, inputs for
   existing ones.
 - `kills` — ids to remove. Kill removes actors and voids late outputs; it is
@@ -133,13 +171,11 @@ Dependencies use the same language: "A depends on C finishing" is the edge
 `C -> A` carrying `mag.Unit` — an informationless payload whose sole purpose
 is to encode the ordering. No second vocabulary exists.
 
-The `bash` capability node leans on exactly this algebra: its input contract
-is the union `(mag.Unit | mag.Text)` — a Unit firing runs the command with no
-stdin (the initial activation of a source node, or an upstream ordering
-edge), a Text firing delivers the upstream node's stdout as the command's
-stdin. Pipe semantics fall out of the firing table, not a special case; and a
-source node whose contract carries the `mag.Unit` variant is seeded with a
-Unit activation at lowering (lowering.md, Shell defaults).
+The shipped shell library leans on exactly this algebra: its foreign actor's
+input contract is the union `(mag.Unit | mag.Text)`. A Unit firing runs the
+command with no stdin; a Text firing supplies upstream stdout. The library
+constructs the initial Unit message explicitly, so pipe semantics require no
+compiler special case.
 
 - **Slot identity is the incoming edge, not the type.** The kernel assembles
   product activations with per-slot FIFO queues, where each slot is bound to

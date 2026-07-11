@@ -86,6 +86,10 @@ end
 
 actor.install()
 
+-- The CLI config lives beside starter rather than containing its own MAG
+-- library tree. Seed session workspaces from the shared starter library.
+require("mag").configure { library_dir = STARTER_ROOT .. "/mag/lib" }
+
 actor.spawn(sessions)
 sessions.init()
 

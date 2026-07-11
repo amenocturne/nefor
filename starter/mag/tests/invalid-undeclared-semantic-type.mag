@@ -1,0 +1,14 @@
+(require "nefor.actors")
+(require "nefor.contracts")
+
+(nefor.actors.agent
+  (as nefor.actors.AgentConfig {:id "invalid"
+   :model nil
+   :profile nil
+   :provider "mock-plugin"
+   :system ""
+   :tools []
+   :da-policy nil})
+  (type-tag nefor.contracts.Task)
+  "task"
+  (type-tag MissingSemanticType))

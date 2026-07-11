@@ -4,9 +4,10 @@ Focus area: {focus}
 
 Instructions:
 
-- Pull known files into context with `read_file`; every other world query is a `mag-eval` expression — `->` pipes one command's output into the next:
-  - `((bash "rg -n '{focus}' src/") -> (bash "head -40"))` — search, capped
-  - `(bash "ls -la src")` — list a directory
+- Pull known files into context with `read_file`; every other world query is a
+  `mag-eval` fragment expression:
+  - `(nefor.graph.connect (nefor.shell.command "search" "rg -n '{focus}' src/") (nefor.shell.pipe-command "cap" "head -40"))`
+  - `(nefor.shell.command "list" "ls -la src")`
 - Do NOT modify any files
 - Produce a concise structured summary of what you found
 - Include file paths and line numbers for important findings

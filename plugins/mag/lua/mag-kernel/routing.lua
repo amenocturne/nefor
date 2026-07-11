@@ -158,8 +158,13 @@ function M.new(opts)
     ready = {}, -- id -> true once the factory confirmed ready
     busy = {}, -- id -> busy-since stamp while an activation window is open
     signaling = {}, -- id -> true while a signal handler (kill/drain) is running
+    result_boundary = nil, -- { actor, wire }; structural, never a factory
   }, M)
   return self
+end
+
+function M:set_result_boundary(boundary)
+  self.result_boundary = boundary
 end
 
 -- Register the constructed instance for an id. activate binds through here
@@ -235,6 +240,15 @@ function M:on_emit(id, message)
     -- synthesized status types (mag.Unit / failures) go out via apply_completion,
     -- not here, so only real actor outputs are persisted.
     self.persist_output(id, message)
+    local boundary = self.result_boundary
+    if boundary and boundary.actor == id and boundary.wire == kind then
+      self.events({
+        kind = EVT_RUN_COMPLETE,
+        from = id,
+        result = message,
+        persisted = true,
+      })
+    end
     self:route_output(id, kind, message)
   end
 end

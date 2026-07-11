@@ -1,25 +1,25 @@
+use crate::ast::TypeDecl;
 use crate::ast::Value;
 use crate::error::MagError;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+#[derive(Debug, Default)]
+struct Modules {
+    loaded: HashMap<String, BTreeMap<String, Value>>,
+    loading: Vec<String>,
+    foreign_identities: HashSet<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct Env {
     scopes: Vec<HashMap<String, Value>>,
     source_dir: PathBuf,
-    loading_modules: HashSet<PathBuf>,
-    /// Per-factory counters for auto-generated inline node ids (`bash-1`,
-    /// `bash-2`, …). Env-scoped so ids are deterministic per compilation —
-    /// two loads of the same source mint identical ids — unlike the global
-    /// `node_N` counter, which only guarantees uniqueness.
-    ///
-    /// Shared (`Arc<Mutex<…>>`) so that fn-execution envs derived from a
-    /// resident program (see [`Env::child_for_call`]) advance the *same*
-    /// counter across successive `apply_named` calls: repeated rule-fn
-    /// evaluations on one `LoadedProgram` mint monotonic, non-colliding ids
-    /// (`bash-1`, `bash-2`, …) rather than each eval restarting at `bash-1`.
-    node_seq: Arc<Mutex<HashMap<String, usize>>>,
+    module_roots: Vec<PathBuf>,
+    module: String,
+    modules: Arc<Mutex<Modules>>,
+    imports: HashSet<String>,
 }
 
 impl Default for Env {
@@ -30,159 +30,221 @@ impl Default for Env {
 
 impl Env {
     pub fn new() -> Self {
-        Self {
-            scopes: vec![HashMap::new()],
-            source_dir: PathBuf::from("."),
-            loading_modules: HashSet::new(),
-            node_seq: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self::new_in(
+            Path::new("."),
+            vec![PathBuf::from(".")],
+            "main",
+            Arc::new(Mutex::new(Modules::default())),
+        )
     }
-
-    fn define_stdlib(&mut self) {
-        self.define("str", Value::BuiltinFn("str".into()));
-        self.define("map", Value::BuiltinFn("map".into()));
-        self.define("filter", Value::BuiltinFn("filter".into()));
-        self.define("flat-map", Value::BuiltinFn("flat-map".into()));
-        self.define("fold", Value::BuiltinFn("fold".into()));
-        self.define("concat", Value::BuiltinFn("concat".into()));
-        self.define("get", Value::BuiltinFn("get".into()));
-        self.define("assoc", Value::BuiltinFn("assoc".into()));
-        self.define("keys", Value::BuiltinFn("keys".into()));
-        self.define("count", Value::BuiltinFn("count".into()));
-        self.define("or", Value::BuiltinFn("or".into()));
-        self.define("not", Value::BuiltinFn("not".into()));
-        self.define("=", Value::BuiltinFn("=".into()));
-        self.define("node", Value::BuiltinFn("node".into()));
-        self.define("bash", Value::BuiltinFn("bash".into()));
-        self.define("graph", Value::BuiltinFn("graph".into()));
-        self.define("subgraph", Value::BuiltinFn("subgraph".into()));
-        self.define("agent", Value::BuiltinFn("agent".into()));
-        self.define("type", Value::BuiltinFn("type".into()));
-        self.define("read", Value::BuiltinFn("read".into()));
-        self.define("require", Value::BuiltinFn("require".into()));
-    }
-
-    pub fn new_with_stdlib() -> Self {
-        let mut env = Self::new();
-        env.define_stdlib();
-        env
-    }
-
-    pub fn new_with_stdlib_and_source_dir(source_dir: &Path) -> Self {
+    fn new_in(
+        source_dir: &Path,
+        module_roots: Vec<PathBuf>,
+        module: &str,
+        modules: Arc<Mutex<Modules>>,
+    ) -> Self {
         let mut env = Self {
             scopes: vec![HashMap::new()],
-            source_dir: source_dir.to_path_buf(),
-            loading_modules: HashSet::new(),
-            node_seq: Arc::new(Mutex::new(HashMap::new())),
+            source_dir: source_dir.into(),
+            module_roots,
+            module: module.into(),
+            modules,
+            imports: HashSet::new(),
         };
-        env.define_stdlib();
+        for name in [
+            "str",
+            "map",
+            "filter",
+            "flat-map",
+            "fold",
+            "concat",
+            "get",
+            "assoc",
+            "keys",
+            "count",
+            "or",
+            "not",
+            "=",
+            "fail",
+            "foreign-id",
+            "read",
+            "require",
+            "artifact",
+        ] {
+            env.define(name, Value::BuiltinFn(name.into()));
+        }
+        for (name, ty) in [
+            ("Data", crate::types::MagType::Data),
+            ("Artifact", crate::types::MagType::Artifact),
+            ("Unit", crate::types::MagType::Unit),
+            ("Bool", crate::types::MagType::Bool),
+            ("Int", crate::types::MagType::Int),
+            ("Float", crate::types::MagType::Float),
+            ("String", crate::types::MagType::String),
+        ] {
+            env.define(name, Value::Type(ty));
+        }
         env
     }
-
-    /// A child environment for evaluating a fn body: fresh (empty) lexical
-    /// scopes — the closure is overlaid separately, so no dynamic-scope leak
-    /// from the caller — but the program-level execution metadata is carried
-    /// over. `source_dir` so `(read …)` inside the fn resolves against the
-    /// program's workspace (not the process cwd), and the *shared* `node_seq`
-    /// so inline-node ids stay monotonic across repeated evaluations.
-    pub fn child_for_call(&self) -> Self {
-        Self {
-            scopes: vec![HashMap::new()],
-            source_dir: self.source_dir.clone(),
-            loading_modules: self.loading_modules.clone(),
-            node_seq: Arc::clone(&self.node_seq),
-        }
+    pub fn new_with_stdlib() -> Self {
+        Self::new()
     }
-
+    pub fn new_with_stdlib_and_source_dir(path: &Path) -> Self {
+        Self::new_with_stdlib_source_dir_and_module_roots(path, vec![path.to_path_buf()])
+    }
+    pub fn new_with_stdlib_source_dir_and_module_roots(
+        path: &Path,
+        module_roots: Vec<PathBuf>,
+    ) -> Self {
+        Self::new_in(
+            path,
+            module_roots,
+            "main",
+            Arc::new(Mutex::new(Modules::default())),
+        )
+    }
     pub fn source_dir(&self) -> &Path {
         &self.source_dir
     }
-
-    pub fn begin_loading(&mut self, path: &Path) -> Result<(), MagError> {
-        if !self.loading_modules.insert(path.to_path_buf()) {
-            return Err(MagError::Eval(format!(
-                "circular require: {} is already being loaded",
-                path.display()
-            )));
+    pub fn module_roots(&self) -> &[PathBuf] {
+        &self.module_roots
+    }
+    pub fn module(&self) -> &str {
+        &self.module
+    }
+    pub fn qualify(&self, local: &str) -> String {
+        if self.module == "main" {
+            format!("main.{local}")
+        } else {
+            format!("{}.{local}", self.module)
         }
-        Ok(())
     }
-
-    pub fn end_loading(&mut self, path: &Path) {
-        self.loading_modules.remove(path);
-    }
-
     pub fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
     }
-
     pub fn pop_scope(&mut self) {
         if self.scopes.len() > 1 {
             self.scopes.pop();
         }
     }
-
     pub fn define(&mut self, name: &str, value: Value) {
-        if let Some(scope) = self.scopes.last_mut() {
-            scope.insert(name.to_string(), value);
+        if let Some(s) = self.scopes.last_mut() {
+            s.insert(name.into(), value);
         }
     }
-
     pub fn lookup(&self, name: &str) -> Result<&Value, MagError> {
         for scope in self.scopes.iter().rev() {
-            if let Some(val) = scope.get(name) {
-                return Ok(val);
+            if let Some(v) = scope.get(name) {
+                return Ok(v);
             }
         }
-        Err(MagError::Unresolved(name.to_string()))
+        Err(MagError::Unresolved(name.into()))
     }
-
-    pub fn snapshot(&self) -> Vec<(String, Value)> {
-        let mut result = Vec::new();
-        for scope in &self.scopes {
-            for (k, v) in scope {
-                result.push((k.clone(), v.clone()));
-            }
-        }
-        result
-    }
-
-    pub fn top_scope_user_defs(&self) -> HashMap<String, Value> {
-        let builtins = [
-            "str", "map", "flat-map", "filter", "fold", "concat", "get", "assoc", "keys", "count",
-            "or", "not", "=", "node", "bash", "graph", "subgraph", "agent", "type", "read",
-            "require",
-        ];
+    pub fn type_decl(&self, canonical: &str) -> Option<&TypeDecl> {
         self.scopes
-            .last()
-            .map(|scope| {
-                scope
-                    .iter()
-                    .filter(|(k, _)| !builtins.contains(&k.as_str()))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
+            .iter()
+            .rev()
+            .flat_map(|scope| scope.values())
+            .find_map(|value| match value {
+                Value::TypeDecl(decl) if decl.name == canonical => Some(decl),
+                _ => None,
             })
-            .unwrap_or_default()
     }
-
-    /// Next per-factory sequence number for auto-generated inline node ids
-    /// (`<factory>-<n>` in appearance order). Interior-mutable via the shared
-    /// counter (recovers a poisoned lock rather than panicking).
-    pub fn next_node_seq(&self, factory: &str) -> usize {
-        let mut seq = self.node_seq.lock().unwrap_or_else(|e| e.into_inner());
-        let n = seq.entry(factory.to_string()).or_insert(0);
-        *n += 1;
-        *n
+    pub fn snapshot(&self) -> Vec<(String, Value)> {
+        self.scopes
+            .iter()
+            .flat_map(|s| s.iter().map(|(k, v)| (k.clone(), v.clone())))
+            .collect()
     }
-
-    pub fn create_module_env(&self) -> Self {
-        let mut env = Self {
+    pub fn child_for_call(&self) -> Self {
+        Self {
             scopes: vec![HashMap::new()],
             source_dir: self.source_dir.clone(),
-            loading_modules: self.loading_modules.clone(),
-            node_seq: Arc::new(Mutex::new(HashMap::new())),
-        };
-        env.define_stdlib();
+            module_roots: self.module_roots.clone(),
+            module: self.module.clone(),
+            modules: self.modules.clone(),
+            imports: self.imports.clone(),
+        }
+    }
+    pub fn user_defs(&self) -> BTreeMap<String, Value> {
+        self.scopes
+            .first()
+            .into_iter()
+            .flat_map(|s| s.iter())
+            .filter(|(name, v)| {
+                !matches!(v, Value::BuiltinFn(_) | Value::Type(_))
+                    && (!name.contains('.') || matches!(v, Value::Foreign(_)))
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+    pub fn module_cached(&self, name: &str) -> Option<BTreeMap<String, Value>> {
+        self.modules
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .loaded
+            .get(name)
+            .cloned()
+    }
+    pub fn loaded_modules(&self) -> Vec<(String, BTreeMap<String, Value>)> {
+        self.modules
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .loaded
+            .iter()
+            .map(|(name, defs)| (name.clone(), defs.clone()))
+            .collect()
+    }
+    pub fn begin_module(&self, name: &str) -> Result<(), MagError> {
+        let mut m = self.modules.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = m.loading.iter().position(|x| x == name) {
+            let mut cycle = m.loading[at..].to_vec();
+            cycle.push(name.into());
+            return Err(MagError::Eval(format!(
+                "circular require: {}",
+                cycle.join(" -> ")
+            )));
+        }
+        m.loading.push(name.into());
+        Ok(())
+    }
+    pub fn register_foreign(&self, identity: &str) -> Result<(), MagError> {
+        let mut modules = self.modules.lock().unwrap_or_else(|e| e.into_inner());
+        if !modules.foreign_identities.insert(identity.to_string()) {
+            return Err(MagError::Type(format!(
+                "duplicate foreign declaration for {identity}"
+            )));
+        }
+        Ok(())
+    }
+    pub fn finish_module(&mut self, name: &str, defs: BTreeMap<String, Value>) {
+        let mut m = self.modules.lock().unwrap_or_else(|e| e.into_inner());
+        m.loading.pop();
+        m.loaded.insert(name.into(), defs.clone());
+        drop(m);
+        self.install_module(name, defs);
+    }
+    pub fn install_module(&mut self, name: &str, defs: BTreeMap<String, Value>) {
+        self.imports.insert(name.into());
+        for (local, value) in defs {
+            let qualified = if local.contains('.') {
+                local
+            } else {
+                format!("{name}.{local}")
+            };
+            self.define(&qualified, value);
+        }
+    }
+    pub fn module_env(&self, name: &str) -> Self {
+        let mut env = Self::new_in(
+            &self.source_dir,
+            self.module_roots.clone(),
+            name,
+            self.modules.clone(),
+        );
+        if let Ok(inputs) = self.lookup("inputs") {
+            env.define("inputs", inputs.clone());
+        }
         env
     }
 }

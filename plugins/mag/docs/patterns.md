@@ -51,8 +51,8 @@ kill/interrupt. Never encode "give up after N tries" in a prompt.
 
 "If the build fails, route the evidence to a fixer."
 
-**Shape:** factory/completion failures are typed outputs when a factory returns
-a failure tag (for example `mag.CommandFailed` from `bash`). Route that failure
+**Shape:** foreign/completion failures are typed outputs when an implementation returns
+a failure tag (for example the shell capability's `mag.CommandFailed`). Route that failure
 type to the repair actor; compose produce → check → repair as an ordinary cycle.
 Unhandled failures escalate to `mag.run_failed`. `kill` removes actors and voids
 late outputs; it is not a general routeable failure output.
@@ -64,7 +64,8 @@ late outputs; it is not a general routeable failure output.
 "Send X to A on the happy path, X to B as a fallback."
 
 Routes are keyed by type, so two destinations for "different reasons" need
-the reason in the type: wrap as distinct types (`Approved<X> | Rejected<X>`)
+the reason in the type: declare distinct nominal variants (for example
+`Approved` and `Rejected` records) and expose their union
 and route each variant. The distinction becomes visible to validation
 instead of living in a prompt convention.
 

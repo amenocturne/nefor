@@ -322,19 +322,19 @@ mod tests {
 
     #[test]
     fn dotted_symbol() {
-        let tokens = tokenize("generic-tool.ToolCalls").unwrap();
-        assert_eq!(tokens, vec![Token::Symbol("generic-tool.ToolCalls".into())]);
+        let tokens = tokenize("core.types.Validated").unwrap();
+        assert_eq!(tokens, vec![Token::Symbol("core.types.Validated".into())]);
     }
 
     #[test]
     fn dotted_symbol_in_type() {
-        let tokens = tokenize("(type generic-provider.FinalAnswer)").unwrap();
+        let tokens = tokenize("(type domain.Result)").unwrap();
         assert_eq!(
             tokens,
             vec![
                 Token::LParen,
                 Token::Symbol("type".into()),
-                Token::Symbol("generic-provider.FinalAnswer".into()),
+                Token::Symbol("domain.Result".into()),
                 Token::RParen,
             ]
         );
