@@ -143,19 +143,36 @@ local emit_verdict_approved
 local emit_verdict_rejected
 local emit_verdict_discarded
 
-local VALID_PROFILES = { fast = true, standard = true, deep = true, max = true }
-
-local function profile_config(name)
-  if not VALID_PROFILES[name] then return nil end
+local function orchestration_profiles()
   local ok, cfg = pcall(require, "config")
-  local active = ok and type(cfg) == "table" and cfg.active or nil
-  local profiles = type(active) == "table" and active.orchestration_profiles or nil
-  local resolved = type(profiles) == "table" and profiles[name] or nil
-  if type(resolved) == "table" then return resolved end
-  local provider = type(active) == "table" and active.default_provider or nil
-  local model = type(active) == "table" and active.default_model or nil
-  local effort = ({ fast = "low", standard = "medium", deep = "high", max = "xhigh" })[name]
-  return { provider = provider, model = model, reasoning_effort = effort }
+  if not ok or type(cfg) ~= "table" or type(cfg.active) ~= "table" then
+    return nil, "config.active.orchestration_profiles is missing"
+  end
+  local profiles = cfg.active.orchestration_profiles
+  if type(profiles) ~= "table" then
+    return nil, "config.active.orchestration_profiles must be a table"
+  end
+  for name in pairs(profiles) do
+    if type(name) ~= "string" or #name == 0 then
+      return nil, "config.active.orchestration_profiles keys must be non-empty strings"
+    end
+  end
+  local names = {}
+  for name in pairs(profiles) do names[#names + 1] = name end
+  table.sort(names)
+  for _, name in ipairs(names) do
+    local profile = profiles[name]
+    if type(profile) ~= "table" then
+      return nil, "configured profile '" .. name .. "' must be a table"
+    end
+    for _, field in ipairs({ "provider", "model", "reasoning_effort" }) do
+      if type(profile[field]) ~= "string" or #profile[field] == 0 then
+        return nil, "configured profile '" .. name ..
+          "' requires a non-empty string " .. field
+      end
+    end
+  end
+  return profiles, nil
 end
 
 local function emit_tool_result_ok(firing_id, output)
@@ -189,6 +206,12 @@ local function sorted_keys(set)
   for k in pairs(set) do keys[#keys + 1] = k end
   table.sort(keys)
   return keys
+end
+
+local function example_profile_name()
+  local profiles = orchestration_profiles()
+  if type(profiles) ~= "table" then return "<configured-profile>" end
+  return sorted_keys(profiles)[1] or "<configured-profile>"
 end
 
 local function validate_factories(actors, firing_id)
@@ -230,14 +253,16 @@ end
 -- factory "sink" (the loader canonicalizes the `:terminal` node's id to
 -- "sink"), terminal (no routes), with at least one inbound route.
 -- Returns sink_id or nil + error text in the current authoring dialect.
-local SINK_EXAMPLE = table.concat({
-  'Every program must end in exactly one sink that collects the final output, e.g.',
-  '  (let [worker (agent {:id "worker" :system "…" :provider "chatgpt"',
-  '                       :profile "standard" :tools ["read_file"]}',
-  '                 : mag.Task -> generic-provider.FinalAnswer)',
-  '        out    (node "sink" {} : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]',
-  '    (graph worker -> out :terminal out))',
-}, "\n")
+local function sink_example()
+  return table.concat({
+    'Every program must end in exactly one sink that collects the final output, e.g.',
+    '  (let [worker (agent {:id "worker" :system "…" :provider "chatgpt"',
+    '                       :profile "' .. example_profile_name() .. '" :tools ["read_file"]}',
+    '                 : mag.Task -> generic-provider.FinalAnswer)',
+    '        out    (node "sink" {} : generic-provider.FinalAnswer -> generic-provider.FinalAnswer)]',
+    '    (graph worker -> out :terminal out))',
+  }, "\n")
+end
 
 local function validate_sink(actors)
   local sinks = {}
@@ -245,7 +270,7 @@ local function validate_sink(actors)
     if actor.factory == "sink" then sinks[#sinks + 1] = actor end
   end
   if #sinks == 0 then
-    return nil, "program has no sink actor. " .. SINK_EXAMPLE
+    return nil, "program has no sink actor. " .. sink_example()
   end
   if #sinks > 1 then
     local ids = {}
@@ -286,6 +311,8 @@ end
 -- reasoning-depth decision. Returns overlay or nil + error text.
 local function resolve_profiles(actors)
   local overlay = {}
+  local profiles
+  local profiles_err
   for _, actor in ipairs(actors or {}) do
     local params = type(actor.params) == "table" and actor.params or {}
     local profile_name = params.profile
@@ -295,28 +322,29 @@ local function resolve_profiles(actors)
         "' sets both profile and reasoning_effort; use profile only"
     end
     if type(profile_name) == "string" and #profile_name > 0 then
-      if not VALID_PROFILES[profile_name] then
+      if profiles == nil and profiles_err == nil then
+        profiles, profiles_err = orchestration_profiles()
+      end
+      if profiles_err ~= nil then
+        return nil, "actor '" .. tostring(actor.id) .. "' uses profile '" ..
+          profile_name .. "', but " .. profiles_err
+      end
+      local resolved = profiles[profile_name]
+      if resolved == nil then
+        local configured = sorted_keys(profiles)
+        local suffix = #configured > 0 and table.concat(configured, ", ") or "none"
         return nil, "actor '" .. tostring(actor.id) ..
           "' has unknown profile '" .. profile_name ..
-          "' (valid: fast, standard, deep, max)"
+          "'. Configured profiles: " .. suffix .. "."
       end
-      local resolved = profile_config(profile_name)
-      if type(resolved) == "table" then
-        local patch = {}
-        if type(resolved.reasoning_effort) == "string" then
-          patch.reasoning_effort = resolved.reasoning_effort
-        end
-        if type(resolved.provider) == "string" and #resolved.provider > 0 then
-          patch.provider = resolved.provider
-        end
-        if type(resolved.model) == "string" and #resolved.model > 0 then
-          patch.model = resolved.model
-        end
-        if next(patch) ~= nil then overlay[actor.id] = patch end
-      end
+      overlay[actor.id] = {
+        provider = resolved.provider,
+        model = resolved.model,
+        reasoning_effort = resolved.reasoning_effort,
+      }
     elseif actor.factory == "llm" and not has_raw_effort then
       return nil, "llm actor '" .. tostring(actor.id) ..
-        "' is missing required :profile (fast, standard, deep, or max). " ..
+        "' is missing required :profile. " ..
         "Author :profile on the (agent {…}) config — it lowers onto the " ..
         "agent's llm actors — or directly on a (node \"llm\" {…})."
     end
@@ -1233,6 +1261,7 @@ end
 local advertised = false
 
 local function lead_workflow_tool_schemas()
+  local example_profile = example_profile_name()
   return {
     {
       name        = "graph-status",
@@ -1299,7 +1328,7 @@ local function lead_workflow_tool_schemas()
         "(let [worker (agent {:id \"worker\"\n" ..
         "                     :system \"Answer the task.\"\n" ..
         "                     :provider \"chatgpt\"\n" ..
-        "                     :profile \"standard\"\n" ..
+        "                     :profile \"" .. example_profile .. "\"\n" ..
         "                     :tools [\"read_file\"]}\n" ..
         "               : mag.Task -> generic-provider.FinalAnswer)\n" ..
         "      out    (node \"sink\" {} : generic-provider.FinalAnswer " ..
@@ -1406,8 +1435,8 @@ end
 -- params overlay. Validation failure acks the firing with an error and drops
 -- the pending entry — nothing runs.
 --
--- Profile params resolved lead-side (fast/standard/deep/max → provider/model/
--- reasoning_effort) are threaded to the actors via `params_overlay` on
+-- Profile params resolved lead-side from the configured registry are threaded
+-- to the actors via `params_overlay` on
 -- mag.execute — a per-actor-id param patch the kernel merges before spawn
 -- (actor params are kernel-opaque, so an overlay is legitimate control-plane
 -- input, ir.md). The overlay keys on the ACTOR ids that author params.profile;

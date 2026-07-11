@@ -68,6 +68,16 @@ local function fresh()
   _test.calls_clear()
 end
 
+local starter_profiles = require("config").active.orchestration_profiles
+
+local function with_profiles(profiles, fn)
+  local config = require("config")
+  config.active.orchestration_profiles = profiles
+  local ok, err = pcall(fn)
+  config.active.orchestration_profiles = starter_profiles
+  if not ok then error(err, 0) end
+end
+
 -- Current authoring dialect: agents are the compiler's `agent` template,
 -- composed with a sink via (graph … :terminal out). The lead's validators
 -- never parse this source — compilation happens in the mag plugin and the
@@ -661,8 +671,9 @@ do
     "a sink nothing routes to is rejected; got " .. json.encode(_test.calls()))
 end
 
--- Profile validators: an llm actor must author :profile (or raw
--- reasoning_effort); both at once and unknown names are rejected.
+-- Profile validators: config.active.orchestration_profiles is the open
+-- registry. An llm actor must author :profile (or raw reasoning_effort);
+-- both at once, unknown names, and malformed configured entries are rejected.
 do
   fresh()
   write_mag_file("firing-profile-missing-write", "no-profile.mag", READ_ONLY_MAG)
@@ -703,21 +714,90 @@ do
 end
 
 do
-  fresh()
-  write_mag_file("firing-profile-unknown-write", "bad-profile.mag", READ_ONLY_MAG)
-  _test.calls_clear()
-  execute_mag("firing-profile-unknown", "bad-profile.mag")
-  local m = read_only_modification()
-  m.actors[2].params.profile = "turbo"
-  feed_loaded(m)
-  local err = find_call(decode_calls(), function(c)
-    return c.body.kind == "tool.result"
-       and c.body.id == "firing-profile-unknown"
-       and type(c.body.error) == "string"
+  with_profiles({ zeta = starter_profiles.standard, alpha = starter_profiles.fast }, function()
+    fresh()
+    write_mag_file("firing-profile-unknown-write", "bad-profile.mag", READ_ONLY_MAG)
+    _test.calls_clear()
+    execute_mag("firing-profile-unknown", "bad-profile.mag")
+    local m = read_only_modification()
+    m.actors[2].params.profile = "turbo"
+    feed_loaded(m)
+    local err = find_call(decode_calls(), function(c)
+      return c.body.kind == "tool.result"
+         and c.body.id == "firing-profile-unknown"
+         and type(c.body.error) == "string"
+    end)
+    assert_true(err ~= nil and err.body.error:find("unknown profile 'turbo'", 1, true) ~= nil,
+      "unknown profile names are rejected; got " .. json.encode(_test.calls()))
+    assert_true(err.body.error:find("Configured profiles: alpha, zeta.", 1, true) ~= nil,
+      "unknown profile error lists configured names in sorted order")
   end)
-  assert_true(err ~= nil and err.body.error:find("unknown profile 'turbo'", 1, true) ~= nil,
-    "unknown profile names are rejected; got " .. json.encode(_test.calls()))
 end
+
+do
+  with_profiles({
+    strong = { provider = "chatgpt", model = "gpt-5.6-sol", reasoning_effort = "medium" },
+    bulk = { provider = "chatgpt", model = "gpt-5.6-luna", reasoning_effort = "low" },
+    audit = { provider = "openai", model = "review-model", reasoning_effort = "high" },
+    another = { provider = "openai", model = "other-model", reasoning_effort = "medium" },
+    fifth = { provider = "openai", model = "fifth-model", reasoning_effort = "low" },
+  }, function()
+    fresh()
+    write_mag_file("firing-profile-strong-write", "strong-profile.mag", READ_ONLY_MAG)
+    _test.calls_clear()
+    execute_mag("firing-profile-strong", "strong-profile.mag")
+    local m = read_only_modification()
+    m.actors[2].params.profile = "strong"
+    feed_loaded(m)
+    local exec = find_call(decode_calls(), function(c)
+      return c.body.kind == "mag.execute" and c.target == "mag"
+    end)
+    assert_true(exec ~= nil, "an arbitrary configured profile executes")
+    local patch = exec.body.params_overlay["worker.llm"]
+    assert_eq(patch.provider, "chatgpt", "custom profile resolves provider")
+    assert_eq(patch.model, "gpt-5.6-sol", "custom profile resolves model")
+    assert_eq(patch.reasoning_effort, "medium", "custom profile resolves effort")
+  end)
+end
+
+local function assert_profile_config_error(profiles, expected)
+  with_profiles(profiles, function()
+    fresh()
+    write_mag_file("firing-profile-malformed-write", "malformed-profile.mag", READ_ONLY_MAG)
+    _test.calls_clear()
+    execute_mag("firing-profile-malformed", "malformed-profile.mag")
+    feed_loaded(read_only_modification())
+    local err = find_call(decode_calls(), function(c)
+      return c.body.kind == "tool.result"
+         and c.body.id == "firing-profile-malformed"
+         and type(c.body.error) == "string"
+    end)
+    assert_true(err ~= nil and err.body.error:find(expected, 1, true) ~= nil,
+      "malformed profile registry is rejected with '" .. expected .. "'; got " ..
+      json.encode(_test.calls()))
+  end)
+end
+
+assert_profile_config_error(nil, "config.active.orchestration_profiles must be a table")
+assert_profile_config_error({ [1] = starter_profiles.standard },
+  "config.active.orchestration_profiles keys must be non-empty strings")
+assert_profile_config_error({ [""] = starter_profiles.standard },
+  "config.active.orchestration_profiles keys must be non-empty strings")
+assert_profile_config_error({}, "unknown profile 'standard'. Configured profiles: none.")
+assert_profile_config_error({ standard = "bad" }, "configured profile 'standard' must be a table")
+assert_profile_config_error({
+  standard = { provider = "", model = "model", reasoning_effort = "medium" },
+}, "configured profile 'standard' requires a non-empty string provider")
+assert_profile_config_error({
+  standard = { provider = "chatgpt", model = nil, reasoning_effort = "medium" },
+}, "configured profile 'standard' requires a non-empty string model")
+assert_profile_config_error({
+  standard = { provider = "chatgpt", model = "model", reasoning_effort = 3 },
+}, "configured profile 'standard' requires a non-empty string reasoning_effort")
+assert_profile_config_error({
+  standard = { provider = "chatgpt", model = "model", reasoning_effort = "medium" },
+  broken = { provider = "chatgpt", model = "", reasoning_effort = "low" },
+}, "configured profile 'broken' requires a non-empty string model")
 
 -- mag.loaded snapshots the kernel factory registry for factory validation.
 do
