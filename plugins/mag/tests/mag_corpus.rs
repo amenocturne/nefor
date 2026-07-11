@@ -1,0 +1,336 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+
+use nefor_protocol::{Body, Envelope, PluginName, PluginOutgoing, SystemBody, Timestamp};
+use serde_json::{json, Map, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin};
+use tokio::time::timeout;
+
+const READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn binary_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_mag-plugin"))
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn kernel_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua/mag-kernel/init.lua")
+}
+
+fn source_files(root: &Path, extension: &str) -> Vec<PathBuf> {
+    fn visit(dir: &Path, extension: &str, paths: &mut Vec<PathBuf>) {
+        let mut entries = fs::read_dir(dir)
+            .unwrap_or_else(|error| panic!("read corpus directory {}: {error}", dir.display()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|error| panic!("read entry under {}: {error}", dir.display()));
+        entries.sort_by_key(|entry| entry.path());
+
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = path.file_name().and_then(|name| name.to_str());
+                if !matches!(name, Some(".git" | "target" | "tmp")) {
+                    visit(&path, extension, paths);
+                }
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some(extension) {
+                paths.push(path);
+            }
+        }
+    }
+
+    let mut paths = Vec::new();
+    visit(root, extension, &mut paths);
+    paths.sort();
+    paths
+}
+
+fn mag_files(root: &Path) -> Vec<PathBuf> {
+    source_files(root, "mag")
+}
+
+fn module_name(lib_root: &Path, path: &Path) -> String {
+    path.strip_prefix(lib_root)
+        .unwrap_or_else(|_| panic!("{} is not under {}", path.display(), lib_root.display()))
+        .with_extension("")
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+async fn spawn_mag(data_dir: &Path) -> Child {
+    let mut cmd = tokio::process::Command::new(binary_path());
+    cmd.arg("--kernel")
+        .arg(kernel_path())
+        .env("NEFOR_DATA_DIR", data_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    cmd.spawn().expect("spawn mag-plugin")
+}
+
+async fn read_outgoing<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    expecting: &str,
+) -> PluginOutgoing {
+    let mut line = String::new();
+    match timeout(READ_TIMEOUT, reader.read_line(&mut line)).await {
+        Ok(Ok(0)) => panic!("mag stdout closed while expecting {expecting}"),
+        Ok(Ok(_)) => PluginOutgoing::parse_line(line.trim_end()).expect("parse mag output"),
+        Ok(Err(error)) => panic!("read mag stdout while expecting {expecting}: {error}"),
+        Err(_) => panic!("timed out waiting for mag output while expecting {expecting}"),
+    }
+}
+
+async fn write_envelope(stdin: &mut ChildStdin, envelope: Envelope) {
+    stdin
+        .write_all(envelope.to_line().as_bytes())
+        .await
+        .expect("write envelope");
+    stdin.write_all(b"\n").await.expect("write newline");
+    stdin.flush().await.expect("flush envelope");
+}
+
+async fn send_event(stdin: &mut ChildStdin, body: Map<String, Value>) {
+    write_envelope(
+        stdin,
+        Envelope::event(PluginName::engine(), Timestamp::now(), body),
+    )
+    .await;
+}
+
+async fn handshake<R: AsyncBufReadExt + Unpin>(reader: &mut R, stdin: &mut ChildStdin) {
+    let ready = read_outgoing(reader, "system ready").await;
+    assert!(matches!(ready.body, Body::System(SystemBody::Ready { .. })));
+    write_envelope(
+        stdin,
+        Envelope::system(
+            PluginName::engine(),
+            Timestamp::now(),
+            SystemBody::ReadyOk {
+                engine_version: "test".into(),
+            },
+        ),
+    )
+    .await;
+}
+
+async fn load<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    stdin: &mut ChildStdin,
+    id: &str,
+    source_dir: &Path,
+    entry: &Path,
+    module_roots: &[PathBuf],
+) -> Map<String, Value> {
+    send_event(
+        stdin,
+        json!({
+            "kind": "mag.load",
+            "id": id,
+            "source_dir": source_dir.to_string_lossy(),
+            "entry": entry.to_string_lossy(),
+            "module_roots": module_roots,
+        })
+        .as_object()
+        .expect("load body is an object")
+        .clone(),
+    )
+    .await;
+
+    loop {
+        let outgoing = read_outgoing(reader, id).await;
+        if let Body::Event(body) = outgoing.body {
+            if body.get("in_reply_to").and_then(Value::as_str) == Some(id) {
+                return body;
+            }
+        }
+    }
+}
+
+async fn shutdown(mut stdin: ChildStdin, mut child: Child) {
+    write_envelope(
+        &mut stdin,
+        Envelope::system(
+            PluginName::engine(),
+            Timestamp::now(),
+            SystemBody::Shutdown {
+                reason: None,
+                grace_ms: None,
+            },
+        ),
+    )
+    .await;
+    drop(stdin);
+    let _ = timeout(Duration::from_secs(10), child.wait()).await;
+}
+
+#[tokio::test]
+async fn shipped_mag_corpus_compiles_with_runtime_contracts() {
+    let root = repo_root();
+    let starter = root.join("starter");
+    let lib_root = starter.join("mag/lib");
+    let fixture_root = starter.join("mag/tests");
+    let all_mag = mag_files(&root);
+    let libraries = mag_files(&lib_root);
+    let fixtures = mag_files(&fixture_root);
+    let entrypoints = all_mag
+        .iter()
+        .filter(|path| {
+            path.starts_with(&starter)
+                && !path.starts_with(&lib_root)
+                && !path.starts_with(&fixture_root)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let unclassified = all_mag
+        .iter()
+        .filter(|path| {
+            !libraries.contains(path) && !fixtures.contains(path) && !entrypoints.contains(path)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        unclassified.is_empty(),
+        "shipped MAG files are outside the known library, entrypoint, or failure-fixture categories: {unclassified:#?}"
+    );
+
+    assert!(
+        !libraries.is_empty(),
+        "no shipped MAG library modules found"
+    );
+    assert!(!entrypoints.is_empty(), "no shipped MAG entrypoints found");
+
+    let missing_expectations = fixtures
+        .iter()
+        .filter(|path| !path.with_extension("error").is_file())
+        .collect::<Vec<_>>();
+    assert!(
+        missing_expectations.is_empty(),
+        "MAG failure fixtures missing matching .error files: {missing_expectations:#?}"
+    );
+
+    let orphan_expectations = source_files(&fixture_root, "error")
+        .into_iter()
+        .filter(|path| !path.with_extension("mag").is_file())
+        .collect::<Vec<_>>();
+    assert!(
+        orphan_expectations.is_empty(),
+        "MAG .error files missing matching fixtures: {orphan_expectations:#?}"
+    );
+
+    let temp_root = std::env::temp_dir().join(format!("mag-corpus-{}", std::process::id()));
+    fs::create_dir_all(&temp_root).expect("create MAG corpus temp directory");
+    let synthetic = libraries
+        .iter()
+        .map(|path| format!("(require \"{}\")", module_name(&lib_root, path)))
+        .chain(std::iter::once(
+            "(artifact \"test.mag-corpus/v1\" {})".to_owned(),
+        ))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(temp_root.join("all-libraries.mag"), synthetic)
+        .expect("write synthetic MAG library entrypoint");
+
+    let mut child = spawn_mag(&temp_root).await;
+    let mut stdin = child.stdin.take().expect("mag stdin");
+    let stdout = child.stdout.take().expect("mag stdout");
+    let mut reader = BufReader::new(stdout);
+    let stderr = child.stderr.take().expect("mag stderr");
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            eprintln!("[mag stderr] {line}");
+        }
+    });
+    handshake(&mut reader, &mut stdin).await;
+
+    let library_result = load(
+        &mut reader,
+        &mut stdin,
+        "corpus-libraries",
+        &temp_root,
+        Path::new("all-libraries.mag"),
+        std::slice::from_ref(&lib_root),
+    )
+    .await;
+    assert_eq!(
+        library_result.get("kind").and_then(Value::as_str),
+        Some("mag.loaded"),
+        "shipped MAG libraries failed to compile: {library_result:#?}"
+    );
+
+    for (index, path) in entrypoints.iter().enumerate() {
+        let entry = path
+            .strip_prefix(&starter)
+            .expect("entrypoint under starter");
+        let result = load(
+            &mut reader,
+            &mut stdin,
+            &format!("corpus-entry-{index}"),
+            &starter,
+            entry,
+            std::slice::from_ref(&lib_root),
+        )
+        .await;
+        assert_eq!(
+            result.get("kind").and_then(Value::as_str),
+            Some("mag.loaded"),
+            "shipped MAG entrypoint {} failed to compile: {result:#?}",
+            path.display()
+        );
+    }
+
+    for (index, path) in fixtures.iter().enumerate() {
+        let expected = fs::read_to_string(path.with_extension("error"))
+            .unwrap_or_else(|error| panic!("read expectation for {}: {error}", path.display()));
+        assert!(
+            !expected.trim().is_empty(),
+            "MAG failure fixture {} has an empty .error expectation",
+            path.display()
+        );
+        let entry = path
+            .strip_prefix(&fixture_root)
+            .expect("fixture under fixture root");
+        let result = load(
+            &mut reader,
+            &mut stdin,
+            &format!("corpus-failure-{index}"),
+            &fixture_root,
+            entry,
+            std::slice::from_ref(&lib_root),
+        )
+        .await;
+        assert_eq!(
+            result.get("kind").and_then(Value::as_str),
+            Some("mag.error"),
+            "expected MAG fixture {} to fail, got: {result:#?}",
+            path.display()
+        );
+        let message = result
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!(
+                    "mag.error for {} has no message: {result:#?}",
+                    path.display()
+                )
+            });
+        assert!(
+            message.contains(expected.trim()),
+            "MAG fixture {} produced unexpected diagnostic\nexpected substring: {:?}\nactual: {message}",
+            path.display(),
+            expected.trim()
+        );
+    }
+
+    shutdown(stdin, child).await;
+    let _ = fs::remove_dir_all(temp_root);
+}
