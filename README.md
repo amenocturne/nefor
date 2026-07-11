@@ -123,6 +123,7 @@ All commands live in the [`justfile`](justfile). Run `just` to see the full list
 
 ## Docs
 
+- [MAG: ground-up visual explanation](docs/mag.html)
 - [Architecture and writing principles](docs/principles.md)
 - [Plugin authoring guide](docs/plugin-authoring.md)
 - [Testing](docs/testing.md)
