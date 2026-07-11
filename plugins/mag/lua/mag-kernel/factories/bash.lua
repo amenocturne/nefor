@@ -53,6 +53,18 @@ local COMMAND_FAILED = "mag.CommandFailed"
 
 M.declaration = {
   name = "bash",
+  semantic = {
+    input={kind="union",items={{kind="primitive",name="Unit"},{kind="named",name="nefor.contracts.Text",arguments={}}}},
+    output={kind="named",name="nefor.contracts.Text",arguments={}},
+    inputs={
+      {wire="mag.Unit",type={kind="primitive",name="Unit"}},
+      {wire="mag.Text",type={kind="named",name="nefor.contracts.Text",arguments={}}},
+    },
+    outputs={
+      {wire="mag.Text",type={kind="named",name="nefor.contracts.Text",arguments={}}},
+      {wire=COMMAND_FAILED,type={kind="primitive",name="Data"}},
+    },
+  },
 
   params = {
     command = "string", -- required; construction fails without it

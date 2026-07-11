@@ -44,6 +44,8 @@
                               :system String
                               :tools (List String)
                               :schema Data})
+(type CollectorParams {:expected_senders (List String)})
+(type DynamicParams {})
 
 (foreign nefor.factory.adapter [T]
   {:params AdapterParams
@@ -84,3 +86,17 @@
   {:params SinkParams
    :input T
    :output Unit})
+
+(foreign nefor.factory.collector [T]
+  {:params CollectorParams
+   :input T
+   :output (List T)})
+
+(foreign nefor.factory.collect-item [T]
+  {:params DynamicParams :input T :output T})
+(foreign nefor.factory.collected-prompt [T]
+  {:params DynamicParams :input (List T) :output ProviderInput})
+(foreign nefor.factory.outcome [T E]
+  {:params DynamicParams
+   :input (core.validated.Validated E T)
+   :output (core.validated.Validated E T)})

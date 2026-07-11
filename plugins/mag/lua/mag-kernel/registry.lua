@@ -27,6 +27,7 @@
 
 local shape = require("shape")
 local kinds = require("kinds")
+local type_node = require("type-node")
 
 local registry = {}
 registry.__index = registry
@@ -102,6 +103,67 @@ local function validate_declaration(decl)
       end
       seen[variable] = true
     end
+  end
+
+  if decl.semantic ~= nil then
+    local variables=decl.type_variables or {}
+    if type(decl.semantic)~="table" or type(decl.semantic.input)~="table" or
+        type(decl.semantic.output)~="table" or type(decl.semantic.inputs)~="table" or
+        type(decl.semantic.outputs)~="table" then
+      return nil,"declaration.semantic must contain input/output schemes and endpoint pairs"
+    end
+    local ok,err=type_node.validate(decl.semantic.input,variables)
+    if not ok then return nil,"semantic input scheme: "..err end
+    ok,err=type_node.validate(decl.semantic.output,variables)
+    if not ok then return nil,"semantic output scheme: "..err end
+    local seen={}
+    for index,endpoint in ipairs(decl.semantic.inputs) do
+      if type(endpoint)~="table" or type(endpoint.wire)~="string" or seen[endpoint.wire] then
+        return nil,"semantic inputs need unique {wire,type} entries"
+      end
+      seen[endpoint.wire]=true
+      ok,err=type_node.validate(endpoint.type,variables)
+      if not ok then return nil,string.format("semantic input %d: %s",index,err) end
+    end
+    seen={}
+    for index,endpoint in ipairs(decl.semantic.outputs) do
+      if type(endpoint)~="table" or type(endpoint.wire)~="string" or seen[endpoint.wire] then
+        return nil,"semantic outputs need unique {wire,type} entries"
+      end
+      seen[endpoint.wire]=true
+      ok,err=type_node.validate(endpoint.type,variables)
+      if not ok then return nil,string.format("semantic output %d: %s",index,err) end
+    end
+
+    local function wire_set(values)
+      local set={}
+      for _,wire in ipairs(values) do
+        if set[wire] then return nil,"duplicate runtime wire "..tostring(wire) end
+        set[wire]=true
+      end
+      return set
+    end
+    local runtime_inputs={}
+    for _,input_shape in pairs(decl.inputs) do
+      for _,wire in ipairs(shape.tags(input_shape)) do runtime_inputs[wire]=true end
+    end
+    local semantic_inputs={}; for _,endpoint in ipairs(decl.semantic.inputs) do semantic_inputs[endpoint.wire]=true end
+    local runtime_outputs,wire_err=wire_set(decl.outputs)
+    if not runtime_outputs then return nil,wire_err end
+    local semantic_outputs={}; for _,endpoint in ipairs(decl.semantic.outputs) do semantic_outputs[endpoint.wire]=true end
+    local function same_set(left,right)
+      for wire in pairs(left) do if not right[wire] then return false end end
+      for wire in pairs(right) do if not left[wire] then return false end end
+      return true
+    end
+    if not same_set(runtime_inputs,semantic_inputs) then
+      return nil,"semantic input wires must exactly match runtime input tags"
+    end
+    if not same_set(runtime_outputs,semantic_outputs) then
+      return nil,"semantic output wires must exactly match runtime output tags"
+    end
+  elseif #(decl.type_variables or {})>0 then
+    return nil,"generic declaration requires a semantic endpoint scheme"
   end
 
   if decl.signals ~= nil then
@@ -278,9 +340,11 @@ function registry:validate_modification(modification, resolve)
 
   -- id -> factory name, for destination wiring checks.
   local factory_of = {}
+  local spec_of = {}
   for _, spec in ipairs(actors) do
     if type(spec.id) == "string" then
       factory_of[spec.id] = spec.factory
+      spec_of[spec.id] = spec
     end
   end
 
@@ -289,12 +353,12 @@ function registry:validate_modification(modification, resolve)
   local function dest_factory_of(spec, tag, dest_id)
     local dest_factory = factory_of[dest_id]
     if dest_factory then
-      return dest_factory
+      return dest_factory, spec_of[dest_id]
     end
     if not resolve then
       return nil -- no resolver: outside-the-modification dests are skipped
     end
-    local factory, state = resolve(dest_id)
+    local factory, state, resolved_spec = resolve(dest_id)
     if factory == nil then
       table.insert(errors, string.format(
         "actor %q: route %q destination %q does not exist "
@@ -305,7 +369,7 @@ function registry:validate_modification(modification, resolve)
     if state == "dead" then
       return nil -- race artifact; delivery drops these as logged no-ops
     end
-    return factory
+    return factory, resolved_spec
   end
 
   for _, spec in ipairs(actors) do
@@ -314,6 +378,77 @@ function registry:validate_modification(modification, resolve)
       table.insert(errors, string.format(
         "actor %q: unknown factory %q", tostring(spec.id), tostring(spec.factory)))
     else
+      local variables = decl.type_variables or {}
+      local evidence = spec.evidence
+      if decl.semantic and type(evidence) ~= "table" then
+        table.insert(errors, string.format(
+          "actor %q: semantic factory requires compiler foreign evidence", tostring(spec.id)))
+      elseif type(evidence) == "table" and
+          (evidence.version ~= 2 or evidence.identity ~= decl.identity or
+           type(evidence.arguments) ~= "table" or type(evidence.input) ~= "table" or
+           type(evidence.output) ~= "table") then
+        table.insert(errors, string.format(
+          "actor %q: invalid or mismatched foreign evidence", tostring(spec.id)))
+      elseif type(evidence) == "table" and #evidence.arguments ~= #variables then
+        table.insert(errors, string.format(
+          "actor %q: factory %q expects %d type argument(s), got %d",
+          tostring(spec.id), spec.factory, #variables, #evidence.arguments))
+      elseif type(evidence) == "table" then
+        local arguments={}; local evidence_ok=true
+        for index, argument in ipairs(evidence.arguments) do
+          local ok,err=type_node.validate(argument); arguments[index]=argument
+          if not ok then evidence_ok=false; table.insert(errors,string.format(
+            "actor %q: foreign evidence argument %d: %s",tostring(spec.id),index,err)) end
+        end
+        local input_ok,input_err=type_node.validate(evidence.input)
+        local output_ok,output_err=type_node.validate(evidence.output)
+        if not input_ok then evidence_ok=false; table.insert(errors,string.format("actor %q: evidence input: %s",tostring(spec.id),input_err)) end
+        if not output_ok then evidence_ok=false; table.insert(errors,string.format("actor %q: evidence output: %s",tostring(spec.id),output_err)) end
+        local input = spec.input
+        local input_type=type(input)=="table" and input.type or nil
+        local spec_input_ok=type_node.validate(input_type)
+        if not spec_input_ok then
+          table.insert(errors, string.format("actor %q: semantic input is not a valid structural type", tostring(spec.id)))
+        end
+        if decl.semantic and evidence_ok then
+          local bindings={}; for index,variable in ipairs(variables) do bindings[variable]=arguments[index] end
+          local evidence_input=type_node.substitute(decl.semantic.input,bindings)
+          local evidence_output=type_node.substitute(decl.semantic.output,bindings)
+          local expected_input=nil
+          for _,endpoint in ipairs(decl.semantic.inputs) do
+            if endpoint.wire==input.wire then expected_input=type_node.substitute(endpoint.type,bindings) end
+          end
+          local expected_outputs={}
+          for _,endpoint in ipairs(decl.semantic.outputs) do
+            expected_outputs[endpoint.wire]=type_node.substitute(endpoint.type,bindings)
+          end
+          if not type_node.equal(evidence.input,evidence_input) or
+              not type_node.equal(evidence.output,evidence_output) then
+            table.insert(errors, string.format("actor %q: foreign evidence does not instantiate the registry scheme", tostring(spec.id)))
+          end
+          if not expected_input or not type_node.equal(input.type,expected_input) then
+            table.insert(errors,string.format("actor %q: semantic input wire has the wrong type",tostring(spec.id)))
+          end
+          local actual={}
+          for _,output in ipairs(spec.outputs or {}) do
+            local ok,err=type_node.validate(output.type)
+            if not ok then table.insert(errors,string.format("actor %q output type: %s",tostring(spec.id),err))
+            elseif actual[output.wire] then table.insert(errors,string.format("actor %q: duplicate semantic output wire %q",tostring(spec.id),output.wire))
+            else actual[output.wire]=output.type end
+          end
+          for wire,expected in pairs(expected_outputs) do
+            local required=type_node.equal(expected,evidence_output)
+            if evidence_output.kind=="union" then
+              for _,arm in ipairs(evidence_output.items) do if type_node.equal(expected,arm) then required=true end end
+            end
+            if (required and not actual[wire]) or (actual[wire] and not type_node.equal(actual[wire],expected)) then
+              table.insert(errors,string.format("actor %q: semantic output for wire %q is missing or has the wrong type",tostring(spec.id),wire))
+            end
+            actual[wire]=nil
+          end
+          if next(actual) then table.insert(errors,string.format("actor %q: undeclared semantic output wire",tostring(spec.id))) end
+          end
+        end
       local declared_output = {}
       for _, tag in ipairs(decl.outputs) do
         declared_output[tag] = true
@@ -326,7 +461,7 @@ function registry:validate_modification(modification, resolve)
             tostring(spec.id), tostring(tag), spec.factory))
         else
           for _, dest_id in ipairs(dests) do
-            local dest_factory = dest_factory_of(spec, tag, dest_id)
+            local dest_factory,dest_spec = dest_factory_of(spec, tag, dest_id)
             if dest_factory then
               local dest_decl = self:declaration(dest_factory)
               if not dest_decl then
@@ -345,6 +480,19 @@ function registry:validate_modification(modification, resolve)
                   table.insert(errors, string.format(
                     "wiring %q -%s-> %q: no input of factory %q accepts that tag",
                     tostring(spec.id), tag, tostring(dest_id), dest_factory))
+                elseif dest_spec and (spec.evidence or dest_spec.evidence) then
+                  local source_semantic=nil
+                  for _,output in ipairs(spec.outputs or {}) do
+                    if output.wire==tag then
+                      if source_semantic then source_semantic=false else source_semantic=output.type end
+                    end
+                  end
+                  local dest_semantic=type(dest_spec.input)=="table" and dest_spec.input.type or nil
+                  if not source_semantic or not dest_semantic or not type_node.equal(source_semantic,dest_semantic) then
+                    table.insert(errors,string.format(
+                      "wiring %q -%s-> %q: semantic endpoint types differ",
+                      tostring(spec.id),tag,tostring(dest_id)))
+                  end
                 end
               end
             end

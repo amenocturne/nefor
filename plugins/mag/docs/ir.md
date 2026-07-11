@@ -1,5 +1,34 @@
 # IR — graph modifications
 
+## Generic foreign specialization
+
+Lowered actors retain an opaque `ForeignEvidence` value produced by
+`specialize`: version, foreign identity, concrete arguments, and instantiated
+semantic input/output. Ordinary MAG data and `as Data` cannot construct this
+value. At the artifact boundary it becomes a versioned descriptor; the runtime
+checks identity, arity, registry scheme instantiation, semantic endpoints, and
+fixed wire tags before spawning anything. Non-generic actors remain unchanged.
+Dynamic routes to static actors are validated against the live inventory
+atomically with new actors.
+
+The artifact carries version-2 structural type nodes directly: primitives,
+qualified nominal applications, lists, maps, records, unions, and products.
+Registry schemes use the same representation plus explicit variables. The
+runtime validates every node recursively, substitutes concrete arguments, and
+compares the result structurally; it never reparses a display string. Functions,
+type tags, foreign capabilities, artifacts, empty-list placeholders, and
+unresolved variables are rejected at the evidence boundary.
+
+Registry semantic endpoints are declared as `{wire, type}` pairs. Validation
+checks each instantiated pair, so matching the set of wires and the set of
+union arms independently is insufficient: swapping two union types between
+their wires rejects before any actor is spawned. Dynamic routes additionally
+require the source and destination structural types to be equal.
+Registration first requires the semantic input/output wire sets to exactly
+match the factory's runtime shapes. Every factory carrying such a semantic
+contract requires compiler evidence, including non-generic factories; only
+runtime-only factories without a semantic contract may omit it.
+
 ## Host artifact boundary
 
 MAG programs return a generic artifact rather than a bare modification:

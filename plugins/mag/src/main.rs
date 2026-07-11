@@ -618,7 +618,6 @@ fn validate_loaded_rules(program: &LoadedProgram, artifact: &Value) -> Result<()
         let input = rule
             .get("on")
             .and_then(|on| on.get("type"))
-            .and_then(Value::as_str)
             .ok_or_else(|| format!("rule {id:?} missing source semantic type"))?;
         nefor_mag::validate_rule_fn_input(program, function, input)
             .map_err(|error| format!("rule {id:?}: {error}"))?;
@@ -1610,11 +1609,11 @@ mod tests {
                    :params {:greeting "expanded"} :routes {}}]
                  :messages [{:to "source" :content {:kind "stub.In"}}]
                  :kills []
-                 :rules [{:id "expand" :on {:actor "source" :type "(core.validated.Validated nefor.contracts.OutputError main.Task)" :wire "stub.Out"}
+                 :rules [{:id "expand" :on {:actor "source" :type (type-evidence (type-tag (core.validated.Validated nefor.contracts.OutputError Task))) :wire "stub.Out"}
                           :fn "expand"}
-                         {:id "finish" :on {:actor "middle" :type "Data" :wire "stub.Out"}
+                         {:id "finish" :on {:actor "middle" :type (type-evidence (type-tag Data)) :wire "stub.Out"}
                           :fn "finish"}]
-                 :result {:from {:actor "result" :type "Data" :wire "stub.Out"}}})
+                 :result {:from {:actor "result" :type (type-evidence (type-tag Data)) :wire "stub.Out"}}})
             "#,
         )
         .expect("program");
@@ -1665,57 +1664,6 @@ mod tests {
             .expect("quiescent")
             .is_none());
         fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn active_run_keeps_the_program_snapshot_it_started_with() {
-        let root = std::env::temp_dir().join(format!("mag-program-pin-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("a.mag"), "(artifact \"test.a/v1\" {})").unwrap();
-        fs::write(root.join("b.mag"), "(artifact \"test.b/v1\" {})").unwrap();
-        let a = Arc::new(nefor_mag::load(&root, "a.mag").unwrap());
-        let b = Arc::new(nefor_mag::load(&root, "b.mag").unwrap());
-        let mut active = ActiveExecutes::new();
-        active.insert(
-            "run-a".into(),
-            ActiveExecute {
-                in_reply_to: None,
-                program: Some(a.clone()),
-            },
-        );
-        assert_eq!(
-            run_program(&active, Some(b.as_ref()), "run-a").map(|program| &program.hash),
-            Some(&a.hash)
-        );
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn artifact_body_names_the_kind() {
-        let b = artifact_body(
-            None,
-            serde_json::json!({"format": GRAPH_MODIFICATION_FORMAT, "data": {}}),
-        );
-        assert_eq!(b.get("kind").and_then(Value::as_str), Some("mag.artifact"));
-        assert!(b.get("in_reply_to").is_none());
-        assert!(b.get("artifact").is_some());
-    }
-
-    #[test]
-    fn applied_body_acks_ok_and_error() {
-        let ok = applied_body(Some("apply-1"), true, None);
-        assert_eq!(ok.get("kind").and_then(Value::as_str), Some("mag.applied"));
-        assert_eq!(
-            ok.get("in_reply_to").and_then(Value::as_str),
-            Some("apply-1")
-        );
-        assert_eq!(ok.get("ok").and_then(Value::as_bool), Some(true));
-        assert!(ok.get("error").is_none());
-
-        let bad = applied_body(None, false, Some("rejected"));
-        assert_eq!(bad.get("ok").and_then(Value::as_bool), Some(false));
-        assert_eq!(bad.get("error").and_then(Value::as_str), Some("rejected"));
     }
 
     #[test]

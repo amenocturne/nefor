@@ -4,9 +4,10 @@
 ;; Graphs are plain library data. A port keeps its public semantic MAG type
 ;; separate from the foreign actor's runtime wire identity.
 (type Port [T] {:actor String :type (TypeTag T) :wire String})
-(type StoredPort {:actor String :type String :wire String})
+(type StoredPort {:actor String :type Data :wire String})
 (type Actor {:id String
              :foreign String
+             :evidence ForeignEvidence
              :params Data
              :input StoredPort
              :outputs (List StoredPort)})
@@ -34,6 +35,9 @@
                        :type_scheme ForeignTypeScheme})
 (type LowerActor {:id String
                   :foreign String
+                  :evidence ForeignEvidence
+                  :input StoredPort
+                  :outputs (List StoredPort)
                   :params Data
                   :routes (Map String (List String))})
 (type LowerMessage {:to String :content Data})
@@ -53,12 +57,13 @@
 
 (def store-port (fn [T] [[port (Port T)]] -> StoredPort
   (as StoredPort {:actor (get port "actor")
-   :type (str (get port "type"))
+   :type (type-evidence (get port "type"))
    :wire (get port "wire")})))
 
 (def actor (fn [P I O] [[id String] [capability (Foreign P I O)] [params P]
                 [input StoredPort] [outputs (List StoredPort)]] -> Actor
   (as Actor {:id id :foreign (foreign-id capability)
+   :evidence (foreign-evidence capability)
    :params (as Data params) :input input :outputs outputs})))
 
 (def route (fn [T] [[from (Port T)] [to (Port T)]] -> (Route T)
@@ -68,19 +73,45 @@
   (let [from (get edge "from") to (get edge "to")]
     (as StoredRoute
       {:from (as StoredPort {:actor (get from "actor")
-                             :type (str (get from "type"))
+       :type (type-evidence (get from "type"))
                              :wire (get from "wire")})
        :to (as StoredPort {:actor (get to "actor")
-                           :type (str (get to "type"))
+                           :type (type-evidence (get to "type"))
                            :wire (get to "wire")})}))))
 (def message (fn [[to String] [content Data]] -> Message
   (as Message {:to to :content content})))
+(def typed-message (fn [T] [[to (Port T)] [value T]] -> Message
+  (as Message {:to (get to "actor")
+               :content (as Data {:kind (get to "wire") :value value})})))
 (def rule (fn [T] [[id String] [on (Port T)] [fn-name String]] -> Rule
   (as Rule {:id id :on (store-port on) :fn fn-name})))
 
 (def delta (fn [[actors (List Actor)] [routes (List StoredRoute)]
                 [messages (List Message)] [kills (List String)]] -> Delta
   (as Delta {:actors actors :routes routes :messages messages :kills kills})))
+
+(def fragment-delta (fn [I O] [[fragment (Fragment I O)]] -> Delta
+  (as Delta {:actors (get fragment "actors")
+             :routes (get fragment "routes")
+             :messages [] :kills []})))
+(def merge-delta (fn [[left Delta] [right Delta]] -> Delta
+  (as Delta {:actors (concat (get left "actors") (get right "actors"))
+             :routes (concat (get left "routes") (get right "routes"))
+             :messages (concat (get left "messages") (get right "messages"))
+             :kills (concat (get left "kills") (get right "kills"))})))
+(def delta-route (fn [T] [[change Delta] [from (Port T)] [to (Port T)]] -> Delta
+  (as Delta {:actors (get change "actors")
+             :routes (concat (get change "routes") [(store-route (route from to))])
+             :messages (get change "messages") :kills (get change "kills")})))
+(def delta-message (fn [T] [[change Delta] [to (Port T)] [value T]] -> Delta
+  (as Delta {:actors (get change "actors")
+             :routes (get change "routes")
+             :messages (concat (get change "messages") [(typed-message to value)])
+             :kills (get change "kills")})))
+(def delta-message-front (fn [T] [[change Delta] [to (Port T)] [value T]] -> Delta
+  (as Delta {:actors (get change "actors") :routes (get change "routes")
+             :messages (concat [(typed-message to value)] (get change "messages"))
+             :kills (get change "kills")})))
 
 ;; Runtime registry entries contain additional implementation/schema fields.
 ;; Project only the structural contract the graph validator consumes.
@@ -103,7 +134,7 @@
    :rules rules
    :result (as ResultBoundary
              {:from (as StoredPort {:actor (get result "actor")
-                                    :type (str (get result "type"))
+                                    :type (type-evidence (get result "type"))
                                     :wire (get result "wire")})})})))
 
 ;; Compose two single-exit fragments. Fragment construction remains ordinary
@@ -115,11 +146,11 @@
              [(as StoredRoute
                 {:from (as StoredPort
                          {:actor (get (get left "output") "actor")
-                          :type (str (get (get left "output") "type"))
+                          :type (type-evidence (get (get left "output") "type"))
                           :wire (get (get left "output") "wire")})
                  :to (as StoredPort
                        {:actor (get (get right "input") "actor")
-                        :type (str (get (get right "input") "type"))
+                        :type (type-evidence (get (get right "input") "type"))
                         :wire (get (get right "input") "wire")})})])
    :input (get left "input")
    :output (get right "output")})))
@@ -136,7 +167,7 @@
        (as ResultBoundary
          {:from (as StoredPort
                   {:actor (get result "actor")
-                   :type (str (get result "type"))
+                   :type (type-evidence (get result "type"))
                    :wire (get result "wire")})})}))))
 
 (def routes-from (fn [[graph Graph] [actor-id String]] -> (List StoredRoute)
@@ -176,12 +207,18 @@
 (def lower-actor (fn [[graph Graph] [actor Actor]] -> LowerActor
   (as LowerActor {:id (get actor "id")
    :foreign (get actor "foreign")
+   :evidence (get actor "evidence")
+   :input (get actor "input")
+   :outputs (get actor "outputs")
    :params (get actor "params")
    :routes (actor-routes graph actor)})))
 
 (def lower-delta-actor (fn [[delta Delta] [actor Actor]] -> LowerActor
   (as LowerActor {:id (get actor "id")
    :foreign (get actor "foreign")
+   :evidence (get actor "evidence")
+   :input (get actor "input")
+   :outputs (get actor "outputs")
    :params (get actor "params")
    :routes (actor-routes-from (get delta "routes") actor)})))
 
@@ -423,3 +460,13 @@
      :messages (map lower-message (get delta "messages"))
      :kills (get delta "kills")
      :rules (as (List LowerRule) [])})))
+
+;; Resident-rule graphs have a source output consumed by a rule rather than a
+;; route, so they lower from their ordinary Delta pieces without pretending
+;; that rule subscriptions are graph edges.
+(def lower-resident (fn [T] [[delta Delta] [rules (List Rule)] [result (Port T)]] -> Modification
+  (let [lowered (lower-delta delta)]
+    (as Modification
+      {:actors (get lowered "actors") :messages (get lowered "messages")
+       :kills (get lowered "kills") :rules (map lower-rule rules)
+       :result (as ResultBoundary {:from (store-port result)})}))))

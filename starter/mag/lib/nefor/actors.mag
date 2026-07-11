@@ -54,7 +54,7 @@
                      "generic-provider.ProviderOut")]
 
     (as (nefor.graph.Fragment I O) {:actors
-      [(nefor.graph.actor entry-id (specialize nefor.factory.adapter [Data])
+      [(nefor.graph.actor entry-id (specialize nefor.factory.adapter [I])
          (as nefor.contracts.AdapterParams {:seed "provider-in"})
          (nefor.graph.store-port entry-in)
          [(nefor.graph.store-port entry-out)])

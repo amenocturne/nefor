@@ -67,6 +67,12 @@ local M = {}
 
 M.declaration = {
   name = "run-tool",
+  semantic = {
+    input={kind="named",name="nefor.contracts.ToolCalls",arguments={}},
+    output={kind="named",name="nefor.contracts.ToolHandle",arguments={}},
+    inputs={{wire="generic-tool.ToolCalls",type={kind="named",name="nefor.contracts.ToolCalls",arguments={}}}},
+    outputs={{wire="generic-tool.ToolHandle",type={kind="named",name="nefor.contracts.ToolHandle",arguments={}}}},
+  },
 
   params = {
     allowlist = "table?",  -- tool-name allowlist for this node (lowered from :tools)

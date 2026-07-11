@@ -198,6 +198,7 @@ fn reify_type(
         }
         MagType::Artifact => return unsupported("Artifact"),
         MagType::TypeTag(_) => return unsupported("TypeTag"),
+        MagType::ForeignEvidence => return unsupported("ForeignEvidence"),
         MagType::Function(_, _) => return unsupported("Fn"),
         MagType::Foreign(_, _, _) => return unsupported("Foreign"),
         MagType::Var(name) => {

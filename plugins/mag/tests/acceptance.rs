@@ -134,11 +134,24 @@ fn body_kind(body: &Map<String, Value>) -> Option<&str> {
 /// result on `generic-provider.FinalAnswer`. Both `llm`s are seeded with a
 /// `generic-provider.ProviderOut` so they fire off the initial messages.
 fn two_agent_modification() -> Value {
+    fn named(name: &str) -> Value {
+        json!({"kind":"named","name":name,"arguments":[]})
+    }
+    fn evidence(identity: &str, input: Value, output: Value) -> Value {
+        json!({"version":2,"identity":identity,"arguments":[],"input":input,"output":output})
+    }
     fn agent(prefix: &str) -> Vec<Value> {
+        let provider_input = named("nefor.contracts.ProviderInput");
+        let tool_calls = named("nefor.contracts.ToolCalls");
+        let final_answer = named("nefor.contracts.FinalAnswer");
+        let tool_handle = named("nefor.contracts.ToolHandle");
         vec![
             json!({
                 "id": format!("{prefix}.llm"),
                 "factory": "llm",
+                "evidence": evidence("nefor.factory.llm",provider_input.clone(),json!({"kind":"union","items":[tool_calls.clone(),final_answer.clone()]})),
+                "input":{"wire":"generic-provider.ProviderOut","type":provider_input.clone()},
+                "outputs":[{"wire":"generic-tool.ToolCalls","type":tool_calls.clone()},{"wire":"generic-provider.FinalAnswer","type":final_answer}],
                 "params": { "model": "opus", "provider": PROVIDER, "system": "work" },
                 "routes": {
                     "generic-tool.ToolCalls": [format!("{prefix}.run-tool")],
@@ -148,12 +161,18 @@ fn two_agent_modification() -> Value {
             json!({
                 "id": format!("{prefix}.run-tool"),
                 "factory": "run-tool",
+                "evidence": evidence("nefor.factory.run-tool",tool_calls.clone(),tool_handle.clone()),
+                "input":{"wire":"generic-tool.ToolCalls","type":tool_calls},
+                "outputs":[{"wire":"generic-tool.ToolHandle","type":tool_handle.clone()}],
                 "params": {},
                 "routes": { "generic-tool.ToolHandle": [format!("{prefix}.tool-result")] }
             }),
             json!({
                 "id": format!("{prefix}.tool-result"),
                 "factory": "tool-result",
+                "evidence": evidence("nefor.factory.tool-result",tool_handle.clone(),provider_input.clone()),
+                "input":{"wire":"generic-tool.ToolHandle","type":tool_handle},
+                "outputs":[{"wire":"generic-provider.ProviderOut","type":provider_input}],
                 "params": {},
                 "routes": { "generic-provider.ProviderOut": [format!("{prefix}.llm")] }
             }),

@@ -174,7 +174,9 @@ local function gate_actors()
       id = "rework", factory = "adapter", params = { seed = "provider-in" },
       routes = { ["generic-provider.ProviderOut"] = { "produce" } },
     },
-    { id = "out", factory = "sink", params = {}, routes = {} },
+    { id = "out", factory = "sink", params = {}, routes = {},
+      evidence={version=2,identity="nefor.factory.sink",arguments={{kind="named",name="test.Approved",arguments={}}},input={kind="named",name="test.Approved",arguments={}},output={kind="primitive",name="Unit"}},
+      input={type={kind="named",name="test.Approved",arguments={}},wire="human.Approved"},outputs={{type={kind="primitive",name="Unit"},wire="mag.Unit"}} },
   }
 end
 
@@ -389,7 +391,9 @@ do
         id = "review.rework", factory = "adapter", params = { seed = "provider-in" },
         routes = { ["generic-provider.ProviderOut"] = { "review.produce" } },
       },
-      { id = "sink", factory = "sink", params = {}, routes = {} },
+      { id = "sink", factory = "sink", params = {}, routes = {},
+        evidence={version=2,identity="nefor.factory.sink",arguments={{kind="named",name="test.Approved",arguments={}}},input={kind="named",name="test.Approved",arguments={}},output={kind="primitive",name="Unit"}},
+        input={type={kind="named",name="test.Approved",arguments={}},wire="human.Approved"},outputs={{type={kind="primitive",name="Unit"},wire="mag.Unit"}} },
     },
   })
   assert_eq(result.ok, true,

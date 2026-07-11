@@ -316,10 +316,16 @@ fn eval_specialize(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
         .iter()
         .map(|expr| parse_type(env, expr, &HashSet::new()))
         .collect::<Result<Vec<_>, _>>()?;
-    let subst = decl.type_params.iter().cloned().zip(types).collect();
+    let subst = decl
+        .type_params
+        .iter()
+        .cloned()
+        .zip(types.clone())
+        .collect();
     Ok(Value::Foreign(ForeignDecl {
         name: decl.name,
         type_params: vec![],
+        specialization: types,
         params: crate::checker::substitute(&decl.params, &subst),
         input: crate::checker::substitute(&decl.input, &subst),
         output: crate::checker::substitute(&decl.output, &subst),
@@ -460,6 +466,7 @@ fn eval_foreign(env: &mut Env, args: &[Expr]) -> Result<Value, MagError> {
     let decl = ForeignDecl {
         name,
         type_params: binder_names,
+        specialization: vec![],
         params: parse_type(env, field("params")?, &binders)?,
         input: parse_type(env, field("input")?, &binders)?,
         output: parse_type(env, field("output")?, &binders)?,
@@ -625,6 +632,7 @@ fn validate_value(env: &Env, value: &Value, ty: &MagType) -> Result<(), MagError
         MagType::TypeTag(expected) => {
             matches!(value, Value::TypeTag(actual) if actual == expected.as_ref())
         }
+        MagType::ForeignEvidence => matches!(value, Value::ForeignEvidence(_)),
         MagType::Union(types) => types.iter().any(|t| validate_value(env, value, t).is_ok()),
         MagType::Product(types) => types.iter().all(|t| validate_value(env, value, t).is_ok()),
         MagType::Function(_, _) => matches!(value, Value::Fn(_)),
@@ -775,6 +783,32 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
                 )),
             }
         }
+        "foreign-evidence" => {
+            arity(args, 1)?;
+            match raw(&args[0]) {
+                Value::Foreign(decl) => Ok(Value::ForeignEvidence(crate::ast::ForeignEvidence {
+                    identity: decl.name.clone(),
+                    arguments: decl.specialization.clone(),
+                    input: decl.input.clone(),
+                    output: decl.output.clone(),
+                })),
+                _ => Err(MagError::Type(
+                    "foreign-evidence expects a Foreign capability".into(),
+                )),
+            }
+        }
+        "type-evidence" => {
+            arity(args, 1)?;
+            match raw(&args[0]) {
+                Value::TypeTag(ty) => Ok(crate::json::json_to_value(
+                    &crate::json::type_evidence_to_json(ty)?,
+                )),
+                other => Err(MagError::Type(format!(
+                    "type-evidence expects TypeTag, got {}",
+                    other.type_name()
+                ))),
+            }
+        }
         "type-schema" => {
             arity(args, 1)?;
             let ty = match raw(&args[0]) {
@@ -803,7 +837,9 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
                 args[1].clone()
             })
         }
-        "map" | "filter" | "flat-map" | "fold" => collection_builtin(env, name, args),
+        "map" | "indexed-map" | "filter" | "flat-map" | "fold" => {
+            collection_builtin(env, name, args)
+        }
         "read" => {
             if args.is_empty() || args.len() > 2 {
                 return Err(MagError::Eval(
@@ -840,6 +876,16 @@ fn collection_builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, Ma
                 seq(&args[1])?
                     .iter()
                     .map(|v| apply(env, &args[0], std::slice::from_ref(v)))
+                    .collect::<Result<_, _>>()?,
+            ))
+        }
+        "indexed-map" => {
+            arity(args, 2)?;
+            Ok(Value::Vector(
+                seq(&args[1])?
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, value)| apply(env, &args[0], &[Value::Int(index as i64), value]))
                     .collect::<Result<_, _>>()?,
             ))
         }
@@ -909,6 +955,15 @@ fn equal(a: &Value, b: &Value) -> bool {
         (Value::Float(a), Value::Float(b)) => a == b,
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::Keyword(a), Value::Keyword(b)) => a == b,
+        (Value::Symbol(a), Value::Symbol(b)) => a == b,
+        (Value::List(a), Value::List(b)) | (Value::Vector(a), Value::Vector(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(left, right)| equal(left, right))
+        }
+        (Value::Map(a), Value::Map(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(key, value)| b.get(key).is_some_and(|other| equal(value, other)))
+        }
         _ => false,
     }
 }

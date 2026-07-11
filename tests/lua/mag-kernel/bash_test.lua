@@ -80,10 +80,18 @@ do
   local result = reg:validate_modification({
     actors = {
       { id = "bash-1", factory = "bash", params = { command = "rg foo" },
+        evidence={version=2,identity="nefor.factory.bash",arguments={},input={kind="union",items={{kind="primitive",name="Unit"},{kind="named",name="nefor.contracts.Text",arguments={}}}},output={kind="named",name="nefor.contracts.Text",arguments={}}},
+        input={type={kind="primitive",name="Unit"},wire="mag.Unit"},outputs={{type={kind="named",name="nefor.contracts.Text",arguments={}},wire="mag.Text"}},
         routes = { ["mag.Text"] = { "bash-2" } } },
       { id = "bash-2", factory = "bash", params = { command = "sort" },
+        evidence={version=2,identity="nefor.factory.bash",arguments={},input={kind="union",items={{kind="primitive",name="Unit"},{kind="named",name="nefor.contracts.Text",arguments={}}}},output={kind="named",name="nefor.contracts.Text",arguments={}}},
+        input={type={kind="named",name="nefor.contracts.Text",arguments={}},wire="mag.Text"},outputs={{type={kind="named",name="nefor.contracts.Text",arguments={}},wire="mag.Text"}},
         routes = { ["mag.Text"] = { "sink" } } },
-      { id = "sink", factory = "sink", params = {}, routes = {} },
+      { id = "sink", factory = "sink", params = {}, routes = {},
+        evidence = { version = 2, identity = "nefor.factory.sink",
+          arguments = {{kind="named",name="nefor.contracts.Text",arguments={}}}, input = {kind="named",name="nefor.contracts.Text",arguments={}}, output = {kind="primitive",name="Unit"} },
+        input = { type = {kind="named",name="nefor.contracts.Text",arguments={}}, wire = "mag.Text" },
+        outputs = { { type = {kind="primitive",name="Unit"}, wire = "mag.Unit" } } },
     },
   })
   assert_true(result.ok,

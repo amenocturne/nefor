@@ -58,8 +58,10 @@ fn rule_functions_are_named_unary_artifact_functions() {
     .unwrap();
     let loaded = load_with_inputs(&root, "main.mag", json!({})).unwrap();
     validate_rule_fn(&loaded, "expand").unwrap();
-    validate_rule_fn_input(&loaded, "expand", "String").unwrap();
-    assert!(validate_rule_fn_input(&loaded, "expand", "Int")
+    let string = serde_json::json!({"kind":"primitive","name":"String"});
+    let int = serde_json::json!({"kind":"primitive","name":"Int"});
+    validate_rule_fn_input(&loaded, "expand", &string).unwrap();
+    assert!(validate_rule_fn_input(&loaded, "expand", &int)
         .unwrap_err()
         .to_string()
         .contains("input must be Int"));

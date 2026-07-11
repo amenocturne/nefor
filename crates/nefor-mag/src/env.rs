@@ -54,6 +54,7 @@ impl Env {
         for name in [
             "str",
             "map",
+            "indexed-map",
             "filter",
             "flat-map",
             "fold",
@@ -67,6 +68,8 @@ impl Env {
             "=",
             "fail",
             "foreign-id",
+            "foreign-evidence",
+            "type-evidence",
             "read",
             "require",
             "artifact",
@@ -76,6 +79,7 @@ impl Env {
         }
         for (name, ty) in [
             ("Data", crate::types::MagType::Data),
+            ("ForeignEvidence", crate::types::MagType::ForeignEvidence),
             ("Artifact", crate::types::MagType::Artifact),
             ("Unit", crate::types::MagType::Unit),
             ("Bool", crate::types::MagType::Bool),

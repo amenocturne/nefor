@@ -70,7 +70,16 @@ pub struct TypeDecl {
 pub struct ForeignDecl {
     pub name: String,
     pub type_params: Vec<String>,
+    pub specialization: Vec<MagType>,
     pub params: MagType,
+    pub input: MagType,
+    pub output: MagType,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForeignEvidence {
+    pub identity: String,
+    pub arguments: Vec<MagType>,
     pub input: MagType,
     pub output: MagType,
 }
@@ -99,6 +108,7 @@ pub enum Value {
     TypeDecl(TypeDecl),
     TypeTag(MagType),
     Foreign(ForeignDecl),
+    ForeignEvidence(ForeignEvidence),
     Artifact(Artifact),
     Typed(Box<Value>, MagType),
 }
@@ -128,6 +138,7 @@ impl Value {
             Self::Type(_) | Self::TypeDecl(_) => "type",
             Self::TypeTag(_) => "type-tag",
             Self::Foreign(_) => "foreign",
+            Self::ForeignEvidence(_) => "foreign-evidence",
             Self::Artifact(_) => "artifact",
             Self::Typed(value, _) => value.type_name(),
         }

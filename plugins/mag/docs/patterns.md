@@ -1,5 +1,18 @@
 # Patterns — canonical shapes for MAG programs
 
+## Planner → workers → collector → static result
+
+A resident rule can bind exactly to `Validated<OutputError,List<Task>>`.
+`Valid` uses `indexed-map` to pair the actual task list with deterministic
+positions, maps those values into real structured-agent fragments, then
+returns one atomic delta containing those workers, typed task messages,
+worker-to-collector routes, and the collector route to a summarizer already in
+the initial graph. `Invalid` normalizes to the same typed outcome wire and
+spawns nothing. For `[]`, `nefor.dynamic.empty-to` targets the summarizer's
+typed `Port<List<T>>`; a zero-input collector would never fire. The shipped
+program is `starter/agentic-loop/dynamic-tasks.mag` and its real provider E2Es
+cover zero, invalid, and reverse worker completion.
+
 Every shipped pattern here has a clean expression in routes or input contracts.
 If a program needs one of these behaviors, use the listed shape — inventing a
 workaround (sentinel messages, polling actors, hand-rolled wait nodes) means

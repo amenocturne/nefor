@@ -6,6 +6,18 @@ local M = {}
 
 M.declaration = {
   name = "llm",
+  semantic = {
+    input={kind="named",name="nefor.contracts.ProviderInput",arguments={}},
+    output={kind="union",items={
+      {kind="named",name="nefor.contracts.ToolCalls",arguments={}},
+      {kind="named",name="nefor.contracts.FinalAnswer",arguments={}},
+    }},
+    inputs={{wire="generic-provider.ProviderOut",type={kind="named",name="nefor.contracts.ProviderInput",arguments={}}}},
+    outputs={
+      {wire="generic-tool.ToolCalls",type={kind="named",name="nefor.contracts.ToolCalls",arguments={}}},
+      {wire="generic-provider.FinalAnswer",type={kind="named",name="nefor.contracts.FinalAnswer",arguments={}}},
+    },
+  },
   params = {
     model = "string?", system = "string?", tools = "table?",
     profile = "string?", reasoning_effort = "string?",

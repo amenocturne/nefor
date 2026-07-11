@@ -62,10 +62,25 @@ local kinds = require("kinds")
 local M = {}
 
 local FINAL_ANSWER = "generic-provider.FinalAnswer"
+local PROVIDER_OUT = "generic-provider.ProviderOut"
 local REJECTED = "human.Rejected"
 
 M.declaration = {
   name = "adapter",
+  type_variables = { "T" },
+  semantic = {
+    input={kind="variable",name="T"},
+    output={kind="named",name="nefor.contracts.ProviderInput",arguments={}},
+    inputs = {
+      {wire="task",type={kind="variable",name="T"}},
+      {wire=FINAL_ANSWER,type={kind="variable",name="T"}},
+      {wire=REJECTED,type={kind="variable",name="T"}},
+      {wire=PROVIDER_OUT,type={kind="variable",name="T"}},
+    },
+    outputs = {{ wire = "generic-provider.ProviderOut", type = {
+      kind="named", name="nefor.contracts.ProviderInput", arguments={}
+    }}},
+  },
 
   params = {
     seed = "string?", -- boundary-shape label (the loader authors "provider-in")
@@ -75,7 +90,7 @@ M.declaration = {
   -- or a human gate's rejection re-entering the provider loop (the gate
   -- template's revise leg). Firing "on any".
   inputs = {
-    boundary = { "task", FINAL_ANSWER, REJECTED },
+    boundary = { "task", FINAL_ANSWER, REJECTED, PROVIDER_OUT },
   },
 
   outputs = {
@@ -98,9 +113,12 @@ local function to_provider_out(tag, message)
     -- the gate's rejection feedback ({ subject, reason }); the reason is the
     -- next turn — the producing llm's transcript already holds the draft
     content = message.reason
+  elseif tag == PROVIDER_OUT then
+    return message
   else
     -- the initial task seed ({ kind = "task", prompt = ... })
-    content = message.prompt
+    local value = message.value
+    content = message.prompt or (type(value) == "table" and value.prompt) or value
   end
   return {
     kind = "generic-provider.ProviderOut",

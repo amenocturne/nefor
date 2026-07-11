@@ -9,6 +9,25 @@ local VALIDATED = "nefor.structured.Validated"
 M.declaration = {
   name = "structured-output",
   type_variables = { "T" },
+  semantic = {
+    input={kind="named",name="nefor.contracts.ProviderInput",arguments={}},
+    output={kind="union",items={
+      {kind="named",name="nefor.contracts.ToolCalls",arguments={}},
+      {kind="named",name="core.validated.Validated",arguments={
+        {kind="named",name="nefor.contracts.OutputError",arguments={}},
+        {kind="variable",name="T"},
+      }},
+    }},
+    inputs = {{ wire="generic-provider.ProviderOut", type={kind="named",
+      name="nefor.contracts.ProviderInput",arguments={}} }},
+    outputs = {
+      {wire="generic-tool.ToolCalls",type={kind="named",name="nefor.contracts.ToolCalls",arguments={}}},
+      {wire=VALIDATED,type={kind="named",name="core.validated.Validated",arguments={
+        {kind="named",name="nefor.contracts.OutputError",arguments={}},
+        {kind="variable",name="T"},
+      }}},
+    },
+  },
   params = {
     model = "table?", profile = "table?", provider = "string",
     system = "string?", tools = "table?", history = "table?", schema = "table",
@@ -35,12 +54,18 @@ local function correction(validation)
 end
 
 local function output_error(validation, attempts, kind, message)
+  local violations = validation.violations
+  if type(violations) ~= "table" or next(violations) == nil then
+    violations = {{ path = "$", code = "invalid_json", expected = "typed JSON",
+      actual = "invalid", message = message or
+        (type(validation.error) == "table" and validation.error.message) or "invalid JSON" }}
+  end
   return {
     kind = kind or (type(validation.error) == "table" and validation.error.kind) or "schema_violation",
     message = message or (type(validation.error) == "table" and validation.error.message)
       or "JSON did not conform to the required MAG type",
     attempts = attempts,
-    violations = validation.violations or {},
+    violations = violations,
   }
 end
 

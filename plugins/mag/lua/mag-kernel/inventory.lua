@@ -77,7 +77,9 @@ end
 -- The comparable core of an actor spec — factory, params, routes. `id` is
 -- excluded (it is the key), so this answers "is this the *same* spec?".
 local function spec_of(actor)
-  return { factory = actor.factory, params = actor.params or {}, routes = actor.routes or {} }
+  return { factory = actor.factory, evidence = actor.evidence,
+    input = actor.input, outputs = actor.outputs,
+    params = actor.params or {}, routes = actor.routes or {} }
 end
 
 -- ---------------------------------------------------------------------------
@@ -133,7 +135,7 @@ local function validate_routes(self, mod)
     if not entry then
       return nil
     end
-    return entry.factory, entry.state
+    return entry.factory, entry.state, entry
   end)
   if result.ok then
     return nil
@@ -296,6 +298,9 @@ local function do_spawn(self, actor)
     id = actor.id,
     factory = actor.factory,
     params = actor.params or {},
+    evidence = actor.evidence,
+    input = actor.input,
+    outputs = actor.outputs,
     routes = actor.routes or {},
     spec = spec_of(actor),
     state = ALIVE,

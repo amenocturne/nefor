@@ -404,6 +404,24 @@ fn infer_builtin(
                 ))),
             }
         }
+        "foreign-evidence" => {
+            exact(1)?;
+            match infer(env, locals, &args[0])? {
+                MagType::Foreign(_, _, _) => Ok(MagType::ForeignEvidence),
+                actual => Err(MagError::Type(format!(
+                    "foreign-evidence expects Foreign, got {actual}"
+                ))),
+            }
+        }
+        "type-evidence" => {
+            exact(1)?;
+            match infer(env, locals, &args[0])? {
+                MagType::TypeTag(_) => Ok(MagType::Data),
+                actual => Err(MagError::Type(format!(
+                    "type-evidence expects TypeTag, got {actual}"
+                ))),
+            }
+        }
         "type-schema" => {
             exact(1)?;
             match infer(env, locals, &args[0])? {
@@ -501,6 +519,28 @@ fn infer_builtin(
                 Ok(MagType::List(result))
             }
         }
+        "indexed-map" => {
+            exact(2)?;
+            let fun = infer(env, locals, &args[0])?;
+            let collection = infer(env, locals, &args[1])?;
+            let item = match collection {
+                MagType::List(t) => *t,
+                _ => return Err(MagError::Type("indexed-map expects List".into())),
+            };
+            let (params, result) = match fun {
+                MagType::Function(p, r) => (p, r),
+                _ => return Err(MagError::Type("indexed-map expects function".into())),
+            };
+            if params.len() != 2 {
+                return Err(MagError::Type(
+                    "indexed-map callback expects 2 parameters".into(),
+                ));
+            }
+            compatible(env, &MagType::Int, &params[0], &mut HashMap::new())
+                .map_err(MagError::Type)?;
+            compatible(env, &item, &params[1], &mut HashMap::new()).map_err(MagError::Type)?;
+            Ok(MagType::List(result))
+        }
         "fold" => {
             exact(3)?;
             let fun = infer(env, locals, &args[0])?;
@@ -554,6 +594,7 @@ fn value_type(value: &Value) -> Option<MagType> {
             Box::new(decl.input.clone()),
             Box::new(decl.output.clone()),
         )),
+        Value::ForeignEvidence(_) => Some(MagType::ForeignEvidence),
         Value::Artifact(_) => Some(MagType::Artifact),
         Value::Typed(_, ty) => Some(ty.clone()),
         Value::BuiltinFn(_) => None,
@@ -714,6 +755,8 @@ fn is_data(t: &MagType) -> bool {
         | MagType::Int
         | MagType::Float
         | MagType::String
+        | MagType::Var(_)
+        | MagType::Named(_, _)
         | MagType::Data => true,
         MagType::List(v) => is_data(v),
         MagType::EmptyList => true,

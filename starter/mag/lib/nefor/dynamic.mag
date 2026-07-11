@@ -1,0 +1,58 @@
+(require "core.validated")
+(require "nefor.contracts")
+(require "nefor.graph")
+
+;; Runtime-backed typed fan-in. The wire wrapper is private to this library;
+;; callers work with semantic T and (List T) ports.
+(def collector (fn [T] [[id String]
+                         [expected-senders (List String)]
+                         [item-type (TypeTag T)]]
+  -> (nefor.graph.Fragment T (List T))
+  (let [input (nefor.graph.port id item-type "nefor.dynamic.Item")
+        output (nefor.graph.port id (type-tag (List T)) "nefor.dynamic.Collected")]
+    (as (nefor.graph.Fragment T (List T))
+      {:actors [(nefor.graph.actor id
+                  (specialize nefor.factory.collector [T])
+                  (as nefor.contracts.CollectorParams
+                    {:expected_senders expected-senders})
+                  (nefor.graph.store-port input)
+                  [(nefor.graph.store-port output)])]
+       :routes (as (List nefor.graph.StoredRoute) [])
+       :input input
+       :output output}))))
+
+;; The zero-worker branch must bypass collector construction. This message
+;; activates a static consumer that accepts the collector's output wire.
+(def empty-to (fn [T] [[target (nefor.graph.Port (List T))]] -> nefor.graph.Message
+  (nefor.graph.typed-message target (as (List T) []))))
+
+(def collect-item (fn [T] [[id String] [type (TypeTag T)] [input-wire String]]
+  -> (nefor.graph.Fragment T T)
+  (let [input (nefor.graph.port id type input-wire)
+        output (nefor.graph.port id type "nefor.dynamic.Item")]
+    (as (nefor.graph.Fragment T T)
+      {:actors [(nefor.graph.actor id (specialize nefor.factory.collect-item [T])
+                  (as nefor.contracts.DynamicParams {}) (nefor.graph.store-port input)
+                  [(nefor.graph.store-port output)])]
+       :routes [] :input input :output output}))))
+
+(def collected-prompt (fn [T] [[id String] [type (TypeTag T)]]
+  -> (nefor.graph.Fragment (List T) nefor.contracts.ProviderInput)
+  (let [input (nefor.graph.port id (type-tag (List T)) "nefor.dynamic.Collected")
+        output (nefor.graph.port id (type-tag nefor.contracts.ProviderInput) "generic-provider.ProviderOut")]
+    (as (nefor.graph.Fragment (List T) nefor.contracts.ProviderInput)
+      {:actors [(nefor.graph.actor id (specialize nefor.factory.collected-prompt [T])
+                  (as nefor.contracts.DynamicParams {}) (nefor.graph.store-port input)
+                  [(nefor.graph.store-port output)])]
+       :routes [] :input input :output output}))))
+
+(def outcome (fn [T E] [[id String] [type (TypeTag T)] [error (TypeTag E)]]
+  -> (nefor.graph.Fragment (core.validated.Validated E T) (core.validated.Validated E T))
+  (let [port-type (type-tag (core.validated.Validated E T))
+        input (nefor.graph.port id port-type "nefor.structured.Validated")
+        output (nefor.graph.port id port-type "nefor.outcome.Result")]
+    (as (nefor.graph.Fragment (core.validated.Validated E T) (core.validated.Validated E T))
+      {:actors [(nefor.graph.actor id (specialize nefor.factory.outcome [T E])
+                  (as nefor.contracts.DynamicParams {}) (nefor.graph.store-port input)
+                  [(nefor.graph.store-port output)])]
+       :routes [] :input input :output output}))))

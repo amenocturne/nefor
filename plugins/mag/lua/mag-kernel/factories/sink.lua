@@ -1,8 +1,8 @@
 -- plugins/mag/lua/mag-kernel/factories/sink.lua — the program's terminal marker.
 --
 -- One sink per program (docs/lowering.md, "The program sink"). Terminality is
--- structural, not a flag: the sink declares empty `outputs` and lowers with
--- `routes: {}`, so nothing routes downstream of it. On activation it does the
+-- structural, not a flag: its only declared output is the kernel completion
+-- wire and it lowers with `routes: {}`, so nothing routes downstream. On activation it does the
 -- two jobs a terminal owes the control plane:
 --
 --   1. Persist the final output. Output persistence is the kernel's
@@ -37,6 +37,18 @@ local M = {}
 
 M.declaration = {
   name = "sink",
+  type_variables = { "T" },
+  semantic = {
+    input={kind="variable",name="T"},
+    output={kind="primitive",name="Unit"},
+    inputs={
+      {wire="generic-provider.FinalAnswer",type={kind="variable",name="T"}},
+      {wire="mag.Text",type={kind="variable",name="T"}},
+      {wire="human.Approved",type={kind="variable",name="T"}},
+      {wire="nefor.outcome.Result",type={kind="variable",name="T"}},
+    },
+    outputs={{wire=kinds.Unit,type={kind="primitive",name="Unit"}}},
+  },
 
   -- No authored params. `writer` is injected by the kernel wiring at construct
   -- time via `deps` (see the seam note above); it is not part of the MAG program.
@@ -48,11 +60,11 @@ M.declaration = {
     -- (mag.Text — the bash capability node, factories/bash.lua); a gate
     -- program terminates in the human's approval (human.Approved —
     -- factories/human.lua, the gate template's exit).
-    final = { "generic-provider.FinalAnswer", "mag.Text", "human.Approved" },
+    final = { "generic-provider.FinalAnswer", "mag.Text", "human.Approved", "nefor.outcome.Result" },
   },
 
-  -- Terminal: emits nothing downstream (routes: {} at lowering).
-  outputs = {},
+  -- Completion is kernel-synthesized; the sink itself emits no data output.
+  outputs = { kinds.Unit },
 
   signals = {},
 }

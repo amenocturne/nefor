@@ -432,6 +432,336 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
     shutdown(stdin, child).await;
 }
 
+async fn complete_chat<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    stdin: &mut ChildStdin,
+    chat_id: &str,
+    text: &str,
+) {
+    let complete = "mock-provider.chat.complete";
+    loop {
+        let event = next_event(reader, "provider request").await;
+        match event.get("kind").and_then(Value::as_str) {
+            Some(kind) if kind == complete => break,
+            Some("mag.error") => panic!("dynamic program failed: {event:?}"),
+            _ => {}
+        }
+    }
+    send_event(
+        stdin,
+        obj(json!({"kind":"mock-provider.chat.complete.result",
+        "chat_id":chat_id,"output":{"text":text}})),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_order() {
+    let data_dir = std::env::temp_dir().join(format!("mag-dynamic-tasks-{}", std::process::id()));
+    std::fs::remove_dir_all(&data_dir).ok();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let mut child = spawn_mag(&data_dir).await;
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let stderr = child.stderr.take().unwrap();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            eprintln!("[dynamic mag stderr] {line}");
+        }
+    });
+    handshake(&mut reader, &mut stdin).await;
+    send_event(
+        &mut stdin,
+        obj(json!({"kind":"mag.load","id":"dynamic-load",
+      "source_dir":starter_dir().to_string_lossy(),
+      "module_roots":[starter_dir().join("mag/lib").to_string_lossy()],
+      "entry":"agentic-loop/dynamic-tasks.mag"})),
+    )
+    .await;
+    let loaded = next_event_of_kind(&mut reader, "mag.loaded").await;
+    let artifact = &loaded["artifact"];
+    assert_eq!(
+        artifact
+            .pointer("/data/messages/0/to")
+            .and_then(Value::as_str),
+        Some("planner.entry")
+    );
+    assert_eq!(
+        artifact
+            .pointer("/data/messages/0/content/kind")
+            .and_then(Value::as_str),
+        Some("task")
+    );
+    send_event(
+        &mut stdin,
+        obj(json!({"kind":"mag.execute","id":"dynamic-exec",
+      "run_id":"dynamic-run","run_name":"dynamic-tasks","session_id":SESSION_ID})),
+    )
+    .await;
+
+    let planner = loop {
+        let event = next_event(&mut reader, "planner chat.create").await;
+        if event.get("kind").and_then(Value::as_str) == Some("mock-provider.chat.create") {
+            break event;
+        }
+        if event.get("kind").and_then(Value::as_str) == Some("mag.error") {
+            panic!("dynamic execute: {event:?}");
+        }
+    };
+    let planner_id = planner["chat_id"].as_str().unwrap().to_owned();
+    complete_chat(&mut reader, &mut stdin, &planner_id,
+      r#"[{"task":"a","description":"first","dependent_tasks":[]},{"task":"a.collect","description":"second","dependent_tasks":["a"]}]"#).await;
+
+    let first = loop {
+        let event = next_event(&mut reader, "first worker chat.create").await;
+        if event.get("kind").and_then(Value::as_str) == Some("mock-provider.chat.create") {
+            break event;
+        }
+        if matches!(
+            event.get("kind").and_then(Value::as_str),
+            Some("mag.error" | "mag.run_result")
+        ) {
+            panic!("planner expansion failed: {event:?}");
+        }
+    };
+    next_event_of_kind(&mut reader, "mock-provider.chat.complete").await;
+    let second = next_event_of_kind(&mut reader, "mock-provider.chat.create").await;
+    next_event_of_kind(&mut reader, "mock-provider.chat.complete").await;
+    let first_id = first["chat_id"].as_str().unwrap().to_owned();
+    let second_id = second["chat_id"].as_str().unwrap().to_owned();
+    assert!(first_id.contains("expand.worker.1.structured"));
+    assert!(second_id.contains("expand.worker.0.structured"));
+    // Planner order is one,two; completion order is two,one.
+    send_event(
+        &mut stdin,
+        obj(json!({"kind":"mock-provider.chat.complete.result",
+      "chat_id":first_id,"output":{"text":r#"{"task":"a.collect","description":"done second"}"#}})),
+    )
+    .await;
+    send_event(
+        &mut stdin,
+        obj(json!({"kind":"mock-provider.chat.complete.result",
+      "chat_id":second_id,"output":{"text":r#"{"task":"a","description":"done first"}"#}})),
+    )
+    .await;
+
+    let summary_create = next_event_of_kind(&mut reader, "mock-provider.chat.create").await;
+    let summary_id = summary_create["chat_id"].as_str().unwrap().to_owned();
+    let mut ordered_input = None;
+    loop {
+        let event = next_event(&mut reader, "summarizer request").await;
+        match event.get("kind").and_then(Value::as_str) {
+            Some("mock-provider.chat.append") => {
+                if let Some(value) = event
+                    .get("message")
+                    .and_then(|message| message.get("content"))
+                {
+                    if value.is_array() {
+                        ordered_input = Some(value.clone());
+                    }
+                }
+            }
+            Some("mock-provider.chat.complete") => break,
+            Some("mag.error") => panic!("summarizer failed: {event:?}"),
+            _ => {}
+        }
+    }
+    let ordered = ordered_input.expect("typed worker list reached summarizer");
+    assert_eq!(ordered[0]["value"]["task"], "a");
+    assert_eq!(ordered[1]["value"]["task"], "a.collect");
+    send_event(
+        &mut stdin,
+        obj(json!({"kind":"mock-provider.chat.complete.result",
+      "chat_id":summary_id,"output":{"text":"{\"content\":\"done\"}"}})),
+    )
+    .await;
+    let result = next_event_of_kind(&mut reader, "mag.run_result").await;
+    assert_eq!(result["status"], "completed", "{result:?}");
+    assert_eq!(result["result"]["value"]["tag"], "core.validated.Valid");
+    shutdown(stdin, child).await;
+}
+
+#[tokio::test]
+async fn dynamic_tasks_zero_bypasses_collector_and_reaches_static_summarizer() {
+    let data_dir = std::env::temp_dir().join(format!("mag-dynamic-zero-{}", std::process::id()));
+    std::fs::remove_dir_all(&data_dir).ok();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let mut child = spawn_mag(&data_dir).await;
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    handshake(&mut reader, &mut stdin).await;
+    send_event(&mut stdin,obj(json!({"kind":"mag.load","id":"zero-load",
+      "source_dir":starter_dir().to_string_lossy(),"module_roots":[starter_dir().join("mag/lib").to_string_lossy()],
+      "entry":"agentic-loop/dynamic-tasks.mag"}))).await;
+    next_event_of_kind(&mut reader, "mag.loaded").await;
+    send_event(
+        &mut stdin,
+        obj(
+            json!({"kind":"mag.execute","id":"zero-exec","run_id":"zero-run",
+      "run_name":"zero","session_id":SESSION_ID}),
+        ),
+    )
+    .await;
+    let planner = next_event_of_kind(&mut reader, "mock-provider.chat.create").await;
+    complete_chat(
+        &mut reader,
+        &mut stdin,
+        planner["chat_id"].as_str().unwrap(),
+        "[]",
+    )
+    .await;
+    let summary = loop {
+        let event = next_event(&mut reader, "zero summary create").await;
+        if let Some(id) = event.get("id").and_then(Value::as_str) {
+            assert!(
+                !id.starts_with("expand.worker") && id != "expand.collector",
+                "zero branch spawned dynamic actor {id}"
+            );
+        }
+        if event.get("kind").and_then(Value::as_str) == Some("mock-provider.chat.create") {
+            break event;
+        }
+    };
+    let summary_id = summary["chat_id"].as_str().unwrap().to_owned();
+    loop {
+        let event = next_event(&mut reader, "zero summarizer").await;
+        if event.get("kind").and_then(Value::as_str) == Some("mock-provider.chat.complete") {
+            break;
+        }
+        assert_ne!(
+            event.get("kind").and_then(Value::as_str),
+            Some("mag.actor_spawned"),
+            "zero branch must not spawn dynamic workers or collector"
+        );
+    }
+    send_event(
+        &mut stdin,
+        obj(
+            json!({"kind":"mock-provider.chat.complete.result","chat_id":summary_id,
+      "output":{"text":"{\"content\":\"empty\"}"}}),
+        ),
+    )
+    .await;
+    let result = loop {
+        let event = next_event(&mut reader, "zero terminal result").await;
+        if let Some(id) = event.get("id").and_then(Value::as_str) {
+            assert!(
+                !id.starts_with("expand.worker") && id != "expand.collector",
+                "zero branch spawned dynamic actor {id}"
+            );
+        }
+        if event.get("kind").and_then(Value::as_str) == Some("mag.run_result") {
+            break event;
+        }
+    };
+    assert_eq!(result["result"]["value"]["tag"], "core.validated.Valid");
+    shutdown(stdin, child).await;
+}
+
+#[tokio::test]
+async fn dynamic_tasks_one_runs_one_real_worker_and_static_summarizer() {
+    let data_dir = std::env::temp_dir().join(format!("mag-dynamic-one-{}", std::process::id()));
+    std::fs::remove_dir_all(&data_dir).ok();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let mut child = spawn_mag(&data_dir).await;
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    handshake(&mut reader, &mut stdin).await;
+    send_event(&mut stdin,obj(json!({"kind":"mag.load","id":"one-load",
+      "source_dir":starter_dir().to_string_lossy(),"module_roots":[starter_dir().join("mag/lib").to_string_lossy()],
+      "entry":"agentic-loop/dynamic-tasks.mag"}))).await;
+    next_event_of_kind(&mut reader, "mag.loaded").await;
+    send_event(
+        &mut stdin,
+        obj(
+            json!({"kind":"mag.execute","id":"one-exec","run_id":"one-run",
+      "run_name":"one","session_id":SESSION_ID}),
+        ),
+    )
+    .await;
+    let planner = next_event_of_kind(&mut reader, "mock-provider.chat.create").await;
+    complete_chat(
+        &mut reader,
+        &mut stdin,
+        planner["chat_id"].as_str().unwrap(),
+        r#"[{"task":"duplicate","description":"only","dependent_tasks":[]}]"#,
+    )
+    .await;
+    let worker = next_event_of_kind(&mut reader, "mock-provider.chat.create").await;
+    assert!(worker["chat_id"]
+        .as_str()
+        .unwrap()
+        .contains("expand.worker.0.structured"));
+    complete_chat(
+        &mut reader,
+        &mut stdin,
+        worker["chat_id"].as_str().unwrap(),
+        r#"{"task":"duplicate","description":"done"}"#,
+    )
+    .await;
+    let summary = next_event_of_kind(&mut reader, "mock-provider.chat.create").await;
+    complete_chat(
+        &mut reader,
+        &mut stdin,
+        summary["chat_id"].as_str().unwrap(),
+        r#"{"content":"one done"}"#,
+    )
+    .await;
+    let result = next_event_of_kind(&mut reader, "mag.run_result").await;
+    assert_eq!(result["result"]["value"]["tag"], "core.validated.Valid");
+    shutdown(stdin, child).await;
+}
+
+#[tokio::test]
+async fn dynamic_tasks_invalid_planner_spawns_nothing_and_returns_typed_error() {
+    let data_dir = std::env::temp_dir().join(format!("mag-dynamic-invalid-{}", std::process::id()));
+    std::fs::remove_dir_all(&data_dir).ok();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let mut child = spawn_mag(&data_dir).await;
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    handshake(&mut reader, &mut stdin).await;
+    send_event(&mut stdin,obj(json!({"kind":"mag.load","id":"invalid-load",
+      "source_dir":starter_dir().to_string_lossy(),"module_roots":[starter_dir().join("mag/lib").to_string_lossy()],
+      "entry":"agentic-loop/dynamic-tasks.mag"}))).await;
+    next_event_of_kind(&mut reader, "mag.loaded").await;
+    send_event(
+        &mut stdin,
+        obj(
+            json!({"kind":"mag.execute","id":"invalid-exec","run_id":"invalid-run",
+      "run_name":"invalid","session_id":SESSION_ID}),
+        ),
+    )
+    .await;
+    for _ in 0..3 {
+        let request = next_event_of_kind(&mut reader, "mock-provider.chat.create").await;
+        complete_chat(
+            &mut reader,
+            &mut stdin,
+            request["chat_id"].as_str().unwrap(),
+            "not json",
+        )
+        .await;
+    }
+    let result = loop {
+        let event = next_event(&mut reader, "invalid terminal result").await;
+        if let Some(id) = event.get("id").and_then(Value::as_str) {
+            assert!(
+                !id.starts_with("expand.worker") && id != "expand.collector",
+                "invalid branch spawned dynamic actor {id}"
+            );
+        }
+        if event.get("kind").and_then(Value::as_str) == Some("mag.run_result") {
+            break event;
+        }
+    };
+    assert_eq!(result["status"], "completed", "{result:?}");
+    assert_eq!(result["result"]["value"]["tag"], "core.validated.Invalid");
+    assert_eq!(result["result"]["value"]["errors"][0]["attempts"], 3);
+    shutdown(stdin, child).await;
+}
+
 #[tokio::test]
 async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
     let data_dir = std::env::temp_dir().join(format!("mag-lead-turn-{}", std::process::id()));

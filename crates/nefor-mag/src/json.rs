@@ -15,7 +15,14 @@ pub fn value_to_json(value: &Value) -> Result<serde_json::Value, MagError> {
         Value::Bool(v) => Ok((*v).into()),
         Value::Keyword(v) => Ok(format!(":{v}").into()),
         Value::Symbol(v) => Ok(v.clone().into()),
-        Value::TypeTag(ty) => Ok(ty.to_string().into()),
+        Value::TypeTag(ty) => type_evidence_to_json(ty),
+        Value::ForeignEvidence(evidence) => Ok(serde_json::json!({
+            "version": 2,
+            "identity": evidence.identity,
+            "arguments": evidence.arguments.iter().map(type_evidence_to_json).collect::<Result<Vec<_>, _>>()?,
+            "input": type_evidence_to_json(&evidence.input)?,
+            "output": type_evidence_to_json(&evidence.output)?,
+        })),
         Value::List(v) | Value::Vector(v) => Ok(serde_json::Value::Array(
             v.iter().map(value_to_json).collect::<Result<_, _>>()?,
         )),
@@ -33,6 +40,56 @@ pub fn value_to_json(value: &Value) -> Result<serde_json::Value, MagError> {
             other.type_name()
         ))),
     }
+}
+
+pub(crate) fn type_evidence_to_json(ty: &MagType) -> Result<serde_json::Value, MagError> {
+    let primitive = |name: &str| serde_json::json!({ "kind": "primitive", "name": name });
+    Ok(match ty {
+        MagType::Data => primitive("Data"),
+        MagType::Unit => primitive("Unit"),
+        MagType::Bool => primitive("Bool"),
+        MagType::Int => primitive("Int"),
+        MagType::Float => primitive("Float"),
+        MagType::String => primitive("String"),
+        MagType::Named(name, arguments) => serde_json::json!({
+            "kind": "named",
+            "name": name,
+            "arguments": arguments.iter().map(type_evidence_to_json).collect::<Result<Vec<_>, _>>()?,
+        }),
+        MagType::List(item) => serde_json::json!({
+            "kind": "list", "item": type_evidence_to_json(item)?
+        }),
+        MagType::Map(key, value) => serde_json::json!({
+            "kind": "map",
+            "key": type_evidence_to_json(key)?,
+            "value": type_evidence_to_json(value)?,
+        }),
+        MagType::Record(fields) => serde_json::json!({
+            "kind": "record",
+            "fields": fields.iter().map(|(name, ty)| Ok(serde_json::json!({
+                "name": name, "type": type_evidence_to_json(ty)?
+            }))).collect::<Result<Vec<_>, MagError>>()?,
+        }),
+        MagType::Union(items) => serde_json::json!({
+            "kind": "union",
+            "items": items.iter().map(type_evidence_to_json).collect::<Result<Vec<_>, _>>()?,
+        }),
+        MagType::Product(items) => serde_json::json!({
+            "kind": "product",
+            "items": items.iter().map(type_evidence_to_json).collect::<Result<Vec<_>, _>>()?,
+        }),
+        MagType::Artifact
+        | MagType::Var(_)
+        | MagType::TypeTag(_)
+        | MagType::ForeignEvidence
+        | MagType::EmptyList
+        | MagType::Function(_, _)
+        | MagType::Foreign(_, _, _) => {
+            return Err(MagError::Type(format!(
+                "{ty} is not legal in runtime foreign evidence"
+            )))
+        }
+    })
 }
 
 pub fn json_to_value(value: &serde_json::Value) -> Value {

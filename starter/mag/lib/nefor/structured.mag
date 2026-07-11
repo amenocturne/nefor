@@ -46,7 +46,7 @@
     (as (nefor.graph.Fragment I
           (core.validated.Validated nefor.contracts.OutputError T))
       {:actors
-       [(nefor.graph.actor entry-id (specialize nefor.factory.adapter [Data])
+       [(nefor.graph.actor entry-id (specialize nefor.factory.adapter [I])
           (as nefor.contracts.AdapterParams {:seed "provider-in"})
           (nefor.graph.store-port entry-in)
           [(nefor.graph.store-port entry-out)])

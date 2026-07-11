@@ -1,5 +1,14 @@
 # Actor model
 
+## Typed dynamic fan-in
+
+`nefor.factory.collector<T>` receives the kernel-owned source actor id with
+each activation; payload fields cannot impersonate a sender. It retains at
+most one value per expected sender and emits `List<T>` once, ordered by
+`expected_senders`. Unexpected senders, duplicates, and incomplete drain are
+terminal failures. An empty sender list bypasses collector construction and
+sends an empty typed list directly to the static consumer.
+
 ## Interface
 
 An actor is anything that can receive messages. That is the whole interface;

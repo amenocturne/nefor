@@ -1,5 +1,10 @@
 # Lowering — library data to a runtime artifact
 
+`Foreign<P,I,O>` lowers its runtime identity plus opaque compiler evidence for
+the concrete specialization and instantiated semantic endpoints. Semantic MAG
+types remain separate from runtime wire tags: libraries choose the wire
+protocol; the compiler proves which `T` instantiated the foreign contract.
+
 MAG has no graph syntax or graph-specific lowering pass. It evaluates pure,
 typed library code. The shipped Nefor libraries represent actors, ports,
 routes, messages, rules, and result selection as ordinary nominal data, validate
@@ -31,7 +36,7 @@ there are no compiler builtins named `agent`, `bash`, `graph`, `subgraph`, or
 A typed port records two identities:
 
 - `type`: a compiler-created `TypeTag<T>` witness, used by generic library
-  composition and erased to its canonical qualified name during lowering;
+  composition and lowered to a versioned structural descriptor;
 - `wire`: the runtime tag emitted or accepted by the foreign implementation.
 
 This lets an agent fragment expose a nominal result such as `CodeAudit` while
@@ -53,7 +58,8 @@ result metadata. Initial activation is explicit library data. The result is
 selected by `{from: Port}`; no terminal actor or sink route is synthesized.
 
 The runtime binds each qualified foreign identity to an implementation and
-revalidates its concrete input/output contract. It remains authoritative for
+revalidates its concrete input/output contract as exact semantic-type/runtime-
+wire pairs. It remains authoritative for
 typed firing, sender-bound product slots, routing, lifecycle, failure handling,
 and result completion.
 

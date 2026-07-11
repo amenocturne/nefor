@@ -173,16 +173,16 @@ pub fn validate_rule_fn(program: &LoadedProgram, name: &str) -> Result<(), MagEr
 pub fn validate_rule_fn_input(
     program: &LoadedProgram,
     name: &str,
-    expected_input: &str,
+    expected_input: &serde_json::Value,
 ) -> Result<(), MagError> {
     validate_rule_fn(program, name)?;
     let ast::Value::Fn(function) = program.env.lookup(name)? else {
         unreachable!("validate_rule_fn accepted a non-function")
     };
-    let actual = function.param_types[0].to_string();
-    if actual != expected_input {
+    let actual = json::type_evidence_to_json(&function.param_types[0])?;
+    if actual != *expected_input {
         return Err(MagError::Type(format!(
-            "rule function '{name}' input must be {expected_input}, got {actual}"
+            "rule function '{name}' input does not match its structural source type"
         )));
     }
     Ok(())
