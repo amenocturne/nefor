@@ -19,12 +19,15 @@ M.declaration = {
   -- constructor accepts. Opaque to the kernel (params belong to the factory).
   params = {
     greeting = "string?", -- optional label echoed on output
+    value = "data?", -- optional canonical payload for rule-kernel tests
+    canonical_from_message = "bool?",
   },
 
   -- Input ports, each a firing-bearing shape (shape.lua). The stub declares
   -- one single-typed input: it fires per arriving message.
   inputs = {
     input = "stub.In",
+    forward = "stub.Out",
   },
 
   -- Output tags this factory can produce (fully-qualified). Composition
@@ -67,9 +70,12 @@ function M.construct(id, params, emit, deps)
   function instance.deliver(activation)
     activation = activation or {}
     local one = (activation.messages or {})[1] or {}
+    local value = params.value
+    if params.canonical_from_message then value = one.message.value end
     emit(sign({
       kind = "stub.Out",
       greeting = params.greeting,
+      value = value,
       payload = one.message,
     }))
     return { status = "ok" }

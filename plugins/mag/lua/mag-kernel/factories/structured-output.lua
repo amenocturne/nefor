@@ -75,19 +75,26 @@ function M.construct(id, params, emit)
         state:append({ role = "assistant", content = text })
       end
       if validation.ok then
-        state:finish({ kind = VALIDATED, tag = "core.validated.Valid", value = validation.value })
+        state:finish({
+          kind = VALIDATED,
+          value = { tag = "core.validated.Valid", value = validation.value },
+        })
         return
       end
       attempts = attempts + 1
       if attempts >= MAX_ATTEMPTS then
-        state:finish({ kind = VALIDATED, tag = "core.validated.Invalid",
-          errors = { output_error(validation, attempts) } })
+        state:finish({ kind = VALIDATED, value = {
+          tag = "core.validated.Invalid",
+          errors = { output_error(validation, attempts) },
+        } })
         return
       end
       if state:is_draining() then
-        state:finish({ kind = VALIDATED, tag = "core.validated.Invalid",
+        state:finish({ kind = VALIDATED, value = {
+          tag = "core.validated.Invalid",
           errors = { output_error(validation, attempts, "drained",
-            "structured output was draining and could not start a correction round") } })
+            "structured output was draining and could not start a correction round") },
+        } })
         return
       end
       state:append({ role = "user", content = correction(validation) })

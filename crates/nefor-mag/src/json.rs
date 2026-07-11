@@ -1,5 +1,10 @@
 use crate::ast::Value;
+use crate::checker::substitute;
+use crate::env::Env;
 use crate::error::MagError;
+use crate::schema::TypeSchema;
+use crate::types::MagType;
+use std::collections::{BTreeMap, HashMap};
 
 pub fn value_to_json(value: &Value) -> Result<serde_json::Value, MagError> {
     match value {
@@ -47,4 +52,86 @@ pub fn json_to_value(value: &serde_json::Value) -> Value {
                 .collect(),
         ),
     }
+}
+
+pub fn json_to_typed_value(
+    env: &Env,
+    value: &serde_json::Value,
+    ty: &MagType,
+) -> Result<Value, MagError> {
+    Ok(match ty {
+        MagType::Named(name, args) => {
+            let decl = env
+                .type_decl(name)
+                .ok_or_else(|| MagError::Type(format!("unknown nominal type {name}")))?;
+            let substitutions: HashMap<_, _> = decl
+                .params
+                .iter()
+                .cloned()
+                .zip(args.iter().cloned())
+                .collect();
+            let body = substitute(&decl.body, &substitutions);
+            Value::Typed(
+                Box::new(json_to_typed_value(env, value, &body)?),
+                ty.clone(),
+            )
+        }
+        MagType::List(item) => Value::Vector(
+            value
+                .as_array()
+                .ok_or_else(|| MagError::Type(format!("expected {ty}")))?
+                .iter()
+                .map(|entry| json_to_typed_value(env, entry, item))
+                .collect::<Result<_, _>>()?,
+        ),
+        MagType::Map(_, item) => Value::Map(
+            value
+                .as_object()
+                .ok_or_else(|| MagError::Type(format!("expected {ty}")))?
+                .iter()
+                .map(|(key, entry)| Ok((key.clone(), json_to_typed_value(env, entry, item)?)))
+                .collect::<Result<BTreeMap<_, _>, MagError>>()?,
+        ),
+        MagType::Record(fields) => {
+            let object = value
+                .as_object()
+                .ok_or_else(|| MagError::Type(format!("expected {ty}")))?;
+            Value::Map(
+                fields
+                    .iter()
+                    .map(|(key, field_type)| {
+                        let field = object.get(key).ok_or_else(|| {
+                            MagError::Type(format!("missing field {key} for {ty}"))
+                        })?;
+                        Ok((key.clone(), json_to_typed_value(env, field, field_type)?))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, MagError>>()?,
+            )
+        }
+        MagType::Union(variants) => {
+            let selected = variants
+                .iter()
+                .find(|variant| {
+                    TypeSchema::reify(env, variant).is_ok_and(|schema| {
+                        serde_json::to_string(value)
+                            .is_ok_and(|encoded| schema.validate_json(&encoded).ok)
+                    })
+                })
+                .ok_or_else(|| MagError::Type(format!("value does not conform to {ty}")))?;
+            Value::Typed(
+                Box::new(json_to_typed_value(env, value, selected)?),
+                ty.clone(),
+            )
+        }
+        MagType::Product(_) => Value::Typed(Box::new(json_to_value(value)), ty.clone()),
+        MagType::Data => json_to_value(value),
+        MagType::Unit | MagType::Bool | MagType::Int | MagType::Float | MagType::String => {
+            json_to_value(value)
+        }
+        unsupported => {
+            return Err(MagError::Type(format!(
+                "{unsupported} is not representable as rule input JSON"
+            )))
+        }
+    })
 }

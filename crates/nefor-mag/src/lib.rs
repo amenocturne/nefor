@@ -101,10 +101,91 @@ pub fn eval_fn(
     input: serde_json::Value,
 ) -> Result<Artifact, MagError> {
     let _fuel = eval::fuel::install(EVALUATION_STEP_LIMIT);
+    let function = match program.env.lookup(name)? {
+        Value::Fn(function) if function.param_types.len() == 1 => function,
+        Value::Fn(function) => {
+            return Err(MagError::Type(format!(
+                "function '{name}' must be unary, got {} parameters",
+                function.param_types.len()
+            )))
+        }
+        _ => return Err(MagError::Type(format!("'{name}' is not a function"))),
+    };
+    let input_type = function.param_types[0].clone();
+    let schema = schema::TypeSchema::reify(&program.env, &input_type)?;
+    let encoded = serde_json::to_string(&input)
+        .map_err(|error| MagError::Eval(format!("serialize rule input: {error}")))?;
+    let validation = schema.validate_json(&encoded);
+    if !validation.ok {
+        let detail = validation
+            .error
+            .map(|error| error.message)
+            .unwrap_or_else(|| {
+                validation
+                    .violations
+                    .iter()
+                    .map(|violation| format!("{}: {}", violation.path, violation.message))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            });
+        return Err(MagError::Type(format!(
+            "rule function '{name}' input does not conform to {input_type}: {detail}"
+        )));
+    }
+    let argument = Value::Typed(
+        Box::new(json::json_to_typed_value(
+            &program.env,
+            &input,
+            &input_type,
+        )?),
+        input_type,
+    );
     extract_artifact(
-        eval::apply_named(&program.env, name, json::json_to_value(&input))?,
+        eval::apply_named(&program.env, name, argument)?,
         &format!("function '{name}'"),
     )
+}
+
+/// Validate that a resident rule binding names a concrete unary MAG function
+/// whose declared result crosses the host boundary as an Artifact.
+pub fn validate_rule_fn(program: &LoadedProgram, name: &str) -> Result<(), MagError> {
+    let value = program.env.lookup(name)?;
+    let ast::Value::Fn(function) = value else {
+        return Err(MagError::Type(format!(
+            "rule function '{name}' is not a function"
+        )));
+    };
+    if function.params.len() != 1 {
+        return Err(MagError::Type(format!(
+            "rule function '{name}' must be unary, got {} parameters",
+            function.params.len()
+        )));
+    }
+    if function.return_type != types::MagType::Artifact {
+        return Err(MagError::Type(format!(
+            "rule function '{name}' must return Artifact, got {}",
+            function.return_type
+        )));
+    }
+    Ok(())
+}
+
+pub fn validate_rule_fn_input(
+    program: &LoadedProgram,
+    name: &str,
+    expected_input: &str,
+) -> Result<(), MagError> {
+    validate_rule_fn(program, name)?;
+    let ast::Value::Fn(function) = program.env.lookup(name)? else {
+        unreachable!("validate_rule_fn accepted a non-function")
+    };
+    let actual = function.param_types[0].to_string();
+    if actual != expected_input {
+        return Err(MagError::Type(format!(
+            "rule function '{name}' input must be {expected_input}, got {actual}"
+        )));
+    }
+    Ok(())
 }
 
 fn extract_artifact(value: Value, source: &str) -> Result<Artifact, MagError> {

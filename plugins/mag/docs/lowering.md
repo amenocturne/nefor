@@ -57,6 +57,19 @@ revalidates its concrete input/output contract. It remains authoritative for
 typed firing, sender-bound product slots, routing, lifecycle, failure handling,
 and result completion.
 
+Rule functions use a parallel, deliberately narrower path:
+
+```text
+typed source value -> pure unary MAG function -> nefor.graph.Delta
+  -> nefor.graph.lower-delta
+  -> Artifact("nefor.graph-delta/v1", data)
+  -> atomic apply to the same run
+```
+
+A delta has no result boundary. Its routes may target actors already live in
+the run; the runtime registry validates those references against the combined
+live-plus-new inventory before applying anything.
+
 ## One-off command expressions
 
 `mag-eval` wraps a fragment expression with the standard artifact pipeline, so

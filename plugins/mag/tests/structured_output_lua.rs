@@ -100,8 +100,8 @@ fn structured_output_retries_and_preserves_tool_rounds() {
 
         actor.deliver({ kind = "reply", result = { text = [[{"task":"build"}]] } })
         assert(emitted[#emitted - 1].kind == "nefor.structured.Validated")
-        assert(emitted[#emitted - 1].tag == "core.validated.Valid")
-        assert(emitted[#emitted - 1].value.task == "build")
+        assert(emitted[#emitted - 1].value.tag == "core.validated.Valid")
+        assert(emitted[#emitted - 1].value.value.task == "build")
       "#,
     )
     .exec()
@@ -127,9 +127,9 @@ fn three_invalid_final_answers_emit_typed_terminal_error() {
         actor.deliver({ kind = "reply", result = { text = "null" } })
         local terminal = emitted[#emitted - 1]
         assert(terminal.kind == "nefor.structured.Validated")
-        assert(terminal.tag == "core.validated.Invalid")
-        assert(terminal.errors[1].attempts == 3)
-        assert(terminal.errors[1].kind == "schema_violation")
+        assert(terminal.value.tag == "core.validated.Invalid")
+        assert(terminal.value.errors[1].attempts == 3)
+        assert(terminal.value.errors[1].kind == "schema_violation")
       "#,
     )
     .exec()
@@ -188,9 +188,9 @@ fn provider_failures_and_retry_signals_preserve_boundary_lifecycle() {
         drained.deliver({ kind = "reply", result = { text = "false" } })
         local terminal = drained_out[#drained_out - 1]
         assert(terminal.kind == "nefor.structured.Validated")
-        assert(terminal.tag == "core.validated.Invalid")
-        assert(terminal.errors[1].kind == "drained")
-        assert(terminal.errors[1].attempts == 2)
+        assert(terminal.value.tag == "core.validated.Invalid")
+        assert(terminal.value.errors[1].kind == "drained")
+        assert(terminal.value.errors[1].attempts == 2)
       "#,
     )
     .exec()
@@ -216,7 +216,7 @@ fn fresh_activation_resets_attempts_but_tool_continuation_does_not() {
 
         activate("first")
         actor.deliver({ kind = "reply", result = { text = [["ok"]] } })
-        assert(emitted[#emitted - 1].tag == "core.validated.Valid")
+        assert(emitted[#emitted - 1].value.tag == "core.validated.Valid")
 
         activate("second")
         actor.deliver({ kind = "reply", result = { text = "1" } })
@@ -227,8 +227,8 @@ fn fresh_activation_resets_attempts_but_tool_continuation_does_not() {
         actor.deliver({ kind = "reply", result = { text = "false" } })
         actor.deliver({ kind = "reply", result = { text = "null" } })
         local terminal = emitted[#emitted - 1]
-        assert(terminal.tag == "core.validated.Invalid")
-        assert(terminal.errors[1].attempts == 3)
+        assert(terminal.value.tag == "core.validated.Invalid")
+        assert(terminal.value.errors[1].attempts == 3)
       "#,
     )
     .exec()

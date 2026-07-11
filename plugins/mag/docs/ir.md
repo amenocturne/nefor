@@ -40,8 +40,8 @@ does not infer library locations from its installation or configuration.
 MAG is a scripting language for the runtime hosted by this plugin. A program
 is loaded once — parsed, definitions evaluated, initial modification
 validated — and its environment stays resident for the session. The shipped
-control-plane can explicitly call resident functions with `mag.eval`, but the
-kernel does not automatically fire rule bindings. The IR is the data the
+control-plane can explicitly call resident functions with `mag.eval`, and the
+host automatically evaluates registered rule bindings. The IR is the data the
 evaluator produces and the kernel folds: a **graph modification**. It is
 minimal, carries only basic operations, and must never grow domain concepts or
 logic primitives — logic lives in MAG, reached through the evaluator.
@@ -53,7 +53,7 @@ logic primitives — logic lives in MAG, reached through the evaluator.
   "actors": [{ "id": "...", "factory": "...", "params": {}, "routes": {} }],
   "messages": [{ "to": "...", "content": {} }],
   "kills": ["..."],
-  "rules": [{ "on": "...", "fn": "..." }]
+  "rules": [{ "id": "expand", "on": { "actor": "planner", "wire": "tasks.Valid" }, "fn": "expand" }]
 }
 ```
 
@@ -73,16 +73,15 @@ logic primitives — logic lives in MAG, reached through the evaluator.
   existing ones.
 - `kills` — ids to remove. Kill removes actors and voids late outputs; it is
   not currently a general routeable failure output.
-- `rules` — rule bindings. The IR shape can represent them, but the shipped
-  kernel rejects any non-empty `rules` list at apply with `"rules not
-implemented"`; current programs therefore run with `rules: []`.
+- `rules` — immutable initial subscriptions. Each names a concrete source
+  actor/output port and a unary pure function in the resident MAG snapshot.
+  Deltas cannot add subscriptions or replace the result boundary.
 
 ## The fold
 
 Runtime state is a graph; the initial state is NullGraph — empty. Loading a
-program applies its initial modification. Later modifications, when present,
-come from explicit control-plane apply/eval paths; automatic kernel rule firing
-is not shipped:
+program applies its initial modification. Later modifications come from
+explicit control-plane apply/eval paths or automatic resident rule firing:
 
 ```
 Graph(0)   = NullGraph
@@ -96,7 +95,9 @@ modifications — running a workflow _is_ this fold.
 
 ## Running a program — registration, then lazy firing
 
-Program start is one fold application, no barrier. Applying a program's
+Program start is one fold application, no barrier. A rule produces the distinct
+`nefor.graph-delta/v1` artifact: it may spawn, send, kill, and route against
+actors already live in the run, but has no result boundary. Applying a program's
 _initial_ modification:
 
 1. **Register** every actor in the initial constellation — id, factory,
@@ -281,20 +282,20 @@ initial-execute rejection is itself terminal.
 ## Rules are names, not code
 
 A rule's `fn` is a reference to a function defined in the program's source
-snapshot, with declared shape `NodeOutput -> GraphModification`. The compiler
-and resident evaluator know how to validate and explicitly apply such unary
-functions (`mag.eval`), using the same pure evaluator as load with runtime
-data as the argument. The kernel sees a name in and plain data out; it never
-learns what a function is.
+snapshot, with declared shape `T -> Artifact` where the artifact format is
+`nefor.graph-delta/v1`. Load rejects missing, non-unary, or non-Artifact
+functions. A source emission is an ordinary output envelope that must contain
+the matching non-empty `kind` and a non-null `value`; extra transport fields
+are allowed. The host never guesses from `result`, `content`, or
+factory-specific fields. The `value` alone becomes the function argument and
+is reified against the function's declared MAG input type before evaluation.
 
-> **Status: kernel rule-firing is not shipped.** Rule data can be represented,
-> and `mag.eval` can explicitly apply a named resident function, but the
-> kernel fold does not automatically fire rule bindings: a non-empty `rules`
-> list is rejected at apply with `"rules not implemented"`. Current load-time
-> lowering emits `rules: []` for static graphs; rule-bearing modifications can
-> only arrive via hand-authored or eval-produced modification data and will be
-> rejected by kernel apply today. Every shipped program is therefore fully
-> static — all composition is routes plus input contracts.
+Each run owns a FIFO trigger queue. A source emission is consumed once under
+the key `(rule id, source emission sequence)`. The host evaluates a trigger
+under the normal MAG fuel budget, validates and atomically applies its delta,
+then continues with any nested triggers until quiescence. Evaluation errors,
+wrong artifact formats, malformed/rejected deltas, and noncanonical source
+payloads fail the run explicitly. Terminal settlement waits for this drain.
 
 - Name-plus-snapshot instead of embedded code: a MAG function closes over
   its defining environment, and re-entering the source snapshot provides
@@ -305,8 +306,10 @@ learns what a function is.
   exceeding it rejects the modification with an error. Purity means a
   killed evaluation leaves nothing to clean up.
 - Load-time checks: every rule's `fn` exists, takes one argument, and
-  matches the declared contract. A typo'd name is a load error, not a
+  returns `Artifact`. A typo'd name is a load error, not a
   runtime surprise.
+- Inline artifacts cannot invent rule bindings: rule-bearing execution must
+  use the resident source snapshot that declared their functions.
 - A modification is a plain map — MAG builds it with ordinary data
   constructors and the standard validator checks its shape.
 

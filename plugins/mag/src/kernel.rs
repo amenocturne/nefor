@@ -79,6 +79,16 @@ pub struct RunCompletion {
     pub result: Option<JsonValue>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RuleTrigger {
+    pub rule_id: String,
+    pub function: String,
+    pub source_actor: String,
+    pub source_wire: String,
+    pub emission_seq: u64,
+    pub value: JsonValue,
+}
+
 /// Owns the Lua VM and the kernel table it produced.
 ///
 /// Kept alive for the whole session: the VM is the kernel's entire world
@@ -214,6 +224,29 @@ impl LuaHost {
         let f: Function = self.kernel.get("apply")?;
         let res: Table = f.call::<Table>((run_id, mod_val))?;
         apply_outcome(&res)
+    }
+
+    pub fn take_rule_trigger(&self, run_id: &str) -> Result<Option<RuleTrigger>, MagError> {
+        let f: Function = self.kernel.get("take_rule_trigger")?;
+        let trigger: Option<Table> = f.call::<Option<Table>>(run_id)?;
+        trigger
+            .map(|trigger| {
+                let source: Table = trigger.get("source")?;
+                Ok(RuleTrigger {
+                    rule_id: trigger.get("rule_id")?,
+                    function: trigger.get("fn")?,
+                    source_actor: source.get("actor")?,
+                    source_wire: source.get("wire")?,
+                    emission_seq: trigger.get("emission_seq")?,
+                    value: self.lua.from_value(trigger.get::<Value>("value")?)?,
+                })
+            })
+            .transpose()
+    }
+
+    pub fn fail_run(&self, run_id: &str, error: &str) -> Result<bool, MagError> {
+        let f: Function = self.kernel.get("fail_run")?;
+        Ok(f.call::<bool>((run_id, error))?)
     }
 
     /// End a run: the kernel reaps the context's live actors through the fold
@@ -728,5 +761,219 @@ mod tests {
                 .and_then(|v| v["greeting"].as_str()),
             Some("done")
         );
+    }
+
+    #[test]
+    fn rules_bind_concrete_ports_and_require_canonical_values() {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let host = LuaHost::load_kernel(
+            &manifest.join("lua/mag-kernel/init.lua"),
+            Some(&manifest.join("../../lua")),
+        )
+        .expect("load shipped kernel");
+
+        host.begin_run("rule-payload", "rule-payload", None)
+            .expect("begin");
+        let graph = serde_json::json!({
+            "actors": [
+                {"id":"source", "factory":"nefor.factory.stub", "params":{}, "routes":{}},
+                {"id":"result", "factory":"nefor.factory.stub", "params":{}, "routes":{}}
+            ],
+            "messages": [
+                {"to":"source", "content":{"kind":"stub.In"}},
+                {"to":"result", "content":{"kind":"stub.In"}}
+            ],
+            "kills": [],
+            "rules": [{
+                "id":"expand", "on":{"actor":"source", "wire":"stub.Out", "type":"String"},
+                "fn":"expand"
+            }],
+            "result":{"from":{"actor":"result", "wire":"stub.Out", "type":"String"}}
+        });
+        let outcome = host.start("rule-payload", &graph).expect("start");
+        assert!(outcome.ok, "start failed: {:?}", outcome.error);
+        assert!(host
+            .take_rule_trigger("rule-payload")
+            .expect("trigger")
+            .is_none());
+        let failure = host
+            .take_run_failed("rule-payload")
+            .expect("failure")
+            .expect("canonical payload failure");
+        assert!(failure.contains("emitted no canonical value"), "{failure}");
+        assert!(host
+            .take_run_complete("rule-payload")
+            .expect("completion")
+            .is_none());
+
+        host.begin_run("rule-ok", "rule-ok", None)
+            .expect("begin canonical rule");
+        let mut canonical = graph.clone();
+        canonical["actors"][0]["params"]["value"] = serde_json::json!({"task":"one"});
+        canonical["messages"] = serde_json::json!([
+            {"to":"source", "content":{"kind":"stub.In", "n":1}},
+            {"to":"source", "content":{"kind":"stub.In", "n":2}},
+            {"to":"result", "content":{"kind":"stub.In"}}
+        ]);
+        let accepted = host.start("rule-ok", &canonical).expect("start canonical");
+        assert!(accepted.ok, "start failed: {:?}", accepted.error);
+        let trigger = host
+            .take_rule_trigger("rule-ok")
+            .expect("trigger")
+            .expect("one canonical trigger");
+        assert_eq!(trigger.rule_id, "expand");
+        assert_eq!(trigger.source_actor, "source");
+        assert_eq!(trigger.source_wire, "stub.Out");
+        assert_eq!(trigger.emission_seq, 1);
+        assert_eq!(trigger.value, serde_json::json!({"task":"one"}));
+
+        host.begin_run("rule-isolated", "rule-isolated", None)
+            .expect("begin isolated rule");
+        let isolated = host
+            .start("rule-isolated", &canonical)
+            .expect("start isolated");
+        assert!(isolated.ok);
+        let isolated_trigger = host
+            .take_rule_trigger("rule-isolated")
+            .expect("isolated trigger")
+            .expect("isolated queue");
+        assert_eq!(isolated_trigger.emission_seq, 1);
+        let second = host
+            .take_rule_trigger("rule-ok")
+            .expect("second trigger")
+            .expect("FIFO second source emission");
+        assert_eq!(second.emission_seq, 2);
+        assert!(host
+            .take_rule_trigger("rule-ok")
+            .expect("quiescent first run")
+            .is_none());
+
+        host.begin_run("rule-fanout", "rule-fanout", None)
+            .expect("begin rule fanout");
+        let mut fanout = graph.clone();
+        fanout["actors"][0]["params"]["value"] = serde_json::json!({"task":"fanout"});
+        let mut second_rule = fanout["rules"][0].clone();
+        second_rule["id"] = JsonValue::String("expand-again".into());
+        fanout["rules"].as_array_mut().unwrap().push(second_rule);
+        assert!(host.start("rule-fanout", &fanout).expect("fanout start").ok);
+        assert_eq!(
+            host.take_rule_trigger("rule-fanout")
+                .unwrap()
+                .unwrap()
+                .rule_id,
+            "expand"
+        );
+        assert_eq!(
+            host.take_rule_trigger("rule-fanout")
+                .unwrap()
+                .unwrap()
+                .rule_id,
+            "expand-again"
+        );
+
+        host.begin_run("rule-result", "rule-result", None)
+            .expect("begin result rule");
+        let mut result_rule = graph;
+        result_rule["rules"][0]["on"]["actor"] = JsonValue::String("result".into());
+        let rejected = host
+            .start("rule-result", &result_rule)
+            .expect("start reject");
+        assert!(!rejected.ok);
+        assert!(rejected
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("may not bind the result boundary")));
+
+        host.begin_run("rule-duplicate", "rule-duplicate", None)
+            .expect("begin duplicate rule");
+        let mut duplicate = result_rule;
+        duplicate["rules"][0]["on"]["actor"] = JsonValue::String("source".into());
+        let copied = duplicate["rules"][0].clone();
+        duplicate["rules"].as_array_mut().unwrap().push(copied);
+        let duplicate_result = host
+            .start("rule-duplicate", &duplicate)
+            .expect("duplicate reject");
+        assert!(!duplicate_result.ok);
+        assert!(duplicate_result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("duplicate rule id")));
+
+        for (run_id, messages) in [
+            (
+                "rule-invalid-valid",
+                serde_json::json!([
+                    {"to":"source", "content":{"kind":"stub.In"}},
+                    {"to":"source", "content":{"kind":"stub.In", "value":{"ok":true}}},
+                    {"to":"result", "content":{"kind":"stub.In"}}
+                ]),
+            ),
+            (
+                "rule-valid-invalid",
+                serde_json::json!([
+                    {"to":"source", "content":{"kind":"stub.In", "value":{"ok":true}}},
+                    {"to":"source", "content":{"kind":"stub.In"}},
+                    {"to":"result", "content":{"kind":"stub.In"}}
+                ]),
+            ),
+        ] {
+            host.begin_run(run_id, run_id, None)
+                .expect("begin mixed emissions");
+            let mut mixed = canonical.clone();
+            mixed["actors"][0]["params"] = serde_json::json!({"canonical_from_message":true});
+            mixed["messages"] = messages;
+            let outcome = host.start(run_id, &mixed).expect("mixed start");
+            assert!(outcome.ok);
+            assert!(host
+                .take_rule_trigger(run_id)
+                .expect("disabled queue")
+                .is_none());
+            assert!(host.take_run_failed(run_id).expect("failed run").is_some());
+            assert!(host
+                .take_run_complete(run_id)
+                .expect("no completion")
+                .is_none());
+        }
+
+        host.begin_run("rule-stop-route", "rule-stop-route", None)
+            .expect("begin stopped route");
+        let stopped_route = serde_json::json!({
+            "actors": [
+                {"id":"source", "factory":"nefor.factory.stub", "params":{},
+                 "routes":{"stub.Out":["consumer"]}},
+                {"id":"consumer", "factory":"nefor.factory.stub", "params":{}, "routes":{}}
+            ],
+            "messages":[{"to":"source", "content":{"kind":"stub.In"}}],
+            "kills":[],
+            "rules":[{"id":"expand", "on":{"actor":"source", "wire":"stub.Out", "type":"String"}, "fn":"expand"}],
+            "result":{"from":{"actor":"consumer", "wire":"stub.Out", "type":"String"}}
+        });
+        assert!(
+            host.start("rule-stop-route", &stopped_route)
+                .expect("stopped route start")
+                .ok
+        );
+        assert!(host
+            .take_run_failed("rule-stop-route")
+            .expect("route failure")
+            .is_some());
+        assert!(host
+            .take_run_complete("rule-stop-route")
+            .expect("consumer stayed unfired")
+            .is_none());
+
+        let immutable = host
+            .apply(
+                "rule-payload",
+                &serde_json::json!({"actors":[], "messages":[], "kills":[], "rules":[{
+                    "id":"late", "on":{"actor":"source", "wire":"stub.Out"}, "fn":"late"
+                }]}),
+            )
+            .expect("delta apply");
+        assert!(!immutable.ok);
+        assert!(immutable
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("immutable initial subscriptions")));
     }
 }

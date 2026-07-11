@@ -17,8 +17,8 @@
 -- Construction is NOT the fold's concern: a spawn only registers the spec
 -- (id, factory, params, routes). The routing layer constructs the instance
 -- lazily, at the actor's first satisfied input contract (actor-model.md,
--- Lifecycle). Rule evaluation is still a separate task (a non-empty `rules`
--- list is rejected "not implemented").
+-- Lifecycle). Initial rule registration belongs to the run composition in
+-- init.lua; the fold accepts only actor/message/kill deltas.
 
 local kinds = require("kinds")
 
@@ -168,9 +168,10 @@ local function validate(self, mod)
     return nil, "rules must be an array"
   end
 
-  -- rules: accepted in the shape, but evaluation is a separate task.
+  -- Initial subscriptions are registered by init.lua before the first fold.
+  -- A later delta cannot mutate that immutable subscription set.
   if #rules > 0 then
-    return nil, "rules not implemented"
+    return nil, "rules are immutable initial subscriptions"
   end
 
   -- actors: shape + intra-modification id uniqueness. A single

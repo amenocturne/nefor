@@ -130,6 +130,12 @@ local function new_run_context(meta)
     last_output_path = nil,
     run_complete = nil,
     run_failed = nil,
+    rules = {},
+    rule_ids = {},
+    trigger_queue = {},
+    emission_seq = 0,
+    rule_error = nil,
+    rule_failed = false,
   }
 
   -- Injected lifecycle-event sink (observer.lua's EVENTS set, plus routing's
@@ -154,11 +160,13 @@ local function new_run_context(meta)
       -- flag surfaced to the control plane is recomputed from that truth.
       event.output_path = ctx.last_output_path
       event.persisted = ctx.last_output_path ~= nil
-      ctx.run_complete = {
-        output_path = ctx.last_output_path,
-        persisted = event.persisted,
-        result = event.result,
-      }
+      if not ctx.rule_error then
+        ctx.run_complete = {
+          output_path = ctx.last_output_path,
+          persisted = event.persisted,
+          result = event.result,
+        }
+      end
     elseif event.kind == observer.EVENTS.run_failed then
       -- An unhandled actor failure (routing.lua apply_completion). Stash it
       -- for take_run_failed so the host fails the run with the detail
@@ -252,6 +260,36 @@ local function new_run_context(meta)
     bus_emit = bus_emit,
     events = emit_event,
     persist_output = persist_output,
+    observe_output = function(actor, wire, output)
+      if ctx.rule_failed then return false end
+      ctx.emission_seq = ctx.emission_seq + 1
+      for _, rule in ipairs(ctx.rules) do
+        if rule.on.actor == actor and rule.on.wire == wire then
+          if type(output) ~= "table" or output.value == nil then
+            ctx.rule_error = string.format(
+              "rule %q source %s/%s emitted no canonical value",
+              rule.id, actor, wire)
+            ctx.rule_failed = true
+            ctx.trigger_queue = {}
+            ctx.run_failed = {
+              error = ctx.rule_error,
+              failure = "rule_payload",
+              from = actor,
+            }
+            return false
+          else
+            ctx.trigger_queue[#ctx.trigger_queue + 1] = {
+              rule_id = rule.id,
+              fn = rule.fn,
+              source = { actor = actor, wire = wire },
+              emission_seq = ctx.emission_seq,
+              value = output.value,
+            }
+          end
+        end
+      end
+      return true
+    end,
     -- Host clock for the busy-window stamps (mag.actor_idle's busy_ms).
     -- nil-safe: routing falls back to a zero clock where the host surface
     -- lacks now_ms (the bare-VM test stub).
@@ -443,10 +481,50 @@ return {
         "result boundary wire %q is not a declared output of actor %q",
         boundary.wire, boundary.actor) }
     end
+    local seen_rules = {}
+    for index, rule in ipairs(mod.rules or {}) do
+      if type(rule) ~= "table" or type(rule.id) ~= "string" or rule.id == ""
+          or type(rule.fn) ~= "string" or rule.fn == ""
+          or type(rule.on) ~= "table" or type(rule.on.actor) ~= "string"
+          or type(rule.on.wire) ~= "string" then
+        return { ok = false, error = string.format("rules[%d] is malformed", index) }
+      end
+      if seen_rules[rule.id] then
+        return { ok = false, error = string.format("duplicate rule id %q", rule.id) }
+      end
+      seen_rules[rule.id] = true
+      if rule.on.actor == boundary.actor and rule.on.wire == boundary.wire then
+        return { ok = false, error = string.format(
+          "rule %q may not bind the result boundary", rule.id) }
+      end
+      local source_rule_actor
+      for _, spec in ipairs(mod.actors or {}) do
+        if spec.id == rule.on.actor then
+          source_rule_actor = spec
+          break
+        end
+      end
+      if not source_rule_actor then
+        return { ok = false, error = string.format(
+          "rule %q source actor %q does not exist", rule.id, rule.on.actor) }
+      end
+      local rule_decl = registry:declaration(source_rule_actor.factory)
+      local wire_declared = false
+      for _, output in ipairs((rule_decl and rule_decl.outputs) or {}) do
+        if output == rule.on.wire then wire_declared = true break end
+      end
+      if not wire_declared then
+        return { ok = false, error = string.format(
+          "rule %q wire %q is not an output of actor %q",
+          rule.id, rule.on.wire, rule.on.actor) }
+      end
+    end
+    ctx.rules = mod.rules or {}
+    ctx.rule_ids = seen_rules
     ctx.router:set_result_boundary({ actor = boundary.actor, wire = boundary.wire })
     local modification = {}
     for key, value in pairs(mod) do
-      if key ~= "result" then
+      if key ~= "result" and key ~= "rules" then
         modification[key] = value
       end
     end
@@ -460,7 +538,30 @@ return {
     if not ctx then
       return { ok = false, error = err }
     end
+    if type(mod) == "table" and type(mod.rules) == "table" and #mod.rules > 0 then
+      return { ok = false, error = "rules are immutable initial subscriptions" }
+    end
+    if type(mod) == "table" and mod.result ~= nil then
+      return { ok = false, error = "a delta cannot define or replace the result boundary" }
+    end
     return ctx.observer:apply(mod)
+  end,
+
+  take_rule_trigger = function(run_id)
+    local ctx = runs[run_id]
+    if not ctx or ctx.rule_failed or #ctx.trigger_queue == 0 then return nil end
+    return table.remove(ctx.trigger_queue, 1)
+  end,
+
+  fail_run = function(run_id, error)
+    local ctx = runs[run_id]
+    if not ctx then return false end
+    ctx.trigger_queue = {}
+    ctx.run_complete = nil
+    ctx.rule_error = error
+    ctx.rule_failed = true
+    ctx.run_failed = { error = error, failure = "rule", from = "mag.rule" }
+    return true
   end,
 
   -- Drain one actor gracefully within a run (actor-model.md, Signals: drain /

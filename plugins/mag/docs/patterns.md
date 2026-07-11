@@ -3,9 +3,9 @@
 Every shipped pattern here has a clean expression in routes or input contracts.
 If a program needs one of these behaviors, use the listed shape — inventing a
 workaround (sentinel messages, polling actors, hand-rolled wait nodes) means
-the type system can no longer see what the program does. Non-empty `rules` are
-rejected by the current kernel, so rule-dependent designs are not listed as
-current patterns.
+the type system can no longer see what the program does. Dynamic expansion uses
+typed resident MAG rule functions returning `nefor.graph-delta/v1`; actors
+still receive no graph authority.
 
 This is the canonical catalog; a lead-facing distillation ships with the
 stdlib so these patterns are available inside session workspaces.

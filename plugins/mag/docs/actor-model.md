@@ -33,9 +33,14 @@ the bus underneath.
 
 **Actors hold no lifecycle authority.** Composing, spawning, and killing are
 environment operations — actors never spawn actors. Composition that depends
-on runtime results must come through explicit environment-side apply/eval
-paths; automatic rule firing is not shipped (see ir.md). An actor receives
+on runtime results comes through immutable environment-side rule bindings and
+their pure resident MAG functions (see ir.md). An actor receives
 messages and emits messages, nothing else.
+
+Rule-capable outputs use the same ordinary output envelope as routing. Their
+declared wire is `kind`; `value` is the complete semantic value of the port.
+For example, structured output carries the complete `Validated<OutputError,T>`
+under `value`, not an unsound projection of only the successful `T`.
 
 ## Factories
 

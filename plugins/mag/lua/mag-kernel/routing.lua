@@ -137,6 +137,7 @@ function M.new(opts)
     -- backed writer, tests pass capturing stubs.
     events = opts.events or noop,
     persist_output = opts.persist_output or noop,
+    observe_output = opts.observe_output or noop,
     -- Injected clock for the busy-window stamps (mag.actor_idle's busy_ms).
     -- init.lua wires the host's nefor.now_ms; pure unit tests pass a fake or
     -- take the zero default.
@@ -240,6 +241,7 @@ function M:on_emit(id, message)
     -- synthesized status types (mag.Unit / failures) go out via apply_completion,
     -- not here, so only real actor outputs are persisted.
     self.persist_output(id, message)
+    if self.observe_output(id, kind, message) == false then return end
     local boundary = self.result_boundary
     if boundary and boundary.actor == id and boundary.wire == kind then
       self.events({

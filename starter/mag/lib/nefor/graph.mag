@@ -13,13 +13,17 @@
 (type Route [T] {:from (Port T) :to (Port T)})
 (type StoredRoute {:from StoredPort :to StoredPort})
 (type Message {:to String :content Data})
-(type Rule {:on String :fn String})
+(type Rule {:id String :on StoredPort :fn String})
 (type ResultBoundary {:from StoredPort})
 (type Graph {:actors (List Actor)
              :routes (List StoredRoute)
              :messages (List Message)
              :rules (List Rule)
              :result ResultBoundary})
+(type Delta {:actors (List Actor)
+             :routes (List StoredRoute)
+             :messages (List Message)
+             :kills (List String)})
 (type Fragment [I O] {:actors (List Actor)
                       :routes (List StoredRoute)
                       :input (Port I)
@@ -33,12 +37,16 @@
                   :params Data
                   :routes (Map String (List String))})
 (type LowerMessage {:to String :content Data})
-(type LowerRule {:on String :fn String})
+(type LowerRule {:id String :on StoredPort :fn String})
 (type Modification {:actors (List LowerActor)
                     :messages (List LowerMessage)
                     :kills (List String)
                     :rules (List LowerRule)
                     :result ResultBoundary})
+(type LowerDelta {:actors (List LowerActor)
+                  :messages (List LowerMessage)
+                  :kills (List String)
+                  :rules (List LowerRule)})
 
 (def port (fn [T] [[actor String] [semantic-type (TypeTag T)] [wire-type String]] -> (Port T)
   (as (Port T) {:actor actor :type semantic-type :wire wire-type})))
@@ -67,8 +75,12 @@
                            :wire (get to "wire")})}))))
 (def message (fn [[to String] [content Data]] -> Message
   (as Message {:to to :content content})))
-(def rule (fn [[on String] [fn-name String]] -> Rule
-  (as Rule {:on on :fn fn-name})))
+(def rule (fn [T] [[id String] [on (Port T)] [fn-name String]] -> Rule
+  (as Rule {:id id :on (store-port on) :fn fn-name})))
+
+(def delta (fn [[actors (List Actor)] [routes (List StoredRoute)]
+                [messages (List Message)] [kills (List String)]] -> Delta
+  (as Delta {:actors actors :routes routes :messages messages :kills kills})))
 
 ;; Runtime registry entries contain additional implementation/schema fields.
 ;; Project only the structural contract the graph validator consumes.
@@ -144,17 +156,40 @@
     (as (Map String (List String)) {})
     (routes-from graph (get actor "id")))))
 
+(def routes-for (fn [[routes (List StoredRoute)] [actor-id String]] -> (List StoredRoute)
+  (filter (fn [[candidate StoredRoute]] -> Bool
+            (= (get (get candidate "from") "actor") actor-id))
+          routes)))
+
+(def actor-routes-from (fn [[routes (List StoredRoute)] [actor Actor]] -> (Map String (List String))
+  (fold
+    (fn [[out (Map String (List String))] [edge StoredRoute]]
+        -> (Map String (List String))
+      (let [from (get edge "from")
+            to (get edge "to")
+            wire (get from "wire")
+            old (or (get out wire) (as (List String) []))]
+        (assoc out wire (concat old [(get to "actor")]))))
+    (as (Map String (List String)) {})
+    (routes-for routes (get actor "id")))))
+
 (def lower-actor (fn [[graph Graph] [actor Actor]] -> LowerActor
   (as LowerActor {:id (get actor "id")
    :foreign (get actor "foreign")
    :params (get actor "params")
    :routes (actor-routes graph actor)})))
 
+(def lower-delta-actor (fn [[delta Delta] [actor Actor]] -> LowerActor
+  (as LowerActor {:id (get actor "id")
+   :foreign (get actor "foreign")
+   :params (get actor "params")
+   :routes (actor-routes-from (get delta "routes") actor)})))
+
 (def lower-message (fn [[entry Message]] -> LowerMessage
   (as LowerMessage {:to (get entry "to") :content (get entry "content")})))
 
 (def lower-rule (fn [[entry Rule]] -> LowerRule
-  (as LowerRule {:on (get entry "on") :fn (get entry "fn")})))
+  (as LowerRule {:id (get entry "id") :on (get entry "on") :fn (get entry "fn")})))
 
 ;; Local structural checks. Foreign-contract specialization is performed from
 ;; the declaration data by the generic MAG type checker before this function
@@ -215,6 +250,20 @@
   (if (= (get left "actor") (get right "actor"))
     (if (= (get left "type") (get right "type"))
       (= (get left "wire") (get right "wire"))
+      false)
+    false)))
+
+(def rule-id-valid? (fn [[graph Graph] [entry Rule]] -> Bool
+  (= (count
+       (filter (fn [[candidate Rule]] -> Bool
+                 (= (get candidate "id") (get entry "id")))
+               (get graph "rules")))
+     1)))
+
+(def rule-valid? (fn [[graph Graph] [entry Rule]] -> Bool
+  (if (rule-id-valid? graph entry)
+    (if (output-port-exists? graph (get entry "on"))
+      (not (same-port? (get entry "on") (get (get graph "result") "from")))
       false)
     false)))
 
@@ -334,6 +383,9 @@
         dead-actors (filter (fn [[actor Actor]] -> Bool
                               (not (actor-reaches-result? graph actor)))
                             (get graph "actors"))
+        bad-rules (filter (fn [[entry Rule]] -> Bool
+                            (not (rule-valid? graph entry)))
+                          (get graph "rules"))
         result-ok (output-port-exists? graph (get (get graph "result") "from"))
         result-routed (result-routed? graph)]
     (if (= (count bad-actors) 0)
@@ -344,7 +396,9 @@
               (if result-routed
                 (core.validated.invalid ["result boundary output must not also source a route"])
                 (if (= (count dead-actors) 0)
-                  (core.validated.valid graph)
+                  (if (= (count bad-rules) 0)
+                    (core.validated.valid graph)
+                    (core.validated.invalid ["rules need unique ids, a concrete source output, and may not bind the result boundary"]))
                   (core.validated.invalid ["every actor must have a path to the result boundary"])))
               (core.validated.invalid ["result boundary references an unknown actor output"]))
             (core.validated.invalid ["every foreign output must route or terminate at the result boundary"]))
@@ -360,3 +414,12 @@
    :kills (as (List String) [])
    :rules (map lower-rule (get graph "rules"))
    :result (get graph "result")})))
+
+(def lower-delta (fn [[delta Delta]] -> LowerDelta
+  (as LowerDelta
+    {:actors (map (fn [[actor Actor]] -> LowerActor
+                    (lower-delta-actor delta actor))
+                  (get delta "actors"))
+     :messages (map lower-message (get delta "messages"))
+     :kills (get delta "kills")
+     :rules (as (List LowerRule) [])})))

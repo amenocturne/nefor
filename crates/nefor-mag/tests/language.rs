@@ -1,4 +1,7 @@
-use nefor_mag::{compile, load_with_inputs, load_with_inputs_and_module_roots};
+use nefor_mag::{
+    compile, eval_fn, load_with_inputs, load_with_inputs_and_module_roots, validate_rule_fn,
+    validate_rule_fn_input,
+};
 use serde_json::json;
 use std::fs;
 
@@ -32,6 +35,61 @@ fn typed_library_functions_return_artifacts() {
     let artifact = compile(source, &root).unwrap();
     assert_eq!(artifact.format, "test.typed-artifact/v1");
     assert_eq!(artifact.data, json!({"answer":42}));
+}
+
+#[test]
+fn rule_functions_are_named_unary_artifact_functions() {
+    let root = workspace("rule-functions");
+    fs::write(
+        root.join("main.mag"),
+        r#"
+          (def expand (fn [[value String]] -> Artifact
+            (artifact "nefor.graph-delta/v1" {:value value})))
+          (def binary (fn [[left String] [right String]] -> Artifact
+            (artifact "nefor.graph-delta/v1" {:left left :right right})))
+          (def wrong-output (fn [[value String]] -> String value))
+          (type Task {:task String :description String})
+          (def expand-tasks (fn [[tasks (List Task)]] -> Artifact
+            (artifact "nefor.graph-delta/v1"
+              {:names (map (fn [[task Task]] -> String (get task "task")) tasks)})))
+          (artifact "test.rules/v1" {})
+        "#,
+    )
+    .unwrap();
+    let loaded = load_with_inputs(&root, "main.mag", json!({})).unwrap();
+    validate_rule_fn(&loaded, "expand").unwrap();
+    validate_rule_fn_input(&loaded, "expand", "String").unwrap();
+    assert!(validate_rule_fn_input(&loaded, "expand", "Int")
+        .unwrap_err()
+        .to_string()
+        .contains("input must be Int"));
+    assert!(validate_rule_fn(&loaded, "binary")
+        .unwrap_err()
+        .to_string()
+        .contains("must be unary"));
+    assert!(validate_rule_fn(&loaded, "wrong-output")
+        .unwrap_err()
+        .to_string()
+        .contains("must return Artifact"));
+    assert!(validate_rule_fn(&loaded, "missing")
+        .unwrap_err()
+        .to_string()
+        .contains("unresolved symbol"));
+    let artifact = eval_fn(
+        &loaded,
+        "expand-tasks",
+        json!([{"task":"one", "description":"first"}]),
+    )
+    .unwrap();
+    assert_eq!(artifact.data["names"], json!(["one"]));
+    let mismatch = eval_fn(
+        &loaded,
+        "expand-tasks",
+        json!([{"task":"one", "description":7}]),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(mismatch.contains("$[0].description"), "{mismatch}");
 }
 
 #[test]

@@ -2,6 +2,7 @@
 (require "nefor.graph")
 
 (def format "nefor.graph-modification/v1")
+(def delta-format "nefor.graph-delta/v1")
 
 ;; Validation and lowering are explicit library calls. The host recognizes
 ;; only the final Artifact wrapper.
@@ -21,3 +22,8 @@
                "value")))
       (let [ignored (fail checked)]
         (artifact format {}))))))
+
+;; A rule result is deliberately a different host format. It has no result
+;; boundary and cannot replace the run's immutable rule subscriptions.
+(def delta (fn [[change nefor.graph.Delta]] -> Artifact
+  (artifact delta-format (nefor.graph.lower-delta change))))

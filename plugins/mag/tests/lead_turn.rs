@@ -422,10 +422,13 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
         Some("completed")
     );
     assert_eq!(
-        result.pointer_str("/result/tag"),
+        result.pointer_str("/result/value/tag"),
         Some("core.validated.Valid")
     );
-    assert_eq!(result.pointer_str("/result/value/task"), Some("build"));
+    assert_eq!(
+        result.pointer_str("/result/value/value/task"),
+        Some("build")
+    );
     shutdown(stdin, child).await;
 }
 
