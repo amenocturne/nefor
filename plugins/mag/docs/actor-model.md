@@ -324,3 +324,34 @@ provider/model/`reasoning_effort` before execute). Arbitrary provider-specific
 reasoning settings are not shipped through this path unless both the bridge and
 the provider schema add them; use `reasoning_effort` in MAG examples instead
 of provider-specific reasoning knobs.
+
+### Structured output boundary
+
+`structured-output` is separate from the prose-producing `llm` factory. Its
+params include a versioned MAG type descriptor produced by
+`(type-schema (type-tag T))`. It adds a JSON-only instruction to the first
+provider round and uses one Rust-owned parse-and-validate operation, so Lua
+never guesses whether a table represented a JSON array or object.
+
+Tool calls take the ordinary `generic-tool.ToolCalls` path and consume no
+validation attempts. An invalid final answer becomes a diagnostic user turn.
+A valid answer emits `nefor.structured.Validated` tagged
+`core.validated.Valid`; three invalid final answers emit the same terminal wire
+tagged `core.validated.Invalid` with a structured `OutputError`. Provider
+failures remain suffered actor failures, not validation attempts.
+
+The MAG constructor is `nefor.structured.agent`. JSON and retry policy belong
+to this Nefor library/factory composition, never to the MAG compiler.
+
+The descriptor is compiler-derived protected params data. `mag.execute`
+rejects any `params_overlay` that attempts to replace `schema`; accepting such
+an overlay would let runtime data weaken the type promised by the fragment.
+Provider/model/history overlays remain ordinary runtime configuration.
+
+Both provider-boundary factories use `factories/provider-boundary.lua` for
+history validation and seeding, provider correlation, tool-call transcript
+normalization, cancellation, draining, and error behavior. A logical turn
+starts at a non-continuation graph activation and spans any tool-result rounds
+and structured correction retries. If the same live actor receives another
+activation after a completed final output, that is a fresh logical turn:
+structured attempts reset and its schema instruction is appended again.

@@ -602,7 +602,9 @@ async fn handle_execute(
     // into the program without re-authoring the modification. Shallow per-actor
     // top-level merge; unknown ids are ignored (a race artifact, not an error).
     if let Some(overlay) = body.get("params_overlay").and_then(Value::as_object) {
-        apply_params_overlay(&mut modification, overlay);
+        if let Err(error) = apply_params_overlay(&mut modification, overlay) {
+            return send_event(out_tx, error_body(in_reply_to, &error)).await;
+        }
     }
 
     let run_id = body
@@ -674,10 +676,13 @@ async fn handle_execute(
 /// shallow top-level merge into the matching actor's `params` (created if
 /// absent, replaced if non-object). Actors not named in the overlay are
 /// untouched; overlay keys with no matching actor are ignored.
-fn apply_params_overlay(modification: &mut Value, overlay: &Map<String, Value>) {
+fn apply_params_overlay(
+    modification: &mut Value,
+    overlay: &Map<String, Value>,
+) -> Result<(), String> {
     let actors = match modification.get_mut("actors").and_then(Value::as_array_mut) {
         Some(a) => a,
-        None => return,
+        None => return Ok(()),
     };
     for actor in actors.iter_mut() {
         let obj = match actor.as_object_mut() {
@@ -692,6 +697,15 @@ fn apply_params_overlay(modification: &mut Value, overlay: &Map<String, Value>) 
             Some(p) => p,
             None => continue,
         };
+        let protected_schema = matches!(
+            obj.get("factory").and_then(Value::as_str),
+            Some("structured-output" | "nefor.factory.structured-output")
+        );
+        if protected_schema && patch.contains_key("schema") {
+            return Err(format!(
+                "params_overlay for structured-output actor {id:?} cannot replace protected compiler-derived param \"schema\""
+            ));
+        }
         let params = obj
             .entry("params")
             .or_insert_with(|| Value::Object(Map::new()));
@@ -704,6 +718,7 @@ fn apply_params_overlay(modification: &mut Value, overlay: &Map<String, Value>) 
             }
         }
     }
+    Ok(())
 }
 
 /// Named rejection for a `mag.apply` outside a live run. The control plane's
@@ -1448,7 +1463,7 @@ mod tests {
         let overlay = serde_json::json!({
             "build": { "provider": "chatgpt", "model": "gpt-5.5", "reasoning_effort": "high" }
         });
-        apply_params_overlay(&mut modification, overlay.as_object().unwrap());
+        apply_params_overlay(&mut modification, overlay.as_object().unwrap()).unwrap();
 
         let actors = modification["actors"].as_array().unwrap();
         let build = &actors[0]["params"];
@@ -1469,11 +1484,30 @@ mod tests {
             "actors": [ { "id": "a", "factory": "llm" } ]
         });
         let overlay = serde_json::json!({ "a": { "model": "m" } });
-        apply_params_overlay(&mut modification, overlay.as_object().unwrap());
+        apply_params_overlay(&mut modification, overlay.as_object().unwrap()).unwrap();
         assert_eq!(
             modification["actors"][0]["params"]["model"].as_str(),
             Some("m")
         );
+    }
+
+    #[test]
+    fn params_overlay_cannot_replace_compiler_derived_structured_schema() {
+        let original = serde_json::json!({"version": 1, "root": {"kind": "string"}});
+        let mut modification = serde_json::json!({
+            "actors": [{
+                "id": "typed",
+                "factory": "nefor.factory.structured-output",
+                "params": {"schema": original, "provider": "mock-provider"}
+            }]
+        });
+        let overlay = serde_json::json!({
+            "typed": {"schema": {"version": 1, "root": {"kind": "data"}}}
+        });
+        let error =
+            apply_params_overlay(&mut modification, overlay.as_object().unwrap()).unwrap_err();
+        assert!(error.contains("protected compiler-derived param \"schema\""));
+        assert_eq!(modification["actors"][0]["params"]["schema"], original);
     }
 
     #[test]

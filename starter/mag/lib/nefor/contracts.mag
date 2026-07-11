@@ -3,6 +3,7 @@
 ;; and the runtime registry.
 
 (require "core.types")
+(require "core.validated")
 
 (type Task {:prompt String})
 (type ProviderInput {:content String})
@@ -14,6 +15,15 @@
 (type Approved {:content String})
 (type Rejected {:reason String})
 (type Text {:content String})
+(type OutputViolation {:path String
+                       :code String
+                       :expected String
+                       :actual String
+                       :message String})
+(type OutputError {:kind String
+                   :message String
+                   :attempts Int
+                   :violations (List OutputViolation)})
 
 (type AdapterParams {:seed String})
 (type LlmParams {:model Data
@@ -28,6 +38,12 @@
                   :timeout_ms Data})
 (type HumanParams {:prompt String})
 (type SinkParams {})
+(type StructuredOutputParams {:model Data
+                              :profile Data
+                              :provider String
+                              :system String
+                              :tools (List String)
+                              :schema Data})
 
 (foreign nefor.factory.adapter [T]
   {:params AdapterParams
@@ -38,6 +54,11 @@
   {:params LlmParams
    :input ProviderInput
    :output (| ToolCalls FinalAnswer)})
+
+(foreign nefor.factory.structured-output [T]
+  {:params StructuredOutputParams
+   :input ProviderInput
+   :output (| ToolCalls (core.validated.Validated OutputError T))})
 
 (foreign nefor.factory.run-tool
   {:params RunToolParams

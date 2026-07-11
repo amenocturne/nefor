@@ -1,0 +1,29 @@
+;; Shipped structured-output example: the terminal value is either a checked
+;; TaskDescription or a typed OutputError after three invalid final answers.
+(require "nefor.actors")
+(require "nefor.artifact")
+(require "nefor.contracts")
+(require "nefor.graph")
+(require "nefor.structured")
+
+(type TaskDescription {:task String
+                       :description String
+                       :dependent-tasks (List String)})
+
+(let [worker
+      (nefor.structured.agent
+        (as nefor.actors.AgentConfig {:id "typed-task"
+         :model nil
+         :profile nil
+         :provider "mock-provider"
+         :system "Describe the requested task."
+         :tools (as (List String) [])
+         :da-policy nil})
+        (type-tag nefor.contracts.Task)
+        "task"
+        (type-tag TaskDescription))
+      initial (nefor.graph.message
+                "typed-task.entry"
+                (as Data {:kind "task" :prompt "Describe the build task"}))]
+  (nefor.artifact.compile
+    (nefor.graph.finish worker [initial] (as (List nefor.graph.Rule) []))))

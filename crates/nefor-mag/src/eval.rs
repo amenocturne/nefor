@@ -775,6 +775,22 @@ fn builtin(env: &Env, name: &str, args: &[Value]) -> Result<Value, MagError> {
                 )),
             }
         }
+        "type-schema" => {
+            arity(args, 1)?;
+            let ty = match raw(&args[0]) {
+                Value::TypeTag(ty) => ty,
+                other => {
+                    return Err(MagError::Type(format!(
+                        "type-schema expects TypeTag, got {}",
+                        other.type_name()
+                    )))
+                }
+            };
+            let schema = crate::schema::TypeSchema::reify(env, ty)?;
+            let json = serde_json::to_value(schema)
+                .map_err(|error| MagError::Eval(format!("serialize type schema: {error}")))?;
+            Ok(crate::json::json_to_value(&json))
+        }
         "not" => {
             arity(args, 1)?;
             Ok(Value::Bool(!truthy(&args[0])))

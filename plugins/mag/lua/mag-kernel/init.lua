@@ -26,6 +26,7 @@ local stub = require("factories.stub")
 local sink = require("factories.sink")
 local human = require("factories.human")
 local llm = require("factories.llm")
+local structured_output = require("factories.structured-output")
 
 -- Shared per-node output persistence (lua/libs/output-persistence). The mag
 -- plugin host currently exposes only nefor.log (plugins/mag/src/kernel.rs,
@@ -71,6 +72,7 @@ local function build_registry()
   seed(sink)
   seed(human)
   seed(llm)
+  seed(structured_output)
   seed(run_tool)
   seed(tool_result)
   seed(adapter)

@@ -456,6 +456,7 @@ fn install_nefor(lua: &Lua, data_root: String) -> Result<(), MagError> {
     nefor.set("log", log)?;
 
     install_json(lua, &nefor)?;
+    install_typed_json(lua, &nefor)?;
     install_fs(lua, &nefor, data_root)?;
 
     let now_ms = lua.create_function(|_, _: ()| {
@@ -480,6 +481,22 @@ fn install_nefor(lua: &Lua, data_root: String) -> Result<(), MagError> {
     nefor.set("emit", emit)?;
 
     lua.globals().set("nefor", nefor)?;
+    Ok(())
+}
+
+/// Rust-owned strict JSON parsing plus MAG schema validation. Keeping parsing
+/// and validation in one host call avoids Lua's empty-table array/object
+/// ambiguity and ensures runtime acceptance uses the compiler's descriptor.
+fn install_typed_json(lua: &Lua, nefor_tbl: &Table) -> Result<(), MagError> {
+    let typed_json = lua.create_table()?;
+    let validate = lua.create_function(|lua, (schema, source): (Value, String)| {
+        let encoded: JsonValue = lua.from_value(schema)?;
+        let schema: nefor_mag::schema::TypeSchema = serde_json::from_value(encoded)
+            .map_err(|error| mlua::Error::runtime(format!("invalid MAG type schema: {error}")))?;
+        lua.to_value(&schema.validate_json(&source))
+    })?;
+    typed_json.set("validate", validate)?;
+    nefor_tbl.set("typed_json", typed_json)?;
     Ok(())
 }
 

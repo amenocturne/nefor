@@ -53,6 +53,21 @@ Libraries stop artifact construction with `(fail diagnostic-data)`. Immutable
 host data is available through the `inputs` map, for example
 `(get inputs :foreign_contracts)`.
 
+## Structural type descriptors
+
+`(type-schema (type-tag T))` reifies a JSON-representable MAG data type into a
+versioned `Data` descriptor. Named types remain named for diagnostics while
+their substituted bodies describe the runtime structure. Records are strict:
+all fields are required and additional fields are rejected. The supported
+shapes are `Data`, `Unit`, `Bool`, `Int`, `Float`, `String`, lists,
+string-keyed maps, records, unions, and products. Functions, foreign
+capabilities, artifacts, type tags, unresolved variables, and maps with
+non-string keys fail while loading the MAG program.
+
+The descriptor is transport-neutral. Nefor's structured-agent library chooses
+JSON as one external encoding; the MAG compiler itself has no provider, LLM,
+prompting, or retry behavior.
+
 Semantic type identities use compiler-created witnesses rather than strings:
 
 ```lisp

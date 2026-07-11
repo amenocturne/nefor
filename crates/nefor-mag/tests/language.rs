@@ -402,3 +402,47 @@ fn generic_calls_unify_arguments_inside_the_same_nominal_type() {
     .unwrap();
     assert_eq!(artifact.data, json!({"actor":"worker"}));
 }
+
+#[test]
+fn type_schema_preserves_qualified_nominals_and_substitutes_generics() {
+    let root = workspace("type-schema");
+    fs::write(
+        root.join("core/types.mag"),
+        "(type Box [T] {:value T})\n(def schema (type-schema (type-tag (Box (List String)))))",
+    )
+    .unwrap();
+    fs::write(
+        root.join("main.mag"),
+        "(require \"core.types\")\n(artifact \"test.schema/v1\" core.types.schema)",
+    )
+    .unwrap();
+    let artifact = load_with_inputs(&root, "main.mag", json!({}))
+        .unwrap()
+        .artifact;
+    assert_eq!(artifact.data["version"], 1);
+    assert_eq!(artifact.data["root"]["kind"], "named");
+    assert_eq!(artifact.data["root"]["name"], "core.types.Box");
+    assert_eq!(
+        artifact.data["root"]["body"]["fields"][0]["schema"]["kind"],
+        "list"
+    );
+    assert_eq!(
+        artifact.data["root"]["body"]["fields"][0]["schema"]["item"]["kind"],
+        "string"
+    );
+}
+
+#[test]
+fn type_schema_rejects_non_data_and_non_string_map_keys() {
+    let root = workspace("type-schema-errors");
+    for (ty, expected) in [
+        ("(Fn String String)", "Fn is not representable"),
+        ("Artifact", "Artifact is not representable"),
+        ("(TypeTag String)", "TypeTag is not representable"),
+        ("(Map Int String)", "JSON object keys must be String"),
+    ] {
+        let source = format!("(artifact \"test.schema/v1\" (type-schema (type-tag {ty})))");
+        let error = compile(&source, &root).unwrap_err().to_string();
+        assert!(error.contains(expected), "{ty}: {error}");
+    }
+}

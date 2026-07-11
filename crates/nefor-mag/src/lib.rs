@@ -6,6 +6,7 @@ pub mod eval;
 pub mod json;
 pub mod lexer;
 pub mod parser;
+pub mod schema;
 pub mod types;
 
 use ast::{Artifact, Value};

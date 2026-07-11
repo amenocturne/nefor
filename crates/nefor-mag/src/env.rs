@@ -70,6 +70,7 @@ impl Env {
             "read",
             "require",
             "artifact",
+            "type-schema",
         ] {
             env.define(name, Value::BuiltinFn(name.into()));
         }

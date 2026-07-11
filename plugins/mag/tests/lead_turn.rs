@@ -247,6 +247,188 @@ fn chat_result(chat_id: &str, output: Value) -> Map<String, Value> {
     }))
 }
 
+async fn load_typed_task_program<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    stdin: &mut ChildStdin,
+) -> Value {
+    send_event(
+        stdin,
+        obj(json!({
+            "kind": "mag.load",
+            "id": "typed-task-load",
+            "source_dir": starter_dir().to_string_lossy(),
+            "module_roots": [starter_dir().join("mag/lib").to_string_lossy()],
+            "entry": "agentic-loop/typed-task.mag",
+        })),
+    )
+    .await;
+    let loaded = next_event_of_kind(reader, "mag.loaded").await;
+    loaded
+        .get("artifact")
+        .cloned()
+        .expect("typed task artifact")
+}
+
+#[tokio::test]
+async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
+    const MOCK: &str = "mock-provider";
+    let data_dir = std::env::temp_dir().join(format!("mag-typed-task-{}", std::process::id()));
+    std::fs::remove_dir_all(&data_dir).ok();
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let mut child = spawn_mag(&data_dir).await;
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    handshake(&mut reader, &mut stdin).await;
+
+    let artifact = load_typed_task_program(&mut reader, &mut stdin).await;
+    let actors = artifact
+        .pointer("/data/actors")
+        .and_then(Value::as_array)
+        .unwrap();
+    let structured = actors
+        .iter()
+        .find(|actor| actor.get("id").and_then(Value::as_str) == Some("typed-task.structured"))
+        .expect("structured actor lowered");
+    assert_eq!(
+        structured.get("foreign").and_then(Value::as_str),
+        Some("nefor.factory.structured-output")
+    );
+    assert_eq!(
+        structured.pointer("/params/schema/version"),
+        Some(&json!(1))
+    );
+    assert_eq!(
+        structured
+            .pointer("/routes/nefor.structured.Validated/0")
+            .and_then(Value::as_str),
+        None,
+        "terminal validated output is not routed onward"
+    );
+
+    send_event(
+        &mut stdin,
+        obj(json!({
+            "kind": "mag.execute",
+            "id": "typed-schema-tamper",
+            "run_id": "typed-schema-tamper-run",
+            "artifact": artifact.clone(),
+            "params_overlay": {
+                "typed-task.structured": {
+                    "schema": {"version": 1, "root": {"kind": "data"}}
+                }
+            }
+        })),
+    )
+    .await;
+    let rejected = next_event_of_kind(&mut reader, "mag.error").await;
+    assert_eq!(
+        rejected.get("in_reply_to").and_then(Value::as_str),
+        Some("typed-schema-tamper")
+    );
+    assert!(rejected
+        .get("message")
+        .and_then(Value::as_str)
+        .is_some_and(|message| message.contains("protected compiler-derived param \"schema\"")));
+
+    send_event(
+        &mut stdin,
+        obj(json!({
+            "kind": "mag.execute",
+            "id": "typed-exec",
+            "run_id": "typed-run",
+            "run_name": "typed-task",
+            "session_id": SESSION_ID,
+            "artifact": artifact,
+            "params_overlay": {
+                "typed-task.structured": { "provider": MOCK, "model": "mock-model" }
+            }
+        })),
+    )
+    .await;
+
+    let create_kind = format!("{MOCK}.chat.create");
+    let append_kind = format!("{MOCK}.chat.append");
+    let complete_kind = format!("{MOCK}.chat.complete");
+    let create = next_event_of_kind(&mut reader, &create_kind).await;
+    let first_chat = create
+        .get("chat_id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_owned();
+    let mut saw_schema_instruction = false;
+    loop {
+        let event = next_event(&mut reader, "first typed provider round").await;
+        match event.get("kind").and_then(Value::as_str) {
+            Some(kind)
+                if kind == append_kind
+                    && event
+                        .pointer_str("/message/content")
+                        .is_some_and(|text| text.contains("bare JSON")) =>
+            {
+                saw_schema_instruction = true;
+            }
+            Some(kind) if kind == complete_kind => break,
+            Some("mag.error") => panic!("typed program failed: {event:?}"),
+            _ => {}
+        }
+    }
+    assert!(saw_schema_instruction);
+    send_event(
+        &mut stdin,
+        obj(json!({
+            "kind": format!("{MOCK}.chat.complete.result"),
+            "chat_id": first_chat,
+            "output": { "text": "```json\n{}\n```" }
+        })),
+    )
+    .await;
+
+    let create2 = next_event_of_kind(&mut reader, &create_kind).await;
+    let second_chat = create2
+        .get("chat_id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_owned();
+    let mut saw_correction = false;
+    loop {
+        let event = next_event(&mut reader, "corrected typed provider round").await;
+        match event.get("kind").and_then(Value::as_str) {
+            Some(kind)
+                if kind == append_kind
+                    && event
+                        .pointer_str("/message/content")
+                        .is_some_and(|text| text.contains("malformed_json")) =>
+            {
+                saw_correction = true;
+            }
+            Some(kind) if kind == complete_kind => break,
+            Some("mag.error") => panic!("typed correction failed: {event:?}"),
+            _ => {}
+        }
+    }
+    assert!(saw_correction);
+    send_event(
+        &mut stdin,
+        obj(json!({
+            "kind": format!("{MOCK}.chat.complete.result"),
+            "chat_id": second_chat,
+            "output": { "text": "{\"task\":\"build\",\"description\":\"Implement it\",\"dependent-tasks\":[]}" }
+        })),
+    )
+    .await;
+    let result = next_event_of_kind(&mut reader, "mag.run_result").await;
+    assert_eq!(
+        result.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+    assert_eq!(
+        result.pointer_str("/result/tag"),
+        Some("core.validated.Valid")
+    );
+    assert_eq!(result.pointer_str("/result/value/task"), Some("build"));
+    shutdown(stdin, child).await;
+}
+
 #[tokio::test]
 async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
     let data_dir = std::env::temp_dir().join(format!("mag-lead-turn-{}", std::process::id()));

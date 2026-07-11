@@ -215,9 +215,13 @@ fn infer_form(
                         decl.type_params.len()
                     )));
                 }
+                let mut vars = HashSet::new();
+                for ty in locals.values() {
+                    collect_vars(ty, &mut vars);
+                }
                 let args = exprs
                     .iter()
-                    .map(|expr| crate::eval::parse_type(env, expr, &HashSet::new()))
+                    .map(|expr| crate::eval::parse_type(env, expr, &vars))
                     .collect::<Result<Vec<_>, _>>()?;
                 let subst = decl.type_params.iter().cloned().zip(args).collect();
                 return Ok(MagType::Foreign(
@@ -397,6 +401,15 @@ fn infer_builtin(
                 MagType::Foreign(_, _, _) => Ok(MagType::String),
                 actual => Err(MagError::Type(format!(
                     "foreign-id expects Foreign, got {actual}"
+                ))),
+            }
+        }
+        "type-schema" => {
+            exact(1)?;
+            match infer(env, locals, &args[0])? {
+                MagType::TypeTag(_) => Ok(MagType::Data),
+                actual => Err(MagError::Type(format!(
+                    "type-schema expects TypeTag, got {actual}"
                 ))),
             }
         }
