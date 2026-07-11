@@ -66,7 +66,7 @@ test-tui-smoke:
       --repo-root "{{justfile_directory()}}" \
       --artifacts-dir "{{justfile_directory()}}/tmp/tui-driver-artifacts" \
       --env "NEFOR_DATA_DIR=$data_dir" \
-      --env NEFOR_DEFAULT_PROVIDER=mock \
+      --env NEFOR_DEFAULT_PROVIDER=mock-plugin \
       --env NEFOR_DEFAULT_MODEL=mock-model \
       --env NEFOR_ENABLE_CHATGPT=0 \
       --env NEFOR_ENABLE_OLLAMA=0 \

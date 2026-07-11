@@ -320,7 +320,6 @@ for _, p in ipairs(cfg.providers or {}) do
       p.name,
       {
         require("config").bin("mock-plugin"),
-        "--name", p.name,
         "--script", STARTER_ROOT .. "/" .. p.mock_script,
       },
       { agentic_loop = agentic_loop }

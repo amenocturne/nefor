@@ -78,13 +78,13 @@ M.bin = function(name)
   return resolved_bin(name, plugin_dir .. "/" .. name, "NEFOR_PLUGIN_DIR")
 end
 
-local DEFAULT_PROVIDER = os.getenv("NEFOR_DEFAULT_PROVIDER") or "mock"
+local DEFAULT_PROVIDER = os.getenv("NEFOR_DEFAULT_PROVIDER") or "mock-plugin"
 local DEFAULT_MODEL    = os.getenv("NEFOR_DEFAULT_MODEL") or "mock-model"
 
 local providers = {
   {
     kind        = "mock",
-    name        = "mock",
+    name        = "mock-plugin",
     mock_script = "mock-provider/init.lua",
   },
 }

@@ -5,7 +5,7 @@ A test/dev NCP peer plugin. Speaks the [current NCP behavior](../../docs/protoco
 ## Usage
 
 ```
-mock-plugin [--name <wire-identity>] --script <path-to-lua-file>
+mock-plugin --script <path-to-lua-file>
 ```
 
 Example:
@@ -16,9 +16,9 @@ mock-plugin --script plugins/mock-plugin/scenarios/minimal.lua
 
 The binary reads its stdin / writes its stdout as the NCP channel, and logs to stderr. The script is loaded once, before the handshake, so syntax errors and top-level script faults surface immediately without ever opening the wire.
 
-The plugin name defaults to `mock-plugin` and is exposed to Lua as `nefor.name`.
-Pass `--name <wire-identity>` when the engine registers the process under a
-different identity; emitted and handled event kinds then use that prefix.
+The plugin name is fixed as `mock-plugin` and exposed to Lua as `nefor.name`.
+Register the process under the same wire identity so handled and emitted event
+kinds keep the `mock-plugin.*` prefix.
 
 ## Lua API
 
