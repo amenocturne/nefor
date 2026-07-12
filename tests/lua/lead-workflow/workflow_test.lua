@@ -258,6 +258,86 @@ local function feed_loaded(modification, factories)
 end
 
 -- ------------------------------------------------------------------
+-- dependency module roots — shared by mag and mag-eval
+-- ------------------------------------------------------------------
+
+local function latest_mag_load()
+  local loads = find_calls(decode_calls(), function(c)
+    return c.body.kind == "mag.load" and c.target == "mag"
+  end)
+  return loads[#loads]
+end
+
+local function assert_config_rejected(value, label)
+  local ok = pcall(function()
+    lw.configure({ dependency_module_roots = value })
+  end)
+  assert_eq(ok, false, label .. " must be rejected")
+end
+
+do
+  fresh()
+  write_mag_file("roots-default-write", "roots-default.mag", READ_ONLY_MAG)
+  _test.calls_clear()
+  execute_mag("roots-default-execute", "roots-default.mag")
+  local default_load = latest_mag_load()
+  assert_true(default_load ~= nil, "default mag execution emits mag.load")
+  assert_eq(#default_load.body.module_roots, 1,
+    "omitted dependency roots preserve the single workspace root")
+  assert_true(default_load.body.module_roots[1]:match("/lib$") ~= nil,
+    "the default root is ws/lib")
+
+  fresh()
+  local configured = { "/deps/standard", "/deps/extra" }
+  lw.configure({ dependency_module_roots = configured })
+  configured[1] = "/mutated/caller"
+  write_mag_file("roots-custom-write", "roots-custom.mag", READ_ONLY_MAG)
+  _test.calls_clear()
+  execute_mag("roots-custom-execute", "roots-custom.mag")
+  local normal_load = latest_mag_load()
+  assert_eq(normal_load.body.module_roots[1], "/deps/standard",
+    "normal mag defensively copies configured dependency roots")
+  assert_eq(normal_load.body.module_roots[2], "/deps/extra",
+    "normal mag preserves dependency order")
+  assert_true(normal_load.body.module_roots[3]:match("/lib$") ~= nil,
+    "normal mag places the workspace-local root last")
+
+  -- Mutating an emitted envelope cannot corrupt the roots held for the next
+  -- eval: init.lua and mag-eval each own defensive copies.
+  normal_load.body.module_roots[1] = "/mutated/envelope"
+  _test.calls_clear()
+  invoke_tool("roots-eval", "mag-eval", {
+    expr = '(nefor.shell.command "roots" "true")',
+  })
+  local eval_load = latest_mag_load()
+  assert_true(eval_load ~= nil, "mag-eval emits mag.load")
+  assert_eq(eval_load.body.module_roots[1], "/deps/standard",
+    "mag-eval receives its own defensive root copy")
+  assert_eq(eval_load.body.module_roots[2], "/deps/extra",
+    "mag-eval preserves dependency order")
+  assert_true(eval_load.body.module_roots[3]:match("/lib$") ~= nil,
+    "mag-eval places the workspace-local root last")
+
+  fresh()
+  invoke_tool("roots-eval-reset", "mag-eval", {
+    expr = '(nefor.shell.command "roots-reset" "true")',
+  })
+  local reset_load = latest_mag_load()
+  assert_eq(#reset_load.body.module_roots, 1,
+    "reset restores mag-eval's exact default root set")
+
+  assert_config_rejected("/not/a/list", "a scalar root configuration")
+  assert_config_rejected(false, "a false root configuration")
+  assert_config_rejected({ "" }, "an empty root")
+  assert_config_rejected({ [1] = "/a", [3] = "/c" }, "a sparse root list")
+  assert_config_rejected({ [1] = "/a", [4] = "/d", [5] = "/e" },
+    "a root list with multiple holes and trailing numeric keys")
+  assert_config_rejected({ [2] = "/b", [3] = "/c" },
+    "a root list missing its first index")
+  assert_config_rejected({ [1] = "/a", named = "/b" }, "a keyed root list")
+end
+
+-- ------------------------------------------------------------------
 -- parse_approval_command — pin the command grammar
 -- ------------------------------------------------------------------
 

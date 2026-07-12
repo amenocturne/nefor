@@ -45,6 +45,52 @@ local SOURCE_NAME = "lead-workflow"
 
 local M = {}
 
+local dependency_module_roots = {}
+
+local function copy_roots(roots)
+  local copy = {}
+  for i = 1, #roots do copy[i] = roots[i] end
+  return copy
+end
+
+local function validate_roots(roots)
+  if type(roots) ~= "table" then
+    error("lead-workflow mag-eval: dependency_module_roots must be a list", 3)
+  end
+  local count = 0
+  for key, value in pairs(roots) do
+    if type(key) ~= "number" or key % 1 ~= 0 or key < 1 then
+      error("lead-workflow mag-eval: dependency_module_roots must be a dense list", 3)
+    end
+    count = count + 1
+    if type(value) ~= "string" or value == "" then
+      error("lead-workflow mag-eval: dependency_module_roots entries must be non-empty strings", 3)
+    end
+  end
+  for index = 1, count do
+    if roots[index] == nil then
+      error("lead-workflow mag-eval: dependency_module_roots must be a dense list", 3)
+    end
+  end
+end
+
+function M.configure(opts)
+  if opts == nil then opts = {} end
+  if type(opts) ~= "table" then
+    error("lead-workflow mag-eval: configure options must be a table", 2)
+  end
+  local roots = opts.dependency_module_roots
+  if roots == nil then roots = {} end
+  validate_roots(roots)
+  dependency_module_roots = copy_roots(roots)
+end
+
+local function module_roots_for(ws)
+  local roots = copy_roots(dependency_module_roots)
+  roots[#roots + 1] = ws .. "/lib"
+  return roots
+end
+
 local state = {
   -- Monotone per-session counter for run names (`eval-1`, `eval-2`, …).
   seq = 0,
@@ -195,7 +241,7 @@ function M.handle(firing_id, args)
     kind       = "mag.load",
     id         = load_id,
     source_dir = ws,
-    module_roots = { ws .. "/lib" },
+    module_roots = module_roots_for(ws),
     entry      = rel,
   })
 end
@@ -349,6 +395,14 @@ function M.on_bus(kind, body)
 end
 
 -- Test seam.
-M._internals = { state = state }
+M._internals = {
+  state = state,
+  reset = function()
+    dependency_module_roots = {}
+    state.seq = 0
+    state.pending_loads = {}
+    state.pending_runs = {}
+  end,
+}
 
 return M

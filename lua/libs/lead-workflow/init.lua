@@ -83,6 +83,41 @@ local replay_window = require("core.history_replay")
 local emit_as = envelope.emit_as
 local emit    = envelope.emit
 
+local dependency_module_roots = {}
+
+local function copy_roots(roots)
+  local copy = {}
+  for i = 1, #roots do copy[i] = roots[i] end
+  return copy
+end
+
+local function validate_dependency_module_roots(roots)
+  if type(roots) ~= "table" then
+    error("lead-workflow: dependency_module_roots must be a list", 3)
+  end
+  local count = 0
+  for key, value in pairs(roots) do
+    if type(key) ~= "number" or key % 1 ~= 0 or key < 1 then
+      error("lead-workflow: dependency_module_roots must be a dense list", 3)
+    end
+    count = count + 1
+    if type(value) ~= "string" or value == "" then
+      error("lead-workflow: dependency_module_roots entries must be non-empty strings", 3)
+    end
+  end
+  for index = 1, count do
+    if roots[index] == nil then
+      error("lead-workflow: dependency_module_roots must be a dense list", 3)
+    end
+  end
+end
+
+local function module_roots_for(ws)
+  local roots = copy_roots(dependency_module_roots)
+  roots[#roots + 1] = ws .. "/lib"
+  return roots
+end
+
 local state = {
   -- The in-flight graph's run_id; nil when no graph is running.
   ---@type string|nil
@@ -1361,7 +1396,7 @@ local function begin_mag_load(firing_id, action, args, ws)
     kind       = "mag.load",
     id         = load_id,
     source_dir = ws,
-    module_roots = { ws .. "/lib" },
+    module_roots = module_roots_for(ws),
     entry      = args.file,
   })
 end
@@ -1726,7 +1761,7 @@ if nefor.bus and nefor.bus.on_event then
   end)
 end
 
-return {
+local M = {
   name        = "lead-workflow",
   receive_msg = receive_msg,
   send_msg    = function(_) end,
@@ -1758,7 +1793,23 @@ return {
       state.gate_mode = "safe"
       state.kernel_factories = {}
       state.pending_mag_load = {}
+      dependency_module_roots = {}
+      mag_eval._internals.reset()
       advertised = false
     end,
   },
 }
+
+function M.configure(opts)
+  if opts == nil then opts = {} end
+  if type(opts) ~= "table" then
+    error("lead-workflow: configure options must be a table", 2)
+  end
+  local roots = opts.dependency_module_roots
+  if roots == nil then roots = {} end
+  validate_dependency_module_roots(roots)
+  dependency_module_roots = copy_roots(roots)
+  mag_eval.configure({ dependency_module_roots = copy_roots(roots) })
+end
+
+return M
