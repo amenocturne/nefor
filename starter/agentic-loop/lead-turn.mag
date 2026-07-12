@@ -34,6 +34,6 @@
       program
       (nefor.graph.finish
         lead
-        [initial]
+        (as (List nefor.graph.Message) [initial])
         (as (List nefor.graph.Rule) []))]
   (nefor.artifact.compile program))

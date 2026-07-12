@@ -1312,8 +1312,9 @@ local function lead_workflow_tool_schemas()
         "wire tags; use (type-tag nefor.contracts.Task), wire \"task\", and " ..
         "an output such as (type-tag nefor.contracts.FinalAnswer). The result boundary is " ..
         "structural metadata, not a sink actor. Agent loops are unbounded; " ..
-        "stop early via interrupt/kill. See lib/patterns.md and the " ..
-        "lib/nefor/*.mag modules for complete examples. " ..
+        "stop early via interrupt/kill. The injected lib/patterns.md is the " ..
+        "canonical complete example: use literal (require \"...\") forms and " ..
+        "never copy historical session files or use removed import/bare-helper syntax. " ..
         "For a one-off shell expression whose result you just need back, " ..
         "use mag-eval instead — no file, no workspace ceremony.\n\n" ..
         "When to dispatch a graph vs work directly: first identify what " ..

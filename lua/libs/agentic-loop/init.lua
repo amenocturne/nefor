@@ -162,9 +162,8 @@ end
 -- The lead used to pay a `mag-env` round-trip (plus reading patterns.md)
 -- before writing any MAG. That context is now ambient: appended to every
 -- turn's `system` overlay. Contents: the session workspace dir, the seeded
--- lib/ inventory, patterns.md inlined (the canonical shapes doc), the type
--- declarations, template signatures (bodies read on demand), and the prompt
--- roster.
+-- lib/ inventory, patterns.md inlined (the canonical authoring contract),
+-- and the prompt roster.
 --
 -- Seam: the MAG workspace is lead-workflow's domain, but its path
 -- resolution and seeding live in the shared `mag` workspace module
@@ -221,55 +220,23 @@ local function prompt_names(lib_dir)
   return names
 end
 
--- Template signatures from templates.mag: the `(def NAME (fn …` name plus
--- the nearest preceding `;; Boundary:` comment. Bodies stay out — the lead
--- reads a body with read_file only when composing with it.
-local function template_signatures(src)
-  local sigs = {}
-  if type(src) ~= "string" then return sigs end
-  local pending
-  for line in (src .. "\n"):gmatch("(.-)\n") do
-    local boundary = line:match(";;%s*Boundary:%s*(.+)")
-    if boundary then pending = boundary end
-    local name = line:match("^%(def%s+([%w%-_]+)%s+%(fn")
-    if name then
-      sigs[#sigs + 1] = pending and (name .. " — " .. pending) or name
-      pending = nil
-    end
-  end
-  return sigs
-end
-
 -- Build the static (config-derived) section. Returns (text, complete) where
 -- `complete` is true when patterns.md was readable — an incomplete build is
 -- not cached, so a later turn (once NEFOR_CONFIG_DIR resolves) rebuilds it.
 local function build_mag_static_section(config_dir)
   local lib_dir  = config_dir .. "/mag/lib"
   local patterns = read_config_file(lib_dir .. "/patterns.md")
-  local types    = read_config_file(lib_dir .. "/types.mag")
-  local tpl_src  = read_config_file(lib_dir .. "/templates.mag")
 
   local parts = {}
   parts[#parts + 1] = "The session MAG workspace is seeded and ready. Paths you pass to " ..
-    "`mag` are relative to it. patterns.md and the type tags are inlined below; " ..
-    "read a template or prompt body with read_file when you compose with it."
+    "`mag` are relative to it. The current canonical authoring contract from " ..
+    "patterns.md is inlined below; read a role prompt body with read_file when needed."
   parts[#parts + 1] = ""
   parts[#parts + 1] = "lib/ inventory:"
   for _, rel in ipairs(lib_inventory(lib_dir)) do parts[#parts + 1] = "  " .. rel end
   parts[#parts + 1] = ""
   parts[#parts + 1] = "### lib/patterns.md"
   parts[#parts + 1] = patterns or "(unavailable)"
-  parts[#parts + 1] = ""
-  parts[#parts + 1] = "### lib/types.mag"
-  parts[#parts + 1] = types or "(unavailable)"
-  parts[#parts + 1] = ""
-  parts[#parts + 1] = "### lib/templates.mag — signatures (read the file for the full body before composing)"
-  local sigs = template_signatures(tpl_src)
-  if #sigs == 0 then
-    parts[#parts + 1] = "  (none)"
-  else
-    for _, s in ipairs(sigs) do parts[#parts + 1] = "  " .. s end
-  end
   parts[#parts + 1] = ""
   parts[#parts + 1] = "### lib/prompts/ (read a role prompt with read_file to reuse it)"
   local names = prompt_names(lib_dir)

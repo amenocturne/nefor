@@ -39,7 +39,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The turn spawner appends a `## MAG workspace` block to the system
 /// overlay (starter/agentic-loop): the session workspace dir plus the
-/// inlined patterns/types doc. Here we build a representative overlay the
+/// inlined canonical patterns document. Here we build a representative overlay the
 /// same way and assert it reaches the provider intact on chat.create.
 const LEAD_SYSTEM: &str = "you are the lead\n\n\
 ## MAG workspace\n\n\

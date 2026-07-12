@@ -336,6 +336,14 @@ do
     "the workspace dir is anchored to the active session")
   assert(string.find(overlay.system, "MAG patterns", 1, true) ~= nil,
     "patterns.md is inlined into the block")
+  assert(string.find(overlay.system, "(require", 1, true) ~= nil,
+    "the inlined contract carries current literal require syntax")
+  assert(string.find(overlay.system, "Never write `(import ...)`", 1, true) ~= nil,
+    "the ambient authoring contract explicitly rejects import syntax")
+  assert(string.find(overlay.system, "### lib/types.mag", 1, true) == nil,
+    "the ambient context does not promise the removed types library")
+  assert(string.find(overlay.system, "### lib/templates.mag", 1, true) == nil,
+    "the ambient context does not promise the removed templates library")
   assert_eq(overlay.provider, "mock", "live provider overlays the llm actor")
   assert_eq(overlay.model, "test-model", "live model overlays the llm actor")
   assert_eq(overlay.reasoning_effort, "high", "reasoning effort overlays the llm actor")
@@ -492,8 +500,8 @@ do
   assert_eq(history[2].content, "fine", "the answer survives")
 end
 
--- (ambient MAG context caching) the static section (inventory + patterns +
--- types + template signatures + prompt roster) is read once and reused
+-- (ambient MAG context caching) the static section (inventory + canonical
+-- patterns + prompt roster) is read once and reused
 -- across turns; only the per-session workspace dir varies.
 do
   fresh_loop()

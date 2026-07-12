@@ -68,6 +68,28 @@ local function fresh()
   _test.calls_clear()
 end
 
+-- The advertised MAG tool points at the injected canonical contract, not at
+-- private library source files that the lead cannot read from its workspace.
+do
+  fresh()
+  feed("tool-gate", { kind = "tool-gate.hello" })
+  local advertised = find_call(decode_calls(), function(call)
+    return call.body.kind == "tool-gate.tools.advertise"
+  end)
+  assert_true(advertised ~= nil, "lead workflow advertises its tool schemas")
+  local mag_schema
+  for _, schema in ipairs(advertised.body.tools or {}) do
+    if schema.name == "mag" then mag_schema = schema end
+  end
+  assert_true(mag_schema ~= nil, "the MAG tool schema is advertised")
+  assert_true(string.find(mag_schema.description, "lib/patterns.md", 1, true) ~= nil,
+    "the MAG schema points to the injected canonical patterns")
+  assert_true(string.find(mag_schema.description, "lib/nefor/*.mag", 1, true) == nil,
+    "the MAG schema does not point at unreadable library implementation files")
+  assert_true(string.find(mag_schema.description, "(require \"...\")", 1, true) ~= nil,
+    "the MAG schema reinforces literal require syntax")
+end
+
 local starter_profiles = require("config").active.orchestration_profiles
 
 local function with_profiles(profiles, fn)
