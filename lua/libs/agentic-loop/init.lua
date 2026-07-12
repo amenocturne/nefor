@@ -81,6 +81,7 @@ local state = {
   lead_program = {
     source_dir = nil,   ---@type string|nil  resolved lazily (NEFOR_CONFIG_DIR)
     entry      = "agentic-loop/lead-turn.mag",
+    module_roots = nil, ---@type string[]|nil explicit ordered search roots
     artifact    = nil,   ---@type table|nil   cached compiled artifact
     hash       = nil,   ---@type string|nil
     entry_actor = nil,  ---@type string|nil  the task message's target
@@ -347,6 +348,17 @@ local function lead_program_source_dir()
   return rawget(_G, "NEFOR_CONFIG_DIR") or os.getenv("NEFOR_CONFIG_DIR") or "."
 end
 
+-- Resolve the ordered MAG module search path. Compositions may add their own
+-- libraries around Nefor's standard library; the historical config-owned
+-- root remains the exact default when no explicit roots were configured.
+local function lead_program_module_roots(source_dir)
+  local configured = state.lead_program.module_roots
+  if configured == nil then return { source_dir .. "/mag/lib" } end
+  local roots = {}
+  for i, root in ipairs(configured) do roots[i] = root end
+  return roots
+end
+
 -- Deep-copy plain data (the cached modification / history are cloned per
 -- turn so per-turn mutation never leaks into the cache).
 local function deep_clone(value)
@@ -390,11 +402,12 @@ local function ensure_lead_program_loaded()
   if p.artifact ~= nil or p.load_id ~= nil then return end
   p.load_id = "lead-turn-load-" .. envelope.uuid_lite()
   local source_dir = lead_program_source_dir()
+  local module_roots = lead_program_module_roots(source_dir)
   emit("mag", {
     kind       = "mag.load",
     id         = p.load_id,
     source_dir = source_dir,
-    module_roots = { source_dir .. "/mag/lib" },
+    module_roots = module_roots,
     entry      = p.entry,
   })
   nefor.log.info("agentic-loop: loading lead turn-program", {
@@ -1100,12 +1113,39 @@ function M.configure(opts)
   -- lead_program: where the shipped turn-program lives. `source_dir`
   -- defaults to the config dir (NEFOR_CONFIG_DIR); compositions whose
   -- config dir is not the starter (cli-config) pass it explicitly.
+  -- `module_roots`, when present, is the complete ordered MAG module search
+  -- path. It is copied so later caller mutation cannot alter live config.
   if type(opts.lead_program) == "table" then
     if type(opts.lead_program.source_dir) == "string" and #opts.lead_program.source_dir > 0 then
       state.lead_program.source_dir = opts.lead_program.source_dir
     end
     if type(opts.lead_program.entry) == "string" and #opts.lead_program.entry > 0 then
       state.lead_program.entry = opts.lead_program.entry
+    end
+    local roots = opts.lead_program.module_roots
+    if roots ~= nil then
+      if type(roots) ~= "table" or #roots == 0 then
+        error("configure: lead_program.module_roots must be a non-empty list of non-empty strings")
+      end
+      local copy = {}
+      for i, root in ipairs(roots) do
+        if type(root) ~= "string" or #root == 0 then
+          error("configure: lead_program.module_roots[" .. tostring(i)
+            .. "] must be a non-empty string")
+        end
+        copy[i] = root
+      end
+      local count = 0
+      for key, _ in pairs(roots) do
+        if type(key) ~= "number" or key % 1 ~= 0 or key < 1 or key > #roots then
+          error("configure: lead_program.module_roots must be a list without extra entries")
+        end
+        count = count + 1
+      end
+      if count ~= #roots then
+        error("configure: lead_program.module_roots must be a contiguous list")
+      end
+      state.lead_program.module_roots = copy
     end
   end
 end
@@ -1310,6 +1350,7 @@ M._internals  = {
     state.lead_program = {
       source_dir = nil,
       entry = "agentic-loop/lead-turn.mag",
+      module_roots = nil,
       artifact = nil,
       hash = nil,
       entry_actor = nil,

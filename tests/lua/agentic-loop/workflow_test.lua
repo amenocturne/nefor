@@ -75,6 +75,14 @@ local function find_kind(calls, kind)
   return nil
 end
 
+local function assert_list_eq(actual, expected, msg)
+  assert_eq(type(actual), "table", (msg or "list") .. " is a table")
+  assert_eq(#actual, #expected, (msg or "list") .. " length")
+  for i, value in ipairs(expected) do
+    assert_eq(actual[i], value, (msg or "list") .. " entry " .. tostring(i))
+  end
+end
+
 -- ------------------------------------------------------------------
 -- configure / chat.model.set — live config plumbing
 -- ------------------------------------------------------------------
@@ -195,6 +203,58 @@ local function fresh_loop()
   }
   _test.set_plugins({ "mock", "mag", "nefor-tui" })
   _test.calls_clear()
+end
+
+-- The legacy/default composition searches only the config-owned library.
+do
+  fresh_loop()
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "default roots" })
+  local load = find_kind(decode_calls(), "mag.load")
+  assert(load ~= nil, "default-root submit emits mag.load")
+  assert_list_eq(load.body.module_roots, { _starter_dir .. "/mag/lib" },
+    "default module roots")
+end
+
+-- A composition can supply a complete ordered search path. configure copies
+-- it defensively, so mutating the caller's table cannot change the load.
+do
+  agentic_loop._internals.reset()
+  local roots = { "/nefor/standard/lib", "/composition/config/lib" }
+  agentic_loop.configure {
+    lead_program = {
+      source_dir = _starter_dir,
+      module_roots = roots,
+    },
+  }
+  roots[1] = "/mutated"
+  roots[3] = "/also-mutated"
+  _test.set_plugins({ "mock", "mag", "nefor-tui" })
+  _test.calls_clear()
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "explicit roots" })
+  local load = find_kind(decode_calls(), "mag.load")
+  assert(load ~= nil, "explicit-root submit emits mag.load")
+  assert_list_eq(load.body.module_roots,
+    { "/nefor/standard/lib", "/composition/config/lib" },
+    "explicit ordered module roots")
+end
+
+-- Invalid explicit roots fail at configuration time instead of producing a
+-- loader error later in the first user turn.
+do
+  local invalid = {
+    {},
+    { "" },
+    { "/valid", false },
+    "not-a-list",
+  }
+  for i, roots in ipairs(invalid) do
+    local ok, err = pcall(function()
+      agentic_loop.configure { lead_program = { module_roots = roots } }
+    end)
+    assert_eq(ok, false, "invalid module roots case " .. tostring(i) .. " rejected")
+    assert(type(err) == "string" and err:find("module_roots", 1, true),
+      "invalid module roots error identifies the field")
+  end
 end
 
 -- Submit `text`; drive the load handshake when the program isn't cached
