@@ -8,14 +8,15 @@
 //!
 //! Filter comes from `RUST_LOG` via `EnvFilter`, defaulting to `info`.
 //!
-//! In file mode, ERROR-level events are *also* mirrored to stderr — silent
-//! failures (plugin spawn errors, init.lua exec errors) would otherwise be
-//! invisible to a user who doesn't know to tail the log file.
+//! File mode never writes live log records to stderr. A terminal UI may own
+//! the same terminal through `/dev/tty`; writing through inherited stderr
+//! would then scroll its alternate-screen buffer behind the renderer's back.
+//! User-facing fatal and abnormal-exit diagnostics are emitted explicitly by
+//! the process boundary after terminal-owning plugins have shut down.
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
-use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::{SubscriberInitExt, TryInitError};
 use tracing_subscriber::{fmt, EnvFilter, Layer};
@@ -70,21 +71,6 @@ pub fn init(log_path: &Path) -> Result<(), LogInitError> {
         .with_ansi(false)
         .with_filter(filter);
 
-    // Surface ERROR-level events on stderr too. The user's terminal is the
-    // primary feedback channel; silent failures (plugin spawn errors, bad
-    // init.lua, etc.) waste a lot of debugging time. Terminal-takeover
-    // plugins claim /dev/tty, not stderr, so these one-line errors print
-    // before any alternate screen is entered and remain visible after exit,
-    // never overwriting live frames.
-    let stderr_errors = fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_target(false)
-        .with_ansi(false)
-        .with_filter(LevelFilter::ERROR);
-
-    tracing_subscriber::registry()
-        .with(file_layer)
-        .with(stderr_errors)
-        .try_init()?;
+    tracing_subscriber::registry().with(file_layer).try_init()?;
     Ok(())
 }

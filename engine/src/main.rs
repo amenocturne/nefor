@@ -244,8 +244,8 @@ async fn run_serve(
     ctrl_c_task.abort();
 
     // Abnormal exits reported here, after the broker (and any TUI plugin's
-    // alternate screen) is gone — ERROR lines mirrored to stderr during the
-    // run get erased by the TUI's screen restore, leaving a silent exit.
+    // alternate screen) is gone. Live tracing stays in nefor.log so it cannot
+    // mutate a terminal-owned framebuffer behind the renderer's back.
     let exits = match abnormal_exits.lock() {
         Ok(g) => g.clone(),
         Err(p) => p.into_inner().clone(),
