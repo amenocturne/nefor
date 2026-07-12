@@ -267,6 +267,127 @@ async fn shipped_mag_corpus_compiles_with_runtime_contracts() {
         "shipped MAG libraries failed to compile: {library_result:#?}"
     );
 
+    // The first Lisp fence in patterns.md is the canonical minimal agent
+    // program injected into every lead turn. Compile that exact text rather
+    // than maintaining a test-side approximation that can drift from the
+    // documentation agents actually see.
+    let patterns_path = lib_root.join("patterns.md");
+    let patterns = fs::read_to_string(&patterns_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", patterns_path.display()));
+    let canonical = patterns
+        .split_once("```lisp\n")
+        .and_then(|(_, rest)| rest.split_once("\n```").map(|(source, _)| source))
+        .expect("patterns.md contains a complete canonical Lisp fence");
+    assert!(
+        canonical.contains("(nefor.actors.agent"),
+        "the first Lisp fence must remain the canonical minimal agent program"
+    );
+    assert!(
+        !canonical.contains("\"mag\""),
+        "ordinary child agents in the canonical example must not receive the lead orchestration tool"
+    );
+    assert!(
+        canonical.contains("\"mag-eval\""),
+        "ordinary child agents retain mag-eval for one-off world work"
+    );
+    fs::write(temp_root.join("canonical-agent.mag"), canonical)
+        .expect("write exact canonical agent regression");
+    let canonical_result = load(
+        &mut reader,
+        &mut stdin,
+        "canonical-agent",
+        &temp_root,
+        Path::new("canonical-agent.mag"),
+        std::slice::from_ref(&lib_root),
+    )
+    .await;
+    assert_eq!(
+        canonical_result.get("kind").and_then(Value::as_str),
+        Some("mag.loaded"),
+        "the exact canonical patterns.md agent must compile against runtime contracts: {canonical_result:#?}"
+    );
+
+    // A library fragment may expose a useful subset of a foreign actor's
+    // runtime outputs. Bash advertises mag.Text plus mag.CommandFailed; the
+    // ordinary shell wrapper deliberately exposes only mag.Text. Unknown
+    // authored wires remain invalid — the runtime inventory is authoritative.
+    fs::write(
+        temp_root.join("shell-output-subset.mag"),
+        r#"(require "nefor.artifact")
+(require "nefor.graph")
+(require "nefor.shell")
+(let [fragment (nefor.shell.command "x" "true")
+      initial (nefor.shell.start-message fragment)
+      program (nefor.graph.finish
+                fragment
+                (as (List nefor.graph.Message) [initial])
+                (as (List nefor.graph.Rule) []))]
+  (nefor.artifact.compile program))"#,
+    )
+    .expect("write shell subset regression");
+    let subset = load(
+        &mut reader,
+        &mut stdin,
+        "shell-output-subset",
+        &temp_root,
+        Path::new("shell-output-subset.mag"),
+        std::slice::from_ref(&lib_root),
+    )
+    .await;
+    assert_eq!(
+        subset.get("kind").and_then(Value::as_str),
+        Some("mag.loaded"),
+        "a shell fragment exposing the mag.Text subset must compile: {subset:#?}"
+    );
+
+    fs::write(
+        temp_root.join("shell-output-unknown.mag"),
+        r#"(require "nefor.artifact")
+(require "nefor.contracts")
+(require "nefor.graph")
+(let [input (nefor.graph.port "x" (type-tag Unit) "mag.Unit")
+      output (nefor.graph.port "x" (type-tag nefor.contracts.Text) "mag.Unknown")
+      actor (nefor.graph.actor
+              "x"
+              nefor.factory.bash
+              (as nefor.contracts.BashParams {:command "true" :timeout_ms nil})
+              (nefor.graph.store-port input)
+              (as (List nefor.graph.StoredPort) [(nefor.graph.store-port output)]))
+      fragment (as (nefor.graph.Fragment Unit nefor.contracts.Text)
+                 {:actors (as (List nefor.graph.Actor) [actor])
+                  :routes (as (List nefor.graph.StoredRoute) [])
+                  :input input
+                  :output output})
+      program (nefor.graph.finish
+                fragment
+                (as (List nefor.graph.Message)
+                    [(nefor.graph.message "x" (as Data {:kind "mag.Unit"}))])
+                (as (List nefor.graph.Rule) []))]
+  (nefor.artifact.compile program))"#,
+    )
+    .expect("write unknown shell output regression");
+    let unknown = load(
+        &mut reader,
+        &mut stdin,
+        "shell-output-unknown",
+        &temp_root,
+        Path::new("shell-output-unknown.mag"),
+        std::slice::from_ref(&lib_root),
+    )
+    .await;
+    assert_eq!(
+        unknown.get("kind").and_then(Value::as_str),
+        Some("mag.error"),
+        "an authored output absent from the runtime scheme must fail: {unknown:#?}"
+    );
+    assert!(
+        unknown
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("wire contract does not match")),
+        "unknown output failure should identify the inventory contract: {unknown:#?}"
+    );
+
     for (index, path) in entrypoints.iter().enumerate() {
         let entry = path
             .strip_prefix(&starter)

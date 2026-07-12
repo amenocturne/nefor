@@ -213,7 +213,8 @@ function M.handle(firing_id, args)
     '(require "nefor.shell")\n',
     '(let [fragment ', expr, '\n',
     '      initial (nefor.shell.start-message fragment)\n',
-    '      program (nefor.graph.finish fragment [initial] ',
+    '      program (nefor.graph.finish fragment ',
+    '                (as (List nefor.graph.Message) [initial]) ',
     '                (as (List nefor.graph.Rule) []))]\n',
     '  (nefor.artifact.compile program))\n',
   })

@@ -324,9 +324,6 @@
        (filter (fn [[value T]] -> Bool (not (contains? right value))) left))
      0)))
 
-(def same-members? (fn [T] [[left (List T)] [right (List T)]] -> Bool
-  (if (all-in? left right) (all-in? right left) false)))
-
 (def actor-output-wires (fn [[actor Actor]] -> (List String)
   (map (fn [[output StoredPort]] -> String (get output "wire"))
        (get actor "outputs"))))
@@ -340,8 +337,12 @@
              (let [scheme (get contract "type_scheme")]
                (if (contains? (get scheme "input_tags")
                               (get (get actor "input") "wire"))
-                 (same-members? (actor-output-wires actor)
-                                (get scheme "outputs"))
+                 ;; Library wrappers may intentionally refine a foreign actor
+                 ;; to the success outputs they compose. Every authored wire
+                 ;; must exist in the runtime scheme; the wrapper need not
+                 ;; expose every runtime failure/alternate output.
+                 (all-in? (actor-output-wires actor)
+                          (get scheme "outputs"))
                  false))
              false))
          contracts))
