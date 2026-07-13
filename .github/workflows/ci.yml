@@ -33,3 +33,27 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  tui-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tui-smoke
+
+      - uses: taiki-e/install-action@just
+
+      - name: Run TUI smoke scenario
+        run: just test-tui-smoke
+
+      - name: Upload TUI smoke artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tui-smoke-artifacts
+          path: tmp/tui-driver-artifacts/
+          if-no-files-found: ignore

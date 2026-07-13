@@ -1,5 +1,5 @@
 {
-  "name": "starter-mock-completes-first-turn",
+  "name": "starter-mock-completes-first-turn-cleanly",
   "command": {
     "argv": ["just", "run"],
     "cwd": ".",

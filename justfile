@@ -51,20 +51,29 @@ test-provider:
 test-tui:
     cargo test -p nefor-tui --lib
 
-# Drive the real starter through its deterministic mock provider. Override
-# TUI_DRIVER_DIR when the sibling source checkout lives elsewhere.
+# Drive the real starter with the same pinned tui-driver locally and in CI.
 test-tui-smoke:
     #!/usr/bin/env bash
     set -euo pipefail
-    tui_driver_dir="${TUI_DRIVER_DIR:-{{justfile_directory()}}/../tui-driver}"
-    mkdir -p "{{justfile_directory()}}/tmp"
-    data_dir="$(mktemp -d "{{justfile_directory()}}/tmp/tui-driver-data.XXXXXX")"
+    readonly tui_driver_rev="0919a8efb130f5e5784dab227a84550284e08ad4"
+    tui_driver_dir="${TUI_DRIVER_DIR:-{{ justfile_directory() }}/tmp/tui-driver}"
+    if [ ! -d "$tui_driver_dir/.git" ]; then
+      git clone --no-checkout https://github.com/amenocturne/tui-driver.git "$tui_driver_dir"
+    fi
+    if ! git -C "$tui_driver_dir" cat-file -e "$tui_driver_rev^{commit}" 2>/dev/null; then
+      git -C "$tui_driver_dir" fetch --depth 1 origin "$tui_driver_rev"
+    fi
+    git -C "$tui_driver_dir" checkout --detach "$tui_driver_rev"
+    test "$(git -C "$tui_driver_dir" rev-parse HEAD)" = "$tui_driver_rev"
+    mkdir -p "{{ justfile_directory() }}/tmp"
+    data_dir="$(mktemp -d "{{ justfile_directory() }}/tmp/tui-driver-data.XXXXXX")"
     trap 'rm -rf "$data_dir"' EXIT
+    rm -rf "{{ justfile_directory() }}/tmp/tui-driver-artifacts"
     cargo build --workspace --locked
     cargo run --quiet --locked --manifest-path "$tui_driver_dir/Cargo.toml" -- \
       run-script tests/tui/starter-mock-smoke.json \
-      --repo-root "{{justfile_directory()}}" \
-      --artifacts-dir "{{justfile_directory()}}/tmp/tui-driver-artifacts" \
+      --repo-root "{{ justfile_directory() }}" \
+      --artifacts-dir "{{ justfile_directory() }}/tmp/tui-driver-artifacts" \
       --env "NEFOR_DATA_DIR=$data_dir" \
       --env NEFOR_DEFAULT_PROVIDER=mock-plugin \
       --env NEFOR_DEFAULT_MODEL=mock-model \
