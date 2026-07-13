@@ -124,7 +124,14 @@ EOF (Ctrl+D or end-of-pipe) exits cleanly with code 0.
 
 ### Other flags
 
-Starter-owned `nefor run --session <id>` opens the TUI on a specific saved session.
+Starter-owned interactive flags are parsed by the composition, not Rust clap:
+
+- `nefor run --session <id>` opens the TUI on a specific saved session.
+- `nefor run --prompt <text>` submits a prompt after startup.
+- `nefor run --mode safe|auto|yolo` selects the initial tool permission mode.
+- `nefor run --yolo` is shorthand for `--mode yolo`.
+
+Arguments may appear in any order. Repeated mode controls are applied left-to-right, so the last occurrence wins. A resumed session remains safe after process restart unless this invocation explicitly supplies a mode.
 
 | Flag                            | What it does                                                                                                                          |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |

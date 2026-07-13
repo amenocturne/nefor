@@ -20,6 +20,15 @@ Reference config for the nefor engine. NCP v0.1 protocol semantics live here in 
 
 ## Run
 
+Interactive startup arguments are composition-owned and may appear in any order:
+
+```sh
+nefor run [--session <id>] [--prompt <text>] [--mode safe|auto|yolo]
+nefor run --yolo [--session <id>] [--prompt <text>]
+```
+
+`--yolo` is shorthand for `--mode yolo`. If mode controls repeat, the last one wins. Resumed sessions start in safe mode unless a mode is supplied explicitly on this invocation.
+
 In-tree (debug build):
 
 ```sh

@@ -31,6 +31,7 @@ test-fast:
 test-starter:
     cargo test -p nefor --test starter_tool_gate_test
     cargo test -p nefor --test starter_sessions_test
+    cargo test -p nefor --test starter_startup_test
     cargo test -p nefor --test starter_openai_provider_test
     cargo test -p nefor --test starter_agentic_workflow_test
     cargo test -p nefor --test starter_agentic_cli_test

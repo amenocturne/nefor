@@ -140,6 +140,26 @@ mod tests {
     }
 
     #[test]
+    fn run_yolo_with_prompt_is_forwarded_verbatim() {
+        let cli = Cli::try_parse_from(["nefor", "run", "--yolo", "--prompt", "ship it"])
+            .expect("parse ok");
+        assert_eq!(
+            runtime_argv_from_cli(&cli),
+            ["--yolo", "--prompt", "ship it"]
+        );
+    }
+
+    #[test]
+    fn run_yolo_with_session_is_forwarded_verbatim() {
+        let cli = Cli::try_parse_from(["nefor", "run", "--session", "abc123", "--yolo"])
+            .expect("parse ok");
+        assert_eq!(
+            runtime_argv_from_cli(&cli),
+            ["--session", "abc123", "--yolo"]
+        );
+    }
+
+    #[test]
     fn plugin_with_no_name_is_list_mode() {
         let cli = Cli::try_parse_from(["nefor", "plugin"]).expect("parse ok");
         assert!(matches!(engine_mode_from_cli(&cli), EngineMode::PluginList));

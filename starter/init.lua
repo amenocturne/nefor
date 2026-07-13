@@ -231,33 +231,8 @@ history_replay.install()
 actor.spawn(sessions)
 actor.spawn(require("libs.state-tracking"))
 
-local function parse_startup_args(argv)
-  local opts = { session_id = nil, prompt = nil }
-  local i = 1
-  while i <= #argv do
-    local a = argv[i]
-    if a == "--session" then
-      local v = argv[i + 1]
-      if type(v) ~= "string" or v == "" then
-        error("--session requires a session id")
-      end
-      opts.session_id = v
-      i = i + 2
-    elseif a == "--prompt" then
-      local v = argv[i + 1]
-      if type(v) ~= "string" or v == "" then
-        error("--prompt requires a prompt")
-      end
-      opts.prompt = v
-      i = i + 2
-    else
-      error("unknown startup arg: " .. tostring(a))
-    end
-  end
-  return opts
-end
-
-local startup = parse_startup_args((nefor.runtime and nefor.runtime.argv) or {})
+local startup_args = require("startup")
+local startup = startup_args.parse((nefor.runtime and nefor.runtime.argv) or {})
 sessions.init(startup.session_id)
 
 -- Spawn order matters: type-tag registrations must complete before the
@@ -428,6 +403,7 @@ actor.spawn(require("tool-validator"))
 actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
 actor.spawn(tools.git_worktree_actor_spec())
 actor.spawn(tools.basic_actor_spec())
+startup_args.apply_mode(startup, agentic_loop)
 
 actor.spawn(require("libs.compositors.chat_bridge").spawn_spec({
   require("config").bin("nefor-tui"),
