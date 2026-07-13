@@ -64,7 +64,7 @@ fn rule_functions_are_named_unary_artifact_functions() {
     assert!(validate_rule_fn_input(&loaded, "expand", &int)
         .unwrap_err()
         .to_string()
-        .contains("input must be Int"));
+        .contains("does not match its structural source type"));
     assert!(validate_rule_fn(&loaded, "binary")
         .unwrap_err()
         .to_string()
@@ -421,7 +421,10 @@ fn type_tags_are_typed_canonical_witnesses() {
         &root,
     )
     .unwrap();
-    assert_eq!(artifact.data, json!("main.Payload"));
+    assert_eq!(
+        artifact.data,
+        json!({"kind":"named","name":"main.Payload","arguments":[]})
+    );
 
     let unknown = compile("(artifact \"test.tag/v1\" (type-tag Missing))", &root)
         .unwrap_err()

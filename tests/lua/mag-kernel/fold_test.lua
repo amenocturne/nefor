@@ -222,7 +222,7 @@ do
 end
 
 -- ------------------------------------------------------------------
--- non-empty rules — rejected "not implemented"
+-- non-empty rules — rejected because subscriptions are immutable after start
 -- ------------------------------------------------------------------
 
 do
@@ -232,7 +232,8 @@ do
     rules = { { on = "a", fn = "handle" } },
   })
   assert_true(not res.ok, "non-empty rules are rejected")
-  assert_contains(res.error, "not implemented", "rules rejection says not implemented")
+  assert_contains(res.error, "immutable initial subscriptions",
+    "rules rejection names the immutable-subscription contract")
   assert_eq(inv.state_of("a"), "never-existed", "rules rejection applied nothing")
 end
 

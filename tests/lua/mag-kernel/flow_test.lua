@@ -69,8 +69,10 @@ do
       "factory " .. tostring(mod.declaration.name) .. " registers cleanly: " .. tostring(err))
   end
 
-  -- sink is terminal: no outputs.
-  assert_eq(#reg:declaration("sink").outputs, 0, "sink declares no outputs (terminal)")
+  -- The sink's only declared output is the kernel completion wire; it emits no
+  -- routable data output.
+  assert_eq(#reg:declaration("sink").outputs, 1, "sink declares one completion output")
+  assert_eq(reg:declaration("sink").outputs[1], "mag.Unit", "sink completion output")
 
   -- human declares a union approve/reject exit and the drain signal.
   local hd = reg:declaration("human")

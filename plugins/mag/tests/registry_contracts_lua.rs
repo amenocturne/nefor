@@ -162,6 +162,22 @@ fn registry_requires_compiler_specialization_for_generic_factories() {
           input=p("Unit"),output={kind="union",items={p("String"),p("Int")}}},input={type=p("Unit"),wire="Start"},
         outputs={{type=p("Int"),wire="Left"},{type=p("String"),wire="Right"}},routes={}}}})
       assert(not swapped.ok)
+
+      assert(reg:register({declaration={name="answer",semantic={
+        input=p("String"),output=n("nefor.contracts.FinalAnswer"),
+        inputs={{wire="In",type=p("String")}},
+        outputs={{wire="Final",type=n("nefor.contracts.FinalAnswer")}}},
+        params={},inputs={value="In"},outputs={"Final"}},construct=function() return {} end}))
+      local refined=reg:validate_modification({actors={{id="answer",factory="answer",evidence={
+        version=2,identity="nefor.factory.answer",arguments={},input=p("String"),
+        output=n("nefor.contracts.FinalAnswer")},input={wire="In",type=p("String")},
+        outputs={{wire="Final",type=n("main.CodeAudit")}},routes={}}}})
+      assert(refined.ok,table.concat(refined.errors or {},"; "))
+      local structural_refinement=reg:validate_modification({actors={{id="answer",factory="answer",evidence={
+        version=2,identity="nefor.factory.answer",arguments={},input=p("String"),
+        output=n("nefor.contracts.FinalAnswer")},input={wire="In",type=p("String")},
+        outputs={{wire="Final",type=p("String")}},routes={}}}})
+      assert(not structural_refinement.ok)
       assert(not valid(p("String"),p("String"),{kind="list"}).ok)
       assert(not valid({kind="variable",name="T"},p("String"),list(p("String"))).ok)
       assert(not valid({kind="primitive",name="String",arguments={}},p("String"),list(p("String"))).ok)

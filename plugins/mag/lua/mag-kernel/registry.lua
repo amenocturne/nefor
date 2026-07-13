@@ -32,6 +32,13 @@ local type_node = require("type-node")
 local registry = {}
 registry.__index = registry
 
+local function compatible_output_type(expected, actual)
+  if type_node.equal(expected, actual) then return true end
+  -- A library boundary may give a foreign actor's nominal success output a
+  -- more specific domain name while retaining the actor's runtime wire.
+  return expected.kind == "named" and actual.kind == "named"
+end
+
 -- Kernel-synthesized status types (docs/ir.md, Firing: "Reserved status types
 -- are kernel-emitted"). Lowering encodes ordering/failure edges as route keys
 -- carrying these tags, yet a factory never declares them as outputs — the
@@ -441,7 +448,7 @@ function registry:validate_modification(modification, resolve)
             if evidence_output.kind=="union" then
               for _,arm in ipairs(evidence_output.items) do if type_node.equal(expected,arm) then required=true end end
             end
-            if (required and not actual[wire]) or (actual[wire] and not type_node.equal(actual[wire],expected)) then
+            if (required and not actual[wire]) or (actual[wire] and not compatible_output_type(expected,actual[wire])) then
               table.insert(errors,string.format("actor %q: semantic output for wire %q is missing or has the wrong type",tostring(spec.id),wire))
             end
             actual[wire]=nil
