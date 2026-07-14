@@ -125,8 +125,12 @@ async fn auth_store_apply_login_result_persists_and_transitions() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("auth.json");
     let store = AuthStore::load_from_disk(&path).await.expect("load");
+    let lease = match store.begin_login().await {
+        chatgpt_provider::auth::LoginStartOutcome::Started(lease) => lease,
+        other => panic!("expected login start, got {other:?}"),
+    };
     store
-        .apply_login_result(dummy_tokens())
+        .apply_login_result(lease, dummy_tokens())
         .await
         .expect("apply");
     let snap = store.snapshot().await;

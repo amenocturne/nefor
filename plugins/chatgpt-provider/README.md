@@ -8,7 +8,11 @@ flag sets the event-kind prefix), but targets the ChatGPT backend
 
 Includes a standalone OAuth PKCE login flow (`chatgpt-provider login`) that
 persists tokens to `$XDG_DATA_HOME/nefor/chatgpt-auth.json`. The plugin
-mode (default, no subcommand) runs as an NCP stdio plugin.
+mode (default, no subcommand) runs as an NCP stdio plugin. A running plugin
+refreshes OAuth access tokens five minutes before their JWT expiry, serializes
+concurrent refreshes, and can adopt a same-account login written by another
+process. A Responses 401 is recovered with one credential reload and one
+forced refresh before the plugin asks the user to log in again.
 
 The model list is fetched from the backend at runtime -- no `--model` CLI
 flag. Users pick via `/model` in the chat surface.

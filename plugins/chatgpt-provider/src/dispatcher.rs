@@ -22,7 +22,9 @@ use nefor_protocol::{Body, Envelope, PluginName, PluginOutgoing, SystemBody};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
-use crate::auth::{AuthSnapshot, AuthState, AuthStore, LogoutOutcome};
+use crate::auth::{
+    AuthSnapshot, AuthState, AuthStore, LoginLease, LoginStartOutcome, LogoutOutcome,
+};
 use crate::broker::{ToolBroker, ToolResult};
 use crate::catalog::ToolCatalog;
 use crate::config::ServeArgs;
@@ -56,10 +58,24 @@ const LOGOUT_REFUSED_ENV_MESSAGE: &str =
 
 const HTTP_401_MESSAGE: &str = "auth failed (HTTP 401) — re-login via chatgpt-provider login";
 
-const NO_LOGIN_FLOW_IN_PROGRESS_MESSAGE: &str =
-    "login already in progress; wait for completion or restart the plugin";
-
 const USAGE_POLL_INTERVAL_SECS: u64 = 5 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Auth401Action {
+    RetryReloaded,
+    ForceRefresh,
+    Fail,
+}
+
+fn auth_401_action(stage: u8, disk_credentials_adopted: bool) -> Auth401Action {
+    if stage == 0 && disk_credentials_adopted {
+        Auth401Action::RetryReloaded
+    } else if stage < 2 {
+        Auth401Action::ForceRefresh
+    } else {
+        Auth401Action::Fail
+    }
+}
 
 // ---------------------------------------------------------------------
 // Wire shape helpers — every event we emit is built here.
@@ -165,8 +181,30 @@ async fn handle_refresh_error(
             )
             .await
         }
-        e => {
+        ChatgptError::RefreshTransient(message) => {
+            let snap = ctx.auth.snapshot().await;
+            send_event(&ctx.out_tx, auth_status_body(&ctx.args, &snap)).await?;
+            send_event(
+                &ctx.out_tx,
+                turn_error_body(
+                    &ctx.args,
+                    chat_id,
+                    &format!("token refresh temporarily unavailable: {message}"),
+                ),
+            )
+            .await
+        }
+        e @ ChatgptError::RefreshFailed(_) => {
             let snap = ctx.auth.apply_error(format!("refresh: {e}")).await;
+            send_event(&ctx.out_tx, auth_status_body(&ctx.args, &snap)).await?;
+            send_event(
+                &ctx.out_tx,
+                turn_error_body(&ctx.args, chat_id, &format!("token refresh failed: {e}")),
+            )
+            .await
+        }
+        e => {
+            let snap = ctx.auth.snapshot().await;
             send_event(&ctx.out_tx, auth_status_body(&ctx.args, &snap)).await?;
             send_event(
                 &ctx.out_tx,
@@ -596,20 +634,24 @@ fn spawn_login_flow(
     chats: Arc<Chats>,
     responses_client: Arc<ResponsesClient>,
     out_tx: mpsc::Sender<PluginOutgoing>,
+    lease: LoginLease,
 ) {
     tokio::spawn(async move {
-        let result = crate::auth::oauth::run_login(
-            true,
-            &crate::auth::store::default_auth_path()
-                .unwrap_or_else(|_| std::path::PathBuf::from("chatgpt-auth.json")),
-        )
-        .await;
+        let result = crate::auth::oauth::run_login_without_persisting(true).await;
         match result {
             Ok(td) => {
-                if let Err(e) = auth.apply_login_result(td).await {
-                    let snap = auth.apply_error(format!("apply login: {e}")).await;
-                    let _ = send_event(&out_tx, auth_status_body(&args, &snap)).await;
-                    return;
+                match auth.apply_login_result(lease, td).await {
+                    Ok(true) => {}
+                    Ok(false) => return,
+                    Err(e) => {
+                        if let Some(snap) = auth
+                            .apply_login_error(lease, format!("apply login: {e}"))
+                            .await
+                        {
+                            let _ = send_event(&out_tx, auth_status_body(&args, &snap)).await;
+                        }
+                        return;
+                    }
                 }
                 let snap = auth.snapshot().await;
                 let _ = send_event(&out_tx, auth_status_body(&args, &snap)).await;
@@ -631,11 +673,28 @@ fn spawn_login_flow(
                 }
             }
             Err(e) => {
-                let snap = auth.apply_error(format!("login: {e}")).await;
-                let _ = send_event(&out_tx, auth_status_body(&args, &snap)).await;
+                if let Some(snap) = auth.apply_login_error(lease, format!("login: {e}")).await {
+                    let _ = send_event(&out_tx, auth_status_body(&args, &snap)).await;
+                }
             }
         }
     });
+}
+
+async fn start_login_flow(
+    args: Arc<ServeArgs>,
+    auth: Arc<AuthStore>,
+    chats: Arc<Chats>,
+    responses_client: Arc<ResponsesClient>,
+    out_tx: mpsc::Sender<PluginOutgoing>,
+) -> Result<(), ChatgptError> {
+    let outcome = auth.begin_login().await;
+    let snap = auth.snapshot().await;
+    send_event(&out_tx, auth_status_body(&args, &snap)).await?;
+    if let LoginStartOutcome::Started(lease) = outcome {
+        spawn_login_flow(args, auth, chats, responses_client, out_tx, lease);
+    }
+    Ok(())
 }
 
 /// Fire-and-forget background fetch of `/models`. Emits
@@ -941,23 +1000,14 @@ async fn dispatch_event(
             Ok(())
         }
         "login_requested" => {
-            let snap = ctx.auth.snapshot().await;
-            if matches!(snap.state, AuthState::LoginRequired | AuthState::Error(_)) {
-                spawn_login_flow(
-                    ctx.args.clone(),
-                    ctx.auth.clone(),
-                    ctx.chats.clone(),
-                    ctx.responses_client.clone(),
-                    ctx.out_tx.clone(),
-                );
-                Ok(())
-            } else {
-                let snap = ctx
-                    .auth
-                    .apply_error(NO_LOGIN_FLOW_IN_PROGRESS_MESSAGE.to_owned())
-                    .await;
-                send_event(&ctx.out_tx, auth_status_body(&ctx.args, &snap)).await
-            }
+            start_login_flow(
+                ctx.args.clone(),
+                ctx.auth.clone(),
+                ctx.chats.clone(),
+                ctx.responses_client.clone(),
+                ctx.out_tx.clone(),
+            )
+            .await
         }
         "logout_requested" => {
             // Cancel any in-flight turns before tearing down auth — a
@@ -1046,13 +1096,14 @@ async fn dispatch_event(
             // surface in sync as the flow progresses.
             let snap = ctx.auth.snapshot().await;
             if matches!(snap.state, AuthState::LoginRequired | AuthState::Error(_)) {
-                spawn_login_flow(
+                start_login_flow(
                     ctx.args.clone(),
                     ctx.auth.clone(),
                     ctx.chats.clone(),
                     ctx.responses_client.clone(),
                     ctx.out_tx.clone(),
-                );
+                )
+                .await?;
             }
             Ok(())
         }
@@ -1981,6 +2032,7 @@ fn spawn_turn(ctx: DispatcherContext, chat_id: ChatId, cancel: TurnToken) {
         let mut total_output_tokens: u64 = 0;
         let mut active_model = String::new();
         let mut pre_output_stream_retries: u32 = 0;
+        let mut auth_401_recovery_stage: u8 = 0;
 
         loop {
             iterations += 1;
@@ -2141,14 +2193,70 @@ fn spawn_turn(ctx: DispatcherContext, chat_id: ChatId, cancel: TurnToken) {
             let auth_snap = ctx.auth.snapshot().await;
 
             let mut stream = match ctx.responses_client.stream(&req, &auth_snap).await {
-                Ok(s) => s,
+                Ok(s) => {
+                    auth_401_recovery_stage = 0;
+                    s
+                }
                 Err(ChatgptError::ResponsesEndpoint { status, body }) => {
                     if status == 401 {
-                        let snap = ctx.auth.apply_error(HTTP_401_MESSAGE.to_owned()).await;
-                        let _ = ctx
-                            .out_tx
-                            .send(PluginOutgoing::event(auth_status_body(&ctx.args, &snap)))
-                            .await;
+                        let failed_token = auth_snap
+                            .tokens
+                            .as_ref()
+                            .map(|tokens| tokens.access_token.clone());
+                        let disk_credentials_adopted = if auth_401_recovery_stage == 0 {
+                            match ctx.auth.adopt_disk_credentials().await {
+                                Ok(adopted) => adopted,
+                                Err(error) => {
+                                    tracing::warn!(%error, "could not reload auth file after 401");
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
+                        let recovery_action =
+                            auth_401_action(auth_401_recovery_stage, disk_credentials_adopted);
+                        match recovery_action {
+                            Auth401Action::RetryReloaded => {
+                                auth_401_recovery_stage = 1;
+                                iterations = iterations.saturating_sub(1);
+                                continue;
+                            }
+                            Auth401Action::ForceRefresh => {}
+                            Auth401Action::Fail => {
+                                let snap = ctx.auth.apply_error(HTTP_401_MESSAGE.to_owned()).await;
+                                let _ = ctx
+                                    .out_tx
+                                    .send(PluginOutgoing::event(auth_status_body(&ctx.args, &snap)))
+                                    .await;
+                            }
+                        }
+                        if recovery_action == Auth401Action::ForceRefresh {
+                            if let Some(failed_token) = failed_token {
+                                match ctx.auth.force_refresh_after(&failed_token).await {
+                                    Ok(_) => {
+                                        auth_401_recovery_stage = 2;
+                                        iterations = iterations.saturating_sub(1);
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        final_error =
+                                            Some(format!("token refresh failed: {error}"));
+                                        let _ =
+                                            handle_refresh_error(&ctx, Some(&chat_id), error).await;
+                                        errored = true;
+                                        final_finish_reason = Some("error".into());
+                                        break;
+                                    }
+                                }
+                            } else {
+                                let snap = ctx.auth.apply_error(HTTP_401_MESSAGE.to_owned()).await;
+                                let _ = ctx
+                                    .out_tx
+                                    .send(PluginOutgoing::event(auth_status_body(&ctx.args, &snap)))
+                                    .await;
+                            }
+                        }
                     }
                     // Reactive fallback: some gpt-5-family slugs
                     // (`gpt-5.3-codex-spark`, etc.) match
@@ -2694,6 +2802,119 @@ mod tests {
             Some("HTTP 401")
         );
         assert_eq!(body.get("source").and_then(Value::as_str), Some("oauth"));
+    }
+
+    #[test]
+    fn auth_401_recovery_is_bounded_reload_then_refresh_then_fail() {
+        assert_eq!(auth_401_action(0, true), Auth401Action::RetryReloaded);
+        assert_eq!(auth_401_action(0, false), Auth401Action::ForceRefresh);
+        assert_eq!(auth_401_action(1, false), Auth401Action::ForceRefresh);
+        assert_eq!(auth_401_action(2, false), Auth401Action::Fail);
+    }
+
+    #[tokio::test]
+    async fn auth_401_retry_rebuilds_headers_with_rotated_token() {
+        use crate::auth::store::{
+            save, AccessToken, AuthDotJson, ChatgptAccountId, RefreshToken, TokenData,
+        };
+
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("server");
+        let addr = server.server_addr().to_ip().expect("ip");
+        let (headers_tx, headers_rx) = std::sync::mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            for step in 0..3 {
+                let request = server.recv().expect("request");
+                let authorization = request
+                    .headers()
+                    .iter()
+                    .find(|header| header.field.equiv("authorization"))
+                    .map(|header| header.value.as_str().to_owned());
+                headers_tx.send(authorization).expect("record header");
+                let response = match step {
+                    0 => tiny_http::Response::from_string("unauthorized").with_status_code(401),
+                    1 => tiny_http::Response::from_string(
+                        r#"{"id_token":"h.e30.s","access_token":"fresh","refresh_token":"rotated"}"#,
+                    )
+                    .with_header(
+                        "content-type: application/json"
+                            .parse::<tiny_http::Header>()
+                            .expect("header"),
+                    ),
+                    _ => tiny_http::Response::from_string("data: [DONE]\n\n").with_header(
+                        "content-type: text/event-stream"
+                            .parse::<tiny_http::Header>()
+                            .expect("header"),
+                    ),
+                };
+                request.respond(response).expect("respond");
+            }
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("auth.json");
+        save(
+            &auth_path,
+            &AuthDotJson {
+                tokens: TokenData {
+                    id_token: "h.e30.s".into(),
+                    access_token: AccessToken("stale".into()),
+                    refresh_token: RefreshToken("refresh".into()),
+                    account_id: Some(ChatgptAccountId("acct".into())),
+                },
+                last_refresh: chrono::Utc::now(),
+            },
+        )
+        .expect("save");
+        let auth = AuthStore::load_from_disk_with_refresh_url(
+            &auth_path,
+            format!("http://{addr}/oauth/token"),
+        )
+        .await
+        .expect("auth");
+        let client = ResponsesClient::new(
+            format!("http://{addr}"),
+            "installation".into(),
+            "test".into(),
+        );
+        let request = ResponsesApiRequest {
+            model: "test".into(),
+            instructions: String::new(),
+            input: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: "auto".into(),
+            parallel_tool_calls: false,
+            reasoning: None,
+            store: false,
+            stream: true,
+            include: Vec::new(),
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+        };
+
+        let first = auth.snapshot().await;
+        assert!(matches!(
+            client.stream(&request, &first).await,
+            Err(ChatgptError::ResponsesEndpoint { status: 401, .. })
+        ));
+        let failed_token = first.tokens.expect("tokens").access_token;
+        auth.force_refresh_after(&failed_token)
+            .await
+            .expect("refresh");
+        client
+            .stream(&request, &auth.snapshot().await)
+            .await
+            .expect("retry");
+        server_thread.join().expect("server thread");
+
+        assert_eq!(
+            headers_rx.into_iter().collect::<Vec<_>>(),
+            vec![
+                Some("Bearer stale".into()),
+                None,
+                Some("Bearer fresh".into())
+            ]
+        );
     }
 
     #[test]

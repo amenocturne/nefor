@@ -60,14 +60,8 @@ pub async fn revoke_tokens(refresh_token: &RefreshToken) -> Result<(), ChatgptEr
     Ok(())
 }
 
-/// Refresh if the persisted token is older than `max_age_secs - leeway`.
-///
-/// We don't have a hard expiry timestamp on disk (the access token's
-/// JWT `exp` claim *does* have one, but reading it pulls in an extra
-/// parsing path; not worth it for Phase 2). Instead, treat
-/// `last_refresh + max_age - leeway` as the trigger — codex's refresh
-/// interval is 8 minutes, well inside the access-token lifetime.
-pub const TOKEN_REFRESH_LEEWAY_SECS: i64 = 60;
+pub const TOKEN_REFRESH_LEEWAY_SECS: i64 = 5 * 60;
+pub const TOKEN_FALLBACK_MAX_AGE_SECS: i64 = 8 * 24 * 60 * 60;
 
 #[derive(Debug, Serialize)]
 struct RefreshRequest<'a> {
@@ -78,52 +72,82 @@ struct RefreshRequest<'a> {
 
 #[derive(Debug, Deserialize)]
 struct RefreshResponse {
-    id_token: String,
-    access_token: String,
-    refresh_token: String,
+    id_token: Option<String>,
+    access_token: Option<String>,
+    refresh_token: Option<String>,
 }
 
 /// Hit `/oauth/token` with the refresh-token grant; return a fresh
 /// `TokenData`. The id_token's `chatgpt_account_id` claim is re-extracted
 /// because the auth service may rotate it (workspace switches).
-pub async fn refresh_tokens(refresh_token: &RefreshToken) -> Result<TokenData, ChatgptError> {
+pub async fn refresh_tokens(tokens: &TokenData) -> Result<TokenData, ChatgptError> {
+    refresh_tokens_at(tokens, TOKEN_URL).await
+}
+
+pub async fn refresh_tokens_at(
+    tokens: &TokenData,
+    token_url: &str,
+) -> Result<TokenData, ChatgptError> {
     let body = RefreshRequest {
         client_id: CLIENT_ID,
         grant_type: "refresh_token",
-        refresh_token: &refresh_token.0,
+        refresh_token: &tokens.refresh_token.0,
     };
 
     let client = reqwest::Client::builder()
         .connect_timeout(REFRESH_CONNECT_TIMEOUT)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
-    let resp = post_refresh_with_retry(&client, &body).await?;
+    let resp = post_refresh_with_retry(&client, &body, token_url).await?;
 
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        return Err(ChatgptError::RefreshFailed(format!("{status}: {text}")));
+        let reason = format!("{status}: {text}");
+        if is_terminal_refresh_failure(status.as_u16(), &text) {
+            return Err(ChatgptError::RefreshFailed(reason));
+        }
+        return Err(ChatgptError::RefreshTransient(reason));
     }
     let resp: RefreshResponse = resp.json().await?;
+    Ok(merge_refresh_response(tokens, resp))
+}
 
-    let claims = parse_chatgpt_jwt_claims(&resp.id_token).unwrap_or_default();
-    Ok(TokenData {
-        id_token: resp.id_token,
-        access_token: AccessToken(resp.access_token),
-        refresh_token: RefreshToken(resp.refresh_token),
-        account_id: claims.chatgpt_account_id,
-    })
+fn merge_refresh_response(current: &TokenData, response: RefreshResponse) -> TokenData {
+    let account_id = match response.id_token.as_deref() {
+        Some(id_token) => {
+            parse_chatgpt_jwt_claims(id_token)
+                .unwrap_or_default()
+                .chatgpt_account_id
+        }
+        None => current.account_id.clone(),
+    };
+    TokenData {
+        id_token: response
+            .id_token
+            .unwrap_or_else(|| current.id_token.clone()),
+        access_token: response
+            .access_token
+            .map(AccessToken)
+            .unwrap_or_else(|| current.access_token.clone()),
+        refresh_token: response
+            .refresh_token
+            .map(RefreshToken)
+            .unwrap_or_else(|| current.refresh_token.clone()),
+        account_id,
+    }
 }
 
 async fn post_refresh_with_retry(
     client: &reqwest::Client,
     body: &RefreshRequest<'_>,
+    token_url: &str,
 ) -> Result<reqwest::Response, ChatgptError> {
     let started = Instant::now();
     let mut attempt: u32 = 0;
     loop {
         let result = client
-            .post(TOKEN_URL)
+            .post(token_url)
             .header("Content-Type", "application/json")
             .timeout(REFRESH_REQUEST_TIMEOUT)
             .json(body)
@@ -175,7 +199,29 @@ async fn post_refresh_with_retry(
 }
 
 fn is_transient_status(status: u16) -> bool {
-    matches!(status, 429 | 502..=504)
+    status == 429 || (500..=599).contains(&status)
+}
+
+fn is_terminal_refresh_failure(status: u16, body: &str) -> bool {
+    if status == 401 {
+        return true;
+    }
+    if status == 429 || status >= 500 {
+        return false;
+    }
+    let body = body.to_ascii_lowercase();
+    [
+        "invalid_grant",
+        "refresh token is expired",
+        "refresh token expired",
+        "refresh token was revoked",
+        "refresh token revoked",
+        "refresh token reused",
+        "refresh token was already used",
+        "refresh token invalidated",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
 }
 
 fn is_transient_transport(e: &reqwest::Error) -> bool {
@@ -205,26 +251,43 @@ fn retry_delay(attempt: u32, retry_after_sec: Option<u64>) -> Duration {
     Duration::from_millis((capped as i64 + jitter).max(0) as u64)
 }
 
-/// True when `last_refresh` is older than `max_age_secs - leeway` from
-/// `now`. Callers decide what max-age window they want — Phase 2 uses
-/// 28 minutes (codex defaults to 8min, but Responses access tokens are
-/// usually good for ~60min and we want some slack).
-pub fn is_expired(auth: &AuthDotJson, now: DateTime<Utc>, max_age_secs: i64) -> bool {
-    let age = now.signed_duration_since(auth.last_refresh).num_seconds();
-    age >= (max_age_secs - TOKEN_REFRESH_LEEWAY_SECS).max(0)
+/// Refresh five minutes before the access JWT expires. Tokens that are
+/// opaque or malformed use Codex's conservative eight-day age fallback.
+pub fn needs_refresh(auth: &AuthDotJson, now: DateTime<Utc>) -> bool {
+    access_token_expiry(&auth.tokens.access_token)
+        .map(|exp| now.timestamp() >= exp.saturating_sub(TOKEN_REFRESH_LEEWAY_SECS))
+        .unwrap_or_else(|| {
+            now.signed_duration_since(auth.last_refresh).num_seconds()
+                >= TOKEN_FALLBACK_MAX_AGE_SECS
+        })
+}
+
+fn access_token_expiry(token: &AccessToken) -> Option<i64> {
+    crate::auth::store::decode_jwt_payload(&token.0)
+        .ok()?
+        .get("exp")?
+        .as_i64()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::store::{AccessToken, RefreshToken, TokenData};
+    use base64::Engine;
     use chrono::Duration;
 
-    fn auth(last_refresh: DateTime<Utc>) -> AuthDotJson {
+    fn jwt_with_exp(exp: i64) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{}");
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp}}}"#));
+        format!("{header}.{payload}.sig")
+    }
+
+    fn auth(access_token: String, last_refresh: DateTime<Utc>) -> AuthDotJson {
         AuthDotJson {
             tokens: TokenData {
                 id_token: "x".into(),
-                access_token: AccessToken("a".into()),
+                access_token: AccessToken(access_token),
                 refresh_token: RefreshToken("r".into()),
                 account_id: None,
             },
@@ -233,25 +296,21 @@ mod tests {
     }
 
     #[test]
-    fn fresh_token_not_expired() {
+    fn jwt_expiry_refreshes_five_minutes_early() {
         let now = Utc::now();
-        let a = auth(now);
-        assert!(!is_expired(&a, now, 600));
+        let fresh = auth(jwt_with_exp(now.timestamp() + 301), now);
+        let expiring = auth(jwt_with_exp(now.timestamp() + 300), now);
+        assert!(!needs_refresh(&fresh, now));
+        assert!(needs_refresh(&expiring, now));
     }
 
     #[test]
-    fn old_token_expired() {
+    fn malformed_jwt_uses_eight_day_fallback() {
         let now = Utc::now();
-        let a = auth(now - Duration::seconds(700));
-        assert!(is_expired(&a, now, 600));
-    }
-
-    #[test]
-    fn leeway_triggers_early_refresh() {
-        let now = Utc::now();
-        // 600 - 60 leeway = trigger at 540s. At 550s old, should be expired.
-        let a = auth(now - Duration::seconds(550));
-        assert!(is_expired(&a, now, 600));
+        let fresh = auth("opaque".into(), now - Duration::days(7));
+        let old = auth("opaque".into(), now - Duration::days(8));
+        assert!(!needs_refresh(&fresh, now));
+        assert!(needs_refresh(&old, now));
     }
 
     #[test]
@@ -274,8 +333,87 @@ mod tests {
         assert!(is_transient_status(502));
         assert!(is_transient_status(503));
         assert!(is_transient_status(504));
+        assert!(is_transient_status(500));
+        assert!(is_transient_status(599));
         assert!(!is_transient_status(401));
         assert!(!is_transient_status(400));
+    }
+
+    #[test]
+    fn terminal_refresh_failure_requires_401_or_known_invalid_token_reason() {
+        assert!(is_terminal_refresh_failure(401, "anything"));
+        assert!(is_terminal_refresh_failure(400, "invalid_grant"));
+        assert!(is_terminal_refresh_failure(
+            400,
+            "refresh token was already used"
+        ));
+        assert!(!is_terminal_refresh_failure(
+            400,
+            "temporary policy failure"
+        ));
+        assert!(!is_terminal_refresh_failure(403, "forbidden"));
+        assert!(!is_terminal_refresh_failure(500, "invalid_grant"));
+    }
+
+    #[test]
+    fn partial_refresh_response_preserves_omitted_tokens() {
+        let current = TokenData {
+            id_token: "old-id".into(),
+            access_token: AccessToken("old-access".into()),
+            refresh_token: RefreshToken("old-refresh".into()),
+            account_id: Some(crate::auth::store::ChatgptAccountId("acct".into())),
+        };
+        let merged = merge_refresh_response(
+            &current,
+            RefreshResponse {
+                id_token: None,
+                access_token: Some("new-access".into()),
+                refresh_token: None,
+            },
+        );
+        assert_eq!(merged.id_token, "old-id");
+        assert_eq!(merged.access_token, AccessToken("new-access".into()));
+        assert_eq!(merged.refresh_token, RefreshToken("old-refresh".into()));
+        assert_eq!(merged.account_id, current.account_id);
+    }
+
+    #[test]
+    fn empty_refresh_response_keeps_complete_current_bundle() {
+        let current = TokenData {
+            id_token: "old-id".into(),
+            access_token: AccessToken("old-access".into()),
+            refresh_token: RefreshToken("old-refresh".into()),
+            account_id: None,
+        };
+        let merged = merge_refresh_response(
+            &current,
+            RefreshResponse {
+                id_token: None,
+                access_token: None,
+                refresh_token: None,
+            },
+        );
+        assert_eq!(merged, current);
+    }
+
+    #[test]
+    fn returned_id_token_without_account_claim_clears_old_account_id() {
+        let current = TokenData {
+            id_token: "old-id".into(),
+            access_token: AccessToken("old-access".into()),
+            refresh_token: RefreshToken("old-refresh".into()),
+            account_id: Some(crate::auth::store::ChatgptAccountId("old-account".into())),
+        };
+        let merged = merge_refresh_response(
+            &current,
+            RefreshResponse {
+                id_token: Some("e30.e30.sig".into()),
+                access_token: None,
+                refresh_token: None,
+            },
+        );
+        assert_eq!(merged.id_token, "e30.e30.sig");
+        assert_eq!(merged.account_id, None);
     }
 
     #[test]

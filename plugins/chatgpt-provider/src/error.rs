@@ -36,6 +36,9 @@ pub enum ChatgptError {
     #[error("OAuth callback returned error: {0}")]
     CallbackError(String),
 
+    #[error("OAuth callback timed out")]
+    CallbackTimeout,
+
     /// Token endpoint returned a non-2xx response.
     #[error("token endpoint returned {status}: {body}")]
     TokenEndpoint { status: u16, body: String },
@@ -54,6 +57,11 @@ pub enum ChatgptError {
     /// revoked).
     #[error("refresh failed: {0}")]
     RefreshFailed(String),
+
+    /// The refresh endpoint could not be reached reliably, or asked us
+    /// to retry later. Existing credentials remain usable/recoverable.
+    #[error("refresh temporarily unavailable: {0}")]
+    RefreshTransient(String),
 
     /// The Responses endpoint returned a non-2xx status with the body
     /// captured for diagnostics. Surfaced before any SSE frame is

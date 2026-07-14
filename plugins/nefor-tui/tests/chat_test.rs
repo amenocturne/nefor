@@ -3745,6 +3745,36 @@ fn slash_model_no_args_fans_out_per_known_provider_and_opens_popup() {
 }
 
 #[test]
+fn model_picker_shows_pending_hint_while_login_is_in_progress() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.auth.status",
+            "provider": "chatgpt",
+            "status": "login_in_progress",
+            "supports_login": true,
+        }),
+    );
+    for ch in "/model".chars() {
+        engine.handle_key(key(&ch.to_string())).expect("type");
+    }
+    engine.handle_key(key("enter")).expect("enter");
+
+    let out = render_str(&mut engine);
+    assert!(
+        out.contains("[logging in]") && out.contains("(completing login…)"),
+        "pending login should have an intentional non-action hint: {out:?}"
+    );
+    assert!(
+        !out.contains("(log in to load models)"),
+        "pending login must not invite a duplicate login: {out:?}"
+    );
+}
+
+#[test]
 fn chat_models_listed_appends_into_open_picker_and_clears_awaiting() {
     // After `/model` opens the picker, each provider responds with
     // `chat.models.listed { provider, models }`. The picker appends the

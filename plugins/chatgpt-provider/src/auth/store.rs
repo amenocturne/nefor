@@ -103,16 +103,18 @@ pub fn load(path: &Path) -> Result<Option<AuthDotJson>, ChatgptError> {
     }
 }
 
-/// Write the auth file atomically-ish (truncate + write). The parent
-/// directory is created if missing. On Unix the mode is `0600` so other
-/// users can't read tokens; the cfg-guard keeps Windows builds
-/// compiling (mode bits there are no-ops at this API level).
+/// Atomically replace the auth file with a fully flushed same-directory
+/// temporary file. On Unix the mode is `0600`.
 pub fn save(path: &Path, auth: &AuthDotJson) -> Result<(), ChatgptError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("chatgpt-auth.json");
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
     let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
 
     #[cfg(unix)]
     {
@@ -120,10 +122,48 @@ pub fn save(path: &Path, auth: &AuthDotJson) -> Result<(), ChatgptError> {
         opts.mode(0o600);
     }
 
-    let mut file = opts.open(path)?;
-    let bytes = serde_json::to_vec_pretty(auth)?;
-    file.write_all(&bytes)?;
-    Ok(())
+    let result = (|| -> Result<(), ChatgptError> {
+        let mut file = opts.open(&temp_path)?;
+        let bytes = serde_json::to_vec_pretty(auth)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        replace_file(&temp_path, path)?;
+        #[cfg(unix)]
+        OpenOptions::new().read(true).open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+#[cfg(not(windows))]
+fn replace_file(temp_path: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(temp_path, path)
+}
+
+#[cfg(windows)]
+fn replace_file(temp_path: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source: Vec<u16> = temp_path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// Pull the middle JWT segment and base64url-decode it to JSON. JWTs

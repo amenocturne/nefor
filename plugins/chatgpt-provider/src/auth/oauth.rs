@@ -10,6 +10,7 @@ use std::io::Cursor;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde::Deserialize;
@@ -33,12 +34,27 @@ pub const FALLBACK_PORT: u16 = 1457;
 pub const SCOPE: &str =
     "openid profile email offline_access api.connectors.read api.connectors.invoke";
 pub const ORIGINATOR: &str = "nefor_cli_rs";
+const CALLBACK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const CALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Run the full login flow and persist tokens to `auth_path`.
 ///
 /// `open_browser` is `false` in CI / SSH scenarios where the URL is
 /// copied manually; we print it to stderr in that case.
 pub async fn run_login(open_browser: bool, auth_path: &Path) -> Result<TokenData, ChatgptError> {
+    let token_data = run_login_without_persisting(open_browser).await?;
+    let auth = AuthDotJson {
+        tokens: token_data.clone(),
+        last_refresh: Utc::now(),
+    };
+    save(auth_path, &auth)?;
+    info!(path = %auth_path.display(), "persisted ChatGPT OAuth tokens");
+    Ok(token_data)
+}
+
+/// Run OAuth without writing credentials. The plugin runtime uses this so
+/// its login lease can reject late callbacks before anything reaches disk.
+pub async fn run_login_without_persisting(open_browser: bool) -> Result<TokenData, ChatgptError> {
     let pkce = generate_pkce();
     let state = generate_state();
 
@@ -65,13 +81,6 @@ pub async fn run_login(open_browser: bool, auth_path: &Path) -> Result<TokenData
         refresh_token: RefreshToken(tokens.refresh_token),
         account_id: claims.chatgpt_account_id,
     };
-
-    let auth = AuthDotJson {
-        tokens: token_data.clone(),
-        last_refresh: Utc::now(),
-    };
-    save(auth_path, &auth)?;
-    info!(path = %auth_path.display(), "persisted ChatGPT OAuth tokens");
 
     Ok(token_data)
 }
@@ -128,6 +137,14 @@ pub fn build_authorize_url(redirect_uri: &str, pkce: &PkceCodes, state: &str) ->
 /// arrives, then return the `code`. State mismatch and OAuth error
 /// responses fail fast.
 async fn wait_for_callback(server: Server, expected_state: &str) -> Result<String, ChatgptError> {
+    wait_for_callback_with_timeout(server, expected_state, CALLBACK_TIMEOUT).await
+}
+
+async fn wait_for_callback_with_timeout(
+    server: Server,
+    expected_state: &str,
+    timeout: Duration,
+) -> Result<String, ChatgptError> {
     let expected_state = expected_state.to_string();
     let (tx, rx) = oneshot::channel::<Result<String, ChatgptError>>();
 
@@ -136,7 +153,20 @@ async fn wait_for_callback(server: Server, expected_state: &str) -> Result<Strin
     // loop as soon as we hand a result to the channel.
     thread::spawn(move || {
         let mut tx_slot = Some(tx);
-        while let Ok(req) = server.recv() {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                if let Some(tx) = tx_slot.take() {
+                    let _ = tx.send(Err(ChatgptError::CallbackTimeout));
+                }
+                break;
+            }
+            let req = match server.recv_timeout(remaining.min(CALLBACK_POLL_INTERVAL)) {
+                Ok(Some(req)) => req,
+                Ok(None) => continue,
+                Err(_) => break,
+            };
             let url = req.url().to_string();
             // Build a fully-qualified URL so url::Url can parse it.
             // Avoid pulling the `url` crate in just for this — split the
@@ -314,5 +344,13 @@ mod tests {
         p.insert("state".into(), "match".into());
         let code = interpret_callback(&p, "match").expect("should succeed");
         assert_eq!(code, "the-code");
+    }
+
+    #[tokio::test]
+    async fn callback_wait_has_a_bounded_timeout() {
+        let server = Server::http("127.0.0.1:0").expect("server");
+        let result =
+            wait_for_callback_with_timeout(server, "state", Duration::from_millis(10)).await;
+        assert!(matches!(result, Err(ChatgptError::CallbackTimeout)));
     }
 }

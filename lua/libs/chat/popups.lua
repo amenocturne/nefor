@@ -232,6 +232,7 @@ function M.model_picker(state)
   local function state_tag(s)
     if s == "connected"      then return "[connected]"    end
     if s == "login_required" then return "[disconnected]" end
+    if s == "login_in_progress" then return "[logging in]" end
     if s == "error"          then return "[disconnected]" end
     return "[" .. tostring(s or "unknown") .. "]"
   end
@@ -284,6 +285,8 @@ function M.model_picker(state)
         else
           hint = "  (no models)"
         end
+      elseif prov.state == "login_in_progress" then
+        hint = "  (completing login…)"
       else
         hint = "  (log in to load models)"
       end
@@ -340,6 +343,7 @@ function M.login_picker(state)
   local function state_tag(s)
     if s == "connected"      then return "[connected]" end
     if s == "login_required" then return "[log in]"    end
+    if s == "login_in_progress" then return "[logging in]" end
     if s == "error"          then return "[error]"     end
     return "[" .. tostring(s or "unknown") .. "]"
   end
