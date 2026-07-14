@@ -339,15 +339,30 @@ fn nominal_values_require_explicit_refinement() {
 }
 
 #[test]
-fn explicit_record_refinement_rejects_extra_fields() {
+fn explicit_record_refinement_reports_missing_and_unexpected_fields() {
     let root = workspace("exact-refinement");
     let error = compile(
-        "(type User {:name String})\n(artifact \"test.exact/v1\" (as User {:name \"Ada\" :admin true}))",
+        "(type BashOptions {:timeout_ms Data})\n(artifact \"test.exact/v1\" (as BashOptions {:timeout-ms 30000}))",
         &root,
     )
     .unwrap_err()
     .to_string();
     assert!(error.contains("does not conform"), "{error}");
+    assert!(error.contains("missing fields: timeout_ms"), "{error}");
+    assert!(error.contains("unexpected fields: timeout-ms"), "{error}");
+}
+
+#[test]
+fn explicit_record_refinement_reports_field_diffs_for_generic_nominals() {
+    let root = workspace("generic-exact-refinement");
+    let error = compile(
+        "(type Pair [T] {:first T :second T})\n(artifact \"test.exact/v1\" (as (Pair Int) {:first 1 :other 2}))",
+        &root,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("missing fields: second"), "{error}");
+    assert!(error.contains("unexpected fields: other"), "{error}");
 }
 
 #[test]

@@ -577,7 +577,54 @@ pub(crate) fn parse_type(
     }
 }
 
+fn record_fields(env: &Env, ty: &MagType) -> Option<BTreeMap<String, MagType>> {
+    match ty {
+        MagType::Record(fields) => Some(fields.clone()),
+        MagType::Named(name, args) => {
+            let decl = env.type_decl(name)?;
+            let substitutions = decl
+                .params
+                .iter()
+                .cloned()
+                .zip(args.iter().cloned())
+                .collect();
+            let body = crate::checker::substitute(&decl.body, &substitutions);
+            record_fields(env, &body)
+        }
+        _ => None,
+    }
+}
+
+fn record_field_diff(env: &Env, value: &Value, ty: &MagType) -> Option<String> {
+    let Value::Map(actual) = raw(value) else {
+        return None;
+    };
+    let expected = record_fields(env, ty)?;
+    let missing = expected
+        .keys()
+        .filter(|key| !actual.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    let unexpected = actual
+        .keys()
+        .filter(|key| !expected.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() && unexpected.is_empty() {
+        return None;
+    }
+    let mut details = Vec::new();
+    if !missing.is_empty() {
+        details.push(format!("missing fields: {}", missing.join(", ")));
+    }
+    if !unexpected.is_empty() {
+        details.push(format!("unexpected fields: {}", unexpected.join(", ")));
+    }
+    Some(details.join("; "))
+}
+
 fn validate_value(env: &Env, value: &Value, ty: &MagType) -> Result<(), MagError> {
+    let original = value;
     let value = raw(value);
     let valid = match ty {
         MagType::Data => match value {
@@ -641,6 +688,10 @@ fn validate_value(env: &Env, value: &Value, ty: &MagType) -> Result<(), MagError
     };
     if valid {
         Ok(())
+    } else if let Some(diff) = record_field_diff(env, original, ty) {
+        Err(MagError::Type(format!(
+            "value does not conform to {ty}: {diff}"
+        )))
     } else {
         Err(MagError::Type(format!("value does not conform to {ty}")))
     }
