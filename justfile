@@ -137,7 +137,7 @@ install-nefor channel="source":
     # misses ones that never existed in the old layout (mag-plugin).
     remove_old_layout_bins() {
       local name
-      for name in openai-provider tool-gate basic-tools reasoner-graph \
+      for name in openai-provider tool-gate basic-tools git-worktree reasoner-graph \
                   nefor-tui mock-plugin generic-provider generic-tool \
                   nefor-combinators chatgpt-provider mag mag-plugin; do
         if [ -e "$PREFIX/bin/$name" ]; then

@@ -9,6 +9,9 @@
 --   tools.basic_actor_spec
 --     Default actor spec for the basic-tools Rust binary. Sources the
 --     plugin lib directly — no orchestrator coupling.
+--
+--   tools.git_worktree_actor_spec
+--     Git worktree capability provider used by MAG's worktree factories.
 
 local json = nefor.json
 
@@ -117,6 +120,14 @@ function M.basic_actor_spec()
   local config = require("config")
   return actor.identity_spec("basic-tools", {
     config.bin("basic-tools"),
+    "--gate", "tool-gate",
+  })
+end
+
+function M.git_worktree_actor_spec()
+  local config = require("config")
+  return actor.identity_spec("git-worktree", {
+    config.bin("git-worktree"),
     "--gate", "tool-gate",
   })
 end

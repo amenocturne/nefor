@@ -48,6 +48,8 @@ local run_tool = require("factories.run-tool")
 local tool_result = require("factories.tool-result")
 local adapter = require("factories.adapter")
 local bash = require("factories.bash")
+local worktree_create = require("factories.worktree-create")
+local worktree_open = require("factories.worktree-open")
 
 -- Adapt the host's single `nefor.log(msg)` function into the leveled sink
 -- the kernel modules expect. Level travels as a prefix (plus the run scope,
@@ -85,6 +87,8 @@ local function build_registry()
   seed(tool_result)
   seed(adapter)
   seed(bash)
+  seed(worktree_create)
+  seed(worktree_open)
   return reg
 end
 
@@ -401,7 +405,7 @@ local function context_of(run_id)
   return nil, string.format("unknown run '%s' (not begun, or already ended)", tostring(run_id))
 end
 
-nefor.log("mag-kernel ready (factories: stub, sink, human, llm, run-tool, tool-result, adapter, bash)")
+nefor.log("mag-kernel ready")
 
 return {
   name = "mag-kernel",

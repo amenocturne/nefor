@@ -1,0 +1,48 @@
+(require "nefor.graph")
+
+(type CreateSpec {:repository String
+                  :path String
+                  :branch String
+                  :base String})
+(type OpenSpec {:repository String
+                :path String
+                :branch String})
+(type Worktree {:repository String
+                :path String
+                :branch String
+                :head String})
+(type WorktreeError {:operation String
+                     :kind String
+                     :message String})
+
+(foreign nefor.factory.worktree-create
+  {:params CreateSpec :input Unit :output Worktree})
+(foreign nefor.factory.worktree-open
+  {:params OpenSpec :input Unit :output Worktree})
+
+(def create (fn [[id String] [spec CreateSpec]] -> (nefor.graph.Fragment Unit Worktree)
+  (let [input (nefor.graph.port id (type-tag Unit) "mag.Unit")
+        output (nefor.graph.port id (type-tag Worktree) "nefor.worktree.Ready")]
+    (as (nefor.graph.Fragment Unit Worktree)
+      {:actors [(nefor.graph.actor id nefor.factory.worktree-create spec
+                  (nefor.graph.store-port input)
+                  [(nefor.graph.store-port output)])]
+       :routes (as (List nefor.graph.StoredRoute) [])
+       :input input
+       :output output}))))
+
+(def open (fn [[id String] [spec OpenSpec]] -> (nefor.graph.Fragment Unit Worktree)
+  (let [input (nefor.graph.port id (type-tag Unit) "mag.Unit")
+        output (nefor.graph.port id (type-tag Worktree) "nefor.worktree.Ready")]
+    (as (nefor.graph.Fragment Unit Worktree)
+      {:actors [(nefor.graph.actor id nefor.factory.worktree-open spec
+                  (nefor.graph.store-port input)
+                  [(nefor.graph.store-port output)])]
+       :routes (as (List nefor.graph.StoredRoute) [])
+       :input input
+       :output output}))))
+
+(def start-message (fn [[fragment (nefor.graph.Fragment Unit Worktree)]] -> nefor.graph.Message
+  (nefor.graph.message
+    (get (get fragment "input") "actor")
+    (as (Map String Data) {:kind "mag.Unit"}))))

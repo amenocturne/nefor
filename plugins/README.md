@@ -10,6 +10,7 @@ Process-isolated NCP plugins. Each plugin is its own crate with a binary entry p
 - `mag/` — MAG actor kernel: executes compiled `.mag` programs as actor constellations.
 - `tool-gate/` — tool advertisement + permission gate.
 - `basic-tools/` — file/image/search/edit/shell tools (`read_file`, `read_image`, `search_text`, `write_file`, `edit_file`, `bash`).
+- `git-worktree/` — explicit Git worktree creation and reuse validation for MAG workflows.
 - `generic-provider/`, `generic-tool/` — passive hubs that emit type-registry events for graph composition.
 - `mock-plugin/` — scriptable NCP actor for integration tests.
 

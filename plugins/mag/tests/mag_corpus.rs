@@ -400,6 +400,112 @@ async fn shipped_mag_corpus_compiles_with_runtime_contracts() {
     );
 
     fs::write(
+        temp_root.join("worktree-create.mag"),
+        r#"(require "nefor.artifact")
+(require "nefor.graph")
+(require "nefor.worktree")
+(let [fragment (nefor.worktree.create
+                 "workspace"
+                 (as nefor.worktree.CreateSpec
+                   {:repository "/repo" :path "/worktrees/topic"
+                    :branch "topic" :base "main"}))
+      initial (nefor.worktree.start-message fragment)
+      program (nefor.graph.finish
+                fragment
+                (as (List nefor.graph.Message) [initial])
+                (as (List nefor.graph.Rule) []))]
+  (nefor.artifact.compile program))"#,
+    )
+    .expect("write worktree create regression");
+    let worktree = load(
+        &mut reader,
+        &mut stdin,
+        "worktree-create",
+        &temp_root,
+        Path::new("worktree-create.mag"),
+        std::slice::from_ref(&lib_root),
+    )
+    .await;
+    assert_eq!(
+        worktree.get("kind").and_then(Value::as_str),
+        Some("mag.loaded"),
+        "a native worktree fragment must compile against runtime contracts: {worktree:#?}"
+    );
+    let create_actor = worktree
+        .get("artifact")
+        .and_then(|artifact| artifact.pointer("/data/actors"))
+        .and_then(Value::as_array)
+        .and_then(|actors| {
+            actors
+                .iter()
+                .find(|actor| actor.get("id").and_then(Value::as_str) == Some("workspace"))
+        })
+        .expect("worktree create actor is visible in the compiled preview");
+    assert_eq!(
+        create_actor.get("foreign").and_then(Value::as_str),
+        Some("nefor.factory.worktree-create")
+    );
+    assert_eq!(
+        create_actor.pointer("/params/repository"),
+        Some(&json!("/repo"))
+    );
+    assert_eq!(
+        create_actor.pointer("/params/path"),
+        Some(&json!("/worktrees/topic"))
+    );
+    assert_eq!(
+        create_actor.pointer("/params/branch"),
+        Some(&json!("topic"))
+    );
+    assert_eq!(create_actor.pointer("/params/base"), Some(&json!("main")));
+    assert!(
+        create_actor.pointer("/params/mode").is_none(),
+        "create and open remain distinct identities rather than a mode flag"
+    );
+
+    fs::write(
+        temp_root.join("worktree-open.mag"),
+        r#"(require "nefor.artifact")
+(require "nefor.graph")
+(require "nefor.worktree")
+(let [fragment (nefor.worktree.open
+                 "workspace"
+                 (as nefor.worktree.OpenSpec
+                   {:repository "/repo" :path "/worktrees/topic"
+                    :branch "topic"}))
+      initial (nefor.worktree.start-message fragment)
+      program (nefor.graph.finish
+                fragment
+                (as (List nefor.graph.Message) [initial])
+                (as (List nefor.graph.Rule) []))]
+  (nefor.artifact.compile program))"#,
+    )
+    .expect("write worktree open regression");
+    let open_worktree = load(
+        &mut reader,
+        &mut stdin,
+        "worktree-open",
+        &temp_root,
+        Path::new("worktree-open.mag"),
+        std::slice::from_ref(&lib_root),
+    )
+    .await;
+    assert_eq!(
+        open_worktree.get("kind").and_then(Value::as_str),
+        Some("mag.loaded"),
+        "an explicit worktree open fragment must compile: {open_worktree:#?}"
+    );
+    let open_actor = open_worktree
+        .get("artifact")
+        .and_then(|artifact| artifact.pointer("/data/actors/0"))
+        .expect("worktree open actor");
+    assert_eq!(
+        open_actor.get("foreign").and_then(Value::as_str),
+        Some("nefor.factory.worktree-open")
+    );
+    assert!(open_actor.pointer("/params/base").is_none());
+
+    fs::write(
         temp_root.join("shell-output-unknown.mag"),
         r#"(require "nefor.artifact")
 (require "nefor.contracts")

@@ -1,0 +1,25 @@
+[package]
+name = "git-worktree-plugin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NCP capability provider for explicit Git worktree creation and reuse."
+
+[[bin]]
+name = "git-worktree"
+path = "src/main.rs"
+
+[dependencies]
+nefor-protocol = { path = "../../crates/nefor-protocol" }
+nefor-plugin-sdk = { path = "../../crates/nefor-plugin-sdk" }
+tokio = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

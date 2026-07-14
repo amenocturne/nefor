@@ -14,6 +14,7 @@ Agent harness substrate. Pure string-bus engine + separate-process plugins (NCP 
 - `plugins/tool-gate/` — tool advertisement aggregator + permission gate. Sources advertise via `tools.advertise`; callers invoke via `tool.invoke`; gate forwards as `<source>.tool.invoke` and echoes `tool.result`.
 - `plugins/mag/` — MAG runtime: actor kernel executing compiled `.mag` programs as in-memory actor constellations — the only execution path. See its `docs/`. Ships its own kernel Lua tree at `plugins/mag/lua/mag-kernel/` (actor fold, factories, routing, run contexts, observer stream), loaded by the plugin's embedded VM and resolved off `--lua-root`'s parent; `--kernel <path>` overrides it.
 - `plugins/basic-tools/` — `read_file` / `write_file` / `bash` built-ins.
+- `plugins/git-worktree/` — stateless Git worktree capability provider. `git_worktree_create` is fresh-only; `git_worktree_open` validates explicit reuse. MAG wraps both as typed graph nodes and never removes successful worktrees.
 - `plugins/mock-plugin/` — scriptable NCP actor for integration tests. Local Ollama works through `openai-provider` directly with `static_token = "ollama-local"`.
 - `tools/fake-engine/` — harness that impersonates the engine for plugin-side tests.
 - `starter/init.lua` — default composition. Sets `package.path`, bootstraps the shared Lua tree via `nefor-pm`, defines the global `dispatch` hook (delegates to `core.ncp.dispatch`), and spawns every actor via `actor.spawn` (sessions, agentic-loop, providers, mag kernel, tool-gate, lead-workflow, chat).

@@ -426,6 +426,7 @@ actor.spawn(require("read-only-tools"))
 actor.spawn(require("tool-validator"))
 
 actor.spawn(tools.gate_spec("tool-gate", tool_gate_argv))
+actor.spawn(tools.git_worktree_actor_spec())
 actor.spawn(tools.basic_actor_spec())
 
 actor.spawn(require("libs.compositors.chat_bridge").spawn_spec({
