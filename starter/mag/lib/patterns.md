@@ -71,8 +71,17 @@ Pipe stdout into another command by composing fragments:
   (nefor.shell.pipe-command "sort" "sort"))
 ```
 
-Use `nefor.shell.command-with-options` for an explicit timeout. Commands still
-pass through the capability gate.
+`nefor.shell.command` is unbounded and runs until the process exits. Opt into a
+wall-clock bound with the nominal `as` refinement and exact `timeout_ms` field:
+
+```lisp
+(nefor.shell.command-with-options
+  "bounded-search"
+  "rg -n TODO src/"
+  (as nefor.shell.BashOptions {:timeout_ms 30000}))
+```
+
+Shell commands still pass through the capability gate.
 
 ## Result boundary
 

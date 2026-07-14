@@ -552,6 +552,13 @@ fn install_json(lua: &Lua, nefor_tbl: &Table) -> Result<(), MagError> {
     })?;
     json.set("decode", decode)?;
 
+    // serde_json null crosses into Lua as mlua's dedicated NULL sentinel, not
+    // nil. Expose an exact predicate so field-specific optional-value
+    // boundaries can normalize it without treating arbitrary userdata as
+    // absence or erasing meaningful nulls elsewhere in actor data.
+    let is_null = lua.create_function(|_, value: Value| Ok(value.is_null()))?;
+    json.set("is_null", is_null)?;
+
     nefor_tbl.set("json", json)?;
     Ok(())
 }
@@ -624,6 +631,92 @@ mod tests {
         let mut f = std::fs::File::create(&path).expect("create kernel");
         f.write_all(body.as_bytes()).expect("write kernel");
         path
+    }
+
+    fn shipped_host() -> LuaHost {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        LuaHost::load_kernel(
+            &manifest.join("lua/mag-kernel/init.lua"),
+            Some(&manifest.join("../../lua")),
+        )
+        .expect("load shipped kernel")
+    }
+
+    fn compile_mag_eval_expression(host: &LuaHost, name: &str, expression: &str) -> JsonValue {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let source_dir =
+            std::env::temp_dir().join(format!("mag-kernel-shell-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&source_dir);
+        std::fs::create_dir_all(&source_dir).expect("create shell test workspace");
+        let source = format!(
+            r#"(require "nefor.artifact")
+(require "nefor.graph")
+(require "nefor.shell")
+(let [fragment {expression}
+      initial (nefor.shell.start-message fragment)
+      program (nefor.graph.finish fragment
+                (as (List nefor.graph.Message) [initial])
+                (as (List nefor.graph.Rule) []))]
+  (nefor.artifact.compile program))
+"#
+        );
+        std::fs::write(source_dir.join("main.mag"), source).expect("write shell test program");
+        let contracts = host.registry_contracts().expect("runtime contracts");
+        let loaded = nefor_mag::load_with_inputs_and_module_roots(
+            &source_dir,
+            "main.mag",
+            serde_json::json!({"foreign_contracts": contracts}),
+            &[manifest.join("../../starter/mag/lib")],
+        )
+        .expect("compile mag-eval-style shell expression");
+        let artifact = serde_json::to_value(loaded.artifact).expect("serialize shell artifact");
+        let modification =
+            crate::artifact_modification(&artifact).expect("normalize shell artifact");
+        let _ = std::fs::remove_dir_all(source_dir);
+        modification
+    }
+
+    fn documented_shell_expression(needle: &str) -> String {
+        let patterns = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../starter/mag/lib/patterns.md"),
+        )
+        .expect("read starter MAG patterns");
+        patterns
+            .split("```lisp\n")
+            .skip(1)
+            .filter_map(|rest| rest.split_once("\n```").map(|(source, _)| source))
+            .find(|source| source.contains(needle))
+            .unwrap_or_else(|| panic!("patterns.md has no Lisp fragment containing {needle}"))
+            .to_owned()
+    }
+
+    fn start_shell_expression(
+        host: &LuaHost,
+        run_id: &str,
+        expression: &str,
+    ) -> Vec<Map<String, JsonValue>> {
+        let modification = compile_mag_eval_expression(host, run_id, expression);
+        let begun = host
+            .begin_run(run_id, run_id, None)
+            .expect("begin shell run");
+        assert!(begun.ok, "begin failed: {:?}", begun.error);
+        host.drain_emits().expect("drain begin event");
+        let outcome = host.start(run_id, &modification).expect("start shell run");
+        assert!(outcome.ok, "start failed: {:?}", outcome.error);
+        host.drain_emits().expect("drain shell start")
+    }
+
+    fn tool_invoke<'a>(
+        emits: &'a [Map<String, JsonValue>],
+        command: &str,
+    ) -> &'a Map<String, JsonValue> {
+        emits
+            .iter()
+            .find(|event| {
+                event.get("kind").and_then(JsonValue::as_str) == Some("tool.invoke")
+                    && event["args"]["args"]["command"].as_str() == Some(command)
+            })
+            .unwrap_or_else(|| panic!("missing tool.invoke for {command}: {emits:#?}"))
     }
 
     #[test]
@@ -716,6 +809,90 @@ mod tests {
         assert_eq!(contracts[0]["identity"], "nefor.factory.example");
         assert_eq!(contracts[0]["type_scheme"]["variables"][0], "T");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn canonical_shell_commands_cross_json_null_and_reach_capability_invocation() {
+        let host = shipped_host();
+
+        let command_emits = start_shell_expression(
+            &host,
+            "shell-command-null",
+            r#"(nefor.shell.command "command" "printf command")"#,
+        );
+        let command = tool_invoke(&command_emits, "printf command");
+        assert!(command["args"]["args"]
+            .as_object()
+            .expect("command capability args")
+            .get("timeout_ms")
+            .is_none());
+        assert!(host
+            .take_run_failed("shell-command-null")
+            .expect("command run failure")
+            .is_none());
+
+        let pipe_emits = start_shell_expression(
+            &host,
+            "shell-pipe-null",
+            r#"(nefor.graph.connect
+  (nefor.shell.command "source" "printf source")
+  (nefor.shell.pipe-command "pipe" "cat"))"#,
+        );
+        let source = tool_invoke(&pipe_emits, "printf source");
+        let source_id = source["id"].as_str().expect("source correlation id");
+        assert!(source["args"]["args"]
+            .as_object()
+            .expect("source capability args")
+            .get("timeout_ms")
+            .is_none());
+        assert_eq!(
+            host.bus_response(source_id, Some(&serde_json::json!("text\n[exit 0]")), None)
+                .expect("source response"),
+            Some("shell-pipe-null".into())
+        );
+        let pipe_emits = host.drain_emits().expect("drain pipe invocation");
+        let pipe = tool_invoke(&pipe_emits, "cat");
+        assert!(pipe["args"]["args"]
+            .as_object()
+            .expect("pipe capability args")
+            .get("timeout_ms")
+            .is_none());
+        assert_eq!(pipe["args"]["args"]["stdin"], "text\n");
+        assert!(host
+            .take_run_failed("shell-pipe-null")
+            .expect("pipe run failure")
+            .is_none());
+    }
+
+    #[test]
+    fn bounded_shell_timeout_is_preserved_and_invalid_bounds_still_fail() {
+        let host = shipped_host();
+        let documented = documented_shell_expression("nefor.shell.command-with-options");
+        let emits = start_shell_expression(&host, "shell-bounded", &documented);
+        let bounded = tool_invoke(&emits, "rg -n TODO src/");
+        assert_eq!(bounded["args"]["args"]["timeout_ms"], 30000);
+        assert!(host
+            .take_run_failed("shell-bounded")
+            .expect("bounded run failure")
+            .is_none());
+
+        for (run_id, bound) in [("shell-zero", "0"), ("shell-negative", "-1")] {
+            let expression = format!(
+                "(nefor.shell.command-with-options \"invalid\" \"true\" (as nefor.shell.BashOptions {{:timeout_ms {bound}}}))"
+            );
+            let emits = start_shell_expression(&host, run_id, &expression);
+            assert!(emits
+                .iter()
+                .all(|event| event.get("kind").and_then(JsonValue::as_str) != Some("tool.invoke")));
+            let failure = host
+                .take_run_failed(run_id)
+                .expect("invalid run failure")
+                .expect("invalid timeout fails construction");
+            assert!(
+                failure.contains("positive number of milliseconds"),
+                "{failure}"
+            );
+        }
     }
 
     #[test]

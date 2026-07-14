@@ -119,6 +119,11 @@ function M.construct(id, params, emit, deps)
     return nil, "bash actor requires a non-empty string params.command"
   end
   local timeout_ms = params.timeout_ms
+  if type(nefor) == "table" and type(nefor.json) == "table"
+      and type(nefor.json.is_null) == "function"
+      and nefor.json.is_null(timeout_ms) then
+    timeout_ms = nil
+  end
   if timeout_ms ~= nil and (type(timeout_ms) ~= "number" or timeout_ms < 1) then
     return nil, "bash actor params.timeout_ms must be a positive number of milliseconds"
   end
