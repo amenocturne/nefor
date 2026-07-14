@@ -328,7 +328,7 @@ do
   -- eval: init.lua and mag-eval each own defensive copies.
   normal_load.body.module_roots[1] = "/mutated/envelope"
   _test.calls_clear()
-  invoke_tool("roots-eval", "mag-eval", {
+  invoke_tool("roots-eval", "mag-eval", { intent = "Evaluate expression",
     expr = '(nefor.shell.command "roots" "true")',
   })
   local eval_load = latest_mag_load()
@@ -341,7 +341,7 @@ do
     "mag-eval places the workspace-local root last")
 
   fresh()
-  invoke_tool("roots-eval-reset", "mag-eval", {
+  invoke_tool("roots-eval-reset", "mag-eval", { intent = "Evaluate expression",
     expr = '(nefor.shell.command "roots-reset" "true")',
   })
   local reset_load = latest_mag_load()
@@ -1722,4 +1722,24 @@ do
   assert_eq(find_call(decode_calls(), function(c)
     return c.body.kind == "mag.interrupt_run"
   end), nil, "no active runs → interrupt_all emits nothing")
+end
+
+-- mag-eval display intent is mandatory and bounded to 1-5 words.
+do
+  fresh()
+  _test.calls_clear()
+  local mag_eval = require("libs.lead-workflow.mag-eval")
+  mag_eval.handle("intent-missing", { expr = "(nefor.shell.command \"x\" \"pwd\")" })
+  local missing = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result" and c.body.id == "intent-missing"
+  end)
+  assert_true(missing ~= nil and missing.body.error:find("1%-5 words") ~= nil,
+    "mag-eval rejects missing intent")
+  _test.calls_clear()
+  mag_eval.handle("intent-long", { intent = "one two three four five six", expr = "(nefor.shell.command \"x\" \"pwd\")" })
+  local long = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result" and c.body.id == "intent-long"
+  end)
+  assert_true(long ~= nil and long.body.error:find("1%-5 words") ~= nil,
+    "mag-eval rejects overlong intent")
 end

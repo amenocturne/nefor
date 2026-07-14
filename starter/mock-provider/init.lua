@@ -522,7 +522,7 @@ local function pick_response_for(chat_id)
         {
           id        = mint_tool_id("pwd"),
           name      = "mag-eval",
-          arguments = { expr = '(nefor.shell.command "pwd" "pwd")' },
+          arguments = { intent = "Inspect workspace", expr = '(nefor.shell.command "pwd" "pwd")' },
         },
       },
     }
@@ -537,7 +537,7 @@ local function pick_response_for(chat_id)
         {
           id        = mint_tool_id("ls"),
           name      = "mag-eval",
-          arguments = { expr = '(nefor.shell.command "ls" "ls -la")' },
+          arguments = { intent = "Inspect workspace", expr = '(nefor.shell.command "ls" "ls -la")' },
         },
       },
     }

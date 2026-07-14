@@ -88,98 +88,51 @@ local function render_assistant_entry(entry, expanded)
 end
 
 -- Salient input summary for the tool collapsed-line.
-local function tool_salient(entry)
-  local name = entry.name or ""
-  local input = entry.input_table or {}
-  if name == "Bash" or name == "bash" then return input.command end
-  if name == "Read" or name == "Edit" or name == "Write" or name == "MultiEdit" then
-    return input.file_path
-  end
-  if name == "read_file" or name == "edit_file" or name == "write_file" then return input.path end
-  if name == "Grep" or name == "Glob" then return input.pattern end
-  -- Fall back: first short string field, skipping policy-ish names.
-  for k, v in pairs(input) do
-    local skip = (k == "on_node_failure" or k == "mode" or k == "policy" or k == "strategy")
-    if (not skip) and type(v) == "string" then return v end
-  end
-  return nil
-end
-
-local function tool_collapsed(entry)
-  local glyph = "▸ "
-  local header_style = entry.error and STYLE.tool_error or STYLE.tool_name
-  local salient = tool_salient(entry)
-  local header = glyph .. (entry.name or "?")
-  if salient then
-    local trimmed = salient
-    if #trimmed > 80 then trimmed = trimmed:sub(1, 77) .. "..." end
-    header = header .. "(" .. trimmed .. ")"
-  end
-  if entry.output == nil and not entry.error then
-    header = header .. " …"  -- running indicator
-  end
-  local rows = { tui.text { content = header, style = header_style, wrap = "none" } }
-  if entry.error then
-    rows[#rows + 1] = tui.text { content = "  error", style = STYLE.status_danger, wrap = "none" }
-  end
+local function raw_tool_expanded(entry)
+  local rows = { tui.text { content = "▼ " .. (entry.name or "?"), style = entry.error and STYLE.tool_error or STYLE.tool_name, wrap = "none" } }
+  rows[#rows + 1] = tui.text { content = "  input:", style = STYLE.footer, wrap = "none" }
+  local input_text = entry.input_table and pretty_json(entry.input_table) or entry.input
+  if input_text and input_text ~= "(object)" and #input_text > 0 then rows[#rows + 1] = tui.text { content = pad_block("  " .. input_text:gsub("\n", "\n  ")), style = { fg = C.md_code_fg, bg = C.md_code_block_bg }, wrap = "word" } end
+  local label = entry.error and "  error:" or "  output:"
+  if entry.output == nil and not entry.error then label = "  running..." end
+  rows[#rows + 1] = tui.text { content = label, style = entry.error and STYLE.status_danger or STYLE.footer, wrap = "none" }
+  if entry.output and #entry.output > 0 then rows[#rows + 1] = tui.text { content = pad_block("  " .. entry.output:gsub("\n", "\n  ")), style = { fg = C.md_code_fg, bg = C.md_code_block_bg }, wrap = "word" } end
   return tui.column { gap = 0, children = rows }
 end
-
+local function semantic_projection(entry)
+  local display = require("libs.chat.tool_display")
+  local projected = display.project(entry.display, entry.input_table, entry.output, entry.error)
+  return projected
+end
+local function tool_header(entry, glyph)
+  local p = semantic_projection(entry)
+  local label = p and p.label or entry.name or "?"
+  local header = glyph .. label
+  if p and p.primary and p.primary ~= "" then header = header .. "(" .. p.primary .. ")" end
+  if entry.output == nil and not entry.error then header = header .. " …" end
+  return header
+end
+local function tool_collapsed(entry)
+  local rows = { tui.text { content = tool_header(entry, "▸ "), style = entry.error and STYLE.tool_error or STYLE.tool_name, wrap = "none" } }
+  if entry.error then rows[#rows + 1] = tui.text { content = "  error", style = STYLE.status_danger, wrap = "none" } end
+  return tui.column { gap = 0, children = rows }
+end
 local function tool_expanded(entry)
-  local glyph = "▼ "
-  local header_style = entry.error and STYLE.tool_error or STYLE.tool_name
-  local salient = tool_salient(entry)
-  local header = glyph .. (entry.name or "?")
-  if salient then
-    local trimmed = salient
-    if #trimmed > 80 then trimmed = trimmed:sub(1, 77) .. "..." end
-    header = header .. "(" .. trimmed .. ")"
+  local p = semantic_projection(entry)
+  if not p then
+    local result
+    if entry.error then result = { kind = "content", text = entry.output or "", error = true }
+    elseif entry.output == nil then result = { kind = "running" }
+    else result = { kind = "receipt", text = "completed" } end
+    p = { label = entry.name or "?", arguments = {}, result = result }
   end
-  local rows = { tui.text { content = header, style = header_style, wrap = "none" } }
-  rows[#rows + 1] = tui.text { content = "  input:",  style = STYLE.footer, wrap = "none" }
-  -- Prefer JSON pretty-print of the structured input_table; fall back
-  -- to the raw string when only a string was sent.
-  local input_text
-  if entry.input_table ~= nil then
-    input_text = pretty_json(entry.input_table)
-  elseif entry.input and #entry.input > 0 and entry.input ~= "(object)" then
-    input_text = entry.input
-  end
-  if input_text and #input_text > 0 then
-    -- 2-space indent each line so the body sits inset from the bullet
-    -- column and the dark background reads as a single block. Pad each
-    -- line to max width post-indent so the bg renders as a rectangle.
-    local indented = "  " .. input_text:gsub("\n", "\n  ")
-    rows[#rows + 1] = tui.text {
-      content = pad_block(indented),
-      style = { fg = C.md_code_fg, bg = C.md_code_block_bg },
-      wrap = "word",
-    }
-  end
-  if entry.output == nil and not entry.error then
-    rows[#rows + 1] = tui.text { content = "  running...", style = STYLE.footer, wrap = "none" }
+  local rows = { tui.text { content = tool_header(entry, "▼ "), style = entry.error and STYLE.tool_error or STYLE.tool_name, wrap = "none" } }
+  for _, field in ipairs(p.arguments) do rows[#rows + 1] = tui.text { content = "  " .. field.label .. ": " .. field.value, style = STYLE.footer, wrap = "word" } end
+  if p.result.kind == "running" then rows[#rows + 1] = tui.text { content = "  running...", style = STYLE.footer, wrap = "none" }
+  elseif p.result.kind == "receipt" then rows[#rows + 1] = tui.text { content = "  ✓ " .. p.result.text, style = STYLE.footer, wrap = "word" }
   else
-    -- Label the trailing block by terminal status. `error:` (red) for
-    -- the deny / policy / unknown-tool / timeout paths so the block
-    -- reads as a denial rather than an empty `output:`. The tool-gate
-    -- wrapper puts the error message into the `output` field so it
-    -- lands here instead of being dropped on the floor.
-    local label, label_style
-    if entry.error then
-      label, label_style = "  error:", STYLE.status_danger
-    else
-      label, label_style = "  output:", STYLE.footer
-    end
-    rows[#rows + 1] = tui.text { content = label, style = label_style, wrap = "none" }
-    if entry.output and #entry.output > 0 then
-      local out_text = entry.output
-      local indented_out = "  " .. out_text:gsub("\n", "\n  ")
-      rows[#rows + 1] = tui.text {
-        content = pad_block(indented_out),
-        style = { fg = C.md_code_fg, bg = C.md_code_block_bg },
-        wrap = "word",
-      }
-    end
+    rows[#rows + 1] = tui.text { content = p.result.error and "  error:" or "  result:", style = p.result.error and STYLE.status_danger or STYLE.footer, wrap = "none" }
+    if p.result.text ~= "" then rows[#rows + 1] = tui.text { content = pad_block("  " .. p.result.text:gsub("\n", "\n  ")), style = { fg = C.md_code_fg, bg = C.md_code_block_bg }, wrap = "word" } end
   end
   return tui.column { gap = 0, children = rows }
 end
@@ -464,9 +417,9 @@ local function compaction_expanded(entry)
   return tui.column { gap = 0, children = rows }
 end
 
-function M.render(entry, _i, expanded, queued)
+function M.render(entry, _i, expanded, queued, debug_mode)
   if entry.kind == "tool_call" then
-    if expanded then return tool_expanded(entry) end
+    if expanded then return debug_mode and raw_tool_expanded(entry) or tool_expanded(entry) end
     return tool_collapsed(entry)
   end
   if entry.kind == "graph_result" then

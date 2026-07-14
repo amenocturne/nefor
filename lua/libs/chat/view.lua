@@ -69,7 +69,7 @@ local function transcript(state)
     entries      = function() return state.entries or {} end,
     render_entry = function(e, i)
       local queued = (state.queued_entry_idx == i)
-      return entries_mod.render(e, i, state.expanded_details, queued)
+      return entries_mod.render(e, i, state.expanded_details, queued, state.debug_mode)
     end,
     append       = thinking_widget(state),
     empty_view   = empty_view,

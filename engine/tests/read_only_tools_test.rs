@@ -17,6 +17,7 @@ fn repo_root() -> PathBuf {
 
 #[test]
 fn read_only_tools_include_seam() {
+    std::env::set_var("NEFOR_REPO_ROOT", repo_root());
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("install nefor stub");
     set_package_path(&lua).expect("set package.path");

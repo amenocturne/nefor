@@ -152,6 +152,23 @@ impl LuaHost {
         // namespace rather than `tui.fs`.
         let nefor = lua.create_table()?;
         install_fs(&lua, &nefor)?;
+        // NCP bodies are converted with mlua's serde bridge. Preserve and
+        // expose JSON array identity (especially `[]` versus `{}`) to the
+        // shared Lua wire validators without installing a second codec.
+        let json = lua.create_table()?;
+        let array_metatable = lua.array_metatable();
+        let is_array = lua.create_function(move |_, value: Value| {
+            Ok(matches!(value, Value::Table(ref table)
+                if table.metatable().is_some_and(|mt| mt.to_pointer() == array_metatable.to_pointer())))
+        })?;
+        json.set("is_array", is_array)?;
+        let array_metatable = lua.array_metatable();
+        let mark_array = lua.create_function(move |_, table: Table| {
+            table.set_metatable(Some(array_metatable.clone()));
+            Ok(table)
+        })?;
+        json.set("mark_array", mark_array)?;
+        nefor.set("json", json)?;
         lua.globals().set("nefor", nefor)?;
         Ok(LuaHost {
             lua,
@@ -208,6 +225,21 @@ impl LuaHost {
     /// scenarios directly.
     pub fn lua(&self) -> &Lua {
         &self.lua
+    }
+
+    /// Clone the registry-held composition state table. Integration tests
+    /// and embedders can inspect public reducer behavior without reaching
+    /// into private registry keys or parsing rendered text.
+    pub fn state_table(&self) -> Result<Table, TuiError> {
+        let started = lock(&self.started);
+        let state_key = started.state_key.as_ref().ok_or(TuiError::NotStarted)?;
+        match self.lua.registry_value(state_key)? {
+            Value::Table(table) => Ok(table),
+            other => Err(TuiError::InvalidDesc(format!(
+                "composition state must be a table (got {})",
+                other.type_name()
+            ))),
+        }
     }
 
     /// Whether `tui.start` has been called.

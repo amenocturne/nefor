@@ -34,6 +34,23 @@ pub fn install_json(lua: &Lua, nefor_tbl: &Table) -> mlua::Result<()> {
     })?;
     json.set("decode", decode_fn)?;
 
+    // serde_json arrays carry mlua's private array metatable, including
+    // empty arrays where Lua's length/key shape cannot distinguish `[]`
+    // from `{}`. Expose that identity at the JSON boundary so protocol
+    // validators never need an empty-table heuristic.
+    let array_metatable = lua.array_metatable();
+    let is_array_fn = lua.create_function(move |_, value: Value| {
+        Ok(matches!(value, Value::Table(ref table)
+            if table.metatable().is_some_and(|mt| mt.to_pointer() == array_metatable.to_pointer())))
+    })?;
+    json.set("is_array", is_array_fn)?;
+    let array_metatable = lua.array_metatable();
+    let mark_array_fn = lua.create_function(move |_, table: Table| {
+        table.set_metatable(Some(array_metatable.clone()));
+        Ok(table)
+    })?;
+    json.set("mark_array", mark_array_fn)?;
+
     nefor_tbl.set("json", json)?;
     Ok(())
 }
@@ -100,6 +117,25 @@ mod tests {
                 local v = nefor.json.decode(s)
                 return v.a == 1 and v.b == "x"
                   and v.c[1] == 1 and v.c[2] == 2 and v.c[3] == 3
+                "#,
+            )
+            .eval()
+            .unwrap();
+        assert!(ok);
+    }
+
+    #[test]
+    fn decoded_empty_array_and_object_keep_distinct_identity() {
+        let lua = setup();
+        let ok: bool = lua
+            .load(
+                r#"
+                local array = nefor.json.decode('[]')
+                local object = nefor.json.decode('{}')
+                return nefor.json.is_array(array)
+                  and not nefor.json.is_array(object)
+                  and #array == 0 and next(array) == nil
+                  and #object == 0 and next(object) == nil
                 "#,
             )
             .eval()

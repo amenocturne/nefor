@@ -49,6 +49,15 @@ pub fn schema() -> Value {
     })
 }
 
+/// Declarative presentation metadata advertised with this tool.
+pub fn display() -> Value {
+    json!({
+        "label": "Edit file",
+        "primary": { "arg": "path" },
+        "result": { "kind": "receipt", "text": "file edited" }
+    })
+}
+
 pub async fn run(args: &Value) -> Result<String, ToolError> {
     let parsed = parse_args(args)?;
     edit_text_file(parsed).await

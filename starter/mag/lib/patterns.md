@@ -55,7 +55,7 @@ is the authority for available providers, profiles, tools, and foreign actors.
 
 ## One-off shell work
 
-`mag-eval` accepts a graph-fragment expression and supplies the required
+`mag-eval` requires a 1–5 word `intent` plus a graph-fragment expression and supplies the required
 libraries, initial `Unit` message, graph finish, validation, and artifact
 wrapper:
 

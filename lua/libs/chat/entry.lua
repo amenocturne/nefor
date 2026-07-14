@@ -36,12 +36,12 @@ function M.assistant_stream()
   return { role = "assistant", kind = "stream", text = "", streaming = true, v = v }
 end
 
-function M.tool_call(id, name, input, input_table)
+function M.tool_call(id, name, input, input_table, display)
   local v = next_v()
   log.log("entry", "create kind=tool_call name=%s v=%d", name or "?", v)
   return {
     role = "tool", kind = "tool_call",
-    id = id, name = name, input = input, input_table = input_table,
+    id = id, name = name, input = input, input_table = input_table, display = display,
     v = v,
   }
 end

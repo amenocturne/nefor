@@ -215,6 +215,11 @@ impl Engine {
         self.lua.lua()
     }
 
+    /// Snapshot the Lua composition's current reducer state table.
+    pub fn state_table(&self) -> Result<mlua::Table, TuiError> {
+        self.lua.state_table()
+    }
+
     /// Dispatch a [`KeyMessage`]. The router first inspects the current
     /// reconciled tree: if a focused `text_input` exists and the key is
     /// an editing key, the router mutates the input's internal state in

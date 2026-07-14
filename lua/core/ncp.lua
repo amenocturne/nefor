@@ -152,6 +152,13 @@ local function deep_copy(v)
   for k, vv in pairs(v) do
     out[k] = deep_copy(vv)
   end
+  -- mlua marks decoded JSON arrays with a private metatable so an empty
+  -- `[]` remains distinguishable from `{}`. Preserve it while isolating
+  -- wrapper mutations; dropping it silently rewrites nested empty arrays.
+  if type(nefor.json.is_array) == "function" and nefor.json.is_array(v)
+      and type(nefor.json.mark_array) == "function" then
+    nefor.json.mark_array(out)
+  end
   return out
 end
 

@@ -60,6 +60,15 @@ pub fn schema() -> Value {
     })
 }
 
+/// Declarative presentation metadata advertised with this tool.
+pub fn display() -> Value {
+    json!({
+        "label": "Read file",
+        "primary": { "arg": "path" },
+        "result": { "kind": "receipt", "text": "content loaded" }
+    })
+}
+
 /// Execute `read_file` with the given args. See module docs for rejection
 /// rules.
 pub async fn run(args: &Value) -> Result<String, ToolError> {

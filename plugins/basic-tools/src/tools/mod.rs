@@ -7,6 +7,7 @@
 //!   `tool.invoke`.
 //! - `schema()` — JSON Schema (OpenAI tool-call shape) for the tool's
 //!   parameters; included in `tool.register`.
+//! - `display()` — declarative model-facing presentation metadata.
 //! - `context()` — internal metadata consumed by wrappers. It is not part
 //!   of the model-facing schema.
 //! - `run(args)` — the implementation. Async because future tools (bash)
@@ -40,6 +41,7 @@ pub struct ToolDescriptor {
     pub schema: fn() -> Value,
     /// Internal context metadata for runtime hooks.
     pub context: fn() -> Value,
+    pub display: fn() -> Value,
 }
 
 fn file_path_context() -> Value {
@@ -75,36 +77,42 @@ pub const TOOLS: &[ToolDescriptor] = &[
         description: read_file::DESCRIPTION,
         schema: read_file::schema,
         context: file_path_context,
+        display: read_file::display,
     },
     ToolDescriptor {
         name: read_image::NAME,
         description: read_image::DESCRIPTION,
         schema: read_image::schema,
         context: file_path_context,
+        display: read_image::display,
     },
     ToolDescriptor {
         name: write_file::NAME,
         description: write_file::DESCRIPTION,
         schema: write_file::schema,
         context: file_path_context,
+        display: write_file::display,
     },
     ToolDescriptor {
         name: edit_file::NAME,
         description: edit_file::DESCRIPTION,
         schema: edit_file::schema,
         context: file_path_context,
+        display: edit_file::display,
     },
     ToolDescriptor {
         name: bash::NAME,
         description: bash::DESCRIPTION,
         schema: bash::schema,
         context: cwd_context,
+        display: bash::display,
     },
     ToolDescriptor {
         name: search_text::NAME,
         description: search_text::DESCRIPTION,
         schema: search_text::schema,
         context: path_or_file_context,
+        display: search_text::display,
     },
 ];
 
@@ -127,5 +135,49 @@ pub async fn run_tool(name: &str, args: &Value) -> Result<Value, ToolError> {
             tool: other.to_owned(),
             message: format!("unknown tool `{other}`"),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[test]
+    fn canonical_inventory_has_unique_names_and_owns_search_text() {
+        let names = TOOLS.iter().map(|tool| tool.name).collect::<Vec<_>>();
+        let unique = names.iter().copied().collect::<HashSet<_>>();
+        assert_eq!(names.len(), unique.len());
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| **name == search_text::NAME)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn every_descriptor_has_a_display_contract() {
+        for descriptor in TOOLS {
+            let display = (descriptor.display)();
+            assert!(display.get("label").is_some(), "{}", descriptor.name);
+            assert!(display.get("result").is_some(), "{}", descriptor.name);
+        }
+    }
+
+    #[test]
+    fn module_owned_display_functions_compile() {
+        let displays: [fn() -> Value; 6] = [
+            read_file::display,
+            read_image::display,
+            write_file::display,
+            edit_file::display,
+            bash::display,
+            search_text::display,
+        ];
+        assert_eq!(displays.len(), TOOLS.len());
+        assert!(displays.into_iter().all(|display| display().is_object()));
     }
 }

@@ -7,6 +7,10 @@ Tool sources advertise privately to the gate via
 `tool-gate.tools.advertise`. The gate aggregates and re-emits a single
 public `tool.register` so providers see one canonical registry with
 `tool-gate.tool.invoke` as the entry point.
+Advertisement `source` and every tool `name` must be non-empty strings;
+whitespace-only identifiers are rejected. Any invalid advertisement emits a
+deterministic `tool-gate.advertise_error` and leaves the prior valid registry
+unchanged.
 
 Private advertisements may carry internal `context.folders` metadata. The Rust
 gate strips private context from the public registry and enforces the transport
@@ -41,3 +45,7 @@ At the transport layer, `yolo` overrides all policies to auto-approve.
 The starter starts `tool-validator` before the gate and routes prompt requests
 through it. The validator may auto-approve, deny, or defer to the chat popup
 before a request reaches the user.
+
+## Tool display contract
+
+Every advertised tool includes a declarative display contract beside its schema. It declares a label (literal or selected argument), optional primary/argument fields, and whether successful results render as content or a receipt. The gate rejects missing or malformed contracts. Ctrl+O uses this semantic projection; /debug, /debug on, and /debug off switch expanded tools between semantic and raw protocol input/output without changing persisted or model-facing data.

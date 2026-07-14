@@ -102,6 +102,7 @@ local state = {
 
 M.schema = {
   name        = "mag-eval",
+  display = { label = { arg = "intent" }, result = { kind = "content" } },
   description =
     "Evaluate one MAG graph-fragment expression on the actor kernel. " ..
     "A command is (nefor.shell.command \"step\" \"rg -n TODO src/\"); " ..
@@ -118,12 +119,13 @@ M.schema = {
   parameters  = {
     type = "object",
     properties = {
+      intent = { type = "string", description = "Main operation in 1-5 words." },
       expr = {
         type        = "string",
         description = "MAG expression source to evaluate.",
       },
     },
-    required = { "expr" },
+    required = { "intent", "expr" },
   },
 }
 
@@ -181,6 +183,13 @@ end
 -- Tool handler: persist the expression as a workspace source file and start
 -- the compile handshake. The firing stays open until the run settles.
 function M.handle(firing_id, args)
+  local intent = args and args.intent
+  local words = 0
+  if type(intent) == "string" then for _ in intent:gmatch("%S+") do words = words + 1 end end
+  if type(intent) ~= "string" or intent:match("^%s*$") or words < 1 or words > 5 then
+    tool_err(firing_id, "mag-eval: 'intent' must contain 1-5 words")
+    return
+  end
   local expr = args and args.expr
   if type(expr) ~= "string" or #expr == 0 then
     tool_err(firing_id, "mag-eval: requires a non-empty 'expr' string")

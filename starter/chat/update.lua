@@ -18,6 +18,7 @@ local popups       = require("libs.chat.popups")
 local usage_view   = require("libs.chat.usage")
 local Entry        = require("libs.chat.entry")
 local log          = require("libs.chat.log")
+local tool_display = require("libs.chat.tool_display")
 local height_cache = require("libs.chat.height_cache")
 
 local shallow_merge = common.shallow_merge
@@ -258,18 +259,15 @@ local function handle_input_submit(msg, state)
     }
   end
   if cmd == "debug" then
-    local chatlog = require("libs.chat.log")
-    if chatlog.is_enabled() then chatlog.disable() else chatlog.enable() end
-    local toasts = {}
-    for _, t in ipairs(state.toasts or {}) do toasts[#toasts + 1] = t end
-    toasts[#toasts + 1] = {
-      id = "debug-" .. tostring(tui.now_ms()),
-      text = chatlog.is_enabled() and "debug logging ON" or "debug logging OFF",
-      level = "info",
-      started_at_ms = tui.now_ms(),
-      ttl_ms = 2000,
-    }
-    return shallow_merge(state, { input_value = "", completion = NIL_SENTINEL, toasts = toasts }), {}
+    local arg = args and args:lower() or nil
+    local enabled
+    if arg == nil then enabled = not state.debug_mode
+    elseif arg == "on" then enabled = true
+    elseif arg == "off" then enabled = false
+    else
+      return shallow_merge(state, { input_value = "", completion = NIL_SENTINEL, popup = { variant = "warning", title = "/debug", body = "Usage: /debug [on|off]" } }), {}
+    end
+    return shallow_merge(state, { input_value = "", completion = NIL_SENTINEL, debug_mode = enabled }), {}
   end
   if cmd == "login" or cmd == "logout" then
     if args and #args > 0 then
@@ -980,10 +978,27 @@ local function handle_tool_start(msg, state)
   if type(msg.input) == "string" then input_str = msg.input
   elseif type(msg.input) == "table" then input_str = "(object)"
   else input_str = "" end
-  return transcript.push_entry(state,
-    Entry.tool_call(msg.id or "", msg.name or "?", input_str,
-      type(msg.input) == "table" and msg.input or nil)
-  ), {}
+  local contract = (state.tool_displays or {})[msg.name]
+  return transcript.push_entry(state, Entry.tool_call(msg.id or "", msg.name or "?", input_str, type(msg.input) == "table" and msg.input or nil, contract)), {}
+end
+
+local function handle_tool_register(msg, state)
+  -- Session history may contain an older persisted catalog. A live gate
+  -- registration already established in this process is authoritative;
+  -- replay only rebuilds the catalog on cold start / late attachment.
+  if state.replay_mode and state.tool_displays_live then return state, {} end
+  local displays = {}
+  for _, spec in ipairs(msg.tools or {}) do
+    if type(spec.name) ~= "string" or spec.name == "" then
+      error("tool.register: tool name must be a non-empty string")
+    end
+    local ok, err = tool_display.validate(spec.display)
+    if not ok then error("tool.register " .. spec.name .. ": " .. tostring(err)) end
+    displays[spec.name] = spec.display
+  end
+  local patch = { tool_displays = displays }
+  if not state.replay_mode then patch.tool_displays_live = true end
+  return shallow_merge(state, patch), {}
 end
 
 local function handle_tool_end(msg, state)
@@ -1458,6 +1473,7 @@ local handlers = {
   ["chat.session.stats"]          = handle_session_stats,
   ["chat.usage.updated"]          = handle_usage_updated,
   ["chat.usage.error"]            = handle_usage_error,
+  ["tool.register"]               = handle_tool_register,
   ["chat.tool.start"]             = handle_tool_start,
   ["chat.tool.end"]               = handle_tool_end,
   ["chat.graph_result.append"]    = handle_graph_result_append,

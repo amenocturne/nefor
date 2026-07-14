@@ -5,7 +5,8 @@ Task: {task}
 Instructions:
 
 - Read relevant files first to understand existing patterns. Search and commands
-  are `mag-eval` fragment expressions:
+  use `mag-eval`. Every call requires a meaningful 1–5-word `intent`; each Lisp
+  form shown below is the `expr` value:
   - `(nefor.shell.command "search" "rg -n 'existing_pattern' src/")`
   - `(nefor.shell.command "verify" "{verify_cmd} 2>&1")`
 - Implement the changes described in the task with `edit_file` / `write_file`

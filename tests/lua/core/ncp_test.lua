@@ -1095,6 +1095,21 @@ local function test_to_plugin_receives_full_batch_in_one_call()
     "the single invocation's envs list must contain all 5 envelopes")
 end
 
+local function test_dispatch_copy_preserves_empty_json_array_identity()
+  reset()
+  _test.set_plugins({ "src", "peer" })
+  local seen
+  ncp._test_set_transforms("peer", {
+    to_plugin = function(envs) seen = envs[1].body.arguments end,
+  })
+  ready_each({ "src", "peer" })
+  _test.calls_clear()
+  local envelope = json.decode('{"type":"event","body":{"kind":"test.array","arguments":[]}}')
+  ncp.invoke_from_plugin("src", json.encode(envelope))
+  ncp.dispatch(_test.bus_log())
+  assert_true(nefor.json.is_array(seen), "deep-copied [] retains JSON array identity")
+end
+
 local tests = {
   { name = "ready_triggers_ready_ok_reply", fn = test_ready_triggers_ready_ok_reply },
   { name = "ready_with_wrong_version_triggers_error", fn = test_ready_with_wrong_version_triggers_error },
@@ -1130,6 +1145,7 @@ local tests = {
   { name = "replay_window_suppresses_replayed_tool_invoke_in_same_batch", fn = test_replay_window_suppresses_replayed_tool_invoke_in_same_batch },
   { name = "replay_window_does_not_starve_nefor_tui", fn = test_replay_window_does_not_starve_nefor_tui },
   { name = "to_plugin_receives_full_batch_in_one_call", fn = test_to_plugin_receives_full_batch_in_one_call },
+  { name = "dispatch_copy_preserves_empty_json_array_identity", fn = test_dispatch_copy_preserves_empty_json_array_identity },
 }
 
 for _, t in ipairs(tests) do

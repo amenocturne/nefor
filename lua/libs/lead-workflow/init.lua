@@ -1244,6 +1244,7 @@ local function lead_workflow_tool_schemas()
   return {
     {
       name        = "graph-status",
+      display = { label = "Graph status", primary = { arg = "run_id" }, result = { kind = "content" } },
       description =
         "Report active graph runs, or one active/recent completed run " ..
         "when run_id is provided. One-shot snapshot for when you or the " ..
@@ -1261,6 +1262,7 @@ local function lead_workflow_tool_schemas()
     },
     {
       name        = "terminate-graph",
+      display = { label = "Terminate graph", primary = { arg = "run_id" }, result = { kind = "content" } },
       description = "Cancel exactly one active graph run by explicit run_id and archive it as canceled.",
       parameters  = {
         type = "object",
@@ -1275,6 +1277,7 @@ local function lead_workflow_tool_schemas()
     },
     {
       name        = "write-review",
+      display = { label = "Review plan", primary = { arg = "view" }, result = { kind = "content" } },
       description =
         "Submit a plan for user review. BLOCKING — the call does not " ..
         "return until the user responds. /approve resolves it with " ..
@@ -1295,6 +1298,7 @@ local function lead_workflow_tool_schemas()
     },
     {
       name        = "mag",
+      display = { label = "MAG", primary = { arg = "file" }, arguments = { { label = "action", arg = "action" } }, result = { kind = "content" } },
       description =
         "Write, compile, and execute MAG programs on the actor kernel. " ..
         "Use action='write' to create/update a .mag file in the workspace. " ..

@@ -410,8 +410,9 @@ tool_gate_argv[#tool_gate_argv + 1] = cfg.tool_gate.default_action
 -- tool" at runtime.
 actor.spawn(require("lead-workflow"))
 
--- read-only-tools advertises list_dir + search_text (Lua-resident,
--- pure-read). Same ordering reason as lead-workflow: register before
+-- read-only-tools advertises the composition-selected Lua read tools.
+-- basic-tools is the canonical shipped search_text owner. Same ordering
+-- reason as lead-workflow: register before
 -- tool-gate spawn so the gate's first hello triggers our advertise.
 actor.spawn(require("read-only-tools"))
 

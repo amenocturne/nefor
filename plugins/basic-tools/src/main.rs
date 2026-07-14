@@ -344,6 +344,7 @@ fn tool_register_body() -> Map<String, Value> {
             m.insert("name".into(), Value::String(t.name.into()));
             m.insert("description".into(), Value::String(t.description.into()));
             m.insert("parameters".into(), (t.schema)());
+            m.insert("display".into(), (t.display)());
             Value::Object(m)
         })
         .collect();
@@ -366,6 +367,7 @@ fn tools_advertise_body(gate: &str) -> Map<String, Value> {
             m.insert("name".into(), Value::String(t.name.into()));
             m.insert("description".into(), Value::String(t.description.into()));
             m.insert("parameters".into(), (t.schema)());
+            m.insert("display".into(), (t.display)());
             m.insert("context".into(), (t.context)());
             Value::Object(m)
         })

@@ -178,6 +178,7 @@ struct ToolSpec {
     name: String,
     description: String,
     parameters: Value,
+    display: Value,
 }
 
 /// Pending forwarded invocation: maps the gate-minted inner id (used to
@@ -344,15 +345,134 @@ async fn handle_set_mode(
     Ok(())
 }
 
+fn validate_display_contract(display: &Value) -> Result<(), String> {
+    let object = display
+        .as_object()
+        .ok_or_else(|| "display must be an object".to_owned())?;
+    for key in object.keys() {
+        if !matches!(key.as_str(), "label" | "primary" | "arguments" | "result") {
+            return Err("display has unknown field".to_owned());
+        }
+    }
+    let valid_selector = |value: &Value| {
+        value.as_str().is_some_and(|s| !s.is_empty())
+            || value.as_object().is_some_and(|o| {
+                o.len() == 1
+                    && o.get("arg")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.is_empty())
+            })
+    };
+    if !object.get("label").is_some_and(valid_selector) {
+        return Err("display.label must be text or {arg}".into());
+    }
+    if object.get("primary").is_some_and(|value| {
+        !value.as_object().is_some_and(|object| {
+            object.len() == 1
+                && object
+                    .get("arg")
+                    .and_then(Value::as_str)
+                    .is_some_and(|arg| !arg.is_empty())
+        })
+    }) {
+        return Err("display.primary must be {arg}".into());
+    }
+    if let Some(arguments) = object.get("arguments") {
+        let fields = arguments
+            .as_array()
+            .ok_or_else(|| "display.arguments must be an array".to_owned())?;
+        for field in fields {
+            let field = field
+                .as_object()
+                .ok_or_else(|| "display argument must be an object".to_owned())?;
+            if field.len() != 2
+                || field
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                || field
+                    .get("arg")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+            {
+                return Err(
+                    "display argument must contain only non-empty label and arg strings".into(),
+                );
+            }
+        }
+    }
+    let result = object
+        .get("result")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "display.result must be an object".to_owned())?;
+    for key in result.keys() {
+        if !matches!(key.as_str(), "kind" | "text") {
+            return Err("display.result has unknown field".into());
+        }
+    }
+    match result.get("kind").and_then(Value::as_str) {
+        Some("content") if !result.contains_key("text") => Ok(()),
+        Some("receipt")
+            if result
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty()) =>
+        {
+            Ok(())
+        }
+        _ => Err("display.result must be content or a receipt with text".into()),
+    }
+}
+
+fn validate_unique_tool_names(
+    source: &str,
+    tools: &[ToolSpec],
+    state: &GateState,
+) -> Result<(), String> {
+    let mut names = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    for pair in names.windows(2) {
+        if pair[0] == pair[1] {
+            return Err(format!(
+                "duplicate tool name `{}` advertised more than once by source `{source}`",
+                pair[0]
+            ));
+        }
+    }
+
+    let mut collisions = Vec::new();
+    for (owner, advertised) in &state.advertised {
+        if owner == source {
+            continue;
+        }
+        for tool in advertised {
+            if names.binary_search(&tool.name.as_str()).is_ok() {
+                collisions.push((tool.name.as_str(), owner.as_str()));
+            }
+        }
+    }
+    collisions.sort_unstable();
+    if let Some((name, owner)) = collisions.first() {
+        return Err(format!(
+            "duplicate tool name `{name}` advertised by sources `{owner}` and `{source}`"
+        ));
+    }
+    Ok(())
+}
 async fn handle_tools_advertise(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: &Map<String, Value>,
     state: &mut GateState,
 ) -> Result<(), TransportError> {
     let source = match body.get("source").and_then(Value::as_str) {
-        Some(s) => s.to_owned(),
-        None => {
-            tracing::warn!("tools.advertise missing required string field `source`; dropping");
+        Some(source) if !source.trim().is_empty() => source.to_owned(),
+        _ => {
+            let error = "source must be a non-empty string";
+            tracing::error!(%error, "rejecting malformed tools advertisement");
+            send_event(out_tx, advertise_error_body("", error)).await?;
             return Ok(());
         }
     };
@@ -363,10 +483,15 @@ async fn handle_tools_advertise(
             return Ok(());
         }
     };
-    let tools: Vec<ToolSpec> = tools_arr
+    let tools: Result<Vec<ToolSpec>, String> = tools_arr
         .iter()
-        .filter_map(|t| {
-            let name = t.get("name").and_then(Value::as_str)?.to_owned();
+        .map(|t| -> Result<ToolSpec, String> {
+            let name = t
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| "tool name must be a non-empty string".to_owned())?
+                .to_owned();
             let description = t
                 .get("description")
                 .and_then(Value::as_str)
@@ -376,13 +501,34 @@ async fn handle_tools_advertise(
                 .get("parameters")
                 .cloned()
                 .unwrap_or_else(|| Value::Object(Map::new()));
-            Some(ToolSpec {
+            let display = t
+                .get("display")
+                .ok_or_else(|| "tool missing display contract: ".to_owned() + &name)?
+                .clone();
+            validate_display_contract(&display)
+                .map_err(|e| "invalid display for ".to_owned() + &name + ": " + &e)?;
+            Ok(ToolSpec {
                 name,
                 description,
                 parameters,
+                display,
             })
         })
-        .collect();
+        .collect::<Result<_, _>>();
+    let tools = match tools {
+        Ok(tools) => tools,
+        Err(error) => {
+            tracing::error!(source = %source, %error, "rejecting malformed tools advertisement");
+            send_event(out_tx, advertise_error_body(&source, &error)).await?;
+            return Ok(());
+        }
+    };
+
+    if let Err(error) = validate_unique_tool_names(&source, &tools, state) {
+        tracing::error!(source = %source, %error, "rejecting duplicate tools advertisement");
+        send_event(out_tx, advertise_error_body(&source, &error)).await?;
+        return Ok(());
+    }
 
     tracing::info!(source = %source, count = tools.len(), "tools.advertise");
     if tools.is_empty() {
@@ -627,12 +773,15 @@ fn hello_body() -> Map<String, Value> {
 }
 
 fn tool_register_body(state: &GateState) -> Map<String, Value> {
+    let mut specs = state.advertised.values().flatten().collect::<Vec<_>>();
+    specs.sort_unstable_by(|left, right| left.name.cmp(&right.name));
     let mut tools: Vec<Value> = Vec::new();
-    for ts in state.advertised.values().flatten() {
+    for ts in specs {
         let mut m = Map::new();
         m.insert("name".into(), Value::String(ts.name.clone()));
         m.insert("description".into(), Value::String(ts.description.clone()));
         m.insert("parameters".into(), ts.parameters.clone());
+        m.insert("display".into(), ts.display.clone());
         tools.push(Value::Object(m));
     }
     let mut m = Map::new();
@@ -698,6 +847,16 @@ fn mode_changed_body(mode: GateMode) -> Map<String, Value> {
     m
 }
 
+fn advertise_error_body(source: &str, message: &str) -> Map<String, Value> {
+    let mut body = Map::new();
+    body.insert(
+        "kind".into(),
+        Value::String(format!("{PLUGIN_NAME}.advertise_error")),
+    );
+    body.insert("source".into(), Value::String(source.to_owned()));
+    body.insert("message".into(), Value::String(message.to_owned()));
+    body
+}
 fn tool_result_error_body(id: &str, message: &str) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("kind".into(), Value::String("tool.result".into()));
@@ -747,7 +906,17 @@ mod tests {
         GateState::new(policy)
     }
 
-    fn advertise_body(source: &str, tools: Value) -> Map<String, Value> {
+    fn advertise_body(source: &str, mut tools: Value) -> Map<String, Value> {
+        if let Some(items) = tools.as_array_mut() {
+            for item in items {
+                if item.get("display").is_none() {
+                    item.as_object_mut().expect("tool object").insert(
+                        "display".into(),
+                        json!({"label": "Test tool", "result": {"kind": "content"}}),
+                    );
+                }
+            }
+        }
         json!({
             "kind": "tool-gate.tools.advertise",
             "source": source,
@@ -756,6 +925,130 @@ mod tests {
         .as_object()
         .expect("obj")
         .clone()
+    }
+
+    #[test]
+    fn validates_display_contract() {
+        assert!(validate_display_contract(&json!({"label": "Read"})).is_err());
+        assert!(validate_display_contract(
+            &json!({"label": "Read", "result": {"kind": "receipt", "text": "loaded"}})
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn shared_display_contract_fixtures_match_rust_validator() {
+        let fixtures: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/tool_display_contracts.json"
+        ))
+        .expect("display fixtures JSON");
+        for fixture in fixtures.as_array().expect("fixture array") {
+            let expected = fixture["valid"].as_bool().expect("valid bool");
+            let actual = validate_display_contract(&fixture["contract"]).is_ok();
+            assert_eq!(actual, expected, "fixture {}", fixture["name"]);
+        }
+    }
+
+    #[test]
+    fn display_contract_wire_shape_is_strict() {
+        let accepted = [
+            json!({"label": "Read", "primary": {"arg": "path"}, "result": {"kind": "content"}}),
+            json!({"label": {"arg": "action"}, "arguments": [{"label": "in", "arg": "path"}], "result": {"kind": "receipt", "text": "done"}}),
+        ];
+        for contract in accepted {
+            assert!(validate_display_contract(&contract).is_ok(), "{contract}");
+        }
+
+        let rejected = [
+            json!({"label": "Read", "primary": "literal", "result": {"kind": "content"}}),
+            json!({"label": {"arg": ""}, "result": {"kind": "content"}}),
+            json!({"label": {"arg": "path", "unknown": true}, "result": {"kind": "content"}}),
+            json!({"label": "Read", "primary": {"arg": 3}, "result": {"kind": "content"}}),
+            json!({"label": "Read", "arguments": [{"label": "in"}], "result": {"kind": "content"}}),
+            json!({"label": "Read", "result": {"kind": "content", "text": "no"}}),
+            json!({"label": "Read", "result": {"kind": "receipt"}}),
+            json!({"label": "Read", "result": {"kind": "other"}}),
+        ];
+        for contract in rejected {
+            assert!(validate_display_contract(&contract).is_err(), "{contract}");
+        }
+    }
+    #[tokio::test]
+    async fn rejects_empty_and_whitespace_only_sources_with_advertise_error() {
+        for source in ["", " 	"] {
+            let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+            let mut state = make_state();
+            let body = advertise_body(source, json!([{"name": "read_file"}]));
+
+            handle_tools_advertise(&tx, &body, &mut state)
+                .await
+                .unwrap();
+
+            let event: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+            assert_eq!(event["body"]["kind"], "tool-gate.advertise_error");
+            assert_eq!(event["body"]["source"], "");
+            assert_eq!(
+                event["body"]["message"],
+                "source must be a non-empty string"
+            );
+            assert!(state.advertised.is_empty());
+            assert!(state.tool_owner.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_and_whitespace_only_tool_names_with_advertise_error() {
+        for name in ["", " 	"] {
+            let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+            let mut state = make_state();
+            let body = advertise_body("basic-tools", json!([{"name": name}]));
+
+            handle_tools_advertise(&tx, &body, &mut state)
+                .await
+                .unwrap();
+
+            let event: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+            assert_eq!(event["body"]["kind"], "tool-gate.advertise_error");
+            assert_eq!(event["body"]["source"], "basic-tools");
+            assert_eq!(
+                event["body"]["message"],
+                "tool name must be a non-empty string"
+            );
+            assert!(state.advertised.is_empty());
+            assert!(state.tool_owner.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_readvertisement_preserves_prior_valid_state_atomically() {
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+        let mut state = make_state();
+        let valid = advertise_body("basic-tools", json!([{"name": "read_file"}]));
+        handle_tools_advertise(&tx, &valid, &mut state)
+            .await
+            .unwrap();
+        let _register = rx.recv().await.unwrap();
+
+        let invalid = advertise_body(
+            "basic-tools",
+            json!([
+                {"name": "write_file"},
+                {"name": ""}
+            ]),
+        );
+        handle_tools_advertise(&tx, &invalid, &mut state)
+            .await
+            .unwrap();
+
+        let event: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        assert_eq!(event["body"]["kind"], "tool-gate.advertise_error");
+        assert_eq!(state.advertised["basic-tools"].len(), 1);
+        assert_eq!(state.advertised["basic-tools"][0].name, "read_file");
+        assert_eq!(
+            state.tool_owner.get("read_file").map(String::as_str),
+            Some("basic-tools")
+        );
+        assert!(!state.tool_owner.contains_key("write_file"));
     }
 
     #[tokio::test]
@@ -787,6 +1080,65 @@ mod tests {
         assert_eq!(arr.len(), 1);
     }
 
+    #[tokio::test]
+    async fn duplicate_tool_names_are_rejected_without_mutating_registry() {
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+        let mut state = make_state();
+        let first = advertise_body(
+            "basic-tools",
+            json!([{"name": "search_text", "parameters": {}}]),
+        );
+        handle_tools_advertise(&tx, &first, &mut state)
+            .await
+            .unwrap();
+        let _ = rx.recv().await.unwrap();
+        let duplicate = advertise_body(
+            "read-only-tools",
+            json!([{"name": "search_text", "parameters": {}}]),
+        );
+        handle_tools_advertise(&tx, &duplicate, &mut state)
+            .await
+            .unwrap();
+        let event: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        assert_eq!(event["body"]["kind"], "tool-gate.advertise_error");
+        assert_eq!(event["body"]["message"], "duplicate tool name `search_text` advertised by sources `basic-tools` and `read-only-tools`");
+        assert_eq!(
+            state.tool_owner.get("search_text").map(String::as_str),
+            Some("basic-tools")
+        );
+        assert!(!state.advertised.contains_key("read-only-tools"));
+    }
+
+    #[tokio::test]
+    async fn source_readvertisement_replaces_inventory_and_replays_full_register() {
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+        let mut state = make_state();
+        let first = advertise_body(
+            "basic-tools",
+            json!([{"name": "write_file", "parameters": {}}, {"name": "read_file", "parameters": {}}]),
+        );
+        handle_tools_advertise(&tx, &first, &mut state)
+            .await
+            .unwrap();
+        let _ = rx.recv().await.unwrap();
+        let replacement = advertise_body(
+            "basic-tools",
+            json!([{"name": "search_text", "parameters": {}}]),
+        );
+        handle_tools_advertise(&tx, &replacement, &mut state)
+            .await
+            .unwrap();
+        let event: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        let names = event["body"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["search_text"]);
+        assert!(!state.tool_owner.contains_key("read_file"));
+        assert!(!state.tool_owner.contains_key("write_file"));
+    }
     #[tokio::test]
     async fn invoke_with_prompt_emits_permission_request() {
         let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);

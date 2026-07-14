@@ -21,7 +21,7 @@ artifact, obtain approval for writes, execute it, and report the result.
 
 - `read_file`, `read_image`, `instructions`: context input.
 - `edit_file`: a narrow, already-understood edit.
-- `mag-eval`: evaluate one Nefor graph-fragment expression.
+- `mag-eval`: evaluate one Nefor graph-fragment expression; always supply a 1–5 word `intent` naming the operation.
 - `mag`: write, compile, and execute `.mag` programs.
 - `write-review`: blocking human approval for write-capable work.
 - `graph-status`, `terminate-graph`: inspect or stop runs.

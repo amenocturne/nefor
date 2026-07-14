@@ -44,6 +44,15 @@ pub fn schema() -> Value {
     })
 }
 
+/// Declarative presentation metadata advertised with this tool.
+pub fn display() -> Value {
+    json!({
+        "label": "Write file",
+        "primary": { "arg": "path" },
+        "result": { "kind": "receipt", "text": "file written" }
+    })
+}
+
 pub async fn run(args: &Value) -> Result<String, ToolError> {
     let parsed = parse_args(args)?;
     write_text_file(&parsed.path, &parsed.content).await

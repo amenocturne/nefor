@@ -97,6 +97,45 @@ fn chat_lua_source() -> String {
     std::fs::read_to_string(&chat_path).unwrap_or_else(|e| panic!("read {:?}: {e}", chat_path))
 }
 
+fn chat_lua_source_for_config(config_dir: &std::path::Path) -> String {
+    ensure_test_data_home();
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("repo root")
+        .to_path_buf();
+    let plugin_lua = repo_root.join("plugins/nefor-tui/lua");
+    let lua_root = repo_root.join("lua");
+    let chat_dir = config_dir.join("chat");
+    let init_path = chat_dir.join("init.lua");
+    let source =
+        std::fs::read_to_string(&init_path).unwrap_or_else(|e| panic!("read {:?}: {e}", init_path));
+    format!(
+        r#"
+        local real_getenv = os.getenv
+        local overrides = {{
+          NEFOR_CONFIG_DIR = {config:?},
+          NEFOR_STARTER_CONFIG_DIR = {config:?},
+          NEFOR_STARTER_CHAT_DIR = {chat:?},
+          NEFOR_TUI_LUA_DIR = {tui:?},
+          NEFOR_LUA_DIR = {lua:?},
+          NEFOR_DEFAULT_PROVIDER = "mock-plugin",
+          NEFOR_DEFAULT_MODEL = "mock-model",
+        }}
+        os.getenv = function(name)
+          if overrides[name] ~= nil then return overrides[name] end
+          return real_getenv(name)
+        end
+        os.execute = function() return true end
+        {source}
+        "#,
+        config = config_dir.display().to_string(),
+        chat = chat_dir.display().to_string(),
+        tui = plugin_lua.display().to_string(),
+        lua = lua_root.display().to_string(),
+    )
+}
+
 fn render_str(engine: &mut Engine) -> String {
     match engine.render_if_dirty().expect("render") {
         Some(bytes) => String::from_utf8(bytes).expect("ansi is utf-8"),
@@ -1595,8 +1634,14 @@ fn statusline_shows_model_with_reasoning_effort() {
 
 #[test]
 fn ctrl_o_toggles_expanded_details() {
+    // Raw protocol assertions live behind debug mode.
+
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/debug on" }),
+    );
     let _ = render_str(&mut engine);
 
     // Seed a tool call (running — no output yet) so we have a tool entry
@@ -1648,6 +1693,26 @@ fn ctrl_o_toggles_expanded_details() {
     assert!(
         out.contains('▸') && !out.contains("output:"),
         "second Ctrl+O should collapse: {out:?}"
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/debug off" }),
+    );
+    engine.handle_key(key("ctrl_o")).expect("semantic expand");
+    let semantic = render_str(&mut engine);
+    assert!(
+        semantic.contains("completed") && !semantic.contains("output:"),
+        "{semantic:?}"
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/debug" }),
+    );
+    let toggled = render_str(&mut engine);
+    assert!(
+        toggled.contains("output:"),
+        "bare /debug should toggle raw rendering: {toggled:?}"
     );
 }
 
@@ -1972,8 +2037,14 @@ fn ctrl_b_after_typing_still_single_press_toggles() {
 
 #[test]
 fn tool_expanded_pretty_prints_input_object() {
+    // Raw protocol assertions live behind debug mode.
+
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/debug on" }),
+    );
     let _ = render_str(&mut engine);
 
     // Seed a tool call whose `input` is a JSON object (the wire shape
@@ -7552,8 +7623,14 @@ fn graph_result_long_output_path_wraps_fully() {
 /// transcript width in the unfolded tool entry — no truncation.
 #[test]
 fn tool_result_long_single_line_wraps_fully() {
+    // Raw protocol assertions live behind debug mode.
+
     let mut engine = Engine::new(80, 40).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/debug on" }),
+    );
     let _ = render_str(&mut engine);
 
     let long = format!("https://example.com/api/v1/resource/{}", "x".repeat(160));
@@ -7593,8 +7670,14 @@ fn tool_result_long_single_line_wraps_fully() {
 /// input is visible somewhere in the unfolded entry.
 #[test]
 fn tool_input_long_single_line_wraps_fully() {
+    // Raw protocol assertions live behind debug mode.
+
     let mut engine = Engine::new(80, 40).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/debug on" }),
+    );
     let _ = render_str(&mut engine);
 
     let expr = format!("(pipeline{})", "-step".repeat(40));
@@ -7685,4 +7768,376 @@ fn slash_new_collapses_stale_scroll_region() {
         .eval()
         .expect("scroll max after /new");
     assert_eq!(max, 0, "reset should collapse stale scroll extent");
+}
+
+#[test]
+fn personal_override_behavior_uses_shared_tui_mechanisms() {
+    let Some(personal_config) = std::env::var_os("NEFOR_PERSONAL_CONFIG_DIR") else {
+        return;
+    };
+    let personal_config = PathBuf::from(personal_config);
+    let temp = tempfile::tempdir().expect("personal chat tempdir");
+    let config = temp.path().join("config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(personal_config.join("chat"), config.join("chat"))
+            .expect("link personal chat");
+        std::os::unix::fs::symlink(personal_config.join("config"), config.join("config"))
+            .expect("link personal runtime config");
+        std::os::unix::fs::symlink(
+            personal_config.join("gemma-audio-core.lua"),
+            config.join("gemma-audio-core.lua"),
+        )
+        .expect("link audio config");
+    }
+    let kb = temp.path().join("kb");
+    std::fs::create_dir_all(kb.join("inbox/audio-discussions")).expect("save dir");
+    std::fs::write(
+        config.join("agentic-kit.json"),
+        serde_json::to_vec(&json!({
+            "knowledge_base": kb,
+            "nefor_repo": PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent().and_then(|p| p.parent()).unwrap(),
+        }))
+        .unwrap(),
+    )
+    .expect("metadata");
+
+    let mut engine = Engine::new(120, 40).expect("engine");
+    engine
+        .load_scenario(&chat_lua_source_for_config(&config))
+        .expect("load personal chat");
+    let _ = render_str(&mut engine);
+
+    let state_bool =
+        |engine: &Engine, key: &str| -> bool { engine.state_table().unwrap().get(key).unwrap() };
+    let popup_body = |engine: &Engine| -> Option<String> {
+        let state = engine.state_table().unwrap();
+        let popup: Option<mlua::Table> = state.get("popup").unwrap();
+        popup.and_then(|p| p.get("body").ok())
+    };
+
+    // /debug supports explicit and toggle forms; invalid input reports usage
+    // and leaves the prior mode untouched.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/debug on" }),
+    );
+    assert!(state_bool(&engine, "debug_mode"));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/debug off" }),
+    );
+    assert!(!state_bool(&engine, "debug_mode"));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/debug maybe" }),
+    );
+    assert!(!state_bool(&engine, "debug_mode"));
+    assert_eq!(
+        popup_body(&engine).as_deref(),
+        Some("Usage: /debug [on|off]")
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/debug" }),
+    );
+    assert!(state_bool(&engine, "debug_mode"));
+
+    // /chatlog has independent on/off/toggle behavior and invalid args do
+    // not accidentally toggle the module-local logger.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/chatlog off" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/chatlog maybe" }),
+    );
+    assert_eq!(
+        popup_body(&engine).as_deref(),
+        Some("Usage: /chatlog [on|off]")
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/chatlog" }),
+    );
+    let state = engine.state_table().unwrap();
+    let toasts: mlua::Table = state.get("toasts").unwrap();
+    let last: mlua::Table = toasts.get(toasts.raw_len()).unwrap();
+    assert_eq!(
+        last.get::<String>("text").unwrap(),
+        "chat diagnostic logging ON"
+    );
+    drop(state);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/chatlog on" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/chatlog off" }),
+    );
+    let state = engine.state_table().unwrap();
+    let toasts: mlua::Table = state.get("toasts").unwrap();
+    let last: mlua::Table = toasts.get(toasts.raw_len()).unwrap();
+    assert_eq!(
+        last.get::<String>("text").unwrap(),
+        "chat diagnostic logging OFF"
+    );
+    drop(state);
+
+    // Public prompt behavior exposes on/off candidates for both commands.
+    for command in ["/debug ", "/chatlog "] {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "input.changed", "value": command }),
+        );
+        let state = engine.state_table().unwrap();
+        let completion: mlua::Table = state.get("completion").unwrap();
+        let matches: mlua::Table = completion.get("matches").unwrap();
+        let names = matches
+            .sequence_values::<mlua::Table>()
+            .map(|entry| entry.unwrap().get::<String>("name").unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            names.iter().any(|name| name.ends_with(" on")),
+            "{command}: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name.ends_with(" off")),
+            "{command}: {names:?}"
+        );
+    }
+
+    // Personal-only commands still execute through the real reducer.
+    // Clear the completion popup left by the candidate assertions first;
+    // Enter with an open combobox intentionally selects its highlighted row.
+    dispatch_event(&mut engine, json!({ "kind": "input.changed", "value": "" }));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/save" }),
+    );
+    let state = engine.state_table().unwrap();
+    let toasts: mlua::Table = state.get("toasts").unwrap();
+    let last: mlua::Table = toasts.get(toasts.raw_len()).unwrap();
+    assert!(last.get::<String>("text").unwrap().starts_with("saved "));
+    drop(state);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/mode audio" }),
+    );
+    let state = engine.state_table().unwrap();
+    assert_eq!(state.get::<String>("mode").unwrap(), "audio");
+    assert_eq!(state.get::<String>("provider").unwrap(), "gemma-audio");
+    assert_eq!(
+        state.get::<String>("model").unwrap(),
+        "gemma-4-12b-audio-q4"
+    );
+    drop(state);
+    let effects = engine.take_emit_queue();
+    assert!(effects
+        .iter()
+        .any(|(_, body)| body.get("kind") == Some(&json!("chat.model.set"))));
+
+    let current = json!({
+        "kind": "tool.register",
+        "tools": [
+            { "name": "loader", "display": { "label": "Load current", "primary": { "arg": "path" }, "result": { "kind": "receipt", "text": "content loaded" } } },
+            { "name": "content", "display": { "label": "Show content", "result": { "kind": "content" } } },
+            { "name": "removed", "display": { "label": "Old removed label", "result": { "kind": "content" } } }
+        ]
+    });
+    dispatch_event(&mut engine, current);
+    dispatch_event(&mut engine, json!({ "kind": "sessions.replay.start" }));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "tool.register", "tools": [{ "name": "loader", "display": { "label": "STALE LABEL", "result": { "kind": "content" } } }] }),
+    );
+    dispatch_event(&mut engine, json!({ "kind": "sessions.replay.end" }));
+
+    // A malformed live aggregate fails atomically and leaves the current
+    // catalog intact.
+    let malformed = json!({ "kind": "tool.register", "tools": [{ "name": "loader", "display": { "label": "Broken", "arguments": {}, "result": { "kind": "content" } } }] });
+    let malformed_map = malformed.as_object().unwrap().clone();
+    assert!(engine.dispatch_envelope_body(&malformed_map).is_err());
+
+    // Full live replacement removes omitted tools.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "tool.register", "tools": [
+        { "name": "loader", "display": { "label": "Load current", "primary": { "arg": "path" }, "result": { "kind": "receipt", "text": "content loaded" } } },
+        { "name": "content", "display": { "label": "Show content", "result": { "kind": "content" } } }
+    ] }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.tool.start", "id": "removed-id", "name": "removed", "input": {} }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.tool.end", "id": "removed-id", "output": "removed-output" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.tool.start", "id": "load-id", "name": "loader", "input": { "path": "secret.txt" } }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.tool.end", "id": "load-id", "output": "SECRET SUCCESS PAYLOAD" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.tool.start", "id": "content-id", "name": "content", "input": {} }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.tool.end", "id": "content-id", "output": "VISIBLE CONTENT RESULT" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.tool.start", "id": "error-id", "name": "loader", "input": { "path": "bad.txt" } }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.tool.end", "id": "error-id", "output": "VISIBLE ERROR RESULT", "error": true }),
+    );
+    engine
+        .handle_key(key("ctrl_o"))
+        .expect("expand semantic tools");
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/debug off" }),
+    );
+    let semantic = render_snapshot(&mut engine);
+    assert!(semantic.contains("Load current(secret.txt)"), "{semantic}");
+    assert!(semantic.contains("content loaded"), "{semantic}");
+    assert!(!semantic.contains("SECRET SUCCESS PAYLOAD"), "{semantic}");
+    assert!(semantic.contains("VISIBLE CONTENT RESULT"), "{semantic}");
+    assert!(semantic.contains("VISIBLE ERROR RESULT"), "{semantic}");
+    assert!(
+        semantic.contains("removed") && !semantic.contains("Old removed label"),
+        "{semantic}"
+    );
+    assert!(!semantic.contains("STALE LABEL"), "{semantic}");
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/debug on" }),
+    );
+    let raw = render_snapshot(&mut engine);
+    assert!(raw.contains("SECRET SUCCESS PAYLOAD"), "{raw}");
+    assert!(raw.contains("secret.txt"), "{raw}");
+
+    // Cold-start replay remains accepted when no live catalog exists.
+    let mut cold = Engine::new(100, 24).expect("cold engine");
+    cold.load_scenario(&chat_lua_source_for_config(&config))
+        .expect("cold load");
+    let _ = render_str(&mut cold);
+    dispatch_event(&mut cold, json!({ "kind": "sessions.replay.start" }));
+    dispatch_event(
+        &mut cold,
+        json!({ "kind": "tool.register", "tools": [{ "name": "late", "display": { "label": "Late catalog", "result": { "kind": "receipt", "text": "late accepted" } } }] }),
+    );
+    dispatch_event(&mut cold, json!({ "kind": "sessions.replay.end" }));
+    dispatch_event(
+        &mut cold,
+        json!({ "kind": "chat.tool.start", "id": "late-id", "name": "late", "input": {} }),
+    );
+    dispatch_event(
+        &mut cold,
+        json!({ "kind": "chat.tool.end", "id": "late-id", "output": "hidden late payload" }),
+    );
+    cold.handle_key(key("ctrl_o")).unwrap();
+    let cold_render = render_snapshot(&mut cold);
+    assert!(
+        cold_render.contains("Late catalog") && cold_render.contains("late accepted"),
+        "{cold_render}"
+    );
+    assert!(
+        !cold_render.contains("hidden late payload"),
+        "{cold_render}"
+    );
+}
+
+#[test]
+fn starter_tool_catalog_replay_freshness_and_atomic_replacement() {
+    let mut engine = Engine::new(100, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    let label = |engine: &Engine, name: &str| -> Option<String> {
+        let state = engine.state_table().unwrap();
+        let displays: mlua::Table = state.get("tool_displays").unwrap();
+        let display: Option<mlua::Table> = displays.get(name).unwrap();
+        display.and_then(|d| d.get("label").ok())
+    };
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "tool.register", "tools": [
+        { "name": "current", "display": { "label": "Current catalog", "arguments": [], "result": { "kind": "content" } } },
+        { "name": "removed", "display": { "label": "Will be removed", "result": { "kind": "content" } } }
+    ] }),
+    );
+    assert_eq!(
+        label(&engine, "current").as_deref(),
+        Some("Current catalog")
+    );
+
+    dispatch_event(&mut engine, json!({ "kind": "sessions.replay.start" }));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "tool.register", "tools": [
+        { "name": "current", "display": { "label": "Stale catalog", "result": { "kind": "content" } } }
+    ] }),
+    );
+    dispatch_event(&mut engine, json!({ "kind": "sessions.replay.end" }));
+    assert_eq!(
+        label(&engine, "current").as_deref(),
+        Some("Current catalog")
+    );
+    assert_eq!(
+        label(&engine, "removed").as_deref(),
+        Some("Will be removed")
+    );
+
+    // Validation builds a fresh local catalog and only swaps state after the
+    // whole aggregate succeeds.
+    let malformed = json!({ "kind": "tool.register", "tools": [
+        { "name": "current", "display": { "label": "Broken", "arguments": {}, "result": { "kind": "content" } } }
+    ] });
+    assert!(engine
+        .dispatch_envelope_body(&malformed.as_object().unwrap().clone())
+        .is_err());
+    assert_eq!(
+        label(&engine, "current").as_deref(),
+        Some("Current catalog")
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "tool.register", "tools": [
+        { "name": "current", "display": { "label": "Replacement catalog", "result": { "kind": "content" } } }
+    ] }),
+    );
+    assert_eq!(
+        label(&engine, "current").as_deref(),
+        Some("Replacement catalog")
+    );
+    assert_eq!(label(&engine, "removed"), None);
+
+    // A cold TUI has no live authority yet, so replay can hydrate the catalog.
+    let mut cold = Engine::new(100, 24).expect("cold engine");
+    cold.load_scenario(&chat_lua_source()).expect("cold load");
+    dispatch_event(&mut cold, json!({ "kind": "sessions.replay.start" }));
+    dispatch_event(
+        &mut cold,
+        json!({ "kind": "tool.register", "tools": [
+        { "name": "late", "display": { "label": "Late attach catalog", "result": { "kind": "content" } } }
+    ] }),
+    );
+    dispatch_event(&mut cold, json!({ "kind": "sessions.replay.end" }));
+    assert_eq!(label(&cold, "late").as_deref(), Some("Late attach catalog"));
 }

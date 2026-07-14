@@ -1,0 +1,108 @@
+[
+  {
+    "name": "content primary",
+    "valid": true,
+    "contract": {
+      "label": "Read",
+      "primary": {
+        "arg": "path"
+      },
+      "result": {
+        "kind": "content"
+      }
+    }
+  },
+  {
+    "name": "nonempty arguments",
+    "valid": true,
+    "contract": {
+      "label": {
+        "arg": "action"
+      },
+      "arguments": [
+        {
+          "label": "in",
+          "arg": "path"
+        }
+      ],
+      "result": {
+        "kind": "receipt",
+        "text": "done"
+      }
+    }
+  },
+  {
+    "name": "empty arguments array",
+    "valid": true,
+    "contract": {
+      "label": "Read",
+      "arguments": [],
+      "result": {
+        "kind": "content"
+      }
+    }
+  },
+  {
+    "name": "arguments object",
+    "valid": false,
+    "contract": {
+      "label": "Read",
+      "arguments": {},
+      "result": {
+        "kind": "content"
+      }
+    }
+  },
+  {
+    "name": "literal primary",
+    "valid": false,
+    "contract": {
+      "label": "Read",
+      "primary": "literal",
+      "result": {
+        "kind": "content"
+      }
+    }
+  },
+  {
+    "name": "unknown selector field",
+    "valid": false,
+    "contract": {
+      "label": {
+        "arg": "path",
+        "unknown": true
+      },
+      "result": {
+        "kind": "content"
+      }
+    }
+  },
+  {
+    "name": "unknown argument field",
+    "valid": false,
+    "contract": {
+      "label": "Read",
+      "arguments": [
+        {
+          "label": "in",
+          "arg": "path",
+          "unknown": true
+        }
+      ],
+      "result": {
+        "kind": "content"
+      }
+    }
+  },
+  {
+    "name": "unknown result field",
+    "valid": false,
+    "contract": {
+      "label": "Read",
+      "result": {
+        "kind": "content",
+        "unknown": true
+      }
+    }
+  }
+]

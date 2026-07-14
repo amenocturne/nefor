@@ -172,6 +172,65 @@ async fn shutdown(mut stdin: ChildStdin, mut child: Child) {
     let _ = timeout(Duration::from_secs(10), child.wait()).await;
 }
 
+#[test]
+fn active_starter_prompts_and_mock_do_not_use_removed_mag_teaching_forms() {
+    let root = repo_root();
+    let mut paths = source_files(&root.join("starter/prompts"), "md");
+    paths.extend(source_files(&root.join("starter/mag/lib/prompts"), "md"));
+    paths.push(root.join("starter/mag/lib/patterns.md"));
+    let guidance_paths = paths.clone();
+    paths.push(root.join("starter/mock-provider/init.lua"));
+    let removed = [
+        "(agent ",
+        "(node ",
+        "(graph ",
+        "(subgraph ",
+        "(bash ",
+        " :terminal ",
+        "`->` pipes",
+        "-> pipes",
+        "-> connects",
+        "-> composes",
+    ];
+
+    for path in &paths {
+        let source = fs::read_to_string(path).unwrap_or_else(|error| {
+            panic!(
+                "read active MAG teaching source {}: {error}",
+                path.display()
+            )
+        });
+        for obsolete in removed {
+            assert!(
+                !source.contains(obsolete),
+                "active MAG teaching source {} contains obsolete form {obsolete:?}",
+                path.display()
+            );
+        }
+    }
+
+    for path in guidance_paths {
+        let source = fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "read active MAG teaching source {}: {error}",
+                path.display()
+            )
+        });
+        if source.contains("mag-eval") {
+            assert!(
+                source.contains("intent"),
+                "active MAG teaching source {} omits intent guidance",
+                path.display()
+            );
+            assert!(
+                source.contains("1–5 word") || source.contains("1–5-word"),
+                "active MAG teaching source {} omits the 1–5-word intent constraint",
+                path.display()
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn shipped_mag_corpus_compiles_with_runtime_contracts() {
     let root = repo_root();

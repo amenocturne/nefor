@@ -67,6 +67,15 @@ pub fn schema() -> Value {
     })
 }
 
+/// Declarative presentation metadata advertised with this tool.
+pub fn display() -> Value {
+    json!({
+        "label": "Run command",
+        "primary": { "arg": "command" },
+        "result": { "kind": "content" }
+    })
+}
+
 pub async fn run(args: &Value) -> Result<String, ToolError> {
     run_cancellable(args, None).await
 }

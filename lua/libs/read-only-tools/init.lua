@@ -55,6 +55,7 @@ local envelope = require("core.envelope")
 local emit_as  = envelope.emit_as
 local instruction_files = require("libs.instruction-files")
 local tool_output_dump = require("tool-gate.tool_output_dump")
+local tool_display = require("libs.chat.tool_display")
 
 local INSTRUCTIONS_DIR = (rawget(_G, "NEFOR_CONFIG_DIR") or ".") .. "/instructions"
 
@@ -341,6 +342,7 @@ local function base_schemas()
   return {
     {
       name = "list_dir",
+      display = { label = "List directory", primary = { arg = "path" }, result = { kind = "content" } },
       description =
         "List the immediate children of a directory. Returns one entry " ..
         "per line, prefixed with `(d)` for directories and `(f)` for " ..
@@ -361,6 +363,7 @@ local function base_schemas()
     },
     {
       name = "search_text",
+      display = { label = "Search text", primary = { arg = "pattern" }, arguments = { { label = "in", arg = "path" } }, result = { kind = "content" } },
       description =
         "Search for a regex pattern in files under a path (recursively). " ..
         "Returns matching lines as `path:line:match`. Uses ripgrep when " ..
@@ -385,6 +388,7 @@ local function base_schemas()
     },
     {
       name = "python-read",
+      display = { label = "Analyze workspace", primary = { arg = "task" }, result = { kind = "content" } },
       description =
         "Run complex read-only Python analysis over workspace files. " ..
         "Prefer Bash/read tools for simple inspection. Do not use raw " ..
@@ -402,6 +406,7 @@ local function base_schemas()
     },
     {
       name = "instructions",
+      display = { label = "Load instructions", result = { kind = "receipt", text = "instructions loaded" } },
       description =
         "Read one or more instruction files by name. When the " ..
         "system prompt says to read instructions (e.g. 'instruction:dev-mode.md'), " ..
@@ -423,6 +428,7 @@ local function base_schemas()
     },
     {
       name = "discover_instruction_files",
+      display = { label = "Discover instructions", primary = { arg = "path" }, result = { kind = "content" } },
       description =
         "List AGENTS.md and CLAUDE.md instruction files available near " ..
         "a path. Does not read file contents. Use ordinary read_file on " ..
@@ -450,6 +456,7 @@ local function base_schemas()
     },
     {
       name = "skill",
+      display = { label = "Load skill", result = { kind = "receipt", text = "skill loaded" } },
       description =
         "Load a workflow skill by name from the config's skills directory " ..
         "(<config>/skills/<name>/skill.md). Read the skill BEFORE acting on a " ..
@@ -503,6 +510,10 @@ local function build(opts)
 
   local handlers = {}
   local schemas = {}
+  local function validate_schema(schema)
+    local ok, err = tool_display.validate(schema.display)
+    if not ok then error("read-only-tools.build: tool '" .. tostring(schema.name) .. "' has invalid display: " .. tostring(err)) end
+  end
 
   for _, name in ipairs(include) do
     local schema = base_by_name[name]
@@ -514,6 +525,7 @@ local function build(opts)
     if handlers[name] then
       error("read-only-tools.build: base tool '" .. name .. "' listed twice in include")
     end
+    validate_schema(schema)
     handlers[name] = BASE_HANDLERS[name]
     schemas[#schemas + 1] = schema
   end
@@ -529,6 +541,7 @@ local function build(opts)
     if handlers[schema.name] then
       error("read-only-tools.build: tool '" .. schema.name .. "' already registered")
     end
+    validate_schema(schema)
     handlers[schema.name] = wrap_extra(spec.handler)
     schemas[#schemas + 1] = schema
   end

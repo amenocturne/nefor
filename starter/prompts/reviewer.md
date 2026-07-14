@@ -16,7 +16,7 @@ You do not need to find issues to be useful. A clean review with `approved: true
 
 - `read_file` — read a text file by path.
 - `read_image` — load an image file for visual inspection. If the active model cannot consume images, report that limitation to the user.
-- `mag-eval` — evaluate one Nefor graph-fragment expression. Your read-only
+- `mag-eval` — evaluate one Nefor graph-fragment expression; always supply a 1–5 word `intent` naming the operation. Your read-only
   shell uses `(nefor.shell.command "search" "rg -n 'unwrap\\(' src/")` or
   composes a capped diff with `nefor.graph.connect` and
   `nefor.shell.pipe-command`.

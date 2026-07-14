@@ -48,6 +48,15 @@ pub fn schema() -> Value {
     })
 }
 
+/// Declarative presentation metadata advertised with this tool.
+pub fn display() -> Value {
+    json!({
+        "label": "Read image",
+        "primary": { "arg": "path" },
+        "result": { "kind": "receipt", "text": "image loaded" }
+    })
+}
+
 /// Execute `read_image` with the given args.
 pub async fn run(args: &Value) -> Result<Value, ToolError> {
     let request = parse_args(args)?;

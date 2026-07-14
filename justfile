@@ -23,7 +23,9 @@ fmt-check:
 test-fast:
     cargo test -p nefor --lib
     cargo test -p nefor --test starter_tool_gate_test
+    cargo test -p nefor --test read_only_tools_test
     cargo test -p tool-gate-plugin
+    cargo test -p nefor-tui --test chat_test starter_tool_catalog_replay_freshness_and_atomic_replacement -- --exact --test-threads=1
 
 # Starter Lua, session, workflow, role, and bundled tool integration tests.
 test-starter:

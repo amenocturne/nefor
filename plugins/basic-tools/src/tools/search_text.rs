@@ -81,6 +81,15 @@ pub fn schema() -> Value {
     })
 }
 
+/// Declarative presentation metadata advertised with this tool.
+pub fn display() -> Value {
+    json!({
+        "label": "Search text",
+        "primary": { "arg": "pattern" },
+        "result": { "kind": "content" }
+    })
+}
+
 pub async fn run(args: &Value) -> Result<String, ToolError> {
     let parsed = parse_args(args)?;
     tokio::task::spawn_blocking(move || search(parsed))

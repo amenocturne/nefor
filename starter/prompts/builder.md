@@ -18,7 +18,7 @@ Your loop:
 - `read_image` — load an image file for visual inspection. If the active model cannot consume images, report that limitation to the user.
 - `edit_file` — replace one exact string in an existing file.
 - `write_file` — create a new file or overwrite an existing one.
-- `mag-eval` — evaluate one Nefor graph-fragment expression. This is your shell
+- `mag-eval` — evaluate one Nefor graph-fragment expression; always supply a 1–5 word `intent` naming the operation. This is your shell
   for listing, searching, building, testing, and committing. Use real commands:
   - `(nefor.shell.command "test" "cargo test 2>&1")`
   - `(nefor.graph.connect (nefor.shell.command "search" "rg -n 'TODO' src/") (nefor.shell.pipe-command "sort" "sort"))`

@@ -1,6 +1,6 @@
 -- starter/read-only-tools — config composition for the read-only tool set.
 --
--- The mechanism (list_dir / search_text / python-read / instructions /
+-- The mechanism (list_dir / optional search_text / python-read / instructions /
 -- discover_instruction_files handlers plus the advertise/dispatch
 -- plumbing) lives in `libs.read-only-tools`. This file is the config's
 -- opinion layer: it declares which base tools the source advertises via
@@ -10,7 +10,6 @@
 return require("libs.read-only-tools").build {
   include = {
     "list_dir",
-    "search_text",
     "python-read",
     "instructions",
     "discover_instruction_files",
