@@ -31,3 +31,4 @@ mlua = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 serde_json = { workspace = true }
+git-worktree-plugin = { path = "../git-worktree" }

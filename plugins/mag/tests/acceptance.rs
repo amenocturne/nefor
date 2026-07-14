@@ -45,7 +45,7 @@
 //! under a second.
 
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use nefor_protocol::{Body, Envelope, PluginName, PluginOutgoing, SystemBody, Timestamp};
@@ -580,4 +580,281 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
     drop(stdin);
     let _ = timeout(Duration::from_secs(10), child.wait()).await;
     std::fs::remove_dir_all(&data_dir).ok();
+}
+
+fn git<const N: usize>(cwd: &std::path::Path, args: [&str; N]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .expect("git executes");
+    assert!(
+        output.status.success(),
+        "git failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git output is UTF-8")
+        .trim()
+        .to_owned()
+}
+
+fn worktree_program(operation: &str, repository: &str, path: &str, branch: &str) -> String {
+    let constructor = match operation {
+        "create" => format!(
+            "(nefor.worktree.create \"workspace\" (as nefor.worktree.CreateSpec {{:repository {repository:?} :path {path:?} :branch {branch:?} :base \"main\"}}))"
+        ),
+        "open" => format!(
+            "(nefor.worktree.open \"workspace\" (as nefor.worktree.OpenSpec {{:repository {repository:?} :path {path:?} :branch {branch:?}}}))"
+        ),
+        _ => panic!("unsupported worktree operation {operation}"),
+    };
+    format!(
+        r#"(require "nefor.artifact")
+(require "nefor.graph")
+(require "nefor.worktree")
+(let [workspace {constructor}
+      program (nefor.graph.finish workspace [(nefor.worktree.start-message workspace)] [])]
+  (nefor.artifact.compile program))"#
+    )
+}
+
+async fn load_worktree_program<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    stdin: &mut ChildStdin,
+    id: &str,
+    source_dir: &std::path::Path,
+    entry: &str,
+) -> Value {
+    let lib_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../starter/mag/lib");
+    send_event(
+        stdin,
+        json!({
+            "kind": "mag.load",
+            "id": id,
+            "source_dir": source_dir,
+            "entry": entry,
+            "module_roots": [lib_root],
+        })
+        .as_object()
+        .expect("load body")
+        .clone(),
+    )
+    .await;
+    loop {
+        let outgoing = read_outgoing(reader, id).await;
+        let Some(body) = event_body(&outgoing) else {
+            continue;
+        };
+        if body.get("in_reply_to").and_then(Value::as_str) == Some(id) {
+            assert_eq!(
+                body_kind(body),
+                Some("mag.loaded"),
+                "worktree program must load: {body:#?}"
+            );
+            return body.get("artifact").expect("loaded artifact").clone();
+        }
+    }
+}
+
+async fn execute_worktree_program<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    stdin: &mut ChildStdin,
+    id: &str,
+    artifact: Value,
+) -> Map<String, Value> {
+    send_event(
+        stdin,
+        json!({
+            "kind": "mag.execute",
+            "id": id,
+            "session_id": "worktree-acceptance",
+            "run_id": id,
+            "run_name": id,
+            "artifact": artifact,
+        })
+        .as_object()
+        .expect("execute body")
+        .clone(),
+    )
+    .await;
+
+    loop {
+        let outgoing = read_outgoing(reader, id).await;
+        let Some(body) = event_body(&outgoing) else {
+            continue;
+        };
+        match body_kind(body) {
+            Some("tool-gate.tool.invoke") => {
+                let request_id = body.get("id").and_then(Value::as_str).expect("tool id");
+                let name = body.get("name").and_then(Value::as_str).expect("tool name");
+                let args = body.get("args").cloned().expect("tool args");
+                let output = match name {
+                    git_worktree_plugin::CREATE_TOOL => {
+                        let spec = serde_json::from_value(args).expect("create spec");
+                        match git_worktree_plugin::create(&spec) {
+                            Ok(worktree) => json!({"ok": true, "worktree": worktree}),
+                            Err(error) => json!({"ok": false, "error": error}),
+                        }
+                    }
+                    git_worktree_plugin::OPEN_TOOL => {
+                        let spec = serde_json::from_value(args).expect("open spec");
+                        match git_worktree_plugin::open(&spec) {
+                            Ok(worktree) => json!({"ok": true, "worktree": worktree}),
+                            Err(error) => json!({"ok": false, "error": error}),
+                        }
+                    }
+                    other => panic!("unexpected worktree tool {other}"),
+                };
+                send_event(stdin, tool_result(request_id, output)).await;
+            }
+            Some("mag.run_result")
+                if body.get("in_reply_to").and_then(Value::as_str) == Some(id) =>
+            {
+                return body.clone();
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn worktree_create_persists_opens_and_rejects_implicit_reuse() {
+    let root = std::env::temp_dir().join(format!("mag-worktree-acceptance-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let repository = root.join("repo");
+    let sources = root.join("sources");
+    let data_dir = root.join("data");
+    let worktree = root.join("worktrees/topic");
+    std::fs::create_dir_all(&repository).expect("repository directory");
+    std::fs::create_dir_all(&sources).expect("source directory");
+    std::fs::create_dir_all(worktree.parent().expect("worktree parent")).expect("worktree parent");
+    std::fs::create_dir_all(&data_dir).expect("data directory");
+    git(&repository, ["init", "-b", "main"]);
+    git(&repository, ["config", "user.email", "test@example.com"]);
+    git(&repository, ["config", "user.name", "Test"]);
+    std::fs::write(repository.join("README.md"), "base\n").expect("seed repository");
+    git(&repository, ["add", "README.md"]);
+    git(&repository, ["commit", "-m", "base"]);
+
+    let repository_text = repository.to_string_lossy();
+    let worktree_text = worktree.to_string_lossy();
+    std::fs::write(
+        sources.join("create.mag"),
+        worktree_program("create", &repository_text, &worktree_text, "topic"),
+    )
+    .expect("create program");
+    std::fs::write(
+        sources.join("open.mag"),
+        worktree_program("open", &repository_text, &worktree_text, "topic"),
+    )
+    .expect("open program");
+
+    let mut child = spawn_mag(&data_dir).await;
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let ready = read_outgoing(&mut reader, "system ready").await;
+    assert!(matches!(ready.body, Body::System(SystemBody::Ready { .. })));
+    write_env(
+        &mut stdin,
+        Envelope::system(
+            PluginName::engine(),
+            Timestamp::now(),
+            SystemBody::ReadyOk {
+                engine_version: "test".into(),
+            },
+        ),
+    )
+    .await;
+
+    let create_artifact = load_worktree_program(
+        &mut reader,
+        &mut stdin,
+        "load-create",
+        &sources,
+        "create.mag",
+    )
+    .await;
+    let created = execute_worktree_program(
+        &mut reader,
+        &mut stdin,
+        "execute-create",
+        create_artifact.clone(),
+    )
+    .await;
+    assert_eq!(
+        created.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+    let canonical_worktree = std::fs::canonicalize(&worktree).expect("canonical worktree");
+    assert_eq!(
+        created
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .and_then(|result| result.get("path"))
+            .and_then(Value::as_str),
+        Some(canonical_worktree.to_string_lossy().as_ref())
+    );
+    assert!(worktree.is_dir(), "worktree persists after run completion");
+
+    std::fs::write(worktree.join("dirty.txt"), "in progress\n").expect("dirty worktree");
+    let open_artifact =
+        load_worktree_program(&mut reader, &mut stdin, "load-open", &sources, "open.mag").await;
+    let opened =
+        execute_worktree_program(&mut reader, &mut stdin, "execute-open", open_artifact).await;
+    assert_eq!(
+        opened.get("status").and_then(Value::as_str),
+        Some("completed")
+    );
+    let opened_head = opened
+        .get("result")
+        .and_then(|result| result.get("value"))
+        .and_then(|worktree| worktree.get("head"))
+        .and_then(Value::as_str);
+    let current_head = git(&worktree, ["rev-parse", "HEAD"]);
+    assert_eq!(opened_head, Some(current_head.as_str()));
+    assert!(
+        worktree.join("dirty.txt").exists(),
+        "open preserves dirty state"
+    );
+
+    let collision = execute_worktree_program(
+        &mut reader,
+        &mut stdin,
+        "execute-create-again",
+        create_artifact,
+    )
+    .await;
+    assert_eq!(
+        collision.get("status").and_then(Value::as_str),
+        Some("failed")
+    );
+    assert!(
+        collision
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| error.contains("worktree path already exists")),
+        "collision failure must explain that implicit reuse was rejected: {collision:#?}"
+    );
+    assert!(
+        worktree.is_dir(),
+        "failed create does not remove the existing worktree"
+    );
+
+    write_env(
+        &mut stdin,
+        Envelope::system(
+            PluginName::engine(),
+            Timestamp::now(),
+            SystemBody::Shutdown {
+                reason: None,
+                grace_ms: None,
+            },
+        ),
+    )
+    .await;
+    drop(stdin);
+    let _ = timeout(Duration::from_secs(10), child.wait()).await;
+    std::fs::remove_dir_all(root).ok();
 }
