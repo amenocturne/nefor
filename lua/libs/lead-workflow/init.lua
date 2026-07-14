@@ -966,7 +966,8 @@ end
 
 -- The lead reads paths; the model needs content. Read the sink's output file so
 -- the run-completion turn carries the actual result, not just a path. Best
--- effort — an unreadable path yields nil and the turn still relays the path.
+-- effort — an unreadable path yields an empty relayed result while the visible
+-- graph-result block still retains the artifact location.
 local function read_output_file(path)
   if type(path) ~= "string" or path == "" then return nil end
   local fh = io.open(path, "r")
@@ -998,21 +999,18 @@ end
 
 -- Relay a kernel run's completion to the model as a fresh orchestrator turn
 -- (agentic-loop's deferred-queue + flush → new user-role turn).
--- `format_deferred` frames it; the output carries the sink PATH plus the
--- content read from it.
-local function relay_kernel_completion(run_id, ok, output_path, content, err)
+-- `format_deferred` frames the sink content. The output path stays on the
+-- visible graph-result block instead of being duplicated in the model input.
+local function relay_kernel_completion(run_id, ok, content, err)
   local al = require("agentic-loop")
   if type(al.relay_run_completion) ~= "function" then return end
   if ok then
-    local parts = {}
-    if type(output_path) == "string" and #output_path > 0 then
-      parts[#parts + 1] = "output_path: " .. output_path
-    end
-    parts[#parts + 1] = tostring(content or "")
+    local content_available = type(content) == "string" and content:find("%S") ~= nil
     al.relay_run_completion({
-      run_id = run_id,
-      status = "success",
-      output = table.concat(parts, "\n\n"),
+      run_id            = run_id,
+      status            = "success",
+      content_available = content_available,
+      output            = content_available and content or nil,
     })
   else
     al.relay_run_completion({
@@ -1074,7 +1072,7 @@ local function handle_mag_run_result(body)
       or (body.status == "killed" and "run killed" or "mag run failed")
     finish_run(run_id, "failed", nil, err)
     emit_mag_result_block(run, "failed", nil, err)
-    relay_kernel_completion(run_id, false, nil, nil, err)
+    relay_kernel_completion(run_id, false, nil, err)
     return
   end
   local results = {}
@@ -1085,7 +1083,7 @@ local function handle_mag_run_result(body)
   emit_mag_result_block(run, "success", body.output_path, nil)
   local content = mag_result_text(body.result)
     or read_output_file(body.output_path)
-  relay_kernel_completion(run_id, true, body.output_path, content, nil)
+  relay_kernel_completion(run_id, true, content, nil)
 end
 
 -- Double-Esc entry point (`chat.interrupt_all`). The `mag` execute tool is

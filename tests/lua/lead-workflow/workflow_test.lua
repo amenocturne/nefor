@@ -642,8 +642,8 @@ do
     "mag.run_result relays a fresh lead turn; got " .. json.encode(_test.calls()))
   assert_true(prompt:find("SINK OUTPUT CONTENT", 1, true) ~= nil,
     "the relayed turn carries the sink output content read from the path")
-  assert_true(prompt:find(out_path, 1, true) ~= nil,
-    "the relayed turn carries the sink output path")
+  assert_true(prompt:find(out_path, 1, true) == nil,
+    "the relayed turn does not duplicate the sink output path")
 
   -- The visible run-result block is appended to the chat surface. It carries
   -- status + run id + the sink output PATH, but NOT the output content (that
@@ -663,6 +663,49 @@ do
     "result block must NOT duplicate the relayed output content")
 
   os.remove(out_path)
+end
+
+-- A successful run can still arrive without usable result content when the
+-- sink did not inline a result and its persisted output is unreadable. Relay
+-- that condition explicitly: the lead must not infer findings from success,
+-- while the visible graph result continues to expose the artifact location.
+do
+  fresh()
+  write_mag_file("firing-kernel-missing-write", "kernel-missing.mag", READ_ONLY_MAG)
+  _test.calls_clear()
+  execute_mag("firing-kernel-missing", "kernel-missing.mag")
+  feed_loaded(read_only_modification())
+  local reply = find_call(decode_calls(), function(c)
+    return c.body.kind == "tool.result" and c.body.id == "firing-kernel-missing"
+  end)
+  assert_true(reply ~= nil and reply.body.output ~= nil, "execute replies executing")
+
+  local missing_path = os.tmpname()
+  os.remove(missing_path)
+  _test.calls_clear()
+  feed("mag", {
+    kind        = "mag.run_result",
+    run_id      = reply.body.output.run_id,
+    status      = "completed",
+    output_path = missing_path,
+  })
+
+  local prompt = relayed_lead_prompt()
+  assert_true(type(prompt) == "string",
+    "missing output still relays a fresh lead turn; got " .. json.encode(_test.calls()))
+  assert_true(prompt:find("result content is unavailable", 1, true) ~= nil,
+    "the relayed turn names the missing-content condition")
+  assert_true(prompt:find("do not infer or fabricate findings", 1, true) ~= nil,
+    "the relayed turn forbids fabricating a result from successful status")
+  assert_true(prompt:find(missing_path, 1, true) == nil,
+    "the missing artifact path is not duplicated in model input")
+
+  local block = find_call(decode_calls(), function(c)
+    return c.body.kind == "chat.graph_result.append" and c.target == "nefor-tui"
+  end)
+  assert_true(block ~= nil and type(block.body.output) == "string"
+              and block.body.output:find(missing_path, 1, true) ~= nil,
+    "the visible graph result retains the missing artifact path")
 end
 
 -- The kernel's lifecycle stream drives node statuses (every kernel event
