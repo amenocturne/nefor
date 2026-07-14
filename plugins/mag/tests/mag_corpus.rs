@@ -35,7 +35,7 @@ fn source_files(root: &Path, extension: &str) -> Vec<PathBuf> {
             let path = entry.path();
             if path.is_dir() {
                 let name = path.file_name().and_then(|name| name.to_str());
-                if !matches!(name, Some(".git" | "target" | "tmp")) {
+                if !matches!(name, Some(".git" | ".worktrees" | "target" | "tmp")) {
                     visit(&path, extension, paths);
                 }
             } else if path.extension().and_then(|ext| ext.to_str()) == Some(extension) {
