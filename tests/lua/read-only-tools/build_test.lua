@@ -196,6 +196,7 @@ do
     { "discover_instruction_files", { label = "Discover instructions", primary = { arg = "path" }, arguments = { { label = "scope", arg = "scope" }, { label = "unread only", arg = "unread_only" } }, result = { kind = "content" } }, { path = "repo", scope = "auto", unread_only = true }, "repo" },
     { "skill", { label = "Load skill", primary = { arg = "name" }, result = { kind = "receipt", text = "skill loaded" } }, { name = { "html-report", "browser-audit" } }, "html-report · browser-audit" },
     { "graph-status", { label = "Graph status", primary = { arg = "run_id" }, result = { kind = "content" } }, { run_id = "run-1" }, "run-1" },
+    { "await-run", { label = "Await run", primary = { arg = "run_id" }, result = { kind = "content" } }, { run_id = "run-1" }, "run-1" },
     { "terminate-graph", { label = "Terminate graph", primary = { arg = "run_id" }, result = { kind = "content" } }, { run_id = "run-1" }, "run-1" },
     { "write-review", { label = "Review plan", primary = { arg = "view" }, result = { kind = "content" } }, { view = "inline", plan = "PRIVATE" }, "inline" },
     { "mag", { label = "MAG", primary = { arg = "file" }, arguments = { { label = "action", arg = "action" } }, result = { kind = "content" } }, { file = "build.mag", action = "execute", content = "PRIVATE" }, "build.mag" },

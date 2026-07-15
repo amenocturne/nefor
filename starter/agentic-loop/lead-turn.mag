@@ -19,6 +19,7 @@
                  "instructions"
                  "edit_file"
                  "graph-status"
+                 "await-run"
                  "terminate-graph"
                  "write-review"
                  "mag"

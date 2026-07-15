@@ -202,6 +202,7 @@ struct PendingApproval {
     name: String,
     args: Value,
     invoking_from: Option<String>,
+    invocation: Option<Value>,
 }
 
 struct GateState {
@@ -586,6 +587,7 @@ async fn handle_tool_invoke(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let invoking_from = body.get("from").and_then(Value::as_str).map(str::to_owned);
+    let invocation = body.get("invocation").cloned();
 
     let source = match state.tool_owner.get(&name).cloned() {
         Some(s) => s,
@@ -609,11 +611,14 @@ async fn handle_tool_invoke(
             forward_to_source(
                 out_tx,
                 state,
-                &outer_id,
-                &source,
-                &name,
-                args,
-                invoking_from.as_deref(),
+                PendingApproval {
+                    outer_id: outer_id.clone(),
+                    source,
+                    name,
+                    args,
+                    invoking_from,
+                    invocation,
+                },
             )
             .await?;
         }
@@ -626,6 +631,7 @@ async fn handle_tool_invoke(
                     name: name.clone(),
                     args: args.clone(),
                     invoking_from,
+                    invocation,
                 },
             );
             send_event(
@@ -648,12 +654,16 @@ async fn handle_tool_invoke(
 async fn forward_to_source(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     state: &mut GateState,
-    outer_id: &str,
-    source: &str,
-    name: &str,
-    args: Value,
-    invoking_from: Option<&str>,
+    invocation: PendingApproval,
 ) -> Result<(), TransportError> {
+    let PendingApproval {
+        outer_id,
+        source,
+        name,
+        args,
+        invoking_from,
+        invocation,
+    } = invocation;
     let inner_id = state.next_inner_id();
     state.pending.insert(
         inner_id.clone(),
@@ -664,7 +674,15 @@ async fn forward_to_source(
     );
     send_event(
         out_tx,
-        forward_invoke_body(source, &inner_id, outer_id, name, args, invoking_from),
+        forward_invoke_body(
+            &source,
+            &inner_id,
+            &outer_id,
+            &name,
+            args,
+            invoking_from.as_deref(),
+            invocation.as_ref(),
+        ),
     )
     .await?;
     Ok(())
@@ -727,15 +745,9 @@ async fn handle_tool_result(
     let Some(pending) = state.pending.remove(inner_id) else {
         return Ok(());
     };
-    let mut out = Map::new();
+    let mut out = body.clone();
     out.insert("kind".into(), Value::String("tool.result".into()));
     out.insert("id".into(), Value::String(pending.outer_id));
-    if let Some(output) = body.get("output") {
-        out.insert("output".into(), output.clone());
-    }
-    if let Some(err) = body.get("error") {
-        out.insert("error".into(), err.clone());
-    }
     send_event(out_tx, out).await?;
     Ok(())
 }
@@ -754,24 +766,15 @@ async fn handle_permission_response(
         .and_then(Value::as_str)
         .unwrap_or("deny");
 
-    let Some(approval) = state.awaiting_approval.remove(&outer_id) else {
+    let Some(mut approval) = state.awaiting_approval.remove(&outer_id) else {
         // No matching pending request — likely a stale response or one
         // belonging to a different gate. Drop silently.
         return Ok(());
     };
 
     if decision == "approve" {
-        let args = body.get("args").cloned().unwrap_or(approval.args);
-        forward_to_source(
-            out_tx,
-            state,
-            &approval.outer_id,
-            &approval.source,
-            &approval.name,
-            args,
-            approval.invoking_from.as_deref(),
-        )
-        .await?;
+        approval.args = body.get("args").cloned().unwrap_or(approval.args);
+        forward_to_source(out_tx, state, approval).await?;
     } else {
         // Optional `reason` carries auto-deny context from a non-user
         // approver (e.g. tool-validator pre-rejecting a dispatch-graph
@@ -827,6 +830,7 @@ fn forward_invoke_body(
     name: &str,
     args: Value,
     invoking_from: Option<&str>,
+    invocation: Option<&Value>,
 ) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert(
@@ -837,6 +841,9 @@ fn forward_invoke_body(
     m.insert("caller_id".into(), Value::String(caller_id.to_owned()));
     if let Some(from) = invoking_from {
         m.insert("from".into(), Value::String(from.to_owned()));
+    }
+    if let Some(invocation) = invocation {
+        m.insert("invocation".into(), invocation.clone());
     }
     m.insert("name".into(), Value::String(name.to_owned()));
     m.insert("args".into(), args);
@@ -1220,6 +1227,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_approval_preserves_invocation_provenance() {
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+        let mut state = make_state();
+        let body = advertise_body(
+            "lead-workflow",
+            json!([{"name": "mag", "description": "", "parameters": {}}]),
+        );
+        handle_tools_advertise(&tx, &body, &mut state)
+            .await
+            .unwrap();
+        let _register = rx.recv().await.unwrap();
+
+        let invoke = json!({
+            "kind": "tool-gate.tool.invoke",
+            "id": "r-old/cap-1",
+            "from": "lead.run-tool",
+            "invocation": {
+                "session_id": "session-before-switch",
+                "run_id": "lead-turn-before-switch",
+                "run_scope": "r-old",
+                "actor_id": "lead.run-tool",
+                "capability_id": "r-old/cap-1",
+                "principal": "lead"
+            },
+            "name": "mag",
+            "args": {"action": "execute", "file": "build.mag"}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        handle_tool_invoke(&tx, &invoke, &mut state).await.unwrap();
+        let permission: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        assert_eq!(permission["body"]["kind"], "chat.tool.permission_request");
+
+        // The gate has no session singleton to consult at approval time: the
+        // exact validated local invocation context captured above must survive.
+        let response = json!({
+            "kind": "tool.permission_response",
+            "id": "r-old/cap-1",
+            "decision": "approve"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        handle_permission_response(&tx, &response, &mut state)
+            .await
+            .unwrap();
+        let forwarded: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        assert_eq!(
+            forwarded["body"]["invocation"]["session_id"],
+            "session-before-switch"
+        );
+        assert_eq!(forwarded["body"]["invocation"]["principal"], "lead");
+        assert_eq!(forwarded["body"]["caller_id"], "r-old/cap-1");
+    }
+
+    #[tokio::test]
     async fn invoke_with_auto_forwards_immediately() {
         let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
         let mut state = make_state();
@@ -1256,6 +1320,7 @@ mod tests {
         assert!(inner_id.starts_with("gate-"));
         assert_eq!(body["caller_id"], "r7/cap-2");
         assert_eq!(body["from"], "lead.llm");
+        assert!(body.get("invocation").is_none());
         assert_eq!(
             state.pending.get(inner_id).map(|p| p.outer_id.as_str()),
             Some("r7/cap-2")
@@ -1513,7 +1578,11 @@ mod tests {
         let body = json!({
             "kind": "tool.result",
             "id": "gate-1",
-            "output": "abc"
+            "error": "await failed",
+            "error_code": "await_run_failed",
+            "status": "failed",
+            "run_id": "mag-run-rg-1-2-3",
+            "terminal": {"metadata": "preserved"}
         })
         .as_object()
         .unwrap()
@@ -1523,7 +1592,13 @@ mod tests {
         let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
         let body = v.get("body").unwrap();
         assert_eq!(body.get("id").and_then(Value::as_str), Some("prov-42"));
-        assert_eq!(body.get("output").and_then(Value::as_str), Some("abc"));
+        assert_eq!(
+            body.get("error_code").and_then(Value::as_str),
+            Some("await_run_failed")
+        );
+        assert_eq!(body.get("status").and_then(Value::as_str), Some("failed"));
+        assert_eq!(body["run_id"], "mag-run-rg-1-2-3");
+        assert_eq!(body["terminal"]["metadata"], "preserved");
         assert!(!state.pending.contains_key("gate-1"));
     }
 
@@ -1543,6 +1618,14 @@ mod tests {
             "kind": "tool-gate.tool.invoke",
             "id": "r7/cap-3",
             "from": "lead.llm",
+            "invocation": {
+                "session_id": "session-a",
+                "run_id": "lead-turn-a",
+                "run_scope": "r7",
+                "actor_id": "lead.llm",
+                "capability_id": "r7/cap-3",
+                "principal": "lead"
+            },
             "name": "write_file",
             "args": {}
         })
@@ -1554,6 +1637,8 @@ mod tests {
         assert_eq!(forwarded["body"]["id"], "gate-1");
         assert_eq!(forwarded["body"]["caller_id"], "r7/cap-3");
         assert_eq!(forwarded["body"]["from"], "lead.llm");
+        assert_eq!(forwarded["body"]["invocation"]["session_id"], "session-a");
+        assert_eq!(forwarded["body"]["invocation"]["principal"], "lead");
 
         let source_result = json!({
             "kind": "tool.result",

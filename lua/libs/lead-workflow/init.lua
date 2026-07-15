@@ -75,13 +75,32 @@
 local json = nefor.json
 
 local mag            = require("mag")
-local mag_eval      = require("libs.lead-workflow.mag-eval")
-local sessions      = require("sessions")
-local envelope      = require("core.envelope")
-local replay_window = require("core.history_replay")
+local mag_eval       = require("libs.lead-workflow.mag-eval")
+local RunRegistry    = require("libs.lead-workflow.run-registry")
+local chat_emitter   = require("libs.chat-emitter")
+local sessions       = require("sessions")
+local envelope       = require("core.envelope")
+local replay_window  = require("core.history_replay")
 
 local emit_as = envelope.emit_as
 local emit    = envelope.emit
+
+local run_registry = RunRegistry.new({
+  terminal_limit = 64,
+  tombstone_limit = 256,
+  mint_id = function()
+    return "mag-run-" .. envelope.uuid_lite()
+  end,
+  now = function()
+    if nefor.engine and type(nefor.engine.now) == "function" then
+      return nefor.engine.now()
+    end
+    return os.date("!%Y-%m-%dT%H:%M:%SZ")
+  end,
+  monotonic_ms = function()
+    return nil
+  end,
+})
 
 local dependency_module_roots = {}
 
@@ -123,11 +142,11 @@ local state = {
   ---@type string|nil
   active_run_id = nil,
 
-  -- Active graph runs keyed by run_id. Kept as a compact lead-facing
-  -- view; agentic-loop remains the owner of actual pending graph relay.
-  active_runs = {},
-  completed_runs = {},
-  completed_run_limit = 10,
+  -- Compatibility aliases onto the focused registry. The registry owns
+  -- active/terminal state, retention, waiter correlations, and provenance.
+  active_runs = run_registry.active_runs,
+  completed_runs = run_registry.completed_runs,
+  completed_run_limit = 64,
 
   -- The single in-flight plan slot. Lifetime is one verdict turn:
   -- created by write-review, decided by /approve or /reject, flushed
@@ -161,6 +180,10 @@ local state = {
   -- with the compiler message. One entry per in-flight handshake.
   pending_mag_load = {},
 
+  -- Provenance-bearing graph-agent `mag action=execute` calls stay attached
+  -- to their capability and never enter the detached awaitable registry.
+  attached_mag_runs = {},
+
   -- Kernel runs are concurrent: every kernel lifecycle event
   -- (`mag.actor_spawned` / `mag.actor_ready` / `mag.actor_killed` /
   -- `mag.run_complete`) carries its run_id, and the tracker keys straight
@@ -174,6 +197,7 @@ local register_active_run
 local submit_loaded_run
 local invalidate_pending_mag_loads
 local graph_status
+local await_run
 local terminate_graph
 local now_ms
 local emit_verdict_approved
@@ -218,6 +242,23 @@ local function emit_tool_result_ok(firing_id, output)
     id     = firing_id,
     output = output,
   })
+end
+
+local function emit_await_outcome(firing_id, outcome)
+  local body = { kind = "tool.result", id = firing_id }
+  if type(outcome) == "table" and outcome.output ~= nil then
+    body.output = outcome.output
+  else
+    body.error = type(outcome) == "table" and outcome.error or "await-run failed"
+    if type(outcome) == "table" then
+      body.error_code = outcome.error_code
+      body.run_id = outcome.run_id
+      body.status = outcome.status
+      body.run_name = outcome.run_name
+      body.terminal = outcome.terminal
+    end
+  end
+  emit_as(SOURCE_NAME, nil, body)
 end
 
 local function emit_tool_result_err(firing_id, err)
@@ -728,7 +769,7 @@ end
 -- actor list ({ id, factory, … }); node summaries carry the factory under the
 -- `reasoner` key, matching what the chat surface renders (chat/run_panel.lua
 -- maps kernel factory → reasoner the same way).
-register_active_run = function(run_id, actors, terminal, firing_id, run_name)
+register_active_run = function(run_id, actors, terminal, firing_id, run_name, session_id)
   local nodes_order, nodes = {}, {}
   for _, actor in ipairs(actors or {}) do
     local id = tostring(actor.id or "")
@@ -742,19 +783,17 @@ register_active_run = function(run_id, actors, terminal, firing_id, run_name)
       }
     end
   end
-  local ts = now_ms()
-  state.active_runs[run_id] = {
+  local run = run_registry:register({
     run_id = run_id,
     run_name = run_name,
-    status = "queued",
-    dispatched_at = ts,
-    updated_at = ts,
+    session_id = session_id,
     terminal = terminal,
     dispatch_firing_id = firing_id,
     nodes_order = nodes_order,
     nodes = nodes,
-  }
+  })
   state.active_run_id = run_id
+  return run
 end
 
 local function ordered_node_summaries(run)
@@ -796,83 +835,15 @@ local function summarize_run(run)
   }
 end
 
-local function archive_run(run)
-  local summary = summarize_run(run)
-  if not summary then return end
-  state.completed_runs[#state.completed_runs + 1] = summary
-  while #state.completed_runs > (state.completed_run_limit or 10) do
-    table.remove(state.completed_runs, 1)
-  end
-end
-
 local function refresh_active_run_id()
   local latest_id, latest_at
   for run_id, run in pairs(state.active_runs) do
-    local at = tonumber(run.dispatched_at) or 0
-    if latest_at == nil or at > latest_at then
+    local at = tostring(run.dispatched_at or "")
+    if latest_at == nil or at > latest_at or (at == latest_at and run_id > latest_id) then
       latest_id, latest_at = run_id, at
     end
   end
   state.active_run_id = latest_id
-end
-
-local function archive_canceled_run(run_id, reason)
-  local run = state.active_runs[run_id]
-  if type(run) ~= "table" then return nil end
-  local ts = now_ms()
-  run.status = "canceled"
-  run.updated_at = ts
-  run.cancel_reason = reason
-  for _, id in ipairs(run.nodes_order or {}) do
-    local node = run.nodes and run.nodes[id]
-    if node then
-      if node.status == "pending" or node.status == "running" then
-        node.status = "canceled"
-        node.completed_at = node.completed_at or ts
-      end
-    end
-  end
-  state.active_runs[run_id] = nil
-  if state.active_run_id == run_id then refresh_active_run_id() end
-  archive_run(run)
-  return summarize_run(run)
-end
-
-local function finish_run(run_id, status, results, explicit_error)
-  local run = state.active_runs[run_id]
-  if type(run) ~= "table" then return end
-  local ts = now_ms()
-  run.status = status or (explicit_error and "failed" or "completed")
-  run.updated_at = ts
-  run.result = results
-  run.error = explicit_error
-  if type(results) == "table" then
-    for node_id, value in pairs(results) do
-      local node = run.nodes and run.nodes[node_id]
-      if node then
-        node.status = "done"
-        node.completed_at = node.completed_at or ts
-        if type(value) == "table" and value.error ~= nil then
-          node.status = "error"
-          node.error = value.error
-        elseif type(value) == "table" and type(value.output) == "table" then
-          node.output_path = value.output.output_path
-          node.output_relpath = value.output.output_relpath
-        end
-      end
-    end
-  end
-  for _, id in ipairs(run.nodes_order or {}) do
-    local node = run.nodes and run.nodes[id]
-    if node and node.status == "running" then
-      node.status = explicit_error and "error" or "done"
-      node.completed_at = node.completed_at or ts
-      if explicit_error then node.error = explicit_error end
-    end
-  end
-  state.active_runs[run_id] = nil
-  if state.active_run_id == run_id then state.active_run_id = nil end
-  archive_run(run)
 end
 
 -- The tracked run a kernel lifecycle event belongs to. Every kernel event
@@ -888,8 +859,7 @@ end
 local function mark_mag_run_started(body)
   local run = mag_event_run(body)
   if not run then return end
-  run.status = "running"
-  run.updated_at = now_ms()
+  run_registry:mark_running(run.run_id)
 end
 
 -- Track one kernel actor lifecycle transition against its run's node table —
@@ -1027,8 +997,8 @@ end
 -- closed kernel run. Carries status + run id/name + the sink's output
 -- PATH; the output CONTENT is deliberately omitted — it arrives separately as
 -- the relayed fresh turn (relay_kernel_completion), so duplicating it here
--- would double-render it. `run` is read after finish_run, whose node-status
--- finalisation is exactly what the block should show.
+-- would double-render it. `run` is read after the registry's canonical
+-- transition and node finalization, exactly the state the block should show.
 local function emit_mag_result_block(run, status, output_path, err)
   local block = {
     kind     = "chat.graph_result.append",
@@ -1037,13 +1007,6 @@ local function emit_mag_result_block(run, status, output_path, err)
     status   = status,
     nodes    = ordered_node_summaries(run),
   }
-  -- Wall time from dispatch to terminal result — the cleanest duration
-  -- source: the run object already stamps dispatched_at at
-  -- register_active_run, so no cross-actor lookup into the sidebar's
-  -- run-panel timestamps is needed.
-  if type(run.dispatched_at) == "number" then
-    block.duration_ms = now_ms() - run.dispatched_at
-  end
   if status == "success" then
     if type(output_path) == "string" and #output_path > 0 then
       block.output = "output_path: " .. output_path
@@ -1051,6 +1014,7 @@ local function emit_mag_result_block(run, status, output_path, err)
   elseif type(err) == "string" and #err > 0 then
     block.error = err
   end
+  if type(run.duration_ms) == "number" then block.duration_ms = run.duration_ms end
   emit("nefor-tui", block)
 end
 
@@ -1063,25 +1027,67 @@ end
 local function handle_mag_run_result(body)
   local run_id = body.run_id or body.in_reply_to
   if type(run_id) ~= "string" then return end
+  local attached = state.attached_mag_runs[run_id]
+  if attached then
+    state.attached_mag_runs[run_id] = nil
+    if body.status == "completed" then
+      emit_tool_result_ok(attached.firing_id, body)
+    else
+      emit_tool_result_err(attached.firing_id,
+        tostring(body.error or (body.status == "killed" and "run killed" or "mag run failed")))
+    end
+    return
+  end
   local run = state.active_runs[run_id]
   if not run then return end
-  -- "killed" closes a run the control plane terminated out from under us
-  -- (a mag.kill_run this actor didn't issue — terminate-graph archives
-  -- before the reply lands, so those never reach here). Surfaced like a
-  -- failure so the lead learns its dispatched run died.
-  if body.status == "failed" or body.status == "killed" then
-    local err = body.error
-      or (body.status == "killed" and "run killed" or "mag run failed")
-    finish_run(run_id, "failed", nil, err)
+
+  local settled, transitioned = run_registry:settle(run_id, body)
+  if not transitioned then return end
+  run = settled.run
+  if state.active_run_id == run_id then refresh_active_run_id() end
+
+  local ts = now_ms()
+  local failed = body.status == "failed" or body.status == "killed"
+  local err = body.error
+    or (body.status == "killed" and "run killed" or "mag run failed")
+  local results = {}
+  if not failed and type(run.terminal) == "string" and body.output_path ~= nil then
+    results[run.terminal] = { output = { output_path = body.output_path } }
+  end
+  run.result = failed and nil or results
+  run.error = failed and err or nil
+  if type(results) == "table" then
+    for node_id, value in pairs(results) do
+      local node = run.nodes and run.nodes[node_id]
+      if node then
+        node.status = "done"
+        node.completed_at = node.completed_at or ts
+        if type(value.output) == "table" then
+          node.output_path = value.output.output_path
+          node.output_relpath = value.output.output_relpath
+        end
+      end
+    end
+  end
+  for _, id in ipairs(run.nodes_order or {}) do
+    local node = run.nodes and run.nodes[id]
+    if node and (node.status == "pending" or node.status == "running") then
+      node.status = failed and (body.status == "killed" and "killed" or "error") or "done"
+      node.completed_at = node.completed_at or ts
+      if failed then node.error = err end
+    end
+  end
+
+  for _, firing_id in ipairs(settled.waiters) do
+    emit_await_outcome(firing_id, settled.outcome)
+  end
+
+  if not run_registry:claim_delivery(run_id) then return end
+  if failed then
     emit_mag_result_block(run, "failed", nil, err)
     relay_kernel_completion(run_id, false, nil, err)
     return
   end
-  local results = {}
-  if type(run.terminal) == "string" and body.output_path ~= nil then
-    results[run.terminal] = { output = { output_path = body.output_path } }
-  end
-  finish_run(run_id, "completed", results, nil)
   emit_mag_result_block(run, "success", body.output_path, nil)
   local content = mag_result_text(body.result)
     or read_output_file(body.output_path)
@@ -1114,7 +1120,13 @@ local function interrupt_active_runs()
   for run_id, _ in pairs(state.active_runs) do ids[#ids + 1] = run_id end
   table.sort(ids)
   for _, run_id in ipairs(ids) do
+    run_registry:mark_terminating(run_id, "interrupt-all")
     emit_as(SOURCE_NAME, "mag", { kind = "mag.interrupt_run", run_id = run_id, terminate = true })
+  end
+  for run_id, pending in pairs(state.attached_mag_runs) do
+    emit_as(SOURCE_NAME, "mag", { kind = "mag.interrupt_run", run_id = run_id, terminate = true })
+    state.attached_mag_runs[run_id] = nil
+    emit_tool_result_err(pending.firing_id, "mag: interrupted before the attached run settled")
   end
   nefor.log.info("lead-workflow: interrupt_all — terminated active dispatched runs", {
     count = #ids,
@@ -1130,6 +1142,7 @@ local function interrupt_run_by_dispatch_firing(firing_id)
   local hit = false
   for run_id, run in pairs(state.active_runs) do
     if run.dispatch_firing_id == firing_id then
+      run_registry:mark_terminating(run_id, "dispatch-canceled")
       emit_as(SOURCE_NAME, "mag", { kind = "mag.interrupt_run", run_id = run_id, terminate = true })
       hit = true
     end
@@ -1137,31 +1150,96 @@ local function interrupt_run_by_dispatch_firing(firing_id)
   return hit
 end
 
-terminate_graph = function(firing_id, args)
+local function resolve_invocation(metadata, direct_default_principal)
+  local has_invocation = type(metadata) == "table" and metadata.invocation ~= nil
+  if not has_invocation then
+    local session_id = sessions.current_id()
+    if type(session_id) ~= "string" or session_id == "" then
+      return nil, "no active session"
+    end
+    local caller_id = type(metadata) == "table" and metadata.caller_id or nil
+    local principal = direct_default_principal or "subagent"
+    local al_ok, al = pcall(require, "agentic-loop")
+    if type(caller_id) == "string" and al_ok and type(al.lead_scoped_id) == "function"
+        and al.lead_scoped_id(caller_id) == true then
+      principal = "lead"
+    end
+    return { session_id = session_id, principal = principal, direct = true }
+  end
+
+  local invocation, validation_error = chat_emitter.validate_invocation(metadata.invocation)
+  if not invocation then
+    return nil, "invalid invocation provenance: " .. tostring(validation_error)
+  end
+  if sessions.current_id() ~= invocation.session_id then
+    return nil, "invocation session is no longer active"
+  end
+  return {
+    session_id = invocation.session_id,
+    principal = invocation.principal,
+    invocation = invocation,
+  }
+end
+
+local function interrupt_attached_mag_by_firing(firing_id)
+  if type(firing_id) ~= "string" then return false end
+  for run_id, pending in pairs(state.attached_mag_runs) do
+    if pending.firing_id == firing_id then
+      state.attached_mag_runs[run_id] = nil
+      emit_as(SOURCE_NAME, "mag", { kind = "mag.interrupt_run", run_id = run_id, terminate = true })
+      return true
+    end
+  end
+  return false
+end
+
+local function invocation_session_id(metadata)
+  local provenance = resolve_invocation(metadata)
+  return provenance and provenance.session_id or nil
+end
+
+await_run = function(firing_id, args, metadata)
+  local provenance, provenance_error = resolve_invocation(metadata)
+  if not provenance then
+    emit_await_outcome(firing_id, RunRegistry.typed_error(
+      "await_run_session_ended", provenance_error, args and args.run_id))
+    return
+  end
+  local result = run_registry:await(args and args.run_id, provenance.session_id, firing_id)
+  if result.immediate then emit_await_outcome(firing_id, result.immediate) end
+end
+
+terminate_graph = function(firing_id, args, metadata)
   local run_id = args and args.run_id
   if type(run_id) ~= "string" or run_id == "" then
     emit_tool_result_err(firing_id, "terminate-graph: args.run_id must be a non-empty active graph run id")
     return
   end
 
-  if type(state.active_runs[run_id]) ~= "table" then
+  local run, lookup_err = run_registry:lookup(run_id, invocation_session_id(metadata))
+  if not run or run.phase == "terminal" then
     emit_tool_result_ok(firing_id, {
       canceled = false,
       run_id = run_id,
-      status = "not_found",
-      notice = "active graph run not found; no graphs were canceled",
+      status = lookup_err and lookup_err.error_code or "not_active",
+      notice = lookup_err and lookup_err.error or "graph run is already terminal",
     })
     return
   end
 
-  -- Kernel kill machinery: the kernel reaps the run's live actors through
-  -- the fold (kill handlers run — provider cancels fire) and settles the
-  -- pending execute as `mag.run_result status:"killed"`. The run is
-  -- archived here first, so that terminal reply finds no tracked run and
-  -- drops (no double relay).
-  emit_as(SOURCE_NAME, "mag", { kind = "mag.kill_run", run_id = run_id })
-  local summary = archive_canceled_run(run_id, "terminate-graph")
-  emit_tool_result_ok(firing_id, { canceled = true, run_id = run_id, run = summary })
+  local first_request = run.phase ~= "terminating"
+  run_registry:mark_terminating(run_id, "terminate-graph")
+  if first_request then
+    emit_as(SOURCE_NAME, "mag", { kind = "mag.kill_run", run_id = run_id })
+  end
+  emit_tool_result_ok(firing_id, {
+    canceled = true,
+    run_id = run_id,
+    status = "terminating",
+    notice = first_request and "termination requested; awaiting canonical MAG terminal confirmation"
+      or "termination was already requested; awaiting canonical MAG terminal confirmation",
+    run = summarize_run(run),
+  })
 end
 
 graph_status = function(firing_id, args)
@@ -1184,9 +1262,9 @@ graph_status = function(firing_id, args)
       return
     end
     for i = #state.completed_runs, 1, -1 do
-      local summary = state.completed_runs[i]
-      if summary.run_id == run_id then
-        emit_tool_result_ok(firing_id, { active = false, run = summary })
+      local run = state.completed_runs[i]
+      if run.run_id == run_id then
+        emit_tool_result_ok(firing_id, { active = false, run = summarize_run(run) })
         return
       end
     end
@@ -1198,39 +1276,35 @@ graph_status = function(firing_id, args)
   for _, run in pairs(state.active_runs) do active[#active + 1] = summarize_run(run) end
   table.sort(active, function(a, b) return tostring(a.dispatched_at) < tostring(b.dispatched_at) end)
   local recent = {}
-  for _, summary in ipairs(state.completed_runs) do recent[#recent + 1] = summary end
+  for _, run in ipairs(state.completed_runs) do recent[#recent + 1] = summarize_run(run) end
   emit_tool_result_ok(firing_id, { active = active, recent = recent })
 end
 
-local function terminate_active_graph()
-  -- Session teardown invalidates compile handshakes before touching submitted
-  -- runs, so delayed compiler replies cannot cross the session boundary.
+local function terminate_active_graph(session_id)
   invalidate_pending_mag_loads(nil)
-
-  -- Session boundary flushes the plan slot unconditionally — no
-  -- approval survives across sessions. If a write-review was in-flight
-  -- at session-end, the deferred firing is abandoned; the agentic-loop
-  -- state is torn down with the session so there's nothing to ack into.
   state.active_plan = nil
 
-  local run_ids = {}
-  for run_id, _ in pairs(state.active_runs) do run_ids[#run_ids + 1] = run_id end
-  table.sort(run_ids)
-  if #run_ids == 0 then return end
+  session_id = session_id or sessions.current_id()
+  if type(session_id) ~= "string" or session_id == "" then return end
+  local ended = run_registry:end_session(session_id)
+  state.active_runs = run_registry.active_runs
+  state.completed_runs = run_registry.completed_runs
+  refresh_active_run_id()
 
-  -- Every tracked run is a kernel run (register_active_run fires only on
-  -- the mag execute path), so session-end termination rides the kernel
-  -- kill machinery: end_run reaps the constellation through the fold and
-  -- the dying actors' provider-cancel envelopes reach the bus.
-  for _, run_id in ipairs(run_ids) do
+  for run_id, attached in pairs(state.attached_mag_runs) do
+    if attached.session_id == session_id then
+      state.attached_mag_runs[run_id] = nil
+      emit_as(SOURCE_NAME, "mag", { kind = "mag.kill_run", run_id = run_id })
+      emit_tool_result_err(attached.firing_id,
+        "mag: session ended before the attached run settled")
+    end
+  end
+
+  for _, settlement in ipairs(ended.waiter_settlements) do
+    emit_await_outcome(settlement.firing_id, settlement.outcome)
+  end
+  for _, run_id in ipairs(ended.active_run_ids) do
     emit_as(SOURCE_NAME, "mag", { kind = "mag.kill_run", run_id = run_id })
-    archive_canceled_run(run_id, "session-end")
-    -- Previously this emitted a "[Graph terminated by user — session
-    -- exit]" chat.message.append for user feedback, but the message
-    -- went into the bus log and leaked into the NEXT session's chat
-    -- when /new replayed bus state. The cancel itself (above) is the
-    -- functional close; the user already knows they ended the
-    -- session. Logging only.
     nefor.log.info("lead-workflow: graph terminated on session-end", { run_id = run_id })
   end
 end
@@ -1262,9 +1336,28 @@ local function lead_workflow_tool_schemas()
       },
     },
     {
+      name        = "await-run",
+      display = { label = "Await run", primary = { arg = "run_id" }, result = { kind = "content" } },
+      description =
+        "Block until a previously acknowledged lead-dispatched MAG run reaches its canonical " ..
+        "terminal result. Use this when your next step depends on completion. This attaches to " ..
+        "the existing run and does not poll graph-status or cancel it. Cancellation detaches " ..
+        "only this waiter; use terminate-graph separately to stop the run.",
+      parameters  = {
+        type = "object",
+        properties = {
+          run_id = {
+            type = "string",
+            description = "Stable opaque run_id returned by mag execute or a lead mag-eval dispatch.",
+          },
+        },
+        required = { "run_id" },
+      },
+    },
+    {
       name        = "terminate-graph",
       display = { label = "Terminate graph", primary = { arg = "run_id" }, result = { kind = "content" } },
-      description = "Cancel exactly one active graph run by explicit run_id and archive it as canceled.",
+      description = "Request termination of exactly one active graph run by explicit run_id; the run remains terminating until canonical MAG confirmation.",
       parameters  = {
         type = "object",
         properties = {
@@ -1382,9 +1475,10 @@ end
 -- mag.run_complete) stream on the bus; the terminal mag.run_result (carrying
 -- the sink's output PATH) closes the run and relays a fresh model turn in
 -- receive_msg.
-local function begin_mag_load(firing_id, action, args, ws)
+local function begin_mag_load(firing_id, action, args, ws, session_id, routing)
   local graph_name = args.file:gsub("%.mag$", ""):gsub("/", "-"):sub(1, 20)
-  local run_id = "mag-" .. tostring(graph_name) .. "-" .. tostring(now_ms())
+  local run_id = action == "execute" and run_registry:mint_run_id()
+    or ("mag-load-" .. envelope.uuid_lite())
   local load_id = run_id .. "-load"
 
   state.pending_mag_load[load_id] = {
@@ -1393,7 +1487,8 @@ local function begin_mag_load(firing_id, action, args, ws)
     file       = args.file,
     run_id     = run_id,
     run_name   = graph_name,
-    session_id = sessions.current_id(),
+    session_id = session_id,
+    routing    = routing or "lead",
   }
 
   emit_as(SOURCE_NAME, "mag", {
@@ -1460,17 +1555,27 @@ submit_loaded_run = function(pending, body, error_prefix, attached)
     artifact = artifact,
   }
   if next(overlay) ~= nil then exec.params_overlay = overlay end
-  emit_as(SOURCE_NAME, "mag", exec)
-  if attached then return true end
+  if attached then
+    if pending.action ~= nil then
+      state.attached_mag_runs[pending.run_id] = {
+        firing_id = pending.firing_id,
+        session_id = pending.session_id,
+      }
+    end
+    emit_as(SOURCE_NAME, "mag", exec)
+    return true
+  end
   register_active_run(pending.run_id, actors, terminal_id,
-    pending.firing_id, pending.run_name)
+    pending.firing_id, pending.run_name, pending.session_id)
+  emit_as(SOURCE_NAME, "mag", exec)
   emit_tool_result_ok(pending.firing_id, {
     status = "executing",
     run_id = pending.run_id,
     hash = body.hash,
     engine = "mag-kernel",
-    message = "Program submitted to the MAG actor kernel. Results arrive automatically when the run " ..
-      "completes. STOP here — do not call any more tools until results arrive.",
+    message = "Program submitted to the MAG actor kernel. Use await-run with this run_id when " ..
+      "your next step depends on completion; do not poll graph-status. The normal completion " ..
+      "notification remains independent.",
   })
   return true
 end
@@ -1516,7 +1621,7 @@ local function resume_pending_load(body)
     return
   end
 
-  submit_loaded_run(pending, body, "mag execute")
+  submit_loaded_run(pending, body, "mag execute", pending.routing == "attached")
 end
 
 -- A `mag.error` reply to an in-flight load: the compiler rejected the
@@ -1532,7 +1637,14 @@ local function fail_pending_load(body)
     "compilation failed:\n" .. tostring(body.message))
 end
 
-local function mag_handler(firing_id, args)
+local function mag_handler(firing_id, args, metadata)
+  local provenance, provenance_error = resolve_invocation(metadata, "lead")
+  if not provenance then
+    emit_tool_result_err(firing_id, "mag: " .. provenance_error)
+    return
+  end
+  local session_id = provenance.session_id
+
   if type(args.file) ~= "string" or #args.file == 0 then
     emit_tool_result_err(firing_id, "mag: requires a non-empty 'file' argument")
     return
@@ -1546,11 +1658,6 @@ local function mag_handler(firing_id, args)
     return
   end
 
-  local session_id = sessions.current_id()
-  if not session_id then
-    emit_tool_result_err(firing_id, "mag: no active session")
-    return
-  end
   local config_dir = os.getenv("NEFOR_CONFIG_DIR") or "."
   local ws, ws_err = mag.init_workspace(session_id, config_dir)
   if not ws then
@@ -1593,11 +1700,13 @@ local function mag_handler(firing_id, args)
 
   -- Compile and execute both go through the mag plugin's load handshake;
   -- the mag.loaded reply resolves them (resume_pending_load).
-  begin_mag_load(firing_id, action, args, ws)
+  local routing = provenance.principal == "lead" and "lead" or "attached"
+  begin_mag_load(firing_id, action, args, ws, session_id, routing)
 end
 
 local TOOL_HANDLERS = {
   ["graph-status"]    = graph_status,
+  ["await-run"]       = await_run,
   ["terminate-graph"] = terminate_graph,
   ["write-review"]    = submit_plan,
   ["submit-plan"]     = submit_plan,
@@ -1617,6 +1726,7 @@ local function handle_tool_invoke(body)
   handler(firing_id, body.args or {}, {
     caller_id = body.caller_id,
     from = body.from,
+    invocation = body.invocation,
   })
 end
 
@@ -1654,7 +1764,9 @@ local function receive_msg(entry)
   -- lead-submitted standard run's dispatch_firing_id.
   if kind == "lead-workflow.tool.cancel" then
     if replay_window.active() then return end
+    if run_registry:detach_waiter(body.id) then return end
     mag_eval.cancel(body.id)
+    interrupt_attached_mag_by_firing(body.id)
     invalidate_pending_mag_loads(body.id)
     interrupt_run_by_dispatch_firing(body.id)
     return
@@ -1783,8 +1895,15 @@ end
 
 -- Bus subscriptions — session lifecycle.
 if nefor.bus and nefor.bus.on_event then
-  nefor.bus.on_event("sessions.session_end", function(_entry)
-    terminate_active_graph()
+  nefor.bus.on_event("sessions.session_end", function(entry)
+    local session_id
+    if type(entry) == "table" and type(entry.payload) == "string" then
+      local ok, decoded = pcall(json.decode, entry.payload)
+      if ok and type(decoded) == "table" and type(decoded.body) == "table" then
+        session_id = decoded.body.session_id
+      end
+    end
+    terminate_active_graph(session_id)
   end)
 end
 
@@ -1812,14 +1931,18 @@ local M = {
     graph_status = graph_status,
     terminate_graph = terminate_graph,
     run_web_review = run_web_review,
+    run_registry = run_registry,
+    await_run = await_run,
     reset = function()
       state.active_run_id = nil
-      state.active_runs = {}
-      state.completed_runs = {}
+      run_registry:reset()
+      state.active_runs = run_registry.active_runs
+      state.completed_runs = run_registry.completed_runs
       state.active_plan = nil
       state.gate_mode = "safe"
       state.kernel_factories = {}
       state.pending_mag_load = {}
+      state.attached_mag_runs = {}
       dependency_module_roots = {}
       mag_eval._internals.reset()
       advertised = false
@@ -1838,6 +1961,8 @@ function M.configure(opts)
   dependency_module_roots = copy_roots(roots)
   mag_eval.configure({
     dependency_module_roots = copy_roots(roots),
+    resolve_invocation = resolve_invocation,
+    mint_run_id = function() return run_registry:mint_run_id() end,
     submit_run = function(pending, body, attached)
       return submit_loaded_run(pending, body, "mag-eval", attached)
     end,
@@ -1847,6 +1972,8 @@ end
 -- Install the standard lead-run submitter even when the composition uses the
 -- module defaults and never calls configure explicitly.
 mag_eval.configure({
+  resolve_invocation = resolve_invocation,
+  mint_run_id = function() return run_registry:mint_run_id() end,
   submit_run = function(pending, body, attached)
     return submit_loaded_run(pending, body, "mag-eval", attached)
   end,

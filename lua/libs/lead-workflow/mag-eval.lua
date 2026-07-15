@@ -62,6 +62,8 @@ local function validate_roots(roots)
 end
 
 local submit_run
+local mint_run_id
+local resolve_invocation
 
 function M.configure(opts)
   if opts == nil then opts = {} end
@@ -75,7 +77,15 @@ function M.configure(opts)
   if opts.submit_run ~= nil and type(opts.submit_run) ~= "function" then
     error("lead-workflow mag-eval: submit_run must be a function", 2)
   end
+  if opts.mint_run_id ~= nil and type(opts.mint_run_id) ~= "function" then
+    error("lead-workflow mag-eval: mint_run_id must be a function", 2)
+  end
+  if opts.resolve_invocation ~= nil and type(opts.resolve_invocation) ~= "function" then
+    error("lead-workflow mag-eval: resolve_invocation must be a function", 2)
+  end
   submit_run = opts.submit_run
+  mint_run_id = opts.mint_run_id or mint_run_id
+  resolve_invocation = opts.resolve_invocation or resolve_invocation
 end
 
 local function module_roots_for(ws)
@@ -104,10 +114,11 @@ M.schema = {
     "work (servers, review UIs, watch loops) needs no backgrounding, no " ..
     "`&`, no polling; run it in the foreground. " ..
     "nefor.shell.command-with-options opts into a wall-clock bound. " ..
-    "As the lead, the call acks immediately with the run name and the " ..
-    "terminal output arrives as a run-completion notification, like any " ..
-    "dispatched graph; as a graph agent, the output returns as the tool " ..
-    "result. Multi-step or multi-file work runs as a .mag program via the " ..
+    "As the lead, the call acknowledges immediately with a stable run_id; " ..
+    "call await-run with that handle when your next step depends on terminal " ..
+    "output. The normal run-completion notification remains independent. " ..
+    "As a graph agent, the output returns as the attached tool result. " ..
+    "Multi-step or multi-file work runs as a .mag program via the " ..
     "mag tool instead.",
   parameters  = {
     type = "object",
@@ -122,11 +133,8 @@ M.schema = {
   },
 }
 
-local function now_ms()
-  if nefor.engine and type(nefor.engine.now) == "function" then
-    return nefor.engine.now()
-  end
-  return os.time() * 1000
+local function opaque_suffix()
+  return envelope.uuid_lite()
 end
 
 local function tool_ok(firing_id, output)
@@ -189,11 +197,19 @@ function M.handle(firing_id, args, metadata)
     tool_err(firing_id, "mag-eval: requires a non-empty 'expr' string")
     return
   end
-  local session_id = sessions.current_id()
-  if not session_id then
-    tool_err(firing_id, "mag-eval: no active session")
+  local provenance, provenance_error
+  if type(resolve_invocation) == "function" then
+    provenance, provenance_error = resolve_invocation(metadata)
+  else
+    local session_id = sessions.current_id()
+    if session_id then provenance = { session_id = session_id, principal = "subagent", direct = true } end
+    provenance_error = "no active session"
+  end
+  if not provenance then
+    tool_err(firing_id, "mag-eval: " .. tostring(provenance_error))
     return
   end
+  local session_id = provenance.session_id
   local config_dir = os.getenv("NEFOR_CONFIG_DIR") or "."
   local ws, ws_err = mag.init_workspace(session_id, config_dir)
   if not ws then
@@ -224,19 +240,30 @@ function M.handle(firing_id, args, metadata)
   fh:write(source)
   fh:close()
 
-  -- The gate-minted firing id is source correlation only. Classification uses
-  -- the preserved outer capability id; direct/internal calls fall back to the
-  -- firing id because no rewrite occurred.
-  local caller_id = type(metadata) == "table" and metadata.caller_id or nil
-  if type(caller_id) ~= "string" then caller_id = firing_id end
-  local routing = "attached"
-  local al_ok, al = pcall(require, "agentic-loop")
-  if al_ok and type(al.lead_scoped_id) == "function"
-      and al.lead_scoped_id(caller_id) == true then
-    routing = "lead"
+  local routing
+  if provenance.direct then
+    local caller_id = type(metadata) == "table" and metadata.caller_id or nil
+    if type(caller_id) ~= "string" then caller_id = firing_id end
+    routing = "attached"
+    local al_ok, al = pcall(require, "agentic-loop")
+    if al_ok and type(al.lead_scoped_id) == "function"
+        and al.lead_scoped_id(caller_id) == true then
+      routing = "lead"
+    end
+  else
+    routing = provenance.principal == "lead" and "lead" or "attached"
   end
 
-  local run_id = "mag-" .. run_name .. "-" .. tostring(now_ms())
+  local run_id
+  if routing == "lead" then
+    if type(mint_run_id) ~= "function" then
+      tool_err(firing_id, "mag-eval: lead run-id allocator is unavailable")
+      return
+    end
+    run_id = mint_run_id()
+  else
+    run_id = "mag-attached-" .. opaque_suffix()
+  end
   local load_id = run_id .. "-load"
   state.pending_loads[load_id] = {
     firing_id  = firing_id,

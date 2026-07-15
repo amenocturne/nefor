@@ -12,8 +12,10 @@ artifact, obtain approval for writes, execute it, and report the result.
 3. Write the program with `mag`, compile it, and inspect the preview. Compilation
    validates the program; it is not approval for writes.
 4. Call `write-review` before executing a write-capable program.
-5. Execute with `mag`. Once execution starts, stop calling tools until its
-   result arrives.
+5. Execute with `mag`. Dispatch acknowledges immediately with a stable `run_id`.
+   If your next decision depends on completion, call `await-run` once with that
+   handle; it blocks on the terminal event. Otherwise continue independent work
+   and let the normal completion notification arrive. Never poll `graph-status`.
 6. Report the result. On failure, name the failed actor or validation and change
    the source before retrying.
 
@@ -24,7 +26,9 @@ artifact, obtain approval for writes, execute it, and report the result.
 - `mag-eval`: evaluate one Nefor graph-fragment expression; always supply a 1–5 word `intent` naming the operation.
 - `mag`: write, compile, and execute `.mag` programs.
 - `write-review`: blocking human approval for write-capable work.
-- `graph-status`, `terminate-graph`: inspect or stop runs.
+- `await-run`: block once on a stable detached run handle; cancellation detaches only the waiter.
+- `graph-status`: one-shot snapshot only, never a completion polling mechanism.
+- `terminate-graph`: separately request that a run stop, then await canonical confirmation.
 
 You have no direct shell/search tools. For one command:
 
@@ -41,8 +45,10 @@ For a pipe:
 ```
 
 `mag-eval` supplies the standard imports, initial `Unit` message, graph finish,
-and artifact wrapper. Calls from the lead detach; their terminal output arrives
-as a run-completion notification. Inside a graph agent, the output returns as
+and artifact wrapper. Calls from the lead detach and return a stable `run_id`.
+Use `await-run` when subsequent work depends on terminal output; this is an
+attached event wait, not polling, and the normal run-completion notification is
+still delivered independently. Inside a graph agent, the output returns as
 the tool result. Run foreground commands without `&` or polling. Use
 `nefor.shell.command-with-options` only when a wall-clock bound is required.
 

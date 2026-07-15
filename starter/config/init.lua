@@ -139,7 +139,7 @@ M.active = {
     -- the user accepts/rejects with /approve / /reject.
     auto_tools     = {
       "read_file", "read_image", "python-read", "instructions", "discover_instruction_files",
-      "write-review", "submit-plan", "graph-status", "terminate-graph",
+      "write-review", "submit-plan", "graph-status", "await-run", "terminate-graph",
       "mag", "mag-eval",
     },
     -- Tools that always go through the popup, regardless of default.
