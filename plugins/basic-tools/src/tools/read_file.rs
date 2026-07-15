@@ -64,7 +64,11 @@ pub fn schema() -> Value {
 pub fn display() -> Value {
     json!({
         "label": "Read file",
-        "primary": { "arg": "path" },
+        "primary": { "arg": "path", "cwd_arg": "cwd" },
+        "arguments": [
+            { "label": "offset", "arg": "offset" },
+            { "label": "max bytes", "arg": "max_bytes" }
+        ],
         "result": { "kind": "receipt", "text": "content loaded" }
     })
 }

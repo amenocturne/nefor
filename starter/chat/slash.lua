@@ -27,7 +27,7 @@ M.COMMANDS = {
   { name = "yolo",    aliases = {},          hint = "approve all tool requests (DANGEROUS)",  takes_args = false },
   { name = "approve", aliases = {},          hint = "approve the pending plan (optional reason)", takes_args = true },
   { name = "reject",  aliases = {},          hint = "reject the pending plan with a reason", takes_args = true },
-  { name = "debug", aliases = {}, hint = "toggle raw tool diagnostics", takes_args = true, arg_completions = { { name = "on", hint = "show raw tool input/output" }, { name = "off", hint = "show semantic tool activity" } } },
+  { name = "raw",     aliases = {},          hint = "reveal one tool receipt by id",          takes_args = true },
 }
 
 local function command_matches(cmd, q)

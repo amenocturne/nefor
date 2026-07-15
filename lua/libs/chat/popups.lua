@@ -27,6 +27,8 @@ local HELP_BODY = [[Keys:
   Tab          focus sidebar ↔ prompt
   (sidebar)    ↑/↓ move · Space view · Enter fold · Esc back
   Ctrl+O       expand/collapse tool calls + reasoning
+  Ctrl+R       reveal raw for latest expanded tool
+  /raw <id>    reveal raw for a specific tool receipt
   ?            this help (when input empty)
   Up / Down    scroll transcript by one line
   PgUp / PgDn  scroll transcript by one page

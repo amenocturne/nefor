@@ -48,7 +48,7 @@ pub fn schema() -> Value {
 pub fn display() -> Value {
     json!({
         "label": "Write file",
-        "primary": { "arg": "path" },
+        "primary": { "arg": "path", "cwd_arg": "cwd" },
         "result": { "kind": "receipt", "text": "file written" }
     })
 }

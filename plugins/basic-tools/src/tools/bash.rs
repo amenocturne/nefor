@@ -72,6 +72,10 @@ pub fn display() -> Value {
     json!({
         "label": "Run command",
         "primary": { "arg": "command" },
+        "arguments": [
+            { "label": "in", "arg": "cwd" },
+            { "label": "timeout ms", "arg": "timeout_ms" }
+        ],
         "result": { "kind": "content" }
     })
 }

@@ -406,7 +406,7 @@ local function base_schemas()
     },
     {
       name = "instructions",
-      display = { label = "Load instructions", result = { kind = "receipt", text = "instructions loaded" } },
+      display = { label = "Load instructions", primary = { arg = "name" }, result = { kind = "receipt", text = "instructions loaded" } },
       description =
         "Read one or more instruction files by name. When the " ..
         "system prompt says to read instructions (e.g. 'instruction:dev-mode.md'), " ..
@@ -428,7 +428,7 @@ local function base_schemas()
     },
     {
       name = "discover_instruction_files",
-      display = { label = "Discover instructions", primary = { arg = "path" }, result = { kind = "content" } },
+      display = { label = "Discover instructions", primary = { arg = "path" }, arguments = { { label = "scope", arg = "scope" }, { label = "unread only", arg = "unread_only" } }, result = { kind = "content" } },
       description =
         "List AGENTS.md and CLAUDE.md instruction files available near " ..
         "a path. Does not read file contents. Use ordinary read_file on " ..
@@ -456,7 +456,7 @@ local function base_schemas()
     },
     {
       name = "skill",
-      display = { label = "Load skill", result = { kind = "receipt", text = "skill loaded" } },
+      display = { label = "Load skill", primary = { arg = "name" }, result = { kind = "receipt", text = "skill loaded" } },
       description =
         "Load a workflow skill by name from the config's skills directory " ..
         "(<config>/skills/<name>/skill.md). Read the skill BEFORE acting on a " ..

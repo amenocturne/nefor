@@ -159,7 +159,22 @@ mod tests {
     }
 
     #[test]
-    fn every_descriptor_has_a_display_contract() {
+    fn actual_advertised_inventory_has_complete_display_coverage() {
+        let expected = [
+            read_file::NAME,
+            read_image::NAME,
+            write_file::NAME,
+            edit_file::NAME,
+            bash::NAME,
+            search_text::NAME,
+        ]
+        .into_iter()
+        .collect::<HashSet<_>>();
+        let actual = TOOLS.iter().map(|tool| tool.name).collect::<HashSet<_>>();
+        assert_eq!(
+            actual, expected,
+            "update semantic display coverage when the active registry changes"
+        );
         for descriptor in TOOLS {
             let display = (descriptor.display)();
             assert!(display.get("label").is_some(), "{}", descriptor.name);

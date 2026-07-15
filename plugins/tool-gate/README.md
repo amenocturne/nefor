@@ -48,4 +48,11 @@ before a request reaches the user.
 
 ## Tool display contract
 
-Every advertised tool includes a declarative display contract beside its schema. It declares a label (literal or selected argument), optional primary/argument fields, and whether successful results render as content or a receipt. The gate rejects missing or malformed contracts. Ctrl+O uses this semantic projection; /debug, /debug on, and /debug off switch expanded tools between semantic and raw protocol input/output without changing persisted or model-facing data.
+Every advertised tool includes a declarative display contract beside its schema.
+It declares a label (literal or selected argument), optional primary/argument
+fields, and whether successful results render as content or a receipt. The gate
+rejects missing or malformed contracts. Ctrl+O expands tool receipts using this
+semantic projection. Press Ctrl+R to toggle raw input/output for the latest
+expanded tool receipt, or use `/raw <tool-call-id>` to toggle a specific entry.
+Raw reveal is presentation-only and does not change persisted or model-facing
+data.

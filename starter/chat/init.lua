@@ -252,7 +252,7 @@ local function initial_state()
     supports_usage   = {},
     usage            = {},
     expanded_details = false,
-    debug_mode      = false,
+    raw_tool_id     = nil,
     tool_displays   = {},
     completion       = nil,
     last_esc_ms      = nil,

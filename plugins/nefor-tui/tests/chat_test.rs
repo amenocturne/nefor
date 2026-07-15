@@ -1634,25 +1634,28 @@ fn statusline_shows_model_with_reasoning_effort() {
 
 #[test]
 fn ctrl_o_toggles_expanded_details() {
-    // Raw protocol assertions live behind debug mode.
-
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "input.submit", "value": "/debug on" }),
-    );
     let _ = render_str(&mut engine);
 
-    // Seed a tool call (running — no output yet) so we have a tool entry
-    // to compare collapsed/expanded against.
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "tool.register", "tools": [{
+            "name": "bash",
+            "display": {
+                "label": "Run command",
+                "primary": { "arg": "command" },
+                "result": { "kind": "content" }
+            }
+        }] }),
+    );
     dispatch_event(
         &mut engine,
         json!({
             "kind": "chat.tool.start",
             "id": "t1",
-            "name": "Bash",
-            "input": "ls -la /tmp",
+            "name": "bash",
+            "input": { "command": "ls -la /tmp" },
         }),
     );
     dispatch_event(
@@ -1660,59 +1663,60 @@ fn ctrl_o_toggles_expanded_details() {
         json!({
             "kind": "chat.tool.end",
             "id": "t1",
-            "output": "drwxr-xr-x 4 root  root  128 May  2 12:00 .",
+            "output": "SECRET RAW OUTPUT",
         }),
     );
 
-    // Collapsed: header glyph is `▸`, no `input:` / `output:` blocks.
     let out = render_str(&mut engine);
     assert!(
-        out.contains('▸') && out.contains("Bash"),
+        out.contains('▸') && out.contains("bash · ls -la /tmp"),
         "collapsed tool header missing: {out:?}"
     );
-    assert!(
-        !out.contains("output:"),
-        "collapsed view should not show 'output:' label: {out:?}"
-    );
+    assert!(!out.contains("SECRET RAW OUTPUT"), "{out:?}");
 
-    // Toggle to expanded via Ctrl+O.
     engine.handle_key(key("ctrl_o")).expect("ctrl_o");
-    let out = render_str(&mut engine);
-    assert!(
-        out.contains('▼'),
-        "expanded glyph (▼) missing after Ctrl+O: {out:?}"
-    );
-    assert!(
-        out.contains("output:"),
-        "expanded view missing 'output:' label: {out:?}"
-    );
-
-    // Toggle back: collapsed again.
-    engine.handle_key(key("ctrl_o")).expect("ctrl_o again");
-    let out = render_str(&mut engine);
-    assert!(
-        out.contains('▸') && !out.contains("output:"),
-        "second Ctrl+O should collapse: {out:?}"
-    );
-
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "input.submit", "value": "/debug off" }),
-    );
-    engine.handle_key(key("ctrl_o")).expect("semantic expand");
     let semantic = render_str(&mut engine);
+    assert!(semantic.contains("▼ bash · ls -la /tmp"), "{semantic:?}");
     assert!(
-        semantic.contains("completed") && !semantic.contains("output:"),
+        semantic.contains("completed") && semantic.contains("hidden"),
         "{semantic:?}"
     );
+    assert!(semantic.contains("/raw t1 to reveal"), "{semantic:?}");
+    assert!(!semantic.contains("SECRET RAW OUTPUT"), "{semantic:?}");
+
+    engine.handle_key(key("ctrl_r")).expect("ctrl_r");
+    let raw = render_str(&mut engine);
+    assert!(raw.contains("SECRET RAW OUTPUT"), "{raw:?}");
+    assert!(raw.contains("raw: visible"), "{raw:?}");
+
+    engine.handle_key(key("ctrl_r")).expect("ctrl_r again");
+    let hidden = render_str(&mut engine);
+    assert!(!hidden.contains("SECRET RAW OUTPUT"), "{hidden:?}");
+
     dispatch_event(
         &mut engine,
-        json!({ "kind": "input.submit", "value": "/debug" }),
+        json!({ "kind": "input.submit", "value": "/raw t1" }),
     );
-    let toggled = render_str(&mut engine);
+    let selected_raw = render_str(&mut engine);
     assert!(
-        toggled.contains("output:"),
-        "bare /debug should toggle raw rendering: {toggled:?}"
+        selected_raw.contains("SECRET RAW OUTPUT"),
+        "{selected_raw:?}"
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/raw t1" }),
+    );
+    let selected_hidden = render_str(&mut engine);
+    assert!(
+        !selected_hidden.contains("SECRET RAW OUTPUT"),
+        "{selected_hidden:?}"
+    );
+
+    engine.handle_key(key("ctrl_o")).expect("ctrl_o again");
+    let collapsed = render_str(&mut engine);
+    assert!(
+        collapsed.contains('▸') && !collapsed.contains("raw:"),
+        "{collapsed:?}"
     );
 }
 
@@ -1748,6 +1752,10 @@ fn denied_tool_call_renders_error_state_not_empty_output() {
             "error": true,
         }),
     );
+
+    // Failure diagnostics are visible even while the entry is collapsed.
+    let collapsed = render_str(&mut engine);
+    assert!(collapsed.contains("denied by user"), "{collapsed:?}");
 
     // Expanded view: clearly labelled as `error:` with the message.
     engine.handle_key(key("ctrl_o")).expect("ctrl_o");
@@ -2037,14 +2045,8 @@ fn ctrl_b_after_typing_still_single_press_toggles() {
 
 #[test]
 fn tool_expanded_pretty_prints_input_object() {
-    // Raw protocol assertions live behind debug mode.
-
     let mut engine = Engine::new(120, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "input.submit", "value": "/debug on" }),
-    );
     let _ = render_str(&mut engine);
 
     // Seed a tool call whose `input` is a JSON object (the wire shape
@@ -2061,6 +2063,7 @@ fn tool_expanded_pretty_prints_input_object() {
         }),
     );
     engine.handle_key(key("ctrl_o")).expect("ctrl_o expand");
+    engine.handle_key(key("ctrl_r")).expect("ctrl_r reveal");
     let out = render_str(&mut engine);
     assert!(
         out.contains("file_path"),
@@ -7623,14 +7626,8 @@ fn graph_result_long_output_path_wraps_fully() {
 /// transcript width in the unfolded tool entry — no truncation.
 #[test]
 fn tool_result_long_single_line_wraps_fully() {
-    // Raw protocol assertions live behind debug mode.
-
     let mut engine = Engine::new(80, 40).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "input.submit", "value": "/debug on" }),
-    );
     let _ = render_str(&mut engine);
 
     let long = format!("https://example.com/api/v1/resource/{}", "x".repeat(160));
@@ -7643,6 +7640,7 @@ fn tool_result_long_single_line_wraps_fully() {
         json!({ "kind": "chat.tool.end", "id": "t1", "output": long.clone() }),
     );
     engine.handle_key(key("ctrl_o")).expect("ctrl_o");
+    engine.handle_key(key("ctrl_r")).expect("ctrl_r");
     let _ = render_str(&mut engine);
 
     // Reconstruct just the transcript (left) column — the sidebar lives to
@@ -7670,14 +7668,8 @@ fn tool_result_long_single_line_wraps_fully() {
 /// input is visible somewhere in the unfolded entry.
 #[test]
 fn tool_input_long_single_line_wraps_fully() {
-    // Raw protocol assertions live behind debug mode.
-
     let mut engine = Engine::new(80, 40).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "input.submit", "value": "/debug on" }),
-    );
     let _ = render_str(&mut engine);
 
     let expr = format!("(pipeline{})", "-step".repeat(40));
@@ -7691,6 +7683,7 @@ fn tool_input_long_single_line_wraps_fully() {
         }),
     );
     engine.handle_key(key("ctrl_o")).expect("ctrl_o");
+    engine.handle_key(key("ctrl_r")).expect("ctrl_r");
     let _ = render_str(&mut engine);
 
     // Reconstruct just the transcript (left) column — the sidebar lives to
@@ -7771,6 +7764,74 @@ fn slash_new_collapses_stale_scroll_region() {
 }
 
 #[test]
+fn tool_display_projection_preserves_entry_payload_identity() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "tool.register", "tools": [{
+            "name": "loader",
+            "display": {
+                "label": "Load",
+                "primary": { "arg": "path", "cwd_arg": "cwd" },
+                "result": { "kind": "receipt", "text": "loaded" }
+            }
+        }] }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.tool.start", "id": "identity-id", "name": "loader", "input": {
+            "path": "secret.txt", "cwd": "/exact/root", "token": "EXACT INPUT TOKEN"
+        } }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "chat.tool.end", "id": "identity-id", "output": {
+            "body": "EXACT MODEL RESULT", "count": 2
+        } }),
+    );
+
+    engine.handle_key(key("ctrl_o")).expect("expand");
+    let semantic = render_snapshot(&mut engine);
+    assert!(
+        semantic.contains("loader · secret.txt (cwd: /exact/root)"),
+        "{semantic}"
+    );
+    assert!(!semantic.contains("EXACT INPUT TOKEN"), "{semantic}");
+    assert!(!semantic.contains("EXACT MODEL RESULT"), "{semantic}");
+
+    let state = engine.state_table().expect("state");
+    let entries: mlua::Table = state.get("entries").expect("entries");
+    let entry: mlua::Table = entries.get(entries.raw_len()).expect("tool entry");
+    let raw_input: mlua::Table = entry.get("raw_input").expect("raw input");
+    let input_table: mlua::Table = entry.get("input_table").expect("input table");
+    let output: mlua::Table = entry.get("output").expect("output");
+    assert_eq!(
+        raw_input.to_pointer(),
+        input_table.to_pointer(),
+        "transcript must retain the exact invocation table"
+    );
+    assert_eq!(raw_input.get::<String>("path").unwrap(), "secret.txt");
+    assert_eq!(raw_input.get::<String>("cwd").unwrap(), "/exact/root");
+    assert_eq!(
+        raw_input.get::<String>("token").unwrap(),
+        "EXACT INPUT TOKEN"
+    );
+    assert_eq!(output.get::<String>("body").unwrap(), "EXACT MODEL RESULT");
+    assert_eq!(output.get::<i64>("count").unwrap(), 2);
+    drop(state);
+
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/raw identity-id" }),
+    );
+    let raw = render_snapshot(&mut engine);
+    assert!(raw.contains("EXACT INPUT TOKEN"), "{raw}");
+    assert!(raw.contains("EXACT MODEL RESULT"), "{raw}");
+}
+
+#[test]
 fn personal_override_behavior_uses_shared_tui_mechanisms() {
     let Some(personal_config) = std::env::var_os("NEFOR_PERSONAL_CONFIG_DIR") else {
         return;
@@ -7810,40 +7871,42 @@ fn personal_override_behavior_uses_shared_tui_mechanisms() {
         .expect("load personal chat");
     let _ = render_str(&mut engine);
 
-    let state_bool =
-        |engine: &Engine, key: &str| -> bool { engine.state_table().unwrap().get(key).unwrap() };
+    let raw_tool_id = |engine: &Engine| -> Option<String> {
+        engine.state_table().unwrap().get("raw_tool_id").unwrap()
+    };
     let popup_body = |engine: &Engine| -> Option<String> {
         let state = engine.state_table().unwrap();
         let popup: Option<mlua::Table> = state.get("popup").unwrap();
         popup.and_then(|p| p.get("body").ok())
     };
 
-    // /debug supports explicit and toggle forms; invalid input reports usage
-    // and leaves the prior mode untouched.
+    // Personal config must preserve the shared per-entry raw receipt path.
+    // The command is exercised against a real entry so both state and body
+    // visibility are meaningful when this optional integration is enabled.
     dispatch_event(
         &mut engine,
-        json!({ "kind": "input.submit", "value": "/debug on" }),
-    );
-    assert!(state_bool(&engine, "debug_mode"));
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "input.submit", "value": "/debug off" }),
-    );
-    assert!(!state_bool(&engine, "debug_mode"));
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "input.submit", "value": "/debug maybe" }),
-    );
-    assert!(!state_bool(&engine, "debug_mode"));
-    assert_eq!(
-        popup_body(&engine).as_deref(),
-        Some("Usage: /debug [on|off]")
+        json!({ "kind": "chat.tool.start", "id": "personal-raw-id", "name": "personal_unknown", "input": { "token": "PERSONAL SECRET INPUT" } }),
     );
     dispatch_event(
         &mut engine,
-        json!({ "kind": "input.submit", "value": "/debug" }),
+        json!({ "kind": "chat.tool.end", "id": "personal-raw-id", "output": "PERSONAL SECRET OUTPUT" }),
     );
-    assert!(state_bool(&engine, "debug_mode"));
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/raw personal-raw-id" }),
+    );
+    assert_eq!(raw_tool_id(&engine).as_deref(), Some("personal-raw-id"));
+    let revealed = render_snapshot(&mut engine);
+    assert!(revealed.contains("PERSONAL SECRET INPUT"), "{revealed}");
+    assert!(revealed.contains("PERSONAL SECRET OUTPUT"), "{revealed}");
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.submit", "value": "/raw personal-raw-id" }),
+    );
+    assert_eq!(raw_tool_id(&engine), None);
+    let hidden = render_snapshot(&mut engine);
+    assert!(!hidden.contains("PERSONAL SECRET INPUT"), "{hidden}");
+    assert!(!hidden.contains("PERSONAL SECRET OUTPUT"), "{hidden}");
 
     // /chatlog has independent on/off/toggle behavior and invalid args do
     // not accidentally toggle the module-local logger.
@@ -7888,28 +7951,27 @@ fn personal_override_behavior_uses_shared_tui_mechanisms() {
     );
     drop(state);
 
-    // Public prompt behavior exposes on/off candidates for both commands.
-    for command in ["/debug ", "/chatlog "] {
-        dispatch_event(
-            &mut engine,
-            json!({ "kind": "input.changed", "value": command }),
-        );
-        let state = engine.state_table().unwrap();
-        let completion: mlua::Table = state.get("completion").unwrap();
-        let matches: mlua::Table = completion.get("matches").unwrap();
-        let names = matches
-            .sequence_values::<mlua::Table>()
-            .map(|entry| entry.unwrap().get::<String>("name").unwrap())
-            .collect::<Vec<_>>();
-        assert!(
-            names.iter().any(|name| name.ends_with(" on")),
-            "{command}: {names:?}"
-        );
-        assert!(
-            names.iter().any(|name| name.ends_with(" off")),
-            "{command}: {names:?}"
-        );
-    }
+    // Public prompt behavior exposes on/off candidates for chat logging.
+    let command = "/chatlog ";
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "input.changed", "value": command }),
+    );
+    let state = engine.state_table().unwrap();
+    let completion: mlua::Table = state.get("completion").unwrap();
+    let matches: mlua::Table = completion.get("matches").unwrap();
+    let names = matches
+        .sequence_values::<mlua::Table>()
+        .map(|entry| entry.unwrap().get::<String>("name").unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        names.iter().any(|name| name.ends_with(" on")),
+        "{command}: {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name.ends_with(" off")),
+        "{command}: {names:?}"
+    );
 
     // Personal-only commands still execute through the real reducer.
     // Clear the completion popup left by the candidate assertions first;
@@ -8006,15 +8068,11 @@ fn personal_override_behavior_uses_shared_tui_mechanisms() {
     engine
         .handle_key(key("ctrl_o"))
         .expect("expand semantic tools");
-    dispatch_event(
-        &mut engine,
-        json!({ "kind": "input.submit", "value": "/debug off" }),
-    );
     let semantic = render_snapshot(&mut engine);
-    assert!(semantic.contains("Load current(secret.txt)"), "{semantic}");
+    assert!(semantic.contains("loader · secret.txt"), "{semantic}");
     assert!(semantic.contains("content loaded"), "{semantic}");
     assert!(!semantic.contains("SECRET SUCCESS PAYLOAD"), "{semantic}");
-    assert!(semantic.contains("VISIBLE CONTENT RESULT"), "{semantic}");
+    assert!(!semantic.contains("VISIBLE CONTENT RESULT"), "{semantic}");
     assert!(semantic.contains("VISIBLE ERROR RESULT"), "{semantic}");
     assert!(
         semantic.contains("removed") && !semantic.contains("Old removed label"),
@@ -8024,8 +8082,9 @@ fn personal_override_behavior_uses_shared_tui_mechanisms() {
 
     dispatch_event(
         &mut engine,
-        json!({ "kind": "input.submit", "value": "/debug on" }),
+        json!({ "kind": "input.submit", "value": "/raw load-id" }),
     );
+    assert_eq!(raw_tool_id(&engine).as_deref(), Some("load-id"));
     let raw = render_snapshot(&mut engine);
     assert!(raw.contains("SECRET SUCCESS PAYLOAD"), "{raw}");
     assert!(raw.contains("secret.txt"), "{raw}");

@@ -52,7 +52,7 @@ pub fn schema() -> Value {
 pub fn display() -> Value {
     json!({
         "label": "Read image",
-        "primary": { "arg": "path" },
+        "primary": { "arg": "path", "cwd_arg": "cwd" },
         "result": { "kind": "receipt", "text": "image loaded" }
     })
 }

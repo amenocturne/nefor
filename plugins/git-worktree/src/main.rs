@@ -146,13 +146,31 @@ fn tools_advertise_body(gate: &str) -> Map<String, Value> {
                 "name": CREATE_TOOL,
                 "description": "Create a fresh Git worktree; existing paths or branches are errors.",
                 "parameters": create_schema(),
-                "context": {}
+                "context": {},
+                "display": {
+                    "label": "Create worktree",
+                    "primary": { "arg": "path" },
+                    "arguments": [
+                        { "label": "branch", "arg": "branch" },
+                        { "label": "base", "arg": "base" }
+                    ],
+                    "result": { "kind": "receipt", "text": "worktree created" }
+                }
             },
             {
                 "name": OPEN_TOOL,
                 "description": "Open and validate an explicitly named existing Git worktree.",
                 "parameters": open_schema(),
-                "context": {}
+                "context": {},
+                "display": {
+                    "label": "Open worktree",
+                    "primary": { "arg": "path" },
+                    "arguments": [
+                        { "label": "branch", "arg": "branch" },
+                        { "label": "repository", "arg": "repository" }
+                    ],
+                    "result": { "kind": "receipt", "text": "worktree opened" }
+                }
             }
         ]
     }))
@@ -229,6 +247,11 @@ mod tests {
             tools[1].get("name").and_then(Value::as_str),
             Some(OPEN_TOOL)
         );
+        for tool in tools {
+            assert!(tool.pointer("/display/label").is_some());
+            assert!(tool.pointer("/display/primary/arg").is_some());
+            assert!(tool.pointer("/display/result/kind").is_some());
+        }
     }
 
     #[test]

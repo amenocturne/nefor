@@ -77,11 +77,16 @@ do
     return call.body.kind == "tool-gate.tools.advertise"
   end)
   assert_true(advertised ~= nil, "lead workflow advertises its tool schemas")
-  local mag_schema
+  local mag_schema, mag_eval_schema
   for _, schema in ipairs(advertised.body.tools or {}) do
+    assert_true(type(schema.display) == "table", schema.name .. " has display metadata")
     if schema.name == "mag" then mag_schema = schema end
+    if schema.name == "mag-eval" then mag_eval_schema = schema end
   end
   assert_true(mag_schema ~= nil, "the MAG tool schema is advertised")
+  assert_true(mag_eval_schema ~= nil, "the mag-eval tool schema is advertised")
+  assert_eq(mag_eval_schema.display.label, "mag-eval", "mag-eval display keeps stable tool identity")
+  assert_eq(mag_eval_schema.display.primary.arg, "intent", "mag-eval display uses exact intent")
   assert_true(string.find(mag_schema.description, "lib/patterns.md", 1, true) ~= nil,
     "the MAG schema points to the injected canonical patterns")
   assert_true(string.find(mag_schema.description, "lib/nefor/*.mag", 1, true) == nil,

@@ -258,16 +258,28 @@ local function handle_input_submit(msg, state)
         body = { kind = "tool-gate.set_mode", mode = cmd } },
     }
   end
-  if cmd == "debug" then
-    local arg = args and args:lower() or nil
-    local enabled
-    if arg == nil then enabled = not state.debug_mode
-    elseif arg == "on" then enabled = true
-    elseif arg == "off" then enabled = false
-    else
-      return shallow_merge(state, { input_value = "", completion = NIL_SENTINEL, popup = { variant = "warning", title = "/debug", body = "Usage: /debug [on|off]" } }), {}
+  if cmd == "raw" then
+    local requested = args
+    if type(requested) ~= "string" or requested == "" then
+      return shallow_merge(state, {
+        input_value = "", completion = NIL_SENTINEL,
+        popup = { variant = "warning", title = "/raw", body = "Usage: /raw <tool-call-id>" },
+      }), {}
     end
-    return shallow_merge(state, { input_value = "", completion = NIL_SENTINEL, debug_mode = enabled }), {}
+    for _, entry in ipairs(state.entries or {}) do
+      if entry.kind == "tool_call" and entry.id == requested then
+        height_cache.invalidate_all()
+        return shallow_merge(state, {
+          input_value = "", completion = NIL_SENTINEL,
+          expanded_details = true,
+          raw_tool_id = state.raw_tool_id == requested and NIL_SENTINEL or requested,
+        }), {}
+      end
+    end
+    return shallow_merge(state, {
+      input_value = "", completion = NIL_SENTINEL,
+      popup = { variant = "warning", title = "/raw", body = "No tool call with id `" .. requested .. "`" },
+    }), {}
   end
   if cmd == "login" or cmd == "logout" then
     if args and #args > 0 then
@@ -628,7 +640,25 @@ local function handle_toggle_expand(_msg, state)
     tui.virtual_scroll_invalidate("chat")
   end
   height_cache.invalidate_all()
-  return shallow_merge(state, { expanded_details = not state.expanded_details }), {}
+  local expanded = not state.expanded_details
+  return shallow_merge(state, {
+    expanded_details = expanded,
+    raw_tool_id = expanded and state.raw_tool_id or NIL_SENTINEL,
+  }), {}
+end
+
+local function handle_toggle_tool_raw(_msg, state)
+  if not state.expanded_details then return state, {} end
+  local entries = state.entries or {}
+  for i = #entries, 1, -1 do
+    local entry = entries[i]
+    if entry.kind == "tool_call" then
+      height_cache.invalidate_all()
+      local raw_tool_id = state.raw_tool_id == entry.id and NIL_SENTINEL or entry.id
+      return shallow_merge(state, { raw_tool_id = raw_tool_id }), {}
+    end
+  end
+  return state, {}
 end
 
 local function handle_help_key(_msg, state)
@@ -978,8 +1008,12 @@ local function handle_tool_start(msg, state)
   if type(msg.input) == "string" then input_str = msg.input
   elseif type(msg.input) == "table" then input_str = "(object)"
   else input_str = "" end
+  local raw_input = msg.input
   local contract = (state.tool_displays or {})[msg.name]
-  return transcript.push_entry(state, Entry.tool_call(msg.id or "", msg.name or "?", input_str, type(msg.input) == "table" and msg.input or nil, contract)), {}
+  return transcript.push_entry(state, Entry.tool_call(
+    msg.id or "", msg.name or "?", input_str,
+    type(msg.input) == "table" and msg.input or nil,
+    contract, raw_input)), {}
 end
 
 local function handle_tool_register(msg, state)
@@ -1456,6 +1490,7 @@ local handlers = {
   ["key.tab"]                     = handle_focus_cycle,
   ["key.shift_tab"]               = handle_focus_cycle,
   ["key.ctrl_o"]                  = handle_toggle_expand,
+  ["key.ctrl_r"]                  = handle_toggle_tool_raw,
   ["key.?"]                       = handle_help_key,
   ["key.shift_?"]                 = handle_help_key,
   ["key.escape"]                  = handle_escape,

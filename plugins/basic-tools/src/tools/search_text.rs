@@ -86,6 +86,12 @@ pub fn display() -> Value {
     json!({
         "label": "Search text",
         "primary": { "arg": "pattern" },
+        "arguments": [
+            { "label": "in", "arg": "path", "cwd_arg": "cwd", "default": "." },
+            { "label": "type", "arg": "file_type" },
+            { "label": "glob", "arg": "glob" },
+            { "label": "limit", "arg": "max_results" }
+        ],
         "result": { "kind": "content" }
     })
 }

@@ -357,25 +357,24 @@ fn validate_display_contract(display: &Value) -> Result<(), String> {
     let valid_selector = |value: &Value| {
         value.as_str().is_some_and(|s| !s.is_empty())
             || value.as_object().is_some_and(|o| {
-                o.len() == 1
-                    && o.get("arg")
-                        .and_then(Value::as_str)
-                        .is_some_and(|s| !s.is_empty())
+                o.get("arg")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty())
+                    && o.keys()
+                        .all(|key| matches!(key.as_str(), "arg" | "cwd_arg" | "default"))
+                    && o.get("cwd_arg")
+                        .is_none_or(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+                    && o.get("default").is_none_or(Value::is_string)
             })
     };
     if !object.get("label").is_some_and(valid_selector) {
         return Err("display.label must be text or {arg}".into());
     }
-    if object.get("primary").is_some_and(|value| {
-        !value.as_object().is_some_and(|object| {
-            object.len() == 1
-                && object
-                    .get("arg")
-                    .and_then(Value::as_str)
-                    .is_some_and(|arg| !arg.is_empty())
-        })
-    }) {
-        return Err("display.primary must be {arg}".into());
+    if object
+        .get("primary")
+        .is_some_and(|value| !value.as_object().is_some_and(|_| valid_selector(value)))
+    {
+        return Err("display.primary must select an argument".into());
     }
     if let Some(arguments) = object.get("arguments") {
         let fields = arguments
@@ -385,18 +384,24 @@ fn validate_display_contract(display: &Value) -> Result<(), String> {
             let field = field
                 .as_object()
                 .ok_or_else(|| "display argument must be an object".to_owned())?;
-            if field.len() != 2
-                || field
-                    .get("label")
-                    .and_then(Value::as_str)
-                    .is_none_or(str::is_empty)
+            if field
+                .get("label")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
                 || field
                     .get("arg")
                     .and_then(Value::as_str)
                     .is_none_or(str::is_empty)
+                || field
+                    .get("cwd_arg")
+                    .is_some_and(|v| v.as_str().is_none_or(str::is_empty))
+                || field.get("default").is_some_and(|v| !v.is_string())
+                || !field
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "label" | "arg" | "cwd_arg" | "default"))
             {
                 return Err(
-                    "display argument must contain only non-empty label and arg strings".into(),
+                    "display argument must contain a label and valid argument selector".into(),
                 );
             }
         }
@@ -953,7 +958,8 @@ mod tests {
     fn display_contract_wire_shape_is_strict() {
         let accepted = [
             json!({"label": "Read", "primary": {"arg": "path"}, "result": {"kind": "content"}}),
-            json!({"label": {"arg": "action"}, "arguments": [{"label": "in", "arg": "path"}], "result": {"kind": "receipt", "text": "done"}}),
+            json!({"label": "Read", "primary": {"arg": "path", "cwd_arg": "cwd"}, "result": {"kind": "content"}}),
+            json!({"label": {"arg": "action"}, "arguments": [{"label": "in", "arg": "path", "cwd_arg": "cwd", "default": "."}], "result": {"kind": "receipt", "text": "done"}}),
         ];
         for contract in accepted {
             assert!(validate_display_contract(&contract).is_ok(), "{contract}");
@@ -964,6 +970,8 @@ mod tests {
             json!({"label": {"arg": ""}, "result": {"kind": "content"}}),
             json!({"label": {"arg": "path", "unknown": true}, "result": {"kind": "content"}}),
             json!({"label": "Read", "primary": {"arg": 3}, "result": {"kind": "content"}}),
+            json!({"label": "Read", "primary": {"arg": "path", "cwd_arg": ""}, "result": {"kind": "content"}}),
+            json!({"label": "Read", "primary": {"arg": "path", "default": 42}, "result": {"kind": "content"}}),
             json!({"label": "Read", "arguments": [{"label": "in"}], "result": {"kind": "content"}}),
             json!({"label": "Read", "result": {"kind": "content", "text": "no"}}),
             json!({"label": "Read", "result": {"kind": "receipt"}}),

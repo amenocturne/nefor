@@ -102,7 +102,7 @@ local state = {
 
 M.schema = {
   name        = "mag-eval",
-  display = { label = { arg = "intent" }, result = { kind = "content" } },
+  display = { label = "mag-eval", primary = { arg = "intent" }, result = { kind = "content" } },
   description =
     "Evaluate one MAG graph-fragment expression on the actor kernel. " ..
     "A command is (nefor.shell.command \"step\" \"rg -n TODO src/\"); " ..
