@@ -201,6 +201,7 @@ struct PendingApproval {
     source: String,
     name: String,
     args: Value,
+    invoking_from: Option<String>,
 }
 
 struct GateState {
@@ -584,6 +585,7 @@ async fn handle_tool_invoke(
         .get("read_only")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let invoking_from = body.get("from").and_then(Value::as_str).map(str::to_owned);
 
     let source = match state.tool_owner.get(&name).cloned() {
         Some(s) => s,
@@ -604,7 +606,16 @@ async fn handle_tool_invoke(
     };
     match decision {
         Decision::Auto => {
-            forward_to_source(out_tx, state, &outer_id, &source, &name, args).await?;
+            forward_to_source(
+                out_tx,
+                state,
+                &outer_id,
+                &source,
+                &name,
+                args,
+                invoking_from.as_deref(),
+            )
+            .await?;
         }
         Decision::Prompt => {
             state.awaiting_approval.insert(
@@ -614,6 +625,7 @@ async fn handle_tool_invoke(
                     source,
                     name: name.clone(),
                     args: args.clone(),
+                    invoking_from,
                 },
             );
             send_event(
@@ -640,6 +652,7 @@ async fn forward_to_source(
     source: &str,
     name: &str,
     args: Value,
+    invoking_from: Option<&str>,
 ) -> Result<(), TransportError> {
     let inner_id = state.next_inner_id();
     state.pending.insert(
@@ -649,42 +662,53 @@ async fn forward_to_source(
             source: source.to_owned(),
         },
     );
-    send_event(out_tx, forward_invoke_body(source, &inner_id, name, args)).await?;
+    send_event(
+        out_tx,
+        forward_invoke_body(source, &inner_id, outer_id, name, args, invoking_from),
+    )
+    .await?;
     Ok(())
 }
 
-/// Forward a `tool.cancel` for a caller's outer id onto the underlying source.
-/// The kernel's interrupt emits `tool-gate.tool.cancel { id: <outer> }` for
-/// each open tool correlation; we look up the live forward by its outer id,
-/// then re-emit `<source>.tool.cancel { id: <inner> }` so the owning plugin
-/// (basic-tools kills the child; lead-workflow cancels a mag-eval sub-run)
-/// aborts exactly that firing. The `pending` entry is KEPT: the real (now
-/// cancelled) `tool.result` still flows back through the normal path and drops
-/// at the caller's already-settled correlation.
+/// Cancel an invocation by the caller's outer id.
+///
+/// Cancellation is a terminal gate operation: permission state is removed
+/// before a stale approval can observe it, forwarded correlation is removed
+/// before a late source result can observe it, and one cancellation result
+/// settles the outer caller. Removing every matching forward also makes an
+/// accidental duplicate outer id fail closed without retaining correlations.
 async fn handle_tool_cancel(
     out_tx: &mpsc::Sender<PluginOutgoing>,
     body: &Map<String, Value>,
-    state: &GateState,
+    state: &mut GateState,
 ) -> Result<(), TransportError> {
     let outer_id = match body.get("id").and_then(Value::as_str) {
-        Some(s) => s,
+        Some(s) => s.to_owned(),
         None => return Ok(()),
     };
-    // Reverse-scan the (small) live-forward table for the matching outer id.
-    let forward = state
+
+    let canceled_approval = state.awaiting_approval.remove(&outer_id).is_some();
+    let mut forwards = state
         .pending
         .iter()
-        .find(|(_, p)| p.outer_id == outer_id)
-        .map(|(inner, p)| (inner.clone(), p.source.clone()));
-    match forward {
-        Some((inner_id, source)) => {
-            tracing::info!(outer_id = %outer_id, inner_id = %inner_id, source = %source, "tool.cancel forwarded");
-            send_event(out_tx, forward_cancel_body(&source, &inner_id)).await?;
-        }
-        None => {
-            tracing::info!(outer_id = %outer_id, "tool.cancel for an unknown/settled forward; no-op");
-        }
+        .filter(|(_, pending)| pending.outer_id == outer_id)
+        .map(|(inner_id, pending)| (inner_id.clone(), pending.source.clone()))
+        .collect::<Vec<_>>();
+    forwards.sort_unstable();
+    for (inner_id, _) in &forwards {
+        state.pending.remove(inner_id);
     }
+
+    if !canceled_approval && forwards.is_empty() {
+        tracing::info!(outer_id = %outer_id, "tool.cancel for an unknown/settled invocation; no-op");
+        return Ok(());
+    }
+
+    for (inner_id, source) in forwards {
+        tracing::info!(outer_id = %outer_id, inner_id = %inner_id, source = %source, "tool.cancel forwarded");
+        send_event(out_tx, forward_cancel_body(&source, &inner_id)).await?;
+    }
+    send_event(out_tx, tool_canceled_body(&outer_id)).await?;
     Ok(())
 }
 
@@ -745,6 +769,7 @@ async fn handle_permission_response(
             &approval.source,
             &approval.name,
             args,
+            approval.invoking_from.as_deref(),
         )
         .await?;
     } else {
@@ -798,8 +823,10 @@ fn tool_register_body(state: &GateState) -> Map<String, Value> {
 fn forward_invoke_body(
     source: &str,
     inner_id: &str,
+    caller_id: &str,
     name: &str,
     args: Value,
+    invoking_from: Option<&str>,
 ) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert(
@@ -807,6 +834,10 @@ fn forward_invoke_body(
         Value::String(format!("{source}.tool.invoke")),
     );
     m.insert("id".into(), Value::String(inner_id.to_owned()));
+    m.insert("caller_id".into(), Value::String(caller_id.to_owned()));
+    if let Some(from) = invoking_from {
+        m.insert("from".into(), Value::String(from.to_owned()));
+    }
     m.insert("name".into(), Value::String(name.to_owned()));
     m.insert("args".into(), args);
     m
@@ -820,6 +851,10 @@ fn forward_cancel_body(source: &str, inner_id: &str) -> Map<String, Value> {
     );
     m.insert("id".into(), Value::String(inner_id.to_owned()));
     m
+}
+
+fn tool_canceled_body(outer_id: &str) -> Map<String, Value> {
+    tool_result_error_body(outer_id, "tool invocation canceled")
 }
 
 fn permission_request_body(
@@ -1199,7 +1234,8 @@ mod tests {
 
         let invoke = json!({
             "kind": "tool-gate.tool.invoke",
-            "id": "prov-2",
+            "id": "r7/cap-2",
+            "from": "lead.llm",
             "name": "write_file",
             "args": {}
         })
@@ -1218,9 +1254,11 @@ mod tests {
         // inner id is freshly minted, not the outer id
         let inner_id = body.get("id").and_then(Value::as_str).unwrap();
         assert!(inner_id.starts_with("gate-"));
+        assert_eq!(body["caller_id"], "r7/cap-2");
+        assert_eq!(body["from"], "lead.llm");
         assert_eq!(
             state.pending.get(inner_id).map(|p| p.outer_id.as_str()),
-            Some("prov-2")
+            Some("r7/cap-2")
         );
     }
 
@@ -1265,7 +1303,8 @@ mod tests {
 
         let invoke = json!({
             "kind": "tool-gate.tool.invoke",
-            "id": "prov-7",
+            "id": "r9/cap-7",
+            "from": "worker.run-tool",
             "name": "read_file",
             "args": {"path": "/x"}
         })
@@ -1277,7 +1316,7 @@ mod tests {
 
         let response = json!({
             "kind": "tool.permission_response",
-            "id": "prov-7",
+            "id": "r9/cap-7",
             "decision": "approve"
         })
         .as_object()
@@ -1294,7 +1333,9 @@ mod tests {
             body.get("kind").and_then(Value::as_str),
             Some("basic-tools.tool.invoke")
         );
-        assert!(!state.awaiting_approval.contains_key("prov-7"));
+        assert_eq!(body["caller_id"], "r9/cap-7");
+        assert_eq!(body["from"], "worker.run-tool");
+        assert!(!state.awaiting_approval.contains_key("r9/cap-7"));
     }
 
     #[tokio::test]
@@ -1487,7 +1528,96 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_cancel_forwards_to_source_under_the_inner_id() {
+    async fn auto_forward_round_trip_preserves_caller_and_result_correlation() {
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+        let mut state = make_state();
+        let advertise = advertise_body(
+            "lead-workflow",
+            json!([{"name": "write_file", "description": "", "parameters": {}}]),
+        );
+        handle_tools_advertise(&tx, &advertise, &mut state)
+            .await
+            .unwrap();
+        let _ = rx.recv().await;
+        let invoke = json!({
+            "kind": "tool-gate.tool.invoke",
+            "id": "r7/cap-3",
+            "from": "lead.llm",
+            "name": "write_file",
+            "args": {}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        handle_tool_invoke(&tx, &invoke, &mut state).await.unwrap();
+        let forwarded: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        assert_eq!(forwarded["body"]["id"], "gate-1");
+        assert_eq!(forwarded["body"]["caller_id"], "r7/cap-3");
+        assert_eq!(forwarded["body"]["from"], "lead.llm");
+
+        let source_result = json!({
+            "kind": "tool.result",
+            "id": "gate-1",
+            "output": {"status": "executing", "run_id": "mag-eval-1"}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        handle_tool_result(&tx, &source_result, &mut state)
+            .await
+            .unwrap();
+        let returned: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        assert_eq!(returned["body"]["id"], "r7/cap-3");
+        assert_eq!(returned["body"]["output"]["run_id"], "mag-eval-1");
+    }
+
+    #[tokio::test]
+    async fn concurrent_results_preserve_outer_correlation_in_reverse_order() {
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(16);
+        let mut state = make_state();
+        let advertise = advertise_body(
+            "basic-tools",
+            json!([{"name": "write_file", "description": "", "parameters": {}}]),
+        );
+        handle_tools_advertise(&tx, &advertise, &mut state)
+            .await
+            .unwrap();
+        let _ = rx.recv().await;
+
+        for outer in ["r7/cap-1", "r7/cap-2"] {
+            let invoke = json!({
+                "kind": "tool-gate.tool.invoke",
+                "id": outer,
+                "name": "write_file",
+                "args": {}
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            handle_tool_invoke(&tx, &invoke, &mut state).await.unwrap();
+        }
+        let first: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        let second: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        let first_inner = first["body"]["id"].as_str().unwrap();
+        let second_inner = second["body"]["id"].as_str().unwrap();
+
+        for (inner, output) in [(second_inner, "second"), (first_inner, "first")] {
+            let result = json!({"kind": "tool.result", "id": inner, "output": output})
+                .as_object()
+                .unwrap()
+                .clone();
+            handle_tool_result(&tx, &result, &mut state).await.unwrap();
+        }
+        let second_out: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        let first_out: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        assert_eq!(second_out["body"]["id"], "r7/cap-2");
+        assert_eq!(second_out["body"]["output"], "second");
+        assert_eq!(first_out["body"]["id"], "r7/cap-1");
+        assert_eq!(first_out["body"]["output"], "first");
+    }
+
+    #[tokio::test]
+    async fn forwarded_cancel_settles_once_and_drops_late_result() {
         let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
         let mut state = make_state();
         let advertise = advertise_body(
@@ -1497,9 +1627,8 @@ mod tests {
         handle_tools_advertise(&tx, &advertise, &mut state)
             .await
             .unwrap();
-        let _ = rx.recv().await; // tool.register
+        let _ = rx.recv().await;
 
-        // Establish a live forward: bash auto-forwards under yolo.
         state.mode = GateMode::Yolo;
         let invoke = json!({
             "kind": "tool-gate.tool.invoke",
@@ -1511,52 +1640,140 @@ mod tests {
         .unwrap()
         .clone();
         handle_tool_invoke(&tx, &invoke, &mut state).await.unwrap();
-        let fwd = rx.recv().await.unwrap();
-        let v: Value = serde_json::from_str(&fwd.to_line()).unwrap();
-        let inner_id = v
-            .get("body")
-            .and_then(|b| b.get("id"))
-            .and_then(Value::as_str)
-            .unwrap()
-            .to_owned();
-        assert!(inner_id.starts_with("gate-"));
+        let forwarded: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        let inner_id = forwarded["body"]["id"].as_str().unwrap().to_owned();
 
-        // Cancel by the OUTER (kernel correlation) id.
-        let cancel = json!({
-            "kind": "tool-gate.tool.cancel",
-            "id": "r16/cap-2"
+        let cancel = json!({"kind": "tool-gate.tool.cancel", "id": "r16/cap-2"})
+            .as_object()
+            .unwrap()
+            .clone();
+        handle_tool_cancel(&tx, &cancel, &mut state).await.unwrap();
+
+        let source_cancel: Value =
+            serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        assert_eq!(source_cancel["body"]["kind"], "basic-tools.tool.cancel");
+        assert_eq!(source_cancel["body"]["id"], inner_id);
+        let settlement: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        assert_eq!(settlement["body"]["kind"], "tool.result");
+        assert_eq!(settlement["body"]["id"], "r16/cap-2");
+        assert_eq!(settlement["body"]["error"], "tool invocation canceled");
+        assert!(state.pending.is_empty());
+        assert!(state.awaiting_approval.is_empty());
+
+        let late = json!({"kind": "tool.result", "id": inner_id, "output": "late"})
+            .as_object()
+            .unwrap()
+            .clone();
+        handle_tool_result(&tx, &late, &mut state).await.unwrap();
+        handle_tool_cancel(&tx, &cancel, &mut state).await.unwrap();
+        drop(tx);
+        assert!(
+            rx.recv().await.is_none(),
+            "late result and duplicate cancel must be silent"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_before_permission_drops_stale_approval_and_settles_once() {
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+        let mut state = make_state();
+        let advertise = advertise_body(
+            "basic-tools",
+            json!([{"name": "read_file", "description": "", "parameters": {}}]),
+        );
+        handle_tools_advertise(&tx, &advertise, &mut state)
+            .await
+            .unwrap();
+        let _ = rx.recv().await;
+
+        let invoke = json!({
+            "kind": "tool-gate.tool.invoke",
+            "id": "r20/cap-1",
+            "name": "read_file",
+            "args": {"path": "/x"}
         })
         .as_object()
         .unwrap()
         .clone();
-        handle_tool_cancel(&tx, &cancel, &state).await.unwrap();
+        handle_tool_invoke(&tx, &invoke, &mut state).await.unwrap();
+        let permission: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        assert_eq!(permission["body"]["kind"], "chat.tool.permission_request");
 
-        let msg = rx.recv().await.unwrap();
-        let v: Value = serde_json::from_str(&msg.to_line()).unwrap();
-        let body = v.get("body").unwrap();
-        assert_eq!(
-            body.get("kind").and_then(Value::as_str),
-            Some("basic-tools.tool.cancel"),
-            "cancel is forwarded to the owning source"
+        let cancel = json!({"kind": "tool-gate.tool.cancel", "id": "r20/cap-1"})
+            .as_object()
+            .unwrap()
+            .clone();
+        handle_tool_cancel(&tx, &cancel, &mut state).await.unwrap();
+        let settlement: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        assert_eq!(settlement["body"]["id"], "r20/cap-1");
+        assert_eq!(settlement["body"]["error"], "tool invocation canceled");
+        assert!(state.awaiting_approval.is_empty());
+        assert!(state.pending.is_empty());
+
+        let stale_approval = json!({
+            "kind": "tool.permission_response",
+            "id": "r20/cap-1",
+            "decision": "approve"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        handle_permission_response(&tx, &stale_approval, &mut state)
+            .await
+            .unwrap();
+        handle_tool_cancel(&tx, &cancel, &mut state).await.unwrap();
+        drop(tx);
+        assert!(
+            rx.recv().await.is_none(),
+            "stale approval and duplicate cancel must be silent"
         );
-        assert_eq!(
-            body.get("id").and_then(Value::as_str),
-            Some(inner_id.as_str()),
-            "forwarded under the gate's inner id, matching the forwarded invoke"
+        assert!(state.awaiting_approval.is_empty());
+        assert!(state.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn result_before_cancel_settles_once() {
+        let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
+        let mut state = make_state();
+        state.pending.insert(
+            "gate-1".into(),
+            PendingForward {
+                outer_id: "r21/cap-1".into(),
+                source: "basic-tools".into(),
+            },
         );
-        // The forward is kept so the real (cancelled) result still correlates.
-        assert!(state.pending.contains_key(&inner_id));
+        let result = json!({"kind": "tool.result", "id": "gate-1", "output": "done"})
+            .as_object()
+            .unwrap()
+            .clone();
+        handle_tool_result(&tx, &result, &mut state).await.unwrap();
+        let settlement: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
+        assert_eq!(settlement["body"]["id"], "r21/cap-1");
+        assert_eq!(settlement["body"]["output"], "done");
+
+        let cancel = json!({"kind": "tool-gate.tool.cancel", "id": "r21/cap-1"})
+            .as_object()
+            .unwrap()
+            .clone();
+        handle_tool_cancel(&tx, &cancel, &mut state).await.unwrap();
+        handle_tool_result(&tx, &result, &mut state).await.unwrap();
+        drop(tx);
+        assert!(
+            rx.recv().await.is_none(),
+            "cancel and duplicate result after settlement must be silent"
+        );
+        assert!(state.pending.is_empty());
     }
 
     #[tokio::test]
     async fn tool_cancel_for_unknown_outer_id_is_a_noop() {
         let (tx, mut rx) = mpsc::channel::<PluginOutgoing>(8);
-        let state = make_state();
+        let mut state = make_state();
         let cancel = json!({ "kind": "tool-gate.tool.cancel", "id": "nope" })
             .as_object()
             .unwrap()
             .clone();
-        handle_tool_cancel(&tx, &cancel, &state).await.unwrap();
+        handle_tool_cancel(&tx, &cancel, &mut state).await.unwrap();
         drop(tx);
         assert!(rx.recv().await.is_none());
     }

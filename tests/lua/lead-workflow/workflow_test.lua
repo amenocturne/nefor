@@ -1486,126 +1486,346 @@ do
     "active_plan flushed at session_end — no carry-over approval")
 end
 
--- (mag-eval interrupt propagation) A graceful interrupt of the lead cancels a
--- mag-eval capability by forwarding `lead-workflow.tool.cancel { id }` here;
--- mag-eval maps the firing to its dispatched sub-run and interrupts IT
--- (`mag.interrupt_run`), which cancels the sub-run's in-flight bash. Uses
--- mag-eval's existing pending_runs tracking (firing_id → sub-run id), not
--- general provenance.
+-- (mag-eval caller routing and ownership) The gate-facing firing id is an
+-- inner correlation; caller_id retains the outer scoped capability identity.
 do
   local mag_eval = require("libs.lead-workflow.mag-eval")
+  local artifact = artifact_from_modification(read_only_modification())
+
+  -- Lead caller: classify by caller_id, validate, submit, acknowledge with the
+  -- standard stable handle, and register in the shared active-run table.
   fresh()
-  -- A mag-eval firing that dispatched a sub-run (as on_loaded records it).
-  mag_eval._internals.state.pending_runs = {
-    ["mag-eval-3-1234"] = { firing_id = "gate-77", run_name = "eval-3" },
-  }
+  agentic_loop._internals.state.current_turn = { scope = "r7" }
+  feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = "gate-77",
+    caller_id = "r7/cap-1", from = "lead.llm", name = "mag-eval",
+    args = { intent = "Inspect files", expr = "(nefor.shell.command \"x\" \"pwd\")" } })
+  local load = latest_mag_load()
+  assert_true(load ~= nil, "lead eval starts a compile handshake")
+  assert_eq(find_call(decode_calls(), function(c) return c.body.kind == "tool.result" end), nil,
+    "no acknowledgment exists before compilation and validation")
   _test.calls_clear()
-
-  -- The cancel arrives through the gate → lead-workflow's receive_msg wiring.
-  feed("tool-gate", { kind = "lead-workflow.tool.cancel", id = "gate-77" })
-
+  feed("mag", { kind = "mag.loaded", in_reply_to = load.body.id,
+    hash = "sha256:eval", foreign_contracts = foreign_contracts(), artifact = artifact })
   local calls = decode_calls()
-  local interrupt = find_call(calls, function(c)
-    return c.body.kind == "mag.interrupt_run" and c.target == "mag"
-  end)
-  assert_true(interrupt ~= nil,
-    "lead-workflow.tool.cancel propagates into mag.interrupt_run for the sub-run; got "
-    .. json.encode(_test.calls()))
-  assert_eq(interrupt.body.run_id, "mag-eval-3-1234",
-    "the interrupt targets the sub-run mag-eval dispatched for this firing")
-
-  -- A cancel for a firing with no live sub-run is a clean no-op.
-  _test.calls_clear()
-  feed("tool-gate", { kind = "lead-workflow.tool.cancel", id = "gate-does-not-exist" })
-  local none = find_call(decode_calls(), function(c)
-    return c.body.kind == "mag.interrupt_run"
-  end)
-  assert_eq(none, nil, "no sub-run for the firing → no interrupt emitted")
-
-  mag_eval._internals.state.pending_runs = {}
-end
-
--- (mag-eval caller routing) A LEAD-called eval DETACHES: the firing acks at
--- dispatch and the terminal output relays through agentic-loop's
--- run-completion channel. A GRAPH AGENT's eval BLOCKS: the firing stays open
--- and the terminal output is the tool result.
-do
-  local mag_eval = require("libs.lead-workflow.mag-eval")
-
-  -- Detached (lead-called; on_loaded reads the flag M.handle computed off
-  -- agentic-loop.lead_scoped_id).
-  fresh()
-  mag_eval._internals.state.pending_runs = {}
-  mag_eval._internals.state.pending_loads["R1-load"] = {
-    firing_id = "r7/cap-1", run_id = "R1", run_name = "eval-1",
-    session_id = "s", detached = true,
-  }
-  feed("mag", { kind = "mag.loaded", in_reply_to = "R1-load",
-    artifact = { format = "nefor.graph-modification/v1",
-      data = { actors = {}, messages = {}, kills = {}, rules = {} } } })
-  local calls = decode_calls()
-  local eval_exec = find_call(calls, function(c)
-    return c.body.kind == "mag.execute" and c.body.run_id == "R1"
-  end)
-  assert_true(eval_exec ~= nil, "the compiled eval executes on the kernel")
-  assert_eq(eval_exec.body.principal, "subagent",
-    "mag-eval production execute declares the subagent domain principal")
+  local exec = find_call(calls, function(c) return c.body.kind == "mag.execute" end)
   local ack = find_call(calls, function(c)
-    return c.body.kind == "tool.result" and c.body.id == "r7/cap-1"
+    return c.body.kind == "tool.result" and c.body.id == "gate-77"
   end)
-  assert_true(ack ~= nil and ack.body.error == nil,
-    "a lead-called eval acks its firing at dispatch")
-  assert_true(tostring(ack.body.output):find("dispatched", 1, true) ~= nil,
-    "the ack names the dispatch")
+  assert_true(exec ~= nil and ack ~= nil, "lead eval executes and promptly acknowledges")
+  assert_eq(exec.body.principal, "subagent", "trusted local subagent principal is preserved")
+  assert_eq(ack.body.output.status, "executing", "lead eval uses structured executing ack")
+  assert_eq(ack.body.output.engine, "mag-kernel", "lead eval names the standard engine")
+  assert_eq(ack.body.output.hash, "sha256:eval", "lead eval ack carries compile hash")
+  assert_eq(ack.body.output.run_id, exec.body.run_id, "ack handle equals execute run id")
+  local run_id = exec.body.run_id
+  assert_true(lw._internals.state.active_runs[run_id] ~= nil,
+    "lead eval is registered in standard active_runs")
+  assert_eq(next(mag_eval._internals.state.attached_runs), nil,
+    "lead eval has no duplicate detached owner")
 
+  -- Terminal delivery is later and goes through the standard result renderer,
+  -- archive, and completion relay exactly once.
   _test.calls_clear()
-  feed("mag", { kind = "mag.run_result", run_id = "R1",
+  feed("mag", { kind = "mag.run_result", run_id = run_id,
     status = "completed", result = { text = "the eval output" } })
-  assert_eq(find_call(decode_calls(), function(c)
-    return c.body.kind == "tool.result"
-  end), nil, "a detached eval's terminal reply emits no second tool result")
-  -- The relay reached agentic-loop's run-completion channel (no lead
-  -- program is cached in this harness, so the relay text queues for the
-  -- next turn instead of executing one).
+  calls = decode_calls()
+  assert_eq(find_call(calls, function(c) return c.body.kind == "tool.result" end), nil,
+    "terminal result does not emit a second tool result")
+  assert_true(find_call(calls, function(c)
+    return c.body.kind == "chat.graph_result.append" and c.body.run_id == run_id
+  end) ~= nil, "lead eval renders through the standard graph result channel")
+  assert_eq(lw._internals.state.active_runs[run_id], nil, "terminal result closes active run")
+  assert_eq(lw._internals.state.completed_runs[#lw._internals.state.completed_runs].run_id,
+    run_id, "terminal result archives the stable run handle")
   local queued = agentic_loop._internals.state.pending_user_inputs[1]
-  assert_true(type(queued) == "string"
-      and queued:find("the eval output", 1, true) ~= nil,
-    "the terminal output relays like a dispatched graph completion")
+  assert_true(type(queued) == "string" and queued:find("the eval output", 1, true) ~= nil,
+    "terminal output reaches the deferred graph completion channel")
 
-  -- Blocking (graph-agent-called).
+  -- Graph-agent caller: a foreign caller_id remains attached and receives no
+  -- acknowledgment until its terminal result.
   fresh()
-  mag_eval._internals.state.pending_loads["R2-load"] = {
-    firing_id = "r9/cap-4", run_id = "R2", run_name = "eval-2",
-    session_id = "s", detached = false,
-  }
-  feed("mag", { kind = "mag.loaded", in_reply_to = "R2-load",
-    artifact = { format = "nefor.graph-modification/v1",
-      data = { actors = {}, messages = {}, kills = {}, rules = {} } } })
-  assert_eq(find_call(decode_calls(), function(c)
-    return c.body.kind == "tool.result"
-  end), nil, "a graph agent's eval does not ack at dispatch")
+  agentic_loop._internals.state.current_turn = { scope = "r7" }
+  feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = "gate-88",
+    caller_id = "r9/cap-4", from = "worker.run-tool", name = "mag-eval",
+    args = { intent = "Inspect files", expr = "(nefor.shell.command \"x\" \"pwd\")" } })
+  load = latest_mag_load()
   _test.calls_clear()
-  feed("mag", { kind = "mag.run_result", run_id = "R2",
+  feed("mag", { kind = "mag.loaded", in_reply_to = load.body.id,
+    hash = "sha256:agent", foreign_contracts = foreign_contracts(), artifact = artifact })
+  calls = decode_calls()
+  exec = find_call(calls, function(c) return c.body.kind == "mag.execute" end)
+  assert_true(exec ~= nil, "graph-agent eval executes after validation")
+  assert_eq(find_call(calls, function(c) return c.body.kind == "tool.result" end), nil,
+    "graph-agent eval stays attached")
+  assert_true(mag_eval._internals.state.attached_runs[exec.body.run_id] ~= nil,
+    "attached run is owned only until terminal capability settlement")
+  assert_eq(lw._internals.state.active_runs[exec.body.run_id], nil,
+    "attached graph-agent eval is not a lead active run")
+  _test.calls_clear()
+  feed("mag", { kind = "mag.run_result", run_id = exec.body.run_id,
     status = "completed", result = { text = "blocking output" } })
   local reply = find_call(decode_calls(), function(c)
-    return c.body.kind == "tool.result" and c.body.id == "r9/cap-4"
+    return c.body.kind == "tool.result" and c.body.id == "gate-88"
   end)
-  assert_true(reply ~= nil, "a graph agent's eval settles on the terminal reply")
-  assert_eq(reply.body.output, "blocking output", "the terminal output IS the tool result")
+  assert_true(reply ~= nil, "graph-agent eval settles on terminal result")
+  assert_eq(reply.body.output, "blocking output", "attached result returns terminal output")
 
-  -- Double-Esc reaches eval runs: chat.interrupt_all interrupts every
-  -- in-flight eval (a detached firing has no gate capability left to cancel;
-  -- this entry point is how the interrupt reaches the run).
+  -- Cancel is terminal for an attached eval: ownership is removed before the
+  -- kernel interrupt, and duplicate cancel / late terminal replies stay silent.
   fresh()
-  mag_eval._internals.state.pending_runs = {
-    ["R3"] = { firing_id = "r7/cap-9", run_id = "R3", run_name = "eval-3", detached = true },
-  }
-  feed("nefor-tui", { kind = "chat.interrupt_all" })
-  local interrupted = find_call(decode_calls(), function(c)
-    return c.body.kind == "mag.interrupt_run" and c.body.run_id == "R3"
+  agentic_loop._internals.state.current_turn = { scope = "r7" }
+  feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = "gate-attached-cancel",
+    caller_id = "r9/cap-5", from = "worker.run-tool", name = "mag-eval",
+    args = { intent = "Wait forever", expr = "(nefor.shell.command \"x\" \"sleep 10\")" } })
+  load = latest_mag_load()
+  _test.calls_clear()
+  feed("mag", { kind = "mag.loaded", in_reply_to = load.body.id,
+    hash = "sha256:agent-cancel", foreign_contracts = foreign_contracts(), artifact = artifact })
+  exec = find_call(decode_calls(), function(c) return c.body.kind == "mag.execute" end)
+  assert_true(exec ~= nil and mag_eval._internals.state.attached_runs[exec.body.run_id] ~= nil,
+    "cancel test starts an attached eval")
+  _test.calls_clear()
+  feed("tool-gate", { kind = "lead-workflow.tool.cancel", id = "gate-attached-cancel" })
+  calls = decode_calls()
+  assert_true(find_call(calls, function(c)
+    return c.body.kind == "mag.interrupt_run" and c.body.run_id == exec.body.run_id
+       and c.body.terminate == true
+  end) ~= nil, "attached cancel terminates the eval")
+  assert_eq(mag_eval._internals.state.attached_runs[exec.body.run_id], nil,
+    "attached cancel releases source ownership")
+  _test.calls_clear()
+  feed("tool-gate", { kind = "lead-workflow.tool.cancel", id = "gate-attached-cancel" })
+  feed("mag", { kind = "mag.run_result", run_id = exec.body.run_id,
+    status = "failed", error = "late cancellation result" })
+  assert_eq(#decode_calls(), 0,
+    "duplicate cancel and late attached result cannot emit a second source settlement")
+
+  local function dispatch_lead_eval(inner, outer)
+    fresh()
+    agentic_loop._internals.state.current_turn = { scope = "r7" }
+    feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = inner,
+      caller_id = outer, name = "mag-eval",
+      args = { intent = "Inspect lifecycle", expr = "(nefor.shell.command \"x\" \"pwd\")" } })
+    local pending_load = latest_mag_load()
+    _test.calls_clear()
+    feed("mag", { kind = "mag.loaded", in_reply_to = pending_load.body.id,
+      hash = "sha256:lifecycle", foreign_contracts = foreign_contracts(), artifact = artifact })
+    local submitted = find_call(decode_calls(), function(c)
+      return c.body.kind == "mag.execute"
+    end)
+    assert_true(submitted ~= nil, "lifecycle eval submits")
+    return submitted.body.run_id
+  end
+
+  -- Failed/killed outcomes use the same standard close and relay path.
+  run_id = dispatch_lead_eval("gate-failed", "r7/cap-20")
+  _test.calls_clear()
+  feed("mag", { kind = "mag.run_result", run_id = run_id,
+    status = "failed", error = "eval failed" })
+  calls = decode_calls()
+  assert_true(find_call(calls, function(c)
+    return c.body.kind == "chat.graph_result.append" and c.body.status == "failed"
+  end) ~= nil, "failed eval renders a standard failed graph result")
+  assert_eq(lw._internals.state.completed_runs[#lw._internals.state.completed_runs].run_id,
+    run_id, "failed eval is archived")
+
+  run_id = dispatch_lead_eval("gate-killed", "r7/cap-21")
+  _test.calls_clear()
+  feed("mag", { kind = "mag.run_result", run_id = run_id, status = "killed" })
+  assert_true(find_call(decode_calls(), function(c)
+    return c.body.kind == "chat.graph_result.append" and c.body.status == "failed"
+  end) ~= nil, "killed eval closes through the standard failure channel")
+  assert_eq(lw._internals.state.active_runs[run_id], nil, "killed eval leaves no active owner")
+
+  -- Standard control surfaces address the exact acknowledged handle.
+  run_id = dispatch_lead_eval("gate-terminate", "r7/cap-22")
+  _test.calls_clear()
+  invoke_tool("terminate-eval", "terminate-graph", { run_id = run_id })
+  calls = decode_calls()
+  assert_true(find_call(calls, function(c)
+    return c.body.kind == "mag.kill_run" and c.body.run_id == run_id
+  end) ~= nil, "terminate-graph kills the eval by its stable handle")
+  assert_eq(lw._internals.state.active_runs[run_id], nil, "terminate-graph archives the eval")
+
+  run_id = dispatch_lead_eval("gate-cancel", "r7/cap-23")
+  _test.calls_clear()
+  feed("tool-gate", { kind = "lead-workflow.tool.cancel", id = "gate-cancel" })
+  assert_true(find_call(decode_calls(), function(c)
+    return c.body.kind == "mag.interrupt_run" and c.body.run_id == run_id
+       and c.body.terminate == true
+  end) ~= nil, "dispatch-firing cancellation terminates the standard eval run")
+
+  run_id = dispatch_lead_eval("gate-session", "r7/cap-24")
+  _test.calls_clear()
+  lw._internals.terminate_active_graph()
+  assert_true(find_call(decode_calls(), function(c)
+    return c.body.kind == "mag.kill_run" and c.body.run_id == run_id
+  end) ~= nil, "session cleanup kills the standard eval run")
+  assert_eq(lw._internals.state.active_runs[run_id], nil,
+    "session cleanup removes eval active ownership")
+end
+
+-- Cancellation during pending load removes correlation, so a late compiler
+-- response cannot submit orphaned work.
+do
+  local mag_eval = require("libs.lead-workflow.mag-eval")
+  fresh()
+  agentic_loop._internals.state.current_turn = { scope = "r7" }
+  feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = "gate-pending",
+    caller_id = "r7/cap-9", name = "mag-eval",
+    args = { intent = "Inspect files", expr = "(nefor.shell.command \"x\" \"sleep 1\")" } })
+  local load = latest_mag_load()
+  assert_true(mag_eval._internals.state.pending_loads[load.body.id] ~= nil,
+    "compile is pending before cancellation")
+  feed("tool-gate", { kind = "lead-workflow.tool.cancel", id = "gate-pending" })
+  assert_eq(mag_eval._internals.state.pending_loads[load.body.id], nil,
+    "cancel removes pending compile correlation")
+  _test.calls_clear()
+  feed("mag", { kind = "mag.loaded", in_reply_to = load.body.id,
+    hash = "sha256:late", foreign_contracts = foreign_contracts(),
+    artifact = artifact_from_modification(read_only_modification()) })
+  assert_eq(find_call(decode_calls(), function(c) return c.body.kind == "mag.execute" end), nil,
+    "late compile response cannot execute orphaned work")
+  assert_eq(next(lw._internals.state.active_runs), nil, "late response registers no active run")
+end
+
+-- Compile and pre-execute validation failures remain direct and never create a
+-- handle or active run.
+do
+  fresh()
+  agentic_loop._internals.state.current_turn = { scope = "r7" }
+  feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = "gate-compile-error",
+    caller_id = "r7/cap-10", name = "mag-eval",
+    args = { intent = "Compile expression", expr = "(broken" } })
+  local load = latest_mag_load()
+  _test.calls_clear()
+  feed("mag", { kind = "mag.error", in_reply_to = load.body.id, message = "unexpected EOF" })
+  local calls = decode_calls()
+  local err = find_call(calls, function(c)
+    return c.body.kind == "tool.result" and c.body.id == "gate-compile-error"
   end)
-  assert_true(interrupted ~= nil, "chat.interrupt_all interrupts in-flight eval runs")
-  mag_eval._internals.state.pending_runs = {}
+  assert_true(err ~= nil and err.body.error:find("unexpected EOF", 1, true) ~= nil,
+    "eval compile error returns directly to its firing")
+  assert_eq(find_call(calls, function(c) return c.body.kind == "mag.execute" end), nil,
+    "compile failure never executes")
+  assert_eq(next(lw._internals.state.active_runs), nil, "compile failure has no run handle")
+
+  fresh()
+  agentic_loop._internals.state.current_turn = { scope = "r7" }
+  feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = "gate-validation-error",
+    caller_id = "r7/cap-11", name = "mag-eval",
+    args = { intent = "Validate expression", expr = "(nefor.shell.command \"x\" \"pwd\")" } })
+  load = latest_mag_load()
+  local invalid = artifact_from_modification(read_only_modification())
+  invalid.data.result = nil
+  _test.calls_clear()
+  feed("mag", { kind = "mag.loaded", in_reply_to = load.body.id,
+    hash = "sha256:invalid", foreign_contracts = foreign_contracts(), artifact = invalid })
+  calls = decode_calls()
+  err = find_call(calls, function(c)
+    return c.body.kind == "tool.result" and c.body.id == "gate-validation-error"
+  end)
+  assert_true(err ~= nil and err.body.error:find("structural result boundary", 1, true) ~= nil,
+    "eval validation error returns directly to its firing")
+  assert_eq(find_call(calls, function(c) return c.body.kind == "mag.execute" end), nil,
+    "validation failure never executes")
+  assert_eq(next(lw._internals.state.active_runs), nil, "validation failure has no run handle")
+end
+
+-- Concurrent eval loads may resolve in reverse order without crossing firing
+-- correlation or stable run handles.
+do
+  fresh()
+  agentic_loop._internals.state.current_turn = { scope = "r7" }
+  for _, call in ipairs({
+    { inner = "gate-a", outer = "r7/cap-12", intent = "Inspect alpha" },
+    { inner = "gate-b", outer = "r7/cap-13", intent = "Inspect beta" },
+  }) do
+    feed("tool-gate", { kind = "lead-workflow.tool.invoke", id = call.inner,
+      caller_id = call.outer, name = "mag-eval",
+      args = { intent = call.intent, expr = "(nefor.shell.command \"x\" \"pwd\")" } })
+  end
+  local loads = find_calls(decode_calls(), function(c)
+    return c.body.kind == "mag.load" and c.target == "mag"
+  end)
+  assert_eq(#loads, 2, "two concurrent eval compiles are pending")
+  _test.calls_clear()
+  for i = #loads, 1, -1 do
+    feed("mag", { kind = "mag.loaded", in_reply_to = loads[i].body.id,
+      hash = "sha256:" .. tostring(i), foreign_contracts = foreign_contracts(),
+      artifact = artifact_from_modification(read_only_modification()) })
+  end
+  local calls = decode_calls()
+  for _, inner in ipairs({ "gate-a", "gate-b" }) do
+    local ack = find_call(calls, function(c)
+      return c.body.kind == "tool.result" and c.body.id == inner
+    end)
+    assert_true(ack ~= nil and lw._internals.state.active_runs[ack.body.output.run_id] ~= nil,
+      "reverse load response preserves " .. inner .. " run correlation")
+  end
+end
+
+-- File-based execute has the same pending-load cancellation guarantees as
+-- mag-eval: cancel invalidates by dispatch firing, is idempotent, and makes
+-- either kind of late compiler response a silent no-op.
+do
+  fresh()
+  write_mag_file("file-pending-write", "pending-cancel.mag", READ_ONLY_MAG)
+  _test.calls_clear()
+  execute_mag("file-pending-execute", "pending-cancel.mag")
+  local load = latest_mag_load()
+  assert_true(load ~= nil and lw._internals.state.pending_mag_load[load.body.id] ~= nil,
+    "file execute compile is pending before cancellation")
+
+  _test.calls_clear()
+  feed("tool-gate", { kind = "lead-workflow.tool.cancel", id = "file-pending-execute" })
+  assert_eq(lw._internals.state.pending_mag_load[load.body.id], nil,
+    "file execute cancel invalidates pending load correlation")
+  assert_eq(#decode_calls(), 0,
+    "canceling an unsubmitted file load emits no source settlement or kernel control")
+
+  feed("tool-gate", { kind = "lead-workflow.tool.cancel", id = "file-pending-execute" })
+  feed("mag", { kind = "mag.loaded", in_reply_to = load.body.id,
+    hash = "sha256:file-late", foreign_contracts = foreign_contracts(),
+    artifact = artifact_from_modification(read_only_modification()) })
+  feed("mag", { kind = "mag.error", in_reply_to = load.body.id,
+    message = "late compiler failure" })
+  local calls = decode_calls()
+  assert_eq(find_call(calls, function(c) return c.body.kind == "mag.execute" end), nil,
+    "duplicate cancel and late loaded response cannot execute file work")
+  assert_eq(find_call(calls, function(c) return c.body.kind == "tool.result" end), nil,
+    "late loaded/error responses cannot settle canceled file execute again")
+  assert_eq(next(lw._internals.state.active_runs), nil,
+    "late file responses register no active run")
+end
+
+-- Session teardown clears every pending file load. Compiler responses arriving
+-- after the boundary cannot launch work into the ended or following session.
+do
+  fresh()
+  write_mag_file("file-session-write", "pending-session.mag", READ_ONLY_MAG)
+  _test.calls_clear()
+  execute_mag("file-session-execute", "pending-session.mag")
+  local load = latest_mag_load()
+  assert_true(load ~= nil and lw._internals.state.pending_mag_load[load.body.id] ~= nil,
+    "file execute compile is pending before session end")
+
+  lw._internals.terminate_active_graph()
+  assert_eq(next(lw._internals.state.pending_mag_load), nil,
+    "session end clears all pending file loads")
+  _test.calls_clear()
+  feed("mag", { kind = "mag.loaded", in_reply_to = load.body.id,
+    hash = "sha256:session-late", foreign_contracts = foreign_contracts(),
+    artifact = artifact_from_modification(read_only_modification()) })
+  feed("mag", { kind = "mag.error", in_reply_to = load.body.id,
+    message = "late session compiler failure" })
+  local calls = decode_calls()
+  assert_eq(find_call(calls, function(c) return c.body.kind == "mag.execute" end), nil,
+    "post-session loaded response cannot execute file work")
+  assert_eq(find_call(calls, function(c) return c.body.kind == "tool.result" end), nil,
+    "post-session loaded/error responses emit no source settlement")
+  assert_eq(next(lw._internals.state.active_runs), nil,
+    "post-session file responses register no active run")
 end
 
 -- ------------------------------------------------------------------

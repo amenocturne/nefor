@@ -6,34 +6,21 @@
 -- decomposed: one schema, no action modes — write/compile/execute
 -- workflows stay on the `mag` tool.
 --
--- Settlement routes by CALLER, decided from the firing id's scope
--- (agentic-loop.lead_scoped_id — ids are `<scope>/cap-N`), never by a
--- model-facing mode:
+-- Settlement routes by CALLER, using the opaque outer `caller_id` preserved
+-- by tool-gate (and the firing id only for direct/internal calls):
 --
---   * The LEAD's own calls DETACH: the tool result answers as soon as the
---     run is submitted ("eval-N dispatched"), and the terminal output relays
---     back through `agentic-loop.relay_run_completion` — the same deferred
---     user-role turn a dispatched `mag` graph produces. One shape for every
---     kernel run, long or short: a review UI that waits minutes on the user
---     and a sub-second `rg` both dispatch, show on the run panel (lifecycle
---     events stream under the readable run_name `eval-<n>`), and come back
---     as a run-completion notification. Nothing blocks the lead's turn, so
---     commands may run unbounded; `nefor.shell.command-with-options` opts into
---     a timeout through its explicit options value.
---   * A GRAPH AGENT's calls BLOCK: the firing settles when the run's
---     terminal `mag.run_result` arrives, and the output IS the tool result.
---     The agent's graph node is itself the waiting structure — a sub-run has
---     no relay channel, and detaching would strand its output at the lead.
+--   * The LEAD's own calls submit through lead-workflow's standard active-run
+--     path. The tool receives the same structured executing acknowledgment as
+--     `mag action="execute"`; lifecycle, control, archival, interruption,
+--     session cleanup, result rendering, and deferred completion are all
+--     owned by that one path.
+--   * A GRAPH AGENT's calls remain attached. This module owns only those
+--     executing runs, because their terminal output must settle the original
+--     capability rather than relay to the lead.
 --
--- A compile error always fails the tool call itself, whoever called: the
--- model authored the expression and needs the message at the callsite.
---
--- Self-contained by design (Unix-shaped): owns its pending state and its
--- slice of the bus protocol end-to-end. init.lua only registers the schema,
--- the tool handler, and the `on_bus` tap — it shares no internals with the
--- `mag` tool's pending-load machinery. Caller routing and the relay ride
--- agentic-loop's PUBLIC seams (lead_scoped_id, relay_run_completion),
--- exactly as lead-workflow's dispatched runs do.
+-- Compile and pre-execute validation failures stay synchronous at the call
+-- site. A canceled pending load is removed before a late compiler response can
+-- launch work.
 
 local mag = require("mag")
 local sessions = require("sessions")
@@ -74,6 +61,8 @@ local function validate_roots(roots)
   end
 end
 
+local submit_run
+
 function M.configure(opts)
   if opts == nil then opts = {} end
   if type(opts) ~= "table" then
@@ -83,6 +72,10 @@ function M.configure(opts)
   if roots == nil then roots = {} end
   validate_roots(roots)
   dependency_module_roots = copy_roots(roots)
+  if opts.submit_run ~= nil and type(opts.submit_run) ~= "function" then
+    error("lead-workflow mag-eval: submit_run must be a function", 2)
+  end
+  submit_run = opts.submit_run
 end
 
 local function module_roots_for(ws)
@@ -96,8 +89,8 @@ local state = {
   seq = 0,
   -- In-flight compile handshakes, keyed by the mag.load request id.
   pending_loads = {},
-  -- Executing runs awaiting their terminal mag.run_result, keyed by run_id.
-  pending_runs = {},
+  -- Attached graph-agent runs awaiting terminal mag.run_result, by run_id.
+  attached_runs = {},
 }
 
 M.schema = {
@@ -180,9 +173,10 @@ local function run_output_text(body)
   return "(run completed with no output)"
 end
 
--- Tool handler: persist the expression as a workspace source file and start
--- the compile handshake. The firing stays open until the run settles.
-function M.handle(firing_id, args)
+-- Tool handler: persist the expression and start the compile handshake. Lead
+-- firings stay open through validation/submission; attached firings stay open
+-- through terminal completion.
+function M.handle(firing_id, args, metadata)
   local intent = args and args.intent
   local words = 0
   if type(intent) == "string" then for _ in intent:gmatch("%S+") do words = words + 1 end end
@@ -230,12 +224,16 @@ function M.handle(firing_id, args)
   fh:write(source)
   fh:close()
 
-  -- Caller routing (header): a lead-scoped firing detaches; anything else
-  -- (a graph agent's call, or a context with no lead loop at all) blocks.
-  local detached = false
+  -- The gate-minted firing id is source correlation only. Classification uses
+  -- the preserved outer capability id; direct/internal calls fall back to the
+  -- firing id because no rewrite occurred.
+  local caller_id = type(metadata) == "table" and metadata.caller_id or nil
+  if type(caller_id) ~= "string" then caller_id = firing_id end
+  local routing = "attached"
   local al_ok, al = pcall(require, "agentic-loop")
-  if al_ok and type(al.lead_scoped_id) == "function" then
-    detached = al.lead_scoped_id(firing_id) == true
+  if al_ok and type(al.lead_scoped_id) == "function"
+      and al.lead_scoped_id(caller_id) == true then
+    routing = "lead"
   end
 
   local run_id = "mag-" .. run_name .. "-" .. tostring(now_ms())
@@ -245,7 +243,7 @@ function M.handle(firing_id, args)
     run_id     = run_id,
     run_name   = run_name,
     session_id = session_id,
-    detached   = detached,
+    routing    = routing,
   }
   emit_as(SOURCE_NAME, "mag", {
     kind       = "mag.load",
@@ -263,13 +261,9 @@ local function take(map, key)
   return entry
 end
 
--- The compile reply: execute the lowered modification inline on the kernel
--- (the control plane reaches kernel ops directly — docs/ir.md; inline rather
--- than resident, so concurrent loaders never race). Kernel-side validation is
--- the backstop for factories and wiring. A detached (lead-called) firing
--- settles HERE — the run is dispatched, its output arrives later as a
--- run-completion notification; a blocking firing stays open until the run's
--- terminal reply.
+-- The compile reply delegates lead submissions to init.lua's standard
+-- validation/active-run path. Attached graph-agent submissions execute here
+-- and remain owned here until their terminal result settles the capability.
 local function on_loaded(body)
   local pending = take(state.pending_loads, body.in_reply_to)
   if not pending then return false end
@@ -277,22 +271,16 @@ local function on_loaded(body)
     tool_err(pending.firing_id, "mag-eval: mag.loaded reply carried no artifact")
     return true
   end
-  emit_as(SOURCE_NAME, "mag", {
-    kind         = "mag.execute",
-    id           = pending.run_id,
-    run_id       = pending.run_id,
-    run_name     = pending.run_name,
-    session_id   = pending.session_id,
-    principal    = "subagent",
-    artifact     = body.artifact,
-  })
-  state.pending_runs[pending.run_id] = pending
-  if pending.detached then
-    tool_ok(pending.firing_id,
-      pending.run_name .. " dispatched (run_id " .. pending.run_id .. "). " ..
-      "It is running on the kernel; the terminal output will arrive as a " ..
-      "run-completion notification.")
+  if type(submit_run) ~= "function" then
+    tool_err(pending.firing_id, "mag-eval: submission path is unavailable")
+    return true
   end
+  if pending.routing == "lead" then
+    submit_run(pending, body, false)
+    return true
+  end
+  if not submit_run(pending, body, true) then return true end
+  state.attached_runs[pending.run_id] = pending
   return true
 end
 
@@ -304,32 +292,10 @@ local function on_error(body)
   return true
 end
 
--- The run's terminal reply. Detached (lead-called): relay the outcome
--- through agentic-loop's run-completion channel — the firing already
--- settled at dispatch. Blocking (graph agent): settle the open firing with
--- the terminal output as the tool result.
+-- Terminal replies here belong only to attached graph-agent evals.
 local function on_run_result(body)
-  local pending = take(state.pending_runs, body.run_id or body.in_reply_to)
+  local pending = take(state.attached_runs, body.run_id or body.in_reply_to)
   if not pending then return false end
-  if pending.detached then
-    local al = require("agentic-loop")
-    if type(al.relay_run_completion) ~= "function" then return true end
-    if body.status == "completed" then
-      al.relay_run_completion({
-        run_id = pending.run_id,
-        status = "success",
-        output = run_output_text(body),
-      })
-    else
-      al.relay_run_completion({
-        run_id = pending.run_id,
-        status = "failed",
-        error  = body.error
-          or (body.status == "killed" and "run killed" or "mag run failed"),
-      })
-    end
-    return true
-  end
   if body.status == "completed" then
     tool_ok(pending.firing_id, run_output_text(body))
   else
@@ -340,56 +306,52 @@ local function on_run_result(body)
   return true
 end
 
--- Graceful interrupt of EVERY in-flight eval run (the double-Esc path;
--- init.lua calls this from its chat.interrupt_all handling, alongside the
--- `mag` tool's own dispatched-run interrupts). A detached firing settled at
--- dispatch, so the gate has no capability left to cancel — this entry point
--- is how the interrupt reaches the runs themselves. `mag.interrupt_run`
--- cancels an in-flight bash (its child process group dies) and settles the
--- run as failed; the terminal `mag.run_result` then flows back through
--- on_run_result (relayed for detached firings, the tool result for blocking
--- ones).
+-- Graceful interrupt of every attached eval run. Lead-called evals live in
+-- init.lua's standard active-run table and are terminated by its interrupt
+-- path; attached graph-agent evals remain capability-scoped here.
 function M.interrupt_all_runs()
-  for run_id in pairs(state.pending_runs) do
+  for run_id in pairs(state.attached_runs) do
     emit_as(SOURCE_NAME, "mag", { kind = "mag.interrupt_run", run_id = run_id })
   end
 end
 
--- Gate-forwarded cancel for one open firing (`lead-workflow.tool.cancel
--- { id = firing_id }`): only a pending COMPILE can still hold the firing —
--- interrupt the runs it would have produced; a dispatched run's cancel
--- travels the interrupt path above. Returns true when something matched.
+-- Gate-forwarded cancel for one open firing. Pending compiles are removed so
+-- late compiler replies are ignored. Attached runs lose their capability
+-- ownership before they are terminated, so a late run result cannot emit a
+-- duplicate source result after the gate has settled the outer invocation.
 function M.cancel(firing_id)
   if type(firing_id) ~= "string" then
     return false
   end
   local hit = false
-  for run_id, pending in pairs(state.pending_runs) do
+  for load_id, pending in pairs(state.pending_loads) do
     if pending.firing_id == firing_id then
-      emit_as(SOURCE_NAME, "mag", { kind = "mag.interrupt_run", run_id = run_id })
+      state.pending_loads[load_id] = nil
+      hit = true
+    end
+  end
+  for run_id, pending in pairs(state.attached_runs) do
+    if pending.firing_id == firing_id then
+      state.attached_runs[run_id] = nil
+      emit_as(SOURCE_NAME, "mag", { kind = "mag.interrupt_run", run_id = run_id, terminate = true })
       hit = true
     end
   end
   return hit
 end
 
--- A session ending mid-eval must not strand an open firing: fail every
--- firing still blocked (compile handshakes, plus blocking runs — detached
--- firings already settled) and kill the in-flight runs (the kernel reaps
--- their actors through the fold). Never consumes the envelope — init.lua's
--- own session-end handling still runs.
+-- Session-end fails pending/attached capabilities. Lead-submitted runs are not
+-- represented here; init.lua's standard active-run cleanup owns them.
 local function on_session_end()
   for _, pending in pairs(state.pending_loads) do
     tool_err(pending.firing_id, "mag-eval: session ended before the run settled")
   end
   state.pending_loads = {}
-  for run_id, pending in pairs(state.pending_runs) do
+  for run_id, pending in pairs(state.attached_runs) do
     emit_as(SOURCE_NAME, "mag", { kind = "mag.kill_run", run_id = run_id })
-    if not pending.detached then
-      tool_err(pending.firing_id, "mag-eval: session ended before the run settled")
-    end
+    tool_err(pending.firing_id, "mag-eval: session ended before the run settled")
   end
-  state.pending_runs = {}
+  state.attached_runs = {}
   return false
 end
 
@@ -412,7 +374,7 @@ M._internals = {
     dependency_module_roots = {}
     state.seq = 0
     state.pending_loads = {}
-    state.pending_runs = {}
+    state.attached_runs = {}
   end,
 }
 

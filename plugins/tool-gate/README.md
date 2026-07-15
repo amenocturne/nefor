@@ -40,7 +40,10 @@ At the transport layer, `yolo` overrides all policies to auto-approve.
   or `yolo`).
 - `tool-gate.mode_changed` announces the active mode after a change.
 - `tool.permission_response` answers a pending prompt with approval/rejection.
-- `tool-gate.tool.cancel` forwards cancellation for an in-flight tool call.
+- `tool-gate.tool.cancel` terminally settles a call by its outer caller ID. A
+  pending permission request is removed before stale approval can forward it;
+  an active source correlation is removed before cancellation is forwarded, so
+  late source results and duplicate cancellation are ignored.
 
 The starter starts `tool-validator` before the gate and routes prompt requests
 through it. The validator may auto-approve, deny, or defer to the chat popup

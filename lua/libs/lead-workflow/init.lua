@@ -171,6 +171,8 @@ local state = {
 local SOURCE_NAME = "lead-workflow"
 
 local register_active_run
+local submit_loaded_run
+local invalidate_pending_mag_loads
 local graph_status
 local terminate_graph
 local now_ms
@@ -1121,13 +1123,8 @@ local function interrupt_active_runs()
 end
 
 -- Completeness for the general cancel route: a `tool.cancel` addressed to a
--- `mag` execute DISPATCH firing (the correlation that acked "executing")
--- propagates into that run just like the interrupt_all entry point — and, being
--- a dispatched run, TERMINATES it (`terminate = true`) so the run ends failed
--- rather than letting its agent llm re-fire to a phantom success. The mag
--- execute firing is acked at dispatch, so the kernel rarely emits a cancel for
--- it — this covers the case where it does, matching mag-eval.cancel's shape for
--- blocking firings. Returns true when a matching run was found.
+-- submitted dispatch firing propagates into its standard active run. This
+-- covers file-based execute and lead-called eval identically.
 local function interrupt_run_by_dispatch_firing(firing_id)
   if type(firing_id) ~= "string" then return false end
   local hit = false
@@ -1206,6 +1203,10 @@ graph_status = function(firing_id, args)
 end
 
 local function terminate_active_graph()
+  -- Session teardown invalidates compile handshakes before touching submitted
+  -- runs, so delayed compiler replies cannot cross the session boundary.
+  invalidate_pending_mag_loads(nil)
+
   -- Session boundary flushes the plan slot unconditionally — no
   -- approval survives across sessions. If a write-review was in-flight
   -- at session-end, the deferred firing is abandoned; the agentic-loop
@@ -1404,6 +1405,76 @@ local function begin_mag_load(firing_id, action, args, ws)
   })
 end
 
+-- Invalidate file-based compile handshakes as one state transition. A firing
+-- id removes only that invocation's load; nil clears every pending file load
+-- at the session boundary. Once removed, both late mag.loaded and mag.error
+-- are uncorrelated no-ops and cannot submit or settle the source again.
+invalidate_pending_mag_loads = function(firing_id)
+  local hit = false
+  for load_id, pending in pairs(state.pending_mag_load) do
+    if firing_id == nil or pending.firing_id == firing_id then
+      state.pending_mag_load[load_id] = nil
+      hit = true
+    end
+  end
+  return hit
+end
+
+-- Validate and submit one loaded artifact through the standard active-run
+-- channel. Both file-based `mag execute` and lead-called `mag-eval` use this
+-- path, so lifecycle/control/rendering/archival/cleanup have one owner.
+submit_loaded_run = function(pending, body, error_prefix, attached)
+  local artifact = body.artifact
+  local modification = type(artifact) == "table" and artifact.data or nil
+  if type(modification) ~= "table" then
+    emit_tool_result_err(pending.firing_id,
+      error_prefix .. ": mag.loaded reply carried no artifact data")
+    return false
+  end
+  local actors = modification.actors or {}
+  if not validate_factories(actors, pending.firing_id) then return false end
+  if actors_have_writers(actors) and state.gate_mode == "safe"
+      and not has_approved_plan() then
+    emit_tool_result_err(pending.firing_id,
+      "Program contains write-capable agents. Submit a plan via write-review " ..
+      "and get approval before executing.")
+    return false
+  end
+  local terminal_id, result_err = result_actor(modification)
+  if not terminal_id then
+    emit_tool_result_err(pending.firing_id, error_prefix .. ": " .. result_err)
+    return false
+  end
+  local overlay, profile_err = resolve_profiles(actors)
+  if not overlay then
+    emit_tool_result_err(pending.firing_id, error_prefix .. ": " .. profile_err)
+    return false
+  end
+  local exec = {
+    kind = "mag.execute",
+    id = pending.run_id,
+    run_id = pending.run_id,
+    run_name = pending.run_name,
+    session_id = pending.session_id,
+    principal = "subagent",
+    artifact = artifact,
+  }
+  if next(overlay) ~= nil then exec.params_overlay = overlay end
+  emit_as(SOURCE_NAME, "mag", exec)
+  if attached then return true end
+  register_active_run(pending.run_id, actors, terminal_id,
+    pending.firing_id, pending.run_name)
+  emit_tool_result_ok(pending.firing_id, {
+    status = "executing",
+    run_id = pending.run_id,
+    hash = body.hash,
+    engine = "mag-kernel",
+    message = "Program submitted to the MAG actor kernel. Results arrive automatically when the run " ..
+      "completes. STOP here — do not call any more tools until results arrive.",
+  })
+  return true
+end
+
 -- Resume a pending compile/execute once its `mag.load` reply arrives. The
 -- reply's registry has already refreshed state.kernel_factories
 -- (capture_kernel_factories runs first). Compile renders the preview from the
@@ -1445,59 +1516,7 @@ local function resume_pending_load(body)
     return
   end
 
-  -- Execute: validators over the modification's actors.
-  if not validate_factories(actors, pending.firing_id) then return end
-
-  -- Approval gate for write-capable programs (safe mode only; auto/yolo
-  -- bypass — the tool-gate enforces runtime permissions there).
-  if actors_have_writers(actors) and state.gate_mode == "safe"
-      and not has_approved_plan() then
-    emit_tool_result_err(pending.firing_id,
-      "Program contains write-capable agents. Submit a plan via write-review " ..
-      "and get approval before executing.")
-    return
-  end
-
-  local terminal_id, result_err = result_actor(modification)
-  if not terminal_id then
-    emit_tool_result_err(pending.firing_id, "mag execute: " .. result_err)
-    return
-  end
-
-  local overlay, profile_err = resolve_profiles(actors)
-  if not overlay then
-    emit_tool_result_err(pending.firing_id, "mag execute: " .. profile_err)
-    return
-  end
-
-  -- The modification rides INLINE on the execute rather than relying on
-  -- the plugin's resident program: concurrent loaders share the plugin
-  -- (the turn spawner loads the lead's own turn-program through the same
-  -- mag.load surface), so "execute whatever was loaded last" would race.
-  local exec = {
-    kind         = "mag.execute",
-    id           = pending.run_id,
-    run_id       = pending.run_id,
-    run_name     = pending.run_name,
-    session_id   = pending.session_id,
-    principal    = "subagent",
-    artifact     = artifact,
-  }
-  if next(overlay) ~= nil then
-    exec.params_overlay = overlay
-  end
-  emit_as(SOURCE_NAME, "mag", exec)
-
-  register_active_run(pending.run_id, actors, terminal_id, pending.firing_id, pending.run_name)
-
-  emit_tool_result_ok(pending.firing_id, {
-    status  = "executing",
-    run_id  = pending.run_id,
-    hash    = body.hash,
-    engine  = "mag-kernel",
-    message = "Program submitted to the MAG actor kernel. Results arrive automatically when the run " ..
-      "completes. STOP here — do not call any more tools until results arrive.",
-  })
+  submit_loaded_run(pending, body, "mag execute")
 end
 
 -- A `mag.error` reply to an in-flight load: the compiler rejected the
@@ -1595,7 +1614,10 @@ local function handle_tool_invoke(body)
     emit_tool_result_err(firing_id, "lead-workflow: unknown tool '" .. tostring(name) .. "'")
     return
   end
-  handler(firing_id, body.args or {})
+  handler(firing_id, body.args or {}, {
+    caller_id = body.caller_id,
+    from = body.from,
+  })
 end
 
 local function receive_msg(entry)
@@ -1627,15 +1649,13 @@ local function receive_msg(entry)
     return
   end
 
-  -- The gate forwards a `tool.cancel` for one of our firings here when a
-  -- graceful interrupt cancels it. Two firing shapes propagate down:
-  --   * a mag-eval blocking firing → its dispatched sub-run (mag-eval.cancel)
-  --   * a `mag` execute dispatch firing → its fire-and-forget run
-  -- Both resolve to `mag.interrupt_run`, killing the run's in-flight bash. Live
-  -- path only.
+  -- Gate-forwarded cancel addresses the source's inner firing id. For evals it
+  -- either removes a pending compile/interrupts an attached run, or matches a
+  -- lead-submitted standard run's dispatch_firing_id.
   if kind == "lead-workflow.tool.cancel" then
     if replay_window.active() then return end
     mag_eval.cancel(body.id)
+    invalidate_pending_mag_loads(body.id)
     interrupt_run_by_dispatch_firing(body.id)
     return
   end
@@ -1691,8 +1711,12 @@ local function receive_msg(entry)
     return
   end
 
-  -- mag-eval's slice of the bus protocol (its own loads, runs, session-end
-  -- cleanup). Consumes only envelopes correlated to a pending eval.
+  -- Refresh the registry before either eval or file-load validation consumes a
+  -- loaded artifact.
+  if kind == "mag.loaded" then capture_kernel_factories(body) end
+
+  -- mag-eval owns pending compile correlation and attached graph-agent runs.
+  -- Lead-submitted evals join the standard active-run path from its load hook.
   if mag_eval.on_bus(kind, body) then return end
 
   -- MAG kernel path.
@@ -1706,7 +1730,6 @@ local function receive_msg(entry)
   -- the registry, then resume the awaiting compile (preview) or execute
   -- (validate → mag.execute).
   if kind == "mag.loaded" then
-    capture_kernel_factories(body)
     resume_pending_load(body)
     return
   end
@@ -1813,7 +1836,20 @@ function M.configure(opts)
   if roots == nil then roots = {} end
   validate_dependency_module_roots(roots)
   dependency_module_roots = copy_roots(roots)
-  mag_eval.configure({ dependency_module_roots = copy_roots(roots) })
+  mag_eval.configure({
+    dependency_module_roots = copy_roots(roots),
+    submit_run = function(pending, body, attached)
+      return submit_loaded_run(pending, body, "mag-eval", attached)
+    end,
+  })
 end
+
+-- Install the standard lead-run submitter even when the composition uses the
+-- module defaults and never calls configure explicitly.
+mag_eval.configure({
+  submit_run = function(pending, body, attached)
+    return submit_loaded_run(pending, body, "mag-eval", attached)
+  end,
+})
 
 return M
