@@ -32,10 +32,11 @@ Events sent before readiness are rejected with an error direct-delivered to the 
 
 ## Bus publishing and delivery
 
-Lua exposes two engine paths:
+Lua exposes three engine paths:
 
 - nefor.engine.send(payload, target?) publishes a Step entry to the in-memory bus log. The broker drain invokes Lua dispatch for the new tail.
 - nefor.engine.deliver(peer, payload) writes one line to one peer stdin without appending a bus-log entry.
+- nefor.engine.deliver_batch(peer, payloads) writes a finite ordered batch to one peer without appending bus-log entries or applying the ordinary live-queue overflow policy. Earlier deliveries drain first; later deliveries and connection close cannot overtake the batch. This path is intended for replay/state restoration, not unbounded live streams.
 
 The bus log contains only payloads explicitly published with send. Session persistence is implemented by Lua session actors that observe the bus; the engine itself writes no session jsonl.
 
@@ -56,6 +57,6 @@ When a plugin completes ready, core.ncp replays prior bus-log events to that plu
 
 Malformed JSON, invalid envelope type, event body that is not an object, unknown system kind, duplicate ready, and protocol-version mismatch produce direct error messages from Lua to the source plugin.
 
-Writer queue overflow is logged by the engine; no shipped protocol-level queue_overflow message is emitted.
+Ordinary live writer-queue overflow drops the oldest queued live line and is logged by the engine; no shipped protocol-level queue_overflow message is emitted. Explicit finite replay batches are lossless and do not make the live queue unbounded.
 
 The engine does not synthesize an NCP shutdown system message on normal peer departure. Shutdown is connection closure/cascade-close behavior coordinated by the engine and Lua composition. Plugins that want to announce departure may publish an ordinary plugin-authored goodbye event before exiting.

@@ -14,6 +14,10 @@
 //!   to the named peer's stdin without appending a new log entry.
 //!   Targeted only — broadcast belongs to `send`. Lua exposes this as
 //!   `nefor.engine.deliver(peer, payload)`.
+//! * [`deliver_batch`](EngineOps::deliver_batch) — **lossless delivery**.
+//!   Writes an ordered batch to one peer without subjecting its lines to
+//!   the bounded live-traffic overflow policy. Lua exposes this as
+//!   `nefor.engine.deliver_batch(peer, payloads)` for finite replay bursts.
 //!
 //! This split keeps the bus log canonical: a "1 emission → 1 entry"
 //! invariant. Without it the dispatch hook's per-peer fan-out for a
@@ -83,6 +87,19 @@ pub trait EngineOps: Send + Sync {
     /// (typically: log + drop). Default impl returns `Ok(())` so test
     /// recorders that don't care about transport semantics stay terse.
     fn deliver(&self, _target: PluginName, _payload: String) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Forward a finite ordered batch to one peer without logging it and
+    /// without applying the ordinary live-delivery overflow policy.
+    ///
+    /// The default preserves compatibility for recording implementations;
+    /// production overrides this to enqueue the batch atomically so later
+    /// sends and connection close cannot overtake it.
+    fn deliver_batch(&self, target: PluginName, payloads: Vec<String>) -> Result<(), String> {
+        for payload in payloads {
+            self.deliver(target.clone(), payload)?;
+        }
         Ok(())
     }
 
@@ -192,6 +209,65 @@ pub fn install_engine(lua: &Lua, nefor_tbl: &Table, ops: Arc<dyn EngineOps>) -> 
         Ok(())
     })?;
     engine.set("deliver", deliver_fn)?;
+
+    // nefor.engine.deliver_batch(peer, payloads) — ordered, lossless
+    // delivery for finite replay bursts. This is deliberately separate
+    // from `deliver`: ordinary live traffic retains its bounded
+    // drop-oldest queue semantics.
+    let ops_for_deliver_batch = Arc::clone(&ops);
+    let deliver_batch_fn = lua.create_function(move |_, args: mlua::Variadic<Value>| {
+        let peer = match args.first() {
+            Some(Value::String(s)) => {
+                let raw = s.to_str()?.to_owned();
+                PluginName::new(raw)
+                    .map_err(|e| mlua::Error::runtime(format!("nefor.engine.deliver_batch: {e}")))?
+            }
+            Some(other) => {
+                return Err(mlua::Error::runtime(format!(
+                    "nefor.engine.deliver_batch: peer must be a string (got {})",
+                    other.type_name(),
+                )));
+            }
+            None => {
+                return Err(mlua::Error::runtime(
+                    "nefor.engine.deliver_batch: peer required (first argument must be a string)",
+                ));
+            }
+        };
+        let payload_table = match args.get(1) {
+            Some(Value::Table(table)) => table,
+            Some(other) => {
+                return Err(mlua::Error::runtime(format!(
+                    "nefor.engine.deliver_batch: payloads must be a table (got {})",
+                    other.type_name(),
+                )));
+            }
+            None => {
+                return Err(mlua::Error::runtime(
+                    "nefor.engine.deliver_batch: payloads required (second argument must be a table)",
+                ));
+            }
+        };
+        let mut payloads = Vec::with_capacity(payload_table.raw_len());
+        for index in 1..=payload_table.raw_len() {
+            match payload_table.raw_get::<Value>(index)? {
+                Value::String(s) => payloads.push(s.to_str()?.to_owned()),
+                other => {
+                    return Err(mlua::Error::runtime(format!(
+                        "nefor.engine.deliver_batch: payload at index {index} must be a string (got {})",
+                        other.type_name(),
+                    )));
+                }
+            }
+        }
+        if let Err(e) = ops_for_deliver_batch.deliver_batch(peer, payloads) {
+            return Err(mlua::Error::runtime(format!(
+                "nefor.engine.deliver_batch: {e}"
+            )));
+        }
+        Ok(())
+    })?;
+    engine.set("deliver_batch", deliver_batch_fn)?;
 
     // nefor.engine.now() returns an ISO-8601 timestamp with millisecond
     // precision — the wire format spec §3 requires for the `ts` field.
@@ -543,6 +619,30 @@ mod tests {
             .exec()
             .expect_err("unknown peer must surface as Lua error");
         assert!(err.to_string().contains("not connected"), "got: {err}");
+    }
+
+    #[test]
+    fn engine_deliver_batch_records_every_payload_in_order() {
+        let (lua, ops) = setup();
+        lua.load(r#"nefor.engine.deliver_batch("mock-plugin", { "first", "middle", "final" })"#)
+            .exec()
+            .unwrap();
+        let delivered = ops.delivered();
+        assert_eq!(delivered.len(), 3);
+        assert_eq!(delivered[0].1, "first");
+        assert_eq!(delivered[1].1, "middle");
+        assert_eq!(delivered[2].1, "final");
+    }
+
+    #[test]
+    fn engine_deliver_batch_rejects_non_string_payload() {
+        let (lua, ops) = setup();
+        let err = lua
+            .load(r#"nefor.engine.deliver_batch("mock-plugin", { "first", 2 })"#)
+            .exec()
+            .expect_err("non-string batch item must be rejected");
+        assert!(err.to_string().contains("index 2"), "got: {err}");
+        assert!(ops.delivered().is_empty());
     }
 
     #[test]

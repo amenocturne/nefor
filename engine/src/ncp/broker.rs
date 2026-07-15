@@ -234,6 +234,20 @@ impl EngineOps for BrokerOps {
         let _ = conn.send(ConnectionOutbound::Send(line));
         Ok(())
     }
+
+    fn deliver_batch(&self, target: PluginName, payloads: Vec<String>) -> Result<(), String> {
+        let guard = match self.shared.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let conn = guard
+            .conns
+            .get(&target)
+            .ok_or_else(|| format!("target plugin '{target}' is not connected"))?;
+        let lines = payloads.into_iter().map(with_trailing_newline).collect();
+        conn.send(ConnectionOutbound::SendLosslessBatch(lines))
+            .map_err(|_| format!("target plugin '{target}' disconnected during delivery"))
+    }
 }
 
 fn with_trailing_newline(mut s: String) -> String {

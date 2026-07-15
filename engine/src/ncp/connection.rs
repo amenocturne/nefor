@@ -56,6 +56,10 @@ pub enum ConnectionOutbound {
     /// trailing `\n` (or whatever framing the wire expects) — the writer
     /// does not add one.
     Send(String),
+    /// Send a pre-ordered batch without applying the live-traffic overflow
+    /// policy to any of its lines. The writer still drains earlier sends
+    /// first and later sends (including `Close`) only after the full batch.
+    SendLosslessBatch(Vec<String>),
     /// Close the connection after draining the preceding sends.
     Close,
 }
@@ -176,12 +180,17 @@ async fn read_line_capped<R: AsyncRead + Unpin>(
     }
 }
 
-/// Spawn the writer task. Implements the bounded receive queue from §6: an
-/// internal [`VecDeque`] of capacity `cap` (default
-/// [`DEFAULT_QUEUE_CAPACITY`]). When a Send arrives and the queue is full,
-/// the oldest queued line is dropped and a warning is logged — the broker no
-/// longer emits a protocol-level `QueueOverflow` system message (that was a
-/// starter/init.lua concern in the new model).
+/// Spawn the writer task. Implements the bounded receive queue from §6 for
+/// ordinary [`ConnectionOutbound::Send`] traffic. When that live queue is
+/// full, the oldest lossy line is dropped and a warning is logged — the
+/// broker no longer emits a protocol-level `QueueOverflow` system message
+/// (that was a starter/init.lua concern in the new model).
+///
+/// Finite [`ConnectionOutbound::SendLosslessBatch`] chunks are protected
+/// from that policy and retain their position relative to preceding sends,
+/// later sends, and [`ConnectionOutbound::Close`]. Their memory is explicitly
+/// owned by the replay caller rather than silently making all live traffic
+/// unbounded.
 ///
 /// `rx` itself is unbounded so the broker is never blocked; backpressure
 /// is enforced inside this task. Exits on [`ConnectionOutbound::Close`] or
@@ -193,7 +202,8 @@ pub async fn run_writer(
     cap: usize,
 ) {
     let mut rx = rx;
-    let mut q: VecDeque<String> = VecDeque::with_capacity(cap.min(1024));
+    let mut q: VecDeque<QueuedOutbound> = VecDeque::with_capacity(cap.min(1024));
+    let mut queued_lossy = 0usize;
     let mut close_after_drain = false;
 
     loop {
@@ -202,15 +212,29 @@ pub async fn run_writer(
         loop {
             match rx.try_recv() {
                 Ok(ConnectionOutbound::Send(payload)) => {
-                    if q.len() >= cap {
-                        let _dropped = q.pop_front();
+                    if queued_lossy >= cap {
+                        let oldest_lossy = q
+                            .iter()
+                            .position(|item| matches!(item, QueuedOutbound::Lossy(_)));
+                        if let Some(index) = oldest_lossy {
+                            let _dropped = q.remove(index);
+                            queued_lossy = queued_lossy.saturating_sub(1);
+                        }
                         tracing::warn!(
                             conn = %id,
                             cap,
                             "write queue full; dropping oldest line",
                         );
                     }
-                    q.push_back(payload);
+                    if cap > 0 {
+                        q.push_back(QueuedOutbound::Lossy(payload));
+                        queued_lossy += 1;
+                    }
+                }
+                Ok(ConnectionOutbound::SendLosslessBatch(payloads)) => {
+                    if !payloads.is_empty() {
+                        q.push_back(QueuedOutbound::Lossless(payloads.into()));
+                    }
                 }
                 Ok(ConnectionOutbound::Close) => {
                     close_after_drain = true;
@@ -225,7 +249,7 @@ pub async fn run_writer(
         }
 
         // Try to write the head of the queue.
-        if let Some(line) = q.pop_front() {
+        if let Some(line) = pop_next_line(&mut q, &mut queued_lossy) {
             if writer.write_all(line.as_bytes()).await.is_err() {
                 return;
             }
@@ -243,9 +267,43 @@ pub async fn run_writer(
 
         // Nothing to do — wait for at least one new message.
         match rx.recv().await {
-            Some(ConnectionOutbound::Send(payload)) => q.push_back(payload),
+            Some(ConnectionOutbound::Send(payload)) => {
+                if cap > 0 {
+                    q.push_back(QueuedOutbound::Lossy(payload));
+                    queued_lossy += 1;
+                }
+            }
+            Some(ConnectionOutbound::SendLosslessBatch(payloads)) => {
+                if !payloads.is_empty() {
+                    q.push_back(QueuedOutbound::Lossless(payloads.into()));
+                }
+            }
             Some(ConnectionOutbound::Close) => close_after_drain = true,
             None => close_after_drain = true,
+        }
+    }
+}
+
+enum QueuedOutbound {
+    Lossy(String),
+    Lossless(VecDeque<String>),
+}
+
+fn pop_next_line(queue: &mut VecDeque<QueuedOutbound>, queued_lossy: &mut usize) -> Option<String> {
+    match queue.front_mut()? {
+        QueuedOutbound::Lossy(_) => {
+            let QueuedOutbound::Lossy(line) = queue.pop_front()? else {
+                unreachable!();
+            };
+            *queued_lossy = queued_lossy.saturating_sub(1);
+            Some(line)
+        }
+        QueuedOutbound::Lossless(lines) => {
+            let line = lines.pop_front();
+            if lines.is_empty() {
+                queue.pop_front();
+            }
+            line
         }
     }
 }
@@ -409,6 +467,63 @@ mod tests {
             let b: u32 = pair[1].trim_start_matches("line").parse().unwrap();
             assert!(a < b, "writer delivered lines out of order: {seen:?}");
         }
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_delivers_large_replay_batch_losslessly_to_slow_consumer_then_closes() {
+        const DISPLAY_EVENTS: usize = 1_536;
+
+        // The tiny duplex capacity stalls the writer until the simulated TUI
+        // starts reading. The replay is deliberately larger than the normal
+        // 1,024-line queue cap that caused resumed transcripts to truncate.
+        let (client, server) = duplex(64);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let id = ConnectionId::next();
+        let handle = tokio::spawn(run_writer(id, Box::pin(server), rx, DEFAULT_QUEUE_CAPACITY));
+
+        tx.send(ConnectionOutbound::Send("ready_ok\n".into()))
+            .unwrap();
+        let mut replay = Vec::with_capacity(DISPLAY_EVENTS + 3);
+        replay.push("sessions.replay.start\n".to_owned());
+        for index in 0..DISPLAY_EVENTS {
+            replay.push(format!("chat.message.append:{index}\n"));
+        }
+        replay.push("sessions.replay.end\n".to_owned());
+        replay.push("sessions.resume_done\n".to_owned());
+        tx.send(ConnectionOutbound::SendLosslessBatch(replay))
+            .unwrap();
+        tx.send(ConnectionOutbound::Send("live.after_resume\n".into()))
+            .unwrap();
+        tx.send(ConnectionOutbound::Close).unwrap();
+
+        tokio::task::yield_now().await;
+        let mut reader = BufReader::new(client);
+        let mut seen = Vec::new();
+        loop {
+            let mut line = String::new();
+            let read = reader.read_line(&mut line).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            seen.push(line.trim_end_matches('\n').to_owned());
+        }
+
+        assert_eq!(seen.len(), DISPLAY_EVENTS + 5, "replay line was lost");
+        assert_eq!(seen[0], "ready_ok");
+        assert_eq!(seen[1], "sessions.replay.start");
+        assert_eq!(seen[2], "chat.message.append:0");
+        assert_eq!(
+            seen[2 + DISPLAY_EVENTS / 2],
+            format!("chat.message.append:{}", DISPLAY_EVENTS / 2)
+        );
+        assert_eq!(
+            seen[1 + DISPLAY_EVENTS],
+            format!("chat.message.append:{}", DISPLAY_EVENTS - 1)
+        );
+        assert_eq!(seen[2 + DISPLAY_EVENTS], "sessions.replay.end");
+        assert_eq!(seen[3 + DISPLAY_EVENTS], "sessions.resume_done");
+        assert_eq!(seen[4 + DISPLAY_EVENTS], "live.after_resume");
         handle.await.unwrap();
     }
 }

@@ -34,15 +34,31 @@ function M.spawn_spec(command)
   end
 
   local function to_plugin(envs)
+    local payloads = {}
+    local contains_replay = false
     for _, env in ipairs(envs) do
       if env.from ~= name then
-        nefor.engine.deliver(name, json.encode({
+        payloads[#payloads + 1] = json.encode({
           type = env.type,
           from = env.from,
           ts   = env.ts,
           body = env.body,
-        }))
+        })
+        if env.replay == true then contains_replay = true end
       end
+    end
+
+    if contains_replay then
+      -- Protect the complete dispatch batch, not just entries stamped
+      -- replay=true. `sessions.replay.end` flips the stamp before it is
+      -- appended, and resume completion follows it; both must stay ordered
+      -- behind the replay they frame even when the TUI consumes slowly.
+      nefor.engine.deliver_batch(name, payloads)
+      return
+    end
+
+    for _, payload in ipairs(payloads) do
+      nefor.engine.deliver(name, payload)
     end
   end
 

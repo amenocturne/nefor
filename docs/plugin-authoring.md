@@ -89,6 +89,8 @@ Default delivery offers published Step events to ready wrappers, then:
 
 `nefor.engine.deliver(peer, payload)` is direct delivery to one peer's stdin and does not append to the bus log. Use `send` for events that should become bus history; use `deliver` for targeted side effects.
 
+`nefor.engine.deliver_batch(peer, payloads)` is the lossless counterpart for a finite, already-materialized replay/state-restoration batch. It preserves the batch's position relative to earlier and later deliveries, including connection close. Do not use it for open-ended live streams: ordinary `deliver` intentionally keeps the per-peer live queue bounded.
+
 ### Per-peer isolation and replay
 
 `core.ncp` deep-copies event bodies for each peer before calling `to_plugin`, so one wrapper's mutation does not leak into another wrapper's batch.
