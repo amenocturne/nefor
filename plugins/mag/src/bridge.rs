@@ -292,6 +292,12 @@ fn gate_invoke(gate: &str, body: &Map<String, Value>) -> Map<String, Value> {
     if let Some(from) = body.get("from").and_then(Value::as_str) {
         m.insert("from".into(), Value::String(from.to_owned()));
     }
+    // Structured invocation provenance is stamped by the authoritative run
+    // context and preserved verbatim. Downstream diagnostics must not recover
+    // run/actor identity by parsing the opaque correlation id.
+    if let Some(invocation @ Value::Object(_)) = body.get("invocation") {
+        m.insert("invocation".into(), invocation.clone());
+    }
     // The tool name: routing.lua stamps the capability name on the envelope;
     // the wrapped request carries the same name (run-tool sets both).
     if let Some(name) = body
@@ -562,6 +568,32 @@ mod tests {
             Some(&json!(["list_dir", "read_file"]))
         );
         assert_eq!(gate.get("da-policy"), Some(&json!({ "git": "read" })));
+    }
+
+    #[test]
+    fn tool_invoke_preserves_structured_invocation_provenance() {
+        let mut bridge = CapabilityBridge::new(GATE);
+        let invocation = json!({
+            "session_id": "session-1",
+            "run_id": "run-1",
+            "run_scope": "r7",
+            "actor_id": "scout.run-tool",
+            "capability_id": "r7/cap-4",
+            "principal": "subagent"
+        });
+        let out = bridge.translate_emit(obj(json!({
+            "kind": "tool.invoke",
+            "id": "r7/cap-4",
+            "from": "scout.run-tool",
+            "name": "read_file",
+            "args": { "name": "read_file", "args": { "path": "src/lib.rs" } },
+            "invocation": invocation
+        })));
+        let gate = &out[0];
+        assert_eq!(gate.get("id"), Some(&json!("r7/cap-4")));
+        assert_eq!(gate.get("from"), Some(&json!("scout.run-tool")));
+        assert_eq!(gate.get("invocation"), Some(&invocation));
+        assert_eq!(gate.get("args"), Some(&json!({ "path": "src/lib.rs" })));
     }
 
     #[test]

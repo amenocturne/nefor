@@ -131,6 +131,10 @@ function M.new(opts)
     -- Injected host bus seam. Kept pure by injection: init.lua wires a stub
     -- until the host bus lands; tests pass a capturing sink.
     bus_emit = opts.bus_emit or noop,
+    -- Authoritative run-context provenance for capability invocations. The
+    -- context owns run/session/scope identity; routing contributes actor and
+    -- the freshly minted capability id without parsing either opaque value.
+    invocation_provenance = opts.invocation_provenance,
     -- Injected lifecycle-event sink (observer.lua's EVENTS set) and per-node
     -- output persistence sink. Both default to no-ops so routing stays pure and
     -- unit-testable; init.lua wires the real emitter and an output-persistence-
@@ -551,12 +555,17 @@ end
 -- context).
 function M:on_capability_invoke(id, message)
   local request_id = self.correlation:open(id, message.ref)
+  local invocation = nil
+  if type(self.invocation_provenance) == "function" then
+    invocation = self.invocation_provenance(id, request_id)
+  end
   self.bus_emit({
     kind = "tool.invoke",
     id = request_id,
     from = id,
     name = message.capability,
     args = message.request,
+    invocation = invocation,
   })
 end
 

@@ -283,6 +283,7 @@ local function on_loaded(body)
     run_id       = pending.run_id,
     run_name     = pending.run_name,
     session_id   = pending.session_id,
+    principal    = "subagent",
     artifact     = body.artifact,
   })
   state.pending_runs[pending.run_id] = pending

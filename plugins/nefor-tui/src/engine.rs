@@ -409,6 +409,22 @@ impl Engine {
         self.dispatch_msg(msg)
     }
 
+    /// Dispatch an inbound event while preserving its engine-stamped sender
+    /// for reducers that validate authoritative event provenance. Any
+    /// body-authored value under the reserved key is overwritten.
+    pub fn dispatch_envelope_from(
+        &mut self,
+        body: &JsonMap<String, JsonValue>,
+        source: &str,
+    ) -> Result<(), TuiError> {
+        let mut stamped = body.clone();
+        stamped.insert(
+            "_event_source".to_owned(),
+            JsonValue::String(source.to_owned()),
+        );
+        self.dispatch_envelope_body(&stamped)
+    }
+
     /// Drain accumulated NCP egress for the binary's writer. Returns
     /// `(target_hint, body)` pairs in submission order. The hint is for
     /// observability only — the engine just emits a broadcast event;

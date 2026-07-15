@@ -68,12 +68,12 @@ function M.plan(text, submitted_at, plan_id, status)
   }
 end
 
-function M.agents_md(path, dir, text)
+function M.agents_md(path, dir, text, notice_id)
   local v = next_v()
   log.log("entry", "create kind=agents_md path=%s v=%d", path or "?", v)
   return {
     kind = "agents_md", role = "system",
-    path = path, dir = dir, text = text,
+    path = path, dir = dir, text = text, notice_id = notice_id,
     v = v,
   }
 end

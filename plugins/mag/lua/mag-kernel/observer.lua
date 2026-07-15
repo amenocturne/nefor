@@ -105,7 +105,9 @@ function M:run_started(meta)
     kind = EVENTS.run_started,
     run_id = meta.run_id,
     run_name = meta.run_name,
+    session_id = meta.session_id,
     scope = meta.scope,
+    principal = meta.principal,
   })
 end
 

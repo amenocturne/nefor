@@ -124,11 +124,12 @@ async fn write_env(stdin: &mut ChildStdin, env: Envelope) {
 }
 
 async fn send_event(stdin: &mut ChildStdin, body: Map<String, Value>) {
-    write_env(
-        stdin,
-        Envelope::event(PluginName::engine(), Timestamp::now(), body),
-    )
-    .await;
+    let source = if body.get("kind").and_then(Value::as_str) == Some("mag.execute") {
+        PluginName::new("agentic-loop").expect("agentic-loop plugin name")
+    } else {
+        PluginName::engine()
+    };
+    write_env(stdin, Envelope::event(source, Timestamp::now(), body)).await;
 }
 
 async fn handshake<R: AsyncBufReadExt + Unpin>(reader: &mut R, stdin: &mut ChildStdin) {
@@ -226,6 +227,7 @@ fn execute_body(
         "run_id": run_id,
         "run_name": "lead",
         "session_id": SESSION_ID,
+        "principal": "lead",
         "artifact": artifact,
         "params_overlay": {
             "lead.llm": {
@@ -311,6 +313,8 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
             "kind": "mag.execute",
             "id": "typed-schema-tamper",
             "run_id": "typed-schema-tamper-run",
+            "session_id": SESSION_ID,
+            "principal": "lead",
             "artifact": artifact.clone(),
             "params_overlay": {
                 "typed-task.structured": {
@@ -338,6 +342,7 @@ async fn typed_task_contract_lowers_and_corrects_mock_provider_json() {
             "run_id": "typed-run",
             "run_name": "typed-task",
             "session_id": SESSION_ID,
+            "principal": "lead",
             "artifact": artifact,
             "params_overlay": {
                 "typed-task.structured": { "provider": MOCK, "model": "mock-model" }
@@ -496,7 +501,8 @@ async fn dynamic_tasks_real_agents_complete_out_of_order_and_preserve_planner_or
     send_event(
         &mut stdin,
         obj(json!({"kind":"mag.execute","id":"dynamic-exec",
-      "run_id":"dynamic-run","run_name":"dynamic-tasks","session_id":SESSION_ID})),
+      "run_id":"dynamic-run","run_name":"dynamic-tasks","session_id":SESSION_ID,
+      "principal":"lead"})),
     )
     .await;
 
@@ -599,7 +605,7 @@ async fn dynamic_tasks_zero_bypasses_collector_and_reaches_static_summarizer() {
         &mut stdin,
         obj(
             json!({"kind":"mag.execute","id":"zero-exec","run_id":"zero-run",
-      "run_name":"zero","session_id":SESSION_ID}),
+      "run_name":"zero","session_id":SESSION_ID,"principal":"lead"}),
         ),
     )
     .await;
@@ -676,7 +682,7 @@ async fn dynamic_tasks_one_runs_one_real_worker_and_static_summarizer() {
         &mut stdin,
         obj(
             json!({"kind":"mag.execute","id":"one-exec","run_id":"one-run",
-      "run_name":"one","session_id":SESSION_ID}),
+      "run_name":"one","session_id":SESSION_ID,"principal":"lead"}),
         ),
     )
     .await;
@@ -730,7 +736,7 @@ async fn dynamic_tasks_invalid_planner_spawns_nothing_and_returns_typed_error() 
         &mut stdin,
         obj(
             json!({"kind":"mag.execute","id":"invalid-exec","run_id":"invalid-run",
-      "run_name":"invalid","session_id":SESSION_ID}),
+      "run_name":"invalid","session_id":SESSION_ID,"principal":"lead"}),
         ),
     )
     .await;
@@ -898,20 +904,78 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         invoke.get("name").and_then(Value::as_str),
         Some("read_file")
     );
+    let provenance = invoke
+        .get("invocation")
+        .and_then(Value::as_object)
+        .expect("gate invoke carries authoritative run provenance");
+    assert_eq!(provenance.get("session_id"), Some(&json!(SESSION_ID)));
+    assert_eq!(provenance.get("run_id"), Some(&json!("lead-run-1")));
+    assert_eq!(provenance.get("run_scope"), Some(&json!(scope)));
+    assert_eq!(provenance.get("principal"), Some(&json!("lead")));
+    assert_eq!(provenance.get("capability_id"), Some(&json!(cap_id)));
+    assert_eq!(
+        provenance.get("actor_id"),
+        invoke.get("from"),
+        "the run binding signs the invoking actor"
+    );
+    let notice_text = "Local instruction files available for /private-agent-worktree";
+    // A dedicated notice is an orthogonal bus event. Feeding it between the
+    // capability invoke and gate result must not create another continuation.
+    send_event(
+        &mut stdin,
+        obj(json!({
+            "kind": "chat.instruction.notice",
+            "notice_id": "lead:session:private",
+            "text": notice_text,
+            "path": "/private-agent-worktree",
+            "invocation": provenance,
+        })),
+    )
+    .await;
     send_event(
         &mut stdin,
         obj(json!({ "kind": "tool.result", "id": cap_id, "output": "# nefor" })),
     )
     .await;
 
-    // Round 2: the tool result feeds a fresh provider round; answer final.
+    // Round 2: the tool result feeds exactly one fresh provider round; answer final.
     let create2 = next_event_of_kind(&mut reader, &create_kind).await;
     let chat_id2 = create2
         .get("chat_id")
         .and_then(Value::as_str)
         .expect("round 2 chat_id")
         .to_owned();
-    next_event_of_kind(&mut reader, &complete_kind).await;
+    let mut continuation_appends = Vec::new();
+    loop {
+        let event = next_event(&mut reader, "correlated MAG continuation").await;
+        match event.get("kind").and_then(Value::as_str) {
+            Some(kind) if kind == append_kind => continuation_appends.push(event),
+            Some(kind) if kind == complete_kind => break,
+            Some(kind) if kind == create_kind => {
+                panic!("tool result created a duplicate model continuation: {event:?}")
+            }
+            Some("mag.error") => panic!("lead continuation failed: {event:?}"),
+            _ => {}
+        }
+    }
+    let tool_results: Vec<&Map<String, Value>> = continuation_appends
+        .iter()
+        .filter(|event| event.pointer_str("/message/role") == Some("tool"))
+        .collect();
+    assert_eq!(
+        tool_results.len(),
+        1,
+        "the original gate result reaches provider history exactly once"
+    );
+    assert_eq!(
+        tool_results[0].pointer_str("/message/content"),
+        Some("# nefor")
+    );
+    let provider_history = serde_json::to_string(&continuation_appends).unwrap();
+    assert!(
+        !provider_history.contains(notice_text),
+        "instruction notices are absent from provider history"
+    );
     send_event(
         &mut stdin,
         chat_result(&chat_id2, json!({ "text": "the repo holds nefor" })),
@@ -931,6 +995,21 @@ async fn lead_turn_runs_through_gate_and_second_turn_replays_seeded_history() {
         result.pointer_str("/result/text"),
         Some("the repo holds nefor"),
         "the sink's final answer rides the terminal reply inline"
+    );
+    let delta = result
+        .get("result")
+        .and_then(|value| value.get("transcript_delta"))
+        .and_then(Value::as_array)
+        .expect("lead result carries the model transcript delta");
+    let delta_text = serde_json::to_string(delta).unwrap();
+    assert!(!delta_text.contains(notice_text));
+    assert_eq!(
+        delta
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+            .count(),
+        1,
+        "transcript delta records the original tool result once"
     );
 
     // ── turn 2: the spawner seeds {user, answer} from turn 1 ───────────

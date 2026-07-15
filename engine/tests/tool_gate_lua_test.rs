@@ -115,6 +115,71 @@ fn install_stub_nefor_with_send_recorder(lua: &Lua) -> mlua::Result<()> {
 // ----------------------------------------------------------------
 
 #[test]
+fn mag_run_binding_registry_rejects_forgery_mismatch_and_conflicting_replay() {
+    let lua = Lua::new();
+    install_stub_nefor(&lua).expect("nefor stub");
+    set_package_path(&lua).expect("package.path");
+
+    let result: Table = lua
+        .load(
+            r#"
+            local registry = require("libs.mag-run-bindings").new()
+            local binding = {
+              kind = "mag.run_started", session_id = "session-1", run_id = "run-1",
+              scope = "r1", principal = "subagent",
+            }
+            local valid = {
+              session_id = "session-1", run_id = "run-1", run_scope = "r1",
+              actor_id = "scout.run-tool", capability_id = "r1/cap-1",
+              principal = "subagent",
+            }
+            local direct_rejected = not registry.bind(binding, "direct-tool")
+            local accepted = registry.bind(binding, "mag")
+            local exact_replay = registry.bind(binding, "mag")
+            local valid_notice = registry.validate(valid, "session-1")
+            local failures = {}
+            for field, value in pairs({
+              session_id = "session-2", run_id = "run-2", run_scope = "r2",
+              principal = "lead",
+            }) do
+              local forged = {}
+              for k, v in pairs(valid) do forged[k] = v end
+              forged[field] = value
+              failures[field] = not registry.validate(forged, "session-1")
+            end
+            local conflict_rejected = not registry.bind({
+              session_id = "session-1", run_id = "run-1", scope = "r1",
+              principal = "lead",
+            }, "mag")
+            local poisoned = not registry.validate(valid, "session-1")
+            return {
+              direct_rejected = direct_rejected, accepted = accepted,
+              exact_replay = exact_replay, valid_notice = valid_notice,
+              failures = failures, conflict_rejected = conflict_rejected,
+              poisoned = poisoned,
+            }
+            "#,
+        )
+        .eval()
+        .expect("registry result");
+
+    for field in [
+        "direct_rejected",
+        "accepted",
+        "exact_replay",
+        "valid_notice",
+        "conflict_rejected",
+        "poisoned",
+    ] {
+        assert!(result.get::<bool>(field).unwrap(), "{field}");
+    }
+    let failures: Table = result.get("failures").unwrap();
+    for field in ["session_id", "run_id", "run_scope", "principal"] {
+        assert!(failures.get::<bool>(field).unwrap(), "forged {field}");
+    }
+}
+
+#[test]
 fn translator_exposes_canonical_kinds_for_gate_name() {
     let lua = Lua::new();
     install_stub_nefor(&lua).expect("nefor stub");
@@ -615,7 +680,7 @@ fn agents_md_emit_for_invoke_no_ops_on_non_outbound_invoke_envelopes() {
             local t = lib.translator("tool-gate")
             require("tool-gate.agents_md")._reset()
             local emitted = {}
-            local emitter = chat_emitter.scoped(nil, function(body) emitted[#emitted + 1] = body end)
+            local emitter = chat_emitter.instruction(nil, function(body) emitted[#emitted + 1] = body end)
             local n = lib.agents_md_emit_for_invoke(
               t,
               { type = "event", from = "agentic-loop",
@@ -657,7 +722,10 @@ fn agents_md_emit_for_invoke_emits_for_folder_touching_outbound_invoke() {
               }}
             }})
             local emitted = {{}}
-            local emitter = chat_emitter.scoped("chat-x", function(body) emitted[#emitted + 1] = body end)
+            local emitter = chat_emitter.instruction({{
+              session_id = "session-1", run_id = "sub-run", run_scope = "r2",
+              actor_id = "scout.run-tool", capability_id = "r2/cap-1", principal = "subagent",
+            }}, function(body) emitted[#emitted + 1] = body end)
             local n = lib.agents_md_emit_for_invoke(
               t,
               {{ type = "event", from = "agentic-loop",
@@ -679,13 +747,16 @@ fn agents_md_emit_for_invoke_emits_for_folder_touching_outbound_invoke() {
     assert_eq!(n, 1, "must emit one reminder for the project scope");
     assert_eq!(emitted_len, n);
 
-    // Each emitted body is a chat.message.append { role = system }.
+    // Each emitted body is a dedicated scoped diagnostic event.
     let first: Table = emitted.get(1).expect("first");
     let kind: String = first.get("kind").expect("kind");
-    let role: String = first.get("role").expect("role");
     let text: String = first.get("text").expect("text");
-    assert_eq!(kind, "chat.message.append");
-    assert_eq!(role, "system");
+    let invocation: Table = first.get("invocation").expect("invocation");
+    assert_eq!(kind, "chat.instruction.notice");
+    assert_eq!(
+        invocation.get::<String>("capability_id").unwrap(),
+        "r2/cap-1"
+    );
     assert!(text.contains("Local instruction files available"));
     assert!(text.contains("AGENTS.md"));
     assert!(
@@ -714,7 +785,7 @@ fn agents_md_emit_for_invoke_swallows_underlying_errors_returns_zero() {
             local prev = agents_md.emit_reminders_for_tool_call
             agents_md.emit_reminders_for_tool_call = function() error("boom") end
 
-            local emitter = chat_emitter.scoped(nil, function(_) end)
+            local emitter = chat_emitter.instruction(nil, function(_) end)
             local n = lib.agents_md_emit_for_invoke(
               t,
               { type = "event", from = "agentic-loop",

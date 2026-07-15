@@ -77,21 +77,23 @@ end
 -- ── mark_read + unread_only filtering ─────────────────────────────────
 do
   local S = IF.new()
-  S.mark_read(nil, ROOT .. "/AGENTS.md")
+  S.mark_read("lead:session-1", ROOT .. "/AGENTS.md")
 
-  local all = S.discover(ROOT, { scope = "subfolders" })
+  local all = S.discover(ROOT, { scope = "subfolders", principal = "lead:session-1" })
   local status_by_rel = {}
   for _, f in ipairs(all.files) do status_by_rel[f.relative_path] = f.status end
   assert_eq(status_by_rel["AGENTS.md"], "read", "marked file reports read")
   assert_eq(status_by_rel["sub/CLAUDE.md"], "unread", "unmarked file stays unread")
 
-  local unread = S.discover(ROOT, { scope = "subfolders", unread_only = true })
+  local unread = S.discover(ROOT, {
+    scope = "subfolders", principal = "lead:session-1", unread_only = true,
+  })
   assert_eq(#unread.files, 1, "unread_only hides the read file")
   assert_eq(unread.files[1].relative_path, "sub/CLAUDE.md", "only the unread file remains")
 
   -- Non-instruction paths are ignored by mark_read.
   S.mark_read(nil, ROOT .. "/other.txt")
-  local st = S._state(nil)
+  local st = S._state("lead:session-1")
   assert_true(st.read_files[IF._normalise(ROOT .. "/other.txt")] == nil,
     "mark_read ignores non-instruction filenames")
 end
@@ -145,20 +147,76 @@ do
 
   local emitted = {}
   local emitter = {
-    chat_id = function() return nil end,
-    system  = function(text, opts) emitted[#emitted + 1] = { text = text, opts = opts } end,
+    valid = function() return true end,
+    principal_key = function() return "lead:session-1" end,
+    notice = function(text, opts)
+      emitted[#emitted + 1] = { text = text, opts = opts }
+      return true
+    end,
   }
 
   local first = S.emit_reminders_for_tool_call("list_dir", { path = ROOT }, emitter)
   assert_eq(first, 1, "first folder-touching call emits one reminder")
-  assert_eq(#emitted, 1, "emitter.system called exactly once")
+  assert_eq(#emitted, 1, "emitter.notice called exactly once")
   assert_true(emitted[1].text:match("^Local instruction files available"),
     "emitted reminder carries the reminder header")
   assert_eq(emitted[1].opts.path, ROOT, "reminder is tagged with the touched root path")
 
   local second = S.emit_reminders_for_tool_call("list_dir", { path = ROOT }, emitter)
-  assert_eq(second, 0, "the same scope is not reminded twice")
+  assert_eq(second, 0, "the same lead session is not reminded twice")
   assert_eq(#emitted, 1, "no additional emission on the deduped call")
+
+  local sibling = {
+    valid = function() return true end,
+    principal_key = function() return "subagent:session-1:run-2:scout.run-tool" end,
+    notice = function(text, opts)
+      emitted[#emitted + 1] = { text = text, opts = opts }
+      return true
+    end,
+  }
+  assert_eq(S.emit_reminders_for_tool_call("list_dir", { path = ROOT }, sibling), 1,
+    "a sibling principal touching the same root has independent reminder state")
+  assert_eq(#emitted, 2, "sibling notice is emitted exactly once")
+
+  local same_actor_other_run = {
+    valid = function() return true end,
+    principal_key = function() return "subagent:session-1:run-3:scout.run-tool" end,
+    notice = function(text, opts)
+      emitted[#emitted + 1] = { text = text, opts = opts }
+      return true
+    end,
+  }
+  assert_eq(S.emit_reminders_for_tool_call(
+      "list_dir", { path = ROOT }, same_actor_other_run), 1,
+    "identical actor names in different runs remain distinct principals")
+  assert_eq(#emitted, 3, "same-named actor in another run gets one notice")
+
+  os.execute("mkdir -p '" .. ROOT .. "/other'")
+  write_file(ROOT .. "/other/AGENTS.md", "# other agents\n")
+  local concurrent = {
+    valid = function() return true end,
+    principal_key = function() return "subagent:session-1:run-4:builder.run-tool" end,
+    notice = function(text, opts)
+      emitted[#emitted + 1] = { text = text, opts = opts }
+      return true
+    end,
+  }
+  assert_eq(S.emit_reminders_for_tool_call(
+      "list_dir", { path = ROOT .. "/other" }, concurrent), 1,
+    "a concurrent principal in a different folder gets its own notice")
+  assert_eq(#emitted, 4, "concurrent folder notice is emitted exactly once")
+
+  local invalid = {
+    valid = function() return false end,
+    principal_key = function() return nil end,
+  }
+  assert_eq(S.emit_reminders_for_tool_call("list_dir", { path = ROOT }, invalid), 0,
+    "missing or malformed provenance fails closed")
+  local internal = S._state(nil)
+  assert_true(internal.all_reminded_scopes._global == nil,
+    "invalid scope never creates a global reminder bucket")
+  assert_true(internal.all_read_files._global == nil,
+    "invalid scope never creates a global read bucket")
 end
 
 os.execute("rm -rf '" .. ROOT .. "'")

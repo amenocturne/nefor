@@ -8,15 +8,16 @@ local M = {}
 M.RESULT_LIMIT = 50
 M.INSTRUCTION_FILENAMES = { "AGENTS.md", "CLAUDE.md" }
 
-local function scope_key(chat_id)
-  if type(chat_id) == "string" and chat_id ~= "" then return chat_id end
-  return "_global"
+local function scope_key(principal)
+  if type(principal) == "string" and principal ~= "" then return principal end
+  return nil
 end
 
-local function bucket(tbl, chat_id)
-  local key = scope_key(chat_id)
+local function bucket(tbl, principal, create)
+  local key = scope_key(principal)
+  if not key then return nil end
   local b = tbl[key]
-  if not b then
+  if not b and create ~= false then
     b = {}
     tbl[key] = b
   end
@@ -230,15 +231,17 @@ function M.new()
   local tool_contexts = {}
   local S = {}
 
-  function S.mark_read(chat_id, path)
+  function S.mark_read(principal, path)
     if type(path) ~= "string" or path == "" then return end
     local abs = normalise(to_absolute(path))
     if not is_instruction_file(abs) then return end
-    bucket(read_files, chat_id)[abs] = true
+    local reads = bucket(read_files, principal)
+    if reads then reads[abs] = true end
   end
 
-  local function status_for_file(chat_id, path)
-    return bucket(read_files, chat_id)[path] and "read" or "unread"
+  local function status_for_file(principal, path)
+    local reads = bucket(read_files, principal, false)
+    return reads and reads[path] and "read" or "unread"
   end
 
   function S.discover(path, opts)
@@ -247,7 +250,7 @@ function M.new()
     local files, total = find_instruction_files(root, max_depth)
     local result_files = {}
     for _, path in ipairs(files) do
-      local read_status = status_for_file(opts.chat_id, path)
+      local read_status = status_for_file(opts.principal, path)
       if not opts.unread_only or read_status ~= "read" then
         result_files[#result_files + 1] = {
           path = path,
@@ -317,31 +320,40 @@ function M.new()
     return folders
   end
 
-  function S.mark_read_for_tool_call(chat_id, tool_name, args)
+  function S.mark_read_for_tool_call(principal, tool_name, args)
     if tool_name ~= "read_file" or type(args) ~= "table" then return end
     local path = resolve_arg_path(args, { arg = "path", cwd_arg = "cwd" })
-    if path then S.mark_read(chat_id, path) end
+    if path then S.mark_read(principal, path) end
   end
 
   function S.emit_reminders_for_tool_call(tool_name, args, emitter)
-    local chat_id = emitter.chat_id()
-    S.mark_read_for_tool_call(chat_id, tool_name, args)
+    if type(emitter) ~= "table" or emitter.valid() ~= true then return 0 end
+    local principal = emitter.principal_key()
+    if type(principal) ~= "string" or principal == "" then return 0 end
+    S.mark_read_for_tool_call(principal, tool_name, args)
 
     local folders = S.folders_for_tool_call(tool_name, args)
     if #folders == 0 then return 0 end
 
-    local reminders = bucket(reminded_scopes, chat_id)
+    local reminders = bucket(reminded_scopes, principal)
+    if not reminders then return 0 end
     local count = 0
     for _, folder in ipairs(folders) do
-      local result = S.discover(folder, { scope = "auto", chat_id = chat_id })
+      local result = S.discover(folder, { scope = "auto", principal = principal })
       if result.total and result.total > 0 then
         local key = result.resolved_scope .. ":" .. result.root
         if not reminders[key] then
           local text = S.format_reminder(result)
           if text then
-            reminders[key] = true
-            emitter.system(text, { path = result.root, dir = result.root })
-            count = count + 1
+            local notice_id = principal .. ":" .. key
+            if emitter.notice(text, {
+              notice_id = notice_id,
+              path = result.root,
+              dir = result.root,
+            }) then
+              reminders[key] = true
+              count = count + 1
+            end
           end
         end
       end
@@ -356,11 +368,13 @@ function M.new()
     tool_contexts = {}
   end
 
-  function S._state(chat_id)
+  function S._state(principal)
     return {
-      reminded_scopes = bucket(reminded_scopes, chat_id),
-      read_files = bucket(read_files, chat_id),
+      reminded_scopes = bucket(reminded_scopes, principal, false) or {},
+      read_files = bucket(read_files, principal, false) or {},
       tool_contexts = tool_contexts,
+      all_reminded_scopes = reminded_scopes,
+      all_read_files = read_files,
     }
   end
 

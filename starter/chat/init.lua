@@ -9,7 +9,8 @@
 --
 -- Inbound chat-contract events handled here:
 --   chat.lead.bound (which chat_id the transcript renders),
---   chat.message.append, chat.stream.delta, chat.stream.end,
+--   chat.message.append, chat.instruction.notice, chat.stream.delta,
+--   chat.stream.end,
 --   chat.stream.reasoning_delta, chat.stream.reasoning_end,
 --   chat.session.stats, chat.tool.start, chat.tool.end,
 --   chat.popup, chat.auth.status, chat.model.set_ack, chat.models.listed,

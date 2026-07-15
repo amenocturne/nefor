@@ -408,6 +408,11 @@ local function render_entry(e)
       content = "[" .. (e.role or "?") .. "] " .. e.text,
       style   = STYLE.system, wrap = "word",
     }
+  elseif e.kind == "instruction" then
+    return tui.text {
+      content = "▸ instructions(" .. (e.path or "?") .. ")",
+      style = STYLE.system, wrap = "word",
+    }
   elseif e.kind == "tool" then
     local head = "⚙ " .. (e.name or "?") .. "(" .. (e.args_preview or "") .. ")"
     if e.status == "pending" then

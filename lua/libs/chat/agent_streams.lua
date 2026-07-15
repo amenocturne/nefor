@@ -266,6 +266,36 @@ function M.record_tool_result(state, id, output, err, now_ms)
   return state
 end
 
+function M.record_instruction_notice(state, invocation, notice_id, text, path, now_ms)
+  if type(invocation) ~= "table" or invocation.principal ~= "subagent" then return state end
+  local run_id = invocation.run_id
+  local actor_id = invocation.actor_id
+  local scope = invocation.run_scope
+  if type(run_id) ~= "string" or run_id == ""
+      or type(actor_id) ~= "string" or actor_id == ""
+      or type(scope) ~= "string" or scope == ""
+      or type(notice_id) ~= "string" or notice_id == "" then
+    return state
+  end
+  if (state.scope_to_run or {})[scope] ~= run_id then return state end
+  local prev_run = (state.agent_streams or {})[run_id] or {}
+  local prev_actor = prev_run[actor_id] or { entries = {} }
+  local entries = {}
+  for i = 1, #(prev_actor.entries or {}) do
+    local entry = prev_actor.entries[i]
+    if entry.kind == "instruction" and entry.notice_id == notice_id then return state end
+    entries[i] = entry
+  end
+  local seq = bump_seq(state)
+  entries[#entries + 1] = {
+    kind = "instruction", notice_id = notice_id, text = text,
+    path = path, at_ms = now_ms, seq = seq,
+  }
+  while #entries > M.MAX_ENTRIES do table.remove(entries, 1) end
+  return put_actor(state, run_id, actor_id, entries, now_ms,
+    "instruction.notice", { capture_seq = seq })
+end
+
 -- Drop buffers + scope bindings for runs no longer in `runs` (the
 -- pruned run map) so capture state follows the existing linger/prune
 -- lifecycle instead of leaking across runs.

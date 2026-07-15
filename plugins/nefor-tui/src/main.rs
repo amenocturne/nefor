@@ -491,8 +491,8 @@ fn process_envelope(engine: &mut Engine, env: Envelope, shutdown: &mut bool) {
         Body::Event(map) => {
             let kind = map.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
             tracing::debug!(kind = kind, "dispatch envelope");
-            if let Err(e) = engine.dispatch_envelope_body(&map) {
-                tracing::warn!(error = %e, kind = kind, "engine.dispatch_envelope_body");
+            if let Err(e) = engine.dispatch_envelope_from(&map, env.from.as_str()) {
+                tracing::warn!(error = %e, kind = kind, "engine.dispatch_envelope_from");
             }
         }
     }

@@ -145,9 +145,20 @@ fn render_str(engine: &mut Engine) -> String {
     }
 }
 
-fn dispatch_event(engine: &mut Engine, body: JsonValue) {
+fn dispatch_event_from(engine: &mut Engine, source: &str, body: JsonValue) {
     let map: JsonMap<String, JsonValue> = body.as_object().expect("event body").clone();
-    engine.dispatch_envelope_body(&map).expect("dispatch event");
+    engine
+        .dispatch_envelope_from(&map, source)
+        .expect("dispatch event");
+}
+
+fn dispatch_event(engine: &mut Engine, body: JsonValue) {
+    let source = match body.get("kind").and_then(JsonValue::as_str) {
+        Some("mag.run_started") => "mag",
+        Some("chat.instruction.notice") => "engine",
+        _ => "test",
+    };
+    dispatch_event_from(engine, source, body);
 }
 
 fn key(name: &str) -> KeyMessage {
@@ -7761,6 +7772,300 @@ fn slash_new_collapses_stale_scroll_region() {
         .eval()
         .expect("scroll max after /new");
     assert_eq!(max, 0, "reset should collapse stale scroll extent");
+}
+
+#[test]
+fn scoped_instruction_notices_project_only_to_the_intended_surface() {
+    let mut engine = Engine::new(140, 40).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "session-1" }),
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.run_started", "run_id": "lead-run", "run_name": "lead",
+            "session_id": "session-1", "scope": "r1", "principal": "lead"
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.instruction.notice",
+            "notice_id": "lead:session-1:git_repo:/workspace",
+            "path": "/workspace",
+            "dir": "/workspace",
+            "text": "Local instruction files available for /workspace\n- AGENTS.md",
+            "invocation": {
+                "session_id": "session-1", "run_id": "lead-run", "run_scope": "r1",
+                "actor_id": "lead.run-tool", "capability_id": "r1/cap-1", "principal": "lead"
+            }
+        }),
+    );
+    // Stable-id duplicate projects exactly once.
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.instruction.notice",
+            "notice_id": "lead:session-1:git_repo:/workspace",
+            "path": "/workspace",
+            "dir": "/workspace",
+            "text": "Local instruction files available for /workspace\n- AGENTS.md",
+            "invocation": {
+                "session_id": "session-1", "run_id": "lead-run", "run_scope": "r1",
+                "actor_id": "lead.run-tool", "capability_id": "r1/cap-2", "principal": "lead"
+            }
+        }),
+    );
+
+    let state = engine.state_table().expect("state");
+    let entries: mlua::Table = state.get("entries").expect("entries");
+    assert_eq!(entries.raw_len(), 1, "lead notice must project once");
+    let lead_entry: mlua::Table = entries.get(1).expect("lead instruction entry");
+    assert_eq!(lead_entry.get::<String>("kind").unwrap(), "agents_md");
+    drop(state);
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.run_started", "run_id": "sub-run", "run_name": "scout",
+            "session_id": "session-1", "scope": "r2", "principal": "subagent"
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.instruction.notice",
+            "notice_id": "subagent:session-1:sub-run:scout.run-tool:git_repo:/secret",
+            "path": "/secret",
+            "dir": "/secret",
+            "text": "Local instruction files available for /secret\n- CLAUDE.md",
+            "invocation": {
+                "session_id": "session-1", "run_id": "sub-run", "run_scope": "r2",
+                "actor_id": "scout.run-tool", "capability_id": "r2/cap-1", "principal": "subagent"
+            }
+        }),
+    );
+    let state = engine.state_table().expect("state");
+    let entries: mlua::Table = state.get("entries").expect("entries");
+    assert_eq!(
+        entries.raw_len(),
+        1,
+        "subagent notice must not enter main transcript"
+    );
+    let streams: mlua::Table = state.get("agent_streams").expect("agent streams");
+    let run: mlua::Table = streams.get("sub-run").expect("sub run stream");
+    let actor: mlua::Table = run.get("scout.run-tool").expect("matching actor stream");
+    let buffered: mlua::Table = actor.get("entries").expect("buffered entries");
+    let notice: mlua::Table = buffered.get(1).expect("instruction notice");
+    assert_eq!(notice.get::<String>("kind").unwrap(), "instruction");
+    assert_eq!(notice.get::<String>("path").unwrap(), "/secret");
+    drop(state);
+
+    // A self-consistent notice cannot promote the authoritative subagent run
+    // to lead, nor can changing any run-binding coordinate make it valid.
+    for (index, invocation) in [
+        json!({
+            "session_id": "session-1", "run_id": "sub-run", "run_scope": "r2",
+            "actor_id": "scout.run-tool", "capability_id": "r2/cap-9", "principal": "lead"
+        }),
+        json!({
+            "session_id": "other-session", "run_id": "sub-run", "run_scope": "r2",
+            "actor_id": "scout.run-tool", "capability_id": "r2/cap-9", "principal": "subagent"
+        }),
+        json!({
+            "session_id": "session-1", "run_id": "other-run", "run_scope": "r2",
+            "actor_id": "scout.run-tool", "capability_id": "r2/cap-9", "principal": "subagent"
+        }),
+        json!({
+            "session_id": "session-1", "run_id": "sub-run", "run_scope": "r9",
+            "actor_id": "scout.run-tool", "capability_id": "r9/cap-9", "principal": "subagent"
+        }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        dispatch_event(
+            &mut engine,
+            json!({
+                "kind": "chat.instruction.notice", "notice_id": format!("forged-{index}"),
+                "path": format!("/forged-{index}"), "text": format!("private forged {index}"),
+                "invocation": invocation
+            }),
+        );
+    }
+    let state = engine.state_table().expect("state");
+    let entries: mlua::Table = state.get("entries").expect("entries");
+    assert_eq!(
+        entries.raw_len(),
+        1,
+        "forged notices cannot enter the transcript"
+    );
+    let streams: mlua::Table = state.get("agent_streams").expect("agent streams");
+    let run: mlua::Table = streams.get("sub-run").expect("sub run stream");
+    let actor: mlua::Table = run.get("scout.run-tool").expect("matching actor stream");
+    let buffered: mlua::Table = actor.get("entries").expect("buffered entries");
+    assert_eq!(
+        buffered.raw_len(),
+        1,
+        "forged notices cannot enter observability"
+    );
+}
+
+#[test]
+fn malformed_and_replayed_instruction_notices_never_enter_main_transcript() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "s" }),
+    );
+
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.instruction.notice", "notice_id": "bad", "path": "/private",
+            "text": "Local instruction files available for /private",
+            "invocation": { "principal": "lead" }
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.replay.start", "session_id": "s" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.instruction.notice", "notice_id": "replayed", "path": "/historical",
+            "text": "Local instruction files available for /historical",
+            "invocation": {
+                "session_id": "s", "run_id": "old-run", "run_scope": "r9",
+                "actor_id": "old.run-tool", "capability_id": "r9/cap-1", "principal": "subagent"
+            }
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.replay.end", "session_id": "s" }),
+    );
+    // Legacy discovery and loaded signatures are suppressed regardless of
+    // absent, malformed, or contradictory path metadata.
+    let private_paths = [
+        "/legacy-absent-discovery",
+        "/legacy-malformed-discovery",
+        "/legacy-contradictory-discovery",
+        "/legacy-absent-loaded/CLAUDE.md",
+        "/legacy-malformed-loaded/AGENTS.md",
+        "/legacy-contradictory-loaded/CLAUDE.md",
+    ];
+    for body in [
+        json!({
+            "kind": "chat.message.append", "role": "system",
+            "text": "Local instruction files available for /legacy-absent-discovery"
+        }),
+        json!({
+            "kind": "chat.message.append", "role": "system", "path": 42, "dir": false,
+            "text": "Local instruction files available for /legacy-malformed-discovery"
+        }),
+        json!({
+            "kind": "chat.message.append", "role": "system", "path": "/public", "dir": "/elsewhere",
+            "text": "Local instruction files available for /legacy-contradictory-discovery"
+        }),
+        json!({
+            "kind": "chat.message.append", "role": "system",
+            "text": "[Loaded /legacy-absent-loaded/CLAUDE.md because tool call touched a file in /private. This is project guidance for that directory, not a user request.]\n\nsecret"
+        }),
+        json!({
+            "kind": "chat.message.append", "role": "system", "path": {}, "dir": 7,
+            "text": "[Loaded /legacy-malformed-loaded/AGENTS.md because tool call touched a file in /private. This is project guidance for that directory, not a user request.]\n\nsecret"
+        }),
+        json!({
+            "kind": "chat.message.append", "role": "system", "path": "/public", "dir": "/public",
+            "text": "[Loaded /legacy-contradictory-loaded/CLAUDE.md because tool call touched a file in /private. This is project guidance for that directory, not a user request.]\n\nsecret"
+        }),
+    ] {
+        dispatch_event(&mut engine, body);
+    }
+
+    let state = engine.state_table().expect("state");
+    let entries: mlua::Table = state.get("entries").expect("entries");
+    assert_eq!(entries.raw_len(), 0);
+    for index in 1..=entries.raw_len() {
+        let entry: mlua::Table = entries.get(index).expect("entry");
+        let text: Option<String> = entry.get("text").ok();
+        for private in private_paths {
+            assert!(!text.as_deref().unwrap_or_default().contains(private));
+        }
+    }
+    let snapshot = render_str(&mut engine);
+    assert!(!snapshot.contains("/private"), "{snapshot}");
+    assert!(!snapshot.contains("/historical"), "{snapshot}");
+    for private in private_paths {
+        assert!(!snapshot.contains(private), "{snapshot}");
+    }
+}
+
+#[test]
+fn replayed_lead_instruction_notice_rebuilds_once_without_promoting_subagent_notice() {
+    let mut engine = Engine::new(120, 30).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.session_start", "session_id": "s" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.replay.start", "session_id": "s" }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "mag.run_started", "run_id": "lead-old", "run_name": "lead",
+            "session_id": "s", "scope": "r1", "principal": "lead"
+        }),
+    );
+    let lead = json!({
+        "kind": "chat.instruction.notice", "notice_id": "lead:s:git_repo:/workspace",
+        "path": "/workspace", "text": "Local instruction files available for /workspace",
+        "invocation": {
+            "session_id": "s", "run_id": "lead-old", "run_scope": "r1",
+            "actor_id": "lead.run-tool", "capability_id": "r1/cap-1", "principal": "lead"
+        }
+    });
+    dispatch_event(&mut engine, lead.clone());
+    dispatch_event(&mut engine, lead);
+    dispatch_event(
+        &mut engine,
+        json!({
+            "kind": "chat.instruction.notice", "notice_id": "subagent:s:old:worker:/private",
+            "path": "/private", "text": "Local instruction files available for /private",
+            "invocation": {
+                "session_id": "s", "run_id": "old", "run_scope": "r2",
+                "actor_id": "worker.run-tool", "capability_id": "r2/cap-1", "principal": "subagent"
+            }
+        }),
+    );
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "sessions.replay.end", "session_id": "s" }),
+    );
+
+    let state = engine.state_table().expect("state");
+    let entries: mlua::Table = state.get("entries").expect("entries");
+    assert_eq!(entries.raw_len(), 1, "replayed lead notice rebuilds once");
+    let entry: mlua::Table = entries.get(1).expect("lead notice entry");
+    assert_eq!(entry.get::<String>("path").unwrap(), "/workspace");
+    let streams: mlua::Table = state.get("agent_streams").expect("agent streams");
+    assert_eq!(
+        streams.raw_len(),
+        0,
+        "replayed subagent panes are not rebuilt"
+    );
 }
 
 #[test]

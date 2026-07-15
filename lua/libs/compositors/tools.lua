@@ -17,8 +17,9 @@ local json = nefor.json
 
 local actor        = require("core.actor")
 local envelope     = require("core.envelope")
-local gate_lib     = require("tool-gate")
-local chat_emitter = require("libs.chat-emitter")
+local gate_lib         = require("tool-gate")
+local chat_emitter     = require("libs.chat-emitter")
+local mag_run_bindings = require("libs.mag-run-bindings")
 
 local M = {}
 
@@ -38,8 +39,9 @@ local M = {}
 --     metadata before forwarding it to the binary.
 --   * On outbound `<gate>.tool.invoke`: derive normalized folders via
 --     the plugin lib's context registry and emit any not-yet-shown
---     instruction-file reminders BEFORE the invoke is forwarded to the
---     binary (ordering is load-bearing for chat history).
+--     dedicated instruction notices before forwarding. Authoritative
+--     structured MAG provenance is mandatory; invalid scope logs a
+--     non-content warning and suppresses only the notice.
 --   * Then forward the envelope verbatim to the binary's stdin.
 function M.gate_spec(gate_name, command)
   gate_name = gate_name or "tool-gate"
@@ -48,6 +50,7 @@ function M.gate_spec(gate_name, command)
   end
 
   local translator = gate_lib.translator(gate_name)
+  local run_bindings = mag_run_bindings.new()
 
   -- Per-envelope inbound logic. Pulled into a local so the batched
   -- from_plugin loop reads as a one-liner.
@@ -82,15 +85,31 @@ function M.gate_spec(gate_name, command)
   local function to_plugin(envs)
     for _, env in ipairs(envs) do
       if not env.replay and env.from ~= gate_name then
+        if type(env.body) == "table" and env.body.kind == "mag.run_started" then
+          run_bindings.bind(env.body, env.from)
+        end
         if type(env.body) == "table"
             and env.body.kind == translator.kinds.tool_advertise then
           gate_lib.record_tool_contexts_from_advertise(env.body)
         end
-        local invoke_chat_id = type(env.body) == "table" and env.body.chat_id or nil
-        local emitter = chat_emitter.scoped(
-          invoke_chat_id,
+        local invocation = type(env.body) == "table" and env.body.invocation or nil
+        if env.from ~= "mag" or (type(invocation) == "table" and (
+            invocation.actor_id ~= env.body.from
+            or invocation.capability_id ~= env.body.id
+            or not run_bindings.validate(invocation))) then
+          invocation = nil
+        end
+        local emitter = chat_emitter.instruction(
+          invocation,
           function(body) envelope.emit(nil, body) end
         )
+        if not emitter.valid() and type(env.body) == "table"
+            and env.body.kind == translator.kinds.tool_invoke then
+          nefor.log.warn("tool-gate: instruction notice suppressed for invalid scope", {
+            tool = env.body.name,
+            reason = emitter.validation_error(),
+          })
+        end
         gate_lib.agents_md_emit_for_invoke(translator, env, emitter)
         nefor.engine.deliver(gate_name, json.encode({
           type = env.type,

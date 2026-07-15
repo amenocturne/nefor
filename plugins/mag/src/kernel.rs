@@ -177,17 +177,31 @@ impl LuaHost {
     /// and emit `mag.run_started`. Run identity is injected, never ambient
     /// (docs/ir.md). The outcome carries the stale run ids the kernel reaped
     /// at the session boundary; a duplicate live `run_id` rejects.
+    #[cfg(test)]
     pub fn begin_run(
         &self,
         run_id: &str,
         run_name: &str,
         session_id: Option<&str>,
     ) -> Result<BeginRunOutcome, MagError> {
+        self.begin_run_with_principal(run_id, run_name, session_id, None)
+    }
+
+    pub fn begin_run_with_principal(
+        &self,
+        run_id: &str,
+        run_name: &str,
+        session_id: Option<&str>,
+        principal: Option<&str>,
+    ) -> Result<BeginRunOutcome, MagError> {
         let meta = self.lua.create_table()?;
         meta.set("run_id", run_id)?;
         meta.set("run_name", run_name)?;
         if let Some(s) = session_id {
             meta.set("session_id", s)?;
+        }
+        if let Some(p) = principal {
+            meta.set("principal", p)?;
         }
         let f: Function = self.kernel.get("begin_run")?;
         let res: Table = f.call::<Table>(meta)?;
@@ -809,6 +823,35 @@ mod tests {
         assert_eq!(contracts[0]["identity"], "nefor.factory.example");
         assert_eq!(contracts[0]["type_scheme"]["variables"][0], "T");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn capability_invocation_carries_authoritative_run_provenance() {
+        let host = shipped_host();
+        let run_id = "provenance-run";
+        let modification = compile_mag_eval_expression(
+            &host,
+            run_id,
+            r#"(nefor.shell.command "command" "printf provenance")"#,
+        );
+        let begun = host
+            .begin_run_with_principal(run_id, "scout", Some("session-1"), Some("subagent"))
+            .expect("begin provenance run");
+        assert!(begun.ok, "begin failed: {:?}", begun.error);
+        host.drain_emits().expect("drain begin event");
+        let outcome = host.start(run_id, &modification).expect("start run");
+        assert!(outcome.ok, "start failed: {:?}", outcome.error);
+        let emits = host.drain_emits().expect("drain start");
+        let invoke = tool_invoke(&emits, "printf provenance");
+        let provenance = invoke["invocation"].as_object().expect("provenance");
+        assert_eq!(provenance["session_id"], "session-1");
+        assert_eq!(provenance["run_id"], run_id);
+        assert_eq!(provenance["principal"], "subagent");
+        assert_eq!(provenance["actor_id"], invoke["from"]);
+        assert_eq!(provenance["capability_id"], invoke["id"]);
+        assert!(provenance["run_scope"]
+            .as_str()
+            .is_some_and(|scope| scope.starts_with('r')));
     }
 
     #[test]

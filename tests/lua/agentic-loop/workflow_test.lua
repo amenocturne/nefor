@@ -316,6 +316,7 @@ do
   assert(type(exec.body.run_id) == "string" and #exec.body.run_id > 0,
     "execute carries a minted run_id")
   assert_eq(exec.body.run_name, "lead", "the lead's run is named")
+  assert_eq(exec.body.principal, "lead", "lead turn execute declares the lead domain principal")
   local mod = exec.body.artifact and exec.body.artifact.data
   assert(type(mod) == "table", "the artifact rides inline on the execute")
   assert_eq(mod.messages[1].to, "lead.entry", "task targets the program's entry actor")
@@ -456,6 +457,17 @@ do
     { role = "tool", tool_call_id = "call-1", name = "read_file", content = "-- config body" },
     { role = "assistant", content = "the config sets provider mock" },
   }
+  -- Dedicated notices ride the bus beside the MAG continuation, never inside
+  -- the model-authored transcript delta.
+  local notice_text = "Local instruction files available for /private-agent-worktree"
+  send_to_loop("engine", {
+    kind = "chat.instruction.notice", notice_id = "private-notice",
+    path = "/private-agent-worktree", text = notice_text,
+    invocation = {
+      session_id = "wf-mag-session", run_id = exec.body.run_id, run_scope = "r21",
+      actor_id = "lead.run-tool", capability_id = "r21/cap-1", principal = "lead",
+    },
+  })
   _test.calls_clear()
   send_to_loop("mag", {
     kind = "mag.run_result", run_id = exec.body.run_id,
@@ -476,6 +488,8 @@ do
   assert_eq(recorded.body.user, "read the config", "the marker keeps the user summary field")
   assert_eq(recorded.body.answer, "the config sets provider mock",
     "the marker keeps the answer summary field")
+  assert(string.find(json.encode(recorded.body), notice_text, 1, true) == nil,
+    "instruction notice text never enters agentic_loop.turn_recorded")
 
   local exec2 = begin_turn("and the model?")
   local seeded = exec2.body.params_overlay["lead.llm"].history

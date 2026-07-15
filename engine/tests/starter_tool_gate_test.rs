@@ -600,7 +600,10 @@ fn reminder_uses_declared_context_and_dedupes_by_scope() {
               }}
             }})
             local emitted = {{}}
-            local emitter = chat_emitter.scoped("chat-1", function(body) emitted[#emitted + 1] = body end)
+            local emitter = chat_emitter.instruction({{
+              session_id = "session-1", run_id = "lead-run", run_scope = "r1",
+              actor_id = "lead.run-tool", capability_id = "r1/cap-1", principal = "lead",
+            }}, function(body) emitted[#emitted + 1] = body end)
             local n1 = d.emit_reminders_for_tool_call("read_file",
               {{ path = "{p1}" }}, emitter)
             local n2 = d.emit_reminders_for_tool_call("read_file",
@@ -653,7 +656,10 @@ fn reminder_is_silent_for_empty_results_and_does_not_mark_scope() {
               }}
             }})
             local emitted = {{}}
-            local emitter = chat_emitter.scoped("chat-1", function(body) emitted[#emitted + 1] = body end)
+            local emitter = chat_emitter.instruction({{
+              session_id = "session-1", run_id = "lead-run", run_scope = "r1",
+              actor_id = "lead.run-tool", capability_id = "r1/cap-1", principal = "lead",
+            }}, function(body) emitted[#emitted + 1] = body end)
             local n1 = d.emit_reminders_for_tool_call("list_dir",
               {{ path = "{dir}" }}, emitter)
             local f = io.open("{dir}/AGENTS.md", "w")
@@ -694,8 +700,8 @@ fn ordinary_read_file_marks_instruction_file_as_read() {
             r#"
             local d = require("tool-gate.agents_md")
             d._reset()
-            d.mark_read_for_tool_call("chat-1", "read_file", {{ path = "{agents}" }})
-            local result = d.discover("{dir}", {{ scope = "subfolders", chat_id = "chat-1" }})
+            d.mark_read_for_tool_call("lead:session-1", "read_file", {{ path = "{agents}" }})
+            local result = d.discover("{dir}", {{ scope = "subfolders", principal = "lead:session-1" }})
             return result.files[1].status
             "#,
             agents = agents.display(),
@@ -742,10 +748,27 @@ fn tool_gate_wrapper_emits_instruction_reminder_on_outbound_folder_touching_invo
                          {{ name = "read_file", description = "", parameters = {{}},
                             context = {{ folders = {{ {{ from = "file_path", arg = "path" }} }} }} }},
                        }} }} }},
-            -- Folder-touching: must trigger instruction reminder.
-            {{ type = "event", from = "agentic-loop",
-              body = {{ kind = "tool-gate.tool.invoke", id = "call-1",
-                       name = "read_file", args = {{ path = "{p}" }} }} }},
+            {{ type = "event", from = "mag",
+              body = {{ kind = "mag.run_started", run_id = "lead-run", run_name = "lead",
+                       session_id = "session-1", scope = "r1", principal = "lead" }} }},
+            -- A valid custom/direct MAG run is explicitly untrusted: its tool
+            -- call still reaches the gate, but it is ineligible for notices.
+            {{ type = "event", from = "mag",
+              body = {{ kind = "mag.run_started", run_id = "direct-run", run_name = "custom",
+                       session_id = "session-1", scope = "r2", principal = "untrusted" }} }},
+            {{ type = "event", from = "mag",
+              body = {{ kind = "tool-gate.tool.invoke", id = "r2/cap-direct",
+                       from = "custom.run-tool", name = "read_file", args = {{ path = "{p}" }},
+                       invocation = {{ session_id = "session-1", run_id = "direct-run",
+                         run_scope = "r2", actor_id = "custom.run-tool",
+                         capability_id = "r2/cap-direct", principal = "untrusted" }} }} }},
+            -- Folder-touching lead call: must trigger instruction reminder.
+            {{ type = "event", from = "mag",
+              body = {{ kind = "tool-gate.tool.invoke", id = "r1/cap-1",
+                       from = "lead.run-tool", name = "read_file", args = {{ path = "{p}" }},
+                       invocation = {{ session_id = "session-1", run_id = "lead-run",
+                         run_scope = "r1", actor_id = "lead.run-tool",
+                         capability_id = "r1/cap-1", principal = "lead" }} }} }},
             -- No instruction files under cwd in this test, so this contributes no reminder.
             {{ type = "event", from = "agentic-loop",
               body = {{ kind = "tool-gate.tool.invoke", id = "call-2",
@@ -782,8 +805,8 @@ fn tool_gate_wrapper_emits_instruction_reminder_on_outbound_folder_touching_invo
         .filter(|p| p.contains("tool-gate.tool.invoke"))
         .count();
     assert_eq!(
-        invoke_count, 2,
-        "wrapper must forward both tool.invoke envelopes verbatim; got: {delivered:?}"
+        invoke_count, 3,
+        "wrapper must forward every tool.invoke verbatim, including the direct invoke; got: {delivered:?}"
     );
 
     // Among the engine.send-published envelopes, exactly one must be
@@ -792,7 +815,7 @@ fn tool_gate_wrapper_emits_instruction_reminder_on_outbound_folder_touching_invo
     let agents_envelopes: Vec<&String> = sent
         .iter()
         .filter(|p| {
-            p.contains("chat.message.append")
+            p.contains("chat.instruction.notice")
                 && p.contains("AGENTS.md")
                 && p.contains(&dir.display().to_string())
         })
@@ -805,8 +828,9 @@ fn tool_gate_wrapper_emits_instruction_reminder_on_outbound_folder_touching_invo
     );
     let agents_payload = agents_envelopes[0];
     assert!(
-        agents_payload.contains("\"role\":\"system\""),
-        "instruction reminder must carry role=system: {agents_payload}"
+        agents_payload.contains("\"principal\":\"lead\"")
+            && agents_payload.contains("\"capability_id\":\"r1/cap-1\""),
+        "instruction notice must preserve validated provenance: {agents_payload}"
     );
     assert!(
         agents_payload.contains("Contents are not loaded automatically"),

@@ -438,6 +438,8 @@ do
     "mag.loaded releases mag.execute; got " .. json.encode(_test.calls()))
   assert_true(type(exec.body.session_id) == "string" and #exec.body.session_id > 0,
     "lead injects session_id on mag.execute")
+  assert_eq(exec.body.principal, "subagent",
+    "dispatched mag execute declares the subagent domain principal")
 
   -- Profiles land via the params overlay, keyed by the ACTOR id that
   -- authors params.profile — the agent template's namespaced llm actor.
@@ -1542,9 +1544,12 @@ do
     artifact = { format = "nefor.graph-modification/v1",
       data = { actors = {}, messages = {}, kills = {}, rules = {} } } })
   local calls = decode_calls()
-  assert_true(find_call(calls, function(c)
+  local eval_exec = find_call(calls, function(c)
     return c.body.kind == "mag.execute" and c.body.run_id == "R1"
-  end) ~= nil, "the compiled eval executes on the kernel")
+  end)
+  assert_true(eval_exec ~= nil, "the compiled eval executes on the kernel")
+  assert_eq(eval_exec.body.principal, "subagent",
+    "mag-eval production execute declares the subagent domain principal")
   local ack = find_call(calls, function(c)
     return c.body.kind == "tool.result" and c.body.id == "r7/cap-1"
   end)

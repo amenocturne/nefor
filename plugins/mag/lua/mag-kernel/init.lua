@@ -139,6 +139,7 @@ local function new_run_context(meta)
     run_id = meta.run_id,
     run_name = meta.run_name,
     session_id = meta.session_id,
+    principal = meta.principal,
     last_output_path = nil,
     run_complete = nil,
     run_failed = nil,
@@ -270,6 +271,16 @@ local function new_run_context(meta)
     registry = registry,
     log = log,
     bus_emit = bus_emit,
+    invocation_provenance = function(actor_id, capability_id)
+      return {
+        session_id = ctx.session_id,
+        run_id = ctx.run_id,
+        run_scope = ctx.scope,
+        actor_id = actor_id,
+        capability_id = capability_id,
+        principal = ctx.principal,
+      }
+    end,
     events = emit_event,
     persist_output = persist_output,
     observe_output = function(actor, wire, output)
@@ -445,7 +456,13 @@ return {
     -- The scope token rides run_started so the run's spawner can bind
     -- prefix-scoped wire ids (chat handles, correlation ids) to this run
     -- without parsing them (observer.lua run_started).
-    ctx.observer:run_started({ run_id = ctx.run_id, run_name = ctx.run_name, scope = ctx.scope })
+    ctx.observer:run_started({
+      run_id = ctx.run_id,
+      run_name = ctx.run_name,
+      session_id = ctx.session_id,
+      scope = ctx.scope,
+      principal = ctx.principal,
+    })
     return { ok = true, reaped = stale }
   end,
 

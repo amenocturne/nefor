@@ -483,12 +483,13 @@ local function submit_orchestrator_run(user_text)
   emit_runtime_state("agentic_loop.run_start", { run_id = run_id })
 
   local sessions = require("sessions")
-  emit("mag", {
+  envelope.emit_as("agentic-loop", "mag", {
     kind           = "mag.execute",
     id             = run_id,
     run_id         = run_id,
     run_name       = "lead",
     session_id     = sessions.current_id(),
+    principal      = "lead",
     artifact       = artifact,
     params_overlay = { [p.llm_actor] = overlay_params },
   })

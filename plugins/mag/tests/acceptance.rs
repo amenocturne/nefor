@@ -111,11 +111,12 @@ async fn write_env(stdin: &mut ChildStdin, env: Envelope) {
 }
 
 async fn send_event(stdin: &mut ChildStdin, body: Map<String, Value>) {
-    write_env(
-        stdin,
-        Envelope::event(PluginName::engine(), Timestamp::now(), body),
-    )
-    .await;
+    let source = if body.get("kind").and_then(Value::as_str) == Some("mag.execute") {
+        PluginName::new("custom-runner").expect("custom runner plugin name")
+    } else {
+        PluginName::engine()
+    };
+    write_env(stdin, Envelope::event(source, Timestamp::now(), body)).await;
 }
 
 fn event_body(out: &PluginOutgoing) -> Option<&Map<String, Value>> {
@@ -293,6 +294,9 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
     execute.insert("kind".into(), Value::String("mag.execute".into()));
     execute.insert("id".into(), Value::String("exec-accept".into()));
     execute.insert("session_id".into(), Value::String(SESSION_ID.into()));
+    // A hand-authored/custom caller may declare anything, but the kernel
+    // assigns it the explicit untrusted/no-notice principal.
+    execute.insert("principal".into(), Value::String("lead".into()));
     execute.insert("run_id".into(), Value::String(RUN_NAME.into()));
     execute.insert("run_name".into(), Value::String(RUN_NAME.into()));
     execute.insert(
@@ -330,6 +334,13 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
         seen.push(kind.clone());
 
         match kind.as_str() {
+            "mag.run_started" => {
+                assert_eq!(
+                    body.get("principal").and_then(Value::as_str),
+                    Some("untrusted"),
+                    "custom execute is explicitly ineligible for instruction notices"
+                );
+            }
             "mag.actor_ready" => {
                 if let Some(id) = body.get("id").and_then(Value::as_str) {
                     ready_ids.push(id.to_owned());
@@ -363,6 +374,13 @@ async fn two_agents_one_killed_mid_flight_the_other_completes() {
                     .and_then(Value::as_str)
                     .expect("gate invoke carries the kernel correlation id")
                     .to_owned();
+                assert_eq!(
+                    body.get("invocation")
+                        .and_then(|invocation| invocation.get("principal"))
+                        .and_then(Value::as_str),
+                    Some("untrusted"),
+                    "direct execute capabilities cannot mint lead/subagent notices"
+                );
                 // The double-wrapped kernel payload was unwrapped: `args` is the
                 // tool's own args, not `{ name, args, allowlist, da-policy }`.
                 let args = body.get("args").and_then(Value::as_object).expect("args");
@@ -670,6 +688,7 @@ async fn execute_worktree_program<R: AsyncBufReadExt + Unpin>(
             "kind": "mag.execute",
             "id": id,
             "session_id": "worktree-acceptance",
+            "principal": "lead",
             "run_id": id,
             "run_name": id,
             "artifact": artifact,

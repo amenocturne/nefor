@@ -165,11 +165,12 @@ end
 -- failure doesn't crash the caller; returns the count emitted (0 on no-op or
 -- failure).
 --
--- `emitter` is a scoped chat-emitter (libs.chat-emitter) that already
--- carries the correct chat_id — callers never thread chat_id manually.
+-- `emitter` is a validated instruction-notice emitter
+-- (libs.chat-emitter). Invalid provenance makes it a fail-closed no-op; the
+-- gated invocation continues unchanged.
 ---@param translator table
 ---@param env table
----@param emitter table  -- chat-emitter scoped instance
+---@param emitter table  -- instruction notice emitter
 ---@return integer count
 function M.agents_md_emit_for_invoke(translator, env, emitter)
   if not translator.is_outbound_tool_invoke(env) then return 0 end

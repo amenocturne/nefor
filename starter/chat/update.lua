@@ -20,12 +20,14 @@ local Entry        = require("libs.chat.entry")
 local log          = require("libs.chat.log")
 local tool_display = require("libs.chat.tool_display")
 local height_cache = require("libs.chat.height_cache")
+local mag_run_bindings = require("libs.mag-run-bindings")
 
 local shallow_merge = common.shallow_merge
 local NIL_SENTINEL  = common.NIL_SENTINEL
 local format_args   = common.format_args
 
 local M = {}
+local run_bindings = mag_run_bindings.new()
 
 local DOUBLE_ESC_MS = 600
 
@@ -731,6 +733,7 @@ end
 -- ── session lifecycle ─────────────────────────────────────────────────
 
 local function handle_session_end(_msg, state)
+  run_bindings = mag_run_bindings.new()
   return shallow_merge(state, {
     in_flight        = NIL_SENTINEL,
     pending          = false,
@@ -745,14 +748,18 @@ local function handle_session_end(_msg, state)
     sidebar_folds    = {},
     lead_chat_id     = NIL_SENTINEL,
     lead_chat_prefix = NIL_SENTINEL,
+    instruction_notice_ids = {},
   }), {}
 end
 
-local function handle_session_start(_msg, state)
+local function handle_session_start(msg, state)
+  run_bindings = mag_run_bindings.new()
   return shallow_merge(state, {
+    session_id = msg.session_id,
     runs = {},
     agent_streams = {}, scope_to_run = {},
     lead_chat_id = NIL_SENTINEL, lead_chat_prefix = NIL_SENTINEL,
+    instruction_notice_ids = {},
   }), {}
 end
 
@@ -769,6 +776,48 @@ local function handle_chat_reset(_msg, state)
 end
 
 -- ── inbound chat-contract events ──────────────────────────────────────
+
+local function handle_instruction_notice(msg, state)
+  local invocation = msg.invocation
+  local notice_id = msg.notice_id
+  local valid_provenance = type(invocation) == "table"
+      and type(invocation.session_id) == "string" and invocation.session_id ~= ""
+      and type(invocation.run_id) == "string" and invocation.run_id ~= ""
+      and type(invocation.run_scope) == "string" and invocation.run_scope ~= ""
+      and type(invocation.actor_id) == "string" and invocation.actor_id ~= ""
+      and type(invocation.capability_id) == "string" and invocation.capability_id ~= ""
+      and invocation.capability_id:sub(1, #invocation.run_scope + 1)
+        == invocation.run_scope .. "/"
+  if msg._event_source ~= "engine"
+      or not valid_provenance
+      or not run_bindings.validate(invocation, state.session_id)
+      or type(notice_id) ~= "string" or notice_id == ""
+      or type(msg.path) ~= "string" or msg.path == ""
+      or type(msg.text) ~= "string" or msg.text == "" then
+    return state, {}
+  end
+  if invocation.principal == "subagent" then
+    -- Historical agent panes are intentionally not rebuilt. Replayed
+    -- subagent notices are ignored and can never enter the transcript.
+    if state.replay_mode then return state, {} end
+    return agent_streams.record_instruction_notice(
+      state, invocation, notice_id, msg.text, msg.path, tui.now_ms()), {}
+  end
+  if invocation.principal ~= "lead" then
+    return state, {}
+  end
+  if (state.scope_to_run or {})[invocation.run_scope] ~= invocation.run_id then
+    return state, {}
+  end
+  local seen = state.instruction_notice_ids or {}
+  if seen[notice_id] then return state, {} end
+  local next_seen = {}
+  for id, value in pairs(seen) do next_seen[id] = value end
+  next_seen[notice_id] = true
+  local next_state = shallow_merge(state, { instruction_notice_ids = next_seen })
+  return transcript.push_entry(next_state,
+    Entry.agents_md(msg.path, msg.dir or msg.path, msg.text, notice_id)), {}
+end
 
 local function handle_message_append(msg, state)
   local text = msg.text or ""
@@ -799,35 +848,13 @@ local function handle_message_append(msg, state)
     and { pending = false, turn_started_at = NIL_SENTINEL }
     or  {}
 
-  -- Instruction-file reminder routing.
-  if role == "system" then
-    local path = msg.path
-    local dir = msg.dir or path
-    if type(path) == "string" and #path > 0
-        and text:match("^Local instruction files available") then
-      local mc = msg.chat_id
-      if type(mc) == "string" and #mc > 0 then
-        -- Scoped (actor-chat) reminders stay out of the lead transcript.
-        return shallow_merge(state, turn_state), {}
-      end
-      return transcript.push_entry(shallow_merge(state, turn_state),
-        Entry.agents_md(path, dir, text)
-      ), {}
-    end
-
-    local path, dir = text:match(
-      "^%[Loaded (.-) because tool call touched a file in (.-)%. This is project guidance for that directory, not a user request%.%]")
-    if path and dir then
-      local mc = msg.chat_id
-      if type(mc) == "string" and #mc > 0 then
-        -- Scoped (actor-chat) reminders stay out of the lead transcript.
-        return shallow_merge(state, turn_state), {}
-      end
-      local body = text:match("\n\n(.*)$") or ""
-      return transcript.push_entry(shallow_merge(state, turn_state),
-        Entry.agents_md(path, dir, body)
-      ), {}
-    end
+  -- Legacy instruction-shaped chat messages fail closed. Dedicated
+  -- chat.instruction.notice events are the only accepted projection path;
+  -- metadata is irrelevant because old sessions contain absent, malformed,
+  -- and contradictory path/dir combinations.
+  if role == "system" and (text:match("^Local instruction files available")
+        or text:match("^%[Loaded .- because tool call touched a file")) then
+    return shallow_merge(state, turn_state), {}
   end
 
   if role == "system" then
@@ -1357,13 +1384,14 @@ end
 -- so overlapping runs render independently.
 
 local function handle_mag_run_started(msg, state)
-  if state.replay_mode then return state, {} end
   local run_id = msg.run_id
   if type(run_id) ~= "string" or run_id == "" then return state, {} end
-  -- The kernel scope-prefixes every actor chat handle with this run's
-  -- scope; storing the binding is what lets the agent-stream capture
-  -- attribute chat.stream.* events back to (run, actor).
+  run_bindings.bind(msg, msg._event_source)
+  -- Scope bindings are safe replay state: lead instruction notices need the
+  -- same run/scope validation while rebuilding the transcript. Historical run
+  -- panels and agent streams remain intentionally unreconstructed.
   state = agent_streams.set_scope(state, msg.scope, run_id)
+  if state.replay_mode then return state, {} end
   return run_panel.mag_run_started(state, run_id, msg.run_name, tui.now_ms()), {}
 end
 
@@ -1500,6 +1528,7 @@ local handlers = {
   ["sessions.replay.end"]         = handle_replay_end,
   ["chat.reset"]                  = handle_chat_reset,
   ["chat.message.append"]         = handle_message_append,
+  ["chat.instruction.notice"]     = handle_instruction_notice,
   ["chat.lead.bound"]             = handle_lead_chat_bound,
   ["chat.stream.delta"]           = handle_stream_delta,
   ["chat.stream.end"]             = handle_stream_end,

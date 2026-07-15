@@ -1480,6 +1480,7 @@ local function resume_pending_load(body)
     run_id       = pending.run_id,
     run_name     = pending.run_name,
     session_id   = pending.session_id,
+    principal    = "subagent",
     artifact     = artifact,
   }
   if next(overlay) ~= nil then

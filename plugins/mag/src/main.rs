@@ -301,8 +301,16 @@ async fn run_dispatch_loop(
                             tracing::warn!(?env, "unexpected system envelope after handshake");
                         }
                         Body::Event(map) => {
-                            handle_event(out_tx, map, &mut program, host, &mut active, &mut bridge)
-                                .await?;
+                            handle_event(
+                                out_tx,
+                                env.from.as_str(),
+                                map,
+                                &mut program,
+                                host,
+                                &mut active,
+                                &mut bridge,
+                            )
+                            .await?;
                         }
                     },
                     Some(Err(e)) => {
@@ -475,6 +483,7 @@ async fn settle_reaped(
 /// broadcast bus is not ours and drops silently.
 async fn handle_event(
     out_tx: &mpsc::Sender<PluginOutgoing>,
+    source: &str,
     body: &Map<String, Value>,
     program: &mut Option<Arc<LoadedProgram>>,
     host: &LuaHost,
@@ -500,7 +509,15 @@ async fn handle_event(
         LOAD_KIND => handle_load(out_tx, body, in_reply_to, program, host).await,
         EVAL_KIND => handle_eval(out_tx, body, in_reply_to, program).await,
         EXECUTE_KIND => {
-            handle_execute(out_tx, body, in_reply_to, program, host, active, bridge).await
+            handle_execute(
+                out_tx,
+                source,
+                body,
+                in_reply_to,
+                program,
+                (host, active, bridge),
+            )
+            .await
         }
         APPLY_KIND => {
             handle_apply(
@@ -663,6 +680,37 @@ fn load_module_roots(body: &Map<String, Value>, source_dir: &Path) -> Result<Vec
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunPrincipal {
+    Lead,
+    Subagent,
+    Untrusted,
+}
+
+impl RunPrincipal {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lead => "lead",
+            Self::Subagent => "subagent",
+            Self::Untrusted => "untrusted",
+        }
+    }
+}
+
+fn authoritative_principal(source: &str, declared: Option<&Value>) -> Result<RunPrincipal, String> {
+    match (source, declared.and_then(Value::as_str)) {
+        ("agentic-loop", Some("lead")) => Ok(RunPrincipal::Lead),
+        ("lead-workflow", Some("subagent")) => Ok(RunPrincipal::Subagent),
+        ("agentic-loop", _) | ("lead-workflow", _) => Err(format!(
+            "mag.execute requires the principal authorized for source {source:?}"
+        )),
+        // Local composition is trusted, but only the two shipped routes mint
+        // instruction-notice principals. Custom/direct execute remains a
+        // supported kernel entry point with explicit no-notice semantics.
+        _ => Ok(RunPrincipal::Untrusted),
+    }
+}
+
 /// Run a program through the kernel. The modification is taken inline from the
 /// request (`modification` — the control plane reaches kernel ops directly,
 /// ir.md) or, absent that, from the session's resident program (`mag.load`).
@@ -676,13 +724,13 @@ fn load_module_roots(body: &Map<String, Value>, source_dir: &Path) -> Result<Vec
 /// touches nothing of the others.
 async fn handle_execute(
     out_tx: &mpsc::Sender<PluginOutgoing>,
+    source: &str,
     body: &Map<String, Value>,
     in_reply_to: Option<&str>,
     program: &Option<Arc<LoadedProgram>>,
-    host: &LuaHost,
-    active: &mut ActiveExecutes,
-    bridge: &mut CapabilityBridge,
+    runtime: (&LuaHost, &mut ActiveExecutes, &mut CapabilityBridge),
 ) -> Result<(), MagError> {
+    let (host, active, bridge) = runtime;
     let mut modification: Value = match body.get("artifact") {
         Some(artifact) => match artifact_modification(artifact) {
             Ok(m) => m,
@@ -751,9 +799,27 @@ async fn handle_execute(
         .get("run_name")
         .and_then(Value::as_str)
         .unwrap_or(&run_id);
-    let session_id = body.get("session_id").and_then(Value::as_str);
+    let session_id = match body.get("session_id").and_then(Value::as_str) {
+        Some(session_id) if !session_id.is_empty() => session_id,
+        _ => {
+            return send_event(
+                out_tx,
+                error_body(in_reply_to, "mag.execute requires a non-empty session_id"),
+            )
+            .await
+        }
+    };
+    let principal = match authoritative_principal(source, body.get("principal")) {
+        Ok(principal) => principal,
+        Err(error) => return send_event(out_tx, error_body(in_reply_to, &error)).await,
+    };
 
-    let begun = host.begin_run(&run_id, run_name, session_id)?;
+    let begun = host.begin_run_with_principal(
+        &run_id,
+        run_name,
+        Some(session_id),
+        Some(principal.as_str()),
+    )?;
     // The kernel reaps stale contexts from a previous session at the boundary
     // (begin_run); fail their pending replies before driving the new run.
     settle_reaped(out_tx, host, active, bridge, &begun.reaped).await?;
@@ -1410,6 +1476,40 @@ async fn send_ready(out_tx: &mpsc::Sender<PluginOutgoing>) -> Result<(), MagErro
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn execute_principal_validates_shipped_routes_and_defaults_custom_routes_untrusted() {
+        assert_eq!(
+            authoritative_principal("agentic-loop", Some(&serde_json::json!("lead"))),
+            Ok(RunPrincipal::Lead)
+        );
+        assert_eq!(
+            authoritative_principal("lead-workflow", Some(&serde_json::json!("subagent"))),
+            Ok(RunPrincipal::Subagent)
+        );
+        for (source, principal) in [
+            ("agentic-loop", None),
+            ("agentic-loop", Some(serde_json::json!("subagent"))),
+            ("lead-workflow", Some(serde_json::json!("lead"))),
+        ] {
+            assert!(
+                authoritative_principal(source, principal.as_ref()).is_err(),
+                "shipped source {source:?} must reject {principal:?}"
+            );
+        }
+        for (source, principal) in [
+            ("engine", None),
+            ("engine", Some(serde_json::json!("lead"))),
+            ("direct-tool", Some(serde_json::json!("lead"))),
+            ("custom-runner", Some(serde_json::json!("subagent"))),
+        ] {
+            assert_eq!(
+                authoritative_principal(source, principal.as_ref()),
+                Ok(RunPrincipal::Untrusted),
+                "custom source {source:?} must execute without notice authority"
+            );
+        }
+    }
 
     #[test]
     fn hello_body_advertises_version_and_kernel() {
