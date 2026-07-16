@@ -311,21 +311,32 @@ local function feed_loaded(modification, factories)
   return load
 end
 
--- The composition supplies one universal system prompt for every delegated
--- LLM actor. MAG programs select profiles and send task prompts; they do not
+-- The composition supplies one complete default agent behind the ready MAG
+-- constructor. MAG programs send task prompts; they do not select models or
 -- need to know how the agent identity is assembled.
 do
   fresh()
-  lw.configure({ agent_system = "universal composed prompt" })
+  lw.configure({ agent_defaults = {
+    provider = "chatgpt",
+    model = "general-model",
+    reasoning_effort = "medium",
+    system = "universal composed prompt",
+  } })
   write_mag_file("system-overlay-write", "system-overlay.mag", READ_ONLY_MAG)
   _test.calls_clear()
   execute_mag("system-overlay-execute", "system-overlay.mag")
-  feed_loaded(read_only_modification())
+  local modification = read_only_modification()
+  modification.actors[2].params.profile = nil
+  feed_loaded(modification)
   local exec = find_call(decode_calls(), function(c)
     return c.body.kind == "mag.execute" and c.target == "mag"
   end)
   assert_true(exec ~= nil, "configured universal system permits execution")
-  assert_eq(exec.body.params_overlay["worker.llm"].system,
+  local patch = exec.body.params_overlay["worker.llm"]
+  assert_eq(patch.provider, "chatgpt", "ready agent receives default provider")
+  assert_eq(patch.model, "general-model", "ready agent receives default model")
+  assert_eq(patch.reasoning_effort, "medium", "ready agent receives default effort")
+  assert_eq(patch.system,
     "universal composed prompt",
     "the runtime overlays the universal system onto delegated LLM actors")
 end

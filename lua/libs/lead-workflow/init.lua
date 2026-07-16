@@ -103,7 +103,7 @@ local run_registry = RunRegistry.new({
 })
 
 local dependency_module_roots = {}
-local agent_system = nil
+local agent_defaults = nil
 
 local function copy_roots(roots)
   local copy = {}
@@ -328,13 +328,11 @@ local function result_actor(modification)
   return result.actor, nil
 end
 
--- Profile resolution over an artifact's actors. Any actor authoring
--- params.profile gets its resolved provider/model/reasoning_effort recorded
--- in the params overlay keyed by the actor id. The nefor.actors library places
--- the profile on its namespaced llm capability. Llm actors must
--- carry :profile or raw reasoning_effort so the lead always makes an explicit
--- reasoning-depth decision. Returns overlay or nil + error text.
-local function resolve_profiles(actors)
+-- Resolve runtime-owned LLM parameters over an artifact's actors. A raw actor
+-- may select an explicit profile or reasoning effort; composition-provided
+-- ready agents omit both and receive the configured defaults. The universal
+-- system prompt is always overlaid when defaults exist.
+local function resolve_agent_params(actors)
   local overlay = {}
   local profiles
   local profiles_err
@@ -368,15 +366,21 @@ local function resolve_profiles(actors)
         reasoning_effort = resolved.reasoning_effort,
       }
     elseif actor.foreign == "nefor.factory.llm" and not has_raw_effort then
-      return nil, "llm actor '" .. tostring(actor.id) ..
-        "' is missing required :profile. " ..
-        "Set :profile in the MAG library wrapper that constructs this " ..
-        "nefor.factory.llm actor."
+      if agent_defaults == nil then
+        return nil, "llm actor '" .. tostring(actor.id) ..
+          "' is missing required :profile. " ..
+          "Set :profile in the MAG library wrapper or configure agent_defaults."
+      end
+      overlay[actor.id] = {
+        provider = agent_defaults.provider,
+        model = agent_defaults.model,
+        reasoning_effort = agent_defaults.reasoning_effort,
+      }
     end
     if actor.foreign == "nefor.factory.llm"
-        and type(agent_system) == "string" and #agent_system > 0 then
+        and agent_defaults ~= nil then
       overlay[actor.id] = overlay[actor.id] or {}
-      overlay[actor.id].system = agent_system
+      overlay[actor.id].system = agent_defaults.system
     end
   end
   return overlay, nil
@@ -1547,9 +1551,9 @@ submit_loaded_run = function(pending, body, error_prefix, attached)
     emit_tool_result_err(pending.firing_id, error_prefix .. ": " .. result_err)
     return false
   end
-  local overlay, profile_err = resolve_profiles(actors)
+  local overlay, params_err = resolve_agent_params(actors)
   if not overlay then
-    emit_tool_result_err(pending.firing_id, error_prefix .. ": " .. profile_err)
+    emit_tool_result_err(pending.firing_id, error_prefix .. ": " .. params_err)
     return false
   end
   local exec = {
@@ -1590,18 +1594,16 @@ end
 -- Resume a pending compile/execute once its `mag.load` reply arrives. The
 -- reply's registry has already refreshed state.kernel_factories
 -- (capture_kernel_factories runs first). Compile renders the preview from the
--- modification. Execute validates — factories, write gate, sink, profiles —
+-- modification. Execute validates — factories, write gate, sink, agent params —
 -- and only then sends `mag.execute` with the resolved session_id, run_id, and
 -- params overlay. Validation failure acks the firing with an error and drops
 -- the pending entry — nothing runs.
 --
--- Profile params resolved lead-side from the configured registry are threaded
--- to the actors via `params_overlay` on
+-- Agent params resolved lead-side from the configured registry/defaults are
+-- threaded to the actors via `params_overlay` on
 -- mag.execute — a per-actor-id param patch the kernel merges before spawn
 -- (actor params are kernel-opaque, so an overlay is legitimate control-plane
--- input, ir.md). The overlay keys on the ACTOR ids that author params.profile;
--- for the agent template those are its namespaced llm actors (eval_agent
--- lowers the agent's :profile onto them).
+-- input, ir.md). The overlay keys on the namespaced LLM actor ids.
 local function resume_pending_load(body)
   local load_id = body.in_reply_to
   local pending = type(load_id) == "string" and state.pending_mag_load[load_id] or nil
@@ -1951,7 +1953,7 @@ local M = {
       state.pending_mag_load = {}
       state.attached_mag_runs = {}
       dependency_module_roots = {}
-      agent_system = nil
+      agent_defaults = nil
       mag_eval._internals.reset()
       advertised = false
     end,
@@ -1967,11 +1969,26 @@ function M.configure(opts)
   if roots == nil then roots = {} end
   validate_dependency_module_roots(roots)
   dependency_module_roots = copy_roots(roots)
-  if opts.agent_system ~= nil
-      and (type(opts.agent_system) ~= "string" or #opts.agent_system == 0) then
-    error("lead-workflow: agent_system must be a non-empty string", 2)
+  local defaults = opts.agent_defaults
+  if defaults ~= nil then
+    if type(defaults) ~= "table" then
+      error("lead-workflow: agent_defaults must be a table", 2)
+    end
+    for _, field in ipairs({ "provider", "model", "reasoning_effort", "system" }) do
+      if type(defaults[field]) ~= "string" or #defaults[field] == 0 then
+        error("lead-workflow: agent_defaults." .. field ..
+          " must be a non-empty string", 2)
+      end
+    end
+    agent_defaults = {
+      provider = defaults.provider,
+      model = defaults.model,
+      reasoning_effort = defaults.reasoning_effort,
+      system = defaults.system,
+    }
+  else
+    agent_defaults = nil
   end
-  agent_system = opts.agent_system
   mag_eval.configure({
     dependency_module_roots = copy_roots(roots),
     resolve_invocation = resolve_invocation,
