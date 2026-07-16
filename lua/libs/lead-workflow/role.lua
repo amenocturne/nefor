@@ -1,8 +1,9 @@
 -- libs/lead-workflow/role.lua — lead-workflow role loader (mechanism).
 --
--- Loads `prompts/lead.md` at module-load time and exposes:
+-- Loads `prompts/base.md` and `prompts/lead.md` at module-load time and exposes:
 --
---   * LEAD_SYSTEM_PROMPT — string, the lead orchestrator's prompt.
+--   * BASE_SYSTEM_PROMPT — string, shared by every agent.
+--   * LEAD_SYSTEM_PROMPT — base plus the root lead's positional overlay.
 --
 -- The lead's tool surface is NOT here: it is authored inside the
 -- turn-program (`:tools` in agentic-loop/lead-turn.mag).
@@ -12,7 +13,7 @@
 -- syntax highlighting in editors, no clean diffs).
 --
 -- PROMPT-ROOT SEAM: this loader is mechanism, but the prompt content it
--- reads is config-owned opinion (`<config>/prompts/lead.md`). It resolves
+-- reads is config-owned opinion (`<config>/prompts/*.md`). It resolves
 -- the prompt dir from the `NEFOR_CONFIG_DIR` global the engine sets to the
 -- dir holding `init.lua` — NOT from this file's own location. So the loader
 -- runs unchanged from the shared lua tree while every config keeps its own
@@ -89,10 +90,14 @@ local REASONING_HYGIENE = table.concat({
 -- ever reaches a model.
 local function load_or_placeholder(name)
   local content, err = read_prompt(name)
-  if content then return REASONING_HYGIENE .. content end
+  if content then return content end
   return "[lead-workflow.role: prompt '" .. name .. "' missing — " .. tostring(err) .. "]"
 end
 
-M.LEAD_SYSTEM_PROMPT = load_or_placeholder("lead")
+local base = load_or_placeholder("base")
+local lead = load_or_placeholder("lead")
+
+M.BASE_SYSTEM_PROMPT = REASONING_HYGIENE .. base
+M.LEAD_SYSTEM_PROMPT = M.BASE_SYSTEM_PROMPT .. "\n\n---\n\n" .. lead
 
 return M

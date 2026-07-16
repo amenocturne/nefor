@@ -328,10 +328,17 @@ local function result_actor(modification)
   return result.actor, nil
 end
 
+local function compose_agent_system(base, positional_overlay)
+  if type(positional_overlay) == "string" and positional_overlay:match("%S") then
+    return base .. "\n\n---\n\n" .. positional_overlay
+  end
+  return base
+end
+
 -- Resolve runtime-owned LLM parameters over an artifact's actors. A raw actor
 -- may select an explicit profile or reasoning effort; composition-provided
--- ready agents omit both and receive the configured defaults. The universal
--- system prompt is always overlaid when defaults exist.
+-- ready agents omit both and receive the configured defaults. The runtime
+-- prepends the shared base prompt to each actor's positional system overlay.
 local function resolve_agent_params(actors)
   local overlay = {}
   local profiles
@@ -380,7 +387,7 @@ local function resolve_agent_params(actors)
     if actor.foreign == "nefor.factory.llm"
         and agent_defaults ~= nil then
       overlay[actor.id] = overlay[actor.id] or {}
-      overlay[actor.id].system = agent_defaults.system
+      overlay[actor.id].system = compose_agent_system(agent_defaults.system, params.system)
     end
   end
   return overlay, nil

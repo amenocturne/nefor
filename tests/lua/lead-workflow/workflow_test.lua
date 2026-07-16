@@ -311,9 +311,9 @@ local function feed_loaded(modification, factories)
   return load
 end
 
--- The composition supplies one complete default agent behind the ready MAG
--- constructor. MAG programs send task prompts; they do not select models or
--- need to know how the agent identity is assembled.
+-- The composition supplies the shared base agent behind the ready MAG
+-- constructor. MAG programs add a positional system overlay and send the full
+-- task as a user message; they do not select models.
 do
   fresh()
   lw.configure({ agent_defaults = {
@@ -337,8 +337,8 @@ do
   assert_eq(patch.model, "general-model", "ready agent receives default model")
   assert_eq(patch.reasoning_effort, "medium", "ready agent receives default effort")
   assert_eq(patch.system,
-    "universal composed prompt",
-    "the runtime overlays the universal system onto delegated LLM actors")
+    "universal composed prompt\n\n---\n\nAnswer the task.",
+    "the runtime composes the shared base with the delegated position")
 end
 
 -- ------------------------------------------------------------------

@@ -21,10 +21,26 @@ end
 -- Module loads without error.
 local lead_role = require("libs.lead-workflow.role")
 
--- LEAD_SYSTEM_PROMPT is a non-empty string with the expected role-cue.
+-- BASE_SYSTEM_PROMPT is real shared content and does not claim the root role.
+assert_true(type(lead_role.BASE_SYSTEM_PROMPT) == "string", "BASE_SYSTEM_PROMPT is a string")
+assert_true(#lead_role.BASE_SYSTEM_PROMPT > 0, "BASE_SYSTEM_PROMPT is non-empty")
+assert_true(
+  not lead_role.BASE_SYSTEM_PROMPT:find("lead orchestrator", 1, true),
+  "BASE_SYSTEM_PROMPT does not claim the root role"
+)
+
+-- LEAD_SYSTEM_PROMPT composes the base with the root-only role cue.
 assert_true(type(lead_role.LEAD_SYSTEM_PROMPT) == "string", "LEAD_SYSTEM_PROMPT is a string")
 assert_true(#lead_role.LEAD_SYSTEM_PROMPT > 0, "LEAD_SYSTEM_PROMPT is non-empty")
 assert_true(
   not lead_role.LEAD_SYSTEM_PROMPT:find("^%[lead%-workflow%.role: prompt"),
   "LEAD_SYSTEM_PROMPT is the real prompt, not a missing-file placeholder"
+)
+assert_true(
+  lead_role.LEAD_SYSTEM_PROMPT:find(lead_role.BASE_SYSTEM_PROMPT, 1, true) == 1,
+  "LEAD_SYSTEM_PROMPT begins with the shared base"
+)
+assert_true(
+  lead_role.LEAD_SYSTEM_PROMPT:find("lead orchestrator", 1, true) ~= nil,
+  "LEAD_SYSTEM_PROMPT includes the root lead overlay"
 )
