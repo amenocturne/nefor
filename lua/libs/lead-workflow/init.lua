@@ -103,6 +103,7 @@ local run_registry = RunRegistry.new({
 })
 
 local dependency_module_roots = {}
+local agent_system = nil
 
 local function copy_roots(roots)
   local copy = {}
@@ -371,6 +372,11 @@ local function resolve_profiles(actors)
         "' is missing required :profile. " ..
         "Set :profile in the MAG library wrapper that constructs this " ..
         "nefor.factory.llm actor."
+    end
+    if actor.foreign == "nefor.factory.llm"
+        and type(agent_system) == "string" and #agent_system > 0 then
+      overlay[actor.id] = overlay[actor.id] or {}
+      overlay[actor.id].system = agent_system
     end
   end
   return overlay, nil
@@ -1402,8 +1408,8 @@ local function lead_workflow_tool_schemas()
         "A program requires nefor.actors, nefor.graph, nefor.contracts, and " ..
         "nefor.artifact; construct an agent fragment, add an explicit initial " ..
         "message with nefor.graph.finish, then return " ..
-        "(nefor.artifact.compile program). Agent config requires :id, " ..
-        ":model, :profile, :provider, :system, :tools, and :da-policy. " ..
+        "(nefor.artifact.compile program). Use the agent constructor shown " ..
+        "by the injected canonical contract. " ..
         "Pass compiler-checked semantic type witnesses separately from runtime " ..
         "wire tags; use (type-tag nefor.contracts.Task), wire \"task\", and " ..
         "an output such as (type-tag nefor.contracts.FinalAnswer). The result boundary is " ..
@@ -1417,9 +1423,10 @@ local function lead_workflow_tool_schemas()
         "is on the critical path for your next decision vs what is " ..
         "self-contained sidecar work. Anything multi-file, multi-step, " ..
         "or long-horizon runs as a graph; keep only glances and " ..
-        "single-file tweaks local. Write each agent's :system prompt " ..
-        "self-contained — goal, relevant paths, constraints, expected " ..
-        "output shape; agents do not see your conversation. Give " ..
+        "single-file tweaks local. Use the composition's ready agent " ..
+        "constructor and put the self-contained goal, relevant paths, " ..
+        "constraints, and expected output in its task message. Agents do " ..
+        "not see your conversation. Give " ..
         "parallel builders disjoint write sets. After dispatch, do not " ..
         "poll graph-status — run outcomes (completion, failure, " ..
         "interruption) are delivered to you by the runtime. Integrate " ..
@@ -1944,6 +1951,7 @@ local M = {
       state.pending_mag_load = {}
       state.attached_mag_runs = {}
       dependency_module_roots = {}
+      agent_system = nil
       mag_eval._internals.reset()
       advertised = false
     end,
@@ -1959,6 +1967,11 @@ function M.configure(opts)
   if roots == nil then roots = {} end
   validate_dependency_module_roots(roots)
   dependency_module_roots = copy_roots(roots)
+  if opts.agent_system ~= nil
+      and (type(opts.agent_system) ~= "string" or #opts.agent_system == 0) then
+    error("lead-workflow: agent_system must be a non-empty string", 2)
+  end
+  agent_system = opts.agent_system
   mag_eval.configure({
     dependency_module_roots = copy_roots(roots),
     resolve_invocation = resolve_invocation,
