@@ -183,13 +183,15 @@ struct ToolSpec {
 
 /// Pending forwarded invocation: maps the gate-minted inner id (used to
 /// address the underlying plugin) back to the provider's outer id (so when
-/// `tool.result` arrives we can rewrite the id and broadcast it) plus the
-/// source plugin the call was forwarded to (so a `tool.cancel` for the outer
-/// id can be forwarded on to the same source under the inner id).
+/// `tool.result` arrives we can rewrite the id, stamp the canonical invoked
+/// tool name, and broadcast it) plus the source plugin the call was forwarded
+/// to (so a `tool.cancel` for the outer id can be forwarded on to the same
+/// source under the inner id).
 #[derive(Debug, Clone)]
 struct PendingForward {
     outer_id: String,
     source: String,
+    name: String,
 }
 
 /// Pending permission request: maps the provider's outer id to the
@@ -670,6 +672,7 @@ async fn forward_to_source(
         PendingForward {
             outer_id: outer_id.to_owned(),
             source: source.to_owned(),
+            name: name.to_owned(),
         },
     );
     send_event(
@@ -748,6 +751,7 @@ async fn handle_tool_result(
     let mut out = body.clone();
     out.insert("kind".into(), Value::String("tool.result".into()));
     out.insert("id".into(), Value::String(pending.outer_id));
+    out.insert("name".into(), Value::String(pending.name));
     send_event(out_tx, out).await?;
     Ok(())
 }
@@ -1573,6 +1577,7 @@ mod tests {
             PendingForward {
                 outer_id: "prov-42".into(),
                 source: "basic-tools".into(),
+                name: "read_file".into(),
             },
         );
         let body = json!({
@@ -1653,6 +1658,7 @@ mod tests {
             .unwrap();
         let returned: Value = serde_json::from_str(&rx.recv().await.unwrap().to_line()).unwrap();
         assert_eq!(returned["body"]["id"], "r7/cap-3");
+        assert_eq!(returned["body"]["name"], "write_file");
         assert_eq!(returned["body"]["output"]["run_id"], "mag-eval-1");
     }
 
@@ -1825,6 +1831,7 @@ mod tests {
             PendingForward {
                 outer_id: "r21/cap-1".into(),
                 source: "basic-tools".into(),
+                name: "bash".into(),
             },
         );
         let result = json!({"kind": "tool.result", "id": "gate-1", "output": "done"})

@@ -380,6 +380,8 @@ fn tool_gate_wrapper_swaps_huge_tool_result_output_to_summary() {
             { type = "event", from = "tool-gate",
               body = { kind = "tool.result", id = "call-big", output = big, name = "read_file" } },
             { type = "event", from = "tool-gate",
+              body = { kind = "tool.result", id = "call-instructions", output = big, name = "instructions" } },
+            { type = "event", from = "tool-gate",
               body = { kind = "tool.result", id = "call-small", output = "ok", name = "read_file" } },
         })
         "#,
@@ -398,8 +400,8 @@ fn tool_gate_wrapper_swaps_huge_tool_result_output_to_summary() {
         .collect();
     assert_eq!(
         payloads.len(),
-        2,
-        "expected 2 publishes, got {}: {payloads:?}",
+        3,
+        "expected 3 publishes, got {}: {payloads:?}",
         payloads.len()
     );
 
@@ -436,11 +438,32 @@ fn tool_gate_wrapper_swaps_huge_tool_result_output_to_summary() {
         big_size
     );
 
+    // The canonical instructions result is the sole oversized-output
+    // exemption: its complete payload remains inline and no dump is created.
+    let instructions = payloads
+        .iter()
+        .find(|p| p.contains("\"id\":\"call-instructions\""))
+        .expect("instructions payload missing");
+    assert!(
+        (instructions.len() as i64) > big_size,
+        "instructions output must remain fully inline ({} bytes vs {} payload bytes)",
+        instructions.len(),
+        big_size
+    );
+    assert!(
+        instructions.contains(&"PAYLOAD-LINE\\n".repeat(5000)),
+        "instructions payload must preserve the full output"
+    );
+
     // The on-disk file landed with the FULL original bytes, ready
     // for the model to grep on a subsequent turn.
     let scope_dir = tempdir.path().join("tool-results").join("_unscoped");
     let dump_path = scope_dir.join("call-big.txt");
     assert!(dump_path.exists(), "dump file missing at {dump_path:?}");
+    assert!(
+        !scope_dir.join("call-instructions.txt").exists(),
+        "oversized instructions output must not create a dump"
+    );
     let on_disk = std::fs::read_to_string(&dump_path).expect("read dump");
     assert_eq!(
         on_disk,
