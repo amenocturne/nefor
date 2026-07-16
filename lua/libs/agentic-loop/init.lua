@@ -230,7 +230,7 @@ local function build_mag_static_section(config_dir)
   local parts = {}
   parts[#parts + 1] = "The session MAG workspace is seeded and ready. Paths you pass to " ..
     "`mag` are relative to it. The current canonical authoring contract from " ..
-    "patterns.md is inlined below; read a role prompt body with read_file when needed."
+    "patterns.md is inlined below; delegated agents reuse the common prompt listed below."
   parts[#parts + 1] = ""
   parts[#parts + 1] = "lib/ inventory:"
   for _, rel in ipairs(lib_inventory(lib_dir)) do parts[#parts + 1] = "  " .. rel end
@@ -238,7 +238,7 @@ local function build_mag_static_section(config_dir)
   parts[#parts + 1] = "### lib/patterns.md"
   parts[#parts + 1] = patterns or "(unavailable)"
   parts[#parts + 1] = ""
-  parts[#parts + 1] = "### lib/prompts/ (read a role prompt with read_file to reuse it)"
+  parts[#parts + 1] = "### lib/prompts/ (one common prompt for every delegated agent)"
   local names = prompt_names(lib_dir)
   parts[#parts + 1] = "  " .. (#names > 0 and table.concat(names, ", ") or "(none)")
 
