@@ -21,15 +21,7 @@ end
 -- Module loads without error.
 local lead_role = require("libs.lead-workflow.role")
 
--- BASE_SYSTEM_PROMPT is real shared content and does not claim the root role.
-assert_true(type(lead_role.BASE_SYSTEM_PROMPT) == "string", "BASE_SYSTEM_PROMPT is a string")
-assert_true(#lead_role.BASE_SYSTEM_PROMPT > 0, "BASE_SYSTEM_PROMPT is non-empty")
-assert_true(
-  not lead_role.BASE_SYSTEM_PROMPT:find("lead orchestrator", 1, true),
-  "BASE_SYSTEM_PROMPT does not claim the root role"
-)
-
--- LEAD_SYSTEM_PROMPT composes the base with the root-only role cue.
+-- LEAD_SYSTEM_PROMPT is the complete lead file, read verbatim off disk.
 assert_true(type(lead_role.LEAD_SYSTEM_PROMPT) == "string", "LEAD_SYSTEM_PROMPT is a string")
 assert_true(#lead_role.LEAD_SYSTEM_PROMPT > 0, "LEAD_SYSTEM_PROMPT is non-empty")
 assert_true(
@@ -37,10 +29,19 @@ assert_true(
   "LEAD_SYSTEM_PROMPT is the real prompt, not a missing-file placeholder"
 )
 assert_true(
-  lead_role.LEAD_SYSTEM_PROMPT:find(lead_role.BASE_SYSTEM_PROMPT, 1, true) == 1,
-  "LEAD_SYSTEM_PROMPT begins with the shared base"
+  lead_role.LEAD_SYSTEM_PROMPT:find("lead orchestrator", 1, true) ~= nil,
+  "LEAD_SYSTEM_PROMPT carries the root lead role"
+)
+
+-- WORKER_SYSTEM_PROMPT is the complete delegated-agent file, read verbatim.
+-- It is a full standalone prompt and does not claim the root role.
+assert_true(type(lead_role.WORKER_SYSTEM_PROMPT) == "string", "WORKER_SYSTEM_PROMPT is a string")
+assert_true(#lead_role.WORKER_SYSTEM_PROMPT > 0, "WORKER_SYSTEM_PROMPT is non-empty")
+assert_true(
+  not lead_role.WORKER_SYSTEM_PROMPT:find("^%[lead%-workflow%.role: prompt"),
+  "WORKER_SYSTEM_PROMPT is the real prompt, not a missing-file placeholder"
 )
 assert_true(
-  lead_role.LEAD_SYSTEM_PROMPT:find("lead orchestrator", 1, true) ~= nil,
-  "LEAD_SYSTEM_PROMPT includes the root lead overlay"
+  not lead_role.WORKER_SYSTEM_PROMPT:find("lead orchestrator", 1, true),
+  "WORKER_SYSTEM_PROMPT does not claim the root role"
 )

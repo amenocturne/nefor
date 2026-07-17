@@ -1,9 +1,17 @@
 -- libs/lead-workflow/role.lua — lead-workflow role loader (mechanism).
 --
--- Loads `prompts/base.md` and `prompts/lead.md` at module-load time and exposes:
+-- Loads `prompts/lead.md` and `prompts/worker.md` at module-load time and
+-- exposes each as a COMPLETE system prompt, read verbatim off disk:
 --
---   * BASE_SYSTEM_PROMPT — string, shared by every agent.
---   * LEAD_SYSTEM_PROMPT — base plus the root lead's positional overlay.
+--   * LEAD_SYSTEM_PROMPT   — the root lead's full system prompt.
+--   * WORKER_SYSTEM_PROMPT — a delegated agent's full system prompt.
+--
+-- These are final files: the loom prompt compiler (agentic-kit) composes
+-- profile fragments + the role overlay + any provider-conditional preamble
+-- (the Qwen/Ollama reasoning-hygiene mitigation that used to live here as a
+-- Lua string literal) into each file. This loader does NO text composition —
+-- it loads and returns. Downstream configs that ship their own prompt files
+-- (the starter) fold any provider preamble into those files directly.
 --
 -- The lead's tool surface is NOT here: it is authored inside the
 -- turn-program (`:tools` in agentic-loop/lead-turn.mag).
@@ -49,40 +57,6 @@ local function read_prompt(name)
   return content
 end
 
--- Reasoning-hygiene preamble. Prepended to every role prompt so every
--- system prompt the engine ships starts with this discipline.
---
--- WHY: Qwen 3 / Ollama-class thinking models route reasoning vs
--- content via raw `<think>...</think>` tags in the chat template.
--- When the model writes the literal characters `</think>` inside its
--- reasoning (because it's discussing tag handling, escaping, or its
--- own format), the chat-template parser sees the close tag and ends
--- the reasoning channel mid-thought. The model's continuing reasoning
--- then bleeds into the content channel as user-visible answer text.
--- We've observed this in production: a 30-line internal monologue
--- collapsed onto the user's screen as if it were a final answer.
---
--- Telling the model to refer to the tag descriptively ("the closing
--- think tag") rather than reproducing the literal characters defuses
--- the parser. This is a mitigation, not a fix — the underlying
--- chat-template behaviour belongs to Ollama — but it removes the
--- common trigger.
-local REASONING_HYGIENE = table.concat({
-  "## Reasoning channel hygiene",
-  "",
-  "If you reason about your own output format — thinking tags, end-of-",
-  "reasoning markers, channel separators — DO NOT reproduce the literal",
-  "tag characters in your reasoning. Refer to them descriptively (e.g.",
-  '"the closing think tag", "the end-of-reasoning marker") instead of',
-  "writing the tag verbatim. Writing the literal close-tag characters in",
-  "your reasoning causes the chat-template parser to end the reasoning",
-  "channel where you wrote them, and the rest of your thought leaks",
-  "into the user-visible answer.",
-  "",
-  "---",
-  "",
-}, "\n")
-
 -- Failure mode: a missing prompt file is a developer error, not a
 -- runtime condition. We surface a placeholder string here so the
 -- module still loads (downstream code can detect the placeholder and
@@ -94,10 +68,7 @@ local function load_or_placeholder(name)
   return "[lead-workflow.role: prompt '" .. name .. "' missing — " .. tostring(err) .. "]"
 end
 
-local base = load_or_placeholder("base")
-local lead = load_or_placeholder("lead")
-
-M.BASE_SYSTEM_PROMPT = REASONING_HYGIENE .. base
-M.LEAD_SYSTEM_PROMPT = M.BASE_SYSTEM_PROMPT .. "\n\n---\n\n" .. lead
+M.LEAD_SYSTEM_PROMPT = load_or_placeholder("lead")
+M.WORKER_SYSTEM_PROMPT = load_or_placeholder("worker")
 
 return M
