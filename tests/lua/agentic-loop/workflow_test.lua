@@ -659,6 +659,69 @@ do
   assert_eq(#seeded, 2, "the promoted turn seeds the finished turn's history")
 end
 
+
+-- A resolved single-Esc gesture steers queued input into the current lead
+-- run. The queue is claimed until MAG acknowledges the exact run/actor.
+do
+  fresh_loop()
+  local exec = begin_bound_turn("first", "r-steer")
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "queued" })
+  _test.calls_clear()
+  send_to_loop("nefor-tui", { kind = "chat.steer" })
+  local calls = decode_calls()
+  local steer = find_kind(calls, "mag.steer_run")
+  assert(steer ~= nil, "chat.steer emits mag.steer_run")
+  assert_eq(steer.body.run_id, exec.body.run_id, "steer targets the current lead run")
+  assert_eq(steer.body.actor_id, "lead.llm", "steer targets the lead transcript owner")
+  assert_eq(steer.body.message.role, "user", "steer injects a user-role message")
+  assert_eq(steer.body.message.content, "queued", "steer carries the claimed queue")
+  assert_eq(#agentic_loop._internals.state.pending_user_inputs, 0,
+    "claimed inputs leave the ordinary promotion queue")
+
+  _test.calls_clear()
+  send_to_loop("mag", {
+    kind = "mag.run_steered", in_reply_to = steer.body.id,
+    run_id = exec.body.run_id, accepted = true,
+  })
+  calls = decode_calls()
+  assert(find_kind(calls, "chat.queue.steered") ~= nil,
+    "accepted steer tells the TUI its queued entry is now live transcript")
+  assert_eq(agentic_loop._internals.state.pending_steer, nil,
+    "accepted steer clears the acknowledgement latch")
+end
+
+-- A raced/ended run cannot eat queued text: rejected steering restores the
+-- claimed inputs so the ordinary next-turn promotion path remains available.
+do
+  fresh_loop()
+  local exec = begin_bound_turn("first", "r-steer-reject")
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "queued" })
+  _test.calls_clear()
+  send_to_loop("nefor-tui", { kind = "chat.steer" })
+  local steer = find_kind(decode_calls(), "mag.steer_run")
+  send_to_loop("mag", {
+    kind = "mag.run_steered", in_reply_to = steer.body.id,
+    run_id = exec.body.run_id, accepted = false,
+  })
+  assert_eq(agentic_loop._internals.state.pending_user_inputs[1], "queued",
+    "rejected steer restores the queued input")
+end
+
+-- Hard lead stop (double Esc / x / X) discards the backend queue before kill,
+-- preventing the killed run's close handler from immediately spawning it.
+do
+  fresh_loop()
+  local exec = begin_bound_turn("first", "r-hard-stop")
+  send_to_loop("nefor-tui", { kind = "chat.input.submit", text = "queued" })
+  _test.calls_clear()
+  send_to_loop("nefor-tui", { kind = "chat.interrupt", drop_queued = true })
+  assert(find_kind(decode_calls(), "mag.kill_run") ~= nil, "hard stop kills the lead run")
+  _test.calls_clear()
+  send_to_loop("mag", { kind = "mag.run_result", run_id = exec.body.run_id, status = "killed" })
+  assert_eq(find_kind(decode_calls(), "mag.execute"), nil,
+    "hard stop does not promote the queue into a replacement lead run")
+end
+
 -- (interrupt_all = graceful) double-Esc GRACEFULLY interrupts the run (not a
 -- kill) and drops the queued inputs. The run SURVIVES and winds down to a
 -- completed turn that records its own history — the amnesia is structurally

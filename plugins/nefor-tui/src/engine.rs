@@ -72,6 +72,7 @@ pub struct Engine {
     /// written to stdout as one JSON-line `PluginOutgoing::event(body)`
     /// per entry.
     pending_emits: Vec<(Option<String>, JsonMap<String, JsonValue>)>,
+    scheduled_dispatches: Vec<ScheduledDispatch>,
     /// Cell coordinates where the user pressed left-mouse-button down,
     /// initiating a selection drag. `None` when no drag is in progress.
     selection_start: Option<(u16, u16)>,
@@ -135,6 +136,11 @@ pub struct Engine {
     last_auto_scroll_tick_ms: u64,
 }
 
+struct ScheduledDispatch {
+    due_at_ms: u64,
+    body: JsonMap<String, JsonValue>,
+}
+
 /// Direction of the continuous auto-scroll latch. `Up` scrolls toward
 /// the start of the content (decreases `scroll_y`); `Down` scrolls toward
 /// the end (increases `scroll_y`).
@@ -160,6 +166,7 @@ impl Engine {
             clock_origin: Instant::now(),
             clock_offset_ms: 0,
             pending_emits: Vec::new(),
+            scheduled_dispatches: Vec::new(),
             selection_start: None,
             selection_end: None,
             selecting: false,
@@ -372,6 +379,12 @@ impl Engine {
                 SideEffect::Emit { target_hint, body } => {
                     self.pending_emits.push((target_hint, body));
                 }
+                SideEffect::DispatchAfter { delay_ms, body } => {
+                    self.scheduled_dispatches.push(ScheduledDispatch {
+                        due_at_ms: self.now_ms().saturating_add(delay_ms),
+                        body,
+                    });
+                }
             }
         }
         // Drain the imperative emit queue too — `tui.emit / tui.send_to`
@@ -391,6 +404,33 @@ impl Engine {
         }
         self.needs_render = true;
         Ok(())
+    }
+
+    pub fn has_scheduled_dispatches(&self) -> bool {
+        !self.scheduled_dispatches.is_empty()
+    }
+
+    /// Dispatch every local timer whose deadline has passed. Timers are
+    /// one-shot; reducers use tokens to ignore callbacks superseded by later
+    /// input (for example the second press of a double-Esc gesture).
+    pub fn drive_scheduled_dispatches(&mut self) -> Result<bool, TuiError> {
+        let now = self.now_ms();
+        let mut due = Vec::new();
+        let mut pending = Vec::new();
+        for timer in self.scheduled_dispatches.drain(..) {
+            if timer.due_at_ms <= now {
+                due.push(timer.body);
+            } else {
+                pending.push(timer);
+            }
+        }
+        self.scheduled_dispatches = pending;
+        let fired = !due.is_empty();
+        for body in due {
+            let msg = self.lua.body_to_msg_table(&body)?;
+            self.dispatch_msg(msg)?;
+        }
+        Ok(fired)
     }
 
     /// Dispatch an inbound NCP `event` body (the deserialized object

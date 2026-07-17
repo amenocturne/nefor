@@ -21,11 +21,11 @@ local M = {}
 local HELP_BODY = [[Keys:
   Enter        send message
   Shift+Enter  insert newline
-  Esc          cancel current turn
-  Esc Esc      cancel everything (within 600ms)
+  Esc          steer queued message after current LLM exchange
+  Esc Esc      stop lead; restore queued text to prompt (within 600ms)
   Ctrl+B       toggle sidebar
   Tab          focus sidebar ↔ prompt
-  (sidebar)    ↑/↓ move · Space view · Enter fold · Esc back
+  (sidebar)    ↑/↓ move · Space view · Enter fold · x/X terminate one/all · Esc back
   Ctrl+O       expand/collapse tool calls + reasoning
   Ctrl+R       reveal raw for latest expanded tool
   /raw <id>    reveal raw for a specific tool receipt
@@ -111,6 +111,28 @@ function M.tool_permission(state)
         content = "[A]pprove   [D]eny   (Esc = deny)",
         style   = STYLE.status_warn,
       },
+    }},
+  })
+end
+
+function M.terminate_workflow(state)
+  if not state.popup or state.popup.variant ~= "terminate_workflow" then return nil end
+  local all = state.popup.scope == "all"
+  return W.popup.view({
+    open         = true,
+    border_style = STYLE.popup_danger,
+    width        = "60%",
+    height       = "35%",
+    title        = all and " terminate ALL workflows " or " terminate workflow ",
+    title_style  = STYLE.popup_danger,
+    child        = tui.column { gap = 1, children = {
+      tui.text {
+        content = all
+          and "Terminate every active MAG workflow, including the lead?"
+          or ("Terminate " .. tostring(state.popup.label or state.popup.run_id or "this workflow") .. "?"),
+        wrap = "word",
+      },
+      tui.text { content = "Enter / Y confirm · Esc / N cancel", style = STYLE.status_warn },
     }},
   })
 end
@@ -651,6 +673,7 @@ function M.scroll_key(variant)
      or variant == "warning"
      or variant == "error"        then return "popup_message" end
   if variant == "tool_permission" then return "popup_tool_permission" end
+  if variant == "terminate_workflow" then return nil end
   if variant == "model_picker"    then return "popup_model_picker" end
   if variant == "session_picker"  then return "popup_session_picker" end
   if variant == "login_picker"    then return "popup_login_picker" end

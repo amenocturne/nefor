@@ -209,6 +209,7 @@ local function handle_input_submit(msg, state)
       turn_started_at = NIL_SENTINEL,
       last_turn_duration_ms = NIL_SENTINEL,
       last_esc_ms = NIL_SENTINEL,
+      escape_token = NIL_SENTINEL,
       history_cursor = NIL_SENTINEL,
       popup = NIL_SENTINEL,
       queued_entry_idx = NIL_SENTINEL,
@@ -403,6 +404,7 @@ local function handle_input_submit(msg, state)
         turn_started_at = NIL_SENTINEL,
         last_turn_duration_ms = NIL_SENTINEL,
         last_esc_ms = NIL_SENTINEL,
+        escape_token = NIL_SENTINEL,
         history_cursor = NIL_SENTINEL,
         popup = NIL_SENTINEL,
         queued_entry_idx = NIL_SENTINEL,
@@ -670,6 +672,58 @@ local function handle_help_key(_msg, state)
   return state, {}
 end
 
+local function join_with_space(left, right)
+  if type(left) ~= "string" or left == "" then return right or "" end
+  if type(right) ~= "string" or right == "" then return left end
+  return left .. " " .. right
+end
+
+local function restore_queued_to_prompt(state)
+  local idx = state.queued_entry_idx
+  if type(idx) ~= "number" then return state end
+  local queued = state.entries and state.entries[idx]
+  local text = queued and queued.text or ""
+  local entries = {}
+  for i, entry in ipairs(state.entries or {}) do
+    if i ~= idx then entries[#entries + 1] = entry end
+  end
+  local in_flight = state.in_flight
+  if type(in_flight) == "number" and in_flight > idx then in_flight = in_flight - 1 end
+  height_cache.invalidate_all()
+  return shallow_merge(state, {
+    entries = entries,
+    in_flight = in_flight,
+    queued_entry_idx = NIL_SENTINEL,
+    pending_user_echo = NIL_SENTINEL,
+    input_value = join_with_space(text, state.input_value),
+  })
+end
+
+local function hard_stop_lead(state)
+  state = restore_queued_to_prompt(state)
+  return shallow_merge(state, {
+    escape_token = NIL_SENTINEL,
+    last_esc_ms = NIL_SENTINEL,
+  }), {
+    { kind = "send_to", target = "engine",
+      body = { kind = "chat.interrupt", drop_queued = true } },
+  }
+end
+
+local function handle_escape_timeout(msg, state)
+  if msg.token ~= state.escape_token then return state, {} end
+  local cleared = shallow_merge(state, {
+    escape_token = NIL_SENTINEL,
+    last_esc_ms = NIL_SENTINEL,
+  })
+  if state.queued_entry_idx and (state.pending or state.in_flight ~= nil) then
+    return cleared, {
+      { kind = "send_to", target = "engine", body = { kind = "chat.steer" } },
+    }
+  end
+  return cleared, {}
+end
+
 local function handle_escape(_msg, state)
   -- 1a) Info / warning / error popups: Esc dismisses the popup only
   -- (toasts stay). Matches the same Enter/Q path in route_keys_and_popups.
@@ -709,25 +763,22 @@ local function handle_escape(_msg, state)
       history_cursor = NIL_SENTINEL,
     }), {}
   end
-  -- 4) double-ESC escalation
+  -- 4) Resolve the gesture only after the double-Esc window. The first
+  -- press schedules a tokened local callback and performs no lead action.
   local now = tui.now_ms()
-  if state.last_esc_ms and (now - state.last_esc_ms) <= DOUBLE_ESC_MS then
-    local interrupted = run_panel.interrupt_all(state, now)
-    return shallow_merge(interrupted, { last_esc_ms = NIL_SENTINEL }), {
-      { kind = "send_to", target = "engine",
-        body = { kind = "chat.interrupt_all" } },
-    }
+  if state.escape_token and state.last_esc_ms
+      and (now - state.last_esc_ms) <= DOUBLE_ESC_MS then
+    return hard_stop_lead(state)
   end
-  -- 4) single ESC interrupts the current turn
-  if state.pending or state.in_flight ~= nil then
-    local interrupted = run_panel.interrupt_all(state, now)
-    return shallow_merge(interrupted, { last_esc_ms = now }), {
-      { kind = "send_to", target = "engine",
-        body = { kind = "chat.interrupt" } },
-    }
-  end
-  -- Stamp anyway so a follow-up ESC within the window can escalate.
-  return shallow_merge(state, { last_esc_ms = now }), {}
+  local token = (state.escape_token_seq or 0) + 1
+  return shallow_merge(state, {
+    last_esc_ms = now,
+    escape_token = token,
+    escape_token_seq = token,
+  }), {
+    { kind = "dispatch_after", delay_ms = DOUBLE_ESC_MS,
+      body = { kind = "chat.escape_timeout", token = token } },
+  }
 end
 
 -- ── session lifecycle ─────────────────────────────────────────────────
@@ -742,6 +793,8 @@ local function handle_session_end(_msg, state)
     popup            = NIL_SENTINEL,
     toasts           = {},
     completion       = NIL_SENTINEL,
+    last_esc_ms      = NIL_SENTINEL,
+    escape_token     = NIL_SENTINEL,
     runs             = {},
     agent_streams    = {},
     scope_to_run     = {},
@@ -1392,7 +1445,12 @@ local function handle_mag_run_started(msg, state)
   -- panels and agent streams remain intentionally unreconstructed.
   state = agent_streams.set_scope(state, msg.scope, run_id)
   if state.replay_mode then return state, {} end
-  return run_panel.mag_run_started(state, run_id, msg.run_name, tui.now_ms()), {}
+  return run_panel.mag_run_started(state, run_id, msg.run_name, msg.principal, tui.now_ms()), {}
+end
+
+local function handle_queue_steered(_msg, state)
+  if not state.queued_entry_idx then return state, {} end
+  return shallow_merge(state, { queued_entry_idx = NIL_SENTINEL }), {}
 end
 
 local function handle_mag_actor_spawned(msg, state)
@@ -1522,12 +1580,14 @@ local handlers = {
   ["key.?"]                       = handle_help_key,
   ["key.shift_?"]                 = handle_help_key,
   ["key.escape"]                  = handle_escape,
+  ["chat.escape_timeout"]         = handle_escape_timeout,
   ["sessions.session_end"]        = handle_session_end,
   ["sessions.session_start"]      = handle_session_start,
   ["sessions.replay.start"]       = handle_replay_start,
   ["sessions.replay.end"]         = handle_replay_end,
   ["chat.reset"]                  = handle_chat_reset,
   ["chat.message.append"]         = handle_message_append,
+  ["chat.queue.steered"]          = handle_queue_steered,
   ["chat.instruction.notice"]     = handle_instruction_notice,
   ["chat.lead.bound"]             = handle_lead_chat_bound,
   ["chat.stream.delta"]           = handle_stream_delta,
@@ -1571,6 +1631,46 @@ local handlers = {
 
 local function route_keys_and_popups(msg, state)
   local kind = msg.kind or ""
+
+  if state.popup and state.popup.variant == "terminate_workflow" then
+    if kind == "key.escape" or kind == "key.n" or kind == "key.N"
+        or kind == "key.q" or kind == "key.Q" then
+      return shallow_merge(state, { popup = NIL_SENTINEL }), {}
+    end
+    if kind == "key.enter" or kind == "key.y" or kind == "key.Y" then
+      local p = state.popup
+      local next_state = shallow_merge(state, { popup = NIL_SENTINEL })
+      local effects = {}
+      if p.scope == "all" then
+        local lead_active = state.pending == true or state.in_flight ~= nil
+        for _, run in pairs(state.runs or {}) do
+          if run.principal == "lead" and run.completed_at_ms == nil then
+            lead_active = true
+            break
+          end
+        end
+        if lead_active then
+          local stop_effects
+          next_state, stop_effects = hard_stop_lead(next_state)
+          for _, effect in ipairs(stop_effects) do effects[#effects + 1] = effect end
+        end
+        effects[#effects + 1] = {
+          kind = "send_to", target = "mag", body = { kind = "mag.kill_all_runs" },
+        }
+        return next_state, effects
+      end
+      local run = (state.runs or {})[p.run_id]
+      if not run or run.completed_at_ms ~= nil then return next_state, {} end
+      if run.principal == "lead" then
+        return hard_stop_lead(next_state)
+      end
+      return next_state, {
+        { kind = "send_to", target = "mag",
+          body = { kind = "mag.kill_run", run_id = p.run_id } },
+      }
+    end
+    return state, {}
+  end
 
   -- Info / warning / error popups are dismiss-only and accept Esc,
   -- Enter, or Q.
@@ -1722,6 +1822,26 @@ local function route_keys_and_popups(msg, state)
   -- the cursor skips them by construction).
   if state.focus == "sidebar" and state.popup == nil then
     local now = tui.now_ms()
+    if kind == "key.x" or kind == "key.X" then
+      if kind == "key.X" then
+        return shallow_merge(state, {
+          popup = { variant = "terminate_workflow", scope = "all" },
+        }), {}
+      end
+      local rows = run_panel.row_model(state, now)
+      local row = rows[run_panel.clamp_cursor(state.sidebar_cursor, #rows)]
+      if row == nil then return state, {} end
+      local run = (state.runs or {})[row.run_id]
+      if not run or run.completed_at_ms ~= nil then return state, {} end
+      return shallow_merge(state, {
+        popup = {
+          variant = "terminate_workflow",
+          scope = "one",
+          run_id = row.run_id,
+          label = run.run_name or row.run_id,
+        },
+      }), {}
+    end
     if kind == "key.up" or kind == "key.down" then
       local rows = run_panel.row_model(state, now)
       if #rows == 0 then return state, {} end

@@ -605,6 +605,12 @@ return {
     return ctx.router:drain(id)
   end,
 
+  steer_run = function(run_id, id, message)
+    local ctx = runs[run_id]
+    if not ctx then return false end
+    return ctx.router:steer(id, message)
+  end,
+
   -- Interrupt a live run's in-flight work. Two shapes, selected by `terminate`:
   --
   -- GRACEFUL (`terminate` falsy — the lead's OWN turn): settle every in-flight

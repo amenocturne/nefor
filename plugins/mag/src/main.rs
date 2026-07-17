@@ -124,8 +124,11 @@ const APPLIED_KIND: &str = "mag.applied";
 /// execute as `mag.run_result status:"killed"`. A kill for a run that is
 /// not live is a logged no-op (monotone lifecycles: kill on dead, no-op).
 const KILL_RUN_KIND: &str = "mag.kill_run";
+const KILL_ALL_RUNS_KIND: &str = "mag.kill_all_runs";
+const STEER_RUN_KIND: &str = "mag.steer_run";
+const RUN_STEERED_KIND: &str = "mag.run_steered";
 
-/// Interrupt a live run — the control plane's double-Esc surface. Carries an
+/// Interrupt a live run — the control plane's graceful-interrupt surface. Carries an
 /// optional `terminate` flag selecting the semantics (see `handle_interrupt_run`):
 ///
 /// * `terminate` absent/false — GRACEFUL (the lead's OWN turn): settle every
@@ -532,6 +535,8 @@ async fn handle_event(
             .await
         }
         KILL_RUN_KIND => handle_kill_run(out_tx, body, host, active, bridge).await,
+        KILL_ALL_RUNS_KIND => handle_kill_all_runs(out_tx, host, active, bridge).await,
+        STEER_RUN_KIND => handle_steer_run(out_tx, body, host, active).await,
         INTERRUPT_RUN_KIND => {
             handle_interrupt_run(out_tx, body, program.as_deref(), host, active, bridge).await
         }
@@ -1062,6 +1067,48 @@ async fn handle_kill_run(
     host.end_run(run_id, TeardownReason::Killed)?;
     flush_emits(out_tx, host, bridge).await?;
     send_event(out_tx, run_result_killed(a.in_reply_to.as_deref(), run_id)).await
+}
+
+async fn handle_kill_all_runs(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    host: &LuaHost,
+    active: &mut ActiveExecutes,
+    bridge: &mut CapabilityBridge,
+) -> Result<(), MagError> {
+    let mut run_ids: Vec<String> = active.keys().cloned().collect();
+    run_ids.sort();
+    for run_id in run_ids {
+        let Some(a) = active.remove(&run_id) else {
+            continue;
+        };
+        host.end_run(&run_id, TeardownReason::Killed)?;
+        flush_emits(out_tx, host, bridge).await?;
+        send_event(out_tx, run_result_killed(a.in_reply_to.as_deref(), &run_id)).await?;
+    }
+    Ok(())
+}
+
+async fn handle_steer_run(
+    out_tx: &mpsc::Sender<PluginOutgoing>,
+    body: &Map<String, Value>,
+    host: &LuaHost,
+    active: &ActiveExecutes,
+) -> Result<(), MagError> {
+    let in_reply_to = body.get("id").and_then(Value::as_str);
+    let run_id = body.get("run_id").and_then(Value::as_str).unwrap_or("");
+    let actor_id = body.get("actor_id").and_then(Value::as_str).unwrap_or("");
+    let message = body.get("message").cloned().unwrap_or(Value::Null);
+    let accepted = active.contains_key(run_id)
+        && !actor_id.is_empty()
+        && host.steer_run(run_id, actor_id, &message)?;
+    let mut ack = Map::new();
+    ack.insert("kind".into(), Value::String(RUN_STEERED_KIND.into()));
+    if let Some(id) = in_reply_to {
+        ack.insert("in_reply_to".into(), Value::String(id.to_owned()));
+    }
+    ack.insert("run_id".into(), Value::String(run_id.to_owned()));
+    ack.insert("accepted".into(), Value::Bool(accepted));
+    send_event(out_tx, ack).await
 }
 
 /// Interrupt one live run. `mag.interrupt_run` carries an optional `terminate`

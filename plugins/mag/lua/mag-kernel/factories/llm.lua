@@ -25,12 +25,18 @@ M.declaration = {
   },
   inputs = { provider_out = "generic-provider.ProviderOut" },
   outputs = { "generic-tool.ToolCalls", "generic-provider.FinalAnswer" },
-  signals = { "kill", "drain" },
+  signals = { "kill", "drain", "steer" },
 }
 
 function M.construct(id, params, emit)
   return boundary.construct(id, params, emit, {
     name = "llm",
+    steerable = true,
+    on_steered_final = function(state, result)
+      if type(result) == "table" and type(result.text) == "string" and result.text ~= "" then
+        state:append({ role = "assistant", content = result.text })
+      end
+    end,
     on_final = function(state, result)
       local final = { kind = "generic-provider.FinalAnswer", result = result }
       if type(result) == "table" then

@@ -33,21 +33,19 @@
 -- keys the lead's gated tool invocations (`<scope>/cap-N`) into
 -- `chat.tool.start` / `chat.tool.end` transcript events.
 --
--- Interrupt semantics split by gesture:
---   * Single-Esc (`chat.interrupt`) still KILLS the active run via
---     `mag.kill_run` — the kernel reaps the constellation and settles the turn
---     as `mag.run_result status:"killed"` (turn aborted, no history append).
---   * Double-Esc (`chat.interrupt_all`) GRACEFULLY interrupts via
---     `mag.interrupt_run`: the kernel settles the in-flight capability as a
---     failed "interrupted by user" result and cancels the real work, the lead
---     re-fires and winds the turn down to a real final answer, and the turn
---     closes through the normal `completed` path — so history records itself
---     and the amnesia is gone.
+-- Live-turn controls:
+--   * `chat.steer` claims queued input and injects it at the lead LLM's next
+--     provider boundary, after the current exchange.
+--   * `chat.interrupt { drop_queued = true }` kills only the active lead run;
+--     the TUI restores the queued text to its prompt before sending it.
+--   * `chat.interrupt_all` remains the session-wide graceful-interrupt surface
+--     used by commands and mode transitions.
 --
 -- Inbound dispatch:
 --   * `chat.input.submit { text }`       — spawn a turn-program (or queue)
---   * `chat.interrupt`                   — Esc; kill the active lead run
---   * `chat.interrupt_all`               — double-Esc; graceful interrupt + drop queues
+--   * `chat.steer`                       — inject queued input before next LLM turn
+--   * `chat.interrupt`                   — kill the active lead run
+--   * `chat.interrupt_all`               — graceful interrupt + drop queues
 --   * `chat.reset`                       — /new: clear state + history
 --   * `chat.model.set`                   — runtime model switch
 --   * `mag.loaded` / `mag.error`         — the turn-program load handshake
@@ -100,6 +98,7 @@ local state = {
   current_turn   = nil,         ---@type table|nil
   deferred_queue       = {},    ---@type table  queued relay texts { text }
   pending_user_inputs  = {},    ---@type table  queued submits while busy
+  pending_steer        = nil,   ---@type table|nil queued inputs awaiting MAG steer ack
 
   -- Observer registries. Public on_* setters append; producers fire via
   -- pcall so a bad observer doesn't break the chain.
@@ -563,8 +562,8 @@ local function kill_active_lead_run()
   return true
 end
 
--- Graceful interrupt of the active lead run (the double-Esc path — NOT a
--- kill). The kernel settles whatever capability the run is blocked on as a
+-- Graceful interrupt of the active lead run (NOT a kill). The kernel settles
+-- whatever capability the run is blocked on as a
 -- failed "interrupted by user" result and cancels the real work (a bash
 -- subprocess dies, a provider round aborts); the lead re-fires with that
 -- failure in context and winds the turn down with a real final answer. The run
@@ -593,12 +592,54 @@ local function interrupt_active_lead_run()
   return true
 end
 
--- Single-Esc: abort the current turn.
-local function cancel()
+-- Abort the current lead turn. When requested by the TUI's hard-stop paths,
+-- queued input has already been restored to the prompt and must not respawn.
+local function cancel(drop_queued)
+  if drop_queued then
+    state.pending_user_inputs = {}
+    state.pending_steer = nil
+  end
   kill_active_lead_run()
 end
 
--- Double-Esc / interrupt-all: gracefully interrupt the current turn and drop
+local function steer_pending_inputs()
+  if state.current_run_id == nil or state.pending_steer ~= nil then return false end
+  if #state.pending_user_inputs == 0 then return false end
+  local texts = state.pending_user_inputs
+  state.pending_user_inputs = {}
+  local text = table.concat(texts, "\n")
+  local id = "lead-steer-" .. envelope.uuid_lite()
+  state.pending_steer = {
+    id = id,
+    run_id = state.current_run_id,
+    texts = texts,
+  }
+  emit("mag", {
+    kind = "mag.steer_run",
+    id = id,
+    run_id = state.current_run_id,
+    actor_id = state.lead_program.llm_actor,
+    message = { role = "user", content = text },
+  })
+  return true
+end
+
+local function handle_run_steered(body)
+  local pending = state.pending_steer
+  if pending == nil or body.in_reply_to ~= pending.id then return end
+  state.pending_steer = nil
+  if body.accepted == true and body.run_id == pending.run_id then
+    emit("nefor-tui", { kind = "chat.queue.steered" })
+    return
+  end
+  local restored = {}
+  for _, text in ipairs(pending.texts) do restored[#restored + 1] = text end
+  for _, text in ipairs(state.pending_user_inputs) do restored[#restored + 1] = text end
+  state.pending_user_inputs = restored
+  flush_pending_user_inputs()
+end
+
+-- Session interrupt-all: gracefully interrupt the current turn and drop
 -- everything queued behind it. Unlike the old kill path, the run is NOT killed
 -- — it winds down to a final answer, so we keep `current_run_id` and do NOT
 -- force idle (the run is still working; it settles through the normal
@@ -609,6 +650,7 @@ local function cancel_all()
   local interrupted = interrupt_active_lead_run()
   local dropped_inputs = #state.pending_user_inputs
   state.pending_user_inputs = {}
+  state.pending_steer = nil
   if interrupted then
     emit("nefor-tui", {
       kind = "chat.message.append",
@@ -636,6 +678,7 @@ local function new_chat()
   state.current_turn = nil
   state.deferred_queue = {}
   state.pending_user_inputs = {}
+  state.pending_steer = nil
   state.history = {}
 end
 
@@ -839,7 +882,7 @@ local function record_turn(run_id, user_text, answer, transcript_delta)
 end
 
 -- The assistant-slot placeholder for a turn that ended without a real answer.
--- A user-initiated interrupt (single-Esc kill or the graceful "interrupted by
+-- A user-initiated hard kill or the graceful "interrupted by
 -- user" settle) records the same honest marker the user saw; any other failure
 -- records its error so the next turn can see what broke.
 local function aborted_turn_marker(err)
@@ -861,7 +904,7 @@ end
 --   failed — surfaced in chat as a system line, AND the turn is recorded
 --     with a placeholder answer so context survives (an interrupted lead
 --     turn settles here; without the record the next turn seeds blind).
---   killed — turn aborted (single-Esc / hard kill): no transcript append,
+--   killed — turn aborted (hard kill): no transcript append,
 --     but the turn IS recorded with an interrupted placeholder so the
 --     user's message survives into the next turn's seed.
 local function handle_mag_run_result(body)
@@ -894,7 +937,7 @@ local function handle_mag_run_result(body)
   end
 
   if body.status == "killed" then
-    -- A killed turn (single-Esc / hard kill) still preserves context: the
+    -- A killed turn (hard kill) still preserves context: the
     -- user's message plus an interrupted placeholder land in history so the
     -- next turn is not seeded blind. The transcript already carries the
     -- interrupt notice from cancel_all.
@@ -994,6 +1037,7 @@ local function teardown_for_session_end()
   state.current_turn   = nil
   state.deferred_queue     = {}
   state.pending_user_inputs = {}
+  state.pending_steer       = nil
   state.history            = {}
   emit_idle_state("session-ended")
   nefor.log.info("agentic-loop: sessions.session_end → state cleared", {})
@@ -1176,6 +1220,7 @@ local function receive_msg(entry)
     -- re-fire (a replayed chat.input.submit would spawn a fresh turn
     -- the user already saw the answer for).
     if kind == "chat.input.submit"
+        or kind == "chat.steer"
         or kind == "chat.reset"
         or kind == "chat.interrupt"
         or kind == "chat.interrupt_all"
@@ -1207,7 +1252,8 @@ local function receive_msg(entry)
 
   if kind == "chat.input.submit" then handle_chat_input_submit(body); return end
   if kind == "chat.reset"        then handle_chat_reset(); return end
-  if kind == "chat.interrupt"    then cancel(); return end
+  if kind == "chat.steer"        then steer_pending_inputs(); return end
+  if kind == "chat.interrupt"    then cancel(body.drop_queued == true); return end
   if kind == "chat.interrupt_all" then cancel_all(); return end
   if kind == "chat.model.set" then handle_chat_model_set(body); return end
   if kind == "chat.reasoning.set" then handle_chat_reasoning_set(body); return end
@@ -1218,6 +1264,7 @@ local function receive_msg(entry)
 
   -- Turn lifecycle.
   if kind == "mag.run_started" then handle_mag_run_started(body); return end
+  if kind == "mag.run_steered" then handle_run_steered(body); return end
   if kind == "mag.run_result"  then handle_mag_run_result(body); return end
 
   -- Lead-scoped tool + stream observation.
@@ -1332,6 +1379,7 @@ M._internals  = {
     state.current_turn = nil
     state.deferred_queue = {}
     state.pending_user_inputs = {}
+    state.pending_steer = nil
     state.stream_observers = {}
     state.reasoning_observers = {}
     state.tool_start_observers = {}

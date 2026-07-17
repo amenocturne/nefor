@@ -476,37 +476,6 @@ local function apply(state, run_id, fn)
   return shallow_merge(state, { runs = new_runs })
 end
 
--- User-initiated interrupt (double-ESC). Flip every still-running
--- node to `error` so it renders red — "interrupted" is a failure
--- from the run's POV, same as a backend crash. Stamp completed_at_ms
--- so the linger window starts running and the run fades out via the
--- existing prune path; otherwise the sidebar would freeze with stale
--- "Ns" timers because cancel_all on the engine side never emits the
--- run.completed envelope a clean termination would.
-function M.interrupt_all(state, now_ms)
-  if type(state.runs) ~= "table" then return state end
-  local new_runs = {}
-  for run_id, run in pairs(state.runs) do
-    local nodes = {}
-    for node_id, node in pairs(run.nodes or {}) do
-      if not TERMINAL_STATUS[node.status] then
-        nodes[node_id] = shallow_merge(node, {
-          status         = "error",
-          finished_at_ms = now_ms,
-        })
-      else
-        nodes[node_id] = node
-      end
-    end
-    new_runs[run_id] = shallow_merge(run, {
-      nodes           = nodes,
-      completed_at_ms = run.completed_at_ms or now_ms,
-      status          = run.status or "interrupted",
-    })
-  end
-  return shallow_merge(state, { runs = new_runs })
-end
-
 -- ── MAG actor-kernel lifecycle ────────────────────────────────────────
 --
 -- The kernel's `mag.*` event stream drives the run panel. Actors are
@@ -517,11 +486,11 @@ end
 -- actors flip to done). Every event carries its run_id; the reducer
 -- keys panel state straight off it.
 
-function M.mag_run_started(state, run_id, run_name, now_ms)
+function M.mag_run_started(state, run_id, run_name, principal, now_ms)
   if state.runs and state.runs[run_id] then return state end
   return apply(state, run_id, function(_)
     return {
-      run_id = run_id, run_name = run_name,
+      run_id = run_id, run_name = run_name, principal = principal,
       total_nodes = 0, started_at_ms = now_ms, nodes = {},
       completed_at_ms = nil, status = nil, rejected = 0, noops = 0,
       actor_seq = 0,

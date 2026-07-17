@@ -482,7 +482,7 @@ fn busy_submits_emit_immediately_and_coalesce_in_transcript() {
 }
 
 #[test]
-fn interrupt_moves_pending_followups_back_to_prompt() {
+fn double_escape_stops_lead_and_moves_queue_before_existing_prompt_text() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -492,21 +492,78 @@ fn interrupt_moves_pending_followups_back_to_prompt() {
     let _ = render_str(&mut engine);
 
     submit_text(&mut engine, "queued");
+    let _ = render_str(&mut engine);
     type_text(&mut engine, "draft");
     let _ = engine.take_emit_queue();
     engine.handle_key(key("escape")).expect("escape");
+    assert!(
+        engine.take_emit_queue().is_empty(),
+        "first escape must wait for the double-Esc window"
+    );
+    engine.handle_key(key("escape")).expect("second escape");
     let emits = engine.take_emit_queue();
     assert_eq!(emits.len(), 1, "interrupt emit");
     assert_eq!(
         emits[0].1.get("kind").and_then(|v| v.as_str()),
         Some("chat.interrupt")
     );
+    assert_eq!(
+        emits[0].1.get("drop_queued").and_then(|v| v.as_bool()),
+        Some(true)
+    );
 
     let out = render_str(&mut engine);
     assert!(
-        !out.contains("queued follow-up") && out.contains("queued") && out.contains("draft"),
-        "interrupt should clear widget and restore queued text before draft in prompt: {out:?}"
+        out.contains("queued draft"),
+        "double Esc should restore queued text before the existing draft with one space: {out:?}"
     );
+}
+
+#[test]
+fn single_escape_waits_then_steers_only_when_a_message_is_queued() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+
+    submit_text(&mut engine, "first");
+    let _ = engine.take_emit_queue();
+    submit_text(&mut engine, "queued");
+    let _ = engine.take_emit_queue();
+
+    engine.handle_key(key("escape")).expect("escape");
+    assert!(
+        engine.take_emit_queue().is_empty(),
+        "single Esc acts only after timeout"
+    );
+    engine.advance_time(Duration::from_millis(601));
+    engine.drive_scheduled_dispatches().expect("drive timer");
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1);
+    assert_eq!(
+        emits[0].1.get("kind").and_then(|v| v.as_str()),
+        Some("chat.steer")
+    );
+
+    dispatch_event(&mut engine, json!({ "kind": "chat.queue.steered" }));
+    let out = render_snapshot(&mut engine);
+    assert!(
+        out.contains("queued"),
+        "steered message remains in the transcript: {out:?}"
+    );
+}
+
+#[test]
+fn single_escape_without_queue_expires_as_noop() {
+    let mut engine = Engine::new(80, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    submit_text(&mut engine, "first");
+    let _ = engine.take_emit_queue();
+
+    engine.handle_key(key("escape")).expect("escape");
+    engine.advance_time(Duration::from_millis(601));
+    engine.drive_scheduled_dispatches().expect("drive timer");
+    assert!(engine.take_emit_queue().is_empty());
 }
 
 #[test]
@@ -2160,7 +2217,7 @@ fn thinking_indicator_has_no_braille_spinner() {
 }
 
 #[test]
-fn double_escape_after_lead_stops_emits_interrupt_all() {
+fn double_escape_stops_only_the_lead() {
     let mut engine = Engine::new(80, 24).expect("engine");
     engine.load_scenario(&chat_lua_source()).expect("load");
     let _ = render_str(&mut engine);
@@ -2194,31 +2251,97 @@ fn double_escape_after_lead_stops_emits_interrupt_all() {
     let second = engine.take_emit_queue();
     assert_eq!(
         second[0].1.get("kind").and_then(|v| v.as_str()),
-        Some("chat.interrupt_all"),
-        "second ESC after lead stops should cancel active runs"
+        Some("chat.interrupt"),
+        "second ESC should hard-stop the lead"
     );
-    let out = render_str(&mut engine);
-    assert!(
-        out.contains("MAG mag-run-"),
-        "interrupted run should still render (lingering) after local mark: {out:?}"
+    assert_eq!(
+        second[0].1.get("drop_queued").and_then(|v| v.as_bool()),
+        Some(true)
     );
+}
 
-    // The graceful interrupt renders a transcript notice: agentic-loop emits a
-    // system `chat.message.append` when it fires `mag.interrupt_run`. Feed that
-    // back the way the loop would and assert it paints in the transcript.
+#[test]
+fn workflow_popup_escape_only_cancels_the_popup() {
+    let mut engine = Engine::new(100, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
     dispatch_event(
         &mut engine,
-        json!({
-            "kind": "chat.message.append",
-            "role": "system",
-            "text": "[interrupted by user — cancelling in-flight work]",
-        }),
+        json!({ "kind": "mag.run_started", "run_id": "run-one", "run_name": "one", "principal": "subagent" }),
     );
-    let out = render_str(&mut engine);
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("tab")).expect("focus sidebar");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("x")).expect("open terminate popup");
+    assert!(render_snapshot(&mut engine).contains("Terminate one?"));
+
+    engine.handle_key(key("escape")).expect("cancel popup");
+    assert!(engine.take_emit_queue().is_empty());
     assert!(
-        out.contains("interrupted by user"),
-        "double-Esc's interrupt notice renders in the transcript: {out:?}"
+        !engine.has_scheduled_dispatches(),
+        "popup Esc must not arm the lead escape gesture"
     );
+}
+
+#[test]
+fn x_on_selected_lead_restores_queue_and_hard_stops_it() {
+    let mut engine = Engine::new(100, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    submit_text(&mut engine, "first");
+    let _ = engine.take_emit_queue();
+    submit_text(&mut engine, "queued");
+    let _ = render_str(&mut engine);
+    type_text(&mut engine, "message");
+    let _ = engine.take_emit_queue();
+    dispatch_event(
+        &mut engine,
+        json!({ "kind": "mag.run_started", "run_id": "lead-run", "run_name": "lead", "principal": "lead" }),
+    );
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("tab")).expect("focus sidebar");
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("x")).expect("open terminate popup");
+    engine.handle_key(key("enter")).expect("confirm");
+
+    let emits = engine.take_emit_queue();
+    assert_eq!(emits.len(), 1);
+    assert_eq!(
+        emits[0].1.get("kind").and_then(|v| v.as_str()),
+        Some("chat.interrupt")
+    );
+    assert_eq!(
+        emits[0].1.get("drop_queued").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert!(render_snapshot(&mut engine).contains("queued message"));
+}
+
+#[test]
+fn uppercase_x_terminates_all_runs_including_lead() {
+    let mut engine = Engine::new(100, 24).expect("engine");
+    engine.load_scenario(&chat_lua_source()).expect("load");
+    let _ = render_str(&mut engine);
+    for (run_id, principal) in [("lead-run", "lead"), ("sub-run", "subagent")] {
+        dispatch_event(
+            &mut engine,
+            json!({ "kind": "mag.run_started", "run_id": run_id, "run_name": run_id, "principal": principal }),
+        );
+    }
+    let _ = render_str(&mut engine);
+    engine.handle_key(key("tab")).expect("focus sidebar");
+    let _ = render_str(&mut engine);
+    engine
+        .handle_key(key("X"))
+        .expect("open terminate-all popup");
+    engine.handle_key(key("enter")).expect("confirm");
+
+    let emits = engine.take_emit_queue();
+    let kinds: Vec<_> = emits
+        .iter()
+        .filter_map(|(_, body)| body.get("kind").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(kinds, vec!["chat.interrupt", "mag.kill_all_runs"]);
 }
 
 #[test]

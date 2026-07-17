@@ -263,6 +263,17 @@ impl LuaHost {
         Ok(f.call::<bool>((run_id, error))?)
     }
 
+    pub fn steer_run(
+        &self,
+        run_id: &str,
+        actor_id: &str,
+        message: &JsonValue,
+    ) -> Result<bool, MagError> {
+        let f: Function = self.kernel.get("steer_run")?;
+        let message = self.lua.to_value(message)?;
+        Ok(f.call::<bool>((run_id, actor_id, message))?)
+    }
+
     /// End a run: the kernel reaps the context's live actors through the fold
     /// (kill handlers run — abort/cancel envelopes land on the emit queue; the
     /// caller drains them) and drops the context. The reason stamps every

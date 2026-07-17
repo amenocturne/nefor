@@ -617,8 +617,8 @@ function M:cancel_inflight()
   return #ids
 end
 
--- GRACEFUL interrupt of this run's in-flight work (double-Esc on the lead's OWN
--- turn, NOT a kill). For every OPEN capability correlation in this run:
+-- GRACEFUL interrupt of this run's in-flight work (NOT a kill). For every OPEN
+-- capability correlation in this run:
 --   1. cancel the real work (cancel_inflight above): a `tool.cancel` per
 --      correlation. Real termination first.
 --   2. settle the correlation by delivering a synthesized FAILED reply
@@ -713,6 +713,17 @@ function M:drain(id)
   instance.handle_drain()
   self.signaling[id] = nil
   return true
+end
+
+-- Queue a user message at an LLM actor's transcript boundary. The factory
+-- owns when it is safe to append it: after the current provider exchange and
+-- any tool results, immediately before the next provider request.
+function M:steer(id, message)
+  local instance = self.instances[id]
+  if not instance or type(instance.handle_steer) ~= "function" then
+    return false
+  end
+  return instance.handle_steer(message) == true
 end
 
 -- Drop all routing state for a killed id — the instance, the firing slots

@@ -72,6 +72,7 @@ function M.construct(id, params, emit, options)
   local draining = false
   local turn_active = false
   local awaiting_continuation = false
+  local steered_messages = {}
 
   function state:append(message) history[#history + 1] = message end
   function state:emit(message) emit(sign(message)) end
@@ -127,6 +128,13 @@ function M.construct(id, params, emit, options)
   end
   function state:retry() return invoke_provider() end
 
+  local function append_steered_messages()
+    if #steered_messages == 0 then return false end
+    for _, message in ipairs(steered_messages) do state:append(message) end
+    steered_messages = {}
+    return true
+  end
+
   local function emit_failure(detail)
     state:emit({ kind = kinds.failed, failure = kinds.Failed, value = { error = detail } })
     turn_active = false
@@ -180,7 +188,13 @@ function M.construct(id, params, emit, options)
         emit_tool_calls(result)
         return nil
       end
-      options.on_final(state, result)
+      if options.steerable and #steered_messages > 0 then
+        if options.on_steered_final then options.on_steered_final(state, result) end
+        append_steered_messages()
+        invoke_provider()
+      else
+        options.on_final(state, result)
+      end
       return nil
     end
 
@@ -189,6 +203,7 @@ function M.construct(id, params, emit, options)
     awaiting_continuation = false
     if not turn_active then turn_active = true end
     extend_history(((activation.messages or {})[1] or {}).message)
+    append_steered_messages()
     if not continuation and options.on_turn_start then options.on_turn_start(state) end
     invoke_provider()
     return { status = "pending" }
@@ -209,6 +224,13 @@ function M.construct(id, params, emit, options)
     else
       draining = true
     end
+  end
+
+  function instance.handle_steer(message)
+    if not options.steerable or type(message) ~= "table" then return false end
+    if type(message.role) ~= "string" or message.role == "" then return false end
+    steered_messages[#steered_messages + 1] = message
+    return true
   end
 
   state:emit({ kind = kinds.ready })

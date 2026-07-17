@@ -112,6 +112,7 @@ function M.render(state)
     state.popup.variant == "info" or
     state.popup.variant == "warning" or
     state.popup.variant == "error" or
+    state.popup.variant == "terminate_workflow" or
     -- Read-only agent view: prompt structurally inactive while open.
     state.popup.variant == "agent_view"
   )
@@ -212,6 +213,7 @@ function M.render(state)
       popups.session_picker(state),
       popups.login_picker(state),
       popups.tool_permission(state),
+      popups.terminate_workflow(state),
       popups.agent_view(state),
       -- Toast renders last so it sits above input, statusline, and
       -- every popup — non-blocking notifications must never be

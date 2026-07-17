@@ -45,6 +45,13 @@ local function find_kind(msgs, kind)
   return nil
 end
 
+local function find_last_kind(msgs, kind)
+  for i = #msgs, 1, -1 do
+    if msgs[i].kind == kind then return msgs[i] end
+  end
+  return nil
+end
+
 -- Construct an llm instance with a fresh capture. Consumes the ready confirm.
 local function make(id, params)
   local msgs, emit = capture()
@@ -78,7 +85,54 @@ do
 
   local sigs = {}
   for _, s in ipairs(reg:declaration("llm").signals) do sigs[s] = true end
-  assert_true(sigs.kill and sigs.drain, "declares the kill and drain signals")
+  assert_true(sigs.kill and sigs.drain and sigs.steer,
+    "declares the kill, drain, and steer signals")
+end
+
+-- ==================================================================
+-- steering lands after the current exchange and before the next round
+-- ==================================================================
+
+do
+  local instance, msgs = make("lead.llm", { provider = "p" })
+  instance.deliver(turn({ messages = { { role = "user", content = "first" } } }))
+  local first = find_last_kind(msgs, "capability.invoke")
+  assert_true(instance.handle_steer({ role = "user", content = "queued" }),
+    "llm accepts a user steering message")
+  instance.deliver({
+    kind = "reply", ref = first.ref,
+    result = { text = "current answer", finish_reason = "stop" },
+  })
+
+  assert_true(find_kind(msgs, "generic-provider.FinalAnswer") == nil,
+    "a queued steer keeps the run open instead of finishing after the current answer")
+  local second = find_last_kind(msgs, "capability.invoke")
+  local history = second.request.input.messages
+  assert_eq(history[1].content, "first", "original user message stays first")
+  assert_eq(history[2].content, "current answer", "current assistant turn finishes before steer")
+  assert_eq(history[3].content, "queued", "steer is the next user turn")
+end
+
+do
+  local instance, msgs = make("lead-tools.llm", { provider = "p" })
+  instance.deliver(turn({ messages = { { role = "user", content = "first" } } }))
+  local first = find_last_kind(msgs, "capability.invoke")
+  instance.handle_steer({ role = "user", content = "queued" })
+  instance.deliver({
+    kind = "reply", ref = first.ref,
+    result = {
+      text = "", finish_reason = "tool_calls",
+      tool_calls = { { id = "call-1", name = "read", args = {} } },
+    },
+  })
+  instance.deliver(turn({ messages = {
+    { role = "tool", tool_call_id = "call-1", name = "read", content = "result" },
+  } }))
+
+  local second = find_last_kind(msgs, "capability.invoke")
+  local history = second.request.input.messages
+  assert_eq(history[#history - 1].role, "tool", "tool result precedes steering")
+  assert_eq(history[#history].content, "queued", "steering is appended after tool results")
 end
 
 -- ==================================================================

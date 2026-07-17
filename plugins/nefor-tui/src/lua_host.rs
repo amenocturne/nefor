@@ -80,6 +80,13 @@ pub enum SideEffect {
         target_hint: Option<String>,
         body: JsonMap<String, JsonValue>,
     },
+    /// Dispatch a local reducer message after a monotonic delay. The message
+    /// never leaves the TUI process; delayed handlers must still validate a
+    /// token in state because a later action may supersede the timer.
+    DispatchAfter {
+        delay_ms: u64,
+        body: JsonMap<String, JsonValue>,
+    },
 }
 
 pub struct LuaHost {
@@ -381,6 +388,10 @@ fn parse_side_effects(lua: &Lua, v: Value) -> Vec<SideEffect> {
                 Ok(eff) => out.push(eff),
                 Err(e) => tracing::warn!(error = %e, "failed to parse emit/send_to side-effect"),
             },
+            Some("dispatch_after") => match parse_dispatch_after_entry(lua, &entry_t) {
+                Ok(eff) => out.push(eff),
+                Err(e) => tracing::warn!(error = %e, "failed to parse dispatch_after side-effect"),
+            },
             Some(other) => {
                 tracing::warn!(kind = other, "unknown side-effect kind; ignoring");
             }
@@ -390,6 +401,18 @@ fn parse_side_effects(lua: &Lua, v: Value) -> Vec<SideEffect> {
         }
     }
     out
+}
+
+fn parse_dispatch_after_entry(lua: &Lua, entry: &Table) -> mlua::Result<SideEffect> {
+    let delay_ms = entry.get::<u64>("delay_ms")?;
+    let body_val: Value = entry.get("body")?;
+    let body_json: JsonValue = lua.from_value(body_val)?;
+    let JsonValue::Object(body) = body_json else {
+        return Err(mlua::Error::runtime(
+            "dispatch_after: `body` must be a JSON object (Lua table with string keys)",
+        ));
+    };
+    Ok(SideEffect::DispatchAfter { delay_ms, body })
 }
 
 /// Convert a `{ kind = "send_to" | "emit", target?: string, body: table }`

@@ -423,6 +423,9 @@ async fn run(script: Option<&PathBuf>) -> Result<(), TuiError> {
                 }
             },
             _ = anim_tick.tick() => {
+                if engine.has_scheduled_dispatches() {
+                    engine.drive_scheduled_dispatches()?;
+                }
                 if engine.has_active_animations() {
                     engine.mark_animation_tick();
                 }
